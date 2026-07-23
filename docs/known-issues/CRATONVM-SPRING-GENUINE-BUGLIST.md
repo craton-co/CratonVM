@@ -389,119 +389,98 @@ budget — flagged for a dedicated follow-up):
 - **`test.context.bean.override.mockito.MockitoBeanByTypeLookupIntegrationTests`
   + the sibling `.constructor.MockitoBeanByTypeLookupForConstructorParametersIntegrationTests`**
   (3/5 and 4/6 — same 2 method names fail identically in both, one shared
-  root cause) — **2026-07-23 session: root-caused precisely, one real
-  sub-bug found+fixed+merged (dev `45e2757d2`), the actual blocker is a
-  DIFFERENT, still-open interpreter defect.** `Mockito.mock(StringBuilder
-  .class)` (final class, inline mock maker) redefines BOTH `StringBuilder`
-  AND its package-private superclass `AbstractStringBuilder` in place (two
-  separate `Instrumentation.redefineClasses` calls — confirmed via
-  redefine tracing). `.substring(0)` returns `""` instead of Mockito's
-  default-answer `null`, with **zero recorded invocations** — earlier
-  "not being intercepted at all" was imprecise; it *is* dispatched to the
-  correctly-redefined, woven `AbstractStringBuilder.substring(int)`
-  bytecode (proven: CratonVM's own native is never invoked, confirmed via
-  an env-gated eprintln that never fires), but that woven method's own
-  Mockito-generated advice preamble (`get()` → `isMocked()` →
-  `isOverridden()` → conditionally `handle()`) takes the wrong branch.
-  `get()` finds the correct, non-null dispatcher (verified: same object,
-  same identifier string content/coder/layout as the registration).
-  `isMocked()` correctly returns `true`. **`isOverridden(mockInstance,
-  AbstractStringBuilder.substring(int))` incorrectly returns `true`**
-  (HotSpot: `false`) — this single wrong boolean is what causes the woven
-  method to skip calling Mockito's `handle()` and instead run the real
-  computation on the mock's zero-initialized fields, producing `""`.
+  root cause chain) — **2026-07-23 session: FOUR real bugs found, fixed,
+  and merged; a FIFTH, distinct residual is still open.** All four fixed
+  bugs are variations on one theme: `Mockito.mock(StringBuilder.class)`
+  (final class, inline mock maker) redefines `StringBuilder` and its
+  package-private superclass `AbstractStringBuilder` in place, and several
+  different CratonVM caching/dispatch layers weren't redefine-aware.
 
-  Found and fixed one real, independently-verified bug in the process:
-  `Class.getDeclaredMethods()` mis-paired bridge methods to the FIRST
-  same-named non-bridge sibling instead of the one it actually bridges
-  (matched by parameter types) — wrong for any class where an overloaded
-  name has both non-bridge overloads AND unrelated bridges (e.g.
-  `AbstractStringBuilder.append`'s 14 real overloads plus 3 unrelated
-  `Appendable`-interface bridges). Fixed in
-  `native-builtins/src/lang_class.rs::native_class_get_declared_methods`
-  (dev `45e2757d2`, 3079 native-builtins unit tests pass, verified against
-  HotSpot for both this class and a generic covariant-bridge case). This
-  fix is real and worth keeping, but landing it alone does **not** flip
-  `isOverridden`'s answer.
+  1. `Class.getDeclaredMethods()` mis-paired bridge methods to the FIRST
+     same-named non-bridge sibling instead of the one it actually bridges
+     (matched by parameter types only, not descriptor). Fixed in
+     `native-builtins/src/lang_class.rs::native_class_get_declared_methods`
+     (dev `45e2757d2`).
+  2. `class_declares_method`'s ancestor walk (used by
+     `native_mockito_mock_method_advice_is_overridden`) counted a
+     compiler-generated bridge as a genuine "declared override", making
+     `isOverridden(mock, AbstractStringBuilder#substring)` wrongly answer
+     `true` — the woven advice's own preamble then skipped `handle()`
+     entirely and ran the real (empty-buffer) computation. Fixed by
+     excluding bridges in `vm/src/vm/vm_exec.rs::class_declares_method`
+     (dev `f5379b3a0`). This flipped `.substring(0)` to correct on the
+     FIRST call to a fresh mock, but exposed bug 3 below on every later
+     call.
+  3. Two invoke-cache blind spots, both keyed on "has this class ever been
+     redefined" without checking it at the RIGHT layer:
+     `StringBuilder.substring(int)` is itself a bridge that forwards to
+     `AbstractStringBuilder.substring` via `invokespecial`; that call
+     site's cache-hit redefine-eviction guard in
+     `execute_invokevirtual_cached` only inspected `VirtualNative`/
+     `Intrinsic` targets for a stale shadow, never the plain `Native`
+     variant (invokestatic/invokespecial's direct-callback target, which
+     carries no `receiver_class_id` to check) — so the cache entry
+     `populate_invoke_cache` warmed right after call #1's correct slow-path
+     dispatch was never evicted, and call #2 onward silently ran the real
+     native instead of the woven advice. Separately,
+     `populate_virtual_invoke_cache`'s direct-native-override lookup had
+     no redefine awareness at all, which would have poisoned the OUTER
+     `mock.substring(0)` call site the same way. Fixed by extending the
+     cache-hit guard to cover `Native` (mirroring the pattern
+     `execute_invokestatic_cached` already used) and adding a
+     `receiver_redefined` check to the populate-side lookup (mirroring
+     `execute_invokevirtual_vtable_fast`'s existing guard).
+  4. Once bugs 2–3 let real per-call dispatch decisions through,
+     `is_string_builder_layout_native_override`'s "always native, real
+     bytecode reads an incompatible compact-string layout" allowlist
+     turned out to be blind to per-instance mock-vs-real status for two
+     methods this suite actually exercises: `setCharAt` was simply missing
+     from the allowlist (a REAL StringBuilder used after an unrelated mock
+     existed crashed with `ArrayIndexOutOfBoundsException` in
+     `String.checkIndex`); `substring(int,int)` (2-arg, used internally by
+     Mockito's own `StringUtil.join` when formatting an exception message)
+     has the same problem but the 1-arg overload must stay OFF the
+     blanket-immune list since that's the one these tests stub/verify on
+     mocks — fixed by giving `is_string_builder_layout_native_override`
+     the descriptor so it can immunize just the 2-arg overload; `length()`
+     has the same tension in the other direction (explicitly `verify()`'d
+     on a mock, so it can't be blanket-immune, but a real receiver's
+     `length()` still needs the native) — fixed with a per-INSTANCE
+     "real carrier" check in `intercept_force_registered_native` (field 0,
+     the `char[]` buffer, is only populated once `<init>` has actually
+     run — a mock is Objenesis-constructed and never runs `<init>`),
+     mirroring the existing `java/net/HttpURLConnection` real-carrier
+     exemption in the same function.
 
-  **What's been conclusively ruled out** for the `isOverridden` divergence
-  (each verified with a dedicated, minimal repro comparing CratonVM vs
-  HotSpot on the actual JDK25 classes, not a synthetic stand-in):
-  redefine-dispatch choosing native over bytecode (ruled out directly —
-  the native never fires); duplicate `ClassId`s for `MockMethodDispatcher`
-  or `AbstractStringBuilder` (single, stable `ClassId` throughout, via
-  `redefine_class`'s own entry/method-order tracing); identifier string
-  mismatch (byte-identical content, coder, LATIN1 layout at both `set()`
-  and both `get()` sites); `<clinit>` re-running / `DISPATCHERS` map
-  getting wiped (initializes exactly once, confirmed via a fast-path
-  tracer); cross-thread visibility bug (single thread throughout);
-  `Class.getModifiers()`/bridge/synthetic flags for `AbstractStringBuilder`
-  or `StringBuilder.substring` (byte-identical to HotSpot); `getSuperclass
-  ()`/`getGenericSuperclass()`/`getGenericInterfaces()` chain (identical);
-  `Method.equals()`/`hashCode()` for two separately-obtained `Method`
-  objects for the same method (identical); `AbstractStringBuilder.class`
-  resolving to two different objects via `getSuperclass()` vs
-  `Class.forName()` post-redefine (same object, same identity hash);
-  Mockito's own graph cache serving a stale/early snapshot (confirmed
-  empty immediately after `mock()` returns — first-ever computation
-  happens later, inside the actual `substring(0)` call); JIT
-  miscompilation (`--nojit` reproduces identically); a swallowed exception
-  inside the advice preamble (confirmed zero `Throwable` constructions
-  during the whole `substring(0)` call via a `fillInStackTrace`-native
-  tracer); `MethodGraph.Compiler.Default.forJavaHierarchy()`'s own
-  algorithm being order-sensitive in a way that matters here (a stable
-  sort-by-descriptor experiment did not change the outcome).
+  All four verified against HotSpot via ad hoc probes on the Azure host
+  (`/data/tmp/mockitobean-substring-20260723/`: `RepeatCallProbe`,
+  `RepeatCallProbe3`, `TwoMocksProbe`, `TwoMocksProbe2`,
+  `LengthAfterMockProbe`, `AmbiguousProbe`, `LengthSubstringProbe`,
+  `LengthRepeatProbe`, `SubstringVerifyProbe` — none checked in).
+  `cargo test -p cratonvm-vm --lib`: 2229 passed, 13 failed, identical
+  failure set to the pre-fix baseline (8 `lock_order` tests that only
+  assert under `debug_assertions`, 4 pre-existing `skip_list`/
+  `tomcat_scanner` failures unrelated to this change). Commit `0bd8213de`,
+  merged `6a5f3db42`, pushed to dev.
 
-  **The critical, still-unexplained finding**: manually replicating
-  `isOverridden`'s entire documented algorithm step-by-step in plain Java
-  — reading the *exact same* `compiler` field off the *exact same*
-  dispatcher instance via reflection, compiling the graph for the *exact
-  same* `mock.getClass()`, locating the *exact same* signature token, and
-  calling `TypeDescription.represents(Class)` on the resulting
-  representative's declaring type — correctly resolves to
-  `AbstractStringBuilder` (`represents() == true`, which per
-  `isOverridden`'s own bytecode should make it return `false`, matching
-  HotSpot). Yet calling the REAL `dispatcher.isOverridden(mock, origin)`
-  method (via reflection, same dispatcher, same mock, same origin,
-  immediately afterward, repeated 3x with identical results) returns
-  `true` every time. **This means every documented input and every API
-  `isOverridden()` calls behaves correctly when exercised directly — the
-  divergence is isolated to CratonVM's interpretation of `isOverridden`'s
-  own ~146-byte method body** (`checkcast` + `invokeinterface` +
-  wide-indexed local slots 4/5 + a `WeakConcurrentMap`/`SoftReference`
-  cache-then-compute shape). Simpler micro-probes replicating individual
-  fragments of this shape (`invokestatic`→`astore`→`aload`→`ifnull`;
-  `invokevirtual`/`invokeinterface` boolean →`ifeq`/`ifne`; the exact
-  `if_acmpne`-against-a-static-field sentinel check inside
-  `MockMethodDispatcher.get()` itself) all pass in isolation on CratonVM —
-  the bug needs the FULL, specific instruction sequence and/or execution
-  context to manifest. Recommended next step for whoever continues:
-  **instruction-level PC tracing of `isOverridden`'s own execution**
-  (log every opcode + top-of-stack while `frame.class_name()`==
-  `"org/mockito/internal/creation/bytebuddy/MockMethodAdvice"` &&
-  `frame.method_name()`==`"isOverridden"`) to find exactly which
-  instruction's result diverges from a manual byte-for-byte trace of the
-  same method; also worth checking whether this specific class uses
-  the interpreter's "fast path" (`class_disables_interp_fast_path`,
-  `vm/src/runtime/frame.rs`) — `org/mockito/**` does not match any of its
-  JDK/Spring prefixes, so it takes the fast path (documented as "tuned for
-  synthetic bytecode", `pop_unchecked`-based) rather than the slower,
-  more defensive path JDK classes get; forcing this one method onto the
-  slow path (or a targeted `--nojit`-style env override) would cheaply
-  test that theory without needing the full PC trace.
-
-  Investigation artifacts (Azure host, `/data/tmp/mockitobean-substring-
-  20260723/`): ~25 standalone `*Probe*.java` repros (`SbMockProbe2`
-  through `SbMockProbe8`, `GraphProbe` through `GraphProbe5`,
-  `AcmpProbe`, `IfNullProbe`/`IfNullProbe2`, `IfEqProbe`, `IfNeProbe`,
-  `LdcWProbe`, `ModProbe`, `OrderProbe`/`OrderProbe2`, `GenProbe`,
-  `MethodEqProbe`, `ClassIdProbe`, `BridgeRegress`, `PlainMockProbe`),
-  each runnable directly against `/data/wt-mockitobean-20260723/target/
-  release/cratonvm --java-home /data/jdk25-real-20260717/jdk-25.0.3+9`.
-  Worktree `/data/wt-mockitobean-20260723` (branch
-  `fix/mockitobean-substring-20260723`, pushed) still has the bridge-fix
-  commit; all temporary Rust-side `eprintln!` diagnostics used during the
-  investigation were reverted before merging (none landed on dev).
+  **Residual (bug 5, still open)**: both disambiguated-qualifier test
+  methods still fail, now with `org.mockito.exceptions.misusing.
+  UnfinishedVerificationException` instead of a crash — a DIFFERENT
+  failure mode that the AIOOBE was masking. Reproduced in isolation
+  (`LengthSubstringProbe.java`, `AmbiguousProbe.java`): calling
+  `mock.length()` then `mock.substring(0)`, then
+  `verify(mock, times(1)).length()` then
+  `verify(mock, times(1)).substring(anyInt())`, throws
+  `UnfinishedVerificationException` at an INCONSISTENT point (sometimes
+  the first `verify()`, sometimes the second) between two structurally
+  identical probes — ruling out a simple ordering bug and pointing at a
+  timing- or identity-sensitive issue in Mockito's `MockingProgress`
+  pending-verification tracking (a `ThreadLocal<MockingProgress>` in real
+  Mockito). Ruled out so far: `length()` alone + `verify(times(N))`
+  repeated works fine (`LengthRepeatProbe`); `substring(0)` alone +
+  `verify()` works fine (`SubstringVerifyProbe`); only the COMBINATION of
+  both methods on the same mock, each wrapped in its own `verify()`,
+  reproduces it. Not yet root-caused.
 - **`test.context.junit.jupiter.event.ParallelApplicationEventsIntegrationTests`**
   (0/2) — `executeTestsInParallelWithInstancePerMethod` fails an AssertJ
   `MultipleFailuresError` ("Test Event Statistics", 2 failures);
