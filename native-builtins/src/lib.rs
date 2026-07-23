@@ -69343,18 +69343,45 @@ fn completed_executor_future(
     ctx: &mut dyn NativeContext,
     result: Value,
 ) -> Result<ObjectRef, MethodCallFailed> {
-    let future =
-        match ctx.new_object_initialized("java/util/concurrent/CompletableFuture", "()V", &[])? {
-            Some(Value::Object(Some(future))) => future,
-            _ => {
-                return Err(RuntimeError::IllegalStateException {
-                    message: "could not allocate executor completion future".to_string(),
+    // Callable.call() can return a heap object. Retain that result across the
+    // CompletableFuture allocation and completion dispatch; both can collect.
+    // Tomcat's WebappClassLoaderBase.clearReferencesJdbc() reaches this path
+    // during DoHead shutdown, where a raw returned value otherwise became stale
+    // before CompletableFuture.complete stored it.
+    let result_obj = match result {
+        Value::Object(Some(result_obj)) => Some(result_obj),
+        _ => None,
+    };
+    let result_pin = result_obj.map(|result_obj| ctx.pin_native_root(result_obj));
+    let outcome = (|| -> Result<ObjectRef, MethodCallFailed> {
+        let future =
+            match ctx.new_object_initialized("java/util/concurrent/CompletableFuture", "()V", &[])? {
+                Some(Value::Object(Some(future))) => future,
+                _ => {
+                    return Err(RuntimeError::IllegalStateException {
+                        message: "could not allocate executor completion future".to_string(),
+                    }
+                    .into())
                 }
-                .into())
+            };
+        let future_pin = ctx.pin_native_root(future);
+        let result = match (result_pin, result_obj) {
+            (Some(result_pin), Some(result_obj)) => {
+                Value::Object(Some(ctx.read_native_pin(result_pin, result_obj)))
             }
+            _ => result,
         };
-    ctx.invoke_virtual(future, "complete", "(Ljava/lang/Object;)Z", &[result])?;
-    Ok(future)
+        let future = ctx.read_native_pin(future_pin, future);
+        let complete = ctx.invoke_virtual(future, "complete", "(Ljava/lang/Object;)Z", &[result]);
+        let future = ctx.read_native_pin(future_pin, future);
+        ctx.unpin_native_roots(future_pin);
+        complete?;
+        Ok(future)
+    })();
+    if let Some(result_pin) = result_pin {
+        ctx.unpin_native_roots(result_pin);
+    }
+    outcome
 }
 
 fn failed_executor_future(
