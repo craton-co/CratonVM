@@ -1,7 +1,12 @@
 # Stale refs surfacing on interpreter operand stacks after a nested allocating call — the residual core of the WildFly cid=0 family
 
-Status: **RE-CHARACTERIZED 2026-07-23; fatal member FIXED (producer #11); dominant non-fatal
-producer FIXED (producer #12, `6e10cba68`) — residual tail ~1.2%/boot, non-fatal, OPEN.**
+Status: **RE-CHARACTERIZED 2026-07-23 (round 2); fatal member FIXED (producer #11); dominant
+non-fatal producer FIXED (producer #12, `6e10cba68`) — residual tail SPLIT into THREE DISTINCT
+open items (see "Campaign 13/fix11" section below), none yet fixed: (A) the original sb-chain
+shape (unchanged, now pushprov-exhausted for every interpreter push site), (B) a NEW non-moving
+young-gen liveness/remembered-set gap (FATAL — `AbstractMethodError`), (C) a NEW STW-takeover-
+correlated checkcast CCE (FATAL — `ClassCastException`). All three are rare (<1%/boot) but (B)
+and (C) are fatal, contradicting this doc's prior "no fatal instance remains" claim.**
 This doc previously attributed the family to a frame-slot scan/remap gap in the moving collector's
 interpreter frame walk. A full forensic campaign (worktree
 `/data/wt-stw-residual-close-20260722`, branch `fix/wildfly-stw-residual-close-20260722`) DISPROVED
@@ -113,6 +118,153 @@ dispatch still operates on reclaimed memory (plausible mechanism of the h2
 `StringBuilder.append(long)` NaN corruption — writes landing in a zeroed block), and (b) a
 consumer without a healing path (checkcast) would make it fatal — no such fatal instance remains
 after producer #11's fix.
+
+## Campaign 13/fix11 (2026-07-23): pushprov extended to every interpreter push site — mixed result
+
+Per the "Next increment" above, `push_prov_record` was extended (worktree
+`/data/wt-stw-residual-close-20260722`, binary `cvm-stw-close-20260722-fix11.bin`) to fire from
+`new`, every `ldc` arm (str/wide-str/classref/condy-cached/condy), the shared `aaload` array-load
+arm, both `getstatic` paths (the System.out/err/in intercept and the common
+`push_static_field_value` path), and every dup/swap opcode (`dup`, `dup_x1`, `dup_x2`, `dup2`,
+`dup2_x1`, `dup2_x2`, `swap`, via a new `record_shuffle_push` helper) — i.e. every Object-producing
+push site in the interpreter now feeds the ring, not just invoke-returns.
+
+A fresh 320-boot campaign (`out/results.tsv`, waves 1-80) came back with 3 `STALERECV` events
+(0.94%, in line with run12's 1.2%) plus 2 unrelated `EXITED`-only boots and 3 `SLOW` timeouts:
+
+- **2/3 events (boot-147, boot-295) are the SAME long-standing sb-chain shape** (`Optional.map`
+  receiver, `[gcpart] moved_to=Some(...)`, `[zeroed] site=fromspace-reset` — the MOVING collector's
+  arena reset). `[pushprov]` shows ONLY `invoke-ret` hits (2 and 1 pushes ago) for both — **every
+  newly-instrumented channel (new/ldc/aaload/getstatic/dup/swap) is now NEGATIVE for this shape**,
+  narrowing the doc's own "remaining un-instrumented channels" list to two candidates: JIT-compiled
+  code paths (which bypass `push_prov_record` entirely — the interpreter instrumentation has no JIT
+  equivalent) and the upward-`len`-restore / `execute_invoke_kind` args-buffer paths already named
+  below. Given `Optional.map`/append chains are hot enough to tier up during a WildFly boot, the JIT
+  hypothesis is now the leading candidate — untested as of this writing.
+
+- **1/3 events (boot-134) is a NEW, mechanistically distinct, FATAL bug.** Consumed at
+  `DelegatingResource.isRuntime()` → dispatch resolves to an abstract `Resource.isRuntime()Z` with
+  no Code attribute → `AbstractMethodError` → `WFLYSRV0056` boot abort. Unlike the sb-chain shape:
+  `[gcpart]` shows `moved_to=None appears_as_dest=false` across ALL 5 tracked epochs (this address
+  was NEVER part of the moving/copying collector's tracked set), `[zeroed]` shows `site=sweep-span`
+  (the NON-MOVING young-gen selective-promotion sweep in `gen_heap.rs`, not the moving arena reset),
+  `[pushprov]` shows a `new` hit 48 pushes ago (the object's original, legitimate allocation), and —
+  critically — `[getfield] parent=0x20020c94b28 fld[0]` shows the **parent object's live heap field
+  CURRENTLY (at capture time) still holds this exact stale pointer**. This is not a raw-Rust-copy-
+  escapes-the-remap bug (the producer #11/#12 class); it is a live object's OWN FIELD pointing into
+  memory the young-gen sweep already reclaimed and zeroed — i.e. a marking/liveness or
+  old-gen→young-gen remembered-set gap. `gen_heap.rs` already has substantial defenses against
+  exactly this bug class (`full_old_rset_scan_enabled()` defaults ON — a complete old→young scan
+  supplementing the card-table fast path, per the doc comment "a missed write barrier has
+  historically manifested as silently emptied Stream/ArrayList results"; `for_each_ref_slot` is
+  correctly compact-ref-layout-aware in both the card-scan and full-scan paths), so this is either a
+  gap NOT covered by those defenses (e.g. a promotion-timing edge case) or a genuinely new
+  regression. **Not yet root-caused.** Next step: `CRATONVM_DBG_RSET_AUDIT=1` (existing, no new code
+  needed) was added to `probes/run-one.sh` and a follow-up campaign launched to try to catch this
+  shape again with the audit's `[rset-miss]`/`[rset-audit]` output correlatable against a fresh
+  stale-recv capture's address — see campaign status appended below once it completes.
+
+- **The run12 `checkcast PathAddress` CCE-BT (boot-157, archived) is ALSO likely part of this
+  broader family, but a THIRD distinct shape.** `java.lang.Object cannot be cast to
+  org.jboss.as.controller.PathAddress` at
+  `UnaryCapabilityNameResolver$1.apply`←`RuntimeCapability.fromBaseCapability`, occurring in the
+  middle of a dense burst of `[blockgc] wake tid=N applying K composed fixups` cross-thread
+  writeback-heal activity across ~10 threads — i.e. this boot exercised the STW cross-thread
+  takeover path (XT-FRAME-SCAN) far more heavily than the ~0-takeover norm this host's boot profile
+  usually shows. This lines up with item 2 in this doc's "true members" list above (frozen-in-JIT
+  peer interpreter-frame coverage) — "rarely exercised in these boots... but a real gap under
+  heavier JIT activity" — this boot is exactly that heavier-activity case. Checkcast has no healing
+  path (unlike invokevirtual's CP-class fallback), so this is FATAL. **Not yet root-caused**; needs
+  a campaign that captures `CRATONVM_DBG_REMAP_TRACE` alongside `CRATONVM_DBG_CCE_BT` specifically
+  during a takeover-heavy boot to get the same forensic depth (`[gcpart]`/`[pushprov]`/`[zeroed]`)
+  the stale-recv path already has for the other two shapes — the CCE-BT capture currently only
+  dumps the Java call stack, not the GC forensics.
+
+- **The run12 `WFLYCTL0079` transactions-module rollback-exit (boot-186, archived) is a SEPARATE,
+  FOURTH shape, likely unrelated to the GC stale-ref family.** Root cause:
+  `WFLYCTL0043: An attribute named 'hornetq-store-enable-async-io' is already registered at
+  location '/subsystem=transactions'` — a genuine DUPLICATE attribute registration, i.e. some
+  extension-initialization code path ran twice. This smells like a class/loader-identity duplication
+  bug (the same family as `docs/internal/aot-beanoverride-double-context-refresh-rootcaused-*`'s
+  fork-loader ClassId instability) rather than a stale-pointer read. **Not yet root-caused; not
+  confirmed related to this doc's family** — flagged here only because it was in the same
+  1.2%-tail sample as the other three.
+
+- **Two unrelated `EXITED`-only boots (boot-47: `IllegalArgumentException: No enum constant
+  MINUTES`; boot-144: `IllegalArgumentException: No enum constant LOCAL_USE_7`)** carry no
+  `[stale-recv]`/`[pushprov]`/`[zeroed]` forensics at all — almost certainly pre-existing,
+  unrelated environment/config flakiness (a real enum constant like `MINUTES` failing
+  `valueOf()` smells like a split-classloader/duplicate-enum-class issue, a different bug
+  entirely). Not investigated further; out of scope for this doc.
+
+**Net: what was one "OPEN" line item is now four,** three of them genuinely new discoveries this
+instrumentation surfaced rather than resolutions of the original shape. The original sb-chain shape
+survives a now-exhaustive interpreter-side pushprov sweep and points at JIT-compiled code as the
+next and likely final interpreter-adjacent hypothesis to test.
+
+## RSET_AUDIT diagnostic hardening + negative reproduction result (2026-07-23)
+
+To test the boot-134 mark-sweep-liveness hypothesis above, `CRATONVM_DBG_RSET_AUDIT` (a pre-existing
+but apparently never-exercised-under-WildFly diagnostic — a full old-gen→young-gen scan that flags
+"clean card on a live edge" write-barrier misses) was enabled in `probes/run-one.sh`. Turning it on
+immediately found — and this campaign then fixed — **an unrelated, genuine bug in the diagnostic
+itself**, independent of everything else in this doc:
+
+- `CRATONVM_DBG_RSET_AUDIT`'s old-gen field walk and a companion young-gen "[small4]" linear scan
+  both hand-derived field offsets assuming the legacy 16-byte `Value`-tagged cell layout
+  unconditionally — never updated for the now-default-on compact-ref-field layout. Enabling the
+  flag SIGSEGV'd **~17% of boots** in the first campaign that exercised it. Fixed the old-gen walk
+  by switching to the existing unified `for_each_ref_slot` helper (same one `scan_all_old_to_young`
+  already used correctly) — `gc/src/gen_heap.rs`.
+- That still left the young-gen "[small4]" scan crashing (~6% of boots, second campaign): a
+  DIFFERENT, orthogonal bug — that walk has no free-list/TLAB-gap-aware cursor advancement (unlike
+  the `young_object_starts` walk elsewhere in the same function, hardened 2026-07-16 for the
+  cce0079 desync), so landing on a stale TLAB-tail byte pattern that happens to parse as a
+  plausible-but-wrong header desyncs it for the rest of the arena — observed as `num_slots` in the
+  hundreds of thousands and a walk into unmapped memory. A `num_slots` plausibility cap closed the
+  Object-kind crash shape but a THIRD campaign still found crashes (down to baseline ~0.6%, but one
+  of two `EXITED` boots was still this walker). Rather than keep chasing an inherently unsound linear
+  walk with narrower caps, it was split into its own separately-gated flag
+  (`CRATONVM_DBG_RSET_AUDIT_YOUNG_SCAN`, NOT set by the harness) so `RSET_AUDIT`'s actually
+  load-bearing old→young scan — now fixed and verified clean across 3 smoke-test boots — is usable
+  without inheriting the young-walk's fragility. **Net: three real (if minor, debug-only, opt-in)
+  bugs found and fixed as a side effect of trying to instrument this investigation further.**
+
+**The hypothesis itself remains UNTESTED.** Across four more 320-boot campaigns run while chasing
+the above (~1250 additional boots total), the boot-134 `site=sweep-span` shape did **not**
+reproduce again — every other `STALERECV` capture in this stretch (boot-77, -234, -238, -275, plus
+the original -147/-295) was the ordinary `site=fromspace-reset` sb-chain shape. Boot-134 remains a
+single occurrence; whatever produces it is rarer than roughly 1-in-1500 boots, or specific to some
+timing/config window not hit again in this stretch. The `[rset-miss]`/`[rset-audit]` correlation
+this diagnostic was built to provide is still unexercised for this specific bug — it needs either a
+much larger campaign or a lucky repro to actually test the missed-write-barrier hypothesis.
+
+## Session status summary (2026-07-23, end of session)
+
+What is FIXED and verified this session:
+- pushprov ring extended to every interpreter Object-push site (`new`, every `ldc` arm, `aaload`,
+  both `getstatic` paths, and the full dup/swap family) — real, working instrumentation, committed.
+- `CRATONVM_DBG_RSET_AUDIT`'s two compact-ref-layout field-walk bugs — real SIGSEGV fixes,
+  independent of the main investigation, verified via 3 clean campaigns + smoke tests.
+
+What is OPEN, in priority order:
+1. **Original sb-chain shape** (`Optional.map`/StringBuilder-chain, `fromspace-reset`,
+   `invoke-ret`-only pushprov) — now pushprov-exhausted for every interpreter channel. Leading
+   hypothesis: JIT-compiled code paths (untested — no JIT-side pushprov equivalent exists).
+2. **boot-134 mark-sweep liveness gap** (FATAL, `AbstractMethodError`) — mechanistically
+   characterized (parent field stale, non-moving sweep zeroing, never in moving-GC epochs) but not
+   reproduced again to test the missed-write-barrier hypothesis; needs a much larger campaign.
+3. **checkcast `PathAddress` CCE-BT** (FATAL, `ClassCastException`) — correlated with heavy
+   cross-thread STW-takeover activity (dense `[blockgc] wake ... composed fixups` burst); likely
+   the "frozen-in-JIT peer interpreter-frame coverage" gap this doc already names as "rarely
+   exercised... but a real gap under heavier JIT activity" — not yet captured with GC forensics
+   (only has a Java-stack dump, needs `REMAP_TRACE`+`GCPART` alongside `CCE_BT` on a takeover-heavy
+   boot).
+4. **`WFLYCTL0079` duplicate attribute registration** (FATAL, `WFLYCTL0043` dup-register) — likely
+   unrelated to the GC family entirely; a class/loader-identity duplication smell, not investigated.
+
+None of items 1-4 are fixed. This doc should stay OPEN with this characterization until a future
+session reproduces and root-causes at least the two fatal items (2, 3).
 
 ## Historical characterization (2026-07-22, superseded in mechanism, preserved)
 
