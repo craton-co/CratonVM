@@ -4005,8 +4005,40 @@ fn map_state(ctx: &dyn NativeContext, this: ObjectRef) -> (Option<ObjectRef>, i3
     // so subsequent reads see `Object(None)` instead of `Int(0)` and we
     // would fall through to slot 2 (`MAP_FIELD_CAPACITY`) and report the
     // bucket count as the size.
+    // BUG fix (Tomcat Jasper/ecj JSP-compile NPE — TestDefaultServlet
+    // .testBug57601 / TestMapperWebapps.testWelcomeFileStrict): this used to
+    // hardcode `"java/util/HashMap"` regardless of the receiver's actual
+    // class. For a genuine `HashMap`/`LinkedHashMap` that is harmless (same
+    // class, same slot). For a `Hashtable` receiver — a completely
+    // different, unrelated class hierarchy that merely shares this generic
+    // bucket-map native machinery — resolving "size" against HashMap's OWN
+    // layout can land on whatever field happens to sit at that same
+    // absolute index in Hashtable's layout, which is NOT a "size" field at
+    // all (Hashtable's own count-tracking field is named `count`, and
+    // separately `bump_map_mod_count` — correctly, via `get/set_field_by_name`
+    // — resolves and increments Hashtable's real `modCount` field by the
+    // OBJECT's own class). If HashMap's "size" slot and Hashtable's
+    // "modCount" slot coincide, `set_map_size`'s write and the very next
+    // `bump_map_mod_count` call both land on the identical physical slot:
+    // size is set to N, then immediately incremented again to N+1 as a
+    // side effect of "bumping modCount" — silently DOUBLING the tracked
+    // size on every put. That corrupted `Hashtable(11).size()` (used by
+    // ecj's `CompilationResult.getClassFiles()`: `new
+    // ClassFile[compiledTypes.size()]` then `.toArray(classFiles)`),
+    // leaving the caller-supplied array null-padded past the real entry
+    // count and NPEing in `CompilationUnitDeclaration.cleanUp()`. Resolve
+    // against the RECEIVER's own actual class (matching
+    // `get_field_by_name`/`bump_map_mod_count`) instead of a hardcoded
+    // class name — for HashMap/LinkedHashMap this is a no-op (same
+    // inherited field, same index); for every other class it correctly
+    // returns `None` (they have no field literally named "size") and falls
+    // through to the legacy slot-1 convention below, which nothing else
+    // independently mutates.
+    let receiver_class_name = ctx
+        .class_name_of_id(ctx.class_id_of_object(this))
+        .unwrap_or_default();
     let size_by_name = ctx
-        .resolve_field_index("java/util/HashMap", "size")
+        .resolve_field_index(&receiver_class_name, "size")
         .filter(|&slot| slot < ctx.object_num_fields(this))
         .map(|slot| ctx.get_field(this, slot));
     // spring-bug-09: bound the slot-2 fallbacks below. `map_state` is invoked on
@@ -4060,7 +4092,16 @@ fn map_state(ctx: &dyn NativeContext, this: ObjectRef) -> (Option<ObjectRef>, i3
 /// coercion that mangles slot 1 (= `AbstractMap.values: Collection`).
 fn set_map_size(ctx: &mut dyn NativeContext, this: ObjectRef, size: i32) {
     ctx.set_field(this, MAP_FIELD_SIZE, Value::Int(size));
-    if let Some(slot) = ctx.resolve_field_index("java/util/HashMap", "size") {
+    // See the matching comment in `map_state` — resolve "size" against the
+    // RECEIVER's own actual class, not a hardcoded "java/util/HashMap". For
+    // a non-HashMap-family receiver (e.g. `Hashtable`) this correctly finds
+    // no such field instead of colliding with an unrelated field (observed:
+    // Hashtable's own `modCount`) at whatever index HashMap's "size"
+    // happens to occupy.
+    let receiver_class_name = ctx
+        .class_name_of_id(ctx.class_id_of_object(this))
+        .unwrap_or_default();
+    if let Some(slot) = ctx.resolve_field_index(&receiver_class_name, "size") {
         if slot != MAP_FIELD_SIZE && slot < ctx.object_num_fields(this) {
             ctx.set_field(this, slot, Value::Int(size));
         }
