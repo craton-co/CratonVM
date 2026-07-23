@@ -10198,6 +10198,56 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             let dst = obj_arg(args, 1)?;
             let src_path = p57_read_path(ctx, src);
             let dst_path = p57_read_path(ctx, dst);
+            // Real Files.move contract: without REPLACE_EXISTING, throw
+            // FileAlreadyExistsException if the target already exists. Plain
+            // std::fs::rename is POSIX rename(2) semantics, which silently
+            // replaces the destination unconditionally -- so H2's
+            // FilePathDisk.moveTo(newName, false) (no REPLACE_EXISTING) never
+            // saw the FileAlreadyExistsException it catches to translate into
+            // DbException(FILE_RENAME_FAILED_2), letting
+            // TestFileSystem.testMoveTo's move-onto-existing-file case
+            // through instead of rejecting it (docs/known-issues/h2-suite-bugs/
+            // bug-h2-files-setposixfilepermissions-FIXED.md residual chain).
+            let mut replace_existing = false;
+            if let Some(Value::Object(Some(opts))) = args.get(2) {
+                let len = ctx.array_length(*opts);
+                for i in 0..len {
+                    if let Value::Object(Some(opt)) = ctx.get_array_element(*opts, i) {
+                        if let Ok(Some(Value::Object(Some(s)))) =
+                            ctx.invoke_virtual(opt, "toString", "()Ljava/lang/String;", &[])
+                        {
+                            if ctx.read_string(s).unwrap_or_default().contains("REPLACE_EXISTING") {
+                                replace_existing = true;
+                            }
+                        }
+                    }
+                }
+            }
+            if !replace_existing
+                && src_path != dst_path
+                && std::fs::symlink_metadata(&dst_path).is_ok()
+            {
+                // Build a REAL java/nio/file/FileAlreadyExistsException via
+                // its real single-String constructor (same pattern as
+                // throw_unsupported_charset_exception below) rather than a
+                // synthetic layout -- this exception is caught by H2's own
+                // real FilePathDisk.moveTo bytecode (catch
+                // (FileAlreadyExistsException ex)) and its getFile() may be
+                // read by real Throwable formatting, so it needs genuine
+                // field layout, not a guessed synthetic one.
+                if let Ok(Some(Value::Object(Some(exc)))) =
+                    ctx.new_object("java/nio/file/FileAlreadyExistsException")
+                {
+                    let file_str = ctx.create_string(&dst_path);
+                    let _ = ctx.invoke(
+                        "java/nio/file/FileAlreadyExistsException",
+                        "<init>",
+                        "(Ljava/lang/String;)V",
+                        &[Value::Object(Some(exc)), Value::Object(Some(file_str))],
+                    );
+                    return Err(MethodCallFailed::ExceptionThrown(exc));
+                }
+            }
             match std::fs::rename(&src_path, &dst_path) {
                 Ok(()) => Ok(Some(Value::Object(Some(dst)))),
                 Err(e) => Err(RuntimeError::IllegalStateException {

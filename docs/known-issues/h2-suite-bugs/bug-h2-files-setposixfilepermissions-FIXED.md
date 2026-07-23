@@ -1,16 +1,20 @@
 # `java.nio.file.Files.setPosixFilePermissions` throws `UnsupportedOperationException` under real-JDK mode on Linux
 
 ## Status
-**MOSTLY FIXED, ONE RESIDUAL STILL OPEN.** The POSIX-permissions bug this
-doc originally covers was fixed 2026-07-22 on `dev`. But
-`org.h2.test.unit.TestFileSystem` — the affected test class — is **still
-not a clean PASS**: it now fails at a distinct, unrelated assertion (see
-"Residual not fixed here" below), confirmed still reproducing as of
-2026-07-23 against current `dev` (see "Independent reconfirmation"). Moved
-back from `docs/internal/` to `docs/known-issues/` for that reason — per
-this repo's convention, a doc stays in `known-issues/` as long as any of
-its affected test classes has an open sub-item, even if the doc's headline
-bug is fixed. Originally opened 2026-07-21 as
+**FIXED, PLUS FIVE MORE RESIDUAL BUGS FOUND AND FIXED IN THE SAME CHAIN — ONE
+NEW, UNRELATED RESIDUAL REMAINS OPEN.** The POSIX-permissions bug this doc
+originally covers was fixed 2026-07-22 on `dev`. A 2026-07-23 follow-up
+session set out to close the `TestFileSystem` residual chain and, by fixing
+each failure in turn, found and fixed five more independent real bugs the
+class was hiding behind the first one (see "Residual chain fixed
+2026-07-23" below). After all six fixes, `TestFileSystem` progresses much
+further than before but still does not reach a clean PASS — it now hangs in
+`testConcurrent` against the `async:` filesystem, a genuinely separate,
+deeper JIT/threading bug tracked in its own new doc,
+[`bug-h2-testfilesystem-testconcurrent-async-hang.md`](bug-h2-testfilesystem-testconcurrent-async-hang.md).
+Kept in `docs/known-issues/` per this repo's convention (a doc stays open as
+long as any affected test class has an open sub-item — `TestFileSystem`
+still does, just for a different reason now). Originally opened 2026-07-21 as
 `docs/known-issues/h2-suite-bugs/bug-h2-files-setposixfilepermissions-unsupported.md`.
 
 ## Severity (as filed)
@@ -21,9 +25,11 @@ supported.
 
 ## Affected test classes
 - `org.h2.test.unit.TestFileSystem` (`testSetReadOnly`) — the specific
-  `setReadOnly()`/`setPosixFilePermissions` path is fixed; the class as a
-  whole is **still not a clean PASS** because of an unrelated, pre-existing
-  bug further down in the same class — see "Residual not fixed here" below.
+  `setReadOnly()`/`setPosixFilePermissions` path is fixed. The class as a
+  whole is **still not a clean PASS**, but the blocker is now
+  `testConcurrent`'s `async:`-filesystem hang (separate doc, see Status
+  above) — every other sub-test, including the read-only-`FileChannel`
+  residual originally flagged here, is now fixed (see below).
 - `org.h2.test.unit.TestTraceSystem` (`testReadOnly`) — **fully fixed**,
   confirmed by rerunning the real class end-to-end (see Verification).
 
@@ -116,39 +122,89 @@ last-write-wins native registry) already correctly checked
 existence-only) was fixed to match anyway, since a registration-order change
 would otherwise silently resurrect the bug.
 
-## Residual NOT fixed here (new, separate finding)
-Rerunning the real `org.h2.test.unit.TestFileSystem` end-to-end (not just the
-`testSetReadOnly` sub-test) shows the class still fails — but now at
-`testSimple()` (`TestFileSystem.java:495`), unrelated to POSIX permissions:
-```
-AssertionError: Expected an exception of type NonWritableChannelException to
-be thrown, but the method returned sun.nio.ch.FileChannelImpl@...
-```
-`FileUtils.open(path, "r")` (read-only mode) returns a `FileChannel` that
-still permits `.write()`/`.truncate()` — CratonVM's `FileChannel.open`/mode
-dispatch doesn't enforce the read-only open mode. This is a distinct bug in
-file-channel open-mode handling, not in POSIX attribute views; it does not
-block `testSetReadOnly` (which runs and passes earlier in the same class,
-confirmed by execution reaching the later, unrelated failure). Flagged as a
-follow-up, not fixed in this session.
+## Residual chain fixed 2026-07-23
 
-### Independent reconfirmation (2026-07-23, new `apps/h2database-suite-runner`)
+The original doc's own residual (`FileChannel.write()`/`truncate()` not
+enforcing read-only open mode) turned out to be the first of a chain of six
+independent bugs, each blocking `TestFileSystem` at a different point. Fixed
+in order, in `fix/h2-filechannel-readonly-mode-20260723`:
 
-A new Linux suite runner (`apps/h2database-suite-runner`, see its own
-`RESULTS-20260723.md`) ran the full 218-class H2 suite against a `dev`
-binary built well after this doc's fix landed, and independently hit the
-exact same residual, byte-for-byte the same stack shape:
+1. **`sun/nio/ch/FileChannelImpl.truncate` didn't check `writable`.** A
+   Kafka-motivated native override registered directly on the *concrete*
+   class `sun/nio/ch/FileChannelImpl` (bug-27, `native-builtins/src/lib.rs`)
+   completely bypasses that method's real bytecode — including the
+   `writable` field check real bytecode does before throwing
+   `NonWritableChannelException`. `write()` had no such concrete-class
+   override, so it already worked correctly via real bytecode; only
+   `truncate()` needed the check added. This is the original symptom:
+   `FileUtils.open(path, "r")` then `.write()`/`.truncate()` silently
+   "succeeded" instead of throwing.
+2. **Same method didn't respect "no-op when new size >= current size".**
+   The bug-27 override unconditionally called `rw_set_length(fd, new_len)`,
+   which *grows* (zero-extends) the file when `truncate()` is called with a
+   size larger than the current one — real `FileChannel.truncate()` is a
+   no-op in that case. Caught by `testRandomAccess`, which runs the same op
+   sequence against a real `RandomAccessFile` oracle.
+3. **`Files.move(Path, Path, CopyOption...)` never checked
+   `REPLACE_EXISTING`.** It called `std::fs::rename` directly — unconditional
+   POSIX `rename(2)` semantics — so a target that already existed was
+   silently overwritten instead of throwing `FileAlreadyExistsException`
+   (H2's `FilePathDisk.moveTo(newName, false)` catches that and converts it
+   to `DbException`). Caught by `testMoveTo`.
+4. **`AsynchronousFileChannel.read`/`write` (native-io) returned a bare
+   unboxed `Value::Int` inside their completed `Future`.**
+   `Future<Integer>.get()`'s real bytecode does `checkcast Integer` on the
+   result — a bare int crashed the whole VM ("internal error: checkcast:
+   not an object reference") the first time `testConcurrent` exercised the
+   `async:` filesystem. Fixed by boxing via the existing (but, on this path,
+   unused) `afc_box_integer` helper, matching the sibling
+   `CompletionHandler`-based overloads that already did this correctly.
+5. **`AsynchronousFileChannel.tryLock(long, long, boolean)` was completely
+   unregistered** (`AbstractMethodError: method ... has no Code attribute`
+   — it really is abstract in the JDK, with no fallback bytecode path).
+   Fixed by building a real `sun/nio/ch/FileLockImpl` via its
+   `(AsynchronousFileChannel, long, long, boolean)` constructor. That
+   exposed a second gap: `FileLockImpl.release()`'s real bytecode does
+   `instanceof FileChannelImpl` / `instanceof AsynchronousFileChannelImpl`
+   to decide how to update the JDK's internal per-file lock table — our
+   synthetic (literal-class-named) `AsynchronousFileChannel` matches
+   neither, hitting the bytecode's `AssertionError` fallback branch. Fixed
+   with a class-level override on `FileLockImpl.release()` that replicates
+   the real control flow exactly (so real `FileChannel`-based locks, which
+   worked correctly before via pure real bytecode, are unaffected) and only
+   substitutes behavior for the synthetic-channel case.
+6. **`AsynchronousFileChannel.write`/`truncate` didn't check writability**,
+   throwing a generic `IOException` ("channel was not opened for writing")
+   instead of `NonWritableChannelException` — the same contract gap as #1,
+   just in the async implementation. Fixed the same way.
 
-```
-[cratonvm] main-vm run() returned Err: Exception in thread "main" java/lang/AssertionError: Expected an exception of type NonWritableChannelException to be thrown, but the method returned sun.nio.ch.FileChannelImpl@15956
-	at org/h2/test/unit/TestFileSystem.testSimple(TestFileSystem.java:495)
-	at org/h2/test/TestBase.assertThrows(TestBase.java:1607)
-	at org/h2/test/TestBase.checkException(TestBase.java:1665)
-```
+Each fix was verified independently: after each one, `TestFileSystem`'s
+failure moved forward to a *new*, previously-unreached assertion or
+exception — never regressed to an earlier failure — confirming the fixes
+compose correctly rather than papering over each other.
 
-Confirms this residual is still live on current `dev`, not stale — worth
-picking up as its own follow-up (`FileChannel` read-only open-mode
-enforcement).
+**Full 218-class H2 suite regression check** (same binary, `--jit on`,
+`--class-to 90`, Azure Linux host) after all six fixes: **PASS 144 / HANG 53
+/ FAIL 20 / CRASH 1**, versus the same-day pre-fix baseline (`RESULTS-20260723.md`,
+before this session's fixes landed) of **PASS 139 / HANG 60 / FAIL 19 /
+CRASH 0** — a net improvement (+5 PASS, −7 HANG). The one new `FAIL`
+(`org.h2.test.unit.TestFileLock`) and the one `CRASH`
+(`org.h2.test.unit.TestTimeStampWithTimeZone`) were both inspected and are
+unrelated to this chain: `TestFileLock` exercises H2's own hand-rolled
+`org.h2.store.FileLock` lock-file protocol (nothing to do with
+`java.nio.channels.FileLock`), and `TestTimeStampWithTimeZone` panics inside
+`java/time/ZoneRegion.ofId` value-stack indexing, unrelated to any file/NIO
+code touched here.
+
+## New residual: `testConcurrent` hangs against the `async:` filesystem
+With the above six fixes in place, `TestFileSystem` reaches `testConcurrent`
+for the first time (previously blocked earlier in the class) and hangs
+there running against the `async:` filesystem prefix. Live-gdb evidence
+narrows this to the JIT's on-stack-replacement (`CompilationPolicy` mutex)
+subsystem interacting with a `LinkedHashMap.put()` eviction callback under
+real multi-thread contention — a genuinely separate, deeper bug, **not**
+part of this doc's scope. Tracked in its own doc:
+[`bug-h2-testfilesystem-testconcurrent-async-hang.md`](bug-h2-testfilesystem-testconcurrent-async-hang.md).
 
 ## Verification
 - Standalone repro (`Files.createTempFile` → read/clear/restore permissions
@@ -158,11 +214,19 @@ enforcement).
   exceptions, no flakiness.
 - `org.h2.test.unit.TestTraceSystem` (real class, full run): **PASS** (was
   the UOE crash above).
-- `org.h2.test.unit.TestFileSystem` (real class, full run): `testSetReadOnly`
-  confirmed passing (execution progresses to the later, unrelated
-  `testSimple` failure described above — proof the fixed code path actually
-  ran and succeeded, not just a synthetic probe).
+- `org.h2.test.unit.TestFileSystem` (real class, full run): `testSetReadOnly`,
+  `testSimple`, `testRandomAccess`, `testMoveTo`, `testDirectories`, and
+  `testTempFile` all confirmed passing after the 2026-07-23 residual-chain
+  fixes (execution now progresses all the way to `testConcurrent`, the new
+  residual above).
 - `org.h2.test.unit.TestFile` (real class, full run): PASS, no regression.
-- Built with `CARGO_PROFILE_RELEASE_LTO=off` on the Azure Linux host in an
-  isolated worktree/branch (`fix/h2-posix-permissions-20260722`), not the
-  shared main checkout.
+- Standalone `FileChannel`/`Files.move`/`AsynchronousFileChannel` repro
+  programs (read-only write/truncate, move-onto-existing-file,
+  `AsynchronousFileChannel.open`+`write`+`tryLock`+`release`) all confirmed
+  matching real HotSpot JDK25 behavior.
+- Full 218-class H2 suite regression sweep (see above): net improvement,
+  no regression attributable to these fixes.
+- Built with `CARGO_PROFILE_RELEASE_LTO=off` on the Azure Linux host in
+  isolated worktrees/branches (`fix/h2-posix-permissions-20260722` for the
+  original fix, `fix/h2-filechannel-readonly-mode-20260723` for the
+  residual chain), not the shared main checkout.
