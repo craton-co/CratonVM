@@ -14699,6 +14699,16 @@ fn invoke_on_class_shared_inner(
                                 (method_name, descriptor),
                                 ("<init>", "(Ljava/io/InputStream;)V") | ("skip", "(J)J")
                             ))
+                        // The real-JDK base implementation deliberately
+                        // throws UnsupportedOperationException. CratonVM's
+                        // FileSystemProvider bridge opens the corresponding
+                        // fd-backed FileChannel instead; without admitting it
+                        // here, FileChannel.open() on the default provider
+                        // never reaches the registered native.
+                        || (class_name == "java/nio/file/spi/FileSystemProvider"
+                            && method_name == "newFileChannel"
+                            && descriptor
+                                == "(Ljava/nio/file/Path;Ljava/util/Set;[Ljava/nio/file/attribute/FileAttribute;)Ljava/nio/channels/FileChannel;")
                         // Mockito's Java-9 member accessor eagerly bootstraps
                         // Byte Buddy just to choose its instrumentation path.
                         // Use the registered bridge to its built-in reflection

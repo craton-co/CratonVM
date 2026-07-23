@@ -27683,6 +27683,22 @@ fn force_native_over_real_jdk_bytecode(
     if is_file_channel_impl_open_native_override(class_name, method_name, method_descriptor) {
         return true;
     }
+    // Keep the cached virtual-call path aligned with vm_exec's
+    // FileSystemProvider.newFileChannel override. The real base method is a
+    // deliberate UnsupportedOperationException stub; the registered native
+    // constructs CratonVM's fd-backed FileChannel for the default provider.
+    if matches!(
+        class_name,
+        "java/nio/file/spi/FileSystemProvider"
+            | "sun/nio/fs/WindowsFileSystemProvider"
+            | "sun/nio/fs/UnixFileSystemProvider"
+    )
+        && method_name == "newFileChannel"
+        && method_descriptor
+            == "(Ljava/nio/file/Path;Ljava/util/Set;[Ljava/nio/file/attribute/FileAttribute;)Ljava/nio/channels/FileChannel;"
+    {
+        return true;
+    }
     if is_native_thread_set_native_override(class_name, method_name, method_descriptor) {
         return true;
     }
@@ -28485,6 +28501,39 @@ fn intercept_force_registered_native(
     method_descriptor: &str,
     args: &[Value],
 ) -> Option<Result<CachedCallResult, MethodCallFailed>> {
+    // FileChannel.open() invokes FileSystemProvider.newFileChannel through a
+    // default-provider receiver (WindowsFileSystemProvider on this host),
+    // while the fd-backed native is registered on the JDK base class. Route
+    // the forced call to that base registration explicitly so a cached
+    // runtime receiver name cannot bypass it and run the JDK's deliberate
+    // UnsupportedOperationException stub.
+    if method_name == "newFileChannel"
+        && method_descriptor
+            == "(Ljava/nio/file/Path;Ljava/util/Set;[Ljava/nio/file/attribute/FileAttribute;)Ljava/nio/channels/FileChannel;"
+        && matches!(
+            class_name,
+            "java/nio/file/spi/FileSystemProvider"
+                | "sun/nio/fs/WindowsFileSystemProvider"
+                | "sun/nio/fs/UnixFileSystemProvider"
+        )
+    {
+        let cb = shared.native_methods.find(
+            "java/nio/file/spi/FileSystemProvider",
+            method_name,
+            method_descriptor,
+        )?;
+        return Some((|| {
+            let result = crate::vm::safe_native_call(shared, thread, cb, args)?;
+            if let Some(value) = result {
+                push_invoke_return_value(
+                    &mut thread.frames[frame_idx].stack,
+                    coerce_value_for_return(value, crate::jit::return_type(method_descriptor)),
+                )?;
+                crate::vm::native_return_pushed_to_stack(shared, thread);
+            }
+            Ok(CachedCallResult::Handled)
+        })());
+    }
     // The resource-name argument is specified to be non-null for every
     // ClassLoader resource accessor.  A virtual call whose constant-pool
     // owner is ClassLoader can resolve to an inherited cached method on a
