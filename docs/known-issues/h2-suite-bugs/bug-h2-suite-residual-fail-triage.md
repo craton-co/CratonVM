@@ -1562,5 +1562,64 @@ extra logging on real HotSpot, ever transiently hold a stale old-store
 `Page` reference the way this trace shows CratonVM doing? If HotSpot
 provably never does, that argues for (b) above rather than (a)).
 
-Fix commits (both dispatch fixes plus this tracing) landed on `dev` via
-branch `fix/h2-testupgrade-round7-20260723`.
+
+
+### Same-session addendum #3: fixed a real receiver GC-forwarding gap too
+### (`peek_at` without forwarding) — also NOT sufficient, and this matters
+
+`execute_invokevirtual_vtable_fast` and three arms of
+`execute_invokevirtual_cached` (`VirtualBytecode`, `VirtualNative`,
+`Intrinsic`) all obtain the dispatch receiver via a bare
+`stack.peek_at(num_params)` and immediately call `shared.heap.class_id_of`/
+`kind_of` on it to pick the dispatch target — with **no**
+`load_and_forward` barrier, unlike `execute_invoke_kind`'s slow path (where
+the receiver is `args[0]`, covered by the args-forwarding loop). This is a
+real gap of the same shape as addendum #1's fix, and matters specifically
+because the compareAndSetRoot corruption (addendum #1) was caught via
+`[CASROOT-TRACE/vtfast]` — i.e. `execute_invokevirtual_vtable_fast`, one of
+the exact functions with this gap, dispatching on a receiver
+(`this.root.map`) obtained via two chained `getfield`s immediately before
+the call. Fixed by forwarding the receiver in all 4 sites. Verified
+harmless (`TestAlter`, `TestShell`, `TestLinkedTable` — clean) and a clean
+release build.
+
+**Also confirmed NOT sufficient to close `TestUpgrade`** — rebuilt, reran
+`--nojit`, identical `NoSuchMethodError` still reproduces. This is a
+meaningful negative result, not just another miss: it positively rules out
+the entire "stale from-space address" theory as the mechanism, for BOTH
+the argument-popping window (addendum #1) and the receiver-peek window
+(this addendum). The wrong `RootReference`/`MVMap` object reaching
+`compareAndSetRoot` is not a dangling/moved pointer being misread — it is
+a **genuinely live, correctly-allocated object of the wrong class**
+already sitting in the field/slot the interpreter reads. Every GC-timing
+hypothesis this doc's history has proposed (this session's addenda, and
+the sixth pass's cross-thread-race and stale-argument theories) is now
+either fixed-and-ruled-out or directly refuted. The bug is a **logic**
+error in which object ends up written where, not a **memory-safety**
+error in how an already-correct object reference is read.
+
+**Suggested different approach for whoever continues**: printf-style
+tracing keeps requiring a correct a-priori guess of which single call site
+to instrument, and this session burned 4 rounds (`tryUpdate`,
+`compareAndSetRoot`, `Page.<init>`, `Page.copy()`) narrowing without
+closing. Two structurally different approaches likely to be more
+productive from here:
+1. **Trace every write to `RootReference.root` / every write to
+   `Page.map`** unconditionally (not just at hand-picked call sites) for
+   the duration of a single `TestUpgrade` run, keyed by object identity, to
+   build a complete provenance chain for the ONE `Page` that ends up with
+   the wrong `map` — rather than checking individual call sites one at a
+   time on each pass.
+2. Actually run `Upgrade.upgrade()`'s migration logic under real HotSpot
+   with the same kind of instrumentation (temporarily patched into a local
+   H2 build) to see whether a transient old-store `Page` reference is
+   EVER legitimately reachable mid-migration on HotSpot too — this would
+   distinguish "CratonVM corrupts something H2 never exposes" from "H2
+   itself relies on some ordering/timing guarantee CratonVM does not
+   provide," which have very different fixes.
+
+`CRATONVM_DBG_LOADER_TRACE=1 --nojit org.h2.test.unit.TestUpgrade`
+continues to reproduce in well under 5 minutes.
+
+Fix commits (all three dispatch/GC-forwarding fixes plus the tracing
+additions) landed on `dev` via branch `fix/h2-testupgrade-round7-20260723`.
