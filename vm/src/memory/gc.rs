@@ -202,6 +202,12 @@ pub fn update_all_roots(
         return;
     }
     gcpart_record(shared.heap.collection_count(), pointer_map);
+    crate::runtime::interpreter::remap_trace_push(
+        shared,
+        thread,
+        "initiator",
+        &format!("map={}", pointer_map.len()),
+    );
 
     // JNI local references (INT-2): rewrite THIS thread's `JNI_LOCAL_FRAMES`
     // handles through the pointer map. The scan half

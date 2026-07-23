@@ -1171,6 +1171,20 @@ fn safe_native_call_impl(
             }
             if let Some(o) = value_as_validated_object_ref(shared, *v) {
                 thread.native_pending_return = Some(o);
+                if crate::runtime::interpreter::remap_trace_on() {
+                    let site = thread
+                        .frames
+                        .last()
+                        .map(|f| {
+                            format!("{}.{} pc={}", f.class_name(), f.method_name(), f.pc)
+                        })
+                        .unwrap_or_default();
+                    crate::runtime::interpreter::nret_record(
+                        callback as usize,
+                        o.as_ptr() as usize,
+                        &site,
+                    );
+                }
             }
             if crate::memory::gc::altrace_enabled_vm() {
                 if let Value::Object(Some(o)) = v {
@@ -1988,6 +2002,16 @@ impl<'a> NativeContextImpl<'a> {
     }
 
     fn deposit_root_snapshot_inner(&self, raise_blocked_flag: bool) {
+        crate::runtime::interpreter::remap_trace_push(
+            self.shared,
+            self.thread,
+            if raise_blocked_flag {
+                "deposit-block"
+            } else {
+                "deposit-wake"
+            },
+            "",
+        );
         // fork6 GC_STRESS fix — flush this thread's SATB buffer before it
         // blocks. A concurrent old-gen remark drains only the GLOBAL queue;
         // a thread that logged pre-barrier entries (overwritten refs during
@@ -2357,6 +2381,12 @@ impl<'a> NativeContextImpl<'a> {
             let mut f = self.thread.gc_block_state.fixup.lock();
             std::mem::take(&mut *f)
         };
+        crate::runtime::interpreter::remap_trace_push(
+            self.shared,
+            self.thread,
+            "wake",
+            &format!("fixup={}", fixup.len()),
+        );
         if !fixup.is_empty() {
             // BUG-03 trace (gated): record that the blocked-wake remap ran for main.
             if self.thread.thread_id.0 == 0 && std::env::var_os("CRATONVM_DBG_BUG03").is_some() {
@@ -17661,11 +17691,43 @@ fn invoke_on_class_shared_inner(
                                 "  NSME-RECV [gcpart] epoch={e} map_len={mlen} moved_to={moved_to:x?} appears_as_dest={as_dest}"
                             );
                         }
+                        if crate::runtime::interpreter::remap_trace_on() {
+                            eprintln!(
+                                "  NSME-RECV [trace]\n    {}",
+                                crate::runtime::interpreter::remap_trace_dump()
+                            );
+                            for (ago, cb, site) in crate::runtime::interpreter::nret_find(addr) {
+                                eprintln!(
+                                    "  NSME-RECV [nret] returned {} native-returns ago by {} at {}",
+                                    ago,
+                                    cratonvm_native_api::native_ring::name_of(cb)
+                                        .unwrap_or_else(|| format!("<cb@{cb:#x}>")),
+                                    site,
+                                );
+                            }
+                            for (ago, parent, fidx) in
+                                crate::runtime::interpreter::getfield_ring_find(addr)
+                            {
+                                let cur = shared
+                                    .heap
+                                    .is_object_address(parent)
+                                    .map(|p| format!("{:?}", shared.heap.get_field(p, fidx)))
+                                    .unwrap_or_else(|| "<parent-not-obj>".into());
+                                eprintln!(
+                                    "  NSME-RECV [getfield] pushed {} getfields ago from parent=0x{parent:x} fld[{fidx}] — parent's field NOW = {cur}",
+                                    ago,
+                                );
+                            }
+                        }
                         for (fi, f) in thread.frames.iter().enumerate().rev().take(6) {
                             if let Some(loc) = f.dbg_locate_addr(addr) {
                                 eprintln!("  NSME-RECV LOCATE frame#{fi} {loc}");
                             }
                             eprintln!("  NSME-RECV RAWSTACK frame#{fi}{}", f.dbg_stack_dump());
+                            eprintln!(
+                                "  NSME-RECV POPPED frame#{fi}{}",
+                                f.stack.dbg_dump_popped(5)
+                            );
                         }
                     }
                 }

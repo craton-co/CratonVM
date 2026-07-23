@@ -1343,6 +1343,31 @@ impl ValueStack {
         s
     }
 
+    /// stw-residual-close debug: dump the raw bits + kind of up to `extra`
+    /// slots ABOVE the current `len` — physically still present in the
+    /// backing Vec after a pop (an invoke's just-popped receiver+args). Only
+    /// meaningful immediately after the pop that consumed them; used by the
+    /// stale-recv / nsme_dispatch capture dumps.
+    #[doc(hidden)]
+    pub fn dbg_dump_popped(&self, extra: usize) -> String {
+        use std::fmt::Write as _;
+        let mut s = String::new();
+        let hi = (self.len + extra).min(self.max_size);
+        for i in self.len..hi {
+            let cv = self.slots[i];
+            let _ = write!(
+                s,
+                " [+{}]kind={} is_obj={} obj={:?} raw=0x{:x};",
+                i - self.len,
+                self.kinds[i],
+                cv.is_object(),
+                cv.as_object_ptr().map(|p| p as usize),
+                cv.raw_bits()
+            );
+        }
+        s
+    }
+
     /// BUG-03 debug: locate `addr` among the operand-stack slots + report kind.
     #[doc(hidden)]
     pub fn dbg_locate_addr(&self, addr: usize) -> Option<String> {
