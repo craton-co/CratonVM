@@ -1,6 +1,7 @@
 # Stale refs surfacing on interpreter operand stacks after a nested allocating call — the residual core of the WildFly cid=0 family
 
-Status: **RE-CHARACTERIZED 2026-07-23; fatal member FIXED; one non-fatal shape remains OPEN.**
+Status: **RE-CHARACTERIZED 2026-07-23; fatal member FIXED (producer #11); dominant non-fatal
+producer FIXED (producer #12, `6e10cba68`) — residual tail ~1.2%/boot, non-fatal, OPEN.**
 This doc previously attributed the family to a frame-slot scan/remap gap in the moving collector's
 interpreter frame walk. A full forensic campaign (worktree
 `/data/wt-stw-residual-close-20260722`, branch `fix/wildfly-stw-residual-close-20260722`) DISPROVED
@@ -63,6 +64,26 @@ stale push; with an nret hit = a native return (the nret site names it). One cam
 carrying this (first is `cvm-stw-close-20260722-fix9`+) should name the holder directly.
 Harness: `probes/batch.sh` (P=4) in the worktree above; pre-fix event rate ~3-4%/boot ⇒ ~10-15
 captures per 320-boot campaign.
+
+### Producer #12 — `append(Object)`/`append(CharSequence)` re-entrant toString (FIXED `6e10cba68`)
+
+The bytecode of `ClassToExternalizerMap.toString` settled the sb-chain shape: the poisoned links
+are chained returns of **`StringBuilder.append(Ljava/lang/Object;)`** (pcs 110/148: `keys[i]` — a
+`Class` — and `values[i]` — an `AdvancedExternalizer`). `native_sb_append_object` captured `this`
+raw, ran `invoke_to_string(obj)` — a re-entrant `obj.toString()` (the captures' 71-frame
+`Unsafe.allocateUninitializedArray0` dives are `Class.toString()`'s string concat) — then appended
+into and RETURNED the raw copy. Same class as producer #11; same fix (pin + `read_native_pin`,
+applied to append_object, append_charsequence, the off/len and repeat variants, and
+`String.replace(CharSequence,CharSequence)`).
+
+**Verification (campaign `out-run12`, 320 boots):** stale-recv events 2 (0.63%) vs 8-12/320
+(2.5-3.8%) one fix earlier; fatal `NSMEDX` 0 — now 960 consecutive fatal-NSME-free boots across
+campaigns 10-12. Remaining tail in run12: 2 healed stale-recv + 1 `checkcast PathAddress` CCE-BT +
+1 `WFLYCTL0079 org.jboss.as.transactions` rollback-exit ≈ 1.2%/boot — the same long-tail signature
+family, almost certainly further members of the SAME re-entrant-native class. Pickup: a static
+sweep of every native that calls `invoke_virtual`/`invoke_to_string`/`invoke_interface` after
+capturing raw `ObjectRef`s (the `stale-objectref-static-sweep` methodology), or keep flywheeling
+captures — each now self-describes via the landed forensics.
 
 ### Push-provenance result (2026-07-23, campaign `out-run11`, binary fix9)
 
