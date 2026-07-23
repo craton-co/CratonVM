@@ -463,24 +463,58 @@ budget — flagged for a dedicated follow-up):
   `tomcat_scanner` failures unrelated to this change). Commit `0bd8213de`,
   merged `6a5f3db42`, pushed to dev.
 
-  **Residual (bug 5, still open)**: both disambiguated-qualifier test
-  methods still fail, now with `org.mockito.exceptions.misusing.
-  UnfinishedVerificationException` instead of a crash — a DIFFERENT
-  failure mode that the AIOOBE was masking. Reproduced in isolation
-  (`LengthSubstringProbe.java`, `AmbiguousProbe.java`): calling
-  `mock.length()` then `mock.substring(0)`, then
-  `verify(mock, times(1)).length()` then
-  `verify(mock, times(1)).substring(anyInt())`, throws
-  `UnfinishedVerificationException` at an INCONSISTENT point (sometimes
-  the first `verify()`, sometimes the second) between two structurally
-  identical probes — ruling out a simple ordering bug and pointing at a
-  timing- or identity-sensitive issue in Mockito's `MockingProgress`
-  pending-verification tracking (a `ThreadLocal<MockingProgress>` in real
-  Mockito). Ruled out so far: `length()` alone + `verify(times(N))`
-  repeated works fine (`LengthRepeatProbe`); `substring(0)` alone +
-  `verify()` works fine (`SubstringVerifyProbe`); only the COMBINATION of
-  both methods on the same mock, each wrapped in its own `verify()`,
-  reproduces it. Not yet root-caused.
+  **Residual (bug 5, root-caused, NOT fixed)**: both disambiguated-qualifier
+  test methods still fail, now with `org.mockito.exceptions.misusing.
+  UnfinishedVerificationException` instead of a crash — a DIFFERENT failure
+  mode that the AIOOBE was masking. Root cause (confirmed via
+  `InvocationCountProbe.java`, which reflectively inspects
+  `Mockito.mockingDetails(mock).getInvocations()` after each step):
+  `length()` is (and must stay) on `is_string_builder_layout_native_override`'s
+  blanket-immune allowlist, so it is ALWAYS dispatched to the native
+  implementation — for a mock receiver just as much as a real one — and
+  NEVER reaches Mockito's woven advice. `verify(mock, times(1)).length()`
+  therefore doesn't fail loudly; it just calls the native, returns `0`, and
+  never performs any actual Mockito verification, leaving the
+  "verification pending" flag `verify()` set BEFORE the call permanently
+  un-cleared. The NEXT `verify()` call in the test — for a completely
+  different method (`substring(anyInt())`) — is the one whose own
+  `MockingProgressImpl.validateState()` check notices the orphaned pending
+  flag and throws, misleadingly pointing at itself
+  ("Missing method call for verify(mock) here" at the SECOND verify's own
+  line) when the real culprit is the FIRST, silently-no-op'd
+  `verify(...).length()`.
+
+  A per-instance "is this receiver actually a Mockito mock" check was
+  attempted (mirroring the existing `java/net/HttpURLConnection`
+  real-carrier exemption in `intercept_force_registered_native`, gated on
+  field 0 — the char[] buffer — being non-null) and reverted: CratonVM's
+  synthetic StringBuilder layout populates field 0 with a default
+  16-char-capacity buffer AT OBJECT ALLOCATION, not at `<init>` time, so an
+  Objenesis-constructed mock (whose `<init>` never runs) is indistinguishable
+  from a real instance by this or any other field/array-shape heuristic
+  (confirmed via direct `arr_len` instrumentation — both read `16`
+  immediately after construction). A correct fix needs an AUTHORITATIVE
+  is-mock signal — e.g. a callback from the dispatch layer into
+  `MockMethodDispatcher.get(identifier, instance).isMocked(instance)`
+  (the exact check Mockito's own woven advice already performs) — which is
+  a real engineering task (a Rust-native → Java call-back path, plus
+  recovering the per-mock-maker `identifier` string), not a quick
+  per-instance heuristic. Left open for a follow-up session.
+
+  Investigation artifacts (Azure host,
+  `/data/tmp/mockitobean-substring-20260723/`, none checked in):
+  `LengthSubstringProbe.java`, `AmbiguousProbe.java`,
+  `TwoMockLengthSubstringProbe.java`, `LengthRepeatProbe.java`,
+  `SubstringVerifyProbe.java`, `InvocationCountProbe.java`,
+  `Field0Probe.java`. Ruled out along the way: `length()` alone +
+  `verify(times(N))` repeated works fine (`LengthRepeatProbe`) —
+  `verify()` genuinely re-executes and re-validates each time, it just
+  never has anything pending to conflict with when it's the ONLY method
+  ever verified; `substring(0)` alone + `verify()` works fine
+  (`SubstringVerifyProbe`) since `substring(int)` correctly reaches the
+  woven advice (bug 3's fix); only the COMBINATION — `length()`'s silent
+  no-op leaving state pending, followed by ANY other `verify()` call —
+  reproduces it.
 - **`test.context.junit.jupiter.event.ParallelApplicationEventsIntegrationTests`**
   (0/2) — `executeTestsInParallelWithInstancePerMethod` fails an AssertJ
   `MultipleFailuresError` ("Test Event Statistics", 2 failures);
