@@ -605,10 +605,15 @@ fn decrypt_pbes2_params(params_der: &[u8], ciphertext: &[u8], password: &[u8]) -
 }
 
 fn decrypt_pbes2_content(content: &p12::EncryptedContentInfo, password: &[u8]) -> Option<Vec<u8>> {
-    let p12::AlgorithmIdentifier::OtherAlg(algorithm) = &content.content_encryption_algorithm else {
+    let p12::AlgorithmIdentifier::OtherAlg(algorithm) = &content.content_encryption_algorithm
+    else {
         return None;
     };
-    decrypt_pbes2_params(algorithm.params.as_deref()?, &content.encrypted_content, password)
+    decrypt_pbes2_params(
+        algorithm.params.as_deref()?,
+        &content.encrypted_content,
+        password,
+    )
 }
 
 fn decrypt_secret_pbes2(epk: &p12::EncryptedPrivateKeyInfo, password: &[u8]) -> Option<Vec<u8>> {
@@ -2886,9 +2891,7 @@ mod tests {
     /// cert `SafeContents`), so build the realistic shape by hand.
     fn synth_unencrypted_content_pkcs12(password: &str) -> Vec<u8> {
         let cert_bag = p12::SafeBag {
-            bag: p12::SafeBagKind::CertBag(p12::CertBag::X509(vec![
-                0x30, 0x03, 0x02, 0x01, 0x00,
-            ])),
+            bag: p12::SafeBagKind::CertBag(p12::CertBag::X509(vec![0x30, 0x03, 0x02, 0x01, 0x00])),
             attributes: vec![],
         };
         let safe_contents =

@@ -8122,6 +8122,44 @@ fn native_spring_has_plain_java_annotations_only_object(
     Ok(Some(Value::Int(0)))
 }
 
+fn spring_extension_invoke_special_anchored_on_test_class(
+    ctx: &mut dyn NativeContext,
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+    test_class: ObjectRef,
+    args: &[Value],
+) -> MethodCallResult {
+    // Shared anchoring helper: invokes a static method on `class_name`,
+    // preferring the copy already loaded by `test_class`'s own defining
+    // loader when that loader is user-defined (see
+    // spring_extension_get_application_context's call site for the full
+    // AOT double-context-refresh rationale). Falls through unchanged to
+    // the original loader-blind ctx.invoke_special by name in every other
+    // case -- purely additive, no behavior change outside forked-loader
+    // tests. Reused for every SpringExtension static call this native
+    // family makes that needs to land on the SAME copy of SpringExtension
+    // the test class's own machinery uses (getApplicationContext,
+    // findProperlyScopedExtensionContext).
+    if let Some(test_class_id) = crate::lang_class::mirror_class_id(ctx, test_class) {
+        let loader_id = ctx.loader_id_of_class(test_class_id);
+        if loader_id >= 3 {
+            if let Some(fork_class_id) =
+                ctx.class_id_defined_by_loader_exact(class_name, loader_id as u32)
+            {
+                return ctx.invoke_by_class_id(
+                    fork_class_id,
+                    class_name,
+                    method_name,
+                    descriptor,
+                    args,
+                );
+            }
+        }
+    }
+    ctx.invoke_special(class_name, method_name, descriptor, args)
+}
+
 fn spring_extension_get_application_context(
     ctx: &mut dyn NativeContext,
     extension_context: ObjectRef,
@@ -8150,31 +8188,23 @@ fn spring_extension_get_application_context(
     // double-context-refresh bug (see
     // docs/known-issues/CRATONVM-SPRING-GENUINE-BUGLIST.md's AOT cluster
     // sections). Anchor resolution on the CURRENT test class's own loader
-    // instead: if that loader is user-defined and it has its own copy of
-    // SpringExtension already loaded, invoke on THAT exact ClassId;
-    // otherwise fall through to the existing, unchanged global behavior.
+    // instead via the shared helper above; falls through to the existing,
+    // unchanged global behavior when there's no fork-loaded copy.
+    let extension_context_for_test_class = extension_context;
     if let Ok(Some(Value::Object(Some(test_class)))) = ctx.invoke_virtual(
-        extension_context,
+        extension_context_for_test_class,
         "getRequiredTestClass",
         "()Ljava/lang/Class;",
         &[],
     ) {
-        if let Some(test_class_id) = crate::lang_class::mirror_class_id(ctx, test_class) {
-            let loader_id = ctx.loader_id_of_class(test_class_id);
-            if loader_id >= 3 {
-                if let Some(fork_class_id) =
-                    ctx.class_id_defined_by_loader_exact(SPRING_EXTENSION, loader_id as u32)
-                {
-                    return ctx.invoke_by_class_id(
-                        fork_class_id,
-                        SPRING_EXTENSION,
-                        "getApplicationContext",
-                        GET_APP_CTX_DESC,
-                        &[Value::Object(Some(extension_context))],
-                    );
-                }
-            }
-        }
+        return spring_extension_invoke_special_anchored_on_test_class(
+            ctx,
+            SPRING_EXTENSION,
+            "getApplicationContext",
+            GET_APP_CTX_DESC,
+            test_class,
+            &[Value::Object(Some(extension_context))],
+        );
     }
 
     ctx.invoke_special(
@@ -8184,7 +8214,6 @@ fn spring_extension_get_application_context(
         &[Value::Object(Some(extension_context))],
     )
 }
-
 fn native_spring_extension_resolve_parameter(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -8233,10 +8262,12 @@ fn native_spring_extension_resolve_parameter(
             ctx.invoke_virtual(executable, "getDeclaringClass", "()Ljava/lang/Class;", &[])
         {
             test_class = declaring;
-            if let Ok(Some(Value::Object(Some(scoped)))) = ctx.invoke_special(
+            if let Ok(Some(Value::Object(Some(scoped)))) = spring_extension_invoke_special_anchored_on_test_class(
+                ctx,
                 "org/springframework/test/context/junit/jupiter/SpringExtension",
                 "findProperlyScopedExtensionContext",
                 "(Ljava/lang/Class;Lorg/junit/jupiter/api/extension/ExtensionContext;)Lorg/junit/jupiter/api/extension/ExtensionContext;",
+                test_class,
                 &[
                     Value::Object(Some(test_class)),
                     Value::Object(Some(extension_context)),
@@ -9821,6 +9852,80 @@ pub(crate) fn jul_logger_handlers_clear(ctx: &mut dyn NativeContext, logger: Obj
     let key = ctx.identity_hash_code(logger);
     if let Some(handle) = jul_logger_handlers_table().lock().unwrap().remove(&key) {
         ctx.remove_global_root(handle);
+    }
+}
+
+/// GC-safe side table for Logger filters. Real JDK loggers keep a Filter in
+/// `Logger$ConfigurationData`, while our compact loggers do not have that
+/// shape; sharing neither raw layout is safe.
+fn jul_logger_filters_table() -> &'static std::sync::Mutex<std::collections::HashMap<i32, usize>> {
+    static T: OnceLock<std::sync::Mutex<std::collections::HashMap<i32, usize>>> = OnceLock::new();
+    T.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn jul_logger_filter_names_table(
+) -> &'static std::sync::Mutex<std::collections::HashMap<String, usize>> {
+    static T: OnceLock<std::sync::Mutex<std::collections::HashMap<String, usize>>> =
+        OnceLock::new();
+    T.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn jul_logger_filter_name(ctx: &mut dyn NativeContext, logger: ObjectRef) -> Option<String> {
+    match ctx.get_field_by_name(logger, "name") {
+        Value::Object(Some(name)) => ctx.read_string(name),
+        _ => match ctx.get_field(logger, LOGGER_FIELD_NAME) {
+            Value::Object(Some(name)) => ctx.read_string(name),
+            _ => None,
+        },
+    }
+}
+
+pub(crate) fn jul_logger_filter_get(
+    ctx: &mut dyn NativeContext,
+    logger: ObjectRef,
+) -> Option<ObjectRef> {
+    let key = ctx.identity_hash_code(logger);
+    if let Some(handle) = jul_logger_filters_table()
+        .lock()
+        .unwrap()
+        .get(&key)
+        .copied()
+    {
+        return ctx.resolve_global_root(handle);
+    }
+    let name = jul_logger_filter_name(ctx, logger)?;
+    let handle = jul_logger_filter_names_table()
+        .lock()
+        .unwrap()
+        .get(&name)
+        .copied()?;
+    ctx.resolve_global_root(handle)
+}
+
+pub(crate) fn jul_logger_filter_set(
+    ctx: &mut dyn NativeContext,
+    logger: ObjectRef,
+    filter: Option<ObjectRef>,
+) {
+    let key = ctx.identity_hash_code(logger);
+    let name = jul_logger_filter_name(ctx, logger);
+    let mut table = jul_logger_filters_table().lock().unwrap();
+    if let Some(handle) = table.remove(&key) {
+        ctx.remove_global_root(handle);
+    }
+    if let Some(name) = &name {
+        if let Some(handle) = jul_logger_filter_names_table().lock().unwrap().remove(name) {
+            ctx.remove_global_root(handle);
+        }
+    }
+    if let Some(filter) = filter {
+        table.insert(key, ctx.add_global_root(filter));
+        if let Some(name) = name {
+            jul_logger_filter_names_table()
+                .lock()
+                .unwrap()
+                .insert(name, ctx.add_global_root(filter));
+        }
     }
 }
 
@@ -25892,52 +25997,6 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         native_jsp_servlet_handle_missing_resource,
     );
 
-    // OutputStreamWriter(OutputStream, CharsetEncoder) -- real bytecode for
-    // this specific constructor overload produces a writer that emits ZERO
-    // bytes for every character written (confirmed by isolated probe: the
-    // (OutputStream, Charset) and (OutputStream, String) overloads work
-    // correctly, only the CharsetEncoder-accepting one is broken). This
-    // silently corrupted org.apache.catalina.util.URLEncoder.encode(String,
-    // Charset) -- which builds its OutputStreamWriter this exact way to
-    // percent-encode unsafe characters -- dropping every encoded character
-    // instead of emitting "%XX", observed as Tomcat manager's "war=" deploy
-    // parameter having every '/' silently stripped. Root cause not fully
-    // understood (a real-bytecode-only bug, no interpreter fix attempted
-    // here); work around by delegating to the proven-working (OutputStream,
-    // Charset) constructor on the same object, reading the Charset off the
-    // caller-supplied CharsetEncoder via its own real charset() accessor.
-    // This loses the caller's chosen malformed-input / unmappable-character
-    // error actions (REPORT vs REPLACE), which no caller in this codebase's
-    // test suites has been observed to depend on.
-    registry.register(
-        "java/io/OutputStreamWriter",
-        "<init>",
-        "(Ljava/io/OutputStream;Ljava/nio/charset/CharsetEncoder;)V",
-        |ctx, args| {
-            let this = args.first().copied().unwrap_or(Value::Object(None));
-            let stream = args.get(1).copied().unwrap_or(Value::Object(None));
-            let encoder = match args.get(2) {
-                Some(Value::Object(Some(e))) => Some(*e),
-                _ => None,
-            };
-            let charset = match encoder {
-                Some(e) => ctx
-                    .invoke_virtual(e, "charset", "()Ljava/nio/charset/Charset;", &[])
-                    .ok()
-                    .flatten()
-                    .unwrap_or(Value::Object(None)),
-                None => Value::Object(None),
-            };
-            ctx.invoke_special(
-                "java/io/OutputStreamWriter",
-                "<init>",
-                "(Ljava/io/OutputStream;Ljava/nio/charset/Charset;)V",
-                &[this, stream, charset],
-            )?;
-            Ok(None)
-        },
-    );
-
     // Real-JDK mode does not call the full synthetic/experimental
     // `register_builtins` surface, but JBoss Marshalling calls
     // `sun.reflect.ReflectionFactory` directly for serialization hooks.
@@ -26815,8 +26874,16 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(Some(Value::Object(None))),
             };
-            let s = ctx.read_string(this).unwrap_or_default();
-            let out = ctx.create_string(&s.to_lowercase());
+            let mut lower = ctx.read_string(this).unwrap_or_default();
+            let changed = if lower.is_ascii() {
+                let changed = lower.bytes().any(|byte| byte.is_ascii_uppercase());
+                lower.make_ascii_lowercase();
+                changed
+            } else {
+                let folded = lower.to_lowercase();
+                if folded == lower { false } else { lower = folded; true }
+            };
+            let out = if changed { ctx.create_string_uninterned_gc_safe(&lower) } else { this };
             Ok(Some(Value::Object(Some(out))))
         },
     );
@@ -26829,8 +26896,16 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(Some(Value::Object(None))),
             };
-            let s = ctx.read_string(this).unwrap_or_default();
-            let out = ctx.create_string(&s.to_uppercase());
+            let mut upper = ctx.read_string(this).unwrap_or_default();
+            let changed = if upper.is_ascii() {
+                let changed = upper.bytes().any(|byte| byte.is_ascii_lowercase());
+                upper.make_ascii_uppercase();
+                changed
+            } else {
+                let folded = upper.to_uppercase();
+                if folded == upper { false } else { upper = folded; true }
+            };
+            let out = if changed { ctx.create_string_uninterned_gc_safe(&upper) } else { this };
             Ok(Some(Value::Object(Some(out))))
         },
     );
@@ -26843,8 +26918,16 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(Some(Value::Object(None))),
             };
-            let s = ctx.read_string(this).unwrap_or_default();
-            let out = ctx.create_string(&s.to_lowercase());
+            let mut lower = ctx.read_string(this).unwrap_or_default();
+            let changed = if lower.is_ascii() {
+                let changed = lower.bytes().any(|byte| byte.is_ascii_uppercase());
+                lower.make_ascii_lowercase();
+                changed
+            } else {
+                let folded = lower.to_lowercase();
+                if folded == lower { false } else { lower = folded; true }
+            };
+            let out = if changed { ctx.create_string_uninterned_gc_safe(&lower) } else { this };
             Ok(Some(Value::Object(Some(out))))
         },
     );
@@ -26857,8 +26940,16 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(Some(Value::Object(None))),
             };
-            let s = ctx.read_string(this).unwrap_or_default();
-            let out = ctx.create_string(&s.to_uppercase());
+            let mut upper = ctx.read_string(this).unwrap_or_default();
+            let changed = if upper.is_ascii() {
+                let changed = upper.bytes().any(|byte| byte.is_ascii_lowercase());
+                upper.make_ascii_uppercase();
+                changed
+            } else {
+                let folded = upper.to_uppercase();
+                if folded == upper { false } else { upper = folded; true }
+            };
+            let out = if changed { ctx.create_string_uninterned_gc_safe(&upper) } else { this };
             Ok(Some(Value::Object(Some(out))))
         },
     );
@@ -32155,6 +32246,15 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         num_fields <= 8
     }
 
+    // The real JDK 25 Thread mirror can be compact at allocation time, so its
+    // field count overlaps the synthetic compatibility layout. Classify the
+    // layout from the declared real-only fields instead of the object size.
+    fn has_real_jdk_thread_layout(ctx: &dyn NativeContext, thread: ObjectRef) -> bool {
+        // Resolve from the receiver: bootstrap class aliases can make a
+        // class-name lookup miss Thread even though the real field is present.
+        matches!(ctx.get_field_by_name(thread, "tid"), Value::Long(_))
+    }
+
     // Real-JDK Thread layout: `priority`, `daemon`, `threadStatus`,
     // `stackSize` live inside a nested `java.lang.Thread$FieldHolder`
     // referenced by `Thread.holder`; only `name`/`holder`/`tid`/etc. are
@@ -35296,7 +35396,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "java/util/logging/Logger",
         "log",
         "(Ljava/util/logging/Level;Ljava/lang/String;Ljava/lang/Throwable;)V",
-        |_ctx, _args| Ok(None),
+        crate::logmanager::native_jul_logger_log_throwable,
     );
     registry.register(
         "java/util/logging/Logger",
@@ -35356,6 +35456,33 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             }
             // Synthetic logger: preserve historic null (inherit from parent).
             Ok(Some(Value::Object(None)))
+        },
+    );
+    registry.register(
+        "java/util/logging/Logger",
+        "setFilter",
+        "(Ljava/util/logging/Filter;)V",
+        |ctx, args| {
+            let Some(Value::Object(Some(logger))) = args.first().copied() else {
+                return Ok(None);
+            };
+            let filter = match args.get(1).copied().unwrap_or(Value::Object(None)) {
+                Value::Object(filter) => filter,
+                _ => None,
+            };
+            jul_logger_filter_set(ctx, logger, filter);
+            Ok(None)
+        },
+    );
+    registry.register(
+        "java/util/logging/Logger",
+        "getFilter",
+        "()Ljava/util/logging/Filter;",
+        |ctx, args| {
+            let Some(Value::Object(Some(logger))) = args.first().copied() else {
+                return Ok(Some(Value::Object(None)));
+            };
+            Ok(Some(Value::Object(jul_logger_filter_get(ctx, logger))))
         },
     );
     registry.register(
@@ -35973,6 +36100,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // register_sslengine_real / register_ssl_session_real precedent for the
     // analogous SSLSession bug, BUG-TC0622).
     crate::phases_late::register_p68_security_cert(registry);
+    register_real_buffer_constructor_natives(registry);
     // WP5.4 — TLS ALPN extension (`h2` / `http/1.1`) and SNI dispatch.
     t27_tls::register_alpn_real(registry);
     // WP5.5 — JDK 11+ java.net.http.HttpClient (sync + async, HTTP/1.1 + HTTP/2).
@@ -40461,7 +40589,17 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
         "java/lang/Thread",
         "setName",
         "(Ljava/lang/String;)V",
-        native_noop_with_this,
+        |ctx, args| {
+            let Some(Value::Object(Some(this))) = args.first() else {
+                return Ok(None);
+            };
+            let name = args.get(1).copied().unwrap_or(Value::Object(None));
+            ctx.set_field_by_name(*this, "name", name.clone());
+            if !has_real_jdk_thread_layout(ctx, *this) && ctx.object_num_fields(*this) > 0 {
+                ctx.set_field(*this, 0, name);
+            }
+            Ok(None)
+        },
     );
     registry.register(
         "java/lang/Thread",
@@ -40720,13 +40858,23 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
     // `ClassCastException: java.lang.Object cannot be cast to okio.Segment`
     // at `SegmentPool.take()` (a `getAndSet` racing to return a value that
     // was neither the expected `Segment`/`null`/the `LOCK` sentinel).
-    // `Thread.threadId()` (JDK 19+, `phases_late.rs`) already does this
-    // correctly via `ctx.thread_id()` -- mirror that exact pattern here so
-    // the legacy, still-widely-called `getId()` returns a real per-thread
-    // identity instead of a constant. `.max(1)` matches `threadId()`'s own
-    // "avoid returning 0 before a positive VM thread id is assigned" guard.
-    registry.register("java/lang/Thread", "getId", "()J", |ctx, _| {
-        Ok(Some(Value::Long(ctx.thread_id().max(1) as i64)))
+    // Both `getId()` and `threadId()` must report the id assigned to their
+    // receiver. The executing VM context is not the receiver when one thread
+    // inspects another, as JULI's ThreadMXBean lookup does below.
+    registry.register("java/lang/Thread", "getId", "()J", |ctx, args| {
+        let receiver_tid = args
+            .first()
+            .and_then(|value| match value {
+                Value::Object(Some(thread)) => match ctx.get_field_by_name(*thread, "tid") {
+                    Value::Long(tid) if tid > 0 => Some(tid),
+                    Value::Int(tid) if tid > 0 => Some(tid as i64),
+                    _ => None,
+                },
+                _ => None,
+            });
+        Ok(Some(Value::Long(
+            receiver_tid.unwrap_or_else(|| ctx.thread_id().max(1) as i64),
+        )))
     });
     // Thread.getState() and Thread.threadState() both return Thread$State.
     // In JDK 25, getState() delegates to threadState() which reads
@@ -40763,7 +40911,7 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
             _ => return Ok(None),
         };
         let name = Value::Object(Some(ctx.create_string("Thread")));
-        if is_synthetic_thread_layout(ctx.object_num_fields(this)) {
+        if !has_real_jdk_thread_layout(ctx, this) {
             ctx.set_field(this, 0, name);
             ctx.set_field(this, 1, Value::Int(5));
         } else {
@@ -40784,7 +40932,7 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
                 Value::Object(Some(s)) => Value::Object(Some(s)),
                 _ => Value::Object(Some(ctx.create_string("Thread"))),
             };
-            if is_synthetic_thread_layout(ctx.object_num_fields(this)) {
+            if !has_real_jdk_thread_layout(ctx, this) {
                 ctx.set_field(this, 0, name);
                 ctx.set_field(this, 1, Value::Int(5));
             } else {
@@ -40810,7 +40958,7 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
             };
             let target = args.get(1).copied().unwrap_or(Value::Object(None));
             let name = Value::Object(Some(ctx.create_string("Thread")));
-            if is_synthetic_thread_layout(ctx.object_num_fields(this)) {
+            if !has_real_jdk_thread_layout(ctx, this) {
                 ctx.set_field(this, 0, name);
                 ctx.set_field(this, 1, Value::Int(5));
                 ctx.set_field(this, 3, target);
@@ -40834,7 +40982,7 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
                 Value::Object(Some(s)) => Value::Object(Some(s)),
                 _ => Value::Object(Some(ctx.create_string("Thread"))),
             };
-            if is_synthetic_thread_layout(ctx.object_num_fields(this)) {
+            if !has_real_jdk_thread_layout(ctx, this) {
                 ctx.set_field(this, 0, name);
                 ctx.set_field(this, 1, Value::Int(5));
                 ctx.set_field(this, 3, target);
@@ -40856,7 +41004,7 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
             let group = args.get(1).copied().unwrap_or(Value::Object(None));
             let target = args.get(2).copied().unwrap_or(Value::Object(None));
             let name = Value::Object(Some(ctx.create_string("Thread")));
-            if is_synthetic_thread_layout(ctx.object_num_fields(this)) {
+            if !has_real_jdk_thread_layout(ctx, this) {
                 ctx.set_field(this, 0, name);
                 ctx.set_field(this, 1, Value::Int(5));
                 ctx.set_field(this, 2, group);
@@ -40881,7 +41029,7 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
                 Value::Object(Some(s)) => Value::Object(Some(s)),
                 _ => Value::Object(Some(ctx.create_string("Thread"))),
             };
-            if is_synthetic_thread_layout(ctx.object_num_fields(this)) {
+            if !has_real_jdk_thread_layout(ctx, this) {
                 ctx.set_field(this, 0, name);
                 ctx.set_field(this, 1, Value::Int(5));
                 ctx.set_field(this, 2, group);
@@ -40906,7 +41054,7 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
                 Value::Object(Some(s)) => Value::Object(Some(s)),
                 _ => Value::Object(Some(ctx.create_string("Thread"))),
             };
-            if is_synthetic_thread_layout(ctx.object_num_fields(this)) {
+            if !has_real_jdk_thread_layout(ctx, this) {
                 ctx.set_field(this, 0, name);
                 ctx.set_field(this, 1, Value::Int(5));
                 ctx.set_field(this, 2, group);
@@ -40932,7 +41080,7 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
                 Value::Object(Some(s)) => Value::Object(Some(s)),
                 _ => Value::Object(Some(ctx.create_string("Thread"))),
             };
-            if is_synthetic_thread_layout(ctx.object_num_fields(this)) {
+            if !has_real_jdk_thread_layout(ctx, this) {
                 ctx.set_field(this, 0, name);
                 ctx.set_field(this, 1, Value::Int(5));
                 ctx.set_field(this, 2, group);
@@ -40958,7 +41106,7 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
                 Value::Object(Some(s)) => Value::Object(Some(s)),
                 _ => Value::Object(Some(ctx.create_string("Thread"))),
             };
-            if is_synthetic_thread_layout(ctx.object_num_fields(this)) {
+            if !has_real_jdk_thread_layout(ctx, this) {
                 ctx.set_field(this, 0, name);
                 ctx.set_field(this, 1, Value::Int(5));
                 ctx.set_field(this, 2, group);
@@ -40988,7 +41136,7 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
                 _ => 5,
             };
             let target = args.get(4).copied().unwrap_or(Value::Object(None));
-            if is_synthetic_thread_layout(ctx.object_num_fields(this)) {
+            if !has_real_jdk_thread_layout(ctx, this) {
                 ctx.set_field(this, 0, name);
                 ctx.set_field(this, 1, Value::Int(prio));
                 ctx.set_field(this, 2, group);
@@ -41007,7 +41155,7 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
             _ => return Ok(None),
         };
         let num_fields = ctx.object_num_fields(this);
-        if is_synthetic_thread_layout(num_fields) {
+        if !has_real_jdk_thread_layout(ctx, this) {
             if num_fields >= 4 {
                 if let Value::Object(Some(target)) = ctx.get_field(this, 3) {
                     let _ = ctx.invoke_virtual(target, "run", "()V", &[]);
@@ -42303,6 +42451,10 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
     // --- Phase 25: Utility classes ---
     register_base64_natives(registry);
     register_charset_natives(registry);
+    // Real-JDK charset paths must replace the older phase stubs above. In
+    // particular, CharsetEncoder must preserve configured REPORT/REPLACE
+    // actions rather than unconditionally returning UNDERFLOW.
+    charset::register_real_charset_natives(registry);
 
     // --- Phase 27: java.math ---
     register_biginteger_natives(registry);
@@ -48051,7 +48203,10 @@ fn next_java_thread_tid() -> i64 {
     let offset = thread_next_tid_offset();
     let mut map = lock_unsafe_shard_usize(static_long_store(), offset);
     let entry = map.entry(offset).or_insert(1);
-    let tid = (*entry).max(1);
+    // The VM bootstrap main Thread is already visible as Java id 1 but is
+    // not constructed through this native. Reserve that id before handing
+    // out ids to application-created Thread mirrors.
+    let tid = (*entry).max(2);
     *entry = tid.saturating_add(1);
     tid
 }
@@ -63764,47 +63919,61 @@ pub(crate) fn pem_block_to_der(bytes: &[u8]) -> Vec<u8> {
 }
 
 fn b64_decode(input: &[u8], variant: i32) -> Result<Vec<u8>, String> {
-    // Filter out whitespace and line breaks
-    let filtered: Vec<u8> = input
+    // RFC 4648's basic and URL decoders reject every non-alphabet byte,
+    // including whitespace.  Only MIME decoding ignores whitespace.
+    let filtered: Vec<u8> = if variant == B64_VARIANT_MIME {
+        input
         .iter()
         .copied()
         .filter(|&c| c != b'\r' && c != b'\n' && c != b' ' && c != b'\t')
-        .collect();
+            .collect()
+    } else {
+        input.to_vec()
+    };
 
     let mut out = Vec::with_capacity(filtered.len() * 3 / 4);
     let mut i = 0;
-    let len = filtered.len();
-
-    while i < len {
-        // Skip padding at the end
-        if filtered[i] == b'=' {
-            break;
+    while i < filtered.len() {
+        let remaining = filtered.len() - i;
+        if remaining < 2 {
+            return Err("Incomplete base64 input".to_string());
         }
         let c0 = b64_decode_char(filtered[i], variant)
             .ok_or_else(|| format!("Invalid base64 char: {}", filtered[i] as char))?;
-        if i + 1 >= len {
-            return Err("Incomplete base64 input".to_string());
-        }
         let c1 = b64_decode_char(filtered[i + 1], variant)
             .ok_or_else(|| format!("Invalid base64 char: {}", filtered[i + 1] as char))?;
 
-        let c2 = if i + 2 < len && filtered[i + 2] != b'=' {
-            b64_decode_char(filtered[i + 2], variant)
-                .ok_or_else(|| format!("Invalid base64 char: {}", filtered[i + 2] as char))?
-        } else {
+        if remaining == 2 {
             out.push(((c0 << 2) | (c1 >> 4)) as u8);
             break;
-        };
+        }
+        let third = filtered[i + 2];
+        if third == b'=' {
+            if remaining != 4 || filtered[i + 3] != b'=' {
+                return Err("Invalid base64 padding".to_string());
+            }
+            out.push(((c0 << 2) | (c1 >> 4)) as u8);
+            break;
+        }
+        let c2 = b64_decode_char(third, variant)
+            .ok_or_else(|| format!("Invalid base64 char: {}", third as char))?;
 
-        let c3 = if i + 3 < len && filtered[i + 3] != b'=' {
-            b64_decode_char(filtered[i + 3], variant)
-                .ok_or_else(|| format!("Invalid base64 char: {}", filtered[i + 3] as char))?
-        } else {
+        if remaining == 3 {
             out.push(((c0 << 2) | (c1 >> 4)) as u8);
             out.push((((c1 & 0xF) << 4) | (c2 >> 2)) as u8);
             break;
-        };
-
+        }
+        let fourth = filtered[i + 3];
+        if fourth == b'=' {
+            if remaining != 4 {
+                return Err("Invalid base64 padding".to_string());
+            }
+            out.push(((c0 << 2) | (c1 >> 4)) as u8);
+            out.push((((c1 & 0xF) << 4) | (c2 >> 2)) as u8);
+            break;
+        }
+        let c3 = b64_decode_char(fourth, variant)
+            .ok_or_else(|| format!("Invalid base64 char: {}", fourth as char))?;
         out.push(((c0 << 2) | (c1 >> 4)) as u8);
         out.push((((c1 & 0xF) << 4) | (c2 >> 2)) as u8);
         out.push((((c2 & 0x3) << 6) | c3) as u8);
@@ -64130,16 +64299,6 @@ fn register_charset_natives(registry: &mut NativeMethodRegistry) {
         "isSupported",
         "(Ljava/lang/String;)Z",
         native_charset_is_supported,
-    );
-    // SportMe / Tomcat startup: real-JDK `Charset.availableCharsets()` enumerates
-    // `CharsetProvider.charsets()` (the iterator's Charset entries lack a `name`
-    // slot in our synthetic layout) and NPEs in `Charset.put(...)`. Return a
-    // TreeMap populated with the standard charsets directly.
-    registry.register(
-        cs,
-        "availableCharsets",
-        "()Ljava/util/SortedMap;",
-        native_charset_available_charsets,
     );
 
     // --- Charset instance methods ---
@@ -65161,7 +65320,22 @@ fn native_charset_for_name(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         // subclass — the assertion requires the exact/more-specific type.
         return Err(throw_unsupported_charset_exception(ctx, &name));
     }
+    if let Some(handle) = real_charset_cache()
+        .lock()
+        .unwrap()
+        .get(&normalized)
+        .copied()
+    {
+        if let Some(charset) = ctx.resolve_global_root(handle) {
+            return Ok(Some(Value::Object(Some(charset))));
+        }
+    }
     let charset = charset_alloc(ctx, &normalized);
+    let handle = ctx.add_global_root(charset);
+    real_charset_cache()
+        .lock()
+        .unwrap()
+        .insert(normalized, handle);
     Ok(Some(Value::Object(Some(charset))))
 }
 
@@ -65209,32 +65383,49 @@ fn native_charset_available_charsets(
     ctx: &mut dyn NativeContext,
     _args: &[Value],
 ) -> MethodCallResult {
-    // Construct a real-JDK TreeMap (so checkcast SortedMap succeeds), then
-    // overlay our synthetic 3-field layout (interleaved [k0,v0,k1,v1,...]
-    // array at slot 0, size at slot 1) which is read by the synthetic
-    // TreeMap natives we register below for size/get/containsKey/keySet/
-    // values/entrySet/isEmpty. The real-JDK constructor zeros out
-    // root/size; we then write our overlay fields by index — they don't
-    // collide with real-JDK's instance fields (comparator/root/size/…)
-    // because we only override the methods that read them.
-    let _ = ctx.ensure_class_initialized("java/util/TreeMap");
-    let tm = match ctx.new_object("java/util/TreeMap")? {
-        Some(Value::Object(Some(o))) => o,
+    let charsets = [
+        "US-ASCII",
+        "ISO-8859-1",
+        "ISO-8859-2",
+        "ISO-8859-3",
+        "ISO-8859-4",
+        "ISO-8859-5",
+        "ISO-8859-15",
+        "UTF-8",
+        "UTF-16",
+        "UTF-16BE",
+        "UTF-16LE",
+    ];
+    let map = match ctx.new_object("java/util/TreeMap")? {
+        Some(Value::Object(Some(map))) => map,
         _ => return Ok(Some(Value::Object(None))),
     };
     ctx.invoke(
         "java/util/TreeMap",
         "<init>",
         "()V",
-        &[Value::Object(Some(tm))],
+        &[Value::Object(Some(map))],
     )?;
-    // Probe the real-JDK `size` slot. If field resolution succeeds, use it;
-    // otherwise scan int slots and pick the first one (real-JDK TreeMap has
-    // `size` as its first int field after the two Object refs).
-    // Set size by name and to every plausible slot. Real-JDK TreeMap.size()
-    // is `return size;` bytecode; writing the right slot should be sufficient.
-    ctx.set_field_by_name(tm, "size", Value::Int(7));
-    Ok(Some(Value::Object(Some(tm))))
+    let map_pin = ctx.pin_native_root(map);
+    for name in charsets {
+        let value = charset_alloc(ctx, name);
+        let value_pin = ctx.pin_native_root(value);
+        let key = ctx.create_string(name);
+        let map = ctx.read_native_pin(map_pin, map);
+        let value = ctx.read_native_pin(value_pin, value);
+        cratonvm_native_collections::native_map_put_pub(
+            ctx,
+            &[
+                Value::Object(Some(map)),
+                Value::Object(Some(key)),
+                Value::Object(Some(value)),
+            ],
+    )?;
+        ctx.unpin_native_roots(value_pin);
+    }
+    let map = ctx.read_native_pin(map_pin, map);
+    ctx.unpin_native_roots(map_pin);
+    Ok(Some(Value::Object(Some(map))))
 }
 
 fn native_charset_is_supported(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -88209,4 +88400,36 @@ mod regex_lookbehind_tests {
             "invalid base64 falls back to input"
         );
     }
+}
+// Tomcat's connector response keeps the media type and charset in distinct real fields. The generic servlet response stubs are only for synthetic test objects, and must not clobber this state.
+
+// Real JDK 25 Buffer(int mark, int position, int limit, int capacity,
+// MemorySegment) initializes inherited private fields. Field-index writes are
+// unsafe here because CharBuffer subclasses add their own layout; use the
+// resolved names so duplicate()/asReadOnlyBuffer() preserve mark semantics.
+fn register_real_buffer_constructor_natives(registry: &mut NativeMethodRegistry) {
+    registry.register(
+        "java/nio/Buffer",
+        "<init>",
+        "(IIIILjava/lang/foreign/MemorySegment;)V",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let mark = args.get(1).and_then(Value::as_int).unwrap_or(-1);
+            let position = args.get(2).and_then(Value::as_int).unwrap_or(0);
+            let limit = args.get(3).and_then(Value::as_int).unwrap_or(0);
+            let capacity = args.get(4).and_then(Value::as_int).unwrap_or(0);
+            let segment = args.get(5).copied().unwrap_or(Value::Object(None));
+            ctx.set_field_by_name(this, "mark", Value::Int(mark));
+            ctx.set_field_by_name(this, "position", Value::Int(position));
+            ctx.set_field_by_name(this, "limit", Value::Int(limit));
+            ctx.set_field_by_name(this, "capacity", Value::Int(capacity));
+            ctx.set_field_by_name(this, "segment", segment);
+            Ok(None)
+        },
+    );
+}
+fn real_charset_cache() -> &'static std::sync::Mutex<std::collections::HashMap<String, usize>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, usize>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }

@@ -847,6 +847,23 @@ fn safe_native_call_impl(
     if stw_pending {
         crate::runtime::interpreter::safepoint_check(shared, thread);
     }
+    // A native callback can allocate through `NativeContext::new_array`, whose
+    // contract cannot surface an allocation failure and therefore must not
+    // initiate a moving collection mid-callback: native locals are not all
+    // rooted yet. This funnel is the safe pre-callback point — every Java
+    // argument is pinned above and refreshed below. The allocation wrapper
+    // records the threshold crossing; only that request is consumed here.
+    // A general `needs_gc()` check is intentionally not enough: it would force
+    // a collection for every native dispatch on allocation-heavy JIT paths.
+    let native_array_gc = crate::runtime::env_cache::disable_jit()
+        && shared
+            .native_array_gc_requested
+            .swap(false, std::sync::atomic::Ordering::Relaxed);
+    let mut requested_gc = false;
+    if native_array_gc && !crate::runtime::interpreter::gc_overhead_limit_exceeded(shared) {
+        crate::runtime::interpreter::maybe_gc_forced_pub(shared, thread);
+        requested_gc = true;
+    }
     // Native-alloc young-pressure relief: when a native allocation wrapper
     // had to spill into old gen because young was exhausted (the wrappers —
     // `ctx.alloc_object`, `new_array`, … — must stay GC-free mid-callback,
@@ -878,7 +895,7 @@ fn safe_native_call_impl(
         // of live data (overhead limit) — the next spill re-sets it.
         shared.heap.clear_young_spill_pressure();
     }
-    if stw_pending || pressure_gc {
+    if stw_pending || requested_gc || pressure_gc {
         let mut fresh = args.to_vec();
         for (idx, root_idx) in arg_root_indices.iter().enumerate() {
             let Some(root_idx) = root_idx else {
@@ -1197,7 +1214,10 @@ fn safe_native_call_impl(
                         .get_class(cid)
                         .map(|c| c.name.to_string())
                         .unwrap_or_else(|| format!("<cid={cid:?}>"));
-                    eprintln!("[altrace NRET] callee={callee} v={:p} cls={cname}", o.as_ptr());
+                    eprintln!(
+                        "[altrace NRET] callee={callee} v={:p} cls={cname}",
+                        o.as_ptr()
+                    );
                 }
             }
         }
@@ -2146,6 +2166,15 @@ impl<'a> NativeContextImpl<'a> {
         if let Some(r) = self.thread.native_pending_return {
             snapshot.push(r);
         }
+        // The blocked-thread snapshot is the only marking view a collector on
+        // another thread has of this JIT worker.  Publish the direct HashMap
+        // cache here as well as in the safepoint snapshot so its map/node pair
+        // cannot become a stale raw ObjectRef while the owner is parked.  The
+        // matching wake-side remap is below in `check_post_block_gc_refs`.
+        for entry in &self.thread.jit_hashmap_string_node_cache {
+            snapshot.push(entry.map);
+            snapshot.push(entry.node);
+        }
         // JNI local references (INT-5): this thread's `JNI_LOCAL_FRAMES`
         // handles. A JNI native that obtained local refs and then re-entered
         // Java (parking at a safepoint) or blocked leaves them populated —
@@ -2453,6 +2482,19 @@ impl<'a> NativeContextImpl<'a> {
                 let old_addr = obj_ref.as_ptr() as usize;
                 if let Some(&new_addr) = fixup.get(&old_addr) {
                     *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+                }
+            }
+            // The JIT HashMap fast path owns raw map/node ObjectRefs outside
+            // frames.  A collector can move either while this native worker is
+            // blocked, so forward both before Java/JIT code is allowed to read
+            // the cache again.  This is the blocked-wake counterpart of the
+            // current-thread `update_all_roots` remap in `memory/gc.rs`.
+            for entry in &mut self.thread.jit_hashmap_string_node_cache {
+                for obj_ref in [&mut entry.map, &mut entry.node] {
+                    let old_addr = obj_ref.as_ptr() as usize;
+                    if let Some(&new_addr) = fixup.get(&old_addr) {
+                        *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+                    }
                 }
             }
             for (_key_id, key_ref, val) in &mut self.thread.scoped_values {
@@ -3285,6 +3327,95 @@ fn resolve_thread_id_from_thread_obj(shared: &SharedVm, thread_obj: ObjectRef) -
         })
 }
 
+/// Whether an object is the real bootstrap `java/lang/String` class.
+fn is_real_java_string(shared: &SharedVm, object: ObjectRef) -> bool {
+    if shared.heap.kind_of(object) != ObjectKind::Object {
+        return false;
+    }
+    shared
+        .class_manager
+        .read()
+        .get_class(shared.heap.class_id_of(object))
+        .is_some_and(|class| class.name.as_ref() == "java/lang/String")
+}
+
+/// Return the raw Java String hash directly from compact storage.
+fn compact_java_string_hash(shared: &SharedVm, object: ObjectRef) -> Option<i32> {
+    if !is_real_java_string(shared, object) {
+        return None;
+    }
+    let (Value::Object(Some(bytes)), Value::Int(coder)) =
+        (shared.heap.get_field(object, 0), shared.heap.get_field(object, 1))
+    else { return None; };
+    if !matches!(coder, 0 | 1)
+        || shared.heap.array_element_type(bytes) != Some(ArrayElementType::Byte) { return None; }
+    let ptr = shared.heap.array_data_ptr(bytes)?;
+    let raw = unsafe { std::slice::from_raw_parts(ptr as *const u8, shared.heap.array_length(bytes)) };
+    let mut hash = 0i32;
+    if coder == 0 {
+        for &byte in raw { hash = hash.wrapping_mul(31).wrapping_add(byte as i32); }
+    } else {
+        if raw.len() & 1 != 0 { return None; }
+        for unit in raw.chunks_exact(2) {
+            hash = hash.wrapping_mul(31).wrapping_add(u16::from_le_bytes([unit[0], unit[1]]) as i32);
+        }
+    }
+    Some(hash)
+}
+
+/// Compare final compact `java.lang.String` instances without creating a
+/// host `String`. Cache entries originate only from confirmed String keys; the
+/// class-id equality guard therefore also rejects unrelated objects that happen
+/// to expose a similar field layout.
+fn compact_java_strings_equal(shared: &SharedVm, left: ObjectRef, right: ObjectRef) -> bool {
+    if left == right {
+        return true;
+    }
+    if shared.heap.class_id_of(left) != shared.heap.class_id_of(right) {
+        return false;
+    }
+    let (Value::Object(Some(left_bytes)), Value::Int(left_coder)) =
+        (shared.heap.get_field(left, 0), shared.heap.get_field(left, 1))
+    else {
+        return false;
+    };
+    let (Value::Object(Some(right_bytes)), Value::Int(right_coder)) =
+        (shared.heap.get_field(right, 0), shared.heap.get_field(right, 1))
+    else {
+        return false;
+    };
+    if !matches!(left_coder, 0 | 1)
+        || !matches!(right_coder, 0 | 1)
+        || shared.heap.array_element_type(left_bytes) != Some(ArrayElementType::Byte)
+        || shared.heap.array_element_type(right_bytes) != Some(ArrayElementType::Byte)
+    {
+        return false;
+    }
+    let (Some(left_ptr), Some(right_ptr)) = (
+        shared.heap.array_data_ptr(left_bytes),
+        shared.heap.array_data_ptr(right_bytes),
+    ) else {
+        return false;
+    };
+    let left_len = shared.heap.array_length(left_bytes);
+    let right_len = shared.heap.array_length(right_bytes);
+    let left_raw = unsafe { std::slice::from_raw_parts(left_ptr as *const u8, left_len) };
+    let right_raw = unsafe { std::slice::from_raw_parts(right_ptr as *const u8, right_len) };
+    if left_coder == right_coder {
+        return left_raw == right_raw;
+    }
+    let (latin, utf16) = if left_coder == 0 {
+        (left_raw, right_raw)
+    } else {
+        (right_raw, left_raw)
+    };
+    utf16.len() == latin.len().saturating_mul(2)
+        && latin
+            .iter()
+            .zip(utf16.chunks_exact(2))
+            .all(|(&byte, unit)| byte == unit[0] && unit[1] == 0)
+}
+
 impl<'a> NativeContext for NativeContextImpl<'a> {
     // See the `NativeContext::refresh_root_snapshot` doc comment
     // (native-api/src/registry.rs) for the full rationale — this closes the
@@ -3643,6 +3774,98 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             .jni_global_refs
             .lock()
             .remove(handle as crate::native::jni::JObject)
+    }
+
+    fn hashmap_string_node_cache_get_object(
+        &mut self,
+        map: ObjectRef,
+        key: ObjectRef,
+    ) -> Option<Value> {
+        let mut index = 0;
+        while index < self.thread.jit_hashmap_string_node_cache.len() {
+            let entry = self.thread.jit_hashmap_string_node_cache[index].clone();
+            if entry.map != map {
+                index += 1;
+                continue;
+            }
+            let Value::Int(mod_count) = self.shared.heap.get_field(map, entry.mod_count_slot) else {
+                self.thread.jit_hashmap_string_node_cache.swap_remove(index);
+                continue;
+            };
+            if mod_count != entry.mod_count {
+                self.thread.jit_hashmap_string_node_cache.swap_remove(index);
+                continue;
+            }
+            let Value::Object(Some(node_key)) = self.shared.heap.get_field(entry.node, 1) else {
+                self.thread.jit_hashmap_string_node_cache.swap_remove(index);
+                continue;
+            };
+            if compact_java_strings_equal(self.shared, key, node_key) {
+                return Some(self.shared.heap.get_field(entry.node, 2));
+            }
+            index += 1;
+        }
+        None
+    }
+
+    fn hashmap_string_node_cache_get(&mut self, map: ObjectRef, key: &str) -> Option<Value> {
+        let mut index = 0;
+        while index < self.thread.jit_hashmap_string_node_cache.len() {
+            let entry = self.thread.jit_hashmap_string_node_cache[index].clone();
+            if entry.map != map || entry.key != key {
+                index += 1;
+                continue;
+            }
+            let Value::Int(mod_count) = self.shared.heap.get_field(map, entry.mod_count_slot) else {
+                self.thread.jit_hashmap_string_node_cache.swap_remove(index);
+                continue;
+            };
+            if mod_count != entry.mod_count {
+                self.thread.jit_hashmap_string_node_cache.swap_remove(index);
+                continue;
+            }
+            return Some(self.shared.heap.get_field(entry.node, 2));
+        }
+        None
+    }
+
+    fn hashmap_string_node_cache_put(&mut self, map: ObjectRef, key: &str, node: ObjectRef) {
+        let class_id = self.shared.heap.class_id_of(map);
+        let fields = self.shared.class_manager.read();
+        let Some(mod_count_slot) = resolve_field_index_in_hierarchy(
+            class_id,
+            "modCount",
+            &fields.class_store,
+        ) else {
+            return;
+        };
+        drop(fields);
+        let Value::Int(mod_count) = self.shared.heap.get_field(map, mod_count_slot) else {
+            return;
+        };
+        if let Some(entry) = self
+            .thread
+            .jit_hashmap_string_node_cache
+            .iter_mut()
+            .find(|entry| entry.map == map && entry.key == key)
+        {
+            entry.node = node;
+            entry.mod_count_slot = mod_count_slot;
+            entry.mod_count = mod_count;
+            return;
+        }
+        if self.thread.jit_hashmap_string_node_cache.len() >= 32 {
+            self.thread.jit_hashmap_string_node_cache.remove(0);
+        }
+        self.thread.jit_hashmap_string_node_cache.push(
+            crate::threading::jvm_thread::JitHashMapStringNodeCacheEntry {
+                map,
+                node,
+                key: key.to_owned(),
+                mod_count_slot,
+                mod_count,
+            },
+        );
     }
 
     fn invoke(
@@ -4580,17 +4803,48 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
 
     fn class_declares_method(&self, class_id: ClassId, name: &str, descriptor: &str) -> bool {
         // Declared-only check: inspect this exact class, NOT its superclasses.
+        //
+        // Exclude compiler-generated bridge methods (ACC_BRIDGE, 0x0040).
+        // A bridge is not a genuine override in the OOP sense CratonVM's
+        // callers care about ("does this class provide its OWN real
+        // implementation") -- it is javac's forwarding stub for visibility
+        // (e.g. `StringBuilder.substring(int)` forwarding to its
+        // package-private superclass `AbstractStringBuilder`'s real
+        // implementation) or covariant-return erasure. Counting it as a
+        // "declared override" broke
+        // `native_mockito_mock_method_advice_is_overridden`'s ancestor walk:
+        // for a Mockito inline mock of `StringBuilder`, it saw
+        // `StringBuilder`'s bridge `substring(int)` between the mock's own
+        // class and `AbstractStringBuilder` (the reflected Method's real
+        // declaring class) and concluded "overridden -- do not intercept
+        // here", silently skipping Mockito's advice and returning the real
+        // (empty-buffer) computation instead of the stubbed answer. Real
+        // JDK reflection call sites never see bridges as "the" declared
+        // method for this kind of check (ByteBuddy's own `MethodGraph`
+        // merges a bridge into its bridged target), so excluding them here
+        // matches that semantics. The other two callers (constructor checks,
+        // a `ClassLoader.findResources` override probe) are unaffected:
+        // constructors can never be bridges, and `findResources`'s fixed,
+        // non-generic signature is never bridge-erased in practice.
         let cm = self.shared.class_manager.read();
         match cm.class_store.get(class_id) {
-            Some(class) => class.find_method(name, descriptor).is_some(),
+            Some(class) => class
+                .find_method(name, descriptor)
+                .is_some_and(|m| !m.is_bridge()),
             None => false,
         }
     }
 
     fn new_array(&mut self, element_type: ArrayElementType, length: usize) -> ObjectRef {
-        self.shared
+        let array = self.shared
             .heap
-            .alloc_array(ClassId::new(0), element_type, length)
+            .alloc_array(ClassId::new(0), element_type, length);
+        if crate::runtime::env_cache::disable_jit() && self.shared.heap.needs_gc() {
+            self.shared
+                .native_array_gc_requested
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        array
     }
 
     fn new_ref_array(&mut self, class_id: ClassId, length: usize) -> ObjectRef {
@@ -4606,9 +4860,15 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 length, frame
             );
         }
-        self.shared
+        let array = self.shared
             .heap
-            .alloc_array(class_id, ArrayElementType::Reference, length)
+            .alloc_array(class_id, ArrayElementType::Reference, length);
+        if crate::runtime::env_cache::disable_jit() && self.shared.heap.needs_gc() {
+            self.shared
+                .native_array_gc_requested
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        array
     }
 
     fn try_new_ref_array(&mut self, class_id: ClassId, length: usize) -> Option<ObjectRef> {
@@ -5055,11 +5315,69 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 .store(true, std::sync::atomic::Ordering::Relaxed);
             crate::runtime::interpreter::maybe_gc(self.shared, self.thread);
         }
-        super::create_java_string_uninterned(self.shared, text)
+        super::create_java_string_uninterned_gc_safe_threaded(self.shared, self.thread, text)
+    }
+
+    fn get_ascii_case_string_cached(&mut self, source: ObjectRef, upper: bool) -> Option<ObjectRef> {
+        let entry = self
+            .thread
+            .string_case_cache
+            .iter_mut()
+            .find(|entry| entry.source == source && entry.upper == upper)?;
+        let result = if entry.next { entry.second } else { entry.first };
+        entry.next = !entry.next;
+        Some(result)
+    }
+
+    fn create_ascii_case_string_cached(
+        &mut self,
+        source: ObjectRef,
+        text: &str,
+        upper: bool,
+    ) -> ObjectRef {
+        if let Some(result) = self.get_ascii_case_string_cached(source, upper) {
+            return result;
+        }
+
+        // Keep source and the first result rooted across the second allocation:
+        // the allocation slow path is allowed to request a moving young GC.
+        let base = self.thread.native_pin_roots.len();
+        self.thread.native_pin_roots.push(source);
+        let first = self.create_string_uninterned_gc_safe(text);
+        self.thread.native_pin_roots.push(first);
+        let second = self.create_string_uninterned_gc_safe(text);
+        let source = self.thread.native_pin_roots[base];
+        let first = self.thread.native_pin_roots[base + 1];
+        self.thread.native_pin_roots.truncate(base);
+
+        if self.thread.string_case_cache.len() >= 32 {
+            self.thread.string_case_cache.remove(0);
+        }
+        self.thread.string_case_cache.push(
+            crate::threading::jvm_thread::StringCaseCacheEntry {
+                source,
+                upper,
+                first,
+                second,
+                next: true,
+            },
+        );
+        first
     }
 
     fn init_string_from_units(&mut self, this: ObjectRef, units: &[u16]) -> bool {
         super::populate_java_string_fields(self.shared, this, units)
+    }
+
+    fn java_string_hash_code(&self, obj: ObjectRef) -> Option<i32> {
+        compact_java_string_hash(self.shared, obj)
+    }
+
+    fn java_strings_equal(&self, a: ObjectRef, b: ObjectRef) -> Option<bool> {
+        if !is_real_java_string(self.shared, a) || !is_real_java_string(self.shared, b) {
+            return None;
+        }
+        Some(compact_java_strings_equal(self.shared, a, b))
     }
 
     fn read_string(&self, obj: ObjectRef) -> Option<String> {
@@ -6727,6 +7045,35 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         self.shared.thread_registry.frame_trace_of(tid)
     }
 
+    fn thread_jmx_snapshot(
+        &self,
+        thread_obj: ObjectRef,
+    ) -> Option<cratonvm_native_api::ThreadJmxSnapshot> {
+        let registry_tid = resolve_thread_id_from_thread_obj(self.shared, thread_obj)?;
+        let thread_id = read_java_thread_tid(self.shared, thread_obj)
+            .unwrap_or(registry_tid.0) as i64;
+        let thread_name = match self.get_field_by_name(thread_obj, "name") {
+            Value::Object(Some(name)) => super::read_java_string(&self.shared.heap, name),
+            _ => None,
+        }
+        .unwrap_or_else(|| format!("Thread-{thread_id}"));
+        let thread_status = match self.thread_run_state(thread_obj) {
+            1 => 0x0001, // RUNNABLE
+            2 => 0x0002, // TERMINATED
+            3 => 0x0010, // WAITING
+            4 => 0x0400, // BLOCKED_ON_MONITOR_ENTER
+            _ => 0,
+        };
+        Some(cratonvm_native_api::ThreadJmxSnapshot {
+            thread_object: Some(thread_obj),
+            thread_id,
+            thread_name,
+            thread_status,
+            stack_trace: self.thread_stack_trace(thread_obj),
+            ..Default::default()
+        })
+    }
+
     fn current_thread_object(&mut self) -> ObjectRef {
         if let Some(obj) = self.thread.java_thread_obj {
             if std::env::var_os("CRATONVM_DBG_WATCHREF").is_some() {
@@ -7881,7 +8228,9 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         {
             eprintln!(
                 "[INVOKE-VIRTUAL-ENTRY-TRACE] method={} receiver_class_id={:?} is_lambda_proxy={}",
-                method_name, receiver_class_id, call_site.is_some()
+                method_name,
+                receiver_class_id,
+                call_site.is_some()
             );
         }
 
@@ -8315,7 +8664,10 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             if std::env::var_os("CRATONVM_INVOKE_VIRTUAL_ENTRY_TRACE").is_some()
                 && method_name == "aotContributedInitializerStartsManagementContext"
             {
-                eprintln!("[INVOKE-VIRTUAL-ENTRY-TRACE] method={} entered NOT-LAMBDA else branch", method_name);
+                eprintln!(
+                    "[INVOKE-VIRTUAL-ENTRY-TRACE] method={} entered NOT-LAMBDA else branch",
+                    method_name
+                );
             }
             // Not a lambda-dispatch call after all (the receiver wasn't a
             // recognized proxy, or the `.filter()` predicate above rejected
@@ -8538,7 +8890,11 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             if std::env::var_os("CRATONVM_NEEDS_EXACT_TRACE").is_some()
                 && method_name == "aotContributedInitializerStartsManagementContext"
             {
-                let global_id = self.shared.class_manager.read().get_loaded_class_id(&class_name);
+                let global_id = self
+                    .shared
+                    .class_manager
+                    .read()
+                    .get_loaded_class_id(&class_name);
                 eprintln!(
                     "[NEEDS-EXACT-TRACE] method={} class_name={} resolved_from_receiver={} receiver_class_id={:?} global_lookup_id={:?} needs_exact_class_dispatch={}",
                     method_name, class_name, resolved_from_receiver, receiver_class_id, global_id, needs_exact_class_dispatch
@@ -13599,6 +13955,38 @@ pub(super) fn proxy_resolve_declaring_class_mirror(
     method_name: &str,
     descriptor: &str,
 ) -> ObjectRef {
+    // `Object`'s own instance methods are never declared on any implemented
+    // interface, by construction (an interface implicitly inherits them, it
+    // never redeclares them) — and per the JLS/`Proxy` contract, `equals`/
+    // `hashCode`/`toString` are the ONLY `Object` methods a proxy's
+    // `InvocationHandler` is ever asked to intercept (`getClass`/`notify`/
+    // `wait`/`finalize` never route through `invoke()`). Short-circuit here
+    // so the interface walk below — and specifically its "no declaring
+    // interface found" fallback just past it, which deliberately guesses the
+    // proxy's FIRST implemented interface for a genuinely-unresolvable
+    // lookup — can never misattribute these three well-known `Object`
+    // methods to an interface that merely happens to be listed first.
+    //
+    // This was the root cause of a 100%-reproducible bug where `Method
+    // .getDeclaringClass()` on the `Method` passed to `invoke()` for
+    // `toString()`/`equals()`/`hashCode()` incorrectly reported the proxy's
+    // first interface instead of `java.lang.Object`: the walk below
+    // correctly fails to find them declared on any interface (they aren't),
+    // then fell through to the "prefer the first interface mirror... so the
+    // Method still answers with a real interface" fallback — which is wrong
+    // for these three specifically, since real `Object` IS the right answer.
+    // (`JndiObjectFactoryBeanTests.lookupWithExposeAccessContext` —
+    // `JndiContextExposingInterceptor.isEligible(Method)` checks `Object
+    // .class != method.getDeclaringClass()`, which incorrectly evaluated
+    // true for `toString()`, causing an extra unwanted JNDI context
+    // open/close Mockito caught as an unexpected extra invocation.)
+    if (method_name == "equals" && descriptor == "(Ljava/lang/Object;)Z")
+        || (method_name == "hashCode" && descriptor == "()I")
+        || (method_name == "toString" && descriptor == "()Ljava/lang/String;")
+    {
+        return super::get_or_create_class_mirror(shared, ClassId::new(0));
+    }
+
     // Source the proxy's implemented interfaces. The synthetic 3-slot layout
     // stores the `Class[]` at slot 1; the real-super layout (proxy-real-classfile
     // migration: extends `java.lang.reflect.Proxy` — single field `h` at slot 0)
@@ -14021,7 +14409,10 @@ fn invoke_on_class_shared_inner(
         // `GenericTypeResolver`-based debug output. Once a class's real
         // bytecode loads, `is_synthetic_stub` flips false and this check
         // naturally stops applying to it.
-        if let Some(callback) = shared.native_methods.find(&class_name, method_name, descriptor) {
+        if let Some(callback) = shared
+            .native_methods
+            .find(&class_name, method_name, descriptor)
+        {
             return safe_native_call(shared, thread, callback, args)
                 .map(|value| coerce_native_return(value, descriptor));
         }
@@ -14107,11 +14498,11 @@ fn invoke_on_class_shared_inner(
                 | "(Ljava/net/Socket;Ljava/lang/String;IZ)Ljava/net/Socket;"
         )
     {
-        if let Some(callback) = shared.native_methods.find(
-            "javax/net/ssl/SSLSocketFactory",
-            method_name,
-            descriptor,
-        ) {
+        if let Some(callback) =
+            shared
+                .native_methods
+                .find("javax/net/ssl/SSLSocketFactory", method_name, descriptor)
+        {
             return safe_native_call(shared, thread, callback, args)
                 .map(|value| coerce_native_return(value, descriptor));
         }
@@ -14143,11 +14534,11 @@ fn invoke_on_class_shared_inner(
                 | ("getWantClientAuth", "()Z")
         )
     {
-        if let Some(callback) = shared.native_methods.find(
-            "javax/net/ssl/SSLSocket",
-            method_name,
-            descriptor,
-        ) {
+        if let Some(callback) =
+            shared
+                .native_methods
+                .find("javax/net/ssl/SSLSocket", method_name, descriptor)
+        {
             return safe_native_call(shared, thread, callback, args)
                 .map(|value| coerce_native_return(value, descriptor));
         }
@@ -14235,8 +14626,7 @@ fn invoke_on_class_shared_inner(
                 "javax/net/ssl/SSLServerSocketFactory"
                     | "sun/security/ssl/SSLServerSocketFactoryImpl"
             ) {
-                if let Some(callback) =
-                    shared
+                if let Some(callback) = shared
                         .native_methods
                         // The real JDK factory carries its SSLContext in the
                         // same first instance slot consumed by the bridge.

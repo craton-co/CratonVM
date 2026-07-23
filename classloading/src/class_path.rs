@@ -26,7 +26,8 @@ use zip::ZipArchive;
 fn diag_resource_call_wrapper<T>(label: &'static str, f: impl FnOnce() -> T) -> T {
     use std::sync::atomic::{AtomicU64, Ordering};
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    let enabled = *ENABLED.get_or_init(|| std::env::var_os("CRATONVM_DBG_RESOURCE_TIMING").is_some());
+    let enabled =
+        *ENABLED.get_or_init(|| std::env::var_os("CRATONVM_DBG_RESOURCE_TIMING").is_some());
     if !enabled {
         return f();
     }
@@ -1258,7 +1259,8 @@ impl ClassPath {
     /// producing an empty classpath and breaking `ServiceLoader`
     /// (`META-INF/services/...`) discovery for every dependency.
     pub fn new(paths: &[String]) -> Self {
-        let __diag_start = std::env::var_os("CRATONVM_DBG_CLASSPATH").map(|_| std::time::Instant::now());
+        let __diag_start =
+            std::env::var_os("CRATONVM_DBG_CLASSPATH").map(|_| std::time::Instant::now());
         let __diag_npaths = paths.len();
         let mut entries = Vec::new();
         for raw in paths {
@@ -1279,11 +1281,17 @@ impl ClassPath {
                                 }
                             }
                             Err(e) => {
-                                debug!("Failed to read nested classpath archive {}: {e}", path.display());
+                                debug!(
+                                    "Failed to read nested classpath archive {}: {e}",
+                                    path.display()
+                                );
                             }
                         }
                     } else {
-                        debug!("Skipping missing nested classpath archive: {}", path.display());
+                        debug!(
+                            "Skipping missing nested classpath archive: {}",
+                            path.display()
+                        );
                     }
                     continue;
                 }
@@ -4029,10 +4037,7 @@ mod tests {
     fn jar_subdirectory_spec_accepts_war_archives() {
         assert_eq!(
             parse_jar_subdir_spec("/apps/test.war!/WEB-INF/classes/"),
-            Some((
-                "/apps/test.war".to_string(),
-                "WEB-INF/classes/".to_string()
-            ))
+            Some(("/apps/test.war".to_string(), "WEB-INF/classes/".to_string()))
         );
     }
 
@@ -4054,7 +4059,10 @@ mod tests {
 
         let spec = format!("{}!/WEB-INF/classes/", war_path.display());
         let cp = ClassPath::new(&[spec]);
-        assert_eq!(cp.find_resource("test.txt"), Some(b"test resource".to_vec()));
+        assert_eq!(
+            cp.find_resource("test.txt"),
+            Some(b"test resource".to_vec())
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

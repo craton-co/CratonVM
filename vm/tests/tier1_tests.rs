@@ -1230,8 +1230,7 @@ fn t9_stub_audit_counts_match_census() {
                 || trimmed.starts_with("use ")
                 || trimmed.starts_with("#[")
             {
-                if trimmed.starts_with("use ") && trimmed.contains('{') && !trimmed.contains("};")
-                {
+                if trimmed.starts_with("use ") && trimmed.contains('{') && !trimmed.contains("};") {
                     in_use_block = true;
                 }
                 continue;

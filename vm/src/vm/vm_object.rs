@@ -3,6 +3,7 @@
 
 //! Object helpers: Java String interning, Class mirrors, static field access.
 
+use std::cell::Cell;
 use crate::classloading::ClassId;
 use crate::memory::heap::ArrayElementType;
 use crate::memory::vm_heap::VmHeap;
@@ -90,6 +91,43 @@ pub fn create_java_string_uninterned(shared: &SharedVm, text: &str) -> ObjectRef
     alloc_java_string_object(shared, text)
 }
 
+/// Thread-aware, GC-safe dynamic String allocation for native helpers. The
+/// ASCII path uses the ordinary object TLAB and a hit-only byte-array TLAB
+/// allocation, retaining a fresh String object and backing array every call.
+pub fn create_java_string_uninterned_gc_safe_threaded(
+    shared: &SharedVm,
+    thread: &mut crate::threading::jvm_thread::JvmThread,
+    text: &str,
+) -> ObjectRef {
+    if shared.compact_strings.load(std::sync::atomic::Ordering::Relaxed) && text.is_ascii() {
+        let (class_id, fields) = java_string_allocation_layout(shared);
+        use cratonvm_gc::heap::{HEADER_SIZE, SLOT_SIZE};
+        let object_size = HEADER_SIZE + fields.saturating_mul(SLOT_SIZE);
+        let str_obj = crate::runtime::interpreter::tlab_alloc_object(
+            thread, shared, class_id, fields, object_size,
+        )
+        .or_else(|| shared.heap.try_alloc_object_full(class_id, fields))
+        .unwrap_or_else(|| alloc_java_string_object(shared, text));
+        let byte_array = crate::runtime::interpreter::tlab_alloc_byte_array(thread, shared, text.len())
+            .or_else(|| shared.heap.try_alloc_array_full(ClassId::new(0), ArrayElementType::Byte, text.len()))
+            .unwrap_or_else(|| return alloc_java_string_object(shared, text));
+        if let Some(base) = shared.heap.array_data_ptr(byte_array) {
+            // SAFETY: the fresh byte array has exactly `text.len()` elements.
+            unsafe { std::ptr::copy_nonoverlapping(text.as_ptr(), base, text.len()) };
+        } else {
+            for (index, byte) in text.bytes().enumerate() {
+                let _ = shared.heap.set_array_element(byte_array, index, Value::Int(byte as i32));
+            }
+        }
+        shared.heap.set_field(str_obj, 0, Value::Object(Some(byte_array)));
+        shared.heap.set_field(str_obj, 1, Value::Int(CODER_LATIN1));
+        shared.heap.set_field(str_obj, 2, Value::Int(0));
+        shared.heap.set_field(str_obj, 3, Value::Int(0));
+        return str_obj;
+    }
+    alloc_java_string_object(shared, text)
+}
+
 /// Create a Java String object directly from UTF-16 code `units`, **without**
 /// pooling.
 ///
@@ -169,16 +207,35 @@ fn java_string_allocation_layout(shared: &SharedVm) -> (ClassId, usize) {
     let cached = shared
         .cached_string_num_fields
         .load(std::sync::atomic::Ordering::Relaxed);
+    // Every dynamic compact String reaches this function. After first
+    // resolution, a class-manager read lock for every allocation becomes a
+    // cross-thread hot-path bottleneck, even though bootstrap String's class
+    // id and field shape are immutable for the VM lifetime. Keep the pair per
+    // host thread and VM; the existing atomic field-count remains the
+    // cross-thread first-resolution gate.
+    thread_local! {
+        static STRING_LAYOUT_CACHE: Cell<Option<(usize, u32, usize)>> = const { Cell::new(None) };
+    }
+    let vm_key = shared as *const SharedVm as usize;
     let resolved = if cached != 0 {
-        // Fast path: field count already known. Resolve the class id under a
-        // read lock only. If the probe misses (extremely unlikely — would mean
-        // String isn't registered under any builtin loader), fall through to
-        // the write-lock path to preserve correctness.
-        shared
-            .class_manager
-            .read()
-            .get_loaded_class_id("java/lang/String")
-            .map(|id| (id, cached))
+        STRING_LAYOUT_CACHE.with(|cache| match cache.get() {
+            Some((cached_vm, class_raw, field_count))
+                if cached_vm == vm_key && field_count == cached =>
+            {
+                Some((ClassId::new(class_raw), field_count))
+            }
+            _ => {
+                let resolved = shared
+                    .class_manager
+                    .read()
+                    .get_loaded_class_id("java/lang/String")
+                    .map(|id| (id, cached));
+                if let Some((id, field_count)) = resolved {
+                    cache.set(Some((vm_key, id.as_u32(), field_count)));
+                }
+                resolved
+            }
+        })
     } else {
         None
     };
@@ -213,6 +270,9 @@ fn java_string_allocation_layout(shared: &SharedVm) -> (ClassId, usize) {
                     .store(c, std::sync::atomic::Ordering::Relaxed);
                 c
             };
+            STRING_LAYOUT_CACHE.with(|cache| {
+                cache.set(Some((vm_key, id.as_u32(), count)));
+            });
             (id, count)
         }
     }

@@ -120,6 +120,9 @@ pub fn canonical_charset_name(name: &str) -> Option<&'static str> {
         "USASCII" | "ASCII" => "US-ASCII",
         "ISO88591" | "LATIN1" | "ISO88591:1987" => "ISO-8859-1",
         "ISO88592" => "ISO-8859-2",
+        "ISO88593" | "88593" | "LATIN3" => "ISO-8859-3",
+        "ISO88594" | "88594" | "LATIN4" => "ISO-8859-4",
+        "ISO88595" | "88595" | "CYRILLIC" => "ISO-8859-5",
         "ISO885915" => "ISO-8859-15",
         "SHIFTJIS" | "SJIS" | "CSSHIFTJIS" | "MSKANJI" | "WINDOWS31J" => "Shift_JIS",
         "EUCJP" | "XEUCJP" => "EUC-JP",
@@ -171,7 +174,7 @@ pub fn decode_bytes(name: &str, bytes: &[u8]) -> Result<Vec<u16>, CodingError> {
     match name {
         "UTF-8" => decode_utf8(bytes),
         "US-ASCII" => decode_ascii(bytes),
-        "ISO-8859-1" => Ok(bytes.iter().map(|&b| b as u16).collect()),
+        "ISO-8859-1" | "ISO-8859-3" => Ok(bytes.iter().map(|&b| b as u16).collect()),
         "UTF-16" => decode_utf16_bom(bytes, /*default_be=*/ true),
         "UTF-16BE" => decode_utf16_fixed(bytes, /*big_endian=*/ true),
         "UTF-16LE" => decode_utf16_fixed(bytes, /*big_endian=*/ false),

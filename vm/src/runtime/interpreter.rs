@@ -2406,6 +2406,48 @@ pub(crate) fn tlab_alloc_object(
     tlab_alloc_object_inner(thread, shared, class_id, num_fields, total_size, false)
 }
 
+/// TLAB hit-only path for the tiny byte arrays backing compact dynamic Strings.
+/// The caller falls back to the heap allocator on a miss, so this never refills
+/// or collects after another newly-created object is live in its native helper.
+pub(crate) fn tlab_alloc_byte_array(
+    thread: &mut JvmThread,
+    shared: &SharedVm,
+    length: usize,
+) -> Option<ObjectRef> {
+    use cratonvm_gc::heap::{ArrayElementType, ObjectHeader, ObjectKind, HEADER_SIZE};
+    let length_u32 = u32::try_from(length).ok()?;
+    let total_size = HEADER_SIZE.checked_add(length)?;
+    if total_size > cratonvm_gc::tlab::tlab_max_alloc() {
+        return None;
+    }
+    let ptr = thread.tlab.alloc_initialized(total_size, 8, |ptr| {
+        let header = ObjectHeader::new(
+            ClassId::new(0),
+            ObjectKind::Array,
+            ArrayElementType::Byte,
+            shared.heap.next_identity_hash(),
+            length_u32,
+            length_u32,
+        );
+        unsafe { std::ptr::write(ptr as *mut ObjectHeader, header) };
+    })?;
+    use std::sync::atomic::Ordering;
+    shared.tlab_hit_count.fetch_add(1, Ordering::Relaxed);
+    shared
+        .bytes_allocated_total
+        .fetch_add(total_size as u64, Ordering::Relaxed);
+    cratonvm_gc::a2dbg::record(
+        ptr as usize,
+        0,
+        ObjectKind::Array as u8,
+        ArrayElementType::Byte as u8,
+        length_u32,
+        length_u32,
+        total_size,
+    );
+    Some(unsafe { ObjectRef::from_raw(ptr) })
+}
+
 /// [`tlab_alloc_object`] for the JIT allocation slow path (`jit_new_object`):
 /// identical bump allocation, but the REFILL arm first asks — in O(1) —
 /// whether young can supply the chunk WITHOUT another GC (bump-tail headroom
@@ -3283,6 +3325,17 @@ pub(crate) fn update_root_snapshot(shared: &SharedVm, thread: &mut JvmThread) {
     if let Some(r) = thread.native_pending_return {
         snapshot.push(r);
     }
+    // Direct JIT HashMap node cache: unlike the ordinary current-thread root
+    // scan, a cross-thread collector can see this parked thread only through
+    // `root_snapshot`.  Keep both cache handles in that snapshot so a
+    // collection initiated by another worker cannot reclaim or relocate a
+    // cached node behind the JIT fast path.  The three pointer-map consumers
+    // (`gc.rs`, `apply_pointer_map_to_thread`, and blocked wake-up) each
+    // forward these entries before the owner can read the cache again.
+    for entry in &thread.jit_hashmap_string_node_cache {
+        snapshot.push(entry.map);
+        snapshot.push(entry.node);
+    }
     // JNI local references (INT-5, safepoint half): a JNI native that
     // obtained local refs and re-entered Java parks HERE — and a
     // cross-thread collector marks this thread only from this snapshot, so
@@ -3341,6 +3394,17 @@ pub(crate) fn update_root_snapshot(shared: &SharedVm, thread: &mut JvmThread) {
     // roots and with the concurrent old-gen collector disabled). See
     // docs/real-raf-segv-root-cause.md.
     if !moving_young_precise_only {
+        // `update_root_snapshot` is also called at ordinary native-call
+        // boundaries, not only immediately before a safepoint.  Its JIT-root
+        // contribution is therefore a future cross-thread collector's only
+        // view of this thread while it is parked.  Do not let the per-thread
+        // scan cache republish a scan taken before the interpreted/native
+        // callee below the JIT frame allocated a new live object: none of the
+        // cache's keys change for that mutation.  The next collector could
+        // otherwise reclaim the omitted object and hand a zero-header slot
+        // back to compiled code.  This mirrors the safepoint and blocked
+        // snapshot paths, both of which already invalidate before publishing.
+        crate::jit::conservative_roots::invalidate_scan_cache_for_gc();
         let jit_scan_start = snapshot.len();
         crate::jit::conservative_roots::scan_active_jit_frames(&shared.heap, &mut snapshot);
         // G1 pin-in-place, cross-thread half: the snapshot keeps these
@@ -3791,6 +3855,18 @@ pub(crate) fn apply_pointer_map_to_thread(
         if let Some(&new_addr) = pointer_map.get(&old_addr) {
             // SAFETY: new_addr was produced by pointer_map and points at the relocated, valid object header within the heap arena.
             *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+        }
+    }
+    // The JIT HashMap fast path owns raw map/node ObjectRefs outside frames.
+    // A thread parked at this safepoint can miss a moving collection initiated
+    // by a peer, so mirror the initiator and blocked-wake remaps before JIT
+    // code resumes and probes the cache.
+    for entry in &mut thread.jit_hashmap_string_node_cache {
+        for obj_ref in [&mut entry.map, &mut entry.node] {
+            let old_addr = obj_ref.as_ptr() as usize;
+            if let Some(&new_addr) = pointer_map.get(&old_addr) {
+                *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+            }
         }
     }
     for (_key_id, key_ref, val) in &mut thread.scoped_values {

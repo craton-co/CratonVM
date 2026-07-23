@@ -3522,9 +3522,19 @@ pub(crate) fn native_string_to_lower_case(
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let text = ctx.read_string(this).unwrap_or_default();
-    let lower = text.to_lowercase();
-    let result = ctx.create_string_uninterned(&lower);
+    if let Some(result) = ctx.get_ascii_case_string_cached(this, false) {
+        return Ok(Some(Value::Object(Some(result))));
+    }
+    let mut lower = ctx.read_string(this).unwrap_or_default();
+    let changed = if lower.is_ascii() {
+        let changed = lower.bytes().any(|byte| byte.is_ascii_uppercase());
+        lower.make_ascii_lowercase();
+        changed
+    } else {
+        let folded = lower.to_lowercase();
+        if folded == lower { false } else { lower = folded; true }
+    };
+    let result = if changed { ctx.create_ascii_case_string_cached(this, &lower, false) } else { this };
     Ok(Some(Value::Object(Some(result))))
 }
 
@@ -3536,9 +3546,19 @@ pub(crate) fn native_string_to_upper_case(
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let text = ctx.read_string(this).unwrap_or_default();
-    let upper = text.to_uppercase();
-    let result = ctx.create_string_uninterned(&upper);
+    if let Some(result) = ctx.get_ascii_case_string_cached(this, true) {
+        return Ok(Some(Value::Object(Some(result))));
+    }
+    let mut upper = ctx.read_string(this).unwrap_or_default();
+    let changed = if upper.is_ascii() {
+        let changed = upper.bytes().any(|byte| byte.is_ascii_lowercase());
+        upper.make_ascii_uppercase();
+        changed
+    } else {
+        let folded = upper.to_uppercase();
+        if folded == upper { false } else { upper = folded; true }
+    };
+    let result = if changed { ctx.create_ascii_case_string_cached(this, &upper, true) } else { this };
     Ok(Some(Value::Object(Some(result))))
 }
 
@@ -6627,14 +6647,24 @@ mod tests {
 
         let result = native_string_join(
             &mut ctx,
-            &[Value::Object(Some(delimiter)), Value::Object(Some(sequences))],
+            &[
+                Value::Object(Some(delimiter)),
+                Value::Object(Some(sequences)),
+            ],
         )
         .unwrap();
         let Some(Value::Object(Some(joined))) = result else {
             panic!("String.join should return a String");
         };
-        assert_eq!(ctx.read_string(joined).as_deref(), Some("prefix|custom|null"));
-        assert_eq!(ctx.native_pin_count_for_test(), 0, "String.join must release native roots");
+        assert_eq!(
+            ctx.read_string(joined).as_deref(),
+            Some("prefix|custom|null")
+        );
+        assert_eq!(
+            ctx.native_pin_count_for_test(),
+            0,
+            "String.join must release native roots"
+        );
     }
 
     // -----------------------------------------------------------------------

@@ -2120,13 +2120,8 @@ fn inline_site_is_fresh_ctor_first_store(
     field_index: usize,
 ) -> bool {
     site.method_name == "<init>"
-        && !site
-            .field_info
-            .iter()
-            .any(|(prior_pc, prior_index, _)| {
-                *prior_pc < cpc
-                    && *prior_index == field_index
-                    && site.callee_code[*prior_pc] == 0xb5
+        && !site.field_info.iter().any(|(prior_pc, prior_index, _)| {
+            *prior_pc < cpc && *prior_index == field_index && site.callee_code[*prior_pc] == 0xb5
             })
 }
 
@@ -2737,6 +2732,18 @@ thread_local! {
 /// call on this thread (method-entry compiles only — never OSR).
 pub fn set_kernel_reg_homes_request(on: bool) {
     KERNEL_REG_HOMES_REQUEST.with(|c| c.set(on));
+}
+
+thread_local! {
+    /// One-shot request from the bytecode front-end: this method has an
+    /// exception handler that reads locals beyond its incoming parameters, so
+    /// post-invoke exceptions must retain a precise frame until handler entry.
+    static PRECISE_EXCEPTION_FRAME_REQUEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Request precise exceptional-frame capture for the next method compile.
+pub fn set_precise_exception_frame_request(on: bool) {
+    PRECISE_EXCEPTION_FRAME_REQUEST.with(|c| c.set(on));
 }
 
 thread_local! {
@@ -4043,11 +4050,23 @@ mod magic_div64_tests {
     #[test]
     fn magic_signed_div64_matches_exact_division() {
         let divisors: [i64; 14] = [2, 3, 5, 6, 7, 9, 10, 11, 12, 25, 100, 1000, 7919, 1_000_003];
-        let mut dividends: Vec<i64> = vec![0, 1, -1, 2, -2, i64::MAX, i64::MIN, i64::MAX - 1, i64::MIN + 1];
+        let mut dividends: Vec<i64> = vec![
+            0,
+            1,
+            -1,
+            2,
+            -2,
+            i64::MAX,
+            i64::MIN,
+            i64::MAX - 1,
+            i64::MIN + 1,
+        ];
         // Pseudo-random spread (deterministic LCG) incl. sign flips.
         let mut x = 0x9E3779B97F4A7C15u64;
         for _ in 0..2000 {
-            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             dividends.push(x as i64);
         }
         for &d in &divisors {
@@ -7288,9 +7307,7 @@ fn analyze_bounds_elimination(
         // walk an elided index below the array base.
         let step_guard: Option<Option<usize>> = match iv_step {
             Some(IvStep::UnitInc) => Some(None),
-            Some(IvStep::VarAdd(sl)) if sl < 64 && (modified & (1u64 << sl)) == 0 => {
-                Some(Some(sl))
-            }
+            Some(IvStep::VarAdd(sl)) if sl < 64 && (modified & (1u64 << sl)) == 0 => Some(Some(sl)),
             _ => None,
         };
         let bound_invariant = (!bounds.inclusive || inclusive_spec_bce_enabled())
@@ -7505,6 +7522,9 @@ struct Compiler {
     /// dispatch-aware route that drains the pending JIT exception (the
     /// `!has_dispatch` fast path returns the raw value without draining).
     emitted_athrow: bool,
+    /// This method uses frame-preserving exception exits for handlers that
+    /// read non-parameter locals (RBC.6 precise-handler continuation).
+    precise_exception_frames: bool,
     /// An allocation OOM bail (`emit_post_alloc_oom_check`) was emitted in this
     /// method — by `newarray` (0xbc), `anewarray` (0xbd), or `new` (0xbb).
     /// Forces `has_dispatch` for the SAME thread-availability reason as
@@ -8570,6 +8590,7 @@ impl Compiler {
         num_scalar_slots: usize,
         cache_jit_thread_for_inline_new: bool,
         reserve_stack_floor: bool,
+        precise_exception_frames: bool,
     ) -> Self {
         // Compact arrays: byte[] uses 1-byte elements, int[] uses 4-byte, ref[] uses 8-byte.
         // Each local takes 8 bytes: [rbp - 8], [rbp - 16], ...
@@ -8794,7 +8815,7 @@ impl Compiler {
         // [rbp - (deopt_regs_base - r*8)] (ascending with r from
         // &gpr[0] = [rbp - deopt_regs_base]); the XMM half follows the GPR half in
         // `#[repr(C)]` order, so xmm[n] at [rbp - (deopt_regs_base - 128 - n*8)].
-        let deopt_regs_size = if crate::deopt_real_enabled() {
+        let deopt_regs_size = if crate::deopt_real_enabled() || precise_exception_frames {
             32 * 8
         } else {
             0
@@ -8871,6 +8892,7 @@ impl Compiler {
             dbg_last_pc: 0,
             dbg_last_op: 0,
             emitted_athrow: false,
+            precise_exception_frames,
             emitted_alloc_oom_check: false,
             emitted_checkcast_throw: false,
             forward_patches: Vec::new(),
@@ -14718,8 +14740,7 @@ impl Compiler {
                 cratonvm_types::class_layout(class_id_raw)
                     .filter(|l| l.field_count() == num_fields)
                     .map(|l| {
-                        let (addr, expected) =
-                            cratonvm_types::layout_replace_guard(class_id_raw);
+                        let (addr, expected) = cratonvm_types::layout_replace_guard(class_id_raw);
                         (l.body_size as usize, addr, expected)
                     })
             } else {
@@ -17423,6 +17444,20 @@ impl Compiler {
     /// SHA-512 word == `0x8000_0000_0000_0000` would otherwise be misread as a
     /// deopt and the caller would silently bail mid-method).
     fn emit_post_invoke_exception_check(&mut self, ret_type: u8) {
+        // The bytecode compiler has just emitted the dispatch, so its local
+        // homes still describe the point at which an exception from that call
+        // is caught. A params-only handler reconstruction is insufficient for
+        // this method; retain a typed snapshot and branch to its frame-deopt
+        // exit instead of the shared sentinel-only exit below.
+        if self.precise_exception_frames
+            && !self.deopt_box_ptr_by_bci.contains_key(&self.dbg_last_pc)
+        {
+            let box_ptr = self.build_and_record_deopt_point(
+                self.dbg_last_pc,
+                crate::deopt::DeoptReason::ReceiverTypeChanged,
+            );
+            self.deopt_box_ptr_by_bci.insert(self.dbg_last_pc, box_ptr);
+        }
         // MOV R10, i64::MIN  (49 BA <imm64>)
         self.buf.emit(&[0x49, 0xBA]);
         self.buf.emit(&(i64::MIN as u64).to_le_bytes()); // Cast: x86-64 immediate encoding
@@ -17448,7 +17483,11 @@ impl Compiler {
             self.buf.emit(&[0x0F, 0x85]);
             let patch_offset = self.buf.pos();
             self.buf.emit(&[0x00, 0x00, 0x00, 0x00]); // placeholder rel32
-            self.exception_check_stubs.push(patch_offset);
+            if self.precise_exception_frames {
+                self.deopt_stubs.push((patch_offset, self.dbg_last_pc, 9));
+            } else {
+                self.exception_check_stubs.push(patch_offset);
+            }
             // .keep: patch the JNE above to land here (self-relative ⇒ copy-safe).
             let keep_off = self.buf.pos();
             let rel = (keep_off as i32) - (keep_patch as i32 + 4); // Cast: rel32 displacement
@@ -17458,7 +17497,11 @@ impl Compiler {
             self.buf.emit(&[0x0F, 0x84]);
             let patch_offset = self.buf.pos();
             self.buf.emit(&[0x00, 0x00, 0x00, 0x00]); // placeholder rel32
-            self.exception_check_stubs.push(patch_offset);
+            if self.precise_exception_frames {
+                self.deopt_stubs.push((patch_offset, self.dbg_last_pc, 9));
+            } else {
+                self.exception_check_stubs.push(patch_offset);
+            }
         }
     }
 
@@ -17651,7 +17694,7 @@ impl Compiler {
             // indy-trap artifact (no helper there could resolve it). Repro:
             // scratch-min/IndyReplay.java (nested shape: 30000/30000 calls
             // corrupted side effects before these fixes, 0 after).
-            let frame_box_ptr = if crate::deopt_real_enabled() || reason == 8 {
+            let frame_box_ptr = if crate::deopt_real_enabled() || matches!(reason, 8 | 9) {
                 match reason {
                     2 => self.deopt_box_ptr_by_bci.get(&bci).copied(),
                     // Step 6: String-intrinsic and call-site type-check guards
@@ -17663,6 +17706,11 @@ impl Compiler {
                     // Reason 8 (UnreachedCode / invokedynamic trap): unconditional,
                     // NOT gated behind `deopt_real_enabled()` — see the doc above.
                     8 => self.osr_exit_box_ptr_by_bci.get(&bci).copied(),
+                    // Reason 9 is a pending Java exception in a method whose
+                    // handler reads non-parameter locals. Its snapshot is taken
+                    // immediately after the throwing invoke, and is consumed by
+                    // the interpreter's exception route rather than normal resume.
+                    9 => self.deopt_box_ptr_by_bci.get(&bci).copied(),
                     _ => None,
                 }
             } else {
@@ -25816,7 +25864,8 @@ impl Compiler {
                                 || self
                                     .method_label
                                     .starts_with("java/util/regex/Pattern$GroupHead.match");
-                            let inline_virtual_ic_allowed = crate::direct_jit_callee_calls_enabled()
+                            let inline_virtual_ic_allowed =
+                                crate::direct_jit_callee_calls_enabled()
                                 && !regex_backtracking_frame;
                             let pic_inline = false;
                             let mic_inline = inline_virtual_ic_allowed
@@ -26475,7 +26524,10 @@ impl Compiler {
                 // `invokespecial AssertionError.<init>` + `athrow`.
                 0xba => {
                     // O(1) pc-indexed lookup — see `indy_info` field doc.
-                    let info = self.indy_info_idx.get(&pc).map(|&i| self.indy_info[i].clone());
+                    let info = self
+                        .indy_info_idx
+                        .get(&pc)
+                        .map(|&i| self.indy_info[i].clone());
                     let Some((_pc, arg_slots, ret_type, arg_type_tags)) = info else {
                         // No resolver, or this site couldn't be resolved at
                         // compile time: fail safe and bail the whole method,
@@ -27399,6 +27451,9 @@ pub fn compile_with_param_slots(
     // Consume the pure-kernel GPR local-homes request FIRST so an early bail
     // below can never leak it into an unrelated later compile on this thread.
     let kernel_reg_homes_requested = KERNEL_REG_HOMES_REQUEST.with(|c| c.take());
+    // A handler-local request is one-shot too, so a compile bailout cannot
+    // accidentally arm the next unrelated method on this worker thread.
+    let precise_exception_frames = PRECISE_EXCEPTION_FRAME_REQUEST.with(|c| c.take());
     // OSR-tier request (perf/halfgap-20260717): same purity conditions below,
     // but the published artifact KEEPS its OSR entries — the trampoline's
     // register-seeded entry contract is exactly what the assignments
@@ -27850,6 +27905,7 @@ pub fn compile_with_param_slots(
         num_scalar_slots,
         cache_jit_thread_for_inline_new,
         reserve_stack_floor,
+        precise_exception_frames,
     );
     KERNEL_REG_HOMES_ACTIVE.with(|c| c.set(false));
     compiler.param_jvm_slots = param_jvm_slots.to_vec();
@@ -28096,7 +28152,7 @@ pub fn compile_with_param_slots(
 
     // deopt-osr P2 — per-local width/type source for the deopt snapshot. Only the
     // (gated) snapshot consumes it, so skip the scan entirely in production.
-    if crate::deopt_real_enabled() {
+    if crate::deopt_real_enabled() || precise_exception_frames {
         compiler.local_kinds = classify_local_kinds(code, code_len, max_locals);
         // FU2 — method-level cat-2/FP gate for the operand-stack snapshot.
         compiler.uses_long_float_double = code_uses_long_float_double(code, code_len);
@@ -28765,6 +28821,7 @@ mod tests {
             alloc_result,
             test_helpers(),
             0,
+            false,
             false,
             false,
         );
@@ -34615,9 +34672,16 @@ mod tests {
             "canonical j += i must name the step local"
         );
         let (safe_pcs, guards) = analyze_bounds_elimination(&code, code_len, &loops);
-        assert!(safe_pcs.contains(&8), "bastore at pc=8 should be guard-elided");
+        assert!(
+            safe_pcs.contains(&8),
+            "bastore at pc=8 should be guard-elided"
+        );
         assert_eq!(guards.len(), 1);
-        assert_eq!(guards[0].step_local, Some(3), "guard must carry the step local");
+        assert_eq!(
+            guards[0].step_local,
+            Some(3),
+            "guard must carry the step local"
+        );
         assert!(!guards[0].inclusive);
 
         // Commuted form `j = i + j` (iload_3; iload_0; iadd; istore_0) is NOT
@@ -34629,7 +34693,10 @@ mod tests {
         ];
         assert_eq!(find_iv_step_provenance(&commuted, 0, 16, 0), None);
         let (safe2, guards2) = analyze_bounds_elimination(&commuted, code_len, &loops);
-        assert!(!safe2.contains(&8), "unproven step must keep the bounds check");
+        assert!(
+            !safe2.contains(&8),
+            "unproven step must keep the bounds check"
+        );
         assert!(guards2.is_empty());
     }
 

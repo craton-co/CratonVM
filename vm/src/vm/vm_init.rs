@@ -749,6 +749,10 @@ pub struct SharedVm {
     /// Flag to request an explicit GC at next safepoint (set by System.gc() / GC.run).
     pub gc_requested: std::sync::atomic::AtomicBool,
 
+    /// A native array allocation crossed the occupancy threshold. The next
+    /// native-call boundary collects after pinning and remapping its arguments.
+    pub native_array_gc_requested: std::sync::atomic::AtomicBool,
+
     /// B6: Counter of silent swallows during class init / invokedynamic / native calls.
     /// Incremented whenever an error is swallowed (converted to a WARN) so the CLI
     /// can surface a summary after main() completes silently. Visible via tracing
@@ -2056,9 +2060,7 @@ impl SharedVm {
             // `register_synthetic_overrides` (which is where this
             // registration otherwise lives, via `register_p67_misc`), same
             // "keep in sync" reasoning as `register_p60_process_handle` above.
-            cratonvm_native_builtins::phases_late::register_classvalue_natives(
-                &mut native_methods,
-            );
+            cratonvm_native_builtins::phases_late::register_classvalue_natives(&mut native_methods);
             register_collections_natives(&mut native_methods);
             // Re-register the side-table-backed `java.util.Random` /
             // `SecureRandom` natives AFTER `register_collections_natives`:
@@ -2922,6 +2924,7 @@ impl SharedVm {
             class_loading_locks: parking_lot::Mutex::new(FxHashMap::default()),
             diagnostic_counters: crate::runtime::diagnostics::DiagnosticCounters::new(),
             gc_requested: std::sync::atomic::AtomicBool::new(false),
+            native_array_gc_requested: std::sync::atomic::AtomicBool::new(false),
             swallow_counter: std::sync::atomic::AtomicU64::new(0),
             stack_dump_requested: std::sync::atomic::AtomicBool::new(false),
             stack_dump_ack_count: std::sync::atomic::AtomicU32::new(0),

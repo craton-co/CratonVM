@@ -171,7 +171,8 @@ fn class_id_in_generic_scope(
     ctx: &dyn NativeContext,
     name: &str,
 ) -> Option<cratonvm_types::ClassId> {
-    let dbg = std::env::var("CRATONVM_DBG_LAMBDA_GENERIC").is_ok() && name.contains("ApplicationContextInitializer");
+    let dbg = std::env::var("CRATONVM_DBG_LAMBDA_GENERIC").is_ok()
+        && name.contains("ApplicationContextInitializer");
     let decl_opt = GENERIC_DECL_SCOPE.with(|scope| scope.get());
     let near_opt = decl_opt.and_then(|decl| ctx.class_id_from_mirror(decl));
     let scoped = near_opt.and_then(|near| ctx.class_id_by_name_near(name, near));

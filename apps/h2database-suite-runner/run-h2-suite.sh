@@ -306,7 +306,10 @@ list_for_category() {
     base="$f"
   fi
   if [ -n "$SHARD" ]; then
-    local i="${SHARD%/*}" m="${SHARD#*/}" f="$META/.shard-${i}of${m}-$$.tsv"
+    local i m f
+    i="${SHARD%/*}"
+    m="${SHARD#*/}"
+    f="$META/.shard-${i}of${m}-$$.tsv"
     awk -v i="$i" -v m="$m" 'NR % m == (i - 1) % m' "$base" > "$f"
     base="$f"
   fi

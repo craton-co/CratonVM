@@ -411,6 +411,25 @@ pub fn update_all_roots(
         }
     }
 
+    for entry in &mut thread.jit_hashmap_string_node_cache {
+        for obj_ref in [&mut entry.map, &mut entry.node] {
+            let old_addr = obj_ref.as_ptr() as usize;
+            if let Some(&new_addr) = pointer_map.get(&old_addr) {
+                debug_assert!(new_addr != 0, "GC pointer map contains null address");
+                *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+            }
+        }
+    }
+    for entry in &mut thread.string_case_cache {
+        for obj_ref in [&mut entry.source, &mut entry.first, &mut entry.second] {
+            let old_addr = obj_ref.as_ptr() as usize;
+            if let Some(&new_addr) = pointer_map.get(&old_addr) {
+                debug_assert!(new_addr != 0, "GC pointer map contains null address");
+                *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+            }
+        }
+    }
+
     // 2. Static fields
     {
         let mut statics = shared.statics.write();

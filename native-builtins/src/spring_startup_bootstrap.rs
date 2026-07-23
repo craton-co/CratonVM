@@ -527,7 +527,10 @@ fn get_or_create_bean_factory(ctx: &mut dyn NativeContext, receiver: ObjectRef) 
         let rname = ctx.class_name_of_id(rcid).unwrap_or_default();
         eprintln!(
             "[CRATONVM_DBG_GOCBF] receiver={:?} class={} fast_path={} current={:?}",
-            receiver, rname, matches!(current, Value::Object(Some(_))), current
+            receiver,
+            rname,
+            matches!(current, Value::Object(Some(_))),
+            current
         );
     }
     if let Value::Object(Some(bf)) = current {
@@ -1755,6 +1758,18 @@ pub fn register(registry: &mut NativeMethodRegistry) {
         bdru_register_bean_definition,
     );
 
+    // See `finish_bean_factory_initialization`'s doc comment: this is the
+    // correct chokepoint (fires only for a caller committed to a full
+    // ApplicationContext boot, before preInstantiateSingletons's eager
+    // pass) for sweeping orphaned bean definitions that the registration
+    // -time check above no longer drops.
+    registry.register(
+        ABSTRACT_CTX,
+        "finishBeanFactoryInitialization",
+        "(Lorg/springframework/beans/factory/config/ConfigurableListableBeanFactory;)V",
+        finish_bean_factory_initialization,
+    );
+
     // ── demo Spring Boot 4 shim: targeted no-op for
     //    `ConfigurationClassPostProcessor.processConfigBeanDefinitions` ─────
     //
@@ -2686,6 +2701,7 @@ fn try_build_replace_override(
     const ACC_FINAL: u16 = 0x0010;
     const ACC_ABSTRACT: u16 = 0x0400;
     const ACC_NATIVE: u16 = 0x0100;
+    const ACC_INTERFACE: u16 = 0x0200;
     const REPLACE_OVERRIDE: &str = "org/springframework/beans/factory/support/ReplaceOverride";
 
     // GC-safety: `mbd`/`owner` (function parameters) are dereferenced again
@@ -2808,7 +2824,10 @@ fn try_build_replace_override(
                     }
                     ctx.unpin_native_roots(ovr_pin);
                     if !mname.is_empty() {
-                        replacers.entry(mname).or_default().push(ReplaceOverrideCfg {
+                        replacers
+                            .entry(mname)
+                            .or_default()
+                            .push(ReplaceOverrideCfg {
                             type_identifiers,
                             replacer_bean_name: rname,
                         });
@@ -2834,19 +2853,31 @@ fn try_build_replace_override(
         declaring_internal: String,
     }
     let mut candidates: Vec<Candidate> = Vec::new();
-    let mut cursor = Some(super_cid);
-    while let Some(cid) = cursor {
-        let cid_internal = ctx.class_name_of_id(cid).unwrap_or_default();
-        for m in ctx.declared_methods(cid) {
+    // An interface (e.g. `EchoService` in
+    // XmlBeanFactoryTests.replaceNonOverloadedInterfaceMethodWithoutSpecifyingExplicitArgTypes)
+    // has no superclass chain to walk (`superclass_of` is meaningless for
+    // it) and its overridable methods are its own ABSTRACT (or default)
+    // declared methods directly -- unlike the class case, ACC_ABSTRACT must
+    // NOT be filtered out here, since every plain interface method has it.
+    // Every abstract method is also tracked separately in `all_abstract` so
+    // the interface codegen path below can stub out any that don't end up
+    // matched to a replacer (a concrete class implementing an interface
+    // must give EVERY abstract method some body).
+    let is_interface = ctx.class_access_flags(super_cid) & ACC_INTERFACE != 0;
+    let mut all_abstract: Vec<(String, String)> = Vec::new();
+    if is_interface {
+        let cid_internal = ctx.class_name_of_id(super_cid).unwrap_or_default();
+        for m in ctx.declared_methods(super_cid) {
             if m.name.starts_with('<') {
                 continue;
             }
-            if !replacers.contains_key(&m.name) {
+            if m.access_flags & (ACC_STATIC | ACC_PRIVATE | ACC_FINAL | ACC_NATIVE) != 0 {
                 continue;
             }
-            if m.access_flags & (ACC_STATIC | ACC_PRIVATE | ACC_FINAL | ACC_ABSTRACT | ACC_NATIVE)
-                != 0
-            {
+            if m.access_flags & ACC_ABSTRACT != 0 {
+                all_abstract.push((m.name.clone(), m.descriptor.clone()));
+            }
+            if !replacers.contains_key(&m.name) {
                 continue;
             }
             if !seen.insert((m.name.clone(), m.descriptor.clone())) {
@@ -2859,7 +2890,35 @@ fn try_build_replace_override(
                 declaring_internal: cid_internal.clone(),
             });
         }
-        cursor = ctx.superclass_of(cid);
+    } else {
+        let mut cursor = Some(super_cid);
+        while let Some(cid) = cursor {
+            let cid_internal = ctx.class_name_of_id(cid).unwrap_or_default();
+            for m in ctx.declared_methods(cid) {
+                if m.name.starts_with('<') {
+                    continue;
+                }
+                if !replacers.contains_key(&m.name) {
+                    continue;
+                }
+                if m.access_flags
+                    & (ACC_STATIC | ACC_PRIVATE | ACC_FINAL | ACC_ABSTRACT | ACC_NATIVE)
+                    != 0
+                {
+                    continue;
+                }
+                if !seen.insert((m.name.clone(), m.descriptor.clone())) {
+                    continue;
+                }
+                candidates.push(Candidate {
+                    name: m.name.clone(),
+                    descriptor: m.descriptor.clone(),
+                    access_flags: m.access_flags,
+                    declaring_internal: cid_internal.clone(),
+                });
+            }
+            cursor = ctx.superclass_of(cid);
+        }
     }
     // A name is "overloaded" (in `ReplaceOverride.matches`'s sense) iff more
     // than one candidate method shares it -- matches Spring's own
@@ -2926,11 +2985,26 @@ fn try_build_replace_override(
     let new_name = if let Some(name) = cached_name {
         name
     } else {
-        let (new_name, bytes) = crate::cglib_enhancer::build_replace_override_subclass(
-            &super_internal,
-            &specs,
-            own_bean_factory_field,
-        );
+        let (new_name, bytes) = if is_interface {
+            // Real CGLIB: "if the 'superclass' is in fact an interface, turn
+            // it into an implemented interface" -- generate `extends Object
+            // implements <iface>` instead of the (illegal) `extends <iface>`.
+            let uncovered: Vec<(String, String)> = all_abstract
+                .into_iter()
+                .filter(|(n, d)| !specs.iter().any(|s| &s.name == n && &s.descriptor == d))
+                .collect();
+            crate::cglib_enhancer::build_replace_override_subclass_for_interface(
+                &super_internal,
+                &specs,
+                &uncovered,
+            )
+        } else {
+            crate::cglib_enhancer::build_replace_override_subclass(
+                &super_internal,
+                &specs,
+                own_bean_factory_field,
+            )
+        };
         let opts = DefineClassFull {
             override_name: Some(new_name.clone()),
             skip_verification: true,
@@ -3733,6 +3807,76 @@ fn m4_abstract_bean_factory_do_resolve_bean_class(
 /// - If the factory doesn't expose a `removeBeanDefinition` or
 ///   `beanDefinitionMap`, silently no-op (we just return null and let the
 ///   downstream code see a bean with no resolved class — bad, but no panic).
+/// Wrap `cause` (whatever `RootBeanDefinition.prepareMethodOverrides()` threw
+/// — real bytecode, a `BeanDefinitionValidationException` for an invalid
+/// `<lookup-method>`/`<replaced-method>` name) as a
+/// `BeanDefinitionStoreException("Validation of method overrides failed", cause)`,
+/// matching real `AbstractBeanFactory.resolveBeanClass(RootBeanDefinition,
+/// String, Class<?>...)`'s own
+/// `catch (BeanDefinitionValidationException ex) { throw new
+/// BeanDefinitionStoreException(mbd.getResourceDescription(), beanName,
+/// "Validation of method overrides failed", ex); }`. `m5` fully REPLACES that
+/// method, so this wrapping has to happen here instead of in a real catch
+/// block — same rationale as `throw_cannot_load_bean_class_exception` right
+/// above it.
+fn wrap_as_bean_definition_store_exception(
+    ctx: &mut dyn NativeContext,
+    resource_description: Option<&str>,
+    bean_name: &str,
+    cause: ObjectRef,
+) -> MethodCallFailed {
+    let cause_pin = ctx.pin_native_root(cause);
+    match ctx.new_object("org/springframework/beans/factory/BeanDefinitionStoreException") {
+        Ok(Some(Value::Object(Some(exc)))) => {
+            let exc_pin = ctx.pin_native_root(exc);
+            let resource_val = match resource_description {
+                Some(s) => Value::Object(Some(ctx.create_string(s))),
+                None => Value::Object(None),
+            };
+            let resource_val_pin = match resource_val {
+                Value::Object(Some(o)) => Some(ctx.pin_native_root(o)),
+                _ => None,
+            };
+            let name_val = Value::Object(Some(ctx.create_string(bean_name)));
+            let name_val_pin = match name_val {
+                Value::Object(Some(o)) => Some(ctx.pin_native_root(o)),
+                _ => None,
+            };
+            let msg_val = Value::Object(Some(ctx.create_string("Validation of method overrides failed")));
+            let exc = ctx.read_native_pin(exc_pin, exc);
+            let resource_val = match (resource_val, resource_val_pin) {
+                (Value::Object(Some(o)), Some(p)) => Value::Object(Some(ctx.read_native_pin(p, o))),
+                _ => resource_val,
+            };
+            let name_val = match (name_val, name_val_pin) {
+                (Value::Object(Some(o)), Some(p)) => Value::Object(Some(ctx.read_native_pin(p, o))),
+                _ => name_val,
+            };
+            let cause = ctx.read_native_pin(cause_pin, cause);
+            let _ = ctx.invoke(
+                "org/springframework/beans/factory/BeanDefinitionStoreException",
+                "<init>",
+                "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/Throwable;)V",
+                &[
+                    Value::Object(Some(exc)),
+                    resource_val,
+                    name_val,
+                    msg_val,
+                    Value::Object(Some(cause)),
+                ],
+            );
+            ctx.unpin_native_roots(cause_pin);
+            MethodCallFailed::ExceptionThrown(exc)
+        }
+        _ => {
+            ctx.unpin_native_roots(cause_pin);
+            // Couldn't even allocate the wrapper — surface the original
+            // validation failure directly rather than swallowing it.
+            MethodCallFailed::ExceptionThrown(cause)
+        }
+    }
+}
+
 fn m5_abstract_bean_factory_resolve_bean_class_with_name(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -3750,6 +3894,17 @@ fn m5_abstract_bean_factory_resolve_bean_class_with_name(
     // function and re-read before each subsequent use.
     let mbd_pin = ctx.pin_native_root(mbd);
 
+    // Snapshot BEFORE resolving: does `beanClass` already hold a resolved
+    // Class mirror? Mirrors real bytecode's `if (mbd.hasBeanClass()) return
+    // mbd.getBeanClass();` early return, which skips `prepareMethodOverrides()`
+    // entirely on every call after the first (validation already happened
+    // the first time). Only a resolution that is fresh THIS call replays it.
+    let already_resolved = matches!(
+        ctx.get_field_by_name(mbd, "beanClass"),
+        Value::Object(Some(o))
+            if ctx.class_name_of_id(ctx.class_id_of_object(o)).as_deref() == Some("java/lang/Class")
+    );
+
     // Resolve from the real `beanClass` field (already-resolved mirror, or the
     // String class name). Loadable classes resolve (and cache back); a bean with
     // NO class name (factory/parent bean) returns null WITHOUT removal (real
@@ -3757,6 +3912,34 @@ fn m5_abstract_bean_factory_resolve_bean_class_with_name(
     // partial-classpath removal path below.
     match resolve_bean_class_field(ctx, mbd) {
         BeanClassResolution::Resolved(mirror) => {
+            if !already_resolved {
+                let mbd = ctx.read_native_pin(mbd_pin, mbd);
+                if let Err(e) = ctx.invoke_virtual(mbd, "prepareMethodOverrides", "()V", &[]) {
+                    match e {
+                        MethodCallFailed::ExceptionThrown(cause) => {
+                            let mbd = ctx.read_native_pin(mbd_pin, mbd);
+                            let resource_description = resource_description_of(ctx, mbd);
+                            let bean_name = bean_name_obj
+                                .and_then(|v| match v {
+                                    Value::Object(Some(s)) => ctx.read_string(s),
+                                    _ => None,
+                                })
+                                .unwrap_or_default();
+                            ctx.unpin_native_roots(mbd_pin);
+                            return Err(wrap_as_bean_definition_store_exception(
+                                ctx,
+                                resource_description.as_deref(),
+                                &bean_name,
+                                cause,
+                            ));
+                        }
+                        other => {
+                            ctx.unpin_native_roots(mbd_pin);
+                            return Err(other);
+                        }
+                    }
+                }
+            }
             return Ok(Some(Value::Object(Some(mirror))));
         }
         BeanClassResolution::NoClass => {
@@ -4031,6 +4214,235 @@ fn noop_void(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult 
 ///   * Otherwise re-invoke `registry.registerBeanDefinition(name, bd)`
 ///     manually to faithfully reproduce what the original bytecode would have
 ///     done.  This keeps every other app's happy path unchanged.
+/// Whether `cn` (a bean's declared class name, dotted form, e.g.
+/// `"com.example.Foo"` or `"com.example.Outer.Inner"`) resolves to a class
+/// reachable on our classpath — tries the internal (slash) form, the dotted
+/// form, a resource probe (a loaded-set miss is NOT proof of absence — see
+/// the FIX(bug-B) note this mirrors), and finally the nested-class dotted
+/// convention (`Outer.Inner` -> `Outer$Inner`, since Java has no such thing
+/// as a top-level "Outer.Inner" class).
+///
+/// Shared by `bdru_register_bean_definition`'s (former) registration-time
+/// check, `m5_abstract_bean_factory_resolve_bean_class_with_name`'s
+/// removal decision, and `finish_bean_factory_initialization`'s sweep — keep
+/// all three in sync if this changes.
+fn bean_class_name_loadable(ctx: &mut dyn NativeContext, cn: &str) -> bool {
+    let internal = cn.replace('.', "/");
+    let mut loadable = ctx.class_id_by_name(&internal).is_some()
+        || ctx.class_id_by_name(cn).is_some()
+        || ctx.find_resource(&format!("{internal}.class")).is_some();
+    if !loadable {
+        if let Some(last_dot) = cn.rfind('.') {
+            let nested_dotted = format!("{}${}", &cn[..last_dot], &cn[last_dot + 1..]);
+            let nested_internal = nested_dotted.replace('.', "/");
+            if ctx.class_id_by_name(&nested_internal).is_some()
+                || ctx.class_id_by_name(&nested_dotted).is_some()
+                || ctx
+                    .find_resource(&format!("{nested_internal}.class"))
+                    .is_some()
+            {
+                loadable = true;
+            }
+        }
+    }
+    loadable
+}
+
+/// Low-level orphan-bean punch-out: removes `bean_name` from `factory`'s
+/// definition map/list/frozen-names-cache/manual-singleton-set. Exact same
+/// 5-step belt-and-braces sequence as
+/// `m5_abstract_bean_factory_resolve_bean_class_with_name`'s removal branch
+/// (see that function's doc comment for why each of the 5 steps is needed —
+/// duplicated here rather than shared so a change to m5's already-verified
+/// behavior can't accidentally affect this newer caller, or vice versa).
+fn remove_bean_definition_low_level(ctx: &mut dyn NativeContext, factory: ObjectRef, bean_name: &str) {
+    let factory_pin = ctx.pin_native_root(factory);
+    let name_str = ctx.create_string(bean_name);
+    let factory = ctx.read_native_pin(factory_pin, factory);
+    let name_pin = ctx.pin_native_root(name_str);
+
+    let _ = ctx.invoke(
+        "org/springframework/beans/factory/support/DefaultListableBeanFactory",
+        "removeBeanDefinition",
+        "(Ljava/lang/String;)V",
+        &[Value::Object(Some(factory)), Value::Object(Some(name_str))],
+    );
+    let factory = ctx.read_native_pin(factory_pin, factory);
+    let name_str = ctx.read_native_pin(name_pin, name_str);
+    let _ = ctx.invoke(
+        "org/springframework/beans/factory/support/BeanDefinitionRegistry",
+        "removeBeanDefinition",
+        "(Ljava/lang/String;)V",
+        &[Value::Object(Some(factory)), Value::Object(Some(name_str))],
+    );
+
+    let factory = ctx.read_native_pin(factory_pin, factory);
+    if let Value::Object(Some(map)) = ctx.get_field_by_name(factory, "beanDefinitionMap") {
+        let name_str = ctx.read_native_pin(name_pin, name_str);
+        let _ = ctx.invoke(
+            "java/util/Map",
+            "remove",
+            "(Ljava/lang/Object;)Ljava/lang/Object;",
+            &[Value::Object(Some(map)), Value::Object(Some(name_str))],
+        );
+    }
+
+    let factory = ctx.read_native_pin(factory_pin, factory);
+    if let Value::Object(Some(list)) = ctx.get_field_by_name(factory, "beanDefinitionNames") {
+        let name_str = ctx.read_native_pin(name_pin, name_str);
+        let _ = ctx.invoke(
+            "java/util/List",
+            "remove",
+            "(Ljava/lang/Object;)Z",
+            &[Value::Object(Some(list)), Value::Object(Some(name_str))],
+        );
+    }
+
+    let factory = ctx.read_native_pin(factory_pin, factory);
+    ctx.set_field_by_name(factory, "frozenBeanDefinitionNames", Value::Object(None));
+
+    let factory = ctx.read_native_pin(factory_pin, factory);
+    if let Value::Object(Some(set)) = ctx.get_field_by_name(factory, "manualSingletonNames") {
+        let name_str = ctx.read_native_pin(name_pin, name_str);
+        let _ = ctx.invoke(
+            "java/util/Set",
+            "remove",
+            "(Ljava/lang/Object;)Z",
+            &[Value::Object(Some(set)), Value::Object(Some(name_str))],
+        );
+    }
+    ctx.unpin_native_roots(name_pin);
+    ctx.unpin_native_roots(factory_pin);
+}
+
+/// `AbstractApplicationContext.finishBeanFactoryInitialization(
+/// ConfigurableListableBeanFactory)` — the last `refresh()` step before
+/// `beanFactory.preInstantiateSingletons()` eagerly instantiates every
+/// non-abstract, non-lazy singleton.
+///
+/// `bdru_register_bean_definition` used to drop an orphaned (declared class
+/// not loadable on our partial classpath, non-lazy) bean definition at
+/// REGISTRATION time, before it was knowable whether the definition would
+/// ever be reached by a bulk eager-instantiation pass at all. That broke a
+/// bare `DefaultListableBeanFactory` used directly (no
+/// `ApplicationContext.refresh()` ever runs, e.g.
+/// `XmlBeanFactoryTests.rejectsOverrideOfBogusMethodName`/`classNotFound*`,
+/// which parse+register bean definitions via the very same
+/// `BeanDefinitionReaderUtils.registerBeanDefinition` entry point as any
+/// `ApplicationContext`, then call `factory.getBean(...)` directly): those
+/// tests expect `NoSuchBeanDefinitionException`/`CannotLoadBeanClassException`
+/// from the explicit `getBean()` call, but the orphan never even reached the
+/// registry, so `getBean()` failed one step too early with the wrong
+/// exception (or, for `classNotFoundWithDefaultBeanClassLoader`, the bean was
+/// silently missing instead of surfacing `getBeanClassName()` unresolved).
+///
+/// This is the correct chokepoint instead: it fires ONLY for a caller that
+/// commits to a full `ApplicationContext` boot (this method is reached
+/// exclusively from `AbstractApplicationContext.refresh()`, never from a bare
+/// `BeanFactory`), and it fires BEFORE `preInstantiateSingletons()` takes its
+/// `beanNames` snapshot — so an orphan swept here is invisible to that bulk
+/// pass, protecting sportme's partial-classpath boot (an unloadable
+/// `RedisHttpSessionConfiguration` etc. never trips
+/// `isFactoryBean(beanName)`'s type-probe followed by an uncaught
+/// `NoSuchBeanDefinitionException`/`BeanCreationException` cascade) exactly
+/// as the old registration-time gate did, without over-firing for callers
+/// that never reach this method.
+///
+/// args[0] = this (AbstractApplicationContext), args[1] = beanFactory.
+fn finish_bean_factory_initialization(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    const DESC: &str = "(Lorg/springframework/beans/factory/config/ConfigurableListableBeanFactory;)V";
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let factory = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return ctx.invoke_virtual_bytecode_only(this, "finishBeanFactoryInitialization", DESC, &args[1..]),
+    };
+
+    let this_pin = ctx.pin_native_root(this);
+    let factory_pin = ctx.pin_native_root(factory);
+
+    // Snapshot the currently-registered bean names up front — the sweep
+    // below mutates the live registry, so iterating a defensive copy avoids
+    // disturbing the iteration itself (matches real Spring's own
+    // `new ArrayList<>(this.beanDefinitionNames)` snapshot-then-iterate
+    // pattern in `preInstantiateSingletons`).
+    let mut names: Vec<String> = Vec::new();
+    let factory_r = ctx.read_native_pin(factory_pin, factory);
+    if let Ok(Some(Value::Object(Some(names_arr)))) =
+        ctx.invoke_virtual(factory_r, "getBeanDefinitionNames", "()[Ljava/lang/String;", &[])
+    {
+        let names_arr_pin = ctx.pin_native_root(names_arr);
+        let n = ctx.array_length(names_arr);
+        for i in 0..n {
+            let names_arr = ctx.read_native_pin(names_arr_pin, names_arr);
+            if let Value::Object(Some(s)) = ctx.get_array_element(names_arr, i) {
+                if let Some(name) = ctx.read_string(s) {
+                    names.push(name);
+                }
+            }
+        }
+        ctx.unpin_native_roots(names_arr_pin);
+    }
+
+    for name in &names {
+        let factory_r = ctx.read_native_pin(factory_pin, factory);
+        let name_obj = ctx.create_string(name);
+        let factory_r = ctx.read_native_pin(factory_pin, factory_r);
+        let bd = match ctx.invoke_virtual(
+            factory_r,
+            "getBeanDefinition",
+            "(Ljava/lang/String;)Lorg/springframework/beans/factory/config/BeanDefinition;",
+            &[Value::Object(Some(name_obj))],
+        ) {
+            Ok(Some(Value::Object(Some(o)))) => o,
+            _ => continue,
+        };
+        let bd_pin = ctx.pin_native_root(bd);
+        let cn = match ctx.invoke_virtual(bd, "getBeanClassName", "()Ljava/lang/String;", &[]) {
+            Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_default(),
+            _ => String::new(),
+        };
+        let bd = ctx.read_native_pin(bd_pin, bd);
+        // Same tolerances as the old registration-time check and m5's
+        // removal branch: null/empty (factory-method or parent-only bean),
+        // an unresolved `${...}` placeholder, an unresolved SpEL `#{...}`
+        // expression, and any `lazy-init="true"` bean are all left alone —
+        // none of them are the partial-classpath boot-crash scenario this
+        // sweep exists for.
+        if !cn.is_empty() && !cn.contains("${") && !cn.contains("#{") && !is_lazy_init(ctx, bd) {
+            if !bean_class_name_loadable(ctx, &cn) {
+                tracing::warn!(
+                    "[bean-orphan] finishBeanFactoryInitialization sweep: removing '{}' (class '{}' not loadable)",
+                    name,
+                    cn
+                );
+                ctx.unpin_native_roots(bd_pin);
+                let factory_r = ctx.read_native_pin(factory_pin, factory);
+                remove_bean_definition_low_level(ctx, factory_r, name);
+                continue;
+            }
+        }
+        ctx.unpin_native_roots(bd_pin);
+    }
+
+    let this = ctx.read_native_pin(this_pin, this);
+    let factory = ctx.read_native_pin(factory_pin, factory);
+    let result = ctx.invoke_virtual_bytecode_only(
+        this,
+        "finishBeanFactoryInitialization",
+        DESC,
+        &[Value::Object(Some(factory))],
+    );
+    ctx.unpin_native_roots(factory_pin);
+    ctx.unpin_native_roots(this_pin);
+    result
+}
+
 fn bdru_register_bean_definition(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let holder = match args.first() {
         Some(Value::Object(Some(o))) => *o,
@@ -4072,97 +4484,17 @@ fn bdru_register_bean_definition(ctx: &mut dyn NativeContext, args: &[Value]) ->
     // /class-lookup calls further below; pin it too.
     let bd_pin = ctx.pin_native_root(bd);
 
-    // Check whether the declared bean class is loadable on our classpath.
-    // Spring's getBeanClassName returns null for factory-method beans and
-    // parent-only beans — those are legitimate and must NOT be filtered.
-    // Only beans whose declared name is non-empty AND unresolvable get
-    // dropped.
-    if let Ok(Some(Value::Object(Some(s)))) =
-        ctx.invoke_virtual(bd, "getBeanClassName", "()Ljava/lang/String;", &[])
-    {
-        if let Some(cn) = ctx.read_string(s) {
-            let bd = ctx.read_native_pin(bd_pin, bd);
-            // A class name still containing an unresolved `${...}` placeholder
-            // (e.g. `org.springframework.context.support.${msClass}`) is not
-            // a genuinely-missing class — it's transiently unresolvable until
-            // a `PropertyPlaceholderConfigurer` runs during
-            // `invokeBeanFactoryPostProcessors`, which happens AFTER every
-            // bean definition (including this one) is already registered.
-            // Dropping the registration here permanently loses the bean
-            // before the placeholder ever gets a chance to resolve — real
-            // bytecode does no loadability filtering at registration time at
-            // all (`ClassPathXmlApplicationContextTests.
-            // contextWithClassNameThatContainsPlaceholder` expects
-            // `containsBean("someMessageSource")` to be true immediately
-            // after construction, long before any placeholder substitution
-            // runs). Mirrors the same guard already applied in
-            // `abstract_bean_definition_get_bean_class_name` and `m5`'s
-            // `BeanClassResolution::Placeholder` handling.
-            //
-            // A `lazy-init="true"` bean also must NOT be dropped here even
-            // when its class is genuinely, permanently unloadable (a typo,
-            // not a placeholder): `preInstantiateSingletons` never eagerly
-            // resolves a lazy bean's class, so removing it at registration
-            // time serves no partial-classpath-boot purpose for THIS bean —
-            // it only breaks the documented contract that an explicit
-            // `getBean()` on a lazy bean with a bad class name throws
-            // `CannotLoadBeanClassException` (`ClassPathXmlApplicationContextTests
-            // .contextWithInvalidLazyClass`, which our `m5`/`doResolveBeanClass`
-            // shims already handle correctly once the definition is allowed
-            // to survive to that point). Eager (non-lazy) beans keep the
-            // existing drop-at-registration tolerance — a missing class on a
-            // bean `preInstantiateSingletons` WILL eagerly try to construct
-            // is exactly the partial-classpath boot-crash scenario this
-            // filter exists for.
-            // Read the `lazyInit` field directly (a boxed `Boolean`, null
-            // unless explicitly set) rather than calling `isLazyInit()` —
-            // matches the field-access pattern already used throughout this
-            // file for `beanClass`/`beanClassName` and avoids any virtual
-            // dispatch uncertainty for this early-registration-time check.
-            if !cn.is_empty() && !cn.contains("${") && !is_lazy_init(ctx, bd) {
-                let internal = cn.replace('.', "/");
-                let mut loadable = ctx.class_id_by_name(&internal).is_some()
-                    || ctx.class_id_by_name(&cn).is_some()
-                    // FIX(bug-B): see the getBeanClassName filter above — a
-                    // loaded-set miss is NOT proof of absence; probe the classpath
-                    // resource before dropping a legitimately-loadable bean.
-                    || ctx.find_resource(&format!("{internal}.class")).is_some();
-                // FIX: nested-class dotted convention (see the identical
-                // fallback in `abstract_bean_definition_get_bean_class_name`
-                // above for the full rationale) — a bean class name like
-                // "pkg.Outer.Inner" is only loadable at "pkg/Outer$Inner",
-                // not "pkg/Outer/Inner". Without this, a legitimately
-                // loadable nested-class aspect bean (e.g.
-                // `<aop:aspect ref="testAspect">` pointing at a test's
-                // static nested aspect class) never even gets its
-                // `BeanDefinition` registered, so later lookups fail with
-                // "Can't determine type of bean" / NoSuchBeanDefinitionException.
-                if !loadable {
-                    if let Some(last_dot) = cn.rfind('.') {
-                        let nested_dotted = format!("{}${}", &cn[..last_dot], &cn[last_dot + 1..]);
-                        let nested_internal = nested_dotted.replace('.', "/");
-                        if ctx.class_id_by_name(&nested_internal).is_some()
-                            || ctx.class_id_by_name(&nested_dotted).is_some()
-                            || ctx
-                                .find_resource(&format!("{nested_internal}.class"))
-                                .is_some()
-                        {
-                            loadable = true;
-                        }
-                    }
-                }
-                if !loadable {
-                    tracing::warn!(
-                        "[bean-orphan] SKIP registering '{}' (class '{}' not loadable)",
-                        name,
-                        cn
-                    );
-                    return Ok(None);
-                }
-            }
-        }
-    }
-
+    // NOTE: this used to drop the registration here when the declared
+    // bean class wasn't loadable on our classpath. That was too early —
+    // it fired for EVERY registrar (bare `DefaultListableBeanFactory`
+    // usage included), before it was knowable whether the definition
+    // would ever reach `preInstantiateSingletons`. The equivalent sweep
+    // now happens in `finish_bean_factory_initialization`, right before
+    // `AbstractApplicationContext.refresh()`'s real eager-instantiation
+    // call — see that function's doc comment for the full rationale.
+    // Always register faithfully here; unloadable-class handling is
+    // `m5_abstract_bean_factory_resolve_bean_class_with_name`'s and
+    // `finish_bean_factory_initialization`'s job now.
     // Class is loadable (or null / factory-method bean). Faithfully delegate
     // to `registry.registerBeanDefinition(name, bd)` — this is what the
     // original static would have done after its (now skipped) validation.

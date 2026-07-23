@@ -1294,8 +1294,7 @@ fn sc_connect_bound(
             ctx.end_blocking_region();
             verdict.map_err(|e| map_err(&target, e))?;
             (stream, true)
-        }
-        // NOTE: a second `DeferredFailure` arm here would be unreachable —
+        } // NOTE: a second `DeferredFailure` arm here would be unreachable —
         // the unconditional `DeferredFailure(_stream, error) => return
         // Err(...)` arm above already matches every case this one used to
         // guard on (`allow_block == true`, since the `if !allow_block` arm
@@ -3498,10 +3497,7 @@ mod tests {
     fn connect_target_host_substitutes_loopback_for_wildcard_only() {
         assert_eq!(connect_target_host("0.0.0.0".to_string()), "127.0.0.1");
         assert_eq!(connect_target_host("::".to_string()), "::1");
-        assert_eq!(
-            connect_target_host("0:0:0:0:0:0:0:0".to_string()),
-            "::1"
-        );
+        assert_eq!(connect_target_host("0:0:0:0:0:0:0:0".to_string()), "::1");
         assert_eq!(connect_target_host("127.0.0.2".to_string()), "127.0.0.2");
         assert_eq!(
             connect_target_host("example.invalid".to_string()),

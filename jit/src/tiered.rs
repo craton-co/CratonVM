@@ -792,7 +792,9 @@ pub fn dump_method_stats_to_stderr() {
             hot_but_stuck.len().min(30)
         );
         for (count, queued, fail, name) in hot_but_stuck.iter().take(30) {
-            eprintln!("[cratonvm]   {count:>10} queued={queued:<5} tier_fail_count={fail:<3} {name}");
+            eprintln!(
+                "[cratonvm]   {count:>10} queued={queued:<5} tier_fail_count={fail:<3} {name}"
+            );
         }
     }
 }

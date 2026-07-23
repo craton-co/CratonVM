@@ -274,9 +274,25 @@ impl Arena {
                     SMALL_TIER_SCAN_BUDGET,
                     &mut self.free_bytes_total,
                 )
-                .or_else(|| Self::first_fit(&mut self.free_large, base, alloc_size, align, usize::MAX, &mut self.free_bytes_total))
+                .or_else(|| {
+                    Self::first_fit(
+                        &mut self.free_large,
+                        base,
+                        alloc_size,
+                        align,
+                        usize::MAX,
+                        &mut self.free_bytes_total,
+                    )
+                })
             } else {
-                Self::first_fit(&mut self.free_large, base, alloc_size, align, usize::MAX, &mut self.free_bytes_total)
+                Self::first_fit(
+                    &mut self.free_large,
+                    base,
+                    alloc_size,
+                    align,
+                    usize::MAX,
+                    &mut self.free_bytes_total,
+                )
             };
             if let Some((alloc_offset, remainders)) = hit {
                 for r in remainders.into_iter().flatten() {
@@ -331,8 +347,24 @@ impl Arena {
         // already-degenerate case where the bump tail is gone, which the
         // common case (tail available) never reaches.
         let base = self.data.as_ptr() as usize;
-        let hit = Self::first_fit(&mut self.free_small, base, alloc_size, align, usize::MAX, &mut self.free_bytes_total)
-            .or_else(|| Self::first_fit(&mut self.free_large, base, alloc_size, align, usize::MAX, &mut self.free_bytes_total));
+        let hit = Self::first_fit(
+            &mut self.free_small,
+            base,
+            alloc_size,
+            align,
+            usize::MAX,
+            &mut self.free_bytes_total,
+        )
+        .or_else(|| {
+            Self::first_fit(
+                &mut self.free_large,
+                base,
+                alloc_size,
+                align,
+                usize::MAX,
+                &mut self.free_bytes_total,
+            )
+        });
         if let Some((alloc_offset, remainders)) = hit {
             for r in remainders.into_iter().flatten() {
                 self.push_block_routed(r);

@@ -29,7 +29,9 @@ use crate::crypto::crypto_impl;
 use crate::lang_class::{mirror_class_id, native_class_is_record, native_class_is_sealed};
 use crate::lang_invoke::register_phase54_method_handle;
 use crate::lang_misc::register_phase53_record;
-use crate::lang_string::{native_string_hash_code, register_phase52_string_buffer};
+use crate::lang_string::{
+    native_string_hash_code, native_string_to_lower_case, register_phase52_string_buffer,
+};
 use crate::{
     alloc_concurrent_synthetic, build_real_layout_string_hashset, native_noop,
     native_noop_with_this, native_return_false, native_return_zero,
@@ -11061,16 +11063,16 @@ pub(crate) fn register_phase52_server_socket_factory(r: &mut NativeMethodRegistr
         "()Ljava/net/SocketAddress;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            // A ServerSocket.accept()-produced Socket (net_phase_e::
-            // re2_accept_into) never writes the raw SOCK_HOST/SOCK_PORT
-            // fields (a host String there would land on real JDK's
-            // Socket.impl slot, corrupting it) -- the real peer address
-            // is side-tabled instead. Falling straight to
-            // InetSocketAddress(String,int) with the raw (null) field
-            // threw an NPE for every accepted connection (e.g.
-            // MockWebServer's serveConnection, breaking
-            // core.io.ResourceTests). Fall back to the side table when
-            // the raw field is unset.
+            // A `ServerSocket.accept()`- or `Socket.connect()`-produced
+            // Socket never writes the raw SOCK_HOST/SOCK_PORT fields (a
+            // host String there would land on real JDK's `Socket.impl`
+            // slot, corrupting it) -- the real peer address is side-tabled
+            // instead (see net_phase_e::SockSide). Falling straight to
+            // InetSocketAddress(String,int) with the raw (null) field threw
+            // an NPE for every connected/accepted Socket (e.g. MockWebServer
+            // MockWebServer's `serveConnection`, breaking every test that
+            // logs/uses the peer address -- RestClientIntegrationTests et
+            // al). Fall back to the side table when the raw field is unset.
             let side = crate::net_phase_e::sock_get(ctx, this);
             let host = match ctx.get_field(this, SOCK_HOST) {
                 h @ Value::Object(Some(_)) => h,
@@ -11081,11 +11083,26 @@ pub(crate) fn register_phase52_server_socket_factory(r: &mut NativeMethodRegistr
                 p @ Value::Int(v) if v != 0 => p,
                 _ => Value::Int(side.port),
             };
-            ctx.new_object_initialized(
+            // `host` may be a freshly-allocated string (the `create_string`
+            // arms above) with no root holding it other than this local --
+            // `new_object_initialized` runs the real InetSocketAddress
+            // constructor bytecode (which calls InetAddress.getByName() and
+            // can allocate/GC), so pin it across that call; otherwise a GC
+            // in that window can reclaim/move it out from under the pending
+            // arg, surfacing as `obj_arg` seeing a null host inside the ctor.
+            let host_obj = match host {
+                Value::Object(Some(o)) => o,
+                _ => unreachable!("host is always Object(Some(_)) from the match above"),
+            };
+            let host_pin = ctx.pin_native_root(host_obj);
+            let host = Value::Object(Some(ctx.read_native_pin(host_pin, host_obj)));
+            let result = ctx.new_object_initialized(
                 "java/net/InetSocketAddress",
                 "(Ljava/lang/String;I)V",
                 &[host, port],
-            )
+            );
+            ctx.unpin_native_roots(host_pin);
+            result
         },
     );
     r.register(
@@ -11094,13 +11111,18 @@ pub(crate) fn register_phase52_server_socket_factory(r: &mut NativeMethodRegistr
         "()Ljava/net/SocketAddress;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let host = Value::Object(Some(ctx.create_string("127.0.0.1")));
+            let host_obj = ctx.create_string("127.0.0.1");
+            let host_pin = ctx.pin_native_root(host_obj);
+            let host_obj = ctx.read_native_pin(host_pin, host_obj);
+            let host = Value::Object(Some(host_obj));
             let port = ctx.get_field(this, SOCK_LOCAL_PORT);
-            ctx.new_object_initialized(
+            let result = ctx.new_object_initialized(
                 "java/net/InetSocketAddress",
                 "(Ljava/lang/String;I)V",
                 &[host, port],
-            )
+            );
+            ctx.unpin_native_roots(host_pin);
+            result
         },
     );
 
@@ -15209,11 +15231,16 @@ pub(crate) fn register_phase53_socket_stubs(r: &mut NativeMethodRegistry) {
         "()Ljava/net/SocketAddress;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            // See the sibling registration in
-            // register_phase52_server_socket_factory (same class, shadowed
-            // by whichever of the two registers last): an accepted
-            // Socket's real peer address lives only in net_phase_e's side
-            // table, never the raw field.
+            // A `ServerSocket.accept()`- or `Socket.connect()`-produced
+            // Socket never writes the raw SOCK_HOST/SOCK_PORT fields (a
+            // host String there would land on real JDK's `Socket.impl`
+            // slot, corrupting it) -- the real peer address is side-tabled
+            // instead (see net_phase_e::SockSide). Falling straight to
+            // InetSocketAddress(String,int) with the raw (null) field threw
+            // an NPE for every connected/accepted Socket (e.g. MockWebServer
+            // MockWebServer's `serveConnection`, breaking every test that
+            // logs/uses the peer address -- RestClientIntegrationTests et
+            // al). Fall back to the side table when the raw field is unset.
             let side = crate::net_phase_e::sock_get(ctx, this);
             let host = match ctx.get_field(this, SOCK_HOST) {
                 h @ Value::Object(Some(_)) => h,
@@ -15224,11 +15251,26 @@ pub(crate) fn register_phase53_socket_stubs(r: &mut NativeMethodRegistry) {
                 p @ Value::Int(v) if v != 0 => p,
                 _ => Value::Int(side.port),
             };
-            ctx.new_object_initialized(
+            // `host` may be a freshly-allocated string (the `create_string`
+            // arms above) with no root holding it other than this local --
+            // `new_object_initialized` runs the real InetSocketAddress
+            // constructor bytecode (which calls InetAddress.getByName() and
+            // can allocate/GC), so pin it across that call; otherwise a GC
+            // in that window can reclaim/move it out from under the pending
+            // arg, surfacing as `obj_arg` seeing a null host inside the ctor.
+            let host_obj = match host {
+                Value::Object(Some(o)) => o,
+                _ => unreachable!("host is always Object(Some(_)) from the match above"),
+            };
+            let host_pin = ctx.pin_native_root(host_obj);
+            let host = Value::Object(Some(ctx.read_native_pin(host_pin, host_obj)));
+            let result = ctx.new_object_initialized(
                 "java/net/InetSocketAddress",
                 "(Ljava/lang/String;I)V",
                 &[host, port],
-            )
+            );
+            ctx.unpin_native_roots(host_pin);
+            result
         },
     );
     r.register(
@@ -15237,13 +15279,18 @@ pub(crate) fn register_phase53_socket_stubs(r: &mut NativeMethodRegistry) {
         "()Ljava/net/SocketAddress;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let host = Value::Object(Some(ctx.create_string("127.0.0.1")));
+            let host_obj = ctx.create_string("127.0.0.1");
+            let host_pin = ctx.pin_native_root(host_obj);
+            let host_obj = ctx.read_native_pin(host_pin, host_obj);
+            let host = Value::Object(Some(host_obj));
             let port = ctx.get_field(this, SOCK_LOCAL_PORT);
-            ctx.new_object_initialized(
+            let result = ctx.new_object_initialized(
                 "java/net/InetSocketAddress",
                 "(Ljava/lang/String;I)V",
                 &[host, port],
-            )
+            );
+            ctx.unpin_native_roots(host_pin);
+            result
         },
     );
 
@@ -18930,6 +18977,18 @@ pub fn register_string_latin1_natives(r: &mut NativeMethodRegistry) {
         }
         Ok(Some(Value::Int(len1 as i32 - len2 as i32)))
     });
+
+    // `String.toLowerCase(Locale)` delegates here for compact Latin-1
+    // Strings. The generic bytecode path allocates a transient String on each
+    // lookup and is disproportionately expensive under the moving collector.
+    // Reuse the String-level implementation, which preserves the unchanged
+    // receiver and alternates distinct cached results for changed ASCII input.
+    r.register(
+        c,
+        "toLowerCase",
+        "(Ljava/lang/String;[BLjava/util/Locale;)Ljava/lang/String;",
+        |ctx, args| native_string_to_lower_case(ctx, &args[..1]),
+    );
 
     // static char getChar(byte[] val, int index)
     r.register(c, "getChar", "([BI)C", |ctx, args| {

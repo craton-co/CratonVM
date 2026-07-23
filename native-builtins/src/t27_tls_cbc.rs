@@ -44,12 +44,14 @@ use rustls::crypto::cipher::{
     MessageDecrypter, MessageEncrypter, OutboundOpaqueMessage, OutboundPlainMessage,
     PrefixedPayload, Tls12AeadAlgorithm, UnsupportedOperationError,
 };
-use rustls::crypto::hash::{Context as HashContext, Hash as HashTrait, HashAlgorithm, Output as HashOutput};
+use rustls::crypto::hash::{
+    Context as HashContext, Hash as HashTrait, HashAlgorithm, Output as HashOutput,
+};
 use rustls::crypto::hmac::{Hmac as HmacTrait, Key as HmacKeyTrait, Tag as HmacTag};
 use rustls::crypto::tls12::PrfUsingHmac;
 use rustls::crypto::KeyExchangeAlgorithm;
-use rustls::{CipherSuite, CipherSuiteCommon, ConnectionTrafficSecrets, Error, SignatureScheme};
 use rustls::Tls12CipherSuite;
+use rustls::{CipherSuite, CipherSuiteCommon, ConnectionTrafficSecrets, Error, SignatureScheme};
 
 const BLOCK_SIZE: usize = 16;
 const EXPLICIT_IV_LEN: usize = 16;
@@ -123,8 +125,20 @@ macro_rules! hash_provider {
     };
 }
 
-hash_provider!(Sha256HashProvider, Sha256Context, Sha256, HashAlgorithm::SHA256, 32);
-hash_provider!(Sha384HashProvider, Sha384Context, Sha384, HashAlgorithm::SHA384, 48);
+hash_provider!(
+    Sha256HashProvider,
+    Sha256Context,
+    Sha256,
+    HashAlgorithm::SHA256,
+    32
+);
+hash_provider!(
+    Sha384HashProvider,
+    Sha384Context,
+    Sha384,
+    HashAlgorithm::SHA384,
+    48
+);
 
 static SHA256_HASH: Sha256HashProvider = Sha256HashProvider;
 static SHA384_HASH: Sha384HashProvider = Sha384HashProvider;
@@ -217,10 +231,17 @@ const fn round_up(n: usize, to: usize) -> usize {
 /// extra.len()` is constant for a given ciphertext length (whatever the
 /// claimed padding length turned out to be), the total hashing work done is
 /// independent of the (attacker-influenced, pre-validation) padding length.
-fn compute_mac(variant: CbcVariant, key: &[u8], header: &[u8], data: &[u8], extra: &[u8]) -> Vec<u8> {
+fn compute_mac(
+    variant: CbcVariant,
+    key: &[u8],
+    header: &[u8],
+    data: &[u8],
+    extra: &[u8],
+) -> Vec<u8> {
     match variant {
         CbcVariant::Aes128Sha256 => {
-            let mut mac = HmacImpl::<Sha256>::new_from_slice(key).expect("HMAC accepts any key length");
+            let mut mac =
+                HmacImpl::<Sha256>::new_from_slice(key).expect("HMAC accepts any key length");
             mac.update(header);
             mac.update(data);
             let mac_for_extra = mac.clone();
@@ -229,7 +250,8 @@ fn compute_mac(variant: CbcVariant, key: &[u8], header: &[u8], data: &[u8], extr
             tag
         }
         CbcVariant::Aes256Sha384 => {
-            let mut mac = HmacImpl::<Sha384>::new_from_slice(key).expect("HMAC accepts any key length");
+            let mut mac =
+                HmacImpl::<Sha384>::new_from_slice(key).expect("HMAC accepts any key length");
             mac.update(header);
             mac.update(data);
             let mac_for_extra = mac.clone();
@@ -240,28 +262,42 @@ fn compute_mac(variant: CbcVariant, key: &[u8], header: &[u8], data: &[u8], extr
     }
 }
 
-fn cbc_encrypt(variant: CbcVariant, key: &[u8], iv: &[u8; EXPLICIT_IV_LEN], content: &[u8]) -> Result<Vec<u8>, Error> {
+fn cbc_encrypt(
+    variant: CbcVariant,
+    key: &[u8],
+    iv: &[u8; EXPLICIT_IV_LEN],
+    content: &[u8],
+) -> Result<Vec<u8>, Error> {
     match variant {
         CbcVariant::Aes128Sha256 => {
-            let enc = cbc::Encryptor::<Aes128>::new_from_slices(key, iv).map_err(|_| Error::EncryptError)?;
+            let enc = cbc::Encryptor::<Aes128>::new_from_slices(key, iv)
+                .map_err(|_| Error::EncryptError)?;
             Ok(enc.encrypt_padded_vec_mut::<NoPadding>(content))
         }
         CbcVariant::Aes256Sha384 => {
-            let enc = cbc::Encryptor::<Aes256>::new_from_slices(key, iv).map_err(|_| Error::EncryptError)?;
+            let enc = cbc::Encryptor::<Aes256>::new_from_slices(key, iv)
+                .map_err(|_| Error::EncryptError)?;
             Ok(enc.encrypt_padded_vec_mut::<NoPadding>(content))
         }
     }
 }
 
-fn cbc_decrypt(variant: CbcVariant, key: &[u8], iv: &[u8; EXPLICIT_IV_LEN], ciphertext: &[u8]) -> Result<Vec<u8>, Error> {
+fn cbc_decrypt(
+    variant: CbcVariant,
+    key: &[u8],
+    iv: &[u8; EXPLICIT_IV_LEN],
+    ciphertext: &[u8],
+) -> Result<Vec<u8>, Error> {
     match variant {
         CbcVariant::Aes128Sha256 => {
-            let dec = cbc::Decryptor::<Aes128>::new_from_slices(key, iv).map_err(|_| Error::DecryptError)?;
+            let dec = cbc::Decryptor::<Aes128>::new_from_slices(key, iv)
+                .map_err(|_| Error::DecryptError)?;
             dec.decrypt_padded_vec_mut::<NoPadding>(ciphertext)
                 .map_err(|_| Error::DecryptError)
         }
         CbcVariant::Aes256Sha384 => {
-            let dec = cbc::Decryptor::<Aes256>::new_from_slices(key, iv).map_err(|_| Error::DecryptError)?;
+            let dec = cbc::Decryptor::<Aes256>::new_from_slices(key, iv)
+                .map_err(|_| Error::DecryptError)?;
             dec.decrypt_padded_vec_mut::<NoPadding>(ciphertext)
                 .map_err(|_| Error::DecryptError)
         }
@@ -275,7 +311,11 @@ struct CbcCipher {
 }
 
 impl MessageEncrypter for CbcCipher {
-    fn encrypt(&mut self, msg: OutboundPlainMessage<'_>, seq: u64) -> Result<OutboundOpaqueMessage, Error> {
+    fn encrypt(
+        &mut self,
+        msg: OutboundPlainMessage<'_>,
+        seq: u64,
+    ) -> Result<OutboundOpaqueMessage, Error> {
         let payload = msg.payload.to_vec();
         let mac_size = self.variant.mac_key_len();
         let header = make_tls12_aad(seq, msg.typ, msg.version, payload.len());
@@ -312,19 +352,30 @@ impl MessageEncrypter for CbcCipher {
 }
 
 impl MessageDecrypter for CbcCipher {
-    fn decrypt<'a>(&mut self, mut msg: InboundOpaqueMessage<'a>, seq: u64) -> Result<InboundPlainMessage<'a>, Error> {
+    fn decrypt<'a>(
+        &mut self,
+        mut msg: InboundOpaqueMessage<'a>,
+        seq: u64,
+    ) -> Result<InboundPlainMessage<'a>, Error> {
         let mac_size = self.variant.mac_key_len();
         let total_len = msg.payload.len();
 
         let min_ciphertext = round_up(mac_size + 1, BLOCK_SIZE);
-        if total_len < EXPLICIT_IV_LEN + min_ciphertext || (total_len - EXPLICIT_IV_LEN) % BLOCK_SIZE != 0 {
+        if total_len < EXPLICIT_IV_LEN + min_ciphertext
+            || (total_len - EXPLICIT_IV_LEN) % BLOCK_SIZE != 0
+        {
             return Err(Error::DecryptError);
         }
 
         let mut iv = [0u8; EXPLICIT_IV_LEN];
         iv.copy_from_slice(&msg.payload[..EXPLICIT_IV_LEN]);
 
-        let plain = cbc_decrypt(self.variant, &self.enc_key, &iv, &msg.payload[EXPLICIT_IV_LEN..])?;
+        let plain = cbc_decrypt(
+            self.variant,
+            &self.enc_key,
+            &iv,
+            &msg.payload[EXPLICIT_IV_LEN..],
+        )?;
 
         let (to_remove, padding_good) = extract_padding(&plain);
 
@@ -339,7 +390,13 @@ impl MessageDecrypter for CbcCipher {
         // so `n + mac_size <= plain.len()` regardless of whether `n` was
         // clamped -- no bounds branch needed here either.
         let header = make_tls12_aad(seq, msg.typ, msg.version, n);
-        let local_mac = compute_mac(self.variant, &self.mac_key, &header, &plain[..n], &plain[n + mac_size..]);
+        let local_mac = compute_mac(
+            self.variant,
+            &self.mac_key,
+            &header,
+            &plain[..n],
+            &plain[n + mac_size..],
+        );
         let remote_mac = &plain[n..n + mac_size];
 
         let mac_choice = local_mac.as_slice().ct_eq(remote_mac);
@@ -600,7 +657,9 @@ mod t_cbc_1_tests {
             rustls::ProtocolVersion::TLSv1_2,
             &mut body,
         );
-        let plain = decrypter.decrypt(inbound, seq).expect("decrypt should succeed and MAC should verify");
+        let plain = decrypter
+            .decrypt(inbound, seq)
+            .expect("decrypt should succeed and MAC should verify");
         assert_eq!(plain.payload, &plaintext[..]);
     }
 

@@ -146,7 +146,6 @@ fn test_jit_two_sequential_try_catch_blocks_same_method() {
     }
 }
 
-
 fn liquibase_scope_bisect_class_files_available() -> bool {
     let dir = test_resources_dir();
     std::path::Path::new(&format!("{dir}/cratonvm/LiquibaseScopeBisect.class")).exists()

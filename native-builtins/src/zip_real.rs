@@ -1125,7 +1125,10 @@ mod tests {
         let (input_consumed, output_consumed, finished) = unpack_deflate_result(packed);
         assert_eq!(input_consumed, original.len());
         assert!(output_consumed > 0, "deflateBytesBuffer produced no output");
-        assert!(finished, "deflateBytesBuffer must report finished on FINISH");
+        assert!(
+            finished,
+            "deflateBytesBuffer must report finished on FINISH"
+        );
         assert_decompresses_to(&output_buf[..output_consumed], original);
 
         // deflateBufferBytes: direct ByteBuffer input, heap byte[] output.
@@ -1156,7 +1159,10 @@ mod tests {
         let (input_consumed, output_consumed, finished) = unpack_deflate_result(packed);
         assert_eq!(input_consumed, original.len());
         assert!(output_consumed > 0, "deflateBufferBytes produced no output");
-        assert!(finished, "deflateBufferBytes must report finished on FINISH");
+        assert!(
+            finished,
+            "deflateBufferBytes must report finished on FINISH"
+        );
         let compressed = read_byte_array(&ctx, output_arr, 0, output_consumed);
         assert_decompresses_to(&compressed, original);
 
@@ -1187,8 +1193,14 @@ mod tests {
         };
         let (input_consumed, output_consumed, finished) = unpack_deflate_result(packed);
         assert_eq!(input_consumed, original.len());
-        assert!(output_consumed > 0, "deflateBufferBuffer produced no output");
-        assert!(finished, "deflateBufferBuffer must report finished on FINISH");
+        assert!(
+            output_consumed > 0,
+            "deflateBufferBuffer produced no output"
+        );
+        assert!(
+            finished,
+            "deflateBufferBuffer must report finished on FINISH"
+        );
         assert_decompresses_to(&output_buf[..output_consumed], original);
     }
 
@@ -1529,7 +1541,11 @@ mod tests {
             Value::Long(p) => p as u64,
             other => panic!("expected Long, got {other:?}"),
         };
-        assert_eq!((first >> 62) & 1, 1, "first FINISH call must report finished");
+        assert_eq!(
+            (first >> 62) & 1,
+            1,
+            "first FINISH call must report finished"
+        );
 
         // Calling deflate() again after finished must stay a clean no-op —
         // not an error, not a re-entry into zlib.
@@ -1541,8 +1557,20 @@ mod tests {
             Value::Long(p) => p as u64,
             other => panic!("expected Long, got {other:?}"),
         };
-        assert_eq!(second & 0x7FFF_FFFF, 0, "post-finish call must consume no input");
-        assert_eq!((second >> 31) & 0x7FFF_FFFF, 0, "post-finish call must produce no output");
-        assert_eq!((second >> 62) & 1, 1, "post-finish call must still report finished");
+        assert_eq!(
+            second & 0x7FFF_FFFF,
+            0,
+            "post-finish call must consume no input"
+        );
+        assert_eq!(
+            (second >> 31) & 0x7FFF_FFFF,
+            0,
+            "post-finish call must produce no output"
+        );
+        assert_eq!(
+            (second >> 62) & 1,
+            1,
+            "post-finish call must still report finished"
+        );
     }
 }

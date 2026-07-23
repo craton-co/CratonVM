@@ -335,7 +335,11 @@ fn init_urlclassloader_fields(ctx: &mut dyn NativeContext, this: ObjectRef) {
 /// keeping `this` only in a native local across `init_classloader_common_fields`
 /// could make the following `ucp` initialization write through a forwarded
 /// reference, leaving the live loader with its default null field.
-pub(crate) fn init_urlclassloader_constructor(ctx: &mut dyn NativeContext, this: ObjectRef, urls: Value) {
+pub(crate) fn init_urlclassloader_constructor(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    urls: Value,
+) {
     let this_pin = ctx.pin_native_root(this);
     let urls_pin = match urls {
         Value::Object(Some(urls)) => Some((ctx.pin_native_root(urls), urls)),
@@ -1017,13 +1021,15 @@ fn cl_real_load_class_base(
 ) -> cratonvm_types::error::MethodCallResult {
     let class_name = ctx.read_string(class_name_obj).unwrap_or_default();
     let internal = class_name.replace('.', "/");
-    let __obsreg_dbg =
-        std::env::var_os("CRATONVM_DBG_OBSREG").is_some() && internal.contains("ObservationRegistry");
+    let __obsreg_dbg = std::env::var_os("CRATONVM_DBG_OBSREG").is_some()
+        && internal.contains("ObservationRegistry");
     if __obsreg_dbg {
         let this_cls = ctx.class_name_of_id(ctx.class_id_of_object(this));
         let parent_field = ctx.get_field_by_name(this, "parent");
         let parent_cls = match parent_field {
-            cratonvm_types::Value::Object(Some(p)) => ctx.class_name_of_id(ctx.class_id_of_object(p)),
+            cratonvm_types::Value::Object(Some(p)) => {
+                ctx.class_name_of_id(ctx.class_id_of_object(p))
+            }
             _ => None,
         };
         let isolated = crate::classloader::url_classloader_isolated_from_app(ctx, this);
@@ -1367,8 +1373,15 @@ pub fn ucl_real_find_class(
         return result;
     }
     if crate::classloader::url_classloader_isolated_from_app(ctx, this) {
-        let exc = crate::jboss_module_loader::alloc_single_message_exception(ctx, "java/lang/ClassNotFoundException", 1, &class_name);
-        return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc));
+        let exc = crate::jboss_module_loader::alloc_single_message_exception(
+            ctx,
+            "java/lang/ClassNotFoundException",
+            1,
+            &class_name,
+        );
+        return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(
+            exc,
+        ));
     }
     if let Ok(Some(mirror)) = ctx.load_class(&internal) {
         return Ok(Some(mirror));

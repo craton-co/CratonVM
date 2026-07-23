@@ -1891,3 +1891,110 @@ on Spring TestContext Framework classes have the same loader-blindness (this
 fix only touches the one call site that was actually proven to matter here).
 See `[[aot-double-refresh-springextension-loader-blind-fix]]` (memory) for
 the full diagnostic-by-diagnostic writeup.
+
+
+## 2026-07-23 AOT follow-up 6 -- second loader-blindness call site fixed, follow-up 5's own next-steps resolved
+
+Same worktree/branch as follow-up 5 (`/data/wt-aot-junitstore-20260723`,
+`fix/aot-junitstore-20260723`). No subagents used.
+
+**Second loader-blindness call site found and fixed.** The same native
+family's constructor-injection branch (`native_spring_extension_resolve_parameter`,
+reached when a test class's `@Nested`-hierarchy constructor needs
+`findProperlyScopedExtensionContext`) also called `SpringExtension` by name
+via `ctx.invoke_special`, with the identical potential to land on the
+Application-loader copy under `@CompileWithForkedClassLoader`. Extracted a
+shared `spring_extension_invoke_special_anchored_on_test_class` helper (the
+same anchoring logic as follow-up 5's fix) and reused it for both call
+sites. Commit `852d3cbd6`, merged and pushed to `origin/dev` at `d6563bd8c`.
+`cargo test -p cratonvm-vm --lib --release`: 2230 passed / 11 failed, same
+11 pre-existing baseline failures, zero regressions.
+
+**Full 175-test `endToEndTestsForBeanOverrides` re-verified: 73/175 ->
+~158/175.** Ran the actual `KRunMethod ... AotIntegrationTests
+endToEndTestsForBeanOverrides` single-method probe (not just the fast
+`BeanOverrideProbe2` fixture) with both fixes applied. Result:
+`MultipleFailuresError: Test execution failures (17 failures)` -- down from
+the documented 102. The remaining 17 cluster into two DISTINCT, UNRELATED
+families, neither a loader-identity issue:
+- The majority: `@MockitoBean`/`@MockitoSpyBean` "by name" lookup for
+  CONSTRUCTOR-injected parameters (`MockitoBeanByNameLookupForConstructorParametersIntegrationTests`,
+  `MockitoSpyBeanByNameLookupForConstructorParametersIntegrationTests`,
+  `MockitoBeansByNameIntegrationTests`) fail with `No qualifying bean...
+  expected single matching bean but found N`, where the listed candidate
+  names show the override bean sitting ALONGSIDE the original(s) it should
+  have replaced -- a bean-override-not-replacing-original bug specific to
+  constructor injection, not investigated further.
+- A smaller family: plain `AssertionFailedError: expected: null but was:
+  ""` -- not yet isolated to a specific test class.
+See `[[aot-endtoend-beanoverrides-73-to-158-of-175]]` (memory) for the full
+breakdown, including which log4j-noise lines to ignore.
+
+**`ApplicationContextAotGeneratorTests`'s residuals RE-CHARACTERIZED -- NOT
+the duplicate-ClassId/CGLIB-naming family this doc's "2026-07-21 late
+session" assumed.** Re-examined the actual exception text (not just the
+class/method names) for the 2 `CompilationException` failures
+(`processAheadOfTimeUsesCglibClassForFactoryMethod`,
+`...WithAnnotationsOnTheUserClasConstructor`). Both are REAL JAVAC (`com.
+sun.tools.javac.jvm.ClassReader`'s own diagnostic format) reporting
+`org.springframework.beans.factory.aot.AutowiredArguments` as a "bad class
+file... truncated" -- but this javac instance runs AS INTERPRETED BYTECODE
+INSIDE CratonVM (`TestCompiler.forSystem()`'s in-process compile), so every
+file read it performs goes through CratonVM's own native I/O. Two
+independent tests ruled out "the jar is just corrupted": the existing jar
+entry passes external Python `zipfile` validation (correct declared size,
+no CRC error) AND a from-scratch recompile with real JDK 25's own `javac`
+(prepended to the classpath, confirmed via the changed byte offset in the
+error message that THIS file was actually being read) is STILL reported
+"truncated," this time at ITS OWN different real size. Truncated-at-exactly-
+its-own-real-length, reproduced across two differently-sized files compiled
+from the same source, points at a **classfile `TypeAnnotations`-attribute
+parsing bug in CratonVM's own reader** rather than file corruption:
+`AutowiredArguments` is a `@FunctionalInterface` with JSpecify `@Nullable`
+TYPE_USE annotations on a generic method return type and an array return
+type -- exactly the structurally-complex `type_path` cases this attribute
+exists to encode. Possibly a not-yet-covered edge case of the existing
+JSpecify TYPE_USE fix family. NOT fixed this session (core classloading/
+reader-crate work, out of scope for the narrowly-scoped native-trampoline
+fixes landed today) -- see
+`[[aot-cglib-residuals-not-classid-its-typeannotations-classfile-bug]]`
+(memory) for the full evidence chain and recommended isolated repro.
+`processAheadOfTimeWithExplicitResolvableType`'s `AotBeanProcessingException`
+and the two `AssertionError`/`AssertionFailedError` failures for this class
+remain uncharacterized.
+
+**`TestContextAotGeneratorIntegrationTests`'s hang: genuine slowness inside
+Groovy's own runtime bootstrap, NOT conclusively a deadlock -- host
+contention is a major unresolved confound.** `--stack-dump-on-timeout`
+(a real CratonVM flag) caught the main thread genuinely busy inside real
+javac's `Attr`/`DeferredAttr` in one run, and inside `org/codehaus/groovy/
+reflection/stdclasses/CachedSAMClass.hasUsableImplementation` <-
+`CompileWithForkedClassLoaderClassLoader.loadClass` in another, with
+`CRATONVM_DBG_ATHROW=1` additionally showing the SAME thread had recently
+been deep in Groovy's own `MetaClassRegistryImpl.<init>` -> `registerMethods`
+-- eagerly registering every "Default Groovy Method," a well-known-heavy,
+one-time Groovy runtime bootstrap step, not a lock-wait. However, a full
+30-minute run (`timeout 1800`) under severe host load (`uptime` load
+average 19-23, 40+ concurrent users) still never completed, frozen at the
+exact same point every time. This is NOT yet conclusively distinguished
+from "just extremely slow under this much contention" -- needs a re-test
+on a quiet host (load average < 2) before concluding either way; if it
+still doesn't finish in ~10x the normal ~490s AOT-suite runtime there,
+that's real evidence of a genuine hang. See the updated
+`[[testcontextaotgeneratorintegrationtests-groovysystem-clinit-hang]]`
+(memory).
+
+**Native-trampoline loader-blindness audit: done, no further fixes
+warranted.** Grepped `native-builtins/src/lib.rs` for every `ctx.
+invoke_special`/`ctx.invoke` by-name call site. Beyond the two
+`SpringExtension` ones fixed above, the only other Spring-TestContext-
+adjacent one is `ParameterResolutionDelegate.resolveDependency`
+(spring-beans) -- left alone: it is a stateless utility with no `Namespace`/
+`Class`-identity-keyed caching downstream, so a wrong-loader-copy
+resolution there has no observable behavioral consequence, unlike
+`SpringExtension` whose own static state IS keyed on its `Class` object
+identity. Everything else found (`org/apache/maven/surefire/booter/
+ForkedBooter`, `java/io/OutputStreamWriter`/`PrintWriter`, `java/util/
+concurrent/Semaphore`, `org/apache/activemq/broker/region/AbstractRegion`)
+belongs to unrelated subsystems never subject to
+`@CompileWithForkedClassLoader` duplication.

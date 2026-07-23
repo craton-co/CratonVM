@@ -1002,6 +1002,25 @@ fn should_skip_jit_internal(
             return Some(SkipReason::RustJvmTestFixture);
         }
 
+        // TOMCAT-JNDIREALM-JIT.2 (2026-07-23) -- a second, independent
+        // JIT-only corruption remains in the UnboundID in-memory LDAP path.
+        // The 76-case TestJNDIRealmIntegration matrix is clean in --nojit and
+        // on HotSpot, but default JIT intermittently reuses a zero-header
+        // String receiver during DN/RDN matching (and can subsequently crash).
+        // The pre-existing RDN.getNameValuePairs guard is insufficient: the
+        // failure reproduces when only com/unboundid/* is JIT-eligible, while
+        // the individual ldap/sdk, ldap/matchingrules, asn1, and util package
+        // slices are each clean.  That identifies a cross-package compiled
+        // interaction, not an LDAP or native-JNDI contract issue.  Keep
+        // UnboundID bytecode interpreted under the conservative policy until
+        // the x64 producer is narrowed; callers retain normal JIT coverage. The
+        // guard is explicitly liftable for continuing bisection.
+        if class_name.starts_with("com/unboundid/")
+            && !package_allowed("com/unboundid/", allow_packages)
+        {
+            return Some(SkipReason::RustJvmTestFixture);
+        }
+
         if callee_saved_gpr_local_homes_enabled()
             && is_known_miscompile(class_name, method_name)
             && !package_allowed(class_name, allow_packages)

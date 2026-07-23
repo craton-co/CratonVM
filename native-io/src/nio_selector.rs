@@ -781,9 +781,7 @@ pub fn selector_set_interest(id: i32, net_fd: i32, ops: i32) -> Result<(), Metho
         // a public Selector.wakeup() request.
         if let Some(wfd) = st.wakeup_pipe_write {
             let byte: u8 = b'I';
-            let _ = unsafe {
-                libc::write(wfd, &byte as *const u8 as *const libc::c_void, 1)
-            };
+            let _ = unsafe { libc::write(wfd, &byte as *const u8 as *const libc::c_void, 1) };
         }
     }
     // Windows/non-Linux equivalent of the epoll self-pipe nudge above: a
