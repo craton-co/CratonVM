@@ -176,6 +176,13 @@ pub enum SkipReason {
     /// InnerClasses-attribute-reading method interpreted until its own JIT
     /// lowering is understood.
     ClassReaderReadInnerClasses,
+
+    /// Javac's `Symbol$ClassSymbol.complete` underflows the interpreter operand
+    /// stack after tiered compilation while H2 compiles a generated alias.
+    /// Keep this symbol-completion method interpreted until its invokespecial
+    /// lowering is corrected.
+    ClassSymbolComplete,
+
     /// Spring's shaded JavaPoet `CodeBlock$Builder.add(String, Object...)`
     /// (the $-placeholder format-string parser, reached from
     /// `org/springframework/javapoet/CodeBlock$Builder`) is a FOURTH distinct
@@ -567,6 +574,19 @@ fn should_skip_jit_internal(
 
     if class_name == "com/sun/tools/javac/jvm/ClassReader" && method_name == "readInnerClasses" {
         return Some(SkipReason::ClassReaderReadInnerClasses);
+
+    // HIB-STOREDPROC-JIT.1 (2026-07-23): H2's `CREATE ALIAS ... AS $$` invokes
+    // the real in-process javac compiler.  After this exact method tiers up,
+    // `Symbol$ClassSymbol.complete()` deterministically reaches an
+    // `invokespecial` with an empty operand stack, reported as
+    // `IllegalStateException: operand stack underflow`; H2 then fails to
+    // install `findUsers` and the Hibernate stored-procedure tests fail.  The
+    // class pair passes under `--nojit` and with only this method denied via
+    // `CRATONVM_JIT_BISECT_SKIP`, so keep the narrow compiler-internal method
+    // interpreted until the special-call lowering is root-caused.
+    if class_name == "com/sun/tools/javac/code/Symbol$ClassSymbol" && method_name == "complete" {
+        return Some(SkipReason::ClassSymbolComplete);
+
     }
 
     // SPRING-TESTCOMPILER.4 (2026-07-21): see `JavaPoetCodeBlockBuilderAdd`
@@ -4781,6 +4801,23 @@ mod tests {
                 ),
                 Some(SkipReason::JavacToolContext),
                 "JavacTool.getTask must remain excluded under every policy",
+            );
+        }
+    }
+
+    #[test]
+    fn javac_class_symbol_complete_is_unconditionally_interpreted() {
+        for policy in [SkipPolicy::Conservative, SkipPolicy::Aggressive] {
+            assert_eq!(
+                check(
+                    "com/sun/tools/javac/code/Symbol$ClassSymbol",
+                    "complete",
+                    false,
+                    true,
+                    policy,
+                ),
+                Some(SkipReason::ClassSymbolComplete),
+                "Javac ClassSymbol.complete must remain excluded under every policy",
             );
         }
     }

@@ -359,6 +359,22 @@ pub fn defining_loader_for(class_id: u32) -> Option<ObjectRef> {
         .copied()
 }
 
+/// Whether ANY class in this process has ever been defined by a
+/// user-defined `ClassLoader` (i.e. `register_defining_loader` has been
+/// called at least once). A single lock-free atomic load — safe for
+/// interpreter hot paths that need to bail out before taking any
+/// classloader-related lock at all. Since `register_defining_loader` is
+/// called unconditionally whenever a class is assigned a
+/// `ClassLoaderId::UserDefined(_)` identity (see the invariant documented
+/// on `ANY_DEFINING_LOADER_REGISTERED` above), `false` here guarantees no
+/// `ClassId` anywhere in `class_manager` currently has a `UserDefined`
+/// loader id — so callers that only care about "is loader-initiated
+/// resolution even possibly relevant" can skip a `class_manager` read lock
+/// entirely in that (overwhelmingly common) case.
+pub fn any_defining_loader_registered() -> bool {
+    ANY_DEFINING_LOADER_REGISTERED.load(Ordering::Acquire)
+}
+
 /// Store `class_data` for a Class mirror. Returns the previous value if any.
 pub fn set_class_data(mirror: ObjectRef, data: Value) -> Option<Value> {
     class_data_store()
@@ -5368,6 +5384,48 @@ fn empty_enumeration_impl(ctx: &mut dyn NativeContext) -> ObjectRef {
     enm
 }
 
+/// Cached `cratonvm_classloading::ClassPath::new(paths)` construction, keyed
+/// by the exact `paths` vector.
+///
+/// PERF (2026-07-23): both call sites below (`loader_local_resource_urls`
+/// and `ucl_try_define_local_class`) used to call `ClassPath::new(&paths)`
+/// FRESH on every single invocation — i.e. every `URLClassLoader.findClass`/
+/// `findResource` call re-read and re-parsed every jar on the loader's
+/// classpath from scratch, with no caching at all (unlike
+/// `jar_contents_cached`, which this superficially resembles but doesn't
+/// share any code with). `ClassPath::new` opens and parses every classpath
+/// entry eagerly, so on a large classpath (`module/spring-boot-data-redis`'s
+/// test classpath has ~121 jars, several of them large — testcontainers.jar
+/// alone is 12.5k entries) this made ordinary Spring context bootstrap,
+/// which does hundreds of `ClassUtils.isPresent()`-style lookups per
+/// `ApplicationContextRunner.run()`, pay a full classpath re-scan on EVERY
+/// lookup — measured ~10-12s for just 100 lookups, when the underlying work
+/// should be milliseconds after the first scan. `DataRedisAutoConfigurationTests`,
+/// `DataRedisAutoConfigurationJedisTests`,
+/// `DataRedisAutoConfigurationLettuceWithoutCommonsPool2Tests`, and
+/// `DataRedisHealthContributorAutoConfigurationTests` all HANG (300s suite
+/// timeout) as a direct result. Cache by the exact paths vector: a
+/// `URLClassLoader.addURL` call naturally produces a longer paths vector, so
+/// it transparently gets its own fresh (correct) cache entry rather than
+/// serving a stale one — no explicit invalidation needed. Unbounded but
+/// small in practice (one entry per distinct classpath actually seen in the
+/// process), consistent with `jar_contents_cached`'s existing precedent.
+fn cached_class_path_for_paths(paths: &[String]) -> std::sync::Arc<cratonvm_classloading::ClassPath> {
+    use std::sync::{Arc, OnceLock};
+    static CACHE: OnceLock<Mutex<std::collections::HashMap<Vec<String>, Arc<cratonvm_classloading::ClassPath>>>> =
+        OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    if let Some(cp) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(paths) {
+        return cp.clone();
+    }
+    let cp = Arc::new(cratonvm_classloading::ClassPath::new(paths));
+    cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(paths.to_vec(), cp.clone());
+    cp
+}
+
 fn loader_constructor_url_paths(ctx: &dyn NativeContext, loader: ObjectRef) -> Vec<String> {
     let mut out = Vec::new();
 
@@ -5552,7 +5610,7 @@ fn loader_local_resource_urls(
         }
         return Vec::new();
     }
-    let urls = cratonvm_classloading::ClassPath::new(&paths).find_all_resource_urls(resource_name);
+    let urls = cached_class_path_for_paths(&paths).find_all_resource_urls(resource_name);
     if std::env::var_os("CRATONVM_DBG_UCLRES").is_some() {
         eprintln!(
             "[UCLRES-DBG] loader={loader:?} resource={resource_name} paths={paths:?} urls={urls:?}"
@@ -5677,8 +5735,7 @@ pub(crate) fn ucl_try_define_local_class(
     // the bytes. Falling back to ClassManager's process-wide lookup after a
     // successful local definition can attach a same-named application JAR as
     // this class's CodeSource (for example, a URLClassLoader override JAR).
-    let local_class_path =
-        (!paths.is_empty()).then(|| cratonvm_classloading::ClassPath::new(&paths));
+    let local_class_path = (!paths.is_empty()).then(|| cached_class_path_for_paths(&paths));
     let (bytes, local_code_source) = match local_class_path.as_ref() {
         Some(class_path) => match class_path.find_resource(&resource_name) {
             Some(bytes) => (

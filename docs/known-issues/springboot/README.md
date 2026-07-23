@@ -39,6 +39,22 @@ smaller/individual differences not yet clustered.
 > by `49d7834e9` (reactor-netty startup-hang residuals fix), confirmed via
 > reproduction rather than code reading alone.
 
+> Closure update (2026-07-23): the `module/spring-boot-data-redis` 4-class
+> HANG cluster (`DataRedisAutoConfigurationTests`,
+> `DataRedisAutoConfigurationJedisTests`,
+> `DataRedisAutoConfigurationLettuceWithoutCommonsPool2Tests`,
+> `DataRedisHealthContributorAutoConfigurationTests` — see
+> `RESULTS-20260723.md`'s residual table) is fixed — see
+> [`data-redis-urlclassloader-uncached-classpath-hang-FIXED.md`](data-redis-urlclassloader-uncached-classpath-hang-FIXED.md).
+> Root cause: `URLClassLoader.findClass`/`findResource` rebuilt the whole
+> classpath scan from scratch on every call (no caching), and `JarFile`
+> entry lookups eagerly decompressed every entry in a jar just to answer an
+> existence check — both general classloading bugs, not Redis-specific,
+> just tipped over the 300s timeout by this module's unusually large
+> (~121-jar) test classpath. Fixed in `native-builtins/src/classloader.rs`
+> and `phases_late.rs`. One pre-existing, narrower residual unmasked by the
+> fix (not caused by it): `data-redis-jedis-sslbundle-withpackageresources-classloader-leak.md`.
+
 | Doc | Classes | Severity | Status |
 |---|---:|---|---|
 | `OnClassCondition.addAll` NPE-cast-to-`String[]` | 75 (348 occurrences) | CRITICAL | **FIXED/RETIRED 2026-07-13** — moved to [`../../internal/springboot/onclasscondition-npe-cast-string-array-cluster-FIXED.md`](../../internal/fixed-suite-bugs/springboot/onclasscondition-npe-cast-string-array-cluster-FIXED.md); `@ConditionalOnClass`'s unresolvable-`Class`-element handling now defers to a `TypeNotPresentException` sentinel matching HotSpot, instead of a bare `null`. Verified against all 75/75 originally-affected classes |
@@ -66,6 +82,20 @@ smaller/individual differences not yet clustered.
 | [`wrong-receiver-virtual-dispatch-corruption-cluster.md`](wrong-receiver-virtual-dispatch-corruption-cluster.md) | 9 FAIL + 1 fatal CRASH | CRITICAL (Case 1) / HIGH unconfirmed (Case 2) | OPEN — found 2026-07-16. Case 1 (`String.setOption`, 9 classes, root-caused): `javax/net/ssl/SSLSocketFactory.createSocket()` (`native-builtins/src/tls.rs`) still hands out a bare 2-field synthetic `Socket` under `CRATONVM_REAL_NET_SOCKETS=1`; real `Socket.getImpl()` bytecode then reads garbage off the undersized object and dispatches onto a leftover `String` — a gap in a previously-fixed sibling bug (`javax/net/SocketFactory`, commit `bd03eb243`) that never covered the SSL variant. Case 2 (`File.get()`, 1 fatal CRASH) has the same symptom shape but is **not confirmed** to share Case 1's mechanism — filed for tracking, root cause still open |
 | [`tomcatservletwebserverfactory-cross-module-classnotfound-crash.md`](tomcatservletwebserverfactory-cross-module-classnotfound-crash.md) | 10 (fatal CRASH) | HIGH | OPEN — found 2026-07-16. A native shim (`native-builtins/src/net_phase_e.rs`, `ServletWebServerApplicationContext.getWebServerFactory()`) unconditionally allocates a hardcoded `TomcatServletWebServerFactory` regardless of servlet backend — added to route around a real Tomcat bean-registration bug, but fires identically for Jetty-only/generic-web-server modules where that class genuinely doesn't exist on the classpath (confirmed via real Gradle classpath dumps, not a suite-runner gap). The resulting class-not-found escapes as an uncaught internal error and aborts the process instead of throwing a catchable `NoClassDefFoundError` |
 
+
+
+## 2026-07-23 rerun: the 429 CratonVM-specific classes, 6 days later (290 now PASS)
+
+Reran exactly the 429 classes confirmed CratonVM-specific in the round
+below, after merging `dev` forward (moved substantially in 6 days) and
+rebuilding. **290/429 (67.6%) now PASS**, residual down to 99 FAIL + 40
+HANG, **0 CRASH** (all 5 previously-fatal crashes resolved — 4 now PASS,
+1 now FAIL but no longer fatal). Full before/after table, residual module
+breakdown, and reproduce instructions in
+`apps/spring-boot-suite-runner/RESULTS-20260723.md`. Not re-triaged against
+the docs below this session — many residuals are very likely the same
+already-documented OPEN clusters, worth a dedicated confirmation pass
+rather than assuming closed or re-investigating from scratch.
 
 ## 2026-07-17 rerun: 510-class set vs first-ever same-scope HotSpot baseline (429 CratonVM-specific)
 

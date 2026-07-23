@@ -10198,6 +10198,56 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             let dst = obj_arg(args, 1)?;
             let src_path = p57_read_path(ctx, src);
             let dst_path = p57_read_path(ctx, dst);
+            // Real Files.move contract: without REPLACE_EXISTING, throw
+            // FileAlreadyExistsException if the target already exists. Plain
+            // std::fs::rename is POSIX rename(2) semantics, which silently
+            // replaces the destination unconditionally -- so H2's
+            // FilePathDisk.moveTo(newName, false) (no REPLACE_EXISTING) never
+            // saw the FileAlreadyExistsException it catches to translate into
+            // DbException(FILE_RENAME_FAILED_2), letting
+            // TestFileSystem.testMoveTo's move-onto-existing-file case
+            // through instead of rejecting it (docs/known-issues/h2-suite-bugs/
+            // bug-h2-files-setposixfilepermissions-FIXED.md residual chain).
+            let mut replace_existing = false;
+            if let Some(Value::Object(Some(opts))) = args.get(2) {
+                let len = ctx.array_length(*opts);
+                for i in 0..len {
+                    if let Value::Object(Some(opt)) = ctx.get_array_element(*opts, i) {
+                        if let Ok(Some(Value::Object(Some(s)))) =
+                            ctx.invoke_virtual(opt, "toString", "()Ljava/lang/String;", &[])
+                        {
+                            if ctx.read_string(s).unwrap_or_default().contains("REPLACE_EXISTING") {
+                                replace_existing = true;
+                            }
+                        }
+                    }
+                }
+            }
+            if !replace_existing
+                && src_path != dst_path
+                && std::fs::symlink_metadata(&dst_path).is_ok()
+            {
+                // Build a REAL java/nio/file/FileAlreadyExistsException via
+                // its real single-String constructor (same pattern as
+                // throw_unsupported_charset_exception below) rather than a
+                // synthetic layout -- this exception is caught by H2's own
+                // real FilePathDisk.moveTo bytecode (catch
+                // (FileAlreadyExistsException ex)) and its getFile() may be
+                // read by real Throwable formatting, so it needs genuine
+                // field layout, not a guessed synthetic one.
+                if let Ok(Some(Value::Object(Some(exc)))) =
+                    ctx.new_object("java/nio/file/FileAlreadyExistsException")
+                {
+                    let file_str = ctx.create_string(&dst_path);
+                    let _ = ctx.invoke(
+                        "java/nio/file/FileAlreadyExistsException",
+                        "<init>",
+                        "(Ljava/lang/String;)V",
+                        &[Value::Object(Some(exc)), Value::Object(Some(file_str))],
+                    );
+                    return Err(MethodCallFailed::ExceptionThrown(exc));
+                }
+            }
             match std::fs::rename(&src_path, &dst_path) {
                 Ok(()) => Ok(Some(Value::Object(Some(dst)))),
                 Err(e) => Err(RuntimeError::IllegalStateException {
@@ -12929,6 +12979,11 @@ struct JarFsIndex {
     names: Vec<String>,
     sizes: std::collections::HashMap<String, u64>,
     raw_names: std::collections::HashMap<String, String>,
+    /// Immediate children keyed by their parent directory.  Javac's archive
+    /// indexer walks every package directory; deriving children by scanning a
+    /// prefix range for each directory makes that first walk quadratic for
+    /// deeply packaged archives.
+    children: std::collections::HashMap<String, Vec<(String, bool)>>,
 }
 
 fn jar_index(jar: &str) -> Option<std::sync::Arc<JarFsIndex>> {
@@ -12947,20 +13002,51 @@ fn jar_index(jar: &str) -> Option<std::sync::Arc<JarFsIndex>> {
         let mut names = Vec::with_capacity(zip.len());
         let mut sizes = std::collections::HashMap::with_capacity(zip.len());
         let mut raw_names = std::collections::HashMap::with_capacity(zip.len());
+        let mut child_maps: std::collections::HashMap<
+            String,
+            std::collections::BTreeMap<String, bool>,
+        > = std::collections::HashMap::new();
         for i in 0..zip.len() {
             let f = zip.by_index(i).ok()?;
             let raw = f.name().to_string();
             let name = raw.trim_start_matches('/').to_string();
             sizes.insert(name.clone(), f.size());
             raw_names.insert(name.clone(), raw);
+            let trimmed = name.trim_end_matches('/');
+            if !trimmed.is_empty() {
+                let components: Vec<&str> =
+                    trimmed.split('/').filter(|part| !part.is_empty()).collect();
+                let explicit_dir = name.ends_with('/');
+                let mut parent = String::new();
+                for (component_index, component) in components.iter().enumerate() {
+                    let child = if parent.is_empty() {
+                        (*component).to_string()
+                    } else {
+                        format!("{parent}/{component}")
+                    };
+                    let is_dir = component_index + 1 < components.len() || explicit_dir;
+                    let entry = child_maps
+                        .entry(parent.clone())
+                        .or_default()
+                        .entry(child.clone())
+                        .or_insert(false);
+                    *entry = *entry || is_dir;
+                    parent = child;
+                }
+            }
             names.push(name);
         }
         names.sort_unstable();
         names.dedup();
+        let children = child_maps
+            .into_iter()
+            .map(|(parent, entries)| (parent, entries.into_iter().collect()))
+            .collect();
         Some(Arc::new(JarFsIndex {
             names,
             sizes,
             raw_names,
+            children,
         }))
     })();
     guard.insert(jar.to_string(), built.clone());
@@ -13135,44 +13221,16 @@ fn jarfs_list_dir(jar: &str, dir: &str) -> Vec<String> {
 }
 
 /// List immediate children of `dir` inside a JAR together with an
-/// is-directory flag, using the cached sorted entry index (a contiguous prefix
-/// range), so a `walkFileTree` does not re-parse the whole zip per directory.
+/// is-directory flag from the cached direct-child index.  This keeps a full
+/// archive walk linear in its entries rather than repeatedly scanning every
+/// descendant below each package directory.
 fn jarfs_list_dir_classified(jar: &str, dir: &str) -> Vec<(String, bool)> {
     let dir = dir.trim_start_matches('/').trim_end_matches('/');
-    let prefix = if dir.is_empty() {
-        String::new()
-    } else {
-        format!("{dir}/")
-    };
     let index = match jar_index(jar) {
         Some(n) => n,
         None => return Vec::new(),
     };
-    let names = &index.names;
-    let start = names.partition_point(|n| n.as_str() < prefix.as_str());
-    let mut seen: std::collections::BTreeMap<String, bool> = std::collections::BTreeMap::new();
-    for name in &names[start..] {
-        let rest = match name.strip_prefix(&prefix) {
-            Some(r) => r,
-            None => break, // sorted: first non-match ends the prefix range
-        };
-        let trimmed = rest.trim_end_matches('/');
-        if trimmed.is_empty() {
-            continue;
-        }
-        // Immediate child; it is a directory when the entry path descends
-        // further (contains '/') or is an explicit directory entry (trailing '/').
-        let (child, is_dir) = match trimmed.find('/') {
-            Some(j) => (&trimmed[..j], true),
-            None => (trimmed, rest.ends_with('/')),
-        };
-        if child.is_empty() {
-            continue;
-        }
-        let e = seen.entry(format!("{prefix}{child}")).or_insert(false);
-        *e = *e || is_dir;
-    }
-    seen.into_iter().collect()
+    index.children.get(dir).cloned().unwrap_or_default()
 }
 
 // ===========================================================================
@@ -22225,10 +22283,12 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
                 },
                 _ => return Ok(Some(Value::Object(None))),
             };
-            // Cached parse + decompress (O(1) per call; avoids re-parsing the
-            // whole central directory on every entry — see `jar_contents_cached`).
-            let bytes: Option<std::sync::Arc<Vec<u8>>> = jar_contents_cached(&path)
-                .and_then(|c| c.by_name.get(&entry_name).map(|r| r.bytes.clone()));
+            // Cached, lazy decompress (O(1) per call after the first read of
+            // this entry; avoids both re-parsing the whole central directory
+            // on every entry AND decompressing entries nothing ever reads —
+            // see `jar_entry_bytes_cached`).
+            let bytes: Option<std::sync::Arc<Vec<u8>>> =
+                jar_entry_bytes_cached(&path, &entry_name);
             let bytes = match bytes {
                 Some(b) => b,
                 None => return Ok(Some(Value::Object(None))),
@@ -23190,14 +23250,15 @@ fn spring_default_app_ctx_factory_create(
 // 4-field synthetic JarEntry instances (name, size, compressedSize, method).
 // =============================================================================
 
-/// One central-directory entry's metadata plus its decompressed bytes.
+/// One central-directory entry's metadata. Deliberately excludes decompressed
+/// bytes — see `jar_contents_cached`'s doc comment for why those are cached
+/// separately (and lazily) via `jar_entry_bytes_cached` instead of here.
 pub(crate) struct JarEntryRec {
     pub(crate) size: i64,
     pub(crate) csize: i64,
     pub(crate) method: i32,
     pub(crate) crc: i64,
     pub(crate) times: JarEntryTimes,
-    pub(crate) bytes: std::sync::Arc<Vec<u8>>,
 }
 
 /// ZIP extended timestamp fields are authoritative when a JDK-created entry
@@ -23351,7 +23412,8 @@ fn p59_set_jar_entry_times(ctx: &mut dyn NativeContext, entry: ObjectRef, times:
     ctx.unpin_native_roots(entry_pin);
 }
 
-/// Per-path cache of a JAR's parsed central directory + decompressed entries.
+/// Per-path cache of a JAR's parsed central directory (metadata only — no
+/// decompressed bytes; see `jar_entry_bytes_cached` for those).
 ///
 /// The `java.util.jar.JarFile` natives (`getInputStream`/`getEntry`/`entries`/
 /// `stream`/lookup) previously called `zip::ZipArchive::new(file)` on EVERY
@@ -23360,8 +23422,25 @@ fn p59_set_jar_entry_times(ctx: &mut dyn NativeContext, entry: ObjectRef, times:
 /// `.class` entry, making that O(N²) over a jar's entry count — for a large jar
 /// like byte-buddy (~3k classes) the web-fragment scan never finishes within
 /// the test timeout (TestValidator HANG; it passes on HotSpot where each lookup
-/// is O(1)). Parse + decompress once and cache, keyed by (path, mtime) so a jar
-/// rewritten on disk (e.g. a test-generated temp jar) is not served stale.
+/// is O(1)). Parse once and cache, keyed by (path, mtime) so a jar rewritten on
+/// disk (e.g. a test-generated temp jar) is not served stale.
+///
+/// PERF (2026-07-23): this cache used to also eagerly `read_to_end` (i.e.
+/// fully INFLATE) every entry's bytes on the very first touch, regardless of
+/// whether the caller wanted bytes at all. `getJarEntry`/`entries`/`stream`/
+/// `getManifest` only need metadata (size/csize/method/crc/times) — a single
+/// `ClassUtils.isPresent()`-style existence check on a jar with thousands of
+/// classes (e.g. testcontainers.jar, 12.5k entries) was paying the FULL
+/// decompression cost of every unrelated entry (measured ~60-70us/entry —
+/// genuine DEFLATE work, not native-dispatch overhead) just to answer one
+/// membership question. On `module/spring-boot-data-redis`'s ~121-jar test
+/// classpath this made ordinary Spring context bootstrap (which does hundreds
+/// of such isPresent/loadClass checks) blow past the 300s suite timeout —
+/// `DataRedisAutoConfigurationTests`, `DataRedisAutoConfigurationJedisTests`,
+/// `DataRedisAutoConfigurationLettuceWithoutCommonsPool2Tests`, and
+/// `DataRedisHealthContributorAutoConfigurationTests` all HANG. Bytes are now
+/// decompressed lazily, per-entry, only when `getInputStream` is actually
+/// called for that entry — see `jar_entry_bytes_cached`.
 pub(crate) fn jar_contents_cached(path: &str) -> Option<std::sync::Arc<JarContents>> {
     use std::sync::{Arc, Mutex, OnceLock};
     static CACHE: OnceLock<Mutex<std::collections::HashMap<String, Arc<JarContents>>>> =
@@ -23388,8 +23467,11 @@ pub(crate) fn jar_contents_cached(path: &str) -> Option<std::sync::Arc<JarConten
     let mut by_name = std::collections::HashMap::with_capacity(len);
     let mut order = Vec::with_capacity(len);
     for i in 0..len {
-        use std::io::Read;
-        let Ok(mut entry) = archive.by_index(i) else {
+        // Metadata only — deliberately no `read_to_end`/decompression here.
+        // `by_index` parses the local file header (cheap: no inflate), which
+        // is enough for every field below. See the doc comment above for why
+        // eagerly decompressing was a severe perf bug.
+        let Ok(entry) = archive.by_index(i) else {
             continue;
         };
         let name = entry.name().to_string();
@@ -23400,10 +23482,6 @@ pub(crate) fn jar_contents_cached(path: &str) -> Option<std::sync::Arc<JarConten
         let crc = entry.crc32() as i64 & 0xFFFF_FFFFi64;
         let mut times = p59_zip_entry_times(&entry);
         p59_merge_zip_times(&mut times, p59_zip_local_entry_times(path, &entry));
-        let mut buf = Vec::with_capacity(entry.size() as usize);
-        if entry.read_to_end(&mut buf).is_err() {
-            continue;
-        }
         order.push(name.clone());
         by_name.insert(
             name,
@@ -23413,7 +23491,6 @@ pub(crate) fn jar_contents_cached(path: &str) -> Option<std::sync::Arc<JarConten
                 method,
                 crc,
                 times,
-                bytes: Arc::new(buf),
             },
         );
     }
@@ -23423,6 +23500,46 @@ pub(crate) fn jar_contents_cached(path: &str) -> Option<std::sync::Arc<JarConten
         .unwrap_or_else(|e| e.into_inner())
         .insert(key, contents.clone());
     Some(contents)
+}
+
+/// Per-(path, mtime, entry name) cache of ONE entry's decompressed bytes.
+/// Companion to `jar_contents_cached`: that cache is metadata-only (cheap,
+/// built eagerly for the whole jar); this one does the actual DEFLATE
+/// inflate, lazily, only for entries some caller's `getInputStream` actually
+/// reads. Re-opens the archive and seeks straight to the named entry rather
+/// than iterating — `by_name` on a `zip::ZipArchive` uses its already-parsed
+/// central-directory name index, so this stays cheap even on jars with
+/// thousands of entries.
+pub(crate) fn jar_entry_bytes_cached(path: &str, entry_name: &str) -> Option<std::sync::Arc<Vec<u8>>> {
+    use std::io::Read;
+    use std::sync::{Arc, Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<std::collections::HashMap<String, Arc<Vec<u8>>>>> =
+        OnceLock::new();
+    if path.is_empty() || entry_name.is_empty() {
+        return None;
+    }
+    let mtime = std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let key = format!("{path}\u{0}{mtime}\u{0}{entry_name}");
+    let cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    if let Some(b) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
+        return Some(b.clone());
+    }
+    let file = std::fs::File::open(path).ok()?;
+    let mut archive = zip::ZipArchive::new(file).ok()?;
+    let mut entry = archive.by_name(entry_name).ok()?;
+    let mut buf = Vec::with_capacity(entry.size() as usize);
+    entry.read_to_end(&mut buf).ok()?;
+    let bytes = Arc::new(buf);
+    cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(key, bytes.clone());
+    Some(bytes)
 }
 
 /// Read the central directory of `path` and return a Vec of allocated
@@ -24399,29 +24516,26 @@ fn p59_jar_file_manifest(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 }
 
 /// Read MANIFEST.MF from a JAR file and create a Manifest synthetic object.
+///
+/// PERF (2026-07-23): this used to `File::open` + `zip::ZipArchive::new` the
+/// WHOLE jar itself, independent of (and redundant with)
+/// `jar_contents_cached`/`jar_entry_bytes_cached`'s caches — every single
+/// `new JarFile(path)` (this runs from every `<init>` handler) re-parsed the
+/// entire central directory again just to grab one entry. For a jar the size
+/// of testcontainers.jar (12.5k entries, ~17MB) that central-directory parse
+/// alone measured ~105ms; Spring Boot test suites that construct many
+/// short-lived JarFile/classloader instances over the run (one context
+/// refresh per `@Test` method, `ApplicationContextRunner`, etc.) pay that
+/// cost again on every construction. Route through the same lazily-cached
+/// `jar_entry_bytes_cached` the `getInputStream` native uses so only the
+/// FIRST touch of a given (path, mtime) pays for the archive open.
 fn p98_read_jar_manifest(ctx: &mut dyn NativeContext, path: &str) -> Value {
     if path.is_empty() {
         return Value::Object(None);
     }
-    let file = match std::fs::File::open(path) {
-        Ok(f) => f,
-        Err(_) => return Value::Object(None),
-    };
-    let mut archive = match zip::ZipArchive::new(file) {
-        Ok(a) => a,
-        Err(_) => return Value::Object(None),
-    };
-    let manifest_bytes = match archive.by_name("META-INF/MANIFEST.MF") {
-        Ok(mut entry) => {
-            use std::io::Read;
-            let mut buf = Vec::new();
-            if entry.read_to_end(&mut buf).is_ok() {
-                buf
-            } else {
-                return Value::Object(None);
-            }
-        }
-        Err(_) => return Value::Object(None),
+    let manifest_bytes = match jar_entry_bytes_cached(path, "META-INF/MANIFEST.MF") {
+        Some(b) => (*b).clone(),
+        None => return Value::Object(None),
     };
     // Parse the main section, including folded continuation lines, through the
     // same manifest parser used by the `Manifest(InputStream)` bridge. Keeping
@@ -37376,7 +37490,7 @@ pub(crate) fn register_p66_file_visitor(r: &mut NativeMethodRegistry) {
         "java/nio/file/Files",
         "walkFileTree",
         "(Ljava/nio/file/Path;Ljava/nio/file/FileVisitor;)Ljava/nio/file/Path;",
-        p98_walk_file_tree,
+        |ctx, args| p98_walk_file_tree(ctx, args, usize::MAX),
     );
     r.register(
         "java/nio/file/Files",
@@ -37384,14 +37498,27 @@ pub(crate) fn register_p66_file_visitor(r: &mut NativeMethodRegistry) {
         "(Ljava/nio/file/Path;Ljava/util/Set;ILjava/nio/file/FileVisitor;)Ljava/nio/file/Path;",
         |ctx, args| {
             let path_obj = args.first().copied().unwrap_or(Value::Object(None));
+            let requested_depth = args
+                .get(2)
+                .and_then(Value::as_int)
+                .unwrap_or(i32::MAX);
+            let max_depth = if requested_depth == i32::MAX {
+                usize::MAX
+            } else {
+                requested_depth.max(0) as usize
+            };
             let visitor = args.get(3).copied().unwrap_or(Value::Object(None));
-            p98_walk_file_tree(ctx, &[path_obj, visitor])
+            p98_walk_file_tree(ctx, &[path_obj, visitor], max_depth)
         },
     );
     r.set_category(__prev_cat);
 }
 
-fn p98_walk_file_tree(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+fn p98_walk_file_tree(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    max_depth: usize,
+) -> MethodCallResult {
     let path_val = args.first().copied().unwrap_or(Value::Object(None));
     let visitor = if let Some(Value::Object(Some(v))) = args.get(1) {
         *v
@@ -37443,7 +37570,24 @@ fn p98_walk_file_tree(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     // -- once it returns.
     let visitor_pin = p98_pin(ctx, visitor);
     let path_pin = p98_pin(ctx, path_obj);
-    let result = p98_walk_dir(ctx, &root_str, visitor_pin, path_pin, skip_file_callbacks);
+    // JDK 25's ArchiveContainer indexer only records package directories.
+    // Serve that exact, already-indexed jar walk without an interpreter
+    // callback for every directory; all other visitors use the generic path.
+    if skip_file_callbacks
+        && max_depth == usize::MAX
+        && p98_index_javac_archive_packages(ctx, &root_str, visitor_pin, path_pin)?
+    {
+        ctx.unpin_native_roots(visitor_pin.0);
+        return Ok(Some(path_val));
+    }
+    let result = p98_walk_dir(
+        ctx,
+        &root_str,
+        visitor_pin,
+        path_pin,
+        skip_file_callbacks,
+        max_depth,
+    );
     ctx.unpin_native_roots(visitor_pin.0);
     result?;
     Ok(Some(path_val))
@@ -37519,12 +37663,142 @@ fn p98_alloc_basic_file_attributes(
     attrs
 }
 
+/// Fast-path the only callback implemented by javac's archive indexer.
+///
+/// JDK 25's `JavacFileManager$ArchiveContainer$1` captures an
+/// `ArchiveContainer` and its root path, then adds every directory with a
+/// Java-identifier basename to `ArchiveContainer.packages`. The archive
+/// filesystem already has the complete direct-child tree in [`JarFsIndex`],
+/// so reproducing that narrow operation avoids a full interpreter round-trip
+/// for every directory of every classpath jar. Return `false` for any shape
+/// we do not recognize so generic visitor dispatch remains the fallback.
+fn p98_index_javac_archive_packages(
+    ctx: &mut dyn NativeContext,
+    root: &str,
+    visitor_pin: P98Pin,
+    root_path_pin: P98Pin,
+) -> Result<bool, MethodCallFailed> {
+    let Some((jar, root_entry)) = jarfs_decode(root) else {
+        return Ok(false);
+    };
+    let Some(index) = jar_index(&jar) else {
+        return Ok(false);
+    };
+
+    // Keep Unicode package names on the generic path. The direct predicate
+    // covers the common ASCII archive layout; falling back rather than
+    // approximating Java's Unicode identifier rules preserves correctness for
+    // unusual jars.
+    if index.children.keys().any(|directory| !directory.is_ascii()) {
+        return Ok(false);
+    }
+
+    let visitor = p98_read_pin(ctx, visitor_pin);
+    let container = match ctx.get_field(visitor, 1) {
+        Value::Object(Some(container))
+            if ctx
+                .class_name_of_id(ctx.class_id_of_object(container))
+                .as_deref()
+                == Some("com/sun/tools/javac/file/JavacFileManager$ArchiveContainer") =>
+        {
+            container
+        }
+        _ => return Ok(false),
+    };
+    let packages = match ctx.get_field(container, 2) {
+        Value::Object(Some(packages)) => packages,
+        _ => return Ok(false),
+    };
+    let packages_pin = p98_pin(ctx, packages);
+    let packages_base = packages_pin.0;
+
+    // `(archive entry, path relative to the walk root)`. The visitor adds the
+    // root itself under RelativeDirectory("") and prunes a non-identifier
+    // directory (for example META-INF) together with its subtree.
+    let root_entry = root_entry.trim_start_matches('/').trim_end_matches('/');
+    let mut pending = vec![(root_entry.to_string(), String::new(), true)];
+    while let Some((entry, relative, is_root)) = pending.pop() {
+        if !is_root
+            && !entry
+                .rsplit('/')
+                .next()
+                .is_some_and(p98_is_ascii_java_identifier)
+        {
+            continue;
+        }
+
+        let path_pin = if is_root {
+            root_path_pin
+        } else {
+            let encoded = jarfs_encode(&jar, &entry);
+            let path = alloc_concurrent_synthetic(ctx, "java/nio/file/Path", 2);
+            let path_pin = p98_pin(ctx, path);
+            let path_string = ctx.create_string(&encoded);
+            let path_now = p98_read_pin(ctx, path_pin);
+            ctx.set_field(path_now, 0, Value::Object(Some(path_string)));
+            path_pin
+        };
+        let relative_string = ctx.create_string(&relative);
+        let relative_string_pin = p98_pin(ctx, relative_string);
+        let relative_directory = match ctx.new_object_initialized(
+            "com/sun/tools/javac/file/RelativePath$RelativeDirectory",
+            "(Ljava/lang/String;)V",
+            &[Value::Object(Some(p98_read_pin(ctx, relative_string_pin)))],
+        )? {
+            Some(Value::Object(Some(directory))) => directory,
+            _ => {
+                ctx.unpin_native_roots(packages_base);
+                return Ok(false);
+            }
+        };
+        let directory_pin = p98_pin(ctx, relative_directory);
+        let packages_now = p98_read_pin(ctx, packages_pin);
+        let directory_now = p98_read_pin(ctx, directory_pin);
+        let path_now = p98_read_pin(ctx, path_pin);
+        ctx.invoke_virtual(
+            packages_now,
+            "put",
+            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            &[
+                Value::Object(Some(directory_now)),
+                Value::Object(Some(path_now)),
+            ],
+        )?;
+
+        if let Some(children) = index.children.get(&entry) {
+            for (child, is_dir) in children.iter().rev() {
+                if *is_dir {
+                    let leaf = child.rsplit('/').next().unwrap_or_default();
+                    let child_relative = if relative.is_empty() {
+                        leaf.to_string()
+                    } else {
+                        format!("{relative}/{leaf}")
+                    };
+                    pending.push((child.clone(), child_relative, false));
+                }
+            }
+        }
+    }
+    ctx.unpin_native_roots(packages_base);
+    Ok(true)
+}
+
+fn p98_is_ascii_java_identifier(component: &str) -> bool {
+    let mut chars = component.bytes();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    matches!(first, b'A'..=b'Z' | b'a'..=b'z' | b'_' | b'$')
+        && chars.all(|byte| matches!(byte, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'_' | b'$'))
+}
+
 fn p98_walk_dir(
     ctx: &mut dyn NativeContext,
     dir: &str,
     visitor_pin: P98Pin,
     dir_path_pin: P98Pin,
     skip_file_callbacks: bool,
+    remaining_depth: usize,
 ) -> Result<bool, MethodCallFailed> {
     let attrs = p98_alloc_basic_file_attributes(ctx, true, 0);
     // preVisitDirectory
@@ -37548,31 +37822,46 @@ fn p98_walk_dir(
             return Ok(true);
         } // SKIP_SUBTREE
     }
-    if let Some((jar, entry)) = jarfs_decode(dir) {
-        // jar-FS directory — children come from the archive listing, not the
-        // host filesystem (std::fs::read_dir on the encoded sentinel string
-        // would ENOENT and silently visit nothing, so e.g. JUnit5's
-        // ClasspathScanner would "discover" an empty jar).
-        for (child, is_dir) in jarfs_list_dir_classified(&jar, &entry) {
-            let es = jarfs_encode(&jar, &child);
-            let epo = alloc_concurrent_synthetic(ctx, "java/nio/file/Path", 2);
-            let epo_pin = p98_pin(ctx, epo);
-            let s = ctx.create_string(&es);
-            let epo_now = p98_read_pin(ctx, epo_pin);
-            ctx.set_field(epo_now, 0, Value::Object(Some(s)));
-            if is_dir {
-                if !p98_walk_dir(ctx, &es, visitor_pin, epo_pin, skip_file_callbacks)? {
-                    return Ok(false);
-                }
-            } else if !skip_file_callbacks {
-                let fa = p98_alloc_basic_file_attributes(
-                    ctx,
-                    false,
-                    jarfs_entry_size(&jar, &child).unwrap_or(0),
-                );
-                let visitor_now = p98_read_pin(ctx, visitor_pin);
-                let epo_now = p98_read_pin(ctx, epo_pin);
-                let vr = p98_invoke_file_visitor(
+    if remaining_depth > 0 {
+        if let Some((jar, entry)) = jarfs_decode(dir) {
+            // jar-FS directory — children come from the archive listing, not the
+            // host filesystem (std::fs::read_dir on the encoded sentinel string
+            // would ENOENT and silently visit nothing, so e.g. JUnit5's
+            // ClasspathScanner would "discover" an empty jar).
+            // The ArchiveContainer indexer only visits directories.  Do not build
+            // transient Java paths for every ignored archive file in that mode.
+            for (child, is_dir) in jarfs_list_dir_classified(&jar, &entry) {
+                let es = jarfs_encode(&jar, &child);
+                if is_dir {
+                    let epo = alloc_concurrent_synthetic(ctx, "java/nio/file/Path", 2);
+                    let epo_pin = p98_pin(ctx, epo);
+                    let s = ctx.create_string(&es);
+                    let epo_now = p98_read_pin(ctx, epo_pin);
+                    ctx.set_field(epo_now, 0, Value::Object(Some(s)));
+                    if !p98_walk_dir(
+                        ctx,
+                        &es,
+                        visitor_pin,
+                        epo_pin,
+                        skip_file_callbacks,
+                        remaining_depth - 1,
+                    )? {
+                        return Ok(false);
+                    }
+                } else if !skip_file_callbacks {
+                    let epo = alloc_concurrent_synthetic(ctx, "java/nio/file/Path", 2);
+                    let epo_pin = p98_pin(ctx, epo);
+                    let s = ctx.create_string(&es);
+                    let epo_now = p98_read_pin(ctx, epo_pin);
+                    ctx.set_field(epo_now, 0, Value::Object(Some(s)));
+                    let fa = p98_alloc_basic_file_attributes(
+                        ctx,
+                        false,
+                        jarfs_entry_size(&jar, &child).unwrap_or(0),
+                    );
+                    let visitor_now = p98_read_pin(ctx, visitor_pin);
+                    let epo_now = p98_read_pin(ctx, epo_pin);
+                    let vr = p98_invoke_file_visitor(
                     ctx,
                     visitor_now,
                     "visitFile",
@@ -37581,35 +37870,47 @@ fn p98_walk_dir(
                     epo_now,
                     Value::Object(Some(fa)),
                 )?;
-                if let Some(r) = vr {
-                    if ctx.get_field(r, 1).as_int().unwrap_or(0) == 1 {
-                        return Ok(false);
+                    if let Some(r) = vr {
+                        if ctx.get_field(r, 1).as_int().unwrap_or(0) == 1 {
+                            return Ok(false);
+                        }
                     }
                 }
             }
-        }
-    } else if let Some((java_home, entry)) = jrtfs_decode(dir) {
-        // jrt-FS directory — children come from the jimage listing.
-        for (child, is_dir) in jrtfs_list_dir_classified(&java_home, &entry) {
-            let es = jrtfs_encode(&java_home, &child);
-            let epo = alloc_concurrent_synthetic(ctx, "java/nio/file/Path", 2);
-            let epo_pin = p98_pin(ctx, epo);
-            let s = ctx.create_string(&es);
-            let epo_now = p98_read_pin(ctx, epo_pin);
-            ctx.set_field(epo_now, 0, Value::Object(Some(s)));
-            if is_dir {
-                if !p98_walk_dir(ctx, &es, visitor_pin, epo_pin, skip_file_callbacks)? {
-                    return Ok(false);
-                }
-            } else if !skip_file_callbacks {
-                let fa = p98_alloc_basic_file_attributes(
-                    ctx,
-                    false,
-                    jrtfs_entry_size(&java_home, &child).unwrap_or(0),
-                );
-                let visitor_now = p98_read_pin(ctx, visitor_pin);
-                let epo_now = p98_read_pin(ctx, epo_pin);
-                let vr = p98_invoke_file_visitor(
+        } else if let Some((java_home, entry)) = jrtfs_decode(dir) {
+            // jrt-FS directory — children come from the jimage listing.
+            for (child, is_dir) in jrtfs_list_dir_classified(&java_home, &entry) {
+                let es = jrtfs_encode(&java_home, &child);
+                if is_dir {
+                    let epo = alloc_concurrent_synthetic(ctx, "java/nio/file/Path", 2);
+                    let epo_pin = p98_pin(ctx, epo);
+                    let s = ctx.create_string(&es);
+                    let epo_now = p98_read_pin(ctx, epo_pin);
+                    ctx.set_field(epo_now, 0, Value::Object(Some(s)));
+                    if !p98_walk_dir(
+                        ctx,
+                        &es,
+                        visitor_pin,
+                        epo_pin,
+                        skip_file_callbacks,
+                        remaining_depth - 1,
+                    )? {
+                        return Ok(false);
+                    }
+                } else if !skip_file_callbacks {
+                    let epo = alloc_concurrent_synthetic(ctx, "java/nio/file/Path", 2);
+                    let epo_pin = p98_pin(ctx, epo);
+                    let s = ctx.create_string(&es);
+                    let epo_now = p98_read_pin(ctx, epo_pin);
+                    ctx.set_field(epo_now, 0, Value::Object(Some(s)));
+                    let fa = p98_alloc_basic_file_attributes(
+                        ctx,
+                        false,
+                        jrtfs_entry_size(&java_home, &child).unwrap_or(0),
+                    );
+                    let visitor_now = p98_read_pin(ctx, visitor_pin);
+                    let epo_now = p98_read_pin(ctx, epo_pin);
+                    let vr = p98_invoke_file_visitor(
                     ctx,
                     visitor_now,
                     "visitFile",
@@ -37618,38 +37919,50 @@ fn p98_walk_dir(
                     epo_now,
                     Value::Object(Some(fa)),
                 )?;
-                if let Some(r) = vr {
-                    if ctx.get_field(r, 1).as_int().unwrap_or(0) == 1 {
-                        return Ok(false);
+                    if let Some(r) = vr {
+                        if ctx.get_field(r, 1).as_int().unwrap_or(0) == 1 {
+                            return Ok(false);
+                        }
                     }
                 }
             }
-        }
-    } else if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let ep = entry.path();
-            let es = ep.to_string_lossy().to_string();
-            let epo = alloc_concurrent_synthetic(ctx, "java/nio/file/Path", 2);
-            let epo_pin = p98_pin(ctx, epo);
-            let s = ctx.create_string(&es);
-            let epo_now = p98_read_pin(ctx, epo_pin);
-            ctx.set_field(epo_now, 0, Value::Object(Some(s)));
-            if ep.is_dir() {
-                if !p98_walk_dir(ctx, &es, visitor_pin, epo_pin, skip_file_callbacks)? {
-                    return Ok(false);
-                }
-            } else if !skip_file_callbacks {
-                let fa = p98_alloc_basic_file_attributes(
-                    ctx,
-                    false,
-                    entry
-                        .metadata()
-                        .map(|metadata| metadata.len() as i64)
-                        .unwrap_or(0),
-                );
-                let visitor_now = p98_read_pin(ctx, visitor_pin);
-                let epo_now = p98_read_pin(ctx, epo_pin);
-                let vr = p98_invoke_file_visitor(
+        } else if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let ep = entry.path();
+                let es = ep.to_string_lossy().to_string();
+                if ep.is_dir() {
+                    let epo = alloc_concurrent_synthetic(ctx, "java/nio/file/Path", 2);
+                    let epo_pin = p98_pin(ctx, epo);
+                    let s = ctx.create_string(&es);
+                    let epo_now = p98_read_pin(ctx, epo_pin);
+                    ctx.set_field(epo_now, 0, Value::Object(Some(s)));
+                    if !p98_walk_dir(
+                        ctx,
+                        &es,
+                        visitor_pin,
+                        epo_pin,
+                        skip_file_callbacks,
+                        remaining_depth - 1,
+                    )? {
+                        return Ok(false);
+                    }
+                } else if !skip_file_callbacks {
+                    let epo = alloc_concurrent_synthetic(ctx, "java/nio/file/Path", 2);
+                    let epo_pin = p98_pin(ctx, epo);
+                    let s = ctx.create_string(&es);
+                    let epo_now = p98_read_pin(ctx, epo_pin);
+                    ctx.set_field(epo_now, 0, Value::Object(Some(s)));
+                    let fa = p98_alloc_basic_file_attributes(
+                        ctx,
+                        false,
+                        entry
+                            .metadata()
+                            .map(|metadata| metadata.len() as i64)
+                            .unwrap_or(0),
+                    );
+                    let visitor_now = p98_read_pin(ctx, visitor_pin);
+                    let epo_now = p98_read_pin(ctx, epo_pin);
+                    let vr = p98_invoke_file_visitor(
                     ctx,
                     visitor_now,
                     "visitFile",
@@ -37658,9 +37971,10 @@ fn p98_walk_dir(
                     epo_now,
                     Value::Object(Some(fa)),
                 )?;
-                if let Some(r) = vr {
-                    if ctx.get_field(r, 1).as_int().unwrap_or(0) == 1 {
-                        return Ok(false);
+                    if let Some(r) = vr {
+                        if ctx.get_field(r, 1).as_int().unwrap_or(0) == 1 {
+                            return Ok(false);
+                        }
                     }
                 }
             }
