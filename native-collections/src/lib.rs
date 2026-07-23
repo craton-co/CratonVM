@@ -4059,6 +4059,16 @@ fn map_state(ctx: &dyn NativeContext, this: ObjectRef) -> (Option<ObjectRef>, i3
 /// slot, which has descriptor `I` and is immune from the `b'L'` Int→Object
 /// coercion that mangles slot 1 (= `AbstractMap.values: Collection`).
 fn set_map_size(ctx: &mut dyn NativeContext, this: ObjectRef, size: i32) {
+    if dbg_hm_trace() {
+        eprintln!(
+            "[HM-SET-SIZE] this={:?} class={:?} new_size={} MAP_FIELD_SIZE_slot={} by_name_slot={:?}",
+            this,
+            ctx.class_name_of_id(ctx.class_id_of_object(this)),
+            size,
+            MAP_FIELD_SIZE,
+            ctx.resolve_field_index("java/util/HashMap", "size"),
+        );
+    }
     ctx.set_field(this, MAP_FIELD_SIZE, Value::Int(size));
     if let Some(slot) = ctx.resolve_field_index("java/util/HashMap", "size") {
         if slot != MAP_FIELD_SIZE && slot < ctx.object_num_fields(this) {
@@ -5670,6 +5680,13 @@ fn native_map_put_evict(
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    if dbg_hm_trace() {
+        eprintln!(
+            "[HM-PUT-ENTRY] native_map_put_evict this={:?} class={:?}",
+            this,
+            ctx.class_name_of_id(ctx.class_id_of_object(this))
+        );
+    }
     if is_bare_java_lang_object(ctx, this) {
         // Defensive interface-native guard: a java/util/Map.put dispatch on a
         // plain Object must not synthesize a HashMap bucket layout onto a
