@@ -1,8 +1,16 @@
 # `java.nio.file.Files.setPosixFilePermissions` throws `UnsupportedOperationException` under real-JDK mode on Linux
 
 ## Status
-**FIXED** — 2026-07-22, `dev` (see commit referenced in the merge that landed this
-doc move). Originally opened 2026-07-21 as
+**MOSTLY FIXED, ONE RESIDUAL STILL OPEN.** The POSIX-permissions bug this
+doc originally covers was fixed 2026-07-22 on `dev`. But
+`org.h2.test.unit.TestFileSystem` — the affected test class — is **still
+not a clean PASS**: it now fails at a distinct, unrelated assertion (see
+"Residual not fixed here" below), confirmed still reproducing as of
+2026-07-23 against current `dev` (see "Independent reconfirmation"). Moved
+back from `docs/internal/` to `docs/known-issues/` for that reason — per
+this repo's convention, a doc stays in `known-issues/` as long as any of
+its affected test classes has an open sub-item, even if the doc's headline
+bug is fixed. Originally opened 2026-07-21 as
 `docs/known-issues/h2-suite-bugs/bug-h2-files-setposixfilepermissions-unsupported.md`.
 
 ## Severity (as filed)
@@ -123,6 +131,24 @@ file-channel open-mode handling, not in POSIX attribute views; it does not
 block `testSetReadOnly` (which runs and passes earlier in the same class,
 confirmed by execution reaching the later, unrelated failure). Flagged as a
 follow-up, not fixed in this session.
+
+### Independent reconfirmation (2026-07-23, new `apps/h2database-suite-runner`)
+
+A new Linux suite runner (`apps/h2database-suite-runner`, see its own
+`RESULTS-20260723.md`) ran the full 218-class H2 suite against a `dev`
+binary built well after this doc's fix landed, and independently hit the
+exact same residual, byte-for-byte the same stack shape:
+
+```
+[cratonvm] main-vm run() returned Err: Exception in thread "main" java/lang/AssertionError: Expected an exception of type NonWritableChannelException to be thrown, but the method returned sun.nio.ch.FileChannelImpl@15956
+	at org/h2/test/unit/TestFileSystem.testSimple(TestFileSystem.java:495)
+	at org/h2/test/TestBase.assertThrows(TestBase.java:1607)
+	at org/h2/test/TestBase.checkException(TestBase.java:1665)
+```
+
+Confirms this residual is still live on current `dev`, not stale — worth
+picking up as its own follow-up (`FileChannel` read-only open-mode
+enforcement).
 
 ## Verification
 - Standalone repro (`Files.createTempFile` → read/clear/restore permissions

@@ -1239,3 +1239,41 @@ surfaced any other issue. A literal exit-0 (all 100 rounds) is still not
 practically obtainable in any reasonable session's timeframe given
 `TestAll.big`'s workload size and current interpreter throughput, and
 isn't necessary to close this out — treating this as closed.
+
+## Follow-up (2026-07-23): independent reconfirmation via new `apps/h2database-suite-runner`
+
+A new Linux suite runner (`apps/h2database-suite-runner`, one-process-per-class
+driver for the whole H2 suite, mirroring the Spring Boot / Elasticsearch
+runners but for Linux) ran the full 218-class suite against a `dev` binary
+built well after this doc's most recent (sixth) pass, independently
+re-hitting `TestBnf`, `TestFileLock`, and `TestTransaction` — all three at
+the exact same assertions already characterized above as performance-margin,
+no-fix-attempted issues, confirming they're still live on current `dev`, not
+stale:
+
+```
+org.h2.test.unit.TestBnf.testProcedures (TestBnf.java:138)
+  AssertionError: Expected: true got: false
+
+org.h2.test.unit.TestFileLock.testSimple (TestFileLock.java:99)
+  JdbcSQLNonTransientConnectionException (wrong error code — expected 90020)
+
+org.h2.test.db.TestTransaction.testMergeUsing (TestTransaction.java:446)
+  AssertionError: Expected: 100 actual: 50
+```
+
+`TestUpgrade` also still fails, consistent with this doc's characterization
+of its secondary `NoSuchMethodError` as the one genuine open residual
+requiring further VM work — the fresh run's stack trace bottoms out in
+`org/h2/mvstore/MVMap.hasChangesSince` → `MVStore.storeNow`/`store`/
+`tryCommit` → `TransactionStore.endTransaction` → `Transaction.commit` →
+`Session.commit`, same call shape as this doc's third/fifth/sixth-pass
+narrowing.
+
+Full run results, HotSpot-baseline comparison, and a broader FAIL/HANG
+triage of the rest of the suite (including 4 newly-found, unrelated
+CratonVM bugs) are in `apps/h2database-suite-runner/RESULTS-20260723.md`
+and `RESULTS-20260723-hangrerun.md`. No new investigation was done on
+`TestBnf`/`TestFileLock`/`TestTransaction`/`TestUpgrade` specifically in
+that session beyond reconfirming they still reproduce — this doc's existing
+characterization stands.

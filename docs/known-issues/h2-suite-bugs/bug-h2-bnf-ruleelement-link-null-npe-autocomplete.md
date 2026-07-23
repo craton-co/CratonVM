@@ -154,3 +154,21 @@ public class BnfProbe {
 - `docs/internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-httpurlconnection-no-keepalive-pooling-FIXED.md` — the fix that exposed this.
 - `apps/h2database/h2/src/main/org/h2/bnf/RuleElement.java`, `RuleList.java`, `Bnf.java` — where the NPE originates.
 - `apps/h2database/h2/src/main/org/h2/server/web/WebSession.java:119` (`loadBnf`) — where it's silently swallowed.
+
+## Follow-up (2026-07-23): independent reconfirmation via new `apps/h2database-suite-runner`
+
+A new Linux suite runner (`apps/h2database-suite-runner`) ran the full
+218-class H2 suite against a `dev` binary built well after this doc's
+CLOSED/reclassified finding, independently re-hitting `TestWeb.testWebApp()`
+at the exact same assertion:
+
+```
+org.h2.test.server.TestWeb.testWebApp (TestWeb.java:388)
+  AssertionError:  does not contain: '
+```
+
+Confirms this is still live on current `dev` (i.e. still the same
+Sentence.MAX_PROCESSING_TIME budget-exhaustion mechanism this doc already
+root-caused, not a regression or a different bug). No new investigation
+done here — see `apps/h2database-suite-runner/RESULTS-20260723.md` for the
+broader run this reconfirmation came from.
