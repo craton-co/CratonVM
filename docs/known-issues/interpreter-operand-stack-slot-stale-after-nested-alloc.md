@@ -266,6 +266,35 @@ What is OPEN, in priority order:
 None of items 1-4 are fixed. This doc should stay OPEN with this characterization until a future
 session reproduces and root-causes at least the two fatal items (2, 3).
 
+## Large-scale campaign (800 boots, fix15, 2026-07-23) — WFLYCTL0079 confirmed reproducible
+
+With the RSET_AUDIT diagnostic now fixed (verified holding at scale: 1 `EXITED`/800, no segfaults),
+an 800-boot campaign was run to try to catch item 2 or 3 again. Results: 7 `STALERECV` (0.875%,
+consistent with prior rates), 1 `EXITED` (0.125%, near baseline), 0 `CCEBT`, 0 `NSMEDX`.
+
+- **6/7 stale-recv events are the ordinary sb-chain shape** (`fromspace-reset`, `invoke-ret`-only
+  pushprov) — no new data.
+- **1/7 (boot-760) superficially LOOKED like item 2's shape** (`[zeroed]` lists a `site=sweep-span`
+  entry) but on inspection it is a coincidence, not a repeat: the sweep-span match is a stale
+  `age=3036` ring entry from address reuse (a prior, unrelated object swept from this same address
+  long ago), while `[gcpart]` shows `moved_to=Some(...)` at epoch 4 (unlike boot-134's `None` across
+  every epoch) and two much fresher `fromspace-reset` zero records dominate — this is the ordinary
+  moving-collector sb-chain shape, not item 2. **Item 2 (boot-134's exact shape) still has not
+  reproduced** across ~2450 boots run this session; it remains a single occurrence.
+- **The 1 `EXITED` boot (boot-739) is item 4 (`WFLYCTL0079`/`WFLYCTL0043` duplicate
+  `hornetq-store-enable-async-io` attribute registration) reproducing with the IDENTICAL signature
+  as the original run12 occurrence (boot-186).** Two occurrences, same exact error string, both
+  during `ParallelExtensionAddHandler`/`parallel-extension-add` — this is now a confirmed-
+  reproducible bug (~1-2 per 1600 boots), not a one-off. It has no `[stale-recv]`/`[pushprov]`
+  forensics (this doc's instrumentation doesn't cover it) and may not even be a CratonVM bug — it
+  could be a genuine WildFly-level race in the transactions-extension attribute builder that
+  HotSpot's different scheduling/timing rarely exposes. The one CratonVM-side hypothesis worth
+  checking first: whether `<clinit>` (class static initialization, JLS-guaranteed to run exactly
+  once) can run twice under CratonVM's class-loading lock during heavy concurrent
+  `parallel-extension-add` — that would be a fundamental correctness bug, not specific to this one
+  attribute, and the natural next diagnostic step (a per-class-init entry/exit trace under
+  contention) for whichever future session picks this up.
+
 ## Historical characterization (2026-07-22, superseded in mechanism, preserved)
 
 The discriminating capture that opened this doc (fix6 campaign, `CRATONVM_DBG_STALE_RECV=1`)
