@@ -1,5 +1,27 @@
 # Group 16 — Full-suite 6-shard run (2026-07-21): 23 confirmed CratonVM-only regressions
 
+> ⚠️ **MAJOR CORRECTION, 2026-07-24 — the "23 regressions / 172 fixture gaps"
+> split below (and the 2026-07-23 addendum's "11 remaining / 172 unchanged")
+> is WRONG.** The runner script never `cd`'d into the Tomcat checkout root
+> before launching each test JVM, so any test reading a resource via a bare
+> relative path (`new File("test/webapp")`, `"test/deployment/context.war"`,
+> etc. — Ant's own `<junit dir=".">` always ran with that cwd, this harness
+> didn't replicate it) resolved against the wrong directory entirely and
+> failed with a spurious `FileNotFoundException`/`NoSuchFileException`,
+> **regardless of which VM ran it** — which is exactly why so many looked
+> like "fails on HotSpot too, must be a fixture gap." Fixed in
+> `apps/tomcat-suite-runner/run-tomcat-suite.sh` (added `cd "$TC_ROOT"`).
+> Rerunning all 195 non-PASS classes with the fix:
+> **HotSpot 160 PASS / 35 not-PASS** (up from 24/196) and **CratonVM 69 PASS
+> / 126 not-PASS** (up from 12/196 the first time, still under `dev`
+> @ `893ddbc73`+the 2026-07-23 merge). The real split is
+> **91 confirmed CratonVM-only regressions and 35 true fixture gaps** — see
+> the "CORRECTED addendum, 2026-07-24" section near the bottom for the full
+> 91-class list, and [18](18-fixture-environment-gaps-20260724.md) for the
+> 35 true gaps categorized by root cause. Everything below this notice, up
+> to that corrected addendum, describes the ORIGINAL (bugged) run — kept for
+> history, not as a source of truth for which classes are actually broken.
+
 Full 646-class Apache Tomcat JUnit suite, Azure host, `dev` @ `660985acb`,
 worktree `wt-tomcat-full-suite-20260721` (binary `cratonvm-tomcat-full-suite-20260721`),
 6-way sharded (one JVM per class, `org.junit.runner.JUnitCore <class>`), real
@@ -205,3 +227,64 @@ for this rerun); worth checking whether the fix regressed, was on a branch
 that never actually merged despite the doc landing in the reorg, or whether
 this harness's flat `2g` heap / missing conf pieces reintroduce a *different*
 failure than the one those docs describe.
+
+## CORRECTED addendum, 2026-07-24 — the real numbers, after fixing the CWD bug
+
+**Root cause of the CWD bug:** `run-tomcat-suite.sh` computed absolute paths
+for `-Dtomcat.test.basedir`/`-Dtomcat.test.temp`/`-Dtomcat.test.tomcatbuild`,
+but never changed the shell's working directory before launching
+`java`/`cratonvm`. Tomcat's own test code frequently opens resources via
+**bare relative paths** (`new File("test/webapp")`,
+`"test/deployment/context.war"`, `"conf/web.xml"`, etc.) that resolve
+against the *process's actual CWD*, not any system property. Ant's own
+`<junit fork="yes" dir=".">` (build.xml) always launches with cwd = the
+Ant basedir (the checkout root) — this harness's shards were instead
+inheriting whatever directory the launching shell happened to be in
+(`/data/wt-tomcat-full-suite-20260721`, the unrelated CratonVM git worktree,
+which coincidentally also has its own `test/` dir — just not one containing
+`webapp`/`webresources`/`deployment` subdirectories — so the failure mode
+was a clean, silent `NoSuchFileException` rather than an obvious "wrong
+directory" error). This affected **every prior run in this doc and the
+2026-07-23 addendum equally** (both CratonVM and HotSpot), which is exactly
+why the original HotSpot-control diff mislabeled ~68 real CratonVM
+regressions as "environment gaps" — they never got far enough to hit real
+VM-specific behavior; they died on the missing-file check before the actual
+test logic ran, on both VMs alike.
+
+**Fix:** one line, `cd "$TC_ROOT"` right before the per-class loop in
+`apps/tomcat-suite-runner/run-tomcat-suite.sh`. Verified with a single-class
+smoke test (`TestDirResourceSet`, previously `NoSuchFileException`, now
+`PASS` under HotSpot) before re-running the full 195-class set.
+
+**Corrected full-suite numbers** (646 classes total, on `dev`
+@ `893ddbc73` + the 2026-07-23 merge, real JDK 25, `--Xmx 2g`, 300s/class
+timeout):
+
+| | Count |
+|---|---:|
+| Clean PASS (451 from the original run + 69 from the corrected 195-class rerun) | **520** |
+| Confirmed CratonVM-only regressions (HotSpot PASS, CratonVM not-PASS) | **91** |
+| True fixture/environment gaps (fail on HotSpot too) | **35** |
+
+520 + 91 + 35 = 646. Full gap breakdown, categorized by actual root cause:
+[18](18-fixture-environment-gaps-20260724.md). The 91 regressions are listed
+in full in `apps/tomcat-suite-runner/RESULTS-20260724-cwdfix.md` (91 classes
+is too many to usefully enumerate again here without grouping by root cause,
+which is future triage work, not done in this session — treat this as an
+updated group-05/16-style worklist, not yet individually diagnosed beyond
+what's already noted above for the original 12).
+
+**Two genuine CratonVM VM bugs were pinned precisely** despite the
+miscounted totals around them, and remain valid: the `TestBeanELResolver`-
+family fixes already merged (12 classes, see the 2026-07-23 addendum above,
+this list is a SUBSET of the 91 and still accurate for those specific
+classes), and the `vm/src/runtime/value_stack.rs:237` panic (`usize`
+underflow on a background NIO worker thread), now confirmed reproducing in
+**two** classes — `TestNonBlockingAPI` and `TestWebSocketFrameClientSSL` —
+see [18](18-fixture-environment-gaps-20260724.md) category I for detail.
+
+**Process note for future sessions:** the HotSpot control pass for this
+correction ran while the shared Azure host's load average spiked to 148 from
+other concurrent sessions — see [18](18-fixture-environment-gaps-20260724.md)
+category J for 9 classes whose `HANG` classification is unconfirmed as a
+result and needs a quiet-host rerun before being trusted either way.
