@@ -85,6 +85,40 @@ specific test's `getClassLoader()` call, or (b) a minimal standalone repro
 excluded package, then constructs a second wrapping loader from
 `thatClass.getClassLoader()` and checks whether the exclusion survives.
 
+## Additional check performed (narrows, doesn't yet pin, the cause)
+
+Read through `native-builtins/src/lang_class.rs`'s `native_class_for_name`
+and `native_class_get_class_loader`:
+
+- `Class.forName(name, init, loader)` for a user-defined loader (after
+  checking `find_loaded_class_for_loader` for an already-known class) DOES
+  correctly dispatch via `ctx.invoke_virtual(loader, "loadClass", ...)`,
+  which for a `URLClassLoader`/subclass routes through
+  `classloader.rs::ucl_try_define_local_class` — which DOES call
+  `register_defining_loader(class_id, loader)`. So the common "class defined
+  via `Class.forName(name, false, loader)`" path looks correctly wired.
+- `Class.getClassLoader()` (`native_class_get_class_loader`) checks
+  `classloader::defining_loader_for(class_id)` (the registry
+  `register_defining_loader` populates) FIRST, and only falls back to the
+  generic singleton `get_or_create_app_loader(ctx)` if that registry has no
+  entry for the class.
+
+So the remaining open question is narrower than originally framed: *why*
+would `defining_loader_for(DataRedisAutoConfigurationJedisTests's class id)`
+be empty (or point somewhere unexpected) specifically for this test class,
+given the define path above looks correct? Candidates not yet ruled out:
+JUnit5's test-class *discovery* phase (which runs before
+`ModifiedClassPathExtension`/`ResourcesExtension` fully take over,
+scanning for `@Test` methods etc.) may resolve/load the class through a
+different mechanism than `Class.forName(name, false, loader)` — e.g.
+directly via `ReflectionUtils`/`ClassLoaderUtils` using
+`Thread.currentThread().getContextClassLoader()` at a point before the
+exclusion-aware loader is installed, registering the class under a
+different loader identity that a later `getClassLoader()` call then
+(correctly, per its own bookkeeping) returns. Confirming this needs an
+actual runtime trace of `register_defining_loader`/`defining_loader_for`
+calls around this specific test's lifecycle, not further code reading.
+
 ## Status
 
 Pre-existing (not introduced by the `data-redis` HANG fix landed
