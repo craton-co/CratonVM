@@ -3341,6 +3341,17 @@ pub(crate) fn update_root_snapshot(shared: &SharedVm, thread: &mut JvmThread) {
     // roots and with the concurrent old-gen collector disabled). See
     // docs/real-raf-segv-root-cause.md.
     if !moving_young_precise_only {
+        // `update_root_snapshot` is also called at ordinary native-call
+        // boundaries, not only immediately before a safepoint.  Its JIT-root
+        // contribution is therefore a future cross-thread collector's only
+        // view of this thread while it is parked.  Do not let the per-thread
+        // scan cache republish a scan taken before the interpreted/native
+        // callee below the JIT frame allocated a new live object: none of the
+        // cache's keys change for that mutation.  The next collector could
+        // otherwise reclaim the omitted object and hand a zero-header slot
+        // back to compiled code.  This mirrors the safepoint and blocked
+        // snapshot paths, both of which already invalidate before publishing.
+        crate::jit::conservative_roots::invalidate_scan_cache_for_gc();
         let jit_scan_start = snapshot.len();
         crate::jit::conservative_roots::scan_active_jit_frames(&shared.heap, &mut snapshot);
         // G1 pin-in-place, cross-thread half: the snapshot keeps these
