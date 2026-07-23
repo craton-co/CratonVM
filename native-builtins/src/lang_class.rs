@@ -7709,6 +7709,47 @@ pub(crate) fn native_class_get_declared_methods(
         // Minimal, stable: everything else keeps its class-file position, and
         // only classes that declare a bridge with a same-name sibling change.
         if visible.iter().any(|m| m.access_flags & 0x0040 != 0) {
+            // Match a bridge to its bridged target by (name, parameter types) --
+            // NOT name alone. A single overloaded name (e.g. `append`) can have
+            // MANY non-bridge siblings plus SEVERAL, DIFFERENT bridges (one per
+            // interface it separately implements, e.g. `Appendable.append(char)`
+            // / `append(CharSequence)` / `append(CharSequence,int,int)` on
+            // `AbstractStringBuilder`). The previous name-only match attached
+            // every same-named bridge to the FIRST non-bridge overload it
+            // scanned (`append(Object)`), yanking all of them out of their
+            // natural position and ahead of the OTHER `append` overloads. Real
+            // JDK reflection keeps bridges immediately after the specific
+            // overload they bridge (verified: HotSpot's own
+            // `getDeclaredMethods()` places the three `Appendable` bridges
+            // after ALL real `append` overloads, each adjacent to its exact
+            // parameter-type match; CratonVM previously grouped them right
+            // after the first `append`). This is a real, independently-
+            // verified ordering bug fix on its own merits -- found while
+            // investigating why `MockMethodAdvice.isOverridden()` (ByteBuddy's
+            // `MethodGraph.Compiler`, used by Mockito's inline mock maker)
+            // answers differently on CratonVM for
+            // `AbstractStringBuilder.substring(int)` on a mocked
+            // `StringBuilder` (see docs/known-issues/
+            // CRATONVM-SPRING-GENUINE-BUGLIST.md's MockitoBeanByTypeLookup
+            // entry). Landing this alone does NOT flip that specific
+            // `isOverridden` answer -- confirmed by direct A/B: calling
+            // Mockito's own `compiler.compile(...)` externally with this fix
+            // in place already resolves `substring(int)`'s graph node to
+            // `AbstractStringBuilder` (matching HotSpot) even BEFORE this fix
+            // landed, yet the real `isOverridden()` method, executed as
+            // interpreted bytecode, still returns the wrong boolean -- so the
+            // substring-mocking bug's root cause is a separate, still-open
+            // interpreter defect in executing that specific method body, not
+            // (only) this ordering gap. Kept as a standalone fix regardless.
+            fn param_types(descriptor: &str) -> &str {
+                let start = descriptor.find('(').map(|i| i + 1).unwrap_or(0);
+                let end = descriptor.find(')').unwrap_or(descriptor.len());
+                if start <= end {
+                    &descriptor[start..end]
+                } else {
+                    ""
+                }
+            }
             let mut reordered: Vec<&MethodMetadata> = Vec::with_capacity(visible.len());
             let mut placed = vec![false; visible.len()];
             for i in 0..visible.len() {
@@ -7717,13 +7758,16 @@ pub(crate) fn native_class_get_declared_methods(
                 }
                 reordered.push(visible[i]);
                 placed[i] = true;
-                // After the first same-name NON-bridge method, pull in any later
-                // same-name bridge(s) so the bridge follows its bridged method.
+                // After a non-bridge method, pull in any later same-name,
+                // same-parameter-types bridge(s) so each bridge follows the
+                // exact overload it bridges.
                 if visible[i].access_flags & 0x0040 == 0 {
+                    let params_i = param_types(&visible[i].descriptor);
                     for j in (i + 1)..visible.len() {
                         if !placed[j]
                             && visible[j].access_flags & 0x0040 != 0
                             && visible[j].name == visible[i].name
+                            && param_types(&visible[j].descriptor) == params_i
                         {
                             reordered.push(visible[j]);
                             placed[j] = true;
@@ -7733,6 +7777,7 @@ pub(crate) fn native_class_get_declared_methods(
             }
             visible = reordered;
         }
+
 
         // GC-safe: `create_method_object` allocates (see `build_mirror_array`).
         let method_component = reflection_component_id(ctx, "java/lang/reflect/Method");

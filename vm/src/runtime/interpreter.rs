@@ -963,6 +963,18 @@ pub(crate) fn push_prov_record(addr: usize, site: &str) {
     });
 }
 
+/// Record a kind-preserving shuffle (dup*/swap) re-push of an Object slot,
+/// for the same pushprov ring `push_prov_record` feeds. Cheap no-op unless
+/// `CRATONVM_DBG_REMAP_TRACE` is set.
+#[inline]
+fn record_shuffle_push(cv: crate::types::CompactValue, site: &str) {
+    if remap_trace_on() {
+        if let Value::Object(Some(o)) = cv.to_value() {
+            push_prov_record(o.as_ptr() as usize, site);
+        }
+    }
+}
+
 /// Probe recent invoke-return pushes for `addr`: (pushes-ago, site).
 pub(crate) fn push_prov_find(addr: usize) -> Vec<(usize, String)> {
     PUSH_PROV_RING.with(|r| {
@@ -13301,6 +13313,11 @@ fn execute_instruction(
                     }
                     RuntimeError::ArrayIndexOutOfBoundsException { index: i }
                 })?;
+            if remap_trace_on() && matches!(instruction, Instruction::Aaload) {
+                if let Value::Object(Some(o)) = &value {
+                    push_prov_record(o.as_ptr() as usize, "aaload");
+                }
+            }
             thread.frames[frame_idx].stack.push(value)?;
         }
 
@@ -13570,11 +13587,14 @@ fn execute_instruction(
             // Preserve the kind so a duplicated collision-long stays KIND_LONG
             // (otherwise the copy lands KIND_UNKNOWN and the GC mis-roots it).
             let (val, kind) = thread.frames[frame_idx].stack.peek_with_kind()?;
+            record_shuffle_push(val, "dup");
             thread.frames[frame_idx].stack.push_with_kind(val, kind)?;
         }
         Instruction::DupX1 => {
             let (val1, k1) = thread.frames[frame_idx].stack.pop_with_kind()?;
             let (val2, k2) = thread.frames[frame_idx].stack.pop_with_kind()?;
+            record_shuffle_push(val1, "dup_x1");
+            record_shuffle_push(val2, "dup_x1");
             thread.frames[frame_idx].stack.push_with_kind(val1, k1)?;
             thread.frames[frame_idx].stack.push_with_kind(val2, k2)?;
             thread.frames[frame_idx].stack.push_with_kind(val1, k1)?;
@@ -13582,12 +13602,15 @@ fn execute_instruction(
         Instruction::DupX2 => {
             let (val1, k1) = thread.frames[frame_idx].stack.pop_with_kind()?;
             let (val2, k2) = thread.frames[frame_idx].stack.pop_with_kind()?;
+            record_shuffle_push(val1, "dup_x2");
+            record_shuffle_push(val2, "dup_x2");
             if crate::runtime::ValueStack::is_cat2_kind(k2, val2) {
                 thread.frames[frame_idx].stack.push_with_kind(val1, k1)?;
                 thread.frames[frame_idx].stack.push_with_kind(val2, k2)?;
                 thread.frames[frame_idx].stack.push_with_kind(val1, k1)?;
             } else {
                 let (val3, k3) = thread.frames[frame_idx].stack.pop_with_kind()?;
+                record_shuffle_push(val3, "dup_x2");
                 thread.frames[frame_idx].stack.push_with_kind(val1, k1)?;
                 thread.frames[frame_idx].stack.push_with_kind(val3, k3)?;
                 thread.frames[frame_idx].stack.push_with_kind(val2, k2)?;
@@ -13596,11 +13619,13 @@ fn execute_instruction(
         }
         Instruction::Dup2 => {
             let (val1, k1) = thread.frames[frame_idx].stack.pop_with_kind()?;
+            record_shuffle_push(val1, "dup2");
             if crate::runtime::ValueStack::is_cat2_kind(k1, val1) {
                 thread.frames[frame_idx].stack.push_with_kind(val1, k1)?;
                 thread.frames[frame_idx].stack.push_with_kind(val1, k1)?;
             } else {
                 let (val2, k2) = thread.frames[frame_idx].stack.pop_with_kind()?;
+                record_shuffle_push(val2, "dup2");
                 thread.frames[frame_idx].stack.push_with_kind(val2, k2)?;
                 thread.frames[frame_idx].stack.push_with_kind(val1, k1)?;
                 thread.frames[frame_idx].stack.push_with_kind(val2, k2)?;
@@ -13610,12 +13635,15 @@ fn execute_instruction(
         Instruction::Dup2X1 => {
             let (val1, k1) = thread.frames[frame_idx].stack.pop_with_kind()?;
             let (val2, k2) = thread.frames[frame_idx].stack.pop_with_kind()?;
+            record_shuffle_push(val1, "dup2_x1");
+            record_shuffle_push(val2, "dup2_x1");
             if crate::runtime::ValueStack::is_cat2_kind(k1, val1) {
                 thread.frames[frame_idx].stack.push_with_kind(val1, k1)?;
                 thread.frames[frame_idx].stack.push_with_kind(val2, k2)?;
                 thread.frames[frame_idx].stack.push_with_kind(val1, k1)?;
             } else {
                 let (val3, k3) = thread.frames[frame_idx].stack.pop_with_kind()?;
+                record_shuffle_push(val3, "dup2_x1");
                 thread.frames[frame_idx].stack.push_with_kind(val2, k2)?;
                 thread.frames[frame_idx].stack.push_with_kind(val1, k1)?;
                 thread.frames[frame_idx].stack.push_with_kind(val3, k3)?;
@@ -13626,6 +13654,8 @@ fn execute_instruction(
         Instruction::Dup2X2 => {
             let (val1, k1) = thread.frames[frame_idx].stack.pop_with_kind()?;
             let (val2, k2) = thread.frames[frame_idx].stack.pop_with_kind()?;
+            record_shuffle_push(val1, "dup2_x2");
+            record_shuffle_push(val2, "dup2_x2");
             let v1c2 = crate::runtime::ValueStack::is_cat2_kind(k1, val1);
             let v2c2 = crate::runtime::ValueStack::is_cat2_kind(k2, val2);
             if v1c2 && v2c2 {
@@ -13634,6 +13664,7 @@ fn execute_instruction(
                 thread.frames[frame_idx].stack.push_with_kind(val1, k1)?;
             } else if v1c2 {
                 let (val3, k3) = thread.frames[frame_idx].stack.pop_with_kind()?;
+                record_shuffle_push(val3, "dup2_x2");
                 thread.frames[frame_idx].stack.push_with_kind(val1, k1)?;
                 thread.frames[frame_idx].stack.push_with_kind(val3, k3)?;
                 thread.frames[frame_idx].stack.push_with_kind(val2, k2)?;
@@ -13646,6 +13677,8 @@ fn execute_instruction(
             } else {
                 let (val3, k3) = thread.frames[frame_idx].stack.pop_with_kind()?;
                 let (val4, k4) = thread.frames[frame_idx].stack.pop_with_kind()?;
+                record_shuffle_push(val3, "dup2_x2");
+                record_shuffle_push(val4, "dup2_x2");
                 thread.frames[frame_idx].stack.push_with_kind(val2, k2)?;
                 thread.frames[frame_idx].stack.push_with_kind(val1, k1)?;
                 thread.frames[frame_idx].stack.push_with_kind(val4, k4)?;
@@ -13657,6 +13690,8 @@ fn execute_instruction(
         Instruction::Swap => {
             let (val1, k1) = thread.frames[frame_idx].stack.pop_with_kind()?;
             let (val2, k2) = thread.frames[frame_idx].stack.pop_with_kind()?;
+            record_shuffle_push(val1, "swap");
+            record_shuffle_push(val2, "swap");
             thread.frames[frame_idx].stack.push_with_kind(val1, k1)?;
             thread.frames[frame_idx].stack.push_with_kind(val2, k2)?;
         }
@@ -14279,12 +14314,18 @@ fn execute_instruction(
                             }
                         }
                     };
+                    if remap_trace_on() {
+                        push_prov_record(stream.as_ptr() as usize, "getstatic-stream");
+                    }
                     thread.frames[frame_idx]
                         .stack
                         .push(Value::Object(Some(stream)))?;
                     // Skip the normal getstatic path — we've already pushed.
                 } else if fname == "in" {
                     let stdin = ensure_system_stdin_object(shared, thread)?;
+                    if remap_trace_on() {
+                        push_prov_record(stdin.as_ptr() as usize, "getstatic-stream");
+                    }
                     thread.frames[frame_idx]
                         .stack
                         .push(Value::Object(Some(stdin)))?;
@@ -15424,6 +15465,9 @@ fn execute_instruction(
                         .unwrap_or_default();
                     eprintln!("[NSEE-STK {i}] {}.{} pc={}", cn, f.method_name(), f.pc);
                 }
+            }
+            if remap_trace_on() {
+                push_prov_record(obj_ref.as_ptr() as usize, "new");
             }
             thread.frames[frame_idx]
                 .stack
@@ -17570,12 +17614,18 @@ fn execute_ldc(
         LdcValue::Float(v) => thread.frames[frame_idx].stack.push(Value::Float(v))?,
         LdcValue::Str(s) => {
             let obj_ref = create_java_string(shared, &s);
+            if remap_trace_on() {
+                push_prov_record(obj_ref.as_ptr() as usize, "ldc-str");
+            }
             thread.frames[frame_idx]
                 .stack
                 .push(Value::Object(Some(obj_ref)))?;
         }
         LdcValue::WideStr(units) => {
             let obj_ref = create_java_string_from_units(shared, &units);
+            if remap_trace_on() {
+                push_prov_record(obj_ref.as_ptr() as usize, "ldc-str");
+            }
             thread.frames[frame_idx]
                 .stack
                 .push(Value::Object(Some(obj_ref)))?;
@@ -17593,6 +17643,9 @@ fn execute_ldc(
                 resolve_class_loader_aware(shared, thread, referencing_class_id, &class_name)
                     .map_err(|e| convert_class_not_found(shared, thread, &class_name, e))?;
             let mirror = get_or_create_class_mirror(shared, class_id);
+            if remap_trace_on() {
+                push_prov_record(mirror.as_ptr() as usize, "ldc-classref");
+            }
             thread.frames[frame_idx]
                 .stack
                 .push(Value::Object(Some(mirror)))?;
@@ -17606,6 +17659,11 @@ fn execute_ldc(
             {
                 let cache = shared.resolution_cache.read();
                 if let Some(val) = cache.get_condy(frame_class_id, index) {
+                    if remap_trace_on() {
+                        if let Value::Object(Some(o)) = val {
+                            push_prov_record(o.as_ptr() as usize, "ldc-condy-cached");
+                        }
+                    }
                     thread.frames[frame_idx].stack.push(*val)?;
                     return Ok(());
                 }
@@ -17670,6 +17728,11 @@ fn execute_ldc(
                 .resolution_cache
                 .write()
                 .put_condy(frame_class_id, index, result);
+            if remap_trace_on() {
+                if let Value::Object(Some(o)) = &result {
+                    push_prov_record(o.as_ptr() as usize, "ldc-condy");
+                }
+            }
             thread.frames[frame_idx].stack.push(result)?;
         }
     }
@@ -18918,6 +18981,11 @@ fn push_static_field_value(
                         v = Value::Int(bits as i32);
                     }
                     _ => {}
+                }
+            }
+            if remap_trace_on() {
+                if let Value::Object(Some(o)) = &v {
+                    push_prov_record(o.as_ptr() as usize, "getstatic");
                 }
             }
             stack.push(v)?;

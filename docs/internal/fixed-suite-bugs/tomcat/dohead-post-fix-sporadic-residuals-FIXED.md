@@ -573,7 +573,7 @@ as closed for its originally-documented defects.
 **Status: CLOSED.** Every defect this document ever catalogued is now fixed
 and verified. The residual that kept this record open since 2026-07-19 is
 split out to its own dedicated, low-severity, accepted-environmental doc:
-[`dohead-environmental-transport-flake.md`](dohead-environmental-transport-flake.md).
+[`dohead-environmental-transport-flake-FIXED.md`](dohead-environmental-transport-flake-FIXED.md).
 
 ### What this session did
 
@@ -702,4 +702,5 @@ tracked by a distinct, separately-scoped open doc — this document is moved
 to `docs/internal/tomcat-08-07/dohead-post-fix-sporadic-residuals-FIXED.md`,
 and the remaining low single-digit-percent, corruption-free, host-load-
 correlated transport flake is now tracked on its own as
-`../../known-issues/tomcat/dohead-environmental-transport-flake.md`.
+`dohead-environmental-transport-flake-FIXED.md`, which records the
+subsequently confirmed moving-GC root gaps and their validation.

@@ -800,20 +800,35 @@ fn native_message_bytes_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -
     match ctx.get_field_by_name(this, "type").as_int().unwrap_or(0) {
         0 | 1 => Ok(Some(ctx.get_field_by_name(this, "strValue"))),
         2 => {
+            // ByteChunk.toString() can execute overridable bytecode and move
+            // MessageBytes; reload its receiver before caching the result.
+            let this_pin = ctx.pin_native_root(this);
             let byte_string = match ctx.get_field_by_name(this, "byteC") {
                 Value::Object(Some(byte_c)) => {
-                    ctx.invoke_virtual(byte_c, "toString", "()Ljava/lang/String;", &[])?
+                    match ctx.invoke_virtual(byte_c, "toString", "()Ljava/lang/String;", &[]) {
+                        Ok(result) => result,
+                        Err(error) => {
+                            ctx.unpin_native_roots(this_pin);
+                            return Err(error);
+                        }
+                    }
                 }
                 _ => None,
             };
+            let this = ctx.read_native_pin(this_pin, this);
             if let Some(value @ Value::Object(_)) = byte_string {
                 ctx.set_field_by_name(this, "strValue", value);
+                ctx.unpin_native_roots(this_pin);
                 Ok(Some(value))
             } else {
+                ctx.unpin_native_roots(this_pin);
                 Ok(Some(Value::Object(None)))
             }
         }
         3 => {
+            // create_string can collect, so retain this receiver while
+            // producing the cached String and refresh it before the write.
+            let this_pin = ctx.pin_native_root(this);
             let str_obj = match ctx.get_field_by_name(this, "charC") {
                 Value::Object(Some(char_c)) => {
                     if let Some((buff, start, end)) = char_chunk_parts(ctx, char_c) {
@@ -828,7 +843,9 @@ fn native_message_bytes_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -
                 }
                 _ => None,
             };
+            let this = ctx.read_native_pin(this_pin, this);
             ctx.set_field_by_name(this, "strValue", Value::Object(str_obj));
+            ctx.unpin_native_roots(this_pin);
             Ok(Some(Value::Object(str_obj)))
         }
         _ => Ok(Some(ctx.get_field_by_name(this, "strValue"))),
@@ -8717,9 +8734,9 @@ pub mod util_time;
 // the loaded value instead of NPE.
 pub mod charset;
 pub mod classloader_value_sidetable;
+pub mod jfr;
 #[cfg(feature = "experimental-jmx")]
 pub mod jmx;
-pub mod jfr;
 pub mod panama;
 pub mod panama_libffi;
 pub mod properties_sidetable;
@@ -9787,12 +9804,17 @@ pub(crate) fn jul_logger_handlers_set(
     logger: ObjectRef,
     list: ObjectRef,
 ) {
+    // Adding a global root may grow the root table and collect. The logger is
+    // keyed immediately afterward, so retain it across that allocation.
+    let logger_pin = ctx.pin_native_root(logger);
     let handle = ctx.add_global_root(list);
+    let logger = ctx.read_native_pin(logger_pin, logger);
     let key = ctx.identity_hash_code(logger);
     jul_logger_handlers_table()
         .lock()
         .unwrap()
         .insert(key, handle);
+    ctx.unpin_native_roots(logger_pin);
 }
 
 pub(crate) fn jul_logger_handlers_clear(ctx: &mut dyn NativeContext, logger: ObjectRef) {
@@ -27943,8 +27965,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
                                 match ctx.get_field(o, 2) {
                                     Value::Object(Some(d)) => {
                                         let dcid = ctx.class_id_of_object(d);
-                                        let dcname =
-                                            ctx.class_name_of_id(dcid).unwrap_or_default();
+                                        let dcname = ctx.class_name_of_id(dcid).unwrap_or_default();
                                         // getName() on a Class/Method/Constructor
                                         // mirror reveals the actual declaration.
                                         match ctx.invoke_virtual(
@@ -27965,9 +27986,8 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
                                 None
                             };
                             match (tv_name, decl_desc) {
-                                (Some(n), Some(d)) => desc.push_str(&format!(
-                                    "{cname}@{ident:x}(name={n:?},decl={d})"
-                                )),
+                                (Some(n), Some(d)) => desc
+                                    .push_str(&format!("{cname}@{ident:x}(name={n:?},decl={d})")),
                                 (Some(n), None) => {
                                     desc.push_str(&format!("{cname}@{ident:x}(name={n:?})"))
                                 }
@@ -27986,8 +28006,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             for i in 0..len {
                 let elem_hash = match ctx.get_array_element(arr, i) {
                     Value::Object(None) => 0,
-                    Value::Object(Some(o)) => match ctx.invoke_virtual(o, "hashCode", "()I", &[])
-                    {
+                    Value::Object(Some(o)) => match ctx.invoke_virtual(o, "hashCode", "()I", &[]) {
                         Ok(Some(Value::Int(h))) => h,
                         _ => 0,
                     },
@@ -38392,18 +38411,12 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // JNDI DNS uses PortConfig to select a UDP source port. These are native
     // JDK methods (not Java fallbacks), so real-JDK mode otherwise stops at an
     // UnsatisfiedLinkError before the TXT query can be issued.
-    registry.register(
-        "sun/net/PortConfig",
-        "getLower0",
-        "()I",
-        |_ctx, _args| Ok(Some(Value::Int(system_ephemeral_port_range().0))),
-    );
-    registry.register(
-        "sun/net/PortConfig",
-        "getUpper0",
-        "()I",
-        |_ctx, _args| Ok(Some(Value::Int(system_ephemeral_port_range().1))),
-    );
+    registry.register("sun/net/PortConfig", "getLower0", "()I", |_ctx, _args| {
+        Ok(Some(Value::Int(system_ephemeral_port_range().0)))
+    });
+    registry.register("sun/net/PortConfig", "getUpper0", "()I", |_ctx, _args| {
+        Ok(Some(Value::Int(system_ephemeral_port_range().1)))
+    });
 
     // MongoDB Reactive Streams 5.7 uses Netty 4.2's
     // MultiThreadIoEventLoopGroup for its driver lifecycle. After a Mongo
@@ -44017,7 +44030,11 @@ fn native_springboot_mongo_reactive_customizer_customize(
         ],
     )?;
     let event_loop_group = ctx.read_native_pin(group_pin, event_loop_group);
-    ctx.set_field_by_name(this, "eventLoopGroup", Value::Object(Some(event_loop_group)));
+    ctx.set_field_by_name(
+        this,
+        "eventLoopGroup",
+        Value::Object(Some(event_loop_group)),
+    );
     ctx.unpin_native_roots(group_pin);
     ctx.unpin_native_roots(handler_pin);
     ctx.unpin_native_roots(factory_pin);
@@ -44076,7 +44093,9 @@ fn system_ephemeral_port_range() -> (i32, i32) {
     std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range")
         .ok()
         .and_then(|range| {
-            let mut ports = range.split_whitespace().filter_map(|port| port.parse::<i32>().ok());
+            let mut ports = range
+                .split_whitespace()
+                .filter_map(|port| port.parse::<i32>().ok());
             Some((ports.next()?, ports.next()?))
         })
         .filter(|(lower, upper)| (0..=*upper).contains(lower) && *upper <= 65_535)
@@ -44889,9 +44908,13 @@ pub(crate) fn system_set_overridden_stream(
         }
     }
     let handle = ctx.add_global_root(stream);
-    system_overridden_streams()
-        .lock()
-        .insert(name, StreamOverride { handle, raw: stream });
+    system_overridden_streams().lock().insert(
+        name,
+        StreamOverride {
+            handle,
+            raw: stream,
+        },
+    );
 }
 
 /// Remove the override for the given stream name (back to default).
@@ -44908,10 +44931,7 @@ pub(crate) fn system_clear_overridden_stream(ctx: &mut dyn NativeContext, name: 
 /// resolved through its persistent global root so the returned ref is
 /// valid after any number of moving collections. Falls back to the
 /// registration-time raw ref only for contexts without global-root support.
-pub fn system_overridden_stream_resolved(
-    ctx: &dyn NativeContext,
-    name: &str,
-) -> Option<ObjectRef> {
+pub fn system_overridden_stream_resolved(ctx: &dyn NativeContext, name: &str) -> Option<ObjectRef> {
     let (handle, raw) = {
         let map = system_overridden_streams().lock();
         let e = map.get(name)?;
@@ -45600,12 +45620,12 @@ fn emit_framework_log_object(
 ) {
     let message = ctx
         .read_string(message)
-        .or_else(|| {
-            match ctx.invoke_virtual(message, "toString", "()Ljava/lang/String;", &[]) {
+        .or_else(
+            || match ctx.invoke_virtual(message, "toString", "()Ljava/lang/String;", &[]) {
                 Ok(Some(Value::Object(Some(text)))) => ctx.read_string(text),
                 _ => None,
-            }
-        })
+            },
+        )
         .or_else(|| match ctx.get_field_by_name(message, "format") {
             Value::Object(Some(format)) => ctx.read_string(format),
             _ => None,
@@ -52860,31 +52880,40 @@ fn native_objects_hash(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(a))) => *a,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let len = ctx.array_length(arr);
-    let mut result: i32 = 1;
-    for i in 0..len {
-        let elem = ctx.get_array_element(arr, i);
-        let elem_hash = match elem {
-            Value::Object(Some(obj)) => native_objects_value_hash_code(ctx, obj)?,
-            Value::Int(v) => v,
-            Value::Long(v) => (v ^ (v >> 32)) as i32,
-            Value::Float(v) => {
-                let bits = if v.is_nan() { 0x7fc0_0000 } else { v.to_bits() };
-                bits as i32
-            }
-            Value::Double(v) => {
-                let bits = if v.is_nan() {
-                    0x7ff8_0000_0000_0000u64
-                } else {
-                    v.to_bits()
-                };
-                (bits ^ (bits >> 32)) as i32
-            }
-            _ => 0,
-        };
-        result = result.wrapping_mul(31).wrapping_add(elem_hash);
-    }
-    Ok(Some(Value::Int(result)))
+    // Element hashCode() is virtual and can allocate/collect. Keep the input
+    // array rooted and reload it before every element access rather than
+    // dereferencing its pre-GC address on the next iteration.
+    let arr_pin = ctx.pin_native_root(arr);
+    let result = (|| -> Result<i32, MethodCallFailed> {
+        let len = ctx.array_length(ctx.read_native_pin(arr_pin, arr));
+        let mut result: i32 = 1;
+        for i in 0..len {
+            let arr = ctx.read_native_pin(arr_pin, arr);
+            let elem = ctx.get_array_element(arr, i);
+            let elem_hash = match elem {
+                Value::Object(Some(obj)) => native_objects_value_hash_code(ctx, obj)?,
+                Value::Int(v) => v,
+                Value::Long(v) => (v ^ (v >> 32)) as i32,
+                Value::Float(v) => {
+                    let bits = if v.is_nan() { 0x7fc0_0000 } else { v.to_bits() };
+                    bits as i32
+                }
+                Value::Double(v) => {
+                    let bits = if v.is_nan() {
+                        0x7ff8_0000_0000_0000u64
+                    } else {
+                        v.to_bits()
+                    };
+                    (bits ^ (bits >> 32)) as i32
+                }
+                _ => 0,
+            };
+            result = result.wrapping_mul(31).wrapping_add(elem_hash);
+        }
+        Ok(result)
+    })();
+    ctx.unpin_native_roots(arr_pin);
+    Ok(Some(Value::Int(result?)))
 }
 
 fn native_objects_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -69314,18 +69343,45 @@ fn completed_executor_future(
     ctx: &mut dyn NativeContext,
     result: Value,
 ) -> Result<ObjectRef, MethodCallFailed> {
-    let future =
-        match ctx.new_object_initialized("java/util/concurrent/CompletableFuture", "()V", &[])? {
-            Some(Value::Object(Some(future))) => future,
-            _ => {
-                return Err(RuntimeError::IllegalStateException {
-                    message: "could not allocate executor completion future".to_string(),
+    // Callable.call() can return a heap object. Retain that result across the
+    // CompletableFuture allocation and completion dispatch; both can collect.
+    // Tomcat's WebappClassLoaderBase.clearReferencesJdbc() reaches this path
+    // during DoHead shutdown, where a raw returned value otherwise became stale
+    // before CompletableFuture.complete stored it.
+    let result_obj = match result {
+        Value::Object(Some(result_obj)) => Some(result_obj),
+        _ => None,
+    };
+    let result_pin = result_obj.map(|result_obj| ctx.pin_native_root(result_obj));
+    let outcome = (|| -> Result<ObjectRef, MethodCallFailed> {
+        let future =
+            match ctx.new_object_initialized("java/util/concurrent/CompletableFuture", "()V", &[])? {
+                Some(Value::Object(Some(future))) => future,
+                _ => {
+                    return Err(RuntimeError::IllegalStateException {
+                        message: "could not allocate executor completion future".to_string(),
+                    }
+                    .into())
                 }
-                .into())
+            };
+        let future_pin = ctx.pin_native_root(future);
+        let result = match (result_pin, result_obj) {
+            (Some(result_pin), Some(result_obj)) => {
+                Value::Object(Some(ctx.read_native_pin(result_pin, result_obj)))
             }
+            _ => result,
         };
-    ctx.invoke_virtual(future, "complete", "(Ljava/lang/Object;)Z", &[result])?;
-    Ok(future)
+        let future = ctx.read_native_pin(future_pin, future);
+        let complete = ctx.invoke_virtual(future, "complete", "(Ljava/lang/Object;)Z", &[result]);
+        let future = ctx.read_native_pin(future_pin, future);
+        ctx.unpin_native_roots(future_pin);
+        complete?;
+        Ok(future)
+    })();
+    if let Some(result_pin) = result_pin {
+        ctx.unpin_native_roots(result_pin);
+    }
+    outcome
 }
 
 fn failed_executor_future(
@@ -72466,11 +72522,7 @@ fn native_attrs_put_object(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     let map = ctx.read_native_pin(map_pin, map);
     let result = cratonvm_native_collections::native_map_put_pub(
         ctx,
-        &[
-            Value::Object(Some(map)),
-            Value::Object(Some(key)),
-            value,
-        ],
+        &[Value::Object(Some(map)), Value::Object(Some(key)), value],
     );
     ctx.unpin_native_roots(this_pin);
     ctx.unpin_native_roots(key_pin);

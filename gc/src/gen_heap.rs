@@ -3820,79 +3820,47 @@ impl GenerationalHeap {
                 let addr = obj_ptr as usize;
                 let card_idx = addr.wrapping_sub(cbase) / csize;
                 let dirty = card_table.is_dirty(card_idx);
-                if hdr.kind == ObjectKind::Array {
-                    if hdr.element_type == ArrayElementType::Reference {
-                        for i in 0..hdr.array_length as usize {
-                            // SAFETY: `i < hdr.array_length`, so the element offset is
-                            // within the array's allocated payload; `obj_ptr.add(..)`
-                            // and the u64 read of that ref slot stay in-bounds.
-                            let s_ptr = unsafe { obj_ptr.add(HEADER_SIZE + i * REF_ELEMENT_SIZE) };
-                            let raw = unsafe { std::ptr::read(s_ptr as *const u64) };
-                            if raw != 0 && raw < 0x1000 {
-                                let cn = crate::gc::resolve_class_info(hdr.class_id.as_u32())
-                                    .map(|(n, _)| n)
-                                    .unwrap_or_else(|| "<unresolved>".to_string());
-                                eprintln!(
-                                    "[small4] PRE-GC OLD {} @0x{:x} arr[{}] -> 0x{:x}",
-                                    cn, addr, i, raw,
-                                );
-                            }
-                            if raw != 0 && young_from.contains(raw as usize as *mut u8) {
-                                edges += 1;
-                                if !dirty {
-                                    misses += 1;
-                                    if reported < 60 {
-                                        reported += 1;
-                                        let cn =
-                                            crate::gc::resolve_class_info(hdr.class_id.as_u32())
-                                                .map(|(n, _)| n)
-                                                .unwrap_or_else(|| "<unresolved>".to_string());
-                                        eprintln!(
-                                            "[rset-miss] OLD {} @0x{:x} arr[{}] -> young 0x{:x} CLEAN(card={})",
-                                            cn, addr, i, raw, card_idx,
-                                        );
-                                    }
+                // stw-residual-close FIX (2026-07-23): this used to hand-walk
+                // `0..hdr.num_slots` as legacy 16-byte `Value` cells, which is
+                // WRONG for compact-ref-layout objects (num_slots/slot stride
+                // differ under `GC_FLAG_COMPACT` — see compact-ref-field-layout
+                // design doc) and reliably walked off the object's real body
+                // into unmapped memory, SIGSEGVing ~1 boot in 6 under a WildFly
+                // campaign. `for_each_ref_slot` is the unified array/compact/
+                // legacy-aware helper already used by `scan_all_old_to_young`
+                // just above — reuse it here instead of re-deriving field
+                // offsets by hand.
+                // SAFETY: `obj_ptr`/`hdr` are a valid, fully-initialized old-gen
+                // object/header pair from `old_gen.walk_objects()`.
+                unsafe {
+                    for_each_ref_slot(obj_ptr, hdr, |raw, slot_idx| {
+                        let p = raw as usize;
+                        if p != 0 && p < 0x1000 {
+                            let cn = crate::gc::resolve_class_info(hdr.class_id.as_u32())
+                                .map(|(n, _)| n)
+                                .unwrap_or_else(|| "<unresolved>".to_string());
+                            eprintln!(
+                                "[small4] PRE-GC OLD {} @0x{:x} fld[{}] -> 0x{:x}",
+                                cn, addr, slot_idx, p,
+                            );
+                        }
+                        if young_from.contains(raw) {
+                            edges += 1;
+                            if !dirty {
+                                misses += 1;
+                                if reported < 60 {
+                                    reported += 1;
+                                    let cn = crate::gc::resolve_class_info(hdr.class_id.as_u32())
+                                        .map(|(n, _)| n)
+                                        .unwrap_or_else(|| "<unresolved>".to_string());
+                                    eprintln!(
+                                        "[rset-miss] OLD {} @0x{:x} fld[{}] -> young 0x{:x} CLEAN(card={})",
+                                        cn, addr, slot_idx, p, card_idx,
+                                    );
                                 }
                             }
                         }
-                    }
-                } else {
-                    for slot_idx in 0..hdr.num_slots as usize {
-                        // SAFETY: `slot_idx < hdr.num_slots`, so the slot offset is
-                        // within the object's allocated field area; the pointer and the
-                        // `Value` read of that initialized slot are in-bounds.
-                        let s_ptr = unsafe { obj_ptr.add(HEADER_SIZE + slot_idx * SLOT_SIZE) };
-                        let value = unsafe { std::ptr::read(s_ptr as *const Value) };
-                        if let Value::Object(Some(ro)) = value {
-                            let p = ro.as_ptr() as usize;
-                            if p != 0 && p < 0x1000 {
-                                let cn = crate::gc::resolve_class_info(hdr.class_id.as_u32())
-                                    .map(|(n, _)| n)
-                                    .unwrap_or_else(|| "<unresolved>".to_string());
-                                eprintln!(
-                                    "[small4] PRE-GC OLD {} @0x{:x} fld[{}] -> 0x{:x}",
-                                    cn, addr, slot_idx, p,
-                                );
-                            }
-                            if young_from.contains(ro.as_ptr()) {
-                                edges += 1;
-                                if !dirty {
-                                    misses += 1;
-                                    if reported < 60 {
-                                        reported += 1;
-                                        let cn =
-                                            crate::gc::resolve_class_info(hdr.class_id.as_u32())
-                                                .map(|(n, _)| n)
-                                                .unwrap_or_else(|| "<unresolved>".to_string());
-                                        eprintln!(
-                                            "[rset-miss] OLD {} @0x{:x} fld[{}] -> young 0x{:x} CLEAN(card={})",
-                                            cn, addr, slot_idx, ro.as_ptr() as usize, card_idx,
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    });
                 }
             }
             if edges > 0 {
@@ -3906,6 +3874,27 @@ impl GenerationalHeap {
             // the GC (it is NOT created by the collector). Linear walk may
             // truncate on a bad header (logged) — but the bump-allocated
             // young space is contiguous so it usually reaches everything.
+            //
+            // stw-residual-close FIX (2026-07-23): gated behind its OWN flag,
+            // separate from `CRATONVM_DBG_RSET_AUDIT` above. Unlike the
+            // `young_object_starts` walk further below (hardened 2026-07-16
+            // for cce0079 with explicit free-list/TLAB-gap skipping) or
+            // `old_gen.walk_objects()` used by the audit above (which owns
+            // its own object-start bookkeeping), THIS walk has no such
+            // protection: it advances purely by `gen_object_total_size`, so
+            // landing on a stale TLAB-tail/free-block byte pattern that
+            // happens to parse as a plausible-but-wrong header desyncs it
+            // for the rest of the arena. Three rounds of narrower fixes
+            // (compact-ref-layout-aware field reads, then a num_slots
+            // plausibility cap) each closed one crash shape a WildFly
+            // campaign found, but the walk remains unsound in general — it
+            // would need the same start-set hardening as the walk below to
+            // be truly safe, which is out of scope for a "was there ever a
+            // 0x4 in young-gen" diagnostic nobody currently depends on.
+            // Splitting the flag keeps `RSET_AUDIT`'s actually-load-bearing
+            // old→young remembered-set check (fixed and verified above)
+            // usable without inheriting this walk's fragility.
+            if std::env::var_os("CRATONVM_DBG_RSET_AUDIT_YOUNG_SCAN").is_some() {
             let ybase = young_from.base_ptr_mut() as usize;
             let yused = young_from.used();
             let mut ycur = 0usize;
@@ -3916,103 +3905,64 @@ impl GenerationalHeap {
                 // begins (a bad header is detected by the size check below).
                 let h = unsafe { &*((ybase + ycur) as *const ObjectHeader) };
                 let size = gen_object_total_size(h);
-                if size == 0 || ycur + size > yused {
+                // stw-residual-close FIX (2026-07-23): this walk (unlike the
+                // free-list/TLAB-gap-aware `young_object_starts` walk further
+                // below, hardened 2026-07-16 for the cce0079 desync) has no
+                // protection against landing mid-object on a stale/leftover
+                // TLAB-tail header: a garbage-but-plausible `num_slots` (e.g.
+                // ~200K, observed) still produces a `size` that fits within
+                // the remaining `yused` budget, so the existing `size == 0 ||
+                // ycur + size > yused` guard doesn't catch it, and the field
+                // loop below then walks `num_slots` slots off the end of the
+                // real (much smaller) object into unmapped memory — SIGSEGV.
+                // No real class has anywhere near this many declared fields;
+                // cap `num_slots` the same way `set_field`/`get_field` cap
+                // theirs against corrupt headers, then bail the whole
+                // best-effort walk rather than trust a header that fails it.
+                let implausible_slots =
+                    h.kind == ObjectKind::Object && h.num_slots as usize > 4096;
+                if size == 0 || ycur + size > yused || implausible_slots {
                     eprintln!(
-                        "[small4] young walk truncated at off={} used={}",
-                        ycur, yused
+                        "[small4] young walk truncated at off={} used={} implausible_slots={}",
+                        ycur, yused, implausible_slots,
                     );
                     break;
                 }
                 let optr = (ybase + ycur) as *mut u8;
-                if h.kind == ObjectKind::Object {
-                    for si in 0..h.num_slots as usize {
-                        // SAFETY: `si < h.num_slots` and `ycur + size <= yused` was
-                        // checked, so this slot is within the object's field area in the
-                        // arena; the pointer and `Value` read of that slot are in-bounds.
-                        let sp = unsafe { optr.add(HEADER_SIZE + si * SLOT_SIZE) };
-                        let v = unsafe { std::ptr::read(sp as *const Value) };
-                        if let Value::Object(Some(ro)) = v {
-                            let p = ro.as_ptr() as usize;
-                            if p != 0 && p < 0x1000 && found4 < 40 {
-                                found4 += 1;
-                                let cn = crate::gc::resolve_class_info(h.class_id.as_u32())
-                                    .map(|(n, _)| n)
-                                    .unwrap_or_else(|| "<unresolved>".to_string());
-                                eprintln!(
-                                    "[small4] PRE-GC YOUNG {} @0x{:x} fld[{}] -> 0x{:x}",
-                                    cn,
-                                    ybase + ycur,
-                                    si,
-                                    p,
-                                );
-                                // bc math-ec 0x4 (2026-06-09): ONE-SHOT hex dump
-                                // of the victim ±128 bytes. The surroundings
-                                // answer "smear vs surgical": a run of math
-                                // longs around the cell = OOB/stale smear; an
-                                // otherwise-intact object with ONE flipped
-                                // payload = a surgical single write. Words are
-                                // u64 at 8-byte stride; the corrupt payload is
-                                // marked `<<<<`.
-                                static DUMPED: std::sync::atomic::AtomicBool =
-                                    std::sync::atomic::AtomicBool::new(false);
-                                if !DUMPED.swap(true, Ordering::Relaxed) {
-                                    let victim = ybase + ycur;
-                                    let cell_payload = victim + HEADER_SIZE + si * SLOT_SIZE + 8;
-                                    let lo = victim.saturating_sub(128).max(ybase);
-                                    let hi = (victim + size + 128).min(ybase + yused);
-                                    eprintln!(
-                                        "[small4] HEXDUMP victim=0x{victim:x} size={size} cell_payload=0x{cell_payload:x}:"
-                                    );
-                                    let mut a = lo & !7;
-                                    while a < hi {
-                                        // SAFETY: `a` is 8-aligned and `lo`/`hi` are
-                                        // clamped to `[ybase, ybase+yused)`, so each word
-                                        // read stays within the live young arena.
-                                        let w = unsafe { std::ptr::read(a as *const u64) };
-                                        eprintln!(
-                                            "[small4]   0x{a:x}: 0x{w:016x}{}{}",
-                                            if a == victim {
-                                                "  <-- victim header"
-                                            } else {
-                                                ""
-                                            },
-                                            if a == cell_payload {
-                                                "  <<<< corrupt payload"
-                                            } else {
-                                                ""
-                                            },
-                                        );
-                                        a += 8;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                } else if h.kind == ObjectKind::Array
-                    && h.element_type == ArrayElementType::Reference
-                {
-                    for i in 0..h.array_length as usize {
-                        // SAFETY: `i < h.array_length` and `ycur + size <= yused` was
-                        // checked, so this element offset is within the array payload in
-                        // the arena; the pointer and u64 read of that ref slot are in-bounds.
-                        let sp = unsafe { optr.add(HEADER_SIZE + i * REF_ELEMENT_SIZE) };
-                        let raw = unsafe { std::ptr::read(sp as *const u64) } as usize;
-                        if raw != 0 && raw < 0x1000 && found4 < 40 {
+                // stw-residual-close FIX (2026-07-23): same compact-ref-layout
+                // gap as the old-gen audit above (`for_each_ref_slot` handles
+                // array/compact/legacy uniformly instead of hand-deriving a
+                // legacy-only 16-byte stride, which walked off compact
+                // objects' real bodies and SIGSEGV'd). The one-shot HEXDUMP is
+                // dropped: with three different offset semantics (byte offset
+                // for compact, slot index for legacy, element index for
+                // arrays) a single "corrupt payload" marker can no longer be
+                // computed generically, and the victim/size boundaries alone
+                // (still printed via the eprintln above it) are what mattered
+                // for the "smear vs surgical" triage this was added for.
+                // SAFETY: `optr`/`h` are a valid, fully-initialized young-gen
+                // object/header pair (the `size`/`yused` bounds were checked
+                // above before entering this iteration).
+                unsafe {
+                    for_each_ref_slot(optr, h, |raw, slot_idx| {
+                        let p = raw as usize;
+                        if p != 0 && p < 0x1000 && found4 < 40 {
                             found4 += 1;
                             let cn = crate::gc::resolve_class_info(h.class_id.as_u32())
                                 .map(|(n, _)| n)
                                 .unwrap_or_else(|| "<unresolved>".to_string());
                             eprintln!(
-                                "[small4] PRE-GC YOUNG {} @0x{:x} arr[{}] -> 0x{:x}",
+                                "[small4] PRE-GC YOUNG {} @0x{:x} fld[{}] -> 0x{:x}",
                                 cn,
                                 ybase + ycur,
-                                i,
-                                raw,
+                                slot_idx,
+                                p,
                             );
                         }
-                    }
+                    });
                 }
                 ycur += size;
+            }
             }
         }
         // -------------------------------------------------------------------
