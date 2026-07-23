@@ -2801,11 +2801,19 @@ fn try_build_replace_override(
     for c in &candidates {
         *name_counts.entry(c.name.clone()).or_insert(0) += 1;
     }
+    let dbg_replovr = std::env::var_os("CRATONVM_DBG_REPLOVR").is_some();
     let mut specs: Vec<crate::cglib_enhancer::ReplaceMethodSpec> = Vec::new();
     for c in &candidates {
         let cfgs = &replacers[&c.name];
         let is_overloaded = name_counts.get(&c.name).copied().unwrap_or(0) > 1;
         let param_types = jvm_descriptor_param_types_dot_notation(&c.descriptor);
+        if dbg_replovr {
+            eprintln!(
+                "[REPLOVR] candidate name={} desc={} declaring={} is_overloaded={} param_types={:?} cfgs={:?}",
+                c.name, c.descriptor, c.declaring_internal, is_overloaded, param_types,
+                cfgs.iter().map(|x| x.type_identifiers.clone()).collect::<Vec<_>>()
+            );
+        }
         // First `ReplaceOverride` config whose type identifiers match this
         // candidate's actual parameter types, mirroring
         // `ReplaceOverride.matches(Method)`: an unoverloaded name always
@@ -2835,8 +2843,18 @@ fn try_build_replace_override(
         return None;
     }
 
-    let (new_name, bytes) =
-        crate::cglib_enhancer::build_replace_override_subclass(&super_internal, &specs);
+    // A chained call (super_cid is itself an already-generated
+    // lookup-override subclass -- see the caller in this file) already
+    // carries a `$$beanFactory` field; declaring a second one on this
+    // subclass would shadow it (see build_replace_override_subclass's doc
+    // comment). Our own synthesised classes are always named
+    // "<original>$$SpringCGLIB$$LM<n>" / "...$$RM<n>".
+    let own_bean_factory_field = !super_internal.contains("$$SpringCGLIB$$");
+    let (new_name, bytes) = crate::cglib_enhancer::build_replace_override_subclass(
+        &super_internal,
+        &specs,
+        own_bean_factory_field,
+    );
     let opts = DefineClassFull {
         override_name: Some(new_name.clone()),
         skip_verification: true,
@@ -2988,6 +3006,34 @@ fn s_instantiation_strategy_instantiate(
         let owner = args.get(3).cloned().unwrap_or(Value::Object(None));
         let mbd = ctx.read_native_pin(mbd_pin, mbd);
         if let Some(inst) = try_build_method_injection(ctx, mbd, owner, cid) {
+            // A bean can need BOTH mechanisms at once: abstract methods
+            // needing lookup-override stubs (or a "no override configured"
+            // throwing stub) AND a *concrete*, unrelated method needing a
+            // ReplaceOverride's MethodReplacer delegation -- e.g.
+            // XmlBeanFactoryTests' OverrideOneMethod has two unrelated
+            // abstract methods (protectedOverrideSingleton /
+            // getPrototypeDependency, satisfied here by throwing stubs
+            // since no <lookup-method> targets them) AND a
+            // <replaced-method> on its own concrete replaceMe(String).
+            // Returning immediately here silently dropped the
+            // replace-override entirely -- try_build_replace_override was
+            // never even called -- whenever a bean's class happened to be
+            // abstract for a reason unrelated to the replaced method
+            // (overrideMethodByArgTypeAttribute/Element,
+            // replaceMethodOverrideWithSetterInjection). Layer any
+            // ReplaceOverride entries on top of the just-built subclass
+            // instead of returning early; try_build_replace_override
+            // already skips non-ReplaceOverride entries, so re-running it
+            // against the same mbd is safe (the LookupOverride entries
+            // just handled above are simply ignored the second time).
+            if let Value::Object(Some(inst_obj)) = inst {
+                let inst_cid = ctx.class_id_of_object(inst_obj);
+                let mbd = ctx.read_native_pin(mbd_pin, mbd);
+                if let Some(inst2) = try_build_replace_override(ctx, mbd, owner, inst_cid) {
+                    ctx.unpin_native_roots(mbd_pin);
+                    return Ok(Some(inst2));
+                }
+            }
             ctx.unpin_native_roots(mbd_pin);
             return Ok(Some(inst));
         }
