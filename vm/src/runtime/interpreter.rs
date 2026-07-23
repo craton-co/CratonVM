@@ -18403,6 +18403,21 @@ fn resolve_class_loader_aware(
         eprintln!(
             "[LOADER-TRACE] resolve name={name} referencing_class_id={referencing_class_id:?} referencing_class={ref_name} referencing_loader={ref_loader:?}"
         );
+        if name.contains("RootReference")
+            && matches!(ref_loader, Some(cratonvm_types::ClassLoaderId::Application))
+        {
+            drop(cm);
+            eprintln!("[RCLA-STACK] full Java stack at resolve_class_loader_aware for name={name}:");
+            for (i, f) in thread.frames.iter().enumerate().rev() {
+                eprintln!(
+                    "[RCLA-STACK]   [{i}] {}.{}{} pc={}",
+                    f.class_name(),
+                    f.method_name(),
+                    f.method_descriptor(),
+                    f.pc
+                );
+            }
+        }
     }
     let user_loader = if should_use_loader_initiated_resolution(shared, referencing_class_id)
         && !name.starts_with('[')
@@ -19871,6 +19886,18 @@ fn execute_invoke_kind(
     let (method_class_name, method_name, method_descriptor, num_params) =
         resolve_method_ref(shared, current_class_id, cp_index)?;
     let method_owner_name = Arc::clone(&method_class_name);
+
+    if std::env::var("CRATONVM_DBG_LOADER_TRACE").is_ok()
+        && method_owner_name.contains("RootReference")
+        && &*method_name == "<init>"
+    {
+        let cm = shared.class_manager.read();
+        let cur_loader = cm.get_loader_id(current_class_id);
+        drop(cm);
+        eprintln!(
+            "[EIK-ENTRY] cp_index={cp_index} is_special={is_special} current_class_id={current_class_id:?} cur_loader={cur_loader:?} method={method_owner_name}.{method_name}{method_descriptor}"
+        );
+    }
 
     if crate::runtime::env_cache::dbg_hang_sample() {
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -29779,6 +29806,19 @@ fn try_stackless_invoke(
     //    when it diverges from the name-resolved copy under loader isolation)
     //    takes precedence so the ENHANCED per-loader copy's methods dispatch
     //    instead of the un-enhanced global same-named class.
+    if std::env::var("CRATONVM_DBG_LOADER_TRACE").is_ok()
+        && class_name.contains("RootReference")
+        && method_name == "<init>"
+    {
+        let recv_cid = match args.first() {
+            Some(Value::Object(Some(recv))) => Some(shared.heap.class_id_of(*recv)),
+            _ => None,
+        };
+        let name_resolved = shared.class_manager.read().get_loaded_class_id(class_name);
+        eprintln!(
+            "[TSI-CTOR-TRACE] class_name={class_name} descriptor={descriptor} is_special={is_special} dispatch_class_override={dispatch_class_override:?} name_resolved={name_resolved:?} receiver_actual_cid={recv_cid:?}"
+        );
+    }
     let class_id = match dispatch_class_override
         .or_else(|| shared.class_manager.read().get_loaded_class_id(class_name))
     {
@@ -30654,11 +30694,33 @@ fn populate_invoke_cache(
     is_special: bool,
 ) {
     // Check if already cached
-    if thread
-        .invoke_cache
-        .get(caller_class_id, cp_index, is_special)
-        .is_some()
-    {
+    if let Some(existing) = thread.invoke_cache.get(caller_class_id, cp_index, is_special) {
+        if std::env::var("CRATONVM_DBG_LOADER_TRACE").is_ok() {
+            let dbg_relevant = matches!(
+                resolve_method_ref(shared, caller_class_id, cp_index),
+                Ok((cn, ..)) if cn.contains("RootReference")
+            );
+            if dbg_relevant {
+                let desc = match existing {
+                    CachedInvokeTarget::Bytecode { cached, .. } => format!(
+                        "Bytecode declaring={:?} class={} {}{}",
+                        cached.declaring_class_id, cached.class_name, cached.method_name, cached.method_descriptor
+                    ),
+                    CachedInvokeTarget::VirtualBytecode { receiver_class_id, cached, .. } => format!(
+                        "VirtualBytecode rc={:?} declaring={:?} class={} {}{}",
+                        receiver_class_id, cached.declaring_class_id, cached.class_name, cached.method_name, cached.method_descriptor
+                    ),
+                    CachedInvokeTarget::Native { .. } => "Native".to_string(),
+                    CachedInvokeTarget::VirtualNative { .. } => "VirtualNative".to_string(),
+                    CachedInvokeTarget::Intrinsic { .. } => "Intrinsic".to_string(),
+                    _ => "Other".to_string(),
+                };
+                eprintln!(
+                    "[PIC-ALREADY-CACHED] caller_class_id={:?} cp_index={} is_special={} existing={}",
+                    caller_class_id, cp_index, is_special, desc
+                );
+            }
+        }
         return;
     }
 
@@ -30671,6 +30733,12 @@ fn populate_invoke_cache(
             Ok(r) => r,
             Err(_) => return,
         };
+    if std::env::var("CRATONVM_DBG_LOADER_TRACE").is_ok() && class_name.contains("RootReference") {
+        eprintln!(
+            "[PIC-ENTRY] caller_class_id={:?} cp_index={} is_special={} class_name(cp)={} method={}{}",
+            caller_class_id, cp_index, is_special, class_name, method_name, descriptor
+        );
+    }
     // JVMS §6.5 super-call redirect (see `invokespecial_owner_class_name`) —
     // this is the PRIMARY invokespecial resolution path (the stackless
     // `thread.invoke_cache`/`shared_resolution` builder consulted by every
@@ -38087,6 +38155,20 @@ fn execute_invokevirtual_cached(
 ) -> Result<CachedCallResult, MethodCallFailed> {
     let caller_class_id = thread.frames[frame_idx].class_id;
 
+    if std::env::var("CRATONVM_DBG_LOADER_TRACE").is_ok()
+        && is_special
+        && thread.frames[frame_idx].class_name().contains("MVMap")
+    {
+        let resolved = resolve_method_ref(shared, caller_class_id, cp_index);
+        eprintln!(
+            "[EIVC-ENTRY-ALL] caller_class_id={caller_class_id:?} cp_index={cp_index} caller_method={}.{}{} resolved={:?}",
+            thread.frames[frame_idx].class_name(),
+            thread.frames[frame_idx].method_name(),
+            thread.frames[frame_idx].method_descriptor(),
+            resolved.as_ref().map(|(cn, mn, md, np)| format!("{cn}.{mn}{md} np={np}")),
+        );
+    }
+
     // Keep Spring's loader-split Adapt identity bridge in the slow dispatcher.
     // The cache can predate the receiver loader's enum copy and otherwise
     // bypasses that narrowly scoped reconciliation entirely.
@@ -38293,7 +38375,8 @@ fn execute_invokevirtual_cached(
                             || cached.class_name.contains("MVMap"))
                     {
                         eprintln!(
-                            "[LOADER-TRACE] execute_invokevirtual_cached HIT-CHECK method={}.{}{} cached.declaring={} cached_receiver_class_id={:?} actual_class_id={:?} match={}",
+                            "[LOADER-TRACE] execute_invokevirtual_cached HIT-CHECK caller_class_id={:?} cp_index={} is_special={} method={}.{}{} cached.declaring={} cached_receiver_class_id={:?} actual_class_id={:?} match={}",
+                            caller_class_id, cp_index, is_special,
                             cached.class_name, cached.method_name, cached.method_descriptor,
                             cached.class_name, receiver_class_id, actual_class_id, actual_class_id == receiver_class_id
                         );
