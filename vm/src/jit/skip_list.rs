@@ -145,6 +145,37 @@ pub enum SkipReason {
     /// already interpreted per the fix above. Keep this symbol-completion
     /// method interpreted until its own JIT lowering is understood too.
     ClassFinderFillIn,
+    /// Javac's `ClassReader.readInnerClasses` -- the InnerClasses attribute
+    /// reader, a moderately complex loop (per-entry: 4 constant-pool-index
+    /// reads, an `adjustClassFlags` call, conditional `enterClass`/
+    /// `enterMember` calls and `ClassType.setEnclosingType` field writes) --
+    /// is a SIXTH distinct JIT residual in the same repeated-in-process-
+    /// javac-compilation family as `ClassReaderReadClass`/
+    /// `ClassFinderComplete`/`ClassFinderFillIn` above. Symptom: real
+    /// javac's own `class file truncated at offset N` diagnostic (thrown
+    /// from `ClassReader.nextChar`/`nextByte`/`nextInt` once the shared
+    /// `bp` buffer-position cursor has been driven past the end of the
+    /// classfile) -- consistent with the entry-count loop in this method's
+    /// own JIT-compiled body over- or under-consuming `nextChar()` calls per
+    /// iteration once tier-compiled, desynchronizing `bp` from every
+    /// subsequent attribute read for the rest of that classfile (and
+    /// possibly the next one read from the same shared `ClassReader`).
+    /// Bisected by binary search over every other method on `ClassReader`
+    /// (all TYPE_ANNOTATIONS/signature/attribute/nextByte-family candidates
+    /// ruled out first, since the trigger classfile has JSpecify
+    /// `@Nullable` TYPE_USE annotations on a generic method return type and
+    /// an array return type -- an initially much more obvious suspect that
+    /// turned out to be a red herring): `CRATONVM_JIT_BISECT_SKIP=.../
+    /// ClassReader.readInnerClasses` (this exact method alone) is
+    /// sufficient against a Spring-free, ~30-line standalone repro
+    /// (`ToolProvider.getSystemJavaCompiler().getTask(...).call()` looped
+    /// ~40x in one process, each iteration compiling a trivial user class
+    /// against a small JSpecify-annotated `@FunctionalInterface` also in
+    /// scope), reproducing deterministically at iteration 38 every time.
+    /// Confirmed JIT-only via `--nojit` (all iterations pass). Keep this
+    /// InnerClasses-attribute-reading method interpreted until its own JIT
+    /// lowering is understood.
+    ClassReaderReadInnerClasses,
     /// Spring's shaded JavaPoet `CodeBlock$Builder.add(String, Object...)`
     /// (the $-placeholder format-string parser, reached from
     /// `org/springframework/javapoet/CodeBlock$Builder`) is a FOURTH distinct
@@ -532,6 +563,10 @@ fn should_skip_jit_internal(
 
     if class_name == "com/sun/tools/javac/code/ClassFinder" && method_name == "fillIn" {
         return Some(SkipReason::ClassFinderFillIn);
+    }
+
+    if class_name == "com/sun/tools/javac/jvm/ClassReader" && method_name == "readInnerClasses" {
+        return Some(SkipReason::ClassReaderReadInnerClasses);
     }
 
     // SPRING-TESTCOMPILER.4 (2026-07-21): see `JavaPoetCodeBlockBuilderAdd`
