@@ -45106,7 +45106,15 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         "()Ljava/net/SocketAddress;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let host = ctx.get_field(this, NEW13_SOCK_HOST);
+            // Defensive: InetSocketAddress(String,int)'s native ctor NPEs on
+            // a null host (see the java/net/Socket sibling fix in
+            // phases_early.rs) -- every known writer of NEW13_SOCK_HOST sets
+            // a non-null placeholder, but never pass a raw possibly-unset
+            // field straight through to a ctor that requires non-null.
+            let host = match ctx.get_field(this, NEW13_SOCK_HOST) {
+                h @ Value::Object(Some(_)) => h,
+                _ => Value::Object(Some(ctx.create_string("0.0.0.0"))),
+            };
             let port = ctx.get_field(this, NEW13_SOCK_PORT);
             ctx.new_object_initialized(
                 "java/net/InetSocketAddress",
