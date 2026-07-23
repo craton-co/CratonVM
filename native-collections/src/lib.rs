@@ -18670,7 +18670,10 @@ fn make_int_stream(ctx: &mut dyn NativeContext, elements: &[Value]) -> MethodCal
     let (elem_base, elem_handles) = pin_value_slice(ctx, elements);
     let stream = alloc_synthetic(ctx, "java/util/stream/IntStream", STREAM_NUM_FIELDS);
     let stream_pin = ctx.pin_native_root(stream);
-    let arr = alloc_ref_array(ctx, elements.len());
+    // Primitive streams must retain their primitive values. A reference array
+    // coerces `Value::Int` to null, making every interpreter-mode callback see
+    // zero instead of the stream element.
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Int, elements.len());
     let arr_pin = ctx.pin_native_root(arr);
     for (i, val) in elements.iter().enumerate() {
         let arr = ctx.read_native_pin(arr_pin, arr);
@@ -18706,7 +18709,13 @@ fn make_primitive_iterator(
 ) -> MethodCallResult {
     // cceres3: pin across GC-capable call (stream stale-at-store wave)
     let (elem_base, elem_handles) = pin_value_slice(ctx, elements);
-    let arr = alloc_ref_array(ctx, elements.len());
+    let element_type = match iterator_class {
+        "java/util/PrimitiveIterator$OfInt" => cratonvm_types::ArrayElementType::Int,
+        "java/util/PrimitiveIterator$OfLong" => cratonvm_types::ArrayElementType::Long,
+        "java/util/PrimitiveIterator$OfDouble" => cratonvm_types::ArrayElementType::Double,
+        _ => cratonvm_types::ArrayElementType::Reference,
+    };
+    let arr = ctx.new_array(element_type, elements.len());
     let arr_pin = ctx.pin_native_root(arr);
     for (i, val) in elements.iter().enumerate() {
         let arr = ctx.read_native_pin(arr_pin, arr);
@@ -20081,7 +20090,7 @@ fn make_long_stream(ctx: &mut dyn NativeContext, elements: &[Value]) -> MethodCa
     let (elem_base, elem_handles) = pin_value_slice(ctx, elements);
     let stream = alloc_synthetic(ctx, "java/util/stream/LongStream", STREAM_NUM_FIELDS);
     let stream_pin = ctx.pin_native_root(stream);
-    let arr = alloc_ref_array(ctx, elements.len());
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Long, elements.len());
     let arr_pin = ctx.pin_native_root(arr);
     for (i, val) in elements.iter().enumerate() {
         let arr = ctx.read_native_pin(arr_pin, arr);
@@ -20831,7 +20840,7 @@ fn make_double_stream(ctx: &mut dyn NativeContext, elements: &[Value]) -> Method
     let (elem_base, elem_handles) = pin_value_slice(ctx, elements);
     let stream = alloc_synthetic(ctx, "java/util/stream/DoubleStream", STREAM_NUM_FIELDS);
     let stream_pin = ctx.pin_native_root(stream);
-    let arr = alloc_ref_array(ctx, elements.len());
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Double, elements.len());
     let arr_pin = ctx.pin_native_root(arr);
     for (i, val) in elements.iter().enumerate() {
         let arr = ctx.read_native_pin(arr_pin, arr);
