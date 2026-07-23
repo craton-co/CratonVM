@@ -2133,6 +2133,14 @@ impl<'a> NativeContextImpl<'a> {
                 }
             }
         }
+        if crate::runtime::interpreter::remap_trace_on() {
+            let snap_now: Vec<cratonvm_types::ObjectRef> = snapshot.clone();
+            crate::runtime::interpreter::deposit_gap_diff(
+                self.thread,
+                &snap_now,
+                if raise_blocked_flag { "block" } else { "wake" },
+            );
+        }
         snapshot.extend(self.thread.native_pin_roots.iter().copied());
         snapshot.extend(self.thread.native_alloc_pool.iter().copied());
         if let Some(r) = self.thread.native_pending_return {
@@ -17689,6 +17697,15 @@ fn invoke_on_class_shared_inner(
                         for (e, moved_to, mlen, as_dest) in crate::memory::gc::gcpart_probe(addr) {
                             eprintln!(
                                 "  NSME-RECV [gcpart] epoch={e} map_len={mlen} moved_to={moved_to:x?} appears_as_dest={as_dest}"
+                            );
+                        }
+                        for (ago, desc) in crate::runtime::interpreter::deposit_gap_find(addr) {
+                            eprintln!("  NSME-RECV [deposit-gap] {ago} entries ago: {desc}");
+                        }
+                        for (age, site, tag, s, l) in cratonvm_gc::zero_forensics::probe(addr) {
+                            eprintln!(
+                                "  NSME-RECV [zeroed] age={age} site={} tag={tag} range=0x{s:x}+0x{l:x}",
+                                if site == 1 { "sweep-span" } else { "fromspace-reset" },
                             );
                         }
                         if crate::runtime::interpreter::remap_trace_on() {

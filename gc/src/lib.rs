@@ -45,6 +45,7 @@
 )]
 
 pub mod a2dbg;
+pub mod zero_forensics;
 pub mod arena;
 pub mod blocked_access_debug;
 pub mod card_table;

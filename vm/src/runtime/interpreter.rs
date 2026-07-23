@@ -877,12 +877,87 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
     static NRET_RING: std::cell::RefCell<Vec<(usize, usize, String)>> =
         const { std::cell::RefCell::new(Vec::new()) };
-    static GETFIELD_RING: std::cell::RefCell<Vec<(usize, u16, usize)>> =
+    static GETFIELD_RING: std::cell::RefCell<Vec<(usize, usize, usize)>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// Record a reference-typed getfield push: (parent, field_index, pushed).
-pub(crate) fn getfield_ring_record(parent: usize, idx: u16, pushed: usize) {
+thread_local! {
+    static DEPOSIT_GAP_RING: std::cell::RefCell<Vec<(usize, String)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// After a snapshot build, diff it against a RAW walk of the frames: ring
+/// every Object-decoding local/stack slot whose address the snapshot lacks.
+pub(crate) fn deposit_gap_diff(
+    thread: &JvmThread,
+    snapshot: &[crate::types::ObjectRef],
+    tag: &str,
+) {
+    if !remap_trace_on() {
+        return;
+    }
+    let have: std::collections::HashSet<usize> =
+        snapshot.iter().map(|o| o.as_ptr() as usize).collect();
+    DEPOSIT_GAP_RING.with(|ring| {
+        let mut ring = ring.borrow_mut();
+        for (fi, fr) in thread.frames.iter().enumerate() {
+            for li in 0..fr.locals_len() {
+                if let Value::Object(Some(o)) = fr.get_local(li as u16) {
+                    let a = o.as_ptr() as usize;
+                    if !have.contains(&a) {
+                        if ring.len() >= 512 {
+                            ring.drain(..128);
+                        }
+                        ring.push((
+                            a,
+                            format!(
+                                "{tag} local f#{fi} {}.{} pc={} slot={li}",
+                                fr.class_name(),
+                                fr.method_name(),
+                                fr.pc
+                            ),
+                        ));
+                    }
+                }
+            }
+            for si in 0..fr.stack.len() {
+                if let Value::Object(Some(o)) = fr.stack.peek_at(si) {
+                    let a = o.as_ptr() as usize;
+                    if !have.contains(&a) {
+                        if ring.len() >= 512 {
+                            ring.drain(..128);
+                        }
+                        ring.push((
+                            a,
+                            format!(
+                                "{tag} stack f#{fi} {}.{} pc={} slot={si}",
+                                fr.class_name(),
+                                fr.method_name(),
+                                fr.pc
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// Probe the deposit-gap ring for `addr`: (entries-ago, description).
+pub(crate) fn deposit_gap_find(addr: usize) -> Vec<(usize, String)> {
+    DEPOSIT_GAP_RING.with(|r| {
+        let r = r.borrow();
+        let n = r.len();
+        r.iter()
+            .enumerate()
+            .filter(|(_, (a, _))| *a == addr)
+            .map(|(i, (_, d))| (n - i, d.clone()))
+            .collect()
+    })
+}
+
+pub(crate) fn getfield_ring_record(parent: usize, idx: usize, pushed: usize) {
     if !remap_trace_on() {
         return;
     }
@@ -897,7 +972,7 @@ pub(crate) fn getfield_ring_record(parent: usize, idx: u16, pushed: usize) {
 
 /// Find `addr` among recent reference getfield pushes:
 /// (pushes-ago, parent, field_index).
-pub(crate) fn getfield_ring_find(addr: usize) -> Vec<(usize, usize, u16)> {
+pub(crate) fn getfield_ring_find(addr: usize) -> Vec<(usize, usize, usize)> {
     GETFIELD_RING.with(|r| {
         let r = r.borrow();
         let n = r.len();
@@ -3462,6 +3537,10 @@ pub(crate) fn safepoint_check(shared: &SharedVm, thread: &mut JvmThread) {
         // the collector this thread is about to park for.
         crate::jit::conservative_roots::invalidate_scan_cache_for_gc();
         update_root_snapshot(shared, thread);
+        if remap_trace_on() {
+            let snap = thread.root_snapshot.lock().clone();
+            deposit_gap_diff(thread, &snap, "publish");
+        }
 
         // Arrive at barrier and wait for GC to complete. Census-aware (auto):
         // a genuine safepoint arrival is normally counted, but if this pause's
@@ -19955,6 +20034,19 @@ fn execute_invoke_kind(
                                     {
                                         eprintln!(
                                             "[stale-recv] [gcpart] epoch={e} map_len={mlen} moved_to={moved_to:x?} appears_as_dest={as_dest}"
+                                        );
+                                    }
+                                    for (ago, desc) in deposit_gap_find(stale_addr) {
+                                        eprintln!(
+                                            "[stale-recv] [deposit-gap] {ago} entries ago: {desc}"
+                                        );
+                                    }
+                                    for (age, site, tag, s, l) in
+                                        cratonvm_gc::zero_forensics::probe(stale_addr)
+                                    {
+                                        eprintln!(
+                                            "[stale-recv] [zeroed] age={age} site={} tag={tag} range=0x{s:x}+0x{l:x}",
+                                            if site == 1 { "sweep-span" } else { "fromspace-reset" },
                                         );
                                     }
                                     if remap_trace_on() {

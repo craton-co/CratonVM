@@ -7368,6 +7368,9 @@ impl GenerationalHeap {
             }
             for &(off, sz) in &reclaimed_regions {
                 let obj_addr = from_base + off;
+                // stw-residual-close forensics: site 1 = non-moving sweep
+                // dead-span zero+freelist, tagged with the sweep cycle.
+                crate::zero_forensics::record(1, sweep_zero_cycle, obj_addr, sz);
                 // SAFETY: this is the union of adjacent/overlapping spans that the
                 // verified walk collected, all within the live from-space region.
                 unsafe { std::ptr::write_bytes(obj_addr as *mut u8, 0, sz) };
