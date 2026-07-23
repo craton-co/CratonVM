@@ -34,3 +34,14 @@ arrays are also preserved. A release executable then passed all 44 methods of
 
 - no-JIT: 473.5 seconds
 - JIT: 455.5 seconds
+
+The same release build was validated against the Azure real-JDK/Tomcat fixture
+with `-Xmx2g`:
+
+- no-JIT: 44/44 in 124.3 seconds;
+- JIT: 44/44 in 127.6 seconds with GC accounting enabled, then three clean
+  uninstrumented repetitions (44/44 in 128.7, 162.5, and 133.6 seconds).
+
+The initial JIT OOM observed while investigating this change did not recur in
+these exact-fixture runs, including the high-callback async-read path, so it is
+not retained as a CratonVM residual.
