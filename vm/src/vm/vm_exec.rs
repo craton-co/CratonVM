@@ -851,17 +851,17 @@ fn safe_native_call_impl(
     // contract cannot surface an allocation failure and therefore must not
     // initiate a moving collection mid-callback: native locals are not all
     // rooted yet. This funnel is the safe pre-callback point — every Java
-    // argument is pinned above and refreshed below. Collect as soon as the
-    // heap's normal occupancy trigger fires, not only after a fallible native
-    // allocation has spilled. Without this, a no-JIT workload made entirely of
-    // native allocations (Tomcat's repeated embedded-server lifecycle is one)
-    // can fill every G1 Eden region and abort on an otherwise tiny array.
-    let mut threshold_gc = false;
-    if shared.heap.needs_gc()
-        && !crate::runtime::interpreter::gc_overhead_limit_exceeded(shared)
-    {
+    // argument is pinned above and refreshed below. The allocation wrapper
+    // records the threshold crossing; only that request is consumed here.
+    // A general `needs_gc()` check is intentionally not enough: it would force
+    // a collection for every native dispatch on allocation-heavy JIT paths.
+    let native_array_gc = shared
+        .native_array_gc_requested
+        .swap(false, std::sync::atomic::Ordering::Relaxed);
+    let mut requested_gc = false;
+    if native_array_gc && !crate::runtime::interpreter::gc_overhead_limit_exceeded(shared) {
         crate::runtime::interpreter::maybe_gc_forced_pub(shared, thread);
-        threshold_gc = true;
+        requested_gc = true;
     }
     // Native-alloc young-pressure relief: when a native allocation wrapper
     // had to spill into old gen because young was exhausted (the wrappers —
@@ -894,7 +894,7 @@ fn safe_native_call_impl(
         // of live data (overhead limit) — the next spill re-sets it.
         shared.heap.clear_young_spill_pressure();
     }
-    if stw_pending || threshold_gc || pressure_gc {
+    if stw_pending || requested_gc || pressure_gc {
         let mut fresh = args.to_vec();
         for (idx, root_idx) in arg_root_indices.iter().enumerate() {
             let Some(root_idx) = root_idx else {
@@ -4810,9 +4810,15 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     }
 
     fn new_array(&mut self, element_type: ArrayElementType, length: usize) -> ObjectRef {
-        self.shared
+        let array = self.shared
             .heap
-            .alloc_array(ClassId::new(0), element_type, length)
+            .alloc_array(ClassId::new(0), element_type, length);
+        if self.shared.heap.needs_gc() {
+            self.shared
+                .native_array_gc_requested
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        array
     }
 
     fn new_ref_array(&mut self, class_id: ClassId, length: usize) -> ObjectRef {
@@ -4828,9 +4834,15 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 length, frame
             );
         }
-        self.shared
+        let array = self.shared
             .heap
-            .alloc_array(class_id, ArrayElementType::Reference, length)
+            .alloc_array(class_id, ArrayElementType::Reference, length);
+        if self.shared.heap.needs_gc() {
+            self.shared
+                .native_array_gc_requested
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        array
     }
 
     fn try_new_ref_array(&mut self, class_id: ClassId, length: usize) -> Option<ObjectRef> {
