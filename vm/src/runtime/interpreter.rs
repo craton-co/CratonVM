@@ -18184,6 +18184,23 @@ fn lookup_loader_initiated(
     name: &str,
 ) -> Option<ClassId> {
     hotpath_counts::bump(&hotpath_counts::LOOKUP_LOADER_INITIATED_CALLS);
+    // PERF (h2-bnf-perf 2026-07-23): several callers (resolve_class_loader_aware,
+    // called on every new/checkcast/instanceof/anewarray; also
+    // resolved_private_invokevirtual_target) call this unconditionally, with
+    // no gate check of their own -- confirmed via call-count instrumentation
+    // this function alone accounted for ~90% of ALL executed bytecode
+    // instructions on an H2 BNF-autocomplete-heavy workload. get_loader_id
+    // below can only ever yield UserDefined(_) for a class that was assigned
+    // that identity via a path that also calls register_defining_loader for
+    // the same ClassId (see that function's invariant doc in
+    // native-builtins/src/classloader.rs), so when NO user-defined loader has
+    // ever defined ANY class in this process, class_manager.read() below is
+    // guaranteed to return None regardless of referencing_class_id -- skip
+    // straight to that outcome without taking the lock. Behavior-preserving:
+    // identical to the pre-existing check, just short-circuited earlier.
+    if !cratonvm_native_builtins::classloader::any_defining_loader_registered() {
+        return None;
+    }
     let loader = match shared
         .class_manager
         .read()
@@ -27418,6 +27435,43 @@ fn force_native_over_real_jdk_bytecode(
     if class_name == "java/lang/String"
         && method_name == "substring"
         && method_descriptor == "(II)Ljava/lang/String;"
+    {
+        return true;
+    }
+    // PERF (h2-bnf-perf 2026-07-23): same "gate mismatch" family as the
+    // `(II)` substring entry immediately above -- `check_override`
+    // (vm_exec.rs) has listed `charAt`/`length`/`isEmpty`/`startsWith` (and
+    // several more `java/lang/String` methods) as forced-native since
+    // "RKC16N.6 RECON" (a real-JDK bytecode-resolution boot fix), but that
+    // allowlist is only consulted on a genuine vtable cache miss -- this
+    // function (the per-call-site cached vtable fast path) never had the
+    // matching entries, so once a call site's cache warmed, real (fully
+    // interpreted) bytecode ran regardless of `check_override`'s intent,
+    // for the entire remaining lifetime of that call site. `substring(I)`
+    // (one-arg) was in the same boat as the already-fixed `substring(II)`
+    // -- both overloads are covered by `check_override`'s bare
+    // `"substring"` name match, but only the two-arg descriptor had an
+    // entry here. Root-caused via an H2 BNF-autocomplete workload
+    // (`org.h2.bnf.RuleFixed`/`RuleElement`/`Bnf`) whose character-by-
+    // character grammar scanning is dominated by exactly these four calls
+    // in tight loops (`s = s.substring(1)`, `s.charAt(0)`, `s.length()`,
+    // `up.startsWith(name)`). Scoped to the subset of `check_override`'s
+    // String list with straightforward, locale/Unicode-independent
+    // semantics (plain UTF-16 content comparison / indexing) that are
+    // trivially equivalent to the real-JDK bytecode for every input --
+    // deliberately NOT extending this to `trim`/`toLowerCase`/
+    // `toUpperCase`/`replace`/`compareTo*` here, since those have
+    // Unicode/locale edge cases that need their own from-scratch
+    // correctness review before being forced this broadly.
+    if class_name == "java/lang/String"
+        && matches!(
+            (method_name, method_descriptor),
+            ("substring", "(I)Ljava/lang/String;")
+                | ("charAt", "(I)C")
+                | ("length", "()I")
+                | ("isEmpty", "()Z")
+                | ("startsWith", "(Ljava/lang/String;)Z")
+        )
     {
         return true;
     }
@@ -37886,6 +37940,13 @@ fn execute_invokevirtual_vtable_fast(
     shared
         .shared_resolution
         .insert_promoted_invoke(promoted_key, target.clone());
+    thread.invoke_cache.put_poly(
+        caller_class_id,
+        cp_index,
+        false,
+        receiver_class_id,
+        target.clone(),
+    );
     thread
         .invoke_cache
         .put(caller_class_id, cp_index, false, target);
@@ -38125,9 +38186,9 @@ fn execute_invokevirtual_cached(
 
     match target {
         CachedInvokeTarget::VirtualBytecode {
-            receiver_class_id,
-            cached,
-            gate: entry_gate,
+            mut receiver_class_id,
+            mut cached,
+            gate: mut entry_gate,
         } => {
             let num_params = cached.num_params as usize; // Widening: parameter count conversion
             let receiver_val = thread.frames[frame_idx].stack.peek_at(num_params);
@@ -38162,7 +38223,40 @@ fn execute_invokevirtual_cached(
                         );
                     }
                     if actual_class_id != receiver_class_id {
-                        return Ok(CachedCallResult::CacheMiss);
+                        // PERF (h2-bnf-perf 2026-07-23): the primary monomorphic
+                        // cache is stale for THIS receiver (it holds whichever
+                        // class called through this site most recently), not
+                        // simply empty -- so a megamorphic call site alternating
+                        // between a handful of concrete classes (e.g. H2's
+                        // `org.h2.bnf.Rule` family) hits this exact mismatch on
+                        // nearly every call. Before giving up, check the small
+                        // polymorphic overflow cache for an entry recorded for
+                        // THIS specific receiver class on an earlier call (see
+                        // `InvokeCache::get_poly`/`put_poly`) -- if found, swap
+                        // in its (already staleness-checked, by construction
+                        // keyed to `actual_class_id`) target and fall through
+                        // to the rest of this arm's normal dispatch below,
+                        // instead of paying for the full vtable-fast/slow-path
+                        // resolution again for a receiver class this call site
+                        // has already seen.
+                        let poly_result = thread.invoke_cache.get_poly(
+                            caller_class_id,
+                            cp_index,
+                            is_special,
+                            actual_class_id,
+                        );
+                        match poly_result {
+                            Some(CachedInvokeTarget::VirtualBytecode {
+                                receiver_class_id: poly_rc,
+                                cached: poly_cached,
+                                gate: poly_gate,
+                            }) => {
+                                receiver_class_id = poly_rc;
+                                cached = poly_cached;
+                                entry_gate = poly_gate;
+                            }
+                            _ => return Ok(CachedCallResult::CacheMiss),
+                        }
                     }
                     // Lambda proxy classes have no bytecode implementation of
                     // their functional-interface method. They must reach the
@@ -39073,6 +39167,13 @@ fn populate_virtual_invoke_cache(
     let promoted_key: crate::runtime::lockfree_resolve::PromotedInvokeKey =
         (caller_class_id, cp_index, false, Some(receiver_class_id));
     if let Some(target) = shared.shared_resolution.get_promoted_invoke(&promoted_key) {
+        thread.invoke_cache.put_poly(
+            caller_class_id,
+            cp_index,
+            false,
+            receiver_class_id,
+            target.clone(),
+        );
         thread
             .invoke_cache
             .put(caller_class_id, cp_index, false, target);
@@ -39272,6 +39373,13 @@ fn populate_virtual_invoke_cache(
                 shared
                     .shared_resolution
                     .insert_promoted_invoke(promoted_key, target.clone());
+                thread.invoke_cache.put_poly(
+                    caller_class_id,
+                    cp_index,
+                    false,
+                    receiver_class_id,
+                    target.clone(),
+                );
                 thread
                     .invoke_cache
                     .put(caller_class_id, cp_index, false, target);
@@ -39378,6 +39486,13 @@ fn populate_virtual_invoke_cache(
             shared
                 .shared_resolution
                 .insert_promoted_invoke(promoted_key, target.clone());
+            thread.invoke_cache.put_poly(
+                caller_class_id,
+                cp_index,
+                false,
+                receiver_class_id,
+                target.clone(),
+            );
             thread
                 .invoke_cache
                 .put(caller_class_id, cp_index, false, target);
@@ -39483,6 +39598,13 @@ fn populate_virtual_invoke_cache(
                             shared
                                 .shared_resolution
                                 .insert_promoted_invoke(promoted_key, target.clone());
+                            thread.invoke_cache.put_poly(
+                                caller_class_id,
+                                cp_index,
+                                false,
+                                receiver_class_id,
+                                target.clone(),
+                            );
                             thread
                                 .invoke_cache
                                 .put(caller_class_id, cp_index, false, target);
@@ -39509,6 +39631,13 @@ fn populate_virtual_invoke_cache(
                         shared
                             .shared_resolution
                             .insert_promoted_invoke(promoted_key, target.clone());
+                        thread.invoke_cache.put_poly(
+                            caller_class_id,
+                            cp_index,
+                            false,
+                            receiver_class_id,
+                            target.clone(),
+                        );
                         thread
                             .invoke_cache
                             .put(caller_class_id, cp_index, false, target);
@@ -39552,6 +39681,13 @@ fn populate_virtual_invoke_cache(
             shared
                 .shared_resolution
                 .insert_promoted_invoke(promoted_key, target.clone());
+            thread.invoke_cache.put_poly(
+                caller_class_id,
+                cp_index,
+                false,
+                receiver_class_id,
+                target.clone(),
+            );
             thread
                 .invoke_cache
                 .put(caller_class_id, cp_index, false, target);
@@ -39635,6 +39771,13 @@ fn populate_virtual_invoke_cache(
                 shared
                     .shared_resolution
                     .insert_promoted_invoke(promoted_key, target.clone());
+                thread.invoke_cache.put_poly(
+                    caller_class_id,
+                    cp_index,
+                    false,
+                    receiver_class_id,
+                    target.clone(),
+                );
                 thread
                     .invoke_cache
                     .put(caller_class_id, cp_index, false, target);
@@ -39671,6 +39814,13 @@ fn populate_virtual_invoke_cache(
                 shared
                     .shared_resolution
                     .insert_promoted_invoke(promoted_key, target.clone());
+                thread.invoke_cache.put_poly(
+                    caller_class_id,
+                    cp_index,
+                    false,
+                    receiver_class_id,
+                    target.clone(),
+                );
                 thread
                     .invoke_cache
                     .put(caller_class_id, cp_index, false, target);
@@ -39703,6 +39853,13 @@ fn populate_virtual_invoke_cache(
                 shared
                     .shared_resolution
                     .insert_promoted_invoke(promoted_key, target.clone());
+                thread.invoke_cache.put_poly(
+                    caller_class_id,
+                    cp_index,
+                    false,
+                    receiver_class_id,
+                    target.clone(),
+                );
                 thread
                     .invoke_cache
                     .put(caller_class_id, cp_index, false, target);
@@ -39730,6 +39887,13 @@ fn populate_virtual_invoke_cache(
         shared
             .shared_resolution
             .insert_promoted_invoke(promoted_key, target.clone());
+        thread.invoke_cache.put_poly(
+            caller_class_id,
+            cp_index,
+            false,
+            receiver_class_id,
+            target.clone(),
+        );
         thread
             .invoke_cache
             .put(caller_class_id, cp_index, false, target);
@@ -39777,6 +39941,13 @@ fn populate_virtual_invoke_cache(
     shared
         .shared_resolution
         .insert_promoted_invoke(promoted_key, target.clone());
+    thread.invoke_cache.put_poly(
+        caller_class_id,
+        cp_index,
+        false,
+        receiver_class_id,
+        target.clone(),
+    );
     thread
         .invoke_cache
         .put(caller_class_id, cp_index, false, target);

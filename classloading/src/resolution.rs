@@ -1270,16 +1270,42 @@ impl CachedInvokeTarget {
 /// infinite recursion through the subclass override.
 type InvokeCacheKey = (ClassId, u16, bool);
 
+/// Per-call-site cap on the polymorphic overflow cache (see `poly_entries`
+/// below). A handful of distinct receiver classes at one call site (the
+/// common "a few concrete implementations of one interface" shape, e.g.
+/// H2's `org.h2.bnf.Rule` family) all fit comfortably; a genuinely
+/// megamorphic site (hundreds+ of distinct receiver classes) simply stops
+/// gaining new poly entries past the cap and keeps missing for classes
+/// beyond it, exactly as it did before this cache existed -- never
+/// unbounded growth.
+const POLY_CACHE_CAP_PER_SITE: usize = 8;
+
 /// Cache that maps invoke sites to fully-resolved invoke targets.
 /// On cache hit, no locks, string allocations, or method resolution needed.
 pub struct InvokeCache {
     entries: FxHashMap<InvokeCacheKey, CachedInvokeTarget>,
+    /// Small overflow cache for call sites that see MORE than one distinct
+    /// receiver class. `entries` above is monomorphic: a second receiver
+    /// class simply overwrites the first, so an alternating/megamorphic call
+    /// site (e.g. a `for (Rule r : list) r.autoComplete(...)` loop rotating
+    /// through several concrete `Rule` implementations at the SAME bytecode
+    /// call site) misses `entries` on nearly every call, falling all the way
+    /// through to the expensive vtable/slow-path resolution each time. Keyed
+    /// by the same call-site identity PLUS the receiver's concrete class, so
+    /// distinct receiver classes coexist here instead of evicting each
+    /// other. Purely an additive fast-path optimization: `entries` and its
+    /// `get`/`put`/`evict` semantics below are completely unchanged, and any
+    /// call site that only ever sees one receiver class never populates this
+    /// map at all (see `put_poly`'s callers, which are the SAME call sites
+    /// that already populate `entries`).
+    poly_entries: FxHashMap<InvokeCacheKey, Vec<(ClassId, CachedInvokeTarget)>>,
 }
 
 impl InvokeCache {
     pub fn new() -> Self {
         Self {
             entries: fx_hashmap_with_capacity(64),
+            poly_entries: fx_hashmap_with_capacity(0),
         }
     }
 
@@ -1321,18 +1347,78 @@ impl InvokeCache {
             .insert((caller_class, cp_index, is_special), target);
     }
 
+    /// Second-chance lookup for a call site that just missed the primary
+    /// `get` above, keyed additionally by the receiver's concrete class.
+    /// Only ever consulted AFTER a primary miss (see
+    /// `execute_invokevirtual_cached`'s cache-miss branch) -- a primary hit
+    /// never reaches this. Same staleness handling as `get`: a stale hit is
+    /// auto-evicted and treated as a miss.
+    #[inline]
+    pub fn get_poly(
+        &mut self,
+        caller_class: ClassId,
+        cp_index: u16,
+        is_special: bool,
+        receiver_class: ClassId,
+    ) -> Option<CachedInvokeTarget> {
+        let key = (caller_class, cp_index, is_special);
+        let entries = self.poly_entries.get_mut(&key)?;
+        let idx = entries.iter().position(|(cid, _)| *cid == receiver_class)?;
+        if entries[idx].1.is_stale() {
+            entries.remove(idx);
+            return None;
+        }
+        Some(entries[idx].1.clone())
+    }
+
+    /// Remember a resolved target for a specific receiver class at this call
+    /// site, in ADDITION to (never instead of) the primary monomorphic slot
+    /// `put` above still maintains for the same call. Capped at
+    /// `POLY_CACHE_CAP_PER_SITE` distinct receiver classes per call site;
+    /// beyond the cap, further distinct classes are simply not remembered
+    /// here (they keep working correctly via the normal slow path -- this
+    /// cache is purely a fast-path optimization, never a correctness
+    /// requirement). An existing entry for the same receiver class is
+    /// refreshed in place.
+    pub fn put_poly(
+        &mut self,
+        caller_class: ClassId,
+        cp_index: u16,
+        is_special: bool,
+        receiver_class: ClassId,
+        target: CachedInvokeTarget,
+    ) {
+        let key = (caller_class, cp_index, is_special);
+        let entries = self.poly_entries.entry(key).or_default();
+        if let Some(slot) = entries.iter_mut().find(|(cid, _)| *cid == receiver_class) {
+            slot.1 = target;
+            return;
+        }
+        if entries.len() < POLY_CACHE_CAP_PER_SITE {
+            entries.push((receiver_class, target));
+        }
+    }
+
     /// Clear all cached invoke targets. Used to invalidate stale entries after
     /// a partially-failed class initialization (e.g. System.initPhase1).
     pub fn clear(&mut self) {
         self.entries.clear();
+        self.poly_entries.clear();
     }
 
     /// Evict a single entry. Used by call sites that detect staleness via
     /// other means (e.g. JIT downgrade) to force the next lookup down the
-    /// slow path.
+    /// slow path. Also drops any polymorphic overflow entries for the same
+    /// call site (across all receiver classes) -- an evict typically fires
+    /// because something about the call site's resolution changed (e.g. a
+    /// redefine-driven shadow suppression), which is not receiver-specific,
+    /// so distrust everything cached at this call site, matching the
+    /// pre-existing `entries` eviction's own scope.
     #[inline]
     pub fn evict(&mut self, caller_class: ClassId, cp_index: u16, is_special: bool) {
-        self.entries.remove(&(caller_class, cp_index, is_special));
+        let key = (caller_class, cp_index, is_special);
+        self.entries.remove(&key);
+        self.poly_entries.remove(&key);
     }
 }
 
