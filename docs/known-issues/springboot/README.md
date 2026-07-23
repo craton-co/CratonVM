@@ -67,6 +67,20 @@ smaller/individual differences not yet clustered.
 | [`tomcatservletwebserverfactory-cross-module-classnotfound-crash.md`](tomcatservletwebserverfactory-cross-module-classnotfound-crash.md) | 10 (fatal CRASH) | HIGH | OPEN — found 2026-07-16. A native shim (`native-builtins/src/net_phase_e.rs`, `ServletWebServerApplicationContext.getWebServerFactory()`) unconditionally allocates a hardcoded `TomcatServletWebServerFactory` regardless of servlet backend — added to route around a real Tomcat bean-registration bug, but fires identically for Jetty-only/generic-web-server modules where that class genuinely doesn't exist on the classpath (confirmed via real Gradle classpath dumps, not a suite-runner gap). The resulting class-not-found escapes as an uncaught internal error and aborts the process instead of throwing a catchable `NoClassDefFoundError` |
 
 
+
+## 2026-07-23 rerun: the 429 CratonVM-specific classes, 6 days later (290 now PASS)
+
+Reran exactly the 429 classes confirmed CratonVM-specific in the round
+below, after merging `dev` forward (moved substantially in 6 days) and
+rebuilding. **290/429 (67.6%) now PASS**, residual down to 99 FAIL + 40
+HANG, **0 CRASH** (all 5 previously-fatal crashes resolved — 4 now PASS,
+1 now FAIL but no longer fatal). Full before/after table, residual module
+breakdown, and reproduce instructions in
+`apps/spring-boot-suite-runner/RESULTS-20260723.md`. Not re-triaged against
+the docs below this session — many residuals are very likely the same
+already-documented OPEN clusters, worth a dedicated confirmation pass
+rather than assuming closed or re-investigating from scratch.
+
 ## 2026-07-17 rerun: 510-class set vs first-ever same-scope HotSpot baseline (429 CratonVM-specific)
 
 Reran the 510 classes still not `PASS` as of the 2026-07-16 snapshot against

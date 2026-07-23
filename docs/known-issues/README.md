@@ -4,6 +4,24 @@ This folder collects CratonVM-only defects found while running upstream Java
 suites. The docs had grown to describe the **same underlying bug from several
 angles**; this index is the consolidated map. Read it first.
 
+## 2026-07-24 Tomcat suite — fixture gaps + one real bug, split into 9 actionable docs
+
+New subfolder: [`tomcat/`](tomcat/README.md). Split out of
+`docs/internal/fixed-suite-bugs/tomcat/18-fixture-environment-gaps-20260724.md`
+(35 classes that fail on both CratonVM and HotSpot in the Linux test
+fixture, after correcting a harness CWD bug that had previously mislabeled
+most of a 172-class "environment gap" bucket) into one file per
+independently-actionable item: missing `ant.jar` on the classpath, missing
+`httpd` binary, `*LargeHeap` OOM at the flat heap, missing
+`conf/Catalina/localhost/*.xml`, missing `output/build/lib/*.jar`, an
+unbuilt Maven test-webapp submodule, 2 untriaged oddities, and 9 classes
+whose HANG classification is unconfirmed due to extreme host contention
+during the control run. Also includes a genuine CratonVM bug pulled out of
+the same bucket: a `usize` underflow panic in `vm/src/runtime/value_stack.rs:237`
+on a background NIO worker thread, confirmed reproducing in two independent
+classes (`TestNonBlockingAPI`, `TestWebSocketFrameClientSSL`) across two
+different protocol paths — see `tomcat/value-stack-usize-underflow-nio-worker-panic.md`.
+
 ## 2026-07-22 H2 `cp500`/IBM500 charset FIXED
 
 FIXED (moved to `docs/internal/fixed-suite-bugs/`):
