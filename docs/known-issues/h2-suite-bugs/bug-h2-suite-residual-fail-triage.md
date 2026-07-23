@@ -2128,30 +2128,92 @@ driver's connection (`stat.execute("CREATE TABLE TEST(...)")`,
 `TestUpgrade.java:61`) — the CREATE TABLE that used to never get reached
 before this pass's fix, since the connection-open commit crashed first.
 
-**Not investigated this pass** beyond one load-bearing observation:
-`org/h2/command/ParserBase` **does not exist in the 1.4.200 jar** —
-`jar tf h2-1.4.200.jar | grep -i parserbase` returns nothing; 1.4.200 has
-only a monolithic `org/h2/command/Parser` (no `Parser`/`ParserBase`
-split, which was introduced in a later H2 version). Yet the stack trace
-above shows `Parser.parse()` calling into an inherited `ParserBase.
-getSyntaxError()` — bytecode that can only belong to the *current*
-(Application) H2 build, not the old driver. This means `stat.execute(...)`
-on `testUpgrade(1,4,200)`'s own old-driver `Statement` is, at some point in
-the `JdbcStatement.execute → JdbcConnection.prepareCommand →
-Session.prepareCommand → Session.prepareLocal → Parser.prepareCommand`
-chain, dispatching into the **Application**-loaded `Parser`/`ParserBase`
-pair instead of staying within the old driver's own loader — the same
-general "wrong loader, name-based resolution" bug *shape* as the
-`updateRootPage` bug just fixed, but for a structurally different part of
-H2 (SQL parsing, not MVStore) and not yet root-caused to a specific call
-site. `h2_parser_read`'s own `ctx.invoke_special("org/h2/command/
-ParserBase", "checkLiterals", ...)` (name-based, `native-builtins/src/
-apps_h2.rs`) is a plausible next place to look, though note that
-`is_h2_parser_native_override`'s `ParserBase`-scoped natives (`read`/
-`setTokenIndex`) would never even match the *old* driver's class (named
-`Parser`, not `ParserBase`, in 1.4.200) — so if the old driver's own
-`Parser.read()`/`setTokenIndex()` calls are somehow ALSO being routed
-through these `ParserBase`-registered natives, that routing decision
-itself (not the natives' own internals) is where the loader confusion
-would have to be introduced. Reproduces reliably in ~10s via
-`--nojit org.h2.test.unit.TestUpgrade` (no special env var needed).
+**Root-caused in the same eighth-pass session, fix attempted, REVERTED as
+unsafe — genuine follow-up work needed with a primitive that doesn't yet
+exist.** `org/h2/command/ParserBase` **does not exist in the 1.4.200 jar**
+(`jar tf h2-1.4.200.jar | grep -i parserbase` returns nothing; 1.4.200 has
+only a monolithic `org/h2/command/Parser`, no `Parser`/`ParserBase` split
+— that came in a later H2 version). The stack trace's `Parser.parse()` →
+inherited `ParserBase.getSyntaxError()` can therefore only be the
+**Application**-loaded `Parser`/`ParserBase` pair, not the old driver's own
+`Parser`.
+
+Root cause pinned down: `native-builtins/src/apps_h2.rs`'s
+`h2_session_prepare_local_no_cache` — the native override for
+`SessionLocal.prepareLocal(String)` (registered on `H2_SESSION_LOCAL`) —
+constructs `new Parser(session)` via the exact same unsafe pattern as the
+already-fixed `updateRootPage` bug:
+```rust
+let parser = match ctx.new_object_initialized(
+    "org/h2/command/Parser",
+    "(Lorg/h2/engine/SessionLocal;)V",
+    &[Value::Object(Some(this))],
+)? { ... };
+```
+— name-based, collapses to whichever loader defined `"org/h2/command/
+Parser"` first process-wide. Since this is the SQL-statement-preparation
+entry point, virtually every `Statement.execute()` on every session in the
+whole process routes through it, unlike `updateRootPage` (MVStore-internal,
+narrowly scoped).
+
+**A fix attempt using the exact `RootReference` pattern (`class_id_by_name_and_loader`
+looked up against the session's own `loader_id_of_class`, falling back to
+a plain lookup) was tried, built, and tested — and had to be reverted**:
+it fixed `TestUpgrade` but broke `TestAlter`/`TestLinkedTable` (both hit
+`NullPointerException: Cannot invoke "org.h2.command.CommandInterface.
+executeUpdate(...)" because "command" is null` on their very first
+`Engine.openSession()` — i.e. on a completely ordinary, single-loader
+Application session). Root cause of the regression: `class_id_by_name_and_loader`
+and `class_id_by_name` (`ctx.class_id_by_name`) are **pure lookups** — they
+never trigger class loading, unlike `new_object_initialized`'s internal
+`load_class_concurrent`. On the very first session in a process,
+`"org/h2/command/Parser"` hasn't been loaded by *anyone* yet, so both
+lookups miss and the native silently returned a null `Command`.
+
+A second attempt — take the loader-scoped path only on an actual lookup
+*hit*, otherwise fall through to the original (loading) `new_object_initialized`
+call — fixed the `TestAlter`/`TestLinkedTable` regression, but **reopened
+the original `TestUpgrade` bug**: at the exact moment `testUpgrade(1,4,200)`'s
+first `CREATE TABLE` fires `prepareLocal`, the old driver's own `Parser`
+class is apparently not yet indexed in `class_id_by_name_and_loader`'s
+per-loader table (a genuine "not yet loaded/indexed under this specific
+loader" timing gap), so the lookup misses and falls through to the
+unsafe, loading-but-name-collapsing original path — reproducing the exact
+`ParserBase.getSyntaxError` NPE again. Confirmed via a full A/B/A rebuild
+cycle: fix-1 (unsafe fallback) closes `TestUpgrade` but breaks
+`TestAlter`/`TestLinkedTable`; fix-2 (safe fallback) fixes
+`TestAlter`/`TestLinkedTable` but reopens `TestUpgrade`. Neither is a net
+improvement, so **both were reverted**; only the already-verified,
+non-regressing `updateRootPage` fix is on `dev`.
+
+**What's actually needed**: a primitive that *loads* `"org/h2/command/
+Parser"` **through the session's own specific `ClassLoader`** (triggering
+that loader's own `findClass`/`defineClass`, exactly like a bytecode `NEW`
+instruction's loader-aware resolution does) — not a bare lookup against
+whatever's already indexed, and not the flat/global `load_class_concurrent`.
+No such NativeContext primitive currently exists (`native-api/src/registry.rs`
+has `load_class`/`ensure_class_initialized`/`ensure_class_initialized_with_class_id`,
+all name-only or class_id-only, and no `class_id_by_name`-family method that
+loads on a loader-scoped miss). Two candidate approaches for whoever picks
+this up: (1) add a `class_id_by_name_and_loader`-loading variant to
+`NativeContext` (Rust-side, mirroring `resolve_class_loader_aware`'s
+already-correct interpreter-side logic, likely the cleanest fix and
+reusable by any future native hitting this same shape of bug); or (2) have
+`h2_session_prepare_local_no_cache` fetch the session's actual
+`ClassLoader` *object* (not just a numeric loader id) and call
+`ClassLoader.loadClass("org.h2.command.Parser")` on it via
+`ctx.invoke_virtual` — the fully JVMS-correct route, but needs a way to
+get from a `ClassId`/loader-id back to the live `ClassLoader` object, which
+may not be directly exposed either.
+
+`h2_parser_read`'s own `ctx.invoke_special("org/h2/command/ParserBase",
+"checkLiterals", ...)` (same file) is a second, not-yet-investigated
+instance of the identical pattern once the primitive above exists — worth
+a follow-up grep sweep of `apps_h2.rs` and other `native-builtins` files
+for any other `ctx.new_object_initialized(<literal string>, ...)` or
+`ctx.invoke_special(<literal string>, ...)` call site whose receiver could
+plausibly belong to a non-Application classloader.
+
+Reproduces reliably in ~10s via `--nojit org.h2.test.unit.TestUpgrade` (no
+special env var needed); no fix landed for this residual as of the eighth
+pass.
