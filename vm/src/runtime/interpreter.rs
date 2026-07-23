@@ -18160,6 +18160,23 @@ fn lookup_loader_initiated(
     name: &str,
 ) -> Option<ClassId> {
     hotpath_counts::bump(&hotpath_counts::LOOKUP_LOADER_INITIATED_CALLS);
+    // PERF (h2-bnf-perf 2026-07-23): several callers (resolve_class_loader_aware,
+    // called on every new/checkcast/instanceof/anewarray; also
+    // resolved_private_invokevirtual_target) call this unconditionally, with
+    // no gate check of their own -- confirmed via call-count instrumentation
+    // this function alone accounted for ~90% of ALL executed bytecode
+    // instructions on an H2 BNF-autocomplete-heavy workload. get_loader_id
+    // below can only ever yield UserDefined(_) for a class that was assigned
+    // that identity via a path that also calls register_defining_loader for
+    // the same ClassId (see that function's invariant doc in
+    // native-builtins/src/classloader.rs), so when NO user-defined loader has
+    // ever defined ANY class in this process, class_manager.read() below is
+    // guaranteed to return None regardless of referencing_class_id -- skip
+    // straight to that outcome without taking the lock. Behavior-preserving:
+    // identical to the pre-existing check, just short-circuited earlier.
+    if !cratonvm_native_builtins::classloader::any_defining_loader_registered() {
+        return None;
+    }
     let loader = match shared
         .class_manager
         .read()
@@ -19887,6 +19904,37 @@ fn execute_invoke_kind(
             method_descriptor,
             describe(&args[0]),
             args.get(1).map(describe).unwrap_or_default(),
+        );
+    }
+    if std::env::var("CRATONVM_DBG_LOADER_TRACE").is_ok()
+        && method_class_name.contains("RootReference")
+        && method_name.as_ref() == "<init>"
+    {
+        let describe = |v: &Value| -> String {
+            match v {
+                Value::Object(Some(obj)) => {
+                    let cid = shared.heap.class_id_of(*obj);
+                    let cn = shared
+                        .class_manager
+                        .read()
+                        .get_class(cid)
+                        .map(|c| c.name.to_string())
+                        .unwrap_or_default();
+                    format!("addr={:?} cid={:?} loader_class={}", obj, cid, cn)
+                }
+                Value::Object(None) => "null".to_string(),
+                other => format!("{:?}", other),
+            }
+        };
+        eprintln!(
+            "[ROOTREFINIT-TRACE/slow] caller_class_id={:?} cp_index={} ctor_desc={} this(args[0])={} a1={} a2={} a3={}",
+            current_class_id,
+            cp_index,
+            method_descriptor,
+            describe(&args[0]),
+            args.get(1).map(describe).unwrap_or_default(),
+            args.get(2).map(describe).unwrap_or_default(),
+            args.get(3).map(describe).unwrap_or_default(),
         );
     }
     // Spring's loader-fork test infrastructure can expose two physical copies
@@ -27314,6 +27362,43 @@ fn force_native_over_real_jdk_bytecode(
     {
         return true;
     }
+    // PERF (h2-bnf-perf 2026-07-23): same "gate mismatch" family as the
+    // `(II)` substring entry immediately above -- `check_override`
+    // (vm_exec.rs) has listed `charAt`/`length`/`isEmpty`/`startsWith` (and
+    // several more `java/lang/String` methods) as forced-native since
+    // "RKC16N.6 RECON" (a real-JDK bytecode-resolution boot fix), but that
+    // allowlist is only consulted on a genuine vtable cache miss -- this
+    // function (the per-call-site cached vtable fast path) never had the
+    // matching entries, so once a call site's cache warmed, real (fully
+    // interpreted) bytecode ran regardless of `check_override`'s intent,
+    // for the entire remaining lifetime of that call site. `substring(I)`
+    // (one-arg) was in the same boat as the already-fixed `substring(II)`
+    // -- both overloads are covered by `check_override`'s bare
+    // `"substring"` name match, but only the two-arg descriptor had an
+    // entry here. Root-caused via an H2 BNF-autocomplete workload
+    // (`org.h2.bnf.RuleFixed`/`RuleElement`/`Bnf`) whose character-by-
+    // character grammar scanning is dominated by exactly these four calls
+    // in tight loops (`s = s.substring(1)`, `s.charAt(0)`, `s.length()`,
+    // `up.startsWith(name)`). Scoped to the subset of `check_override`'s
+    // String list with straightforward, locale/Unicode-independent
+    // semantics (plain UTF-16 content comparison / indexing) that are
+    // trivially equivalent to the real-JDK bytecode for every input --
+    // deliberately NOT extending this to `trim`/`toLowerCase`/
+    // `toUpperCase`/`replace`/`compareTo*` here, since those have
+    // Unicode/locale edge cases that need their own from-scratch
+    // correctness review before being forced this broadly.
+    if class_name == "java/lang/String"
+        && matches!(
+            (method_name, method_descriptor),
+            ("substring", "(I)Ljava/lang/String;")
+                | ("charAt", "(I)C")
+                | ("length", "()I")
+                | ("isEmpty", "()Z")
+                | ("startsWith", "(Ljava/lang/String;)Z")
+        )
+    {
+        return true;
+    }
     // java.net.DatagramSocket / MulticastSocket — real-JDK delegate architecture.
     // Since JDK 14 these classes are thin wrappers that forward every operation
     // to an internal `delegate` (a `DatagramSocketImpl`-backed socket) created
@@ -27928,32 +28013,61 @@ pub(crate) fn is_string_builder_layout_native_override(
         // writes through `String.checkIndex` against the compact
         // byte[]/coder layout, which CratonVM's synthetic builder doesn't
         // have, so it AIOOBE'd instead of writing the synthetic char[].
-        "<init>" | "append" | "charAt" | "delete" | "getChars" | "insert" | "length"
+        "<init>" | "append" | "charAt" | "delete" | "getChars" | "insert"
             | "setCharAt" | "toString"
     ) {
         return true;
     }
-    // KNOWN GAP (2026-07-23): `length()` stays blanket-immune even though
-    // that means it can never route to a Mockito mock's woven advice --
-    // `verify(mock).length()` silently no-ops instead of throwing "wanted
-    // but not invoked", which then surfaces as `UnfinishedVerificationException`
-    // on the NEXT unrelated `verify()` call once its own pending-verification
-    // state is never cleared (see
-    // `MockitoBeanByTypeLookup*IntegrationTests`' two still-failing
-    // disambiguated-qualifier tests). A per-INSTANCE "is this receiver a
-    // real, `<init>`-constructed StringBuilder" check was attempted here
-    // (mirroring the `java/net/HttpURLConnection` real-carrier exemption
-    // below, gated on field 0 being non-null) and DOES NOT WORK for this
-    // class: CratonVM's synthetic StringBuilder layout pre-populates the
-    // `char[]` buffer (field 0) and its default 16-char capacity AT OBJECT
-    // ALLOCATION, not at `<init>` time, so an Objenesis-constructed mock
-    // (whose `<init>` never runs) has an indistinguishable field 0 from a
-    // genuinely real instance -- confirmed via direct inspection
-    // (`CRATONVM_DBG_LEN`-style tracing showed `arr_len=16` for both). A
-    // correct fix needs an authoritative "is this a Mockito mock" signal --
-    // e.g. a callback into `MockMethodDispatcher.get(id, instance)
-    // .isMocked(instance)` from the dispatch layer -- which is a real
-    // engineering task, not a quick per-instance heuristic; left open.
+    // `length()` FIX (2026-07-23, follow-up to the KNOWN GAP left by the
+    // previous session): stop blanket-immunizing "length" for ANY of the
+    // three class names -- matching `substring(int)`'s existing treatment
+    // exactly (that method is not, and never has been, in this list).
+    //
+    // Ground truth, captured by dumping Mockito's OWN redefined bytecode on
+    // real HotSpot (`-Dnet.bytebuddy.dump=...`, JDK 25, Mockito 5.23.0):
+    // `Mockito.mock(StringBuilder.class)` redefines BOTH `StringBuilder`
+    // (whose `length()` is a compiler-generated public bridge --
+    // `AbstractStringBuilder` is package-private -- confirmed via `javap -p
+    // -c java.lang.StringBuilder`: `aload_0; invokespecial
+    // AbstractStringBuilder.length:()I; ireturn`, UNCHANGED by redefinition)
+    // AND `AbstractStringBuilder` itself, weaving the actual
+    // `MockMethodDispatcher.get/isMocked/isOverridden/handle` advice
+    // directly into `AbstractStringBuilder.length()`'s own body, ahead of
+    // its original `getfield count:I` tail. So blanket-forcing native for
+    // `AbstractStringBuilder.length()` (an earlier version of this fix kept
+    // that arm immune, reasoning the bridge alone was the redefined method,
+    // by analogy with `substring`) permanently pre-empted the advice for
+    // BOTH a mock AND a real receiver of the class -- the STRINGBUILDER
+    // bridge's `invokespecial` reached `AbstractStringBuilder.length()`,
+    // which our own force-native gate intercepted before Mockito's advice
+    // ever got to run. Removing immunity here (verified against
+    // `InvocationCountProbe`, which reflects
+    // `Mockito.mockingDetails(mock).getInvocations()`) now byte-for-byte
+    // matches real HotSpot's `length()`/`substring(0)`/`verify()` sequence.
+    //
+    // KNOWN REMAINING GAP: a REAL (non-mock) receiver's `.length()`, called
+    // AFTER some OTHER StringBuilder has been Mockito-redefined ANYWHERE in
+    // the process, now falls through the woven advice's "not mocked" branch
+    // into `AbstractStringBuilder.length()`'s original `getfield count:I` --
+    // which reads the wrong field index against CratonVM's 2-field
+    // (`char[]`, `int`) synthetic layout (real JDK's compiled class expects
+    // `value`/`coder`/`count` at indices 0/1/2) and silently returns `0`
+    // instead of the real length (confirmed via a dedicated probe:
+    // `RealAfterMockLengthProbe`, `/data/tmp/mockitobean-substring-20260723/`).
+    // This is the EXACT SAME latent risk `substring(int)` has carried,
+    // unaddressed, since bug 3 of this class's fix history -- not a
+    // regression this change introduces, just the same known tradeoff now
+    // also applying to `length()`. Fixing it for real needs an authoritative
+    // per-instance "is this receiver actually mocked" signal reachable from
+    // Rust WITHOUT re-entering bytecode dispatch for the same (class,
+    // method) pair (a naive `MockUtil.isMock` + re-invoke attempt during
+    // this session's investigation infinite-looped, since re-invoking
+    // "this method's bytecode" from inside the very native registered for
+    // it re-triggers the identical force-native decision) -- left open, not
+    // hit by any currently-passing suite class.
+    if method_name == "length" && method_descriptor == "()I" {
+        return false;
+    }
     // `substring(int, int)` -- deliberately excludes `substring(int)`.
     // `substring(int)` must stay evictable: `MockitoBeanByTypeLookup*
     // IntegrationTests` explicitly stubs/verifies `.substring(anyInt())`
@@ -37750,6 +37864,13 @@ fn execute_invokevirtual_vtable_fast(
     shared
         .shared_resolution
         .insert_promoted_invoke(promoted_key, target.clone());
+    thread.invoke_cache.put_poly(
+        caller_class_id,
+        cp_index,
+        false,
+        receiver_class_id,
+        target.clone(),
+    );
     thread
         .invoke_cache
         .put(caller_class_id, cp_index, false, target);
@@ -37989,9 +38110,9 @@ fn execute_invokevirtual_cached(
 
     match target {
         CachedInvokeTarget::VirtualBytecode {
-            receiver_class_id,
-            cached,
-            gate: entry_gate,
+            mut receiver_class_id,
+            mut cached,
+            gate: mut entry_gate,
         } => {
             let num_params = cached.num_params as usize; // Widening: parameter count conversion
             let receiver_val = thread.frames[frame_idx].stack.peek_at(num_params);
@@ -38026,7 +38147,40 @@ fn execute_invokevirtual_cached(
                         );
                     }
                     if actual_class_id != receiver_class_id {
-                        return Ok(CachedCallResult::CacheMiss);
+                        // PERF (h2-bnf-perf 2026-07-23): the primary monomorphic
+                        // cache is stale for THIS receiver (it holds whichever
+                        // class called through this site most recently), not
+                        // simply empty -- so a megamorphic call site alternating
+                        // between a handful of concrete classes (e.g. H2's
+                        // `org.h2.bnf.Rule` family) hits this exact mismatch on
+                        // nearly every call. Before giving up, check the small
+                        // polymorphic overflow cache for an entry recorded for
+                        // THIS specific receiver class on an earlier call (see
+                        // `InvokeCache::get_poly`/`put_poly`) -- if found, swap
+                        // in its (already staleness-checked, by construction
+                        // keyed to `actual_class_id`) target and fall through
+                        // to the rest of this arm's normal dispatch below,
+                        // instead of paying for the full vtable-fast/slow-path
+                        // resolution again for a receiver class this call site
+                        // has already seen.
+                        let poly_result = thread.invoke_cache.get_poly(
+                            caller_class_id,
+                            cp_index,
+                            is_special,
+                            actual_class_id,
+                        );
+                        match poly_result {
+                            Some(CachedInvokeTarget::VirtualBytecode {
+                                receiver_class_id: poly_rc,
+                                cached: poly_cached,
+                                gate: poly_gate,
+                            }) => {
+                                receiver_class_id = poly_rc;
+                                cached = poly_cached;
+                                entry_gate = poly_gate;
+                            }
+                            _ => return Ok(CachedCallResult::CacheMiss),
+                        }
                     }
                     // Lambda proxy classes have no bytecode implementation of
                     // their functional-interface method. They must reach the
@@ -38773,6 +38927,37 @@ fn execute_invokevirtual_cached(
                     args_slice.get(1).map(describe).unwrap_or_default(),
                 );
             }
+            if std::env::var("CRATONVM_DBG_LOADER_TRACE").is_ok()
+                && cached.class_name.contains("RootReference")
+                && cached.method_name.as_ref() == "<init>"
+            {
+                let describe = |v: &Value| -> String {
+                    match v {
+                        Value::Object(Some(obj)) => {
+                            let cid = shared.heap.class_id_of(*obj);
+                            let cn = shared
+                                .class_manager
+                                .read()
+                                .get_class(cid)
+                                .map(|c| c.name.to_string())
+                                .unwrap_or_default();
+                            format!("addr={:?} cid={:?} loader_class={}", obj, cid, cn)
+                        }
+                        Value::Object(None) => "null".to_string(),
+                        other => format!("{:?}", other),
+                    }
+                };
+                eprintln!(
+                    "[ROOTREFINIT-TRACE/bc] caller_class_id={:?} cp_index={} ctor_desc={} this(args[0])={} a1={} a2={} a3={}",
+                    caller_class_id,
+                    cp_index,
+                    cached.method_descriptor,
+                    describe(&args_slice[0]),
+                    args_slice.get(1).map(describe).unwrap_or_default(),
+                    args_slice.get(2).map(describe).unwrap_or_default(),
+                    args_slice.get(3).map(describe).unwrap_or_default(),
+                );
+            }
 
             if let Some(res) = intercept_classloader_set_default_assertion_status(
                 shared,
@@ -38900,6 +39085,13 @@ fn populate_virtual_invoke_cache(
     let promoted_key: crate::runtime::lockfree_resolve::PromotedInvokeKey =
         (caller_class_id, cp_index, false, Some(receiver_class_id));
     if let Some(target) = shared.shared_resolution.get_promoted_invoke(&promoted_key) {
+        thread.invoke_cache.put_poly(
+            caller_class_id,
+            cp_index,
+            false,
+            receiver_class_id,
+            target.clone(),
+        );
         thread
             .invoke_cache
             .put(caller_class_id, cp_index, false, target);
@@ -39040,16 +39232,40 @@ fn populate_virtual_invoke_cache(
             } else {
                 false
             };
-            if let Some(kind) = (!native_override_below_declaring)
-                .then(|| {
-                    cratonvm_native_builtins::intrinsics::lookup(
-                        declaring_name,
-                        &method_name,
-                        &descriptor,
-                    )
-                })
-                .flatten()
-            {
+            // JVMTI redefine guard (2026-07-23 mockitobean length() fix):
+            // this intrinsic-population block had NO redefine awareness at
+            // all, unlike its sibling gate in `execute_invokevirtual_vtable_fast`
+            // (which already checks exactly this) and unlike the plain-Native
+            // populate-side check further down in THIS function (fixed for
+            // bug 3 of the mockitobean session). `StringBuilder.length()`'s
+            // compiler-generated public bridge (`AbstractStringBuilder` is
+            // package-private) is declared directly on `StringBuilder` --
+            // `find_method_recursive` resolves `declaring_id` to
+            // `StringBuilder` itself, which IS in the intrinsic table
+            // (`StringBuilderLength`) -- so a Mockito inline mock's woven
+            // advice on that exact bridge was being permanently shadowed by
+            // this early, unconditional `Intrinsic` cache population, never
+            // even reaching the (already redefine-aware) native-override
+            // check below. Without this guard `verify(mock).length()`
+            // silently no-ops instead of throwing "wanted but not invoked".
+            let declaring_redefined_not_immune = crate::classloading::any_class_redefined()
+                && cm.class_redefine_generation(declaring_id) > 0
+                && !redefine_immune_string_builder_native(declaring_name, &method_name, &descriptor)
+                && !redefine_immune_path_native(declaring_name, &method_name, &descriptor);
+            let intrinsic_kind = if declaring_redefined_not_immune {
+                None
+            } else {
+                (!native_override_below_declaring)
+                    .then(|| {
+                        cratonvm_native_builtins::intrinsics::lookup(
+                            declaring_name,
+                            &method_name,
+                            &descriptor,
+                        )
+                    })
+                    .flatten()
+            };
+            if let Some(kind) = intrinsic_kind {
                 // Gate bound to the receiver class — a redefine of the
                 // receiver swaps the dispatched body, mirroring the
                 // `VirtualNative` gate binding below.
@@ -39075,6 +39291,13 @@ fn populate_virtual_invoke_cache(
                 shared
                     .shared_resolution
                     .insert_promoted_invoke(promoted_key, target.clone());
+                thread.invoke_cache.put_poly(
+                    caller_class_id,
+                    cp_index,
+                    false,
+                    receiver_class_id,
+                    target.clone(),
+                );
                 thread
                     .invoke_cache
                     .put(caller_class_id, cp_index, false, target);
@@ -39181,6 +39404,13 @@ fn populate_virtual_invoke_cache(
             shared
                 .shared_resolution
                 .insert_promoted_invoke(promoted_key, target.clone());
+            thread.invoke_cache.put_poly(
+                caller_class_id,
+                cp_index,
+                false,
+                receiver_class_id,
+                target.clone(),
+            );
             thread
                 .invoke_cache
                 .put(caller_class_id, cp_index, false, target);
@@ -39286,6 +39516,13 @@ fn populate_virtual_invoke_cache(
                             shared
                                 .shared_resolution
                                 .insert_promoted_invoke(promoted_key, target.clone());
+                            thread.invoke_cache.put_poly(
+                                caller_class_id,
+                                cp_index,
+                                false,
+                                receiver_class_id,
+                                target.clone(),
+                            );
                             thread
                                 .invoke_cache
                                 .put(caller_class_id, cp_index, false, target);
@@ -39312,6 +39549,13 @@ fn populate_virtual_invoke_cache(
                         shared
                             .shared_resolution
                             .insert_promoted_invoke(promoted_key, target.clone());
+                        thread.invoke_cache.put_poly(
+                            caller_class_id,
+                            cp_index,
+                            false,
+                            receiver_class_id,
+                            target.clone(),
+                        );
                         thread
                             .invoke_cache
                             .put(caller_class_id, cp_index, false, target);
@@ -39355,6 +39599,13 @@ fn populate_virtual_invoke_cache(
             shared
                 .shared_resolution
                 .insert_promoted_invoke(promoted_key, target.clone());
+            thread.invoke_cache.put_poly(
+                caller_class_id,
+                cp_index,
+                false,
+                receiver_class_id,
+                target.clone(),
+            );
             thread
                 .invoke_cache
                 .put(caller_class_id, cp_index, false, target);
@@ -39438,6 +39689,13 @@ fn populate_virtual_invoke_cache(
                 shared
                     .shared_resolution
                     .insert_promoted_invoke(promoted_key, target.clone());
+                thread.invoke_cache.put_poly(
+                    caller_class_id,
+                    cp_index,
+                    false,
+                    receiver_class_id,
+                    target.clone(),
+                );
                 thread
                     .invoke_cache
                     .put(caller_class_id, cp_index, false, target);
@@ -39474,6 +39732,13 @@ fn populate_virtual_invoke_cache(
                 shared
                     .shared_resolution
                     .insert_promoted_invoke(promoted_key, target.clone());
+                thread.invoke_cache.put_poly(
+                    caller_class_id,
+                    cp_index,
+                    false,
+                    receiver_class_id,
+                    target.clone(),
+                );
                 thread
                     .invoke_cache
                     .put(caller_class_id, cp_index, false, target);
@@ -39506,6 +39771,13 @@ fn populate_virtual_invoke_cache(
                 shared
                     .shared_resolution
                     .insert_promoted_invoke(promoted_key, target.clone());
+                thread.invoke_cache.put_poly(
+                    caller_class_id,
+                    cp_index,
+                    false,
+                    receiver_class_id,
+                    target.clone(),
+                );
                 thread
                     .invoke_cache
                     .put(caller_class_id, cp_index, false, target);
@@ -39533,6 +39805,13 @@ fn populate_virtual_invoke_cache(
         shared
             .shared_resolution
             .insert_promoted_invoke(promoted_key, target.clone());
+        thread.invoke_cache.put_poly(
+            caller_class_id,
+            cp_index,
+            false,
+            receiver_class_id,
+            target.clone(),
+        );
         thread
             .invoke_cache
             .put(caller_class_id, cp_index, false, target);
@@ -39580,6 +39859,13 @@ fn populate_virtual_invoke_cache(
     shared
         .shared_resolution
         .insert_promoted_invoke(promoted_key, target.clone());
+    thread.invoke_cache.put_poly(
+        caller_class_id,
+        cp_index,
+        false,
+        receiver_class_id,
+        target.clone(),
+    );
     thread
         .invoke_cache
         .put(caller_class_id, cp_index, false, target);

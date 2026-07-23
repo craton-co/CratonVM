@@ -26,7 +26,8 @@ Unified status (verified on the fresh dev worktree build, srun run):
 | [10](10-pagecontext-npe-contains-null-FAIL.md) | Embedded-server serving wall (null response body; re-diagnosed → group 04, NOT a JSP/EL bug) | jakarta.servlet.jsp.TestPageContext | FAIL | 🔴 **OPEN** (→ 04) |
 | [05](05-suite-rerun-fail-triage.md) | Remaining craton-only FAIL set — to triage | (~30 classes) | FAIL | 🔴 **OPEN** (mostly undiagnosed) |
 | [14](14-classpath-url-protocol-not-registered-FIXED.md) | `classpath:` URL scheme unresolvable (`VM.isBooted` false → factory bypassed; pre-clinit factory publish; synthetic `URI.toURL` allowlist; webapp-TCCL resource scoping; `file:`-dir listing) | TestClasspathUrlStreamHandler, TestConfigFileLoader, TestPropertiesRoleMappingListener | FAIL | ✅ **FIXED** |
-| [16](16-full-suite-6shard-rerun-20260721.md) | Full 646-class Linux 6-shard run (Azure host) + HotSpot control diff | 23 classes (jakarta.el/catalina/coyote/juli/util.buf/websocket) | FAIL/HANG | 🔴 **OPEN** (individually undiagnosed, like 05) |
+| [16](16-full-suite-6shard-rerun-20260721.md) | Full 646-class Linux 6-shard run + HotSpot control diff (corrected 2026-07-24 for a harness CWD bug) | **91 classes** (was miscounted as 23) | FAIL/HANG/CRASH | 🔴 **OPEN** (individually undiagnosed, like 05) |
+| [18](18-fixture-environment-gaps-20260724.md) | True Linux fixture gaps (httpd/OCSP/LargeHeap/missing conf-Catalina-localhost/missing ant.jar), categorized by root cause | 35 classes | FAIL/HANG/CRASH | 🔴 **OPEN** (not CratonVM bugs — fixture completion work) |
 
 9 of the diagnosed bug groups are FIXED (01/02/03/06/07/08/09/13/14); the open set is
 dominated by the throughput wall (04) and the not-yet-individually-diagnosed
@@ -84,3 +85,15 @@ in the remaining 11. Also flagged: two remaining-11 classes
 (`TestMapperPerformance`, `TestJNDIRealmIntegration`) have existing docs in
 this directory claiming they're already fixed, but both still fail/hang on
 current `dev` — not reconciled yet. See group 16's addendum for full detail.
+
+> ⚠️ **The 172-fixture-gap figure above (both 2026-07-21 and 2026-07-23) is
+> WRONG — corrected 2026-07-24.** `run-tomcat-suite.sh` never `cd`'d into the
+> Tomcat checkout root before launching each test, so relative-path resource
+> lookups (`new File("test/webapp")` etc.) silently resolved against the
+> wrong directory on **both** VMs — that's why so many looked like
+> "environment gaps." Fixed (one line, `cd "$TC_ROOT"`) and reran all 195
+> non-PASS classes fresh. **Real split: 520 PASS / 91 confirmed CratonVM-only
+> regressions / 35 true fixture gaps** (categorized by actual root cause in
+> [18](18-fixture-environment-gaps-20260724.md)). See group 16's
+> "CORRECTED addendum, 2026-07-24" for full detail — treat the 23/11/172
+> numbers anywhere above this notice as historical, not current.

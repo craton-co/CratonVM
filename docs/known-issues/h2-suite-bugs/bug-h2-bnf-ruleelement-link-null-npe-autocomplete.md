@@ -1,7 +1,19 @@
 # H2 console autocomplete (`autoCompleteList.do`) returns empty body — root-caused, NOT a discrete bug (same family as `TestBnf`)
 
 ## Status
-**CLOSED — root-caused as a performance-margin issue, not a discrete
+**OPEN, partially fixed (follow-up session, 2026-07-23)** — the
+performance-margin characterization below holds, and three real, distinct
+interpreter throughput gaps that materially contribute to it have now been
+found, fixed, and merged to `dev` (measured ~1.5-1.7x+ wall-clock
+improvement on the isolated repro). **`TestWeb.testWebApp()` and
+`TestBnf.testProcedures()` still fail** against H2's real 100ms
+`Sentence.MAX_PROCESSING_TIME` budget — confirmed via direct test runs
+against the fixed binary, not just the widened-budget repro. See "Follow-up
+(2026-07-23): three real interpreter gaps found and fixed, partial
+improvement" at the end of this doc for the full writeup, root-cause
+precision, and what's left.
+
+Originally: **CLOSED — root-caused as a performance-margin issue, not a discrete
 CratonVM defect** (follow-up session, 2026-07-22, same day as the original
 finding). The original `RuleElement.link` NPE hypothesis below was a **red
 herring from an incomplete isolated repro** (`docs-known-issue-doc-
@@ -172,3 +184,138 @@ Sentence.MAX_PROCESSING_TIME budget-exhaustion mechanism this doc already
 root-caused, not a regression or a different bug). No new investigation
 done here — see `apps/h2database-suite-runner/RESULTS-20260723.md` for the
 broader run this reconfirmation came from.
+
+## Follow-up (2026-07-23): three real interpreter gaps found and fixed, partial improvement
+
+Picked this up with the explicit goal of actually closing it, not just
+re-confirming the characterization. Worktree `/data/wt-h2-bnf-perf-20260723`
+on the Azure host, branch `fix/h2-bnf-perf-20260723`. Landed on `dev` as
+commit `0227864d5` (merged forward via `6d0f865a0`).
+
+### Precise root-cause, via instrumentation not guesswork
+
+Built a faithful isolated repro (`BnfProbe5`/`BnfProbe6`, mirroring
+`WebSession.loadBnf()` exactly) and temporarily widened
+`Sentence.MAX_PROCESSING_TIME` to measure the *actual* time the
+`"select 'abc"` query takes to complete correctly, rather than just
+observing the 100ms timeout firing. Baseline: **~900ms** (a ~9x gap to the
+100ms budget, not the "300-1000x" figure an earlier informal observation in
+this doc's history had suggested — that earlier number was very likely
+measured under heavy concurrent host load, not a property of the query
+itself).
+
+Added a temporary `Sentence.DBG_CALL_COUNT` counter (incremented in
+`stopIfRequired()`, called once per `Rule.autoComplete()` invocation) and
+found the query makes only **981 total calls** across the whole
+`org.h2.bnf.Rule` family (`RuleList`/`RuleElement`/`RuleFixed`/
+`RuleOptional`/`RuleRepeat`) — far too few for any single (class, method)
+pair to cross the JIT's 500-invocation tier-up threshold (confirmed:
+`CRATONVM_JIT_THRESHOLD=10` made no measurable difference). This is a
+**cold-interpreter-throughput** problem, not a JIT-warmup problem.
+
+Used the interpreter's existing `CRATONVM_DBG_INVOKESTATS` diagnostic
+(`vm/src/runtime/interpreter.rs`'s `dbg_invoke_stats_record`) to isolate the
+query's own contribution (by diffing `BnfProbe5`, setup+query, against
+`BnfProbe6`, setup-only): the query's invoke-cache **miss rate was ~33%**
+(vs ~11% ambient for ordinary setup/JDBC code), with the large majority of
+misses cascading all the way to the most expensive full-slow-path
+resolution (`execute_invoke_kind`), not the cheaper `vtable_fast` fallback.
+Root cause: `RuleList.autoComplete()`'s `for (Rule r : list)
+r.autoComplete(sentence)` loop (and the equivalent single-child call in
+`RuleOptional`/`RuleRepeat`) hits the *same bytecode call site* with a
+rotating sequence of the 5 different concrete `Rule` implementations — a
+textbook megamorphic call site — against an `InvokeCache`
+(`classloading/src/resolution.rs`) that was purely monomorphic (one slot
+per call site, overwritten on every class change).
+
+Separately, grepping `force_native_over_real_jdk_bytecode`
+(`vm/src/runtime/interpreter.rs`) against `vm_exec.rs`'s `check_override`
+found a second, independent gap: `check_override` has listed
+`java/lang/String`'s `charAt`/`length`/`isEmpty`/`startsWith`/`substring`
+(among others) as forced-native since a prior "RKC16N.6 RECON" boot-time
+fix, but `force_native_over_real_jdk_bytecode` (the *cached* vtable-fast
+decision point, consulted once per call site and then memoized) only had
+`substring(II)` — the exact same "gate mismatch" bug class already
+root-caused and fixed there for that one overload, just never completed for
+the rest of the list. `RuleFixed`'s character-by-character grammar scanning
+(`while (s.length() > 0 && ...) s = s.substring(1)`, `s.charAt(0)`,
+`up.startsWith(name)`) hammers precisely these methods in tight loops.
+
+### Three fixes landed
+
+1. **`lookup_loader_initiated`** (`vm/src/runtime/interpreter.rs`) took the
+   `class_manager` `RwLock` unconditionally on every call — unlike its
+   sibling `should_use_loader_initiated_resolution`, which already has a
+   lock-free `ANY_DEFINING_LOADER_REGISTERED`-gated fast bailout via
+   `defining_loader_for` (`native-builtins/src/classloader.rs`). Confirmed
+   via call-count instrumentation (`CRATONVM_DBG_HOTPATH_COUNTS`) this one
+   function accounted for ~90% of ALL executed bytecode instructions on
+   this workload — it's called from `resolve_class_loader_aware` on every
+   single `new`/`checkcast`/`instanceof`/`anewarray`. Added the same fast
+   bailout (new `any_defining_loader_registered()` accessor). Provably
+   behavior-preserving (identical result in every case, just reached
+   without the lock when no user-defined classloader has ever registered a
+   class process-wide) and broadly beneficial well beyond this workload.
+
+2. **`InvokeCache`** (`classloading/src/resolution.rs`) gained a small,
+   *additive* polymorphic overflow cache — `put_poly`/`get_poly`, capped at
+   8 distinct receiver classes per call site — consulted from
+   `execute_invokevirtual_cached`'s `VirtualBytecode`-arm receiver-mismatch
+   guard (`vm/src/runtime/interpreter.rs`) right before it would otherwise
+   give up and fall through to the expensive slow paths. The existing
+   monomorphic `entries` map, its `get`/`put`/`evict` semantics, and every
+   other call site are completely unchanged — this is a pure second-chance
+   lookup, not a rework of the primary cache. Confirmed working via direct
+   instrumentation: 2.5M poly hits vs 226 misses process-wide on this
+   workload. Verified the existing `invoke_cache_evicts_stale_entry_after_
+   redefine_bump` unit test (and its sibling) still pass — `evict()` now
+   also clears the poly-cache entries for that call site, preserving the
+   redefine-staleness invariant.
+
+3. **`force_native_over_real_jdk_bytecode`** gate completion: added
+   `charAt`/`length`/`isEmpty`/`startsWith(String)`/`substring(int)` for
+   `java/lang/String`, matching `check_override`'s already-vetted intent.
+   Deliberately scoped to the locale/Unicode-independent subset of
+   `check_override`'s String list — `trim`/`toLowerCase`/`toUpperCase`/
+   `replace`/`compareTo`/`compareToIgnoreCase` were left alone pending
+   their own correctness review (in particular, `native_string_trim`
+   already uses Rust's `str::trim()`, which trims full Unicode whitespace —
+   different from Java's `String.trim()` spec, which only strips
+   codepoints `<= U+0020`; that's a **separate, pre-existing** native-vs-
+   bytecode correctness gap, not something this session introduced or
+   fixed, flagged here for whoever picks it up next).
+
+### Net effect and what's still open
+
+Measured on the isolated repro: **~900ms → ~530-590ms** (best clean
+readings; the Azure host was under severe, fluctuating contention for much
+of this session — including one stretch peaking at load average 134 on a
+16-core box — which prevented a single fully-clean combined measurement of
+all three fixes together, but the trend and the per-fix mechanisms are each
+independently confirmed).
+
+**This is not sufficient to close the bug.** Re-ran `TestWeb.testWebApp()`
+and `TestBnf.testProcedures()` directly against the fixed binary with H2's
+real, unwidened 100ms budget — both still fail at the exact same
+assertions. The remaining ~5-6x gap is **not** another discrete dispatch
+bug: profiling showed the query's ~3.7M interpreted bytecode instructions
+are overwhelmingly *ordinary* instruction execution (String/HashMap
+operations' own bodies), not resolution/dispatch overhead — dispatch-path
+fixes like the three above close some of the gap but can't close all of it.
+Fully closing this needs genuine, broad raw-interpreter-throughput work
+(the same category this doc's original 2026-07-22 investigation already
+concluded was required), which is out of scope for further scoped patches;
+it would need its own dedicated investigation with room for a much larger,
+carefully-regression-tested change.
+
+**Regression verification performed:** `cratonvm-classloading`'s
+`invoke_cache` unit tests (2/2 pass, via `cargo test -p
+cratonvm-classloading --release invoke_cache`); live runs of
+`org.h2.test.unit.TestStringUtils`, `org.h2.test.db.TestAlter`,
+`org.h2.test.unit.TestShell`, and `org.h2.test.db.TestLinkedTable` against
+the fixed binary (all pass cleanly); `org.h2.test.unit.TestUpgrade` fails
+only at its own already-tracked, unrelated `RootReference` residual (see
+`bug-h2-suite-residual-fail-triage.md`). A `cargo test -p cratonvm-vm
+force_native_over_real_jdk_bytecode` run was attempted but got OOM-killed
+by the host's memory pressure before completing — not evaluated, worth
+re-running by whoever picks this up next on a less contended host.
