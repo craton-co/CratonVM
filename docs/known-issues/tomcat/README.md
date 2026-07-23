@@ -56,7 +56,13 @@ in `.suite/all-tests.txt`) with no code fix needed.
 
 | Doc | Classes |
 |---|---:|
-| [hang-classification-unconfirmed-host-contention.md](hang-classification-unconfirmed-host-contention.md) | 9 |
+| [untriaged-oddities.md](untriaged-oddities.md) | 2 |
+
+## Fixed and moved to `docs/internal/`
+
+| Doc | Classes | Outcome |
+|---|---:|---|
+| [hang-classification-unconfirmed-host-contention-FIXED.md](../../internal/fixed-suite-bugs/tomcat/hang-classification-unconfirmed-host-contention-FIXED.md) | 9 | ✅ HANG was a pure host-contention artifact (HotSpot passes all 9 cleanly); once ruled out, all 9 were genuine CratonVM regressions from 2 root causes (ecj/Hashtable JSP-compile NPE affecting 8; SSLContext-resolution-through-wrapped-factory affecting `TestCustomSsl`), both fixed and verified — 9/9 PASS on CratonVM on a quiet host |
 
 ## Real CratonVM bug (not a fixture gap — despite living in the same 35-class "both VMs fail" bucket)
 
