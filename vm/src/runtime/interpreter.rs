@@ -19834,6 +19834,32 @@ fn execute_invoke_kind(
             args.get(1).map(describe).unwrap_or_default(),
         );
     }
+    if std::env::var("CRATONVM_DBG_LOADER_TRACE").is_ok() && &*method_name == "compareAndSetRoot" {
+        let describe = |v: &Value| -> String {
+            match v {
+                Value::Object(Some(obj)) => {
+                    let cid = shared.heap.class_id_of(*obj);
+                    let cn = shared
+                        .class_manager
+                        .read()
+                        .get_class(cid)
+                        .map(|c| c.name.to_string())
+                        .unwrap_or_default();
+                    format!("addr={:?} cid={:?} loader_class={}", obj, cid, cn)
+                }
+                Value::Object(None) => "null".to_string(),
+                other => format!("{:?}", other),
+            }
+        };
+        eprintln!(
+            "[CASROOT-TRACE/slow] caller_class_id={:?} cp_index={} receiver_map(args[0])={} expected(args[1])={} updated(args[2])={}",
+            current_class_id,
+            cp_index,
+            describe(&args[0]),
+            args.get(1).map(describe).unwrap_or_default(),
+            args.get(2).map(describe).unwrap_or_default(),
+        );
+    }
     // Spring's loader-fork test infrastructure can expose two physical copies
     // of this private enum while representing one logical annotation operation.
     // Preserve the enum member identity by its declaring binary name and enum
@@ -21215,7 +21241,9 @@ fn execute_invoke_kind(
         None
     };
 
-    if std::env::var("CRATONVM_DBG_LOADER_TRACE").is_ok() && invoke_class.contains("RootReference") {
+    if std::env::var("CRATONVM_DBG_LOADER_TRACE").is_ok()
+        && (invoke_class.contains("RootReference") || &*method_name == "compareAndSetRoot")
+    {
         let cm = shared.class_manager.read();
         let invoke_class_resolved = cm.get_loaded_class_id(&invoke_class);
         let cur_loader = cm.get_loader_id(current_class_id);
@@ -37578,6 +37606,32 @@ fn execute_invokevirtual_vtable_fast(
         &mut args_vec
     };
     refresh_stale_object_args(shared, args_slice);
+    if std::env::var("CRATONVM_DBG_LOADER_TRACE").is_ok() && &*method_name == "compareAndSetRoot" {
+        let describe = |v: &Value| -> String {
+            match v {
+                Value::Object(Some(obj)) => {
+                    let cid = shared.heap.class_id_of(*obj);
+                    let cn = shared
+                        .class_manager
+                        .read()
+                        .get_class(cid)
+                        .map(|c| c.name.to_string())
+                        .unwrap_or_default();
+                    format!("addr={:?} cid={:?} loader_class={}", obj, cid, cn)
+                }
+                Value::Object(None) => "null".to_string(),
+                other => format!("{:?}", other),
+            }
+        };
+        eprintln!(
+            "[CASROOT-TRACE/vtfast] caller_class_id={:?} cp_index={} receiver_map(args[0])={} expected(args[1])={} updated(args[2])={}",
+            caller_class_id,
+            cp_index,
+            describe(&args_slice[0]),
+            args_slice.get(1).map(describe).unwrap_or_default(),
+            args_slice.get(2).map(describe).unwrap_or_default(),
+        );
+    }
 
     if let Some(res) = intercept_classloader_set_default_assertion_status(
         shared,
@@ -38045,6 +38099,35 @@ fn execute_invokevirtual_cached(
                             receiver_class_id,
                             describe(&args_slice[0]),
                             args_slice.get(1).map(describe).unwrap_or_default(),
+                        );
+                    }
+                    if std::env::var("CRATONVM_DBG_LOADER_TRACE").is_ok()
+                        && cached.method_name.as_ref() == "compareAndSetRoot"
+                    {
+                        let describe = |v: &Value| -> String {
+                            match v {
+                                Value::Object(Some(obj)) => {
+                                    let cid = shared.heap.class_id_of(*obj);
+                                    let cn = shared
+                                        .class_manager
+                                        .read()
+                                        .get_class(cid)
+                                        .map(|c| c.name.to_string())
+                                        .unwrap_or_default();
+                                    format!("addr={:?} cid={:?} loader_class={}", obj, cid, cn)
+                                }
+                                Value::Object(None) => "null".to_string(),
+                                other => format!("{:?}", other),
+                            }
+                        };
+                        eprintln!(
+                            "[CASROOT-TRACE/vbc] caller_class_id={:?} cp_index={} receiver_class_id={:?} receiver_map(args[0])={} expected(args[1])={} updated(args[2])={}",
+                            caller_class_id,
+                            cp_index,
+                            receiver_class_id,
+                            describe(&args_slice[0]),
+                            args_slice.get(1).map(describe).unwrap_or_default(),
+                            args_slice.get(2).map(describe).unwrap_or_default(),
                         );
                     }
 
