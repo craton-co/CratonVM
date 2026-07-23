@@ -574,6 +574,7 @@ fn should_skip_jit_internal(
 
     if class_name == "com/sun/tools/javac/jvm/ClassReader" && method_name == "readInnerClasses" {
         return Some(SkipReason::ClassReaderReadInnerClasses);
+    }
 
     // HIB-STOREDPROC-JIT.1 (2026-07-23): H2's `CREATE ALIAS ... AS $$` invokes
     // the real in-process javac compiler.  After this exact method tiers up,
