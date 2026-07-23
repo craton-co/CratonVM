@@ -294,6 +294,45 @@ across 5 smoke tests + 1600 campaign boots) and committed to dev — a future se
 sampling with `CRATONVM_DBG_DUPCALL_FILTER=1` already wired into `probes/run-one.sh`, or pursue the
 class-init-twice alternative hypothesis instead.
 
+## WFLYCTL0079 round 2 + CCE-BT forensics extension (2026-07-23)
+
+Added a SECOND, more precise diagnostic (`DUPREG`, tracing
+`TransactionSubsystemRootResourceDefinition.registerAttributes()` directly — the actual
+registry-mutation call site, several frames below the executor task dispatch `DUPCALL` already
+tested clean) after decompiling the class confirmed `HORNETQ_STORE_ENABLE_ASYNC_IO` is registered
+via an `AliasedHandler` inside this one instance method. Unlike `DUPCALL`, this method has no
+bridge-method ambiguity — any repeat of the same (receiver, registration-registry) identity pair is
+unambiguously a genuine double call. An 800-boot campaign (`DUPREG2X`/`DUPATTR` tags) came up empty
+— survived two silent mid-campaign deaths from host contention (50+ concurrent users; `setsid`
+detachment fixed it) before finally completing clean.
+
+That campaign's real find was a **second checkcast-CCE occurrence** (target=
+`com.squareup.protoparser.FieldElement$Label`, NOT `PathAddress` — confirms the family isn't
+specific to one target class, it's a general "any checkcast can hit a degraded-to-bare-Object
+receiver" gap), non-fatal this time (WildFly's MSC marked the owning service FAILED and continued
+booting), with 246 `[blockgc] wake` cross-thread writeback events in the same boot — supporting the
+"correlates with heavy STW cross-thread takeover activity" hypothesis with a second data point.
+`CRATONVM_DBG_CCE_BT` had never captured GC forensics before (only a Java call-stack dump), so it
+was extended to reuse the exact same `gcpart`/`pushprov`/`zeroed`/`getfield` probes `[stale-recv]`
+already has, gated on the CCE'd receiver having degraded to a bare `java.lang.Object` (this family's
+signature — an app-level type-mismatch CCE has nothing useful to probe). A THIRD 800-boot campaign
+with this extension active came up empty for `CCEBT` too (checkcast-CCE is itself rare, ~2
+occurrences across ~3200+ boots this session).
+
+**Running total across all three campaigns with active double-invocation tracing: 2400 boots, 0
+`DUPCALL3X`, 0 `DUPREG2X`, 0 fresh `WFLYCTL0079`.** Combined with the original ~2400 boots (2
+occurrences, no tracing), the true base rate is likely rarer than the earlier ~1-in-1200 estimate —
+that estimate was from n=2 and is noisy. Both double-dispatch hypotheses (executor-level and
+registry-mutation-level) are now reasonably well tested and NOT confirmed; if `WFLYCTL0079` is
+still a double-execution bug, it must be more localized than either level traced so far (e.g. inside
+`AliasedHandler`'s own construction), or it is a different mechanism entirely (a genuine WildFly-side
+non-determinism, possibly config-order or hash-iteration-order dependent, unrelated to CratonVM
+double-dispatch). **Recommendation for continuation:** further blind campaigns have poor
+cost/reproduction odds at this rate; a more targeted move would be tracing `AliasedHandler`'s own
+constructor/registration call directly (same technique, one level deeper), or giving up on live
+reproduction and instead statically auditing `AliasedHandler`'s WildFly-side registration logic for
+a genuine non-atomic check-then-act pattern.
+
 ## Large-scale campaign (800 boots, fix15, 2026-07-23) — WFLYCTL0079 confirmed reproducible
 
 With the RSET_AUDIT diagnostic now fixed (verified holding at scale: 1 `EXITED`/800, no segfaults),
