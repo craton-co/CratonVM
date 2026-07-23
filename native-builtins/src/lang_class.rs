@@ -7695,6 +7695,19 @@ pub(crate) fn native_class_get_declared_methods(
         };
 
         let methods = declared_methods_with_synthetic(ctx, class_id);
+        if std::env::var_os("CRATONVM_DBG_OBSREG").is_some() {
+            let __cname = ctx.class_name_of_id(class_id).unwrap_or_default();
+            if __cname.contains("SecurityFilterAutoConfigurationEarlyInitializationTests")
+                || __cname.contains("PathRequestTests")
+                || __cname.contains("ManagementWebSecurityAutoConfigurationTests")
+            {
+                eprintln!(
+                    "[OBSREG-DBG] getDeclaredMethods class={__cname} class_id={class_id:?} count={} names={:?}",
+                    methods.len(),
+                    methods.iter().map(|m| format!("{}{}", m.name, m.descriptor)).collect::<Vec<_>>()
+                );
+            }
+        }
         // `getDeclaredMethods0(boolean publicOnly)` вЂ” the real JDK calls this
         // with publicOnly=true on the `Class.getMethods()` / `getMethod()` path
         // (`privateGetPublicMethods`) and TRUSTS it to return only PUBLIC

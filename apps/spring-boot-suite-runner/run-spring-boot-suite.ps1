@@ -368,10 +368,18 @@ function Invoke-Gradlew {
   # discovering 0 classes / regenerating no classpaths despite exit 0).
   $prevEAP = $ErrorActionPreference
   $ErrorActionPreference = 'Continue'
+  # gradlew.bat relies on the CALLER's current directory being the Gradle
+  # project root (it does not `cd` into its own location) -- invoking it via
+  # `& $Gradlew` from an arbitrary caller cwd (e.g. the CratonVM repo root)
+  # fails with "Directory '<cwd>' does not contain a Gradle build" even
+  # though $Gradlew's own path is fully qualified. Push into its directory
+  # for the duration of the call.
+  Push-Location (Split-Path $Gradlew -Parent)
   try {
     & $Gradlew @GradleArgs 2>&1 | ForEach-Object { Write-Host $_ }
     return $LASTEXITCODE
   } finally {
+    Pop-Location
     $ErrorActionPreference = $prevEAP
   }
 }

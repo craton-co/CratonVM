@@ -18392,7 +18392,10 @@ fn resolve_class_loader_aware(
             || name.contains("org/h2/Driver")
             || name.contains("AotTestContextInitializers")
             || name.contains("AotMergedContextConfiguration")
-            || name.contains("DefaultCacheAwareContextLoaderDelegate"));
+            || name.contains("DefaultCacheAwareContextLoaderDelegate")
+            || name.contains("SecurityFilterAutoConfigurationEarlyInitializationTests")
+            || name.contains("PathRequestTests")
+            || name.contains("ManagementWebSecurityAutoConfigurationTests"));
     if dbg_trace {
         let cm = shared.class_manager.read();
         let ref_name = cm
