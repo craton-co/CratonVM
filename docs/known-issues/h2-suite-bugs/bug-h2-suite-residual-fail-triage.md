@@ -1429,3 +1429,155 @@ continues to reproduce the failure in well under 5 minutes.
 
 Fix commits landed on `dev` via branch
 `fix/h2-testupgrade-round7-20260723`.
+
+## Follow-up session (seventh pass, 2026-07-23): two more real dispatch bugs
+## found and fixed via new targeted tracing; `TestUpgrade` narrowed further
+## but still OPEN
+
+Worktree `/data/wt-h2-round7-20260723` on the Azure host, branch
+`fix/h2-testupgrade-round7-20260723`, branched from `origin/dev`
+(`893ddbc73`). Picked up the sixth pass's "concrete next step" (compare the
+value on the caller's operand stack immediately before an invokespecial/
+invokevirtual dispatch against what the callee's frame actually receives)
+and went further than prior passes by adding fresh, call-site-specific
+tracing rather than re-reading the existing `[LOADER-TRACE]` output.
+
+### Bug found and fixed #1: cached/fast invoke-dispatch paths popped object
+### args without the GC-forwarding barrier `execute_invoke_kind` already has
+
+`execute_invoke_kind` (the slow, uncached invoke dispatcher) has a
+documented barrier: args popped off the operand stack into a plain
+(non-GC-rooted) buffer get `shared.heap.load_and_forward()` applied to every
+`Value::Object` before use, because a moving-GC evacuation in the gap
+between popping and copying into the callee's locals can otherwise leave a
+stale from-space address in that buffer. Auditing every OTHER call-site that
+pops args the same way (`execute_invokevirtual_cached`'s `VirtualBytecode`
+and `Bytecode` arms, `execute_invokevirtual_vtable_fast`,
+`execute_invokestatic_cached`'s `Bytecode`-cache-hit arm,
+`pop_coerced_invoke_args_virtual`/`_static`/`_intrinsic`) found **none** of
+them had this barrier — only the slow path did. Added a shared
+`refresh_stale_object_args` helper and called it at all 8 sites. Verified
+harmless via regression spot-checks (`TestAlter`, `TestShell`,
+`TestLinkedTable` — all clean) and via a full release build. **This is a
+real, generally-applicable correctness fix** (same shape as the third
+pass's JIT-cache fix): any hot cached-dispatch call site popping a
+newly-allocated or recently-moved object argument was vulnerable to reading
+a stale address if a GC evacuation landed in the narrow window between pop
+and frame-construction. **However, confirmed NOT sufficient by itself to
+fix `TestUpgrade`** — rebuilt and reran; the identical `NoSuchMethodError`
+still reproduces. Keeping the fix regardless (same rationale as the third
+pass's JIT-cache fix: independently correct, confirmed harmless).
+
+### Bug found and fixed #2: `resolved_private_invokevirtual_target`'s
+### loader-blind fallback
+
+Added targeted per-call tracing (gated behind the existing
+`CRATONVM_DBG_LOADER_TRACE`) specifically to `RootReference.tryUpdate`
+argument popping at every candidate dispatch site, plus confirmed via
+`javap -c` that `tryUpdate`'s callers (`updateRootPage`/`tryLock`/
+`tryUnlockAndUpdateVersion`/`updatePageAndLockedStatus`) compile their
+`this.tryUpdate(new RootReference<>(...))` self-calls as **`invokevirtual`**,
+not `invokespecial` — a real (if unusual) javac quirk for this era of
+bytecode: private methods can still be encoded with opcode `0xb6`. CratonVM
+already has dedicated handling for exactly this shape,
+`resolved_private_invokevirtual_target` (`vm/src/runtime/interpreter.rs`),
+whose own doc comment explains the general problem correctly. But its
+resolution of the target class was:
+```rust
+let target_class_id = lookup_loader_initiated(shared, current_class_id, method_class_name)
+    .or_else(|| shared.class_manager.read().get_loaded_class_id(method_class_name))?;
+```
+`lookup_loader_initiated` is loader-aware and correct when it hits, but its
+`.or_else` fallback, `get_loaded_class_id`, is a **global, name-only,
+single-slot "first loaded wins" lookup** — exactly the same bug class as
+the third pass's JIT-cache-key gap and the "GLOBAL-FIRST fallback" pattern
+already seen elsewhere in this file's history. For two classloaders each
+defining their own `org/h2/mvstore/RootReference` (the `Upgrade.loadH2`
+shape this whole doc keeps circling back to), a miss in
+`lookup_loader_initiated` — plausible here since this is a class resolving
+**itself** by name at a private self-call site, not a delegated import,
+which loader-initiated-resolution tables are not necessarily indexed for —
+falls back to returning whichever copy loaded first (observed to always be
+the Application one), silently pinning the private call's dispatch to the
+**wrong loader's** method body/constant pool while the receiver stays the
+caller's own (correct-loader) object.
+
+**Fix:** since a private method is, by JVM access control, only ever
+legally invoked from within the exact class that declares it, the CP-resolved
+owner name at any legitimate private-via-invokevirtual call site always
+names the caller's own class. Added a `self_match` fast path that resolves
+directly against `current_class_id` (zero lookup, zero loader ambiguity)
+whenever `current_class_id`'s own name matches `method_class_name`, before
+ever consulting `lookup_loader_initiated`/`get_loaded_class_id`. Verified
+harmless via the same regression spot-checks and a clean release build.
+**This is also a real, generally-applicable correctness fix** — any
+private-method self-call compiled as `invokevirtual` under two classloaders
+defining the same-named class was vulnerable. **Also confirmed NOT
+sufficient by itself to close `TestUpgrade`**: rebuilt and reran with
+`--nojit`; the identical `NoSuchMethodError` still reproduces, and the new
+`[TRYUPDATE-TRACE/*]` instrumentation (left in the tree, gated behind
+`CRATONVM_DBG_LOADER_TRACE`, zero cost when unset) shows every sampled
+`tryUpdate` call in a full run was self-consistent (`Application` caller →
+`Application` receiver/arg, or vice versa) — the actual corrupting
+`UserDefined`-context `tryUpdate` call was never captured in this pass's
+sampling window (`UserDefined`-loader `RootReference` activity is rare —
+only 1 loader-scoped `resolve name=RootReference` event for the whole
+`UserDefined(5)` loader across a full run — so a 300s window can miss it).
+
+### Narrowed further: the corruption is confirmed downstream of `tryUpdate`'s
+### own (now more rigorously verified sound) dispatch and frame construction
+
+New direct evidence this pass, not available to any prior pass:
+
+- The failing call's own WARN line names the exact caller precisely:
+  `NoSuchMethodError method="org/h2/mvstore/RootReference.hasChangesSince(J)Z"
+  caller="org/h2/mvstore/MVMap.hasChangesSince(J)Z @pc=8"`. `MVMap.
+  hasChangesSince(long)` (single-arg) only exists in the OLD (1.4.200)
+  `MVMap` — current `MVMap`/`RootReference` both take a 2-arg
+  `(long,boolean)` `hasChangesSince`. So the CALLING `MVMap` instance is
+  unambiguously the `UserDefined`-loader (old) one; `hasChangesSince` on
+  `RootReference` is **package-private, not private** — a genuinely
+  polymorphic `invokevirtual` dispatched correctly by receiver class (not
+  covered by `resolved_private_invokevirtual_target` at all, and not shown
+  to be buggy). The `NoSuchMethodError` is a **faithful, correct**
+  consequence of dispatching against whatever object is actually sitting in
+  `this.root` (an `AtomicReference<RootReference>` field on the OLD `MVMap`)
+  at the time of the call — which is an `Application`-loaded (current)
+  `RootReference` instance, lacking the 1-arg overload.
+- Re-confirmed (sixth pass) that every CAS onto the SPECIFIC `AtomicReference`
+  holder that ends up "mixed" (a `UserDefined`-cid write followed later by an
+  `Application`-cid write) targets the **same physical holder object**
+  throughout — i.e. `MVMap.compareAndSetRoot`'s dispatch itself is NOT
+  landing on the wrong `MVMap` instance; the SAME (old) `MVMap`'s own `root`
+  field gets a value CAS'd into it that is already wrong by the time the CAS
+  runs. Combined with this pass's `tryUpdate`-argument-popping and
+  frame-construction fixes both landing clean without closing the bug, the
+  remaining candidates narrow to: (a) `MVMap.compareAndSetRoot`'s own
+  (package-private, polymorphic) invokevirtual argument marshalling — not yet
+  traced with the same rigor `tryUpdate`'s was this pass — or (b) something
+  upstream of `tryUpdate` entirely, e.g. `Page.map` (a `final` field set once
+  at `Page` construction, `Page.java:131-141`) holding a cross-loader-wrong
+  `MVMap` reference for some `UserDefined`-loader `Page`, which would make
+  `root.map.compareAndSetRoot(...)` (in `tryUpdate`'s own body — `root` here
+  is `RootReference.root`, a `Page`, NOT the `MVMap.root` `AtomicReference`;
+  the two same-named fields on different classes are easy to conflate when
+  reading this trail) dispatch correctly-per-its-wrong-receiver onto the
+  Application MVMap, silently missing the OLD MVMap's actual root field
+  entirely.
+
+**Concrete next step, not yet attempted**: instrument `Page`'s constructors
+(`Page.java:131,135,140`) to trace `map` field identity (loader) against the
+caller's own loader context, specifically for `UserDefined`-loader-context
+`Page` construction/copying paths (page splits, `Page.copy()`-style clones)
+— the same "does the constructor argument's loader match the constructing
+context's loader" question this pass answered for `tryUpdate`, one level
+further up the object graph. Second candidate: extend the same
+per-call-site tracing technique this pass used for `tryUpdate` to
+`MVMap.compareAndSetRoot` itself (it was traced only via the pre-existing,
+coarser `execute_invokevirtual_cached` `HIT-CHECK` tag in every prior pass,
+never with `describe()`-style before/after argument dumps).
+`CRATONVM_DBG_LOADER_TRACE=1 --nojit org.h2.test.unit.TestUpgrade`
+continues to reproduce the failure in well under 5 minutes.
+
+Fix commits landed on `dev` via branch
+`fix/h2-testupgrade-round7-20260723`.
