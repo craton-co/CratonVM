@@ -8122,6 +8122,44 @@ fn native_spring_has_plain_java_annotations_only_object(
     Ok(Some(Value::Int(0)))
 }
 
+fn spring_extension_invoke_special_anchored_on_test_class(
+    ctx: &mut dyn NativeContext,
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+    test_class: ObjectRef,
+    args: &[Value],
+) -> MethodCallResult {
+    // Shared anchoring helper: invokes a static method on `class_name`,
+    // preferring the copy already loaded by `test_class`'s own defining
+    // loader when that loader is user-defined (see
+    // spring_extension_get_application_context's call site for the full
+    // AOT double-context-refresh rationale). Falls through unchanged to
+    // the original loader-blind ctx.invoke_special by name in every other
+    // case -- purely additive, no behavior change outside forked-loader
+    // tests. Reused for every SpringExtension static call this native
+    // family makes that needs to land on the SAME copy of SpringExtension
+    // the test class's own machinery uses (getApplicationContext,
+    // findProperlyScopedExtensionContext).
+    if let Some(test_class_id) = crate::lang_class::mirror_class_id(ctx, test_class) {
+        let loader_id = ctx.loader_id_of_class(test_class_id);
+        if loader_id >= 3 {
+            if let Some(fork_class_id) =
+                ctx.class_id_defined_by_loader_exact(class_name, loader_id as u32)
+            {
+                return ctx.invoke_by_class_id(
+                    fork_class_id,
+                    class_name,
+                    method_name,
+                    descriptor,
+                    args,
+                );
+            }
+        }
+    }
+    ctx.invoke_special(class_name, method_name, descriptor, args)
+}
+
 fn spring_extension_get_application_context(
     ctx: &mut dyn NativeContext,
     extension_context: ObjectRef,
@@ -8150,31 +8188,23 @@ fn spring_extension_get_application_context(
     // double-context-refresh bug (see
     // docs/known-issues/CRATONVM-SPRING-GENUINE-BUGLIST.md's AOT cluster
     // sections). Anchor resolution on the CURRENT test class's own loader
-    // instead: if that loader is user-defined and it has its own copy of
-    // SpringExtension already loaded, invoke on THAT exact ClassId;
-    // otherwise fall through to the existing, unchanged global behavior.
+    // instead via the shared helper above; falls through to the existing,
+    // unchanged global behavior when there's no fork-loaded copy.
+    let extension_context_for_test_class = extension_context;
     if let Ok(Some(Value::Object(Some(test_class)))) = ctx.invoke_virtual(
-        extension_context,
+        extension_context_for_test_class,
         "getRequiredTestClass",
         "()Ljava/lang/Class;",
         &[],
     ) {
-        if let Some(test_class_id) = crate::lang_class::mirror_class_id(ctx, test_class) {
-            let loader_id = ctx.loader_id_of_class(test_class_id);
-            if loader_id >= 3 {
-                if let Some(fork_class_id) =
-                    ctx.class_id_defined_by_loader_exact(SPRING_EXTENSION, loader_id as u32)
-                {
-                    return ctx.invoke_by_class_id(
-                        fork_class_id,
-                        SPRING_EXTENSION,
-                        "getApplicationContext",
-                        GET_APP_CTX_DESC,
-                        &[Value::Object(Some(extension_context))],
-                    );
-                }
-            }
-        }
+        return spring_extension_invoke_special_anchored_on_test_class(
+            ctx,
+            SPRING_EXTENSION,
+            "getApplicationContext",
+            GET_APP_CTX_DESC,
+            test_class,
+            &[Value::Object(Some(extension_context))],
+        );
     }
 
     ctx.invoke_special(
@@ -8184,7 +8214,6 @@ fn spring_extension_get_application_context(
         &[Value::Object(Some(extension_context))],
     )
 }
-
 fn native_spring_extension_resolve_parameter(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -8233,10 +8262,12 @@ fn native_spring_extension_resolve_parameter(
             ctx.invoke_virtual(executable, "getDeclaringClass", "()Ljava/lang/Class;", &[])
         {
             test_class = declaring;
-            if let Ok(Some(Value::Object(Some(scoped)))) = ctx.invoke_special(
+            if let Ok(Some(Value::Object(Some(scoped)))) = spring_extension_invoke_special_anchored_on_test_class(
+                ctx,
                 "org/springframework/test/context/junit/jupiter/SpringExtension",
                 "findProperlyScopedExtensionContext",
                 "(Ljava/lang/Class;Lorg/junit/jupiter/api/extension/ExtensionContext;)Lorg/junit/jupiter/api/extension/ExtensionContext;",
+                test_class,
                 &[
                     Value::Object(Some(test_class)),
                     Value::Object(Some(extension_context)),
