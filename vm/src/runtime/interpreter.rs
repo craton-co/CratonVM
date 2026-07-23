@@ -10500,6 +10500,43 @@ pub(crate) fn push_frame_and_fire_entry(thread: &mut JvmThread, frame: Frame) {
             }
         }
     }
+    // TEMP DIAGNOSTIC (CRATONVM_DBG_DUPCALL_FILTER, 2026-07-23, WFLYCTL0079
+    // investigation): "An attribute named 'hornetq-store-enable-async-io'
+    // is already registered at location '/subsystem=transactions'" fires
+    // ~1/1600 WildFly boots from inside
+    // ParallelExtensionAddHandler$ExtensionInitializeTask.call(), which
+    // decompiled bytecode shows invokes `ExtensionAddHandler.
+    // initializeExtension(module, ...)` exactly once per task instance —
+    // each extension gets exactly one task submitted to the boot executor.
+    // A single-threaded, deterministic registration bug inside WildFly
+    // would fail EVERY boot, not ~1/1600, so the leading hypothesis is
+    // that the SAME task object's `call()` is somehow entered twice (an
+    // executor/queue double-dispatch race) rather than a WildFly-side
+    // logic bug. This is directly testable: log (receiver identity,
+    // thread, entry ordinal) on every entry to this one method and see if
+    // the same receiver address appears twice. Filtered by exact class
+    // name (not a substring) since this must be cheap enough to run a
+    // multi-hundred-boot campaign with it always on.
+    if crate::runtime::env_cache::dbg_dupcall_filter() {
+        let last = thread.frames.len() - 1;
+        let frame_ref = &thread.frames[last];
+        if frame_ref.method_name() == "call"
+            && frame_ref.class_name()
+                == "org/jboss/as/controller/extension/ParallelExtensionAddHandler$ExtensionInitializeTask"
+        {
+            let recv = frame_ref.get_local(0);
+            let recv_addr = match recv {
+                Value::Object(Some(o)) => o.as_ptr() as usize,
+                _ => 0,
+            };
+            static ORDINAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let ord = ORDINAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            eprintln!(
+                "[DUPCALL] #{ord} ExtensionInitializeTask.call() recv=0x{recv_addr:x} tid={}",
+                thread.thread_id.0,
+            );
+        }
+    }
 }
 
 /// Best-effort JVMS opcode mnemonic + trailing-operand-byte-count lookup,

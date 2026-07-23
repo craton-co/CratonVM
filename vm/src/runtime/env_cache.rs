@@ -657,6 +657,15 @@ cached_is_set!(dbg_hotpath_counts, "CRATONVM_DBG_HOTPATH_COUNTS");
 /// runtime and have no static `.class` file `javap` can decompile.
 cached_is_set!(dbg_bytecode_dump, "CRATONVM_DBG_BYTECODE_DUMP");
 
+/// `CRATONVM_DBG_DUPCALL_FILTER` -- temporary double-invocation trace
+/// (2026-07-23, WFLYCTL0079 investigation): see `push_frame_and_fire_entry`'s
+/// own doc comment. Logs every entry to
+/// `ParallelExtensionAddHandler$ExtensionInitializeTask.call()` with the
+/// receiver's identity, to test whether the boot executor ever double-
+/// dispatches the same task (which would explain the rare "attribute
+/// already registered" duplicate-registration failure).
+cached_is_set!(dbg_dupcall_filter, "CRATONVM_DBG_DUPCALL_FILTER");
+
 // ── Flags read via `env::var(...).is_ok()` ──────────────────────────────
 
 /// `CRATONVM_NO_LOCAL_LIVENESS` — disable the per-bci local-variable
