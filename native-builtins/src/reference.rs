@@ -222,6 +222,22 @@ fn ref_init_impl(ctx: &mut dyn NativeContext, args: &[Value], has_queue: bool) {
         _ => return,
     };
     let referent = args.get(1).cloned().unwrap_or(Value::Object(None));
+    let class_id = ctx.class_id_of_object(this);
+    if ctx
+        .resolve_field_index_by_class_id(class_id, "referent")
+        .is_some()
+    {
+        // Real JDK Reference declares queue/next/discovered/referent in a
+        // different order than the synthetic two-slot runtime object.
+        ctx.set_field_by_name(this, "referent", referent);
+        let queue = if has_queue {
+            args.get(2).cloned().unwrap_or(Value::Object(None))
+        } else {
+            Value::Object(None)
+        };
+        ctx.set_field_by_name(this, "queue", queue);
+        return;
+    }
     ctx.set_field(this, REF_FIELD_REFERENT, referent);
     if has_queue {
         let queue = args.get(2).cloned().unwrap_or(Value::Object(None));
@@ -371,31 +387,78 @@ fn native_ref_enqueue(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let queue = ctx.get_field(this, REF_FIELD_QUEUE);
-    match queue {
-        Value::Object(Some(q)) => {
-            // JDK 9+ semantics: `enqueue()` clears the referent before
-            // adding to the queue.
-            ctx.set_field(this, REF_FIELD_REFERENT, Value::Object(None));
-            // Push this reference onto the queue's linked list head,
-            // linked through the `next` slot (see `ref_next_slot` — NOT
-            // the referent, which must keep reading null after enqueue).
-            let old_head = ctx.get_field(q, RQ_FIELD_HEAD);
-            ctx.set_field(q, RQ_FIELD_HEAD, Value::Object(Some(this)));
-            let next_slot = ref_next_slot(ctx, this);
-            ctx.set_field(this, next_slot, old_head);
-            // Increment size
-            let size = match ctx.get_field(q, RQ_FIELD_SIZE) {
-                Value::Int(v) => v,
-                _ => 0,
+    let this_pin = ctx.pin_native_root(this);
+    let result = (|| -> MethodCallResult {
+        let this = ctx.read_native_pin(this_pin, this);
+        // Real JDK Reference uses declared queue/next/discovered/referent
+        // fields and ReferenceQueue.enqueue() owns its locking, queueLength,
+        // and self-link rules. Do not splice it with the two-slot synthetic
+        // model: that can place a bare Object in poll0()'s Reference.next.
+        let real_layout = ctx
+            .resolve_field_index_by_class_id(ctx.class_id_of_object(this), "referent")
+            .is_some();
+        if real_layout {
+            let queue = ctx.get_field_by_name(this, "queue");
+            let Value::Object(Some(queue)) = queue else {
+                return Ok(Some(Value::Int(0)));
             };
-            ctx.set_field(q, RQ_FIELD_SIZE, Value::Int(size + 1));
-            // Mark as enqueued — sentinel Int(1) distinguishes from "never had queue"
-            ctx.set_field(this, REF_FIELD_QUEUE, Value::Int(1));
-            Ok(Some(Value::Int(1)))
+            let queue_pin = ctx.pin_native_root(queue);
+            let result = (|| -> MethodCallResult {
+                let this = ctx.read_native_pin(this_pin, this);
+                ctx.set_field_by_name(this, "referent", Value::Object(None));
+                let queue = ctx.read_native_pin(queue_pin, queue);
+                ctx.invoke_special(
+                    "java/lang/ref/ReferenceQueue",
+                    "enqueue",
+                    "(Ljava/lang/ref/Reference;)Z",
+                    &[Value::Object(Some(queue)), Value::Object(Some(this))],
+                )
+            })();
+            ctx.unpin_native_roots(queue_pin);
+            return result;
         }
-        _ => Ok(Some(Value::Int(0))), // no queue attached
-    }
+        let queue = ctx.get_field(this, REF_FIELD_QUEUE);
+        match queue {
+            Value::Object(Some(q)) => {
+                let queue_pin = ctx.pin_native_root(q);
+                let result = (|| -> MethodCallResult {
+                    // `ref_next_slot` can resolve/load metadata. Root both
+                    // participants and resolve it before loading old_head, so
+                    // no unrooted queue-link value crosses that GC-capable call.
+                    let this = ctx.read_native_pin(this_pin, this);
+                    let next_slot = ref_next_slot(ctx, this);
+                    let this = ctx.read_native_pin(this_pin, this);
+                    let q = ctx.read_native_pin(queue_pin, q);
+                    // JDK 9+ semantics: enqueue() clears the referent before
+                    // adding to the queue.
+                    ctx.set_field(this, REF_FIELD_REFERENT, Value::Object(None));
+                    let old_head = ctx.get_field(q, RQ_FIELD_HEAD);
+                    let q = ctx.read_native_pin(queue_pin, q);
+                    let this = ctx.read_native_pin(this_pin, this);
+                    ctx.set_field(q, RQ_FIELD_HEAD, Value::Object(Some(this)));
+                    let this = ctx.read_native_pin(this_pin, this);
+                    ctx.set_field(this, next_slot, old_head);
+                    let q = ctx.read_native_pin(queue_pin, q);
+                    let size = match ctx.get_field(q, RQ_FIELD_SIZE) {
+                        Value::Int(v) => v,
+                        _ => 0,
+                    };
+                    let q = ctx.read_native_pin(queue_pin, q);
+                    ctx.set_field(q, RQ_FIELD_SIZE, Value::Int(size + 1));
+                    let this = ctx.read_native_pin(this_pin, this);
+                    // Mark as enqueued — sentinel Int(1) distinguishes from
+                    // never having had a queue.
+                    ctx.set_field(this, REF_FIELD_QUEUE, Value::Int(1));
+                    Ok(Some(Value::Int(1)))
+                })();
+                ctx.unpin_native_roots(queue_pin);
+                result
+            }
+            _ => Ok(Some(Value::Int(0))), // no queue attached
+        }
+    })();
+    ctx.unpin_native_roots(this_pin);
+    result
 }
 
 fn native_ref_is_enqueued(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -455,98 +518,101 @@ fn native_rq_poll(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    // avrora `get_field` OOB fix: `ReferenceQueue.remove(timeout)` parks the
-    // JDK Common Cleaner thread in a 60 s native poll loop, holding `this` as a
-    // raw `ObjectRef` snapshot. A moving young GC that runs while the thread is
-    // blocked relocates the queue, but this thread is excluded from the STW
-    // barrier and never applies the pointer map to its raw `this`; the young
-    // allocator then reuses the stale from-space slot for a bare
-    // `java.lang.Object`. Reading `RQ_FIELD_HEAD`/`SIZE` off that 0-field object
-    // tripped the `gen_heap` out-of-bounds guard tens of thousands of times per
-    // run (the guard already returned `null`, so `poll()` already behaved as
-    // "empty" — this only suppresses the warning by detecting the reclaimed
-    // receiver up front). A real (live) queue always carries its head/size
-    // slots, so a receiver with fewer than two fields cannot be one; treat it
-    // as empty rather than dereferencing past its layout. The blocked thread
-    // re-reads the live queue from its (eventually remapped) frame on a later
-    // `remove()` invocation, so this is graceful degradation, not data loss.
-    if ctx.object_num_fields(this) < 2 {
-        return Ok(Some(Value::Object(None)));
-    }
-    let head = ctx.get_field(this, RQ_FIELD_HEAD);
-    match head {
-        Value::Object(Some(ref_obj)) => {
-            // Pop from linked list — linked through the `next` slot (or the
-            // legacy referent-slot fallback; see `ref_next_slot`).
-            let next_slot = ref_next_slot(ctx, ref_obj);
-            let next = ctx.get_field(ref_obj, next_slot);
-            ctx.set_field(this, RQ_FIELD_HEAD, next);
-            // Detach the popped reference from the list and clear its
-            // enqueued state (JDK: poll sets queue = null, so isEnqueued()
-            // reads false afterwards). The referent stays whatever it was —
-            // null for GC-cleared/enqueued references.
-            ctx.set_field(ref_obj, next_slot, Value::Object(None));
-            ctx.set_field(ref_obj, REF_FIELD_QUEUE, Value::Object(None));
-            // Decrement size
-            let size = match ctx.get_field(this, RQ_FIELD_SIZE) {
-                Value::Int(v) => v,
-                _ => 0,
-            };
-            ctx.set_field(this, RQ_FIELD_SIZE, Value::Int((size - 1).max(0)));
-            Ok(Some(Value::Object(Some(ref_obj))))
+    // `ReferenceQueue.remove(timeout)` can resume after a moving collection;
+    // furthermore resolving Reference.next can allocate/load metadata. Root
+    // both the queue and the dequeued reference, then reload each before every
+    // field access in the linked-list update.
+    let this_pin = ctx.pin_native_root(this);
+    let result = (|| -> MethodCallResult {
+        let this = ctx.read_native_pin(this_pin, this);
+        if ctx.object_num_fields(this) < 2 {
+            return Ok(Some(Value::Object(None)));
         }
-        _ => Ok(Some(Value::Object(None))),
-    }
+        let head = ctx.get_field(this, RQ_FIELD_HEAD);
+        match head {
+            Value::Object(Some(ref_obj)) => {
+                let ref_pin = ctx.pin_native_root(ref_obj);
+                let result = (|| -> MethodCallResult {
+                    // Pop from linked list — linked through the `next` slot
+                    // (or the legacy referent-slot fallback; see ref_next_slot).
+                    let ref_obj = ctx.read_native_pin(ref_pin, ref_obj);
+                    let next_slot = ref_next_slot(ctx, ref_obj);
+                    let ref_obj = ctx.read_native_pin(ref_pin, ref_obj);
+                    let next = ctx.get_field(ref_obj, next_slot);
+                    let this = ctx.read_native_pin(this_pin, this);
+                    ctx.set_field(this, RQ_FIELD_HEAD, next);
+                    // Detach the popped reference from the list and clear its
+                    // enqueued state (JDK: poll sets queue = null, so
+                    // isEnqueued() reads false afterwards).
+                    let ref_obj = ctx.read_native_pin(ref_pin, ref_obj);
+                    ctx.set_field(ref_obj, next_slot, Value::Object(None));
+                    let ref_obj = ctx.read_native_pin(ref_pin, ref_obj);
+                    ctx.set_field(ref_obj, REF_FIELD_QUEUE, Value::Object(None));
+                    let this = ctx.read_native_pin(this_pin, this);
+                    let size = match ctx.get_field(this, RQ_FIELD_SIZE) {
+                        Value::Int(v) => v,
+                        _ => 0,
+                    };
+                    let this = ctx.read_native_pin(this_pin, this);
+                    ctx.set_field(this, RQ_FIELD_SIZE, Value::Int((size - 1).max(0)));
+                    let ref_obj = ctx.read_native_pin(ref_pin, ref_obj);
+                    Ok(Some(Value::Object(Some(ref_obj))))
+                })();
+                ctx.unpin_native_roots(ref_pin);
+                result
+            }
+            _ => Ok(Some(Value::Object(None))),
+        }
+    })();
+    ctx.unpin_native_roots(this_pin);
+    result
 }
 
 fn native_rq_remove_blocking(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // Blocking remove: spin-wait with yield until an element is available.
     // Safety cap at 60 seconds to prevent true deadlock.
-    let _this = match args.first() {
+    let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
     let start = std::time::Instant::now();
     let timeout = std::time::Duration::from_secs(60);
-    // T19.H1 — this poll loop can spin for up to 60 s without ever
-    // reaching an interpreter safepoint (the JBoss/WildFly Reference
-    // Handler thread parks here for the whole process lifetime). Mark a
-    // blocking region so a concurrent stop-the-world GC does not
-    // deadlock waiting for this thread in `wait_for_all`.
-    //
-    // Stale-receiver fix (the H2 MVStore "compareAndSetRoot on null"
-    // writer): the poll must run OUTSIDE the blocked region. While
-    // blocked, this thread is excluded from the STW barrier, so a moving
-    // GC can relocate the queue mid-loop and the raw `args` receiver goes
-    // stale — `native_rq_poll` then splices head/referent/size fields
-    // through whatever live object recycled the address. Outside the
-    // region we are an expected mutator: a GC may START but cannot
-    // COMPLETE until we arrive (at the next region boundary), so `largs`
-    // cannot go stale mid-poll. The region is entered only around the
-    // yield, and `end_blocking_region_refs` re-syncs both the frames and
-    // our local arg copies against the GC fixup accumulated while parked.
-    let mut largs: Vec<Value> = args.to_vec();
-    // Exponential-backoff park (200µs → 10ms): the queue is usually empty
-    // (always, during bootstrap), and the JDK Reference Handler + Common
-    // Cleaner sit in this loop for the whole process lifetime. A hot
-    // yield-spin here costs a full core each AND a region-transition +
-    // root-snapshot deposit per iteration — measured as a ~10x bootstrap
-    // slowdown. Reference processing tolerates a ≤10ms wake (HotSpot
-    // blocks on a monitor here outright).
-    let mut backoff_us: u64 = 200;
-    loop {
-        let result = native_rq_poll(ctx, &largs)?;
-        if let Some(Value::Object(Some(_))) = result {
-            return Ok(result);
+    // Keep the receiver in the native root snapshot for the whole parked
+    // lifetime. `largs` is only a local copy: a moving GC can update it at a
+    // region boundary only after finding a rooted source reference. Reload the
+    // pin before every poll so the synthetic and real-JDK queue paths both see
+    // the post-GC queue object.
+    let queue_pin = ctx.pin_native_root(this);
+    let result = (|| -> MethodCallResult {
+        let mut largs: Vec<Value> = args.to_vec();
+        // Exponential-backoff park (200µs → 10ms): the queue is usually empty
+        // and long-lived cleaner/reference-handler threads must not yield-spin.
+        let mut backoff_us: u64 = 200;
+        loop {
+            // `end_blocking_region_refs` is the authoritative post-GC
+            // rewrite for locals captured before parking. Reading only the
+            // pin here can preserve an address from the deposit snapshot
+            // across a blocked young collection.
+            let this = match largs.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => ctx.read_native_pin(queue_pin, this),
+            };
+            largs[0] = Value::Object(Some(this));
+            let result = native_rq_poll(ctx, &largs)?;
+            if let Some(Value::Object(Some(_))) = result {
+                return Ok(result);
+            }
+            if start.elapsed() >= timeout {
+                return Ok(Some(Value::Object(None)));
+            }
+            ctx.begin_blocking_region();
+            std::thread::sleep(std::time::Duration::from_micros(backoff_us));
+            ctx.end_blocking_region_refs(&mut largs);
+            backoff_us = (backoff_us * 2).min(10_000);
         }
-        if start.elapsed() >= timeout {
-            return Ok(Some(Value::Object(None)));
-        }
-        ctx.begin_blocking_region();
-        std::thread::sleep(std::time::Duration::from_micros(backoff_us));
-        ctx.end_blocking_region_refs(&mut largs);
-        backoff_us = (backoff_us * 2).min(10_000);
-    }
+    })();
+    ctx.unpin_native_roots(queue_pin);
+    result
 }
 
 fn native_rq_remove_timeout(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -559,29 +625,42 @@ fn native_rq_remove_timeout(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     if timeout_ms == 0 {
         return native_rq_poll(ctx, args);
     }
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
     let start = std::time::Instant::now();
     let timeout = std::time::Duration::from_millis(timeout_ms);
-    // T19.H1 + stale-receiver fix — see `native_rq_remove_blocking`: poll
-    // outside the blocked region (an expected mutator cannot observe a GC
-    // completing mid-poll), park inside it only for the yield, and re-sync
-    // the local arg copies on every region exit. The JDK Common Cleaner
-    // parks here (`remove(60_000)`) for the whole process lifetime.
-    let mut largs: Vec<Value> = args.to_vec();
-    // Exponential-backoff park — see `native_rq_remove_blocking`.
-    let mut backoff_us: u64 = 200;
-    loop {
-        let result = native_rq_poll(ctx, &largs)?;
-        if let Some(Value::Object(Some(_))) = result {
-            return Ok(result);
+    // See `native_rq_remove_blocking`: the pin, rather than `largs`, is the
+    // stable root deposited while this native thread is outside the safepoint
+    // barrier. The Common Cleaner uses this overload for its entire lifetime.
+    let queue_pin = ctx.pin_native_root(this);
+    let result = (|| -> MethodCallResult {
+        let mut largs: Vec<Value> = args.to_vec();
+        let mut backoff_us: u64 = 200;
+        loop {
+            // See the blocking overload: use the wake-up rewrite, not the
+            // pre-park pin snapshot, as the next poll receiver.
+            let this = match largs.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => ctx.read_native_pin(queue_pin, this),
+            };
+            largs[0] = Value::Object(Some(this));
+            let result = native_rq_poll(ctx, &largs)?;
+            if let Some(Value::Object(Some(_))) = result {
+                return Ok(result);
+            }
+            if start.elapsed() >= timeout {
+                return Ok(Some(Value::Object(None)));
+            }
+            ctx.begin_blocking_region();
+            std::thread::sleep(std::time::Duration::from_micros(backoff_us));
+            ctx.end_blocking_region_refs(&mut largs);
+            backoff_us = (backoff_us * 2).min(10_000);
         }
-        if start.elapsed() >= timeout {
-            return Ok(Some(Value::Object(None)));
-        }
-        ctx.begin_blocking_region();
-        std::thread::sleep(std::time::Duration::from_micros(backoff_us));
-        ctx.end_blocking_region_refs(&mut largs);
-        backoff_us = (backoff_us * 2).min(10_000);
-    }
+    })();
+    ctx.unpin_native_roots(queue_pin);
+    result
 }
 
 // ---------------------------------------------------------------------------
