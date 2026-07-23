@@ -253,7 +253,7 @@ fn sock_default() -> SockSide {
     }
 }
 
-fn sock_get(ctx: &dyn NativeContext, this: ObjectRef) -> SockSide {
+pub(crate) fn sock_get(ctx: &dyn NativeContext, this: ObjectRef) -> SockSide {
     let t = sock_side_table().lock();
     t.get(&native_obj_key(ctx, this))
         .cloned()
@@ -6944,32 +6944,33 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
     // getHeaderFieldDate("last-modified", ...) shape used by Spring Boot's
     // JarUrlConnectionTests and NestedUrlConnectionTests.
     r.register(huc, "getLastModified", "()J", |ctx, args| {
-        let mut this = obj_arg(args, 0)?;
+        let this = obj_arg(args, 0)?;
         let url = huc_origin_url_string(ctx, this);
         let value = if url.starts_with("http://") || url.starts_with("https://") {
-            // A genuine HTTP(S) response's `Last-Modified` header was
-            // previously ignored entirely (always 0), breaking
-            // `UrlResource.lastModified()` for any real HTTP resource
-            // (`URLConnection.getLastModified()` -> `getHeaderFieldDate
-            // ("last-modified", 0)` in real JDK bytecode, but the synthetic
-            // huc's OWN `getLastModified` native short-circuits before that
-            // bytecode ever runs). Perform the request so the response
-            // headers are populated, then parse the real header.
-            //
-            // GC-SAFETY: `huc_perform` allocates heavily (headers array +
-            // one `String` per header + body byte[]); pin `this` across the
-            // call and re-read it before touching the receiver again --
-            // otherwise a moving GC during `huc_perform` leaves THIS local
-            // `this` stale even though `huc_perform` itself wrote the real
-            // (relocated) object correctly, and the header lookup below
-            // reads through the stale copy and always misses.
-            let pin = ctx.pin_native_root(this);
-            huc_perform(ctx, this)?;
-            this = ctx.read_native_pin(pin, this);
-            ctx.unpin_native_roots(pin);
-            huc_find_header_value(ctx, this, "last-modified")
-                .and_then(|v| parse_rfc1123_date_millis(&v))
-                .unwrap_or(0)
+            // This class has TWO independent native registrations for
+            // HttpURLConnection (see http_url_connection.rs) -- that one
+            // owns setRequestMethod/getHeaderField's actual dispatch, but
+            // this file's OWN huc_perform reads a separate HUC_METHOD
+            // field that setRequestMethod never populates when the other
+            // implementation wins. Calling huc_perform directly here
+            // silently sent GET instead of the caller's configured method
+            // and always returned 0 (ResourceTests.remoteResourceExists*).
+            // Delegate to getHeaderField (an ordinary virtual dispatch, so
+            // it always reaches whichever implementation actually wins)
+            // instead of duplicating the request logic.
+            let name = ctx.create_string("last-modified");
+            match ctx.invoke_virtual(
+                this,
+                "getHeaderField",
+                "(Ljava/lang/String;)Ljava/lang/String;",
+                &[Value::Object(Some(name))],
+            ) {
+                Ok(Some(Value::Object(Some(s)))) => ctx
+                    .read_string(s)
+                    .and_then(|v| parse_rfc1123_date_millis(&v))
+                    .unwrap_or(0),
+                _ => 0,
+            }
         } else {
             synthetic_resource_url_last_modified(&url)
         };
@@ -7006,14 +7007,21 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
             // Real HTTP(S) response: parse whatever the actual header says
             // (any date-valued header, not just last-modified -- matches
             // real `HttpURLConnection.getHeaderFieldDate`, which is generic).
-            // GC-SAFETY: see the identical pin/re-read in `getLastModified`
-            // above -- `huc_perform` can relocate `this`.
-            let pin = ctx.pin_native_root(this);
-            huc_perform(ctx, this)?;
-            this = ctx.read_native_pin(pin, this);
-            ctx.unpin_native_roots(pin);
-            let parsed = huc_find_header_value(ctx, this, &name)
-                .and_then(|v| parse_rfc1123_date_millis(&v));
+            // Delegate to getHeaderField -- see the sibling fix/comment in
+            // `getLastModified` above for why this file's own huc_perform
+            // must not be called directly here.
+            let name_obj = ctx.create_string(&name);
+            let parsed = match ctx.invoke_virtual(
+                this,
+                "getHeaderField",
+                "(Ljava/lang/String;)Ljava/lang/String;",
+                &[Value::Object(Some(name_obj))],
+            ) {
+                Ok(Some(Value::Object(Some(s)))) => {
+                    ctx.read_string(s).and_then(|v| parse_rfc1123_date_millis(&v))
+                }
+                _ => None,
+            };
             Ok(Some(Value::Long(parsed.unwrap_or(fallback))))
         },
     );

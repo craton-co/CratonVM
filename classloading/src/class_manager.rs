@@ -6973,9 +6973,9 @@ fn jdk_interfaces(name: &str) -> &'static [&'static str] {
             "java/util/function/Function",
         ],
         "java/util/function/Consumer$AndThen" => &["java/util/function/Consumer"],
-        "java/util/function/Predicate$And"
-        | "java/util/function/Predicate$Or"
-        | "java/util/function/Predicate$Negate" => &["java/util/function/Predicate"],
+        "java/util/function/Predicate$$Lambda$And"
+        | "java/util/function/Predicate$$Lambda$Or"
+        | "java/util/function/Predicate$$Lambda$Negate" => &["java/util/function/Predicate"],
 
         // S111r17 — Our internal `AnnotationProxy` must declare
         // `java.lang.annotation.Annotation` as a superinterface so that

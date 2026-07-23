@@ -11061,8 +11061,26 @@ pub(crate) fn register_phase52_server_socket_factory(r: &mut NativeMethodRegistr
         "()Ljava/net/SocketAddress;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let host = ctx.get_field(this, SOCK_HOST);
-            let port = ctx.get_field(this, SOCK_PORT);
+            // A ServerSocket.accept()-produced Socket (net_phase_e::
+            // re2_accept_into) never writes the raw SOCK_HOST/SOCK_PORT
+            // fields (a host String there would land on real JDK's
+            // Socket.impl slot, corrupting it) -- the real peer address
+            // is side-tabled instead. Falling straight to
+            // InetSocketAddress(String,int) with the raw (null) field
+            // threw an NPE for every accepted connection (e.g.
+            // MockWebServer's serveConnection, breaking
+            // core.io.ResourceTests). Fall back to the side table when
+            // the raw field is unset.
+            let side = crate::net_phase_e::sock_get(ctx, this);
+            let host = match ctx.get_field(this, SOCK_HOST) {
+                h @ Value::Object(Some(_)) => h,
+                _ if !side.host.is_empty() => Value::Object(Some(ctx.create_string(&side.host))),
+                _ => Value::Object(Some(ctx.create_string("0.0.0.0"))),
+            };
+            let port = match ctx.get_field(this, SOCK_PORT) {
+                p @ Value::Int(v) if v != 0 => p,
+                _ => Value::Int(side.port),
+            };
             ctx.new_object_initialized(
                 "java/net/InetSocketAddress",
                 "(Ljava/lang/String;I)V",
@@ -15191,8 +15209,21 @@ pub(crate) fn register_phase53_socket_stubs(r: &mut NativeMethodRegistry) {
         "()Ljava/net/SocketAddress;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let host = ctx.get_field(this, SOCK_HOST);
-            let port = ctx.get_field(this, SOCK_PORT);
+            // See the sibling registration in
+            // register_phase52_server_socket_factory (same class, shadowed
+            // by whichever of the two registers last): an accepted
+            // Socket's real peer address lives only in net_phase_e's side
+            // table, never the raw field.
+            let side = crate::net_phase_e::sock_get(ctx, this);
+            let host = match ctx.get_field(this, SOCK_HOST) {
+                h @ Value::Object(Some(_)) => h,
+                _ if !side.host.is_empty() => Value::Object(Some(ctx.create_string(&side.host))),
+                _ => Value::Object(Some(ctx.create_string("0.0.0.0"))),
+            };
+            let port = match ctx.get_field(this, SOCK_PORT) {
+                p @ Value::Int(v) if v != 0 => p,
+                _ => Value::Int(side.port),
+            };
             ctx.new_object_initialized(
                 "java/net/InetSocketAddress",
                 "(Ljava/lang/String;I)V",

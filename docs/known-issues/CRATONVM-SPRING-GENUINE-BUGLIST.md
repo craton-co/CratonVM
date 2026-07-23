@@ -389,14 +389,119 @@ budget — flagged for a dedicated follow-up):
 - **`test.context.bean.override.mockito.MockitoBeanByTypeLookupIntegrationTests`
   + the sibling `.constructor.MockitoBeanByTypeLookupForConstructorParametersIntegrationTests`**
   (3/5 and 4/6 — same 2 method names fail identically in both, one shared
-  root cause). A Mockito-mocked `StringBuilder` (final class, inline mock
-  maker) correctly answers `length()`/`isEmpty()`-style calls but
-  `.substring(0)` returns `""` instead of Mockito's default-answer `null`
-  — `substring` isn't being intercepted at all (falls through to real,
-  empty-buffer bytecode). Likely the same family as this repo's other
-  documented Mockito inline-redefine gaps (redefine only covering the
-  concrete mocked class's own declared methods, missing ones inherited from
-  `java.lang.AbstractStringBuilder`).
+  root cause) — **2026-07-23 session: root-caused precisely, one real
+  sub-bug found+fixed+merged (dev `45e2757d2`), the actual blocker is a
+  DIFFERENT, still-open interpreter defect.** `Mockito.mock(StringBuilder
+  .class)` (final class, inline mock maker) redefines BOTH `StringBuilder`
+  AND its package-private superclass `AbstractStringBuilder` in place (two
+  separate `Instrumentation.redefineClasses` calls — confirmed via
+  redefine tracing). `.substring(0)` returns `""` instead of Mockito's
+  default-answer `null`, with **zero recorded invocations** — earlier
+  "not being intercepted at all" was imprecise; it *is* dispatched to the
+  correctly-redefined, woven `AbstractStringBuilder.substring(int)`
+  bytecode (proven: CratonVM's own native is never invoked, confirmed via
+  an env-gated eprintln that never fires), but that woven method's own
+  Mockito-generated advice preamble (`get()` → `isMocked()` →
+  `isOverridden()` → conditionally `handle()`) takes the wrong branch.
+  `get()` finds the correct, non-null dispatcher (verified: same object,
+  same identifier string content/coder/layout as the registration).
+  `isMocked()` correctly returns `true`. **`isOverridden(mockInstance,
+  AbstractStringBuilder.substring(int))` incorrectly returns `true`**
+  (HotSpot: `false`) — this single wrong boolean is what causes the woven
+  method to skip calling Mockito's `handle()` and instead run the real
+  computation on the mock's zero-initialized fields, producing `""`.
+
+  Found and fixed one real, independently-verified bug in the process:
+  `Class.getDeclaredMethods()` mis-paired bridge methods to the FIRST
+  same-named non-bridge sibling instead of the one it actually bridges
+  (matched by parameter types) — wrong for any class where an overloaded
+  name has both non-bridge overloads AND unrelated bridges (e.g.
+  `AbstractStringBuilder.append`'s 14 real overloads plus 3 unrelated
+  `Appendable`-interface bridges). Fixed in
+  `native-builtins/src/lang_class.rs::native_class_get_declared_methods`
+  (dev `45e2757d2`, 3079 native-builtins unit tests pass, verified against
+  HotSpot for both this class and a generic covariant-bridge case). This
+  fix is real and worth keeping, but landing it alone does **not** flip
+  `isOverridden`'s answer.
+
+  **What's been conclusively ruled out** for the `isOverridden` divergence
+  (each verified with a dedicated, minimal repro comparing CratonVM vs
+  HotSpot on the actual JDK25 classes, not a synthetic stand-in):
+  redefine-dispatch choosing native over bytecode (ruled out directly —
+  the native never fires); duplicate `ClassId`s for `MockMethodDispatcher`
+  or `AbstractStringBuilder` (single, stable `ClassId` throughout, via
+  `redefine_class`'s own entry/method-order tracing); identifier string
+  mismatch (byte-identical content, coder, LATIN1 layout at both `set()`
+  and both `get()` sites); `<clinit>` re-running / `DISPATCHERS` map
+  getting wiped (initializes exactly once, confirmed via a fast-path
+  tracer); cross-thread visibility bug (single thread throughout);
+  `Class.getModifiers()`/bridge/synthetic flags for `AbstractStringBuilder`
+  or `StringBuilder.substring` (byte-identical to HotSpot); `getSuperclass
+  ()`/`getGenericSuperclass()`/`getGenericInterfaces()` chain (identical);
+  `Method.equals()`/`hashCode()` for two separately-obtained `Method`
+  objects for the same method (identical); `AbstractStringBuilder.class`
+  resolving to two different objects via `getSuperclass()` vs
+  `Class.forName()` post-redefine (same object, same identity hash);
+  Mockito's own graph cache serving a stale/early snapshot (confirmed
+  empty immediately after `mock()` returns — first-ever computation
+  happens later, inside the actual `substring(0)` call); JIT
+  miscompilation (`--nojit` reproduces identically); a swallowed exception
+  inside the advice preamble (confirmed zero `Throwable` constructions
+  during the whole `substring(0)` call via a `fillInStackTrace`-native
+  tracer); `MethodGraph.Compiler.Default.forJavaHierarchy()`'s own
+  algorithm being order-sensitive in a way that matters here (a stable
+  sort-by-descriptor experiment did not change the outcome).
+
+  **The critical, still-unexplained finding**: manually replicating
+  `isOverridden`'s entire documented algorithm step-by-step in plain Java
+  — reading the *exact same* `compiler` field off the *exact same*
+  dispatcher instance via reflection, compiling the graph for the *exact
+  same* `mock.getClass()`, locating the *exact same* signature token, and
+  calling `TypeDescription.represents(Class)` on the resulting
+  representative's declaring type — correctly resolves to
+  `AbstractStringBuilder` (`represents() == true`, which per
+  `isOverridden`'s own bytecode should make it return `false`, matching
+  HotSpot). Yet calling the REAL `dispatcher.isOverridden(mock, origin)`
+  method (via reflection, same dispatcher, same mock, same origin,
+  immediately afterward, repeated 3x with identical results) returns
+  `true` every time. **This means every documented input and every API
+  `isOverridden()` calls behaves correctly when exercised directly — the
+  divergence is isolated to CratonVM's interpretation of `isOverridden`'s
+  own ~146-byte method body** (`checkcast` + `invokeinterface` +
+  wide-indexed local slots 4/5 + a `WeakConcurrentMap`/`SoftReference`
+  cache-then-compute shape). Simpler micro-probes replicating individual
+  fragments of this shape (`invokestatic`→`astore`→`aload`→`ifnull`;
+  `invokevirtual`/`invokeinterface` boolean →`ifeq`/`ifne`; the exact
+  `if_acmpne`-against-a-static-field sentinel check inside
+  `MockMethodDispatcher.get()` itself) all pass in isolation on CratonVM —
+  the bug needs the FULL, specific instruction sequence and/or execution
+  context to manifest. Recommended next step for whoever continues:
+  **instruction-level PC tracing of `isOverridden`'s own execution**
+  (log every opcode + top-of-stack while `frame.class_name()`==
+  `"org/mockito/internal/creation/bytebuddy/MockMethodAdvice"` &&
+  `frame.method_name()`==`"isOverridden"`) to find exactly which
+  instruction's result diverges from a manual byte-for-byte trace of the
+  same method; also worth checking whether this specific class uses
+  the interpreter's "fast path" (`class_disables_interp_fast_path`,
+  `vm/src/runtime/frame.rs`) — `org/mockito/**` does not match any of its
+  JDK/Spring prefixes, so it takes the fast path (documented as "tuned for
+  synthetic bytecode", `pop_unchecked`-based) rather than the slower,
+  more defensive path JDK classes get; forcing this one method onto the
+  slow path (or a targeted `--nojit`-style env override) would cheaply
+  test that theory without needing the full PC trace.
+
+  Investigation artifacts (Azure host, `/data/tmp/mockitobean-substring-
+  20260723/`): ~25 standalone `*Probe*.java` repros (`SbMockProbe2`
+  through `SbMockProbe8`, `GraphProbe` through `GraphProbe5`,
+  `AcmpProbe`, `IfNullProbe`/`IfNullProbe2`, `IfEqProbe`, `IfNeProbe`,
+  `LdcWProbe`, `ModProbe`, `OrderProbe`/`OrderProbe2`, `GenProbe`,
+  `MethodEqProbe`, `ClassIdProbe`, `BridgeRegress`, `PlainMockProbe`),
+  each runnable directly against `/data/wt-mockitobean-20260723/target/
+  release/cratonvm --java-home /data/jdk25-real-20260717/jdk-25.0.3+9`.
+  Worktree `/data/wt-mockitobean-20260723` (branch
+  `fix/mockitobean-substring-20260723`, pushed) still has the bridge-fix
+  commit; all temporary Rust-side `eprintln!` diagnostics used during the
+  investigation were reverted before merging (none landed on dev).
 - **`test.context.junit.jupiter.event.ParallelApplicationEventsIntegrationTests`**
   (0/2) — `executeTestsInParallelWithInstancePerMethod` fails an AssertJ
   `MultipleFailuresError` ("Test Event Statistics", 2 failures);
@@ -1686,3 +1791,103 @@ GroovySystem's clinit is reached at all during plain JUnit discovery of a
 Spring Framework test class with no declared Groovy dependency). Flag as a
 NEW, distinct blocker for whoever continues -- do not conflate with the
 already-closed loader-identity family above.
+
+
+## 2026-07-23 AOT follow-up 5 -- double-context-refresh ROOT-CAUSED AND FIXED
+
+Same session as follow-up 4, continuing directly from its refuted
+hypotheses. Worktree `/data/wt-aot-junitstore-20260723` (branch
+`fix/aot-junitstore-20260723`). No subagents used, per this task's standing
+instruction.
+
+**Method**: since every externally-observable input to
+`DefaultCacheAwareContextLoaderDelegate`'s cache-hit decision was already
+proven stable (follow-up 4), the delegate itself was wrapped directly.
+Subclassed `DefaultTestContextBootstrapper`, overrode
+`getCacheAwareContextLoaderDelegate()` to return a logging wrapper around the
+real delegate, and registered it via `@BootstrapWith(LoggingBootstrapper.class)`
+on the `BeanOverrideProbe2` fixture (own new probe file, not the shared
+`spring-framework-recheck` checkout). **Every single `loadContext`/
+`isContextLoaded` call for the entire run returned the SAME correct
+`ApplicationContext`** -- yet `Probe.setBeanFactory` still fired twice with
+two different `BeanFactory` identities. This proves the second, wrong
+context is never routed through `CacheAwareContextLoaderDelegate` at all.
+
+Widening the probe's own stack-trace capture (6 to 60 frames) for the wrong
+`bean1()` call showed the full chain ending in:
+```
+DefaultCacheAwareContextLoaderDelegate.loadContext   <- the RAW class, not the wrapper
+DefaultTestContext.getApplicationContext
+SpringExtension.getApplicationContext
+ParameterResolutionUtils.resolveParameter
+```
+-- i.e. a genuinely SECOND, independent `TestContext`/`TestContextManager`
+that never went through the wrapped bootstrapper (confirmed:
+`getCacheAwareContextLoaderDelegate()` printed only 3 times all run, none
+near this second construction). `CRATONVM_DBG_DUPCLASS=1
+CRATONVM_DBG_DUPCLASS_BT=1` then showed a correlated rejection cluster for
+EXACTLY `SpringExtension`, `TestContextManager`, `BootstrapUtils`,
+`DefaultTestContextBootstrapper`/`AbstractTestContextBootstrapper`/
+`TestContextBootstrapper` -- all "a SEPARATE ClassId will be created under
+Application" -- with the `TestContextManager` rejection's backtrace bottoming
+out in `native-builtins/src/lib.rs`'s `spring_extension_get_application_context`
+/`native_spring_extension_resolve_parameter`, NOT real Spring bytecode.
+
+**Root cause**: `SpringExtension.resolveParameter` is intercepted by a
+single, globally-registered native override
+(`native_spring_extension_resolve_parameter`). Its helper,
+`spring_extension_get_application_context`, invoked the real
+`SpringExtension.getApplicationContext(ExtensionContext)` bytecode via
+`ctx.invoke_special("org/springframework/test/context/junit/jupiter/SpringExtension", ...)`
+-- a NAME-based lookup with no `referencing_class_id` (this native trampoline
+has no bytecode frame of its own to derive one from), so class resolution
+fell through to the ordinary loader-BLIND `load_class_concurrent` path, which
+(per its long-documented behavior) prefers the Application-loader copy
+whenever the delegation chain can also serve the name. Under
+`@CompileWithForkedClassLoader`, the fork has its OWN already-loaded copy of
+`SpringExtension` -- but this native ignored it and always resolved a fresh
+Application-loader copy. Since `SpringExtension.getTestContextManager` keys
+its JUnit `ExtensionContext.Store` lookup on `Namespace.create(SpringExtension.class)`
+(identity-based), the wrong copy's `Class` object is a different `Namespace`
+identity, so `store.computeIfAbsent(testClass, TestContextManager::new, ...)`
+misses and builds a SECOND, independent `TestContextManager` with its own
+un-customized `ApplicationContext` (`BeanOverrideContextCustomizer` never
+ran for it) -- exactly the context that ends up bound to the `@Test`
+method's `ApplicationContext`-typed parameter, since parameter resolution is
+precisely where this native runs.
+
+**Fix**: `spring_extension_get_application_context` now resolves the
+current test class (`extension_context.getRequiredTestClass()`), its
+`ClassId` (`lang_class::mirror_class_id`), and that class's defining loader
+(`ctx.loader_id_of_class`). If that loader is user-defined
+(`loader_id >= 3`) and it has already loaded its own copy of
+`SpringExtension` (`ctx.class_id_defined_by_loader_exact`), invokes
+`getApplicationContext` on THAT exact `ClassId` via `ctx.invoke_by_class_id`
+instead. Falls through unchanged to the original by-name `invoke_special`
+in every other case -- purely additive, zero behavior change for the vast
+majority of test classes that never use `@CompileWithForkedClassLoader`.
+
+**Verified**: the `BeanOverrideProbe2` fast repro now passes -- exactly ONE
+`Probe.setBeanFactory`/`afterSingletonsInstantiated` cycle fires (was two),
+the `@Test` method's `ApplicationContext` parameter resolves to the correct,
+customized context, `ctx.getBean("field")` and the injected `@TestBean`
+field both read `"fieldOverride"` (were `"prod"`/mismatched before this
+fix). `cargo test -p cratonvm-vm --lib --release`: **2229 passed / 11
+failed**, byte-identical to the documented pre-existing baseline (the
+`lock_order`/`skip_list`/`tomcat_scanner`/`elasticsearch_vector` family) --
+zero regressions.
+
+**Still open / not done this session**: re-running the FULL
+`AotIntegrationTests#endToEndTestsForBeanOverrides` 175-test suite (only the
+fast single-fixture repro was verified, not the full suite -- the mechanism
+is proven fixed but the aggregate pass count wasn't re-measured, needs a
+300-400s+ run); `ApplicationContextAotGeneratorTests`'s remaining 5
+CGLIB/duplicate-`ClassId` failures (confirmed unrelated to this fix, same
+"2026-07-21 late session" family, a different native/bytecode call site);
+`TestContextAotGeneratorIntegrationTests`'s `GroovySystem` clinit hang
+(unrelated, not root-caused); and a worthwhile follow-up audit of whether
+OTHER native trampolines that call `ctx.invoke_special`/`ctx.invoke` by name
+on Spring TestContext Framework classes have the same loader-blindness (this
+fix only touches the one call site that was actually proven to matter here).
+See `[[aot-double-refresh-springextension-loader-blind-fix]]` (memory) for
+the full diagnostic-by-diagnostic writeup.
