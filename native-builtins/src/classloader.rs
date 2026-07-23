@@ -1243,7 +1243,7 @@ fn loader_namespace_id_store() -> &'static Mutex<Vec<(ObjectRef, u32)>> {
 /// an identity-hash-keyed id (real-JDK mode). Used by `defineClass` to give a
 /// user loader its own namespace so an override-first redefinition of an
 /// already-loaded class does not collide with the original definer.
-pub(crate) fn loader_namespace_id(ctx: &mut dyn NativeContext, loader: ObjectRef) -> u32 {
+pub fn loader_namespace_id(ctx: &mut dyn NativeContext, loader: ObjectRef) -> u32 {
     if !is_user_defined_loader(ctx, loader) {
         return 0;
     }

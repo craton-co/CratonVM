@@ -690,6 +690,75 @@ fn stw_take_over_and_wait(
             warned = true;
         }
     }
+    // XT-FRAME-SCAN fix (2026-07-22, stw-residual-close): a frozen in-JIT
+    // peer's interpreter frames live in Rust Vecs (`JvmThread::frames`) —
+    // invisible to the conservative register/native-stack scan — and its
+    // deposited `root_snapshot` is only as fresh as its last publish
+    // (safepoint arrival, block-enter). Any ref pushed onto an interpreter
+    // operand stack (or stored into a local) after that publish and before
+    // entering compiled code was therefore missing from the mark roots for
+    // the whole frozen window, and the non-moving sweep zeroed the still-live
+    // object in place (WildFly parallel-extension-add: fresh
+    // StringBuilder/Reader receivers reading back all-zero — see
+    // docs/known-issues/interpreter-operand-stack-slot-stale-after-nested-alloc.md).
+    // Walk each frozen peer's interpreter frames directly into `xt_roots`.
+    //
+    // SAFETY: each address was published by its owning thread with the
+    // `tlab_addr` discipline (stable for the thread's life, cleared before
+    // the `JvmThread` drops), and the peer is OS-frozen with `Rip` inside
+    // registered compiled code (`take_over_pass` freezes nothing else).
+    // Compiled code never mutates the `JvmThread`'s interpreter state — the
+    // code paths that do (interpreter, JIT helpers) put `Rip` outside every
+    // registered range — and frozen peers are resumed only after the
+    // collection completes (`xt_root_scan::resume`), so the reference is
+    // dropped before any mutation can resume. A frozen thread also cannot
+    // exit, so the entry stays alive and the `JvmThread` cannot drop.
+    // Contributed roots go into `xt_roots`, which already forces the
+    // non-moving sweep (Generational) / region pinning (G1) for this cycle,
+    // so a stale or dead value can only over-retain — never relocate or
+    // corrupt.
+    if taken.count() > 0 {
+        let peer_addrs = shared.thread_registry.frozen_peer_thread_addrs(&taken.tids);
+        let contributed_from = xt_roots.len();
+        for addr in peer_addrs {
+            // SAFETY: see the block comment above.
+            let peer: &crate::threading::jvm_thread::JvmThread =
+                unsafe { &*(addr as *const crate::threading::jvm_thread::JvmThread) };
+            for frame in peer.frames.iter() {
+                frame.scan_local_objects(xt_roots, &shared.heap);
+                let sb = xt_roots.len();
+                frame.stack.scan_object_refs(xt_roots, &shared.heap);
+                if xt_roots.len() > sb {
+                    // Operand-stack candidates are validated strictly, exactly
+                    // like the deposit path (`scan_frame_roots`): a pointer-
+                    // shaped primitive long must not become a root.
+                    let added = xt_roots.split_off(sb);
+                    for o in added {
+                        if shared.heap.is_object_address(o.as_ptr() as usize).is_some() {
+                            xt_roots.push(o);
+                        }
+                    }
+                }
+                if let Some(m) = frame.monitor_on_exit {
+                    xt_roots.push(m);
+                }
+            }
+            for r in peer.native_pin_roots.iter() {
+                xt_roots.push(*r);
+            }
+            if let Some(r) = peer.native_pending_return {
+                xt_roots.push(r);
+            }
+        }
+        if std::env::var_os("CRATONVM_DBG_XT_JIT_ROOT_SCAN").is_some() {
+            eprintln!(
+                "[xt-frame-scan] frozen_peers={} contributed_roots={}",
+                taken.count(),
+                xt_roots.len() - contributed_from
+            );
+        }
+    }
+
     // A4 (fork6-fjp) — helper-window coverage. The barrier is satisfied, so
     // every remaining un-scanned root holder is a BLOCKED thread (excluded via
     // `threads_blocked`, covered only by its `deposit_root_snapshot`, which
@@ -788,6 +857,222 @@ fn pin_frozen_peer_roots_for_g1(
     {
         cratonvm_gc::gc_quiescence::add_pinned_jit_root(r.as_ptr() as usize);
     }
+}
+
+// stw-residual-close (CRATONVM_DBG_REMAP_TRACE): per-OS-thread debug rings.
+// (a) participation trace: one line per GC-relevant transition on this thread
+// (publish/deposit/arrive/apply/wake/initiator) with the top frame + pc and
+// the map/fixup size, so a stale-ref capture can reconstruct exactly how the
+// holder participated in the fatal epoch. (b) native-return ring: the last
+// object-returning natives and their returned addresses, so a capture can
+// name the producer of a stale value that was pushed from a Rust-side copy.
+pub(crate) fn remap_trace_on() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| std::env::var_os("CRATONVM_DBG_REMAP_TRACE").is_some())
+}
+
+thread_local! {
+    static REMAP_TRACE: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    static NRET_RING: std::cell::RefCell<Vec<(usize, usize, String)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    static GETFIELD_RING: std::cell::RefCell<Vec<(usize, usize, usize)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Record a reference-typed getfield push: (parent, field_index, pushed).
+thread_local! {
+    static DEPOSIT_GAP_RING: std::cell::RefCell<Vec<(usize, String)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// After a snapshot build, diff it against a RAW walk of the frames: ring
+/// every Object-decoding local/stack slot whose address the snapshot lacks.
+pub(crate) fn deposit_gap_diff(
+    thread: &JvmThread,
+    snapshot: &[crate::types::ObjectRef],
+    tag: &str,
+) {
+    if !remap_trace_on() {
+        return;
+    }
+    let have: std::collections::HashSet<usize> =
+        snapshot.iter().map(|o| o.as_ptr() as usize).collect();
+    DEPOSIT_GAP_RING.with(|ring| {
+        let mut ring = ring.borrow_mut();
+        for (fi, fr) in thread.frames.iter().enumerate() {
+            for li in 0..fr.locals_len() {
+                if let Value::Object(Some(o)) = fr.get_local(li as u16) {
+                    let a = o.as_ptr() as usize;
+                    if !have.contains(&a) {
+                        if ring.len() >= 512 {
+                            ring.drain(..128);
+                        }
+                        ring.push((
+                            a,
+                            format!(
+                                "{tag} local f#{fi} {}.{} pc={} slot={li}",
+                                fr.class_name(),
+                                fr.method_name(),
+                                fr.pc
+                            ),
+                        ));
+                    }
+                }
+            }
+            for si in 0..fr.stack.len() {
+                if let Value::Object(Some(o)) = fr.stack.peek_at(si) {
+                    let a = o.as_ptr() as usize;
+                    if !have.contains(&a) {
+                        if ring.len() >= 512 {
+                            ring.drain(..128);
+                        }
+                        ring.push((
+                            a,
+                            format!(
+                                "{tag} stack f#{fi} {}.{} pc={} slot={si}",
+                                fr.class_name(),
+                                fr.method_name(),
+                                fr.pc
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+    });
+}
+
+thread_local! {
+    static PUSH_PROV_RING: std::cell::RefCell<Vec<(usize, String)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Record an invoke-return Object push with its call-site description.
+pub(crate) fn push_prov_record(addr: usize, site: &str) {
+    if !remap_trace_on() {
+        return;
+    }
+    PUSH_PROV_RING.with(|r| {
+        let mut r = r.borrow_mut();
+        if r.len() >= 128 {
+            r.drain(..32);
+        }
+        r.push((addr, site.to_string()));
+    });
+}
+
+/// Probe recent invoke-return pushes for `addr`: (pushes-ago, site).
+pub(crate) fn push_prov_find(addr: usize) -> Vec<(usize, String)> {
+    PUSH_PROV_RING.with(|r| {
+        let r = r.borrow();
+        let n = r.len();
+        r.iter()
+            .enumerate()
+            .filter(|(_, (a, _))| *a == addr)
+            .map(|(i, (_, s))| (n - i, s.clone()))
+            .collect()
+    })
+}
+
+/// Probe the deposit-gap ring for `addr`: (entries-ago, description).
+pub(crate) fn deposit_gap_find(addr: usize) -> Vec<(usize, String)> {
+    DEPOSIT_GAP_RING.with(|r| {
+        let r = r.borrow();
+        let n = r.len();
+        r.iter()
+            .enumerate()
+            .filter(|(_, (a, _))| *a == addr)
+            .map(|(i, (_, d))| (n - i, d.clone()))
+            .collect()
+    })
+}
+
+pub(crate) fn getfield_ring_record(parent: usize, idx: usize, pushed: usize) {
+    if !remap_trace_on() {
+        return;
+    }
+    GETFIELD_RING.with(|r| {
+        let mut r = r.borrow_mut();
+        if r.len() >= 96 {
+            r.remove(0);
+        }
+        r.push((parent, idx, pushed));
+    });
+}
+
+/// Find `addr` among recent reference getfield pushes:
+/// (pushes-ago, parent, field_index).
+pub(crate) fn getfield_ring_find(addr: usize) -> Vec<(usize, usize, usize)> {
+    GETFIELD_RING.with(|r| {
+        let r = r.borrow();
+        let n = r.len();
+        r.iter()
+            .enumerate()
+            .filter(|(_, (_, _, a))| *a == addr)
+            .map(|(i, (p, f, _))| (n - i, *p, *f))
+            .collect()
+    })
+}
+
+pub(crate) fn remap_trace_push(shared: &SharedVm, thread: &JvmThread, tag: &str, extra: &str) {
+    if !remap_trace_on() {
+        return;
+    }
+    let top = thread
+        .frames
+        .last()
+        .map(|f| format!("{}.{} pc={}", f.class_name(), f.method_name(), f.pc))
+        .unwrap_or_else(|| "<no-frame>".to_string());
+    let line = format!(
+        "e{} {} tid={} frames={} top={} {}",
+        shared.heap.collection_count(),
+        tag,
+        thread.thread_id.0,
+        thread.frames.len(),
+        top,
+        extra,
+    );
+    REMAP_TRACE.with(|t| {
+        let mut t = t.borrow_mut();
+        if t.len() >= 24 {
+            t.remove(0);
+        }
+        t.push(line);
+    });
+}
+
+pub(crate) fn remap_trace_dump() -> String {
+    REMAP_TRACE.with(|t| t.borrow().join("
+    "))
+}
+
+pub(crate) fn nret_record(cb: usize, addr: usize, site: &str) {
+    if !remap_trace_on() {
+        return;
+    }
+    NRET_RING.with(|r| {
+        let mut r = r.borrow_mut();
+        if r.len() >= 64 {
+            r.remove(0);
+        }
+        r.push((cb, addr, site.to_string()));
+    });
+}
+
+/// Find `addr` among recent native object returns:
+/// (returns-ago, callback, java-site).
+pub(crate) fn nret_find(addr: usize) -> Vec<(usize, usize, String)> {
+    NRET_RING.with(|r| {
+        let r = r.borrow();
+        let n = r.len();
+        r.iter()
+            .enumerate()
+            .filter(|(_, (_, a, _))| *a == addr)
+            .map(|(i, (cb, _, s))| (n - i, *cb, s.clone()))
+            .collect()
+    })
 }
 
 pub(crate) fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
@@ -2761,6 +3046,7 @@ fn scan_frame_roots(frame: &Frame, out: &mut Vec<ObjectRef>, heap: &crate::memor
 }
 
 pub(crate) fn update_root_snapshot(shared: &SharedVm, thread: &mut JvmThread) {
+    remap_trace_push(shared, thread, "publish", "");
     // cceres3 FIX: self-heal a leaked blocked-region exit. If a blocking
     // native returned without `check_post_block_gc` (unpaired exit), this
     // thread is running with an unconsumed fixup chain / slot-origin set —
@@ -3283,6 +3569,10 @@ pub(crate) fn safepoint_check(shared: &SharedVm, thread: &mut JvmThread) {
         // the collector this thread is about to park for.
         crate::jit::conservative_roots::invalidate_scan_cache_for_gc();
         update_root_snapshot(shared, thread);
+        if remap_trace_on() {
+            let snap = thread.root_snapshot.lock().clone();
+            deposit_gap_diff(thread, &snap, "publish");
+        }
 
         // Arrive at barrier and wait for GC to complete. Census-aware (auto):
         // a genuine safepoint arrival is normally counted, but if this pause's
@@ -3290,6 +3580,16 @@ pub(crate) fn safepoint_check(shared: &SharedVm, thread: &mut JvmThread) {
         // would fill a counted mutator's quota slot.
         let pointer_map = shared.gc_barrier.arrive_and_wait_auto(thread.thread_id);
 
+        remap_trace_push(
+            shared,
+            thread,
+            if pointer_map.is_empty() {
+                "arrive-nomap"
+            } else {
+                "arrive"
+            },
+            &format!("map={}", pointer_map.len()),
+        );
         // Apply pointer map to this thread's frames
         if !pointer_map.is_empty() {
             apply_pointer_map_to_thread(thread, &pointer_map, &shared.heap);
@@ -14473,6 +14773,15 @@ fn execute_instruction(
                 if let Value::Object(Some(inner)) = value {
                     value = Value::Object(Some(shared.heap.load_and_forward(inner)));
                 }
+                if remap_trace_on() {
+                    if let Value::Object(Some(inner)) = value {
+                        getfield_ring_record(
+                            obj_ref.as_ptr() as usize,
+                            field.field_index,
+                            inner.as_ptr() as usize,
+                        );
+                    }
+                }
 
                 thread.frames[frame_idx].stack.push(value)?;
             }
@@ -15056,7 +15365,8 @@ fn execute_instruction(
                 let ref_loader = cm.get_loader_id(referencing_class_id);
                 let target_loader = cm.get_loader_id(target_class_id);
                 eprintln!(
-                    "[LOADER-TRACE] new class_name={class_name} referencing_class_id={referencing_class_id:?} referencing_loader={ref_loader:?} target_class_id={target_class_id:?} target_loader={target_loader:?}"
+                    "[LOADER-TRACE] new thread={:?} class_name={class_name} referencing_class_id={referencing_class_id:?} referencing_loader={ref_loader:?} target_class_id={target_class_id:?} target_loader={target_loader:?}",
+                    thread.thread_id
                 );
                 if matches!(ref_loader, Some(cratonvm_types::ClassLoaderId::Application)) {
                     eprintln!("[LOADER-TRACE-STACK] full Java stack for this Application-context 'new':");
@@ -17786,7 +18096,10 @@ fn resolve_class_loader_aware(
             || name.contains("MergedAnnotations")
             || name.contains("RootReference")
             || name.contains("MVMap")
-            || name.contains("org/h2/Driver"));
+            || name.contains("org/h2/Driver")
+            || name.contains("AotTestContextInitializers")
+            || name.contains("AotMergedContextConfiguration")
+            || name.contains("DefaultCacheAwareContextLoaderDelegate"));
     if dbg_trace {
         let cm = shared.class_manager.read();
         let ref_name = cm
@@ -17802,13 +18115,45 @@ fn resolve_class_loader_aware(
         && !name.starts_with('[')
         && !is_global_resolution_namespace(name)
     {
-        match shared
+        let direct_loader_id = shared
             .class_manager
             .read()
-            .get_loader_id(referencing_class_id)
-        {
+            .get_loader_id(referencing_class_id);
+        match direct_loader_id {
             Some(l @ cratonvm_types::ClassLoaderId::UserDefined(_)) => Some(l),
-            _ => None,
+            // `should_use_loader_initiated_resolution` just confirmed (via the
+            // `defining_loader_for` side table) that `referencing_class_id` WAS
+            // defined by a recognized user loader (Groovy or
+            // CompileWithForkedClassLoader) -- but `class_manager`'s own
+            // `loader_id` field for that same ClassId can disagree (return
+            // `Application`/`None`), silently discarding the gate's answer and
+            // falling all the way through to the loader-BLIND global fallback
+            // below. Observed for the `AotTestContextInitializers`/
+            // `AotTestContextInitializersFactory`/
+            // `DefaultCacheAwareContextLoaderDelegate`/
+            // `AotMergedContextConfiguration` family under
+            // `@CompileWithForkedClassLoader` (2026-07-22 AOT bean-override
+            // double-context-refresh session, see
+            // docs/known-issues/CRATONVM-SPRING-GENUINE-BUGLIST.md) -- a `new`
+            // instruction referencing one of these classes resolved via the
+            // global path instead of the fork's own already-loaded copy,
+            // busting a `Class`-identity-keyed cache
+            // (`AotMergedContextConfiguration.hashCode()`) and causing a
+            // second, uncustomized `ApplicationContext` to be created. Trust
+            // the side table `should_use_loader_initiated_resolution` already
+            // consulted directly instead of silently downgrading to "not a
+            // user loader" on a disagreement.
+            _ => cratonvm_native_builtins::classloader::defining_loader_for(
+                referencing_class_id.as_u32(),
+            )
+            .map(|loader_obj| {
+                let mut ctx = crate::vm::NativeContextImpl { shared, thread };
+                cratonvm_types::ClassLoaderId::UserDefined(
+                    cratonvm_native_builtins::classloader::loader_namespace_id(
+                        &mut ctx, loader_obj,
+                    ),
+                )
+            }),
         }
     } else {
         None
@@ -18663,6 +19008,11 @@ fn push_invoke_return_value(
     stack: &mut crate::runtime::ValueStack,
     value: Value,
 ) -> Result<(), RuntimeError> {
+    if remap_trace_on() {
+        if let Value::Object(Some(o)) = &value {
+            push_prov_record(o.as_ptr() as usize, "invoke-ret");
+        }
+    }
     match value {
         Value::Long(x) => {
             // Mark KIND_LONG so the caller's subsequent `pop_long` reads the
@@ -19740,6 +20090,75 @@ fn execute_invoke_kind(
                                     &*method_name,
                                     &*method_descriptor,
                                 );
+                                {
+                                    let blocked_flag = thread
+                                        .gc_block_state
+                                        .in_blocked_region
+                                        .load(std::sync::atomic::Ordering::Acquire);
+                                    eprintln!(
+                                        "[stale-recv] holder tid={} blocked={} epoch={} kind={:?}",
+                                        thread.thread_id.0,
+                                        blocked_flag,
+                                        shared.heap.collection_count(),
+                                        thread.kind,
+                                    );
+                                    for (e, moved_to, mlen, as_dest) in
+                                        crate::memory::gc::gcpart_probe(stale_addr)
+                                    {
+                                        eprintln!(
+                                            "[stale-recv] [gcpart] epoch={e} map_len={mlen} moved_to={moved_to:x?} appears_as_dest={as_dest}"
+                                        );
+                                    }
+                                    for (ago, site) in push_prov_find(stale_addr) {
+                                        eprintln!(
+                                            "[stale-recv] [pushprov] pushed {ago} invoke-returns ago at {site}"
+                                        );
+                                    }
+                                    for (ago, desc) in deposit_gap_find(stale_addr) {
+                                        eprintln!(
+                                            "[stale-recv] [deposit-gap] {ago} entries ago: {desc}"
+                                        );
+                                    }
+                                    for (age, site, tag, s, l) in
+                                        cratonvm_gc::zero_forensics::probe(stale_addr)
+                                    {
+                                        eprintln!(
+                                            "[stale-recv] [zeroed] age={age} site={} tag={tag} range=0x{s:x}+0x{l:x}",
+                                            if site == 1 { "sweep-span" } else { "fromspace-reset" },
+                                        );
+                                    }
+                                    if remap_trace_on() {
+                                        eprintln!(
+                                            "[stale-recv] [trace]\n    {}",
+                                            remap_trace_dump()
+                                        );
+                                        for (ago, cb, site) in nret_find(stale_addr) {
+                                            eprintln!(
+                                                "[stale-recv] [nret] returned {} native-returns ago by {} at {}",
+                                                ago,
+                                                cratonvm_native_api::native_ring::name_of(cb)
+                                                    .unwrap_or_else(|| format!("<cb@{cb:#x}>")),
+                                                site,
+                                            );
+                                        }
+                                        for (ago, parent, fidx) in getfield_ring_find(stale_addr) {
+                                            let cur = shared
+                                                .heap
+                                                .is_object_address(parent)
+                                                .map(|p| {
+                                                    format!(
+                                                        "{:?}",
+                                                        shared.heap.get_field(p, fidx)
+                                                    )
+                                                })
+                                                .unwrap_or_else(|| "<parent-not-obj>".into());
+                                            eprintln!(
+                                                "[stale-recv] [getfield] pushed {} getfields ago from parent=0x{parent:x} fld[{fidx}] — parent's field NOW = {cur}",
+                                                ago,
+                                            );
+                                        }
+                                    }
+                                }
                                 for (fi, f) in thread.frames.iter().enumerate().rev().take(30) {
                                     eprintln!(
                                         "  [{}] {}.{}{} pc={}",
@@ -19749,6 +20168,13 @@ fn execute_invoke_kind(
                                         f.method_descriptor(),
                                         f.pc,
                                     );
+                                    if let Some(loc) = f.dbg_locate_addr(stale_addr) {
+                                        eprintln!("      LOCATE {loc}");
+                                    }
+                                    if fi + 3 >= thread.frames.len() {
+                                        eprintln!("      RAWSTACK{}", f.dbg_stack_dump());
+                                        eprintln!("      POPPED{}", f.stack.dbg_dump_popped(5));
+                                    }
                                     for li in 0..f.locals_len() {
                                         // Cast: numeric/representation conversion
                                         let v = f.get_local(li as u16);

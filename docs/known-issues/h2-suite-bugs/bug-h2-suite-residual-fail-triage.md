@@ -1,27 +1,39 @@
 # H2 suite — residual FAIL triage (2026-07-21): reproduced, narrowed, not fully root-caused
 
 ## Status
-**OPEN, mixed, mostly closed after three follow-up sessions.** Of the
+**OPEN, mixed, mostly closed after five follow-up sessions.** Of the
 original 11 items: **8 now confirmed FIXED** (`TestPreparedStatement`,
-`TestShell`, `TestRandomMapOps` [very likely — see its section],
-`TestLinkedTable`, `TestAlter`, `TestDataUtils` [now fully fixed — see the
-"Follow-up session (2026-07-22, third pass)" section], plus the
-`SecurityException` half of `TestUpgrade`), **1 root-caused as a genuine
-performance-margin issue rather than a discrete bug** (`TestBnf`, joining
+`TestShell`, `TestRandomMapOps` [very likely — ~99 CPU-minutes clean before
+an unrelated host-wide OOM kill cut the confirmation run short; see its
+section for the corrected account — a prior version of this doc incorrectly
+claimed a clean 2-hour completion], `TestLinkedTable`, `TestAlter`,
+`TestDataUtils` [now fully fixed — see the "Follow-up session (2026-07-22,
+third pass)" section], plus the `SecurityException` half of `TestUpgrade`),
+**1 root-caused as a genuine performance-margin issue rather than a
+discrete bug, now with two confirmed instances** (`TestBnf` and, as of the
+fifth pass, the separate `Bnf`/`RuleElement`-NPE doc — both the exact same
+`Sentence.MAX_PROCESSING_TIME` budget-exhaustion mechanism; joining
 `TestFileLock`/`TestTransaction` in that category), and **3 root-caused,
 performance-margin, no fix expected/attempted** (`TestFileLock`,
 `TestTransaction`, plus `TestFuzzOptimizations` which is
 inconclusive/likely-not-CratonVM-specific). **One genuine open residual
 remains requiring further VM work: `TestUpgrade`'s secondary
-`NoSuchMethodError`** — now narrowed much further (see the third-pass
-section) but still not closed. A **separate, previously-undiscovered
-systemic bug was found and fixed** in the process (the JIT compiled-code
-cache was keyed by class NAME only, with no loader/`ClassId` component —
-see the third-pass section for the full writeup) — real and worth keeping,
-but confirmed **not sufficient by itself** to close `TestUpgrade` (the
-NoSuchMethodError reproduces identically with `--nojit`). See each item
-below, and the "Follow-up session (2026-07-22, second pass)" and "third
-pass" summaries further down, for full detail.
+`NoSuchMethodError`** — narrowed much further across the third and fifth
+passes (see those sections) but still not closed; the fifth pass pinned it
+to a specific polymorphic inline-cache-miss correlation with a concrete
+next instrumentation step. A **separate, previously-undiscovered systemic
+bug was found and fixed** in the process (the JIT compiled-code cache was
+keyed by class NAME only, with no loader/`ClassId` component — see the
+third-pass section for the full writeup) — real and worth keeping, but
+confirmed **not sufficient by itself** to close `TestUpgrade` (the
+NoSuchMethodError reproduces identically with `--nojit`). A **ninth item is
+now also FIXED**: the `TestPreparedStatement.testDate8` 1-hour-offset
+residual discovered during the third pass (distinct from the
+already-fixed Julian/Gregorian cutover bug in the same test class) — see
+the "Follow-up session (2026-07-22, fourth pass)" section. See each item
+below, and the "Follow-up session (2026-07-22, second pass)", "third
+pass", "fourth pass", and "fifth pass" summaries further down, for full
+detail.
 
 All classes below PASS on the HotSpot JDK25 baseline; all originally FAILed
 under CratonVM `jit-real` (real JDK25 backend). Fix commits landed on
@@ -501,7 +513,15 @@ Picked up the 7 items still open after the first follow-up session (worktree
   reaches the `user_defined_function_name` grammar production that would
   suggest `CUSTOM_PRINT`. Not a logic/dispatch bug — a genuine interpreter
   throughput gap for this specific (apparently very branchy/recursive)
-  workload. No targeted fix attempted, matching `TestFileLock`/
+  workload. **Second confirmed instance (2026-07-22, fifth pass)**:
+  `TestWeb.testWebApp()`'s `autoCompleteList.do?query=select 'abc`
+  empty-body failure — originally tracked as a separate doc
+  (`bug-h2-bnf-ruleelement-link-null-npe-autocomplete.md`, a `RuleElement
+  .link` NPE hypothesis from an incomplete isolated repro that skipped
+  `linkStatements()`) — turned out to be this exact same budget-exhaustion
+  mechanism for a query with an unclosed string literal; see that doc (now
+  closed/reclassified) and the "fifth pass" section below for the full
+  faithful-repro writeup. No targeted fix attempted, matching `TestFileLock`/
   `TestTransaction`'s existing characterization — would require broader
   interpreter throughput work, not a discrete patch.
 
@@ -728,8 +748,9 @@ observed**. One *new*, unrelated finding surfaced:
 confirmed via a from-scratch build of unmodified `dev@ad909ee8f` that this is
 **pre-existing, not a regression from this session**; it's a distinct residual
 from the already-fixed Julian/Gregorian cutover bug in the same test class.
-Filed separately, not fixed here (out of scope for this pass) — see the
-spawned follow-up task / a new doc for it.
+Filed separately, not fixed here (out of scope for this pass) at the time —
+**now FIXED, see the "Follow-up session (2026-07-22, fourth pass)" section
+below.**
 
 `org.h2.test.store.TestRandomMapOps` was kicked off again with a full 2-hour
 timeout at the end of this session to try for the definitive exit-0
@@ -738,3 +759,438 @@ confirmation the second-pass session couldn't get; check
 rerun) for the outcome if this doc wasn't updated with a result before the
 session ended.
 
+**Outcome (2026-07-22, same session) — CORRECTED (2026-07-22, fifth pass):**
+the original writeup here claimed the run "completed its `timeout` wrapper
+without ever exiting on its own — killed at the 7200s mark." **That is
+factually wrong** — checked directly against the Azure host's kernel log
+(`dmesg`) during the fifth-pass session: PID `1793972` was **OOM-killed by
+the Linux kernel at 23:27:12 UTC**, i.e. **~99 minutes** into the run
+(started 21:48), not reaped by the `timeout 7200` wrapper at the 2-hour
+mark:
+```
+kernel: Out of memory: Killed process 1793972 (cratonvm-h2fina) total-vm:5700264kB, anon-rss:1962172kB, ...
+```
+This happened because the Azure host was concurrently running several other
+sessions' heavy workloads (multiple WildFly node clusters, other H2/Tomcat
+fixture runs, several `cargo build`/`cargo test` invocations) at the same
+time, not because of anything specific to `TestRandomMapOps` itself — the
+host's `free -g` showed 25GB reclaimed immediately after the kill, i.e. a
+genuine system-wide memory-pressure event, not a leak in the test or the VM.
+The **qualitative conclusion is still likely correct** (~99 minutes of
+continuous CPU-bound execution with no assertion failure or crash before the
+OOM kill is still meaningful evidence the original fast, deterministic
+`rev (1654, null)` bug is gone) but it is **weaker evidence than the
+original writeup claimed**, and a truly definitive exit-0 confirmation is
+still outstanding. Whoever picks this up next should re-run with a
+generous timeout **on a host that is not concurrently oversubscribed**
+(check `free -g` and `ps aux --sort=-%mem` first — this Azure host runs many
+concurrent orchestrated sessions and can OOM-kill an otherwise-healthy long
+run), or run it with a lower per-process memory footprint / under `systemd-run
+--scope -p MemoryMax=...` isolation so an unrelated session's memory spike
+can't take it down.
+
+
+
+## Follow-up session (2026-07-22, fourth pass): `TestPreparedStatement.testDate8` 1-hour-offset residual — FIXED
+
+Picked up the residual filed at the end of the third pass (see immediately
+above). Re-confirmed it still reproduces on current `dev` HEAD
+(`becf0f642f9`, 2026-07-22) with an unmodified, from-scratch build before
+touching anything, per this repo's "check already fixed first" convention —
+still reproduced identically:
+```
+AssertionError: Expected: 1582-09-25 00:00:00.000 actual: 1582-09-24 23:00:00.000
+	at org/h2/test/jdbc/TestPreparedStatement.testDate8(TestPreparedStatement.java:728)
+```
+
+### Root cause
+
+**Not** a date-arithmetic or calendar-cutover bug (the working hypothesis
+going in — a historical-date DST/zone-offset edge case — turned out to be
+wrong; the actual bug isn't date-dependent at all). `testDate8` wraps its
+Julian/Gregorian-transition assertions in:
+```java
+TimeZone.setDefault(TimeZone.getTimeZone("GMT+01"));
+```
+and the failing assertion (`assertEquals(Date.valueOf("1582-09-25"),
+rs.getDate(1))`) compares a value built via `java.sql.Date.valueOf` (which
+routes through `java.util.Date`'s deprecated field constructors and the
+already-fixed JDN-based `date_fields_to_millis`/`date_fields_to_default_millis`
+in `deprecated_util.rs`) against a value the H2 JDBC driver computes
+independently. The JDN/cutover math on both sides is correct — verified by
+isolating `Date.valueOf("1582-09-25")` alone (no H2 involved) under
+`TimeZone.setDefault(TimeZone.getTimeZone("GMT+01"))`: CratonVM produced
+`-12220156800000` where real HotSpot JDK 25 produces `-12220160400000` —
+an exact 3,600,000 ms (1h) discrepancy, reproducing with **any** date, not
+just 1582 ones.
+
+Traced further with a direct probe of `TimeZone.getTimeZone("GMT+01")`
+itself (no `Date`/H2 involved at all):
+```
+tz id=GMT+01:00 rawOffset=0 getOffset(0)=0 getOffset(now)=0   <- CratonVM (WRONG)
+tz id=GMT+01:00 rawOffset=3600000 getOffset(...)=3600000      <- real HotSpot JDK 25
+```
+Every synthetic **custom fixed-offset** `TimeZone` — any id of the form
+`"GMT±HH:MM"` / `"GMT±HHMM"` / `"GMT±H"` / `"UTC±HH:MM"`, canonicalised by
+`normalize_gmt_custom_id` in `native-builtins/src/lib.rs` — resolved every
+offset query (`getRawOffset()`, `getOffset(long)`, `getOffsets(long,int[])`,
+`getOffsetsByWall(long,int[])`) to **0**, regardless of the requested
+offset. `TimeZone.getTimeZone("GMT+01")`'s canonical `ID` field
+(`"GMT+01:00"`) was set correctly, so `getID()`/`toString()` looked right —
+only the numeric offset was silently wrong, which is exactly why `testDate8`
+(fixed-offset-zone-dependent) was the symptom while dates alone were red
+herrings.
+
+Root cause, once traced into `native-builtins/src/lib.rs`'s `getRawOffset`/
+`getOffset`/`getOffsets`/`getOffsetsByWall` native registrations for
+`sun/util/calendar/ZoneInfo`/`java/util/SimpleTimeZone`: none of them read
+the object's own `rawOffset` field (which `alloc_synth_timezone` *does* set
+correctly via the `tz_standard_offset_seconds` lookup table — a dead code
+path for this purpose, it turns out). They instead all go through
+`crate::tzdb::raw_offset_seconds`/`offset_seconds_at_instant`/
+`offset_seconds_at_local`/`standard_offset_seconds_at_instant`, which in
+turn call `tzdb::get_zone_rules(ctx, zone_id)` — a lookup **purely against
+the real `tzdb.dat` catalog** (604 IANA zones + aliases). A synthetic
+`"GMT+01:00"` id has no `tzdb.dat` entry (real Java doesn't need one either
+— it builds these zones' `ZoneInfo` directly from the parsed offset, never
+touching tzdb), so `get_zone_rules` returned `None` for every custom-offset
+id, and every caller's `.unwrap_or(0)` silently substituted 0.
+
+### Fix
+
+`native-builtins/src/tzdb.rs`: added `parse_fixed_gmt_offset_seconds(id)` —
+a self-contained parser for `"GMT±HH:MM"`/`"GMT±HHMM"`/`"GMT±H"`/
+`"UTC±HH:MM"` ids (handles both the canonicalised form
+`normalize_gmt_custom_id` produces and the short forms it accepts on input)
+— and `fixed_offset_rules(offset_seconds)`, which builds a degenerate
+`ZoneRulesData` with empty transition tables and a single constant offset
+(the existing `offset_at_instant`/`offset_at_local`/
+`standard_offset_at_instant`/`raw_offset` functions already treat empty
+transition vectors as "constant offset, no DST" — no changes needed there).
+`get_zone_rules` now falls back to this synthetic rule set when the tzdb
+catalog lookup misses and the id parses as a fixed GMT/UTC offset — fixing
+`getRawOffset`/`getOffset`/`getOffsets`/`getOffsetsByWall` for **every**
+custom-offset zone uniformly (not just `"GMT+01"`), since all four go
+through this same shared lookup. `get_zone_rules`'s one other caller
+(`TimeZone.getTimeZone`'s "is this id resolvable, or should it fall back to
+bogus-id `GMT`" check) already short-circuits `custom_gmt.is_some()` before
+reaching `get_zone_rules`, so this fallback doesn't change that path's
+behavior.
+
+**Verified bit-for-bit against real HotSpot JDK 25**:
+- `TimeZone.getTimeZone("GMT+01"/"GMT+01:00"/"GMT+1"/"GMT+0100").getRawOffset()`
+  / `.getOffset(0)` / `.getOffset(now)`: all now `3600000`, matching HotSpot
+  exactly (was `0`).
+- `TimeZone.getTimeZone("GMT-05"/"GMT-05:00").getOffset(...)`: `-18000000`,
+  matching HotSpot (was `0`).
+- `TimeZone.getTimeZone("UTC"/"GMT"/"GMT+00").getOffset(...)`: unchanged at
+  `0` (still correct — not custom-offset ids, or a genuinely zero offset).
+- `Date.valueOf("1582-09-25")` under `TimeZone.setDefault(GMT+01)`:
+  `-12220160400000`, now matching HotSpot exactly (was `-12220156800000`,
+  off by +3,600,000 ms).
+- `org.h2.test.jdbc.TestPreparedStatement` (the full class, including
+  `testDate8`): clean pass, no assertion failures.
+
+3 new regression unit tests added to `native-builtins/src/tzdb.rs`'s
+existing `#[cfg(test)] mod tests`, alongside 2 more covering the
+`fixed_offset_rules`/`get_zone_rules` fallback plumbing directly (5 new,
+7/7 total in the module including the 2 pre-existing tests, all pass).
+
+**Regression check**: spot-ran `TestAlter`, `TestShell`, `TestLinkedTable`
+(the classes this doc's own history most recently touched) against the
+fixed binary — all clean, no regressions.
+
+## Follow-up session (2026-07-22, fifth pass): `TestUpgrade` narrowed to a
+## specific inline-cache-miss correlation (still open); `Bnf`/`RuleElement`
+## NPE doc reclassified as the same `TestBnf` family (closed)
+
+Worktree `/data/wt-h2-testupgrade-20260722` on the Azure host, branch
+`fix/h2-testupgrade-rootreference-20260722`, branched from `origin/dev`
+(`ffe407a5f`).
+
+### `TestUpgrade`'s secondary `NoSuchMethodError` — narrowed further via a
+### precise inline-cache-miss correlation, still OPEN
+
+Re-ran the existing `CRATONVM_DBG_LOADER_TRACE=1 --nojit` repro (confirms
+the bug is unchanged/still open) and, this time, grepped the full
+`[LOADER-TRACE]` output (100k+ lines) systematically instead of sampling,
+cross-referencing `execute_invokevirtual_cached`'s HIT-CHECK lines against
+the `compare_and_swap_field`/`set_field_volatile` lines by line-number
+adjacency. Found a precise, reproducible correlation that narrows the
+search significantly:
+
+- **Confirmed (again, via a fresh trace) that every single `new
+  RootReference(...)` allocation in the failure window resolves its target
+  class correctly relative to its OWN referencing class's loader** — e.g.
+  `referencing_class_id=ClassId(1619) referencing_loader=Some(UserDefined(5))
+  target_class_id=ClassId(1619)`, and the one Application-context `new`
+  observed in the same window (`referencing_class_id=ClassId(1168)
+  referencing_loader=Some(Application) target_class_id=ClassId(1168)`) is
+  likewise self-consistent. This rules out `Instruction::New`'s
+  `resolve_class_loader_aware` call as the mechanism — reconfirms the
+  third-pass session's finding, now with a wider sample.
+- **New finding**: immediately before/after the corrupting
+  `compare_and_swap_field` writes (a `cid=1168` `RootReference` landing in an
+  `AtomicReference` holder whose entire history otherwise shows `cid=1619`
+  objects — e.g. holder `0x200c647f4b0` gets 10 consecutive `cid=1619`
+  writes, then one `cid=1168` write), the `execute_invokevirtual_cached`
+  HIT-CHECK immediately preceding it shows a **polymorphic inline-cache
+  miss** at the *same* call site:
+  ```
+  execute_invokevirtual_cached HIT-CHECK method=org/h2/mvstore/MVMap.compareAndSetRoot(...)Z
+    cached.declaring=org/h2/mvstore/MVMap cached_receiver_class_id=ClassId(1162)
+    actual_class_id=ClassId(1613) match=false
+  compare_and_swap_field SUCCESS holder_obj=0x200c647f4b0 ... new_cid=1168
+  execute_invokevirtual_cached HIT-CHECK method=org/h2/mvstore/RootReference.removeUnusedOldVersions(J)V
+    cached.declaring=org/h2/mvstore/RootReference cached_receiver_class_id=ClassId(1619)
+    actual_class_id=ClassId(1168) match=false
+  ```
+  and separately, aggregating every HIT-CHECK for `RootReference`'s
+  package-private chained-update methods
+  (`tryLock`/`updatePageAndLockedStatus`/`tryUnlockAndUpdateVersion`) across
+  the whole run: **1 single occurrence** (out of ~300) of
+  `RootReference.tryUnlockAndUpdateVersion(JI)... cached_receiver_class_id=
+  ClassId(1619) actual_class_id=ClassId(1168) match=false` — i.e. a call
+  site whose inline cache had been warmed by a `UserDefined(5)` receiver
+  suddenly sees an `Application` receiver (or vice versa) exactly once, right
+  in the failure window.
+- **Ruled out**: the `actual_class_id != receiver_class_id` guard in
+  `execute_invokevirtual_cached` (`vm/src/runtime/interpreter.rs`, the
+  `CachedInvokeTarget::VirtualBytecode` arm) is itself correct — on a
+  mismatch it unconditionally returns `CachedCallResult::CacheMiss`, forcing
+  the slow path to re-resolve against the ACTUAL receiver's own class. By
+  inspection this cannot be the mechanism that lets a wrong-class method body
+  execute; the corruption has to be happening either in what the slow path
+  resolves TO after a miss, or upstream of this guard (i.e. the receiver
+  object itself, at the point it's pushed onto the operand stack for one of
+  these calls, is already the wrong object — not a dispatch bug on a correct
+  receiver, but a wrong receiver reaching a correct dispatcher).
+- **Working hypothesis for the next session**: given both (new) is
+  confirmed sound and (cache-miss guard) is confirmed sound, the remaining
+  candidates are narrower than the third-pass session's list: (a) the
+  SLOW-PATH re-resolution invoked after a `CacheMiss` on one of
+  `RootReference`'s package-private chained-update methods
+  (`tryLock`/`updatePageAndLockedStatus`/`tryUnlockAndUpdateVersion`/
+  `updateRootPage`) — does it correctly re-cache keyed by the receiver's
+  OWN `ClassId`, or could two different `RootReference` classes'
+  call sites alias the same `thread.invoke_cache` slot
+  (`(caller_class_id, cp_index, is_special)`)? (b) whether `AtomicReference
+  .get()` (`native_atomic_ref_get`, `native-builtins/src/lib.rs`) can, under
+  a race with a concurrent GC/compaction or a background MVStore thread,
+  return a stale/wrong-generation value for a specific field-slot-0 read —
+  not yet directly instrumented. **Concrete next step**: add a trace
+  specifically at `native_atomic_ref_get`'s call site printing the
+  `caller_class_id`/`cp_index` of the *calling* bytecode (not just the class
+  of the returned value, which the existing trace already covers) for every
+  `AtomicReference.get()` on a holder whose class is `RootReference`'s
+  atomic root field — this would directly confirm or refute the
+  `thread.invoke_cache` key-aliasing hypothesis in (a) above without another
+  full investigative pass.
+
+Doc updated in place, no code changes landed this session for `TestUpgrade`
+itself (investigation-only pass). `CRATONVM_DBG_LOADER_TRACE=1` remains in
+the tree, zero cost when unset, and is confirmed to reproduce the full trace
+in well under 5 minutes.
+
+### `Bnf`/`RuleElement.link` NPE doc — reclassified and closed
+
+Investigated `bug-h2-bnf-ruleelement-link-null-npe-autocomplete.md` (the
+`TestWeb.testWebApp()` autocomplete empty-body finding). The doc's own
+`RuleElement.link` NPE hypothesis turned out to be a red herring from an
+incomplete isolated repro that skipped the required `linkStatements()` call
+(`docs-known-issue-doc-hypothesis-can-be-wrong-not-just-stale` applies). A
+faithful repro replicating `WebSession.loadBnf()` exactly — all 7
+`updateTopic()` calls, a real `readContents()`-populated `DbContents`
+against a live H2 connection, then `linkStatements()` — shows the NPE does
+**not** reproduce at all (`BnfProbe4.java`, worktree
+`/data/wt-h2-testupgrade-20260722/apps/h2database/h2/BnfProbe4.java`).
+
+The real mechanism: `getNextTokenList("select 'abc")` (unclosed string
+literal) returns an empty result instead of suggesting the closing `'` —
+root-caused (via the same "widen `Sentence.MAX_PROCESSING_TIME` in a scratch
+rebuild" technique already used for `TestBnf` above) to the **exact same
+100ms budget-exhaustion mechanism**: widening the budget to 30000ms makes
+this query correctly return `{1#anything=Hello World, 1#'='}`. Not a
+dispatch/NPE/loader bug — the same interpreter-throughput performance-margin
+family as `TestBnf`/`TestFileLock`/`TestTransaction`. See the updated
+`bug-h2-bnf-ruleelement-link-null-npe-autocomplete.md` for the full
+corrected writeup; no code fix attempted or needed (matches this family's
+existing "no targeted fix, broader interpreter throughput work" stance).
+
+### Regression check
+
+Ran `TestWeb` (the `select 'abc` case only, via `BnfProbe4`) and confirmed
+the reverted/clean binary (all diagnostic edits to `Sentence.java`,
+`WebSession.java`, `WebApp.java` backed out — those files aren't
+git-tracked in this repo, see below) still fails `TestWeb.testWebApp()`
+identically to `origin/dev`, i.e. this session made no code changes, purely
+investigation + doc updates. Note: `apps/h2database/` is not tracked by
+git in this repo (each worktree gets its own untracked local copy of the H2
+source/build); any source-level scratch edits made while investigating
+(temporary debug prints, the `Sentence.MAX_PROCESSING_TIME` widening) were
+reverted in-place in this worktree's copy and are not part of any commit.
+
+Fix commit landed on `dev` via branch
+`fix/h2-testdate8-1hour-offset-20260722`.
+
+## Follow-up session (2026-07-22, sixth pass): `TestUpgrade` — ruled out
+## dispatch/resolution *and* cross-thread races; corruption traced to a
+## stale (non-freshly-constructed) argument value, still OPEN
+
+Same worktree/branch as the fifth pass
+(`/data/wt-h2-testupgrade-20260722`, `fix/h2-testupgrade-rootreference-20260722`).
+Picked up the fifth pass's concrete next step: added targeted tracing to
+`native_atomic_ref_get`/`native_atomic_ref_cas`
+(`native-builtins/src/lib.rs`) printing the *caller's* `ClassId` (via
+`NativeContext::frame_class_ids()`) and thread id (via
+`NativeContext::thread_id()`/`JvmThread::thread_id`) alongside the existing
+held-object-class trace, plus a thread id on the `Instruction::New` trace
+(`vm/src/runtime/interpreter.rs`) — all gated behind the existing
+`CRATONVM_DBG_LOADER_TRACE` env var, zero cost when unset, **left in the
+tree** (uncommitted as of this writeup — see "Status of this session's
+changes" below).
+
+### Two prior hypotheses now directly refuted
+
+1. **Cross-thread race (the fifth pass's leading theory)**: refuted with
+   hard evidence. For every "mixed" `AtomicReference` holder found (one
+   whose CAS history shows objects from *both* `RootReference` classes —
+   e.g. holder `0x200c624b2b0`: a healthy `cid=1617` (UserDefined(5)) write
+   followed by a corrupting `cid=1168` (Application) write), **every single
+   CAS on that holder happened on `thread=0`** — the same thread, no
+   interleaving from thread 6/7/10 (which *do* exist and *do* call
+   `compareAndSetRoot`, but only ever self-consistently within their own
+   world, confirmed separately). This rules out a genuine data race between
+   the main thread and `MVStore`'s background auto-commit thread(s) as the
+   mechanism — a real, useful negative result, since the doc's third/fifth
+   pass sections had flagged this as a leading candidate.
+2. **Wrong-class dispatch on a correctly-identified receiver**: still
+   refuted (reconfirmed) — `execute_invokevirtual_cached`'s mismatch guard
+   is sound, and, new this pass, `resolve_class_by_name`'s "GLOBAL-FIRST
+   fallback" path (`vm/src/runtime/interpreter.rs` ~L17880-17910, the
+   function containing the `[LOADER-TRACE] name=... resolved via
+   GLOBAL-FIRST fallback` line seen throughout every trace so far) was
+   directly checked and is **not** the mechanism either: `grep`-ing every
+   trace run for a `GLOBAL-FIRST fallback` event whose `referencing_loader`
+   is `UserDefined(_)` (i.e. a case where UserDefined(5) bytecode should
+   have used loader-aware resolution but fell through to the loader-blind
+   global path instead) returns **zero hits**, in any of this session's
+   three trace runs. Every `GLOBAL-FIRST fallback` observed is `Application`
+   resolving `Application` — itself correct, expected behavior (Application
+   classes have no reason to use loader-initiated resolution), not a bug.
+   `should_use_loader_initiated_resolution`
+   (`vm/src/runtime/interpreter.rs` ~L17653) does gate loader-aware
+   resolution behind a narrow Groovy/Spring-fork allowlist *unless*
+   `CRATONVM_LOADER_AWARE_RESOLUTION` is set — but that env var's own
+   default (`vm/src/runtime/env_cache.rs::loader_aware_resolution`,
+   `Err(_) => true`) is **on** by default, and the gate's own
+   `get_loader_id(referencing_class_id)` direct-hit path (checked before
+   ever consulting the narrow allowlist) correctly identifies UserDefined(5)
+   classes in every observed case — so this path is sound for this bug,
+   despite superficially looking like a promising lead (a stale doc comment
+   two lines above the function, claiming the gate "stays off" by default,
+   is itself now wrong/outdated and worth a follow-up correction someday,
+   but is not connected to this bug).
+
+### New finding: the corrupting object is not freshly constructed nearby
+
+For the specific corrupting CAS events examined line-by-line (e.g. holder
+`0x200c624b2b0` at trace line ~94531 in
+`/tmp/testupgrade-trace3.log` on the Azure host — not preserved past the
+session, re-run `CRATONVM_DBG_LOADER_TRACE=1 --nojit org.h2.test.unit
+.TestUpgrade` to reproduce, takes well under 5 minutes): the ~40 lines
+immediately preceding the corrupting `native_atomic_ref_cas PRE ...
+new_cid=1168` contain **no** `[LOADER-TRACE] new ...RootReference` line at
+all — only a burst of ~14 repeated `resolve name=RootReference
+referencing_class_id=ClassId(1168) referencing_loader=Some(Application)`
+lines (Application's own, unrelated `RootReference` class-name resolution
+activity, running sequentially on the *same* thread=0 immediately before,
+not concurrently) followed directly by the corrupting CAS. Since every
+`new RootReference(...)` allocation observed anywhere in three separate
+trace runs this session (and the fifth pass) resolves its target class
+correctly relative to its own referencing class, and none appears in this
+specific window, the `RootReference` object being passed as `updated` to
+UserDefined(5)'s `MVMap.compareAndSetRoot` here was **not just constructed
+here** — it must already have existed (most plausibly: it's the object
+Application's own, immediately-preceding, unrelated code was just working
+with) and is reaching this call site as an already-stale value in some
+storage location the interpreter believes holds `tryUpdate`'s fresh
+`updatedRootReference` parameter.
+
+### Working hypothesis for the next session: local-variable/argument-slot
+### staleness in `RootReference.tryUpdate`'s invokespecial call
+
+Given `RootReference.tryUpdate(RootReference<K,V> updatedRootReference)`
+is private (2 local slots: `this`, `updatedRootReference`) and is always
+called as `tryUpdate(new RootReference<>(this, ...))` from a sibling
+private/package-private method
+(`updateRootPage`/`tryLock`/`updatePageAndLockedStatus`/
+`tryUnlockAndUpdateVersion`), the most concrete remaining explanation
+consistent with every finding so far (sound dispatch, sound `new`
+resolution, no cross-thread race, corrupting value not freshly
+constructed) is **frame/local-slot reuse**: if the interpreter pools/reuses
+`Frame` objects (`Frame::new_pooled_cached`, already flagged as a suspect
+in the second-pass session's `TestDataUtils` investigation for a *different*
+bug — the `KIND_LONG` tag-loss family, since fixed) and a pooled frame
+previously used for an Application-context `tryUpdate` call still has
+`updatedRootReference`'s local slot populated with that Application
+`RootReference` object, a bug in the NEW call's argument-marshalling that
+fails to overwrite that slot (e.g. an early-return/fast-path that assumes
+"same slot count, skip re-writing" for some class of invokespecial calls)
+would produce exactly this symptom: `tryUpdate` reads its OWN stale local
+instead of the freshly-`new`'d argument the caller actually pushed.
+
+**Concrete next step, not yet attempted**: instrument
+`execute_invokespecial_cached`/whatever code path marshals arguments into
+a newly-entered private-method frame (grep `Frame::new_pooled_cached` and
+its callers in `vm/src/runtime/interpreter.rs`) to print, on frame entry
+for `RootReference.tryUpdate`/`tryLock`/`updatePageAndLockedStatus`/
+`tryUnlockAndUpdateVersion` specifically, (a) the object reference actually
+present in local slot 1 immediately after argument marshalling completes,
+compared against (b) the object reference that was on top of the operand
+stack in the CALLER's frame immediately before the `invokespecial`
+instruction executed. A mismatch between (a) and (b) for any call would be
+a direct, unambiguous confirmation of this hypothesis and would pinpoint
+the exact marshalling function responsible.
+
+### Status of this session's changes
+
+The `native_atomic_ref_get`/`native_atomic_ref_cas`/`Instruction::New`
+thread-id-and-caller-class tracing added this session is a small,
+`CRATONVM_DBG_LOADER_TRACE`-gated, zero-cost-when-unset diagnostic — same
+category as the existing loader trace already in the tree — and is left
+**uncommitted** in `/data/wt-h2-testupgrade-20260722` pending review (not
+pushed to `dev` as of this writeup; whoever picks this up next should
+either commit it as-is or fold it into whatever further instrumentation
+the "concrete next step" above requires). The Azure host this session ran
+on was under heavy, fluctuating memory pressure from several concurrent
+orchestrated sessions for most of this pass (two `cargo build` attempts
+were `SIGKILL`'d by the OOM killer before a third succeeded once load
+dropped) — worth checking `free -g`/`ps aux --sort=-%mem` before assuming a
+build failure here is a code problem rather than host contention.
+
+### Addendum (same session, static check while `TestRandomMapOps` ran):
+### `init_locals_pooled`/`Frame::new_pooled_cached` ruled out
+
+Read `vm/src/runtime/frame.rs`'s `Frame::new_pooled_cached` and the
+`init_locals_pooled` helper it calls directly (the pooled-frame
+construction path the sixth pass's hypothesis pointed at). Both look
+correct on inspection: `init_locals_pooled` unconditionally does
+`locals.clear(); locals.resize(n, uninitialized); kinds.clear();
+kinds.resize(n, LKIND_OTHER);` — a full wipe — before
+`copy_args_to_locals` writes the actual call arguments starting at slot 0,
+for exactly `args.len()` slots. There is no code path here that could
+leave a stale value from a previous pooled use in a slot the new call
+should have populated; a pooled `Vec`'s prior contents are discarded, not
+selectively overwritten. This rules out the pooled-frame *construction*
+step specifically as the mechanism — it does not rule out the hypothesis
+generally, since the actual argument values (`args`/`args_slice`) are
+built *before* this function is called, by popping the operand stack in
+the invoke dispatcher (`execute_invokevirtual_cached`, the
+`CachedInvokeTarget::VirtualBytecode` arm, `vm/src/runtime/interpreter.rs`
+~L37170-37310 for the cache-hit path, a parallel cache-miss path nearby).
+**Narrows the "concrete next step" from the sixth pass**: the remaining
+suspect is specifically the operand-stack argument *popping* for an
+`invokespecial` call to `RootReference.tryUpdate` (i.e. `is_special=true`
+in this dispatcher) — not frame/locals construction, which is now
+confirmed clean.

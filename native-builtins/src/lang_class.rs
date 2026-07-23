@@ -1680,7 +1680,7 @@ fn dbg_is_entity_name(n: &str) -> bool {
     n.contains("orm/test/cache/") || n.contains("orm.test.cache.")
 }
 
-fn class_for_name_one_arg_caller_loader(ctx: &mut dyn NativeContext) -> Option<ObjectRef> {
+pub(crate) fn class_for_name_one_arg_caller_loader(ctx: &mut dyn NativeContext) -> Option<ObjectRef> {
     for caller_cid in ctx.frame_class_ids() {
         if matches!(
             ctx.class_name_of_id(caller_cid).as_deref(),

@@ -1895,7 +1895,11 @@ pub(crate) fn native_sb_repeat_charsequence(
     if count == 0 {
         return Ok(Some(Value::Object(Some(this))));
     }
+    // Producer-#12 fix: re-entrant `invoke_to_string` can move `this`.
+    let this_pin = ctx.pin_native_root(this);
     let text = invoke_to_string(ctx, cs).unwrap_or_default();
+    let this = ctx.read_native_pin(this_pin, this);
+    ctx.unpin_native_roots(this_pin);
     let units: Vec<u16> = text.encode_utf16().collect();
     let mut chars = sb_read_chars(ctx, this);
     for _ in 0..count {
@@ -2176,11 +2180,22 @@ pub(crate) fn native_sb_append_object(
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
+    // Producer-#12 fix (stw-residual-close 20260723): `invoke_to_string`
+    // re-enters Java (obj.toString() — e.g. Class.toString() in infinispan's
+    // ClassToExternalizerMap.toString append chain); a nested moving young
+    // collection relocates `this`, and the raw copy would append into
+    // from-space memory `Arena::reset` has already zeroed AND be returned
+    // stale, poisoning every later link of the javac chain (the WildFly
+    // [stale-recv] StringBuilder family). Pin + re-read, exactly like the
+    // in-tree exemplar in the insert-CharSequence native.
+    let this_pin = ctx.pin_native_root(this);
     let text = match args.get(1) {
         Some(Value::Object(Some(obj))) => invoke_to_string(ctx, *obj)?,
         Some(Value::Object(None)) => "null".to_string(),
         _ => "null".to_string(),
     };
+    let this = ctx.read_native_pin(this_pin, this);
+    ctx.unpin_native_roots(this_pin);
     let this = sb_append_str(ctx, this, &text);
     Ok(Some(Value::Object(Some(this))))
 }
@@ -2196,6 +2211,9 @@ pub(crate) fn native_sb_append_charsequence(
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
+    // Producer-#12 fix: same re-entrant `invoke_to_string` hazard as
+    // `native_sb_append_object` just above — pin + re-read `this`.
+    let this_pin = ctx.pin_native_root(this);
     let text = match args.get(1) {
         Some(Value::Object(Some(obj))) => match invoke_to_string(ctx, *obj) {
             Ok(s) => s,
@@ -2204,6 +2222,8 @@ pub(crate) fn native_sb_append_charsequence(
         Some(Value::Object(None)) => "null".to_string(),
         _ => "null".to_string(),
     };
+    let this = ctx.read_native_pin(this_pin, this);
+    ctx.unpin_native_roots(this_pin);
     let this = sb_append_str(ctx, this, &text);
     Ok(Some(Value::Object(Some(this))))
 }
@@ -2247,10 +2267,14 @@ pub(crate) fn native_sb_append_charsequence_off_len(
     //  - java.lang.String: read_string.
     //  - Any CharSequence with a toString()Ljava/lang/String;: invoke_to_string.
     // Both paths already handle StringBuilder/StringBuffer/String/CharBuffer.
+    // Producer-#12 fix: re-entrant `invoke_to_string` can move `this`.
+    let this_pin = ctx.pin_native_root(this);
     let text = match invoke_to_string(ctx, cs_obj) {
         Ok(s) => s,
         Err(_) => String::new(),
     };
+    let this = ctx.read_native_pin(this_pin, this);
+    ctx.unpin_native_roots(this_pin);
     let chars: Vec<u16> = text.encode_utf16().collect();
 
     // Clamp [start, end] to the CharSequence's length; real JDK throws
@@ -3467,6 +3491,10 @@ pub(crate) fn native_string_replace_charseq(
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    // Producer-#12 fix: the two re-entrant `invoke_to_string` calls can
+    // move `this`; re-read it through a pin before the read_string below
+    // (the funnel unpins on the early-return paths).
+    let this_pin = ctx.pin_native_root(this);
     let target = match args.get(1) {
         Some(Value::Object(Some(o))) => invoke_to_string(ctx, *o).unwrap_or_default(),
         // null target → real JDK NPEs; defer to the (graceful) null result the
@@ -3477,6 +3505,8 @@ pub(crate) fn native_string_replace_charseq(
         Some(Value::Object(Some(o))) => invoke_to_string(ctx, *o).unwrap_or_default(),
         _ => return Ok(Some(Value::Object(None))),
     };
+    let this = ctx.read_native_pin(this_pin, this);
+    ctx.unpin_native_roots(this_pin);
     let s = ctx.read_string(this).unwrap_or_default();
     let result = s.replace(&target, &replacement);
     Ok(Some(Value::Object(Some(

@@ -512,6 +512,9 @@ impl Arena {
     /// stack map). The audit-flagged "perf bug" is a real cost, but the
     /// correctness hazard outweighs it.
     pub fn reset(&mut self) {
+        // stw-residual-close forensics: record the wipe range before zeroing
+        // (site 2 = from-space reset). Gated; no-op unless the env is set.
+        crate::zero_forensics::record(2, 0, self.data.as_ptr() as usize, self.cursor);
         // Zero out used region for safety (prevents stale data reads)
         self.data[..self.cursor].fill(0);
         self.cursor = 0;

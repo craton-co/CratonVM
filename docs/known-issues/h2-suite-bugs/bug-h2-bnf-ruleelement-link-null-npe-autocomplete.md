@@ -1,10 +1,49 @@
-# H2 console autocomplete (`autoCompleteList.do`) returns empty body — `Bnf`/`RuleElement.link` NPE, silently swallowed by H2
+# H2 console autocomplete (`autoCompleteList.do`) returns empty body — root-caused, NOT a discrete bug (same family as `TestBnf`)
 
 ## Status
-**OPEN** — new finding, 2026-07-22, uncovered by fixing
-`bug-h2-httpurlconnection-no-keepalive-pooling-FIXED.md` (that fix let
-`TestWeb.test()` proceed from `testServer()` into `testWebApp()`, which
-fails on this unrelated, pre-existing gap).
+**CLOSED — root-caused as a performance-margin issue, not a discrete
+CratonVM defect** (follow-up session, 2026-07-22, same day as the original
+finding). The original `RuleElement.link` NPE hypothesis below was a **red
+herring from an incomplete isolated repro** (`docs-known-issue-doc-
+hypothesis-can-be-wrong-not-just-stale` applies exactly here) — the isolated
+repro called `Bnf.getInstance(null)` then `getNextTokenList(...)` directly,
+skipping the required `linkStatements()` call that every real caller
+(`WebSession.loadBnf()` included) makes first. With `linkStatements()`
+called (verified via a faithful probe replicating `WebSession.loadBnf()`
+exactly, including all 7 `updateTopic()` calls and a real, `readContents()`-
+populated `DbContents` against a live H2 connection — `BnfProbe4.java`,
+worktree `/data/wt-h2-testupgrade-20260722`), the `RuleElement.link` NPE
+**does not reproduce at all**.
+
+The REAL mechanism behind `TestWeb.testWebApp()`'s empty-body symptom:
+`getNextTokenList("select 'abc")` (an autocomplete query with an
+**unclosed string literal**) returns an empty result (`size=0`) instead of
+suggesting the closing `'`. Root cause: `org.h2.bnf.Sentence`'s hardcoded
+`MAX_PROCESSING_TIME = 100` (milliseconds) wall-clock budget for the BNF
+grammar-tree walk — **the exact same mechanism already characterized for
+`org.h2.test.unit.TestBnf` in `bug-h2-suite-residual-fail-triage.md`**.
+Confirmed directly: temporarily widening the budget to 30000ms in a scratch
+rebuild makes `getNextTokenList("select 'abc")` correctly return
+`{1#anything=Hello World, 1#'='}` (the expected closing-quote suggestion) —
+i.e. CratonVM's interpreter is slow enough that the 100ms budget expires
+before the grammar walk reaches the string-literal (`RuleFixed
+.ANY_EXCEPT_SINGLE_QUOTE`) branch for this specific query shape. Not a
+dispatch/NPE/loader bug of any kind — a genuine interpreter-throughput gap,
+same category as `TestFileLock`/`TestTransaction`/`TestBnf`. No targeted fix
+attempted (would require broader interpreter throughput work, matching
+those items' existing characterization).
+
+`WebApp.autoCompleteList()` swallows the resulting empty-result case
+silently by design (`try { ... session.put("autoCompleteList", result); }
+catch (Throwable e) { server.traceError(e); }` — an empty `result` string is
+not even an exception here, just the correct-per-input output of a grammar
+walk that ran out of budget), which is why the HTTP response comes back as
+a well-formed `200 OK` with `Content-Length: 0` rather than a visible
+error — exactly the originally-reported symptom, now correctly attributed.
+
+**Original (incorrect) hypothesis kept below for context, per this
+project's convention of preserving investigation history rather than
+deleting a superseded hypothesis.**
 
 ## Severity
 **LOW-MEDIUM** — cosmetic/feature gap in the H2 Console's SQL-autocomplete
