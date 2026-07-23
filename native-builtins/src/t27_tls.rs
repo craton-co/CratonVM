@@ -4099,16 +4099,29 @@ fn register_https_url_connection(r: &mut NativeMethodRegistry) {
         ctx: &mut dyn cratonvm_native_api::NativeContext,
         factory: ObjectRef,
     ) -> Option<ObjectRef> {
+        // `class_num_total_fields` is NOT trustworthy here: our own synthetic
+        // `SSLSocketFactory` carrier (`alloc_concurrent_synthetic(...,
+        // "javax/net/ssl/SSLSocketFactory", 1)`) reports 0 total fields for
+        // its ClassId even though it was allocated with (and, per
+        // `get_field`'s M4a contract, safely holds) exactly 1 real slot —
+        // confirmed via `CRATONVM_DBG_TLS_AUTH` tracing (`cid=ClassId(1046)
+        // nfields=0` for an object that DOES have the SSLContext at index
+        // 0). This is the identical "interface-like synthetic class"
+        // metadata gap `alloc_concurrent_synthetic` itself documents and
+        // works around at allocation time via `num_fields.max(real)` — this
+        // resolver hits the same gap on the READ side, where there is no
+        // equivalent fallback. `get_field` is required (M4a, this trait's
+        // own doc) to bounds-check and fail safe on an out-of-declared-range
+        // index, so scanning a small fixed range unconditionally is safe:
+        // true out-of-bounds reads just come back `Value::Object(None)` and
+        // are silently skipped, never a bad memory access.
+        const FIELD_SCAN_RANGE: usize = 8;
         const MAX_DEPTH: usize = 6;
         const MAX_VISITED: usize = 64;
-        let dbg = std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok();
         let sslcontext_cid = ctx.class_id_by_name("javax/net/ssl/SSLContext");
-        if dbg {
-            eprintln!("[dbg-tls-auth] MYFIX sslcontext_cid={:?}", sslcontext_cid);
-        }
         let mut frontier = vec![factory];
         let mut visited = 0usize;
-        for depth in 0..MAX_DEPTH {
+        for _ in 0..MAX_DEPTH {
             let mut next_frontier = Vec::new();
             for obj in frontier {
                 if visited >= MAX_VISITED {
@@ -4116,25 +4129,11 @@ fn register_https_url_connection(r: &mut NativeMethodRegistry) {
                 }
                 visited += 1;
                 let cid = ctx.class_id_of_object(obj);
-                if dbg {
-                    eprintln!(
-                        "[dbg-tls-auth] MYFIX depth={} obj_ih={} cid={:?} nfields={}",
-                        depth,
-                        ctx.identity_hash_code(obj),
-                        cid,
-                        ctx.class_num_total_fields(cid)
-                    );
-                }
                 if sslcontext_cid == Some(cid) {
                     return Some(obj);
                 }
-                let nfields = ctx.class_num_total_fields(cid);
-                for i in 0..nfields {
-                    let fv = ctx.get_field(obj, i);
-                    if dbg {
-                        eprintln!("[dbg-tls-auth] MYFIX   field[{}]={:?}", i, fv);
-                    }
-                    if let Value::Object(Some(candidate)) = fv {
+                for i in 0..FIELD_SCAN_RANGE {
+                    if let Value::Object(Some(candidate)) = ctx.get_field(obj, i) {
                         let sub_cid = ctx.class_id_of_object(candidate);
                         if sslcontext_cid == Some(sub_cid) {
                             return Some(candidate);
