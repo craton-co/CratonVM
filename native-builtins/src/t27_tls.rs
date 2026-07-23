@@ -4158,9 +4158,6 @@ fn register_https_url_connection(r: &mut NativeMethodRegistry) {
         factory: ObjectRef,
         connection: Option<ObjectRef>,
     ) {
-        if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
-            eprintln!("[dbg-tls-auth] MYFIX capture_huc_client_identity CALLED factory_ih={}", ctx.identity_hash_code(factory));
-        }
         if let Some(sslctx) = resolve_sslcontext_from_factory(ctx, factory) {
             if let Some(connection) = connection {
                 capture_huc_ssl_context_for_connection(ctx, connection, sslctx);
