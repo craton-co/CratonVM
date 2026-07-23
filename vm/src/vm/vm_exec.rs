@@ -13599,6 +13599,38 @@ pub(super) fn proxy_resolve_declaring_class_mirror(
     method_name: &str,
     descriptor: &str,
 ) -> ObjectRef {
+    // `Object`'s own instance methods are never declared on any implemented
+    // interface, by construction (an interface implicitly inherits them, it
+    // never redeclares them) — and per the JLS/`Proxy` contract, `equals`/
+    // `hashCode`/`toString` are the ONLY `Object` methods a proxy's
+    // `InvocationHandler` is ever asked to intercept (`getClass`/`notify`/
+    // `wait`/`finalize` never route through `invoke()`). Short-circuit here
+    // so the interface walk below — and specifically its "no declaring
+    // interface found" fallback just past it, which deliberately guesses the
+    // proxy's FIRST implemented interface for a genuinely-unresolvable
+    // lookup — can never misattribute these three well-known `Object`
+    // methods to an interface that merely happens to be listed first.
+    //
+    // This was the root cause of a 100%-reproducible bug where `Method
+    // .getDeclaringClass()` on the `Method` passed to `invoke()` for
+    // `toString()`/`equals()`/`hashCode()` incorrectly reported the proxy's
+    // first interface instead of `java.lang.Object`: the walk below
+    // correctly fails to find them declared on any interface (they aren't),
+    // then fell through to the "prefer the first interface mirror... so the
+    // Method still answers with a real interface" fallback — which is wrong
+    // for these three specifically, since real `Object` IS the right answer.
+    // (`JndiObjectFactoryBeanTests.lookupWithExposeAccessContext` —
+    // `JndiContextExposingInterceptor.isEligible(Method)` checks `Object
+    // .class != method.getDeclaringClass()`, which incorrectly evaluated
+    // true for `toString()`, causing an extra unwanted JNDI context
+    // open/close Mockito caught as an unexpected extra invocation.)
+    if (method_name == "equals" && descriptor == "(Ljava/lang/Object;)Z")
+        || (method_name == "hashCode" && descriptor == "()I")
+        || (method_name == "toString" && descriptor == "()Ljava/lang/String;")
+    {
+        return super::get_or_create_class_mirror(shared, ClassId::new(0));
+    }
+
     // Source the proxy's implemented interfaces. The synthetic 3-slot layout
     // stores the `Class[]` at slot 1; the real-super layout (proxy-real-classfile
     // migration: extends `java.lang.reflect.Proxy` — single field `h` at slot 0)
