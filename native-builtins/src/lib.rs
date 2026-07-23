@@ -71478,10 +71478,47 @@ fn native_url_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let s = url_external_form(ctx, this);
-    let mut h: i32 = 0;
-    for b in s.bytes() {
-        h = h.wrapping_mul(31).wrapping_add(b as i32);
+    // Match URLStreamHandler.hashCode rather than hashing the external-form
+    // string. In particular, `file:example.jar` is hashed as protocol + file
+    // + port (-1), which Spring Boot's nested-jar Handler composes into its
+    // own URL hash contract.
+    let string_hash = |value: &str| {
+        value
+            .encode_utf16()
+            .fold(0i32, |hash, ch| hash.wrapping_mul(31).wrapping_add(ch as i32))
+    };
+    let protocol = url_str_field(ctx, this, "protocol", URL_FIELD_PROTOCOL).unwrap_or_default();
+    let host = url_str_field(ctx, this, "host", URL_FIELD_HOST).unwrap_or_default();
+    let file = url_str_field(ctx, this, "file", URL_FIELD_PATH).unwrap_or_default();
+    let port = match ctx.get_field_by_name(this, "port") {
+        Value::Int(port) => port,
+        _ => match ctx.get_field(this, URL_FIELD_PORT) {
+            Value::Int(port) => port,
+            _ => -1,
+        },
+    };
+    let port = if port == -1 {
+        match protocol.as_str() {
+            "http" => 80,
+            "https" => 443,
+            "ftp" => 21,
+            _ => -1,
+        }
+    } else {
+        port
+    };
+    let reference = match ctx.get_field_by_name(this, "ref") {
+        Value::Object(Some(value)) => ctx.read_string(value).unwrap_or_default(),
+        _ => String::new(),
+    };
+    let mut h = string_hash(&protocol);
+    if !host.is_empty() {
+        h = h.wrapping_add(string_hash(&host.to_lowercase()));
+    }
+    h = h.wrapping_add(string_hash(&file));
+    h = h.wrapping_add(port);
+    if !reference.is_empty() {
+        h = h.wrapping_add(string_hash(&reference));
     }
     Ok(Some(Value::Int(h)))
 }
