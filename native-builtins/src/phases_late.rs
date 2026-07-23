@@ -22367,9 +22367,8 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
     });
     // JarEntry inherits ZipEntry accessors. Spring Boot's JarFileArchive
     // walks each entry via getName / isDirectory (for the include-filter)
-    // and getComment (only consulted when checking the UNPACK: marker on
-    // nested-JAR entries; we do not pack any UNPACK markers so null is
-    // the right answer). Register them on JarEntry directly so the
+    // and getComment (consulted when checking the UNPACK: marker on
+    // nested-JAR entries). Register them on JarEntry directly so the
     // override-allow-list (which forces native-only dispatch on certain
     // jar/zip entry points) sees a non-null result.
     r.register(je, "isDirectory", "()Z", |ctx, args| {
@@ -22388,8 +22387,9 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
         };
         Ok(Some(Value::Int(if is_dir { 1 } else { 0 })))
     });
-    r.register(je, "getComment", "()Ljava/lang/String;", |_ctx, _args| {
-        Ok(Some(Value::Object(None)))
+    r.register(je, "getComment", "()Ljava/lang/String;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        Ok(Some(ctx.get_field_by_name(this, "comment")))
     });
     r.register(je, "getSize", "()J", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -23200,6 +23200,7 @@ fn spring_default_app_ctx_factory_create(
 
 /// One central-directory entry's metadata plus its decompressed bytes.
 pub(crate) struct JarEntryRec {
+    pub(crate) comment: String,
     pub(crate) size: i64,
     pub(crate) csize: i64,
     pub(crate) method: i32,
@@ -23401,6 +23402,7 @@ pub(crate) fn jar_contents_cached(path: &str) -> Option<std::sync::Arc<JarConten
             continue;
         };
         let name = entry.name().to_string();
+        let comment = entry.comment().to_string();
         let size = entry.size() as i64;
         let csize = entry.compressed_size() as i64;
         #[allow(deprecated)]
@@ -23416,6 +23418,7 @@ pub(crate) fn jar_contents_cached(path: &str) -> Option<std::sync::Arc<JarConten
         by_name.insert(
             name,
             JarEntryRec {
+                comment,
                 size,
                 csize,
                 method,
@@ -23458,8 +23461,8 @@ fn p59_jar_collect_entries(ctx: &mut dyn NativeContext, path: &str) -> Vec<Value
             Some(r) => r,
             None => continue,
         };
-        let (size, csize, method, crc, times) =
-            (rec.size, rec.csize, rec.method, rec.crc, rec.times);
+        let (comment, size, csize, method, crc, times) =
+            (&rec.comment, rec.size, rec.csize, rec.method, rec.crc, rec.times);
         let je = alloc_concurrent_synthetic(ctx, "java/util/jar/JarEntry", 4);
         let je_pin = ctx.pin_native_root(je);
         let name_s = ctx.create_string(name);
@@ -23481,6 +23484,14 @@ fn p59_jar_collect_entries(ctx: &mut dyn NativeContext, path: &str) -> Vec<Value
         ctx.set_field_by_name(je, "csize", Value::Long(csize));
         ctx.set_field_by_name(je, "method", Value::Int(method));
         ctx.set_field_by_name(je, "crc", Value::Long(crc));
+        let je = if !comment.is_empty() {
+            let comment_s = ctx.create_string(comment);
+            let je = ctx.read_native_pin(je_pin, je);
+            ctx.set_field_by_name(je, "comment", Value::Object(Some(comment_s)));
+            je
+        } else {
+            je
+        };
         p59_set_jar_entry_times(ctx, je, times);
         out.push(Value::Object(Some(je)));
     }
@@ -23504,9 +23515,10 @@ fn p59_jar_lookup_entry(ctx: &mut dyn NativeContext, path: &str, entry_name: &st
         Some(c) => c,
         None => return Value::Object(None),
     };
-    let (name, size, csize, method, crc, times) = match contents.by_name.get(entry_name) {
+    let (name, comment, size, csize, method, crc, times) = match contents.by_name.get(entry_name) {
         Some(rec) => (
             entry_name.to_string(),
+            rec.comment.clone(),
             rec.size,
             rec.csize,
             rec.method,
@@ -23521,7 +23533,6 @@ fn p59_jar_lookup_entry(ctx: &mut dyn NativeContext, path: &str, entry_name: &st
     let je_pin = ctx.pin_native_root(je);
     let name_s = ctx.create_string(&name);
     let je = ctx.read_native_pin(je_pin, je);
-    ctx.unpin_native_roots(je_pin);
     ctx.set_field(je, 0, Value::Object(Some(name_s)));
     ctx.set_field(je, 1, Value::Long(size));
     ctx.set_field(je, 2, Value::Long(csize));
@@ -23536,7 +23547,16 @@ fn p59_jar_lookup_entry(ctx: &mut dyn NativeContext, path: &str, entry_name: &st
     ctx.set_field_by_name(je, "csize", Value::Long(csize));
     ctx.set_field_by_name(je, "method", Value::Int(method));
     ctx.set_field_by_name(je, "crc", Value::Long(crc));
+    let je = if !comment.is_empty() {
+        let comment_s = ctx.create_string(&comment);
+        let je = ctx.read_native_pin(je_pin, je);
+        ctx.set_field_by_name(je, "comment", Value::Object(Some(comment_s)));
+        je
+    } else {
+        je
+    };
     p59_set_jar_entry_times(ctx, je, times);
+    ctx.unpin_native_roots(je_pin);
     Value::Object(Some(je))
 }
 
@@ -23645,7 +23665,6 @@ fn p59_spring_boot_jar_archive_get_class_path_urls(
 
     let include_filter_pin = ctx.pin_native_root(include_filter);
     let mut urls: Vec<(ObjectRef, usize)> = Vec::new();
-    let jar_uri_path = jar_path.replace('\\', "/").replace('!', "%21");
     for jar_entry in p59_jar_collect_entries(ctx, &jar_path) {
         let Value::Object(Some(jar_entry)) = jar_entry else {
             continue;
@@ -23680,15 +23699,38 @@ fn p59_spring_boot_jar_archive_get_class_path_urls(
                 _ => String::new(),
             };
             if !name.is_empty() {
-                // The Spring Boot nested protocol represents a directory
-                // class root (for example `BOOT-INF/classes/`) differently
-                // from a nested archive. The local class resolver understands
-                // the former `jar:nested:` form; preserve the ordinary
-                // `jar:file:` spelling for nested JAR/ZIP entries.
-                let url_text = if name.ends_with('/') {
-                    format!("jar:nested:/{jar_uri_path}/!{name}!/")
+                let comment = match ctx.get_field_by_name(jar_entry, "comment") {
+                    Value::Object(Some(value)) => ctx.read_string(value).unwrap_or_default(),
+                    _ => String::new(),
+                };
+                let url_text = if comment.starts_with("UNPACK") {
+                    // `JarFileArchive` must materialize UNPACK-marked entries
+                    // at a unique location for each outer archive. Calling its
+                    // private Java helper re-enters unimplemented NIO paths;
+                    // perform the same copy directly from our cached entry.
+                    let bytes = jar_contents_cached(&jar_path)
+                        .and_then(|contents| contents.by_name.get(&name).map(|entry| entry.bytes.clone()));
+                    if let Some(bytes) = bytes {
+                        use std::hash::{Hash, Hasher};
+                        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                        jar_path.hash(&mut hasher);
+                        // Spring Boot scopes the unpack directory to the
+                        // Archive instance, not merely the source path: two
+                        // JarFileArchives over the same outer JAR must not
+                        // share extracted nested libraries.
+                        ctx.identity_hash_code(this).hash(&mut hasher);
+                        let target = std::env::temp_dir()
+                            .join("cratonvm-spring-boot-unpack")
+                            .join(format!("{:x}", hasher.finish()))
+                            .join(std::path::Path::new(&name).file_name().unwrap_or_default());
+                        let _ = target.parent().map(std::fs::create_dir_all);
+                        let _ = std::fs::write(&target, bytes.as_slice());
+                        format!("file:/{}", target.to_string_lossy().replace('\\', "/"))
+                    } else {
+                        format!("jar:nested:/{}/!{}!/", jar_path.replace('\\', "/").replace('!', "%21"), name)
+                    }
                 } else {
-                    format!("jar:file:/{jar_uri_path}!/{name}!/")
+                    format!("jar:nested:/{}/!{}!/", jar_path.replace('\\', "/").replace('!', "%21"), name)
                 };
                 let url = p59_alloc_url(ctx, &url_text);
                 urls.push((url, ctx.pin_native_root(url)));
@@ -23898,46 +23940,25 @@ fn p59_spring_boot_exploded_archive_get_class_path_urls(
 }
 
 /// Spring Boot 3 `ExecutableArchiveLauncher.createClassLoader(Collection)`:
-/// real bytecode does `urls.toArray(new URL[0])` and can `ClassCastException`
-/// when collection iteration / typed `toArray` does not match CratonVM's
-/// mixed real-JDK + synthetic collection layout. Rebuild the nested-jar
-/// `URL[]` from the fat-jar path (same scan as [`p59_fat_jar_boot_inf_nested_url_values`])
-/// and `invokespecial` the private `Launcher.createClassLoader(URL[])` on
-/// the real SB3 launcher type.
+/// Re-enter its real bytecode without native redispatch. This preserves the
+/// supplied collection's URL ordering and classpath-index merge rather than
+/// rebuilding a fat-jar path from the launcher's own code source.
 fn sb3_executable_archive_launcher_create_class_loader_collection(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let cid = ctx.class_id_of_object(this);
-    let cn = ctx.class_name_of_id(cid).unwrap_or_default();
-    let jar_path = ctx.find_class_source_path(&cn).unwrap_or_default();
-    if std::env::var_os("CRATONVM_DBG_SBLOAD").is_some() {
-        eprintln!(
-            "[DBG_SBLOAD] SB3 EAL.createClassLoader(Collection) class={} jar_path={:?}",
-            cn, jar_path
-        );
-    }
+    let urls = obj_arg(args, 1)?;
     // Pin across the URL scan / array alloc below — a moving young GC there
     // would relocate `this` and the collected URLs (native stale-local family).
-    let this_pin = ctx.pin_native_root(this);
-    let url_values = p59_fat_jar_boot_inf_nested_url_values(ctx, &jar_path);
-    let pins = pin_object_values(ctx, &url_values);
-    let url_arr = ctx.new_array(
-        cratonvm_types::ArrayElementType::Reference,
-        url_values.len(),
-    );
-    for (i, (v, p)) in url_values.iter().zip(&pins).enumerate() {
-        let v = read_pinned_object_value(ctx, *p, *v);
-        ctx.set_array_element(url_arr, i, v);
-    }
-    let this = ctx.read_native_pin(this_pin, this);
-    ctx.unpin_native_roots(this_pin);
-    ctx.invoke_special(
-        "org/springframework/boot/loader/launch/Launcher",
+    // Re-enter the concrete bytecode without native redispatch. It preserves
+    // caller-supplied ordering and the classpath-index merge for both nested
+    // and exploded archives.
+    ctx.invoke_special_bytecode_only(
+        "org/springframework/boot/loader/launch/ExecutableArchiveLauncher",
         "createClassLoader",
-        "([Ljava/net/URL;)Ljava/lang/ClassLoader;",
-        &[Value::Object(Some(this)), Value::Object(Some(url_arr))],
+        "(Ljava/util/Collection;)Ljava/lang/ClassLoader;",
+        &[Value::Object(Some(this)), Value::Object(Some(urls))],
     )
 }
 
