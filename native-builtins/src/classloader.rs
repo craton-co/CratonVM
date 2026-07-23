@@ -359,6 +359,22 @@ pub fn defining_loader_for(class_id: u32) -> Option<ObjectRef> {
         .copied()
 }
 
+/// Whether ANY class in this process has ever been defined by a
+/// user-defined `ClassLoader` (i.e. `register_defining_loader` has been
+/// called at least once). A single lock-free atomic load — safe for
+/// interpreter hot paths that need to bail out before taking any
+/// classloader-related lock at all. Since `register_defining_loader` is
+/// called unconditionally whenever a class is assigned a
+/// `ClassLoaderId::UserDefined(_)` identity (see the invariant documented
+/// on `ANY_DEFINING_LOADER_REGISTERED` above), `false` here guarantees no
+/// `ClassId` anywhere in `class_manager` currently has a `UserDefined`
+/// loader id — so callers that only care about "is loader-initiated
+/// resolution even possibly relevant" can skip a `class_manager` read lock
+/// entirely in that (overwhelmingly common) case.
+pub fn any_defining_loader_registered() -> bool {
+    ANY_DEFINING_LOADER_REGISTERED.load(Ordering::Acquire)
+}
+
 /// Store `class_data` for a Class mirror. Returns the previous value if any.
 pub fn set_class_data(mirror: ObjectRef, data: Value) -> Option<Value> {
     class_data_store()
