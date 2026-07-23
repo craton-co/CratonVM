@@ -266,6 +266,16 @@ pub struct ThreadRegistry {
 /// the table from growing across a long-running process.
 const FORMER_MIRROR_CAP: usize = 8192;
 
+// A terminated Java thread's observable state lives in its mirror. Keeping a
+// registry entry after its carrier has exited is therefore unnecessary: all
+// registry-backed operations on a missing entry already have the terminated
+// semantics (not alive, no interrupt target, join returns immediately). More
+// importantly, every GC/STW census walks this map. Tomcat's non-blocking test
+// repeatedly creates and tears down endpoint pools, and retaining every dead
+// carrier turned those censuses into an ever-growing O(total threads ever
+// created) cost. Keep a small diagnostic tail while bounding that cost.
+const TERMINATED_THREAD_ENTRY_CAP: usize = 256;
+
 impl ThreadRegistry {
     /// Create a new, empty registry. The next thread id will be 1
     /// (id 0 is reserved for the main thread).
@@ -693,6 +703,7 @@ impl ThreadRegistry {
     pub fn mark_dead(&self, thread_id: ThreadId) {
         let dead_mirror;
         let dead_park_state;
+        let mut retired_java_tids = Vec::new();
         {
             let mut threads = self.threads.lock();
             let Some(entry) = threads.get_mut(&thread_id) else {
@@ -712,6 +723,32 @@ impl ThreadRegistry {
             entry.join_handle.take();
             dead_mirror = entry.java_thread_obj;
             dead_park_state = entry.park_state.clone();
+
+            let dead_count = threads
+                .values()
+                .filter(|entry| !entry.alive.load(Ordering::Acquire))
+                .count();
+            if dead_count > TERMINATED_THREAD_ENTRY_CAP {
+                let mut purge: Vec<ThreadId> = threads
+                    .iter()
+                    .filter_map(|(id, entry)| {
+                        (!entry.alive.load(Ordering::Acquire)
+                            && entry.async_exception_slot.load(Ordering::Acquire) == 0)
+                            .then_some(*id)
+                    })
+                    .collect();
+                purge.sort_by_key(|id| id.0);
+                for id in purge
+                    .into_iter()
+                    .take(dead_count - TERMINATED_THREAD_ENTRY_CAP)
+                {
+                    if let Some(retired) = threads.remove(&id) {
+                        if retired.java_tid != 0 {
+                            retired_java_tids.push(retired.java_tid);
+                        }
+                    }
+                }
+            }
         }
         // Drop the dead thread's mirror-ADDRESS→ParkState reverse-index entry.
         // The entry itself is retained (TERMINATED `getState()` answers), but
@@ -730,6 +767,12 @@ impl ThreadRegistry {
                 if Arc::ptr_eq(mapped, &dead_park_state) {
                     idx.remove(&(obj.as_ptr() as usize));
                 }
+            }
+        }
+        if !retired_java_tids.is_empty() {
+            let mut by_java_tid = self.java_tid_to_id.lock();
+            for java_tid in retired_java_tids {
+                by_java_tid.remove(&java_tid);
             }
         }
     }
@@ -1956,6 +1999,20 @@ mod tests {
         assert!(!registry.is_alive(tid));
         assert_eq!(registry.count(), 1);
         assert_eq!(registry.alive_count(), 0);
+    }
+
+    #[test]
+    fn terminated_entries_are_bounded() {
+        let registry = ThreadRegistry::new();
+        for id in 1..=(TERMINATED_THREAD_ENTRY_CAP as u64 + 3) {
+            let tid = ThreadId(id);
+            registry.register(tid, "short-lived", None);
+            registry.mark_dead(tid);
+        }
+
+        assert_eq!(registry.alive_count(), 0);
+        assert_eq!(registry.count(), TERMINATED_THREAD_ENTRY_CAP);
+        assert!(!registry.is_alive(ThreadId(1)));
     }
 
     #[test]
