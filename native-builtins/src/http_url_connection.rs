@@ -2605,9 +2605,9 @@ fn huc_get_response_message(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     // Real-JDK carrier: derive from the cached perform result. Prefer the
     // reason phrase actually read off the wire (real servers often deviate
     // from the RFC's canonical phrase, e.g. OkHttp MockWebServer's default
-    // "Server Error" for 500 vs. the RFC's "Internal Server Error" -- real
+    // "Server Error" for 500 vs. the RFC's "Internal Server Error" — real
     // HttpURLConnection.getResponseMessage() always returns exactly what the
-    // server sent) -- the hardcoded `status_reason` table is only a fallback
+    // server sent) — the hardcoded `status_reason` table is only a fallback
     // for when no reason was captured (e.g. the synthetic timeout result).
     if let Some(url_str) = huc_real_object_url(ctx, this) {
         if url_str.starts_with("http://") || url_str.starts_with("https://") {

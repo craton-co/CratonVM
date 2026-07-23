@@ -101,7 +101,7 @@ struct SeState {
     /// functions with no memory of prior calls, so "UTF-16"/"UTF-32" (the
     /// BOM-prefixed JDK charset names, as opposed to the fixed-endian
     /// "UTF-16BE"/"UTF-16LE"/etc.) would otherwise get a fresh BOM prepended
-    /// on EVERY `write()` call instead of once at the start of the stream --
+    /// on EVERY `write()` call instead of once at the start of the stream —
     /// real JDK's `sun.nio.cs.UTF_16.Encoder` tracks this with an internal
     /// `first` flag and only writes the BOM before the very first character.
     /// See `effective_encode_name` below for how this is used.
@@ -266,7 +266,7 @@ fn name_of(ctx: &dyn NativeContext, this: ObjectRef) -> String {
 /// write call: `name` unchanged (BOM included) the first time this stream
 /// encodes anything, or the fixed big-endian variant ("UTF-16BE"/"UTF-32BE",
 /// matching the endianness `encode_utf16_with_bom`/`encode_utf32_with_bom`
-/// already commit to) on every call after that -- see `SeState::bom_written`.
+/// already commit to) on every call after that — see `SeState::bom_written`.
 /// Any other charset name is returned unchanged.
 fn effective_encode_name(ctx: &dyn NativeContext, this: ObjectRef, name: &str) -> String {
     let fixed_be = match name {
