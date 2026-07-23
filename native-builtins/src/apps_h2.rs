@@ -1231,8 +1231,18 @@ fn h2_root_reference_update_root_page(
             None => return Ok(Some(Value::Object(None))),
         };
         let old_root_pin = ctx.pin_native_root(old_root);
-        let new_ref = match ctx.new_object_initialized(
-            H2_ROOT_REFERENCE,
+        // Loader-precise construction (JVMS §5.3): resolving "org/h2/mvstore/
+        // RootReference" by name alone collapses to whichever loader defined
+        // it FIRST process-wide (see `new_object_initialized`'s own doc
+        // comment) -- fatal here specifically, since `Upgrade.loadH2`'s
+        // per-call anonymous ClassLoader defines its OWN, distinct copy of
+        // this class. `this` (the RootReference being updated) is always an
+        // instance of the correct copy, so its own class_id is the
+        // authoritative target -- construct the new RootReference as THAT
+        // exact class, never re-resolved by name.
+        let this_class_id = ctx.class_id_of_object(this);
+        let new_ref = match ctx.new_object_initialized_with_class_id(
+            this_class_id,
             "(Lorg/h2/mvstore/RootReference;Lorg/h2/mvstore/Page;J)V",
             &[
                 Value::Object(Some(this)),
