@@ -107,6 +107,15 @@ run_one() {
 
 mkdir -p "$TC_ROOT/output/test-tmp"
 
+# Ant's <junit> task runs with dir="." (its own basedir == the checkout root),
+# and a lot of TomcatBaseTest-derived tests open resources via bare relative
+# paths like new File("test/webapp") that resolve against the JVM's actual
+# CWD at launch - NOT against -Dtomcat.test.basedir. Without this cd, every
+# such class fails with FileNotFoundException/NoSuchFileException regardless
+# of which VM runs it (found 2026-07-24: ~107 of a 172-class "fixture gap"
+# bucket were actually this bug, not real environment gaps).
+cd "$TC_ROOT" || { echo "cannot cd to TC_ROOT=$TC_ROOT" >&2; exit 1; }
+
 idx=0
 while IFS= read -r cls; do
   [ -z "$cls" ] && continue
