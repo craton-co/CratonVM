@@ -2149,6 +2149,15 @@ impl<'a> NativeContextImpl<'a> {
         if let Some(r) = self.thread.native_pending_return {
             snapshot.push(r);
         }
+        // The blocked-thread snapshot is the only marking view a collector on
+        // another thread has of this JIT worker.  Publish the direct HashMap
+        // cache here as well as in the safepoint snapshot so its map/node pair
+        // cannot become a stale raw ObjectRef while the owner is parked.  The
+        // matching wake-side remap is below in `check_post_block_gc_refs`.
+        for entry in &self.thread.jit_hashmap_string_node_cache {
+            snapshot.push(entry.map);
+            snapshot.push(entry.node);
+        }
         // JNI local references (INT-5): this thread's `JNI_LOCAL_FRAMES`
         // handles. A JNI native that obtained local refs and then re-entered
         // Java (parking at a safepoint) or blocked leaves them populated —
@@ -2456,6 +2465,19 @@ impl<'a> NativeContextImpl<'a> {
                 let old_addr = obj_ref.as_ptr() as usize;
                 if let Some(&new_addr) = fixup.get(&old_addr) {
                     *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+                }
+            }
+            // The JIT HashMap fast path owns raw map/node ObjectRefs outside
+            // frames.  A collector can move either while this native worker is
+            // blocked, so forward both before Java/JIT code is allowed to read
+            // the cache again.  This is the blocked-wake counterpart of the
+            // current-thread `update_all_roots` remap in `memory/gc.rs`.
+            for entry in &mut self.thread.jit_hashmap_string_node_cache {
+                for obj_ref in [&mut entry.map, &mut entry.node] {
+                    let old_addr = obj_ref.as_ptr() as usize;
+                    if let Some(&new_addr) = fixup.get(&old_addr) {
+                        *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+                    }
                 }
             }
             for (_key_id, key_ref, val) in &mut self.thread.scoped_values {

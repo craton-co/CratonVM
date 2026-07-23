@@ -3283,6 +3283,17 @@ pub(crate) fn update_root_snapshot(shared: &SharedVm, thread: &mut JvmThread) {
     if let Some(r) = thread.native_pending_return {
         snapshot.push(r);
     }
+    // Direct JIT HashMap node cache: unlike the ordinary current-thread root
+    // scan, a cross-thread collector can see this parked thread only through
+    // `root_snapshot`.  Keep both cache handles in that snapshot so a
+    // collection initiated by another worker cannot reclaim or relocate a
+    // cached node behind the JIT fast path.  The three pointer-map consumers
+    // (`gc.rs`, `apply_pointer_map_to_thread`, and blocked wake-up) each
+    // forward these entries before the owner can read the cache again.
+    for entry in &thread.jit_hashmap_string_node_cache {
+        snapshot.push(entry.map);
+        snapshot.push(entry.node);
+    }
     // JNI local references (INT-5, safepoint half): a JNI native that
     // obtained local refs and re-entered Java parks HERE — and a
     // cross-thread collector marks this thread only from this snapshot, so
@@ -3802,6 +3813,18 @@ pub(crate) fn apply_pointer_map_to_thread(
         if let Some(&new_addr) = pointer_map.get(&old_addr) {
             // SAFETY: new_addr was produced by pointer_map and points at the relocated, valid object header within the heap arena.
             *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+        }
+    }
+    // The JIT HashMap fast path owns raw map/node ObjectRefs outside frames.
+    // A thread parked at this safepoint can miss a moving collection initiated
+    // by a peer, so mirror the initiator and blocked-wake remaps before JIT
+    // code resumes and probes the cache.
+    for entry in &mut thread.jit_hashmap_string_node_cache {
+        for obj_ref in [&mut entry.map, &mut entry.node] {
+            let old_addr = obj_ref.as_ptr() as usize;
+            if let Some(&new_addr) = pointer_map.get(&old_addr) {
+                *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+            }
         }
     }
     for (_key_id, key_ref, val) in &mut thread.scoped_values {
