@@ -6345,11 +6345,9 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         "newFileSystem",
         "(Ljava/nio/file/Path;Ljava/util/Map;Ljava/lang/ClassLoader;)Ljava/nio/file/FileSystem;",
         |ctx, args| {
-            let jar_path = obj_arg(args, 0)
-                .ok()
-                .map(|p| p57_read_path(ctx, p))
-                .unwrap_or_default();
-            let fs = p57_alloc_jar_filesystem(ctx, &jar_path);
+            let fs = obj_arg(args, 0)
+                .map(|p| p57_mount_jar_filesystem(ctx, p))
+                .unwrap_or_else(|_| p57_alloc_default_filesystem(ctx));
             Ok(Some(Value::Object(Some(fs))))
         },
     );
@@ -6358,11 +6356,9 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         "newFileSystem",
         "(Ljava/nio/file/Path;Ljava/util/Map;)Ljava/nio/file/FileSystem;",
         |ctx, args| {
-            let jar_path = obj_arg(args, 0)
-                .ok()
-                .map(|p| p57_read_path(ctx, p))
-                .unwrap_or_default();
-            let fs = p57_alloc_jar_filesystem(ctx, &jar_path);
+            let fs = obj_arg(args, 0)
+                .map(|p| p57_mount_jar_filesystem(ctx, p))
+                .unwrap_or_else(|_| p57_alloc_default_filesystem(ctx));
             Ok(Some(Value::Object(Some(fs))))
         },
     );
@@ -6371,11 +6367,9 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         "newFileSystem",
         "(Ljava/nio/file/Path;Ljava/lang/ClassLoader;)Ljava/nio/file/FileSystem;",
         |ctx, args| {
-            let jar_path = obj_arg(args, 0)
-                .ok()
-                .map(|p| p57_read_path(ctx, p))
-                .unwrap_or_default();
-            let fs = p57_alloc_jar_filesystem(ctx, &jar_path);
+            let fs = obj_arg(args, 0)
+                .map(|p| p57_mount_jar_filesystem(ctx, p))
+                .unwrap_or_else(|_| p57_alloc_default_filesystem(ctx));
             Ok(Some(Value::Object(Some(fs))))
         },
     );
@@ -6735,6 +6729,14 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                 .ok()
                 .map(|p| p57_read_path(ctx, p))
                 .unwrap_or_default();
+            // A path obtained from a mounted outer jar identifies an entry,
+            // rather than a host file. ZipFS must mount that entry's bytes as
+            // the inner archive (Spring Boot's `nested.jar` integration path).
+            let jar_path = if let Some((outer, entry)) = jarfs_decode(&jar_path) {
+                jarfs_materialize_entry(&outer, &entry).unwrap_or(jar_path)
+            } else {
+                jar_path
+            };
             let fs = p57_alloc_jar_filesystem(ctx, &jar_path);
             Ok(Some(Value::Object(Some(fs))))
         },
@@ -6762,7 +6764,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                 let fs = p57_alloc_jrt_filesystem(ctx, &jh);
                 return Ok(Some(Value::Object(Some(fs))));
             }
-            if let Some(jar) = p57_jar_uri_to_os_path(&text) {
+            if let Some((jar, _entry)) = p57_jar_uri_to_entry_path(&text) {
                 // Mount file-backed jar/zip URIs even when the archive does not
                 // exist yet. HotSpot's zipfs supports Map.of("create", "true");
                 // callers then populate it through Files.createDirectories/copy.
@@ -12184,6 +12186,19 @@ fn p57_read_path(ctx: &mut dyn NativeContext, path_obj: ObjectRef) -> String {
     result
 }
 
+/// Mount a host archive or an entry in an already-mounted archive. Nested jar
+/// entries must first become a physical temporary ZIP, because the virtual-FS
+/// sentinel is not a path the ZIP provider can reopen directly.
+fn p57_mount_jar_filesystem(ctx: &mut dyn NativeContext, path_obj: ObjectRef) -> ObjectRef {
+    let jar_path = p57_read_path(ctx, path_obj);
+    let jar_path = if let Some((outer, entry)) = jarfs_decode(&jar_path) {
+        jarfs_materialize_entry(&outer, &entry).unwrap_or(jar_path)
+    } else {
+        jar_path
+    };
+    p57_alloc_jar_filesystem(ctx, &jar_path)
+}
+
 /// Convert a Java-style path to an OS-native path.
 /// Strips leading `/` from Windows drive paths like `/C:/foo` → `C:/foo`.
 fn p57_to_os_path(p: &str) -> String {
@@ -13072,6 +13087,27 @@ fn jarfs_read_entry(jar: &str, entry: &str) -> std::io::Result<Vec<u8>> {
     Ok(buf)
 }
 
+/// Expose a nested archive entry as a stable temporary host file. The virtual
+/// jar filesystem is intentionally read-only and byte-backed, while ZipFS's
+/// `newFileSystem(Path)` contract expects an archive path it can mount. Keep
+/// the materialization keyed by both the outer archive path and entry name so
+/// separate test archives never alias one another.
+fn jarfs_materialize_entry(jar: &str, entry: &str) -> Option<String> {
+    use std::hash::{Hash, Hasher};
+
+    let bytes = jarfs_read_entry(jar, entry).ok()?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    jar.hash(&mut hasher);
+    entry.hash(&mut hasher);
+    let dir = std::env::temp_dir().join("cratonvm-nested-jarfs");
+    std::fs::create_dir_all(&dir).ok()?;
+    let file = dir.join(format!("{:016x}.jar", hasher.finish()));
+    if !file.is_file() {
+        std::fs::write(&file, bytes).ok()?;
+    }
+    Some(file.to_string_lossy().into_owned())
+}
+
 fn jarfs_entry_size(jar: &str, entry: &str) -> std::io::Result<i64> {
     let entry = entry.trim_start_matches('/');
     let index = jar_index(jar).ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))?;
@@ -13781,9 +13817,37 @@ fn p57_jar_uri_to_os_path(text: &str) -> Option<String> {
 /// whereas `Path.of(URI)` must retain the entry portion for `Files.*` calls.
 fn p57_jar_uri_to_entry_path(text: &str) -> Option<(String, String)> {
     let rest = text.strip_prefix("jar:")?;
-    let (container, entry) = rest.split_once("!/")?;
-    let jar = p57_jar_uri_to_os_path(container)?;
-    Some((jar, entry.to_string()))
+    if let Some(nested) = rest.strip_prefix("nested:") {
+        // Spring Boot's handler uses `nested:<outer-path>/!<inner.jar>!/…`.
+        // Unlike ordinary jar URIs, the first delimiter is `/!` (without the
+        // slash after `!`). Materialize each nested archive on demand so the
+        // normal jarfs index can continue to operate over a physical ZIP.
+        let (outer_text, nested_tail) = match nested.split_once("/!") {
+            Some((outer, tail)) => (outer, Some(tail)),
+            None => (nested.trim_end_matches('/'), None),
+        };
+        let mut jar = p57_jar_uri_to_os_path(outer_text)?;
+        let Some(nested_tail) = nested_tail else {
+            return Some((jar, String::new()));
+        };
+        let parts: Vec<&str> = nested_tail.split("!/").collect();
+        if parts.is_empty() || parts[0].is_empty() {
+            return Some((jar, String::new()));
+        }
+        for nested_entry in &parts[..parts.len().saturating_sub(1)] {
+            jar = jarfs_materialize_entry(&jar, nested_entry)?;
+        }
+        if parts.len() == 1 {
+            jar = jarfs_materialize_entry(&jar, parts[0])?;
+            Some((jar, String::new()))
+        } else {
+            Some((jar, parts.last().unwrap_or(&"").to_string()))
+        }
+    } else {
+        let (container, entry) = rest.split_once("!/")?;
+        let jar = p57_jar_uri_to_os_path(container)?;
+        Some((jar, entry.to_string()))
+    }
 }
 
 /// Build a `java.io.IOException` runtime error from a Rust IO error — used so
@@ -22884,14 +22948,38 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
     // legacy SB2 bridge above. Reuse the real-mode base delegation, including
     // its post-parent URLClassLoader local lookup.
     let luc3 = "org/springframework/boot/loader/launch/LaunchedClassLoader";
-    for descriptor in [
+    r.register(
+        luc3,
+        "loadClass",
         "(Ljava/lang/String;)Ljava/lang/Class;",
+        |ctx, args| {
+            // Keep ClassLoader's public overload in bytecode. It performs a
+            // virtual call to the two-argument overload, which then reaches
+            // the concrete LaunchedClassLoader implementation below.
+            ctx.invoke_special_bytecode_only(
+                "java/lang/ClassLoader",
+                "loadClass",
+                "(Ljava/lang/String;)Ljava/lang/Class;",
+                args,
+            )
+        },
+    );
+    r.register(
+        luc3,
+        "loadClass",
         "(Ljava/lang/String;Z)Ljava/lang/Class;",
-    ] {
-        r.register(luc3, "loadClass", descriptor, |ctx, args| {
-            crate::classloader_real::cl_real_load_class_base_from_args(ctx, args)
-        });
-    }
+        |ctx, args| {
+            // LaunchedClassLoader has a deliberate child-first path for
+            // JarMode/JarModeRunner. The generic parent-first bridge returns
+            // the AppClassLoader's class mirror instead.
+            ctx.invoke_special_bytecode_only(
+                "org/springframework/boot/loader/launch/LaunchedClassLoader",
+                "loadClass",
+                "(Ljava/lang/String;Z)Ljava/lang/Class;",
+                args,
+            )
+        },
+    );
     // ---------------------------------------------------------------------------
     // S111r21 — Spring's ClassUtils.forName(String, ClassLoader) native override.
     //
