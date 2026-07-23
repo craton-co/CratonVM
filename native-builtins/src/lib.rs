@@ -8278,20 +8278,56 @@ fn native_spring_extension_resolve_parameter(
         }
     }
 
-    // Spring Framework 7.0.7 delegates every parameter shape directly to
-    // ParameterResolutionDelegate. Keep this native mirror deliberately
-    // narrow: the former ApplicationContext / BeanOverride branches drifted
-    // from Spring and linked a removed SpringExtension.isBeanOverride method.
+    // Real Spring source (spring-framework-recheck, verified 2026-07-23) still
+    // has an isBeanOverride(Parameter) short-circuit ahead of the generic
+    // ParameterResolutionDelegate fallback: a @BeanOverride-annotated (e.g.
+    // @MockitoBean/@MockitoSpyBean) constructor parameter with a resolvable
+    // BeanOverrideHandler.getBeanName() is looked up DIRECTLY by name via
+    // applicationContext.getBean(name), bypassing ambiguous by-type
+    // autowiring entirely. The prior "narrowed" comment here claiming this
+    // was removed upstream was wrong (or based on a stale/different
+    // checkout) -- without this branch, EVERY bean-override constructor
+    // parameter whose override name doesn't happen to equal the parameter's
+    // own name (or carry an explicit @Qualifier) falls through to
+    // ParameterResolutionDelegate.resolveDependency and throws
+    // NoUniqueBeanDefinitionException, since all sibling override beans
+    // share the same declared type. Restore the shortcut by calling the
+    // real (unmodified) BeanOverrideUtils.resolveHandlerForParameter, which
+    // itself performs the isBeanOverride check internally (returns null for
+    // non-override parameters), so this is purely additive.
     let application_context = spring_extension_get_application_context(ctx, extension_context)?;
-    let bean_factory_result = match application_context {
-        Some(Value::Object(Some(application_context))) => ctx.invoke_virtual(
-            application_context,
-            "getAutowireCapableBeanFactory",
-            "()Lorg/springframework/beans/factory/config/AutowireCapableBeanFactory;",
-            &[],
-        )?,
+    let application_context_obj = match application_context {
+        Some(Value::Object(Some(application_context))) => application_context,
         other => return Ok(other),
     };
+
+    if let Ok(Some(Value::Object(Some(handler)))) = ctx.invoke_special(
+        "org/springframework/test/context/bean/override/BeanOverrideUtils",
+        "resolveHandlerForParameter",
+        "(Ljava/lang/reflect/Parameter;Ljava/lang/Class;)Lorg/springframework/test/context/bean/override/BeanOverrideHandler;",
+        &[
+            Value::Object(Some(parameter)),
+            Value::Object(Some(test_class)),
+        ],
+    ) {
+        if let Ok(Some(Value::Object(Some(bean_name)))) =
+            ctx.invoke_virtual(handler, "getBeanName", "()Ljava/lang/String;", &[])
+        {
+            return ctx.invoke_virtual(
+                application_context_obj,
+                "getBean",
+                "(Ljava/lang/String;)Ljava/lang/Object;",
+                &[Value::Object(Some(bean_name))],
+            );
+        }
+    }
+
+    let bean_factory_result = ctx.invoke_virtual(
+        application_context_obj,
+        "getAutowireCapableBeanFactory",
+        "()Lorg/springframework/beans/factory/config/AutowireCapableBeanFactory;",
+        &[],
+    )?;
     let bean_factory = match bean_factory_result {
         Some(Value::Object(Some(bean_factory))) => bean_factory,
         _ => return Ok(Some(Value::Object(None))),

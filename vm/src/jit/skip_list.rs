@@ -120,6 +120,31 @@ pub enum SkipReason {
     /// Keep this symbol-completion method interpreted until its JIT lowering
     /// is understood.
     ClassFinderComplete,
+    /// Javac's `ClassFinder.fillIn` -- the method `ClassFinder.complete`
+    /// itself calls to do the actual symbol completion -- is a FIFTH
+    /// distinct JIT residual in the same repeated-in-process-compilation
+    /// scenario as `ClassReaderReadClass`/`ClassFinderComplete` above.
+    /// `ClassFinderComplete`'s own doc comment noted `fillIn` was
+    /// bisect-RULED-OUT for the two symptoms known at the time (a
+    /// deprecation-warning `-Werror` false positive and duplicated-token
+    /// generated source) -- but `fillIn` gets its own independent JIT
+    /// tier-up eligibility separate from its caller `complete` (forcing
+    /// `complete` to interpret does not prevent `fillIn` from itself
+    /// getting hot enough to tier up under a longer-running loop), and DOES
+    /// independently miscompile: `java.lang.NullPointerException` thrown
+    /// directly from `ClassFinder.fillIn` (JDK 25.0.3, line ~395) reached
+    /// via `Types.unboxedType` -> `ClassFinder.complete` -> `fillIn`
+    /// while attributing a `new Object[]{...}` array-initializer literal,
+    /// surfacing as real javac's own internal-compiler-error report rather
+    /// than a Spring-visible `CompilationException`. Reproduced
+    /// deterministically at iteration 38 of a Spring-free, ~30-line
+    /// standalone repro (`ToolProvider.getSystemJavaCompiler().getTask(...)
+    /// .call()` looped in one process, each iteration compiling a trivial
+    /// user class against a small JSpecify-`@Nullable`-annotated
+    /// `@FunctionalInterface` also in scope) -- with `ClassFinderComplete`
+    /// already interpreted per the fix above. Keep this symbol-completion
+    /// method interpreted until its own JIT lowering is understood too.
+    ClassFinderFillIn,
     /// Spring's shaded JavaPoet `CodeBlock$Builder.add(String, Object...)`
     /// (the $-placeholder format-string parser, reached from
     /// `org/springframework/javapoet/CodeBlock$Builder`) is a FOURTH distinct
@@ -503,6 +528,10 @@ fn should_skip_jit_internal(
     // `complete` interpreted until the x64 lowering bug is found.
     if class_name == "com/sun/tools/javac/code/ClassFinder" && method_name == "complete" {
         return Some(SkipReason::ClassFinderComplete);
+    }
+
+    if class_name == "com/sun/tools/javac/code/ClassFinder" && method_name == "fillIn" {
+        return Some(SkipReason::ClassFinderFillIn);
     }
 
     // SPRING-TESTCOMPILER.4 (2026-07-21): see `JavaPoetCodeBlockBuilderAdd`
