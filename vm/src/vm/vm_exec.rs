@@ -847,6 +847,22 @@ fn safe_native_call_impl(
     if stw_pending {
         crate::runtime::interpreter::safepoint_check(shared, thread);
     }
+    // A native callback can allocate through `NativeContext::new_array`, whose
+    // contract cannot surface an allocation failure and therefore must not
+    // initiate a moving collection mid-callback: native locals are not all
+    // rooted yet. This funnel is the safe pre-callback point — every Java
+    // argument is pinned above and refreshed below. Collect as soon as the
+    // heap's normal occupancy trigger fires, not only after a fallible native
+    // allocation has spilled. Without this, a no-JIT workload made entirely of
+    // native allocations (Tomcat's repeated embedded-server lifecycle is one)
+    // can fill every G1 Eden region and abort on an otherwise tiny array.
+    let mut threshold_gc = false;
+    if shared.heap.needs_gc()
+        && !crate::runtime::interpreter::gc_overhead_limit_exceeded(shared)
+    {
+        crate::runtime::interpreter::maybe_gc_forced_pub(shared, thread);
+        threshold_gc = true;
+    }
     // Native-alloc young-pressure relief: when a native allocation wrapper
     // had to spill into old gen because young was exhausted (the wrappers —
     // `ctx.alloc_object`, `new_array`, … — must stay GC-free mid-callback,
@@ -878,7 +894,7 @@ fn safe_native_call_impl(
         // of live data (overhead limit) — the next spill re-sets it.
         shared.heap.clear_young_spill_pressure();
     }
-    if stw_pending || pressure_gc {
+    if stw_pending || threshold_gc || pressure_gc {
         let mut fresh = args.to_vec();
         for (idx, root_idx) in arg_root_indices.iter().enumerate() {
             let Some(root_idx) = root_idx else {
