@@ -22993,6 +22993,31 @@ fn spring_class_utils_for_name_impl(
             _ => None,
         },
     };
+    // Fork-loader identity fix (2026-07-22 AOT bean-override session): when
+    // the resolved `loader` above is None (no explicit arg, no TCCL) or is a
+    // built-in loader that `is_user_defined_loader` rejects, this native
+    // previously fell straight through to the global, loader-BLIND
+    // `ensure_class_initialized` fast path below. That path prefers an
+    // already-loaded Application-loader answer over a class the CALLER's own
+    // `@CompileWithForkedClassLoader` fork loader already redefined (see
+    // `classloading::class_manager::resolve_fast_path_class_id`'s own doc
+    // comment), so framework infrastructure classes resolved via
+    // `ClassUtils.forName(name, null)` from code running INSIDE a fork (e.g.
+    // `GeneratedMapUtils.loadMap` -> `AotTestContextInitializersFactory`)
+    // silently collapsed onto a FRESH Application-loader `ClassId` distinct
+    // from the fork's own copy -- busting identity-based caches keyed off the
+    // resulting `Class` object (`AotMergedContextConfiguration.hashCode()`),
+    // and ultimately causing a SECOND, uncustomized `ApplicationContext` to
+    // be created and used in place of the properly `@TestBean`/`@MockitoBean`
+    // -overridden one (see docs/known-issues/CRATONVM-SPRING-GENUINE-BUGLIST.md,
+    // AOT cluster, 2026-07-22 bean-override session). Mirror `Class.forName`'s
+    // OWN caller-sensitive fallback here too: if the immediate Java caller of
+    // this native (i.e. of `ClassUtils.forName` itself) was defined by a
+    // user-defined loader, prefer resolving through THAT loader before ever
+    // reaching the global fallback -- exactly the same rule already applied
+    // above when `loader` came from TCCL/an explicit arg.
+    let loader = loader.or_else(|| crate::lang_class::class_for_name_one_arg_caller_loader(ctx));
+
     if let Some(loader) = loader {
         if crate::classloader::is_user_defined_loader(ctx, loader) {
             let load = |ctx: &mut dyn NativeContext, n: ObjectRef| {
