@@ -73,3 +73,14 @@ needing a bigger `-Xmx` than the flat default) / 0 CRASH.**
 
 Full breakdown and the 23-class list: [16](16-full-suite-6shard-rerun-20260721.md).
 Reusable Linux runner: `apps/tomcat-suite-runner/run-tomcat-suite.sh`.
+
+**Update, 2026-07-23:** merged `origin/dev` (253 commits, `→ 893ddbc73`),
+rebuilt, and reran the 195 non-PASS classes in 4 shards. **12 of the 23
+regressions are now fixed** upstream — **463 PASS / 11 confirmed regressions
+remaining / 172 unchanged fixture gaps.** New finding: `TestNonBlockingAPI`
+now reproduces a real Rust panic (`vm/src/runtime/value_stack.rs:237:25`,
+`usize` underflow) on a background NIO worker thread — highest-priority item
+in the remaining 11. Also flagged: two remaining-11 classes
+(`TestMapperPerformance`, `TestJNDIRealmIntegration`) have existing docs in
+this directory claiming they're already fixed, but both still fail/hang on
+current `dev` — not reconciled yet. See group 16's addendum for full detail.
