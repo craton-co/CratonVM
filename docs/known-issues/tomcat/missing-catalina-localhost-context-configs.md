@@ -1,7 +1,25 @@
 # Missing `conf/Catalina/localhost/*.xml` per-webapp context configs — 8 classes
 
-**Not a CratonVM bug.** Fails identically on real JDK 25 (HotSpot) in the
-same fixture.
+> ⚠️ **ROOT-CAUSE THEORY WAS WRONG — corrected 2026-07-23.** Ran a real
+> `ant deploy` in the fixture; it does **not** stage
+> `conf/Catalina/localhost/*.xml` at all (`grep`'d `build.xml` for
+> `Catalina/localhost`/`manager.xml`/`host-manager.xml` — zero hits). The
+> `manager`/`host-manager` webapps actually ship their own embedded
+> `webapps/{manager,host-manager}/META-INF/context.xml`, which Tomcat's
+> `HostConfig` reads directly when auto-deploying a directory under
+> `webapps/` — no separate per-`Host` XML fragment needed. What `ant deploy`
+> **did** fix was `output/build/lib/*.jar` being completely absent (see
+> [missing-build-lib-jars.md](missing-build-lib-jars.md)) — that was the
+> actual blocker for most of these classes' `LifecycleException`s. After
+> that one fix: `TestHostManagerWebapp` and `TestMapperListener` now PASS on
+> both VMs; **the other 6** (`TestManagerWebapp`, `TestManagerWebappSsl`,
+> `TestMapperWebapps`, `TestDefaultServlet`, `TestWebdavServlet`, `TestSsl`)
+> now PASS on HotSpot but reveal genuine CratonVM-only regressions — see
+> [regressions-revealed-by-fixture-completion-20260723.md](regressions-revealed-by-fixture-completion-20260723.md).
+> No `conf/Catalina/localhost/` work was ever actually done or needed.
+
+**Historical, WRONG root-cause theory below — kept for reference, not as a
+current fix guide. See the correction note above.**
 
 ## Symptom
 

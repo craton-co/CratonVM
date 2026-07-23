@@ -1,7 +1,20 @@
 # `*LargeHeap` classes OOM at the harness's flat `-Xmx2g` — 3 classes
 
-**Not a CratonVM bug.** Fails identically on real JDK 25 (HotSpot) in the
-same fixture.
+> ⚠️ **PARTIALLY RESOLVED, 2026-07-23.** Bumped to `--Xmx 8g` for a rerun.
+> `TestByteChunkLargeHeap`/`TestCharChunkLargeHeap` now PASS on HotSpot —
+> but **both now FAIL on CratonVM**, a newly-revealed regression (not yet
+> individually triaged). `TestEncryptInterceptorLargeHeap` still fails on
+> **both** VMs even at 8g, but with different, narrower symptoms than the
+> original flat-`2g` OOM: HotSpot gets a semantic assertion failure (`actual
+> array was null`), CratonVM **hard-aborts** (`FATAL: OutOfMemoryError:
+> young gen exhausted` on a single ~1GB allocation — the young generation
+> doesn't grow/promote for one huge object even with a large `-Xmx`). See
+> [regressions-revealed-by-fixture-completion-20260723.md](regressions-revealed-by-fixture-completion-20260723.md)
+> for detail on all three.
+
+**Not a CratonVM bug** (the original flat-heap-OOM framing) — the heap-size
+diagnosis below is still accurate as far as it went; it just wasn't the
+whole story for all three classes.
 
 ## Symptom
 
