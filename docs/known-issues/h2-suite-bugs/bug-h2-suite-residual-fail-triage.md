@@ -1506,5 +1506,61 @@ continues to reproduce in well under 5 minutes; the new `[CASROOT-TRACE/*]`
 tags are left in the tree alongside `[TRYUPDATE-TRACE/*]`, both zero-cost
 when the env var is unset.
 
+
+
+### Same-session addendum #2: `Page` constructors and `copy(map, ...)` call
+### sites ruled out — corruption entry point still not pinned down
+
+Extended tracing to `Page`'s three constructors (`Page.java:131,135,140` —
+`<init>` calls, gated on `class_name.contains("Page")`), comparing each
+call's own class context against the `map` constructor argument's loader.
+**1542 constructor calls captured in a full run — zero mismatches.** Every
+`Application`-context `Page`/`Leaf`/`NonLeaf` construction receives an
+`Application` `map`; every `UserDefined`-context one receives a
+`UserDefined` `map`, without exception. `Page` construction itself is
+clean.
+
+Also read (not traced — structurally unambiguous) both call sites of the
+abstract `Page.copy(MVMap<K,V> map, boolean eraseChildrenRefs)`:
+`MVMap.java:650` (`root = root.copy(this, false)`) and `MVMap.java:1182`
+(`source.copy(this, true)`) both pass the **enclosing method's own `this`**
+as the `map` argument — this can't independently introduce a cross-loader
+value; a bug here would only be a symptom of the enclosing `MVMap` method
+already executing against the wrong receiver, which is a dispatch question
+already covered (and not found buggy) by this pass's earlier tracing. The
+six other `.copy()` call sites in `MVMap.java` are all the no-arg
+`Page.copy()` (→ `clone()`, already audited as loader-correct).
+
+**Net result of this pass's four tracing rounds** (`tryUpdate`,
+`compareAndSetRoot`, `Page.<init>`, `Page.copy()`'s call sites): the
+*single* concretely-caught corrupting event remains the one
+`compareAndSetRoot` call recorded in the first addendum above —
+`Application`-context code reading `this.root.map` (i.e. `Page.map` on
+whatever `Page` `RootReference.root` pointed to at that moment) and getting
+`UserDefined`'s `MVMap`. Every upstream construction/assignment path this
+pass checked is individually clean, which either means (a) the corrupting
+`Page` was legitimately constructed with the `UserDefined` `map` at some
+EARLIER point for a legitimate transient reason (H2's own migration logic
+touching both stores) and something fails to swap it out before it reaches
+`Application`'s live root chain — an H2-semantic/timing bug surfaced by
+CratonVM rather than a CratonVM dispatch bug per se — or (b) the actual
+mutation happens through a path not yet traced (e.g. `RootReference`'s
+`previous`-chain-walking constructor, which copies `r.root` directly rather
+than constructing a `Page`; or a `Page` field mutated post-construction via
+some non-`<init>` route this session didn't consider).
+
+**Not attempted this session, for whoever picks this up next**: trace
+`RootReference`'s "version change" constructor
+(`RootReference(RootReference<K,V> r, long version, int attempt)`,
+`RootReference.java`, the one that walks `r.previous`) — it's the one
+private constructor whose body reads a field (`r.root`) from its argument
+rather than only forwarding constructor parameters straight through, making
+it structurally different from the four already-clean `tryUpdate`-adjacent
+constructors this pass checked. Second: reconsider whether the bug is in H2
+itself (does the SAME migration sequence, run under a debugger or with
+extra logging on real HotSpot, ever transiently hold a stale old-store
+`Page` reference the way this trace shows CratonVM doing? If HotSpot
+provably never does, that argues for (b) above rather than (a)).
+
 Fix commits (both dispatch fixes plus this tracing) landed on `dev` via
 branch `fix/h2-testupgrade-round7-20260723`.

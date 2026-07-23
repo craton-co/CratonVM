@@ -19860,6 +19860,35 @@ fn execute_invoke_kind(
             args.get(2).map(describe).unwrap_or_default(),
         );
     }
+    if std::env::var("CRATONVM_DBG_LOADER_TRACE").is_ok()
+        && method_class_name.contains("Page")
+        && method_name.as_ref() == "<init>"
+    {
+        let describe = |v: &Value| -> String {
+            match v {
+                Value::Object(Some(obj)) => {
+                    let cid = shared.heap.class_id_of(*obj);
+                    let cn = shared
+                        .class_manager
+                        .read()
+                        .get_class(cid)
+                        .map(|c| c.name.to_string())
+                        .unwrap_or_default();
+                    format!("addr={:?} cid={:?} loader_class={}", obj, cid, cn)
+                }
+                Value::Object(None) => "null".to_string(),
+                other => format!("{:?}", other),
+            }
+        };
+        eprintln!(
+            "[PAGEINIT-TRACE/slow] caller_class_id={:?} cp_index={} ctor_desc={} new_page(args[0])={} map_arg(args[1])={}",
+            current_class_id,
+            cp_index,
+            method_descriptor,
+            describe(&args[0]),
+            args.get(1).map(describe).unwrap_or_default(),
+        );
+    }
     // Spring's loader-fork test infrastructure can expose two physical copies
     // of this private enum while representing one logical annotation operation.
     // Preserve the enum member identity by its declaring binary name and enum
@@ -38683,6 +38712,35 @@ fn execute_invokevirtual_cached(
                     "[TRYUPDATE-TRACE] caller_class_id={:?} cp_index={} post-refresh receiver(args[0])={} updated(args[1])={}",
                     caller_class_id,
                     cp_index,
+                    describe(&args_slice[0]),
+                    args_slice.get(1).map(describe).unwrap_or_default(),
+                );
+            }
+            if std::env::var("CRATONVM_DBG_LOADER_TRACE").is_ok()
+                && cached.class_name.contains("Page")
+                && cached.method_name.as_ref() == "<init>"
+            {
+                let describe = |v: &Value| -> String {
+                    match v {
+                        Value::Object(Some(obj)) => {
+                            let cid = shared.heap.class_id_of(*obj);
+                            let cn = shared
+                                .class_manager
+                                .read()
+                                .get_class(cid)
+                                .map(|c| c.name.to_string())
+                                .unwrap_or_default();
+                            format!("addr={:?} cid={:?} loader_class={}", obj, cid, cn)
+                        }
+                        Value::Object(None) => "null".to_string(),
+                        other => format!("{:?}", other),
+                    }
+                };
+                eprintln!(
+                    "[PAGEINIT-TRACE/bc] caller_class_id={:?} cp_index={} ctor_desc={} new_page(args[0])={} map_arg(args[1])={}",
+                    caller_class_id,
+                    cp_index,
+                    cached.method_descriptor,
                     describe(&args_slice[0]),
                     args_slice.get(1).map(describe).unwrap_or_default(),
                 );
