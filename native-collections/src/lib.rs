@@ -4028,6 +4028,18 @@ fn map_state(ctx: &dyn NativeContext, this: ObjectRef) -> (Option<ObjectRef>, i3
             _ => 0,
         },
     };
+    if dbg_hm_trace() {
+        eprintln!(
+            "[HM-MAP-STATE] this={:?} class={:?} nf={} resolved_slot={:?} size_by_name={:?} slot1_val={:?} final_size={}",
+            this,
+            ctx.class_name_of_id(ctx.class_id_of_object(this)),
+            nf,
+            ctx.resolve_field_index("java/util/HashMap", "size"),
+            size_by_name,
+            ctx.get_field(this, MAP_FIELD_SIZE),
+            size,
+        );
+    }
     // S111r26: Use bucket array length as the true capacity.  When
     // make_hashset_with_elements uses the real JDK HashMap field layout
     // (table=0, entrySet=1, size=2, ...), MAP_FIELD_CAPACITY (slot 2)
