@@ -10810,6 +10810,25 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     );
     r.register(fc_cls, "close", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        // See docs/known-issues/h2-suite-bugs/bug-h2-testlob-mvstore-chunk-not-found-and-file-lock.md:
+        // this native is registered on the literal "java/nio/channels/FileChannel"
+        // class to service a synthetic single-field FileChannel, but native
+        // overrides shadow ALL dispatch for that class name -- including a real
+        // `sun/nio/ch/FileChannelImpl` reaching an inherited method (close()V is
+        // declared in the grandparent AbstractInterruptibleChannel, not
+        // FileChannel itself) through a FileChannel-typed call site. Detect a
+        // real instance and replicate AbstractInterruptibleChannel.close()'s
+        // contract by calling the real implCloseChannel() bytecode instead of
+        // treating field 0 as a synthetic fd.
+        let class_name = ctx.class_name_of_id(ctx.class_id_of_object(this));
+        if class_name.as_deref() != Some("java/nio/channels/FileChannel") {
+            if matches!(ctx.get_field_by_name(this, "closed"), Value::Int(1)) {
+                return Ok(None);
+            }
+            ctx.set_field_by_name(this, "closed", Value::Int(1));
+            ctx.invoke_virtual(this, "implCloseChannel", "()V", &[])?;
+            return Ok(None);
+        }
         if let Value::Int(v) = ctx.get_field(this, 0) {
             if v >= 0 {
                 let _ = ctx.fd_table().close(v as u32);
@@ -10817,7 +10836,14 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         }
         Ok(None)
     });
-    r.register(fc_cls, "isOpen", "()Z", |_ctx, _args| {
+    r.register(fc_cls, "isOpen", "()Z", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let class_name = ctx.class_name_of_id(ctx.class_id_of_object(this));
+        if class_name.as_deref() != Some("java/nio/channels/FileChannel") {
+            return Ok(Some(Value::Int(
+                if matches!(ctx.get_field_by_name(this, "closed"), Value::Int(1)) { 0 } else { 1 },
+            )));
+        }
         Ok(Some(Value::Int(1)))
     });
     // write(ByteBuffer)I — `FileChannel.write` is abstract; cassandra's
@@ -17715,6 +17741,25 @@ pub(crate) fn register_phase57_file_channel(r: &mut NativeMethodRegistry) {
     // close()V
     r.register(fc, "close", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        // See docs/known-issues/h2-suite-bugs/bug-h2-testlob-mvstore-chunk-not-found-and-file-lock.md:
+        // this native is registered on the literal "java/nio/channels/FileChannel"
+        // class to service a synthetic single-field FileChannel, but native
+        // overrides shadow ALL dispatch for that class name -- including a real
+        // `sun/nio/ch/FileChannelImpl` reaching an inherited method (close()V is
+        // declared in the grandparent AbstractInterruptibleChannel, not
+        // FileChannel itself) through a FileChannel-typed call site. Detect a
+        // real instance and replicate AbstractInterruptibleChannel.close()'s
+        // contract by calling the real implCloseChannel() bytecode instead of
+        // treating field 0 as a synthetic fd.
+        let class_name = ctx.class_name_of_id(ctx.class_id_of_object(this));
+        if class_name.as_deref() != Some("java/nio/channels/FileChannel") {
+            if matches!(ctx.get_field_by_name(this, "closed"), Value::Int(1)) {
+                return Ok(None);
+            }
+            ctx.set_field_by_name(this, "closed", Value::Int(1));
+            ctx.invoke_virtual(this, "implCloseChannel", "()V", &[])?;
+            return Ok(None);
+        }
         let fd_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
         if fd_id >= 0 {
             let _ = ctx.fd_table().close(fd_id as u32);
@@ -17726,6 +17771,12 @@ pub(crate) fn register_phase57_file_channel(r: &mut NativeMethodRegistry) {
     // isOpen()Z
     r.register(fc, "isOpen", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        let class_name = ctx.class_name_of_id(ctx.class_id_of_object(this));
+        if class_name.as_deref() != Some("java/nio/channels/FileChannel") {
+            return Ok(Some(Value::Int(
+                if matches!(ctx.get_field_by_name(this, "closed"), Value::Int(1)) { 0 } else { 1 },
+            )));
+        }
         let fd_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
         Ok(Some(Value::Int(if fd_id >= 0 { 1 } else { 0 })))
     });
