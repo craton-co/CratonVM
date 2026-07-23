@@ -26045,6 +26045,67 @@ fn force_native_over_real_jdk_bytecode(
     {
         return true;
     }
+    // BUG (found investigating the Tomcat Jasper/ecj JSP-compile NPE,
+    // TestDefaultServlet.testBug57601 / TestMapperWebapps.testWelcomeFileStrict):
+    // this function is the ONLY force-native gate consulted by the
+    // reflective/megamorphic/`invokespecial`/interface-default dispatch path
+    // (`intercept_force_registered_native[_cached]` ->
+    // `should_force_registered_native_over_bytecode` ->
+    // `force_native_over_real_jdk_bytecode_memoized` -> here). The "regular"
+    // cached-invokevirtual dispatch path OR's in an extra
+    // `matches!((class_name,...), "java/util/HashMap"|"java/util/LinkedHashMap"
+    // |"java/util/Hashtable"|"java/util/concurrent/ConcurrentHashMap")`
+    // cluster locally (see further below in this same file, and the
+    // companion `check_override` chain in `vm/src/vm/vm_exec.rs`), but this
+    // base function never did — so a call reaching it directly ran the REAL
+    // JDK bytecode for `put`/`get`/`size`/etc. instead of (or, when a
+    // different call to the identical call site had already gone through the
+    // OTHER, covered path, *in addition to*) the registered native,
+    // corrupting any state the two implementations don't share (e.g.
+    // `Hashtable`'s own real `count` field vs. our side-store bucket count —
+    // `Hashtable.put()` ending up incrementing the tracked size TWICE,
+    // doubling `size()` and leaving `values().toArray()`'s caller-supplied
+    // array null-padded past the real entry count. That is exactly what made
+    // ecj's `CompilationResult.getClassFiles()` — `new
+    // ClassFile[compiledTypes.size()]` then `compiledTypes.values()
+    // .toArray(classFiles)` on a `Hashtable(11)` — hand back a null-padded
+    // array and NPE in `CompilationUnitDeclaration.cleanUp()`). Add the same
+    // cluster here so every dispatch path agrees.
+    if matches!(
+        class_name,
+        "java/util/HashMap"
+            | "java/util/LinkedHashMap"
+            | "java/util/Hashtable"
+            | "java/util/concurrent/ConcurrentHashMap"
+    ) && matches!(
+        method_name,
+        "computeIfAbsent"
+            | "compute"
+            | "computeIfPresent"
+            | "merge"
+            | "putIfAbsent"
+            | "replace"
+            | "forEach"
+            | "replaceAll"
+            | "getOrDefault"
+            | "putMapEntries"
+            | "put"
+            | "get"
+            | "remove"
+            | "containsKey"
+            | "containsValue"
+            | "size"
+            | "isEmpty"
+            | "clear"
+            | "putAll"
+            | "keySet"
+            | "values"
+            | "entrySet"
+            | "keys"
+            | "elements"
+    ) {
+        return true;
+    }
     // Keep this warmed-invoke-cache policy in sync with vm_exec's cold-path
     // allow-list. JarFile inherits these operations from ZipFile, so a
     // subclass `super.close()` resolves to the real ZipFile bytecode after
