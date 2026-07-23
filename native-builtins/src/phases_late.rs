@@ -4405,7 +4405,7 @@ pub(crate) fn register_phase56_function_extras(r: &mut NativeMethodRegistry) {
             // would relocate them (native stale-local family).
             let this_pin = ctx.pin_native_root(this);
             let other_pin = pinned_object_value(ctx, other);
-            let composite = alloc_concurrent_synthetic(ctx, "java/util/function/Predicate$And", 2);
+            let composite = alloc_concurrent_synthetic(ctx, "java/util/function/Predicate$$Lambda$And", 2);
             let this = ctx.read_native_pin(this_pin, this);
             ctx.set_field(composite, 0, Value::Object(Some(this)));
             ctx.set_field(
@@ -4428,7 +4428,7 @@ pub(crate) fn register_phase56_function_extras(r: &mut NativeMethodRegistry) {
             // would relocate them (native stale-local family).
             let this_pin = ctx.pin_native_root(this);
             let other_pin = pinned_object_value(ctx, other);
-            let composite = alloc_concurrent_synthetic(ctx, "java/util/function/Predicate$Or", 2);
+            let composite = alloc_concurrent_synthetic(ctx, "java/util/function/Predicate$$Lambda$Or", 2);
             let this = ctx.read_native_pin(this_pin, this);
             ctx.set_field(composite, 0, Value::Object(Some(this)));
             ctx.set_field(
@@ -4450,7 +4450,7 @@ pub(crate) fn register_phase56_function_extras(r: &mut NativeMethodRegistry) {
             // would relocate `this` (native stale-local family).
             let this_pin = ctx.pin_native_root(this);
             let composite =
-                alloc_concurrent_synthetic(ctx, "java/util/function/Predicate$Negate", 1);
+                alloc_concurrent_synthetic(ctx, "java/util/function/Predicate$$Lambda$Negate", 1);
             let this = ctx.read_native_pin(this_pin, this);
             ctx.set_field(composite, 0, Value::Object(Some(this)));
             ctx.unpin_native_roots(this_pin);
@@ -4468,7 +4468,7 @@ pub(crate) fn register_phase56_function_extras(r: &mut NativeMethodRegistry) {
             // would relocate it (native stale-local family).
             let target_pin = pinned_object_value(ctx, target);
             let composite =
-                alloc_concurrent_synthetic(ctx, "java/util/function/Predicate$Negate", 1);
+                alloc_concurrent_synthetic(ctx, "java/util/function/Predicate$$Lambda$Negate", 1);
             ctx.set_field(
                 composite,
                 0,
@@ -4485,7 +4485,7 @@ pub(crate) fn register_phase56_function_extras(r: &mut NativeMethodRegistry) {
 
     // Predicate$And.test(x) = first.test(x) && second.test(x)
     r.register(
-        "java/util/function/Predicate$And",
+        "java/util/function/Predicate$$Lambda$And",
         "test",
         "(Ljava/lang/Object;)Z",
         |ctx, args| {
@@ -4530,7 +4530,7 @@ pub(crate) fn register_phase56_function_extras(r: &mut NativeMethodRegistry) {
 
     // Predicate$Or.test(x) = first.test(x) || second.test(x)
     r.register(
-        "java/util/function/Predicate$Or",
+        "java/util/function/Predicate$$Lambda$Or",
         "test",
         "(Ljava/lang/Object;)Z",
         |ctx, args| {
@@ -4575,7 +4575,7 @@ pub(crate) fn register_phase56_function_extras(r: &mut NativeMethodRegistry) {
 
     // Predicate$Negate.test(x) = !inner.test(x)
     r.register(
-        "java/util/function/Predicate$Negate",
+        "java/util/function/Predicate$$Lambda$Negate",
         "test",
         "(Ljava/lang/Object;)Z",
         |ctx, args| {
@@ -10810,6 +10810,25 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     );
     r.register(fc_cls, "close", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        // See docs/known-issues/h2-suite-bugs/bug-h2-testlob-mvstore-chunk-not-found-and-file-lock.md:
+        // this native is registered on the literal "java/nio/channels/FileChannel"
+        // class to service a synthetic single-field FileChannel, but native
+        // overrides shadow ALL dispatch for that class name -- including a real
+        // `sun/nio/ch/FileChannelImpl` reaching an inherited method (close()V is
+        // declared in the grandparent AbstractInterruptibleChannel, not
+        // FileChannel itself) through a FileChannel-typed call site. Detect a
+        // real instance and replicate AbstractInterruptibleChannel.close()'s
+        // contract by calling the real implCloseChannel() bytecode instead of
+        // treating field 0 as a synthetic fd.
+        let class_name = ctx.class_name_of_id(ctx.class_id_of_object(this));
+        if class_name.as_deref() != Some("java/nio/channels/FileChannel") {
+            if matches!(ctx.get_field_by_name(this, "closed"), Value::Int(1)) {
+                return Ok(None);
+            }
+            ctx.set_field_by_name(this, "closed", Value::Int(1));
+            ctx.invoke_virtual(this, "implCloseChannel", "()V", &[])?;
+            return Ok(None);
+        }
         if let Value::Int(v) = ctx.get_field(this, 0) {
             if v >= 0 {
                 let _ = ctx.fd_table().close(v as u32);
@@ -10817,7 +10836,14 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         }
         Ok(None)
     });
-    r.register(fc_cls, "isOpen", "()Z", |_ctx, _args| {
+    r.register(fc_cls, "isOpen", "()Z", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let class_name = ctx.class_name_of_id(ctx.class_id_of_object(this));
+        if class_name.as_deref() != Some("java/nio/channels/FileChannel") {
+            return Ok(Some(Value::Int(
+                if matches!(ctx.get_field_by_name(this, "closed"), Value::Int(1)) { 0 } else { 1 },
+            )));
+        }
         Ok(Some(Value::Int(1)))
     });
     // write(ByteBuffer)I — `FileChannel.write` is abstract; cassandra's
@@ -17715,6 +17741,25 @@ pub(crate) fn register_phase57_file_channel(r: &mut NativeMethodRegistry) {
     // close()V
     r.register(fc, "close", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        // See docs/known-issues/h2-suite-bugs/bug-h2-testlob-mvstore-chunk-not-found-and-file-lock.md:
+        // this native is registered on the literal "java/nio/channels/FileChannel"
+        // class to service a synthetic single-field FileChannel, but native
+        // overrides shadow ALL dispatch for that class name -- including a real
+        // `sun/nio/ch/FileChannelImpl` reaching an inherited method (close()V is
+        // declared in the grandparent AbstractInterruptibleChannel, not
+        // FileChannel itself) through a FileChannel-typed call site. Detect a
+        // real instance and replicate AbstractInterruptibleChannel.close()'s
+        // contract by calling the real implCloseChannel() bytecode instead of
+        // treating field 0 as a synthetic fd.
+        let class_name = ctx.class_name_of_id(ctx.class_id_of_object(this));
+        if class_name.as_deref() != Some("java/nio/channels/FileChannel") {
+            if matches!(ctx.get_field_by_name(this, "closed"), Value::Int(1)) {
+                return Ok(None);
+            }
+            ctx.set_field_by_name(this, "closed", Value::Int(1));
+            ctx.invoke_virtual(this, "implCloseChannel", "()V", &[])?;
+            return Ok(None);
+        }
         let fd_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
         if fd_id >= 0 {
             let _ = ctx.fd_table().close(fd_id as u32);
@@ -17726,6 +17771,12 @@ pub(crate) fn register_phase57_file_channel(r: &mut NativeMethodRegistry) {
     // isOpen()Z
     r.register(fc, "isOpen", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        let class_name = ctx.class_name_of_id(ctx.class_id_of_object(this));
+        if class_name.as_deref() != Some("java/nio/channels/FileChannel") {
+            return Ok(Some(Value::Int(
+                if matches!(ctx.get_field_by_name(this, "closed"), Value::Int(1)) { 0 } else { 1 },
+            )));
+        }
         let fd_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
         Ok(Some(Value::Int(if fd_id >= 0 { 1 } else { 0 })))
     });
@@ -45106,7 +45157,15 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         "()Ljava/net/SocketAddress;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            let host = ctx.get_field(this, NEW13_SOCK_HOST);
+            // Defensive: InetSocketAddress(String,int)'s native ctor NPEs on
+            // a null host (see the java/net/Socket sibling fix in
+            // phases_early.rs) -- every known writer of NEW13_SOCK_HOST sets
+            // a non-null placeholder, but never pass a raw possibly-unset
+            // field straight through to a ctor that requires non-null.
+            let host = match ctx.get_field(this, NEW13_SOCK_HOST) {
+                h @ Value::Object(Some(_)) => h,
+                _ => Value::Object(Some(ctx.create_string("0.0.0.0"))),
+            };
             let port = ctx.get_field(this, NEW13_SOCK_PORT);
             ctx.new_object_initialized(
                 "java/net/InetSocketAddress",

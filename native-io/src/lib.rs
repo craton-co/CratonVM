@@ -7782,6 +7782,53 @@ fn native_fc_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
+
+    // `close()` is declared `final` in `AbstractInterruptibleChannel`, a
+    // GRANDPARENT of any real `FileChannelImpl`
+    // (`FileChannelImpl extends FileChannel extends
+    // AbstractInterruptibleChannel`) -- `FileChannel` itself has no
+    // `close()` bytecode of its own, the method is pure inheritance. This
+    // native is registered on `java/nio/channels/FileChannel` only to
+    // service the fully-synthetic 2-field object `native_fc_open`
+    // constructs as a DIRECT instance of that literal abstract class (the
+    // only way to reach it is the 2-arg `FileChannel.open(Path,
+    // OpenOption[])` static overload's simplified fallback). But this
+    // registration also sits in the vtable walk the interpreter performs to
+    // resolve an INHERITED method for any real subclass -- so a genuine
+    // `FileChannelImpl` (built by `native_fcimpl_open` in real-JDK mode,
+    // e.g. every H2 MVStore file) reaching `close()` through a
+    // `FileChannel`-typed call site (H2's own `fileChannel.close()`,
+    // `RandomAccessFile.close()`'s `fc.close()`, ...) lands here too,
+    // instead of the real `AbstractInterruptibleChannel.close()` bytecode.
+    // That skipped `implCloseChannel()` entirely: the fileLockTable release
+    // loop never ran, `closed` never flipped to `true` (so `isOpen()` kept
+    // reporting the channel open forever), and the registered `closer`
+    // Cleaner action never ran synchronously -- the underlying fd and its
+    // JVM-level FileLockTable bookkeeping were only ever cleaned up later,
+    // asynchronously, whenever the background Cleaner thread happened to
+    // run -- a real resource-lifecycle correctness gap in its own right
+    // (independent of any specific caller), and a contributing factor to
+    // `docs/known-issues/h2-suite-bugs/bug-h2-testlob-mvstore-chunk-not-found-and-file-lock.md`'s
+    // `OverlappingFileLockException` investigation (that doc's residual
+    // occurrences trace to a separate, H2-level chunk-reclaim race --
+    // see the doc for the full picture).
+    //
+    // Detect a real instance (anything other than the literal synthetic
+    // `java/nio/channels/FileChannel` class `native_fc_open` allocates) and
+    // replicate `AbstractInterruptibleChannel.close()`'s exact contract --
+    // idempotent on `closed`, then invoke the real `implCloseChannel()`
+    // bytecode, which is never itself intercepted by a native -- instead of
+    // the synthetic single-fd close below.
+    let class_name = ctx.class_name_of_id(ctx.class_id_of_object(this));
+    if class_name.as_deref() != Some("java/nio/channels/FileChannel") {
+        if matches!(ctx.get_field_by_name(this, "closed"), Value::Int(1)) {
+            return Ok(None);
+        }
+        ctx.set_field_by_name(this, "closed", Value::Int(1));
+        ctx.invoke_virtual(this, "implCloseChannel", "()V", &[])?;
+        return Ok(None);
+    }
+
     let fd_id = match ctx.get_field(this, FC_FIELD_FD) {
         Value::Int(v) => v as u32,
         _ => return Ok(None),

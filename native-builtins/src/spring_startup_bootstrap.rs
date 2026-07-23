@@ -2236,6 +2236,60 @@ fn count_descriptor_params(desc: &str) -> i32 {
     c
 }
 
+// Real CGLIB's `AbstractClassGenerator` caches a generated proxy class per
+// (superclass, callback/config) key and returns the SAME `Class` for a
+// repeat `Enhancer.createClass()` of an identical configuration, rather
+// than emitting a fresh numbered subclass every time. Without this,
+// re-synthesising a lookup/replace-override subclass for the exact same
+// bean class + override config (e.g. a fresh `DefaultListableBeanFactory`
+// reloading the identical XML bean definitions, as
+// XmlBeanFactoryTests.methodInjectedBeanMustBeOfSameEnhancedCglibSubclassTypeAcrossBeanFactories
+// does 10 times in a loop) produced a DIFFERENT `$$SpringCGLIB$$<n>` name
+// each time (the shared `ENHANCER_COUNTER` just kept incrementing), even
+// though callers reasonably expect `ClassUtils.isCglibProxyClass` +
+// repeated-identical-config enhancement to be stable across separate
+// `BeanFactory` instances, exactly like real CGLIB.
+fn lookup_override_subclass_cache() -> &'static Mutex<std::collections::HashMap<(u32, String), String>> {
+    static CACHE: OnceLock<Mutex<std::collections::HashMap<(u32, String), String>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+fn lookup_method_spec_cache_key(specs: &[crate::cglib_enhancer::LookupMethodSpec]) -> String {
+    specs
+        .iter()
+        .map(|s| {
+            format!(
+                "{}|{}|{}|{}|{}",
+                s.name,
+                s.descriptor,
+                s.return_internal,
+                s.bean_name.as_deref().unwrap_or(""),
+                s.is_lookup
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
+fn replace_override_subclass_cache() -> &'static Mutex<std::collections::HashMap<(u32, String), String>> {
+    static CACHE: OnceLock<Mutex<std::collections::HashMap<(u32, String), String>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+fn replace_method_spec_cache_key(specs: &[crate::cglib_enhancer::ReplaceMethodSpec]) -> String {
+    specs
+        .iter()
+        .map(|s| {
+            format!(
+                "{}|{}|{}|{}",
+                s.name, s.descriptor, s.replacer_bean_name, s.declaring_internal
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
+
 /// bug-B2: method-injection (`<lookup-method>` / `@Lookup`). A lookup-method
 /// bean is declared on an ABSTRACT class; the old shim refused to instantiate
 /// abstract classes and returned null → "Target object must not be null". Real
@@ -2401,6 +2455,7 @@ fn try_build_method_injection(
     // Enumerate methods up the hierarchy; a method needs implementing if it is
     // abstract somewhere and never concrete.
     let mut all: Vec<(String, String, bool)> = Vec::new();
+    let mut iface_work: Vec<cratonvm_types::ClassId> = Vec::new();
     let mut cursor = Some(super_cid);
     while let Some(cid) = cursor {
         for m in ctx.declared_methods(cid) {
@@ -2413,7 +2468,37 @@ fn try_build_method_injection(
                 m.access_flags & ACC_ABSTRACT != 0,
             ));
         }
+        iface_work.extend(ctx.class_interfaces(cid));
         cursor = ctx.superclass_of(cid);
+    }
+    // Interface-declared methods live outside the superclass chain walked
+    // above, but are abstract (unless `default`) just the same. A bean class
+    // that `implements` an interface without redeclaring one of its methods
+    // (e.g. `abstract class OverrideOneMethod ... implements OverrideInterface`,
+    // never overriding `OverrideInterface.getPrototypeDependency()` itself)
+    // left that method entirely undiscovered here -- not even matched to the
+    // "no override -> throwing stub" fallback below -- so the generated CGLIB
+    // subclass never declared it at all, surfacing as `AbstractMethodError:
+    // ... has no Code attribute` the moment it's called (XmlBeanFactoryTests
+    // lookupOverrideMethodsWithSetterInjection / replaceMethodOverrideWithSetterInjection).
+    // Walk every implemented interface (transitively, since an interface can
+    // itself extend others) for each class already visited above.
+    let mut visited_ifaces: HashSet<cratonvm_types::ClassId> = HashSet::new();
+    while let Some(icid) = iface_work.pop() {
+        if !visited_ifaces.insert(icid) {
+            continue;
+        }
+        for m in ctx.declared_methods(icid) {
+            if m.name.starts_with('<') {
+                continue;
+            }
+            all.push((
+                m.name.clone(),
+                m.descriptor.clone(),
+                m.access_flags & ACC_ABSTRACT != 0,
+            ));
+        }
+        iface_work.extend(ctx.class_interfaces(icid));
     }
     let mut concrete: HashSet<(String, String)> = HashSet::new();
     for (n, d, is_abs) in &all {
@@ -2461,15 +2546,29 @@ fn try_build_method_injection(
         return None; // no abstract methods to implement → ordinary path
     }
 
-    let (new_name, bytes) = crate::cglib_enhancer::build_lookup_subclass(&super_internal, &specs);
-    let opts = DefineClassFull {
-        override_name: Some(new_name.clone()),
-        skip_verification: true,
-        ..Default::default()
+    let cache_key = (super_cid.as_u32(), lookup_method_spec_cache_key(&specs));
+    let cached_name = lookup_override_subclass_cache()
+        .lock()
+        .get(&cache_key)
+        .cloned();
+    let new_name = if let Some(name) = cached_name {
+        name
+    } else {
+        let (new_name, bytes) =
+            crate::cglib_enhancer::build_lookup_subclass(&super_internal, &specs);
+        let opts = DefineClassFull {
+            override_name: Some(new_name.clone()),
+            skip_verification: true,
+            ..Default::default()
+        };
+        if ctx.define_class_full(&new_name, &bytes, 0, opts).is_err() {
+            return None;
+        }
+        lookup_override_subclass_cache()
+            .lock()
+            .insert(cache_key, new_name.clone());
+        new_name
     };
-    if ctx.define_class_full(&new_name, &bytes, 0, opts).is_err() {
-        return None;
-    }
     let inst = match ctx.new_object(&new_name) {
         Ok(Some(Value::Object(Some(o)))) => o,
         _ => return None,
@@ -2732,10 +2831,12 @@ fn try_build_replace_override(
         name: String,
         descriptor: String,
         access_flags: u16,
+        declaring_internal: String,
     }
     let mut candidates: Vec<Candidate> = Vec::new();
     let mut cursor = Some(super_cid);
     while let Some(cid) = cursor {
+        let cid_internal = ctx.class_name_of_id(cid).unwrap_or_default();
         for m in ctx.declared_methods(cid) {
             if m.name.starts_with('<') {
                 continue;
@@ -2755,6 +2856,7 @@ fn try_build_replace_override(
                 name: m.name.clone(),
                 descriptor: m.descriptor.clone(),
                 access_flags: m.access_flags,
+                declaring_internal: cid_internal.clone(),
             });
         }
         cursor = ctx.superclass_of(cid);
@@ -2767,11 +2869,19 @@ fn try_build_replace_override(
     for c in &candidates {
         *name_counts.entry(c.name.clone()).or_insert(0) += 1;
     }
+    let dbg_replovr = std::env::var_os("CRATONVM_DBG_REPLOVR").is_some();
     let mut specs: Vec<crate::cglib_enhancer::ReplaceMethodSpec> = Vec::new();
     for c in &candidates {
         let cfgs = &replacers[&c.name];
         let is_overloaded = name_counts.get(&c.name).copied().unwrap_or(0) > 1;
         let param_types = jvm_descriptor_param_types_dot_notation(&c.descriptor);
+        if dbg_replovr {
+            eprintln!(
+                "[REPLOVR] candidate name={} desc={} declaring={} is_overloaded={} param_types={:?} cfgs={:?}",
+                c.name, c.descriptor, c.declaring_internal, is_overloaded, param_types,
+                cfgs.iter().map(|x| x.type_identifiers.clone()).collect::<Vec<_>>()
+            );
+        }
         // First `ReplaceOverride` config whose type identifiers match this
         // candidate's actual parameter types, mirroring
         // `ReplaceOverride.matches(Method)`: an unoverloaded name always
@@ -2794,22 +2904,46 @@ fn try_build_replace_override(
             name: c.name.clone(),
             descriptor: c.descriptor.clone(),
             replacer_bean_name: cfg.replacer_bean_name.clone(),
+            declaring_internal: c.declaring_internal.clone(),
         });
     }
     if specs.is_empty() {
         return None;
     }
 
-    let (new_name, bytes) =
-        crate::cglib_enhancer::build_replace_override_subclass(&super_internal, &specs);
-    let opts = DefineClassFull {
-        override_name: Some(new_name.clone()),
-        skip_verification: true,
-        ..Default::default()
+    // A chained call (super_cid is itself an already-generated
+    // lookup-override subclass -- see the caller in this file) already
+    // carries a `$$beanFactory` field; declaring a second one on this
+    // subclass would shadow it (see build_replace_override_subclass's doc
+    // comment). Our own synthesised classes are always named
+    // "<original>$$SpringCGLIB$$LM<n>" / "...$$RM<n>".
+    let own_bean_factory_field = !super_internal.contains("$$SpringCGLIB$$");
+    let cache_key = (super_cid.as_u32(), replace_method_spec_cache_key(&specs));
+    let cached_name = replace_override_subclass_cache()
+        .lock()
+        .get(&cache_key)
+        .cloned();
+    let new_name = if let Some(name) = cached_name {
+        name
+    } else {
+        let (new_name, bytes) = crate::cglib_enhancer::build_replace_override_subclass(
+            &super_internal,
+            &specs,
+            own_bean_factory_field,
+        );
+        let opts = DefineClassFull {
+            override_name: Some(new_name.clone()),
+            skip_verification: true,
+            ..Default::default()
+        };
+        if ctx.define_class_full(&new_name, &bytes, 0, opts).is_err() {
+            return None;
+        }
+        replace_override_subclass_cache()
+            .lock()
+            .insert(cache_key, new_name.clone());
+        new_name
     };
-    if ctx.define_class_full(&new_name, &bytes, 0, opts).is_err() {
-        return None;
-    }
     let inst = match ctx.new_object(&new_name) {
         Ok(Some(Value::Object(Some(o)))) => o,
         _ => return None,
@@ -2953,6 +3087,34 @@ fn s_instantiation_strategy_instantiate(
         let owner = args.get(3).cloned().unwrap_or(Value::Object(None));
         let mbd = ctx.read_native_pin(mbd_pin, mbd);
         if let Some(inst) = try_build_method_injection(ctx, mbd, owner, cid) {
+            // A bean can need BOTH mechanisms at once: abstract methods
+            // needing lookup-override stubs (or a "no override configured"
+            // throwing stub) AND a *concrete*, unrelated method needing a
+            // ReplaceOverride's MethodReplacer delegation -- e.g.
+            // XmlBeanFactoryTests' OverrideOneMethod has two unrelated
+            // abstract methods (protectedOverrideSingleton /
+            // getPrototypeDependency, satisfied here by throwing stubs
+            // since no <lookup-method> targets them) AND a
+            // <replaced-method> on its own concrete replaceMe(String).
+            // Returning immediately here silently dropped the
+            // replace-override entirely -- try_build_replace_override was
+            // never even called -- whenever a bean's class happened to be
+            // abstract for a reason unrelated to the replaced method
+            // (overrideMethodByArgTypeAttribute/Element,
+            // replaceMethodOverrideWithSetterInjection). Layer any
+            // ReplaceOverride entries on top of the just-built subclass
+            // instead of returning early; try_build_replace_override
+            // already skips non-ReplaceOverride entries, so re-running it
+            // against the same mbd is safe (the LookupOverride entries
+            // just handled above are simply ignored the second time).
+            if let Value::Object(Some(inst_obj)) = inst {
+                let inst_cid = ctx.class_id_of_object(inst_obj);
+                let mbd = ctx.read_native_pin(mbd_pin, mbd);
+                if let Some(inst2) = try_build_replace_override(ctx, mbd, owner, inst_cid) {
+                    ctx.unpin_native_roots(mbd_pin);
+                    return Ok(Some(inst2));
+                }
+            }
             ctx.unpin_native_roots(mbd_pin);
             return Ok(Some(inst));
         }

@@ -1789,6 +1789,17 @@ pub struct ReplaceMethodSpec {
     pub descriptor: String,
     /// Bean name of the `MethodReplacer` to dispatch to.
     pub replacer_bean_name: String,
+    /// Internal name of the class that actually DECLARES this method --
+    /// not necessarily the enhanced subclass's immediate superclass. A
+    /// replaced method inherited from a grandparent (or higher) class,
+    /// e.g. `MethodReplaceCandidate.replaceMe` inherited two levels down
+    /// through `SerializableMethodReplacerCandidate`, must reflectively
+    /// resolve via ITS OWN declaring class: `Class.getDeclaredMethod` only
+    /// finds methods declared directly on the class it's called on, so
+    /// always querying the immediate superclass threw
+    /// `NoSuchMethodException` for anything declared further up
+    /// (XmlBeanFactoryTests.serializableMethodReplacerAndSuperclass).
+    pub declaring_internal: String,
 }
 
 /// Per-wrapper constant-pool indices for boxing args / unboxing the replacer
@@ -1862,9 +1873,25 @@ fn add_wrapper_refs(cw: &mut ClassWriter, ch: char) -> WrapperRefs {
 
 /// Build a `<OriginalName>$$SpringCGLIB$$RMn` subclass overriding each replaced
 /// method. Returns the chosen internal name and the class-file bytes.
+/// `own_bean_factory_field`: pass `false` when `super_internal_name` is
+/// ITSELF an already-generated lookup-override subclass (see
+/// `try_build_method_injection`'s chaining in spring_startup_bootstrap.rs)
+/// that already declares a `$$beanFactory` field. Declaring a SECOND field
+/// of the same name on this subclass would shadow rather than reuse it:
+/// the generated methods below reference the field via `this_class_idx`,
+/// so they'd read/write the new (never-initialised) shadow copy while
+/// `set_field_by_name`'s hierarchy walk resolves whichever copy comes
+/// first -- observed as `this.$$beanFactory` staying null
+/// (XmlBeanFactoryTests.replaceMethodOverrideWithSetterInjection, a bean
+/// needing BOTH a lookup-override-satisfied abstract method AND a
+/// replaced concrete method). When `false`, skip declaring the field and
+/// reference the inherited one instead -- a `getfield`/`putfield` naming
+/// a subclass still resolves to the superclass's field per JVMS 5.4.3.2
+/// field resolution.
 pub fn build_replace_override_subclass(
     super_internal_name: &str,
     methods: &[ReplaceMethodSpec],
+    own_bean_factory_field: bool,
 ) -> (String, Vec<u8>) {
     let counter = ENHANCER_COUNTER.fetch_add(1, Ordering::Relaxed);
     let new_name = format!("{super_internal_name}$$SpringCGLIB$$RM{counter:x}");
@@ -1880,7 +1907,11 @@ pub fn build_replace_override_subclass(
 
     let bf_field_name_idx = cw.add_utf8("$$beanFactory");
     let object_desc_idx = cw.add_utf8("Ljava/lang/Object;");
-    let bf_field_ref = cw.add_fieldref(this_class_idx, "$$beanFactory", "Ljava/lang/Object;");
+    let bf_field_ref = cw.add_fieldref(
+        if own_bean_factory_field { this_class_idx } else { super_class_idx },
+        "$$beanFactory",
+        "Ljava/lang/Object;",
+    );
 
     // Shared invocation machinery.
     let beanfactory_cast_idx = cw.add_class("org/springframework/beans/factory/BeanFactory");
@@ -1969,6 +2000,10 @@ pub fn build_replace_override_subclass(
         let desc_idx = cw.add_utf8(&m.descriptor);
         let name_str_idx = cw.add_string(&m.name);
         let replacer_str_idx = cw.add_string(&m.replacer_bean_name);
+        // Resolve the Method reflectively against the class that actually
+        // declares it (see the field doc on `declaring_internal`), not
+        // always the enhanced subclass's immediate superclass.
+        let declaring_class_idx = cw.add_class(&m.declaring_internal);
 
         let params = parse_param_descriptors(&m.descriptor);
         let ret = m.descriptor.split(')').nth(1).unwrap_or("V").to_string();
@@ -2028,9 +2063,9 @@ pub fn build_replace_override_subclass(
         code.push(0x3A); // astore mr_slot
         code.push(mr_slot);
 
-        // (B) method = Super.class.getDeclaredMethod(name, paramClasses)
-        code.push(0x13); // ldc_w Super.class
-        code.extend_from_slice(&b(super_class_idx));
+        // (B) method = DeclaringClass.class.getDeclaredMethod(name, paramClasses)
+        code.push(0x13); // ldc_w DeclaringClass.class
+        code.extend_from_slice(&b(declaring_class_idx));
         code.push(0x13); // ldc_w "<name>"
         code.extend_from_slice(&b(name_str_idx));
         push_int(&mut code, params.len() as i32);
@@ -2197,12 +2232,13 @@ pub fn build_replace_override_subclass(
     }
 
     let access_flags: u16 = 0x0001 | 0x0020 | 0x1000; // PUBLIC | SUPER | SYNTHETIC
+    let fields: &[Vec<u8>] = if own_bean_factory_field { &[bf_field] } else { &[] };
     let bytes = cw.finish(
         access_flags,
         this_class_idx,
         super_class_idx,
         &[],
-        &[bf_field],
+        fields,
         &method_bytes,
     );
     (new_name, bytes)

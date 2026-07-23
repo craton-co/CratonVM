@@ -8109,10 +8109,61 @@ fn spring_extension_get_application_context(
     ctx: &mut dyn NativeContext,
     extension_context: ObjectRef,
 ) -> MethodCallResult {
+    const SPRING_EXTENSION: &str =
+        "org/springframework/test/context/junit/jupiter/SpringExtension";
+    const GET_APP_CTX_DESC: &str =
+        "(Lorg/junit/jupiter/api/extension/ExtensionContext;)Lorg/springframework/context/ApplicationContext;";
+
+    // SpringExtension.resolveParameter is intercepted by a single, global
+    // native override (registered once, independent of which ClassId the
+    // receiver instance actually is) -- so this trampoline has no bytecode
+    // frame of its own and no referencing_class_id for the interpreter's
+    // usual loader-aware CONSTANT_Class resolution to key off. Left alone,
+    // ctx.invoke_special(SPRING_EXTENSION, ...) resolves the class purely
+    // by name through the loader-blind global path (load_class_concurrent),
+    // which prefers the Application-loader copy whenever the ordinary
+    // delegation chain can also serve the class -- even when the CURRENT
+    // test class was loaded by a CompileWithForkedClassLoader fork that
+    // has its OWN, already-loaded copy of SpringExtension. Since
+    // SpringExtension.getTestContextManager keys its JUnit Store lookup
+    // on Namespace.create(SpringExtension.class), invoking the WRONG copy
+    // silently constructs a second, independent TestContextManager (a
+    // Store miss on a different Class-identity Namespace) with its own
+    // un-customized ApplicationContext -- this is the AOT bean-override
+    // double-context-refresh bug (see
+    // docs/known-issues/CRATONVM-SPRING-GENUINE-BUGLIST.md's AOT cluster
+    // sections). Anchor resolution on the CURRENT test class's own loader
+    // instead: if that loader is user-defined and it has its own copy of
+    // SpringExtension already loaded, invoke on THAT exact ClassId;
+    // otherwise fall through to the existing, unchanged global behavior.
+    if let Ok(Some(Value::Object(Some(test_class)))) = ctx.invoke_virtual(
+        extension_context,
+        "getRequiredTestClass",
+        "()Ljava/lang/Class;",
+        &[],
+    ) {
+        if let Some(test_class_id) = crate::lang_class::mirror_class_id(ctx, test_class) {
+            let loader_id = ctx.loader_id_of_class(test_class_id);
+            if loader_id >= 3 {
+                if let Some(fork_class_id) =
+                    ctx.class_id_defined_by_loader_exact(SPRING_EXTENSION, loader_id as u32)
+                {
+                    return ctx.invoke_by_class_id(
+                        fork_class_id,
+                        SPRING_EXTENSION,
+                        "getApplicationContext",
+                        GET_APP_CTX_DESC,
+                        &[Value::Object(Some(extension_context))],
+                    );
+                }
+            }
+        }
+    }
+
     ctx.invoke_special(
-        "org/springframework/test/context/junit/jupiter/SpringExtension",
+        SPRING_EXTENSION,
         "getApplicationContext",
-        "(Lorg/junit/jupiter/api/extension/ExtensionContext;)Lorg/springframework/context/ApplicationContext;",
+        GET_APP_CTX_DESC,
         &[Value::Object(Some(extension_context))],
     )
 }
