@@ -1621,5 +1621,84 @@ productive from here:
 `CRATONVM_DBG_LOADER_TRACE=1 --nojit org.h2.test.unit.TestUpgrade`
 continues to reproduce in well under 5 minutes.
 
+
+
+### Same-session addendum #4 (user-directed): exhaustive `RootReference.root`
+### / `Page.map` construction-site tracing — every write checked, all clean
+
+Per explicit direction to trace every write to `RootReference.root` and
+`Page.map` rather than continuing to guess individual call sites: both
+fields are `final`, so every write happens at construction. `Page.map`'s 3
+constructors were already covered (addendum #2, 1522-1542 calls, zero
+mismatches). Added the same unconditional tracing to all 5 of
+`RootReference`'s private constructors (`ctor_desc` distinguishes the
+overload), printing the constructed object's own class/loader alongside
+every object-typed constructor argument.
+
+**362 `RootReference` construction calls captured in a full `--nojit` run,
+across 4 of the 5 constructor overloads — zero cross-loader mismatches.**
+(One apparent anomaly on first pass — a `(Page;J)V` call with the `Page`
+argument at class id `1424` instead of the usual `1167` — resolved as a
+false alarm: `1424` is `org/h2/mvstore/Page$NonLeaf`, a different
+legitimate `Application`-loaded `Page` subclass (vs. `Page$Leaf` at
+`1167`), not a foreign loader; already covered by addendum #2's clean
+1522-call `Page` constructor sweep.) The 5th overload — `RootReference(r,
+Page root, long updateAttemptCounter)`, used only by `updateRootPage` — was
+never observed at all in this run; cross-checked directly and confirmed
+`updateRootPage` itself is never dispatched in this failure path (this
+`TestUpgrade` run exercises the `tryLock`/`updatePageAndLockedStatus`/
+`tryUnlockAndUpdateVersion` → `tryUpdate` cycle exclusively, matching the
+sixth pass's original correlation — `updateRootPage` is confirmed off the
+corrupting path, not an untraced gap).
+
+**This closes off construction-time cross-loader argument passing as a
+hypothesis entirely, for both fields, exhaustively.** Combined with
+addenda #1-3 (dispatch, argument marshalling, and both GC-forwarding
+windows all fixed or ruled out), there is now no remaining "wrong
+reference passed into a constructor or invoke argument" mechanism left
+unchecked anywhere between object construction and the one directly-caught
+corrupting `compareAndSetRoot` call. Every individual step in the chain —
+`Page` built correctly, `RootReference` built correctly from correctly-built
+`Page`s, dispatched to the correct method body with a correctly-forwarded
+receiver and correctly-forwarded arguments — is now verified sound in
+isolation, and yet the end-to-end result (addendum #1) was still wrong
+exactly once in 327 calls.
+
+**This pushes the likely mechanism outside the "wrong value passed
+somewhere" category entirely** and toward one of:
+1. A heap/GC identity issue where the SAME memory address is, at different
+   times, legitimately read as two DIFFERENT objects — not a stale/dangling
+   pointer (ruled out by addenda #1/#3's forwarding fixes, which read the
+   CURRENT occupant correctly either way), but a genuine double-occupancy
+   or allocator/compaction race not yet identified.
+2. The single captured anomaly (addendum #1) being a red herring —
+   possibly a legitimate, transient, non-persisted intermediate state
+   (H2's own migration code constructing throwaway objects for validation)
+   that this session mistook for THE corrupting event, with the actual
+   mechanism still uncaught.
+3. A race specific to concurrent/background GC thread timing that no
+   single-threaded reasoning about "which call site passed what" can catch
+   — would require attaching a debugger with hardware watchpoints on the
+   specific `Page.map` field slot of the affected object, rather than
+   further printf-tracing.
+
+Given the exhaustive sweep this addendum represents, further guessing at
+individual call sites is unlikely to be productive. Whoever continues
+should strongly consider option 3 above (watchpoint-based debugging,
+e.g. `gdb`/`rr` on the specific holder address) or first re-verify
+option 2 (does the exact `Page` object flagged in addendum #1 actually get
+persisted into a live, later-read `RootReference.root` chain, or does it
+get discarded/superseded before ever being read again — trace its
+`compare_and_swap_field` history forward from the anomalous write to see
+whether that specific write's result is the one that later causes
+`hasChangesSince`'s `NoSuchMethodError`, or whether a DIFFERENT, still
+uncaught corruption is the real cause).
+
+`CRATONVM_DBG_LOADER_TRACE=1 --nojit org.h2.test.unit.TestUpgrade`
+continues to reproduce in well under 5 minutes. All tracing
+(`TRYUPDATE-TRACE`, `CASROOT-TRACE`, `PAGEINIT-TRACE`, `ROOTREFINIT-TRACE`,
+each with `/slow`, `/bc`, `/vbc`, `/vtfast` variants as applicable) is left
+in the tree, gated behind the existing env var, zero cost when unset.
+
 Fix commits (all three dispatch/GC-forwarding fixes plus the tracing
 additions) landed on `dev` via branch `fix/h2-testupgrade-round7-20260723`.
