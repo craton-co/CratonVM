@@ -2924,7 +2924,25 @@ fn is_known_miscompile_aqs_family(class_name: &str, method_name: &str) -> bool {
     matches!(
         (class_name, method_name),
         // --- AbstractQueuedSynchronizer (classic, int state) ---
-        ("java/util/concurrent/locks/AbstractQueuedSynchronizer", "acquire")
+        // H2 TestFileSystem.testConcurrent hang (2026-07-23): compareAndSetState/
+        // getState/setState -- the raw Unsafe-CAS/volatile-accessor wrappers
+        // around `state` -- were missing from this family despite being the
+        // single hottest, most contended methods of the whole synchronizer
+        // protocol (every acquire/release funnels through them). A live gdb
+        // attach on a hung two-real-thread ReentrantReadWriteLock repro (H2's
+        // TestFileSystem.testConcurrent against the `async:` filesystem)
+        // caught one thread parked in `monitor_enter_synchronized_method`
+        // waiting on a lock the other thread's `compareAndSetState` call
+        // never visibly released, with no forward progress for 100s of
+        // seconds under real CPU load -- the same "AbstractQueuedLongSynchronizer.
+        // acquire" family hang this list already documents lower down, just
+        // one level deeper (the CAS primitive `acquire` itself calls, not
+        // `acquire`). See docs/known-issues/h2-suite-bugs/
+        // bug-h2-testfilesystem-testconcurrent-async-hang.md.
+        ("java/util/concurrent/locks/AbstractQueuedSynchronizer", "compareAndSetState")
+            | ("java/util/concurrent/locks/AbstractQueuedSynchronizer", "getState")
+            | ("java/util/concurrent/locks/AbstractQueuedSynchronizer", "setState")
+            | ("java/util/concurrent/locks/AbstractQueuedSynchronizer", "acquire")
             | ("java/util/concurrent/locks/AbstractQueuedSynchronizer", "release")
             | ("java/util/concurrent/locks/AbstractQueuedSynchronizer", "acquireShared")
             | ("java/util/concurrent/locks/AbstractQueuedSynchronizer", "releaseShared")
@@ -2975,6 +2993,13 @@ fn is_known_miscompile_aqs_family(class_name: &str, method_name: &str) -> bool {
             | ("java/util/concurrent/locks/ReentrantLock$FairSync", "initialTryLock")
             | ("java/util/concurrent/locks/ReentrantLock$FairSync", "tryAcquire")
             // --- AbstractQueuedLongSynchronizer (JDK 25+, long state) ---
+            // See the matching compareAndSetState/getState/setState note on the
+            // classic AbstractQueuedSynchronizer block above -- same gap, same
+            // fix, same repro (ReentrantReadWriteLock$Sync extends this class on
+            // JDK 25, so this is the copy that actually fired in the H2 hang).
+            | ("java/util/concurrent/locks/AbstractQueuedLongSynchronizer", "compareAndSetState")
+            | ("java/util/concurrent/locks/AbstractQueuedLongSynchronizer", "getState")
+            | ("java/util/concurrent/locks/AbstractQueuedLongSynchronizer", "setState")
             | ("java/util/concurrent/locks/AbstractQueuedLongSynchronizer", "acquire")
             | ("java/util/concurrent/locks/AbstractQueuedLongSynchronizer", "release")
             | ("java/util/concurrent/locks/AbstractQueuedLongSynchronizer", "acquireShared")
@@ -3107,16 +3132,35 @@ fn callee_saved_gpr_local_homes_enabled() -> bool {
         return true;
     }
 
+    // PERF (H2 TestFileSystem.testConcurrent hang, 2026-07-23): this is
+    // called from `should_skip_jit_internal`, which runs on every single
+    // interpreted method invocation VM-wide -- unlike its four sibling
+    // env-var checks in this file (CRATONVM_JIT_BISECT_SKIP/ONLY,
+    // CRATONVM_JIT_ALLOW_PACKAGES), which all cache via `OnceLock`, this one
+    // called `std::env::var()` fresh on every call. Under a two-real-thread,
+    // JIT-heavy, high-invocation-count workload (H2's
+    // TestFileSystem.testConcurrent against the `async:` filesystem) this
+    // manifested as an apparent 300s+ hang: live gdb attaches during the
+    // "hang" showed both threads actively burning CPU (not parked), one
+    // repeatedly stuck inside `std::env::var` -> libc `getenv`, with no
+    // forward progress visible in the test's own log for minutes at a time.
+    // Cache the decision once, matching the established pattern below.
     #[cfg(target_arch = "x86_64")]
-    std::env::var("CRATONVM_JIT_ENABLE_CALLEE_SAVED_GPR_LOCALS")
-        .ok()
-        .map(|v| {
-            matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "on" | "yes"
-            )
+    {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            std::env::var("CRATONVM_JIT_ENABLE_CALLEE_SAVED_GPR_LOCALS")
+                .ok()
+                .map(|v| {
+                    matches!(
+                        v.trim().to_ascii_lowercase().as_str(),
+                        "1" | "true" | "on" | "yes"
+                    )
+                })
+                .unwrap_or(false)
         })
-        .unwrap_or(false)
+    }
 }
 
 /// True if `prefix` matches any entry in `allow_packages`. An entry matches if
