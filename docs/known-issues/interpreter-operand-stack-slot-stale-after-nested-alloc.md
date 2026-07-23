@@ -1,69 +1,86 @@
-# Interpreter operand-stack slot reads stale after a nested allocating call — the residual core of the WildFly cid=0 family
+# Stale refs surfacing on interpreter operand stacks after a nested allocating call — the residual core of the WildFly cid=0 family
 
-Status: OPEN — precisely characterized 2026-07-22 with live slot-level captures; non-fatal in every
-current observation (the all-zero-header invokevirtual detector's CP fallback heals the dispatch and
-boots complete). This is the REMAINING mechanism after
-`fix/wildfly-remoting-cce-close-20260722` closed every native-side producer of the
-`parallel-extension-add` stale-ref family (10 producers; see
-`docs/known-issues/wildfly-remoting-classcastexception-parallel-extension-add.md`).
+Status: **RE-CHARACTERIZED 2026-07-23; fatal member FIXED; one non-fatal shape remains OPEN.**
+This doc previously attributed the family to a frame-slot scan/remap gap in the moving collector's
+interpreter frame walk. A full forensic campaign (worktree
+`/data/wt-stw-residual-close-20260722`, branch `fix/wildfly-stw-residual-close-20260722`) DISPROVED
+that: frames are scanned and remapped correctly in every captured event. The family's true members:
 
-## The discriminating capture
+1. **Producer #11 — `Properties.load` re-entrant natives (FIXED, commit `8e1162cfa`).** The fatal
+   `MechanismDatabase.<init>` Reader NSME — see
+   `docs/internal/fixed-suite-bugs/wildfly-boot-stale-reader-nsme-mechanismdatabase-FIXED.md`.
+   0/320 boots post-fix (was the only fatal member).
+2. **Frozen-in-JIT peer interpreter-frame coverage (HARDENED, commit `ec883f519`).** A peer frozen
+   mid-JIT by the cross-thread STW takeover was covered only by its last root-snapshot deposit +
+   the conservative register/native-stack scan; interpreter frames live in Rust Vecs, invisible to
+   both. XT-FRAME-SCAN now walks frozen peers' frames on the initiator (JvmThread address published
+   with the `tlab_addr` discipline). Rarely exercised in these boots (takeover engages ~never on
+   this host's boot profile: `0 newly taken over` across hundreds of passes) but a real gap under
+   heavier JIT activity.
+3. **OPEN — the non-fatal "StringBuilder chain" shape**, ~3-4%/boot, always healed by the
+   all-zero-header CP fallback (boots complete; `WFLYSRV0025` reached; 0 fatal consequences
+   observed in 700+ boots). Signature: a chained-append receiver (fresh `StringBuilder`,
+   `ArrayList$Itr`, `Optional`) consumed at a `toString`/`getAbsoluteName` append site reads
+   all-zero, with the SAME pre-move address propagating the whole chain
+   (`ClassToExternalizerMap.toString`, `JndiName.getAbsoluteName`, `Optional.map`).
 
-fix6 campaign (all native producers fixed, binary md5-verified), `CRATONVM_DBG_STALE_RECV=1`:
+## What is PROVEN about the open shape (campaign forensics, all tooling landed)
 
-```
-[stale-recv] ptr=0x20019dd2510 method=java/lang/StringBuilder.append(Ljava/lang/String;) — Java frames:
-  [64] org/infinispan/marshall/core/impl/ClassToExternalizerMap.toString() pc=118
-      LOCAL[0] -> 0x2001e08b4a8 all_zero_header=false
-      LOCAL[1] -> 0x2001e08b520 all_zero_header=false        ← every LOCAL healthy
-  ...
-[stale-recv] ptr=0x20019dd2510 method=java/lang/StringBuilder.append(I) — same frame pc=122
-```
+Per-capture facts, consistent across dozens of captures on binaries `fix2`..`fix8`:
 
-- The stale receiver appears in NO local of any frame — it exists only as the operand-stack value
-  consumed by the dispatch.
-- The SAME stale address is consumed at two consecutive append call sites (pc 118 then 122) in a
-  javac `sb.append(x).append(y)` chain — i.e. the value was pushed once (aload/chained return),
-  survived a nested GC-capable evaluation (argument expressions allocate), and both consumers saw
-  the pre-move address.
-- Every native producer that could have handed the value back stale is fixed and verified on this
-  binary (the append natives return pin-refreshed `this`; `cargo test` clean; the doc's campaign
-  history shows each earlier producer's signature at 0 post-fix).
+- The stale address X **was a key of the fatal epoch's pointer map** (`CRATONVM_DBG_GCPART` ring
+  probe: `moved_to=Some(Y)`) — the object was rooted and copied. In one capture the relocated `Y`
+  was visible in the SAME frame's healed local while the consumed receiver still read X.
+- The holder thread **participated normally** in the fatal collection
+  (`CRATONVM_DBG_REMAP_TRACE`: `arrive`/`initiator` entries with the correct map size — in the
+  richest capture the holder ITSELF initiated the GC, 71 frames deep at
+  `jdk/internal/misc/Unsafe.allocateUninitializedArray0 pc=10` inside real-JDK
+  StringBuilder/concat internals invoked from the consuming `toString`).
+- The deposit-gap differ (raw frame walk vs deposited snapshot) shows **no exclusion** of X at any
+  deposit; the wake-writeback verifiers (`ARRIVE/WAKE/SAFEPOINT-STALE`, `[blockgc]`) are silent;
+  `verify_no_stale_refs` runs on the initiator after the remap.
+- The popped-slot dump shows X in a **properly tagged object slot** (`raw=0xfffd...`, kind=0) —
+  no CompactValue tag/kind anomaly.
+- The nret ring shows the append natives returning X repeatedly BEFORE the fatal epoch (the
+  pre-GC chain) and — in one capture — **a native returning X one return before consumption,
+  post-GC**; the getfield ring shows X was never pushed by an interpreter getfield.
+- `CRATONVM_DBG_ZERO_RANGES` places X's memory inside the fatal epoch's own `fromspace-reset`
+  wipe (zeroed at collection end — which is also why the funnel's `load_and_forward` return-heal
+  cannot recover it afterward).
 
-Conclusion: a reference sitting on an INTERPRETER OPERAND STACK across a nested allocating call can
-read back stale — the frame's stack slot missed the moving-GC root scan/remap in some window. Locals
-in the same frame were remapped correctly in every capture, so the gap is specific to stack slots
-(or to a stack-slot tagging state — e.g. a CompactValue variant the scanner classifies as
-non-reference).
+Net: after a collection that correctly rooted, copied and frame-remapped everything, a pre-move
+address re-enters the operand stack through the invoke plumbing — i.e. a Rust-side copy held by
+one of the ~70 in-flight interpreter invoke layers (popped-args buffers, return-value plumbing, a
+restore path) or a native's internal loop, is pushed after the remap. It is the same CLASS as
+producer #11 (raw Rust copies crossing a GC), but the specific holder has not been named yet.
 
-## Why this is the old "cid=0 menagerie" core
+## Queued next step (instrumentation already built and landed)
 
-This mechanism produces exactly the historical symptom set the retired
-`wildfly-standalone-boot-attributeaccess-cce-register-invisible-root-RETIRED.md` family chased for
-weeks: an arbitrary consumer (checkcast/invoke on whatever type that code expected) observing a
-zeroed/reused block that identifies as bare `java.lang.Object` (ClassId 0), at ~0.5-2%/boot rates
-under parallel-extension-add's allocation storm, JIT-independent, per-site pin fixes never moving
-the rate. Every NATIVE-side member of the family is now closed; what remains is this interpreter
-frame-scan window.
+`push_invoke_return_value` now records every Object invoke-return push in a per-thread ring
+(`[pushprov]`, gate `CRATONVM_DBG_REMAP_TRACE`), dumped at every stale-recv/NSME capture next to
+the nret ring: a pushprov hit WITHOUT an nret hit = interpreted/lambda/proxy return produced the
+stale push; with an nret hit = a native return (the nret site names it). One campaign on a binary
+carrying this (first is `cvm-stw-close-20260722-fix9`+) should name the holder directly.
+Harness: `probes/batch.sh` (P=4) in the worktree above; pre-fix event rate ~3-4%/boot ⇒ ~10-15
+captures per 320-boot campaign.
 
-## Current impact
+## Impact assessment for the open shape
 
-Non-fatal in all fix5/fix6 observations: the invokevirtual stale-receiver detector heals via CP
-fallback and boots reach completion (`WFLYSRV0025` with the 2026-07-22 console-logging fix). The
-residual risk is (a) the healed path still OPERATES on the stale object (writes land in reclaimed
-memory — the plausible mechanism of the open h2 `StringBuilder.append(long)` NaN corruption), and
-(b) consumers without a healing path (checkcast) turn it into the family's fatal CCE at very low
-residual rates.
+Non-fatal in every observation across 700+ instrumented boots: the invokevirtual stale-receiver
+detector heals dispatch via the CP class and the boot completes. Residual risks: (a) the healed
+dispatch still operates on reclaimed memory (plausible mechanism of the h2
+`StringBuilder.append(long)` NaN corruption — writes landing in a zeroed block), and (b) a
+consumer without a healing path (checkcast) would make it fatal — no such fatal instance remains
+after producer #11's fix.
 
-## Pickup
+## Historical characterization (2026-07-22, superseded in mechanism, preserved)
 
-- Tooling is all landed and env-gated: `CRATONVM_DBG_STALE_RECV=1` (frame + slot provenance dump,
-  optionally + `CRATONVM_DBG_A2` allocation history), `CRATONVM_DBG_CCE_BT=1` (checkcast +
-  nsme_dispatch stack dumps). The `xargs -P 10` isolated-boot harness in
-  `/data/wt-remoting-cce-close-20260722/probes/` reproduces captures within ~30-100 attempts.
-- Start from the interpreter frame stack scanner (the moving young collector's root walk over
-  `thread.frames[*].stack`) and audit which slot states are classified non-reference; correlate
-  with the CompactValue tag transitions used by the K2/T10.9.E direct-push fast paths.
-- This belongs with the precise-maps/frame-scan roadmap
-  (`docs/feature-designs/precise-jit-maps-default.md`), not with another native sweep — the native
-  surface is done.
+The discriminating capture that opened this doc (fix6 campaign, `CRATONVM_DBG_STALE_RECV=1`)
+showed the stale receiver in NO local of any frame, consumed at two consecutive append pcs, with
+every native producer of the remoting-cce family fixed on that binary. The conclusion drawn then —
+"a reference sitting on an INTERPRETER OPERAND STACK across a nested allocating call can read back
+stale — the frame's stack slot missed the moving-GC root scan/remap" — was WRONG in mechanism:
+"locals healthy" was survivorship (locals mostly reference older objects), and the stack slot was
+never missed by the remap; the stale value re-entered via Rust-side invoke plumbing after the
+remap. The suggested pickup (audit the frame stack scanner's slot classification) was carried out
+during this investigation and found sound.

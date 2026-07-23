@@ -1028,3 +1028,37 @@ addendum (which left this as an open "wedge" needing investigation) is supersede
 downgrading it from "residual defect" to "understood, bounded, non-blocking rare race," consistent
 with how this doc's own history has repeatedly had to distinguish real hangs from misclassified slow
 paths (see "Final resolution 2026-07-14").
+
+
+---
+
+## Seventh verification + residual-family closure (2026-07-23, `fix/wildfly-stw-residual-close-20260722`)
+
+Re-opened by user report ("still not fixed"). Result: **the hang itself did not reproduce — 0 STW
+warnings, 0 tripwire hits, 0 CPU-dead wedges across 700+ isolated boots** on dev `ffe407a5f`
+(campaigns `out-run1..run10` in `/data/wt-stw-residual-close-20260722/probes/`, CPU-activity-aware
+verdicts, boots completing `WFLYSRV0025`). The one `rounds=64` warning observed occurred at host
+load >100 during an unrelated host memory incident, with the census dump showing normal mid-work
+threads and the boot progressing after — the established contention-artifact pattern.
+
+What the report actually was: the doc's residual **stale-receiver family** (non-fatal `[stale-recv]`
+heals + the fatal `MechanismDatabase` Reader NSME). This session root-caused and fixed its fatal
+member — a *twelfth* distinct mechanism under this doc's umbrella, and notably NOT a GC/safepoint
+protocol bug:
+
+- **Producer #11 (FIXED `8e1162cfa`, verified 0/320 boots):** `Properties.load(Reader/InputStream)`
+  natives held raw `ObjectRef`s across re-entrant `invoke_virtual("read")` loops; a moving young
+  collection inside the nested real-JDK read left the copies pointing at from-space that
+  `Arena::reset` zeroes at collection end. See
+  `wildfly-boot-stale-reader-nsme-mechanismdatabase-FIXED.md`.
+- **XT-FRAME-SCAN hardening (`ec883f519`):** the takeover now walks OS-frozen in-JIT peers'
+  interpreter frames (Rust-Vec-resident, invisible to the conservative register/stack scan) into
+  `xt_roots`, closing the stale-snapshot window for frozen peers.
+- The remaining non-fatal StringBuilder-chain shape (~3-4%/boot, always healed, 0 fatal in 700+
+  boots) is precisely characterized with new always-landed forensics in
+  `docs/known-issues/interpreter-operand-stack-slot-stale-after-nested-alloc.md`.
+
+Forensic tooling added for this closure (all env-gated): `CRATONVM_DBG_GCPART` (recent pointer-map
+ring probe), `CRATONVM_DBG_ZERO_RANGES` (bulk-zeroing range forensics: sweep-span vs
+fromspace-reset), `CRATONVM_DBG_REMAP_TRACE` (per-thread participation trace + native-return ring
++ getfield ring + invoke-return push ring + deposit-gap differ + popped-slot dumps).
