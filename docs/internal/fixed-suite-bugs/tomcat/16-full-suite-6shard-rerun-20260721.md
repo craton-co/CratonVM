@@ -130,3 +130,78 @@ Azure host under
 `/data/data/tomcat-dohead-fixture-20260717/.suite/results/{full-suite-20260721,rerun-after-conffix,hotspot-control}/`.
 Worktree left in place (not cleaned up) for a follow-up session to triage the
 23 individually.
+
+## Addendum, 2026-07-23 — rerun after merging origin/dev (4 shards)
+
+Merged `origin/dev` into `test/tomcat-full-suite-20260721` (fast-forward,
+`aa150b62b` → `893ddbc73`, 253 commits), rebuilt (`cratonvm-tomcat-full-suite-20260721`,
+5m28s clean release build), and reran all 195 previously-non-PASS classes
+(the 23 confirmed regressions + 172 fixture gaps) in 4 shards via the
+committed `apps/tomcat-suite-runner/run-tomcat-suite.sh`. ~26 min wall clock.
+
+**12 of the 23 confirmed regressions from 2026-07-21 are now fixed** by
+whatever landed in those 253 commits — no individual root-cause needed here,
+they now PASS outright:
+
+- `jakarta.el.TestBeanSupport`, `jakarta.el.TestOptionalELResolver`
+- `org.apache.catalina.authenticator.TestBasicAuthParser`
+- `org.apache.catalina.core.TestApplicationFilterConfig`
+- `org.apache.catalina.core.TestSwallowAbortedUploads`
+- `org.apache.catalina.filters.TestAddCharSetFilter`
+- `org.apache.catalina.util.TestURLEncoder`
+- `org.apache.catalina.valves.TestSSLValve`
+- `org.apache.coyote.http2.TestHttp2Limits`
+- `org.apache.el.TestValueExpressionImpl`
+- `org.apache.juli.TestThreadNameCache`
+- `org.apache.tomcat.util.buf.TestB2CConverter`
+
+**11 confirmed regressions remain** (unchanged from the 2026-07-21 list minus
+the 12 above):
+`org.apache.catalina.connector.TestResponsePerformance` (now FAIL, was HANG),
+`org.apache.catalina.mapper.TestMapperPerformance`,
+`org.apache.catalina.nonblocking.TestNonBlockingAPI` (now **CRASH**, was HANG
+— see below), `org.apache.catalina.realm.TestJNDIRealmIntegration` (now
+**HANG**, was FAIL), `org.apache.coyote.http2.TestHttp2Section_8_2`,
+`org.apache.el.parser.TestELParserPerformance`,
+`org.apache.juli.TestOneLineFormatterPerformance`,
+`org.apache.tomcat.util.buf.TestCharsetCachePerformance`,
+`org.apache.tomcat.util.http.TestMethodPerformance`,
+`org.apache.tomcat.util.net.TestXxxEndpoint`,
+`org.apache.tomcat.websocket.server.TestAsyncMessagesPerformance`.
+
+The 172 fixture-gap classes are unchanged (still fail identically — no
+fixture work was done between the two runs, as expected).
+
+### New finding: real Rust panic in `TestNonBlockingAPI` (was HANG, now CRASH)
+
+```
+thread 'http-nio-127.0.0.1-auto-22-exec-3' panicked at vm/src/runtime/value_stack.rs:237:25:
+index out of bounds: the len is 24 but the index is 18446744073709551615
+```
+
+`18446744073709551615` = `u64::MAX`, i.e. a `0usize - 1` underflow wrapping
+around — classic off-by-one/stale-index bug in the interpreter's value stack.
+Happens on a **background NIO worker thread** (`http-nio-*-exec-3`) inside
+`java/util/concurrent/LinkedBlockingQueue.take()`, during connector
+pause/stop teardown between two of the class's ~44 parameterized test
+methods — not on the main JUnit thread, which is why the class still printed
+a normal `FAILURES!!! Tests run: 44, Failures: 1` summary afterward instead
+of dying outright (CratonVM's panic handler caught it and kept the process
+alive). This is a real, isolated VM bug, worth prioritizing over the
+performance-timeout regressions in the list above — reproduce via
+`org.apache.catalina.nonblocking.TestNonBlockingAPI` alone with JIT on, real
+JDK, real sockets; the panic fires reliably somewhere around test ~30-35 of
+44 in this run's log (`shard-0/org.apache.catalina.nonblocking.TestNonBlockingAPI.log`
+on the Azure host, `.suite/results/rerun-4shard-20260723/`).
+
+### Two remaining-11 classes have existing "FIXED" docs that don't match this run — flag, not yet reconciled
+
+`docs/internal/fixed-suite-bugs/tomcat/mapper-performance-and-redirect-failures.md`
+(dated 2026-07-10) claims `TestMapperPerformance` is fixed, and
+`jndirealmintegration-specialchar-credential-residual-FIXED.md` claims
+`TestJNDIRealmIntegration`'s JIT-only failure is fixed — but both still
+fail/hang in this fresh `dev`-tip build. Not root-caused here (out of scope
+for this rerun); worth checking whether the fix regressed, was on a branch
+that never actually merged despite the doc landing in the reorg, or whether
+this harness's flat `2g` heap / missing conf pieces reintroduce a *different*
+failure than the one those docs describe.
