@@ -4,6 +4,30 @@ This folder collects CratonVM-only defects found while running upstream Java
 suites. The docs had grown to describe the **same underlying bug from several
 angles**; this index is the consolidated map. Read it first.
 
+## 2026-07-23 `module/spring-boot-tomcat` 5-class residual sweep — 3 real bugs fixed, 2 open
+
+Fixed and verified (see the two commits on `worktree-sb-tomcat-5class-fix-20260723`):
+`TomcatEmbeddedWebappClassLoaderTests` (classpath resource-URL builder
+forcibly normalized backslash-spelled `jar:file:` classpath entries instead
+of preserving them, unlike real Java) and two distinct
+`AsynchronousServerSocketChannel` gaps that were making
+`TomcatServletWebServerFactoryTests.sslWithHttp11Nio2Protocol` fail (missing
+`bind(SocketAddress,int)` native registration → `AbstractMethodError`, and
+missing `getLocalAddress()` → NPE; the first fix attempt at the latter
+introduced a real deadlock by locking the same `Mutex` the accept loop holds
+for its whole blocking `accept()` call — caught and fixed properly by
+capturing the bound address at bind time instead). Two of the five residual
+classes turned out to be the known embedded-Tomcat throughput-wall pattern,
+not bugs (confirmed by rerunning with a long timeout — both pass cleanly
+given enough time). Two new open docs:
+[`springboot/tomcatservletwebserverservletcontextlistenertests-mockito-forkedclasspath-mockmethodadvice.md`](springboot/tomcatservletwebserverservletcontextlistenertests-mockito-forkedclasspath-mockmethodadvice.md)
+(Mockito `MockMethodAdvice` fails to load specifically inside
+`@ForkedClassPath`'s reentrant nested-JUnit-Launcher execution — root cause
+narrowed, not fixed) and
+[`springboot/tomcatservletwebserverfactorytests-ssl-clientauth-peercert-residuals.md`](springboot/tomcatservletwebserverfactorytests-ssl-clientauth-peercert-residuals.md)
+(SSL client-certificate mutual-auth handshake/peer-certificate gaps, distinct
+from the already-documented CBC/DHE/TLS1.1 rustls limitations).
+
 ## 2026-07-24 Tomcat suite — fixture gaps + one real bug, split into 9 actionable docs
 
 New subfolder: [`tomcat/`](tomcat/README.md). Split out of
