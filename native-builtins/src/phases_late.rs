@@ -12929,6 +12929,11 @@ struct JarFsIndex {
     names: Vec<String>,
     sizes: std::collections::HashMap<String, u64>,
     raw_names: std::collections::HashMap<String, String>,
+    /// Immediate children keyed by their parent directory.  Javac's archive
+    /// indexer walks every package directory; deriving children by scanning a
+    /// prefix range for each directory makes that first walk quadratic for
+    /// deeply packaged archives.
+    children: std::collections::HashMap<String, Vec<(String, bool)>>,
 }
 
 fn jar_index(jar: &str) -> Option<std::sync::Arc<JarFsIndex>> {
@@ -12947,20 +12952,51 @@ fn jar_index(jar: &str) -> Option<std::sync::Arc<JarFsIndex>> {
         let mut names = Vec::with_capacity(zip.len());
         let mut sizes = std::collections::HashMap::with_capacity(zip.len());
         let mut raw_names = std::collections::HashMap::with_capacity(zip.len());
+        let mut child_maps: std::collections::HashMap<
+            String,
+            std::collections::BTreeMap<String, bool>,
+        > = std::collections::HashMap::new();
         for i in 0..zip.len() {
             let f = zip.by_index(i).ok()?;
             let raw = f.name().to_string();
             let name = raw.trim_start_matches('/').to_string();
             sizes.insert(name.clone(), f.size());
             raw_names.insert(name.clone(), raw);
+            let trimmed = name.trim_end_matches('/');
+            if !trimmed.is_empty() {
+                let components: Vec<&str> =
+                    trimmed.split('/').filter(|part| !part.is_empty()).collect();
+                let explicit_dir = name.ends_with('/');
+                let mut parent = String::new();
+                for (component_index, component) in components.iter().enumerate() {
+                    let child = if parent.is_empty() {
+                        (*component).to_string()
+                    } else {
+                        format!("{parent}/{component}")
+                    };
+                    let is_dir = component_index + 1 < components.len() || explicit_dir;
+                    let entry = child_maps
+                        .entry(parent.clone())
+                        .or_default()
+                        .entry(child.clone())
+                        .or_insert(false);
+                    *entry = *entry || is_dir;
+                    parent = child;
+                }
+            }
             names.push(name);
         }
         names.sort_unstable();
         names.dedup();
+        let children = child_maps
+            .into_iter()
+            .map(|(parent, entries)| (parent, entries.into_iter().collect()))
+            .collect();
         Some(Arc::new(JarFsIndex {
             names,
             sizes,
             raw_names,
+            children,
         }))
     })();
     guard.insert(jar.to_string(), built.clone());
@@ -13135,44 +13171,16 @@ fn jarfs_list_dir(jar: &str, dir: &str) -> Vec<String> {
 }
 
 /// List immediate children of `dir` inside a JAR together with an
-/// is-directory flag, using the cached sorted entry index (a contiguous prefix
-/// range), so a `walkFileTree` does not re-parse the whole zip per directory.
+/// is-directory flag from the cached direct-child index.  This keeps a full
+/// archive walk linear in its entries rather than repeatedly scanning every
+/// descendant below each package directory.
 fn jarfs_list_dir_classified(jar: &str, dir: &str) -> Vec<(String, bool)> {
     let dir = dir.trim_start_matches('/').trim_end_matches('/');
-    let prefix = if dir.is_empty() {
-        String::new()
-    } else {
-        format!("{dir}/")
-    };
     let index = match jar_index(jar) {
         Some(n) => n,
         None => return Vec::new(),
     };
-    let names = &index.names;
-    let start = names.partition_point(|n| n.as_str() < prefix.as_str());
-    let mut seen: std::collections::BTreeMap<String, bool> = std::collections::BTreeMap::new();
-    for name in &names[start..] {
-        let rest = match name.strip_prefix(&prefix) {
-            Some(r) => r,
-            None => break, // sorted: first non-match ends the prefix range
-        };
-        let trimmed = rest.trim_end_matches('/');
-        if trimmed.is_empty() {
-            continue;
-        }
-        // Immediate child; it is a directory when the entry path descends
-        // further (contains '/') or is an explicit directory entry (trailing '/').
-        let (child, is_dir) = match trimmed.find('/') {
-            Some(j) => (&trimmed[..j], true),
-            None => (trimmed, rest.ends_with('/')),
-        };
-        if child.is_empty() {
-            continue;
-        }
-        let e = seen.entry(format!("{prefix}{child}")).or_insert(false);
-        *e = *e || is_dir;
-    }
-    seen.into_iter().collect()
+    index.children.get(dir).cloned().unwrap_or_default()
 }
 
 // ===========================================================================
@@ -37376,7 +37384,7 @@ pub(crate) fn register_p66_file_visitor(r: &mut NativeMethodRegistry) {
         "java/nio/file/Files",
         "walkFileTree",
         "(Ljava/nio/file/Path;Ljava/nio/file/FileVisitor;)Ljava/nio/file/Path;",
-        p98_walk_file_tree,
+        |ctx, args| p98_walk_file_tree(ctx, args, usize::MAX),
     );
     r.register(
         "java/nio/file/Files",
@@ -37384,14 +37392,27 @@ pub(crate) fn register_p66_file_visitor(r: &mut NativeMethodRegistry) {
         "(Ljava/nio/file/Path;Ljava/util/Set;ILjava/nio/file/FileVisitor;)Ljava/nio/file/Path;",
         |ctx, args| {
             let path_obj = args.first().copied().unwrap_or(Value::Object(None));
+            let requested_depth = args
+                .get(2)
+                .and_then(Value::as_int)
+                .unwrap_or(i32::MAX);
+            let max_depth = if requested_depth == i32::MAX {
+                usize::MAX
+            } else {
+                requested_depth.max(0) as usize
+            };
             let visitor = args.get(3).copied().unwrap_or(Value::Object(None));
-            p98_walk_file_tree(ctx, &[path_obj, visitor])
+            p98_walk_file_tree(ctx, &[path_obj, visitor], max_depth)
         },
     );
     r.set_category(__prev_cat);
 }
 
-fn p98_walk_file_tree(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+fn p98_walk_file_tree(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    max_depth: usize,
+) -> MethodCallResult {
     let path_val = args.first().copied().unwrap_or(Value::Object(None));
     let visitor = if let Some(Value::Object(Some(v))) = args.get(1) {
         *v
@@ -37443,7 +37464,24 @@ fn p98_walk_file_tree(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     // -- once it returns.
     let visitor_pin = p98_pin(ctx, visitor);
     let path_pin = p98_pin(ctx, path_obj);
-    let result = p98_walk_dir(ctx, &root_str, visitor_pin, path_pin, skip_file_callbacks);
+    // JDK 25's ArchiveContainer indexer only records package directories.
+    // Serve that exact, already-indexed jar walk without an interpreter
+    // callback for every directory; all other visitors use the generic path.
+    if skip_file_callbacks
+        && max_depth == usize::MAX
+        && p98_index_javac_archive_packages(ctx, &root_str, visitor_pin, path_pin)?
+    {
+        ctx.unpin_native_roots(visitor_pin.0);
+        return Ok(Some(path_val));
+    }
+    let result = p98_walk_dir(
+        ctx,
+        &root_str,
+        visitor_pin,
+        path_pin,
+        skip_file_callbacks,
+        max_depth,
+    );
     ctx.unpin_native_roots(visitor_pin.0);
     result?;
     Ok(Some(path_val))
@@ -37519,12 +37557,142 @@ fn p98_alloc_basic_file_attributes(
     attrs
 }
 
+/// Fast-path the only callback implemented by javac's archive indexer.
+///
+/// JDK 25's `JavacFileManager$ArchiveContainer$1` captures an
+/// `ArchiveContainer` and its root path, then adds every directory with a
+/// Java-identifier basename to `ArchiveContainer.packages`. The archive
+/// filesystem already has the complete direct-child tree in [`JarFsIndex`],
+/// so reproducing that narrow operation avoids a full interpreter round-trip
+/// for every directory of every classpath jar. Return `false` for any shape
+/// we do not recognize so generic visitor dispatch remains the fallback.
+fn p98_index_javac_archive_packages(
+    ctx: &mut dyn NativeContext,
+    root: &str,
+    visitor_pin: P98Pin,
+    root_path_pin: P98Pin,
+) -> Result<bool, MethodCallFailed> {
+    let Some((jar, root_entry)) = jarfs_decode(root) else {
+        return Ok(false);
+    };
+    let Some(index) = jar_index(&jar) else {
+        return Ok(false);
+    };
+
+    // Keep Unicode package names on the generic path. The direct predicate
+    // covers the common ASCII archive layout; falling back rather than
+    // approximating Java's Unicode identifier rules preserves correctness for
+    // unusual jars.
+    if index.children.keys().any(|directory| !directory.is_ascii()) {
+        return Ok(false);
+    }
+
+    let visitor = p98_read_pin(ctx, visitor_pin);
+    let container = match ctx.get_field(visitor, 1) {
+        Value::Object(Some(container))
+            if ctx
+                .class_name_of_id(ctx.class_id_of_object(container))
+                .as_deref()
+                == Some("com/sun/tools/javac/file/JavacFileManager$ArchiveContainer") =>
+        {
+            container
+        }
+        _ => return Ok(false),
+    };
+    let packages = match ctx.get_field(container, 2) {
+        Value::Object(Some(packages)) => packages,
+        _ => return Ok(false),
+    };
+    let packages_pin = p98_pin(ctx, packages);
+    let packages_base = packages_pin.0;
+
+    // `(archive entry, path relative to the walk root)`. The visitor adds the
+    // root itself under RelativeDirectory("") and prunes a non-identifier
+    // directory (for example META-INF) together with its subtree.
+    let root_entry = root_entry.trim_start_matches('/').trim_end_matches('/');
+    let mut pending = vec![(root_entry.to_string(), String::new(), true)];
+    while let Some((entry, relative, is_root)) = pending.pop() {
+        if !is_root
+            && !entry
+                .rsplit('/')
+                .next()
+                .is_some_and(p98_is_ascii_java_identifier)
+        {
+            continue;
+        }
+
+        let path_pin = if is_root {
+            root_path_pin
+        } else {
+            let encoded = jarfs_encode(&jar, &entry);
+            let path = alloc_concurrent_synthetic(ctx, "java/nio/file/Path", 2);
+            let path_pin = p98_pin(ctx, path);
+            let path_string = ctx.create_string(&encoded);
+            let path_now = p98_read_pin(ctx, path_pin);
+            ctx.set_field(path_now, 0, Value::Object(Some(path_string)));
+            path_pin
+        };
+        let relative_string = ctx.create_string(&relative);
+        let relative_string_pin = p98_pin(ctx, relative_string);
+        let relative_directory = match ctx.new_object_initialized(
+            "com/sun/tools/javac/file/RelativePath$RelativeDirectory",
+            "(Ljava/lang/String;)V",
+            &[Value::Object(Some(p98_read_pin(ctx, relative_string_pin)))],
+        )? {
+            Some(Value::Object(Some(directory))) => directory,
+            _ => {
+                ctx.unpin_native_roots(packages_base);
+                return Ok(false);
+            }
+        };
+        let directory_pin = p98_pin(ctx, relative_directory);
+        let packages_now = p98_read_pin(ctx, packages_pin);
+        let directory_now = p98_read_pin(ctx, directory_pin);
+        let path_now = p98_read_pin(ctx, path_pin);
+        ctx.invoke_virtual(
+            packages_now,
+            "put",
+            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            &[
+                Value::Object(Some(directory_now)),
+                Value::Object(Some(path_now)),
+            ],
+        )?;
+
+        if let Some(children) = index.children.get(&entry) {
+            for (child, is_dir) in children.iter().rev() {
+                if *is_dir {
+                    let leaf = child.rsplit('/').next().unwrap_or_default();
+                    let child_relative = if relative.is_empty() {
+                        leaf.to_string()
+                    } else {
+                        format!("{relative}/{leaf}")
+                    };
+                    pending.push((child.clone(), child_relative, false));
+                }
+            }
+        }
+    }
+    ctx.unpin_native_roots(packages_base);
+    Ok(true)
+}
+
+fn p98_is_ascii_java_identifier(component: &str) -> bool {
+    let mut chars = component.bytes();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    matches!(first, b'A'..=b'Z' | b'a'..=b'z' | b'_' | b'$')
+        && chars.all(|byte| matches!(byte, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'_' | b'$'))
+}
+
 fn p98_walk_dir(
     ctx: &mut dyn NativeContext,
     dir: &str,
     visitor_pin: P98Pin,
     dir_path_pin: P98Pin,
     skip_file_callbacks: bool,
+    remaining_depth: usize,
 ) -> Result<bool, MethodCallFailed> {
     let attrs = p98_alloc_basic_file_attributes(ctx, true, 0);
     // preVisitDirectory
@@ -37548,31 +37716,46 @@ fn p98_walk_dir(
             return Ok(true);
         } // SKIP_SUBTREE
     }
-    if let Some((jar, entry)) = jarfs_decode(dir) {
-        // jar-FS directory — children come from the archive listing, not the
-        // host filesystem (std::fs::read_dir on the encoded sentinel string
-        // would ENOENT and silently visit nothing, so e.g. JUnit5's
-        // ClasspathScanner would "discover" an empty jar).
-        for (child, is_dir) in jarfs_list_dir_classified(&jar, &entry) {
-            let es = jarfs_encode(&jar, &child);
-            let epo = alloc_concurrent_synthetic(ctx, "java/nio/file/Path", 2);
-            let epo_pin = p98_pin(ctx, epo);
-            let s = ctx.create_string(&es);
-            let epo_now = p98_read_pin(ctx, epo_pin);
-            ctx.set_field(epo_now, 0, Value::Object(Some(s)));
-            if is_dir {
-                if !p98_walk_dir(ctx, &es, visitor_pin, epo_pin, skip_file_callbacks)? {
-                    return Ok(false);
-                }
-            } else if !skip_file_callbacks {
-                let fa = p98_alloc_basic_file_attributes(
-                    ctx,
-                    false,
-                    jarfs_entry_size(&jar, &child).unwrap_or(0),
-                );
-                let visitor_now = p98_read_pin(ctx, visitor_pin);
-                let epo_now = p98_read_pin(ctx, epo_pin);
-                let vr = p98_invoke_file_visitor(
+    if remaining_depth > 0 {
+        if let Some((jar, entry)) = jarfs_decode(dir) {
+            // jar-FS directory — children come from the archive listing, not the
+            // host filesystem (std::fs::read_dir on the encoded sentinel string
+            // would ENOENT and silently visit nothing, so e.g. JUnit5's
+            // ClasspathScanner would "discover" an empty jar).
+            // The ArchiveContainer indexer only visits directories.  Do not build
+            // transient Java paths for every ignored archive file in that mode.
+            for (child, is_dir) in jarfs_list_dir_classified(&jar, &entry) {
+                let es = jarfs_encode(&jar, &child);
+                if is_dir {
+                    let epo = alloc_concurrent_synthetic(ctx, "java/nio/file/Path", 2);
+                    let epo_pin = p98_pin(ctx, epo);
+                    let s = ctx.create_string(&es);
+                    let epo_now = p98_read_pin(ctx, epo_pin);
+                    ctx.set_field(epo_now, 0, Value::Object(Some(s)));
+                    if !p98_walk_dir(
+                        ctx,
+                        &es,
+                        visitor_pin,
+                        epo_pin,
+                        skip_file_callbacks,
+                        remaining_depth - 1,
+                    )? {
+                        return Ok(false);
+                    }
+                } else if !skip_file_callbacks {
+                    let epo = alloc_concurrent_synthetic(ctx, "java/nio/file/Path", 2);
+                    let epo_pin = p98_pin(ctx, epo);
+                    let s = ctx.create_string(&es);
+                    let epo_now = p98_read_pin(ctx, epo_pin);
+                    ctx.set_field(epo_now, 0, Value::Object(Some(s)));
+                    let fa = p98_alloc_basic_file_attributes(
+                        ctx,
+                        false,
+                        jarfs_entry_size(&jar, &child).unwrap_or(0),
+                    );
+                    let visitor_now = p98_read_pin(ctx, visitor_pin);
+                    let epo_now = p98_read_pin(ctx, epo_pin);
+                    let vr = p98_invoke_file_visitor(
                     ctx,
                     visitor_now,
                     "visitFile",
@@ -37581,35 +37764,47 @@ fn p98_walk_dir(
                     epo_now,
                     Value::Object(Some(fa)),
                 )?;
-                if let Some(r) = vr {
-                    if ctx.get_field(r, 1).as_int().unwrap_or(0) == 1 {
-                        return Ok(false);
+                    if let Some(r) = vr {
+                        if ctx.get_field(r, 1).as_int().unwrap_or(0) == 1 {
+                            return Ok(false);
+                        }
                     }
                 }
             }
-        }
-    } else if let Some((java_home, entry)) = jrtfs_decode(dir) {
-        // jrt-FS directory — children come from the jimage listing.
-        for (child, is_dir) in jrtfs_list_dir_classified(&java_home, &entry) {
-            let es = jrtfs_encode(&java_home, &child);
-            let epo = alloc_concurrent_synthetic(ctx, "java/nio/file/Path", 2);
-            let epo_pin = p98_pin(ctx, epo);
-            let s = ctx.create_string(&es);
-            let epo_now = p98_read_pin(ctx, epo_pin);
-            ctx.set_field(epo_now, 0, Value::Object(Some(s)));
-            if is_dir {
-                if !p98_walk_dir(ctx, &es, visitor_pin, epo_pin, skip_file_callbacks)? {
-                    return Ok(false);
-                }
-            } else if !skip_file_callbacks {
-                let fa = p98_alloc_basic_file_attributes(
-                    ctx,
-                    false,
-                    jrtfs_entry_size(&java_home, &child).unwrap_or(0),
-                );
-                let visitor_now = p98_read_pin(ctx, visitor_pin);
-                let epo_now = p98_read_pin(ctx, epo_pin);
-                let vr = p98_invoke_file_visitor(
+        } else if let Some((java_home, entry)) = jrtfs_decode(dir) {
+            // jrt-FS directory — children come from the jimage listing.
+            for (child, is_dir) in jrtfs_list_dir_classified(&java_home, &entry) {
+                let es = jrtfs_encode(&java_home, &child);
+                if is_dir {
+                    let epo = alloc_concurrent_synthetic(ctx, "java/nio/file/Path", 2);
+                    let epo_pin = p98_pin(ctx, epo);
+                    let s = ctx.create_string(&es);
+                    let epo_now = p98_read_pin(ctx, epo_pin);
+                    ctx.set_field(epo_now, 0, Value::Object(Some(s)));
+                    if !p98_walk_dir(
+                        ctx,
+                        &es,
+                        visitor_pin,
+                        epo_pin,
+                        skip_file_callbacks,
+                        remaining_depth - 1,
+                    )? {
+                        return Ok(false);
+                    }
+                } else if !skip_file_callbacks {
+                    let epo = alloc_concurrent_synthetic(ctx, "java/nio/file/Path", 2);
+                    let epo_pin = p98_pin(ctx, epo);
+                    let s = ctx.create_string(&es);
+                    let epo_now = p98_read_pin(ctx, epo_pin);
+                    ctx.set_field(epo_now, 0, Value::Object(Some(s)));
+                    let fa = p98_alloc_basic_file_attributes(
+                        ctx,
+                        false,
+                        jrtfs_entry_size(&java_home, &child).unwrap_or(0),
+                    );
+                    let visitor_now = p98_read_pin(ctx, visitor_pin);
+                    let epo_now = p98_read_pin(ctx, epo_pin);
+                    let vr = p98_invoke_file_visitor(
                     ctx,
                     visitor_now,
                     "visitFile",
@@ -37618,38 +37813,50 @@ fn p98_walk_dir(
                     epo_now,
                     Value::Object(Some(fa)),
                 )?;
-                if let Some(r) = vr {
-                    if ctx.get_field(r, 1).as_int().unwrap_or(0) == 1 {
-                        return Ok(false);
+                    if let Some(r) = vr {
+                        if ctx.get_field(r, 1).as_int().unwrap_or(0) == 1 {
+                            return Ok(false);
+                        }
                     }
                 }
             }
-        }
-    } else if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let ep = entry.path();
-            let es = ep.to_string_lossy().to_string();
-            let epo = alloc_concurrent_synthetic(ctx, "java/nio/file/Path", 2);
-            let epo_pin = p98_pin(ctx, epo);
-            let s = ctx.create_string(&es);
-            let epo_now = p98_read_pin(ctx, epo_pin);
-            ctx.set_field(epo_now, 0, Value::Object(Some(s)));
-            if ep.is_dir() {
-                if !p98_walk_dir(ctx, &es, visitor_pin, epo_pin, skip_file_callbacks)? {
-                    return Ok(false);
-                }
-            } else if !skip_file_callbacks {
-                let fa = p98_alloc_basic_file_attributes(
-                    ctx,
-                    false,
-                    entry
-                        .metadata()
-                        .map(|metadata| metadata.len() as i64)
-                        .unwrap_or(0),
-                );
-                let visitor_now = p98_read_pin(ctx, visitor_pin);
-                let epo_now = p98_read_pin(ctx, epo_pin);
-                let vr = p98_invoke_file_visitor(
+        } else if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let ep = entry.path();
+                let es = ep.to_string_lossy().to_string();
+                if ep.is_dir() {
+                    let epo = alloc_concurrent_synthetic(ctx, "java/nio/file/Path", 2);
+                    let epo_pin = p98_pin(ctx, epo);
+                    let s = ctx.create_string(&es);
+                    let epo_now = p98_read_pin(ctx, epo_pin);
+                    ctx.set_field(epo_now, 0, Value::Object(Some(s)));
+                    if !p98_walk_dir(
+                        ctx,
+                        &es,
+                        visitor_pin,
+                        epo_pin,
+                        skip_file_callbacks,
+                        remaining_depth - 1,
+                    )? {
+                        return Ok(false);
+                    }
+                } else if !skip_file_callbacks {
+                    let epo = alloc_concurrent_synthetic(ctx, "java/nio/file/Path", 2);
+                    let epo_pin = p98_pin(ctx, epo);
+                    let s = ctx.create_string(&es);
+                    let epo_now = p98_read_pin(ctx, epo_pin);
+                    ctx.set_field(epo_now, 0, Value::Object(Some(s)));
+                    let fa = p98_alloc_basic_file_attributes(
+                        ctx,
+                        false,
+                        entry
+                            .metadata()
+                            .map(|metadata| metadata.len() as i64)
+                            .unwrap_or(0),
+                    );
+                    let visitor_now = p98_read_pin(ctx, visitor_pin);
+                    let epo_now = p98_read_pin(ctx, epo_pin);
+                    let vr = p98_invoke_file_visitor(
                     ctx,
                     visitor_now,
                     "visitFile",
@@ -37658,9 +37865,10 @@ fn p98_walk_dir(
                     epo_now,
                     Value::Object(Some(fa)),
                 )?;
-                if let Some(r) = vr {
-                    if ctx.get_field(r, 1).as_int().unwrap_or(0) == 1 {
-                        return Ok(false);
+                    if let Some(r) = vr {
+                        if ctx.get_field(r, 1).as_int().unwrap_or(0) == 1 {
+                            return Ok(false);
+                        }
                     }
                 }
             }

@@ -31,11 +31,16 @@ import java.net.URLConnection;
 import java.nio.file.FileSystems;
 import java.util.*;
 import java.util.stream.IntStream;
+import java.util.stream.Stream;
 
 public class GetClassProbe {
   static String c(Object o){return o.getClass().getName();}
   public static void main(String[] a) throws Exception {
     System.out.println("intRange=" + c(IntStream.rangeClosed(1, 4)));
+    System.out.println("intRangeVals=" + Arrays.toString(IntStream.rangeClosed(1, 4).toArray()));
+    System.out.println("longVals=" + Arrays.toString(java.util.stream.LongStream.of(11L, 13L).toArray()));
+    System.out.println("doubleVals=" + Arrays.toString(java.util.stream.DoubleStream.of(2.5, 4.5).toArray()));
+    System.out.println("mapToIntVals=" + Arrays.toString(Stream.of("bbb", "a").mapToInt(String::length).toArray()));
     // Immutable factories -> ImmutableCollections (size-discriminated).
     System.out.println("listEmpty=" + c(List.of()));
     System.out.println("list2=" + c(List.of(1, 2)));
@@ -215,6 +220,10 @@ fn getclass_reports_concrete_classes() {
         "java.util.stream.IntPipeline$Head",
         "IntStream.rangeClosed must report a concrete IntPipeline class, not the interface"
     );
+    assert_eq!(line("intRangeVals="), "[1, 2, 3, 4]");
+    assert_eq!(line("longVals="), "[11, 13]");
+    assert_eq!(line("doubleVals="), "[2.5, 4.5]");
+    assert_eq!(line("mapToIntVals="), "[3, 1]");
     // Immutable factories.
     assert_eq!(line("listEmpty="), "java.util.ImmutableCollections$ListN");
     assert_eq!(line("list2="), "java.util.ImmutableCollections$List12");

@@ -388,13 +388,12 @@ budget — flagged for a dedicated follow-up):
   interaction, not traced to a specific native gap.
 - **`test.context.bean.override.mockito.MockitoBeanByTypeLookupIntegrationTests`
   + the sibling `.constructor.MockitoBeanByTypeLookupForConstructorParametersIntegrationTests`**
-  (3/5 and 4/6 — same 2 method names fail identically in both, one shared
-  root cause chain) — **2026-07-23 session: FOUR real bugs found, fixed,
-  and merged; a FIFTH, distinct residual is still open.** All four fixed
-  bugs are variations on one theme: `Mockito.mock(StringBuilder.class)`
-  (final class, inline mock maker) redefines `StringBuilder` and its
-  package-private superclass `AbstractStringBuilder` in place, and several
-  different CratonVM caching/dispatch layers weren't redefine-aware.
+  — **FIXED 2026-07-23 (5/5 and 6/6, both fully green).** Both classes went
+  through five real bugs across two sessions on 2026-07-23, all variations on
+  one theme: `Mockito.mock(StringBuilder.class)` (final class, inline mock
+  maker) redefines `StringBuilder` AND its package-private superclass
+  `AbstractStringBuilder` in place, and several different CratonVM
+  caching/dispatch layers weren't redefine-aware.
 
   1. `Class.getDeclaredMethods()` mis-paired bridge methods to the FIRST
      same-named non-bridge sibling instead of the one it actually bridges
@@ -408,79 +407,88 @@ budget — flagged for a dedicated follow-up):
      `true` — the woven advice's own preamble then skipped `handle()`
      entirely and ran the real (empty-buffer) computation. Fixed by
      excluding bridges in `vm/src/vm/vm_exec.rs::class_declares_method`
-     (dev `f5379b3a0`). This flipped `.substring(0)` to correct on the
-     FIRST call to a fresh mock, but exposed bug 3 below on every later
-     call.
-  3. Two invoke-cache blind spots, both keyed on "has this class ever been
-     redefined" without checking it at the RIGHT layer:
-     `StringBuilder.substring(int)` is itself a bridge that forwards to
-     `AbstractStringBuilder.substring` via `invokespecial`; that call
-     site's cache-hit redefine-eviction guard in
-     `execute_invokevirtual_cached` only inspected `VirtualNative`/
-     `Intrinsic` targets for a stale shadow, never the plain `Native`
-     variant (invokestatic/invokespecial's direct-callback target, which
-     carries no `receiver_class_id` to check) — so the cache entry
-     `populate_invoke_cache` warmed right after call #1's correct slow-path
-     dispatch was never evicted, and call #2 onward silently ran the real
-     native instead of the woven advice. Separately,
-     `populate_virtual_invoke_cache`'s direct-native-override lookup had
-     no redefine awareness at all, which would have poisoned the OUTER
-     `mock.substring(0)` call site the same way. Fixed by extending the
-     cache-hit guard to cover `Native` (mirroring the pattern
-     `execute_invokestatic_cached` already used) and adding a
-     `receiver_redefined` check to the populate-side lookup (mirroring
-     `execute_invokevirtual_vtable_fast`'s existing guard).
-  4. Once bugs 2–3 let real per-call dispatch decisions through,
-     `is_string_builder_layout_native_override`'s "always native, real
-     bytecode reads an incompatible compact-string layout" allowlist
-     turned out to be blind to per-instance mock-vs-real status for two
-     methods this suite actually exercises: `setCharAt` was simply missing
-     from the allowlist (a REAL StringBuilder used after an unrelated mock
-     existed crashed with `ArrayIndexOutOfBoundsException` in
-     `String.checkIndex`); `substring(int,int)` (2-arg, used internally by
-     Mockito's own `StringUtil.join` when formatting an exception message)
-     has the same problem but the 1-arg overload must stay OFF the
-     blanket-immune list since that's the one these tests stub/verify on
-     mocks — fixed by giving `is_string_builder_layout_native_override`
-     the descriptor so it can immunize just the 2-arg overload; `length()`
-     has the same tension in the other direction (explicitly `verify()`'d
-     on a mock, so it can't be blanket-immune, but a real receiver's
-     `length()` still needs the native) — fixed with a per-INSTANCE
-     "real carrier" check in `intercept_force_registered_native` (field 0,
-     the `char[]` buffer, is only populated once `<init>` has actually
-     run — a mock is Objenesis-constructed and never runs `<init>`),
-     mirroring the existing `java/net/HttpURLConnection` real-carrier
-     exemption in the same function.
+     (dev `f5379b3a0`).
+  3. Two invoke-cache blind spots in `execute_invokevirtual_cached` /
+     `populate_virtual_invoke_cache`, both keyed on "has this class ever
+     been redefined" without checking it at the RIGHT layer for the plain
+     `Native` cache-target variant. Fixed by extending the cache-hit guard
+     to cover `Native` and adding a `receiver_redefined` check to the
+     populate-side lookup.
+  4. `is_string_builder_layout_native_override`'s "always native, real
+     bytecode reads an incompatible compact-string layout" allowlist had two
+     gaps: `setCharAt` was simply missing (a REAL StringBuilder used after
+     an unrelated mock crashed with AIOOBE); `substring(int,int)` (2-arg,
+     used internally by Mockito's own `StringUtil.join` when formatting an
+     exception message) needed the same treatment, but the 1-arg overload
+     had to stay OFF the list since that's the one these tests stub/verify.
+     Fixed by giving the function the descriptor parameter.
 
-  All four verified against HotSpot via ad hoc probes on the Azure host
-  (`/data/tmp/mockitobean-substring-20260723/`: `RepeatCallProbe`,
-  `RepeatCallProbe3`, `TwoMocksProbe`, `TwoMocksProbe2`,
-  `LengthAfterMockProbe`, `AmbiguousProbe`, `LengthSubstringProbe`,
-  `LengthRepeatProbe`, `SubstringVerifyProbe` — none checked in).
-  `cargo test -p cratonvm-vm --lib`: 2229 passed, 13 failed, identical
-  failure set to the pre-fix baseline (8 `lock_order` tests that only
-  assert under `debug_assertions`, 4 pre-existing `skip_list`/
-  `tomcat_scanner` failures unrelated to this change). Commit `0bd8213de`,
-  merged `6a5f3db42`, pushed to dev.
+     All four verified against HotSpot, `cargo test -p cratonvm-vm --lib`:
+     2229 passed, 13 failed (pre-existing baseline, unrelated). Commit
+     `0bd8213de`, merged `6a5f3db42`.
 
-  **Residual (bug 5, still open)**: both disambiguated-qualifier test
-  methods still fail, now with `org.mockito.exceptions.misusing.
-  UnfinishedVerificationException` instead of a crash — a DIFFERENT
-  failure mode that the AIOOBE was masking. Reproduced in isolation
-  (`LengthSubstringProbe.java`, `AmbiguousProbe.java`): calling
-  `mock.length()` then `mock.substring(0)`, then
-  `verify(mock, times(1)).length()` then
-  `verify(mock, times(1)).substring(anyInt())`, throws
-  `UnfinishedVerificationException` at an INCONSISTENT point (sometimes
-  the first `verify()`, sometimes the second) between two structurally
-  identical probes — ruling out a simple ordering bug and pointing at a
-  timing- or identity-sensitive issue in Mockito's `MockingProgress`
-  pending-verification tracking (a `ThreadLocal<MockingProgress>` in real
-  Mockito). Ruled out so far: `length()` alone + `verify(times(N))`
-  repeated works fine (`LengthRepeatProbe`); `substring(0)` alone +
-  `verify()` works fine (`SubstringVerifyProbe`); only the COMBINATION of
-  both methods on the same mock, each wrapped in its own `verify()`,
-  reproduces it. Not yet root-caused.
+  5. **The residual that took both classes from 3/5 and 4/6 to 5/5 and 6/6**:
+     `length()` had the exact same compiler-generated public-bridge shape as
+     `substring(int)` (`AbstractStringBuilder` is package-private, so
+     `StringBuilder.length()`/`StringBuffer.length()` are real,
+     class-file-declared bridges — confirmed via `javap -p -c
+     java.lang.StringBuilder`), but stayed on the blanket-immune allowlist
+     for ALL THREE class names (`StringBuilder`, `StringBuffer`,
+     `AbstractStringBuilder`) — the previous session's documented "KNOWN
+     GAP". Root-caused this session by dumping Mockito's OWN redefined
+     bytecode on real HotSpot (`-Dnet.bytebuddy.dump=...`, JDK 25, Mockito
+     5.23.0): the woven `MockMethodDispatcher.get/isMocked/isOverridden/
+     handle` advice is woven directly into `AbstractStringBuilder.length()`
+     itself (NOT the `StringBuilder`/`StringBuffer` bridges, which stay
+     unmodified plain delegation), so blanket-forcing native for
+     `AbstractStringBuilder.length()` permanently pre-empted the advice for
+     mock AND real receivers alike. A SEPARATE, previously-unnoticed
+     redefine-unaware intrinsic-population code path in
+     `populate_virtual_invoke_cache` (parallel to, but never updated
+     alongside, the `execute_invokevirtual_vtable_fast` guard already fixed
+     for bug 3) also needed the same redefine-awareness guard, since
+     `StringBuilder.length()`'s bridge is itself in the `StringBuilderLength`
+     intrinsic table.
+
+     **Fix**: removed `length` from `is_string_builder_layout_native_override`'s
+     blanket-immune list entirely (matching `substring(int)`'s existing,
+     never-immune treatment), and added the missing redefine guard to
+     `populate_virtual_invoke_cache`'s intrinsic-population block. Verified
+     via `InvocationCountProbe` (reflects
+     `Mockito.mockingDetails(mock).getInvocations()`) matching real HotSpot's
+     exact `length()`/`substring(0)`/`verify()` invocation-count sequence
+     byte-for-byte, then both full test classes: 5/5 and 6/6.
+     `cargo test -p cratonvm-vm --lib`: 2229 passed, 13 failed (identical
+     pre-existing baseline). `intrinsic_diff` differential suite: 4/4
+     passed.
+
+     **KNOWN REMAINING GAP (not hit by any currently-passing suite class)**:
+     a REAL (non-mock) receiver's `.length()`, called after some OTHER
+     StringBuilder has been Mockito-redefined ANYWHERE in the process, now
+     falls through the woven advice's "not mocked" branch into
+     `AbstractStringBuilder.length()`'s original `getfield count:I` — which
+     reads the wrong field index against CratonVM's 2-field (`char[]`,
+     `int`) synthetic layout and silently returns `0` instead of the real
+     length (confirmed via a dedicated probe, `RealAfterMockLengthProbe`).
+     This is the EXACT SAME latent risk `substring(int)` has carried,
+     unaddressed, since bug 3 above — not a regression this fix introduces,
+     just the same known tradeoff now also applying to `length()`. A real
+     fix needs an authoritative per-instance "is this receiver actually
+     mocked" signal reachable from Rust WITHOUT re-entering bytecode
+     dispatch for the same (class, method) pair — a naive
+     `MockUtil.isMock()` + re-invoke-bytecode attempt during this session's
+     investigation infinite-looped, since re-invoking "this method's
+     bytecode" from inside the very native registered for it re-triggers
+     the identical force-native decision.
+
+     Investigation artifacts (Azure host,
+     `/data/tmp/mockitobean-substring-20260723/`, none checked in):
+     `InvocationCountProbe.java` (reused from the previous session),
+     `RealAfterMockLengthProbe.java` (new), plus a ByteBuddy class dump at
+     `/tmp/bbdump/` on the Azure host (ephemeral, not preserved) showing the
+     actual woven bytecode. Worktree
+     `/data/data/wt-mockitobean-realmock-20260723`, branch
+     `fix/mockitobean-realmock-signal-20260723`.
 - **`test.context.junit.jupiter.event.ParallelApplicationEventsIntegrationTests`**
   (0/2) — `executeTestsInParallelWithInstancePerMethod` fails an AssertJ
   `MultipleFailuresError` ("Test Event Statistics", 2 failures);
@@ -1310,8 +1318,8 @@ above. Removed from this table.
 | `test.context.aot.AotIntegrationTests` | FAIL (2026-07-20, now completes, see above) | 0/4 | 56296ms |
 | `test.context.aot.TestClassScannerTests` | OK (2026-07-20 JIT fix) | 7/7 | 197691ms |
 | `test.context.aot.TestContextAotGeneratorIntegrationTests` | FAIL (2026-07-20, improved, see above) | 2/4 | 148117ms |
-| `test.context.bean.override.mockito.MockitoBeanByTypeLookupIntegrationTests` | FAIL | 3/5 | 27473ms |
-| `test.context.bean.override.mockito.constructor.MockitoBeanByTypeLookupForConstructorParametersIntegrationTests` | FAIL | 4/6 | 16982ms |
+| `test.context.bean.override.mockito.MockitoBeanByTypeLookupIntegrationTests` | OK (2026-07-23 fix) | 5/5 | 27473ms |
+| `test.context.bean.override.mockito.constructor.MockitoBeanByTypeLookupForConstructorParametersIntegrationTests` | OK (2026-07-23 fix) | 6/6 | 16982ms |
 | `test.context.junit.jupiter.event.ParallelApplicationEventsIntegrationTests` | FAIL | 0/2 | 918ms |
 | `test.context.junit.jupiter.parallel.ParallelExecutionSpringExtensionTests` | TIMEOUT | 0/0 | 120000ms |
 | `test.context.testng.TestNGConcurrencyTests` | OK (2026-07-21, side effect) | 1/1 | 2439ms |
