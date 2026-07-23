@@ -96,6 +96,16 @@ struct SeState {
     pending: Vec<u8>,
     capacity: usize,
     name: String,
+    /// Whether a byte-order-mark has already been emitted for this stream.
+    /// `engine::encode_chars`/`encode_chars_lossy` are pure per-call
+    /// functions with no memory of prior calls, so "UTF-16"/"UTF-32" (the
+    /// BOM-prefixed JDK charset names, as opposed to the fixed-endian
+    /// "UTF-16BE"/"UTF-16LE"/etc.) would otherwise get a fresh BOM prepended
+    /// on EVERY `write()` call instead of once at the start of the stream --
+    /// real JDK's `sun.nio.cs.UTF_16.Encoder` tracks this with an internal
+    /// `first` flag and only writes the BOM before the very first character.
+    /// See `effective_encode_name` below for how this is used.
+    bom_written: bool,
 }
 
 /// Mirrors `sun.nio.cs.StreamEncoder.INITIAL_BYTE_BUFFER_CAPACITY`.
@@ -251,6 +261,30 @@ fn name_of(ctx: &dyn NativeContext, this: ObjectRef) -> String {
         .unwrap_or_else(|| "UTF-8".to_string())
 }
 
+/// For the BOM-prefixed charset names ("UTF-16"/"UTF-32"), returns the name
+/// to actually hand to `engine::encode_chars`/`encode_chars_lossy` for THIS
+/// write call: `name` unchanged (BOM included) the first time this stream
+/// encodes anything, or the fixed big-endian variant ("UTF-16BE"/"UTF-32BE",
+/// matching the endianness `encode_utf16_with_bom`/`encode_utf32_with_bom`
+/// already commit to) on every call after that -- see `SeState::bom_written`.
+/// Any other charset name is returned unchanged.
+fn effective_encode_name(ctx: &dyn NativeContext, this: ObjectRef, name: &str) -> String {
+    let fixed_be = match name {
+        "UTF-16" => "UTF-16BE",
+        "UTF-32" => "UTF-32BE",
+        _ => return name.to_string(),
+    };
+    let key = se_key(ctx, this);
+    let mut table = se_table().lock().unwrap();
+    let state = table.entry(key).or_default();
+    if state.bom_written {
+        fixed_be.to_string()
+    } else {
+        state.bom_written = true;
+        name.to_string()
+    }
+}
+
 pub(crate) fn alloc_stream_encoder(
     ctx: &mut dyn NativeContext,
     os: ObjectRef,
@@ -294,6 +328,7 @@ pub(crate) fn alloc_stream_encoder(
             pending: Vec::with_capacity(INITIAL_BYTE_BUFFER_CAPACITY),
             capacity: INITIAL_BYTE_BUFFER_CAPACITY,
             name: charset_name.to_string(),
+            bom_written: false,
         },
     );
     // No pending high surrogate yet (real-field carry, cleared explicitly).
@@ -532,7 +567,8 @@ fn write_bytes(
     let to_encode = &combined[..encode_len];
 
     let name = name_of(ctx, this);
-    let bytes = encode_for_stream(ctx, this, &name, to_encode)?;
+    let encode_name = effective_encode_name(ctx, this, &name);
+    let bytes = encode_for_stream(ctx, this, &encode_name, to_encode)?;
     if bytes.is_empty() {
         return Ok(());
     }
@@ -576,6 +612,7 @@ fn buffer_and_maybe_flush(
             pending: Vec::with_capacity(INITIAL_BYTE_BUFFER_CAPACITY),
             capacity: INITIAL_BYTE_BUFFER_CAPACITY,
             name: "UTF-8".to_string(),
+            bom_written: false,
         });
         // Grow toward (but never past) MAX_BYTE_BUFFER_CAPACITY if the
         // incoming bytes wouldn't fit in the buffer's CURRENT capacity —
@@ -786,9 +823,10 @@ fn flush_pending_surrogate(
         _ => return Ok(()),
     };
     let name = name_of(ctx, this);
+    let encode_name = effective_encode_name(ctx, this, &name);
     // Lossy encode of a lone surrogate yields the charset's replacement bytes
     // (U+FFFD → EF BF BD for UTF-8), exactly as HotSpot's REPLACE action does.
-    let bytes = engine::encode_chars_lossy(&name, &[hi]);
+    let bytes = engine::encode_chars_lossy(&encode_name, &[hi]);
     if bytes.is_empty() {
         return Ok(());
     }

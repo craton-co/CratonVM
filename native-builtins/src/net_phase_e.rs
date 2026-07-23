@@ -253,7 +253,7 @@ fn sock_default() -> SockSide {
     }
 }
 
-fn sock_get(ctx: &dyn NativeContext, this: ObjectRef) -> SockSide {
+pub(crate) fn sock_get(ctx: &dyn NativeContext, this: ObjectRef) -> SockSide {
     let t = sock_side_table().lock();
     t.get(&native_obj_key(ctx, this))
         .cloned()

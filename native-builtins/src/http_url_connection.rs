@@ -27,11 +27,30 @@
 //! No stubs: every code path performs real I/O against the network or rejects
 //! the call with a typed `IOException`. We never fabricate canned 200s.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpStream};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
+
+thread_local! {
+    /// Reason phrase from the most recently parsed HTTP response status line
+    /// on this thread. httparse gives us the exact bytes the server sent
+    /// (`resp.reason`), but `read_response`/`read_response_with_prefix`'s
+    /// return type is the canonical `(status, headers, body)` triple used
+    /// pervasively throughout this module's pooling/retry/redirect call
+    /// chains -- threading a 4th field through every one of those signatures
+    /// is a large, risky refactor for what only `huc_get_response_message`
+    /// needs. A thread-local side channel (mirroring this file's existing
+    /// identity-keyed side-table pattern, e.g. `real_results()`) is far
+    /// smaller in scope: each blocking HTTP call is performed serially on
+    /// the calling Java thread, so "most recently parsed" always means "the
+    /// response this thread just read" -- correctly reflecting the final
+    /// (post-redirect-follow) response by the time `huc_real_perform` reads
+    /// it back out into `RealResult::reason`.
+    static LAST_REASON_PHRASE: RefCell<String> = RefCell::new(String::new());
+}
 
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
@@ -134,6 +153,10 @@ struct RealResult {
     status: i32,
     headers: Vec<(String, String)>,
     body: Vec<u8>,
+    /// The real reason phrase read off the wire (see `LAST_REASON_PHRASE`).
+    /// Empty for the synthetic timeout-sentinel result, in which case
+    /// `huc_get_response_message` falls back to the hardcoded table.
+    reason: String,
 }
 
 fn real_results() -> &'static Mutex<HashMap<i32, RealResult>> {
@@ -560,6 +583,7 @@ fn huc_real_perform(
         ctx.end_blocking_region();
         return match response {
             Ok((status, headers, body)) => {
+                let reason = LAST_REASON_PHRASE.with(|r| r.borrow().clone());
                 if let Ok(mut results) = real_results().lock() {
                     results.insert(
                         key,
@@ -567,6 +591,7 @@ fn huc_real_perform(
                             status,
                             headers,
                             body,
+                            reason,
                         },
                     );
                 }
@@ -580,6 +605,7 @@ fn huc_real_perform(
                             status: HUC_TIMEOUT_STATUS,
                             headers: Vec::new(),
                             body: Vec::new(),
+                            reason: String::new(),
                         },
                     );
                 }
@@ -668,6 +694,7 @@ fn huc_real_perform(
     let resp = final_resp.unwrap_or_else(|| Ok((310, Vec::new(), Vec::new())));
     match resp {
         Ok((status, headers, body)) => {
+            let reason = LAST_REASON_PHRASE.with(|r| r.borrow().clone());
             if let Ok(mut t) = real_results().lock() {
                 t.insert(
                     key,
@@ -675,6 +702,7 @@ fn huc_real_perform(
                         status,
                         headers,
                         body,
+                        reason,
                     },
                 );
             }
@@ -692,6 +720,7 @@ fn huc_real_perform(
                         status: HUC_TIMEOUT_STATUS,
                         headers: Vec::new(),
                         body: Vec::new(),
+                        reason: String::new(),
                     },
                 );
             }
@@ -1215,6 +1244,7 @@ fn read_response_with_prefix<S: Read>(
         return Err("incomplete response head".into());
     }
     let status = resp.code.ok_or("no status code")? as i32;
+    LAST_REASON_PHRASE.with(|r| *r.borrow_mut() = resp.reason.unwrap_or("").to_string());
     let mut headers: Vec<(String, String)> = Vec::with_capacity(resp.headers.len());
     let mut content_length: Option<usize> = None;
     let mut chunked = false;
@@ -2570,11 +2600,24 @@ fn status_reason(status: i32) -> String {
 
 fn huc_get_response_message(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    // Real-JDK carrier: derive from the cached perform result.
+    // Real-JDK carrier: derive from the cached perform result. Prefer the
+    // reason phrase actually read off the wire (real servers often deviate
+    // from the RFC's canonical phrase, e.g. OkHttp MockWebServer's default
+    // "Server Error" for 500 vs. the RFC's "Internal Server Error" -- real
+    // HttpURLConnection.getResponseMessage() always returns exactly what the
+    // server sent) -- the hardcoded `status_reason` table is only a fallback
+    // for when no reason was captured (e.g. the synthetic timeout result).
     if let Some(url_str) = huc_real_object_url(ctx, this) {
         if url_str.starts_with("http://") || url_str.starts_with("https://") {
             let status = huc_real_perform(ctx, this, &url_str)?;
-            let s = ctx.create_string(&status_reason(status));
+            let key = ctx.identity_hash_code(this);
+            let reason = real_results()
+                .lock()
+                .ok()
+                .and_then(|t| t.get(&key).map(|r| r.reason.clone()))
+                .filter(|r| !r.is_empty())
+                .unwrap_or_else(|| status_reason(status));
+            let s = ctx.create_string(&reason);
             return Ok(Some(Value::Object(Some(s))));
         }
     }

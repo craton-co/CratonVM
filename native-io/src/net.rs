@@ -1086,10 +1086,20 @@ fn net_accept(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         if ctx.array_length(arr) >= 1 {
             let peer_ip = peer.ip().to_string();
             let peer_port = peer.port() as i32;
-            // Pin the array across the re-entrant InetSocketAddress
-            // construction (which runs Java bytecode that may move the heap).
+            // Pin the array AND the freshly-allocated host string across the
+            // re-entrant InetSocketAddress construction (which runs real Java
+            // bytecode -- the constructor calls InetAddress.getByName(), which
+            // can allocate and trigger GC). host has no other root holding it
+            // between creation and being read out of the args slice by the
+            // constructor invocation, so without a pin a GC in that window can
+            // reclaim/move it out from under the call, leaving the interpreter
+            // reading a null/stale reference for the hostname argument (seen
+            // as obj_arg failing on args[1] inside the InetSocketAddress
+            // (Ljava/lang/String;I)V native with "null object argument").
             let arr_pin = ctx.pin_native_root(arr);
             let host = ctx.create_string(&peer_ip);
+            let host_pin = ctx.pin_native_root(host);
+            let host = ctx.read_native_pin(host_pin, host);
             let isa = ctx.new_object_initialized(
                 "java/net/InetSocketAddress",
                 "(Ljava/lang/String;I)V",
@@ -1100,6 +1110,7 @@ fn net_accept(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
                 ctx.set_array_element(arr, 0, Value::Object(Some(isa_obj)));
             }
             ctx.unpin_native_roots(arr_pin);
+            ctx.unpin_native_roots(host_pin);
         }
     }
 
