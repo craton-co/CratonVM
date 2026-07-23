@@ -4836,7 +4836,7 @@ fn register_s4_http_servlet_response(r: &mut NativeMethodRegistry) {
             Ok(Some(ctx.get_field(this, S4_RESP_STATUS)))
         });
         r.register(cls, "setContentType", "(Ljava/lang/String;)V", |ctx, args| {
-            let this = obj_arg(args, 0)?;
+            }
             ctx.set_field(this, S4_RESP_CTYPE, args.get(1).copied().unwrap_or(Value::Object(None)));
             Ok(None)
         });
@@ -4926,7 +4926,10 @@ fn register_s4_http_servlet_response(r: &mut NativeMethodRegistry) {
         });
         r.register(cls, "setContentLength", "(I)V", |_ctx, _args| Ok(None));
         r.register(cls, "setContentLengthLong", "(J)V", |_ctx, _args| Ok(None));
-        r.register(cls, "setCharacterEncoding", "(Ljava/lang/String;)V", |_ctx, _args| Ok(None));
+        r.register(cls, "setCharacterEncoding", "(Ljava/lang/String;)V", |ctx, args| {
+            }
+            Ok(None)
+        });
         r.register(cls, "getCharacterEncoding", "()Ljava/lang/String;", |ctx, _args| {
             let s = ctx.create_string("UTF-8");
             Ok(Some(Value::Object(Some(s))))

@@ -9,6 +9,7 @@
 use std::cell::Cell;
 
 use cratonvm_jit::{DescriptorParamIter, JitInvokeInfo, JitMICSlot, JitPICSlot, JitRuntimeHelpers};
+use cratonvm_native_api::NativeContext;
 use cratonvm_types::{
     ArrayElementType, ClassId, ObjectRef, Value, ARRAY_LENGTH_OFFSET, HEADER_SIZE,
     REF_ELEMENT_SIZE, SLOT_SIZE,
@@ -66,10 +67,12 @@ use crate::vm::SharedVm;
 #[inline]
 fn direct_static_compiled_callee_entry_enabled() -> bool {
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *CACHE.get_or_init(|| match std::env::var("CRATONVM_JIT_DISPATCH_CACHE_DIRECT_ENTRY") {
+    *CACHE.get_or_init(
+        || match std::env::var("CRATONVM_JIT_DISPATCH_CACHE_DIRECT_ENTRY") {
         Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
         Err(_) => true,
-    })
+        },
+    )
 }
 
 // The virtual-call counterpart of the flag above. Kept OFF by default,
@@ -6159,8 +6162,27 @@ static HASHMAP_GET_DIRECT_INFO: JitInvokeInfo = JitInvokeInfo {
     return_type: b'L',
     invoke_kind: 0,
 };
+static CONCURRENT_HASHMAP_GET_DIRECT_INFO: JitInvokeInfo = JitInvokeInfo {
+    class_name: "java/util/concurrent/ConcurrentMap",
+    method_name: "get",
+    descriptor: "(Ljava/lang/Object;)Ljava/lang/Object;",
+    num_jit_args: 2,
+    return_type: b'L',
+    invoke_kind: 2,
+};
+
+static STRING_LATIN1_LOWER_DIRECT_INFO: JitInvokeInfo = JitInvokeInfo {
+    class_name: "java/lang/StringLatin1",
+    method_name: "toLowerCase",
+    descriptor: "(Ljava/lang/String;[BLjava/util/Locale;)Ljava/lang/String;",
+    num_jit_args: 3,
+    return_type: b'L',
+    invoke_kind: 3,
+};
 
 thread_local! {
+    static CONCURRENT_HASHMAP_CLASS_CACHE: std::cell::Cell<Option<(usize, u32)>> =
+        const { std::cell::Cell::new(None) };
     /// `(vm_key, class_id)` of the EXACT `java/util/HashMap` class, learned
     /// on the first direct-call fallback resolution — same pattern as
     /// `MATCHER_CLASS_CACHE`/`INTEGER_WRAPPER_CLASS_CACHE`.
@@ -6194,6 +6216,68 @@ unsafe fn jit_hashmap_receiver_is_exact(vm: &SharedVm, receiver: i64) -> bool {
         return !crate::classloading::any_class_redefined();
     }
     false
+}
+
+unsafe fn jit_concurrent_hashmap_receiver_is_exact(vm: &SharedVm, receiver: i64) -> bool {
+    let cid = std::ptr::read(receiver as usize as *const u32);
+    let vm_key = vm as *const SharedVm as usize;
+    if CONCURRENT_HASHMAP_CLASS_CACHE.with(|c| c.get() == Some((vm_key, cid))) {
+        return !crate::classloading::any_class_redefined();
+    }
+    let exact = vm.class_manager.read().get_class(ClassId::new(cid))
+        .map(|class| class.name.as_ref() == "java/util/concurrent/ConcurrentHashMap")
+        .unwrap_or(false);
+    if exact {
+        CONCURRENT_HASHMAP_CLASS_CACHE.with(|c| c.set(Some((vm_key, cid))));
+    }
+    exact && !crate::classloading::any_class_redefined()
+}
+
+/// Guarded direct path for `ConcurrentMap.get(Object)` when the runtime
+/// receiver is exactly ConcurrentHashMap. All other receivers retain the
+/// canonical interface dispatcher.
+pub unsafe extern "C" fn jit_concurrent_hashmap_get_direct(
+    vm_ptr: i64, receiver: i64, key: i64,
+) -> i64 {
+    crate::jit::conservative_roots::note_jit_boundary();
+    jit_safepoint_flush_satb(vm_ptr);
+    let vm = &*(vm_ptr as *const SharedVm);
+    if receiver != 0 && (receiver as u64 & 0x7) == 0 && (receiver as u64) < (1u64 << 48)
+        && jit_concurrent_hashmap_receiver_is_exact(vm, receiver)
+    {
+        if let (Some(recv), Some((thread, _guard))) =
+            (vm.heap.is_object_address(receiver as usize), jit_thread_mut())
+        {
+            let key = if key == 0 { Value::Object(None) } else if let Some(key) = vm.heap.is_object_address(key as usize) {
+                Value::Object(Some(key))
+            } else {
+                return 0;
+            };
+            let values = [Value::Object(Some(recv)), key];
+            // `native_chm_get` pins its receiver/key before every operation
+            // that can invoke Java or collect. Calling it directly avoids the
+            // second, redundant safe-native wrapper/root snapshot on a hot
+            // read-only lookup while retaining its canonical error contract.
+            let result = {
+                let mut ctx = crate::vm::NativeContextImpl {
+                    shared: vm,
+                    thread: &mut *thread,
+                };
+                cratonvm_native_collections::native_chm_get(&mut ctx, &values)
+            };
+            match result {
+                Ok(Some(Value::Object(Some(object)))) => {
+                    thread.native_pending_return = Some(object);
+                    return object.as_ptr() as i64;
+                }
+                Ok(Some(Value::Object(None))) | Ok(None) => return 0,
+                Ok(_) => {},
+                Err(error) => return handle_jit_dispatch_error(vm, thread, error, &CONCURRENT_HASHMAP_GET_DIRECT_INFO),
+            }
+        }
+    }
+    let args = [receiver, key];
+    jit_invoke_dispatch(vm_ptr, &CONCURRENT_HASHMAP_GET_DIRECT_INFO as *const JitInvokeInfo as i64, args.as_ptr() as i64, 2)
 }
 
 /// Thin direct-call target for JIT `invokevirtual HashMap.get(Object)` sites
@@ -6243,6 +6327,25 @@ pub unsafe extern "C" fn jit_hashmap_get_direct(vm_ptr: i64, receiver: i64, key:
         let Some((thread, _guard)) = jit_thread_mut() else {
             break 'fast;
         };
+        // The native HashMap path maintains a GC-remapped, modCount-guarded
+        // String-node cache. Probe it directly here so hot dynamic lowercase
+        // keys avoid entering the GC-safe native wrapper at all.
+        if let Value::Object(Some(key_object)) = key_val {
+            let cached = {
+                let mut ctx = crate::vm::NativeContextImpl {
+                    shared: vm,
+                    thread: &mut *thread,
+                };
+                ctx.hashmap_string_node_cache_get_object(recv_obj, key_object)
+            };
+            if let Some(Value::Object(Some(object))) = cached {
+                thread.native_pending_return = Some(object);
+                return object.as_ptr() as i64;
+            }
+            if let Some(Value::Object(None)) = cached {
+                return 0;
+            }
+        }
         let probe = {
             let ctx = crate::vm::NativeContextImpl {
                 shared: vm,
@@ -6264,7 +6367,34 @@ pub unsafe extern "C" fn jit_hashmap_get_direct(vm_ptr: i64, receiver: i64, key:
             Some(Err(error)) => {
                 return handle_jit_dispatch_error(vm, thread, error, &HASHMAP_GET_DIRECT_INFO)
             }
-            None => break 'fast,
+            None => {
+                let values = [
+                    Value::Object(Some(recv_obj)),
+                    key_val,
+                ];
+                match crate::vm::safe_native_call_prevalidated_objects(
+                    vm,
+                    thread,
+                    cratonvm_native_collections::native_hashmap_get_exact,
+                    &values,
+                ) {
+                    Ok(Some(Value::Object(Some(object)))) => {
+                        let result = object.as_ptr() as i64;
+                        thread.native_pending_return = Some(object);
+                        return result;
+                    }
+                    Ok(Some(Value::Object(None))) | Ok(None) => return 0,
+                    Ok(_) => break 'fast,
+                    Err(error) => {
+                        return handle_jit_dispatch_error(
+                            vm,
+                            thread,
+                            error,
+                            &HASHMAP_GET_DIRECT_INFO,
+                        )
+                    }
+                }
+            }
         }
     }
     let args = [receiver, key];
@@ -6274,6 +6404,43 @@ pub unsafe extern "C" fn jit_hashmap_get_direct(vm_ptr: i64, receiver: i64, key:
         args.as_ptr() as i64,
         2,
     )
+}
+
+/// Direct compact-Latin1 lowercase helper. The registered Java helper is
+/// correct for interpreter execution, but its generic native-dispatch round
+/// trip dominates repeated charset lookups. This preserves the same cached
+/// immutable result and pending-return root contracts without that overhead.
+/// Direct receiver-typed `String.toLowerCase(Locale)` entry. The ASCII
+/// compact helper below owns the implementation; Locale is currently unused
+/// by the VM's existing ASCII fast path.
+pub unsafe extern "C" fn jit_string_locale_to_lower_direct(
+    vm_ptr: i64,
+    source: i64,
+    locale: i64,
+) -> i64 {
+    jit_string_latin1_to_lower_direct(vm_ptr, source, 0, locale)
+}
+
+pub unsafe extern "C" fn jit_string_latin1_to_lower_direct(
+    vm_ptr: i64,
+    source: i64,
+    _value: i64,
+    _locale: i64,
+) -> i64 {
+    crate::jit::conservative_roots::note_jit_boundary();
+    jit_safepoint_flush_satb(vm_ptr);
+    let vm = &*(vm_ptr as *const SharedVm);
+    if source == 0 { return 0; }
+    let Some(source) = vm.heap.is_object_address(source as usize) else { return 0; };
+    let Some((thread, _guard)) = jit_thread_mut() else { return 0; };
+    let mut ctx = crate::vm::NativeContextImpl { shared: vm, thread: &mut *thread };
+    let result = if let Some(cached) = ctx.get_ascii_case_string_cached(source, false) { cached } else {
+        let mut lower = ctx.read_string(source).unwrap_or_default();
+        let changed = if lower.is_ascii() { let changed = lower.bytes().any(|byte| byte.is_ascii_uppercase()); lower.make_ascii_lowercase(); changed } else { let folded = lower.to_lowercase(); if folded == lower { false } else { lower = folded; true } };
+        if changed { ctx.create_ascii_case_string_cached(source, &lower, false) } else { source }
+    };
+    thread.native_pending_return = Some(result);
+    result.as_ptr() as i64
 }
 
 /// PUT sibling of [`jit_hashmap_get_direct`] — see its doc for the contract.
@@ -9419,6 +9586,9 @@ pub fn build_helpers() -> JitRuntimeHelpers {
     );
     cratonvm_jit::set_hashmap_put_direct_fn(jit_hashmap_put_direct as *const () as usize);
     cratonvm_jit::set_hashmap_get_direct_fn(jit_hashmap_get_direct as *const () as usize);
+    cratonvm_jit::set_string_latin1_lower_direct_fn(jit_string_latin1_to_lower_direct as *const () as usize);
+    cratonvm_jit::set_string_locale_lower_direct_fn(jit_string_locale_to_lower_direct as *const () as usize);
+    cratonvm_jit::set_concurrent_hashmap_get_direct_fn(jit_concurrent_hashmap_get_direct as *const () as usize);
 
     JitRuntimeHelpers {
         newarray: jit_newarray as *const () as usize,

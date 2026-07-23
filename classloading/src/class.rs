@@ -1908,13 +1908,18 @@ mod tests {
         ));
 
         // The CP entry names Grandparent directly.
-        let start =
-            invokespecial_selection_start(child_id, grandparent_id, false, "m", &store);
-        assert_eq!(start, parent_id, "must redirect to the caller's direct superclass");
+        let start = invokespecial_selection_start(child_id, grandparent_id, false, "m", &store);
+        assert_eq!(
+            start, parent_id,
+            "must redirect to the caller's direct superclass"
+        );
 
         let (method, declaring) = find_method_recursive(start, "m", "()V", &store).unwrap();
         assert_eq!(&*method.name, "m");
-        assert_eq!(declaring, parent_id, "must land on Parent's override, not Grandparent's");
+        assert_eq!(
+            declaring, parent_id,
+            "must land on Parent's override, not Grandparent's"
+        );
     }
 
     /// No redirect for `<init>` — constructors are never subject to the

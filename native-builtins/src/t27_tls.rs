@@ -2340,10 +2340,18 @@ fn java_cipher_name_to_suite(name: &str) -> Option<rustls::CipherSuite> {
 fn cbc_augmented_default_provider() -> rustls::crypto::CryptoProvider {
     let mut provider = rustls::crypto::ring::default_provider();
     provider.cipher_suites.extend([
-        rustls::SupportedCipherSuite::from(&crate::t27_tls_cbc::TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256),
-        rustls::SupportedCipherSuite::from(&crate::t27_tls_cbc::TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256),
-        rustls::SupportedCipherSuite::from(&crate::t27_tls_cbc::TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA384),
-        rustls::SupportedCipherSuite::from(&crate::t27_tls_cbc::TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA384),
+        rustls::SupportedCipherSuite::from(
+            &crate::t27_tls_cbc::TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256,
+        ),
+        rustls::SupportedCipherSuite::from(
+            &crate::t27_tls_cbc::TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256,
+        ),
+        rustls::SupportedCipherSuite::from(
+            &crate::t27_tls_cbc::TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA384,
+        ),
+        rustls::SupportedCipherSuite::from(
+            &crate::t27_tls_cbc::TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA384,
+        ),
     ]);
     provider
 }
@@ -2673,7 +2681,10 @@ pub(crate) fn rustls_server_accept(listener_id: i32) -> Result<i32, String> {
     };
     let _ = tcp.set_nonblocking(false);
     if debug_hs {
-        eprintln!("[dbg-tls-hs] server_accept listener_id={} accepted TCP", listener_id);
+        eprintln!(
+            "[dbg-tls-hs] server_accept listener_id={} accepted TCP",
+            listener_id
+        );
     }
     let _ = tcp.set_read_timeout(Some(std::time::Duration::from_secs(30)));
     let _ = tcp.set_write_timeout(Some(std::time::Duration::from_secs(30)));
@@ -2687,7 +2698,10 @@ pub(crate) fn rustls_server_accept(listener_id: i32) -> Result<i32, String> {
                 while stream.conn.is_handshaking() {
                     if stream.conn.wants_read() {
                         if debug_hs {
-                            eprintln!("[dbg-tls-hs] server_accept listener_id={} waiting read", listener_id);
+                            eprintln!(
+                                "[dbg-tls-hs] server_accept listener_id={} waiting read",
+                                listener_id
+                            );
                         }
                         stream
                             .conn
@@ -2700,7 +2714,10 @@ pub(crate) fn rustls_server_accept(listener_id: i32) -> Result<i32, String> {
                     }
                     if stream.conn.wants_write() {
                         if debug_hs {
-                            eprintln!("[dbg-tls-hs] server_accept listener_id={} writing response", listener_id);
+                            eprintln!(
+                                "[dbg-tls-hs] server_accept listener_id={} writing response",
+                                listener_id
+                            );
                         }
                         stream
                             .conn
@@ -2709,7 +2726,10 @@ pub(crate) fn rustls_server_accept(listener_id: i32) -> Result<i32, String> {
                     }
                 }
                 if debug_hs {
-                    eprintln!("[dbg-tls-hs] server_accept listener_id={} handshake complete", listener_id);
+                    eprintln!(
+                        "[dbg-tls-hs] server_accept listener_id={} handshake complete",
+                        listener_id
+                    );
                 }
                 let sni = stream.conn.server_name().map(|s| s.to_string());
                 let protocol = match stream.conn.protocol_version() {
@@ -2791,8 +2811,8 @@ pub(crate) fn rustls_server_handshake_over_stream(
         eprintln!("[dbg-tls-srv] wrap_existing_socket: got raw stream");
     }
     let config = build_server_config_single_cert(cert_pem, key_pem, &[], false, None)?;
-    let conn = ServerConnection::new(config)
-        .map_err(|e| format!("layered server connection: {e}"))?;
+    let conn =
+        ServerConnection::new(config).map_err(|e| format!("layered server connection: {e}"))?;
     let mut stream = StreamOwned::new(conn, tcp);
     let mut iter_n = 0u32;
     while stream.conn.is_handshaking() {
@@ -2811,7 +2831,10 @@ pub(crate) fn rustls_server_handshake_over_stream(
                 .read_tls(&mut stream.sock)
                 .map_err(|e| format!("layered server handshake read: {e}"))?;
             if debug_srv {
-                eprintln!("[dbg-tls-srv] wrap_existing_socket: read_tls -> {} bytes", n);
+                eprintln!(
+                    "[dbg-tls-srv] wrap_existing_socket: read_tls -> {} bytes",
+                    n
+                );
             }
             stream
                 .conn
@@ -2824,7 +2847,10 @@ pub(crate) fn rustls_server_handshake_over_stream(
                 .write_tls(&mut stream.sock)
                 .map_err(|e| format!("layered server handshake write: {e}"))?;
             if debug_srv {
-                eprintln!("[dbg-tls-srv] wrap_existing_socket: write_tls -> {} bytes", n);
+                eprintln!(
+                    "[dbg-tls-srv] wrap_existing_socket: write_tls -> {} bytes",
+                    n
+                );
             }
         }
     }
@@ -2882,7 +2908,9 @@ pub(crate) fn rustls_server_handshake_over_stream(
     // RTT, and every handshake+request cycle observed in this investigation
     // (`CRATONVM_DBG_TLS_SRV`-traced) completed in well under 100ms even on
     // this heavily shared, contended build host.
-    let _ = stream.sock.set_read_timeout(Some(std::time::Duration::from_secs(3)));
+    let _ = stream
+        .sock
+        .set_read_timeout(Some(std::time::Duration::from_secs(3)));
     let sni_hostname = stream.conn.server_name().map(|s| s.to_string());
     let negotiated_protocol = match stream.conn.protocol_version() {
         Some(rustls::ProtocolVersion::TLSv1_3) => "TLSv1.3",
@@ -3263,7 +3291,10 @@ pub(crate) fn rustls_stream_read(id: i32, buf: &mut [u8]) -> std::io::Result<usi
             TlsServerStream::LegacyDsa(s) => s.read(buf),
         };
         if debug_srv {
-            eprintln!("[dbg-tls-srv] stream_read RETURN id={} result={:?}", id, result);
+            eprintln!(
+                "[dbg-tls-srv] stream_read RETURN id={} result={:?}",
+                id, result
+            );
         }
         return result;
     }
@@ -3295,7 +3326,10 @@ pub(crate) fn rustls_stream_write(id: i32, data: &[u8]) -> std::io::Result<usize
             TlsServerStream::LegacyDsa(s) => s.write(data),
         };
         if debug_srv {
-            eprintln!("[dbg-tls-srv] stream_write RETURN id={} result={:?}", id, result);
+            eprintln!(
+                "[dbg-tls-srv] stream_write RETURN id={} result={:?}",
+                id, result
+            );
         }
         return result;
     }
@@ -3417,14 +3451,21 @@ fn ssl_server_socket_states() -> &'static Mutex<HashMap<u64, SslServerSocketStat
     STATES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn ssl_server_socket_state(ctx: &dyn NativeContext, socket: ObjectRef) -> Option<SslServerSocketState> {
+fn ssl_server_socket_state(
+    ctx: &dyn NativeContext,
+    socket: ObjectRef,
+) -> Option<SslServerSocketState> {
     ssl_server_socket_states()
         .lock()
         .get(&gc_stable_objref_key(ctx, socket))
         .copied()
 }
 
-fn set_ssl_server_socket_state(ctx: &dyn NativeContext, socket: ObjectRef, state: SslServerSocketState) {
+fn set_ssl_server_socket_state(
+    ctx: &dyn NativeContext,
+    socket: ObjectRef,
+    state: SslServerSocketState,
+) {
     ssl_server_socket_states()
         .lock()
         .insert(gc_stable_objref_key(ctx, socket), state);

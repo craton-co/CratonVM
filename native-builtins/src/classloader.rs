@@ -1346,8 +1346,8 @@ pub(crate) fn find_loaded_class_for_loader(
     this: ObjectRef,
     internal_name: &str,
 ) -> Option<ObjectRef> {
-    let __obsreg_dbg =
-        std::env::var_os("CRATONVM_DBG_OBSREG").is_some() && internal_name.contains("ObservationRegistry");
+    let __obsreg_dbg = std::env::var_os("CRATONVM_DBG_OBSREG").is_some()
+        && internal_name.contains("ObservationRegistry");
     let __is_user_defined = is_user_defined_loader(ctx, this);
     if __obsreg_dbg {
         eprintln!(
@@ -1700,8 +1700,8 @@ fn cl_load_class_base_delegation(
 ) -> MethodCallResult {
     let dotted = ctx.read_string(name_obj).unwrap_or_default();
     let internal = dotted.replace('.', "/");
-    let __obsreg_dbg =
-        std::env::var_os("CRATONVM_DBG_OBSREG").is_some() && internal.contains("ObservationRegistry");
+    let __obsreg_dbg = std::env::var_os("CRATONVM_DBG_OBSREG").is_some()
+        && internal.contains("ObservationRegistry");
     if __obsreg_dbg {
         let parent = classloader_parent(ctx, this);
         let this_cls = ctx.class_name_of_id(ctx.class_id_of_object(this));
@@ -3084,7 +3084,9 @@ fn cl_define_class0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     };
 
     let loader_id = loader_id_for(ctx, loader);
-    define_class_via_full(ctx, &name, bytes, loader_id, opts, initialize, class_data, loader)
+    define_class_via_full(
+        ctx, &name, bytes, loader_id, opts, initialize, class_data, loader,
+    )
 }
 
 /// WP2.3-C — register the JDK-internal `defineClass0/1/2` natives on
@@ -5194,10 +5196,7 @@ pub(crate) fn is_platform_class_loader(ctx: &dyn NativeContext, loader: ObjectRe
             .is_some_and(|platform| platform.as_ptr() == loader.as_ptr())
 }
 
-pub fn url_classloader_isolated_from_app(
-    ctx: &dyn NativeContext,
-    loader: ObjectRef,
-) -> bool {
+pub fn url_classloader_isolated_from_app(ctx: &dyn NativeContext, loader: ObjectRef) -> bool {
     if !object_extends(ctx, loader, "java/net/URLClassLoader") {
         return false;
     }
@@ -5584,7 +5583,12 @@ fn url_classloader_define_locks() -> &'static Mutex<
     std::collections::HashMap<(u32, String), std::sync::Arc<(Mutex<bool>, std::sync::Condvar)>>,
 > {
     static INSTANCE: OnceLock<
-        Mutex<std::collections::HashMap<(u32, String), std::sync::Arc<(Mutex<bool>, std::sync::Condvar)>>>,
+        Mutex<
+            std::collections::HashMap<
+                (u32, String),
+                std::sync::Arc<(Mutex<bool>, std::sync::Condvar)>,
+            >,
+        >,
     > = OnceLock::new();
     INSTANCE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
 }
@@ -5625,15 +5629,11 @@ pub(crate) fn ucl_try_define_local_class(
             .unwrap_or_else(|e| e.into_inner());
         locks
             .entry(define_lock_key)
-            .or_insert_with(|| {
-                std::sync::Arc::new((Mutex::new(false), std::sync::Condvar::new()))
-            })
+            .or_insert_with(|| std::sync::Arc::new((Mutex::new(false), std::sync::Condvar::new())))
             .clone()
     };
     let (define_lock_mutex, define_lock_cvar) = &*define_lock;
-    let mut in_progress = define_lock_mutex
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let mut in_progress = define_lock_mutex.lock().unwrap_or_else(|e| e.into_inner());
     while *in_progress {
         let (guard, timeout) = define_lock_cvar
             .wait_timeout(in_progress, std::time::Duration::from_secs(30))
@@ -5700,8 +5700,15 @@ pub(crate) fn ucl_try_define_local_class(
         Some(b) => b,
         None if http_bases.is_empty() => {
             if url_classloader_isolated_from_app(ctx, loader) {
-                let exception = crate::jboss_module_loader::alloc_single_message_exception(ctx, "java/lang/ClassNotFoundException", 1, internal_name);
-                return Some(Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(exception)));
+                let exception = crate::jboss_module_loader::alloc_single_message_exception(
+                    ctx,
+                    "java/lang/ClassNotFoundException",
+                    1,
+                    internal_name,
+                );
+                return Some(Err(
+                    cratonvm_types::error::MethodCallFailed::ExceptionThrown(exception),
+                ));
             }
             return None;
         }
@@ -5719,7 +5726,9 @@ pub(crate) fn ucl_try_define_local_class(
     };
 
     if url_classloader_isolated_from_app(ctx, loader) {
-        if let Err(error) = crate::lang_system::preload_isolated_loader_supertypes(ctx, loader, &bytes) {
+        if let Err(error) =
+            crate::lang_system::preload_isolated_loader_supertypes(ctx, loader, &bytes)
+        {
             return Some(Err(error));
         }
     }

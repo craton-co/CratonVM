@@ -3315,9 +3315,7 @@ fn native_properties_put_all(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
             };
             let key_obj = ctx.read_native_pin(ko_pin, key_obj);
             let value = match (value, vh) {
-                (Value::Object(Some(o)), Some(h)) => {
-                    Value::Object(Some(ctx.read_native_pin(h, o)))
-                }
+                (Value::Object(Some(o)), Some(h)) => Value::Object(Some(ctx.read_native_pin(h, o))),
                 (v, _) => v,
             };
             put_non_string_into_chm(ctx, this, Value::Object(Some(key_obj)), value);

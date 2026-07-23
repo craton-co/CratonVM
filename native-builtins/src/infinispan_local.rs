@@ -975,7 +975,10 @@ fn native_dcm_get_cache_names(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
 /// `invoke_virtual` against the real fields, rather than re-entering this
 /// native (which would just recurse into itself since dispatch is keyed by
 /// method name, not by which code is calling it).
-fn native_real_dcm_get_cache_names(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodCallResult {
+fn native_real_dcm_get_cache_names(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+) -> MethodCallResult {
     let this_pin = ctx.pin_native_root(this);
     let result = (|| -> MethodCallResult {
         let this_cur = ctx.read_native_pin(this_pin, this);
@@ -986,12 +989,8 @@ fn native_real_dcm_get_cache_names(ctx: &mut dyn NativeContext, this: ObjectRef)
         let cm_pin = ctx.pin_native_root(configuration_manager);
 
         let cm_cur = ctx.read_native_pin(cm_pin, configuration_manager);
-        let defined = ctx.invoke_virtual(
-            cm_cur,
-            "getDefinedCaches",
-            "()Ljava/util/Collection;",
-            &[],
-        )?;
+        let defined =
+            ctx.invoke_virtual(cm_cur, "getDefinedCaches", "()Ljava/util/Collection;", &[])?;
         let defined_obj = match defined {
             Some(Value::Object(Some(o))) => o,
             _ => return Ok(Some(Value::Object(None))),
@@ -1027,7 +1026,8 @@ fn native_real_dcm_get_cache_names(ctx: &mut dyn NativeContext, this: ObjectRef)
         }
 
         let this_cur = ctx.read_native_pin(this_pin, this);
-        if let Value::Object(Some(gcr)) = ctx.get_field_by_name(this_cur, "globalComponentRegistry") {
+        if let Value::Object(Some(gcr)) = ctx.get_field_by_name(this_cur, "globalComponentRegistry")
+        {
             let gcr_pin = ctx.pin_native_root(gcr);
             if let Ok(icr_cid) =
                 ctx.ensure_class_initialized("org/infinispan/registry/InternalCacheRegistry")

@@ -1289,7 +1289,10 @@ mod tests {
                 let _ = zip::ZipArchive::new(f);
             }
         }
-        eprintln!("diag: second pass (warm cache) total={:?}", start2.elapsed());
+        eprintln!(
+            "diag: second pass (warm cache) total={:?}",
+            start2.elapsed()
+        );
     }
 
     #[test]

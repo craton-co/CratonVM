@@ -1891,3 +1891,103 @@ on Spring TestContext Framework classes have the same loader-blindness (this
 fix only touches the one call site that was actually proven to matter here).
 See `[[aot-double-refresh-springextension-loader-blind-fix]]` (memory) for
 the full diagnostic-by-diagnostic writeup.
+
+
+## 2026-07-23 AOT follow-up 5 -- double-context-refresh ROOT-CAUSED AND FIXED
+
+Same session as follow-up 4, continuing directly from its refuted
+hypotheses. Worktree `/data/wt-aot-junitstore-20260723` (branch
+`fix/aot-junitstore-20260723`). No subagents used, per this task's standing
+instruction.
+
+**Method**: since every externally-observable input to
+`DefaultCacheAwareContextLoaderDelegate`'s cache-hit decision was already
+proven stable (follow-up 4), the delegate itself was wrapped directly.
+Subclassed `DefaultTestContextBootstrapper`, overrode
+`getCacheAwareContextLoaderDelegate()` to return a logging wrapper around the
+real delegate, and registered it via `@BootstrapWith(LoggingBootstrapper.class)`
+on the `BeanOverrideProbe2` fixture (own new probe file, not the shared
+`spring-framework-recheck` checkout). **Every single `loadContext`/
+`isContextLoaded` call for the entire run returned the SAME correct
+`ApplicationContext`** -- yet `Probe.setBeanFactory` still fired twice with
+two different `BeanFactory` identities. This proves the second, wrong
+context is never routed through `CacheAwareContextLoaderDelegate` at all.
+
+Widening the probe's own stack-trace capture (6 to 60 frames) for the wrong
+`bean1()` call showed the full chain ending in:
+```
+DefaultCacheAwareContextLoaderDelegate.loadContext   <- the RAW class, not the wrapper
+DefaultTestContext.getApplicationContext
+SpringExtension.getApplicationContext
+ParameterResolutionUtils.resolveParameter
+```
+-- i.e. a genuinely SECOND, independent `TestContext`/`TestContextManager`
+that never went through the wrapped bootstrapper (confirmed:
+`getCacheAwareContextLoaderDelegate()` printed only 3 times all run, none
+near this second construction). `CRATONVM_DBG_DUPCLASS=1
+CRATONVM_DBG_DUPCLASS_BT=1` then showed a correlated rejection cluster for
+EXACTLY `SpringExtension`, `TestContextManager`, `BootstrapUtils`,
+`DefaultTestContextBootstrapper`/`AbstractTestContextBootstrapper`/
+`TestContextBootstrapper` -- all "a SEPARATE ClassId will be created under
+Application" -- with the `TestContextManager` rejection's backtrace bottoming
+out in `native-builtins/src/lib.rs`'s `spring_extension_get_application_context`
+/`native_spring_extension_resolve_parameter`, NOT real Spring bytecode.
+
+**Root cause**: `SpringExtension.resolveParameter` is intercepted by a
+single, globally-registered native override
+(`native_spring_extension_resolve_parameter`). Its helper,
+`spring_extension_get_application_context`, invoked the real
+`SpringExtension.getApplicationContext(ExtensionContext)` bytecode via
+`ctx.invoke_special("org/springframework/test/context/junit/jupiter/SpringExtension", ...)`
+-- a NAME-based lookup with no `referencing_class_id` (this native trampoline
+has no bytecode frame of its own to derive one from), so class resolution
+fell through to the ordinary loader-BLIND `load_class_concurrent` path, which
+(per its long-documented behavior) prefers the Application-loader copy
+whenever the delegation chain can also serve the name. Under
+`@CompileWithForkedClassLoader`, the fork has its OWN already-loaded copy of
+`SpringExtension` -- but this native ignored it and always resolved a fresh
+Application-loader copy. Since `SpringExtension.getTestContextManager` keys
+its JUnit `ExtensionContext.Store` lookup on `Namespace.create(SpringExtension.class)`
+(identity-based), the wrong copy's `Class` object is a different `Namespace`
+identity, so `store.computeIfAbsent(testClass, TestContextManager::new, ...)`
+misses and builds a SECOND, independent `TestContextManager` with its own
+un-customized `ApplicationContext` (`BeanOverrideContextCustomizer` never
+ran for it) -- exactly the context that ends up bound to the `@Test`
+method's `ApplicationContext`-typed parameter, since parameter resolution is
+precisely where this native runs.
+
+**Fix**: `spring_extension_get_application_context` now resolves the
+current test class (`extension_context.getRequiredTestClass()`), its
+`ClassId` (`lang_class::mirror_class_id`), and that class's defining loader
+(`ctx.loader_id_of_class`). If that loader is user-defined
+(`loader_id >= 3`) and it has already loaded its own copy of
+`SpringExtension` (`ctx.class_id_defined_by_loader_exact`), invokes
+`getApplicationContext` on THAT exact `ClassId` via `ctx.invoke_by_class_id`
+instead. Falls through unchanged to the original by-name `invoke_special`
+in every other case -- purely additive, zero behavior change for the vast
+majority of test classes that never use `@CompileWithForkedClassLoader`.
+
+**Verified**: the `BeanOverrideProbe2` fast repro now passes -- exactly ONE
+`Probe.setBeanFactory`/`afterSingletonsInstantiated` cycle fires (was two),
+the `@Test` method's `ApplicationContext` parameter resolves to the correct,
+customized context, `ctx.getBean("field")` and the injected `@TestBean`
+field both read `"fieldOverride"` (were `"prod"`/mismatched before this
+fix). `cargo test -p cratonvm-vm --lib --release`: **2229 passed / 11
+failed**, byte-identical to the documented pre-existing baseline (the
+`lock_order`/`skip_list`/`tomcat_scanner`/`elasticsearch_vector` family) --
+zero regressions.
+
+**Still open / not done this session**: re-running the FULL
+`AotIntegrationTests#endToEndTestsForBeanOverrides` 175-test suite (only the
+fast single-fixture repro was verified, not the full suite -- the mechanism
+is proven fixed but the aggregate pass count wasn't re-measured, needs a
+300-400s+ run); `ApplicationContextAotGeneratorTests`'s remaining 5
+CGLIB/duplicate-`ClassId` failures (confirmed unrelated to this fix, same
+"2026-07-21 late session" family, a different native/bytecode call site);
+`TestContextAotGeneratorIntegrationTests`'s `GroovySystem` clinit hang
+(unrelated, not root-caused); and a worthwhile follow-up audit of whether
+OTHER native trampolines that call `ctx.invoke_special`/`ctx.invoke` by name
+on Spring TestContext Framework classes have the same loader-blindness (this
+fix only touches the one call site that was actually proven to matter here).
+See `[[aot-double-refresh-springextension-loader-blind-fix]]` (memory) for
+the full diagnostic-by-diagnostic writeup.

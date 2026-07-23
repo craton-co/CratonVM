@@ -4236,11 +4236,7 @@ fn map_hash_key(ctx: &mut dyn NativeContext, key: ObjectRef) -> Result<i32, Meth
     // Strings: hash by UTF-16 code units. Wrappers are checked first because
     // the two class sets are disjoint and wrapper-heavy maps otherwise take a
     // class-manager lock just to reject String before every unbox.
-    if let Some(s) = ctx.read_string(key) {
-        let mut h: i32 = 0;
-        for cu in s.encode_utf16() {
-            h = h.wrapping_mul(31).wrapping_add(cu as i32);
-        }
+    if let Some(h) = ctx.java_string_hash_code(key) {
         return Ok(h ^ ((h as u32) >> 16) as i32);
     }
     // Enum constants: hash by (declaring class name, constant name) — the
@@ -4364,8 +4360,8 @@ fn map_keys_equal(
     }
     // String value equality. Wrappers are checked first because the type sets
     // are disjoint and primitive-wrapper maps avoid two failed String checks.
-    if let (Some(sa), Some(sb)) = (ctx.read_string(a), ctx.read_string(b)) {
-        return Ok(sa == sb);
+    if let Some(equal) = ctx.java_strings_equal(a, b) {
+        return Ok(equal);
     }
     // `java.lang.Thread` mirrors are VM-owned identity objects. A moving GC
     // preserves the header identity hash, but some real-JDK weak-key paths can
@@ -5643,6 +5639,15 @@ fn ensure_hashtable_load_factor(ctx: &mut dyn NativeContext, this: ObjectRef, cn
     }
 }
 
+/// Keep the real JDK HashMap fail-fast version in sync with native structural
+/// edits. Besides iterator semantics, this is the invalidation generation for
+/// the bounded String-node lookup cache below.
+fn bump_map_mod_count(ctx: &dyn NativeContext, this: ObjectRef) {
+    if let Value::Int(current) = ctx.get_field_by_name(this, "modCount") {
+        ctx.set_field_by_name(this, "modCount", Value::Int(current.wrapping_add(1)));
+    }
+}
+
 fn native_map_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     native_map_put_evict(ctx, args, true)
 }
@@ -6066,6 +6071,7 @@ fn native_map_put_evict_pinned(
     // immediately before this last use.
     let this = ctx.read_native_pin(this_pin, this);
     set_map_size(ctx, this, size + 1);
+    bump_map_mod_count(ctx, this);
     ctx.unpin_native_roots(this_pin);
 
     Ok(Some(Value::Object(None))) // no old value
@@ -6088,6 +6094,48 @@ fn native_map_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     native_hashmap_get_exact(ctx, args)
 }
 
+/// Fast, allocation-free-from-the-Java-heap String-key lookup for real and
+/// synthetic HashMaps. `map_hash_key` and `map_keys_equal` already recognize
+/// Strings, but route through `read_string` twice and pin every bucket node in
+/// case user code runs. String hash/equality are final, pure operations, so
+/// handling them here avoids that native-call machinery while preserving the
+/// exact Java `HashMap` hash spreading and content-equality contracts.
+fn native_hashmap_get_string_fast(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    key: ObjectRef,
+) -> Option<MethodCallResult> {
+    if let Some(value) = ctx.hashmap_string_node_cache_get_object(this, key) {
+        return Some(Ok(Some(value)));
+    }
+    let key_text = ctx.read_string(key)?;
+    if let Some(value) = ctx.hashmap_string_node_cache_get(this, &key_text) {
+        return Some(Ok(Some(value)));
+    }
+    let mut raw_hash: i32 = 0;
+    for unit in key_text.encode_utf16() {
+        raw_hash = raw_hash.wrapping_mul(31).wrapping_add(unit as i32);
+    }
+    let hash = raw_hash ^ ((raw_hash as u32) >> 16) as i32;
+    let (buckets, _, cap) = map_state(ctx, this);
+    let buckets = buckets?;
+    let mut node_value = ctx.get_array_element(buckets, map_bucket_index(hash, cap));
+    const CHAIN_WALK_LIMIT: usize = 4096;
+    for _ in 0..CHAIN_WALK_LIMIT {
+        let Value::Object(Some(node)) = node_value else { return Some(Ok(Some(Value::Object(None)))); };
+        if let Value::Object(Some(node_key)) = get_node_key(ctx, node) {
+            if ctx.read_string(node_key).as_deref() == Some(key_text.as_str()) {
+                ctx.hashmap_string_node_cache_put(this, &key_text, node);
+                return Some(Ok(Some(get_node_value(ctx, node))));
+            }
+        }
+        node_value = ctx.get_field(node, NODE_FIELD_NEXT);
+    }
+    Some(Err(cratonvm_types::error::RuntimeError::IllegalStateException {
+        message: "hashmap chain exceeded safety cap; possible corruption".to_string(),
+    }.into()))
+}
+
 /// Exact-class HashMap get entry used after a receiver-ClassId guard.
 pub fn native_hashmap_get_exact(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
@@ -6095,6 +6143,11 @@ pub fn native_hashmap_get_exact(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         _ => return Ok(Some(Value::Object(None))),
     };
     let key_val = args.get(1).copied().unwrap_or(Value::Object(None));
+    if let Value::Object(Some(key)) = key_val {
+        if let Some(result) = native_hashmap_get_string_fast(ctx, this, key) {
+            return result;
+        }
+    }
     if let Some(result) = try_hm_int_fast_get(ctx, this, key_val) {
         return result;
     }
@@ -6392,6 +6445,7 @@ fn native_map_remove_pinned(
             let next = ctx.get_field(head, NODE_FIELD_NEXT);
             ctx.set_array_element(buckets, idx, next);
             set_map_size(ctx, this, size - 1);
+            bump_map_mod_count(ctx, this);
             let old_value = get_node_value(ctx, head);
             return Ok(Some(old_value));
         }
@@ -6441,6 +6495,7 @@ fn native_map_remove_pinned(
                 let next = ctx.get_field(curr, NODE_FIELD_NEXT);
                 ctx.set_field(prev, NODE_FIELD_NEXT, next);
                 set_map_size(ctx, this, size - 1);
+                bump_map_mod_count(ctx, this);
                 let old_value = get_node_value(ctx, curr);
                 return Ok(Some(old_value));
             }
@@ -6684,13 +6739,16 @@ fn native_map_clear(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     {
         return Ok(None);
     }
-    let (buckets, _, cap) = map_state(ctx, this);
+    let (buckets, size, cap) = map_state(ctx, this);
     if let Some(b) = buckets {
         for i in 0..(cap as usize) {
             ctx.set_array_element(b, i, Value::Object(None));
         }
     }
     set_map_size(ctx, this, 0);
+    if size != 0 {
+        bump_map_mod_count(ctx, this);
+    }
     Ok(None)
 }
 
@@ -35820,7 +35878,7 @@ fn chm_seg_get(
     Ok(None)
 }
 
-fn native_chm_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub fn native_chm_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),

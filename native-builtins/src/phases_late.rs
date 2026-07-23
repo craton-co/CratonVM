@@ -11898,12 +11898,11 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                 _ => 2,
             };
             let path = file_read_path(ctx, file_ref);
-            let value = file_disk_space_bytes(&path).map_or(0, |(total, free, usable)| {
-                match space_type {
+            let value =
+                file_disk_space_bytes(&path).map_or(0, |(total, free, usable)| match space_type {
                     0 => total,
                     1 => free,
                     _ => usable,
-                }
             });
             Ok(Some(Value::Long(value as i64)))
         });
@@ -27172,7 +27171,9 @@ fn populate_stack_frame(
     // empty). Resolving from the guaranteed-valid ClassId at population time
     // sidesteps that failure mode entirely; `class_id_by_name` remains a
     // fallback for synthetic/no-frame entries (`entry.class_id.is_none()`).
-    let decl_cid = entry.class_id.or_else(|| ctx.class_id_by_name(&entry.class_name));
+    let decl_cid = entry
+        .class_id
+        .or_else(|| ctx.class_id_by_name(&entry.class_name));
 
     let mut sf = alloc_concurrent_synthetic(ctx, "java/lang/StackWalker$StackFrame", 7);
     let base = ctx.pin_native_root(sf);
@@ -38198,12 +38199,22 @@ pub(crate) fn register_p66_thread_builder(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Int(0)))
         }
     });
-    // Thread.threadId() — Java 19. Some single-threaded launcher paths do not
-    // have a positive VM thread id yet; expose the same main-thread id that the
-    // ThreadMXBean stubs publish from getAllThreadIds().
-    r.register(t, "threadId", "()J", |ctx, _args| {
-        let tid = ctx.thread_id().max(1);
-        Ok(Some(Value::Long(tid as i64)))
+    // Thread.threadId() — Java 19. Use the receiver's Java tid for cross-thread
+    // queries; the VM context is only a fallback during early bootstrap.
+    r.register(t, "threadId", "()J", |ctx, args| {
+        let receiver_tid = args
+            .first()
+            .and_then(|value| match value {
+                Value::Object(Some(thread)) => match ctx.get_field_by_name(*thread, "tid") {
+                    Value::Long(tid) if tid > 0 => Some(tid),
+                    Value::Int(tid) if tid > 0 => Some(tid as i64),
+                    _ => None,
+                },
+                _ => None,
+            });
+        Ok(Some(Value::Long(
+            receiver_tid.unwrap_or_else(|| ctx.thread_id().max(1) as i64),
+        )))
     });
     r.set_category(__prev_cat);
 }
@@ -44447,7 +44458,9 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(socket))) => *socket,
                 _ => {
                     return Err(RuntimeError::NullPointerException {
-                        message: Some("SSLSocketFactory.createSocket: wrapped Socket is null".into()),
+                        message: Some(
+                            "SSLSocketFactory.createSocket: wrapped Socket is null".into(),
+                        ),
                     }
                     .into())
                 }
@@ -44674,11 +44687,15 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
     r.register(ssl_sock, "getUseClientMode", "()Z", |_ctx, _args| {
         Ok(Some(Value::Int(0)))
     });
-    r.register(ssl_sock, "setNeedClientAuth", "(Z)V", |_ctx, _args| Ok(None));
+    r.register(ssl_sock, "setNeedClientAuth", "(Z)V", |_ctx, _args| {
+        Ok(None)
+    });
     r.register(ssl_sock, "getNeedClientAuth", "()Z", |_ctx, _args| {
         Ok(Some(Value::Int(0)))
     });
-    r.register(ssl_sock, "setWantClientAuth", "(Z)V", |_ctx, _args| Ok(None));
+    r.register(ssl_sock, "setWantClientAuth", "(Z)V", |_ctx, _args| {
+        Ok(None)
+    });
     r.register(ssl_sock, "getWantClientAuth", "()Z", |_ctx, _args| {
         Ok(Some(Value::Int(0)))
     });
@@ -44782,10 +44799,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             let params = match ctx.new_object_initialized(
                 "javax/net/ssl/SSLParameters",
                 "([Ljava/lang/String;[Ljava/lang/String;)V",
-                &[
-                    Value::Object(Some(ciphers)),
-                    Value::Object(Some(protocols)),
-                ],
+                &[Value::Object(Some(ciphers)), Value::Object(Some(protocols))],
             )? {
                 Some(Value::Object(Some(o))) => o,
                 _ => alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLParameters", 4),
@@ -44815,18 +44829,21 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             // setters, so `setEnabledCipherSuites` alone never saw
             // `connectWithSslBundleAndOptionsMismatch`'s deliberately
             // mismatched cipher suite).
-            if let (Ok(this), Some(Value::Object(Some(params)))) = (obj_arg(args, 0), args.get(1).copied().and_then(|v| match v { Value::Object(Some(_)) => Some(v), _ => None })) {
+            if let (Ok(this), Some(Value::Object(Some(params)))) = (
+                obj_arg(args, 0),
+                args.get(1).copied().and_then(|v| match v {
+                    Value::Object(Some(_)) => Some(v),
+                    _ => None,
+                }),
+            ) {
                 let tls_id = new13_resolve_tls_id(ctx, this);
                 if tls_id >= crate::servlet::PENDING_LAYERED_SOCK_ID_BASE
                     && tls_id < crate::servlet::RUSTLS_SOCK_ID_BASE
                 {
                     let mut ciphers = Vec::new();
-                    if let Ok(Some(Value::Object(Some(arr)))) = ctx.invoke_virtual(
-                        params,
-                        "getCipherSuites",
-                        "()[Ljava/lang/String;",
-                        &[],
-                    ) {
+                    if let Ok(Some(Value::Object(Some(arr)))) =
+                        ctx.invoke_virtual(params, "getCipherSuites", "()[Ljava/lang/String;", &[])
+                    {
                         let len = ctx.array_length(arr);
                         for i in 0..len {
                             if let Value::Object(Some(s)) = ctx.get_array_element(arr, i) {
@@ -45182,7 +45199,8 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         "getLocalAddress",
         "()Ljava/net/InetAddress;",
         |ctx, _args| {
-            let address = crate::net_phase_e::alloc_inet_address_external(ctx, "127.0.0.1", "127.0.0.1");
+            let address =
+                crate::net_phase_e::alloc_inet_address_external(ctx, "127.0.0.1", "127.0.0.1");
             Ok(Some(Value::Object(Some(address))))
         },
     );
@@ -46822,6 +46840,46 @@ pub(crate) fn register_p68_security_cert(r: &mut NativeMethodRegistry) {
             let obj = alloc_concurrent_synthetic(ctx, "java/security/cert/CertificateFactory", 1);
             ctx.set_field(obj, 0, Value::Object(None));
             Ok(Some(Value::Object(Some(obj))))
+        },
+    );
+    r.register(
+        cf,
+        "getInstance",
+        "(Ljava/lang/String;Ljava/lang/String;)Ljava/security/cert/CertificateFactory;",
+        |ctx, args| {
+            let provider_name = match args.get(1) {
+                Some(Value::Object(Some(name))) => ctx.read_string(*name).unwrap_or_default(),
+                _ => String::new(),
+            };
+            // Do not silently substitute the default provider. The two-arg JCA
+            // overload is a provider-selection API and must fail before any
+            // certificate parsing when the requested provider is absent.
+            let provider = ctx.invoke(
+                "java/security/Security",
+                "getProvider",
+                "(Ljava/lang/String;)Ljava/security/Provider;",
+                &args[1..2],
+            );
+            if matches!(provider, Ok(Some(Value::Object(Some(_))))) {
+                return ctx.invoke(
+                    "java/security/cert/CertificateFactory",
+                    "getInstance",
+                    "(Ljava/lang/String;)Ljava/security/cert/CertificateFactory;",
+                    &args[..1],
+                );
+            }
+            let detail = ctx.create_string(&format!("no such provider: {provider_name}"));
+            if let Ok(Some(Value::Object(Some(exc)))) = ctx.new_object_initialized(
+                "java/security/NoSuchProviderException",
+                "(Ljava/lang/String;)V",
+                &[Value::Object(Some(detail))],
+            ) {
+                return Err(MethodCallFailed::ExceptionThrown(exc));
+            }
+            Err(RuntimeError::SecurityException {
+                message: format!("no such provider: {provider_name}"),
+            }
+            .into())
         },
     );
     r.register(
@@ -67168,6 +67226,12 @@ pub(crate) fn register_phase72_natives(registry: &mut NativeMethodRegistry) {
     registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     register_p72_preferences(registry);
     register_p72_beans(registry);
+    // The real JDK InitialContext must execute its provider-selection bytecode
+    // (notably NamingManager's LDAP factory resolution).  These compact
+    // in-memory stubs are only valid for the synthetic JDK layout; registering
+    // them in a real-JDK build silently bypasses LDAP and yields
+    // NoInitialContextException for every JNDIRealm authentication.
+    #[cfg(feature = "synthetic-jdk")]
     register_p72_naming(registry);
     register_p72_datagram(registry);
     register_datagram_channel(registry);
@@ -68190,6 +68254,27 @@ pub(crate) fn register_p72_beans(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(arr))))
         },
     );
+    // The synthetic BeanInfo objects above are intentionally stamped with the
+    // BeanInfo interface so these native entries are their complete public
+    // contract.  Leaving the remaining abstract interface members unresolved
+    // makes perfectly ordinary callers (including Introspector's superclass
+    // merge) dispatch to the abstract declaration and fail with
+    // AbstractMethodError.
+    r.register(bi, "getDefaultPropertyIndex", "()I", |_ctx, _args| {
+        Ok(Some(Value::Int(-1)))
+    });
+    r.register(bi, "getDefaultEventIndex", "()I", |_ctx, _args| {
+        Ok(Some(Value::Int(-1)))
+    });
+    r.register(
+        bi,
+        "getAdditionalBeanInfo",
+        "()[Ljava/beans/BeanInfo;",
+        |_ctx, _args| Ok(Some(Value::Object(None))),
+    );
+    r.register(bi, "getIcon", "(I)Ljava/awt/Image;", |_ctx, _args| {
+        Ok(Some(Value::Object(None)))
+    });
 
     // FeatureDescriptor.getName(): JDK declares `private String name` on
     // FeatureDescriptor. Resolving it via `get_field_by_name("name")` is robust
@@ -68968,10 +69053,14 @@ fn build_property_descriptor(
             (Some(h), Some(o)) => Some(ctx.read_native_pin(h, o)),
             _ => write,
         };
-        // Ignore the IntrospectionException: setWriteMethod stores the ref first.
+        // This is the package-private helper used by the JDK Introspector.
+        // The public setter validates read/write type equality *before*
+        // retaining the Method, while Introspector deliberately preserves its
+        // selected covariant setter.  Calling the helper keeps that same
+        // descriptor contract for overloaded JavaBeans properties.
         let _ = ctx.invoke(
             "java/beans/PropertyDescriptor",
-            "setWriteMethod",
+            "setWriteMethod0",
             "(Ljava/lang/reflect/Method;)V",
             &[Value::Object(Some(pd)), Value::Object(write)],
         );

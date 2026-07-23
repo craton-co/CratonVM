@@ -565,7 +565,9 @@ fn jla_define_class(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     }
 
     let loader_id = crate::classloader::loader_id_for(ctx, loader);
-    crate::classloader::define_class_via_full(ctx, &name, bytes, loader_id, opts, false, None, loader)
+    crate::classloader::define_class_via_full(
+        ctx, &name, bytes, loader_id, opts, false, None, loader,
+    )
 }
 
 fn jla_define_class_hidden(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -655,7 +657,14 @@ fn jla_define_class_hidden(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         loader
     };
     crate::classloader::define_class_via_full(
-        ctx, &name, bytes, loader_id, opts, initialize, class_data, loader_for_registration,
+        ctx,
+        &name,
+        bytes,
+        loader_id,
+        opts,
+        initialize,
+        class_data,
+        loader_for_registration,
     )
 }
 

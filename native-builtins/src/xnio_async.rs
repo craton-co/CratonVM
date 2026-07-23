@@ -2475,7 +2475,9 @@ mod tests {
             },
             OptionValue::Int(7),
         );
-        let h = register_map(Arc::new(OptionMapInner { entries: Mutex::new(entries) }));
+        let h = register_map(Arc::new(OptionMapInner {
+            entries: Mutex::new(entries),
+        }));
         write_handle_slot_if_present(&ctx, m, OM_ENTRIES_HANDLE, h);
         remember_map_handle(&ctx, m, h);
 
@@ -3072,7 +3074,12 @@ mod tests {
             },
             OptionValue::Obj(Some(boxed_true)),
         );
-        let map = alloc_option_map(&mut ctx, Arc::new(OptionMapInner { entries: Mutex::new(entries) }));
+        let map = alloc_option_map(
+            &mut ctx,
+            Arc::new(OptionMapInner {
+                entries: Mutex::new(entries),
+            }),
+        );
 
         let got = native_option_map_get_bool(
             &mut ctx,

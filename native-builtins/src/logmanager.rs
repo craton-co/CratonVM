@@ -2331,6 +2331,74 @@ fn publish_jul_handlers(
     publish_jul_handlers_src(ctx, logger, level, message, None, None)
 }
 
+/// Deliver a JUL record to the logger-local Filter before the compact logging
+/// bridge emits it. `Logger.setFilter` cannot use the real JDK field layout:
+/// compact and real loggers have different shapes, so the filter itself lives
+/// in a rooted side table maintained by `lib.rs`.
+fn notify_jul_logger_filter(
+    ctx: &mut dyn NativeContext,
+    logger: Option<ObjectRef>,
+    level: Option<ObjectRef>,
+    message: Option<ObjectRef>,
+    thrown: Option<ObjectRef>,
+) {
+    let (Some(logger), Some(level), Some(message)) = (logger, level, message) else {
+        return;
+    };
+    let Some(filter) = crate::jul_logger_filter_get(ctx, logger) else {
+        return;
+    };
+    let level_pin = ctx.pin_native_root(level);
+    let message_pin = ctx.pin_native_root(message);
+    let filter_pin = ctx.pin_native_root(filter);
+    let thrown_pin = thrown.map(|o| (ctx.pin_native_root(o), o));
+    // The compact JUL bridge only needs the observable LogRecord fields.
+    // Its real-JDK constructor may walk unmaterialized time/sequence state
+    // before a filter gets to inspect the record, so use the same compact
+    // allocation strategy as the established handler bridge below.
+    let record = match ctx.new_object("java/util/logging/LogRecord") {
+        Ok(Some(Value::Object(Some(record)))) => record,
+        _ => {
+            ctx.unpin_native_roots(level_pin);
+            return;
+        }
+    };
+    let record_pin = ctx.pin_native_root(record);
+    let record = ctx.read_native_pin(record_pin, record);
+    let level = ctx.read_native_pin(level_pin, level);
+    let message = ctx.read_native_pin(message_pin, message);
+    ctx.set_field_by_name(record, "level", Value::Object(Some(level)));
+    ctx.set_field_by_name(record, "message", Value::Object(Some(message)));
+    let _ = ctx.invoke_virtual(
+        record,
+        "setLevel",
+        "(Ljava/util/logging/Level;)V",
+        &[Value::Object(Some(level))],
+    );
+    let record = ctx.read_native_pin(record_pin, record);
+    if let Some((pin, obj)) = thrown_pin {
+        let thrown = ctx.read_native_pin(pin, obj);
+        ctx.set_field_by_name(record, "thrown", Value::Object(Some(thrown)));
+        let _ = ctx.invoke_virtual(
+            record,
+            "setThrown",
+            "(Ljava/lang/Throwable;)V",
+            &[Value::Object(Some(thrown))],
+        );
+    }
+    let filter = ctx.read_native_pin(filter_pin, filter);
+    let record = ctx.read_native_pin(record_pin, record);
+    let filter = ctx.read_native_pin(filter_pin, filter);
+    let record = ctx.read_native_pin(record_pin, record);
+    let _ = ctx.invoke_virtual(
+        filter,
+        "isLoggable",
+        "(Ljava/util/logging/LogRecord;)Z",
+        &[Value::Object(Some(record))],
+    );
+    ctx.unpin_native_roots(level_pin);
+}
+
 /// `publish_jul_handlers` with the caller-provided source class/method pair
 /// (`Logger.logp` args) stamped into each record so JULI's OneLineFormatter
 /// prints the real source instead of "null.null".
@@ -2578,6 +2646,7 @@ fn native_jul_logger_logp(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     let message = message_obj
         .and_then(|o| ctx.read_string(o))
         .unwrap_or_default();
+    notify_jul_logger_filter(ctx, this, level_obj, message_obj, throwable_obj);
     publish_jul_handlers_src(ctx, this, level_obj, message_obj, src_cls_obj, src_mth_obj);
     let this = this_pin.map(|(pin, o)| ctx.read_native_pin(pin, o));
     let level_obj = level_pin.map(|(pin, o)| ctx.read_native_pin(pin, o));
@@ -2904,7 +2973,7 @@ fn jul_level_tag(ctx: &mut dyn NativeContext, level_obj: Option<ObjectRef>) -> S
 /// JUnit's `ListenerRegistry.notifyEach` logs swallowed listener exceptions
 /// exactly this way, so any such error was invisible. Identify the throwable
 /// by `instanceof Throwable` and render it with a short stack trace.
-fn native_jul_logger_log_throwable(
+pub(crate) fn native_jul_logger_log_throwable(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
@@ -2916,8 +2985,14 @@ fn native_jul_logger_log_throwable(
         Some(Value::Object(o)) => *o,
         _ => None,
     };
+    // `jul_resolve_msg` may invoke Java supplier code and allocate. Keep the
+    // receiver/level rooted while identifying the throwable so the later
+    // Filter record never receives an old moving-GC address.
+    let this_pin = this.map(|o| (ctx.pin_native_root(o), o));
+    let level_pin = level_obj.map(|o| (ctx.pin_native_root(o), o));
     let throwable_cid = ctx.class_id_by_name("java/lang/Throwable");
     let (mut msg, mut thrown): (String, Option<ObjectRef>) = (String::new(), None);
+    let mut thrown_pin: Option<(usize, ObjectRef)> = None;
     for slot in [2usize, 3usize] {
         if let Some(Value::Object(Some(o))) = args.get(slot) {
             let o = *o;
@@ -2927,11 +3002,17 @@ fn native_jul_logger_log_throwable(
             });
             if is_throwable {
                 thrown = Some(o);
+                thrown_pin = Some((ctx.pin_native_root(o), o));
             } else if msg.is_empty() {
                 msg = jul_resolve_msg(ctx, o);
             }
         }
     }
+    let this = this_pin.map(|(pin, obj)| ctx.read_native_pin(pin, obj));
+    let level_obj = level_pin.map(|(pin, obj)| ctx.read_native_pin(pin, obj));
+    let thrown = thrown_pin
+        .map(|(pin, obj)| ctx.read_native_pin(pin, obj))
+        .or(thrown);
     let logger_name = this
         .and_then(|o| match ctx.get_field(o, LOGGER_FIELD_NAME) {
             Value::Object(Some(s)) => ctx.read_string(s),
@@ -2939,6 +3020,13 @@ fn native_jul_logger_log_throwable(
         })
         .unwrap_or_default();
     let tag = jul_level_tag(ctx, level_obj);
+    let filter_message = ctx.create_string(&msg);
+    let this = this_pin.map(|(pin, obj)| ctx.read_native_pin(pin, obj));
+    let level_obj = level_pin.map(|(pin, obj)| ctx.read_native_pin(pin, obj));
+    let thrown = thrown_pin
+        .map(|(pin, obj)| ctx.read_native_pin(pin, obj))
+        .or(thrown);
+    notify_jul_logger_filter(ctx, this, level_obj, Some(filter_message), thrown);
     match thrown {
         Some(t) => {
             let r = jul_render_throwable(ctx, t);

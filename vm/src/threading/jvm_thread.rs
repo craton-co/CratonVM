@@ -33,6 +33,27 @@ use cratonvm_types::ClassId;
 /// Pool type for SoA locals and stack vecs: (values, tags).
 pub type SoaPool = Vec<(Vec<u64>, Vec<u8>)>;
 
+/// A two-entry per-thread cache for repeated ASCII case conversion.  Returning
+/// alternating immutable results avoids the observable same-object shortcut
+/// while eliminating allocation/collection in hot use-and-discard patterns.
+#[derive(Clone)]
+pub struct StringCaseCacheEntry {
+    pub source: ObjectRef,
+    pub upper: bool,
+    pub first: ObjectRef,
+    pub second: ObjectRef,
+    pub next: bool,
+}
+
+#[derive(Clone)]
+pub struct JitHashMapStringNodeCacheEntry {
+    pub map: ObjectRef,
+    pub node: ObjectRef,
+    pub key: String,
+    pub mod_count_slot: usize,
+    pub mod_count: i32,
+}
+
 // Pool size limits — prevent unbounded growth
 const MAX_POOL_SIZE: usize = 64;
 
@@ -399,6 +420,11 @@ pub struct JvmThread {
     /// catch handler. Covers the cross-thread GC window after the call returns.
     pub native_pending_return: Option<ObjectRef>,
 
+    /// Bounded JIT cache for immutable String keys in exact HashMaps. Entries
+    /// are normal thread roots and are cleared lazily on a structural change.
+    pub jit_hashmap_string_node_cache: Vec<JitHashMapStringNodeCacheEntry>,
+    pub string_case_cache: Vec<StringCaseCacheEntry>,
+
     /// Thread-local invoke cache — maps (caller_class, cp_index) to resolved targets.
     /// No locking needed since each thread owns its cache.
     pub invoke_cache: InvokeCache,
@@ -587,6 +613,8 @@ impl JvmThread {
             native_alloc_pool: Vec::new(),
             native_alloc_pool_layout: None,
             native_pending_return: None,
+            jit_hashmap_string_node_cache: Vec::new(),
+            string_case_cache: Vec::new(),
             invoke_cache: InvokeCache::new(),
             native_shadow_cache: FxHashMap::default(),
             kind: ThreadKind::Platform,
