@@ -19282,6 +19282,32 @@ fn decode_arg_kind_aware(cv: CompactValue, is_long: bool, pd_byte: u8) -> Value 
     cv.decode_by_descriptor(pd_byte)
 }
 
+/// Refresh every `Value::Object` reference in `args` via `load_and_forward`.
+///
+/// Mirrors the barrier `execute_invoke_kind` (the slow dispatch path)
+/// already applies to its popped args, with the same rationale: args popped
+/// off the operand stack land in a plain buffer that is invisible to the
+/// collector's root scan. If a moving-GC evacuation runs in the gap between
+/// popping and copying into the callee's locals (e.g. a shared-pool refill
+/// or a monitor acquisition below, both of which can allocate), a stale
+/// from-space address would otherwise reach the callee — and if that
+/// address's old object has since been reclaimed and its memory reused by
+/// an unrelated object, dereferencing it silently returns the WRONG
+/// object's data instead of crashing. `execute_invoke_kind` already had
+/// this barrier; the cached/fast dispatch paths below (`execute_invoke*_cached`,
+/// `execute_invokevirtual_vtable_fast`) popped args the same way but never
+/// re-validated them before building the callee frame. Root-caused via
+/// `org.h2.test.unit.TestUpgrade`'s residual `NoSuchMethodError` — see
+/// `docs/known-issues/h2-suite-bugs/bug-h2-suite-residual-fail-triage.md`.
+#[inline]
+fn refresh_stale_object_args(shared: &SharedVm, args: &mut [Value]) {
+    for value in args.iter_mut() {
+        if let Value::Object(Some(obj)) = value {
+            *obj = shared.heap.load_and_forward(*obj);
+        }
+    }
+}
+
 /// Pop `invokevirtual` / `invokespecial` / `invokeinterface` arguments from
 /// the operand stack (slow-path order) and apply `coerce_invoke_arg_for_descriptor`
 /// so cached fast paths match `execute_invoke`.
@@ -19335,6 +19361,7 @@ fn pop_coerced_invoke_args_virtual(
         let v = decode_arg_kind_aware(cv, is_long, pd_byte);
         args.push(coerce_invoke_arg_for_descriptor(pd_byte, v));
     }
+    refresh_stale_object_args(shared, &mut args);
     Ok((args, method_descriptor))
 }
 
@@ -19369,6 +19396,7 @@ fn pop_coerced_invoke_args_static(
         let v = decode_arg_kind_aware(cv, is_long, pd_byte);
         args.push(coerce_invoke_arg_for_descriptor(pd_byte, v));
     }
+    refresh_stale_object_args(shared, &mut args);
     Ok((args, method_descriptor))
 }
 
@@ -19609,13 +19637,38 @@ fn resolved_private_invokevirtual_target(
     method_name: &str,
     method_descriptor: &str,
 ) -> Option<(ClassId, Arc<str>)> {
-    let target_class_id = lookup_loader_initiated(shared, current_class_id, method_class_name)
-        .or_else(|| {
+    // A private method is only ever invocable, per JVM access control, from
+    // within the exact class that declares it — so a private-via-invokevirtual
+    // call's CP-resolved owner name always names the CALLER's own class.
+    // Resolve directly against `current_class_id` in that case: it's precise
+    // by construction, with no name lookup involved and therefore no risk of
+    // a loader-blind name lookup returning a DIFFERENT loaded copy of a
+    // same-named class. Two classloaders each defining their own
+    // `org/h2/mvstore/RootReference` is exactly this shape: `lookup_loader_
+    // initiated` can miss (this call is the class resolving ITSELF by name,
+    // not a delegated import), and its `get_loaded_class_id` fallback is a
+    // single-slot "first loaded wins" map that silently returns the OTHER
+    // loader's copy — pinning a private call's dispatch to the wrong
+    // class's bytecode/constant pool while the receiver stays the caller's
+    // own (correct-loader) object. See
+    // docs/known-issues/h2-suite-bugs/bug-h2-suite-residual-fail-triage.md
+    // (TestUpgrade's `RootReference.tryUpdate`/`hasChangesSince` residual).
+    let self_match = {
+        let cm = shared.class_manager.read();
+        cm.get_class(current_class_id)
+            .map(|c| &*c.name == method_class_name)
+            .unwrap_or(false)
+    };
+    let target_class_id = if self_match {
+        Some(current_class_id)
+    } else {
+        lookup_loader_initiated(shared, current_class_id, method_class_name).or_else(|| {
             shared
                 .class_manager
                 .read()
                 .get_loaded_class_id(method_class_name)
-        })?;
+        })
+    }?;
 
     let cm = shared.class_manager.read();
     let store = &cm.class_store;
@@ -19752,6 +19805,89 @@ fn execute_invoke_kind(
         if let Value::Object(Some(obj)) = value {
             *obj = shared.heap.load_and_forward(*obj);
         }
+    }
+    if std::env::var("CRATONVM_DBG_LOADER_TRACE").is_ok()
+        && method_class_name.contains("RootReference")
+        && method_name.as_ref() == "tryUpdate"
+    {
+        let describe = |v: &Value| -> String {
+            match v {
+                Value::Object(Some(obj)) => {
+                    let cid = shared.heap.class_id_of(*obj);
+                    let cn = shared
+                        .class_manager
+                        .read()
+                        .get_class(cid)
+                        .map(|c| c.name.to_string())
+                        .unwrap_or_default();
+                    format!("addr={:?} cid={:?} loader_class={}", obj, cid, cn)
+                }
+                Value::Object(None) => "null".to_string(),
+                other => format!("{:?}", other),
+            }
+        };
+        eprintln!(
+            "[TRYUPDATE-TRACE/slow] caller_class_id={:?} cp_index={} receiver(args[0])={} updated(args[1])={}",
+            current_class_id,
+            cp_index,
+            describe(&args[0]),
+            args.get(1).map(describe).unwrap_or_default(),
+        );
+    }
+    if std::env::var("CRATONVM_DBG_LOADER_TRACE").is_ok() && &*method_name == "compareAndSetRoot" {
+        let describe = |v: &Value| -> String {
+            match v {
+                Value::Object(Some(obj)) => {
+                    let cid = shared.heap.class_id_of(*obj);
+                    let cn = shared
+                        .class_manager
+                        .read()
+                        .get_class(cid)
+                        .map(|c| c.name.to_string())
+                        .unwrap_or_default();
+                    format!("addr={:?} cid={:?} loader_class={}", obj, cid, cn)
+                }
+                Value::Object(None) => "null".to_string(),
+                other => format!("{:?}", other),
+            }
+        };
+        eprintln!(
+            "[CASROOT-TRACE/slow] caller_class_id={:?} cp_index={} receiver_map(args[0])={} expected(args[1])={} updated(args[2])={}",
+            current_class_id,
+            cp_index,
+            describe(&args[0]),
+            args.get(1).map(describe).unwrap_or_default(),
+            args.get(2).map(describe).unwrap_or_default(),
+        );
+    }
+    if std::env::var("CRATONVM_DBG_LOADER_TRACE").is_ok()
+        && method_class_name.contains("Page")
+        && method_name.as_ref() == "<init>"
+    {
+        let describe = |v: &Value| -> String {
+            match v {
+                Value::Object(Some(obj)) => {
+                    let cid = shared.heap.class_id_of(*obj);
+                    let cn = shared
+                        .class_manager
+                        .read()
+                        .get_class(cid)
+                        .map(|c| c.name.to_string())
+                        .unwrap_or_default();
+                    format!("addr={:?} cid={:?} loader_class={}", obj, cid, cn)
+                }
+                Value::Object(None) => "null".to_string(),
+                other => format!("{:?}", other),
+            }
+        };
+        eprintln!(
+            "[PAGEINIT-TRACE/slow] caller_class_id={:?} cp_index={} ctor_desc={} new_page(args[0])={} map_arg(args[1])={}",
+            current_class_id,
+            cp_index,
+            method_descriptor,
+            describe(&args[0]),
+            args.get(1).map(describe).unwrap_or_default(),
+        );
     }
     // Spring's loader-fork test infrastructure can expose two physical copies
     // of this private enum while representing one logical annotation operation.
@@ -21134,7 +21270,9 @@ fn execute_invoke_kind(
         None
     };
 
-    if std::env::var("CRATONVM_DBG_LOADER_TRACE").is_ok() && invoke_class.contains("RootReference") {
+    if std::env::var("CRATONVM_DBG_LOADER_TRACE").is_ok()
+        && (invoke_class.contains("RootReference") || &*method_name == "compareAndSetRoot")
+    {
         let cm = shared.class_manager.read();
         let invoke_class_resolved = cm.get_loaded_class_id(&invoke_class);
         let cur_loader = cm.get_loader_id(current_class_id);
@@ -30225,6 +30363,7 @@ const MAX_INTRINSIC_ARGS: usize = 8;
 /// parse, and no heap allocation. `with_receiver` is true for virtual
 /// intrinsics, where the receiver occupies args[0].
 fn pop_coerced_invoke_args_intrinsic<'b>(
+    shared: &SharedVm,
     thread: &mut JvmThread,
     frame_idx: usize,
     num_params: usize,
@@ -30263,6 +30402,7 @@ fn pop_coerced_invoke_args_intrinsic<'b>(
         buf[base + i] =
             coerce_invoke_arg_for_descriptor(pd_byte, decode_arg_kind_aware(cv, is_long, pd_byte));
     }
+    refresh_stale_object_args(shared, &mut buf[..total]);
     Ok(&buf[..total])
 }
 
@@ -30720,6 +30860,7 @@ fn execute_invokestatic_cached(
         } => {
             let mut arg_buf = [Value::Uninitialized; MAX_INTRINSIC_ARGS];
             let args = pop_coerced_invoke_args_intrinsic(
+                shared,
                 thread,
                 frame_idx,
                 // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
@@ -31021,6 +31162,7 @@ fn execute_invokestatic_cached(
                 }
                 &mut args_vec
             };
+            refresh_stale_object_args(shared, args_slice);
 
             if let Some(res) = intercept_force_registered_native_cached(
                 shared, thread, frame_idx, &cached, args_slice,
@@ -37521,6 +37663,33 @@ fn execute_invokevirtual_vtable_fast(
         }
         &mut args_vec
     };
+    refresh_stale_object_args(shared, args_slice);
+    if std::env::var("CRATONVM_DBG_LOADER_TRACE").is_ok() && &*method_name == "compareAndSetRoot" {
+        let describe = |v: &Value| -> String {
+            match v {
+                Value::Object(Some(obj)) => {
+                    let cid = shared.heap.class_id_of(*obj);
+                    let cn = shared
+                        .class_manager
+                        .read()
+                        .get_class(cid)
+                        .map(|c| c.name.to_string())
+                        .unwrap_or_default();
+                    format!("addr={:?} cid={:?} loader_class={}", obj, cid, cn)
+                }
+                Value::Object(None) => "null".to_string(),
+                other => format!("{:?}", other),
+            }
+        };
+        eprintln!(
+            "[CASROOT-TRACE/vtfast] caller_class_id={:?} cp_index={} receiver_map(args[0])={} expected(args[1])={} updated(args[2])={}",
+            caller_class_id,
+            cp_index,
+            describe(&args_slice[0]),
+            args_slice.get(1).map(describe).unwrap_or_default(),
+            args_slice.get(2).map(describe).unwrap_or_default(),
+        );
+    }
 
     if let Some(res) = intercept_classloader_set_default_assertion_status(
         shared,
@@ -37931,6 +38100,94 @@ fn execute_invokevirtual_cached(
                         }
                         &mut args_vec
                     };
+                    if std::env::var("CRATONVM_DBG_LOADER_TRACE").is_ok()
+                        && cached.class_name.contains("RootReference")
+                        && cached.method_name.as_ref() == "tryUpdate"
+                    {
+                        let describe = |v: &Value| -> String {
+                            match v {
+                                Value::Object(Some(obj)) => {
+                                    let cid = shared.heap.class_id_of(*obj);
+                                    let cn = shared
+                                        .class_manager
+                                        .read()
+                                        .get_class(cid)
+                                        .map(|c| c.name.to_string())
+                                        .unwrap_or_default();
+                                    format!("addr={:?} cid={:?} loader_class={}", obj, cid, cn)
+                                }
+                                Value::Object(None) => "null".to_string(),
+                                other => format!("{:?}", other),
+                            }
+                        };
+                        eprintln!(
+                            "[TRYUPDATE-TRACE/vbc] caller_class_id={:?} cp_index={} receiver_class_id={:?} pre-refresh receiver(args[0])={} updated(args[1])={}",
+                            caller_class_id,
+                            cp_index,
+                            receiver_class_id,
+                            describe(&args_slice[0]),
+                            args_slice.get(1).map(describe).unwrap_or_default(),
+                        );
+                    }
+                    refresh_stale_object_args(shared, args_slice);
+                    if std::env::var("CRATONVM_DBG_LOADER_TRACE").is_ok()
+                        && cached.class_name.contains("RootReference")
+                        && cached.method_name.as_ref() == "tryUpdate"
+                    {
+                        let describe = |v: &Value| -> String {
+                            match v {
+                                Value::Object(Some(obj)) => {
+                                    let cid = shared.heap.class_id_of(*obj);
+                                    let cn = shared
+                                        .class_manager
+                                        .read()
+                                        .get_class(cid)
+                                        .map(|c| c.name.to_string())
+                                        .unwrap_or_default();
+                                    format!("addr={:?} cid={:?} loader_class={}", obj, cid, cn)
+                                }
+                                Value::Object(None) => "null".to_string(),
+                                other => format!("{:?}", other),
+                            }
+                        };
+                        eprintln!(
+                            "[TRYUPDATE-TRACE/vbc] caller_class_id={:?} cp_index={} receiver_class_id={:?} post-refresh receiver(args[0])={} updated(args[1])={}",
+                            caller_class_id,
+                            cp_index,
+                            receiver_class_id,
+                            describe(&args_slice[0]),
+                            args_slice.get(1).map(describe).unwrap_or_default(),
+                        );
+                    }
+                    if std::env::var("CRATONVM_DBG_LOADER_TRACE").is_ok()
+                        && cached.method_name.as_ref() == "compareAndSetRoot"
+                    {
+                        let describe = |v: &Value| -> String {
+                            match v {
+                                Value::Object(Some(obj)) => {
+                                    let cid = shared.heap.class_id_of(*obj);
+                                    let cn = shared
+                                        .class_manager
+                                        .read()
+                                        .get_class(cid)
+                                        .map(|c| c.name.to_string())
+                                        .unwrap_or_default();
+                                    format!("addr={:?} cid={:?} loader_class={}", obj, cid, cn)
+                                }
+                                Value::Object(None) => "null".to_string(),
+                                other => format!("{:?}", other),
+                            }
+                        };
+                        eprintln!(
+                            "[CASROOT-TRACE/vbc] caller_class_id={:?} cp_index={} receiver_class_id={:?} receiver_map(args[0])={} expected(args[1])={} updated(args[2])={}",
+                            caller_class_id,
+                            cp_index,
+                            receiver_class_id,
+                            describe(&args_slice[0]),
+                            args_slice.get(1).map(describe).unwrap_or_default(),
+                            args_slice.get(2).map(describe).unwrap_or_default(),
+                        );
+                    }
 
                     if let Some(res) = intercept_classloader_set_default_assertion_status(
                         shared,
@@ -38349,6 +38606,7 @@ fn execute_invokevirtual_cached(
                         // steady-state path.
                         let mut arg_buf = [Value::Uninitialized; MAX_INTRINSIC_ARGS];
                         let args = pop_coerced_invoke_args_intrinsic(
+                            shared,
                             thread,
                             frame_idx,
                             num_params_usize,
@@ -38430,6 +38688,92 @@ fn execute_invokevirtual_cached(
                 }
                 &mut args_vec
             };
+            if std::env::var("CRATONVM_DBG_LOADER_TRACE").is_ok()
+                && cached.class_name.contains("RootReference")
+                && cached.method_name.as_ref() == "tryUpdate"
+            {
+                let describe = |v: &Value| -> String {
+                    match v {
+                        Value::Object(Some(obj)) => {
+                            let cid = shared.heap.class_id_of(*obj);
+                            let cn = shared
+                                .class_manager
+                                .read()
+                                .get_class(cid)
+                                .map(|c| c.name.to_string())
+                                .unwrap_or_default();
+                            format!("addr={:?} cid={:?} loader_class={}", obj, cid, cn)
+                        }
+                        Value::Object(None) => "null".to_string(),
+                        other => format!("{:?}", other),
+                    }
+                };
+                eprintln!(
+                    "[TRYUPDATE-TRACE] caller_class_id={:?} cp_index={} pre-refresh receiver(args[0])={} updated(args[1])={}",
+                    caller_class_id,
+                    cp_index,
+                    describe(&args_slice[0]),
+                    args_slice.get(1).map(describe).unwrap_or_default(),
+                );
+            }
+            refresh_stale_object_args(shared, args_slice);
+            if std::env::var("CRATONVM_DBG_LOADER_TRACE").is_ok()
+                && cached.class_name.contains("RootReference")
+                && cached.method_name.as_ref() == "tryUpdate"
+            {
+                let describe = |v: &Value| -> String {
+                    match v {
+                        Value::Object(Some(obj)) => {
+                            let cid = shared.heap.class_id_of(*obj);
+                            let cn = shared
+                                .class_manager
+                                .read()
+                                .get_class(cid)
+                                .map(|c| c.name.to_string())
+                                .unwrap_or_default();
+                            format!("addr={:?} cid={:?} loader_class={}", obj, cid, cn)
+                        }
+                        Value::Object(None) => "null".to_string(),
+                        other => format!("{:?}", other),
+                    }
+                };
+                eprintln!(
+                    "[TRYUPDATE-TRACE] caller_class_id={:?} cp_index={} post-refresh receiver(args[0])={} updated(args[1])={}",
+                    caller_class_id,
+                    cp_index,
+                    describe(&args_slice[0]),
+                    args_slice.get(1).map(describe).unwrap_or_default(),
+                );
+            }
+            if std::env::var("CRATONVM_DBG_LOADER_TRACE").is_ok()
+                && cached.class_name.contains("Page")
+                && cached.method_name.as_ref() == "<init>"
+            {
+                let describe = |v: &Value| -> String {
+                    match v {
+                        Value::Object(Some(obj)) => {
+                            let cid = shared.heap.class_id_of(*obj);
+                            let cn = shared
+                                .class_manager
+                                .read()
+                                .get_class(cid)
+                                .map(|c| c.name.to_string())
+                                .unwrap_or_default();
+                            format!("addr={:?} cid={:?} loader_class={}", obj, cid, cn)
+                        }
+                        Value::Object(None) => "null".to_string(),
+                        other => format!("{:?}", other),
+                    }
+                };
+                eprintln!(
+                    "[PAGEINIT-TRACE/bc] caller_class_id={:?} cp_index={} ctor_desc={} new_page(args[0])={} map_arg(args[1])={}",
+                    caller_class_id,
+                    cp_index,
+                    cached.method_descriptor,
+                    describe(&args_slice[0]),
+                    args_slice.get(1).map(describe).unwrap_or_default(),
+                );
+            }
 
             if let Some(res) = intercept_classloader_set_default_assertion_status(
                 shared,
