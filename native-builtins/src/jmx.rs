@@ -1244,6 +1244,25 @@ pub fn register_vm_management_impl(r: &mut NativeMethodRegistry) {
     );
     // setVerboseGC(boolean) — accept and ignore.
     r.register(memory_impl, "setVerboseGC", "(Z)V", |_ctx, _args| Ok(None));
+    // isVerbose()Z — `alloc_memory_mxbean` allocates this bean as a real
+    // `sun/management/MemoryImpl` (not a purely-synthetic interface stamp,
+    // unlike e.g. `ClassLoadingMXBean`), so the real-JDK bytecode
+    // `MemoryImpl.isVerbose() { return jvm.getVerboseGC(); }` is reachable
+    // by normal virtual dispatch and wins over the sibling native already
+    // registered on the `MemoryMXBean` *interface* (interface natives never
+    // shadow a concrete class's own bytecode). Since our `MemoryImpl`
+    // instances are built via `alloc_concurrent_synthetic` rather than the
+    // real `<init>(VMManagement)` constructor, the `jvm` field is never
+    // populated and stays null, so that bytecode NPEs
+    // ("Cannot invoke sun.management.VMManagement.getVerboseGC() because
+    // this.jvm is null") the moment anything calls `isVerbose()` — Tomcat's
+    // manager webapp status page does, via `MemoryMXBean.isVerbose()`
+    // (TestManagerWebapp.testServlets: expected 200 got 500). Register
+    // directly on the concrete class so it wins dispatch, matching
+    // `setVerboseGC`'s always-off convention.
+    r.register(memory_impl, "isVerbose", "()Z", |_ctx, _args| {
+        Ok(Some(Value::Int(0)))
+    });
     // getMemoryUsage0(boolean heap) — for the HEAP case we have a REAL
     // source (`heap_allocated_bytes`, the same accessor MemoryMXBean's
     // getHeapMemoryUsage uses); report it as `used` with committed>=used,
