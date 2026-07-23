@@ -2244,6 +2244,387 @@ pub fn build_replace_override_subclass(
     (new_name, bytes)
 }
 
+/// Sibling of [`build_replace_override_subclass`] for the case where the
+/// bean's declared class is itself an INTERFACE (e.g. `EchoService` in
+/// `XmlBeanFactoryTests.replaceNonOverloadedInterfaceMethodWithoutSpecifyingExplicitArgTypes`).
+/// An interface has no `<init>` and cannot be `extends`ed — real CGLIB's
+/// `Enhancer` documents exactly this: "if the 'superclass' is in fact an
+/// interface, turn it into an implemented interface". So this generates
+/// `class $$SpringCGLIB$$RMI<N> extends Object implements <iface>` instead
+/// of `extends <iface>`.
+///
+/// `methods` are the interface's abstract (or default) methods matched to a
+/// configured `<replaced-method>` — same delegating-to-`MethodReplacer` body
+/// as the class-based generator. `uncovered` are the interface's OTHER
+/// abstract methods with no matching override: since the generated class
+/// must be concrete (every abstract interface method needs SOME method
+/// body to be instantiable), each gets a throwing `AbstractMethodError` stub
+/// — the same fallback `build_lookup_subclass` already uses for an abstract
+/// method with no matching `<lookup-method>`. A default (non-abstract)
+/// interface method that isn't in `methods` needs no stub at all: normal
+/// interface-default-method inheritance already provides its body.
+pub fn build_replace_override_subclass_for_interface(
+    iface_internal_name: &str,
+    methods: &[ReplaceMethodSpec],
+    uncovered: &[(String, String)],
+) -> (String, Vec<u8>) {
+    let counter = ENHANCER_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let new_name = format!("{iface_internal_name}$$SpringCGLIB$$RMI{counter:x}");
+    let mut cw = ClassWriter::new();
+
+    let this_class_idx = cw.add_class(&new_name);
+    let object_super_idx = cw.add_class("java/lang/Object");
+    let iface_idx = cw.add_class(iface_internal_name);
+
+    let init_name_idx = cw.add_utf8("<init>");
+    let void_no_arg_desc_idx = cw.add_utf8("()V");
+    let code_attr_name_idx = cw.add_utf8("Code");
+    let super_init_methodref = cw.add_methodref(object_super_idx, "<init>", "()V");
+
+    let bf_field_name_idx = cw.add_utf8("$$beanFactory");
+    let object_desc_idx = cw.add_utf8("Ljava/lang/Object;");
+    let bf_field_ref = cw.add_fieldref(this_class_idx, "$$beanFactory", "Ljava/lang/Object;");
+
+    // Shared invocation machinery.
+    let beanfactory_cast_idx = cw.add_class("org/springframework/beans/factory/BeanFactory");
+    let getbean_name_type_ref = cw.add_interface_methodref(
+        beanfactory_cast_idx,
+        "getBean",
+        "(Ljava/lang/String;Ljava/lang/Class;)Ljava/lang/Object;",
+    );
+    let methodreplacer_cls =
+        cw.add_class("org/springframework/beans/factory/support/MethodReplacer");
+    let reimplement_ref = cw.add_interface_methodref(
+        methodreplacer_cls,
+        "reimplement",
+        "(Ljava/lang/Object;Ljava/lang/reflect/Method;[Ljava/lang/Object;)Ljava/lang/Object;",
+    );
+    let class_cls = cw.add_class("java/lang/Class");
+    let getdeclaredmethod_ref = cw.add_methodref(
+        class_cls,
+        "getDeclaredMethod",
+        "(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;",
+    );
+    let object_cls = cw.add_class("java/lang/Object");
+    let ise_cls = cw.add_class("java/lang/IllegalStateException");
+    let ise_init_ref = cw.add_methodref(ise_cls, "<init>", "(Ljava/lang/String;)V");
+    let sb_cls = cw.add_class("java/lang/StringBuilder");
+    let sb_init_ref = cw.add_methodref(sb_cls, "<init>", "(Ljava/lang/String;)V");
+    let sb_append_obj_ref = cw.add_methodref(
+        sb_cls,
+        "append",
+        "(Ljava/lang/Object;)Ljava/lang/StringBuilder;",
+    );
+    let sb_tostring_ref = cw.add_methodref(sb_cls, "toString", "()Ljava/lang/String;");
+    let ise_prefix_str_idx = cw.add_string(
+        "Null return value from MethodReplacer does not match primitive return type for: ",
+    );
+    let ame_class_idx = cw.add_class("java/lang/AbstractMethodError");
+    let ame_init_ref = cw.add_methodref(ame_class_idx, "<init>", "()V");
+
+    let number_cls = cw.add_class("java/lang/Number");
+    let num_byte_value = cw.add_methodref(number_cls, "byteValue", "()B");
+    let num_short_value = cw.add_methodref(number_cls, "shortValue", "()S");
+    let num_int_value = cw.add_methodref(number_cls, "intValue", "()I");
+    let num_long_value = cw.add_methodref(number_cls, "longValue", "()J");
+    let num_float_value = cw.add_methodref(number_cls, "floatValue", "()F");
+    let num_double_value = cw.add_methodref(number_cls, "doubleValue", "()D");
+
+    let wr_i = add_wrapper_refs(&mut cw, 'I');
+    let wr_j = add_wrapper_refs(&mut cw, 'J');
+    let wr_f = add_wrapper_refs(&mut cw, 'F');
+    let wr_d = add_wrapper_refs(&mut cw, 'D');
+    let wr_z = add_wrapper_refs(&mut cw, 'Z');
+    let wr_b = add_wrapper_refs(&mut cw, 'B');
+    let wr_c = add_wrapper_refs(&mut cw, 'C');
+    let wr_s = add_wrapper_refs(&mut cw, 'S');
+    let wrapper_for = |ch: char| -> &WrapperRefs {
+        match ch {
+            'I' => &wr_i,
+            'J' => &wr_j,
+            'F' => &wr_f,
+            'D' => &wr_d,
+            'Z' => &wr_z,
+            'B' => &wr_b,
+            'C' => &wr_c,
+            'S' => &wr_s,
+            _ => &wr_i,
+        }
+    };
+
+    let ctor = emit_default_ctor(
+        init_name_idx,
+        void_no_arg_desc_idx,
+        code_attr_name_idx,
+        super_init_methodref,
+    );
+    let bf_field = emit_bean_factory_field(bf_field_name_idx, object_desc_idx);
+    let mut method_bytes: Vec<Vec<u8>> = vec![ctor];
+
+    let b = |x: u16| x.to_be_bytes();
+    for m in methods {
+        let name_idx = cw.add_utf8(&m.name);
+        let desc_idx = cw.add_utf8(&m.descriptor);
+        let name_str_idx = cw.add_string(&m.name);
+        let replacer_str_idx = cw.add_string(&m.replacer_bean_name);
+        let declaring_class_idx = cw.add_class(&m.declaring_internal);
+
+        let params = parse_param_descriptors(&m.descriptor);
+        let ret = m.descriptor.split(')').nth(1).unwrap_or("V").to_string();
+        let ret_char = ret.chars().next().unwrap_or('V');
+        let primitive_ret = matches!(ret_char, 'I' | 'J' | 'F' | 'D' | 'Z' | 'B' | 'C' | 'S');
+
+        let param_class_consts: Vec<Option<u16>> = params
+            .iter()
+            .map(|p| {
+                if p.starts_with('L') || p.starts_with('[') {
+                    let internal = if p.starts_with('L') && p.ends_with(';') {
+                        p[1..p.len() - 1].to_string()
+                    } else {
+                        p.clone()
+                    };
+                    Some(cw.add_class(&internal))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let ret_ref_class = if ret.starts_with('L') && ret.ends_with(';') {
+            Some(cw.add_class(&ret[1..ret.len() - 1]))
+        } else if ret.starts_with('[') {
+            Some(cw.add_class(&ret))
+        } else {
+            None
+        };
+
+        let base = 1u16 + param_slots(&params);
+        let mr_slot = base as u8;
+        let method_slot = (base + 1) as u8;
+        let args_slot = (base + 2) as u8;
+        let result_slot = (base + 3) as u8;
+        let max_locals = base + 4;
+
+        let mut code: Vec<u8> = Vec::new();
+
+        // (A) mr = (MethodReplacer) bf.getBean(replacer, MethodReplacer.class)
+        code.push(0x2A); // aload_0
+        code.push(0xB4); // getfield $$beanFactory
+        code.extend_from_slice(&b(bf_field_ref));
+        code.push(0xC0); // checkcast BeanFactory
+        code.extend_from_slice(&b(beanfactory_cast_idx));
+        code.push(0x13); // ldc_w "<replacer>"
+        code.extend_from_slice(&b(replacer_str_idx));
+        code.push(0x13); // ldc_w MethodReplacer.class
+        code.extend_from_slice(&b(methodreplacer_cls));
+        code.push(0xB9); // invokeinterface getBean(String,Class)
+        code.extend_from_slice(&b(getbean_name_type_ref));
+        code.push(0x03);
+        code.push(0x00);
+        code.push(0xC0); // checkcast MethodReplacer
+        code.extend_from_slice(&b(methodreplacer_cls));
+        code.push(0x3A); // astore mr_slot
+        code.push(mr_slot);
+
+        // (B) method = DeclaringClass.class.getDeclaredMethod(name, paramClasses)
+        code.push(0x13);
+        code.extend_from_slice(&b(declaring_class_idx));
+        code.push(0x13);
+        code.extend_from_slice(&b(name_str_idx));
+        push_int(&mut code, params.len() as i32);
+        code.push(0xBD);
+        code.extend_from_slice(&b(class_cls));
+        for (i, p) in params.iter().enumerate() {
+            code.push(0x59);
+            push_int(&mut code, i as i32);
+            match param_class_consts[i] {
+                Some(cidx) => {
+                    code.push(0x13);
+                    code.extend_from_slice(&b(cidx));
+                }
+                None => {
+                    let ch = p.chars().next().unwrap_or('I');
+                    code.push(0xB2);
+                    code.extend_from_slice(&b(wrapper_for(ch).type_field_ref));
+                }
+            }
+            code.push(0x53);
+        }
+        code.push(0xB6);
+        code.extend_from_slice(&b(getdeclaredmethod_ref));
+        code.push(0x3A);
+        code.push(method_slot);
+
+        // (C) args = new Object[]{ boxed params }
+        push_int(&mut code, params.len() as i32);
+        code.push(0xBD);
+        code.extend_from_slice(&b(object_cls));
+        let mut slot = 1u16;
+        for (i, p) in params.iter().enumerate() {
+            code.push(0x59);
+            push_int(&mut code, i as i32);
+            let ch = p.chars().next().unwrap_or('L');
+            match ch {
+                'J' => {
+                    code.push(0x16);
+                    code.push(slot as u8);
+                    code.push(0xB8);
+                    code.extend_from_slice(&b(wr_j.valueof_ref));
+                    slot += 2;
+                }
+                'F' => {
+                    code.push(0x17);
+                    code.push(slot as u8);
+                    code.push(0xB8);
+                    code.extend_from_slice(&b(wr_f.valueof_ref));
+                    slot += 1;
+                }
+                'D' => {
+                    code.push(0x18);
+                    code.push(slot as u8);
+                    code.push(0xB8);
+                    code.extend_from_slice(&b(wr_d.valueof_ref));
+                    slot += 2;
+                }
+                'I' | 'Z' | 'B' | 'C' | 'S' => {
+                    code.push(0x15);
+                    code.push(slot as u8);
+                    code.push(0xB8);
+                    code.extend_from_slice(&b(wrapper_for(ch).valueof_ref));
+                    slot += 1;
+                }
+                _ => {
+                    code.push(0x19);
+                    code.push(slot as u8);
+                    slot += 1;
+                }
+            }
+            code.push(0x53);
+        }
+        code.push(0x3A);
+        code.push(args_slot);
+
+        // (D) result = mr.reimplement(this, method, args)
+        code.push(0x19);
+        code.push(mr_slot);
+        code.push(0x2A);
+        code.push(0x19);
+        code.push(method_slot);
+        code.push(0x19);
+        code.push(args_slot);
+        code.push(0xB9);
+        code.extend_from_slice(&b(reimplement_ref));
+        code.push(0x04);
+        code.push(0x00);
+        code.push(0x3A);
+        code.push(result_slot);
+
+        // (E) processReturnType + return.
+        if primitive_ret {
+            let mut throw_block: Vec<u8> = Vec::new();
+            throw_block.push(0xBB);
+            throw_block.extend_from_slice(&b(ise_cls));
+            throw_block.push(0x59);
+            throw_block.push(0xBB);
+            throw_block.extend_from_slice(&b(sb_cls));
+            throw_block.push(0x59);
+            throw_block.push(0x13);
+            throw_block.extend_from_slice(&b(ise_prefix_str_idx));
+            throw_block.push(0xB7);
+            throw_block.extend_from_slice(&b(sb_init_ref));
+            throw_block.push(0x19);
+            throw_block.push(method_slot);
+            throw_block.push(0xB6);
+            throw_block.extend_from_slice(&b(sb_append_obj_ref));
+            throw_block.push(0xB6);
+            throw_block.extend_from_slice(&b(sb_tostring_ref));
+            throw_block.push(0xB7);
+            throw_block.extend_from_slice(&b(ise_init_ref));
+            throw_block.push(0xBF);
+
+            code.push(0x19);
+            code.push(result_slot);
+            code.push(0xC7);
+            let off = (3 + throw_block.len()) as u16;
+            code.extend_from_slice(&b(off));
+            code.extend_from_slice(&throw_block);
+            let (cast_idx, xvalue_ref, ret_op): (u16, u16, u8) = match ret_char {
+                'Z' => (wr_z.class_idx, wr_z.xvalue_ref, 0xAC),
+                'C' => (wr_c.class_idx, wr_c.xvalue_ref, 0xAC),
+                'B' => (number_cls, num_byte_value, 0xAC),
+                'S' => (number_cls, num_short_value, 0xAC),
+                'I' => (number_cls, num_int_value, 0xAC),
+                'J' => (number_cls, num_long_value, 0xAD),
+                'F' => (number_cls, num_float_value, 0xAE),
+                'D' => (number_cls, num_double_value, 0xAF),
+                _ => (number_cls, num_int_value, 0xAC),
+            };
+            code.push(0x19);
+            code.push(result_slot);
+            code.push(0xC0);
+            code.extend_from_slice(&b(cast_idx));
+            code.push(0xB6);
+            code.extend_from_slice(&b(xvalue_ref));
+            code.push(ret_op);
+        } else if ret_char == 'V' {
+            code.push(0xB1);
+        } else {
+            code.push(0x19);
+            code.push(result_slot);
+            if let Some(rc) = ret_ref_class {
+                code.push(0xC0);
+                code.extend_from_slice(&b(rc));
+            }
+            code.push(0xB0);
+        }
+
+        method_bytes.push(wrap_method(
+            name_idx,
+            desc_idx,
+            code_attr_name_idx,
+            &code,
+            8,
+            max_locals,
+        ));
+    }
+
+    // Every OTHER abstract interface method (no matching <replaced-method>)
+    // needs SOME body for the class to be concrete/instantiable — a throwing
+    // AbstractMethodError stub, same fallback build_lookup_subclass uses.
+    for (name, descriptor) in uncovered {
+        let name_idx = cw.add_utf8(name);
+        let desc_idx = cw.add_utf8(descriptor);
+        let params = parse_param_descriptors(descriptor);
+        let mlocals = 1 + param_slots(&params);
+        let mut code: Vec<u8> = Vec::new();
+        code.push(0xBB); // new AbstractMethodError
+        code.extend_from_slice(&b(ame_class_idx));
+        code.push(0x59); // dup
+        code.push(0xB7); // invokespecial <init>
+        code.extend_from_slice(&b(ame_init_ref));
+        code.push(0xBF); // athrow
+        method_bytes.push(wrap_method(
+            name_idx,
+            desc_idx,
+            code_attr_name_idx,
+            &code,
+            2,
+            mlocals,
+        ));
+    }
+
+    let access_flags: u16 = 0x0001 | 0x0020 | 0x1000; // PUBLIC | SUPER | SYNTHETIC
+    let fields: &[Vec<u8>] = &[bf_field];
+    let bytes = cw.finish(
+        access_flags,
+        this_class_idx,
+        object_super_idx,
+        &[iface_idx],
+        fields,
+        &method_bytes,
+    );
+    (new_name, bytes)
+}
+
 // ---------------------------------------------------------------------------
 // Native intercept
 // ---------------------------------------------------------------------------
