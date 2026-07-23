@@ -266,6 +266,34 @@ What is OPEN, in priority order:
 None of items 1-4 are fixed. This doc should stay OPEN with this characterization until a future
 session reproduces and root-causes at least the two fatal items (2, 3).
 
+## WFLYCTL0079 double-dispatch hypothesis test (2026-07-23) — inconclusive, diagnostic landed
+
+Added `CRATONVM_DBG_DUPCALL_FILTER` (`push_frame_and_fire_entry`'s chokepoint in interpreter.rs,
+gated by a new `env_cache::dbg_dupcall_filter`): traces every entry to
+`ParallelExtensionAddHandler$ExtensionInitializeTask.call()` with the receiver's identity and
+thread id, to test whether item 4 (`WFLYCTL0079`) is caused by the boot executor double-dispatching
+the same task (each task's `call()` should legitimately run exactly once per extension per boot —
+decompiling the class confirmed exactly one `executor.submit()` per extension, so a genuine second
+execution would be a real CratonVM executor/queue correctness bug).
+
+**False-positive found and fixed first:** the task class implements `Callable<V>`, so it has a
+compiler-generated bridge method (`call()Ljava/lang/Object;`) alongside the real covariant-return
+method (`call()Lorg/jboss/.../OperationFailedRuntimeException;`) — both named `call`, so every
+logical invocation legitimately produces TWO frame-push events (bridge → real), on the SAME thread,
+back-to-back, on **every single task, every single boot**. Confirmed via the first smoke-test boot
+(72 `[DUPCALL]` lines for 36 tasks, every receiver appearing in a consecutive same-thread pair).
+`probes/run-one.sh`'s tag detection was corrected to flag only a receiver seen **3+** times
+(`DUPCALL3X`) as a genuine extra invocation — 2 is the expected bridge-pair baseline.
+
+**Result: inconclusive.** Two independent 800-boot campaigns (1600 boots total) with the corrected
+diagnostic active caught neither a `DUPCALL3X` nor a fresh `WFLYCTL0079`/`DUPATTR` occurrence. Given
+the bug's own historical rate (~2 occurrences in ~2400 boots run without the diagnostic, i.e.
+roughly 1-in-1200), going 1600 boots without a repeat is unsurprising sampling variance, not
+evidence against the double-dispatch hypothesis. The diagnostic itself is safe (zero false positives
+across 5 smoke tests + 1600 campaign boots) and committed to dev — a future session can either keep
+sampling with `CRATONVM_DBG_DUPCALL_FILTER=1` already wired into `probes/run-one.sh`, or pursue the
+class-init-twice alternative hypothesis instead.
+
 ## Large-scale campaign (800 boots, fix15, 2026-07-23) — WFLYCTL0079 confirmed reproducible
 
 With the RSET_AUDIT diagnostic now fixed (verified holding at scale: 1 `EXITED`/800, no segfaults),
