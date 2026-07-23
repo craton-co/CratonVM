@@ -64,6 +64,26 @@ carrying this (first is `cvm-stw-close-20260722-fix9`+) should name the holder d
 Harness: `probes/batch.sh` (P=4) in the worktree above; pre-fix event rate ~3-4%/boot ⇒ ~10-15
 captures per 320-boot campaign.
 
+### Push-provenance result (2026-07-23, campaign `out-run11`, binary fix9)
+
+The invoke-return ring answered NEGATIVELY: the stale address appears in `[pushprov]` only
+~115 invoke-returns BEFORE the fatal epoch (the pre-GC chain, aligned with the `[nret]` wall) —
+**nothing re-pushed it post-GC through `push_invoke_return_value`**, and the native-return /
+getfield rings are equally silent post-GC, while every dumped LOCAL in every capture is healthy
+(so not an `aload` of a stale local either). Remaining un-instrumented channels that could place
+the pre-move address into the consuming dispatch:
+
+- non-invoke pushes: `new`-result, `ldc`, `aaload`, `getstatic`, and the kind-preserving
+  dup/swap shuffle primitives (`push_with_kind` / `push_compact`);
+- any path that resurrects popped-above-`len` slots (the popped-slot dumps prove the pre-move
+  bits persist physically above `len`; `update_object_refs` remaps only `0..len` BY DESIGN, so
+  any upward `len` restore — deopt/exception/retry machinery — re-exposes unremapped values);
+- the in-flight `execute_invoke_kind` `args` buffer if any post-callee code path re-reads it.
+
+Next increment: extend the pushprov recording to the dup-family + `new`/`ldc`/`aaload`/`getstatic`
+push sites (or, cheaper, record ONLY pushes whose value lies in the previous epoch's from-space —
+a one-comparison gate against the `zero_forensics` newest reset range), then one more campaign.
+
 ## Impact assessment for the open shape
 
 Non-fatal in every observation across 700+ instrumented boots: the invokevirtual stale-receiver
