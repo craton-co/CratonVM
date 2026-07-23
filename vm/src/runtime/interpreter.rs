@@ -2406,6 +2406,48 @@ pub(crate) fn tlab_alloc_object(
     tlab_alloc_object_inner(thread, shared, class_id, num_fields, total_size, false)
 }
 
+/// TLAB hit-only path for the tiny byte arrays backing compact dynamic Strings.
+/// The caller falls back to the heap allocator on a miss, so this never refills
+/// or collects after another newly-created object is live in its native helper.
+pub(crate) fn tlab_alloc_byte_array(
+    thread: &mut JvmThread,
+    shared: &SharedVm,
+    length: usize,
+) -> Option<ObjectRef> {
+    use cratonvm_gc::heap::{ArrayElementType, ObjectHeader, ObjectKind, HEADER_SIZE};
+    let length_u32 = u32::try_from(length).ok()?;
+    let total_size = HEADER_SIZE.checked_add(length)?;
+    if total_size > cratonvm_gc::tlab::tlab_max_alloc() {
+        return None;
+    }
+    let ptr = thread.tlab.alloc_initialized(total_size, 8, |ptr| {
+        let header = ObjectHeader::new(
+            ClassId::new(0),
+            ObjectKind::Array,
+            ArrayElementType::Byte,
+            shared.heap.next_identity_hash(),
+            length_u32,
+            length_u32,
+        );
+        unsafe { std::ptr::write(ptr as *mut ObjectHeader, header) };
+    })?;
+    use std::sync::atomic::Ordering;
+    shared.tlab_hit_count.fetch_add(1, Ordering::Relaxed);
+    shared
+        .bytes_allocated_total
+        .fetch_add(total_size as u64, Ordering::Relaxed);
+    cratonvm_gc::a2dbg::record(
+        ptr as usize,
+        0,
+        ObjectKind::Array as u8,
+        ArrayElementType::Byte as u8,
+        length_u32,
+        length_u32,
+        total_size,
+    );
+    Some(unsafe { ObjectRef::from_raw(ptr) })
+}
+
 /// [`tlab_alloc_object`] for the JIT allocation slow path (`jit_new_object`):
 /// identical bump allocation, but the REFILL arm first asks — in O(1) —
 /// whether young can supply the chunk WITHOUT another GC (bump-tail headroom
