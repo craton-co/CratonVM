@@ -2401,6 +2401,7 @@ fn try_build_method_injection(
     // Enumerate methods up the hierarchy; a method needs implementing if it is
     // abstract somewhere and never concrete.
     let mut all: Vec<(String, String, bool)> = Vec::new();
+    let mut iface_work: Vec<cratonvm_types::ClassId> = Vec::new();
     let mut cursor = Some(super_cid);
     while let Some(cid) = cursor {
         for m in ctx.declared_methods(cid) {
@@ -2413,7 +2414,37 @@ fn try_build_method_injection(
                 m.access_flags & ACC_ABSTRACT != 0,
             ));
         }
+        iface_work.extend(ctx.class_interfaces(cid));
         cursor = ctx.superclass_of(cid);
+    }
+    // Interface-declared methods live outside the superclass chain walked
+    // above, but are abstract (unless `default`) just the same. A bean class
+    // that `implements` an interface without redeclaring one of its methods
+    // (e.g. `abstract class OverrideOneMethod ... implements OverrideInterface`,
+    // never overriding `OverrideInterface.getPrototypeDependency()` itself)
+    // left that method entirely undiscovered here -- not even matched to the
+    // "no override -> throwing stub" fallback below -- so the generated CGLIB
+    // subclass never declared it at all, surfacing as `AbstractMethodError:
+    // ... has no Code attribute` the moment it's called (XmlBeanFactoryTests
+    // lookupOverrideMethodsWithSetterInjection / replaceMethodOverrideWithSetterInjection).
+    // Walk every implemented interface (transitively, since an interface can
+    // itself extend others) for each class already visited above.
+    let mut visited_ifaces: HashSet<cratonvm_types::ClassId> = HashSet::new();
+    while let Some(icid) = iface_work.pop() {
+        if !visited_ifaces.insert(icid) {
+            continue;
+        }
+        for m in ctx.declared_methods(icid) {
+            if m.name.starts_with('<') {
+                continue;
+            }
+            all.push((
+                m.name.clone(),
+                m.descriptor.clone(),
+                m.access_flags & ACC_ABSTRACT != 0,
+            ));
+        }
+        iface_work.extend(ctx.class_interfaces(icid));
     }
     let mut concrete: HashSet<(String, String)> = HashSet::new();
     for (n, d, is_abs) in &all {
