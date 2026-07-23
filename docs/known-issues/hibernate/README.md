@@ -39,6 +39,7 @@ regression tracking — not committed (`apps/` is gitignored).
 
 ## Resolved since this rerun
 
+- [storedproc/resultmapping real-javac archive walker + JIT residual - FIXED](../../internal/fixed-suite-bugs/hibernate/storedproc-resultmapping-javac-walk-maxdepth-jit-20260723-FIXED.md) - `StoredProcedureTest` and `ResultMappingTest` now complete 4/4 in both JIT and `--nojit`; the archive walker honors javac's non-recursive `maxDepth=1` listing contract and the one verified `Symbol$ClassSymbol.complete` JIT underflow is narrowly interpreted.
 - [qualfiedTableNaming timeout and JIT-corruption cluster - FIXED](../../internal/fixed-suite-bugs/hibernate/qualfiedtablenaming-hang-cluster-20260721-FIXED.md) - the slow class now has a 3600-second floor and a narrow JIT-to-interpreter correctness quarantine after reproducible class-id-zero metadata-store drops; `NamespaceTest` passes in seconds.
 
 ## Residual clusters (2026-07-21 "others" rerun)
