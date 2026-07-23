@@ -40,3 +40,14 @@ on that path. Calling `AbstractPipeline.spliterator()` via `invokespecial` and
 draining it likewise returned no elements in the focused probe, so it is not a
 safe replacement. Do not force `Stream.mapToInt` to the eager native bridge
 until its source extraction preserves real `ReferencePipeline` elements.
+
+## 2026-07-23 continuation
+
+A fresh release build tested the narrow native-bridge override for
+`mapToInt(ToIntFunction)` through both its `Stream` and
+`ReferencePipeline` resolution routes. It did not change the no-JIT probe:
+the real `IntPipeline$Head.toArray()` still contained twelve zeroes, with an
+empty `min()` and a zero `sum()`. The mapper works when called directly, so
+the defect remains in the interpreter's real reference-to-primitive pipeline
+execution or its dispatch path, not in HashMap iteration or the terminal
+operations. No ineffective source change was retained.
