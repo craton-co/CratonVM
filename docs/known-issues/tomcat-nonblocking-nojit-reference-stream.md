@@ -23,6 +23,10 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File `
 specialsMap.keySet().stream().mapToInt(String::length).min().getAsInt()
 ```
 
+Fresh verification on 2026-07-23 with the clean audit executable recorded
+`PASS` in 225.3 seconds with JIT and the expected no-JIT failure in 243.8
+seconds (`expected:<200> but was:<500>`).
+
 The fixture probe `apps/tomcat/.suite/HashMapClinitProbe` confirms that the
 real `ReferencePipeline$Head` counts its twelve source keys, while its
 `mapToInt(...).min()` is empty and `sum()` is zero only under `--nojit`.
@@ -36,4 +40,3 @@ on that path. Calling `AbstractPipeline.spliterator()` via `invokespecial` and
 draining it likewise returned no elements in the focused probe, so it is not a
 safe replacement. Do not force `Stream.mapToInt` to the eager native bridge
 until its source extraction preserves real `ReferencePipeline` elements.
-
