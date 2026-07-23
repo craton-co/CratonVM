@@ -97,6 +97,19 @@ the docs below this session — many residuals are very likely the same
 already-documented OPEN clusters, worth a dedicated confirmation pass
 rather than assuming closed or re-investigating from scratch.
 
+> Closure update (2026-07-23): `module/spring-boot-security`'s 4-class
+> residual from this rerun (`SecurityFilterAutoConfigurationEarlyInitializationTests`,
+> `PathRequestTests`, `ManagementWebSecurityAutoConfigurationTests`,
+> `ReactiveManagementWebSecurityAutoConfigurationTests`) — root cause was a
+> `ModifiedClassPathClassLoader` built from a "pathing JAR" launch (used when
+> a module's classpath is too long for a Windows command line) resolving to
+> an effectively empty classpath, since `ClassPath::new` never expanded a
+> plain jar's own manifest `Class-Path:` attribute. **FIXED** — see
+> [`../../internal/fixed-suite-bugs/springboot/springboot-security-modifiedclasspathextension-pathing-jar-classpath-manifest-FIXED.md`](../../internal/fixed-suite-bugs/springboot/springboot-security-modifiedclasspathextension-pathing-jar-classpath-manifest-FIXED.md).
+> `PathRequestTests` now passes outright; the other 3 narrow to two distinct,
+> newly-exposed residuals: [`onbeancondition-mergedannotations-intermittent-identity-mismatch.md`](onbeancondition-mergedannotations-intermittent-identity-mismatch.md)
+> and [`securityfilterautoconfig-capturedoutput-password-not-observed.md`](securityfilterautoconfig-capturedoutput-password-not-observed.md).
+
 ## 2026-07-17 rerun: 510-class set vs first-ever same-scope HotSpot baseline (429 CratonVM-specific)
 
 Reran the 510 classes still not `PASS` as of the 2026-07-16 snapshot against

@@ -1363,7 +1363,10 @@ pub(crate) fn find_loaded_class_for_loader(
     internal_name: &str,
 ) -> Option<ObjectRef> {
     let __obsreg_dbg = std::env::var_os("CRATONVM_DBG_OBSREG").is_some()
-        && internal_name.contains("ObservationRegistry");
+        && (internal_name.contains("ObservationRegistry")
+            || internal_name.contains("SecurityFilterAutoConfigurationEarlyInitializationTests")
+            || internal_name.contains("PathRequestTests")
+            || internal_name.contains("ManagementWebSecurityAutoConfigurationTests"));
     let __is_user_defined = is_user_defined_loader(ctx, this);
     if __obsreg_dbg {
         eprintln!(
@@ -5599,7 +5602,7 @@ fn fetch_http_resource(
 }
 
 fn loader_local_resource_urls(
-    ctx: &dyn NativeContext,
+    ctx: &mut dyn NativeContext,
     loader: ObjectRef,
     resource_name: &str,
 ) -> Vec<String> {
@@ -5610,6 +5613,14 @@ fn loader_local_resource_urls(
         }
         return Vec::new();
     }
+    // `cached_class_path_for_paths` (keyed by the exact paths vector) already
+    // covers the repeated-rebuild cost that a "pathing JAR" -- a jar with no
+    // class entries, only a manifest `Class-Path:` naming the real dependency
+    // jars, used by e.g. the spring-boot-suite-runner to dodge Windows'
+    // command-line length limit -- would otherwise pay on every single
+    // lookup once `ClassPath::new` honours that manifest attribute (see
+    // `classloading/src/class_path.rs`) and expands to the module's full,
+    // possibly 100s-of-jars dependency list.
     let urls = cached_class_path_for_paths(&paths).find_all_resource_urls(resource_name);
     if std::env::var_os("CRATONVM_DBG_UCLRES").is_some() {
         eprintln!(
@@ -5756,7 +5767,18 @@ pub(crate) fn ucl_try_define_local_class(
     let bytes = match bytes {
         Some(b) => b,
         None if http_bases.is_empty() => {
-            if url_classloader_isolated_from_app(ctx, loader) {
+            // A class dynamically appended to the BOOTSTRAP search
+            // (`Instrumentation.appendToBootstrapClassLoaderSearch` — e.g.
+            // Mockito's inline mock maker injecting `MockMethodDispatcher`/
+            // `MockMethodAdvice`) is visible to every loader via real
+            // parent-delegation semantics (an isolated `URLClassLoader`'s
+            // parent is null, i.e. the bootstrap loader itself — NOT "no
+            // parent at all"). Defer to the caller's own fallback (which
+            // consults the global class store, itself searching the
+            // bootstrap path) instead of making the miss authoritative here.
+            if url_classloader_isolated_from_app(ctx, loader)
+                && !cratonvm_classloading::is_bootstrap_appended_class(internal_name)
+            {
                 let exception = crate::jboss_module_loader::alloc_single_message_exception(
                     ctx,
                     "java/lang/ClassNotFoundException",
@@ -8455,7 +8477,7 @@ mod classloader_tests {
         ctx.set_array_element(urls, 0, Value::Object(Some(url)));
         ctx.set_field(ucp, UCP_STASHED_URLS, Value::Object(Some(urls)));
 
-        let hits = loader_local_resource_urls(&ctx, loader, "virtual/tomcat0807_webapp.txt");
+        let hits = loader_local_resource_urls(&mut ctx, loader, "virtual/tomcat0807_webapp.txt");
         assert_eq!(
             hits.len(),
             1,

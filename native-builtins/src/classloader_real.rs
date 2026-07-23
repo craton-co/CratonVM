@@ -1182,6 +1182,7 @@ fn cl_real_load_class_base(
     // recorded URLs, then make the miss authoritative.
     if crate::classloader::url_classloader_isolated_from_app(ctx, this)
         && !crate::classloader::is_bootstrap_class_name(&internal)
+        && !cratonvm_classloading::is_bootstrap_appended_class(&internal)
     {
         if let Some(result) = crate::classloader::ucl_try_define_local_class(ctx, this, &internal) {
             return result;
@@ -1372,7 +1373,9 @@ pub fn ucl_real_find_class(
     if let Some(result) = crate::classloader::ucl_try_define_local_class(ctx, this, &internal) {
         return result;
     }
-    if crate::classloader::url_classloader_isolated_from_app(ctx, this) {
+    if crate::classloader::url_classloader_isolated_from_app(ctx, this)
+        && !cratonvm_classloading::is_bootstrap_appended_class(&internal)
+    {
         let exc = crate::jboss_module_loader::alloc_single_message_exception(
             ctx,
             "java/lang/ClassNotFoundException",

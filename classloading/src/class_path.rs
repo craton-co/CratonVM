@@ -1264,72 +1264,7 @@ impl ClassPath {
         let __diag_npaths = paths.len();
         let mut entries = Vec::new();
         for raw in paths {
-            for p in Self::expand_classpath_wildcard(raw) {
-                // A URLClassLoader rooted at an archive subdirectory hands us
-                // `<archive>!/<prefix>/`. Handle it before interpreting the
-                // token as a filesystem path so `.war`/`.ear` archives retain
-                // their internal root for both class and resource lookup.
-                if let Some((archive, prefix)) = parse_jar_subdir_spec(&p) {
-                    let path = PathBuf::from(archive);
-                    if path.exists() {
-                        match read_file_for_classpath(&path) {
-                            Ok(data) => {
-                                if let Some(entry) =
-                                    Self::build_nested_directory_from_jar(&path, data, &prefix)
-                                {
-                                    entries.push(entry);
-                                }
-                            }
-                            Err(e) => {
-                                debug!(
-                                    "Failed to read nested classpath archive {}: {e}",
-                                    path.display()
-                                );
-                            }
-                        }
-                    } else {
-                        debug!(
-                            "Skipping missing nested classpath archive: {}",
-                            path.display()
-                        );
-                    }
-                    continue;
-                }
-                let path = PathBuf::from(&p);
-                if path.is_dir() {
-                    entries.push(ClassPathEntry::Directory(path));
-                } else if path.extension().is_some_and(|ext| ext == "jmod") && path.exists() {
-                    match Self::load_jmod(&path) {
-                        Ok(entry) => entries.push(entry),
-                        Err(e) => debug!("Failed to read JMOD {}: {e}", path.display()),
-                    }
-                } else if Self::is_likely_jimage(&path) {
-                    // NEW-5: the JDK 9+ runtime image at `$JAVA_HOME/lib/modules`
-                    // is a single jimage blob. Detection is by file name
-                    // (`modules` under any directory) plus a magic-number
-                    // verification inside `load_jimage`. The explicit file
-                    // name check lets users write `-cp /path/to/lib/modules`
-                    // without having to pass a special flag.
-                    match Self::load_jimage(&path) {
-                        Ok(entry) => entries.push(entry),
-                        Err(e) => debug!("Failed to read jimage {}: {e}", path.display()),
-                    }
-                } else if path.is_file() {
-                    // A URLClassLoader treats every existing file URL as an
-                    // archive candidate, regardless of its suffix. Hibernate's
-                    // packaged-bootstrap tests use `.par`/`.war`/`.ear` ZIPs;
-                    // accepting only `.jar` here made the per-loader resolver
-                    // silently lose their resources while `add_path` accepted
-                    // the same URLs. `load_jar_data` fails closed for ordinary
-                    // non-archive files, so the broader admission is safe.
-                    match read_file_for_classpath(&path) {
-                        Ok(data) => Self::load_jar_data(&path, data, &mut entries),
-                        Err(e) => debug!("Failed to read classpath archive {}: {e}", path.display()),
-                    }
-                } else {
-                    debug!("Skipping non-existent classpath entry: {p}");
-                }
-            }
+            Self::process_classpath_token(raw, &mut entries, 0);
         }
         if let Some(t0) = __diag_start {
             static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1468,8 +1403,108 @@ impl ClassPath {
         }
     }
 
+    /// Resolve a single classpath token (wildcard, jar-subdir spec,
+    /// directory, jmod, jimage, or plain jar/file) into `entries`. Shared by
+    /// [`ClassPath::new`]'s top-level path list (`depth=0`) and by a plain
+    /// jar's own manifest `Class-Path:` expansion (`depth=parent_depth+1`,
+    /// see [`ClassPath::load_jar_data_at_depth`]).
+    fn process_classpath_token(raw: &str, entries: &mut Vec<ClassPathEntry>, depth: u32) {
+        for p in Self::expand_classpath_wildcard(raw) {
+            // A URLClassLoader rooted at an archive subdirectory hands us
+            // `<archive>!/<prefix>/`. Handle it before interpreting the
+            // token as a filesystem path so `.war`/`.ear` archives retain
+            // their internal root for both class and resource lookup.
+            if let Some((archive, prefix)) = parse_jar_subdir_spec(&p) {
+                let path = PathBuf::from(archive);
+                if path.exists() {
+                    match read_file_for_classpath(&path) {
+                        Ok(data) => {
+                            if let Some(entry) =
+                                Self::build_nested_directory_from_jar(&path, data, &prefix)
+                            {
+                                entries.push(entry);
+                            }
+                        }
+                        Err(e) => {
+                            debug!(
+                                "Failed to read nested classpath archive {}: {e}",
+                                path.display()
+                            );
+                        }
+                    }
+                } else {
+                    debug!(
+                        "Skipping missing nested classpath archive: {}",
+                        path.display()
+                    );
+                }
+                continue;
+            }
+            let path = PathBuf::from(&p);
+            if path.is_dir() {
+                entries.push(ClassPathEntry::Directory(path));
+            } else if path.extension().is_some_and(|ext| ext == "jmod") && path.exists() {
+                match Self::load_jmod(&path) {
+                    Ok(entry) => entries.push(entry),
+                    Err(e) => debug!("Failed to read JMOD {}: {e}", path.display()),
+                }
+            } else if Self::is_likely_jimage(&path) {
+                // NEW-5: the JDK 9+ runtime image at `$JAVA_HOME/lib/modules`
+                // is a single jimage blob. Detection is by file name
+                // (`modules` under any directory) plus a magic-number
+                // verification inside `load_jimage`. The explicit file
+                // name check lets users write `-cp /path/to/lib/modules`
+                // without having to pass a special flag.
+                match Self::load_jimage(&path) {
+                    Ok(entry) => entries.push(entry),
+                    Err(e) => debug!("Failed to read jimage {}: {e}", path.display()),
+                }
+            } else if path.is_file() {
+                // A URLClassLoader treats every existing file URL as an
+                // archive candidate, regardless of its suffix. Hibernate's
+                // packaged-bootstrap tests use `.par`/`.war`/`.ear` ZIPs;
+                // accepting only `.jar` here made the per-loader resolver
+                // silently lose their resources while `add_path` accepted
+                // the same URLs. `load_jar_data` fails closed for ordinary
+                // non-archive files, so the broader admission is safe.
+                match read_file_for_classpath(&path) {
+                    Ok(data) => Self::load_jar_data_at_depth(&path, data, entries, depth),
+                    Err(e) => debug!("Failed to read classpath archive {}: {e}", path.display()),
+                }
+            } else {
+                debug!("Skipping non-existent classpath entry: {p}");
+            }
+        }
+    }
+
     /// Load a JAR from raw bytes, auto-detecting fat JAR structure.
     fn load_jar_data(path: &Path, data: Vec<u8>, entries: &mut Vec<ClassPathEntry>) {
+        Self::load_jar_data_at_depth(path, data, entries, 0);
+    }
+
+    /// Manifest `Class-Path:` expansion recursion cap — guards against a
+    /// cyclic chain (jar A's Class-Path names jar B, whose Class-Path names
+    /// A again) recursing forever. Real classpaths are never nested this
+    /// deep in practice.
+    const MAX_CLASS_PATH_MANIFEST_DEPTH: u32 = 16;
+
+    /// [`load_jar_data`], plus honouring a plain (non-fat) JAR's own
+    /// manifest `Class-Path:` attribute.
+    ///
+    /// Per the JAR spec, `Class-Path:` is honoured for ANY jar a
+    /// `URLClassLoader`/launcher opens, not just the process's initial
+    /// classpath — but until this fix, `vm-cli`'s one-time `--jar <path>`
+    /// bootstrap handling (`resolve_class_path`, `vm-cli/src/main.rs`) was
+    /// the ONLY caller that expanded it. A "pathing JAR" (a jar containing
+    /// no classes, only a manifest `Class-Path:` pointing at the real
+    /// dependency jars/dirs — used by e.g. the spring-boot-suite-runner to
+    /// dodge Windows' command-line length limit) loaded through this
+    /// general-purpose `ClassPath::new` path — the one every ad hoc
+    /// `URLClassLoader` (`ModifiedClassPathClassLoader`, custom test
+    /// classloaders, etc.) is built from — therefore silently resolved to
+    /// an unusable, effectively empty classpath: the pathing jar itself
+    /// has no class entries, and its `Class-Path:` was never followed.
+    fn load_jar_data_at_depth(path: &Path, data: Vec<u8>, entries: &mut Vec<ClassPathEntry>, depth: u32) {
         let cursor = Cursor::new(data);
         match ZipArchive::new(cursor) {
             Ok(mut archive) => {
@@ -1529,6 +1564,11 @@ impl ClassPath {
                         versions_cache: Mutex::new(None),
                         signer_cache: OnceLock::new(),
                     });
+                    if depth < Self::MAX_CLASS_PATH_MANIFEST_DEPTH {
+                        for token in manifest.resolve_class_path(path) {
+                            Self::process_classpath_token(&token, entries, depth + 1);
+                        }
+                    }
                 }
             }
             Err(e) => {
