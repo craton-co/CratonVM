@@ -4101,10 +4101,14 @@ fn register_https_url_connection(r: &mut NativeMethodRegistry) {
     ) -> Option<ObjectRef> {
         const MAX_DEPTH: usize = 6;
         const MAX_VISITED: usize = 64;
+        let dbg = std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok();
         let sslcontext_cid = ctx.class_id_by_name("javax/net/ssl/SSLContext");
+        if dbg {
+            eprintln!("[dbg-tls-auth] MYFIX sslcontext_cid={:?}", sslcontext_cid);
+        }
         let mut frontier = vec![factory];
         let mut visited = 0usize;
-        for _ in 0..MAX_DEPTH {
+        for depth in 0..MAX_DEPTH {
             let mut next_frontier = Vec::new();
             for obj in frontier {
                 if visited >= MAX_VISITED {
@@ -4112,12 +4116,25 @@ fn register_https_url_connection(r: &mut NativeMethodRegistry) {
                 }
                 visited += 1;
                 let cid = ctx.class_id_of_object(obj);
+                if dbg {
+                    eprintln!(
+                        "[dbg-tls-auth] MYFIX depth={} obj_ih={} cid={:?} nfields={}",
+                        depth,
+                        ctx.identity_hash_code(obj),
+                        cid,
+                        ctx.class_num_total_fields(cid)
+                    );
+                }
                 if sslcontext_cid == Some(cid) {
                     return Some(obj);
                 }
                 let nfields = ctx.class_num_total_fields(cid);
                 for i in 0..nfields {
-                    if let Value::Object(Some(candidate)) = ctx.get_field(obj, i) {
+                    let fv = ctx.get_field(obj, i);
+                    if dbg {
+                        eprintln!("[dbg-tls-auth] MYFIX   field[{}]={:?}", i, fv);
+                    }
+                    if let Value::Object(Some(candidate)) = fv {
                         let sub_cid = ctx.class_id_of_object(candidate);
                         if sslcontext_cid == Some(sub_cid) {
                             return Some(candidate);
