@@ -944,6 +944,38 @@ pub(crate) fn deposit_gap_diff(
     });
 }
 
+thread_local! {
+    static PUSH_PROV_RING: std::cell::RefCell<Vec<(usize, String)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Record an invoke-return Object push with its call-site description.
+pub(crate) fn push_prov_record(addr: usize, site: &str) {
+    if !remap_trace_on() {
+        return;
+    }
+    PUSH_PROV_RING.with(|r| {
+        let mut r = r.borrow_mut();
+        if r.len() >= 128 {
+            r.drain(..32);
+        }
+        r.push((addr, site.to_string()));
+    });
+}
+
+/// Probe recent invoke-return pushes for `addr`: (pushes-ago, site).
+pub(crate) fn push_prov_find(addr: usize) -> Vec<(usize, String)> {
+    PUSH_PROV_RING.with(|r| {
+        let r = r.borrow();
+        let n = r.len();
+        r.iter()
+            .enumerate()
+            .filter(|(_, (a, _))| *a == addr)
+            .map(|(i, (_, s))| (n - i, s.clone()))
+            .collect()
+    })
+}
+
 /// Probe the deposit-gap ring for `addr`: (entries-ago, description).
 pub(crate) fn deposit_gap_find(addr: usize) -> Vec<(usize, String)> {
     DEPOSIT_GAP_RING.with(|r| {
@@ -18940,6 +18972,11 @@ fn push_invoke_return_value(
     stack: &mut crate::runtime::ValueStack,
     value: Value,
 ) -> Result<(), RuntimeError> {
+    if remap_trace_on() {
+        if let Value::Object(Some(o)) = &value {
+            push_prov_record(o.as_ptr() as usize, "invoke-ret");
+        }
+    }
     match value {
         Value::Long(x) => {
             // Mark KIND_LONG so the caller's subsequent `pop_long` reads the
@@ -20034,6 +20071,11 @@ fn execute_invoke_kind(
                                     {
                                         eprintln!(
                                             "[stale-recv] [gcpart] epoch={e} map_len={mlen} moved_to={moved_to:x?} appears_as_dest={as_dest}"
+                                        );
+                                    }
+                                    for (ago, site) in push_prov_find(stale_addr) {
+                                        eprintln!(
+                                            "[stale-recv] [pushprov] pushed {ago} invoke-returns ago at {site}"
                                         );
                                     }
                                     for (ago, desc) in deposit_gap_find(stale_addr) {

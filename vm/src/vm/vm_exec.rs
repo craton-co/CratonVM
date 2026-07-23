@@ -17699,6 +17699,9 @@ fn invoke_on_class_shared_inner(
                                 "  NSME-RECV [gcpart] epoch={e} map_len={mlen} moved_to={moved_to:x?} appears_as_dest={as_dest}"
                             );
                         }
+                        for (ago, site) in crate::runtime::interpreter::push_prov_find(addr) {
+                            eprintln!("  NSME-RECV [pushprov] pushed {ago} invoke-returns ago at {site}");
+                        }
                         for (ago, desc) in crate::runtime::interpreter::deposit_gap_find(addr) {
                             eprintln!("  NSME-RECV [deposit-gap] {ago} entries ago: {desc}");
                         }
