@@ -10,22 +10,30 @@ on the Azure host. All of this is against the Linux Tomcat fixture at
 `/data/data/apps/tomcat`), reusable Linux runner at
 `apps/tomcat-suite-runner/run-tomcat-suite.sh`.
 
-## Fixture-completion work (not CratonVM bugs — do these to unblock real testing)
+## Fixture-completion work — ALL 6 IMPLEMENTED 2026-07-23
 
-| Doc | Classes | Fix effort |
+| Doc | Classes | Outcome |
 |---|---:|---|
-| [missing-antjar-classpath.md](missing-antjar-classpath.md) | 2 | Trivial — add a jar |
-| [missing-httpd-binary.md](missing-httpd-binary.md) | 8 | Small — install + configure `httpd` |
-| [largeheap-flat-heap-oom.md](largeheap-flat-heap-oom.md) | 3 | Trivial — exclude or bump per-class `-Xmx` |
-| [missing-catalina-localhost-context-configs.md](missing-catalina-localhost-context-configs.md) | 8 | Small — stage 2 XML files |
-| [missing-build-lib-jars.md](missing-build-lib-jars.md) | 1 | Small — run `ant package`/`deploy` |
-| [unbuilt-virtual-webapp-submodule.md](unbuilt-virtual-webapp-submodule.md) | 1 | Small — `mvn compile` one submodule |
+| [missing-antjar-classpath.md](missing-antjar-classpath.md) | 2 | ✅ Fixed — 1 PASS both, 1 revealed a real regression |
+| [missing-httpd-binary.md](missing-httpd-binary.md) | 8 | ✅ Fully fixed — all 8 PASS both VMs, no regressions |
+| [largeheap-flat-heap-oom.md](largeheap-flat-heap-oom.md) | 3 | ⚠️ Partial — 2 now PASS HotSpot/reveal regressions, 1 still fails both (narrower) |
+| [missing-catalina-localhost-context-configs.md](missing-catalina-localhost-context-configs.md) | 8 | ⚠️ Root-cause theory was wrong (see doc) — real fix was the lib-jars doc below; 2 PASS both, 6 revealed regressions |
+| [missing-build-lib-jars.md](missing-build-lib-jars.md) | 1 | ✅ Fixed via `ant deploy` — also fixed most of the "conf/Catalina/localhost" bucket above |
+| [unbuilt-virtual-webapp-submodule.md](unbuilt-virtual-webapp-submodule.md) | 1 | ⚠️ Root-cause theory was wrong (no Maven module) — one method now passes, a second method reveals a narrower regression |
 
-**23 of the 35 non-PASS classes** in this bucket are blocked purely on fixture
-work above, not investigation. Completing all six items would very plausibly
-turn some into real CratonVM regressions (as happened when the CWD harness
-bug fix alone reclassified ~65 previously-miscounted classes) — treat a
-PASS after fixture completion as the expected/good outcome, not a surprise.
+As predicted, completing these turned several into real CratonVM
+regressions rather than clean passes — see
+[regressions-revealed-by-fixture-completion-20260723.md](regressions-revealed-by-fixture-completion-20260723.md)
+for the full accounting: **12 PASS both VMs / 9 confirmed CratonVM-only
+regressions / 2 still fail on both (different, narrower reasons than
+originally documented)**. One regression was root-caused precisely: a `%20`
+in a file path isn't decoded back to a space when CratonVM resolves a
+`file:` URL, breaking `TestDeployTask`.
+
+Note: none of this fixture work is git-tracked — it all lives on the Azure
+host (`/data/data/apps/tomcat`, i.e. `/data/data/tomcat-dohead-fixture-20260717`).
+A future session rebuilding this fixture from scratch needs to redo these
+steps (see each doc's "RESOLVED" note for the exact commands).
 
 ## Needs investigation, not yet root-caused
 
