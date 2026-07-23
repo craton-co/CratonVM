@@ -4,6 +4,33 @@ This folder collects CratonVM-only defects found while running upstream Java
 suites. The docs had grown to describe the **same underlying bug from several
 angles**; this index is the consolidated map. Read it first.
 
+## 2026-07-23 Tomcat 9-class HANG-classification doc — FIXED, moved to internal
+
+FIXED (moved to `docs/internal/fixed-suite-bugs/tomcat/`):
+[`hang-classification-unconfirmed-host-contention-FIXED.md`](../internal/fixed-suite-bugs/tomcat/hang-classification-unconfirmed-host-contention-FIXED.md)
+— reran the 9 classes flagged as "HANG classification unconfirmed due to
+host contention" under both HotSpot and CratonVM. HotSpot passed all 9
+cleanly (confirming the original HANG was indeed a contention artifact),
+but CratonVM failed all 9 with real, fast, deterministic errors from two
+independent root causes: (1) a `Hashtable.size()` field-index collision
+breaking ecj's JSP compilation (`CompilationResult.getClassFiles()` NPE),
+affecting 8 of the 9 classes — same bug a concurrent session root-caused
+and fixed (commits `744401af4`/`b854dc01f`, cherry-picked here) while
+investigating a separate fixture-completion doc; and (2) a new bug,
+`HttpsURLConnection.setDefaultSSLSocketFactory` not unwrapping a real
+bytecode subclass that delegates to CratonVM's own synthetic
+`SSLSocketFactory` carrier (Tomcat's own `TesterSupport
+.ClientSSLSocketFactory` test helper), causing every `ctx_obj_key`-keyed
+trust-manager/identity lookup to silently miss and the client to reject the
+test's self-signed CA (`SSLHandshakeException: ... UnknownIssuer`) —
+affecting `TestCustomSsl`. Fixed via a new `resolve_sslcontext_from_factory`
+bounded-BFS resolver in `native-builtins/src/t27_tls.rs` that also worked
+around two related metadata-reporting gaps (`class_name_of_id` and
+`class_num_total_fields` both misreport for the abstract-typed synthetic
+carrier). Verified: all 9 classes PASS cleanly on CratonVM on a genuinely
+quiet host (`uptime` load 6-13 on 16 cores) with the standard 300s per-class
+timeout, matching HotSpot exactly.
+
 ## 2026-07-24 Tomcat suite — fixture gaps + one real bug, split into 9 actionable docs
 
 New subfolder: [`tomcat/`](tomcat/README.md). Split out of
