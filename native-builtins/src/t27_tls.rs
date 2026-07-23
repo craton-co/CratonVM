@@ -4080,38 +4080,56 @@ fn register_https_url_connection(r: &mut NativeMethodRegistry) {
     // key managers, identity) then silently missed for a completely
     // unrelated object's identity, and the client fell back to the platform
     // default trust store — rejecting the test's self-signed CA with
-    // `SSLHandshakeException: ... UnknownIssuer`. Recurse through any number
-    // of such wrapper layers (bounded) instead of assuming a fixed depth.
+    // `SSLHandshakeException: ... UnknownIssuer`.
+    //
+    // Match by `ClassId` (via a single `class_id_by_name` lookup), NOT by
+    // `class_name_of_id` on each candidate object: `alloc_concurrent_synthetic`
+    // itself documents that `class_name_of_id` can misreport an
+    // interface-like synthetic class (this carrier's declared type,
+    // `SSLSocketFactory`, is abstract) back as `java/lang/Object` — a
+    // name-string comparison at each node silently found nothing and this
+    // first attempt returned `None` every time, never actually resolving the
+    // wrapped SSLContext. `class_id_by_name` performed ONCE up front and
+    // compared by `ClassId` equality is immune to that per-object name
+    // misreport. Also explore EVERY reachable Object-typed field (bounded
+    // breadth/depth) rather than trying to first guess which one is
+    // "SSLSocketFactory-shaped" — that guess is exactly what needed the
+    // now-unreliable name check.
     fn resolve_sslcontext_from_factory(
         ctx: &mut dyn cratonvm_native_api::NativeContext,
         factory: ObjectRef,
     ) -> Option<ObjectRef> {
-        const MAX_DEPTH: usize = 8;
-        const SSL_CONTEXT: &str = "javax/net/ssl/SSLContext";
-        let mut current = factory;
+        const MAX_DEPTH: usize = 6;
+        const MAX_VISITED: usize = 64;
+        let sslcontext_cid = ctx.class_id_by_name("javax/net/ssl/SSLContext");
+        let mut frontier = vec![factory];
+        let mut visited = 0usize;
         for _ in 0..MAX_DEPTH {
-            let cid = ctx.class_id_of_object(current);
-            if ctx.class_name_of_id(cid).as_deref() == Some(SSL_CONTEXT) {
-                return Some(current);
-            }
-            let nfields = ctx.class_num_total_fields(cid);
-            let mut next = None;
-            for i in 0..nfields {
-                if let Value::Object(Some(candidate)) = ctx.get_field(current, i) {
-                    let sub_cid = ctx.class_id_of_object(candidate);
-                    let sub_name = ctx.class_name_of_id(sub_cid).unwrap_or_default();
-                    if sub_name == SSL_CONTEXT {
-                        return Some(candidate);
-                    }
-                    if next.is_none() && sub_name.ends_with("SSLSocketFactory") {
-                        next = Some(candidate);
+            let mut next_frontier = Vec::new();
+            for obj in frontier {
+                if visited >= MAX_VISITED {
+                    return None;
+                }
+                visited += 1;
+                let cid = ctx.class_id_of_object(obj);
+                if sslcontext_cid == Some(cid) {
+                    return Some(obj);
+                }
+                let nfields = ctx.class_num_total_fields(cid);
+                for i in 0..nfields {
+                    if let Value::Object(Some(candidate)) = ctx.get_field(obj, i) {
+                        let sub_cid = ctx.class_id_of_object(candidate);
+                        if sslcontext_cid == Some(sub_cid) {
+                            return Some(candidate);
+                        }
+                        next_frontier.push(candidate);
                     }
                 }
             }
-            match next {
-                Some(candidate) => current = candidate,
-                None => return None,
+            if next_frontier.is_empty() {
+                return None;
             }
+            frontier = next_frontier;
         }
         None
     }
