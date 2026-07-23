@@ -169,6 +169,11 @@ with enough trials, not a deterministic CratonVM regression. Not
 investigated further; flag for the next session only if it recurs with a
 reproducible seed.
 
+**Reconfirmed clean, eighth pass (2026-07-23)**: ran again for ~4 minutes
+(`testIn`/`testInSelect`/`testGroupSorted`, dozens more random seeds) —
+exit 0, zero reproductions, consistent with every prior session's finding.
+No further action; characterization stands.
+
 ## `org.h2.test.db.TestLinkedTable` (`testHiddenSQL`) — password redaction / SQL text mismatch — **FIXED (2026-07-22 follow-up)**
 Root-caused to a **`SQLException.toString()` vs `getMessage()` divergence**:
 `getMessage()` (called directly) correctly returns the full H2-formatted
