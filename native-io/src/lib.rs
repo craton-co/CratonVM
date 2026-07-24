@@ -8704,6 +8704,11 @@ fn dis_read_exact(
     let buf = ctx.new_array(ArrayElementType::Byte, len);
     let buf_pin = ctx.pin_native_root(buf);
     let mut buf = buf;
+    // `new_array` can collect and relocate the wrapped stream. The pin keeps
+    // it live, but ObjectRef is an address-like handle in the moving heap, so
+    // reload it before the first virtual read just as the loop does after
+    // every subsequent GC-capable call.
+    inner = ctx.read_native_pin(inner_pin, inner);
     let mut total = 0usize;
     while total < len {
         let remaining = (len - total) as i32;
@@ -15212,6 +15217,26 @@ fn afc_file_size(id: u32) -> io::Result<u64> {
     Ok(handle.file.metadata()?.len())
 }
 
+fn afc_file_writable(id: u32) -> bool {
+    match afc_file_entry(id) {
+        Ok(entry) => entry.lock().writable,
+        Err(_) => false,
+    }
+}
+
+/// Real AsynchronousFileChannel.truncate() contract (same as
+/// FileChannel.truncate(): no-op when the requested size is >= the
+/// current file size, only ever shrinks.
+fn afc_truncate_at(id: u32, new_len: u64) -> io::Result<()> {
+    let entry = afc_file_entry(id)?;
+    let handle = entry.lock();
+    let cur_len = handle.file.metadata()?.len();
+    if new_len < cur_len {
+        handle.file.set_len(new_len)?;
+    }
+    Ok(())
+}
+
 /// WatchService layout: 3 fields
 /// [0] = registrations (Object — array of WatchKey objects)
 /// [1] = count (Int)
@@ -15414,6 +15439,43 @@ fn register_async_file_channel(r: &mut NativeMethodRegistry) {
         native_afc_write_handler,
     );
 
+    // tryLock(long position, long size, boolean shared) → FileLock
+    //
+    // AsynchronousFileChannel declares this as its own abstract method
+    // (distinct from the no-arg, Future<FileLock>-returning lock()/
+    // tryLock() pair above) -- nothing in native-io or native-builtins
+    // registered it, so it had no Code attribute and any real bytecode
+    // caller (H2's FileAsync.tryLock -> channel.tryLock(pos, size,
+    // shared), reached via FileChannel.tryLock() -> the abstract
+    // FileAsync override, from TestFileSystem.testSimple) hit
+    // AbstractMethodError. Reuse the same OS-advisory-lock plumbing as
+    // FileChannel.tryLock (try_acquire_file_lock/alloc_file_lock), keyed
+    // off AFC_FIELD_FD instead of the FileChannelImpl fd lookup.
+    r.register(
+        afc,
+        "tryLock",
+        "(JJZ)Ljava/nio/channels/FileLock;",
+        native_afc_try_lock,
+    );
+    // truncate(long) -> AsynchronousFileChannel. Previously unregistered
+    // here, so native-builtins' no-op passthrough (`|_, args| Ok(args[0])`)
+    // was the only registrant -- it never checked writability, letting
+    // TestFileSystem.testSimple's "truncate on a read-only async channel
+    // must throw NonWritableChannelException" case silently "succeed"
+    // instead (same bug class as the tryLock/write fixes above).
+    r.register(
+        afc,
+        "truncate",
+        "(J)Ljava/nio/channels/AsynchronousFileChannel;",
+        native_afc_truncate,
+    );
+    r.register(
+        "sun/nio/ch/FileLockImpl",
+        "release",
+        "()V",
+        native_file_lock_impl_release,
+    );
+
     // size() → long
     r.register(afc, "size", "()J", native_afc_size);
 
@@ -15455,6 +15517,182 @@ fn register_async_file_channel(r: &mut NativeMethodRegistry) {
         native_completed_future_get,
     );
     r.set_category(__prev_cat);
+}
+
+fn native_afc_try_lock(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg92(args, 0)?;
+
+    if !matches!(ctx.get_field(this, AFC_FIELD_OPEN), Value::Int(1)) {
+        return Err(RuntimeError::IOException {
+            message: "AsynchronousFileChannel is closed".into(),
+        }
+        .into());
+    }
+
+    let position = afc_position_arg(args, 1)? as i64;
+    let size = match args.get(2) {
+        Some(Value::Long(v)) => *v,
+        _ => i64::MAX,
+    };
+    let shared = args.get(3).and_then(|v| v.as_int()).unwrap_or(0) != 0;
+
+    // Build a REAL sun/nio/ch/FileLockImpl via its
+    // (AsynchronousFileChannel, long, long, boolean) constructor -- NOT
+    // the synthetic alloc_file_lock() FL_FIELD_* layout used by the
+    // #[cfg(feature = "synthetic-jdk")]-only FileChannel.lock()/tryLock()
+    // path above. That synthetic layout's own position()/size()/isValid()/
+    // release() natives are compiled out entirely in real-JDK builds
+    // (registering them unconditionally would shadow the real
+    // FileLockImpl bytecode that regular FileChannel.tryLock() already
+    // depends on -- see the big comment on register_nio_channel_extras).
+    // A real FileLockImpl gives isValid()/position()/size()/isShared()/
+    // channel()/close() for free via real bytecode; only release() needs
+    // a companion override below, since its real bytecode does an
+    // instanceof FileChannelImpl / AsynchronousFileChannelImpl dispatch
+    // that our synthetic AFC class matches neither of.
+    let lock = match ctx.new_object("sun/nio/ch/FileLockImpl") {
+        Ok(Some(Value::Object(Some(o)))) => o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    ctx.invoke(
+        "sun/nio/ch/FileLockImpl",
+        "<init>",
+        "(Ljava/nio/channels/AsynchronousFileChannel;JJZ)V",
+        &[
+            Value::Object(Some(lock)),
+            Value::Object(Some(this)),
+            Value::Long(position),
+            Value::Long(size),
+            Value::Int(if shared { 1 } else { 0 }),
+        ],
+    )?;
+    Ok(Some(Value::Object(Some(lock))))
+}
+
+fn native_afc_truncate(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg92(args, 0)?;
+
+    if !matches!(ctx.get_field(this, AFC_FIELD_OPEN), Value::Int(1)) {
+        return Err(RuntimeError::IOException {
+            message: "AsynchronousFileChannel is closed".into(),
+        }
+        .into());
+    }
+
+    let handle_id = match ctx.get_field(this, AFC_FIELD_FD) {
+        Value::Int(v) if v > 0 => v as u32,
+        _ => return Ok(Some(Value::Object(Some(this)))),
+    };
+
+    if !afc_file_writable(handle_id) {
+        return match ctx.new_object("java/nio/channels/NonWritableChannelException") {
+            Ok(Some(Value::Object(Some(exc)))) => {
+                let _ = ctx.invoke(
+                    "java/nio/channels/NonWritableChannelException",
+                    "<init>",
+                    "()V",
+                    &[Value::Object(Some(exc))],
+                );
+                Err(MethodCallFailed::ExceptionThrown(exc))
+            }
+            _ => Err(RuntimeError::IOException {
+                message: "channel was not opened for writing".into(),
+            }
+            .into()),
+        };
+    }
+
+    let new_len = match args.get(1) {
+        Some(Value::Long(v)) => (*v).max(0) as u64,
+        _ => 0,
+    };
+    // STW-TAKEOVER guard -- see the matching comment in native_afc_read.
+    // `this` isn't touched again after this call, but the ObjectRef we
+    // ultimately return must reflect any relocation from a GC that ran
+    // while blocked.
+    let mut blocked_refs = [Value::Object(Some(this))];
+    ctx.begin_blocking_region();
+    let truncate_result = afc_truncate_at(handle_id, new_len);
+    ctx.end_blocking_region_refs(&mut blocked_refs);
+    let this = match blocked_refs[0] {
+        Value::Object(Some(o)) => o,
+        _ => this,
+    };
+    truncate_result.map_err(|e| RuntimeError::IOException {
+        message: format!("async truncate: {e}"),
+    })?;
+    Ok(Some(Value::Object(Some(this))))
+}
+
+/// sun/nio/ch/FileLockImpl.release() -- class-level override.
+///
+/// Real bytecode: if !channel.isOpen() throw ClosedChannelException; if
+/// isValid(), dispatch to `FileChannelImpl.release(this)` or
+/// `AsynchronousFileChannelImpl.release(this)` by instanceof, else
+/// AssertionError; then invalidate(). Registering directly on the
+/// concrete FileLockImpl class shadows that real bytecode for EVERY
+/// FileLockImpl instance (including ones built by real FileChannel.
+/// tryLock(), whose flow already worked correctly via pure real bytecode
+/// before this registration existed) -- so this replicates that exact
+/// control flow instead of narrowing it, and only substitutes real
+/// behavior for the one case with no real counterpart: our synthetic
+/// (literal-class-named) AsynchronousFileChannel from native_afc_try_lock
+/// above, which is neither a real FileChannelImpl nor a real
+/// AsynchronousFileChannelImpl and would otherwise hit the bytecode's
+/// AssertionError branch.
+fn native_file_lock_impl_release(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg92(args, 0)?;
+    let channel = match ctx.get_field_by_name(this, "channel") {
+        Value::Object(Some(c)) => c,
+        _ => return Ok(None),
+    };
+
+    let is_open = matches!(
+        ctx.invoke_virtual(channel, "isOpen", "()Z", &[]),
+        Ok(Some(Value::Int(1)))
+    );
+    if !is_open {
+        return match ctx.new_object("java/nio/channels/ClosedChannelException") {
+            Ok(Some(Value::Object(Some(exc)))) => {
+                let _ = ctx.invoke(
+                    "java/nio/channels/ClosedChannelException",
+                    "<init>",
+                    "()V",
+                    &[Value::Object(Some(exc))],
+                );
+                Err(MethodCallFailed::ExceptionThrown(exc))
+            }
+            _ => Err(RuntimeError::IOException {
+                message: "Channel closed".into(),
+            }
+            .into()),
+        };
+    }
+
+    let is_valid = matches!(
+        ctx.invoke_virtual(this, "isValid", "()Z", &[]),
+        Ok(Some(Value::Int(1)))
+    );
+    if is_valid {
+        let channel_class = ctx.class_name_of_id(ctx.class_id_of_object(channel));
+        if channel_class.as_deref() != Some("java/nio/channels/AsynchronousFileChannel") {
+            // Real FileChannelImpl (the only other producer of a real
+            // FileLockImpl in this codebase) -- replicate the bytecode's
+            // FileChannelImpl.release(this) call exactly.
+            let _ = ctx.invoke(
+                "sun/nio/ch/FileChannelImpl",
+                "release",
+                "(Lsun/nio/ch/FileLockImpl;)V",
+                &[Value::Object(Some(channel)), Value::Object(Some(this))],
+            );
+        }
+        // Our synthetic AsynchronousFileChannel case: no per-channel lock
+        // table to update (native_afc_try_lock never registered one) --
+        // invalidate() below is the entire effect, matching the contract
+        // that a released lock reports isValid() == false afterward.
+        ctx.invoke_virtual(this, "invalidate", "()V", &[])?;
+    }
+    Ok(None)
 }
 
 fn alloc_afc_channel(
@@ -15517,7 +15755,15 @@ fn native_afc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
 
     let handle_id = match ctx.get_field(this, AFC_FIELD_FD) {
         Value::Int(v) if v > 0 => v as u32,
-        _ => return Ok(Some(Value::Int(-1))),
+        // Future<Integer>.get() real bytecode does checkcast Integer on
+        // this return value -- a bare Value::Int here (as opposed to
+        // going through wrap_completed_future+afc_box_integer like every
+        // other exit point) crashes the VM instead of raising. Box +
+        // wrap like the rest of this function.
+        _ => {
+            let boxed = afc_box_integer(ctx, -1);
+            return Ok(Some(wrap_completed_future(ctx, boxed)));
+        }
     };
 
     let view = bb_storage_view(ctx, bb)?;
@@ -15525,23 +15771,59 @@ fn native_afc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     let lim = view.lim;
     let remaining = (lim - pos) as usize;
     if remaining == 0 {
-        return Ok(Some(wrap_completed_future(ctx, Value::Int(0))));
+        let boxed = afc_box_integer(ctx, 0);
+        return Ok(Some(wrap_completed_future(ctx, boxed)));
     }
 
     let mut buf = vec![0u8; remaining];
-    let n = afc_read_at(handle_id, &mut buf, position).map_err(|e| RuntimeError::IOException {
+    // STW-TAKEOVER guard (same class of bug as the documented
+    // AsynchronousSocketChannel.read/write fix elsewhere in this file):
+    // afc_read_at parks on a real Mutex::lock() around genuinely blocking
+    // disk I/O. Under testConcurrent's tight two-thread read/write loop
+    // (H2 TestFileSystem, "async:" filesystem) contention on that mutex
+    // is real, and without a GC-safepoint-cooperation bracket a
+    // concurrent STW pause waits forever for this thread to reach an
+    // interpreter safepoint it never hits while parked in the lock/I-O
+    // call -- observed as TestFileSystem hanging at the 300s harness
+    // timeout instead of completing. `bb` is used again after the call
+    // (bb_write_byte/buf_set_position below), so it must survive any GC
+    // that ran while blocked; re-derive `view` from the refreshed `bb`
+    // rather than reusing the pre-block one, in case a moving GC
+    // relocated its backing array too.
+    let mut blocked_refs = [Value::Object(Some(bb))];
+    ctx.begin_blocking_region();
+    let read_result = afc_read_at(handle_id, &mut buf, position);
+    ctx.end_blocking_region_refs(&mut blocked_refs);
+    let bb = match blocked_refs[0] {
+        Value::Object(Some(o)) => o,
+        _ => bb,
+    };
+    let n = read_result.map_err(|e| RuntimeError::IOException {
         message: format!("async read: {e}"),
     })?;
 
     if n == 0 {
-        return Ok(Some(wrap_completed_future(ctx, Value::Int(-1))));
+        let boxed = afc_box_integer(ctx, -1);
+        return Ok(Some(wrap_completed_future(ctx, boxed)));
     }
 
+    let view = bb_storage_view(ctx, bb)?;
     for (i, &b) in buf.iter().enumerate().take(n) {
         bb_write_byte(ctx, view, pos as usize + i, b)?;
     }
     buf_set_position(ctx, bb, pos + n as i32);
-    Ok(Some(wrap_completed_future(ctx, Value::Int(n as i32))))
+    // BUG (async read/write Future path, found via H2
+    // TestFileSystem.testConcurrent against the "async:" filesystem):
+    // this used to pass a bare Value::Int straight into
+    // wrap_completed_future. Future<Integer>.get() real bytecode does
+    // checkcast Integer on the result, so a caller like H2's
+    // FileAsync.write -> complete(future) crashed the VM with "internal
+    // error: checkcast: not an object reference" instead of getting a
+    // proper Integer. The sibling CompletionHandler-based overloads
+    // below already box via afc_box_integer -- this just brings the
+    // plain Future overload in line with that established pattern.
+    let boxed = afc_box_integer(ctx, n as i32);
+    Ok(Some(wrap_completed_future(ctx, boxed)))
 }
 
 fn native_afc_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -15558,26 +15840,76 @@ fn native_afc_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
 
     let handle_id = match ctx.get_field(this, AFC_FIELD_FD) {
         Value::Int(v) if v > 0 => v as u32,
-        _ => return Ok(Some(Value::Int(-1))),
+        // See the matching arm in native_afc_read: must be a boxed
+        // Integer inside a real completed Future, not a bare Value::Int.
+        _ => {
+            let boxed = afc_box_integer(ctx, -1);
+            return Ok(Some(wrap_completed_future(ctx, boxed)));
+        }
     };
+
+    // Real AsynchronousFileChannel.write() contract: throws
+    // NonWritableChannelException (not a generic IOException) when the
+    // channel was opened without WRITE. afc_write_at already refuses the
+    // OS-level write for a non-writable handle, but it surfaces that as a
+    // raw PermissionDenied IOException -- H2's TestFileSystem.testSimple
+    // opens the "async:" filesystem's channel read-only and expects
+    // fc.write() to throw NonWritableChannelException specifically
+    // (assertThrows(NonWritableChannelException.class, ...)), matching
+    // the same contract already enforced for the plain (non-async)
+    // FileChannel path.
+    if !afc_file_writable(handle_id) {
+        return match ctx.new_object("java/nio/channels/NonWritableChannelException") {
+            Ok(Some(Value::Object(Some(exc)))) => {
+                let _ = ctx.invoke(
+                    "java/nio/channels/NonWritableChannelException",
+                    "<init>",
+                    "()V",
+                    &[Value::Object(Some(exc))],
+                );
+                Err(MethodCallFailed::ExceptionThrown(exc))
+            }
+            _ => Err(RuntimeError::IOException {
+                message: "channel was not opened for writing".into(),
+            }
+            .into()),
+        };
+    }
 
     let view = bb_storage_view(ctx, bb)?;
     let pos = view.pos;
     let lim = view.lim;
     let remaining = (lim - pos) as usize;
     if remaining == 0 {
-        return Ok(Some(wrap_completed_future(ctx, Value::Int(0))));
+        let boxed = afc_box_integer(ctx, 0);
+        return Ok(Some(wrap_completed_future(ctx, boxed)));
     }
 
     let mut data = vec![0u8; remaining];
     bb_read_bytes(ctx, view, pos as usize, &mut data)?;
 
-    let n = afc_write_at(handle_id, &data, position).map_err(|e| RuntimeError::IOException {
+    // STW-TAKEOVER guard -- see the matching comment in native_afc_read.
+    // `data` is Rust-owned (already copied out of the Java heap above), so
+    // only `bb` needs to survive the blocking window (buf_set_position
+    // below touches it again).
+    let mut blocked_refs = [Value::Object(Some(bb))];
+    ctx.begin_blocking_region();
+    let write_result = afc_write_at(handle_id, &data, position);
+    ctx.end_blocking_region_refs(&mut blocked_refs);
+    let bb = match blocked_refs[0] {
+        Value::Object(Some(o)) => o,
+        _ => bb,
+    };
+    let n = write_result.map_err(|e| RuntimeError::IOException {
         message: format!("async write: {e}"),
     })?;
 
     buf_set_position(ctx, bb, pos + n as i32);
-    Ok(Some(wrap_completed_future(ctx, Value::Int(n as i32))))
+    // See native_afc_read above for the full rationale: box before
+    // wrapping, matching the CompletionHandler overloads' afc_box_integer
+    // usage, so Future<Integer>.get()'s checkcast Integer succeeds.
+    let boxed = afc_box_integer(ctx, n as i32);
+    Ok(Some(wrap_completed_future(ctx, boxed)))
 }
 
 fn afc_box_integer(ctx: &mut dyn NativeContext, n: i32) -> Value {

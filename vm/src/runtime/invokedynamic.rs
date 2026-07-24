@@ -1090,6 +1090,63 @@ fn execute_cached_lambda(
     )
 }
 
+// Zero-capture lambda singleton cache — mirrors real HotSpot's
+// `InnerClassLambdaMetafactory` behaviour of caching a single `INSTANCE`
+// per spun lambda class when the lambda captures nothing. Some code
+// (Spring AOT's bean-override identity check across an original context
+// and its AOT-replayed context) depends on `==`/`.equals()` identity
+// holding for two separate invocations of the same non-capturing lambda
+// expression. `proxy_class_id` is a monotonically-increasing synthetic id
+// (`SharedVm::alloc_lambda_proxy_id`) that is never recycled, so unlike
+// the real (recyclable) `ClassId` space used for loaded classes, keying
+// this cache directly by `(vm_identity, proxy_class_id)` carries no
+// aliasing risk. GC-scanned/remapped the same way as the
+// `Integer.valueOf` cache in `native-builtins/src/lang_math.rs` (see
+// `gc_scan_lambda_singleton_roots` / `gc_update_lambda_singleton_refs`,
+// wired into `vm/src/memory/{roots.rs,gc.rs}`).
+static LAMBDA_SINGLETON_CACHE: std::sync::OnceLock<
+    parking_lot::Mutex<std::collections::HashMap<(usize, ClassId), ObjectRef>>,
+> = std::sync::OnceLock::new();
+
+fn lambda_singleton_cache(
+) -> &'static parking_lot::Mutex<std::collections::HashMap<(usize, ClassId), ObjectRef>> {
+    LAMBDA_SINGLETON_CACHE.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// GC root scan hook — called from `vm/src/memory/roots.rs`. Reports the
+/// cached zero-capture lambda singletons for the active VM so the GC keeps
+/// them live.
+pub fn gc_scan_lambda_singleton_roots(vm_identity: usize, out: &mut Vec<ObjectRef>) {
+    let cache = lambda_singleton_cache().lock();
+    for (&(vid, _), obj_ref) in cache.iter() {
+        if vid == vm_identity {
+            out.push(*obj_ref);
+        }
+    }
+}
+
+/// GC post-compaction hook — called from `vm/src/memory/gc.rs`. Remaps
+/// every cached singleton for the active VM through the GC's pointer map.
+pub fn gc_update_lambda_singleton_refs(
+    vm_identity: usize,
+    pointer_map: &std::collections::HashMap<usize, usize>,
+) {
+    if pointer_map.is_empty() {
+        return;
+    }
+    let mut cache = lambda_singleton_cache().lock();
+    for (&(vid, _), obj_ref) in cache.iter_mut() {
+        if vid != vm_identity {
+            continue;
+        }
+        let old_addr = obj_ref.as_ptr() as usize;
+        if let Some(&new_addr) = pointer_map.get(&old_addr) {
+            debug_assert!(new_addr != 0, "GC pointer map contains null address");
+            *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+        }
+    }
+}
+
 /// Pop captured values from the stack, allocate a lambda proxy object, push it.
 fn allocate_lambda_proxy(
     shared: &SharedVm,
@@ -1099,6 +1156,23 @@ fn allocate_lambda_proxy(
     capture_types: &[char],
 ) -> Result<(), MethodCallFailed> {
     let num_captures = capture_types.len();
+
+    // Fast path: a zero-capture call site whose singleton was already
+    // minted on a prior invocation just returns the cached instance —
+    // matches real HotSpot's cached-INSTANCE-field optimization for
+    // non-capturing lambdas (see LAMBDA_SINGLETON_CACHE above).
+    if num_captures == 0 {
+        if let Some(cached) = lambda_singleton_cache()
+            .lock()
+            .get(&(shared.vm_identity, proxy_class_id))
+            .copied()
+        {
+            thread.frames[frame_idx]
+                .stack
+                .push(Value::Object(Some(cached)))?;
+            return Ok(());
+        }
+    }
 
     // Pop captured values (pushed left-to-right, pop right-to-left)
     let mut captures: Vec<Value> = Vec::with_capacity(num_captures);
@@ -1172,6 +1246,14 @@ fn allocate_lambda_proxy(
 
     for (i, val) in captures.iter().enumerate() {
         shared.heap.set_field(proxy_ref, i, *val);
+    }
+
+    // Zero-capture call sites mint their singleton exactly once; every
+    // later invocation hits the fast path above instead.
+    if num_captures == 0 {
+        lambda_singleton_cache()
+            .lock()
+            .insert((shared.vm_identity, proxy_class_id), proxy_ref);
     }
 
     // Push the proxy object onto the stack

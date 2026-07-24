@@ -1264,72 +1264,7 @@ impl ClassPath {
         let __diag_npaths = paths.len();
         let mut entries = Vec::new();
         for raw in paths {
-            for p in Self::expand_classpath_wildcard(raw) {
-                // A URLClassLoader rooted at an archive subdirectory hands us
-                // `<archive>!/<prefix>/`. Handle it before interpreting the
-                // token as a filesystem path so `.war`/`.ear` archives retain
-                // their internal root for both class and resource lookup.
-                if let Some((archive, prefix)) = parse_jar_subdir_spec(&p) {
-                    let path = PathBuf::from(archive);
-                    if path.exists() {
-                        match read_file_for_classpath(&path) {
-                            Ok(data) => {
-                                if let Some(entry) =
-                                    Self::build_nested_directory_from_jar(&path, data, &prefix)
-                                {
-                                    entries.push(entry);
-                                }
-                            }
-                            Err(e) => {
-                                debug!(
-                                    "Failed to read nested classpath archive {}: {e}",
-                                    path.display()
-                                );
-                            }
-                        }
-                    } else {
-                        debug!(
-                            "Skipping missing nested classpath archive: {}",
-                            path.display()
-                        );
-                    }
-                    continue;
-                }
-                let path = PathBuf::from(&p);
-                if path.is_dir() {
-                    entries.push(ClassPathEntry::Directory(path));
-                } else if path.extension().is_some_and(|ext| ext == "jmod") && path.exists() {
-                    match Self::load_jmod(&path) {
-                        Ok(entry) => entries.push(entry),
-                        Err(e) => debug!("Failed to read JMOD {}: {e}", path.display()),
-                    }
-                } else if Self::is_likely_jimage(&path) {
-                    // NEW-5: the JDK 9+ runtime image at `$JAVA_HOME/lib/modules`
-                    // is a single jimage blob. Detection is by file name
-                    // (`modules` under any directory) plus a magic-number
-                    // verification inside `load_jimage`. The explicit file
-                    // name check lets users write `-cp /path/to/lib/modules`
-                    // without having to pass a special flag.
-                    match Self::load_jimage(&path) {
-                        Ok(entry) => entries.push(entry),
-                        Err(e) => debug!("Failed to read jimage {}: {e}", path.display()),
-                    }
-                } else if path.is_file() {
-                    // A URLClassLoader treats every existing file URL as an
-                    // archive candidate, regardless of its suffix. Hibernate's
-                    // packaged-bootstrap tests use `.par`/`.war`/`.ear` ZIPs;
-                    // accepting only `.jar` here made the per-loader resolver
-                    // silently lose their resources while `add_path` accepted
-                    // the same URLs. `load_jar_data` fails closed for ordinary
-                    // non-archive files, so the broader admission is safe.
-                    match read_file_for_classpath(&path) {
-                        Ok(data) => Self::load_jar_data(&path, data, &mut entries),
-                        Err(e) => debug!("Failed to read classpath archive {}: {e}", path.display()),
-                    }
-                } else {
-                    debug!("Skipping non-existent classpath entry: {p}");
-                }
-            }
+            Self::process_classpath_token(raw, &mut entries, 0);
         }
         if let Some(t0) = __diag_start {
             static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1468,13 +1403,126 @@ impl ClassPath {
         }
     }
 
+    /// Resolve a single classpath token (wildcard, jar-subdir spec,
+    /// directory, jmod, jimage, or plain jar/file) into `entries`. Shared by
+    /// [`ClassPath::new`]'s top-level path list (`depth=0`) and by a plain
+    /// jar's own manifest `Class-Path:` expansion (`depth=parent_depth+1`,
+    /// see [`ClassPath::load_jar_data_at_depth`]).
+    fn process_classpath_token(raw: &str, entries: &mut Vec<ClassPathEntry>, depth: u32) {
+        for p in Self::expand_classpath_wildcard(raw) {
+            // A URLClassLoader rooted at an archive subdirectory hands us
+            // `<archive>!/<prefix>/`. Handle it before interpreting the
+            // token as a filesystem path so `.war`/`.ear` archives retain
+            // their internal root for both class and resource lookup.
+            if let Some((archive, prefix)) = parse_jar_subdir_spec(&p) {
+                let path = PathBuf::from(archive);
+                if path.exists() {
+                    match read_file_for_classpath(&path) {
+                        Ok(data) => {
+                            if let Some(entry) =
+                                Self::build_nested_directory_from_jar(&path, data, &prefix)
+                            {
+                                entries.push(entry);
+                            }
+                        }
+                        Err(e) => {
+                            debug!(
+                                "Failed to read nested classpath archive {}: {e}",
+                                path.display()
+                            );
+                        }
+                    }
+                } else {
+                    debug!(
+                        "Skipping missing nested classpath archive: {}",
+                        path.display()
+                    );
+                }
+                continue;
+            }
+            let path = PathBuf::from(&p);
+            if path.is_dir() {
+                entries.push(ClassPathEntry::Directory(path));
+            } else if path.extension().is_some_and(|ext| ext == "jmod") && path.exists() {
+                match Self::load_jmod(&path) {
+                    Ok(entry) => entries.push(entry),
+                    Err(e) => debug!("Failed to read JMOD {}: {e}", path.display()),
+                }
+            } else if Self::is_likely_jimage(&path) {
+                // NEW-5: the JDK 9+ runtime image at `$JAVA_HOME/lib/modules`
+                // is a single jimage blob. Detection is by file name
+                // (`modules` under any directory) plus a magic-number
+                // verification inside `load_jimage`. The explicit file
+                // name check lets users write `-cp /path/to/lib/modules`
+                // without having to pass a special flag.
+                match Self::load_jimage(&path) {
+                    Ok(entry) => entries.push(entry),
+                    Err(e) => debug!("Failed to read jimage {}: {e}", path.display()),
+                }
+            } else if path.is_file() {
+                // A URLClassLoader treats every existing file URL as an
+                // archive candidate, regardless of its suffix. Hibernate's
+                // packaged-bootstrap tests use `.par`/`.war`/`.ear` ZIPs;
+                // accepting only `.jar` here made the per-loader resolver
+                // silently lose their resources while `add_path` accepted
+                // the same URLs. `load_jar_data` fails closed for ordinary
+                // non-archive files, so the broader admission is safe.
+                match read_file_for_classpath(&path) {
+                    Ok(data) => Self::load_jar_data_at_depth(&path, data, entries, depth),
+                    Err(e) => debug!("Failed to read classpath archive {}: {e}", path.display()),
+                }
+            } else {
+                debug!("Skipping non-existent classpath entry: {p}");
+            }
+        }
+    }
+
     /// Load a JAR from raw bytes, auto-detecting fat JAR structure.
     fn load_jar_data(path: &Path, data: Vec<u8>, entries: &mut Vec<ClassPathEntry>) {
+        Self::load_jar_data_at_depth(path, data, entries, 0);
+    }
+
+    /// Compatibility wrapper for legacy callers that still supply a manifest
+    /// expansion set. `load_jar_data_at_depth` now owns recursive manifest
+    /// processing and its depth guard, so the set is no longer needed here.
+    fn load_jar_data_with_manifest_class_path(
+        path: &Path,
+        data: Vec<u8>,
+        entries: &mut Vec<ClassPathEntry>,
+        _expanded_manifest_jars: &mut FxHashSet<PathBuf>,
+    ) {
+        Self::load_jar_data_at_depth(path, data, entries, 0);
+    }
+
+    /// Manifest `Class-Path:` expansion recursion cap — guards against a
+    /// cyclic chain (jar A's Class-Path names jar B, whose Class-Path names
+    /// A again) recursing forever. Real classpaths are never nested this
+    /// deep in practice.
+    const MAX_CLASS_PATH_MANIFEST_DEPTH: u32 = 16;
+
+    /// [`load_jar_data`], plus honouring a plain (non-fat) JAR's own
+    /// manifest `Class-Path:` attribute.
+    ///
+    /// Per the JAR spec, `Class-Path:` is honoured for ANY jar a
+    /// `URLClassLoader`/launcher opens, not just the process's initial
+    /// classpath — but until this fix, `vm-cli`'s one-time `--jar <path>`
+    /// bootstrap handling (`resolve_class_path`, `vm-cli/src/main.rs`) was
+    /// the ONLY caller that expanded it. A "pathing JAR" (a jar containing
+    /// no classes, only a manifest `Class-Path:` pointing at the real
+    /// dependency jars/dirs — used by e.g. the spring-boot-suite-runner to
+    /// dodge Windows' command-line length limit) loaded through this
+    /// general-purpose `ClassPath::new` path — the one every ad hoc
+    /// `URLClassLoader` (`ModifiedClassPathClassLoader`, custom test
+    /// classloaders, etc.) is built from — therefore silently resolved to
+    /// an unusable, effectively empty classpath: the pathing jar itself
+    /// has no class entries, and its `Class-Path:` was never followed.
+    fn load_jar_data_at_depth(path: &Path, data: Vec<u8>, entries: &mut Vec<ClassPathEntry>, depth: u32) {
         let cursor = Cursor::new(data);
         match ZipArchive::new(cursor) {
             Ok(mut archive) => {
                 // Check for MANIFEST.MF to detect Spring Boot fat JAR
                 let manifest = Self::read_manifest(&mut archive);
+                let manifest_class_path = manifest.resolve_class_path(path);
                 let is_fat_jar =
                     manifest.is_spring_boot() || Self::probe_fat_jar_structure(&mut archive);
 
@@ -1529,10 +1577,87 @@ impl ClassPath {
                         versions_cache: Mutex::new(None),
                         signer_cache: OnceLock::new(),
                     });
+                    if depth < Self::MAX_CLASS_PATH_MANIFEST_DEPTH {
+                        for token in manifest.resolve_class_path(path) {
+                            Self::process_classpath_token(&token, entries, depth + 1);
+                        }
+                    }
                 }
+
             }
             Err(e) => {
                 debug!("Failed to open JAR {}: {e}", path.display());
+            }
+        }
+    }
+
+    /// Add one classpath token, including wildcard expansion and any manifest
+    /// dependencies discovered while opening archives.
+    fn add_classpath_entry(
+        raw: &str,
+        entries: &mut Vec<ClassPathEntry>,
+        expanded_manifest_jars: &mut FxHashSet<PathBuf>,
+    ) {
+        for p in Self::expand_classpath_wildcard(raw) {
+            // A URLClassLoader rooted at an archive subdirectory hands us
+            // `<archive>!/<prefix>/`. Handle it before interpreting the token
+            // as a filesystem path so `.war`/`.ear` archives retain their
+            // internal root for both class and resource lookup.
+            if let Some((archive, prefix)) = parse_jar_subdir_spec(&p) {
+                let path = PathBuf::from(archive);
+                if path.exists() {
+                    match read_file_for_classpath(&path) {
+                        Ok(data) => {
+                            if let Some(entry) =
+                                Self::build_nested_directory_from_jar(&path, data, &prefix)
+                            {
+                                entries.push(entry);
+                            }
+                        }
+                        Err(e) => {
+                            debug!(
+                                "Failed to read nested classpath archive {}: {e}",
+                                path.display()
+                            );
+                        }
+                    }
+                } else {
+                    debug!(
+                        "Skipping missing nested classpath archive: {}",
+                        path.display()
+                    );
+                }
+                continue;
+            }
+
+            let path = PathBuf::from(&p);
+            if path.is_dir() {
+                entries.push(ClassPathEntry::Directory(path));
+            } else if path.extension().is_some_and(|ext| ext == "jmod") && path.exists() {
+                match Self::load_jmod(&path) {
+                    Ok(entry) => entries.push(entry),
+                    Err(e) => debug!("Failed to read JMOD {}: {e}", path.display()),
+                }
+            } else if Self::is_likely_jimage(&path) {
+                match Self::load_jimage(&path) {
+                    Ok(entry) => entries.push(entry),
+                    Err(e) => debug!("Failed to read jimage {}: {e}", path.display()),
+                }
+            } else if path.is_file() {
+                // URLClassLoader accepts every file URL as an archive
+                // candidate. `load_jar_data_with_manifest_class_path` fails
+                // closed for ordinary non-archive files.
+                match read_file_for_classpath(&path) {
+                    Ok(data) => Self::load_jar_data_with_manifest_class_path(
+                        &path,
+                        data,
+                        entries,
+                        expanded_manifest_jars,
+                    ),
+                    Err(e) => debug!("Failed to read classpath archive {}: {e}", path.display()),
+                }
+            } else {
+                debug!("Skipping non-existent classpath entry: {p}");
             }
         }
     }
@@ -3230,6 +3355,41 @@ impl ClassPath {
         out
     }
 
+    /// Build the `file:`-path segment of a reconstructed `jar:file:...!/...`
+    /// resource URL for a `NestedDirectory`/`NestedJar` entry's `parent_jar`.
+    ///
+    /// `NestedDirectory`/`NestedJar` entries reached via `add_path`'s
+    /// DaCapo-style `<jar>!/<prefix>/` handoff (see its doc comment) carry a
+    /// `parent_jar` that is the UNTOUCHED substring of whatever raw `jar:`
+    /// URL string the caller built — `extract_url_path` in
+    /// `native-builtins/src/classloader.rs` strips only a spurious leading
+    /// `/` before a Windows drive letter (for `PathBuf` resolvability) and
+    /// otherwise never rewrites separators. Real Java's `URL`/`URLClassLoader`
+    /// machinery is equally hands-off: `new URL(String)` never normalizes,
+    /// so a caller-built `"jar:file:" + file.getAbsolutePath() + "!/..."`
+    /// (Windows: backslash-separated, no leading `/`) round-trips through
+    /// HotSpot byte-for-byte. Forcibly rewriting `parent_jar` to a canonical
+    /// forward-slash `/C:/...` form here — as this used to do unconditionally
+    /// — produced a URL that differed from HotSpot's for exactly that raw,
+    /// backslash-spelled case (Spring Boot's
+    /// `TomcatEmbeddedWebappClassLoaderTests`, which builds the expected URL
+    /// via `File.getAbsolutePath()` directly, no `toURI()`).
+    ///
+    /// A backslash anywhere in `parent_jar` can only mean it came from that
+    /// raw, unnormalized path (real on-disk jar discovery always resolves
+    /// through `canonicalize_cached` into the `JarFile`/`Directory` variants,
+    /// not this one) — preserve it verbatim. Otherwise fall back to the
+    /// historical canonical-forward-slash form.
+    fn nested_jar_url_path(parent_jar: &Path) -> std::borrow::Cow<'_, str> {
+        let raw = parent_jar.to_string_lossy();
+        if raw.contains('\\') {
+            raw
+        } else {
+            let p = raw.trim_start_matches('/');
+            std::borrow::Cow::Owned(format!("/{p}"))
+        }
+    }
+
     pub fn find_all_resource_urls(&self, resource_name: &str) -> Vec<String> {
         diag_resource_call_wrapper("find_all_resource_urls", || {
             self.find_all_resource_urls_impl(resource_name)
@@ -3441,19 +3601,17 @@ impl ClassPath {
                         continue;
                     }
                     if simple_resource_glob(name).is_some() {
-                        let p = parent_jar.to_string_lossy().replace('\\', "/");
-                        let p = p.trim_start_matches('/');
+                        let p = Self::nested_jar_url_path(parent_jar);
                         for candidate in
                             Self::matching_resource_entry_names(entries_cache.keys(), name)
                         {
-                            urls.push(format!("jar:file:/{p}!/{prefix}{candidate}"));
+                            urls.push(format!("jar:file:{p}!/{prefix}{candidate}"));
                         }
                         continue;
                     }
                     if entries_cache.contains_key(name) {
-                        let p = parent_jar.to_string_lossy().replace('\\', "/");
-                        let p = p.trim_start_matches('/');
-                        urls.push(format!("jar:file:/{p}!/{prefix}{name}"));
+                        let p = Self::nested_jar_url_path(parent_jar);
+                        urls.push(format!("jar:file:{p}!/{prefix}{name}"));
                     }
                 }
                 ClassPathEntry::NestedJar {
@@ -3467,19 +3625,17 @@ impl ClassPath {
                         continue;
                     }
                     if simple_resource_glob(name).is_some() {
-                        let p = parent_jar.to_string_lossy().replace('\\', "/");
-                        let p = p.trim_start_matches('/');
+                        let p = Self::nested_jar_url_path(parent_jar);
                         for candidate in
                             Self::matching_resource_entry_names(entry_index.iter(), name)
                         {
-                            urls.push(format!("jar:file:/{p}!/{nested_path}!/{candidate}"));
+                            urls.push(format!("jar:file:{p}!/{nested_path}!/{candidate}"));
                         }
                         continue;
                     }
                     if Self::find_in_indexed_archive(archive, entry_index, name).is_some() {
-                        let p = parent_jar.to_string_lossy().replace('\\', "/");
-                        let p = p.trim_start_matches('/');
-                        urls.push(format!("jar:file:/{p}!/{nested_path}!/{name}"));
+                        let p = Self::nested_jar_url_path(parent_jar);
+                        urls.push(format!("jar:file:{p}!/{nested_path}!/{name}"));
                     }
                 }
                 ClassPathEntry::JmodFile {
@@ -4062,6 +4218,72 @@ mod tests {
         assert_eq!(
             cp.find_resource("test.txt"),
             Some(b"test resource".to_vec())
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn classpath_new_expands_manifest_class_path() {
+        let dir = std::env::temp_dir().join("cratonvm_manifest_class_path");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let dependency = dir.join("dependency.jar");
+        let launcher = dir.join("launcher.jar");
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+
+        {
+            let file = fs::File::create(&dependency).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            zip.start_file("META-INF/services/example.Service", options)
+                .unwrap();
+            zip.write_all(b"example.ServiceImpl\n").unwrap();
+            zip.finish().unwrap();
+        }
+        {
+            let file = fs::File::create(&launcher).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            zip.start_file("META-INF/MANIFEST.MF", options).unwrap();
+            zip.write_all(b"Manifest-Version: 1.0\r\nClass-Path: dependency.jar\r\n\r\n")
+                .unwrap();
+            zip.finish().unwrap();
+        }
+
+        let cp = ClassPath::new(&[launcher.to_string_lossy().into_owned()]);
+        assert_eq!(cp.entry_count(), 2, "manifest dependency must be added");
+        assert_eq!(
+            cp.find_resource("META-INF/services/example.Service"),
+            Some(b"example.ServiceImpl\n".to_vec())
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn manifest_class_path_cycle_is_not_reloaded() {
+        let dir = std::env::temp_dir().join("cratonvm_manifest_class_path_cycle");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let first = dir.join("first.jar");
+        let second = dir.join("second.jar");
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+
+        for (path, dependency) in [(&first, "second.jar"), (&second, "first.jar")] {
+            let file = fs::File::create(path).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            zip.start_file("META-INF/MANIFEST.MF", options).unwrap();
+            zip.write_all(
+                format!("Manifest-Version: 1.0\r\nClass-Path: {dependency}\r\n\r\n").as_bytes(),
+            )
+            .unwrap();
+            zip.finish().unwrap();
+        }
+
+        let cp = ClassPath::new(&[first.to_string_lossy().into_owned()]);
+        assert_eq!(
+            cp.entry_count(),
+            2,
+            "manifest cycle must terminate without duplicates"
         );
         let _ = fs::remove_dir_all(&dir);
     }

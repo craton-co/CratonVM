@@ -1288,8 +1288,9 @@ impl ThreadRegistry {
         })
     }
 
-    /// The Java blocking state for a currently blocked thread: 1 is WAITING
-    /// and 2 is BLOCKED. Returns 0 for running, dead, and unknown threads.
+    /// The Java blocking state for a currently blocked thread: 1 is WAITING,
+    /// 2 is BLOCKED, 3 is TIMED_WAITING. Returns 0 for running, dead, and
+    /// unknown threads.
     pub fn java_block_state(&self, thread_id: ThreadId) -> u8 {
         let threads = self.threads.lock();
         threads
