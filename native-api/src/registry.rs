@@ -713,6 +713,79 @@ pub trait NativeContext {
     /// [`pin_native_root`]) onward. Default impl is a no-op.
     fn unpin_native_roots(&mut self, _base: usize) {}
 
+    // ---- rooted handle scope (arch/handles) ----
+    //
+    // `pin_native_root`/`read_native_pin`/`unpin_native_roots` above fix
+    // staleness but not the discipline: a native method still holds the
+    // SAME `ObjectRef` type before and after pinning, so reading the
+    // pre-pin local by mistake type-checks fine and silently reintroduces
+    // the bug. The handle-scope quartet below is `cratonvm_types::handle`'s
+    // rooted-handle design (`RootedHandle`/`HandleStorage`) adapted to this
+    // trait-object boundary: a handle is an opaque `u32` slot, not an
+    // `ObjectRef`, so there is no raw pointer left to accidentally read.
+    //
+    // **Discipline — READ BEFORE holding any `ObjectRef` across a call that
+    // can allocate:** any native code that holds a reference across
+    // `invoke`/`new_object_initialized`/`new_array`/anything that can run
+    // Java (and therefore can trigger a GC) MUST root it with
+    // [`handle_root`] first and read it back with [`handle_get`] afterward
+    // — never keep using the pre-call local. The usual shape:
+    //
+    // ```ignore
+    // ctx.handle_scope_push();
+    // let this_h = ctx.handle_root(this);
+    // let arr = ctx.new_array(ArrayElementType::Char, len); // may GC-move `this`
+    // let this = ctx.handle_get(this_h).unwrap_or(this);    // current address
+    // ctx.handle_scope_pop();
+    // ```
+    //
+    // Scopes nest: an inner `handle_scope_push`/`handle_scope_pop` pair
+    // rooted and released entirely inside an outer one only touches its own
+    // handles, mirroring `pin_native_root`'s base-index nesting. See
+    // `docs/feature-designs/native-handle-discipline.md` for the full
+    // design and `native_builtins::lang_string` for worked examples
+    // (`native_string_init_abstract_string_builder`,
+    // `native_sb_init_default`, `native_sb_init_string`,
+    // `native_sb_init_charsequence`, `native_sb_init_capacity`).
+    //
+    // Default impls below mirror the no-op/pass-through convention already
+    // used by `pin_native_root` & co. for mock/test contexts with no moving
+    // GC: pushing/popping a scope is a no-op, and `handle_root` delegates to
+    // the already-default-implemented `pin_native_root` (truncated to
+    // `u32`) as the closest existing stand-in. `handle_get`'s default
+    // returns `None` rather than trying to read back through that
+    // delegation — `pin_native_root`'s own default doesn't retain anything
+    // to read, so there is nothing genuine to hand back. The VM's
+    // `NativeContextImpl` overrides all four with a real per-thread slot
+    // table (`vm/src/vm/vm_exec.rs`, "handle scope support").
+
+    /// Push a new handle scope. Every [`handle_root`] call until the
+    /// matching [`handle_scope_pop`] is released together when that pop
+    /// runs. Default impl is a no-op.
+    fn handle_scope_push(&mut self) {}
+
+    /// Pop the current handle scope, releasing every handle rooted since the
+    /// matching [`handle_scope_push`]. Default impl is a no-op.
+    fn handle_scope_pop(&mut self) {}
+
+    /// Root `r` in the current handle scope and return its slot id. Reading
+    /// through the slot (via [`handle_get`]) always returns `r`'s current,
+    /// possibly-GC-forwarded address — a handle can never go stale while its
+    /// scope is open, unlike a raw `ObjectRef` copy.
+    ///
+    /// Default impl delegates to [`pin_native_root`] (see the block doc
+    /// above for why); real GC-safety comes from the VM's override.
+    fn handle_root(&mut self, r: ObjectRef) -> u32 {
+        self.pin_native_root(r) as u32
+    }
+
+    /// Read back the current reference for `slot` (from [`handle_root`]), or
+    /// `None` if `slot` is out of range or its scope already popped. Default
+    /// impl returns `None`.
+    fn handle_get(&self, _slot: u32) -> Option<ObjectRef> {
+        None
+    }
+
     /// Create a *persistent* global GC root for `obj`, returning an opaque handle.
     ///
     /// Unlike [`pin_native_root`] (which is per-thread and unwound when the

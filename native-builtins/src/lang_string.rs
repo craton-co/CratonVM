@@ -912,10 +912,18 @@ pub(crate) fn native_string_init_abstract_string_builder(
     let latin1 = chars.iter().all(|&u| u <= 0xFF);
     let byte_len = if latin1 { chars.len() } else { chars.len() * 2 };
 
-    let this_pin = ctx.pin_native_root(this);
+    // arch/handles pilot: `this` crosses `ctx.new_array` (allocating — can
+    // GC-move `this` under the moving collector), so it is held as a rooted
+    // handle rather than a bare pin-and-reread. Reading through
+    // `ctx.handle_get` always yields the current address; there is no raw
+    // `ObjectRef` copy left in scope for a caller to accidentally read
+    // stale. See docs/feature-designs/native-handle-discipline.md and
+    // `NativeContext`'s "handle scope support" doc block.
+    ctx.handle_scope_push();
+    let this_h = ctx.handle_root(this);
     let value = ctx.new_array(ArrayElementType::Byte, byte_len);
-    let this = ctx.read_native_pin(this_pin, this);
-    ctx.unpin_native_roots(this_pin);
+    let this = ctx.handle_get(this_h).unwrap_or(this);
+    ctx.handle_scope_pop();
 
     if latin1 {
         for (i, &u) in chars.iter().enumerate() {
@@ -1617,12 +1625,15 @@ pub(crate) fn native_sb_init_default(
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
-    // Pin `this` before `ctx.new_array` — a moving GC during allocation would
-    // relocate `this`, leaving the Rust-local copy stale.
-    let this_pin = ctx.pin_native_root(this);
+    // arch/handles pilot (see `native_string_init_abstract_string_builder`
+    // above for the full rationale): `this` crosses the allocating
+    // `ctx.new_array` call, so it is rooted as a handle instead of a bare
+    // pin-and-reread.
+    ctx.handle_scope_push();
+    let this_h = ctx.handle_root(this);
     let buf = ctx.new_array(ArrayElementType::Char, 16);
-    let this = ctx.read_native_pin(this_pin, this);
-    ctx.unpin_native_roots(this_pin);
+    let this = ctx.handle_get(this_h).unwrap_or(this);
+    ctx.handle_scope_pop();
     ctx.set_field(this, 0, Value::Object(Some(buf)));
     sb_set_count(ctx, this, 0);
     Ok(None)
@@ -1643,10 +1654,12 @@ pub(crate) fn native_sb_init_string(
     };
     let chars: Vec<u16> = text.encode_utf16().collect();
     let cap = chars.len() + 16;
-    let this_pin = ctx.pin_native_root(this);
+    // arch/handles pilot — see `native_string_init_abstract_string_builder`.
+    ctx.handle_scope_push();
+    let this_h = ctx.handle_root(this);
     let buf = ctx.new_array(ArrayElementType::Char, cap);
-    let this = ctx.read_native_pin(this_pin, this);
-    ctx.unpin_native_roots(this_pin);
+    let this = ctx.handle_get(this_h).unwrap_or(this);
+    ctx.handle_scope_pop();
     for (i, &ch) in chars.iter().enumerate() {
         ctx.set_array_element(buf, i, Value::Int(ch as i32));
     }
@@ -1678,9 +1691,14 @@ pub(crate) fn native_sb_init_charsequence(
     };
     // Real JDK `AbstractStringBuilder(CharSequence)` calls `seq.length()`, so a
     // null sequence throws NPE; coerce any non-null CharSequence to its text.
-    // Pin `this` before any allocating call: `invoke_to_string` and `new_array`
-    // can both trigger a moving GC that relocates `this`.
-    let this_pin = ctx.pin_native_root(this);
+    // arch/handles pilot: `this` crosses TWO allocating calls here —
+    // `invoke_to_string` (arbitrary Java `toString()`, can allocate/GC at
+    // will) and `new_array` — while still reading back correctly through a
+    // single root/scope pair (see `native_string_init_abstract_string_builder`
+    // above). A raw pin would need re-reading after EACH call individually;
+    // a handle just stays current the whole time.
+    ctx.handle_scope_push();
+    let this_h = ctx.handle_root(this);
     let text = match args.get(1) {
         Some(Value::Object(Some(o))) => invoke_to_string(ctx, *o).unwrap_or_default(),
         _ => String::new(),
@@ -1688,8 +1706,8 @@ pub(crate) fn native_sb_init_charsequence(
     let chars: Vec<u16> = text.encode_utf16().collect();
     let cap = chars.len() + 16;
     let buf = ctx.new_array(ArrayElementType::Char, cap);
-    let this = ctx.read_native_pin(this_pin, this);
-    ctx.unpin_native_roots(this_pin);
+    let this = ctx.handle_get(this_h).unwrap_or(this);
+    ctx.handle_scope_pop();
     for (i, &ch) in chars.iter().enumerate() {
         ctx.set_array_element(buf, i, Value::Int(ch as i32));
     }
@@ -1711,22 +1729,28 @@ pub(crate) fn native_sb_init_capacity(
         Some(Value::Int(v)) => std::cmp::max(*v, 0) as usize,
         _ => 16,
     };
-    let this_pin = ctx.pin_native_root(this);
+    // arch/handles pilot — see `native_string_init_abstract_string_builder`.
+    // Note the early-return path below still has to pop the scope itself
+    // before returning: unlike a Rust-`Drop`-based guard, `handle_scope_pop`
+    // is a plain trait call, so it does not run automatically on early exit
+    // — the same discipline `unpin_native_roots` already required here.
+    ctx.handle_scope_push();
+    let this_h = ctx.handle_root(this);
     // HotSpot throws a catchable OutOfMemoryError for an over-large value array
     // (e.g. `new StringBuilder(Integer.MAX_VALUE)`); mirror that instead of the
     // panicking allocator, which would abort the whole VM.
     let buf = match ctx.try_new_array(ArrayElementType::Char, cap) {
         Some(b) => b,
         None => {
-            ctx.unpin_native_roots(this_pin);
+            ctx.handle_scope_pop();
             return Err(cratonvm_types::error::RuntimeError::OutOfMemoryError {
                 message: "Requested array size exceeds VM limit".to_string(),
             }
             .into());
         }
     };
-    let this = ctx.read_native_pin(this_pin, this);
-    ctx.unpin_native_roots(this_pin);
+    let this = ctx.handle_get(this_h).unwrap_or(this);
+    ctx.handle_scope_pop();
     ctx.set_field(this, 0, Value::Object(Some(buf)));
     sb_set_count(ctx, this, 0);
     Ok(None)

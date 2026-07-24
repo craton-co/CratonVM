@@ -3754,6 +3754,67 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         }
     }
 
+    // ---- handle scope support (arch/handles) ----
+    //
+    // Real backing for `NativeContext::handle_scope_push`/`handle_scope_pop`/
+    // `handle_root`/`handle_get` (default no-ops in `native-api`). Storage is
+    // `JvmThread::handle_slots` (a flat `Vec<Option<ObjectRef>>`) plus
+    // `JvmThread::handle_scope_bases` (a stack of `handle_slots` lengths),
+    // append/truncate exactly like `native_pin_roots`/`pin_native_root` just
+    // above — the difference is WHERE the base index lives: here it's
+    // recorded on the thread by `handle_scope_push` itself, so nested native
+    // calls each get a plain push/pop pair instead of every caller having to
+    // thread a base index through (as `pin_native_root`'s callers must via
+    // `unpin_native_roots(base)`). See
+    // `docs/feature-designs/native-handle-discipline.md` for the full design,
+    // and the root-scan/remap-gap note at `vm/src/memory/roots.rs`'s
+    // `handle_slots` splice.
+
+    fn handle_scope_push(&mut self) {
+        self.thread.handle_scope_bases.push(self.thread.handle_slots.len());
+    }
+
+    fn handle_scope_pop(&mut self) {
+        if let Some(base) = self.thread.handle_scope_bases.pop() {
+            // `<=` (not `==`): a scope popped out of order relative to a
+            // sibling that already truncated past it is simply a no-op here,
+            // matching `unpin_native_roots`' own `base < len` guard rather
+            // than panicking on an already-shorter vec.
+            if base <= self.thread.handle_slots.len() {
+                self.thread.handle_slots.truncate(base);
+            }
+        }
+    }
+
+    fn handle_root(&mut self, r: ObjectRef) -> u32 {
+        // Same census-visibility guard `pin_native_root` applies: a slot
+        // pushed while this thread's blocked-region flag is raised is
+        // invisible to both the STW root scan and the blocked-thread fold.
+        if cratonvm_gc::blocked_access_debug::enabled()
+            && self
+                .thread
+                .gc_block_state
+                .in_blocked_region
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            cratonvm_gc::blocked_access_debug::report_blocked_violation(
+                "handle_root push on a census-excluded thread",
+                r.as_ptr() as usize,
+            );
+        }
+        debug_assert!(
+            self.thread.handle_slots.len() < u32::MAX as usize,
+            "handle_slots overflowed u32 slot ids"
+        );
+        let slot = self.thread.handle_slots.len() as u32;
+        self.thread.handle_slots.push(Some(r));
+        slot
+    }
+
+    fn handle_get(&self, slot: u32) -> Option<ObjectRef> {
+        self.thread.handle_slots.get(slot as usize).copied().flatten()
+    }
+
     fn add_global_root(&mut self, obj: ObjectRef) -> usize {
         // Backed by the JNI global-ref table: a persistent, cross-thread,
         // GC-remapped root. Used by the async-socket completion path to hold a

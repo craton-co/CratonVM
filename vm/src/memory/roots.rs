@@ -154,6 +154,30 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
         roots.push(*obj_ref);
     }
 
+    // ---- handle scope support (arch/handles) ----
+    // 4b'. Rooted-handle slots — `NativeContext::handle_root`'s per-thread
+    //      backing store (`JvmThread::handle_slots`, see that field's doc
+    //      comment). Same shape as the `native_pin_roots` splice just above:
+    //      a live (`Some`) slot is a GC root exactly like a pin. A `None`
+    //      hole is an already-released slot and contributes nothing.
+    //
+    //      NOTE (integration gap, out of scope for this change): a moving
+    //      collection must ALSO rewrite these slots in place after
+    //      relocating an object, mirroring the `native_pin_roots` remap
+    //      loop in `vm::memory::gc::update_all_roots`
+    //      (vm/src/memory/gc.rs, right after that function's own
+    //      `native_pin_roots` block) — that companion remap has NOT been
+    //      added yet. Until it lands, a handle survives a NON-moving
+    //      collection correctly (this scan keeps the slot's object alive)
+    //      but is NOT yet immune to going stale across a MOVING collection,
+    //      same residual risk `native_pin_roots` would have without its own
+    //      remap loop. See docs/feature-designs/native-handle-discipline.md.
+    for slot in &thread.handle_slots {
+        if let Some(obj_ref) = slot {
+            roots.push(*obj_ref);
+        }
+    }
+
     // 4c. Native object in flight — object return before the interpreter pushes
     //     it onto the operand stack, or native-thrown exception before it is
     //     routed into a Java handler / uncaught dispatch.

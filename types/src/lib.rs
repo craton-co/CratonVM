@@ -14,6 +14,7 @@ pub mod error;
 pub mod field_layout;
 pub mod field_watch;
 pub mod float_format;
+pub mod handle;
 mod heap_types;
 pub mod intern;
 pub mod loader_pin;
@@ -31,6 +32,7 @@ pub use field_layout::{
     set_compact_ref_fields_enabled, CompactLayout,
 };
 pub use float_format::{java_double_to_string, java_float_to_string};
+pub use handle::{HandleScope, HandleStorage, RootedHandle};
 pub use heap_types::{
     array_data_size, array_data_size_checked, array_element_type_from_tag, element_byte_size,
     object_kind_from_tag, ArrayElementType, ObjectHeader, ObjectKind, ARRAY_ELEMENT_TYPE_OFFSET,
@@ -147,5 +149,32 @@ mod tests {
         let fake_ptr = 0x1000_u64 as *mut u8;
         let r = unsafe { ObjectRef::from_raw(fake_ptr) };
         assert_eq!(r.as_ptr() as u64, 0x1000);
+    }
+
+    #[test]
+    fn reexport_handle_types() {
+        struct S {
+            slots: Vec<Option<ObjectRef>>,
+        }
+        impl HandleStorage for S {
+            fn root(&mut self, r: ObjectRef) -> u32 {
+                self.slots.push(Some(r));
+                (self.slots.len() - 1) as u32
+            }
+            fn unroot(&mut self, slot: u32) {
+                self.slots[slot as usize] = None;
+            }
+            fn get(&self, slot: u32) -> ObjectRef {
+                self.slots[slot as usize].unwrap()
+            }
+        }
+        let mut storage = S { slots: Vec::new() };
+        let fake_ptr = 0x2000_u64 as *mut u8;
+        let r = unsafe { ObjectRef::from_raw(fake_ptr) };
+        let handle = RootedHandle::new(&mut storage, r);
+        assert_eq!(handle.get(&storage), r);
+        let mut scope = HandleScope::new(&mut storage);
+        let h2 = scope.root(r);
+        assert_eq!(scope.get(&h2), r);
     }
 }
