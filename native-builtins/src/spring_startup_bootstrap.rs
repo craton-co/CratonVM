@@ -1285,6 +1285,28 @@ pub fn register(registry: &mut NativeMethodRegistry) {
     // provider into a required bean. Preserve a method already owned by a
     // defining loader, but canonicalize an application/global Method through
     // the active TCCL before caching it in the bean definition.
+    //
+    // AOT-cluster fix (2026-07-24): this override wrote the incoming `Method`
+    // to a field named `resolvedFactoryMethod`, which doesn't exist on
+    // real `RootBeanDefinition` (the actual field is `factoryMethodToIntrospect`,
+    // confirmed against the current `spring-framework-recheck` checkout's
+    // source) -- so every write here was silently absorbed by
+    // `set_field_by_name`'s no-such-field path, `getResolvedFactoryMethod()`
+    // (which reads `factoryMethodToIntrospect`) always saw `null`, and real
+    // Spring's own `setResolvedFactoryMethod`'s side effect of calling
+    // `setUniqueFactoryMethodName(method.getName())` (setting BOTH
+    // `factoryMethodName` and `isFactoryMethodUnique = true`) was skipped
+    // entirely. `ConstructorResolver.resolveFactoryMethod` requires
+    // `isFactoryMethodUnique` to even consult `getResolvedFactoryMethod()` in
+    // the first place, so the net effect was a bean definition that behaved
+    // as if `setResolvedFactoryMethod` had never been called at all --
+    // surfaced as `ApplicationContextAotGeneratorTests
+    // .processAheadOfTimeWithExplicitResolvableType` (gh-30689, a bean
+    // definition built with `setResolvedFactoryMethod` + `setTargetType` and
+    // no `factoryMethodName` ever set explicitly) failing with
+    // `IllegalStateException: No constructor or factory method candidate
+    // found for ... factoryMethodName=null`. Fixed by writing the correct
+    // field and replicating `setUniqueFactoryMethodName`'s two side effects.
     registry.register(
         "org/springframework/beans/factory/support/RootBeanDefinition",
         "setResolvedFactoryMethod",
@@ -1320,7 +1342,17 @@ pub fn register(registry: &mut NativeMethodRegistry) {
             }
             let this_pin = ctx.pin_native_root(this);
             let this = ctx.read_native_pin(this_pin, this);
-            ctx.set_field_by_name(this, "resolvedFactoryMethod", Value::Object(method));
+            ctx.set_field_by_name(this, "factoryMethodToIntrospect", Value::Object(method));
+            if let Some(m) = method {
+                // Mirrors `setUniqueFactoryMethodName(method.getName())`,
+                // real `setResolvedFactoryMethod`'s side effect for a
+                // non-null method — see the doc comment above.
+                if let Some((_, name, _)) = crate::lang_class::method_class_name_desc(ctx, m) {
+                    let name_str = ctx.create_string(&name);
+                    ctx.set_field_by_name(this, "factoryMethodName", Value::Object(Some(name_str)));
+                    ctx.set_field_by_name(this, "isFactoryMethodUnique", Value::Int(1));
+                }
+            }
             ctx.unpin_native_roots(this_pin);
             Ok(None)
         },

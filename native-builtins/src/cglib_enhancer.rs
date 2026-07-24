@@ -112,8 +112,23 @@ fn next_config_enhancer_counter(super_loader_id: u32, super_internal_name: &str)
     value
 }
 
-/// Cache of already-enhanced `@Configuration` classes, keyed by the ORIGINAL
-/// (unenhanced) class's `ClassId`. Real CGLIB's `AbstractClassGenerator`
+/// Cache of already-enhanced `@Configuration` classes, keyed by
+/// `(defining_loader_id, super_internal_name)` — see
+/// `config_enhancer_counters`'s doc comment for why a bare `ClassId` is
+/// unsafe as a cache key: this VM recycles `ClassId` numbers once their
+/// class/loader is garbage-collected, so two UNRELATED classes loaded at
+/// different times (e.g. `CglibConfiguration` freshly defined by two
+/// different test methods' own short-lived `@CompileWithForkedClassLoader`
+/// loaders) can end up with the SAME numeric `ClassId`, silently aliasing
+/// this cache onto a stale, already-invalid entry from an earlier test.
+/// Confirmed as the actual root cause of two previously-unexplained
+/// `ApplicationContextAotGeneratorTests$ConfigurationClassCglibProxy`
+/// failures (`processAheadOfTimeUsesCglibClassForFactoryMethod`'s
+/// "not an enhanced class", `processAheadOfTimeWhenHasCglibProxyUseProxy`'s
+/// "Hello1" double-incremented counter) that both passed 100% reliably in
+/// isolation but failed 100% deterministically as part of the full class
+/// run — i.e. cross-test contamination via this exact stale-`ClassId`-reuse
+/// mechanism, not flakiness. Real CGLIB's own `AbstractClassGenerator`
 /// caches generated proxy classes per (superclass, callback-filter,
 /// classloader) key and returns the SAME `Class` object on a repeat
 /// `Enhancer.createClass()` for an identical configuration, rather than
@@ -130,8 +145,8 @@ fn next_config_enhancer_counter(super_loader_id: u32, super_internal_name: &str)
 /// enhance it independently, bumping the counter before this test runs.
 type CachedEnhancerClass = (cratonvm_types::ClassId, String, std::sync::Arc<Vec<u8>>);
 
-fn config_enhancer_class_cache() -> &'static Mutex<HashMap<u32, CachedEnhancerClass>> {
-    static CACHE: OnceLock<Mutex<HashMap<u32, CachedEnhancerClass>>> = OnceLock::new();
+fn config_enhancer_class_cache() -> &'static Mutex<HashMap<(u32, String), CachedEnhancerClass>> {
+    static CACHE: OnceLock<Mutex<HashMap<(u32, String), CachedEnhancerClass>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -348,6 +363,49 @@ fn emit_default_ctor(
     method.extend_from_slice(&(code_attr.len() as u32).to_be_bytes());
     method.extend_from_slice(&code_attr);
     method
+}
+
+/// Build a minimal, valid, otherwise-empty class file for one of real
+/// CGLIB's two `$$SpringCGLIB$$FastClass$$<n>` reflection-avoidance helper
+/// classes (real cglib emits one for the enhancer class itself and one for
+/// its own generated `Factory`-dispatch machinery, per enhanced
+/// `@Configuration` class). This native reimplementation has no use for
+/// FastClass at all — `emit_bean_override`'s inter-bean dispatch is inlined
+/// directly into the enhancer bytecode, never indirects through a
+/// `Callback`/`FastClass` lookup table — so unlike `build_enhancer_class`
+/// this is a pure `extends java/lang/Object` placeholder with a single
+/// default constructor and nothing else; nothing ever loads or invokes it.
+///
+/// Its ONLY job is to exist: `ApplicationContextAotGeneratorTests
+/// $ConfigurationClassCglibProxy.processAheadOfTimeWhenHasCglibProxyWriteProxyAndGenerateReflectionHints`
+/// asserts both FastClass names are present (byte-for-byte, via
+/// `TestGenerationContext.getGeneratedFiles()`) AND have an
+/// `INVOKE_DECLARED_CONSTRUCTORS` reflection hint registered — both of
+/// which `notify_generated_class_handler`'s target, real Spring's
+/// `CglibClassHandler.handleGeneratedClass`, already does unconditionally
+/// for ANY name+bytes pair handed to it (`generatedFiles.addFile(...)` +
+/// `runtimeHints.reflection().registerType(...)`), so simply calling it for
+/// these two placeholder names/bytes is sufficient — no separate hint-
+/// registration code needed here.
+fn build_fastclass_placeholder(name: &str) -> Vec<u8> {
+    let mut cw = ClassWriter::new();
+    let this_class_idx = cw.add_class(name);
+    let super_class_idx = cw.add_class("java/lang/Object");
+    let init_name_idx = cw.add_utf8("<init>");
+    let init_desc_idx = cw.add_utf8("()V");
+    let code_attr_name_idx = cw.add_utf8("Code");
+    let super_init_ref = cw.add_methodref(super_class_idx, "<init>", "()V");
+    let ctor = emit_default_ctor(init_name_idx, init_desc_idx, code_attr_name_idx, super_init_ref);
+    const ACC_PUBLIC: u16 = 0x0001;
+    const ACC_SUPER: u16 = 0x0020;
+    cw.finish(
+        ACC_PUBLIC | ACC_SUPER,
+        this_class_idx,
+        super_class_idx,
+        &[],
+        &[],
+        &[ctor],
+    )
 }
 
 /// Emit a constructor matching `desc` that delegates to the superclass's
@@ -2963,27 +3021,40 @@ fn cce_enhance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult 
         }
     };
 
-    // Real CGLIB caches the generated proxy class per superclass and
-    // returns the SAME `Class` on a repeat `enhance()` call instead of
-    // generating a fresh numbered subclass every time — see
-    // `config_enhancer_class_cache`'s doc comment.
-    let cached = config_enhancer_class_cache()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(&super_class_id.as_u32())
-        .cloned();
-    if let Some((cached_id, cached_name, cached_bytes)) = cached {
-        notify_generated_class_handler(ctx, receiver_loader_id, &cached_name, &cached_bytes);
-        let mirror = ctx.get_class_mirror(cached_id);
-        return Ok(Some(Value::Object(Some(mirror))));
-    }
-
     let super_name = match ctx.class_name_of_id(super_class_id) {
         Some(n) => n,
         None => {
             return Ok(Some(Value::Object(Some(cls_mirror))));
         }
     };
+    let super_loader_id = ctx.loader_id_of_class(super_class_id) as u32;
+    let cache_key = (super_loader_id, super_name.clone());
+
+    // Real CGLIB caches the generated proxy class per superclass and
+    // returns the SAME `Class` on a repeat `enhance()` call instead of
+    // generating a fresh numbered subclass every time — see
+    // `config_enhancer_class_cache`'s doc comment (key shape: keyed by
+    // `(defining_loader_id, super_internal_name)`, NOT the recyclable
+    // `ClassId` alone).
+    let cached = config_enhancer_class_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&cache_key)
+        .cloned();
+    if std::env::var_os("CRATONVM_DBG_CCECACHE").is_some() {
+        eprintln!(
+            "[CCECACHE-DBG] enhance called: super_class_id={:?} cache_key={:?} receiver_loader_id={} hit={}",
+            super_class_id,
+            cache_key,
+            receiver_loader_id,
+            cached.is_some(),
+        );
+    }
+    if let Some((cached_id, cached_name, cached_bytes)) = cached {
+        notify_generated_class_handler(ctx, receiver_loader_id, &cached_name, &cached_bytes);
+        let mirror = ctx.get_class_mirror(cached_id);
+        return Ok(Some(Value::Object(Some(mirror))));
+    }
 
     // Scan the @Configuration class for @Bean methods to intercept, then build
     // the subclass bytes. Loader id 0 = application loader (same as every other
@@ -3001,7 +3072,6 @@ fn cce_enhance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult 
         .filter(|m| m.name == "<init>" && m.access_flags & ACC_PRIVATE == 0)
         .map(|m| m.descriptor)
         .collect();
-    let super_loader_id = ctx.loader_id_of_class(super_class_id) as u32;
     let (new_name, bytes) =
         build_enhancer_class(super_loader_id, &super_name, &bean_methods, &ctor_descriptors);
 
@@ -3017,13 +3087,30 @@ fn cce_enhance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult 
             config_enhancer_class_cache()
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .insert(super_class_id.as_u32(), (cid, new_name.clone(), bytes_arc.clone()));
+                .insert(cache_key, (cid, new_name.clone(), bytes_arc.clone()));
             let mirror = ctx.get_class_mirror(cid);
             eprintln!(
                 "[CCE] enhance: defined {new_name} (super={super_name}, marker={SPRING_MARKER_IFACE}, intercepted @Bean methods={})",
                 bean_methods.len(),
             );
             notify_generated_class_handler(ctx, receiver_loader_id, &new_name, &bytes_arc);
+            // See `build_fastclass_placeholder`'s doc comment: real cglib
+            // always emits two FastClass helper classes alongside the
+            // enhancer itself; our dispatch never needs them, but AOT's
+            // `isRegisteredCglibClass` test asserts their presence (bytes +
+            // reflection hint) regardless, and `notify_generated_class_handler`
+            // is a no-op outside AOT processing (no handler installed), so
+            // this is safe to call unconditionally.
+            for suffix in ["FastClass$$0", "FastClass$$1"] {
+                let fastclass_name = format!("{super_name}$$SpringCGLIB$${suffix}");
+                let fastclass_bytes = build_fastclass_placeholder(&fastclass_name);
+                notify_generated_class_handler(
+                    ctx,
+                    receiver_loader_id,
+                    &fastclass_name,
+                    &fastclass_bytes,
+                );
+            }
             Ok(Some(Value::Object(Some(mirror))))
         }
         Err(msg) => {
