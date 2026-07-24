@@ -46020,10 +46020,28 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         ssl_session,
         "getLocalCertificates",
         "()[Ljava/security/cert/Certificate;",
-        |_ctx, _args| {
-            // Same rationale as getLocalPrincipal: null is the documented
-            // return when no local certificate chain was used.
-            Ok(Some(Value::Object(None)))
+        |ctx, args| {
+            // FIX (spring-boot-jetty SecureRequestCustomizer 400 "Invalid SNI"):
+            // this used to unconditionally return null, which was only correct
+            // for a plain (no-mTLS) CLIENT session. A SERVER session always has
+            // a local (its own) certificate chain; Jetty's
+            // `SecureRequestCustomizer.getX509()` calls exactly this method on
+            // every HTTPS request and throws `HttpException.RuntimeException(400,
+            // "Invalid SNI")` when it comes back empty. See
+            // `t27_tls::build_synthetic_ssl_session`/`local_certs_for_session`
+            // for where the chain is actually populated (client sessions with no
+            // configured identity correctly still get an empty chain here).
+            let this = obj_arg(args, 0)?;
+            let chain = crate::t27_tls::local_certs_for_session(ctx, this);
+            if chain.is_empty() {
+                return Ok(Some(Value::Object(None)));
+            }
+            let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), chain.len());
+            for (i, der) in chain.iter().enumerate() {
+                let mirror = crate::keystore::make_x509_mirror(ctx, "local", der);
+                ctx.set_array_element(arr, i, Value::Object(Some(mirror)));
+            }
+            Ok(Some(Value::Object(Some(arr))))
         },
     );
     r.register(
