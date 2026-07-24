@@ -30669,17 +30669,30 @@ fn execute_invokestatic(
 
     // Sibling static owners in a user-defined loader need the same identity
     // preservation as self-calls; resolving by flat name can pick the app copy.
+    //
+    // bt18-inline-tlab-regression-20260724 (part 2): both probes below are
+    // gated on the process-wide "any defining loader registered at all"
+    // atomic. Without the gate, every dispatched static call paid the
+    // defining-loader registry mutex twice — and, worse, the
+    // cache-suppression rule below misread a plain SELF-RECURSIVE static
+    // call (static_dispatch_class_id == Some(self)) as loader-specific,
+    // suppressing invoke-cache promotion for every recursive static in
+    // every application and sending each call through the slow dispatcher
+    // (bt18 4.8x). Only a genuinely loader-specific owner selection —
+    // tracked via `loader_specific_dispatch` — may suppress promotion.
+    let any_user_loader = cratonvm_native_builtins::classloader::any_defining_loader_registered();
     let isolated_url_definition =
-        is_isolated_url_loader_definition(shared, thread, current_class_id);
+        any_user_loader && is_isolated_url_loader_definition(shared, thread, current_class_id);
     // A defining-loader registration is authoritative even when the
     // class-manager's loader-id metadata is unavailable for a real-JDK
     // subclass. Static symbolic references still use the caller's defining
     // loader under JVMS 5.4.3; restricting that to the historical fork/Groovy
     // gates leaves ordinary ModifiedClassPathClassLoader bytecode bound to the
     // flat application copy.
-    let has_user_defining_loader =
-        cratonvm_native_builtins::classloader::defining_loader_for(current_class_id.as_u32())
+    let has_user_defining_loader = any_user_loader
+        && cratonvm_native_builtins::classloader::defining_loader_for(current_class_id.as_u32())
             .is_some();
+    let mut loader_specific_dispatch = false;
     let static_dispatch_class_id = self_class_id.or_else(|| {
         // Keep static method owners in the same initiating-loader namespace
         // as every other symbolic reference. This includes the narrow
@@ -30691,6 +30704,7 @@ fn execute_invokestatic(
             || isolated_url_definition
             || has_user_defining_loader
         {
+            loader_specific_dispatch = true;
             // Preserve the initiating loader even when the global classpath
             // already has a same-named class. This is required for nested
             // implementation jars whose owner is only visible to the caller
@@ -30712,7 +30726,13 @@ fn execute_invokestatic(
         }
     });
 
-    if std::env::var_os("CRATONVM_INVOKESTATIC_LOADER_TRACE").is_some()
+    // Cached: this sat as a raw per-call getenv inside the static
+    // dispatcher (visible in the bt18 regression profile's getenv storm).
+    fn invokestatic_loader_trace() -> bool {
+        static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *G.get_or_init(|| std::env::var_os("CRATONVM_INVOKESTATIC_LOADER_TRACE").is_some())
+    }
+    if invokestatic_loader_trace()
         && (method_class_name.contains("SpringFactoriesLoader")
             || method_class_name.contains("EnvironmentPostProcessorsFactory")
             || method_class_name.contains("ManagementPortType")
@@ -30842,7 +30862,12 @@ fn execute_invokestatic(
     // call into an application-loader copy. Keep loader-specific static calls
     // on the already-correct slow dispatcher until the cache key can carry
     // the resolved ClassId.
-    let mut suppress_invoke_cache = static_dispatch_class_id.is_some() || has_user_defining_loader;
+    //
+    // bt18 part 2: suppression keys on `loader_specific_dispatch`, NOT on
+    // `static_dispatch_class_id.is_some()` — the latter is Some for every
+    // plain self-recursive static call (self_class_id), which suppressed
+    // caching for all recursive statics in loader-free applications.
+    let mut suppress_invoke_cache = loader_specific_dispatch || has_user_defining_loader;
     #[cfg(feature = "gpu-offload")]
     {
         if shared.config.gpu_offload_enabled
