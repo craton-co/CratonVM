@@ -70,12 +70,12 @@ fn assert_one_deopt_after(before_traps: u64, context: &str) {
     );
 }
 
-fn helpers() -> JitRuntimeHelpers {
+fn helpers() -> JitRuntimeHelpers { safepoint_flag_addr: 0, safepoint_slow_path: 0,
     unsafe extern "C" fn stub() {
         panic!("STRING_ACCESS intrinsic test invoked an unwired runtime helper");
     }
     let s = stub as *const () as usize;
-    JitRuntimeHelpers {
+    JitRuntimeHelpers { safepoint_flag_addr: 0, safepoint_slow_path: 0,
         newarray: s,
         new_object: s,
         anewarray_object: s,

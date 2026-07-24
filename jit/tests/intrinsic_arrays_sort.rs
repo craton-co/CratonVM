@@ -34,12 +34,12 @@ use cratonvm_types::{ARRAY_LENGTH_OFFSET, HEADER_SIZE};
 use std::collections::{HashMap, HashSet};
 
 /// Stub runtime helpers — no ARRAYS_SORT intrinsic invokes a helper.
-fn stub_helpers() -> JitRuntimeHelpers {
+fn stub_helpers() -> JitRuntimeHelpers { safepoint_flag_addr: 0, safepoint_slow_path: 0,
     unsafe extern "C" fn stub() {
         panic!("ARRAYS_SORT intrinsic test invoked an unwired runtime helper");
     }
     let s = stub as *const () as usize;
-    JitRuntimeHelpers {
+    JitRuntimeHelpers { safepoint_flag_addr: 0, safepoint_slow_path: 0,
         newarray: s,
         new_object: s,
         anewarray_object: s,

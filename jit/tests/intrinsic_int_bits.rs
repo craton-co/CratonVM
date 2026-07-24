@@ -20,12 +20,12 @@ use std::collections::{HashMap, HashSet};
 
 /// Stub runtime helpers — no INT_BITS intrinsic touches the heap, fields,
 /// type checks or dispatch, so the stub pointer is never invoked.
-fn stub_helpers() -> JitRuntimeHelpers {
+fn stub_helpers() -> JitRuntimeHelpers { safepoint_flag_addr: 0, safepoint_slow_path: 0,
     unsafe extern "C" fn stub() {
         panic!("INT_BITS intrinsic test invoked an unwired runtime helper");
     }
     let s = stub as *const () as usize;
-    JitRuntimeHelpers {
+    JitRuntimeHelpers { safepoint_flag_addr: 0, safepoint_slow_path: 0,
         newarray: s,
         new_object: s,
         anewarray_object: s,

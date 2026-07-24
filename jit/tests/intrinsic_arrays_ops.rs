@@ -31,7 +31,7 @@ const ARRAY_LENGTH_OFFSET: usize = 12;
 /// panicking. (Historically the stub triggered the NPE via a `bastore` to the
 /// zeroed array arg; it now calls the dedicated `jit_npe_with_action` helper for
 /// JEP-358 helpful messages.)
-fn arrays_helpers() -> JitRuntimeHelpers {
+fn arrays_helpers() -> JitRuntimeHelpers { safepoint_flag_addr: 0, safepoint_slow_path: 0,
     unsafe extern "C" fn stub() {
         panic!("ARRAYS_OPS intrinsic test invoked an unexpected runtime helper");
     }
@@ -41,7 +41,7 @@ fn arrays_helpers() -> JitRuntimeHelpers {
     // crashing so the call yields the deopt sentinel.
     unsafe extern "C" fn noop_npe_with_action() {}
     let s = stub as *const () as usize;
-    JitRuntimeHelpers {
+    JitRuntimeHelpers { safepoint_flag_addr: 0, safepoint_slow_path: 0,
         newarray: s,
         new_object: s,
         anewarray_object: s,
