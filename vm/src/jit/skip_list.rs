@@ -177,6 +177,34 @@ pub enum SkipReason {
     /// lowering is understood.
     ClassReaderReadInnerClasses,
 
+    /// Javac's `ClassReader.readAttrs` -- the shared per-member/per-class
+    /// attribute-dispatch loop (`readClassAttrs`/`readMemberAttrs` both
+    /// delegate straight into it: read an attribute count via `nextChar()`,
+    /// then loop that many times reading a name-index `nextChar()` + a
+    /// length `nextInt()` and either dispatching to a specific
+    /// `AttributeReader` or skipping `bp += attrLen`) -- is a SEVENTH
+    /// distinct JIT residual in the same repeated-in-process-javac-
+    /// compilation family as `ClassReaderReadClass`/`ClassFinderComplete`/
+    /// `ClassFinderFillIn`/`ClassReaderReadInnerClasses` above, same
+    /// "moderately complex counted loop over the shared `bp` cursor" shape.
+    /// Symptom: real javac's `bad class file... bad signature: "ourceFile"`
+    /// (a corrupted read of the `SourceFile` attribute's own name — the
+    /// leading `"S"` lost, i.e. the shared constant-pool-index/length cursor
+    /// desynchronized by a couple of bytes) surfacing while compiling
+    /// AOT-generated sources against `spring-core`/`spring-beans`/JDK
+    /// `.class` files pulled onto the classpath — found via
+    /// `ApplicationContextAotGeneratorTests$ConfigurationClassCglibProxy
+    /// .processAheadOfTimeWhenHasCglibProxyUseProxy`, which reproduces this
+    /// deterministically with default (Conservative) JIT settings despite
+    /// `readClass`/`readInnerClasses` already being interpreted. Confirmed
+    /// JIT-only (`--nojit`: pass) and isolated with `CRATONVM_JIT_DENY=
+    /// com/sun/tools/javac/jvm/ClassReader` (whole class: pass) then
+    /// narrowed with `CRATONVM_JIT_BISECT_SKIP=com/sun/tools/javac/jvm/
+    /// ClassReader.readAttrs` (this exact method alone: pass). Keep this
+    /// attribute-dispatch loop interpreted until its own JIT lowering is
+    /// understood.
+    ClassReaderReadAttrs,
+
     /// Javac's `Symbol$ClassSymbol.complete` underflows the interpreter operand
     /// stack after tiered compilation while H2 compiles a generated alias.
     /// Keep this symbol-completion method interpreted until its invokespecial
@@ -574,6 +602,10 @@ fn should_skip_jit_internal(
 
     if class_name == "com/sun/tools/javac/jvm/ClassReader" && method_name == "readInnerClasses" {
         return Some(SkipReason::ClassReaderReadInnerClasses);
+    }
+
+    if class_name == "com/sun/tools/javac/jvm/ClassReader" && method_name == "readAttrs" {
+        return Some(SkipReason::ClassReaderReadAttrs);
     }
 
     // HIB-STOREDPROC-JIT.1 (2026-07-23): H2's `CREATE ALIAS ... AS $$` invokes
