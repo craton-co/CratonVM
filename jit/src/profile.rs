@@ -389,6 +389,19 @@ impl ProfileStore {
         }
     }
 
+    /// Reclaim every profile and warmup counter owned by an unloaded class.
+    pub fn invalidate_class(&self, class_id: u32) {
+        self.invocation_counts
+            .lock()
+            .retain(|packed, _| (*packed >> 32) as u32 != class_id);
+        for shard in &self.shards {
+            let mut methods = shard.methods.write();
+            methods.retain(|key, _| key.class_id != class_id);
+            let mut index = shard.name_index.write();
+            index.retain(|_, (key, _)| key.class_id != class_id);
+        }
+    }
+
     /// round-9 fix (HIGH): observed benign re-probe races (between the
     /// first probe and the collision re-probe, another writer published
     /// an entry that matches the queried key). Exposed for diagnostics

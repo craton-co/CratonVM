@@ -14,9 +14,12 @@ pub mod error;
 pub mod field_layout;
 pub mod field_watch;
 pub mod float_format;
+pub mod handle;
 mod heap_types;
 pub mod intern;
+pub mod jit_activation;
 pub mod loader_pin;
+pub mod metadata_pin;
 pub mod mirror_pin;
 pub mod reflective_probe;
 mod value;
@@ -26,18 +29,24 @@ pub use compact_value::{CompactTag, CompactValue, CompactValueError};
 #[cfg(any(test, debug_assertions))]
 pub use field_layout::clear_class_layouts;
 pub use field_layout::{
-    class_layout, compact_field_slot, compact_ref_fields_enabled, is_compact_object,
-    layout_generation, layout_replace_guard, object_body_size, register_class_layout,
-    set_compact_ref_fields_enabled, CompactLayout,
+    class_layout, class_layout_for_fields, compact_field_slot, compact_field_storage,
+    compact_object_body_size, compact_object_field_storage, compact_ref_fields_enabled,
+    is_compact_object,
+    layout_generation, layout_replace_guard, object_body_size, read_compact_field,
+    register_class_layout, set_compact_ref_fields_enabled, unregister_class_layout,
+    write_compact_field,
+    CompactLayout, FieldStorageKind,
 };
 pub use float_format::{java_double_to_string, java_float_to_string};
+pub use handle::{HandleScope, HandleStorage, RootedHandle};
 pub use heap_types::{
     array_data_size, array_data_size_checked, array_element_type_from_tag, element_byte_size,
     object_kind_from_tag, ArrayElementType, ObjectHeader, ObjectKind, ARRAY_ELEMENT_TYPE_OFFSET,
     ARRAY_LENGTH_OFFSET, AUTOBOX_CLASS_ID, FIELD_CELL_PAYLOAD32_OFFSET,
-    FIELD_CELL_PAYLOAD64_OFFSET, FIELD_CELL_TAG_OFFSET, GC_FLAG_COMPACT, GC_FLAG_MARKED,
-    GC_FLAG_OLD_GEN, HEADER_SIZE, INFLATED_PTR_MASK, MARK_INFLATED, MARK_NEUTRAL, MARK_STATE_MASK,
-    MARK_THIN_LOCKED, MARK_WORD_OFFSET, OBJECT_KIND_OFFSET, REF_ELEMENT_SIZE, REF_FIELD_SIZE,
+    FIELD_CELL_PAYLOAD64_OFFSET, FIELD_CELL_TAG_OFFSET, FORWARDING_PTR_OFFSET, GC_AGE_OFFSET,
+    GC_FLAGS_OFFSET, GC_FLAG_COMPACT, GC_FLAG_MARKED, GC_FLAG_OLD_GEN, HEADER_SIZE,
+    INFLATED_PTR_MASK, MARK_INFLATED, MARK_NEUTRAL, MARK_STATE_MASK, MARK_THIN_LOCKED,
+    MARK_WORD_OFFSET, NUM_SLOTS_OFFSET, OBJECT_KIND_OFFSET, REF_ELEMENT_SIZE, REF_FIELD_SIZE,
     SLOT_SIZE, THIN_LOCK_OWNER_MASK, THIN_LOCK_OWNER_SHIFT, THIN_LOCK_RECURSION_MASK,
     THIN_LOCK_RECURSION_SHIFT,
 };
@@ -98,7 +107,7 @@ mod tests {
 
     #[test]
     fn reexport_heap_constants() {
-        assert_eq!(HEADER_SIZE, 40);
+        assert_eq!(HEADER_SIZE, 32);
         assert_eq!(SLOT_SIZE, 16);
         assert_eq!(REF_ELEMENT_SIZE, 8);
         assert!(ARRAY_LENGTH_OFFSET > 0);
@@ -147,5 +156,32 @@ mod tests {
         let fake_ptr = 0x1000_u64 as *mut u8;
         let r = unsafe { ObjectRef::from_raw(fake_ptr) };
         assert_eq!(r.as_ptr() as u64, 0x1000);
+    }
+
+    #[test]
+    fn reexport_handle_types() {
+        struct S {
+            slots: Vec<Option<ObjectRef>>,
+        }
+        impl HandleStorage for S {
+            fn root(&mut self, r: ObjectRef) -> u32 {
+                self.slots.push(Some(r));
+                (self.slots.len() - 1) as u32
+            }
+            fn unroot(&mut self, slot: u32) {
+                self.slots[slot as usize] = None;
+            }
+            fn get(&self, slot: u32) -> ObjectRef {
+                self.slots[slot as usize].unwrap()
+            }
+        }
+        let mut storage = S { slots: Vec::new() };
+        let fake_ptr = 0x2000_u64 as *mut u8;
+        let r = unsafe { ObjectRef::from_raw(fake_ptr) };
+        let handle = RootedHandle::new(&mut storage, r);
+        assert_eq!(handle.get(&storage), r);
+        let mut scope = HandleScope::new(&mut storage);
+        let h2 = scope.root(r);
+        assert_eq!(scope.get(&h2), r);
     }
 }

@@ -32,7 +32,7 @@ pub use cratonvm_types::{
     ARRAY_LENGTH_OFFSET, AUTOBOX_CLASS_ID, GC_FLAG_COMPACT, GC_FLAG_MARKED, GC_FLAG_OLD_GEN,
     HEADER_SIZE, OBJECT_KIND_OFFSET, REF_ELEMENT_SIZE, REF_FIELD_SIZE, SLOT_SIZE,
 };
-use cratonvm_types::{class_layout, is_compact_object, CompactLayout};
+use cratonvm_types::{class_layout_for_fields, is_compact_object, CompactLayout};
 use std::sync::Arc;
 
 /// For a compact object (one allocated under the compact reference-field
@@ -61,24 +61,28 @@ pub(crate) fn compact_oop_scan(header: &ObjectHeader) -> Option<(Arc<CompactLayo
     // load + an `Arc` refcount bump. Validated against `layout_generation()`
     // so a redefine (which bumps the generation) cannot serve a stale layout.
     thread_local! {
-        static OOP_CACHE: std::cell::RefCell<Option<(u32, u64, Arc<CompactLayout>)>> =
+        static OOP_CACHE: std::cell::RefCell<Option<(u32, u32, u64, Arc<CompactLayout>)>> =
             const { std::cell::RefCell::new(None) };
     }
     let gen = cratonvm_types::layout_generation();
     let layout = OOP_CACHE.with(|c| {
         {
             let cache = c.borrow();
-            if let Some((cached_cid, cached_gen, arc)) = &*cache {
-                if *cached_cid == cid && *cached_gen == gen {
+            if let Some((cached_cid, cached_fields, cached_gen, arc)) = &*cache {
+                if *cached_cid == cid
+                    && *cached_fields == header.num_slots()
+                    && *cached_gen == gen
+                {
                     return Some(arc.clone());
                 }
             }
         }
-        let arc = class_layout(cid)?;
-        *c.borrow_mut() = Some((cid, gen, arc.clone()));
+        let arc = class_layout_for_fields(cid, header.num_slots())?;
+        *c.borrow_mut() = Some((cid, header.num_slots(), gen, arc.clone()));
         Some(arc)
     })?;
-    Some((layout, header.array_length as usize))
+    let body_size = layout.body_size as usize;
+    Some((layout, body_size))
 }
 
 // ---------------------------------------------------------------------------
@@ -294,15 +298,19 @@ impl Heap {
     /// # Panics
     /// Panics if `num_fields * SLOT_SIZE` overflows.
     pub fn alloc_object(&self, class_id: ClassId, num_fields: usize) -> ObjectRef {
-        let fields_size = num_fields
-            .checked_mul(SLOT_SIZE)
-            .expect("object field size overflow");
+        let compact_body =
+            cratonvm_types::compact_object_body_size(class_id.as_u32(), num_fields);
+        let fields_size = compact_body.unwrap_or_else(|| {
+            num_fields
+                .checked_mul(SLOT_SIZE)
+                .expect("object field size overflow")
+        });
         let total_size = HEADER_SIZE
             .checked_add(fields_size)
             .expect("object total size overflow");
         let ptr = self.alloc_zeroed(total_size);
 
-        let header = ObjectHeader::new(
+        let mut header = ObjectHeader::new(
             class_id,
             ObjectKind::Object,
             ArrayElementType::Reference, // unused for objects
@@ -310,6 +318,9 @@ impl Heap {
             0,
             u32::try_from(num_fields).expect("field count exceeds u32::MAX"),
         );
+        if let Some(body) = compact_body {
+            header.set_compact_shape(num_fields as u32, body);
+        }
 
         // SAFETY: `ptr` was just returned by `alloc_zeroed`, which guarantees it
         // is valid, non-null, properly aligned (8-byte), and has at least
@@ -384,7 +395,7 @@ impl Heap {
                 .get(i)
                 .and_then(|&b| default_value_for_descriptor(b))
                 .unwrap_or(Value::Object(None));
-            // SAFETY: `i < num_fields == header.num_slots`, so `slot_ptr`
+            // SAFETY: `i < num_fields == header.num_slots()`, so `slot_ptr`
             // lands within the freshly-allocated object's field region.
             unsafe {
                 let ptr = slot_ptr(obj, i);
@@ -396,7 +407,10 @@ impl Heap {
 
     /// Like `alloc_object`, but returns `None` instead of panicking on overflow.
     pub fn alloc_object_checked(&self, class_id: ClassId, num_fields: usize) -> Option<ObjectRef> {
-        let fields_size = num_fields.checked_mul(SLOT_SIZE)?;
+        let compact_body =
+            cratonvm_types::compact_object_body_size(class_id.as_u32(), num_fields);
+        let fields_size = compact_body
+            .or_else(|| num_fields.checked_mul(SLOT_SIZE))?;
         let total_size = HEADER_SIZE.checked_add(fields_size)?;
         // See `alloc_zeroed` for the NUMA hint rationale.
         let _node = self.refresh_numa_hint();
@@ -405,7 +419,7 @@ impl Heap {
         // SAFETY: same as `alloc_object` — ptr is valid, aligned, with sufficient capacity.
         unsafe {
             std::ptr::write_bytes(ptr, 0, total_size);
-            let header = ObjectHeader::new(
+            let mut header = ObjectHeader::new(
                 class_id,
                 ObjectKind::Object,
                 ArrayElementType::Reference,
@@ -413,6 +427,9 @@ impl Heap {
                 0,
                 u32::try_from(num_fields).ok()?,
             );
+            if let Some(body) = compact_body {
+                header.set_compact_shape(num_fields as u32, body);
+            }
             std::ptr::write(ptr as *mut ObjectHeader, header);
             Some(ObjectRef::from_raw(ptr))
         }
@@ -537,11 +554,23 @@ impl Heap {
     /// Panics if `index >= num_slots`.
     pub fn get_field(&self, obj_ref: ObjectRef, index: usize) -> Value {
         assert!(
-            index < self.get_header(obj_ref).num_slots as usize,
+            index < self.get_header(obj_ref).num_slots() as usize,
             "field index {} out of bounds (num_slots={})",
             index,
-            self.get_header(obj_ref).num_slots
+            self.get_header(obj_ref).num_slots()
         );
+        if let Some((offset, storage)) =
+            cratonvm_types::compact_object_field_storage(self.get_header(obj_ref), index)
+        {
+            let ptr = unsafe { obj_ref.as_ptr().add(HEADER_SIZE + offset) };
+            return unsafe {
+                cratonvm_types::read_compact_field(
+                    ptr,
+                    storage,
+                    std::sync::atomic::Ordering::Relaxed,
+                )
+            };
+        }
         // SAFETY: `obj_ref` is a live heap object. The assert above
         // confirms `index < num_slots`. `slot_ptr` computes
         // `obj_ref + HEADER_SIZE + index * SLOT_SIZE`, which is within the
@@ -558,11 +587,25 @@ impl Heap {
     /// Panics if `index >= num_slots`.
     pub fn set_field(&self, obj_ref: ObjectRef, index: usize, value: Value) {
         assert!(
-            index < self.get_header(obj_ref).num_slots as usize,
+            index < self.get_header(obj_ref).num_slots() as usize,
             "field index {} out of bounds (num_slots={})",
             index,
-            self.get_header(obj_ref).num_slots
+            self.get_header(obj_ref).num_slots()
         );
+        if let Some((offset, storage)) =
+            cratonvm_types::compact_object_field_storage(self.get_header(obj_ref), index)
+        {
+            let ptr = unsafe { obj_ref.as_ptr().add(HEADER_SIZE + offset) };
+            unsafe {
+                cratonvm_types::write_compact_field(
+                    ptr,
+                    storage,
+                    value,
+                    std::sync::atomic::Ordering::Relaxed,
+                )
+            };
+            return;
+        }
         // SAFETY: same invariant as `get_field` — index is within bounds,
         // and the slot pointer is within the allocated object block.
         unsafe {
@@ -670,7 +713,7 @@ impl Heap {
     pub fn array_length(&self, obj_ref: ObjectRef) -> usize {
         let header = self.get_header(obj_ref);
         assert_eq!(header.kind, ObjectKind::Array, "not an array");
-        header.array_length as usize
+        header.array_length() as usize
     }
 
     /// Get an array element at the given index.
@@ -679,7 +722,7 @@ impl Heap {
     pub fn get_array_element(&self, obj_ref: ObjectRef, index: usize) -> Result<Value, i32> {
         let header = self.get_header(obj_ref);
         assert_eq!(header.kind, ObjectKind::Array, "not an array");
-        if index >= header.array_length as usize {
+        if index >= header.array_length() as usize {
             return Err(index as i32);
         }
         // SAFETY: bounds check passed above (`index < array_length`).
@@ -708,7 +751,7 @@ impl Heap {
     ) -> Result<Value, i32> {
         let header = self.get_header(obj_ref);
         assert_eq!(header.kind, ObjectKind::Array, "not an array");
-        if index >= header.array_length as usize {
+        if index >= header.array_length() as usize {
             return Err(index as i32);
         }
         // SAFETY: bounds check passed above. Same invariant as `get_array_element`.
@@ -795,7 +838,7 @@ impl Heap {
     ) -> Result<(), i32> {
         let header = self.get_header(obj_ref);
         assert_eq!(header.kind, ObjectKind::Array, "not an array");
-        if index >= header.array_length as usize {
+        if index >= header.array_length() as usize {
             return Err(index as i32);
         }
         // SAFETY: bounds check passed above. Same invariant as `get_array_element`.
@@ -1758,7 +1801,7 @@ mod tests {
         let header = heap.get_header(obj);
         assert_eq!(header.class_id, class_id);
         assert_eq!(header.kind, ObjectKind::Object);
-        assert_eq!(header.num_slots, 3);
+        assert_eq!(header.num_slots(), 3);
         assert_ne!(header.identity_hash_code, 0);
     }
 
@@ -1831,7 +1874,7 @@ mod tests {
         assert_eq!(header.class_id, class_id);
         assert_eq!(header.kind, ObjectKind::Array);
         assert_eq!(header.element_type, ArrayElementType::Int);
-        assert_eq!(header.array_length, 5);
+        assert_eq!(header.array_length(), 5);
         assert_eq!(heap.array_length(arr), 5);
     }
 
@@ -1989,7 +2032,7 @@ mod tests {
         let obj = obj.unwrap();
         let header = heap.get_header(obj);
         assert_eq!(header.class_id, ClassId::new(1));
-        assert_eq!(header.num_slots, 2);
+        assert_eq!(header.num_slots(), 2);
     }
 
     #[test]
@@ -2080,7 +2123,7 @@ mod tests {
         let header = heap.get_header(obj);
         assert_eq!(header.class_id, ClassId::new(7));
         assert_eq!(header.kind, ObjectKind::Object);
-        assert_eq!(header.num_slots, 3);
+        assert_eq!(header.num_slots(), 3);
     }
 
     #[test]
@@ -2667,7 +2710,7 @@ mod tests {
             // The header decodes correctly via the new address.
             let h = heap.get_header(arr_new);
             assert_eq!(h.kind, ObjectKind::Array);
-            assert_eq!(h.array_length, 4);
+            assert_eq!(h.array_length(), 4);
             assert_eq!(h.class_id, ClassId::new(7));
             // And the element values survived.
             assert_eq!(

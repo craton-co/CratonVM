@@ -294,6 +294,35 @@ pub fn force_non_moving_jit_roots() -> bool {
 
 thread_local! {
     static MAJOR_GC_REQUESTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static CLASS_UNLOAD_MARKING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run one root-gather operation for a collector's non-moving class-unloading
+/// mark. Ordinary moving/evacuating pauses keep loader metadata strongly
+/// rooted; only an initial/final full-mark snapshot may publish conditional
+/// loader-owned edges.
+pub fn with_class_unload_marking<T>(f: impl FnOnce() -> T) -> T {
+    struct Reset(bool);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            CLASS_UNLOAD_MARKING.with(|flag| flag.set(self.0));
+        }
+    }
+
+    let previous = CLASS_UNLOAD_MARKING.with(|flag| {
+        let previous = flag.get();
+        flag.set(true);
+        previous
+    });
+    let _reset = Reset(previous);
+    f()
+}
+
+/// Whether this thread is gathering roots for a full non-moving mark whose
+/// side-edge closure understands loader-owned metadata.
+#[inline]
+pub fn class_unload_marking() -> bool {
+    CLASS_UNLOAD_MARKING.with(std::cell::Cell::get)
 }
 
 /// Request that the next collection on this thread run a full (major) cycle

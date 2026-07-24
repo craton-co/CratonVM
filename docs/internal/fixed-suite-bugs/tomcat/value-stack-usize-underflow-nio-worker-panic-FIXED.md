@@ -30,7 +30,7 @@ crash.
 - `org.apache.catalina.nonblocking.TestNonBlockingAPI` — panic fired around
   test ~30-35 of 44 parameterized cases. (This class also fails on HotSpot
   for an unrelated, still-untriaged reason — tracked in
-  `docs/known-issues/tomcat/untriaged-oddities.md`; that failure never
+  `../../../known-issues/tomcat/untriaged-oddities.md`; that failure never
   explained the panic, which was CratonVM-only.)
 - `org.apache.tomcat.websocket.TestWebSocketFrameClientSSL` — same
   `value_stack.rs:237:25`, same `u64::MAX` signature, over WebSocket/TLS

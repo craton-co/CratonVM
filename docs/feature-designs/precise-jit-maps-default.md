@@ -669,6 +669,6 @@ work. They are described here; this doc does not implement them.
   default-off `CRATONVM_PRECISE_COVERAGE_PIN` knob so the pin-on-uncovered
   policy can be A/B-tested before becoming unconditional.
 - **Regression-pool GC-root lane.** A `test-infra/regression-pool` config that
-  runs the A1–A4 repros (`docs/internal/repros/A2-reflrepro`,
+  runs the A1–A4 repros (`../internal/fixed-suite-bugs/repros/A2-reflrepro`,
   `…/A4-fork6`, `MinRegexProbe`) + the named register-invisibility apps with
   precise on and diffs against HotSpot baselines. Harness/config only.

@@ -2,7 +2,7 @@
 
 ## Scope
 
-Follow-up cluster from `docs/known-issues/spring-boot-core39-residual-clusters-20260723.md`, Cluster B:
+Follow-up cluster from `../../../known-issues/springboot/spring-boot-core39-residual-clusters-20260723.md`, Cluster B:
 
 - `org.springframework.boot.diagnostics.analyzer.NoSuchMethodFailureAnalyzerTests`
 - `org.springframework.boot.info.ProcessInfoTests`

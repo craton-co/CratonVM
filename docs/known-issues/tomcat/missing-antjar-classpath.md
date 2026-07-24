@@ -39,7 +39,7 @@ harness at `apps\tomcat-suite-runner\.suite\apache-ant\lib\{ant.jar,ant-launcher
 (or install fresh: `sudo apt-get install ant` on the Azure host, then point
 at `/usr/share/java/ant.jar` + `ant-launcher.jar`). Append both to
 `cp-linux-fixed.txt` (or the `$CP` construction in
-`apps/tomcat-suite-runner/run-tomcat-suite.sh`) and rerun both classes.
+`../../../apps/tomcat-suite-runner/run-tomcat-suite.sh`) and rerun both classes.
 
 ## Verify
 

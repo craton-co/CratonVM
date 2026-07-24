@@ -3018,7 +3018,7 @@ fn is_known_miscompile(class_name: &str, method_name: &str) -> bool {
 /// `ExclusiveNode` and immediately `casHead`s it in — an allocate-then-CAS
 /// hazard structurally identical to the allocate-then-putfield family, but
 /// running only once per lock instance (its first-ever contended acquire),
-/// which is exactly why light-contention repros (a handful of threads,
+/// which is exactly why light-contention springboot (a handful of threads,
 /// brief hold times) never trigger it while heavy-contention ones
 /// (many threads, deep contention) reliably do — matching the observed gap
 /// between an initial 4-thread stress repro (passed) and the real
@@ -3041,7 +3041,7 @@ fn is_known_miscompile_aqs_family(class_name: &str, method_name: &str) -> bool {
         // seconds under real CPU load -- the same "AbstractQueuedLongSynchronizer.
         // acquire" family hang this list already documents lower down, just
         // one level deeper (the CAS primitive `acquire` itself calls, not
-        // `acquire`). See docs/known-issues/h2-suite-bugs/
+        // `acquire`). See docs/known-issues/h2/
         // bug-h2-testfilesystem-testconcurrent-async-hang.md.
         ("java/util/concurrent/locks/AbstractQueuedSynchronizer", "compareAndSetState")
             | ("java/util/concurrent/locks/AbstractQueuedSynchronizer", "getState")

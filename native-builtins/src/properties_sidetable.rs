@@ -175,7 +175,7 @@ fn key_for(ctx: &dyn NativeContext, obj: ObjectRef) -> usize {
 // 10_000 distinct `Properties` objects had EVER been registered in this
 // process's lifetime, every subsequent brand-new object silently lost all
 // `put`/`getProperty` calls forever (no exception, no eviction). See
-// docs/known-issues/h2-suite-bugs/bug-h2-properties-sidetable-global-cap-silent-drop.md.
+// docs/known-issues/h2/bug-h2-properties-sidetable-global-cap-silent-drop.md.
 // H2's `TestAnalyzeTableTx` (10_000 connections in a loop, each constructing
 // a JDBC-properties object) crosses that watermark and starts reading back
 // empty username/password, which H2 correctly reports as "Wrong user name or

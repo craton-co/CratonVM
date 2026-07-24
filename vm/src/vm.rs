@@ -54107,7 +54107,7 @@ mod tests {
         let vt = shared.heap.alloc_object(ClassId::new(0), 5);
         shared.heap.set_field(vt, 4, Value::Int(1));
         let header = shared.heap.get_header(vt);
-        assert!(header.num_slots >= 5);
+        assert!(header.num_slots() >= 5);
         assert!(matches!(shared.heap.get_field(vt, 4), Value::Int(1)));
 
         // 5-field Thread with field 4 = 0 (platform)
@@ -54118,7 +54118,7 @@ mod tests {
         // 3-field Thread (no field 4, platform by default)
         let st = shared.heap.alloc_object(ClassId::new(0), 3);
         let h = shared.heap.get_header(st);
-        assert!(h.num_slots < 5);
+        assert!(h.num_slots() < 5);
     }
 
     // =========================================================================
@@ -72851,19 +72851,16 @@ public class SkippedTest {
         use cratonvm_gc::compact_header::{migrate_to_compact, to_legacy_fields};
         use cratonvm_gc::HashCodeTable;
 
-        let old = cratonvm_gc::heap::ObjectHeader {
-            class_id: cratonvm_types::ClassId::new(42),
-            kind: cratonvm_gc::heap::ObjectKind::Array,
-            element_type: cratonvm_gc::heap::ArrayElementType::Long,
-            _padding: [0; 2],
-            identity_hash_code: 777,
-            array_length: 10,
-            num_slots: 10,
-            gc_age: 3,
-            gc_flags: 0x01,
-            _gc_reserved: [0; 2],
-            forwarding_ptr: std::ptr::null_mut(),
-        };
+        let mut old = cratonvm_gc::heap::ObjectHeader::new(
+            cratonvm_types::ClassId::new(42),
+            cratonvm_gc::heap::ObjectKind::Array,
+            cratonvm_gc::heap::ArrayElementType::Long,
+            777,
+            10,
+            0,
+        );
+        old.gc_age = 3;
+        old.gc_flags = 0x01;
 
         let ht = HashCodeTable::new();
         let compact = migrate_to_compact(&old, 42, &ht, 0x2000);

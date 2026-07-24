@@ -5,7 +5,7 @@
 H2-internals-independent CratonVM correctness bug — not specific to any
 particular application suite. Discovered as a side effect of the H2
 `TestUpgrade` Parser-loader-collapse fix session (see
-`docs/known-issues/h2-suite-bugs/bug-h2-suite-residual-fail-triage.md`'s
+`../../../known-issues/h2/bug-h2-suite-residual-fail-triage.md`'s
 ninth-pass section) while investigating a deeper `TestUpgrade`
 LOB-migration residual, and confirmed to be the same root cause as a
 separately-observed dev regression in `org.h2.test.db.TestLinkedTable` /

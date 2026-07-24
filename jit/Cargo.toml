@@ -14,6 +14,7 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
+arc-swap = "1.7"
 cratonvm-types = { path = "../types", version = "0.3.0" }
 cratonvm-reader = { path = "../reader", version = "0.3.0" }
 cratonvm-jit-api = { path = "../jit-api", version = "0.3.0" }

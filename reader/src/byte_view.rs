@@ -26,6 +26,96 @@ use std::sync::Arc;
 
 use crate::class_reader_error::ClassReaderError;
 
+/// Reference-counted bytes whose storage may be either an ordinary
+/// `Arc<[u8]>` or an external immutable backing such as a file mapping.
+///
+/// Keeping the storage abstraction in the reader lets class-file `ByteView`s
+/// point directly into stored ZIP entries without copying the whole archive
+/// or class into a second allocation.
+#[derive(Clone)]
+pub enum SharedBytes {
+    Owned(Arc<[u8]>),
+    External(Arc<dyn AsRef<[u8]> + Send + Sync>),
+}
+
+impl SharedBytes {
+    #[inline]
+    pub fn from_external<T>(source: T) -> Self
+    where
+        T: AsRef<[u8]> + Send + Sync + 'static,
+    {
+        Self::External(Arc::new(source))
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.as_ref().len()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.as_ref().is_empty()
+    }
+
+    /// Whether the bytes retain an external immutable backing such as a
+    /// read-only JAR mapping instead of owning a copied allocation.
+    #[inline]
+    pub fn is_external(&self) -> bool {
+        matches!(self, Self::External(_))
+    }
+}
+
+impl From<Vec<u8>> for SharedBytes {
+    fn from(bytes: Vec<u8>) -> Self {
+        Self::Owned(Arc::from(bytes))
+    }
+}
+
+impl From<Arc<[u8]>> for SharedBytes {
+    fn from(bytes: Arc<[u8]>) -> Self {
+        Self::Owned(bytes)
+    }
+}
+
+impl From<&[u8]> for SharedBytes {
+    fn from(bytes: &[u8]) -> Self {
+        Self::Owned(Arc::from(bytes))
+    }
+}
+
+impl AsRef<[u8]> for SharedBytes {
+    #[inline]
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            Self::Owned(bytes) => bytes,
+            Self::External(bytes) => bytes.as_ref().as_ref(),
+        }
+    }
+}
+
+impl Deref for SharedBytes {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        self.as_ref()
+    }
+}
+
+impl std::fmt::Debug for SharedBytes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SharedBytes")
+            .field("len", &self.len())
+            .field(
+                "storage",
+                &match self {
+                    Self::Owned(_) => "owned",
+                    Self::External(_) => "external",
+                },
+            )
+            .finish()
+    }
+}
+
 /// A zero-copy view into a shared `Arc<[u8]>` buffer.
 ///
 /// Cloning a `ByteView` is a single atomic refcount bump on the parent
@@ -33,7 +123,7 @@ use crate::class_reader_error::ClassReaderError;
 /// `&source[start..end]`.
 #[derive(Clone)]
 pub struct ByteView {
-    source: Arc<[u8]>,
+    source: SharedBytes,
     start: usize,
     end: usize,
 }
@@ -66,7 +156,8 @@ impl ByteView {
     #[deprecated(note = "prefer try_new for runtime-derived offsets")]
     #[track_caller]
     #[inline]
-    pub(crate) fn new(source: Arc<[u8]>, range: Range<usize>) -> Self {
+    pub(crate) fn new(source: impl Into<SharedBytes>, range: Range<usize>) -> Self {
+        let source = source.into();
         assert!(range.start <= range.end, "ByteView range start > end");
         assert!(
             range.end <= source.len(),
@@ -91,7 +182,11 @@ impl ByteView {
     /// Unknown attribute data) uses this constructor so a malformed
     /// class file produces an error instead of aborting the process.
     #[inline]
-    pub fn try_new(source: Arc<[u8]>, range: Range<usize>) -> Result<Self, ClassReaderError> {
+    pub fn try_new(
+        source: impl Into<SharedBytes>,
+        range: Range<usize>,
+    ) -> Result<Self, ClassReaderError> {
+        let source = source.into();
         if range.start > range.end || range.end > source.len() {
             return Err(ClassReaderError::InvalidClassData {
                 message: format!(
@@ -116,7 +211,7 @@ impl ByteView {
     #[inline]
     pub fn from_vec(bytes: Vec<u8>) -> Self {
         let len = bytes.len();
-        let source: Arc<[u8]> = Arc::from(bytes);
+        let source = SharedBytes::from(bytes);
         Self {
             source,
             start: 0,
@@ -131,7 +226,7 @@ impl ByteView {
     #[inline]
     pub fn from_slice(bytes: &[u8]) -> Self {
         let len = bytes.len();
-        let source: Arc<[u8]> = Arc::from(bytes);
+        let source = SharedBytes::from(bytes);
         Self {
             source,
             start: 0,
@@ -142,7 +237,7 @@ impl ByteView {
     /// Empty view — does not allocate.
     #[inline]
     pub fn empty() -> Self {
-        let empty: Arc<[u8]> = Arc::from(Vec::<u8>::new());
+        let empty = SharedBytes::from(Vec::<u8>::new());
         Self {
             source: empty,
             start: 0,
@@ -154,7 +249,7 @@ impl ByteView {
     #[inline]
     pub fn as_bytes(&self) -> &[u8] {
         // SAFETY of bounds: enforced by `ByteView::new`.
-        &self.source[self.start..self.end]
+        &self.source.as_ref()[self.start..self.end]
     }
 
     /// Number of bytes in the view.

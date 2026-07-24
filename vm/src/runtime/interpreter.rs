@@ -1740,6 +1740,13 @@ pub fn force_gc_from_native(shared: &SharedVm, thread: &mut JvmThread) {
     // full collection that processes every generation's references; this
     // IHOP/completion check is the closest cycle-machinery equivalent.
     maybe_concurrent_gc(shared, thread);
+    if shared.heap.is_g1() {
+        // An explicit System.gc() is a full-collection request, not merely an
+        // Eden evacuation. Finish the G1 mark/remark/cleanup synchronously so
+        // dead old regions, weak loaders, and their metadata are observable
+        // before System.gc() returns.
+        g1_force_full_cycle(shared, thread);
+    }
     // Run pending finalizers
     run_finalizers(shared, thread);
     // Run pending Cleaner actions (NEW-17). These were submitted to
@@ -1963,10 +1970,21 @@ fn process_references_after_gc(
         let is_marked = |addr: usize| -> bool {
             pointer_map.contains_key(&addr) || shared.heap.is_addr_live(addr)
         };
-        cratonvm_native_builtins::classloader::gc_reconcile_defining_loaders(
+        let dead_class_hints =
+            cratonvm_native_builtins::classloader::gc_reconcile_defining_loaders(
             &is_marked,
             pointer_map,
         );
+        let unload =
+            crate::memory::gc::unload_dead_class_metadata(shared, &dead_class_hints);
+        if unload.classes_unloaded != 0 {
+            tracing::debug!(
+                loaders = unload.loaders_unloaded,
+                classes = unload.classes_unloaded,
+                jit_entries = unload.jit_entries_retired,
+                "class-loader metadata unloaded"
+            );
+        }
         // Prune dead entries from the overlay-backed-collection side-tables
         // (LinkedList / LinkedHashMap / TreeMap / TreeSet — `roots.rs` step 17
         // / `native_collections::gc_scan_collection_overlay_roots`). This
@@ -2874,21 +2892,17 @@ fn tlab_alloc_object_inner(
 #[inline(always)]
 fn init_object_header(ptr: *mut u8, class_id: ClassId, num_fields: usize, identity_hash_code: i32) {
     use cratonvm_gc::heap::{ArrayElementType, ObjectHeader, ObjectKind};
-    let header = ObjectHeader {
+    let header = ObjectHeader::new(
         class_id,
-        kind: ObjectKind::Object,
-        element_type: ArrayElementType::Reference,
-        _padding: [0; 2],
+        ObjectKind::Object,
+        ArrayElementType::Reference,
         identity_hash_code,
-        array_length: 0,
-        // Truncation-checked: num_fields (usize) to u32; JVM classes have < 2^16 fields
-        num_slots: u32::try_from(num_fields).unwrap_or(u32::MAX),
-        gc_age: 0,
-        gc_flags: 0,
-        _gc_reserved: [0; 2],
-        forwarding_ptr: std::ptr::null_mut(),
-        mark_word: std::sync::atomic::AtomicU64::new(cratonvm_types::MARK_NEUTRAL),
-    };
+        0,
+        // A class-file field table is u16-sized, so this is unreachable for a
+        // verified Java class. Keep the allocation path panic-free if a corrupt
+        // synthetic caller nevertheless violates that invariant.
+        u32::try_from(num_fields).unwrap_or(u32::MAX),
+    );
     // SAFETY: ptr points to freshly allocated, properly aligned memory for an ObjectHeader.
     unsafe { std::ptr::write(ptr as *mut ObjectHeader, header) };
     // A2 breadcrumb (CRATONVM_DBG_A2): the interpreter TLAB fast path bypasses
@@ -3922,7 +3936,7 @@ pub(crate) fn apply_pointer_map_to_thread(
                     if a != 0 {
                         // SAFETY: `a` is a non-null heap address from a live Object local; reading its ObjectHeader is valid for the lifetime of the borrow.
                         let h = unsafe { &*(a as *const ObjectHeader) };
-                        if h.class_id.as_u32() == 0 && h.num_slots == 0 && h.array_length == 0 {
+                        if h.class_id.as_u32() == 0 && h.num_slots() == 0 && h.array_length() == 0 {
                             eprintln!(
                                 "POST-GC ZERO-HEADER PARKED tid={} frame[{}] {}.{} local[{}] pc={} addr=0x{:x}",
                                 tname, fi, cn, mn, li, frame.pc, a
@@ -3939,7 +3953,7 @@ pub(crate) fn apply_pointer_map_to_thread(
                 if a != 0 {
                     // SAFETY: `a` is a non-null heap address from a live Object stack slot; reading its ObjectHeader is valid for the lifetime of the borrow.
                     let h = unsafe { &*(a as *const ObjectHeader) };
-                    if h.class_id.as_u32() == 0 && h.num_slots == 0 && h.array_length == 0 {
+                    if h.class_id.as_u32() == 0 && h.num_slots() == 0 && h.array_length() == 0 {
                         eprintln!(
                             "POST-GC ZERO-HEADER PARKED-STACK tid={} frame[{}] {}.{} pc={} addr=0x{:x}",
                             tname, fi, cn, mn, frame.pc, a
@@ -4272,7 +4286,9 @@ fn g1_concurrent_mark_cycle(shared: &SharedVm, thread: &mut JvmThread) {
         let ref_objs = shared.ref_processor.lock().reference_object_addresses();
         shared.heap.g1_set_reference_skip_set(&ref_objs);
         // Mark roots into the G1 mark bitmap
-        let roots = collect_roots(shared, thread);
+        let roots = cratonvm_gc::gc_quiescence::with_class_unload_marking(|| {
+            collect_roots(shared, thread)
+        });
         let snapshot_roots = shared.thread_registry.collect_all_root_snapshots();
         let all_roots: Vec<cratonvm_types::ObjectRef> = roots
             .into_iter()
@@ -4364,7 +4380,9 @@ fn g1_final_remark_cleanup(shared: &SharedVm, thread: &mut JvmThread) {
         // mutators' buffers are pulled by `remark` itself
         // (`flush_all_thread_satb_buffers`) now that they are parked.
         shared.heap.flush_thread_satb();
-        let roots = collect_roots(shared, thread);
+        let roots = cratonvm_gc::gc_quiescence::with_class_unload_marking(|| {
+            collect_roots(shared, thread)
+        });
         let snapshot_roots = shared.thread_registry.collect_all_root_snapshots();
         let all_roots: Vec<cratonvm_types::ObjectRef> = roots
             .into_iter()
@@ -4428,17 +4446,27 @@ fn g1_remark_process_references(
     shared: &SharedVm,
     is_marked: &dyn Fn(usize) -> bool,
 ) -> Vec<usize> {
-    // Companion reconciliation for the class-mirror cache (see
-    // `memory::gc::reconcile_class_mirrors` / `roots.rs` step 6). `roots.rs`
-    // step 6 only stops unconditionally rooting a user-defined class's mirror
-    // when the Generational collector's non-moving marker is active — NOT
-    // under G1 (no mirror_pin propagation wired into `g1.rs` yet) — so under
-    // G1 every mirror stays rooted and this call is a no-op (`is_marked`
-    // always true, nothing pruned). Kept here anyway, unconditionally, so
-    // this stays correct for free if G1 ever gains the same treatment. Done
-    // before the `no_refproc` short-circuit, same rationale as the post-GC
-    // path.
+    // G1's marker follows loader/mirror/metadata side edges during a full mark.
+    // Reconcile those weak ownership tables against the completed bitmap before
+    // cleanup frees dead regions and before the optional reference-processor
+    // short-circuit.
     crate::memory::gc::reconcile_class_mirrors(shared, is_marked);
+    let no_moves = std::collections::HashMap::new();
+    let dead_class_hints =
+        cratonvm_native_builtins::classloader::gc_reconcile_defining_loaders(
+            is_marked,
+            &no_moves,
+        );
+    let unloaded =
+        crate::memory::gc::unload_dead_class_metadata(shared, &dead_class_hints);
+    if unloaded.classes_unloaded != 0 {
+        tracing::debug!(
+            loaders = unloaded.loaders_unloaded,
+            classes = unloaded.classes_unloaded,
+            jit_entries = unloaded.jit_entries_retired,
+            "G1 class-loader metadata unloaded at final remark"
+        );
+    }
 
     // Same subsystem-level exclusion switch as the post-GC path.
     if no_refproc() {
@@ -4977,7 +5005,7 @@ pub fn execute(
     // SpringApplication.run() catch the failure, log it through its own
     // failure path, and at least produce a partial banner / startup-failure
     // banner before exiting.
-    let (code_attr, source_file, class_name_str, is_synchronized) = {
+    let (code_attr, source_file, class_name_str, is_synchronized, is_static) = {
         let cm = shared.class_manager.read();
         let class = cm.get_class(class_id).ok_or_else(|| VmError::Internal {
             message: format!("class {class_id} not found"),
@@ -4993,6 +5021,7 @@ pub fn execute(
             })?;
         let has_code = method.code().is_some();
         let is_synchronized = method.is_synchronized();
+        let is_static = method.is_static();
         let class_name_owned = class.name.to_string();
         let code_attr_opt = method.code().cloned();
         let source_file = class.source_file.clone();
@@ -5411,7 +5440,13 @@ pub fn execute(
                 }));
             }
         };
-        (code_attr, source_file, class_name_owned, is_synchronized)
+        (
+            code_attr,
+            source_file,
+            class_name_owned,
+            is_synchronized,
+            is_static,
+        )
     };
 
     // If the JIT early-compile path encounters an exception from a callee
@@ -5532,7 +5567,13 @@ pub fn execute(
         // Mirrors the gates in `try_jit_compile_callee` / `try_jit_upgrade_with_gate` /
         // `try_osr` so the user-facing CRATONVM_DISABLE_JIT flag actually disables
         // the FIRST-CALL JIT compile path here too.
-        let env_disable_jit = crate::runtime::env_cache::disable_jit();
+        // Continuations currently freeze precise interpreter frames. Until a
+        // compiled activation can deopt directly into a heap stack chunk, a
+        // virtual thread must not enter machine code that may cross a yield.
+        // This is a per-thread execution gate; platform threads still compile
+        // and use the shared artifacts normally.
+        let env_disable_jit = crate::runtime::env_cache::disable_jit()
+            || matches!(thread.kind, crate::threading::ThreadKind::Virtual);
         let redefine_jit_quiesced = crate::classloading::any_class_redefined();
         // GPU-offload JIT admission gate (known-issues followups item 2):
         // while `--gpu` is active, a caller whose bytecode contains an
@@ -6931,6 +6972,83 @@ pub fn execute(
                                             deopt_reason,
                                             rframe_for_despec.bci,
                                         );
+                                    // This first-call tier-up sink historically
+                                    // discarded the reconstructed frame and
+                                    // restarted the method at bci 0. That
+                                    // duplicates every side effect committed
+                                    // before the guard. Build the same cached
+                                    // metadata the hot callsites use and resume
+                                    // the captured frame directly.
+                                    if compiled.can_deopt_resume
+                                        && deopt_frame_matches_method(
+                                            &rframe_for_despec,
+                                            &class_name_str,
+                                            method_name,
+                                            method_descriptor,
+                                        )
+                                    {
+                                        let cached = Arc::new(CachedBytecodeMethod {
+                                            declaring_class_id: class_id,
+                                            class_name: Arc::from(class_name_str.as_str()),
+                                            method_name: Arc::from(method_name),
+                                            method_descriptor: Arc::from(method_descriptor),
+                                            source_file: source_file
+                                                .as_deref()
+                                                .map(Arc::from),
+                                            code: crate::runtime::frame::padded_bytecode(
+                                                &code_attr.code,
+                                            ),
+                                            exception_table: Arc::from(
+                                                code_attr.exception_table.as_slice(),
+                                            ),
+                                            max_stack: code_attr.max_stack,
+                                            max_locals: code_attr.max_locals,
+                                            num_params: count_method_params(method_descriptor)
+                                                as u16,
+                                            is_synchronized,
+                                            is_static,
+                                            force_native_cache: std::sync::OnceLock::new(),
+                                            native_callback_cache: std::sync::OnceLock::new(),
+                                        });
+                                        let pin_base = thread.native_pin_roots.len();
+                                        if let Some(frame) = build_deopt_frame_inner(
+                                            shared,
+                                            thread,
+                                            &cached,
+                                            &rframe_for_despec,
+                                            false,
+                                        ) {
+                                            // Keep materialization pins live
+                                            // through the frame-push handoff and
+                                            // the resumed execution. The frame
+                                            // itself is authoritative after push;
+                                            // retaining the pins a little longer
+                                            // is conservative and guarantees
+                                            // cleanup on every returned result.
+                                            let resumed =
+                                                execute_prebuilt_frame(shared, thread, frame);
+                                            thread.native_pin_roots.truncate(pin_base);
+                                            return resumed;
+                                        }
+                                        thread.native_pin_roots.truncate(pin_base);
+                                    }
+                                    // Precise reconstruction is a correctness
+                                    // requirement once native code has executed
+                                    // past bci 0. Refuse a whole-method replay:
+                                    // it is observably wrong for methods with
+                                    // stores, I/O, monitor actions, or callbacks.
+                                    return Err(MethodCallFailed::InternalError(
+                                        VmError::Internal {
+                                            message: format!(
+                                                "precise deoptimization unavailable for \
+                                                 {}.{}{} at bci {}; refusing side-effecting replay",
+                                                class_name_str,
+                                                method_name,
+                                                method_descriptor,
+                                                rframe_for_despec.bci
+                                            ),
+                                        },
+                                    ));
                                 }
                                 // Deoptimized — pending-NPE drain was hoisted above the
                                 // i64::MIN branch (round-8 CRIT fix); fall through to
@@ -7173,6 +7291,16 @@ pub fn execute(
         }
     };
 
+    // A continuation yield is a scheduler control transfer, not a method
+    // failure. Keep every frame exactly as execute_frame left it so the
+    // virtual-thread manager can freeze the complete Java stack.
+    if matches!(
+        result,
+        Err(MethodCallFailed::InternalError(VmError::ContinuationYield { .. }))
+    ) {
+        return result;
+    }
+
     // Truncate any orphaned inner frames that execute_frame may have left on the
     // stack when it returned early via `return Err(e)` without popping callees.
     // We expect exactly `frames_depth_before_push + 1` frames here (the one we
@@ -7184,6 +7312,46 @@ pub fn execute(
     // Pop frame and recycle its Vec allocations
     pop_and_recycle_frame(shared, thread);
 
+    result
+}
+
+/// Resume a complete Java stack restored from a virtual-thread continuation.
+///
+/// Unlike `execute`, no new root frame is created: every frame already carries
+/// its exact bytecode PC, locals, operand stack, exception table, and method
+/// identity. Dispatch begins at the youngest frame and may return/unwind
+/// through all restored callers down to index zero.
+pub fn resume_continuation(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+) -> MethodCallResult {
+    if thread.frames.is_empty() {
+        return Ok(None);
+    }
+    if crate::runtime::env_cache::frame_trace() {
+        eprintln!("[CONTINUATION_RESUME] frames={}", thread.frames.len());
+        for (index, frame) in thread.frames.iter().enumerate() {
+            eprintln!(
+                "  [{index}] {}.{}{} pc={} stack={}",
+                frame.class_name(),
+                frame.method_name(),
+                frame.method_descriptor(),
+                frame.pc,
+                frame.stack.len(),
+            );
+        }
+    }
+    let result = execute_frame_from_index(shared, thread, 0);
+    if matches!(
+        result,
+        Err(MethodCallFailed::InternalError(VmError::ContinuationYield { .. }))
+    ) {
+        return result;
+    }
+    while thread.frames.len() > 1 {
+        pop_and_recycle_frame(shared, thread);
+    }
+    pop_and_recycle_frame(shared, thread);
     result
 }
 
@@ -7480,6 +7648,9 @@ pub(crate) fn try_osr_with_backoff(
     initial_frame_idx: usize,
     entry_pc: usize,
 ) -> OsrBackoffOutcome {
+    if matches!(thread.kind, crate::threading::ThreadKind::Virtual) {
+        return OsrBackoffOutcome::Skip;
+    }
     // Back-edge OSR is default-on after the known entry-state corruption
     // blockers were retired. Whole-method JIT is unaffected. `CRATONVM_JIT_OSR=0`
     // opts out for diagnosis/bisection. This is the canonical entry for BOTH the
@@ -7572,7 +7743,17 @@ pub(crate) fn try_osr_with_backoff(
 
 fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult {
     let initial_frame_idx = thread.frames.len() - 1;
-    let mut frame_idx = initial_frame_idx;
+    execute_frame_from_index(shared, thread, initial_frame_idx)
+}
+
+/// Execute a previously frozen stack. `initial_frame_idx` is the oldest frame
+/// owned by this invocation, while dispatch resumes at the current top frame.
+fn execute_frame_from_index(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    initial_frame_idx: usize,
+) -> MethodCallResult {
+    let mut frame_idx = thread.frames.len() - 1;
     // AUDIT CRIT-3 fix: hoist the PGO-enabled atomic load ONCE per
     // execute_frame invocation.  Branch sites in the interpreter hot loop
     // (~13 of them) test this local instead of doing an atomic load + 2
@@ -10156,6 +10337,16 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                 }
                 return Ok(value);
             }
+            Err(MethodCallFailed::InternalError(
+                yield_signal @ VmError::ContinuationYield { .. },
+            )) => {
+                // Yield crosses every nested execute_frame boundary without
+                // unwinding a Java frame. In particular, preserve the leaf
+                // frame whose native sleep/park issued the signal: its PC is
+                // already after the invoke and its operand stack contains the
+                // live values needed when the continuation is remounted.
+                return Err(MethodCallFailed::InternalError(yield_signal));
+            }
             Err(MethodCallFailed::InternalError(VmError::Runtime(re))) => {
                 // B4 fix (audit `vm-runtime.md`): an operand-stack overflow is
                 // reported by `ValueStack::push` as
@@ -12047,12 +12238,10 @@ fn stamp_compilation_epoch(
 ///
 /// Returns `Some` when the frame was resumed (caller returns it), `None` to
 /// fall through to the whole-method re-run.
-/// Read-once mirror of the jit crate's `CRATONVM_JIT_FREE_CODE` check (see
-/// `jit/src/deopt.rs::jit_free_code_enabled`): `true` only in the A/B mode
-/// that actually frees evicted artifacts and their deopt-point boxes.
+/// Legacy compatibility mirror. Ownership-safe reclamation keeps an executing
+/// artifact's reconstruction metadata alive, so stale frames remain resumable.
 fn vm_jit_free_code_enabled() -> bool {
-    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var_os("CRATONVM_JIT_FREE_CODE").is_some())
+    false
 }
 
 /// jit-invokedynamic-groovy-regression fix — does the stashed reconstructed
@@ -14719,7 +14908,7 @@ fn execute_instruction(
                             // Cast: object/code pointer to integer address
                             obj_ref.as_ptr() as usize,
                             field.field_index,
-                            shared.heap.get_header(obj_ref).num_slots,
+                            shared.heap.get_header(obj_ref).num_slots(),
                             matches!(raw, Value::Object(Some(_))),
                             thread.frames[frame_idx].class_name(),
                         );
@@ -14776,7 +14965,7 @@ fn execute_instruction(
                     // container with fields.
                     if p != 0 && shared.heap.is_heap_addr(p).is_some() {
                         let h = shared.heap.get_header(obj_ref);
-                        if h.class_id.as_u32() == 0 && h.num_slots == 0 {
+                        if h.class_id.as_u32() == 0 && h.num_slots() == 0 {
                             use std::sync::atomic::{AtomicUsize, Ordering};
                             static NZ: AtomicUsize = AtomicUsize::new(0);
                             let n = NZ.fetch_add(1, Ordering::Relaxed);
@@ -15223,7 +15412,7 @@ fn execute_instruction(
                             // Cast: object/code pointer to integer address
                             obj_ref.as_ptr() as usize,
                             field.field_index,
-                            shared.heap.get_header(obj_ref).num_slots,
+                            shared.heap.get_header(obj_ref).num_slots(),
                             matches!(value, Value::Object(Some(_))),
                             thread.frames[frame_idx].class_name(),
                         );
@@ -15241,8 +15430,8 @@ fn execute_instruction(
                 if straystack_enabled() {
                     let h = shared.heap.get_header(obj_ref);
                     // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
-                    let ns = h.num_slots as usize;
-                    if field.field_index >= ns || h.num_slots > (1 << 24) {
+                    let ns = h.num_slots() as usize;
+                    if field.field_index >= ns || h.num_slots() > (1 << 24) {
                         use std::sync::atomic::{AtomicUsize, Ordering};
                         static N: AtomicUsize = AtomicUsize::new(0);
                         let k = N.fetch_add(1, Ordering::Relaxed);
@@ -15253,7 +15442,7 @@ fn execute_instruction(
                             // Cast: object/code pointer to integer address
                             obj_ref.as_ptr() as usize,
                             // Truncation: integer -> u8 (intentional low 8 bits)
-                            h.class_id.as_u32(), h.num_slots, h.array_length, h.kind as u8,
+                            h.class_id.as_u32(), h.num_slots(), h.array_length(), h.kind as u8,
                             field_name.as_deref().unwrap_or("?"),
                             field.field_index, field.is_reference, value,
                         );
@@ -15356,7 +15545,7 @@ fn execute_instruction(
             // FIELD-WATCH (TestUpgrade RootReference/MVMap residual) — every
             // real putfield to any Page/RootReference field, unconditional
             // (not tied to a construction-site guess or a GC-move-fragile
-            // address watch list). See docs/known-issues/h2-suite-bugs/
+            // address watch list). See docs/known-issues/h2/
             // bug-h2-suite-residual-fail-triage.md.
             if std::env::var_os("CRATONVM_DBG_FIELD_WATCH").is_some() {
                 let decl_name = shared
@@ -18385,6 +18574,28 @@ fn lookup_loader_initiated(
     cache_hit
 }
 
+/// Per-loader hard cap for initiating-loader memoization. Entries are an
+/// optimization, not VM state: eviction re-drives `loadClass` and therefore
+/// preserves JVMS resolution semantics.
+const INITIATING_RESOLUTION_CACHE_CAP: usize = 4096;
+
+fn cache_loader_initiated(
+    shared: &SharedVm,
+    loader: cratonvm_types::ClassLoaderId,
+    name: &str,
+    class_id: ClassId,
+) {
+    let mut caches = shared.initiating_resolution_cache.write();
+    let cache = caches.entry(loader).or_default();
+    let key = cratonvm_types::intern_arc(name);
+    if !cache.contains_key(key.as_ref()) && cache.len() >= INITIATING_RESOLUTION_CACHE_CAP {
+        if let Some(victim) = cache.keys().next().cloned() {
+            cache.remove(victim.as_ref());
+        }
+    }
+    cache.insert(key, class_id);
+}
+
 /// Read only the exact definitions that belong to `referencing_class_id`'s
 /// user loader. Unlike [`lookup_loader_initiated`], this intentionally never
 /// consults the initiating-resolution cache.
@@ -18761,12 +18972,7 @@ fn drive_defining_loader_load(
     if let Ok(Some(Value::Object(Some(mirror)))) = result {
         if let Some(id) = crate::vm::class_id_from_mirror(shared, mirror) {
             if let Some(l) = cache_loader {
-                shared
-                    .initiating_resolution_cache
-                    .write()
-                    .entry(l)
-                    .or_default()
-                    .insert(cratonvm_types::intern_arc(name), id);
+                cache_loader_initiated(shared, l, name, id);
             }
             return Some(id);
         }
@@ -19618,7 +19824,7 @@ fn decode_arg_kind_aware(cv: CompactValue, is_long: bool, pd_byte: u8) -> Value 
 /// `execute_invokevirtual_vtable_fast`) popped args the same way but never
 /// re-validated them before building the callee frame. Root-caused via
 /// `org.h2.test.unit.TestUpgrade`'s residual `NoSuchMethodError` — see
-/// `docs/known-issues/h2-suite-bugs/bug-h2-suite-residual-fail-triage.md`.
+/// `docs/known-issues/h2/bug-h2-suite-residual-fail-triage.md`.
 #[inline]
 fn refresh_stale_object_args(shared: &SharedVm, args: &mut [Value]) {
     for value in args.iter_mut() {
@@ -19971,7 +20177,7 @@ fn resolved_private_invokevirtual_target(
     // loader's copy — pinning a private call's dispatch to the wrong
     // class's bytecode/constant pool while the receiver stays the caller's
     // own (correct-loader) object. See
-    // docs/known-issues/h2-suite-bugs/bug-h2-suite-residual-fail-triage.md
+    // docs/known-issues/h2/bug-h2-suite-residual-fail-triage.md
     // (TestUpgrade's `RootReference.tryUpdate`/`hasChangesSince` residual).
     let self_match = {
         let cm = shared.class_manager.read();
@@ -22983,7 +23189,10 @@ fn try_invoke_cached_lambda_impl(
     // `(I)D`. When that leaf is already compiled and has no dispatch helpers,
     // enter it directly instead of materializing an interpreter frame per get.
     // Other lambda implementations retain the generic cached-frame path below.
-    if &*cached.method_name == "get" && &*cached.method_descriptor == "(I)D" {
+    if !matches!(thread.kind, crate::threading::ThreadKind::Virtual)
+        && &*cached.method_name == "get"
+        && &*cached.method_descriptor == "(I)D"
+    {
         let compiled = {
             let cache = shared.jit_cache.read();
             cache.get(
@@ -29556,11 +29765,29 @@ pub(crate) fn synthetic_stub_should_yield_to_real_bytecode(
     method_name: &str,
     descriptor: &str,
 ) -> bool {
-    let synthetic_stub_native = shared
+    let kind = shared
         .native_methods
-        .kind_of(class_name, method_name, descriptor)
-        == Some(cratonvm_native_api::NativeKind::SyntheticStub);
-    if !synthetic_stub_native {
+        .kind_of(class_name, method_name, descriptor);
+    synthetic_stub_kind_should_yield_to_real_bytecode(
+        shared,
+        class_name,
+        method_name,
+        descriptor,
+        kind,
+    )
+}
+
+/// Variant for callers that already resolved and cached the native category in
+/// method metadata. Keeping the selection predicate separate prevents a second
+/// full triple hash on the first invocation of every constant-pool reference.
+fn synthetic_stub_kind_should_yield_to_real_bytecode(
+    shared: &SharedVm,
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+    kind: Option<cratonvm_native_api::NativeKind>,
+) -> bool {
+    if kind != Some(cratonvm_native_api::NativeKind::SyntheticStub) {
         return false;
     }
 
@@ -31155,11 +31382,15 @@ fn populate_invoke_cache(
     // owner before consulting the shared promoted cache because loader-aware
     // invokestatic/invokespecial sites may have a per-loader owner that differs
     // from the flat global owner.
-    let (class_name, method_name, descriptor, num_params) =
-        match resolve_method_ref(shared, caller_class_id, cp_index) {
-            Ok(r) => r,
+    let resolved = match resolve_method_metadata(shared, caller_class_id, cp_index) {
+            Ok(resolved) => resolved,
             Err(_) => return,
         };
+    let symbolic_class_name = Arc::clone(&resolved.class_name);
+    let mut class_name = Arc::clone(&resolved.class_name);
+    let method_name = Arc::clone(&resolved.method_name);
+    let descriptor = Arc::clone(&resolved.method_descriptor);
+    let num_params = resolved.num_params as usize;
     if std::env::var("CRATONVM_DBG_LOADER_TRACE").is_ok() && class_name.contains("RootReference") {
         eprintln!(
             "[PIC-ENTRY] caller_class_id={:?} cp_index={} is_special={} class_name(cp)={} method={}{}",
@@ -31174,7 +31405,7 @@ fn populate_invoke_cache(
     // use of `class_name` below (native lookup, loader-owner override,
     // `target_class_id` resolution, the promoted-cache key), so a
     // super-call bridge's cache entry is never built from the wrong class.
-    let class_name = if is_special {
+    class_name = if is_special {
         invokespecial_owner_class_name(shared, caller_class_id, cp_index, &class_name, &method_name)
     } else {
         class_name
@@ -31234,15 +31465,23 @@ fn populate_invoke_cache(
     // `new OutputStreamWriter` kept minting encoders with a null `se`
     // while the sibling constructor call site ran the real ctor).
     // Fall through to the bytecode resolution below instead.
-    if let Some(callback) = shared
-        .native_methods
-        .find(&class_name, &method_name, &descriptor)
-        .filter(|_| {
-            !synthetic_stub_should_yield_to_real_bytecode(
+    let cached_exact_native = (loader_owner_override.is_none()
+        && class_name == symbolic_class_name)
+        .then(|| resolved.native_target.zip(resolved.native_kind))
+        .flatten();
+    if let Some((callback, kind)) = cached_exact_native
+        .or_else(|| {
+            shared
+                .native_methods
+                .find_with_kind(&class_name, &method_name, &descriptor)
+        })
+        .filter(|(_, kind)| {
+            !synthetic_stub_kind_should_yield_to_real_bytecode(
                 shared,
                 &class_name,
                 &method_name,
                 &descriptor,
+                Some(*kind),
             )
         })
     {
@@ -31494,6 +31733,8 @@ fn execute_invokestatic_cached(
     cp_index: u16,
 ) -> Result<CachedCallResult, MethodCallFailed> {
     let caller_class_id = thread.frames[frame_idx].class_id;
+    let continuation_interpreted =
+        matches!(thread.kind, crate::threading::ThreadKind::Virtual);
 
     // Thread-local invoke cache — no locking needed. invokestatic uses
     // is_special=false since static calls never collide cp_index with
@@ -31521,7 +31762,9 @@ fn execute_invokestatic_cached(
             }
         }
     }
-    if redefine_jit_quiesced && matches!(&target, CachedInvokeTarget::Jit { .. }) {
+    if (redefine_jit_quiesced || continuation_interpreted)
+        && matches!(&target, CachedInvokeTarget::Jit { .. })
+    {
         thread.invoke_cache.evict(caller_class_id, cp_index, false);
         return Ok(CachedCallResult::CacheMiss);
     }
@@ -31639,7 +31882,7 @@ fn execute_invokestatic_cached(
 
             // Fast path: check if the method was already JIT-compiled (e.g. by OSR)
             // before going through the invocation counter.
-            if !redefine_jit_quiesced {
+            if !redefine_jit_quiesced && !continuation_interpreted {
                 let jit_cache = shared.jit_cache.read();
                 if let Some(compiled) = jit_cache.get(
                     &cached.class_name,
@@ -31662,7 +31905,6 @@ fn execute_invokestatic_cached(
                         gate: entry_gate.clone(),
                         supersede_epoch: crate::classloading::jit_supersede_epoch(),
                     };
-                    drop(jit_cache);
                     thread
                         .invoke_cache
                         .put(caller_class_id, cp_index, false, jit_target.clone());
@@ -31749,7 +31991,7 @@ fn execute_invokestatic_cached(
             let should_attempt = past_threshold
                 && (invoc_count == jit_invocation_threshold
                     || (invoc_count - jit_invocation_threshold) % JIT_RETRY_STRIDE == 0);
-            if should_attempt && !redefine_jit_quiesced {
+            if should_attempt && !redefine_jit_quiesced && !continuation_interpreted {
                 // Consult tiered compilation manager for recommended tier
                 let tiered_key = crate::jit::tiered::MethodKey::new(
                     cached.class_name.as_ref(),
@@ -37828,7 +38070,7 @@ fn execute_invokevirtual_vtable_fast(
     // (`class_id_of`/`kind_of` used to pick the dispatch target) are
     // exactly the class-resolution step implicated in the TestUpgrade
     // RootReference residual — refresh defensively before trusting it for
-    // dispatch. See docs/known-issues/h2-suite-bugs/
+    // dispatch. See docs/known-issues/h2/
     // bug-h2-suite-residual-fail-triage.md.
     let receiver_obj = shared.heap.load_and_forward(receiver_obj);
 
@@ -38808,7 +39050,7 @@ fn execute_invokevirtual_cached(
                     // Refresh via the same GC-forwarding barrier as invoke
                     // args (`refresh_stale_object_args`) — this receiver
                     // came from a bare `peek_at`, not a `pop`. See
-                    // docs/known-issues/h2-suite-bugs/
+                    // docs/known-issues/h2/
                     // bug-h2-suite-residual-fail-triage.md.
                     let obj_ref = shared.heap.load_and_forward(obj_ref);
                     let actual_class_id = shared.heap.class_id_of(obj_ref);
@@ -39118,6 +39360,7 @@ fn execute_invokevirtual_cached(
                         })
                         .is_some();
                     if !is_special
+                        && !matches!(thread.kind, crate::threading::ThreadKind::Virtual)
                         && !cached.is_synchronized
                         && !has_registered_native
                         && !crate::classloading::any_class_redefined()
@@ -39278,7 +39521,7 @@ fn execute_invokevirtual_cached(
                     // Refresh via the same GC-forwarding barrier as invoke
                     // args (`refresh_stale_object_args`) — this receiver
                     // came from a bare `peek_at`, not a `pop`. See
-                    // docs/known-issues/h2-suite-bugs/
+                    // docs/known-issues/h2/
                     // bug-h2-suite-residual-fail-triage.md.
                     let obj_ref = shared.heap.load_and_forward(obj_ref);
                     let actual_class_id = shared.heap.class_id_of(obj_ref);
@@ -39420,7 +39663,7 @@ fn execute_invokevirtual_cached(
                         // Refresh via the same GC-forwarding barrier as
                         // invoke args (`refresh_stale_object_args`) — this
                         // receiver came from a bare `peek_at`, not a `pop`.
-                        // See docs/known-issues/h2-suite-bugs/
+                        // See docs/known-issues/h2/
                         // bug-h2-suite-residual-fail-triage.md.
                         let obj_ref = shared.heap.load_and_forward(obj_ref);
                         let actual_class_id = shared.heap.class_id_of(obj_ref);
@@ -40564,29 +40807,25 @@ fn populate_virtual_invoke_cache(
         .put(caller_class_id, cp_index, false, target);
 }
 
-/// Returns (class_name, method_name, descriptor, num_params).
+/// Resolve the metadata for a constant-pool method reference.
 ///
-/// String fields are `Arc<str>` so cache hits pay a refcount bump, not a heap
-/// allocation.  Callers that need `&str` use `&*name` or pass `&name` directly
-/// (Arc<str> derefs to &str).
-fn resolve_method_ref(
+/// Besides the symbolic names and parameter count, this stores the exact
+/// native callback/category for the symbolic owner. The registry hash is paid
+/// once per resolved CP entry, not once per call site that consumes it.
+fn resolve_method_metadata(
     shared: &SharedVm,
     current_class_id: ClassId,
     cp_index: u16,
-) -> Result<(Arc<str>, Arc<str>, Arc<str>, usize), MethodCallFailed> {
+) -> Result<ResolvedMethod, MethodCallFailed> {
     hotpath_counts::bump(&hotpath_counts::RESOLVE_METHOD_REF_CALLS);
-    // Check cache first — Arc::clone is a cheap refcount bump, not an allocation.
+    // Check cache first. Cloning is Arc bumps plus two copied function-pointer
+    // metadata fields; there is no string allocation or registry hash.
     if let Some(cached) = shared
         .resolution_cache
         .read()
         .get_method(current_class_id, cp_index)
     {
-        return Ok((
-            Arc::clone(&cached.class_name),
-            Arc::clone(&cached.method_name),
-            Arc::clone(&cached.method_descriptor),
-            cached.num_params as usize, // Widening: parameter count conversion
-        ));
+        return Ok(cached.clone());
     }
 
     // read_recursive() instead of read() — resolve_method_ref can be called
@@ -40650,19 +40889,43 @@ fn resolve_method_ref(
     // Drop the read lock before acquiring write lock
     drop(cm);
 
+    let (native_target, native_kind) = shared
+        .native_methods
+        .find_with_kind(&class_name, &method_name, &method_descriptor)
+        .map(|(target, kind)| (Some(target), Some(kind)))
+        .unwrap_or((None, None));
+    let resolved = ResolvedMethod {
+        declaring_class_id: current_class_id,
+        class_name,
+        method_name,
+        method_descriptor,
+        num_params: num_params as u16, // Widening: parameter count conversion
+        native_target,
+        native_kind,
+    };
     shared.resolution_cache.write().put_method(
         current_class_id,
         cp_index,
-        ResolvedMethod {
-            declaring_class_id: current_class_id,
-            class_name: Arc::clone(&class_name),
-            method_name: Arc::clone(&method_name),
-            method_descriptor: Arc::clone(&method_descriptor),
-            num_params: num_params as u16, // Widening: parameter count conversion
-        },
+        resolved.clone(),
     );
 
-    Ok((class_name, method_name, method_descriptor, num_params))
+    Ok(resolved)
+}
+
+/// Compatibility view for the interpreter paths that only need symbolic
+/// method data. The underlying cache entry still carries its native target.
+fn resolve_method_ref(
+    shared: &SharedVm,
+    current_class_id: ClassId,
+    cp_index: u16,
+) -> Result<(Arc<str>, Arc<str>, Arc<str>, usize), MethodCallFailed> {
+    let resolved = resolve_method_metadata(shared, current_class_id, cp_index)?;
+    Ok((
+        resolved.class_name,
+        resolved.method_name,
+        resolved.method_descriptor,
+        resolved.num_params as usize,
+    ))
 }
 
 /// JVMS §6.5 `invokespecial` — apply the super-call "selection" redirect
@@ -45561,7 +45824,7 @@ mod tests {
         let header = unsafe { std::ptr::read(ptr as *const ObjectHeader) };
         assert_eq!(header.class_id, ClassId::new(0));
         assert_eq!(header.identity_hash_code, supplied_hash);
-        assert_eq!(header.num_slots, 0);
+        assert_eq!(header.num_slots(), 0);
 
         // First 16 bytes: must NOT be all-zero, since identity_hash_code
         // is at byte offset 8..12 and is non-zero. This is the invariant

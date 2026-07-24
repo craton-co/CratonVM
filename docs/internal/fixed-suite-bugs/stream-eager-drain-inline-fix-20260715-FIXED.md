@@ -41,7 +41,7 @@ as the implementation and historical investigation record.
 # Stream/Spliterator eager-drain fix: lazy sources now drive their op-chain inline (2026-07-15)
 
 Status: FIXED, merged to `dev`. Follow-up to
-`docs/known-issues/keycloak/welcomepagetest-stream-spliterator-zipcopy-residuals-20260715.md`
+`../../known-issues/keycloak/welcomepagetest-stream-spliterator-zipcopy-residuals-20260715.md`
 (section 2, "Selenium/HtmlUnit JSON parsing failure — ROOT-CAUSED, NOT FIXED"), which root-caused
 this bug but deliberately left it unfixed pending a dedicated session. This doc records the fix,
 what was verified, and residual scope.

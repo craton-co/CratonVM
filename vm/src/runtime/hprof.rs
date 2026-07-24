@@ -388,7 +388,7 @@ impl<'a> HprofDumper<'a> {
 
     fn write_obj_array_dump(&self, seg: &mut SegmentBuilder, obj: ObjectRef) {
         let header = self.vm.heap.get_header(obj);
-        let length = header.array_length as usize;
+        let length = header.array_length() as usize;
         let class_id = header.class_id;
 
         seg.push_u8(GC_OBJ_ARRAY_DUMP);
@@ -414,7 +414,7 @@ impl<'a> HprofDumper<'a> {
 
     fn write_prim_array_dump(&self, seg: &mut SegmentBuilder, obj: ObjectRef) {
         let header = self.vm.heap.get_header(obj);
-        let length = header.array_length as usize;
+        let length = header.array_length() as usize;
         let elem_type = header.element_type;
         let hprof_type = array_element_to_hprof(elem_type);
 
@@ -637,7 +637,7 @@ impl<'a> HprofDumper<'a> {
     fn write_instance_dump_with_values(&self, seg: &mut SegmentBuilder, obj: ObjectRef) {
         let header = self.vm.heap.get_header(obj);
         let class_id = header.class_id;
-        let num_fields = header.num_slots as usize;
+        let num_fields = header.num_slots() as usize;
 
         let cm = self.vm.class_manager.read();
         let chain = class_hierarchy_chain(class_id, &cm.class_store);

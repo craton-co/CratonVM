@@ -1517,7 +1517,7 @@ fn huc_upcall_create_socket_if_custom_factory(
 // Plain-HTTP keep-alive connection pool
 // ---------------------------------------------------------------------------
 //
-// docs/known-issues/h2-suite-bugs/bug-h2-httpurlconnection-no-keepalive-pooling.md
+// docs/known-issues/h2/bug-h2-httpurlconnection-no-keepalive-pooling.md
 // — real JDK's `sun.net.www.http.HttpClient` pools/reuses a TCP connection to
 // the same `(host, port)` across separate `HttpURLConnection` instances once
 // a response is fully drained; `perform` previously always opened a brand
@@ -2026,7 +2026,7 @@ fn perform(
 /// which also covers a genuinely brand-new connection the peer tears down
 /// mid-request). Confirmed against real JDK 21 and 25 with a minimal
 /// standalone repro mirroring H2 `WebServer`'s self-shutdown-on-logout
-/// pattern (`docs/known-issues/h2-suite-bugs/
+/// pattern (`docs/known-issues/h2/
 /// bug-h2-testweb-logout-connectexception-mismatch.md`): the server reads
 /// the `logout.do` request in full, then — synchronously, on that same
 /// request-handling thread — closes its own just-accepted socket as part of
@@ -2091,7 +2091,7 @@ fn perform_with_retry(
 // `TcpStream`. That's not just a performance gap: some servers key
 // connection-scoped state off the TCP connection itself (H2's `WebServer`
 // per-`WebThread` session-locale persistence is one confirmed case — see
-// `docs/known-issues/h2-suite-bugs/bug-h2-httpurlconnection-no-keepalive-pooling.md`
+// `docs/known-issues/h2/bug-h2-httpurlconnection-no-keepalive-pooling.md`
 // for the full root-cause writeup with a `tcpdump`-confirmed repro).
 //
 // Deliberately scoped conservative for this first implementation:
@@ -2357,7 +2357,7 @@ fn perform_pooled(
 /// which also covers a genuinely brand-new connection the peer tears down
 /// mid-request). Confirmed against real JDK 21 and 25 with a minimal
 /// standalone repro mirroring H2 `WebServer`'s self-shutdown-on-logout
-/// pattern (`docs/known-issues/h2-suite-bugs/
+/// pattern (`docs/known-issues/h2/
 /// bug-h2-testweb-logout-connectexception-mismatch.md`): the server reads
 /// the `logout.do` request in full, then — synchronously, on that same
 /// request-handling thread — closes its own just-accepted socket as part of

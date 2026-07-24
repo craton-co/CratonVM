@@ -226,7 +226,7 @@ pub fn loader_aware_resolution() -> bool {
 /// default inline-OSR path and the Step-5 background-OSR path (which is why it
 /// is a VM-side env knob, separate from the tiered manager's policy
 /// `osr_threshold`). Lowering it makes hot loops OSR sooner (useful for
-/// gauntlet tuning / quick repros); raising it defers OSR. Invalid/unset →
+/// gauntlet tuning / quick springboot); raising it defers OSR. Invalid/unset →
 /// useful profile/warmup). `None` when unset/invalid, so the caller keeps its
 /// own default (`OSR_THRESHOLD`); `0` clamps to `1`. Read once and cached.
 #[inline]
