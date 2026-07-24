@@ -1,12 +1,53 @@
-# `ClassUtils.isPresent`/`forName` (Spring Framework) falsely reports a class present via `ClassLoader.getPlatformClassLoader()` when the identical logic, hand-replicated, correctly reports absent
+# FIXED — `ClassUtils.isPresent`/`forName` (Spring Framework) falsely reported a class present via `ClassLoader.getPlatformClassLoader()`
 
-**Status: OPEN — found 2026-07-24.** Found via the Spring Boot core Cluster
-C (logging bootstrap) batch. Blocks
+**Status: FIXED 2026-07-24 (root cause was a native override, not the
+interpreter — see the retraction below).** Found via the Spring Boot core
+Cluster C (logging bootstrap) batch. Was blocking
 `org.springframework.boot.logging.logback.LogbackRuntimeHintsTests
-#doesNotRegisterHintsWhenLoggerContextIsNotAvailable`. Likely affects any
-test asserting "hints/behavior X is absent when a library isn't on this
-classloader" via `ClassLoader.getPlatformClassLoader()` (or any loader that
-legitimately doesn't have the class) + Spring's `ClassUtils.isPresent`.
+#doesNotRegisterHintsWhenLoggerContextIsNotAvailable` — that class is now
+4/4 passing.
+
+## Retraction — this was never a VM bug either
+
+`org/springframework/util/ClassUtils.forName` (the engine behind
+`isPresent`) is natively overridden in `phases_late.rs`
+(`spring_class_utils_for_name_impl`) — a large, deliberately-written native
+that (by its own comment) "deliberately ignores" the passed `ClassLoader`
+for anything it classifies as a "built-in loader" and instead resolves
+through **CratonVM's global, unified classpath scanner**. That
+classification lumps the platform/bootstrap loader in with the
+application loader, whose whole *job* is to see the unified classpath —
+but the platform loader, per the JLS, can never see application classes.
+So `ClassUtils.isPresent(anyAppClass, ClassLoader.getPlatformClassLoader())`
+always resolved true via the global scanner, regardless of what the
+platform loader would really see.
+
+Every "ruled out" data point in the original investigation below was
+real and correctly observed — direct `Class.forName(name, false,
+platformLoader)` calls genuinely threw `ClassNotFoundException`, because
+those went through real bytecode, never touching this native override at
+all (the override only fires for `ClassUtils.forName`/`isPresent`
+specifically, not `Class.forName`). The mistake was concluding "every
+sub-operation works, so the composed real method must be a VM bug" without
+first checking whether the composed method itself had its own native
+override intercepting it before any of those sub-operations ran.
+
+**Fix:** added a narrow check in `spring_class_utils_for_name_impl`,
+scoped specifically to `jdk/internal/loader/ClassLoaders$PlatformClassLoader`
+/ `$BootClassLoader` (not the app loader, which is unaffected and still
+uses the global scanner as before): consult the existing
+`classloader::is_bootstrap_class_name` predicate (already used elsewhere
+for real bootstrap-loader lookups) and report `ClassNotFoundException` for
+any name it doesn't recognize as JDK/platform-owned, before ever reaching
+the global scanner. Verified: `LogbackRuntimeHintsTests` 4/4,
+`JavaLoggingSystemTests` 12/12 (this fix was the last piece —
+`testNonDefaultConfigLocation` also depends on `ClassUtils`-adjacent
+classpath probing indirectly), full Cluster C green-controls suite
+unaffected, `JakartaApiValidationExceptionFailureAnalyzerTests` (a
+`ModifiedClassPathExtension`/`@ClassPathExclusions` test exercising this
+same native heavily, from a different angle) still passes.
+
+## Original investigation (kept for the record — see the retraction above for the actual root cause)
 
 ## Symptom
 

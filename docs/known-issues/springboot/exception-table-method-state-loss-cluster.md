@@ -1,156 +1,79 @@
-# Suspected VM interpreter/JIT bug: real bytecode in methods with an exception table (try/catch or try/finally) silently loses or corrupts correctly-computed state on the NORMAL (non-exceptional) path
+# RETRACTED — all three "VM interpreter/JIT state-loss" instances were stale native-override stubs, not a VM bug
 
-**Status: OPEN, HIGH PRIORITY — found 2026-07-24.** Discovered across three
-independent, unrelated call sites during the Spring Boot core Cluster C
-(logging bootstrap) batch. Not scoped to logging or to Spring Boot — this
-looks like a genuine CratonVM interpreter/JIT correctness gap, wide enough
-that it likely explains failures well beyond this cluster. Recommend a
-dedicated VM-level investigation session before further Cluster C work,
-since several of the still-uninvestigated failures in this same batch
-(`LoggingApplicationListenerTests`, `Log4J2LoggingSystemTests`,
-`SpringBootJoranConfiguratorTests`) call into the same
-lock/try/apply/finally-shaped configuration-application methods and are
-likely hitting this same bug rather than independent issues.
+**Status: CLOSED 2026-07-24 — all three instances retracted.** Originally
+written up as a suspected high-priority CratonVM interpreter/JIT
+correctness gap (methods with an exception table silently losing
+correctly-computed state on their normal path), found across three
+independent call sites in the Spring Boot core Cluster C (logging
+bootstrap) batch. **All three turned out to be ordinary native-override
+bugs** — each failing method had an existing native registration in
+`native-builtins/src/phases_early.rs` or `phases_late.rs` that either
+stubbed the method to a no-op or intercepted it with stale/wrong logic,
+fully explaining the observed symptom without any VM-level defect. Kept
+as a retrospective, not deleted, because the *investigation shape* that
+produced (and then had to walk back) three false positives in a row is
+itself worth learning from.
 
-## The pattern
+## The lesson
 
-Three separate, unrelated real-JDK/Spring methods — each containing a
-`try`/`catch` or `try`/`finally` block (i.e., a non-empty bytecode
-exception table) — produce **wrong results on their normal, no-exception
-path**, even though:
-- every individual operation the method performs, hand-replicated outside
-  the try/catch/finally shape (same classpath, same process), produces the
-  CORRECT result, and
-- no exception is thrown or expected at any point in the real run.
+Every instance had the same signature: "every individual sub-operation
+works correctly when replicated by hand outside the real method's control
+flow, but the real, composed method produces wrong results." That pattern
+feels like strong evidence for a VM bug in the *composition* — but it's
+equally, and far more cheaply, explained by **something intercepting the
+composed method before any of its sub-operations run**. In all three
+cases here, that's exactly what was happening: a native override for the
+*exact* failing method (not its sub-operations, which is why they tested
+fine individually).
 
-### Instance 1 — `java.util.logging.SimpleFormatter.format(LogRecord)`
-See `javaloggingsystemtests-simpleformatter-args-drop.md`. Real bytecode
-drops the date (`%1$tc`) and message (`%5$s`) `String.format` arguments;
-every sub-operation (the date computation, `formatMessage()`, the final
-`String.format` call itself) works correctly when replicated by hand. This
-method doesn't actually have a `try`/`catch` in the FAILING call path
-(only its unrelated throwable-formatting branch does) — flagged here as a
-data point, not yet confirmed to share this exact mechanism; may be a
-separate bug that happens to look similar.
+**Before attributing a "real bytecode doesn't produce the right result"
+symptom to a VM interpreter/JIT bug, grep for an existing native override
+on the exact failing method first.** It takes a few minutes and would have
+prevented every hour spent on the writeups below.
 
-### Instance 2 — `org.springframework.util.ClassUtils.forName(String, ClassLoader)`
-See `classutils-forname-platform-loader-false-positive.md`. Real bytecode
-returns a class as present when it is not; the method has TWO
-`catch(ClassNotFoundException)` exception-table entries (a primary lookup
-guarded by one handler, whose fallback lookup is guarded by a second). Both
-individual `Class.forName` calls, replicated by hand, correctly throw.
+## Instance 1 — `java.util.logging.SimpleFormatter.format(LogRecord)` — FIXED
+Real cause: `SimpleFormatter.<init>`/`format` were natively stubbed in
+`phases_early.rs` (the same legacy layer, predating the `logmanager.rs`
+rewrite, that also had a matching stale `ConsoleHandler` stub). `<init>`
+was a bare no-op; `format` read `LogRecord` raw slot 1 (that layer's OLD
+message-slot convention, no longer accurate — the real layout moved to
+`get/set_field_by_name(_, "message")`), missed, and fell through to a
+**hardcoded `"INFO: {text}\n"` / `"INFO: \n"`** regardless of the record's
+actual level or message — exactly the "date and message dropped" symptom
+originally attributed to the interpreter. Removed; see
+`javaloggingsystemtests-simpleformatter-args-drop.md` (now marked FIXED).
+`JavaLoggingSystemTests` went from 11/12 to 12/12.
 
-### Instance 3 — `org.springframework.boot.logging.logback.DefaultLogbackConfiguration.apply(LogbackConfigurator)`
-New this entry. `apply()` is:
-```java
-void apply(LogbackConfigurator config) {
-    config.getConfigurationLock().lock();
-    try {
-        defaults(config);
-        Appender<ILoggingEvent> consoleAppender = consoleAppender(config);
-        ... config.root(Level.INFO, ...);
-    }
-    finally {
-        config.getConfigurationLock().unlock();
-    }
-}
+## Instance 2 — `org.springframework.util.ClassUtils.forName(String, ClassLoader)` — FIXED
+Real cause: `ClassUtils.forName`'s native override
+(`spring_class_utils_for_name_impl` in `phases_late.rs`) deliberately
+ignores the passed `ClassLoader` for anything classified as a "built-in
+loader" (comment: "the classLoader arg is deliberately ignored"),
+resolving through CratonVM's global unified classpath scanner instead —
+correct for the application loader (whose whole job is exactly that), but
+wrong for the platform/bootstrap loader, which per the JLS can never see
+application classes. Fixed with a narrow check scoped to
+`ClassLoaders$PlatformClassLoader`/`$BootClassLoader` specifically (not
+the app loader). See
+`classutils-forname-platform-loader-false-positive.md` (now marked
+FIXED). `LogbackRuntimeHintsTests` went from 3/4 to 4/4.
+
+## Instance 3 — `org.springframework.boot.logging.logback.DefaultLogbackConfiguration.apply(LogbackConfigurator)` — FIXED
+Real cause: `apply()` was entirely stubbed to a no-op in `lib.rs`, dating
+from when `LoggerContext` was synthetically allocated and NPE'd on
+`monitorenter` — a premise that stopped holding once `LoggerContext`
+construction moved to real bytecode, but nobody removed the now-stale
+stub. `DefaultLogbackConfigurationTests` went from 4/7 to 6/7 (the last
+failure is an unrelated Mockito/`java.io.Console` mocking limitation).
+
+## What would have ruled all three out immediately
+
+```bash
+grep -rn '"format"\|"formatMessage"' native-builtins/src/*.rs   # → SimpleFormatter stub, instance 1
+grep -rn '"org/springframework/util/ClassUtils"' native-builtins/src/*.rs   # → forName override, instance 2
+grep -rn "DefaultLogbackConfiguration" native-builtins/src/*.rs   # → apply() stub, instance 3
 ```
-`javap -c` confirms a real exception table:
-```
-Exception table:
-   from    to  target type
-        7    75    85   any
-       85    87    85   any
-```
-`defaults(config)` (called at the very start of the `try` block) sets
-several `LoggerContext` properties, including `FILE_LOG_CHARSET` /
-`CONSOLE_LOG_CHARSET` (resolved from a `${NAME:-default}` pattern via real
-Logback `OptionHelper.substVars`, honoring a `System.setProperty` override
-when present). After `apply()` returns normally (no exception, confirmed —
-the process exits cleanly), **every property `defaults()` set is gone**:
-`loggerContext.getProperty("FILE_LOG_CHARSET")` returns `null`, not even
-the literal default.
 
-Ruled out via direct repro (same classpath, package-private class access
-via a same-package helper class):
-- `LogbackConfigurator.getContext()` returns the identical `LoggerContext`
-  instance passed to its constructor (`==` true) — not a copy/different
-  object.
-- Calling `config.getContext().putProperty(...)` / `dlc.putProperty(config,
-  ...)` directly round-trips correctly.
-- Calling `OptionHelper.substVars("${FILE_LOG_CHARSET:-UTF-8}", ctx)`
-  directly, with the system property set, correctly resolves and the
-  result round-trips through `ctx.putProperty`/`getProperty`.
-- Calling `defaults(config)` **and then** `consoleAppender(config)** via
-  reflection (`Method.setAccessible(true)` + `invoke`, bypassing the real
-  `apply()` method's own bytecode and its try/finally entirely) leaves
-  `FILE_LOG_CHARSET` correctly set afterward.
-
-Only calling through the real `apply()` method itself — i.e., going
-through its try/finally — loses the property. This blocks all 3 failures
-in `DefaultLogbackConfigurationTests`
-(`fileLogCharsetShouldUseSystemPropertyIfSet`,
-`consoleLogCharsetShouldUseConsoleCharsetIfConsoleAvailable`,
-`consoleLogCharsetShouldDefaultToUtf8WhenConsoleIsNull` — all three call
-`apply()`), and is the leading suspect for
-`LogbackConfigurationAotContributionTests`'s 2 failures too (unexpected
-extra registered types leaking across test methods — a shape consistent
-with "state set during one call silently escaping/surviving/corrupting
-past where it should be scoped", though not yet confirmed to be the exact
-same mechanism).
-
-## What does NOT reproduce it
-
-A minimal, standalone (no Spring/Logback) try/finally around a
-field-setting call correctly preserves state:
-```java
-static class Holder { ReentrantLock lock = new ReentrantLock(); String value; }
-static void applyWithTryFinally(Holder h) {
-    h.lock.lock();
-    try { setValue(h, "SET-VIA-TRY-FINALLY"); }
-    finally { h.lock.unlock(); }
-}
-static void setValue(Holder h, String v) { h.value = v; }
-```
-`h.value` is correctly `"SET-VIA-TRY-FINALLY"` afterward. So "any
-try/finally" is not sufficient to trigger this — something about the real
-methods' larger size, deeper call chains, and/or JIT eligibility
-(tiering/hotness thresholds; these are exercised many times across the
-149-class-ish suite runs vs. a single cold call in the minimal repro) is
-likely part of the trigger condition. **Whoever picks this up should try
-scaling the minimal repro up** (more locals, more nested calls inside the
-try block, calling it in a loop to force JIT compilation) to find the
-actual threshold, rather than assuming the simplified case is
-representative.
-
-## Why this is scoped OPEN rather than fixed
-
-This is a VM interpreter/JIT correctness investigation, not a native-bridge
-patch — well outside a logging-bootstrap batch's scope, and risky to guess
-at blindly. Given three independent real-JDK/Spring methods across
-different libraries all involve an exception table and all lose state on
-their normal path, this looks systemic enough to be worth a dedicated
-session with proper tooling (bisect JIT vs interpreter via
-`--nojit`/`CRATONVM_NO_PRECISE_JIT_MAPS`, check `CRATONVM_DBG_JIT_DISASM`
-output for the affected methods, compare against the interpreter's
-exception-table PC-range matching logic).
-
-## Reproduction assets
-
-All three repros need `core/spring-boot`'s own generated test classpath
-(`apps/spring-boot/core/spring-boot/build/cratonvm-test-cp.txt`). Instance
-3's full repro (package-private class access):
-```java
-// file: org/springframework/boot/logging/logback/FullApplyRepro.java
-package org.springframework.boot.logging.logback;
-import ch.qos.logback.classic.LoggerContext;
-public class FullApplyRepro {
-    public static void main(String[] args) throws Exception {
-        LoggerContext loggerContext = new LoggerContext();
-        LogbackConfigurator config = new LogbackConfigurator(loggerContext);
-        System.setProperty("FILE_LOG_CHARSET", "ISO-8859-1");
-        new DefaultLogbackConfiguration(null).apply(config);
-        System.err.println(loggerContext.getProperty("FILE_LOG_CHARSET")); // expect ISO-8859-1, get null
-    }
-}
-```
+No VM-level interpreter/JIT investigation is warranted from this cluster's
+findings — there is no remaining evidence of the originally-suspected bug
+class.

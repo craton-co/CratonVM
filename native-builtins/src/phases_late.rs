@@ -23257,6 +23257,33 @@ fn spring_class_utils_for_name_impl(
         }
     }
 
+    // Platform/bootstrap loader: the JLS guarantees these can never see
+    // application classes, no matter how permissive the "built-in loader ->
+    // global scanner" fallback above is for the (very different) app-loader
+    // case, whose whole job IS to see the unified classpath. Without this,
+    // `ClassUtils.isPresent(appClassName, ClassLoader.getPlatformClassLoader())`
+    // false-positived every application class as present via the same
+    // global scanner an app-loader lookup legitimately uses, breaking any
+    // "is X absent from a restricted loader" check (e.g.
+    // `LogbackRuntimeHints#registerHints` gating on whether logback is on
+    // the given loader — see
+    // docs/known-issues/springboot/classutils-forname-platform-loader-false-positive.md).
+    if let Some(loader) = loader {
+        let is_platform_or_boot = matches!(
+            ctx.class_name_of_id(ctx.class_id_of_object(loader)).as_deref(),
+            Some("jdk/internal/loader/ClassLoaders$PlatformClassLoader")
+                | Some("jdk/internal/loader/ClassLoaders$BootClassLoader")
+        );
+        if is_platform_or_boot {
+            let internal = dotted.replace('.', "/");
+            if !crate::classloader::is_bootstrap_class_name(&internal) {
+                return Err(RuntimeError::ClassNotFoundException { class_name: dotted }.into());
+            }
+            // Genuinely bootstrap-owned name (java.*, jdk.*, ...) — fall
+            // through to the normal resolution below.
+        }
+    }
+
     // Regular class name: try direct binary name first (a.b.Foo → a/b/Foo)
     let internal = dotted.replace('.', "/");
     if let Ok(cid) = ctx.ensure_class_initialized(&internal) {

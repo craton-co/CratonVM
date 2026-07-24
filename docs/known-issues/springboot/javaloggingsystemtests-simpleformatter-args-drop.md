@@ -1,12 +1,35 @@
-# Real `java.util.logging.SimpleFormatter.format()`'s own bytecode drops the date (`%1$tc`) and message (`%5$s`) `String.format` args — even with a known-good pattern string
+# FIXED — Real `java.util.logging.SimpleFormatter.format()` appeared to drop the date/message `String.format` args, but was actually a stale stub
 
-**Status: OPEN — found 2026-07-24.** Residual of the Spring Boot core Cluster C
-(logging bootstrap) repair batch. Blocks
-`org.springframework.boot.logging.java.JavaLoggingSystemTests#testNonDefaultConfigLocation`
-only; 11/12 methods in that class now pass (was 3/12 before this batch — see
-the JUL fixes in `native-builtins/src/logmanager.rs`,
-`native-builtins/src/lib.rs`, and the removed stale `ConsoleHandler` stub in
+**Status: FIXED 2026-07-24 (was misdiagnosed as an interpreter/JIT bug,
+see the retraction below).** Residual of the Spring Boot core Cluster C
+(logging bootstrap) repair batch.
+`org.springframework.boot.logging.java.JavaLoggingSystemTests` is now
+**12/12** passing (was 3/12 before this batch — see the JUL fixes in
+`native-builtins/src/logmanager.rs`, `native-builtins/src/lib.rs`, and the
+removed stale `ConsoleHandler`/`SimpleFormatter` stubs in
 `native-builtins/src/phases_early.rs`).
+
+## Retraction — this was never a VM bug
+
+`java.util.logging.SimpleFormatter`'s `<init>()` and
+`format(LogRecord)` were natively stubbed in `phases_early.rs` — the SAME
+stale legacy layer (predating the `logmanager.rs` T19.H3 rewrite) that had
+a matching `ConsoleHandler.<init>`/`publish` stub removed earlier in this
+same batch. `<init>` was a bare no-op; `format` read `LogRecord` raw slot
+1 (that layer's OLD convention for "message" — the real layout has since
+moved to `get/set_field_by_name(_, "message")`, so slot 1 no longer holds
+it) and, on the inevitable pattern-match miss, fell through to a
+**hardcoded `"INFO: \n"`** regardless of the record's actual level or
+message. That hardcoded string is *exactly* the "date and message dropped"
+symptom documented below — there was no interpreter bug to find. Removing
+both stubs (letting real `Handler`/`Formatter`/`SimpleFormatter` bytecode
+run, already verified working directly per the investigation below) fixed
+`testNonDefaultConfigLocation` immediately.
+
+The investigation below is kept for the record (and as a second example,
+alongside `exception-table-method-state-loss-cluster.md`, of why grepping
+for an existing native override on the exact failing method — before
+assuming a VM-level bug — should be step one, not a late one).
 
 ## Symptom
 
