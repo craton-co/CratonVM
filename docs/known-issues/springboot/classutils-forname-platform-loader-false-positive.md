@@ -77,6 +77,13 @@ doesn't depend on Spring or Logback (a hand-compiled two-exception-table
 method) would help isolate this from `SimpleFormatter`'s residual and
 confirm/refute the shared-root-cause hypothesis above.
 
+**Update:** a third, independent instance of this same general shape
+(real bytecode in a method with an exception table losing correctly-set
+state on the normal path) was found in
+`DefaultLogbackConfiguration.apply()` (a plain `try`/`finally`, no
+`catch`) — see the consolidated writeup and a minimal-repro negative
+result in `exception-table-method-state-loss-cluster.md`.
+
 ## Repro
 
 Needs `core/spring-boot`'s own test classpath (has `spring-core` +

@@ -58,6 +58,15 @@ several attempts to reproduce with an explicit `Object[]` array populated
 from method-call results (including with padding locals to force wide
 slot indices) did not reproduce it.
 
+**Possibly related:** two other real-bytecode-only state-loss bugs found
+in the same session, both in methods with an actual exception table
+(try/catch or try/finally) — see
+`exception-table-method-state-loss-cluster.md`. This method's failing call
+path has no exception table itself, so the shared mechanism (if any) is
+unconfirmed, but the overall shape — real bytecode silently losing
+correctly-computed state that every hand-replicated equivalent preserves —
+is the same.
+
 ## Why this is scoped OPEN rather than fixed
 
 Spring Boot's own `JavaLoggingSystem` (and every other Cluster C test)
