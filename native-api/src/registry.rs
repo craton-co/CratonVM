@@ -2165,6 +2165,26 @@ pub trait NativeContext {
     /// Must be paired with `vt_release_carrier`. No-op for platform threads.
     fn vt_acquire_carrier(&mut self) {}
 
+    /// Request a continuation-backed timed park. Returns `true` only for an
+    /// unpinned virtual thread whose interpreter frames can be frozen by the
+    /// VM. The native must then return `ContinuationYield` without blocking.
+    fn vt_park_for(&mut self, _duration: std::time::Duration) -> bool {
+        false
+    }
+
+    /// Register the current unpinned virtual thread as an asynchronous waiter
+    /// on a VM-local stable key. The native must recheck its condition after
+    /// registration and return `ContinuationYield` only while it remains false.
+    fn vt_wait_on_key(&mut self, _key: u64) -> bool {
+        false
+    }
+
+    /// Cancel a waiter registration made by [`Self::vt_wait_on_key`].
+    fn vt_cancel_wait_on_key(&mut self, _key: u64) {}
+
+    /// Wake and resubmit all virtual threads waiting on a stable key.
+    fn vt_wake_waiters(&mut self, _key: u64) {}
+
     /// Emit a `jdk.VirtualThreadPinned` JFR event for the current thread.
     /// Called when a pinned virtual thread is about to block its carrier.
     ///

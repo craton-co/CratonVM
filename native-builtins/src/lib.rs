@@ -50700,6 +50700,26 @@ pub(crate) fn native_unsafe_fence(
     Ok(None)
 }
 
+fn try_yield_virtual_park(
+    ctx: &mut dyn NativeContext,
+    timeout: Option<std::time::Duration>,
+) -> Option<MethodCallResult> {
+    if !ctx.is_current_virtual() || ctx.vt_pin_count() != 0 {
+        return None;
+    }
+    let duration = timeout.unwrap_or(std::time::Duration::ZERO);
+    if !ctx.vt_park_for(duration) {
+        return None;
+    }
+    Some(Err(MethodCallFailed::InternalError(
+        cratonvm_types::error::VmError::ContinuationYield {
+            wake_after_nanos: timeout
+                .map(|d| d.as_nanos().min(u64::MAX as u128) as u64)
+                .unwrap_or(0),
+        },
+    )))
+}
+
 fn native_unsafe_park(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // args: [unsafe, isAbsolute(bool), time(long)]
     // JDK spec: if interrupted, park returns immediately (no exception, flag NOT cleared)
@@ -50741,6 +50761,9 @@ fn native_unsafe_park(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(std::time::Duration::from_nanos(time as u64))
     };
 
+    if let Some(yielded) = try_yield_virtual_park(ctx, timeout) {
+        return yielded;
+    }
     ctx.park(timeout);
     Ok(None)
 }
@@ -52953,7 +52976,11 @@ fn register_lock_support_natives(r: &mut NativeMethodRegistry) {
             _ => 0,
         };
         if nanos > 0 {
-            ctx.park(Some(std::time::Duration::from_nanos(nanos as u64)));
+            let timeout = Some(std::time::Duration::from_nanos(nanos as u64));
+            if let Some(yielded) = try_yield_virtual_park(ctx, timeout) {
+                return yielded;
+            }
+            ctx.park(timeout);
         }
         Ok(None)
     });
@@ -52983,6 +53010,9 @@ fn native_lock_support_park(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     // JDK spec: if interrupted, park returns immediately (no exception, flag NOT cleared)
     if ctx.is_interrupted(false) {
         return Ok(None);
+    }
+    if let Some(yielded) = try_yield_virtual_park(ctx, None) {
+        return yielded;
     }
     // AQS-PARK-PIN: this bridge only fires when a real-JDK `LockSupport.park`
     // overload is routed straight to us instead of running its bytecode (which
@@ -53018,12 +53048,16 @@ fn native_lock_support_park_nanos(ctx: &mut dyn NativeContext, args: &[Value]) -
         _ => 0,
     };
     if nanos > 0 {
+        let timeout = Some(std::time::Duration::from_nanos(nanos as u64));
+        if let Some(yielded) = try_yield_virtual_park(ctx, timeout) {
+            return yielded;
+        }
         // AQS-PARK-PIN — see `native_lock_support_park`.
         let pin = match args.first() {
             Some(Value::Object(Some(o))) => Some(ctx.pin_native_root(*o)),
             _ => None,
         };
-        ctx.park(Some(std::time::Duration::from_nanos(nanos as u64)));
+        ctx.park(timeout);
         if let Some(pin) = pin {
             ctx.unpin_native_roots(pin);
         }
@@ -53051,12 +53085,16 @@ fn native_lock_support_park_until(ctx: &mut dyn NativeContext, args: &[Value]) -
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
         let remaining = (deadline - now_ms).max(0) as u64;
+        let timeout = Some(std::time::Duration::from_millis(remaining));
+        if let Some(yielded) = try_yield_virtual_park(ctx, timeout) {
+            return yielded;
+        }
         // AQS-PARK-PIN — see `native_lock_support_park`.
         let pin = match args.first() {
             Some(Value::Object(Some(o))) => Some(ctx.pin_native_root(*o)),
             _ => None,
         };
-        ctx.park(Some(std::time::Duration::from_millis(remaining)));
+        ctx.park(timeout);
         if let Some(pin) = pin {
             ctx.unpin_native_roots(pin);
         }
@@ -63310,7 +63348,7 @@ fn native_cond_signal_all(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
 // WildFly's subsystem-test `waitForSetup()` fell through before the boot
 // thread assigned `bootSuccess`, so `isSuccessfulBoot()` read false and the
 // test failed with "Subsystem boot failed!" while boot later succeeded.
-// Store the count in a 1-element int[] holder instead — an object reference
+// Store the count in an int[] holder instead — an object reference
 // matches the declared slot type, survives the coercion, and is traced and
 // relocated by the GC.
 fn cdl_count(ctx: &mut dyn NativeContext, this: ObjectRef) -> i32 {
@@ -63326,6 +63364,44 @@ fn cdl_count(ctx: &mut dyn NativeContext, this: ObjectRef) -> i32 {
     }
 }
 
+static NEXT_CDL_WAIT_KEY: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+
+fn next_cdl_wait_key() -> i32 {
+    loop {
+        let candidate = NEXT_CDL_WAIT_KEY
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            & i32::MAX as u64;
+        if candidate != 0 {
+            return candidate as i32;
+        }
+    }
+}
+
+/// Stable VM-local condition key stored alongside the latch count. It moves
+/// with the holder array, unlike a raw ObjectRef address, and therefore stays
+/// valid while an unmounted continuation is visible to a moving collector.
+fn cdl_wait_key(ctx: &mut dyn NativeContext, this: ObjectRef) -> u64 {
+    if let Value::Object(Some(holder)) = ctx.get_field(this, CDL_FIELD_COUNT) {
+        if let Value::Int(key) = ctx.get_array_element(holder, 1) {
+            if key > 0 {
+                return key as u64;
+            }
+        }
+        let key = next_cdl_wait_key();
+        ctx.set_array_element(holder, 1, Value::Int(key));
+        if let Value::Int(stored) = ctx.get_array_element(holder, 1) {
+            if stored > 0 {
+                return stored as u64;
+            }
+        }
+    }
+    // Compatibility for a legacy one-slot holder: the header hash is
+    // non-zero and move-stable. New latch instances always take the unique
+    // holder-key path above.
+    ctx.identity_hash_code(this) as u32 as u64
+}
+
 fn cdl_set_count(ctx: &mut dyn NativeContext, this: ObjectRef, count: i32) {
     if let Value::Object(Some(holder)) = ctx.get_field(this, CDL_FIELD_COUNT) {
         ctx.set_array_element(holder, 0, Value::Int(count));
@@ -63337,10 +63413,11 @@ fn cdl_set_count(ctx: &mut dyn NativeContext, this: ObjectRef, count: i32) {
     // across the allocation — a moving GC during `new_array` would relocate
     // the receiver and leave the Rust-local copy stale.
     let this_pin = ctx.pin_native_root(this);
-    let holder = ctx.new_array(cratonvm_types::ArrayElementType::Int, 1);
+    let holder = ctx.new_array(cratonvm_types::ArrayElementType::Int, 2);
     let this = ctx.read_native_pin(this_pin, this);
     ctx.unpin_native_roots(this_pin);
     ctx.set_array_element(holder, 0, Value::Int(count));
+    ctx.set_array_element(holder, 1, Value::Int(next_cdl_wait_key()));
     ctx.set_field(this, CDL_FIELD_COUNT, Value::Object(Some(holder)));
 }
 
@@ -63380,6 +63457,8 @@ fn native_cdl_count_down(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         cdl_set_count(ctx, this, count - 1);
         if count - 1 == 0 {
             // Count reached zero — wake all waiting threads
+            let wait_key = cdl_wait_key(ctx, this);
+            ctx.vt_wake_waiters(wait_key);
             let notify_result = ctx.monitor_notify_all(this);
             ctx.monitor_exit(this);
             notify_result?;
@@ -63395,6 +63474,25 @@ fn native_cdl_await(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
+    if ctx.is_current_virtual() && ctx.vt_pin_count() == 0 {
+        if cdl_count(ctx, this) <= 0 {
+            return Ok(None);
+        }
+        let wait_key = cdl_wait_key(ctx, this);
+        if ctx.vt_wait_on_key(wait_key) {
+            // Close the registration-vs-countDown race. If count reached zero
+            // first, cancel locally and complete without unmounting.
+            if cdl_count(ctx, this) <= 0 {
+                ctx.vt_cancel_wait_on_key(wait_key);
+                return Ok(None);
+            }
+            return Err(MethodCallFailed::InternalError(
+                cratonvm_types::error::VmError::ContinuationYield {
+                    wake_after_nanos: 0,
+                },
+            ));
+        }
+    }
     // Block on the monitor instead of spinning. The bounded wait (10ms)
     // covers the lost-wakeup window between the count read and the wait.
     loop {

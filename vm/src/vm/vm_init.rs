@@ -584,6 +584,11 @@ pub struct SharedVm {
     /// to a carrier-thread pool (JEP 444, Java 21).
     pub virtual_scheduler: Arc<crate::threading::VirtualThreadScheduler>,
 
+    /// Continuation scheduler and heap-resident virtual-thread execution
+    /// states. Unlike `virtual_scheduler`'s legacy permit semaphore, this
+    /// manager owns a bounded set of carrier OS threads.
+    pub virtual_thread_manager: Arc<crate::threading::VirtualThreadManager>,
+
     /// Off-heap memory allocations for Panama FFI (JEP 454).
     pub native_memory: parking_lot::Mutex<crate::native::ffi::NativeMemoryTable>,
 
@@ -2846,6 +2851,9 @@ impl SharedVm {
             gc_barrier: GcBarrier::new(),
             jit_cache: JitCache::new(),
             virtual_scheduler: crate::threading::VirtualThreadScheduler::new_default(),
+            virtual_thread_manager: Arc::new(
+                crate::threading::VirtualThreadManager::with_default_parallelism(),
+            ),
             native_memory: parking_lot::Mutex::new(crate::native::ffi::NativeMemoryTable::new()),
             native_libraries: parking_lot::Mutex::new(Vec::new()),
             upcall_table: parking_lot::Mutex::new(crate::native::ffi::UpcallTable::new()),

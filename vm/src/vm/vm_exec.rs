@@ -1968,6 +1968,178 @@ fn cold_log_overlay_corruption(
     }
 }
 
+/// Run a previously yielded virtual-thread continuation on a pool carrier.
+///
+/// The boxed `JvmThread` owns heap-resident Java frames, so returning from this
+/// function releases the native carrier stack while preserving the Java stack.
+fn resume_virtual_continuation(shared: std::sync::Arc<SharedVm>, vt_id: u64) {
+    let Some((mut thread, resumed)) = shared
+        .virtual_thread_manager
+        .take_runtime_for_mount(vt_id, vt_id)
+    else {
+        return;
+    };
+    let tid = thread.thread_id;
+    thread
+        .gc_block_state
+        .in_blocked_region
+        .store(false, std::sync::atomic::Ordering::Release);
+    thread
+        .gc_block_state
+        .java_state
+        .store(0, std::sync::atomic::Ordering::Release);
+    shared.thread_registry.set_os_tid_current(tid);
+    shared
+        .thread_registry
+        .set_jvm_thread_addr(tid, (&*thread as *const JvmThread) as usize);
+    shared
+        .thread_registry
+        .set_tlab_addr(tid, &thread.tlab as *const cratonvm_gc::Tlab as usize);
+
+    let result = if resumed {
+        if shared
+            .gc_barrier
+            .stw_requested
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            crate::runtime::interpreter::safepoint_check(&shared, &mut thread);
+        }
+        crate::runtime::interpreter::resume_continuation(&shared, &mut thread)
+    } else {
+        crate::runtime::interpreter::init_thread_exec_depth_ceiling(8 * 1024 * 1024);
+        loop {
+            let ready = shared.gc_barrier.run_if_no_stw_requested(|| {
+                shared.thread_registry.mark_stw_ready(tid);
+            });
+            if ready {
+                break;
+            }
+            let pointer_map = shared.gc_barrier.arrive_and_wait_excluded(tid);
+            if !pointer_map.is_empty() {
+                crate::runtime::interpreter::apply_pointer_map_to_thread(
+                    &mut thread,
+                    &pointer_map,
+                    &shared.heap,
+                );
+            }
+        }
+        let Some(thread_obj) = shared.thread_registry.java_thread_obj(tid) else {
+            shared.virtual_thread_manager.terminate(vt_id);
+            return;
+        };
+        thread.java_thread_obj = Some(thread_obj);
+        let recv_cid = shared.heap.class_id_of(thread_obj);
+        let _ = super::ensure_class_initialized_shared(&shared, &mut thread, recv_cid);
+        invoke_on_class_shared(
+            &shared,
+            &mut thread,
+            recv_cid,
+            "run",
+            "()V",
+            &[Value::Object(Some(thread_obj))],
+        )
+    };
+    if let Err(MethodCallFailed::InternalError(VmError::ContinuationYield {
+        wake_after_nanos,
+    })) = &result
+    {
+        NativeContextImpl {
+            shared: &shared,
+            thread: &mut thread,
+        }
+        .deposit_root_snapshot();
+        shared.virtual_thread_manager.suspend_runtime(
+            vt_id,
+            thread,
+            std::time::Duration::from_nanos(*wake_after_nanos),
+        );
+        return;
+    }
+
+    if let Err(error) = &result {
+        if let MethodCallFailed::ExceptionThrown(exception) = error {
+            let pin_base = thread.native_pin_roots.len();
+            thread.native_pin_roots.push(*exception);
+            if let Some(thread_obj) = shared.thread_registry.java_thread_obj(tid) {
+                let receiver_class = shared.heap.class_id_of(thread_obj);
+                let exception = thread.native_pin_roots[pin_base];
+                let _ = invoke_on_class_shared(
+                    &shared,
+                    &mut thread,
+                    receiver_class,
+                    "dispatchUncaughtException",
+                    "(Ljava/lang/Throwable;)V",
+                    &[Value::Object(Some(thread_obj)), Value::Object(Some(exception))],
+                );
+            }
+            thread.native_pin_roots.truncate(pin_base);
+        } else {
+            eprintln!("Virtual thread {} terminated with error: {:?}", tid, error);
+        }
+    }
+    {
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        let mut recorder = shared.flight_recorder.lock();
+        cratonvm_jfr::builtin::emit_thread_end_event_arc(
+            &mut recorder,
+            std::sync::Arc::from(thread.name.as_str()),
+            tid.0,
+            now_ns,
+        );
+    }
+    shared.heap.flush_thread_satb();
+
+    let wake_obj = shared.thread_registry.java_thread_obj(tid);
+    let term_monitor = wake_obj.and_then(
+        |thread_obj| match shared.monitors.enter_inflated_or_contend(thread_obj, tid) {
+            Ok((monitor, contended)) => {
+                if contended {
+                    NativeContextImpl {
+                        shared: &shared,
+                        thread: &mut thread,
+                    }
+                    .deposit_root_snapshot();
+                    let blocked = shared.gc_barrier.enter_blocked();
+                    if blocked.pre_stw {
+                        let _ = shared.gc_barrier.arrive_and_wait_auto(tid);
+                    }
+                    monitor.block_enter(tid);
+                    drop(blocked);
+                }
+                Some(monitor)
+            }
+            Err(_) => None,
+        },
+    );
+
+    thread.tlab.retire();
+    NativeContextImpl {
+        shared: &shared,
+        thread: &mut thread,
+    }
+    .deposit_root_snapshot();
+    let blocked = shared.gc_barrier.enter_blocked();
+    if blocked.pre_stw {
+        let _ = shared.gc_barrier.arrive_and_wait_auto(tid);
+    }
+    blocked.finish_after(|| {
+        shared.thread_registry.clear_tlab_addr(tid);
+        shared.thread_registry.set_jvm_thread_addr(tid, 0);
+        shared.thread_registry.mark_dead(tid);
+        shared
+            .monitors
+            .release_monitors_held_by_except(tid, term_monitor.as_ref());
+    });
+    if let Some(monitor) = term_monitor {
+        let _ = monitor.notify_all(tid);
+        let _ = monitor.exit(tid);
+    }
+    shared.virtual_thread_manager.terminate(vt_id);
+}
+
 pub struct NativeContextImpl<'a> {
     pub shared: &'a SharedVm,
     pub thread: &'a mut JvmThread,
@@ -6527,6 +6699,17 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // field-initializer lives in does not run to completion for app-created
         // threads in our VM (e.g. H2 MVStore's background writer on a file DB).
         self.ensure_thread_interrupt_lock(thread_obj);
+        if is_virtual {
+            self.shared
+                .virtual_thread_manager
+                .create_virtual_thread_with_id(tid.0, &name);
+            let carrier_shared = shared_arc.clone();
+            self.shared
+                .virtual_thread_manager
+                .start_carriers_once(move |vt_id| {
+                    resume_virtual_continuation(carrier_shared.clone(), vt_id);
+                });
+        }
         let thread_obj_for_spawn = thread_obj;
         // Round-9 misc HIGH fix (audit `round9-misc.md`): this knob sizes the
         // *native Rust stack* for the carrier OS thread that hosts a Java
@@ -6546,6 +6729,43 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(8 * 1024 * 1024);
+        if is_virtual {
+            let mut virtual_runtime = Box::new(JvmThread::new(tid, &name));
+            virtual_runtime.kind = crate::threading::ThreadKind::Virtual;
+            virtual_runtime.park_state = pre_park;
+            virtual_runtime.interrupted = pre_interrupted;
+            virtual_runtime.java_thread_obj = self
+                .shared
+                .thread_registry
+                .java_thread_obj(tid)
+                .or(Some(thread_obj_for_spawn));
+            self.shared
+                .thread_registry
+                .set_root_snapshot(tid, virtual_runtime.root_snapshot.clone());
+            self.shared
+                .thread_registry
+                .set_frame_trace(tid, virtual_runtime.frame_trace.clone());
+            self.shared
+                .thread_registry
+                .set_vm_state(tid, virtual_runtime.vm_state.clone());
+            self.shared
+                .thread_registry
+                .set_gc_block_state(tid, virtual_runtime.gc_block_state.clone());
+            self.shared.thread_registry.set_tlab_addr(
+                tid,
+                &virtual_runtime.tlab as *const cratonvm_gc::Tlab as usize,
+            );
+            self.shared.thread_registry.set_jvm_thread_addr(
+                tid,
+                (&*virtual_runtime as *const JvmThread) as usize,
+            );
+            self.shared
+                .virtual_thread_manager
+                .install_runtime(tid.0, virtual_runtime);
+            self.shared.virtual_thread_manager.start(tid.0);
+            std::thread::yield_now();
+            return Ok(None);
+        }
         let thread_name_for_builder = name.clone();
         let handle = std::thread::Builder::new()
             .name(thread_name_for_builder)
@@ -6705,6 +6925,28 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 &[Value::Object(Some(run_thread_obj))],
             );
             jvm_thread.set_vm_state("thread-start:run-returned");
+            if let Err(MethodCallFailed::InternalError(VmError::ContinuationYield {
+                wake_after_nanos,
+            })) = &result
+            {
+                NativeContextImpl {
+                    shared: &shared_arc,
+                    thread: &mut jvm_thread,
+                }
+                .deposit_root_snapshot();
+                let boxed = Box::new(jvm_thread);
+                shared_arc.thread_registry.set_jvm_thread_addr(
+                    tid,
+                    (&*boxed as *const JvmThread) as usize,
+                );
+                shared_arc.virtual_thread_manager.suspend_runtime(
+                    tid.0,
+                    boxed,
+                    std::time::Duration::from_nanos(*wake_after_nanos),
+                );
+                shared_arc.virtual_scheduler.release();
+                return;
+            }
             if dbg_ts {
                 eprintln!(
                     "[THREADEND] tid={} name={:?} result={}",
@@ -7462,6 +7704,33 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         }
     }
 
+    fn vt_park_for(&mut self, _duration: std::time::Duration) -> bool {
+        matches!(self.thread.kind, crate::threading::ThreadKind::Virtual)
+            && self.thread.pin_count == 0
+    }
+
+    fn vt_wait_on_key(&mut self, key: u64) -> bool {
+        if !matches!(self.thread.kind, crate::threading::ThreadKind::Virtual)
+            || self.thread.pin_count != 0
+        {
+            return false;
+        }
+        self.shared
+            .virtual_thread_manager
+            .wait_on_key(key, self.thread.thread_id.0);
+        true
+    }
+
+    fn vt_cancel_wait_on_key(&mut self, key: u64) {
+        self.shared
+            .virtual_thread_manager
+            .cancel_wait_on_key(key, self.thread.thread_id.0);
+    }
+
+    fn vt_wake_waiters(&mut self, key: u64) {
+        self.shared.virtual_thread_manager.wake_waiters(key);
+    }
+
     fn emit_virtual_thread_pinned_jfr(&mut self, reason: &'static str) {
         // Round-4: pin_reason is a JEP-491 enum-like literal — the underlying
         // `emit_virtual_thread_pinned_event` now requires `&'static str`.
@@ -8212,6 +8481,13 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     }
 
     fn unpark(&self, thread_obj: ObjectRef) {
+        if let Some(tid) = resolve_thread_id_from_thread_obj(self.shared, thread_obj) {
+            if self.shared.virtual_thread_manager.is_virtual(tid.0) {
+                self.shared.virtual_thread_manager.cancel_wakeup(tid.0);
+                self.shared.virtual_thread_manager.unpark_virtual(tid.0);
+                return;
+            }
+        }
         // Find the ParkState associated with this Java Thread object
         // by looking up in the thread registry.
         if let Some(park_state) = self.shared.find_park_state_for_thread_obj(thread_obj) {

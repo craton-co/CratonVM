@@ -5533,7 +5533,13 @@ pub fn execute(
         // Mirrors the gates in `try_jit_compile_callee` / `try_jit_upgrade_with_gate` /
         // `try_osr` so the user-facing CRATONVM_DISABLE_JIT flag actually disables
         // the FIRST-CALL JIT compile path here too.
-        let env_disable_jit = crate::runtime::env_cache::disable_jit();
+        // Continuations currently freeze precise interpreter frames. Until a
+        // compiled activation can deopt directly into a heap stack chunk, a
+        // virtual thread must not enter machine code that may cross a yield.
+        // This is a per-thread execution gate; platform threads still compile
+        // and use the shared artifacts normally.
+        let env_disable_jit = crate::runtime::env_cache::disable_jit()
+            || matches!(thread.kind, crate::threading::ThreadKind::Virtual);
         let redefine_jit_quiesced = crate::classloading::any_class_redefined();
         // GPU-offload JIT admission gate (known-issues followups item 2):
         // while `--gpu` is active, a caller whose bytecode contains an
@@ -7251,6 +7257,16 @@ pub fn execute(
         }
     };
 
+    // A continuation yield is a scheduler control transfer, not a method
+    // failure. Keep every frame exactly as execute_frame left it so the
+    // virtual-thread manager can freeze the complete Java stack.
+    if matches!(
+        result,
+        Err(MethodCallFailed::InternalError(VmError::ContinuationYield { .. }))
+    ) {
+        return result;
+    }
+
     // Truncate any orphaned inner frames that execute_frame may have left on the
     // stack when it returned early via `return Err(e)` without popping callees.
     // We expect exactly `frames_depth_before_push + 1` frames here (the one we
@@ -7262,6 +7278,46 @@ pub fn execute(
     // Pop frame and recycle its Vec allocations
     pop_and_recycle_frame(shared, thread);
 
+    result
+}
+
+/// Resume a complete Java stack restored from a virtual-thread continuation.
+///
+/// Unlike `execute`, no new root frame is created: every frame already carries
+/// its exact bytecode PC, locals, operand stack, exception table, and method
+/// identity. Dispatch begins at the youngest frame and may return/unwind
+/// through all restored callers down to index zero.
+pub fn resume_continuation(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+) -> MethodCallResult {
+    if thread.frames.is_empty() {
+        return Ok(None);
+    }
+    if crate::runtime::env_cache::frame_trace() {
+        eprintln!("[CONTINUATION_RESUME] frames={}", thread.frames.len());
+        for (index, frame) in thread.frames.iter().enumerate() {
+            eprintln!(
+                "  [{index}] {}.{}{} pc={} stack={}",
+                frame.class_name(),
+                frame.method_name(),
+                frame.method_descriptor(),
+                frame.pc,
+                frame.stack.len(),
+            );
+        }
+    }
+    let result = execute_frame_from_index(shared, thread, 0);
+    if matches!(
+        result,
+        Err(MethodCallFailed::InternalError(VmError::ContinuationYield { .. }))
+    ) {
+        return result;
+    }
+    while thread.frames.len() > 1 {
+        pop_and_recycle_frame(shared, thread);
+    }
+    pop_and_recycle_frame(shared, thread);
     result
 }
 
@@ -7558,6 +7614,9 @@ pub(crate) fn try_osr_with_backoff(
     initial_frame_idx: usize,
     entry_pc: usize,
 ) -> OsrBackoffOutcome {
+    if matches!(thread.kind, crate::threading::ThreadKind::Virtual) {
+        return OsrBackoffOutcome::Skip;
+    }
     // Back-edge OSR is default-on after the known entry-state corruption
     // blockers were retired. Whole-method JIT is unaffected. `CRATONVM_JIT_OSR=0`
     // opts out for diagnosis/bisection. This is the canonical entry for BOTH the
@@ -7650,7 +7709,17 @@ pub(crate) fn try_osr_with_backoff(
 
 fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult {
     let initial_frame_idx = thread.frames.len() - 1;
-    let mut frame_idx = initial_frame_idx;
+    execute_frame_from_index(shared, thread, initial_frame_idx)
+}
+
+/// Execute a previously frozen stack. `initial_frame_idx` is the oldest frame
+/// owned by this invocation, while dispatch resumes at the current top frame.
+fn execute_frame_from_index(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    initial_frame_idx: usize,
+) -> MethodCallResult {
+    let mut frame_idx = thread.frames.len() - 1;
     // AUDIT CRIT-3 fix: hoist the PGO-enabled atomic load ONCE per
     // execute_frame invocation.  Branch sites in the interpreter hot loop
     // (~13 of them) test this local instead of doing an atomic load + 2
@@ -10233,6 +10302,16 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                     continue;
                 }
                 return Ok(value);
+            }
+            Err(MethodCallFailed::InternalError(
+                yield_signal @ VmError::ContinuationYield { .. },
+            )) => {
+                // Yield crosses every nested execute_frame boundary without
+                // unwinding a Java frame. In particular, preserve the leaf
+                // frame whose native sleep/park issued the signal: its PC is
+                // already after the invoke and its operand stack contains the
+                // live values needed when the continuation is remounted.
+                return Err(MethodCallFailed::InternalError(yield_signal));
             }
             Err(MethodCallFailed::InternalError(VmError::Runtime(re))) => {
                 // B4 fix (audit `vm-runtime.md`): an operand-stack overflow is
@@ -23059,7 +23138,10 @@ fn try_invoke_cached_lambda_impl(
     // `(I)D`. When that leaf is already compiled and has no dispatch helpers,
     // enter it directly instead of materializing an interpreter frame per get.
     // Other lambda implementations retain the generic cached-frame path below.
-    if &*cached.method_name == "get" && &*cached.method_descriptor == "(I)D" {
+    if !matches!(thread.kind, crate::threading::ThreadKind::Virtual)
+        && &*cached.method_name == "get"
+        && &*cached.method_descriptor == "(I)D"
+    {
         let compiled = {
             let cache = shared.jit_cache.read();
             cache.get(
@@ -31600,6 +31682,8 @@ fn execute_invokestatic_cached(
     cp_index: u16,
 ) -> Result<CachedCallResult, MethodCallFailed> {
     let caller_class_id = thread.frames[frame_idx].class_id;
+    let continuation_interpreted =
+        matches!(thread.kind, crate::threading::ThreadKind::Virtual);
 
     // Thread-local invoke cache — no locking needed. invokestatic uses
     // is_special=false since static calls never collide cp_index with
@@ -31627,7 +31711,9 @@ fn execute_invokestatic_cached(
             }
         }
     }
-    if redefine_jit_quiesced && matches!(&target, CachedInvokeTarget::Jit { .. }) {
+    if (redefine_jit_quiesced || continuation_interpreted)
+        && matches!(&target, CachedInvokeTarget::Jit { .. })
+    {
         thread.invoke_cache.evict(caller_class_id, cp_index, false);
         return Ok(CachedCallResult::CacheMiss);
     }
@@ -31745,7 +31831,7 @@ fn execute_invokestatic_cached(
 
             // Fast path: check if the method was already JIT-compiled (e.g. by OSR)
             // before going through the invocation counter.
-            if !redefine_jit_quiesced {
+            if !redefine_jit_quiesced && !continuation_interpreted {
                 let jit_cache = shared.jit_cache.read();
                 if let Some(compiled) = jit_cache.get(
                     &cached.class_name,
@@ -31854,7 +31940,7 @@ fn execute_invokestatic_cached(
             let should_attempt = past_threshold
                 && (invoc_count == jit_invocation_threshold
                     || (invoc_count - jit_invocation_threshold) % JIT_RETRY_STRIDE == 0);
-            if should_attempt && !redefine_jit_quiesced {
+            if should_attempt && !redefine_jit_quiesced && !continuation_interpreted {
                 // Consult tiered compilation manager for recommended tier
                 let tiered_key = crate::jit::tiered::MethodKey::new(
                     cached.class_name.as_ref(),
@@ -39223,6 +39309,7 @@ fn execute_invokevirtual_cached(
                         })
                         .is_some();
                     if !is_special
+                        && !matches!(thread.kind, crate::threading::ThreadKind::Virtual)
                         && !cached.is_synchronized
                         && !has_registered_native
                         && !crate::classloading::any_class_redefined()

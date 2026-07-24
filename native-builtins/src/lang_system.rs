@@ -603,6 +603,15 @@ pub(crate) fn native_thread_sleep(ctx: &mut dyn NativeContext, args: &[Value]) -
             ctx.emit_virtual_thread_pinned_jfr("Thread.sleep while pinned");
         }
         let release = is_virtual && !pinned;
+        let effective_millis = crate::async_handoff_sleep_millis(millis);
+        let target = std::time::Duration::from_millis(effective_millis as u64);
+        if release && ctx.vt_park_for(target) {
+            return Err(cratonvm_types::error::MethodCallFailed::InternalError(
+                cratonvm_types::error::VmError::ContinuationYield {
+                    wake_after_nanos: target.as_nanos().min(u64::MAX as u128) as u64,
+                },
+            ));
+        }
         if release {
             ctx.vt_release_carrier();
         }
@@ -620,8 +629,6 @@ pub(crate) fn native_thread_sleep(ctx: &mut dyn NativeContext, args: &[Value]) -
         // immediately follows async submission, give those short sleeps a small
         // scheduling floor; Thread.sleep only promises to sleep at least the
         // requested duration.
-        let effective_millis = crate::async_handoff_sleep_millis(millis);
-        let target = std::time::Duration::from_millis(effective_millis as u64);
         let deadline = sleep_start + target;
         let mut interrupted = false;
         loop {
@@ -2285,6 +2292,13 @@ pub(crate) fn native_thread_sleep_nanos(
             ctx.emit_virtual_thread_pinned_jfr("Thread.sleep(nanos) while pinned");
         }
         let release = is_virtual && !pinned;
+        if release && ctx.vt_park_for(duration) {
+            return Err(cratonvm_types::error::MethodCallFailed::InternalError(
+                cratonvm_types::error::VmError::ContinuationYield {
+                    wake_after_nanos: duration.as_nanos().min(u64::MAX as u128) as u64,
+                },
+            ));
+        }
         if release {
             ctx.vt_release_carrier();
         }
@@ -2379,6 +2393,15 @@ pub(crate) fn native_thread_sleep0(
         ctx.emit_virtual_thread_pinned_jfr("Thread.sleep0 while pinned");
     }
     let release = is_virtual && !pinned;
+    let effective_millis = crate::async_handoff_sleep_millis(millis as i64) as u64;
+    let sleep_duration = std::time::Duration::from_millis(effective_millis);
+    if release && ctx.vt_park_for(sleep_duration) {
+        return Err(cratonvm_types::error::MethodCallFailed::InternalError(
+            cratonvm_types::error::VmError::ContinuationYield {
+                wake_after_nanos: sleep_duration.as_nanos().min(u64::MAX as u128) as u64,
+            },
+        ));
+    }
     if release {
         ctx.vt_release_carrier();
     }
@@ -2389,8 +2412,7 @@ pub(crate) fn native_thread_sleep0(
     // sleep window. (Pre-WP4.5 the chunk was 100ms; the smaller chunk
     // matches the resolution of `scheduleAtFixedRate`.)
     let start = std::time::Instant::now();
-    let effective_millis = crate::async_handoff_sleep_millis(millis as i64) as u64;
-    let deadline = start + std::time::Duration::from_millis(effective_millis);
+    let deadline = start + sleep_duration;
     let result = loop {
         let now = std::time::Instant::now();
         if now >= deadline {
