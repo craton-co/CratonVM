@@ -1,4 +1,4 @@
-# H2 suite — residual FAIL triage (2026-07-21): reproduced, narrowed, mostly closed after nine follow-up sessions
+# H2 suite — residual FAIL triage (2026-07-21): reproduced, narrowed, mostly closed after ten follow-up sessions
 
 ## Status
 **MOSTLY CLOSED after nine follow-up sessions.** The ninth pass FIXED the
@@ -2433,4 +2433,129 @@ receiver's own class", "force native Hashtable/HashMap put/get/size on
 ALL dispatch paths") -- both `GROUP BY` grouping and subquery
 result-caching plausibly use `HashMap`-like structures internally, so a
 regression there is at least plausible, though not verified.
+
+
+## Follow-up session (tenth pass, 2026-07-24): the composite-PK
+## partial-WHERE null-column bug FIXED; `TestUpgrade`'s SQL-parsing NPE
+## reopened by that fix through an unexplained interaction, still OPEN
+
+Worktree `/data/wt-h2-nullvalue-rowlookup-20260724` on the Azure host,
+branch `fix/h2-nullvalue-rowlookup-20260724`, branched from `origin/dev`
+(which already had all nine prior passes' fixes). Picked up via the
+`task_2168068f` follow-up spawned at the end of the ninth pass (originally
+framed as "TestLinkedTable/TestPreparedStatement fail with a null Value
+in a JDBC row, suspect recent Hashtable/HashMap dispatch commits").
+
+### Root cause and fix: NOT a Hashtable/HashMap issue
+
+The leading suspect from the ninth pass (recent `Hashtable`/`HashMap`
+map-dispatch commits) was a red herring. Root-caused instead to
+`native-builtins/src/apps_h2.rs`'s fast-path native override for
+`ExpressionColumn.getValue` — see
+`docs/internal/fixed-suite-bugs/h2-suite-bugs/composite-pk-partial-where-null-column-FIXED.md`
+for the full writeup and minimal, H2-Upgrade-independent repro (also
+recorded as its own `docs/known-issues/` doc during the ninth pass, now
+moved to `internal/` since it's fixed). Short version: the fast path read
+`TableFilter.currentSearchRow` directly and returned whatever it got with
+no null check; for a cursor driven by a SECONDARY index over a PREFIX of
+a composite key (an index range scan), `currentSearchRow` is the index's
+own partial key row, and reading a non-indexed column off it returns raw
+`null` instead of triggering the real `TableFilter.getValue(Column)`
+bytecode's correct lazy full-row fetch. Fixed by falling through to that
+real (slower, correct) virtual dispatch whenever the fast-path read comes
+back null.
+
+Verified: the minimal repro, `TestLinkedTable`, and `TestPreparedStatement`
+all pass now. Regression-clean on `TestAlter`, `TestShell`,
+`TestResultSet`, `TestUpdatableResultSet`. `TestView`'s pre-existing,
+unrelated `testInnerSelectWithRownum` failure confirmed present
+identically on pristine pre-fix `dev` (not caused by this fix). Fix commit
+`a88d06a5a`, pushed to `origin/dev` (`37367454c`) from the worktree
+directly (same rationale as the ninth pass: avoid the shared main
+checkout's concurrent dirty state).
+
+### New residual: this fix reopens `TestUpgrade`'s SQL-parsing NPE,
+### mechanism NOT understood despite investigation — OPEN
+
+After landing the fix above, `org.h2.test.unit.TestUpgrade` regressed
+back to the EXACT SQL-parsing `NullPointerException`
+(`ParserBase.getSyntaxError`, `this.token` is null) that the ninth pass's
+Parser loader-collapse fix had closed. Confirmed this is a genuine,
+deterministic (2/2 runs) effect of the `ExpressionColumn.getValue` fix
+specifically:
+- A binary built from the SAME worktree/commit WITHOUT the
+  `ExpressionColumn.getValue` change (i.e. with only the ninth pass's
+  Parser fix) correctly shows `TestUpgrade` progressing past the
+  SQL-parsing NPE into the already-known LOB-migration residual.
+- The SAME binary WITH the `ExpressionColumn.getValue` fix regresses back
+  to the SQL-parsing NPE, deterministically.
+
+**Ruled out**: this is NOT a GC-safety bug in the new fix itself. The
+initial fix version read `resolver`/`column` again after a re-entrant
+`invoke_virtual` probe call without pinning them (a real, separate bug,
+matching this doc's own established "GC-forwarding gap" bug family) —
+but adding the missing pinning (mirroring the pattern used throughout
+this file, e.g. the ninth pass's own `h2_session_prepare_local_no_cache`
+fix) did NOT change the outcome; `TestUpgrade` still regresses identically
+either way. The GC-safety fix was kept anyway (independently correct) but
+is confirmed NOT the mechanism connecting the two.
+
+**Confirmed NOT a `NoSuchMethodError` regression** — grepped the full
+failure output, zero occurrences; only the `ParserBase.getSyntaxError`
+NPE reappears, meaning the eighth-pass `updateRootPage` fix and the
+ninth-pass `h2_session_prepare_local_no_cache` fix both remain intact and
+unaffected.
+
+Traced with `CRATONVM_DBG_TABLEFILTER=1` (a new, ad-hoc env-gated trace
+added to `h2_expression_column_get_value` for this investigation, since
+reverted/not committed) that only 6 `ExpressionColumn.getValue` calls
+during the whole `TestUpgrade` run ever take the new fallthrough branch
+before the failure — all with `column_id` 2 or 3 against a
+`row_class=org/h2/result/Sparse` (H2's own partial-row representation),
+consistent with some INFORMATION_SCHEMA-shaped internal query executed
+very early in test setup. Did not manage to pin down, within this
+session's time budget, HOW triggering the real `TableFilter.getValue`
+bytecode path (and its `cursor.get()` full-row fetch) for those 6 calls
+propagates into a completely different subsystem (SQL parsing of the OLD
+driver's own `CREATE TABLE` statement) minutes/statements later.
+
+**Working hypotheses for whoever picks this up next, none yet tested**:
+1. The newly-exercised `cursor.get()` full-row fetch (now reached for the
+   first time for these 6 calls, since the old buggy fast path never
+   called it) triggers loading of `org/h2/command/Parser` or a related
+   class for the FIRST time in the process, in a context/order that
+   exposes a DIFFERENT, not-yet-found loader-collapse-shaped bug distinct
+   from the two already fixed (eighth and ninth passes) — i.e. a THIRD
+   vulnerable call site, not yet identified. `CRATONVM_DBG_LOADER_TRACE=1`
+   combined with the `CRATONVM_DBG_TABLEFILTER` trace mentioned above
+   (both env-gated, straightforward to re-add) would be the natural way
+   to correlate the two.
+2. `TableFilter.getValue(Column)`'s own bytecode, when exercised via
+   genuine interpretation for the very first time in a `TestUpgrade` run
+   (previously always shortcut by the buggy native), hits an UNRELATED,
+   pre-existing interpreter dispatch bug of its own — i.e. the
+   `ExpressionColumn.getValue` fix is innocent of the actual mechanism,
+   merely the first thing to newly exercise a different latent bug.
+   Distinguishing this from hypothesis 1 would need tracing what,
+   specifically, changes in `TestUpgrade`'s early execution between the
+   two binaries (e.g. a full bytecode-level diff of the first ~10k
+   interpreted instructions of each run, or watchpoint-style tracing on
+   `org/h2/command/Parser`'s class-identity as done for the RootReference
+   investigation in the seventh/eighth passes).
+3. Not yet ruled out: simple execution-count/timing sensitivity (the
+   `Sentence.MAX_PROCESSING_TIME`-style budget-exhaustion family
+   documented earlier in this doc for `TestBnf`/`TestFileLock` /
+   `TestTransaction`) — though this seems less likely given the failure
+   is a hard NPE with a specific, reproducible stack trace rather than a
+   soft assertion failure, and reproduces at 2/2 so far, not flaky.
+
+**Decision**: shipped the `ExpressionColumn.getValue` fix anyway despite
+this open interaction, since it corrects a severe, general
+data-correctness bug (silently wrong result values for an extremely
+common "filter by a prefix of a composite key" SQL pattern, well beyond
+just `TestUpgrade`) — see the fix's own doc for the full trade-off
+reasoning. `TestUpgrade` was already not a clean pass on `dev` (the
+LOB-migration residual from the ninth pass remains open regardless), so
+this does not represent a NEW regression from a previously-clean state,
+just a different failure point within an already-failing test class.
 pass.
