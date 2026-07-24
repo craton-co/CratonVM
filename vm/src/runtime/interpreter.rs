@@ -15620,6 +15620,24 @@ fn execute_instruction(
                 resolve_class_loader_aware(shared, thread, referencing_class_id, &class_name)
                     .map_err(|e| convert_class_not_found(shared, thread, &class_name, e))?;
 
+            if std::env::var_os("CRATONVM_DBG_H2TRACE").is_some()
+                && (class_name == "org/h2/command/Parser"
+                    || class_name == "org/h2/command/ParserBase"
+                    || class_name == "org/h2/command/Token")
+            {
+                let cm = shared.class_manager.read();
+                let ref_loader = cm.get_loader_id(referencing_class_id);
+                let target_loader = cm.get_loader_id(target_class_id);
+                let ref_name = cm
+                    .get_class(referencing_class_id)
+                    .map(|c| c.name.to_string())
+                    .unwrap_or_default();
+                drop(cm);
+                eprintln!(
+                    "[h2trace-new] BYTECODE-NEW class_name={class_name} referencing_class={ref_name} referencing_class_id={referencing_class_id:?} referencing_loader={ref_loader:?} target_class_id={target_class_id:?} target_loader={target_loader:?}",
+                );
+            }
+
             if std::env::var("CRATONVM_DBG_LOADER_TRACE").is_ok()
                 && class_name.contains("RootReference")
             {
@@ -30651,17 +30669,30 @@ fn execute_invokestatic(
 
     // Sibling static owners in a user-defined loader need the same identity
     // preservation as self-calls; resolving by flat name can pick the app copy.
+    //
+    // bt18-inline-tlab-regression-20260724 (part 2): both probes below are
+    // gated on the process-wide "any defining loader registered at all"
+    // atomic. Without the gate, every dispatched static call paid the
+    // defining-loader registry mutex twice — and, worse, the
+    // cache-suppression rule below misread a plain SELF-RECURSIVE static
+    // call (static_dispatch_class_id == Some(self)) as loader-specific,
+    // suppressing invoke-cache promotion for every recursive static in
+    // every application and sending each call through the slow dispatcher
+    // (bt18 4.8x). Only a genuinely loader-specific owner selection —
+    // tracked via `loader_specific_dispatch` — may suppress promotion.
+    let any_user_loader = cratonvm_native_builtins::classloader::any_defining_loader_registered();
     let isolated_url_definition =
-        is_isolated_url_loader_definition(shared, thread, current_class_id);
+        any_user_loader && is_isolated_url_loader_definition(shared, thread, current_class_id);
     // A defining-loader registration is authoritative even when the
     // class-manager's loader-id metadata is unavailable for a real-JDK
     // subclass. Static symbolic references still use the caller's defining
     // loader under JVMS 5.4.3; restricting that to the historical fork/Groovy
     // gates leaves ordinary ModifiedClassPathClassLoader bytecode bound to the
     // flat application copy.
-    let has_user_defining_loader =
-        cratonvm_native_builtins::classloader::defining_loader_for(current_class_id.as_u32())
+    let has_user_defining_loader = any_user_loader
+        && cratonvm_native_builtins::classloader::defining_loader_for(current_class_id.as_u32())
             .is_some();
+    let mut loader_specific_dispatch = false;
     let static_dispatch_class_id = self_class_id.or_else(|| {
         // Keep static method owners in the same initiating-loader namespace
         // as every other symbolic reference. This includes the narrow
@@ -30673,6 +30704,7 @@ fn execute_invokestatic(
             || isolated_url_definition
             || has_user_defining_loader
         {
+            loader_specific_dispatch = true;
             // Preserve the initiating loader even when the global classpath
             // already has a same-named class. This is required for nested
             // implementation jars whose owner is only visible to the caller
@@ -30694,7 +30726,13 @@ fn execute_invokestatic(
         }
     });
 
-    if std::env::var_os("CRATONVM_INVOKESTATIC_LOADER_TRACE").is_some()
+    // Cached: this sat as a raw per-call getenv inside the static
+    // dispatcher (visible in the bt18 regression profile's getenv storm).
+    fn invokestatic_loader_trace() -> bool {
+        static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *G.get_or_init(|| std::env::var_os("CRATONVM_INVOKESTATIC_LOADER_TRACE").is_some())
+    }
+    if invokestatic_loader_trace()
         && (method_class_name.contains("SpringFactoriesLoader")
             || method_class_name.contains("EnvironmentPostProcessorsFactory")
             || method_class_name.contains("ManagementPortType")
@@ -30824,7 +30862,12 @@ fn execute_invokestatic(
     // call into an application-loader copy. Keep loader-specific static calls
     // on the already-correct slow dispatcher until the cache key can carry
     // the resolved ClassId.
-    let mut suppress_invoke_cache = static_dispatch_class_id.is_some() || has_user_defining_loader;
+    //
+    // bt18 part 2: suppression keys on `loader_specific_dispatch`, NOT on
+    // `static_dispatch_class_id.is_some()` — the latter is Some for every
+    // plain self-recursive static call (self_class_id), which suppressed
+    // caching for all recursive statics in loader-free applications.
+    let mut suppress_invoke_cache = loader_specific_dispatch || has_user_defining_loader;
     #[cfg(feature = "gpu-offload")]
     {
         if shared.config.gpu_offload_enabled
@@ -38538,6 +38581,31 @@ fn execute_invokevirtual_cached(
     is_special: bool,
 ) -> Result<CachedCallResult, MethodCallFailed> {
     let caller_class_id = thread.frames[frame_idx].class_id;
+
+    if std::env::var_os("CRATONVM_DBG_H2TRACE").is_some() {
+        if let Ok((owner, method, descriptor, _)) = resolve_method_ref(shared, caller_class_id, cp_index) {
+            if method.as_ref() == "prepareJoinBatch" {
+                let cm = shared.class_manager.read();
+                let caller_name = cm.get_class(caller_class_id).map(|c| c.name.to_string()).unwrap_or_default();
+                let caller_loader = cm.get_loader_id(caller_class_id);
+                let receiver = thread.frames[frame_idx].stack.peek_at(0);
+                let recv_info = if let Value::Object(Some(r)) = receiver {
+                    let rcid = shared.heap.class_id_of(r);
+                    let rname = cm.get_class(rcid).map(|c| c.name.to_string()).unwrap_or_default();
+                    let rloader = cm.get_loader_id(rcid);
+                    format!("class_id={rcid:?} class={rname} loader={rloader:?}")
+                } else {
+                    format!("{receiver:?}")
+                };
+                let cached = thread.invoke_cache.get(caller_class_id, cp_index, is_special);
+                let cached_info = cached.as_ref().map(|t| format!("{t:?}"));
+                drop(cm);
+                eprintln!(
+                    "[h2trace-pjb] site owner={owner} method={method}{descriptor} caller={caller_name} caller_loader={caller_loader:?} cp_index={cp_index} receiver=[{recv_info}] cached={cached_info:?}",
+                );
+            }
+        }
+    }
 
     if std::env::var("CRATONVM_DBG_LOADER_TRACE").is_ok()
         && is_special

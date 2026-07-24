@@ -2114,6 +2114,29 @@ pub fn inline_putfield_enabled() -> bool {
     *G.get_or_init(|| std::env::var_os("CRATONVM_NO_JIT_INLINE_PUTFIELD").is_none())
 }
 
+/// Inline TLAB `new` — bump allocation emitted directly in compiled code.
+///
+/// Default-ON again (bt18-inline-tlab-regression-20260724): the emission is
+/// now suspension- and walker-safe — the full object header is written
+/// BEFORE the cursor-commit store, which is the single linearization point
+/// (x86-64 TSO: stores are not reordered with older stores), and every
+/// header field that historically relied on the "TLAB refill zeroes the
+/// region" assumption is written explicitly. That closes the publication
+/// race for which 1ee92e3fd demoted this path to opt-in — a demotion that
+/// re-helperized the hottest allocation path and cost bt18 ~4x
+/// (single-cycle 90%-fill young GC and the inline fresh-ctor stores both
+/// sat on top of this path).
+///
+/// Opt out: `CRATONVM_NO_JIT_INLINE_TLAB_NEW=1` routes every `new` through
+/// the always-correct `new_object` helper. The legacy opt-in
+/// `CRATONVM_ENABLE_UNSAFE_INLINE_TLAB_NEW` remains accepted and is now
+/// redundant.
+pub fn inline_tlab_new_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| std::env::var_os("CRATONVM_NO_JIT_INLINE_TLAB_NEW").is_none())
+}
+
 fn inline_site_is_fresh_ctor_first_store(
     site: &crate::InlineSite,
     cpc: usize,
@@ -14698,7 +14721,7 @@ impl Compiler {
         //
         // The helper retains TLAB allocation (and its fast path); it merely
         // removes the unsynchronised machine-code cursor writer.
-        if std::env::var_os("CRATONVM_ENABLE_UNSAFE_INLINE_TLAB_NEW").is_none() {
+        if !inline_tlab_new_enabled() {
             self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
             self.emit_mov_imm32_sx(ARG_REGS[1], class_id_raw as i32);
             self.emit_mov_imm32_sx(ARG_REGS[2], num_fields as i32);
@@ -14905,6 +14928,10 @@ impl Compiler {
         // (and the four array_length bytes) explicitly. Two extra dwords
         // per `new` is negligible vs. the safety guarantee.
         self.emit_mov_dword_mem_disp32_imm32(R11, 4, 0);
+        // offset 8: identity_hash_code = 0 (lazy-mint contract). Written
+        // explicitly, not left to refill zeroing — see the default-on note
+        // below.
+        self.emit_mov_dword_mem_disp32_imm32(R11, 8, 0);
         // offset 12: array_length. For a compact object this carries the body
         // size in bytes (object_body_size reads it); a legacy object writes 0.
         self.emit_mov_dword_mem_disp32_imm32(R11, 12, compact_body.map(|b| b as i32).unwrap_or(0));
@@ -14918,8 +14945,8 @@ impl Compiler {
         );
         // Compact object: set GC_FLAG_COMPACT (bit 2) in gc_flags (header byte
         // 21) so the heap/GC treat it as compact. Write a dword at offset 20
-        // (gc_age=0, gc_flags=COMPACT, _gc_reserved=0); legacy objects leave it
-        // TLAB-zeroed. GC_FLAG_COMPACT (0x04) << 8 == 0x400 places it at byte 21.
+        // (gc_age=0, gc_flags=COMPACT, _gc_reserved=0); legacy objects write 0.
+        // GC_FLAG_COMPACT (0x04) << 8 == 0x400 places it at byte 21.
         if let Some(body) = compact_body {
             if std::env::var_os("CRATONVM_DBG_COMPACT_INLINE").is_some() {
                 eprintln!(
@@ -14931,7 +14958,20 @@ impl Compiler {
                 20,
                 (cratonvm_types::GC_FLAG_COMPACT as i32) << 8,
             );
+        } else {
+            self.emit_mov_dword_mem_disp32_imm32(R11, 20, 0);
         }
+        // default-on hardening (bt18-inline-tlab-regression-20260724): the
+        // "TLAB refill zeroes the region" assumption was empirically violated
+        // once already (the offset-4/12 incident above), so with this path
+        // default-on NO header field may depend on it. forwarding_ptr
+        // (24..32) and mark_word (32..40, MARK_NEUTRAL == 0) are written
+        // explicitly as dword pairs (no qword-imm store emitter; four dwords
+        // per `new` is negligible vs. a helper call).
+        self.emit_mov_dword_mem_disp32_imm32(R11, 24, 0);
+        self.emit_mov_dword_mem_disp32_imm32(R11, 28, 0);
+        self.emit_mov_dword_mem_disp32_imm32(R11, 32, 0);
+        self.emit_mov_dword_mem_disp32_imm32(R11, 36, 0);
 
         // Commit the bump LAST: [R10 + cursor_off] = RAX. This publishes the
         // object's end as the new cursor (and, transitively, the object's
@@ -14948,9 +14988,10 @@ impl Compiler {
             // both the GC walker and the runtime; no helper call needed.
             //
             // All other header fields (kind=0/Object,
-            // element_type=0/Reference, padding, array_length=0, gc_age=0,
-            // gc_flags=0, forwarding_ptr=null, mark_word=MARK_NEUTRAL)
-            // are already the correct values from the TLAB-zeroed refill.
+            // element_type=0/Reference, padding, array_length, gc_age,
+            // gc_flags, forwarding_ptr=null, mark_word=MARK_NEUTRAL) are
+            // written explicitly by the inline stores above — nothing
+            // depends on refill zeroing anymore.
             //
             // RAX = obj_ptr — both arms converge with RAX holding the
             // freshly-allocated object pointer.
