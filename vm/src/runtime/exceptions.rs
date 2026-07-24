@@ -1682,7 +1682,18 @@ fn linkage_throwable(error: &LinkageError) -> (&'static str, String) {
             method_descriptor,
         } => (
             "java/lang/NoSuchMethodError",
-            format!("{}.{}{}", class_name, method_name, method_descriptor),
+            // Real JDK's NoSuchMethodError message names the class in
+            // source (dotted) form, not internal (slash) form — e.g.
+            // `'void com.example.Foo.bar()'`. Spring Boot's
+            // `NoSuchMethodFailureAnalyzer` embeds this message verbatim in
+            // its `FailureAnalysis` description, and
+            // `NoSuchMethodFailureAnalyzerTests.
+            // whenAnInheritedMethodIsMissingThenNoSuchMethodErrorIsAnalyzed`
+            // asserts the description contains the fully-qualified DOTTED
+            // class+method (`R2dbcMappingContext.class.getName() +
+            // ".setForceQuote("`), which a slash-separated class name can
+            // never satisfy.
+            format!("{}.{}{}", class_name.replace('/', "."), method_name, method_descriptor),
         ),
         LinkageError::IncompatibleClassChangeError { message } => {
             ("java/lang/IncompatibleClassChangeError", message.clone())
