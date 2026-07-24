@@ -1951,6 +1951,21 @@ pub(crate) fn native_class_for_name(
                     "[S111-DBG] loadClass({}) succeeded via invoke_virtual",
                     dotted_name
                 );
+                if s111_dbg_enabled()
+                    && (dotted_name.contains("ConditionalOnMissingBean")
+                        || dotted_name.contains("DataSourceAutoConfiguration$PooledDataSourceConfiguration"))
+                {
+                    if let Value::Object(Some(mirror_ref)) = mirror {
+                        let cid = ctx.class_id_from_mirror(mirror_ref);
+                        let defining_loader = cid.and_then(|id| {
+                            crate::classloader::defining_loader_for(id.as_u32())
+                        });
+                        eprintln!(
+                            "[S111-DBG] loadClass({}) mirror={:?} cid={:?} defining_loader={:?}",
+                            dotted_name, mirror_ref, cid, defining_loader
+                        );
+                    }
+                }
                 // Root-cause-2 fix (WildFly parallel-extension-add CCE family,
                 // docs/known-issues/wildfly-remoting-classcastexception-
                 // parallel-extension-add.md): `mirror` -- the `Class` object
@@ -10205,7 +10220,7 @@ fn cached_annotation_proxy_for_key(
             }
         );
     }
-    let proxy = create_annotation_proxy(ctx, ann, container_loader);
+    let proxy = create_annotation_proxy(ctx, ann, Some(holder_class_id), container_loader);
     let mut guard = annotation_proxy_cache()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -10971,6 +10986,7 @@ fn resolve_annotation_class_via_loader(
 fn create_annotation_proxy(
     ctx: &mut dyn NativeContext,
     ann: &cratonvm_native_api::AnnotationData,
+    container_class_id: Option<ClassId>,
     container_loader: Option<ObjectRef>,
 ) -> ObjectRef {
     let mut proxy = alloc_concurrent_synthetic(
@@ -11015,7 +11031,17 @@ fn create_annotation_proxy(
                 Err(_) => None,
             }
         });
-        let cid_mirror = via_loader.or_else(|| {
+        // App-loader classes do not have an ObjectRef recorded in
+        // `defining_loader_for`, but they still carry a loader id in the class
+        // manager. Prefer that namespace before the flat global index: once an
+        // isolated Spring test has loaded a child copy of `OnBeanCondition`, a
+        // global lookup can otherwise make an annotation on an app-loader
+        // configuration class instantiate the child condition class.
+        let via_container_scope = container_class_id.and_then(|holder| {
+            ctx.class_id_by_name_near(class_name, holder)
+                .map(|cid| (cid, ctx.get_class_mirror(cid)))
+        });
+        let cid_mirror = via_loader.or(via_container_scope).or_else(|| {
             let cid = ctx.class_id_by_name(class_name).or_else(|| {
                 // load_class returns the mirror; we only need the ClassId, so just
                 // trigger the load and re-query by name.
@@ -11123,7 +11149,13 @@ fn create_annotation_proxy(
         names_arr = ctx.read_native_pin(names_pin, names_arr);
         ctx.set_array_element(names_arr, i, Value::Object(Some(name_str)));
         let java_val =
-            annotation_element_to_java_typed(ctx, val, ret_desc.as_deref(), container_loader);
+            annotation_element_to_java_typed(
+                ctx,
+                val,
+                ret_desc.as_deref(),
+                container_class_id,
+                container_loader,
+            );
         if std::env::var("CRATONVM_IAE_TRACE2").is_ok() {
             let desc = match &java_val {
                 Value::Object(Some(o)) => {
@@ -11199,7 +11231,7 @@ pub(crate) fn annotation_element_to_java(
     ctx: &mut dyn NativeContext,
     val: &cratonvm_native_api::AnnotationElementValue,
 ) -> Value {
-    annotation_element_to_java_typed(ctx, val, None, None)
+    annotation_element_to_java_typed(ctx, val, None, None, None)
 }
 
 /// Preserve the declared array shape when the class-file annotation reader
@@ -11253,6 +11285,7 @@ pub(crate) fn annotation_element_to_java_typed(
     ctx: &mut dyn NativeContext,
     val: &cratonvm_native_api::AnnotationElementValue,
     return_type_desc: Option<&str>,
+    container_class_id: Option<ClassId>,
     container_loader: Option<ObjectRef>,
 ) -> Value {
     use cratonvm_native_api::AnnotationElementValue;
@@ -11441,7 +11474,10 @@ pub(crate) fn annotation_element_to_java_typed(
                         }
                     }
                 }
-                if let Some(cid) = ctx.class_id_by_name(class_name) {
+                if let Some(cid) = container_class_id
+                    .and_then(|holder| ctx.class_id_by_name_near(class_name, holder))
+                    .or_else(|| ctx.class_id_by_name(class_name))
+                {
                     let mirror = ctx.get_class_mirror(cid);
                     if iae_trace_cls {
                         eprintln!("ANN-CLASS desc={desc} class={class_name} already-loaded ok");
@@ -11506,7 +11542,7 @@ pub(crate) fn annotation_element_to_java_typed(
             Value::Object(Some(descriptor_to_class_mirror(ctx, desc)))
         }
         AnnotationElementValue::Annotation(nested) => {
-            let proxy = create_annotation_proxy(ctx, nested, container_loader);
+            let proxy = create_annotation_proxy(ctx, nested, container_class_id, container_loader);
             normalize_single_annotation_array(ctx, Value::Object(Some(proxy)), return_type_desc)
         }
         AnnotationElementValue::Array(elems) => {
@@ -11734,6 +11770,7 @@ pub(crate) fn annotation_element_to_java_typed(
                     ctx,
                     elem,
                     elem_desc.as_deref(),
+                    container_class_id,
                     container_loader,
                 );
                 arr = ctx.read_native_pin(arr_pin, arr);
@@ -11901,7 +11938,7 @@ fn build_annotation_array_for(
         declaring_class_id.and_then(|cid| crate::classloader::defining_loader_for(cid.as_u32()));
     // GC-safe: `create_annotation_proxy` allocates (see `build_mirror_array`).
     build_mirror_array_comp(ctx, comp, resolvable.len(), |ctx, i| {
-        create_annotation_proxy(ctx, resolvable[i], container_loader)
+        create_annotation_proxy(ctx, resolvable[i], declaring_class_id, container_loader)
     })
 }
 
@@ -12357,7 +12394,7 @@ fn class_annotations_by_type_impl(
     // GC-safe: `create_annotation_proxy` allocates (see `build_mirror_array`).
     let container_loader = crate::classloader::defining_loader_for(class_id.as_u32());
     let arr = build_mirror_array(ctx, matching.len(), |ctx, i| {
-        create_annotation_proxy(ctx, &matching[i], container_loader)
+        create_annotation_proxy(ctx, &matching[i], Some(class_id), container_loader)
     });
     Ok(Some(Value::Object(Some(arr))))
 }
@@ -12433,7 +12470,7 @@ pub(crate) fn native_method_get_annotations_by_type(
     // GC-safe: `create_annotation_proxy` allocates (see `build_mirror_array`).
     let container_loader = crate::classloader::defining_loader_for(class_id.as_u32());
     let arr = build_mirror_array(ctx, matching.len(), |ctx, i| {
-        create_annotation_proxy(ctx, &matching[i], container_loader)
+        create_annotation_proxy(ctx, &matching[i], Some(class_id), container_loader)
     });
     Ok(Some(Value::Object(Some(arr))))
 }
@@ -12596,7 +12633,7 @@ pub(crate) fn native_field_get_annotation(
     let container_loader = crate::classloader::defining_loader_for(class_id.as_u32());
     for ann in &annotations {
         if ann.type_descriptor == target_desc {
-            let proxy = create_annotation_proxy(ctx, ann, container_loader);
+            let proxy = create_annotation_proxy(ctx, ann, Some(class_id), container_loader);
             return Ok(Some(Value::Object(Some(proxy))));
         }
     }

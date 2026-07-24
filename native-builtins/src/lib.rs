@@ -36291,6 +36291,16 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)Ljava/io/InputStream;",
         classloader::cl_get_resource_as_stream_essential,
     );
+    // JDK 25's URLClassLoader.getURLs() is concrete bytecode that reads the
+    // shimmed URLClassPath directly. Route it through the receiver-local
+    // native so manifest class-path entries are visible to callers before
+    // they construct filtered child loaders.
+    registry.register(
+        "java/net/URLClassLoader",
+        "getURLs",
+        "()[Ljava/net/URL;",
+        classloader::ucl_get_urls,
+    );
     // SB-15: `java.lang.Module.getResourceAsStream(String)`. kotlin-reflect's
     // multi-release `BuiltInsResourceLoader.loadResource` (JDK 9+ variant)
     // resolves the `.kotlin_builtins` protobuf resources via

@@ -15097,6 +15097,8 @@ fn invoke_on_class_shared_inner(
                         || (class_name == "java/net/URLClassLoader"
                             && ((method_name == "findClass"
                                 && descriptor == "(Ljava/lang/String;)Ljava/lang/Class;")
+                                || (method_name == "getURLs"
+                                    && descriptor == "()[Ljava/net/URL;")
                                 || (method_name == "findResource"
                                     && descriptor == "(Ljava/lang/String;)Ljava/net/URL;")
                                 || (method_name == "findResources"

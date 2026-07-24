@@ -6,7 +6,7 @@
 
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::service_loader::impl_jars_load_class;
 use crate::{alloc_concurrent_synthetic, obj_arg};
@@ -16,6 +16,51 @@ use cratonvm_types::{ObjectRef, Value};
 
 /// Monotonic counter for generating unique hidden class names.
 pub static HIDDEN_CLASS_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// URLClassLoader resource and class lookups can occur thousands of times for
+/// one immutable URL list. Reopening every archive for each lookup is already
+/// wasteful; a manifest-only pathing JAR makes it catastrophic because each
+/// lookup must also open all of its `Class-Path` dependencies. Keep a small,
+/// process-local cache keyed by the complete URL list. It intentionally owns
+/// no Java `ObjectRef`, so it cannot keep a loader alive.
+const LOCAL_URL_CLASS_PATH_CACHE_LIMIT: usize = 64;
+
+fn local_url_class_path_cache(
+) -> &'static Mutex<
+    std::collections::HashMap<Vec<String>, Arc<cratonvm_classloading::ClassPath>>,
+> {
+    static INSTANCE: OnceLock<
+        Mutex<std::collections::HashMap<Vec<String>, Arc<cratonvm_classloading::ClassPath>>>,
+    > = OnceLock::new();
+    INSTANCE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+fn cached_local_url_class_path(paths: &[String]) -> Arc<cratonvm_classloading::ClassPath> {
+    if let Some(existing) = local_url_class_path_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(paths)
+        .cloned()
+    {
+        return existing;
+    }
+
+    // Construct outside the cache lock: opening a manifest pathing JAR can
+    // touch hundreds of dependency archives and must not serialize unrelated
+    // URLClassLoader resolution work.
+    let built = Arc::new(cratonvm_classloading::ClassPath::new(paths));
+    let mut cache = local_url_class_path_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(existing) = cache.get(paths).cloned() {
+        return existing;
+    }
+    if cache.len() >= LOCAL_URL_CLASS_PATH_CACHE_LIMIT {
+        cache.clear();
+    }
+    cache.insert(paths.to_vec(), Arc::clone(&built));
+    built
+}
 
 // ---------------------------------------------------------------------------
 // Singleton classloader instances (JVM spec: one instance per built-in loader)
@@ -74,6 +119,10 @@ pub fn reset_loader_singletons() {
     // Companion: drop the GC marker's mirror_pin registry for the new VM too
     // (see `cratonvm_types::mirror_pin`).
     cratonvm_types::mirror_pin::clear_mirror_pins();
+    local_url_class_path_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
 }
 
 /// GC root scan for the singleton built-in class loaders.
@@ -1852,6 +1901,38 @@ fn cl_load_class_base_delegation_inner(
                 }
             }
         }
+    }
+
+    // A URLClassLoader parented only by bootstrap/platform is intentionally
+    // isolated from application entries. Spring Boot's
+    // ModifiedClassPathClassLoader uses this topology to remove selected JARs
+    // from a test's classpath. Do this before the flat global-store fallback:
+    // otherwise `super.loadClass` from its override returns the application
+    // loader's same-named class, and Spring's ASM metadata resolves annotation
+    // types through a different loader than the condition class itself.
+    //
+    // Keep bootstrap-appended classes on their normal parent-delegation path;
+    // Mockito's injected dispatcher must remain bootstrap-defined.
+    // In real-JDK mode an inherited URLClassLoader relationship is not always
+    // visible through `object_extends` while dispatching a subclass override.
+    // Its constructor URLs are retained independently and are the authoritative
+    // signal that this loader has a private URL search path.
+    let has_private_url_path = !loader_constructor_url_paths(ctx, this).is_empty();
+    if (url_classloader_isolated_from_app(ctx, this)
+        || ((parent_is_null || parent_is_platform) && has_private_url_path))
+        && !is_bootstrap_class_name(&internal)
+        && !cratonvm_classloading::is_bootstrap_appended_class(&internal)
+    {
+        if let Some(result) = ucl_try_define_local_class(ctx, this, &internal) {
+            return result;
+        }
+        let exception = crate::jboss_module_loader::alloc_single_message_exception(
+            ctx,
+            "java/lang/ClassNotFoundException",
+            1,
+            &internal,
+        );
+        return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(exception));
     }
 
     // 2. Delegate to parent loader first (recursive parent-first delegation)
@@ -4327,6 +4408,123 @@ fn ucp_path_urls(ctx: &mut dyn NativeContext, ucp: ObjectRef) -> Option<ObjectRe
     Some(result)
 }
 
+/// Construct a file URL from an absolute class-path entry. The manifest
+/// resolver returns native paths rather than URL text, while Java callers of
+/// `URLClassLoader.getURLs()` need real URL objects.
+fn file_url_spec(path: &str) -> String {
+    let path = path.replace('\\', "/");
+    let encoded = path
+        .replace('%', "%25")
+        .replace(' ', "%20")
+        .replace('#', "%23")
+        .replace('?', "%3F");
+    if encoded.starts_with('/') {
+        format!("file://{encoded}")
+    } else {
+        format!("file:///{encoded}")
+    }
+}
+
+fn new_url_from_spec(ctx: &mut dyn NativeContext, spec: &str) -> Option<ObjectRef> {
+    let text = ctx.create_string(spec);
+    let text_pin = ctx.pin_native_root(text);
+    let url = match ctx.new_object("java/net/URL") {
+        Ok(Some(Value::Object(Some(url)))) => url,
+        _ => {
+            ctx.unpin_native_roots(text_pin);
+            return None;
+        }
+    };
+    let url_pin = ctx.pin_native_root(url);
+    let text = ctx.read_native_pin(text_pin, text);
+    let result = ctx.invoke_special(
+        "java/net/URL",
+        "<init>",
+        "(Ljava/lang/String;)V",
+        &[Value::Object(Some(url)), Value::Object(Some(text))],
+    );
+    let url = ctx.read_native_pin(url_pin, url);
+    ctx.unpin_native_roots(text_pin);
+    ctx.unpin_native_roots(url_pin);
+    result.ok().map(|_| url)
+}
+
+/// The real JDK application loader is not a `URLClassLoader`, so Spring
+/// Boot's `ModifiedClassPathClassLoader` obtains its individual class-path
+/// entries from `java.class.path`. CratonVM exposes an AppClassLoader-shaped
+/// URL loader instead; handing Spring the suite runner's single manifest
+/// pathing JAR causes its exclusion filter to run *before* that manifest is
+/// expanded, and the later local lookup silently restores excluded JARs.
+///
+/// Expose manifest dependencies as effective URLClassLoader entries. CratonVM
+/// resolves a manifest `Class-Path` for every receiver-local lookup, so
+/// returning its original pathing JAR here lets callers filter a different
+/// class path than the loader will subsequently search.
+fn expanded_manifest_urls(
+    ctx: &mut dyn NativeContext,
+    urls: ObjectRef,
+) -> Option<ObjectRef> {
+    // `new_url_from_spec` below can collect; the source array is revisited
+    // while discovering the manifest entries, so keep it visible to a moving
+    // collector throughout that phase as well.
+    let urls_pin = ctx.pin_native_root(urls);
+    let count = ctx.array_length(urls);
+    let mut paths = Vec::new();
+    let mut expanded_any = false;
+    for index in 0..count {
+        let urls = ctx.read_native_pin(urls_pin, urls);
+        let url = match ctx.get_array_element(urls, index) {
+            Value::Object(Some(url)) => url,
+            _ => {
+                ctx.unpin_native_roots(urls_pin);
+                return None;
+            }
+        };
+        let Some(path) = extract_url_path(ctx, url) else {
+            ctx.unpin_native_roots(urls_pin);
+            return None;
+        };
+        let manifest_paths = if std::path::Path::new(&path).is_file() {
+            cratonvm_classloading::ClassPath::read_jar_manifest(std::path::Path::new(&path))
+                .map(|manifest| manifest.resolve_class_path(std::path::Path::new(&path)))
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        if std::env::var_os("CRATONVM_DBG_UCLRES").is_some() {
+            eprintln!(
+                "[UCLURLS-DBG] path={path:?} manifest_entries={}",
+                manifest_paths.len()
+            );
+        }
+        if manifest_paths.is_empty() {
+            paths.push(path);
+        } else {
+            expanded_any = true;
+            paths.extend(manifest_paths);
+        }
+    }
+    if !expanded_any {
+        ctx.unpin_native_roots(urls_pin);
+        return None;
+    }
+    ctx.unpin_native_roots(urls_pin);
+
+    let result = ctx.new_array(cratonvm_types::ArrayElementType::Reference, paths.len());
+    let result_pin = ctx.pin_native_root(result);
+    for (index, path) in paths.iter().enumerate() {
+        let Some(url) = new_url_from_spec(ctx, &file_url_spec(path)) else {
+            ctx.unpin_native_roots(result_pin);
+            return None;
+        };
+        let result = ctx.read_native_pin(result_pin, result);
+        ctx.set_array_element(result, index, Value::Object(Some(url)));
+    }
+    let result = ctx.read_native_pin(result_pin, result);
+    ctx.unpin_native_roots(result_pin);
+    Some(result)
+}
+
 /// `URLClassPath.getURLs()[Ljava/net/URL;` — return recorded URL paths or an empty URL[].
 ///
 /// Real-JDK bytecode reads `path` (an ArrayList) under a monitor and
@@ -4339,7 +4537,8 @@ fn ucp_get_urls_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     // `record_ucl_urls` retains constructor URLs in the real `path` field.
     // Returning a copy preserves URLClassLoader's public isolation contract.
     if let Some(Value::Object(Some(ucp))) = args.first() {
-        if let Some(result) = ucp_path_urls(ctx, *ucp) {
+        if let Some(urls) = ucp_path_urls(ctx, *ucp) {
+            let result = expanded_manifest_urls(ctx, urls).unwrap_or(urls);
             return Ok(Some(Value::Object(Some(result))));
         }
     }
@@ -4424,6 +4623,12 @@ pub fn register_url_class_path_safe_stubs(r: &mut NativeMethodRegistry) {
         // recent JDK builds: the regular `getURLs()` and a package-private
         // `getURLs(boolean)` that includes/excludes the loaderless entries.
         r.register(cls, "getURLs", "()[Ljava/net/URL;", ucp_get_urls_empty);
+        r.register(
+            cls,
+            "getURLs",
+            "(Z)[Ljava/net/URL;",
+            ucp_get_urls_empty,
+        );
         // `closeLoaders` — both signatures.
         r.register(
             cls,
@@ -5213,7 +5418,12 @@ pub(crate) fn is_platform_class_loader(ctx: &dyn NativeContext, loader: ObjectRe
 }
 
 pub fn url_classloader_isolated_from_app(ctx: &dyn NativeContext, loader: ObjectRef) -> bool {
-    if !object_extends(ctx, loader, "java/net/URLClassLoader") {
+    // Some real-JDK subclasses lose their inherited URLClassLoader identity
+    // at native dispatch sites. Their constructor URL list is retained by our
+    // URL loader shims, so accept that authoritative signal as well.
+    if !object_extends(ctx, loader, "java/net/URLClassLoader")
+        && loader_constructor_url_paths(ctx, loader).is_empty()
+    {
         return false;
     }
     match ctx.get_field_by_name(loader, "parent") {
@@ -5568,7 +5778,7 @@ fn loader_local_resource_urls(
         }
         return Vec::new();
     }
-    let urls = cratonvm_classloading::ClassPath::new(&paths).find_all_resource_urls(resource_name);
+    let urls = cached_local_url_class_path(&paths).find_all_resource_urls(resource_name);
     if std::env::var_os("CRATONVM_DBG_UCLRES").is_some() {
         eprintln!(
             "[UCLRES-DBG] loader={loader:?} resource={resource_name} paths={paths:?} urls={urls:?}"
@@ -5693,8 +5903,7 @@ pub(crate) fn ucl_try_define_local_class(
     // the bytes. Falling back to ClassManager's process-wide lookup after a
     // successful local definition can attach a same-named application JAR as
     // this class's CodeSource (for example, a URLClassLoader override JAR).
-    let local_class_path =
-        (!paths.is_empty()).then(|| cratonvm_classloading::ClassPath::new(&paths));
+    let local_class_path = (!paths.is_empty()).then(|| cached_local_url_class_path(&paths));
     let (bytes, local_code_source) = match local_class_path.as_ref() {
         Some(class_path) => match class_path.find_resource(&resource_name) {
             Some(bytes) => (
@@ -6058,10 +6267,13 @@ pub(crate) fn ucl_find_resources(ctx: &mut dyn NativeContext, args: &[Value]) ->
     Ok(result)
 }
 
-fn ucl_get_urls(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn ucl_get_urls(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     if let Value::Object(Some(ucp)) = ctx.get_field_by_name(this, "ucp") {
         if let Some(result) = ucp_path_urls(ctx, ucp) {
+            if let Some(expanded) = expanded_manifest_urls(ctx, result) {
+                return Ok(Some(Value::Object(Some(expanded))));
+            }
             return Ok(Some(Value::Object(Some(result))));
         }
     }
@@ -8969,6 +9181,18 @@ mod classloader_tests {
     fn test_ucl_get_urls_registered() {
         let r = make_registry();
         assert!(r.find(UCL_CLASS, "getURLs", "()[Ljava/net/URL;").is_some());
+    }
+
+    #[test]
+    fn test_url_class_path_boolean_get_urls_registered() {
+        let r = make_registry();
+        assert!(r
+            .find(
+                "jdk/internal/loader/URLClassPath",
+                "getURLs",
+                "(Z)[Ljava/net/URL;",
+            )
+            .is_some());
     }
 
     #[test]

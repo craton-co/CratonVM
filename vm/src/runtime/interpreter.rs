@@ -18316,6 +18316,44 @@ fn lookup_loader_initiated(
     cache_hit
 }
 
+/// Read only the exact definitions that belong to `referencing_class_id`'s
+/// user loader. Unlike [`lookup_loader_initiated`], this intentionally never
+/// consults the initiating-resolution cache.
+///
+/// A platform-parented isolated URL loader has no application-loader
+/// delegation path. A cached result for such a loader can nevertheless point
+/// at an earlier application copy (recorded before the loader had defined its
+/// own framework class), collapsing a later `CONSTANT_Class` literal back to
+/// that copy. Spring's `ModifiedClassPathClassLoader` then compares an
+/// application `ConditionalOnMissingBean.class` against child metadata and
+/// loses the annotation by Class identity. Exact definitions are safe; cache
+/// entries are not for this loader shape.
+#[inline]
+fn lookup_loader_defined_exact(
+    shared: &SharedVm,
+    referencing_class_id: ClassId,
+    name: &str,
+) -> Option<ClassId> {
+    if !cratonvm_native_builtins::classloader::any_defining_loader_registered()
+        || name.starts_with('[')
+        || is_global_resolution_namespace(name)
+    {
+        return None;
+    }
+    let loader = match shared
+        .class_manager
+        .read()
+        .get_loader_id(referencing_class_id)
+    {
+        Some(l @ cratonvm_types::ClassLoaderId::UserDefined(_)) => l,
+        _ => return None,
+    };
+    shared
+        .class_manager
+        .read()
+        .class_defined_by_loader_exact(name, loader)
+}
+
 fn is_isolated_url_loader_definition(
     shared: &SharedVm,
     thread: &mut JvmThread,
@@ -18372,7 +18410,14 @@ fn resolve_class_loader_aware(
 ) -> Result<ClassId, MethodCallFailed> {
     // (1) Gate / built-in / JDK-name fast paths + already-known loader-local
     //     answer — none of which need a re-entrant call.
-    if let Some(id) = lookup_loader_initiated(shared, referencing_class_id, name) {
+    let isolated_url_definition =
+        is_isolated_url_loader_definition(shared, thread, referencing_class_id);
+    let known = if isolated_url_definition {
+        lookup_loader_defined_exact(shared, referencing_class_id, name)
+    } else {
+        lookup_loader_initiated(shared, referencing_class_id, name)
+    };
+    if let Some(id) = known {
         return Ok(id);
     }
     // `lookup_loader_initiated` returned `None`, so either this is a legacy case
@@ -18387,6 +18432,10 @@ fn resolve_class_loader_aware(
             || name.contains("ChildManagementContextInitializerAotTests")
             || name.contains("SearchStrategy")
             || name.contains("MergedAnnotations")
+            || name.contains("ConditionalOnMissingBean")
+            || name.contains("ConditionalOnBean")
+            || name.contains("OnBeanCondition")
+            || name.contains("DataSourceConfiguration")
             || name.contains("RootReference")
             || name.contains("MVMap")
             || name.contains("org/h2/Driver")
@@ -18404,7 +18453,18 @@ fn resolve_class_loader_aware(
             "[LOADER-TRACE] resolve name={name} referencing_class_id={referencing_class_id:?} referencing_class={ref_name} referencing_loader={ref_loader:?}"
         );
     }
-    let user_loader = if should_use_loader_initiated_resolution(shared, referencing_class_id)
+    // An isolated URLClassLoader (including Spring Boot's
+    // ModifiedClassPathClassLoader) has the same JVMS initiating-loader
+    // requirement as the existing Groovy/forked-loader cases: class literals
+    // and other CONSTANT_Class consumers inside one of its private framework
+    // copies must resolve through that exact loader, never through the flat
+    // application store. Otherwise `OnBeanCondition`'s
+    // `ConditionalOnMissingBean.class` literal is app-defined while ASM
+    // metadata is child-defined, and MergedAnnotations' Class-keyed lookup
+    // misses an annotation that its name-keyed lookup just found.
+    let loader_faithful = should_use_loader_initiated_resolution(shared, referencing_class_id)
+        || isolated_url_definition;
+    let user_loader = if loader_faithful
         && !name.starts_with('[')
         && !is_global_resolution_namespace(name)
     {
@@ -18464,7 +18524,7 @@ fn resolve_class_loader_aware(
         if let Some(id) = driven {
             return Ok(id);
         }
-        if is_isolated_url_loader_definition(shared, thread, referencing_class_id) {
+        if isolated_url_definition {
             return Err(isolated_loader_class_not_found(shared, thread, name));
         }
         let fallback = shared.load_class_concurrent(name);
@@ -18827,8 +18887,18 @@ fn resolve_field_ref_loader_aware(
             shared.class_manager.read().get_loader_id(current_class_id),
             Some(cratonvm_types::ClassLoaderId::UserDefined(_))
         );
+    // An isolated URL loader must not accept an initiating-cache entry here:
+    // it may predate the loader's private definition and point at the
+    // application copy. A getstatic against that stale owner shares static
+    // annotation metadata caches across otherwise isolated frameworks.
+    let isolated_url_definition =
+        is_isolated_url_loader_definition(shared, thread, current_class_id);
     let loader_local_id = if loader_sensitive {
-        lookup_loader_initiated(shared, current_class_id, &field_class_name)
+        if isolated_url_definition {
+            lookup_loader_defined_exact(shared, current_class_id, &field_class_name)
+        } else {
+            lookup_loader_initiated(shared, current_class_id, &field_class_name)
+        }
     } else {
         None
     };
@@ -28021,7 +28091,7 @@ fn force_native_over_real_jdk_bytecode(
         // delegates to the base classpath (where `<init>` already registered the
         // loader's URLs), matching HotSpot.
         || (class_name == "java/net/URLClassLoader"
-            && (matches!(method_name, "findClass" | "findResource" | "findResources" | "addURL")
+            && (matches!(method_name, "findClass" | "findResource" | "findResources" | "getURLs" | "addURL")
                 || (method_name == "<init>"
                     && matches!(
                         method_descriptor,
@@ -30256,6 +30326,17 @@ fn execute_invokestatic(
 
     // Sibling static owners in a user-defined loader need the same identity
     // preservation as self-calls; resolving by flat name can pick the app copy.
+    let isolated_url_definition =
+        is_isolated_url_loader_definition(shared, thread, current_class_id);
+    // A defining-loader registration is authoritative even when the
+    // class-manager's loader-id metadata is unavailable for a real-JDK
+    // subclass. Static symbolic references still use the caller's defining
+    // loader under JVMS 5.4.3; restricting that to the historical fork/Groovy
+    // gates leaves ordinary ModifiedClassPathClassLoader bytecode bound to the
+    // flat application copy.
+    let has_user_defining_loader =
+        cratonvm_native_builtins::classloader::defining_loader_for(current_class_id.as_u32())
+            .is_some();
     let static_dispatch_class_id = self_class_id.or_else(|| {
         // Keep static method owners in the same initiating-loader namespace
         // as every other symbolic reference. This includes the narrow
@@ -30263,12 +30344,24 @@ fn execute_invokestatic(
         // Spring's forked BootstrapUtils calls MergedAnnotations.search(), and
         // mixing a forked SearchStrategy singleton with an application Search
         // instance makes the latter's identity check fail spuriously.
-        if should_use_loader_initiated_resolution(shared, current_class_id) {
+        if should_use_loader_initiated_resolution(shared, current_class_id)
+            || isolated_url_definition
+            || has_user_defining_loader
+        {
             // Preserve the initiating loader even when the global classpath
             // already has a same-named class. This is required for nested
             // implementation jars whose owner is only visible to the caller
             // loader.
-            lookup_loader_initiated(shared, current_class_id, &method_class_name).or_else(|| {
+            let known = if isolated_url_definition || has_user_defining_loader {
+                // An initiating-cache hit may be an application definition
+                // recorded before this isolated URL loader defined its own
+                // copy. Static calls into that stale class share its caches
+                // with the child and poison Class-identity keyed metadata.
+                lookup_loader_defined_exact(shared, current_class_id, &method_class_name)
+            } else {
+                lookup_loader_initiated(shared, current_class_id, &method_class_name)
+            };
+            known.or_else(|| {
                 drive_defining_loader_load(shared, thread, current_class_id, &method_class_name)
             })
         } else {
@@ -30400,7 +30493,13 @@ fn execute_invokestatic(
     // warm benchmark loop. The slow-path re-entry cost is noise next
     // to any kernel that clears `--gpu-min-work`.
     #[cfg_attr(not(feature = "gpu-offload"), allow(unused_mut))]
-    let mut suppress_invoke_cache = false;
+    // The per-thread/static promoted invoke caches do not encode the
+    // loader-specific owner selected above. Promoting this call site would
+    // re-resolve its symbolic owner through the flat store and send the next
+    // call into an application-loader copy. Keep loader-specific static calls
+    // on the already-correct slow dispatcher until the cache key can carry
+    // the resolved ClassId.
+    let mut suppress_invoke_cache = static_dispatch_class_id.is_some() || has_user_defining_loader;
     #[cfg(feature = "gpu-offload")]
     {
         if shared.config.gpu_offload_enabled
