@@ -46,6 +46,7 @@ use crate::module::{
 };
 use crate::vtype::ClassHierarchy;
 use cratonvm_types::error::{ClassFileError, LinkageError, RuntimeError, VmError};
+use cratonvm_reader::SharedBytes;
 
 /// Default soft cap for [`ClassManager::class_bytes_cache`]. 16 MiB.
 ///
@@ -1269,7 +1270,7 @@ pub struct ClassManager {
     /// classes averaging 6 KB each). The default 16 MiB cap covers
     /// JVMTI agents (re-fetch typically targets recently-defined
     /// classes) without bounding the heap of an idle process.
-    pub class_bytes_cache: FxHashMap<ClassId, Vec<u8>>,
+    pub class_bytes_cache: FxHashMap<ClassId, SharedBytes>,
 
     /// Insertion-order tracker for [`Self::class_bytes_cache`] FIFO
     /// eviction. Deque front = oldest entry. Entries re-inserted
@@ -2090,7 +2091,7 @@ impl ClassManager {
             {
                 match self.find_class_bytes_delegated(name) {
                     Ok((bytes, loader_id)) => {
-                        if let Err(e) = self.upgrade_synthetic_class(id, name, &bytes, loader_id) {
+                        if let Err(e) = self.upgrade_synthetic_class(id, name, bytes, loader_id) {
                             tracing::debug!(
                                 class = name,
                                 "ensure_synthetic_class: real-class upgrade failed: {e:?}"
@@ -2834,7 +2835,7 @@ impl ClassManager {
             {
                 match self.find_class_bytes_delegated(name) {
                     Ok((bytes, loader_id)) => {
-                        match self.upgrade_synthetic_class(id, name, &bytes, loader_id) {
+                        match self.upgrade_synthetic_class(id, name, bytes, loader_id) {
                             Ok(()) => {
                                 tracing::debug!(
                                     class = name,
@@ -2873,7 +2874,12 @@ impl ClassManager {
         match self.find_class_bytes_delegated(name) {
             Ok((bytes, loader_id)) => {
                 // Parse and register with the loader that found it
-                self.define_class(name, &bytes, loader_id)
+                self.define_class_shared_with_options(
+                    name,
+                    bytes,
+                    loader_id,
+                    DefineClassOptions::default(),
+                )
             }
             Err(_) if is_jboss_logging_locale_lookup(name) => {
                 // S-trinity #3: JBoss Logging i18n probes locale-specific
@@ -2978,10 +2984,13 @@ impl ClassManager {
     }
 
     /// Find class bytes using parent delegation.
-    fn find_class_bytes_delegated(&self, name: &str) -> Result<(Vec<u8>, ClassLoaderId), VmError> {
+    fn find_class_bytes_delegated(
+        &self,
+        name: &str,
+    ) -> Result<(SharedBytes, ClassLoaderId), VmError> {
         // CDS archive check — fastest path
         if let Some(bytes) = self.cds_class_cache.get(name) {
-            return Ok((bytes.clone(), ClassLoaderId::Bootstrap));
+            return Ok((bytes.clone().into(), ClassLoaderId::Bootstrap));
         }
         // Bootstrap first
         if let Ok(bytes) = self.bootstrap.find_class_bytes(name) {
@@ -3029,6 +3038,20 @@ impl ClassManager {
         loader_id: ClassLoaderId,
         options: DefineClassOptions,
     ) -> Result<ClassId, VmError> {
+        self.define_class_shared_with_options(name, bytes.to_vec().into(), loader_id, options)
+    }
+
+    /// Define a class while retaining the class-path or archive backing that
+    /// supplied its bytes. Public byte-slice callers still enter through
+    /// `define_class_with_options`; class-path loads use this path to avoid a
+    /// second allocation and copy.
+    fn define_class_shared_with_options(
+        &mut self,
+        name: &str,
+        bytes: SharedBytes,
+        loader_id: ClassLoaderId,
+        options: DefineClassOptions,
+    ) -> Result<ClassId, VmError> {
         if std::env::var("CRATONVM_DBG_DEFINE").is_ok()
             && (name.contains("TestNGTestEngine") || name.contains("IsTestNGTestClass"))
         {
@@ -3042,7 +3065,7 @@ impl ClassManager {
         if std::env::var_os("CRATONVM_DBG_FBCGLIB").is_some()
             && (name.contains("RepositoryConfiguration") || name.contains("RawFactoryMethod"))
         {
-            let haystack = String::from_utf8_lossy(bytes);
+            let haystack = String::from_utf8_lossy(&bytes);
             let has_factory_data = haystack.contains("CGLIB$FACTORY_DATA");
             eprintln!(
                 "[FBCGLIB-DBG] define_class name={name} override_name={:?} loader_id={:?} bytes_len={} has_CGLIB$FACTORY_DATA_utf8={has_factory_data}",
@@ -3084,7 +3107,7 @@ impl ClassManager {
         }
 
         // Parse the class file
-        let mut class_file = cratonvm_reader::read_class(bytes).map_err(|e| {
+        let mut class_file = cratonvm_reader::read_class_shared(bytes.clone()).map_err(|e| {
             VmError::Linkage(LinkageError::ClassFormatError {
                 class_name: name.to_string(),
                 message: e.to_string(),
@@ -3864,7 +3887,7 @@ impl ClassManager {
         // (`class_bytes_cache_cap`, default 16 MiB) is enforced. Without
         // this, every classfile would stay resident forever — ~90 MB on
         // a medium Spring app.
-        self.insert_class_bytes(id, bytes.to_vec());
+        self.insert_class_bytes(id, bytes);
         // WP2.3: persist the per-class skip-verification flag in the side
         // table. The verifier consults `class_skip_bytecode_verification`
         // during link-time so trusted hidden / generated classes
@@ -5301,7 +5324,12 @@ impl ClassManager {
     /// size accounting and move the entry to the tail of the FIFO so
     /// it is the *last* candidate for eviction — agents that redefine
     /// hot classes keep them in cache.
-    pub fn insert_class_bytes(&mut self, class_id: ClassId, bytes: Vec<u8>) {
+    pub fn insert_class_bytes(
+        &mut self,
+        class_id: ClassId,
+        bytes: impl Into<SharedBytes>,
+    ) {
+        let bytes = bytes.into();
         let new_size = bytes.len();
         // If we already had an entry for this class, subtract its size
         // and remove it from the FIFO before re-appending.
@@ -6159,12 +6187,12 @@ impl ClassManager {
         &mut self,
         id: ClassId,
         name: &str,
-        bytes: &[u8],
+        bytes: SharedBytes,
         loader_id: ClassLoaderId,
     ) -> Result<(), VmError> {
         use cratonvm_reader::attribute::Attribute;
 
-        let mut class_file = cratonvm_reader::read_class(bytes).map_err(|e| {
+        let mut class_file = cratonvm_reader::read_class_shared(bytes.clone()).map_err(|e| {
             VmError::ClassFile(ClassFileError::InvalidClassFile {
                 class_name: name.to_string(),
                 message: e.to_string(),
@@ -6408,7 +6436,7 @@ impl ClassManager {
         fire_resolution_invalidate_hook(id.as_u32());
 
         // Cache the class bytes (FIFO-bounded helper).
-        self.insert_class_bytes(id, bytes.to_vec());
+        self.insert_class_bytes(id, bytes);
 
         Ok(())
     }
@@ -12739,7 +12767,9 @@ mod tests {
             .upgrade_synthetic_class(
                 class_id,
                 "Foo",
-                include_bytes!("../tests/fixtures/wp2_4b_redefine/Foo.v1.class"),
+                include_bytes!("../tests/fixtures/wp2_4b_redefine/Foo.v1.class")
+                    .to_vec()
+                    .into(),
                 ClassLoaderId::Bootstrap,
             )
             .expect("upgrade synthetic Foo stub to real fixture");
@@ -12907,7 +12937,7 @@ mod tests {
         for i in 0..50u32 {
             let class_id = ClassId::new(i);
             let bytes = vec![0xcafe_babeu32.to_be_bytes()[0]; i as usize + 4];
-            mgr.class_bytes_cache.insert(class_id, bytes);
+            mgr.class_bytes_cache.insert(class_id, bytes.into());
         }
         for i in 0..50u32 {
             let class_id = ClassId::new(i);

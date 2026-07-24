@@ -9,6 +9,7 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used,))]
 
 use cratonvm_types::error::ClassFileError;
+use cratonvm_reader::SharedBytes;
 use parking_lot::Mutex;
 use rustc_hash::FxHashSet;
 use std::collections::{BTreeSet, HashMap, VecDeque};
@@ -18,6 +19,55 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use tracing::debug;
 use zip::ZipArchive;
+
+/// Immutable backing for an archive. On-disk archives are mapped once and all
+/// `ZipArchive` cursors plus stored class entries share that mapping. Nested
+/// archives and test fixtures retain an owned reference-counted buffer.
+#[derive(Clone)]
+enum ArchiveBacking {
+    Owned(Arc<[u8]>),
+    Mapped(Arc<memmap2::Mmap>),
+    Shared(SharedBytes),
+}
+
+impl ArchiveBacking {
+    fn from_vec(bytes: Vec<u8>) -> Self {
+        Self::Owned(Arc::from(bytes))
+    }
+}
+
+impl AsRef<[u8]> for ArchiveBacking {
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            Self::Owned(bytes) => bytes,
+            Self::Mapped(bytes) => bytes,
+            Self::Shared(bytes) => bytes,
+        }
+    }
+}
+
+impl std::ops::Deref for ArchiveBacking {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        self.as_ref()
+    }
+}
+
+type SharedArchive = ZipArchive<Cursor<ArchiveBacking>>;
+
+#[derive(Clone)]
+struct ArchiveSlice {
+    backing: ArchiveBacking,
+    start: usize,
+    end: usize,
+}
+
+impl AsRef<[u8]> for ArchiveSlice {
+    fn as_ref(&self) -> &[u8] {
+        &self.backing.as_ref()[self.start..self.end]
+    }
+}
 
 /// Diagnostic-only (TLD/JAR-scan slowness investigation, 2026-07-21): time
 /// every `find_resource`/`find_all_resource_urls` call and print a running
@@ -72,6 +122,36 @@ fn read_file_for_classpath(path: &Path) -> std::io::Result<Vec<u8>> {
         ));
     }
     Ok(buf)
+}
+
+/// Map an on-disk archive once, falling back to owned bytes when mapping is
+/// unavailable. Classpath archives are immutable for the lifetime of a class
+/// loader by JVM convention. `CRATONVM_DISABLE_JAR_MMAP=1` retains the copied
+/// path for deployment systems that replace/truncate archives in place.
+fn read_archive_for_classpath(path: &Path) -> std::io::Result<ArchiveBacking> {
+    if std::env::var_os("CRATONVM_DISABLE_JAR_MMAP").is_some() {
+        return read_file_for_classpath(path).map(ArchiveBacking::from_vec);
+    }
+    let file = std::fs::File::open(path)?;
+    let before = file.metadata()?;
+    if before.len() == 0 {
+        return Ok(ArchiveBacking::from_vec(Vec::new()));
+    }
+    // SAFETY: the mapping is read-only, its owner is held by every archive
+    // cursor/slice, and classpath archives are immutable after loader creation.
+    // Deployments that cannot provide immutability use the opt-out above.
+    let mapped = match unsafe { memmap2::MmapOptions::new().map(&file) } {
+        Ok(mapped) => mapped,
+        Err(_) => return read_file_for_classpath(path).map(ArchiveBacking::from_vec),
+    };
+    let after = file.metadata()?;
+    if classpath_file_metadata_changed(&before, &after) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("classpath archive changed while being mapped: {}", path.display()),
+        ));
+    }
+    Ok(ArchiveBacking::Mapped(Arc::new(mapped)))
 }
 
 fn classpath_file_metadata_changed(before: &fs::Metadata, after: &fs::Metadata) -> bool {
@@ -255,7 +335,8 @@ enum ClassPathEntry {
     /// for multi-threaded access (Phase 5).
     JarFile {
         path: PathBuf,
-        archive: Mutex<ZipArchive<Cursor<Vec<u8>>>>,
+        archive: Mutex<SharedArchive>,
+        backing: ArchiveBacking,
         /// Exact central-directory entry names in this archive. This lets hot
         /// class/resource lookup reject misses without taking the ZipArchive
         /// lock or asking zip::ZipArchive::by_name to hash/probe its index.
@@ -300,7 +381,7 @@ enum ClassPathEntry {
         /// Prefix inside the outer JAR (e.g. `BOOT-INF/classes/`).
         prefix: String,
         /// Cached entries: relative_path (without prefix) → bytes.
-        entries_cache: HashMap<String, Vec<u8>>,
+        entries_cache: HashMap<String, SharedBytes>,
     },
     /// A nested JAR extracted from inside a fat JAR (e.g. `BOOT-INF/lib/dep.jar`).
     NestedJar {
@@ -309,7 +390,8 @@ enum ClassPathEntry {
         /// Path inside the outer JAR (e.g. `BOOT-INF/lib/spring-core-6.1.0.jar`).
         nested_path: String,
         /// The extracted nested archive.
-        archive: Mutex<ZipArchive<Cursor<Vec<u8>>>>,
+        archive: Mutex<SharedArchive>,
+        backing: ArchiveBacking,
         /// Exact central-directory entry names in this nested archive.
         entry_index: FxHashSet<String>,
         /// Report P1 (perf): memoized verified signer cert chain for this
@@ -329,12 +411,13 @@ enum ClassPathEntry {
         path: PathBuf,
         /// Pre-extracted class entries: relative path (e.g. `java/lang/Object.class`)
         /// mapped to decompressed bytes.  Built once during `load_jmod`.
-        classes_cache: HashMap<String, Vec<u8>>,
+        classes_cache: HashMap<String, SharedBytes>,
         /// The full set of entry names in the JMOD (including non-class entries)
         /// kept for `list_jmod_classes` and resource lookups.
         all_entry_names: Vec<String>,
         /// Lazily-opened archive for non-class resource lookups (rare path).
-        archive: Mutex<ZipArchive<Cursor<Vec<u8>>>>,
+        archive: Mutex<SharedArchive>,
+        backing: ArchiveBacking,
     },
     /// A JDK 9+ `lib/modules` jimage file (NEW-5): one binary blob holding
     /// every class and resource in the boot layer, accessed through the
@@ -1105,7 +1188,7 @@ impl ClassPath {
     /// `by_name` probes the previous implementation paid for every
     /// absent version.
     fn ensure_versions_cache(
-        archive: &Mutex<ZipArchive<Cursor<Vec<u8>>>>,
+        archive: &Mutex<SharedArchive>,
         versions_cache: &Mutex<Option<Arc<BTreeSet<u32>>>>,
     ) -> Arc<BTreeSet<u32>> {
         // PERF: hand back a shared `Arc` so the fast path (every
@@ -1168,7 +1251,7 @@ impl ClassPath {
     /// versions actually present in the archive, eliminating the
     /// per-class 17 `by_name` round-trips.
     fn find_in_multi_release_archive(
-        archive: &Mutex<ZipArchive<Cursor<Vec<u8>>>>,
+        archive: &Mutex<SharedArchive>,
         versions_cache: &Mutex<Option<Arc<BTreeSet<u32>>>>,
         entry_index: Option<&FxHashSet<String>>,
         name: &str,
@@ -1194,6 +1277,26 @@ impl ClassPath {
         Self::find_in_archive(archive, name)
     }
 
+    fn find_shared_in_multi_release_archive(
+        archive: &Mutex<SharedArchive>,
+        backing: &ArchiveBacking,
+        versions_cache: &Mutex<Option<Arc<BTreeSet<u32>>>>,
+        entry_index: &FxHashSet<String>,
+        name: &str,
+    ) -> Option<SharedBytes> {
+        let present = Self::ensure_versions_cache(archive, versions_cache);
+        for &ver in present.range(9..=JVM_FEATURE_VERSION).rev() {
+            let versioned = format!("META-INF/versions/{ver}/{name}");
+            if entry_index.contains(&versioned) {
+                return Self::find_shared_in_archive(archive, backing, &versioned);
+            }
+        }
+        if !entry_index.contains(name) {
+            return None;
+        }
+        Self::find_shared_in_archive(archive, backing, name)
+    }
+
     /// Return the physical entry selected for a multi-release lookup.
     ///
     /// Resource URLs must name this physical entry, not the logical base name:
@@ -1203,7 +1306,7 @@ impl ClassPath {
     /// multi-release class load use the right bytes while its corresponding
     /// resource URL exposed the base bytes.
     fn multi_release_entry_name(
-        archive: &Mutex<ZipArchive<Cursor<Vec<u8>>>>,
+        archive: &Mutex<SharedArchive>,
         versions_cache: &Mutex<Option<Arc<BTreeSet<u32>>>>,
         entry_index: &FxHashSet<String>,
         name: &str,
@@ -1218,7 +1321,7 @@ impl ClassPath {
         entry_index.contains(name).then(|| name.to_string())
     }
 
-    fn build_archive_entry_index(archive: &mut ZipArchive<Cursor<Vec<u8>>>) -> FxHashSet<String> {
+    fn build_archive_entry_index(archive: &mut SharedArchive) -> FxHashSet<String> {
         let mut index = FxHashSet::default();
         for i in 0..archive.len() {
             if let Ok(entry) = archive.by_index_raw(i) {
@@ -1230,7 +1333,7 @@ impl ClassPath {
 
     #[inline]
     fn find_in_indexed_archive(
-        archive: &Mutex<ZipArchive<Cursor<Vec<u8>>>>,
+        archive: &Mutex<SharedArchive>,
         entry_index: &FxHashSet<String>,
         name: &str,
     ) -> Option<Vec<u8>> {
@@ -1238,6 +1341,19 @@ impl ClassPath {
             return None;
         }
         Self::find_in_archive(archive, name)
+    }
+
+    #[inline]
+    fn find_shared_in_indexed_archive(
+        archive: &Mutex<SharedArchive>,
+        backing: &ArchiveBacking,
+        entry_index: &FxHashSet<String>,
+        name: &str,
+    ) -> Option<SharedBytes> {
+        if !entry_index.contains(name) {
+            return None;
+        }
+        Self::find_shared_in_archive(archive, backing, name)
     }
 
     /// Create a classpath from a list of path strings.
@@ -1417,7 +1533,7 @@ impl ClassPath {
             if let Some((archive, prefix)) = parse_jar_subdir_spec(&p) {
                 let path = PathBuf::from(archive);
                 if path.exists() {
-                    match read_file_for_classpath(&path) {
+                    match read_archive_for_classpath(&path) {
                         Ok(data) => {
                             if let Some(entry) =
                                 Self::build_nested_directory_from_jar(&path, data, &prefix)
@@ -1467,7 +1583,7 @@ impl ClassPath {
                 // silently lose their resources while `add_path` accepted
                 // the same URLs. `load_jar_data` fails closed for ordinary
                 // non-archive files, so the broader admission is safe.
-                match read_file_for_classpath(&path) {
+                match read_archive_for_classpath(&path) {
                     Ok(data) => Self::load_jar_data_at_depth(&path, data, entries, depth),
                     Err(e) => debug!("Failed to read classpath archive {}: {e}", path.display()),
                 }
@@ -1479,7 +1595,7 @@ impl ClassPath {
 
     /// Load a JAR from raw bytes, auto-detecting fat JAR structure.
     fn load_jar_data(path: &Path, data: Vec<u8>, entries: &mut Vec<ClassPathEntry>) {
-        Self::load_jar_data_at_depth(path, data, entries, 0);
+        Self::load_jar_data_at_depth(path, ArchiveBacking::from_vec(data), entries, 0);
     }
 
     /// Compatibility wrapper for legacy callers that still supply a manifest
@@ -1491,7 +1607,7 @@ impl ClassPath {
         entries: &mut Vec<ClassPathEntry>,
         _expanded_manifest_jars: &mut FxHashSet<PathBuf>,
     ) {
-        Self::load_jar_data_at_depth(path, data, entries, 0);
+        Self::load_jar_data_at_depth(path, ArchiveBacking::from_vec(data), entries, 0);
     }
 
     /// Manifest `Class-Path:` expansion recursion cap — guards against a
@@ -1516,7 +1632,30 @@ impl ClassPath {
     /// classloaders, etc.) is built from — therefore silently resolved to
     /// an unusable, effectively empty classpath: the pathing jar itself
     /// has no class entries, and its `Class-Path:` was never followed.
-    fn load_jar_data_at_depth(path: &Path, data: Vec<u8>, entries: &mut Vec<ClassPathEntry>, depth: u32) {
+    fn load_jar_data_at_depth(
+        path: &Path,
+        data: ArchiveBacking,
+        entries: &mut Vec<ClassPathEntry>,
+        depth: u32,
+    ) {
+        // Manifest Class-Path chains can form cycles. Avoid mapping and
+        // indexing an archive a second time once any entry from that archive
+        // has already been published into this ClassPath.
+        if entries.iter().any(|entry| match entry {
+            ClassPathEntry::JarFile { path: loaded, .. } => loaded == path,
+            ClassPathEntry::NestedDirectory {
+                parent_jar: loaded,
+                ..
+            }
+            | ClassPathEntry::NestedJar {
+                parent_jar: loaded,
+                ..
+            } => loaded == path,
+            _ => false,
+        }) {
+            return;
+        }
+        let backing = data.clone();
         let cursor = Cursor::new(data);
         match ZipArchive::new(cursor) {
             Ok(mut archive) => {
@@ -1532,7 +1671,13 @@ impl ClassPath {
                         path.display(),
                         manifest.start_class
                     );
-                    Self::extract_fat_jar_entries(path, &mut archive, &manifest, entries);
+                    Self::extract_fat_jar_entries(
+                        path,
+                        &mut archive,
+                        &backing,
+                        &manifest,
+                        entries,
+                    );
                     // Also add the outer JAR itself (for classes at the root,
                     // e.g. the Spring Boot launcher classes in org/springframework/boot/loader/).
                     //
@@ -1546,12 +1691,14 @@ impl ClassPath {
                     // root-classes entry and log.
                     let mr = manifest.multi_release;
                     let data = archive.into_inner().into_inner();
+                    let root_backing = data.clone();
                     match ZipArchive::new(Cursor::new(data)) {
                         Ok(mut reloaded) => {
                             let entry_index = Self::build_archive_entry_index(&mut reloaded);
                             entries.push(ClassPathEntry::JarFile {
                                 path: path.to_path_buf(),
                                 archive: Mutex::new(reloaded),
+                                backing: root_backing,
                                 entry_index,
                                 multi_release: mr,
                                 versions_cache: Mutex::new(None),
@@ -1572,6 +1719,7 @@ impl ClassPath {
                     entries.push(ClassPathEntry::JarFile {
                         path: path.to_path_buf(),
                         archive: Mutex::new(archive),
+                        backing,
                         entry_index,
                         multi_release: mr,
                         versions_cache: Mutex::new(None),
@@ -1606,7 +1754,7 @@ impl ClassPath {
             if let Some((archive, prefix)) = parse_jar_subdir_spec(&p) {
                 let path = PathBuf::from(archive);
                 if path.exists() {
-                    match read_file_for_classpath(&path) {
+                    match read_archive_for_classpath(&path) {
                         Ok(data) => {
                             if let Some(entry) =
                                 Self::build_nested_directory_from_jar(&path, data, &prefix)
@@ -1647,12 +1795,12 @@ impl ClassPath {
                 // URLClassLoader accepts every file URL as an archive
                 // candidate. `load_jar_data_with_manifest_class_path` fails
                 // closed for ordinary non-archive files.
-                match read_file_for_classpath(&path) {
-                    Ok(data) => Self::load_jar_data_with_manifest_class_path(
+                match read_archive_for_classpath(&path) {
+                    Ok(data) => Self::load_jar_data_at_depth(
                         &path,
                         data,
                         entries,
-                        expanded_manifest_jars,
+                        0,
                     ),
                     Err(e) => debug!("Failed to read classpath archive {}: {e}", path.display()),
                 }
@@ -1663,7 +1811,7 @@ impl ClassPath {
     }
 
     /// Read `META-INF/MANIFEST.MF` from an archive.
-    fn read_manifest(archive: &mut ZipArchive<Cursor<Vec<u8>>>) -> ManifestInfo {
+    fn read_manifest(archive: &mut SharedArchive) -> ManifestInfo {
         let result = archive
             .by_name("META-INF/MANIFEST.MF")
             .and_then(|mut entry| {
@@ -1683,7 +1831,7 @@ impl ClassPath {
 
     /// Probe for fat JAR structure by checking if any entry starts with
     /// `BOOT-INF/` or `WEB-INF/classes/`.
-    fn probe_fat_jar_structure(archive: &mut ZipArchive<Cursor<Vec<u8>>>) -> bool {
+    fn probe_fat_jar_structure(archive: &mut SharedArchive) -> bool {
         for i in 0..archive.len().min(100) {
             if let Ok(entry) = archive.by_index_raw(i) {
                 let name = entry.name().to_string();
@@ -1703,7 +1851,8 @@ impl ClassPath {
     ///    into memory and added as a `NestedJar` entry.
     fn extract_fat_jar_entries(
         path: &Path,
-        archive: &mut ZipArchive<Cursor<Vec<u8>>>,
+        archive: &mut SharedArchive,
+        backing: &ArchiveBacking,
         manifest: &ManifestInfo,
         entries: &mut Vec<ClassPathEntry>,
     ) {
@@ -1729,7 +1878,7 @@ impl ClassPath {
         let war_classes_prefix = "WEB-INF/classes/";
 
         // Phase 1: Collect BOOT-INF/classes/ entries into a NestedDirectory
-        let mut classes_cache: HashMap<String, Vec<u8>> = HashMap::new();
+        let mut classes_cache: HashMap<String, SharedBytes> = HashMap::new();
         let mut nested_jar_names: Vec<String> = Vec::new();
 
         for i in 0..archive.len() {
@@ -1757,12 +1906,10 @@ impl ClassPath {
                 let relative = &name[classes_prefix.len()..];
                 if !relative.is_empty() && !relative.ends_with('/') && is_safe_entry_name(relative)
                 {
-                    if let Ok(mut entry) = archive.by_name(&name) {
-                        // Audit-fix #2 (capacity) + V2 (streaming bound).
-                        let size = entry.size();
-                        if let Ok(data) = read_entry_capped(&mut entry, size) {
-                            classes_cache.insert(relative.to_string(), data);
-                        }
+                    if let Some(data) =
+                        Self::find_shared_in_archive_locked(archive, backing, &name)
+                    {
+                        classes_cache.insert(relative.to_string(), data);
                     }
                 }
             } else if name.starts_with(war_classes_prefix) && name.len() > war_classes_prefix.len()
@@ -1770,12 +1917,10 @@ impl ClassPath {
                 let relative = &name[war_classes_prefix.len()..];
                 if !relative.is_empty() && !relative.ends_with('/') && is_safe_entry_name(relative)
                 {
-                    if let Ok(mut entry) = archive.by_name(&name) {
-                        // Audit-fix #2 (capacity) + V2 (streaming bound).
-                        let size = entry.size();
-                        if let Ok(data) = read_entry_capped(&mut entry, size) {
-                            classes_cache.insert(relative.to_string(), data);
-                        }
+                    if let Some(data) =
+                        Self::find_shared_in_archive_locked(archive, backing, &name)
+                    {
+                        classes_cache.insert(relative.to_string(), data);
                     }
                 }
             } else if name.starts_with(&lib_prefix)
@@ -1803,11 +1948,11 @@ impl ClassPath {
         // Phase 2: Extract each nested JAR from BOOT-INF/lib/
         let mut nested_count = 0;
         for jar_name in &nested_jar_names {
-            if let Ok(mut entry) = archive.by_name(jar_name) {
-                // Audit-fix #2 (capacity) + V2 (streaming bound).
-                let size = entry.size();
-                if let Ok(jar_data) = read_entry_capped(&mut entry, size) {
-                    let cursor = Cursor::new(jar_data);
+            if let Some(jar_data) =
+                Self::find_shared_in_archive_locked(archive, backing, jar_name)
+            {
+                    let nested_backing = ArchiveBacking::Shared(jar_data);
+                    let cursor = Cursor::new(nested_backing.clone());
                     match ZipArchive::new(cursor) {
                         Ok(mut nested_archive) => {
                             let entry_index = Self::build_archive_entry_index(&mut nested_archive);
@@ -1815,6 +1960,7 @@ impl ClassPath {
                                 parent_jar: path.to_path_buf(),
                                 nested_path: jar_name.clone(),
                                 archive: Mutex::new(nested_archive),
+                                backing: nested_backing,
                                 entry_index,
                                 signer_cache: OnceLock::new(),
                             });
@@ -1828,7 +1974,6 @@ impl ClassPath {
                             );
                         }
                     }
-                }
             }
         }
 
@@ -1861,7 +2006,7 @@ impl ClassPath {
     pub fn read_jar_manifest(jar_path: &Path) -> Option<ManifestInfo> {
         // Read into owned bytes and reject concurrent mutation before ZIP
         // parsing, so a changing JAR is handled as invalid input.
-        let data = read_file_for_classpath(jar_path).ok()?;
+        let data = read_archive_for_classpath(jar_path).ok()?;
         let cursor = Cursor::new(data);
         let mut archive = ZipArchive::new(cursor).ok()?;
         let info = Self::read_manifest(&mut archive);
@@ -1909,7 +2054,7 @@ impl ClassPath {
             if let Some((jar_part, prefix)) = parse_jar_subdir_spec(&expanded) {
                 let pb = std::path::PathBuf::from(jar_part);
                 if pb.exists() {
-                    match read_file_for_classpath(&pb) {
+                    match read_archive_for_classpath(&pb) {
                         Ok(data) => {
                             match Self::build_nested_directory_from_jar(&pb, data, &prefix) {
                                 Some(entry) => {
@@ -1960,9 +2105,9 @@ impl ClassPath {
                 // zip, so a stray non-archive file on the classpath is harmless.
                 //
                 // Use the same stable owned read as startup classpath JARs.
-                match read_file_for_classpath(&pb) {
+                match read_archive_for_classpath(&pb) {
                     Ok(data) => {
-                        Self::load_jar_data(&pb, data, &mut self.entries);
+                        Self::load_jar_data_at_depth(&pb, data, &mut self.entries, 0);
                     }
                     Err(e) => {
                         debug!("Dynamic classpath: failed to read {expanded}: {e}");
@@ -1982,9 +2127,10 @@ impl ClassPath {
     /// Used by `add_path` for the DaCapo-style `<jar>!/<prefix>/` URL form.
     fn build_nested_directory_from_jar(
         path: &Path,
-        data: Vec<u8>,
+        data: ArchiveBacking,
         prefix: &str,
     ) -> Option<ClassPathEntry> {
+        let backing = data.clone();
         let cursor = Cursor::new(data);
         let mut archive = match ZipArchive::new(cursor) {
             Ok(a) => a,
@@ -1993,7 +2139,7 @@ impl ClassPath {
                 return None;
             }
         };
-        let mut entries_cache: HashMap<String, Vec<u8>> = HashMap::new();
+        let mut entries_cache: HashMap<String, SharedBytes> = HashMap::new();
         let total = archive.len();
         for i in 0..total {
             let name = match archive.by_index_raw(i) {
@@ -2014,12 +2160,10 @@ impl ClassPath {
             if !is_safe_entry_name(relative) {
                 continue;
             }
-            if let Ok(mut entry) = archive.by_name(&name) {
-                // V2 (streaming bound) in addition to the capacity clamp.
-                let size = entry.size();
-                if let Ok(bytes) = read_entry_capped(&mut entry, size) {
-                    entries_cache.insert(relative.to_string(), bytes);
-                }
+            if let Some(bytes) =
+                Self::find_shared_in_archive_locked(&mut archive, &backing, &name)
+            {
+                entries_cache.insert(relative.to_string(), bytes);
             }
         }
         if entries_cache.is_empty() {
@@ -2036,7 +2180,7 @@ impl ClassPath {
     ///
     /// Class names are validated to prevent path traversal attacks. Names containing
     /// `..` or starting with `/` are rejected.
-    pub fn find_class(&self, class_name: &str) -> Result<Vec<u8>, ClassFileError> {
+    pub fn find_class(&self, class_name: &str) -> Result<SharedBytes, ClassFileError> {
         // Reject path traversal attempts, absolute paths, and suspicious patterns.
         // Class binary names use '/' as separator and must not escape the classpath root.
         if !is_safe_class_name(class_name) {
@@ -2115,12 +2259,12 @@ impl ClassPath {
                         debug!("Found class {class_name} at {}", full_path.display());
                         // Use the stable classpath read helper so a class file
                         // that changes mid-read is rejected as invalid input.
-                        return read_file_for_classpath(&full_path).map_err(|e| {
-                            ClassFileError::IoError {
+                        return read_file_for_classpath(&full_path)
+                            .map(SharedBytes::from)
+                            .map_err(|e| ClassFileError::IoError {
                                 class_name: class_name.to_string(),
                                 source: e,
-                            }
-                        });
+                            });
                     }
                 }
                 ClassPathEntry::JarFile {
@@ -2128,18 +2272,25 @@ impl ClassPath {
                     multi_release,
                     versions_cache,
                     entry_index,
+                    backing,
                     ..
                 } => {
                     for candidate in &archive_candidates {
                         let found = if *multi_release {
-                            Self::find_in_multi_release_archive(
+                            Self::find_shared_in_multi_release_archive(
                                 archive,
+                                backing,
                                 versions_cache,
-                                Some(entry_index),
+                                entry_index,
                                 candidate,
                             )
                         } else {
-                            Self::find_in_indexed_archive(archive, entry_index, candidate)
+                            Self::find_shared_in_indexed_archive(
+                                archive,
+                                backing,
+                                entry_index,
+                                candidate,
+                            )
                         };
                         if let Some(data) = found {
                             debug!("Found class {class_name} in JAR (entry: {candidate})");
@@ -2157,11 +2308,16 @@ impl ClassPath {
                     archive,
                     entry_index,
                     nested_path,
+                    backing,
                     ..
                 } => {
                     for candidate in &archive_candidates {
-                        if let Some(data) =
-                            Self::find_in_indexed_archive(archive, entry_index, candidate)
+                        if let Some(data) = Self::find_shared_in_indexed_archive(
+                            archive,
+                            backing,
+                            entry_index,
+                            candidate,
+                        )
                         {
                             debug!(
                                 "Found class {class_name} in nested JAR {nested_path} \
@@ -2202,7 +2358,7 @@ impl ClassPath {
                                     "Found class {class_name} in jimage {} (module {module})",
                                     path.display()
                                 );
-                                return Ok(bytes);
+                                return Ok(SharedBytes::from(bytes));
                             }
                             Ok(None) => {
                                 // Index said module owns it, but the
@@ -2379,6 +2535,7 @@ impl ClassPath {
                     path,
                     signer_cache,
                     entry_index,
+                    ..
                 } => {
                     let found = if *multi_release {
                         Self::find_in_multi_release_archive(
@@ -2438,6 +2595,7 @@ impl ClassPath {
                     nested_path,
                     signer_cache,
                     entry_index,
+                    ..
                 } => {
                     if Self::find_in_indexed_archive(archive, entry_index, &relative_path).is_some()
                     {
@@ -2495,7 +2653,7 @@ impl ClassPath {
     /// blob, and trust-store chaining, are tracked in
     /// `jar_signer.rs` module docs.  Once `crypto_impl::Rsa::verify_*`
     /// is hoisted out of `cratonvm-native-builtins` we plug it in here.
-    fn extract_jar_signer_blocks(archive: &Mutex<ZipArchive<Cursor<Vec<u8>>>>) -> JarSignerInfo {
+    fn extract_jar_signer_blocks(archive: &Mutex<SharedArchive>) -> JarSignerInfo {
         let mut guard = archive.lock();
         // Collect every safe META-INF entry name once; we need both the
         // `*.SF` companions (to feed into the integrity check) and the
@@ -2650,7 +2808,7 @@ impl ClassPath {
     /// the same descending search `find_in_multi_release_archive` uses.
     fn certs_for_signed_class(
         info: &JarSignerInfo,
-        archive: &Mutex<ZipArchive<Cursor<Vec<u8>>>>,
+        archive: &Mutex<SharedArchive>,
         relative_path: &str,
         mr_versions: Option<&Mutex<Option<Arc<BTreeSet<u32>>>>>,
     ) -> Vec<Vec<u8>> {
@@ -2736,7 +2894,7 @@ impl ClassPath {
     /// manifest would otherwise inherit the signer's certificates).
     #[allow(clippy::type_complexity)]
     fn verify_signed_entries(
-        archive: &mut ZipArchive<Cursor<Vec<u8>>>,
+        archive: &mut SharedArchive,
         sf_bytes: &[u8],
     ) -> Option<Vec<(String, crate::jar_signer::DigestAlg, Vec<u8>)>> {
         // (1) Read MANIFEST.MF (streaming-bounded against zip-bombs).
@@ -2969,14 +3127,14 @@ impl ClassPath {
                                 debug!(
                                     "Found resource glob {name} in nested directory as {candidate}"
                                 );
-                                return Some(data.clone());
+                                return Some(data.to_vec());
                             }
                         }
                         continue;
                     }
                     if let Some(data) = entries_cache.get(name) {
                         debug!("Found resource {name} in nested directory");
-                        return Some(data.clone());
+                        return Some(data.to_vec());
                     }
                 }
                 ClassPathEntry::NestedJar {
@@ -3026,7 +3184,7 @@ impl ClassPath {
                                     "Found resource glob {name} in JMOD {} as {candidate} (cached)",
                                     path.display()
                                 );
-                                return Some(data.clone());
+                                return Some(data.to_vec());
                             }
                         }
                         continue;
@@ -3034,7 +3192,7 @@ impl ClassPath {
                     // Try the pre-extracted classes cache first (covers .class + resources under classes/)
                     if let Some(data) = classes_cache.get(name) {
                         debug!("Found resource {name} in JMOD {} (cached)", path.display());
-                        return Some(data.clone());
+                        return Some(data.to_vec());
                     }
                     // Fall back to archive for non-class entries
                     let jmod_name = format!("classes/{}", name);
@@ -3245,13 +3403,13 @@ impl ClassPath {
                             Self::matching_resource_entry_names(entries_cache.keys(), name)
                         {
                             if let Some(b) = entries_cache.get(&candidate) {
-                                out.push(b.clone());
+                                out.push(b.to_vec());
                             }
                         }
                         continue;
                     }
                     if let Some(b) = entries_cache.get(name) {
-                        out.push(b.clone());
+                        out.push(b.to_vec());
                     }
                 }
                 ClassPathEntry::NestedJar {
@@ -3291,13 +3449,13 @@ impl ClassPath {
                             Self::matching_resource_entry_names(classes_cache.keys(), name)
                         {
                             if let Some(b) = classes_cache.get(&candidate) {
-                                out.push(b.clone());
+                                out.push(b.to_vec());
                             }
                         }
                         continue;
                     }
                     if let Some(b) = classes_cache.get(name) {
-                        out.push(b.clone());
+                        out.push(b.to_vec());
                     } else {
                         let jmod_name = format!("classes/{}", name);
                         if let Some(b) = Self::find_in_archive(archive, &jmod_name) {
@@ -3773,7 +3931,7 @@ impl ClassPath {
                 ClassPathEntry::NestedDirectory { entries_cache, .. } => {
                     if let Some(data) = entries_cache.get("module-info.class") {
                         debug!("Found module-info.class in nested directory");
-                        results.push(data.clone());
+                        results.push(data.to_vec());
                     }
                 }
                 ClassPathEntry::NestedJar {
@@ -3796,7 +3954,7 @@ impl ClassPath {
                 } => {
                     if let Some(data) = classes_cache.get("module-info.class") {
                         debug!("Found module-info.class in JMOD {}", path.display());
-                        results.push(data.clone());
+                        results.push(data.to_vec());
                     }
                 }
                 ClassPathEntry::JImageFile {
@@ -4036,7 +4194,7 @@ impl ClassPath {
         }
     }
 
-    fn list_archive_classes(archive: &Mutex<ZipArchive<Cursor<Vec<u8>>>>, out: &mut Vec<String>) {
+    fn list_archive_classes(archive: &Mutex<SharedArchive>, out: &mut Vec<String>) {
         let mut guard = archive.lock();
         for i in 0..guard.len() {
             if let Ok(entry) = guard.by_index_raw(i) {
@@ -4058,7 +4216,7 @@ impl ClassPath {
 
     /// Helper: try to read a named entry from a mutex-guarded ZipArchive.
     fn find_in_archive(
-        archive: &Mutex<ZipArchive<Cursor<Vec<u8>>>>,
+        archive: &Mutex<SharedArchive>,
         name: &str,
     ) -> Option<Vec<u8>> {
         let mut guard = archive.lock();
@@ -4076,6 +4234,46 @@ impl ClassPath {
             Ok(data) => Some(data),
             Err(_) => None,
         }
+    }
+
+    /// Read an entry as shared class bytes. Stored entries become a direct
+    /// range view over the archive mapping; compressed entries are inflated
+    /// once into reference-counted owned storage.
+    fn find_shared_in_archive(
+        archive: &Mutex<SharedArchive>,
+        backing: &ArchiveBacking,
+        name: &str,
+    ) -> Option<SharedBytes> {
+        let mut guard = archive.lock();
+        Self::find_shared_in_archive_locked(&mut guard, backing, name)
+    }
+
+    fn find_shared_in_archive_locked(
+        archive: &mut SharedArchive,
+        backing: &ArchiveBacking,
+        name: &str,
+    ) -> Option<SharedBytes> {
+        let mut entry = archive.by_name(name).ok()?;
+        let size = entry.size();
+        if size > MAX_UNCOMPRESSED_ENTRY_BYTES {
+            return None;
+        }
+        if entry.compression() == zip::CompressionMethod::Stored {
+            let start = usize::try_from(entry.data_start()).ok()?;
+            let len = usize::try_from(size).ok()?;
+            let end = start.checked_add(len)?;
+            if end > backing.as_ref().len() {
+                return None;
+            }
+            return Some(SharedBytes::from_external(ArchiveSlice {
+                backing: backing.clone(),
+                start,
+                end,
+            }));
+        }
+        read_entry_capped(&mut entry, size)
+            .ok()
+            .map(SharedBytes::from)
     }
 
     /// JMOD file header prefix: `JM` (0x4A 0x4D).
@@ -4101,7 +4299,8 @@ impl ClassPath {
     fn load_jmod(path: &Path) -> Result<ClassPathEntry, String> {
         // JMOD files are ordinary classpath archives here; read them through
         // the same owned, mutation-detecting helper as JARs.
-        let data = read_file_for_classpath(path).map_err(|e| format!("failed to read: {e}"))?;
+        let data =
+            read_archive_for_classpath(path).map_err(|e| format!("failed to read: {e}"))?;
         if data.len() < 4 {
             return Err("file too small to be a valid JMOD".to_string());
         }
@@ -4130,7 +4329,12 @@ impl ClassPath {
         }
         debug!("JMOD {} version {}.{}", path.display(), major, minor);
         // Strip the 4-byte JMOD magic prefix to get standard ZIP data
-        let zip_data = data[4..].to_vec();
+        let zip_bytes = SharedBytes::from_external(ArchiveSlice {
+            backing: data.clone(),
+            start: 4,
+            end: data.as_ref().len(),
+        });
+        let zip_data = ArchiveBacking::Shared(zip_bytes);
         let cursor = Cursor::new(zip_data.clone());
         let mut archive =
             ZipArchive::new(cursor).map_err(|e| format!("failed to parse ZIP inside JMOD: {e}"))?;
@@ -4150,14 +4354,10 @@ impl ClassPath {
 
             if let Some(relative) = name.strip_prefix("classes/") {
                 if !relative.is_empty() && !relative.ends_with('/') {
-                    if let Ok(mut entry) = archive.by_name(&name) {
-                        // Audit-fix (zip-bomb) + V2: clamp the attacker-
-                        // controlled central-directory `size()` AND bound the
-                        // actual streaming inflate like every other path.
-                        let size = entry.size();
-                        if let Ok(buf) = read_entry_capped(&mut entry, size) {
-                            classes_cache.insert(relative.to_string(), buf);
-                        }
+                    if let Some(buf) =
+                        Self::find_shared_in_archive_locked(&mut archive, &zip_data, &name)
+                    {
+                        classes_cache.insert(relative.to_string(), buf);
                     }
                 }
             }
@@ -4171,7 +4371,7 @@ impl ClassPath {
         );
 
         // Re-open the archive for rare non-class resource lookups
-        let cursor2 = Cursor::new(zip_data);
+        let cursor2 = Cursor::new(zip_data.clone());
         let archive2 = ZipArchive::new(cursor2)
             .map_err(|e| format!("failed to re-parse ZIP inside JMOD: {e}"))?;
 
@@ -4180,6 +4380,7 @@ impl ClassPath {
             classes_cache,
             all_entry_names,
             archive: Mutex::new(archive2),
+            backing: zip_data,
         })
     }
 }
@@ -4327,11 +4528,47 @@ mod tests {
         let data = cp.find_class("com/example/Hello").unwrap();
         assert_eq!(&data[..4], b"\xCA\xFE\xBA\xBE");
         assert!(data.len() > 4);
+        assert!(
+            data.is_external(),
+            "stored ZIP entries should retain the mapped archive backing"
+        );
 
         // Not found in JAR
         assert!(cp.find_class("com/example/Missing").is_err());
 
         // Cleanup
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn compressed_class_uses_shared_owned_bytes() {
+        let dir = std::env::temp_dir().join("cratonvm_test_deflated_jar");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let jar_path = dir.join("test.jar");
+        {
+            let file = fs::File::create(&jar_path).unwrap();
+            let mut zip_writer = zip::ZipWriter::new(file);
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            zip_writer
+                .start_file("com/example/Compressed.class", options)
+                .unwrap();
+            zip_writer
+                .write_all(b"\xCA\xFE\xBA\xBE_compressed_class_data")
+                .unwrap();
+            zip_writer.finish().unwrap();
+        }
+
+        let cp = ClassPath::new(&[jar_path.to_string_lossy().into_owned()]);
+        let first = cp.find_class("com/example/Compressed").unwrap();
+        let second = first.clone();
+        assert_eq!(first.as_ref(), second.as_ref());
+        assert!(
+            !first.is_external() && !second.is_external(),
+            "deflated entries should use reference-counted inflated storage"
+        );
+        assert_eq!(first.as_ref().as_ptr(), second.as_ref().as_ptr());
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -5564,7 +5801,7 @@ mod tests {
             let internal = format!("{parent}/{base}");
             let got = cp.find_class(&internal).expect("class present");
             assert_eq!(
-                got.as_slice(),
+                got.as_ref(),
                 bytes,
                 "bytes for {internal} must round-trip"
             );

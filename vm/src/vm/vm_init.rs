@@ -3240,7 +3240,7 @@ impl SharedVm {
                         .iter()
                         .filter_map(|iid| cm.class_store.get(*iid).map(|c| c.name.to_string()))
                         .collect(),
-                    class_bytes: bytes.clone(),
+                    class_bytes: bytes.to_vec(),
                 };
                 generator.add_entry(entry);
             }

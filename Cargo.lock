@@ -471,6 +471,7 @@ dependencies = [
  "ecdsa",
  "elliptic-curve",
  "hashbrown 0.14.5",
+ "memmap2",
  "p12",
  "p256",
  "p384",

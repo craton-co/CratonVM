@@ -9765,7 +9765,9 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
 
     fn class_bytes(&self, class_id: ClassId) -> Option<Vec<u8>> {
         let cm = self.shared.class_manager.read();
-        cm.class_bytes_cache.get(&class_id).cloned()
+        cm.class_bytes_cache
+            .get(&class_id)
+            .map(|bytes| bytes.to_vec())
     }
 
     fn find_all_resource_urls(&self, name: &str) -> Vec<String> {
