@@ -52,6 +52,12 @@ pub use class_manager::{
     is_builtin_classloader_name,
     jdk_superclass_lookup,
     jit_supersede_epoch,
+    // Loader-identity consolidation: the single-source-of-truth
+    // `CRATONVM_LOADER_AWARE_RESOLUTION` gate. `vm::runtime::env_cache` and
+    // `native-builtins::classloader` both delegate to this instead of
+    // keeping their own `OnceLock`-cached env-var copy — see
+    // `docs/internal/loader-identity.md`.
+    loader_aware_resolution,
     register_builtin_classloaders,
     static_common_superclass_lookup,
     ClassFileLoadHook,

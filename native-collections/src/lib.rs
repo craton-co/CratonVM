@@ -3980,7 +3980,11 @@ fn map_state(ctx: &dyn NativeContext, this: ObjectRef) -> (Option<ObjectRef>, i3
     // `new AnnotationAttributes(annotationType, false)`), the absolute
     // slot 0 is NOT necessarily the `table` field. Fall back to the
     // JDK-resolved `table` slot when slot 0 doesn't yield a bucket array.
+    let hashtable_layout = uses_native_hashtable_layout(ctx, this);
     let buckets = buckets_slot0.or_else(|| {
+        if hashtable_layout {
+            return None;
+        }
         let slot = ctx.resolve_field_index("java/util/HashMap", "table")?;
         if slot == MAP_FIELD_BUCKETS || slot >= ctx.object_num_fields(this) {
             return None;
@@ -4038,7 +4042,14 @@ fn map_state(ctx: &dyn NativeContext, this: ObjectRef) -> (Option<ObjectRef>, i3
         .class_name_of_id(ctx.class_id_of_object(this))
         .unwrap_or_default();
     let size_by_name = ctx
-        .resolve_field_index(&receiver_class_name, "size")
+        .resolve_field_index(
+            if hashtable_layout {
+                "java/util/Hashtable"
+            } else {
+                &receiver_class_name
+            },
+            if hashtable_layout { "count" } else { "size" },
+        )
         .filter(|&slot| slot < ctx.object_num_fields(this))
         .map(|slot| ctx.get_field(this, slot));
     // spring-bug-09: bound the slot-2 fallbacks below. `map_state` is invoked on
@@ -4101,7 +4112,12 @@ fn set_map_size(ctx: &mut dyn NativeContext, this: ObjectRef, size: i32) {
     let receiver_class_name = ctx
         .class_name_of_id(ctx.class_id_of_object(this))
         .unwrap_or_default();
-    if let Some(slot) = ctx.resolve_field_index(&receiver_class_name, "size") {
+    let (class_name, field_name) = if uses_native_hashtable_layout(ctx, this) {
+        ("java/util/Hashtable", "count")
+    } else {
+        (receiver_class_name.as_str(), "size")
+    };
+    if let Some(slot) = ctx.resolve_field_index(class_name, field_name) {
         if slot != MAP_FIELD_SIZE && slot < ctx.object_num_fields(this) {
             ctx.set_field(this, slot, Value::Int(size));
         }
@@ -4800,14 +4816,20 @@ fn map_resize_inner(ctx: &mut dyn NativeContext, this: ObjectRef, is_concurrent:
     // reads slot 0) would see the new buckets, but any JDK-bytecode path
     // that reads `table` directly would see null. Also keeps the two
     // storage locations in sync.
-    let table_slot = ctx.resolve_field_index("java/util/HashMap", "table");
-    if let Some(slot) = table_slot {
-        if slot != MAP_FIELD_BUCKETS && slot < ctx.object_num_fields(this) {
-            ctx.set_field_volatile(this, slot, Value::Object(Some(new_buckets)));
+    if !uses_native_hashtable_layout(ctx, this) {
+        let table_slot = ctx.resolve_field_index("java/util/HashMap", "table");
+        if let Some(slot) = table_slot {
+            if slot != MAP_FIELD_BUCKETS && slot < ctx.object_num_fields(this) {
+                ctx.set_field_volatile(this, slot, Value::Object(Some(new_buckets)));
+            }
         }
-    }
-    if table_slot != Some(MAP_FIELD_CAPACITY) {
-        ctx.set_field(this, MAP_FIELD_CAPACITY, Value::Int(new_cap));
+        if table_slot != Some(MAP_FIELD_CAPACITY) {
+            ctx.set_field(this, MAP_FIELD_CAPACITY, Value::Int(new_cap));
+        }
+    } else if let Some(slot) = ctx.resolve_field_index("java/util/Hashtable", "threshold") {
+        if slot < ctx.object_num_fields(this) {
+            ctx.set_field(this, slot, Value::Int((new_cap * 3) / 4));
+        }
     }
     ctx.unpin_native_roots(this_pin); // gcstress residual face-1 fix
 }
@@ -5254,6 +5276,16 @@ pub fn native_map_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
+    if uses_native_hashtable_layout(ctx, this) {
+        let buckets = alloc_ref_array(ctx, MAP_DEFAULT_CAPACITY);
+        ctx.set_field(this, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
+        set_map_size(ctx, this, 0);
+        let cname = ctx
+            .class_name_of_id(ctx.class_id_of_object(this))
+            .unwrap_or_else(|| "java/util/Hashtable".to_string());
+        ensure_hashtable_load_factor(ctx, this, &cname);
+        return Ok(None);
+    }
     let ptr = this.as_ptr() as usize;
     if let Some((_, stale_key)) = HM_INT_FAST_LAST_KEY
         .with(|cache| cache.get())
@@ -11901,6 +11933,26 @@ fn is_hashtable_receiver(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
     for _ in 0..32 {
         match ctx.class_name_of_id(cur) {
             Some(n) if n == "java/util/Hashtable" || n == "java/util/Properties" => return true,
+            Some(n) if n == "java/util/HashMap" || n == "java/lang/Object" => return false,
+            _ => {}
+        }
+        match ctx.superclass_of(cur) {
+            Some(p) if p != cur => cur = p,
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// True for `Hashtable` and its ordinary subclasses. `Properties` is excluded:
+/// JDK 25 backs it with a separate `ConcurrentHashMap` and is handled by the
+/// properties side-table path rather than the native Hashtable bucket layout.
+fn uses_native_hashtable_layout(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
+    let mut cur = ctx.class_id_of_object(this);
+    for _ in 0..32 {
+        match ctx.class_name_of_id(cur) {
+            Some(n) if n == "java/util/Properties" => return false,
+            Some(n) if n == "java/util/Hashtable" => return true,
             Some(n) if n == "java/util/HashMap" || n == "java/lang/Object" => return false,
             _ => {}
         }

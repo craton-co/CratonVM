@@ -23257,6 +23257,33 @@ fn spring_class_utils_for_name_impl(
         }
     }
 
+    // Platform/bootstrap loader: the JLS guarantees these can never see
+    // application classes, no matter how permissive the "built-in loader ->
+    // global scanner" fallback above is for the (very different) app-loader
+    // case, whose whole job IS to see the unified classpath. Without this,
+    // `ClassUtils.isPresent(appClassName, ClassLoader.getPlatformClassLoader())`
+    // false-positived every application class as present via the same
+    // global scanner an app-loader lookup legitimately uses, breaking any
+    // "is X absent from a restricted loader" check (e.g.
+    // `LogbackRuntimeHints#registerHints` gating on whether logback is on
+    // the given loader — see
+    // docs/known-issues/springboot/classutils-forname-platform-loader-false-positive.md).
+    if let Some(loader) = loader {
+        let is_platform_or_boot = matches!(
+            ctx.class_name_of_id(ctx.class_id_of_object(loader)).as_deref(),
+            Some("jdk/internal/loader/ClassLoaders$PlatformClassLoader")
+                | Some("jdk/internal/loader/ClassLoaders$BootClassLoader")
+        );
+        if is_platform_or_boot {
+            let internal = dotted.replace('.', "/");
+            if !crate::classloader::is_bootstrap_class_name(&internal) {
+                return Err(RuntimeError::ClassNotFoundException { class_name: dotted }.into());
+            }
+            // Genuinely bootstrap-owned name (java.*, jdk.*, ...) — fall
+            // through to the normal resolution below.
+        }
+    }
+
     // Regular class name: try direct binary name first (a.b.Foo → a/b/Foo)
     let internal = dotted.replace('.', "/");
     if let Ok(cid) = ctx.ensure_class_initialized(&internal) {
@@ -46020,10 +46047,28 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         ssl_session,
         "getLocalCertificates",
         "()[Ljava/security/cert/Certificate;",
-        |_ctx, _args| {
-            // Same rationale as getLocalPrincipal: null is the documented
-            // return when no local certificate chain was used.
-            Ok(Some(Value::Object(None)))
+        |ctx, args| {
+            // FIX (spring-boot-jetty SecureRequestCustomizer 400 "Invalid SNI"):
+            // this used to unconditionally return null, which was only correct
+            // for a plain (no-mTLS) CLIENT session. A SERVER session always has
+            // a local (its own) certificate chain; Jetty's
+            // `SecureRequestCustomizer.getX509()` calls exactly this method on
+            // every HTTPS request and throws `HttpException.RuntimeException(400,
+            // "Invalid SNI")` when it comes back empty. See
+            // `t27_tls::build_synthetic_ssl_session`/`local_certs_for_session`
+            // for where the chain is actually populated (client sessions with no
+            // configured identity correctly still get an empty chain here).
+            let this = obj_arg(args, 0)?;
+            let chain = crate::t27_tls::local_certs_for_session(ctx, this);
+            if chain.is_empty() {
+                return Ok(Some(Value::Object(None)));
+            }
+            let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), chain.len());
+            for (i, der) in chain.iter().enumerate() {
+                let mirror = crate::keystore::make_x509_mirror(ctx, "local", der);
+                ctx.set_array_element(arr, i, Value::Object(Some(mirror)));
+            }
+            Ok(Some(Value::Object(Some(arr))))
         },
     );
     r.register(

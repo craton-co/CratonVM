@@ -3984,6 +3984,47 @@ fn cce_enhance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult 
         .filter(|m| m.name == "<init>" && m.access_flags & ACC_PRIVATE == 0)
         .map(|m| m.descriptor)
         .collect();
+    // Real CGLIB's `Enhancer.filterConstructors` (via `VisibilityPredicate`)
+    // drops every non-visible declared constructor and throws
+    // `IllegalArgumentException("No visible constructors in " + sc)` when
+    // NONE remain (SpringApplicationTests.sourcesMustBeAccessible: a
+    // `@Configuration` class with only a `private` constructor). This
+    // fast-path bytecode generator skips real CGLIB entirely, so it must
+    // replicate that same guard itself — without it, `build_enhancer_class`
+    // silently emitted a proxy with zero delegating constructors and
+    // `SpringApplication.run()` never threw.
+    //
+    // The test expects `BeanDefinitionStoreException` with this
+    // `IllegalArgumentException` as its ROOT cause, not the bare
+    // `IllegalArgumentException` itself — construct + wrap it explicitly
+    // (`crate::spring_startup_bootstrap::wrap_as_bean_definition_store_exception`,
+    // the same helper `m5_abstract_bean_factory_resolve_bean_class_with_name`
+    // uses for an analogous "we replaced the real bytecode, so we must
+    // replicate its catch-and-wrap too" case) rather than a bare
+    // `RuntimeError::IllegalArgumentException`, which would propagate
+    // unwrapped.
+    if ctor_descriptors.is_empty() {
+        let message = format!("No visible constructors in class {super_name}");
+        let message_str = ctx.create_string(&message);
+        let cause = match ctx.new_object_initialized(
+            "java/lang/IllegalArgumentException",
+            "(Ljava/lang/String;)V",
+            &[Value::Object(Some(message_str))],
+        ) {
+            Ok(Some(Value::Object(Some(cause)))) => cause,
+            _ => {
+                return Err(RuntimeError::IllegalArgumentException { message }.into());
+            }
+        };
+        return Err(
+            crate::spring_startup_bootstrap::wrap_as_bean_definition_store_exception(
+                ctx,
+                None,
+                &super_name,
+                cause,
+            ),
+        );
+    }
     let (new_name, bytes) =
         build_enhancer_class(super_loader_id, &super_name, &bean_methods, &ctor_descriptors);
 

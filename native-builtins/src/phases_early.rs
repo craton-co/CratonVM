@@ -17728,31 +17728,27 @@ pub(crate) fn register_phase54_logging_extras(r: &mut NativeMethodRegistry) {
     });
 
     // --- ConsoleHandler ---
-    let ch = "java/util/logging/ConsoleHandler";
-    r.register(ch, "<init>", "()V", |_ctx, _args| {
-        Ok(Some(Value::Object(None)))
-    });
-    r.register(
-        ch,
-        "publish",
-        "(Ljava/util/logging/LogRecord;)V",
-        |ctx, args| {
-            if let Some(Value::Object(Some(rec))) = args.get(1) {
-                let msg_val = ctx.get_field(*rec, 1);
-                if let Value::Object(Some(m)) = msg_val {
-                    let text = ctx.read_string(m).unwrap_or_default();
-                    ctx.record_printed_line(text);
-                }
-            }
-            Ok(Some(Value::Object(None)))
-        },
-    );
-    r.register(ch, "close", "()V", |_ctx, _args| {
-        Ok(Some(Value::Object(None)))
-    });
-    r.register(ch, "flush", "()V", |_ctx, _args| {
-        Ok(Some(Value::Object(None)))
-    });
+    // Previously `<init>`/`publish`/`close`/`flush` were all stubbed here:
+    // `<init>` was a bare no-op (skipping the real `StreamHandler`
+    // constructor's `setOutputStream(System.err)` + property-driven
+    // formatter setup entirely, leaving `getFormatter()` null), and
+    // `publish` read `LogRecord` raw slot 1 (this module's OLD synthetic
+    // `LogRecord` layout, where slot 1 was the message) and fed it to
+    // `record_printed_line` -- an internal Rust-side debug buffer nothing
+    // in a real Java program (including Spring Boot's `CapturedOutput`
+    // test infra) ever reads. The rest of the JUL bridge (logmanager.rs,
+    // T19.H3) moved `LogRecord` to a real-field-name layout
+    // (`get/set_field_by_name(_, "message")`) long ago, so slot 1 no
+    // longer holds the message on records built via
+    // `publish_to_jul_handlers_src`'s `new_object_initialized` path --
+    // this stub had silently gone stale and made every `ConsoleHandler`
+    // constructed by a real `readConfiguration`-driven `logging.properties`
+    // (e.g. Spring Boot's `JavaLoggingSystem`) produce zero visible output
+    // no matter what handler/level/formatter wiring was otherwise correct.
+    // Real `StreamHandler`/`Handler` bytecode verified working directly
+    // (`new StreamHandler(System.err, new SimpleFormatter())` correctly
+    // formats and writes through the current `System.err`, including under
+    // JUnit's `CapturedOutput` wrapping) -- let it run instead of stubbing.
 
     // --- Formatter (abstract) ---
     let fmt = "java/util/logging/Formatter";
@@ -17778,27 +17774,29 @@ pub(crate) fn register_phase54_logging_extras(r: &mut NativeMethodRegistry) {
     );
 
     // --- SimpleFormatter ---
-    let sf = "java/util/logging/SimpleFormatter";
-    r.register(sf, "<init>", "()V", |_ctx, _args| {
-        Ok(Some(Value::Object(None)))
-    });
-    r.register(
-        sf,
-        "format",
-        "(Ljava/util/logging/LogRecord;)Ljava/lang/String;",
-        |ctx, args| {
-            if let Some(Value::Object(Some(rec))) = args.get(1) {
-                let msg = ctx.get_field(*rec, 1);
-                if let Value::Object(Some(m)) = msg {
-                    let text = ctx.read_string(m).unwrap_or_default();
-                    let formatted = ctx.create_string(&format!("INFO: {text}\n"));
-                    return Ok(Some(Value::Object(Some(formatted))));
-                }
-            }
-            let s = ctx.create_string("INFO: \n");
-            Ok(Some(Value::Object(Some(s))))
-        },
-    );
+    // Previously `<init>`/`format` were stubbed here the same way
+    // `ConsoleHandler.<init>`/`publish` were (see the removal note above
+    // `register_spring_boot_logback_apply`'s sibling in lib.rs and the
+    // `ConsoleHandler` removal in this file): `<init>` was a bare no-op
+    // (skipping the real no-arg constructor's `invokedynamic`-driven
+    // default-format-pattern setup entirely), and `format` read `LogRecord`
+    // raw slot 1 -- this module's OLD synthetic layout, where slot 1 was
+    // the message; the REAL layout (`get/set_field_by_name(_, "message")`,
+    // used throughout `logmanager.rs`) has moved the message elsewhere, so
+    // slot 1 no longer holds it. The read always missed, falling through to
+    // a hardcoded `"INFO: \n"` regardless of the record's actual level or
+    // message -- misdiagnosed for a time as a VM interpreter/JIT
+    // correctness bug (see the retraction in
+    // docs/known-issues/springboot/exception-table-method-state-loss-cluster.md)
+    // before this stale stub was found. Real `Formatter`/`SimpleFormatter`
+    // bytecode verified working directly for the message/level path (via
+    // `Formatter.formatMessage`, already natively bridged further down in
+    // this same file); the real no-arg constructor's own
+    // `invokedynamic`-driven default pattern remains a separate, narrower,
+    // documented residual (`javaloggingsystemtests-simpleformatter-args-drop.md`,
+    // corrected likewise) that only affects handlers with no explicit
+    // `.formatter=` config -- `apply_jul_config_entries` in
+    // `logmanager.rs` already patches around it for that specific case.
 
     // --- LogManager (singleton) ---
     let lm = "java/util/logging/LogManager";
