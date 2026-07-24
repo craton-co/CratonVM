@@ -64187,6 +64187,15 @@ pub(crate) fn pem_block_to_der(bytes: &[u8]) -> Vec<u8> {
     }
 }
 
+/// Matches real `java.util.Base64.Decoder`'s exact wording for an
+/// out-of-alphabet byte (`"Illegal base64 character " +
+/// Integer.toString(b & 0xff, 16)`) — Spring Boot's
+/// `Base64ProtocolResolverTests`/`JksSslStoreBundleTests` assert on this
+/// text, not just the exception type.
+fn b64_illegal_char_msg(b: u8) -> String {
+    format!("Illegal base64 character {b:x}")
+}
+
 fn b64_decode(input: &[u8], variant: i32) -> Result<Vec<u8>, String> {
     // RFC 4648's basic and URL decoders reject every non-alphabet byte,
     // including whitespace.  Only MIME decoding ignores whitespace.
@@ -64208,9 +64217,9 @@ fn b64_decode(input: &[u8], variant: i32) -> Result<Vec<u8>, String> {
             return Err("Incomplete base64 input".to_string());
         }
         let c0 = b64_decode_char(filtered[i], variant)
-            .ok_or_else(|| format!("Invalid base64 char: {}", filtered[i] as char))?;
+            .ok_or_else(|| b64_illegal_char_msg(filtered[i]))?;
         let c1 = b64_decode_char(filtered[i + 1], variant)
-            .ok_or_else(|| format!("Invalid base64 char: {}", filtered[i + 1] as char))?;
+            .ok_or_else(|| b64_illegal_char_msg(filtered[i + 1]))?;
 
         if remaining == 2 {
             out.push(((c0 << 2) | (c1 >> 4)) as u8);
@@ -64225,7 +64234,7 @@ fn b64_decode(input: &[u8], variant: i32) -> Result<Vec<u8>, String> {
             break;
         }
         let c2 = b64_decode_char(third, variant)
-            .ok_or_else(|| format!("Invalid base64 char: {}", third as char))?;
+            .ok_or_else(|| b64_illegal_char_msg(third))?;
 
         if remaining == 3 {
             out.push(((c0 << 2) | (c1 >> 4)) as u8);
@@ -64242,7 +64251,7 @@ fn b64_decode(input: &[u8], variant: i32) -> Result<Vec<u8>, String> {
             break;
         }
         let c3 = b64_decode_char(fourth, variant)
-            .ok_or_else(|| format!("Invalid base64 char: {}", fourth as char))?;
+            .ok_or_else(|| b64_illegal_char_msg(fourth))?;
         out.push(((c0 << 2) | (c1 >> 4)) as u8);
         out.push((((c1 & 0xF) << 4) | (c2 >> 2)) as u8);
         out.push((((c2 & 0x3) << 6) | c3) as u8);
@@ -69885,19 +69894,22 @@ fn assertj_arrays_equal(
     left: ObjectRef,
     right: ObjectRef,
 ) -> Result<bool, MethodCallFailed> {
-    let left_elem = ctx.heap_element_type_of(left);
-    let right_elem = ctx.heap_element_type_of(right);
-    let left_is_reference_array = matches!(left_elem, cratonvm_types::ArrayElementType::Reference);
+    let left_type = ctx.heap_element_type_of(left);
+    let right_type = ctx.heap_element_type_of(right);
+    let left_is_reference_array = left_type == cratonvm_types::ArrayElementType::Reference;
+    let right_is_reference_array = right_type == cratonvm_types::ArrayElementType::Reference;
     if std::env::var_os("CRATONVM_DBG_ASSERTJ_ARR").is_some() {
         eprintln!(
-            "[ASSERTJ-ARR-DBG] left_elem={left_elem:?} right_elem={right_elem:?} left_ref={left_is_reference_array}"
+            "[ASSERTJ-ARR-DBG] left_type={left_type:?} right_type={right_type:?} left_ref={left_is_reference_array}"
         );
     }
 
     // The Java implementation falls through to Object.equals (identity for
     // arrays) for different primitive array types and primitive/reference
     // pairs. `left == right` was handled by the caller.
-    if left_elem != right_elem {
+    if left_is_reference_array != right_is_reference_array
+        || (!left_is_reference_array && left_type != right_type)
+    {
         if std::env::var_os("CRATONVM_DBG_ASSERTJ_ARR").is_some() {
             eprintln!("[ASSERTJ-ARR-DBG] early-false: mismatched array element type");
         }
@@ -69963,23 +69975,26 @@ fn assertj_objects_equal(
         (Some(left), Some(right)) => (left, right),
     };
 
-    // Check array-ness FIRST, via `object_is_array` (the same reliable API
-    // `java.lang.reflect.Array`'s natives use) — see the BUG note on
-    // `assertj_arrays_equal` for why `class_id_of_object`/`class_name_of_id`
-    // must NOT be trusted for array objects: an array's header `class_id`
-    // holds its ELEMENT type's id (e.g. `java/lang/Long`'s id for a
-    // `Long[]`), so checking those name strings BEFORE ruling out
-    // array-ness could misroute an actual `Long[]`/`Long[]` pair into the
-    // scalar-Long fast path below, reading a nonexistent "value" field off
-    // an array object.
-    let left_is_array = ctx.object_is_array(left);
-    let right_is_array = ctx.object_is_array(right);
+    // Arrays never override `Object.equals` (reference semantics), but
+    // AssertJ's `isEqualTo` needs a deep element-wise comparison. Detect
+    // arrays via `heap_kind_of`/`heap_element_type_of` (the heap object
+    // header CratonVM actually tracks this on), NOT a `class_name_of_id()`
+    // string check: an array's header `class_id` field stores its ELEMENT
+    // type's ClassId (e.g. `java/lang/String`'s ClassId for a `String[]`),
+    // not the array type's own ClassId — array objects are not registered
+    // under a normal `"[B"`-style class name in `class_manager`, so the
+    // name-based check silently returned `""`/the component class name for
+    // every array and fell through to the generic `Object.equals` branch
+    // below — reference equality — making `isEqualTo(byte[])` and
+    // `isEqualTo(String[])` alike report content-identical arrays as
+    // unequal (`AppendableByteArrayTests`/`writesMultipleSmallStrings`,
+    // `GraphitePropertiesConfigAdapterTests`/
+    // `whenPropertiesTagsAsPrefixIsSetAdapterTagsAsPrefixReturnsIt`, found
+    // independently the same day).
+    let left_is_array = ctx.heap_kind_of(left) == cratonvm_types::ObjectKind::Array;
+    let right_is_array = ctx.heap_kind_of(right) == cratonvm_types::ObjectKind::Array;
     if left_is_array || right_is_array {
-        if !left_is_array || !right_is_array {
-            // Mismatched array-ness: real bytecode's instanceof chain
-            // finds no match either side and falls through to identity
-            // Object.equals — never equal for two distinct objects (the
-            // `left == right` case was already handled above).
+        if left_is_array != right_is_array {
             return Ok(false);
         }
         return assertj_arrays_equal(ctx, left, right);

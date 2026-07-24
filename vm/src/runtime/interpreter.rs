@@ -21572,7 +21572,45 @@ fn execute_invoke_kind(
     // receiver whose method the stackless path couldn't handle (synthetic stub /
     // exotic → CacheMiss) must still dispatch on the receiver's own class_id,
     // not the wrong name-resolved copy. Rare, so the recursive path is fine.
-    let result = if let Some(rcv_cid) = dispatch_override {
+    //
+    // `dispatch_override` alone under-detects this: it's computed by comparing
+    // `get_loaded_class_id(&invoke_class)` against the receiver's class_id at
+    // THIS point in time, but `invoke_shared`'s own `load_class_concurrent`
+    // (name-based) can independently resolve the SAME name string to a
+    // DIFFERENT ClassId than `get_loaded_class_id` just did — observed with
+    // `@ClassPathOverrides`'s `ModifiedClassPathClassLoader`, where an old
+    // override jar's class (e.g. Spring's `MimeType`, missing a method added
+    // in later versions) and the main classpath's same-named class are BOTH
+    // loaded, and the two name-resolution call sites picked different
+    // copies. That let `mimeType.isMoreSpecific(null)` — a genuinely absent
+    // method on the receiver's OWN class — silently dispatch to the OTHER
+    // same-named class's bytecode instead of raising `NoSuchMethodError`
+    // (`NoSuchMethodFailureAnalyzerTests`). For an ordinary virtual call, the
+    // receiver's own (already-loaded, already-initialized) class_id is
+    // JVMS-authoritative regardless of what any name lookup returns, so
+    // prefer it whenever available instead of falling through to the
+    // loader-blind by-name path. Excludes:
+    //  - the stale-pointer sentinel (`ClassId::new(0)`, see the cid==0
+    //    handling above), which intentionally keeps using the CP method-ref
+    //    class name for its own recovery path;
+    //  - lambda-proxy receivers, whose synthetic class_id is NOT a normal
+    //    entry in `class_manager` (it has no real method table of its own
+    //    for `invoke_on_class_shared`'s `find_method_recursive` to walk).
+    //    `invoke_on_class_shared_inner` DOES also re-check
+    //    `shared.lambda_proxies` on the receiver up front and redirect to
+    //    `try_lambda_dispatch`, but only when passed the RECEIVER's own
+    //    class_id — routing a lambda receiver's SAM method call (e.g.
+    //    `Consumer.accept`) through this branch at all, instead of the
+    //    by-name `invoke_shared` fallback the lambda dispatch machinery
+    //    already handles correctly, regressed
+    //    `ProcessInfoTests.memoryInfoIsAvailable`'s `allSatisfy(lambda)`
+    //    with `NoSuchMethodError: <unknown class N>.accept(...)`.
+    let is_lambda_receiver = receiver_class_id
+        .map(|c| shared.lambda_proxies.read().contains_key(&c))
+        .unwrap_or(false);
+    let result = if let Some(rcv_cid) = dispatch_override.or_else(|| {
+        receiver_class_id.filter(|c| *c != ClassId::new(0) && !is_lambda_receiver)
+    }) {
         crate::vm::invoke_on_class_shared(
             shared,
             thread,

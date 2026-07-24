@@ -2046,6 +2046,14 @@ pub trait NativeContext {
         256 * 1024 * 1024
     }
 
+    /// Initial heap size in bytes, as reported by the JMX `MemoryMXBean`'s
+    /// heap `MemoryUsage.getInit()`. The default (mock/test contexts) mirrors
+    /// `max_heap_bytes`'s historical placeholder; the VM overrides it to
+    /// return the configured `-Xms` (`VmConfig::initial_heap_size`).
+    fn initial_heap_bytes(&self) -> i64 {
+        16 * 1024 * 1024
+    }
+
     /// Returns the total number of bytes allocated on the heap.
     fn heap_allocated_bytes(&self) -> usize;
 
@@ -2073,6 +2081,22 @@ pub trait NativeContext {
     /// The default impl is a no-op so out-of-tree `NativeContext`
     /// implementors (tests) need not change.
     fn begin_blocking_region(&mut self) {}
+
+    /// Same GC-safety contract as `begin_blocking_region`, for a region with
+    /// a bounded/known wait duration (`Thread.sleep`, a timed `Object.wait`,
+    /// `LockSupport.parkNanos`, …). `Thread.getState()` reports
+    /// `TIMED_WAITING` for a thread inside one of these vs. plain `WAITING`
+    /// for an unbounded `begin_blocking_region` — real JDK's
+    /// `Thread.State` makes exactly this distinction, and callers such as
+    /// Spring Boot's `SpringApplicationShutdownHookTests` assert on it via
+    /// `Awaitility.await().until(thread::getState, State.TIMED_WAITING::equals)`.
+    ///
+    /// The default impl just delegates to `begin_blocking_region` (reported
+    /// as plain `WAITING`) so out-of-tree `NativeContext` implementors need
+    /// not change; must still be paired with exactly one `end_blocking_region`.
+    fn begin_timed_blocking_region(&mut self) {
+        self.begin_blocking_region();
+    }
 
     /// T19.H1 — end a blocking region opened by `begin_blocking_region`.
     /// Re-syncs the thread with any GC that ran while it was blocked.

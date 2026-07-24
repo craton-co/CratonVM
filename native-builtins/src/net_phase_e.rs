@@ -1827,7 +1827,7 @@ fn hash_str_ignore_case(h: i32, s: Option<&str>) -> i32 {
 /// every other character (INCLUDING `+`, which URI leaves literal — unlike
 /// `application/x-www-form-urlencoded`) is copied verbatim. A malformed `%`
 /// escape (missing/non-hex digits) is copied through unchanged.
-fn uri_percent_decode(input: &str) -> String {
+pub(crate) fn uri_percent_decode(input: &str) -> String {
     if !input.contains('%') {
         return input.to_string();
     }

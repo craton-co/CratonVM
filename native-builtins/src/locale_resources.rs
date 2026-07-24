@@ -1281,10 +1281,41 @@ fn rb_get_object(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         Value::Object(Some(m)) => m,
         _ => return Ok(Some(Value::Object(None))),
     };
-    cratonvm_native_collections::native_map_get_pub(
+    let result = cratonvm_native_collections::native_map_get_pub(
         ctx,
         &[Value::Object(Some(map)), Value::Object(Some(key))],
-    )
+    );
+    // Key absent from the synthetic bundle's backing map: same contract as the
+    // real-subclass branches above — walk the parent chain, then throw
+    // `MissingResourceException` rather than silently returning null.
+    // Hibernate Validator's `AbstractMessageInterpolator.resolveParameter`
+    // depends on this: it calls `bundle.getString(key)` inside a
+    // `try { ... } catch (MissingResourceException e) { keep original
+    // "{param}" text }` — a null return (instead of the exception) let the
+    // literal Java string "null" leak into interpolated messages
+    // (`MessageSourceMessageInterpolatorIntegrationTests.unknown`,
+    // `JksSslStoreBundleTests`'s provider-not-found messages).
+    match result {
+        Ok(Some(Value::Object(None))) | Ok(None) => {
+            if let Value::Object(Some(parent)) = ctx.get_field_by_name(this, "parent") {
+                return rb_get_object(
+                    ctx,
+                    &[Value::Object(Some(parent)), Value::Object(Some(key))],
+                );
+            }
+            let key_str = ctx.read_string(key);
+            let exc = alloc_concurrent_synthetic(ctx, "java/util/MissingResourceException", 8);
+            let msg = ctx.create_string(&format!(
+                "Can't find resource for key {}",
+                key_str.unwrap_or_default()
+            ));
+            ctx.set_field_by_name(exc, "detailMessage", Value::Object(Some(msg)));
+            Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(
+                exc,
+            ))
+        }
+        other => other,
+    }
 }
 
 fn rb_get_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {

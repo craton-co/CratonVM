@@ -634,7 +634,11 @@ pub(crate) fn native_thread_sleep(ctx: &mut dyn NativeContext, args: &[Value]) -
                 interrupted = true;
                 break;
             }
-            ctx.begin_blocking_region();
+            // `Thread.sleep` has a bounded duration, so `Thread.getState()`
+            // must report `TIMED_WAITING`, not plain `WAITING` (real JDK
+            // distinguishes them; `SpringApplicationShutdownHookTests`
+            // polls for exactly this state via Awaitility).
+            ctx.begin_timed_blocking_region();
             std::thread::sleep(remaining.min(pump_slice));
             ctx.end_blocking_region();
         }
@@ -679,6 +683,7 @@ pub(crate) fn native_thread_get_state(
         2 => "TERMINATED",
         3 => "WAITING",
         4 => "BLOCKED",
+        5 => "TIMED_WAITING",
         _ => "NEW",
     };
     let cid = match ctx.ensure_class_initialized("java/lang/Thread$State") {
