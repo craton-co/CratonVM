@@ -5919,6 +5919,19 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         cm.find_class_by_name(name)
     }
 
+    fn class_id_by_name_via_referencing_class(
+        &mut self,
+        referencing_class_id: ClassId,
+        name: &str,
+    ) -> Result<ClassId, cratonvm_types::error::MethodCallFailed> {
+        crate::runtime::interpreter::resolve_class_loader_aware(
+            self.shared,
+            self.thread,
+            referencing_class_id,
+            name,
+        )
+    }
+
     fn is_record_class(&self, class_id: ClassId) -> bool {
         self.shared
             .class_manager

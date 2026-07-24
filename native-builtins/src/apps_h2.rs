@@ -1887,22 +1887,72 @@ fn h2_session_prepare_local_no_cache(
         return result;
     }
 
-    let parser = match ctx.new_object_initialized(
-        "org/h2/command/Parser",
-        "(Lorg/h2/engine/SessionLocal;)V",
-        &[Value::Object(Some(this))],
-    )? {
-        Some(Value::Object(Some(o))) => o,
-        _ => return Ok(Some(Value::Object(None))),
-    };
-    let command = ctx.invoke_virtual(
-        parser,
-        "prepareCommand",
-        "(Ljava/lang/String;)Lorg/h2/command/Command;",
-        &[Value::Object(Some(sql))],
-    )?;
-    ctx.set_field_by_name(this, "derivedTableIndexCache", Value::Object(None));
-    Ok(command)
+    let this_pin = ctx.pin_native_root(this);
+    let sql_pin = ctx.pin_native_root(sql);
+    let result = (|| {
+        let this = ctx.read_native_pin(this_pin, this);
+        // Loader-precise construction (JVMS SS5.3): resolving "org/h2/command/
+        // Parser" by name alone collapses to whichever loader defined it
+        // FIRST process-wide (see `new_object_initialized`'s own doc
+        // comment) -- fatal for `Upgrade.loadH2`'s per-call anonymous
+        // ClassLoader, which defines its own, distinct copy of `Parser`, and
+        // whose sessions reach this native. Gated behind an actual
+        // UserDefined-loader check (`loader_id_of_class` returns 0/1/2 for
+        // Bootstrap/Extension/Application, 3+ for UserDefined): this is the
+        // SQL statement-preparation entry point for EVERY session in the
+        // whole process, and unconditionally driving
+        // `class_id_by_name_via_referencing_class` (which re-enters the
+        // interpreter's loader-initiated-resolution machinery) on every
+        // ordinary, single-loader Application call was measured to corrupt
+        // unrelated later state (a regression caught by `TestLinkedTable`
+        // during verification of this fix -- exact mechanism not pinned
+        // down, but the ordinary single-loader path has no need for
+        // loader-aware resolution at all, so simply not taking it there is
+        // both the minimal-risk and the correct fix). Only sessions
+        // genuinely loaded by a non-Application loader (`Upgrade.loadH2`'s
+        // old-driver copies) pay for the loader-aware path.
+        let session_class_id = ctx.class_id_of_object(this);
+        let parser_class_id = if ctx.loader_id_of_class(session_class_id) >= 3 {
+            Some(ctx.class_id_by_name_via_referencing_class(
+                session_class_id,
+                "org/h2/command/Parser",
+            )?)
+        } else {
+            None
+        };
+        let this = ctx.read_native_pin(this_pin, this);
+        let sql = ctx.read_native_pin(sql_pin, sql);
+        let parser = match if let Some(parser_class_id) = parser_class_id {
+            ctx.new_object_initialized_with_class_id(
+                parser_class_id,
+                "(Lorg/h2/engine/SessionLocal;)V",
+                &[Value::Object(Some(this))],
+            )?
+        } else {
+            ctx.new_object_initialized(
+                "org/h2/command/Parser",
+                "(Lorg/h2/engine/SessionLocal;)V",
+                &[Value::Object(Some(this))],
+            )?
+        } {
+            Some(Value::Object(Some(o))) => o,
+            _ => return Ok(Some(Value::Object(None))),
+        };
+        let parser_pin = ctx.pin_native_root(parser);
+        let sql = ctx.read_native_pin(sql_pin, sql);
+        let parser = ctx.read_native_pin(parser_pin, parser);
+        let command = ctx.invoke_virtual(
+            parser,
+            "prepareCommand",
+            "(Ljava/lang/String;)Lorg/h2/command/Command;",
+            &[Value::Object(Some(sql))],
+        )?;
+        let this = ctx.read_native_pin(this_pin, this);
+        ctx.set_field_by_name(this, "derivedTableIndexCache", Value::Object(None));
+        Ok(command)
+    })();
+    ctx.unpin_native_roots(this_pin);
+    result
 }
 
 fn h2_constraint_check_existing_data(
