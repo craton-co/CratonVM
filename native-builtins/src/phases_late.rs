@@ -45008,6 +45008,48 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         ensure_layered_handshake_started(ctx, this)?;
         Ok(None)
     });
+    // FIX (TestSsl.testClientInitiatedRenegotiation[JSSE]): these two real
+    // JDK SSLSocket methods had no native registration at all, so calling
+    // either threw `AbstractMethodError: ... has no Code attribute` (the
+    // abstract class has no bytecode of its own) — a VM-crash-shaped error
+    // for what should be an ordinary, always-legal listener registration
+    // call. Honest no-op registration (matching the real
+    // `addHandshakeCompletedListener` null-check contract): we do NOT fire
+    // stored listeners on a later `startHandshake()` call, because rustls
+    // (this VM's TLS backend) does not implement TLS renegotiation at the
+    // protocol level at all — a permanent upstream design choice, same
+    // class of gap as the already-documented rustls DHE/CBC limitations.
+    // Registering these as real (if inert) methods turns the crash into a
+    // clean, honest test assertion failure (listener never completes)
+    // instead of an uncatchable AbstractMethodError.
+    r.register(
+        ssl_sock,
+        "addHandshakeCompletedListener",
+        "(Ljavax/net/ssl/HandshakeCompletedListener;)V",
+        |_ctx, args| {
+            if matches!(args.get(1), Some(Value::Object(None)) | None) {
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: "listener is null".to_string(),
+                }
+                .into());
+            }
+            Ok(None)
+        },
+    );
+    r.register(
+        ssl_sock,
+        "removeHandshakeCompletedListener",
+        "(Ljavax/net/ssl/HandshakeCompletedListener;)V",
+        |_ctx, args| {
+            if matches!(args.get(1), Some(Value::Object(None)) | None) {
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: "listener is null".to_string(),
+                }
+                .into());
+            }
+            Ok(None)
+        },
+    );
     // connect(SocketAddress[, int timeout]) — the other half of the zero-arg
     // `createSocket()` pattern registered on `SSLSocketFactory` above. Real
     // `javax.net.ssl.SSLSocket` does not redeclare `connect` (it stays

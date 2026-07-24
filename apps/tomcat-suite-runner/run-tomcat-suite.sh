@@ -78,8 +78,33 @@ fi
 run_one() {
   local cls="$1" logfile="$2"
   if [ "$MODE" = "craton" ]; then
+    # *LargeHeap classes (e.g. TestByteChunkLargeHeap/TestCharChunkLargeHeap)
+    # push a SINGLE array up to AbstractChunk.ARRAY_MAX_SIZE
+    # (Integer.MAX_VALUE-8 elements, up to ~4.3 GiB for a char[]). CratonVM's
+    # default Generational collector has a fixed Xmx/2 old-gen cap (no
+    # dynamic growth), so a humongous array that size can't fit even at
+    # -Xmx8g even though HotSpot's region-based G1 handles it fine at 8g.
+    # CratonVM's OWN G1 backend (gc/src/g1.rs, production-status per
+    # docs/internal/gaps/gc-tuning.md) doesn't have that fixed split and
+    # passes both classes cleanly -- TestByteChunkLargeHeap at -Xmx8g,
+    # TestCharChunkLargeHeap needs -Xmx10g (measured; HotSpot needs neither
+    # bump, its G1 is somewhat more memory-efficient at this extreme). Never
+    # downgrade a larger caller-supplied MAX_HEAP.
+    local heap="$MAX_HEAP" gc_flag=""
+    if [[ "$cls" == *LargeHeap ]]; then
+      gc_flag="-XX:+UseG1GC"
+      # Bump to 10g unless MAX_HEAP is already a larger *g value (bash-only
+      # parse — avoids numfmt's case-sensitive iec-suffix quirks (rejects
+      # lowercase "8g")). Any non-"<N>g" MAX_HEAP form (e.g. "512m") is
+      # smaller than 10g for this test family, so it's bumped too.
+      if [[ "$MAX_HEAP" =~ ^([0-9]+)[gG]$ ]] && [ "${BASH_REMATCH[1]}" -ge 10 ]; then
+        heap="$MAX_HEAP"
+      else
+        heap="10g"
+      fi
+    fi
     timeout "${TIMEOUT_SEC}s" "$CRATONVM_EXE" \
-      --java-home "$JAVA_HOME25" --Xmx "$MAX_HEAP" \
+      --java-home "$JAVA_HOME25" --Xmx "$heap" $gc_flag \
       -Dfile.encoding=UTF-8 -Djava.net.preferIPv4Stack=true \
       -Dtomcat.test.basedir="$TC_ROOT/output/build" \
       -Dtomcat.test.temp="$TC_ROOT/output/test-tmp" \
