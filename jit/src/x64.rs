@@ -14260,6 +14260,36 @@ impl Compiler {
         self.buf.emit(&disp.to_le_bytes());
     }
 
+    /// Emit a sign- or zero-extending 8/16-bit load into a 64-bit register.
+    fn emit_movx_r64_mem_disp32(
+        &mut self,
+        dst: u8,
+        base: u8,
+        disp: i32,
+        source_bits: u8,
+        signed: bool,
+    ) {
+        let mut rex = 0x48u8;
+        if dst >= 8 {
+            rex |= 0x04;
+        }
+        if base >= 8 {
+            rex |= 0x01;
+        }
+        self.buf.emit_byte(rex);
+        self.buf.emit_byte(0x0F);
+        self.buf.emit_byte(match (source_bits, signed) {
+            (8, true) => 0xBE,   // MOVSX r64, r/m8
+            (8, false) => 0xB6,  // MOVZX r64, r/m8
+            (16, true) => 0xBF,  // MOVSX r64, r/m16
+            (16, false) => 0xB7, // MOVZX r64, r/m16
+            _ => unreachable!("compact field load width"),
+        });
+        self.buf
+            .emit_byte(0x80 | ((dst & 7) << 3) | (base & 7));
+        self.buf.emit(&disp.to_le_bytes());
+    }
+
     /// Emit `MOV dst32, [base + disp32]` — a 32-bit load that zero-extends
     /// into the full 64-bit `dst` (implicit on x86-64 for any 32-bit GPR
     /// write). Used by inline `getfield` for `float` fields so the result
@@ -14508,7 +14538,11 @@ impl Compiler {
     /// offset 21), exactly mirroring the getfield 0xb4 inline path. No
     /// scratch register needed.
     fn emit_load_string_value_ptr(&mut self, dst: u8, base: u8, compact_offset: i32) {
-        self.emit_test_mem8_imm8(base, 21, cratonvm_types::GC_FLAG_COMPACT);
+        self.emit_test_mem8_imm8(
+            base,
+            cratonvm_types::GC_FLAGS_OFFSET as i32,
+            cratonvm_types::GC_FLAG_COMPACT,
+        );
         let legacy = self.emit_jcc_rel32_patch(0x84); // JZ (flag clear => legacy)
         self.emit_mov_r64_mem_disp32(dst, base, compact_offset);
         let done = self.emit_jmp_rel32_patch();
@@ -14523,7 +14557,11 @@ impl Compiler {
     /// and `hash` are always non-negative in practice, so sign- vs
     /// zero-extension is behaviourally identical here.
     fn emit_load_string_i32_field(&mut self, dst: u8, base: u8, compact_offset: i32) {
-        self.emit_test_mem8_imm8(base, 21, cratonvm_types::GC_FLAG_COMPACT);
+        self.emit_test_mem8_imm8(
+            base,
+            cratonvm_types::GC_FLAGS_OFFSET as i32,
+            cratonvm_types::GC_FLAG_COMPACT,
+        );
         let legacy = self.emit_jcc_rel32_patch(0x84);
         self.emit_movsxd_r64_mem_disp32(dst, base, compact_offset);
         let done = self.emit_jmp_rel32_patch();
@@ -14719,11 +14757,19 @@ impl Compiler {
 
         // A registered compact class may still have legacy instances when a
         // synthetic/native allocation used a mismatched slot count.
-        self.emit_test_mem8_imm8(RAX, 21, cratonvm_types::GC_FLAG_COMPACT);
+        self.emit_test_mem8_imm8(
+            RAX,
+            cratonvm_types::GC_FLAGS_OFFSET as i32,
+            cratonvm_types::GC_FLAG_COMPACT,
+        );
         bail.push(self.emit_jcc_rel32_patch(0x84)); // JZ legacy -> helper
 
         // Old receiver needs a generational card mark.
-        self.emit_test_mem8_imm8(RAX, 21, cratonvm_types::GC_FLAG_OLD_GEN);
+        self.emit_test_mem8_imm8(
+            RAX,
+            cratonvm_types::GC_FLAGS_OFFSET as i32,
+            cratonvm_types::GC_FLAG_OLD_GEN,
+        );
         bail.push(self.emit_jcc_rel32_patch(0x85)); // JNZ old -> helper
 
         // A non-null old value needs the SATB pre-barrier.
@@ -14732,7 +14778,11 @@ impl Compiler {
         bail.push(self.emit_jcc_rel32_patch(0x85)); // JNZ non-null -> helper
 
         // Match the interpreter/helper's silent out-of-bounds drop.
-        self.emit_mov_r32_mem_disp32(RCX, RAX, 16);
+        self.emit_mov_r32_mem_disp32(
+            RCX,
+            RAX,
+            cratonvm_types::NUM_SLOTS_OFFSET as i32,
+        );
         self.emit_mov_imm64(RDX, field_index as i64);
         self.emit_cmp_r32_r32(RDX, RCX);
         let oob = self.emit_jcc_rel32_patch(0x83); // JAE -> drop
@@ -14776,9 +14826,17 @@ impl Compiler {
         let mut bail: Vec<usize> = Vec::new();
 
         self.load_slot_to_reg(RAX, obj_slot);
-        self.emit_test_mem8_imm8(RAX, 21, cratonvm_types::GC_FLAG_COMPACT);
+        self.emit_test_mem8_imm8(
+            RAX,
+            cratonvm_types::GC_FLAGS_OFFSET as i32,
+            cratonvm_types::GC_FLAG_COMPACT,
+        );
         bail.push(self.emit_jcc_rel32_patch(0x84)); // JZ legacy -> helper
-        self.emit_test_mem8_imm8(RAX, 21, cratonvm_types::GC_FLAG_OLD_GEN);
+        self.emit_test_mem8_imm8(
+            RAX,
+            cratonvm_types::GC_FLAGS_OFFSET as i32,
+            cratonvm_types::GC_FLAG_OLD_GEN,
+        );
         bail.push(self.emit_jcc_rel32_patch(0x85)); // JNZ old -> helper
 
         self.load_slot_to_reg(RDX, val_slot);
@@ -15031,21 +15089,14 @@ impl Compiler {
         // explicitly, not left to refill zeroing — see the default-on note
         // below.
         self.emit_mov_dword_mem_disp32_imm32(R11, 8, 0);
-        // offset 12: array_length. For a compact object this carries the body
-        // size in bytes (object_body_size reads it); a legacy object writes 0.
-        self.emit_mov_dword_mem_disp32_imm32(R11, 12, compact_body.map(|b| b as i32).unwrap_or(0));
-        // Layout reminder (from `types/src/heap_types.rs`):
-        //   off 16: num_slots (u32) — Object kind only; arrays use
-        //   array_length at offset 12, but `new` only allocates Objects.
+        // offset 12: the full 32-bit field count for Object kind.
+        let shape = num_fields as u32;
         self.emit_mov_dword_mem_disp32_imm32(
             R11,
-            16,
-            num_fields as i32, // Cast: x86-64 immediate encoding
+            cratonvm_types::NUM_SLOTS_OFFSET as i32,
+            shape as i32,
         );
-        // Compact object: set GC_FLAG_COMPACT (bit 2) in gc_flags (header byte
-        // 21) so the heap/GC treat it as compact. Write a dword at offset 20
-        // (gc_age=0, gc_flags=COMPACT, _gc_reserved=0); legacy objects write 0.
-        // GC_FLAG_COMPACT (0x04) << 8 == 0x400 places it at byte 21.
+        // Compact object: set GC_FLAG_COMPACT (bit 2) in the gc_flags byte.
         if let Some(body) = compact_body {
             if std::env::var_os("CRATONVM_DBG_COMPACT_INLINE").is_some() {
                 eprintln!(
@@ -15054,23 +15105,37 @@ impl Compiler {
             }
             self.emit_mov_dword_mem_disp32_imm32(
                 R11,
-                20,
-                (cratonvm_types::GC_FLAG_COMPACT as i32) << 8,
+                4,
+                (cratonvm_types::GC_FLAG_COMPACT as i32) << 24,
             );
-        } else {
-            self.emit_mov_dword_mem_disp32_imm32(R11, 20, 0);
         }
         // default-on hardening (bt18-inline-tlab-regression-20260724): the
         // "TLAB refill zeroes the region" assumption was empirically violated
         // once already (the offset-4/12 incident above), so with this path
         // default-on NO header field may depend on it. forwarding_ptr
-        // (24..32) and mark_word (32..40, MARK_NEUTRAL == 0) are written
+        // (16..24) and mark_word (24..32, MARK_NEUTRAL == 0) are written
         // explicitly as dword pairs (no qword-imm store emitter; four dwords
         // per `new` is negligible vs. a helper call).
-        self.emit_mov_dword_mem_disp32_imm32(R11, 24, 0);
-        self.emit_mov_dword_mem_disp32_imm32(R11, 28, 0);
-        self.emit_mov_dword_mem_disp32_imm32(R11, 32, 0);
-        self.emit_mov_dword_mem_disp32_imm32(R11, 36, 0);
+        self.emit_mov_dword_mem_disp32_imm32(
+            R11,
+            cratonvm_types::FORWARDING_PTR_OFFSET as i32,
+            0,
+        );
+        self.emit_mov_dword_mem_disp32_imm32(
+            R11,
+            cratonvm_types::FORWARDING_PTR_OFFSET as i32 + 4,
+            0,
+        );
+        self.emit_mov_dword_mem_disp32_imm32(
+            R11,
+            cratonvm_types::MARK_WORD_OFFSET as i32,
+            0,
+        );
+        self.emit_mov_dword_mem_disp32_imm32(
+            R11,
+            cratonvm_types::MARK_WORD_OFFSET as i32 + 4,
+            0,
+        );
 
         // Commit the bump LAST: [R10 + cursor_off] = RAX. This publishes the
         // object's end as the new cursor (and, transitively, the object's
@@ -21812,10 +21877,8 @@ impl Compiler {
                         // packed byte offset + ref-ness were resolved at compile
                         // time, so emit a raw MOV (no helper call, no runtime
                         // layout lookup). A reference field is the bare 8-byte
-                        // pointer AT the cell (0 = null, matching the helper's
-                        // `Object(None) => 0`); a primitive field keeps its
-                        // 16-byte cell, payload at the same +4/+8 within-cell
-                        // offsets as the legacy path.
+                        // pointer AT the field; primitives are their tagless
+                        // descriptor width (1/2/4/8 bytes).
                         //
                         // CRITICAL: a class with a registered compact layout may
                         // still have LEGACY-laid-out (16-byte-cell) instances —
@@ -21870,7 +21933,11 @@ impl Compiler {
                         };
                         // Per-object compactness: gc_flags byte @21 & GC_FLAG_COMPACT.
                         // Zero ⇒ legacy 16-byte-cell object → uniform-layout read.
-                        self.emit_mov_r32_mem_disp32(RCX, RAX, 21);
+                        self.emit_mov_r32_mem_disp32(
+                            RCX,
+                            RAX,
+                            cratonvm_types::GC_FLAGS_OFFSET as i32,
+                        );
                         self.emit_and_r64_imm8(RCX, cratonvm_types::GC_FLAG_COMPACT as i8);
                         let legacy_patch = self.emit_jcc_rel32_patch(0x84); // JZ → legacy
                                                                             // --- compact path (8-byte ref / packed primitive cell) ---
@@ -21880,11 +21947,7 @@ impl Compiler {
                         } else {
                             match type_tag {
                                 b'J' | b'D' => {
-                                    self.emit_mov_r64_mem_disp32(
-                                        RAX,
-                                        RAX,
-                                        cell_off + FIELD_CELL_PAYLOAD64_OFFSET as i32,
-                                    );
+                                    self.emit_mov_r64_mem_disp32(RAX, RAX, cell_off);
                                 }
                                 b'L' | b'[' => {
                                     // Defense-in-depth: contradictory metadata
@@ -21901,18 +21964,22 @@ impl Compiler {
                                     );
                                 }
                                 b'F' => {
-                                    self.emit_mov_r32_mem_disp32(
-                                        RAX,
-                                        RAX,
-                                        cell_off + FIELD_CELL_PAYLOAD32_OFFSET as i32,
-                                    );
+                                    self.emit_mov_r32_mem_disp32(RAX, RAX, cell_off);
                                 }
+                                b'Z' => self.emit_movx_r64_mem_disp32(
+                                    RAX, RAX, cell_off, 8, false,
+                                ),
+                                b'B' => self.emit_movx_r64_mem_disp32(
+                                    RAX, RAX, cell_off, 8, true,
+                                ),
+                                b'C' => self.emit_movx_r64_mem_disp32(
+                                    RAX, RAX, cell_off, 16, false,
+                                ),
+                                b'S' => self.emit_movx_r64_mem_disp32(
+                                    RAX, RAX, cell_off, 16, true,
+                                ),
                                 _ => {
-                                    self.emit_movsxd_r64_mem_disp32(
-                                        RAX,
-                                        RAX,
-                                        cell_off + FIELD_CELL_PAYLOAD32_OFFSET as i32,
-                                    );
+                                    self.emit_movsxd_r64_mem_disp32(RAX, RAX, cell_off);
                                 }
                             }
                         }
@@ -22073,7 +22140,11 @@ impl Compiler {
                             // registered compact offset (or the class layout didn't
                             // match), so the uniform 16-byte-cell load below is only
                             // valid for a legacy-laid-out object. gc_flags byte @21.
-                            self.emit_mov_r32_mem_disp32(RCX, RAX, 21);
+                            self.emit_mov_r32_mem_disp32(
+                                RCX,
+                                RAX,
+                                cratonvm_types::GC_FLAGS_OFFSET as i32,
+                            );
                             self.emit_and_r64_imm8(RCX, cratonvm_types::GC_FLAG_COMPACT as i8);
                             slow_patches.push(self.emit_jcc_rel32_patch(0x85)); // JNZ
                         }
@@ -22308,11 +22379,19 @@ impl Compiler {
                                 // this the compact-offset old-value read + store would
                                 // scribble a pointer into the wrong bytes of a legacy
                                 // object → heap corruption / SIGSEGV.
-                                self.emit_mov_r32_mem_disp32(RCX, RAX, 21);
+                                self.emit_mov_r32_mem_disp32(
+                                    RCX,
+                                    RAX,
+                                    cratonvm_types::GC_FLAGS_OFFSET as i32,
+                                );
                                 self.emit_and_r64_imm8(RCX, cratonvm_types::GC_FLAG_COMPACT as i8);
                                 bail.push(self.emit_jcc_rel32_patch(0x84)); // JZ not-compact → helper
                                                                             // old-gen receiver → helper (card). gc_flags @21 bit0.
-                                self.emit_mov_r32_mem_disp32(RCX, RAX, 21);
+                                self.emit_mov_r32_mem_disp32(
+                                    RCX,
+                                    RAX,
+                                    cratonvm_types::GC_FLAGS_OFFSET as i32,
+                                );
                                 self.emit_and_r64_imm8(RCX, 1);
                                 bail.push(self.emit_jcc_rel32_patch(0x85)); // JNZ old-gen
                                                                             // non-null OLD value → helper (SATB). The old ref
@@ -22320,8 +22399,12 @@ impl Compiler {
                                 self.emit_mov_r64_mem_disp32(RCX, RAX, cell_off);
                                 self.emit_test_r64_r64(RCX);
                                 bail.push(self.emit_jcc_rel32_patch(0x85)); // JNZ non-null old
-                                                                            // bounds: field_index < num_slots (header u32 @16).
-                                self.emit_mov_r32_mem_disp32(RCX, RAX, 16);
+                                                                            // bounds: field_index < num_slots (header u32 @12).
+                                self.emit_mov_r32_mem_disp32(
+                                    RCX,
+                                    RAX,
+                                    cratonvm_types::NUM_SLOTS_OFFSET as i32,
+                                );
                                 self.emit_mov_imm64(RDX, field_index as i64);
                                 self.emit_cmp_r32_r32(RDX, RCX);
                                 let oob = self.emit_jcc_rel32_patch(0x83); // JAE → drop
@@ -22367,8 +22450,12 @@ impl Compiler {
                                     )
                                 });
                                 // old-gen receiver → helper (card barrier). gc_flags is
-                                // the byte at header offset 21; GC_FLAG_OLD_GEN == bit 0.
-                                self.emit_mov_r32_mem_disp32(RCX, RAX, 21);
+                                // the exported gc_flags byte; GC_FLAG_OLD_GEN == bit 0.
+                                self.emit_mov_r32_mem_disp32(
+                                    RCX,
+                                    RAX,
+                                    cratonvm_types::GC_FLAGS_OFFSET as i32,
+                                );
                                 self.emit_and_r64_imm8(RCX, 1);
                                 bail.push(self.emit_jcc_rel32_patch(0x85)); // JNZ old-gen
                                                                             // non-null OLD value → helper (SATB). Read the cell's
@@ -22380,10 +22467,14 @@ impl Compiler {
                                 );
                                 self.emit_test_r64_r64(RCX);
                                 bail.push(self.emit_jcc_rel32_patch(0x85)); // JNZ non-null old
-                                                                            // bounds: field_index < num_slots (header u32 @16).
+                                                                            // bounds: field_index < num_slots (header u32 @12).
                                                                             // 32-bit compare — an 8-byte read would fold in the
                                                                             // adjacent gc_age/gc_flags bytes.
-                                self.emit_mov_r32_mem_disp32(RCX, RAX, 16); // RCX = num_slots
+                                self.emit_mov_r32_mem_disp32(
+                                    RCX,
+                                    RAX,
+                                    cratonvm_types::NUM_SLOTS_OFFSET as i32,
+                                );
                                 self.emit_mov_imm64(RDX, field_index as i64); // RDX = field_index
                                 self.emit_cmp_r32_r32(RDX, RCX); // cmp field_index, num_slots
                                 let oob = self.emit_jcc_rel32_patch(0x83); // JAE → out of bounds, drop
@@ -29031,8 +29122,9 @@ mod tests {
     // SAFETY: obj_ptr points to a live, properly aligned ObjectHeader (repr(C)); reading the
     // u32 num_slots field at its fixed offset is in-bounds and the object is not freed.
     unsafe fn read_num_slots(obj_ptr: *const u8) -> u32 {
-        let num_slots_offset = std::mem::offset_of!(cratonvm_types::ObjectHeader, num_slots);
-        std::ptr::read(obj_ptr.add(num_slots_offset) as *const u32) // Cast: address arithmetic
+        std::ptr::read(
+            obj_ptr.add(cratonvm_types::NUM_SLOTS_OFFSET) as *const u32
+        )
     }
 
     // SAFETY: Called from JIT-compiled code which passes a valid heap-allocated object pointer
@@ -39299,7 +39391,7 @@ mod tests {
     // raw loads from the array header/data region with no helper `CALL`
     // on the fast path:
     //   - length:  MOV EAX, [array + ARRAY_LENGTH_OFFSET(12)]
-    //   - element: load from [array + HEADER_SIZE(40) + idx*scale]
+    //   - element: load from [array + HEADER_SIZE + idx*scale]
     //     with scale 1/2/4/8 and the correct sign/zero extension.
     // The two exception edges (null-array NPE, out-of-bounds AIOOBE)
     // still funnel through the shared deopt stubs, which call the

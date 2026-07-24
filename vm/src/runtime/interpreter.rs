@@ -2874,21 +2874,15 @@ fn tlab_alloc_object_inner(
 #[inline(always)]
 fn init_object_header(ptr: *mut u8, class_id: ClassId, num_fields: usize, identity_hash_code: i32) {
     use cratonvm_gc::heap::{ArrayElementType, ObjectHeader, ObjectKind};
-    let header = ObjectHeader {
+    let header = ObjectHeader::new(
         class_id,
-        kind: ObjectKind::Object,
-        element_type: ArrayElementType::Reference,
-        _padding: [0; 2],
+        ObjectKind::Object,
+        ArrayElementType::Reference,
         identity_hash_code,
-        array_length: 0,
+        0,
         // Truncation-checked: num_fields (usize) to u32; JVM classes have < 2^16 fields
-        num_slots: u32::try_from(num_fields).unwrap_or(u32::MAX),
-        gc_age: 0,
-        gc_flags: 0,
-        _gc_reserved: [0; 2],
-        forwarding_ptr: std::ptr::null_mut(),
-        mark_word: std::sync::atomic::AtomicU64::new(cratonvm_types::MARK_NEUTRAL),
-    };
+        u32::try_from(num_fields).expect("object field count exceeds u32"),
+    );
     // SAFETY: ptr points to freshly allocated, properly aligned memory for an ObjectHeader.
     unsafe { std::ptr::write(ptr as *mut ObjectHeader, header) };
     // A2 breadcrumb (CRATONVM_DBG_A2): the interpreter TLAB fast path bypasses
@@ -3922,7 +3916,7 @@ pub(crate) fn apply_pointer_map_to_thread(
                     if a != 0 {
                         // SAFETY: `a` is a non-null heap address from a live Object local; reading its ObjectHeader is valid for the lifetime of the borrow.
                         let h = unsafe { &*(a as *const ObjectHeader) };
-                        if h.class_id.as_u32() == 0 && h.num_slots == 0 && h.array_length == 0 {
+                        if h.class_id.as_u32() == 0 && h.num_slots() == 0 && h.array_length() == 0 {
                             eprintln!(
                                 "POST-GC ZERO-HEADER PARKED tid={} frame[{}] {}.{} local[{}] pc={} addr=0x{:x}",
                                 tname, fi, cn, mn, li, frame.pc, a
@@ -3939,7 +3933,7 @@ pub(crate) fn apply_pointer_map_to_thread(
                 if a != 0 {
                     // SAFETY: `a` is a non-null heap address from a live Object stack slot; reading its ObjectHeader is valid for the lifetime of the borrow.
                     let h = unsafe { &*(a as *const ObjectHeader) };
-                    if h.class_id.as_u32() == 0 && h.num_slots == 0 && h.array_length == 0 {
+                    if h.class_id.as_u32() == 0 && h.num_slots() == 0 && h.array_length() == 0 {
                         eprintln!(
                             "POST-GC ZERO-HEADER PARKED-STACK tid={} frame[{}] {}.{} pc={} addr=0x{:x}",
                             tname, fi, cn, mn, frame.pc, a
@@ -14801,7 +14795,7 @@ fn execute_instruction(
                             // Cast: object/code pointer to integer address
                             obj_ref.as_ptr() as usize,
                             field.field_index,
-                            shared.heap.get_header(obj_ref).num_slots,
+                            shared.heap.get_header(obj_ref).num_slots(),
                             matches!(raw, Value::Object(Some(_))),
                             thread.frames[frame_idx].class_name(),
                         );
@@ -14858,7 +14852,7 @@ fn execute_instruction(
                     // container with fields.
                     if p != 0 && shared.heap.is_heap_addr(p).is_some() {
                         let h = shared.heap.get_header(obj_ref);
-                        if h.class_id.as_u32() == 0 && h.num_slots == 0 {
+                        if h.class_id.as_u32() == 0 && h.num_slots() == 0 {
                             use std::sync::atomic::{AtomicUsize, Ordering};
                             static NZ: AtomicUsize = AtomicUsize::new(0);
                             let n = NZ.fetch_add(1, Ordering::Relaxed);
@@ -15305,7 +15299,7 @@ fn execute_instruction(
                             // Cast: object/code pointer to integer address
                             obj_ref.as_ptr() as usize,
                             field.field_index,
-                            shared.heap.get_header(obj_ref).num_slots,
+                            shared.heap.get_header(obj_ref).num_slots(),
                             matches!(value, Value::Object(Some(_))),
                             thread.frames[frame_idx].class_name(),
                         );
@@ -15323,8 +15317,8 @@ fn execute_instruction(
                 if straystack_enabled() {
                     let h = shared.heap.get_header(obj_ref);
                     // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
-                    let ns = h.num_slots as usize;
-                    if field.field_index >= ns || h.num_slots > (1 << 24) {
+                    let ns = h.num_slots() as usize;
+                    if field.field_index >= ns || h.num_slots() > (1 << 24) {
                         use std::sync::atomic::{AtomicUsize, Ordering};
                         static N: AtomicUsize = AtomicUsize::new(0);
                         let k = N.fetch_add(1, Ordering::Relaxed);
@@ -15335,7 +15329,7 @@ fn execute_instruction(
                             // Cast: object/code pointer to integer address
                             obj_ref.as_ptr() as usize,
                             // Truncation: integer -> u8 (intentional low 8 bits)
-                            h.class_id.as_u32(), h.num_slots, h.array_length, h.kind as u8,
+                            h.class_id.as_u32(), h.num_slots(), h.array_length(), h.kind as u8,
                             field_name.as_deref().unwrap_or("?"),
                             field.field_index, field.is_reference, value,
                         );
@@ -45642,7 +45636,7 @@ mod tests {
         let header = unsafe { std::ptr::read(ptr as *const ObjectHeader) };
         assert_eq!(header.class_id, ClassId::new(0));
         assert_eq!(header.identity_hash_code, supplied_hash);
-        assert_eq!(header.num_slots, 0);
+        assert_eq!(header.num_slots(), 0);
 
         // First 16 bytes: must NOT be all-zero, since identity_hash_code
         // is at byte offset 8..12 and is non-zero. This is the invariant

@@ -946,35 +946,11 @@ impl SharedVm {
     pub fn new(mut config: VmConfig) -> Self {
         apply_container_default_heap(&mut config);
 
-        // GC-audit finding 1 "single-threaded component" (BinaryTrees G1+JIT
-        // wrong totals) — ROOT CAUSE: the compact reference-field layout
-        // (`CRATONVM_COMPACT_REF_FIELDS`, default-on) is only implemented
-        // end-to-end by the GENERATIONAL backend. G1's `get_field`/`set_field`
-        // (and the volatile variants) compute `index * SLOT_SIZE`
-        // unconditionally — zero `GC_FLAG_COMPACT` awareness — while the
-        // backend-agnostic JIT inline-TLAB allocation and `jit_tlab_post_init`
-        // happily mark fresh objects compact. Under G1+JIT every compact-
-        // marked object is then WRITTEN as legacy 16-byte cells through
-        // `heap.set_field` (stomping the neighbouring object for the higher
-        // field indices) and READ as bare-8-byte compact slots by
-        // `jit_getfield`, whose plausibility gate degrades the mis-read tag
-        // word to null — `Node.l == null` for every JIT-built tree, plus the
-        // occasional NPE/wild ref from the crossed slots. Interpreter-only
-        // runs are self-consistently legacy, which is why `--nojit` was exact.
-        //
-        // Until G1 (and ZGC) grow real compact-layout support in their field
-        // accessors, evacuation scanners, and allocators, pin the process to
-        // the legacy layout whenever the selected backend is not Generational.
-        // First-set-wins: this runs before any classloading can populate the
-        // compact layout registry or any JIT compile can bake a compact body
-        // size, so the whole process is uniformly legacy — the exact
-        // (validated) behaviour of `CRATONVM_COMPACT_REF_FIELDS=0`.
-        if !matches!(
-            config.gc_algorithm,
-            crate::config::GcAlgorithm::Generational
-        ) {
-            cratonvm_types::set_compact_ref_fields_enabled(false);
-        }
+        // Compact tagless field layouts are a VM-wide contract. Generational,
+        // G1, and ZGC now share the same allocation predicate, field encoding,
+        // oop-map scan, and relocation fixup; no collector-specific opt-out is
+        // permitted because it would let JIT-baked offsets disagree with heap
+        // storage.
 
         #[cfg(feature = "experimental-debug")]
         let mut jvmti_env = crate::jvmti::create_jvmti_env();
@@ -6100,7 +6076,7 @@ impl crate::runtime::serviceability::VmDiagnosticState for SharedVm {
                     class_id: header.class_id.as_u32(),
                     is_array: header.kind == ObjectKind::Array,
                     element_type: header.element_type as u8,
-                    array_length: header.array_length,
+                    array_length: header.array_length(),
                     total_size: size,
                     data_ptr: ptr as *const u8,
                 }
@@ -6443,7 +6419,7 @@ mod tests {
         let header = shared.heap.get_header(lock);
 
         assert_eq!(header.class_id, object_id);
-        assert_eq!(header.num_slots, 0);
+        assert_eq!(header.num_slots(), 0);
     }
 
     // -----------------------------------------------------------------------
@@ -6458,8 +6434,8 @@ mod tests {
         let err_header = shared.heap.get_header(err);
         assert_ne!(out.as_ptr(), err.as_ptr());
         assert_eq!(out_header.class_id, err_header.class_id);
-        assert!(out_header.num_slots >= 1);
-        assert!(err_header.num_slots >= 1);
+        assert!(out_header.num_slots() >= 1);
+        assert!(err_header.num_slots() >= 1);
 
         // Synthetic PrintStream uses slot 0 as its stdout/stderr descriptor.
         // In the real JDK, that slot is FilterOutputStream.out (a reference),

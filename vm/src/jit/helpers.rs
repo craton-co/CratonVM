@@ -2187,8 +2187,10 @@ unsafe fn jit_newarray_finish(obj_ref: ObjectRef, atype: i64, length: i64) -> i6
         let class_id_raw = std::ptr::read(raw as *const u32);
         let kind_byte = *raw.add(4);
         let elem_byte = *raw.add(5);
-        let stored_len = std::ptr::read(raw.add(12) as *const u32);
-        let num_slots = std::ptr::read(raw.add(16) as *const u32);
+        let stored_len =
+            std::ptr::read(raw.add(cratonvm_types::ARRAY_LENGTH_OFFSET) as *const u32);
+        let num_slots =
+            std::ptr::read(raw.add(cratonvm_types::NUM_SLOTS_OFFSET) as *const u32);
         eprintln!(
             "[JIT-NA] ptr={:p} atype={} len={} cid={} kind={} elem={} arrlen={} num_slots={}",
             raw, atype, length, class_id_raw, kind_byte, elem_byte, stored_len, num_slots
@@ -2247,7 +2249,7 @@ pub unsafe extern "C" fn jit_post_tlab_init(
     //   off  6: padding (2)              — already zero
     //   off  8: identity_hash_code (4)
     //   off 12: array_length (4)         — already zero
-    //   off 16: num_slots (4)
+    //   off 12: shape / full num_slots (4)
     //   off 20: gc_age + gc_flags + _gc_reserved — already zero
     //   off 24: forwarding_ptr (8)       — already zero
     //   off 32: mark_word (8)            — already zero == MARK_NEUTRAL
@@ -2272,16 +2274,16 @@ pub unsafe extern "C" fn jit_post_tlab_init(
     } else {
         None
     };
-    if let Some(body) = compact_body {
-        *(raw_ptr.add(12) as *mut u32) = body;
-        // gc_flags byte at offset 21 (leave gc_age@20 / _gc_reserved@22-23 zero).
-        *(raw_ptr.add(21) as *mut u8) = cratonvm_types::GC_FLAG_COMPACT;
+    let shape = if compact_body.is_some() {
+        *(raw_ptr.add(cratonvm_types::GC_FLAGS_OFFSET) as *mut u8) =
+            cratonvm_types::GC_FLAG_COMPACT;
+        num_fields as u32
     } else {
-        *(raw_ptr.add(12) as *mut u32) = 0;
-    }
+        num_fields as u32
+    };
+    *(raw_ptr.add(cratonvm_types::NUM_SLOTS_OFFSET) as *mut u32) = shape;
     let hash = vm.heap.next_identity_hash();
     *(raw_ptr.add(8) as *mut i32) = hash;
-    *(raw_ptr.add(16) as *mut u32) = num_fields as u32;
 
     // Family-A forensics (CRATONVM_DBG_A2, default-inert): record the
     // JIT-inline allocation into the a2dbg breadcrumb ring, exactly like the
@@ -3220,17 +3222,29 @@ pub unsafe extern "C" fn jit_arraylength(array_ptr: i64) -> i64 {
 #[inline]
 // SAFETY: callers validate that `obj_ptr` names a live object before using
 // the compact-layout metadata derived from its header.
-unsafe fn jit_compact_field_slot(obj_ptr: i64, field_index: i64) -> Option<(usize, bool)> {
+unsafe fn jit_compact_field_slot(
+    obj_ptr: i64,
+    field_index: i64,
+) -> Option<(usize, cratonvm_types::FieldStorageKind)> {
     if field_index < 0 {
         return None;
     }
-    // GC_FLAG_COMPACT is the gc_flags byte at header offset 21.
-    let gc_flags = std::ptr::read((obj_ptr as *const u8).add(21));
+    // GC_FLAG_COMPACT is in the exported gc_flags byte.
+    let gc_flags = std::ptr::read(
+        (obj_ptr as *const u8).add(cratonvm_types::GC_FLAGS_OFFSET)
+    );
     if gc_flags & cratonvm_types::GC_FLAG_COMPACT == 0 {
         return None;
     }
     let class_id = std::ptr::read(obj_ptr as *const u32); // class_id @ offset 0
-    cratonvm_types::compact_field_slot(class_id, field_index as usize)
+    let field_count = std::ptr::read(
+        (obj_ptr as *const u8).add(cratonvm_types::NUM_SLOTS_OFFSET) as *const u32,
+    );
+    let layout = cratonvm_types::class_layout_for_fields(class_id, field_count)?;
+    Some((
+        layout.field_offset(field_index as usize)? as usize,
+        layout.field_storage(field_index as usize)?,
+    ))
 }
 
 /// Byte pointer to a **primitive** field's 16-byte cell, honouring the compact
@@ -3243,12 +3257,15 @@ unsafe fn jit_compact_field_slot(obj_ptr: i64, field_index: i64) -> Option<(usiz
 #[inline]
 // SAFETY: callers bounds-check `field_index`, so the returned address remains
 // within the live object's allocated field storage.
-unsafe fn jit_field_cell_ptr(obj_ptr: i64, field_index: i64) -> *mut u8 {
-    let off = match jit_compact_field_slot(obj_ptr, field_index) {
-        Some((o, _)) => o,
-        None => field_index as usize * SLOT_SIZE,
+unsafe fn jit_field_cell_ptr(
+    obj_ptr: i64,
+    field_index: i64,
+) -> (*mut u8, Option<cratonvm_types::FieldStorageKind>) {
+    let (off, storage) = match jit_compact_field_slot(obj_ptr, field_index) {
+        Some((o, storage)) => (o, Some(storage)),
+        None => (field_index as usize * SLOT_SIZE, None),
     };
-    (obj_ptr as *mut u8).add(HEADER_SIZE + off)
+    ((obj_ptr as *mut u8).add(HEADER_SIZE + off), storage)
 }
 
 // SAFETY: Called from JIT-compiled code. vm_ptr must be a valid SharedVm pointer.
@@ -3299,10 +3316,10 @@ pub unsafe extern "C" fn jit_getfield(vm_ptr: i64, obj_ptr: i64, field_index: i6
     // Compact layout: a reference field is a bare 8-byte pointer (0 = null,
     // matching the legacy `Object(Some(r)) => r.as_ptr()` / `Object(None) => 0`
     // result); a primitive field stays a 16-byte cell at its packed offset.
-    if let Some((off, is_ref)) = jit_compact_field_slot(obj_ptr, field_index) {
+    if let Some((off, storage)) = jit_compact_field_slot(obj_ptr, field_index) {
         // SAFETY: off is within the object body (field_index < num_slots).
         let ptr = (obj_ptr as *const u8).add(HEADER_SIZE + off);
-        if is_ref {
+        if storage.is_reference() {
             // Degrade an implausible reference (stale/garbage from a GC
             // root-coverage gap) to null instead of handing the JIT bits it
             // will later deref → SIGSEGV. Mirrors `read_prim_element`'s
@@ -3326,7 +3343,11 @@ pub unsafe extern "C" fn jit_getfield(vm_ptr: i64, obj_ptr: i64, field_index: i6
         // `firstReaderHoldCount`) -- see
         // docs/known-issues/elasticsearch-lucene-binary-docvalues-range-hangs.md
         // #3 for the interpreter-side counterpart of this same gap.
-        let val: Value = cratonvm_types::read_value_atomic(ptr as *const Value);
+        let val: Value = cratonvm_types::read_compact_field(
+            ptr,
+            storage,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         return match val {
             Value::Int(i) => i as i64,
             Value::Long(l) => l,
@@ -3394,8 +3415,10 @@ unsafe fn jit_putfield_slot_in_bounds(obj_ptr: i64, field_index: i64) -> bool {
     if field_index < 0 {
         return false;
     }
-    // off 16: num_slots (u32).
-    let num_slots = std::ptr::read((obj_ptr as *const u8).add(16) as *const u32);
+    // shape/num_slots is a u32 at the exported NUM_SLOTS_OFFSET.
+    let num_slots = std::ptr::read(
+        (obj_ptr as *const u8).add(cratonvm_types::NUM_SLOTS_OFFSET) as *const u32
+    );
     (field_index as u64) < num_slots as u64
 }
 
@@ -3440,10 +3463,18 @@ pub unsafe extern "C" fn jit_putfield_int(obj_ptr: i64, field_index: i64, val: i
     }
     // SAFETY: obj_ptr is non-null, field slot is within the object's allocated
     // region; `jit_field_cell_ptr` packs the offset for a compact object.
-    let ptr = jit_field_cell_ptr(obj_ptr, field_index);
+    let (ptr, storage) = jit_field_cell_ptr(obj_ptr, field_index);
     if crate::runtime::env_cache::jit_pfi_trace() {
         // Read existing value to see if we're overwriting a ref with an int
-        let existing = std::ptr::read(ptr as *const Value);
+        let existing = if let Some(storage) = storage {
+            cratonvm_types::read_compact_field(
+                ptr,
+                storage,
+                std::sync::atomic::Ordering::Relaxed,
+            )
+        } else {
+            cratonvm_types::read_value_atomic(ptr as *const Value)
+        };
         let cid_off = obj_ptr as *const u8;
         let cid: u32 = std::ptr::read(cid_off as *const u32);
         eprintln!("[JIT-PFI] obj=0x{:x} class_id={} field_index={} val=0x{:x} (val_as_i32={}) prev_value={:?}",
@@ -3452,7 +3483,16 @@ pub unsafe extern "C" fn jit_putfield_int(obj_ptr: i64, field_index: i64, val: i
     // Atomic per-word store: the concurrent GC marker may read this 16-byte
     // slot at the same time (it scans object fields concurrently). See
     // `cratonvm_types::write_value_atomic`.
-    cratonvm_types::write_value_atomic(ptr as *mut Value, Value::Int(val as i32));
+    if let Some(storage) = storage {
+        cratonvm_types::write_compact_field(
+            ptr,
+            storage,
+            Value::Int(val as i32),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    } else {
+        cratonvm_types::write_value_atomic(ptr as *mut Value, Value::Int(val as i32));
+    }
 }
 
 // SAFETY: Called from JIT-compiled code. obj_ptr must be 0 (null) or a valid heap pointer
@@ -3474,10 +3514,19 @@ pub unsafe extern "C" fn jit_putfield_long(obj_ptr: i64, field_index: i64, val: 
     }
     // SAFETY: obj_ptr is non-null, field slot is within the object's allocated
     // region; `jit_field_cell_ptr` packs the offset for a compact object.
-    let ptr = jit_field_cell_ptr(obj_ptr, field_index);
+    let (ptr, storage) = jit_field_cell_ptr(obj_ptr, field_index);
     // Atomic per-word store (concurrent-GC torn-read safety; see
     // `write_value_atomic`).
-    cratonvm_types::write_value_atomic(ptr as *mut Value, Value::Long(val));
+    if let Some(storage) = storage {
+        cratonvm_types::write_compact_field(
+            ptr,
+            storage,
+            Value::Long(val),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    } else {
+        cratonvm_types::write_value_atomic(ptr as *mut Value, Value::Long(val));
+    }
 }
 
 // SAFETY: Called from JIT-compiled code. obj_ptr must be 0 (null) or a valid heap pointer
@@ -3499,10 +3548,20 @@ pub unsafe extern "C" fn jit_putfield_float(obj_ptr: i64, field_index: i64, val:
     }
     // SAFETY: obj_ptr is non-null, field slot is within the object's allocated
     // region; `jit_field_cell_ptr` packs the offset for a compact object.
-    let ptr = jit_field_cell_ptr(obj_ptr, field_index);
+    let (ptr, storage) = jit_field_cell_ptr(obj_ptr, field_index);
     // Atomic per-word store (concurrent-GC torn-read safety; see
     // `write_value_atomic`).
-    cratonvm_types::write_value_atomic(ptr as *mut Value, Value::Float(f32::from_bits(val as u32)));
+    let value = Value::Float(f32::from_bits(val as u32));
+    if let Some(storage) = storage {
+        cratonvm_types::write_compact_field(
+            ptr,
+            storage,
+            value,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    } else {
+        cratonvm_types::write_value_atomic(ptr as *mut Value, value);
+    }
 }
 
 // SAFETY: Called from JIT-compiled code. obj_ptr must be 0 (null) or a valid heap pointer
@@ -3524,13 +3583,20 @@ pub unsafe extern "C" fn jit_putfield_double(obj_ptr: i64, field_index: i64, val
     }
     // SAFETY: obj_ptr is non-null, field slot is within the object's allocated
     // region; `jit_field_cell_ptr` packs the offset for a compact object.
-    let ptr = jit_field_cell_ptr(obj_ptr, field_index);
+    let (ptr, storage) = jit_field_cell_ptr(obj_ptr, field_index);
     // Atomic per-word store (concurrent-GC torn-read safety; see
     // `write_value_atomic`).
-    cratonvm_types::write_value_atomic(
-        ptr as *mut Value,
-        Value::Double(f64::from_bits(val as u64)),
-    );
+    let value = Value::Double(f64::from_bits(val as u64));
+    if let Some(storage) = storage {
+        cratonvm_types::write_compact_field(
+            ptr,
+            storage,
+            value,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    } else {
+        cratonvm_types::write_value_atomic(ptr as *mut Value, value);
+    }
 }
 
 // SAFETY: Called from JIT-compiled code. vm_ptr must be a valid SharedVm pointer.
@@ -3609,7 +3675,11 @@ pub unsafe extern "C" fn jit_putfield_object(
     // Compact layout: reference fields are bare 8-byte pointers. Preserve the
     // SATB pre-barrier on the old 8-byte ref, then route through the heap's
     // compact-aware `set_field` (8-byte store + generational card barrier).
-    if let Some((off, _is_ref)) = jit_compact_field_slot(obj_ptr, field_index) {
+    if let Some((off, storage)) = jit_compact_field_slot(obj_ptr, field_index) {
+        if !storage.is_reference() {
+            heap_from_vm(vm_ptr).set_field(obj_ref, field_index as usize, value);
+            return;
+        }
         let heap = heap_from_vm(vm_ptr);
         // SAFETY: `off` is within the object body (slot bounds-checked above).
         let old_raw: u64 =
@@ -4590,11 +4660,21 @@ pub unsafe extern "C" fn jit_throw_aioobe(
             let kind = std::ptr::read_unaligned(base.add(4) as *const u8);
             let elem_ty = std::ptr::read_unaligned(base.add(5) as *const u8);
             let ident_hash = std::ptr::read_unaligned(base.add(8) as *const i32);
-            let arr_len_hdr = std::ptr::read_unaligned(base.add(12) as *const u32);
-            let num_slots = std::ptr::read_unaligned(base.add(16) as *const u32);
-            let gc_age = std::ptr::read_unaligned(base.add(21) as *const u8);
-            let gc_flags = std::ptr::read_unaligned(base.add(22) as *const u8);
-            let fwd_ptr = std::ptr::read_unaligned(base.add(24) as *const usize);
+            let arr_len_hdr = std::ptr::read_unaligned(
+                base.add(cratonvm_types::ARRAY_LENGTH_OFFSET) as *const u32
+            );
+            let num_slots = std::ptr::read_unaligned(
+                base.add(cratonvm_types::NUM_SLOTS_OFFSET) as *const u32
+            );
+            let gc_age = std::ptr::read_unaligned(
+                base.add(cratonvm_types::GC_AGE_OFFSET) as *const u8
+            );
+            let gc_flags = std::ptr::read_unaligned(
+                base.add(cratonvm_types::GC_FLAGS_OFFSET) as *const u8
+            );
+            let fwd_ptr = std::ptr::read_unaligned(
+                base.add(cratonvm_types::FORWARDING_PTR_OFFSET) as *const usize
+            );
             eprintln!(
                 "[AIOOBE3-DIAG] bci={bytecode_pc} jit-reported index={index} length={length} array_ptr={array_ptr:#x} \
 header: class_id={class_id} kind={kind} elem_ty={elem_ty} ident_hash={ident_hash} \

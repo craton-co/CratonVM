@@ -223,8 +223,8 @@ pub fn collect(from_space: &mut Arena, to_space: &mut Arena, roots: &mut [Object
                 scan_cursor,
                 total_size,
                 header.kind as u8,
-                header.num_slots,
-                header.array_length,
+                header.num_slots(),
+                header.array_length(),
                 to_space.used(),
             );
             break;
@@ -234,7 +234,7 @@ pub fn collect(from_space: &mut Arena, to_space: &mut Arena, roots: &mut [Object
         if header.kind == ObjectKind::Array {
             // Reference arrays use compact 8-byte pointer storage (REF_ELEMENT_SIZE).
             if header.element_type == ArrayElementType::Reference {
-                for i in 0..header.array_length as usize {
+                for i in 0..header.array_length() as usize {
                     // SAFETY: i < array_length, so HEADER_SIZE + i * REF_ELEMENT_SIZE
                     // is within the allocated object bounds.
                     let s_ptr = unsafe { obj_ptr.add(HEADER_SIZE + i * REF_ELEMENT_SIZE) };
@@ -260,8 +260,29 @@ pub fn collect(from_space: &mut Arena, to_space: &mut Arena, roots: &mut [Object
                 }
             }
         } else {
-            let num_slots = header.num_slots as usize;
-            for slot_idx in 0..num_slots {
+            if cratonvm_types::is_compact_object(header) {
+                if let Some(layout) = cratonvm_types::class_layout_for_fields(
+                    header.class_id.as_u32(),
+                    header.num_slots(),
+                ) {
+                    for &offset in &layout.ref_offsets {
+                        let slot_ptr = unsafe { obj_ptr.add(HEADER_SIZE + offset as usize) };
+                        let raw = unsafe { std::ptr::read(slot_ptr as *const u64) };
+                        if raw != 0 && from_space.contains(raw as usize as *mut u8) {
+                            let new_ref_ptr = forward_object(
+                                from_space,
+                                to_space,
+                                raw as usize as *mut u8,
+                                &mut objects_copied,
+                                &mut pointer_map,
+                            );
+                            unsafe { std::ptr::write(slot_ptr as *mut u64, new_ref_ptr as u64) };
+                        }
+                    }
+                }
+            } else {
+                let num_slots = header.num_slots() as usize;
+                for slot_idx in 0..num_slots {
                 // SAFETY: slot_idx < num_slots, so the offset is within the object.
                 let slot_ptr = unsafe { obj_ptr.add(HEADER_SIZE + slot_idx * SLOT_SIZE) };
                 // SAFETY: slot_ptr points to a valid Value-sized region.
@@ -282,6 +303,7 @@ pub fn collect(from_space: &mut Arena, to_space: &mut Arena, roots: &mut [Object
                         // SAFETY: slot_ptr is a valid Value slot within the copied object.
                         unsafe { std::ptr::write(slot_ptr as *mut Value, new_value) };
                     }
+                }
                 }
             }
         }
@@ -393,9 +415,10 @@ fn try_forward_object(
             std::ptr::addr_of!((*h).kind).read(),
             std::ptr::addr_of!((*h).element_type).read(),
             std::ptr::addr_of!((*h).identity_hash_code).read(),
-            std::ptr::addr_of!((*h).array_length).read(),
-            std::ptr::addr_of!((*h).num_slots).read(),
+            0,
+            0,
         );
+        owned.shape = std::ptr::addr_of!((*h).shape).read();
         owned.gc_age = std::ptr::addr_of!((*h).gc_age).read();
         owned.gc_flags = std::ptr::addr_of!((*h).gc_flags).read();
         owned.forwarding_ptr = std::ptr::addr_of!((*h).forwarding_ptr).read();
@@ -421,8 +444,8 @@ fn try_forward_object(
                 total_size,
                 old_ptr,
                 header_copy.kind,
-                header_copy.num_slots,
-                header_copy.array_length,
+                header_copy.num_slots(),
+                header_copy.array_length(),
             ),
         });
     }
@@ -526,7 +549,7 @@ fn try_forward_object(
 /// it converts a hard process abort into a recoverable / fail-safe path.
 pub fn object_total_size(header: &ObjectHeader) -> usize {
     if header.kind == ObjectKind::Array {
-        match array_data_size(header.array_length as usize, header.element_type) {
+        match array_data_size(header.array_length() as usize, header.element_type) {
             Ok(data) => HEADER_SIZE + data,
             Err(_) => {
                 // Implausible array header — treat as corrupt. Return 0 so the
@@ -535,7 +558,7 @@ pub fn object_total_size(header: &ObjectHeader) -> usize {
                 tracing::warn!(
                     "gc: implausible array_length {} (element_type={:?}) in moving-collector \
                      object header — treating as corrupt; caller will skip/stop the walk",
-                    header.array_length,
+                    header.array_length(),
                     header.element_type,
                 );
                 0
@@ -626,8 +649,8 @@ pub fn collect_with_finalizers(
                 scan_cursor,
                 total_size,
                 header.kind as u8,
-                header.num_slots,
-                header.array_length,
+                header.num_slots(),
+                header.array_length(),
                 to_space.used(),
             );
             break;
@@ -635,7 +658,7 @@ pub fn collect_with_finalizers(
 
         if header.kind == ObjectKind::Array {
             if header.element_type == ArrayElementType::Reference {
-                for i in 0..header.array_length as usize {
+                for i in 0..header.array_length() as usize {
                     let s_ptr = unsafe { obj_ptr.add(HEADER_SIZE + i * REF_ELEMENT_SIZE) };
                     let raw: u64 = unsafe { std::ptr::read(s_ptr as *const u64) };
                     if raw != 0 {
@@ -656,8 +679,29 @@ pub fn collect_with_finalizers(
                 }
             }
         } else {
-            let num_slots = header.num_slots as usize;
-            for slot_idx in 0..num_slots {
+            if cratonvm_types::is_compact_object(header) {
+                if let Some(layout) = cratonvm_types::class_layout_for_fields(
+                    header.class_id.as_u32(),
+                    header.num_slots(),
+                ) {
+                    for &offset in &layout.ref_offsets {
+                        let slot_ptr = unsafe { obj_ptr.add(HEADER_SIZE + offset as usize) };
+                        let raw = unsafe { std::ptr::read(slot_ptr as *const u64) };
+                        if raw != 0 && from_space.contains(raw as usize as *mut u8) {
+                            let new_ref_ptr = forward_object(
+                                from_space,
+                                to_space,
+                                raw as usize as *mut u8,
+                                &mut objects_copied,
+                                &mut pointer_map,
+                            );
+                            unsafe { std::ptr::write(slot_ptr as *mut u64, new_ref_ptr as u64) };
+                        }
+                    }
+                }
+            } else {
+                let num_slots = header.num_slots() as usize;
+                for slot_idx in 0..num_slots {
                 let slot_ptr = unsafe { obj_ptr.add(HEADER_SIZE + slot_idx * SLOT_SIZE) };
                 let value = unsafe { std::ptr::read(slot_ptr as *const Value) };
                 if let Value::Object(Some(ref_obj)) = value {
@@ -676,6 +720,7 @@ pub fn collect_with_finalizers(
                             std::ptr::write(slot_ptr as *mut Value, new_value);
                         }
                     }
+                }
                 }
             }
         }
@@ -761,8 +806,8 @@ pub fn collect_with_finalizers(
                     scan_cursor,
                     total_size,
                     header.kind as u8,
-                    header.num_slots,
-                    header.array_length,
+                    header.num_slots(),
+                    header.array_length(),
                     to_space.used(),
                 );
                 scan_cursor = to_space.used();
@@ -771,7 +816,7 @@ pub fn collect_with_finalizers(
 
             if header.kind == ObjectKind::Array {
                 if header.element_type == ArrayElementType::Reference {
-                    for i in 0..header.array_length as usize {
+                    for i in 0..header.array_length() as usize {
                         let s_ptr = unsafe { obj_ptr.add(HEADER_SIZE + i * REF_ELEMENT_SIZE) };
                         let raw: u64 = unsafe { std::ptr::read(s_ptr as *const u64) };
                         if raw != 0 {
@@ -792,8 +837,32 @@ pub fn collect_with_finalizers(
                     }
                 }
             } else {
-                let num_slots = header.num_slots as usize;
-                for slot_idx in 0..num_slots {
+                if cratonvm_types::is_compact_object(header) {
+                    if let Some(layout) = cratonvm_types::class_layout_for_fields(
+                        header.class_id.as_u32(),
+                        header.num_slots(),
+                    ) {
+                        for &offset in &layout.ref_offsets {
+                            let slot_ptr =
+                                unsafe { obj_ptr.add(HEADER_SIZE + offset as usize) };
+                            let raw = unsafe { std::ptr::read(slot_ptr as *const u64) };
+                            if raw != 0 && from_space.contains(raw as usize as *mut u8) {
+                                let new_ref_ptr = forward_object(
+                                    from_space,
+                                    to_space,
+                                    raw as usize as *mut u8,
+                                    &mut objects_copied,
+                                    &mut pointer_map,
+                                );
+                                unsafe {
+                                    std::ptr::write(slot_ptr as *mut u64, new_ref_ptr as u64)
+                                };
+                            }
+                        }
+                    }
+                } else {
+                    let num_slots = header.num_slots() as usize;
+                    for slot_idx in 0..num_slots {
                     let slot_ptr = unsafe { obj_ptr.add(HEADER_SIZE + slot_idx * SLOT_SIZE) };
                     let value = unsafe { std::ptr::read(slot_ptr as *const Value) };
                     if let Value::Object(Some(ref_obj)) = value {
@@ -812,6 +881,7 @@ pub fn collect_with_finalizers(
                                 std::ptr::write(slot_ptr as *mut Value, new_value);
                             }
                         }
+                    }
                     }
                 }
             }
@@ -896,7 +966,7 @@ mod tests {
         // Read fields from to-space
         let header = unsafe { &*(new_obj.as_ptr() as *const ObjectHeader) };
         assert_eq!(header.class_id, ClassId::new(1));
-        assert_eq!(header.num_slots, 2);
+        assert_eq!(header.num_slots(), 2);
 
         // Read field values from to-space via raw pointers
         let field0_ptr = unsafe { new_obj.as_ptr().add(HEADER_SIZE) };

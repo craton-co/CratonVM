@@ -2703,7 +2703,7 @@ impl<'a> NativeContextImpl<'a> {
                 }
             }
         }
-        if header.num_slots > 3 {
+        if header.num_slots() > 3 {
             if let Value::Object(Some(task)) = self.shared.heap.get_field(thread_obj, 3) {
                 return Some(task);
             }
@@ -4643,7 +4643,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // caller's Java stack so we can trace the cached-receiver use-after-move.
         if youngscan_straystack_enabled() {
             let h = self.shared.heap.get_header(obj);
-            if index >= h.num_slots as usize || h.num_slots > (1 << 24) {
+            if index >= h.num_slots() as usize || h.num_slots() > (1 << 24) {
                 use std::sync::atomic::{AtomicUsize, Ordering};
                 static N: AtomicUsize = AtomicUsize::new(0);
                 let k = N.fetch_add(1, Ordering::Relaxed);
@@ -4667,7 +4667,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                     let rva = cb_addr.wrapping_sub(module_base);
                     eprintln!(
                         "[straystack-native] #{k} STRAY ctx.set_field recv@0x{:x} cid={} num_slots={} kind={} idx={} value={:?} CULPRIT-NATIVE={} RVA=0x{:X}",
-                        obj.as_ptr() as usize, h.class_id.as_u32(), h.num_slots, h.kind as u8, index, value, culprit, rva,
+                        obj.as_ptr() as usize, h.class_id.as_u32(), h.num_slots(), h.kind as u8, index, value, culprit, rva,
                     );
                     eprintln!("[straystack-native] Java stack (top first):");
                     for f in self.thread.frames.iter().rev().take(28) {
@@ -6117,7 +6117,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     }
 
     fn object_num_fields(&self, obj: ObjectRef) -> usize {
-        self.shared.heap.get_header(obj).num_slots as usize
+        self.shared.heap.get_header(obj).num_slots() as usize
     }
 
     fn class_num_total_fields(&self, class_id: ClassId) -> usize {
@@ -6402,7 +6402,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         //      threads created by `Thread.ofVirtual().start(r)` wouldn't
         //      release the carrier semaphore on `Thread.sleep`/`park`,
         //      starving the carrier pool under load (e.g. 10K vthreads).
-        let is_virtual_synthetic = header.num_slots >= 5
+        let is_virtual_synthetic = header.num_slots() >= 5
             && matches!(self.shared.heap.get_field(thread_obj, 4), Value::Int(1));
         let is_virtual_real_jdk = {
             let cm = self.shared.class_manager.read();
@@ -6503,7 +6503,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 .map(|c| !c.is_synthetic_stub)
                 .unwrap_or(false)
         };
-        if !is_real_jdk_thread && header.num_slots >= 3 {
+        if !is_real_jdk_thread && header.num_slots() >= 3 {
             self.shared
                 .heap
                 .set_field(thread_obj, 2, Value::Long(tid.0 as i64));

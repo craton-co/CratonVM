@@ -1080,7 +1080,7 @@ mod tests {
         assert_eq!(hdr.kind, ObjectKind::Array);
         assert_eq!(hdr.element_type, ArrayElementType::Int);
         assert_eq!(hdr.class_id, TLAB_FILLER_CLASS_ID);
-        let total = HEADER_SIZE + (hdr.array_length as usize) * 4;
+        let total = HEADER_SIZE + (hdr.array_length() as usize) * 4;
         // total should equal tail_before (no padding waste because both ends 8-aligned).
         assert_eq!(total, tail_before);
     }

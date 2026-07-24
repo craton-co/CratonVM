@@ -952,8 +952,8 @@ pub fn validate_object_sizes(shared: &crate::vm::SharedVm) {
             continue;
         }
         let cid = hdr.class_id;
-        let actual = hdr.num_slots as usize;
-        let arrlen = hdr.array_length;
+        let actual = hdr.num_slots() as usize;
+        let arrlen = hdr.array_length();
         match cm.get_class(cid) {
             Some(c) => {
                 if actual != c.num_total_fields || arrlen != 0 {
@@ -1031,8 +1031,8 @@ pub fn verify_heap_object_fields(
         let h = unsafe { &*(addr as *const ObjectHeader) };
         if h.class_id.as_u32() == 0
             && h.identity_hash_code == 0
-            && h.num_slots == 0
-            && h.array_length == 0
+            && h.num_slots() == 0
+            && h.array_length() == 0
         {
             return Some("ZEROED(reclaimed)");
         }
@@ -1066,7 +1066,7 @@ pub fn verify_heap_object_fields(
             }
         } else if hdr.kind == ObjectKind::Array && hdr.element_type == ArrayElementType::Reference {
             // Reference array (Object[]): elements are 8-byte compact pointers.
-            let len = hdr.array_length as usize;
+            let len = hdr.array_length() as usize;
             for i in 0..len {
                 let s_ptr = unsafe { (ptr as *const u8).add(HEADER_SIZE + i * REF_ELEMENT_SIZE) };
                 let raw = unsafe { std::ptr::read(s_ptr as *const u64) } as usize;
@@ -1208,8 +1208,8 @@ fn verify_no_stale_refs(
                     let h = unsafe { &*(addr as *const ObjectHeader) };
                     if h.class_id.as_u32() == 0
                         && h.identity_hash_code == 0
-                        && h.num_slots == 0
-                        && h.array_length == 0
+                        && h.num_slots() == 0
+                        && h.array_length() == 0
                     {
                         eprintln!(
                             "POST-GC ZERO-HEADER LOCAL: frame[{}] {}.{} local[{}] pc={} \
@@ -1264,8 +1264,8 @@ fn verify_no_stale_refs(
                     let h = unsafe { &*(addr as *const ObjectHeader) };
                     if h.class_id.as_u32() == 0
                         && h.identity_hash_code == 0
-                        && h.num_slots == 0
-                        && h.array_length == 0
+                        && h.num_slots() == 0
+                        && h.array_length() == 0
                     {
                         eprintln!(
                             "POST-GC ZERO-HEADER STACK: frame[{}] {}.{} stack[{}] pc={} \
@@ -1336,7 +1336,7 @@ mod tests {
         // Read fields from to-space
         let header = unsafe { &*(new_obj.as_ptr() as *const crate::memory::heap::ObjectHeader) };
         assert_eq!(header.class_id, ClassId::new(1));
-        assert_eq!(header.num_slots, 2);
+        assert_eq!(header.num_slots(), 2);
 
         // Read field values from to-space via raw pointers
         let field0_ptr = unsafe { new_obj.as_ptr().add(crate::memory::heap::HEADER_SIZE) };

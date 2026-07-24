@@ -1688,7 +1688,7 @@ impl VmHeap {
 
     /// Get the number of fields (slots) in an object.
     pub fn num_fields(&self, obj: ObjectRef) -> usize {
-        dispatch!(self, get_header(obj)).num_slots as usize
+        dispatch!(self, get_header(obj)).num_slots() as usize
     }
 
     /// Carve out a TLAB from the young generation (generational) or Eden region (G1).

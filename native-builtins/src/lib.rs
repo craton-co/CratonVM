@@ -28212,7 +28212,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // hangs permanently inside real bytecode `jdk.internal.util.ArraysSupport
     // .hashCode(Object[], int, int, int)`, called from `Arrays.hashCode` on
     // a `ParameterizedTypeImpl`'s `actualTypeArguments`. This native
-    // override reads the SAME array via `ctx.array_length`/`get_array_element`
+    // override reads the SAME array via `ctx.array_length()`/`get_array_element`
     // (bypassing whatever real-bytecode interpretation issue may be at
     // fault) so the trace print reveals the array's ACTUAL length at the
     // moment of the hang — if that's small and sane, the bug is an

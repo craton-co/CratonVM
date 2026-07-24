@@ -937,10 +937,9 @@ impl ClassStore {
         }
     }
 
-    /// Build the per-class compact instance-field layout: a prefix-sum offset
-    /// table (reference field = 8 bytes, primitive field = 16-byte tagged cell),
-    /// in declaration order with superclasses first, plus the reference-field
-    /// oop-map for the GC.
+    /// Build the per-class compact instance-field layout: a naturally aligned
+    /// tagless payload table (1/2/4/8 bytes), in declaration order with
+    /// superclasses first, plus the reference-field oop-map for the GC.
     ///
     /// Handles synthetic-stub **padding**: a class's `num_total_fields` may
     /// exceed its declared instance fields (native `<init>` writes to synthetic
@@ -962,20 +961,24 @@ impl ClassStore {
         let total = self.get(id)?.num_total_fields;
         let mut field_offsets: Vec<u32> = Vec::with_capacity(total);
         let mut is_ref: Vec<bool> = Vec::with_capacity(total);
+        let mut field_kinds: Vec<cratonvm_types::FieldStorageKind> =
+            Vec::with_capacity(total);
         let mut ref_offsets: Vec<u32> = Vec::new();
         let mut off: u32 = 0;
         let mut count: usize = 0;
         let mut padded = false;
 
-        let mut push = |r: bool, off: &mut u32| {
+        let mut push = |storage: cratonvm_types::FieldStorageKind, off: &mut u32| {
+            let alignment = storage.alignment();
+            *off = (*off + alignment - 1) & !(alignment - 1);
             field_offsets.push(*off);
+            let r = storage.is_reference();
             is_ref.push(r);
+            field_kinds.push(storage);
             if r {
                 ref_offsets.push(*off);
-                *off += cratonvm_types::REF_FIELD_SIZE as u32;
-            } else {
-                *off += cratonvm_types::SLOT_SIZE as u32;
             }
+            *off += storage.size();
         };
 
         for cid in chain {
@@ -985,14 +988,14 @@ impl ClassStore {
                     continue;
                 }
                 let b = f.descriptor.as_bytes().first().copied().unwrap_or(0);
-                let r = b == b'L' || b == b'[';
-                push(r, &mut off);
+                let storage = cratonvm_types::FieldStorageKind::from_descriptor_byte(b)?;
+                push(storage, &mut off);
                 count += 1;
             }
             // Pad up to this ancestor's own total so absolute indices stay aligned.
             let target = class.num_total_fields;
             while count < target {
-                push(true, &mut off); // padded slot -> reference (8-byte null)
+                push(cratonvm_types::FieldStorageKind::Reference, &mut off);
                 count += 1;
                 padded = true;
             }
@@ -1018,9 +1021,14 @@ impl ClassStore {
             return None;
         }
 
+        // Every object begins on an 8-byte boundary. Rounding the tail keeps
+        // the next header aligned without expanding individual fields.
+        off = (off + 7) & !7;
+
         Some(CompactLayout {
             field_offsets,
             is_ref,
+            field_kinds,
             ref_offsets,
             body_size: off,
         })
