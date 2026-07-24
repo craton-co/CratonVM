@@ -110,7 +110,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
-use cratonvm_types::{ArrayElementType, ObjectRef, Value};
+use cratonvm_types::{ObjectRef, Value};
 use parking_lot::RwLock;
 
 use crate::alloc_concurrent_synthetic;
@@ -3783,18 +3783,25 @@ fn read_keystore_id(ctx: &mut dyn NativeContext, ks: ObjectRef) -> i32 {
     crate::keystore::keystore_id_from_object(ctx, ks)
 }
 
+/// FIX (TestManagerWebappSsl sslConnectorCerts, "Subject: CN=..." missing from
+/// the manager's cert-chain listing): this used to always
+/// `alloc_concurrent_synthetic` a BARE `java/security/cert/X509Certificate`
+/// (the abstract class itself, which has no `toString()` implementation of
+/// its own) and stash `alias` as both subject and issuer, unconditionally —
+/// a local, worse duplicate of `keystore::make_x509_mirror`, which this same
+/// file's own DER-extraction fallback above already documents as the
+/// "preferred path" for a REAL certificate object. Calling `.toString()` on
+/// the bare synthetic fell through to `Object.toString()`
+/// (`java.security.cert.X509Certificate@<hash>`), not a real
+/// subject/issuer/validity dump — breaking `ManagerServlet.sslConnectorCerts`
+/// (`cert.toString()`) and anything else relying on a real
+/// `X509Certificate.toString()`/`checkValidity()`/etc. Delegate to
+/// `keystore::make_x509_mirror` instead, which tries a REAL
+/// `sun.security.x509.X509CertImpl` (real bytecode, so `toString()` and
+/// friends work correctly) parsed from the DER first, only falling back to
+/// a bare synthetic mirror if that construction itself fails.
 fn make_x509_mirror(ctx: &mut dyn NativeContext, alias: &str, der: &[u8]) -> ObjectRef {
-    let cert_obj = alloc_concurrent_synthetic(ctx, "java/security/cert/X509Certificate", 4);
-    let alias_str = ctx.create_string(alias);
-    ctx.set_field(cert_obj, 0, Value::Object(Some(alias_str)));
-    ctx.set_field(cert_obj, 1, Value::Object(Some(alias_str)));
-    ctx.set_field(cert_obj, 2, Value::Int(0));
-    let arr = ctx.new_array(ArrayElementType::Byte, der.len());
-    for (i, b) in der.iter().enumerate() {
-        ctx.set_array_element(arr, i, Value::Int(*b as i8 as i32));
-    }
-    ctx.set_field(cert_obj, 3, Value::Object(Some(arr)));
-    cert_obj
+    crate::keystore::make_x509_mirror(ctx, alias, der)
 }
 
 fn make_private_key_mirror(

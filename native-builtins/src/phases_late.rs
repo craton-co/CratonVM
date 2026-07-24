@@ -4405,7 +4405,8 @@ pub(crate) fn register_phase56_function_extras(r: &mut NativeMethodRegistry) {
             // would relocate them (native stale-local family).
             let this_pin = ctx.pin_native_root(this);
             let other_pin = pinned_object_value(ctx, other);
-            let composite = alloc_concurrent_synthetic(ctx, "java/util/function/Predicate$$Lambda$And", 2);
+            let composite =
+                alloc_concurrent_synthetic(ctx, "java/util/function/Predicate$$Lambda$And", 2);
             let this = ctx.read_native_pin(this_pin, this);
             ctx.set_field(composite, 0, Value::Object(Some(this)));
             ctx.set_field(
@@ -4428,7 +4429,8 @@ pub(crate) fn register_phase56_function_extras(r: &mut NativeMethodRegistry) {
             // would relocate them (native stale-local family).
             let this_pin = ctx.pin_native_root(this);
             let other_pin = pinned_object_value(ctx, other);
-            let composite = alloc_concurrent_synthetic(ctx, "java/util/function/Predicate$$Lambda$Or", 2);
+            let composite =
+                alloc_concurrent_synthetic(ctx, "java/util/function/Predicate$$Lambda$Or", 2);
             let this = ctx.read_native_pin(this_pin, this);
             ctx.set_field(composite, 0, Value::Object(Some(this)));
             ctx.set_field(
@@ -10198,6 +10200,56 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             let dst = obj_arg(args, 1)?;
             let src_path = p57_read_path(ctx, src);
             let dst_path = p57_read_path(ctx, dst);
+            // Real Files.move contract: without REPLACE_EXISTING, throw
+            // FileAlreadyExistsException if the target already exists. Plain
+            // std::fs::rename is POSIX rename(2) semantics, which silently
+            // replaces the destination unconditionally -- so H2's
+            // FilePathDisk.moveTo(newName, false) (no REPLACE_EXISTING) never
+            // saw the FileAlreadyExistsException it catches to translate into
+            // DbException(FILE_RENAME_FAILED_2), letting
+            // TestFileSystem.testMoveTo's move-onto-existing-file case
+            // through instead of rejecting it (docs/known-issues/h2-suite-bugs/
+            // bug-h2-files-setposixfilepermissions-FIXED.md residual chain).
+            let mut replace_existing = false;
+            if let Some(Value::Object(Some(opts))) = args.get(2) {
+                let len = ctx.array_length(*opts);
+                for i in 0..len {
+                    if let Value::Object(Some(opt)) = ctx.get_array_element(*opts, i) {
+                        if let Ok(Some(Value::Object(Some(s)))) =
+                            ctx.invoke_virtual(opt, "toString", "()Ljava/lang/String;", &[])
+                        {
+                            if ctx.read_string(s).unwrap_or_default().contains("REPLACE_EXISTING") {
+                                replace_existing = true;
+                            }
+                        }
+                    }
+                }
+            }
+            if !replace_existing
+                && src_path != dst_path
+                && std::fs::symlink_metadata(&dst_path).is_ok()
+            {
+                // Build a REAL java/nio/file/FileAlreadyExistsException via
+                // its real single-String constructor (same pattern as
+                // throw_unsupported_charset_exception below) rather than a
+                // synthetic layout -- this exception is caught by H2's own
+                // real FilePathDisk.moveTo bytecode (catch
+                // (FileAlreadyExistsException ex)) and its getFile() may be
+                // read by real Throwable formatting, so it needs genuine
+                // field layout, not a guessed synthetic one.
+                if let Ok(Some(Value::Object(Some(exc)))) =
+                    ctx.new_object("java/nio/file/FileAlreadyExistsException")
+                {
+                    let file_str = ctx.create_string(&dst_path);
+                    let _ = ctx.invoke(
+                        "java/nio/file/FileAlreadyExistsException",
+                        "<init>",
+                        "(Ljava/lang/String;)V",
+                        &[Value::Object(Some(exc)), Value::Object(Some(file_str))],
+                    );
+                    return Err(MethodCallFailed::ExceptionThrown(exc));
+                }
+            }
             match std::fs::rename(&src_path, &dst_path) {
                 Ok(()) => Ok(Some(Value::Object(Some(dst)))),
                 Err(e) => Err(RuntimeError::IllegalStateException {
@@ -10841,7 +10893,11 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         let class_name = ctx.class_name_of_id(ctx.class_id_of_object(this));
         if class_name.as_deref() != Some("java/nio/channels/FileChannel") {
             return Ok(Some(Value::Int(
-                if matches!(ctx.get_field_by_name(this, "closed"), Value::Int(1)) { 0 } else { 1 },
+                if matches!(ctx.get_field_by_name(this, "closed"), Value::Int(1)) {
+                    0
+                } else {
+                    1
+                },
             )));
         }
         Ok(Some(Value::Int(1)))
@@ -11903,7 +11959,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                     0 => total,
                     1 => free,
                     _ => usable,
-            });
+                });
             Ok(Some(Value::Long(value as i64)))
         });
 
@@ -15825,12 +15881,25 @@ fn file_read_path(ctx: &mut dyn NativeContext, this: ObjectRef) -> String {
 fn file_normalise_path(path: &str) -> String {
     let bytes = path.as_bytes();
     // Strip leading `/<drive>:` -> `<drive>:` (e.g. `/C:/foo` -> `C:/foo`).
-    if bytes.len() >= 3 && bytes[0] == b'/' && bytes[1].is_ascii_alphabetic() && bytes[2] == b':' {
-        return path[1..].replace('/', "\\");
-    }
+    let mut normalized = if bytes.len() >= 3
+        && bytes[0] == b'/'
+        && bytes[1].is_ascii_alphabetic()
+        && bytes[2] == b':'
+    {
+        path[1..].replace('/', "\\")
+    } else {
+        // Otherwise normalise forward slashes for consistency with Java's
+        // canonical Windows path separator.
+        path.replace('/', "\\")
+    };
     // Otherwise normalise forward slashes for consistency with Java's
-    // canonical Windows path separator.
-    path.replace('/', "\\")
+    // canonical Windows path separator. WinNTFileSystem.normalize also drops
+    // a redundant final separator (except the drive root): this is observable
+    // in Spring's config-tree location descriptions.
+    while normalized.len() > 3 && normalized.ends_with('\\') {
+        normalized.pop();
+    }
+    normalized
 }
 
 #[cfg(not(windows))]
@@ -16096,6 +16165,57 @@ fn file_canonicalize_path(path: &str) -> String {
     result
 }
 
+/// Resolve symlinks in the longest existing ancestor of `path` (via repeated
+/// `std::fs::canonicalize` on shrinking prefixes, i.e. `realpath`), then
+/// re-append whatever nonexistent trailing components were stripped off,
+/// literally and lexically `.`/`..`-collapsed. Mirrors the real JDK's
+/// `UnixFileSystem.canonicalize0` behavior for a path that doesn't fully
+/// exist on disk (`realpath -m` semantics), unlike a pure string-only
+/// normalization which never touches the filesystem and so can't resolve
+/// symlinks at all. Returns `None` only if `path` can't even be made
+/// absolute (no CWD available for a relative path).
+#[cfg(not(windows))]
+fn resolve_existing_ancestor_then_literal_tail(path: &str) -> Option<String> {
+    let norm = file_normalise_path(path);
+    let p = std::path::Path::new(&norm);
+    let abs: std::path::PathBuf = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        std::env::current_dir().ok()?.join(p)
+    };
+    use std::path::Component;
+    let mut comps: Vec<std::ffi::OsString> = Vec::new();
+    for comp in abs.components() {
+        match comp {
+            Component::CurDir | Component::RootDir | Component::Prefix(_) => {}
+            Component::ParentDir => {
+                comps.pop();
+            }
+            Component::Normal(s) => comps.push(s.to_os_string()),
+        }
+    }
+    // Shrink from the immediate parent of the (lexically-collapsed) full path
+    // down to just "/", canonicalizing each candidate ancestor, and re-append
+    // whichever trailing components had to be stripped off once one resolves.
+    // (The full path itself was already tried, via `std::fs::canonicalize`,
+    // by the caller before falling back to this function.) "/" itself always
+    // canonicalizes, so this always terminates with `Some`.
+    for split in (0..comps.len()).rev() {
+        let mut candidate = std::path::PathBuf::from("/");
+        for c in &comps[..split] {
+            candidate.push(c);
+        }
+        if let Ok(canon) = std::fs::canonicalize(&candidate) {
+            let mut result = canon;
+            for c in &comps[split..] {
+                result.push(c);
+            }
+            return Some(result.to_string_lossy().into_owned());
+        }
+    }
+    Some("/".to_string())
+}
+
 fn file_canonicalize_path_uncached(path: &str) -> String {
     #[cfg(windows)]
     {
@@ -16129,9 +16249,27 @@ fn file_canonicalize_path_uncached(path: &str) -> String {
     #[cfg(not(windows))]
     {
         // Non-Windows has no cpcrypt-style filter hazard, so keep the symlink-resolving
-        // filesystem call for existing paths; fall through to lexical for non-existent.
+        // filesystem call for existing paths.
         if let Ok(c) = std::fs::canonicalize(path) {
             return strip_unc(&c.to_string_lossy());
+        }
+        // `path` (or its final component(s)) doesn't exist yet — e.g. a file about
+        // to be created by `WebResourceRoot.write()`/`DirResourceSet.write()`.
+        // `std::fs::canonicalize` (== `realpath`) fails outright in that case, but
+        // falling through to pure lexical normalization below would silently
+        // UN-resolve any symlink in an EXISTING ancestor directory. That breaks any
+        // `child.startsWith(canonicalBase)`-style containment check where
+        // `canonicalBase` was itself computed by successfully canonicalizing an
+        // existing directory through a symlink (e.g. Tomcat's
+        // `AbstractFileResourceSet.file()`, or java.io.File's own canonical-path
+        // contract): the base resolves through the symlink, the not-yet-existing
+        // child doesn't, and the prefix check spuriously fails — a real bug,
+        // confirmed via `TestWebdavServlet`'s PUT-to-a-symlinked-fixture-root
+        // 201-vs-409 regression cluster. Real JDK's `UnixFileSystem.canonicalize0`
+        // resolves symlinks in the longest EXISTING ancestor and appends the
+        // nonexistent tail literally (`realpath -m` semantics) — do the same here.
+        if let Some(resolved) = resolve_existing_ancestor_then_literal_tail(path) {
+            return strip_unc(&resolved);
         }
     }
     // Lexical fallback: normalize the path as a string without touching the filesystem.
@@ -17781,7 +17919,11 @@ pub(crate) fn register_phase57_file_channel(r: &mut NativeMethodRegistry) {
         let class_name = ctx.class_name_of_id(ctx.class_id_of_object(this));
         if class_name.as_deref() != Some("java/nio/channels/FileChannel") {
             return Ok(Some(Value::Int(
-                if matches!(ctx.get_field_by_name(this, "closed"), Value::Int(1)) { 0 } else { 1 },
+                if matches!(ctx.get_field_by_name(this, "closed"), Value::Int(1)) {
+                    0
+                } else {
+                    1
+                },
             )));
         }
         let fd_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
@@ -22233,10 +22375,12 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
                 },
                 _ => return Ok(Some(Value::Object(None))),
             };
-            // Cached parse + decompress (O(1) per call; avoids re-parsing the
-            // whole central directory on every entry — see `jar_contents_cached`).
-            let bytes: Option<std::sync::Arc<Vec<u8>>> = jar_contents_cached(&path)
-                .and_then(|c| c.by_name.get(&entry_name).map(|r| r.bytes.clone()));
+            // Cached, lazy decompress (O(1) per call after the first read of
+            // this entry; avoids both re-parsing the whole central directory
+            // on every entry AND decompressing entries nothing ever reads —
+            // see `jar_entry_bytes_cached`).
+            let bytes: Option<std::sync::Arc<Vec<u8>>> =
+                jar_entry_bytes_cached(&path, &entry_name);
             let bytes = match bytes {
                 Some(b) => b,
                 None => return Ok(Some(Value::Object(None))),
@@ -23113,6 +23257,33 @@ fn spring_class_utils_for_name_impl(
         }
     }
 
+    // Platform/bootstrap loader: the JLS guarantees these can never see
+    // application classes, no matter how permissive the "built-in loader ->
+    // global scanner" fallback above is for the (very different) app-loader
+    // case, whose whole job IS to see the unified classpath. Without this,
+    // `ClassUtils.isPresent(appClassName, ClassLoader.getPlatformClassLoader())`
+    // false-positived every application class as present via the same
+    // global scanner an app-loader lookup legitimately uses, breaking any
+    // "is X absent from a restricted loader" check (e.g.
+    // `LogbackRuntimeHints#registerHints` gating on whether logback is on
+    // the given loader — see
+    // docs/known-issues/springboot/classutils-forname-platform-loader-false-positive.md).
+    if let Some(loader) = loader {
+        let is_platform_or_boot = matches!(
+            ctx.class_name_of_id(ctx.class_id_of_object(loader)).as_deref(),
+            Some("jdk/internal/loader/ClassLoaders$PlatformClassLoader")
+                | Some("jdk/internal/loader/ClassLoaders$BootClassLoader")
+        );
+        if is_platform_or_boot {
+            let internal = dotted.replace('.', "/");
+            if !crate::classloader::is_bootstrap_class_name(&internal) {
+                return Err(RuntimeError::ClassNotFoundException { class_name: dotted }.into());
+            }
+            // Genuinely bootstrap-owned name (java.*, jdk.*, ...) — fall
+            // through to the normal resolution below.
+        }
+    }
+
     // Regular class name: try direct binary name first (a.b.Foo → a/b/Foo)
     let internal = dotted.replace('.', "/");
     if let Ok(cid) = ctx.ensure_class_initialized(&internal) {
@@ -23198,14 +23369,15 @@ fn spring_default_app_ctx_factory_create(
 // 4-field synthetic JarEntry instances (name, size, compressedSize, method).
 // =============================================================================
 
-/// One central-directory entry's metadata plus its decompressed bytes.
+/// One central-directory entry's metadata. Deliberately excludes decompressed
+/// bytes — see `jar_contents_cached`'s doc comment for why those are cached
+/// separately (and lazily) via `jar_entry_bytes_cached` instead of here.
 pub(crate) struct JarEntryRec {
     pub(crate) size: i64,
     pub(crate) csize: i64,
     pub(crate) method: i32,
     pub(crate) crc: i64,
     pub(crate) times: JarEntryTimes,
-    pub(crate) bytes: std::sync::Arc<Vec<u8>>,
 }
 
 /// ZIP extended timestamp fields are authoritative when a JDK-created entry
@@ -23359,7 +23531,8 @@ fn p59_set_jar_entry_times(ctx: &mut dyn NativeContext, entry: ObjectRef, times:
     ctx.unpin_native_roots(entry_pin);
 }
 
-/// Per-path cache of a JAR's parsed central directory + decompressed entries.
+/// Per-path cache of a JAR's parsed central directory (metadata only — no
+/// decompressed bytes; see `jar_entry_bytes_cached` for those).
 ///
 /// The `java.util.jar.JarFile` natives (`getInputStream`/`getEntry`/`entries`/
 /// `stream`/lookup) previously called `zip::ZipArchive::new(file)` on EVERY
@@ -23368,8 +23541,25 @@ fn p59_set_jar_entry_times(ctx: &mut dyn NativeContext, entry: ObjectRef, times:
 /// `.class` entry, making that O(N²) over a jar's entry count — for a large jar
 /// like byte-buddy (~3k classes) the web-fragment scan never finishes within
 /// the test timeout (TestValidator HANG; it passes on HotSpot where each lookup
-/// is O(1)). Parse + decompress once and cache, keyed by (path, mtime) so a jar
-/// rewritten on disk (e.g. a test-generated temp jar) is not served stale.
+/// is O(1)). Parse once and cache, keyed by (path, mtime) so a jar rewritten on
+/// disk (e.g. a test-generated temp jar) is not served stale.
+///
+/// PERF (2026-07-23): this cache used to also eagerly `read_to_end` (i.e.
+/// fully INFLATE) every entry's bytes on the very first touch, regardless of
+/// whether the caller wanted bytes at all. `getJarEntry`/`entries`/`stream`/
+/// `getManifest` only need metadata (size/csize/method/crc/times) — a single
+/// `ClassUtils.isPresent()`-style existence check on a jar with thousands of
+/// classes (e.g. testcontainers.jar, 12.5k entries) was paying the FULL
+/// decompression cost of every unrelated entry (measured ~60-70us/entry —
+/// genuine DEFLATE work, not native-dispatch overhead) just to answer one
+/// membership question. On `module/spring-boot-data-redis`'s ~121-jar test
+/// classpath this made ordinary Spring context bootstrap (which does hundreds
+/// of such isPresent/loadClass checks) blow past the 300s suite timeout —
+/// `DataRedisAutoConfigurationTests`, `DataRedisAutoConfigurationJedisTests`,
+/// `DataRedisAutoConfigurationLettuceWithoutCommonsPool2Tests`, and
+/// `DataRedisHealthContributorAutoConfigurationTests` all HANG. Bytes are now
+/// decompressed lazily, per-entry, only when `getInputStream` is actually
+/// called for that entry — see `jar_entry_bytes_cached`.
 pub(crate) fn jar_contents_cached(path: &str) -> Option<std::sync::Arc<JarContents>> {
     use std::sync::{Arc, Mutex, OnceLock};
     static CACHE: OnceLock<Mutex<std::collections::HashMap<String, Arc<JarContents>>>> =
@@ -23396,8 +23586,11 @@ pub(crate) fn jar_contents_cached(path: &str) -> Option<std::sync::Arc<JarConten
     let mut by_name = std::collections::HashMap::with_capacity(len);
     let mut order = Vec::with_capacity(len);
     for i in 0..len {
-        use std::io::Read;
-        let Ok(mut entry) = archive.by_index(i) else {
+        // Metadata only — deliberately no `read_to_end`/decompression here.
+        // `by_index` parses the local file header (cheap: no inflate), which
+        // is enough for every field below. See the doc comment above for why
+        // eagerly decompressing was a severe perf bug.
+        let Ok(entry) = archive.by_index(i) else {
             continue;
         };
         let name = entry.name().to_string();
@@ -23408,10 +23601,6 @@ pub(crate) fn jar_contents_cached(path: &str) -> Option<std::sync::Arc<JarConten
         let crc = entry.crc32() as i64 & 0xFFFF_FFFFi64;
         let mut times = p59_zip_entry_times(&entry);
         p59_merge_zip_times(&mut times, p59_zip_local_entry_times(path, &entry));
-        let mut buf = Vec::with_capacity(entry.size() as usize);
-        if entry.read_to_end(&mut buf).is_err() {
-            continue;
-        }
         order.push(name.clone());
         by_name.insert(
             name,
@@ -23421,7 +23610,6 @@ pub(crate) fn jar_contents_cached(path: &str) -> Option<std::sync::Arc<JarConten
                 method,
                 crc,
                 times,
-                bytes: Arc::new(buf),
             },
         );
     }
@@ -23431,6 +23619,46 @@ pub(crate) fn jar_contents_cached(path: &str) -> Option<std::sync::Arc<JarConten
         .unwrap_or_else(|e| e.into_inner())
         .insert(key, contents.clone());
     Some(contents)
+}
+
+/// Per-(path, mtime, entry name) cache of ONE entry's decompressed bytes.
+/// Companion to `jar_contents_cached`: that cache is metadata-only (cheap,
+/// built eagerly for the whole jar); this one does the actual DEFLATE
+/// inflate, lazily, only for entries some caller's `getInputStream` actually
+/// reads. Re-opens the archive and seeks straight to the named entry rather
+/// than iterating — `by_name` on a `zip::ZipArchive` uses its already-parsed
+/// central-directory name index, so this stays cheap even on jars with
+/// thousands of entries.
+pub(crate) fn jar_entry_bytes_cached(path: &str, entry_name: &str) -> Option<std::sync::Arc<Vec<u8>>> {
+    use std::io::Read;
+    use std::sync::{Arc, Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<std::collections::HashMap<String, Arc<Vec<u8>>>>> =
+        OnceLock::new();
+    if path.is_empty() || entry_name.is_empty() {
+        return None;
+    }
+    let mtime = std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let key = format!("{path}\u{0}{mtime}\u{0}{entry_name}");
+    let cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    if let Some(b) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
+        return Some(b.clone());
+    }
+    let file = std::fs::File::open(path).ok()?;
+    let mut archive = zip::ZipArchive::new(file).ok()?;
+    let mut entry = archive.by_name(entry_name).ok()?;
+    let mut buf = Vec::with_capacity(entry.size() as usize);
+    entry.read_to_end(&mut buf).ok()?;
+    let bytes = Arc::new(buf);
+    cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(key, bytes.clone());
+    Some(bytes)
 }
 
 /// Read the central directory of `path` and return a Vec of allocated
@@ -24407,29 +24635,26 @@ fn p59_jar_file_manifest(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 }
 
 /// Read MANIFEST.MF from a JAR file and create a Manifest synthetic object.
+///
+/// PERF (2026-07-23): this used to `File::open` + `zip::ZipArchive::new` the
+/// WHOLE jar itself, independent of (and redundant with)
+/// `jar_contents_cached`/`jar_entry_bytes_cached`'s caches — every single
+/// `new JarFile(path)` (this runs from every `<init>` handler) re-parsed the
+/// entire central directory again just to grab one entry. For a jar the size
+/// of testcontainers.jar (12.5k entries, ~17MB) that central-directory parse
+/// alone measured ~105ms; Spring Boot test suites that construct many
+/// short-lived JarFile/classloader instances over the run (one context
+/// refresh per `@Test` method, `ApplicationContextRunner`, etc.) pay that
+/// cost again on every construction. Route through the same lazily-cached
+/// `jar_entry_bytes_cached` the `getInputStream` native uses so only the
+/// FIRST touch of a given (path, mtime) pays for the archive open.
 fn p98_read_jar_manifest(ctx: &mut dyn NativeContext, path: &str) -> Value {
     if path.is_empty() {
         return Value::Object(None);
     }
-    let file = match std::fs::File::open(path) {
-        Ok(f) => f,
-        Err(_) => return Value::Object(None),
-    };
-    let mut archive = match zip::ZipArchive::new(file) {
-        Ok(a) => a,
-        Err(_) => return Value::Object(None),
-    };
-    let manifest_bytes = match archive.by_name("META-INF/MANIFEST.MF") {
-        Ok(mut entry) => {
-            use std::io::Read;
-            let mut buf = Vec::new();
-            if entry.read_to_end(&mut buf).is_ok() {
-                buf
-            } else {
-                return Value::Object(None);
-            }
-        }
-        Err(_) => return Value::Object(None),
+    let manifest_bytes = match jar_entry_bytes_cached(path, "META-INF/MANIFEST.MF") {
+        Some(b) => (*b).clone(),
+        None => return Value::Object(None),
     };
     // Parse the main section, including folded continuation lines, through the
     // same manifest parser used by the `Manifest(InputStream)` bridge. Keeping
@@ -27452,6 +27677,23 @@ pub(crate) fn register_p59_file_attributes(r: &mut NativeMethodRegistry) {
     r.register("java/nio/file/Files", "readAttributes",
         "(Ljava/nio/file/Path;Ljava/lang/Class;[Ljava/nio/file/LinkOption;)Ljava/nio/file/attribute/BasicFileAttributes;",
         p59_files_read_attributes);
+    // Windows has no POSIX attribute view.  The real `Files` bytecode would
+    // otherwise ask the Windows provider for attributes and then checkcast
+    // the returned WindowsFileAttributes to PosixFileAttributes, producing a
+    // VM-only ClassCastException.  Match the JDK contract so callers such as
+    // Spring Boot's ApplicationPid can take their documented fallback.
+    #[cfg(windows)]
+    r.register(
+        "java/nio/file/Files",
+        "getPosixFilePermissions",
+        "(Ljava/nio/file/Path;[Ljava/nio/file/LinkOption;)Ljava/util/Set;",
+        |_ctx, _args| {
+            Err(RuntimeError::UnsupportedOperationException {
+                message: "POSIX file permissions are not supported on Windows".into(),
+            }
+            .into())
+        },
+    );
     r.register(
         "java/nio/file/Files",
         "getLastModifiedTime",
@@ -37392,10 +37634,7 @@ pub(crate) fn register_p66_file_visitor(r: &mut NativeMethodRegistry) {
         "(Ljava/nio/file/Path;Ljava/util/Set;ILjava/nio/file/FileVisitor;)Ljava/nio/file/Path;",
         |ctx, args| {
             let path_obj = args.first().copied().unwrap_or(Value::Object(None));
-            let requested_depth = args
-                .get(2)
-                .and_then(Value::as_int)
-                .unwrap_or(i32::MAX);
+            let requested_depth = args.get(2).and_then(Value::as_int).unwrap_or(i32::MAX);
             let max_depth = if requested_depth == i32::MAX {
                 usize::MAX
             } else {
@@ -38410,16 +38649,14 @@ pub(crate) fn register_p66_thread_builder(r: &mut NativeMethodRegistry) {
     // Thread.threadId() — Java 19. Use the receiver's Java tid for cross-thread
     // queries; the VM context is only a fallback during early bootstrap.
     r.register(t, "threadId", "()J", |ctx, args| {
-        let receiver_tid = args
-            .first()
-            .and_then(|value| match value {
-                Value::Object(Some(thread)) => match ctx.get_field_by_name(*thread, "tid") {
-                    Value::Long(tid) if tid > 0 => Some(tid),
-                    Value::Int(tid) if tid > 0 => Some(tid as i64),
-                    _ => None,
-                },
+        let receiver_tid = args.first().and_then(|value| match value {
+            Value::Object(Some(thread)) => match ctx.get_field_by_name(*thread, "tid") {
+                Value::Long(tid) if tid > 0 => Some(tid),
+                Value::Int(tid) if tid > 0 => Some(tid as i64),
                 _ => None,
-            });
+            },
+            _ => None,
+        });
         Ok(Some(Value::Long(
             receiver_tid.unwrap_or_else(|| ctx.thread_id().max(1) as i64),
         )))
@@ -43951,8 +44188,7 @@ fn new13_ssl_socket_connect(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     };
     let (host, port) = crate::net_phase_e::read_inet_socket_address(ctx, sa)?;
     let (extra_roots, java_tm_key) = take_pending_ssl_socket_connect_ctx(ctx, this);
-    let tls_id =
-        new13_connect_and_handshake(ctx, &host, port as u16, &extra_roots, java_tm_key)?;
+    let tls_id = new13_connect_and_handshake(ctx, &host, port as u16, &extra_roots, java_tm_key)?;
     let _ = new13_finish_socket(ctx, this, &host, port as u16, tls_id);
     Ok(None)
 }
@@ -44549,7 +44785,8 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
     r.register(ssf, "createSocket", "()Ljava/net/Socket;", |ctx, args| {
         let extra_roots = p68_factory_trust_roots(ctx, args);
         let java_tm_key = p68_factory_java_tm_key(ctx, args);
-        let sock = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocket", NEW13_SSL_SOCK_FIELDS);
+        let sock =
+            alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocket", NEW13_SSL_SOCK_FIELDS);
         ctx.set_field(sock, NEW13_SOCK_TLSID, Value::Int(-1));
         ctx.set_field(sock, NEW13_SOCK_CLOSED, Value::Int(0));
         stash_pending_ssl_socket_connect_ctx(ctx, sock, extra_roots, java_tm_key);
@@ -44833,6 +45070,48 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         ensure_layered_handshake_started(ctx, this)?;
         Ok(None)
     });
+    // FIX (TestSsl.testClientInitiatedRenegotiation[JSSE]): these two real
+    // JDK SSLSocket methods had no native registration at all, so calling
+    // either threw `AbstractMethodError: ... has no Code attribute` (the
+    // abstract class has no bytecode of its own) — a VM-crash-shaped error
+    // for what should be an ordinary, always-legal listener registration
+    // call. Honest no-op registration (matching the real
+    // `addHandshakeCompletedListener` null-check contract): we do NOT fire
+    // stored listeners on a later `startHandshake()` call, because rustls
+    // (this VM's TLS backend) does not implement TLS renegotiation at the
+    // protocol level at all — a permanent upstream design choice, same
+    // class of gap as the already-documented rustls DHE/CBC limitations.
+    // Registering these as real (if inert) methods turns the crash into a
+    // clean, honest test assertion failure (listener never completes)
+    // instead of an uncatchable AbstractMethodError.
+    r.register(
+        ssl_sock,
+        "addHandshakeCompletedListener",
+        "(Ljavax/net/ssl/HandshakeCompletedListener;)V",
+        |_ctx, args| {
+            if matches!(args.get(1), Some(Value::Object(None)) | None) {
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: "listener is null".to_string(),
+                }
+                .into());
+            }
+            Ok(None)
+        },
+    );
+    r.register(
+        ssl_sock,
+        "removeHandshakeCompletedListener",
+        "(Ljavax/net/ssl/HandshakeCompletedListener;)V",
+        |_ctx, args| {
+            if matches!(args.get(1), Some(Value::Object(None)) | None) {
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: "listener is null".to_string(),
+                }
+                .into());
+            }
+            Ok(None)
+        },
+    );
     // connect(SocketAddress[, int timeout]) — the other half of the zero-arg
     // `createSocket()` pattern registered on `SSLSocketFactory` above. Real
     // `javax.net.ssl.SSLSocket` does not redeclare `connect` (it stays
@@ -45768,10 +46047,28 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         ssl_session,
         "getLocalCertificates",
         "()[Ljava/security/cert/Certificate;",
-        |_ctx, _args| {
-            // Same rationale as getLocalPrincipal: null is the documented
-            // return when no local certificate chain was used.
-            Ok(Some(Value::Object(None)))
+        |ctx, args| {
+            // FIX (spring-boot-jetty SecureRequestCustomizer 400 "Invalid SNI"):
+            // this used to unconditionally return null, which was only correct
+            // for a plain (no-mTLS) CLIENT session. A SERVER session always has
+            // a local (its own) certificate chain; Jetty's
+            // `SecureRequestCustomizer.getX509()` calls exactly this method on
+            // every HTTPS request and throws `HttpException.RuntimeException(400,
+            // "Invalid SNI")` when it comes back empty. See
+            // `t27_tls::build_synthetic_ssl_session`/`local_certs_for_session`
+            // for where the chain is actually populated (client sessions with no
+            // configured identity correctly still get an empty chain here).
+            let this = obj_arg(args, 0)?;
+            let chain = crate::t27_tls::local_certs_for_session(ctx, this);
+            if chain.is_empty() {
+                return Ok(Some(Value::Object(None)));
+            }
+            let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), chain.len());
+            for (i, der) in chain.iter().enumerate() {
+                let mirror = crate::keystore::make_x509_mirror(ctx, "local", der);
+                ctx.set_array_element(arr, i, Value::Object(Some(mirror)));
+            }
+            Ok(Some(Value::Object(Some(arr))))
         },
     );
     r.register(

@@ -983,11 +983,16 @@ fn jar_url_entry_size(ext: &str) -> Option<i64> {
         .strip_prefix("jar:file:")
         .or_else(|| ext.strip_prefix("jar:"))?;
     let mut parts = after.splitn(2, "!/");
-    let jar_raw = parts.next()?.trim_start_matches("file:");
+    let jar_raw_enc = parts.next()?.trim_start_matches("file:");
     let entry_name = parts.next()?;
     if entry_name.is_empty() {
         return None;
     }
+    // Percent-decode the jar's own file path — see the matching fix in
+    // URL.openStream's jar:file: handler (TestDeployTask.bug58086a) for why
+    // a `%20` must resolve back to a literal space before touching disk.
+    let jar_raw_owned = uri_percent_decode(jar_raw_enc);
+    let jar_raw = jar_raw_owned.as_str();
     if let Some(bytes) = war_nested_jar_bytes(jar_raw) {
         let cursor = std::io::Cursor::new(bytes.as_slice());
         let mut archive = zip::ZipArchive::new(cursor).ok()?;
@@ -1822,7 +1827,7 @@ fn hash_str_ignore_case(h: i32, s: Option<&str>) -> i32 {
 /// every other character (INCLUDING `+`, which URI leaves literal — unlike
 /// `application/x-www-form-urlencoded`) is copied verbatim. A malformed `%`
 /// escape (missing/non-hex digits) is copied through unchanged.
-fn uri_percent_decode(input: &str) -> String {
+pub(crate) fn uri_percent_decode(input: &str) -> String {
     if !input.contains('%') {
         return input.to_string();
     }
@@ -5758,7 +5763,7 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
                 } else {
                     raw_rest
                 };
-            let (outer_jar, inner_path) = match rest.find("!/") {
+            let (outer_jar_raw, inner_path) = match rest.find("!/") {
                 Some(i) => (&rest[..i], &rest[i + 2..]),
                 None => {
                     return Err(ioex(format!(
@@ -5766,6 +5771,18 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
                     )))
                 }
             };
+            // HotSpot's JarURLConnection percent-decodes the outer jar's own
+            // URL component (`ParseUtil.decode`) before touching disk, so a
+            // `%20` resolves back to a literal space — e.g. a directory
+            // literally named "dir with spaces" is addressed as
+            // `dir%20with%20spaces` in the URL. `outer_jar` previously stayed
+            // encoded, so `std::fs`/`zip` lookups for any percent-escaped jar
+            // path always missed with ENOENT even though the file visibly
+            // exists (TestDeployTask.bug58086a). The entry name after `!/` is
+            // a raw zip entry name, not a URL component, and must NOT be
+            // decoded.
+            let outer_jar_owned = uri_percent_decode(outer_jar_raw);
+            let outer_jar = outer_jar_owned.as_str();
             // Check if the inner_path itself is a nested jar entry (double !/):
             // e.g. "BOOT-INF/lib/spring-boot-2.7.12.jar!/META-INF/spring.factories"
             let buf = if let Some(second_sep) = inner_path.find("!/") {
@@ -6336,15 +6353,18 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
                 .strip_prefix("jar:file:")
                 .or_else(|| ext.strip_prefix("jar:"))
                 .unwrap_or(&ext);
-            let jar_part = after_scheme
+            let jar_part_enc = after_scheme
                 .split("!/")
                 .next()
                 .unwrap_or("")
-                .trim_start_matches("file:")
-                .to_string();
-            if jar_part.is_empty() {
+                .trim_start_matches("file:");
+            if jar_part_enc.is_empty() {
                 return Err(ioex("JarURLConnection.getJarFile: malformed URL"));
             }
+            // Percent-decode the jar file's own URL component — see the
+            // matching fix in URL.openStream's jar:file: handler
+            // (TestDeployTask.bug58086a) for why.
+            let jar_part = uri_percent_decode(jar_part_enc);
             // Resolve to a real on-disk path. `file:` URLs use a leading `/`
             // before a Windows drive letter (`/C:/…`); try the trimmed form
             // first, then the raw form for POSIX absolute paths — mirrors the
@@ -7209,14 +7229,100 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
     );
 
     // S111r25 — Banner lookup is best-effort; unresolved classpath URLs can
-    // trip `new UrlResource(null)` on some fallback paths. Returning null
-    // from both banner resolvers keeps boot moving (Spring then uses no
-    // custom banner or the default fallback).
+    // trip `new UrlResource(null)` on some fallback paths. The original fix
+    // here unconditionally returned null from both banner resolvers to keep
+    // boot moving — but that also permanently disabled a WORKING custom
+    // `banner.txt`/`banner.gif` lookup, since `getTextBanner`'s real bytecode
+    // (`resourceLoader.getResource(location)`) never even ran anymore
+    // (SpringApplicationTests.customBanner/customBannerWithProperties/
+    // failureInANativeImageWritesFailureToSystemOut always printed the
+    // DEFAULT SpringBootBanner instead of the test's `@WithResource
+    // banner.txt`). Reimplement the real logic instead — `getBanner()`'s
+    // `Environment.getProperty` / `ResourceLoader.getResource` /
+    // `Resource.exists()` / `Resource.getURL()` calls, `ResourceBanner`
+    // construction — but keep the S111r25 defensive intent by swallowing
+    // ANY failure along the way (not just the real method's checked
+    // `IOException`) and falling back to null, same as before.
     r.register(
         "org/springframework/boot/SpringApplicationBannerPrinter",
         "getTextBanner",
         "(Lorg/springframework/core/env/Environment;)Lorg/springframework/boot/Banner;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        |ctx, args| {
+            if std::env::var_os("CRATONVM_DBG_SBLOAD").is_some() {
+                eprintln!(
+                    "[DBG_SBLOAD] SpringApplicationBannerPrinter.getTextBanner native override"
+                );
+            }
+            let this = match obj_arg(args, 0) {
+                Ok(o) => o,
+                Err(_) => return Ok(Some(Value::Object(None))),
+            };
+            let environment = match args.get(1) {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let resource_loader = match ctx.get_field_by_name(this, "resourceLoader") {
+                Value::Object(Some(o)) => o,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let prop_name = ctx.create_string("spring.banner.location");
+            let default_loc = ctx.create_string("banner.txt");
+            let location = match ctx.invoke_virtual(
+                environment,
+                "getProperty",
+                "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
+                &[
+                    Value::Object(Some(prop_name)),
+                    Value::Object(Some(default_loc)),
+                ],
+            ) {
+                Ok(Some(Value::Object(Some(s)))) => s,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let resource = match ctx.invoke_virtual(
+                resource_loader,
+                "getResource",
+                "(Ljava/lang/String;)Lorg/springframework/core/io/Resource;",
+                &[Value::Object(Some(location))],
+            ) {
+                Ok(Some(Value::Object(Some(r)))) => r,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let exists = matches!(
+                ctx.invoke_virtual(resource, "exists", "()Z", &[]),
+                Ok(Some(Value::Int(n))) if n != 0
+            );
+            if !exists {
+                return Ok(Some(Value::Object(None)));
+            }
+            let is_liquibase = match ctx.invoke_virtual(resource, "getURL", "()Ljava/net/URL;", &[])
+            {
+                Ok(Some(Value::Object(Some(url)))) => match ctx.invoke_virtual(
+                    url,
+                    "toExternalForm",
+                    "()Ljava/lang/String;",
+                    &[],
+                ) {
+                    Ok(Some(Value::Object(Some(s)))) => ctx
+                        .read_string(s)
+                        .map(|s| s.contains("liquibase-core"))
+                        .unwrap_or(false),
+                    _ => false,
+                },
+                _ => false,
+            };
+            if is_liquibase {
+                return Ok(Some(Value::Object(None)));
+            }
+            match ctx.new_object_initialized(
+                "org/springframework/boot/ResourceBanner",
+                "(Lorg/springframework/core/io/Resource;)V",
+                &[Value::Object(Some(resource))],
+            ) {
+                Ok(v) => Ok(v),
+                Err(_) => Ok(Some(Value::Object(None))),
+            }
+        },
     );
     r.register(
         "org/springframework/boot/SpringApplicationBannerPrinter",
@@ -9432,10 +9538,19 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
             if let Some(ctx_obj) = crate::t27_tls::get_runtime_default_ssl_context() {
                 return Ok(Some(Value::Object(Some(ctx_obj))));
             }
+            // No explicit setDefault() call yet: mirror the JDK's lazy-init
+            // contract (SSLContext.getDefault() javadoc — the default is
+            // "created if not yet created") by allocating ONE context and
+            // caching it in the same slot setDefault() writes to, so a
+            // second getDefault() call returns this SAME object instead of
+            // a fresh one each time (e.g. OtlpMetricsExportAutoConfigurationTests
+            // .whenNoSslBundleDefaultHttpSenderHasDefaultSslContext asserts
+            // `httpClient.sslContext()).isSameAs(SSLContext.getDefault())`).
             let obj = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLContext", 2);
             let name = ctx.create_string("TLS");
             ctx.set_field(obj, 0, Value::Object(Some(name)));
             ctx.set_field(obj, 1, Value::Int(1));
+            crate::t27_tls::set_runtime_default_ssl_context(obj);
             Ok(Some(Value::Object(Some(obj))))
         },
     );
