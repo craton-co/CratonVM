@@ -12131,12 +12131,10 @@ fn stamp_compilation_epoch(
 ///
 /// Returns `Some` when the frame was resumed (caller returns it), `None` to
 /// fall through to the whole-method re-run.
-/// Read-once mirror of the jit crate's `CRATONVM_JIT_FREE_CODE` check (see
-/// `jit/src/deopt.rs::jit_free_code_enabled`): `true` only in the A/B mode
-/// that actually frees evicted artifacts and their deopt-point boxes.
+/// Legacy compatibility mirror. Ownership-safe reclamation keeps an executing
+/// artifact's reconstruction metadata alive, so stale frames remain resumable.
 fn vm_jit_free_code_enabled() -> bool {
-    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var_os("CRATONVM_JIT_FREE_CODE").is_some())
+    false
 }
 
 /// jit-invokedynamic-groovy-regression fix — does the stashed reconstructed
@@ -31746,7 +31744,6 @@ fn execute_invokestatic_cached(
                         gate: entry_gate.clone(),
                         supersede_epoch: crate::classloading::jit_supersede_epoch(),
                     };
-                    drop(jit_cache);
                     thread
                         .invoke_cache
                         .put(caller_class_id, cp_index, false, jit_target.clone());

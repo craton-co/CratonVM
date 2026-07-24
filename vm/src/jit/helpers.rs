@@ -4706,6 +4706,8 @@ pub unsafe extern "C" fn jit_throw_exception(exc_ptr: i64, bci: i64) -> i64 {
 struct DispatchCache {
     entry: usize,
     needs_context: bool,
+    /// Owns JIT code while this thread-local raw entry remains published.
+    _owner: Option<std::sync::Arc<cratonvm_jit::CompiledMethod>>,
 }
 
 #[derive(Clone, Copy)]
@@ -4803,6 +4805,7 @@ thread_local! {
     /// Last C1→C2 supersede epoch this thread's DISPATCH_CACHE was flushed
     /// at — see the flush in `jit_invoke_dispatch`.
     static DISPATCH_CACHE_SUPERSEDE_EPOCH: Cell<u32> = const { Cell::new(0) };
+    static DISPATCH_CACHE_JIT_GENERATION: Cell<u64> = const { Cell::new(0) };
 }
 
 /// RAII guard that decrements [`JIT_DISPATCH_DEPTH`] when dropped. Constructed
@@ -5350,12 +5353,22 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
         DISPATCH_CACHE.with(|dc| dc.borrow_mut().clear());
         VIRTUAL_DISPATCH_CACHE.with(|dc| dc.borrow_mut().clear());
     }
-    // C1→C2 supersede: the dispatch cache holds raw entry pointers captured
-    // at first resolution. When the background worker publishes a replacing
-    // C2 body it bumps the global supersede epoch — flush this thread's
-    // cache once per bump so subsequent dispatches re-probe the jit cache
-    // and pick up the upgraded body. (Stale entries were never unsound —
-    // superseded code is retained forever — merely stuck on the C1 body.)
+    // Every compiled publication/invalidation advances this generation. Flush
+    // raw-entry dispatch caches before probing them, both to pick up tier
+    // replacements and to release their code owners after invalidation.
+    {
+        let generation = cratonvm_jit::jit_cache_generation();
+        DISPATCH_CACHE_JIT_GENERATION.with(|seen| {
+            if seen.get() != generation {
+                seen.set(generation);
+                DISPATCH_CACHE.with(|dc| dc.borrow_mut().clear());
+                VIRTUAL_DISPATCH_CACHE.with(|dc| dc.borrow_mut().clear());
+            }
+        });
+    }
+    // Retain the older supersede epoch as a compatibility signal for tiering
+    // paths that may advance it independently of a cache replacement. The
+    // general JIT generation above is the lifetime-safety mechanism.
     {
         let epoch = crate::classloading::jit_supersede_epoch();
         DISPATCH_CACHE_SUPERSEDE_EPOCH.with(|e| {
@@ -5439,6 +5452,7 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
                                     DispatchCache {
                                         entry,
                                         needs_context,
+                                        _owner: cratonvm_jit::pin_jit_entry(entry),
                                     },
                                 );
                             });
@@ -5544,10 +5558,10 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
                     DispatchCache {
                         entry,
                         needs_context: needs_ctx,
+                        _owner: Some(compiled.clone()),
                     },
                 );
             });
-            drop(jit_cache);
             // SAFETY: entry was obtained from a CompiledMethod in the JIT cache, whose
             // entry_ptr points to executable memory with the correct extern "C" ABI.
             // CRIT round-5 fix: on >ARG_REGS args, route directly to the interpreter
@@ -5603,6 +5617,7 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
                     DispatchCache {
                         entry,
                         needs_context: needs_ctx,
+                        _owner: cratonvm_jit::pin_jit_entry(entry),
                     },
                 );
             });

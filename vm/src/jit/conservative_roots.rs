@@ -548,6 +548,7 @@ pub(crate) fn push_entry_full(entry: JitFrameChainEntry) -> usize {
         n
     });
     GLOBAL_JIT_DEPTH.fetch_add(1, Ordering::Release);
+    cratonvm_jit::jit_execution_enter();
     // Mirror into the GC-side quiescence flag so the GC can defer
     // compaction whenever any thread is inside a JIT call. NEW-12's
     // precise root walk removes false positives from the root set,
@@ -589,6 +590,7 @@ pub fn pop_jit_entry() -> Option<usize> {
     if let Some(entry) = popped {
         GLOBAL_JIT_DEPTH.fetch_sub(1, Ordering::Release);
         cratonvm_gc::gc_quiescence::leave();
+        cratonvm_jit::jit_execution_leave();
         Some(entry.entry_sp)
     } else {
         None
@@ -640,6 +642,7 @@ pub fn prune_returned_jit_entries(scanner_sp: usize) -> usize {
     for _ in 0..pruned {
         GLOBAL_JIT_DEPTH.fetch_sub(1, Ordering::Release);
         cratonvm_gc::gc_quiescence::leave();
+        cratonvm_jit::jit_execution_leave();
     }
     if pruned > 0 {
         tracing::debug!(

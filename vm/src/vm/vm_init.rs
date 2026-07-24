@@ -592,7 +592,7 @@ pub struct SharedVm {
     pub gc_barrier: GcBarrier,
 
     /// JIT compiler cache — maps method identity to compiled native code.
-    pub jit_cache: parking_lot::RwLock<JitCache>,
+    pub jit_cache: JitCache,
 
     /// Virtual thread scheduler — bounds concurrent virtual thread execution
     /// to a carrier-thread pool (JEP 444, Java 21).
@@ -2885,7 +2885,7 @@ impl SharedVm {
             oom_dump_written: std::sync::atomic::AtomicBool::new(false),
             fd_table: FileDescriptorTable::new(),
             gc_barrier: GcBarrier::new(),
-            jit_cache: parking_lot::RwLock::new(JitCache::new()),
+            jit_cache: JitCache::new(),
             virtual_scheduler: crate::threading::VirtualThreadScheduler::new_default(),
             native_memory: parking_lot::Mutex::new(crate::native::ffi::NativeMemoryTable::new()),
             native_libraries: parking_lot::Mutex::new(Vec::new()),

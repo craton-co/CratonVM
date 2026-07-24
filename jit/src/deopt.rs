@@ -1242,14 +1242,12 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-/// Read-once: is `CRATONVM_JIT_FREE_CODE` set (the A/B mode that actually
-/// frees evicted artifacts and their deopt-point boxes)? Mirrors the reads in
-/// `ExecutableBuffer::drop` / `CompiledMethod::drop` (jit/src/lib.rs); in the
-/// default retain-everything mode this is `false` and superseded artifacts'
-/// deopt boxes remain valid for the process lifetime.
+/// Legacy compatibility gate. Code reclamation is now ownership-safe in every
+/// configuration: an executing artifact owns its deopt metadata until return,
+/// so a superseded frame remains reconstructable and must not be forced into a
+/// side-effect-replaying whole-method fallback.
 fn jit_free_code_enabled() -> bool {
-    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var_os("CRATONVM_JIT_FREE_CODE").is_some())
+    false
 }
 
 /// Take (and clear) the frame most recently reconstructed by a deopt.
