@@ -3274,7 +3274,18 @@ pub(crate) fn rustls_stream_read(id: i32, buf: &mut [u8]) -> std::io::Result<usi
     let debug_srv = std::env::var_os("CRATONVM_DBG_TLS_SRV").is_some();
     let mut reg = sreg().lock();
     if let Some(e) = reg.client_streams.get_mut(&id) {
-        return e.stream.read(buf);
+        // FIX (TestSsl.testSni[JSSE]): a plain `SSLSocket.getInputStream()
+        // .read()` on the client side used to propagate rustls's raw
+        // `UnexpectedEof` ("peer closed connection without sending TLS
+        // close_notify") straight through as an `IOException`. Tomcat's own
+        // server connector (also CratonVM/rustls) closes the raw socket
+        // after writing a `Connection: Close` response without a clean TLS
+        // shutdown — an unclean-but-benign close real JSSE clients
+        // routinely tolerate at the end of a fully-framed HTTP response.
+        // Reuse the same EOF-tolerant read already established for the
+        // native HTTP client bridge (`http_url_connection::
+        // read_eof_tolerant`) instead of duplicating the tolerance logic.
+        return crate::http_url_connection::read_eof_tolerant(&mut e.stream, buf);
     }
     if let Some(e) = reg.server_streams.get_mut(&id) {
         if debug_srv {
@@ -4064,6 +4075,91 @@ fn register_https_url_connection(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(obj))))
         },
     );
+    // Walk from an arbitrary `SSLSocketFactory`-typed object down to the
+    // `SSLContext` it ultimately carries. The fast path is our own synthetic
+    // carrier (`alloc_concurrent_synthetic("javax/net/ssl/SSLSocketFactory",
+    // 1)`, field 0 = the SSLContext, as returned by `SSLContext.
+    // getSocketFactory()`), but real test/application code routinely wraps
+    // that in a REAL bytecode subclass that delegates to it — e.g. Tomcat's
+    // own `TesterSupport.ClientSSLSocketFactory(SSLSocketFactory delegate)`,
+    // used by `TesterSupport.configureClientSsl()` (every `TestCustomSsl`/
+    // `TestClientCert*`-style test). That subclass's field 0 is its own
+    // `delegate` field — itself another `SSLSocketFactory`, one hop short of
+    // the actual `SSLContext` — so blindly reading field 0 once returned the
+    // wrapper's delegate and treated IT as the SSLContext. Every
+    // `ctx_obj_key`-keyed lookup keyed off the real SSLContext (trust roots,
+    // key managers, identity) then silently missed for a completely
+    // unrelated object's identity, and the client fell back to the platform
+    // default trust store — rejecting the test's self-signed CA with
+    // `SSLHandshakeException: ... UnknownIssuer`.
+    //
+    // Match by `ClassId` (via a single `class_id_by_name` lookup), NOT by
+    // `class_name_of_id` on each candidate object: `alloc_concurrent_synthetic`
+    // itself documents that `class_name_of_id` can misreport an
+    // interface-like synthetic class (this carrier's declared type,
+    // `SSLSocketFactory`, is abstract) back as `java/lang/Object` — a
+    // name-string comparison at each node silently found nothing and this
+    // first attempt returned `None` every time, never actually resolving the
+    // wrapped SSLContext. `class_id_by_name` performed ONCE up front and
+    // compared by `ClassId` equality is immune to that per-object name
+    // misreport. Also explore EVERY reachable Object-typed field (bounded
+    // breadth/depth) rather than trying to first guess which one is
+    // "SSLSocketFactory-shaped" — that guess is exactly what needed the
+    // now-unreliable name check.
+    fn resolve_sslcontext_from_factory(
+        ctx: &mut dyn cratonvm_native_api::NativeContext,
+        factory: ObjectRef,
+    ) -> Option<ObjectRef> {
+        // `class_num_total_fields` is NOT trustworthy here: our own synthetic
+        // `SSLSocketFactory` carrier (`alloc_concurrent_synthetic(...,
+        // "javax/net/ssl/SSLSocketFactory", 1)`) reports 0 total fields for
+        // its ClassId even though it was allocated with (and, per
+        // `get_field`'s M4a contract, safely holds) exactly 1 real slot —
+        // confirmed via `CRATONVM_DBG_TLS_AUTH` tracing (`cid=ClassId(1046)
+        // nfields=0` for an object that DOES have the SSLContext at index
+        // 0). This is the identical "interface-like synthetic class"
+        // metadata gap `alloc_concurrent_synthetic` itself documents and
+        // works around at allocation time via `num_fields.max(real)` — this
+        // resolver hits the same gap on the READ side, where there is no
+        // equivalent fallback. `get_field` is required (M4a, this trait's
+        // own doc) to bounds-check and fail safe on an out-of-declared-range
+        // index, so scanning a small fixed range unconditionally is safe:
+        // true out-of-bounds reads just come back `Value::Object(None)` and
+        // are silently skipped, never a bad memory access.
+        const FIELD_SCAN_RANGE: usize = 8;
+        const MAX_DEPTH: usize = 6;
+        const MAX_VISITED: usize = 64;
+        let sslcontext_cid = ctx.class_id_by_name("javax/net/ssl/SSLContext");
+        let mut frontier = vec![factory];
+        let mut visited = 0usize;
+        for _ in 0..MAX_DEPTH {
+            let mut next_frontier = Vec::new();
+            for obj in frontier {
+                if visited >= MAX_VISITED {
+                    return None;
+                }
+                visited += 1;
+                let cid = ctx.class_id_of_object(obj);
+                if sslcontext_cid == Some(cid) {
+                    return Some(obj);
+                }
+                for i in 0..FIELD_SCAN_RANGE {
+                    if let Value::Object(Some(candidate)) = ctx.get_field(obj, i) {
+                        let sub_cid = ctx.class_id_of_object(candidate);
+                        if sslcontext_cid == Some(sub_cid) {
+                            return Some(candidate);
+                        }
+                        next_frontier.push(candidate);
+                    }
+                }
+            }
+            if next_frontier.is_empty() {
+                return None;
+            }
+            frontier = next_frontier;
+        }
+        None
+    }
     // Capture the client identity (cert+key) carried by the factory's
     // SSLContext so the native HttpsURLConnection client can present a client
     // certificate for mTLS. `setDefaultSSLSocketFactory` is static (factory =
@@ -4073,7 +4169,7 @@ fn register_https_url_connection(r: &mut NativeMethodRegistry) {
         factory: ObjectRef,
         connection: Option<ObjectRef>,
     ) {
-        if let Value::Object(Some(sslctx)) = ctx.get_field(factory, 0) {
+        if let Some(sslctx) = resolve_sslcontext_from_factory(ctx, factory) {
             if let Some(connection) = connection {
                 capture_huc_ssl_context_for_connection(ctx, connection, sslctx);
             } else {

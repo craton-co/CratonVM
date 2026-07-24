@@ -1,7 +1,15 @@
 # Missing `httpd` binary — 8 integration/proxy classes
 
-**Not a CratonVM bug.** Fails identically on real JDK 25 (HotSpot) in the
-same fixture.
+> ✅ **FULLY RESOLVED, 2026-07-23.** `sudo apt-get install -y apache2`
+> (Debian names the binary `apache2`, not `httpd`) then `sudo ln -sf
+> /usr/sbin/apache2 /usr/local/bin/httpd` (the test only looks for a literal
+> `httpd` on `PATH` unless `-Dtomcat.test.httpd.path` is set). **No further
+> mod_proxy/config work was needed** — all 8 classes below passed on both
+> HotSpot and CratonVM immediately after the symlink, with zero CratonVM
+> regressions found in this category. This is the one fully-clean fix among
+> the 6 in this folder.
+
+**Not a CratonVM bug** — confirmed, all 8 classes now pass on both VMs.
 
 ## Symptom
 

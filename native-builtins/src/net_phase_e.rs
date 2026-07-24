@@ -983,11 +983,16 @@ fn jar_url_entry_size(ext: &str) -> Option<i64> {
         .strip_prefix("jar:file:")
         .or_else(|| ext.strip_prefix("jar:"))?;
     let mut parts = after.splitn(2, "!/");
-    let jar_raw = parts.next()?.trim_start_matches("file:");
+    let jar_raw_enc = parts.next()?.trim_start_matches("file:");
     let entry_name = parts.next()?;
     if entry_name.is_empty() {
         return None;
     }
+    // Percent-decode the jar's own file path — see the matching fix in
+    // URL.openStream's jar:file: handler (TestDeployTask.bug58086a) for why
+    // a `%20` must resolve back to a literal space before touching disk.
+    let jar_raw_owned = uri_percent_decode(jar_raw_enc);
+    let jar_raw = jar_raw_owned.as_str();
     if let Some(bytes) = war_nested_jar_bytes(jar_raw) {
         let cursor = std::io::Cursor::new(bytes.as_slice());
         let mut archive = zip::ZipArchive::new(cursor).ok()?;
@@ -1822,7 +1827,7 @@ fn hash_str_ignore_case(h: i32, s: Option<&str>) -> i32 {
 /// every other character (INCLUDING `+`, which URI leaves literal — unlike
 /// `application/x-www-form-urlencoded`) is copied verbatim. A malformed `%`
 /// escape (missing/non-hex digits) is copied through unchanged.
-fn uri_percent_decode(input: &str) -> String {
+pub(crate) fn uri_percent_decode(input: &str) -> String {
     if !input.contains('%') {
         return input.to_string();
     }
@@ -5758,7 +5763,7 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
                 } else {
                     raw_rest
                 };
-            let (outer_jar, inner_path) = match rest.find("!/") {
+            let (outer_jar_raw, inner_path) = match rest.find("!/") {
                 Some(i) => (&rest[..i], &rest[i + 2..]),
                 None => {
                     return Err(ioex(format!(
@@ -5766,6 +5771,18 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
                     )))
                 }
             };
+            // HotSpot's JarURLConnection percent-decodes the outer jar's own
+            // URL component (`ParseUtil.decode`) before touching disk, so a
+            // `%20` resolves back to a literal space — e.g. a directory
+            // literally named "dir with spaces" is addressed as
+            // `dir%20with%20spaces` in the URL. `outer_jar` previously stayed
+            // encoded, so `std::fs`/`zip` lookups for any percent-escaped jar
+            // path always missed with ENOENT even though the file visibly
+            // exists (TestDeployTask.bug58086a). The entry name after `!/` is
+            // a raw zip entry name, not a URL component, and must NOT be
+            // decoded.
+            let outer_jar_owned = uri_percent_decode(outer_jar_raw);
+            let outer_jar = outer_jar_owned.as_str();
             // Check if the inner_path itself is a nested jar entry (double !/):
             // e.g. "BOOT-INF/lib/spring-boot-2.7.12.jar!/META-INF/spring.factories"
             let buf = if let Some(second_sep) = inner_path.find("!/") {
@@ -6336,15 +6353,18 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
                 .strip_prefix("jar:file:")
                 .or_else(|| ext.strip_prefix("jar:"))
                 .unwrap_or(&ext);
-            let jar_part = after_scheme
+            let jar_part_enc = after_scheme
                 .split("!/")
                 .next()
                 .unwrap_or("")
-                .trim_start_matches("file:")
-                .to_string();
-            if jar_part.is_empty() {
+                .trim_start_matches("file:");
+            if jar_part_enc.is_empty() {
                 return Err(ioex("JarURLConnection.getJarFile: malformed URL"));
             }
+            // Percent-decode the jar file's own URL component — see the
+            // matching fix in URL.openStream's jar:file: handler
+            // (TestDeployTask.bug58086a) for why.
+            let jar_part = uri_percent_decode(jar_part_enc);
             // Resolve to a real on-disk path. `file:` URLs use a leading `/`
             // before a Windows drive letter (`/C:/…`); try the trimmed form
             // first, then the raw form for POSIX absolute paths — mirrors the

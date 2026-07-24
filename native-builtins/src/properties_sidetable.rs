@@ -1816,6 +1816,76 @@ fn native_properties_put_if_absent(
     Ok(Some(Value::Object(None)))
 }
 
+/// Native `Properties.computeIfAbsent(Object, Function)Object` with the same
+/// side-table-aware storage semantics as `put` and `get`.
+fn native_properties_compute_if_absent(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    let function = match args.get(2) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+
+    // `get`, `Function.apply`, and `put` can all re-enter Java and collect.
+    // Keep every live reference rooted, then refresh it before each use.
+    let roots_base = ctx.pin_native_root(this);
+    let key_pin = match key {
+        Value::Object(Some(o)) => Some((ctx.pin_native_root(o), o)),
+        _ => None,
+    };
+    let function_pin = ctx.pin_native_root(function);
+    let read_key = |ctx: &mut dyn NativeContext| match key_pin {
+        Some((pin, original)) => Value::Object(Some(ctx.read_native_pin(pin, original))),
+        None => key,
+    };
+
+    let this_cur = ctx.read_native_pin(roots_base, this);
+    let key_cur = read_key(ctx);
+    let existing = native_properties_get(ctx, &[Value::Object(Some(this_cur)), key_cur])?;
+    if matches!(existing, Some(Value::Object(Some(_)))) {
+        ctx.unpin_native_roots(roots_base);
+        return Ok(existing);
+    }
+
+    let function_cur = ctx.read_native_pin(function_pin, function);
+    let key_cur = read_key(ctx);
+    let computed = ctx.invoke_virtual(
+        function_cur,
+        "apply",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+        &[key_cur],
+    )?;
+    let value = computed.unwrap_or(Value::Object(None));
+    if matches!(value, Value::Object(None)) {
+        ctx.unpin_native_roots(roots_base);
+        return Ok(Some(Value::Object(None)));
+    }
+    let value_pin = match value {
+        Value::Object(Some(o)) => Some((ctx.pin_native_root(o), o)),
+        _ => None,
+    };
+
+    let this_cur = ctx.read_native_pin(roots_base, this);
+    let key_cur = read_key(ctx);
+    let value_cur = match value_pin {
+        Some((pin, original)) => Value::Object(Some(ctx.read_native_pin(pin, original))),
+        None => value,
+    };
+    native_properties_put(ctx, &[Value::Object(Some(this_cur)), key_cur, value_cur])?;
+    let result = match value_pin {
+        Some((pin, original)) => Value::Object(Some(ctx.read_native_pin(pin, original))),
+        None => value,
+    };
+    ctx.unpin_native_roots(roots_base);
+    Ok(Some(result))
+}
+
 /// Native `Properties.remove(Object) Object` — symmetric with `put` /
 /// `setProperty`.  JDK 25's `Properties.remove` (Properties.java:1348)
 /// delegates to `map.remove(key)` where `map` is the private
@@ -3254,6 +3324,16 @@ pub fn register_properties_sidetable(registry: &mut NativeMethodRegistry) {
         "putIfAbsent",
         "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
         native_properties_put_if_absent,
+    );
+    // JDK 25's Properties.computeIfAbsent delegates directly to the private
+    // ConcurrentHashMap `map`. Synthetic Properties keep String entries in
+    // this side table, so route the functional update through the same get/put
+    // bridges. Spring's MapBinder uses exactly this path.
+    registry.register(
+        "java/util/Properties",
+        "computeIfAbsent",
+        "(Ljava/lang/Object;Ljava/util/function/Function;)Ljava/lang/Object;",
+        native_properties_compute_if_absent,
     );
     });
 }

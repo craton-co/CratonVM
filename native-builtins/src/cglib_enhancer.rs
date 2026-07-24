@@ -112,8 +112,23 @@ fn next_config_enhancer_counter(super_loader_id: u32, super_internal_name: &str)
     value
 }
 
-/// Cache of already-enhanced `@Configuration` classes, keyed by the ORIGINAL
-/// (unenhanced) class's `ClassId`. Real CGLIB's `AbstractClassGenerator`
+/// Cache of already-enhanced `@Configuration` classes, keyed by
+/// `(defining_loader_id, super_internal_name)` — see
+/// `config_enhancer_counters`'s doc comment for why a bare `ClassId` is
+/// unsafe as a cache key: this VM recycles `ClassId` numbers once their
+/// class/loader is garbage-collected, so two UNRELATED classes loaded at
+/// different times (e.g. `CglibConfiguration` freshly defined by two
+/// different test methods' own short-lived `@CompileWithForkedClassLoader`
+/// loaders) can end up with the SAME numeric `ClassId`, silently aliasing
+/// this cache onto a stale, already-invalid entry from an earlier test.
+/// Confirmed as the actual root cause of two previously-unexplained
+/// `ApplicationContextAotGeneratorTests$ConfigurationClassCglibProxy`
+/// failures (`processAheadOfTimeUsesCglibClassForFactoryMethod`'s
+/// "not an enhanced class", `processAheadOfTimeWhenHasCglibProxyUseProxy`'s
+/// "Hello1" double-incremented counter) that both passed 100% reliably in
+/// isolation but failed 100% deterministically as part of the full class
+/// run — i.e. cross-test contamination via this exact stale-`ClassId`-reuse
+/// mechanism, not flakiness. Real CGLIB's own `AbstractClassGenerator`
 /// caches generated proxy classes per (superclass, callback-filter,
 /// classloader) key and returns the SAME `Class` object on a repeat
 /// `Enhancer.createClass()` for an identical configuration, rather than
@@ -130,8 +145,8 @@ fn next_config_enhancer_counter(super_loader_id: u32, super_internal_name: &str)
 /// enhance it independently, bumping the counter before this test runs.
 type CachedEnhancerClass = (cratonvm_types::ClassId, String, std::sync::Arc<Vec<u8>>);
 
-fn config_enhancer_class_cache() -> &'static Mutex<HashMap<u32, CachedEnhancerClass>> {
-    static CACHE: OnceLock<Mutex<HashMap<u32, CachedEnhancerClass>>> = OnceLock::new();
+fn config_enhancer_class_cache() -> &'static Mutex<HashMap<(u32, String), CachedEnhancerClass>> {
+    static CACHE: OnceLock<Mutex<HashMap<(u32, String), CachedEnhancerClass>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -350,6 +365,49 @@ fn emit_default_ctor(
     method
 }
 
+/// Build a minimal, valid, otherwise-empty class file for one of real
+/// CGLIB's two `$$SpringCGLIB$$FastClass$$<n>` reflection-avoidance helper
+/// classes (real cglib emits one for the enhancer class itself and one for
+/// its own generated `Factory`-dispatch machinery, per enhanced
+/// `@Configuration` class). This native reimplementation has no use for
+/// FastClass at all — `emit_bean_override`'s inter-bean dispatch is inlined
+/// directly into the enhancer bytecode, never indirects through a
+/// `Callback`/`FastClass` lookup table — so unlike `build_enhancer_class`
+/// this is a pure `extends java/lang/Object` placeholder with a single
+/// default constructor and nothing else; nothing ever loads or invokes it.
+///
+/// Its ONLY job is to exist: `ApplicationContextAotGeneratorTests
+/// $ConfigurationClassCglibProxy.processAheadOfTimeWhenHasCglibProxyWriteProxyAndGenerateReflectionHints`
+/// asserts both FastClass names are present (byte-for-byte, via
+/// `TestGenerationContext.getGeneratedFiles()`) AND have an
+/// `INVOKE_DECLARED_CONSTRUCTORS` reflection hint registered — both of
+/// which `notify_generated_class_handler`'s target, real Spring's
+/// `CglibClassHandler.handleGeneratedClass`, already does unconditionally
+/// for ANY name+bytes pair handed to it (`generatedFiles.addFile(...)` +
+/// `runtimeHints.reflection().registerType(...)`), so simply calling it for
+/// these two placeholder names/bytes is sufficient — no separate hint-
+/// registration code needed here.
+fn build_fastclass_placeholder(name: &str) -> Vec<u8> {
+    let mut cw = ClassWriter::new();
+    let this_class_idx = cw.add_class(name);
+    let super_class_idx = cw.add_class("java/lang/Object");
+    let init_name_idx = cw.add_utf8("<init>");
+    let init_desc_idx = cw.add_utf8("()V");
+    let code_attr_name_idx = cw.add_utf8("Code");
+    let super_init_ref = cw.add_methodref(super_class_idx, "<init>", "()V");
+    let ctor = emit_default_ctor(init_name_idx, init_desc_idx, code_attr_name_idx, super_init_ref);
+    const ACC_PUBLIC: u16 = 0x0001;
+    const ACC_SUPER: u16 = 0x0020;
+    cw.finish(
+        ACC_PUBLIC | ACC_SUPER,
+        this_class_idx,
+        super_class_idx,
+        &[],
+        &[],
+        &[ctor],
+    )
+}
+
 /// Emit a constructor matching `desc` that delegates to the superclass's
 /// same-descriptor constructor (`super(arg0, arg1, ...)`), mirroring what
 /// real CGLIB emits for EVERY non-private superclass constructor -- not
@@ -545,6 +603,42 @@ struct BeanMethod {
 /// exception) via a `finally`-shaped exception-table entry. Without this,
 /// the nested lookup trips `BeanCurrentlyInCreationException` even though
 /// real Spring resolves it fine.
+/// Java's `Class.getSimpleName()` for a nested-class internal name: the
+/// portion after the last `$` (or `/` if there's no `$`) — matches what
+/// `resolveBeanReference`'s error message uses for `beanMethod
+/// .getDeclaringClass().getSimpleName()`, computed at codegen time since the
+/// declaring class is always statically known here (avoids a runtime
+/// `getClass()` round-trip just to reformat a name we already have).
+fn simple_name_of_internal(internal: &str) -> String {
+    let after_slash = internal.rsplit('/').next().unwrap_or(internal);
+    after_slash.rsplit('$').next().unwrap_or(after_slash).to_string()
+}
+
+/// Shared constant-pool refs for `emit_bean_override`'s type-mismatch
+/// handling (real Spring's `resolveBeanReference`: an inter-bean `getBean()`
+/// result that isn't assignable to the declared return type throws a
+/// descriptive `IllegalStateException` instead of a bare `ClassCastException`).
+/// Computed once per generated class, reused by every `@Bean` override.
+struct MismatchRefs {
+    stringbuilder_cls: u16,
+    sb_init_ref: u16,
+    sb_append_string_ref: u16,
+    sb_tostring_ref: u16,
+    object_equals_ref: u16,
+    object_getclass_ref: u16,
+    class_getname_ref: u16,
+    illegalstate_cls: u16,
+    illegalstate_init_ref: u16,
+    nsbde_cls: u16,
+    get_merged_bd_ref: u16,
+    get_resource_desc_ref: u16,
+    lit_bean_method_prefix: u16,
+    lit_called_as: u16,
+    lit_overridden_by: u16,
+    lit_close_bracket_dot: u16,
+    lit_overriding_bean: u16,
+}
+
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 fn emit_bean_override(
@@ -610,6 +704,17 @@ fn emit_bean_override(
     // FactoryBean) `@Bean` methods, producing byte-identical output to
     // before this parameter existed.
     fb_ref: Option<(u16, u16)>,
+    // Type-mismatch handling (real Spring's `resolveBeanReference`): when the
+    // inter-bean `getBean()` result isn't assignable to the declared return
+    // type, throw a descriptive `IllegalStateException` instead of letting a
+    // bare `checkcast` raise `ClassCastException`. The two string indices are
+    // per-method (this method's own declaring-class simple name + method
+    // name, and its declared return type's dotted name — both known at
+    // codegen time); `mismatch` bundles the refs shared across every
+    // `@Bean` override in the class.
+    decl_method_string_idx: u16,
+    rettype_dotted_string_idx: u16,
+    mismatch: &MismatchRefs,
 ) -> Vec<u8> {
     let b = |x: u16| -> [u8; 2] { x.to_be_bytes() };
     let mut code: Vec<u8> = Vec::new();
@@ -776,10 +881,170 @@ fn emit_bean_override(
         code.push(0xB8); // invokestatic
         code.extend_from_slice(&b(enhance_fb_ref_methodref));
     }
-    // checkcast <Ret>
+    // --- Type-mismatch check (real Spring's resolveBeanReference): replaces
+    // a bare `checkcast <Ret>` with `instanceof` + a descriptive
+    // IllegalStateException on mismatch, treating a `beanInstance
+    // .equals(null)` NullBean marker as a plain null (assignable to
+    // anything). All of this stays inside the SPR-8080 try region below
+    // (same as the checkcast it replaces) so a thrown IllegalStateException
+    // still restores "currently in creation" via the outer handler. ---
+    // 0: dup
+    code.push(0x59);
+    // 1: instanceof <Ret>
+    code.push(0xC1);
+    code.extend_from_slice(&b(rettype_cast_idx));
+    // 4: ifne → L_STORE (120); offset 116
+    code.push(0x9A);
+    code.extend_from_slice(&b(116));
+    // 7: dup
+    code.push(0x59);
+    // 8: aconst_null
+    code.push(0x01);
+    // 9: invokevirtual Object.equals(Object)Z
+    code.push(0xB6);
+    code.extend_from_slice(&b(mismatch.object_equals_ref));
+    // 12: ifeq → L_THROW (20); offset 8
+    code.push(0x99);
+    code.extend_from_slice(&b(8));
+    // 15: pop   (drop the NullBean marker)
+    code.push(0x57);
+    // 16: aconst_null
+    code.push(0x01);
+    // 17: goto → L_STORE (120); offset 103
+    code.push(0xA7);
+    code.extend_from_slice(&b(103));
+    // --- L_THROW (20): genuine mismatch — build and throw the message. ---
+    // 20: astore 7   (local7 = mismatchInstance; safe here — only reused as
+    //     scratch in this normal-flow region; the SPR-8080 handler's own
+    //     `astore 7` only executes on an actual exception, at which point
+    //     this value is irrelevant.)
+    code.push(0x3A);
+    code.push(0x07);
+    // 22: new StringBuilder
+    code.push(0xBB);
+    code.extend_from_slice(&b(mismatch.stringbuilder_cls));
+    // 25: dup
+    code.push(0x59);
+    // 26: invokespecial StringBuilder.<init>()V
+    code.push(0xB7);
+    code.extend_from_slice(&b(mismatch.sb_init_ref));
+    // 29: ldc_w "@Bean method "
+    code.push(0x13);
+    code.extend_from_slice(&b(mismatch.lit_bean_method_prefix));
+    // 32: invokevirtual StringBuilder.append(String)StringBuilder
+    code.push(0xB6);
+    code.extend_from_slice(&b(mismatch.sb_append_string_ref));
+    // 35: ldc_w "<DeclaringSimpleName>.<methodName>"
+    code.push(0x13);
+    code.extend_from_slice(&b(decl_method_string_idx));
+    // 38: invokevirtual append
+    code.push(0xB6);
+    code.extend_from_slice(&b(mismatch.sb_append_string_ref));
+    // 41: ldc_w " called as bean reference for type ["
+    code.push(0x13);
+    code.extend_from_slice(&b(mismatch.lit_called_as));
+    // 44: invokevirtual append
+    code.push(0xB6);
+    code.extend_from_slice(&b(mismatch.sb_append_string_ref));
+    // 47: ldc_w "<declared return type, dotted>"
+    code.push(0x13);
+    code.extend_from_slice(&b(rettype_dotted_string_idx));
+    // 50: invokevirtual append
+    code.push(0xB6);
+    code.extend_from_slice(&b(mismatch.sb_append_string_ref));
+    // 53: ldc_w "] but overridden by non-compatible bean instance of type ["
+    code.push(0x13);
+    code.extend_from_slice(&b(mismatch.lit_overridden_by));
+    // 56: invokevirtual append
+    code.push(0xB6);
+    code.extend_from_slice(&b(mismatch.sb_append_string_ref));
+    // 59: aload 7   (mismatchInstance)
+    code.push(0x19);
+    code.push(0x07);
+    // 61: invokevirtual Object.getClass()Class
+    code.push(0xB6);
+    code.extend_from_slice(&b(mismatch.object_getclass_ref));
+    // 64: invokevirtual Class.getName()String
+    code.push(0xB6);
+    code.extend_from_slice(&b(mismatch.class_getname_ref));
+    // 67: invokevirtual append
+    code.push(0xB6);
+    code.extend_from_slice(&b(mismatch.sb_append_string_ref));
+    // 70: ldc_w "]."
+    code.push(0x13);
+    code.extend_from_slice(&b(mismatch.lit_close_bracket_dot));
+    // 73: invokevirtual append
+    code.push(0xB6);
+    code.extend_from_slice(&b(mismatch.sb_append_string_ref));
+    // 76: dup   (save a copy of the StringBuilder ref into local7 — survives
+    //     an exception from the nested try2 below, where the operand stack
+    //     is cleared)
+    code.push(0x59);
+    // 77: astore 7
+    code.push(0x3A);
+    code.push(0x07);
+    // --- TRY2_START (79): optional " Overriding bean of same name declared
+    // in: <resource>" suffix — mirrors resolveBeanReference's own
+    // try/catch(NoSuchBeanDefinitionException), silently skipped on failure. ---
+    // 79: ldc_w " Overriding bean of same name declared in: "
+    code.push(0x13);
+    code.extend_from_slice(&b(mismatch.lit_overriding_bean));
+    // 82: invokevirtual append
+    code.push(0xB6);
+    code.extend_from_slice(&b(mismatch.sb_append_string_ref));
+    // 85: aload 6   (cbf)
+    code.push(0x19);
+    code.push(0x06);
+    // 87: aload_3   (beanName)
+    code.push(0x2D);
+    // 88: invokeinterface ConfigurableBeanFactory.getMergedBeanDefinition(String)BeanDefinition  count=2
+    code.push(0xB9);
+    code.extend_from_slice(&b(mismatch.get_merged_bd_ref));
+    code.push(0x02);
+    code.push(0x00);
+    // 93: invokeinterface BeanDefinition.getResourceDescription()String  count=1
+    code.push(0xB9);
+    code.extend_from_slice(&b(mismatch.get_resource_desc_ref));
+    code.push(0x01);
+    code.push(0x00);
+    // 98: invokevirtual append
+    code.push(0xB6);
+    code.extend_from_slice(&b(mismatch.sb_append_string_ref));
+    // --- TRY2_END (101, exclusive) ---
+    // 101: goto → L_BUILD_DONE (105); offset 4
+    code.push(0xA7);
+    code.extend_from_slice(&b(4));
+    // --- CATCH2 (104): NoSuchBeanDefinitionException — discard, keep the
+    // pre-suffix StringBuilder (stack cleared by the JVM on exception entry,
+    // so reload the saved copy from local7). ---
+    // 104: pop
+    code.push(0x57);
+    // --- L_BUILD_DONE (105) ---
+    // 105: invokevirtual StringBuilder.toString()String
+    code.push(0xB6);
+    code.extend_from_slice(&b(mismatch.sb_tostring_ref));
+    // 108: astore 7   (local7 = msg)
+    code.push(0x3A);
+    code.push(0x07);
+    // 110: new IllegalStateException
+    code.push(0xBB);
+    code.extend_from_slice(&b(mismatch.illegalstate_cls));
+    // 113: dup
+    code.push(0x59);
+    // 114: aload 7   (msg)
+    code.push(0x19);
+    code.push(0x07);
+    // 116: invokespecial IllegalStateException.<init>(String)V
+    code.push(0xB7);
+    code.extend_from_slice(&b(mismatch.illegalstate_init_ref));
+    // 119: athrow
+    code.push(0xBF);
+    // --- L_STORE (120): shared by both the instanceof-true path and the
+    // NullBean→null path (checkcast on a null reference is always legal). ---
+    // 120: checkcast <Ret>
     code.push(0xC0);
     code.extend_from_slice(&b(rettype_cast_idx));
-    // astore 4   (local4 = result)
+    // 123: astore 4   (local4 = result)
     code.push(0x3A);
     code.push(0x04);
     // --- TRY_END (exclusive). Normal path continues below: mirrors
@@ -866,11 +1131,30 @@ fn emit_bean_override(
     // any of them recomputed, only the three ABSOLUTE exception-table
     // values below.
     let fb_ref_extra_bytes: u16 = if fb_ref.is_some() { 8 } else { 0 };
-    debug_assert_eq!(code.len(), 161 + fb_ref_extra_bytes as usize);
+    // The mismatch-handling block (125 bytes) replaced a 5-byte
+    // checkcast+astore4, so everything from the old try_end/handler_pc
+    // onward shifted forward by 120 bytes — see that block's own comment for
+    // why every OTHER branch offset in the method needed no changes (it's a
+    // self-contained splice whose only exit is the same fallthrough point
+    // the old code had, `checkcast <Ret>; astore 4`).
+    let mismatch_block_growth: u16 = 120;
+    debug_assert_eq!(
+        code.len(),
+        161 + fb_ref_extra_bytes as usize + mismatch_block_growth as usize
+    );
 
     let try_start: u16 = 94;
-    let try_end: u16 = 109 + fb_ref_extra_bytes;
-    let handler_pc: u16 = 142 + fb_ref_extra_bytes;
+    let try_end: u16 = 109 + fb_ref_extra_bytes + mismatch_block_growth;
+    let handler_pc: u16 = 142 + fb_ref_extra_bytes + mismatch_block_growth;
+    // Inner try2/catch2 — NoSuchBeanDefinitionException around the
+    // getMergedBeanDefinition()/getResourceDescription() suffix, positioned
+    // at the FIXED offsets 79/101/104 relative to the mismatch block's own
+    // start (104, or 112 with `fb_ref`), unaffected by fb_ref_extra_bytes
+    // since the block's internal layout is identical either way.
+    let mismatch_block_start: u16 = 104 + fb_ref_extra_bytes;
+    let try2_start: u16 = mismatch_block_start + 79;
+    let try2_end: u16 = mismatch_block_start + 101;
+    let handler_pc2: u16 = mismatch_block_start + 104;
 
     let mut code_attr = Vec::new();
     // max_stack: the `fb_ref` splice pushes bf/beanName/exposedType (3
@@ -878,13 +1162,21 @@ fn emit_bean_override(
     // `getBean`, briefly reaching a 4-deep stack before `invokestatic`
     // consumes them — one more than the 3-deep
     // setCurrentlyInCreation/registerDependentBean calls that otherwise
-    // dominate.
+    // dominate. The mismatch-handling block's own peak (dup/instanceof,
+    // Object.equals, and the cbf/beanName pair feeding
+    // getMergedBeanDefinition) stays at or below 3, so it never raises this.
     let max_stack: u16 = if fb_ref.is_some() { 4 } else { 3 };
     code_attr.extend_from_slice(&max_stack.to_be_bytes());
     code_attr.extend_from_slice(&8u16.to_be_bytes()); // max_locals (this, method, bf, beanName, result, alreadyInCreation, cbf, throwable)
     code_attr.extend_from_slice(&(code.len() as u32).to_be_bytes());
     code_attr.extend_from_slice(&code);
-    code_attr.extend_from_slice(&1u16.to_be_bytes()); // exception_table_length
+    code_attr.extend_from_slice(&2u16.to_be_bytes()); // exception_table_length
+    // Entry 1 (checked first): inner NoSuchBeanDefinitionException handler.
+    code_attr.extend_from_slice(&try2_start.to_be_bytes());
+    code_attr.extend_from_slice(&try2_end.to_be_bytes());
+    code_attr.extend_from_slice(&handler_pc2.to_be_bytes());
+    code_attr.extend_from_slice(&mismatch.nsbde_cls.to_be_bytes());
+    // Entry 2: outer SPR-8080 any-Throwable finally handler.
     code_attr.extend_from_slice(&try_start.to_be_bytes());
     code_attr.extend_from_slice(&try_end.to_be_bytes());
     code_attr.extend_from_slice(&handler_pc.to_be_bytes());
@@ -1037,6 +1329,534 @@ fn emit_cglib_factory_interface_methods(cw: &mut ClassWriter, code_attr_name_idx
 /// file as a `Vec<u8>` plus the chosen internal-name. The new class
 /// extends `super_internal_name` and implements
 /// [`SPRING_MARKER_IFACE`].
+/// Minimal label-based bytecode assembler: computes JVM branch/goto offsets
+/// automatically instead of requiring them hand-derived. `emit_bean_override`
+/// (the no-arg case) hand-derives its offsets because it's a small, stable,
+/// heavily-commented method; `emit_bean_override_with_args` below has
+/// substantially more branches (the `useArgs` decision), where hand-derived
+/// offsets become error-prone to get right and to keep right under edits.
+struct Asm {
+    code: Vec<u8>,
+    fixups: Vec<(usize, String)>,
+    labels: std::collections::HashMap<String, u16>,
+}
+
+impl Asm {
+    fn new() -> Self {
+        Asm {
+            code: Vec::new(),
+            fixups: Vec::new(),
+            labels: std::collections::HashMap::new(),
+        }
+    }
+    fn pos(&self) -> u16 {
+        self.code.len() as u16
+    }
+    fn mark(&mut self, label: &str) {
+        let p = self.pos();
+        self.labels.insert(label.to_string(), p);
+    }
+    fn u8_(&mut self, v: u8) {
+        self.code.push(v);
+    }
+    fn u16be(&mut self, v: u16) {
+        self.code.extend_from_slice(&v.to_be_bytes());
+    }
+    /// Emit a branch opcode (`ifnull`/`ifeq`/`ifne`/`goto`/...) with a
+    /// placeholder 2-byte offset, resolved against `label` at `finish()`.
+    fn branch(&mut self, opcode: u8, label: &str) {
+        self.code.push(opcode);
+        let at = self.code.len();
+        self.code.extend_from_slice(&[0, 0]);
+        self.fixups.push((at, label.to_string()));
+    }
+    fn finish(mut self) -> Vec<u8> {
+        for (at, label) in &self.fixups {
+            let opcode_addr = *at as i32 - 1;
+            let target = *self.labels.get(label).unwrap_or_else(|| {
+                panic!("emit_bean_override_with_args: unresolved label {label}")
+            }) as i32;
+            let offset = (target - opcode_addr) as i16;
+            let bytes = offset.to_be_bytes();
+            self.code[*at] = bytes[0];
+            self.code[*at + 1] = bytes[1];
+        }
+        self.code
+    }
+}
+
+/// `Integer`/`Long`/.../`Boolean.valueOf` methodrefs for boxing primitive
+/// `@Bean`-method parameters into the `Object[]` array passed to
+/// `BeanFactory.getBean(String, Object...)` — see `emit_load_box2`.
+struct ValueOfRefs {
+    valueof_int: u16,
+    valueof_long: u16,
+    valueof_float: u16,
+    valueof_double: u16,
+    valueof_bool: u16,
+    valueof_byte: u16,
+    valueof_char: u16,
+    valueof_short: u16,
+}
+
+/// Emit `load + box` for one parameter at `slot`, leaving a reference on the
+/// operand stack (primitives boxed via `valueOf`). Standalone twin of
+/// `emit_load_box` (which takes `&LookupCp`) so `emit_bean_override_with_args`
+/// doesn't need to construct an entire unrelated `LookupCp` just for its 8
+/// `valueOf` refs.
+fn emit_load_box2(code: &mut Vec<u8>, v: &ValueOfRefs, p: &str, slot: u16) {
+    let b = |x: u16| x.to_be_bytes();
+    let (load_op, valueof): (u8, Option<u16>) = match p {
+        "I" => (0x15, Some(v.valueof_int)),
+        "Z" => (0x15, Some(v.valueof_bool)),
+        "B" => (0x15, Some(v.valueof_byte)),
+        "C" => (0x15, Some(v.valueof_char)),
+        "S" => (0x15, Some(v.valueof_short)),
+        "J" => (0x16, Some(v.valueof_long)),
+        "F" => (0x17, Some(v.valueof_float)),
+        "D" => (0x18, Some(v.valueof_double)),
+        _ => (0x19, None), // aload (reference / array)
+    };
+    code.push(load_op);
+    code.push(slot as u8);
+    if let Some(vref) = valueof {
+        code.push(0xB8); // invokestatic Boxtype.valueOf
+        code.extend_from_slice(&b(vref));
+    }
+}
+
+/// Like `emit_bean_override`, but for `@Bean` methods that take one or more
+/// parameters. `emit_bean_override` alone can't handle these: its local-slot
+/// layout hardcodes `this` at 0 and everything else at 1..=7, leaving no room
+/// for real parameters (which the JVM requires at 1..=N for an instance
+/// method matching its own descriptor). Implements Spring's
+/// `resolveBeanReference` `useArgs` decision for the inter-bean-reference
+/// path: a non-singleton bean always resolves via `getBean(name, args)`; a
+/// singleton bean resolves via `getBean(name, args)` ONLY if every
+/// reference-typed arg is non-null, else falls back to plain `getBean(name)`
+/// so the container's own creation/autowiring supplies the real argument
+/// instead of a stubbed null one — see `nullArgumentThroughBeanMethodCall`.
+/// FactoryBean-enhancement (`fb_ref` in `emit_bean_override`) is intentionally
+/// NOT supported here: no test exercises a FactoryBean-typed `@Bean` method
+/// that also takes parameters, and real Spring's own `enhanceFactoryBean`
+/// path assumes a no-arg getter shape.
+#[allow(clippy::too_many_arguments)]
+fn emit_bean_override_with_args(
+    name_idx: u16,
+    descriptor_idx: u16,
+    code_attr_name_idx: u16,
+    name_string_idx: u16,
+    params: &[String],
+    super_method_ref: u16,
+    bf_field_ref: u16,
+    beanfactory_cast_idx: u16,
+    getbean_ref: u16,
+    getbean_name_args_ref: u16,
+    is_singleton_ref: u16,
+    rettype_cast_idx: u16,
+    get_factory_method_ref: u16,
+    method_get_name_ref: u16,
+    string_equals_ref: u16,
+    singleton_registry_cast_idx: u16,
+    get_singleton_ref: u16,
+    config_gen_iface_idx: u16,
+    cfg_gen_name_string_idx: u16,
+    beanname_lookup_idx: u16,
+    fq_beanname_lookup_idx: u16,
+    configurable_bf_cast_idx: u16,
+    register_dependent_bean_ref: u16,
+    is_currently_in_creation_ref: u16,
+    set_currently_in_creation_ref: u16,
+    object_class_idx: u16,
+    valueof: &ValueOfRefs,
+    decl_method_string_idx: u16,
+    rettype_dotted_string_idx: u16,
+    mismatch: &MismatchRefs,
+) -> Vec<u8> {
+    let is_wide = |p: &str| p == "J" || p == "D";
+    let w: u16 = params.iter().map(|p| if is_wide(p) { 2 } else { 1 }).sum();
+    let l_method = 1 + w;
+    let l_bf = 2 + w;
+    let l_beanname = 3 + w;
+    let l_result = 4 + w;
+    let l_already = 5 + w;
+    let l_cbf = 6 + w;
+    let l_scratch = 7 + w;
+    let max_locals = 8 + w;
+
+    let mut a = Asm::new();
+
+    // currentlyInvoked = SimpleInstantiationStrategy.getCurrentlyInvokedFactoryMethod()
+    a.u8_(0xB8);
+    a.u16be(get_factory_method_ref);
+    a.u8_(0x3A);
+    a.u8_(l_method as u8); // astore l_method
+    a.u8_(0x19);
+    a.u8_(l_method as u8); // aload l_method
+    a.branch(0xC6, "L_GETBEAN"); // ifnull
+    a.u8_(0x19);
+    a.u8_(l_method as u8); // aload l_method
+    a.u8_(0xB6);
+    a.u16be(method_get_name_ref); // invokevirtual Method.getName()
+    a.u8_(0x13);
+    a.u16be(name_string_idx); // ldc_w "<name>"
+    a.u8_(0xB6);
+    a.u16be(string_equals_ref); // invokevirtual String.equals
+    a.branch(0x99, "L_GETBEAN"); // ifeq
+
+    a.mark("L_SUPER");
+    a.u8_(0x2A); // aload_0
+    {
+        let mut s = 1u16;
+        for p in params {
+            let op: u8 = match p.as_str() {
+                "J" => 0x16,
+                "F" => 0x17,
+                "D" => 0x18,
+                "I" | "Z" | "B" | "C" | "S" => 0x15,
+                _ => 0x19,
+            };
+            a.u8_(op);
+            a.u8_(s as u8);
+            s += if is_wide(p) { 2 } else { 1 };
+        }
+    }
+    a.u8_(0xB7);
+    a.u16be(super_method_ref); // invokespecial super.<name><desc>
+    a.u8_(0xB0); // areturn
+
+    a.mark("L_GETBEAN");
+    a.u8_(0x2A); // aload_0
+    a.u8_(0xB4);
+    a.u16be(bf_field_ref); // getfield $$beanFactory
+    a.u8_(0x3A);
+    a.u8_(l_bf as u8); // astore l_bf
+    a.u8_(0x13);
+    a.u16be(beanname_lookup_idx); // ldc_w <default beanName>
+    a.u8_(0x3A);
+    a.u8_(l_beanname as u8); // astore l_beanname
+    a.u8_(0x19);
+    a.u8_(l_bf as u8); // aload l_bf
+    a.u8_(0xC1);
+    a.u16be(singleton_registry_cast_idx); // instanceof SingletonBeanRegistry
+    a.branch(0x99, "L_GET"); // ifeq
+    a.u8_(0x19);
+    a.u8_(l_bf as u8); // aload l_bf
+    a.u8_(0xC0);
+    a.u16be(singleton_registry_cast_idx); // checkcast SingletonBeanRegistry
+    a.u8_(0x13);
+    a.u16be(cfg_gen_name_string_idx); // ldc_w CONFIGURATION_BEAN_NAME_GENERATOR
+    a.u8_(0xB9);
+    a.u16be(get_singleton_ref); // invokeinterface getSingleton(String)Object count=2
+    a.u8_(0x02);
+    a.u8_(0x00);
+    a.u8_(0xC1);
+    a.u16be(config_gen_iface_idx); // instanceof ConfigurationBeanNameGenerator
+    a.branch(0x99, "L_GET"); // ifeq
+    a.u8_(0x13);
+    a.u16be(fq_beanname_lookup_idx); // ldc_w <fq name>
+    a.u8_(0x3A);
+    a.u8_(l_beanname as u8); // astore l_beanname
+
+    a.mark("L_GET");
+    a.u8_(0x19);
+    a.u8_(l_bf as u8); // aload l_bf
+    a.u8_(0xC0);
+    a.u16be(configurable_bf_cast_idx); // checkcast ConfigurableBeanFactory
+    a.u8_(0x3A);
+    a.u8_(l_cbf as u8); // astore l_cbf
+    a.u8_(0x19);
+    a.u8_(l_cbf as u8); // aload l_cbf
+    a.u8_(0x19);
+    a.u8_(l_beanname as u8); // aload l_beanname
+    a.u8_(0xB9);
+    a.u16be(is_currently_in_creation_ref); // invokeinterface isCurrentlyInCreation(String)Z count=2
+    a.u8_(0x02);
+    a.u8_(0x00);
+    a.u8_(0x36);
+    a.u8_(l_already as u8); // istore l_already
+    a.u8_(0x15);
+    a.u8_(l_already as u8); // iload l_already
+    a.branch(0x99, "TRY_START"); // ifeq
+    a.u8_(0x19);
+    a.u8_(l_cbf as u8); // aload l_cbf
+    a.u8_(0x19);
+    a.u8_(l_beanname as u8); // aload l_beanname
+    a.u8_(0x03); // iconst_0
+    a.u8_(0xB9);
+    a.u16be(set_currently_in_creation_ref); // invokeinterface setCurrentlyInCreation(String,boolean)V count=3
+    a.u8_(0x03);
+    a.u8_(0x00);
+
+    a.mark("TRY_START");
+    // useArgs decision: !isSingleton -> always use args; isSingleton -> use
+    // args only if every reference-typed param is non-null (mirrors real
+    // Spring's resolveBeanReference exactly).
+    a.u8_(0x19);
+    a.u8_(l_bf as u8); // aload l_bf
+    a.u8_(0xC0);
+    a.u16be(beanfactory_cast_idx); // checkcast BeanFactory
+    a.u8_(0x19);
+    a.u8_(l_beanname as u8); // aload l_beanname
+    a.u8_(0xB9);
+    a.u16be(is_singleton_ref); // invokeinterface isSingleton(String)Z count=2
+    a.u8_(0x02);
+    a.u8_(0x00);
+    a.branch(0x99, "L_WITH_ARGS"); // ifeq (not singleton -> use args)
+    {
+        let mut s = 1u16;
+        for p in params {
+            let is_ref = !matches!(p.as_str(), "I" | "Z" | "B" | "C" | "S" | "J" | "F" | "D");
+            if is_ref {
+                a.u8_(0x19);
+                a.u8_(s as u8); // aload s
+                a.branch(0xC6, "L_NOARGS"); // ifnull
+            }
+            s += if is_wide(p) { 2 } else { 1 };
+        }
+    }
+
+    a.mark("L_WITH_ARGS");
+    a.u8_(0x19);
+    a.u8_(l_bf as u8); // aload l_bf
+    a.u8_(0xC0);
+    a.u16be(beanfactory_cast_idx); // checkcast BeanFactory
+    a.u8_(0x19);
+    a.u8_(l_beanname as u8); // aload l_beanname
+    push_int(&mut a.code, params.len() as i32);
+    a.u8_(0xBD);
+    a.u16be(object_class_idx); // anewarray Object
+    {
+        let mut s = 1u16;
+        for (i, p) in params.iter().enumerate() {
+            a.u8_(0x59); // dup
+            push_int(&mut a.code, i as i32);
+            emit_load_box2(&mut a.code, valueof, p, s);
+            a.u8_(0x53); // aastore
+            s += if is_wide(p) { 2 } else { 1 };
+        }
+    }
+    a.u8_(0xB9);
+    a.u16be(getbean_name_args_ref); // invokeinterface getBean(String,Object[])Object count=3
+    a.u8_(0x03);
+    a.u8_(0x00);
+    a.branch(0xA7, "L_GETBEAN_DONE"); // goto
+
+    a.mark("L_NOARGS");
+    a.u8_(0x19);
+    a.u8_(l_bf as u8); // aload l_bf
+    a.u8_(0xC0);
+    a.u16be(beanfactory_cast_idx); // checkcast BeanFactory
+    a.u8_(0x19);
+    a.u8_(l_beanname as u8); // aload l_beanname
+    a.u8_(0xB9);
+    a.u16be(getbean_ref); // invokeinterface getBean(String)Object count=2
+    a.u8_(0x02);
+    a.u8_(0x00);
+
+    a.mark("L_GETBEAN_DONE");
+    // --- Type-mismatch check (same shape as emit_bean_override's, adapted
+    // to this method's shifted local slots). ---
+    a.u8_(0x59); // dup
+    a.u8_(0xC1);
+    a.u16be(rettype_cast_idx); // instanceof <Ret>
+    a.branch(0x9A, "L_STORE"); // ifne
+    a.u8_(0x59); // dup
+    a.u8_(0x01); // aconst_null
+    a.u8_(0xB6);
+    a.u16be(mismatch.object_equals_ref); // invokevirtual Object.equals
+    a.branch(0x99, "L_THROW"); // ifeq
+    a.u8_(0x57); // pop
+    a.u8_(0x01); // aconst_null
+    a.branch(0xA7, "L_STORE"); // goto
+
+    a.mark("L_THROW");
+    a.u8_(0x3A);
+    a.u8_(l_scratch as u8); // astore l_scratch
+    a.u8_(0xBB);
+    a.u16be(mismatch.stringbuilder_cls); // new StringBuilder
+    a.u8_(0x59); // dup
+    a.u8_(0xB7);
+    a.u16be(mismatch.sb_init_ref); // invokespecial <init>()V
+    a.u8_(0x13);
+    a.u16be(mismatch.lit_bean_method_prefix); // ldc_w "@Bean method "
+    a.u8_(0xB6);
+    a.u16be(mismatch.sb_append_string_ref);
+    a.u8_(0x13);
+    a.u16be(decl_method_string_idx); // ldc_w "Decl.method"
+    a.u8_(0xB6);
+    a.u16be(mismatch.sb_append_string_ref);
+    a.u8_(0x13);
+    a.u16be(mismatch.lit_called_as); // ldc_w " called as bean reference for type ["
+    a.u8_(0xB6);
+    a.u16be(mismatch.sb_append_string_ref);
+    a.u8_(0x13);
+    a.u16be(rettype_dotted_string_idx); // ldc_w "<rettype dotted>"
+    a.u8_(0xB6);
+    a.u16be(mismatch.sb_append_string_ref);
+    a.u8_(0x13);
+    a.u16be(mismatch.lit_overridden_by); // ldc_w "] but overridden by non-compatible bean instance of type ["
+    a.u8_(0xB6);
+    a.u16be(mismatch.sb_append_string_ref);
+    a.u8_(0x19);
+    a.u8_(l_scratch as u8); // aload l_scratch
+    a.u8_(0xB6);
+    a.u16be(mismatch.object_getclass_ref); // invokevirtual getClass
+    a.u8_(0xB6);
+    a.u16be(mismatch.class_getname_ref); // invokevirtual getName
+    a.u8_(0xB6);
+    a.u16be(mismatch.sb_append_string_ref);
+    a.u8_(0x13);
+    a.u16be(mismatch.lit_close_bracket_dot); // ldc_w "]."
+    a.u8_(0xB6);
+    a.u16be(mismatch.sb_append_string_ref);
+    a.u8_(0x59); // dup
+    a.u8_(0x3A);
+    a.u8_(l_scratch as u8); // astore l_scratch
+
+    a.mark("TRY2_START");
+    a.u8_(0x13);
+    a.u16be(mismatch.lit_overriding_bean); // ldc_w " Overriding bean of same name declared in: "
+    a.u8_(0xB6);
+    a.u16be(mismatch.sb_append_string_ref);
+    a.u8_(0x19);
+    a.u8_(l_cbf as u8); // aload l_cbf
+    a.u8_(0x19);
+    a.u8_(l_beanname as u8); // aload l_beanname
+    a.u8_(0xB9);
+    a.u16be(mismatch.get_merged_bd_ref); // invokeinterface getMergedBeanDefinition count=2
+    a.u8_(0x02);
+    a.u8_(0x00);
+    a.u8_(0xB9);
+    a.u16be(mismatch.get_resource_desc_ref); // invokeinterface getResourceDescription count=1
+    a.u8_(0x01);
+    a.u8_(0x00);
+    a.u8_(0xB6);
+    a.u16be(mismatch.sb_append_string_ref);
+    a.mark("TRY2_END");
+    a.branch(0xA7, "L_BUILD_DONE"); // goto
+    a.mark("CATCH2");
+    a.u8_(0x57); // pop
+    a.mark("L_BUILD_DONE");
+    a.u8_(0xB6);
+    a.u16be(mismatch.sb_tostring_ref); // invokevirtual toString
+    a.u8_(0x3A);
+    a.u8_(l_scratch as u8); // astore l_scratch
+    a.u8_(0xBB);
+    a.u16be(mismatch.illegalstate_cls); // new IllegalStateException
+    a.u8_(0x59); // dup
+    a.u8_(0x19);
+    a.u8_(l_scratch as u8); // aload l_scratch
+    a.u8_(0xB7);
+    a.u16be(mismatch.illegalstate_init_ref); // invokespecial <init>(String)V
+    a.u8_(0xBF); // athrow
+
+    a.mark("L_STORE");
+    a.u8_(0xC0);
+    a.u16be(rettype_cast_idx); // checkcast <Ret>
+    a.u8_(0x3A);
+    a.u8_(l_result as u8); // astore l_result
+    let try_start = *a.labels.get("TRY_START").unwrap();
+    let try_end = a.pos();
+
+    // Normal path: dependency registration + SPR-8080 restore (outside the
+    // try region — matches `emit_bean_override`'s own scoping choice).
+    a.u8_(0x19);
+    a.u8_(l_method as u8); // aload l_method
+    a.branch(0xC6, "L_RESTORE"); // ifnull
+    a.u8_(0x19);
+    a.u8_(l_cbf as u8); // aload l_cbf
+    a.u8_(0x19);
+    a.u8_(l_beanname as u8); // aload l_beanname
+    a.u8_(0x19);
+    a.u8_(l_method as u8); // aload l_method
+    a.u8_(0xB6);
+    a.u16be(method_get_name_ref); // invokevirtual Method.getName()
+    a.u8_(0xB9);
+    a.u16be(register_dependent_bean_ref); // invokeinterface registerDependentBean(String,String)V count=3
+    a.u8_(0x03);
+    a.u8_(0x00);
+
+    a.mark("L_RESTORE");
+    a.u8_(0x15);
+    a.u8_(l_already as u8); // iload l_already
+    a.branch(0x99, "L_RETURN"); // ifeq
+    a.u8_(0x19);
+    a.u8_(l_cbf as u8); // aload l_cbf
+    a.u8_(0x19);
+    a.u8_(l_beanname as u8); // aload l_beanname
+    a.u8_(0x04); // iconst_1
+    a.u8_(0xB9);
+    a.u16be(set_currently_in_creation_ref); // invokeinterface setCurrentlyInCreation(String,boolean)V count=3
+    a.u8_(0x03);
+    a.u8_(0x00);
+
+    a.mark("L_RETURN");
+    a.u8_(0x19);
+    a.u8_(l_result as u8); // aload l_result
+    a.u8_(0xB0); // areturn
+
+    let handler_pc = a.pos();
+    a.u8_(0x3A);
+    a.u8_(l_scratch as u8); // astore l_scratch  (caught throwable)
+    a.u8_(0x15);
+    a.u8_(l_already as u8); // iload l_already
+    a.branch(0x99, "RETHROW"); // ifeq
+    a.u8_(0x19);
+    a.u8_(l_cbf as u8); // aload l_cbf
+    a.u8_(0x19);
+    a.u8_(l_beanname as u8); // aload l_beanname
+    a.u8_(0x04); // iconst_1
+    a.u8_(0xB9);
+    a.u16be(set_currently_in_creation_ref); // invokeinterface setCurrentlyInCreation(String,boolean)V count=3
+    a.u8_(0x03);
+    a.u8_(0x00);
+    a.mark("RETHROW");
+    a.u8_(0x19);
+    a.u8_(l_scratch as u8); // aload l_scratch
+    a.u8_(0xBF); // athrow
+
+    let try2_start = *a.labels.get("TRY2_START").unwrap();
+    let try2_end = *a.labels.get("TRY2_END").unwrap();
+    let handler_pc2 = *a.labels.get("CATCH2").unwrap();
+    let nsbde_cls = mismatch.nsbde_cls;
+
+    let code = a.finish();
+
+    let mut code_attr = Vec::new();
+    // max_stack: the Object[]-building loop briefly reaches array+index+
+    // boxed-value (3) on top of bf/beanName already consumed by that point;
+    // the deepest actual point is bf+beanName+array (3) before the loop, or
+    // array+index+box (3) during it. 6 is generous headroom.
+    let max_stack: u16 = 6;
+    code_attr.extend_from_slice(&max_stack.to_be_bytes());
+    code_attr.extend_from_slice(&max_locals.to_be_bytes());
+    code_attr.extend_from_slice(&(code.len() as u32).to_be_bytes());
+    code_attr.extend_from_slice(&code);
+    code_attr.extend_from_slice(&2u16.to_be_bytes()); // exception_table_length
+    // Entry 1 (checked first): inner NoSuchBeanDefinitionException handler.
+    code_attr.extend_from_slice(&try2_start.to_be_bytes());
+    code_attr.extend_from_slice(&try2_end.to_be_bytes());
+    code_attr.extend_from_slice(&handler_pc2.to_be_bytes());
+    code_attr.extend_from_slice(&nsbde_cls.to_be_bytes());
+    // Entry 2: outer SPR-8080 any-Throwable finally handler.
+    code_attr.extend_from_slice(&try_start.to_be_bytes());
+    code_attr.extend_from_slice(&try_end.to_be_bytes());
+    code_attr.extend_from_slice(&handler_pc.to_be_bytes());
+    code_attr.extend_from_slice(&0u16.to_be_bytes()); // catch_type 0 = any (finally semantics)
+    code_attr.extend_from_slice(&0u16.to_be_bytes()); // attributes_count
+
+    let mut method = Vec::new();
+    method.extend_from_slice(&0x0001u16.to_be_bytes()); // ACC_PUBLIC
+    method.extend_from_slice(&name_idx.to_be_bytes());
+    method.extend_from_slice(&descriptor_idx.to_be_bytes());
+    method.extend_from_slice(&1u16.to_be_bytes()); // attributes_count = 1 (Code)
+    method.extend_from_slice(&code_attr_name_idx.to_be_bytes());
+    method.extend_from_slice(&(code_attr.len() as u32).to_be_bytes());
+    method.extend_from_slice(&code_attr);
+    method
+}
+
 fn build_enhancer_class(
     super_loader_id: u32,
     super_internal_name: &str,
@@ -1139,6 +1959,19 @@ fn build_enhancer_class(
             "getBean",
             "(Ljava/lang/String;)Ljava/lang/Object;",
         );
+        // Parameterized @Bean methods only (emit_bean_override_with_args):
+        // the explicit-args getBean overload and the isSingleton() check
+        // driving Spring's `useArgs` decision.
+        let getbean_name_args_ref = cw.add_interface_methodref(
+            beanfactory_cast_idx,
+            "getBean",
+            "(Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/Object;",
+        );
+        let is_singleton_ref = cw.add_interface_methodref(
+            beanfactory_cast_idx,
+            "isSingleton",
+            "(Ljava/lang/String;)Z",
+        );
         // The factory-method thread-local that distinguishes "the container is
         // creating this bean" (→ super) from an inter-bean reference (→ getBean),
         // exactly like Spring's BeanMethodInterceptor.isCurrentlyInvokedFactoryMethod.
@@ -1214,6 +2047,87 @@ fn build_enhancer_class(
             "(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/String;Ljava/lang/String;)Ljava/lang/Object;",
         );
 
+        // Shared refs for `emit_bean_override`'s type-mismatch handling —
+        // see `MismatchRefs`'s doc comment.
+        let mismatch_object_cls = cw.add_class("java/lang/Object");
+        let mismatch_class_cls = cw.add_class("java/lang/Class");
+        let mismatch_sb_cls = cw.add_class("java/lang/StringBuilder");
+        let mismatch_ise_cls = cw.add_class("java/lang/IllegalStateException");
+        let mismatch_beandef_cls =
+            cw.add_class("org/springframework/beans/factory/config/BeanDefinition");
+        let mismatch_refs = MismatchRefs {
+            stringbuilder_cls: mismatch_sb_cls,
+            sb_init_ref: cw.add_methodref(mismatch_sb_cls, "<init>", "()V"),
+            sb_append_string_ref: cw.add_methodref(
+                mismatch_sb_cls,
+                "append",
+                "(Ljava/lang/String;)Ljava/lang/StringBuilder;",
+            ),
+            sb_tostring_ref: cw.add_methodref(
+                mismatch_sb_cls,
+                "toString",
+                "()Ljava/lang/String;",
+            ),
+            object_equals_ref: cw.add_methodref(
+                mismatch_object_cls,
+                "equals",
+                "(Ljava/lang/Object;)Z",
+            ),
+            object_getclass_ref: cw.add_methodref(
+                mismatch_object_cls,
+                "getClass",
+                "()Ljava/lang/Class;",
+            ),
+            class_getname_ref: cw.add_methodref(
+                mismatch_class_cls,
+                "getName",
+                "()Ljava/lang/String;",
+            ),
+            illegalstate_cls: mismatch_ise_cls,
+            illegalstate_init_ref: cw.add_methodref(
+                mismatch_ise_cls,
+                "<init>",
+                "(Ljava/lang/String;)V",
+            ),
+            nsbde_cls: cw.add_class("org/springframework/beans/factory/NoSuchBeanDefinitionException"),
+            get_merged_bd_ref: cw.add_interface_methodref(
+                configurable_bf_cast_idx,
+                "getMergedBeanDefinition",
+                "(Ljava/lang/String;)Lorg/springframework/beans/factory/config/BeanDefinition;",
+            ),
+            get_resource_desc_ref: cw.add_interface_methodref(
+                mismatch_beandef_cls,
+                "getResourceDescription",
+                "()Ljava/lang/String;",
+            ),
+            lit_bean_method_prefix: cw.add_string("@Bean method "),
+            lit_called_as: cw.add_string(" called as bean reference for type ["),
+            lit_overridden_by: cw.add_string("] but overridden by non-compatible bean instance of type ["),
+            lit_close_bracket_dot: cw.add_string("]."),
+            lit_overriding_bean: cw.add_string(" Overriding bean of same name declared in: "),
+        };
+
+        // Shared boxing refs for parameterized @Bean methods
+        // (emit_bean_override_with_args) — see `ValueOfRefs`.
+        let integer_cls = cw.add_class("java/lang/Integer");
+        let long_cls = cw.add_class("java/lang/Long");
+        let float_cls = cw.add_class("java/lang/Float");
+        let double_cls = cw.add_class("java/lang/Double");
+        let boolean_cls = cw.add_class("java/lang/Boolean");
+        let byte_cls = cw.add_class("java/lang/Byte");
+        let char_cls = cw.add_class("java/lang/Character");
+        let short_cls = cw.add_class("java/lang/Short");
+        let valueof_refs = ValueOfRefs {
+            valueof_int: cw.add_methodref(integer_cls, "valueOf", "(I)Ljava/lang/Integer;"),
+            valueof_long: cw.add_methodref(long_cls, "valueOf", "(J)Ljava/lang/Long;"),
+            valueof_float: cw.add_methodref(float_cls, "valueOf", "(F)Ljava/lang/Float;"),
+            valueof_double: cw.add_methodref(double_cls, "valueOf", "(D)Ljava/lang/Double;"),
+            valueof_bool: cw.add_methodref(boolean_cls, "valueOf", "(Z)Ljava/lang/Boolean;"),
+            valueof_byte: cw.add_methodref(byte_cls, "valueOf", "(B)Ljava/lang/Byte;"),
+            valueof_char: cw.add_methodref(char_cls, "valueOf", "(C)Ljava/lang/Character;"),
+            valueof_short: cw.add_methodref(short_cls, "valueOf", "(S)Ljava/lang/Short;"),
+        };
+
         for bm in bean_methods {
             let name_idx = cw.add_utf8(&bm.name);
             let desc_idx = cw.add_utf8(&bm.descriptor);
@@ -1237,37 +2151,84 @@ fn build_enhancer_class(
             };
             let super_method_ref = cw.add_methodref(super_class_idx, &bm.name, &bm.descriptor);
             let rettype_cast_idx = cw.add_class(&bm.return_internal);
+            // Precomputed at codegen time (both pieces are statically known
+            // here) for the type-mismatch message — see `MismatchRefs`.
+            let decl_method_string_idx = cw.add_string(&format!(
+                "{}.{}",
+                simple_name_of_internal(super_internal_name),
+                bm.name
+            ));
+            let rettype_dotted_string_idx = cw.add_string(&bm.return_internal.replace('/', "."));
             let fb_ref = if bm.is_factory_bean {
                 let exposed_type_string_idx = cw.add_string(&bm.return_internal);
                 Some((enhance_fb_ref_methodref, exposed_type_string_idx))
             } else {
                 None
             };
-            let override_method = emit_bean_override(
-                name_idx,
-                desc_idx,
-                code_attr_name_idx,
-                name_string_idx,
-                super_method_ref,
-                bf_field_ref,
-                beanfactory_cast_idx,
-                getbean_ref,
-                rettype_cast_idx,
-                get_factory_method_ref,
-                method_get_name_ref,
-                string_equals_ref,
-                singleton_registry_cast_idx,
-                get_singleton_ref,
-                config_gen_iface_idx,
-                cfg_gen_name_string_idx,
-                beanname_lookup_idx,
-                fq_beanname_lookup_idx,
-                configurable_bf_cast_idx,
-                register_dependent_bean_ref,
-                is_currently_in_creation_ref,
-                set_currently_in_creation_ref,
-                fb_ref,
-            );
+            let bean_method_params = parse_param_descriptors(&bm.descriptor);
+            let override_method = if bean_method_params.is_empty() {
+                emit_bean_override(
+                    name_idx,
+                    desc_idx,
+                    code_attr_name_idx,
+                    name_string_idx,
+                    super_method_ref,
+                    bf_field_ref,
+                    beanfactory_cast_idx,
+                    getbean_ref,
+                    rettype_cast_idx,
+                    get_factory_method_ref,
+                    method_get_name_ref,
+                    string_equals_ref,
+                    singleton_registry_cast_idx,
+                    get_singleton_ref,
+                    config_gen_iface_idx,
+                    cfg_gen_name_string_idx,
+                    beanname_lookup_idx,
+                    fq_beanname_lookup_idx,
+                    configurable_bf_cast_idx,
+                    register_dependent_bean_ref,
+                    is_currently_in_creation_ref,
+                    set_currently_in_creation_ref,
+                    fb_ref,
+                    decl_method_string_idx,
+                    rettype_dotted_string_idx,
+                    &mismatch_refs,
+                )
+            } else {
+                emit_bean_override_with_args(
+                    name_idx,
+                    desc_idx,
+                    code_attr_name_idx,
+                    name_string_idx,
+                    &bean_method_params,
+                    super_method_ref,
+                    bf_field_ref,
+                    beanfactory_cast_idx,
+                    getbean_ref,
+                    getbean_name_args_ref,
+                    is_singleton_ref,
+                    rettype_cast_idx,
+                    get_factory_method_ref,
+                    method_get_name_ref,
+                    string_equals_ref,
+                    singleton_registry_cast_idx,
+                    get_singleton_ref,
+                    config_gen_iface_idx,
+                    cfg_gen_name_string_idx,
+                    beanname_lookup_idx,
+                    fq_beanname_lookup_idx,
+                    configurable_bf_cast_idx,
+                    register_dependent_bean_ref,
+                    is_currently_in_creation_ref,
+                    set_currently_in_creation_ref,
+                    mismatch_object_cls,
+                    &valueof_refs,
+                    decl_method_string_idx,
+                    rettype_dotted_string_idx,
+                    &mismatch_refs,
+                )
+            };
             methods.push(override_method);
         }
     }
@@ -1327,6 +2288,15 @@ pub struct LookupMethodSpec {
     pub bean_name: Option<String>,
     /// `true` → emit a `getBean` override; `false` → emit a throwing stub.
     pub is_lookup: bool,
+    /// Internal name of the class whose OWN `declared_methods` this abstract
+    /// method actually appears in — NOT necessarily this subclass's immediate
+    /// superclass, since another enhancer (e.g. `ConfigurationClassEnhancer`)
+    /// may already have wrapped the original user class before this lookup
+    /// subclass wraps THAT in turn. Baked into the generated bytecode as a
+    /// `Class` constant so the by-type/no-args branch can look the `Method`
+    /// up reflectively without a `getClass().getSuperclass()` walk that only
+    /// ever finds one level up. See beanLookupFromSameConfigurationClass.
+    pub declaring_internal: String,
 }
 
 /// Shared constant-pool indices used by every emitted lookup override.
@@ -1688,17 +2658,21 @@ pub fn build_lookup_subclass(
             code.push(0xB0); // areturn
         } else if !has_args {
             // ---- BY TYPE, no args: generic-aware getBeanProvider(ResolvableType) ----
+            // Resolves the Method via a baked-in Class constant for
+            // `m.declaring_internal` instead of `this.getClass()
+            // .getSuperclass()` — the latter only ever finds one level up,
+            // which is wrong once another enhancer (e.g.
+            // ConfigurationClassEnhancer) already wraps the original user
+            // class before this lookup subclass wraps THAT in turn.
             let mname_string_idx = cw.add_string(&m.name);
+            let declaring_class_idx = cw.add_class(&m.declaring_internal);
             code.push(0x2A);
             code.push(0xB4);
             code.extend_from_slice(&b(cp.bf_field_ref));
             code.push(0xC0);
             code.extend_from_slice(&b(cp.beanfactory_cast_idx)); // [bf]
-            code.push(0x2A); // aload_0
-            code.push(0xB6);
-            code.extend_from_slice(&b(cp.object_getclass_ref));
-            code.push(0xB6);
-            code.extend_from_slice(&b(cp.class_getsuperclass_ref));
+            code.push(0x13); // ldc_w <declaring class>
+            code.extend_from_slice(&b(declaring_class_idx));
             code.push(0x13);
             code.extend_from_slice(&b(mname_string_idx));
             code.push(0x03); // iconst_0
@@ -2811,10 +3785,6 @@ fn scan_bean_methods(
             if m.access_flags & (ACC_STATIC | ACC_PRIVATE | ACC_FINAL) != 0 {
                 continue;
             }
-            // No-arg only.
-            if !m.descriptor.starts_with("()") {
-                continue;
-            }
             // Reference return only (Lxxx;) — parse the return-type internal name.
             let ret = match m.descriptor.split(')').nth(1) {
                 Some(r) => r,
@@ -2963,27 +3933,40 @@ fn cce_enhance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult 
         }
     };
 
-    // Real CGLIB caches the generated proxy class per superclass and
-    // returns the SAME `Class` on a repeat `enhance()` call instead of
-    // generating a fresh numbered subclass every time — see
-    // `config_enhancer_class_cache`'s doc comment.
-    let cached = config_enhancer_class_cache()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(&super_class_id.as_u32())
-        .cloned();
-    if let Some((cached_id, cached_name, cached_bytes)) = cached {
-        notify_generated_class_handler(ctx, receiver_loader_id, &cached_name, &cached_bytes);
-        let mirror = ctx.get_class_mirror(cached_id);
-        return Ok(Some(Value::Object(Some(mirror))));
-    }
-
     let super_name = match ctx.class_name_of_id(super_class_id) {
         Some(n) => n,
         None => {
             return Ok(Some(Value::Object(Some(cls_mirror))));
         }
     };
+    let super_loader_id = ctx.loader_id_of_class(super_class_id) as u32;
+    let cache_key = (super_loader_id, super_name.clone());
+
+    // Real CGLIB caches the generated proxy class per superclass and
+    // returns the SAME `Class` on a repeat `enhance()` call instead of
+    // generating a fresh numbered subclass every time — see
+    // `config_enhancer_class_cache`'s doc comment (key shape: keyed by
+    // `(defining_loader_id, super_internal_name)`, NOT the recyclable
+    // `ClassId` alone).
+    let cached = config_enhancer_class_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&cache_key)
+        .cloned();
+    if std::env::var_os("CRATONVM_DBG_CCECACHE").is_some() {
+        eprintln!(
+            "[CCECACHE-DBG] enhance called: super_class_id={:?} cache_key={:?} receiver_loader_id={} hit={}",
+            super_class_id,
+            cache_key,
+            receiver_loader_id,
+            cached.is_some(),
+        );
+    }
+    if let Some((cached_id, cached_name, cached_bytes)) = cached {
+        notify_generated_class_handler(ctx, receiver_loader_id, &cached_name, &cached_bytes);
+        let mirror = ctx.get_class_mirror(cached_id);
+        return Ok(Some(Value::Object(Some(mirror))));
+    }
 
     // Scan the @Configuration class for @Bean methods to intercept, then build
     // the subclass bytes. Loader id 0 = application loader (same as every other
@@ -3001,7 +3984,6 @@ fn cce_enhance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult 
         .filter(|m| m.name == "<init>" && m.access_flags & ACC_PRIVATE == 0)
         .map(|m| m.descriptor)
         .collect();
-    let super_loader_id = ctx.loader_id_of_class(super_class_id) as u32;
     let (new_name, bytes) =
         build_enhancer_class(super_loader_id, &super_name, &bean_methods, &ctor_descriptors);
 
@@ -3017,13 +3999,30 @@ fn cce_enhance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult 
             config_enhancer_class_cache()
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .insert(super_class_id.as_u32(), (cid, new_name.clone(), bytes_arc.clone()));
+                .insert(cache_key, (cid, new_name.clone(), bytes_arc.clone()));
             let mirror = ctx.get_class_mirror(cid);
             eprintln!(
                 "[CCE] enhance: defined {new_name} (super={super_name}, marker={SPRING_MARKER_IFACE}, intercepted @Bean methods={})",
                 bean_methods.len(),
             );
             notify_generated_class_handler(ctx, receiver_loader_id, &new_name, &bytes_arc);
+            // See `build_fastclass_placeholder`'s doc comment: real cglib
+            // always emits two FastClass helper classes alongside the
+            // enhancer itself; our dispatch never needs them, but AOT's
+            // `isRegisteredCglibClass` test asserts their presence (bytes +
+            // reflection hint) regardless, and `notify_generated_class_handler`
+            // is a no-op outside AOT processing (no handler installed), so
+            // this is safe to call unconditionally.
+            for suffix in ["FastClass$$0", "FastClass$$1"] {
+                let fastclass_name = format!("{super_name}$$SpringCGLIB$${suffix}");
+                let fastclass_bytes = build_fastclass_placeholder(&fastclass_name);
+                notify_generated_class_handler(
+                    ctx,
+                    receiver_loader_id,
+                    &fastclass_name,
+                    &fastclass_bytes,
+                );
+            }
             Ok(Some(Value::Object(Some(mirror))))
         }
         Err(msg) => {

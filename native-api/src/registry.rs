@@ -1573,6 +1573,44 @@ pub trait NativeContext {
         self.class_id_by_name(name)
     }
 
+    /// Resolve `name` to a `ClassId`, LOADING it through
+    /// `referencing_class_id`'s own defining classloader if it isn't loaded
+    /// yet -- exactly as a bytecode instruction (`new`/`checkcast`/
+    /// `invokestatic`/...) referencing `name` FROM `referencing_class_id`
+    /// would (JVMS SS5.4.3 initiating-loader semantics).
+    ///
+    /// Unlike [`Self::class_id_by_name_near`]/[`Self::class_id_by_name`] --
+    /// pure lookups that only succeed once `name` has already been
+    /// resolved/indexed under that loader -- this drives the loader's own
+    /// `loadClass`/`defineClass` on a miss, so it also answers correctly the
+    /// very first time a class is needed under a given loader (the gap that
+    /// made two prior lookup-based fix attempts for the H2 `Parser`
+    /// loader-collapse bug regress on a fresh session -- see
+    /// docs/known-issues/h2-suite-bugs/bug-h2-suite-residual-fail-triage.md's
+    /// eighth-pass section).
+    ///
+    /// Native overrides that construct or invoke-special a DIFFERENT class
+    /// than their own receiver's declaring class (an app/H2 native bridging
+    /// into the receiver's own package -- e.g. `SessionLocal.prepareLocal`'s
+    /// `new Parser(this)`) MUST use this instead of
+    /// `new_object_initialized`/`invoke_special` with a bare name: those
+    /// collapse to whichever loader defined `name` FIRST process-wide,
+    /// silently constructing/invoking the WRONG loader's copy of the class
+    /// whenever the receiver's own defining loader is a user-defined one
+    /// distinct from the first-loaded (usually Application) copy.
+    ///
+    /// The default implementation ignores `referencing_class_id` and falls
+    /// back to the name-only [`Self::ensure_class_initialized`] -- sufficient
+    /// for test mocks and any context with a single (global) loader
+    /// namespace; the real VM implementation honours per-loader identity.
+    fn class_id_by_name_via_referencing_class(
+        &mut self,
+        _referencing_class_id: ClassId,
+        name: &str,
+    ) -> Result<ClassId, cratonvm_types::error::MethodCallFailed> {
+        self.ensure_class_initialized(name)
+    }
+
     /// For a synthetic lambda-proxy `ClassId` (created by `register_lambda_proxy`,
     /// class id `>= 0x8000_0000`, not in the class store), return the internal
     /// name of its functional (SAM) interface. Returns `None` for any non-lambda
@@ -2035,6 +2073,22 @@ pub trait NativeContext {
     /// The default impl is a no-op so out-of-tree `NativeContext`
     /// implementors (tests) need not change.
     fn begin_blocking_region(&mut self) {}
+
+    /// Same GC-safety contract as `begin_blocking_region`, for a region with
+    /// a bounded/known wait duration (`Thread.sleep`, a timed `Object.wait`,
+    /// `LockSupport.parkNanos`, …). `Thread.getState()` reports
+    /// `TIMED_WAITING` for a thread inside one of these vs. plain `WAITING`
+    /// for an unbounded `begin_blocking_region` — real JDK's
+    /// `Thread.State` makes exactly this distinction, and callers such as
+    /// Spring Boot's `SpringApplicationShutdownHookTests` assert on it via
+    /// `Awaitility.await().until(thread::getState, State.TIMED_WAITING::equals)`.
+    ///
+    /// The default impl just delegates to `begin_blocking_region` (reported
+    /// as plain `WAITING`) so out-of-tree `NativeContext` implementors need
+    /// not change; must still be paired with exactly one `end_blocking_region`.
+    fn begin_timed_blocking_region(&mut self) {
+        self.begin_blocking_region();
+    }
 
     /// T19.H1 — end a blocking region opened by `begin_blocking_region`.
     /// Re-syncs the thread with any GC that ran while it was blocked.
@@ -4293,6 +4347,37 @@ impl NativeMethodRegistry {
                 crate::native_ring::register_name(cb_ptr, &triple);
             }
         }
+    }
+
+    /// Combined `find` + `kind_of`: computes the 128-bit
+    /// `(class, method, descriptor)` hash once and looks up both the
+    /// callback and its category from it, instead of the two independent
+    /// hashes (one full byte-walk each) `invoke_or_native`'s
+    /// synthetic-stub check used to pay on every native dispatch --
+    /// `find(...)` to get the callback, then immediately `kind_of(...)`
+    /// with the identical three strings to classify it. A gdb sampling
+    /// profile of a hung-looking H2 `TestFileSystem.testConcurrent` run
+    /// (two real threads, heavy native-call volume) caught both live
+    /// threads inside `hash_byte_pair`/`native_method_hash` disproportionately
+    /// often, which is this exact redundant second pass. Only covers the
+    /// fast exact-hash path (mirroring `find`'s own fast path); falls back
+    /// to the slow `find`+`kind_of` pair on a miss so descriptor-quirk
+    /// rewriting keeps working unchanged.
+    #[inline]
+    pub fn find_with_kind(
+        &self,
+        class_name: &str,
+        method_name: &str,
+        descriptor: &str,
+    ) -> Option<(NativeCallback, NativeKind)> {
+        let key = native_method_hash(class_name, method_name, descriptor);
+        if let Some(cb) = self.methods.get(&key).copied() {
+            let kind = self.category_by_key.get(&key).copied().unwrap_or(NativeKind::Bridge);
+            return Some((cb, kind));
+        }
+        let cb = self.find(class_name, method_name, descriptor)?;
+        let kind = self.kind_of(class_name, method_name, descriptor).unwrap_or(NativeKind::Bridge);
+        Some((cb, kind))
     }
 
     /// Look up a native method implementation (zero allocation on the

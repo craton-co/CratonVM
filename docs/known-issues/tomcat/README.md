@@ -10,36 +10,60 @@ on the Azure host. All of this is against the Linux Tomcat fixture at
 `/data/data/apps/tomcat`), reusable Linux runner at
 `apps/tomcat-suite-runner/run-tomcat-suite.sh`.
 
-## Fixture-completion work (not CratonVM bugs — do these to unblock real testing)
+## Fixture-completion work — ALL 6 IMPLEMENTED 2026-07-23
 
-| Doc | Classes | Fix effort |
+| Doc | Classes | Outcome |
 |---|---:|---|
-| [missing-antjar-classpath.md](missing-antjar-classpath.md) | 2 | Trivial — add a jar |
-| [missing-httpd-binary.md](missing-httpd-binary.md) | 8 | Small — install + configure `httpd` |
-| [largeheap-flat-heap-oom.md](largeheap-flat-heap-oom.md) | 3 | Trivial — exclude or bump per-class `-Xmx` |
-| [missing-catalina-localhost-context-configs.md](missing-catalina-localhost-context-configs.md) | 8 | Small — stage 2 XML files |
-| [missing-build-lib-jars.md](missing-build-lib-jars.md) | 1 | Small — run `ant package`/`deploy` |
-| [unbuilt-virtual-webapp-submodule.md](unbuilt-virtual-webapp-submodule.md) | 1 | Small — `mvn compile` one submodule |
+| [missing-antjar-classpath.md](missing-antjar-classpath.md) | 2 | ✅ Fixed — 1 PASS both, 1 revealed a real regression |
+| [missing-httpd-binary.md](missing-httpd-binary.md) | 8 | ✅ Fully fixed — all 8 PASS both VMs, no regressions |
+| [largeheap-flat-heap-oom.md](largeheap-flat-heap-oom.md) | 3 | ⚠️ Partial — 2 now PASS HotSpot/reveal regressions, 1 still fails both (narrower) |
+| [missing-catalina-localhost-context-configs.md](missing-catalina-localhost-context-configs.md) | 8 | ⚠️ Root-cause theory was wrong (see doc) — real fix was the lib-jars doc below; 2 PASS both, 6 revealed regressions |
+| [missing-build-lib-jars.md](missing-build-lib-jars.md) | 1 | ✅ Fixed via `ant deploy` — also fixed most of the "conf/Catalina/localhost" bucket above |
+| [unbuilt-virtual-webapp-submodule.md](unbuilt-virtual-webapp-submodule.md) | 1 | ⚠️ Root-cause theory was wrong (no Maven module) — one method now passes, a second method reveals a narrower regression |
 
-**23 of the 35 non-PASS classes** in this bucket are blocked purely on fixture
-work above, not investigation. Completing all six items would very plausibly
-turn some into real CratonVM regressions (as happened when the CWD harness
-bug fix alone reclassified ~65 previously-miscounted classes) — treat a
-PASS after fixture completion as the expected/good outcome, not a surprise.
+As predicted, completing these turned several into real CratonVM
+regressions rather than clean passes — see
+[20-fixture-completion-regressions-closure-FIXED.md](../../internal/fixed-suite-bugs/tomcat/20-fixture-completion-regressions-closure-FIXED.md)
+(moved to `docs/internal/` 2026-07-24, superseding the now-closed
+`regressions-revealed-by-fixture-completion-20260723.md`) for the full
+accounting: of the 9 confirmed CratonVM-only regressions, **7 are fixed and
+verified**; the remaining 2 (`TestManagerWebapp.testBug57700`,
+`TestSsl.testPost`) are confirmed to be the same already-tracked,
+deliberately-deferred interpreter/dispatch throughput ceiling as
+[04-embedded-server-throughput-wall-OPEN.md](../../internal/fixed-suite-bugs/tomcat/04-embedded-server-throughput-wall-OPEN.md),
+not new or independently-fixable bugs.
 
-## Needs investigation, not yet root-caused
+Note: none of this fixture work is git-tracked — it all lives on the Azure
+host (`/data/data/apps/tomcat`, i.e. `/data/data/tomcat-dohead-fixture-20260717`).
+A future session rebuilding this fixture from scratch needs to redo these
+steps (see each doc's "RESOLVED" note for the exact commands).
 
-| Doc | Classes |
-|---|---:|
-| [untriaged-oddities.md](untriaged-oddities.md) | 2 |
-| [hang-classification-unconfirmed-host-contention.md](hang-classification-unconfirmed-host-contention.md) | 9 |
+## Untriaged oddities — RESOLVED 2026-07-23
+
+Both classes formerly tracked here (`org.apache.catalina.startup.TestTomcat`'s
+misleading "Deliberately Broken" log line, and
+`org.apache.jasper.compiler.TestNonstandardTagPerformance`'s self-referential
+`ClassNotFoundException`) are fully triaged and closed — see
+[19-untriaged-oddities-closed-shared-hashtable-bug-FIXED.md](../../internal/fixed-suite-bugs/tomcat/19-untriaged-oddities-closed-shared-hashtable-bug-FIXED.md)
+in `docs/internal/fixed-suite-bugs/tomcat/`. Short version: "Deliberately
+Broken" was always a red herring (from tests that deliberately trigger and
+catch it); the real bug underneath was a genuine CratonVM regression — a
+`java.util.Hashtable` field-misresolution bug that silently doubled
+`Hashtable.size()` on every `put()`, which corrupted Jasper's embedded ECJ
+Java compiler (JSPs use a `Hashtable` internally) and broke JSP compilation
+entirely. Now fixed; `TestTomcat` is 26/26 PASS. The
+`TestNonstandardTagPerformance` class was a fixture-data typo (missing "er"
+in `.suite/all-tests.txt`) with no code fix needed.
+
+## Fixed and moved to `docs/internal/`
+
+| Doc | Classes | Outcome |
+|---|---:|---|
+| [hang-classification-unconfirmed-host-contention-FIXED.md](../../internal/fixed-suite-bugs/tomcat/hang-classification-unconfirmed-host-contention-FIXED.md) | 9 | ✅ HANG was a pure host-contention artifact (HotSpot passes all 9 cleanly); once ruled out, all 9 were genuine CratonVM regressions from 2 root causes (ecj/Hashtable JSP-compile NPE affecting 8; SSLContext-resolution-through-wrapped-factory affecting `TestCustomSsl`), both fixed and verified — 9/9 PASS on CratonVM on a quiet host |
+| [20-fixture-completion-regressions-closure-FIXED.md](../../internal/fixed-suite-bugs/tomcat/20-fixture-completion-regressions-closure-FIXED.md) | 9 | ✅ 7/9 fixed (X509Certificate toString, symlink+canonicalize, G1 for `*LargeHeap`, catchable-OOME Cipher fixes, 2 TestSsl bugs); 2 residual confirmed = pre-existing throughput ceiling, not new bugs |
 
 ## Real CratonVM bug (not a fixture gap — despite living in the same 35-class "both VMs fail" bucket)
 
 | Doc | Classes |
 |---|---:|
 | [value-stack-usize-underflow-nio-worker-panic.md](value-stack-usize-underflow-nio-worker-panic.md) | 2 (confirmed in a 3rd bucket too — see doc) |
-
-Total accounted for: 6 + 2 + 1 = 9 docs covering all 35 non-PASS classes from
-the "true fixture gap" bucket, plus the 2 classes where the real panic also
-reproduces.

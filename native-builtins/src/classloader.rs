@@ -1225,6 +1225,30 @@ pub(crate) fn invoke_single_load_class_override(
 /// decide whether `findLoadedClass`/`findLoadedClass0` must be loader-scoped
 /// (a user loader only "knows" classes in its own namespace) versus the global
 /// lookup that is correct for the built-in loaders.
+/// True iff `this` is a bare `java.net.URLClassLoader` instance (not a user
+/// subclass — a subclass already gets its own namespace via
+/// `is_user_defined_loader`'s `!is_builtin_loader_class` check).
+///
+/// `loader_namespace_id`/`peek_loader_namespace_id` are the ONLY callers —
+/// `is_builtin_loader_class` intentionally still lists
+/// `"java/net/URLClassLoader"` for its other ~20 call sites (isolation
+/// checks, resource/service-loader resolution, …), where the bare class is
+/// correctly treated as "not a distinguished user loader implementation".
+/// But `new URLClassLoader(urls)` is a completely ordinary, unlimited-arity
+/// application pattern for building an ISOLATED loader (e.g. Spring Boot's
+/// `ApplicationHomeTests` constructs one per test method, each defining its
+/// own unrelated `com.example.Source`); routing every such instance through
+/// `loader_namespace_id`'s built-in shortcut (id `0`, the shared Application
+/// namespace) made a SECOND bare `URLClassLoader` instance's class-define
+/// collide with the first's as `IncompatibleClassChangeError: already
+/// defined by application loader` — the two loaders are unrelated objects
+/// with disjoint URLs, not aliases of the single real Application loader.
+fn is_bare_url_class_loader(ctx: &mut dyn NativeContext, this: ObjectRef) -> bool {
+    ctx.class_name_of_id(ctx.class_id_of_object(this))
+        .as_deref()
+        == Some("java/net/URLClassLoader")
+}
+
 pub(crate) fn is_user_defined_loader(ctx: &mut dyn NativeContext, this: ObjectRef) -> bool {
     let cid = ctx.class_id_of_object(this);
     // This predicate is reached from real ClassLoader bytecode before the
@@ -1304,7 +1328,7 @@ pub(crate) fn loader_object_for_namespace_id(ns_id: u32) -> Option<ObjectRef> {
 /// user loader its own namespace so an override-first redefinition of an
 /// already-loaded class does not collide with the original definer.
 pub fn loader_namespace_id(ctx: &mut dyn NativeContext, loader: ObjectRef) -> u32 {
-    if !is_user_defined_loader(ctx, loader) {
+    if !is_user_defined_loader(ctx, loader) && !is_bare_url_class_loader(ctx, loader) {
         return 0;
     }
     if let Value::Int(v) = ctx.get_field(loader, CL_LOADER_ID) {
@@ -1330,7 +1354,7 @@ pub(crate) fn peek_loader_namespace_id(
     ctx: &mut dyn NativeContext,
     loader: ObjectRef,
 ) -> Option<u32> {
-    if !is_user_defined_loader(ctx, loader) {
+    if !is_user_defined_loader(ctx, loader) && !is_bare_url_class_loader(ctx, loader) {
         return None;
     }
     if let Value::Int(v) = ctx.get_field(loader, CL_LOADER_ID) {
@@ -1395,7 +1419,10 @@ pub(crate) fn find_loaded_class_for_loader(
     internal_name: &str,
 ) -> Option<ObjectRef> {
     let __obsreg_dbg = std::env::var_os("CRATONVM_DBG_OBSREG").is_some()
-        && internal_name.contains("ObservationRegistry");
+        && (internal_name.contains("ObservationRegistry")
+            || internal_name.contains("SecurityFilterAutoConfigurationEarlyInitializationTests")
+            || internal_name.contains("PathRequestTests")
+            || internal_name.contains("ManagementWebSecurityAutoConfigurationTests"));
     let __is_user_defined = is_user_defined_loader(ctx, this);
     if __obsreg_dbg {
         eprintln!(
@@ -4942,6 +4969,14 @@ fn extract_url_path(ctx: &dyn NativeContext, url_obj: ObjectRef) -> Option<Strin
         .replacen("/!", "!/", 1);
     let p = p.strip_prefix("file:").unwrap_or(&p).to_string();
     let p = p.strip_prefix("//").unwrap_or(&p).to_string();
+    // `File.toURI().toURL()` percent-encodes reserved/space characters in the
+    // path (e.g. a directory named `app location` becomes `app%20location`).
+    // Real `URLClassPath` decodes this back (`new File(url.toURI())`) before
+    // touching the filesystem; do the same here, mirroring the sibling
+    // `jar:file:` decode in `net_phase_e::uri_percent_decode`. Decoding after
+    // the `/!`-marker normalisation above keeps the jar-boundary detection on
+    // the original encoded text.
+    let p = crate::net_phase_e::uri_percent_decode(&p);
     // Windows: `File.toURI().toURL()` yields `file:/C:/dir/...`, so the
     // extracted path is `/C:/dir/...` — a leading slash *before* the
     // drive letter. `PathBuf::from("/C:/...")` does not resolve on
@@ -5416,6 +5451,48 @@ fn empty_enumeration_impl(ctx: &mut dyn NativeContext) -> ObjectRef {
     enm
 }
 
+/// Cached `cratonvm_classloading::ClassPath::new(paths)` construction, keyed
+/// by the exact `paths` vector.
+///
+/// PERF (2026-07-23): both call sites below (`loader_local_resource_urls`
+/// and `ucl_try_define_local_class`) used to call `ClassPath::new(&paths)`
+/// FRESH on every single invocation — i.e. every `URLClassLoader.findClass`/
+/// `findResource` call re-read and re-parsed every jar on the loader's
+/// classpath from scratch, with no caching at all (unlike
+/// `jar_contents_cached`, which this superficially resembles but doesn't
+/// share any code with). `ClassPath::new` opens and parses every classpath
+/// entry eagerly, so on a large classpath (`module/spring-boot-data-redis`'s
+/// test classpath has ~121 jars, several of them large — testcontainers.jar
+/// alone is 12.5k entries) this made ordinary Spring context bootstrap,
+/// which does hundreds of `ClassUtils.isPresent()`-style lookups per
+/// `ApplicationContextRunner.run()`, pay a full classpath re-scan on EVERY
+/// lookup — measured ~10-12s for just 100 lookups, when the underlying work
+/// should be milliseconds after the first scan. `DataRedisAutoConfigurationTests`,
+/// `DataRedisAutoConfigurationJedisTests`,
+/// `DataRedisAutoConfigurationLettuceWithoutCommonsPool2Tests`, and
+/// `DataRedisHealthContributorAutoConfigurationTests` all HANG (300s suite
+/// timeout) as a direct result. Cache by the exact paths vector: a
+/// `URLClassLoader.addURL` call naturally produces a longer paths vector, so
+/// it transparently gets its own fresh (correct) cache entry rather than
+/// serving a stale one — no explicit invalidation needed. Unbounded but
+/// small in practice (one entry per distinct classpath actually seen in the
+/// process), consistent with `jar_contents_cached`'s existing precedent.
+fn cached_class_path_for_paths(paths: &[String]) -> std::sync::Arc<cratonvm_classloading::ClassPath> {
+    use std::sync::{Arc, OnceLock};
+    static CACHE: OnceLock<Mutex<std::collections::HashMap<Vec<String>, Arc<cratonvm_classloading::ClassPath>>>> =
+        OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    if let Some(cp) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(paths) {
+        return cp.clone();
+    }
+    let cp = Arc::new(cratonvm_classloading::ClassPath::new(paths));
+    cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(paths.to_vec(), cp.clone());
+    cp
+}
+
 fn loader_constructor_url_paths(ctx: &dyn NativeContext, loader: ObjectRef) -> Vec<String> {
     let mut out = Vec::new();
 
@@ -5589,7 +5666,7 @@ fn fetch_http_resource(
 }
 
 fn loader_local_resource_urls(
-    ctx: &dyn NativeContext,
+    ctx: &mut dyn NativeContext,
     loader: ObjectRef,
     resource_name: &str,
 ) -> Vec<String> {
@@ -5600,7 +5677,15 @@ fn loader_local_resource_urls(
         }
         return Vec::new();
     }
-    let urls = cratonvm_classloading::ClassPath::new(&paths).find_all_resource_urls(resource_name);
+    // `cached_class_path_for_paths` (keyed by the exact paths vector) already
+    // covers the repeated-rebuild cost that a "pathing JAR" -- a jar with no
+    // class entries, only a manifest `Class-Path:` naming the real dependency
+    // jars, used by e.g. the spring-boot-suite-runner to dodge Windows'
+    // command-line length limit -- would otherwise pay on every single
+    // lookup once `ClassPath::new` honours that manifest attribute (see
+    // `classloading/src/class_path.rs`) and expands to the module's full,
+    // possibly 100s-of-jars dependency list.
+    let urls = cached_class_path_for_paths(&paths).find_all_resource_urls(resource_name);
     if std::env::var_os("CRATONVM_DBG_UCLRES").is_some() {
         eprintln!(
             "[UCLRES-DBG] loader={loader:?} resource={resource_name} paths={paths:?} urls={urls:?}"
@@ -5725,8 +5810,7 @@ pub(crate) fn ucl_try_define_local_class(
     // the bytes. Falling back to ClassManager's process-wide lookup after a
     // successful local definition can attach a same-named application JAR as
     // this class's CodeSource (for example, a URLClassLoader override JAR).
-    let local_class_path =
-        (!paths.is_empty()).then(|| cratonvm_classloading::ClassPath::new(&paths));
+    let local_class_path = (!paths.is_empty()).then(|| cached_class_path_for_paths(&paths));
     let (bytes, local_code_source) = match local_class_path.as_ref() {
         Some(class_path) => match class_path.find_resource(&resource_name) {
             Some(bytes) => (
@@ -5747,7 +5831,18 @@ pub(crate) fn ucl_try_define_local_class(
     let bytes = match bytes {
         Some(b) => b,
         None if http_bases.is_empty() => {
-            if url_classloader_isolated_from_app(ctx, loader) {
+            // A class dynamically appended to the BOOTSTRAP search
+            // (`Instrumentation.appendToBootstrapClassLoaderSearch` — e.g.
+            // Mockito's inline mock maker injecting `MockMethodDispatcher`/
+            // `MockMethodAdvice`) is visible to every loader via real
+            // parent-delegation semantics (an isolated `URLClassLoader`'s
+            // parent is null, i.e. the bootstrap loader itself — NOT "no
+            // parent at all"). Defer to the caller's own fallback (which
+            // consults the global class store, itself searching the
+            // bootstrap path) instead of making the miss authoritative here.
+            if url_classloader_isolated_from_app(ctx, loader)
+                && !cratonvm_classloading::is_bootstrap_appended_class(internal_name)
+            {
                 let exception = crate::jboss_module_loader::alloc_single_message_exception(
                     ctx,
                     "java/lang/ClassNotFoundException",
@@ -8446,7 +8541,7 @@ mod classloader_tests {
         ctx.set_array_element(urls, 0, Value::Object(Some(url)));
         ctx.set_field(ucp, UCP_STASHED_URLS, Value::Object(Some(urls)));
 
-        let hits = loader_local_resource_urls(&ctx, loader, "virtual/tomcat0807_webapp.txt");
+        let hits = loader_local_resource_urls(&mut ctx, loader, "virtual/tomcat0807_webapp.txt");
         assert_eq!(
             hits.len(),
             1,

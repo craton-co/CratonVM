@@ -143,17 +143,24 @@ that class HotSpot-passes cleanly, so it's unambiguously a real regression).
 the "both fail" bucket — don't let the HotSpot-also-fails classification
 hide it.
 
-## J. Possible contention artifacts — HotSpot HANGs during an overloaded control run, UNCONFIRMED (9 classes)
+## J. Contention artifacts, CONFIRMED — HANG was fake, but the underlying regressions were real; now FIXED (9 classes)
 
 The 2026-07-24 HotSpot control pass ran while this shared Azure host's
 `uptime` load average spiked to **70 → 148** (other concurrent sessions, not
 this run) — see [[feedback_shared_host_multitenant_confound]]. These 9
 classes were classified `HANG` (hit the 300s per-class timeout) on the
-HotSpot side; under that level of contention a merely-slow test can easily
-blow past 300s without any real defect. **Not confirmed as genuine fixture
-gaps** — rerun on a quiet host before trusting the HANG classification for
-these specifically (they may turn out to be more confirmed CratonVM
-regressions, or genuinely slow-but-passing tests, once verified clean):
+HotSpot side.
+
+**Resolved 2026-07-23** (full writeup:
+[hang-classification-unconfirmed-host-contention-FIXED.md](hang-classification-unconfirmed-host-contention-FIXED.md)).
+Reran on a quiet host: HotSpot passed all 9 cleanly (confirming the HANG was
+indeed the suspected contention artifact), but CratonVM failed all 9 with
+real, deterministic errors — 8 from a shared `Hashtable.size()` field-index
+collision breaking ecj JSP compilation (same bug fixed elsewhere via commits
+`744401af4`/`b854dc01f`), and 1 (`TestCustomSsl`) from a new bug,
+`HttpsURLConnection.setDefaultSSLSocketFactory` not unwrapping a delegating
+`SSLSocketFactory` subclass. Both fixed; all 9 classes now PASS cleanly on
+CratonVM on a quiet host, matching HotSpot:
 
 - `jakarta.el.TestCompositeELResolver`
 - `jakarta.el.TestOptionalELResolverInJsp`
@@ -177,7 +184,7 @@ regressions, or genuinely slow-but-passing tests, once verified clean):
 | F — unbuilt Maven test-webapp submodule | 1 | Yes (`mvn compile` the submodule) |
 | G/H — not yet root-caused | 2 | Needs individual investigation |
 | I — real CratonVM panic (masked by unrelated HotSpot fail) | 1 | **Real VM bug — prioritize** |
-| J — possible contention artifacts, unconfirmed | 9 | Rerun on a quiet host to confirm |
+| J — contention artifact (HANG) + 2 real bugs, ✅ FIXED 2026-07-23 | 9 | Done — see linked doc |
 
 Categories A/B/C/D/E/F (23 classes) are all completable fixture work — doing
 it would very likely turn several into either clean PASSes on both VMs or

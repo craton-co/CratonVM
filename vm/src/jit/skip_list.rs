@@ -120,11 +120,97 @@ pub enum SkipReason {
     /// Keep this symbol-completion method interpreted until its JIT lowering
     /// is understood.
     ClassFinderComplete,
+    /// Javac's `ClassFinder.fillIn` -- the method `ClassFinder.complete`
+    /// itself calls to do the actual symbol completion -- is a FIFTH
+    /// distinct JIT residual in the same repeated-in-process-compilation
+    /// scenario as `ClassReaderReadClass`/`ClassFinderComplete` above.
+    /// `ClassFinderComplete`'s own doc comment noted `fillIn` was
+    /// bisect-RULED-OUT for the two symptoms known at the time (a
+    /// deprecation-warning `-Werror` false positive and duplicated-token
+    /// generated source) -- but `fillIn` gets its own independent JIT
+    /// tier-up eligibility separate from its caller `complete` (forcing
+    /// `complete` to interpret does not prevent `fillIn` from itself
+    /// getting hot enough to tier up under a longer-running loop), and DOES
+    /// independently miscompile: `java.lang.NullPointerException` thrown
+    /// directly from `ClassFinder.fillIn` (JDK 25.0.3, line ~395) reached
+    /// via `Types.unboxedType` -> `ClassFinder.complete` -> `fillIn`
+    /// while attributing a `new Object[]{...}` array-initializer literal,
+    /// surfacing as real javac's own internal-compiler-error report rather
+    /// than a Spring-visible `CompilationException`. Reproduced
+    /// deterministically at iteration 38 of a Spring-free, ~30-line
+    /// standalone repro (`ToolProvider.getSystemJavaCompiler().getTask(...)
+    /// .call()` looped in one process, each iteration compiling a trivial
+    /// user class against a small JSpecify-`@Nullable`-annotated
+    /// `@FunctionalInterface` also in scope) -- with `ClassFinderComplete`
+    /// already interpreted per the fix above. Keep this symbol-completion
+    /// method interpreted until its own JIT lowering is understood too.
+    ClassFinderFillIn,
+    /// Javac's `ClassReader.readInnerClasses` -- the InnerClasses attribute
+    /// reader, a moderately complex loop (per-entry: 4 constant-pool-index
+    /// reads, an `adjustClassFlags` call, conditional `enterClass`/
+    /// `enterMember` calls and `ClassType.setEnclosingType` field writes) --
+    /// is a SIXTH distinct JIT residual in the same repeated-in-process-
+    /// javac-compilation family as `ClassReaderReadClass`/
+    /// `ClassFinderComplete`/`ClassFinderFillIn` above. Symptom: real
+    /// javac's own `class file truncated at offset N` diagnostic (thrown
+    /// from `ClassReader.nextChar`/`nextByte`/`nextInt` once the shared
+    /// `bp` buffer-position cursor has been driven past the end of the
+    /// classfile) -- consistent with the entry-count loop in this method's
+    /// own JIT-compiled body over- or under-consuming `nextChar()` calls per
+    /// iteration once tier-compiled, desynchronizing `bp` from every
+    /// subsequent attribute read for the rest of that classfile (and
+    /// possibly the next one read from the same shared `ClassReader`).
+    /// Bisected by binary search over every other method on `ClassReader`
+    /// (all TYPE_ANNOTATIONS/signature/attribute/nextByte-family candidates
+    /// ruled out first, since the trigger classfile has JSpecify
+    /// `@Nullable` TYPE_USE annotations on a generic method return type and
+    /// an array return type -- an initially much more obvious suspect that
+    /// turned out to be a red herring): `CRATONVM_JIT_BISECT_SKIP=.../
+    /// ClassReader.readInnerClasses` (this exact method alone) is
+    /// sufficient against a Spring-free, ~30-line standalone repro
+    /// (`ToolProvider.getSystemJavaCompiler().getTask(...).call()` looped
+    /// ~40x in one process, each iteration compiling a trivial user class
+    /// against a small JSpecify-annotated `@FunctionalInterface` also in
+    /// scope), reproducing deterministically at iteration 38 every time.
+    /// Confirmed JIT-only via `--nojit` (all iterations pass). Keep this
+    /// InnerClasses-attribute-reading method interpreted until its own JIT
+    /// lowering is understood.
+    ClassReaderReadInnerClasses,
+
+    /// Javac's `ClassReader.readAttrs` -- the shared per-member/per-class
+    /// attribute-dispatch loop (`readClassAttrs`/`readMemberAttrs` both
+    /// delegate straight into it: read an attribute count via `nextChar()`,
+    /// then loop that many times reading a name-index `nextChar()` + a
+    /// length `nextInt()` and either dispatching to a specific
+    /// `AttributeReader` or skipping `bp += attrLen`) -- is a SEVENTH
+    /// distinct JIT residual in the same repeated-in-process-javac-
+    /// compilation family as `ClassReaderReadClass`/`ClassFinderComplete`/
+    /// `ClassFinderFillIn`/`ClassReaderReadInnerClasses` above, same
+    /// "moderately complex counted loop over the shared `bp` cursor" shape.
+    /// Symptom: real javac's `bad class file... bad signature: "ourceFile"`
+    /// (a corrupted read of the `SourceFile` attribute's own name — the
+    /// leading `"S"` lost, i.e. the shared constant-pool-index/length cursor
+    /// desynchronized by a couple of bytes) surfacing while compiling
+    /// AOT-generated sources against `spring-core`/`spring-beans`/JDK
+    /// `.class` files pulled onto the classpath — found via
+    /// `ApplicationContextAotGeneratorTests$ConfigurationClassCglibProxy
+    /// .processAheadOfTimeWhenHasCglibProxyUseProxy`, which reproduces this
+    /// deterministically with default (Conservative) JIT settings despite
+    /// `readClass`/`readInnerClasses` already being interpreted. Confirmed
+    /// JIT-only (`--nojit`: pass) and isolated with `CRATONVM_JIT_DENY=
+    /// com/sun/tools/javac/jvm/ClassReader` (whole class: pass) then
+    /// narrowed with `CRATONVM_JIT_BISECT_SKIP=com/sun/tools/javac/jvm/
+    /// ClassReader.readAttrs` (this exact method alone: pass). Keep this
+    /// attribute-dispatch loop interpreted until its own JIT lowering is
+    /// understood.
+    ClassReaderReadAttrs,
+
     /// Javac's `Symbol$ClassSymbol.complete` underflows the interpreter operand
     /// stack after tiered compilation while H2 compiles a generated alias.
     /// Keep this symbol-completion method interpreted until its invokespecial
     /// lowering is corrected.
     ClassSymbolComplete,
+
     /// Spring's shaded JavaPoet `CodeBlock$Builder.add(String, Object...)`
     /// (the $-placeholder format-string parser, reached from
     /// `org/springframework/javapoet/CodeBlock$Builder`) is a FOURTH distinct
@@ -510,6 +596,18 @@ fn should_skip_jit_internal(
         return Some(SkipReason::ClassFinderComplete);
     }
 
+    if class_name == "com/sun/tools/javac/code/ClassFinder" && method_name == "fillIn" {
+        return Some(SkipReason::ClassFinderFillIn);
+    }
+
+    if class_name == "com/sun/tools/javac/jvm/ClassReader" && method_name == "readInnerClasses" {
+        return Some(SkipReason::ClassReaderReadInnerClasses);
+    }
+
+    if class_name == "com/sun/tools/javac/jvm/ClassReader" && method_name == "readAttrs" {
+        return Some(SkipReason::ClassReaderReadAttrs);
+    }
+
     // HIB-STOREDPROC-JIT.1 (2026-07-23): H2's `CREATE ALIAS ... AS $$` invokes
     // the real in-process javac compiler.  After this exact method tiers up,
     // `Symbol$ClassSymbol.complete()` deterministically reaches an
@@ -521,6 +619,7 @@ fn should_skip_jit_internal(
     // interpreted until the special-call lowering is root-caused.
     if class_name == "com/sun/tools/javac/code/Symbol$ClassSymbol" && method_name == "complete" {
         return Some(SkipReason::ClassSymbolComplete);
+
     }
 
     // SPRING-TESTCOMPILER.4 (2026-07-21): see `JavaPoetCodeBlockBuilderAdd`
@@ -1011,8 +1110,10 @@ fn should_skip_jit_internal(
         // every neighbouring RDN comparison/normalisation method remains JIT
         // eligible. Keep this small accessor interpreted under the conservative
         // policy until the JIT's array-backed SortedSet return path is
-        // root-caused. It remains explicitly liftable for diagnosis with
-        // CRATONVM_JIT_ALLOW_PACKAGES=com/unboundid/ldap/sdk/.
+        // root-caused. NOTE: since TOMCAT-JNDIREALM-JIT.2 below widened the
+        // ban to all of com/unboundid/, lifting for diagnosis needs the full
+        // CRATONVM_JIT_ALLOW_PACKAGES=com/unboundid/ prefix; the narrower
+        // com/unboundid/ldap/sdk/ entry only clears this guard, not JIT.2's.
         if class_name == "com/unboundid/ldap/sdk/RDN"
             && method_name == "getNameValuePairs"
             && !package_allowed("com/unboundid/ldap/sdk/", allow_packages)
@@ -1912,8 +2013,11 @@ fn is_unconditional_hash_miscompile_cluster(class_name: &str, method_name: &str)
 // policy until the package can be safely re-bisected. The July 2026 vector and
 // DiskBBQ hang residuals are covered by this same containment: the affected
 // test classes and their Elasticsearch vector-codec bodies sit under
-// `org/elasticsearch/`, while Lucene bytecode has its own fail-closed package
-// skip below.
+// `org/elasticsearch/`. Lucene bytecode is no longer skip-listed: the
+// LUCENE-POSTINGS.1 blanket `org/apache/lucene/` ban was retired by
+// `117d2d906` ("admit Lucene after synchronized-method gate") once the
+// interpreter started gating ACC_SYNCHRONIZED methods out of JIT/OSR itself,
+// which closed the IndexWriter monitor repro that had kept the ban alive.
 fn is_elasticsearch_suite_jit_fragile_cluster(class_name: &str, _method_name: &str) -> bool {
     class_name.starts_with("org/elasticsearch/")
 }
@@ -2924,7 +3028,25 @@ fn is_known_miscompile_aqs_family(class_name: &str, method_name: &str) -> bool {
     matches!(
         (class_name, method_name),
         // --- AbstractQueuedSynchronizer (classic, int state) ---
-        ("java/util/concurrent/locks/AbstractQueuedSynchronizer", "acquire")
+        // H2 TestFileSystem.testConcurrent hang (2026-07-23): compareAndSetState/
+        // getState/setState -- the raw Unsafe-CAS/volatile-accessor wrappers
+        // around `state` -- were missing from this family despite being the
+        // single hottest, most contended methods of the whole synchronizer
+        // protocol (every acquire/release funnels through them). A live gdb
+        // attach on a hung two-real-thread ReentrantReadWriteLock repro (H2's
+        // TestFileSystem.testConcurrent against the `async:` filesystem)
+        // caught one thread parked in `monitor_enter_synchronized_method`
+        // waiting on a lock the other thread's `compareAndSetState` call
+        // never visibly released, with no forward progress for 100s of
+        // seconds under real CPU load -- the same "AbstractQueuedLongSynchronizer.
+        // acquire" family hang this list already documents lower down, just
+        // one level deeper (the CAS primitive `acquire` itself calls, not
+        // `acquire`). See docs/known-issues/h2-suite-bugs/
+        // bug-h2-testfilesystem-testconcurrent-async-hang.md.
+        ("java/util/concurrent/locks/AbstractQueuedSynchronizer", "compareAndSetState")
+            | ("java/util/concurrent/locks/AbstractQueuedSynchronizer", "getState")
+            | ("java/util/concurrent/locks/AbstractQueuedSynchronizer", "setState")
+            | ("java/util/concurrent/locks/AbstractQueuedSynchronizer", "acquire")
             | ("java/util/concurrent/locks/AbstractQueuedSynchronizer", "release")
             | ("java/util/concurrent/locks/AbstractQueuedSynchronizer", "acquireShared")
             | ("java/util/concurrent/locks/AbstractQueuedSynchronizer", "releaseShared")
@@ -2975,6 +3097,13 @@ fn is_known_miscompile_aqs_family(class_name: &str, method_name: &str) -> bool {
             | ("java/util/concurrent/locks/ReentrantLock$FairSync", "initialTryLock")
             | ("java/util/concurrent/locks/ReentrantLock$FairSync", "tryAcquire")
             // --- AbstractQueuedLongSynchronizer (JDK 25+, long state) ---
+            // See the matching compareAndSetState/getState/setState note on the
+            // classic AbstractQueuedSynchronizer block above -- same gap, same
+            // fix, same repro (ReentrantReadWriteLock$Sync extends this class on
+            // JDK 25, so this is the copy that actually fired in the H2 hang).
+            | ("java/util/concurrent/locks/AbstractQueuedLongSynchronizer", "compareAndSetState")
+            | ("java/util/concurrent/locks/AbstractQueuedLongSynchronizer", "getState")
+            | ("java/util/concurrent/locks/AbstractQueuedLongSynchronizer", "setState")
             | ("java/util/concurrent/locks/AbstractQueuedLongSynchronizer", "acquire")
             | ("java/util/concurrent/locks/AbstractQueuedLongSynchronizer", "release")
             | ("java/util/concurrent/locks/AbstractQueuedLongSynchronizer", "acquireShared")
@@ -3107,16 +3236,35 @@ fn callee_saved_gpr_local_homes_enabled() -> bool {
         return true;
     }
 
+    // PERF (H2 TestFileSystem.testConcurrent hang, 2026-07-23): this is
+    // called from `should_skip_jit_internal`, which runs on every single
+    // interpreted method invocation VM-wide -- unlike its four sibling
+    // env-var checks in this file (CRATONVM_JIT_BISECT_SKIP/ONLY,
+    // CRATONVM_JIT_ALLOW_PACKAGES), which all cache via `OnceLock`, this one
+    // called `std::env::var()` fresh on every call. Under a two-real-thread,
+    // JIT-heavy, high-invocation-count workload (H2's
+    // TestFileSystem.testConcurrent against the `async:` filesystem) this
+    // manifested as an apparent 300s+ hang: live gdb attaches during the
+    // "hang" showed both threads actively burning CPU (not parked), one
+    // repeatedly stuck inside `std::env::var` -> libc `getenv`, with no
+    // forward progress visible in the test's own log for minutes at a time.
+    // Cache the decision once, matching the established pattern below.
     #[cfg(target_arch = "x86_64")]
-    std::env::var("CRATONVM_JIT_ENABLE_CALLEE_SAVED_GPR_LOCALS")
-        .ok()
-        .map(|v| {
-            matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "on" | "yes"
-            )
+    {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            std::env::var("CRATONVM_JIT_ENABLE_CALLEE_SAVED_GPR_LOCALS")
+                .ok()
+                .map(|v| {
+                    matches!(
+                        v.trim().to_ascii_lowercase().as_str(),
+                        "1" | "true" | "on" | "yes"
+                    )
+                })
+                .unwrap_or(false)
         })
-        .unwrap_or(false)
+    }
 }
 
 /// True if `prefix` matches any entry in `allow_packages`. An entry matches if
@@ -3431,8 +3579,10 @@ mod tests {
                 true,
                 SkipPolicy::Conservative,
             ),
-            None,
-            "the Tomcat LDAP guard must stay exact to RDN.getNameValuePairs"
+            Some(SkipReason::RustJvmTestFixture),
+            "TOMCAT-JNDIREALM-JIT.2 keeps ALL of com/unboundid/ interpreted \
+             (cross-package String-receiver corruption), not just \
+             RDN.getNameValuePairs"
         );
     }
 
@@ -3445,9 +3595,25 @@ mod tests {
                 false,
                 true,
                 SkipPolicy::Conservative,
+                &["com/unboundid/"],
+            ),
+            None,
+            "CRATONVM_JIT_ALLOW_PACKAGES=com/unboundid/ must lift the \
+             TOMCAT-JNDIREALM-JIT.2 package ban for bisection"
+        );
+        assert_eq!(
+            check_with(
+                "com/unboundid/ldap/sdk/RDN",
+                "getNameValuePairs",
+                false,
+                true,
+                SkipPolicy::Conservative,
                 &["com/unboundid/ldap/sdk/"],
             ),
-            None
+            Some(SkipReason::RustJvmTestFixture),
+            "a narrower allow entry must NOT lift the JIT.2 ban: the \
+             corruption is a cross-package compiled interaction, so partial \
+             lifts of individually-clean slices would mask the repro"
         );
         assert_eq!(
             check(
@@ -3984,8 +4150,10 @@ mod tests {
                 true,
                 SkipPolicy::Conservative,
             ),
-            Some(SkipReason::RustJvmTestFixture),
-            "Lucene vector leaves must stay interpreted by the separate Lucene package ban"
+            None,
+            "Lucene is JIT-admitted at the skip-list level since 117d2d906 \
+             retired the LUCENE-POSTINGS.1 package ban (ACC_SYNCHRONIZED \
+             methods are gated in the interpreter, not here)"
         );
     }
 

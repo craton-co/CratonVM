@@ -1985,3 +1985,370 @@ ForkedBooter`, `java/io/OutputStreamWriter`/`PrintWriter`, `java/util/
 concurrent/Semaphore`, `org/apache/activemq/broker/region/AbstractRegion`)
 belongs to unrelated subsystems never subject to
 `@CompileWithForkedClassLoader` duplication.
+
+
+## 2026-07-23 AOT follow-up 7 -- MockitoBean constructor-param native shortcut restored, sixth JIT residual (ClassReader.readInnerClasses) root-caused and fixed
+
+Worktree `/data/wt-aot-final-close-20260723` (branch `fix/aot-final-close-20260723`,
+from `origin/dev` `893ddbc73`). No subagents used, per this task's standing
+instruction. Pushed to `origin/dev` at `9fb1b8749`.
+
+### Fix 1: `@MockitoBean`/`@MockitoSpyBean` constructor-parameter by-name lookup
+
+**Root cause found**: `native_spring_extension_resolve_parameter`
+(`native-builtins/src/lib.rs`) -- the same native trampoline
+follow-up 5/6 above fixed for loader-blindness -- is a full native
+reimplementation of `SpringExtension.resolveParameter`, not a thin
+delegate. Its doc comment claimed "Spring Framework 7.0.7 delegates every
+parameter shape directly to `ParameterResolutionDelegate`... the former
+ApplicationContext/BeanOverride branches drifted from Spring and linked a
+removed `SpringExtension.isBeanOverride` method" -- **this was simply
+wrong**. The actual, current `spring-framework-recheck` checkout's
+`SpringExtension.java` (verified by reading the source directly) still has
+`isBeanOverride(Parameter)` and, in `resolveParameter`, a direct
+`applicationContext.getBean(handler.getBeanName())` shortcut ahead of the
+`ParameterResolutionDelegate` fallback, for any parameter whose
+`BeanOverrideHandler.getBeanName()` resolves non-null. The native mirror
+never had this branch (or had it removed at some point based on a stale
+checkout), so it *always* fell through to the ambiguous by-type
+`ParameterResolutionDelegate.resolveDependency` path.
+
+**Symptom**: any `@MockitoBean`/`@MockitoSpyBean`-annotated *constructor*
+parameter whose override bean name doesn't happen to equal the parameter's
+own name (or carry an explicit `@Qualifier`) throws
+`NoUniqueBeanDefinitionException: ... expected single matching bean but
+found N: <every sibling override's bean name>` -- since all sibling
+override beans (mocks/spies registered by the SAME `BeanOverrideBeanFactoryPostProcessor`
+pass) share the exact declared type. Root-caused with a sequence of
+isolated probes proving each individual mechanism (`MergedAnnotations`
+meta-annotation scanning, `@AliasFor` resolution, `Parameter` reflection,
+`BeanOverrideUtils.resolveHandlerForParameter`, `DefaultListableBeanFactory`
+disambiguation) byte-identical between CratonVM and real JDK 25 in
+isolation -- the actual divergence only showed up by adding an
+unconditional canary exception at the top of a *locally patched copy* of
+`SpringExtension.resolveParameter`'s Java source: it never fired under
+CratonVM (proving the real bytecode body never runs), while the exact same
+build fired it immediately under real JDK. That, plus a full unelided
+stack-trace dump of the actual failure (no `SpringExtension` frame at all,
+straight from `ParameterResolutionUtils` into `ParameterResolutionDelegate`),
+pointed at a same-class *native* override rather than a Java-level bug --
+confirmed by finding the `registry.register("...SpringExtension",
+"resolveParameter", ...)` entry in `native-builtins/src/lib.rs`.
+
+**Fix**: added the same `BeanOverrideUtils.resolveHandlerForParameter` +
+`handler.getBeanName()` + direct `applicationContext.getBean(name)`
+shortcut to the native, purely additive (falls through to the existing
+`ParameterResolutionDelegate.resolveDependency` call unchanged when no
+override name resolves).
+
+**Verified**: `MockitoBeanByNameLookupForConstructorParametersIntegrationTests`
+7/7 (was 0/7), `MockitoSpyBeanByNameLookupForConstructorParametersIntegrationTests`
+5/5, `MockitoBeansByNameIntegrationTests` 1/1 -- all three of the
+previously-documented "Family A" residuals from
+`[[aot-endtoend-beanoverrides-73-to-158-of-175]]` now fully pass.
+
+### Fix 2 (bonus, found while chasing Fix 1): `ClassFinder.fillIn` fifth JIT residual
+
+While bisecting a *different* NPE hit during repeated in-process javac
+compiles (see Fix 3 below), found that `com.sun.tools.javac.code.
+ClassFinder.fillIn` -- the method `ClassFinder.complete` (already
+skip-listed as `ClassFinderComplete`) itself calls to do the actual symbol
+completion -- independently miscompiles once IT crosses its own JIT
+tier-up threshold, throwing a raw `NullPointerException` from inside real
+javac (`Types.unboxedType -> ClassFinder.complete -> fillIn`) while
+attributing a `new Object[]{...}` array literal, surfacing as javac's own
+internal-compiler-error report. `ClassFinderComplete`'s own doc comment
+had explicitly bisect-RULED-OUT `fillIn` for the two symptoms known at the
+time -- that ruling was correct for those symptoms, but `fillIn` has its
+own, separate JIT eligibility from its caller and can still miscompile on
+its own under a long enough loop. Added `SkipReason::ClassFinderFillIn`.
+
+### Fix 3: `ClassReader.readInnerClasses` -- sixth JIT residual, root cause of the long-standing "AutowiredArguments...truncated" bug
+
+This closes the residual flagged in
+`[[aot-cglib-residuals-not-classid-its-typeannotations-classfile-bug]]`
+(memory) and the "2026-07-21 late session" table row above for
+`ApplicationContextAotGeneratorTests`'s `processAheadOfTimeUsesCglibClassForFactoryMethod`
+/ `...WithAnnotationsOnTheUserClasConstructor`.
+
+**The original hypothesis was a red herring.** That memory entry suspected
+a `TypeAnnotations`-attribute-length parsing bug in CratonVM's own
+classfile reader (`reader/src/attribute.rs`), since the failing class
+(`AutowiredArguments`) is a `@FunctionalInterface` with JSpecify
+`@Nullable` TYPE_USE annotations on a generic method return type and an
+array return type -- exactly the structurally-complex `type_path` cases
+that attribute exists to encode.
+
+**What actually happened**: built a Spring-free, ~30-line standalone repro
+(a small JSpecify-`@Nullable`-annotated `@FunctionalInterface` +
+`ToolProvider.getSystemJavaCompiler().getTask(...).call()` looped ~40x in
+one process) and confirmed it reproduces the exact "`bad class file...
+class file truncated at offset N`" symptom deterministically at iteration
+38, and confirmed via `--nojit` (all iterations pass) that this is a
+genuine JIT miscompilation, not a reader-crate bug at all -- consistent
+with the SAME family as `ClassReaderReadClass`/`ClassFinderComplete`/
+`ClassFinderFillIn` above, just a fifth-become-sixth member nobody had
+isolated yet.
+
+Bisected via `CRATONVM_JIT_BISECT_SKIP` binary search across every method
+on `com.sun.tools.javac.jvm.ClassReader` (~70 candidates enumerated via
+`javap -p com.sun.tools.javac.jvm.ClassReader` against the real JDK 25
+install) -- deliberately ruled out every TYPE_ANNOTATIONS/signature/
+attribute-value-reading method FIRST (`readTypePath`, `readPosition`,
+`readTypeAnnotation`, `attachTypeAnnotations`, `sigToType`/`sigToTypeParams`/
+`classSigToType`, `readAnnotations`/`readCompoundAnnotation`/
+`readAttributeValue`, `nextByte`/`nextChar`/`nextInt`, etc. -- all
+skip-listed together, zero effect, exact same failure at the exact same
+offset) before finding it via a 25-then-12-then-6-then-3-then-1 binary
+search: **`ClassReader.readInnerClasses`** (this exact method alone) is
+sufficient.
+
+**Mechanism**: `readInnerClasses` reads an entry count via `nextChar()`
+then loops that many times, each iteration doing 4 more `nextChar()`
+calls plus conditional `enterClass`/`enterMember`/`ClassType.
+setEnclosingType` calls -- a moderately complex loop that JIT-miscompiles
+its own trip-count/cursor-advance handling once tier-compiled, over- or
+under-consuming bytes from the shared `ClassReader.bp` buffer-position
+field. Since `bp` is shared mutable state on the `ClassReader` instance
+(reused across the whole `javac` invocation, not per-classfile), the
+corruption doesn't necessarily surface on the SAME classfile being read --
+a control run with the pre-fix binary showed the "truncated" error landing
+on **`java.lang.Integer.class`** (an entirely unrelated JDK bootstrap
+class, autoboxed from `new Object[]{1, 2}` in the trivial repro's user
+code), not `AutowiredArguments` at all. `AutowiredArguments` was simply
+one of many `InnerClasses`-bearing classfiles read in the AOT test
+scenario's much longer compile sequence, unlucky enough to be read right
+after `readInnerClasses` had crossed its JIT tier-up threshold -- the
+TYPE_USE annotations on it were coincidental, not causal.
+
+Added `SkipReason::ClassReaderReadInnerClasses`.
+
+**Verified against the real `ApplicationContextAotGeneratorTests`**: both
+previously-`CompilationException` tests no longer hit ANY compile failure.
+`...WithAnnotationsOnTheUserClasConstructor` now passes outright.
+`processAheadOfTimeUsesCglibClassForFactoryMethod` now reaches (and only
+fails on) the SEPARATE, already-documented CGLIB duplicate-`ClassId`
+family (`IllegalArgumentException: class ... is not an enhanced class`) --
+a distinct, unrelated bug this session did not attempt to fix. Full-class
+re-run: 34/40 (was 34/40 before this session's fixes too, but with a
+DIFFERENT set of 5 failures -- the two truncation-based ones are gone,
+replaced by the CGLIB "not enhanced" one plus 3 others this session did
+not further chase: `processAheadOfTimeWithExplicitResolvableType`'s
+`AotBeanProcessingException` on bean `hierarchyBean`,
+`processAheadOfTimeWhenHasCglibProxyWriteProxyAndGenerateReflectionHints`'s
+`Expecting actual not to be null`, and `processAheadOfTimeWhenHasCglibProxyUseProxy`'s
+`expected: "Hello0 World" but was: "Hello1 World"`, plus
+`processAheadOfTimeWhenHasAutowiringOnUnresolvedGeneric`'s
+`AutowiredGenericTemplate` mismatch -- none characterized further this
+session, flagged as the next targets for whoever continues).
+
+Also merged in a concurrent, independent fix from another session
+(`ClassSymbolComplete` -- `Symbol$ClassSymbol.complete` operand-stack
+underflow, found via H2 stored-procedure `CREATE ALIAS ... AS $$`) that
+turned out to be the SAME symptom this session separately observed as a
+NEW `ApplicationContextAotGeneratorTests` failure
+(`processAheadOfTimeWhenHasSimpleBean`'s "operand stack underflow") --
+already fixed on `origin/dev` by the time this session's branch merged, no
+duplicate work needed.
+
+`cargo test -p cratonvm-vm --lib --release`: 2230 passed / 13 failed, same
+pre-existing `lock_order`/`skip_list`/`tomcat_scanner` release-mode
+baseline family throughout (before, after each fix, and after the final
+merge to `origin/dev`), zero regressions at any point.
+
+**Still open for whoever continues** (see `[[aot-endtoend-beanoverrides-73-to-158-of-175]]`
+and this doc's earlier sections for full context):
+1. "Family B" of the `endToEndTestsForBeanOverrides` 175-test suite (a
+   smaller cluster of plain `AssertionFailedError: expected: null but was:
+   ""`) -- still not isolated to specific test classes; the full 175-test
+   aggregate run needs several GB of heap (`--Xmx 4g` recommended) and
+   repeatedly hit host-level OOM/kill under this session's shared-host
+   contention, so a clean full-suite count was not obtained this session.
+2. `ApplicationContextAotGeneratorTests`'s remaining 6 residuals (listed
+   above) -- 5 distinct, uncharacterized failure modes plus the
+   already-known CGLIB duplicate-`ClassId` one.
+3. `TestContextAotGeneratorIntegrationTests`'s `GroovySystem` hang/slowness
+   -- still needs a re-test on a genuinely quiet host (load average < 2) to
+   distinguish real hang from host-contention artifact; this session's host
+   oscillated between load 1 and load 100+ repeatedly and was never quiet
+   for long enough to attempt it.
+
+## 2026-07-24 AOT follow-up 8 -- three more residuals closed (34/40 -> 36/40), two CGLIB cross-test failures root-caused but not yet fixed, new lambda-singleton gap found
+
+Worktree `/data/wt-aot-residuals3-20260723` (branch
+`fix/aot-residuals3-20260723`, from `origin/dev` `1dae989b1`, merged with
+`origin/dev` `d58e8ea1e` mid-session with no conflicts). No subagents used,
+per this task's standing instruction. Pushed directly to `origin/dev` at
+`ce0804f81` (fast-forward, `d58e8ea1e..ce0804f81`) — the shared main
+checkout at `/data/data/cratonvm` had uncommitted changes belonging to
+another concurrent session, so the merge-and-push was done entirely from
+this session's own worktree instead of touching the shared checkout.
+
+### Fix 1: `ClassReader.readAttrs` -- SEVENTH JIT-miscompile residual in the repeated-in-process-javac family
+
+Same family as `ClassReaderReadClass`/`ClassFinderComplete`/
+`ClassFinderFillIn`/`ClassReaderReadInnerClasses`/`ClassSymbolComplete`
+(see follow-up 7 and earlier entries above). New symptom: `bad class
+file... bad signature: "ourceFile"` (the leading `S` of `SourceFile` lost
+-- a `ClassReader.bp` cursor desync) while compiling AOT-generated sources
+against classpath `.class` files, reproduced deterministically via
+`ApplicationContextAotGeneratorTests$ConfigurationClassCglibProxy
+.processAheadOfTimeWhenHasCglibProxyUseProxy` even with every previously-
+known culprit already interpreted. Root-caused to `ClassReader.readAttrs`
+-- the attribute-dispatch loop `readClassAttrs`/`readMemberAttrs` both
+delegate straight into (read a count via `nextChar()`, then loop reading a
+name-index `nextChar()` + length `nextInt()` per entry) -- via the
+established methodology: `--nojit` control (pass), `CRATONVM_JIT_DENY=
+com/sun/tools/javac/jvm/ClassReader` (whole class: pass), then
+`CRATONVM_JIT_BISECT_SKIP=com/sun/tools/javac/jvm/ClassReader.readAttrs`
+(this exact method alone: pass). Added `SkipReason::ClassReaderReadAttrs`
+to `vm/src/jit/skip_list.rs`.
+
+### Fix 2: `RootBeanDefinition.setResolvedFactoryMethod` native override wrote to a non-existent field
+
+`processAheadOfTimeWithExplicitResolvableType` (gh-30689 -- a bean
+definition built via `setResolvedFactoryMethod` + `setTargetType`, no
+`factoryMethodName` ever set explicitly) failed with `IllegalStateException:
+No constructor or factory method candidate found for ... factoryMethodName=
+null`. Root-caused with a small standalone probe (`HBProbe.java`): calling
+the native-overridden `setResolvedFactoryMethod` and immediately reading
+back `getResolvedFactoryMethod()`/`getFactoryMethodName()` both returned
+`null`. The override (`native-builtins/src/spring_startup_bootstrap.rs`,
+originally landed for an unrelated `ModifiedClassPathClassLoader`/
+loader-canonicalization fix) wrote the incoming `Method` to a field named
+`"resolvedFactoryMethod"` -- confirmed against the current
+`spring-framework-recheck` checkout's actual source that the real field is
+`factoryMethodToIntrospect` -- so every write was silently absorbed by
+`set_field_by_name`'s no-such-field path, and the override never replicated
+`setResolvedFactoryMethod`'s real side effect of calling
+`setUniqueFactoryMethodName(method.getName())` (setting both
+`factoryMethodName` and `isFactoryMethodUnique = true`), which
+`ConstructorResolver.resolveFactoryMethod` requires before it will even
+consult `getResolvedFactoryMethod()`. Fixed by writing the correct field
+name and replicating both side effects.
+
+### Fix 3: CGLIB `FastClass` placeholder classes never emitted
+
+`processAheadOfTimeWhenHasCglibProxyWriteProxyAndGenerateReflectionHints`'s
+`isRegisteredCglibClass` helper checks THREE class names are present in
+`TestGenerationContext.getGeneratedFiles()` with a matching reflection
+hint: the main `$$SpringCGLIB$$0` enhancer (correctly emitted) plus TWO
+`$$SpringCGLIB$$FastClass$$0`/`$$1` helper classes real cglib always emits
+alongside it (a reflection-avoidance dispatch-table optimization). This
+native `ConfigurationClassEnhancer.enhance()` reimplementation never
+generates FastClass at all (`emit_bean_override`'s dispatch is inlined
+directly, no indirection through a `Callback`/`FastClass` lookup table
+needed), so the third `getGeneratedFileContent` assertion always saw
+`null`, confirmed by a debug print added to a locally-patched copy of the
+test (`isRegisteredCglibClass`) run against the real classpath jar via
+front-of-classpath override -- main class: `content=present len=3620`;
+`FastClass$$0`: `content=NULL`. Fixed with a NEW `build_fastclass_
+placeholder` helper (`native-builtins/src/cglib_enhancer.rs`) emitting a
+minimal `extends java/lang/Object` placeholder class (nothing ever loads
+or invokes it) for each of the two names, fed through the SAME
+`notify_generated_class_handler` hook the main class already uses -- real
+Spring's `CglibClassHandler.handleGeneratedClass` generically registers
+BOTH the `GeneratedFiles` entry and the `INVOKE_DECLARED_CONSTRUCTORS`
+reflection hint for any name+bytes handed to it, so no separate hint-
+registration code was needed on this side.
+
+### Root-caused but NOT fixed: two CGLIB cross-test residuals, confirmed test-order-dependent
+
+`processAheadOfTimeUsesCglibClassForFactoryMethod` ("`IllegalArgumentException:
+class ... is not an enhanced class`") and `processAheadOfTimeWhenHasCglibProxyUseProxy`
+("Hello1" instead of "Hello0" -- `CglibConfiguration.prefix()`'s body
+running twice) were BOTH independently confirmed, via repeated isolated
+`KRunMethod` runs, to **pass 100% reliably every time in isolation** but
+**fail 100% deterministically** whenever run as part of the full
+40-method `ApplicationContextAotGeneratorTests` class run (verified twice,
+identical failure set both times -- not flaky/host-load-dependent).
+
+Initial hypothesis: `config_enhancer_class_cache` (the cache added in an
+earlier session so a repeat `enhance()` call for the SAME `@Configuration`
+class returns the SAME `Class`, matching real CGLIB's own
+`AbstractClassGenerator` caching) was keyed by the bare, **recyclable**
+`ClassId` alone rather than `(defining_loader_id, class_name)` -- flagged
+as a known gap in an earlier session's `ConfigurationClassEnhancerTests
+.withPublicClass` note, and matching the sibling `config_enhancer_counters`
+cache's own already-fixed key shape. **Fixed this** (now keyed by
+`(loader_id, super_internal_name)`, mirroring `config_enhancer_counters`)
+as a genuine, independent correctness improvement -- but empirically, via
+a `CRATONVM_DBG_CCECACHE`-gated trace (kept in the code, see
+`cce_enhance`), this did **not** turn out to be what's happening here:
+both tests, run back-to-back in EITHER order via a minimal custom 2-method
+JUnit launcher (`KRun2Methods.java`), showed the SECOND call reusing the
+FIRST call's cache entry with the **exact same** `super_class_id` AND
+`loader_id` both times -- i.e. `CglibConfiguration` genuinely is loaded
+via the SAME stable loader across these nested test methods (contradicting
+an initial assumption, checked with a minimal classloader-only repro, that
+`@CompileWithForkedClassLoader` gives every test method method a fully
+independent copy of every referenced class -- it does NOT for
+`testFixtures` classes reached only by name, only for the outer test class
+itself and anything the injected `classResourceLookup` covers). The cached
+bytes themselves were independently confirmed correct (a `CBProbe.java`
+probe directly enhancing `CglibConfiguration` and calling
+`Enhancer.registerStaticCallbacks` on the result succeeded, setter method
+present and reflectively found) -- so a cache HIT returning them should be
+harmless. The actual mechanism was not further isolated this session:
+attempts to trace deeper (running the two tests back-to-back with
+`CRATONVM_DBG_CCECACHE=1`) repeatedly hit multi-minute delays around
+Hibernate Validator's `ResourceBundleMessageInterpolator`/EL-processor
+one-time initialization under host contention, consuming the remaining
+investigation budget without a clean trace. **Next step for whoever
+continues**: bypass the JUnit/Spring-context-refresh machinery entirely
+(a raw Java program that directly exercises `ConfigurationClassPostProcessor`
++ `ApplicationContextAotGenerator.processAheadOfTime` twice in one process,
+skipping anything that would trigger Hibernate Validator) to get a clean
+multi-minute-hang-free trace of what differs between the cached-hit
+`Class` mirror returned during AOT PROCESSING and whatever the REPLAY-time
+compiled/loaded class actually is.
+
+### New finding, not fixed: non-capturing lambdas aren't cached as JVM singletons
+
+`processAheadOfTimeWhenHasAutowiringOnUnresolvedGeneric` (confirmed to
+fail 100% reliably even in ISOLATION, not cross-test) asserts that
+`AutowiredGenericTemplate.genericTemplate` (autowired in a FRESH, AOT-
+replayed context) is `.equals()` (== identity, no custom `equals()`) to
+`applicationContext.getBean("genericTemplate")` from the ORIGINAL context
+used for AOT processing -- both ultimately backed by the exact same
+`v -> {}` non-capturing lambda expression in `GenericTemplateConfiguration
+.genericTemplate()`. On real HotSpot this holds because
+`InnerClassLambdaMetafactory` special-cases a lambda with ZERO captured
+arguments: it emits a single cached `private static final INSTANCE` field
+on the spun-up hidden lambda class and every invocation of the factory
+method just returns that same field, rather than allocating a fresh
+instance -- a real, load-bearing JDK optimization, not just an incidental
+detail. CratonVM's own lambda implementation (`vm/src/runtime/
+invokedynamic.rs`'s `allocate_lambda_proxy`, called from both the fresh-
+link and cached-call-site paths) unconditionally allocates a brand new
+heap object on every invocation regardless of capture count, so two
+separate invocations of the same non-capturing lambda expression produce
+two non-identical (and non-`.equals()`) objects on this VM. **Not fixed
+this session** -- implementing the singleton-per-zero-capture-callsite
+cache correctly needs a GC-safe long-lived `ObjectRef` cache (precedent
+exists: `native-builtins/src/lang_math.rs`'s `integer_cache` +
+`gc_scan_value_of_cache_roots`/its remap counterpart for `Integer.valueOf`'s
+`-128..127` boxed cache), keyed by something that survives class/loader
+GC without recycling-related aliasing (the exact same recyclable-`ClassId`
+concern as the CGLIB cache above) -- flagged as a real, understood, but
+nontrivial VM-level gap for a dedicated follow-up, not attempted given
+this session's remaining time budget.
+
+### Not attempted this session (time budget)
+
+Family B of `endToEndTestsForBeanOverrides` and the `TestContextAotGeneratorIntegrationTests`
+`GroovySystem` quiet-host recheck (both already flagged above) were not
+revisited this session either -- the host was never quiet, and this
+session's remaining time went to the CGLIB cross-test investigation above
+instead.
+
+Verified: `cargo test -p cratonvm-native-builtins --lib` (3078 passed / 1
+pre-existing unrelated failure -- `regex_lookbehind_tests::pem_block_to_der_roundtrip`,
+crypto/PEM code untouched by this session -- / 6 ignored), `cargo test -p
+cratonvm-vm --lib --release` both before merging `origin/dev` (2230
+passed / 13 pre-existing `lock_order`/`skip_list`/`tomcat_scanner`
+baseline failures) and after (2233 passed / 10 of the same family --
+3 of the 13 were independently fixed by concurrent upstream work merged
+in mid-session) -- zero regressions introduced by this session's 3 fixes
+at any point. `ApplicationContextAotGeneratorTests` full class:
+34/40 -> 36/40.
