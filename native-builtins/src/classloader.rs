@@ -947,11 +947,9 @@ pub(crate) fn is_bootstrap_class_name(internal: &str) -> bool {
 /// Whether `loader_obj` is eligible for loader-initiated resolution of a
 /// class it defined -- either the global `CRATONVM_LOADER_AWARE_RESOLUTION`
 /// gate is on (default-on since the Hibernate custom-loader soak; see
-/// `vm::runtime::env_cache::loader_aware_resolution`'s doc comment for the
-/// validation history -- duplicated here rather than shared because
-/// `native-builtins` cannot depend on `vm`), or `loader_obj` is a
-/// `groovy.lang.GroovyClassLoader` / Spring's own AOT-test isolating loaders
-/// (`org.springframework.core.test.tools.{DynamicClassLoader,
+/// [`loader_aware_resolution`]'s doc comment for the validation history), or
+/// `loader_obj` is a `groovy.lang.GroovyClassLoader` / Spring's own AOT-test
+/// isolating loaders (`org.springframework.core.test.tools.{DynamicClassLoader,
 /// CompileWithForkedClassLoaderClassLoader}`) -- narrow carve-outs for when
 /// the global gate is explicitly disabled (`CRATONVM_LOADER_AWARE_
 /// RESOLUTION=0`), mirroring `is_groovy_class_loader` in interpreter.rs.
@@ -959,11 +957,14 @@ pub(crate) fn is_loader_aware_resolution_eligible(
     ctx: &mut dyn NativeContext,
     loader_obj: ObjectRef,
 ) -> bool {
-    let global_gate = match std::env::var("CRATONVM_LOADER_AWARE_RESOLUTION") {
-        Ok(v) => !v.is_empty() && v != "0",
-        Err(_) => true,
-    };
-    if global_gate {
+    // Loader-identity consolidation: this used to inline its own
+    // `std::env::var("CRATONVM_LOADER_AWARE_RESOLUTION")` parse -- a FOURTH
+    // copy of the same gate living right next to the crate's own
+    // `loader_aware_resolution()` below. Route through that single
+    // in-crate copy (which itself now delegates to
+    // `cratonvm_classloading::loader_aware_resolution`, the workspace
+    // source of truth) instead. See `docs/internal/loader-identity.md`.
+    if loader_aware_resolution() {
         return true;
     }
     let loader_cid = ctx.class_id_of_object(loader_obj);
@@ -1020,25 +1021,36 @@ pub fn loader_unload_enabled() -> bool {
     })
 }
 
-/// `CRATONVM_LOADER_AWARE_RESOLUTION` gate (default ON). Mirrors
-/// `cratonvm_vm::runtime::env_cache::loader_aware_resolution` so the
-/// native-builtins half of loader-faithful class resolution (per-user-loader
-/// namespace assignment in `defineClass`, exact `findLoadedClass`,
-/// `descriptor_to_class_mirror_via_loader` for reflective Field/Method/
-/// Constructor types, annotation Class-value resolution) stays in lock-step
-/// with the interpreter half. This copy had drifted out of lock-step (still
-/// default OFF) after `env_cache::loader_aware_resolution` flipped to default
-/// ON for the `context.groovy` bug-cluster fix, which silently disabled this
-/// crate's share of the loader-faithful fixes by default — see
-/// `docs/known-issues/hib-bytecode-enhancement-loader-faithful-linking.md`.
+/// `CRATONVM_LOADER_AWARE_RESOLUTION` gate (default ON). Gates the
+/// native-builtins half of loader-faithful class resolution
+/// (per-user-loader namespace assignment in `defineClass`, exact
+/// `findLoadedClass`, `descriptor_to_class_mirror_via_loader` for
+/// reflective Field/Method/Constructor types, annotation Class-value
+/// resolution) so it stays in lock-step with the interpreter
+/// (`vm::runtime::env_cache::loader_aware_resolution`) and class-manager
+/// (`cratonvm_classloading::loader_aware_resolution`) halves.
+///
+/// **Loader-identity consolidation:** this crate depends directly on
+/// `cratonvm-classloading` (see `Cargo.toml`), so this is no longer an
+/// independent `OnceLock`-cached env-var parse -- it forwards to
+/// `cratonvm_classloading::loader_aware_resolution`, the single workspace
+/// source of truth, which is what `vm::runtime::env_cache::
+/// loader_aware_resolution` now also forwards to. This copy previously
+/// drifted out of lock-step (stayed default OFF after `env_cache::
+/// loader_aware_resolution` flipped to default ON for the `context.groovy`
+/// bug-cluster fix), silently disabling this crate's share of the
+/// loader-faithful fixes by default -- see
+/// `docs/known-issues/hib-bytecode-enhancement-loader-faithful-linking.md`
+/// and `docs/internal/loader-identity.md`. Kept as a thin wrapper (rather
+/// than switching call sites over to the classloading path directly) so
+/// this crate's `#[inline]`/`pub(crate)` call sites and doc cross-references
+/// do not need to change.
+///
 /// When off, every loader-identity path keeps its exact pre-gate behavior.
 /// Empty / `"0"` ⇒ off; any other value ⇒ on.
+#[inline]
 pub(crate) fn loader_aware_resolution() -> bool {
-    static GATE: OnceLock<bool> = OnceLock::new();
-    *GATE.get_or_init(|| match std::env::var("CRATONVM_LOADER_AWARE_RESOLUTION") {
-        Ok(v) => !v.is_empty() && v != "0",
-        Err(_) => true,
-    })
+    cratonvm_classloading::loader_aware_resolution()
 }
 
 /// Virtual-dispatch correctness for custom `ClassLoader` subclasses.
