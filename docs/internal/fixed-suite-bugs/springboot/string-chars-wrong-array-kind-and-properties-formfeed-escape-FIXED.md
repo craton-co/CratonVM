@@ -1,7 +1,7 @@
 # `String.chars()` wrong array kind + `Properties` `\f` escape gap — FIXED
 
 Found and fixed 2026-07-24 investigating Spring Boot core39 residual Cluster A
-(`docs/known-issues/spring-boot-core39-residual-clusters-20260723.md`).
+(`../../../known-issues/springboot/spring-boot-core39-residual-clusters-20260723.md`).
 Worktree `springboot-core39-clusterA-20260723`.
 
 ## Bug 1 — `Properties` `.properties`-file loader never decoded `\f`

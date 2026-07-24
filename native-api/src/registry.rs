@@ -1742,7 +1742,7 @@ pub trait NativeContext {
     /// very first time a class is needed under a given loader (the gap that
     /// made two prior lookup-based fix attempts for the H2 `Parser`
     /// loader-collapse bug regress on a fresh session -- see
-    /// docs/known-issues/h2-suite-bugs/bug-h2-suite-residual-fail-triage.md's
+    /// docs/known-issues/h2/bug-h2-suite-residual-fail-triage.md's
     /// eighth-pass section).
     ///
     /// Native overrides that construct or invoke-special a DIFFERENT class
@@ -4164,7 +4164,7 @@ impl NativeMethodRegistry {
         // PipedInputStream itself -- which declares neither -- producing a
         // NoSuchMethodError naming PipedInputStream for a completely
         // unrelated method. See
-        // docs/known-issues/h2-suite-bugs/bug-h2-nosuchmethoderror-cross-class-dispatch.md
+        // docs/known-issues/h2/bug-h2-nosuchmethoderror-cross-class-dispatch.md
         // (H2's TestLob/TestLobApi/TestSQLXML/TestUpdatableResultSet/
         // TestResultSet, which all use real connected Piped stream pairs).
         // Real JDK PipedInputStream/PipedOutputStream bytecode is

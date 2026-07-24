@@ -188,7 +188,7 @@ pub(crate) struct SockSide {
     // invokes methods on a String receiver instead of a SocketImpl,
     // producing a NoSuchMethodError that names String for a method that
     // plainly does not exist on it (e.g. create(Z)V). See
-    // docs/known-issues/h2-suite-bugs/bug-h2-nosuchmethoderror-cross-class-dispatch.md.
+    // docs/known-issues/h2/bug-h2-nosuchmethoderror-cross-class-dispatch.md.
     pub host: String,
     pub port: i32,
     pub local_port: i32,

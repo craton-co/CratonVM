@@ -1,6 +1,6 @@
 # core/spring-boot Cluster D — application lifecycle, SSL, and validation
 
-Follow-up to `docs/known-issues/spring-boot-core39-residual-clusters-20260723.md`'s
+Follow-up to `../../../known-issues/springboot/spring-boot-core39-residual-clusters-20260723.md`'s
 Cluster D. Worked in worktree `springboot-core39-clusterD-20260723`, branch
 `worktree-springboot-core39-clusterD-20260723`, based on `dev` @ `1dae989b1`.
 

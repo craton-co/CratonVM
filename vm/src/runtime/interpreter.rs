@@ -15545,7 +15545,7 @@ fn execute_instruction(
             // FIELD-WATCH (TestUpgrade RootReference/MVMap residual) — every
             // real putfield to any Page/RootReference field, unconditional
             // (not tied to a construction-site guess or a GC-move-fragile
-            // address watch list). See docs/known-issues/h2-suite-bugs/
+            // address watch list). See docs/known-issues/h2/
             // bug-h2-suite-residual-fail-triage.md.
             if std::env::var_os("CRATONVM_DBG_FIELD_WATCH").is_some() {
                 let decl_name = shared
@@ -19824,7 +19824,7 @@ fn decode_arg_kind_aware(cv: CompactValue, is_long: bool, pd_byte: u8) -> Value 
 /// `execute_invokevirtual_vtable_fast`) popped args the same way but never
 /// re-validated them before building the callee frame. Root-caused via
 /// `org.h2.test.unit.TestUpgrade`'s residual `NoSuchMethodError` — see
-/// `docs/known-issues/h2-suite-bugs/bug-h2-suite-residual-fail-triage.md`.
+/// `docs/known-issues/h2/bug-h2-suite-residual-fail-triage.md`.
 #[inline]
 fn refresh_stale_object_args(shared: &SharedVm, args: &mut [Value]) {
     for value in args.iter_mut() {
@@ -20177,7 +20177,7 @@ fn resolved_private_invokevirtual_target(
     // loader's copy — pinning a private call's dispatch to the wrong
     // class's bytecode/constant pool while the receiver stays the caller's
     // own (correct-loader) object. See
-    // docs/known-issues/h2-suite-bugs/bug-h2-suite-residual-fail-triage.md
+    // docs/known-issues/h2/bug-h2-suite-residual-fail-triage.md
     // (TestUpgrade's `RootReference.tryUpdate`/`hasChangesSince` residual).
     let self_match = {
         let cm = shared.class_manager.read();
@@ -38070,7 +38070,7 @@ fn execute_invokevirtual_vtable_fast(
     // (`class_id_of`/`kind_of` used to pick the dispatch target) are
     // exactly the class-resolution step implicated in the TestUpgrade
     // RootReference residual — refresh defensively before trusting it for
-    // dispatch. See docs/known-issues/h2-suite-bugs/
+    // dispatch. See docs/known-issues/h2/
     // bug-h2-suite-residual-fail-triage.md.
     let receiver_obj = shared.heap.load_and_forward(receiver_obj);
 
@@ -39050,7 +39050,7 @@ fn execute_invokevirtual_cached(
                     // Refresh via the same GC-forwarding barrier as invoke
                     // args (`refresh_stale_object_args`) — this receiver
                     // came from a bare `peek_at`, not a `pop`. See
-                    // docs/known-issues/h2-suite-bugs/
+                    // docs/known-issues/h2/
                     // bug-h2-suite-residual-fail-triage.md.
                     let obj_ref = shared.heap.load_and_forward(obj_ref);
                     let actual_class_id = shared.heap.class_id_of(obj_ref);
@@ -39521,7 +39521,7 @@ fn execute_invokevirtual_cached(
                     // Refresh via the same GC-forwarding barrier as invoke
                     // args (`refresh_stale_object_args`) — this receiver
                     // came from a bare `peek_at`, not a `pop`. See
-                    // docs/known-issues/h2-suite-bugs/
+                    // docs/known-issues/h2/
                     // bug-h2-suite-residual-fail-triage.md.
                     let obj_ref = shared.heap.load_and_forward(obj_ref);
                     let actual_class_id = shared.heap.class_id_of(obj_ref);
@@ -39663,7 +39663,7 @@ fn execute_invokevirtual_cached(
                         // Refresh via the same GC-forwarding barrier as
                         // invoke args (`refresh_stale_object_args`) — this
                         // receiver came from a bare `peek_at`, not a `pop`.
-                        // See docs/known-issues/h2-suite-bugs/
+                        // See docs/known-issues/h2/
                         // bug-h2-suite-residual-fail-triage.md.
                         let obj_ref = shared.heap.load_and_forward(obj_ref);
                         let actual_class_id = shared.heap.class_id_of(obj_ref);

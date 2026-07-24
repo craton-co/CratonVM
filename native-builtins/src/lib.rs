@@ -26795,7 +26795,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             // bytecode entirely (see bug-27 comment above), so it must
             // replicate the check itself or a channel opened FileChannel.open(
             // path, READ) silently truncates the real file instead of
-            // rejecting the call (docs/known-issues/h2-suite-bugs/
+            // rejecting the call (docs/known-issues/h2/
             // bug-h2-files-setposixfilepermissions-FIXED.md residual).
             let writable = !matches!(ctx.get_field_by_name(this, "writable"), Value::Int(0));
             if !writable {
@@ -37611,7 +37611,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
                         // (still correct for "UTC"/"GMT"/custom "+HH:MM"
                         // forms `ZoneId.of` handles natively) if this
                         // catalog doesn't recognize it. See
-                        // docs/known-issues/h2-suite-bugs/bug-h2-timezone-zonerules-offset-miscalculation.md.
+                        // docs/known-issues/h2/bug-h2-timezone-zonerules-offset-miscalculation.md.
                         // Try the id verbatim first (preserves display
                         // names/behavior for everything that already
                         // worked, e.g. "UTC"/"GMT"/"Zulu"/"+08:00"/plain
@@ -37997,7 +37997,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // Superseded by the TZDB-OFFSET fix below, which reads the real
     // historical cutover for every zone directly from tzdb.dat instead of
     // hand-listing one zone at a time — see
-    // `docs/known-issues/h2-suite-bugs/bug-h2-timezone-zonerules-offset-miscalculation.md`.
+    // `docs/known-issues/h2/bug-h2-timezone-zonerules-offset-miscalculation.md`.
 
     fn alloc_synth_timezone(ctx: &mut dyn NativeContext, id_str: &str) -> cratonvm_types::Value {
         // DST-aware path (hib-temporal DST-boundary skew): for a zone whose
@@ -38175,7 +38175,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             // "EST5EDT", "MST7MDT", "PST8PDT" — the four POSIX-rule zone
             // names `TimeZone.getAvailableIDs()` itself returns) as bogus,
             // collapsing them to "GMT"/UTC+0 — see
-            // docs/known-issues/h2-suite-bugs/bug-h2-timezone-zonerules-offset-miscalculation.md.
+            // docs/known-issues/h2/bug-h2-timezone-zonerules-offset-miscalculation.md.
             // Now backed by the real tzdb.dat catalog (604 zones + legacy
             // aliases), so this matches exactly what real HotSpot resolves.
             let recognized = id == "GMT"
@@ -38299,7 +38299,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // `java.time.zone.ZoneRules` (unfloored) would report. Mirrored here so
     // the legacy `TimeZone`/`GregorianCalendar` path matches real HotSpot's
     // legacy behavior bug-for-bug, same as it does post-1900 — see
-    // `docs/known-issues/h2-suite-bugs/bug-h2-timezone-zonerules-offset-miscalculation.md`.
+    // `docs/known-issues/h2/bug-h2-timezone-zonerules-offset-miscalculation.md`.
     const ZONEINFO_LEGACY_FLOOR_EPOCH_SEC: i64 = -2_208_988_800; // 1900-01-01T00:00:00Z
 
     fn legacy_offset_and_standard(ctx: &mut dyn NativeContext, id: &str, epoch_sec: i64) -> (i32, i32) {

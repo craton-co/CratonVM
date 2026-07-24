@@ -97,7 +97,7 @@ on an **unrelated, pre-existing, much larger gap**: CratonVM's
 `HttpURLConnection` never pools/reuses TCP connections across separate
 `openConnection()` calls (no `KeepAliveCache` equivalent), while real JDK
 does. See
-`docs/known-issues/h2-suite-bugs/bug-h2-httpurlconnection-no-keepalive-pooling.md`
+`../../../known-issues/h2/bug-h2-httpurlconnection-no-keepalive-pooling.md`
 for the full root-cause writeup — deliberately **not** fixed here: a
 correct keep-alive pool is a much bigger, higher-blast-radius feature
 (`HttpURLConnection` is exercised by nearly every suite in this repo) that
@@ -107,4 +107,4 @@ this fix.
 ## Related
 - `docs/internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-nosuchmethoderror-cross-class-dispatch-FIXED.md` — Cluster B, whose 3rd class (`TestWeb`) this was the remaining blocker for.
 - `docs/internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-dataoutputstream-writechars-data-loss-FIXED.md` — the fix that got `TestWeb` far enough to expose this as a distinct, separate issue.
-- `docs/known-issues/h2-suite-bugs/bug-h2-httpurlconnection-no-keepalive-pooling.md` — the new residual this fix exposed.
+- `../../../known-issues/h2/bug-h2-httpurlconnection-no-keepalive-pooling.md` — the new residual this fix exposed.

@@ -344,7 +344,7 @@ shape. `rsi` alone breaks that pattern (`0x1894ed00` — a bare, truncated
 value, not a real 64-bit tagged pointer). This is a **byte-for-byte
 signature match** with the "register-invisible JIT root" bug family
 documented as still-OPEN in
-`docs/internal/fixed-suite-bugs/dohead-jit-heap-corruption-register-invisibility-FIXED.md`
+`dohead-jit-heap-corruption-register-invisibility-FIXED.md`
 ("Layer 1 (register-invisible roots...) is UNCHANGED — the real fix remains
 precise oop maps / shadow stack") and independently confirmed a third and
 now — with this session — a fourth time in

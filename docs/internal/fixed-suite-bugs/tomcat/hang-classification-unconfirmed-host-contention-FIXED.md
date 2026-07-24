@@ -74,7 +74,7 @@ with root cause (java/lang/NullPointerException: Cannot assign field "referenceB
 
 This is the exact ecj (`CompilationResult.getClassFiles()`) NPE already
 root-caused and fixed by a concurrent session's investigation into
-`docs/known-issues/tomcat/regressions-revealed-by-fixture-completion-20260723.md`
+`../../../known-issues/tomcat/regressions-revealed-by-fixture-completion-20260723.md`
 — see `[[reference_hashtable_size_field_collision_modcount]]` and commits
 `744401af4` ("fix(vm): force native Hashtable/HashMap put/get/size on ALL
 dispatch paths") and `b854dc01f` ("fix(collections): resolve map size field

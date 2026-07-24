@@ -259,7 +259,7 @@ struct Args {
     /// `-XX:MaxDirectMemorySize=<size>` -> direct (off-heap NIO) buffer
     /// accounting cap. Mirrors real JDK: when absent, the cap defaults to
     /// `-Xmx` instead of a fixed value. See
-    /// docs/known-issues/h2-suite-bugs/bug-h2-largeblob-direct-memory-oom.md.
+    /// docs/known-issues/h2/bug-h2-largeblob-direct-memory-oom.md.
     #[arg(
         long = "XX:MaxDirectMemorySize",
         value_name = "SIZE",

@@ -4320,7 +4320,7 @@ struct JitKey {
     // `ClassLoader(null)` re-loading an old H2 jar's own
     // `org.h2.mvstore.RootReference` alongside the identically-named class
     // already on the application classpath — see
-    // `docs/known-issues/h2-suite-bugs/bug-h2-suite-residual-fail-triage.md`'s
+    // `docs/known-issues/h2/bug-h2-suite-residual-fail-triage.md`'s
     // `TestUpgrade` residual) are DISTINCT classes with unrelated bytecode,
     // but the interpreter's own dispatch (`resolve_method_ref` /
     // `execute_invoke_kind` / `try_stackless_invoke`) already correctly

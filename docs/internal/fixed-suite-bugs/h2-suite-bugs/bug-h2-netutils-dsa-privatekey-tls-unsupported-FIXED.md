@@ -2,7 +2,7 @@
 
 ## Status
 **FIXED** — 2026-07-22, `dev`. Originally opened 2026-07-21 as
-`docs/known-issues/h2-suite-bugs/bug-h2-netutils-dsa-privatekey-tls-unsupported.md`.
+`../../../known-issues/h2/bug-h2-netutils-dsa-privatekey-tls-unsupported.md`.
 Four distinct bugs were found and fixed in the same investigation, all
 required to get `org.h2.test.unit.TestNetUtils` past this point cleanly (no
 exceptions that fail the test, no hang).

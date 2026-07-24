@@ -2529,7 +2529,7 @@ impl GenerationalHeap {
         debug_assert!(index < self.get_header(obj_ref).num_slots() as usize);
         // FIELD-WATCH (TestUpgrade RootReference/MVMap residual, software
         // watchpoint — see cratonvm_types::field_watch and
-        // docs/known-issues/h2-suite-bugs/bug-h2-suite-residual-fail-triage.md).
+        // docs/known-issues/h2/bug-h2-suite-residual-fail-triage.md).
         // Zero cost unless CRATONVM_DBG_FIELD_WATCH is set AND obj_ref was
         // explicitly registered via field_watch::watch() at construction.
         // Every write is reported (not deduped) — a count reaching 2 for a

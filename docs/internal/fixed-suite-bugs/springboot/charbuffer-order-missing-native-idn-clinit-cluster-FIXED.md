@@ -233,7 +233,7 @@ Both TSV rows are present in
   documenting the identical omission already fixed for
   `isReadOnly()`/`isDirect()`/`toString()`/`subSequence()` on `CharBuffer`;
   `order()` is the one method from that same audit that was never added.
-- `docs/internal/fixed-suite-bugs/springboot-httpclient-builder-dead-registration-abstractmethoderror-FIXED.md`
+- `springboot-httpclient-builder-dead-registration-abstractmethoderror-FIXED.md`
   — an earlier, structurally similar "missing native registration →
   `AbstractMethodError`" cluster in this same suite, fixed by completing the
   registrar's method coverage; the fix for this bug is very likely the same

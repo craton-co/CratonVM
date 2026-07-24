@@ -7838,7 +7838,7 @@ fn native_fc_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     // asynchronously, whenever the background Cleaner thread happened to
     // run -- a real resource-lifecycle correctness gap in its own right
     // (independent of any specific caller), and a contributing factor to
-    // `docs/known-issues/h2-suite-bugs/bug-h2-testlob-mvstore-chunk-not-found-and-file-lock.md`'s
+    // `docs/known-issues/h2/bug-h2-testlob-mvstore-chunk-not-found-and-file-lock.md`'s
     // `OverlappingFileLockException` investigation (that doc's residual
     // occurrences trace to a separate, H2-level chunk-reclaim race --
     // see the doc for the full picture).
@@ -9376,7 +9376,7 @@ fn native_dos_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     // that seeding this field fixes the symptom). Seed it
     // here exactly like the real constructor does, so any current or
     // future not-natively-overridden method that depends on it works.
-    // See docs/known-issues/h2-suite-bugs/bug-h2-dataoutputstream-writechars-data-loss.md.
+    // See docs/known-issues/h2/bug-h2-dataoutputstream-writechars-data-loss.md.
     let write_buffer = ctx.new_array(ArrayElementType::Byte, 8);
     ctx.set_field_by_name(this, "writeBuffer", Value::Object(Some(write_buffer)));
     Ok(None)

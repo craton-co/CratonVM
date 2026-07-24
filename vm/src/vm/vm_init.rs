@@ -1319,7 +1319,7 @@ impl SharedVm {
         // genuine ~250 MiB direct-buffer working set (chunk writer thread)
         // threw OutOfMemoryError at a ceiling HotSpot doesn't impose at the
         // same heap size. See
-        // docs/known-issues/h2-suite-bugs/bug-h2-largeblob-direct-memory-oom.md.
+        // docs/known-issues/h2/bug-h2-largeblob-direct-memory-oom.md.
         let direct_memory_cap = config
             .max_direct_memory_size
             .unwrap_or(config.max_heap_size);

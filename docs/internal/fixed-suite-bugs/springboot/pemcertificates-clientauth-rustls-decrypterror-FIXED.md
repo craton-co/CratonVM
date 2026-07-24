@@ -160,7 +160,7 @@ found a genuinely separate, still-valid bug fix along the way (already on
   id (a field-slot reused for a different, unrelated purpose by the native
   TLS layer). Reproduced in complete isolation
   (`Pkcs12AliasConsistencyProbe.java`, preserved under
-  `docs/internal/repros/pemcertificates-clientauth/`). Confirmed this fix
+  `../repros/pemcertificates-clientauth/`). Confirmed this fix
   alone does **not** resolve `sslWithPemCertificates` — the actual TLS
   handshake signing goes through rustls's own native `ring`-backed signer,
   never through `java.security.Signature`. Still a live, worthwhile fix for

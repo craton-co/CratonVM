@@ -1399,7 +1399,7 @@ const IBM1047_TO_U16: [u16; 256] = [
 // ASCII-compatible so all 256 byte values are tabulated. Byte-for-byte
 // identical to real JDK25's `sun.nio.cs.ext.IBM500` (verified by dumping
 // `new String(allBytes, Charset.forName("cp500"))` on the HotSpot
-// baseline) — see docs/known-issues/h2-suite-bugs/bug-h2-charset-cp500-unsupported.md.
+// baseline) — see docs/known-issues/h2/bug-h2-charset-cp500-unsupported.md.
 const IBM500_TO_U16: [u16; 256] = [
     0x0000, 0x0001, 0x0002, 0x0003, 0x009C, 0x0009, 0x0086, 0x007F, 0x0097, 0x008D, 0x008E, 0x000B,
     0x000C, 0x000D, 0x000E, 0x000F, 0x0010, 0x0011, 0x0012, 0x0013, 0x009D, 0x000A, 0x0008, 0x0087,

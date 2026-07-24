@@ -2,7 +2,7 @@
 
 Class: `org.springframework.boot.context.properties.ConfigurationPropertiesBeanRegistrationAotProcessorTests`
 (`core/spring-boot`). Found investigating Spring Boot core39 residual Cluster
-A (`docs/known-issues/spring-boot-core39-residual-clusters-20260723.md`),
+A (`spring-boot-core39-residual-clusters-20260723.md`),
 2026-07-24. Worktree `springboot-core39-clusterA-20260723`.
 
 ## Status: confirmed real hang, not a throughput/timeout issue

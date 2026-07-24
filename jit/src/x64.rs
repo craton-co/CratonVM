@@ -17931,7 +17931,7 @@ impl Compiler {
             // discarding or duplicating side effects committed by
             // JIT-compiled code between OSR entry and the trap — confirmed via
             // the `AccumRepro3`/`LicmRepro`/`LicmRepro2`/`ArrRepro` standalone
-            // repros run many times over: pre-`fb4a333d`, `AccumRepro3`
+            // springboot run many times over: pre-`fb4a333d`, `AccumRepro3`
             // silently and nondeterministically doubles a loop's iteration
             // count roughly 90% of the time). That routing then appeared to
             // independently regress Groovy (every
