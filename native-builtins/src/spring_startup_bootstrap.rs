@@ -2469,7 +2469,7 @@ fn try_build_method_injection(
 
     // Enumerate methods up the hierarchy; a method needs implementing if it is
     // abstract somewhere and never concrete.
-    let mut all: Vec<(String, String, bool)> = Vec::new();
+    let mut all: Vec<(String, String, bool, cratonvm_types::ClassId)> = Vec::new();
     let mut iface_work: Vec<cratonvm_types::ClassId> = Vec::new();
     let mut cursor = Some(super_cid);
     while let Some(cid) = cursor {
@@ -2481,6 +2481,7 @@ fn try_build_method_injection(
                 m.name.clone(),
                 m.descriptor.clone(),
                 m.access_flags & ACC_ABSTRACT != 0,
+                cid,
             ));
         }
         iface_work.extend(ctx.class_interfaces(cid));
@@ -2511,19 +2512,20 @@ fn try_build_method_injection(
                 m.name.clone(),
                 m.descriptor.clone(),
                 m.access_flags & ACC_ABSTRACT != 0,
+                icid,
             ));
         }
         iface_work.extend(ctx.class_interfaces(icid));
     }
     let mut concrete: HashSet<(String, String)> = HashSet::new();
-    for (n, d, is_abs) in &all {
+    for (n, d, is_abs, _cid) in &all {
         if !is_abs {
             concrete.insert((n.clone(), d.clone()));
         }
     }
     let mut seen: HashSet<(String, String)> = HashSet::new();
     let mut specs: Vec<crate::cglib_enhancer::LookupMethodSpec> = Vec::new();
-    for (n, d, is_abs) in &all {
+    for (n, d, is_abs, decl_cid) in &all {
         if !is_abs || concrete.contains(&(n.clone(), d.clone())) {
             continue;
         }
@@ -2549,12 +2551,15 @@ fn try_build_method_injection(
             Some(b) if ref_ret => (true, b),
             _ => (false, None),
         };
+        let declaring_internal =
+            ctx.class_name_of_id(*decl_cid).unwrap_or_else(|| super_internal.clone());
         specs.push(crate::cglib_enhancer::LookupMethodSpec {
             name: n.clone(),
             descriptor: d.clone(),
             return_internal,
             bean_name,
             is_lookup,
+            declaring_internal,
         });
     }
     if specs.is_empty() {
