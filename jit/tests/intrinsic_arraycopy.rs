@@ -106,7 +106,7 @@ unsafe extern "C" fn recording_uncommon_trap(_vm: i64, _reason: i64, _bci: i64) 
 /// Runtime helpers. The arraycopy fast path never calls a helper; only the
 /// deopt stub calls `uncommon_trap`, so that one slot is wired to a real
 /// recording function and the rest are panic stubs.
-fn helpers() -> JitRuntimeHelpers { safepoint_flag_addr: 0, safepoint_slow_path: 0,
+fn helpers() -> JitRuntimeHelpers {
     unsafe extern "C" fn stub() {
         panic!("ARRAYCOPY intrinsic test invoked an unwired runtime helper");
     }
@@ -166,7 +166,7 @@ fn helpers() -> JitRuntimeHelpers { safepoint_flag_addr: 0, safepoint_slow_path:
     }
 }
 
-fn helpers_with_dispatch(dispatch: usize) -> JitRuntimeHelpers { safepoint_flag_addr: 0, safepoint_slow_path: 0,
+fn helpers_with_dispatch(dispatch: usize) -> JitRuntimeHelpers {
     let mut h = helpers();
     h.invoke_dispatch = dispatch;
     h

@@ -22,7 +22,7 @@ use std::collections::{HashMap, HashSet};
 
 /// Dummy runtime helpers — none of the FP tests invoke heap allocation,
 /// fields, type checks, or method dispatch, so the stub pointer is unused.
-fn dummy_helpers() -> JitRuntimeHelpers { safepoint_flag_addr: 0, safepoint_slow_path: 0,
+fn dummy_helpers() -> JitRuntimeHelpers {
     unsafe extern "C" fn stub() {
         panic!("JIT differential test invoked an unwired runtime helper");
     }

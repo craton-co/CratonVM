@@ -41,7 +41,7 @@ static TEST_REGION_BOUNDS: [std::sync::atomic::AtomicUsize; 6] = [
     std::sync::atomic::AtomicUsize::new(0),
 ];
 
-fn dummy_helpers() -> JitRuntimeHelpers { safepoint_flag_addr: 0, safepoint_slow_path: 0,
+fn dummy_helpers() -> JitRuntimeHelpers {
     // guarded_inline_getfield_enabled() is default-ON (jit/src/x64.rs) --
     // this whole file's contract ("no runtime helper reachable" via the
     // wide-open TEST_REGION_BOUNDS above) relies on the guarded-inline path
@@ -1378,7 +1378,7 @@ fn ir_vs_singlepass_getfield_loop() {
 /// into the synthetic object — single-pass lowers an int `putfield` to a
 /// `CALL jit_putfield_int`, so it needs a live helper. Matches the inline IR
 /// store byte-for-byte (discriminant 0 + 32-bit payload, high qword cleared).
-fn field_helpers() -> JitRuntimeHelpers { safepoint_flag_addr: 0, safepoint_slow_path: 0,
+fn field_helpers() -> JitRuntimeHelpers {
     unsafe extern "C" fn putfield_int(obj: i64, field_index: i64, val: i64) {
         if obj == 0 {
             return;
@@ -2346,7 +2346,7 @@ unsafe extern "C" fn test_drem(a: f64, b: f64) -> f64 {
 
 /// [`dummy_helpers`] with the two FP-remainder helpers wired to real stubs (the
 /// rest stay panic stubs — a `frem`/`drem` method calls no other helper).
-fn frem_helpers() -> JitRuntimeHelpers { safepoint_flag_addr: 0, safepoint_slow_path: 0,
+fn frem_helpers() -> JitRuntimeHelpers {
     JitRuntimeHelpers { safepoint_flag_addr: 0, safepoint_slow_path: 0,
         jit_frem: test_frem as *const () as usize,
         jit_drem: test_drem as *const () as usize,

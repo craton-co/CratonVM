@@ -19,7 +19,7 @@ use std::collections::{HashMap, HashSet};
 
 /// Dummy runtime helpers — bit-op intrinsics never touch the heap, fields,
 /// type checks, or dispatch, so a panicking stub pointer is never reached.
-fn dummy_helpers() -> JitRuntimeHelpers { safepoint_flag_addr: 0, safepoint_slow_path: 0,
+fn dummy_helpers() -> JitRuntimeHelpers {
     unsafe extern "C" fn stub() {
         panic!("LONG_BITS intrinsic test invoked an unwired runtime helper");
     }

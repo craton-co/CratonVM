@@ -74,7 +74,7 @@ fn assert_one_deopt_after(before_traps: u64, context: &str) {
     );
 }
 
-fn helpers() -> JitRuntimeHelpers { safepoint_flag_addr: 0, safepoint_slow_path: 0,
+fn helpers() -> JitRuntimeHelpers {
     unsafe extern "C" fn stub() {
         panic!("STRING_SEARCH intrinsic test invoked an unwired runtime helper");
     }

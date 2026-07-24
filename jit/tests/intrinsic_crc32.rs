@@ -120,7 +120,7 @@ fn assert_no_deopt_signaled(context: &str) {
     );
 }
 
-fn stub_helpers() -> JitRuntimeHelpers { safepoint_flag_addr: 0, safepoint_slow_path: 0,
+fn stub_helpers() -> JitRuntimeHelpers {
     unsafe extern "C" fn stub() {
         panic!("CRC32 intrinsic test invoked an unwired runtime helper");
     }
