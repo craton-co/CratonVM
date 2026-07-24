@@ -2502,3 +2502,152 @@ this session's lambda-cache fix). `cargo test -p cratonvm-native-builtins
 `fb_ref_splice_shifts_exception_table_by_exactly_8_bytes` above, neither
 caused by this session). `ApplicationContextAotGeneratorTests` full class:
 36/40 -> 38/40.
+
+## 2026-07-24 AOT follow-up 9b -- Family B investigation blocked by two newly-found regressions (neither fixed), both characterized with repros
+
+Continuation of follow-up 9's session (same worktree, `/data/wt-aot-followup9-20260724`).
+Attempted to isolate "Family B" of `endToEndTestsForBeanOverrides` (the
+plain `AssertionFailedError: expected: null but was: ""` failures flagged
+since [[aot-endtoend-beanoverrides-73-to-158-of-175]] and never isolated to
+specific test classes). Did not reach it -- hit two separate, apparently-NEW
+blocking issues in sequence, neither present when the prior session
+(2026-07-23) got a clean ~158/175 baseline on the exact same test method.
+Both are real VM bugs, fully characterized with standalone repro commands,
+but not fixed this session (time budget).
+
+### Blocker 1: `Package.getPackageInfo()` NPE during TestNG-engine classpath discovery
+
+Running `AotIntegrationTests` (whole class, or just `endToEndTestsForBeanOverrides`
+via `MethodRun`) now fails immediately (~22s) with:
+
+```
+org.junit.platform.commons.JUnitException: TestEngine with ID 'testng' failed to discover tests
+Caused by: java.lang.NullPointerException: Cannot invoke "java.lang.Module.getClassLoader()" because "module" is null
+    java.lang.Package.getPackageInfo(Package.java:417)
+    java.lang.Package.getAnnotation(Package.java:446)
+    org.testng.internal.annotations.IgnoreListener.findAnnotation(...)
+    ...
+    org.springframework.test.context.aot.TestClassScanner.scan(TestClassScanner.java:156)
+```
+
+`TestClassScanner.scan()` (spring-core-test) uses a plain `LauncherFactory
+.create()` (all registered engines auto-discovered via ServiceLoader,
+including `org.junit.support.testng`'s TestNG-compat engine) with
+`selectClasspathRoots(...)` -- meaning the TestNG engine's own
+`TestNGClassFinder` walks (a large slice of) the classpath root looking for
+TestNG-style classes, and NPEs on the FIRST class whose `Class.getPackage()`
+returns a `Package` object with a null `module` field (real JDK requires
+the `module` field to always be at least the defining loader's unnamed
+module, never null).
+
+**Isolation attempts, both inconclusive** (2 standalone, Spring-free
+repros): a plain `-cp`-loaded class's `getPackage()` correctly returns a
+non-null module on CratonVM (though the module's OWN `.getClassLoader()`
+already differs from real JDK -- see below); adding a `package-info.java`
+with a runtime-retained annotation to force the real `getPackageInfo()`
+path (`Class.forName(module, pkg + ".package-info")`) still worked fine.
+**Neither reproduces the NPE** -- whatever class/loader combination TestNG's
+crawler hits during Spring's classpath-root scan produces a `Package` with
+a genuinely null `module` field, and it wasn't isolated to a specific class
+this session (the TestNG engine's own class-by-class walk order wasn't
+traced). A secondary, likely-related but non-crashing gap found along the
+way: `Class.getModule().getClassLoader()` returns `null` on CratonVM for an
+ordinary `-cp`-loaded class's unnamed module, where real JDK returns the
+actual `AppClassLoader` -- this alone doesn't crash anything found this
+session, but is almost certainly the same underlying gap (module objects
+not fully wired to their defining loader) just not always fatal.
+
+**Workaround used to unblock further investigation** (not a fix): strip
+`testng-engine-*.jar` and `testng-*.jar` from the classpath entirely before
+invoking `AotIntegrationTests` --
+`cat cratonvm-testcp.txt | tr ':' '\n' | grep -v -i testng | tr '\n' ':'`
+-- since `TestClassScanner` only needs the JUnit Jupiter engine for Spring's
+own AOT integration tests; removing the optional TestNG engine sidesteps
+the crash entirely and lets discovery proceed.
+
+**Next step for whoever continues**: instrument `TestClassScanner.scan()`
+(or run with a debug agent) to print the exact class name being examined
+when the NPE fires, then trace how THAT class's `Package` object got built
+with a null `module` -- likely in `vm/src/native` wherever `Class
+.getPackage()`/`ClassLoader.definePackage`-equivalent synthetic Package
+construction happens, check whether it's conditioned on the loader type
+(bootstrap/app/user-defined) and misses a case.
+
+### Blocker 2: `Class.getDeclaredMethods()` NoSuchMethodError inside a dynamically-defined (non-file) CGLIB class's `<clinit>` -- confirmed a NEW regression
+
+With Blocker 1 worked around, `endToEndTestsForBeanOverrides` actually ran
+(~70s) and reached real AOT PROCESSING -- but `runEndToEndTests(testClasses,
+true)` uses `failOnError=true`, so it stops at the FIRST test class whose
+AOT generation fails, rather than aggregating all 175 like the final
+(replay-phase) failure list follow-up 7/8's sessions saw. First (alphabetical
+discovery order) failure:
+
+```
+TestContextAotException: Failed to generate AOT artifacts for test classes
+  [...MockitoSpyBeanAndCircularDependenciesWithLazyResolutionProxyIntegrationTests]
+Caused by: AotBeanProcessingException: Error processing bean ...$One
+Caused by: AopConfigException: Unexpected AOP exception
+Caused by: IllegalStateException: Unable to load cache item
+  org.springframework.cglib.core.internal.LoadingCache.createEntry
+  org.springframework.cglib.core.AbstractClassGenerator.create
+  org.springframework.aop.framework.ObjenesisCglibAopProxy.createProxyClass
+Caused by: java.lang.NoSuchMethodError: java.lang.Class.getDeclaredMethods()[Ljava/lang/reflect/Method;
+  ...MockitoSpyBeanAndCircularDependenciesWithLazyResolutionProxyIntegrationTests$Two$$SpringCGLIB$$0.CGLIB$STATICHOOK1(<generated>)
+  ...MockitoSpyBeanAndCircularDependenciesWithLazyResolutionProxyIntegrationTests$Two$$SpringCGLIB$$0.<clinit>(<generated>)
+  org.springframework.cglib.core.ReflectUtils.defineClass(ReflectUtils.java:581)
+```
+
+Important: this is **real, bytecode-generated cglib** (`org.springframework
+.cglib.core.ReflectUtils.defineClass` / `Enhancer.generate()`, Spring's
+repackaged-cglib for `CglibAopProxy` AOP proxies via `ContextAnnotation
+AutowireCandidateResolver.buildLazyResolutionProxy` -- a "lazy resolution
+proxy" for a circular-dependency `@Autowired` field), NOT the native
+`cce_enhance`/`ConfigurationClassEnhancer.enhance()` override this whole
+CGLIB-cluster investigation (follow-up 8/9) has otherwise been chasing --
+i.e. this is a THIRD, distinct CGLIB code path in CratonVM (native
+`ConfigurationClassEnhancer` override, native `FastClass` placeholder, and
+now real-bytecode-executed `cglib.core`/`Enhancer` proxy generation all
+exist independently). `CGLIB$STATICHOOK1` is cglib's universal
+per-generated-class static initializer that populates its internal
+method-interception tables by reflectively calling `Class
+.getDeclaredMethods()` on itself -- a completely standard, ubiquitous cglib
+pattern, so this is NOT specific to lazy-resolution proxies; any real-cglib
+(non-Spring-Configuration) proxy generation likely hits the same wall.
+
+`Class.getDeclaredMethods()` IS registered as an unconditional native
+override for `java/lang/Class` (`native-builtins/src/lib.rs`, delegates to
+`lang_class::native_class_get_declared_methods`) -- the `NoSuchMethodError`
+is therefore NOT a missing-registration gap but a method-RESOLUTION failure
+specific to this receiver, most likely something about how CratonVM
+resolves a `Methodref` constant-pool entry against `java/lang/Class` from
+WITHIN a dynamically-`defineClass`'d (not loaded from a `.class` file on
+disk) class's own bytecode -- not investigated further this session.
+
+**Confirmed to be a genuine regression, not a pre-existing gap**: follow-up
+7's own memory note ([[aot-endtoend-beanoverrides-73-to-158-of-175]])
+recorded a clean **158/175** pass on this EXACT test method
+(`endToEndTestsForBeanOverrides`, same `failOnError=true`) on 2026-07-23 --
+if this CGLIB-proxy class already failed AOT processing then, `failOnError
+=true` would have aborted immediately with 1/175, not proceeded to
+aggregate 17 replay-phase failures. Something merged into `origin/dev`
+between that session and this one (31+ commits of drift on top of this
+session's own base) broke real-bytecode cglib class generation's
+`Class.getDeclaredMethods()` resolution. Bisecting the responsible commit
+was not attempted this session.
+
+**Next step for whoever continues**: (1) bisect `origin/dev` between the
+2026-07-23 session's commit and now for whatever changed
+`Class.getDeclaredMethods` resolution, dynamic-`defineClass` constant-pool
+resolution, or cglib-adjacent native code -- likely a much smaller, faster
+fix than re-deriving root cause from scratch; (2) once found/fixed, rerun
+`endToEndTestsForBeanOverrides` (classpath with `testng` jars stripped per
+Blocker 1's workaround, `--Xmx 4g`, expect several more classes to hit
+similar or different failures before Family B's null-vs-"" symptom
+actually surfaces -- budget for multiple iterations); (3) Blocker 1 (the
+Package/Module NPE) should also be fixed independently since it silently
+breaks ANY test suite that includes the TestNG JUnit-Platform engine on the
+classpath, a much broader blast radius than just this one Spring test.
+
+Family B itself remains completely unisolated -- zero net progress on the
+original goal this session, but two real, previously-unknown-to-this-suite
+bugs found and characterized instead.
