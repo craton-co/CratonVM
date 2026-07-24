@@ -104,6 +104,77 @@ and a classpath-shadowed instrumented `WritableAssertionInfo`)
   against) or may be an artifact of the shadowing technique itself — **not
   conclusively distinguished this session**, flagged for whoever continues.
 
+### Also confirmed affecting `module/spring-boot-jetty` (2026-07-24 session, worktree `CratonVM-spring-boot-jetty-closure-20260723`) — 3 more hypotheses ruled out
+
+Same exact NPE signature (`ShouldBeEqual.actualAndExpectedHaveSameStringRepresentation`
+and, in a `contains()` assertion, `MessageFormatter.asText` — a second call site,
+same root field) hits 3 `module/spring-boot-jetty` test methods:
+`JettyReactiveWebServerFactoryTests.specificIPAddressNotReverseResolved`,
+`JettyServletWebServerFactoryTests.specificIPAddressNotReverseResolved`/
+`specificIPAddressWithSslIsNotReverseResolved`, plus all 9 parameterized
+`sessionCookieSameSiteAttributeCanBeConfiguredAndOnlyAffectsSessionCookies*`
+cases (a `satisfiesExactlyInAnyOrder(...).contains(...)` assertion) — consistent
+with this doc's own prediction that it would surface wherever a `String`/
+`CharSequence` AssertJ assertion genuinely fails, across many modules, not
+just this one.
+
+Built a fast (sub-second, no Spring/Gradle needed), iteration-friendly
+standalone harness against the same `assertj-core-3.27.7.jar` (reflectively
+reading `AbstractAssert.info`/`WritableAssertionInfo.representation` right
+after construction, mirroring this doc's own technique) and used it to test
+3 NEW hypotheses this session's synthetic-repro attempts hadn't covered —
+**all 3 ruled out, still no working synthetic repro**:
+
+1. **Jar vs. directory classpath entry for the CALLER.** Packaged an
+   otherwise-identical 2-hop static-delegation caller (own class, not
+   assertj's) into a real `.jar` and called it that way — still passed
+   cleanly (`representation` correctly non-null). Real
+   `AssertionsForClassTypes`/`Assertions` are also loaded from a jar, so this
+   alone isn't the differentiator, contrary to one plausible reading of the
+   "classpath-shadowed" clue above.
+2. **Call-site indirection depth.** A 2-hop static delegation
+   (`hop1(s) -> hop2(s) -> new StringAssert(s)`, own classes) — still passes.
+   `Assertions.assertThat(String)` is itself exactly this shape
+   (`Assertions.assertThat` → `AssertionsForClassTypes.assertThat` → `new
+   StringAssert`), so hop count alone isn't it either.
+3. **Overload count on the caller class.** `AssertionsForClassTypes` has 62
+   overloaded `assertThat` methods; built a synthetic class with 65
+   overloaded `assertThat` methods (covering the same breadth of parameter
+   types: primitives, arrays, boxed types, `java.time.*`, `java.util.*`,
+   collections, etc.) where the `String` overload also does `new
+   StringAssert(s)` — still passes cleanly. Overload-set size/breadth on the
+   caller alone isn't the trigger either.
+
+**Decisive, reproducible split** (this session's clearest new data point):
+`new StringAssert("x")` called directly, OR via any number of hops through
+**self-authored** classes (own jar or own directory classpath, any overload
+count) — always works. The IDENTICAL bytecode shape
+(`new StringAssert; dup; aload_0; invokespecial <init>; areturn`), when it
+lives inside the REAL, precompiled `AssertionsForClassTypes.class` or
+`Assertions.class` from the actual `assertj-core-3.27.7.jar` — always fails,
+100% reproducible, first call, no warm-up needed. So the trigger is provably
+NOT about jar-loading, hop count, or overload count in isolation — it is
+something else specific to those two real, precompiled class files (their
+exact constant pool, verification behavior, or something else about the
+genuine bytecode this session did not isolate). Given a dedicated session
+already spent significant effort on this exact question without resolving
+it, and this session's 3 additional negative results still didn't converge
+either, **not attempted further** — the fast standalone harness below is
+handed off as-is so the next session doesn't need to rebuild it.
+
+**Reusable fast harness** (each ~15-20 lines, compiles instantly, runs in
+under a second — no Gradle/Spring needed):
+```powershell
+$javaHome = "C:\Program Files\Eclipse Adoptium\jdk-25.0.3.9-hotspot"
+$assertj = "<path to assertj-core-3.27.7.jar in ~/.gradle/caches>"
+& "$javaHome\bin\javac.exe" -cp $assertj -d <outdir> Repro.java
+& <cratonvm.exe> --java-home $javaHome --Xmx 512m -cp "<outdir>;$assertj" Repro
+```
+Reflectively read `AbstractAssert.info` then `WritableAssertionInfo.representation`
+right after any `StringAssert`/`Assertions.assertThat(String)` call to check
+`null` vs `StandardRepresentation` without needing an assertion to actually
+fail first.
+
 ### Suspected impact beyond this module
 
 `assertThat(someString).isEqualTo(...)` is one of the single most common

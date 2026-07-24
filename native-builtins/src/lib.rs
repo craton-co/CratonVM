@@ -69871,17 +69871,17 @@ fn assertj_arrays_equal(
     ctx: &mut dyn NativeContext,
     left: ObjectRef,
     right: ObjectRef,
-    left_name: &str,
-    right_name: &str,
 ) -> Result<bool, MethodCallFailed> {
-    let left_is_reference_array = left_name.starts_with("[L") || left_name.starts_with("[[");
-    let right_is_reference_array = right_name.starts_with("[L") || right_name.starts_with("[[");
+    let left_type = ctx.heap_element_type_of(left);
+    let right_type = ctx.heap_element_type_of(right);
+    let left_is_reference_array = left_type == cratonvm_types::ArrayElementType::Reference;
+    let right_is_reference_array = right_type == cratonvm_types::ArrayElementType::Reference;
 
     // The Java implementation falls through to Object.equals (identity for
     // arrays) for different primitive array types and primitive/reference
     // pairs. `left == right` was handled by the caller.
     if left_is_reference_array != right_is_reference_array
-        || (!left_is_reference_array && left_name != right_name)
+        || (!left_is_reference_array && left_type != right_type)
     {
         return Ok(false);
     }
@@ -69934,6 +69934,27 @@ fn assertj_objects_equal(
         (Some(left), Some(right)) if left == right => return Ok(true),
         (Some(left), Some(right)) => (left, right),
     };
+
+    // Arrays never override `Object.equals` (reference semantics), but
+    // AssertJ's `isEqualTo` needs a deep element-wise comparison. Detect
+    // arrays via `heap_kind_of`/`heap_element_type_of` (the heap object
+    // header CratonVM actually tracks this on), NOT a `class_name_of_id()`
+    // string check: array objects are not registered under a normal
+    // `"[B"`-style class name in `class_manager`, so the name-based check
+    // silently returned `""` for every array and fell through to the
+    // generic `Object.equals` branch below — reference equality — making
+    // `isEqualTo(byte[])` (and every other array type) report
+    // content-identical arrays as unequal
+    // (`AppendableByteArrayTests`/`writesMultipleSmallStrings` et al).
+    let left_is_array = ctx.heap_kind_of(left) == cratonvm_types::ObjectKind::Array;
+    let right_is_array = ctx.heap_kind_of(right) == cratonvm_types::ObjectKind::Array;
+    if left_is_array || right_is_array {
+        if left_is_array != right_is_array {
+            return Ok(false);
+        }
+        return assertj_arrays_equal(ctx, left, right);
+    }
+
     let left_name = ctx.class_name_of_id(ctx.class_id_of_object(left));
     let right_name = ctx.class_name_of_id(ctx.class_id_of_object(right));
     let left_name = left_name.as_deref().unwrap_or_default();
@@ -69945,9 +69966,6 @@ fn assertj_objects_equal(
             .unwrap_or(0);
         return Ok(assertj_long_value(ctx, left, value_slot)
             == assertj_long_value(ctx, right, value_slot));
-    }
-    if left_name.starts_with('[') && right_name.starts_with('[') {
-        return assertj_arrays_equal(ctx, left, right, left_name, right_name);
     }
 
     // A virtual call may allocate or re-enter Java, so retain both operands
