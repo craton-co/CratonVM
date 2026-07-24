@@ -177,6 +177,34 @@ pub enum SkipReason {
     /// lowering is understood.
     ClassReaderReadInnerClasses,
 
+    /// Javac's `ClassReader.readAttrs` -- the shared per-member/per-class
+    /// attribute-dispatch loop (`readClassAttrs`/`readMemberAttrs` both
+    /// delegate straight into it: read an attribute count via `nextChar()`,
+    /// then loop that many times reading a name-index `nextChar()` + a
+    /// length `nextInt()` and either dispatching to a specific
+    /// `AttributeReader` or skipping `bp += attrLen`) -- is a SEVENTH
+    /// distinct JIT residual in the same repeated-in-process-javac-
+    /// compilation family as `ClassReaderReadClass`/`ClassFinderComplete`/
+    /// `ClassFinderFillIn`/`ClassReaderReadInnerClasses` above, same
+    /// "moderately complex counted loop over the shared `bp` cursor" shape.
+    /// Symptom: real javac's `bad class file... bad signature: "ourceFile"`
+    /// (a corrupted read of the `SourceFile` attribute's own name — the
+    /// leading `"S"` lost, i.e. the shared constant-pool-index/length cursor
+    /// desynchronized by a couple of bytes) surfacing while compiling
+    /// AOT-generated sources against `spring-core`/`spring-beans`/JDK
+    /// `.class` files pulled onto the classpath — found via
+    /// `ApplicationContextAotGeneratorTests$ConfigurationClassCglibProxy
+    /// .processAheadOfTimeWhenHasCglibProxyUseProxy`, which reproduces this
+    /// deterministically with default (Conservative) JIT settings despite
+    /// `readClass`/`readInnerClasses` already being interpreted. Confirmed
+    /// JIT-only (`--nojit`: pass) and isolated with `CRATONVM_JIT_DENY=
+    /// com/sun/tools/javac/jvm/ClassReader` (whole class: pass) then
+    /// narrowed with `CRATONVM_JIT_BISECT_SKIP=com/sun/tools/javac/jvm/
+    /// ClassReader.readAttrs` (this exact method alone: pass). Keep this
+    /// attribute-dispatch loop interpreted until its own JIT lowering is
+    /// understood.
+    ClassReaderReadAttrs,
+
     /// Javac's `Symbol$ClassSymbol.complete` underflows the interpreter operand
     /// stack after tiered compilation while H2 compiles a generated alias.
     /// Keep this symbol-completion method interpreted until its invokespecial
@@ -574,6 +602,10 @@ fn should_skip_jit_internal(
 
     if class_name == "com/sun/tools/javac/jvm/ClassReader" && method_name == "readInnerClasses" {
         return Some(SkipReason::ClassReaderReadInnerClasses);
+    }
+
+    if class_name == "com/sun/tools/javac/jvm/ClassReader" && method_name == "readAttrs" {
+        return Some(SkipReason::ClassReaderReadAttrs);
     }
 
     // HIB-STOREDPROC-JIT.1 (2026-07-23): H2's `CREATE ALIAS ... AS $$` invokes
@@ -1078,8 +1110,10 @@ fn should_skip_jit_internal(
         // every neighbouring RDN comparison/normalisation method remains JIT
         // eligible. Keep this small accessor interpreted under the conservative
         // policy until the JIT's array-backed SortedSet return path is
-        // root-caused. It remains explicitly liftable for diagnosis with
-        // CRATONVM_JIT_ALLOW_PACKAGES=com/unboundid/ldap/sdk/.
+        // root-caused. NOTE: since TOMCAT-JNDIREALM-JIT.2 below widened the
+        // ban to all of com/unboundid/, lifting for diagnosis needs the full
+        // CRATONVM_JIT_ALLOW_PACKAGES=com/unboundid/ prefix; the narrower
+        // com/unboundid/ldap/sdk/ entry only clears this guard, not JIT.2's.
         if class_name == "com/unboundid/ldap/sdk/RDN"
             && method_name == "getNameValuePairs"
             && !package_allowed("com/unboundid/ldap/sdk/", allow_packages)
@@ -1979,8 +2013,11 @@ fn is_unconditional_hash_miscompile_cluster(class_name: &str, method_name: &str)
 // policy until the package can be safely re-bisected. The July 2026 vector and
 // DiskBBQ hang residuals are covered by this same containment: the affected
 // test classes and their Elasticsearch vector-codec bodies sit under
-// `org/elasticsearch/`, while Lucene bytecode has its own fail-closed package
-// skip below.
+// `org/elasticsearch/`. Lucene bytecode is no longer skip-listed: the
+// LUCENE-POSTINGS.1 blanket `org/apache/lucene/` ban was retired by
+// `117d2d906` ("admit Lucene after synchronized-method gate") once the
+// interpreter started gating ACC_SYNCHRONIZED methods out of JIT/OSR itself,
+// which closed the IndexWriter monitor repro that had kept the ban alive.
 fn is_elasticsearch_suite_jit_fragile_cluster(class_name: &str, _method_name: &str) -> bool {
     class_name.starts_with("org/elasticsearch/")
 }
@@ -3542,8 +3579,10 @@ mod tests {
                 true,
                 SkipPolicy::Conservative,
             ),
-            None,
-            "the Tomcat LDAP guard must stay exact to RDN.getNameValuePairs"
+            Some(SkipReason::RustJvmTestFixture),
+            "TOMCAT-JNDIREALM-JIT.2 keeps ALL of com/unboundid/ interpreted \
+             (cross-package String-receiver corruption), not just \
+             RDN.getNameValuePairs"
         );
     }
 
@@ -3556,9 +3595,25 @@ mod tests {
                 false,
                 true,
                 SkipPolicy::Conservative,
+                &["com/unboundid/"],
+            ),
+            None,
+            "CRATONVM_JIT_ALLOW_PACKAGES=com/unboundid/ must lift the \
+             TOMCAT-JNDIREALM-JIT.2 package ban for bisection"
+        );
+        assert_eq!(
+            check_with(
+                "com/unboundid/ldap/sdk/RDN",
+                "getNameValuePairs",
+                false,
+                true,
+                SkipPolicy::Conservative,
                 &["com/unboundid/ldap/sdk/"],
             ),
-            None
+            Some(SkipReason::RustJvmTestFixture),
+            "a narrower allow entry must NOT lift the JIT.2 ban: the \
+             corruption is a cross-package compiled interaction, so partial \
+             lifts of individually-clean slices would mask the repro"
         );
         assert_eq!(
             check(
@@ -4095,8 +4150,10 @@ mod tests {
                 true,
                 SkipPolicy::Conservative,
             ),
-            Some(SkipReason::RustJvmTestFixture),
-            "Lucene vector leaves must stay interpreted by the separate Lucene package ban"
+            None,
+            "Lucene is JIT-admitted at the skip-list level since 117d2d906 \
+             retired the LUCENE-POSTINGS.1 package ban (ACC_SYNCHRONIZED \
+             methods are gated in the interpreter, not here)"
         );
     }
 

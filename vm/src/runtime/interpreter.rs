@@ -18364,7 +18364,7 @@ fn isolated_loader_class_not_found(
 /// the legacy global [`SharedVm::load_class_concurrent`]. The loader path can
 /// therefore only ever return a *more* correct answer, never a worse failure
 /// than the pre-gate behavior.
-fn resolve_class_loader_aware(
+pub(crate) fn resolve_class_loader_aware(
     shared: &SharedVm,
     thread: &mut JvmThread,
     referencing_class_id: ClassId,
