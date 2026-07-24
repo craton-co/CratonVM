@@ -9452,10 +9452,19 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
             if let Some(ctx_obj) = crate::t27_tls::get_runtime_default_ssl_context() {
                 return Ok(Some(Value::Object(Some(ctx_obj))));
             }
+            // No explicit setDefault() call yet: mirror the JDK's lazy-init
+            // contract (SSLContext.getDefault() javadoc — the default is
+            // "created if not yet created") by allocating ONE context and
+            // caching it in the same slot setDefault() writes to, so a
+            // second getDefault() call returns this SAME object instead of
+            // a fresh one each time (e.g. OtlpMetricsExportAutoConfigurationTests
+            // .whenNoSslBundleDefaultHttpSenderHasDefaultSslContext asserts
+            // `httpClient.sslContext()).isSameAs(SSLContext.getDefault())`).
             let obj = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLContext", 2);
             let name = ctx.create_string("TLS");
             ctx.set_field(obj, 0, Value::Object(Some(name)));
             ctx.set_field(obj, 1, Value::Int(1));
+            crate::t27_tls::set_runtime_default_ssl_context(obj);
             Ok(Some(Value::Object(Some(obj))))
         },
     );

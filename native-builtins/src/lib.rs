@@ -69858,22 +69858,49 @@ fn assertj_array_values_equal(left: Value, right: Value) -> bool {
     }
 }
 
+// BUG (micrometer-metrics-graphite-array-equality-20260724): this used to
+// take `left_name`/`right_name` strings derived from
+// `class_name_of_id(class_id_of_object(obj))` and decide reference-vs-
+// primitive by prefix-matching ("[L"/"[["/exact primitive descriptor). That
+// is unsound for ARRAY objects specifically: the heap object header's
+// `class_id` field for an array stores the ELEMENT type's ClassId (e.g.
+// `java/lang/String`'s ClassId for a `String[]`), not the array type's own
+// ClassId — confirmed via a from-scratch repro comparing native-side
+// `identity_hash_code`/`class_id_of_object` output against the SAME
+// object's Java-side `System.identityHashCode()`: the identity matched the
+// array exactly, but `class_id_of_object` reported the component class
+// (`java/lang/String`), so `left_name.starts_with('[')` was always false
+// and every reference-array comparison silently fell through to this
+// function's caller's `Object.equals` (identity) branch — e.g.
+// `GraphitePropertiesConfigAdapterTests.whenPropertiesTagsAsPrefixIsSetAdapterTagsAsPrefixReturnsIt`
+// asserting `assertThat(new String[]{"worker"}).isEqualTo(new String[]{"worker"})`
+// spuriously failed despite `Arrays.deepEquals`/`Objects.deepEquals`/
+// `instanceof` all correctly recognizing the exact same objects as
+// content-equal `String[]` arrays. Fixed by using `object_is_array`/
+// `heap_element_type_of` (the same reliable APIs `java.lang.reflect.Array`'s
+// natives already use — see `reflect_array_arg`/`native_array_get`) instead
+// of class-id-derived name strings.
 fn assertj_arrays_equal(
     ctx: &mut dyn NativeContext,
     left: ObjectRef,
     right: ObjectRef,
-    left_name: &str,
-    right_name: &str,
 ) -> Result<bool, MethodCallFailed> {
-    let left_is_reference_array = left_name.starts_with("[L") || left_name.starts_with("[[");
-    let right_is_reference_array = right_name.starts_with("[L") || right_name.starts_with("[[");
+    let left_elem = ctx.heap_element_type_of(left);
+    let right_elem = ctx.heap_element_type_of(right);
+    let left_is_reference_array = matches!(left_elem, cratonvm_types::ArrayElementType::Reference);
+    if std::env::var_os("CRATONVM_DBG_ASSERTJ_ARR").is_some() {
+        eprintln!(
+            "[ASSERTJ-ARR-DBG] left_elem={left_elem:?} right_elem={right_elem:?} left_ref={left_is_reference_array}"
+        );
+    }
 
     // The Java implementation falls through to Object.equals (identity for
     // arrays) for different primitive array types and primitive/reference
     // pairs. `left == right` was handled by the caller.
-    if left_is_reference_array != right_is_reference_array
-        || (!left_is_reference_array && left_name != right_name)
-    {
+    if left_elem != right_elem {
+        if std::env::var_os("CRATONVM_DBG_ASSERTJ_ARR").is_some() {
+            eprintln!("[ASSERTJ-ARR-DBG] early-false: mismatched array element type");
+        }
         return Ok(false);
     }
 
@@ -69898,11 +69925,21 @@ fn assertj_arrays_equal(
                     (Value::Object(left), Value::Object(right)) => {
                         assertj_objects_equal(ctx, left, right)?
                     }
-                    _ => false,
+                    _ => {
+                        if std::env::var_os("CRATONVM_DBG_ASSERTJ_ARR").is_some() {
+                            eprintln!(
+                                "[ASSERTJ-ARR-DBG] index={index} non-object element value(s): left={left_value:?} right={right_value:?}"
+                            );
+                        }
+                        false
+                    }
                 }
             } else {
                 assertj_array_values_equal(left_value, right_value)
             };
+            if std::env::var_os("CRATONVM_DBG_ASSERTJ_ARR").is_some() {
+                eprintln!("[ASSERTJ-ARR-DBG] index={index} equal={equal}");
+            }
             if !equal {
                 return Ok(false);
             }
@@ -69925,8 +69962,34 @@ fn assertj_objects_equal(
         (Some(left), Some(right)) if left == right => return Ok(true),
         (Some(left), Some(right)) => (left, right),
     };
+
+    // Check array-ness FIRST, via `object_is_array` (the same reliable API
+    // `java.lang.reflect.Array`'s natives use) — see the BUG note on
+    // `assertj_arrays_equal` for why `class_id_of_object`/`class_name_of_id`
+    // must NOT be trusted for array objects: an array's header `class_id`
+    // holds its ELEMENT type's id (e.g. `java/lang/Long`'s id for a
+    // `Long[]`), so checking those name strings BEFORE ruling out
+    // array-ness could misroute an actual `Long[]`/`Long[]` pair into the
+    // scalar-Long fast path below, reading a nonexistent "value" field off
+    // an array object.
+    let left_is_array = ctx.object_is_array(left);
+    let right_is_array = ctx.object_is_array(right);
+    if left_is_array || right_is_array {
+        if !left_is_array || !right_is_array {
+            // Mismatched array-ness: real bytecode's instanceof chain
+            // finds no match either side and falls through to identity
+            // Object.equals — never equal for two distinct objects (the
+            // `left == right` case was already handled above).
+            return Ok(false);
+        }
+        return assertj_arrays_equal(ctx, left, right);
+    }
+
     let left_name = ctx.class_name_of_id(ctx.class_id_of_object(left));
     let right_name = ctx.class_name_of_id(ctx.class_id_of_object(right));
+    if std::env::var_os("CRATONVM_DBG_ASSERTJ_ARR").is_some() {
+        eprintln!("[ASSERTJ-OBJ-DBG] left_name={left_name:?} right_name={right_name:?}");
+    }
     let left_name = left_name.as_deref().unwrap_or_default();
     let right_name = right_name.as_deref().unwrap_or_default();
 
@@ -69936,9 +69999,6 @@ fn assertj_objects_equal(
             .unwrap_or(0);
         return Ok(assertj_long_value(ctx, left, value_slot)
             == assertj_long_value(ctx, right, value_slot));
-    }
-    if left_name.starts_with('[') && right_name.starts_with('[') {
-        return assertj_arrays_equal(ctx, left, right, left_name, right_name);
     }
 
     // A virtual call may allocate or re-enter Java, so retain both operands
@@ -70054,6 +70114,19 @@ fn native_assertj_standard_comparison_are_equal(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
+    if std::env::var_os("CRATONVM_DBG_ASSERTJ_ARR").is_some() {
+        eprintln!("[ASSERTJ-ENTRY-DBG] native_assertj_standard_comparison_are_equal args.len()={} args={args:?}", args.len());
+        for (i, a) in args.iter().enumerate() {
+            if let Value::Object(Some(o)) = a {
+                eprintln!(
+                    "[ASSERTJ-ENTRY-DBG] args[{i}] identity_hash={} class_id={:?} class_name={:?}",
+                    ctx.identity_hash_code(*o),
+                    ctx.class_id_of_object(*o),
+                    ctx.class_name_of_id(ctx.class_id_of_object(*o))
+                );
+            }
+        }
+    }
     let left = match args.get(1) {
         Some(Value::Object(value)) => *value,
         _ => None,
@@ -70062,7 +70135,11 @@ fn native_assertj_standard_comparison_are_equal(
         Some(Value::Object(value)) => *value,
         _ => None,
     };
-    Ok(Some(Value::Int(i32::from(assertj_objects_equal(ctx, left, right)?))))
+    let out = assertj_objects_equal(ctx, left, right)?;
+    if std::env::var_os("CRATONVM_DBG_ASSERTJ_ARR").is_some() {
+        eprintln!("[ASSERTJ-ENTRY-DBG] result={out}");
+    }
+    Ok(Some(Value::Int(i32::from(out))))
 }
 
 fn native_assertj_lightweight_comparable_assert(
@@ -74631,11 +74708,53 @@ pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
         },
     );
 
+    // BUG (micrometer-metrics-logbackcondition-wrong-binder-20260724): both
+    // natives below used to apply UNCONDITIONALLY — registered natives shadow
+    // ANY class of this name at every interpreter dispatch site (WP0.1
+    // native-override-priority), regardless of whether a REAL binder jar
+    // (log4j-slf4j-impl, slf4j-log4j12, ...) is actually on the classpath
+    // with its own genuine `getSingleton`/`getLoggerFactory` bytecode. That
+    // silently discarded a real, non-Logback binding: Spring Boot's
+    // `@ConfigureClasspathToPreferLog4j2` (`ClassPathOverrides` installing
+    // log4j-slf4j-impl ahead of logback-classic on a `ModifiedClassPathClassLoader`)
+    // makes `org/slf4j/impl/StaticLoggerBinder` resolve to log4j's REAL class
+    // — whose real `getLoggerFactory()` legitimately returns a Log4j-backed
+    // `ILoggerFactory` — but this fallback kept fabricating a Logback
+    // `LoggerContext` anyway (logback-classic remains on the classpath, just
+    // not what THIS StaticLoggerBinder should bind to), so
+    // `LogbackLoggingCondition`/`LogbackMetricsAutoConfiguration` wrongly saw
+    // Logback as active and registered a `logbackMetrics` bean the test
+    // asserts must be absent (`LogbackMetricsAutoConfigurationWithLog4j2AndLogbackTests
+    // .doesNotConfigureLogbackMetrics`), and separately broke
+    // `Log4J2MetricsWithLog4jLoggerContextAutoConfigurationTests`. Now: run
+    // the receiver/class's own real bytecode via the `*_bytecode_only`
+    // primitives (bypassing native re-dispatch to avoid self-recursion) when
+    // `class_declares_method` confirms a genuine (non-bridge) declaration is
+    // present — i.e. a real binder jar was actually found. Only fabricate the
+    // synthetic Logback-preferring placeholder below when no real
+    // implementation exists anywhere (the "impl JAR isn't visible" case this
+    // stub was written for — see the module doc above).
     registry.register(
         "org/slf4j/impl/StaticLoggerBinder",
         "getSingleton",
         "()Lorg/slf4j/impl/StaticLoggerBinder;",
         |ctx, _| {
+            if let Some(cid) = ctx.class_id_by_name("org/slf4j/impl/StaticLoggerBinder") {
+                if ctx.class_declares_method(
+                    cid,
+                    "getSingleton",
+                    "()Lorg/slf4j/impl/StaticLoggerBinder;",
+                ) {
+                    if let Ok(Some(real)) = ctx.invoke_special_bytecode_only(
+                        "org/slf4j/impl/StaticLoggerBinder",
+                        "getSingleton",
+                        "()Lorg/slf4j/impl/StaticLoggerBinder;",
+                        &[],
+                    ) {
+                        return Ok(Some(real));
+                    }
+                }
+            }
             let s = alloc_concurrent_synthetic(ctx, "org/slf4j/impl/StaticLoggerBinder", 1);
             Ok(Some(Value::Object(Some(s))))
         },
@@ -74653,7 +74772,26 @@ pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
         "org/slf4j/impl/StaticLoggerBinder",
         "getLoggerFactory",
         "()Lorg/slf4j/ILoggerFactory;",
-        |ctx, _| {
+        |ctx, args| {
+            // Prefer the RECEIVER's own real bytecode (see the BUG note
+            // above `getSingleton`) — `getSingleton()` may have handed back a
+            // genuinely-real binder instance (a real jar was found), in
+            // which case its own `getLoggerFactory()` already knows the
+            // correct backend and must not be second-guessed here.
+            if let Ok(this) = obj_arg(args, 0) {
+                let cid = ctx.class_id_of_object(this);
+                if ctx.class_declares_method(cid, "getLoggerFactory", "()Lorg/slf4j/ILoggerFactory;")
+                {
+                    if let Ok(Some(real)) = ctx.invoke_virtual_bytecode_only(
+                        this,
+                        "getLoggerFactory",
+                        "()Lorg/slf4j/ILoggerFactory;",
+                        &[],
+                    ) {
+                        return Ok(Some(real));
+                    }
+                }
+            }
             if ctx
                 .ensure_class_initialized("ch/qos/logback/classic/LoggerContext")
                 .is_ok()
