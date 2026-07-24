@@ -2573,19 +2573,17 @@ fn shadow_no_savebase() -> bool {
 
 /// Cooperative JIT safepoint polling — whether the backend emits an inline
 /// poll of `helpers.safepoint_flag_addr` (the GC barrier's
-/// `stw_requested` flag byte) at context-method entry and on every `goto`
-/// loop back-edge. Enabled by setting `CRATONVM_JIT_SAFEPOINT_POLLS` to any
-/// value. Off by default (byte-identical to the pre-existing codegen): JIT
-/// threads currently have NO cooperative safepoint of their own — the
-/// collector instead suspends them at the OS level and conservatively scans
-/// their registers (`vm/src/jit/xt_root_scan.rs`). See
-/// `docs/internal/jit-safepoint-polls.md` for the design and the current
-/// coverage limitations (pure methods and non-`goto` back edges are not
-/// polled in this first cut). See [`Compiler::emit_safepoint_poll`].
+/// `stw_requested` flag byte) at method entry and loop back-edges. Polling is
+/// enabled by default; `CRATONVM_JIT_SAFEPOINT_POLLS=0` is the diagnostic
+/// opt-out.
 fn jit_safepoint_polls_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| std::env::var_os("CRATONVM_JIT_SAFEPOINT_POLLS").is_some())
+    *G.get_or_init(|| {
+        std::env::var_os("CRATONVM_JIT_SAFEPOINT_POLLS")
+            .and_then(|v| v.into_string().ok())
+            .is_none_or(|v| v != "0")
+    })
 }
 
 /// SB-CRASH-04 (register-invisibility) — whether GC-capable safepoints blind-
@@ -10037,7 +10035,6 @@ impl Compiler {
     /// TEST byte ptr [R11], 0xFF  ; nonzero => STW requested
     /// JZ   .no_poll
     ///   <emit_pre_safepoint_spill>              ; frame-slot oop map valid
-    ///   MOV  ARG_REGS[0], [rbp - heap_local_offset]  ; vm_ptr
     ///   CALL helpers.safepoint_slow_path
     ///   <emit_oop_map_for_safepoint>             ; precise/shadow modes only
     /// .no_poll:
@@ -10051,23 +10048,13 @@ impl Compiler {
     /// clobber here) via `MOV R11, imm64`, then read with a single non-atomic
     /// byte `TEST`.
     ///
-    /// Callers gate emission on this being a context method
-    /// (`self.needs_heap`) — a pure method (no `vm_ptr` frame slot) has
-    /// nowhere to load the slow-path helper's argument from, so v1 skips the
-    /// poll for pure methods entirely rather than threading a second hidden
-    /// argument through every pure-method call site. See
-    /// `docs/internal/jit-safepoint-polls.md` for the follow-up path and the
-    /// other current coverage gap (only `goto`-shaped back edges are
-    /// polled; a loop whose only backward branch is a conditional `ifXX`/
-    /// `if_icmpXX`/`if_acmpXX` is not).
+    /// The slow helper resolves the current VM and Java thread from published
+    /// process state/TLS, so the sequence is valid in pure methods too.
     fn emit_safepoint_poll(&mut self) {
         if self.failed {
             return;
         }
         if !jit_safepoint_polls_enabled() {
-            return;
-        }
-        if !self.needs_heap {
             return;
         }
         if self.helpers.safepoint_flag_addr == 0 || self.helpers.safepoint_slow_path == 0 {
@@ -10078,7 +10065,6 @@ impl Compiler {
         self.emit_test_mem8_imm8(R11, 0, 0xFF);
         let no_poll = self.emit_jcc_rel32_patch(0x84); // JZ (flag clear) -> skip slow path
         self.emit_pre_safepoint_spill();
-        self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
         self.emit_call_absolute(self.helpers.safepoint_slow_path);
         if self.precise_maps || self.shadow_enabled {
             self.emit_oop_map_for_safepoint();
@@ -20813,6 +20799,9 @@ impl Compiler {
                         Some(t) => t,
                         None => return false, // invalid branch target
                     };
+                    if target_pc <= pc {
+                        self.emit_safepoint_poll();
+                    }
 
                     // Canonicalize for forward merge points BEFORE popping the
                     // operand, so it participates in the relocation. Popping
@@ -20865,6 +20854,9 @@ impl Compiler {
                         Some(t) => t,
                         None => return false, // invalid branch target
                     };
+                    if target_pc <= pc {
+                        self.emit_safepoint_poll();
+                    }
 
                     // Canonicalize for forward merge points BEFORE popping the
                     // operands (see ifeq..ifle above): with both operands still
@@ -21307,7 +21299,7 @@ impl Compiler {
                 // tableswitch — jump table for dense tables, CMP chain for small
                 0xaa => {
                     self.flush_scratch_registers();
-                    self.pop_to_rax();
+                    let key_slot = self.pop_stack();
                     let base_pc = pc;
                     pc += 1;
                     while pc % 4 != 0 {
@@ -21368,6 +21360,10 @@ impl Compiler {
                         pc += 4;
                     }
                     let def_target = (base_pc as i32 + default_offset) as usize; // Cast: x86-64 immediate encoding
+                    if def_target <= base_pc || targets.iter().any(|&target| target <= base_pc) {
+                        self.emit_safepoint_poll();
+                    }
+                    self.load_slot_to_reg(RAX, key_slot);
 
                     if count <= 4 {
                         // Small table: CMP chain (compact code, few comparisons)
@@ -21449,7 +21445,7 @@ impl Compiler {
                 // lookupswitch — CMP chain for small, binary search for large
                 0xab => {
                     self.flush_scratch_registers();
-                    self.pop_to_rax();
+                    let key_slot = self.pop_stack();
                     let base_pc = pc;
                     pc += 1;
                     while pc % 4 != 0 {
@@ -21504,6 +21500,12 @@ impl Compiler {
                         pairs.push((key, target));
                     }
                     let def_target = (base_pc as i32 + default_offset) as usize; // Cast: x86-64 immediate encoding
+                    if def_target <= base_pc
+                        || pairs.iter().any(|&(_, target)| target <= base_pc)
+                    {
+                        self.emit_safepoint_poll();
+                    }
+                    self.load_slot_to_reg(RAX, key_slot);
 
                     if npairs <= 6 {
                         // Small: linear CMP chain (fast for few entries)
@@ -27009,6 +27011,9 @@ impl Compiler {
                         Some(t) => t,
                         None => return false, // invalid branch target
                     };
+                    if target_pc <= pc {
+                        self.emit_safepoint_poll();
+                    }
 
                     // Canonicalize for forward merge points BEFORE popping the
                     // operands (see ifeq..ifle). if_acmp historically skipped
@@ -27049,6 +27054,9 @@ impl Compiler {
                         Some(t) => t,
                         None => return false, // invalid branch target
                     };
+                    if target_pc <= pc {
+                        self.emit_safepoint_poll();
+                    }
 
                     // Canonicalize for forward merge points BEFORE popping the
                     // operands (see if_acmpeq above).
@@ -27197,6 +27205,9 @@ impl Compiler {
                         Some(t) => t,
                         None => return false, // invalid branch target
                     };
+                    if target_pc <= pc {
+                        self.emit_safepoint_poll();
+                    }
 
                     // Canonicalize for forward merge points BEFORE popping the
                     // operand (see ifeq..ifle): popping first could let the
@@ -27249,6 +27260,9 @@ impl Compiler {
                         Some(t) => t,
                         None => return false, // invalid branch target
                     };
+                    if target_pc <= pc {
+                        self.emit_safepoint_poll();
+                    }
 
                     // Canonicalize for forward merge points BEFORE popping the
                     // operand (see ifeq..ifle / ifnull above).
@@ -29210,6 +29224,109 @@ mod tests {
             safepoint_flag_addr: 0,
             safepoint_slow_path: 0,
         }
+    }
+
+    #[test]
+    fn cooperative_poll_runs_in_a_pure_compiled_method() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static FLAG: u8 = 1;
+        static HITS: AtomicUsize = AtomicUsize::new(0);
+        extern "C" fn slow_poll() {
+            HITS.fetch_add(1, Ordering::SeqCst);
+        }
+
+        let mut helpers = test_helpers();
+        helpers.safepoint_flag_addr = &FLAG as *const u8 as usize;
+        helpers.safepoint_slow_path = slow_poll as *const () as usize;
+        HITS.store(0, Ordering::SeqCst);
+
+        // iconst_1; ireturn -- deliberately no heap/context dependency.
+        let code = [0x04, 0xac];
+        let compiled = compile(
+            &code,
+            code.len(),
+            0,
+            0,
+            false,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            HashMap::new(),
+            HashMap::new(),
+            &helpers,
+            std::collections::HashSet::new(),
+            HashMap::new(),
+            None,
+        )
+        .expect("pure method should compile with a cooperative poll");
+
+        // SAFETY: the generated function has no arguments and returns int 1.
+        assert_eq!(unsafe { compiled.try_call(&[]) }, Ok(1));
+        assert_eq!(HITS.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn cooperative_poll_covers_a_conditional_only_backedge() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static FLAG: u8 = 1;
+        static HITS: AtomicUsize = AtomicUsize::new(0);
+        extern "C" fn slow_poll() {
+            HITS.fetch_add(1, Ordering::SeqCst);
+        }
+
+        let mut helpers = test_helpers();
+        helpers.safepoint_flag_addr = &FLAG as *const u8 as usize;
+        helpers.safepoint_slow_path = slow_poll as *const () as usize;
+        HITS.store(0, Ordering::SeqCst);
+
+        // int i=3; do { --i; } while (i != 0); return i;
+        // The loop has no goto: its only backedge is the conditional ifne.
+        let code = [0x06, 0x3b, 0x84, 0x00, 0xff, 0x1a, 0x9a, 0xff, 0xfc, 0x1a, 0xac];
+        let compiled = compile(
+            &code,
+            code.len(),
+            0,
+            1,
+            false,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            HashMap::new(),
+            HashMap::new(),
+            &helpers,
+            std::collections::HashSet::new(),
+            HashMap::new(),
+            None,
+        )
+        .expect("conditional loop should compile");
+
+        // SAFETY: the generated function has no arguments and returns int 0.
+        assert_eq!(unsafe { compiled.try_call(&[]) }, Ok(0));
+        assert_eq!(
+            HITS.load(Ordering::SeqCst),
+            4,
+            "one method-entry poll plus one poll at each of three loop tests"
+        );
     }
 
     #[test]

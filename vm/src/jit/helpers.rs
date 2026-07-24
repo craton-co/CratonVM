@@ -9742,8 +9742,8 @@ pub extern "C" fn jit_ldc_string(vm_ptr: i64, bytes: *const u8, len: usize) -> i
 /// flag byte (`helpers.safepoint_flag_addr`, see
 /// `GcBarrier::stw_requested_flag_addr`) set.
 ///
-/// Recovers the `SharedVm`/`JvmThread` the same way every other JIT helper
-/// does (`vm_ptr` argument + `jit_thread_mut()`'s `JIT_THREAD` TLS), then
+/// Recovers the `SharedVm`/`JvmThread` from process-wide VM publication and
+/// `jit_thread_mut()`'s `JIT_THREAD` TLS, then
 /// joins the SAME stop-the-world wait the interpreter's own poll hit uses
 /// (`crate::runtime::interpreter::safepoint_check` — retire the TLAB, drain
 /// SATB, publish a fresh root snapshot, arrive at the GC barrier) so a
@@ -9756,27 +9756,28 @@ pub extern "C" fn jit_ldc_string(vm_ptr: i64, bytes: *const u8, len: usize) -> i
 /// slot before `safepoint_check` can park this thread — the conservative
 /// scanner sees a complete picture of this frame while parked.
 ///
-/// A null `vm_ptr` (should not happen at a context-method poll site, but
-/// the JIT->VM boundary is untrusted) or an absent `JIT_THREAD` TLS entry
-/// is a silent no-op: the caller's inline fast path only reaches this CALL
-/// when the flag byte was observed nonzero, so skipping here merely defers
-/// the pause to this thread's NEXT poll hit — the same latency bound an
-/// ordinary missed poll already has.
+/// An absent process VM or `JIT_THREAD` TLS entry is a silent no-op. Resolving
+/// the VM here instead of passing the hidden context pointer lets pure
+/// compiled methods use the same poll sequence as context methods.
 // SAFETY: called only from JIT-compiled code at a poll site emitted by
 // `emit_safepoint_poll`, which always precedes the CALL with
-// `emit_pre_safepoint_spill`. `vm_ptr` is the same hidden SharedVm pointer
-// every other JIT helper receives (0 or a live SharedVm pointer).
+// `emit_pre_safepoint_spill`.
 #[no_mangle]
-pub unsafe extern "C" fn jit_safepoint_slow_path(vm_ptr: i64) {
+pub unsafe extern "C" fn jit_safepoint_slow_path() {
+    static HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     crate::jit::conservative_roots::note_jit_boundary();
-    if vm_ptr == 0 {
+    let Some(vm) = crate::native::jni::process_vm() else {
         return;
-    }
-    // SAFETY: caller contract for every JIT helper — vm_ptr is a live
-    // SharedVm pointer.
-    let vm = &*(vm_ptr as *const SharedVm);
+    };
     if let Some((thread, _guard)) = jit_thread_mut() {
-        crate::runtime::interpreter::safepoint_check(vm, thread);
+        let hit = HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if hit <= 16 && std::env::var_os("CRATONVM_DBG_JIT_SAFEPOINTS").is_some() {
+            eprintln!(
+                "[jit-safepoint] cooperative slow-path hit={} thread_id={}",
+                hit, thread.thread_id.0
+            );
+        }
+        crate::runtime::interpreter::safepoint_check(vm.as_ref(), thread);
     }
 }
 

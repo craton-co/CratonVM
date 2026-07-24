@@ -88,6 +88,7 @@ const RCX: u8 = 1;
 const RDX: u8 = 2;
 #[allow(dead_code)]
 const R10: u8 = 10;
+const R11: u8 = 11;
 
 // XMM scratch registers for the FP value tier (inc 30). Analogous to RAX/RCX:
 // XMM0 holds the first operand / result, XMM1 the second operand / a mask.
@@ -168,6 +169,10 @@ struct Lowerer<'a> {
     /// instance-field reads route through it so receivers are validated against
     /// the live heap before any object-header dereference.
     getfield: usize,
+    /// Cooperative GC poll flag and no-argument slow path. IR values are
+    /// canonicalized in frame slots, so the slow-path call needs no spill.
+    safepoint_flag_addr: usize,
+    safepoint_slow_path: usize,
     /// True iff the graph contains an `Op::Call` — then the method takes the VM
     /// context pointer as a hidden first argument (`try_call_with_context`), and
     /// the prologue stores it to `context_slot_off` + shifts the Java params.
@@ -287,6 +292,8 @@ impl<'a> Lowerer<'a> {
             frem: helpers.jit_frem,
             drem: helpers.jit_drem,
             getfield: helpers.getfield,
+            safepoint_flag_addr: helpers.safepoint_flag_addr,
+            safepoint_slow_path: helpers.safepoint_slow_path,
             needs_context,
             context_slot_off,
             args_stage_top_off,
@@ -489,6 +496,29 @@ impl<'a> Lowerer<'a> {
             }
             self.store_abi_reg(abi_regs[abi_idx], ((i as i32) + 1) * 8); // local_offset(i)
         }
+    }
+
+    /// Emit the default-on cooperative poll used at method entries and loop
+    /// back-edges. The lowerer keeps all live values in frame slots, so the
+    /// no-argument slow path may be called directly.
+    fn emit_safepoint_poll(&mut self) {
+        let enabled = std::env::var_os("CRATONVM_JIT_SAFEPOINT_POLLS")
+            .and_then(|v| v.into_string().ok())
+            .is_none_or(|v| v != "0");
+        if !enabled || self.safepoint_flag_addr == 0 || self.safepoint_slow_path == 0 {
+            return;
+        }
+        self.emit_mov_reg_imm64(R11, self.safepoint_flag_addr as u64);
+        self.buf.emit(&[0x41, 0xF6, 0x03, 0xFF]); // TEST byte ptr [R11], 0xff
+        self.buf.emit(&[0x0F, 0x84]); // JZ .clear
+        let clear_patch = self.buf.pos();
+        self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
+        self.emit_mov_reg_imm64(RAX, self.safepoint_slow_path as u64);
+        self.buf.emit(&[0xFF, 0xD0]); // CALL RAX
+        let rel = self.buf.pos() as i32 - (clear_patch as i32 + 4);
+        self.buf
+            .try_patch_i32(clear_patch, rel)
+            .expect("IR safepoint poll patch in-bounds");
     }
 
     /// MOV [RBP - offset], reg  (REX.W [+ REX.R for an extended reg]).
@@ -809,6 +839,9 @@ impl<'a> Lowerer<'a> {
             // successor physically next).
             let succ = self.schedule.blocks[block_idx].successors.first().copied();
             if let Some(succ_block) = succ {
+                if succ_block <= block_idx {
+                    self.emit_safepoint_poll();
+                }
                 self.emit_phi_copies(block_idx, succ_block);
                 self.buf.emit_byte(0xE9); // JMP succ_block
                 let patch_pos = self.buf.pos();
@@ -1698,6 +1731,13 @@ impl<'a> Lowerer<'a> {
     }
 
     fn lower_terminator(&mut self, term: NodeId, block_idx: usize) {
+        if self.schedule.blocks[block_idx]
+            .successors
+            .iter()
+            .any(|&succ| succ <= block_idx)
+        {
+            self.emit_safepoint_poll();
+        }
         let node = &self.graph.nodes[term as usize];
         match &node.op {
             Op::Return => {
@@ -2533,6 +2573,7 @@ pub(crate) fn lower_inner(
     lowerer.prealloc_phi_slots();
 
     lowerer.emit_prologue();
+    lowerer.emit_safepoint_poll();
 
     // Emit blocks in order
     for block_idx in 0..schedule.blocks.len() {
@@ -2612,6 +2653,32 @@ mod tests {
     /// all-integer (usize) fields, so an all-zero bit pattern is a valid value.
     fn no_helpers() -> JitRuntimeHelpers {
         unsafe { std::mem::zeroed() }
+    }
+
+    #[test]
+    fn cooperative_poll_runs_in_a_pure_ir_method() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static FLAG: u8 = 1;
+        static HITS: AtomicUsize = AtomicUsize::new(0);
+        extern "C" fn slow_poll() {
+            HITS.fetch_add(1, Ordering::SeqCst);
+        }
+
+        let code = [0x04, 0xac]; // iconst_1; ireturn
+        let builder = IrBuilder::new(0, 0);
+        let graph = builder.build(&code, code.len()).expect("IR build");
+        let schedule = ir_schedule::schedule(&graph);
+        let mut helpers = no_helpers();
+        helpers.safepoint_flag_addr = &FLAG as *const u8 as usize;
+        helpers.safepoint_slow_path = slow_poll as *const () as usize;
+        HITS.store(0, Ordering::SeqCst);
+        let compiled =
+            lower(&graph, &schedule, 0, 0, &helpers).expect("pure IR method should lower");
+
+        // SAFETY: the generated function has no arguments and returns int 1.
+        assert_eq!(unsafe { compiled.try_call(&[]) }, Ok(1));
+        assert_eq!(HITS.load(Ordering::SeqCst), 1);
     }
 
     fn compile_via_ir(
