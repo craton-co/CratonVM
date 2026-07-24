@@ -35569,6 +35569,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             };
             let level = args.get(1).copied().unwrap_or(Value::Object(None));
             crate::logmanager::record_jul_logger_level(ctx, this, level);
+            let mut wrote_real_config = false;
             if let Value::Object(Some(config)) = ctx.get_field_by_name(this, "config") {
                 if jul_logger_config_is_real(ctx, config) {
                     ctx.set_field_by_name(config, "levelObject", level);
@@ -35580,6 +35581,24 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
                             ctx.set_field_by_name(config, "levelValue", Value::Int(v));
                         }
                     }
+                    wrote_real_config = true;
+                }
+            }
+            // Our `allocate_logger`-created synthetic loggers (slot0=name,
+            // slot1=level, slot2=parent) have no `config` object at all, so
+            // the branch above never fires for them -- write the level slot
+            // directly so `getLevel()` (below) and the ancestor-walking
+            // `getEffectiveLevel()` callers in real Spring Boot bytecode see
+            // the update instead of a permanent null.
+            if !wrote_real_config {
+                let is_synthetic = matches!(
+                    ctx.get_field(this, crate::logmanager::LOGGER_FIELD_NAME),
+                    Value::Object(Some(name))
+                        if ctx.class_name_of_id(ctx.class_id_of_object(name)).as_deref()
+                            == Some("java/lang/String")
+                );
+                if is_synthetic {
+                    ctx.set_field(this, crate::logmanager::LOGGER_FIELD_LEVEL, level);
                 }
             }
             Ok(None)
@@ -35598,7 +35617,17 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
                     return Ok(Some(ctx.get_field_by_name(config, "levelObject")));
                 }
             }
-            // Synthetic logger: preserve historic null (inherit from parent).
+            // Synthetic logger: read the real level slot `setLevel` (above)
+            // writes, instead of the historic hardcoded null.
+            let is_synthetic = matches!(
+                ctx.get_field(this, crate::logmanager::LOGGER_FIELD_NAME),
+                Value::Object(Some(name))
+                    if ctx.class_name_of_id(ctx.class_id_of_object(name)).as_deref()
+                        == Some("java/lang/String")
+            );
+            if is_synthetic {
+                return Ok(Some(ctx.get_field(this, crate::logmanager::LOGGER_FIELD_LEVEL)));
+            }
             Ok(Some(Value::Object(None)))
         },
     );
@@ -35644,19 +35673,33 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             // their real `name` field, NOT at slot 0 (slot 0 is `config`, a
             // `Logger$ConfigurationData`). Reading slot 0 unconditionally returned
             // that ConfigurationData, so the caller's `getName().lastIndexOf('.')`
-            // threw NoSuchMethodError and aborted the VM. Prefer the real `name`
-            // field; fall back to slot 0 for synthetic loggers our getLogger
-            // natives create (which stash the name there).
+            // threw NoSuchMethodError and aborted the VM.
+            //
+            // Check our OWN synthetic layout (slot 0 = name, a String) FIRST,
+            // before `get_field_by_name(this, "name")`: `allocate_logger`
+            // (logmanager.rs) now links non-root synthetic loggers to a real
+            // parent `Logger` at slot 2, and `get_field_by_name` resolves
+            // "name" using the REAL class's field metadata -- which for
+            // `java.util.logging.Logger` happens to BE slot 2. Checking
+            // `get_field_by_name` first would therefore alias onto the
+            // parent Logger object (any non-null object satisfies the `Some`
+            // pattern below, uncaught by any type check), returning it in
+            // place of the true name and blowing up the very next
+            // `getName().someStringMethod()` call with a `NoSuchMethodError`
+            // on `Logger`. A real Logger's slot 0 is never a String (it's
+            // `config`), so this ordering is safe for both layouts.
+            if let Value::Object(Some(s)) = ctx.get_field(this, 0) {
+                if ctx.class_name_of_id(ctx.class_id_of_object(s)).as_deref()
+                    == Some("java/lang/String")
+                {
+                    return Ok(Some(Value::Object(Some(s))));
+                }
+            }
             if let Value::Object(Some(s)) = ctx.get_field_by_name(this, "name") {
                 return Ok(Some(Value::Object(Some(s))));
             }
-            match ctx.get_field(this, 0) {
-                Value::Object(Some(s)) => Ok(Some(Value::Object(Some(s)))),
-                _ => {
-                    let s = ctx.create_string("");
-                    Ok(Some(Value::Object(Some(s))))
-                }
-            }
+            let s = ctx.create_string("");
+            Ok(Some(Value::Object(Some(s))))
         },
     );
     registry.register(
@@ -35751,7 +35794,32 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "java/util/logging/Logger",
         "getParent",
         "()Ljava/util/logging/Logger;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        |ctx, args| {
+            let Some(Value::Object(Some(this))) = args.first().copied() else {
+                return Ok(Some(Value::Object(None)));
+            };
+            // `allocate_logger` (logmanager.rs) links every non-root
+            // synthetic logger to a real parent (demand-created from its
+            // dotted-name prefix) at slot 2. Previously this was hardcoded
+            // null for every Logger, real or synthetic, which broke any
+            // ancestor walk (e.g. Spring Boot's `JavaLoggingSystem
+            // .getEffectiveLevel`'s `while (getLevel()==null)
+            // logger=getParent()` loop NPEs the moment it dereferences the
+            // never-non-null parent). Real-JDK Logger objects (built via
+            // actual bytecode `new`, not `allocate_logger`) keep the old
+            // safe null -- we have no reliable parent chain for those under
+            // this simplified bridge.
+            let is_synthetic = matches!(
+                ctx.get_field(this, crate::logmanager::LOGGER_FIELD_NAME),
+                Value::Object(Some(name))
+                    if ctx.class_name_of_id(ctx.class_id_of_object(name)).as_deref()
+                        == Some("java/lang/String")
+            );
+            if is_synthetic {
+                return Ok(Some(ctx.get_field(this, crate::logmanager::LOGGER_FIELD_PARENT)));
+            }
+            Ok(Some(Value::Object(None)))
+        },
     );
     registry.register(
         "java/util/logging/Logger",
