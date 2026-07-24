@@ -45,6 +45,7 @@ pub mod method;
 pub mod method_descriptor;
 pub mod signature;
 pub mod stack_map;
+pub mod verified_code;
 
 pub use attribute::{decode_attribute, force_decode_all, LazyAttribute};
 pub use byte_view::ByteView;
@@ -53,3 +54,4 @@ pub use class_reader::{read_class, read_class_arc};
 pub use class_reader_error::ClassReaderError;
 pub use constant_pool::ConstantPool;
 pub use jimage::{JImageError, JImageReader};
+pub use verified_code::{verified_code, VerifiedCode, VerifiedInstruction};

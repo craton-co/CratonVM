@@ -37,12 +37,12 @@ required.
 
 ## Layout stability
 
-Objects select immutable metadata by `(class_id, field_count)`. Append-only
+Objects select metadata by `(class_id, field_count)`. Append-only
 synthetic-class upgrades publish a new layout version without changing the
-size or oop-map of already allocated objects. Re-registering a different
-layout with the same class id and field count is rejected because the header
-cannot distinguish those two layouts; legal method-only redefinition retains
-an identical field layout.
+size or oop-map of already allocated objects. Legal JVM redefinition cannot
+change the field schema while retaining the same field count; a same-key
+registration therefore refreshes the entry for independent class-manager
+lifetimes that reuse numeric class IDs.
 
 Layout metadata remains live at least as long as instances can be live.
 Class-loader unloading is responsible for reclaiming versions only after the

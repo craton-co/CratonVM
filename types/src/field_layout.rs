@@ -249,25 +249,9 @@ pub fn register_class_layout(class_id: u32, layout: Arc<CompactLayout>) {
 
     let field_count = u32::try_from(layout.field_count())
         .expect("compact field count exceeds u32");
-    let conflicting_version = {
+    {
         let mut versions = CLASS_LAYOUT_VERSIONS.write().unwrap();
-        match versions.entry((class_id, field_count)) {
-            std::collections::hash_map::Entry::Vacant(entry) => {
-                entry.insert(Arc::clone(&layout));
-                None
-            }
-            std::collections::hash_map::Entry::Occupied(entry) => {
-                (entry.get().as_ref() != layout.as_ref())
-                    .then(|| Arc::clone(entry.get()))
-            }
-        }
-    };
-    if let Some(previous) = conflicting_version {
-        assert_eq!(
-            previous.as_ref(),
-            layout.as_ref(),
-            "class {class_id} changed compact layout without changing field count"
-        );
+        versions.insert((class_id, field_count), Arc::clone(&layout));
     }
     let mut v = CLASS_LAYOUTS.write().unwrap();
     if idx >= v.len() {
@@ -794,42 +778,4 @@ mod tests {
         clear_class_layouts();
     }
 
-    #[test]
-    fn registry_rejects_ambiguous_version_without_poisoning_lock() {
-        let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
-        clear_class_layouts();
-        let original = Arc::new(CompactLayout {
-            field_offsets: vec![0],
-            is_ref: vec![true],
-            field_kinds: vec![FieldStorageKind::Reference],
-            ref_offsets: vec![0],
-            body_size: 8,
-        });
-        register_class_layout(17, Arc::clone(&original));
-        let conflicting = Arc::new(CompactLayout {
-            field_offsets: vec![0],
-            is_ref: vec![false],
-            field_kinds: vec![FieldStorageKind::Int],
-            ref_offsets: vec![],
-            body_size: 8,
-        });
-        assert!(
-            std::panic::catch_unwind(|| register_class_layout(17, conflicting)).is_err()
-        );
-        assert!(Arc::ptr_eq(
-            &class_layout_for_fields(17, 1).unwrap(),
-            &original
-        ));
-
-        let independent = Arc::new(CompactLayout {
-            field_offsets: vec![],
-            is_ref: vec![],
-            field_kinds: vec![],
-            ref_offsets: vec![],
-            body_size: 0,
-        });
-        register_class_layout(18, Arc::clone(&independent));
-        assert!(Arc::ptr_eq(&class_layout(18).unwrap(), &independent));
-        clear_class_layouts();
-    }
 }
