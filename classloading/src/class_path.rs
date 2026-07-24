@@ -1482,6 +1482,18 @@ impl ClassPath {
         Self::load_jar_data_at_depth(path, data, entries, 0);
     }
 
+    /// Compatibility wrapper for legacy callers that still supply a manifest
+    /// expansion set. `load_jar_data_at_depth` now owns recursive manifest
+    /// processing and its depth guard, so the set is no longer needed here.
+    fn load_jar_data_with_manifest_class_path(
+        path: &Path,
+        data: Vec<u8>,
+        entries: &mut Vec<ClassPathEntry>,
+        _expanded_manifest_jars: &mut FxHashSet<PathBuf>,
+    ) {
+        Self::load_jar_data_at_depth(path, data, entries, 0);
+    }
+
     /// Manifest `Class-Path:` expansion recursion cap — guards against a
     /// cyclic chain (jar A's Class-Path names jar B, whose Class-Path names
     /// A again) recursing forever. Real classpaths are never nested this
@@ -1510,6 +1522,7 @@ impl ClassPath {
             Ok(mut archive) => {
                 // Check for MANIFEST.MF to detect Spring Boot fat JAR
                 let manifest = Self::read_manifest(&mut archive);
+                let manifest_class_path = manifest.resolve_class_path(path);
                 let is_fat_jar =
                     manifest.is_spring_boot() || Self::probe_fat_jar_structure(&mut archive);
 
@@ -1570,9 +1583,81 @@ impl ClassPath {
                         }
                     }
                 }
+
             }
             Err(e) => {
                 debug!("Failed to open JAR {}: {e}", path.display());
+            }
+        }
+    }
+
+    /// Add one classpath token, including wildcard expansion and any manifest
+    /// dependencies discovered while opening archives.
+    fn add_classpath_entry(
+        raw: &str,
+        entries: &mut Vec<ClassPathEntry>,
+        expanded_manifest_jars: &mut FxHashSet<PathBuf>,
+    ) {
+        for p in Self::expand_classpath_wildcard(raw) {
+            // A URLClassLoader rooted at an archive subdirectory hands us
+            // `<archive>!/<prefix>/`. Handle it before interpreting the token
+            // as a filesystem path so `.war`/`.ear` archives retain their
+            // internal root for both class and resource lookup.
+            if let Some((archive, prefix)) = parse_jar_subdir_spec(&p) {
+                let path = PathBuf::from(archive);
+                if path.exists() {
+                    match read_file_for_classpath(&path) {
+                        Ok(data) => {
+                            if let Some(entry) =
+                                Self::build_nested_directory_from_jar(&path, data, &prefix)
+                            {
+                                entries.push(entry);
+                            }
+                        }
+                        Err(e) => {
+                            debug!(
+                                "Failed to read nested classpath archive {}: {e}",
+                                path.display()
+                            );
+                        }
+                    }
+                } else {
+                    debug!(
+                        "Skipping missing nested classpath archive: {}",
+                        path.display()
+                    );
+                }
+                continue;
+            }
+
+            let path = PathBuf::from(&p);
+            if path.is_dir() {
+                entries.push(ClassPathEntry::Directory(path));
+            } else if path.extension().is_some_and(|ext| ext == "jmod") && path.exists() {
+                match Self::load_jmod(&path) {
+                    Ok(entry) => entries.push(entry),
+                    Err(e) => debug!("Failed to read JMOD {}: {e}", path.display()),
+                }
+            } else if Self::is_likely_jimage(&path) {
+                match Self::load_jimage(&path) {
+                    Ok(entry) => entries.push(entry),
+                    Err(e) => debug!("Failed to read jimage {}: {e}", path.display()),
+                }
+            } else if path.is_file() {
+                // URLClassLoader accepts every file URL as an archive
+                // candidate. `load_jar_data_with_manifest_class_path` fails
+                // closed for ordinary non-archive files.
+                match read_file_for_classpath(&path) {
+                    Ok(data) => Self::load_jar_data_with_manifest_class_path(
+                        &path,
+                        data,
+                        entries,
+                        expanded_manifest_jars,
+                    ),
+                    Err(e) => debug!("Failed to read classpath archive {}: {e}", path.display()),
+                }
+            } else {
+                debug!("Skipping non-existent classpath entry: {p}");
             }
         }
     }
@@ -4133,6 +4218,72 @@ mod tests {
         assert_eq!(
             cp.find_resource("test.txt"),
             Some(b"test resource".to_vec())
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn classpath_new_expands_manifest_class_path() {
+        let dir = std::env::temp_dir().join("cratonvm_manifest_class_path");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let dependency = dir.join("dependency.jar");
+        let launcher = dir.join("launcher.jar");
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+
+        {
+            let file = fs::File::create(&dependency).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            zip.start_file("META-INF/services/example.Service", options)
+                .unwrap();
+            zip.write_all(b"example.ServiceImpl\n").unwrap();
+            zip.finish().unwrap();
+        }
+        {
+            let file = fs::File::create(&launcher).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            zip.start_file("META-INF/MANIFEST.MF", options).unwrap();
+            zip.write_all(b"Manifest-Version: 1.0\r\nClass-Path: dependency.jar\r\n\r\n")
+                .unwrap();
+            zip.finish().unwrap();
+        }
+
+        let cp = ClassPath::new(&[launcher.to_string_lossy().into_owned()]);
+        assert_eq!(cp.entry_count(), 2, "manifest dependency must be added");
+        assert_eq!(
+            cp.find_resource("META-INF/services/example.Service"),
+            Some(b"example.ServiceImpl\n".to_vec())
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn manifest_class_path_cycle_is_not_reloaded() {
+        let dir = std::env::temp_dir().join("cratonvm_manifest_class_path_cycle");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let first = dir.join("first.jar");
+        let second = dir.join("second.jar");
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+
+        for (path, dependency) in [(&first, "second.jar"), (&second, "first.jar")] {
+            let file = fs::File::create(path).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            zip.start_file("META-INF/MANIFEST.MF", options).unwrap();
+            zip.write_all(
+                format!("Manifest-Version: 1.0\r\nClass-Path: {dependency}\r\n\r\n").as_bytes(),
+            )
+            .unwrap();
+            zip.finish().unwrap();
+        }
+
+        let cp = ClassPath::new(&[first.to_string_lossy().into_owned()]);
+        assert_eq!(
+            cp.entry_count(),
+            2,
+            "manifest cycle must terminate without duplicates"
         );
         let _ = fs::remove_dir_all(&dir);
     }

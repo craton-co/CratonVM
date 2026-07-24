@@ -29,105 +29,116 @@ Reproduced deterministically (10/10 runs) with the suite harness
 the official 2026-07-23 429-class rerun and via repeated targeted
 single-class reruns in a fresh worktree (`fix/springboot-devtools-fullfix-20260723`).
 
-## Root cause (confirmed via targeted native tracing)
+## Root cause (confirmed via bytecode analysis + targeted native tracing, updated 2026-07-24)
 
 `ModifiedClassPathExtension` (Spring Boot's JUnit5 `@ClassPathExclusions`
 fork mechanism) does **not** intercept constructor invocation — only
 `@Test`/`@BeforeEach`/etc. method invocation. Test **class instantiation**
 (`ClassBasedTestDescriptor.instantiateAndPostProcessTestInstance` /
 `NestedClassTestDescriptor.instantiateTestClass`) happens as part of a
-separate JUnit lifecycle phase, and — confirmed via CratonVM-side tracing
-added temporarily during this investigation (`CRATONVM_DBG_UCLDEFINE`,
-`CRATONVM_DBG_COERCE`, and Java-side thread/classloader prints in
-`ModifiedClassPathExtension`/`ModifiedClassPathClassLoader`, all since
-reverted) —  two *separate* `Class` definitions of
-`DevToolsR2dbcAutoConfigurationTests` exist within one JVM process:
+separate JUnit lifecycle phase.
 
-1. An early, pre-fork definition, resolved via the outer harness's own
-   initial (non-isolated) `SbRunner.main` → `Class.forName(fqcn, false,
-   appClassLoader)` → `outerClass.getDeclaredClasses()` walk that discovers
-   `Embedded`/`Pooled`/`Common` as part of building the full JUnit
-   `TestDescriptor` tree *before any test method runs, before any fork ever
-   happens*. This copy is **not** registered under any CratonVM
-   loader-namespace id (`class_manager`'s `get_loader_id` returns `None` for
-   it — confirmed via a temporary trace on `loader_namespace_id`/
-   `register_defining_loader`/`ucl_try_define_local_class`).
-2. A second, freshly-isolated definition, resolved through
-   `ModifiedClassPathClassLoader` (confirmed via `classloader_real.rs`'s
-   `loadClass`-native gate firing with `isolated=true`, correctly minting a
-   real `UserDefined` loader-namespace id) — this is the copy the *actual*
-   outer test instance JUnit constructs at execution time is made from.
+**2026-07-24 correction to the original framing below:** decompiling
+`junit-jupiter-engine`'s `ClassSelectorResolver` (via `javap`) confirmed
+JUnit's own resolution bytecode is correct — `resolveStandaloneClassUniqueId`
+calls `ReflectionSupport.tryToLoadClass(name)` (no explicit loader), which
+`ClassLoaderUtils.getDefaultClassLoader()` resolves to
+`Thread.currentThread().getContextClassLoader()` (verified: no hidden
+static Class-by-name cache exists in `junit-platform-commons`'
+`ReflectionUtils` — only a small primitive-name table, unrelated).
+`resolveNestedClassUniqueId` then finds the nested class via
+`ReflectionSupport.findNestedClasses(parentTestClass, predicate)` — i.e.
+`parentTestClass.getDeclaredClasses()` — on whatever `Class` the parent
+segment resolved to. So architecturally the nested class SHOULD end up
+under the same loader as its freshly-resolved parent.
 
-`Embedded`'s constructor (`near` in CratonVM's `coerce_arg_strict`) is
-**declaration (1)** — JUnit reuses the pre-fork `Class<Embedded>` reference
-for the constructor/declaring-class lookup — while the outer instance JUnit
-actually passes as the constructor argument is **declaration (2)**. Both are
-the textually-identical source class, but CratonVM tracks them as two
-distinct `ClassId`s, so `is_subclass(arg_cid, expected_cid)` correctly (per
-its own contract) rejects them as unrelated, throwing
-`IllegalArgumentException: argument type mismatch`.
+Fresh tracing (`CRATONVM_DBG_COERCE` + a temporary trace added to
+`native_class_get_declared_classes`, since removed) showed:
 
-The `class_id_by_name_near`/`loader_namespace_id`/`defining_loader_for`
-machinery already in the codebase (used successfully for the analogous
-`Class.getDeclaringClass()`/`getEnclosingClass()` case, see
-`declaring_class_loader_aware` in `native-builtins/src/lang_class.rs`) does
-**not** help here because it depends on `near` (`Embedded`) itself having a
-registered loader namespace — but `near`, being definition (1), has none.
+- `near` (`Embedded`'s declaring class used for the constructor
+  invocation) and `expected` (the constructor's outer-instance parameter
+  type) are **both genuinely, correctly registered under
+  `ClassLoaderId::Application`** — this is a real `class_manager` record
+  (`cm.get_loader_id()` returns `Some(Application)`, not `None`
+  defaulting to a display value of `2`, as originally suspected). In other
+  words, `near`/`expected` are **not** an untracked/stale artifact; they
+  are the ordinary, singular Application-loader copy of
+  `Outer`/`Embedded` that both the ORIGINAL SbRunner-level discovery and
+  (per this correction) JUnit's own `@Nested`-resolution genuinely land
+  on.
+- The **only** mismatched side is `arg` — the actual outer *test instance
+  object* JUnit constructs at execution time — which is a freshly
+  isolated (`ModifiedClassPathClassLoader`, real `UserDefined` namespace
+  id) instance.
+- A fix was added (`native-builtins/src/classloader.rs`'s new
+  `loader_object_for_namespace_id` reverse lookup, wired into
+  `native-builtins/src/lang_class.rs`'s `native_class_get_declared_classes`
+  loader-driving fallback) that correctly and verifiably drives a fresh,
+  properly-isolated `Embedded` definition when `getDeclaredClasses()` is
+  called on the freshly-isolated outer `Class` — confirmed via tracing
+  that this call **does** happen (5×, once per test method) and **does**
+  produce a new, correctly-`UserDefined`-tracked `Embedded`. But that
+  freshly-created `Embedded` is **not** what ends up as `near` for the
+  constructor invocation JUnit actually performs — `near` stays the
+  Application-loader copy across all 5 methods, unaffected by the fix.
 
-## Why this is hard to fix safely
+This means the mismatch is **not** (as originally framed) "CratonVM
+resolves the same class two different ways due to a loader-registration
+gap it can fix locally" — it's that **JUnit5 itself, for constructing the
+actual `@Nested` outer test instance, uses a different `Class` reference
+than the one its own discovery-phase `getDeclaredClasses()` walk
+produces** (or than CratonVM's `getDeclaredClasses()` is asked to
+produce). Where exactly that second, isolated resolution comes from
+inside JUnit5's execution phase (as opposed to its discovery phase) was
+not pinned down this session — plausible candidates: `TestInstancesProvider`
+independently re-resolving the outer class at instantiation time via
+some other path, or `ModifiedClassPathClassLoader`'s own
+`super.loadClass()` delegation chain behaving differently for the
+already-loaded-by-app-loader case than assumed. Needs either a Java
+debugger attach or JUL `FINE`-level tracing on `org.junit.platform`
+(neither available on this session's box) to pin down precisely.
 
-This session tried two fix strategies, both unsuccessful or unsafe:
+## Fix attempts this session (2026-07-23 → 2026-07-24)
 
-1. **Eagerly preload the outer class through the isolated loader** when
-   defining a non-static `@Nested` inner class (mirroring the existing
-   super/interface preload, `preload_isolated_loader_supertypes` in
-   `native-builtins/src/lang_system.rs`), so `class_id_by_name_near` would
-   find a same-loader match. This correctly registers a fresh, isolated
-   outer-class copy (confirmed loader-namespace id assigned) — but
-   `class_id_by_name_near`'s lookup is keyed on `near`'s (still
-   unregistered) namespace, so `expected_cid` still resolved to definition
-   (1) via the global fallback. No effect on the failure. (Reverted —
-   harmless but useless without also fixing `near`'s own registration,
-   which is the deeper problem below.)
+1. **Eagerly preload the outer class through the isolated loader** at
+   `@Nested` class-definition time (mirroring the existing super/interface
+   preload, `preload_isolated_loader_supertypes` in
+   `native-builtins/src/lang_system.rs`). No effect — reverted (superseded
+   by the understanding above: `near` was never going to be the isolated
+   copy regardless).
 
-2. **Relax the argument-assignability check** for exactly this shape
-   (constructor's first parameter is the compiler-synthesized `this$0` outer
-   reference, detected via the class's own `InnerClasses` self-entry,
-   non-static) to accept a same-named class regardless of which of the two
-   loader-tracked copies defined it. This *did* make
-   `ReflectionUtils.newInstance` succeed — but then caused a
-   `java.lang.StackOverflowError` deep inside JUnit's own
-   `CompositeTestExecutionListener` failure-reporting path, which itself
-   recurses trying to log the overflow, producing an unbounded retry loop
-   (observed hang at 900s). Most likely explanation: accepting the
-   mismatched-loader outer instance lets construction proceed, but `static`
-   state on `Common`/`Embedded` (e.g. the `shutdowns` list) is **not**
-   shared between the two loader-tracked copies (JVMS: statics are per
-   defining-class, and these are two distinct `ClassId`s) — so the test
-   body's interaction with that divergent static state likely triggers the
-   overflow. **Reverted** — a clean, understood test failure is much safer
-   than a hang that could mask other results in a shared suite run.
+2. **Relax the argument-assignability check** to accept a same-named class
+   across the two loader-tracked copies for exactly the outer-instance
+   parameter shape. Made `ReflectionUtils.newInstance` succeed but caused
+   a `java.lang.StackOverflowError` cascade elsewhere (divergent `static`
+   state between the two copies — JVMS: statics are per-`ClassId`).
+   **Reverted** — a clean, understood test failure beats a hang that could
+   mask other results in a shared suite run.
 
-## Suggested next steps (not attempted this session)
+3. **Add a genuine reverse loader-namespace lookup** (`loader_object_for_namespace_id`
+   in `native-builtins/src/classloader.rs`) and wire it into
+   `Class.getDeclaredClasses()`'s existing (but previously unreliable,
+   since it depended on the narrowly-populated `defining_loader_for` side
+   table) loader-driving fallback in `native-builtins/src/lang_class.rs`.
+   This is a **genuine, verified-safe architectural fix** — confirmed via
+   a full 51-class module regression to introduce zero regressions among
+   the 47 previously-passing classes — and is worth keeping even though it
+   does not, on its own, close this specific bug (see above: the gap is
+   deeper than `getDeclaredClasses()`'s own loader fidelity). **Kept and
+   merged.**
 
-- The real fix is almost certainly on the JUnit-resolution side: prevent
-  `NestedClassTestDescriptor`'s constructor-invocation path from reusing the
-  pre-fork `Class<Embedded>` reference at all, so **both** the declaring
-  class and the outer instance are resolved through the *same* (isolated,
-  post-fork) definition. This may require either (a) making CratonVM's
-  `outerClass.getDeclaredClasses()` implementation re-resolve nested members
-  through the *current* thread context classloader rather than returning a
-  cached/first-loaded set, or (b) confirming whether this is inherent to
-  how `ModifiedClassPathExtension`'s `runTest()` nested `Launcher` discovers
-  a `[nested-class:X]` `UniqueId` segment (worth attaching a Java debugger
-  or adding JUL `FINE`-level tracing to `org.junit.platform` to see exactly
-  which `Class` object `NestedClassSelectorResolver` hands to the
-  `TestInstanceFactory`).
-- Whichever fix is chosen, it needs a way to verify it doesn't just move
-  the loader mismatch into the `Common`-declared static field access itself
-  (i.e. don't declare victory on `ReflectionUtils.newInstance` succeeding
-  alone — run the full 5-test class and confirm assertions against
-  `shutdowns` also pass, not just that construction doesn't throw).
+## Suggested next steps
+
+- Attach a Java debugger (not available on this session's box) or add
+  `-Djava.util.logging` `FINE`-level tracing to `org.junit.platform`
+  packages to find exactly which code path constructs the isolated outer
+  test instance at *execution* time, and why it doesn't reuse the same
+  `Class` reference `getDeclaredClasses()`/discovery-phase resolution
+  settled on.
+- Whichever fix is chosen, verify it doesn't just move the loader mismatch
+  into `Common`-declared static field access (e.g. `shutdowns`) — run the
+  full 5-test class and confirm assertions pass, not just that
+  construction doesn't throw.
 
 ## Reproduce
 

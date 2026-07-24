@@ -55,15 +55,17 @@ entirely. Now fixed; `TestTomcat` is 26/26 PASS. The
 `TestNonstandardTagPerformance` class was a fixture-data typo (missing "er"
 in `.suite/all-tests.txt`) with no code fix needed.
 
+**New untriaged item (2026-07-24):** `org.apache.catalina.nonblocking.TestNonBlockingAPI`
+fails on *both* CratonVM and HotSpot in this fixture for a reason that has
+never been pinned down — surfaced while root-causing this class's separate,
+CratonVM-only `value_stack.rs` panic (see below), which is now fixed and
+unrelated to this failure. Needs a future session to run this class against
+both VMs, diff the actual failing assertion/exception, and categorize it.
+
 ## Fixed and moved to `docs/internal/`
 
 | Doc | Classes | Outcome |
 |---|---:|---|
 | [hang-classification-unconfirmed-host-contention-FIXED.md](../../internal/fixed-suite-bugs/tomcat/hang-classification-unconfirmed-host-contention-FIXED.md) | 9 | ✅ HANG was a pure host-contention artifact (HotSpot passes all 9 cleanly); once ruled out, all 9 were genuine CratonVM regressions from 2 root causes (ecj/Hashtable JSP-compile NPE affecting 8; SSLContext-resolution-through-wrapped-factory affecting `TestCustomSsl`), both fixed and verified — 9/9 PASS on CratonVM on a quiet host |
 | [20-fixture-completion-regressions-closure-FIXED.md](../../internal/fixed-suite-bugs/tomcat/20-fixture-completion-regressions-closure-FIXED.md) | 9 | ✅ 7/9 fixed (X509Certificate toString, symlink+canonicalize, G1 for `*LargeHeap`, catchable-OOME Cipher fixes, 2 TestSsl bugs); 2 residual confirmed = pre-existing throughput ceiling, not new bugs |
-
-## Real CratonVM bug (not a fixture gap — despite living in the same 35-class "both VMs fail" bucket)
-
-| Doc | Classes |
-|---|---:|
-| [value-stack-usize-underflow-nio-worker-panic.md](value-stack-usize-underflow-nio-worker-panic.md) | 2 (confirmed in a 3rd bucket too — see doc) |
+| [value-stack-usize-underflow-nio-worker-panic-FIXED.md](../../internal/fixed-suite-bugs/tomcat/value-stack-usize-underflow-nio-worker-panic-FIXED.md) | 2 | ✅ Fixed — `usize` underflow panic on a background NIO worker thread (`TestNonBlockingAPI` / `TestWebSocketFrameClientSSL`, both hitting `LinkedBlockingQueue.take()`'s `Condition.await()` interface dispatch) root-caused to a missing pre-pop deopt-frame snapshot in `jit/src/x64.rs`'s generic invoke-dispatch codegen; verified panic-free across 35 repro attempts |

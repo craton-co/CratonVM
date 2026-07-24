@@ -3856,7 +3856,16 @@ fn m4_abstract_bean_factory_do_resolve_bean_class(
 /// method, so this wrapping has to happen here instead of in a real catch
 /// block — same rationale as `throw_cannot_load_bean_class_exception` right
 /// above it.
-fn wrap_as_bean_definition_store_exception(
+///
+/// `pub(crate)`: also reused by `cglib_enhancer::cce_enhance` to wrap the
+/// "No visible constructors" `IllegalArgumentException` it synthesizes for
+/// `@Configuration` classes with no non-private constructor — real CGLIB's
+/// `Enhancer.filterConstructors` throws that exception raw (not wrapped, per
+/// `AbstractClassGenerator`'s RuntimeException-passthrough catch), so the
+/// wrapping into `BeanDefinitionStoreException`
+/// (`SpringApplicationTests.sourcesMustBeAccessible`'s expected type) has to
+/// happen at our synthesis site too, same rationale as here.
+pub(crate) fn wrap_as_bean_definition_store_exception(
     ctx: &mut dyn NativeContext,
     resource_description: Option<&str>,
     bean_name: &str,

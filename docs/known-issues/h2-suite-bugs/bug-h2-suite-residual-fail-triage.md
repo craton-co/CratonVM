@@ -1,4 +1,4 @@
-# H2 suite — residual FAIL triage (2026-07-21): reproduced, narrowed, mostly closed after nine follow-up sessions
+# H2 suite — residual FAIL triage (2026-07-21): reproduced, narrowed, mostly closed after ten follow-up sessions
 
 ## Status
 **MOSTLY CLOSED after nine follow-up sessions.** The ninth pass FIXED the
@@ -2433,4 +2433,308 @@ receiver's own class", "force native Hashtable/HashMap put/get/size on
 ALL dispatch paths") -- both `GROUP BY` grouping and subquery
 result-caching plausibly use `HashMap`-like structures internally, so a
 regression there is at least plausible, though not verified.
+
+
+## Follow-up session (tenth pass, 2026-07-24): the composite-PK
+## partial-WHERE null-column bug FIXED; `TestUpgrade`'s SQL-parsing NPE
+## reopened by that fix through an unexplained interaction, still OPEN
+
+Worktree `/data/wt-h2-nullvalue-rowlookup-20260724` on the Azure host,
+branch `fix/h2-nullvalue-rowlookup-20260724`, branched from `origin/dev`
+(which already had all nine prior passes' fixes). Picked up via the
+`task_2168068f` follow-up spawned at the end of the ninth pass (originally
+framed as "TestLinkedTable/TestPreparedStatement fail with a null Value
+in a JDBC row, suspect recent Hashtable/HashMap dispatch commits").
+
+### Root cause and fix: NOT a Hashtable/HashMap issue
+
+The leading suspect from the ninth pass (recent `Hashtable`/`HashMap`
+map-dispatch commits) was a red herring. Root-caused instead to
+`native-builtins/src/apps_h2.rs`'s fast-path native override for
+`ExpressionColumn.getValue` — see
+`docs/internal/fixed-suite-bugs/h2-suite-bugs/composite-pk-partial-where-null-column-FIXED.md`
+for the full writeup and minimal, H2-Upgrade-independent repro (also
+recorded as its own `docs/known-issues/` doc during the ninth pass, now
+moved to `internal/` since it's fixed). Short version: the fast path read
+`TableFilter.currentSearchRow` directly and returned whatever it got with
+no null check; for a cursor driven by a SECONDARY index over a PREFIX of
+a composite key (an index range scan), `currentSearchRow` is the index's
+own partial key row, and reading a non-indexed column off it returns raw
+`null` instead of triggering the real `TableFilter.getValue(Column)`
+bytecode's correct lazy full-row fetch. Fixed by falling through to that
+real (slower, correct) virtual dispatch whenever the fast-path read comes
+back null.
+
+Verified: the minimal repro, `TestLinkedTable`, and `TestPreparedStatement`
+all pass now. Regression-clean on `TestAlter`, `TestShell`,
+`TestResultSet`, `TestUpdatableResultSet`. `TestView`'s pre-existing,
+unrelated `testInnerSelectWithRownum` failure confirmed present
+identically on pristine pre-fix `dev` (not caused by this fix). Fix commit
+`a88d06a5a`, pushed to `origin/dev` (`37367454c`) from the worktree
+directly (same rationale as the ninth pass: avoid the shared main
+checkout's concurrent dirty state).
+
+### New residual: this fix reopens `TestUpgrade`'s SQL-parsing NPE,
+### mechanism NOT understood despite investigation — OPEN
+
+After landing the fix above, `org.h2.test.unit.TestUpgrade` regressed
+back to the EXACT SQL-parsing `NullPointerException`
+(`ParserBase.getSyntaxError`, `this.token` is null) that the ninth pass's
+Parser loader-collapse fix had closed. Confirmed this is a genuine,
+deterministic (2/2 runs) effect of the `ExpressionColumn.getValue` fix
+specifically:
+- A binary built from the SAME worktree/commit WITHOUT the
+  `ExpressionColumn.getValue` change (i.e. with only the ninth pass's
+  Parser fix) correctly shows `TestUpgrade` progressing past the
+  SQL-parsing NPE into the already-known LOB-migration residual.
+- The SAME binary WITH the `ExpressionColumn.getValue` fix regresses back
+  to the SQL-parsing NPE, deterministically.
+
+**Ruled out**: this is NOT a GC-safety bug in the new fix itself. The
+initial fix version read `resolver`/`column` again after a re-entrant
+`invoke_virtual` probe call without pinning them (a real, separate bug,
+matching this doc's own established "GC-forwarding gap" bug family) —
+but adding the missing pinning (mirroring the pattern used throughout
+this file, e.g. the ninth pass's own `h2_session_prepare_local_no_cache`
+fix) did NOT change the outcome; `TestUpgrade` still regresses identically
+either way. The GC-safety fix was kept anyway (independently correct) but
+is confirmed NOT the mechanism connecting the two.
+
+**Confirmed NOT a `NoSuchMethodError` regression** — grepped the full
+failure output, zero occurrences; only the `ParserBase.getSyntaxError`
+NPE reappears, meaning the eighth-pass `updateRootPage` fix and the
+ninth-pass `h2_session_prepare_local_no_cache` fix both remain intact and
+unaffected.
+
+Traced with `CRATONVM_DBG_TABLEFILTER=1` (a new, ad-hoc env-gated trace
+added to `h2_expression_column_get_value` for this investigation, since
+reverted/not committed) that only 6 `ExpressionColumn.getValue` calls
+during the whole `TestUpgrade` run ever take the new fallthrough branch
+before the failure — all with `column_id` 2 or 3 against a
+`row_class=org/h2/result/Sparse` (H2's own partial-row representation),
+consistent with some INFORMATION_SCHEMA-shaped internal query executed
+very early in test setup. Did not manage to pin down, within this
+session's time budget, HOW triggering the real `TableFilter.getValue`
+bytecode path (and its `cursor.get()` full-row fetch) for those 6 calls
+propagates into a completely different subsystem (SQL parsing of the OLD
+driver's own `CREATE TABLE` statement) minutes/statements later.
+
+**Working hypotheses for whoever picks this up next, none yet tested**:
+1. The newly-exercised `cursor.get()` full-row fetch (now reached for the
+   first time for these 6 calls, since the old buggy fast path never
+   called it) triggers loading of `org/h2/command/Parser` or a related
+   class for the FIRST time in the process, in a context/order that
+   exposes a DIFFERENT, not-yet-found loader-collapse-shaped bug distinct
+   from the two already fixed (eighth and ninth passes) — i.e. a THIRD
+   vulnerable call site, not yet identified. `CRATONVM_DBG_LOADER_TRACE=1`
+   combined with the `CRATONVM_DBG_TABLEFILTER` trace mentioned above
+   (both env-gated, straightforward to re-add) would be the natural way
+   to correlate the two.
+2. `TableFilter.getValue(Column)`'s own bytecode, when exercised via
+   genuine interpretation for the very first time in a `TestUpgrade` run
+   (previously always shortcut by the buggy native), hits an UNRELATED,
+   pre-existing interpreter dispatch bug of its own — i.e. the
+   `ExpressionColumn.getValue` fix is innocent of the actual mechanism,
+   merely the first thing to newly exercise a different latent bug.
+   Distinguishing this from hypothesis 1 would need tracing what,
+   specifically, changes in `TestUpgrade`'s early execution between the
+   two binaries (e.g. a full bytecode-level diff of the first ~10k
+   interpreted instructions of each run, or watchpoint-style tracing on
+   `org/h2/command/Parser`'s class-identity as done for the RootReference
+   investigation in the seventh/eighth passes).
+3. Not yet ruled out: simple execution-count/timing sensitivity (the
+   `Sentence.MAX_PROCESSING_TIME`-style budget-exhaustion family
+   documented earlier in this doc for `TestBnf`/`TestFileLock` /
+   `TestTransaction`) — though this seems less likely given the failure
+   is a hard NPE with a specific, reproducible stack trace rather than a
+   soft assertion failure, and reproduces at 2/2 so far, not flaky.
+
+**Decision**: shipped the `ExpressionColumn.getValue` fix anyway despite
+this open interaction, since it corrects a severe, general
+data-correctness bug (silently wrong result values for an extremely
+common "filter by a prefix of a composite key" SQL pattern, well beyond
+just `TestUpgrade`) — see the fix's own doc for the full trade-off
+reasoning. `TestUpgrade` was already not a clean pass on `dev` (the
+LOB-migration residual from the ninth pass remains open regardless), so
+this does not represent a NEW regression from a previously-clean state,
+just a different failure point within an already-failing test class.
 pass.
+
+## Follow-up session (eleventh pass, 2026-07-24): the `TestUpgrade` NPE reopened
+## by the composite-PK fix — class-loading exonerated, new evidence points at
+## cross-loader/cross-session dispatch or stack-trace corruption, root cause
+## STILL NOT PINNED — OPEN
+
+Worktree `/data/data/wt/wt-testupgrade-npe-20260724` on the Azure host, branch
+`fix/h2-testupgrade-npe-20260724`, branched from `origin/dev` (`648351e6c`,
+already includes the tenth pass's `a88d06a5a` fix). Picked up the residual
+this doc's tenth-pass section left open.
+
+### Reproduction reconfirmed, and now also under `--nojit`
+
+Deterministic (2/2 runs), identical NPE (`ParserBase.getSyntaxError`,
+`this.token` is null, parsing the OLD (1.4.200) driver's own `CREATE TABLE`
+statement inside `testUpgrade(1,4,200)`). **New this pass: reproduces
+identically under `--nojit`**, ruling out JIT/JIT-cache involvement entirely
+(the tenth pass hadn't checked this).
+
+```bash
+cd apps/h2database/h2
+<cratonvm-bin> --java-home /home/victor/jdk25 --nojit \
+  -c "target/classes:target/test-classes:$(cat craton-testcp.txt)" \
+  org.h2.test.unit.TestUpgrade
+```
+
+### Hypothesis 1 from the tenth pass (a third Parser loader-collapse site) —
+### REFUTED with direct evidence
+
+Added `CRATONVM_DBG_H2TRACE`-gated tracing to `Instruction::New`'s class
+resolution (`vm/src/runtime/interpreter.rs`) for `org/h2/command/Parser`,
+`ParserBase`, and `Token`. Across a full `TestUpgrade` run, bytecode `new
+Parser(session)` fires exactly 3 times before the crash — once per
+`UserDefined` loader instantiated so far (`UserDefined(3)` =
+`testUpgrade(1,2,120)`'s own `loadH2`, `UserDefined(4)` =
+`Upgrade.upgrade()`'s own internal `loadH2(120)` call for `SCRIPT TO`,
+`UserDefined(5)` = `testUpgrade(1,4,200)`'s own `loadH2`, the one that then
+crashes) — and in **every** case `target_loader` exactly matches
+`referencing_loader`. `resolve_class_loader_aware` resolves the old driver's
+own `Parser` class correctly every time; class-loading is not the mechanism.
+
+### A related but distinct discovery: the ninth pass's own loader-aware
+### `h2_session_prepare_local_no_cache` fix never actually intercepts the old
+### driver's sessions at all
+
+`h2_session_prepare_local_no_cache` (`native-builtins/src/apps_h2.rs`) is
+registered against `H2_SESSION_LOCAL` (`"org/h2/engine/SessionLocal"`) — the
+class name H2 renamed `Session` to in a later version. Every old-driver
+download this test exercises (1.2.120, 1.4.200) predates that rename and
+still literally declares `org/h2/engine/Session`, a different string, so
+CratonVM's (name-keyed) native registry never matches it: added an
+unconditional trace print at the very top of this native's body, and it
+never fires for any `UserDefined`-loader session across the whole run — only
+for the "normal" Application-loaded `SessionLocal` (RUNSCRIPT, LOB SELECTs,
+etc.). This means the ninth pass's `loader_id_of_class(session_class_id) >=
+3` branch — the actual fix that pass shipped — is **dead code with respect
+to `TestUpgrade`'s own old-driver sessions**; real, un-intercepted H2
+bytecode always handled (and, per the `Instruction::New` trace above, always
+correctly resolved) their `Session.prepareLocal`/`new Parser(...)` calls, on
+`dev` both before and after this session. Worth a note for whoever revisits
+the ninth-pass fix's own doc — its explanation of *why* that fix unblocked
+`TestUpgrade` at the time may need revisiting (something else in that same
+pass, or a concurrent merge, more likely gets the credit); it does not
+change this pass's own conclusions about the current bug.
+
+### Rock-solid new finding: the crash's own stack trace names classes that do
+### not exist in the actual old-driver jar
+
+Extracted the real, cached `h2-1.4.200.jar`
+(`/home/victor/.m2/repository/com/h2database/h2/1.4.200/h2-1.4.200.jar` on
+the Azure host — same bytes `Upgrade.loadH2`'s `ClassLoader` `defineClass`s
+from) and listed `org/h2/command/*`: it contains `Parser.class` and three
+inner classes, **and nothing else** — no `ParserBase.class`, no
+`Token.class`. `javap -c` on `Parser.class` confirms its own private
+`getSyntaxError()` (bytecode present, standalone) calls
+`DbException.getSyntaxError(String, int)` directly with a raw character
+offset — **no `Token` object, no `.start()` call, anywhere in the class**.
+(`ParserBase`/`Token` are a later H2 refactor, present only in the
+Application-loaded, current-source-tree H2 build this repo carries under
+`apps/h2database/h2/src/main`.)
+
+Yet the crash's exception explicitly names
+`org.h2.command.ParserBase.getSyntaxError(ParserBase.java:760)` and
+`Cannot invoke "org.h2.command.Token.start()"`. **This is architecturally
+impossible for the old driver's own, unmodified bytecode to produce.** The
+exception embeds frames/method references that can only belong to the
+*modern*, Application-loaded H2 build — not to anything reachable from
+`testUpgrade(1,4,200)`'s own call chain into its private 1.4.200 driver
+copy. This is the strongest evidence yet that the bug is a cross-loader (or
+even cross-*session*/cross-*thread*) contamination of dispatch or of
+exception/stack-trace construction, not a genuine parse failure inside the
+old driver's own, textually different `getSyntaxError()`.
+
+### An attempt to pin the exact call site — inconclusive, a promising lead
+### undercut by an instrumentation gap, not resolved
+
+The captured interpreter frame at the moment of the athrow
+(`CRATONVM_DBG_ATHROW=1`, an existing hook) shows the innermost live frame as
+`org/h2/engine/Session.prepareLocal pc=145` — no `Parser`/`ParserBase` frames
+above it at all, i.e. by the time the top-level uncaught-exception handler
+sees this exception, `thread.frames` has already unwound past whatever threw
+it. Cross-referencing `pc=145` against `javap -c -l`'s line/byte table for
+the OLD driver's real `Session.prepareLocal(String)` bytecode lines up with
+the instruction immediately AFTER the method's `new Parser(this)
+.prepareCommand(sql)` try/finally block (i.e., that call returning normally,
+about to execute `command.prepareJoinBatch()`) — which would mean the SQL
+genuinely parsed successfully and the failure is in the *next* step, not in
+parsing at all. **This specific claim is UNCONFIRMED**: added a targeted
+`CRATONVM_DBG_H2TRACE` trace inside `execute_invokevirtual_cached`
+(`vm/src/runtime/interpreter.rs`) keyed on `method_name == "prepareJoinBatch"`
+— it never fired once across a full run, despite adjacent traces in the same
+build firing correctly (981 + 47 hits). Most likely explanation: CratonVM's
+interpreter `pc` numbering is not a 1:1 mapping to the original class file's
+raw byte offsets (probably due to internal bytecode pre-processing/rewriting
+this session did not investigate), which would invalidate the javap-offset
+correlation above outright. **Do not trust the "it's `prepareJoinBatch`, not
+parsing" claim without independently confirming CratonVM's pc semantics
+first** — it is currently just a plausible-looking but unverified read of a
+debug print, and the real call site could equally well still be inside
+`Parser.prepareCommand`/`parse` itself.
+
+### Working hypotheses for whoever picks this up next (supersedes the tenth
+### pass's three, which the class-loading trace above has now ruled out)
+
+1. **A cross-loader method-dispatch collision** at some call site not yet
+   identified (candidates: whatever bytecode instruction is actually at
+   `pc=145` once its true meaning is established, or any call reachable from
+   `Session.prepareLocal`/`Parser.prepareCommand`/`Parser.parse` in the old
+   driver's own bytecode) resolves to a method belonging to the *modern*
+   H2 build instead of the old driver's own same-named method — e.g. an
+   inline/monomorphic call-site cache keyed insufficiently (by
+   `caller_class_id` + constant-pool index, per
+   `execute_invokevirtual_cached`'s `thread.invoke_cache`, which in
+   principle SHOULD already disambiguate by loader since each `loadH2()`
+   call defines a wholly distinct `Session`/`Parser` `ClassId` — but this
+   was not independently verified this session for the actual failing call).
+2. **A stack-trace/exception-construction bug**, not a dispatch bug at all:
+   a genuine `NullPointerException` thrown by the *Application*-loaded
+   `SessionLocal`'s own (legitimate) `ParserBase`/`Token` machinery — quite
+   plausibly on H2's own background MVStore committer thread, which the
+   `CRATONVM_DBG_ATHROW` trace shows actively running (and being
+   interrupted) around the same window — gets its frames merged into or
+   substituted for the main thread's/old-driver-session's exception when
+   printed, matching this codebase's existing "stack-trace fidelity" bug
+   family ([[tco-breaks-stacktrace-fidelity]],
+   [[invoke-to-string-wrapper-fastpath-misid]] in project memory). Since
+   the `ExpressionColumn.getValue` fix adds a large amount of new GC
+   pressure and re-entrant `invoke_virtual` traffic (981 fallthrough
+   events logged over the run before the crash), a timing/concurrency-
+   sensitive exposure of a pre-existing fidelity bug is very plausible —
+   more plausible, given the evidence gathered this session, than a new
+   dispatch bug.
+3. Simple execution-count/timing sensitivity (tenth pass's hypothesis 3) is
+   not newly supported or refuted by this session; still on the table but
+   still the least likely given the failure's hard determinism (2/2, now
+   also 2/2 under `--nojit`).
+
+### Diagnostic tooling left in place (all env-gated, zero cost when unset)
+
+- `native-builtins/src/apps_h2.rs`: `CRATONVM_DBG_H2TRACE=1` traces every
+  `ExpressionColumn.getValue` fallthrough (column id, row class, probe
+  outcome) and every `Session.prepareLocal` native-dispatch decision
+  (is_select, loader id, which branch).
+- `vm/src/runtime/interpreter.rs`: same env var traces `Instruction::New`
+  resolution specifically for `Parser`/`ParserBase`/`Token` (referencing vs.
+  target class id and loader), and `execute_invokevirtual_cached` dispatch
+  specifically for `method_name == "prepareJoinBatch"` (currently
+  unconfirmed to ever fire — see above; worth widening to trace ALL
+  invokevirtual calls from a `UserDefined`-loader caller instead of
+  filtering by method name, since the name-based filter may be missing the
+  actual call site).
+- Existing `CRATONVM_DBG_ATHROW=1` (pre-existing, not new this session) is
+  the fastest way to see the full sequence of exception throws, including
+  background-thread activity, around the crash.
+
+Committed alongside this doc update on `dev` — see commit history for the
+exact SHAs. **Root cause still not found; do not attempt another fix without
+first resolving the pc-semantics question above**, since the
+"`prepareJoinBatch`, not parsing" read this session leaned on is unverified.

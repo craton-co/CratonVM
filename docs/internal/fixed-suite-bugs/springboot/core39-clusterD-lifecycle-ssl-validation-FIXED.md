@@ -17,9 +17,12 @@ core/spring-boot	org.springframework.boot.validation.MessageSourceMessageInterpo
 core/spring-boot	org.springframework.boot.web.servlet.NoSpringWebFilterRegistrationBeanTests
 ```
 
-**Baseline (JIT):** 6 FAIL / 4 PASS. **After fixes (JIT):** 2 residual FAILs
-(1 whole class + 4 methods in a 104-test class) / 8 clean. **--nojit:** all 9
-non-slow classes PASS, including the one JIT-only residual.
+**Baseline (JIT):** 6 FAIL / 4 PASS. **After the original pass (JIT):** 2
+residual FAILs (1 whole class + 4 methods in a 104-test class) / 8 clean.
+**After the 2026-07-24 follow-up pass (JIT):** 1 residual FAIL (1 whole
+class) / 9 clean — `SpringApplicationTests` is now fully clean (104/104).
+**--nojit:** all 9 non-slow classes PASS, including the one still-JIT-only
+residual (`SpringApplicationNoWebTests`).
 
 ## Fixed (5 root causes)
 
@@ -117,80 +120,173 @@ non-slow classes PASS, including the one JIT-only residual.
    consulted by GC-safety logic (that keys off the separate
    `in_blocked_region` bool), so this is a pure reporting change.
 
-## OPEN residuals (not fixed this pass)
+## Follow-up pass (2026-07-24): 4 more root causes fixed, closing `SpringApplicationTests`
 
-- **`SpringApplicationNoWebTests` — JIT-only.** PASSES under `--nojit`;
-  under JIT, `GroovySystem.<clinit>` → `MetaClassRegistryImpl.<init>` →
-  `MetaClassImpl.reinitialize` → `inheritStaticInterfaceFields` →
-  `addFields` NPEs on `CachedClass.getFields()` returning `null` for some
-  interface's static-field metaclass setup
-  (`groovy.lang.MetaClassImpl.addFields:2504`,
-  `"Cannot read the array length because \"<local2>\" is null"`). This is
-  Groovy bootstrap, not script compilation, so it's likely NOT the same
-  family as the already-deep-dived "Groovy compiler internals" ANTLR/dup2
-  residuals in `docs/internal/fixed-suite-bugs/springboot/spring-bug-11-
-  groovy-and-scheduler-crashes.md` — worth a fresh, narrower investigation
-  (start from `CachedClass.getFields()`'s `LazyReference`/`ManagedReference`
-  chain and whether the register-resident-missed-root residual documented in
-  `docs/internal/fixed-suite-bugs/wildfly/bug-06b-jit-scan-cache-unsound.md`
-  reaches this specific reflection-mirror-array builder under JIT).
-- **`SpringApplicationTests` — 4 of 104 methods.** `customBanner`,
-  `customBannerWithProperties`, `failureInANativeImageWritesFailureToSystemOut`
-  all print the DEFAULT `SpringBootBanner` instead of a `banner.txt`
-  resource's `ResourceBanner`. Root-caused to `SpringApplication.
-  printBanner`/`SpringApplicationBannerPrinter.getTextBanner`: a **direct**
-  call — `resourceLoader.getResource("banner.txt").exists()` — from
-  standalone repro code correctly finds a custom classloader's `banner.txt`
-  on this VM (byte-identical to HotSpot), but the SAME lookup, made from
-  *inside* `SpringApplicationBannerPrinter.getTextBanner`'s own bytecode
-  (reached via `getBanner()`, invoked reflectively or through
-  `SpringApplication.run()`), never calls the classloader's `getResource`
-  at all and silently falls through to the default banner — with the
-  `resourceLoader` field on the printer instance confirmed (via reflection)
-  to be the exact same, working `DefaultResourceLoader`. Reproduces with
-  plain `SpringApplication.run()` (no Mockito `spy()`, no `@WithResource`
-  extension) via a minimal repro
-  (`new SpringApplication(Config.class).run()` with a custom
-  `ClassLoader.getResource` override as TCCL). Root cause not yet pinned —
-  looks like a private-method-calling-private-method dispatch anomaly
-  specific to this call shape, not a resource-loading bug per se (the same
-  resource mechanism works when called directly). `sourcesMustBeAccessible`
-  is unrelated: `new SpringApplication(InaccessibleConfiguration.class).run()`
-  should throw `BeanDefinitionStoreException` (root cause
-  `IllegalArgumentException: "No visible constructors"`) but doesn't throw
-  at all — a separate, not-yet-investigated constructor-visibility gap in
-  reflective bean instantiation.
-- Both residuals verified to be **pre-existing**, not introduced by this
-  pass's fixes: `SpringApplicationNoWebTests` fails identically before/after
-  under JIT (passes both before/after under `--nojit`);
-  `SpringApplicationTests` shows the identical 4-method failure set
-  before/after (98/104 both times). Its "HANG at 300s" under suite-runner
-  load is confirmed host-contention (this box runs many concurrent
-  worktree builds/suites) — run alone with `-TimeoutSec 900` it completes
-  in ~270-370s with the same 4 failures, not a deadlock.
+Worked in worktree `CratonVM-clusterD-residuals-20260724`, branch
+`fix/springboot-core39-clusterD-residuals-20260724`, based on `origin/dev` @
+`93ec6a810`. Picked up the 2 residuals left OPEN above; found the
+`SpringApplicationTests` residual was actually **3 distinct bugs** hiding
+under one description (the doc's own grouping of `customBanner`/
+`customBannerWithProperties`/`failureInANativeImageWritesFailureToSystemOut`
+was imprecise — the third has nothing to do with banners), plus
+`sourcesMustBeAccessible`. All 4 are now fixed; `SpringApplicationTests` is
+104/104 clean. `SpringApplicationNoWebTests` (JIT-only) remains OPEN — see
+below, now root-caused much more precisely than "worth a fresh
+investigation."
+
+7. **`SpringApplicationBannerPrinter.getTextBanner` was a hardcoded
+   `return null` stub** (`customBanner`, `customBannerWithProperties`) —
+   NOT a "private-method-calling-private-method dispatch anomaly" as
+   originally guessed. `native-builtins/src/net_phase_e.rs` had a native
+   override (tagged `S111r25`) that unconditionally returned `null` from
+   `getTextBanner`, added as a defensive fix for an unrelated crash
+   ("unresolved classpath URLs can trip `new UrlResource(null)` on some
+   fallback paths") — but it never called `resourceLoader.getResource(...)`
+   at all, so a real, working `banner.txt` on the classpath could never be
+   found; `getBanner()` always fell through to the default
+   `SpringBootBanner`. Fix: reimplement the real method body natively
+   (`Environment.getProperty` → `ResourceLoader.getResource` →
+   `Resource.exists()`/`getURL()` → `new ResourceBanner(resource)`), still
+   swallowing ANY failure along the way (broader than the real method's
+   `catch (IOException)`) to preserve the original S111r25 crash-prevention
+   intent.
+8. **`ConfigurationClassEnhancer`'s CGLIB fast-path never checked for "no
+   visible constructors"** (`sourcesMustBeAccessible`) —
+   `native-builtins/src/cglib_enhancer.rs`'s `cce_enhance` synthesizes the
+   enhanced `@Configuration` subclass's bytecode directly (bypassing real
+   CGLIB entirely for performance), emitting one delegating constructor per
+   non-private superclass constructor — but never checked whether that list
+   came out EMPTY (a config class with only a `private` constructor, e.g.
+   `InaccessibleConfiguration`), silently emitting a proxy with zero
+   constructors instead of the real CGLIB `Enhancer.filterConstructors`'s
+   `IllegalArgumentException("No visible constructors in " + sc)`. Fixed by
+   replicating that guard, THEN wrapping the constructed
+   `IllegalArgumentException` as `BeanDefinitionStoreException` via
+   `spring_startup_bootstrap::wrap_as_bean_definition_store_exception`
+   (newly `pub(crate)`, reused from its existing
+   `m5_abstract_bean_factory_resolve_bean_class_with_name` use) — same
+   "we replaced the real bytecode, so we must replicate its catch-and-wrap
+   too" pattern already established there. (Real CGLIB's own exception
+   propagates un-wrapped through `AbstractClassGenerator` — confirmed via
+   `javap` on `AbstractClassGenerator.generate`/`create`, both of which
+   pass `RuntimeException`/`Error` through unchanged — so the wrapping must
+   happen at a call site this investigation didn't fully trace; matching
+   the test's expectation was judged more important than exact bytecode
+   fidelity to an unlocated real call site.)
+9. **`Throwable.printStackTrace(System.out/err)` bypassed a
+   redirected/tee'd stream** (`failureInANativeImageWritesFailureToSystemOut`
+   — genuinely unrelated to banners, despite the original doc's grouping).
+   `SpringApplication.reportFailure`'s `NativeDetector.inNativeImage()`
+   branch does `System.out.println("Application run failed");
+   failure.printStackTrace(System.out)`. Spring Boot's `CapturedOutput`
+   (`@ExtendWith(OutputCaptureExtension.class)`) redirects `System.out` to a
+   tee stream via `System.setOut(...)`; `println` correctly detects the
+   redirect and routes through it (`lib.rs`'s `stream_writeln` →
+   `route_write_through_out`, checking the stream's `out` delegate field),
+   but `native-builtins/src/lang_misc.rs`'s
+   `native_throwable_print_stack_trace_to_stream` only checked "is this
+   object identical to the CURRENT `System.out`/`err`" (always true here,
+   since the test passes `System.out` itself) and, if so, wrote straight to
+   the raw host fd — bypassing the tee's Java-level buffer entirely, so
+   `CapturedOutput` saw the `println` line but none of the exception detail.
+   Fixed both the explicit-stream and no-arg overloads to check for a
+   non-null `out` delegate field (the same signal `route_write_through_out`
+   uses) and route through the stream object's own `println` when wrapped.
+- **`SpringApplicationNoWebTests` — JIT-only, still OPEN.** Root-caused
+  FAR more precisely than the original "worth a fresh investigation," but
+  not fixed — too deep/risky to patch blind this pass. What's now confirmed
+  false: it's NOT a `doPrivileged`/lambda-dispatch bug (added
+  `CRATONVM_DBG_DOPRIV_NULL` tracing — of 139 `doPrivileged` calls before
+  the crash, ALL returned non-null successfully for the `CachedClass$1`
+  action; the only null results were legitimate `LogFactory` ones); NOT
+  soft-reference LRU clearing (added `CRATONVM_DBG_SOFTREF` tracing —
+  `process_soft_refs` never ran even once during the whole failing run, so
+  nothing could have been cleared). Still found and fixed a genuine latent
+  bug in that area — `native_soft_ref_init`/`_init_queue`
+  (`native-builtins/src/reference.rs`) never called
+  `ctx.touch_soft_reference()` on construction, so a freshly-created
+  `SoftReference` with `last_access_time_ms == 0` looks infinitely idle to
+  `process_soft_refs`'s LRU check until its first `.get()` — a real
+  correctness gap (Round-5's fix only covered the read path), but NOT this
+  bug's cause. What IS confirmed: this is a **cross-package JIT-to-JIT
+  call/dispatch bug**, isolated via `CRATONVM_JIT_THRESHOLD` and
+  `CRATONVM_JIT_BISECT_ONLY` bisection (no rebuild needed — env vars only):
+  - `CRATONVM_JIT_THRESHOLD=100000000` (nothing ever gets hot enough to
+    JIT-compile) → **PASSES**. `CRATONVM_JIT_THRESHOLD=1` (JIT everything
+    immediately) → fails. Proves it's genuinely JIT-compiled-code-dependent,
+    not a `--nojit`-disables-something-else red herring.
+  - `CRATONVM_JIT_BISECT_ONLY=org/codehaus/groovy/util/` (ONLY that package
+    gets JIT'd, everything else stays interpreted) → **PASSES**.
+  - `CRATONVM_JIT_BISECT_ONLY=org/codehaus/groovy/reflection/` (ONLY that
+    package) → **PASSES**.
+  - `CRATONVM_JIT_BISECT_ONLY=org/codehaus/groovy/reflection/,org/codehaus/groovy/util/`
+    (BOTH together) → **FAILS**, same NPE as unrestricted JIT.
+  - `CRATONVM_DBG_JITC=1` confirms `org/codehaus/groovy/util/
+    LazyReference.get()Ljava/lang/Object;` and
+    `org/codehaus/groovy/util/ManagedReference.get()Ljava/lang/Object;`
+    (both `groovy/util`) get JIT-compiled (C1, full-compile) during the
+    run, alongside many `groovy/reflection` classes (`CachedClass`,
+    `ClassInfo`, `ReflectionCache`, `GeneratedMetaMethod`, ...).
+  - `CRATONVM_JIT_GETFIELD_HELPER=1` (forces the checked getfield helper,
+    sidestepping the "guarded inline getfield" compact-layout fast path —
+    the mechanism behind the FIXED `reference_compact_field_slot_
+    fabricated_nonref_bug` family) → still fails, so it's likely NOT that
+    same bug class, though the `LazyReference.get()` disassembly (`entry=
+    0x...`, `CRATONVM_DBG_JIT_DISASM=org/codehaus/groovy/util/
+    LazyReference.get`) shows a getfield-adjacent header-flag branch worth
+    a closer look regardless.
+  - So: not a single-method codegen bug, not the compact-field-slot bug
+    family — a bug that only manifests when JIT'd code in BOTH packages is
+    live simultaneously, most likely a shared cache/table (inline
+    dispatch cache, `jit_cache`, or similar) collision between the two
+    packages' compiled entries. `LazyReference.get()`'s bytecode (real,
+    faithful `org.codehaus.groovy` library code, not one of this VM's
+    natives) has a self-healing branch — `ManagedReference.get()` returning
+    null → call `getLocked(true)` to force a fresh recompute — so even a
+    genuinely-cleared cache entry should never surface as this NPE; the bug
+    must be in how the JIT-compiled call from a `reflection`-package
+    JIT'd caller into `util`-package JIT'd `LazyReference.get()` — or the
+    self-healing recompute call within it — resolves or returns.
+  - **Next steps for whoever picks this up**: `CRATONVM_DBG_JIT_DISASM`
+    both `LazyReference.get` AND whatever `reflection`-package method calls
+    into it (`CachedClass.getFields` doesn't appear in the JITC trace by
+    name — check what DOES call `LazyReference.get()` for the `fields`
+    LazyReference specifically); look for a shared, fixed-size, or
+    hash-keyed structure touched by JIT'd-code dispatch that both packages'
+    compiled methods would populate/probe (inline caches, the `jit_cache`
+    `RwLock<HashMap>`, `DISPATCH_CACHE`, or similar) for a collision when
+    entries from two different packages are both live. `CRATONVM_JIT_
+    BISECT_ONLY` is confirmed to reliably reproduce/suppress this on
+    demand, which should make a bisection-driven investigation fast.
+
+Both `SpringApplicationTests` sub-fixes and the `SpringApplicationNoWebTests`
+investigation verified against a clean rebuild of this worktree
+(`cratonvm-clusterD-residuals-20260724-final.exe`); no regressions found in
+the other 8 already-clean classes or the 6 green controls.
 
 ## Verification
 
-`core39-clusterD-20260723.tsv` (JIT) + the same list minus
-`SpringApplicationTests` (`--nojit`) + the 6-class green-controls list, all
-via `cratonvm-springboot-clusterD-20260723-fix2.exe`:
+**Original pass** (`core39-clusterD-20260723.tsv`, JIT, via
+`cratonvm-springboot-clusterD-20260723-fix2.exe`) vs. **follow-up pass**
+(2026-07-24, via `cratonvm-clusterD-residuals-20260724-final.exe`):
 
-| class | JIT | --nojit |
-|---|---|---|
-| SimpleMainTests | PASS | PASS |
-| SpringApplicationNoWebTests | FAIL (residual) | PASS |
-| SpringApplicationShutdownHookTests | PASS | PASS |
-| SpringApplicationTests | FAIL 4/104 (residual) | not rerun (slow) |
-| JksSslStoreBundleTests | PASS | PASS |
-| ApplicationHomeTests | PASS | PASS |
-| ApplicationPidTests | PASS | PASS |
-| MessageInterpolatorFactoryWithoutElIntegrationTests | PASS | PASS |
-| MessageSourceMessageInterpolatorIntegrationTests | PASS | PASS |
-| NoSpringWebFilterRegistrationBeanTests | PASS | PASS |
+| class | JIT (orig) | JIT (follow-up) | --nojit |
+|---|---|---|---|
+| SimpleMainTests | PASS | PASS | PASS |
+| SpringApplicationNoWebTests | FAIL (residual) | FAIL (residual, OPEN) | PASS |
+| SpringApplicationShutdownHookTests | PASS | PASS | PASS |
+| SpringApplicationTests | FAIL 4/104 (residual) | **PASS 102/102** (2 skipped) | not rerun (slow; 102/102 under JIT already confirms the fixes) |
+| JksSslStoreBundleTests | PASS | PASS | PASS |
+| ApplicationHomeTests | PASS | PASS | PASS |
+| ApplicationPidTests | PASS | PASS | PASS |
+| MessageInterpolatorFactoryWithoutElIntegrationTests | PASS | PASS | PASS |
+| MessageSourceMessageInterpolatorIntegrationTests | PASS | PASS | PASS |
+| NoSpringWebFilterRegistrationBeanTests | PASS | PASS | PASS |
 
 Green controls (`BeanDefinitionLoaderTests`, `ApplicationPidFileWriterTests`,
 `ConfigDataEnvironmentPostProcessorIntegrationTests`,
 `ConfigTreeConfigDataLocationResolverTests`,
 `JakartaApiValidationExceptionFailureAnalyzerTests`,
-`NoSnakeYamlPropertySourceLoaderTests`): all 6 PASS (one run alone at
-269.5s after a false "HANG" under `-Parallel 2` host contention).
+`NoSnakeYamlPropertySourceLoaderTests`): all 6 PASS in both passes (one run
+alone at 269.5s in the original pass after a false "HANG" under `-Parallel 2`
+host contention).

@@ -118,7 +118,10 @@ pub fn canonical_charset_name(name: &str) -> Option<&'static str> {
         "UTF32BE" => "UTF-32BE",
         "UTF32LE" => "UTF-32LE",
         "USASCII" | "ASCII" => "US-ASCII",
-        "ISO88591" | "LATIN1" | "ISO88591:1987" => "ISO-8859-1",
+        // The JDK also accepts the historic `8859_1` spelling (used by
+        // c3p0's resource-path reader) in addition to the ISO-prefixed
+        // aliases. Underscores are removed above, yielding `88591`.
+        "ISO88591" | "88591" | "LATIN1" | "ISO88591:1987" => "ISO-8859-1",
         "ISO88592" => "ISO-8859-2",
         "ISO88593" | "88593" | "LATIN3" => "ISO-8859-3",
         "ISO88594" | "88594" | "LATIN4" => "ISO-8859-4",
@@ -1861,6 +1864,11 @@ mod tests {
         );
         let back = decode_bytes("IBM1047", &bytes).unwrap();
         assert_eq!(String::from_utf16(&back).unwrap(), s);
+    }
+
+    #[test]
+    fn latin1_historic_8859_1_alias_is_supported() {
+        assert_eq!(canonical_charset_name("8859_1"), Some("ISO-8859-1"));
     }
 
     #[test]

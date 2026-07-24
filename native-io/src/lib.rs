@@ -8704,6 +8704,11 @@ fn dis_read_exact(
     let buf = ctx.new_array(ArrayElementType::Byte, len);
     let buf_pin = ctx.pin_native_root(buf);
     let mut buf = buf;
+    // `new_array` can collect and relocate the wrapped stream. The pin keeps
+    // it live, but ObjectRef is an address-like handle in the moving heap, so
+    // reload it before the first virtual read just as the loop does after
+    // every subsequent GC-capable call.
+    inner = ctx.read_native_pin(inner_pin, inner);
     let mut total = 0usize;
     while total < len {
         let remaining = (len - total) as i32;

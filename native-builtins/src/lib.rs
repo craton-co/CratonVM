@@ -35659,6 +35659,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             };
             let level = args.get(1).copied().unwrap_or(Value::Object(None));
             crate::logmanager::record_jul_logger_level(ctx, this, level);
+            let mut wrote_real_config = false;
             if let Value::Object(Some(config)) = ctx.get_field_by_name(this, "config") {
                 if jul_logger_config_is_real(ctx, config) {
                     ctx.set_field_by_name(config, "levelObject", level);
@@ -35670,6 +35671,24 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
                             ctx.set_field_by_name(config, "levelValue", Value::Int(v));
                         }
                     }
+                    wrote_real_config = true;
+                }
+            }
+            // Our `allocate_logger`-created synthetic loggers (slot0=name,
+            // slot1=level, slot2=parent) have no `config` object at all, so
+            // the branch above never fires for them -- write the level slot
+            // directly so `getLevel()` (below) and the ancestor-walking
+            // `getEffectiveLevel()` callers in real Spring Boot bytecode see
+            // the update instead of a permanent null.
+            if !wrote_real_config {
+                let is_synthetic = matches!(
+                    ctx.get_field(this, crate::logmanager::LOGGER_FIELD_NAME),
+                    Value::Object(Some(name))
+                        if ctx.class_name_of_id(ctx.class_id_of_object(name)).as_deref()
+                            == Some("java/lang/String")
+                );
+                if is_synthetic {
+                    ctx.set_field(this, crate::logmanager::LOGGER_FIELD_LEVEL, level);
                 }
             }
             Ok(None)
@@ -35688,7 +35707,17 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
                     return Ok(Some(ctx.get_field_by_name(config, "levelObject")));
                 }
             }
-            // Synthetic logger: preserve historic null (inherit from parent).
+            // Synthetic logger: read the real level slot `setLevel` (above)
+            // writes, instead of the historic hardcoded null.
+            let is_synthetic = matches!(
+                ctx.get_field(this, crate::logmanager::LOGGER_FIELD_NAME),
+                Value::Object(Some(name))
+                    if ctx.class_name_of_id(ctx.class_id_of_object(name)).as_deref()
+                        == Some("java/lang/String")
+            );
+            if is_synthetic {
+                return Ok(Some(ctx.get_field(this, crate::logmanager::LOGGER_FIELD_LEVEL)));
+            }
             Ok(Some(Value::Object(None)))
         },
     );
@@ -35734,19 +35763,33 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             // their real `name` field, NOT at slot 0 (slot 0 is `config`, a
             // `Logger$ConfigurationData`). Reading slot 0 unconditionally returned
             // that ConfigurationData, so the caller's `getName().lastIndexOf('.')`
-            // threw NoSuchMethodError and aborted the VM. Prefer the real `name`
-            // field; fall back to slot 0 for synthetic loggers our getLogger
-            // natives create (which stash the name there).
+            // threw NoSuchMethodError and aborted the VM.
+            //
+            // Check our OWN synthetic layout (slot 0 = name, a String) FIRST,
+            // before `get_field_by_name(this, "name")`: `allocate_logger`
+            // (logmanager.rs) now links non-root synthetic loggers to a real
+            // parent `Logger` at slot 2, and `get_field_by_name` resolves
+            // "name" using the REAL class's field metadata -- which for
+            // `java.util.logging.Logger` happens to BE slot 2. Checking
+            // `get_field_by_name` first would therefore alias onto the
+            // parent Logger object (any non-null object satisfies the `Some`
+            // pattern below, uncaught by any type check), returning it in
+            // place of the true name and blowing up the very next
+            // `getName().someStringMethod()` call with a `NoSuchMethodError`
+            // on `Logger`. A real Logger's slot 0 is never a String (it's
+            // `config`), so this ordering is safe for both layouts.
+            if let Value::Object(Some(s)) = ctx.get_field(this, 0) {
+                if ctx.class_name_of_id(ctx.class_id_of_object(s)).as_deref()
+                    == Some("java/lang/String")
+                {
+                    return Ok(Some(Value::Object(Some(s))));
+                }
+            }
             if let Value::Object(Some(s)) = ctx.get_field_by_name(this, "name") {
                 return Ok(Some(Value::Object(Some(s))));
             }
-            match ctx.get_field(this, 0) {
-                Value::Object(Some(s)) => Ok(Some(Value::Object(Some(s)))),
-                _ => {
-                    let s = ctx.create_string("");
-                    Ok(Some(Value::Object(Some(s))))
-                }
-            }
+            let s = ctx.create_string("");
+            Ok(Some(Value::Object(Some(s))))
         },
     );
     registry.register(
@@ -35841,7 +35884,32 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "java/util/logging/Logger",
         "getParent",
         "()Ljava/util/logging/Logger;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        |ctx, args| {
+            let Some(Value::Object(Some(this))) = args.first().copied() else {
+                return Ok(Some(Value::Object(None)));
+            };
+            // `allocate_logger` (logmanager.rs) links every non-root
+            // synthetic logger to a real parent (demand-created from its
+            // dotted-name prefix) at slot 2. Previously this was hardcoded
+            // null for every Logger, real or synthetic, which broke any
+            // ancestor walk (e.g. Spring Boot's `JavaLoggingSystem
+            // .getEffectiveLevel`'s `while (getLevel()==null)
+            // logger=getParent()` loop NPEs the moment it dereferences the
+            // never-non-null parent). Real-JDK Logger objects (built via
+            // actual bytecode `new`, not `allocate_logger`) keep the old
+            // safe null -- we have no reliable parent chain for those under
+            // this simplified bridge.
+            let is_synthetic = matches!(
+                ctx.get_field(this, crate::logmanager::LOGGER_FIELD_NAME),
+                Value::Object(Some(name))
+                    if ctx.class_name_of_id(ctx.class_id_of_object(name)).as_deref()
+                        == Some("java/lang/String")
+            );
+            if is_synthetic {
+                return Ok(Some(ctx.get_field(this, crate::logmanager::LOGGER_FIELD_PARENT)));
+            }
+            Ok(Some(Value::Object(None)))
+        },
     );
     registry.register(
         "java/util/logging/Logger",
@@ -36524,6 +36592,16 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "getResourceAsStream",
         "(Ljava/lang/String;)Ljava/io/InputStream;",
         classloader::cl_get_resource_as_stream_essential,
+    );
+    // JDK 25's URLClassLoader.getURLs() is concrete bytecode that reads the
+    // shimmed URLClassPath directly. Route it through the receiver-local
+    // native so manifest class-path entries are visible to callers before
+    // they construct filtered child loaders.
+    registry.register(
+        "java/net/URLClassLoader",
+        "getURLs",
+        "()[Ljava/net/URL;",
+        classloader::ucl_get_urls,
     );
     // SB-15: `java.lang.Module.getResourceAsStream(String)`. kotlin-reflect's
     // multi-release `BuiltInsResourceLoader.loadResource` (JDK 9+ variant)
@@ -69867,6 +69945,28 @@ fn assertj_array_values_equal(left: Value, right: Value) -> bool {
     }
 }
 
+// BUG (micrometer-metrics-graphite-array-equality-20260724): this used to
+// take `left_name`/`right_name` strings derived from
+// `class_name_of_id(class_id_of_object(obj))` and decide reference-vs-
+// primitive by prefix-matching ("[L"/"[["/exact primitive descriptor). That
+// is unsound for ARRAY objects specifically: the heap object header's
+// `class_id` field for an array stores the ELEMENT type's ClassId (e.g.
+// `java/lang/String`'s ClassId for a `String[]`), not the array type's own
+// ClassId — confirmed via a from-scratch repro comparing native-side
+// `identity_hash_code`/`class_id_of_object` output against the SAME
+// object's Java-side `System.identityHashCode()`: the identity matched the
+// array exactly, but `class_id_of_object` reported the component class
+// (`java/lang/String`), so `left_name.starts_with('[')` was always false
+// and every reference-array comparison silently fell through to this
+// function's caller's `Object.equals` (identity) branch — e.g.
+// `GraphitePropertiesConfigAdapterTests.whenPropertiesTagsAsPrefixIsSetAdapterTagsAsPrefixReturnsIt`
+// asserting `assertThat(new String[]{"worker"}).isEqualTo(new String[]{"worker"})`
+// spuriously failed despite `Arrays.deepEquals`/`Objects.deepEquals`/
+// `instanceof` all correctly recognizing the exact same objects as
+// content-equal `String[]` arrays. Fixed by using `object_is_array`/
+// `heap_element_type_of` (the same reliable APIs `java.lang.reflect.Array`'s
+// natives already use — see `reflect_array_arg`/`native_array_get`) instead
+// of class-id-derived name strings.
 fn assertj_arrays_equal(
     ctx: &mut dyn NativeContext,
     left: ObjectRef,
@@ -69876,6 +69976,11 @@ fn assertj_arrays_equal(
     let right_type = ctx.heap_element_type_of(right);
     let left_is_reference_array = left_type == cratonvm_types::ArrayElementType::Reference;
     let right_is_reference_array = right_type == cratonvm_types::ArrayElementType::Reference;
+    if std::env::var_os("CRATONVM_DBG_ASSERTJ_ARR").is_some() {
+        eprintln!(
+            "[ASSERTJ-ARR-DBG] left_type={left_type:?} right_type={right_type:?} left_ref={left_is_reference_array}"
+        );
+    }
 
     // The Java implementation falls through to Object.equals (identity for
     // arrays) for different primitive array types and primitive/reference
@@ -69883,6 +69988,9 @@ fn assertj_arrays_equal(
     if left_is_reference_array != right_is_reference_array
         || (!left_is_reference_array && left_type != right_type)
     {
+        if std::env::var_os("CRATONVM_DBG_ASSERTJ_ARR").is_some() {
+            eprintln!("[ASSERTJ-ARR-DBG] early-false: mismatched array element type");
+        }
         return Ok(false);
     }
 
@@ -69907,11 +70015,21 @@ fn assertj_arrays_equal(
                     (Value::Object(left), Value::Object(right)) => {
                         assertj_objects_equal(ctx, left, right)?
                     }
-                    _ => false,
+                    _ => {
+                        if std::env::var_os("CRATONVM_DBG_ASSERTJ_ARR").is_some() {
+                            eprintln!(
+                                "[ASSERTJ-ARR-DBG] index={index} non-object element value(s): left={left_value:?} right={right_value:?}"
+                            );
+                        }
+                        false
+                    }
                 }
             } else {
                 assertj_array_values_equal(left_value, right_value)
             };
+            if std::env::var_os("CRATONVM_DBG_ASSERTJ_ARR").is_some() {
+                eprintln!("[ASSERTJ-ARR-DBG] index={index} equal={equal}");
+            }
             if !equal {
                 return Ok(false);
             }
@@ -69939,13 +70057,18 @@ fn assertj_objects_equal(
     // AssertJ's `isEqualTo` needs a deep element-wise comparison. Detect
     // arrays via `heap_kind_of`/`heap_element_type_of` (the heap object
     // header CratonVM actually tracks this on), NOT a `class_name_of_id()`
-    // string check: array objects are not registered under a normal
-    // `"[B"`-style class name in `class_manager`, so the name-based check
-    // silently returned `""` for every array and fell through to the
-    // generic `Object.equals` branch below — reference equality — making
-    // `isEqualTo(byte[])` (and every other array type) report
-    // content-identical arrays as unequal
-    // (`AppendableByteArrayTests`/`writesMultipleSmallStrings` et al).
+    // string check: an array's header `class_id` field stores its ELEMENT
+    // type's ClassId (e.g. `java/lang/String`'s ClassId for a `String[]`),
+    // not the array type's own ClassId — array objects are not registered
+    // under a normal `"[B"`-style class name in `class_manager`, so the
+    // name-based check silently returned `""`/the component class name for
+    // every array and fell through to the generic `Object.equals` branch
+    // below — reference equality — making `isEqualTo(byte[])` and
+    // `isEqualTo(String[])` alike report content-identical arrays as
+    // unequal (`AppendableByteArrayTests`/`writesMultipleSmallStrings`,
+    // `GraphitePropertiesConfigAdapterTests`/
+    // `whenPropertiesTagsAsPrefixIsSetAdapterTagsAsPrefixReturnsIt`, found
+    // independently the same day).
     let left_is_array = ctx.heap_kind_of(left) == cratonvm_types::ObjectKind::Array;
     let right_is_array = ctx.heap_kind_of(right) == cratonvm_types::ObjectKind::Array;
     if left_is_array || right_is_array {
@@ -69957,6 +70080,9 @@ fn assertj_objects_equal(
 
     let left_name = ctx.class_name_of_id(ctx.class_id_of_object(left));
     let right_name = ctx.class_name_of_id(ctx.class_id_of_object(right));
+    if std::env::var_os("CRATONVM_DBG_ASSERTJ_ARR").is_some() {
+        eprintln!("[ASSERTJ-OBJ-DBG] left_name={left_name:?} right_name={right_name:?}");
+    }
     let left_name = left_name.as_deref().unwrap_or_default();
     let right_name = right_name.as_deref().unwrap_or_default();
 
@@ -70081,6 +70207,19 @@ fn native_assertj_standard_comparison_are_equal(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
+    if std::env::var_os("CRATONVM_DBG_ASSERTJ_ARR").is_some() {
+        eprintln!("[ASSERTJ-ENTRY-DBG] native_assertj_standard_comparison_are_equal args.len()={} args={args:?}", args.len());
+        for (i, a) in args.iter().enumerate() {
+            if let Value::Object(Some(o)) = a {
+                eprintln!(
+                    "[ASSERTJ-ENTRY-DBG] args[{i}] identity_hash={} class_id={:?} class_name={:?}",
+                    ctx.identity_hash_code(*o),
+                    ctx.class_id_of_object(*o),
+                    ctx.class_name_of_id(ctx.class_id_of_object(*o))
+                );
+            }
+        }
+    }
     let left = match args.get(1) {
         Some(Value::Object(value)) => *value,
         _ => None,
@@ -70089,7 +70228,11 @@ fn native_assertj_standard_comparison_are_equal(
         Some(Value::Object(value)) => *value,
         _ => None,
     };
-    Ok(Some(Value::Int(i32::from(assertj_objects_equal(ctx, left, right)?))))
+    let out = assertj_objects_equal(ctx, left, right)?;
+    if std::env::var_os("CRATONVM_DBG_ASSERTJ_ARR").is_some() {
+        eprintln!("[ASSERTJ-ENTRY-DBG] result={out}");
+    }
+    Ok(Some(Value::Int(i32::from(out))))
 }
 
 fn native_assertj_lightweight_comparable_assert(
@@ -74658,11 +74801,53 @@ pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
         },
     );
 
+    // BUG (micrometer-metrics-logbackcondition-wrong-binder-20260724): both
+    // natives below used to apply UNCONDITIONALLY — registered natives shadow
+    // ANY class of this name at every interpreter dispatch site (WP0.1
+    // native-override-priority), regardless of whether a REAL binder jar
+    // (log4j-slf4j-impl, slf4j-log4j12, ...) is actually on the classpath
+    // with its own genuine `getSingleton`/`getLoggerFactory` bytecode. That
+    // silently discarded a real, non-Logback binding: Spring Boot's
+    // `@ConfigureClasspathToPreferLog4j2` (`ClassPathOverrides` installing
+    // log4j-slf4j-impl ahead of logback-classic on a `ModifiedClassPathClassLoader`)
+    // makes `org/slf4j/impl/StaticLoggerBinder` resolve to log4j's REAL class
+    // — whose real `getLoggerFactory()` legitimately returns a Log4j-backed
+    // `ILoggerFactory` — but this fallback kept fabricating a Logback
+    // `LoggerContext` anyway (logback-classic remains on the classpath, just
+    // not what THIS StaticLoggerBinder should bind to), so
+    // `LogbackLoggingCondition`/`LogbackMetricsAutoConfiguration` wrongly saw
+    // Logback as active and registered a `logbackMetrics` bean the test
+    // asserts must be absent (`LogbackMetricsAutoConfigurationWithLog4j2AndLogbackTests
+    // .doesNotConfigureLogbackMetrics`), and separately broke
+    // `Log4J2MetricsWithLog4jLoggerContextAutoConfigurationTests`. Now: run
+    // the receiver/class's own real bytecode via the `*_bytecode_only`
+    // primitives (bypassing native re-dispatch to avoid self-recursion) when
+    // `class_declares_method` confirms a genuine (non-bridge) declaration is
+    // present — i.e. a real binder jar was actually found. Only fabricate the
+    // synthetic Logback-preferring placeholder below when no real
+    // implementation exists anywhere (the "impl JAR isn't visible" case this
+    // stub was written for — see the module doc above).
     registry.register(
         "org/slf4j/impl/StaticLoggerBinder",
         "getSingleton",
         "()Lorg/slf4j/impl/StaticLoggerBinder;",
         |ctx, _| {
+            if let Some(cid) = ctx.class_id_by_name("org/slf4j/impl/StaticLoggerBinder") {
+                if ctx.class_declares_method(
+                    cid,
+                    "getSingleton",
+                    "()Lorg/slf4j/impl/StaticLoggerBinder;",
+                ) {
+                    if let Ok(Some(real)) = ctx.invoke_special_bytecode_only(
+                        "org/slf4j/impl/StaticLoggerBinder",
+                        "getSingleton",
+                        "()Lorg/slf4j/impl/StaticLoggerBinder;",
+                        &[],
+                    ) {
+                        return Ok(Some(real));
+                    }
+                }
+            }
             let s = alloc_concurrent_synthetic(ctx, "org/slf4j/impl/StaticLoggerBinder", 1);
             Ok(Some(Value::Object(Some(s))))
         },
@@ -74680,7 +74865,26 @@ pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
         "org/slf4j/impl/StaticLoggerBinder",
         "getLoggerFactory",
         "()Lorg/slf4j/ILoggerFactory;",
-        |ctx, _| {
+        |ctx, args| {
+            // Prefer the RECEIVER's own real bytecode (see the BUG note
+            // above `getSingleton`) — `getSingleton()` may have handed back a
+            // genuinely-real binder instance (a real jar was found), in
+            // which case its own `getLoggerFactory()` already knows the
+            // correct backend and must not be second-guessed here.
+            if let Ok(this) = obj_arg(args, 0) {
+                let cid = ctx.class_id_of_object(this);
+                if ctx.class_declares_method(cid, "getLoggerFactory", "()Lorg/slf4j/ILoggerFactory;")
+                {
+                    if let Ok(Some(real)) = ctx.invoke_virtual_bytecode_only(
+                        this,
+                        "getLoggerFactory",
+                        "()Lorg/slf4j/ILoggerFactory;",
+                        &[],
+                    ) {
+                        return Ok(Some(real));
+                    }
+                }
+            }
             if ctx
                 .ensure_class_initialized("ch/qos/logback/classic/LoggerContext")
                 .is_ok()
@@ -75037,23 +75241,26 @@ pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
 /// Spring Boot 3.2 logback bridge — registered unconditionally in real-JDK
 /// mode by `vm_init.rs`.
 ///
-/// `DefaultLogbackConfiguration.apply(LogbackConfigurator)` sets up the
-/// default logback config (root logger level, console appender, pattern
-/// layout, …) by entering synchronized blocks on the wrapped LoggerContext.
-/// Because we serve LoggerContext via `alloc_concurrent_synthetic` (bypassing
-/// logback's `<init>`), the first `monitorenter` at pc=7 NPEs on a null
-/// field. Treat `apply()` as a no-op so the bytecode never runs — logs fall
-/// back to the JVM's default stderr handler, which is fine for Spring Boot
-/// bootstrap. Paired with the `check_override` allow-list entry in
-/// `vm/src/vm/vm_exec.rs`.
-pub fn register_spring_boot_logback_apply(registry: &mut NativeMethodRegistry) {
-    registry.register(
-        "org/springframework/boot/logging/logback/DefaultLogbackConfiguration",
-        "apply",
-        "(Lorg/springframework/boot/logging/logback/LogbackConfigurator;)V",
-        |_, _| Ok(None),
-    );
-}
+/// STALE, REMOVED 2026-07-24 (Cluster C logging-bootstrap batch):
+/// `DefaultLogbackConfiguration.apply(LogbackConfigurator)` used to be
+/// forced to a no-op here because `ch/qos/logback/classic/LoggerContext`
+/// was served via `alloc_concurrent_synthetic` (bypassing logback's real
+/// `<init>`), so `apply()`'s first `monitorenter` NPE'd on a null field.
+/// That premise no longer holds: `LoggerContext` construction is real
+/// bytecode now (confirmed by both the
+/// `logback_context_construction_and_state_are_not_native_overridden`
+/// regression test below and direct testing — `new LoggerContext()` +
+/// `getConfigurationLock()` return a genuinely working `ReentrantLock`).
+/// With this no-op left in place, `apply()` silently never installed a
+/// `ConsoleAppender`, root level, or pattern layout at all — the actual
+/// root cause of `DefaultLogbackConfigurationTests`' failures and (via
+/// `LoggingApplicationListener`'s bootstrap path, which calls `apply()`)
+/// `LoggingApplicationListenerTests`' captured-output-always-empty
+/// failures. Letting real bytecode run instead: `defaults()` +
+/// `consoleAppender()` + `config.root(...)` verified directly to work and
+/// correctly preserve `LoggerContext` properties/state, both individually
+/// and through `apply()`'s own try/finally.
+pub fn register_spring_boot_logback_apply(_registry: &mut NativeMethodRegistry) {}
 
 fn register_slf4j_natives(registry: &mut NativeMethodRegistry) {
     let lf = "org/slf4j/LoggerFactory";

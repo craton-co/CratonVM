@@ -1,12 +1,18 @@
 # Stale refs surfacing on interpreter operand stacks after a nested allocating call — the residual core of the WildFly cid=0 family
 
-Status: **RE-CHARACTERIZED 2026-07-23 (round 2); fatal member FIXED (producer #11); dominant
-non-fatal producer FIXED (producer #12, `6e10cba68`) — residual tail SPLIT into THREE DISTINCT
-open items (see "Campaign 13/fix11" section below), none yet fixed: (A) the original sb-chain
-shape (unchanged, now pushprov-exhausted for every interpreter push site), (B) a NEW non-moving
-young-gen liveness/remembered-set gap (FATAL — `AbstractMethodError`), (C) a NEW STW-takeover-
-correlated checkcast CCE (FATAL — `ClassCastException`). All three are rare (<1%/boot) but (B)
-and (C) are fatal, contradicting this doc's prior "no fatal instance remains" claim.**
+Status: **RE-CHARACTERIZED 2026-07-24 (round 3); fatal member FIXED (producer #11); dominant
+non-fatal producer FIXED (producer #12, `6e10cba68`) — residual family now understood as (at least)
+FIVE distinct items, none yet fixed. MAJOR 2026-07-24 finding (see "MAJOR FINDING" section below):
+the original sb-chain shape (A) is JIT-INDEPENDENT and still unexplained, but a SEPARATE,
+JIT-DEPENDENT bug (E) was discovered sharing the same `[stale-recv]` detector — confirmed via a
+controlled 3-way experiment (14.6% JIT+OSR-on vs 11.9% JIT-on/OSR-off vs 1.33% JIT-fully-off) and
+direct evidence of a JIT oop-map coverage gap (`CRATONVM_DBG_VERIFY_OOP_MAPS` found 64 unmapped
+live-looking stack slots in one compiled method with only 2 registered oop-maps). (E) is 10x+ more
+reproducible than (A) once triggered — the most tractable open item. (B) non-moving young-gen
+liveness/remembered-set gap and (C) STW-takeover-correlated checkcast CCE remain open and FATAL.
+(D) WFLYCTL0079 duplicate-attribute-registration remains open, reproducible (~1/1200-1600), likely
+unrelated to the GC family — two precise double-invocation hypotheses (executor-dispatch level,
+registry-mutation level) tested and refuted across 2400+ boots.**
 This doc previously attributed the family to a frame-slot scan/remap gap in the moving collector's
 interpreter frame walk. A full forensic campaign (worktree
 `/data/wt-stw-residual-close-20260722`, branch `fix/wildfly-stw-residual-close-20260722`) DISPROVED
@@ -361,6 +367,89 @@ consistent with prior rates), 1 `EXITED` (0.125%, near baseline), 0 `CCEBT`, 0 `
   `parallel-extension-add` — that would be a fundamental correctness bug, not specific to this one
   attribute, and the natural next diagnostic step (a per-class-init entry/exit trace under
   contention) for whichever future session picks this up.
+
+## MAJOR FINDING (2026-07-24): the JIT hypothesis is CONFIRMED — but for a SECOND, separate bug
+
+Pursuing item 9 (JIT-compiled code as the remaining sb-chain holder) turned up something bigger than
+expected. While building the WFLYCTL0079 `REGCALL` diagnostic (traces every `invokeinterface` call
+made from one specific caller frame, gated by `CRATONVM_DBG_DUPCALL_FILTER`), its per-call string
+comparisons on the hot `invokeinterface` path turned out to have a dramatic side effect: it slows
+interpreted execution enough to massively widen whatever race window produces the stale-recv family.
+**With this diagnostic active, the stale-recv rate jumps from the historical ~1% to 10-15%,** and the
+dominant capture site shifts from `Optional.map`/`StringBuilder.append` chains to **`String.hashCode()`**
+— same GC forensics signature (`[gcpart] moved_to=Some(...)` + `[zeroed] site=fromspace-reset`),
+confirmed same bug family, just far more frequent.
+
+This gave enough statistical power for a clean three-way controlled experiment (same `REGCALL`-active
+binary throughout, only the JIT config varied), run overnight on separate slot ranges:
+
+| Config | Boots | STALERECV | Rate |
+|---|---|---|---|
+| (A) JIT + OSR on (REGCALL baseline) | 800 | 117 | **14.6%** |
+| (B) JIT on, OSR off (`CRATONVM_JIT_OSR=0`) | 1173 | 140 | **11.9%** |
+| (C) JIT fully off (`CRATONVM_DISABLE_JIT=1`) | 828 | 11 | **1.33%** |
+
+**Interpretation: JIT compilation (in general — NOT specifically On-Stack-Replacement) is required for
+the amplified String.hashCode() manifestation.** Disabling only OSR gave a modest ~19% relative
+reduction (noise-adjacent); disabling JIT entirely gave a ~10x drop, landing back at the ORIGINAL
+baseline rate — and at config (C), the captures reverted to the original `Optional.map` shape, not
+`String.hashCode()`, with none of the amplification. **This means there are two distinct bugs sharing
+one detector:**
+
+1. **The original sb-chain shape** (`Optional.map`/`StringBuilder.append`, ~1%, present with OR
+   without JIT) — still not root-caused, JIT-independent, presumably the genuine interpreter/GC-remap
+   issue this doc originally set out to find.
+2. **A NEW, JIT-dependent bug** (manifests mostly as `String.hashCode()` receiving a stale receiver,
+   though also seen on `String.isEmpty()` and others) that requires JIT compilation of SOME kind to
+   trigger, and is 10x+ more frequent once triggered — a much more tractable target.
+
+### Direct evidence for bug #2's mechanism: an oop-map coverage gap
+
+`CRATONVM_DBG_VERIFY_OOP_MAPS` (a pre-existing, apparently unused diagnostic in
+`vm/src/jit/conservative_roots.rs::verify_precise_covers_conservative`) does a completeness-oracle
+scan: for one precise JIT frame, diff the union of the compiled method's oop-map slot offsets against
+a conservative sweep of the same stack band, flagging any word that looks like a live object pointer
+but isn't covered by ANY registered map. Enabling it on a single manual boot immediately found **64
+such "unmapped in-band oop" hits, ALL from ONE JIT-compiled method**, whose `CompiledMethod` reports
+`fully_oop_covered=true` but has only **2 registered oop-maps** despite spanning a wide (~4KB)
+compiled stack frame with dozens of distinct live-looking object-reference slots at different
+`[rbp-N]` offsets. This is a direct, mechanistic match for the hypothesis: a JIT-compiled method with
+a long/loopy body whose GC-safepoint oop-maps don't cover every point execution could actually be
+paused at — a GC landing at an uncovered point leaves that frame's stale (pre-move) values in place,
+which is EXACTLY what a moving GC's root scan is supposed to prevent. (The specific method's identity
+wasn't pinned down — a follow-up attempt combining `CRATONVM_DBG_VERIFY_OOP_MAPS` with
+`CRATONVM_DBG_JITC` to correlate the code address to a method name stalled/hung, likely too much
+combined per-GC overhead for a full boot; a future session should either shorten the target workload
+or extract method identity a different way, e.g. cross-referencing `cratonvm_jit::lookup_jit_code_range`
+directly.)
+
+Separately: `Type.primitiveFromString(String)` (Infinispan protostream) — the method that directly
+calls `hashCode()` on a stale receiver in a captured `String.hashCode()` event — was independently
+confirmed to be JIT-compiled (`tier=C1 full-compile`) via `CRATONVM_DBG_JITC`, and the stale-recv
+capture's Java-frame dump showed **multiple frames simultaneously** with `all_zero_header=true`
+locals up the SAME call chain (frame 68 `Type.primitiveFromString` AND frame 62
+`SquareProtoParser.parse`), consistent with a GC landing mid-chain and several JIT-compiled callers'
+locals failing to get updated together, not an isolated single-slot miss.
+
+### Recommended next steps (in priority order)
+
+1. **Find and fix the oop-map coverage gap.** Re-run `CRATONVM_DBG_VERIFY_OOP_MAPS=1` alone (without
+   JITC, which seems to be what made the combined run hang) across a real campaign, collect the
+   `code@` addresses of hits, and separately capture a `CRATONVM_DBG_JITC=1`-only campaign's
+   `full-compile`/`bg-compile` entry-address log to correlate addresses to method names post-hoc
+   (both logs are deterministic per-run in relative order even if absolute addresses vary run-to-run,
+   so matching by entry sequence/method-invocation-order may work where direct address matching
+   doesn't). Once identified, the fix is almost certainly in whatever JIT compilation pass decides
+   which points need a safepoint-with-oop-map (a loop-body GC-poll or a call site inside a long
+   method being skipped).
+2. **Use the REGCALL-overhead trick deliberately** as a cheap, reusable amplifier for reproducing
+   this whole bug family in future campaigns — no code changes needed, just leave
+   `CRATONVM_DBG_DUPCALL_FILTER=1` set (it's already default-wired into `probes/run-one.sh`) even
+   for investigations unrelated to WFLYCTL0079.
+3. The **original JIT-independent `Optional.map` shape** (bug #1) remains open and still needs its
+   own root-cause; now that bug #2's amplification is understood and can be filtered out (by checking
+   the captured method name and/or running with `CRATONVM_DISABLE_JIT=1` to isolate it), future
+   campaigns can target bug #1 specifically without bug #2's noise dominating the sample.
 
 ## Historical characterization (2026-07-22, superseded in mechanism, preserved)
 
