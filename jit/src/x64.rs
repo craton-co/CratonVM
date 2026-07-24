@@ -2692,20 +2692,23 @@ fn flush_callee_saved_oops_enabled() -> bool {
     *G.get_or_init(|| std::env::var_os("CRATONVM_JIT_NO_CALLEE_OOP_FLUSH").is_none())
 }
 
-/// Temporary safety gate for the callee-saved GPR local allocator.
+/// Enable graph-coloured callee-saved GPR homes for Java locals.
 ///
-/// The remaining `is_known_miscompile` family is driven by live Java values kept
-/// exclusively in callee-saved GPRs across calls/OSR transitions. Until the
-/// precise register-map allocator work lands, keep those GPR local homes out of
-/// the default codegen path. The graph-coloring allocator still runs for tests
-/// and XMM locals; developers can opt back into the old GPR homes with
-/// `CRATONVM_JIT_ENABLE_CALLEE_SAVED_GPR_LOCALS=1` when bisecting allocator
-/// bugs.
+/// This is now the default when precise JIT maps are active. Every GC-capable
+/// call first publishes register locals to their canonical frame slots, precise
+/// oop maps describe those slots, moved references are reloaded after the call,
+/// and OSR entry carries the allocator's live-in/dead-local masks. Together
+/// those contracts make a callee-saved register a real local home across both
+/// loop backedges and calls rather than an untracked cache.
+///
+/// `CRATONVM_JIT_ENABLE_CALLEE_SAVED_GPR_LOCALS=0` is retained as a diagnostic
+/// opt-out. An explicit true value remains accepted for compatibility, but can
+/// never bypass the precise-map requirement.
 pub fn callee_saved_gpr_local_homes_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
     *G.get_or_init(|| {
-        std::env::var("CRATONVM_JIT_ENABLE_CALLEE_SAVED_GPR_LOCALS")
+        let requested = std::env::var("CRATONVM_JIT_ENABLE_CALLEE_SAVED_GPR_LOCALS")
             .ok()
             .map(|v| {
                 matches!(
@@ -2713,7 +2716,8 @@ pub fn callee_saved_gpr_local_homes_enabled() -> bool {
                     "1" | "true" | "on" | "yes"
                 )
             })
-            .unwrap_or(false)
+            .unwrap_or(true);
+        requested && (precise_jit_maps_enabled() || moving_young_enabled())
     })
 }
 
@@ -35600,8 +35604,9 @@ mod tests {
     }
 
     #[test]
-    fn callee_saved_gpr_local_homes_are_default_off() {
-        if callee_saved_gpr_local_homes_enabled() {
+    fn callee_saved_gpr_local_homes_are_default_on_with_precise_maps() {
+        if !callee_saved_gpr_local_homes_enabled() {
+            // The process-wide diagnostic opt-out is intentionally respected.
             return;
         }
 
@@ -35642,15 +35647,15 @@ mod tests {
         )
         .expect("simple int-local method should compile");
 
-        assert_eq!(compiled.osr_num_reg_locals, 0);
+        assert!(compiled.osr_num_reg_locals > 0);
         assert!(compiled
             .osr_callee_saved_regs
             .as_ref()
-            .is_some_and(Vec::is_empty));
+            .is_some_and(|registers| !registers.is_empty()));
         assert!(compiled
             .osr_local_assignments
             .as_ref()
-            .is_some_and(|assignments| assignments.iter().all(Option::is_none)));
+            .is_some_and(|assignments| assignments.iter().any(Option::is_some)));
     }
 
     #[test]

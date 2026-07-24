@@ -2455,6 +2455,13 @@ pub const MAX_INLINE_BYTECODE_SIZE: usize = 35;
 /// Total inlined bytecode budget per compiled method.
 pub const MAX_INLINE_BUDGET: usize = 250;
 
+/// Maximum estimated native-code expansion accepted for one inline site.
+///
+/// Bytecode length alone under-prices field accesses and helper-dependent
+/// bodies. Keeping a second, backend-oriented ceiling prevents one nominally
+/// small leaf from consuming disproportionate instruction-cache space.
+pub const MAX_INLINE_EXPANSION_COST: usize = 64;
+
 /// C1→C2 supersede eligibility: would an `optimize=true` recompile of this
 /// method actually take the optimizing IR pipeline AND be expected to produce
 /// better code than the single-pass body it replaces?
@@ -2574,6 +2581,68 @@ pub struct InlineSite {
     /// emitter pops the receiver the preceding `aload_0` pushed and emits
     /// NOTHING for these PCs; any 0xb7 NOT in this list still bails.
     pub elided_invoke_pcs: Vec<usize>,
+}
+
+/// Estimate the native-code expansion charged to the compilation's inline
+/// budget. The estimate deliberately stays cheap and deterministic: planning
+/// happens before backend emission and must not resolve or compile anything
+/// speculatively.
+pub fn inline_site_expansion_cost(site: &InlineSite) -> Option<usize> {
+    if site.callee_code_len == 0 || site.callee_code_len > MAX_INLINE_BYTECODE_SIZE {
+        return None;
+    }
+
+    let field_cost = site.field_info.len().saturating_mul(6);
+    let static_field_cost = site.static_field_info.len().saturating_mul(8);
+    let context_cost = usize::from(site.needs_heap).saturating_mul(4);
+    let cost = site
+        .callee_code_len
+        .saturating_add(field_cost)
+        .saturating_add(static_field_cost)
+        .saturating_add(context_cost);
+    (cost <= MAX_INLINE_EXPANSION_COST).then_some(cost)
+}
+
+#[cfg(test)]
+mod inline_selection_tests {
+    use super::*;
+
+    fn site(code_len: usize, fields: usize, static_fields: usize, needs_heap: bool) -> InlineSite {
+        InlineSite {
+            callee_code: vec![0; code_len.saturating_add(2)],
+            callee_code_len: code_len,
+            callee_max_locals: 1,
+            callee_num_args: 0,
+            callee_is_static: true,
+            return_type: b'V',
+            field_info: (0..fields).map(|pc| (pc, 0, b'I')).collect(),
+            compact_field_info: Vec::new(),
+            static_field_info: (0..static_fields)
+                .map(|pc| (pc, 1, 0, b'I', false))
+                .collect(),
+            ldc_info: Vec::new(),
+            ldc2w_info: Vec::new(),
+            needs_heap,
+            class_name: "InlineCost".to_string(),
+            method_name: "leaf".to_string(),
+            descriptor: "()V".to_string(),
+            elided_invoke_pcs: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn inline_selection_prices_backend_expansion() {
+        assert_eq!(inline_site_expansion_cost(&site(10, 2, 1, true)), Some(34));
+    }
+
+    #[test]
+    fn inline_selection_rejects_oversized_or_expensive_leaf() {
+        assert_eq!(
+            inline_site_expansion_cost(&site(MAX_INLINE_BYTECODE_SIZE + 1, 0, 0, false)),
+            None
+        );
+        assert_eq!(inline_site_expansion_cost(&site(35, 5, 0, true)), None);
+    }
 }
 
 /// A constant-pool value that the JIT can materialize safely.
@@ -7236,9 +7305,11 @@ fn try_compile_inner(
                 if inline_budget_remaining > 0 {
                     if let Some(resolver_fn) = inline_resolver.as_ref() {
                         if let Some(site) = resolver_fn(&class_name, &method_name, &descriptor) {
-                            if site.callee_code_len <= inline_budget_remaining {
+                            if let Some(expansion_cost) = inline_site_expansion_cost(&site)
+                                .filter(|cost| *cost <= inline_budget_remaining)
+                            {
                                 inline_budget_remaining =
-                                    inline_budget_remaining.saturating_sub(site.callee_code_len);
+                                    inline_budget_remaining.saturating_sub(expansion_cost);
                                 if site.needs_heap {
                                     needs_heap = true;
                                 }
