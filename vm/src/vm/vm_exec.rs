@@ -10974,9 +10974,9 @@ pub fn invoke_or_native(
         }
     }
 
-    if let Some(callback) = shared
+    if let Some((callback, native_kind)) = shared
         .native_methods
-        .find(effective_class, method_name, descriptor)
+        .find_with_kind(effective_class, method_name, descriptor)
     {
         if crate::runtime::env_cache::bd_debug() && method_name == "intValue" {
             eprintln!("[invoke_or_native] direct native hit");
@@ -10987,11 +10987,15 @@ pub fn invoke_or_native(
         // end of this function — provided real bytecode actually exists. The
         // ReentrantLock fallback is also protected this way: it exists only for
         // fake-JDK synthetic lock stubs and must not steal real AQS bytecode.
+        //
+        // PERF (H2 TestFileSystem.testConcurrent hang, 2026-07-23): this used
+        // to be a second independent `kind_of(...)` call recomputing the same
+        // 128-bit (class, method, descriptor) hash `find(...)` just computed
+        // above -- a full byte-walk of all three strings, twice, on every
+        // single native dispatch VM-wide. `find_with_kind` above folds both
+        // lookups into one hash computation. See its doc comment.
         let synthetic_stub_native =
-            shared
-                .native_methods
-                .kind_of(effective_class, method_name, descriptor)
-                == Some(cratonvm_native_api::NativeKind::SyntheticStub);
+            native_kind == cratonvm_native_api::NativeKind::SyntheticStub;
         let real_protected_stub = synthetic_stub_native
             && (crate::runtime::env_cache::real_bytecode_selector().prefers_real(effective_class)
                 || matches!(
@@ -15449,6 +15453,7 @@ fn invoke_on_class_shared_inner(
                                 | "setProperty"
                                 | "put"
                                 | "putAll"
+                                | "computeIfAbsent"
                                 | "get"
                                 | "containsKey"
                                 | "stringPropertyNames"

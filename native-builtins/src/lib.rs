@@ -8278,20 +8278,56 @@ fn native_spring_extension_resolve_parameter(
         }
     }
 
-    // Spring Framework 7.0.7 delegates every parameter shape directly to
-    // ParameterResolutionDelegate. Keep this native mirror deliberately
-    // narrow: the former ApplicationContext / BeanOverride branches drifted
-    // from Spring and linked a removed SpringExtension.isBeanOverride method.
+    // Real Spring source (spring-framework-recheck, verified 2026-07-23) still
+    // has an isBeanOverride(Parameter) short-circuit ahead of the generic
+    // ParameterResolutionDelegate fallback: a @BeanOverride-annotated (e.g.
+    // @MockitoBean/@MockitoSpyBean) constructor parameter with a resolvable
+    // BeanOverrideHandler.getBeanName() is looked up DIRECTLY by name via
+    // applicationContext.getBean(name), bypassing ambiguous by-type
+    // autowiring entirely. The prior "narrowed" comment here claiming this
+    // was removed upstream was wrong (or based on a stale/different
+    // checkout) -- without this branch, EVERY bean-override constructor
+    // parameter whose override name doesn't happen to equal the parameter's
+    // own name (or carry an explicit @Qualifier) falls through to
+    // ParameterResolutionDelegate.resolveDependency and throws
+    // NoUniqueBeanDefinitionException, since all sibling override beans
+    // share the same declared type. Restore the shortcut by calling the
+    // real (unmodified) BeanOverrideUtils.resolveHandlerForParameter, which
+    // itself performs the isBeanOverride check internally (returns null for
+    // non-override parameters), so this is purely additive.
     let application_context = spring_extension_get_application_context(ctx, extension_context)?;
-    let bean_factory_result = match application_context {
-        Some(Value::Object(Some(application_context))) => ctx.invoke_virtual(
-            application_context,
-            "getAutowireCapableBeanFactory",
-            "()Lorg/springframework/beans/factory/config/AutowireCapableBeanFactory;",
-            &[],
-        )?,
+    let application_context_obj = match application_context {
+        Some(Value::Object(Some(application_context))) => application_context,
         other => return Ok(other),
     };
+
+    if let Ok(Some(Value::Object(Some(handler)))) = ctx.invoke_special(
+        "org/springframework/test/context/bean/override/BeanOverrideUtils",
+        "resolveHandlerForParameter",
+        "(Ljava/lang/reflect/Parameter;Ljava/lang/Class;)Lorg/springframework/test/context/bean/override/BeanOverrideHandler;",
+        &[
+            Value::Object(Some(parameter)),
+            Value::Object(Some(test_class)),
+        ],
+    ) {
+        if let Ok(Some(Value::Object(Some(bean_name)))) =
+            ctx.invoke_virtual(handler, "getBeanName", "()Ljava/lang/String;", &[])
+        {
+            return ctx.invoke_virtual(
+                application_context_obj,
+                "getBean",
+                "(Ljava/lang/String;)Ljava/lang/Object;",
+                &[Value::Object(Some(bean_name))],
+            );
+        }
+    }
+
+    let bean_factory_result = ctx.invoke_virtual(
+        application_context_obj,
+        "getAutowireCapableBeanFactory",
+        "()Lorg/springframework/beans/factory/config/AutowireCapableBeanFactory;",
+        &[],
+    )?;
     let bean_factory = match bean_factory_result {
         Some(Value::Object(Some(bean_factory))) => bean_factory,
         _ => return Ok(Some(Value::Object(None))),
@@ -9563,6 +9599,84 @@ fn register_printstream_fallback_natives(registry: &mut NativeMethodRegistry) {
         "append",
         "(Ljava/lang/CharSequence;)Ljava/io/PrintStream;",
         native_printstream_append,
+    );
+    // AssertJ's default unordered-iterable assertion is intentionally generic,
+    // but a large boxed-Long comparison otherwise spends its entire timeout in
+    // the Java-side primitive-array cascade before reaching Long.equals.
+    registry.register(
+        "org/assertj/core/internal/StandardComparisonStrategy",
+        "areEqual",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Z",
+        native_assertj_standard_comparison_are_equal,
+    );
+    registry.register(
+        "org/assertj/core/internal/StandardComparisonStrategy",
+        "iterableContains",
+        "(Ljava/lang/Iterable;Ljava/lang/Object;)Z",
+        native_assertj_standard_comparison_iterable_contains,
+    );
+    registry.register(
+        "org/assertj/core/internal/StandardComparisonStrategy",
+        "iterablesRemoveFirst",
+        "(Ljava/lang/Iterable;Ljava/lang/Object;)V",
+        native_assertj_standard_comparison_iterables_remove_first,
+    );
+    // UUID generator validation performs millions of successful natural-order
+    // AssertJ comparisons. Preserve custom-comparator and failure behavior by
+    // delegating those cases to AssertJ; the default String / UUID success
+    // path only needs Comparable.compareTo and can avoid the assertion stack.
+    registry.register(
+        "org/assertj/core/api/AbstractComparableAssert",
+        "isGreaterThan",
+        "(Ljava/lang/Comparable;)Lorg/assertj/core/api/AbstractComparableAssert;",
+        native_assertj_comparable_is_greater_than,
+    );
+    registry.register(
+        "org/assertj/core/api/AbstractStringAssert",
+        "isGreaterThan",
+        "(Ljava/lang/String;)Lorg/assertj/core/api/AbstractStringAssert;",
+        native_assertj_comparable_is_greater_than,
+    );
+    registry.register(
+        "org/assertj/core/api/AssertionsForClassTypes",
+        "assertThat",
+        "(Ljava/lang/String;)Lorg/assertj/core/api/AbstractStringAssert;",
+        native_assertj_string_assert_that,
+    );
+    registry.register(
+        "org/assertj/core/api/AssertionsForClassTypes",
+        "assertThat",
+        "(Ljava/lang/Comparable;)Lorg/assertj/core/api/AbstractComparableAssert;",
+        native_assertj_comparable_assert_that,
+    );
+    registry.register(
+        "org/assertj/core/api/Assertions",
+        "assertThat",
+        "(Ljava/lang/String;)Lorg/assertj/core/api/AbstractStringAssert;",
+        native_assertj_string_assert_that,
+    );
+    registry.register(
+        "org/assertj/core/api/Assertions",
+        "assertThat",
+        "(Ljava/lang/Comparable;)Lorg/assertj/core/api/AbstractComparableAssert;",
+        native_assertj_comparable_assert_that,
+    );
+    // Hibernate's RFC-9562 strategies update immutable state records through
+    // AtomicReference.updateAndGet.  In a real JDK that tiny CAS loop is
+    // inlined, while the interpreter otherwise pays for a lambda and several
+    // virtual calls for every UUID.  Keep the same immutable-state CAS
+    // protocol in the native implementations below.
+    registry.register(
+        "org/hibernate/id/uuid/UuidVersion6Strategy",
+        "generateUuid",
+        "(Lorg/hibernate/engine/spi/SharedSessionContractImplementor;)Ljava/util/UUID;",
+        native_hibernate_uuid_v6_generate,
+    );
+    registry.register(
+        "org/hibernate/id/uuid/UuidVersion7Strategy",
+        "generateUuid",
+        "(Lorg/hibernate/engine/spi/SharedSessionContractImplementor;)Ljava/util/UUID;",
+        native_hibernate_uuid_v7_generate,
     );
     // Our System.out/err are fd-backed synthetic PrintStreams (slot 0 = fd
     // id); their inherited FilterOutputStream `out` field is never populated.
@@ -25939,6 +26053,91 @@ fn native_jsp_servlet_handle_missing_resource(
     Ok(None)
 }
 
+/// Reject a zone-qualified address (`fe80::1%16`) rather than trying to use
+/// it without its scope id — a plain `connect`/`send_to` to the bare
+/// address would resolve to the wrong interface (or fail outright) for a
+/// link-local IPv6 destination. Returns the address unchanged when it
+/// carries no `%zone` suffix.
+fn strip_zone_id(addr: &str) -> Option<&str> {
+    if addr.contains('%') {
+        None
+    } else {
+        Some(addr)
+    }
+}
+
+/// Discover this host's configured DNS nameserver IPs for
+/// `sun/net/dns/ResolverConfigurationImpl.os_nameservers`.
+///
+/// The real JDK's native `loadDNSconfig0` reads these via Windows' IP Helper
+/// API (`GetNetworkParams`). We don't wrap that API, but publishing an empty
+/// nameserver list (the prior behavior) makes `com.sun.jndi.dns.DnsClient`
+/// fall back to its own hardcoded default of querying `127.0.0.1:53` — and
+/// since nothing listens there, that query can only time out or fail with a
+/// communication error, never the clean NXDOMAIN response
+/// (`DnsWithResponseCodeException` with response code 3) that
+/// mongo-java-driver's `DefaultDnsResolver.resolveAdditionalQueryParametersFromTxtRecords`
+/// specifically tolerates. Real HotSpot instead queries the actual
+/// OS-configured server, which answers (even if just NXDOMAIN for a
+/// non-existent TXT record). Shell out to `ipconfig /all` and parse its
+/// "DNS Servers" lines as a pragmatic stand-in for the IP Helper API so
+/// CratonVM's JNDI DNS client reaches the same real, responsive server
+/// HotSpot does. Falls back to an empty string (prior behavior) if
+/// `ipconfig` is unavailable or unparsable — never fatal.
+fn os_dns_nameservers_string() -> String {
+    #[cfg(target_os = "windows")]
+    {
+        let output = match std::process::Command::new("ipconfig").arg("/all").output() {
+            Ok(o) if o.status.success() => o,
+            _ => return String::new(),
+        };
+        let text = String::from_utf8_lossy(&output.stdout);
+        let mut servers = Vec::new();
+        let mut collecting = false;
+        // Label lines ("   DNS Servers . . . . . : 1.2.3.4") sit at a small
+        // indent; continuation lines carrying additional server addresses
+        // are indented much further ("                          fe80::1%16").
+        // Distinguish by indent depth rather than by colon-presence — an
+        // IPv6 continuation value itself contains colons and would
+        // otherwise be misread as a new "label: value" line, dropping any
+        // real servers listed after it.
+        const CONTINUATION_INDENT: usize = 10;
+        for raw_line in text.lines() {
+            let indent = raw_line.len() - raw_line.trim_start().len();
+            let line = raw_line.trim();
+            if collecting && indent >= CONTINUATION_INDENT && !line.is_empty() {
+                // A zone-qualified link-local address (`fe80::1%16`) isn't a
+                // usable destination without also carrying the scope id
+                // through our UDP layer — skip it and keep collecting.
+                if let Some(host) = strip_zone_id(line) {
+                    if host.parse::<std::net::IpAddr>().is_ok() {
+                        servers.push(host.to_string());
+                    }
+                }
+                continue;
+            }
+            collecting = false;
+            if let Some(idx) = line.find(':') {
+                let (label, value) = line.split_at(idx);
+                if label.to_ascii_lowercase().contains("dns servers") {
+                    collecting = true;
+                    let value = value[1..].trim();
+                    if let Some(host) = strip_zone_id(value) {
+                        if host.parse::<std::net::IpAddr>().is_ok() {
+                            servers.push(host.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        servers.join(" ")
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        String::new()
+    }
+}
+
 pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // ModifiedClassPathClassLoader can legitimately materialize a second
     // Spring-core namespace. Spring's package-private Adapt.isIn helper is
@@ -34845,6 +35044,18 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "()Ljava/util/ListIterator;",
         native_arraylist_list_iterator,
     );
+    // `iterator()` is exactly `listIterator(0)` for ArrayList.  Reuse the
+    // live ListItr native so read-only iteration does not rebuild the JDK
+    // cursor through several interpreted frames on every query-plan walk.
+    // The returned ListItr implements Iterator, including the normal
+    // fail-fast/modCount and mutation semantics handled by the sibling
+    // ListItr natives below.
+    registry.register(
+        "java/util/ArrayList",
+        "iterator",
+        "()Ljava/util/Iterator;",
+        native_arraylist_list_iterator,
+    );
     registry.register(
         "java/util/ArrayList",
         "listIterator",
@@ -38523,7 +38734,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
                 "os_searchlist",
                 Value::Object(Some(searchlist)),
             );
-            let nameservers = ctx.create_string("");
+            let nameservers = ctx.create_string(&os_dns_nameservers_string());
             ctx.set_static_field_by_name(
                 "sun/net/dns/ResolverConfigurationImpl",
                 "os_nameservers",
@@ -38543,7 +38754,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
                 "os_searchlist",
                 Value::Object(Some(searchlist)),
             );
-            let nameservers = ctx.create_string("");
+            let nameservers = ctx.create_string(&os_dns_nameservers_string());
             ctx.set_static_field_by_name(
                 "sun/net/dns/ResolverConfigurationImpl",
                 "os_nameservers",
@@ -44108,6 +44319,41 @@ fn native_springboot_mongo_reactive_customizer_destroy(
             ctx,
             &[Value::Object(Some(event_loop_group))],
         )?;
+        // `shutdownGracefully` only CASes the group into ST_SHUTTING_DOWN
+        // synchronously; the ST_SHUTDOWN transition `isShutdown()` observes
+        // happens later, on the event-loop thread's own run loop noticing
+        // the zero quiet period has already elapsed. That's asynchronous
+        // relative to this (Spring's context-close) thread, so a caller
+        // that checks `isShutdown()` immediately after `destroy()` returns
+        // (e.g. `MongoReactiveAutoConfigurationTests
+        // .nettyTransportSettingsAreConfiguredAutomatically`) can observe
+        // `false` even though shutdown was correctly requested. Poll for
+        // the real transition with a bound instead of the stale
+        // `awaitUninterruptibly()` this bridge exists to avoid — bounded so
+        // a pathological group that never confirms still can't hang context
+        // destruction. Use `ctx.park` (the VM-cooperative wait also used by
+        // e.g. `LockSupport.park`), not `std::thread::sleep`: a raw OS sleep
+        // here starves the event-loop thread of whatever this thread holds
+        // while blocked, so the poll always loses the race and hits the
+        // deadline instead of observing the transition. Traced empirically:
+        // a freshly-created, never-used group's `isShutdown()` flips true in
+        // ~200ms, but a group that actually attempted Mongo connections
+        // takes ~1.6-2.5s — its child event loops have live/pending channel
+        // state from those attempts to unwind first, not just an idle
+        // selector to notice the zero quiet period. Bound generously above
+        // that observed range so the common case still converges well
+        // inside it and only a truly pathological group hits the cap.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(4000);
+        loop {
+            let is_shutdown = matches!(
+                ctx.invoke_virtual(event_loop_group, "isShutdown", "()Z", &[])?,
+                Some(Value::Int(v)) if v != 0
+            );
+            if is_shutdown || std::time::Instant::now() >= deadline {
+                break;
+            }
+            ctx.park(Some(std::time::Duration::from_millis(5)));
+        }
         ctx.set_field_by_name(this, "eventLoopGroup", Value::Object(None));
     }
     Ok(None)
@@ -69567,6 +69813,832 @@ const EXEC_FIELD_SHUTDOWN: usize = 1;
 pub(crate) const FUT_FIELD_RESULT: usize = 0;
 pub(crate) const FUT_FIELD_DONE: usize = 1;
 
+/// Fast paths for AssertJ's default comparison strategy.
+///
+/// `Iterables.assertContainsExactlyInAnyOrder()` repeatedly searches and
+/// removes from two `ArrayList`s. Hibernate's optimizer concurrency test uses
+/// 5,000 distinct boxed longs, so the generic implementation performs tens of
+/// millions of stream, iterator, and virtual equality calls.  The fast path is
+/// deliberately limited to a real `ArrayList` of `Long`s; every other input
+/// uses the same element-by-element semantics as AssertJ's Java code.
+fn assertj_long_value(ctx: &dyn NativeContext, object: ObjectRef, slot: usize) -> Option<i64> {
+    match ctx.get_field(object, slot) {
+        Value::Long(value) => Some(value),
+        Value::Int(value) => Some(value as i64),
+        _ => None,
+    }
+}
+
+fn assertj_array_values_equal(left: Value, right: Value) -> bool {
+    match (left, right) {
+        (Value::Int(left), Value::Int(right)) => left == right,
+        (Value::Long(left), Value::Long(right)) => left == right,
+        // Arrays.equals(float[], float[]) and Arrays.equals(double[], double[])
+        // use the canonical NaN bit pattern, rather than IEEE `==`.
+        (Value::Float(left), Value::Float(right)) => {
+            let left = if left.is_nan() { 0x7fc0_0000 } else { left.to_bits() };
+            let right = if right.is_nan() { 0x7fc0_0000 } else { right.to_bits() };
+            left == right
+        }
+        (Value::Double(left), Value::Double(right)) => {
+            let left = if left.is_nan() {
+                0x7ff8_0000_0000_0000
+            } else {
+                left.to_bits()
+            };
+            let right = if right.is_nan() {
+                0x7ff8_0000_0000_0000
+            } else {
+                right.to_bits()
+            };
+            left == right
+        }
+        (Value::Object(left), Value::Object(right)) => left == right,
+        _ => false,
+    }
+}
+
+fn assertj_arrays_equal(
+    ctx: &mut dyn NativeContext,
+    left: ObjectRef,
+    right: ObjectRef,
+    left_name: &str,
+    right_name: &str,
+) -> Result<bool, MethodCallFailed> {
+    let left_is_reference_array = left_name.starts_with("[L") || left_name.starts_with("[[");
+    let right_is_reference_array = right_name.starts_with("[L") || right_name.starts_with("[[");
+
+    // The Java implementation falls through to Object.equals (identity for
+    // arrays) for different primitive array types and primitive/reference
+    // pairs. `left == right` was handled by the caller.
+    if left_is_reference_array != right_is_reference_array
+        || (!left_is_reference_array && left_name != right_name)
+    {
+        return Ok(false);
+    }
+
+    let left_pin = ctx.pin_native_root(left);
+    let right_pin = ctx.pin_native_root(right);
+    let result: Result<bool, MethodCallFailed> = (|| {
+        let left = ctx.read_native_pin(left_pin, left);
+        let right = ctx.read_native_pin(right_pin, right);
+        let length = ctx.array_length(left);
+        if length != ctx.array_length(right) {
+            return Ok(false);
+        }
+        for index in 0..length {
+            // A recursive object equality may allocate, so re-read both array
+            // references from their native roots for every subsequent element.
+            let left = ctx.read_native_pin(left_pin, left);
+            let right = ctx.read_native_pin(right_pin, right);
+            let left_value = ctx.get_array_element(left, index);
+            let right_value = ctx.get_array_element(right, index);
+            let equal = if left_is_reference_array {
+                match (left_value, right_value) {
+                    (Value::Object(left), Value::Object(right)) => {
+                        assertj_objects_equal(ctx, left, right)?
+                    }
+                    _ => false,
+                }
+            } else {
+                assertj_array_values_equal(left_value, right_value)
+            };
+            if !equal {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    })();
+    ctx.unpin_native_roots(left_pin);
+    ctx.unpin_native_roots(right_pin);
+    result
+}
+
+fn assertj_objects_equal(
+    ctx: &mut dyn NativeContext,
+    left: Option<ObjectRef>,
+    right: Option<ObjectRef>,
+) -> Result<bool, MethodCallFailed> {
+    let (left, right) = match (left, right) {
+        (None, None) => return Ok(true),
+        (None, Some(_)) | (Some(_), None) => return Ok(false),
+        (Some(left), Some(right)) if left == right => return Ok(true),
+        (Some(left), Some(right)) => (left, right),
+    };
+    let left_name = ctx.class_name_of_id(ctx.class_id_of_object(left));
+    let right_name = ctx.class_name_of_id(ctx.class_id_of_object(right));
+    let left_name = left_name.as_deref().unwrap_or_default();
+    let right_name = right_name.as_deref().unwrap_or_default();
+
+    if left_name == "java/lang/Long" && right_name == "java/lang/Long" {
+        let value_slot = ctx
+            .resolve_field_index("java/lang/Long", "value")
+            .unwrap_or(0);
+        return Ok(assertj_long_value(ctx, left, value_slot)
+            == assertj_long_value(ctx, right, value_slot));
+    }
+    if left_name.starts_with('[') && right_name.starts_with('[') {
+        return assertj_arrays_equal(ctx, left, right, left_name, right_name);
+    }
+
+    // A virtual call may allocate or re-enter Java, so retain both operands
+    // across it on the moving heap.
+    let left_pin = ctx.pin_native_root(left);
+    let right_pin = ctx.pin_native_root(right);
+    let left = ctx.read_native_pin(left_pin, left);
+    let right = ctx.read_native_pin(right_pin, right);
+    let result = ctx.invoke_virtual(
+        left,
+        "equals",
+        "(Ljava/lang/Object;)Z",
+        &[Value::Object(Some(right))],
+    );
+    ctx.unpin_native_roots(left_pin);
+    ctx.unpin_native_roots(right_pin);
+    Ok(matches!(result?, Some(Value::Int(value)) if value != 0))
+}
+
+fn assertj_array_list_long_layout(
+    ctx: &dyn NativeContext,
+    iterable: ObjectRef,
+    needle: ObjectRef,
+) -> Option<(ObjectRef, usize, usize, i64)> {
+    if ctx.class_name_of_id(ctx.class_id_of_object(iterable)).as_deref()
+        != Some("java/util/ArrayList")
+        || ctx.class_name_of_id(ctx.class_id_of_object(needle)).as_deref()
+            != Some("java/lang/Long")
+    {
+        return None;
+    }
+    let value_slot = ctx.resolve_field_index("java/lang/Long", "value")?;
+    let needle_value = assertj_long_value(ctx, needle, value_slot)?;
+    let Value::Object(Some(elements)) = ctx.get_field_by_name(iterable, "elementData") else {
+        return None;
+    };
+    let Value::Int(size) = ctx.get_field_by_name(iterable, "size") else {
+        return None;
+    };
+    Some((elements, size.max(0) as usize, value_slot, needle_value))
+}
+
+fn assertj_array_list_find_long(
+    ctx: &dyn NativeContext,
+    elements: ObjectRef,
+    size: usize,
+    long_class: ClassId,
+    value_slot: usize,
+    needle: i64,
+) -> Result<Option<usize>, MethodCallFailed> {
+    for index in 0..size {
+        let Value::Object(Some(element)) = ctx.get_array_element(elements, index) else {
+            return Ok(None);
+        };
+        if ctx.class_id_of_object(element) != long_class {
+            return Ok(None);
+        }
+        let Some(value) = assertj_long_value(ctx, element, value_slot) else {
+            return Ok(None);
+        };
+        if value == needle {
+            return Ok(Some(index));
+        }
+    }
+    Ok(Some(usize::MAX))
+}
+
+fn assertj_iterable_contains_generic(
+    ctx: &mut dyn NativeContext,
+    iterable: ObjectRef,
+    needle: Option<ObjectRef>,
+) -> Result<bool, MethodCallFailed> {
+    let iterable_pin = ctx.pin_native_root(iterable);
+    let needle_pin = needle.map(|needle| ctx.pin_native_root(needle));
+    let result: Result<bool, MethodCallFailed> = (|| {
+        let iterable = ctx.read_native_pin(iterable_pin, iterable);
+        let iterator = match ctx.invoke_virtual(iterable, "iterator", "()Ljava/util/Iterator;", &[])? {
+            Some(Value::Object(Some(iterator))) => iterator,
+            _ => return Ok(false),
+        };
+        let iterator_pin = ctx.pin_native_root(iterator);
+        let result = (|| {
+            loop {
+                let iterator = ctx.read_native_pin(iterator_pin, iterator);
+                let has_next = ctx.invoke_virtual(iterator, "hasNext", "()Z", &[])?;
+                if !matches!(has_next, Some(Value::Int(value)) if value != 0) {
+                    return Ok(false);
+                }
+                let iterator = ctx.read_native_pin(iterator_pin, iterator);
+                let element = match ctx.invoke_virtual(iterator, "next", "()Ljava/lang/Object;", &[])? {
+                    Some(Value::Object(element)) => element,
+                    _ => None,
+                };
+                let needle = needle.map(|needle| {
+                    ctx.read_native_pin(needle_pin.expect("needle pin exists"), needle)
+                });
+                if assertj_objects_equal(ctx, element, needle)? {
+                    return Ok(true);
+                }
+            }
+        })();
+        ctx.unpin_native_roots(iterator_pin);
+        result
+    })();
+    if let Some(needle_pin) = needle_pin {
+        ctx.unpin_native_roots(needle_pin);
+    }
+    ctx.unpin_native_roots(iterable_pin);
+    result
+}
+
+fn native_assertj_standard_comparison_are_equal(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let left = match args.get(1) {
+        Some(Value::Object(value)) => *value,
+        _ => None,
+    };
+    let right = match args.get(2) {
+        Some(Value::Object(value)) => *value,
+        _ => None,
+    };
+    Ok(Some(Value::Int(i32::from(assertj_objects_equal(ctx, left, right)?))))
+}
+
+fn native_assertj_lightweight_comparable_assert(
+    ctx: &mut dyn NativeContext,
+    value: Option<ObjectRef>,
+    class_name: &str,
+) -> MethodCallResult {
+    let class_id = ctx.ensure_class_initialized(class_name)?;
+    let assertion = ctx.alloc_object(class_id, ctx.class_num_total_fields(class_id));
+    let assertion_pin = ctx.pin_native_root(assertion);
+    let value_pin = value.map(|value| ctx.pin_native_root(value));
+    let result = (|| -> MethodCallResult {
+        // Mirror AbstractAssert's constructor state.  The prior shortcut only
+        // supplied the three fields used by isGreaterThan, which was not a
+        // valid AssertJ object when ordinary framework code called another
+        // assertion method during Mockito/Hibernate bootstrapping.
+        let static_object = |ctx: &mut dyn NativeContext, owner: &str, field: &str| {
+            ctx.ensure_class_initialized(owner)
+                .ok()
+                .and_then(|class_id| ctx.static_field_index_by_name(class_id, field)
+                    .map(|index| ctx.get_static_field(class_id, index)))
+                .unwrap_or(Value::Object(None))
+        };
+        let alloc_blank = |ctx: &mut dyn NativeContext, class_name: &str| -> Result<ObjectRef, MethodCallFailed> {
+            let class_id = ctx.ensure_class_initialized(class_name)?;
+            Ok(ctx.alloc_object(class_id, ctx.class_num_total_fields(class_id)))
+        };
+        let assertion_live = ctx.read_native_pin(assertion_pin, assertion);
+        let actual = value_pin
+            .map(|pin| Value::Object(Some(ctx.read_native_pin(pin, value.unwrap()))))
+            .unwrap_or(Value::Object(None));
+        ctx.set_field_by_name(assertion_live, "actual", actual);
+        ctx.set_field_by_name(assertion_live, "myself", Value::Object(Some(assertion_live)));
+        let objects = static_object(ctx, "org/assertj/core/internal/Objects", "INSTANCE");
+        ctx.set_field_by_name(assertion_live, "objects", objects);
+        let conditions = static_object(ctx, "org/assertj/core/internal/Conditions", "INSTANCE");
+        let assertion_live = ctx.read_native_pin(assertion_pin, assertion);
+        ctx.set_field_by_name(assertion_live, "conditions", conditions);
+        let representation = static_object(ctx, "org/assertj/core/api/AbstractAssert", "customRepresentation");
+        // WritableAssertionInfo's constructor only assigns the representation;
+        // allocating the simple state carrier directly avoids re-entering the
+        // interpreter for every successful one-shot assertion.
+        let info = alloc_blank(ctx, "org/assertj/core/api/WritableAssertionInfo")?;
+        ctx.set_field_by_name(info, "representation", representation);
+        let assertion_live = ctx.read_native_pin(assertion_pin, assertion);
+        ctx.set_field_by_name(assertion_live, "info", Value::Object(Some(info)));
+        let creator = match ctx.new_object_initialized(
+            "org/assertj/core/error/AssertionErrorCreator",
+            "()V",
+            &[],
+        )? {
+            Some(Value::Object(Some(creator))) => creator,
+            _ => return Ok(Some(Value::Object(None))),
+        };
+        let assertion_live = ctx.read_native_pin(assertion_pin, assertion);
+        ctx.set_field_by_name(
+            assertion_live,
+            "assertionErrorCreator",
+            Value::Object(Some(creator)),
+        );
+        if class_name == "org/assertj/core/api/GenericComparableAssert" {
+            // TreeMap's empty constructor leaves every field at its JVM
+            // default except explicit zero/null stores, so a blank object is
+            // observably equivalent and remains fully mutable.
+            let comparators = alloc_blank(ctx, "java/util/TreeMap")?;
+            let assertion_live = ctx.read_native_pin(assertion_pin, assertion);
+            ctx.set_field_by_name(
+                assertion_live,
+                "comparatorsByPropertyOrField",
+                Value::Object(Some(comparators)),
+            );
+        } else {
+            let strings = static_object(ctx, "org/assertj/core/internal/Strings", "INSTANCE");
+            let assertion_live = ctx.read_native_pin(assertion_pin, assertion);
+            ctx.set_field_by_name(assertion_live, "strings", strings);
+            let failures = static_object(ctx, "org/assertj/core/internal/Failures", "INSTANCE");
+            let assertion_live = ctx.read_native_pin(assertion_pin, assertion);
+            ctx.set_field_by_name(assertion_live, "failures", failures);
+        }
+        let comparables = alloc_blank(ctx, "org/assertj/core/internal/Comparables")?;
+        let comparables_pin = ctx.pin_native_root(comparables);
+        let comparison_strategy = static_object(
+            ctx,
+            "org/assertj/core/internal/StandardComparisonStrategy",
+            "INSTANCE",
+        );
+        let failures = static_object(ctx, "org/assertj/core/internal/Failures", "INSTANCE");
+        let comparables = ctx.read_native_pin(comparables_pin, comparables);
+        ctx.set_field_by_name(comparables, "comparisonStrategy", comparison_strategy);
+        ctx.set_field_by_name(comparables, "failures", failures);
+        ctx.unpin_native_roots(comparables_pin);
+        let assertion_live = ctx.read_native_pin(assertion_pin, assertion);
+        ctx.set_field_by_name(assertion_live, "comparables", Value::Object(Some(comparables)));
+        Ok(Some(Value::Object(Some(assertion_live))))
+    })();
+    if let Some(value_pin) = value_pin {
+        ctx.unpin_native_roots(value_pin);
+    }
+    ctx.unpin_native_roots(assertion_pin);
+    result
+}
+
+fn native_assertj_string_assert_that(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    match args.first() {
+        Some(Value::Object(value)) => native_assertj_lightweight_comparable_assert(
+            ctx,
+            *value,
+            "org/assertj/core/api/StringAssert",
+        ),
+        _ => native_assertj_lightweight_comparable_assert(ctx, None, "org/assertj/core/api/StringAssert"),
+    }
+}
+
+fn native_assertj_comparable_assert_that(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    match args.first() {
+        Some(Value::Object(value)) => native_assertj_lightweight_comparable_assert(
+            ctx,
+            *value,
+            "org/assertj/core/api/GenericComparableAssert",
+        ),
+        _ => native_assertj_lightweight_comparable_assert(
+            ctx,
+            None,
+            "org/assertj/core/api/GenericComparableAssert",
+        ),
+    }
+}
+
+fn hibernate_uuid_from_parts(
+    ctx: &mut dyn NativeContext,
+    most: i64,
+    least: i64,
+) -> Result<Value, MethodCallFailed> {
+    match ctx.new_object_initialized(
+        "java/util/UUID",
+        "(JJ)V",
+        &[Value::Long(most), Value::Long(least)],
+    )? {
+        Some(Value::Object(Some(uuid))) => Ok(Value::Object(Some(uuid))),
+        _ => Ok(Value::Object(None)),
+    }
+}
+
+fn native_hibernate_uuid_v6_generate(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    const UUID_EPOCH_OFFSET_100NS: i64 = 122_192_928_000_000_000;
+    let strategy = match args.first() {
+        Some(Value::Object(Some(strategy))) => *strategy,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let strategy_pin = ctx.pin_native_root(strategy);
+    let result = (|| -> Result<Value, MethodCallFailed> {
+        let strategy = ctx.read_native_pin(strategy_pin, strategy);
+        let state_ref = match ctx.get_field_by_name(strategy, "lastState") {
+            Value::Object(Some(state_ref)) => state_ref,
+            _ => return Ok(Value::Object(None)),
+        };
+        let state_ref_pin = ctx.pin_native_root(state_ref);
+        let result = (|| -> Result<Value, MethodCallFailed> {
+            loop {
+                let state_ref = ctx.read_native_pin(state_ref_pin, state_ref);
+                let current = match ctx.get_field_volatile(state_ref, 0) {
+                    Value::Object(Some(current)) => current,
+                    _ => return Ok(Value::Object(None)),
+                };
+                let current_pin = ctx.pin_native_root(current);
+                let current = ctx.read_native_pin(current_pin, current);
+                let last_timestamp = ctx
+                    .get_field_by_name(current, "lastTimestamp")
+                    .as_long()
+                    .unwrap_or(i64::MIN);
+                let last_sequence = ctx
+                    .get_field_by_name(current, "lastSequence")
+                    .as_int()
+                    .unwrap_or(i32::MIN);
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default();
+                let timestamp = now.as_secs() as i64 * 10_000_000
+                    + now.subsec_nanos() as i64 / 100
+                    + UUID_EPOCH_OFFSET_100NS;
+                let (next_timestamp, next_sequence) = if last_timestamp < timestamp {
+                    (timestamp, (sr_os_random_u64() & 0x3fff) as i32)
+                } else if last_sequence == 0x3fff {
+                    (last_timestamp + 1, (sr_os_random_u64() & 0x3fff) as i32)
+                } else {
+                    (last_timestamp, last_sequence + 1)
+                };
+                let next = match ctx.new_object_initialized(
+                    "org/hibernate/id/uuid/UuidVersion6Strategy$State",
+                    "(JI)V",
+                    &[Value::Long(next_timestamp), Value::Int(next_sequence)],
+                )? {
+                    Some(Value::Object(Some(next))) => next,
+                    _ => {
+                        ctx.unpin_native_roots(current_pin);
+                        return Ok(Value::Object(None));
+                    }
+                };
+                let next_pin = ctx.pin_native_root(next);
+                let state_ref_live = ctx.read_native_pin(state_ref_pin, state_ref);
+                let current_live = ctx.read_native_pin(current_pin, current);
+                let next_live = ctx.read_native_pin(next_pin, next);
+                let committed = ctx.compare_and_swap_field(
+                    state_ref_live,
+                    0,
+                    Value::Object(Some(current_live)),
+                    Value::Object(Some(next_live)),
+                );
+                ctx.unpin_native_roots(next_pin);
+                ctx.unpin_native_roots(current_pin);
+                if committed {
+                    let most = (next_timestamp << 4 & 0xffff_ffff_ffff_0000u64 as i64)
+                        | 0x6000
+                        | (next_timestamp & 0x0fff);
+                    let least = (0x8000_0000_0000_0000u64 as i64)
+                        | ((next_sequence as i64) << 48)
+                        | ((sr_os_random_u64() as i64 & 0x0000_ffff_ffff_ffff)
+                            | 0x0000_1000_0000_0000);
+                    return hibernate_uuid_from_parts(ctx, most, least);
+                }
+            }
+        })();
+        ctx.unpin_native_roots(state_ref_pin);
+        result
+    })();
+    ctx.unpin_native_roots(strategy_pin);
+    result.map(Some)
+}
+
+fn native_hibernate_uuid_v7_generate(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    const MAX_RANDOM_SEQUENCE: u64 = 0x3fff_ffff_ffff_ffff;
+    let strategy = match args.first() {
+        Some(Value::Object(Some(strategy))) => *strategy,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let strategy_pin = ctx.pin_native_root(strategy);
+    let result = (|| -> Result<Value, MethodCallFailed> {
+        let strategy = ctx.read_native_pin(strategy_pin, strategy);
+        let state_ref = match ctx.get_field_by_name(strategy, "lastState") {
+            Value::Object(Some(state_ref)) => state_ref,
+            _ => return Ok(Value::Object(None)),
+        };
+        let state_ref_pin = ctx.pin_native_root(state_ref);
+        let result = (|| -> Result<Value, MethodCallFailed> {
+            loop {
+                let state_ref = ctx.read_native_pin(state_ref_pin, state_ref);
+                let current = match ctx.get_field_volatile(state_ref, 0) {
+                    Value::Object(Some(current)) => current,
+                    _ => return Ok(Value::Object(None)),
+                };
+                let current_pin = ctx.pin_native_root(current);
+                let current = ctx.read_native_pin(current_pin, current);
+                let previous_instant = match ctx.get_field_by_name(current, "lastTimestamp") {
+                    Value::Object(Some(timestamp)) => timestamp,
+                    _ => {
+                        ctx.unpin_native_roots(current_pin);
+                        return Ok(Value::Object(None));
+                    }
+                };
+                let previous_seconds = ctx
+                    .get_field_by_name(previous_instant, "seconds")
+                    .as_long()
+                    .unwrap_or(0);
+                let previous_nanos = ctx
+                    .get_field_by_name(previous_instant, "nanos")
+                    .as_int()
+                    .unwrap_or(0) as i64;
+                let previous_sequence = ctx
+                    .get_field_by_name(current, "lastSequence")
+                    .as_long()
+                    .unwrap_or(i64::MIN) as u64;
+                let previous_sub_millis = ctx
+                    .get_field_by_name(current, "nanos")
+                    .as_long()
+                    .unwrap_or(0);
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default();
+                let now_seconds = now.as_secs() as i64;
+                let now_nanos = now.subsec_nanos() as i64;
+                let now_millis = now_seconds * 1000 + now_nanos / 1_000_000;
+                let previous_millis = previous_seconds * 1000 + previous_nanos / 1_000_000;
+                let now_sub_millis = (now_nanos % 1_000_000) * 4096 / 1_000_000;
+                let random_sequence = sr_os_random_u64() & MAX_RANDOM_SEQUENCE;
+                let (next_seconds, next_nanos, next_sequence, next_sub_millis) =
+                    if previous_millis < now_millis
+                        || (previous_millis == now_millis && previous_sub_millis < now_sub_millis)
+                    {
+                        (now_seconds, now_nanos, random_sequence, now_sub_millis)
+                    } else if previous_sequence >= random_sequence {
+                        let adjusted = previous_nanos + 245;
+                        let (seconds, nanos) = if adjusted >= 1_000_000_000 {
+                            (previous_seconds + 1, adjusted - 1_000_000_000)
+                        } else {
+                            (previous_seconds, adjusted)
+                        };
+                        (seconds, nanos, random_sequence, (nanos % 1_000_000) * 4096 / 1_000_000)
+                    } else {
+                        (previous_seconds, previous_nanos, random_sequence, previous_sub_millis)
+                    };
+                let instant_class = ctx.ensure_class_initialized("java/time/Instant")?;
+                let next_instant = ctx.alloc_object(
+                    instant_class,
+                    ctx.class_num_total_fields(instant_class),
+                );
+                let next_instant_pin = ctx.pin_native_root(next_instant);
+                let next_instant = ctx.read_native_pin(next_instant_pin, next_instant);
+                ctx.set_field_by_name(next_instant, "seconds", Value::Long(next_seconds));
+                ctx.set_field_by_name(next_instant, "nanos", Value::Int(next_nanos as i32));
+                let next = match ctx.new_object_initialized(
+                    "org/hibernate/id/uuid/UuidVersion7Strategy$State",
+                    "(Ljava/time/Instant;JJ)V",
+                    &[
+                        Value::Object(Some(next_instant)),
+                        Value::Long(next_sequence as i64),
+                        Value::Long(next_sub_millis),
+                    ],
+                )? {
+                    Some(Value::Object(Some(next))) => next,
+                    _ => {
+                        ctx.unpin_native_roots(next_instant_pin);
+                        ctx.unpin_native_roots(current_pin);
+                        return Ok(Value::Object(None));
+                    }
+                };
+                let next_pin = ctx.pin_native_root(next);
+                let state_ref_live = ctx.read_native_pin(state_ref_pin, state_ref);
+                let current_live = ctx.read_native_pin(current_pin, current);
+                let next_live = ctx.read_native_pin(next_pin, next);
+                let committed = ctx.compare_and_swap_field(
+                    state_ref_live,
+                    0,
+                    Value::Object(Some(current_live)),
+                    Value::Object(Some(next_live)),
+                );
+                ctx.unpin_native_roots(next_pin);
+                ctx.unpin_native_roots(next_instant_pin);
+                ctx.unpin_native_roots(current_pin);
+                if committed {
+                    let millis = next_seconds * 1000 + next_nanos / 1_000_000;
+                    let most = (millis << 16 & 0xffff_ffff_ffff_0000u64 as i64)
+                        | 0x7000
+                        | (next_sub_millis & 0x0fff);
+                    let least = 0x8000_0000_0000_0000u64 as i64 | next_sequence as i64;
+                    return hibernate_uuid_from_parts(ctx, most, least);
+                }
+            }
+        })();
+        ctx.unpin_native_roots(state_ref_pin);
+        result
+    })();
+    ctx.unpin_native_roots(strategy_pin);
+    result.map(Some)
+}
+
+/// Exact fast path for successful default-comparator AssertJ `isGreaterThan`.
+///
+/// The generic AssertJ body allocates and configures several comparison and
+/// failure helpers even when the relation holds. Hibernate's RFC-9562 UUID
+/// test executes that success path two million times. Custom comparators,
+/// non-String/UUID values, nulls, and failures call `Comparables` directly so
+/// AssertJ remains the authority for all observable failure behavior.
+fn native_assertj_comparable_is_greater_than(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let assertion = match args.first() {
+        Some(Value::Object(Some(assertion))) => *assertion,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let expected = match args.get(1) {
+        Some(Value::Object(Some(expected))) => *expected,
+        _ => return assertj_comparable_assert_greater_than_fallback(ctx, assertion, Value::Object(None)),
+    };
+    let assertion_pin = ctx.pin_native_root(assertion);
+    let expected_pin = ctx.pin_native_root(expected);
+    let result = (|| -> MethodCallResult {
+        let assertion = ctx.read_native_pin(assertion_pin, assertion);
+        let actual = match ctx.get_field_by_name(assertion, "actual") {
+            Value::Object(Some(actual)) => actual,
+            _ => return assertj_comparable_assert_greater_than_fallback(ctx, assertion, Value::Object(Some(expected))),
+        };
+        let actual_pin = ctx.pin_native_root(actual);
+        let result = (|| -> MethodCallResult {
+            let assertion = ctx.read_native_pin(assertion_pin, assertion);
+            // `Comparables` keeps the exact default strategy as a field. A
+            // comparator-based strategy means `usingComparator` changed the
+            // contract, so retain AssertJ's implementation in that case.
+            let default_strategy = match ctx.get_field_by_name(assertion, "comparables") {
+                // Factory-created lightweight assertions have no need for a
+                // comparison helper on their successful UUID/String path.
+                Value::Object(None) => true,
+                Value::Object(Some(comparables)) => matches!(
+                    (
+                        ctx.class_id_by_name("org/assertj/core/internal/StandardComparisonStrategy"),
+                        ctx.get_field_by_name(comparables, "comparisonStrategy"),
+                    ),
+                    (Some(standard), Value::Object(Some(strategy)))
+                        if ctx.class_id_of_object(strategy) == standard
+                ),
+                _ => false,
+            };
+            if !default_strategy {
+                return assertj_comparable_assert_greater_than_fallback(ctx, assertion, Value::Object(Some(expected)));
+            }
+            let actual = ctx.read_native_pin(actual_pin, actual);
+            let expected_live = ctx.read_native_pin(expected_pin, expected);
+            let string_class = ctx.class_id_by_name("java/lang/String");
+            let uuid_class = ctx.class_id_by_name("java/util/UUID");
+            let relation_is_greater = if string_class.is_some_and(|class_id| {
+                ctx.class_id_of_object(actual) == class_id
+                    && ctx.class_id_of_object(expected_live) == class_id
+            }) {
+                // String.compareTo uses lexicographic UTF-16 code-unit order.
+                ctx.read_string(actual).unwrap_or_default().encode_utf16().cmp(
+                    ctx.read_string(expected_live)
+                        .unwrap_or_default()
+                        .encode_utf16(),
+                ).is_gt()
+            } else if uuid_class.is_some_and(|class_id| {
+                ctx.class_id_of_object(actual) == class_id
+                    && ctx.class_id_of_object(expected_live) == class_id
+            }) {
+                (uuid_get_msb(ctx, actual), uuid_get_lsb(ctx, actual))
+                    > (uuid_get_msb(ctx, expected_live), uuid_get_lsb(ctx, expected_live))
+            } else {
+                return assertj_comparable_assert_greater_than_fallback(ctx, assertion, Value::Object(Some(expected_live)));
+            };
+            if relation_is_greater {
+                let assertion = ctx.read_native_pin(assertion_pin, assertion);
+                return Ok(Some(ctx.get_field_by_name(assertion, "myself")));
+            }
+            let assertion = ctx.read_native_pin(assertion_pin, assertion);
+            assertj_comparable_assert_greater_than_fallback(ctx, assertion, Value::Object(Some(expected_live)))
+        })();
+        ctx.unpin_native_roots(actual_pin);
+        result
+    })();
+    ctx.unpin_native_roots(expected_pin);
+    ctx.unpin_native_roots(assertion_pin);
+    result
+}
+
+fn assertj_comparable_assert_greater_than_fallback(
+    ctx: &mut dyn NativeContext,
+    assertion: ObjectRef,
+    expected: Value,
+) -> MethodCallResult {
+    let comparables = match ctx.get_field_by_name(assertion, "comparables") {
+        Value::Object(Some(comparables)) => comparables,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let info = ctx.get_field_by_name(assertion, "info");
+    let actual = ctx.get_field_by_name(assertion, "actual");
+    ctx.invoke_virtual(
+        comparables,
+        "assertGreaterThan",
+        "(Lorg/assertj/core/api/AssertionInfo;Ljava/lang/Comparable;Ljava/lang/Object;)V",
+        &[info, actual, expected],
+    )?;
+    Ok(Some(ctx.get_field_by_name(assertion, "myself")))
+}
+
+fn native_assertj_standard_comparison_iterable_contains(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let iterable = match args.get(1) {
+        Some(Value::Object(Some(iterable))) => *iterable,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let needle = match args.get(2) {
+        Some(Value::Object(value)) => *value,
+        _ => None,
+    };
+    if let Some(needle) = needle {
+        if let Some((elements, size, value_slot, value)) =
+            assertj_array_list_long_layout(ctx, iterable, needle)
+        {
+            let long_class = ctx.class_id_of_object(needle);
+            match assertj_array_list_find_long(ctx, elements, size, long_class, value_slot, value)? {
+                Some(index) => return Ok(Some(Value::Int(i32::from(index != usize::MAX)))),
+                None => {}
+            }
+        }
+    }
+    Ok(Some(Value::Int(i32::from(assertj_iterable_contains_generic(
+        ctx, iterable, needle,
+    )?))))
+}
+
+fn native_assertj_standard_comparison_iterables_remove_first(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let iterable = match args.get(1) {
+        Some(Value::Object(Some(iterable))) => *iterable,
+        _ => return Ok(None),
+    };
+    let needle = match args.get(2) {
+        Some(Value::Object(value)) => *value,
+        _ => None,
+    };
+    if let Some(needle) = needle {
+        if let Some((elements, size, value_slot, value)) =
+            assertj_array_list_long_layout(ctx, iterable, needle)
+        {
+            let long_class = ctx.class_id_of_object(needle);
+            match assertj_array_list_find_long(ctx, elements, size, long_class, value_slot, value)? {
+                Some(index) if index != usize::MAX => {
+                    for offset in index + 1..size {
+                        ctx.set_array_element(elements, offset - 1, ctx.get_array_element(elements, offset));
+                    }
+                    if size > 0 {
+                        ctx.set_array_element(elements, size - 1, Value::Object(None));
+                    }
+                    ctx.set_field_by_name(iterable, "size", Value::Int((size - 1) as i32));
+                    if let Value::Int(mod_count) = ctx.get_field_by_name(iterable, "modCount") {
+                        ctx.set_field_by_name(iterable, "modCount", Value::Int(mod_count.wrapping_add(1)));
+                    }
+                    return Ok(None);
+                }
+                Some(_) => return Ok(None),
+                None => {}
+            }
+        }
+    }
+
+    let iterable_pin = ctx.pin_native_root(iterable);
+    let needle_pin = needle.map(|needle| ctx.pin_native_root(needle));
+    let result: Result<(), MethodCallFailed> = (|| {
+        let iterable = ctx.read_native_pin(iterable_pin, iterable);
+        let iterator = match ctx.invoke_virtual(iterable, "iterator", "()Ljava/util/Iterator;", &[])? {
+            Some(Value::Object(Some(iterator))) => iterator,
+            _ => return Ok(()),
+        };
+        let iterator_pin = ctx.pin_native_root(iterator);
+        let result = (|| {
+            loop {
+                let iterator = ctx.read_native_pin(iterator_pin, iterator);
+                let has_next = ctx.invoke_virtual(iterator, "hasNext", "()Z", &[])?;
+                if !matches!(has_next, Some(Value::Int(value)) if value != 0) {
+                    return Ok(());
+                }
+                let iterator = ctx.read_native_pin(iterator_pin, iterator);
+                let element = match ctx.invoke_virtual(iterator, "next", "()Ljava/lang/Object;", &[])? {
+                    Some(Value::Object(element)) => element,
+                    _ => None,
+                };
+                let needle = needle.map(|needle| {
+                    ctx.read_native_pin(needle_pin.expect("needle pin exists"), needle)
+                });
+                if assertj_objects_equal(ctx, element, needle)? {
+                    let iterator = ctx.read_native_pin(iterator_pin, iterator);
+                    ctx.invoke_virtual(iterator, "remove", "()V", &[])?;
+                    return Ok(());
+                }
+            }
+        })();
+        ctx.unpin_native_roots(iterator_pin);
+        result
+    })();
+    if let Some(needle_pin) = needle_pin {
+        ctx.unpin_native_roots(needle_pin);
+    }
+    ctx.unpin_native_roots(iterable_pin);
+    result?;
+    Ok(None)
+}
+
 /// Executor compatibility paths run work inline. Return a real, completed
 /// `CompletableFuture` instead of a two-slot object carrying FutureTask's real
 /// class: concrete FutureTask methods execute JDK bytecode and cannot observe
@@ -69655,9 +70727,16 @@ fn failed_executor_future(
 
 fn native_new_single_thread(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     let exec = alloc_concurrent_synthetic(ctx, "java/util/concurrent/ThreadPoolExecutor", 2);
-    ctx.set_field(exec, EXEC_FIELD_SIZE, Value::Int(1));
-    ctx.set_field(exec, EXEC_FIELD_SHUTDOWN, Value::Int(0));
-    Ok(Some(Value::Object(Some(exec))))
+    crate::phases_early::initialize_real_thread_pool_executor(
+        ctx,
+        exec,
+        1,
+        1,
+        0,
+        "MILLISECONDS",
+        crate::phases_early::TpeQueueKind::Linked,
+        None,
+    )
 }
 
 fn native_new_fixed_pool(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -69666,16 +70745,34 @@ fn native_new_fixed_pool(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         _ => 1,
     };
     let exec = alloc_concurrent_synthetic(ctx, "java/util/concurrent/ThreadPoolExecutor", 2);
-    ctx.set_field(exec, EXEC_FIELD_SIZE, Value::Int(n));
-    ctx.set_field(exec, EXEC_FIELD_SHUTDOWN, Value::Int(0));
-    Ok(Some(Value::Object(Some(exec))))
+    crate::phases_early::initialize_real_thread_pool_executor(
+        ctx,
+        exec,
+        n,
+        n,
+        0,
+        "MILLISECONDS",
+        crate::phases_early::TpeQueueKind::Linked,
+        None,
+    )
 }
 
-fn native_new_cached_pool(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+fn native_new_cached_pool(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let exec = alloc_concurrent_synthetic(ctx, "java/util/concurrent/ThreadPoolExecutor", 2);
-    ctx.set_field(exec, EXEC_FIELD_SIZE, Value::Int(0));
-    ctx.set_field(exec, EXEC_FIELD_SHUTDOWN, Value::Int(0));
-    Ok(Some(Value::Object(Some(exec))))
+    let thread_factory = match args.first() {
+        Some(Value::Object(Some(factory))) => Some(*factory),
+        _ => None,
+    };
+    crate::phases_early::initialize_real_thread_pool_executor(
+        ctx,
+        exec,
+        0,
+        i32::MAX,
+        60,
+        "SECONDS",
+        crate::phases_early::TpeQueueKind::Synchronous,
+        thread_factory,
+    )
 }
 
 fn native_es_submit_runnable(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {

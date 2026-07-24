@@ -35,19 +35,37 @@ host (`/data/data/apps/tomcat`, i.e. `/data/data/tomcat-dohead-fixture-20260717`
 A future session rebuilding this fixture from scratch needs to redo these
 steps (see each doc's "RESOLVED" note for the exact commands).
 
+## Untriaged oddities — RESOLVED 2026-07-23
+
+Both classes formerly tracked here (`org.apache.catalina.startup.TestTomcat`'s
+misleading "Deliberately Broken" log line, and
+`org.apache.jasper.compiler.TestNonstandardTagPerformance`'s self-referential
+`ClassNotFoundException`) are fully triaged and closed — see
+[19-untriaged-oddities-closed-shared-hashtable-bug-FIXED.md](../../internal/fixed-suite-bugs/tomcat/19-untriaged-oddities-closed-shared-hashtable-bug-FIXED.md)
+in `docs/internal/fixed-suite-bugs/tomcat/`. Short version: "Deliberately
+Broken" was always a red herring (from tests that deliberately trigger and
+catch it); the real bug underneath was a genuine CratonVM regression — a
+`java.util.Hashtable` field-misresolution bug that silently doubled
+`Hashtable.size()` on every `put()`, which corrupted Jasper's embedded ECJ
+Java compiler (JSPs use a `Hashtable` internally) and broke JSP compilation
+entirely. Now fixed; `TestTomcat` is 26/26 PASS. The
+`TestNonstandardTagPerformance` class was a fixture-data typo (missing "er"
+in `.suite/all-tests.txt`) with no code fix needed.
+
 ## Needs investigation, not yet root-caused
 
 | Doc | Classes |
 |---|---:|
 | [untriaged-oddities.md](untriaged-oddities.md) | 2 |
-| [hang-classification-unconfirmed-host-contention.md](hang-classification-unconfirmed-host-contention.md) | 9 |
+
+## Fixed and moved to `docs/internal/`
+
+| Doc | Classes | Outcome |
+|---|---:|---|
+| [hang-classification-unconfirmed-host-contention-FIXED.md](../../internal/fixed-suite-bugs/tomcat/hang-classification-unconfirmed-host-contention-FIXED.md) | 9 | ✅ HANG was a pure host-contention artifact (HotSpot passes all 9 cleanly); once ruled out, all 9 were genuine CratonVM regressions from 2 root causes (ecj/Hashtable JSP-compile NPE affecting 8; SSLContext-resolution-through-wrapped-factory affecting `TestCustomSsl`), both fixed and verified — 9/9 PASS on CratonVM on a quiet host |
 
 ## Real CratonVM bug (not a fixture gap — despite living in the same 35-class "both VMs fail" bucket)
 
 | Doc | Classes |
 |---|---:|
 | [value-stack-usize-underflow-nio-worker-panic.md](value-stack-usize-underflow-nio-worker-panic.md) | 2 (confirmed in a 3rd bucket too — see doc) |
-
-Total accounted for: 6 + 2 + 1 = 9 docs covering all 35 non-PASS classes from
-the "true fixture gap" bucket, plus the 2 classes where the real panic also
-reproduces.

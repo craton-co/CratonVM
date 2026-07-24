@@ -4405,7 +4405,8 @@ pub(crate) fn register_phase56_function_extras(r: &mut NativeMethodRegistry) {
             // would relocate them (native stale-local family).
             let this_pin = ctx.pin_native_root(this);
             let other_pin = pinned_object_value(ctx, other);
-            let composite = alloc_concurrent_synthetic(ctx, "java/util/function/Predicate$$Lambda$And", 2);
+            let composite =
+                alloc_concurrent_synthetic(ctx, "java/util/function/Predicate$$Lambda$And", 2);
             let this = ctx.read_native_pin(this_pin, this);
             ctx.set_field(composite, 0, Value::Object(Some(this)));
             ctx.set_field(
@@ -4428,7 +4429,8 @@ pub(crate) fn register_phase56_function_extras(r: &mut NativeMethodRegistry) {
             // would relocate them (native stale-local family).
             let this_pin = ctx.pin_native_root(this);
             let other_pin = pinned_object_value(ctx, other);
-            let composite = alloc_concurrent_synthetic(ctx, "java/util/function/Predicate$$Lambda$Or", 2);
+            let composite =
+                alloc_concurrent_synthetic(ctx, "java/util/function/Predicate$$Lambda$Or", 2);
             let this = ctx.read_native_pin(this_pin, this);
             ctx.set_field(composite, 0, Value::Object(Some(this)));
             ctx.set_field(
@@ -10891,7 +10893,11 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         let class_name = ctx.class_name_of_id(ctx.class_id_of_object(this));
         if class_name.as_deref() != Some("java/nio/channels/FileChannel") {
             return Ok(Some(Value::Int(
-                if matches!(ctx.get_field_by_name(this, "closed"), Value::Int(1)) { 0 } else { 1 },
+                if matches!(ctx.get_field_by_name(this, "closed"), Value::Int(1)) {
+                    0
+                } else {
+                    1
+                },
             )));
         }
         Ok(Some(Value::Int(1)))
@@ -11953,7 +11959,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                     0 => total,
                     1 => free,
                     _ => usable,
-            });
+                });
             Ok(Some(Value::Long(value as i64)))
         });
 
@@ -15875,12 +15881,25 @@ fn file_read_path(ctx: &mut dyn NativeContext, this: ObjectRef) -> String {
 fn file_normalise_path(path: &str) -> String {
     let bytes = path.as_bytes();
     // Strip leading `/<drive>:` -> `<drive>:` (e.g. `/C:/foo` -> `C:/foo`).
-    if bytes.len() >= 3 && bytes[0] == b'/' && bytes[1].is_ascii_alphabetic() && bytes[2] == b':' {
-        return path[1..].replace('/', "\\");
-    }
+    let mut normalized = if bytes.len() >= 3
+        && bytes[0] == b'/'
+        && bytes[1].is_ascii_alphabetic()
+        && bytes[2] == b':'
+    {
+        path[1..].replace('/', "\\")
+    } else {
+        // Otherwise normalise forward slashes for consistency with Java's
+        // canonical Windows path separator.
+        path.replace('/', "\\")
+    };
     // Otherwise normalise forward slashes for consistency with Java's
-    // canonical Windows path separator.
-    path.replace('/', "\\")
+    // canonical Windows path separator. WinNTFileSystem.normalize also drops
+    // a redundant final separator (except the drive root): this is observable
+    // in Spring's config-tree location descriptions.
+    while normalized.len() > 3 && normalized.ends_with('\\') {
+        normalized.pop();
+    }
+    normalized
 }
 
 #[cfg(not(windows))]
@@ -17831,7 +17850,11 @@ pub(crate) fn register_phase57_file_channel(r: &mut NativeMethodRegistry) {
         let class_name = ctx.class_name_of_id(ctx.class_id_of_object(this));
         if class_name.as_deref() != Some("java/nio/channels/FileChannel") {
             return Ok(Some(Value::Int(
-                if matches!(ctx.get_field_by_name(this, "closed"), Value::Int(1)) { 0 } else { 1 },
+                if matches!(ctx.get_field_by_name(this, "closed"), Value::Int(1)) {
+                    0
+                } else {
+                    1
+                },
             )));
         }
         let fd_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
@@ -27558,6 +27581,23 @@ pub(crate) fn register_p59_file_attributes(r: &mut NativeMethodRegistry) {
     r.register("java/nio/file/Files", "readAttributes",
         "(Ljava/nio/file/Path;Ljava/lang/Class;[Ljava/nio/file/LinkOption;)Ljava/nio/file/attribute/BasicFileAttributes;",
         p59_files_read_attributes);
+    // Windows has no POSIX attribute view.  The real `Files` bytecode would
+    // otherwise ask the Windows provider for attributes and then checkcast
+    // the returned WindowsFileAttributes to PosixFileAttributes, producing a
+    // VM-only ClassCastException.  Match the JDK contract so callers such as
+    // Spring Boot's ApplicationPid can take their documented fallback.
+    #[cfg(windows)]
+    r.register(
+        "java/nio/file/Files",
+        "getPosixFilePermissions",
+        "(Ljava/nio/file/Path;[Ljava/nio/file/LinkOption;)Ljava/util/Set;",
+        |_ctx, _args| {
+            Err(RuntimeError::UnsupportedOperationException {
+                message: "POSIX file permissions are not supported on Windows".into(),
+            }
+            .into())
+        },
+    );
     r.register(
         "java/nio/file/Files",
         "getLastModifiedTime",
@@ -37498,10 +37538,7 @@ pub(crate) fn register_p66_file_visitor(r: &mut NativeMethodRegistry) {
         "(Ljava/nio/file/Path;Ljava/util/Set;ILjava/nio/file/FileVisitor;)Ljava/nio/file/Path;",
         |ctx, args| {
             let path_obj = args.first().copied().unwrap_or(Value::Object(None));
-            let requested_depth = args
-                .get(2)
-                .and_then(Value::as_int)
-                .unwrap_or(i32::MAX);
+            let requested_depth = args.get(2).and_then(Value::as_int).unwrap_or(i32::MAX);
             let max_depth = if requested_depth == i32::MAX {
                 usize::MAX
             } else {
@@ -38516,16 +38553,14 @@ pub(crate) fn register_p66_thread_builder(r: &mut NativeMethodRegistry) {
     // Thread.threadId() — Java 19. Use the receiver's Java tid for cross-thread
     // queries; the VM context is only a fallback during early bootstrap.
     r.register(t, "threadId", "()J", |ctx, args| {
-        let receiver_tid = args
-            .first()
-            .and_then(|value| match value {
-                Value::Object(Some(thread)) => match ctx.get_field_by_name(*thread, "tid") {
-                    Value::Long(tid) if tid > 0 => Some(tid),
-                    Value::Int(tid) if tid > 0 => Some(tid as i64),
-                    _ => None,
-                },
+        let receiver_tid = args.first().and_then(|value| match value {
+            Value::Object(Some(thread)) => match ctx.get_field_by_name(*thread, "tid") {
+                Value::Long(tid) if tid > 0 => Some(tid),
+                Value::Int(tid) if tid > 0 => Some(tid as i64),
                 _ => None,
-            });
+            },
+            _ => None,
+        });
         Ok(Some(Value::Long(
             receiver_tid.unwrap_or_else(|| ctx.thread_id().max(1) as i64),
         )))
@@ -44057,8 +44092,7 @@ fn new13_ssl_socket_connect(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     };
     let (host, port) = crate::net_phase_e::read_inet_socket_address(ctx, sa)?;
     let (extra_roots, java_tm_key) = take_pending_ssl_socket_connect_ctx(ctx, this);
-    let tls_id =
-        new13_connect_and_handshake(ctx, &host, port as u16, &extra_roots, java_tm_key)?;
+    let tls_id = new13_connect_and_handshake(ctx, &host, port as u16, &extra_roots, java_tm_key)?;
     let _ = new13_finish_socket(ctx, this, &host, port as u16, tls_id);
     Ok(None)
 }
@@ -44655,7 +44689,8 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
     r.register(ssf, "createSocket", "()Ljava/net/Socket;", |ctx, args| {
         let extra_roots = p68_factory_trust_roots(ctx, args);
         let java_tm_key = p68_factory_java_tm_key(ctx, args);
-        let sock = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocket", NEW13_SSL_SOCK_FIELDS);
+        let sock =
+            alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocket", NEW13_SSL_SOCK_FIELDS);
         ctx.set_field(sock, NEW13_SOCK_TLSID, Value::Int(-1));
         ctx.set_field(sock, NEW13_SOCK_CLOSED, Value::Int(0));
         stash_pending_ssl_socket_connect_ctx(ctx, sock, extra_roots, java_tm_key);
