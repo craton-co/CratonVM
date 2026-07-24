@@ -2559,3 +2559,182 @@ LOB-migration residual from the ninth pass remains open regardless), so
 this does not represent a NEW regression from a previously-clean state,
 just a different failure point within an already-failing test class.
 pass.
+
+## Follow-up session (eleventh pass, 2026-07-24): the `TestUpgrade` NPE reopened
+## by the composite-PK fix — class-loading exonerated, new evidence points at
+## cross-loader/cross-session dispatch or stack-trace corruption, root cause
+## STILL NOT PINNED — OPEN
+
+Worktree `/data/data/wt/wt-testupgrade-npe-20260724` on the Azure host, branch
+`fix/h2-testupgrade-npe-20260724`, branched from `origin/dev` (`648351e6c`,
+already includes the tenth pass's `a88d06a5a` fix). Picked up the residual
+this doc's tenth-pass section left open.
+
+### Reproduction reconfirmed, and now also under `--nojit`
+
+Deterministic (2/2 runs), identical NPE (`ParserBase.getSyntaxError`,
+`this.token` is null, parsing the OLD (1.4.200) driver's own `CREATE TABLE`
+statement inside `testUpgrade(1,4,200)`). **New this pass: reproduces
+identically under `--nojit`**, ruling out JIT/JIT-cache involvement entirely
+(the tenth pass hadn't checked this).
+
+```bash
+cd apps/h2database/h2
+<cratonvm-bin> --java-home /home/victor/jdk25 --nojit \
+  -c "target/classes:target/test-classes:$(cat craton-testcp.txt)" \
+  org.h2.test.unit.TestUpgrade
+```
+
+### Hypothesis 1 from the tenth pass (a third Parser loader-collapse site) —
+### REFUTED with direct evidence
+
+Added `CRATONVM_DBG_H2TRACE`-gated tracing to `Instruction::New`'s class
+resolution (`vm/src/runtime/interpreter.rs`) for `org/h2/command/Parser`,
+`ParserBase`, and `Token`. Across a full `TestUpgrade` run, bytecode `new
+Parser(session)` fires exactly 3 times before the crash — once per
+`UserDefined` loader instantiated so far (`UserDefined(3)` =
+`testUpgrade(1,2,120)`'s own `loadH2`, `UserDefined(4)` =
+`Upgrade.upgrade()`'s own internal `loadH2(120)` call for `SCRIPT TO`,
+`UserDefined(5)` = `testUpgrade(1,4,200)`'s own `loadH2`, the one that then
+crashes) — and in **every** case `target_loader` exactly matches
+`referencing_loader`. `resolve_class_loader_aware` resolves the old driver's
+own `Parser` class correctly every time; class-loading is not the mechanism.
+
+### A related but distinct discovery: the ninth pass's own loader-aware
+### `h2_session_prepare_local_no_cache` fix never actually intercepts the old
+### driver's sessions at all
+
+`h2_session_prepare_local_no_cache` (`native-builtins/src/apps_h2.rs`) is
+registered against `H2_SESSION_LOCAL` (`"org/h2/engine/SessionLocal"`) — the
+class name H2 renamed `Session` to in a later version. Every old-driver
+download this test exercises (1.2.120, 1.4.200) predates that rename and
+still literally declares `org/h2/engine/Session`, a different string, so
+CratonVM's (name-keyed) native registry never matches it: added an
+unconditional trace print at the very top of this native's body, and it
+never fires for any `UserDefined`-loader session across the whole run — only
+for the "normal" Application-loaded `SessionLocal` (RUNSCRIPT, LOB SELECTs,
+etc.). This means the ninth pass's `loader_id_of_class(session_class_id) >=
+3` branch — the actual fix that pass shipped — is **dead code with respect
+to `TestUpgrade`'s own old-driver sessions**; real, un-intercepted H2
+bytecode always handled (and, per the `Instruction::New` trace above, always
+correctly resolved) their `Session.prepareLocal`/`new Parser(...)` calls, on
+`dev` both before and after this session. Worth a note for whoever revisits
+the ninth-pass fix's own doc — its explanation of *why* that fix unblocked
+`TestUpgrade` at the time may need revisiting (something else in that same
+pass, or a concurrent merge, more likely gets the credit); it does not
+change this pass's own conclusions about the current bug.
+
+### Rock-solid new finding: the crash's own stack trace names classes that do
+### not exist in the actual old-driver jar
+
+Extracted the real, cached `h2-1.4.200.jar`
+(`/home/victor/.m2/repository/com/h2database/h2/1.4.200/h2-1.4.200.jar` on
+the Azure host — same bytes `Upgrade.loadH2`'s `ClassLoader` `defineClass`s
+from) and listed `org/h2/command/*`: it contains `Parser.class` and three
+inner classes, **and nothing else** — no `ParserBase.class`, no
+`Token.class`. `javap -c` on `Parser.class` confirms its own private
+`getSyntaxError()` (bytecode present, standalone) calls
+`DbException.getSyntaxError(String, int)` directly with a raw character
+offset — **no `Token` object, no `.start()` call, anywhere in the class**.
+(`ParserBase`/`Token` are a later H2 refactor, present only in the
+Application-loaded, current-source-tree H2 build this repo carries under
+`apps/h2database/h2/src/main`.)
+
+Yet the crash's exception explicitly names
+`org.h2.command.ParserBase.getSyntaxError(ParserBase.java:760)` and
+`Cannot invoke "org.h2.command.Token.start()"`. **This is architecturally
+impossible for the old driver's own, unmodified bytecode to produce.** The
+exception embeds frames/method references that can only belong to the
+*modern*, Application-loaded H2 build — not to anything reachable from
+`testUpgrade(1,4,200)`'s own call chain into its private 1.4.200 driver
+copy. This is the strongest evidence yet that the bug is a cross-loader (or
+even cross-*session*/cross-*thread*) contamination of dispatch or of
+exception/stack-trace construction, not a genuine parse failure inside the
+old driver's own, textually different `getSyntaxError()`.
+
+### An attempt to pin the exact call site — inconclusive, a promising lead
+### undercut by an instrumentation gap, not resolved
+
+The captured interpreter frame at the moment of the athrow
+(`CRATONVM_DBG_ATHROW=1`, an existing hook) shows the innermost live frame as
+`org/h2/engine/Session.prepareLocal pc=145` — no `Parser`/`ParserBase` frames
+above it at all, i.e. by the time the top-level uncaught-exception handler
+sees this exception, `thread.frames` has already unwound past whatever threw
+it. Cross-referencing `pc=145` against `javap -c -l`'s line/byte table for
+the OLD driver's real `Session.prepareLocal(String)` bytecode lines up with
+the instruction immediately AFTER the method's `new Parser(this)
+.prepareCommand(sql)` try/finally block (i.e., that call returning normally,
+about to execute `command.prepareJoinBatch()`) — which would mean the SQL
+genuinely parsed successfully and the failure is in the *next* step, not in
+parsing at all. **This specific claim is UNCONFIRMED**: added a targeted
+`CRATONVM_DBG_H2TRACE` trace inside `execute_invokevirtual_cached`
+(`vm/src/runtime/interpreter.rs`) keyed on `method_name == "prepareJoinBatch"`
+— it never fired once across a full run, despite adjacent traces in the same
+build firing correctly (981 + 47 hits). Most likely explanation: CratonVM's
+interpreter `pc` numbering is not a 1:1 mapping to the original class file's
+raw byte offsets (probably due to internal bytecode pre-processing/rewriting
+this session did not investigate), which would invalidate the javap-offset
+correlation above outright. **Do not trust the "it's `prepareJoinBatch`, not
+parsing" claim without independently confirming CratonVM's pc semantics
+first** — it is currently just a plausible-looking but unverified read of a
+debug print, and the real call site could equally well still be inside
+`Parser.prepareCommand`/`parse` itself.
+
+### Working hypotheses for whoever picks this up next (supersedes the tenth
+### pass's three, which the class-loading trace above has now ruled out)
+
+1. **A cross-loader method-dispatch collision** at some call site not yet
+   identified (candidates: whatever bytecode instruction is actually at
+   `pc=145` once its true meaning is established, or any call reachable from
+   `Session.prepareLocal`/`Parser.prepareCommand`/`Parser.parse` in the old
+   driver's own bytecode) resolves to a method belonging to the *modern*
+   H2 build instead of the old driver's own same-named method — e.g. an
+   inline/monomorphic call-site cache keyed insufficiently (by
+   `caller_class_id` + constant-pool index, per
+   `execute_invokevirtual_cached`'s `thread.invoke_cache`, which in
+   principle SHOULD already disambiguate by loader since each `loadH2()`
+   call defines a wholly distinct `Session`/`Parser` `ClassId` — but this
+   was not independently verified this session for the actual failing call).
+2. **A stack-trace/exception-construction bug**, not a dispatch bug at all:
+   a genuine `NullPointerException` thrown by the *Application*-loaded
+   `SessionLocal`'s own (legitimate) `ParserBase`/`Token` machinery — quite
+   plausibly on H2's own background MVStore committer thread, which the
+   `CRATONVM_DBG_ATHROW` trace shows actively running (and being
+   interrupted) around the same window — gets its frames merged into or
+   substituted for the main thread's/old-driver-session's exception when
+   printed, matching this codebase's existing "stack-trace fidelity" bug
+   family ([[tco-breaks-stacktrace-fidelity]],
+   [[invoke-to-string-wrapper-fastpath-misid]] in project memory). Since
+   the `ExpressionColumn.getValue` fix adds a large amount of new GC
+   pressure and re-entrant `invoke_virtual` traffic (981 fallthrough
+   events logged over the run before the crash), a timing/concurrency-
+   sensitive exposure of a pre-existing fidelity bug is very plausible —
+   more plausible, given the evidence gathered this session, than a new
+   dispatch bug.
+3. Simple execution-count/timing sensitivity (tenth pass's hypothesis 3) is
+   not newly supported or refuted by this session; still on the table but
+   still the least likely given the failure's hard determinism (2/2, now
+   also 2/2 under `--nojit`).
+
+### Diagnostic tooling left in place (all env-gated, zero cost when unset)
+
+- `native-builtins/src/apps_h2.rs`: `CRATONVM_DBG_H2TRACE=1` traces every
+  `ExpressionColumn.getValue` fallthrough (column id, row class, probe
+  outcome) and every `Session.prepareLocal` native-dispatch decision
+  (is_select, loader id, which branch).
+- `vm/src/runtime/interpreter.rs`: same env var traces `Instruction::New`
+  resolution specifically for `Parser`/`ParserBase`/`Token` (referencing vs.
+  target class id and loader), and `execute_invokevirtual_cached` dispatch
+  specifically for `method_name == "prepareJoinBatch"` (currently
+  unconfirmed to ever fire — see above; worth widening to trace ALL
+  invokevirtual calls from a `UserDefined`-loader caller instead of
+  filtering by method name, since the name-based filter may be missing the
+  actual call site).
+- Existing `CRATONVM_DBG_ATHROW=1` (pre-existing, not new this session) is
+  the fastest way to see the full sequence of exception throws, including
+  background-thread activity, around the crash.
+
+Committed alongside this doc update on `dev` — see commit history for the
+exact SHAs. **Root cause still not found; do not attempt another fix without
+first resolving the pc-semantics question above**, since the
+"`prepareJoinBatch`, not parsing" read this session leaned on is unverified.

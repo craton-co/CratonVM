@@ -15620,6 +15620,24 @@ fn execute_instruction(
                 resolve_class_loader_aware(shared, thread, referencing_class_id, &class_name)
                     .map_err(|e| convert_class_not_found(shared, thread, &class_name, e))?;
 
+            if std::env::var_os("CRATONVM_DBG_H2TRACE").is_some()
+                && (class_name == "org/h2/command/Parser"
+                    || class_name == "org/h2/command/ParserBase"
+                    || class_name == "org/h2/command/Token")
+            {
+                let cm = shared.class_manager.read();
+                let ref_loader = cm.get_loader_id(referencing_class_id);
+                let target_loader = cm.get_loader_id(target_class_id);
+                let ref_name = cm
+                    .get_class(referencing_class_id)
+                    .map(|c| c.name.to_string())
+                    .unwrap_or_default();
+                drop(cm);
+                eprintln!(
+                    "[h2trace-new] BYTECODE-NEW class_name={class_name} referencing_class={ref_name} referencing_class_id={referencing_class_id:?} referencing_loader={ref_loader:?} target_class_id={target_class_id:?} target_loader={target_loader:?}",
+                );
+            }
+
             if std::env::var("CRATONVM_DBG_LOADER_TRACE").is_ok()
                 && class_name.contains("RootReference")
             {
@@ -38538,6 +38556,31 @@ fn execute_invokevirtual_cached(
     is_special: bool,
 ) -> Result<CachedCallResult, MethodCallFailed> {
     let caller_class_id = thread.frames[frame_idx].class_id;
+
+    if std::env::var_os("CRATONVM_DBG_H2TRACE").is_some() {
+        if let Ok((owner, method, descriptor, _)) = resolve_method_ref(shared, caller_class_id, cp_index) {
+            if method.as_ref() == "prepareJoinBatch" {
+                let cm = shared.class_manager.read();
+                let caller_name = cm.get_class(caller_class_id).map(|c| c.name.to_string()).unwrap_or_default();
+                let caller_loader = cm.get_loader_id(caller_class_id);
+                let receiver = thread.frames[frame_idx].stack.peek_at(0);
+                let recv_info = if let Value::Object(Some(r)) = receiver {
+                    let rcid = shared.heap.class_id_of(r);
+                    let rname = cm.get_class(rcid).map(|c| c.name.to_string()).unwrap_or_default();
+                    let rloader = cm.get_loader_id(rcid);
+                    format!("class_id={rcid:?} class={rname} loader={rloader:?}")
+                } else {
+                    format!("{receiver:?}")
+                };
+                let cached = thread.invoke_cache.get(caller_class_id, cp_index, is_special);
+                let cached_info = cached.as_ref().map(|t| format!("{t:?}"));
+                drop(cm);
+                eprintln!(
+                    "[h2trace-pjb] site owner={owner} method={method}{descriptor} caller={caller_name} caller_loader={caller_loader:?} cp_index={cp_index} receiver=[{recv_info}] cached={cached_info:?}",
+                );
+            }
+        }
+    }
 
     if std::env::var("CRATONVM_DBG_LOADER_TRACE").is_ok()
         && is_special

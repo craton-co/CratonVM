@@ -1244,6 +1244,15 @@ fn h2_prune_nested_unnest_range(ctx: &mut dyn NativeContext, expression: ObjectR
 /// `SearchRow`. Reading that row directly avoids reinterpreting
 /// `TableFilter.getValue(Column)` for every nested-range candidate. All other
 /// resolver shapes retain H2's virtual dispatch as the fallback.
+fn h2trace_enabled() -> bool {
+    std::env::var_os("CRATONVM_DBG_H2TRACE").is_some()
+}
+
+fn h2trace_seq() -> u32 {
+    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 fn h2_expression_column_get_value(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let expression = h2_object_arg(args, 0, "ExpressionColumn.getValue receiver is null")?;
     let resolver = h2_object_field(ctx, expression, "columnResolver").ok_or_else(|| {
@@ -1287,6 +1296,14 @@ fn h2_expression_column_get_value(ctx: &mut dyn NativeContext, args: &[Value]) -
             );
         }
         if let Some(row) = h2_object_field(ctx, resolver, "currentSearchRow") {
+            if h2trace_enabled() {
+                let row_cid = ctx.class_id_of_object(row);
+                let row_cls = ctx.class_name_of_id(row_cid).unwrap_or_default();
+                eprintln!(
+                    "[h2trace seq={}] EC.getValue FALLTHROUGH-ENTER column_id={} row_class={}",
+                    h2trace_seq(), column_id, row_cls,
+                );
+            }
             // GC-safety: the probe call below re-enters Java and may move
             // `resolver`/`column` (both read again afterward -- `resolver`
             // by the fallback dispatch below, `column` as its argument).
@@ -1304,7 +1321,14 @@ fn h2_expression_column_get_value(ctx: &mut dyn NativeContext, args: &[Value]) -
             let resolver = ctx.read_native_pin(resolver_pin, resolver);
             let column = ctx.read_native_pin(column_pin, column);
             ctx.unpin_native_roots(resolver_pin);
-            if let Some(Value::Object(Some(value))) = probe? {
+            let probe = probe?;
+            if h2trace_enabled() {
+                eprintln!(
+                    "[h2trace seq={}] EC.getValue FALLTHROUGH probe_hit={}",
+                    h2trace_seq(), probe.is_some(),
+                );
+            }
+            if let Some(Value::Object(Some(value))) = probe {
                 return Ok(Some(Value::Object(Some(value))));
             }
             return ctx.invoke_virtual(
@@ -1915,6 +1939,16 @@ fn h2_session_prepare_local_no_cache(
             .get(..6)
             .is_some_and(|prefix| prefix.eq_ignore_ascii_case("select"))
     });
+    if h2trace_enabled() {
+        let sql_text = ctx.read_string(sql).unwrap_or_default();
+        let prefix: String = sql_text.chars().take(60).collect();
+        let session_class_id = ctx.class_id_of_object(this);
+        let loader_id = ctx.loader_id_of_class(session_class_id);
+        eprintln!(
+            "[h2trace seq={}] Session.prepareLocal is_select={} loader_id={} sql={:?}",
+            h2trace_seq(), is_select, loader_id, prefix,
+        );
+    }
     if is_select {
         // The bytecode path re-enters Java and may move either argument.
         // Root and refresh both before handing them to the original method.
@@ -1957,12 +1991,27 @@ fn h2_session_prepare_local_no_cache(
         // genuinely loaded by a non-Application loader (`Upgrade.loadH2`'s
         // old-driver copies) pay for the loader-aware path.
         let session_class_id = ctx.class_id_of_object(this);
-        let parser_class_id = if ctx.loader_id_of_class(session_class_id) >= 3 {
-            Some(ctx.class_id_by_name_via_referencing_class(
+        let loader_id = ctx.loader_id_of_class(session_class_id);
+        let parser_class_id = if loader_id >= 3 {
+            let resolved = ctx.class_id_by_name_via_referencing_class(
                 session_class_id,
                 "org/h2/command/Parser",
-            )?)
+            )?;
+            if h2trace_enabled() {
+                let resolved_loader = ctx.loader_id_of_class(resolved);
+                eprintln!(
+                    "[h2trace seq={}] Session.prepareLocal LOADER-AWARE-PATH session_loader={} parser_class_id={:?} parser_loader={}",
+                    h2trace_seq(), loader_id, resolved, resolved_loader,
+                );
+            }
+            Some(resolved)
         } else {
+            if h2trace_enabled() {
+                eprintln!(
+                    "[h2trace seq={}] Session.prepareLocal PLAIN-PATH session_loader={}",
+                    h2trace_seq(), loader_id,
+                );
+            }
             None
         };
         let this = ctx.read_native_pin(this_pin, this);
