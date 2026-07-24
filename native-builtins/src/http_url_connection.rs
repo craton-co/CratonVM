@@ -1179,7 +1179,16 @@ fn read_io_err(prefix: &str, e: std::io::Error) -> String {
 /// rustls surfaces as `UnexpectedEof` ("peer closed connection without sending
 /// TLS close_notify"). For an HTTP client that is a normal end-of-stream, so map
 /// it to `Ok(0)` (EOF) rather than a hard error.
-fn read_eof_tolerant<S: Read>(stream: &mut S, buf: &mut [u8]) -> std::io::Result<usize> {
+///
+/// `pub(crate)` — also reused by `t27_tls::rustls_stream_read`'s CLIENT-side
+/// path (a plain `javax.net.ssl.SSLSocket.getInputStream().read()`, not just
+/// this file's own HTTP client bridge, hits the identical "server did
+/// Connection: Close without a TLS close_notify" pattern — see
+/// `TestSsl.testSni`). Deliberately NOT applied to the server-side read path
+/// in that same function: a client that goes silent mid-REQUEST is a more
+/// security-relevant truncation than a server closing after a fully-framed
+/// response, so server reads keep surfacing the hard error.
+pub(crate) fn read_eof_tolerant<S: Read>(stream: &mut S, buf: &mut [u8]) -> std::io::Result<usize> {
     loop {
         match stream.read(buf) {
             Ok(n) => return Ok(n),

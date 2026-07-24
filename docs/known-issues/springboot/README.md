@@ -53,7 +53,13 @@ smaller/individual differences not yet clustered.
 > just tipped over the 300s timeout by this module's unusually large
 > (~121-jar) test classpath. Fixed in `native-builtins/src/classloader.rs`
 > and `phases_late.rs`. One pre-existing, narrower residual unmasked by the
-> fix (not caused by it): `data-redis-jedis-sslbundle-withpackageresources-classloader-leak.md`.
+> fix (not caused by it) — **also now FIXED 2026-07-23**, moved to
+> [`../../internal/fixed-suite-bugs/springboot/data-redis-jedis-sslbundle-withpackageresources-classloader-leak-FIXED.md`](../../internal/fixed-suite-bugs/springboot/data-redis-jedis-sslbundle-withpackageresources-classloader-leak-FIXED.md).
+> Root cause: `classloader_real.rs::cl_real_load_class_base` silently
+> swallowed a user-defined parent loader's authoritative
+> `ClassNotFoundException` and fell through to CratonVM's loader-blind flat
+> global class store, un-doing `ModifiedClassPathClassLoader`'s
+> `@ClassPathExclusions` filtering.
 
 | Doc | Classes | Severity | Status |
 |---|---:|---|---|
@@ -109,6 +115,18 @@ rather than assuming closed or re-investigating from scratch.
 > `PathRequestTests` now passes outright; the other 3 narrow to two distinct,
 > newly-exposed residuals: [`onbeancondition-mergedannotations-intermittent-identity-mismatch.md`](onbeancondition-mergedannotations-intermittent-identity-mismatch.md)
 > and [`securityfilterautoconfig-capturedoutput-password-not-observed.md`](securityfilterautoconfig-capturedoutput-password-not-observed.md).
+
+> Investigation (2026-07-24): `module/spring-boot-micrometer-tracing-opentelemetry`'s
+> 2-class residual from this rerun (`OpenTelemetryBaggagePropagationIntegrationTests`,
+> `OpenTelemetryTracingAutoConfigurationTests`) — the former's 5 failing
+> parameterized cases all throw a CratonVM NPE from inside AssertJ's own
+> error-formatting path (`WritableAssertionInfo.representation` ends up null
+> only when `StringAssert`/`AbstractCharSequenceAssert` objects are
+> constructed via `Assertions.assertThat(String)`, not via direct
+> construction — reduced to a 100% reproducing ~15-line standalone repro, not
+> yet root-caused to file:line, likely masking real failure messages broadly
+> across the suite since `assertThat(someString)` is ubiquitous). OPEN — see
+> [`micrometer-tracing-opentelemetry-assertj-representation-npe-and-eventpublisher-residuals.md`](micrometer-tracing-opentelemetry-assertj-representation-npe-and-eventpublisher-residuals.md).
 
 ## 2026-07-17 rerun: 510-class set vs first-ever same-scope HotSpot baseline (429 CratonVM-specific)
 

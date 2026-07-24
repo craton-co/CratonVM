@@ -131,8 +131,49 @@ reentrant nested-Launcher call stack.
 | Module | Class | Method |
 |---|---|---|
 | `module/spring-boot-tomcat` | `org.springframework.boot.tomcat.servlet.TomcatServletWebServerServletContextListenerTests` | `registeredServletContextListenerBeanIsCalled`, `servletContextListenerBeanIsCalled` |
+| `module/spring-boot-jetty` | `org.springframework.boot.jetty.autoconfigure.servlet.JettyServletWebServerServletContextListenerTests` | `registeredServletContextListenerBeanIsCalled`, `servletContextListenerBeanIsCalled` |
+
+Confirmed 2026-07-24 (worktree `CratonVM-spring-boot-jetty-closure-20260723`):
+the predicted "likely affects any other `@ForkedClassPath` + `Mockito.mock()`"
+scope above is real — `module/spring-boot-jetty`'s sibling class (same base
+test fixture, `AbstractServletWebServerServletContextListenerTests`, just a
+Jetty `webServerConfiguration` instead of Tomcat's) hits the SAME
+`@ForkedClassPath`/reentrant-Launcher trigger with a DIFFERENT symptom:
+
+```
+org.mockito.exceptions.misusing.NotAMockException:
+Argument passed to verify() is of type ServletContextListener$MockitoMock$xxx and is not a mock!
+```
+
+Root-caused one level further than the Tomcat symptom above (though still
+not fixed): `Mockito.verify(mock)` → `MockUtil.isMock`/`getMockHandlerOrNull`
+→ `InlineDelegateByteBuddyMockMaker.getHandler(Object)` looks the mock up in
+`this.mocks: WeakConcurrentMap` (identity-keyed). The mock IS genuinely
+created (the exception's own message names the real generated
+`$MockitoMock$` class), so ByteBuddy/self-attach succeeded this time (no
+`NoClassDefFoundError` here, unlike Tomcat's symptom) — but the later
+`verify()` call's `WeakConcurrentMap.get(mock)` comes back empty, as if the
+mock was never registered, or was registered against a different `MockMaker`
+instance than the one `verify()` consults.
+
+Ruled out via a fast standalone repro (mirrors the Tomcat doc's own ruled-out
+list, retested independently): a plain `Mockito.mock()` + `verify()` cycle
+run through an isolated `URLClassLoader` built the exact same way
+`ModifiedClassPathClassLoader` builds one (`ManagementFactory.getRuntimeMXBean().getClassPath()`
+fallback URL extraction, since the real system classloader isn't a
+`URLClassLoader` on JDK9+) — passes cleanly on both HotSpot and CratonVM,
+`isMock()` true before and after crossing the classloader boundary. So
+"isolated classloader" alone isn't the trigger for either symptom; both
+require the actual reentrant `Launcher.discover()+execute()` call while the
+outer Jupiter engine's own `execute()` is still on the stack, exactly as this
+doc's mechanism section already describes. Not fixed this session either —
+same high-blast-radius reasoning as below applies (shared Mockito/self-attach
+machinery, used by nearly every ByteBuddy/CGLIB-based test in the suite);
+documenting the additional data point rather than risking a blind patch.
 
 Likely affects any other `@ForkedClassPath`/`ModifiedClassPathExtension`
 test that calls `Mockito.mock()` for the first time in that process from
-inside the reentrant nested-Launcher context — not confirmed against other
-classes this session, scope limited to the `module/spring-boot-tomcat` 5.
+inside the reentrant nested-Launcher context — confirmed independently
+across 2 modules now (Tomcat, Jetty), each with a different visible symptom,
+consistent with one shared underlying defect surfacing differently depending
+on exactly where in Mockito's init/registration sequence it bites.

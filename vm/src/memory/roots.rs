@@ -614,6 +614,12 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     //     remap lives in `gc.rs` (`gc_update_lambda_callsite_cache_refs`).
     cratonvm_native_builtins::lang_invoke::gc_scan_lambda_callsite_cache_roots(&mut roots);
 
+    // 16a. Zero-capture lambda proxy singleton cache (companion to the
+    //      LambdaMetafactory CallSite cache in step 16 above, but for the
+    //      cached proxy INSTANCE of a non-capturing lambda rather than the
+    //      CallSite metadata). Lives in `vm/src/runtime/invokedynamic.rs`.
+    crate::runtime::invokedynamic::gc_scan_lambda_singleton_roots(shared.vm_identity, &mut roots);
+
     // 17. Overlay-backed collections (LinkedList / LinkedHashMap / TreeMap /
     //     TreeSet). These keep backing arrays + nodes in Rust side-tables,
     //     invisible to ordinary field tracing. The moving/G1/ZGC paths retain

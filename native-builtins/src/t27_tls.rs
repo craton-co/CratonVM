@@ -3274,7 +3274,18 @@ pub(crate) fn rustls_stream_read(id: i32, buf: &mut [u8]) -> std::io::Result<usi
     let debug_srv = std::env::var_os("CRATONVM_DBG_TLS_SRV").is_some();
     let mut reg = sreg().lock();
     if let Some(e) = reg.client_streams.get_mut(&id) {
-        return e.stream.read(buf);
+        // FIX (TestSsl.testSni[JSSE]): a plain `SSLSocket.getInputStream()
+        // .read()` on the client side used to propagate rustls's raw
+        // `UnexpectedEof` ("peer closed connection without sending TLS
+        // close_notify") straight through as an `IOException`. Tomcat's own
+        // server connector (also CratonVM/rustls) closes the raw socket
+        // after writing a `Connection: Close` response without a clean TLS
+        // shutdown — an unclean-but-benign close real JSSE clients
+        // routinely tolerate at the end of a fully-framed HTTP response.
+        // Reuse the same EOF-tolerant read already established for the
+        // native HTTP client bridge (`http_url_connection::
+        // read_eof_tolerant`) instead of duplicating the tolerance logic.
+        return crate::http_url_connection::read_eof_tolerant(&mut e.stream, buf);
     }
     if let Some(e) = reg.server_streams.get_mut(&id) {
         if debug_srv {
@@ -3850,7 +3861,9 @@ fn register_sslserversocket(r: &mut NativeMethodRegistry) {
         // left uninvestigated rather than risk a half-understood change to
         // this shared accept path).
 
-        let session = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSession", 3);
+        // 4-field synthetic session: proto, cipher, streamId, attrs (slot 3 —
+        // see SSLSESS_ATTRS_SLOT doc comment).
+        let session = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSession", 4);
         let p = ctx.create_string(&proto);
         let c = ctx.create_string(&cipher);
         ctx.set_field(session, 0, Value::Object(Some(p)));
@@ -7103,8 +7116,9 @@ fn build_synthetic_ssl_session(ctx: &mut dyn NativeContext, id: i32) -> ObjectRe
             String::new(),
         )
     });
-    // 7-field synthetic session: cipher, protocol, valid, peerHost, peerPort, creationTime, alpn
-    let ses = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSession", 7);
+    // 8-field synthetic session: cipher, protocol, valid, peerHost, peerPort,
+    // creationTime, alpn, attrs (slot 7 — see SSLSESS_ATTRS_SLOT doc comment).
+    let ses = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSession", 8);
     let cipher_s = ctx.create_string(&cipher);
     let proto_s = ctx.create_string(&proto);
     let alpn_s = ctx.create_string(&alpn);
@@ -7131,6 +7145,35 @@ fn build_synthetic_ssl_session(ctx: &mut dyn NativeContext, id: i32) -> ObjectRe
         session_peer_certs_table()
             .lock()
             .insert(gc_stable_objref_key(ctx, ses), peer_chain);
+    }
+    // Associate THIS side's own (local) cert chain so
+    // SSLSession.getLocalCertificates() can return it. Required by Jetty's
+    // SecureRequestCustomizer.getX509() (called from retrieveSni/checkSni on
+    // every HTTPS request): it calls getLocalCertificates() and, on an empty
+    // result, throws `HttpException.RuntimeException(400, "Invalid SNI")`
+    // unconditionally — a server ALWAYS presents a certificate, so an empty
+    // chain here failed every HTTPS request through a `SecureRequestCustomizer`
+    // (JettyServletWebServerFactoryTests/JettyReactiveWebServerFactoryTests).
+    let local_chain_pem = with_engine(id, |s| {
+        s.identity_override
+            .as_ref()
+            .map(|(cert, _)| cert.clone())
+            .or_else(|| {
+                (!s.is_client)
+                    .then(runtime_tls_identity)
+                    .flatten()
+                    .map(|rti| rti.cert_pem)
+            })
+    })
+    .flatten();
+    let local_chain: Vec<Vec<u8>> = local_chain_pem
+        .and_then(|pem| parse_cert_chain_pem(&pem).ok())
+        .map(|certs| certs.iter().map(|c| c.as_ref().to_vec()).collect())
+        .unwrap_or_default();
+    if !local_chain.is_empty() {
+        session_local_certs_table()
+            .lock()
+            .insert(gc_stable_objref_key(ctx, ses), local_chain);
     }
     ses
 }
@@ -8772,6 +8815,27 @@ fn session_peer_certs_table() -> &'static Mutex<HashMap<u64, Vec<Vec<u8>>>> {
     T.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Side-table associating an `SSLSession` object with ITS OWN (local) certificate
+/// chain (DER, leaf first) — the mirror-image of `session_peer_certs_table`,
+/// populated by `build_synthetic_ssl_session`. Backs `SSLSession.getLocalCertificates()`
+/// (`phases_late::register_p68_ssl`'s registration, which cannot reach a
+/// `t27_tls`-private table directly — see `local_certs_for_session`/
+/// `record_local_cert_chain` below for the crate-visible accessors).
+fn session_local_certs_table() -> &'static Mutex<HashMap<u64, Vec<Vec<u8>>>> {
+    static T: OnceLock<Mutex<HashMap<u64, Vec<Vec<u8>>>>> = OnceLock::new();
+    T.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Crate-visible accessor for `session_local_certs_table`, used by
+/// `phases_late::register_p68_ssl`'s `getLocalCertificates` registration.
+pub(crate) fn local_certs_for_session(ctx: &dyn NativeContext, session: ObjectRef) -> Vec<Vec<u8>> {
+    session_local_certs_table()
+        .lock()
+        .get(&gc_stable_objref_key(ctx, session))
+        .cloned()
+        .unwrap_or_default()
+}
+
 /// FIX (netty-https-client-trust residual): populate `session_peer_certs_table`
 /// for a CLIENT-side `SSLSession` (allocated by `phases_late::new13_alloc_ssl_session`
 /// for the native-tls `SSLSocketFactory.createSocket` path). Without this, the
@@ -8935,6 +8999,161 @@ fn register_ssl_session_real(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Long(0)))
         }
     });
+
+    // getValue/putValue/removeValue/getValueNames — the JSSE session-attribute
+    // API. `SSLSession` is an interface with no default body for any of these,
+    // so an un-intercepted call throws AbstractMethodError. Jetty's
+    // `SecureRequestCustomizer.retrieveSni()` calls `getValue()`/`putValue()`
+    // on every SSL request to cache the resolved SNI host, so this previously
+    // failed every HTTPS request that reached `SecureRequestCustomizer`
+    // (`JettyServletWebServerFactoryTests`/`JettyReactiveWebServerFactoryTests`,
+    // both 500s with this exact AbstractMethodError). Backed by a real
+    // `java.util.HashMap` stored in the session's own LAST field (slot
+    // `num_fields - 1`, added to both the 4-field and 8-field shapes above)
+    // rather than a native side-table keyed by object address — normal GC
+    // root-scanning of the (live, reachable) session object keeps arbitrary
+    // attribute VALUES alive for free, avoiding the class of GC-unstable
+    // objref-key bug this file's other side tables have hit.
+    r.register(
+        cls,
+        "getValue",
+        "(Ljava/lang/String;)Ljava/lang/Object;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let name = args.get(1).copied().unwrap_or(Value::Object(None));
+            let slot = ctx.object_num_fields(this) - 1;
+            let map = match ctx.get_field(this, slot) {
+                Value::Object(Some(m)) => m,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            ctx.invoke(
+                "java/util/HashMap",
+                "get",
+                "(Ljava/lang/Object;)Ljava/lang/Object;",
+                &[Value::Object(Some(map)), name],
+            )
+        },
+    );
+    r.register(
+        cls,
+        "putValue",
+        "(Ljava/lang/String;Ljava/lang/Object;)V",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let name = args.get(1).copied().unwrap_or(Value::Object(None));
+            let value = args.get(2).copied().unwrap_or(Value::Object(None));
+            if matches!(name, Value::Object(None)) || matches!(value, Value::Object(None)) {
+                return Err(RuntimeError::NullPointerException {
+                    message: Some("name and value must not be null".into()),
+                }
+                .into());
+            }
+            let map = sslsess_attrs_map(ctx, this)?;
+            ctx.invoke(
+                "java/util/HashMap",
+                "put",
+                "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+                &[Value::Object(Some(map)), name, value],
+            )?;
+            Ok(None)
+        },
+    );
+    r.register(cls, "removeValue", "(Ljava/lang/String;)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let name = args.get(1).copied().unwrap_or(Value::Object(None));
+        let slot = ctx.object_num_fields(this) - 1;
+        let map = match ctx.get_field(this, slot) {
+            Value::Object(Some(m)) => m,
+            _ => return Ok(None),
+        };
+        ctx.invoke(
+            "java/util/HashMap",
+            "remove",
+            "(Ljava/lang/Object;)Ljava/lang/Object;",
+            &[Value::Object(Some(map)), name],
+        )?;
+        Ok(None)
+    });
+    r.register(cls, "getValueNames", "()[Ljava/lang/String;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let empty = |ctx: &mut dyn NativeContext| {
+            Ok(Some(Value::Object(Some(
+                ctx.new_ref_array(cratonvm_types::ClassId::new(0), 0),
+            ))))
+        };
+        let slot = ctx.object_num_fields(this) - 1;
+        let map = match ctx.get_field(this, slot) {
+            Value::Object(Some(m)) => m,
+            _ => return empty(ctx),
+        };
+        let key_set = match ctx.invoke(
+            "java/util/HashMap",
+            "keySet",
+            "()Ljava/util/Set;",
+            &[Value::Object(Some(map))],
+        )? {
+            Some(Value::Object(Some(s))) => s,
+            _ => return empty(ctx),
+        };
+        // `keySet()`'s runtime type is `HashMap$KeySet`, not `HashSet` — resolve
+        // `toArray`'s declaring class dynamically rather than guessing a name,
+        // since a wrong static class name here would use the wrong field/vtable
+        // layout for the dispatch.
+        let key_set_class = ctx.class_id_of_object(key_set);
+        let key_set_class_name = match ctx.class_name_of_id(key_set_class) {
+            Some(n) => n,
+            None => return empty(ctx),
+        };
+        let raw_arr = match ctx.invoke(
+            &key_set_class_name,
+            "toArray",
+            "()[Ljava/lang/Object;",
+            &[Value::Object(Some(key_set))],
+        )? {
+            Some(Value::Object(Some(arr))) => arr,
+            _ => return empty(ctx),
+        };
+        // `Collection.toArray()` reifies as `Object[]`, not `String[]` — real
+        // JDK's own `SSLSessionImpl.getValueNames()` has the same mismatch and
+        // copies into a freshly-typed array rather than returning it directly.
+        // Mirror that: allocate our own array (same `ClassId::new(0)` "generic
+        // String[]" convention already used elsewhere in this file, e.g.
+        // `getEnabledProtocols`) and copy each key across.
+        let len = ctx.array_length(raw_arr);
+        let out = ctx.new_ref_array(cratonvm_types::ClassId::new(0), len);
+        for i in 0..len {
+            ctx.set_array_element(out, i, ctx.get_array_element(raw_arr, i));
+        }
+        Ok(Some(Value::Object(Some(out))))
+    });
+}
+
+/// Lazily allocate (and cache in the session's own last field) the
+/// `java.util.HashMap` backing `SSLSession.putValue`/`getValue`/etc — see the
+/// doc comment on its registration in `register_ssl_session_real`.
+fn sslsess_attrs_map(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+) -> Result<ObjectRef, cratonvm_types::error::MethodCallFailed> {
+    let slot = ctx.object_num_fields(this) - 1;
+    if let Value::Object(Some(map)) = ctx.get_field(this, slot) {
+        return Ok(map);
+    }
+    let this_pin = ctx.pin_native_root(this);
+    let map = match ctx.new_object_initialized("java/util/HashMap", "()V", &[])? {
+        Some(Value::Object(Some(m))) => m,
+        _ => {
+            ctx.unpin_native_roots(this_pin);
+            return Err(RuntimeError::OutOfMemoryError {
+                message: "SSLSession: could not allocate attribute map".into(),
+            }
+            .into());
+        }
+    };
+    let this = ctx.read_native_pin(this_pin, this);
+    ctx.unpin_native_roots(this_pin);
+    ctx.set_field(this, slot, Value::Object(Some(map)));
+    Ok(map)
 }
 
 /// WP5.4 — register ALPN-related natives on SSLParameters. ALPN propagation

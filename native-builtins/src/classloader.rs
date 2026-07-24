@@ -1225,6 +1225,30 @@ pub(crate) fn invoke_single_load_class_override(
 /// decide whether `findLoadedClass`/`findLoadedClass0` must be loader-scoped
 /// (a user loader only "knows" classes in its own namespace) versus the global
 /// lookup that is correct for the built-in loaders.
+/// True iff `this` is a bare `java.net.URLClassLoader` instance (not a user
+/// subclass — a subclass already gets its own namespace via
+/// `is_user_defined_loader`'s `!is_builtin_loader_class` check).
+///
+/// `loader_namespace_id`/`peek_loader_namespace_id` are the ONLY callers —
+/// `is_builtin_loader_class` intentionally still lists
+/// `"java/net/URLClassLoader"` for its other ~20 call sites (isolation
+/// checks, resource/service-loader resolution, …), where the bare class is
+/// correctly treated as "not a distinguished user loader implementation".
+/// But `new URLClassLoader(urls)` is a completely ordinary, unlimited-arity
+/// application pattern for building an ISOLATED loader (e.g. Spring Boot's
+/// `ApplicationHomeTests` constructs one per test method, each defining its
+/// own unrelated `com.example.Source`); routing every such instance through
+/// `loader_namespace_id`'s built-in shortcut (id `0`, the shared Application
+/// namespace) made a SECOND bare `URLClassLoader` instance's class-define
+/// collide with the first's as `IncompatibleClassChangeError: already
+/// defined by application loader` — the two loaders are unrelated objects
+/// with disjoint URLs, not aliases of the single real Application loader.
+fn is_bare_url_class_loader(ctx: &mut dyn NativeContext, this: ObjectRef) -> bool {
+    ctx.class_name_of_id(ctx.class_id_of_object(this))
+        .as_deref()
+        == Some("java/net/URLClassLoader")
+}
+
 pub(crate) fn is_user_defined_loader(ctx: &mut dyn NativeContext, this: ObjectRef) -> bool {
     let cid = ctx.class_id_of_object(this);
     // This predicate is reached from real ClassLoader bytecode before the
@@ -1264,6 +1288,38 @@ fn loader_namespace_id_store() -> &'static Mutex<Vec<(ObjectRef, u32)>> {
     INSTANCE.get_or_init(|| Mutex::new(Vec::new()))
 }
 
+/// Reverse of `loader_namespace_id`: given a namespace id already allocated
+/// via the object-keyed side table (real-JDK mode's path — a `UserDefined`
+/// id from `class_manager`'s per-class `loader_id`, e.g. as returned by
+/// `NativeContext::loader_id_of_class`), find the live `ClassLoader` object
+/// that owns it. `None` for built-in namespaces (0/1/2) or a namespace this
+/// process never allocated via the object-keyed store (e.g. one only ever
+/// set through the synthetic-JDK `CL_LOADER_ID` field slot, which this store
+/// doesn't track).
+///
+/// Exists because several call sites need to *actively drive* a specific
+/// loader's own `loadClass()` (JVMS §5.4.3 initiating-loader semantics) once
+/// they already know a class's numeric namespace id but not the loader
+/// object itself — `defining_loader_for` (a separate, narrowly-populated
+/// side table keyed by `class_id`, written only by explicit
+/// `register_defining_loader` calls) is NOT a reliable source for this: a
+/// class defined via `ucl_try_define_local_class`'s isolated-loader native
+/// path IS correctly assigned a real `UserDefined` namespace id (this store
+/// IS populated for it, since `loader_namespace_id` is exactly what
+/// assigned that id), independent of whether `register_defining_loader`
+/// also happened to run for it.
+pub(crate) fn loader_object_for_namespace_id(ns_id: u32) -> Option<ObjectRef> {
+    if ns_id < 3 {
+        return None;
+    }
+    loader_namespace_id_store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .find(|(_, id)| *id == ns_id)
+        .map(|&(loader, _)| loader)
+}
+
 /// Stable CratonVM loader-namespace id for a `ClassLoader` instance, allocating
 /// one on first request. Built-in loaders map to `0` (the Application / global
 /// namespace — they ARE the global store). User-defined loaders use their
@@ -1272,7 +1328,7 @@ fn loader_namespace_id_store() -> &'static Mutex<Vec<(ObjectRef, u32)>> {
 /// user loader its own namespace so an override-first redefinition of an
 /// already-loaded class does not collide with the original definer.
 pub fn loader_namespace_id(ctx: &mut dyn NativeContext, loader: ObjectRef) -> u32 {
-    if !is_user_defined_loader(ctx, loader) {
+    if !is_user_defined_loader(ctx, loader) && !is_bare_url_class_loader(ctx, loader) {
         return 0;
     }
     if let Value::Int(v) = ctx.get_field(loader, CL_LOADER_ID) {
@@ -1298,7 +1354,7 @@ pub(crate) fn peek_loader_namespace_id(
     ctx: &mut dyn NativeContext,
     loader: ObjectRef,
 ) -> Option<u32> {
-    if !is_user_defined_loader(ctx, loader) {
+    if !is_user_defined_loader(ctx, loader) && !is_bare_url_class_loader(ctx, loader) {
         return None;
     }
     if let Value::Int(v) = ctx.get_field(loader, CL_LOADER_ID) {
@@ -2595,8 +2651,28 @@ pub(crate) fn extract_pd_code_source_url(ctx: &dyn NativeContext, pd: ObjectRef)
     // Real-JDK PD path: field 0 may not match. Try by-name.
     if let Value::Object(Some(cs)) = ctx.get_field_by_name(pd, "codesource") {
         if let Value::Object(Some(loc)) = ctx.get_field_by_name(cs, "location") {
+            // Real `CodeSource.location` is typed `java.net.URL`, not
+            // `String` — `read_string` correctly fails on it (it's a
+            // different concrete class), which silently dropped every
+            // real-JDK-constructed CodeSource's URL here (e.g.
+            // `URLClassLoader.defineClass(name, Resource)`'s
+            // `new CodeSource(url, signers)`, the path
+            // `ModifiedClassPathClassLoader`/`@ClassPathOverrides` uses to
+            // load an overridden jar's classes — see
+            // `NoSuchMethodFailureAnalyzerTests`). Reconstruct the URL
+            // string from its own real fields the same way HotSpot's
+            // `URL.toString()` does (`protocol + ":" + file`) instead.
             if let Some(s) = ctx.read_string(loc) {
                 return Some(s);
+            }
+            if let (Value::Object(Some(proto)), Value::Object(Some(file))) = (
+                ctx.get_field_by_name(loc, "protocol"),
+                ctx.get_field_by_name(loc, "file"),
+            ) {
+                if let (Some(proto), Some(file)) = (ctx.read_string(proto), ctx.read_string(file))
+                {
+                    return Some(format!("{proto}:{file}"));
+                }
             }
         }
     }
@@ -4913,6 +4989,14 @@ fn extract_url_path(ctx: &dyn NativeContext, url_obj: ObjectRef) -> Option<Strin
         .replacen("/!", "!/", 1);
     let p = p.strip_prefix("file:").unwrap_or(&p).to_string();
     let p = p.strip_prefix("//").unwrap_or(&p).to_string();
+    // `File.toURI().toURL()` percent-encodes reserved/space characters in the
+    // path (e.g. a directory named `app location` becomes `app%20location`).
+    // Real `URLClassPath` decodes this back (`new File(url.toURI())`) before
+    // touching the filesystem; do the same here, mirroring the sibling
+    // `jar:file:` decode in `net_phase_e::uri_percent_decode`. Decoding after
+    // the `/!`-marker normalisation above keeps the jar-boundary detection on
+    // the original encoded text.
+    let p = crate::net_phase_e::uri_percent_decode(&p);
     // Windows: `File.toURI().toURL()` yields `file:/C:/dir/...`, so the
     // extracted path is `/C:/dir/...` — a leading slash *before* the
     // drive letter. `PathBuf::from("/C:/...")` does not resolve on

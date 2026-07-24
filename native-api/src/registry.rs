@@ -1573,6 +1573,44 @@ pub trait NativeContext {
         self.class_id_by_name(name)
     }
 
+    /// Resolve `name` to a `ClassId`, LOADING it through
+    /// `referencing_class_id`'s own defining classloader if it isn't loaded
+    /// yet -- exactly as a bytecode instruction (`new`/`checkcast`/
+    /// `invokestatic`/...) referencing `name` FROM `referencing_class_id`
+    /// would (JVMS SS5.4.3 initiating-loader semantics).
+    ///
+    /// Unlike [`Self::class_id_by_name_near`]/[`Self::class_id_by_name`] --
+    /// pure lookups that only succeed once `name` has already been
+    /// resolved/indexed under that loader -- this drives the loader's own
+    /// `loadClass`/`defineClass` on a miss, so it also answers correctly the
+    /// very first time a class is needed under a given loader (the gap that
+    /// made two prior lookup-based fix attempts for the H2 `Parser`
+    /// loader-collapse bug regress on a fresh session -- see
+    /// docs/known-issues/h2-suite-bugs/bug-h2-suite-residual-fail-triage.md's
+    /// eighth-pass section).
+    ///
+    /// Native overrides that construct or invoke-special a DIFFERENT class
+    /// than their own receiver's declaring class (an app/H2 native bridging
+    /// into the receiver's own package -- e.g. `SessionLocal.prepareLocal`'s
+    /// `new Parser(this)`) MUST use this instead of
+    /// `new_object_initialized`/`invoke_special` with a bare name: those
+    /// collapse to whichever loader defined `name` FIRST process-wide,
+    /// silently constructing/invoking the WRONG loader's copy of the class
+    /// whenever the receiver's own defining loader is a user-defined one
+    /// distinct from the first-loaded (usually Application) copy.
+    ///
+    /// The default implementation ignores `referencing_class_id` and falls
+    /// back to the name-only [`Self::ensure_class_initialized`] -- sufficient
+    /// for test mocks and any context with a single (global) loader
+    /// namespace; the real VM implementation honours per-loader identity.
+    fn class_id_by_name_via_referencing_class(
+        &mut self,
+        _referencing_class_id: ClassId,
+        name: &str,
+    ) -> Result<ClassId, cratonvm_types::error::MethodCallFailed> {
+        self.ensure_class_initialized(name)
+    }
+
     /// For a synthetic lambda-proxy `ClassId` (created by `register_lambda_proxy`,
     /// class id `>= 0x8000_0000`, not in the class store), return the internal
     /// name of its functional (SAM) interface. Returns `None` for any non-lambda
@@ -2008,6 +2046,14 @@ pub trait NativeContext {
         256 * 1024 * 1024
     }
 
+    /// Initial heap size in bytes, as reported by the JMX `MemoryMXBean`'s
+    /// heap `MemoryUsage.getInit()`. The default (mock/test contexts) mirrors
+    /// `max_heap_bytes`'s historical placeholder; the VM overrides it to
+    /// return the configured `-Xms` (`VmConfig::initial_heap_size`).
+    fn initial_heap_bytes(&self) -> i64 {
+        16 * 1024 * 1024
+    }
+
     /// Returns the total number of bytes allocated on the heap.
     fn heap_allocated_bytes(&self) -> usize;
 
@@ -2035,6 +2081,22 @@ pub trait NativeContext {
     /// The default impl is a no-op so out-of-tree `NativeContext`
     /// implementors (tests) need not change.
     fn begin_blocking_region(&mut self) {}
+
+    /// Same GC-safety contract as `begin_blocking_region`, for a region with
+    /// a bounded/known wait duration (`Thread.sleep`, a timed `Object.wait`,
+    /// `LockSupport.parkNanos`, …). `Thread.getState()` reports
+    /// `TIMED_WAITING` for a thread inside one of these vs. plain `WAITING`
+    /// for an unbounded `begin_blocking_region` — real JDK's
+    /// `Thread.State` makes exactly this distinction, and callers such as
+    /// Spring Boot's `SpringApplicationShutdownHookTests` assert on it via
+    /// `Awaitility.await().until(thread::getState, State.TIMED_WAITING::equals)`.
+    ///
+    /// The default impl just delegates to `begin_blocking_region` (reported
+    /// as plain `WAITING`) so out-of-tree `NativeContext` implementors need
+    /// not change; must still be paired with exactly one `end_blocking_region`.
+    fn begin_timed_blocking_region(&mut self) {
+        self.begin_blocking_region();
+    }
 
     /// T19.H1 — end a blocking region opened by `begin_blocking_region`.
     /// Re-syncs the thread with any GC that ran while it was blocked.

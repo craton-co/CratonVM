@@ -442,6 +442,87 @@ fn coding_action(ctx: &dyn NativeContext, obj: ObjectRef, field: &str) -> engine
     engine::CodingAction::Report
 }
 
+// ---------------------------------------------------------------------------
+// UTF-16 BOM session state
+// ---------------------------------------------------------------------------
+//
+// The "UTF-16" charset (unlike "UTF-16BE"/"UTF-16LE") writes a leading
+// byte-order-mark exactly once per encoder *session* — i.e. once per encoder
+// object, until `reset()` starts a new session — not once per `encode()`
+// call. `AppendableByteArray` (Spring Boot's `WritableJson` byte buffer,
+// `org.springframework.boot.json.AppendableByteArrayTests`) drives a single
+// `CharsetEncoder` through many small `encode()` calls as its output
+// `ByteBuffer` overflows and grows, so a naive "prepend BOM on every call"
+// implementation emits a fresh BOM before every 1-2 chars instead of once at
+// the very start of the message. Real JDK's `sun.nio.cs.UnicodeEncoder`
+// tracks this via a `needsBOM` instance field; our `CharsetEncoder` objects
+// have no spare field slot (the real class defines exactly six: charset,
+// averageBytesPerChar, maxBytesPerChar, replacement, malformedInputAction,
+// unmappableCharacterAction — see `register_p58_charset_coder`), so track it
+// in a side-table keyed by GC-stable object identity instead, same pattern as
+// `properties_sidetable`'s `key_for` / `jca::key_factory`'s `kpg_obj_key_for`.
+struct BomKeyEntry {
+    last_ptr: usize,
+    generation: u32,
+}
+
+fn bom_key_registry() -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<u32, Vec<BomKeyEntry>>> {
+    static R: std::sync::OnceLock<
+        parking_lot::Mutex<rustc_hash::FxHashMap<u32, Vec<BomKeyEntry>>>,
+    > = std::sync::OnceLock::new();
+    R.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
+}
+
+#[inline]
+fn pack_bom_key(hash: u32, generation: u32) -> usize {
+    ((hash as usize) << 32) | (generation as usize)
+}
+
+fn bom_key_for(ctx: &dyn NativeContext, obj: ObjectRef) -> usize {
+    let hash = ctx.identity_hash_code(obj) as u32;
+    let ptr = obj.as_ptr() as usize;
+    let mut reg = bom_key_registry().lock();
+    let slots = reg.entry(hash).or_default();
+    if let Some(slot) = slots.iter().find(|s| s.last_ptr == ptr) {
+        return pack_bom_key(hash, slot.generation);
+    }
+    if hash != 0 && slots.len() == 1 {
+        slots[0].last_ptr = ptr;
+        return pack_bom_key(hash, slots[0].generation);
+    }
+    let generation = slots.len() as u32;
+    slots.push(BomKeyEntry {
+        last_ptr: ptr,
+        generation,
+    });
+    pack_bom_key(hash, generation)
+}
+
+fn bom_written_set() -> &'static parking_lot::Mutex<rustc_hash::FxHashSet<usize>> {
+    static S: std::sync::OnceLock<parking_lot::Mutex<rustc_hash::FxHashSet<usize>>> =
+        std::sync::OnceLock::new();
+    S.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashSet::default()))
+}
+
+/// Has `this` (a `CharsetEncoder`) already written its BOM for the current
+/// session (i.e. since construction or the last `reset()`)?
+fn bom_already_written(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
+    let key = bom_key_for(ctx, this);
+    bom_written_set().lock().contains(&key)
+}
+
+fn mark_bom_written(ctx: &dyn NativeContext, this: ObjectRef) {
+    let key = bom_key_for(ctx, this);
+    bom_written_set().lock().insert(key);
+}
+
+/// Start a new BOM session for `this` — called by `CharsetEncoder.reset()`,
+/// mirroring real JDK's `UnicodeEncoder.implReset()` re-arming `needsBOM`.
+pub(crate) fn clear_bom_state(ctx: &dyn NativeContext, this: ObjectRef) {
+    let key = bom_key_for(ctx, this);
+    bom_written_set().lock().remove(&key);
+}
+
 /// `CharsetEncoder.encode(CharBuffer, ByteBuffer, boolean end_of_input)
 ///  -> CoderResult`
 ///
@@ -500,11 +581,26 @@ fn native_encoder_encode(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 
     let avail = (blim - bpos).max(0) as usize;
 
+    // "UTF-16" writes its BOM once per encoder *session* (see `clear_bom_state`
+    // doc comment above), not once per `encode()` call. Transcode the actual
+    // atoms as plain big-endian ("UTF-16BE") and prepend the 2-byte BOM
+    // ourselves, exactly once, the first time this encoder instance commits
+    // any output.
+    let bom_pending = name == "UTF-16" && !bom_already_written(ctx, this);
+    let effective_name: &str = if name == "UTF-16" { "UTF-16BE" } else { &name };
+    let bom_bytes: &[u8] = if bom_pending { &[0xFE, 0xFF] } else { &[] };
+
     // Fast path: the whole slice encodes cleanly (no surrogate/mapping errors)
     // and fits in the destination. Avoids per-atom work for the common case.
-    if let Ok(encoded) = engine::encode_chars(&name, &chars) {
-        if encoded.len() <= avail {
-            let written = write_byte_array(ctx, barr, bpos as usize, &encoded);
+    if let Ok(encoded) = engine::encode_chars(effective_name, &chars) {
+        if bom_bytes.len() + encoded.len() <= avail {
+            let mut final_bytes = Vec::with_capacity(bom_bytes.len() + encoded.len());
+            final_bytes.extend_from_slice(bom_bytes);
+            final_bytes.extend_from_slice(&encoded);
+            if bom_pending {
+                mark_bom_written(ctx, this);
+            }
+            let written = write_byte_array(ctx, barr, bpos as usize, &final_bytes);
             set_pos(ctx, bb, bpos + written as i32);
             set_pos(ctx, cb, cpos + chars.len() as i32);
             let r = alloc_coder_result(ctx, CR_UNDERFLOW);
@@ -517,7 +613,20 @@ fn native_encoder_encode(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     let unmappable_replace = coding_action_is_replace(ctx, this, "unmappableCharacterAction");
     let replacement = encoder_replacement(ctx, this);
 
+    // Not enough room even for the BOM: OVERFLOW without consuming/committing
+    // anything (matches real JDK's `UnicodeEncoder.encodeLoop`).
+    if bom_pending && avail < bom_bytes.len() {
+        let r = alloc_coder_result(ctx, CR_OVERFLOW);
+        return Ok(Some(Value::Object(Some(r))));
+    }
     let mut out: Vec<u8> = Vec::new();
+    out.extend_from_slice(bom_bytes);
+    if bom_pending {
+        // Committed regardless of whether any atoms end up fitting after it —
+        // same as real JDK, which writes the BOM as an unconditional first
+        // step and only then attempts the character loop.
+        mark_bom_written(ctx, this);
+    }
     let mut i = 0usize;
     let mut tag = CR_UNDERFLOW;
     while i < chars.len() {
@@ -526,7 +635,7 @@ fn native_encoder_encode(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         // REPORT-action error or an incomplete trailing surrogate.
         let (atom_units, atom_bytes): (usize, Vec<u8>) = if is_high_surrogate(c) {
             match chars.get(i + 1).copied() {
-                Some(lo) if is_low_surrogate(lo) => match engine::encode_chars(&name, &[c, lo]) {
+                Some(lo) if is_low_surrogate(lo) => match engine::encode_chars(effective_name, &[c, lo]) {
                     Ok(b) => (2, b),
                     Err(e) if e.kind == engine::CodingErrorKind::Unmappable => {
                         if unmappable_replace {
@@ -569,7 +678,7 @@ fn native_encoder_encode(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
                 break;
             }
         } else {
-            match engine::encode_chars(&name, &[c]) {
+            match engine::encode_chars(effective_name, &[c]) {
                 Ok(b) => (1, b),
                 Err(e) if e.kind == engine::CodingErrorKind::Unmappable => {
                     if unmappable_replace {
@@ -945,6 +1054,21 @@ pub fn register_real_charset_natives(registry: &mut NativeMethodRegistry) {
         "encode",
         "(Ljava/nio/CharBuffer;)Ljava/nio/ByteBuffer;",
         native_charset_encode_charbuf_via_encoder,
+    );
+    // Overrides `register_p58_charset_coder`'s no-op `reset()` stub: a "UTF-16"
+    // encoder must re-arm its BOM state (see `clear_bom_state`) so the NEXT
+    // encoding session — not just the next `encode()` call — gets its own
+    // leading BOM again (`AppendableByteArrayTests.writeUsingCache` reuses a
+    // single cached encoder instance across independent messages).
+    registry.register(
+        enc,
+        "reset",
+        "()Ljava/nio/charset/CharsetEncoder;",
+        |ctx, args| {
+            let this = arg_obj(args, 0)?;
+            clear_bom_state(ctx, this);
+            Ok(Some(Value::Object(Some(this))))
+        },
     );
 
     let dec = "java/nio/charset/CharsetDecoder";
