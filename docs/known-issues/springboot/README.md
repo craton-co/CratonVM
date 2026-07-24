@@ -53,7 +53,13 @@ smaller/individual differences not yet clustered.
 > just tipped over the 300s timeout by this module's unusually large
 > (~121-jar) test classpath. Fixed in `native-builtins/src/classloader.rs`
 > and `phases_late.rs`. One pre-existing, narrower residual unmasked by the
-> fix (not caused by it): `data-redis-jedis-sslbundle-withpackageresources-classloader-leak.md`.
+> fix (not caused by it) — **also now FIXED 2026-07-23**, moved to
+> [`../../internal/fixed-suite-bugs/springboot/data-redis-jedis-sslbundle-withpackageresources-classloader-leak-FIXED.md`](../../internal/fixed-suite-bugs/springboot/data-redis-jedis-sslbundle-withpackageresources-classloader-leak-FIXED.md).
+> Root cause: `classloader_real.rs::cl_real_load_class_base` silently
+> swallowed a user-defined parent loader's authoritative
+> `ClassNotFoundException` and fell through to CratonVM's loader-blind flat
+> global class store, un-doing `ModifiedClassPathClassLoader`'s
+> `@ClassPathExclusions` filtering.
 
 | Doc | Classes | Severity | Status |
 |---|---:|---|---|

@@ -83,10 +83,11 @@ bugs — see "Residuals unmasked" below).
   **passes 56/56** — just takes ~349s, 49s over the 300s suite-runner
   default (see "Residual" below; this is a genuine perf gap unrelated to
   the caching bug, not a hang). `DataRedisAutoConfigurationJedisTests` now
-  completes in ~215s, 22/23 tests pass — see
-  `data-redis-jedis-sslbundle-withpackageresources-classloader-leak.md` for
-  the one remaining failure (pre-existing, unrelated, previously masked by
-  the class-level hang).
+  completes in ~215s, 22/23 tests pass — the one remaining failure
+  (pre-existing, unrelated, previously masked by the class-level hang) is
+  **also now FIXED 2026-07-23**, see
+  `../../internal/fixed-suite-bugs/springboot/data-redis-jedis-sslbundle-withpackageresources-classloader-leak-FIXED.md`.
+  Full class now 23/23 PASS.
 - Regression sweep: 82 classes (all `module/spring-boot-data-redis` +
   71 classes across the codebase using `@ClassPathExclusions`/
   `@ClassPathOverrides`, chosen because they most directly exercise the
