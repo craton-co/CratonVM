@@ -1,4 +1,4 @@
-# Untriaged oddities — 2 classes
+# Untriaged oddities — 3 classes
 
 Not confirmed as fixture gaps or CratonVM bugs — flagged for a future
 session to spend ~15-30 minutes reading the failing test method before
@@ -38,3 +38,19 @@ the ordering wrong). Not understood yet; needs someone to actually read
 `TestNonstandardTagPerformance.java` and reproduce standalone with
 `-verbose:class` to see which classloader is asking for it and why the
 lookup fails.
+
+## `org.apache.catalina.nonblocking.TestNonBlockingAPI`
+
+Fails on **both** CratonVM and HotSpot in this fixture for a reason that has
+never been pinned down — moved here from
+`docs/known-issues/tomcat/value-stack-usize-underflow-nio-worker-panic.md`
+(now `docs/internal/fixed-suite-bugs/tomcat/`, FIXED) once that doc's actual
+CratonVM-only bug (a `value_stack.rs` underflow panic on a background NIO
+worker thread, same class) was root-caused and fixed. This class's
+HotSpot-shared failure is unrelated to that panic — the panic was
+CratonVM-only, confirmed via 35 repro attempts post-fix with zero
+recurrence, while whatever makes this class ALSO fail on HotSpot is a
+separate, still-untriaged issue. Needs someone to run this class against
+both VMs, diff the actual failing assertion/exception, and categorize it
+properly (test-framework artifact vs. a genuine shared-library/fixture gap
+vs. a real shared bug both VMs happen to hit).

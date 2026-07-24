@@ -39,15 +39,21 @@ steps (see each doc's "RESOLVED" note for the exact commands).
 
 | Doc | Classes |
 |---|---:|
-| [untriaged-oddities.md](untriaged-oddities.md) | 2 |
+| [untriaged-oddities.md](untriaged-oddities.md) | 3 |
 | [hang-classification-unconfirmed-host-contention.md](hang-classification-unconfirmed-host-contention.md) | 9 |
 
-## Real CratonVM bug (not a fixture gap — despite living in the same 35-class "both VMs fail" bucket)
+## Real CratonVM bug (not a fixture gap — despite living in the same 35-class "both VMs fail" bucket) — FIXED
 
-| Doc | Classes |
-|---|---:|
-| [value-stack-usize-underflow-nio-worker-panic.md](value-stack-usize-underflow-nio-worker-panic.md) | 2 (confirmed in a 3rd bucket too — see doc) |
+The `value_stack.rs` `usize`-underflow panic on a background NIO worker
+thread (`TestNonBlockingAPI` / `TestWebSocketFrameClientSSL`, both hitting
+`LinkedBlockingQueue.take()`'s `Condition.await()` interface dispatch) was
+root-caused and fixed — a missing pre-pop deopt-frame snapshot in
+`jit/src/x64.rs`'s generic invoke-dispatch codegen. See
+`docs/internal/fixed-suite-bugs/tomcat/value-stack-usize-underflow-nio-worker-panic-FIXED.md`.
+`TestNonBlockingAPI`'s separate, unrelated HotSpot-shared failure is tracked
+in [untriaged-oddities.md](untriaged-oddities.md).
 
-Total accounted for: 6 + 2 + 1 = 9 docs covering all 35 non-PASS classes from
-the "true fixture gap" bucket, plus the 2 classes where the real panic also
-reproduces.
+Total accounted for: 6 + 3 = 9 docs covering all 35 non-PASS classes from
+the "true fixture gap" bucket, plus the 2 classes where the panic used to
+reproduce (now fixed, folded into the count above via `untriaged-oddities.md`
+picking up `TestNonBlockingAPI`'s residual HotSpot-shared issue).

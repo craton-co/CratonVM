@@ -23907,6 +23907,18 @@ impl Compiler {
                         }
                         // ===== INTRINSIC REGION END: ARRAYS_SORT =====
                         else {
+                            // value-stack-usize-underflow-nio-worker-panic fix:
+                            // snapshot the pre-pop operand stack (see the
+                            // matching invokevirtual/interface fix below) so a
+                            // post-invoke exception/deopt guard's `Reinterpret`
+                            // resume at this bci has the args this invokestatic
+                            // needs, instead of underflowing on an empty stack.
+                            if crate::deopt_real_enabled() {
+                                self.snapshot_pre_intrinsic_call(
+                                    pc,
+                                    crate::deopt::DeoptReason::ReceiverTypeChanged,
+                                );
+                            }
                             // Direct call to a JIT-compiled callee
                             let n = callee_params;
                             let mut arg_slots = Vec::with_capacity(n);
@@ -24039,6 +24051,19 @@ impl Compiler {
                         let info_ref = unsafe { &*info };
                         let n = info_ref.num_jit_args;
 
+                        // value-stack-usize-underflow-nio-worker-panic fix:
+                        // snapshot the pre-pop operand stack (see the matching
+                        // invokevirtual/interface fix below) so a post-invoke
+                        // exception/deopt guard's `Reinterpret` resume at this
+                        // bci has the args this invokestatic needs, instead of
+                        // underflowing on an empty stack.
+                        if crate::deopt_real_enabled() {
+                            self.snapshot_pre_intrinsic_call(
+                                pc,
+                                crate::deopt::DeoptReason::ReceiverTypeChanged,
+                            );
+                        }
+
                         // Capture spill offset BEFORE popping to prevent
                         // the args buffer from overlapping source Frame slots.
                         let pre_pop_spill = self.next_spill_offset;
@@ -24159,6 +24184,19 @@ impl Compiler {
                             return false;
                         }
 
+                        // value-stack-usize-underflow-nio-worker-panic fix:
+                        // snapshot the pre-pop operand stack for the non-tail
+                        // path below (see the matching invokevirtual/interface
+                        // fix elsewhere in this match arm) — the tail-call form
+                        // JMPs and never reaches `emit_post_invoke_exception_check`,
+                        // so this is a no-op for it beyond the idempotent
+                        // `deopt_box_ptr_by_bci` insert.
+                        if crate::deopt_real_enabled() {
+                            self.snapshot_pre_intrinsic_call(
+                                pc,
+                                crate::deopt::DeoptReason::ReceiverTypeChanged,
+                            );
+                        }
                         let mut arg_slots = Vec::with_capacity(n);
                         for _ in 0..n {
                             arg_slots.push(self.pop_stack());
@@ -25623,6 +25661,20 @@ impl Compiler {
                         // ===== INTRINSIC REGION END: CRC32 =====
 
                         if !intrinsic_handled {
+                            // value-stack-usize-underflow-nio-worker-panic fix:
+                            // snapshot the pre-pop operand stack here too (see
+                            // the matching fix + comment on the MIC/PIC helper
+                            // dispatch path below) — a direct call's callee can
+                            // still throw/deopt, and `emit_post_invoke_exception_check`
+                            // would otherwise be the first (and only) snapshot
+                            // for this bci, taken AFTER the receiver/args are
+                            // popped, which underflows on a `Reinterpret` resume.
+                            if crate::deopt_real_enabled() {
+                                self.snapshot_pre_intrinsic_call(
+                                    pc,
+                                    crate::deopt::DeoptReason::ReceiverTypeChanged,
+                                );
+                            }
                             // Direct call: pop receiver + params, call compiled entry
                             // invokespecial has a receiver, so total args = callee_params + 1
                             let n = callee_params + 1; // receiver + params
@@ -25682,6 +25734,34 @@ impl Compiler {
                             // JitInvokeInfo structs kept alive by the caller for the duration of compilation.
                             let info_ref = unsafe { &*info };
                             let n = info_ref.num_jit_args;
+
+                            // value-stack-usize-underflow-nio-worker-panic fix:
+                            // snapshot the operand stack BEFORE popping this
+                            // invoke's receiver/args, mirroring
+                            // `snapshot_pre_intrinsic_call`'s "Step 6" pattern
+                            // used by the String-intrinsic ladder above. Without
+                            // this, the ONLY deopt point available at this bci is
+                            // the one `emit_post_invoke_exception_check` builds
+                            // AFTER the args are already popped (it only builds
+                            // one when `deopt_box_ptr_by_bci` has no entry yet) —
+                            // that snapshot is fine for "resume after the call
+                            // with an exception pending", but every such point is
+                            // tagged `DeoptAction::Reinterpret` at THIS bci, which
+                            // means "re-execute this same invoke bytecode from
+                            // scratch" and therefore needs the receiver (+ args)
+                            // still live on the operand stack. An empty
+                            // post-pop snapshot underflows the moment the
+                            // resumed interpreter re-fetches the receiver —
+                            // reproduced as a `value_stack.rs` panic on a
+                            // background NIO worker thread resuming
+                            // `LinkedBlockingQueue.take()`'s `Condition.await()`
+                            // interface dispatch after an inline-cache miss.
+                            if crate::deopt_real_enabled() {
+                                self.snapshot_pre_intrinsic_call(
+                                    pc,
+                                    crate::deopt::DeoptReason::ReceiverTypeChanged,
+                                );
+                            }
 
                             // Check for MIC slot at this PC
                             let mic_ptr = self.mic_slots_idx.get(&pc).map(|&i| self.mic_slots[i].1);
