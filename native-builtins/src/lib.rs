@@ -75231,23 +75231,26 @@ pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
 /// Spring Boot 3.2 logback bridge — registered unconditionally in real-JDK
 /// mode by `vm_init.rs`.
 ///
-/// `DefaultLogbackConfiguration.apply(LogbackConfigurator)` sets up the
-/// default logback config (root logger level, console appender, pattern
-/// layout, …) by entering synchronized blocks on the wrapped LoggerContext.
-/// Because we serve LoggerContext via `alloc_concurrent_synthetic` (bypassing
-/// logback's `<init>`), the first `monitorenter` at pc=7 NPEs on a null
-/// field. Treat `apply()` as a no-op so the bytecode never runs — logs fall
-/// back to the JVM's default stderr handler, which is fine for Spring Boot
-/// bootstrap. Paired with the `check_override` allow-list entry in
-/// `vm/src/vm/vm_exec.rs`.
-pub fn register_spring_boot_logback_apply(registry: &mut NativeMethodRegistry) {
-    registry.register(
-        "org/springframework/boot/logging/logback/DefaultLogbackConfiguration",
-        "apply",
-        "(Lorg/springframework/boot/logging/logback/LogbackConfigurator;)V",
-        |_, _| Ok(None),
-    );
-}
+/// STALE, REMOVED 2026-07-24 (Cluster C logging-bootstrap batch):
+/// `DefaultLogbackConfiguration.apply(LogbackConfigurator)` used to be
+/// forced to a no-op here because `ch/qos/logback/classic/LoggerContext`
+/// was served via `alloc_concurrent_synthetic` (bypassing logback's real
+/// `<init>`), so `apply()`'s first `monitorenter` NPE'd on a null field.
+/// That premise no longer holds: `LoggerContext` construction is real
+/// bytecode now (confirmed by both the
+/// `logback_context_construction_and_state_are_not_native_overridden`
+/// regression test below and direct testing — `new LoggerContext()` +
+/// `getConfigurationLock()` return a genuinely working `ReentrantLock`).
+/// With this no-op left in place, `apply()` silently never installed a
+/// `ConsoleAppender`, root level, or pattern layout at all — the actual
+/// root cause of `DefaultLogbackConfigurationTests`' failures and (via
+/// `LoggingApplicationListener`'s bootstrap path, which calls `apply()`)
+/// `LoggingApplicationListenerTests`' captured-output-always-empty
+/// failures. Letting real bytecode run instead: `defaults()` +
+/// `consoleAppender()` + `config.root(...)` verified directly to work and
+/// correctly preserve `LoggerContext` properties/state, both individually
+/// and through `apply()`'s own try/finally.
+pub fn register_spring_boot_logback_apply(_registry: &mut NativeMethodRegistry) {}
 
 fn register_slf4j_natives(registry: &mut NativeMethodRegistry) {
     let lf = "org/slf4j/LoggerFactory";

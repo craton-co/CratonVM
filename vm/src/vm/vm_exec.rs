@@ -16402,20 +16402,17 @@ fn invoke_on_class_shared_inner(
                                 | "isEnabled" | "logIfEnabled" | "logMessage"
                                 | "getName" | "getLevel" | "getMessageFactory"
                                 | "<init>"))
-                        // SB3-LOGBACK: Spring Boot's
-                        // DefaultLogbackConfiguration.apply(LoggerContext) sets
-                        // up the default logback configuration (root logger
-                        // level, console appender, pattern layout, etc.) by
-                        // entering synchronized blocks on internal LoggerContext
-                        // fields. Because we serve LoggerContext via
-                        // `alloc_concurrent_synthetic` (bypassing logback's
-                        // `<init>`), the very first `monitorenter` at pc=7
-                        // dereferences a null field and NPEs.  Force the no-op
-                        // native override (registered alongside the other
-                        // logback bridge natives in `native-builtins/src/lib.rs`)
-                        // so the bytecode never runs — logs fall back to the
-                        // JVM's default stderr handler, which is fine for
-                        // Spring Boot's bootstrap path.
+                        // SB3-LOGBACK: STALE, no native override registered
+                        // here anymore (removed 2026-07-24 — see
+                        // `register_spring_boot_logback_apply` in
+                        // `native-builtins/src/lib.rs`; the premise, a
+                        // synthetic-allocated `LoggerContext` NPEing on
+                        // `monitorenter`, no longer holds — `LoggerContext`
+                        // construction is real bytecode). This allow-list
+                        // entry is now inert (no registration exists for this
+                        // triple, so dispatch falls through to real bytecode
+                        // either way) — left as a harmless historical marker
+                        // rather than risk touching unrelated dispatch logic.
                         || (class_name
                             == "org/springframework/boot/logging/logback/DefaultLogbackConfiguration"
                             && method_name == "apply"
