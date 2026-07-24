@@ -1,11 +1,43 @@
-# `Properties.keySet()`/`entrySet()`/`values()` return disconnected snapshots, not live `Map` views — `keySet().retainAll(...)`/`.remove(...)` silently no-op on the real properties
+# FIXED — `Properties.keySet()`/`entrySet()`/`values()` returned disconnected snapshots, not live `Map` views
 
-**Status: OPEN — found 2026-07-24.** General `java.util.Properties` bridge gap
+**Status: FIXED 2026-07-24, second attempt (first attempt reverted — see
+below for what changed).** General `java.util.Properties` bridge gap
 (`native-builtins/src/properties_sidetable.rs`), discovered via the Spring
-Boot core Cluster C (logging bootstrap) batch. Blocks
+Boot core Cluster C (logging bootstrap) batch. Was blocking
 `org.springframework.boot.logging.log4j2.Log4j2LoggingSystemPropertiesTests
-#appliesLog4j2RollingPolicyPropertiesWithDefaults` specifically, but the
-underlying gap is general — any test relying on the common JUnit idiom
+#appliesLog4j2RollingPolicyPropertiesWithDefaults` (now fully passing) and
+contributing to several `LoggingApplicationListenerTests` failures (its
+`@AfterEach` uses the exact idiom below; went from 22 to 17 failures out
+of 41 once this landed — the rest are unrelated to this specific gap).
+
+## Second attempt: scope the override to `LinkedHashSet`, not `HashSet`
+
+The first attempt (see the original writeup below) registered natives on
+`java/util/HashSet.retainAll`/`.remove` globally, gated on a
+source-`Properties` side-table tag so ordinary `HashSet`s passed straight
+through to real bytecode. That caused a real regression in an unrelated
+test (`JakartaApiValidationExceptionFailureAnalyzerTests`, via a Spring
+`DefaultSingletonBeanRegistry` interaction never fully root-caused) and
+was reverted.
+
+This attempt keeps the exact same tagging/propagation logic but changes
+which class the `Properties.keySet()` snapshot is built as:
+`java/util/LinkedHashSet` instead of `java/util/HashSet`
+(`build_key_set`), with the native overrides registered on
+`java/util/LinkedHashSet` specifically. `LinkedHashSet extends HashSet`,
+so the `Set` contract and `instanceof HashSet` are unchanged for any
+caller — but the override's blast radius shrinks from "every `HashSet` in
+the entire process" to "objects this one function creates or the
+override on `LinkedHashSet` retainAll/remove". Verified: full Cluster C
+list + green controls, including
+`JakartaApiValidationExceptionFailureAnalyzerTests` specifically (the
+prior regression victim), all pass.
+
+## Original writeup (root cause and first, reverted attempt)
+
+General `java.util.Properties` bridge gap
+(`native-builtins/src/properties_sidetable.rs`). The underlying gap is
+general — any test relying on the common JUnit idiom
 `Set<Object> baseline = new HashSet<>(props.keySet()); ...
 props.keySet().retainAll(baseline);` to restore `System` properties between
 test methods is affected if a prior method in the same process added keys.
@@ -44,7 +76,7 @@ not through a `keySet()` view) removes correctly — only the *view*-based
 mutation path (`keySet().remove(...)`, `keySet().retainAll(...)`,
 `keySet().iterator().remove()`) is disconnected from the source.
 
-## First fix attempt reverted — do not retry without a much narrower scope
+## First fix attempt — reverted (superseded by the `LinkedHashSet`-scoped retry above)
 
 A native override on `java/util/HashSet.retainAll`/`.remove`, gated on a
 side-table tag linking a specific snapshot `Set` back to its source
