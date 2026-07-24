@@ -1225,6 +1225,30 @@ pub(crate) fn invoke_single_load_class_override(
 /// decide whether `findLoadedClass`/`findLoadedClass0` must be loader-scoped
 /// (a user loader only "knows" classes in its own namespace) versus the global
 /// lookup that is correct for the built-in loaders.
+/// True iff `this` is a bare `java.net.URLClassLoader` instance (not a user
+/// subclass — a subclass already gets its own namespace via
+/// `is_user_defined_loader`'s `!is_builtin_loader_class` check).
+///
+/// `loader_namespace_id`/`peek_loader_namespace_id` are the ONLY callers —
+/// `is_builtin_loader_class` intentionally still lists
+/// `"java/net/URLClassLoader"` for its other ~20 call sites (isolation
+/// checks, resource/service-loader resolution, …), where the bare class is
+/// correctly treated as "not a distinguished user loader implementation".
+/// But `new URLClassLoader(urls)` is a completely ordinary, unlimited-arity
+/// application pattern for building an ISOLATED loader (e.g. Spring Boot's
+/// `ApplicationHomeTests` constructs one per test method, each defining its
+/// own unrelated `com.example.Source`); routing every such instance through
+/// `loader_namespace_id`'s built-in shortcut (id `0`, the shared Application
+/// namespace) made a SECOND bare `URLClassLoader` instance's class-define
+/// collide with the first's as `IncompatibleClassChangeError: already
+/// defined by application loader` — the two loaders are unrelated objects
+/// with disjoint URLs, not aliases of the single real Application loader.
+fn is_bare_url_class_loader(ctx: &mut dyn NativeContext, this: ObjectRef) -> bool {
+    ctx.class_name_of_id(ctx.class_id_of_object(this))
+        .as_deref()
+        == Some("java/net/URLClassLoader")
+}
+
 pub(crate) fn is_user_defined_loader(ctx: &mut dyn NativeContext, this: ObjectRef) -> bool {
     let cid = ctx.class_id_of_object(this);
     // This predicate is reached from real ClassLoader bytecode before the
@@ -1272,7 +1296,7 @@ fn loader_namespace_id_store() -> &'static Mutex<Vec<(ObjectRef, u32)>> {
 /// user loader its own namespace so an override-first redefinition of an
 /// already-loaded class does not collide with the original definer.
 pub fn loader_namespace_id(ctx: &mut dyn NativeContext, loader: ObjectRef) -> u32 {
-    if !is_user_defined_loader(ctx, loader) {
+    if !is_user_defined_loader(ctx, loader) && !is_bare_url_class_loader(ctx, loader) {
         return 0;
     }
     if let Value::Int(v) = ctx.get_field(loader, CL_LOADER_ID) {
@@ -1298,7 +1322,7 @@ pub(crate) fn peek_loader_namespace_id(
     ctx: &mut dyn NativeContext,
     loader: ObjectRef,
 ) -> Option<u32> {
-    if !is_user_defined_loader(ctx, loader) {
+    if !is_user_defined_loader(ctx, loader) && !is_bare_url_class_loader(ctx, loader) {
         return None;
     }
     if let Value::Int(v) = ctx.get_field(loader, CL_LOADER_ID) {
@@ -4933,6 +4957,14 @@ fn extract_url_path(ctx: &dyn NativeContext, url_obj: ObjectRef) -> Option<Strin
         .replacen("/!", "!/", 1);
     let p = p.strip_prefix("file:").unwrap_or(&p).to_string();
     let p = p.strip_prefix("//").unwrap_or(&p).to_string();
+    // `File.toURI().toURL()` percent-encodes reserved/space characters in the
+    // path (e.g. a directory named `app location` becomes `app%20location`).
+    // Real `URLClassPath` decodes this back (`new File(url.toURI())`) before
+    // touching the filesystem; do the same here, mirroring the sibling
+    // `jar:file:` decode in `net_phase_e::uri_percent_decode`. Decoding after
+    // the `/!`-marker normalisation above keeps the jar-boundary detection on
+    // the original encoded text.
+    let p = crate::net_phase_e::uri_percent_decode(&p);
     // Windows: `File.toURI().toURL()` yields `file:/C:/dir/...`, so the
     // extracted path is `/C:/dir/...` — a leading slash *before* the
     // drive letter. `PathBuf::from("/C:/...")` does not resolve on

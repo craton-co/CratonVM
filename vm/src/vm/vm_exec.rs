@@ -7026,6 +7026,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                     match self.shared.thread_registry.java_block_state(id) {
                         1 => 3, // WAITING
                         2 => 4, // BLOCKED
+                        3 => 5, // TIMED_WAITING
                         _ => 1, // RUNNABLE
                     }
                 } else {
@@ -7075,6 +7076,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             2 => 0x0002, // TERMINATED
             3 => 0x0010, // WAITING
             4 => 0x0400, // BLOCKED_ON_MONITOR_ENTER
+            5 => 0x0010, // TIMED_WAITING (approximated as WAITING for this bit-field)
             _ => 0,
         };
         Some(cratonvm_native_api::ThreadJmxSnapshot {
@@ -7596,40 +7598,11 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     }
 
     fn begin_blocking_region(&mut self) {
-        self.thread
-            .gc_block_state
-            .java_state
-            .store(1, std::sync::atomic::Ordering::Release);
-        // CRIT (TLAB UAF) — retire this thread's TLAB before entering the
-        // blocked region, while the young arena it points into is still valid.
-        // While we are GC-blocked a stop-the-world moving collection can run on
-        // another thread and `grow()` (realloc) the young arena, freeing the old
-        // backing buffer; a retained TLAB `[cursor,end)` into that buffer would
-        // then be dangling and the first post-block fast-path bump would write
-        // the object header into freed memory → EXCEPTION_ACCESS_VIOLATION in
-        // `init_object_header`. Retiring here (arena still mapped) fills the tail
-        // for the collector's walk and empties the TLAB so the next allocation,
-        // after the block, refills from the current arena. Symmetric to the
-        // parked-thread retire in `safepoint_check`; `check_post_block_gc` only
-        // remaps existing refs and runs after the buffer may already be freed,
-        // so the retire must happen here, before the block.
-        self.thread.tlab.retire();
-        // T19.H1 — a native about to spin/poll or OS-wait for a long
-        // time (e.g. `ReferenceQueue.remove`) must publish its roots and
-        // mark itself GC-blocked, otherwise a concurrent stop-the-world
-        // collector's `wait_for_all` deadlocks waiting for this thread
-        // to reach an interpreter safepoint it will never reach.
-        self.deposit_root_snapshot();
-        if self.shared.gc_barrier.mark_blocked_region_enter() {
-            // A STW was already in progress — arrive at the barrier so
-            // the initiator's `wait_for_all` can complete.
-            // GCAUDIT-0711-FIX (finding 1a): `_auto` — the deposit above
-            // already raised `in_blocked_region` before this check.
-            let _ = self
-                .shared
-                .gc_barrier
-                .arrive_and_wait_auto(self.thread.thread_id);
-        }
+        self.begin_blocking_region_with_state(1);
+    }
+
+    fn begin_timed_blocking_region(&mut self) {
+        self.begin_blocking_region_with_state(3);
     }
 
     fn end_blocking_region(&mut self) {
@@ -11246,6 +11219,47 @@ pub(super) fn resolve_library_path(shared: &SharedVm, name: &str) -> String {
 }
 
 impl<'a> NativeContextImpl<'a> {
+    /// Shared body for `begin_blocking_region` (`java_state=1`, WAITING) and
+    /// `begin_timed_blocking_region` (`java_state=3`, TIMED_WAITING) — see
+    /// `NativeContext::begin_blocking_region`'s doc comment for the GC-safety
+    /// contract; only the reported `Thread.getState()` value differs.
+    fn begin_blocking_region_with_state(&mut self, java_state: u8) {
+        self.thread
+            .gc_block_state
+            .java_state
+            .store(java_state, std::sync::atomic::Ordering::Release);
+        // CRIT (TLAB UAF) — retire this thread's TLAB before entering the
+        // blocked region, while the young arena it points into is still valid.
+        // While we are GC-blocked a stop-the-world moving collection can run on
+        // another thread and `grow()` (realloc) the young arena, freeing the old
+        // backing buffer; a retained TLAB `[cursor,end)` into that buffer would
+        // then be dangling and the first post-block fast-path bump would write
+        // the object header into freed memory → EXCEPTION_ACCESS_VIOLATION in
+        // `init_object_header`. Retiring here (arena still mapped) fills the tail
+        // for the collector's walk and empties the TLAB so the next allocation,
+        // after the block, refills from the current arena. Symmetric to the
+        // parked-thread retire in `safepoint_check`; `check_post_block_gc` only
+        // remaps existing refs and runs after the buffer may already be freed,
+        // so the retire must happen here, before the block.
+        self.thread.tlab.retire();
+        // T19.H1 — a native about to spin/poll or OS-wait for a long
+        // time (e.g. `ReferenceQueue.remove`) must publish its roots and
+        // mark itself GC-blocked, otherwise a concurrent stop-the-world
+        // collector's `wait_for_all` deadlocks waiting for this thread
+        // to reach an interpreter safepoint it will never reach.
+        self.deposit_root_snapshot();
+        if self.shared.gc_barrier.mark_blocked_region_enter() {
+            // A STW was already in progress — arrive at the barrier so
+            // the initiator's `wait_for_all` can complete.
+            // GCAUDIT-0711-FIX (finding 1a): `_auto` — the deposit above
+            // already raised `in_blocked_region` before this check.
+            let _ = self
+                .shared
+                .gc_barrier
+                .arrive_and_wait_auto(self.thread.thread_id);
+        }
+    }
+
     /// Try native method first, then full invoke_shared.
     fn invoke_or_native(
         &mut self,

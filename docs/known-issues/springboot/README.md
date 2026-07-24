@@ -116,6 +116,18 @@ rather than assuming closed or re-investigating from scratch.
 > newly-exposed residuals: [`onbeancondition-mergedannotations-intermittent-identity-mismatch.md`](onbeancondition-mergedannotations-intermittent-identity-mismatch.md)
 > and [`securityfilterautoconfig-capturedoutput-password-not-observed.md`](securityfilterautoconfig-capturedoutput-password-not-observed.md).
 
+> Investigation (2026-07-24): `module/spring-boot-micrometer-tracing-opentelemetry`'s
+> 2-class residual from this rerun (`OpenTelemetryBaggagePropagationIntegrationTests`,
+> `OpenTelemetryTracingAutoConfigurationTests`) — the former's 5 failing
+> parameterized cases all throw a CratonVM NPE from inside AssertJ's own
+> error-formatting path (`WritableAssertionInfo.representation` ends up null
+> only when `StringAssert`/`AbstractCharSequenceAssert` objects are
+> constructed via `Assertions.assertThat(String)`, not via direct
+> construction — reduced to a 100% reproducing ~15-line standalone repro, not
+> yet root-caused to file:line, likely masking real failure messages broadly
+> across the suite since `assertThat(someString)` is ubiquitous). OPEN — see
+> [`micrometer-tracing-opentelemetry-assertj-representation-npe-and-eventpublisher-residuals.md`](micrometer-tracing-opentelemetry-assertj-representation-npe-and-eventpublisher-residuals.md).
+
 ## 2026-07-17 rerun: 510-class set vs first-ever same-scope HotSpot baseline (429 CratonVM-specific)
 
 Reran the 510 classes still not `PASS` as of the 2026-07-16 snapshot against

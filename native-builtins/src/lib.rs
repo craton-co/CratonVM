@@ -64187,6 +64187,15 @@ pub(crate) fn pem_block_to_der(bytes: &[u8]) -> Vec<u8> {
     }
 }
 
+/// Matches real `java.util.Base64.Decoder`'s exact wording for an
+/// out-of-alphabet byte (`"Illegal base64 character " +
+/// Integer.toString(b & 0xff, 16)`) — Spring Boot's
+/// `Base64ProtocolResolverTests`/`JksSslStoreBundleTests` assert on this
+/// text, not just the exception type.
+fn b64_illegal_char_msg(b: u8) -> String {
+    format!("Illegal base64 character {b:x}")
+}
+
 fn b64_decode(input: &[u8], variant: i32) -> Result<Vec<u8>, String> {
     // RFC 4648's basic and URL decoders reject every non-alphabet byte,
     // including whitespace.  Only MIME decoding ignores whitespace.
@@ -64208,9 +64217,9 @@ fn b64_decode(input: &[u8], variant: i32) -> Result<Vec<u8>, String> {
             return Err("Incomplete base64 input".to_string());
         }
         let c0 = b64_decode_char(filtered[i], variant)
-            .ok_or_else(|| format!("Illegal base64 character {:x}", filtered[i]))?;
+            .ok_or_else(|| b64_illegal_char_msg(filtered[i]))?;
         let c1 = b64_decode_char(filtered[i + 1], variant)
-            .ok_or_else(|| format!("Illegal base64 character {:x}", filtered[i + 1]))?;
+            .ok_or_else(|| b64_illegal_char_msg(filtered[i + 1]))?;
 
         if remaining == 2 {
             out.push(((c0 << 2) | (c1 >> 4)) as u8);
@@ -64225,7 +64234,7 @@ fn b64_decode(input: &[u8], variant: i32) -> Result<Vec<u8>, String> {
             break;
         }
         let c2 = b64_decode_char(third, variant)
-            .ok_or_else(|| format!("Illegal base64 character {:x}", third))?;
+            .ok_or_else(|| b64_illegal_char_msg(third))?;
 
         if remaining == 3 {
             out.push(((c0 << 2) | (c1 >> 4)) as u8);
@@ -64242,7 +64251,7 @@ fn b64_decode(input: &[u8], variant: i32) -> Result<Vec<u8>, String> {
             break;
         }
         let c3 = b64_decode_char(fourth, variant)
-            .ok_or_else(|| format!("Illegal base64 character {:x}", fourth))?;
+            .ok_or_else(|| b64_illegal_char_msg(fourth))?;
         out.push(((c0 << 2) | (c1 >> 4)) as u8);
         out.push((((c1 & 0xF) << 4) | (c2 >> 2)) as u8);
         out.push((((c2 & 0x3) << 6) | c3) as u8);
