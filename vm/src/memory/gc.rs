@@ -403,6 +403,17 @@ pub fn update_all_roots(
         }
     }
 
+    // Handle-scope slots (arch/handles) are roots too: without this remap a
+    // RootedHandle read after a moving collection would decode the pre-move
+    // address. Mirrors the native_pin_roots loop above.
+    for slot in thread.handle_slots.iter_mut().flatten() {
+        let old_addr = slot.as_ptr() as usize;
+        if let Some(&new_addr) = pointer_map.get(&old_addr) {
+            debug_assert!(new_addr != 0, "GC pointer map contains null address");
+            *slot = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+        }
+    }
+
     if let Some(ref mut obj_ref) = thread.native_pending_return {
         let old_addr = obj_ref.as_ptr() as usize;
         if let Some(&new_addr) = pointer_map.get(&old_addr) {
