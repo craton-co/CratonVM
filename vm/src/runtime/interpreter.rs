@@ -29632,11 +29632,29 @@ pub(crate) fn synthetic_stub_should_yield_to_real_bytecode(
     method_name: &str,
     descriptor: &str,
 ) -> bool {
-    let synthetic_stub_native = shared
+    let kind = shared
         .native_methods
-        .kind_of(class_name, method_name, descriptor)
-        == Some(cratonvm_native_api::NativeKind::SyntheticStub);
-    if !synthetic_stub_native {
+        .kind_of(class_name, method_name, descriptor);
+    synthetic_stub_kind_should_yield_to_real_bytecode(
+        shared,
+        class_name,
+        method_name,
+        descriptor,
+        kind,
+    )
+}
+
+/// Variant for callers that already resolved and cached the native category in
+/// method metadata. Keeping the selection predicate separate prevents a second
+/// full triple hash on the first invocation of every constant-pool reference.
+fn synthetic_stub_kind_should_yield_to_real_bytecode(
+    shared: &SharedVm,
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+    kind: Option<cratonvm_native_api::NativeKind>,
+) -> bool {
+    if kind != Some(cratonvm_native_api::NativeKind::SyntheticStub) {
         return false;
     }
 
@@ -31231,11 +31249,15 @@ fn populate_invoke_cache(
     // owner before consulting the shared promoted cache because loader-aware
     // invokestatic/invokespecial sites may have a per-loader owner that differs
     // from the flat global owner.
-    let (class_name, method_name, descriptor, num_params) =
-        match resolve_method_ref(shared, caller_class_id, cp_index) {
-            Ok(r) => r,
+    let resolved = match resolve_method_metadata(shared, caller_class_id, cp_index) {
+            Ok(resolved) => resolved,
             Err(_) => return,
         };
+    let symbolic_class_name = Arc::clone(&resolved.class_name);
+    let mut class_name = Arc::clone(&resolved.class_name);
+    let method_name = Arc::clone(&resolved.method_name);
+    let descriptor = Arc::clone(&resolved.method_descriptor);
+    let num_params = resolved.num_params as usize;
     if std::env::var("CRATONVM_DBG_LOADER_TRACE").is_ok() && class_name.contains("RootReference") {
         eprintln!(
             "[PIC-ENTRY] caller_class_id={:?} cp_index={} is_special={} class_name(cp)={} method={}{}",
@@ -31250,7 +31272,7 @@ fn populate_invoke_cache(
     // use of `class_name` below (native lookup, loader-owner override,
     // `target_class_id` resolution, the promoted-cache key), so a
     // super-call bridge's cache entry is never built from the wrong class.
-    let class_name = if is_special {
+    class_name = if is_special {
         invokespecial_owner_class_name(shared, caller_class_id, cp_index, &class_name, &method_name)
     } else {
         class_name
@@ -31310,15 +31332,23 @@ fn populate_invoke_cache(
     // `new OutputStreamWriter` kept minting encoders with a null `se`
     // while the sibling constructor call site ran the real ctor).
     // Fall through to the bytecode resolution below instead.
-    if let Some(callback) = shared
-        .native_methods
-        .find(&class_name, &method_name, &descriptor)
-        .filter(|_| {
-            !synthetic_stub_should_yield_to_real_bytecode(
+    let cached_exact_native = (loader_owner_override.is_none()
+        && class_name == symbolic_class_name)
+        .then(|| resolved.native_target.zip(resolved.native_kind))
+        .flatten();
+    if let Some((callback, kind)) = cached_exact_native
+        .or_else(|| {
+            shared
+                .native_methods
+                .find_with_kind(&class_name, &method_name, &descriptor)
+        })
+        .filter(|(_, kind)| {
+            !synthetic_stub_kind_should_yield_to_real_bytecode(
                 shared,
                 &class_name,
                 &method_name,
                 &descriptor,
+                Some(*kind),
             )
         })
     {
@@ -40639,29 +40669,25 @@ fn populate_virtual_invoke_cache(
         .put(caller_class_id, cp_index, false, target);
 }
 
-/// Returns (class_name, method_name, descriptor, num_params).
+/// Resolve the metadata for a constant-pool method reference.
 ///
-/// String fields are `Arc<str>` so cache hits pay a refcount bump, not a heap
-/// allocation.  Callers that need `&str` use `&*name` or pass `&name` directly
-/// (Arc<str> derefs to &str).
-fn resolve_method_ref(
+/// Besides the symbolic names and parameter count, this stores the exact
+/// native callback/category for the symbolic owner. The registry hash is paid
+/// once per resolved CP entry, not once per call site that consumes it.
+fn resolve_method_metadata(
     shared: &SharedVm,
     current_class_id: ClassId,
     cp_index: u16,
-) -> Result<(Arc<str>, Arc<str>, Arc<str>, usize), MethodCallFailed> {
+) -> Result<ResolvedMethod, MethodCallFailed> {
     hotpath_counts::bump(&hotpath_counts::RESOLVE_METHOD_REF_CALLS);
-    // Check cache first — Arc::clone is a cheap refcount bump, not an allocation.
+    // Check cache first. Cloning is Arc bumps plus two copied function-pointer
+    // metadata fields; there is no string allocation or registry hash.
     if let Some(cached) = shared
         .resolution_cache
         .read()
         .get_method(current_class_id, cp_index)
     {
-        return Ok((
-            Arc::clone(&cached.class_name),
-            Arc::clone(&cached.method_name),
-            Arc::clone(&cached.method_descriptor),
-            cached.num_params as usize, // Widening: parameter count conversion
-        ));
+        return Ok(cached.clone());
     }
 
     // read_recursive() instead of read() — resolve_method_ref can be called
@@ -40725,19 +40751,43 @@ fn resolve_method_ref(
     // Drop the read lock before acquiring write lock
     drop(cm);
 
+    let (native_target, native_kind) = shared
+        .native_methods
+        .find_with_kind(&class_name, &method_name, &method_descriptor)
+        .map(|(target, kind)| (Some(target), Some(kind)))
+        .unwrap_or((None, None));
+    let resolved = ResolvedMethod {
+        declaring_class_id: current_class_id,
+        class_name,
+        method_name,
+        method_descriptor,
+        num_params: num_params as u16, // Widening: parameter count conversion
+        native_target,
+        native_kind,
+    };
     shared.resolution_cache.write().put_method(
         current_class_id,
         cp_index,
-        ResolvedMethod {
-            declaring_class_id: current_class_id,
-            class_name: Arc::clone(&class_name),
-            method_name: Arc::clone(&method_name),
-            method_descriptor: Arc::clone(&method_descriptor),
-            num_params: num_params as u16, // Widening: parameter count conversion
-        },
+        resolved.clone(),
     );
 
-    Ok((class_name, method_name, method_descriptor, num_params))
+    Ok(resolved)
+}
+
+/// Compatibility view for the interpreter paths that only need symbolic
+/// method data. The underlying cache entry still carries its native target.
+fn resolve_method_ref(
+    shared: &SharedVm,
+    current_class_id: ClassId,
+    cp_index: u16,
+) -> Result<(Arc<str>, Arc<str>, Arc<str>, usize), MethodCallFailed> {
+    let resolved = resolve_method_metadata(shared, current_class_id, cp_index)?;
+    Ok((
+        resolved.class_name,
+        resolved.method_name,
+        resolved.method_descriptor,
+        resolved.num_params as usize,
+    ))
 }
 
 /// JVMS §6.5 `invokespecial` — apply the super-call "selection" redirect

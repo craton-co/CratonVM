@@ -379,20 +379,6 @@ pub struct SharedVm {
     /// Native method registry (immutable after construction).
     pub native_methods: NativeMethodRegistry,
 
-    /// T5.6.1 — per-resolved-method cache of native function pointers.
-    ///
-    /// After the first successful `NativeMethodRegistry::find` for a
-    /// (class, method, descriptor) triple, the callback is stored here
-    /// so subsequent invocations skip the registry's linear key scan.
-    /// The cache is append-only (no eviction) and lives as long as the
-    /// VM — matching HotSpot's `Method::native_function` slot.
-    pub native_method_cache: parking_lot::RwLock<
-        crate::runtime::fx_collections::FxHashMap<
-            (String, String, String),
-            cratonvm_native_api::NativeCallback,
-        >,
-    >,
-
     /// Static fields: class_id -> field_index -> Value.
     /// T10.9.B: FxHashMap — keys are internal ClassId, hot path accessed
     /// on every getstatic/putstatic bytecode.
@@ -2823,9 +2809,6 @@ impl SharedVm {
             concurrent_gc_state,
             anon_class_cache: std::array::from_fn(|_| AtomicU32::new(0)),
             native_methods,
-            native_method_cache: parking_lot::RwLock::new(
-                crate::runtime::fx_collections::fx_hashmap(),
-            ),
             statics: RwLock::new(FxHashMap::default()),
             resolution_cache: RwLock::new(ResolutionCache::new()),
             throwable_stacks: RwLock::new(FxHashMap::default()),
@@ -4897,7 +4880,6 @@ impl SharedVm {
 // | Doc level / lock          | HEAD `LockLevel` |
 // |---------------------------|------------------|
 // | L10 `class_manager`       | `HeapLock`       |
-// | L9  `native_method_cache` | `ClassLoader`    |
 // | L7  `ref_processor`       | `MonitorPool`    |
 // | L6  `monitors`            | `ThreadList`     |
 // | L5  `thread_registry`     | `JitCache`       |
@@ -5054,7 +5036,6 @@ mod ranked_locks {
     // ----- Per-lock level mapping -----------------------------------
 
     pub(super) const CLASS_MANAGER: LockLevel = LockLevel::ClassManager; // L10
-    pub(super) const NATIVE_METHOD_CACHE: LockLevel = LockLevel::NativeMethods; // L9
     pub(super) const REF_PROCESSOR: LockLevel = LockLevel::RefProcessor; // L7
     pub(super) const MONITORS: LockLevel = LockLevel::Monitors; // L6
     pub(super) const THREAD_REGISTRY: LockLevel = LockLevel::ThreadRegistry; // L5
@@ -5127,26 +5108,6 @@ impl SharedVm {
         }
     }
 
-    /// Acquire the native-method callback cache for read.
-    #[inline]
-    pub fn native_method_cache_read_ranked(
-        &self,
-    ) -> RankedGuard<
-        parking_lot::RwLockReadGuard<
-            '_,
-            crate::runtime::fx_collections::FxHashMap<
-                (String, String, String),
-                cratonvm_native_api::NativeCallback,
-            >,
-        >,
-    > {
-        let rank = ranked_locks::enter(ranked_locks::NATIVE_METHOD_CACHE);
-        RankedGuard {
-            lock: self.native_method_cache.read(),
-            rank_scope: rank,
-        }
-    }
-
     /// Acquire `ref_processor` with debug-only rank tracking.
     #[inline]
     pub fn ref_processor_lock_ranked(
@@ -5163,7 +5124,7 @@ impl SharedVm {
     /// many fine-grained inner locks; this helper just announces that
     /// the caller is about to touch monitor state so the rank tracker
     /// can reject downstream acquisitions of higher-ranked locks
-    /// (i.e. `class_manager` or `native_method_cache`). Bind the
+    /// (i.e. `class_manager`). Bind the
     /// returned guard to a local for the duration of the monitor work.
     #[inline]
     #[must_use = "bind the guard to a local for the duration of the monitor work"]
