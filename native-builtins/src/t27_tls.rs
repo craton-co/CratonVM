@@ -3274,7 +3274,18 @@ pub(crate) fn rustls_stream_read(id: i32, buf: &mut [u8]) -> std::io::Result<usi
     let debug_srv = std::env::var_os("CRATONVM_DBG_TLS_SRV").is_some();
     let mut reg = sreg().lock();
     if let Some(e) = reg.client_streams.get_mut(&id) {
-        return e.stream.read(buf);
+        // FIX (TestSsl.testSni[JSSE]): a plain `SSLSocket.getInputStream()
+        // .read()` on the client side used to propagate rustls's raw
+        // `UnexpectedEof` ("peer closed connection without sending TLS
+        // close_notify") straight through as an `IOException`. Tomcat's own
+        // server connector (also CratonVM/rustls) closes the raw socket
+        // after writing a `Connection: Close` response without a clean TLS
+        // shutdown — an unclean-but-benign close real JSSE clients
+        // routinely tolerate at the end of a fully-framed HTTP response.
+        // Reuse the same EOF-tolerant read already established for the
+        // native HTTP client bridge (`http_url_connection::
+        // read_eof_tolerant`) instead of duplicating the tolerance logic.
+        return crate::http_url_connection::read_eof_tolerant(&mut e.stream, buf);
     }
     if let Some(e) = reg.server_streams.get_mut(&id) {
         if debug_srv {
