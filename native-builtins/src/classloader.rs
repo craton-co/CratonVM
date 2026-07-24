@@ -119,6 +119,8 @@ pub fn reset_loader_singletons() {
     // Companion: drop the GC marker's mirror_pin registry for the new VM too
     // (see `cratonvm_types::mirror_pin`).
     cratonvm_types::mirror_pin::clear_mirror_pins();
+    cratonvm_types::metadata_pin::clear_metadata_pins();
+    cratonvm_types::jit_activation::clear();
     local_url_class_path_cache()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -222,8 +224,9 @@ pub fn gc_update_loader_singleton_refs(pointer_map: &std::collections::HashMap<u
 pub fn gc_reconcile_defining_loaders(
     is_marked: &dyn Fn(usize) -> bool,
     pointer_map: &std::collections::HashMap<usize, usize>,
-) {
+) -> Vec<u32> {
     let dbg = std::env::var_os("CRATONVM_DBG_MIRRORPIN").is_some();
+    let mut dead_class_ids = Vec::new();
     let mut map = defining_loader_store()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -248,6 +251,7 @@ pub fn gc_reconcile_defining_loaders(
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .insert(*_class_id);
+            dead_class_ids.push(*_class_id);
             return false;
         }
         // Survivor: remap if it relocated (moving collection).
@@ -284,6 +288,40 @@ pub fn gc_reconcile_defining_loaders(
         }
         true
     });
+    dead_class_ids.sort_unstable();
+    dead_class_ids.dedup();
+    dead_class_ids
+}
+
+/// Drop temporary fail-closed orphan markers after the VM has tombstoned the
+/// corresponding class metadata. Keeping them after a completed unload would
+/// turn the safety set itself into an unbounded per-loader metadata leak.
+pub fn forget_unloaded_classes(class_ids: &[u32]) {
+    if class_ids.is_empty() {
+        return;
+    }
+    let ids: std::collections::HashSet<u32> = class_ids.iter().copied().collect();
+    orphaned_defining_loader_classes()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|id| !ids.contains(id));
+    for id in class_ids {
+        cratonvm_types::loader_pin::remove_loader_pin(*id);
+    }
+}
+
+/// Release hidden-class `classData` entries keyed by mirrors that belong to
+/// classes being unloaded.
+pub fn forget_unloaded_class_mirrors(mirrors: &[ObjectRef]) {
+    if mirrors.is_empty() {
+        return;
+    }
+    let addresses: std::collections::HashSet<usize> =
+        mirrors.iter().map(|mirror| mirror.as_ptr() as usize).collect();
+    class_data_store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|mirror, _| !addresses.contains(&(mirror.as_ptr() as usize)));
 }
 
 // ---------------------------------------------------------------------------

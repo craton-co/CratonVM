@@ -228,6 +228,14 @@ pub struct VirtualThread {
     pub runnable: Option<u64>,
     pub join_waiters: Vec<u64>,
     pub unpark_permit: bool,
+    /// A condition became ready after a native registered this continuation
+    /// but before the carrier finished unmounting it.
+    pub wake_pending: bool,
+    /// Heap-resident execution state while unmounted. The `JvmThread` is
+    /// boxed so its address remains stable for precise GC scanning across
+    /// carrier migration; its `frames` are the continuation stack chunks.
+    pub runtime: Option<Box<crate::threading::JvmThread>>,
+    pub execution_started: bool,
 }
 
 impl VirtualThread {
@@ -246,6 +254,9 @@ impl VirtualThread {
             runnable: None,
             join_waiters: Vec::new(),
             unpark_permit: false,
+            wake_pending: false,
+            runtime: None,
+            execution_started: false,
         }
     }
 
@@ -773,6 +784,7 @@ pub struct VirtualThreadManager {
     _next_continuation_id: AtomicU64,
     /// Carrier OS thread join handles (populated by `start_carriers`).
     carrier_handles: Mutex<Vec<std::thread::JoinHandle<()>>>,
+    carriers_started: AtomicBool,
     /// Per-virtual-thread wakeup signal for timed park/sleep cancellation.
     /// T10.9.B: FxHashMap — internal thread IDs.
     /// Held behind an `Arc` so the shared wakeup timer thread can validate and
@@ -784,6 +796,8 @@ pub struct VirtualThreadManager {
     /// one background OS thread and a min-heap of deadlines (replaces the former
     /// per-`Thread.sleep` OS-thread spawn).
     wakeup_timer: Arc<WakeupTimer>,
+    /// Stable VM-local synchronization key to unmounted continuation IDs.
+    keyed_waiters: Mutex<FxHashMap<u64, Vec<u64>>>,
 }
 
 impl VirtualThreadManager {
@@ -797,8 +811,10 @@ impl VirtualThreadManager {
             next_id: AtomicU64::new(1),
             _next_continuation_id: AtomicU64::new(1),
             carrier_handles: Mutex::new(Vec::new()),
+            carriers_started: AtomicBool::new(false),
             wakeup_signals,
             wakeup_timer,
+            keyed_waiters: Mutex::new(FxHashMap::default()),
         }
     }
 
@@ -826,6 +842,7 @@ impl VirtualThreadManager {
             let f = task_fn.clone();
             let handle = std::thread::Builder::new()
                 .name(format!("ForkJoinPool-carrier-{}", carrier_idx))
+                .stack_size(8 * 1024 * 1024)
                 .spawn(move || {
                     while let Some(vt_id) = sched.wait_for_task(carrier_idx) {
                         f(vt_id);
@@ -833,6 +850,20 @@ impl VirtualThreadManager {
                 })
                 .expect("failed to spawn carrier thread");
             handles.push(handle);
+        }
+    }
+
+    /// Start the bounded carrier pool exactly once.
+    pub fn start_carriers_once<F>(&self, task_fn: F)
+    where
+        F: Fn(u64) + Send + Sync + 'static,
+    {
+        if self
+            .carriers_started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            self.start_carriers(task_fn);
         }
     }
 
@@ -858,6 +889,125 @@ impl VirtualThreadManager {
         let vt = VirtualThread::new(id, name.to_string());
         self.threads.lock().insert(id, vt);
         id
+    }
+
+    /// Register a VM thread id as the virtual-thread id. Runtime integration
+    /// uses the registry id directly so JFR, GC, park/unpark, and Java mirror
+    /// lookups all share one stable identity.
+    pub fn create_virtual_thread_with_id(&self, id: u64, name: &str) {
+        let mut threads = self.threads.lock();
+        threads
+            .entry(id)
+            .or_insert_with(|| VirtualThread::new(id, name.to_string()));
+        self.next_id.fetch_max(id.saturating_add(1), Ordering::Relaxed);
+    }
+
+    /// Install the heap-resident execution state before first submission.
+    pub fn install_runtime(&self, vt_id: u64, runtime: Box<crate::threading::JvmThread>) {
+        if let Some(vt) = self.threads.lock().get_mut(&vt_id) {
+            vt.runtime = Some(runtime);
+        }
+    }
+
+    /// Mount an execution state on a carrier. Returns whether this is a
+    /// continuation resume (`true`) or the first invocation of `Thread.run`.
+    pub fn take_runtime_for_mount(
+        &self,
+        vt_id: u64,
+        carrier_id: u64,
+    ) -> Option<(Box<crate::threading::JvmThread>, bool)> {
+        let mut threads = self.threads.lock();
+        let vt = threads.get_mut(&vt_id)?;
+        let resumed = vt.execution_started;
+        vt.execution_started = true;
+        vt.mount(carrier_id);
+        vt.runtime.take().map(|runtime| (runtime, resumed))
+    }
+
+    /// Unmount a yielded continuation without retaining an OS stack.
+    pub fn suspend_runtime(
+        &self,
+        vt_id: u64,
+        mut runtime: Box<crate::threading::JvmThread>,
+        wake_after: std::time::Duration,
+    ) {
+        let mut resubmit = false;
+        let mut threads = self.threads.lock();
+        if let Some(vt) = threads.get_mut(&vt_id) {
+            vt.state = VirtualThreadState::Parked;
+            vt.continuation.state = ContinuationState::Suspended;
+            vt.continuation.yield_count = vt.continuation.yield_count.saturating_add(1);
+            vt.unmount();
+            // The frames stay in their boxed heap stack chunks. This preserves
+            // precise GC visibility through the stable published JvmThread
+            // address and avoids serializing raw ObjectRefs into an untracked
+            // byte buffer.
+            runtime.tlab.retire();
+            vt.runtime = Some(runtime);
+            if vt.wake_pending {
+                vt.wake_pending = false;
+                vt.state = VirtualThreadState::Started;
+                resubmit = true;
+            }
+        }
+        drop(threads);
+        self.scheduler
+            .stats
+            .total_parks
+            .fetch_add(1, Ordering::Relaxed);
+        if resubmit {
+            self.scheduler.submit(vt_id);
+        } else if !wake_after.is_zero() {
+            self.schedule_wakeup(vt_id, wake_after);
+        }
+    }
+
+    /// Register a mounted continuation on a stable VM-local synchronization
+    /// key. Duplicate registration is suppressed so a retry cannot create
+    /// duplicate scheduler submissions.
+    pub fn wait_on_key(&self, key: u64, vt_id: u64) {
+        let mut waiters = self.keyed_waiters.lock();
+        let entry = waiters.entry(key).or_default();
+        if !entry.contains(&vt_id) {
+            entry.push(vt_id);
+        }
+    }
+
+    pub fn cancel_wait_on_key(&self, key: u64, vt_id: u64) {
+        let mut waiters = self.keyed_waiters.lock();
+        let mut remove_key = false;
+        if let Some(entry) = waiters.get_mut(&key) {
+            entry.retain(|candidate| *candidate != vt_id);
+            remove_key = entry.is_empty();
+        }
+        if remove_key {
+            waiters.remove(&key);
+        }
+    }
+
+    /// Drain a condition's waiter set. Parked continuations are submitted
+    /// immediately; a still-mounted continuation records a wake that
+    /// `suspend_runtime` consumes after depositing its heap stack.
+    pub fn wake_waiters(&self, key: u64) {
+        let waiter_ids = self.keyed_waiters.lock().remove(&key).unwrap_or_default();
+        let mut ready = Vec::with_capacity(waiter_ids.len());
+        {
+            let mut threads = self.threads.lock();
+            for vt_id in waiter_ids {
+                let Some(vt) = threads.get_mut(&vt_id) else {
+                    continue;
+                };
+                if vt.state == VirtualThreadState::Parked && vt.runtime.is_some() {
+                    vt.state = VirtualThreadState::Started;
+                    ready.push(vt_id);
+                } else if vt.state != VirtualThreadState::Terminated {
+                    vt.wake_pending = true;
+                }
+            }
+        }
+        for vt_id in ready {
+            self.scheduler.submit(vt_id);
+        }
     }
 
     /// Start a virtual thread -- submit it to the scheduler.
@@ -938,6 +1088,12 @@ impl VirtualThreadManager {
             vt.continuation.state = ContinuationState::Completed;
             vt.unmount();
         }
+        drop(threads);
+        let mut keyed = self.keyed_waiters.lock();
+        keyed.retain(|_, waiters| {
+            waiters.retain(|candidate| *candidate != vt_id);
+            !waiters.is_empty()
+        });
     }
 
     /// Register `waiter_id` as waiting for `vt_id` to complete.
@@ -2533,5 +2689,47 @@ mod tests {
         // After terminate
         mgr.terminate(vt_id);
         assert_eq!(mgr.get_state(vt_id), Some(VirtualThreadState::Terminated));
+    }
+
+    #[test]
+    fn keyed_wakeup_before_unmount_is_not_lost() {
+        use crate::threading::jvm_thread::{JvmThread, ThreadId};
+
+        let mgr = VirtualThreadManager::new(1);
+        let id = 41;
+        mgr.create_virtual_thread_with_id(id, "keyed-race");
+        mgr.install_runtime(id, Box::new(JvmThread::new(ThreadId(id), "keyed-race")));
+        mgr.start(id);
+        assert_eq!(mgr.scheduler().next_task(0), Some(id));
+        let (runtime, _) = mgr.take_runtime_for_mount(id, 0).unwrap();
+
+        mgr.wait_on_key(7, id);
+        mgr.wake_waiters(7);
+        assert!(mgr.threads.lock().get(&id).unwrap().wake_pending);
+
+        mgr.suspend_runtime(id, runtime, std::time::Duration::ZERO);
+        assert_eq!(mgr.get_state(id), Some(VirtualThreadState::Started));
+        assert_eq!(mgr.scheduler().next_task(0), Some(id));
+    }
+
+    #[test]
+    fn keyed_wakeup_resubmits_parked_continuation() {
+        use crate::threading::jvm_thread::{JvmThread, ThreadId};
+
+        let mgr = VirtualThreadManager::new(1);
+        let id = 42;
+        mgr.create_virtual_thread_with_id(id, "keyed-parked");
+        mgr.install_runtime(id, Box::new(JvmThread::new(ThreadId(id), "keyed-parked")));
+        mgr.start(id);
+        assert_eq!(mgr.scheduler().next_task(0), Some(id));
+        let (runtime, _) = mgr.take_runtime_for_mount(id, 0).unwrap();
+
+        mgr.wait_on_key(8, id);
+        mgr.suspend_runtime(id, runtime, std::time::Duration::ZERO);
+        assert_eq!(mgr.get_state(id), Some(VirtualThreadState::Parked));
+
+        mgr.wake_waiters(8);
+        assert_eq!(mgr.get_state(id), Some(VirtualThreadState::Started));
+        assert_eq!(mgr.scheduler().next_task(0), Some(id));
     }
 }

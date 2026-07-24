@@ -385,6 +385,18 @@ pub trait GarbageCollector: Send + Sync {
     /// pre-barrier. G1 ships a best-effort `debug_assert!` that fires when
     /// `write_barrier` is invoked while marking is active without any
     /// matching pre-call on the same thread; release builds skip the check.
+    ///
+    /// # Publication ordering
+    ///
+    /// A reference update is published as one ordered triad:
+    ///
+    /// `SATB(old) -> slot.store(new) -> remembered_set/card.release(new)`
+    ///
+    /// No safepoint or other call may occur between the slot store and its
+    /// post barrier. The collector consumes remembered-set/card state with
+    /// acquire ordering after the stop-the-world handshake, so observing a
+    /// dirty card also observes the reference value stored before it. JIT
+    /// inline barriers and helper-backed barriers implement the same order.
     fn write_barrier(&self, obj: ObjectRef, stored_value: Value);
 
     /// SATB **pre**-store barrier — called BEFORE a reference-typed slot

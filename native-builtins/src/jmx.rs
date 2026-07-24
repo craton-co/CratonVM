@@ -3402,8 +3402,16 @@ fn alloc_class_loading_mxbean(ctx: &mut dyn NativeContext) -> ObjectRef {
     let obj = alloc_concurrent_synthetic(ctx, "java/lang/management/ClassLoadingMXBean", 3);
     let loaded = ctx.loaded_class_count() as i32;
     ctx.set_field(obj, 0, Value::Int(loaded)); // loadedClassCount (real)
-    ctx.set_field(obj, 1, Value::Long(loaded as i64)); // totalLoadedClassCount (real)
-    ctx.set_field(obj, 2, Value::Long(0)); // unloadedClassCount
+    ctx.set_field(
+        obj,
+        1,
+        Value::Long(loaded as i64 + ctx.unloaded_class_count() as i64),
+    );
+    ctx.set_field(
+        obj,
+        2,
+        Value::Long(ctx.unloaded_class_count() as i64),
+    );
     obj
 }
 
@@ -3413,17 +3421,16 @@ fn register_class_loading_mxbean(r: &mut NativeMethodRegistry) {
     let cls = "java/lang/management/ClassLoadingMXBean";
     r.register(cls, "<init>", "()V", native_noop_with_this);
 
-    r.register(cls, "getLoadedClassCount", "()I", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 0)))
+    r.register(cls, "getLoadedClassCount", "()I", |ctx, _args| {
+        Ok(Some(Value::Int(ctx.loaded_class_count() as i32)))
     });
-    r.register(cls, "getTotalLoadedClassCount", "()J", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 1)))
+    r.register(cls, "getTotalLoadedClassCount", "()J", |ctx, _args| {
+        Ok(Some(Value::Long(
+            ctx.loaded_class_count() as i64 + ctx.unloaded_class_count() as i64,
+        )))
     });
-    r.register(cls, "getUnloadedClassCount", "()J", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 2)))
+    r.register(cls, "getUnloadedClassCount", "()J", |ctx, _args| {
+        Ok(Some(Value::Long(ctx.unloaded_class_count() as i64)))
     });
     r.register(cls, "isVerbose", "()Z", |_ctx, _args| {
         Ok(Some(Value::Int(0)))

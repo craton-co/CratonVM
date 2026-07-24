@@ -379,20 +379,6 @@ pub struct SharedVm {
     /// Native method registry (immutable after construction).
     pub native_methods: NativeMethodRegistry,
 
-    /// T5.6.1 — per-resolved-method cache of native function pointers.
-    ///
-    /// After the first successful `NativeMethodRegistry::find` for a
-    /// (class, method, descriptor) triple, the callback is stored here
-    /// so subsequent invocations skip the registry's linear key scan.
-    /// The cache is append-only (no eviction) and lives as long as the
-    /// VM — matching HotSpot's `Method::native_function` slot.
-    pub native_method_cache: parking_lot::RwLock<
-        crate::runtime::fx_collections::FxHashMap<
-            (String, String, String),
-            cratonvm_native_api::NativeCallback,
-        >,
-    >,
-
     /// Static fields: class_id -> field_index -> Value.
     /// T10.9.B: FxHashMap — keys are internal ClassId, hot path accessed
     /// on every getstatic/putstatic bytecode.
@@ -592,11 +578,16 @@ pub struct SharedVm {
     pub gc_barrier: GcBarrier,
 
     /// JIT compiler cache — maps method identity to compiled native code.
-    pub jit_cache: parking_lot::RwLock<JitCache>,
+    pub jit_cache: JitCache,
 
     /// Virtual thread scheduler — bounds concurrent virtual thread execution
     /// to a carrier-thread pool (JEP 444, Java 21).
     pub virtual_scheduler: Arc<crate::threading::VirtualThreadScheduler>,
+
+    /// Continuation scheduler and heap-resident virtual-thread execution
+    /// states. Unlike `virtual_scheduler`'s legacy permit semaphore, this
+    /// manager owns a bounded set of carrier OS threads.
+    pub virtual_thread_manager: Arc<crate::threading::VirtualThreadManager>,
 
     /// Off-heap memory allocations for Panama FFI (JEP 454).
     pub native_memory: parking_lot::Mutex<crate::native::ffi::NativeMemoryTable>,
@@ -690,6 +681,9 @@ pub struct SharedVm {
     /// `x64_deopt_entry` can read the live epoch lock-free, BEFORE dereferencing
     /// the deopt box, to detect a superseded compilation.
     pub method_epochs: parking_lot::RwLock<FxHashMap<String, Box<std::sync::atomic::AtomicU64>>>,
+    /// Shared fail-closed epoch for methods admitted after the bounded
+    /// per-method epoch table reaches capacity.
+    method_epoch_overflow: std::sync::atomic::AtomicU64,
 
     /// Invalidation manager — tracks class-hierarchy assumptions and invalidates
     /// dependent compiled methods when class loading breaks those assumptions.
@@ -946,35 +940,11 @@ impl SharedVm {
     pub fn new(mut config: VmConfig) -> Self {
         apply_container_default_heap(&mut config);
 
-        // GC-audit finding 1 "single-threaded component" (BinaryTrees G1+JIT
-        // wrong totals) — ROOT CAUSE: the compact reference-field layout
-        // (`CRATONVM_COMPACT_REF_FIELDS`, default-on) is only implemented
-        // end-to-end by the GENERATIONAL backend. G1's `get_field`/`set_field`
-        // (and the volatile variants) compute `index * SLOT_SIZE`
-        // unconditionally — zero `GC_FLAG_COMPACT` awareness — while the
-        // backend-agnostic JIT inline-TLAB allocation and `jit_tlab_post_init`
-        // happily mark fresh objects compact. Under G1+JIT every compact-
-        // marked object is then WRITTEN as legacy 16-byte cells through
-        // `heap.set_field` (stomping the neighbouring object for the higher
-        // field indices) and READ as bare-8-byte compact slots by
-        // `jit_getfield`, whose plausibility gate degrades the mis-read tag
-        // word to null — `Node.l == null` for every JIT-built tree, plus the
-        // occasional NPE/wild ref from the crossed slots. Interpreter-only
-        // runs are self-consistently legacy, which is why `--nojit` was exact.
-        //
-        // Until G1 (and ZGC) grow real compact-layout support in their field
-        // accessors, evacuation scanners, and allocators, pin the process to
-        // the legacy layout whenever the selected backend is not Generational.
-        // First-set-wins: this runs before any classloading can populate the
-        // compact layout registry or any JIT compile can bake a compact body
-        // size, so the whole process is uniformly legacy — the exact
-        // (validated) behaviour of `CRATONVM_COMPACT_REF_FIELDS=0`.
-        if !matches!(
-            config.gc_algorithm,
-            crate::config::GcAlgorithm::Generational
-        ) {
-            cratonvm_types::set_compact_ref_fields_enabled(false);
-        }
+        // Compact tagless field layouts are a VM-wide contract. Generational,
+        // G1, and ZGC now share the same allocation predicate, field encoding,
+        // oop-map scan, and relocation fixup; no collector-specific opt-out is
+        // permitted because it would let JIT-baked offsets disagree with heap
+        // storage.
 
         #[cfg(feature = "experimental-debug")]
         let mut jvmti_env = crate::jvmti::create_jvmti_env();
@@ -2847,9 +2817,6 @@ impl SharedVm {
             concurrent_gc_state,
             anon_class_cache: std::array::from_fn(|_| AtomicU32::new(0)),
             native_methods,
-            native_method_cache: parking_lot::RwLock::new(
-                crate::runtime::fx_collections::fx_hashmap(),
-            ),
             statics: RwLock::new(FxHashMap::default()),
             resolution_cache: RwLock::new(ResolutionCache::new()),
             throwable_stacks: RwLock::new(FxHashMap::default()),
@@ -2885,8 +2852,11 @@ impl SharedVm {
             oom_dump_written: std::sync::atomic::AtomicBool::new(false),
             fd_table: FileDescriptorTable::new(),
             gc_barrier: GcBarrier::new(),
-            jit_cache: parking_lot::RwLock::new(JitCache::new()),
+            jit_cache: JitCache::new(),
             virtual_scheduler: crate::threading::VirtualThreadScheduler::new_default(),
+            virtual_thread_manager: Arc::new(
+                crate::threading::VirtualThreadManager::with_default_parallelism(),
+            ),
             native_memory: parking_lot::Mutex::new(crate::native::ffi::NativeMemoryTable::new()),
             native_libraries: parking_lot::Mutex::new(Vec::new()),
             upcall_table: parking_lot::Mutex::new(crate::native::ffi::UpcallTable::new()),
@@ -2904,6 +2874,7 @@ impl SharedVm {
             tiered_manager: crate::jit::tiered::TieredCompilationManager::with_env_policy(),
             deopt_log: parking_lot::Mutex::new(crate::jit::deopt::DeoptimizationLog::new()),
             method_epochs: parking_lot::RwLock::new(FxHashMap::default()),
+            method_epoch_overflow: std::sync::atomic::AtomicU64::new(0),
             invalidation_manager: parking_lot::Mutex::new(
                 cratonvm_jit::deopt::InvalidationManager::new(),
             ),
@@ -3281,7 +3252,7 @@ impl SharedVm {
                         .iter()
                         .filter_map(|iid| cm.class_store.get(*iid).map(|c| c.name.to_string()))
                         .collect(),
-                    class_bytes: bytes.clone(),
+                    class_bytes: bytes.to_vec(),
                 };
                 generator.add_entry(entry);
             }
@@ -4143,7 +4114,10 @@ impl SharedVm {
             .read()
             .get(method_key)
             .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
-            .unwrap_or(0)
+            .unwrap_or_else(|| {
+                self.method_epoch_overflow
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            })
     }
 
     /// deopt-osr Step 9 — advance and return the live compilation epoch for
@@ -4151,10 +4125,17 @@ impl SharedVm {
     /// superseded. Called on each invalidation (see
     /// `DeoptimizationController::deoptimize`). See [`Self::method_epochs`].
     pub fn bump_compilation_epoch(&self, method_key: &str) -> u64 {
+        const METHOD_EPOCH_CAP: usize = 65_536;
         let mut map = self.method_epochs.write();
-        let cell = map
-            .entry(method_key.to_string())
-            .or_insert_with(|| Box::new(std::sync::atomic::AtomicU64::new(0)));
+        if !map.contains_key(method_key) && map.len() >= METHOD_EPOCH_CAP {
+            return self
+                .method_epoch_overflow
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                + 1;
+        }
+        let cell = map.entry(method_key.to_string()).or_insert_with(|| {
+            Box::new(std::sync::atomic::AtomicU64::new(0))
+        });
         // fetch_add returns the PREVIOUS value; the new live epoch is +1.
         cell.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
     }
@@ -4167,7 +4148,11 @@ impl SharedVm {
     /// the live epoch lock-free before touching the deopt box. Only called under
     /// `deopt_real_enabled()` (at install, by `stamp_compilation_epoch`).
     pub fn live_epoch_cell_ptr(&self, method_key: &str) -> *const std::sync::atomic::AtomicU64 {
+        const METHOD_EPOCH_CAP: usize = 65_536;
         let mut map = self.method_epochs.write();
+        if !map.contains_key(method_key) && map.len() >= METHOD_EPOCH_CAP {
+            return &self.method_epoch_overflow;
+        }
         let cell = map
             .entry(method_key.to_string())
             .or_insert_with(|| Box::new(std::sync::atomic::AtomicU64::new(0)));
@@ -4921,7 +4906,6 @@ impl SharedVm {
 // | Doc level / lock          | HEAD `LockLevel` |
 // |---------------------------|------------------|
 // | L10 `class_manager`       | `HeapLock`       |
-// | L9  `native_method_cache` | `ClassLoader`    |
 // | L7  `ref_processor`       | `MonitorPool`    |
 // | L6  `monitors`            | `ThreadList`     |
 // | L5  `thread_registry`     | `JitCache`       |
@@ -5078,7 +5062,6 @@ mod ranked_locks {
     // ----- Per-lock level mapping -----------------------------------
 
     pub(super) const CLASS_MANAGER: LockLevel = LockLevel::ClassManager; // L10
-    pub(super) const NATIVE_METHOD_CACHE: LockLevel = LockLevel::NativeMethods; // L9
     pub(super) const REF_PROCESSOR: LockLevel = LockLevel::RefProcessor; // L7
     pub(super) const MONITORS: LockLevel = LockLevel::Monitors; // L6
     pub(super) const THREAD_REGISTRY: LockLevel = LockLevel::ThreadRegistry; // L5
@@ -5151,26 +5134,6 @@ impl SharedVm {
         }
     }
 
-    /// Acquire the native-method callback cache for read.
-    #[inline]
-    pub fn native_method_cache_read_ranked(
-        &self,
-    ) -> RankedGuard<
-        parking_lot::RwLockReadGuard<
-            '_,
-            crate::runtime::fx_collections::FxHashMap<
-                (String, String, String),
-                cratonvm_native_api::NativeCallback,
-            >,
-        >,
-    > {
-        let rank = ranked_locks::enter(ranked_locks::NATIVE_METHOD_CACHE);
-        RankedGuard {
-            lock: self.native_method_cache.read(),
-            rank_scope: rank,
-        }
-    }
-
     /// Acquire `ref_processor` with debug-only rank tracking.
     #[inline]
     pub fn ref_processor_lock_ranked(
@@ -5187,7 +5150,7 @@ impl SharedVm {
     /// many fine-grained inner locks; this helper just announces that
     /// the caller is about to touch monitor state so the rank tracker
     /// can reject downstream acquisitions of higher-ranked locks
-    /// (i.e. `class_manager` or `native_method_cache`). Bind the
+    /// (i.e. `class_manager`). Bind the
     /// returned guard to a local for the duration of the monitor work.
     #[inline]
     #[must_use = "bind the guard to a local for the duration of the monitor work"]
@@ -6100,7 +6063,7 @@ impl crate::runtime::serviceability::VmDiagnosticState for SharedVm {
                     class_id: header.class_id.as_u32(),
                     is_array: header.kind == ObjectKind::Array,
                     element_type: header.element_type as u8,
-                    array_length: header.array_length,
+                    array_length: header.array_length(),
                     total_size: size,
                     data_ptr: ptr as *const u8,
                 }
@@ -6443,7 +6406,7 @@ mod tests {
         let header = shared.heap.get_header(lock);
 
         assert_eq!(header.class_id, object_id);
-        assert_eq!(header.num_slots, 0);
+        assert_eq!(header.num_slots(), 0);
     }
 
     // -----------------------------------------------------------------------
@@ -6458,8 +6421,8 @@ mod tests {
         let err_header = shared.heap.get_header(err);
         assert_ne!(out.as_ptr(), err.as_ptr());
         assert_eq!(out_header.class_id, err_header.class_id);
-        assert!(out_header.num_slots >= 1);
-        assert!(err_header.num_slots >= 1);
+        assert!(out_header.num_slots() >= 1);
+        assert!(err_header.num_slots() >= 1);
 
         // Synthetic PrintStream uses slot 0 as its stdout/stderr descriptor.
         // In the real JDK, that slot is FilterOutputStream.out (a reference),

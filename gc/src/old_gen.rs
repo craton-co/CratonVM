@@ -540,7 +540,7 @@ impl OldGen {
             }
             let raw_size = if header.kind == ObjectKind::Array {
                 HEADER_SIZE
-                    + array_data_size(header.array_length as usize, header.element_type)
+                    + array_data_size(header.array_length() as usize, header.element_type)
                         .expect("array_data_size overflow in old_gen scan")
             } else {
                 // Compact reference-field layout: a promoted compact object's body
@@ -587,7 +587,7 @@ impl OldGen {
             }
             let raw_size = if header.kind == ObjectKind::Array {
                 HEADER_SIZE
-                    + array_data_size(header.array_length as usize, header.element_type)
+                    + array_data_size(header.array_length() as usize, header.element_type)
                         .expect("array_data_size overflow in old_gen scan")
             } else {
                 // Compact reference-field layout: honour the per-object
@@ -778,8 +778,8 @@ impl OldGen {
             (
                 h.kind,
                 h.element_type,
-                h.array_length,
-                h.num_slots,
+                h.array_length(),
+                h.num_slots(),
                 crate::heap::compact_oop_scan(h),
             )
         };
@@ -1027,8 +1027,9 @@ mod tests {
 
         assert_eq!(second as usize - first as usize, 48);
         // OldGen reserves at least one header for any request, so the second
-        // 8-byte request occupies 40 bytes after the 48-byte compact extent.
-        assert_eq!(og.used(), 88);
+        // 8-byte request occupies one 32-byte production header after the
+        // 48-byte aligned extent.
+        assert_eq!(og.used(), 80);
     }
 
     #[test]
@@ -1117,14 +1118,14 @@ mod tests {
         let p1 = og.alloc(obj_size1, 8).unwrap();
         unsafe {
             let header = &mut *(p1 as *mut ObjectHeader);
-            header.num_slots = 2;
+            header.set_num_slots(2);
         }
 
         let obj_size2 = HEADER_SIZE + SLOT_SIZE; // 1 field
         let p2 = og.alloc(obj_size2, 8).unwrap();
         unsafe {
             let header = &mut *(p2 as *mut ObjectHeader);
-            header.num_slots = 1;
+            header.set_num_slots(1);
         }
 
         let objects = og.walk_objects();
@@ -1154,7 +1155,7 @@ mod tests {
         let filler_size = HEADER_SIZE + 4 * SLOT_SIZE;
         let filler = og.alloc(filler_size, 8).unwrap();
         unsafe {
-            (*(filler as *mut ObjectHeader)).num_slots = 4;
+            (*(filler as *mut ObjectHeader)).set_num_slots(4);
             // left UNMARKED -> dead -> reclaimed.
         }
 
@@ -1167,14 +1168,14 @@ mod tests {
         unsafe {
             // A is live, references B in field 0.
             let a_hdr = &mut *(a as *mut ObjectHeader);
-            a_hdr.num_slots = 1;
+            a_hdr.set_num_slots(1);
             a_hdr.gc_flags |= GC_FLAG_MARKED;
             let a_field0 = a.add(HEADER_SIZE) as *mut Value;
             std::ptr::write(a_field0, Value::Object(Some(ObjectRef::from_raw(b))));
 
             // B is left UNMARKED (would be floating garbage without the guard).
             let b_hdr = &mut *(b as *mut ObjectHeader);
-            b_hdr.num_slots = 1;
+            b_hdr.set_num_slots(1);
             b_hdr.identity_hash_code = B_TAG;
         }
 
@@ -1231,7 +1232,7 @@ mod tests {
         let a = og.alloc(a_size, 8).unwrap();
         unsafe {
             let a_hdr = &mut *(a as *mut ObjectHeader);
-            a_hdr.num_slots = 1;
+            a_hdr.set_num_slots(1);
             a_hdr.gc_flags |= GC_FLAG_MARKED;
         }
 
@@ -1241,7 +1242,7 @@ mod tests {
         let b = og.alloc(b_size, 8).unwrap();
         unsafe {
             let b_hdr = &mut *(b as *mut ObjectHeader);
-            b_hdr.num_slots = 1;
+            b_hdr.set_num_slots(1);
             b_hdr.gc_flags |= GC_FLAG_MARKED;
         }
 

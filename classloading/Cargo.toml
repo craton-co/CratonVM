@@ -26,6 +26,7 @@ tracing.workspace = true
 parking_lot.workspace = true
 zip.workspace = true
 rustc-hash.workspace = true
+memmap2 = "0.9"
 # Round 8 audit fix (CRIT): hashbrown provides stable `raw_entry_mut` API used
 # by `LinkResolver::get` to probe the `(ClassId, Arc<str>, Arc<str>)` cache by
 # `(ClassId, &str, &str)` without paying two Arc clones per hit. std's

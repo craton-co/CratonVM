@@ -975,13 +975,18 @@ impl IrBuilder {
     /// Convert bytecode to IR graph.  Returns `None` if an unsupported
     /// opcode is encountered.
     pub fn build(mut self, code: &[u8], code_len: usize) -> Option<Graph> {
-        // First pass: identify branch targets so we know where merges go, and
-        // which of them are loop headers (targets of a backward branch).
-        let targets = find_branch_targets(code, code_len);
-        for &target in &targets {
+        // Consume the verifier's canonical decode/CFG contract instead of
+        // maintaining a second opcode-length scanner in the compiler.
+        let verified = cratonvm_reader::verified_code(code.get(..code_len)?).ok()?;
+        for &target in verified.merge_targets() {
+            let target = target as usize;
             self.ensure_merge(target);
         }
-        self.loop_headers = find_loop_headers(code, code_len);
+        self.loop_headers = verified
+            .loop_headers()
+            .iter()
+            .map(|target| *target as usize)
+            .collect();
 
         let mut pc = 0;
         while pc < code_len {
@@ -2382,6 +2387,7 @@ fn parse_switch(
 }
 
 /// Scan bytecode for branch targets (PCs that are jumped to).
+#[cfg(test)]
 fn find_branch_targets(code: &[u8], code_len: usize) -> Vec<usize> {
     let mut targets = Vec::new();
     let mut pc = 0;
@@ -2501,6 +2507,7 @@ fn find_branch_targets(code: &[u8], code_len: usize) -> Vec<usize> {
 /// (`target <= source`). These must be activated with eager loop-carried phis
 /// (see `activate_loop_header`) so the back-edge value can be back-patched.
 /// Mirrors `find_branch_targets`' opcode-length walk exactly.
+#[cfg(test)]
 fn find_loop_headers(code: &[u8], code_len: usize) -> HashSet<usize> {
     let mut headers = HashSet::new();
     let mut pc = 0;

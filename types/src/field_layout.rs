@@ -21,7 +21,68 @@
 //! See `docs/feature-designs/compact-ref-field-layout.md`.
 
 use crate::heap_types::{ObjectHeader, GC_FLAG_COMPACT, SLOT_SIZE};
-use std::sync::{Arc, OnceLock, RwLock};
+use crate::{ObjectRef, Value};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering};
+use std::sync::{Arc, LazyLock, OnceLock, RwLock};
+
+/// Tagless storage representation of a compact instance field.
+///
+/// The verifier and class loader determine this once from the field descriptor;
+/// mutators and compiled code then load/store only the Java payload width. This
+/// removes the 16-byte Rust `Value` discriminant cell from production object
+/// bodies while retaining `Value` at VM API boundaries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum FieldStorageKind {
+    Reference,
+    Boolean,
+    Byte,
+    Char,
+    Short,
+    Int,
+    Float,
+    Long,
+    Double,
+}
+
+impl FieldStorageKind {
+    #[inline]
+    pub const fn from_descriptor_byte(descriptor: u8) -> Option<Self> {
+        Some(match descriptor {
+            b'L' | b'[' => Self::Reference,
+            b'Z' => Self::Boolean,
+            b'B' => Self::Byte,
+            b'C' => Self::Char,
+            b'S' => Self::Short,
+            b'I' => Self::Int,
+            b'F' => Self::Float,
+            b'J' => Self::Long,
+            b'D' => Self::Double,
+            _ => return None,
+        })
+    }
+
+    #[inline]
+    pub const fn size(self) -> u32 {
+        match self {
+            Self::Boolean | Self::Byte => 1,
+            Self::Char | Self::Short => 2,
+            Self::Int | Self::Float => 4,
+            Self::Reference | Self::Long | Self::Double => 8,
+        }
+    }
+
+    #[inline]
+    pub const fn alignment(self) -> u32 {
+        self.size()
+    }
+
+    #[inline]
+    pub const fn is_reference(self) -> bool {
+        matches!(self, Self::Reference)
+    }
+}
 
 /// Per-class instance-field layout for the compact reference-field model.
 ///
@@ -30,7 +91,7 @@ use std::sync::{Arc, OnceLock, RwLock};
 /// `set_field`. A parent's layout is an exact prefix of every child's layout
 /// (declaration order, supers first), so inherited indices map to identical
 /// offsets across the hierarchy.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompactLayout {
     /// Byte offset within the object body (relative to `HEADER_SIZE`) of each
     /// field index. `field_offsets.len()` == instance-field count.
@@ -39,12 +100,14 @@ pub struct CompactLayout {
     /// unknown/uncovered descriptor — treated as a reference, matching the heap
     /// default-init rule).
     pub is_ref: Vec<bool>,
+    /// Descriptor-derived tagless storage representation for each field.
+    pub field_kinds: Vec<FieldStorageKind>,
     /// Byte offsets (relative to `HEADER_SIZE`) of every reference field, in
     /// ascending order. This is the GC oop-map: the only slots the collector
     /// scans/remaps for an instance of this class.
     pub ref_offsets: Vec<u32>,
-    /// Total object body size in bytes (sum of per-field sizes; ref = 8,
-    /// primitive = 16). Object total size = `HEADER_SIZE + body_size`.
+    /// Total object body size in bytes, rounded to 8-byte object alignment.
+    /// Fields use their natural Java payload width (1/2/4/8 bytes).
     pub body_size: u32,
 }
 
@@ -59,6 +122,12 @@ impl CompactLayout {
     #[inline]
     pub fn field_is_ref(&self, index: usize) -> Option<bool> {
         self.is_ref.get(index).copied()
+    }
+
+    /// Tagless storage representation of field `index`.
+    #[inline]
+    pub fn field_storage(&self, index: usize) -> Option<FieldStorageKind> {
+        self.field_kinds.get(index).copied()
     }
 
     /// Instance-field count (bounds for `get_field`/`set_field`).
@@ -104,6 +173,8 @@ pub fn set_compact_ref_fields_enabled(enabled: bool) {
 /// Dense `class_id -> layout` registry. `class_id`s are assigned densely from 0,
 /// so a `Vec` indexed by id is compact. Only populated when the flag is on.
 static CLASS_LAYOUTS: RwLock<Vec<Option<Arc<CompactLayout>>>> = RwLock::new(Vec::new());
+static CLASS_LAYOUT_VERSIONS: LazyLock<RwLock<HashMap<(u32, u32), Arc<CompactLayout>>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
 
 /// Maximum slot count for the dense layout registry.
 ///
@@ -176,6 +247,12 @@ pub fn register_class_layout(class_id: u32, layout: Arc<CompactLayout>) {
          ({MAX_DENSE_CLASS_LAYOUTS}); refusing sparse allocation"
     );
 
+    let field_count = u32::try_from(layout.field_count())
+        .expect("compact field count exceeds u32");
+    {
+        let mut versions = CLASS_LAYOUT_VERSIONS.write().unwrap();
+        versions.insert((class_id, field_count), Arc::clone(&layout));
+    }
     let mut v = CLASS_LAYOUTS.write().unwrap();
     if idx >= v.len() {
         v.resize(idx + 1, None);
@@ -195,11 +272,51 @@ pub fn register_class_layout(class_id: u32, layout: Arc<CompactLayout>) {
     LAYOUT_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
 }
 
+/// Drop the compact field layout owned by an unloaded class.
+///
+/// The registry is slot-indexed and ClassIds are monotonic, so clearing the
+/// slot releases the layout allocation without allowing a future class to
+/// inherit it.
+pub fn unregister_class_layout(class_id: u32) {
+    let Ok(index) = usize::try_from(class_id) else {
+        return;
+    };
+    CLASS_LAYOUT_VERSIONS
+        .write()
+        .unwrap()
+        .retain(|(id, _), _| *id != class_id);
+    let mut layouts = CLASS_LAYOUTS.write().unwrap();
+    if let Some(slot) = layouts.get_mut(index) {
+        if slot.take().is_some() {
+            if index < MAX_DENSE_CLASS_LAYOUTS {
+                layout_replace_counts()[index]
+                    .fetch_add(1, std::sync::atomic::Ordering::Release);
+            }
+            LAYOUT_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
+        }
+    }
+}
+
 /// Look up the compact layout for a class, if registered.
 #[inline]
 pub fn class_layout(class_id: u32) -> Option<Arc<CompactLayout>> {
     let v = CLASS_LAYOUTS.read().unwrap();
     v.get(class_id as usize).and_then(|o| o.clone())
+}
+
+/// Resolve the immutable layout version used by an object with this exact
+/// hierarchy-wide field count. Retaining versions makes object size and oop
+/// maps stable across append-only synthetic-class upgrades.
+#[inline]
+pub fn class_layout_for_fields(
+    class_id: u32,
+    field_count: u32,
+) -> Option<Arc<CompactLayout>> {
+    CLASS_LAYOUT_VERSIONS
+        .read()
+        .unwrap()
+        .get(&(class_id, field_count))
+        .cloned()
 }
 
 /// `(byte_offset, is_ref)` for field `index` of `class_id`, if a compact layout
@@ -222,6 +339,16 @@ pub fn class_layout(class_id: u32) -> Option<Arc<CompactLayout>> {
 /// layout.
 #[inline]
 pub fn compact_field_slot(class_id: u32, index: usize) -> Option<(usize, bool)> {
+    compact_field_storage(class_id, index)
+        .map(|(offset, storage)| (offset, storage.is_reference()))
+}
+
+/// `(byte_offset, storage_kind)` for a field in a registered compact layout.
+#[inline]
+pub fn compact_field_storage(
+    class_id: u32,
+    index: usize,
+) -> Option<(usize, FieldStorageKind)> {
     struct SlotCache {
         entries: [Option<(u32, u64, Arc<CompactLayout>)>; 8],
         next: usize,
@@ -246,25 +373,174 @@ pub fn compact_field_slot(class_id: u32, index: usize) -> Option<(usize, bool)> 
                 if *cached_cid == class_id && *cached_gen == generation {
                     return Some((
                         layout.field_offset(index)? as usize,
-                        layout.field_is_ref(index)?,
+                        layout.field_storage(index)?,
                     ));
                 }
             }
         }
         let layout = class_layout(class_id)?;
         let offset = layout.field_offset(index)? as usize;
-        let is_ref = layout.field_is_ref(index)?;
+        let storage = layout.field_storage(index)?;
         let slot = cache.next;
         cache.entries[slot] = Some((class_id, generation, layout));
         cache.next = (slot + 1) % cache.entries.len();
-        Some((offset, is_ref))
+        Some((offset, storage))
     })
+}
+
+/// Return the compact body size when `class_id` has a complete layout matching
+/// the requested instance-field count. Allocation paths in every collector use
+/// this one predicate, so an object can never be marked compact with a partial
+/// or stale class recipe.
+#[inline]
+pub fn compact_object_body_size(class_id: u32, field_count: usize) -> Option<usize> {
+    if !compact_ref_fields_enabled() {
+        return None;
+    }
+    class_layout(class_id)
+        .filter(|layout| layout.field_count() == field_count)
+        .map(|layout| layout.body_size as usize)
+}
+
+/// Resolve a field of an object that is actually marked compact.
+#[inline]
+pub fn compact_object_field_storage(
+    header: &ObjectHeader,
+    index: usize,
+) -> Option<(usize, FieldStorageKind)> {
+    if !is_compact_object(header) {
+        return None;
+    }
+    let layout = class_layout_for_fields(header.class_id.as_u32(), header.num_slots())?;
+    Some((
+        layout.field_offset(index)? as usize,
+        layout.field_storage(index)?,
+    ))
+}
+
+/// Atomically read a tagless compact field and reconstruct its VM `Value`.
+///
+/// # Safety
+/// `ptr` must point to a naturally aligned field of the supplied storage kind.
+#[inline]
+pub unsafe fn read_compact_field(
+    ptr: *const u8,
+    storage: FieldStorageKind,
+    ordering: Ordering,
+) -> Value {
+    match storage {
+        FieldStorageKind::Reference => {
+            let raw = unsafe { (&*(ptr as *const AtomicU64)).load(ordering) };
+            if raw == 0 {
+                Value::Object(None)
+            } else {
+                Value::Object(Some(unsafe { ObjectRef::from_raw(raw as usize as *mut u8) }))
+            }
+        }
+        FieldStorageKind::Boolean => {
+            Value::Int((unsafe { (&*(ptr as *const AtomicU8)).load(ordering) } != 0) as i32)
+        }
+        FieldStorageKind::Byte => Value::Int(
+            unsafe { (&*(ptr as *const AtomicU8)).load(ordering) } as i8 as i32,
+        ),
+        FieldStorageKind::Char => Value::Int(
+            unsafe { (&*(ptr as *const AtomicU16)).load(ordering) } as i32,
+        ),
+        FieldStorageKind::Short => Value::Int(
+            unsafe { (&*(ptr as *const AtomicU16)).load(ordering) } as i16 as i32,
+        ),
+        FieldStorageKind::Int => Value::Int(
+            unsafe { (&*(ptr as *const AtomicU32)).load(ordering) } as i32,
+        ),
+        FieldStorageKind::Float => Value::Float(f32::from_bits(
+            unsafe { (&*(ptr as *const AtomicU32)).load(ordering) },
+        )),
+        FieldStorageKind::Long => Value::Long(
+            unsafe { (&*(ptr as *const AtomicU64)).load(ordering) } as i64,
+        ),
+        FieldStorageKind::Double => Value::Double(f64::from_bits(
+            unsafe { (&*(ptr as *const AtomicU64)).load(ordering) },
+        )),
+    }
+}
+
+/// Atomically store a VM `Value` into tagless compact field storage.
+///
+/// Descriptor-compatible values are expected on verified bytecode paths.
+/// Integer-family writes are narrowed according to JVMS field semantics.
+///
+/// # Safety
+/// `ptr` must point to a naturally aligned field of the supplied storage kind.
+#[inline]
+pub unsafe fn write_compact_field(
+    ptr: *mut u8,
+    storage: FieldStorageKind,
+    value: Value,
+    ordering: Ordering,
+) {
+    match storage {
+        FieldStorageKind::Reference => {
+            let raw = match value {
+                Value::Object(Some(r)) => r.as_ptr() as u64,
+                Value::Object(None) => 0,
+                _ => 0,
+            };
+            unsafe { (&*(ptr as *const AtomicU64)).store(raw, ordering) };
+        }
+        FieldStorageKind::Boolean => {
+            let raw = matches!(value, Value::Int(v) if v != 0) as u8;
+            unsafe { (&*(ptr as *const AtomicU8)).store(raw, ordering) };
+        }
+        FieldStorageKind::Byte => {
+            let raw = match value { Value::Int(v) => v as u8, _ => 0 };
+            unsafe { (&*(ptr as *const AtomicU8)).store(raw, ordering) };
+        }
+        FieldStorageKind::Char | FieldStorageKind::Short => {
+            let raw = match value { Value::Int(v) => v as u16, _ => 0 };
+            unsafe { (&*(ptr as *const AtomicU16)).store(raw, ordering) };
+        }
+        FieldStorageKind::Int => {
+            let raw = match value {
+                Value::Int(v) => v as u32,
+                Value::Float(v) => v.to_bits(),
+                _ => 0,
+            };
+            unsafe { (&*(ptr as *const AtomicU32)).store(raw, ordering) };
+        }
+        FieldStorageKind::Float => {
+            let raw = match value {
+                Value::Float(v) => v.to_bits(),
+                Value::Int(v) => v as u32,
+                _ => 0,
+            };
+            unsafe { (&*(ptr as *const AtomicU32)).store(raw, ordering) };
+        }
+        FieldStorageKind::Long => {
+            let raw = match value {
+                Value::Long(v) => v as u64,
+                Value::Int(v) => v as i64 as u64,
+                Value::Double(v) => v.to_bits(),
+                _ => 0,
+            };
+            unsafe { (&*(ptr as *const AtomicU64)).store(raw, ordering) };
+        }
+        FieldStorageKind::Double => {
+            let raw = match value {
+                Value::Double(v) => v.to_bits(),
+                Value::Long(v) => v as u64,
+                Value::Int(v) => v as i64 as u64,
+                _ => 0,
+            };
+            unsafe { (&*(ptr as *const AtomicU64)).store(raw, ordering) };
+        }
+    }
 }
 
 /// Clear the registry (test/debug-only).
 #[cfg(any(test, debug_assertions))]
 pub fn clear_class_layouts() {
     CLASS_LAYOUTS.write().unwrap().clear();
+    CLASS_LAYOUT_VERSIONS.write().unwrap().clear();
 }
 
 // --- Object body size --------------------------------------------------------
@@ -286,9 +562,11 @@ pub fn is_compact_object(header: &ObjectHeader) -> bool {
 #[inline]
 pub fn object_body_size(header: &ObjectHeader) -> usize {
     if is_compact_object(header) {
-        header.array_length as usize
+        class_layout_for_fields(header.class_id.as_u32(), header.num_slots())
+            .map(|layout| layout.body_size as usize)
+            .unwrap_or(0)
     } else {
-        header.num_slots as usize * SLOT_SIZE
+        header.num_slots() as usize * SLOT_SIZE
     }
 }
 
@@ -296,23 +574,30 @@ pub fn object_body_size(header: &ObjectHeader) -> usize {
 mod tests {
     use super::*;
 
+    static REGISTRY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn layout_offsets_and_oopmap() {
         // Class with fields: ref, int, ref  (descriptors L, I, L)
-        // prefix-sum: off0=0(ref,8) off1=8(int,16) off2=24(ref,8) body=32
+        // natural-width layout: ref@0, int@8, align the next ref to ref@16.
         let layout = CompactLayout {
-            field_offsets: vec![0, 8, 24],
+            field_offsets: vec![0, 8, 16],
             is_ref: vec![true, false, true],
-            ref_offsets: vec![0, 24],
-            body_size: 32,
+            field_kinds: vec![
+                FieldStorageKind::Reference,
+                FieldStorageKind::Int,
+                FieldStorageKind::Reference,
+            ],
+            ref_offsets: vec![0, 16],
+            body_size: 24,
         };
         assert_eq!(layout.field_offset(0), Some(0));
         assert_eq!(layout.field_offset(1), Some(8));
-        assert_eq!(layout.field_offset(2), Some(24));
+        assert_eq!(layout.field_offset(2), Some(16));
         assert_eq!(layout.field_offset(3), None);
         assert_eq!(layout.field_is_ref(1), Some(false));
         assert_eq!(layout.field_count(), 3);
-        assert_eq!(layout.ref_offsets, vec![0, 24]);
+        assert_eq!(layout.ref_offsets, vec![0, 16]);
     }
 
     /// Regression: mixed reference + `double`/`long`/`float` fields.
@@ -329,8 +614,6 @@ mod tests {
     /// compact-ref-field-layout.md`).
     #[test]
     fn mixed_ref_double_long_float_offsets() {
-        use crate::heap_types::REF_FIELD_SIZE;
-
         // Fields (declaration order): Object a; double x; Object b; double y;
         //                             long z;   Object c; float f
         // descriptors:                L        D         L        D
@@ -344,32 +627,54 @@ mod tests {
         //   c  L  off 64 (ref, +8)  -> 72
         //   f  F  off 72 (prim,+16) -> 88
         let layout = CompactLayout {
-            field_offsets: vec![0, 8, 24, 32, 48, 64, 72],
+            field_offsets: vec![0, 8, 16, 24, 32, 40, 48],
             is_ref: vec![true, false, true, false, false, true, false],
-            ref_offsets: vec![0, 24, 64],
-            body_size: 88,
+            field_kinds: vec![
+                FieldStorageKind::Reference,
+                FieldStorageKind::Double,
+                FieldStorageKind::Reference,
+                FieldStorageKind::Double,
+                FieldStorageKind::Long,
+                FieldStorageKind::Reference,
+                FieldStorageKind::Float,
+            ],
+            ref_offsets: vec![0, 16, 40],
+            body_size: 56,
         };
 
         // Cross-check the literal layout against the prefix-sum rule it encodes,
         // so a change to REF_FIELD_SIZE / SLOT_SIZE (or a mis-sized field) is
         // caught here rather than corrupting objects at runtime.
-        let is_ref = [true, false, true, false, false, true, false];
+        let kinds = [
+            FieldStorageKind::Reference,
+            FieldStorageKind::Double,
+            FieldStorageKind::Reference,
+            FieldStorageKind::Double,
+            FieldStorageKind::Long,
+            FieldStorageKind::Reference,
+            FieldStorageKind::Float,
+        ];
         let mut expect_off = 0u32;
         let mut expect_refs = Vec::new();
-        for (i, &r) in is_ref.iter().enumerate() {
+        for (i, &kind) in kinds.iter().enumerate() {
+            let align = kind.alignment();
+            expect_off = (expect_off + align - 1) & !(align - 1);
             assert_eq!(
                 layout.field_offset(i),
                 Some(expect_off),
-                "field {i} offset must follow the 8-byte-per-ref prefix sum",
+                "field {i} must be naturally aligned",
             );
-            assert_eq!(layout.field_is_ref(i), Some(r), "field {i} ref-ness");
-            if r {
+            assert_eq!(
+                layout.field_is_ref(i),
+                Some(kind.is_reference()),
+                "field {i} ref-ness"
+            );
+            if kind.is_reference() {
                 expect_refs.push(expect_off);
-                expect_off += REF_FIELD_SIZE as u32;
-            } else {
-                expect_off += SLOT_SIZE as u32;
             }
+            expect_off += kind.size();
         }
+        expect_off = (expect_off + 7) & !7;
         assert_eq!(
             layout.body_size, expect_off,
             "body size = sum of field sizes"
@@ -391,9 +696,9 @@ mod tests {
             1 * SLOT_SIZE as u32,
             "non-compact assumption would use 16"
         );
-        assert_eq!(layout.field_offset(3), Some(32)); // double y, two refs before
+        assert_eq!(layout.field_offset(3), Some(24)); // double y, two refs before
         assert_ne!(
-            32,
+            24,
             3 * SLOT_SIZE as u32,
             "non-compact assumption would use 48"
         );
@@ -401,14 +706,14 @@ mod tests {
         // No primitive field's [off, off+SLOT_SIZE) byte range may overlap any
         // reference field's [off, off+REF_FIELD_SIZE) range — that overlap is
         // exactly how a double read yields a ref's bytes.
-        for (i, &r) in is_ref.iter().enumerate() {
-            if r {
+        for (i, &kind) in kinds.iter().enumerate() {
+            if kind.is_reference() {
                 continue;
             }
             let p0 = layout.field_offset(i).unwrap();
-            let p1 = p0 + SLOT_SIZE as u32;
+            let p1 = p0 + kind.size();
             for &ro in &layout.ref_offsets {
-                let r1 = ro + REF_FIELD_SIZE as u32;
+                let r1 = ro + FieldStorageKind::Reference.size();
                 assert!(
                     p1 <= ro || r1 <= p0,
                     "primitive field {i} at [{p0},{p1}) overlaps ref slot [{ro},{r1})",
@@ -418,11 +723,47 @@ mod tests {
     }
 
     #[test]
+    fn tagless_field_round_trip_all_storage_kinds() {
+        let mut words = [0u64; 8];
+        let ptr = words.as_mut_ptr() as *mut u8;
+        let cases = [
+            (FieldStorageKind::Boolean, Value::Int(1)),
+            (FieldStorageKind::Byte, Value::Int(-17)),
+            (FieldStorageKind::Char, Value::Int(0x20ac)),
+            (FieldStorageKind::Short, Value::Int(-1234)),
+            (FieldStorageKind::Int, Value::Int(-123_456_789)),
+            (FieldStorageKind::Float, Value::Float(3.25)),
+            (FieldStorageKind::Long, Value::Long(-9_876_543_210)),
+            (FieldStorageKind::Double, Value::Double(-17.5)),
+        ];
+        for (kind, value) in cases {
+            unsafe {
+                write_compact_field(ptr, kind, value, Ordering::Release);
+                assert_eq!(read_compact_field(ptr, kind, Ordering::Acquire), value);
+            }
+        }
+        unsafe {
+            write_compact_field(
+                ptr,
+                FieldStorageKind::Reference,
+                Value::Object(None),
+                Ordering::Release,
+            );
+            assert_eq!(
+                read_compact_field(ptr, FieldStorageKind::Reference, Ordering::Acquire),
+                Value::Object(None)
+            );
+        }
+    }
+
+    #[test]
     fn registry_round_trip() {
+        let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
         clear_class_layouts();
         let layout = Arc::new(CompactLayout {
             field_offsets: vec![0],
             is_ref: vec![true],
+            field_kinds: vec![FieldStorageKind::Reference],
             ref_offsets: vec![0],
             body_size: 8,
         });
@@ -433,20 +774,28 @@ mod tests {
         let layout2 = Arc::new(CompactLayout {
             field_offsets: vec![0, 8],
             is_ref: vec![true, true],
+            field_kinds: vec![
+                FieldStorageKind::Reference,
+                FieldStorageKind::Reference,
+            ],
             ref_offsets: vec![0, 8],
             body_size: 16,
         });
         register_class_layout(7, layout2);
         assert_eq!(class_layout(7).unwrap().body_size, 16);
+        assert_eq!(class_layout_for_fields(7, 1).unwrap().body_size, 8);
+        assert_eq!(class_layout_for_fields(7, 2).unwrap().body_size, 16);
         clear_class_layouts();
     }
 
     #[test]
     fn registry_rejects_sparse_class_id_without_poisoning_lock() {
+        let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
         clear_class_layouts();
         let layout = Arc::new(CompactLayout {
             field_offsets: vec![0],
             is_ref: vec![true],
+            field_kinds: vec![FieldStorageKind::Reference],
             ref_offsets: vec![0],
             body_size: 8,
         });
@@ -467,4 +816,5 @@ mod tests {
         assert!(class_layout(u32::MAX).is_none());
         clear_class_layouts();
     }
+
 }

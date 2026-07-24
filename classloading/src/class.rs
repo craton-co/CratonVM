@@ -886,7 +886,10 @@ const MAX_HIERARCHY_DEPTH: usize = 1024;
 /// Lookup is O(1) by `ClassId`.
 #[derive(Debug)]
 pub struct ClassStore {
-    classes: Vec<Class>,
+    /// Monotonic ClassId slots. An unloaded class leaves a tombstone so a
+    /// stale ClassId can never alias a subsequently loaded class.
+    classes: Vec<Option<Class>>,
+    live_count: usize,
 }
 
 impl ClassStore {
@@ -894,6 +897,7 @@ impl ClassStore {
     pub fn new() -> Self {
         Self {
             classes: Vec::new(),
+            live_count: 0,
         }
     }
 
@@ -917,7 +921,8 @@ impl ClassStore {
             class.id,
         );
         let id = class.id;
-        self.classes.push(class);
+        self.classes.push(Some(class));
+        self.live_count += 1;
         // Compact reference-field layout: register this class's oop-map / offset
         // table so the heap + GC can place and scan its reference fields as
         // 8-byte pointers. No-op when `CRATONVM_COMPACT_REF_FIELDS=0` opts out.
@@ -937,10 +942,9 @@ impl ClassStore {
         }
     }
 
-    /// Build the per-class compact instance-field layout: a prefix-sum offset
-    /// table (reference field = 8 bytes, primitive field = 16-byte tagged cell),
-    /// in declaration order with superclasses first, plus the reference-field
-    /// oop-map for the GC.
+    /// Build the per-class compact instance-field layout: a naturally aligned
+    /// tagless payload table (1/2/4/8 bytes), in declaration order with
+    /// superclasses first, plus the reference-field oop-map for the GC.
     ///
     /// Handles synthetic-stub **padding**: a class's `num_total_fields` may
     /// exceed its declared instance fields (native `<init>` writes to synthetic
@@ -962,20 +966,24 @@ impl ClassStore {
         let total = self.get(id)?.num_total_fields;
         let mut field_offsets: Vec<u32> = Vec::with_capacity(total);
         let mut is_ref: Vec<bool> = Vec::with_capacity(total);
+        let mut field_kinds: Vec<cratonvm_types::FieldStorageKind> =
+            Vec::with_capacity(total);
         let mut ref_offsets: Vec<u32> = Vec::new();
         let mut off: u32 = 0;
         let mut count: usize = 0;
         let mut padded = false;
 
-        let mut push = |r: bool, off: &mut u32| {
+        let mut push = |storage: cratonvm_types::FieldStorageKind, off: &mut u32| {
+            let alignment = storage.alignment();
+            *off = (*off + alignment - 1) & !(alignment - 1);
             field_offsets.push(*off);
+            let r = storage.is_reference();
             is_ref.push(r);
+            field_kinds.push(storage);
             if r {
                 ref_offsets.push(*off);
-                *off += cratonvm_types::REF_FIELD_SIZE as u32;
-            } else {
-                *off += cratonvm_types::SLOT_SIZE as u32;
             }
+            *off += storage.size();
         };
 
         for cid in chain {
@@ -985,14 +993,14 @@ impl ClassStore {
                     continue;
                 }
                 let b = f.descriptor.as_bytes().first().copied().unwrap_or(0);
-                let r = b == b'L' || b == b'[';
-                push(r, &mut off);
+                let storage = cratonvm_types::FieldStorageKind::from_descriptor_byte(b)?;
+                push(storage, &mut off);
                 count += 1;
             }
             // Pad up to this ancestor's own total so absolute indices stay aligned.
             let target = class.num_total_fields;
             while count < target {
-                push(true, &mut off); // padded slot -> reference (8-byte null)
+                push(cratonvm_types::FieldStorageKind::Reference, &mut off);
                 count += 1;
                 padded = true;
             }
@@ -1018,9 +1026,14 @@ impl ClassStore {
             return None;
         }
 
+        // Every object begins on an 8-byte boundary. Rounding the tail keeps
+        // the next header aligned without expanding individual fields.
+        off = (off + 7) & !7;
+
         Some(CompactLayout {
             field_offsets,
             is_ref,
+            field_kinds,
             ref_offsets,
             body_size: off,
         })
@@ -1028,33 +1041,44 @@ impl ClassStore {
 
     /// Look up a class by id.
     pub fn get(&self, id: ClassId) -> Option<&Class> {
-        self.classes.get(id.as_u32() as usize)
+        self.classes.get(id.as_u32() as usize)?.as_ref()
     }
 
     /// Look up a class by id (mutable).
     pub fn get_mut(&mut self, id: ClassId) -> Option<&mut Class> {
-        self.classes.get_mut(id.as_u32() as usize)
+        self.classes.get_mut(id.as_u32() as usize)?.as_mut()
+    }
+
+    /// Replace a live class slot with a tombstone and return its metadata.
+    ///
+    /// ClassIds are deliberately never reused: [`Self::next_id`] remains based
+    /// on the slot vector length, not `live_count`.
+    pub fn remove(&mut self, id: ClassId) -> Option<Class> {
+        let class = self.classes.get_mut(id.as_u32() as usize)?.take()?;
+        self.live_count = self.live_count.saturating_sub(1);
+        cratonvm_types::unregister_class_layout(id.as_u32());
+        Some(class)
     }
 
     /// The number of loaded classes.
     pub fn len(&self) -> usize {
-        self.classes.len()
+        self.live_count
     }
 
     /// Returns true if no classes have been loaded.
     pub fn is_empty(&self) -> bool {
-        self.classes.is_empty()
+        self.live_count == 0
     }
 
     /// Iterate over all loaded classes.
     pub fn iter(&self) -> impl Iterator<Item = &Class> {
-        self.classes.iter()
+        self.classes.iter().filter_map(Option::as_ref)
     }
 
     /// Find a class by name. O(n) scan — the class manager maintains a
     /// `HashMap` for fast name-based lookup; this is a fallback.
     pub fn find_by_name(&self, name: &str) -> Option<&Class> {
-        self.classes.iter().find(|c| &*c.name == name)
+        self.iter().find(|c| &*c.name == name)
     }
 }
 
@@ -2964,5 +2988,47 @@ mod tests {
         let pooled1 = cratonvm_types::intern_arc(&field1);
         let pooled2 = cratonvm_types::intern_arc(&field2);
         assert!(Arc::ptr_eq(&pooled1, &pooled2));
+    }
+
+    #[test]
+    fn unloaded_slots_are_tombstoned_and_never_reused() {
+        let mut store = ClassStore::new();
+        store.add(make_class(
+            ClassId::new(0),
+            "dead/C",
+            None,
+            vec![],
+            vec![],
+            vec![],
+            0,
+            0,
+        ));
+        store.add(make_class(
+            ClassId::new(1),
+            "live/C",
+            None,
+            vec![],
+            vec![],
+            vec![],
+            0,
+            0,
+        ));
+        assert!(store.remove(ClassId::new(0)).is_some());
+        assert!(store.get(ClassId::new(0)).is_none());
+        assert_eq!(store.len(), 1);
+        assert_eq!(store.next_id(), ClassId::new(2));
+
+        let new_id = store.add(make_class(
+            ClassId::new(2),
+            "new/C",
+            None,
+            vec![],
+            vec![],
+            vec![],
+            0,
+            0,
+        ));
+        assert_eq!(new_id, ClassId::new(2));
+        assert!(store.get(ClassId::new(0)).is_none());
     }
 }

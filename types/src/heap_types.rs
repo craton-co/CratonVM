@@ -12,11 +12,10 @@ use std::sync::atomic::AtomicU64;
 
 /// Size of `ObjectHeader` in bytes. Must be a multiple of 8 for alignment.
 ///
-/// NOTE: This was increased from 32 to 40 bytes when the `mark_word` field
-/// was appended to support thin-lock monitors. Downstream consumers (JIT, GC)
-/// that reference `HEADER_SIZE` will pick up the new size automatically; any
-/// code that hardcoded `32` must be updated.
-pub const HEADER_SIZE: usize = 40;
+/// The array length and object shape share a word, and age/flags occupy the
+/// first word's two spare bytes, keeping both forwarding and lock words while
+/// avoiding the former 8 bytes of padding/redundant shape state.
+pub const HEADER_SIZE: usize = 32;
 
 // JIT x64 emits array element offsets as signed disp8 = HEADER_SIZE as u8.
 // If HEADER_SIZE exceeds 127, disp8 wraps to negative and produces wrong
@@ -68,9 +67,9 @@ pub const INFLATED_PTR_MASK: u64 = !MARK_STATE_MASK;
 /// Byte offset of `mark_word` within `ObjectHeader`. Documented for downstream
 /// agents (JIT lock fast-path) so they can emit direct atomic loads / CAS.
 ///
-/// Derived from the `#[repr(C)]` layout: HEADER_SIZE(40) - 8 = 32. The
+/// Derived from the `#[repr(C)]` layout: HEADER_SIZE(32) - 8 = 24. The
 /// `_const_check_mark_word_offset` assertion below pins this at compile time.
-pub const MARK_WORD_OFFSET: usize = 32;
+pub const MARK_WORD_OFFSET: usize = 24;
 
 /// Size of each field/array element slot in bytes.
 /// Must be >= size_of::<Value>() (which is 16 bytes: 8 for the payload + 8 for the discriminant).
@@ -164,14 +163,16 @@ pub const MAX_SEQUENTIAL_CLASS_ID: u32 = u32::MAX;
 // pinned at test time rather than compile time (see
 // `autobox_class_id_is_reserved` in the tests module below).
 
-/// Byte offset of the `array_length` field within `ObjectHeader`.
-/// Derived from the `#[repr(C)]` layout: ClassId(4) + kind(1) + element_type(1) + padding(2) + identity_hash_code(4) = 12.
-/// Used by the JIT compiler for inline array length reads.
+/// Byte offset of the array-length/object-shape word.
 pub const ARRAY_LENGTH_OFFSET: usize = 12;
+pub const NUM_SLOTS_OFFSET: usize = 12;
+pub const GC_AGE_OFFSET: usize = 6;
+pub const GC_FLAGS_OFFSET: usize = 7;
+pub const FORWARDING_PTR_OFFSET: usize = 16;
 
 // Compile-time check that the offset is correct.
 const _: () = assert!(
-    std::mem::offset_of!(ObjectHeader, array_length) == ARRAY_LENGTH_OFFSET,
+    std::mem::offset_of!(ObjectHeader, shape) == ARRAY_LENGTH_OFFSET,
     "ARRAY_LENGTH_OFFSET must match ObjectHeader layout"
 );
 
@@ -239,7 +240,7 @@ pub fn array_data_size(
 /// entire region; not a real object, no oops to scan". Without this
 /// sentinel, the zeroed bytes of a continuation region decode as a
 /// well-formed `Object` (kind=0, class_id=0, num_slots=0) and walkers
-/// iterate the region as a 40-byte object, following the next zero header,
+/// iterate the region as a minimum-sized object, following the next zero header,
 /// and so on -- effectively scanning garbage as live objects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -296,19 +297,16 @@ pub fn array_element_type_from_tag(tag: u8) -> Option<ArrayElementType> {
 
 /// The header stored at the beginning of every heap-allocated object/array.
 ///
-/// Layout (40 bytes total, 8-byte aligned):
+/// Layout (32 bytes total, 8-byte aligned):
 /// - `class_id`: ClassId (4 bytes) -- MUST stay at offset 0 (JIT contract)
 /// - `kind`: ObjectKind (1 byte)
 /// - `element_type`: ArrayElementType (1 byte, only meaningful for arrays)
-/// - `_padding`: 2 bytes
+/// - `gc_age`: u8
+/// - `gc_flags`: u8
 /// - `identity_hash_code`: i32 (4 bytes)
-/// - `array_length`: u32 (4 bytes, only meaningful for arrays)
-/// - `num_slots`: u32 (4 bytes, field count for objects)
-/// - `gc_age`: u8 (1 byte, times survived minor GC)
-/// - `gc_flags`: u8 (1 byte, bit 0 = in old gen)
-/// - `_gc_reserved`: [u8; 2] (2 bytes padding)
+/// - `shape`: u32 (array length, or full instance-field count)
 /// - `forwarding_ptr`: *mut u8 (8 bytes, used by GC for object relocation)
-/// - `mark_word`: AtomicU64 (8 bytes, thin-lock / monitor state -- offset 32)
+/// - `mark_word`: AtomicU64 (8 bytes, thin-lock / monitor state -- offset 24)
 ///
 /// NOTE: `Clone`/`Copy` were removed when `mark_word: AtomicU64` was added,
 /// since atomics are `!Copy`. Header copies must now go through explicit
@@ -320,23 +318,21 @@ pub struct ObjectHeader {
     pub class_id: ClassId,
     pub kind: ObjectKind,
     pub element_type: ArrayElementType,
-    pub _padding: [u8; 2],
-    pub identity_hash_code: i32,
-    pub array_length: u32,
-    pub num_slots: u32,
     /// GC age -- number of times this object survived a minor GC (0..15).
     pub gc_age: u8,
-    /// GC flags -- bit 0: object is in old generation.
+    /// GC flags -- old/marked/compact layout bits.
     pub gc_flags: u8,
-    /// Reserved padding to maintain header alignment.
-    pub _gc_reserved: [u8; 2],
+    pub identity_hash_code: i32,
+    /// Arrays store their length directly. Objects store the full 32-bit
+    /// hierarchy-wide instance-field count.
+    pub shape: u32,
     /// Forwarding pointer for GC. When an object is copied during collection,
     /// the old header's forwarding_ptr is set to the new location.
     /// Null means the object has not been forwarded.
     pub forwarding_ptr: *mut u8,
     /// Mark word -- thin-lock owner / recursion / inflated-monitor pointer.
     /// State encoded in low 2 bits; see `MARK_NEUTRAL` / `MARK_THIN_LOCKED` /
-    /// `MARK_INFLATED`. Always at byte offset `MARK_WORD_OFFSET` (= 32).
+    /// `MARK_INFLATED`. Always at byte offset `MARK_WORD_OFFSET` (= 24).
     /// Initialized to `MARK_NEUTRAL` by `ObjectHeader::new`.
     pub mark_word: AtomicU64,
 }
@@ -365,9 +361,9 @@ pub const GC_FLAG_MARKED: u8 = 0x02;
 
 /// GC flag: object uses the **compact reference-field layout** — reference
 /// instance fields are stored as bare 8-byte pointers (per the registered
-/// [`crate::field_layout::CompactLayout`] for its class) and the object's body
-/// size in bytes is recorded in the `array_length` header field. Set at
-/// allocation time and never cleared (a permanent property of the object).
+/// [`crate::field_layout::CompactLayout`] version selected by its class and
+/// field count). Set at allocation time and never cleared (a permanent
+/// property of the object).
 ///
 /// Decided per-object so AUTOBOX wrappers, ad-hoc `ClassId(0)` containers, and
 /// objects allocated before a synthetic-stub class grew all stay on the legacy
@@ -390,20 +386,59 @@ impl ObjectHeader {
         array_length: u32,
         num_slots: u32,
     ) -> Self {
+        let shape = if kind == ObjectKind::Array {
+            array_length
+        } else {
+            num_slots
+        };
         Self {
             class_id,
             kind,
             element_type,
-            _padding: [0; 2],
-            identity_hash_code,
-            array_length,
-            num_slots,
             gc_age: 0,
             gc_flags: 0,
-            _gc_reserved: [0; 2],
+            identity_hash_code,
+            shape,
             forwarding_ptr: std::ptr::null_mut(),
             mark_word: AtomicU64::new(MARK_NEUTRAL),
         }
+    }
+
+    #[inline]
+    pub fn array_length(&self) -> u32 {
+        if self.kind == ObjectKind::Array {
+            self.shape
+        } else {
+            0
+        }
+    }
+
+    #[inline]
+    pub fn set_array_length(&mut self, length: u32) {
+        debug_assert_eq!(self.kind, ObjectKind::Array);
+        self.shape = length;
+    }
+
+    #[inline]
+    pub fn num_slots(&self) -> u32 {
+        self.shape
+    }
+
+    #[inline]
+    pub fn set_num_slots(&mut self, slots: u32) {
+        self.shape = slots;
+    }
+
+    /// Mark an object as using its class's compact field layout.
+    ///
+    /// The full 32-bit logical field count remains in the shape word. Body
+    /// size is owned by immutable class metadata and is only reclaimed after
+    /// the loader and all of its instances are proven dead.
+    #[inline]
+    pub fn set_compact_shape(&mut self, slots: u32, body_size: usize) {
+        assert_eq!(body_size & 7, 0, "compact body must be 8-byte aligned");
+        self.shape = slots;
+        self.gc_flags |= GC_FLAG_COMPACT;
     }
 
     /// Returns true if this object has been forwarded by the GC.
@@ -504,8 +539,36 @@ mod tests {
 
     #[test]
     fn header_size_is_correct() {
-        assert_eq!(HEADER_SIZE, 40);
+        assert_eq!(HEADER_SIZE, 32);
         assert_eq!(std::mem::size_of::<ObjectHeader>(), HEADER_SIZE);
+        assert_eq!(std::mem::align_of::<ObjectHeader>(), 8);
+        assert_eq!(std::mem::offset_of!(ObjectHeader, class_id), 0);
+        assert_eq!(std::mem::offset_of!(ObjectHeader, kind), OBJECT_KIND_OFFSET);
+        assert_eq!(
+            std::mem::offset_of!(ObjectHeader, element_type),
+            ARRAY_ELEMENT_TYPE_OFFSET
+        );
+        assert_eq!(std::mem::offset_of!(ObjectHeader, gc_age), GC_AGE_OFFSET);
+        assert_eq!(std::mem::offset_of!(ObjectHeader, gc_flags), GC_FLAGS_OFFSET);
+        assert_eq!(std::mem::offset_of!(ObjectHeader, identity_hash_code), 8);
+        assert_eq!(std::mem::offset_of!(ObjectHeader, shape), NUM_SLOTS_OFFSET);
+        assert_eq!(
+            std::mem::offset_of!(ObjectHeader, forwarding_ptr),
+            FORWARDING_PTR_OFFSET
+        );
+        assert_eq!(
+            std::mem::offset_of!(ObjectHeader, mark_word),
+            MARK_WORD_OFFSET
+        );
+    }
+
+    #[test]
+    fn object_shape_preserves_full_u32_field_count() {
+        let mut header = make_header();
+        header.set_compact_shape(0xfeed_beef, 24);
+        assert_eq!(header.num_slots(), 0xfeed_beef);
+        assert_eq!(header.array_length(), 0);
+        assert_eq!(header.gc_flags & GC_FLAG_COMPACT, GC_FLAG_COMPACT);
     }
 
     #[test]
@@ -591,9 +654,9 @@ mod tests {
     }
 
     #[test]
-    fn array_length_offset_matches_layout() {
+    fn packed_shape_offset_matches_array_length_layout() {
         assert_eq!(
-            std::mem::offset_of!(ObjectHeader, array_length),
+            std::mem::offset_of!(ObjectHeader, shape),
             ARRAY_LENGTH_OFFSET
         );
     }
@@ -825,7 +888,7 @@ mod tests {
         header.gc_age = 3;
         assert_eq!(header.kind, ObjectKind::Array);
         assert_eq!(header.element_type, ArrayElementType::Int);
-        assert_eq!(header.array_length, 100);
+        assert_eq!(header.array_length(), 100);
         assert_eq!(header.identity_hash_code, 12345);
         assert_eq!(header.gc_age, 3);
     }
@@ -929,7 +992,7 @@ mod tests {
     fn mark_word_offset_is_stable() {
         // The JIT lock fast-path hardcodes this offset; if it ever changes
         // both the constant and every emitter must be updated together.
-        assert_eq!(MARK_WORD_OFFSET, 32);
+        assert_eq!(MARK_WORD_OFFSET, 24);
         assert_eq!(
             std::mem::offset_of!(ObjectHeader, mark_word),
             MARK_WORD_OFFSET

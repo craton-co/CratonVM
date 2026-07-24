@@ -1704,7 +1704,7 @@ fn value_to_string(
             // so a length-1 array would masquerade as a wrapper and packed
             // primitive arrays would read a garbage Value slot.
             let is_array = shared.heap.kind_of(*obj_ref) == crate::memory::heap::ObjectKind::Array;
-            let nf = shared.heap.get_header(*obj_ref).num_slots as usize;
+            let nf = shared.heap.get_header(*obj_ref).num_slots() as usize;
             if nf == 1 && !is_array {
                 match shared.heap.get_field(*obj_ref, 0) {
                     Value::Int(v) => {
