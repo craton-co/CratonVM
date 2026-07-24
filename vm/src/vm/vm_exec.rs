@@ -5919,6 +5919,19 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         cm.find_class_by_name(name)
     }
 
+    fn class_id_by_name_via_referencing_class(
+        &mut self,
+        referencing_class_id: ClassId,
+        name: &str,
+    ) -> Result<ClassId, cratonvm_types::error::MethodCallFailed> {
+        crate::runtime::interpreter::resolve_class_loader_aware(
+            self.shared,
+            self.thread,
+            referencing_class_id,
+            name,
+        )
+    }
+
     fn is_record_class(&self, class_id: ClassId) -> bool {
         self.shared
             .class_manager
@@ -7013,6 +7026,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                     match self.shared.thread_registry.java_block_state(id) {
                         1 => 3, // WAITING
                         2 => 4, // BLOCKED
+                        3 => 5, // TIMED_WAITING
                         _ => 1, // RUNNABLE
                     }
                 } else {
@@ -7062,6 +7076,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             2 => 0x0002, // TERMINATED
             3 => 0x0010, // WAITING
             4 => 0x0400, // BLOCKED_ON_MONITOR_ENTER
+            5 => 0x0010, // TIMED_WAITING (approximated as WAITING for this bit-field)
             _ => 0,
         };
         Some(cratonvm_native_api::ThreadJmxSnapshot {
@@ -7564,6 +7579,12 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         self.shared.config.max_heap_size as i64
     }
 
+    fn initial_heap_bytes(&self) -> i64 {
+        // Report the configured `-Xms`, mirroring `max_heap_bytes`'s use of
+        // the real configured value in place of a hardcoded placeholder.
+        self.shared.config.initial_heap_size as i64
+    }
+
     fn loaded_class_count(&self) -> usize {
         self.shared.class_manager.read().loaded_count()
     }
@@ -7577,40 +7598,11 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     }
 
     fn begin_blocking_region(&mut self) {
-        self.thread
-            .gc_block_state
-            .java_state
-            .store(1, std::sync::atomic::Ordering::Release);
-        // CRIT (TLAB UAF) — retire this thread's TLAB before entering the
-        // blocked region, while the young arena it points into is still valid.
-        // While we are GC-blocked a stop-the-world moving collection can run on
-        // another thread and `grow()` (realloc) the young arena, freeing the old
-        // backing buffer; a retained TLAB `[cursor,end)` into that buffer would
-        // then be dangling and the first post-block fast-path bump would write
-        // the object header into freed memory → EXCEPTION_ACCESS_VIOLATION in
-        // `init_object_header`. Retiring here (arena still mapped) fills the tail
-        // for the collector's walk and empties the TLAB so the next allocation,
-        // after the block, refills from the current arena. Symmetric to the
-        // parked-thread retire in `safepoint_check`; `check_post_block_gc` only
-        // remaps existing refs and runs after the buffer may already be freed,
-        // so the retire must happen here, before the block.
-        self.thread.tlab.retire();
-        // T19.H1 — a native about to spin/poll or OS-wait for a long
-        // time (e.g. `ReferenceQueue.remove`) must publish its roots and
-        // mark itself GC-blocked, otherwise a concurrent stop-the-world
-        // collector's `wait_for_all` deadlocks waiting for this thread
-        // to reach an interpreter safepoint it will never reach.
-        self.deposit_root_snapshot();
-        if self.shared.gc_barrier.mark_blocked_region_enter() {
-            // A STW was already in progress — arrive at the barrier so
-            // the initiator's `wait_for_all` can complete.
-            // GCAUDIT-0711-FIX (finding 1a): `_auto` — the deposit above
-            // already raised `in_blocked_region` before this check.
-            let _ = self
-                .shared
-                .gc_barrier
-                .arrive_and_wait_auto(self.thread.thread_id);
-        }
+        self.begin_blocking_region_with_state(1);
+    }
+
+    fn begin_timed_blocking_region(&mut self) {
+        self.begin_blocking_region_with_state(3);
     }
 
     fn end_blocking_region(&mut self) {
@@ -10974,9 +10966,9 @@ pub fn invoke_or_native(
         }
     }
 
-    if let Some(callback) = shared
+    if let Some((callback, native_kind)) = shared
         .native_methods
-        .find(effective_class, method_name, descriptor)
+        .find_with_kind(effective_class, method_name, descriptor)
     {
         if crate::runtime::env_cache::bd_debug() && method_name == "intValue" {
             eprintln!("[invoke_or_native] direct native hit");
@@ -10987,11 +10979,15 @@ pub fn invoke_or_native(
         // end of this function — provided real bytecode actually exists. The
         // ReentrantLock fallback is also protected this way: it exists only for
         // fake-JDK synthetic lock stubs and must not steal real AQS bytecode.
+        //
+        // PERF (H2 TestFileSystem.testConcurrent hang, 2026-07-23): this used
+        // to be a second independent `kind_of(...)` call recomputing the same
+        // 128-bit (class, method, descriptor) hash `find(...)` just computed
+        // above -- a full byte-walk of all three strings, twice, on every
+        // single native dispatch VM-wide. `find_with_kind` above folds both
+        // lookups into one hash computation. See its doc comment.
         let synthetic_stub_native =
-            shared
-                .native_methods
-                .kind_of(effective_class, method_name, descriptor)
-                == Some(cratonvm_native_api::NativeKind::SyntheticStub);
+            native_kind == cratonvm_native_api::NativeKind::SyntheticStub;
         let real_protected_stub = synthetic_stub_native
             && (crate::runtime::env_cache::real_bytecode_selector().prefers_real(effective_class)
                 || matches!(
@@ -11223,6 +11219,47 @@ pub(super) fn resolve_library_path(shared: &SharedVm, name: &str) -> String {
 }
 
 impl<'a> NativeContextImpl<'a> {
+    /// Shared body for `begin_blocking_region` (`java_state=1`, WAITING) and
+    /// `begin_timed_blocking_region` (`java_state=3`, TIMED_WAITING) — see
+    /// `NativeContext::begin_blocking_region`'s doc comment for the GC-safety
+    /// contract; only the reported `Thread.getState()` value differs.
+    fn begin_blocking_region_with_state(&mut self, java_state: u8) {
+        self.thread
+            .gc_block_state
+            .java_state
+            .store(java_state, std::sync::atomic::Ordering::Release);
+        // CRIT (TLAB UAF) — retire this thread's TLAB before entering the
+        // blocked region, while the young arena it points into is still valid.
+        // While we are GC-blocked a stop-the-world moving collection can run on
+        // another thread and `grow()` (realloc) the young arena, freeing the old
+        // backing buffer; a retained TLAB `[cursor,end)` into that buffer would
+        // then be dangling and the first post-block fast-path bump would write
+        // the object header into freed memory → EXCEPTION_ACCESS_VIOLATION in
+        // `init_object_header`. Retiring here (arena still mapped) fills the tail
+        // for the collector's walk and empties the TLAB so the next allocation,
+        // after the block, refills from the current arena. Symmetric to the
+        // parked-thread retire in `safepoint_check`; `check_post_block_gc` only
+        // remaps existing refs and runs after the buffer may already be freed,
+        // so the retire must happen here, before the block.
+        self.thread.tlab.retire();
+        // T19.H1 — a native about to spin/poll or OS-wait for a long
+        // time (e.g. `ReferenceQueue.remove`) must publish its roots and
+        // mark itself GC-blocked, otherwise a concurrent stop-the-world
+        // collector's `wait_for_all` deadlocks waiting for this thread
+        // to reach an interpreter safepoint it will never reach.
+        self.deposit_root_snapshot();
+        if self.shared.gc_barrier.mark_blocked_region_enter() {
+            // A STW was already in progress — arrive at the barrier so
+            // the initiator's `wait_for_all` can complete.
+            // GCAUDIT-0711-FIX (finding 1a): `_auto` — the deposit above
+            // already raised `in_blocked_region` before this check.
+            let _ = self
+                .shared
+                .gc_barrier
+                .arrive_and_wait_auto(self.thread.thread_id);
+        }
+    }
+
     /// Try native method first, then full invoke_shared.
     fn invoke_or_native(
         &mut self,
@@ -15097,6 +15134,8 @@ fn invoke_on_class_shared_inner(
                         || (class_name == "java/net/URLClassLoader"
                             && ((method_name == "findClass"
                                 && descriptor == "(Ljava/lang/String;)Ljava/lang/Class;")
+                                || (method_name == "getURLs"
+                                    && descriptor == "()[Ljava/net/URL;")
                                 || (method_name == "findResource"
                                     && descriptor == "(Ljava/lang/String;)Ljava/net/URL;")
                                 || (method_name == "findResources"
@@ -15449,6 +15488,7 @@ fn invoke_on_class_shared_inner(
                                 | "setProperty"
                                 | "put"
                                 | "putAll"
+                                | "computeIfAbsent"
                                 | "get"
                                 | "containsKey"
                                 | "stringPropertyNames"
@@ -16364,20 +16404,17 @@ fn invoke_on_class_shared_inner(
                                 | "isEnabled" | "logIfEnabled" | "logMessage"
                                 | "getName" | "getLevel" | "getMessageFactory"
                                 | "<init>"))
-                        // SB3-LOGBACK: Spring Boot's
-                        // DefaultLogbackConfiguration.apply(LoggerContext) sets
-                        // up the default logback configuration (root logger
-                        // level, console appender, pattern layout, etc.) by
-                        // entering synchronized blocks on internal LoggerContext
-                        // fields. Because we serve LoggerContext via
-                        // `alloc_concurrent_synthetic` (bypassing logback's
-                        // `<init>`), the very first `monitorenter` at pc=7
-                        // dereferences a null field and NPEs.  Force the no-op
-                        // native override (registered alongside the other
-                        // logback bridge natives in `native-builtins/src/lib.rs`)
-                        // so the bytecode never runs — logs fall back to the
-                        // JVM's default stderr handler, which is fine for
-                        // Spring Boot's bootstrap path.
+                        // SB3-LOGBACK: STALE, no native override registered
+                        // here anymore (removed 2026-07-24 — see
+                        // `register_spring_boot_logback_apply` in
+                        // `native-builtins/src/lib.rs`; the premise, a
+                        // synthetic-allocated `LoggerContext` NPEing on
+                        // `monitorenter`, no longer holds — `LoggerContext`
+                        // construction is real bytecode). This allow-list
+                        // entry is now inert (no registration exists for this
+                        // triple, so dispatch falls through to real bytecode
+                        // either way) — left as a harmless historical marker
+                        // rather than risk touching unrelated dispatch logic.
                         || (class_name
                             == "org/springframework/boot/logging/logback/DefaultLogbackConfiguration"
                             && method_name == "apply"

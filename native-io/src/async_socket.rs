@@ -54,7 +54,15 @@ use std::time::Duration;
 /// out for the duration of an op without holding the registry lock.
 pub enum AioHandle {
     Stream(Arc<Mutex<TcpStream>>),
-    Listener(Arc<Mutex<TcpListener>>),
+    // The `SocketAddr` is captured once at bind time (before the accept
+    // loop starts) so `getLocalAddress()` never has to contend for the
+    // same `Mutex` the accept worker holds for the full duration of its
+    // blocking `TcpListener::accept()` call — locking it from
+    // `aio_assc_local_address` deadlocked-in-practice (an indefinite wait
+    // whenever it landed between two accepted connections), turning
+    // Tomcat's post-bind `getLocalPort()` call into a startup hang. See
+    // the `aio_assc_local_address` doc comment.
+    Listener(Arc<Mutex<TcpListener>>, SocketAddr),
     Pending,
     Closed,
 }
@@ -1083,7 +1091,7 @@ fn handle_job(job: Job) -> Result<(), String> {
             let listener = {
                 let map = aio_registry().read();
                 match map.get(&id) {
-                    Some(AioHandle::Listener(l)) => Arc::clone(l),
+                    Some(AioHandle::Listener(l, _)) => Arc::clone(l),
                     _ => {
                         if let Some(h) = handler {
                             completion_queue().lock().push_back(Completion {
@@ -2058,11 +2066,77 @@ fn aio_assc_bind(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     let bind_text = decode_addr(ctx, sa).unwrap_or_else(|_| "0.0.0.0:0".to_string());
     let listener =
         TcpListener::bind(&bind_text).map_err(|e| ioex(format!("bind {bind_text}: {e}")))?;
-    let id = aio_register(AioHandle::Listener(Arc::new(Mutex::new(listener))));
+    let local_addr = listener
+        .local_addr()
+        .map_err(|e| ioex(format!("bind {bind_text}: local_addr: {e}")))?;
+    let id = aio_register(AioHandle::Listener(
+        Arc::new(Mutex::new(listener)),
+        local_addr,
+    ));
     if ctx.object_num_fields(this) > F_REG_ID {
         ctx.set_field(this, F_REG_ID, Value::Int(id));
     }
     Ok(Some(Value::Object(Some(this))))
+}
+
+/// `SocketAddress getLocalAddress()`. Without this, Tomcat's
+/// `Nio2Endpoint.getLocalPort()` (via
+/// `((InetSocketAddress) serverSock.getLocalAddress()).getPort()`) NPEs on
+/// the missing native — same shape as `ssc_local_address` in
+/// `socket_channel.rs`'s fix for the synchronous `ServerSocketChannel`
+/// (see its comment for the full story: real JDK bytecode expects a real
+/// `InetSocketAddress` with a populated `holder`, not a synthetic stub).
+///
+/// Reads the address captured on `AioHandle::Listener` at bind time —
+/// deliberately NOT `listener.lock().local_addr()`: the accept worker
+/// holds that same `Mutex` for the entire duration of its blocking
+/// `TcpListener::accept()` call (see `Job::Accept`), so locking it here
+/// raced the just-started accept loop and could block this call
+/// indefinitely (observed as a full-suite-timeout HANG on
+/// `TomcatServletWebServerFactoryTests.sslWithHttp11Nio2Protocol`, which
+/// calls this immediately after `start()`).
+fn aio_assc_local_address(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match obj_or_none(args, 0) {
+        Some(o) => o,
+        None => return Ok(Some(Value::Object(None))),
+    };
+    let id = match read_aio_id(ctx, this) {
+        Some(id) => id,
+        None => return Ok(Some(Value::Object(None))),
+    };
+    let addr = match aio_registry().read().get(&id) {
+        Some(AioHandle::Listener(_, addr)) => Some(*addr),
+        _ => None,
+    };
+    let addr = match addr {
+        Some(a) => a,
+        None => return Ok(Some(Value::Object(None))),
+    };
+    // Mirror `new_resolved_inet_socket_address` in `socket_channel.rs`
+    // (go through the real `InetAddress.getByName` + `InetSocketAddress
+    // (InetAddress,int)` ctor, not the `(String,int)` overload) so the
+    // resulting object's `holder` is populated the same proven way that
+    // fixed the identical `getLocalPort()` NPE for the synchronous
+    // `ServerSocketChannel`.
+    let host_str = ctx.create_string(&addr.ip().to_string());
+    if let Ok(Some(Value::Object(Some(inet_addr)))) = ctx.invoke(
+        "java/net/InetAddress",
+        "getByName",
+        "(Ljava/lang/String;)Ljava/net/InetAddress;",
+        &[Value::Object(Some(host_str))],
+    ) {
+        return ctx.new_object_initialized(
+            "java/net/InetSocketAddress",
+            "(Ljava/net/InetAddress;I)V",
+            &[Value::Object(Some(inet_addr)), Value::Int(addr.port() as i32)],
+        );
+    }
+    let host_str = ctx.create_string(&addr.ip().to_string());
+    ctx.new_object_initialized(
+        "java/net/InetSocketAddress",
+        "(Ljava/lang/String;I)V",
+        &[Value::Object(Some(host_str)), Value::Int(addr.port() as i32)],
+    )
 }
 
 fn aio_assc_accept(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -2196,11 +2270,40 @@ pub fn register_async_socket_real(r: &mut NativeMethodRegistry) {
         "(Ljava/net/SocketAddress;)Ljava/nio/channels/AsynchronousServerSocketChannel;",
         aio_assc_bind,
     );
+    // Two-arg overload (explicit `backlog` hint) — real JDK code (e.g.
+    // Tomcat's `Nio2Endpoint.bind`) calls this form. Without this
+    // registration the abstract `AsynchronousServerSocketChannel.bind(SocketAddress,int)`
+    // has no concrete override, so real-JDK-mode dispatch hits it directly
+    // and throws `AbstractMethodError: has no Code attribute` instead of
+    // ever reaching a native. `TcpListener::bind` has no backlog knob to
+    // honor (std doesn't expose one), so this reuses the same handler as
+    // the single-arg form and simply ignores the extra `int` arg — same
+    // behavior the single-arg overload already has.
+    r.register(
+        assc,
+        "bind",
+        "(Ljava/net/SocketAddress;I)Ljava/nio/channels/AsynchronousServerSocketChannel;",
+        aio_assc_bind,
+    );
     r.register(
         assc,
         "accept",
         "(Ljava/lang/Object;Ljava/nio/channels/CompletionHandler;)V",
         aio_assc_accept,
+    );
+    r.register(
+        assc,
+        "getLocalAddress",
+        "()Ljava/net/SocketAddress;",
+        aio_assc_local_address,
+    );
+    // Package-private `localAddress()` — same mirrored-alias pattern as
+    // `sc_local_address`'s registration in `socket_channel.rs`.
+    r.register(
+        assc,
+        "localAddress",
+        "()Ljava/net/SocketAddress;",
+        aio_assc_local_address,
     );
 
     // -- AsynchronousChannelGroup --

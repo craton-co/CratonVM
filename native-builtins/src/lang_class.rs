@@ -1675,7 +1675,9 @@ fn dbg_is_entity_name(n: &str) -> bool {
     n.contains("orm/test/cache/") || n.contains("orm.test.cache.")
 }
 
-pub(crate) fn class_for_name_one_arg_caller_loader(ctx: &mut dyn NativeContext) -> Option<ObjectRef> {
+pub(crate) fn class_for_name_one_arg_caller_loader(
+    ctx: &mut dyn NativeContext,
+) -> Option<ObjectRef> {
     for caller_cid in ctx.frame_class_ids() {
         if matches!(
             ctx.class_name_of_id(caller_cid).as_deref(),
@@ -1951,6 +1953,21 @@ pub(crate) fn native_class_for_name(
                     "[S111-DBG] loadClass({}) succeeded via invoke_virtual",
                     dotted_name
                 );
+                if s111_dbg_enabled()
+                    && (dotted_name.contains("ConditionalOnMissingBean")
+                        || dotted_name.contains("DataSourceAutoConfiguration$PooledDataSourceConfiguration"))
+                {
+                    if let Value::Object(Some(mirror_ref)) = mirror {
+                        let cid = ctx.class_id_from_mirror(mirror_ref);
+                        let defining_loader = cid.and_then(|id| {
+                            crate::classloader::defining_loader_for(id.as_u32())
+                        });
+                        eprintln!(
+                            "[S111-DBG] loadClass({}) mirror={:?} cid={:?} defining_loader={:?}",
+                            dotted_name, mirror_ref, cid, defining_loader
+                        );
+                    }
+                }
                 // Root-cause-2 fix (WildFly parallel-extension-add CCE family,
                 // docs/known-issues/wildfly-remoting-classcastexception-
                 // parallel-extension-add.md): `mirror` -- the `Class` object
@@ -3418,7 +3435,10 @@ pub(crate) fn descriptor_to_class_mirror(
 /// `ClassId(0)` / java.lang.Object).  Otherwise `invokevirtual Class.isArray`
 /// on the returned mirror walks up Object's superclass chain and raises
 /// `NoSuchMethodError: java/lang/Object.isArray()Z`.
-pub(crate) fn synthetic_class_mirror(ctx: &mut dyn NativeContext, name: &str) -> cratonvm_types::ObjectRef {
+pub(crate) fn synthetic_class_mirror(
+    ctx: &mut dyn NativeContext,
+    name: &str,
+) -> cratonvm_types::ObjectRef {
     // Resolve java/lang/Class вЂ” ensure it's loaded so we get its real ClassId.
     let class_class_id = ctx
         .ensure_class_initialized("java/lang/Class")
@@ -7690,6 +7710,19 @@ pub(crate) fn native_class_get_declared_methods(
         };
 
         let methods = declared_methods_with_synthetic(ctx, class_id);
+        if std::env::var_os("CRATONVM_DBG_OBSREG").is_some() {
+            let __cname = ctx.class_name_of_id(class_id).unwrap_or_default();
+            if __cname.contains("SecurityFilterAutoConfigurationEarlyInitializationTests")
+                || __cname.contains("PathRequestTests")
+                || __cname.contains("ManagementWebSecurityAutoConfigurationTests")
+            {
+                eprintln!(
+                    "[OBSREG-DBG] getDeclaredMethods class={__cname} class_id={class_id:?} count={} names={:?}",
+                    methods.len(),
+                    methods.iter().map(|m| format!("{}{}", m.name, m.descriptor)).collect::<Vec<_>>()
+                );
+            }
+        }
         // `getDeclaredMethods0(boolean publicOnly)` вЂ” the real JDK calls this
         // with publicOnly=true on the `Class.getMethods()` / `getMethod()` path
         // (`privateGetPublicMethods`) and TRUSTS it to return only PUBLIC
@@ -7796,7 +7829,6 @@ pub(crate) fn native_class_get_declared_methods(
             }
             visible = reordered;
         }
-
 
         // GC-safe: `create_method_object` allocates (see `build_mirror_array`).
         let method_component = reflection_component_id(ctx, "java/lang/reflect/Method");
@@ -9335,7 +9367,9 @@ pub(crate) fn native_class_get_field(
 
     if std::env::var_os("CRATONVM_DBG_FBCGLIB").is_some() && target_name.starts_with("CGLIB$") {
         let cname = ctx.class_name_of_id(class_id);
-        eprintln!("[FBCGLIB-DBG] Class.getField({target_name}) on class_id={class_id:?} name={cname:?}");
+        eprintln!(
+            "[FBCGLIB-DBG] Class.getField({target_name}) on class_id={class_id:?} name={cname:?}"
+        );
     }
 
     // Round 9 audit fix (HIGH #7): probe the LinkResolver for the
@@ -10205,7 +10239,7 @@ fn cached_annotation_proxy_for_key(
             }
         );
     }
-    let proxy = create_annotation_proxy(ctx, ann, container_loader);
+    let proxy = create_annotation_proxy(ctx, ann, Some(holder_class_id), container_loader);
     let mut guard = annotation_proxy_cache()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -10971,6 +11005,7 @@ fn resolve_annotation_class_via_loader(
 fn create_annotation_proxy(
     ctx: &mut dyn NativeContext,
     ann: &cratonvm_native_api::AnnotationData,
+    container_class_id: Option<ClassId>,
     container_loader: Option<ObjectRef>,
 ) -> ObjectRef {
     let mut proxy = alloc_concurrent_synthetic(
@@ -11015,7 +11050,17 @@ fn create_annotation_proxy(
                 Err(_) => None,
             }
         });
-        let cid_mirror = via_loader.or_else(|| {
+        // App-loader classes do not have an ObjectRef recorded in
+        // `defining_loader_for`, but they still carry a loader id in the class
+        // manager. Prefer that namespace before the flat global index: once an
+        // isolated Spring test has loaded a child copy of `OnBeanCondition`, a
+        // global lookup can otherwise make an annotation on an app-loader
+        // configuration class instantiate the child condition class.
+        let via_container_scope = container_class_id.and_then(|holder| {
+            ctx.class_id_by_name_near(class_name, holder)
+                .map(|cid| (cid, ctx.get_class_mirror(cid)))
+        });
+        let cid_mirror = via_loader.or(via_container_scope).or_else(|| {
             let cid = ctx.class_id_by_name(class_name).or_else(|| {
                 // load_class returns the mirror; we only need the ClassId, so just
                 // trigger the load and re-query by name.
@@ -11123,7 +11168,13 @@ fn create_annotation_proxy(
         names_arr = ctx.read_native_pin(names_pin, names_arr);
         ctx.set_array_element(names_arr, i, Value::Object(Some(name_str)));
         let java_val =
-            annotation_element_to_java_typed(ctx, val, ret_desc.as_deref(), container_loader);
+            annotation_element_to_java_typed(
+                ctx,
+                val,
+                ret_desc.as_deref(),
+                container_class_id,
+                container_loader,
+            );
         if std::env::var("CRATONVM_IAE_TRACE2").is_ok() {
             let desc = match &java_val {
                 Value::Object(Some(o)) => {
@@ -11199,7 +11250,7 @@ pub(crate) fn annotation_element_to_java(
     ctx: &mut dyn NativeContext,
     val: &cratonvm_native_api::AnnotationElementValue,
 ) -> Value {
-    annotation_element_to_java_typed(ctx, val, None, None)
+    annotation_element_to_java_typed(ctx, val, None, None, None)
 }
 
 /// Preserve the declared array shape when the class-file annotation reader
@@ -11253,6 +11304,7 @@ pub(crate) fn annotation_element_to_java_typed(
     ctx: &mut dyn NativeContext,
     val: &cratonvm_native_api::AnnotationElementValue,
     return_type_desc: Option<&str>,
+    container_class_id: Option<ClassId>,
     container_loader: Option<ObjectRef>,
 ) -> Value {
     use cratonvm_native_api::AnnotationElementValue;
@@ -11441,7 +11493,9 @@ pub(crate) fn annotation_element_to_java_typed(
                         }
                     }
                 }
-                if let Some(cid) = ctx.class_id_by_name(class_name) {
+                let scoped = container_class_id
+                    .and_then(|holder| ctx.class_id_by_name_near(class_name, holder));
+                if let Some(cid) = scoped.or_else(|| ctx.class_id_by_name(class_name)) {
                     let mirror = ctx.get_class_mirror(cid);
                     if iae_trace_cls {
                         eprintln!("ANN-CLASS desc={desc} class={class_name} already-loaded ok");
@@ -11506,7 +11560,7 @@ pub(crate) fn annotation_element_to_java_typed(
             Value::Object(Some(descriptor_to_class_mirror(ctx, desc)))
         }
         AnnotationElementValue::Annotation(nested) => {
-            let proxy = create_annotation_proxy(ctx, nested, container_loader);
+            let proxy = create_annotation_proxy(ctx, nested, container_class_id, container_loader);
             normalize_single_annotation_array(ctx, Value::Object(Some(proxy)), return_type_desc)
         }
         AnnotationElementValue::Array(elems) => {
@@ -11734,6 +11788,7 @@ pub(crate) fn annotation_element_to_java_typed(
                     ctx,
                     elem,
                     elem_desc.as_deref(),
+                    container_class_id,
                     container_loader,
                 );
                 arr = ctx.read_native_pin(arr_pin, arr);
@@ -11901,7 +11956,7 @@ fn build_annotation_array_for(
         declaring_class_id.and_then(|cid| crate::classloader::defining_loader_for(cid.as_u32()));
     // GC-safe: `create_annotation_proxy` allocates (see `build_mirror_array`).
     build_mirror_array_comp(ctx, comp, resolvable.len(), |ctx, i| {
-        create_annotation_proxy(ctx, resolvable[i], container_loader)
+        create_annotation_proxy(ctx, resolvable[i], declaring_class_id, container_loader)
     })
 }
 
@@ -12357,7 +12412,7 @@ fn class_annotations_by_type_impl(
     // GC-safe: `create_annotation_proxy` allocates (see `build_mirror_array`).
     let container_loader = crate::classloader::defining_loader_for(class_id.as_u32());
     let arr = build_mirror_array(ctx, matching.len(), |ctx, i| {
-        create_annotation_proxy(ctx, &matching[i], container_loader)
+        create_annotation_proxy(ctx, &matching[i], Some(class_id), container_loader)
     });
     Ok(Some(Value::Object(Some(arr))))
 }
@@ -12433,7 +12488,7 @@ pub(crate) fn native_method_get_annotations_by_type(
     // GC-safe: `create_annotation_proxy` allocates (see `build_mirror_array`).
     let container_loader = crate::classloader::defining_loader_for(class_id.as_u32());
     let arr = build_mirror_array(ctx, matching.len(), |ctx, i| {
-        create_annotation_proxy(ctx, &matching[i], container_loader)
+        create_annotation_proxy(ctx, &matching[i], Some(class_id), container_loader)
     });
     Ok(Some(Value::Object(Some(arr))))
 }
@@ -12596,7 +12651,7 @@ pub(crate) fn native_field_get_annotation(
     let container_loader = crate::classloader::defining_loader_for(class_id.as_u32());
     for ann in &annotations {
         if ann.type_descriptor == target_desc {
-            let proxy = create_annotation_proxy(ctx, ann, container_loader);
+            let proxy = create_annotation_proxy(ctx, ann, Some(class_id), container_loader);
             return Ok(Some(Value::Object(Some(proxy))));
         }
     }
@@ -12646,13 +12701,8 @@ pub(crate) fn native_method_get_annotations(
             }
         }
     }
-    let arr = build_method_annotation_array(
-        ctx,
-        class_id,
-        &method_name,
-        &method_desc,
-        &annotations,
-    );
+    let arr =
+        build_method_annotation_array(ctx, class_id, &method_name, &method_desc, &annotations);
     Ok(Some(Value::Object(Some(arr))))
 }
 
@@ -12739,13 +12789,8 @@ pub(crate) fn native_method_get_annotation(
     }
     for ann in &annotations {
         if ann.type_descriptor == target_desc {
-            let proxy = cached_method_annotation_proxy(
-                ctx,
-                class_id,
-                &method_name,
-                &method_desc,
-                ann,
-            );
+            let proxy =
+                cached_method_annotation_proxy(ctx, class_id, &method_name, &method_desc, ann);
             return Ok(Some(Value::Object(Some(proxy))));
         }
     }
@@ -13327,9 +13372,9 @@ pub(crate) fn native_class_get_generic_interfaces(
                         host_id
                             .map(|host_id| ctx.get_class_mirror(host_id))
                             .map(|host_mirror| {
-                            crate::generics::GenericDeclScope::new(Value::Object(Some(
-                                host_mirror,
-                            )))
+                                crate::generics::GenericDeclScope::new(Value::Object(Some(
+                                    host_mirror,
+                                )))
                             });
                     let val = crate::generics::typesig_to_real_type(ctx, &sig);
                     if dbg_lg {
@@ -14656,12 +14701,11 @@ pub(crate) fn native_class_get_package(
 // propagates up as `IllegalStateException: Failed to create invoker for
 // Invoker` -- the canonical I2 blocker for ByteBuddy + Mockito.
 //
-// Fix: register our own native bodies for the three methods below so they
-// short-circuit before touching the null `packages` field. They mirror the
-// `cl_get_defined_package` synthetic-mode native (returns null) and the
-// `native_class_get_package` synthetic Package builder so that
-// `postDefineClass` and `Class.getPackage()` keep working without depending
-// on `packages` being non-null.
+// Fix: register native bodies for the three methods below so they avoid the
+// null `packages` field. `getDefinedPackage` derives a conservative answer
+// from classpath-visible class files; the package builders synthesize the
+// JDK object shape so `postDefineClass` and `Class.getPackage()` keep working
+// without depending on `packages` being non-null.
 
 /// `ClassLoader.getDefinedPackage(String name) -> Package` вЂ” returns null
 /// (no package is defined on this classloader). JDK semantics: returning
@@ -14669,10 +14713,30 @@ pub(crate) fn native_class_get_package(
 /// package by that name. ByteBuddy's `Resolver$ForModuleSystem.accept`
 /// already null-checks the result, so returning null is a clean exit.
 pub(crate) fn i2_classloader_get_defined_package(
-    _ctx: &mut dyn NativeContext,
-    _args: &[Value],
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
 ) -> MethodCallResult {
-    Ok(Some(Value::Object(None)))
+    // Avoid the real-JDK `ClassLoader.packages` map: it can be uninitialised
+    // for a user-created loader.  Returning null unconditionally, however,
+    // violates the application loader's contract. Spring Boot uses this
+    // probe to distinguish a package directory from an XML resource.
+    let package_name = match args.get(1) {
+        Some(Value::Object(Some(name))) => ctx.read_string(*name).unwrap_or_default(),
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    if package_name.is_empty() || package_name.contains('/') {
+        return Ok(Some(Value::Object(None)));
+    }
+
+    // A class file immediately below the package path is a conservative,
+    // classpath-backed proof that the package exists. It avoids synthesising
+    // packages for arbitrary names or resource-only directories.
+    let class_glob = format!("{}/*.class", package_name.replace('.', "/"));
+    if ctx.find_all_resource_urls(&class_glob).is_empty() {
+        return Ok(Some(Value::Object(None)));
+    }
+    let package = i2_alloc_synthetic_package(ctx, &package_name);
+    Ok(Some(Value::Object(Some(package))))
 }
 
 /// `ClassLoader.getDefinedPackages() -> Package[]` вЂ” returns an empty array.
@@ -15882,7 +15946,13 @@ pub(crate) fn native_class_get_declared_classes(
         // downstream that reads their annotations/enum constants (e.g. a
         // `@Conditional` enum attribute compared by `==` against a value
         // resolved through the forked loader elsewhere).
-        let inner_id = match ctx.class_id_by_name_near(inner_class, class_id) {
+        let loader_id = ctx.loader_id_of_class(class_id);
+        let exact_inner = if loader_id >= 3 {
+            ctx.class_id_defined_by_loader_exact(inner_class, loader_id as u32)
+        } else {
+            None
+        };
+        let inner_id = match exact_inner {
             Some(id) => Some(id),
             None => {
                 // Not already loaded under the outer class's own loader.
@@ -15899,27 +15969,53 @@ pub(crate) fn native_class_get_declared_classes(
                 // `forkedLoader.loadClass("...NestedConfig")` directly)
                 // falls straight to the global lookup and silently returns
                 // the FIRST same-named class some other loader registered.
-                let driven = crate::classloader::defining_loader_for(class_id.as_u32()).and_then(
-                    |loader_obj| {
-                        let dotted = inner_class.replace('/', ".");
-                        let name_obj = ctx.create_string(&dotted);
-                        match ctx.invoke_virtual(
-                            loader_obj,
-                            "loadClass",
-                            "(Ljava/lang/String;)Ljava/lang/Class;",
-                            &[Value::Object(Some(name_obj))],
-                        ) {
-                            Ok(Some(Value::Object(Some(mirror)))) => mirror_class_id(ctx, mirror),
-                            _ => None,
-                        }
-                    },
-                );
+                //
+                // `defining_loader_for` is narrowly populated (only the ~4
+                // explicit `register_defining_loader` call sites write it),
+                // so a class defined via the ordinary isolated-`URLClassLoader`
+                // native path (`ucl_try_define_local_class`) can have a
+                // perfectly good `UserDefined` namespace id in `class_manager`
+                // (readable via `loader_id_of_class`) while still missing
+                // from that side table. Fall back to the namespace-id-keyed
+                // reverse lookup (`loader_object_for_namespace_id`, backed by
+                // the SAME object-keyed store `loader_namespace_id` itself
+                // writes) before giving up on driving the loader directly —
+                // this is exactly the scenario a JUnit5 `@Nested` class run
+                // under Spring Boot's `ModifiedClassPathClassLoader` fork
+                // hits: `getDeclaredClasses()` is called on a freshly
+                // isolated outer `Class` whose defining loader was never
+                // separately registered.
+                let loader_obj = crate::classloader::defining_loader_for(class_id.as_u32())
+                    .or_else(|| {
+                        let ns_id = ctx.loader_id_of_class(class_id);
+                        (ns_id >= 3)
+                            .then(|| crate::classloader::loader_object_for_namespace_id(ns_id as u32))
+                            .flatten()
+                    });
+                let driven = loader_obj.and_then(|loader_obj| {
+                    let dotted = inner_class.replace('/', ".");
+                    let name_obj = ctx.create_string(&dotted);
+                    match ctx.invoke_virtual(
+                        loader_obj,
+                        "loadClass",
+                        "(Ljava/lang/String;)Ljava/lang/Class;",
+                        &[Value::Object(Some(name_obj))],
+                    ) {
+                        Ok(Some(Value::Object(Some(mirror)))) => mirror_class_id(ctx, mirror),
+                        _ => None,
+                    }
+                });
                 match driven {
                     Some(id) => Some(id),
-                    None => match ctx.load_class(inner_class) {
-                        Ok(_) => ctx.class_id_by_name_near(inner_class, class_id),
-                        Err(_) => None,
-                    },
+                    None => ctx.class_id_by_name_near(inner_class, class_id).or_else(|| {
+                        ctx.load_class(inner_class)
+                            .ok()
+                            .flatten()
+                            .and_then(|value| match value {
+                                Value::Object(Some(mirror)) => mirror_class_id(ctx, mirror),
+                                _ => None,
+                            })
+                    }),
                 }
             }
         };
@@ -16780,13 +16876,13 @@ pub(crate) fn native_executable_get_annotated_parameter_types(
     let this = obj_arg(args, 0)?;
     let (declaring_class_id, per_param, per_param_type_args, count) =
         match method_class_name_desc(ctx, this) {
-        Some((cid, name, desc)) => {
-            let pta = ctx.method_parameter_type_annotations(cid, &name, &desc);
-            let pta_args = ctx.method_parameter_type_argument_annotations(cid, &name, &desc);
-            (Some(cid), pta, pta_args, count_method_params(&desc))
-        }
-        None => (None, Vec::new(), Vec::new(), 0),
-    };
+            Some((cid, name, desc)) => {
+                let pta = ctx.method_parameter_type_annotations(cid, &name, &desc);
+                let pta_args = ctx.method_parameter_type_argument_annotations(cid, &name, &desc);
+                (Some(cid), pta, pta_args, count_method_params(&desc))
+            }
+            None => (None, Vec::new(), Vec::new(), 0),
+        };
     // Resolve the erased parameter type mirrors once (fallback + length
     // reference for the generic array below).
     let erased_type_mirrors: Vec<ObjectRef> =
@@ -19579,7 +19675,7 @@ Implementation-Title: opensaml-core-api\r\n\
 
         assert_eq!(
             manifest_attr_for_package(&attrs, Some("org/opensaml/core/"), "Implementation-Version")
-            .as_deref(),
+                .as_deref(),
             Some("5.2.1")
         );
         assert_eq!(

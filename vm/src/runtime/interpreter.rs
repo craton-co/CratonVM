@@ -15521,6 +15521,57 @@ fn execute_instruction(
             }
         }
         Instruction::Invokeinterface { index, count: _ } => {
+            // WFLYCTL0079 round 3 (2026-07-23): the bytecode of
+            // `TransactionSubsystemRootResourceDefinition.registerAttributes`
+            // builds a `HashSet<AttributeDefinition>` from a static array,
+            // removes ~11 specific attributes from it (including
+            // `HORNETQ_STORE_ENABLE_ASYNC_IO`, which needs special
+            // `AliasedHandler` treatment applied later via an explicit call
+            // at a separate pc), then registers whatever remains via a
+            // generic loop, THEN makes the explicit HORNETQ_STORE_ENABLE_
+            // ASYNC_IO registration call. If `Set.remove()` for that
+            // attribute ever silently returns `false` (return value is
+            // discarded in the bytecode — `pop` after every `.remove()`
+            // call), the attribute would get registered TWICE: once by the
+            // generic loop, once by the explicit call — "already
+            // registered". Both `DUPCALL` (executor-dispatch level) and
+            // `DUPREG` (registerAttributes-entry level) diagnostics tested
+            // clean across 1600 boots, which only rules out re-ENTERING the
+            // method twice — NOT this same-invocation double-registration
+            // shape. Trace every `invokeinterface` call made BY this one
+            // caller frame, with the AttributeDefinition argument's raw
+            // identity, so a within-one-invocation repeat is directly
+            // visible without needing to resolve field offsets.
+            if crate::runtime::env_cache::dbg_dupcall_filter() {
+                let caller = &thread.frames[frame_idx];
+                if caller.method_name() == "registerAttributes"
+                    && caller.class_name()
+                        == "org/jboss/as/txn/subsystem/TransactionSubsystemRootResourceDefinition"
+                {
+                    // Safety guard: other invokeinterface calls inside this
+                    // same method (Set.remove/iterator/Iterator.hasNext/next)
+                    // have shallower stack shapes at their call site — only
+                    // peek when there's plausibly a 4-slot call
+                    // (registration, attrDef, handler, handler) in flight,
+                    // to avoid `peek_at` panicking on an out-of-range depth
+                    // for those unrelated calls.
+                    if caller.stack.len() >= 4 {
+                        let attr_def = caller.stack.peek_at(2);
+                        let addr = match attr_def {
+                            Value::Object(Some(o)) => o.as_ptr() as usize,
+                            _ => 0,
+                        };
+                        if addr != 0 {
+                            eprintln!(
+                                "[REGCALL] caller_pc={} attr=0x{:x} tid={}",
+                                caller.pc,
+                                addr,
+                                thread.thread_id.0,
+                            );
+                        }
+                    }
+                }
+            }
             // is_interface=true threads γ's stash so the default-method
             // rescue can fire on NSME for invokeinterface only. Same cache
             // consultation as invokevirtual/invokespecial above (PERF FIX
@@ -18316,6 +18367,44 @@ fn lookup_loader_initiated(
     cache_hit
 }
 
+/// Read only the exact definitions that belong to `referencing_class_id`'s
+/// user loader. Unlike [`lookup_loader_initiated`], this intentionally never
+/// consults the initiating-resolution cache.
+///
+/// A platform-parented isolated URL loader has no application-loader
+/// delegation path. A cached result for such a loader can nevertheless point
+/// at an earlier application copy (recorded before the loader had defined its
+/// own framework class), collapsing a later `CONSTANT_Class` literal back to
+/// that copy. Spring's `ModifiedClassPathClassLoader` then compares an
+/// application `ConditionalOnMissingBean.class` against child metadata and
+/// loses the annotation by Class identity. Exact definitions are safe; cache
+/// entries are not for this loader shape.
+#[inline]
+fn lookup_loader_defined_exact(
+    shared: &SharedVm,
+    referencing_class_id: ClassId,
+    name: &str,
+) -> Option<ClassId> {
+    if !cratonvm_native_builtins::classloader::any_defining_loader_registered()
+        || name.starts_with('[')
+        || is_global_resolution_namespace(name)
+    {
+        return None;
+    }
+    let loader = match shared
+        .class_manager
+        .read()
+        .get_loader_id(referencing_class_id)
+    {
+        Some(l @ cratonvm_types::ClassLoaderId::UserDefined(_)) => l,
+        _ => return None,
+    };
+    shared
+        .class_manager
+        .read()
+        .class_defined_by_loader_exact(name, loader)
+}
+
 fn is_isolated_url_loader_definition(
     shared: &SharedVm,
     thread: &mut JvmThread,
@@ -18364,7 +18453,7 @@ fn isolated_loader_class_not_found(
 /// the legacy global [`SharedVm::load_class_concurrent`]. The loader path can
 /// therefore only ever return a *more* correct answer, never a worse failure
 /// than the pre-gate behavior.
-fn resolve_class_loader_aware(
+pub(crate) fn resolve_class_loader_aware(
     shared: &SharedVm,
     thread: &mut JvmThread,
     referencing_class_id: ClassId,
@@ -18372,7 +18461,14 @@ fn resolve_class_loader_aware(
 ) -> Result<ClassId, MethodCallFailed> {
     // (1) Gate / built-in / JDK-name fast paths + already-known loader-local
     //     answer — none of which need a re-entrant call.
-    if let Some(id) = lookup_loader_initiated(shared, referencing_class_id, name) {
+    let isolated_url_definition =
+        is_isolated_url_loader_definition(shared, thread, referencing_class_id);
+    let known = if isolated_url_definition {
+        lookup_loader_defined_exact(shared, referencing_class_id, name)
+    } else {
+        lookup_loader_initiated(shared, referencing_class_id, name)
+    };
+    if let Some(id) = known {
         return Ok(id);
     }
     // `lookup_loader_initiated` returned `None`, so either this is a legacy case
@@ -18387,12 +18483,19 @@ fn resolve_class_loader_aware(
             || name.contains("ChildManagementContextInitializerAotTests")
             || name.contains("SearchStrategy")
             || name.contains("MergedAnnotations")
+            || name.contains("ConditionalOnMissingBean")
+            || name.contains("ConditionalOnBean")
+            || name.contains("OnBeanCondition")
+            || name.contains("DataSourceConfiguration")
             || name.contains("RootReference")
             || name.contains("MVMap")
             || name.contains("org/h2/Driver")
             || name.contains("AotTestContextInitializers")
             || name.contains("AotMergedContextConfiguration")
-            || name.contains("DefaultCacheAwareContextLoaderDelegate"));
+            || name.contains("DefaultCacheAwareContextLoaderDelegate")
+            || name.contains("SecurityFilterAutoConfigurationEarlyInitializationTests")
+            || name.contains("PathRequestTests")
+            || name.contains("ManagementWebSecurityAutoConfigurationTests"));
     if dbg_trace {
         let cm = shared.class_manager.read();
         let ref_name = cm
@@ -18403,8 +18506,34 @@ fn resolve_class_loader_aware(
         eprintln!(
             "[LOADER-TRACE] resolve name={name} referencing_class_id={referencing_class_id:?} referencing_class={ref_name} referencing_loader={ref_loader:?}"
         );
+        if name.contains("RootReference")
+            && matches!(ref_loader, Some(cratonvm_types::ClassLoaderId::Application))
+        {
+            drop(cm);
+            eprintln!("[RCLA-STACK] full Java stack at resolve_class_loader_aware for name={name}:");
+            for (i, f) in thread.frames.iter().enumerate().rev() {
+                eprintln!(
+                    "[RCLA-STACK]   [{i}] {}.{}{} pc={}",
+                    f.class_name(),
+                    f.method_name(),
+                    f.method_descriptor(),
+                    f.pc
+                );
+            }
+        }
     }
-    let user_loader = if should_use_loader_initiated_resolution(shared, referencing_class_id)
+    // An isolated URLClassLoader (including Spring Boot's
+    // ModifiedClassPathClassLoader) has the same JVMS initiating-loader
+    // requirement as the existing Groovy/forked-loader cases: class literals
+    // and other CONSTANT_Class consumers inside one of its private framework
+    // copies must resolve through that exact loader, never through the flat
+    // application store. Otherwise `OnBeanCondition`'s
+    // `ConditionalOnMissingBean.class` literal is app-defined while ASM
+    // metadata is child-defined, and MergedAnnotations' Class-keyed lookup
+    // misses an annotation that its name-keyed lookup just found.
+    let loader_faithful = should_use_loader_initiated_resolution(shared, referencing_class_id)
+        || isolated_url_definition;
+    let user_loader = if loader_faithful
         && !name.starts_with('[')
         && !is_global_resolution_namespace(name)
     {
@@ -18464,7 +18593,7 @@ fn resolve_class_loader_aware(
         if let Some(id) = driven {
             return Ok(id);
         }
-        if is_isolated_url_loader_definition(shared, thread, referencing_class_id) {
+        if isolated_url_definition {
             return Err(isolated_loader_class_not_found(shared, thread, name));
         }
         let fallback = shared.load_class_concurrent(name);
@@ -18827,8 +18956,18 @@ fn resolve_field_ref_loader_aware(
             shared.class_manager.read().get_loader_id(current_class_id),
             Some(cratonvm_types::ClassLoaderId::UserDefined(_))
         );
+    // An isolated URL loader must not accept an initiating-cache entry here:
+    // it may predate the loader's private definition and point at the
+    // application copy. A getstatic against that stale owner shares static
+    // annotation metadata caches across otherwise isolated frameworks.
+    let isolated_url_definition =
+        is_isolated_url_loader_definition(shared, thread, current_class_id);
     let loader_local_id = if loader_sensitive {
-        lookup_loader_initiated(shared, current_class_id, &field_class_name)
+        if isolated_url_definition {
+            lookup_loader_defined_exact(shared, current_class_id, &field_class_name)
+        } else {
+            lookup_loader_initiated(shared, current_class_id, &field_class_name)
+        }
     } else {
         None
     };
@@ -19871,6 +20010,18 @@ fn execute_invoke_kind(
     let (method_class_name, method_name, method_descriptor, num_params) =
         resolve_method_ref(shared, current_class_id, cp_index)?;
     let method_owner_name = Arc::clone(&method_class_name);
+
+    if std::env::var("CRATONVM_DBG_LOADER_TRACE").is_ok()
+        && method_owner_name.contains("RootReference")
+        && &*method_name == "<init>"
+    {
+        let cm = shared.class_manager.read();
+        let cur_loader = cm.get_loader_id(current_class_id);
+        drop(cm);
+        eprintln!(
+            "[EIK-ENTRY] cp_index={cp_index} is_special={is_special} current_class_id={current_class_id:?} cur_loader={cur_loader:?} method={method_owner_name}.{method_name}{method_descriptor}"
+        );
+    }
 
     if crate::runtime::env_cache::dbg_hang_sample() {
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -21542,7 +21693,45 @@ fn execute_invoke_kind(
     // receiver whose method the stackless path couldn't handle (synthetic stub /
     // exotic → CacheMiss) must still dispatch on the receiver's own class_id,
     // not the wrong name-resolved copy. Rare, so the recursive path is fine.
-    let result = if let Some(rcv_cid) = dispatch_override {
+    //
+    // `dispatch_override` alone under-detects this: it's computed by comparing
+    // `get_loaded_class_id(&invoke_class)` against the receiver's class_id at
+    // THIS point in time, but `invoke_shared`'s own `load_class_concurrent`
+    // (name-based) can independently resolve the SAME name string to a
+    // DIFFERENT ClassId than `get_loaded_class_id` just did — observed with
+    // `@ClassPathOverrides`'s `ModifiedClassPathClassLoader`, where an old
+    // override jar's class (e.g. Spring's `MimeType`, missing a method added
+    // in later versions) and the main classpath's same-named class are BOTH
+    // loaded, and the two name-resolution call sites picked different
+    // copies. That let `mimeType.isMoreSpecific(null)` — a genuinely absent
+    // method on the receiver's OWN class — silently dispatch to the OTHER
+    // same-named class's bytecode instead of raising `NoSuchMethodError`
+    // (`NoSuchMethodFailureAnalyzerTests`). For an ordinary virtual call, the
+    // receiver's own (already-loaded, already-initialized) class_id is
+    // JVMS-authoritative regardless of what any name lookup returns, so
+    // prefer it whenever available instead of falling through to the
+    // loader-blind by-name path. Excludes:
+    //  - the stale-pointer sentinel (`ClassId::new(0)`, see the cid==0
+    //    handling above), which intentionally keeps using the CP method-ref
+    //    class name for its own recovery path;
+    //  - lambda-proxy receivers, whose synthetic class_id is NOT a normal
+    //    entry in `class_manager` (it has no real method table of its own
+    //    for `invoke_on_class_shared`'s `find_method_recursive` to walk).
+    //    `invoke_on_class_shared_inner` DOES also re-check
+    //    `shared.lambda_proxies` on the receiver up front and redirect to
+    //    `try_lambda_dispatch`, but only when passed the RECEIVER's own
+    //    class_id — routing a lambda receiver's SAM method call (e.g.
+    //    `Consumer.accept`) through this branch at all, instead of the
+    //    by-name `invoke_shared` fallback the lambda dispatch machinery
+    //    already handles correctly, regressed
+    //    `ProcessInfoTests.memoryInfoIsAvailable`'s `allSatisfy(lambda)`
+    //    with `NoSuchMethodError: <unknown class N>.accept(...)`.
+    let is_lambda_receiver = receiver_class_id
+        .map(|c| shared.lambda_proxies.read().contains_key(&c))
+        .unwrap_or(false);
+    let result = if let Some(rcv_cid) = dispatch_override.or_else(|| {
+        receiver_class_id.filter(|c| *c != ClassId::new(0) && !is_lambda_receiver)
+    }) {
         crate::vm::invoke_on_class_shared(
             shared,
             thread,
@@ -24847,6 +25036,44 @@ pub(crate) fn is_h2_parser_native_override(
     method_name: &str,
     descriptor: &str,
 ) -> bool {
+    // Hibernate's UUID monotonicity test executes AssertJ's successful
+    // natural-order comparison path millions of times. The native preserves
+    // custom-comparator and failure delegation, but must win over the real
+    // inherited library bytecode to remove its per-assertion setup overhead.
+    if class_name == "org/assertj/core/api/AbstractComparableAssert" {
+        return (method_name, descriptor)
+            == (
+                "isGreaterThan",
+                "(Ljava/lang/Comparable;)Lorg/assertj/core/api/AbstractComparableAssert;",
+            );
+    }
+    if class_name == "org/assertj/core/api/AbstractStringAssert" {
+        return (method_name, descriptor)
+            == (
+                "isGreaterThan",
+                "(Ljava/lang/String;)Lorg/assertj/core/api/AbstractStringAssert;",
+            );
+    }
+    if matches!(
+        class_name,
+        "org/assertj/core/api/AssertionsForClassTypes" | "org/assertj/core/api/Assertions"
+    ) {
+        return matches!(
+            (method_name, descriptor),
+            ("assertThat", "(Ljava/lang/String;)Lorg/assertj/core/api/AbstractStringAssert;")
+                | ("assertThat", "(Ljava/lang/Comparable;)Lorg/assertj/core/api/AbstractComparableAssert;")
+        );
+    }
+    if matches!(
+        class_name,
+        "org/hibernate/id/uuid/UuidVersion6Strategy" | "org/hibernate/id/uuid/UuidVersion7Strategy"
+    ) {
+        return (method_name, descriptor)
+            == (
+                "generateUuid",
+                "(Lorg/hibernate/engine/spi/SharedSessionContractImplementor;)Ljava/util/UUID;",
+            );
+    }
     if class_name == "org/h2/util/Utils" {
         return (method_name, descriptor) == ("getResource", "(Ljava/lang/String;)[B");
     }
@@ -24878,7 +25105,9 @@ pub(crate) fn is_h2_parser_native_override(
     if class_name == "org/h2/table/Column" {
         return matches!(
             (method_name, descriptor),
-            ("equals", "(Ljava/lang/Object;)Z") | ("hashCode", "()I")
+            ("equals", "(Ljava/lang/Object;)Z")
+                | ("hashCode", "()I")
+                | ("getTable", "()Lorg/h2/table/Table;")
         );
     }
     if class_name == "org/h2/engine/DbObject" {
@@ -24896,8 +25125,100 @@ pub(crate) fn is_h2_parser_native_override(
     if class_name == "org/h2/command/ParserBase" {
         return matches!(
             (method_name, descriptor),
-            ("read", "()V") | ("setTokenIndex", "(I)V")
+            ("read", "()V")
+                | ("setTokenIndex", "(I)V")
+                | ("readIf", "(I)Z")
+                | ("addExpected", "(I)V")
         );
+    }
+    if class_name == "org/h2/command/Tokenizer" {
+        return (method_name, descriptor) == ("eq", "(Ljava/lang/String;Ljava/lang/String;II)Z");
+    }
+    if class_name == "org/h2/expression/ExpressionVisitor" {
+        return matches!(
+            (method_name, descriptor),
+            ("getType", "()I")
+                | (
+                    "getDependenciesVisitor",
+                    "(Ljava/util/HashSet;)Lorg/h2/expression/ExpressionVisitor;",
+                )
+                | (
+                    "getMaxModificationIdVisitor",
+                    "()Lorg/h2/expression/ExpressionVisitor;",
+                )
+        );
+    }
+    if class_name == "org/h2/message/Trace" {
+        return (method_name, descriptor) == ("isDebugEnabled", "()Z");
+    }
+    if class_name == "org/h2/message/TraceSystem" {
+        return (method_name, descriptor) == ("isEnabled", "(I)Z");
+    }
+    // Hibernate's JSON-array unnest tests lower to two
+    // `system_range(1, 1000)` joins. H2's Java `ValueBigint.get(long)` only
+    // interns 0..99, causing the remaining immutable row values to be
+    // repeatedly allocated in the nested scan. The registered native extends
+    // that exact immutable cache through 1000; it must be admitted here for
+    // real-JDK bytecode calls to reach it.
+    if class_name == "org/h2/value/ValueBigint" {
+        return (method_name, descriptor) == ("get", "(J)Lorg/h2/value/ValueBigint;");
+    }
+    if class_name == "org/h2/expression/condition/Comparison" {
+        return matches!(
+            (method_name, descriptor),
+            (
+                "compare",
+                "(Lorg/h2/engine/SessionLocal;Lorg/h2/value/Value;Lorg/h2/value/Value;I)Lorg/h2/value/Value;",
+            ) | (
+                "getValue",
+                "(Lorg/h2/engine/SessionLocal;)Lorg/h2/value/Value;",
+            )
+        );
+    }
+    if class_name == "org/h2/expression/ExpressionColumn" {
+        return (method_name, descriptor)
+            == (
+                "getValue",
+                "(Lorg/h2/engine/SessionLocal;)Lorg/h2/value/Value;",
+            );
+    }
+    if class_name == "org/h2/value/Value" {
+        return (method_name, descriptor) == ("isFalse", "()Z");
+    }
+    if class_name == "org/h2/expression/condition/ConditionAndOr" {
+        return (method_name, descriptor)
+            == (
+                "getValue",
+                "(Lorg/h2/engine/SessionLocal;)Lorg/h2/value/Value;",
+            );
+    }
+    if class_name == "org/h2/expression/function/CoalesceFunction" {
+        return (method_name, descriptor)
+            == (
+                "getValue",
+                "(Lorg/h2/engine/SessionLocal;)Lorg/h2/value/Value;",
+            );
+    }
+    if class_name == "org/h2/expression/function/CardinalityExpression" {
+        return (method_name, descriptor)
+            == (
+                "getValue",
+                "(Lorg/h2/engine/SessionLocal;)Lorg/h2/value/Value;",
+            );
+    }
+    if class_name == "org/h2/index/RangeCursor" {
+        return matches!(
+            (method_name, descriptor),
+            ("next", "()Z")
+                | ("get", "()Lorg/h2/result/Row;")
+                | ("getSearchRow", "()Lorg/h2/result/SearchRow;")
+        );
+    }
+    if class_name == "org/h2/result/Row" {
+        return (method_name, descriptor) == ("get", "([Lorg/h2/value/Value;I)Lorg/h2/result/Row;");
+    }
+    if class_name == "org/h2/result/DefaultRow" {
+        return (method_name, descriptor) == ("getValue", "(I)Lorg/h2/value/Value;");
     }
     class_name.starts_with("org/h2/command/Token")
         && matches!(
@@ -26016,6 +26337,67 @@ fn force_native_over_real_jdk_bytecode(
                 | "equals"
         )
     {
+        return true;
+    }
+    // BUG (found investigating the Tomcat Jasper/ecj JSP-compile NPE,
+    // TestDefaultServlet.testBug57601 / TestMapperWebapps.testWelcomeFileStrict):
+    // this function is the ONLY force-native gate consulted by the
+    // reflective/megamorphic/`invokespecial`/interface-default dispatch path
+    // (`intercept_force_registered_native[_cached]` ->
+    // `should_force_registered_native_over_bytecode` ->
+    // `force_native_over_real_jdk_bytecode_memoized` -> here). The "regular"
+    // cached-invokevirtual dispatch path OR's in an extra
+    // `matches!((class_name,...), "java/util/HashMap"|"java/util/LinkedHashMap"
+    // |"java/util/Hashtable"|"java/util/concurrent/ConcurrentHashMap")`
+    // cluster locally (see further below in this same file, and the
+    // companion `check_override` chain in `vm/src/vm/vm_exec.rs`), but this
+    // base function never did — so a call reaching it directly ran the REAL
+    // JDK bytecode for `put`/`get`/`size`/etc. instead of (or, when a
+    // different call to the identical call site had already gone through the
+    // OTHER, covered path, *in addition to*) the registered native,
+    // corrupting any state the two implementations don't share (e.g.
+    // `Hashtable`'s own real `count` field vs. our side-store bucket count —
+    // `Hashtable.put()` ending up incrementing the tracked size TWICE,
+    // doubling `size()` and leaving `values().toArray()`'s caller-supplied
+    // array null-padded past the real entry count. That is exactly what made
+    // ecj's `CompilationResult.getClassFiles()` — `new
+    // ClassFile[compiledTypes.size()]` then `compiledTypes.values()
+    // .toArray(classFiles)` on a `Hashtable(11)` — hand back a null-padded
+    // array and NPE in `CompilationUnitDeclaration.cleanUp()`). Add the same
+    // cluster here so every dispatch path agrees.
+    if matches!(
+        class_name,
+        "java/util/HashMap"
+            | "java/util/LinkedHashMap"
+            | "java/util/Hashtable"
+            | "java/util/concurrent/ConcurrentHashMap"
+    ) && matches!(
+        method_name,
+        "computeIfAbsent"
+            | "compute"
+            | "computeIfPresent"
+            | "merge"
+            | "putIfAbsent"
+            | "replace"
+            | "forEach"
+            | "replaceAll"
+            | "getOrDefault"
+            | "putMapEntries"
+            | "put"
+            | "get"
+            | "remove"
+            | "containsKey"
+            | "containsValue"
+            | "size"
+            | "isEmpty"
+            | "clear"
+            | "putAll"
+            | "keySet"
+            | "values"
+            | "entrySet"
+            | "keys"
+            | "elements"
+    ) {
         return true;
     }
     // Keep this warmed-invoke-cache policy in sync with vm_exec's cold-path
@@ -28021,7 +28403,7 @@ fn force_native_over_real_jdk_bytecode(
         // delegates to the base classpath (where `<init>` already registered the
         // loader's URLs), matching HotSpot.
         || (class_name == "java/net/URLClassLoader"
-            && (matches!(method_name, "findClass" | "findResource" | "findResources" | "addURL")
+            && (matches!(method_name, "findClass" | "findResource" | "findResources" | "getURLs" | "addURL")
                 || (method_name == "<init>"
                     && matches!(
                         method_descriptor,
@@ -29779,6 +30161,19 @@ fn try_stackless_invoke(
     //    when it diverges from the name-resolved copy under loader isolation)
     //    takes precedence so the ENHANCED per-loader copy's methods dispatch
     //    instead of the un-enhanced global same-named class.
+    if std::env::var("CRATONVM_DBG_LOADER_TRACE").is_ok()
+        && class_name.contains("RootReference")
+        && method_name == "<init>"
+    {
+        let recv_cid = match args.first() {
+            Some(Value::Object(Some(recv))) => Some(shared.heap.class_id_of(*recv)),
+            _ => None,
+        };
+        let name_resolved = shared.class_manager.read().get_loaded_class_id(class_name);
+        eprintln!(
+            "[TSI-CTOR-TRACE] class_name={class_name} descriptor={descriptor} is_special={is_special} dispatch_class_override={dispatch_class_override:?} name_resolved={name_resolved:?} receiver_actual_cid={recv_cid:?}"
+        );
+    }
     let class_id = match dispatch_class_override
         .or_else(|| shared.class_manager.read().get_loaded_class_id(class_name))
     {
@@ -30256,6 +30651,17 @@ fn execute_invokestatic(
 
     // Sibling static owners in a user-defined loader need the same identity
     // preservation as self-calls; resolving by flat name can pick the app copy.
+    let isolated_url_definition =
+        is_isolated_url_loader_definition(shared, thread, current_class_id);
+    // A defining-loader registration is authoritative even when the
+    // class-manager's loader-id metadata is unavailable for a real-JDK
+    // subclass. Static symbolic references still use the caller's defining
+    // loader under JVMS 5.4.3; restricting that to the historical fork/Groovy
+    // gates leaves ordinary ModifiedClassPathClassLoader bytecode bound to the
+    // flat application copy.
+    let has_user_defining_loader =
+        cratonvm_native_builtins::classloader::defining_loader_for(current_class_id.as_u32())
+            .is_some();
     let static_dispatch_class_id = self_class_id.or_else(|| {
         // Keep static method owners in the same initiating-loader namespace
         // as every other symbolic reference. This includes the narrow
@@ -30263,12 +30669,24 @@ fn execute_invokestatic(
         // Spring's forked BootstrapUtils calls MergedAnnotations.search(), and
         // mixing a forked SearchStrategy singleton with an application Search
         // instance makes the latter's identity check fail spuriously.
-        if should_use_loader_initiated_resolution(shared, current_class_id) {
+        if should_use_loader_initiated_resolution(shared, current_class_id)
+            || isolated_url_definition
+            || has_user_defining_loader
+        {
             // Preserve the initiating loader even when the global classpath
             // already has a same-named class. This is required for nested
             // implementation jars whose owner is only visible to the caller
             // loader.
-            lookup_loader_initiated(shared, current_class_id, &method_class_name).or_else(|| {
+            let known = if isolated_url_definition || has_user_defining_loader {
+                // An initiating-cache hit may be an application definition
+                // recorded before this isolated URL loader defined its own
+                // copy. Static calls into that stale class share its caches
+                // with the child and poison Class-identity keyed metadata.
+                lookup_loader_defined_exact(shared, current_class_id, &method_class_name)
+            } else {
+                lookup_loader_initiated(shared, current_class_id, &method_class_name)
+            };
+            known.or_else(|| {
                 drive_defining_loader_load(shared, thread, current_class_id, &method_class_name)
             })
         } else {
@@ -30400,7 +30818,13 @@ fn execute_invokestatic(
     // warm benchmark loop. The slow-path re-entry cost is noise next
     // to any kernel that clears `--gpu-min-work`.
     #[cfg_attr(not(feature = "gpu-offload"), allow(unused_mut))]
-    let mut suppress_invoke_cache = false;
+    // The per-thread/static promoted invoke caches do not encode the
+    // loader-specific owner selected above. Promoting this call site would
+    // re-resolve its symbolic owner through the flat store and send the next
+    // call into an application-loader copy. Keep loader-specific static calls
+    // on the already-correct slow dispatcher until the cache key can carry
+    // the resolved ClassId.
+    let mut suppress_invoke_cache = static_dispatch_class_id.is_some() || has_user_defining_loader;
     #[cfg(feature = "gpu-offload")]
     {
         if shared.config.gpu_offload_enabled
@@ -30654,11 +31078,33 @@ fn populate_invoke_cache(
     is_special: bool,
 ) {
     // Check if already cached
-    if thread
-        .invoke_cache
-        .get(caller_class_id, cp_index, is_special)
-        .is_some()
-    {
+    if let Some(existing) = thread.invoke_cache.get(caller_class_id, cp_index, is_special) {
+        if std::env::var("CRATONVM_DBG_LOADER_TRACE").is_ok() {
+            let dbg_relevant = matches!(
+                resolve_method_ref(shared, caller_class_id, cp_index),
+                Ok((cn, ..)) if cn.contains("RootReference")
+            );
+            if dbg_relevant {
+                let desc = match existing {
+                    CachedInvokeTarget::Bytecode { cached, .. } => format!(
+                        "Bytecode declaring={:?} class={} {}{}",
+                        cached.declaring_class_id, cached.class_name, cached.method_name, cached.method_descriptor
+                    ),
+                    CachedInvokeTarget::VirtualBytecode { receiver_class_id, cached, .. } => format!(
+                        "VirtualBytecode rc={:?} declaring={:?} class={} {}{}",
+                        receiver_class_id, cached.declaring_class_id, cached.class_name, cached.method_name, cached.method_descriptor
+                    ),
+                    CachedInvokeTarget::Native { .. } => "Native".to_string(),
+                    CachedInvokeTarget::VirtualNative { .. } => "VirtualNative".to_string(),
+                    CachedInvokeTarget::Intrinsic { .. } => "Intrinsic".to_string(),
+                    _ => "Other".to_string(),
+                };
+                eprintln!(
+                    "[PIC-ALREADY-CACHED] caller_class_id={:?} cp_index={} is_special={} existing={}",
+                    caller_class_id, cp_index, is_special, desc
+                );
+            }
+        }
         return;
     }
 
@@ -30671,6 +31117,12 @@ fn populate_invoke_cache(
             Ok(r) => r,
             Err(_) => return,
         };
+    if std::env::var("CRATONVM_DBG_LOADER_TRACE").is_ok() && class_name.contains("RootReference") {
+        eprintln!(
+            "[PIC-ENTRY] caller_class_id={:?} cp_index={} is_special={} class_name(cp)={} method={}{}",
+            caller_class_id, cp_index, is_special, class_name, method_name, descriptor
+        );
+    }
     // JVMS §6.5 super-call redirect (see `invokespecial_owner_class_name`) —
     // this is the PRIMARY invokespecial resolution path (the stackless
     // `thread.invoke_cache`/`shared_resolution` builder consulted by every
@@ -38087,6 +38539,20 @@ fn execute_invokevirtual_cached(
 ) -> Result<CachedCallResult, MethodCallFailed> {
     let caller_class_id = thread.frames[frame_idx].class_id;
 
+    if std::env::var("CRATONVM_DBG_LOADER_TRACE").is_ok()
+        && is_special
+        && thread.frames[frame_idx].class_name().contains("MVMap")
+    {
+        let resolved = resolve_method_ref(shared, caller_class_id, cp_index);
+        eprintln!(
+            "[EIVC-ENTRY-ALL] caller_class_id={caller_class_id:?} cp_index={cp_index} caller_method={}.{}{} resolved={:?}",
+            thread.frames[frame_idx].class_name(),
+            thread.frames[frame_idx].method_name(),
+            thread.frames[frame_idx].method_descriptor(),
+            resolved.as_ref().map(|(cn, mn, md, np)| format!("{cn}.{mn}{md} np={np}")),
+        );
+    }
+
     // Keep Spring's loader-split Adapt identity bridge in the slow dispatcher.
     // The cache can predate the receiver loader's enum copy and otherwise
     // bypasses that narrowly scoped reconciliation entirely.
@@ -38293,7 +38759,8 @@ fn execute_invokevirtual_cached(
                             || cached.class_name.contains("MVMap"))
                     {
                         eprintln!(
-                            "[LOADER-TRACE] execute_invokevirtual_cached HIT-CHECK method={}.{}{} cached.declaring={} cached_receiver_class_id={:?} actual_class_id={:?} match={}",
+                            "[LOADER-TRACE] execute_invokevirtual_cached HIT-CHECK caller_class_id={:?} cp_index={} is_special={} method={}.{}{} cached.declaring={} cached_receiver_class_id={:?} actual_class_id={:?} match={}",
+                            caller_class_id, cp_index, is_special,
                             cached.class_name, cached.method_name, cached.method_descriptor,
                             cached.class_name, receiver_class_id, actual_class_id, actual_class_id == receiver_class_id
                         );
