@@ -1259,14 +1259,59 @@ fn h2_expression_column_get_value(ctx: &mut dyn NativeContext, args: &[Value]) -
     let table_filter_class = ctx.class_id_by_name("org/h2/table/TableFilter");
     if table_filter_class.is_some_and(|class_id| ctx.class_id_of_object(resolver) == class_id) {
         let column_id = h2_int_field(ctx, column, "columnId");
-        if let Some(row) = h2_object_field(ctx, resolver, "current")
-            .or_else(|| h2_object_field(ctx, resolver, "currentSearchRow"))
-        {
+        // `current` (TableFilter.next()'s lazily-fetched FULL row, populated
+        // by the real getValue(Column) bytecode below on first need -- see
+        // that method's own `current = cursor.get()` line) always holds
+        // every column once it exists, so reading it directly is always
+        // safe. `currentSearchRow` (set unconditionally on every
+        // TableFilter.next()) is NOT always a full row: for a cursor driven
+        // by a SECONDARY index over only a PREFIX of a composite key (an
+        // index range scan, not an exact point lookup), it is the index's
+        // own lightweight key row -- containing only the INDEXED columns.
+        // Reading a non-indexed column straight off that partial row
+        // returns a bare Java null (not H2's own ValueNull.INSTANCE SQL-NULL
+        // sentinel) instead of triggering the genuine `Table.getValue`'s
+        // lazy `cursor.get()` full-row fetch that reads it correctly --
+        // corrupting the query result with a raw null instead of the real
+        // value. Take the fast path off `currentSearchRow` only when the
+        // read actually comes back with a value; a null result falls
+        // through to the real (slow, but correct) virtual dispatch below,
+        // which also has the side effect of caching the fetched full row
+        // into `current` for any later columns read from this same row.
+        if let Some(row) = h2_object_field(ctx, resolver, "current") {
             return ctx.invoke_virtual(
                 row,
                 "getValue",
                 "(I)Lorg/h2/value/Value;",
                 &[Value::Int(column_id)],
+            );
+        }
+        if let Some(row) = h2_object_field(ctx, resolver, "currentSearchRow") {
+            // GC-safety: the probe call below re-enters Java and may move
+            // `resolver`/`column` (both read again afterward -- `resolver`
+            // by the fallback dispatch below, `column` as its argument).
+            // Pin both across it and re-read the forwarded references
+            // before any further use, same pattern as every other
+            // re-entrant call in this file.
+            let resolver_pin = ctx.pin_native_root(resolver);
+            let column_pin = ctx.pin_native_root(column);
+            let probe = ctx.invoke_virtual(
+                row,
+                "getValue",
+                "(I)Lorg/h2/value/Value;",
+                &[Value::Int(column_id)],
+            );
+            let resolver = ctx.read_native_pin(resolver_pin, resolver);
+            let column = ctx.read_native_pin(column_pin, column);
+            ctx.unpin_native_roots(resolver_pin);
+            if let Some(Value::Object(Some(value))) = probe? {
+                return Ok(Some(Value::Object(Some(value))));
+            }
+            return ctx.invoke_virtual(
+                resolver,
+                "getValue",
+                "(Lorg/h2/table/Column;)Lorg/h2/value/Value;",
+                &[Value::Object(Some(column))],
             );
         }
     }
