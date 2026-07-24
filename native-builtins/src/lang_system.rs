@@ -1357,8 +1357,30 @@ pub(crate) fn native_runtime_version(
 /// `Runtime.Version.feature()` вЂ” major Java specification version (e.g. 25).
 pub(crate) fn native_runtime_version_feature(
     ctx: &mut dyn NativeContext,
-    _args: &[Value],
+    args: &[Value],
 ) -> MethodCallResult {
+    // `Runtime.Version.parse("8")` produces a fully initialized real JDK
+    // Version object (not the lightweight metadata fallback below). Its
+    // `version` list is authoritative: returning the host VM feature for it
+    // makes `JarFile.baseVersion()` incorrectly report 25, disabling every
+    // multi-release lookup in Spring Boot's NestedJarFile.
+    if let Ok(this) = obj_arg(args, 0) {
+        if let Value::Object(Some(parts)) = ctx.get_field_by_name(this, "version") {
+            let parts_pin = ctx.pin_native_root(parts);
+            let parts = ctx.read_native_pin(parts_pin, parts);
+            let first = ctx.invoke_virtual(parts, "get", "(I)Ljava/lang/Object;", &[Value::Int(0)]);
+            ctx.unpin_native_roots(parts_pin);
+            if let Ok(Some(Value::Object(Some(first)))) = first {
+                let first_pin = ctx.pin_native_root(first);
+                let first = ctx.read_native_pin(first_pin, first);
+                let value = ctx.invoke_virtual(first, "intValue", "()I", &[]);
+                ctx.unpin_native_roots(first_pin);
+                if let Ok(Some(Value::Int(value))) = value {
+                    return Ok(Some(Value::Int(value)));
+                }
+            }
+        }
+    }
     let v = ctx
         .get_system_property("java.specification.version")
         .and_then(|s| s.trim().parse::<i32>().ok())
