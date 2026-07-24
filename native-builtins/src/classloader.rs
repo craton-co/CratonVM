@@ -2595,8 +2595,28 @@ pub(crate) fn extract_pd_code_source_url(ctx: &dyn NativeContext, pd: ObjectRef)
     // Real-JDK PD path: field 0 may not match. Try by-name.
     if let Value::Object(Some(cs)) = ctx.get_field_by_name(pd, "codesource") {
         if let Value::Object(Some(loc)) = ctx.get_field_by_name(cs, "location") {
+            // Real `CodeSource.location` is typed `java.net.URL`, not
+            // `String` — `read_string` correctly fails on it (it's a
+            // different concrete class), which silently dropped every
+            // real-JDK-constructed CodeSource's URL here (e.g.
+            // `URLClassLoader.defineClass(name, Resource)`'s
+            // `new CodeSource(url, signers)`, the path
+            // `ModifiedClassPathClassLoader`/`@ClassPathOverrides` uses to
+            // load an overridden jar's classes — see
+            // `NoSuchMethodFailureAnalyzerTests`). Reconstruct the URL
+            // string from its own real fields the same way HotSpot's
+            // `URL.toString()` does (`protocol + ":" + file`) instead.
             if let Some(s) = ctx.read_string(loc) {
                 return Some(s);
+            }
+            if let (Value::Object(Some(proto)), Value::Object(Some(file))) = (
+                ctx.get_field_by_name(loc, "protocol"),
+                ctx.get_field_by_name(loc, "file"),
+            ) {
+                if let (Some(proto), Some(file)) = (ctx.read_string(proto), ctx.read_string(file))
+                {
+                    return Some(format!("{proto}:{file}"));
+                }
             }
         }
     }

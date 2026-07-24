@@ -2008,6 +2008,14 @@ pub trait NativeContext {
         256 * 1024 * 1024
     }
 
+    /// Initial heap size in bytes, as reported by the JMX `MemoryMXBean`'s
+    /// heap `MemoryUsage.getInit()`. The default (mock/test contexts) mirrors
+    /// `max_heap_bytes`'s historical placeholder; the VM overrides it to
+    /// return the configured `-Xms` (`VmConfig::initial_heap_size`).
+    fn initial_heap_bytes(&self) -> i64 {
+        16 * 1024 * 1024
+    }
+
     /// Returns the total number of bytes allocated on the heap.
     fn heap_allocated_bytes(&self) -> usize;
 

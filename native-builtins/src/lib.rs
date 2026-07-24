@@ -64118,9 +64118,9 @@ fn b64_decode(input: &[u8], variant: i32) -> Result<Vec<u8>, String> {
             return Err("Incomplete base64 input".to_string());
         }
         let c0 = b64_decode_char(filtered[i], variant)
-            .ok_or_else(|| format!("Invalid base64 char: {}", filtered[i] as char))?;
+            .ok_or_else(|| format!("Illegal base64 character {:x}", filtered[i]))?;
         let c1 = b64_decode_char(filtered[i + 1], variant)
-            .ok_or_else(|| format!("Invalid base64 char: {}", filtered[i + 1] as char))?;
+            .ok_or_else(|| format!("Illegal base64 character {:x}", filtered[i + 1]))?;
 
         if remaining == 2 {
             out.push(((c0 << 2) | (c1 >> 4)) as u8);
@@ -64135,7 +64135,7 @@ fn b64_decode(input: &[u8], variant: i32) -> Result<Vec<u8>, String> {
             break;
         }
         let c2 = b64_decode_char(third, variant)
-            .ok_or_else(|| format!("Invalid base64 char: {}", third as char))?;
+            .ok_or_else(|| format!("Illegal base64 character {:x}", third))?;
 
         if remaining == 3 {
             out.push(((c0 << 2) | (c1 >> 4)) as u8);
@@ -64152,7 +64152,7 @@ fn b64_decode(input: &[u8], variant: i32) -> Result<Vec<u8>, String> {
             break;
         }
         let c3 = b64_decode_char(fourth, variant)
-            .ok_or_else(|| format!("Invalid base64 char: {}", fourth as char))?;
+            .ok_or_else(|| format!("Illegal base64 character {:x}", fourth))?;
         out.push(((c0 << 2) | (c1 >> 4)) as u8);
         out.push((((c1 & 0xF) << 4) | (c2 >> 2)) as u8);
         out.push((((c2 & 0x3) << 6) | c3) as u8);
