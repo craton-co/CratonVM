@@ -1264,6 +1264,38 @@ fn loader_namespace_id_store() -> &'static Mutex<Vec<(ObjectRef, u32)>> {
     INSTANCE.get_or_init(|| Mutex::new(Vec::new()))
 }
 
+/// Reverse of `loader_namespace_id`: given a namespace id already allocated
+/// via the object-keyed side table (real-JDK mode's path — a `UserDefined`
+/// id from `class_manager`'s per-class `loader_id`, e.g. as returned by
+/// `NativeContext::loader_id_of_class`), find the live `ClassLoader` object
+/// that owns it. `None` for built-in namespaces (0/1/2) or a namespace this
+/// process never allocated via the object-keyed store (e.g. one only ever
+/// set through the synthetic-JDK `CL_LOADER_ID` field slot, which this store
+/// doesn't track).
+///
+/// Exists because several call sites need to *actively drive* a specific
+/// loader's own `loadClass()` (JVMS §5.4.3 initiating-loader semantics) once
+/// they already know a class's numeric namespace id but not the loader
+/// object itself — `defining_loader_for` (a separate, narrowly-populated
+/// side table keyed by `class_id`, written only by explicit
+/// `register_defining_loader` calls) is NOT a reliable source for this: a
+/// class defined via `ucl_try_define_local_class`'s isolated-loader native
+/// path IS correctly assigned a real `UserDefined` namespace id (this store
+/// IS populated for it, since `loader_namespace_id` is exactly what
+/// assigned that id), independent of whether `register_defining_loader`
+/// also happened to run for it.
+pub(crate) fn loader_object_for_namespace_id(ns_id: u32) -> Option<ObjectRef> {
+    if ns_id < 3 {
+        return None;
+    }
+    loader_namespace_id_store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .find(|(_, id)| *id == ns_id)
+        .map(|&(loader, _)| loader)
+}
+
 /// Stable CratonVM loader-namespace id for a `ClassLoader` instance, allocating
 /// one on first request. Built-in loaders map to `0` (the Application / global
 /// namespace — they ARE the global store). User-defined loaders use their
