@@ -15521,6 +15521,57 @@ fn execute_instruction(
             }
         }
         Instruction::Invokeinterface { index, count: _ } => {
+            // WFLYCTL0079 round 3 (2026-07-23): the bytecode of
+            // `TransactionSubsystemRootResourceDefinition.registerAttributes`
+            // builds a `HashSet<AttributeDefinition>` from a static array,
+            // removes ~11 specific attributes from it (including
+            // `HORNETQ_STORE_ENABLE_ASYNC_IO`, which needs special
+            // `AliasedHandler` treatment applied later via an explicit call
+            // at a separate pc), then registers whatever remains via a
+            // generic loop, THEN makes the explicit HORNETQ_STORE_ENABLE_
+            // ASYNC_IO registration call. If `Set.remove()` for that
+            // attribute ever silently returns `false` (return value is
+            // discarded in the bytecode — `pop` after every `.remove()`
+            // call), the attribute would get registered TWICE: once by the
+            // generic loop, once by the explicit call — "already
+            // registered". Both `DUPCALL` (executor-dispatch level) and
+            // `DUPREG` (registerAttributes-entry level) diagnostics tested
+            // clean across 1600 boots, which only rules out re-ENTERING the
+            // method twice — NOT this same-invocation double-registration
+            // shape. Trace every `invokeinterface` call made BY this one
+            // caller frame, with the AttributeDefinition argument's raw
+            // identity, so a within-one-invocation repeat is directly
+            // visible without needing to resolve field offsets.
+            if crate::runtime::env_cache::dbg_dupcall_filter() {
+                let caller = &thread.frames[frame_idx];
+                if caller.method_name() == "registerAttributes"
+                    && caller.class_name()
+                        == "org/jboss/as/txn/subsystem/TransactionSubsystemRootResourceDefinition"
+                {
+                    // Safety guard: other invokeinterface calls inside this
+                    // same method (Set.remove/iterator/Iterator.hasNext/next)
+                    // have shallower stack shapes at their call site — only
+                    // peek when there's plausibly a 4-slot call
+                    // (registration, attrDef, handler, handler) in flight,
+                    // to avoid `peek_at` panicking on an out-of-range depth
+                    // for those unrelated calls.
+                    if caller.stack.len() >= 4 {
+                        let attr_def = caller.stack.peek_at(2);
+                        let addr = match attr_def {
+                            Value::Object(Some(o)) => o.as_ptr() as usize,
+                            _ => 0,
+                        };
+                        if addr != 0 {
+                            eprintln!(
+                                "[REGCALL] caller_pc={} attr=0x{:x} tid={}",
+                                caller.pc,
+                                addr,
+                                thread.thread_id.0,
+                            );
+                        }
+                    }
+                }
+            }
             // is_interface=true threads γ's stash so the default-method
             // rescue can fire on NSME for invokeinterface only. Same cache
             // consultation as invokevirtual/invokespecial above (PERF FIX
