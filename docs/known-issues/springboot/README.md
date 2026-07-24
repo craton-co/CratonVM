@@ -53,7 +53,13 @@ smaller/individual differences not yet clustered.
 > just tipped over the 300s timeout by this module's unusually large
 > (~121-jar) test classpath. Fixed in `native-builtins/src/classloader.rs`
 > and `phases_late.rs`. One pre-existing, narrower residual unmasked by the
-> fix (not caused by it): `data-redis-jedis-sslbundle-withpackageresources-classloader-leak.md`.
+> fix (not caused by it) — **also now FIXED 2026-07-23**, moved to
+> [`../../internal/fixed-suite-bugs/springboot/data-redis-jedis-sslbundle-withpackageresources-classloader-leak-FIXED.md`](../../internal/fixed-suite-bugs/springboot/data-redis-jedis-sslbundle-withpackageresources-classloader-leak-FIXED.md).
+> Root cause: `classloader_real.rs::cl_real_load_class_base` silently
+> swallowed a user-defined parent loader's authoritative
+> `ClassNotFoundException` and fell through to CratonVM's loader-blind flat
+> global class store, un-doing `ModifiedClassPathClassLoader`'s
+> `@ClassPathExclusions` filtering.
 
 | Doc | Classes | Severity | Status |
 |---|---:|---|---|
@@ -96,6 +102,19 @@ breakdown, and reproduce instructions in
 the docs below this session — many residuals are very likely the same
 already-documented OPEN clusters, worth a dedicated confirmation pass
 rather than assuming closed or re-investigating from scratch.
+
+> Closure update (2026-07-23): `module/spring-boot-security`'s 4-class
+> residual from this rerun (`SecurityFilterAutoConfigurationEarlyInitializationTests`,
+> `PathRequestTests`, `ManagementWebSecurityAutoConfigurationTests`,
+> `ReactiveManagementWebSecurityAutoConfigurationTests`) — root cause was a
+> `ModifiedClassPathClassLoader` built from a "pathing JAR" launch (used when
+> a module's classpath is too long for a Windows command line) resolving to
+> an effectively empty classpath, since `ClassPath::new` never expanded a
+> plain jar's own manifest `Class-Path:` attribute. **FIXED** — see
+> [`../../internal/fixed-suite-bugs/springboot/springboot-security-modifiedclasspathextension-pathing-jar-classpath-manifest-FIXED.md`](../../internal/fixed-suite-bugs/springboot/springboot-security-modifiedclasspathextension-pathing-jar-classpath-manifest-FIXED.md).
+> `PathRequestTests` now passes outright; the other 3 narrow to two distinct,
+> newly-exposed residuals: [`onbeancondition-mergedannotations-intermittent-identity-mismatch.md`](onbeancondition-mergedannotations-intermittent-identity-mismatch.md)
+> and [`securityfilterautoconfig-capturedoutput-password-not-observed.md`](securityfilterautoconfig-capturedoutput-password-not-observed.md).
 
 ## 2026-07-17 rerun: 510-class set vs first-ever same-scope HotSpot baseline (429 CratonVM-specific)
 

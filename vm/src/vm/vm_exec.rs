@@ -15453,6 +15453,7 @@ fn invoke_on_class_shared_inner(
                                 | "setProperty"
                                 | "put"
                                 | "putAll"
+                                | "computeIfAbsent"
                                 | "get"
                                 | "containsKey"
                                 | "stringPropertyNames"

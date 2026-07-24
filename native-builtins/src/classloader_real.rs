@@ -1182,6 +1182,7 @@ fn cl_real_load_class_base(
     // recorded URLs, then make the miss authoritative.
     if crate::classloader::url_classloader_isolated_from_app(ctx, this)
         && !crate::classloader::is_bootstrap_class_name(&internal)
+        && !cratonvm_classloading::is_bootstrap_appended_class(&internal)
     {
         if let Some(result) = crate::classloader::ucl_try_define_local_class(ctx, this, &internal) {
             return result;
@@ -1215,22 +1216,46 @@ fn cl_real_load_class_base(
     //    path below; a miss or exception here is swallowed (`_ => {}`) so
     //    every existing fallback (global store, `findClass` override,
     //    deferred resolution) still runs exactly as before.
+    // Set when the user-defined parent's own `loadClass` was actually
+    // invoked (real bytecode) and did NOT hand back a class. That refusal
+    // is authoritative — the parent already ran its own full delegation/
+    // exclusion logic (which, for a loader like Spring Boot's
+    // `ModifiedClassPathClassLoader`, deliberately narrows its own URL list
+    // via `@ClassPathExclusions`), and CratonVM's flat global store mixes
+    // together every loader's classpath, so it can still find a class the
+    // parent specifically hid. Falling through to "standard VM class
+    // loading" below after such a refusal defeats the exclusion: a
+    // `ResourcesClassLoader` (installed by `@WithPackageResources`) wrapping
+    // a correctly-exclusion-aware `ModifiedClassPathClassLoader` parent got
+    // `ClassNotFoundException` from the parent's own `loadClass`, but that
+    // `Err` doesn't match the `Ok(Some(Object(Some(_))))` pattern above, so
+    // it was silently swallowed and step 1 re-resolved the excluded class
+    // globally anyway — `@ConditionalOnClass` checks made through such a
+    // loader then saw a class the exclusion was written to hide. See
+    // docs/known-issues/springboot/data-redis-jedis-sslbundle-withpackageresources-classloader-leak.md.
+    let mut parent_user_defined_authoritative_miss = false;
     if let Some(parent) = parent {
         if crate::classloader::is_user_defined_loader(ctx, parent) {
-            if let Ok(Some(Value::Object(Some(mirror)))) = ctx.invoke_virtual(
+            match ctx.invoke_virtual(
                 parent,
                 "loadClass",
                 "(Ljava/lang/String;)Ljava/lang/Class;",
                 &[Value::Object(Some(class_name_obj))],
             ) {
-                return Ok(Some(Value::Object(Some(mirror))));
+                Ok(Some(Value::Object(Some(mirror)))) => {
+                    return Ok(Some(Value::Object(Some(mirror))));
+                }
+                _ => {
+                    parent_user_defined_authoritative_miss = true;
+                }
             }
         }
     }
 
     // 1. Standard VM class loading (skipped when deferring to a custom findClass,
-    //    or when the loader's chain cannot reach a built-in loader).
-    if !defer_to_find_class && !scoped_user_chain {
+    //    or when the loader's chain cannot reach a built-in loader, or when a
+    //    user-defined parent already authoritatively refused above).
+    if !parent_user_defined_authoritative_miss && !defer_to_find_class && !scoped_user_chain {
         match load_class_visible_to(ctx, this, &internal) {
             ClassLookup::Found(mirror) => return Ok(Some(mirror)),
             ClassLookup::DependencyMissing(missing) => {
@@ -1372,7 +1397,9 @@ pub fn ucl_real_find_class(
     if let Some(result) = crate::classloader::ucl_try_define_local_class(ctx, this, &internal) {
         return result;
     }
-    if crate::classloader::url_classloader_isolated_from_app(ctx, this) {
+    if crate::classloader::url_classloader_isolated_from_app(ctx, this)
+        && !cratonvm_classloading::is_bootstrap_appended_class(&internal)
+    {
         let exc = crate::jboss_module_loader::alloc_single_message_exception(
             ctx,
             "java/lang/ClassNotFoundException",

@@ -6272,10 +6272,12 @@ fn try_compile_inner(
             );
         }
         if unsafe_local {
-            // The single-pass backend can preserve the full local state at a
-            // post-invoke exceptional exit. Request that path instead of
-            // reconstructing a handler from parameters only.
-            x64::set_precise_exception_frame_request(true);
+            // The current exception router can restore only incoming
+            // parameters. A handler that reads a later local must remain
+            // interpreted until the precise exceptional-frame handoff covers
+            // every compiled-call sink. Compiling it is unsound: a propagated
+            // exception reaches the handler with that local reset to null/zero.
+            return None;
         }
     }
 
