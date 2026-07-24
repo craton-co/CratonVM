@@ -1189,8 +1189,25 @@ pub(crate) fn native_throwable_print_stack_trace(
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
-    // No-arg overload: real JDK writes to `System.err` (fd 2).
-    print_throwable_chain_to_fd(ctx, this, 2);
+    // No-arg overload: real JDK writes to `System.err`. Same trap as the
+    // explicit-stream overload (see its doc comment): if `System.err` has
+    // been redirected to a tee/capture stream (`System.setErr`,
+    // `OutputCaptureExtension`), a raw fd-2 write bypasses that stream's
+    // Java-level buffer entirely. Resolve the CURRENT `System.err` value and
+    // route through its own `println` when it's wrapped.
+    let err_stream = ctx.class_id_by_name("java/lang/System").and_then(|sys| {
+        ctx.static_field_index_by_name(sys, "err")
+            .and_then(|idx| match ctx.get_static_field(sys, idx) {
+                Value::Object(Some(s)) => Some(s),
+                _ => None,
+            })
+    });
+    match err_stream {
+        Some(s) if matches!(ctx.get_field_by_name(s, "out"), Value::Object(Some(_))) => {
+            print_throwable_chain_to_stream_obj(ctx, this, s);
+        }
+        _ => print_throwable_chain_to_fd(ctx, this, 2),
+    }
     Ok(None)
 }
 
@@ -2299,16 +2316,38 @@ pub(crate) fn native_throwable_print_stack_trace_to_stream(
         // Null stream (e.g. System.err still null on early boot): fall back to
         // the stderr fd so a catch-handler's printStackTrace never NPEs.
         None => print_throwable_chain_to_fd(ctx, this, 2),
-        // System.out / System.err: keep the battle-tested host-fd sink so
-        // boot-time exception dumps stay visible exactly as before.
-        Some(s) if is_system_out_or_err(ctx, s) => {
+        // A CANONICAL (unwrapped) System.out / System.err: keep the
+        // battle-tested host-fd sink so boot-time exception dumps stay
+        // visible exactly as before. But `System.out`/`err` can be
+        // REDIRECTED (`System.setOut(tee)` — Spring Boot's
+        // `OutputCaptureExtension`/`CapturedOutput` does exactly this for
+        // every test using it, e.g.
+        // `SpringApplicationTests.failureInANativeImageWritesFailureToSystemOut`,
+        // whose `NativeDetector.inNativeImage()` branch does
+        // `System.out.println("Application run failed");
+        // failure.printStackTrace(System.out)`); at that point the current
+        // `System.out` VALUE is the tee stream, and `is_system_out_or_err`
+        // correctly says "yes, this IS System.out" — but writing straight to
+        // the raw host fd bypasses that tee's Java-level buffer entirely, so
+        // the capturing extension's assertion sees the leading
+        // println but NONE of the exception detail. `stream_writeln` (the
+        // `println` native path) avoids exactly this trap via
+        // `route_write_through_out` — mirror that here: a non-null `out`
+        // delegate field means the stream is wrapped, so route through the
+        // object's own `println` (which itself is capture-aware) instead of
+        // the fd fast path.
+        Some(s)
+            if is_system_out_or_err(ctx, s)
+                && !matches!(ctx.get_field_by_name(s, "out"), Value::Object(Some(_))) =>
+        {
             let fd = print_stream_target_fd(ctx, Some(s));
             print_throwable_chain_to_fd(ctx, this, fd);
         }
-        // Any other stream is a user sink the fd write cannot reach (e.g. a
+        // Any other stream — including a WRAPPED System.out/err, and any
+        // user sink the fd write cannot reach (e.g. a
         // ByteArrayOutputStream-backed PrintWriter). Drive it through the
-        // object's own println so the trace is actually captured — this is the
-        // path Spring's AggressiveFactoryBeanInstantiationTests.checkLinkageError
+        // object's own println so the trace is actually captured — this is
+        // the path Spring's AggressiveFactoryBeanInstantiationTests.checkLinkageError
         // and every log-to-string idiom depends on.
         Some(s) => print_throwable_chain_to_stream_obj(ctx, this, s),
     }

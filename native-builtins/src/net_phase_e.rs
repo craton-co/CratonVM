@@ -7229,14 +7229,100 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
     );
 
     // S111r25 — Banner lookup is best-effort; unresolved classpath URLs can
-    // trip `new UrlResource(null)` on some fallback paths. Returning null
-    // from both banner resolvers keeps boot moving (Spring then uses no
-    // custom banner or the default fallback).
+    // trip `new UrlResource(null)` on some fallback paths. The original fix
+    // here unconditionally returned null from both banner resolvers to keep
+    // boot moving — but that also permanently disabled a WORKING custom
+    // `banner.txt`/`banner.gif` lookup, since `getTextBanner`'s real bytecode
+    // (`resourceLoader.getResource(location)`) never even ran anymore
+    // (SpringApplicationTests.customBanner/customBannerWithProperties/
+    // failureInANativeImageWritesFailureToSystemOut always printed the
+    // DEFAULT SpringBootBanner instead of the test's `@WithResource
+    // banner.txt`). Reimplement the real logic instead — `getBanner()`'s
+    // `Environment.getProperty` / `ResourceLoader.getResource` /
+    // `Resource.exists()` / `Resource.getURL()` calls, `ResourceBanner`
+    // construction — but keep the S111r25 defensive intent by swallowing
+    // ANY failure along the way (not just the real method's checked
+    // `IOException`) and falling back to null, same as before.
     r.register(
         "org/springframework/boot/SpringApplicationBannerPrinter",
         "getTextBanner",
         "(Lorg/springframework/core/env/Environment;)Lorg/springframework/boot/Banner;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        |ctx, args| {
+            if std::env::var_os("CRATONVM_DBG_SBLOAD").is_some() {
+                eprintln!(
+                    "[DBG_SBLOAD] SpringApplicationBannerPrinter.getTextBanner native override"
+                );
+            }
+            let this = match obj_arg(args, 0) {
+                Ok(o) => o,
+                Err(_) => return Ok(Some(Value::Object(None))),
+            };
+            let environment = match args.get(1) {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let resource_loader = match ctx.get_field_by_name(this, "resourceLoader") {
+                Value::Object(Some(o)) => o,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let prop_name = ctx.create_string("spring.banner.location");
+            let default_loc = ctx.create_string("banner.txt");
+            let location = match ctx.invoke_virtual(
+                environment,
+                "getProperty",
+                "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
+                &[
+                    Value::Object(Some(prop_name)),
+                    Value::Object(Some(default_loc)),
+                ],
+            ) {
+                Ok(Some(Value::Object(Some(s)))) => s,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let resource = match ctx.invoke_virtual(
+                resource_loader,
+                "getResource",
+                "(Ljava/lang/String;)Lorg/springframework/core/io/Resource;",
+                &[Value::Object(Some(location))],
+            ) {
+                Ok(Some(Value::Object(Some(r)))) => r,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let exists = matches!(
+                ctx.invoke_virtual(resource, "exists", "()Z", &[]),
+                Ok(Some(Value::Int(n))) if n != 0
+            );
+            if !exists {
+                return Ok(Some(Value::Object(None)));
+            }
+            let is_liquibase = match ctx.invoke_virtual(resource, "getURL", "()Ljava/net/URL;", &[])
+            {
+                Ok(Some(Value::Object(Some(url)))) => match ctx.invoke_virtual(
+                    url,
+                    "toExternalForm",
+                    "()Ljava/lang/String;",
+                    &[],
+                ) {
+                    Ok(Some(Value::Object(Some(s)))) => ctx
+                        .read_string(s)
+                        .map(|s| s.contains("liquibase-core"))
+                        .unwrap_or(false),
+                    _ => false,
+                },
+                _ => false,
+            };
+            if is_liquibase {
+                return Ok(Some(Value::Object(None)));
+            }
+            match ctx.new_object_initialized(
+                "org/springframework/boot/ResourceBanner",
+                "(Lorg/springframework/core/io/Resource;)V",
+                &[Value::Object(Some(resource))],
+            ) {
+                Ok(v) => Ok(v),
+                Err(_) => Ok(Some(Value::Object(None))),
+            }
+        },
     );
     r.register(
         "org/springframework/boot/SpringApplicationBannerPrinter",
