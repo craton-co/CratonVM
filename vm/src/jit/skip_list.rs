@@ -1078,8 +1078,10 @@ fn should_skip_jit_internal(
         // every neighbouring RDN comparison/normalisation method remains JIT
         // eligible. Keep this small accessor interpreted under the conservative
         // policy until the JIT's array-backed SortedSet return path is
-        // root-caused. It remains explicitly liftable for diagnosis with
-        // CRATONVM_JIT_ALLOW_PACKAGES=com/unboundid/ldap/sdk/.
+        // root-caused. NOTE: since TOMCAT-JNDIREALM-JIT.2 below widened the
+        // ban to all of com/unboundid/, lifting for diagnosis needs the full
+        // CRATONVM_JIT_ALLOW_PACKAGES=com/unboundid/ prefix; the narrower
+        // com/unboundid/ldap/sdk/ entry only clears this guard, not JIT.2's.
         if class_name == "com/unboundid/ldap/sdk/RDN"
             && method_name == "getNameValuePairs"
             && !package_allowed("com/unboundid/ldap/sdk/", allow_packages)
@@ -1979,8 +1981,11 @@ fn is_unconditional_hash_miscompile_cluster(class_name: &str, method_name: &str)
 // policy until the package can be safely re-bisected. The July 2026 vector and
 // DiskBBQ hang residuals are covered by this same containment: the affected
 // test classes and their Elasticsearch vector-codec bodies sit under
-// `org/elasticsearch/`, while Lucene bytecode has its own fail-closed package
-// skip below.
+// `org/elasticsearch/`. Lucene bytecode is no longer skip-listed: the
+// LUCENE-POSTINGS.1 blanket `org/apache/lucene/` ban was retired by
+// `117d2d906` ("admit Lucene after synchronized-method gate") once the
+// interpreter started gating ACC_SYNCHRONIZED methods out of JIT/OSR itself,
+// which closed the IndexWriter monitor repro that had kept the ban alive.
 fn is_elasticsearch_suite_jit_fragile_cluster(class_name: &str, _method_name: &str) -> bool {
     class_name.starts_with("org/elasticsearch/")
 }
@@ -3542,8 +3547,10 @@ mod tests {
                 true,
                 SkipPolicy::Conservative,
             ),
-            None,
-            "the Tomcat LDAP guard must stay exact to RDN.getNameValuePairs"
+            Some(SkipReason::RustJvmTestFixture),
+            "TOMCAT-JNDIREALM-JIT.2 keeps ALL of com/unboundid/ interpreted \
+             (cross-package String-receiver corruption), not just \
+             RDN.getNameValuePairs"
         );
     }
 
@@ -3556,9 +3563,25 @@ mod tests {
                 false,
                 true,
                 SkipPolicy::Conservative,
+                &["com/unboundid/"],
+            ),
+            None,
+            "CRATONVM_JIT_ALLOW_PACKAGES=com/unboundid/ must lift the \
+             TOMCAT-JNDIREALM-JIT.2 package ban for bisection"
+        );
+        assert_eq!(
+            check_with(
+                "com/unboundid/ldap/sdk/RDN",
+                "getNameValuePairs",
+                false,
+                true,
+                SkipPolicy::Conservative,
                 &["com/unboundid/ldap/sdk/"],
             ),
-            None
+            Some(SkipReason::RustJvmTestFixture),
+            "a narrower allow entry must NOT lift the JIT.2 ban: the \
+             corruption is a cross-package compiled interaction, so partial \
+             lifts of individually-clean slices would mask the repro"
         );
         assert_eq!(
             check(
@@ -4095,8 +4118,10 @@ mod tests {
                 true,
                 SkipPolicy::Conservative,
             ),
-            Some(SkipReason::RustJvmTestFixture),
-            "Lucene vector leaves must stay interpreted by the separate Lucene package ban"
+            None,
+            "Lucene is JIT-admitted at the skip-list level since 117d2d906 \
+             retired the LUCENE-POSTINGS.1 package ban (ACC_SYNCHRONIZED \
+             methods are gated in the interpreter, not here)"
         );
     }
 

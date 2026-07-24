@@ -16165,6 +16165,57 @@ fn file_canonicalize_path(path: &str) -> String {
     result
 }
 
+/// Resolve symlinks in the longest existing ancestor of `path` (via repeated
+/// `std::fs::canonicalize` on shrinking prefixes, i.e. `realpath`), then
+/// re-append whatever nonexistent trailing components were stripped off,
+/// literally and lexically `.`/`..`-collapsed. Mirrors the real JDK's
+/// `UnixFileSystem.canonicalize0` behavior for a path that doesn't fully
+/// exist on disk (`realpath -m` semantics), unlike a pure string-only
+/// normalization which never touches the filesystem and so can't resolve
+/// symlinks at all. Returns `None` only if `path` can't even be made
+/// absolute (no CWD available for a relative path).
+#[cfg(not(windows))]
+fn resolve_existing_ancestor_then_literal_tail(path: &str) -> Option<String> {
+    let norm = file_normalise_path(path);
+    let p = std::path::Path::new(&norm);
+    let abs: std::path::PathBuf = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        std::env::current_dir().ok()?.join(p)
+    };
+    use std::path::Component;
+    let mut comps: Vec<std::ffi::OsString> = Vec::new();
+    for comp in abs.components() {
+        match comp {
+            Component::CurDir | Component::RootDir | Component::Prefix(_) => {}
+            Component::ParentDir => {
+                comps.pop();
+            }
+            Component::Normal(s) => comps.push(s.to_os_string()),
+        }
+    }
+    // Shrink from the immediate parent of the (lexically-collapsed) full path
+    // down to just "/", canonicalizing each candidate ancestor, and re-append
+    // whichever trailing components had to be stripped off once one resolves.
+    // (The full path itself was already tried, via `std::fs::canonicalize`,
+    // by the caller before falling back to this function.) "/" itself always
+    // canonicalizes, so this always terminates with `Some`.
+    for split in (0..comps.len()).rev() {
+        let mut candidate = std::path::PathBuf::from("/");
+        for c in &comps[..split] {
+            candidate.push(c);
+        }
+        if let Ok(canon) = std::fs::canonicalize(&candidate) {
+            let mut result = canon;
+            for c in &comps[split..] {
+                result.push(c);
+            }
+            return Some(result.to_string_lossy().into_owned());
+        }
+    }
+    Some("/".to_string())
+}
+
 fn file_canonicalize_path_uncached(path: &str) -> String {
     #[cfg(windows)]
     {
@@ -16198,9 +16249,27 @@ fn file_canonicalize_path_uncached(path: &str) -> String {
     #[cfg(not(windows))]
     {
         // Non-Windows has no cpcrypt-style filter hazard, so keep the symlink-resolving
-        // filesystem call for existing paths; fall through to lexical for non-existent.
+        // filesystem call for existing paths.
         if let Ok(c) = std::fs::canonicalize(path) {
             return strip_unc(&c.to_string_lossy());
+        }
+        // `path` (or its final component(s)) doesn't exist yet — e.g. a file about
+        // to be created by `WebResourceRoot.write()`/`DirResourceSet.write()`.
+        // `std::fs::canonicalize` (== `realpath`) fails outright in that case, but
+        // falling through to pure lexical normalization below would silently
+        // UN-resolve any symlink in an EXISTING ancestor directory. That breaks any
+        // `child.startsWith(canonicalBase)`-style containment check where
+        // `canonicalBase` was itself computed by successfully canonicalizing an
+        // existing directory through a symlink (e.g. Tomcat's
+        // `AbstractFileResourceSet.file()`, or java.io.File's own canonical-path
+        // contract): the base resolves through the symlink, the not-yet-existing
+        // child doesn't, and the prefix check spuriously fails — a real bug,
+        // confirmed via `TestWebdavServlet`'s PUT-to-a-symlinked-fixture-root
+        // 201-vs-409 regression cluster. Real JDK's `UnixFileSystem.canonicalize0`
+        // resolves symlinks in the longest EXISTING ancestor and appends the
+        // nonexistent tail literally (`realpath -m` semantics) — do the same here.
+        if let Some(resolved) = resolve_existing_ancestor_then_literal_tail(path) {
+            return strip_unc(&resolved);
         }
     }
     // Lexical fallback: normalize the path as a string without touching the filesystem.
@@ -44974,6 +45043,48 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         ensure_layered_handshake_started(ctx, this)?;
         Ok(None)
     });
+    // FIX (TestSsl.testClientInitiatedRenegotiation[JSSE]): these two real
+    // JDK SSLSocket methods had no native registration at all, so calling
+    // either threw `AbstractMethodError: ... has no Code attribute` (the
+    // abstract class has no bytecode of its own) — a VM-crash-shaped error
+    // for what should be an ordinary, always-legal listener registration
+    // call. Honest no-op registration (matching the real
+    // `addHandshakeCompletedListener` null-check contract): we do NOT fire
+    // stored listeners on a later `startHandshake()` call, because rustls
+    // (this VM's TLS backend) does not implement TLS renegotiation at the
+    // protocol level at all — a permanent upstream design choice, same
+    // class of gap as the already-documented rustls DHE/CBC limitations.
+    // Registering these as real (if inert) methods turns the crash into a
+    // clean, honest test assertion failure (listener never completes)
+    // instead of an uncatchable AbstractMethodError.
+    r.register(
+        ssl_sock,
+        "addHandshakeCompletedListener",
+        "(Ljavax/net/ssl/HandshakeCompletedListener;)V",
+        |_ctx, args| {
+            if matches!(args.get(1), Some(Value::Object(None)) | None) {
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: "listener is null".to_string(),
+                }
+                .into());
+            }
+            Ok(None)
+        },
+    );
+    r.register(
+        ssl_sock,
+        "removeHandshakeCompletedListener",
+        "(Ljavax/net/ssl/HandshakeCompletedListener;)V",
+        |_ctx, args| {
+            if matches!(args.get(1), Some(Value::Object(None)) | None) {
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: "listener is null".to_string(),
+                }
+                .into());
+            }
+            Ok(None)
+        },
+    );
     // connect(SocketAddress[, int timeout]) — the other half of the zero-arg
     // `createSocket()` pattern registered on `SSLSocketFactory` above. Real
     // `javax.net.ssl.SSLSocket` does not redeclare `connect` (it stays
