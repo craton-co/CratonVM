@@ -3066,6 +3066,21 @@ impl GenerationalHeap {
         self.card_table.thread_local_dirty_addr(src_addr);
     }
 
+    /// Stable card-table metadata for the x64 inline post-write barrier.
+    ///
+    /// The old-generation arena and card table are fixed-size for this heap
+    /// lifetime. Generated code can therefore range-check the source/target,
+    /// compute `(source - old_base) / CARD_SIZE`, and release-store
+    /// `CARD_DIRTY` directly into `cards_addr[index]`.
+    pub fn jit_card_table_info(&self) -> (usize, usize, usize) {
+        let base = self.card_table.base_addr();
+        (
+            self.card_table.jit_cards_addr(),
+            base,
+            base.wrapping_add(self.card_table.region_size()),
+        )
+    }
+
     /// SATB write barrier — called BEFORE a reference field is overwritten.
     ///
     /// If concurrent marking is active, logs the old reference value to the

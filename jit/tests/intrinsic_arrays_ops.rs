@@ -42,6 +42,9 @@ fn arrays_helpers() -> JitRuntimeHelpers {
     unsafe extern "C" fn noop_npe_with_action() {}
     let s = stub as *const () as usize;
     JitRuntimeHelpers { safepoint_flag_addr: 0, safepoint_slow_path: 0,
+        jit_card_table_addr: 0,
+        jit_card_old_base: 0,
+        jit_card_old_end: 0,
         newarray: s,
         new_object: s,
         anewarray_object: s,

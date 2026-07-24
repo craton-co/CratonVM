@@ -2088,14 +2088,11 @@ pub fn precise_jit_maps_enabled() -> bool {
 /// Default-on inline reference-`putfield` fast path.
 ///
 /// When on, a `putfield` of a reference field emits an inline 16-byte `Value`
-/// store INSTEAD of the `jit_putfield_object` helper CALL — but ONLY on the
-/// barrier-free fast path: the target object is in the YOUNG generation
-/// (`gc_flags & GC_FLAG_OLD_GEN == 0` → no generational card needed) AND the
-/// field's OLD value is null (`payload == 0` → no SATB snapshot to preserve,
-/// regardless of concurrent-marking state). Any other case (null receiver,
-/// old-gen receiver, non-null old value, out-of-bounds index) bails to the
-/// existing, validated `jit_putfield_object` helper, which performs the full
-/// SATB pre-barrier + card-marking write-barrier. This is the canonical
+/// store INSTEAD of the `jit_putfield_object` helper CALL when the field's OLD
+/// value is null (`payload == 0`, so no SATB snapshot is needed). Young
+/// receivers require no post barrier; old generational receivers use the
+/// inline atomic card mark. Collector-specific G1/ZGC barriers and non-null
+/// old values retain the validated helper. This is the canonical
 /// fresh-object-initialisation pattern (`n.left = newChild`) that dominates
 /// allocation-heavy code (object binarytrees). Opt out with
 /// `CRATONVM_NO_JIT_INLINE_PUTFIELD`; the former
@@ -14397,6 +14394,85 @@ impl Compiler {
         self.buf.emit_byte(0xC0 | ((src & 7) << 3) | (dst & 7));
     }
 
+    fn emit_sub_r64_r64(&mut self, dst: u8, src: u8) {
+        self.rex_w_rb(src, dst);
+        self.buf.emit_byte(0x29); // SUB r/m64, r64
+        self.modrm_reg(src, dst);
+    }
+
+    fn emit_shr_r64_imm8(&mut self, reg: u8, shift: u8) {
+        self.rex_w_b(reg);
+        self.buf.emit_byte(0xC1);
+        self.buf.emit_byte(0xE8 | (reg & 7)); // /5 SHR, mod=11
+        self.buf.emit_byte(shift);
+    }
+
+    /// `MOV byte ptr [base + index], imm8`.
+    fn emit_mov_mem8_indexed_imm8(&mut self, base: u8, index: u8, value: u8) {
+        let mut rex = 0x40u8;
+        if index >= 8 {
+            rex |= 0x02; // X
+        }
+        if base >= 8 {
+            rex |= 0x01; // B
+        }
+        if rex != 0x40 {
+            self.buf.emit_byte(rex);
+        }
+        self.buf.emit_byte(0xC6);
+        self.buf.emit_byte(0x04); // mod=00, /0, SIB
+        self.buf
+            .emit_byte(((index & 7) << 3) | (base & 7)); // scale=1
+        self.buf.emit_byte(value);
+    }
+
+    fn inline_card_mark_available(&self) -> bool {
+        self.helpers.jit_card_table_addr != 0
+            && self.helpers.jit_card_old_base != 0
+            && self.helpers.jit_card_old_end > self.helpers.jit_card_old_base
+    }
+
+    /// Emit the generational post-write barrier using `source_reg` and
+    /// `target_reg`, immediately after the reference-slot store.
+    ///
+    /// Protocol: slot store -> release dirty-byte store. x86-64 TSO preserves
+    /// store-store order, so a plain byte store is the release implementation
+    /// and needs no `SFENCE`; the STW consumer acquire-scans the atomic card
+    /// bytes before following the old-to-young edge. G1/ZGC never expose this
+    /// metadata and retain their helper-owned remembered-set barriers.
+    fn emit_inline_card_mark_regs(&mut self, source_reg: u8, target_reg: u8) {
+        debug_assert!(self.inline_card_mark_available());
+        debug_assert!(!matches!(source_reg, RCX | R10 | R11));
+        debug_assert!(!matches!(target_reg, RCX | R10 | R11));
+
+        let mut done = Vec::new();
+        self.emit_test_r64_r64(target_reg);
+        done.push(self.emit_jcc_rel32_patch(0x84)); // null target
+
+        self.emit_mov_imm64_full(R10, self.helpers.jit_card_old_base as i64);
+        self.emit_cmp_r64_r64(source_reg, R10);
+        done.push(self.emit_jcc_rel32_patch(0x82)); // source below old
+        self.emit_mov_imm64_full(R11, self.helpers.jit_card_old_end as i64);
+        self.emit_cmp_r64_r64(source_reg, R11);
+        done.push(self.emit_jcc_rel32_patch(0x83)); // source at/above old end
+
+        self.emit_cmp_r64_r64(target_reg, R10);
+        let target_below_old = self.emit_jcc_rel32_patch(0x82);
+        self.emit_cmp_r64_r64(target_reg, R11);
+        done.push(self.emit_jcc_rel32_patch(0x82)); // old -> old
+        self.patch_rel32_to_here(target_below_old);
+
+        self.emit_mov_r64_r64(RCX, source_reg);
+        self.emit_sub_r64_r64(RCX, R10);
+        self.emit_shr_r64_imm8(RCX, 9); // CARD_SIZE = 512
+        self.emit_mov_imm64_full(R11, self.helpers.jit_card_table_addr as i64);
+        self.emit_mov_mem8_indexed_imm8(R11, RCX, 1); // CARD_DIRTY
+
+        for patch in done {
+            self.patch_rel32_to_here(patch);
+        }
+    }
+
     /// Emit `ADD r64, imm8` (sign-extended). Used by the TLAB-align step
     /// (`cursor + 7` before AND with -8).
     fn emit_add_r64_imm8(&mut self, reg: u8, imm: i8) {
@@ -14768,13 +14844,16 @@ impl Compiler {
         );
         bail.push(self.emit_jcc_rel32_patch(0x84)); // JZ legacy -> helper
 
-        // Old receiver needs a generational card mark.
-        self.emit_test_mem8_imm8(
-            RAX,
-            cratonvm_types::GC_FLAGS_OFFSET as i32,
-            cratonvm_types::GC_FLAG_OLD_GEN,
-        );
-        bail.push(self.emit_jcc_rel32_patch(0x85)); // JNZ old -> helper
+        // Without direct generational card metadata, old receivers retain the
+        // collector-specific helper. Otherwise the post-store mark is inline.
+        if !self.inline_card_mark_available() {
+            self.emit_test_mem8_imm8(
+                RAX,
+                cratonvm_types::GC_FLAGS_OFFSET as i32,
+                cratonvm_types::GC_FLAG_OLD_GEN,
+            );
+            bail.push(self.emit_jcc_rel32_patch(0x85)); // JNZ old -> helper
+        }
 
         // A non-null old value needs the SATB pre-barrier.
         self.emit_mov_r64_mem_disp32(RCX, RAX, cell_off);
@@ -14794,6 +14873,9 @@ impl Compiler {
         // Compact reference fields are bare 8-byte pointers.
         self.load_slot_to_reg(RDX, val_slot);
         self.emit_mov_mem_disp32_r64(RAX, RDX, cell_off);
+        if self.inline_card_mark_available() {
+            self.emit_inline_card_mark_regs(RAX, RDX);
+        }
         let done = self.emit_jmp_rel32_patch();
 
         for b in bail {
@@ -14836,15 +14918,20 @@ impl Compiler {
             cratonvm_types::GC_FLAG_COMPACT,
         );
         bail.push(self.emit_jcc_rel32_patch(0x84)); // JZ legacy -> helper
-        self.emit_test_mem8_imm8(
-            RAX,
-            cratonvm_types::GC_FLAGS_OFFSET as i32,
-            cratonvm_types::GC_FLAG_OLD_GEN,
-        );
-        bail.push(self.emit_jcc_rel32_patch(0x85)); // JNZ old -> helper
+        if !self.inline_card_mark_available() {
+            self.emit_test_mem8_imm8(
+                RAX,
+                cratonvm_types::GC_FLAGS_OFFSET as i32,
+                cratonvm_types::GC_FLAG_OLD_GEN,
+            );
+            bail.push(self.emit_jcc_rel32_patch(0x85)); // JNZ old -> helper
+        }
 
         self.load_slot_to_reg(RDX, val_slot);
         self.emit_mov_mem_disp32_r64(RAX, RDX, cell_off);
+        if self.inline_card_mark_available() {
+            self.emit_inline_card_mark_regs(RAX, RDX);
+        }
         let done = self.emit_jmp_rel32_patch();
 
         for b in bail {
@@ -15143,10 +15230,10 @@ impl Compiler {
 
         // Commit the bump LAST: [R10 + cursor_off] = RAX. This publishes the
         // object's end as the new cursor (and, transitively, the object's
-        // address as a live allocation). Every header store above has
-        // already retired in program order; on x86-64's TSO memory model the
-        // commit store cannot be reordered ahead of them, so the object is
-        // fully typed the instant it becomes reachable.
+        // address as a live allocation). x86-64 TSO preserves the required
+        // header/body-before-cursor store order; the STW handshake provides
+        // the acquire side. Do not add an SFENCE here: it is unnecessary on
+        // this backend and would tax every fast-path allocation.
         self.emit_mov_mem_disp32_r64(R10, RAX, cursor_off);
 
         if skip_post_init_helper {
@@ -19823,17 +19910,18 @@ impl Compiler {
                     self.load_slot_to_reg(RDX, val_slot);
                     // Inline store: MOV QWORD [RAX + RCX*8 + HEADER_SIZE], RDX
                     self.emit_ref_astore_regs();
-                    // Post-store write barrier: jit_write_barrier(vm_ptr, array_ptr, val_ptr).
-                    // The helper itself bails out when val_ptr == 0, so storing null
-                    // skips the card-mark cost (no extra inline branch needed).
-                    // TODO: inline the card-mark (`SHR addr, 9; MOV BYTE [card_table+addr], 0`)
-                    // when `card_table_base` is exposed in JitRuntimeHelpers — would eliminate
-                    // this call entirely. Per task constraint, do not add a new helper field
-                    // unilaterally; leave the call-only barrier as the partial win.
-                    self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
-                    self.load_slot_to_reg(ARG_REGS[1], array_slot);
-                    self.load_slot_to_reg(ARG_REGS[2], val_slot);
-                    self.emit_call_absolute(self.helpers.write_barrier);
+                    // Post-store publication. Generational GC exposes a stable
+                    // atomic card map, so RAX=array/RDX=value can mark it
+                    // inline without a helper transition. G1/ZGC retain their
+                    // collector-specific helper.
+                    if self.inline_card_mark_available() {
+                        self.emit_inline_card_mark_regs(RAX, RDX);
+                    } else {
+                        self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
+                        self.load_slot_to_reg(ARG_REGS[1], array_slot);
+                        self.load_slot_to_reg(ARG_REGS[2], val_slot);
+                        self.emit_call_absolute(self.helpers.write_barrier);
+                    }
                     pc += 1;
                 }
 
@@ -22391,13 +22479,15 @@ impl Compiler {
                                 self.emit_and_r64_imm8(RCX, cratonvm_types::GC_FLAG_COMPACT as i8);
                                 bail.push(self.emit_jcc_rel32_patch(0x84)); // JZ not-compact → helper
                                                                             // old-gen receiver → helper (card). gc_flags @21 bit0.
-                                self.emit_mov_r32_mem_disp32(
-                                    RCX,
-                                    RAX,
-                                    cratonvm_types::GC_FLAGS_OFFSET as i32,
-                                );
-                                self.emit_and_r64_imm8(RCX, 1);
-                                bail.push(self.emit_jcc_rel32_patch(0x85)); // JNZ old-gen
+                                if !self.inline_card_mark_available() {
+                                    self.emit_mov_r32_mem_disp32(
+                                        RCX,
+                                        RAX,
+                                        cratonvm_types::GC_FLAGS_OFFSET as i32,
+                                    );
+                                    self.emit_and_r64_imm8(RCX, 1);
+                                    bail.push(self.emit_jcc_rel32_patch(0x85)); // JNZ old-gen
+                                }
                                                                             // non-null OLD value → helper (SATB). The old ref
                                                                             // is the 8-byte pointer AT the cell base.
                                 self.emit_mov_r64_mem_disp32(RCX, RAX, cell_off);
@@ -22415,6 +22505,9 @@ impl Compiler {
                                                                            // FAST STORE: bare 8-byte pointer at the cell base.
                                 self.load_slot_to_reg(RDX, val_slot);
                                 self.emit_mov_mem_disp32_r64(RAX, RDX, cell_off);
+                                if self.inline_card_mark_available() {
+                                    self.emit_inline_card_mark_regs(RAX, RDX);
+                                }
                                 let done = self.emit_jmp_rel32_patch();
                                 // --- helper fallback (full barriers) ---
                                 for b in bail {
@@ -22455,13 +22548,15 @@ impl Compiler {
                                 });
                                 // old-gen receiver → helper (card barrier). gc_flags is
                                 // the exported gc_flags byte; GC_FLAG_OLD_GEN == bit 0.
-                                self.emit_mov_r32_mem_disp32(
-                                    RCX,
-                                    RAX,
-                                    cratonvm_types::GC_FLAGS_OFFSET as i32,
-                                );
-                                self.emit_and_r64_imm8(RCX, 1);
-                                bail.push(self.emit_jcc_rel32_patch(0x85)); // JNZ old-gen
+                                if !self.inline_card_mark_available() {
+                                    self.emit_mov_r32_mem_disp32(
+                                        RCX,
+                                        RAX,
+                                        cratonvm_types::GC_FLAGS_OFFSET as i32,
+                                    );
+                                    self.emit_and_r64_imm8(RCX, 1);
+                                    bail.push(self.emit_jcc_rel32_patch(0x85)); // JNZ old-gen
+                                }
                                                                             // non-null OLD value → helper (SATB). Read the cell's
                                                                             // 8-byte payload; a null old value never needs SATB.
                                 self.emit_mov_r64_mem_disp32(
@@ -22496,6 +22591,9 @@ impl Compiler {
                                     RDX,
                                     cell_off + FIELD_CELL_PAYLOAD64_OFFSET as i32, // Cast: layout offset → disp32
                                 );
+                                if self.inline_card_mark_available() {
+                                    self.emit_inline_card_mark_regs(RAX, RDX);
+                                }
                                 let done = self.emit_jmp_rel32_patch();
                                 // --- helper fallback (full barriers) ---
                                 for b in bail {
@@ -29319,6 +29417,9 @@ mod tests {
             // so leaving it 0 keeps these tests byte-identical either way.
             safepoint_flag_addr: 0,
             safepoint_slow_path: 0,
+            jit_card_table_addr: 0,
+            jit_card_old_base: 0,
+            jit_card_old_end: 0,
         }
     }
 

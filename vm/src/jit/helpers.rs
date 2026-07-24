@@ -9685,6 +9685,11 @@ pub fn build_helpers() -> JitRuntimeHelpers {
     cratonvm_jit::set_string_locale_lower_direct_fn(jit_string_locale_to_lower_direct as *const () as usize);
     cratonvm_jit::set_concurrent_hashmap_get_direct_fn(jit_concurrent_hashmap_get_direct as *const () as usize);
 
+    let (jit_card_table_addr, jit_card_old_base, jit_card_old_end) =
+        crate::native::jni::process_vm()
+            .and_then(|shared| shared.heap.jit_card_table_info())
+            .unwrap_or((0, 0, 0));
+
     JitRuntimeHelpers {
         newarray: jit_newarray as *const () as usize,
         new_object: jit_new_object as *const () as usize,
@@ -9808,6 +9813,9 @@ pub fn build_helpers() -> JitRuntimeHelpers {
         // to it, so leaving this non-zero when the flag address happens to
         // be unavailable is harmless (dead code, never reached).
         safepoint_slow_path: jit_safepoint_slow_path as *const () as usize,
+        jit_card_table_addr,
+        jit_card_old_base,
+        jit_card_old_end,
     }
 }
 

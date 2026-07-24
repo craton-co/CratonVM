@@ -435,6 +435,16 @@ pub struct JitRuntimeHelpers {
     /// never reached). Appended at the END of the struct so all prior
     /// golden offsets stay stable.
     pub safepoint_slow_path: usize,
+    /// Stable address of the generational collector's atomic card-byte array.
+    ///
+    /// Together with `jit_card_old_base/end`, this enables the x64 backend to
+    /// emit the post-store card mark inline. All three fields are zero for G1
+    /// and ZGC, whose remembered-set protocols remain helper-owned.
+    pub jit_card_table_addr: usize,
+    /// Inclusive old-generation base covered by `jit_card_table_addr`.
+    pub jit_card_old_base: usize,
+    /// Exclusive old-generation end covered by `jit_card_table_addr`.
+    pub jit_card_old_end: usize,
 }
 
 /// Classifies each field of [`JitRuntimeHelpers`] for the validator.
@@ -588,6 +598,11 @@ helper_fields! {
     // whether the JIT ever emits a CALL to it, so 0 here is only ever
     // "not wired" for a hand-built test helpers table.
     (safepoint_slow_path,            FieldKind::OptionalPtr),
+    // Optional generational inline-card metadata. These are data addresses /
+    // bounds rather than callable targets and are all zero for G1/ZGC.
+    (jit_card_table_addr,             FieldKind::Offset),
+    (jit_card_old_base,               FieldKind::Offset),
+    (jit_card_old_end,                FieldKind::Offset),
 }
 
 // Compile-time integrity check: the macro-generated NUM_FIELDS must
@@ -613,7 +628,7 @@ const _: () = assert!(
 // struct field AND its macro entry simultaneously would still satisfy
 // the ratio assert above and silently change the JIT ABI.
 const _: () = assert!(
-    JitRuntimeHelpers::NUM_FIELDS == 53,
+    JitRuntimeHelpers::NUM_FIELDS == 56,
     "JitRuntimeHelpers field count changed — bump the literal here and update \
      the golden-offset test in mod tests if the change is intentional",
 );
@@ -776,6 +791,9 @@ mod tests {
             ldc_string: 0x1158,
             safepoint_flag_addr: 0x1160,
             safepoint_slow_path: 0x1168,
+            jit_card_table_addr: 0x1170,
+            jit_card_old_base: 0x1178,
+            jit_card_old_end: 0x1180,
         }
     }
 
@@ -1001,6 +1019,9 @@ mod tests {
             ldc_string: 0,
             safepoint_flag_addr: 0,
             safepoint_slow_path: 0,
+            jit_card_table_addr: 0,
+            jit_card_old_base: 0,
+            jit_card_old_end: 0,
         };
         assert_eq!(h.newarray, 0);
         assert_eq!(h.write_barrier, 0);
@@ -1176,8 +1197,8 @@ mod tests {
             std::mem::size_of::<JitRuntimeHelpers>(),
             JitRuntimeHelpers::NUM_FIELDS * FIELD_WIDTH,
         );
-        // And the macro-driven count is the canonical 53.
-        assert_eq!(JitRuntimeHelpers::NUM_FIELDS, 53);
+        // And the macro-driven count is the canonical 56.
+        assert_eq!(JitRuntimeHelpers::NUM_FIELDS, 56);
     }
 
     #[test]
@@ -1440,6 +1461,21 @@ mod tests {
                 "safepoint_slow_path",
                 std::mem::offset_of!(JitRuntimeHelpers, safepoint_slow_path),
             ),
+            (
+                53,
+                "jit_card_table_addr",
+                std::mem::offset_of!(JitRuntimeHelpers, jit_card_table_addr),
+            ),
+            (
+                54,
+                "jit_card_old_base",
+                std::mem::offset_of!(JitRuntimeHelpers, jit_card_old_base),
+            ),
+            (
+                55,
+                "jit_card_old_end",
+                std::mem::offset_of!(JitRuntimeHelpers, jit_card_old_end),
+            ),
         ];
 
         // (a) Each field is at its documented sequential byte offset.
@@ -1477,8 +1513,7 @@ mod tests {
     #[test]
     fn jit_runtime_helpers_all_fields_classified() {
         // The macro must classify every field. 41 RequiredPtr + 6
-        // Offset + 6 OptionalPtr = 53 (round-11: safepoint_flag_addr /
-        // safepoint_slow_path added one Offset + one OptionalPtr). A new
+        // 41 RequiredPtr + 6 OptionalPtr + 9 Offset = 56. A new
         // field whose classification is omitted will fail to compile (the
         // macro requires both arms); this test pins the *counts* so a
         // reclassification (e.g. demoting a RequiredPtr to OptionalPtr) is
@@ -1496,7 +1531,7 @@ mod tests {
         let off = f.iter().filter(|e| e.kind == FieldKind::Offset).count();
         assert_eq!(req, 41, "required-pointer count drifted");
         assert_eq!(opt, 6, "optional-pointer count drifted");
-        assert_eq!(off, 6, "offset-field count drifted");
+        assert_eq!(off, 9, "offset-field count drifted");
         assert_eq!(req + opt + off, JitRuntimeHelpers::NUM_FIELDS);
     }
 
