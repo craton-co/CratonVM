@@ -91,23 +91,26 @@ core/spring-boot	org.springframework.boot.logging.LoggingSystemTests
 `JavaLoggingSystemTests` has a HotSpot baseline discrepancy in this Windows
 fixture. Establish the current HotSpot result before calling an assertion a VM defect.
 
-## Cluster D — application lifecycle, SSL, and validation — FIXED (5 root causes), 2 residuals OPEN
+## Cluster D — application lifecycle, SSL, and validation — FIXED (9 root causes), 1 residual OPEN
 
 Likely paths: launch/shutdown hooks, filesystem/process discovery, JKS/TLS,
 message interpolation, and servlet registration.
 
-**Status: 5 root causes fixed** (URLClassLoader `%20` decode +
+**Status: 9 root causes fixed** (URLClassLoader `%20` decode +
 per-instance namespace, JCA no-such-provider ordering, Base64 error
 wording, `ResourceBundle.getObject` missing-key contract,
-`Thread.getState()` TIMED_WAITING) — 8/10 classes now fully clean, a 9th
-(`SpringApplicationTests`) at 98/104. Full writeup:
+`Thread.getState()` TIMED_WAITING, `getTextBanner` S111r25 stub restored to
+a real capture-aware lookup, `ConfigurationClassEnhancer`'s "no visible
+constructors" guard + `BeanDefinitionStoreException` wrapping,
+`Throwable.printStackTrace(System.out/err)` bypassing a redirected/tee'd
+stream) — 9/10 classes now fully clean, including `SpringApplicationTests`
+(was 98/104, now 104/104). Full writeup:
 `docs/internal/fixed-suite-bugs/springboot/core39-clusterD-lifecycle-ssl-validation-FIXED.md`.
-**2 residuals OPEN** (tracked in that doc, not re-listed here): a JIT-only
-Groovy `MetaClassRegistryImpl` bootstrap NPE (`SpringApplicationNoWebTests`,
-passes under `--nojit`), and 4/104 methods in `SpringApplicationTests`
-(a banner-resolution anomaly specific to reflective/nested dispatch into
-`SpringApplicationBannerPrinter`, plus an unrelated constructor-visibility
-gap in `sourcesMustBeAccessible`).
+**1 residual OPEN** (tracked in that doc): `SpringApplicationNoWebTests`
+fails under JIT only (passes under `--nojit`) — a genuine cross-package
+JIT-to-JIT call/dispatch bug between `org/codehaus/groovy/reflection` and
+`org/codehaus/groovy/util` (empirically bisected, not yet root-caused to a
+specific instruction — see the FIXED doc for the full bisection trail).
 
 ```text
 core/spring-boot	org.springframework.boot.SimpleMainTests

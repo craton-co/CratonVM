@@ -297,15 +297,40 @@ fn native_weak_ref_init_queue(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     Ok(None)
 }
 
+/// Round-5 fixed `SoftReference.get()` to touch the LRU timestamp on every
+/// *read* — but a freshly-constructed SoftReference whose first read is
+/// still ahead of it starts with `last_access_time_ms == 0`
+/// (`RefProcessor::discover_reference`), which looks INFINITELY idle to
+/// `process_soft_refs`'s `current_time_ms - last_access_time_ms > threshold`
+/// check. A cache that populates a SoftReference once and only reads it
+/// through a wrapper that doesn't itself call `.get()` on the first
+/// population (Groovy's `org.codehaus.groovy.util.LazyReference.getLocked`
+/// stores `new ManagedReference(bundle, res)` and returns `res` directly,
+/// without ever calling the `ManagedReference`'s own `.get()`) can therefore
+/// have its cached value cleared on the very first GC after construction —
+/// SECONDS before anything ever read it — instead of only under genuine LRU
+/// staleness. Root cause of `groovy.lang.MetaClassImpl.addFields` NPEing on
+/// `CachedClass.getFields()` returning null the *second* time a given
+/// interface's fields are requested (`SpringApplicationNoWebTests`,
+/// `GroovySystem.<clinit>` bootstrap). Touch it once at construction so a
+/// brand-new SoftReference starts its LRU clock at "now", matching a real
+/// JVM's effective behavior (a soft ref's clock is seeded relative to the
+/// GC epoch at creation, not zero).
 fn native_soft_ref_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     ref_init_impl(ctx, args, false);
     discover_ref_from_args(ctx, args, 1, false);
+    if let Some(Value::Object(Some(this))) = args.first() {
+        ctx.touch_soft_reference(*this);
+    }
     Ok(None)
 }
 
 fn native_soft_ref_init_queue(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     ref_init_impl(ctx, args, true);
     discover_ref_from_args(ctx, args, 1, true);
+    if let Some(Value::Object(Some(this))) = args.first() {
+        ctx.touch_soft_reference(*this);
+    }
     Ok(None)
 }
 
