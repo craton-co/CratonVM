@@ -1151,10 +1151,12 @@ fn cl_real_load_class_base(
             .is_some_and(|name| name == "jdk/internal/loader/ClassLoaders$PlatformClassLoader")
     });
     let overrides_find_class = crate::classloader::receiver_overrides_find_class(ctx, this);
+    let bootstrap_appended = cratonvm_classloading::is_bootstrap_appended_class(&internal);
     let defer_to_find_class = overrides_find_class
         && (parent_is_null || parent_is_platform)
         && crate::classloader::cl_bootstrap_scoped()
-        && !crate::classloader::is_bootstrap_class_name(&internal);
+        && !crate::classloader::is_bootstrap_class_name(&internal)
+        && !bootstrap_appended;
     // JVMS 5.3-faithful scoping of the flat-store fallback (real-JDK-mode
     // counterpart of the same fix in classloader.rs's synthetic-mode base
     // delegation — this file has its OWN parallel loadClass implementation,
@@ -1171,7 +1173,7 @@ fn cl_real_load_class_base(
     // only override-less chains change.
     let scoped_user_chain = crate::classloader::cl_bootstrap_scoped()
         && !crate::classloader::is_bootstrap_class_name(&internal)
-        && !cratonvm_classloading::is_bootstrap_appended_class(&internal)
+        && !bootstrap_appended
         && !crate::classloader::builtin_loader_reachable(ctx, this);
 
     // A URLClassLoader parented only by bootstrap/platform is intentionally
@@ -1182,6 +1184,7 @@ fn cl_real_load_class_base(
     // recorded URLs, then make the miss authoritative.
     if crate::classloader::url_classloader_isolated_from_app(ctx, this)
         && !crate::classloader::is_bootstrap_class_name(&internal)
+        && !bootstrap_appended
     {
         if let Some(result) = crate::classloader::ucl_try_define_local_class(ctx, this, &internal) {
             return result;
@@ -1251,8 +1254,10 @@ fn cl_real_load_class_base(
     // URLClassLoader searches its recorded URLs after parent delegation. The
     // helper is a no-op for loaders without recorded URLs, and subclasses do
     // not always expose their inherited URLClassLoader identity here.
-    if let Some(result) = crate::classloader::ucl_try_define_local_class(ctx, this, &internal) {
-        return result;
+    if !bootstrap_appended {
+        if let Some(result) = crate::classloader::ucl_try_define_local_class(ctx, this, &internal) {
+            return result;
+        }
     }
 
     // 2. Custom-classloader extension point: if the receiver overrides

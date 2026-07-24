@@ -11474,10 +11474,9 @@ pub(crate) fn annotation_element_to_java_typed(
                         }
                     }
                 }
-                if let Some(cid) = container_class_id
-                    .and_then(|holder| ctx.class_id_by_name_near(class_name, holder))
-                    .or_else(|| ctx.class_id_by_name(class_name))
-                {
+                let scoped = container_class_id
+                    .and_then(|holder| ctx.class_id_by_name_near(class_name, holder));
+                if let Some(cid) = scoped.or_else(|| ctx.class_id_by_name(class_name)) {
                     let mirror = ctx.get_class_mirror(cid);
                     if iae_trace_cls {
                         eprintln!("ANN-CLASS desc={desc} class={class_name} already-loaded ok");
@@ -15919,7 +15918,13 @@ pub(crate) fn native_class_get_declared_classes(
         // downstream that reads their annotations/enum constants (e.g. a
         // `@Conditional` enum attribute compared by `==` against a value
         // resolved through the forked loader elsewhere).
-        let inner_id = match ctx.class_id_by_name_near(inner_class, class_id) {
+        let loader_id = ctx.loader_id_of_class(class_id);
+        let exact_inner = if loader_id >= 3 {
+            ctx.class_id_defined_by_loader_exact(inner_class, loader_id as u32)
+        } else {
+            None
+        };
+        let inner_id = match exact_inner {
             Some(id) => Some(id),
             None => {
                 // Not already loaded under the outer class's own loader.
@@ -15936,7 +15941,10 @@ pub(crate) fn native_class_get_declared_classes(
                 // `forkedLoader.loadClass("...NestedConfig")` directly)
                 // falls straight to the global lookup and silently returns
                 // the FIRST same-named class some other loader registered.
-                let driven = crate::classloader::defining_loader_for(class_id.as_u32()).and_then(
+                let driven = (loader_id >= 3)
+                    .then(|| crate::classloader::defining_loader_for(class_id.as_u32()))
+                    .flatten()
+                    .and_then(
                     |loader_obj| {
                         let dotted = inner_class.replace('/', ".");
                         let name_obj = ctx.create_string(&dotted);
@@ -15953,10 +15961,15 @@ pub(crate) fn native_class_get_declared_classes(
                 );
                 match driven {
                     Some(id) => Some(id),
-                    None => match ctx.load_class(inner_class) {
-                        Ok(_) => ctx.class_id_by_name_near(inner_class, class_id),
-                        Err(_) => None,
-                    },
+                    None => ctx.class_id_by_name_near(inner_class, class_id).or_else(|| {
+                        ctx.load_class(inner_class)
+                            .ok()
+                            .flatten()
+                            .and_then(|value| match value {
+                                Value::Object(Some(mirror)) => mirror_class_id(ctx, mirror),
+                                _ => None,
+                            })
+                    }),
                 }
             }
         };
