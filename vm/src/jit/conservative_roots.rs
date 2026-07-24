@@ -668,6 +668,7 @@ pub fn prune_returned_jit_entries(scanner_sp: usize) -> usize {
 pub struct JitEntryGuard {
     /// Depth at the moment of construction; used as a sanity check on drop.
     depth_at_push: usize,
+    active_class_id: Option<u32>,
 }
 
 impl JitEntryGuard {
@@ -683,7 +684,10 @@ impl JitEntryGuard {
     pub fn enter() -> Self {
         let sp = current_stack_pointer();
         let depth_at_push = push_jit_entry_at(sp);
-        Self { depth_at_push }
+        Self {
+            depth_at_push,
+            active_class_id: None,
+        }
     }
 
     /// NEW-12: push a JIT entry that carries precise-frame metadata.
@@ -718,7 +722,10 @@ impl JitEntryGuard {
             }),
         };
         let depth_at_push = push_entry_full(entry);
-        Self { depth_at_push }
+        Self {
+            depth_at_push,
+            active_class_id: cratonvm_types::jit_activation::enter(cm.entry_ptr() as usize),
+        }
     }
 }
 
@@ -741,6 +748,9 @@ impl Drop for JitEntryGuard {
             "JitEntryGuard::drop: chain underflow (was depth {})",
             self.depth_at_push
         );
+        if let Some(class_id) = self.active_class_id.take() {
+            cratonvm_types::jit_activation::exit(class_id);
+        }
     }
 }
 

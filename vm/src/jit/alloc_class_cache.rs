@@ -157,6 +157,32 @@ impl JitAllocClassCache {
             }
         }
     }
+
+    /// Remove and reclaim the immutable recipe for an unloaded class.
+    ///
+    /// Called only from the stop-the-world loader-unload transaction, after
+    /// reachability proved that no instance or activation of the class remains.
+    pub fn invalidate(&self, class_id: u32) -> bool {
+        let idx = class_id as usize;
+        let Some(chunk_slot) = self.chunks.get(idx / CHUNK_LEN) else {
+            return false;
+        };
+        let chunk = chunk_slot.load(Ordering::Acquire);
+        if chunk.is_null() {
+            return false;
+        }
+        // SAFETY: published chunks live until cache Drop.
+        let entry =
+            unsafe { &(*chunk).entries[idx % CHUNK_LEN] }.swap(std::ptr::null_mut(), Ordering::AcqRel);
+        if entry.is_null() {
+            false
+        } else {
+            // SAFETY: the STW unload transaction proved the class has no live
+            // users, and the swap gives this caller sole ownership.
+            drop(unsafe { Box::from_raw(entry) });
+            true
+        }
+    }
 }
 
 impl Drop for JitAllocClassCache {

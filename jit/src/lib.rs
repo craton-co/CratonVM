@@ -1348,6 +1348,7 @@ unsafe impl Sync for CompiledMethod {}
 impl Drop for CompiledMethod {
     fn drop(&mut self) {
         let entry = self.entry as usize;
+        cratonvm_types::jit_activation::unregister_executable_owner(entry);
         unregister_jit_code_range(entry);
         if let Some(owners) = JIT_ENTRY_OWNERS.get() {
             let mut owners = owners.lock();
@@ -4715,6 +4716,10 @@ impl JitCache {
         };
         Self::prepare_for_publication(&mut compiled);
         let arc = Arc::new(compiled);
+        cratonvm_types::jit_activation::register_executable_owner(
+            arc.entry_ptr() as usize,
+            declaring_class_id.as_u32(),
+        );
         // Stage 5 — register this method's code range for the GC RBP-chain
         // walker. Enabled when the precise gate is on (the registry is consulted
         // by `remap_active_jit_frames`) OR when the BUG-03 cross-thread STW JIT
@@ -4770,6 +4775,10 @@ impl JitCache {
         };
         Self::prepare_for_publication(&mut compiled);
         let arc = Arc::new(compiled);
+        cratonvm_types::jit_activation::register_executable_owner(
+            arc.entry_ptr() as usize,
+            declaring_class_id.as_u32(),
+        );
         if crate::x64::precise_jit_maps_enabled() || xt_jit_root_scan_enabled() {
             register_jit_code_range(
                 arc.entry_ptr() as usize,
@@ -4855,6 +4864,23 @@ impl JitCache {
                 .inlined_methods
                 .iter()
                 .any(|(cn, _, _)| cn == class_name)
+        })
+    }
+
+    /// Retire every body owned by an unloaded class and every caller that
+    /// inlined one of its methods. Retired executable allocations are reclaimed
+    /// by the epoch/quiescence path once no active frame can still execute them.
+    pub fn invalidate_unloaded_class(
+        &self,
+        class_id: cratonvm_types::ClassId,
+        class_name: &str,
+    ) -> usize {
+        self.invalidate_matching(|key, compiled| {
+            key.declaring_class_id == class_id
+                || compiled
+                    .inlined_methods
+                    .iter()
+                    .any(|(cn, _, _)| cn == class_name)
         })
     }
 

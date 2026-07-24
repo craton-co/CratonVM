@@ -17,7 +17,9 @@ pub mod float_format;
 pub mod handle;
 mod heap_types;
 pub mod intern;
+pub mod jit_activation;
 pub mod loader_pin;
+pub mod metadata_pin;
 pub mod mirror_pin;
 pub mod reflective_probe;
 mod value;
@@ -31,7 +33,8 @@ pub use field_layout::{
     compact_object_body_size, compact_object_field_storage, compact_ref_fields_enabled,
     is_compact_object,
     layout_generation, layout_replace_guard, object_body_size, read_compact_field,
-    register_class_layout, set_compact_ref_fields_enabled, write_compact_field,
+    register_class_layout, set_compact_ref_fields_enabled, unregister_class_layout,
+    write_compact_field,
     CompactLayout, FieldStorageKind,
 };
 pub use float_format::{java_double_to_string, java_float_to_string};

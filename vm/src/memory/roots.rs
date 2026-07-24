@@ -38,6 +38,24 @@ pub(crate) fn conservative_locals_enabled() -> bool {
     base && cratonvm_gc::gc_quiescence::is_active()
 }
 
+#[inline]
+fn conditional_loader_metadata(shared: &SharedVm) -> bool {
+    if !cratonvm_native_builtins::classloader::loader_unload_enabled() {
+        return false;
+    }
+    match shared.config.gc_algorithm {
+        crate::config::GcAlgorithm::Generational => {
+            cratonvm_gc::gc_quiescence::is_active()
+                || cratonvm_gc::gc_quiescence::unregistered_jit_frame_on_stack()
+                || cratonvm_gc::gc_quiescence::major_gc_requested()
+        }
+        crate::config::GcAlgorithm::G1 => {
+            cratonvm_gc::gc_quiescence::class_unload_marking()
+        }
+        crate::config::GcAlgorithm::Zgc => true,
+    }
+}
+
 /// Collect all GC root ObjectRefs from the shared VM state and the current thread.
 ///
 /// Returns a vector of all live non-null ObjectRefs reachable from:
@@ -66,6 +84,28 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     // below re-sets it iff it finds a guard-less JIT frame on the native stack,
     // and the generational collector consults it to pick the non-moving sweep.
     cratonvm_gc::gc_quiescence::clear_unregistered_jit_frame_on_stack();
+    let conditional_metadata = conditional_loader_metadata(shared);
+    cratonvm_types::metadata_pin::set_metadata_weak_mode(conditional_metadata);
+    cratonvm_types::metadata_pin::replace_metadata_pins(&[]);
+
+    // A live activation keeps its defining loader and class metadata alive,
+    // including static methods that carry no receiver oop. Interpreter frames
+    // expose ClassId directly; compiled activations are counted globally by
+    // JitEntryGuard so cross-thread STW scans see them too.
+    for frame in &thread.frames {
+        if let Some(loader) =
+            cratonvm_native_builtins::classloader::defining_loader_for(frame.class_id.as_u32())
+        {
+            roots.push(loader);
+        }
+    }
+    for class_id in cratonvm_types::jit_activation::active_class_ids() {
+        if let Some(loader) =
+            cratonvm_native_builtins::classloader::defining_loader_for(class_id)
+        {
+            roots.push(loader);
+        }
+    }
 
     // 1. Thread frames — scan locals and operand stacks (SoA layout).
     //
@@ -124,9 +164,20 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     // 2. Static fields — all classes
     {
         let statics = shared.statics.read();
-        for fields in statics.values() {
+        for (&class_id, fields) in statics.iter() {
             for val in fields {
                 if let Value::Object(Some(obj_ref)) = val {
+                    if conditional_metadata {
+                        if let Some(loader) =
+                            cratonvm_types::loader_pin::loader_pin_addr(class_id.as_u32())
+                        {
+                            cratonvm_types::metadata_pin::add_metadata_pin(
+                                loader,
+                                obj_ref.as_ptr() as usize,
+                            );
+                            continue;
+                        }
+                    }
                     roots.push(*obj_ref);
                 }
             }
@@ -136,7 +187,18 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     // 3. Class lock objects — synthetic objects for static synchronized methods
     {
         let class_locks = shared.class_locks.read();
-        for obj_ref in class_locks.values() {
+        for (&class_id, obj_ref) in class_locks.iter() {
+            if conditional_metadata {
+                if let Some(loader) =
+                    cratonvm_types::loader_pin::loader_pin_addr(class_id.as_u32())
+                {
+                    cratonvm_types::metadata_pin::add_metadata_pin(
+                        loader,
+                        obj_ref.as_ptr() as usize,
+                    );
+                    continue;
+                }
+            }
             roots.push(*obj_ref);
         }
     }
@@ -233,23 +295,13 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     // mirror alone sufficient. A mirror whose loader turns out unreachable
     // this cycle is pruned post-GC by `memory::gc::reconcile_class_mirrors`.
     //
-    // The mirror_pin propagation is only wired into the Generational
-    // collector's NON-MOVING marker (`gen_heap.rs`'s `mark_young` worklist
-    // loop + old-gen BFS, both keyed off a STABLE object address — see the
-    // mirror_pin call sites there) — the SAME collector
-    // `conservative_locals_enabled` above already keys off
-    // `gc_quiescence::is_active()` for an analogous reason. It is NOT wired
-    // into G1's or ZGC's own marker (a pre-existing gap shared with
-    // `loader_pin` itself, which also only instruments `gen_heap.rs`), nor
-    // into the Generational collector's MOVING young-gen Cheney-copy path,
-    // which relocates objects while scanning and would need the mirror_pin
-    // lookup keyed by each object's PRE-copy address (not implemented this
-    // pass — no test exercises it and it is a materially different,
-    // higher-risk change to the copying loop). So: only take mirrors out of
-    // the unconditional root set when BOTH the configured algorithm is
-    // Generational AND its non-moving marker is what will actually run this
-    // cycle. Under G1/ZGC or the moving path this falls back to the original
-    // (safe, if still-leaky) unconditional rooting.
+    // Conditional mirror propagation is wired into every non-moving full
+    // marker: Generational's non-moving young/old closure, G1's initial/final
+    // full-mark closure, and ZGC-real's mark-sweep closure. Ordinary
+    // Generational moving collections and G1 evacuation pauses retain the
+    // conservative unconditional roots because side-table addresses can move
+    // during those scans. `conditional_loader_metadata` selects exactly these
+    // safe full-mark windows.
     //
     // Classification note: whether to skip unconditional rooting MUST use a
     // PERMANENT signal — `class_manager`'s `ClassLoaderId::UserDefined(_)`,
@@ -270,12 +322,7 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     // which is exactly what that machinery wants.
     {
         let class_mirrors = shared.class_mirrors.read();
-        if cratonvm_native_builtins::classloader::loader_unload_enabled()
-            && shared.config.gc_algorithm == crate::config::GcAlgorithm::Generational
-            && (cratonvm_gc::gc_quiescence::is_active()
-                || cratonvm_gc::gc_quiescence::unregistered_jit_frame_on_stack()
-                || cratonvm_gc::gc_quiescence::major_gc_requested())
-        {
+        if conditional_metadata {
             let cm = shared.class_manager.read();
             for (&class_id, obj_ref) in class_mirrors.iter() {
                 let is_user_defined = cm.get_class(class_id).is_some_and(|c| {
@@ -492,7 +539,20 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     // 13. Resolution cache — CONSTANT_Dynamic values may hold ObjectRefs
     {
         let cache = shared.resolution_cache.read();
-        cache.scan_condy_roots(&mut roots);
+        cache.for_each_condy_root(|class_id, object| {
+            if conditional_metadata {
+                if let Some(loader) =
+                    cratonvm_types::loader_pin::loader_pin_addr(class_id.as_u32())
+                {
+                    cratonvm_types::metadata_pin::add_metadata_pin(
+                        loader,
+                        object.as_ptr() as usize,
+                    );
+                    return;
+                }
+            }
+            roots.push(object);
+        });
     }
 
     // 14. NEW-1.5 — conservative scan of every active JIT spill region on the
@@ -801,6 +861,7 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     //     a no-op (byte-identical to baseline) until a subsystem registers, so
     //     it is safe to land ahead of any adopter. The matching post-move remap
     //     is `native_roots::remap_all_native_roots` in `gc.rs`.
+    shared.osc_cache.scan_roots(&mut roots);
     crate::memory::native_roots::scan_all_native_roots(&mut roots);
 
     if let Some(w) = crate::memory::gc::watch_addr() {

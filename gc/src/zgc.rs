@@ -2213,8 +2213,18 @@ impl GarbageCollector for ZgcRealHeap {
             if header.gc_flags & GC_FLAG_MARKED != 0 {
                 continue; // already visited
             }
+            let class_id = header.class_id.as_u32();
             header.gc_flags |= GC_FLAG_MARKED;
             self.enumerate_references(addr as *mut u8, &mut work, skip_for(addr));
+            if let Some(loader) = cratonvm_types::loader_pin::loader_pin_addr(class_id) {
+                work.push(loader);
+            }
+            if let Some(mirrors) = cratonvm_types::mirror_pin::mirrors_for_loader(addr) {
+                work.extend(mirrors);
+            }
+            if let Some(metadata) = cratonvm_types::metadata_pin::roots_for_loader(addr) {
+                work.extend(metadata);
+            }
         }
         if wild_skipped > 0 {
             tracing::warn!(
@@ -2249,8 +2259,24 @@ impl GarbageCollector for ZgcRealHeap {
                     if h.gc_flags & GC_FLAG_MARKED != 0 {
                         continue;
                     }
+                    let class_id = h.class_id.as_u32();
                     h.gc_flags |= GC_FLAG_MARKED;
                     self.enumerate_references(a as *mut u8, &mut work, skip_for(a));
+                    if let Some(loader) =
+                        cratonvm_types::loader_pin::loader_pin_addr(class_id)
+                    {
+                        work.push(loader);
+                    }
+                    if let Some(mirrors) =
+                        cratonvm_types::mirror_pin::mirrors_for_loader(a)
+                    {
+                        work.extend(mirrors);
+                    }
+                    if let Some(metadata) =
+                        cratonvm_types::metadata_pin::roots_for_loader(a)
+                    {
+                        work.extend(metadata);
+                    }
                 }
             }
             if !resurrected.is_empty() {

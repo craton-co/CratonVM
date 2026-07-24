@@ -14279,13 +14279,17 @@ impl Compiler {
         }
         self.buf.emit_byte(rex);
         self.buf.emit_byte(0x0F);
-        self.buf.emit_byte(match (source_bits, signed) {
+        let opcode = match (source_bits, signed) {
             (8, true) => 0xBE,   // MOVSX r64, r/m8
             (8, false) => 0xB6,  // MOVZX r64, r/m8
             (16, true) => 0xBF,  // MOVSX r64, r/m16
             (16, false) => 0xB7, // MOVZX r64, r/m16
-            _ => unreachable!("compact field load width"),
-        });
+            _ => {
+                self.failed = true;
+                return;
+            }
+        };
+        self.buf.emit_byte(opcode);
         self.buf
             .emit_byte(0x80 | ((dst & 7) << 3) | (base & 7));
         self.buf.emit(&disp.to_le_bytes());

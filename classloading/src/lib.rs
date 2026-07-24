@@ -67,6 +67,7 @@ pub use class_manager::{
     JvmtiClassHook,
     RedefineOptions,
     ResolutionInvalidateHook,
+    UnloadedClass,
     VtableInstallHook,
     VtableMethodSnapshot,
     VtableOverrideHook,

@@ -469,6 +469,20 @@ impl ResolutionCache {
         }
     }
 
+    /// Visit condy roots together with the referring class that owns the
+    /// constant-pool cache entry. Loader unloading uses this to make the root
+    /// conditional on defining-loader liveness.
+    pub fn for_each_condy_root(
+        &self,
+        mut visit: impl FnMut(ClassId, cratonvm_types::ObjectRef),
+    ) {
+        for (&(class_id, _), value) in &self.condy {
+            if let Value::Object(Some(object)) = value {
+                visit(class_id, *object);
+            }
+        }
+    }
+
     /// Update cached CONSTANT_Dynamic ObjectRefs after GC relocation.
     pub fn update_condy_refs(&mut self, pointer_map: &std::collections::HashMap<usize, usize>) {
         for val in self.condy.values_mut() {

@@ -1435,6 +1435,14 @@ pub struct ClassManager {
     init_states: parking_lot::RwLock<FxHashMap<ClassId, Arc<std::sync::atomic::AtomicU8>>>,
 }
 
+/// Metadata released when a user-defined class loader is unloaded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnloadedClass {
+    pub id: ClassId,
+    pub name: Arc<str>,
+    pub loader_id: ClassLoaderId,
+}
+
 /// Initialization-state values stored in [`ClassManager::init_states`].
 pub const CLASS_INIT_UNINITIALIZED: u8 = 0;
 pub const CLASS_INIT_IN_PROGRESS: u8 = 1;
@@ -4279,6 +4287,70 @@ impl ClassManager {
     /// Get a mutable reference to a loaded class by its id.
     pub fn get_class_mut(&mut self, id: ClassId) -> Option<&mut Class> {
         self.class_store.get_mut(id)
+    }
+
+    /// Atomically detach every class defined by `loader_id` from the live
+    /// metadata graph.
+    ///
+    /// The underlying [`ClassStore`] leaves monotonic tombstones, so stale
+    /// ClassIds fail closed and can never alias a later definition. Callers
+    /// must additionally evict VM-owned ClassId caches (statics, mirrors,
+    /// vtables and executable code); the returned identities are the exact
+    /// invalidation set for that transaction.
+    pub fn unload_user_loader(&mut self, loader_id: ClassLoaderId) -> Vec<UnloadedClass> {
+        if !matches!(loader_id, ClassLoaderId::UserDefined(_)) {
+            return Vec::new();
+        }
+
+        let ids: FxHashSet<ClassId> = self
+            .class_store
+            .iter()
+            .filter(|class| class.loader_id == loader_id)
+            .map(|class| class.id)
+            .collect();
+        if ids.is_empty() {
+            self.user_loaders.remove(&loader_id);
+            return Vec::new();
+        }
+
+        // Remove both defining and initiating-name aliases that point into the
+        // dead loader's class set.
+        self.loaded_classes.retain(|_, id| !ids.contains(id));
+        self.user_loaders.remove(&loader_id);
+
+        self.vtable_descriptors.retain(|id, _| !ids.contains(id));
+        self.skip_bytecode_verification
+            .retain(|id| !ids.contains(id));
+        self.redefine_generations
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .retain(|id, _| !ids.contains(id));
+        self.init_states.write().retain(|id, _| !ids.contains(id));
+
+        for id in &ids {
+            if let Some(bytes) = self.class_bytes_cache.remove(id) {
+                self.class_bytes_cache_size =
+                    self.class_bytes_cache_size.saturating_sub(bytes.len());
+            }
+        }
+        self.class_bytes_cache_fifo
+            .retain(|id| !ids.contains(id));
+
+        let mut unloaded = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(class) = self.class_store.remove(id) {
+                unloaded.push(UnloadedClass {
+                    id,
+                    name: class.name,
+                    loader_id,
+                });
+                // Symbolic and reflective resolution caches may hold the class
+                // as either key or resolved target.
+                fire_resolution_invalidate_hook(id.as_u32());
+            }
+        }
+        unloaded.sort_unstable_by_key(|class| class.id.as_u32());
+        unloaded
     }
 
     /// Find a raw classpath resource by name.

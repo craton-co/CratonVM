@@ -681,6 +681,9 @@ pub struct SharedVm {
     /// `x64_deopt_entry` can read the live epoch lock-free, BEFORE dereferencing
     /// the deopt box, to detect a superseded compilation.
     pub method_epochs: parking_lot::RwLock<FxHashMap<String, Box<std::sync::atomic::AtomicU64>>>,
+    /// Shared fail-closed epoch for methods admitted after the bounded
+    /// per-method epoch table reaches capacity.
+    method_epoch_overflow: std::sync::atomic::AtomicU64,
 
     /// Invalidation manager — tracks class-hierarchy assumptions and invalidates
     /// dependent compiled methods when class loading breaks those assumptions.
@@ -2871,6 +2874,7 @@ impl SharedVm {
             tiered_manager: crate::jit::tiered::TieredCompilationManager::with_env_policy(),
             deopt_log: parking_lot::Mutex::new(crate::jit::deopt::DeoptimizationLog::new()),
             method_epochs: parking_lot::RwLock::new(FxHashMap::default()),
+            method_epoch_overflow: std::sync::atomic::AtomicU64::new(0),
             invalidation_manager: parking_lot::Mutex::new(
                 cratonvm_jit::deopt::InvalidationManager::new(),
             ),
@@ -4110,7 +4114,10 @@ impl SharedVm {
             .read()
             .get(method_key)
             .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
-            .unwrap_or(0)
+            .unwrap_or_else(|| {
+                self.method_epoch_overflow
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            })
     }
 
     /// deopt-osr Step 9 — advance and return the live compilation epoch for
@@ -4118,10 +4125,17 @@ impl SharedVm {
     /// superseded. Called on each invalidation (see
     /// `DeoptimizationController::deoptimize`). See [`Self::method_epochs`].
     pub fn bump_compilation_epoch(&self, method_key: &str) -> u64 {
+        const METHOD_EPOCH_CAP: usize = 65_536;
         let mut map = self.method_epochs.write();
-        let cell = map
-            .entry(method_key.to_string())
-            .or_insert_with(|| Box::new(std::sync::atomic::AtomicU64::new(0)));
+        if !map.contains_key(method_key) && map.len() >= METHOD_EPOCH_CAP {
+            return self
+                .method_epoch_overflow
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                + 1;
+        }
+        let cell = map.entry(method_key.to_string()).or_insert_with(|| {
+            Box::new(std::sync::atomic::AtomicU64::new(0))
+        });
         // fetch_add returns the PREVIOUS value; the new live epoch is +1.
         cell.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
     }
@@ -4134,7 +4148,11 @@ impl SharedVm {
     /// the live epoch lock-free before touching the deopt box. Only called under
     /// `deopt_real_enabled()` (at install, by `stamp_compilation_epoch`).
     pub fn live_epoch_cell_ptr(&self, method_key: &str) -> *const std::sync::atomic::AtomicU64 {
+        const METHOD_EPOCH_CAP: usize = 65_536;
         let mut map = self.method_epochs.write();
+        if !map.contains_key(method_key) && map.len() >= METHOD_EPOCH_CAP {
+            return &self.method_epoch_overflow;
+        }
         let cell = map
             .entry(method_key.to_string())
             .or_insert_with(|| Box::new(std::sync::atomic::AtomicU64::new(0)));

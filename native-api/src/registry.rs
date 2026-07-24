@@ -2236,6 +2236,11 @@ pub trait NativeContext {
     /// Returns the number of classes currently loaded in the VM.
     fn loaded_class_count(&self) -> usize;
 
+    /// Cumulative classes reclaimed by class-loader unloading.
+    fn unloaded_class_count(&self) -> u64 {
+        0
+    }
+
     /// Returns the cumulative number of GC collections that have occurred.
     fn gc_collection_count(&self) -> u64;
 

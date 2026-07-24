@@ -1740,6 +1740,13 @@ pub fn force_gc_from_native(shared: &SharedVm, thread: &mut JvmThread) {
     // full collection that processes every generation's references; this
     // IHOP/completion check is the closest cycle-machinery equivalent.
     maybe_concurrent_gc(shared, thread);
+    if shared.heap.is_g1() {
+        // An explicit System.gc() is a full-collection request, not merely an
+        // Eden evacuation. Finish the G1 mark/remark/cleanup synchronously so
+        // dead old regions, weak loaders, and their metadata are observable
+        // before System.gc() returns.
+        g1_force_full_cycle(shared, thread);
+    }
     // Run pending finalizers
     run_finalizers(shared, thread);
     // Run pending Cleaner actions (NEW-17). These were submitted to
@@ -1963,10 +1970,21 @@ fn process_references_after_gc(
         let is_marked = |addr: usize| -> bool {
             pointer_map.contains_key(&addr) || shared.heap.is_addr_live(addr)
         };
-        cratonvm_native_builtins::classloader::gc_reconcile_defining_loaders(
+        let dead_class_hints =
+            cratonvm_native_builtins::classloader::gc_reconcile_defining_loaders(
             &is_marked,
             pointer_map,
         );
+        let unload =
+            crate::memory::gc::unload_dead_class_metadata(shared, &dead_class_hints);
+        if unload.classes_unloaded != 0 {
+            tracing::debug!(
+                loaders = unload.loaders_unloaded,
+                classes = unload.classes_unloaded,
+                jit_entries = unload.jit_entries_retired,
+                "class-loader metadata unloaded"
+            );
+        }
         // Prune dead entries from the overlay-backed-collection side-tables
         // (LinkedList / LinkedHashMap / TreeMap / TreeSet — `roots.rs` step 17
         // / `native_collections::gc_scan_collection_overlay_roots`). This
@@ -2880,8 +2898,10 @@ fn init_object_header(ptr: *mut u8, class_id: ClassId, num_fields: usize, identi
         ArrayElementType::Reference,
         identity_hash_code,
         0,
-        // Truncation-checked: num_fields (usize) to u32; JVM classes have < 2^16 fields
-        u32::try_from(num_fields).expect("object field count exceeds u32"),
+        // A class-file field table is u16-sized, so this is unreachable for a
+        // verified Java class. Keep the allocation path panic-free if a corrupt
+        // synthetic caller nevertheless violates that invariant.
+        u32::try_from(num_fields).unwrap_or(u32::MAX),
     );
     // SAFETY: ptr points to freshly allocated, properly aligned memory for an ObjectHeader.
     unsafe { std::ptr::write(ptr as *mut ObjectHeader, header) };
@@ -4266,7 +4286,9 @@ fn g1_concurrent_mark_cycle(shared: &SharedVm, thread: &mut JvmThread) {
         let ref_objs = shared.ref_processor.lock().reference_object_addresses();
         shared.heap.g1_set_reference_skip_set(&ref_objs);
         // Mark roots into the G1 mark bitmap
-        let roots = collect_roots(shared, thread);
+        let roots = cratonvm_gc::gc_quiescence::with_class_unload_marking(|| {
+            collect_roots(shared, thread)
+        });
         let snapshot_roots = shared.thread_registry.collect_all_root_snapshots();
         let all_roots: Vec<cratonvm_types::ObjectRef> = roots
             .into_iter()
@@ -4358,7 +4380,9 @@ fn g1_final_remark_cleanup(shared: &SharedVm, thread: &mut JvmThread) {
         // mutators' buffers are pulled by `remark` itself
         // (`flush_all_thread_satb_buffers`) now that they are parked.
         shared.heap.flush_thread_satb();
-        let roots = collect_roots(shared, thread);
+        let roots = cratonvm_gc::gc_quiescence::with_class_unload_marking(|| {
+            collect_roots(shared, thread)
+        });
         let snapshot_roots = shared.thread_registry.collect_all_root_snapshots();
         let all_roots: Vec<cratonvm_types::ObjectRef> = roots
             .into_iter()
@@ -4422,17 +4446,27 @@ fn g1_remark_process_references(
     shared: &SharedVm,
     is_marked: &dyn Fn(usize) -> bool,
 ) -> Vec<usize> {
-    // Companion reconciliation for the class-mirror cache (see
-    // `memory::gc::reconcile_class_mirrors` / `roots.rs` step 6). `roots.rs`
-    // step 6 only stops unconditionally rooting a user-defined class's mirror
-    // when the Generational collector's non-moving marker is active — NOT
-    // under G1 (no mirror_pin propagation wired into `g1.rs` yet) — so under
-    // G1 every mirror stays rooted and this call is a no-op (`is_marked`
-    // always true, nothing pruned). Kept here anyway, unconditionally, so
-    // this stays correct for free if G1 ever gains the same treatment. Done
-    // before the `no_refproc` short-circuit, same rationale as the post-GC
-    // path.
+    // G1's marker follows loader/mirror/metadata side edges during a full mark.
+    // Reconcile those weak ownership tables against the completed bitmap before
+    // cleanup frees dead regions and before the optional reference-processor
+    // short-circuit.
     crate::memory::gc::reconcile_class_mirrors(shared, is_marked);
+    let no_moves = std::collections::HashMap::new();
+    let dead_class_hints =
+        cratonvm_native_builtins::classloader::gc_reconcile_defining_loaders(
+            is_marked,
+            &no_moves,
+        );
+    let unloaded =
+        crate::memory::gc::unload_dead_class_metadata(shared, &dead_class_hints);
+    if unloaded.classes_unloaded != 0 {
+        tracing::debug!(
+            loaders = unloaded.loaders_unloaded,
+            classes = unloaded.classes_unloaded,
+            jit_entries = unloaded.jit_entries_retired,
+            "G1 class-loader metadata unloaded at final remark"
+        );
+    }
 
     // Same subsystem-level exclusion switch as the post-GC path.
     if no_refproc() {
@@ -18540,6 +18574,28 @@ fn lookup_loader_initiated(
     cache_hit
 }
 
+/// Per-loader hard cap for initiating-loader memoization. Entries are an
+/// optimization, not VM state: eviction re-drives `loadClass` and therefore
+/// preserves JVMS resolution semantics.
+const INITIATING_RESOLUTION_CACHE_CAP: usize = 4096;
+
+fn cache_loader_initiated(
+    shared: &SharedVm,
+    loader: cratonvm_types::ClassLoaderId,
+    name: &str,
+    class_id: ClassId,
+) {
+    let mut caches = shared.initiating_resolution_cache.write();
+    let cache = caches.entry(loader).or_default();
+    let key = cratonvm_types::intern_arc(name);
+    if !cache.contains_key(key.as_ref()) && cache.len() >= INITIATING_RESOLUTION_CACHE_CAP {
+        if let Some(victim) = cache.keys().next().cloned() {
+            cache.remove(victim.as_ref());
+        }
+    }
+    cache.insert(key, class_id);
+}
+
 /// Read only the exact definitions that belong to `referencing_class_id`'s
 /// user loader. Unlike [`lookup_loader_initiated`], this intentionally never
 /// consults the initiating-resolution cache.
@@ -18916,12 +18972,7 @@ fn drive_defining_loader_load(
     if let Ok(Some(Value::Object(Some(mirror)))) = result {
         if let Some(id) = crate::vm::class_id_from_mirror(shared, mirror) {
             if let Some(l) = cache_loader {
-                shared
-                    .initiating_resolution_cache
-                    .write()
-                    .entry(l)
-                    .or_default()
-                    .insert(cratonvm_types::intern_arc(name), id);
+                cache_loader_initiated(shared, l, name, id);
             }
             return Some(id);
         }

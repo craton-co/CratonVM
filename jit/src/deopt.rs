@@ -504,6 +504,12 @@ impl DeoptimizationLog {
         }
     }
 
+    /// Release deoptimization history for methods owned by an unloaded class.
+    pub fn clear_class(&mut self, class_name: &str) {
+        let prefix = format!("{class_name}.");
+        self.history.retain(|method, _| !method.starts_with(&prefix));
+    }
+
     /// Recommend a deopt action based on current history and the triggering reason.
     ///
     /// The `reason` parameter influences the recommended action:
@@ -650,6 +656,16 @@ impl InvalidationManager {
             leaf_class_index: FxHashMap::default(),
             unique_method_index: FxHashMap::default(),
         }
+    }
+
+    /// Drop all hierarchy assumptions after class unloading. Unloading is rare
+    /// and invalidates both owners and dependants, so a conservative reset is
+    /// smaller and safer than retaining strings that may name dead metadata.
+    pub fn clear_all(&mut self) {
+        self.assumptions.clear();
+        self.class_dependencies.clear();
+        self.leaf_class_index.clear();
+        self.unique_method_index.clear();
     }
 
     /// Register an assumption made while compiling `method`.

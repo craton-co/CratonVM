@@ -1691,12 +1691,29 @@ fn field_descriptor_remember(vm_key: usize, class_id: u32, slot_index: usize, by
     });
 }
 
+/// Hard bound for descriptor memoization. Eviction is correctness-neutral:
+/// a miss simply re-walks immutable class metadata and repopulates the entry.
+const FIELD_DESCRIPTOR_CACHE_CAP: usize = 1 << 16;
+
+fn cache_field_descriptor(shared: &SharedVm, key: (ClassId, usize), byte: u8) {
+    let mut cache = shared.field_descriptor_cache.write();
+    if !cache.contains_key(&key) && cache.len() >= FIELD_DESCRIPTOR_CACHE_CAP {
+        if let Some(victim) = cache.keys().next().copied() {
+            cache.remove(&victim);
+        }
+    }
+    cache.insert(key, byte);
+}
+
 fn resolve_field_descriptor_byte_cached(
     shared: &SharedVm,
     class_id: ClassId,
     slot_index: usize,
 ) -> Option<u8> {
-    let vm_key = shared as *const SharedVm as usize;
+    // A SharedVm address can be recycled after a short-lived VM is dropped,
+    // especially by unit tests. Use the process-unique lifetime identity so
+    // thread-local descriptor entries can never bleed into a later VM.
+    let vm_key = shared.vm_identity;
     if let Some(cached) = FIELD_DESCRIPTOR_LAST.with(|cache| {
         cache
             .get()
@@ -1867,17 +1884,11 @@ fn resolve_field_descriptor_byte_cached(
             // Defensive: a real descriptor first byte is never NUL, so it can
             // never collide with the negative sentinel.
             debug_assert_ne!(b, 0, "descriptor first byte must not be NUL");
-            shared
-                .field_descriptor_cache
-                .write()
-                .insert((class_id, slot_index), b);
+            cache_field_descriptor(shared, (class_id, slot_index), b);
             field_descriptor_remember(vm_key, class_id.as_u32(), slot_index, b);
         }
         None if cacheable => {
-            shared
-                .field_descriptor_cache
-                .write()
-                .insert((class_id, slot_index), 0u8);
+            cache_field_descriptor(shared, (class_id, slot_index), 0u8);
             field_descriptor_remember(vm_key, class_id.as_u32(), slot_index, 0u8);
         }
         None => {}
@@ -7917,6 +7928,13 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
 
     fn loaded_class_count(&self) -> usize {
         self.shared.class_manager.read().loaded_count()
+    }
+
+    fn unloaded_class_count(&self) -> u64 {
+        self.shared
+            .diagnostic_counters
+            .classes_unloaded
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     fn gc_collection_count(&self) -> u64 {

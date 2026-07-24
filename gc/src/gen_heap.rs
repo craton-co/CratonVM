@@ -5713,6 +5713,20 @@ impl GenerationalHeap {
                     mark_young_precise(mirror_addr as *mut u8, &mut worklist, &mut side_marks);
                 }
             }
+            // Loader-owned metadata roots (static reference fields, class
+            // monitor, condy and reflective descriptor caches) are conditional
+            // edges: follow them only after the loader itself is live.
+            if let Some(metadata_addrs) =
+                cratonvm_types::metadata_pin::roots_for_loader(obj_ptr as usize)
+            {
+                for metadata_addr in metadata_addrs {
+                    mark_young_precise(
+                        metadata_addr as *mut u8,
+                        &mut worklist,
+                        &mut side_marks,
+                    );
+                }
+            }
         }
 
         // Sorted view of the side mark set for O(1)-amortized lockstep checks
@@ -7808,6 +7822,22 @@ impl GenerationalHeap {
                     let mp = mirror_addr as *mut u8;
                     if old_gen.contains(mp) {
                         // SAFETY: `mp` is within old gen (verified by `contains`).
+                        let h = unsafe { &mut *(mp as *mut ObjectHeader) };
+                        if h.gc_flags & GC_FLAG_MARKED == 0 {
+                            h.gc_flags |= GC_FLAG_MARKED;
+                            worklist.push(mp);
+                        }
+                    }
+                }
+            }
+            if let Some(metadata_addrs) =
+                cratonvm_types::metadata_pin::roots_for_loader(obj_ptr as usize)
+            {
+                for metadata_addr in metadata_addrs {
+                    let mp = metadata_addr as *mut u8;
+                    if old_gen.contains(mp) {
+                        // SAFETY: `mp` is within old gen and is a registered
+                        // loader-owned heap root.
                         let h = unsafe { &mut *(mp as *mut ObjectHeader) };
                         if h.gc_flags & GC_FLAG_MARKED == 0 {
                             h.gc_flags |= GC_FLAG_MARKED;

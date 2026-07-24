@@ -272,6 +272,31 @@ pub fn register_class_layout(class_id: u32, layout: Arc<CompactLayout>) {
     LAYOUT_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
 }
 
+/// Drop the compact field layout owned by an unloaded class.
+///
+/// The registry is slot-indexed and ClassIds are monotonic, so clearing the
+/// slot releases the layout allocation without allowing a future class to
+/// inherit it.
+pub fn unregister_class_layout(class_id: u32) {
+    let Ok(index) = usize::try_from(class_id) else {
+        return;
+    };
+    CLASS_LAYOUT_VERSIONS
+        .write()
+        .unwrap()
+        .retain(|(id, _), _| *id != class_id);
+    let mut layouts = CLASS_LAYOUTS.write().unwrap();
+    if let Some(slot) = layouts.get_mut(index) {
+        if slot.take().is_some() {
+            if index < MAX_DENSE_CLASS_LAYOUTS {
+                layout_replace_counts()[index]
+                    .fetch_add(1, std::sync::atomic::Ordering::Release);
+            }
+            LAYOUT_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
+        }
+    }
+}
+
 /// Look up the compact layout for a class, if registered.
 #[inline]
 pub fn class_layout(class_id: u32) -> Option<Arc<CompactLayout>> {
@@ -475,23 +500,37 @@ pub unsafe fn write_compact_field(
             unsafe { (&*(ptr as *const AtomicU16)).store(raw, ordering) };
         }
         FieldStorageKind::Int => {
-            let raw = match value { Value::Int(v) => v as u32, _ => 0 };
+            let raw = match value {
+                Value::Int(v) => v as u32,
+                Value::Float(v) => v.to_bits(),
+                _ => 0,
+            };
             unsafe { (&*(ptr as *const AtomicU32)).store(raw, ordering) };
         }
         FieldStorageKind::Float => {
-            let raw = match value { Value::Float(v) => v.to_bits(), _ => 0 };
+            let raw = match value {
+                Value::Float(v) => v.to_bits(),
+                Value::Int(v) => v as u32,
+                _ => 0,
+            };
             unsafe { (&*(ptr as *const AtomicU32)).store(raw, ordering) };
         }
         FieldStorageKind::Long => {
             let raw = match value {
                 Value::Long(v) => v as u64,
                 Value::Int(v) => v as i64 as u64,
+                Value::Double(v) => v.to_bits(),
                 _ => 0,
             };
             unsafe { (&*(ptr as *const AtomicU64)).store(raw, ordering) };
         }
         FieldStorageKind::Double => {
-            let raw = match value { Value::Double(v) => v.to_bits(), _ => 0 };
+            let raw = match value {
+                Value::Double(v) => v.to_bits(),
+                Value::Long(v) => v as u64,
+                Value::Int(v) => v as i64 as u64,
+                _ => 0,
+            };
             unsafe { (&*(ptr as *const AtomicU64)).store(raw, ordering) };
         }
     }

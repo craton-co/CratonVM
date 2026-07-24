@@ -16,6 +16,145 @@ use crate::types::ObjectRef;
 #[cfg(test)]
 use crate::types::Value;
 
+/// Result of one VM metadata-unloading transaction.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ClassMetadataUnloadResult {
+    pub loaders_unloaded: usize,
+    pub classes_unloaded: usize,
+    pub jit_entries_retired: usize,
+}
+
+/// Complete the metadata half of class-loader unloading after GC has proved
+/// the defining loader objects unreachable.
+///
+/// ClassIds remain monotonic tombstones. Every VM-owned cache is either
+/// invalidated by exact ClassId or conservatively flushed when it lacks an
+/// ownership index.
+pub fn unload_dead_class_metadata(
+    shared: &crate::vm::SharedVm,
+    dead_class_hints: &[u32],
+) -> ClassMetadataUnloadResult {
+    use crate::classloading::{ClassId, ClassLoaderId};
+    use rustc_hash::FxHashSet;
+
+    if dead_class_hints.is_empty() {
+        return ClassMetadataUnloadResult::default();
+    }
+
+    let loaders: FxHashSet<ClassLoaderId> = {
+        let cm = shared.class_manager.read();
+        dead_class_hints
+            .iter()
+            .filter_map(|id| cm.get_loader_id(ClassId::new(*id)))
+            .filter(|id| matches!(id, ClassLoaderId::UserDefined(_)))
+            .collect()
+    };
+    if loaders.is_empty() {
+        cratonvm_native_builtins::classloader::forget_unloaded_classes(dead_class_hints);
+        return ClassMetadataUnloadResult::default();
+    }
+
+    let unloaded = {
+        let mut cm = shared.class_manager.write();
+        let mut classes = Vec::new();
+        for loader in &loaders {
+            classes.extend(cm.unload_user_loader(*loader));
+        }
+        classes
+    };
+    if unloaded.is_empty() {
+        cratonvm_native_builtins::classloader::forget_unloaded_classes(dead_class_hints);
+        return ClassMetadataUnloadResult::default();
+    }
+
+    let ids: FxHashSet<ClassId> = unloaded.iter().map(|class| class.id).collect();
+    let raw_ids: Vec<u32> = unloaded.iter().map(|class| class.id.as_u32()).collect();
+
+    shared.statics.write().retain(|id, _| !ids.contains(id));
+    shared.class_locks.write().retain(|id, _| !ids.contains(id));
+    shared
+        .field_descriptor_cache
+        .write()
+        .retain(|(id, _), _| !ids.contains(id));
+    shared
+        .class_init_waiters
+        .lock()
+        .retain(|id, _| !ids.contains(id));
+    shared
+        .lambda_proxies
+        .write()
+        .retain(|id, _| !ids.contains(id));
+    shared
+        .lambda_proxy_hosts
+        .write()
+        .retain(|proxy, host| !ids.contains(proxy) && !ids.contains(host));
+
+    let dead_mirrors: Vec<ObjectRef> = {
+        let mut mirrors = shared.class_mirrors.write();
+        ids.iter().filter_map(|id| mirrors.remove(id)).collect()
+    };
+    shared
+        .class_mirrors_reverse
+        .write()
+        .retain(|_, id| !ids.contains(id));
+    cratonvm_native_builtins::classloader::forget_unloaded_class_mirrors(&dead_mirrors);
+
+    {
+        let mut cache = shared.initiating_resolution_cache.write();
+        cache.retain(|loader, entries| {
+            if loaders.contains(loader) {
+                return false;
+            }
+            entries.retain(|_, id| !ids.contains(id));
+            !entries.is_empty()
+        });
+    }
+
+    // These caches are pure memoizers. A conservative clear is preferable to
+    // retaining a value that mentions an unloaded class through an indirect
+    // target not represented in its key.
+    shared.shared_resolution.invalidate_all();
+    shared.osc_cache.remove_classes(&ids);
+
+    let mut jit_entries_retired = 0;
+    {
+        let mut vtables = shared.vtable_manager.write();
+        for class in &unloaded {
+            vtables.unload_class(class.id.as_u32() as u64);
+        }
+    }
+    for class in &unloaded {
+        shared.jit_alloc_class_cache.invalidate(class.id.as_u32());
+        shared.profile_store.invalidate_class(class.id.as_u32());
+        shared.tiered_manager.invalidate_class(class.name.as_ref());
+        shared.deopt_log.lock().clear_class(class.name.as_ref());
+        jit_entries_retired += shared
+            .jit_cache
+            .invalidate_unloaded_class(class.id, class.name.as_ref());
+    }
+    shared.invalidation_manager.lock().clear_all();
+    shared
+        .jit_skip_set
+        .write()
+        .retain(|(class_name, _, _)| {
+            !unloaded
+                .iter()
+                .any(|class| class.name.as_ref() == class_name.as_ref())
+        });
+
+    cratonvm_native_builtins::classloader::forget_unloaded_classes(&raw_ids);
+    shared
+        .diagnostic_counters
+        .classes_unloaded
+        .fetch_add(unloaded.len() as u64, std::sync::atomic::Ordering::Relaxed);
+
+    ClassMetadataUnloadResult {
+        loaders_unloaded: loaders.len(),
+        classes_unloaded: unloaded.len(),
+        jit_entries_retired,
+    }
+}
+
 /// Post-GC reconciliation of the class-mirror cache (companion to
 /// `roots.rs` step 6, which stops unconditionally rooting a user-defined
 /// class's `java.lang.Class` mirror once `CRATONVM_LOADER_UNLOAD` is on —

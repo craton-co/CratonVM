@@ -623,6 +623,7 @@ impl<'a> SharedEvac<'a> {
                 }
             }
         }
+
     }
 
     /// Seed phase (driver/main thread, single-threaded): walk a non-CSet
@@ -5365,6 +5366,49 @@ impl G1Collector {
                     }
                 }
                 }
+            }
+        }
+
+        // Class-loader-data side edges. CratonVM stores these relationships in
+        // VM side tables rather than traceable Java fields:
+        //
+        //   live instance -> defining loader
+        //   live defining loader -> class mirrors and metadata oops
+        //
+        // Root gathering publishes the mirror/metadata tables only for G1's
+        // initial/final full-mark snapshots, never for an evacuating young
+        // pause. The concurrent marker can therefore follow them exactly like
+        // ordinary object references without making the loader itself a root.
+        let mut enqueue = |addr: usize| {
+            let ptr = addr as *mut u8;
+            if let Some(idx) = region_for(ptr) {
+                if !regions[idx].mark_bitmap.is_marked(addr) {
+                    if worklist.len() >= MARK_WORKLIST_CAP {
+                        self.mark_worklist_overflowed
+                            .store(true, Ordering::Relaxed);
+                    } else {
+                        worklist.push(addr);
+                    }
+                }
+            }
+        };
+        if let Some(loader) =
+            cratonvm_types::loader_pin::loader_pin_addr(header.class_id.as_u32())
+        {
+            enqueue(loader);
+        }
+        if let Some(mirrors) =
+            cratonvm_types::mirror_pin::mirrors_for_loader(obj_ptr as usize)
+        {
+            for mirror in mirrors {
+                enqueue(mirror);
+            }
+        }
+        if let Some(metadata) =
+            cratonvm_types::metadata_pin::roots_for_loader(obj_ptr as usize)
+        {
+            for object in metadata {
+                enqueue(object);
             }
         }
     }
