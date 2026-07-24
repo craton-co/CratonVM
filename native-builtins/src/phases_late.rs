@@ -25843,10 +25843,21 @@ fn p59_collection_spliterator(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     // Pin across the Spliterator alloc below — a moving young GC there would
     // relocate the backing array (native stale-local family).
     let data_pin = ctx.pin_native_root(data);
-    let spl = alloc_concurrent_synthetic(ctx, "java/util/Spliterator", 2);
+    // 3-field layout (elements=0, pos=1, fence=2) — see the `tryAdvance`/
+    // `estimateSize`/`characteristics`/`forEachRemaining` natives below,
+    // which all read field 2 as the exclusive upper bound. This previously
+    // allocated only 2 fields and never wrote `fence`, so every consumer
+    // read an uninitialized slot 2 — a genuine hang/wrong-size-stream
+    // hazard traced back to this via a native-call-hang watchdog dump
+    // during `TestContextAotGeneratorIntegrationTests` (AccessControl
+    // .lowest -> Arrays.stream -> Arrays.asList(arr).stream() ->
+    // Collection.stream() default method -> this native).
+    let len = ctx.array_length(data) as i32;
+    let spl = alloc_concurrent_synthetic(ctx, "java/util/Spliterator", 3);
     let data = ctx.read_native_pin(data_pin, data);
     ctx.set_field(spl, 0, Value::Object(Some(data)));
     ctx.set_field(spl, 1, Value::Int(0)); // cursor at start
+    ctx.set_field(spl, 2, Value::Int(len)); // fence = backing array length
     ctx.unpin_native_roots(data_pin);
     Ok(Some(Value::Object(Some(spl))))
 }
@@ -25900,10 +25911,14 @@ fn p59_hashset_spliterator(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         let k = read_pinned_object_value(ctx, *p, *k);
         ctx.set_array_element(arr, i, k);
     }
-    let spl = alloc_concurrent_synthetic(ctx, "java/util/Spliterator", 2);
+    // 3-field layout (elements=0, pos=1, fence=2) — see the companion fix
+    // in `p59_collection_spliterator` above for why fence must be set.
+    let fence = keys.len() as i32;
+    let spl = alloc_concurrent_synthetic(ctx, "java/util/Spliterator", 3);
     let arr = ctx.read_native_pin(arr_pin, arr);
     ctx.set_field(spl, 0, Value::Object(Some(arr)));
     ctx.set_field(spl, 1, Value::Int(0));
+    ctx.set_field(spl, 2, Value::Int(fence));
     ctx.unpin_native_roots(first_pin.unwrap_or(arr_pin));
     Ok(Some(Value::Object(Some(spl))))
 }
