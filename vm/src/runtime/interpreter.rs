@@ -4977,7 +4977,7 @@ pub fn execute(
     // SpringApplication.run() catch the failure, log it through its own
     // failure path, and at least produce a partial banner / startup-failure
     // banner before exiting.
-    let (code_attr, source_file, class_name_str, is_synchronized) = {
+    let (code_attr, source_file, class_name_str, is_synchronized, is_static) = {
         let cm = shared.class_manager.read();
         let class = cm.get_class(class_id).ok_or_else(|| VmError::Internal {
             message: format!("class {class_id} not found"),
@@ -4993,6 +4993,7 @@ pub fn execute(
             })?;
         let has_code = method.code().is_some();
         let is_synchronized = method.is_synchronized();
+        let is_static = method.is_static();
         let class_name_owned = class.name.to_string();
         let code_attr_opt = method.code().cloned();
         let source_file = class.source_file.clone();
@@ -5411,7 +5412,13 @@ pub fn execute(
                 }));
             }
         };
-        (code_attr, source_file, class_name_owned, is_synchronized)
+        (
+            code_attr,
+            source_file,
+            class_name_owned,
+            is_synchronized,
+            is_static,
+        )
     };
 
     // If the JIT early-compile path encounters an exception from a callee
@@ -6931,6 +6938,83 @@ pub fn execute(
                                             deopt_reason,
                                             rframe_for_despec.bci,
                                         );
+                                    // This first-call tier-up sink historically
+                                    // discarded the reconstructed frame and
+                                    // restarted the method at bci 0. That
+                                    // duplicates every side effect committed
+                                    // before the guard. Build the same cached
+                                    // metadata the hot callsites use and resume
+                                    // the captured frame directly.
+                                    if compiled.can_deopt_resume
+                                        && deopt_frame_matches_method(
+                                            &rframe_for_despec,
+                                            &class_name_str,
+                                            method_name,
+                                            method_descriptor,
+                                        )
+                                    {
+                                        let cached = Arc::new(CachedBytecodeMethod {
+                                            declaring_class_id: class_id,
+                                            class_name: Arc::from(class_name_str.as_str()),
+                                            method_name: Arc::from(method_name),
+                                            method_descriptor: Arc::from(method_descriptor),
+                                            source_file: source_file
+                                                .as_deref()
+                                                .map(Arc::from),
+                                            code: crate::runtime::frame::padded_bytecode(
+                                                &code_attr.code,
+                                            ),
+                                            exception_table: Arc::from(
+                                                code_attr.exception_table.as_slice(),
+                                            ),
+                                            max_stack: code_attr.max_stack,
+                                            max_locals: code_attr.max_locals,
+                                            num_params: count_method_params(method_descriptor)
+                                                as u16,
+                                            is_synchronized,
+                                            is_static,
+                                            force_native_cache: std::sync::OnceLock::new(),
+                                            native_callback_cache: std::sync::OnceLock::new(),
+                                        });
+                                        let pin_base = thread.native_pin_roots.len();
+                                        if let Some(frame) = build_deopt_frame_inner(
+                                            shared,
+                                            thread,
+                                            &cached,
+                                            &rframe_for_despec,
+                                            false,
+                                        ) {
+                                            // Keep materialization pins live
+                                            // through the frame-push handoff and
+                                            // the resumed execution. The frame
+                                            // itself is authoritative after push;
+                                            // retaining the pins a little longer
+                                            // is conservative and guarantees
+                                            // cleanup on every returned result.
+                                            let resumed =
+                                                execute_prebuilt_frame(shared, thread, frame);
+                                            thread.native_pin_roots.truncate(pin_base);
+                                            return resumed;
+                                        }
+                                        thread.native_pin_roots.truncate(pin_base);
+                                    }
+                                    // Precise reconstruction is a correctness
+                                    // requirement once native code has executed
+                                    // past bci 0. Refuse a whole-method replay:
+                                    // it is observably wrong for methods with
+                                    // stores, I/O, monitor actions, or callbacks.
+                                    return Err(MethodCallFailed::InternalError(
+                                        VmError::Internal {
+                                            message: format!(
+                                                "precise deoptimization unavailable for \
+                                                 {}.{}{} at bci {}; refusing side-effecting replay",
+                                                class_name_str,
+                                                method_name,
+                                                method_descriptor,
+                                                rframe_for_despec.bci
+                                            ),
+                                        },
+                                    ));
                                 }
                                 // Deoptimized — pending-NPE drain was hoisted above the
                                 // i64::MIN branch (round-8 CRIT fix); fall through to
