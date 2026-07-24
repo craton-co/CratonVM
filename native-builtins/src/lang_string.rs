@@ -5669,8 +5669,6 @@ pub(crate) fn native_string_is_blank(
 /// see `STREAM_FIELD_ELEMENTS`/`STREAM_FIELD_CLOSE_HANDLERS` in
 /// native-collections/src/lib.rs), matching every other IntStream factory.
 pub(crate) fn native_string_chars(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    use cratonvm_types::ClassId;
-
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
@@ -5689,7 +5687,13 @@ pub(crate) fn native_string_chars(ctx: &mut dyn NativeContext, args: &[Value]) -
     // also breaks `StringUtils.containsWhitespace` -> `"...".chars().anyMatch(...)`
     // -- via a 1-field allocation; reconciled to the 2-field layout here.)
     let stream = alloc_concurrent_synthetic(ctx, "java/util/stream/IntStream", 2);
-    let arr = ctx.new_ref_array(ClassId::new(0), char_values.len());
+    // Must be a primitive `int[]`, not a reference array: this stream's
+    // consumers (`IntStream.forEach`/`toArray`/etc.) read field 0 as an
+    // int-element array. A `new_ref_array` allocation stored `Value::Int`s
+    // into Object-shaped slots, which silently read back as 0 -- every
+    // `"...".chars()` consumer therefore saw a correctly-SIZED but all-zero
+    // stream (confirmed via a standalone `chars().toArray()` repro).
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Int, char_values.len());
     for (i, val) in char_values.iter().enumerate() {
         ctx.set_array_element(arr, i, *val);
     }

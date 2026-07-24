@@ -687,7 +687,7 @@ fn split_key_value(line: &str) -> (String, String) {
     (line.to_string(), String::new())
 }
 
-/// Decode Java `.properties` escapes (`\n`, `\t`, `\r`, `\\`, `\"`,
+/// Decode Java `.properties` escapes (`\n`, `\t`, `\r`, `\f`, `\\`, `\"`,
 /// `\'`, `\<space>`, `\:`, `\=`, `\uXXXX`).  Unknown escapes degrade
 /// to literal characters.
 ///
@@ -726,6 +726,7 @@ fn unescape_inner(s: &str, strict_unicode: bool) -> Result<String, ()> {
             Some('n') => out.push('\n'),
             Some('t') => out.push('\t'),
             Some('r') => out.push('\r'),
+            Some('f') => out.push('\u{000c}'),
             Some('\\') => out.push('\\'),
             Some('"') => out.push('"'),
             Some('\'') => out.push('\''),

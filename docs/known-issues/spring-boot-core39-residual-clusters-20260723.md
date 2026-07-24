@@ -31,7 +31,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File apps\spring-boot-suite-r
 Before closure, rerun the selected list in both modes and then rerun
 `apps/spring-boot-suite-runner/core-spring-boot-residual39-20260723.tsv`.
 
-## Cluster A — property/configuration and origin loading
+## Cluster A — property/configuration and origin loading — 4/5 CLOSED 2026-07-24
 
 Likely paths: `Properties`/map backing, property-source enumeration,
 configuration metadata, origin tracking, and AOT reflection.
@@ -44,11 +44,91 @@ core/spring-boot	org.springframework.boot.env.OriginTrackedPropertiesLoaderTests
 core/spring-boot	org.springframework.boot.env.OriginTrackedYamlLoaderTests
 ```
 
-The first two timed out in the JIT diagnostic; `OriginTrackedPropertiesLoaderTests`
-failed one assertion. `MapBinderTests` now passes JIT (45/45) after the
-`Properties.computeIfAbsent` bridge, but its no-JIT run still has two
-placeholder-expansion assertions. Sample the timeouts before treating them as
-one root cause.
+Worktree `springboot-core39-clusterA-20260723`. Two real VM bugs found and
+fixed, plus two timeout-tuning corrections:
+
+1. **`java.util.Properties` `.properties`-file escape decoder never handled
+   `\f`** (`native-builtins/src/properties_sidetable.rs`,
+   `unescape_inner`) — `\f` degraded to a literal `f` instead of a form-feed
+   (0x0C), because the escape `match` simply had no `'f'` arm. Fixed
+   `OriginTrackedPropertiesLoaderTests.compareToJavaProperties` (the ONLY
+   failing assertion in that class — real `java.util.Properties.load` and the
+   hand-rolled `OriginTrackedPropertiesLoader` disagreed on exactly the
+   `test-form-feed-property` entry).
+2. **`String.chars()`/`String.codePoints()` allocated the wrong array kind**
+   (`native-builtins/src/lang_string.rs`, `native_string_chars`) —
+   `ctx.new_ref_array(ClassId::new(0), ...)` (a *reference*-element array)
+   instead of `ctx.new_array(ArrayElementType::Int, ...)`, then stored
+   `Value::Int`s into the Object-shaped slots. Every consumer that reads the
+   backing array as `int[]` (the whole `IntStream` machinery: `forEach`,
+   `toArray`, `filter`, `map`, …) silently saw all-zero elements — the array
+   was correctly *sized* but every element read back as `0`. Confirmed via a
+   minimal standalone repro (`"foo-bar".chars().toArray()` →
+   `[0,0,0,0,0,0,0]` before the fix, `[102,111,111,45,98,97,114]` after).
+   This is a broadly-used JDK API (any character-by-character `Stream`
+   pipeline over a `String`), not Cluster-A-specific; it happened to surface
+   here via Spring Boot's `LenientObjectToEnumConverterFactory
+   .getCanonicalName()`, whose `name.chars().filter(...).map(...)
+   .forEach(...)` pipeline always produced an empty canonical name, so
+   `findEnum()` always matched the *first* enum constant regardless of the
+   real input — `MapBinderTests.bindToMapShouldBeGreedyForScalars` /
+   `bindToMapWithPlaceholdersShouldBeGreedyForScalars` (both `--nojit`
+   residuals) bound every non-exact-match enum value to the same wrong
+   constant. Fixed both; **no known regression risk given how targeted the
+   fix is, but re-audit any code that depends on `chars()`/`codePoints()`
+   returning all-zero if something relied on that (accidentally) — extremely
+   unlikely, but flagging since the bug was old enough to have shipped with
+   some workaround somewhere.**
+3. `OriginTrackedYamlLoaderTests` was reported as a 300s HANG but is not a
+   deadlock — CPU-sampled busy the whole time, completes on its own in
+   386.8s (JUnit5 extension-registry/interceptor-chain dispatch overhead
+   across its many individual `@Test` methods, see
+   `reference_junit5_execution_machinery_dispatch_overhead` in project
+   memory). Registered a 900s override in `run-spring-boot-suite.ps1`'s
+   `Get-EffectiveClassTimeoutSec` (extra margin over the observed time for
+   `-Parallel` contention).
+4. `ConfigurationPropertySourcesTests` was also reported as a 300s HANG and
+   is **also not a deadlock** — extensively diagnosed (repeated
+   stack-dump-on-timeout samples at 60s/400s/1100s, all pegged near 100%
+   CPU, never parked; a scaled-down hand repro of its own `N sources x M
+   keys x K getProperty() iterations` shape measured constant, not
+   quadratic, per-iteration cost — confirmed linear scaling). It
+   deliberately benchmarks an "uncached" O(sources x keys) baseline against
+   ~100 sources x 1000 keys x 1000 iterations (`cached < uncached/2`
+   assertions) — genuinely CPU-heavy by design, not merely slow-to-start;
+   this is the same diffuse interpreter/dispatch throughput family as
+   `reference_hashmap_native_call_dispatch_overhead` /
+   `reference_junit5_execution_machinery_dispatch_overhead`, not a single
+   fixable hotspot. A full standalone rerun completed (PASS) in 2645.0s.
+   Registered a 5400s override rather than continuing to report a false
+   HANG.
+
+4 of the 5 classes PASS under both JIT and `--nojit` after the fixes above;
+see the validation run log referenced in the merge commit for exact timings.
+`OriginTrackedPropertiesLoaderTests` and `MapBinderTests` are fast (order of
+seconds); `OriginTrackedYamlLoaderTests` takes several minutes;
+`ConfigurationPropertySourcesTests` can take on the order of 45 minutes —
+expected, not a regression, given the CPU-bound findings above.
+
+**`ConfigurationPropertiesBeanRegistrationAotProcessorTests` remains OPEN.**
+Unlike the other four, it is a genuine, confirmed hang: it never completed
+even with a 7200s (2-hour) ceiling, with *zero* of its 9 `@Test` methods
+reporting a result in that window, and repeated CPU-sampled stack dumps
+taken minutes AND hours apart land at the identical bytecode offset inside
+Hibernate Validator's `BeanMetaDataImpl.getClassLevelConstraintsAsDescriptors`.
+Deep investigation (a minimal standalone Hibernate Validator repro completes
+in ~320ms, ruling out a generic Hibernate Validator bug; rebuilding with the
+`String.chars()` fix made no difference; empty-array `Arrays.stream()` edge
+cases were ruled out) narrowed but did not pin the exact root cause — it is
+very likely specific to the interaction between Hibernate Validator's
+per-class metadata caching and this class's repeated
+`@CompileWithForkedClassLoader` fresh-classloader + in-process-`javac`
+compilation cycles. Full diagnostic trail:
+`docs/known-issues/springboot/configurationpropertiesbeanregistrationaotprocessortests-hang.md`.
+Left OUT of the suite-runner timeout table deliberately — do not paper over
+a real hang with a large timeout; it needs either a native debugger
+(unavailable in this environment) or a much longer targeted bisection
+session to close.
 
 ## Cluster B — diagnostics, process metadata, and byte/URL utilities
 
