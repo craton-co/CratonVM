@@ -2651,3 +2651,143 @@ classpath, a much broader blast radius than just this one Spring test.
 Family B itself remains completely unisolated -- zero net progress on the
 original goal this session, but two real, previously-unknown-to-this-suite
 bugs found and characterized instead.
+
+## 2026-07-24 AOT follow-up 9c -- TestContextAotGeneratorIntegrationTests "GroovySystem hang" REFUTED as Groovy-related AND as JIT-related; real hang site narrowed to Spliterators.spliterator()/ArraySpliterator construction; one real (but insufficient) bug fixed along the way
+
+Re-ran `TestContextAotGeneratorIntegrationTests` on a genuinely quiet host
+(`uptime` load average ~0.4-1.6, the condition
+[[testcontextaotgeneratorintegrationtests-groovysystem-clinit-hang]] said
+was needed to distinguish a real hang from host-contention artifact),
+`--stack-dump-on-timeout 600`. **Both of that memory's live hypotheses are
+now refuted.**
+
+### Refuted: "genuine (if extreme) Groovy MetaClassRegistryImpl bootstrap slowness"
+
+CratonVM's own T19.H1 native-hang watchdog fired at the 600s mark and
+self-aborted with a full diagnostic dump. No `GroovySystem`/Groovy anywhere
+in the dump. The watchdog's thread summary and per-thread **native-call
+ring buffer** (64 entries, oldest first) instead show the main thread
+`STILL-IN-NATIVE(550000ms+ ago)` inside `java/util/Arrays.stream(
+[Ljava/lang/Object;)Ljava/util/stream/Stream;`, reached from
+`org/springframework/aot/generate/AccessControl.lowest([...])` (real
+source: `Arrays.stream(candidates).map(AccessControl::getVisibility)
+.toArray(Visibility[]::new)`), itself reached via `DefaultListableBeanFactory
+.findAllAnnotationsOnBean` <- `RuntimeHintsBeanFactoryInitializationAotProcessor
+.extractFromBeanFactory/processAheadOfTime`. Reproduced identically twice
+(both attempts hung at the exact same site, ruling out a one-off fluke).
+
+### Investigated and FIXED (but did not resolve the hang): missing `fence` field on synthetic Spliterators
+
+`Arrays.stream(T[])`'s native override (`native-builtins/src/lib.rs`)
+delegates to `Arrays.asList(arr).stream()`, which resolves through
+`Collection.stream()`'s default method -> `spliterator()`. The native
+`p59_collection_spliterator`/`p59_hashset_spliterator` implementations
+(`native-builtins/src/phases_late.rs`) build a synthetic `java/util/
+Spliterator` object but -- despite their own doc comment stating the type
+is a "3-field (elements=0 Object[], pos=1 Int, fence=2 Int)" layout --
+only allocated 2 fields and never wrote field 2 (`fence`) at all, while
+`tryAdvance`/`estimateSize`/`characteristics`/`forEachRemaining` all read
+field 2 as the exclusive upper bound. **Fixed**: both functions now
+allocate 3 fields and set `fence` to the backing array/key-list's real
+length. This is a genuine, real correctness bug (confirmed via code
+reading, not just inference) and is kept regardless of the outcome below --
+verified zero regressions (`cargo test -p cratonvm-vm --lib --release`
+2233 passed/10 pre-existing-family failures matching baseline exactly
+after re-running the one flaky new failure in isolation --
+`native::jni::tests::process_vm_publish_and_resolve` passed cleanly alone,
+confirming it was parallel-execution flakiness, not caused by this fix;
+`cargo test -p cratonvm-native-builtins --lib` 3076 passed/4 failed, same
+known family as before this session's other work, zero new failures).
+
+**However: re-running the exact same hang scenario with the fix applied
+reproduces the IDENTICAL hang, same site, same ~550s.** The fence-field
+bug, while real, is not (solely) responsible for this hang.
+
+### Refuted: JIT miscompilation
+
+Given this codebase's extensive precedent of JIT-miscompile bugs in
+adjacent areas (see `vm/src/jit/skip_list.rs`'s `ClassReaderReadClass`
+family), re-ran with `--nojit` (interpreter-only). **The hang reproduces
+identically** -- same site conceptually, though the EXACT call sequence at
+the point of freezing differs slightly between JIT and no-JIT runs (see
+below), ruling out a JIT-compiled-code-specific miscompilation as the
+cause. This is a real interpreter/native-dispatch bug, not a codegen bug.
+
+### Narrowed further: the no-JIT run reveals a DIFFERENT concrete call site than initially assumed
+
+The `--nojit` run's dispatch trace, at the point of freezing, shows:
+
+```
+[...] BC  java/util/Collection.stream()Ljava/util/stream/Stream;
+[...] NAT java/util/Spliterators.spliterator([Ljava/lang/Object;I)Ljava/util/Spliterator;  ->NATIVE java/util/Objects.requireNonNull(Ljava/lang/Object;)Ljava/lang/Object;
+===== end dispatch_trace dump =====
+```
+
+This is a DIFFERENT path than `p59_collection_spliterator` (which this
+session's fix targeted): `java.util.Spliterators.spliterator(Object[],
+int)` is the real JDK STATIC factory method that `java.util.Arrays
+$ArrayList.spliterator()` (the actual concrete class `Arrays.asList()`
+returns on a real JDK -- a private nested class distinct from `java.util
+.ArrayList`) calls, per its real source:
+`return Spliterators.spliterator(a, Spliterator.ORDERED);`. Its own real
+source is `return new Spliterators.ArraySpliterator<>(Objects
+.requireNonNull(array), additionalCharacteristics);` -- i.e. it calls
+`Objects.requireNonNull` (confirmed via code reading to be a trivial,
+non-blocking native: `native_objects_require_non_null` in
+`native-builtins/src/lib.rs`, cannot itself hang) and then constructs a
+`java.util.Spliterators$ArraySpliterator` -- a REAL, bytecode-defined JDK
+class, NOT one of CratonVM's synthetic objects.
+
+**This means the actual hang is most likely inside either (a) object
+allocation/constructor execution for `Spliterators$ArraySpliterator`
+itself, or (b) whatever real bytecode runs immediately after
+`Collection.stream()` returns this real Spliterator to `StreamSupport
+.stream()` and onward through the `.map()`/`.toArray()` pipeline stages
+`AccessControl.lowest` chains -- NOT inside any of the synthetic-object
+native overrides this session inspected.** Given `Arrays.asList()`'s
+native override (registered `"java/util/Arrays"`/`"asList"`) stamps its
+returned synthetic object as plain `"java/util/ArrayList"` rather than
+`"java/util/Arrays$ArrayList"`, there is likely a genuine class-identity
+mismatch between what CratonVM's native `Arrays.asList` returns and what
+real JDK bytecode (`Arrays$ArrayList.spliterator()`, only reachable if the
+object's class resolves correctly to `Arrays$ArrayList`) expects to run --
+worth checking whether method resolution for `spliterator()`/`stream()` on
+this synthetic object is landing on the RIGHT declaring class consistently
+across JIT vs no-JIT execution, since the two runs took visibly different
+call paths to reach conceptually the same operation.
+
+### Next step for whoever continues
+
+1. Do NOT assume the fence-field fix (already landed) is sufficient --
+   verify against a rebuild.
+2. Attach a live debugger per the watchdog's own on-screen instructions
+   (`gdb -p <pid>` within the 3s grace window after the dump; lower
+   `--stack-dump-on-timeout` to trigger sooner for faster iteration) to
+   get a REAL native backtrace of the frozen call -- this is now the only
+   way to make further progress; static code reading has been pushed as
+   far as it reasonably can without seeing the actual stuck frame.
+3. Consider whether `Arrays.asList()`'s native override should stamp its
+   result as `java/util/Arrays$ArrayList` (loading/using the REAL JDK
+   class, if CratonVM's real-JDK mode can do so) rather than the
+   synthetic `java/util/ArrayList`, to make `spliterator()`/`stream()`
+   resolution match real JDK's actual dispatch (real `ArraySpliterator`
+   construction) instead of landing inconsistently between a synthetic
+   native override (JIT run) and real bytecode (no-JIT run) depending on
+   execution mode -- this divergence is itself suspicious and worth
+   investigating even independent of the hang.
+4. A minimal standalone repro of the same `Arrays.stream(arr).map(...)
+   .toArray(...)` shape (this session tried `String[3]` with `.map()`
+   +`.toArray()`) does NOT reproduce in isolation, meaning some
+   additional state (heap layout, prior GC activity, or receiver-class
+   identity established only after thousands of prior class loads) is
+   needed to trigger it -- a repro embedded inside (or immediately after)
+   a real `RuntimeHintsBeanFactoryInitializationAotProcessor
+   .extractFromBeanFactory` run, rather than a fresh-process synthetic
+   test, is more likely to reproduce reliably.
+
+This memory should be considered **superseded**:
+[[testcontextaotgeneratorintegrationtests-groovysystem-clinit-hang]]'s
+"most likely genuine (if extreme) Groovy bootstrap slowness" conclusion no
+longer holds -- this session found zero Groovy involvement, ruled out JIT
+miscompilation, and identified a specific (if not yet fully pinpointed)
+real-JDK-class construction site as the actual hang.
