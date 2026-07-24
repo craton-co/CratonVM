@@ -23,12 +23,15 @@ on the Azure host. All of this is against the Linux Tomcat fixture at
 
 As predicted, completing these turned several into real CratonVM
 regressions rather than clean passes — see
-[regressions-revealed-by-fixture-completion-20260723.md](regressions-revealed-by-fixture-completion-20260723.md)
-for the full accounting: **12 PASS both VMs / 9 confirmed CratonVM-only
-regressions / 2 still fail on both (different, narrower reasons than
-originally documented)**. One regression was root-caused precisely: a `%20`
-in a file path isn't decoded back to a space when CratonVM resolves a
-`file:` URL, breaking `TestDeployTask`.
+[20-fixture-completion-regressions-closure-FIXED.md](../../internal/fixed-suite-bugs/tomcat/20-fixture-completion-regressions-closure-FIXED.md)
+(moved to `docs/internal/` 2026-07-24, superseding the now-closed
+`regressions-revealed-by-fixture-completion-20260723.md`) for the full
+accounting: of the 9 confirmed CratonVM-only regressions, **7 are fixed and
+verified**; the remaining 2 (`TestManagerWebapp.testBug57700`,
+`TestSsl.testPost`) are confirmed to be the same already-tracked,
+deliberately-deferred interpreter/dispatch throughput ceiling as
+[04-embedded-server-throughput-wall-OPEN.md](../../internal/fixed-suite-bugs/tomcat/04-embedded-server-throughput-wall-OPEN.md),
+not new or independently-fixable bugs.
 
 Note: none of this fixture work is git-tracked — it all lives on the Azure
 host (`/data/data/apps/tomcat`, i.e. `/data/data/tomcat-dohead-fixture-20260717`).
@@ -52,17 +55,12 @@ entirely. Now fixed; `TestTomcat` is 26/26 PASS. The
 `TestNonstandardTagPerformance` class was a fixture-data typo (missing "er"
 in `.suite/all-tests.txt`) with no code fix needed.
 
-## Needs investigation, not yet root-caused
-
-| Doc | Classes |
-|---|---:|
-| [untriaged-oddities.md](untriaged-oddities.md) | 2 |
-
 ## Fixed and moved to `docs/internal/`
 
 | Doc | Classes | Outcome |
 |---|---:|---|
 | [hang-classification-unconfirmed-host-contention-FIXED.md](../../internal/fixed-suite-bugs/tomcat/hang-classification-unconfirmed-host-contention-FIXED.md) | 9 | ✅ HANG was a pure host-contention artifact (HotSpot passes all 9 cleanly); once ruled out, all 9 were genuine CratonVM regressions from 2 root causes (ecj/Hashtable JSP-compile NPE affecting 8; SSLContext-resolution-through-wrapped-factory affecting `TestCustomSsl`), both fixed and verified — 9/9 PASS on CratonVM on a quiet host |
+| [20-fixture-completion-regressions-closure-FIXED.md](../../internal/fixed-suite-bugs/tomcat/20-fixture-completion-regressions-closure-FIXED.md) | 9 | ✅ 7/9 fixed (X509Certificate toString, symlink+canonicalize, G1 for `*LargeHeap`, catchable-OOME Cipher fixes, 2 TestSsl bugs); 2 residual confirmed = pre-existing throughput ceiling, not new bugs |
 
 ## Real CratonVM bug (not a fixture gap — despite living in the same 35-class "both VMs fail" bucket)
 

@@ -113,20 +113,28 @@ fn loaded_classes_probe(
         .map(|(_, &id)| id)
 }
 
-/// `CRATONVM_LOADER_AWARE_RESOLUTION` gate (default ON). Mirrors
-/// `cratonvm_vm::runtime::env_cache::loader_aware_resolution` and the
-/// native-builtins twin so the classloading half of loader-faithful class
-/// resolution (loader-faithful supertype linking in `define_class_with_options`)
-/// stays in lock-step. This copy had drifted out of lock-step (still default
-/// OFF) after `env_cache::loader_aware_resolution` flipped to default ON for
-/// the `context.groovy` bug-cluster fix, which silently disabled this crate's
-/// share of the loader-faithful fixes (superclass/interface linking, verifier
-/// hierarchy lookup) by default — see
-/// `docs/known-issues/hib-bytecode-enhancement-loader-faithful-linking.md`.
-/// Flip on links an enhanced subclass to its same-loader (enhanced) supertype
-/// copy rather than the un-enhanced global one returned by
-/// `get_loaded_class_id`. Empty / `"0"` ⇒ off; any other value ⇒ on.
-fn loader_aware_resolution() -> bool {
+/// `CRATONVM_LOADER_AWARE_RESOLUTION` gate (default ON) — **the single
+/// source of truth**. `vm::runtime::env_cache::loader_aware_resolution` and
+/// the `native-builtins::classloader::loader_aware_resolution` twin both now
+/// delegate here (see their doc comments) instead of re-parsing the env var
+/// through their own `OnceLock`, so the three copies cannot drift again.
+///
+/// **History (why this consolidation happened):** this crate's copy had
+/// drifted out of lock-step with the VM copy — it stayed default **OFF**
+/// after `env_cache::loader_aware_resolution` flipped to default **ON** for
+/// the `context.groovy` bug-cluster fix, which silently disabled this
+/// crate's share of the loader-faithful fixes (superclass/interface
+/// linking, verifier hierarchy lookup) by default even though the
+/// interpreter half of the same fix was live — a production desync between
+/// three independently-read env-var copies. See
+/// `docs/known-issues/hib-bytecode-enhancement-loader-faithful-linking.md`
+/// and `docs/internal/loader-identity.md` for the consolidation. Flip on
+/// links an enhanced subclass to its same-loader (enhanced) supertype copy
+/// rather than the un-enhanced global one returned by `get_loaded_class_id`.
+///
+/// Empty / `"0"` ⇒ off; any other value (including unset) ⇒ on. Read once
+/// and cached in a `OnceLock` — the env var is not re-read after first use.
+pub fn loader_aware_resolution() -> bool {
     use std::sync::OnceLock;
     static GATE: OnceLock<bool> = OnceLock::new();
     *GATE.get_or_init(|| match std::env::var("CRATONVM_LOADER_AWARE_RESOLUTION") {
@@ -5399,6 +5407,22 @@ impl ClassManager {
     ///
     /// Returns `None` if the class hasn't been loaded by any loader.
     ///
+    /// **Loader-blind — prefer [`Self::find_class_by_name_for_loader`].**
+    /// This method has no notion of *which* loader is asking, so when two
+    /// or more distinct user-defined loaders each define their own class
+    /// under the same name it cannot know which copy the caller means (see
+    /// the context.groovy note below — it now reports a miss rather than
+    /// guessing, but "miss when it could have answered correctly given the
+    /// requester" is itself the residual unsoundness). New call sites that
+    /// have a requesting/initiating loader in hand should call
+    /// `find_class_by_name_for_loader(name, requesting_loader)` instead,
+    /// which checks that loader's own namespace first and never guesses
+    /// across unrelated user-defined loaders. `#[deprecated]` below is
+    /// advisory only (no `deny(warnings)` anywhere in the workspace, so this
+    /// cannot break the centrally-run build) — it exists to surface the ~50
+    /// remaining external call sites for follow-up migration. See
+    /// `docs/internal/loader-identity.md` for the current per-file tally.
+    ///
     /// **Round 4 audit fix (HIGH):** the prior fallback scanned every
     /// entry in `loaded_classes` linearly for each key (O(n · keys)).
     /// With the (`ClassLoaderId`, `Arc<str>`) keying we already have,
@@ -5407,6 +5431,7 @@ impl ClassManager {
     /// O(entries · keys). On a Spring app with ~15k loaded classes that
     /// turns every miss from ~15k string compares into a handful of
     /// hash probes.
+    #[deprecated(note = "loader-blind; use find_class_by_name_for_loader")]
     pub fn find_class_by_name(&self, name: &str) -> Option<ClassId> {
         let slash = if name.contains('.') && !name.contains('/') {
             name.replace('.', "/")
@@ -5499,6 +5524,90 @@ impl ClassManager {
         None
     }
 
+    /// Loader-aware class lookup — JVMS §5.3/§5.4.3 delegation semantics
+    /// keyed on `(requesting_loader, name)` identity rather than on `name`
+    /// alone. Checks `requesting_loader`'s own namespace first (the classes
+    /// it has itself defined), then walks
+    /// [`BUILTIN_LOADER_DELEGATION_CHAIN`] (Bootstrap → Extension →
+    /// Application) up to the bootstrap loader.
+    ///
+    /// This is the sound replacement for [`Self::find_class_by_name`]:
+    /// unlike that method (and unlike [`Self::find_class_by_name_in_loader`],
+    /// whose fallback now forwards here — see its doc comment), this
+    /// function never scans `self.user_loaders` for an unrelated
+    /// user-defined loader's same-named class. Two isolating loaders that
+    /// each define their own copy of `X` must never collapse to whichever
+    /// one this function happens to see; if `requesting_loader` and the
+    /// built-in chain both miss, the answer is `None`, full stop.
+    ///
+    /// **Known limitation:** `ClassManager` does not track user-defined
+    /// loader *parentage* — a user loader's `getParent()` is a Java-level
+    /// field (`java.lang.ClassLoader.parent`) that this crate never
+    /// observes (see `loaders.rs`'s `BUILTIN_LOADER_DELEGATION_CHAIN` doc
+    /// comment: "user-defined loaders have their parent chains modelled on
+    /// the Java side"). So when `requesting_loader` is itself a
+    /// `ClassLoaderId::UserDefined` loader whose Java-level parent is
+    /// ANOTHER user-defined loader (rather than the built-in chain), this
+    /// function cannot walk that link — it degrades to "requesting loader's
+    /// own namespace, then the built-in chain," which is a strict subset of
+    /// full JVMS delegation for that case. Callers that need the true
+    /// parent chain for such a loader must drive its `loadClass` directly
+    /// at the bytecode/interpreter layer (the way
+    /// `native-builtins::lang_class::native_class_get_declared_classes`
+    /// falls through to `ClassLoader.loadClass` via
+    /// `native-builtins::classloader::defining_loader_for` when this kind
+    /// of lookup misses) rather than expecting this crate to resolve it.
+    /// See `docs/internal/loader-identity.md`.
+    pub fn find_class_by_name_for_loader(
+        &self,
+        name: &str,
+        requesting_loader: ClassLoaderId,
+    ) -> Option<ClassId> {
+        let slash = if name.contains('.') && !name.contains('/') {
+            name.replace('.', "/")
+        } else {
+            name.to_string()
+        };
+        let dot = slash.replace('/', ".");
+        let keys = if slash == dot {
+            vec![slash]
+        } else {
+            vec![slash, dot]
+        };
+
+        // Own namespace first: classes `requesting_loader` itself defined.
+        for key in &keys {
+            if let Some(id) = loaded_classes_probe(&self.loaded_classes, requesting_loader, key) {
+                if let Some(class) = self.get_class(id) {
+                    if class.hidden {
+                        continue;
+                    }
+                }
+                return Some(id);
+            }
+        }
+
+        // Then the built-in delegation chain up to Bootstrap. Skip
+        // `requesting_loader` itself if it's one of the three built-ins —
+        // already probed above.
+        for key in &keys {
+            for loader_id in BUILTIN_LOADER_DELEGATION_CHAIN {
+                if *loader_id == requesting_loader {
+                    continue;
+                }
+                if let Some(id) = loaded_classes_probe(&self.loaded_classes, *loader_id, key) {
+                    if let Some(class) = self.get_class(id) {
+                        if class.hidden {
+                            continue;
+                        }
+                    }
+                    return Some(id);
+                }
+            }
+        }
+        None
+    }
+
     /// Find a class by name within a specific loader's namespace, with delegation
     /// fallback to the standard loader chain (Bootstrap → Extension → Application).
     /// Exact-key lookup: the `ClassId` recorded under *exactly* `(loader_id,
@@ -5529,6 +5638,18 @@ impl ClassManager {
         })
     }
 
+    /// **Behavior change (loader-identity consolidation):** the parent-chain
+    /// fallback used to be the loader-blind `find_class_by_name`, which — on
+    /// a miss in the built-in chain — additionally scanned every OTHER
+    /// user-defined loader's namespace and returned an unambiguous same-named
+    /// match if it found exactly one. That was a guess: it could hand back a
+    /// completely unrelated user loader's class just because `loader_id`
+    /// itself and the built-ins didn't have it. The fallback now forwards to
+    /// [`Self::find_class_by_name_for_loader`], which stops at the built-in
+    /// chain and never guesses across unrelated user loaders. Practical
+    /// effect: callers only see a difference in the case that WAS unsound
+    /// (some other, unrelated user loader happened to have a same-named
+    /// class); the own-namespace and built-in-chain paths are unchanged.
     pub fn find_class_by_name_in_loader(
         &self,
         name: &str,
@@ -5543,8 +5664,8 @@ impl ClassManager {
         if let Some(id) = loaded_classes_probe(&self.loaded_classes, loader_id, name) {
             return Some(id);
         }
-        // Delegate to parent chain
-        self.find_class_by_name(name)
+        // Delegate to parent chain — see the doc comment above.
+        self.find_class_by_name_for_loader(name, loader_id)
     }
 
     /// Get the loader identity for a loaded class.
@@ -12645,6 +12766,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)] // deliberately exercises the loader-blind method
     fn class_manager_find_before_load_returns_none() {
         let mgr = ClassManager::new(&[], &[], &[]);
         assert!(mgr.find_class_by_name("java/lang/Object").is_none());

@@ -129,6 +129,17 @@ pub fn osr_backedge_enabled() -> bool {
 /// `CRATONVM_LOADER_AWARE_RESOLUTION` — loader-faithful `CONSTANT_Class`
 /// resolution (ProxyClassReuseTest / IsoProbe family).
 ///
+/// **Loader-identity consolidation:** this used to be one of THREE
+/// independent copies of the same env-var parse (this file, a
+/// `classloading::class_manager` copy, and a `native-builtins::classloader`
+/// copy) — they drifted out of lock-step at least once in production (see
+/// `docs/internal/loader-identity.md`). `cratonvm_classloading::
+/// loader_aware_resolution` is now the single source of truth; this
+/// function is kept (same name, same signature, own doc history below) so
+/// none of ITS callers have to change, but it simply forwards to the
+/// classloading crate's `OnceLock`-cached copy rather than maintaining a
+/// second cache of its own.
+///
 /// **Default: ON** (flipped from off during the `context.groovy` bug-cluster
 /// fix — see below). When on, an implicit class-constant reference (`ldc
 /// X.class`, `new X`, `checkcast`/`instanceof X`, `anewarray X`, and
@@ -200,18 +211,12 @@ pub fn osr_backedge_enabled() -> bool {
 /// off) rather than reverting the loader-aware resolution logic itself, which
 /// is independently correct.
 ///
-/// Empty or `"0"` ⇒ disabled; any other value ⇒ enabled. Read once and cached.
+/// Empty or `"0"` ⇒ disabled; any other value ⇒ enabled. Read once and
+/// cached (in `cratonvm_classloading`'s own `OnceLock` — see the
+/// consolidation note above; this function no longer keeps a second cache).
 #[inline]
 pub fn loader_aware_resolution() -> bool {
-    static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(|| match std::env::var("CRATONVM_LOADER_AWARE_RESOLUTION") {
-        // Explicitly set: preserve the original opt-out semantics (empty or
-        // "0" disables; anything else enables) so `CRATONVM_LOADER_AWARE_
-        // RESOLUTION=0` still forces the old (gate-off) behavior verbatim.
-        Ok(v) => !v.is_empty() && v != "0",
-        // Unset: new default is enabled (see doc comment above).
-        Err(_) => true,
-    })
+    cratonvm_classloading::loader_aware_resolution()
 }
 
 /// `CRATONVM_TIER_OSR_BACKEDGE` — wire-tiered-manager Step 6 — per-frame
