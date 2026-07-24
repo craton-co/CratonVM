@@ -29325,6 +29325,32 @@ fn try_stackless_invoke(
     // with `expected int on stack, got ref(...)`.
     let ret_type = crate::jit::return_type(descriptor);
 
+    // A nested-archive subclass calls `super(file)` with invokespecial. Mockito
+    // can redefine JarFile, so the ordinary redefine guard would otherwise run
+    // the real JDK constructor. Its ZipFile state is not present on CratonVM's
+    // compact native JarFile representation; retain the bridge for precisely
+    // the registered File constructor shapes. Ordinary mock calls remain
+    // redefine-aware.
+    if is_special
+        && class_name == "java/util/jar/JarFile"
+        && method_name == "<init>"
+        && matches!(
+            descriptor,
+            "(Ljava/io/File;)V"
+                | "(Ljava/io/File;Z)V"
+                | "(Ljava/io/File;ZI)V"
+                | "(Ljava/io/File;ZILjava/lang/Runtime$Version;)V"
+        )
+    {
+        if let Some(callback) = shared
+            .native_methods
+            .find("java/util/jar/JarFile", method_name, descriptor)
+        {
+            safe_native_call(shared, thread, callback, args)?;
+            return Ok(CachedCallResult::Handled);
+        }
+    }
+
     // A subclass `super.close()` is an invokespecial whose constant-pool
     // owner is JarFile even though the concrete implementation is inherited
     // from ZipFile. Mockito can redefine JarFile for ordinary mock calls; the
