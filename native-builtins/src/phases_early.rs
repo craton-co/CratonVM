@@ -13922,7 +13922,23 @@ fn cipher_do_final(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodCallRe
 
     match result_bytes {
         Ok(bytes) => {
-            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, bytes.len());
+            // FIX (TestEncryptInterceptorLargeHeap hard-abort-instead-of-OOME):
+            // this used to allocate the plaintext/ciphertext output via the
+            // panicking `new_array`, which `std::process::abort()`s the whole
+            // VM (killing every remaining test in the batch) when a huge
+            // payload (observed: a ~1 GiB AES-GCM round-trip) can't fit —
+            // instead of the catchable `OutOfMemoryError` HotSpot throws. Use
+            // the fallible `try_new_array` (same `try_new_ref_array`/
+            // `try_alloc_array_full` idiom as the `ArrayList(int)` abend fix,
+            // see `docs/internal/gaps/crash-01-arraylist-capacity-oom-abend.md`)
+            // and throw a catchable OOME on `None` instead.
+            let Some(arr) = ctx.try_new_array(cratonvm_types::ArrayElementType::Byte, bytes.len())
+            else {
+                return Err(RuntimeError::OutOfMemoryError {
+                    message: "Java heap space".to_string(),
+                }
+                .into());
+            };
             for (i, &b) in bytes.iter().enumerate() {
                 ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
             }
