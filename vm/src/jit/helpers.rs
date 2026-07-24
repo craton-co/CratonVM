@@ -9692,6 +9692,27 @@ pub fn build_helpers() -> JitRuntimeHelpers {
         // jit-api field doc; prologue-called once per self-recursive method).
         native_stack_floor_fn: jit_native_stack_floor as *const () as usize,
         ldc_string: jit_ldc_string as *const () as usize,
+        // Cooperative JIT safepoint polling (CRATONVM_JIT_SAFEPOINT_POLLS,
+        // off by default) — address of the process-global VM's
+        // stw_requested flag byte. `process_vm()` is published by
+        // `Vm::new()` before any bytecode runs (see its doc comment), which
+        // is always before the first `build_helpers()` call a real JIT
+        // compile can trigger (compilation only starts once the
+        // interpreter is executing bytecode). `None` here (e.g. a unit
+        // test that calls `build_helpers()` before any `Vm::new()`) leaves
+        // this at `0`, which `emit_safepoint_poll` (the SOLE reader of this
+        // field) treats as "not wired" and emits no poll code at all — the
+        // same optional-helper contract as `region_bounds_addr`/
+        // `frame_record` above.
+        safepoint_flag_addr: crate::native::jni::process_vm()
+            .map(|shared| shared.gc_barrier.stw_requested_flag_addr() as usize)
+            .unwrap_or(0),
+        // Slow-path helper for a poll hit. Unconditionally wired (the
+        // function always exists in this binary) — `safepoint_flag_addr`
+        // above is what actually gates whether the JIT ever emits a CALL
+        // to it, so leaving this non-zero when the flag address happens to
+        // be unavailable is harmless (dead code, never reached).
+        safepoint_slow_path: jit_safepoint_slow_path as *const () as usize,
     }
 }
 
@@ -9713,6 +9734,50 @@ pub extern "C" fn jit_ldc_string(vm_ptr: i64, bytes: *const u8, len: usize) -> i
     let text = unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(bytes, len)) };
     let shared = unsafe { &*(vm_ptr as *const SharedVm) };
     crate::vm::create_java_string(shared, text).as_ptr() as i64
+}
+
+/// Cooperative JIT safepoint polling (`CRATONVM_JIT_SAFEPOINT_POLLS`) slow
+/// path — called by JIT-compiled code when the inline poll
+/// (`jit/src/x64.rs::emit_safepoint_poll`) observes the `stw_requested`
+/// flag byte (`helpers.safepoint_flag_addr`, see
+/// `GcBarrier::stw_requested_flag_addr`) set.
+///
+/// Recovers the `SharedVm`/`JvmThread` the same way every other JIT helper
+/// does (`vm_ptr` argument + `jit_thread_mut()`'s `JIT_THREAD` TLS), then
+/// joins the SAME stop-the-world wait the interpreter's own poll hit uses
+/// (`crate::runtime::interpreter::safepoint_check` — retire the TLAB, drain
+/// SATB, publish a fresh root snapshot, arrive at the GC barrier) so a
+/// thread parked here is exactly as GC-visible as an interpreter frame at
+/// its poll point.
+///
+/// The poll site (`emit_safepoint_poll`) always emits
+/// `emit_pre_safepoint_spill()` immediately before this CALL, so every
+/// register-resident local/oop is already flushed to its canonical frame
+/// slot before `safepoint_check` can park this thread — the conservative
+/// scanner sees a complete picture of this frame while parked.
+///
+/// A null `vm_ptr` (should not happen at a context-method poll site, but
+/// the JIT->VM boundary is untrusted) or an absent `JIT_THREAD` TLS entry
+/// is a silent no-op: the caller's inline fast path only reaches this CALL
+/// when the flag byte was observed nonzero, so skipping here merely defers
+/// the pause to this thread's NEXT poll hit — the same latency bound an
+/// ordinary missed poll already has.
+// SAFETY: called only from JIT-compiled code at a poll site emitted by
+// `emit_safepoint_poll`, which always precedes the CALL with
+// `emit_pre_safepoint_spill`. `vm_ptr` is the same hidden SharedVm pointer
+// every other JIT helper receives (0 or a live SharedVm pointer).
+#[no_mangle]
+pub unsafe extern "C" fn jit_safepoint_slow_path(vm_ptr: i64) {
+    crate::jit::conservative_roots::note_jit_boundary();
+    if vm_ptr == 0 {
+        return;
+    }
+    // SAFETY: caller contract for every JIT helper — vm_ptr is a live
+    // SharedVm pointer.
+    let vm = &*(vm_ptr as *const SharedVm);
+    if let Some((thread, _guard)) = jit_thread_mut() {
+        crate::runtime::interpreter::safepoint_check(vm, thread);
+    }
 }
 
 /// Stage 3 (precise oop maps) — record the EXACT RBP of the JIT frame that is

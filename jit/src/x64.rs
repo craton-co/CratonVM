@@ -2571,6 +2571,23 @@ fn shadow_no_savebase() -> bool {
     *G.get_or_init(|| std::env::var_os("CRATONVM_SHADOW_NO_SAVEBASE").is_some())
 }
 
+/// Cooperative JIT safepoint polling — whether the backend emits an inline
+/// poll of `helpers.safepoint_flag_addr` (the GC barrier's
+/// `stw_requested` flag byte) at context-method entry and on every `goto`
+/// loop back-edge. Enabled by setting `CRATONVM_JIT_SAFEPOINT_POLLS` to any
+/// value. Off by default (byte-identical to the pre-existing codegen): JIT
+/// threads currently have NO cooperative safepoint of their own — the
+/// collector instead suspends them at the OS level and conservatively scans
+/// their registers (`vm/src/jit/xt_root_scan.rs`). See
+/// `docs/internal/jit-safepoint-polls.md` for the design and the current
+/// coverage limitations (pure methods and non-`goto` back edges are not
+/// polled in this first cut). See [`Compiler::emit_safepoint_poll`].
+fn jit_safepoint_polls_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| std::env::var_os("CRATONVM_JIT_SAFEPOINT_POLLS").is_some())
+}
+
 /// SB-CRASH-04 (register-invisibility) — whether GC-capable safepoints blind-
 /// spill every used callee-saved GPR into a reserved frame slot so the
 /// conservative root scan marks register-only oops. Enabled when
@@ -10013,6 +10030,94 @@ impl Compiler {
         }
     }
 
+    /// Cooperative JIT safepoint poll (`CRATONVM_JIT_SAFEPOINT_POLLS`, see
+    /// [`jit_safepoint_polls_enabled`]) — emits:
+    /// ```asm
+    /// MOV  R11, imm64            ; helpers.safepoint_flag_addr
+    /// TEST byte ptr [R11], 0xFF  ; nonzero => STW requested
+    /// JZ   .no_poll
+    ///   <emit_pre_safepoint_spill>              ; frame-slot oop map valid
+    ///   MOV  ARG_REGS[0], [rbp - heap_local_offset]  ; vm_ptr
+    ///   CALL helpers.safepoint_slow_path
+    ///   <emit_oop_map_for_safepoint>             ; precise/shadow modes only
+    /// .no_poll:
+    /// ```
+    /// matching the `self_call_stack_guard` call sequence's spill/call/oop-map
+    /// bracketing exactly (see that call site in the direct self-recursive
+    /// call arm). x86-64 has no `CMP [m64], imm` form that takes a bare
+    /// absolute address, so the flag address is first materialized into the
+    /// scratch register R11 (never a Java-local home — see `LOCAL_REGS` —
+    /// nor an `ARG_REGS`/`SCRATCH_REGS` member, so it is always free to
+    /// clobber here) via `MOV R11, imm64`, then read with a single non-atomic
+    /// byte `TEST`.
+    ///
+    /// Callers gate emission on this being a context method
+    /// (`self.needs_heap`) — a pure method (no `vm_ptr` frame slot) has
+    /// nowhere to load the slow-path helper's argument from, so v1 skips the
+    /// poll for pure methods entirely rather than threading a second hidden
+    /// argument through every pure-method call site. See
+    /// `docs/internal/jit-safepoint-polls.md` for the follow-up path and the
+    /// other current coverage gap (only `goto`-shaped back edges are
+    /// polled; a loop whose only backward branch is a conditional `ifXX`/
+    /// `if_icmpXX`/`if_acmpXX` is not).
+    fn emit_safepoint_poll(&mut self) {
+        if self.failed {
+            return;
+        }
+        if !jit_safepoint_polls_enabled() {
+            return;
+        }
+        if !self.needs_heap {
+            return;
+        }
+        if self.helpers.safepoint_flag_addr == 0 || self.helpers.safepoint_slow_path == 0 {
+            return;
+        }
+        // Cast: x86-64 immediate encoding
+        self.emit_mov_imm64(R11, self.helpers.safepoint_flag_addr as i64);
+        self.emit_test_mem8_imm8(R11, 0, 0xFF);
+        let no_poll = self.emit_jcc_rel32_patch(0x84); // JZ (flag clear) -> skip slow path
+        self.emit_pre_safepoint_spill();
+        self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
+        self.emit_call_absolute(self.helpers.safepoint_slow_path);
+        if self.precise_maps || self.shadow_enabled {
+            self.emit_oop_map_for_safepoint();
+        }
+        self.patch_rel32_to_here(no_poll);
+    }
+
+    /// Method-entry variant of [`Self::emit_safepoint_poll`], called once
+    /// from the END of [`Self::emit_prologue`].
+    ///
+    /// `emit_prologue` runs before `compile_bytecode`'s per-instruction loop
+    /// ever assigns `self.cur_bc_pc` (see `compile`'s call order), so at
+    /// this point `cur_bc_pc` still holds its `Compiler::new` default of
+    /// `0` — the SAME value a genuine safepoint at the method's first real
+    /// bytecode instruction (bci 0, a very common shape: a constructor or
+    /// method that opens with `new`/an `invoke`) would use. Under
+    /// `precise_maps`, both `emit_pre_safepoint_spill` and
+    /// `emit_oop_map_for_safepoint` key their bookkeeping off `cur_bc_pc`
+    /// (the frame's sp-id slot store and the pushed `OopMapEntry::
+    /// bytecode_pc` respectively) — recording the prologue poll under the
+    /// SAME bci as a real bci-0 safepoint would let the GC's sp-id-keyed
+    /// oop-map lookup for a thread parked at ONE of the two safepoints
+    /// match the OTHER one's (differently-shaped) frame-slot list, which
+    /// could under-report live oops.
+    ///
+    /// `native_pc_offset` (the primary, always-unique-per-call-site key —
+    /// see its doc on [`crate::OopMapEntry`]) does not collide here, only
+    /// the auxiliary `bytecode_pc` cross-check does. Sidestepping it costs
+    /// nothing: swap `cur_bc_pc` to `u32::MAX` (no real method's bytecode
+    /// is anywhere near 4 GiB, so this can never equal a genuine bci) for
+    /// the duration of the poll, then restore the saved value so the
+    /// upcoming bytecode loop starts from its expected `0`.
+    fn emit_safepoint_poll_prologue(&mut self) {
+        let saved_pc = self.cur_bc_pc;
+        self.cur_bc_pc = u32::MAX as usize;
+        self.emit_safepoint_poll();
+        self.cur_bc_pc = saved_pc;
+    }
+
     /// A direct self-call may omit the blind all-GPR spill when this method is
     /// at the exact call-site state proves every surviving operand is already
     /// visible in a canonical frame slot.
@@ -13871,6 +13976,14 @@ impl Compiler {
                 self.emit_call_absolute(h);
             }
         }
+        // Cooperative JIT safepoint poll (CRATONVM_JIT_SAFEPOINT_POLLS) —
+        // method entry, context methods only. Emitted last in the prologue
+        // so every earlier prologue effect (param homing, frame-record,
+        // shadow-stack thread cache) is already committed before this
+        // thread could possibly park at the barrier. No-op unless the env
+        // flag is set AND the helper table wired the flag address (see
+        // `emit_safepoint_poll_prologue` / `emit_safepoint_poll`).
+        self.emit_safepoint_poll_prologue();
     }
 
     /// Lazy-prologue perf lever — call AFTER the whole body is compiled. If the
@@ -21162,6 +21275,21 @@ impl Compiler {
                                 }
                             }
                         }
+                    }
+
+                    // Cooperative JIT safepoint poll (CRATONVM_JIT_SAFEPOINT_POLLS)
+                    // -- loop back-edge. `target_pc <= pc` is this codebase's own
+                    // definition of a `goto`-shaped back edge (mirrors the check
+                    // just above that drives `unroll_copies`, and
+                    // `detect_natural_loops`, which finds loop headers the same
+                    // way). No-op unless the env flag is set AND this is a
+                    // context method AND the helper table wired the flag
+                    // address (see `emit_safepoint_poll`'s doc for the current
+                    // coverage gap: a loop whose only backward branch is a
+                    // conditional `ifXX`/`if_icmpXX`/`if_acmpXX` is not polled
+                    // by this first cut).
+                    if target_pc <= pc {
+                        self.emit_safepoint_poll();
                     }
 
                     // JMP rel32 to header
@@ -29076,6 +29204,11 @@ mod tests {
             region_bounds_addr: 0,
             native_stack_floor_fn: 0,
             ldc_string: sentinel,
+            // Unwired (0) — CRATONVM_JIT_SAFEPOINT_POLLS is off by default,
+            // and `emit_safepoint_poll` also requires this to be non-zero,
+            // so leaving it 0 keeps these tests byte-identical either way.
+            safepoint_flag_addr: 0,
+            safepoint_slow_path: 0,
         }
     }
 

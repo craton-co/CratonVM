@@ -402,6 +402,39 @@ pub struct JitRuntimeHelpers {
     /// returned reference remains valid after a relocating collection; JIT code
     /// must never bake a managed-object address as an immediate.
     pub ldc_string: usize,
+    /// Cooperative JIT safepoint polling (`CRATONVM_JIT_SAFEPOINT_POLLS`, off
+    /// by default) — address of the single STW-requested flag byte
+    /// (`GcBarrier::stw_requested`, see
+    /// `vm/src/threading/gc_barrier.rs::stw_requested_flag_addr`), NOT a
+    /// function pointer. The JIT backend bakes this address as an absolute
+    /// immediate (`MOV R11, imm64`) and emits `TEST byte ptr [R11], 0xFF; JNZ
+    /// slow` at method entry (context methods only) and on every `goto`
+    /// loop back-edge when the flag is wired. `0` = polling disabled
+    /// entirely — the backend emits no poll code and GC continues to rely
+    /// solely on the `SuspendThread`-based conservative scan
+    /// (`vm/src/jit/xt_root_scan.rs`) for threads running JIT code. The
+    /// `GcBarrier` this points at lives inside `Arc<SharedVm>`, so the
+    /// address is stable for the life of the VM (see the stability contract
+    /// on `stw_requested_flag_addr`). Appended at the END of the struct so
+    /// all prior golden offsets stay stable.
+    pub safepoint_flag_addr: usize,
+    /// Cooperative JIT safepoint polling slow path — address of
+    /// `extern "C" fn(vm_ptr: i64)`
+    /// (`vm/src/jit/helpers.rs::jit_safepoint_slow_path`). Called only on a
+    /// poll hit (the inline flag-byte check observed a nonzero value):
+    /// the poll site first performs the existing pre-safepoint register
+    /// spill (`x64.rs::emit_pre_safepoint_spill`) so the frame's oop map is
+    /// valid, THEN calls this helper, which joins the same stop-the-world
+    /// wait the interpreter's own poll hit uses
+    /// (`vm/src/runtime/interpreter.rs::safepoint_check`) so GC observes
+    /// this thread's roots exactly like an interpreter frame.
+    /// `vm/src/jit/helpers.rs::build_helpers` wires this unconditionally
+    /// (the function always exists); [`Self::safepoint_flag_addr`] is what
+    /// actually gates whether the JIT ever emits a `CALL` to it, so this
+    /// field being non-zero while that one is `0` is harmless (dead code,
+    /// never reached). Appended at the END of the struct so all prior
+    /// golden offsets stay stable.
+    pub safepoint_slow_path: usize,
 }
 
 /// Classifies each field of [`JitRuntimeHelpers`] for the validator.
@@ -545,6 +578,16 @@ helper_fields! {
     // Leaf floor-query helper for the inline self-recursion check.
     (native_stack_floor_fn,          FieldKind::OptionalPtr),
     (ldc_string,                     FieldKind::RequiredPtr),
+    // Cooperative JIT safepoint polling (CRATONVM_JIT_SAFEPOINT_POLLS,
+    // off by default). Address of the STW-requested flag byte, not a
+    // pointer — 0 = polling disabled (matches the region_bounds_addr
+    // "optional address" convention above).
+    (safepoint_flag_addr,            FieldKind::Offset),
+    // Slow-path helper called on a poll hit. build_helpers wires this
+    // unconditionally; safepoint_flag_addr above is what actually gates
+    // whether the JIT ever emits a CALL to it, so 0 here is only ever
+    // "not wired" for a hand-built test helpers table.
+    (safepoint_slow_path,            FieldKind::OptionalPtr),
 }
 
 // Compile-time integrity check: the macro-generated NUM_FIELDS must
@@ -570,7 +613,7 @@ const _: () = assert!(
 // struct field AND its macro entry simultaneously would still satisfy
 // the ratio assert above and silently change the JIT ABI.
 const _: () = assert!(
-    JitRuntimeHelpers::NUM_FIELDS == 51,
+    JitRuntimeHelpers::NUM_FIELDS == 53,
     "JitRuntimeHelpers field count changed — bump the literal here and update \
      the golden-offset test in mod tests if the change is intentional",
 );
@@ -731,6 +774,8 @@ mod tests {
             region_bounds_addr: 0x1148,
             native_stack_floor_fn: 0x1150,
             ldc_string: 0x1158,
+            safepoint_flag_addr: 0x1160,
+            safepoint_slow_path: 0x1168,
         }
     }
 
@@ -954,6 +999,8 @@ mod tests {
             region_bounds_addr: 0,
             native_stack_floor_fn: 0,
             ldc_string: 0,
+            safepoint_flag_addr: 0,
+            safepoint_slow_path: 0,
         };
         assert_eq!(h.newarray, 0);
         assert_eq!(h.write_barrier, 0);
@@ -1129,8 +1176,8 @@ mod tests {
             std::mem::size_of::<JitRuntimeHelpers>(),
             JitRuntimeHelpers::NUM_FIELDS * FIELD_WIDTH,
         );
-        // And the macro-driven count is the canonical 51.
-        assert_eq!(JitRuntimeHelpers::NUM_FIELDS, 51);
+        // And the macro-driven count is the canonical 53.
+        assert_eq!(JitRuntimeHelpers::NUM_FIELDS, 53);
     }
 
     #[test]
@@ -1383,6 +1430,16 @@ mod tests {
                 "ldc_string",
                 std::mem::offset_of!(JitRuntimeHelpers, ldc_string),
             ),
+            (
+                51,
+                "safepoint_flag_addr",
+                std::mem::offset_of!(JitRuntimeHelpers, safepoint_flag_addr),
+            ),
+            (
+                52,
+                "safepoint_slow_path",
+                std::mem::offset_of!(JitRuntimeHelpers, safepoint_slow_path),
+            ),
         ];
 
         // (a) Each field is at its documented sequential byte offset.
@@ -1419,12 +1476,13 @@ mod tests {
 
     #[test]
     fn jit_runtime_helpers_all_fields_classified() {
-        // The macro must classify every field. 41 RequiredPtr + 5
-        // Offset + 5 OptionalPtr = 51. A new field whose classification
-        // is omitted will fail to compile (the macro requires both
-        // arms); this test pins the *counts* so a reclassification
-        // (e.g. demoting a RequiredPtr to OptionalPtr) is also a
-        // deliberate, reviewed change.
+        // The macro must classify every field. 41 RequiredPtr + 6
+        // Offset + 6 OptionalPtr = 53 (round-11: safepoint_flag_addr /
+        // safepoint_slow_path added one Offset + one OptionalPtr). A new
+        // field whose classification is omitted will fail to compile (the
+        // macro requires both arms); this test pins the *counts* so a
+        // reclassification (e.g. demoting a RequiredPtr to OptionalPtr) is
+        // also a deliberate, reviewed change.
         let h = make_helpers();
         let f = h.all_fields();
         let req = f
@@ -1437,8 +1495,8 @@ mod tests {
             .count();
         let off = f.iter().filter(|e| e.kind == FieldKind::Offset).count();
         assert_eq!(req, 41, "required-pointer count drifted");
-        assert_eq!(opt, 5, "optional-pointer count drifted");
-        assert_eq!(off, 5, "offset-field count drifted");
+        assert_eq!(opt, 6, "optional-pointer count drifted");
+        assert_eq!(off, 6, "offset-field count drifted");
         assert_eq!(req + opt + off, JitRuntimeHelpers::NUM_FIELDS);
     }
 
