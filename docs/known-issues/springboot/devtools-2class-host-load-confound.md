@@ -87,14 +87,32 @@ or an `IllegalArgumentException`. `NoClassDefFoundError` for a class that
 exists on disk is the JVM's "erroneous class" signal (JVMS §5.5): some
 *earlier* attempt to initialize `MockMethodAdvice` (or a class in its
 `<clinit>` chain) threw, and every subsequent reference is now permanently
-poisoned for that classloader — the actual root exception from that first
-failure was not captured this session. Given the reproducibility (not
-flaky across identical re-runs) this looks like a real, deterministic
-issue in this exact class/fork combination rather than pure load noise, but
-was not root-caused further — the original 2026-07-23 rerun's
-"could not be resolved" signature for this class was also not reproduced,
-so it's unclear whether these are the same underlying bug manifesting
-differently or two distinct issues.
+poisoned for that classloader.
+
+**2026-07-24 update: this is the SAME bug as
+[`tomcatservletwebserverservletcontextlistenertests-mockito-forkedclasspath-mockmethodadvice.md`](tomcatservletwebserverservletcontextlistenertests-mockito-forkedclasspath-mockmethodadvice.md)**,
+independently found the same day by a concurrent session investigating
+`module/spring-boot-tomcat`'s
+`TomcatServletWebServerServletContextListenerTests` — same exact exception
+chain, same trigger (`Mockito.mock()`/`spy()` called for the first time
+from *inside* `ModifiedClassPathExtension`'s reentrant nested-`Launcher`
+execution, i.e. any `@ForkedClassPath`/`@ClassPathExclusions` test). That
+doc has a much more precise, actionable hypothesis: `InlineByteBuddyMockMaker`
+calls `Instrumentation.appendToBootstrapClassLoaderSearch(jarFile)` after
+self-attach, routed to `native_append_to_classloader_search0`
+(`vm/src/runtime/instrument.rs`) → `ctx.register_bootstrap_classpath(&[path])`
+→ gates `MockMethodDispatcher` visibility (see
+`native-builtins/src/classloader.rs` ~line 1792). Only one self-attach line
+ever appears in the log with no native-side warning, so either the append
+call never fires on this reentrant-Launcher code path, or the temp
+dispatcher jar ByteBuddy writes at runtime is read by CratonVM before
+ByteBuddy finishes writing it (a race). See that doc's "Next steps" section
+for the concrete tracing plan (`eprintln!` on
+`native_append_to_classloader_search0` and its bootstrap sibling, checking
+whether/when it fires and whether the jar it's given actually contains
+`MockMethodDispatcher.class` at read time) — this is likely the SAME fix
+needed for both `module/spring-boot-tomcat` and this class, not two
+separate bugs.
 
 ## Suggested next steps
 

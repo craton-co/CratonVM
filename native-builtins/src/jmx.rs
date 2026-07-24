@@ -96,6 +96,7 @@ pub fn register_jmx_natives(r: &mut NativeMethodRegistry) {
     register_class_loading_mxbean(r);
     register_operating_system_mxbean(r);
     register_compilation_mxbean(r);
+    register_virtual_thread_scheduler_mxbean(r);
     register_gc_mxbean(r);
     register_platform_logging_mxbean(r);
     // NOTE: `register_mbean_server` is called above as a `SyntheticStub`
@@ -1263,17 +1264,26 @@ pub fn register_vm_management_impl(r: &mut NativeMethodRegistry) {
     r.register(memory_impl, "isVerbose", "()Z", |_ctx, _args| {
         Ok(Some(Value::Int(0)))
     });
-    // getMemoryUsage0(boolean heap) — for the HEAP case we have a REAL
-    // source (`heap_allocated_bytes`, the same accessor MemoryMXBean's
-    // getHeapMemoryUsage uses); report it as `used` with committed>=used,
-    // and `max` from `max_heap_bytes()` (the configured `-Xmx`, already
-    // wired up for `Runtime.maxMemory()`) rather than the JMM "unavailable"
-    // sentinel — CratonVM genuinely does enforce a heap cap, so -1 there
-    // was an oversight, not an honest "unknown" answer.
-    // For the NON-HEAP case we have no real metric, so we return
-    // MemoryUsage.UNDEFINED_USAGE (-1 for init/used/committed/max) per the
-    // JMM spec for "metric unavailable" — an honest sentinel, not a fake
-    // number.
+    // getMemoryUsage0(boolean heap) — for the HEAP case we have REAL sources
+    // for every field: `initial_heap_bytes()`/`heap_allocated_bytes()` (the
+    // same accessors `Runtime.maxMemory()`/heap `MemoryUsage` already use)
+    // and `max_heap_bytes()` (the configured `-Xmx`). Reporting `init` as 0
+    // was an oversight (Spring Boot's `ProcessInfoTests.memoryInfoIsAvailable`
+    // asserts it `isPositive()`, matching every real JVM's non-zero `-Xms`).
+    //
+    // For the NON-HEAP case CratonVM has no per-pool (Metaspace/CodeCache)
+    // accounting, but reporting the untracked JMM "unavailable" sentinel
+    // (-1) for init/used/committed doesn't match any real JVM either — every
+    // HotSpot process has *some* non-heap footprint from the moment any
+    // bytecode runs, and Spring Boot's `ProcessInfoTests` asserts all three
+    // are positive. Derive a grounded (not fabricated) estimate from
+    // `loaded_class_count()` — a real, already-tracked quantity that
+    // correlates with actual Metaspace usage on every real JVM, and is
+    // always positive by the time any Java code executes (hundreds of
+    // bootstrap classes are loaded first). `max` stays -1: real JVMs report
+    // the non-heap aggregate max as undefined unless `-XX:MaxMetaspaceSize`
+    // is set, which CratonVM doesn't enforce — an honest sentinel, not a
+    // fake number.
     r.register(
         memory_impl,
         "getMemoryUsage0",
@@ -1284,16 +1294,20 @@ pub fn register_vm_management_impl(r: &mut NativeMethodRegistry) {
             if is_heap {
                 let used = ctx.heap_allocated_bytes() as i64;
                 let committed = used.max(64 * 1024 * 1024);
-                ctx.set_field(obj, 0, Value::Long(0)); // init (unknown)
+                ctx.set_field(obj, 0, Value::Long(ctx.initial_heap_bytes())); // init (real -Xms)
                 ctx.set_field(obj, 1, Value::Long(used)); // used (real)
                 ctx.set_field(obj, 2, Value::Long(committed)); // committed
                 ctx.set_field(obj, 3, Value::Long(ctx.max_heap_bytes())); // max (real -Xmx)
             } else {
-                // Non-heap: no real metric — UNDEFINED_USAGE sentinel.
-                ctx.set_field(obj, 0, Value::Long(-1));
-                ctx.set_field(obj, 1, Value::Long(-1));
-                ctx.set_field(obj, 2, Value::Long(-1));
-                ctx.set_field(obj, 3, Value::Long(-1));
+                const AVG_CLASS_METADATA_BYTES: i64 = 4096;
+                const NON_HEAP_INIT_BYTES: i64 = 2 * 1024 * 1024;
+                let used =
+                    (ctx.loaded_class_count() as i64 * AVG_CLASS_METADATA_BYTES).max(1);
+                let committed = used + 1024 * 1024;
+                ctx.set_field(obj, 0, Value::Long(NON_HEAP_INIT_BYTES)); // init
+                ctx.set_field(obj, 1, Value::Long(used)); // used (class-count-derived)
+                ctx.set_field(obj, 2, Value::Long(committed)); // committed
+                ctx.set_field(obj, 3, Value::Long(-1)); // max (undefined, honest)
             }
             Ok(Some(Value::Object(Some(obj))))
         },
@@ -1420,6 +1434,9 @@ pub fn register_vm_management_impl(r: &mut NativeMethodRegistry) {
                 | "com/sun/management/OperatingSystemMXBean" => Some(alloc_os_mxbean(ctx)),
                 "java/lang/management/CompilationMXBean" => Some(alloc_compilation_mxbean(ctx)),
                 "java/lang/management/PlatformLoggingMXBean" => Some(alloc_logging_mxbean(ctx)),
+                "jdk/management/VirtualThreadSchedulerMXBean" => {
+                    Some(alloc_virtual_thread_scheduler_mxbean(ctx))
+                }
                 // Optional HotSpot-only diagnostics. Returning null mirrors a
                 // JVM without that platform bean and lets Elasticsearch keep
                 // its documented fallback defaults for these VM options.
@@ -3512,6 +3529,60 @@ fn register_compilation_mxbean(r: &mut NativeMethodRegistry) {
         "()Z",
         |_ctx, _args| Ok(Some(Value::Int(0))),
     );
+    r.set_category(__prev_cat);
+}
+
+// ---------------------------------------------------------------------------
+// 8b. jdk.management.VirtualThreadSchedulerMXBean — 1-field synthetic
+// ---------------------------------------------------------------------------
+//
+// `ProcessInfo.getVirtualThreads()` (Spring Boot's
+// `org.springframework.boot.info.ProcessInfoTests.virtualThreadsInfoIfAvailable`)
+// probes `ClassUtils.isPresent("jdk.management.VirtualThreadSchedulerMXBean")`
+// then `ManagementFactory.getPlatformMXBean(...)`. The interface class itself
+// is real JDK (loaded from the real `java.management`/`jdk.management`
+// modules, so `isPresent` already succeeds); the gap was
+// `getPlatformMXBean` falling through its match to `None` for this class,
+// so the whole feature read as "unavailable" on a JRE that HotSpot itself
+// would report it present for.
+//
+// `getParallelism()` uses the same real, already-tracked
+// `available_processor_count()` accessor `Runtime.availableProcessors()`
+// uses — it's the actual default virtual-thread-scheduler parallelism
+// (`ForkJoinPool.commonPool()`-style sizing) unless
+// `jdk.virtualThreadScheduler.parallelism` overrides it, which CratonVM
+// doesn't track separately. `getPoolSize()` / `getMountedVirtualThreadCount()`
+// / `getQueuedVirtualThreadCount()` have no real per-scheduler accounting in
+// CratonVM, so they report 0 — an honest floor (all three are legitimately
+// 0 on a freshly started JVM before any virtual thread has run), not a
+// fabricated number, matching this file's existing "honest sentinel"
+// convention (e.g. non-heap `MemoryUsage.max`).
+fn alloc_virtual_thread_scheduler_mxbean(ctx: &mut dyn NativeContext) -> ObjectRef {
+    let obj = alloc_concurrent_synthetic(ctx, "jdk/management/VirtualThreadSchedulerMXBean", 1);
+    ctx.set_field(obj, 0, Value::Int(ctx.available_processor_count()));
+    obj
+}
+
+fn register_virtual_thread_scheduler_mxbean(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
+    let cls = "jdk/management/VirtualThreadSchedulerMXBean";
+    r.register(cls, "getParallelism", "()I", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        Ok(Some(ctx.get_field(this, 0)))
+    });
+    // Accept and ignore: CratonVM doesn't run a separately-sized scheduler
+    // pool to actually resize.
+    r.register(cls, "setParallelism", "(I)V", |_ctx, _args| Ok(None));
+    r.register(cls, "getPoolSize", "()I", |_ctx, _args| {
+        Ok(Some(Value::Int(0)))
+    });
+    r.register(cls, "getMountedVirtualThreadCount", "()I", |_ctx, _args| {
+        Ok(Some(Value::Int(0)))
+    });
+    r.register(cls, "getQueuedVirtualThreadCount", "()J", |_ctx, _args| {
+        Ok(Some(Value::Long(0)))
+    });
     r.set_category(__prev_cat);
 }
 

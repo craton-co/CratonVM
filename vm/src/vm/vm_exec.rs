@@ -7579,6 +7579,12 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         self.shared.config.max_heap_size as i64
     }
 
+    fn initial_heap_bytes(&self) -> i64 {
+        // Report the configured `-Xms`, mirroring `max_heap_bytes`'s use of
+        // the real configured value in place of a hardcoded placeholder.
+        self.shared.config.initial_heap_size as i64
+    }
+
     fn loaded_class_count(&self) -> usize {
         self.shared.class_manager.read().loaded_count()
     }

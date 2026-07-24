@@ -743,6 +743,11 @@ pub fn update_all_roots(
     //     Same scan/update contract as the Integer.valueOf cache.
     cratonvm_native_builtins::lang_invoke::gc_update_lambda_callsite_cache_refs(pointer_map);
 
+    // 16a. Re-point the zero-capture lambda proxy singleton cache
+    //      (scanned in `roots.rs` step 16a). Same scan/update contract as
+    //      the Integer.valueOf cache.
+    crate::runtime::invokedynamic::gc_update_lambda_singleton_refs(shared.vm_identity, pointer_map);
+
     // 17. Overlay-backed collections (LinkedList / LinkedHashMap / TreeMap /
     //     TreeSet) keep their backing arrays + nodes in process-global Rust
     //     side-tables. Their roots are scanned in `roots.rs` step 17; repoint

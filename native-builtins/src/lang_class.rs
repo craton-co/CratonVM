@@ -15927,21 +15927,42 @@ pub(crate) fn native_class_get_declared_classes(
                 // `forkedLoader.loadClass("...NestedConfig")` directly)
                 // falls straight to the global lookup and silently returns
                 // the FIRST same-named class some other loader registered.
-                let driven = crate::classloader::defining_loader_for(class_id.as_u32()).and_then(
-                    |loader_obj| {
-                        let dotted = inner_class.replace('/', ".");
-                        let name_obj = ctx.create_string(&dotted);
-                        match ctx.invoke_virtual(
-                            loader_obj,
-                            "loadClass",
-                            "(Ljava/lang/String;)Ljava/lang/Class;",
-                            &[Value::Object(Some(name_obj))],
-                        ) {
-                            Ok(Some(Value::Object(Some(mirror)))) => mirror_class_id(ctx, mirror),
-                            _ => None,
-                        }
-                    },
-                );
+                //
+                // `defining_loader_for` is narrowly populated (only the ~4
+                // explicit `register_defining_loader` call sites write it),
+                // so a class defined via the ordinary isolated-`URLClassLoader`
+                // native path (`ucl_try_define_local_class`) can have a
+                // perfectly good `UserDefined` namespace id in `class_manager`
+                // (readable via `loader_id_of_class`) while still missing
+                // from that side table. Fall back to the namespace-id-keyed
+                // reverse lookup (`loader_object_for_namespace_id`, backed by
+                // the SAME object-keyed store `loader_namespace_id` itself
+                // writes) before giving up on driving the loader directly —
+                // this is exactly the scenario a JUnit5 `@Nested` class run
+                // under Spring Boot's `ModifiedClassPathClassLoader` fork
+                // hits: `getDeclaredClasses()` is called on a freshly
+                // isolated outer `Class` whose defining loader was never
+                // separately registered.
+                let loader_obj = crate::classloader::defining_loader_for(class_id.as_u32())
+                    .or_else(|| {
+                        let ns_id = ctx.loader_id_of_class(class_id);
+                        (ns_id >= 3)
+                            .then(|| crate::classloader::loader_object_for_namespace_id(ns_id as u32))
+                            .flatten()
+                    });
+                let driven = loader_obj.and_then(|loader_obj| {
+                    let dotted = inner_class.replace('/', ".");
+                    let name_obj = ctx.create_string(&dotted);
+                    match ctx.invoke_virtual(
+                        loader_obj,
+                        "loadClass",
+                        "(Ljava/lang/String;)Ljava/lang/Class;",
+                        &[Value::Object(Some(name_obj))],
+                    ) {
+                        Ok(Some(Value::Object(Some(mirror)))) => mirror_class_id(ctx, mirror),
+                        _ => None,
+                    }
+                });
                 match driven {
                     Some(id) => Some(id),
                     None => match ctx.load_class(inner_class) {
