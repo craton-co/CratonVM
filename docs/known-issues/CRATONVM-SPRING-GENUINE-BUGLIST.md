@@ -2352,3 +2352,153 @@ baseline failures) and after (2233 passed / 10 of the same family --
 in mid-session) -- zero regressions introduced by this session's 3 fixes
 at any point. `ApplicationContextAotGeneratorTests` full class:
 34/40 -> 36/40.
+
+## 2026-07-24 AOT follow-up 9 -- non-capturing lambda singleton cache fixed (36/40 -> 38/40), CGLIB cross-test residual narrowed but not fixed
+
+Worktree `/data/wt-aot-followup9-20260724` (branch `fix/aot-followup9-20260724`,
+from `origin/dev` `93ec6a810`). No subagents used, per this task's standing
+instruction.
+
+### Fix: non-capturing lambdas now cache a per-call-site singleton
+
+Implemented the gap flagged (not fixed) at the end of follow-up 8: real
+HotSpot's `InnerClassLambdaMetafactory` caches a single `INSTANCE` per spun
+lambda class when the lambda captures zero arguments, and some code (this
+AOT test) depends on that identity holding across two separate invocations
+of the same non-capturing lambda expression. Added a
+`LAMBDA_SINGLETON_CACHE` (`vm/src/runtime/invokedynamic.rs`, keyed by
+`(vm_identity, proxy_class_id)`) that `allocate_lambda_proxy` consults
+before allocating: a zero-capture call site mints its singleton exactly
+once and every later invocation hits the cache instead of allocating a
+fresh proxy object. `proxy_class_id` (`SharedVm::alloc_lambda_proxy_id`) is
+a monotonically-increasing id that is **never recycled** (confirmed by
+reading the allocator: plain `AtomicU32::fetch_add`, no reuse), unlike the
+real, recyclable `ClassId` space used for loaded classes -- so unlike the
+CGLIB cache below, this key carries no aliasing risk and needed no extra
+care. GC-scanned/remapped the same way as the `Integer.valueOf` cache in
+`native-builtins/src/lang_math.rs` (new `gc_scan_lambda_singleton_roots`/
+`gc_update_lambda_singleton_refs`, wired into `vm/src/memory/{roots.rs,gc.rs}`
+as step 16a, right after the existing step-16 LambdaMetafactory CallSite
+cache).
+
+Fixes `processAheadOfTimeWhenHasAutowiringOnUnresolvedGeneric`. Verified via
+isolated `MethodRun` and via the full `ApplicationContextAotGeneratorTests`
+class: 36/40 -> 38/40, only the two already-known CGLIB cross-test
+residuals remain (`processAheadOfTimeUsesCglibClassForFactoryMethod`,
+`processAheadOfTimeWhenHasCglibProxyUseProxy`).
+
+### CGLIB cross-test residual: two more hypotheses ruled out, real mechanism narrowed
+
+Continued follow-up 8's "next step" (bypass JUnit/Spring-context-refresh
+machinery for a clean repro). Two hypotheses that looked highly plausible
+going in were both **refuted** with direct evidence:
+
+1. **Loader-id recycling.** Checked `ClassManager`'s own doc comment
+   (`classloading/src/class_manager.rs` around `user_loaders`): "the set
+   only grows because class-loader unloading is not implemented in this
+   VM." Confirmed at the allocator itself
+   (`vm/src/vm/vm_exec.rs::allocate_loader_id`): a plain
+   `AtomicU32::fetch_add`, starting at 3, never recycled. Two different
+   `new CompileWithForkedClassLoaderClassLoader(...)` instances (Spring's
+   real per-`@Test`-method forking mechanism, `spring-core-test.jar`)
+   genuinely get distinct, monotonically-increasing loader ids -- ruled
+   out as the cause.
+2. **The forked-classloader mechanism itself being loader-blind for
+   testfixture classes reached only by name** (follow-up 8's tentative
+   read of its own `CRATONVM_DBG_CCECACHE` trace). Built two
+   Spring-free/CGLIB-free repros using Spring's REAL
+   `CompileWithForkedClassLoaderClassLoader`/`CompileWithForkedClassLoader`
+   classes (already on the classpath, `org.springframework.core.test.tools`)
+   against a plain fixture class with a static `AtomicInteger` counter --
+   one flat (`ProbeForkTest`, two top-level `@Test` methods), one nested
+   with the counter-touching call routed through a private helper method
+   on the OUTER class (`OuterProbeTest.Nested2`, matching
+   `ApplicationContextAotGeneratorTests.ConfigurationClassCglibProxy`'s own
+   shape exactly). **Both reproduced correctly on CratonVM**: fresh counter
+   (`==1`) and a fresh, distinct defining loader on every forked
+   invocation, matching real HotSpot's behavior byte-for-byte. This rules
+   out "the generic forking mechanism is broken" as the cause -- whatever
+   is happening is specific to the CGLIB/`ConfigurationClassPostProcessor`
+   path, not to `@CompileWithForkedClassLoader` in general.
+
+**New finding, narrows the real mechanism**: re-ran the full 40-method
+class with `CRATONVM_DBG_CCECACHE=1`. Across the whole run,
+`config_enhancer_class_cache`'s lookup key
+(`(super_loader_id, super_class_name)`) is correctly **unique per test
+method** -- 9 distinct loader ids observed for 9 CGLIB-using test methods,
+confirming (again) no loader-id aliasing across tests. But **within the
+two failing tests' own single loader scope**, `ConfigurationClassEnhancer
+.enhance()` is called **twice** for the identical `(loader_id,
+"CglibConfiguration")` key, and **both calls report a cache MISS** --
+which is itself the anomaly: a same-loader repeat call should hit the
+cache the second time (real cglib's own `AbstractClassGenerator` caching
+guarantees the same generated `Class` on a repeat `enhance()` call for the
+same superclass+loader, which is exactly what `config_enhancer_class_cache`
+was added to emulate). A double-miss means two DIFFERENT `ClassId`s get
+minted for what should be "the same" enhancer class within one test's own
+scope -- if the AOT-generated source (compiled once, referencing
+whichever `ClassId` was live when generation ran) and the actual
+CGLIB-marker/dispatch check at replay time (whichever `ClassId` a second,
+missed-cache `enhance()` call produced) end up disagreeing about which of
+the two is canonical, that would explain both symptoms directly: "not an
+enhanced class" (an identity/marker check against the wrong `ClassId`) and
+"Hello1" instead of "Hello0" (the underlying real `CglibConfiguration`'s
+static `AtomicInteger` counter genuinely getting exercised twice within
+one test run, once per enhance() attempt, if scanning/building a second
+enhancer subclass also touches the superclass's own state).
+
+Two tests with a bare `CglibConfiguration` (not one of the `Value/
+Autowired/Configurable` variants) are exactly `processAheadOfTime
+UsesCglibClassForFactoryMethod` and `processAheadOfTimeWhenHasCglibProxy
+UseProxy` -- i.e. this double-miss-within-one-test pattern maps 1:1 onto
+the two actually-failing tests, and does NOT occur for any of the other
+CGLIB-using tests in the class (which call `enhance()` either once, or
+twice with the second call correctly hitting the cache). **Not yet
+explained**: why `testCompiledResult`'s generation+replay flow calls
+`enhance()` twice specifically for these two tests and not the others
+(`processAheadOfTimeWhenHasCglibProxyAndAutowiring`/`AndMixedAutowiring`/
+`WithArgumentsUseProxy`, all similarly `testCompiledResult`-based, showed
+a clean single miss + single hit in the same trace), nor why the SECOND
+call misses instead of hitting given an apparently-identical cache key.
+**Next step for whoever continues**: instrument `cce_enhance` with a
+cache-size print immediately before/after both the lookup and the insert
+(not just hit/miss) to rule out reentrancy (the second call happening
+before the first's insert completes, e.g. via a recursive trigger during
+`scan_bean_methods`/class initialization) versus the key itself somehow
+differing between the two calls despite printing identically in the
+existing trace; a raw (non-JUnit, non-Spring-context) driver that calls
+`ConfigurationClassPostProcessor`/`ApplicationContextAotGenerator
+.processAheadOfTime` directly, twice, in one process for
+ONLY these two specific config classes would isolate this far faster than
+the ~5-minute full-class run this session used.
+
+### Also found, out of scope, flagged separately
+
+`cargo test -p cratonvm-native-builtins --lib` surfaced a NEW failure not
+present in follow-up 8's baseline:
+`cglib_enhancer::fb_ref_bytecode_tests::fb_ref_splice_shifts_exception_table_by_exactly_8_bytes`
+(`left: 281 right: 161` at `cglib_enhancer.rs:4668`, deterministic in
+isolation). Confirmed pre-existing on `origin/dev` (this session never
+touched `cglib_enhancer.rs`) -- most likely `86b638d65`
+("parameterized @Bean methods" / `@Lookup` fixes) changed
+`emit_bean_override`'s generated bytecode shape without updating this
+test's hardcoded byte-length constants. Flagged via a spawned background
+task rather than fixed here to stay in scope.
+
+### Not attempted this session (time budget)
+
+Family B of `endToEndTestsForBeanOverrides` and the
+`TestContextAotGeneratorIntegrationTests` `GroovySystem` quiet-host
+recheck (both flagged since follow-up 7/8) were not revisited this session
+either -- the CGLIB cross-test investigation above consumed the bulk of
+this session's time budget.
+
+Verified: `cargo test -p cratonvm-vm --lib --release` (2233 passed / 10
+pre-existing `lock_order`/`tomcat_scanner` baseline failures -- exact same
+family/count as follow-up 8's post-merge baseline, zero regressions from
+this session's lambda-cache fix). `cargo test -p cratonvm-native-builtins
+--lib` (3077 passed / 2 failed -- the 1 pre-existing
+`pem_block_to_der_roundtrip` plus the newly-surfaced, pre-existing-on-dev
+`fb_ref_splice_shifts_exception_table_by_exactly_8_bytes` above, neither
+caused by this session). `ApplicationContextAotGeneratorTests` full class:
+36/40 -> 38/40.
