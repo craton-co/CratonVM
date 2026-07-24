@@ -159,6 +159,23 @@ pub(crate) fn gcpart_probe(addr: usize) -> Vec<(u64, Option<usize>, usize, bool)
     }
 }
 
+fn remap_handle_slots(
+    slots: &mut [Option<ObjectRef>],
+    pointer_map: &HashMap<usize, usize>,
+) -> usize {
+    let mut rewritten = 0;
+    for slot in slots.iter_mut().flatten() {
+        let old_addr = slot.as_ptr() as usize;
+        if let Some(&new_addr) = pointer_map.get(&old_addr) {
+            debug_assert!(new_addr != 0, "GC pointer map contains null address");
+            // SAFETY: relocation maps contain live, aligned object addresses.
+            *slot = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+            rewritten += 1;
+        }
+    }
+    rewritten
+}
+
 /// Scans thread frames (locals + operand stacks), static fields, class locks,
 /// and printed values, updating any ObjectRef whose old address appears in
 /// the pointer map.
@@ -406,13 +423,7 @@ pub fn update_all_roots(
     // Handle-scope slots (arch/handles) are roots too: without this remap a
     // RootedHandle read after a moving collection would decode the pre-move
     // address. Mirrors the native_pin_roots loop above.
-    for slot in thread.handle_slots.iter_mut().flatten() {
-        let old_addr = slot.as_ptr() as usize;
-        if let Some(&new_addr) = pointer_map.get(&old_addr) {
-            debug_assert!(new_addr != 0, "GC pointer map contains null address");
-            *slot = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
-        }
-    }
+    remap_handle_slots(&mut thread.handle_slots, pointer_map);
 
     if let Some(ref mut obj_ref) = thread.native_pending_return {
         let old_addr = obj_ref.as_ptr() as usize;
@@ -1289,6 +1300,20 @@ mod tests {
     #[inline]
     fn stw() -> cratonvm_gc::collector::StopTheWorldToken {
         unsafe { cratonvm_gc::collector::StopTheWorldToken::new() }
+    }
+
+    #[test]
+    fn moving_gc_rewrites_live_handle_slots_in_place() {
+        // SAFETY: these aligned non-null addresses are never dereferenced.
+        let old = unsafe { ObjectRef::from_raw(0x1000usize as *mut u8) };
+        let unmoved = unsafe { ObjectRef::from_raw(0x3000usize as *mut u8) };
+        let mut slots = vec![Some(old), None, Some(unmoved)];
+        let pointer_map = HashMap::from([(0x1000usize, 0x2000usize)]);
+
+        assert_eq!(remap_handle_slots(&mut slots, &pointer_map), 1);
+        assert_eq!(slots[0].unwrap().as_ptr() as usize, 0x2000);
+        assert!(slots[1].is_none());
+        assert_eq!(slots[2].unwrap().as_ptr() as usize, 0x3000);
     }
 
     #[test]

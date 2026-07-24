@@ -324,6 +324,87 @@ pub enum GpuFutureResult {
     ScalarF64(f64),
 }
 
+/// Opaque reference to a GC-updated slot owned by a [`NativeHandleScope`].
+///
+/// The fallback is intentionally private. Lightweight mock contexts do not
+/// implement a moving heap and therefore use it when their default
+/// [`NativeContext::handle_get`] returns `None`; production VM contexts always
+/// read the current address through `slot`. Native implementations cannot
+/// extract either value, so they cannot accidentally keep using a pre-GC raw
+/// reference or reinterpret a slot index as a heap address.
+#[derive(Debug)]
+pub struct NativeHandle {
+    slot: u32,
+    fallback: ObjectRef,
+}
+
+/// Early-return- and panic-safe native root scope.
+///
+/// Construct this before retaining any object across an allocating or
+/// re-entrant VM call. Every object rooted through [`Self::root`] remains in
+/// the executing thread's collector-visible handle table until this guard is
+/// dropped. [`Drop`] closes the scope on every Rust exit path, eliminating the
+/// manually paired `handle_scope_push`/`handle_scope_pop` discipline.
+///
+/// `DerefMut<Target = dyn NativeContext>` lets existing native code call VM
+/// capabilities through the scope while the roots are active:
+///
+/// ```ignore
+/// let mut scope = NativeHandleScope::new(ctx);
+/// let receiver = scope.root(receiver);
+/// let array = scope.new_array(ArrayElementType::Char, len); // may collect
+/// let receiver = scope.get(&receiver); // always the current address
+/// scope.set_field(receiver, 0, Value::Object(Some(array)));
+/// // scope closes automatically, including on `?` or `return`.
+/// ```
+pub struct NativeHandleScope<'a> {
+    context: &'a mut dyn NativeContext,
+}
+
+impl<'a> NativeHandleScope<'a> {
+    /// Open a nested scope on `context`.
+    pub fn new(context: &'a mut dyn NativeContext) -> Self {
+        context.handle_scope_push();
+        Self { context }
+    }
+
+    /// Root `object` and return an opaque handle that can only be resolved
+    /// through this scope.
+    pub fn root(&mut self, object: ObjectRef) -> NativeHandle {
+        NativeHandle {
+            slot: self.context.handle_root(object),
+            fallback: object,
+        }
+    }
+
+    /// Resolve `handle` to its current post-GC address.
+    pub fn get(&self, handle: &NativeHandle) -> ObjectRef {
+        self.context
+            .handle_get(handle.slot)
+            .unwrap_or(handle.fallback)
+    }
+}
+
+impl<'a> std::ops::Deref for NativeHandleScope<'a> {
+    type Target = dyn NativeContext + 'a;
+
+    fn deref(&self) -> &Self::Target {
+        self.context
+    }
+}
+
+impl<'a> std::ops::DerefMut for NativeHandleScope<'a> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.context
+    }
+}
+
+impl Drop for NativeHandleScope<'_> {
+    fn drop(&mut self) {
+        self.context.handle_scope_pop();
+    }
+}
+
 /// Trait providing VM capabilities needed by native method implementations.
 ///
 /// The `Vm` struct implements this trait. Using a trait here avoids circular
@@ -732,16 +813,14 @@ pub trait NativeContext {
     // — never keep using the pre-call local. The usual shape:
     //
     // ```ignore
-    // ctx.handle_scope_push();
-    // let this_h = ctx.handle_root(this);
-    // let arr = ctx.new_array(ArrayElementType::Char, len); // may GC-move `this`
-    // let this = ctx.handle_get(this_h).unwrap_or(this);    // current address
-    // ctx.handle_scope_pop();
+    // let mut scope = NativeHandleScope::new(ctx);
+    // let this_h = scope.root(this);
+    // let arr = scope.new_array(ArrayElementType::Char, len); // may GC-move `this`
+    // let this = scope.get(&this_h);                          // current address
     // ```
     //
-    // Scopes nest: an inner `handle_scope_push`/`handle_scope_pop` pair
-    // rooted and released entirely inside an outer one only touches its own
-    // handles, mirroring `pin_native_root`'s base-index nesting. See
+    // `NativeHandleScope` closes itself on normal, early-return, and unwind
+    // paths. Scopes nest and each guard releases only its own handles. See
     // `docs/feature-designs/native-handle-discipline.md` for the full
     // design and `native_builtins::lang_string` for worked examples
     // (`native_string_init_abstract_string_builder`,
@@ -1398,7 +1477,11 @@ pub trait NativeContext {
     /// Probe a per-thread cache for an ASCII case-conversion result. The
     /// cache alternates two immutable values so consecutive calls stay
     /// observably distinct.
-    fn get_ascii_case_string_cached(&mut self, _source: ObjectRef, _upper: bool) -> Option<ObjectRef> {
+    fn get_ascii_case_string_cached(
+        &mut self,
+        _source: ObjectRef,
+        _upper: bool,
+    ) -> Option<ObjectRef> {
         None
     }
 
@@ -4453,11 +4536,17 @@ impl NativeMethodRegistry {
     ) -> Option<(NativeCallback, NativeKind)> {
         let key = native_method_hash(class_name, method_name, descriptor);
         if let Some(cb) = self.methods.get(&key).copied() {
-            let kind = self.category_by_key.get(&key).copied().unwrap_or(NativeKind::Bridge);
+            let kind = self
+                .category_by_key
+                .get(&key)
+                .copied()
+                .unwrap_or(NativeKind::Bridge);
             return Some((cb, kind));
         }
         let cb = self.find(class_name, method_name, descriptor)?;
-        let kind = self.kind_of(class_name, method_name, descriptor).unwrap_or(NativeKind::Bridge);
+        let kind = self
+            .kind_of(class_name, method_name, descriptor)
+            .unwrap_or(NativeKind::Bridge);
         Some((cb, kind))
     }
 
@@ -4712,6 +4801,7 @@ impl std::fmt::Debug for NativeMethodRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_mock::MockNativeContext;
 
     fn dummy_native(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
         Ok(None)
@@ -4719,6 +4809,46 @@ mod tests {
 
     fn dummy_native_2(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
         Ok(Some(Value::Int(42)))
+    }
+
+    #[test]
+    fn native_handle_scope_releases_nested_roots_on_all_rust_exit_paths() {
+        fn root_then_return(ctx: &mut dyn NativeContext, object: ObjectRef) {
+            let mut scope = NativeHandleScope::new(ctx);
+            let handle = scope.root(object);
+            assert_eq!(scope.get(&handle), object);
+        }
+
+        let mut ctx = MockNativeContext::new();
+        let first = ctx.fresh_object_ref();
+        root_then_return(&mut ctx, first);
+        assert_eq!(ctx.handle_slot_count(), 0);
+        assert_eq!(ctx.handle_scope_depth(), 0);
+
+        let outer_object = ctx.fresh_object_ref();
+        let inner_object = ctx.fresh_object_ref();
+        {
+            let mut outer = NativeHandleScope::new(&mut ctx);
+            let outer_handle = outer.root(outer_object);
+            {
+                let mut inner = NativeHandleScope::new(&mut *outer);
+                let inner_handle = inner.root(inner_object);
+                assert_eq!(inner.get(&inner_handle), inner_object);
+            }
+            assert_eq!(outer.get(&outer_handle), outer_object);
+        }
+        assert_eq!(ctx.handle_slot_count(), 0);
+        assert_eq!(ctx.handle_scope_depth(), 0);
+
+        let unwind_object = ctx.fresh_object_ref();
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut scope = NativeHandleScope::new(&mut ctx);
+            let _handle = scope.root(unwind_object);
+            panic!("exercise NativeHandleScope::drop during unwind");
+        }));
+        assert!(panicked.is_err());
+        assert_eq!(ctx.handle_slot_count(), 0);
+        assert_eq!(ctx.handle_scope_depth(), 0);
     }
 
     fn legacy_native_method_hash(class: &str, method: &str, descriptor: &str) -> (u64, u64) {
