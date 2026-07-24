@@ -27699,6 +27699,16 @@ fn force_native_over_real_jdk_bytecode(
     {
         return true;
     }
+    // Native-backed ZIP metadata uses the real JDK field layout but may carry
+    // a null optional comment. Keep the bridge for the nullable setter so a
+    // Spring Boot nested-entry copy does not enter ZipEntry's CEN validation
+    // path with compact/native state.
+    if matches!(class_name, "java/util/zip/ZipEntry" | "java/util/jar/JarEntry")
+        && method_name == "setComment"
+        && method_descriptor == "(Ljava/lang/String;)V"
+    {
+        return true;
+    }
     if is_native_thread_set_native_override(class_name, method_name, method_descriptor) {
         return true;
     }

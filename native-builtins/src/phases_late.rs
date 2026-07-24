@@ -20239,6 +20239,15 @@ pub(crate) fn register_p58_gzip_streams(r: &mut NativeMethodRegistry) {
         };
         Ok(Some(Value::Int(if is_dir { 1 } else { 0 })))
     });
+    // Spring Boot copies the optional central-directory comment from one
+    // ZipEntry into another. A missing comment is represented as null; retain
+    // that JDK value instead of entering the compact-layout-incompatible real
+    // implementation, which dereferences it while validating the CEN header.
+    r.register(ze, "setComment", "(Ljava/lang/String;)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        ctx.set_field_by_name(this, "comment", args.get(1).copied().unwrap_or(Value::Object(None)));
+        Ok(None)
+    });
 
     // InflaterInputStream / DeflaterOutputStream (abstract bases)
     r.register(
@@ -22504,6 +22513,11 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
     r.register(je, "getComment", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         Ok(Some(ctx.get_field_by_name(this, "comment")))
+    });
+    r.register(je, "setComment", "(Ljava/lang/String;)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        ctx.set_field_by_name(this, "comment", args.get(1).copied().unwrap_or(Value::Object(None)));
+        Ok(None)
     });
     r.register(je, "getSize", "()J", |ctx, args| {
         let this = obj_arg(args, 0)?;
