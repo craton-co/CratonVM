@@ -58,6 +58,7 @@ use cratonvm_jit_api::JitRuntimeHelpers;
 // truth in jit-api (the VM crate maps these same codes to HotSpot strings).
 use cratonvm_jit_api::npe_action;
 #[allow(unused_imports)]
+use cratonvm_types::narrow_oop::{narrow_base, narrow_oops_enabled};
 use cratonvm_types::{
     ARRAY_LENGTH_OFFSET, FIELD_CELL_PAYLOAD32_OFFSET, FIELD_CELL_PAYLOAD64_OFFSET,
     FIELD_CELL_TAG_OFFSET, HEADER_SIZE, SLOT_SIZE,
@@ -2105,6 +2106,20 @@ pub fn precise_jit_maps_enabled() -> bool {
 /// (null/alignment/published-region containment): G1/ZGC never publish
 /// region bounds, so every receiver bails to the full-barrier helper there,
 /// making the switch safe to enable on any backend.
+/// Whether narrow oops force every compact-field access through the helpers.
+///
+/// The inline compact-field fast paths bake an 8-byte reference load/store at a
+/// compile-time offset. Under compressed oops a reference slot is 4 bytes
+/// holding `(addr - base) >> shift`, so those emissions would read/write the
+/// wrong width and the wrong value. Until the codegen learns to emit the narrow
+/// load plus the base+shift transform, compressed oops disable the inline path
+/// and `getfield`/`putfield` fall back to `jit_getfield` / `jit_putfield_object`,
+/// which go through the width-aware `read_compact_field` / `write_compact_field`.
+#[inline]
+pub fn narrow_oops_block_inline_fields() -> bool {
+    narrow_oops_enabled()
+}
+
 pub fn inline_putfield_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
@@ -16477,6 +16492,7 @@ impl Compiler {
                             let fresh_ctor_first_store =
                                 inline_site_is_fresh_ctor_first_store(&site, cpc, field_index);
                             if inline_putfield_enabled()
+                                && !narrow_oops_block_inline_fields()
                                 && cratonvm_types::compact_ref_fields_enabled()
                                 && self.helpers.region_bounds_addr != 0
                             {
@@ -17089,6 +17105,10 @@ impl Compiler {
     ///
     /// Emits: MOV RAX, QWORD [RAX + RCX*8 + HEADER_SIZE]
     fn emit_ref_aload_regs(&mut self) {
+        if narrow_oops_enabled() {
+            self.emit_narrow_ref_aload_regs();
+            return;
+        }
         // MOV RAX, QWORD [RAX + RCX*8 + HEADER_SIZE]
         // REX.W + 0x8B + ModRM(mod=01, reg=RAX, r/m=SIB) + SIB(scale=3, idx=RCX, base=RAX) + disp8
         self.rex_w();
@@ -17096,6 +17116,30 @@ impl Compiler {
         self.buf.emit_byte(0x44); // ModRM: mod=01(disp8), reg=000(RAX), r/m=100(SIB)
         self.buf.emit_byte(0xC8); // SIB: scale=11(*8), index=001(RCX), base=000(RAX)
         self.buf.emit_byte(HEADER_SIZE as u8); // Cast: x86-64 immediate encoding
+    }
+
+    /// Compressed-oops reference element load. RAX=array, RCX=index; result in
+    /// RAX as a full 64-bit pointer, so every consumer downstream is unchanged.
+    ///
+    /// The element is a 4-byte `(addr - base) >> 3`, with 0 meaning null, so the
+    /// decode is `base + (narrow << 3)` — except for null, which must stay 0
+    /// rather than becoming `base`. `SHL` sets ZF from its result (the count is
+    /// a non-zero literal), so the null test is free: branch over the rebase
+    /// when the shifted value is zero.
+    ///
+    /// R11 is the scratch: it is neither an `ARG_REGS` nor a `SCRATCH_REGS`
+    /// member, so the operand-stack register cache never parks a value there.
+    fn emit_narrow_ref_aload_regs(&mut self) {
+        // MOV EAX, DWORD [RAX + RCX*4 + HEADER_SIZE]   (32-bit dst zero-extends)
+        self.buf.emit_byte(0x8B); // MOV r32, r/m32
+        self.buf.emit_byte(0x44); // ModRM: mod=01(disp8), reg=000(EAX), r/m=100(SIB)
+        self.buf.emit_byte(0x88); // SIB: scale=10(*4), index=001(RCX), base=000(RAX)
+        self.buf.emit_byte(HEADER_SIZE as u8); // Cast: x86-64 immediate encoding
+        self.buf.emit(&[0x48, 0xC1, 0xE0, 0x03]); // SHL RAX, 3
+        self.buf.emit(&[0x74, 0x0D]); // JZ +13 (past the rebase: null stays 0)
+        self.buf.emit(&[0x49, 0xBB]); // MOV R11, imm64
+        self.buf.emit(&narrow_base().to_le_bytes()); // ... = heap base
+        self.buf.emit(&[0x4C, 0x01, 0xD8]); // ADD RAX, R11
     }
 
     /// Inline ref element store to Object[] array (compact 8-byte pointers).
@@ -17106,12 +17150,38 @@ impl Compiler {
     /// Wired into the `aastore` opcode arm; the GC write-barrier is emitted
     /// separately as a call to `self.helpers.write_barrier` after the store.
     fn emit_ref_astore_regs(&mut self) {
+        if narrow_oops_enabled() {
+            self.emit_narrow_ref_astore_regs();
+            return;
+        }
         // MOV QWORD [RAX + RCX*8 + HEADER_SIZE], RDX
         // REX.W + 0x89 + ModRM(mod=01, reg=RDX, r/m=SIB) + SIB(scale=3, idx=RCX, base=RAX) + disp8
         self.rex_w();
         self.buf.emit_byte(0x89); // MOV r/m64, r64
         self.buf.emit_byte(0x54); // ModRM: mod=01(disp8), reg=010(RDX), r/m=100(SIB)
         self.buf.emit_byte(0xC8); // SIB: scale=11(*8), index=001(RCX), base=000(RAX)
+        self.buf.emit_byte(HEADER_SIZE as u8); // Cast: x86-64 immediate encoding
+    }
+
+    /// Compressed-oops reference element store. RAX=array, RCX=index,
+    /// RDX=value (raw 64-bit pointer, 0 for null).
+    ///
+    /// Encodes to `(addr - base) >> 3` in R11 and stores 4 bytes; a null value
+    /// stores 0. **RDX is preserved** — the `aastore` arm hands it to the write
+    /// barrier after this store — so the subtraction is done as
+    /// `R11 = (-base) + RDX` rather than in place.
+    fn emit_narrow_ref_astore_regs(&mut self) {
+        self.buf.emit(&[0x4D, 0x31, 0xDB]); // XOR R11, R11 (the null encoding)
+        self.buf.emit(&[0x48, 0x85, 0xD2]); // TEST RDX, RDX
+        self.buf.emit(&[0x74, 0x11]); // JZ +17 (store the zero already in R11)
+        self.buf.emit(&[0x49, 0xBB]); // MOV R11, imm64
+        self.buf.emit(&narrow_base().wrapping_neg().to_le_bytes()); // ... = -base
+        self.buf.emit(&[0x49, 0x01, 0xD3]); // ADD R11, RDX -> addr - base
+        self.buf.emit(&[0x49, 0xC1, 0xEB, 0x03]); // SHR R11, 3
+        self.buf.emit_byte(0x44); // MOV DWORD [..], R11D: REX.R (R11 as reg field)
+        self.buf.emit_byte(0x89); // MOV r/m32, r32
+        self.buf.emit_byte(0x5C); // ModRM: mod=01(disp8), reg=011(R11), r/m=100(SIB)
+        self.buf.emit_byte(0x88); // SIB: scale=10(*4), index=001(RCX), base=000(RAX)
         self.buf.emit_byte(HEADER_SIZE as u8); // Cast: x86-64 immediate encoding
     }
 
@@ -21959,9 +22029,10 @@ impl Compiler {
                         pc += 3;
                     } else if let Some(&(c_off, c_is_ref)) =
                         self.compact_field_off.get(&pc).filter(|_| {
-                            inline_getfield_enabled()
-                                || (guarded_inline_getfield_enabled()
-                                    && self.helpers.region_bounds_addr != 0)
+                            !narrow_oops_block_inline_fields()
+                                && (inline_getfield_enabled()
+                                    || (guarded_inline_getfield_enabled()
+                                        && self.helpers.region_bounds_addr != 0))
                         })
                     {
                         if std::env::var_os("CRATONVM_DBG_COMPACT_INLINE").is_some() {
@@ -22423,6 +22494,7 @@ impl Compiler {
                                     // scribble a Value cell during Tomcat's
                                     // repeated webapp start/stop cycles.
                                     inline_putfield_enabled()
+                                        && !narrow_oops_block_inline_fields()
                                         && cratonvm_types::compact_ref_fields_enabled()
                                         && self.helpers.region_bounds_addr != 0
                                 })

@@ -18,6 +18,7 @@ use cratonvm_types::{
 use crate::memory::vm_heap::VmHeap;
 use crate::threading::jvm_thread::JvmThread;
 use crate::vm::SharedVm;
+use cratonvm_types::narrow_oop::{read_ref_slot, ref_element_size, write_ref_slot};
 
 // These two gate the RUNTIME dispatch helper's OWN direct-entry cache
 // (`jit_invoke_dispatch`'s `DISPATCH_CACHE`/`jit_cache` lookups and
@@ -3015,11 +3016,11 @@ pub unsafe extern "C" fn jit_aaload(array_ptr: i64, index: i64) -> i64 {
         JIT_SIGNALS.with(|s| s.aioobe.set(Some((index, length))));
         return i64::MIN;
     }
-    let elem_ptr = ptr.add(HEADER_SIZE + index as usize * REF_ELEMENT_SIZE) as *const u64;
+    let elem_ptr = ptr.add(HEADER_SIZE + index as usize * ref_element_size());
     // Degrade an implausible element reference to null instead of returning bits
     // the JIT will deref → SIGSEGV (the `0x8D8D..`-class stale ref). Mirrors
     // `read_prim_element`'s Reference arm; valid refs (or 0=null) pass through.
-    let raw = std::ptr::read(elem_ptr);
+    let raw = read_ref_slot(elem_ptr);
     if cratonvm_types::plausible_heap_pointer(raw) {
         raw as i64
     } else {
@@ -3106,7 +3107,7 @@ pub unsafe extern "C" fn jit_aastore(vm_ptr: i64, array_ptr: i64, index: i64, va
             }
         }
     }
-    let elem_ptr = ptr.add(HEADER_SIZE + index as usize * REF_ELEMENT_SIZE) as *mut u64;
+    let elem_ptr = ptr.add(HEADER_SIZE + index as usize * ref_element_size()) as *mut u8;
     // Task #43 (HIGH soundness, deferred from #25/#26): SATB pre-write
     // barrier — the JIT helper equivalent of the interpreter's
     // `shared.mem.heap.satb_barrier(old_value)` at runtime/interpreter.rs:4228
@@ -3122,13 +3123,13 @@ pub unsafe extern "C" fn jit_aastore(vm_ptr: i64, array_ptr: i64, index: i64, va
     // trait alias is planned but not yet landed here — when it does, this
     // call should migrate to it for triad-pairing under the
     // `vm_heap.rs` debug-build assertion).
-    let old_raw = std::ptr::read(elem_ptr);
+    let old_raw = read_ref_slot(elem_ptr);
     if old_raw != 0 {
         let heap = heap_from_vm(vm_ptr);
         let old_obj = ObjectRef::from_raw(old_raw as usize as *mut u8);
         heap.satb_barrier(Value::Object(Some(old_obj)));
     }
-    std::ptr::write(elem_ptr, val as u64);
+    write_ref_slot(elem_ptr, val as u64);
 
     if val != 0 {
         let heap = heap_from_vm(vm_ptr);
@@ -3325,7 +3326,7 @@ pub unsafe extern "C" fn jit_getfield(vm_ptr: i64, obj_ptr: i64, field_index: i6
             // will later deref → SIGSEGV. Mirrors `read_prim_element`'s
             // Reference arm so interpreter and JIT decode a stale ref slot
             // identically. Valid refs (or 0=null) always pass through.
-            let raw = std::ptr::read(ptr as *const u64);
+            let raw = read_ref_slot(ptr);
             return if cratonvm_types::plausible_heap_pointer(raw) {
                 raw as i64
             } else {
@@ -3674,8 +3675,7 @@ pub unsafe extern "C" fn jit_putfield_object(
         }
         let heap = heap_from_vm(vm_ptr);
         // SAFETY: `off` is within the object body (slot bounds-checked above).
-        let old_raw: u64 =
-            std::ptr::read((obj_ptr as *const u8).add(HEADER_SIZE + off) as *const u64);
+        let old_raw: u64 = read_ref_slot((obj_ptr as *const u8).add(HEADER_SIZE + off));
         if old_raw != 0 {
             heap.satb_barrier(Value::Object(Some(ObjectRef::from_raw(
                 old_raw as usize as *mut u8,

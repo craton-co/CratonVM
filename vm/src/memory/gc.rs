@@ -15,6 +15,7 @@ pub use cratonvm_gc::gc::*;
 use crate::types::ObjectRef;
 #[cfg(test)]
 use crate::types::Value;
+use cratonvm_types::narrow_oop::{read_ref_slot, ref_element_size};
 
 /// Result of one VM metadata-unloading transaction.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -1244,8 +1245,8 @@ pub fn verify_heap_object_fields(
             // Reference array (Object[]): elements are 8-byte compact pointers.
             let len = hdr.array_length() as usize;
             for i in 0..len {
-                let s_ptr = unsafe { (ptr as *const u8).add(HEADER_SIZE + i * REF_ELEMENT_SIZE) };
-                let raw = unsafe { std::ptr::read(s_ptr as *const u64) } as usize;
+                let s_ptr = unsafe { (ptr as *const u8).add(HEADER_SIZE + i * ref_element_size()) };
+                let raw = unsafe { read_ref_slot(s_ptr) } as usize;
                 if let Some(reason) = classify(raw) {
                     eprintln!(
                         "[heap-stale] {} ARR {}[{}] -> 0x{:x}",

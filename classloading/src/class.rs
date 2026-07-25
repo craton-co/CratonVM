@@ -930,6 +930,27 @@ impl ClassStore {
         id
     }
 
+    /// Rebuild and re-register the compact field layout of **every** loaded
+    /// class.
+    ///
+    /// Needed exactly once, when compressed oops are switched on at VM init:
+    /// the bootstrap class set is already loaded and laid out by then, with
+    /// 8-byte reference fields, while the field accessors are about to start
+    /// reading 4-byte narrow slots. Since the heap has just been created, no
+    /// instance of any of those classes exists yet, so re-laying them out is
+    /// free of the "read back under a different layout than it was written"
+    /// hazard that makes layout changes unsafe at any later point.
+    pub fn recompute_all_compact_layouts(&self) -> usize {
+        let mut n = 0;
+        for slot in &self.classes {
+            if let Some(class) = slot {
+                self.register_compact_layout_if_enabled(class.id);
+                n += 1;
+            }
+        }
+        n
+    }
+
     /// Build and register the compact field layout for class `id`, if the
     /// compact reference-field layout is enabled. Idempotent (overwrites on
     /// redefine / subclass-layout recompute). Safe no-op when the flag is off.
@@ -937,7 +958,26 @@ impl ClassStore {
         if !cratonvm_types::compact_ref_fields_enabled() {
             return;
         }
-        if let Some(layout) = self.build_compact_layout(id) {
+        let built = self.build_compact_layout(id);
+        // Diagnostic for compressed-oops / layout work: shows whether a class
+        // got the compact tagless layout at all, and how wide its body is.
+        if std::env::var_os("CRATONVM_DBG_LAYOUT").is_some() {
+            let name = self.get(id).map(|c| c.name.to_string()).unwrap_or_default();
+            match &built {
+                Some(l) => eprintln!(
+                    "[layout] {name} cid={} body={} refs={} fields={}",
+                    id.as_u32(),
+                    l.body_size,
+                    l.ref_offsets.len(),
+                    l.field_offsets.len()
+                ),
+                None => eprintln!(
+                    "[layout] {name} cid={} LEGACY, no compact layout",
+                    id.as_u32()
+                ),
+            }
+        }
+        if let Some(layout) = built {
             cratonvm_types::register_class_layout(id.as_u32(), Arc::new(layout));
         }
     }
@@ -974,7 +1014,7 @@ impl ClassStore {
         let mut padded = false;
 
         let mut push = |storage: cratonvm_types::FieldStorageKind, off: &mut u32| {
-            let alignment = storage.alignment();
+            let alignment = storage.alignment_runtime();
             *off = (*off + alignment - 1) & !(alignment - 1);
             field_offsets.push(*off);
             let r = storage.is_reference();
@@ -983,7 +1023,7 @@ impl ClassStore {
             if r {
                 ref_offsets.push(*off);
             }
-            *off += storage.size();
+            *off += storage.size_runtime();
         };
 
         for cid in chain {

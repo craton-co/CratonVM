@@ -53,6 +53,7 @@ use cratonvm_types::GC_FLAG_COMPACT;
 use cratonvm_types::{
     ClassId, CompactLayout, FieldStorageKind, ObjectRef, Value,
 };
+use cratonvm_types::narrow_oop::{read_ref_slot, ref_element_size, ref_field_size, write_ref_slot};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -818,6 +819,11 @@ impl GenerationalHeap {
             (og.base_ptr() as usize, og.capacity()),
         ];
         for (i, (slot, (base, cap))) in self.region_bounds.iter().zip(pairs).enumerate() {
+            // Compressed oops fix a base/shift at VM init from these very
+            // regions. A region that later moves outside that window (young-gen
+            // growth reallocates the arena) makes every reference into it
+            // unencodable — fail loudly here rather than corrupt the heap.
+            crate::compressed_oops::assert_region_encodable(base, base.wrapping_add(cap));
             slot.0.store(base, Ordering::Release);
             slot.1.store(base.wrapping_add(cap), Ordering::Release);
             // Mirror into the process-global table the JIT's guarded inline
@@ -4234,10 +4240,10 @@ impl GenerationalHeap {
                 let slot_ptr = unsafe {
                     old_obj
                         .as_ptr()
-                        .add(HEADER_SIZE + slot_idx * REF_ELEMENT_SIZE)
+                        .add(HEADER_SIZE + slot_idx * ref_element_size())
                 };
                 // SAFETY: `slot_ptr` points to a valid 8-byte ref element within the array.
-                let raw: u64 = unsafe { std::ptr::read(slot_ptr as *const u64) };
+                let raw: u64 = unsafe { read_ref_slot(slot_ptr) };
                 if raw != 0 {
                     let ref_ptr = raw as usize as *mut u8;
                     if young_from.contains(ref_ptr) {
@@ -4253,7 +4259,7 @@ impl GenerationalHeap {
                             force_promote_all,
                         );
                         // SAFETY: Writing the forwarded pointer back to the same valid slot.
-                        unsafe { std::ptr::write(slot_ptr as *mut u64, new_ptr as u64) };
+                        unsafe { write_ref_slot(slot_ptr, new_ptr as u64) };
                         // Persistent old→young edge: re-remember if the referent
                         // stayed young (not promoted), so it survives clear_all().
                         if !old_gen.contains(new_ptr) {
@@ -4268,7 +4274,7 @@ impl GenerationalHeap {
                 // SAFETY: `slot_idx` (byte offset) was recorded by dirty-card
                 // scanning within this object's body; the 8-byte read is in-bounds.
                 let slot_ptr = unsafe { old_obj.as_ptr().add(HEADER_SIZE + slot_idx) };
-                let raw: u64 = unsafe { std::ptr::read(slot_ptr as *const u64) };
+                let raw: u64 = unsafe { read_ref_slot(slot_ptr) };
                 if raw != 0 {
                     let ref_ptr = raw as usize as *mut u8;
                     if young_from.contains(ref_ptr) {
@@ -4284,7 +4290,7 @@ impl GenerationalHeap {
                             force_promote_all,
                         );
                         // SAFETY: writing the forwarded pointer back to the slot.
-                        unsafe { std::ptr::write(slot_ptr as *mut u64, new_ptr as u64) };
+                        unsafe { write_ref_slot(slot_ptr, new_ptr as u64) };
                         if !old_gen.contains(new_ptr) {
                             deferred_dirty_cards.push(old_obj.as_ptr() as usize);
                         }
@@ -5597,10 +5603,10 @@ impl GenerationalHeap {
                 let slot_ptr = unsafe {
                     old_obj
                         .as_ptr()
-                        .add(HEADER_SIZE + slot_idx * REF_ELEMENT_SIZE)
+                        .add(HEADER_SIZE + slot_idx * ref_element_size())
                 };
                 // SAFETY: `slot_ptr` is a valid 8-byte ref element.
-                let raw: u64 = unsafe { std::ptr::read(slot_ptr as *const u64) };
+                let raw: u64 = unsafe { read_ref_slot(slot_ptr) };
                 if raw != 0 {
                     mark_young_precise(raw as usize as *mut u8, &mut worklist, &mut side_marks);
                 }
@@ -5609,7 +5615,7 @@ impl GenerationalHeap {
                 // reference slot (as recorded by scan_dirty_cards).
                 // SAFETY: byte offset within this object's body (from card scan).
                 let slot_ptr = unsafe { old_obj.as_ptr().add(HEADER_SIZE + slot_idx) };
-                let raw: u64 = unsafe { std::ptr::read(slot_ptr as *const u64) };
+                let raw: u64 = unsafe { read_ref_slot(slot_ptr) };
                 if raw != 0 {
                     mark_young_precise(raw as usize as *mut u8, &mut worklist, &mut side_marks);
                 }
@@ -9043,12 +9049,12 @@ impl GenerationalHeap {
             if header.kind == ObjectKind::Array {
                 if header.element_type == ArrayElementType::Reference {
                     // Cap element count at what the array's data region holds.
-                    let max_elems = body_bytes / REF_ELEMENT_SIZE;
+                    let max_elems = body_bytes / ref_element_size();
                     let elems = (header.array_length() as usize).min(max_elems);
                     for i in 0..elems {
                         // SAFETY: `i` < capped element count; offset within array data region.
-                        let s_ptr = unsafe { obj_ptr.add(HEADER_SIZE + i * REF_ELEMENT_SIZE) };
-                        let raw: u64 = unsafe { std::ptr::read(s_ptr as *const u64) };
+                        let s_ptr = unsafe { obj_ptr.add(HEADER_SIZE + i * ref_element_size()) };
+                        let raw: u64 = unsafe { read_ref_slot(s_ptr) };
                         if raw != 0 {
                             let ref_ptr = raw as usize as *mut u8;
                             if young_from.contains(ref_ptr) {
@@ -9066,12 +9072,12 @@ impl GenerationalHeap {
                 let body = compact_body.min(body_bytes);
                 for &off in &layout.ref_offsets {
                     let off = off as usize;
-                    if off + crate::heap::REF_FIELD_SIZE > body {
+                    if off + ref_field_size() > body {
                         break;
                     }
                     // SAFETY: `off` is within the object's body (capped above).
                     let s_ptr = unsafe { obj_ptr.add(HEADER_SIZE + off) };
-                    let raw: u64 = unsafe { std::ptr::read(s_ptr as *const u64) };
+                    let raw: u64 = unsafe { read_ref_slot(s_ptr) };
                     if raw != 0 {
                         let ref_ptr = raw as usize as *mut u8;
                         if young_from.contains(ref_ptr) {
@@ -9673,8 +9679,8 @@ fn seedhunt_scan_obj(
     } else if h.kind == ObjectKind::Array && h.element_type == ArrayElementType::Reference {
         for i in 0..h.array_length() as usize {
             // SAFETY: `i < array_length`; offset stays within the array data.
-            let sp = unsafe { optr.add(HEADER_SIZE + i * REF_ELEMENT_SIZE) };
-            let raw = unsafe { std::ptr::read(sp as *const u64) } as usize;
+            let sp = unsafe { optr.add(HEADER_SIZE + i * ref_element_size()) };
+            let raw = unsafe { read_ref_slot(sp) } as usize;
             if raw != 0 && raw < 0x1000 {
                 count += 1;
                 if *printed < cap {
@@ -10045,8 +10051,8 @@ pub(crate) unsafe fn for_each_ref_slot(
     if header.kind == ObjectKind::Array {
         if header.element_type == ArrayElementType::Reference {
             for i in 0..header.array_length() as usize {
-                let s = obj_ptr.add(HEADER_SIZE + i * REF_ELEMENT_SIZE);
-                let raw: u64 = std::ptr::read(s as *const u64);
+                let s = obj_ptr.add(HEADER_SIZE + i * ref_element_size());
+                let raw: u64 = read_ref_slot(s);
                 if raw != 0 {
                     f(raw as usize as *mut u8, i);
                 }
@@ -10055,11 +10061,11 @@ pub(crate) unsafe fn for_each_ref_slot(
     } else if let Some((layout, body)) = crate::heap::compact_oop_scan(header) {
         for &off in &layout.ref_offsets {
             let off = off as usize;
-            if off + crate::heap::REF_FIELD_SIZE > body {
+            if off + ref_field_size() > body {
                 break;
             }
             let s = obj_ptr.add(HEADER_SIZE + off);
-            let raw: u64 = std::ptr::read(s as *const u64);
+            let raw: u64 = read_ref_slot(s);
             if raw != 0 {
                 f(raw as usize as *mut u8, off);
             }
@@ -10095,8 +10101,8 @@ pub(crate) unsafe fn forward_ref_slots(
     if header.kind == ObjectKind::Array {
         if header.element_type == ArrayElementType::Reference {
             for i in 0..header.array_length() as usize {
-                let s = obj_ptr.add(HEADER_SIZE + i * REF_ELEMENT_SIZE);
-                let raw: u64 = std::ptr::read(s as *const u64);
+                let s = obj_ptr.add(HEADER_SIZE + i * ref_element_size());
+                let raw: u64 = read_ref_slot(s);
                 if raw != 0 {
                     if let Some(n) = forward(raw as usize as *mut u8) {
                         // gcstress face-1 hunt (no-op unless gated) — a RAW
@@ -10109,7 +10115,7 @@ pub(crate) unsafe fn forward_ref_slots(
                             "forward_ref_slots-refarray",
                             &(n as usize),
                         );
-                        std::ptr::write(s as *mut u64, n as u64);
+                        write_ref_slot(s, n as u64);
                     }
                 }
             }
@@ -10117,11 +10123,11 @@ pub(crate) unsafe fn forward_ref_slots(
     } else if let Some((layout, body)) = crate::heap::compact_oop_scan(header) {
         for &off in &layout.ref_offsets {
             let off = off as usize;
-            if off + crate::heap::REF_FIELD_SIZE > body {
+            if off + ref_field_size() > body {
                 break;
             }
             let s = obj_ptr.add(HEADER_SIZE + off);
-            let raw: u64 = std::ptr::read(s as *const u64);
+            let raw: u64 = read_ref_slot(s);
             if raw != 0 {
                 if let Some(n) = forward(raw as usize as *mut u8) {
                     // gcstress face-1 hunt (no-op unless gated).
@@ -10131,7 +10137,7 @@ pub(crate) unsafe fn forward_ref_slots(
                         "forward_ref_slots-compact",
                         &(n as usize),
                     );
-                    std::ptr::write(s as *mut u64, n as u64);
+                    write_ref_slot(s, n as u64);
                 }
             }
         }

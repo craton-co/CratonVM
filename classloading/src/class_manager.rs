@@ -14341,3 +14341,15 @@ pub fn is_bootstrap_appended_class(internal: &str) -> bool {
         .unwrap_or_else(|e| e.into_inner())
         .contains(internal)
 }
+
+impl ClassManager {
+    /// Rebuild the compact field layout of every loaded class.
+    ///
+    /// Called once at VM init when compressed oops are enabled, after the
+    /// bootstrap class set has been laid out with wide references but before
+    /// any instance of those classes exists. See
+    /// [`ClassStore::recompute_all_compact_layouts`].
+    pub fn recompute_all_compact_layouts(&self) -> usize {
+        self.class_store.recompute_all_compact_layouts()
+    }
+}

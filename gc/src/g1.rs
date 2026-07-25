@@ -7070,7 +7070,7 @@ impl GarbageCollector for G1Collector {
 
         let compact = cratonvm_types::compact_object_field_storage(header, index);
         let (payload_off, payload_size) = compact
-            .map(|(offset, storage)| (offset, storage.size() as usize))
+            .map(|(offset, storage)| (offset, storage.size_runtime() as usize))
             .unwrap_or((index * SLOT_SIZE, SLOT_SIZE));
         let total_size = object_total_size(header);
 
@@ -7182,7 +7182,7 @@ impl GarbageCollector for G1Collector {
 
         let compact = cratonvm_types::compact_object_field_storage(header, index);
         let (payload_off, payload_size) = compact
-            .map(|(offset, storage)| (offset, storage.size() as usize))
+            .map(|(offset, storage)| (offset, storage.size_runtime() as usize))
             .unwrap_or((index * SLOT_SIZE, SLOT_SIZE));
         let total_size = object_total_size(header);
 
