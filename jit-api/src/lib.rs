@@ -123,6 +123,25 @@ pub struct CachedBytecodeMethod {
     /// JIT cache; see `JitCache::put` / `put_osr` / `invalidate_matching` /
     /// `clear_all` in `jit/src/lib.rs`, which are the only mutators.
     pub jit_probe_generation: std::sync::atomic::AtomicU64,
+    /// Perf (2026-07-25, bytecode quickening): memoizes this method's
+    /// pre-decoded instruction stream, mirroring `force_native_cache` above.
+    ///
+    /// The interpreter's spec-correct dispatch path used to call
+    /// `Instruction::decode` on *every* execution of *every* bytecode -- a
+    /// full opcode match plus operand reads, and a heap allocation for the
+    /// out-of-line payload of every `tableswitch` / `lookupswitch` that
+    /// executed. `cratonvm_reader::QuickenedCode` does that decode once and
+    /// hands out borrowed `&Instruction` records thereafter.
+    ///
+    /// `None` means "this method could not be pre-decoded" (a linear walk
+    /// from pc 0 hit a decode error); such methods keep using the original
+    /// on-demand decode, so quickening can never change behaviour.
+    ///
+    /// The stream itself is interned process-wide on the identity of the
+    /// bytecode allocation (`cratonvm_reader::quickened::intern`), so the
+    /// several `CachedBytecodeMethod`s that a hot method accumulates across
+    /// call sites all share one copy rather than each building their own.
+    pub quickened: std::sync::OnceLock<Option<std::sync::Arc<cratonvm_reader::QuickenedCode>>>,
 }
 
 impl Clone for CachedBytecodeMethod {
@@ -147,6 +166,11 @@ impl Clone for CachedBytecodeMethod {
                 self.jit_probe_generation
                     .load(std::sync::atomic::Ordering::Relaxed),
             ),
+            // Cloning the memo is correct and desirable: the quickened stream is
+            // a pure function of `code`, which is `Arc`-shared with the clone, so
+            // the clone would derive an identical stream. Carrying it over just
+            // avoids re-deriving it (and the intern-table probe) on first use.
+            quickened: self.quickened.clone(),
         }
     }
 }
@@ -857,6 +881,7 @@ mod tests {
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
+            quickened: std::sync::OnceLock::new(),
         }
     }
 

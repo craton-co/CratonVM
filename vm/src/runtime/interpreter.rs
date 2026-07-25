@@ -7013,6 +7013,7 @@ pub fn execute(
                                             jit_probe_generation: std::sync::atomic::AtomicU64::new(
                                                 0,
                                             ),
+                                            quickened: std::sync::OnceLock::new(),
                                         });
                                         let pin_base = thread.native_pin_roots.len();
                                         if let Some(frame) = build_deopt_frame_inner(
@@ -7745,6 +7746,31 @@ pub(crate) fn try_osr_with_backoff(
 // Main execution loop
 // ---------------------------------------------------------------------------
 
+/// Fetch (building on first use) the pre-decoded instruction stream for the
+/// method this frame is executing.
+///
+/// Two tiers, both one-time-per-method:
+///
+/// * `Cached` frames read a `OnceLock` on the shared `CachedBytecodeMethod`
+///   -- an acquire load after the first call.
+/// * `Owned` frames (non-cached invoke paths, synthetic frames, JNI entry
+///   stubs) go to the process-wide intern table, which is keyed on the
+///   identity of the bytecode allocation so both tiers share one stream per
+///   method.
+///
+/// `None` means the method is not quickenable and the caller must keep using
+/// `Instruction::decode`.
+#[inline]
+fn quickened_for_frame(frame: &Frame) -> Option<Arc<cratonvm_reader::QuickenedCode>> {
+    match frame.cached_method() {
+        Some(cm) => cm
+            .quickened
+            .get_or_init(|| cratonvm_reader::quickened::intern(&cm.code))
+            .clone(),
+        None => cratonvm_reader::quickened::intern(&frame.code),
+    }
+}
+
 fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult {
     let initial_frame_idx = thread.frames.len() - 1;
     execute_frame_from_index(shared, thread, initial_frame_idx)
@@ -7787,6 +7813,26 @@ fn execute_frame_from_index(
     // T19.H1 — per-invocation guard so an `execute()` frame dumps its
     // stack at most once when the watchdog flag is sticky-true.
     let mut stack_dump_emitted = false;
+    // --- Quickening (bytecode pre-decode) state, valid for the frame whose
+    // bytecode allocation lives at `quick_code_ptr`.
+    //
+    // `quick` is an owned `Arc` deliberately: the dispatch below borrows an
+    // `&Instruction` out of it and hands that borrow to `execute_instruction`,
+    // which takes `&mut thread`. Keeping the stream in a loop-local (rather
+    // than reading it back out of `thread.frames[..]` every iteration) is what
+    // makes those two borrows disjoint.
+    //
+    // The pointer key is sound because a live `QuickenedCode` holds a strong
+    // `Arc<[u8]>` to the very bytecode it was built from, so this address
+    // cannot be freed and recycled by a different method while `quick` is
+    // `Some`. When `quick` is `None` a recycled address can only mislabel
+    // another method as un-quickened -- a pessimisation, never a miscompare.
+    let mut quick: Option<Arc<cratonvm_reader::QuickenedCode>> = None;
+    let mut quick_code_ptr: *const u8 = std::ptr::null();
+    // Expected stream index of the next instruction (straight-line execution
+    // resolves a pc in one compare; anything else binary-searches the pc
+    // table). Purely a hint -- never trusted without a pc equality check.
+    let mut quick_hint: usize = 0;
     loop {
         // Route callee-thrown Java exceptions before the safepoint poll below.
         // `pending_java_exception` is only a Rust local between the callee's
@@ -10166,21 +10212,62 @@ fn execute_frame_from_index(
             }
         }
 
-        // --- Slow path: full decode + execute for all other bytecodes ---
-        let (instruction, next_pc) =
-            Instruction::decode(&thread.frames[frame_idx].code, thread.frames[frame_idx].pc)
-                .map_err(|e| {
-                    MethodCallFailed::InternalError(VmError::Internal {
-                        message: format!(
-                            "decode error at pc={} in {}.{}: {}",
-                            thread.frames[frame_idx].pc,
-                            thread.frames[frame_idx].method_name(),
-                            thread.frames[frame_idx].method_descriptor(),
-                            e
-                        ),
-                    })
-                })?;
-        thread.frames[frame_idx].pc = next_pc;
+        // --- Slow path: pre-decoded (quickened) lookup, else full decode ---
+        //
+        // The quickened stream is a pure memoization of `Instruction::decode`
+        // keyed by bytecode pc: `index_of_pc` only ever returns an index whose
+        // recorded pc equals `saved_pc`, and `next_pc` replays exactly what
+        // `decode` returned there. Every pc-keyed consumer downstream
+        // (exception table, stack maps, line numbers, JVMTI single-step,
+        // JIT/OSR entry) therefore sees identical values. Any pc the stream
+        // does not know -- dead bytes, a desynchronised landing pad -- falls
+        // through to the original decode below.
+        let code_ptr_now = thread.frames[frame_idx].code.as_ptr();
+        if code_ptr_now != quick_code_ptr {
+            quick = quickened_for_frame(&thread.frames[frame_idx]);
+            quick_code_ptr = code_ptr_now;
+            quick_hint = 0;
+        }
+        let quick_hit = quick
+            .as_deref()
+            .and_then(|q| q.index_of_pc(saved_pc, quick_hint).map(|i| (q, i)));
+        // Only populated on the fallback path; keeps the freshly decoded
+        // instruction alive for as long as `instruction` borrows it.
+        let mut fallback_decoded: Option<Instruction> = None;
+        if quick_hit.is_none() {
+            let (decoded, next_pc) =
+                Instruction::decode(&thread.frames[frame_idx].code, thread.frames[frame_idx].pc)
+                    .map_err(|e| {
+                        MethodCallFailed::InternalError(VmError::Internal {
+                            message: format!(
+                                "decode error at pc={} in {}.{}: {}",
+                                thread.frames[frame_idx].pc,
+                                thread.frames[frame_idx].method_name(),
+                                thread.frames[frame_idx].method_descriptor(),
+                                e
+                            ),
+                        })
+                    })?;
+            thread.frames[frame_idx].pc = next_pc;
+            fallback_decoded = Some(decoded);
+        }
+        // Panic-free selection (B3 / NEW-7 zero-panic gate): the `(None, None)`
+        // arm is unreachable by construction -- the block above always fills
+        // `fallback_decoded` when there is no quickened hit -- but it is routed
+        // through `VmError` rather than an `unreachable!`.
+        let instruction: &Instruction = match (quick_hit, fallback_decoded.as_ref()) {
+            (Some((q, idx)), _) => {
+                thread.frames[frame_idx].pc = q.next_pc(idx);
+                quick_hint = idx + 1;
+                q.op(idx)
+            }
+            (None, Some(decoded)) => decoded,
+            (None, None) => {
+                return Err(MethodCallFailed::InternalError(VmError::Internal {
+                    message: format!("no instruction decoded at pc={saved_pc}"),
+                }))
+            }
+        };
 
         trace!(
             pc = saved_pc,
@@ -10209,7 +10296,7 @@ fn execute_frame_from_index(
             );
         }
 
-        let exec_result = execute_instruction(shared, thread, frame_idx, &instruction, saved_pc);
+        let exec_result = execute_instruction(shared, thread, frame_idx, instruction, saved_pc);
 
         // DIAG (gated `CRATONVM_DBG_UNDERFLOW=1`): pinpoint an operand-stack
         // underflow — log the offending method/bci/opcode + the Java frame chain
@@ -12445,6 +12532,7 @@ mod deopt_step3_tests {
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
+            quickened: std::sync::OnceLock::new(),
         })
     }
 
@@ -12468,6 +12556,7 @@ mod deopt_step3_tests {
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
+            quickened: std::sync::OnceLock::new(),
         })
     }
 
@@ -12966,6 +13055,7 @@ mod deopt_step3_tests {
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
+            quickened: std::sync::OnceLock::new(),
         });
         let key = "DespecFuC.loop:()V";
         cratonvm_jit::deopt::despec_clear_for_test();
@@ -14511,29 +14601,25 @@ fn execute_instruction(
         }
 
         // -- Switch --
-        Instruction::Tableswitch {
-            default,
-            low,
-            high,
-            offsets,
-        } => {
+        Instruction::Tableswitch(ts) => {
             let index = thread.frames[frame_idx].stack.pop_int()?;
-            let offset = if index >= *low && index <= *high {
-                offsets[(index - low) as usize] // Widening: index conversion
+            let offset = if index >= ts.low && index <= ts.high {
+                ts.offsets[(index - ts.low) as usize] // Widening: index conversion
             } else {
-                *default
+                ts.default
             };
             // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
             thread.frames[frame_idx].pc = (saved_pc as i64 + offset as i64) as usize;
             // Widening: index conversion
         }
-        Instruction::Lookupswitch { default, pairs } => {
+        Instruction::Lookupswitch(ls) => {
             let key = thread.frames[frame_idx].stack.pop_int()?;
-            let offset = pairs
+            let offset = ls
+                .pairs
                 .iter()
                 .find(|(k, _)| *k == key)
                 .map(|(_, off)| *off)
-                .unwrap_or(*default);
+                .unwrap_or(ls.default);
             // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
             thread.frames[frame_idx].pc = (saved_pc as i64 + offset as i64) as usize;
             // Widening: index conversion
@@ -23188,6 +23274,7 @@ fn try_invoke_cached_lambda_impl(
                 native_callback_cache: std::sync::OnceLock::new(),
                 invoc_key: std::sync::OnceLock::new(),
                 jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
+                quickened: std::sync::OnceLock::new(),
             });
             drop(cm);
             LAMBDA_IMPL_BYTECODE_CACHE.with(|cache| cache.borrow_mut().insert(key, Arc::clone(&c)));
@@ -31702,6 +31789,7 @@ fn populate_invoke_cache(
         native_callback_cache: std::sync::OnceLock::new(),
         invoc_key: std::sync::OnceLock::new(),
         jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
+        quickened: std::sync::OnceLock::new(),
     };
 
     // WP2.4-F1: snapshot the redefine generation BEFORE dropping the
@@ -34748,6 +34836,7 @@ fn try_jit_upgrade_with_gate(
                 native_callback_cache: std::sync::OnceLock::new(),
                 invoc_key: std::sync::OnceLock::new(),
                 jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
+                quickened: std::sync::OnceLock::new(),
             };
             drop(cm);
 
@@ -35638,6 +35727,7 @@ fn try_jit_compile_callee_slow(
         native_callback_cache: std::sync::OnceLock::new(),
         invoc_key: std::sync::OnceLock::new(),
         jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
+        quickened: std::sync::OnceLock::new(),
     };
     drop(cm);
 
@@ -40844,6 +40934,7 @@ fn populate_virtual_invoke_cache(
         native_callback_cache: std::sync::OnceLock::new(),
         invoc_key: std::sync::OnceLock::new(),
         jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
+        quickened: std::sync::OnceLock::new(),
     };
 
     // WP2.4-F1: snapshot before dropping the class_manager read-lock so
@@ -45052,6 +45143,7 @@ mod tests {
             native_callback_cache: std::sync::OnceLock::new(),
             invoc_key: std::sync::OnceLock::new(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
+            quickened: std::sync::OnceLock::new(),
         });
         let key: PromotedInvokeKey = (ClassId::new(9999), 17, false, Some(ClassId::new(12345)));
         vm.shared.shared_resolution.insert_promoted_invoke(
