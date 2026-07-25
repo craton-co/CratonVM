@@ -2469,15 +2469,47 @@ pub const MAX_INLINE_EXPANSION_COST: usize = 64;
 ///
 /// Mirrors the IR gate in `try_compile_inner` (`ir_compatible` + the
 /// category-2/FP admission clauses) with one deliberate extra restriction:
-/// only CALL-FREE and ALLOCATION-FREE methods qualify. The IR path lowers
-/// every invoke through the generic `invoke_dispatch` helper (no inline
-/// caches, no direct calls, no direct self-recursive CALL) and its
-/// allocation lowering differs from the single-pass inline-TLAB fast path —
-/// for such methods an "optimizing" recompile can be a net REGRESSION over
-/// the single-pass body (which has direct self-calls, ctor inlining, and the
-/// inline TLAB bump). Pure compute (int/long/FP arithmetic over locals,
-/// arrays and fields — sieve/matrix/reduction loop shapes) is where the IR
-/// backend reliably wins; that is exactly what this admits.
+/// only ALLOCATION-FREE methods qualify, and a call-bearing method qualifies
+/// only when the IR can lower its calls as well as the single-pass backend
+/// does. Pure compute (int/long/FP arithmetic over locals, arrays and fields —
+/// sieve/matrix/reduction loop shapes) is where the IR backend reliably wins.
+///
+/// # Why calls used to be excluded outright, and what changed
+///
+/// This predicate used to reject ANY method containing an invoke, because the
+/// IR path lowered every invoke through the generic `invoke_dispatch` helper —
+/// no direct calls, no inline caches — so an "optimizing" recompile of a
+/// call-bearing method could be a net REGRESSION over the single-pass body,
+/// which has always had direct calls and constructor inlining. That was the
+/// binding constraint on the whole IR pipeline: the tiered manager compiles a
+/// hot call-bearing method at C1 (`optimize == false`, which skips the IR
+/// pipeline entirely) and then declined to promote it here, so raising
+/// `ir_compatible`'s invoke cap alone changed nothing under tiered routing.
+///
+/// `ir_lower::emit_direct_cross_call` removed that per-call tax for the
+/// STATICALLY BOUND invoke kinds, so those are now admitted:
+///
+///  * `invokestatic` (0xb8) and `invokespecial` (0xb7) have exactly one
+///    possible target, so the IR binds them with the same raw `CALL` the
+///    single-pass backend emits — subject to `ir_direct_calls_enabled()`,
+///    without which the IR would be back to paying the helper per call and the
+///    original rejection is still the right answer.
+///  * `invokevirtual` (0xb6) / `invokeinterface` (0xb9) stay excluded: the IR
+///    has no monomorphic inline cache, so a virtual site still pays the full
+///    helper round trip with a dynamic target lookup. (They are also
+///    default-OFF for IR lowering entirely — `CRATONVM_JIT_IR_CALL_VIRTUAL` —
+///    so such a method's invokes would bail the IR builder anyway.)
+///
+/// ALLOCATION-bearing methods remain excluded, unchanged: the IR's allocation
+/// lowering differs from the single-pass inline-TLAB bump, and the IR call
+/// eligibility loop requires `new_ops.is_empty()` anyway, so an
+/// allocation-bearing method's invokes would bail the builder.
+///
+/// This predicate deliberately stays a cheap, scan-only approximation (it
+/// cannot resolve a constant pool), so it can admit a method the IR later
+/// bails on — e.g. a constructor whose `invokespecial` is an `<init>` super
+/// call. That costs a wasted optimizing compile whose result is discarded in
+/// favour of the single-pass body; it is never a correctness risk.
 pub fn c2_upgrade_would_engage(
     code: &[u8],
     code_len: usize,
@@ -2488,12 +2520,20 @@ pub fn c2_upgrade_would_engage(
     let Some(scan) = x64::jit_scan(code, code_len, descriptor) else {
         return false;
     };
-    if !scan.invoke_ops.is_empty()
-        || !scan.new_ops.is_empty()
-        || !scan.anewarray_ops.is_empty()
-        || !scan.indy_ops.is_empty()
-    {
+    if !scan.new_ops.is_empty() || !scan.anewarray_ops.is_empty() || !scan.indy_ops.is_empty() {
         return false;
+    }
+    if !scan.invoke_ops.is_empty() {
+        if !ir_direct_calls_enabled() {
+            return false;
+        }
+        if scan
+            .invoke_ops
+            .iter()
+            .any(|(_, _, opcode)| *opcode != 0xb8 && *opcode != 0xb7)
+        {
+            return false;
+        }
     }
     if !ir::ir_compatible(&scan) {
         return false;
