@@ -29,7 +29,7 @@ use crate::native::register_essential_natives;
 use crate::native::register_io_natives;
 use crate::native::registry::{NativeMethodRegistry, StackTraceEntry};
 use crate::native::{register_builtins, register_collections_natives};
-use crate::runtime::lock_order::{LockLevel, OrderedPlMutex};
+use crate::runtime::lock_order::{LockLevel, OrderedPlMutex, OrderedPlRwLock};
 use crate::threading::gc_barrier::GcBarrier;
 use crate::threading::jvm_thread::{JvmThread, ThreadId};
 use crate::threading::monitor::MonitorTable;
@@ -344,7 +344,14 @@ pub struct SharedVm {
     pub offload_registry: std::sync::Arc<crate::runtime::offload::OffloadCacheRegistry>,
 
     /// Class loader and cache, protected by an RwLock.
-    pub class_manager: RwLock<ClassManager>,
+    ///
+    /// L10 in the global lock hierarchy — the coarsest lock, acquired first.
+    /// See [`crate::runtime::lock_order`]. [`OrderedPlRwLock`] is a drop-in for
+    /// `parking_lot::RwLock` that asserts the descending acquisition order on
+    /// every `.read()` / `.write()` / `.read_recursive()`, so holding any
+    /// lower-level lock (a monitor, `ref_processor`, …) across a class-manager
+    /// acquisition is caught instead of deadlocking.
+    pub class_manager: OrderedPlRwLock<ClassManager>,
 
     /// Object/array heap — generational GC with young + old gen.
     pub heap: VmHeap,
@@ -2816,7 +2823,7 @@ impl SharedVm {
             config,
             #[cfg(feature = "gpu-offload")]
             offload_registry,
-            class_manager: RwLock::new(class_manager),
+            class_manager: OrderedPlRwLock::new(class_manager, LockLevel::ClassManager),
             heap,
             concurrent_satb,
             concurrent_gc_state,
@@ -5069,8 +5076,10 @@ mod ranked_locks {
 
     // ----- Per-lock level mapping -----------------------------------
 
-    pub(super) const CLASS_MANAGER: LockLevel = LockLevel::ClassManager; // L10
-    pub(super) const REF_PROCESSOR: LockLevel = LockLevel::RefProcessor; // L7
+    // NOTE: `class_manager` (L10) and `ref_processor` (L7) are no longer
+    // listed here — they are `OrderedPlRwLock`/`OrderedPlMutex` fields that
+    // enforce their own level, so a rank tag for them would double-record the
+    // level and trip the same-level assertion.
     pub(super) const MONITORS: LockLevel = LockLevel::Monitors; // L6
     pub(super) const THREAD_REGISTRY: LockLevel = LockLevel::ThreadRegistry; // L5
     pub(super) const FLIGHT_RECORDER: LockLevel = LockLevel::FlightRecorder; // L4
@@ -5114,32 +5123,27 @@ impl<G: std::ops::DerefMut> std::ops::DerefMut for RankedGuard<G> {
 }
 
 impl SharedVm {
-    /// Acquire `class_manager` for read with debug-only rank tracking.
+    /// Acquire `class_manager` (L10) for read.
     ///
-    /// In debug builds, panics if the calling thread already holds a
-    /// lock at a higher or equal rank (per `docs/lock-order.md`). In
-    /// release builds the rank check compiles away.
+    /// Retained as a compatibility alias: the field is now an
+    /// [`OrderedPlRwLock`] at [`LockLevel::ClassManager`], so a plain
+    /// `shared.class_manager.read()` is already order-checked and this helper
+    /// adds nothing. Taking a *second* rank scope here would double-record L10
+    /// and trip the same-level assertion.
     #[inline]
     pub fn class_manager_read_ranked(
         &self,
-    ) -> RankedGuard<parking_lot::RwLockReadGuard<'_, ClassManager>> {
-        let rank = ranked_locks::enter(ranked_locks::CLASS_MANAGER);
-        RankedGuard {
-            lock: self.class_manager.read(),
-            rank_scope: rank,
-        }
+    ) -> crate::runtime::lock_order::OrderedPlRwLockReadGuard<'_, ClassManager> {
+        self.class_manager.read()
     }
 
-    /// Acquire `class_manager` for write with debug-only rank tracking.
+    /// Acquire `class_manager` (L10) for write. See
+    /// [`Self::class_manager_read_ranked`] for why this is a plain alias.
     #[inline]
     pub fn class_manager_write_ranked(
         &self,
-    ) -> RankedGuard<parking_lot::RwLockWriteGuard<'_, ClassManager>> {
-        let rank = ranked_locks::enter(ranked_locks::CLASS_MANAGER);
-        RankedGuard {
-            lock: self.class_manager.write(),
-            rank_scope: rank,
-        }
+    ) -> crate::runtime::lock_order::OrderedPlRwLockWriteGuard<'_, ClassManager> {
+        self.class_manager.write()
     }
 
     /// Acquire `ref_processor` (L7).
