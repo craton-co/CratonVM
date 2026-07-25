@@ -913,6 +913,19 @@ impl Frame {
         }
     }
 
+    /// The shared `CachedBytecodeMethod` behind this frame, when it was
+    /// pushed through the cached-invoke path. Used by the interpreter to
+    /// reach the per-method memoized quickened instruction stream without a
+    /// hash lookup; `Owned` frames fall back to the process-wide intern
+    /// table keyed on the bytecode allocation.
+    #[inline]
+    pub(crate) fn cached_method(&self) -> Option<&Arc<CachedBytecodeMethod>> {
+        match &self.inner {
+            FrameInner::Owned { .. } => None,
+            FrameInner::Cached(cm) => Some(cm),
+        }
+    }
+
     /// Access the method name (cold path — error messages, stack traces).
     #[inline]
     pub fn method_name(&self) -> &str {

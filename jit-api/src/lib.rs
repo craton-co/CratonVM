@@ -79,6 +79,25 @@ pub struct CachedBytecodeMethod {
     /// used for `force_native_cache`. See docs/known-issues/tomcat-08-07/
     /// silent-hang-no-signature-cluster.md.
     pub native_callback_cache: std::sync::OnceLock<Option<cratonvm_native_api::NativeCallback>>,
+    /// Perf (2026-07-25, bytecode quickening): memoizes this method's
+    /// pre-decoded instruction stream, mirroring `force_native_cache` above.
+    ///
+    /// The interpreter's spec-correct dispatch path used to call
+    /// `Instruction::decode` on *every* execution of *every* bytecode -- a
+    /// full opcode match plus operand reads, and a heap allocation for the
+    /// out-of-line payload of every `tableswitch` / `lookupswitch` that
+    /// executed. `cratonvm_reader::QuickenedCode` does that decode once and
+    /// hands out borrowed `&Instruction` records thereafter.
+    ///
+    /// `None` means "this method could not be pre-decoded" (a linear walk
+    /// from pc 0 hit a decode error); such methods keep using the original
+    /// on-demand decode, so quickening can never change behaviour.
+    ///
+    /// The stream itself is interned process-wide on the identity of the
+    /// bytecode allocation (`cratonvm_reader::quickened::intern`), so the
+    /// several `CachedBytecodeMethod`s that a hot method accumulates across
+    /// call sites all share one copy rather than each building their own.
+    pub quickened: std::sync::OnceLock<Option<std::sync::Arc<cratonvm_reader::QuickenedCode>>>,
 }
 
 /// JEP 358 (helpful NPE) — operation-kind codes carried out-of-band from a
@@ -733,6 +752,7 @@ mod tests {
             is_static: false,
             force_native_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
+            quickened: std::sync::OnceLock::new(),
         }
     }
 

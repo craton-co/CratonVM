@@ -454,16 +454,14 @@ pub mod helpful_npe {
                 vec![rel(*o as i64)]
             }
             GotoW(o) | JsrW(o) => vec![rel(*o as i64)],
-            Tableswitch {
-                default, offsets, ..
-            } => {
-                let mut t = vec![rel(*default as i64)];
-                t.extend(offsets.iter().map(|o| rel(*o as i64)));
+            Tableswitch(ts) => {
+                let mut t = vec![rel(ts.default as i64)];
+                t.extend(ts.offsets.iter().map(|o| rel(*o as i64)));
                 t
             }
-            Lookupswitch { default, pairs } => {
-                let mut t = vec![rel(*default as i64)];
-                t.extend(pairs.iter().map(|(_, o)| rel(*o as i64)));
+            Lookupswitch(ls) => {
+                let mut t = vec![rel(ls.default as i64)];
+                t.extend(ls.pairs.iter().map(|(_, o)| rel(*o as i64)));
                 t
             }
             _ => return None,

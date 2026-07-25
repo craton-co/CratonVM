@@ -236,13 +236,11 @@ fn instruction_targets(
         | Goto(offset)
         | Jsr(offset) => vec![*offset as i64],
         GotoW(offset) | JsrW(offset) => vec![*offset as i64],
-        Tableswitch {
-            default, offsets, ..
-        } => std::iter::once(*default as i64)
-            .chain(offsets.iter().map(|offset| *offset as i64))
+        Tableswitch(ts) => std::iter::once(ts.default as i64)
+            .chain(ts.offsets.iter().map(|offset| *offset as i64))
             .collect(),
-        Lookupswitch { default, pairs } => std::iter::once(*default as i64)
-            .chain(pairs.iter().map(|(_, offset)| *offset as i64))
+        Lookupswitch(ls) => std::iter::once(ls.default as i64)
+            .chain(ls.pairs.iter().map(|(_, offset)| *offset as i64))
             .collect(),
         _ => Vec::new(),
     };

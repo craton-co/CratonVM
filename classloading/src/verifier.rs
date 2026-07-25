@@ -1251,7 +1251,7 @@ fn structural_successors(
                 successors.push(decoded_insn.next_pc);
             }
         }
-        Instruction::Tableswitch { .. } | Instruction::Lookupswitch { .. } => {
+        Instruction::Tableswitch(_) | Instruction::Lookupswitch(_) => {
             successors.extend_from_slice(branch_targets);
         }
         Instruction::Ret(_)
@@ -1308,20 +1308,18 @@ fn instruction_branch_targets(insn: &Instruction, pc: usize) -> Result<Vec<i64>,
         | Instruction::Goto(o)
         | Instruction::Jsr(o) => Ok(vec![target(*o as i64)?]),
         Instruction::GotoW(o) | Instruction::JsrW(o) => Ok(vec![target(*o as i64)?]),
-        Instruction::Tableswitch {
-            default, offsets, ..
-        } => {
-            let mut v = Vec::with_capacity(offsets.len() + 1);
-            v.push(target(*default as i64)?);
-            for off in offsets {
+        Instruction::Tableswitch(ts) => {
+            let mut v = Vec::with_capacity(ts.offsets.len() + 1);
+            v.push(target(ts.default as i64)?);
+            for off in &ts.offsets {
                 v.push(target(*off as i64)?);
             }
             Ok(v)
         }
-        Instruction::Lookupswitch { default, pairs } => {
-            let mut v = Vec::with_capacity(pairs.len() + 1);
-            v.push(target(*default as i64)?);
-            for (_, off) in pairs {
+        Instruction::Lookupswitch(ls) => {
+            let mut v = Vec::with_capacity(ls.pairs.len() + 1);
+            v.push(target(ls.default as i64)?);
+            for (_, off) in &ls.pairs {
                 v.push(target(*off as i64)?);
             }
             Ok(v)
