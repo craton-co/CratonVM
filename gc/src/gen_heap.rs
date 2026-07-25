@@ -5189,120 +5189,254 @@ impl GenerationalHeap {
         conservative_candidates.sort_unstable();
         conservative_candidates.dedup();
 
-        let mut young_object_ranges: Vec<(usize, usize)> = Vec::new();
-        let mut cand_idx = 0usize;
         let exact_skips = merge_skips(young_from.free_blocks_sorted());
-        let mut exact_free_iter = exact_skips.iter().peekable();
-        let mut exact_cursor = 0usize;
-        // perf/parallel-young-gc (2026-07-25): every offset this walk parses an
-        // object at is a VERIFIED point on the object grid. Recording one per
-        // `SWEEP_ANCHOR_STRIDE` bytes costs a compare and a push, and hands the
-        // sweep walk below a set of split points -- the one thing a linear
-        // header-chase walk needs to become parallelisable. Nothing allocates,
-        // frees or resizes an object between here and the sweep (the mark phase
-        // is read-only and selective promotion only writes forwarding pointers,
-        // which do not change an object's size), so the anchors stay valid.
-        // Offset 0 is where the sweep walk itself starts, so it is always a
-        // valid first anchor even if the arena opens with a free block (the
-        // chunk walker's own free-block skip handles that).
+        let used_bytes = young_from.used();
+
+        // ----- Object-grid anchors -------------------------------------------
+        //
+        // perf/gc-oracle-anchors (2026-07-25). Both consumers of an "object
+        // grid split point" -- the parallel sweep's chunk boundaries and this
+        // oracle's exact-base lookup -- used to get them from ONE sequential
+        // linear header chase over the whole from-space, right here. On the
+        // bintrees-18 profile (`-Xmx8g`, a full 2 GiB from-space, 8 threads)
+        // that chase measured 233-262 ms and was the largest single item left
+        // in the young pause -- larger than the parallel sweep it fed (68 ms)
+        // and larger than mark-card-seed + mark-closure combined.
+        //
+        // It was also redundant: the ALLOCATOR already knows every boundary it
+        // hands out. Anchors are now collected from three O(1)-per-event
+        // sources instead of being rediscovered by chasing
+        // `gen_object_total_size` over ~36M objects:
+        //
+        //   1. offset 0 -- where any linear from-space walk starts, valid even
+        //      if the arena opens with a free block (every walker skips those).
+        //   2. `Arena::take_alloc_anchors` -- bases the allocator handed out
+        //      during the epoch that just ended: one per bucket per epoch, both
+        //      TLAB starts and non-TLAB young objects. See the field comment on
+        //      `Arena::alloc_anchors` for why a TLAB start is an object base.
+        //   3. The END of every pre-existing free/TLAB-skip block. A sweep
+        //      coalesces dead spans up TO a survivor and never past one, so the
+        //      byte after a free block is that survivor's base. This is the
+        //      source that covers regions which survived an EARLIER collection
+        //      and were therefore never re-handed-out by (2) -- without it,
+        //      anchor coverage would decay to "this epoch's allocations only".
+        //   4. `used` -- the bump frontier, so the final chunk has an upper
+        //      bound to chain onto and the sequential sweep tail is empty.
+        //
+        // WHY A BAD ANCHOR CANNOT CORRUPT. Every consumer re-proves an anchor
+        // by chaining onto the NEXT one: the sweep's `sweep_chunk` returns
+        // `None` unless its chain lands exactly on its upper bound (and the
+        // whole parallel attempt is then discarded, writing nothing), and the
+        // per-interval walk below discards its own ranges on the same test.
+        // So a MISSING anchor only lengthens a chunk, and a WRONG anchor only
+        // costs a fallback to the sequential/pre-oracle path.
+        //
+        // WHY DIRECTION "just walk the whole arena unconditionally" WAS NOT
+        // TAKEN. The old loop also carried `&& cand_idx < candidates.len()`, so
+        // its anchor coverage was workload-dependent. Dropping that condition
+        // was the obvious fix -- but measurement (2026-07-25, bintrees-18)
+        // showed the condition never binds on the workload that matters: the
+        // 126 conservative candidates spanned the full 2 GiB, the walk already
+        // reached `used`, and `sweep-walk` (the sequential tail) was already
+        // 0 ms. Dropping the condition would have bought exactly nothing there
+        // while leaving the 262 ms in place. Sourcing anchors from the
+        // allocator delivers unconditional full-arena coverage anyway -- the
+        // anchor list no longer has any dependence on the candidate set at all
+        // -- so that direction is subsumed, not skipped.
+        let mut grid_anchors: Vec<usize> = Vec::with_capacity(exact_skips.len() + 64);
+        if used_bytes > 0 {
+            grid_anchors.push(0);
+            grid_anchors.extend(young_from.take_alloc_anchors());
+            grid_anchors.extend(exact_skips.iter().filter_map(|&(off, sz)| off.checked_add(sz)));
+            grid_anchors.retain(|&o| o < used_bytes);
+            grid_anchors.sort_unstable();
+            grid_anchors.dedup();
+            // Drop anything that lands INSIDE a free/TLAB-skip block. Source
+            // (3) can mint one directly: two adjacent uncoalesced free blocks
+            // put A's end exactly at B's start, and a walk that starts there
+            // resyncs to B's end -- which may be past its own upper bound, so
+            // the chunk (and with it the whole parallel sweep attempt) would
+            // abort. Correct either way, but pointlessly slow. Offset 0 is
+            // exempt: it is the walk's start, not a split point, and every
+            // walker already skip-resyncs from it (unchanged from the
+            // perf/parallel-young-gc anchor list this replaces).
+            {
+                let mut blocks = exact_skips.iter().peekable();
+                grid_anchors.retain(|&o| {
+                    while blocks.peek().is_some_and(|&&(off, sz)| off + sz <= o) {
+                        blocks.next();
+                    }
+                    o == 0 || !blocks.peek().is_some_and(|&&(off, _)| off <= o)
+                });
+            }
+            grid_anchors.push(used_bytes);
+        } else {
+            young_from.clear_alloc_anchors();
+        }
+
+        // Sweep chunk boundaries: subsample the grid at `sweep_anchor_stride()`
+        // so the chunk count stays in the "far more chunks than workers, but
+        // not one per TLAB" band the sweep was tuned for. `used` is always the
+        // terminal entry so the sequential tail below has nothing left to do.
         let anchor_stride = sweep_anchor_stride();
-        let mut sweep_anchors: Vec<usize> = vec![0];
-        let mut next_anchor = anchor_stride;
-        while exact_cursor < young_from.used() && cand_idx < conservative_candidates.len() {
-            if skip_free_blocks(&mut exact_cursor, &mut exact_free_iter).0 {
-                continue;
+        let mut sweep_anchors: Vec<usize> = Vec::new();
+        let mut next_anchor = 0usize;
+        for &a in &grid_anchors {
+            if a >= next_anchor {
+                sweep_anchors.push(a);
+                next_anchor = a - a % anchor_stride + anchor_stride;
             }
-            if exact_cursor >= next_anchor {
-                sweep_anchors.push(exact_cursor);
-                next_anchor = exact_cursor - exact_cursor % anchor_stride + anchor_stride;
-            }
-            let ptr = (from_base + exact_cursor) as *mut u8;
-            // SAFETY: free/TLAB ranges were skipped; this cursor is on an
-            // allocator-written object boundary in the young arena.
-            let header = unsafe { &*(ptr as *const ObjectHeader) };
-            // Skip a GAP-filler sentinel (Bug-D, 2026-06-12) before treating
-            // this as a normal header — its layout overlays a raw gap length
-            // at offset 4, not real header fields (see the established
-            // pattern elsewhere in this file, e.g. the selective-promotion
-            // walk above).
-            if header.class_id.as_u32() == crate::tlab::GAP_FILLER_CLASS_ID.as_u32() {
-                // SAFETY: offset 4 lies within the >=8-byte gap.
-                let gap =
-                    unsafe { std::ptr::read((ptr as *const u8).add(4) as *const u32) } as usize;
-                if (8..HEADER_SIZE).contains(&gap)
-                    && gap & 7 == 0
-                    && exact_cursor + gap <= young_from.used()
-                {
-                    exact_cursor += gap;
+        }
+        if used_bytes > 0 && sweep_anchors.last() != Some(&used_bytes) {
+            sweep_anchors.push(used_bytes);
+        }
+
+        // ----- Exact-base oracle for CONSERVATIVE candidates -----------------
+        //
+        // Only anchor intervals that actually CONTAIN a candidate are walked;
+        // an interval with no candidate in it can produce no range, so walking
+        // it was always pure loss. With allocator anchors at TLAB granularity
+        // (256 KiB - 1 MiB) that turns "chase every object up to the last
+        // candidate" into "chase one TLAB per candidate cluster".
+        let mut young_object_ranges: Vec<(usize, usize)> = Vec::new();
+        // Absolute [start, end) spans whose object grid this collection PROVED
+        // (a chain that landed exactly on the interval's upper anchor). This
+        // replaces the single `oracle_trusted_abs` frontier and preserves its
+        // 2026-07-18 semantics exactly: inside a proved span, a candidate with
+        // no covering range is free/gap space and is dropped; anywhere else the
+        // candidate falls back to direct validation of its own address (the
+        // pre-oracle behaviour) rather than being silently dropped, which is
+        // what caused the trigger-ON bt18 676xxxxx under-count family.
+        // Over-retention-safe, never a header write through an unproved base.
+        let mut verified_spans: Vec<(usize, usize)> = Vec::new();
+        let mut ci = 0usize;
+        while ci < conservative_candidates.len() {
+            let cand_off = conservative_candidates[ci] - from_base;
+            // `grid_anchors[0] == 0` and the list ends at `used`, and
+            // `in_young` already bounded every candidate below `from_end`, so
+            // the containing interval always exists.
+            let ai = grid_anchors.partition_point(|&a| a <= cand_off) - 1;
+            let lo = grid_anchors[ai];
+            let hi = grid_anchors[ai + 1];
+
+            let ranges_before = young_object_ranges.len();
+            let mut exact_cursor = lo;
+            let fi = exact_skips.partition_point(|&(off, sz)| off + sz <= lo);
+            let mut exact_free_iter = exact_skips[fi..].iter().peekable();
+            let mut cand_idx = ci;
+            while exact_cursor < hi {
+                if skip_free_blocks(&mut exact_cursor, &mut exact_free_iter).0 {
                     continue;
                 }
-                tracing::warn!(
-                    exact_cursor,
-                    "GC: exact young-object walk found an implausible GAP-filler sentinel"
-                );
-                break;
-            }
-            let total = gen_object_total_size(header);
-            if total < HEADER_SIZE
-                || exact_cursor
-                    .checked_add(total)
-                    .is_none_or(|end| end > young_from.used())
-            {
-                tracing::warn!(
-                    exact_cursor,
-                    used = young_from.used(),
-                    "GC: exact young-object walk stopped at an implausible extent"
-                );
-                break;
-            }
-            if let Some(&&(off, _)) = exact_free_iter.peek() {
-                if off > exact_cursor && off < exact_cursor + total {
+                if exact_cursor >= hi {
+                    break;
+                }
+                let ptr = (from_base + exact_cursor) as *mut u8;
+                // SAFETY: free/TLAB ranges were skipped; this cursor is on an
+                // allocator-written object boundary in the young arena.
+                let header = unsafe { &*(ptr as *const ObjectHeader) };
+                // Skip a GAP-filler sentinel (Bug-D, 2026-06-12) before treating
+                // this as a normal header — its layout overlays a raw gap length
+                // at offset 4, not real header fields (see the established
+                // pattern elsewhere in this file, e.g. the selective-promotion
+                // walk above).
+                if header.class_id.as_u32() == crate::tlab::GAP_FILLER_CLASS_ID.as_u32() {
+                    // SAFETY: offset 4 lies within the >=8-byte gap.
+                    let gap =
+                        unsafe { std::ptr::read((ptr as *const u8).add(4) as *const u32) } as usize;
+                    if (8..HEADER_SIZE).contains(&gap)
+                        && gap & 7 == 0
+                        && exact_cursor + gap <= used_bytes
+                    {
+                        exact_cursor += gap;
+                        continue;
+                    }
                     tracing::warn!(
                         exact_cursor,
-                        off,
-                        "GC: exact young-object walk crossed a free/TLAB range"
+                        "GC: exact young-object walk found an implausible GAP-filler sentinel"
                     );
                     break;
                 }
-            }
-            // Record this object's range only if it covers (or could still
-            // cover) a conservative candidate; skip candidates that fell
-            // into free/gap space below it (they resolve to "not an object"
-            // in the oracle — identical to the full-walk behavior, where a
-            // non-covered address failed the range probe and was dropped).
-            let start_addr = ptr as usize;
-            let end_addr = start_addr + total;
-            while cand_idx < conservative_candidates.len()
-                && conservative_candidates[cand_idx] < start_addr
-            {
-                cand_idx += 1;
-            }
-            if cand_idx < conservative_candidates.len()
-                && conservative_candidates[cand_idx] < end_addr
-            {
-                young_object_ranges.push((start_addr, end_addr));
+                let total = gen_object_total_size(header);
+                if total < HEADER_SIZE
+                    || exact_cursor
+                        .checked_add(total)
+                        .is_none_or(|end| end > used_bytes)
+                {
+                    tracing::warn!(
+                        exact_cursor,
+                        used = used_bytes,
+                        "GC: exact young-object walk stopped at an implausible extent"
+                    );
+                    break;
+                }
+                if let Some(&&(off, _)) = exact_free_iter.peek() {
+                    if off > exact_cursor && off < exact_cursor + total {
+                        tracing::warn!(
+                            exact_cursor,
+                            off,
+                            "GC: exact young-object walk crossed a free/TLAB range"
+                        );
+                        break;
+                    }
+                }
+                // Record this object's range only if it covers a conservative
+                // candidate; a candidate that fell into free/gap space below it
+                // resolves to "not an object" in the oracle — identical to the
+                // full-walk behavior, where a non-covered address failed the
+                // range probe and was dropped.
+                let start_addr = ptr as usize;
+                let end_addr = start_addr + total;
                 while cand_idx < conservative_candidates.len()
-                    && conservative_candidates[cand_idx] < end_addr
+                    && conservative_candidates[cand_idx] < start_addr
                 {
                     cand_idx += 1;
                 }
+                if cand_idx < conservative_candidates.len()
+                    && conservative_candidates[cand_idx] < end_addr
+                {
+                    young_object_ranges.push((start_addr, end_addr));
+                    while cand_idx < conservative_candidates.len()
+                        && conservative_candidates[cand_idx] < end_addr
+                    {
+                        cand_idx += 1;
+                    }
+                }
+                exact_cursor += total;
             }
-            exact_cursor += total;
+            if exact_cursor == hi {
+                // Chain landed exactly on the next anchor: `lo` really was an
+                // object base and every range collected in between is exact.
+                // Merge with the previous span when they abut so the lookup
+                // list stays a handful of entries.
+                let (a, b) = (from_base + lo, from_base + hi);
+                match verified_spans.last_mut() {
+                    Some(last) if last.1 == a => last.1 = b,
+                    _ => verified_spans.push((a, b)),
+                }
+            } else {
+                // Unproved interval: discard its ranges. Its candidates now
+                // take the direct-validation fallback in `mark_young`.
+                young_object_ranges.truncate(ranges_before);
+            }
+            // Every candidate below `hi` has been resolved one way or the other.
+            while ci < conservative_candidates.len()
+                && conservative_candidates[ci] - from_base < hi
+            {
+                ci += 1;
+            }
         }
-        // Truncated-oracle fail-safe (2026-07-18): everything the exact-base
-        // walk verified lies BELOW this frontier. A walk that broke early on a
-        // grid anomaly used to silently drop every conservative candidate
-        // above the break (no covering range -> `mark_young` returned -> the
-        // root's whole subtree got swept: the trigger-ON bt18 676xxxxx
-        // under-count family). Candidates above the frontier now fall back to
-        // direct validation of the candidate address (the pre-oracle
-        // behavior) — over-retention-safe, never a header write.
-        let oracle_trusted_abs = from_base + exact_cursor;
-        // Terminate the anchor list at the frontier the walk actually reached
-        // (candidates exhausted, arena end, or an anomaly break -- in every
-        // case `exact_cursor` is a grid position the chain landed on).
-        if sweep_anchors.last().is_some_and(|&a| a < exact_cursor) {
-            sweep_anchors.push(exact_cursor);
+        if phase_diag {
+            let walked: usize = verified_spans.iter().map(|&(a, b)| b - a).sum();
+            eprintln!(
+                "[gcphase] oracle: cands={} ranges={} grid-anchors={} sweep-anchors={} \
+                 walked={walked} used={used_bytes} verified-spans={}",
+                conservative_candidates.len(),
+                young_object_ranges.len(),
+                grid_anchors.len(),
+                sweep_anchors.len(),
+                verified_spans.len(),
+            );
         }
         report_phase("mark-oracle-walk");
 
@@ -5374,12 +5508,19 @@ impl GenerationalHeap {
                 .filter(|&&(_, end)| addr < end);
             let (addr, ptr) = match covering {
                 Some(&(base, _end)) => (base, base as *mut u8),
-                // Below the oracle's trusted frontier the walk was verified:
-                // an uncovered candidate is free/gap space — not an object.
-                None if addr < oracle_trusted_abs => return,
-                // Above the frontier the walk broke early — fall back to
-                // validating the candidate address directly (see the
-                // `oracle_trusted_abs` note above).
+                // Inside a PROVED span the walk was verified end to end: an
+                // uncovered candidate is free/gap space — not an object.
+                None if verified_spans
+                    .partition_point(|&(s, _)| s <= addr)
+                    .checked_sub(1)
+                    .is_some_and(|i| addr < verified_spans[i].1) =>
+                {
+                    return
+                }
+                // Outside every proved span (no anchor interval held this
+                // candidate, or that interval's chain failed to land) — fall
+                // back to validating the candidate address directly, the
+                // pre-oracle behaviour. See the `verified_spans` note above.
                 None => (addr, ptr),
             };
             // SAFETY: `in_young` confirmed `addr` is an 8-byte-aligned
@@ -8292,6 +8433,11 @@ impl GenerationalHeap {
         let ptr = {
             let mut from = self.young_from.lock();
             let ptr = from.alloc(size, 8)?;
+            // perf/gc-oracle-anchors (2026-07-25): this offset is an object
+            // base by definition — record it as a sweep/oracle anchor. See
+            // `Arena::note_object_start`.
+            let off = ptr as usize - from.base_ptr() as usize;
+            from.note_object_start(off);
             // SAFETY: `ptr` was just allocated from the arena with `size`
             // bytes; zeroing is within bounds. `init` writes the valid header
             // before the arena lock is released.
@@ -8419,6 +8565,15 @@ impl GenerationalHeap {
             return None;
         }
         if let Some(ptr) = from.alloc(actual_size, 8) {
+            // perf/gc-oracle-anchors (2026-07-25): a TLAB's first byte is an
+            // object base — the owning thread bumps its first object there,
+            // and `Tlab::retire` tail-fills whatever it did not use, so the
+            // whole TLAB is object-covered end to end. This is the anchor that
+            // matters: the JIT's inline TLAB fast path never re-enters this
+            // file, so TLAB granularity (256 KiB–1 MiB) is the finest grid the
+            // Rust side can see for JIT-allocated workloads.
+            let off = ptr as usize - from.base_ptr() as usize;
+            from.note_object_start(off);
             // Zero the TLAB region
             // SAFETY: `ptr` was just allocated from the arena with `actual_size` bytes; zeroing is within bounds.
             unsafe { std::ptr::write_bytes(ptr, 0, actual_size) };
@@ -8457,6 +8612,9 @@ impl GenerationalHeap {
             // `& !7`: same TLAB-size alignment invariant as the main path.
             let take = largest.min(actual_size) & !7;
             if let Some(ptr) = from.alloc(take, 8) {
+                // Anchor the mini-TLAB too — same argument as the main path.
+                let off = ptr as usize - from.base_ptr() as usize;
+                from.note_object_start(off);
                 // SAFETY: `ptr` was just allocated from the arena with `take` bytes; zeroing is within bounds.
                 unsafe { std::ptr::write_bytes(ptr, 0, take) };
                 return Some((ptr, take));
@@ -8832,6 +8990,18 @@ impl GenerationalHeap {
                 }
             }
         };
+
+        // perf/gc-oracle-anchors (2026-07-25): a Cheney destination inside
+        // to-space is an object base, and after the from/to swap that arena
+        // becomes the next collection's from-space. Anchoring it here keeps
+        // the opt-in moving-young path from starting each epoch with an empty
+        // anchor table (which is correct — every consumer falls back — but
+        // gives up the parallel sweep for no reason). No-op for old-gen
+        // destinations, which are a different arena.
+        if young_to.contains(new_ptr) {
+            let off = new_ptr as usize - young_to.base_ptr() as usize;
+            young_to.note_object_start(off);
+        }
 
         // Copy the entire object
         // gcstress face-1 hunt (no-op unless gated): validate the source body
