@@ -1105,6 +1105,7 @@ fn safe_native_call_impl(
             let in_bootstrap = shared.get_init_level() < 4;
             if (msg.contains("unaligned pointer") || msg.contains("null pointer")) && in_bootstrap {
                 shared
+                    .debug
                     .swallow_counter
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 tracing::debug!("Native method panic (bootstrap): {}", msg);
@@ -2093,7 +2094,7 @@ fn resume_virtual_continuation(shared: std::sync::Arc<SharedVm>, vt_id: u64) {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos() as u64;
-        let mut recorder = shared.flight_recorder.lock();
+        let mut recorder = shared.debug.flight_recorder.lock();
         cratonvm_jfr::builtin::emit_thread_end_event_arc(
             &mut recorder,
             std::sync::Arc::from(thread.name.as_str()),
@@ -6533,7 +6534,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 .unwrap_or_default()
                 .as_nanos() as u64;
             let timeout_ns = timeout_ms.map(|ms| ms as i64 * 1_000_000).unwrap_or(0);
-            let mut jfr = self.shared.flight_recorder.lock();
+            let mut jfr = self.shared.debug.flight_recorder.lock();
             cratonvm_jfr::builtin::emit_monitor_wait_event(
                 &mut jfr,
                 "java/lang/Object",
@@ -6672,7 +6673,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_nanos() as u64;
-            let mut jfr = self.shared.flight_recorder.lock();
+            let mut jfr = self.shared.debug.flight_recorder.lock();
             // Round-9 HIGH-5: build the Arc once and hand ownership to the
             // `_arc` variant so the emit doesn't reallocate from `&str`.
             let name_arc: std::sync::Arc<str> = std::sync::Arc::from(name.as_str());
@@ -7109,7 +7110,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_nanos() as u64;
-                let mut jfr = shared_arc.flight_recorder.lock();
+                let mut jfr = shared_arc.debug.flight_recorder.lock();
                 // Round-9 HIGH-5: prefer the `_arc` variant.
                 let name_arc: std::sync::Arc<str> = std::sync::Arc::from(name.as_str());
                 cratonvm_jfr::builtin::emit_thread_end_event_arc(
@@ -7119,7 +7120,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             // Fire JVMTI ThreadEnd event
             #[cfg(feature = "experimental-debug")]
             {
-                let env = shared_arc.jvmti_env.lock();
+                let env = shared_arc.debug.jvmti_env.lock();
                 if env.event_manager.is_enabled(crate::jvmti::JvmtiEvent::ThreadEnd) {
                     crate::jvmti::notify_thread_end(&env, tid.0 as u64);
                 }
@@ -7783,7 +7784,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // Virtual threads currently share their carrier's id; this is fine
         // for JFR classification — what matters is the `pin_reason` string.
         let vt_id = carrier_id;
-        let mut jfr = self.shared.flight_recorder.lock();
+        let mut jfr = self.shared.debug.flight_recorder.lock();
         cratonvm_jfr::builtin::emit_virtual_thread_pinned_event(
             &mut jfr,
             &self.thread.name,
@@ -7962,6 +7963,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
 
     fn unloaded_class_count(&self) -> u64 {
         self.shared
+            .debug
             .diagnostic_counters
             .classes_unloaded
             .load(std::sync::atomic::Ordering::Relaxed)
@@ -8446,7 +8448,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_nanos() as u64;
-            let mut jfr = self.shared.flight_recorder.lock();
+            let mut jfr = self.shared.debug.flight_recorder.lock();
             cratonvm_jfr::builtin::emit_virtual_thread_pinned_event(
                 &mut jfr,
                 &self.thread.name,
@@ -8515,7 +8517,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 .unwrap_or_default()
                 .as_nanos() as u64;
             let timeout_ns = timeout.map(|d| d.as_nanos() as i64).unwrap_or(0);
-            let mut jfr = self.shared.flight_recorder.lock();
+            let mut jfr = self.shared.debug.flight_recorder.lock();
             cratonvm_jfr::builtin::emit_thread_park_event(
                 &mut jfr,
                 "java/util/concurrent/locks/LockSupport",
@@ -10473,7 +10475,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos() as u64;
-        let mut jfr = self.shared.flight_recorder.lock();
+        let mut jfr = self.shared.debug.flight_recorder.lock();
         cratonvm_jfr::builtin::emit_thread_sleep_event(
             &mut jfr,
             sleep_nanos,
@@ -10489,7 +10491,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             .unwrap_or_default()
             .as_nanos() as u64;
         let path = format!("fd:{}", fd);
-        let mut jfr = self.shared.flight_recorder.lock();
+        let mut jfr = self.shared.debug.flight_recorder.lock();
         cratonvm_jfr::builtin::emit_file_read_event(
             &mut jfr,
             &path,
@@ -10507,7 +10509,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             .unwrap_or_default()
             .as_nanos() as u64;
         let path = format!("fd:{}", fd);
-        let mut jfr = self.shared.flight_recorder.lock();
+        let mut jfr = self.shared.debug.flight_recorder.lock();
         cratonvm_jfr::builtin::emit_file_write_event(
             &mut jfr,
             &path,

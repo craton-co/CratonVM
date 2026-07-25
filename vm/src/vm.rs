@@ -68703,7 +68703,7 @@ mod tests {
     fn p90_jdwp_set_breakpoint_and_check() {
         // Set a breakpoint in the JDWP EventManager and verify it matches.
         let shared = p90_shared();
-        let mut ds = shared.debug_state.lock();
+        let mut ds = shared.debug.debug_state.lock();
         use crate::debug::events::{EventKind, EventModifier, SuspendPolicy};
 
         let req_id = ds.events.set_event_request(
@@ -68729,13 +68729,16 @@ mod tests {
         let shared = p90_shared();
         use std::sync::atomic::Ordering;
 
-        assert!(!shared.breakpoints_active.load(Ordering::Relaxed));
-        shared.breakpoints_active.store(true, Ordering::Relaxed);
-        assert!(shared.breakpoints_active.load(Ordering::Relaxed));
+        assert!(!shared.debug.breakpoints_active.load(Ordering::Relaxed));
+        shared
+            .debug
+            .breakpoints_active
+            .store(true, Ordering::Relaxed);
+        assert!(shared.debug.breakpoints_active.load(Ordering::Relaxed));
 
         // When active, the interpreter loop checks debug_state for breakpoints.
         // Set a breakpoint and verify the debug_state is accessible.
-        let mut ds = shared.debug_state.lock();
+        let mut ds = shared.debug.debug_state.lock();
         use crate::debug::events::{EventKind, EventModifier, SuspendPolicy};
         ds.events.set_event_request(
             EventKind::Breakpoint,
@@ -68753,7 +68756,7 @@ mod tests {
     fn p90_jdwp_suspend_thread_on_breakpoint() {
         // Verify that hitting a breakpoint with SuspendPolicy::EventThread marks thread suspended.
         let shared = p90_shared();
-        let mut ds = shared.debug_state.lock();
+        let mut ds = shared.debug.debug_state.lock();
         use crate::debug::events::{EventKind, EventModifier, SuspendPolicy};
 
         ds.events.set_event_request(
@@ -68784,14 +68787,14 @@ mod tests {
         // JFR records a GC event when a recording is active.
         let shared = p90_shared();
         let rec_id = {
-            let mut fr = shared.flight_recorder.lock();
+            let mut fr = shared.debug.flight_recorder.lock();
             let id = fr.new_recording(cratonvm_jfr::RecordingSettings::new("test"));
             fr.start_recording(id);
             id
         };
         // Emit a GC event
         {
-            let mut fr = shared.flight_recorder.lock();
+            let mut fr = shared.debug.flight_recorder.lock();
             cratonvm_jfr::builtin::emit_gc_event(
                 &mut fr,
                 1,
@@ -68801,7 +68804,7 @@ mod tests {
                 500,
             );
         }
-        let mut fr = shared.flight_recorder.lock();
+        let mut fr = shared.debug.flight_recorder.lock();
         fr.stop_recording(rec_id);
         let rec = fr.get_recording_mut(rec_id).unwrap();
         let events = rec.get_events();
@@ -68817,13 +68820,13 @@ mod tests {
         // JFR records a class load event when a recording is active.
         let shared = p90_shared();
         let rec_id = {
-            let mut fr = shared.flight_recorder.lock();
+            let mut fr = shared.debug.flight_recorder.lock();
             let id = fr.new_recording(cratonvm_jfr::RecordingSettings::new("test"));
             fr.start_recording(id);
             id
         };
         {
-            let mut fr = shared.flight_recorder.lock();
+            let mut fr = shared.debug.flight_recorder.lock();
             cratonvm_jfr::builtin::emit_class_load_event(
                 &mut fr,
                 "java/lang/Object",
@@ -68833,7 +68836,7 @@ mod tests {
                 200,
             );
         }
-        let mut fr = shared.flight_recorder.lock();
+        let mut fr = shared.debug.flight_recorder.lock();
         fr.stop_recording(rec_id);
         let rec = fr.get_recording_mut(rec_id).unwrap();
         let events = rec.get_events();
@@ -68849,19 +68852,19 @@ mod tests {
         // JFR records thread start and end events.
         let shared = p90_shared();
         let rec_id = {
-            let mut fr = shared.flight_recorder.lock();
+            let mut fr = shared.debug.flight_recorder.lock();
             let id = fr.new_recording(cratonvm_jfr::RecordingSettings::new("test"));
             fr.start_recording(id);
             id
         };
         {
-            let mut fr = shared.flight_recorder.lock();
+            let mut fr = shared.debug.flight_recorder.lock();
             cratonvm_jfr::builtin::emit_thread_start_event(
                 &mut fr, "worker-1", "platform", 1, 1000,
             );
             cratonvm_jfr::builtin::emit_thread_end_event(&mut fr, "worker-1", 1, 2000);
         }
-        let mut fr = shared.flight_recorder.lock();
+        let mut fr = shared.debug.flight_recorder.lock();
         fr.stop_recording(rec_id);
         let rec = fr.get_recording_mut(rec_id).unwrap();
         let events = rec.get_events();
@@ -68877,13 +68880,13 @@ mod tests {
         // JFR records a compilation event.
         let shared = p90_shared();
         let rec_id = {
-            let mut fr = shared.flight_recorder.lock();
+            let mut fr = shared.debug.flight_recorder.lock();
             let id = fr.new_recording(cratonvm_jfr::RecordingSettings::new("test"));
             fr.start_recording(id);
             id
         };
         {
-            let mut fr = shared.flight_recorder.lock();
+            let mut fr = shared.debug.flight_recorder.lock();
             cratonvm_jfr::builtin::emit_compilation_event(
                 &mut fr,
                 "com/example/Main::main([Ljava/lang/String;)V",
@@ -68897,7 +68900,7 @@ mod tests {
                 500,
             );
         }
-        let mut fr = shared.flight_recorder.lock();
+        let mut fr = shared.debug.flight_recorder.lock();
         fr.stop_recording(rec_id);
         let rec = fr.get_recording_mut(rec_id).unwrap();
         let events = rec.get_events();
@@ -72058,7 +72061,7 @@ public class SkippedTest {
 
         // Start a JFR recording
         {
-            let mut jfr = vm.flight_recorder.lock();
+            let mut jfr = vm.debug.flight_recorder.lock();
             let rid = jfr.new_recording(cratonvm_jfr::RecordingSettings::new("test"));
             jfr.start_recording(rid);
         }
@@ -72074,7 +72077,7 @@ public class SkippedTest {
         );
 
         // Verify JFR event was recorded
-        let mut jfr = vm.flight_recorder.lock();
+        let mut jfr = vm.debug.flight_recorder.lock();
         let rec = jfr.get_recording_mut(1).unwrap();
         let events = rec.get_events();
         let deopt_events: Vec<_> = events

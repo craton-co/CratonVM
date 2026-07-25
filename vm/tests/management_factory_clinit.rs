@@ -74,6 +74,7 @@ fn management_factory_clinit_no_swallow() {
     let mut vm = Vm::new(config);
     let baseline = vm
         .shared
+        .debug
         .swallow_counter
         .load(std::sync::atomic::Ordering::Relaxed);
 
@@ -91,6 +92,7 @@ fn management_factory_clinit_no_swallow() {
 
     let after = vm
         .shared
+        .debug
         .swallow_counter
         .load(std::sync::atomic::Ordering::Relaxed);
     assert_eq!(

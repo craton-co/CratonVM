@@ -2067,9 +2067,7 @@ fn run() -> Result<()> {
     if let Some(s) = &args.max_direct_memory {
         match parse_size(s) {
             Some(sz) if sz > 0 => config.max_direct_memory_size = Some(sz),
-            _ => eprintln!(
-                "Warning: ignoring -XX:MaxDirectMemorySize={s} (expected a byte size)"
-            ),
+            _ => eprintln!("Warning: ignoring -XX:MaxDirectMemorySize={s} (expected a byte size)"),
         }
     }
 
@@ -2749,6 +2747,7 @@ fn run() -> Result<()> {
     if matches!(result, Ok(_)) {
         let swallowed = vm
             .shared
+            .debug
             .swallow_counter
             .load(std::sync::atomic::Ordering::Relaxed);
         if swallowed > 0 {

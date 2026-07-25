@@ -152,6 +152,7 @@ pub fn unload_dead_class_metadata(
 
     cratonvm_native_builtins::classloader::forget_unloaded_classes(&raw_ids);
     shared
+        .debug
         .diagnostic_counters
         .classes_unloaded
         .fetch_add(unloaded.len() as u64, std::sync::atomic::Ordering::Relaxed);

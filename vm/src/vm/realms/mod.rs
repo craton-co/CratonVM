@@ -41,6 +41,8 @@
 //! site (`shared.classes.…` under `shared.threads.…`) rather than hidden
 //! behind two same-looking `shared.<field>` accesses.
 
+pub mod debug_realm;
 pub mod jit_realm;
 
+pub use debug_realm::DebugRealm;
 pub use jit_realm::JitRealm;

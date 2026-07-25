@@ -1241,7 +1241,7 @@ pub(crate) fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
             );
             // Record JFR GC event
             {
-                let mut jfr = shared.flight_recorder.lock();
+                let mut jfr = shared.debug.flight_recorder.lock();
                 let now_ns = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
@@ -2996,6 +2996,7 @@ fn maybe_dump_heap_on_oom(shared: &SharedVm) {
         return;
     }
     if shared
+        .debug
         .oom_dump_written
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
         .is_err()
@@ -6571,7 +6572,7 @@ pub fn execute(
                                 "{}.{}:{}",
                                 class_name_arc, method_name_arc, descriptor_arc,
                             );
-                            let mut jfr = shared.flight_recorder.lock();
+                            let mut jfr = shared.debug.flight_recorder.lock();
                             // Round-9 HIGH-5: convert the scratch buffer to an
                             // `Arc<str>` once and pass it to the `_arc` variant so
                             // the emit path doesn't re-do `Arc::from(&str)`.
@@ -7832,7 +7833,7 @@ fn execute_frame_from_index(
         // T19.H1 — opportunistic stack-dump hook.
         //
         // When the CLI watchdog fires (`--stack-dump-on-timeout=N`), it sets
-        // `shared.stack_dump_requested`. Every interpreter thread observes
+        // `shared.debug.stack_dump_requested`. Every interpreter thread observes
         // the flag on its next dispatch iteration and self-dumps its frame
         // chain before the watchdog aborts the process. The load is
         // `Ordering::Relaxed` — a single predicted branch per bytecode in
@@ -16374,7 +16375,7 @@ fn execute_instruction(
                                 .unwrap_or_default()
                                 // Widening: smaller integer -> 64-bit (zero/sign-extended, value preserved)
                                 .as_nanos() as u64;
-                            let mut jfr = shared.flight_recorder.lock();
+                            let mut jfr = shared.debug.flight_recorder.lock();
                             cratonvm_jfr::builtin::emit_java_error_throw_event(
                                 &mut jfr,
                                 class_name,
@@ -16887,7 +16888,7 @@ fn execute_instruction(
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_nanos() as u64; // Cast: duration to u64 nanoseconds
-                    let mut jfr = shared.flight_recorder.lock();
+                    let mut jfr = shared.debug.flight_recorder.lock();
                     // Round-5 HIGH-fix (Bug 4, 2026-05-17): use the `_arc`
                     // variant so the monitor class name avoids a per-event
                     // `Arc::from(&str)` allocation inside `emit_*`. The
@@ -35985,7 +35986,7 @@ fn try_jit_compile_callee_slow(
     //
     // GC-STW-safety / lock-scope discipline (wire-tiered-manager increment 3):
     // when this runs on the GC-neutral `cratonvm-jit-compiler` worker, the
-    // `shared.flight_recorder.lock()` must be held for the MINIMAL scope and
+    // `shared.debug.flight_recorder.lock()` must be held for the MINIMAL scope and
     // NEVER across a blocking op or a nested VM-lock acquisition — a mutator
     // wanting the recorder must not stall behind the worker (which would keep
     // that mutator off its safepoint and stall a third-thread STW). The
@@ -36007,7 +36008,7 @@ fn try_jit_compile_callee_slow(
         cached.class_name, cached.method_name, cached.method_descriptor
     ));
     {
-        let mut jfr = shared.flight_recorder.lock();
+        let mut jfr = shared.debug.flight_recorder.lock();
         cratonvm_jfr::builtin::emit_compilation_event_arc(
             &mut jfr,
             method_desc,

@@ -163,7 +163,7 @@ fn t1_oom_dump_flag_can_be_set_via_config() {
 #[test]
 fn t1_oom_dump_written_flag_starts_unset() {
     let shared = Arc::new(SharedVm::new(VmConfig::default()));
-    assert!(!shared.oom_dump_written.load(Ordering::SeqCst));
+    assert!(!shared.debug.oom_dump_written.load(Ordering::SeqCst));
 }
 
 // ===========================================================================

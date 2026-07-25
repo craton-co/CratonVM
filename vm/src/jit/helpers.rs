@@ -8200,7 +8200,7 @@ impl DeoptimizationController {
                 cratonvm_jit::deopt::DeoptAction::MakeNotEntrant => "MakeNotEntrant",
                 cratonvm_jit::deopt::DeoptAction::MakeNotCompilable => "MakeNotCompilable",
             };
-            let mut jfr = vm.flight_recorder.lock();
+            let mut jfr = vm.debug.flight_recorder.lock();
             cratonvm_jfr::builtin::emit_deoptimization_event(
                 &mut jfr,
                 &method_key,

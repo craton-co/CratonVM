@@ -574,10 +574,12 @@ pub struct SharedVm {
     /// Weak self-reference so native methods can obtain `Arc<SharedVm>` for
     /// spawning new threads. Set by `Vm::new()` after wrapping in `Arc`.
     pub self_arc: RwLock<Option<Weak<SharedVm>>>,
-
-    /// T1.7.7 — set to `true` after the first HPROF dump-on-OOM so a
-    /// tight allocation loop doesn't write thousands of dumps.
-    pub oom_dump_written: std::sync::atomic::AtomicBool,
+    /// Observability, diagnostics and the JVMTI/JDWP debug plumbing.
+    ///
+    /// See [`crate::vm::realms::DebugRealm`]. Access paths are
+    /// `shared.debug.<field>`; lock types and levels are
+    /// unchanged by the move.
+    pub debug: crate::vm::realms::DebugRealm,
 
     /// File descriptor table for I/O operations.
     pub fd_table: FileDescriptorTable,
@@ -632,59 +634,6 @@ pub struct SharedVm {
     /// Cached field count for java/lang/Class mirror objects (0 = not yet resolved).
     pub cached_class_mirror_num_fields: AtomicUsize,
 
-    /// Structured audit log of ACC_NATIVE methods that were invoked but had no
-    /// Rust implementation. Populated when `config.audit_missing_natives` is
-    /// true. Entries are deduped by `(class, method, descriptor)`; the first
-    /// occurrence records the caller frame as a sample call-site which is
-    /// useful for diagnosing which Java code transitively reaches the missing
-    /// native.
-    ///
-    /// Schema written to disk by [`Self::dump_missing_natives_json`]:
-    ///
-    /// ```json
-    /// {
-    ///   "missing_natives": [
-    ///     {
-    ///       "class": "java/lang/Foo",
-    ///       "name": "bar",
-    ///       "descriptor": "(I)V",
-    ///       "sample_call_site": "com/example/Main.main([Ljava/lang/String;)V"
-    ///     }
-    ///   ]
-    /// }
-    /// ```
-    ///
-    /// The ordering is the order of first occurrence. Two consecutive runs on
-    /// the same program produce byte-identical JSON, which makes the file
-    /// suitable as a committed baseline that can be diffed against new
-    /// releases.
-    pub missing_natives_log: parking_lot::Mutex<Vec<MissingNativeEntry>>,
-
-    /// Java Flight Recorder — records VM events (GC, thread, class loading, compilation).
-    pub flight_recorder: parking_lot::Mutex<cratonvm_jfr::FlightRecorder>,
-
-    /// JVMTI debug state — breakpoints, step requests, and event callbacks.
-    #[cfg(feature = "experimental-debug")]
-    pub debug_state: parking_lot::Mutex<crate::debug::DebugState>,
-
-    /// JVMTI environment — exposes the JVMTI interface to attached agents.
-    #[cfg(feature = "experimental-debug")]
-    pub jvmti_env: parking_lot::Mutex<crate::jvmti::JvmtiEnv>,
-
-    /// Fast-path flag: true when at least one breakpoint is active.
-    /// Checked on every interpreted instruction to skip the debug_state lock
-    /// when no breakpoints are set.
-    #[cfg(feature = "experimental-debug")]
-    pub breakpoints_active: std::sync::atomic::AtomicBool,
-
-    /// Event channel: interpreter threads send debug events here; the JDWP
-    /// server thread drains and forwards them as composite event packets.
-    #[cfg(feature = "experimental-debug")]
-    pub debug_event_tx: std::sync::Mutex<Option<std::sync::mpsc::Sender<crate::debug::DebugEvent>>>,
-    #[cfg(feature = "experimental-debug")]
-    pub debug_event_rx:
-        std::sync::Mutex<Option<std::sync::mpsc::Receiver<crate::debug::DebugEvent>>>,
-
     /// Finalizer thread queue — objects with `finalize()` overrides are enqueued
     /// here when the GC determines they are unreachable.  The VM drains this
     /// queue and invokes each object's `finalize()` method (JLS §12.6).
@@ -708,21 +657,12 @@ pub struct SharedVm {
         FxHashMap<ClassId, Arc<(parking_lot::Mutex<bool>, parking_lot::Condvar)>>,
     >,
 
-    /// Diagnostic counters — atomic counters for bytecodes, GC, classes, etc.
-    pub diagnostic_counters: crate::runtime::diagnostics::DiagnosticCounters,
-
     /// Flag to request an explicit GC at next safepoint (set by System.gc() / GC.run).
     pub gc_requested: std::sync::atomic::AtomicBool,
 
     /// A native array allocation crossed the occupancy threshold. The next
     /// native-call boundary collects after pinning and remapping its arguments.
     pub native_array_gc_requested: std::sync::atomic::AtomicBool,
-
-    /// B6: Counter of silent swallows during class init / invokedynamic / native calls.
-    /// Incremented whenever an error is swallowed (converted to a WARN) so the CLI
-    /// can surface a summary after main() completes silently. Visible via tracing
-    /// at WARN level. Setting CRATONVM_STRICT_SWALLOWS=1 escalates swallows to panics.
-    pub swallow_counter: std::sync::atomic::AtomicU64,
 
     /// Per-class-name loading locks (Session 30: Thread-Safe Class Loading).
     ///
@@ -734,26 +674,6 @@ pub struct SharedVm {
     /// T10.9.B: FxHashMap — keys are internal class names.
     pub class_loading_locks:
         parking_lot::Mutex<FxHashMap<String, Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>>>,
-
-    /// T19.H1 — cross-thread stack-dump-on-timeout flag.
-    ///
-    /// Set by the CLI watchdog thread (see `--stack-dump-on-timeout`) after
-    /// the configured deadline elapses. Interpreter threads poll this flag
-    /// on every dispatch loop iteration with a cheap `Ordering::Relaxed`
-    /// load; when set, each thread writes its frame chain to stderr via
-    /// [`Self::dump_current_thread_frames`] and increments
-    /// [`stack_dump_ack_count`] so the watchdog can confirm all runtime
-    /// threads responded before calling `std::process::abort`.
-    ///
-    /// This is a diagnostic-only mechanism — the flag is one-shot and is
-    /// never cleared; the process is expected to abort soon after.
-    pub stack_dump_requested: std::sync::atomic::AtomicBool,
-
-    /// T19.H1 — count of threads that have flushed their frame dump to
-    /// stderr in response to [`stack_dump_requested`]. The watchdog uses
-    /// this to decide how long to wait for interpreter threads to respond
-    /// before aborting the process.
-    pub stack_dump_ack_count: std::sync::atomic::AtomicU32,
 
     /// T19.3.G1 — number of TLAB refills across all threads since VM start.
     ///
@@ -2809,7 +2729,26 @@ impl SharedVm {
             module_mirrors: RwLock::new(FxHashMap::default()),
             var_handle_roots: RwLock::new(FxHashMap::default()),
             self_arc: RwLock::new(None),
-            oom_dump_written: std::sync::atomic::AtomicBool::new(false),
+            debug: crate::vm::realms::DebugRealm {
+                oom_dump_written: std::sync::atomic::AtomicBool::new(false),
+                missing_natives_log: parking_lot::Mutex::new(Vec::new()),
+                flight_recorder: parking_lot::Mutex::new(cratonvm_jfr::create_flight_recorder()),
+                #[cfg(feature = "experimental-debug")]
+                debug_state: parking_lot::Mutex::new(crate::debug::DebugState::new()),
+                #[cfg(feature = "experimental-debug")]
+                jvmti_env: parking_lot::Mutex::new(jvmti_env),
+                #[cfg(feature = "experimental-debug")]
+                breakpoints_active: std::sync::atomic::AtomicBool::new(false),
+                #[cfg(feature = "experimental-debug")]
+                debug_event_tx: std::sync::Mutex::new(None),
+                #[cfg(feature = "experimental-debug")]
+                debug_event_rx: std::sync::Mutex::new(None),
+                diagnostic_counters: crate::runtime::diagnostics::DiagnosticCounters::new(),
+                swallow_counter: std::sync::atomic::AtomicU64::new(0),
+                stack_dump_requested: std::sync::atomic::AtomicBool::new(false),
+                stack_dump_ack_count: std::sync::atomic::AtomicU32::new(0),
+            },
+
             fd_table: FileDescriptorTable::new(),
             gc_barrier: GcBarrier::new(),
             jit: crate::vm::realms::JitRealm {
@@ -2845,28 +2784,12 @@ impl SharedVm {
             cached_string_num_fields: AtomicUsize::new(0),
             compact_strings: std::sync::atomic::AtomicBool::new(false),
             cached_class_mirror_num_fields: AtomicUsize::new(0),
-            missing_natives_log: parking_lot::Mutex::new(Vec::new()),
-            flight_recorder: parking_lot::Mutex::new(cratonvm_jfr::create_flight_recorder()),
-            #[cfg(feature = "experimental-debug")]
-            debug_state: parking_lot::Mutex::new(crate::debug::DebugState::new()),
-            #[cfg(feature = "experimental-debug")]
-            jvmti_env: parking_lot::Mutex::new(jvmti_env),
-            #[cfg(feature = "experimental-debug")]
-            breakpoints_active: std::sync::atomic::AtomicBool::new(false),
-            #[cfg(feature = "experimental-debug")]
-            debug_event_tx: std::sync::Mutex::new(None),
-            #[cfg(feature = "experimental-debug")]
-            debug_event_rx: std::sync::Mutex::new(None),
             finalizer_thread: cratonvm_gc::reference::FinalizerThread::new(),
             cleaner_thread: cratonvm_gc::reference::CleanerThread::new(),
             class_init_waiters: parking_lot::Mutex::new(FxHashMap::default()),
             class_loading_locks: parking_lot::Mutex::new(FxHashMap::default()),
-            diagnostic_counters: crate::runtime::diagnostics::DiagnosticCounters::new(),
             gc_requested: std::sync::atomic::AtomicBool::new(false),
             native_array_gc_requested: std::sync::atomic::AtomicBool::new(false),
-            swallow_counter: std::sync::atomic::AtomicU64::new(0),
-            stack_dump_requested: std::sync::atomic::AtomicBool::new(false),
-            stack_dump_ack_count: std::sync::atomic::AtomicU32::new(0),
             // T19.3.G1 — allocation-storm observability counters.
             tlab_refill_count: std::sync::atomic::AtomicU64::new(0),
             tlab_hit_count: std::sync::atomic::AtomicU64::new(0),
@@ -3265,7 +3188,7 @@ impl SharedVm {
     /// Prints a sorted, deduplicated list of ACC_NATIVE methods that were
     /// invoked during execution but had no Rust implementation.
     pub fn dump_missing_natives(&self) {
-        let log = self.missing_natives_log.lock();
+        let log = self.debug.missing_natives_log.lock();
         if log.is_empty() {
             return;
         }
@@ -3299,7 +3222,7 @@ impl SharedVm {
     /// implementation registered. Only populated when `config.audit_missing_natives`
     /// is `true`.
     pub fn get_missing_natives(&self) -> Vec<String> {
-        let log = self.missing_natives_log.lock();
+        let log = self.debug.missing_natives_log.lock();
         let mut sigs: Vec<String> = log.iter().map(MissingNativeEntry::full_signature).collect();
         sigs.sort();
         sigs.dedup();
@@ -3337,7 +3260,7 @@ impl SharedVm {
         &self,
         path: impl AsRef<std::path::Path>,
     ) -> std::io::Result<()> {
-        let log = self.missing_natives_log.lock();
+        let log = self.debug.missing_natives_log.lock();
         let mut sorted: Vec<MissingNativeEntry> = log.clone();
         sorted.sort_by(|a, b| {
             (&a.class_name, &a.method_name, &a.descriptor).cmp(&(
@@ -3459,7 +3382,7 @@ impl SharedVm {
         descriptor: &str,
         sample_call_site: Option<String>,
     ) {
-        let mut log = self.missing_natives_log.lock();
+        let mut log = self.debug.missing_natives_log.lock();
         let already = log.iter().any(|e| {
             e.class_name == class_name && e.method_name == method_name && e.descriptor == descriptor
         });
@@ -3487,7 +3410,7 @@ impl SharedVm {
     pub fn classify_missing_natives_by_module(
         &self,
     ) -> std::collections::BTreeMap<&'static str, Vec<MissingNativeEntry>> {
-        let log = self.missing_natives_log.lock();
+        let log = self.debug.missing_natives_log.lock();
         let mut grouped: std::collections::BTreeMap<&'static str, Vec<MissingNativeEntry>> =
             std::collections::BTreeMap::new();
         for entry in log.iter() {
@@ -3907,7 +3830,7 @@ impl SharedVm {
         if let Ok(class_id) = &result {
             #[cfg(feature = "experimental-debug")]
             {
-                let env = self.jvmti_env.lock();
+                let env = self.debug.jvmti_env.lock();
                 if env
                     .event_manager
                     .is_enabled(crate::jvmti::JvmtiEvent::ClassLoad)
@@ -4295,7 +4218,8 @@ impl SharedVm {
     /// the configured deadline elapses. The flag is sticky and never
     /// cleared — the process is expected to abort shortly after.
     pub fn request_stack_dump(&self) {
-        self.stack_dump_requested
+        self.debug
+            .stack_dump_requested
             .store(true, std::sync::atomic::Ordering::Release);
         // KC16-watchdog: also wake every thread parked in Object.wait().
         // The interpreter top-of-loop poll only fires when the thread is
@@ -4324,7 +4248,8 @@ impl SharedVm {
     /// dispatched bytecode (the typical case is `false` forever).
     #[inline(always)]
     pub fn stack_dump_pending(&self) -> bool {
-        self.stack_dump_requested
+        self.debug
+            .stack_dump_requested
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
@@ -4441,13 +4366,15 @@ impl SharedVm {
         let _ = handle.write_all(footer.as_bytes());
         let _ = handle.flush();
 
-        self.stack_dump_ack_count
+        self.debug
+            .stack_dump_ack_count
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     }
 
     /// T19.H1 — count of threads that have completed their dump.
     pub fn stack_dump_ack_count(&self) -> u32 {
-        self.stack_dump_ack_count
+        self.debug
+            .stack_dump_ack_count
             .load(std::sync::atomic::Ordering::Acquire)
     }
 }
@@ -4523,6 +4450,7 @@ pub fn dump_wait_site_thread_local(shared: &SharedVm) {
         let _ = handle.write_all(buf.as_bytes());
         let _ = handle.flush();
         shared
+            .debug
             .stack_dump_ack_count
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     } else {
@@ -5019,7 +4947,7 @@ impl SharedVm {
     ) -> RankedGuard<parking_lot::MutexGuard<'_, cratonvm_jfr::FlightRecorder>> {
         let rank = ranked_locks::enter(ranked_locks::FLIGHT_RECORDER);
         RankedGuard {
-            lock: self.flight_recorder.lock(),
+            lock: self.debug.flight_recorder.lock(),
             rank_scope: rank,
         }
     }
@@ -5266,7 +5194,7 @@ impl Vm {
         // scope while keeping the field non-zero so the consumer-side
         // schema check passes.
         let total = shared.config.max_heap_size as i64;
-        let mut jfr = shared.flight_recorder.lock();
+        let mut jfr = shared.debug.flight_recorder.lock();
         cratonvm_jfr::builtin::emit_physical_memory_event(&mut jfr, total, total, now_ns);
 
         // Round-5 JFR Fix 4: emit `jdk.InitialEnvironmentVariable` for
@@ -5772,7 +5700,7 @@ impl crate::runtime::serviceability::VmDiagnosticState for SharedVm {
     }
 
     fn uptime_secs(&self) -> f64 {
-        self.diagnostic_counters.uptime_secs()
+        self.debug.diagnostic_counters.uptime_secs()
     }
 
     fn command_line(&self) -> String {
@@ -6469,7 +6397,7 @@ mod tests {
     #[test]
     fn missing_natives_log_initially_empty() {
         let shared = SharedVm::new(VmConfig::default());
-        assert!(shared.missing_natives_log.lock().is_empty());
+        assert!(shared.debug.missing_natives_log.lock().is_empty());
     }
 
     #[test]
@@ -6498,7 +6426,7 @@ mod tests {
         shared.record_missing_native("java/lang/Foo", "bar", "()V", None);
         shared.record_missing_native("java/lang/Baz", "qux", "(I)I", Some("main".into()));
         shared.record_missing_native("java/lang/Foo", "bar", "()V", None); // dup
-        let log = shared.missing_natives_log.lock();
+        let log = shared.debug.missing_natives_log.lock();
         assert_eq!(log.len(), 2);
         // dump_missing_natives prints without panicking even on a
         // populated log.
@@ -9342,7 +9270,7 @@ mod tests {
 
         // Check audit log for missing natives
         {
-            let log = shared.missing_natives_log.lock();
+            let log = shared.debug.missing_natives_log.lock();
             if !log.is_empty() {
                 eprintln!("Missing natives called during put():");
                 for entry in log.iter() {
@@ -11884,17 +11812,18 @@ mod tests {
         // Counters should be initialized to zero
         assert_eq!(
             crate::runtime::diagnostics::DiagnosticCounters::get(
-                &shared.diagnostic_counters.gc_cycles
+                &shared.debug.diagnostic_counters.gc_cycles
             ),
             0
         );
         // Increment and check
         shared
+            .debug
             .diagnostic_counters
-            .inc(&shared.diagnostic_counters.classes_loaded);
+            .inc(&shared.debug.diagnostic_counters.classes_loaded);
         assert_eq!(
             crate::runtime::diagnostics::DiagnosticCounters::get(
-                &shared.diagnostic_counters.classes_loaded
+                &shared.debug.diagnostic_counters.classes_loaded
             ),
             1
         );

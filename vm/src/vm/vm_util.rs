@@ -1255,7 +1255,7 @@ fn initialize_class_shared(
                     .unwrap_or_default()
                     .as_nanos() as u64;
                 let duration_ns = init_start.elapsed().as_nanos() as u64;
-                let mut jfr = shared.flight_recorder.lock();
+                let mut jfr = shared.debug.flight_recorder.lock();
                 // Round-9 HIGH-5 fix (2026-05-17): use `_arc` to skip the
                 // per-event `Arc::from(&str)` clone — `class_name_for_jfr`
                 // is already `Arc<str>` (cloned from `Class.name`).
@@ -1470,6 +1470,7 @@ fn initialize_class_shared(
                     let recoverable_silent = &*class_name_for_jfr == "java/math/BigDecimal";
                     if recoverable_silent {
                         shared
+                            .debug
                             .swallow_counter
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         if crate::runtime::env_cache::strict_swallows() {
@@ -1869,7 +1870,7 @@ fn initialize_class_shared(
             .unwrap_or_default()
             .as_nanos() as u64;
         let duration_ns = init_start.elapsed().as_nanos() as u64;
-        let mut jfr = shared.flight_recorder.lock();
+        let mut jfr = shared.debug.flight_recorder.lock();
         // Round-9 HIGH-5 fix (2026-05-17): use `_arc` variant — name is
         // already `Arc<str>` from `Class.name.clone()`.
         cratonvm_jfr::builtin::emit_class_load_event_arc(
