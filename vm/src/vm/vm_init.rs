@@ -348,19 +348,19 @@ pub struct SharedVm {
     /// `shared.classes.<field>`; lock types and levels are
     /// unchanged by the move.
     pub classes: crate::vm::realms::ClassRealm,
-    /// Object heap, GC coordination and the VM-wide GC root tables.
-    ///
-    /// See [`crate::vm::realms::HeapRealm`]. Access paths are
-    /// `shared.mem.<field>`; lock types and levels are
-    /// unchanged by the move.
-    pub mem: crate::vm::realms::HeapRealm,
-
     /// Native-method registry, Panama FFI tables, JNI globals and the fd table.
     ///
     /// See [`crate::vm::realms::NativeRealm`]. Access paths are
     /// `shared.natives.<field>`; lock types and levels are
     /// unchanged by the move.
     pub natives: crate::vm::realms::NativeRealm,
+
+    /// Object heap, GC coordination and the VM-wide GC root tables.
+    ///
+    /// See [`crate::vm::realms::HeapRealm`]. Access paths are
+    /// `shared.mem.<field>`; lock types and levels are
+    /// unchanged by the move.
+    pub mem: crate::vm::realms::HeapRealm,
 
     /// Java threads: registry, monitors, virtual-thread scheduling and the main ThreadGroup.
     ///

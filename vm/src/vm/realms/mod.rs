@@ -4,42 +4,67 @@
 //! `SharedVm` realms — cohesive sub-structs of the former god object.
 //!
 //! `SharedVm` used to declare 86 fields, roughly half of them independently
-//! locked, in a single flat struct. Every subsystem reached into every other
-//! one through it, which made the global lock hierarchy
+//! locked, in one flat struct. Every subsystem reached into every other one
+//! through it, which made the global lock hierarchy
 //! ([`crate::runtime::lock_order`]) hard to reason about and the crate hard
 //! to navigate.
 //!
 //! The state is now grouped into *realms*: plain sub-structs owned by
-//! `SharedVm`, one per subsystem. Nothing else changed — field types, lock
-//! types (`OrderedPlRwLock`, `OrderedPlMutex`, `parking_lot::*`,
-//! `std::sync::*`), lock levels, the initialisation order inside
-//! `SharedVm::new`, and every acquisition site are identical modulo the
-//! extra path segment. Access is `shared.<realm>.<field>`.
+//! `SharedVm`, one per subsystem. `SharedVm` itself is down to 16 fields —
+//! six realms plus VM identity, config, the `System.in/out/err` handles,
+//! system properties, the self-`Weak`, the bootstrap init-level state
+//! machine, and the optional GPU offload registry.
+//!
+//! Nothing else changed. Field types, lock types (`OrderedPlRwLock`,
+//! `OrderedPlMutex`, `parking_lot::*`, `std::sync::*`), lock levels, the
+//! initialisation order inside `SharedVm::new`, and every acquisition site
+//! are identical modulo the extra path segment. Access is
+//! `shared.<realm>.<field>`.
 //!
 //! # Realms and the lock hierarchy
 //!
 //! The realms are declared on `SharedVm` in **descending lock-level order**,
-//! so the L10..L0 hierarchy is visible in the struct layout:
+//! so the L10..L0 hierarchy of [`crate::runtime::lock_order`] is visible in
+//! the struct layout rather than buried in an 800-line field list:
 //!
-//! | Realm           | Accessor  | Lock levels owned | Notes |
-//! |-----------------|-----------|-------------------|-------|
-//! | [`ClassRealm`]  | `classes` | L10               | `class_manager` is the `OrderedPlRwLock` at [`LockLevel::ClassManager`] |
-//! | [`NativeRealm`] | `natives` | L9, L2            | `native_methods` (L9; a bare registry, immutable after `SharedVm::new`, so no lock instance), `native_memory` (L2) |
-//! | [`HeapRealm`]   | `gc`      | L8, L7, L3        | heap interior locks (L8, defined in `cratonvm-gc`), `ref_processor` (L7 `OrderedPlMutex`), `cleaner_thread.pending_actions` (L3) |
-//! | [`ThreadRealm`] | `threads` | L6, L5            | `monitors` (L6), `thread_registry` (L5) |
-//! | [`JitRealm`]    | `jit`     | —                 | compile-time state; holds no level in the hierarchy |
-//! | [`DebugRealm`]  | `debug`   | L4                | `flight_recorder` (L4) |
+//! | Realm           | Accessor  | Fields | Lock levels owned |
+//! |-----------------|-----------|-------:|-------------------|
+//! | [`ClassRealm`]  | `classes` |     23 | **L10** — `class_manager` is the `OrderedPlRwLock` at [`LockLevel::ClassManager`] |
+//! | [`NativeRealm`] | `natives` |      6 | **L9** (`native_methods` — reserved; a bare registry, immutable after `SharedVm::new`, so no lock instance), **L2** (`native_memory`) |
+//! | [`HeapRealm`]   | `mem`     |     19 | **L8** (`heap` interior locks, defined in `cratonvm-gc`, not yet wrapped), **L7** (`ref_processor`, `OrderedPlMutex`), **L3** (`cleaner_thread.pending_actions`) |
+//! | [`ThreadRealm`] | `threads` |      7 | **L6** (`monitors`), **L5** (`thread_registry`) |
+//! | [`DebugRealm`]  | `debug`   |     12 | **L4** (`flight_recorder`) |
+//! | [`JitRealm`]    | `jit`     |      9 | — compile-time state; holds no level in the hierarchy |
 //!
 //! [`LockLevel::ClassManager`]: crate::runtime::lock_order::LockLevel::ClassManager
 //!
-//! The grouping is *descriptive*, not enforcing. The levels are still
-//! asserted at runtime by the ordered-lock wrappers in
-//! [`crate::runtime::lock_order`], and splitting the struct does not by
-//! itself prevent an inversion. What it does buy is that "which realm owns
-//! which level" is now a one-line answer instead of an 800-line struct read,
-//! and that a cross-realm acquisition is syntactically visible at the call
-//! site (`shared.classes.…` under `shared.threads.…`) rather than hidden
-//! behind two same-looking `shared.<field>` accesses.
+//! ## How structural is this?
+//!
+//! Honestly: *descriptive, not enforcing*. Splitting the struct does not by
+//! itself make an inversion unrepresentable — the levels are still asserted
+//! at runtime by the ordered-lock wrappers in
+//! [`crate::runtime::lock_order`], and that remains the mechanism that
+//! catches a violation.
+//!
+//! What the split does buy:
+//!
+//! * "which realm owns which level" is a one-line answer, and the answer is
+//!   checked against the declaration order of `SharedVm` every time someone
+//!   reads it;
+//! * a *cross-realm* acquisition is now syntactically visible at the call
+//!   site — `shared.classes.class_manager.write()` inside a
+//!   `shared.threads.monitors` critical section reads as two different
+//!   subsystems, where previously both were indistinguishable
+//!   `shared.<field>` accesses;
+//! * the realms are the natural unit at which to add level-typed wrappers
+//!   later: each realm owns a contiguous band of the hierarchy, so a future
+//!   `impl ClassRealm { fn with_classes<R>(…) }`-style API could enforce
+//!   entry order per realm instead of per field.
+//!
+//! Making the hierarchy *statically* unrepresentable-if-violated would need
+//! level-indexed capability tokens threaded through every acquisition, which
+//! is a much larger change than this restructuring and is deliberately not
+//! attempted here.
 
 pub mod class_realm;
 pub mod debug_realm;
