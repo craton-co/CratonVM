@@ -195,25 +195,85 @@ numbers up to N = 2²⁸, kernel sources, and eligibility rules — are in
 > that is how the layout-registry win was measured — but say so when reporting,
 > and never quote an LTO=off absolute against a baseline.
 
-> **⚠ OPEN: the gate fails on an unmodified checkout, and build config does not
-> account for it.** On 2026-07-25 an unmodified `dev` failed 4 of 7 phases
-> (sieve, hashmap, stringregex, bintrees); arithmetic/fib/matrix passed. The
-> first hypothesis was that this was just the LTO=off build above — **the A/B
-> disproves that.** Even with fat LTO the gap remains: hashmap ~26200 ms against
-> a 4515 ms budget (**5.8x**), sieve ~9550 vs 6090 (1.6x), bintrees ~2260 vs
-> 1627 (1.4x).
+> **⚠ OPEN: 4 of the 7 baselines are not reproducible from the commit they were
+> anchored at. It is NOT host load and NOT a regression.** Resolved 2026-07-25 on
+> the Azure EPYC host; both earlier candidate explanations are refuted by
+> measurement.
 >
-> Two candidate explanations remain and have not been separated:
-> 1. **Host load.** These runs sat at load 6-7 with several sessions building.
->    The gate refuses to measure above 2.0 for exactly this reason, and the
->    within-arm spread above shows why. Nobody has re-measured on a quiet host.
-> 2. **A real regression** accumulated since the baselines were taken
->    (2026-07-24 — one day before these measurements).
+> **Not host load.** The gate was run at its documented defaults (cpu 13, `-Xmx8g`,
+> median of 5) on a genuinely quiet host — 1-min load 1.10, every core idle in
+> `mpstat`, zero competing benchmarks. The same 4 phases still fail, and the
+> run-to-run spread collapses from the 33% seen under load to **under 1%**
+> (hashmap: 22289/22312/22240/22317/22439 ms), which is itself the proof the host
+> was quiet:
 >
-> hashmap is the one to attack first: 5.8x is a lot to pin on load, and it is the
-> only phase fat LTO did not move at all. **Do not re-anchor these baselines to
-> make the gate go green** — that erases the signal. Measure on a quiet host and
-> find out which explanation is true.
+> | phase | quiet median | budget | verdict |
+> |---|---|---|---|
+> | arithmetic | 4067 ms | 4935 | PASS |
+> | fib | 4442 ms | 4672 | PASS |
+> | matrix | 2859 ms | 5985 | PASS |
+> | sieve | 11655 ms | 6090 | **FAIL 1.9x** |
+> | hashmap | 22312 ms | 4515 | **FAIL 4.9x** |
+> | stringregex | 457 ms | 173 | **FAIL 2.6x** |
+> | bintrees | 2023 ms | 1627 | **FAIL 1.24x** |
+>
+> That arithmetic/fib/matrix *pass* — matrix by 2x — on the very same runs proves
+> the core is delivering full throughput. Uniform CPU starvation cannot produce a
+> pass/fail split that is stable across load levels.
+>
+> **Not a regression.** `e57f0bc7d` (the commit the baselines were anchored at)
+> was built with fat LTO and run interleaved against `58c9b643c` on an idle core.
+> It fails the *same* 4 phases with statistically identical numbers — anchor
+> hashmap 26350 vs dev 26075, anchor stringregex 463 vs dev 468. Where the two
+> differ, **dev is faster**: bintrees 2101 vs 2895 (−27%), sieve 9029 vs 11597
+> (−22%), i.e. the layout-registry/inline-TLAB work is measurably paying off.
+> There is no regression to bisect.
+>
+> **Therefore the baselines themselves are wrong for these 4 rows.** They are
+> marked `provisional` and were recorded as *"pair-1 best"* — a best-of, not a
+> median — and evidently came from a different measurement series than the gate
+> performs. hashmap in particular is ~22.3 s under *every* methodology tried
+> (isolated cold, all-phase warm in-process at 23.5 s, `-Xmx8g` and `-Xmx2g`), at
+> *both* commits. Nothing reproduces 4237 ms.
+>
+> **Do not re-anchor these baselines just to make the gate go green** — but note
+> the reason has changed: the open question is no longer "is dev slow?" (it is
+> not) but "where did 4237/5800/165/1550 come from, and on what?". Re-anchoring
+> requires answering that first, under the README's evidence-doc policy. The
+> `anchored` bintrees row is the one with a real evidence doc
+> (`bt18-inline-tlab-regression-20260724.md`, 1527–1533 ms); at 2023 ms quiet it
+> is 1.24x off its own doc and is the most tractable thread to pull.
+>
+> **Where hashmap's 22 s actually goes** (perf, `-F 199`, quiet core): it is not
+> the layout registry that `994a543bf` fixed for bintrees — that symbol does not
+> appear. The profile is *entirely interpreter dispatch into the synthetic native
+> collections*: `NativeMethodRegistry::find` 8.3%, the synthetic HashMap engine
+> (`DenseIntEntries::note_fresh_insert` + `try_hm_int_fast_put`) 9.7%,
+> `execute_invokestatic`/`execute_invoke_kind`/`resolve_method_metadata` ~11%, the
+> per-call native-vs-bytecode policy checks
+> (`synthetic_stub_should_yield_to_real_bytecode` +
+> `should_force_registered_native_over_bytecode`) 5.2%, `OrderedPlRwLock::read`
+> 2.6%. `hashMapPutGet` is entered *once* with two 10M-iteration loops, so
+> invocation-count tier-up can never fire on it.
+>
+> **~10% of hashmap CPU is pure waste in `getenv`** (`std::sys::env::unix::getenv`
+> 4.9% + `_var_os` 2.0% + libc `getenv` 1.6% + `_var` 1.6%). Two uncached probes
+> sit on per-operation paths, both predating the anchor (added 2026-07-21), so
+> they are long-standing rather than new:
+> - `vm/src/vm/vm_exec.rs:8828` — `std::env::var_os("CRATONVM_INVOKE_VIRTUAL_ENTRY_TRACE").is_some() && method_name == "…"`
+>   on every `invokevirtual` entry. The `getenv` is evaluated *before* the cheap
+>   string compare; swapping the operands (or caching in `env_cache`) is a
+>   one-line fix.
+> - `vm/src/vm/vm_exec.rs:5254` — a String-allocating `std::env::var("CRATONVM_DBG_ARRLEN")`
+>   per `array_length` miss.
+>
+> **Methodology warning for whoever picks this up:** the gate's default pin is
+> **cpu 13**, and concurrent sessions on this shared host run their own
+> CratonBench pinned to the same cpu 13. Two benchmarks then timeshare one core
+> while `mpstat` shows 14 other cores idle — contention far worse than the 1-min
+> load average suggests, and `--max-load` does not catch it. Check
+> `taskset -cp <pid>` on any competing `CratonBench` and use `--cpu N` on a
+> verified-idle core, or wait for `pgrep -f CratonBench` to come back empty.
 
 ```bash
 # Build. Fat LTO — required for baseline-comparable numbers.
