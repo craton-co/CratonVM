@@ -40,10 +40,9 @@ fall back on if the unified harness goes missing again:
 | `QuickBenchLong2.java` | arithmetic / fib / sieve / matrix kernels | (printed) |
 | `BinT.java`, `IntrinsicBench.java`, `HmSemanticsProbe.java` | targeted probes | (printed) |
 
-Rebuilding a unified `CratonBench` harness plus the gate script is tracked
-work. Until then, use the per-kernel files above and compare **before/after on
-one host with one binary pair**, which is the methodologically sound comparison
-regardless of harness.
+Whichever harness you use, compare **before/after on one host with one binary
+pair**. That is the methodologically sound comparison regardless of harness, and
+on this shared box it is often the only trustworthy one.
 
 ### Methodology
 
@@ -195,25 +194,163 @@ numbers up to N = 2²⁸, kernel sources, and eligibility rules — are in
 > that is how the layout-registry win was measured — but say so when reporting,
 > and never quote an LTO=off absolute against a baseline.
 
-> **⚠ OPEN: the gate fails on an unmodified checkout, and build config does not
-> account for it.** On 2026-07-25 an unmodified `dev` failed 4 of 7 phases
-> (sieve, hashmap, stringregex, bintrees); arithmetic/fib/matrix passed. The
-> first hypothesis was that this was just the LTO=off build above — **the A/B
-> disproves that.** Even with fat LTO the gap remains: hashmap ~26200 ms against
-> a 4515 ms budget (**5.8x**), sieve ~9550 vs 6090 (1.6x), bintrees ~2260 vs
-> 1627 (1.4x).
+> **⚠ OPEN: 4 of the 7 baselines are not reproducible from the commit they were
+> anchored at. It is NOT host load and NOT a regression.** Resolved 2026-07-25 on
+> the Azure EPYC host; both earlier candidate explanations are refuted by
+> measurement.
 >
-> Two candidate explanations remain and have not been separated:
-> 1. **Host load.** These runs sat at load 6-7 with several sessions building.
->    The gate refuses to measure above 2.0 for exactly this reason, and the
->    within-arm spread above shows why. Nobody has re-measured on a quiet host.
-> 2. **A real regression** accumulated since the baselines were taken
->    (2026-07-24 — one day before these measurements).
+> **Not host load.** The gate was run at its documented defaults (cpu 13, `-Xmx8g`,
+> median of 5) on a genuinely quiet host — 1-min load 1.10, every core idle in
+> `mpstat`, zero competing benchmarks. The same 4 phases still fail, and the
+> run-to-run spread collapses from the 33% seen under load to **under 1%**
+> (hashmap: 22289/22312/22240/22317/22439 ms), which is itself the proof the host
+> was quiet:
 >
-> hashmap is the one to attack first: 5.8x is a lot to pin on load, and it is the
-> only phase fat LTO did not move at all. **Do not re-anchor these baselines to
-> make the gate go green** — that erases the signal. Measure on a quiet host and
-> find out which explanation is true.
+> | phase | quiet median | budget | verdict |
+> |---|---|---|---|
+> | arithmetic | 4067 ms | 4935 | PASS |
+> | fib | 4442 ms | 4672 | PASS |
+> | matrix | 2859 ms | 5985 | PASS |
+> | sieve | 11655 ms | 6090 | **FAIL 1.9x** |
+> | hashmap | 22312 ms | 4515 | **FAIL 4.9x** |
+> | stringregex | 457 ms | 173 | **FAIL 2.6x** |
+> | bintrees | 2023 ms | 1627 | **FAIL 1.24x** |
+>
+> That arithmetic/fib/matrix *pass* — matrix by 2x — on the very same runs proves
+> the core is delivering full throughput. Uniform CPU starvation cannot produce a
+> pass/fail split that is stable across load levels.
+>
+> **Not a regression.** `e57f0bc7d` (the commit the baselines were anchored at)
+> was built with fat LTO and run interleaved against `58c9b643c` on an idle core.
+> It fails the *same* 4 phases with statistically identical numbers — anchor
+> hashmap 26350 vs dev 26075, anchor stringregex 463 vs dev 468. Where the two
+> differ, **dev is faster**: bintrees 2101 vs 2895 (−27%), sieve 9029 vs 11597
+> (−22%), i.e. the layout-registry/inline-TLAB work is measurably paying off.
+> There is no regression to bisect.
+>
+> **Therefore the baselines themselves are wrong for these 4 rows.** They are
+> marked `provisional` and were recorded as *"pair-1 best"* — a best-of, not a
+> median — and evidently came from a different measurement series than the gate
+> performs. hashmap in particular is ~22.3 s under *every* methodology tried
+> (isolated cold, all-phase warm in-process at 23.5 s, `-Xmx8g` and `-Xmx2g`), at
+> *both* commits. Nothing reproduces 4237 ms.
+>
+> **Do not re-anchor these baselines just to make the gate go green** — but note
+> the reason has changed: the open question is no longer "is dev slow?" (it is
+> not) but "where did 4237/5800/165/1550 come from, and on what?". Re-anchoring
+> requires answering that first, under the README's evidence-doc policy. The
+> `anchored` bintrees row is the one with a real evidence doc
+> (`bt18-inline-tlab-regression-20260724.md`, 1527–1533 ms); at 2023 ms quiet it
+> is 1.24x off its own doc and is the most tractable thread to pull.
+>
+> **Where hashmap's 22 s actually goes** (perf, `-F 199`, quiet core): it is not
+> the layout registry that `994a543bf` fixed for bintrees — that symbol does not
+> appear. The profile is *entirely interpreter dispatch into the synthetic native
+> collections*: `NativeMethodRegistry::find` 8.3%, the synthetic HashMap engine
+> (`DenseIntEntries::note_fresh_insert` + `try_hm_int_fast_put`) 9.7%,
+> `execute_invokestatic`/`execute_invoke_kind`/`resolve_method_metadata` ~11%, the
+> per-call native-vs-bytecode policy checks
+> (`synthetic_stub_should_yield_to_real_bytecode` +
+> `should_force_registered_native_over_bytecode`) 5.2%, `OrderedPlRwLock::read`
+> 2.6%. `hashMapPutGet` is entered *once* with two 10M-iteration loops, so
+> invocation-count tier-up can never fire on it.
+>
+> **~11% of hashmap CPU was pure waste in `getenv` — now FIXED** (−13.1% on
+> hashmap, −15.4% on stringregex; see the note below this one).
+>
+> **Methodology warning for whoever picks this up:** the gate's default pin is
+> **cpu 13**, and concurrent sessions on this shared host run their own
+> CratonBench pinned to the same cpu 13. Two benchmarks then timeshare one core
+> while `mpstat` shows 14 other cores idle — contention far worse than the 1-min
+> load average suggests, and `--max-load` does not catch it. Check
+> `taskset -cp <pid>` on any competing `CratonBench` and use `--cpu N` on a
+> verified-idle core, or wait for `pgrep -f CratonBench` to come back empty.
+
+> **✅ FIXED 2026-07-25: 130 million `getenv` calls per hashmap run.**
+> −13.1% on hashmap, −15.4% on stringregex, neutral elsewhere.
+>
+> **How it was found — and how the first attempt got it wrong.** A sampled
+> `perf` profile showed ~11% of the hashmap phase in the `getenv` family. A
+> `--call-graph=dwarf` profile attributed it to `invoke_on_class_shared_inner`,
+> which pointed at an uncached `CRATONVM_INVOKE_VIRTUAL_ENTRY_TRACE` probe on
+> the `invokevirtual` path. **That attribution was wrong** — the dwarf stacks
+> only resolved ~15% of samples, and caching that flag produced *no measurable
+> change* (hashmap 25444 → 25536 ms, i.e. nothing). Do not trust partial dwarf
+> unwinds on this binary; it is built `debug = "line-tables-only"` with no frame
+> pointers.
+>
+> **What actually worked** was an `LD_PRELOAD` shim that intercepts `getenv` and
+> tallies calls *by variable name* — no unwinding, no sampling, exact counts.
+> Over one hashmap run (10M put/get) it recorded **~130,000,000 calls, ≈13 per
+> benchmark iteration**:
+>
+> | calls | variable |
+> |---:|---|
+> | 60,008,062 | `CRATONVM_DBG_LOADER_TRACE` |
+> | 20,001,011 | `CRATONVM_DBG_MH_STACK` |
+> | 20,001,011 | `CRATONVM_DBG_MH_ADAPTER` |
+> | 20,001,005 | `CRATONVM_DBG_STACKLESS` |
+> | 10,002,013 | `CRATONVM_DBG_H2TRACE` |
+>
+> All were uncached `std::env::var`/`var_os` probes on the `new` opcode and
+> `try_stackless_invoke` paths (~40 call sites, `CRATONVM_DBG_LOADER_TRACE`
+> alone had 33). `getenv` takes the process environ lock and linearly scans
+> environ, so each one is far from free. Most had the env probe as the **left**
+> operand of an `&&` whose right operand is a cheap string compare, so the
+> `getenv` ran unconditionally and the cheap test could never short-circuit it.
+>
+> Fix: cached predicates in `vm/src/runtime/env_cache.rs` (`cached_is_set!` /
+> `cached_is_ok!`, the idiom already used for ~80 other flags) plus local
+> `OnceLock` helpers in `native-builtins`, which cannot reach the vm crate.
+> Total `getenv` calls per hashmap run: **130,000,000 → ~8,000**.
+>
+> Measured interleaved on a quiet host, same base commit, both arms fat-LTO,
+> with `arithmetic` as an unaffected control:
+>
+> | phase | before | after | delta |
+> |---|---|---|---|
+> | hashmap | 21961 ms | 19078 ms | **−13.1%** |
+> | stringregex | 462 ms | 391 ms | **−15.4%** |
+> | bintrees | 1988 ms | 2000 ms | ~0 |
+> | arithmetic (control) | 4098 ms | 4078 ms | ~0 |
+>
+> This does **not** close any gate phase — hashmap is still ~4.2x over a budget
+> that nothing reproduces. It is an independent, real win on the interpreter's
+> native-invoke path.
+>
+> **Generalisable lesson:** when a profile says "time is in `getenv`" (or any
+> libc leaf), an `LD_PRELOAD` counting shim identifies the culprit by *name* in
+> one run and cannot be fooled by missing unwind info. Reach for it before
+> trusting a call-graph attribution.
+
+> **bintrees 1.24x: investigated, NOT the bt18 regression.** The `anchored`
+> 1550 row derives from `binarytrees-half-gap-20260718.md`'s 1468 ms, and
+> `bt18-inline-tlab-regression-20260724.md` verified the fix at 1527–1533 ms.
+> Quiet-host measurement is ~1990–2200 ms. All of the bt18 doc's own acceptance
+> criteria still hold on current dev, so the regression it describes has **not**
+> recurred:
+> - **single** young GC cycle under `CRATONVM_DBG_GCPHASE=1` (the doc's
+>   "method of record"; the regressed state showed two), checksum `68332206`;
+> - `CRATONVM_NO_JIT_INLINE_TLAB_NEW=1` → 5884 ms vs 1988 ms default (**2.96x**),
+>   so the inline TLAB `new` fast path is active and carrying its weight;
+> - `CRATONVM_NO_JIT_INLINE_PUTFIELD=1` → 4973 ms vs 1988 ms (**2.5x**), so the
+>   inline constructor stores are being emitted — this is exactly the "regains a
+>   measurable delta" check the doc asks for.
+>
+> Nor is it a harness-transfer artifact: the CratonBench `bintrees` phase and
+> the standalone `bench/BinTreesClassic.java` the 1468 ms number came from are
+> **byte-identical kernels**, and measured head-to-head on the same binary they
+> agree — 2204 ms vs 2152 ms. The original harness no longer reproduces its own
+> recorded number either.
+>
+> Also refuted: memory fragmentation / transparent huge pages. Despite the host
+> showing 96% compaction failure after 3 days uptime, the running VM's heap is
+> `AnonHugePages: 1912832 kB` of `Anonymous: 1914180 kB` — **99.93% huge-page
+> backed** — so TLB pressure is not the mechanism.
+>
+> bintrees therefore joins the other three rows: in the documented fixed state,
+> with the optimisations verifiably active, measuring ~1.3x its recorded number
+> for reasons not yet explained by code, load, harness, heap size, or paging.
 
 ```bash
 # Build. Fat LTO — required for baseline-comparable numbers.

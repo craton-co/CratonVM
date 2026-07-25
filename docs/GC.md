@@ -143,6 +143,9 @@ mark), BinaryTrees (deep recursion). Always diff against a real JDK run.
 | `CRATONVM_G1_NO_EVAC_RETRY=1` | Disable the evacuation-failure drain (bisection) |
 | `CRATONVM_G1_PARALLEL_EVAC=1` | Opt-in parallel young evacuator (known race — testing only) |
 | `CRATONVM_DBG_GC_STRESS=<bytes>` | Force young GCs every N allocated bytes (Generational) |
+| `CRATONVM_GC_PAR_THREADS=<n>` | Generational young-GC worker count. `0`/`1` forces the sequential collector; `>= 2` forces that many workers regardless of heap size. Unset = `min(available_parallelism, 8)` once the young gen passes the size floor. `available_parallelism` follows CPU affinity, so a `taskset -c N` run is automatically sequential |
+| `CRATONVM_GC_PAR_MIN_BYTES=<bytes>` | Young-gen size floor below which the young GC stays sequential (default 16 MiB) |
+| `CRATONVM_GC_SWEEP_ANCHOR_STRIDE=<bytes>` | Byte spacing of the parallel-sweep anchors (default 8 MiB). Lower it to drive the parallel sweep on a small young gen under `CRATONVM_DBG_GC_STRESS` |
 
 Note: `tracing::debug!` is compiled out of release builds
 (`release_max_level_info`); for cycle-phase confirmation attach gdb to
@@ -160,7 +163,21 @@ collection's copy-time budget), `-XX:MaxHeapSize`,
 **Generational.** Young is a pair of semi-spaces with TLAB bump
 allocation; while any thread holds a JIT frame the young collection is a
 non-moving sweep with selective promotion (this is the load-bearing
-reason conservative JIT roots are safe here). Old gen is a free-list
+reason conservative JIT roots are safe here). That default young
+collection is PARALLEL in two phases. The transitive closure is drained
+by several workers over a lock-free mark bitmap (one bit per 8 bytes of
+from-space) — sound because the phase is pure and read-only on a frozen
+heap and the only write is an atomic bit claim. The sweep walk, a linear
+header chase that is inherently sequential, is split at anchors the
+mark phase's exact-base oracle walk records for free: every offset that
+walk parsed an object at is a verified grid position, and nothing
+allocates, frees or resizes an object between the two walks. Each chunk
+re-proves its own anchor by requiring its chain to land exactly on the
+next one, and the parallel walker writes nothing — on any grid anomaly
+it is abandoned wholesale and the untouched sequential walk (which owns
+every diagnostic and the unwind/re-anchor recovery) runs from scratch.
+Parallel EVACUATION does not exist here and must wait for the moving
+young gen to be fixed (`docs/known-issues/moving-young-gen-drops-jit-held-oops.md`). Old gen is a free-list
 allocator collected by a VM-driven concurrent cycle (initial mark STW →
 concurrent trace → remark STW → concurrent sweep, with a remark-time
 TAMS snapshot gating the sweep).

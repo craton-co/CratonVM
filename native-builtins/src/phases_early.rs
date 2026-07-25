@@ -16874,7 +16874,7 @@ pub(crate) fn register_phase54_atomics(r: &mut NativeMethodRegistry) {
     r.register(ar, "get", "()Ljava/lang/Object;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let v = ctx.get_field_volatile(this, 0);
-        if std::env::var_os("CRATONVM_DBG_LOADER_TRACE").is_some() {
+        if loader_trace_enabled() {
             if let Value::Object(Some(o)) = v {
                 let cid = ctx.class_id_of_object(o);
                 let cn = ctx.class_name_of_id(cid).unwrap_or_default();
@@ -16890,7 +16890,7 @@ pub(crate) fn register_phase54_atomics(r: &mut NativeMethodRegistry) {
     });
     r.register(ar, "set", "(Ljava/lang/Object;)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        if std::env::var_os("CRATONVM_DBG_LOADER_TRACE").is_some() {
+        if loader_trace_enabled() {
             if let Value::Object(Some(o)) = args[1] {
                 let cid = ctx.class_id_of_object(o);
                 let cn = ctx.class_name_of_id(cid).unwrap_or_default();
@@ -16932,7 +16932,7 @@ pub(crate) fn register_phase54_atomics(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let ok = ctx.compare_and_swap_field(this, 0, args[1], args[2]);
-            if std::env::var_os("CRATONVM_DBG_LOADER_TRACE").is_some() {
+            if loader_trace_enabled() {
                 if let Value::Object(Some(o)) = args[2] {
                     let cid = ctx.class_id_of_object(o);
                     let cn = ctx.class_name_of_id(cid).unwrap_or_default();
@@ -21368,4 +21368,13 @@ mod t2_tests {
         assert!(pkcs7_unpad(&[]).is_err());
         assert!(pkcs7_unpad(&[1, 2, 3]).is_err()); // not a multiple of 16
     }
+}
+
+/// PERF (2026-07-25): `CRATONVM_DBG_LOADER_TRACE` was probed with an uncached
+/// `std::env::var_os` at every call site. `getenv` takes the process environ
+/// lock and linearly scans environ; an LD_PRELOAD tally over the CratonBench
+/// `hashmap` phase counted 60M probes of this one flag. Read once, then reuse.
+fn loader_trace_enabled() -> bool {
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| std::env::var_os("CRATONVM_DBG_LOADER_TRACE").is_some())
 }

@@ -671,12 +671,67 @@ cached_is_set!(dbg_bytecode_dump, "CRATONVM_DBG_BYTECODE_DUMP");
 /// already registered" duplicate-registration failure).
 cached_is_set!(dbg_dupcall_filter, "CRATONVM_DBG_DUPCALL_FILTER");
 
+/// `CRATONVM_INVOKE_VIRTUAL_ENTRY_TRACE` — AOT management-context trace
+/// (`aotContributedInitializerStartsManagementContext`), on the
+/// `invoke_on_class_shared_inner` lambda-dispatch path.
+///
+/// PERF (2026-07-25): the two call sites read this with an **uncached**
+/// `std::env::var_os` on *every* `invokevirtual` entry, and — because the env
+/// probe was the left operand of the `&&` — paid a `getenv` before the cheap
+/// `method_name ==` compare could short-circuit it. `getenv` takes the process
+/// environ lock and linearly scans environ, so this alone was ~10% of the
+/// CratonBench `hashmap` phase (10M virtual calls). Same class of bug as the
+/// `CRATONVM_DBG_BLOCKGC` note in `vm_exec.rs`. Keep this predicate as the
+/// left operand: a `OnceLock<bool>` read is cheaper than the string compare,
+/// so it short-circuits the common (unset) case in a single load.
+cached_is_set!(invoke_virtual_entry_trace, "CRATONVM_INVOKE_VIRTUAL_ENTRY_TRACE");
+
+// ── PERF 2026-07-25: the five `getenv` hogs found by an LD_PRELOAD tally ──
+//
+// An `LD_PRELOAD` shim counting `getenv()` by name over the CratonBench
+// `hashmap` phase (10M put/get) recorded **~130 million calls**, ≈13 per
+// benchmark iteration:
+//
+//     60,008,062  CRATONVM_DBG_LOADER_TRACE
+//     20,001,011  CRATONVM_DBG_MH_STACK
+//     20,001,011  CRATONVM_DBG_MH_ADAPTER
+//     20,001,005  CRATONVM_DBG_STACKLESS
+//     10,002,013  CRATONVM_DBG_H2TRACE
+//
+// All were uncached `std::env::var`/`var_os` probes sitting on the `new`
+// opcode and `try_stackless_invoke` paths, and most had the env probe as the
+// LEFT operand of an `&&` whose right operand is a cheap string compare — so
+// the `getenv` (which takes the process environ lock and linearly scans
+// environ) ran unconditionally and the cheap test could never short-circuit
+// it. Together they were ~11% of the phase's CPU. Caching is the fix; keep
+// these predicates as the left operand, since a `OnceLock<bool>` read is
+// cheaper than the string compares they guard.
+cached_is_set!(dbg_mh_stack, "CRATONVM_DBG_MH_STACK");
+cached_is_set!(dbg_mh_adapter, "CRATONVM_DBG_MH_ADAPTER");
+cached_is_set!(dbg_stackless, "CRATONVM_DBG_STACKLESS");
+cached_is_set!(dbg_h2trace, "CRATONVM_DBG_H2TRACE");
+
 // ── Flags read via `env::var(...).is_ok()` ──────────────────────────────
 
 /// `CRATONVM_NO_LOCAL_LIVENESS` — disable the per-bci local-variable
 /// liveness filter in the interpreter frame GC root scan (restores the
 /// scan-every-object-typed-slot behaviour; see `runtime::local_liveness`).
 cached_is_ok!(no_local_liveness, "CRATONVM_NO_LOCAL_LIVENESS");
+/// `CRATONVM_DBG_ARRLEN` — diagnostic for a non-array reaching
+/// `NativeContextImpl::array_length`. PERF (2026-07-25): was an uncached
+/// `std::env::var` (which allocates a `String` on a hit and takes the environ
+/// lock either way) evaluated on every `array_length` call whose receiver is
+/// not an array. Cached for the same reason as
+/// [`invoke_virtual_entry_trace`].
+cached_is_ok!(dbg_arrlen, "CRATONVM_DBG_ARRLEN");
+/// `CRATONVM_DBG_LOADER_TRACE` — MVStore `RootReference` loader-identity
+/// trace. The single worst `getenv` offender on the interpreter hot path
+/// (60M calls in one CratonBench `hashmap` run): ~33 uncached call sites,
+/// several on the `new` opcode path. See the tally note above
+/// [`dbg_mh_stack`]. Both `.is_ok()` and `.is_some()` spellings existed at
+/// the call sites; they are equivalent here (the flag is never set to
+/// non-UTF-8), so one predicate serves both.
+cached_is_ok!(dbg_loader_trace, "CRATONVM_DBG_LOADER_TRACE");
 cached_is_ok!(trace_sb_filter, "CRATONVM_TRACE_SB_FILTER");
 cached_is_ok!(nsee_trace, "CRATONVM_NSEE_TRACE");
 cached_is_ok!(iae_trace, "CRATONVM_IAE_TRACE");

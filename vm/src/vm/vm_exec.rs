@@ -5251,7 +5251,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             // Only emit the (noisy) diagnostic when explicitly requested — the
             // `#[track_caller]` location pinpoints the offending native/opcode
             // far more reliably than the previously-broken symbolized backtrace.
-            if std::env::var("CRATONVM_DBG_ARRLEN").is_ok() {
+            if crate::runtime::env_cache::dbg_arrlen() {
                 let class_id = self.shared.mem.heap.class_id_of(obj);
                 let class_name = self
                     .shared
@@ -8442,7 +8442,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     }
 
     fn set_field_volatile(&self, obj: ObjectRef, index: usize, value: Value) {
-        if std::env::var_os("CRATONVM_DBG_LOADER_TRACE").is_some() {
+        if crate::runtime::env_cache::dbg_loader_trace() {
             if let Value::Object(Some(o)) = value {
                 let new_cid = self.shared.mem.heap.class_id_of(o);
                 let cn = self
@@ -8536,7 +8536,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             }
         });
         if swapped {
-            if std::env::var_os("CRATONVM_DBG_LOADER_TRACE").is_some() {
+            if crate::runtime::env_cache::dbg_loader_trace() {
                 if let Value::Object(Some(o)) = new_val {
                     let new_cid = self.shared.mem.heap.class_id_of(o);
                     let cn = self
@@ -8825,7 +8825,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             let proxies = self.shared.classes.lambda_proxies.read();
             proxies.get(&receiver_class_id).cloned()
         };
-        if std::env::var_os("CRATONVM_INVOKE_VIRTUAL_ENTRY_TRACE").is_some()
+        if crate::runtime::env_cache::invoke_virtual_entry_trace()
             && method_name == "aotContributedInitializerStartsManagementContext"
         {
             eprintln!(
@@ -9275,7 +9275,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 r,
             )
         } else {
-            if std::env::var_os("CRATONVM_INVOKE_VIRTUAL_ENTRY_TRACE").is_some()
+            if crate::runtime::env_cache::invoke_virtual_entry_trace()
                 && method_name == "aotContributedInitializerStartsManagementContext"
             {
                 eprintln!(

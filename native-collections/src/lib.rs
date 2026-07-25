@@ -30815,6 +30815,26 @@ pub fn gc_scan_collection_overlay_roots(roots: &mut Vec<ObjectRef>) {
     for_each_overlay_ref(true, |r| roots.push(*r));
 }
 
+/// Owner addresses that have at least one overlay key registered.
+///
+/// `gc_overlay_roots_for_collection` locks the owner index on every call and
+/// returns an empty `Vec` for an owner that has no overlay -- which is every
+/// object in a run that never touches an overlay-backed collection. A
+/// stop-the-world marker can take this set once and consult it lock-free per
+/// object, which is what makes a multi-threaded young marker viable (the
+/// per-object `Mutex` would otherwise serialise it). `None` means the index
+/// is empty, so the marker can skip the check entirely.
+pub fn gc_overlay_owner_addrs() -> Option<std::collections::HashSet<usize>> {
+    let index = overlay_owner_keys()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if index.is_empty() {
+        None
+    } else {
+        Some(index.keys().copied().collect())
+    }
+}
+
 /// Return the Rust-side references owned by one already-marked collection.
 ///
 /// On the Generational non-moving collector this is the conditional replacement

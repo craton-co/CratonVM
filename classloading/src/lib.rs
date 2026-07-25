@@ -16,6 +16,17 @@
 //! - [`bytecode_verifier`] — bytecode type-checking verification (Pass 3)
 //! - [`vtype`] — verification type lattice for Pass 3
 
+/// The class-loading slice of the process-wide typed configuration.
+///
+/// Every `CRATONVM_*` flag this crate reads is a field on
+/// [`cratonvm_types::LoaderFlags`], parsed once at first use. See
+/// `docs/internal/flag-census.md` for the inventory and
+/// `cratonvm_types::flags` for the latching rules.
+#[inline]
+pub(crate) fn loader_flags() -> &'static cratonvm_types::LoaderFlags {
+    &cratonvm_types::flags().loader
+}
+
 pub mod access_control;
 pub mod annotations;
 pub mod builtin_loaders;

@@ -41,6 +41,7 @@ use crate::numa;
 use cratonvm_types::{ClassId, ObjectRef, Value};
 
 // Re-export heap types from the shared types crate.
+use crate::gc_flags;
 use cratonvm_types::narrow_oop::{read_ref_slot, ref_element_size, write_ref_slot};
 pub use cratonvm_types::{
     array_data_size, array_data_size_checked, array_element_type_from_tag, element_byte_size,
@@ -1646,20 +1647,7 @@ pub unsafe fn read_prim_element(base: *mut u8, index: usize, et: ArrayElementTyp
 /// on the hot paths).
 #[inline]
 pub fn cell_watch_addr() -> usize {
-    static A: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *A.get_or_init(|| {
-        std::env::var("CRATONVM_DBG_WATCH_CELL")
-            .ok()
-            .and_then(|s| {
-                let s = s.trim();
-                let s = s
-                    .strip_prefix("0x")
-                    .or_else(|| s.strip_prefix("0X"))
-                    .unwrap_or(s);
-                usize::from_str_radix(s, 16).ok()
-            })
-            .unwrap_or(0)
-    })
+    crate::gc_flags().dbg_watch_cell
 }
 
 /// ES-FAIL-FAMILY-20260710 hunt: a RUNTIME-settable companion to

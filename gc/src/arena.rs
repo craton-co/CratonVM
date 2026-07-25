@@ -16,6 +16,7 @@
 /// allocator satisfy requests from holes *below* the cursor without
 /// relocating any survivor (which is what makes the collection
 /// JIT-frame-safe — see `gen_heap::sweep_young_non_moving`).
+use crate::gc_flags;
 #[derive(Debug, Clone, Copy)]
 pub struct FreeBlock {
     /// Byte offset from the start of the backing buffer.
@@ -641,7 +642,7 @@ impl Arena {
         let old_base = self.data.as_ptr();
         let old_capacity = self.data.len();
         self.data.resize(new_capacity, 0);
-        if std::env::var_os("CRATONVM_DBG_YOUNGSTATE").is_some() {
+        if gc_flags().dbg_youngstate {
             eprintln!("[youngstate] arena-grow {old_capacity} -> {new_capacity} bytes");
         }
         old_base

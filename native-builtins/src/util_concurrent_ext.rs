@@ -519,7 +519,7 @@ fn native_atomic_ref_init_value(ctx: &mut dyn NativeContext, args: &[Value]) -> 
 fn native_atomic_ref_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = unsafe_obj(args, 0).unwrap();
     let val = ctx.get_field_volatile(this, 0);
-    if std::env::var_os("CRATONVM_DBG_LOADER_TRACE").is_some() {
+    if loader_trace_enabled() {
         if let Value::Object(Some(o)) = val {
             let val_cid = ctx.class_id_of_object(o);
             let val_cn = ctx.class_name_of_id(val_cid).unwrap_or_default();
@@ -550,7 +550,7 @@ fn native_atomic_ref_cas(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     let this = unsafe_obj(args, 0).unwrap();
     let expected = args.get(1).copied().unwrap_or(Value::Object(None));
     let new_val = args.get(2).copied().unwrap_or(Value::Object(None));
-    if std::env::var_os("CRATONVM_DBG_LOADER_TRACE").is_some() {
+    if loader_trace_enabled() {
         if let Value::Object(Some(o)) = new_val {
             let val_cid = ctx.class_id_of_object(o);
             let val_cn = ctx.class_name_of_id(val_cid).unwrap_or_default();
@@ -8986,4 +8986,13 @@ mod concurrency_tests {
         );
         assert!(ok.is_ok());
     }
+}
+
+/// PERF (2026-07-25): `CRATONVM_DBG_LOADER_TRACE` was probed with an uncached
+/// `std::env::var_os` at every call site. `getenv` takes the process environ
+/// lock and linearly scans environ; an LD_PRELOAD tally over the CratonBench
+/// `hashmap` phase counted 60M probes of this one flag. Read once, then reuse.
+fn loader_trace_enabled() -> bool {
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| std::env::var_os("CRATONVM_DBG_LOADER_TRACE").is_some())
 }

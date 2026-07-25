@@ -16114,7 +16114,7 @@ fn execute_instruction(
                 resolve_class_loader_aware(shared, thread, referencing_class_id, &class_name)
                     .map_err(|e| convert_class_not_found(shared, thread, &class_name, e))?;
 
-            if std::env::var_os("CRATONVM_DBG_H2TRACE").is_some()
+            if crate::runtime::env_cache::dbg_h2trace()
                 && (class_name == "org/h2/command/Parser"
                     || class_name == "org/h2/command/ParserBase"
                     || class_name == "org/h2/command/Token")
@@ -16132,7 +16132,7 @@ fn execute_instruction(
                 );
             }
 
-            if std::env::var("CRATONVM_DBG_LOADER_TRACE").is_ok()
+            if crate::runtime::env_cache::dbg_loader_trace()
                 && class_name.contains("RootReference")
             {
                 let cm = shared.classes.class_manager.read();
@@ -17552,7 +17552,7 @@ fn lambda_proxy_satisfies(
     obj_class_id: ClassId,
     target_class_id: ClassId,
 ) -> bool {
-    let dbg_aci = std::env::var("CRATONVM_DBG_LOADER_TRACE").is_ok();
+    let dbg_aci = crate::runtime::env_cache::dbg_loader_trace();
     let proxies = shared.classes.lambda_proxies.read();
     if dbg_aci && !proxies.contains_key(&obj_class_id) {
         eprintln!(
@@ -18909,7 +18909,7 @@ fn lookup_loader_initiated(
         .read()
         .class_defined_by_loader_exact(name, loader)
     {
-        if std::env::var("CRATONVM_DBG_LOADER_TRACE").is_ok() && name.contains("RootReference") {
+        if crate::runtime::env_cache::dbg_loader_trace() && name.contains("RootReference") {
             eprintln!("[LOADER-TRACE] lookup_loader_initiated name={name} loader={loader:?} HIT class_defined_by_loader_exact id={id:?}");
         }
         return Some(id);
@@ -18921,7 +18921,7 @@ fn lookup_loader_initiated(
         .get(&loader)
         .and_then(|m| m.get(name))
         .copied();
-    if std::env::var("CRATONVM_DBG_LOADER_TRACE").is_ok() && name.contains("RootReference") {
+    if crate::runtime::env_cache::dbg_loader_trace() && name.contains("RootReference") {
         eprintln!("[LOADER-TRACE] lookup_loader_initiated name={name} loader={loader:?} initiating_resolution_cache={cache_hit:?}");
     }
     cache_hit
@@ -19059,7 +19059,7 @@ pub(crate) fn resolve_class_loader_aware(
     // (gate off / built-in loader / JDK or array name) or the loader is
     // user-defined but has not yet resolved this name. Only the latter takes the
     // cold loadClass path below; everything else resolves globally.
-    let dbg_trace = std::env::var("CRATONVM_DBG_LOADER_TRACE").is_ok()
+    let dbg_trace = crate::runtime::env_cache::dbg_loader_trace()
         && (name.contains("EnvironmentPostProcessorsFactory")
             || name.contains("CloudFoundryVcapEnvironmentPostProcessor")
             || name.contains("ManagementContextAutoConfiguration")
@@ -19243,7 +19243,7 @@ fn drive_defining_loader_load(
     if name.starts_with('[') || is_global_resolution_namespace(name) {
         return None;
     }
-    let dbg_trace = std::env::var("CRATONVM_DBG_LOADER_TRACE").is_ok()
+    let dbg_trace = crate::runtime::env_cache::dbg_loader_trace()
         && (name.contains("EnvironmentPostProcessorsFactory")
             || name.contains("CloudFoundryVcapEnvironmentPostProcessor"));
     let loader_obj_opt =
@@ -20605,7 +20605,7 @@ fn execute_invoke_kind(
         resolve_method_ref(shared, current_class_id, cp_index)?;
     let method_owner_name = Arc::clone(&method_class_name);
 
-    if std::env::var("CRATONVM_DBG_LOADER_TRACE").is_ok()
+    if crate::runtime::env_cache::dbg_loader_trace()
         && method_owner_name.contains("RootReference")
         && &*method_name == "<init>"
     {
@@ -20709,7 +20709,7 @@ fn execute_invoke_kind(
             *obj = shared.mem.heap.load_and_forward(*obj);
         }
     }
-    if std::env::var("CRATONVM_DBG_LOADER_TRACE").is_ok()
+    if crate::runtime::env_cache::dbg_loader_trace()
         && method_class_name.contains("RootReference")
         && method_name.as_ref() == "tryUpdate"
     {
@@ -20738,7 +20738,7 @@ fn execute_invoke_kind(
             args.get(1).map(describe).unwrap_or_default(),
         );
     }
-    if std::env::var("CRATONVM_DBG_LOADER_TRACE").is_ok() && &*method_name == "compareAndSetRoot" {
+    if crate::runtime::env_cache::dbg_loader_trace() && &*method_name == "compareAndSetRoot" {
         let describe = |v: &Value| -> String {
             match v {
                 Value::Object(Some(obj)) => {
@@ -20765,7 +20765,7 @@ fn execute_invoke_kind(
             args.get(2).map(describe).unwrap_or_default(),
         );
     }
-    if std::env::var("CRATONVM_DBG_LOADER_TRACE").is_ok()
+    if crate::runtime::env_cache::dbg_loader_trace()
         && method_class_name.contains("Page")
         && method_name.as_ref() == "<init>"
     {
@@ -20798,7 +20798,7 @@ fn execute_invoke_kind(
     if let Value::Object(Some(o)) = &args[0] {
         cratonvm_types::field_watch::watch(*o);
     }
-    if std::env::var("CRATONVM_DBG_LOADER_TRACE").is_ok()
+    if crate::runtime::env_cache::dbg_loader_trace()
         && method_class_name.contains("RootReference")
         && method_name.as_ref() == "<init>"
     {
@@ -22227,7 +22227,7 @@ fn execute_invoke_kind(
         None
     };
 
-    if std::env::var("CRATONVM_DBG_LOADER_TRACE").is_ok()
+    if crate::runtime::env_cache::dbg_loader_trace()
         && (invoke_class.contains("RootReference") || &*method_name == "compareAndSetRoot")
     {
         let cm = shared.classes.class_manager.read();
@@ -30768,7 +30768,7 @@ fn try_stackless_invoke(
             None
         }
     });
-    if std::env::var_os("CRATONVM_DBG_MH_STACK").is_some()
+    if crate::runtime::env_cache::dbg_mh_stack()
         && matches!(method_name, "invoke" | "invokeExact" | "invokeBasic")
     {
         eprintln!(
@@ -30777,7 +30777,7 @@ fn try_stackless_invoke(
             args.len()
         );
     }
-    if std::env::var_os("CRATONVM_DBG_MH_ADAPTER").is_some()
+    if crate::runtime::env_cache::dbg_mh_adapter()
         && method_name == "invokeExact"
         && descriptor == "(Ljava/lang/foreign/MemorySegment;Ljava/lang/foreign/MemorySegment;IILjava/lang/foreign/MemorySegment;)V"
     {
@@ -30828,7 +30828,7 @@ fn try_stackless_invoke(
             } else {
                 value
             };
-            if std::env::var_os("CRATONVM_DBG_STACKLESS").is_some() {
+            if crate::runtime::env_cache::dbg_stackless() {
                 eprintln!(
                     "[STACKLESS_RET] {}.{}{} -> {:?}",
                     class_name, method_name, descriptor, value
@@ -30868,7 +30868,7 @@ fn try_stackless_invoke(
     //    when it diverges from the name-resolved copy under loader isolation)
     //    takes precedence so the ENHANCED per-loader copy's methods dispatch
     //    instead of the un-enhanced global same-named class.
-    if std::env::var("CRATONVM_DBG_LOADER_TRACE").is_ok()
+    if crate::runtime::env_cache::dbg_loader_trace()
         && class_name.contains("RootReference")
         && method_name == "<init>"
     {
@@ -31837,7 +31837,7 @@ fn populate_invoke_cache(
         .invoke_cache
         .get(caller_class_id, cp_index, is_special)
     {
-        if std::env::var("CRATONVM_DBG_LOADER_TRACE").is_ok() {
+        if crate::runtime::env_cache::dbg_loader_trace() {
             let dbg_relevant = matches!(
                 resolve_method_ref(shared, caller_class_id, cp_index),
                 Ok((cn, ..)) if cn.contains("RootReference")
@@ -31890,7 +31890,7 @@ fn populate_invoke_cache(
     let method_name = Arc::clone(&resolved.method_name);
     let descriptor = Arc::clone(&resolved.method_descriptor);
     let num_params = resolved.num_params as usize;
-    if std::env::var("CRATONVM_DBG_LOADER_TRACE").is_ok() && class_name.contains("RootReference") {
+    if crate::runtime::env_cache::dbg_loader_trace() && class_name.contains("RootReference") {
         eprintln!(
             "[PIC-ENTRY] caller_class_id={:?} cp_index={} is_special={} class_name(cp)={} method={}{}",
             caller_class_id, cp_index, is_special, class_name, method_name, descriptor
@@ -32063,7 +32063,7 @@ fn populate_invoke_cache(
         None => return,
     };
 
-    if std::env::var("CRATONVM_DBG_LOADER_TRACE").is_ok() && class_name.contains("RootReference") {
+    if crate::runtime::env_cache::dbg_loader_trace() && class_name.contains("RootReference") {
         let cm = shared.classes.class_manager.read();
         let caller_loader = cm.get_loader_id(caller_class_id);
         let target_loader = cm.get_loader_id(target_class_id);
@@ -39239,7 +39239,7 @@ fn execute_invokevirtual_vtable_fast(
         &mut args_vec
     };
     refresh_stale_object_args(shared, args_slice);
-    if std::env::var("CRATONVM_DBG_LOADER_TRACE").is_ok() && &*method_name == "compareAndSetRoot" {
+    if crate::runtime::env_cache::dbg_loader_trace() && &*method_name == "compareAndSetRoot" {
         let describe = |v: &Value| -> String {
             match v {
                 Value::Object(Some(obj)) => {
@@ -39418,7 +39418,7 @@ fn execute_invokevirtual_cached(
 ) -> Result<CachedCallResult, MethodCallFailed> {
     let caller_class_id = thread.frames[frame_idx].class_id;
 
-    if std::env::var_os("CRATONVM_DBG_H2TRACE").is_some() {
+    if crate::runtime::env_cache::dbg_h2trace() {
         if let Ok((owner, method, descriptor, _)) =
             resolve_method_ref(shared, caller_class_id, cp_index)
         {
@@ -39453,7 +39453,7 @@ fn execute_invokevirtual_cached(
         }
     }
 
-    if std::env::var("CRATONVM_DBG_LOADER_TRACE").is_ok()
+    if crate::runtime::env_cache::dbg_loader_trace()
         && is_special
         && thread.frames[frame_idx].class_name().contains("MVMap")
     {
@@ -39674,7 +39674,7 @@ fn execute_invokevirtual_cached(
                             actual_class_id.as_u32(),
                         );
                     }
-                    if std::env::var("CRATONVM_DBG_LOADER_TRACE").is_ok()
+                    if crate::runtime::env_cache::dbg_loader_trace()
                         && (cached.class_name.contains("RootReference")
                             || cached.class_name.contains("MVMap"))
                     {
@@ -39786,7 +39786,7 @@ fn execute_invokevirtual_cached(
                         }
                         &mut args_vec
                     };
-                    if std::env::var("CRATONVM_DBG_LOADER_TRACE").is_ok()
+                    if crate::runtime::env_cache::dbg_loader_trace()
                         && cached.class_name.contains("RootReference")
                         && cached.method_name.as_ref() == "tryUpdate"
                     {
@@ -39817,7 +39817,7 @@ fn execute_invokevirtual_cached(
                         );
                     }
                     refresh_stale_object_args(shared, args_slice);
-                    if std::env::var("CRATONVM_DBG_LOADER_TRACE").is_ok()
+                    if crate::runtime::env_cache::dbg_loader_trace()
                         && cached.class_name.contains("RootReference")
                         && cached.method_name.as_ref() == "tryUpdate"
                     {
@@ -39847,7 +39847,7 @@ fn execute_invokevirtual_cached(
                             args_slice.get(1).map(describe).unwrap_or_default(),
                         );
                     }
-                    if std::env::var("CRATONVM_DBG_LOADER_TRACE").is_ok()
+                    if crate::runtime::env_cache::dbg_loader_trace()
                         && cached.method_name.as_ref() == "compareAndSetRoot"
                     {
                         let describe = |v: &Value| -> String {
@@ -40403,7 +40403,7 @@ fn execute_invokevirtual_cached(
                 }
                 &mut args_vec
             };
-            if std::env::var("CRATONVM_DBG_LOADER_TRACE").is_ok()
+            if crate::runtime::env_cache::dbg_loader_trace()
                 && cached.class_name.contains("RootReference")
                 && cached.method_name.as_ref() == "tryUpdate"
             {
@@ -40433,7 +40433,7 @@ fn execute_invokevirtual_cached(
                 );
             }
             refresh_stale_object_args(shared, args_slice);
-            if std::env::var("CRATONVM_DBG_LOADER_TRACE").is_ok()
+            if crate::runtime::env_cache::dbg_loader_trace()
                 && cached.class_name.contains("RootReference")
                 && cached.method_name.as_ref() == "tryUpdate"
             {
@@ -40462,7 +40462,7 @@ fn execute_invokevirtual_cached(
                     args_slice.get(1).map(describe).unwrap_or_default(),
                 );
             }
-            if std::env::var("CRATONVM_DBG_LOADER_TRACE").is_ok()
+            if crate::runtime::env_cache::dbg_loader_trace()
                 && cached.class_name.contains("Page")
                 && cached.method_name.as_ref() == "<init>"
             {
@@ -40495,7 +40495,7 @@ fn execute_invokevirtual_cached(
             if let Value::Object(Some(o)) = &args_slice[0] {
                 cratonvm_types::field_watch::watch(*o);
             }
-            if std::env::var("CRATONVM_DBG_LOADER_TRACE").is_ok()
+            if crate::runtime::env_cache::dbg_loader_trace()
                 && cached.class_name.contains("RootReference")
                 && cached.method_name.as_ref() == "<init>"
             {
