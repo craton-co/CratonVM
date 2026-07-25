@@ -356,14 +356,14 @@ pub fn update_all_roots(
     // Done BEFORE the empty-map early return so a non-relocating sweep also keeps
     // the cache rather than forcing a full rebuild. Opt-in/default-OFF + no-op
     // unless the rootsnap cache is enabled. See `remap_rs_cache_after_gc`.
-    crate::runtime::interpreter::remap_rs_cache_after_gc(thread, pointer_map, &shared.heap);
+    crate::runtime::interpreter::remap_rs_cache_after_gc(thread, pointer_map, &shared.mem.heap);
     // Long-smuggle mint registry: relocate registered handles through this
     // cycle's pointer map and drop entries whose referent died. BEFORE the
     // empty-map early return so non-relocating sweeps still sweep dead
     // entries (a reclaimed address must not stay registered — a future
     // primitive long colliding with the reused address would otherwise pass
     // the rewrite gate).
-    crate::memory::smuggled_longs::remap_and_sweep(pointer_map, &shared.heap);
+    crate::memory::smuggled_longs::remap_and_sweep(pointer_map, &shared.mem.heap);
     // Throwable backtraces are VM-wide, non-owning side data. Keep the stored
     // object handle in sync with a move and prune traces for collected
     // throwables before any early return for a non-relocating sweep.
@@ -371,7 +371,7 @@ pub fn update_all_roots(
     if std::env::var_os("CRATONVM_DBG_ALTRACE").is_some() {
         eprintln!(
             "[altrace GC] count={} moved={} tid={}",
-            shared.heap.collection_count(),
+            shared.mem.heap.collection_count(),
             pointer_map.len(),
             thread.thread_id.0
         );
@@ -379,7 +379,7 @@ pub fn update_all_roots(
     if pointer_map.is_empty() {
         return;
     }
-    gcpart_record(shared.heap.collection_count(), pointer_map);
+    gcpart_record(shared.mem.heap.collection_count(), pointer_map);
     crate::runtime::interpreter::remap_trace_push(
         shared,
         thread,
@@ -410,7 +410,7 @@ pub fn update_all_roots(
     // moves but main's frames are not remapped (the concurrent-spawn stale-`parent`
     // root cause). Read the mirror's CURRENT (pre-step-21) registry address.
     if std::env::var_os("CRATONVM_DBG_BUG03").is_some() {
-        let epoch = shared.heap.collection_count();
+        let epoch = shared.mem.heap.collection_count();
         let main_old = shared
             .threads
             .thread_registry
@@ -494,13 +494,15 @@ pub fn update_all_roots(
             .find_map(|(k, v)| (*v == w).then_some(*k));
         eprintln!(
             "[watch] GC#{} addr=0x{w:x} moved_to={fwd:x?} moved_from={back:x?}",
-            shared.heap.collection_count()
+            shared.mem.heap.collection_count()
         );
     }
     // 1. Thread frames — locals and operand stacks (SoA layout)
     for frame in &mut thread.frames {
-        frame.update_local_refs(pointer_map, &shared.heap);
-        frame.stack.update_object_refs(pointer_map, &shared.heap);
+        frame.update_local_refs(pointer_map, &shared.mem.heap);
+        frame
+            .stack
+            .update_object_refs(pointer_map, &shared.mem.heap);
         // Forward the synchronized-method monitor object too. A `synchronized`
         // method records the object it locked on entry in `monitor_on_exit` and
         // releases it on frame-pop. If a GC during the method body relocates
@@ -527,7 +529,7 @@ pub fn update_all_roots(
             for li in 0..fr.locals_len() {
                 if let crate::types::Value::Object(Some(o)) = fr.get_local(li as u16) {
                     let a = o.as_ptr() as usize;
-                    if let Some(new) = shared.heap.debug_forwarded_target(a) {
+                    if let Some(new) = shared.mem.heap.debug_forwarded_target(a) {
                         eprintln!(
                             "[blockgc] INITIATOR-STALE tid={} frame#{fi} {}.{} pc={} local[{li}] 0x{a:x}->0x{new:x} in_map={}",
                             thread.thread_id.0, fr.class_name(), fr.method_name(), fr.pc,
@@ -539,7 +541,7 @@ pub fn update_all_roots(
             for si in 0..fr.stack.len() {
                 if let crate::types::Value::Object(Some(o)) = fr.stack.peek_at(si) {
                     let a = o.as_ptr() as usize;
-                    if let Some(new) = shared.heap.debug_forwarded_target(a) {
+                    if let Some(new) = shared.mem.heap.debug_forwarded_target(a) {
                         eprintln!(
                             "[blockgc] INITIATOR-STALE tid={} frame#{fi} {}.{} pc={} stack[{si}] 0x{a:x}->0x{new:x} in_map={}",
                             thread.thread_id.0, fr.class_name(), fr.method_name(), fr.pc,
@@ -647,7 +649,7 @@ pub fn update_all_roots(
 
     // 5. Interned string pool
     {
-        let mut string_pool = shared.string_pool.write();
+        let mut string_pool = shared.mem.string_pool.write();
         for obj_ref in string_pool.values_mut() {
             let old_addr = obj_ref.as_ptr() as usize;
             if let Some(&new_addr) = pointer_map.get(&old_addr) {
@@ -680,7 +682,7 @@ pub fn update_all_roots(
     //     `static final` slot is remapped via the `statics` block above using
     //     the same pointer-map entry, now that the VarHandle is traced/copied).
     {
-        let mut var_handle_roots = shared.var_handle_roots.write();
+        let mut var_handle_roots = shared.mem.var_handle_roots.write();
         for obj_ref in var_handle_roots.values_mut() {
             let old_addr = obj_ref.as_ptr() as usize;
             if let Some(&new_addr) = pointer_map.get(&old_addr) {
@@ -694,12 +696,12 @@ pub fn update_all_roots(
     //     ALIVE (memory/roots.rs step 8c), but the holder is a bare
     //     `SharedVm` field no other remap step covers — without this, the
     //     first relocating GC that moves the singleton leaves
-    //     `shared.singleton_oom` dangling, and a later true OOM throws a
+    //     `shared.mem.singleton_oom` dangling, and a later true OOM throws a
     //     reclaimed/zeroed object that surfaces as the unreadable
     //     `Exception in thread "main" unknown` (observed deterministically on
     //     the SteadyChurn recreation under sustained G1 churn).
     {
-        let mut oom = shared.singleton_oom.write();
+        let mut oom = shared.mem.singleton_oom.write();
         if let Some(ref mut obj_ref) = *oom {
             let old_addr = obj_ref.as_ptr() as usize;
             if let Some(&new_addr) = pointer_map.get(&old_addr) {
@@ -1094,7 +1096,7 @@ pub fn validate_object_sizes(shared: &crate::vm::SharedVm) {
     if std::env::var_os("CRATONVM_DBG_VALIDATE_NEW").is_none() {
         return;
     }
-    let heap = &shared.heap;
+    let heap = &shared.mem.heap;
     let cm = shared.classes.class_manager.read();
     // One-shot: dump the class_id -> (name, num_total_fields) table for the
     // low class_ids that show up in the JUnitCore-corruption walks (6, 12, 34,
@@ -1178,7 +1180,7 @@ pub fn verify_heap_object_fields(
     if std::env::var_os("CRATONVM_DBG_HEAP_STALE").is_none() {
         return;
     }
-    let heap = &shared.heap;
+    let heap = &shared.mem.heap;
     let class_name = |cid: cratonvm_types::ClassId| -> String {
         shared
             .classes

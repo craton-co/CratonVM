@@ -170,7 +170,7 @@ pub fn ensure_system_stdin_object(
             .map(|c| c.num_total_fields.max(2))
             .unwrap_or(2)
     };
-    let in_obj = shared.heap.alloc_object(fis_class_id, num_fields);
+    let in_obj = shared.mem.heap.alloc_object(fis_class_id, num_fields);
     // gcstress residual face fix — pin `in_obj` across the FileDescriptor
     // class-load/clinit/alloc window below. Those calls allocate, and under
     // allocation pressure a MOVING young GC can run inside the window; this
@@ -211,7 +211,7 @@ pub fn ensure_system_stdin_object(
             return Err(e);
         }
     };
-    let fd_obj = shared.heap.alloc_object(fd_class_id, fd_num_fields);
+    let fd_obj = shared.mem.heap.alloc_object(fd_class_id, fd_num_fields);
     // End of the allocating window: re-read the (possibly remapped) pin and
     // release it. `fd_obj` was the last allocation, so it cannot go stale
     // before the writes below.
@@ -229,10 +229,10 @@ pub fn ensure_system_stdin_object(
         (fd_idx, h_idx)
     };
     if let Some(idx) = fd_field_idx {
-        shared.heap.set_field(fd_obj, idx, Value::Int(0));
+        shared.mem.heap.set_field(fd_obj, idx, Value::Int(0));
     }
     if let Some(idx) = handle_field_idx {
-        shared.heap.set_field(fd_obj, idx, Value::Long(0));
+        shared.mem.heap.set_field(fd_obj, idx, Value::Long(0));
     }
 
     // Pin the FileDescriptor object on the FIS's `fd` slot.
@@ -242,11 +242,12 @@ pub fn ensure_system_stdin_object(
     };
     if let Some(idx) = fis_fd_slot {
         shared
+            .mem
             .heap
             .set_field(in_obj, idx, Value::Object(Some(fd_obj)));
     } else {
         // Fall back to the legacy slot-1 encoding if reflection fails.
-        shared.heap.set_field(in_obj, 1, Value::Int(1));
+        shared.mem.heap.set_field(in_obj, 1, Value::Int(1));
     }
 
     *guard = Some(in_obj);
@@ -438,11 +439,11 @@ pub fn ensure_class_initialized_shared(
                     // deposit - see vm_exec.rs::monitor_enter_blocking.
                     ctx.thread.tlab.retire();
                     ctx.deposit_root_snapshot();
-                    let blk = shared.gc_barrier.enter_blocked();
+                    let blk = shared.mem.gc_barrier.enter_blocked();
                     if blk.pre_stw {
                         // GCAUDIT-0711-FIX (finding 1a): auto - the deposit
                         // above already raised in_blocked_region.
-                        let _ = shared.gc_barrier.arrive_and_wait_auto(
+                        let _ = shared.mem.gc_barrier.arrive_and_wait_auto(
                             crate::threading::jvm_thread::ThreadId(current_thread_id),
                         );
                     }
@@ -1359,7 +1360,7 @@ fn initialize_class_shared(
                 // when optional JDK/library classes have init failures due to
                 // incomplete native support.
                 let is_swallowable = if let MethodCallFailed::ExceptionThrown(exc_ref) = &e {
-                    let eid = shared.heap.class_id_of(*exc_ref);
+                    let eid = shared.mem.heap.class_id_of(*exc_ref);
                     let cm = shared.classes.class_manager.read();
                     let exc_name = cm
                         .get_class(eid)
@@ -1452,7 +1453,7 @@ fn initialize_class_shared(
                     // the class name alone on any read failure.
                     let exc_detail = match &e {
                         MethodCallFailed::ExceptionThrown(exc_ref) => {
-                            let exc_cid = shared.heap.class_id_of(*exc_ref);
+                            let exc_cid = shared.mem.heap.class_id_of(*exc_ref);
                             let exc_class = shared
                                 .classes
                                 .class_manager
@@ -1460,9 +1461,9 @@ fn initialize_class_shared(
                                 .get_class(exc_cid)
                                 .map(|c| c.name.to_string())
                                 .unwrap_or_else(|| format!("class_id={}", exc_cid.as_u32()));
-                            let msg = match shared.heap.get_field(*exc_ref, 0) {
+                            let msg = match shared.mem.heap.get_field(*exc_ref, 0) {
                                 crate::types::Value::Object(Some(s)) => {
-                                    crate::vm::vm_object::read_java_string(&shared.heap, s)
+                                    crate::vm::vm_object::read_java_string(&shared.mem.heap, s)
                                         .unwrap_or_default()
                                 }
                                 _ => String::new(),
@@ -1532,7 +1533,7 @@ fn initialize_class_shared(
                         // swallowed clinit exception so we can pinpoint where
                         // bare-NPEs originate during boot.
                         if let MethodCallFailed::ExceptionThrown(exc_ref) = &e {
-                            let h = shared.heap.identity_hash_code(*exc_ref);
+                            let h = shared.mem.heap.identity_hash_code(*exc_ref);
                             if let Some(frames) = shared.throwable_stack_trace(h) {
                                 for (i, f) in frames.iter().enumerate().take(20) {
                                     tracing::warn!(
@@ -1585,7 +1586,7 @@ fn initialize_class_shared(
                 if lenient_clinit() && crate::runtime::env_cache::strict_swallows() {
                     let exc_ty = match &e {
                         MethodCallFailed::ExceptionThrown(exc_ref) => {
-                            let eid = shared.heap.class_id_of(*exc_ref);
+                            let eid = shared.mem.heap.class_id_of(*exc_ref);
                             shared
                                 .classes
                                 .class_manager
@@ -1606,7 +1607,7 @@ fn initialize_class_shared(
                 // propagate as-is. Otherwise, wrap in ExceptionInInitializerError.
                 match &e {
                     MethodCallFailed::ExceptionThrown(exc_ref) => {
-                        let exc_class_id = shared.heap.class_id_of(*exc_ref);
+                        let exc_class_id = shared.mem.heap.class_id_of(*exc_ref);
                         let is_error = {
                             let cm = shared.classes.class_manager.read();
                             let error_id = cm.find_class_by_name("java/lang/Error");
@@ -1657,7 +1658,7 @@ fn initialize_class_shared(
                                             if &*f.name == "detailMessage" {
                                                 let idx = cls.first_field_index + inst;
                                                 if let crate::types::Value::Object(Some(s)) =
-                                                    shared.heap.get_field(*exc_ref, idx)
+                                                    shared.mem.heap.get_field(*exc_ref, idx)
                                                 {
                                                     found = Some(s);
                                                 }
@@ -1673,7 +1674,10 @@ fn initialize_class_shared(
                                     drop(cm);
                                     found
                                         .and_then(|s| {
-                                            crate::vm::vm_object::read_java_string(&shared.heap, s)
+                                            crate::vm::vm_object::read_java_string(
+                                                &shared.mem.heap,
+                                                s,
+                                            )
                                         })
                                         .unwrap_or_default()
                                 };
@@ -1686,7 +1690,7 @@ fn initialize_class_shared(
                                 // Diagnostic: dump captured stack trace from
                                 // the VM-wide Throwable trace registry so we can pinpoint where
                                 // bare-NPEs originate during boot.
-                                let h = shared.heap.identity_hash_code(*exc_ref);
+                                let h = shared.mem.heap.identity_hash_code(*exc_ref);
                                 if let Some(frames) = shared.throwable_stack_trace(h) {
                                     for (i, f) in frames.iter().enumerate().take(20) {
                                         tracing::warn!(
@@ -1731,7 +1735,7 @@ fn initialize_class_shared(
                                     // Resolve Throwable.cause field index by name
                                     let cause_idx_of =
                                         |obj: crate::types::ObjectRef| -> Option<usize> {
-                                            let mut walk = Some(shared.heap.class_id_of(obj));
+                                            let mut walk = Some(shared.mem.heap.class_id_of(obj));
                                             while let Some(k) = walk {
                                                 if let Some(cls) = cm.get_class(k) {
                                                     let mut inst = 0usize;
@@ -1757,33 +1761,34 @@ fn initialize_class_shared(
                                         let Some(ci) = cause_idx_of(cur) else {
                                             break;
                                         };
-                                        let cause_val = shared.heap.get_field(cur, ci);
+                                        let cause_val = shared.mem.heap.get_field(cur, ci);
                                         let cause_obj = match cause_val {
                                             Value::Object(Some(o)) if o != cur => o,
                                             _ => break,
                                         };
-                                        let cause_cid = shared.heap.class_id_of(cause_obj);
+                                        let cause_cid = shared.mem.heap.class_id_of(cause_obj);
                                         let cause_name = cm
                                             .get_class(cause_cid)
                                             .map(|c| c.name.to_string())
                                             .unwrap_or_default();
-                                        let cause_msg = match shared.heap.get_field(cause_obj, 0) {
-                                            Value::Object(Some(s)) => {
-                                                crate::vm::vm_object::read_java_string(
-                                                    &shared.heap,
-                                                    s,
-                                                )
-                                                .unwrap_or_default()
-                                            }
-                                            _ => String::new(),
-                                        };
+                                        let cause_msg =
+                                            match shared.mem.heap.get_field(cause_obj, 0) {
+                                                Value::Object(Some(s)) => {
+                                                    crate::vm::vm_object::read_java_string(
+                                                        &shared.mem.heap,
+                                                        s,
+                                                    )
+                                                    .unwrap_or_default()
+                                                }
+                                                _ => String::new(),
+                                            };
                                         tracing::warn!(
                                             "  [CLINIT-CAUSE depth={}] {}: {}",
                                             depth,
                                             cause_name,
                                             cause_msg,
                                         );
-                                        let ch = shared.heap.identity_hash_code(cause_obj);
+                                        let ch = shared.mem.heap.identity_hash_code(cause_obj);
                                         if let Some(frames) = shared.throwable_stack_trace(ch) {
                                             for (i, f) in frames.iter().enumerate().take(15) {
                                                 tracing::warn!(
@@ -1813,7 +1818,7 @@ fn initialize_class_shared(
                                     let cause_idx = {
                                         let cm = shared.classes.class_manager.read();
                                         let mut found: Option<usize> = None;
-                                        let mut walk = Some(shared.heap.class_id_of(eiie_ref));
+                                        let mut walk = Some(shared.mem.heap.class_id_of(eiie_ref));
                                         while let Some(k) = walk {
                                             if let Some(cls) = cm.get_class(k) {
                                                 let mut inst = 0usize;
@@ -1838,7 +1843,7 @@ fn initialize_class_shared(
                                         found
                                     };
                                     if let Some(i) = cause_idx {
-                                        shared.heap.set_field(
+                                        shared.mem.heap.set_field(
                                             eiie_ref,
                                             i,
                                             Value::Object(Some(cause_ref)),
@@ -1847,7 +1852,7 @@ fn initialize_class_shared(
                                     let _ = super::invoke_on_class_shared(
                                         shared,
                                         thread,
-                                        shared.heap.class_id_of(eiie_ref),
+                                        shared.mem.heap.class_id_of(eiie_ref),
                                         "initCause",
                                         "(Ljava/lang/Throwable;)Ljava/lang/Throwable;",
                                         &[
@@ -1958,9 +1963,12 @@ fn make_prepared_value_layout(
         .get_class(layout_class_id)
         .map(|c| c.num_total_fields.max(2))
         .unwrap_or(2);
-    let obj = shared.heap.alloc_object(layout_class_id, num_fields);
-    shared.heap.set_field(obj, 0, Value::Long(byte_size));
-    shared.heap.set_field(obj, 1, Value::Long(byte_alignment));
+    let obj = shared.mem.heap.alloc_object(layout_class_id, num_fields);
+    shared.mem.heap.set_field(obj, 0, Value::Long(byte_size));
+    shared
+        .mem
+        .heap
+        .set_field(obj, 1, Value::Long(byte_alignment));
     Some(obj)
 }
 
@@ -2401,7 +2409,7 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
             let already_initialized = unsafe_option_slot.is_some_and(|static_idx| {
                 match super::vm_object::get_static_shared(shared, class_id, static_idx) {
                     Value::Object(Some(obj)) => {
-                        let obj_class_id = shared.heap.class_id_of(obj);
+                        let obj_class_id = shared.mem.heap.class_id_of(obj);
                         let is_option = enum_class_id.is_some_and(|eid| obj_class_id == eid);
                         if !is_option {
                             tracing::warn!(
@@ -2485,7 +2493,7 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
                             if !f.is_static() {
                                 if &*f.name == field_name {
                                     drop(cm);
-                                    shared.heap.set_field(obj, instance_idx, value);
+                                    shared.mem.heap.set_field(obj, instance_idx, value);
                                     return true;
                                 }
                                 instance_idx += 1;
@@ -2509,7 +2517,7 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
                 })
             });
             if let Some((fs_class_id, fs_fields)) = fs_class {
-                if let Some(fs_obj) = shared.heap.try_alloc_object(fs_class_id, fs_fields) {
+                if let Some(fs_obj) = shared.mem.heap.try_alloc_object(fs_class_id, fs_fields) {
                     let (java_home, user_dir) = {
                         let props = shared.system_properties.read();
                         (
@@ -2589,7 +2597,7 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
         // this function is still in place — it is just a no-op for Module.
         "java/util/logging/LogManager" => {
             // LogManager.manager must be non-null for getLogManager()
-            if let Some(mgr) = shared.heap.try_alloc_object(class_id, 4) {
+            if let Some(mgr) = shared.mem.heap.try_alloc_object(class_id, 4) {
                 if set_static_by_name("manager", Value::Object(Some(mgr))) {
                     tracing::warn!("Post-clinit fixup: LogManager.manager populated");
                 }
@@ -2620,10 +2628,11 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
             };
             if let (Some(mid), Some(nid)) = (mode_impl_id, noop_id) {
                 // NoopNormalizer2 has no instance fields.
-                if let Some(noop_obj) = shared.heap.try_alloc_object(nid, 0) {
+                if let Some(noop_obj) = shared.mem.heap.try_alloc_object(nid, 0) {
                     // ModeImpl has 1 instance field: normalizer2:Normalizer2.
-                    if let Some(mode_impl) = shared.heap.try_alloc_object(mid, 1) {
+                    if let Some(mode_impl) = shared.mem.heap.try_alloc_object(mid, 1) {
                         shared
+                            .mem
                             .heap
                             .set_field(mode_impl, 0, Value::Object(Some(noop_obj)));
                         if set_static_by_name("INSTANCE", Value::Object(Some(mode_impl))) {
@@ -2674,7 +2683,7 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
             };
             if let Some(vfid) = varform_id {
                 // VarForm has 4 instance fields (see javap of VarForm).
-                if let Some(vf_obj) = shared.heap.try_alloc_object(vfid, 4) {
+                if let Some(vf_obj) = shared.mem.heap.try_alloc_object(vfid, 4) {
                     if set_static_by_name("FORM", Value::Object(Some(vf_obj))) {
                         tracing::warn!(
                             class = %class_name,
@@ -2699,7 +2708,7 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
                 cm.find_class_by_name(handler_class_name)
             };
             if let Some(hid) = handler_id {
-                if let Some(handler) = shared.heap.try_alloc_object(hid, 4) {
+                if let Some(handler) = shared.mem.heap.try_alloc_object(hid, 4) {
                     if set_static_by_name("DELAYED_HANDLER", Value::Object(Some(handler))) {
                         tracing::warn!(
                             "Post-clinit fixup: InitialConfigurator.DELAYED_HANDLER populated"
@@ -2708,7 +2717,7 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
                 }
             } else {
                 // Class not yet loaded вЂ” allocate a generic Handler stub
-                if let Some(handler) = shared.heap.try_alloc_object(class_id, 4) {
+                if let Some(handler) = shared.mem.heap.try_alloc_object(class_id, 4) {
                     if set_static_by_name("DELAYED_HANDLER", Value::Object(Some(handler))) {
                         tracing::warn!("Post-clinit fixup: InitialConfigurator.DELAYED_HANDLER populated (generic)");
                     }
@@ -2729,7 +2738,7 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
                 cm.find_class_by_name(loader_class_name)
             };
             let target_id = loader_id.unwrap_or(class_id);
-            if let Some(loader_obj) = shared.heap.try_alloc_object(target_id, 1) {
+            if let Some(loader_obj) = shared.mem.heap.try_alloc_object(target_id, 1) {
                 if set_static_by_name("INSTANCE", Value::Object(Some(loader_obj))) {
                     tracing::warn!(
                         "Post-clinit fixup: DefaultBootModuleLoaderHolder.INSTANCE populated with synthetic LocalModuleLoader"
@@ -2806,18 +2815,22 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
                     let bi = if let Some(e) = existing {
                         e
                     } else {
-                        shared.heap.try_alloc_object(class_id, num_fields)?
+                        shared.mem.heap.try_alloc_object(class_id, num_fields)?
                     };
-                    let mag_arr = shared.heap.alloc_array(
+                    let mag_arr = shared.mem.heap.alloc_array(
                         ClassId::new(0),
                         ArrayElementType::Int,
                         mag_words.len(),
                     );
                     for (i, w) in mag_words.iter().enumerate() {
-                        let _ = shared.heap.set_array_element(mag_arr, i, Value::Int(*w));
+                        let _ = shared
+                            .mem
+                            .heap
+                            .set_array_element(mag_arr, i, Value::Int(*w));
                     }
-                    shared.heap.set_field(bi, sig_i, Value::Int(signum));
+                    shared.mem.heap.set_field(bi, sig_i, Value::Int(signum));
                     shared
+                        .mem
                         .heap
                         .set_field(bi, mag_i, Value::Object(Some(mag_arr)));
                     Some(bi)
@@ -2934,19 +2947,19 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
                     0x41c21cb8e1000000,
                 ];
                 let mut radix_fixed = false;
-                if let Some(dpl_arr) = shared.heap.try_alloc_array(
+                if let Some(dpl_arr) = shared.mem.heap.try_alloc_array(
                     ClassId::new(0),
                     ArrayElementType::Int,
                     DIGITS_PER_LONG.len(),
                 ) {
                     for (i, &d) in DIGITS_PER_LONG.iter().enumerate() {
-                        let _ = shared.heap.set_array_element(dpl_arr, i, Value::Int(d));
+                        let _ = shared.mem.heap.set_array_element(dpl_arr, i, Value::Int(d));
                     }
                     if set_static_by_name("digitsPerLong", Value::Object(Some(dpl_arr))) {
                         radix_fixed = true;
                     }
                 }
-                if let Some(lr_arr) = shared.heap.try_alloc_array(
+                if let Some(lr_arr) = shared.mem.heap.try_alloc_array(
                     class_id,
                     ArrayElementType::Reference,
                     LONG_RADIX_HEX.len(),
@@ -2961,10 +2974,11 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
                             vec![(hex >> 32) as i32, (hex & 0xFFFF_FFFF) as i32]
                         };
                         if let Some(bi) = make_or_patch_bi(None, 1, &mag_words) {
-                            let _ =
-                                shared
-                                    .heap
-                                    .set_array_element(lr_arr, i, Value::Object(Some(bi)));
+                            let _ = shared.mem.heap.set_array_element(
+                                lr_arr,
+                                i,
+                                Value::Object(Some(bi)),
+                            );
                         }
                     }
                     if set_static_by_name("longRadix", Value::Object(Some(lr_arr))) {
@@ -3057,15 +3071,17 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
                 if matches!(read_static_named(name), Some(Value::Object(Some(_)))) {
                     continue;
                 }
-                let Some(obj) = shared.heap.try_alloc_object(class_id, alloc_fields) else {
+                let Some(obj) = shared.mem.heap.try_alloc_object(class_id, alloc_fields) else {
                     continue;
                 };
                 shared
+                    .mem
                     .heap
                     .set_field(obj, ordinal_idx, Value::Int(ord as i32));
                 if let Some(name_idx) = name_idx {
                     let nm = super::vm_object::create_java_string(shared, name);
                     shared
+                        .mem
                         .heap
                         .set_field(obj, name_idx, Value::Object(Some(nm)));
                 }
@@ -3080,14 +3096,14 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
                 );
             }
             if !matches!(read_static_named("$VALUES"), Some(Value::Object(Some(_)))) {
-                if let Some(values_arr) =
-                    shared
-                        .heap
-                        .try_alloc_array(class_id, ArrayElementType::Reference, NAMES.len())
-                {
+                if let Some(values_arr) = shared.mem.heap.try_alloc_array(
+                    class_id,
+                    ArrayElementType::Reference,
+                    NAMES.len(),
+                ) {
                     for (i, &name) in NAMES.iter().enumerate() {
                         if let Some(Value::Object(Some(o))) = read_static_named(name) {
-                            let _ = shared.heap.set_array_element(
+                            let _ = shared.mem.heap.set_array_element(
                                 values_arr,
                                 i,
                                 Value::Object(Some(o)),
@@ -3204,12 +3220,16 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
                 if matches!(read_static_named(name), Some(Value::Object(Some(_)))) {
                     continue;
                 }
-                let Some(obj) = shared.heap.try_alloc_object(class_id, num_fields) else {
+                let Some(obj) = shared.mem.heap.try_alloc_object(class_id, num_fields) else {
                     continue;
                 };
-                shared.heap.set_field(obj, ord_idx, Value::Int(ord as i32));
+                shared
+                    .mem
+                    .heap
+                    .set_field(obj, ord_idx, Value::Int(ord as i32));
                 let nm = super::vm_object::create_java_string(shared, name);
                 shared
+                    .mem
                     .heap
                     .set_field(obj, name_idx, Value::Object(Some(nm)));
                 if set_static_by_name(name, Value::Object(Some(obj))) {
@@ -3227,15 +3247,17 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
             // ("not an enum") even when the named static fields are populated.
             if let Some(values_arr) =
                 shared
+                    .mem
                     .heap
                     .try_alloc_array(class_id, ArrayElementType::Reference, NAMES.len())
             {
                 for (i, &name) in NAMES.iter().enumerate() {
                     if let Some(Value::Object(Some(o))) = read_static_named(name) {
-                        let _ =
-                            shared
-                                .heap
-                                .set_array_element(values_arr, i, Value::Object(Some(o)));
+                        let _ = shared.mem.heap.set_array_element(
+                            values_arr,
+                            i,
+                            Value::Object(Some(o)),
+                        );
                     }
                 }
                 if !set_static_by_name("$VALUES", Value::Object(Some(values_arr))) {
@@ -3324,11 +3346,11 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
                                scale: i32,
                                prec: i32|
                  -> Option<crate::types::ObjectRef> {
-                    let bd = shared.heap.try_alloc_object(class_id, num_fields)?;
-                    shared.heap.set_field(bd, iv_i, Value::Object(bi));
-                    shared.heap.set_field(bd, sc_i, Value::Int(scale));
-                    shared.heap.set_field(bd, pr_i, Value::Int(prec));
-                    shared.heap.set_field(bd, ic_i, Value::Long(compact));
+                    let bd = shared.mem.heap.try_alloc_object(class_id, num_fields)?;
+                    shared.mem.heap.set_field(bd, iv_i, Value::Object(bi));
+                    shared.mem.heap.set_field(bd, sc_i, Value::Int(scale));
+                    shared.mem.heap.set_field(bd, pr_i, Value::Int(prec));
+                    shared.mem.heap.set_field(bd, ic_i, Value::Long(compact));
                     Some(bd)
                 };
                 let zero_bd = make_bd(lookup_bi_static("ZERO"), 0, 0, 1);
@@ -3412,10 +3434,10 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
                     let cur = read_static(fname);
                     let needs_fix = matches!(cur, Some(Value::Object(None)) | None);
                     if needs_fix {
-                        if let Some(ai_obj) = shared.heap.try_alloc_object(aid, 1) {
+                        if let Some(ai_obj) = shared.mem.heap.try_alloc_object(aid, 1) {
                             // Initial value 1, matching SCI<clinit> bytecode
                             // (`new AtomicInteger / dup / iconst_1 / <init>(I)V`).
-                            shared.heap.set_field(ai_obj, 0, Value::Int(1));
+                            shared.mem.heap.set_field(ai_obj, 0, Value::Int(1));
                             if set_static_by_name(fname, Value::Object(Some(ai_obj))) {
                                 tracing::warn!(
                                     "Post-clinit fixup: ServiceContainerImpl.{} populated with AtomicInteger(1)",
@@ -3485,7 +3507,7 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
             };
             let needs_fix = matches!(cur, Some(Value::Object(None)) | None);
             if needs_fix {
-                if let Some(obj) = shared.heap.try_alloc_object(target_id, num_fields) {
+                if let Some(obj) = shared.mem.heap.try_alloc_object(target_id, num_fields) {
                     if set_static_by_name("log", Value::Object(Some(obj))) {
                         tracing::warn!(
                             "Post-clinit fixup: ElytronMessages.log populated with synthetic $logger"
@@ -3534,7 +3556,7 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
                 };
                 let needs_fix = matches!(cur, Some(Value::Object(None)) | None);
                 if needs_fix {
-                    if let Some(obj) = shared.heap.try_alloc_object(target_id, num_fields) {
+                    if let Some(obj) = shared.mem.heap.try_alloc_object(target_id, num_fields) {
                         if set_static_by_name(fname, Value::Object(Some(obj))) {
                             tracing::warn!(
                                 "Post-clinit fixup: ServiceLogger.{} populated with synthetic $logger",
@@ -3946,7 +3968,7 @@ mod tests {
         // S_CONST: must be a non-null String reference.
         match slots[4] {
             Value::Object(Some(obj_ref)) => {
-                let text = super::super::vm_object::read_java_string(&shared.heap, obj_ref)
+                let text = super::super::vm_object::read_java_string(&shared.mem.heap, obj_ref)
                     .expect("read string");
                 assert_eq!(text, "hello", "S_CONST text");
             }

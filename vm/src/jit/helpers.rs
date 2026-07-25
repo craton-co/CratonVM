@@ -404,7 +404,7 @@ fn forward_jit_arg_at(
     // references are live object pointers at this boundary; the canonicality
     // checks above reject immediate/tagged values before constructing ObjectRef.
     let object = unsafe { ObjectRef::from_raw(raw as usize as *mut u8) };
-    let forwarded = vm.heap.load_and_forward(object).as_ptr() as i64;
+    let forwarded = vm.mem.heap.load_and_forward(object).as_ptr() as i64;
     if forwarded != raw {
         let args = replacement.get_or_insert_with(|| original.to_vec());
         args[index] = forwarded;
@@ -1356,14 +1356,14 @@ unsafe fn virtual_dispatch_target_for_receiver(
     receiver: ObjectRef,
     info: &JitInvokeInfo,
 ) -> VirtualDispatchTarget {
-    if vm.heap.kind_of(receiver) == cratonvm_types::ObjectKind::Array {
+    if vm.mem.heap.kind_of(receiver) == cratonvm_types::ObjectKind::Array {
         return VirtualDispatchTarget {
             class_name: std::sync::Arc::from("java/lang/Object"),
             cacheable_receiver: false,
         };
     }
 
-    let cid = vm.heap.class_id_of(receiver);
+    let cid = vm.mem.heap.class_id_of(receiver);
     if cid == ClassId::new(0) {
         return VirtualDispatchTarget {
             class_name: if crate::vm::is_object_member(info.method_name, info.descriptor) {
@@ -1828,7 +1828,7 @@ unsafe fn decode_dispatch_values(
                 // heap pointer (else GC SEGVs walking a bogus oop).
                 let bits = ptr as u64;
                 let validated = if (bits & 0x7) == 0 && bits < (1u64 << 48) {
-                    vm.heap.is_object_address(bits as usize)
+                    vm.mem.heap.is_object_address(bits as usize)
                 } else {
                     None
                 };
@@ -1855,7 +1855,7 @@ unsafe fn decode_dispatch_values(
                 } else {
                     let bits = raw as u64;
                     let validated = if (bits & 0x7) == 0 && bits < (1u64 << 48) {
-                        vm.heap.is_object_address(bits as usize)
+                        vm.mem.heap.is_object_address(bits as usize)
                     } else {
                         None
                     };
@@ -1883,7 +1883,7 @@ unsafe fn heap_from_vm(vm_ptr: i64) -> &'static VmHeap {
     debug_assert!(vm_ptr != 0, "heap_from_vm called with null VM pointer");
     // SAFETY: vm_ptr was passed from JIT-compiled code which received it from the
     // interpreter's SharedVm reference, so it points to a valid SharedVm.
-    &(*(vm_ptr as *const SharedVm)).heap
+    &(*(vm_ptr as *const SharedVm)).mem.heap
 }
 
 // ---------------------------------------------------------------------------
@@ -1916,7 +1916,7 @@ unsafe fn jit_safepoint_flush_satb(vm_ptr: i64) {
     // SAFETY: caller contract for every JIT helper — vm_ptr is a live
     // SharedVm pointer.
     let vm = &*(vm_ptr as *const SharedVm);
-    vm.heap.flush_thread_satb();
+    vm.mem.heap.flush_thread_satb();
 }
 
 // ---------------------------------------------------------------------------
@@ -1968,7 +1968,7 @@ pub unsafe extern "C" fn jit_newarray(vm_ptr: i64, atype: i64, length: i64) -> i
         // a negative length into a huge allocation request.
         return jit_negative_array_size(vm, length);
     }
-    let heap = &vm.heap;
+    let heap = &vm.mem.heap;
     // Try allocation; if young gen exhausted, run GC and retry.
     //
     // Task #43 (HIGH soundness — deferred from #25/#26): route the
@@ -2089,7 +2089,7 @@ fn jit_newarray_oom(vm: &SharedVm, length: usize) -> i64 {
 /// once before surfacing OOM).
 #[cold]
 fn jit_g1_last_ditch_full_cycle(vm: &SharedVm) -> bool {
-    if !vm.heap.is_g1() {
+    if !vm.mem.heap.is_g1() {
         return false;
     }
     // SAFETY: called only from the JIT allocation slow-path helpers, on a
@@ -2141,7 +2141,7 @@ fn jit_alloc_oom(vm: &SharedVm, msg: &str) -> i64 {
         }
     }
     // Fresh creation failed (or no JIT thread) — use the pre-allocated singleton.
-    if let Some(oom) = *vm.singleton_oom.read() {
+    if let Some(oom) = *vm.mem.singleton_oom.read() {
         set_jit_pending_exception(oom);
     }
     0
@@ -2280,7 +2280,7 @@ pub unsafe extern "C" fn jit_post_tlab_init(
         num_fields as u32
     };
     *(raw_ptr.add(cratonvm_types::NUM_SLOTS_OFFSET) as *mut u32) = shape;
-    let hash = vm.heap.next_identity_hash();
+    let hash = vm.mem.heap.next_identity_hash();
     *(raw_ptr.add(8) as *mut i32) = hash;
 
     // Family-A forensics (CRATONVM_DBG_A2, default-inert): record the
@@ -2379,7 +2379,7 @@ pub unsafe extern "C" fn jit_new_object(vm_ptr: i64, class_id_raw: i64, num_fiel
     jit_safepoint_flush_satb(vm_ptr);
     // SAFETY: vm_ptr originates from JIT code that received it from the interpreter's SharedVm reference.
     let vm = &*(vm_ptr as *const SharedVm);
-    let heap = &vm.heap;
+    let heap = &vm.mem.heap;
     let class_id = ClassId::new(class_id_raw as u32);
 
     // JVMS §5.5 / §new: `new` must initialize its class before the object
@@ -2645,7 +2645,7 @@ fn jit_post_alloc_init(vm: &SharedVm, obj: ObjectRef, class_id: ClassId) {
                 PrimKind::Float => Value::Float(0.0),
                 PrimKind::Double => Value::Double(0.0),
             };
-            vm.heap.set_field(obj, inst_idx as usize, val);
+            vm.mem.heap.set_field(obj, inst_idx as usize, val);
         }
         if info.has_finalizer {
             vm.register_finalizable(obj.as_ptr() as usize);
@@ -2688,7 +2688,7 @@ fn jit_init_primitive_fields(vm: &SharedVm, obj: ObjectRef, class_id: ClassId) {
                     _ => None,
                 };
                 if let Some(val) = default {
-                    vm.heap.set_field(obj, inst_idx, val);
+                    vm.mem.heap.set_field(obj, inst_idx, val);
                 }
                 inst_idx += 1;
             }
@@ -2729,7 +2729,7 @@ pub unsafe extern "C" fn jit_anewarray_object(
         // through the method's exception table (catchable).
         return jit_negative_array_size(vm, length);
     }
-    let heap = &vm.heap;
+    let heap = &vm.mem.heap;
     let class_id = ClassId::new(component_class_id_raw as u32);
 
     // CRIT (jit/gc audit, 2026-05): probe young-gen capacity and retire
@@ -3071,7 +3071,7 @@ pub unsafe extern "C" fn jit_aastore(vm_ptr: i64, array_ptr: i64, index: i64, va
         let vm = &*(vm_ptr as *const SharedVm);
         let array_ref = ObjectRef::from_raw(array_ptr as usize as *mut u8);
         let value_ref = ObjectRef::from_raw(val as usize as *mut u8);
-        if vm.heap.element_type_of(array_ref) == ArrayElementType::Reference
+        if vm.mem.heap.element_type_of(array_ref) == ArrayElementType::Reference
             && !crate::runtime::interpreter::aastore_element_assignable(vm, array_ref, value_ref)
         {
             // Build a real ArrayStoreException and stash it via the pending-
@@ -3087,7 +3087,7 @@ pub unsafe extern "C" fn jit_aastore(vm_ptr: i64, array_ptr: i64, index: i64, va
                 .classes
                 .class_manager
                 .read()
-                .get_class(vm.heap.class_id_of(value_ref))
+                .get_class(vm.mem.heap.class_id_of(value_ref))
                 .map(|c| c.name.to_string())
                 .unwrap_or_else(|| "?".to_string());
             if let Some((thread, _guard)) = jit_thread_mut() {
@@ -3106,7 +3106,7 @@ pub unsafe extern "C" fn jit_aastore(vm_ptr: i64, array_ptr: i64, index: i64, va
     let elem_ptr = ptr.add(HEADER_SIZE + index as usize * REF_ELEMENT_SIZE) as *mut u64;
     // Task #43 (HIGH soundness, deferred from #25/#26): SATB pre-write
     // barrier — the JIT helper equivalent of the interpreter's
-    // `shared.heap.satb_barrier(old_value)` at runtime/interpreter.rs:4228
+    // `shared.mem.heap.satb_barrier(old_value)` at runtime/interpreter.rs:4228
     // (aastore) and :5349 (aastore via set_array_element). Read the OLD
     // reference *before* the store so concurrent marking still sees a
     // path to the about-to-be-overwritten target (snapshot-at-the-
@@ -3293,7 +3293,7 @@ pub unsafe extern "C" fn jit_getfield(vm_ptr: i64, obj_ptr: i64, field_index: i6
         return i64::MIN;
     }
     let vm = &*(vm_ptr as *const SharedVm);
-    if vm.heap.is_object_address(obj_ptr as usize).is_none() {
+    if vm.mem.heap.is_object_address(obj_ptr as usize).is_none() {
         set_jit_pending_npe();
         return i64::MIN;
     }
@@ -3686,7 +3686,7 @@ pub unsafe extern "C" fn jit_putfield_object(
         .add(HEADER_SIZE + field_index as usize * SLOT_SIZE);
     // Task #43 (HIGH soundness, deferred from #25/#26): SATB pre-write
     // barrier — the JIT helper equivalent of the interpreter putfield's
-    // `shared.heap.satb_barrier(old_value)` at runtime/interpreter.rs:6391.
+    // `shared.mem.heap.satb_barrier(old_value)` at runtime/interpreter.rs:6391.
     // Read the OLD reference before overwriting it so concurrent marking
     // preserves the snapshot-at-the-beginning invariant. The post-store
     // `write_barrier` (card-table dirty) below is necessary but not
@@ -3747,7 +3747,7 @@ pub unsafe extern "C" fn jit_write_barrier(vm_ptr: i64, obj_ptr: i64, val_ptr: i
 // references silently disappear from the mark closure and become UAF on
 // the next mixed evacuation.
 //
-// The interpreter calls `shared.heap.satb_barrier(old_value)` at every
+// The interpreter calls `shared.mem.heap.satb_barrier(old_value)` at every
 // ref-store site (interpreter.rs lines 4093, 5164, 5961, 6206). This
 // helper is the JIT-callable equivalent.
 //
@@ -3771,7 +3771,7 @@ pub unsafe extern "C" fn jit_satb_pre_write_barrier(vm_ptr: i64, old_ref: i64) {
     }
     let vm = &*(vm_ptr as *const SharedVm);
     let old_obj = ObjectRef::from_raw(old_ref as usize as *mut u8);
-    vm.heap.satb_barrier(Value::Object(Some(old_obj)));
+    vm.mem.heap.satb_barrier(Value::Object(Some(old_obj)));
 }
 
 // ---------------------------------------------------------------------------
@@ -4117,7 +4117,7 @@ pub unsafe extern "C" fn jit_putstatic_object(
     // at runtime/interpreter.rs:5961.
     let old_static = crate::vm::get_static_shared(vm, class_id, field_index as usize);
     if let Value::Object(Some(_)) = old_static {
-        vm.heap.satb_barrier(old_static);
+        vm.mem.heap.satb_barrier(old_static);
     }
     let value = if val == 0 {
         Value::Object(None)
@@ -4195,7 +4195,7 @@ unsafe fn jit_typecheck_resolve(
     // the JIT'd lambda body because `checkcast [I` after the clone() return
     // hit the false branch below and zeroed the result. With this branch
     // in place, the cast succeeds and the array round-trips correctly.
-    if vm.heap.kind_of(*obj_ref) == cratonvm_types::ObjectKind::Array {
+    if vm.mem.heap.kind_of(*obj_ref) == cratonvm_types::ObjectKind::Array {
         if let Some(src_desc) = crate::runtime::interpreter::array_descriptor_of(vm, *obj_ref) {
             let assignable = if lenient {
                 crate::runtime::interpreter::array_is_assignable_to(vm, &src_desc, class_name)
@@ -4398,7 +4398,7 @@ unsafe fn jit_typecheck_resolve(
     // ScannerTest / PackagedEntityManagerTest / SimpleTests). Gating the strict
     // path on the element kind fixes it. The lenient (`checkcast`) leniency is
     // preserved unchanged (SBR-03 keeps native `Object[]`→`T[]` casts working).
-    if vm.heap.kind_of(*obj_ref) == cratonvm_types::ObjectKind::Array {
+    if vm.mem.heap.kind_of(*obj_ref) == cratonvm_types::ObjectKind::Array {
         if class_name == "java/lang/Object"
             || class_name == "java/io/Serializable"
             || class_name == "java/lang/Cloneable"
@@ -4406,7 +4406,7 @@ unsafe fn jit_typecheck_resolve(
             return true;
         }
         if class_name == "[Ljava/lang/Object;"
-            && (lenient || vm.heap.element_type_of(*obj_ref) == ArrayElementType::Reference)
+            && (lenient || vm.mem.heap.element_type_of(*obj_ref) == ArrayElementType::Reference)
         {
             return true;
         }
@@ -4458,7 +4458,7 @@ pub unsafe extern "C" fn jit_checkcast(
     }
     // SAFETY: vm_ptr originates from JIT code that received it from the interpreter's SharedVm reference.
     let vm = &*(vm_ptr as *const SharedVm);
-    let mut obj_ref = match vm.heap.is_object_address(obj_ptr as usize) {
+    let mut obj_ref = match vm.mem.heap.is_object_address(obj_ptr as usize) {
         Some(r) => r,
         None => {
             if cv_trace_enabled() {
@@ -4479,7 +4479,7 @@ pub unsafe extern "C" fn jit_checkcast(
         Ok(s) => s,
         Err(_) => return 0,
     };
-    let obj_class_id = vm.heap.class_id_of(obj_ref);
+    let obj_class_id = vm.mem.heap.class_id_of(obj_ref);
     // checkcast: lenient (SBR-03).
     //
     // GC-SAFETY (FMT-JIT-CCE): `jit_typecheck_resolve` can trigger a moving
@@ -4595,7 +4595,7 @@ pub unsafe extern "C" fn jit_instanceof(
     // dereferencing it, degrading a dangling reference to "not an
     // instance" instead of crashing — the same fallback every other stale-
     // reference guard in this codebase uses.
-    let mut obj_ref = match vm.heap.is_object_address(obj_ptr as usize) {
+    let mut obj_ref = match vm.mem.heap.is_object_address(obj_ptr as usize) {
         Some(r) => r,
         None => return 0,
     };
@@ -4608,7 +4608,7 @@ pub unsafe extern "C" fn jit_instanceof(
         Ok(s) => s,
         Err(_) => return 0,
     };
-    let obj_class_id = vm.heap.class_id_of(obj_ref);
+    let obj_class_id = vm.mem.heap.class_id_of(obj_ref);
     // instanceof: strict (SBR-03). `obj_ref` is passed `&mut` — see the
     // GC-SAFETY comment in `jit_checkcast` — so any GC triggered by
     // resolving a not-yet-loaded target class inside `jit_typecheck_resolve`
@@ -4951,7 +4951,7 @@ fn raise_jit_stack_overflow(vm: &SharedVm) -> i64 {
 
 #[cold]
 fn throwable_class_name(vm: &SharedVm, obj: ObjectRef) -> Option<String> {
-    let cid = vm.heap.class_id_of(obj);
+    let cid = vm.mem.heap.class_id_of(obj);
     vm.classes
         .class_manager
         .read()
@@ -4961,12 +4961,12 @@ fn throwable_class_name(vm: &SharedVm, obj: ObjectRef) -> Option<String> {
 
 #[cold]
 fn throwable_detail_message(vm: &SharedVm, obj: ObjectRef) -> Option<String> {
-    let cid = vm.heap.class_id_of(obj);
+    let cid = vm.mem.heap.class_id_of(obj);
     let msg_ref = {
         let cm = vm.classes.class_manager.read();
         let idx =
             crate::vm::resolve_field_index_in_hierarchy(cid, "detailMessage", &cm.class_store)?;
-        match vm.heap.get_field(obj, idx) {
+        match vm.mem.heap.get_field(obj, idx) {
             Value::Object(Some(s)) => s,
             _ => return None,
         }
@@ -4974,7 +4974,7 @@ fn throwable_detail_message(vm: &SharedVm, obj: ObjectRef) -> Option<String> {
     if throwable_class_name(vm, msg_ref).as_deref() != Some("java/lang/String") {
         return None;
     }
-    crate::vm::read_java_string(&vm.heap, msg_ref)
+    crate::vm::read_java_string(&vm.mem.heap, msg_ref)
 }
 
 #[cold]
@@ -5354,8 +5354,8 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
         if let Some(entry) = cached {
             let receiver_raw = args_slice[0] as u64;
             if receiver_raw != 0 && (receiver_raw & 0x7) == 0 && receiver_raw < (1u64 << 48) {
-                if let Some(receiver) = vm.heap.is_object_address(receiver_raw as usize) {
-                    if vm.heap.class_id_of(receiver).as_u32() == entry.receiver_class_id {
+                if let Some(receiver) = vm.mem.heap.is_object_address(receiver_raw as usize) {
+                    if vm.mem.heap.class_id_of(receiver).as_u32() == entry.receiver_class_id {
                         if let Some((thread, _guard)) = jit_thread_mut() {
                             if let Some(result) = call_object_native_raw(
                                 vm, thread, info, receiver, args_slice, entry,
@@ -5472,7 +5472,7 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
         let raw = args_slice[0] as u64;
         if raw != 0 && (raw & 7) == 0 && raw < (1u64 << 48) {
             let receiver = ObjectRef::from_raw(raw as usize as *mut u8);
-            let receiver_cid = vm.heap.class_id_of(receiver);
+            let receiver_cid = vm.mem.heap.class_id_of(receiver);
             let target = virtual_dispatch_target_for_receiver(vm, receiver, info);
             let globally_named = target.cacheable_receiver
                 && vm
@@ -5749,8 +5749,8 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
         let kind = object_native_kind.expect("checked above");
         let receiver_raw = args_slice[0] as u64;
         if receiver_raw != 0 && (receiver_raw & 0x7) == 0 && receiver_raw < (1u64 << 48) {
-            if let Some(receiver) = vm.heap.is_object_address(receiver_raw as usize) {
-                let receiver_class_id = vm.heap.class_id_of(receiver).as_u32();
+            if let Some(receiver) = vm.mem.heap.is_object_address(receiver_raw as usize) {
+                let receiver_class_id = vm.mem.heap.class_id_of(receiver).as_u32();
                 let cached = OBJECT_NATIVE_DISPATCH_CACHE.with(|cache| {
                     cache
                         .borrow()
@@ -5810,8 +5810,8 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
     // class-store MIC. Give the erased primitive adapter its own receiver-guarded
     // direct path before allocating decoded Values for the generic fallback.
     if matches!(info.invoke_kind, 0 | 2) && args_slice.len() == 2 {
-        if let Some(proxy) = vm.heap.is_object_address(args_slice[0] as usize) {
-            let proxy_class_id = vm.heap.class_id_of(proxy);
+        if let Some(proxy) = vm.mem.heap.is_object_address(args_slice[0] as usize) {
+            let proxy_class_id = vm.mem.heap.class_id_of(proxy);
             if vm
                 .classes
                 .lambda_proxies
@@ -5897,7 +5897,7 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
                     // for invokeinterface and the S111r8 cid=0 →
                     // CP-class fallback in `execute_invoke`.
                     if !info.class_name.is_empty() {
-                        let recv_cid = vm.heap.class_id_of(receiver_ref);
+                        let recv_cid = vm.mem.heap.class_id_of(receiver_ref);
                         let recv_name_opt = {
                             let cm = vm.classes.class_manager.read();
                             cm.get_class(recv_cid).map(|c| c.name.to_string())
@@ -6157,7 +6157,7 @@ pub unsafe extern "C" fn jit_integer_value_of_direct(vm_ptr: i64, value: i64) ->
                 // Descriptor-typed write (`Integer.value`, field 0, `I`) —
                 // this cold arm's allocator may pick a non-legacy layout, so
                 // keep the layout-aware store.
-                vm.heap.set_field_as(object, 0, Value::Int(value), b'I');
+                vm.mem.heap.set_field_as(object, 0, Value::Int(value), b'I');
                 // Object-return handoff root (see `call_integer_native_raw`).
                 thread.native_pending_return = Some(object);
                 return object.as_ptr() as i64;
@@ -6188,7 +6188,7 @@ pub unsafe extern "C" fn jit_integer_value_of_direct(vm_ptr: i64, value: i64) ->
             INTEGER_WRAPPER_CLASS_CACHE.with(|cache| {
                 cache.set(Some((
                     vm as *const SharedVm as usize,
-                    vm.heap.class_id_of(object).as_u32(),
+                    vm.mem.heap.class_id_of(object).as_u32(),
                 )))
             });
             object.as_ptr() as i64
@@ -6233,8 +6233,8 @@ pub unsafe extern "C" fn jit_integer_int_value_direct(vm_ptr: i64, receiver: i64
     // SAFETY: vm_ptr originates from JIT code compiled against this live VM.
     let vm = &*(vm_ptr as *const SharedVm);
     if (raw & 0x7) == 0 && raw < (1u64 << 48) {
-        if let Some(object) = vm.heap.is_object_address(raw as usize) {
-            return match vm.heap.get_field(object, 0) {
+        if let Some(object) = vm.mem.heap.is_object_address(raw as usize) {
+            return match vm.mem.heap.get_field(object, 0) {
                 Value::Int(value) => value as i64,
                 _ => 0,
             };
@@ -6362,12 +6362,12 @@ pub unsafe extern "C" fn jit_concurrent_hashmap_get_direct(
         && jit_concurrent_hashmap_receiver_is_exact(vm, receiver)
     {
         if let (Some(recv), Some((thread, _guard))) = (
-            vm.heap.is_object_address(receiver as usize),
+            vm.mem.heap.is_object_address(receiver as usize),
             jit_thread_mut(),
         ) {
             let key = if key == 0 {
                 Value::Object(None)
-            } else if let Some(key) = vm.heap.is_object_address(key as usize) {
+            } else if let Some(key) = vm.mem.heap.is_object_address(key as usize) {
                 Value::Object(Some(key))
             } else {
                 return 0;
@@ -6447,12 +6447,12 @@ pub unsafe extern "C" fn jit_hashmap_get_direct(vm_ptr: i64, receiver: i64, key:
             if (kraw & 0x7) != 0 || kraw >= (1u64 << 48) {
                 break 'fast;
             }
-            match vm.heap.is_object_address(key as usize) {
+            match vm.mem.heap.is_object_address(key as usize) {
                 Some(object) => Value::Object(Some(object)),
                 None => break 'fast,
             }
         };
-        let Some(recv_obj) = vm.heap.is_object_address(receiver as usize) else {
+        let Some(recv_obj) = vm.mem.heap.is_object_address(receiver as usize) else {
             break 'fast;
         };
         let Some((thread, _guard)) = jit_thread_mut() else {
@@ -6561,7 +6561,7 @@ pub unsafe extern "C" fn jit_string_latin1_to_lower_direct(
     if source == 0 {
         return 0;
     }
-    let Some(source) = vm.heap.is_object_address(source as usize) else {
+    let Some(source) = vm.mem.heap.is_object_address(source as usize) else {
         return 0;
     };
     let Some((thread, _guard)) = jit_thread_mut() else {
@@ -6635,12 +6635,12 @@ pub unsafe extern "C" fn jit_hashmap_put_direct(
             if (bits & 0x7) != 0 || bits >= (1u64 << 48) {
                 break 'fast;
             }
-            match vm.heap.is_object_address(raw as usize) {
+            match vm.mem.heap.is_object_address(raw as usize) {
                 Some(object) => vals[slot] = Value::Object(Some(object)),
                 None => break 'fast,
             }
         }
-        let Some(recv_obj) = vm.heap.is_object_address(receiver as usize) else {
+        let Some(recv_obj) = vm.mem.heap.is_object_address(receiver as usize) else {
             break 'fast;
         };
         let Some((thread, _guard)) = jit_thread_mut() else {
@@ -6707,13 +6707,13 @@ fn call_integer_native_raw(
                 // object pointers are held across it. Without this, a
                 // boxing-dominated compiled loop keeps spilling wrappers into
                 // old gen until `alloc_young_initialized` hard-aborts.
-                if vm.heap.young_spill_pressure() {
+                if vm.mem.heap.young_spill_pressure() {
                     if !crate::runtime::interpreter::gc_overhead_limit_exceeded(vm)
-                        && vm.heap.needs_gc_for_jit_allocation()
+                        && vm.mem.heap.needs_gc_for_jit_allocation()
                     {
                         crate::runtime::interpreter::maybe_gc_forced_pub(vm, thread);
                     }
-                    vm.heap.clear_young_spill_pressure();
+                    vm.mem.heap.clear_young_spill_pressure();
                 }
                 use cratonvm_native_api::NativeContext as _;
                 let mut ctx = crate::vm::NativeContextImpl { shared: vm, thread };
@@ -6733,14 +6733,14 @@ fn call_integer_native_raw(
         if raw == 0 || (raw & 0x7) != 0 || raw >= (1u64 << 48) {
             return None;
         }
-        let object = vm.heap.is_object_address(raw as usize)?;
+        let object = vm.mem.heap.is_object_address(raw as usize)?;
         // `intrinsic_integer_int_value` delegates to
         // `native_wrapper_int_value`, whose complete behavior is a read of
         // wrapper field 0 and `Int`-or-zero normalization. The receiver is
         // already heap-validated above and this operation cannot allocate or
         // safepoint, so entering `safe_native_call` adds only rooting/panic/
         // dispatch overhead on every unbox in a compiled loop.
-        return Some(match vm.heap.get_field(object, 0) {
+        return Some(match vm.mem.heap.get_field(object, 0) {
             Value::Int(value) => value as i64,
             _ => 0,
         });
@@ -6763,7 +6763,7 @@ fn call_integer_native_raw(
             INTEGER_WRAPPER_CLASS_CACHE.with(|cache| {
                 cache.set(Some((
                     vm as *const SharedVm as usize,
-                    vm.heap.class_id_of(object).as_u32(),
+                    vm.mem.heap.class_id_of(object).as_u32(),
                 )))
             });
         }
@@ -6877,7 +6877,7 @@ fn call_stringbuilder_native_raw(
                 if (bits & 0x7) != 0 || bits >= (1u64 << 48) {
                     return None;
                 }
-                let object = vm.heap.is_object_address(bits as usize)?;
+                let object = vm.mem.heap.is_object_address(bits as usize)?;
                 values[1] = Value::Object(Some(object));
             }
             _ => return None,
@@ -6976,7 +6976,7 @@ fn call_hashmap_native_raw(
         if (bits & 0x7) != 0 || bits >= (1u64 << 48) {
             return None;
         }
-        let object = vm.heap.is_object_address(bits as usize)?;
+        let object = vm.mem.heap.is_object_address(bits as usize)?;
         values[index + 1] = Value::Object(Some(object));
     }
 
@@ -7053,10 +7053,10 @@ pub unsafe extern "C" fn jit_lambda_int_to_double(vm_ptr: i64, proxy_raw: i64, i
     crate::jit::conservative_roots::note_jit_boundary();
     jit_safepoint_flush_satb(vm_ptr);
     let vm = &*(vm_ptr as *const SharedVm);
-    let Some(proxy) = vm.heap.is_object_address(proxy_raw as usize) else {
+    let Some(proxy) = vm.mem.heap.is_object_address(proxy_raw as usize) else {
         return f64::NAN.to_bits() as i64;
     };
-    let proxy_class_id = vm.heap.class_id_of(proxy);
+    let proxy_class_id = vm.mem.heap.class_id_of(proxy);
     let call_site = match vm
         .classes
         .lambda_proxies
@@ -7081,11 +7081,11 @@ pub unsafe extern "C" fn jit_lambda_int_to_double(vm_ptr: i64, proxy_raw: i64, i
     {
         return f64::NAN.to_bits() as i64;
     }
-    let receiver = match vm.heap.get_field(proxy, 0) {
+    let receiver = match vm.mem.heap.get_field(proxy, 0) {
         Value::Object(Some(receiver)) => receiver,
         _ => return f64::NAN.to_bits() as i64,
     };
-    let receiver_class_id = vm.heap.class_id_of(receiver);
+    let receiver_class_id = vm.mem.heap.class_id_of(receiver);
     let class_name = match vm.classes.class_manager.read().get_class(receiver_class_id) {
         Some(class) => class.name.clone(),
         None => return f64::NAN.to_bits() as i64,
@@ -7180,18 +7180,18 @@ unsafe fn try_fast_lambda_int_to_double_apply(
     {
         return Ok(None);
     }
-    let index = match vm.heap.is_object_address(args[1] as usize) {
-        Some(index_box) => match vm.heap.get_field(index_box, 0) {
+    let index = match vm.mem.heap.is_object_address(args[1] as usize) {
+        Some(index_box) => match vm.mem.heap.get_field(index_box, 0) {
             Value::Int(index) => index,
             _ => return Ok(None),
         },
         None => return Ok(None),
     };
-    let receiver = match vm.heap.get_field(proxy, 0) {
+    let receiver = match vm.mem.heap.get_field(proxy, 0) {
         Value::Object(Some(receiver)) => receiver,
         _ => return Ok(None),
     };
-    let receiver_class_id = vm.heap.class_id_of(receiver);
+    let receiver_class_id = vm.mem.heap.class_id_of(receiver);
     let class_name = match vm.classes.class_manager.read().get_class(receiver_class_id) {
         Some(class) => class.name.clone(),
         None => return Ok(None),
@@ -7427,7 +7427,7 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
                         // membership, not just bit-pattern plausibility.
                         let bits = raw as u64;
                         let validated = if (bits & 0x7) == 0 && bits < (1u64 << 48) {
-                            vm.heap.is_object_address(bits as usize)
+                            vm.mem.heap.is_object_address(bits as usize)
                         } else {
                             None
                         };
@@ -7489,7 +7489,7 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
         }
     }
 
-    let receiver_class_id = vm.heap.class_id_of(receiver_ref);
+    let receiver_class_id = vm.mem.heap.class_id_of(receiver_ref);
     let receiver_cid = receiver_class_id.as_u32();
 
     // Real-layout Matcher methods are registered natives, so they can never
@@ -8364,7 +8364,7 @@ mod tests {
         use crate::vm::SharedVm;
 
         let vm = SharedVm::new(VmConfig::default());
-        let receiver = vm.heap.alloc_object(ClassId::new(0), 0);
+        let receiver = vm.mem.heap.alloc_object(ClassId::new(0), 0);
         let info = JitInvokeInfo {
             class_name: "java/io/InputStream",
             method_name: "read",
@@ -8388,7 +8388,7 @@ mod tests {
         use crate::vm::SharedVm;
 
         let vm = SharedVm::new(VmConfig::default());
-        let receiver = vm.heap.alloc_object(ClassId::new(0), 0);
+        let receiver = vm.mem.heap.alloc_object(ClassId::new(0), 0);
         let info = JitInvokeInfo {
             class_name: "java/lang/Object",
             method_name: "hashCode",
@@ -8750,7 +8750,7 @@ mod tests {
         config.max_heap_size = 4 * 1024 * 1024; // 4 MB — plenty for one tiny array
         config.initial_heap_size = 4 * 1024 * 1024;
         let vm_box: Box<SharedVm> = Box::new(SharedVm::new(config));
-        let arr = vm_box.heap.alloc_array(ClassId::new(0), et, len);
+        let arr = vm_box.mem.heap.alloc_array(ClassId::new(0), et, len);
         let arr_ptr = arr.as_ptr() as i64;
         (vm_box, arr_ptr)
     }
@@ -8906,7 +8906,7 @@ mod tests {
         let vm_box: Box<SharedVm> = Box::new(SharedVm::new(VmConfig::default()));
         let vm_ptr = (&*vm_box as *const SharedVm) as i64;
         // Object with exactly 2 reference fields (num_slots == 2).
-        let obj = vm_box.heap.alloc_object(ClassId::new(0), 2);
+        let obj = vm_box.mem.heap.alloc_object(ClassId::new(0), 2);
         let obj_ptr = obj.as_ptr() as i64;
         // SAFETY: obj_ptr is a live 2-field object; slot indices 2 and 5 are
         // out of range so the helper takes the bounds-check arm and never
@@ -8942,6 +8942,7 @@ mod tests {
         // stale/truncated receiver bits before getfield.
         let mut bad_receiver = 0x1000_i64;
         while vm_box
+            .mem
             .heap
             .is_object_address(bad_receiver as usize)
             .is_some()
@@ -8963,9 +8964,9 @@ mod tests {
         let _ = take_jit_pending_npe();
         let vm_box: Box<SharedVm> = Box::new(SharedVm::new(VmConfig::default()));
         let vm_ptr = (&*vm_box as *const SharedVm) as i64;
-        let obj = vm_box.heap.alloc_object(ClassId::new(0), 2);
+        let obj = vm_box.mem.heap.alloc_object(ClassId::new(0), 2);
         // Write via the interpreter path (the helper read must observe it).
-        vm_box.heap.set_field(obj, 1, Value::Int(0x5A5A));
+        vm_box.mem.heap.set_field(obj, 1, Value::Int(0x5A5A));
         let obj_ptr = obj.as_ptr() as i64;
         // SAFETY: obj_ptr is a live 2-field object; slot 1 is in bounds.
         let v = unsafe { jit_getfield(vm_ptr, obj_ptr, 1) };
@@ -8996,7 +8997,7 @@ mod tests {
 
         let vm_box: Arc<SharedVm> = Arc::new(SharedVm::new(VmConfig::default()));
         let vm_ptr = Arc::as_ptr(&vm_box) as i64;
-        let obj = vm_box.heap.alloc_object(ClassId::new(0), 1);
+        let obj = vm_box.mem.heap.alloc_object(ClassId::new(0), 1);
         let obj_ptr = obj.as_ptr() as i64;
 
         const A: i32 = 0x1111_1111;
@@ -9162,6 +9163,7 @@ mod tests {
         let satb: Arc<SatbQueue> = Arc::new(SatbQueue::new());
         let state: Arc<ConcurrentGcState> = Arc::new(ConcurrentGcState::new());
         vm_box
+            .mem
             .heap
             .enable_concurrent_gc(satb.clone(), state.clone());
 
@@ -9174,19 +9176,20 @@ mod tests {
 
         // Allocate a container with one reference field plus two payload
         // objects to use as old/new references for the putfield store.
-        let container = vm_box.heap.alloc_object(ClassId::new(0), 1);
-        let old_obj = vm_box.heap.alloc_object(ClassId::new(0), 0);
-        let new_obj = vm_box.heap.alloc_object(ClassId::new(0), 0);
+        let container = vm_box.mem.heap.alloc_object(ClassId::new(0), 1);
+        let old_obj = vm_box.mem.heap.alloc_object(ClassId::new(0), 0);
+        let new_obj = vm_box.mem.heap.alloc_object(ClassId::new(0), 0);
 
         // Pre-write the old reference into slot 0 (interpreter path —
         // bypasses the SATB barrier we are about to test).
         vm_box
+            .mem
             .heap
             .set_field(container, 0, Value::Object(Some(old_obj)));
 
         // Pre-drain any baggage from this thread's local SATB buffer so
         // the test only observes references logged by the JIT helper.
-        vm_box.heap.flush_thread_satb();
+        vm_box.mem.heap.flush_thread_satb();
         let _ = satb.drain();
 
         let vm_ptr = &*vm_box as *const SharedVm as i64;
@@ -9203,7 +9206,7 @@ mod tests {
         // Flush this thread's SATB buffer into the global queue so the
         // drain below sees it. The per-thread buffer auto-flushes at
         // 256 entries; with a single store we must drain explicitly.
-        vm_box.heap.flush_thread_satb();
+        vm_box.mem.heap.flush_thread_satb();
         let drained = satb.drain();
 
         // The SATB pre-barrier must have logged the OLD reference's
@@ -9222,7 +9225,7 @@ mod tests {
 
         // The new value must be visible in the slot post-store (sanity
         // check that the helper actually performed the write).
-        let post = vm_box.heap.get_field(container, 0);
+        let post = vm_box.mem.heap.get_field(container, 0);
         match post {
             Value::Object(Some(obj)) => assert_eq!(
                 obj.as_ptr() as usize,
@@ -9292,6 +9295,7 @@ mod tests {
         // now pressured exactly as the test requires.
         for _ in 0..256 {
             let _ = vm_box
+                .mem
                 .heap
                 .try_alloc_array(ClassId::new(0), ArrayElementType::Int, 1024);
         }
@@ -9339,7 +9343,7 @@ mod tests {
         // successful `jit_newarray` call above, so it is a live, aligned heap object.
         let arr = unsafe { ObjectRef::from_raw(result as usize as *mut u8) };
         assert_eq!(
-            vm_box.heap.array_length(arr),
+            vm_box.mem.heap.array_length(arr),
             len as usize,
             "post-GC alloc_array must produce an int[] of the requested length",
         );
@@ -9779,7 +9783,7 @@ pub fn build_helpers() -> JitRuntimeHelpers {
 
     let (jit_card_table_addr, jit_card_old_base, jit_card_old_end) =
         crate::native::jni::process_vm()
-            .and_then(|shared| shared.heap.jit_card_table_info())
+            .and_then(|shared| shared.mem.heap.jit_card_table_info())
             .unwrap_or((0, 0, 0));
 
     JitRuntimeHelpers {
@@ -9897,7 +9901,7 @@ pub fn build_helpers() -> JitRuntimeHelpers {
         // same optional-helper contract as `region_bounds_addr`/
         // `frame_record` above.
         safepoint_flag_addr: crate::native::jni::process_vm()
-            .map(|shared| shared.gc_barrier.stw_requested_flag_addr() as usize)
+            .map(|shared| shared.mem.gc_barrier.stw_requested_flag_addr() as usize)
             .unwrap_or(0),
         // Slow-path helper for a poll hit. Unconditionally wired (the
         // function always exists in this binary) — `safepoint_flag_addr`

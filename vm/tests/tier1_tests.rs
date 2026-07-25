@@ -37,7 +37,7 @@ use cratonvm_vm::vm::SharedVm;
 #[test]
 fn t1_holdslock_returns_true_for_owned_monitor() {
     let shared = Arc::new(SharedVm::new(VmConfig::default()));
-    let obj = shared.heap.alloc_object(ClassId::new(1), 0);
+    let obj = shared.mem.heap.alloc_object(ClassId::new(1), 0);
     let tid = ThreadId(7);
 
     // Initially: nobody holds it.
@@ -58,7 +58,7 @@ fn t1_holdslock_returns_true_for_owned_monitor() {
 #[test]
 fn t1_holdslock_handles_reentrancy() {
     let shared = Arc::new(SharedVm::new(VmConfig::default()));
-    let obj = shared.heap.alloc_object(ClassId::new(1), 0);
+    let obj = shared.mem.heap.alloc_object(ClassId::new(1), 0);
     let tid = ThreadId(11);
 
     shared.threads.monitors.enter(obj, tid);
@@ -76,7 +76,7 @@ fn t1_holdslock_handles_reentrancy() {
 #[test]
 fn t1_holdslock_returns_false_for_never_entered() {
     let shared = Arc::new(SharedVm::new(VmConfig::default()));
-    let obj = shared.heap.alloc_object(ClassId::new(1), 0);
+    let obj = shared.mem.heap.alloc_object(ClassId::new(1), 0);
     // No one has ever called monitorenter on this object.
     assert!(!shared.threads.monitors.holds(obj, ThreadId(1)));
 }
@@ -100,7 +100,7 @@ fn t1_parallel_allocation_no_lost_objects() {
         let allocated = allocated.clone();
         handles.push(thread::spawn(move || {
             for i in 0..per_thread {
-                let _obj = shared.heap.alloc_object(ClassId::new(1), 4);
+                let _obj = shared.mem.heap.alloc_object(ClassId::new(1), 4);
                 allocated.fetch_add(1, Ordering::Relaxed);
                 if i % 50 == 0 {
                     std::thread::yield_now();
@@ -225,7 +225,7 @@ fn t1_jit_entry_guard_with_compiled_is_callable() {
     // healthy after the enter_with_compiled migration.
 
     let shared = Arc::new(SharedVm::new(VmConfig::default()));
-    let _obj = shared.heap.alloc_object(ClassId::new(1), 2);
+    let _obj = shared.mem.heap.alloc_object(ClassId::new(1), 2);
     // The guard API is available and the module compiles with T1.1.a
     // wired — this is the enforced invariant.
     let _ = JitEntryGuard::enter; // take the function pointer
@@ -303,7 +303,7 @@ fn t1_vm_under_brief_load_does_not_deadlock() {
     for tid in 1..=4 {
         let shared = shared.clone();
         handles.push(std::thread::spawn(move || {
-            let obj = shared.heap.alloc_object(ClassId::new(1), 0);
+            let obj = shared.mem.heap.alloc_object(ClassId::new(1), 0);
             let t = ThreadId(tid);
             shared.threads.monitors.enter(obj, t);
             assert!(shared.threads.monitors.holds(obj, t));
@@ -743,7 +743,7 @@ fn t1_gc_parallel_allocation_and_collection_no_lost_objects() {
         let allocated = allocated.clone();
         handles.push(std::thread::spawn(move || {
             for i in 0..per_thread {
-                let _obj = shared.heap.alloc_object(ClassId::new(1), 4);
+                let _obj = shared.mem.heap.alloc_object(ClassId::new(1), 4);
                 allocated.fetch_add(1, Ordering::Relaxed);
                 if i % 25 == 0 {
                     std::thread::yield_now();
@@ -798,7 +798,7 @@ fn t1_gc_no_pause_exceeds_500ms_on_1000_objects() {
     let shared = Arc::new(SharedVm::new(VmConfig::default()));
     let start = Instant::now();
     for _ in 0..1000 {
-        let _obj = shared.heap.alloc_object(ClassId::new(1), 2);
+        let _obj = shared.mem.heap.alloc_object(ClassId::new(1), 2);
     }
     let elapsed = start.elapsed();
     assert!(
@@ -817,15 +817,15 @@ fn t1_gc_no_pause_exceeds_500ms_on_1000_objects() {
 #[test]
 fn t1_reference_processor_weak_ref_stress() {
     let shared = Arc::new(SharedVm::new(VmConfig::default()));
-    let before = shared.ref_processor.lock().weak_ref_count();
+    let before = shared.mem.ref_processor.lock().weak_ref_count();
 
     // Allocate 100 weak references + referents using the ref processor
     // directly (we skip the Java-side init path to keep the test
     // hermetic — the init path is covered by the NEW-17 suite).
     for i in 0..100 {
-        let referent = shared.heap.alloc_object(ClassId::new(1), 0);
-        let weak = shared.heap.alloc_object(ClassId::new(1), 2);
-        let mut rp = shared.ref_processor.lock();
+        let referent = shared.mem.heap.alloc_object(ClassId::new(1), 0);
+        let weak = shared.mem.heap.alloc_object(ClassId::new(1), 2);
+        let mut rp = shared.mem.ref_processor.lock();
         rp.discover_reference(
             cratonvm_gc::ReferenceType::Weak,
             weak.as_ptr() as usize,
@@ -834,7 +834,7 @@ fn t1_reference_processor_weak_ref_stress() {
         );
         let _ = i;
     }
-    let after = shared.ref_processor.lock().weak_ref_count();
+    let after = shared.mem.ref_processor.lock().weak_ref_count();
     assert_eq!(after, before + 100);
 }
 
@@ -850,7 +850,7 @@ fn t1_reachability_fence_accepts_null_and_object() {
     // running the same black_box-backed closure with null and with
     // a live object and asserting neither panics.
     let shared = Arc::new(SharedVm::new(VmConfig::default()));
-    let obj = shared.heap.alloc_object(ClassId::new(1), 0);
+    let obj = shared.mem.heap.alloc_object(ClassId::new(1), 0);
     let _ = std::hint::black_box(Some(obj));
     let _: Option<cratonvm_vm::types::ObjectRef> = std::hint::black_box(None);
     // If we reach here, the fence path didn't panic or diverge.
@@ -909,7 +909,7 @@ fn t1_async_exception_round_trip_through_registry() {
     let tid = ThreadId(42);
     shared.threads.thread_registry.register(tid, "target", None);
 
-    let throwable = shared.heap.alloc_object(ClassId::new(1), 2);
+    let throwable = shared.mem.heap.alloc_object(ClassId::new(1), 2);
     assert!(shared
         .threads
         .thread_registry
@@ -1004,8 +1004,8 @@ fn t1_regalloc_invariants_reject_interfering_same_register() {
 #[test]
 fn t1_brooks_barrier_noop_on_unforwarded_object() {
     let shared = Arc::new(SharedVm::new(VmConfig::default()));
-    let obj = shared.heap.alloc_object(ClassId::new(1), 2);
-    let forwarded = shared.heap.load_and_forward(obj);
+    let obj = shared.mem.heap.alloc_object(ClassId::new(1), 2);
+    let forwarded = shared.mem.heap.load_and_forward(obj);
     assert_eq!(
         forwarded.as_ptr(),
         obj.as_ptr(),
@@ -1020,8 +1020,8 @@ fn t1_brooks_barrier_noop_on_unforwarded_object() {
 #[test]
 fn t1_brooks_barrier_follows_forwarding_pointer() {
     let shared = Arc::new(SharedVm::new(VmConfig::default()));
-    let old = shared.heap.alloc_object(ClassId::new(1), 2);
-    let new_obj = shared.heap.alloc_object(ClassId::new(1), 2);
+    let old = shared.mem.heap.alloc_object(ClassId::new(1), 2);
+    let new_obj = shared.mem.heap.alloc_object(ClassId::new(1), 2);
     // Directly install a forwarding pointer on `old`'s header exactly the
     // way the live stop-the-world collector does. Every `VmHeap` backend
     // lays objects out with the full 32-byte `ObjectHeader`, and
@@ -1041,7 +1041,7 @@ fn t1_brooks_barrier_follows_forwarding_pointer() {
         std::ptr::addr_of_mut!((*hdr).forwarding_ptr).write(new_obj.as_ptr() as *mut u8);
     }
     // Now the barrier should follow the forwarding pointer.
-    let forwarded = shared.heap.load_and_forward(old);
+    let forwarded = shared.mem.heap.load_and_forward(old);
     assert_eq!(forwarded.as_ptr(), new_obj.as_ptr());
 }
 
@@ -1058,7 +1058,7 @@ fn t1_concurrent_mark_visits_every_reachable_object_once() {
     // Allocate a small graph of N objects.
     let n = 200;
     let mut roots: Vec<_> = (0..n)
-        .map(|_| shared.heap.alloc_object(ClassId::new(1), 2))
+        .map(|_| shared.mem.heap.alloc_object(ClassId::new(1), 2))
         .collect();
     let before: std::collections::HashSet<usize> =
         roots.iter().map(|o| o.as_ptr() as usize).collect();
@@ -1072,10 +1072,11 @@ fn t1_concurrent_mark_visits_every_reachable_object_once() {
     // bits; we only verify (a) no object is lost, (b) no duplicate
     // survives. The heap's internal mark counter would double-count
     // an object only if the marking pass enqueued it twice.
-    if shared.heap.needs_gc() {
+    if shared.mem.heap.needs_gc() {
         // Single-threaded test harness — no other mutator exists.
         let stw = unsafe { cratonvm_gc::collector::StopTheWorldToken::new() };
         let _ = shared
+            .mem
             .heap
             .collect_garbage(&stw, &mut roots, &shared.threads.monitors);
     }
@@ -1130,8 +1131,8 @@ fn t1_compare_and_swap_field_is_atomic_under_parallel_load() {
     use std::thread;
 
     let shared = Arc::new(SharedVm::new(VmConfig::default()));
-    let obj = shared.heap.alloc_object(ClassId::new(1), 2);
-    shared.heap.set_field(obj, 0, Value::Int(0));
+    let obj = shared.mem.heap.alloc_object(ClassId::new(1), 2);
+    shared.mem.heap.set_field(obj, 0, Value::Int(0));
 
     let n_threads = 4;
     let per_thread = 200;
@@ -1144,17 +1145,17 @@ fn t1_compare_and_swap_field_is_atomic_under_parallel_load() {
                 // new, CAS until success. Standard lock-free
                 // increment pattern.
                 loop {
-                    let current = shared.heap.get_field_volatile(obj, 0);
+                    let current = shared.mem.heap.get_field_volatile(obj, 0);
                     let cur_v = match current {
                         Value::Int(n) => n,
                         _ => 0,
                     };
                     let next = Value::Int(cur_v + 1);
                     if shared.threads.monitors.with_cas_lock(obj, || {
-                        let c = shared.heap.get_field_volatile(obj, 0);
+                        let c = shared.mem.heap.get_field_volatile(obj, 0);
                         if let (Value::Int(a), Value::Int(b)) = (c, current) {
                             if a == b {
-                                shared.heap.set_field_volatile(obj, 0, next);
+                                shared.mem.heap.set_field_volatile(obj, 0, next);
                                 return true;
                             }
                         }
@@ -1169,7 +1170,7 @@ fn t1_compare_and_swap_field_is_atomic_under_parallel_load() {
     for h in handles {
         h.join().unwrap();
     }
-    let final_val = shared.heap.get_field_volatile(obj, 0);
+    let final_val = shared.mem.heap.get_field_volatile(obj, 0);
     match final_val {
         Value::Int(n) => assert_eq!(n, (n_threads * per_thread) as i32),
         other => panic!("expected Int, got {other:?}"),
@@ -1348,17 +1349,17 @@ fn t9_tls_stubs_not_shadowing_real_impls() {
 #[test]
 fn t1_weak_ref_cleared_on_referent_unreachable() {
     let shared = Arc::new(SharedVm::new(VmConfig::default()));
-    let referent = shared.heap.alloc_object(ClassId::new(1), 0);
-    let weak = shared.heap.alloc_object(ClassId::new(1), 2);
+    let referent = shared.mem.heap.alloc_object(ClassId::new(1), 0);
+    let weak = shared.mem.heap.alloc_object(ClassId::new(1), 2);
     let ref_addr = weak.as_ptr() as usize;
     let refer_addr = referent.as_ptr() as usize;
     {
-        let mut rp = shared.ref_processor.lock();
+        let mut rp = shared.mem.ref_processor.lock();
         rp.discover_reference(cratonvm_gc::ReferenceType::Weak, ref_addr, refer_addr, None);
     }
     // Simulate GC: mark only the ref object, not the referent.
     {
-        let mut rp = shared.ref_processor.lock();
+        let mut rp = shared.mem.ref_processor.lock();
         let is_marked = |addr: usize| -> bool { addr == ref_addr };
         let _ = rp.process_references(&is_marked, 64, 0);
         let cleared = rp.cleared_ref_objects();
@@ -1393,10 +1394,11 @@ fn t1_chained_exception_preserves_identity() {
     use cratonvm_vm::types::Value;
 
     let shared = Arc::new(SharedVm::new(VmConfig::default()));
-    let throwable = shared.heap.alloc_object(ClassId::new(1), 2);
+    let throwable = shared.mem.heap.alloc_object(ClassId::new(1), 2);
     // Write a message into field 0 to simulate Throwable.detailMessage.
-    let msg = shared.heap.alloc_object(ClassId::new(2), 1);
+    let msg = shared.mem.heap.alloc_object(ClassId::new(2), 1);
     shared
+        .mem
         .heap
         .set_field(throwable, 0, Value::Object(Some(msg)));
 
@@ -1410,7 +1412,7 @@ fn t1_chained_exception_preserves_identity() {
                 "identity must be preserved"
             );
             // The message field must still be readable.
-            match shared.heap.get_field(obj, 0) {
+            match shared.mem.heap.get_field(obj, 0) {
                 Value::Object(Some(m)) => assert_eq!(m.as_ptr(), msg.as_ptr()),
                 other => panic!("expected message object, got {other:?}"),
             }
@@ -1451,7 +1453,7 @@ fn t1_gc_pause_budget_100k_objects_under_200ms() {
     let shared = Arc::new(SharedVm::new(VmConfig::default()));
     let start = Instant::now();
     for _ in 0..100_000 {
-        let _obj = shared.heap.alloc_object(ClassId::new(1), 0);
+        let _obj = shared.mem.heap.alloc_object(ClassId::new(1), 0);
     }
     let elapsed = start.elapsed();
     assert!(

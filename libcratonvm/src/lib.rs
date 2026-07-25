@@ -1569,7 +1569,7 @@ pub extern "C" fn cratonvm_string_utf8(vm: *mut CratonVm, str: CratonRef) -> *mu
                 };
                 // Reuse the VM's String reader (`vm::read_java_string`), the same
                 // primitive the JNIEnv `GetStringUTFChars` slot uses.
-                match cratonvm_vm::vm::read_java_string(&h.vm.shared.heap, oref) {
+                match cratonvm_vm::vm::read_java_string(&h.vm.shared.mem.heap, oref) {
                     Some(s) => {
                         // Strip interior NULs so `CString::new` cannot fail; the
                         // buffer is caller-owned (freed via cratonvm_free_string).
@@ -1726,7 +1726,7 @@ pub extern "C" fn cratonvm_invoke_virtual(
                 // most-derived class is exactly virtual dispatch (the same
                 // pattern `Vm::run_pending_finalizers` uses to virtual-dispatch
                 // `finalize()` on an object's concrete class).
-                let class_id = h.vm.shared.heap.class_id_of(recv);
+                let class_id = h.vm.shared.mem.heap.class_id_of(recv);
                 let class_name = match h.vm.class_name(class_id) {
                     Some(n) => n,
                     None => {
@@ -1792,7 +1792,7 @@ pub extern "C" fn cratonvm_object_class(
                         return JNI_ERR;
                     }
                 };
-                let class_id = h.vm.shared.heap.class_id_of(oref);
+                let class_id = h.vm.shared.mem.heap.class_id_of(oref);
                 if !out_class.is_null() {
                     // SAFETY: `out_class` checked non-null; writable per contract.
                     *out_class = class_id.as_u32() as CratonClass;
@@ -1871,7 +1871,7 @@ pub extern "C" fn cratonvm_field_count(vm: *mut CratonVm, obj: CratonRef) -> JIn
                         return -1;
                     }
                 };
-                let class_id = h.vm.shared.heap.class_id_of(oref);
+                let class_id = h.vm.shared.mem.heap.class_id_of(oref);
                 let n =
                     h.vm.shared
                         .classes
@@ -1924,7 +1924,7 @@ pub extern "C" fn cratonvm_get_field(
                         return CratonValue::error();
                     }
                 };
-                let class_id = h.vm.shared.heap.class_id_of(oref);
+                let class_id = h.vm.shared.mem.heap.class_id_of(oref);
                 let nfields =
                     h.vm.shared
                         .classes
@@ -1940,7 +1940,7 @@ pub extern "C" fn cratonvm_get_field(
                     return CratonValue::error();
                 }
                 // Bounds-checked above; `heap.get_field` reads the slot value.
-                let v = h.vm.shared.heap.get_field(oref, index as usize);
+                let v = h.vm.shared.mem.heap.get_field(oref, index as usize);
                 CratonValue::from_value(&h.vm.shared, v)
             })
         }
@@ -2121,7 +2121,7 @@ pub extern "C" fn cratonvm_get_field_by_name(
                     Some(s) => s,
                     None => return CratonValue::error(),
                 };
-                let class_id = h.vm.shared.heap.class_id_of(oref);
+                let class_id = h.vm.shared.mem.heap.class_id_of(oref);
                 match h.vm.instance_field_index(class_id, field_name) {
                     Some(idx) => {
                         CratonValue::from_value(&h.vm.shared, h.vm.get_instance_field(oref, idx))
@@ -2173,7 +2173,7 @@ pub extern "C" fn cratonvm_set_field(
                         return JNI_ERR;
                     }
                 };
-                let class_id = h.vm.shared.heap.class_id_of(oref);
+                let class_id = h.vm.shared.mem.heap.class_id_of(oref);
                 let nfields = h.vm.instance_field_count(class_id);
                 if index < 0 || (index as usize) >= nfields {
                     set_last_error(format!(
@@ -2230,7 +2230,7 @@ pub extern "C" fn cratonvm_set_field_by_name(
                     Some(s) => s,
                     None => return JNI_ERR,
                 };
-                let class_id = h.vm.shared.heap.class_id_of(oref);
+                let class_id = h.vm.shared.mem.heap.class_id_of(oref);
                 match h.vm.instance_field_index(class_id, field_name) {
                     Some(idx) => {
                         let value = match decode_craton_value(
@@ -3224,6 +3224,7 @@ mod tests {
             .alive_count();
         let gc_before = cratonvm_vm::native::jni::process_vm()
             .expect("process_vm published")
+            .mem
             .heap
             .collection_count();
 
@@ -3364,11 +3365,11 @@ mod tests {
                     eprintln!(
                         "[soak/watchdog] alive={} stw_requested={} blocked={} pending(expected-arrived)={}",
                         vm.threads.thread_registry.alive_count(),
-                        vm.gc_barrier
+                        vm.mem.gc_barrier
                             .stw_requested
                             .load(std::sync::atomic::Ordering::Acquire),
-                        vm.gc_barrier.blocked_count(),
-                        vm.gc_barrier.pending_count(),
+                        vm.mem.gc_barrier.blocked_count(),
+                        vm.mem.gc_barrier.pending_count(),
                     );
                     for (tid, blocked, snap) in vm.threads.thread_registry.dump_blocked_states() {
                         eprintln!(
@@ -3421,6 +3422,7 @@ mod tests {
         // the caller forced a large heap / few iterations for bisection.)
         let gc_after = cratonvm_vm::native::jni::process_vm()
             .expect("process_vm still live")
+            .mem
             .heap
             .collection_count();
         if iters >= 64 {

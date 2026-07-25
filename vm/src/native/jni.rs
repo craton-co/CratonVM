@@ -509,7 +509,7 @@ pub fn detach_foreign_thread(shared: &SharedVm) -> bool {
     // vm_exec.rs: unflushed entries in the thread-local buffer are dropped
     // with the TLS, losing the marker's only record of overwritten
     // references. Cheap no-op when no marking cycle is active.
-    shared.heap.flush_thread_satb();
+    shared.mem.heap.flush_thread_satb();
     // Retire the TLAB: install its tail filler and reset, so the unfilled tail
     // is walkable BEFORE this thread stops publishing its tail.  Clearing the
     // registry entry or marking it dead first lets a later non-moving sweep
@@ -568,7 +568,7 @@ pub fn host_thread_enter_native() -> bool {
         Some(s) => s,
         None => return false,
     };
-    let pre_stw = shared.gc_barrier.mark_blocked_region_enter();
+    let pre_stw = shared.mem.gc_barrier.mark_blocked_region_enter();
     if pre_stw {
         // A stop-the-world was already active when we incremented the blocked
         // count, so `request_stw` had counted this thread in `expected` (it was
@@ -578,7 +578,7 @@ pub fn host_thread_enter_native() -> bool {
         // initiator — and a non-foreign caller here is the creating thread (id 0).
         // GCAUDIT-0711-FIX (finding 1a): auto for uniformity - this call
         // site never raises in_blocked_region, so it resolves identically.
-        let _ = shared.gc_barrier.arrive_and_wait_auto(ThreadId(0));
+        let _ = shared.mem.gc_barrier.arrive_and_wait_auto(ThreadId(0));
     }
     true
 }
@@ -595,7 +595,7 @@ pub fn host_thread_leave_native() -> bool {
         Some(s) => s,
         None => return false,
     };
-    shared.gc_barrier.mark_blocked_region_leave();
+    shared.mem.gc_barrier.mark_blocked_region_leave();
     true
 }
 
@@ -704,7 +704,7 @@ fn aio_dispatcher_main() {
             .in_blocked_region
             .store(true, Ordering::Release);
     });
-    let _ = shared.gc_barrier.mark_blocked_region_enter();
+    let _ = shared.mem.gc_barrier.mark_blocked_region_enter();
     set_jni_context_arc(Arc::clone(&shared));
     set_jni_thread(raw);
 
@@ -729,7 +729,7 @@ fn aio_dispatcher_main() {
     // Clean detach (only reached on explicit shutdown).
     if let Some(shared) = process_vm() {
         if let Some(tid) = with_foreign_thread(|jt| jt.thread_id) {
-            shared.gc_barrier.mark_blocked_region_leave_after(|| {
+            shared.mem.gc_barrier.mark_blocked_region_leave_after(|| {
                 // Keep the retiring tail and the liveness transition in the
                 // barrier-serialized closure. A new STW must not observe this
                 // thread as dead before the tail has become walkable.
@@ -739,7 +739,7 @@ fn aio_dispatcher_main() {
                 shared.threads.monitors.release_monitors_held_by(tid);
             });
         } else {
-            shared.gc_barrier.mark_blocked_region_leave();
+            shared.mem.gc_barrier.mark_blocked_region_leave();
         }
         detach_foreign_thread(&shared);
     }
@@ -887,7 +887,7 @@ impl ForeignCallGuard {
         // helper methods instead of reimplementing a partial version of them
         // closes the gap and keeps this transition in sync with any future
         // change to the canonical blocking-region discipline.
-        shared.gc_barrier.mark_blocked_region_leave();
+        shared.mem.gc_barrier.mark_blocked_region_leave();
         with_foreign_thread(|jt| {
             crate::vm::NativeContextImpl {
                 shared: shared.as_ref(),
@@ -967,14 +967,14 @@ impl Drop for ForeignCallGuard {
                     .in_blocked_region
                     .store(true, std::sync::atomic::Ordering::Release);
             });
-            let pre_stw = shared.gc_barrier.mark_blocked_region_enter();
+            let pre_stw = shared.mem.gc_barrier.mark_blocked_region_enter();
             if pre_stw {
                 // GCAUDIT-0711-FIX (finding 1a): the in_blocked_region store
                 // above already ran, so this pause may already have
                 // excluded us - auto resolves it from that pause's own
                 // exclusion snapshot instead of assuming participation.
                 let tid = with_foreign_thread(|jt| jt.thread_id).unwrap_or(ThreadId(0));
-                let _ = shared.gc_barrier.arrive_and_wait_auto(tid);
+                let _ = shared.mem.gc_barrier.arrive_and_wait_auto(tid);
             }
         }
         if self.counted {
@@ -1199,7 +1199,7 @@ fn jni_call_instance(obj: JObject, mid: JMethodID, args: *const JValue) -> Optio
     let _fg = ForeignCallGuard::enter();
     with_jni_context(|shared, thread| {
         let oref = jobject_to_obj(obj)?;
-        let obj_class_id = shared.heap.class_id_of(oref);
+        let obj_class_id = shared.mem.heap.class_id_of(oref);
         let (decl_class_id, method_index) = decode_method_id(mid);
         let (method_name, descriptor) = {
             let cm = shared.classes.class_manager.read();
@@ -1666,7 +1666,7 @@ pub fn jobject_to_obj(jobj: JObject) -> Option<ObjectRef> {
         JNI_SHARED_VM.with(|c| {
             let borrow = c.borrow();
             match borrow.as_ref() {
-                Some(shared) => shared.heap.is_heap_addr(jobj as usize),
+                Some(shared) => shared.mem.heap.is_heap_addr(jobj as usize),
                 None => {
                     tracing::warn!(
                         "jobject_to_obj: local ref {jobj:#x} resolved outside JNI context"
@@ -2076,7 +2076,7 @@ extern "C" fn jni_get_object_class(_env: JNIEnv, obj: JObject) -> JClass {
     }
     with_shared_vm(|shared| {
         let oref = jobject_to_obj(obj)?;
-        let class_id = shared.heap.class_id_of(oref);
+        let class_id = shared.mem.heap.class_id_of(oref);
         Some(class_id.as_u32() as JClass)
     })
     .flatten()
@@ -2093,7 +2093,7 @@ extern "C" fn jni_is_instance_of(_env: JNIEnv, obj: JObject, clazz: JClass) -> J
     }
     with_shared_vm(|shared| {
         let oref = jobject_to_obj(obj)?;
-        let obj_class_id = shared.heap.class_id_of(oref);
+        let obj_class_id = shared.mem.heap.class_id_of(oref);
         let target_id = ClassId::new(clazz as u32);
         if obj_class_id == target_id {
             return Some(JNI_TRUE);
@@ -2653,7 +2653,7 @@ extern "C" fn jni_get_object_field(_env: JNIEnv, obj: JObject, field_id: JFieldI
     with_shared_vm(|shared| {
         let oref = jobject_to_obj(obj)?;
         let (_, field_index) = decode_field_id(field_id);
-        match shared.heap.get_field(oref, field_index) {
+        match shared.mem.heap.get_field(oref, field_index) {
             Value::Object(Some(r)) => Some(obj_to_jobject(r)),
             _ => Some(0),
         }
@@ -2695,7 +2695,7 @@ extern "C" fn jni_get_long_field(_env: JNIEnv, obj: JObject, field_id: JFieldID)
     with_shared_vm(|shared| {
         let oref = jobject_to_obj(obj)?;
         let (_, field_index) = decode_field_id(field_id);
-        match shared.heap.get_field(oref, field_index) {
+        match shared.mem.heap.get_field(oref, field_index) {
             Value::Long(l) => Some(l),
             Value::Int(i) => Some(i as JLong),
             _ => Some(0),
@@ -2713,7 +2713,7 @@ extern "C" fn jni_get_float_field(_env: JNIEnv, obj: JObject, field_id: JFieldID
     with_shared_vm(|shared| {
         let oref = jobject_to_obj(obj)?;
         let (_, field_index) = decode_field_id(field_id);
-        match shared.heap.get_field(oref, field_index) {
+        match shared.mem.heap.get_field(oref, field_index) {
             Value::Float(f) => Some(f),
             _ => Some(0.0),
         }
@@ -2730,7 +2730,7 @@ extern "C" fn jni_get_double_field(_env: JNIEnv, obj: JObject, field_id: JFieldI
     with_shared_vm(|shared| {
         let oref = jobject_to_obj(obj)?;
         let (_, field_index) = decode_field_id(field_id);
-        match shared.heap.get_field(oref, field_index) {
+        match shared.mem.heap.get_field(oref, field_index) {
             Value::Double(d) => Some(d),
             _ => Some(0.0),
         }
@@ -2751,7 +2751,7 @@ extern "C" fn jni_set_object_field(_env: JNIEnv, obj: JObject, field_id: JFieldI
             Some(r) => Value::Object(Some(r)),
             None => Value::Object(None),
         };
-        shared.heap.set_field(oref, field_index, value);
+        shared.mem.heap.set_field(oref, field_index, value);
         // write_barrier fires automatically inside set_field
         Some(())
     });
@@ -2794,10 +2794,16 @@ extern "C" fn jni_set_long_field(_env: JNIEnv, obj: JObject, field_id: JFieldID,
         // handle into a Java long field (see smuggled_longs). Strict probe so
         // ordinary numeric stores don't register.
         let bits = val as u64;
-        if bits != 0 && bits & 0x7 == 0 && shared.heap.is_object_address(bits as usize).is_some() {
+        if bits != 0
+            && bits & 0x7 == 0
+            && shared.mem.heap.is_object_address(bits as usize).is_some()
+        {
             crate::memory::smuggled_longs::record_minted_long(bits);
         }
-        shared.heap.set_field(oref, field_index, Value::Long(val));
+        shared
+            .mem
+            .heap
+            .set_field(oref, field_index, Value::Long(val));
         Some(())
     });
 }
@@ -2810,7 +2816,10 @@ extern "C" fn jni_set_float_field(_env: JNIEnv, obj: JObject, field_id: JFieldID
     with_shared_vm(|shared| {
         let oref = jobject_to_obj(obj)?;
         let (_, field_index) = decode_field_id(field_id);
-        shared.heap.set_field(oref, field_index, Value::Float(val));
+        shared
+            .mem
+            .heap
+            .set_field(oref, field_index, Value::Float(val));
         Some(())
     });
 }
@@ -2823,7 +2832,10 @@ extern "C" fn jni_set_double_field(_env: JNIEnv, obj: JObject, field_id: JFieldI
     with_shared_vm(|shared| {
         let oref = jobject_to_obj(obj)?;
         let (_, field_index) = decode_field_id(field_id);
-        shared.heap.set_field(oref, field_index, Value::Double(val));
+        shared
+            .mem
+            .heap
+            .set_field(oref, field_index, Value::Double(val));
         Some(())
     });
 }
@@ -3073,7 +3085,7 @@ extern "C" fn jni_get_string_utf_length(_env: JNIEnv, str_obj: JString) -> JSize
     }
     with_shared_vm(|shared| {
         let oref = jobject_to_obj(str_obj)?;
-        let s = read_java_string(&shared.heap, oref)?;
+        let s = read_java_string(&shared.mem.heap, oref)?;
         // The JNI contract specifies the *modified* UTF-8 length, which must
         // agree with what GetStringUTFChars produces (a caller commonly does
         // `malloc(GetStringUTFLength()+1)` then copies the chars in). Standard
@@ -3096,7 +3108,7 @@ extern "C" fn jni_get_string_utf_chars(
     }
     let result = with_shared_vm(|shared| {
         let oref = jobject_to_obj(str_obj)?;
-        let s = read_java_string(&shared.heap, oref)?;
+        let s = read_java_string(&shared.mem.heap, oref)?;
         // Encode as JNI "modified UTF-8": interior NUL (U+0000) must be encoded
         // as the two-byte sequence 0xC0 0x80 rather than a single 0x00, so that
         // the C string is only terminated by the trailing NUL we append below.
@@ -3140,7 +3152,7 @@ extern "C" fn jni_get_array_length(_env: JNIEnv, array: JArray) -> JSize {
     }
     with_shared_vm(|shared| {
         let oref = jobject_to_obj(array)?;
-        Some(shared.heap.array_length(oref) as JSize)
+        Some(shared.mem.heap.array_length(oref) as JSize)
     })
     .flatten()
     .unwrap_or(0)
@@ -3160,15 +3172,18 @@ extern "C" fn jni_new_object_array(
         let component_id = ClassId::new(clazz as u32);
         let arr =
             shared
+                .mem
                 .heap
                 .alloc_array(component_id, ArrayElementType::Reference, length as usize);
         // Initialize elements if init is non-null
         if init != 0 {
             if let Some(init_ref) = jobject_to_obj(init) {
                 for i in 0..length as usize {
-                    let _ = shared
-                        .heap
-                        .set_array_element(arr, i, Value::Object(Some(init_ref)));
+                    let _ =
+                        shared
+                            .mem
+                            .heap
+                            .set_array_element(arr, i, Value::Object(Some(init_ref)));
                 }
             }
         }
@@ -3184,7 +3199,7 @@ extern "C" fn jni_get_object_array_element(_env: JNIEnv, array: JArray, index: J
     }
     with_shared_vm(|shared| {
         let oref = jobject_to_obj(array)?;
-        match shared.heap.get_array_element(oref, index as usize) {
+        match shared.mem.heap.get_array_element(oref, index as usize) {
             Ok(Value::Object(Some(r))) => Some(obj_to_jobject(r)),
             _ => Some(0),
         }
@@ -3209,7 +3224,10 @@ extern "C" fn jni_set_object_array_element(
             Some(r) => Value::Object(Some(r)),
             None => Value::Object(None),
         };
-        let _ = shared.heap.set_array_element(oref, index as usize, value);
+        let _ = shared
+            .mem
+            .heap
+            .set_array_element(oref, index as usize, value);
         Some(())
     });
 }
@@ -3223,6 +3241,7 @@ macro_rules! new_prim_array {
             }
             with_shared_vm(|shared| {
                 let arr = shared
+                    .mem
                     .heap
                     .alloc_array(ClassId::new(0), $elem_type, length as usize);
                 obj_to_jobject(arr)
@@ -3295,7 +3314,7 @@ macro_rules! get_array_elements {
                 // per-element accessor (works for ordinary AND G1-humongous
                 // arrays). See the module comment above for why a copy — not a
                 // direct heap pointer — is what we hand to native code.
-                let len = shared.heap.array_length(oref);
+                let len = shared.mem.heap.array_length(oref);
                 // `len.max(1)` guarantees a real, uniquely-addressed allocation
                 // even for a zero-length array, so its buffer pointer is never a
                 // shared dangling sentinel that would collide in the maps below.
@@ -3303,7 +3322,7 @@ macro_rules! get_array_elements {
                 // by one element for the empty case stays sound.
                 let mut buf: Vec<$rust_type> = Vec::with_capacity(len.max(1));
                 for i in 0..len {
-                    let val = match shared.heap.get_array_element(oref, i) {
+                    let val = match shared.mem.heap.get_array_element(oref, i) {
                         Ok(v) => v,
                         Err(_) => break,
                     };
@@ -3417,12 +3436,12 @@ macro_rules! release_array_elements {
                 // array's bounds if it has since shrunk.
                 with_shared_vm(|shared| {
                     let oref = shared.natives.jni_global_refs.lock().resolve(array_gref)?;
-                    let arr_len = shared.heap.array_length(oref);
+                    let arr_len = shared.mem.heap.array_length(oref);
                     let copy_len = stored_len.min(arr_len);
                     for i in 0..copy_len {
                         let val = unsafe { *elems.add(i) };
                         let value = $value_constructor(val);
-                        let _ = shared.heap.set_array_element(oref, i, value);
+                        let _ = shared.mem.heap.set_array_element(oref, i, value);
                     }
                     Some(())
                 });
@@ -3557,11 +3576,12 @@ macro_rules! get_array_region {
                 let oref = jobject_to_obj(array)?;
                 // JNI contract: validate the requested window against the array
                 // length BEFORE touching memory; raise AIOOBE on a bad range.
-                if !region_bounds_ok(start, len, shared.heap.array_length(oref)) {
+                if !region_bounds_ok(start, len, shared.mem.heap.array_length(oref)) {
                     return None;
                 }
                 for i in 0..len as usize {
                     let val = shared
+                        .mem
                         .heap
                         .get_array_element(oref, start as usize + i)
                         .ok()?;
@@ -3606,12 +3626,12 @@ macro_rules! set_array_region {
                 // JNI contract: validate the requested window against the array
                 // length BEFORE writing; raise AIOOBE on a bad range so no
                 // partial / out-of-range store is performed.
-                if !region_bounds_ok(start, len, shared.heap.array_length(oref)) {
+                if !region_bounds_ok(start, len, shared.mem.heap.array_length(oref)) {
                     return None;
                 }
                 for i in 0..len as usize {
                     let val = unsafe { *buf.add(i) };
-                    let _ = shared.heap.set_array_element(
+                    let _ = shared.mem.heap.set_array_element(
                         oref,
                         start as usize + i,
                         $value_constructor(val),
@@ -3656,7 +3676,7 @@ extern "C" fn jni_set_long_array_region(
         // JNI contract: validate the requested window against the array
         // length BEFORE writing; raise AIOOBE on a bad range so no
         // partial / out-of-range store is performed.
-        if !region_bounds_ok(start, len, shared.heap.array_length(oref)) {
+        if !region_bounds_ok(start, len, shared.mem.heap.array_length(oref)) {
             return None;
         }
         for i in 0..len as usize {
@@ -3664,11 +3684,12 @@ extern "C" fn jni_set_long_array_region(
             let bits = val as u64;
             if bits != 0
                 && bits & 0x7 == 0
-                && shared.heap.is_object_address(bits as usize).is_some()
+                && shared.mem.heap.is_object_address(bits as usize).is_some()
             {
                 crate::memory::smuggled_longs::record_minted_long(bits);
             }
             let _ = shared
+                .mem
                 .heap
                 .set_array_element(oref, start as usize + i, Value::Long(val));
         }
@@ -3696,10 +3717,10 @@ extern "C" fn jni_monitor_enter(_env: JNIEnv, obj: JObject) -> JInt {
         // context; the calling thread's Java roots are covered by its own
         // registry snapshot).
         if let Some(m) = shared.threads.monitors.enter_or_contend(oref, ThreadId(0)) {
-            let blk = shared.gc_barrier.enter_blocked();
+            let blk = shared.mem.gc_barrier.enter_blocked();
             if blk.pre_stw {
                 // GCAUDIT-0711-FIX (finding 1a): auto for uniformity.
-                let _ = shared.gc_barrier.arrive_and_wait_auto(ThreadId(0));
+                let _ = shared.mem.gc_barrier.arrive_and_wait_auto(ThreadId(0));
             }
             m.block_enter(ThreadId(0));
             drop(blk);
@@ -3848,11 +3869,11 @@ extern "C" fn jni_from_reflected_method(_env: JNIEnv, method: JObject) -> JMetho
     with_shared_vm(|shared| {
         let oref = jobject_to_obj(method)?;
         // Reflected method objects store class_id and method_index in fields 0 and 1.
-        let class_id_val = match shared.heap.get_field(oref, 0) {
+        let class_id_val = match shared.mem.heap.get_field(oref, 0) {
             Value::Int(i) => i as u32,
             _ => return None,
         };
-        let method_idx = match shared.heap.get_field(oref, 1) {
+        let method_idx = match shared.mem.heap.get_field(oref, 1) {
             Value::Int(i) => i as u16,
             _ => return None,
         };
@@ -3871,11 +3892,11 @@ extern "C" fn jni_from_reflected_field(_env: JNIEnv, field: JObject) -> JFieldID
     with_shared_vm(|shared| {
         let oref = jobject_to_obj(field)?;
         // Reflected field objects store class_id in field 0 and field_index in field 1.
-        let class_id_val = match shared.heap.get_field(oref, 0) {
+        let class_id_val = match shared.mem.heap.get_field(oref, 0) {
             Value::Int(i) => i as u32,
             _ => return None,
         };
-        let field_idx = match shared.heap.get_field(oref, 1) {
+        let field_idx = match shared.mem.heap.get_field(oref, 1) {
             Value::Int(i) => i as usize,
             _ => return None,
         };
@@ -3924,11 +3945,13 @@ extern "C" fn jni_to_reflected_method(
             .read()
             .get_class(method_class_id)
             .map_or(4, |c| c.num_total_fields.max(4));
-        let obj = shared.heap.alloc_object(method_class_id, num_fields);
+        let obj = shared.mem.heap.alloc_object(method_class_id, num_fields);
         shared
+            .mem
             .heap
             .set_field(obj, 0, Value::Int(class_id.as_u32() as i32));
         shared
+            .mem
             .heap
             .set_field(obj, 1, Value::Int(method_index as i32));
         obj_to_jobject(obj)
@@ -3973,11 +3996,13 @@ extern "C" fn jni_to_reflected_field(
             .read()
             .get_class(field_class_id)
             .map_or(4, |c| c.num_total_fields.max(4));
-        let obj = shared.heap.alloc_object(field_class_id, num_fields);
+        let obj = shared.mem.heap.alloc_object(field_class_id, num_fields);
         shared
+            .mem
             .heap
             .set_field(obj, 0, Value::Int(class_id.as_u32() as i32));
         shared
+            .mem
             .heap
             .set_field(obj, 1, Value::Int(field_index as i32));
         obj_to_jobject(obj)
@@ -3998,7 +4023,7 @@ extern "C" fn jni_get_string_region(
     }
     with_shared_vm(|shared| {
         let oref = jobject_to_obj(str_obj)?;
-        let s = read_java_string(&shared.heap, oref)?;
+        let s = read_java_string(&shared.mem.heap, oref)?;
         let utf16: Vec<u16> = s.encode_utf16().collect();
         // JNI contract: a region outside the string raises (String)IndexOutOf-
         // BoundsException — surfaced here as AIOOBE via the shared checker
@@ -4028,7 +4053,7 @@ extern "C" fn jni_get_string_utf_region(
     }
     with_shared_vm(|shared| {
         let oref = jobject_to_obj(str_obj)?;
-        let s = read_java_string(&shared.heap, oref)?;
+        let s = read_java_string(&shared.mem.heap, oref)?;
         // In JNI, start/len refer to UTF-16 code units.
         let utf16: Vec<u16> = s.encode_utf16().collect();
         // JNI contract: a region outside the string raises (String)IndexOutOf-
@@ -4177,15 +4202,15 @@ extern "C" fn jni_get_primitive_array_critical(
         // spec permits returning a copy from GetPrimitiveArrayCritical; it is the
         // only collector-agnostic correct choice for this heap. Works uniformly
         // for ordinary AND G1-humongous arrays.
-        let element_type = shared.heap.array_element_type(oref)?;
+        let element_type = shared.mem.heap.array_element_type(oref)?;
         let stride = critical_stride(element_type);
         if stride == 0 {
             return None; // reference array — not a primitive critical
         }
-        let len = shared.heap.array_length(oref);
+        let len = shared.mem.heap.array_length(oref);
         let mut buf: Vec<u8> = vec![0u8; len * stride];
         for i in 0..len {
-            let v = match shared.heap.get_array_element(oref, i) {
+            let v = match shared.mem.heap.get_array_element(oref, i) {
                 Ok(v) => v,
                 Err(_) => break,
             };
@@ -4202,7 +4227,7 @@ extern "C" fn jni_get_primitive_array_critical(
         // address would be stale (data loss / write to a recycled object). Empty
         // (no-op) under the generational collector. Released by
         // `ReleasePrimitiveArrayCritical`.
-        let pinned_regions = shared.heap.pin_critical_region(oref);
+        let pinned_regions = shared.mem.heap.pin_critical_region(oref);
         JNI_CRITICAL_COPIES.with(|c| {
             c.borrow_mut().insert(
                 ptr as usize,
@@ -4265,7 +4290,7 @@ extern "C" fn jni_release_primitive_array_critical(
                     std::slice::from_raw_parts((carray as *const u8).add(off), copy.stride)
                 };
                 let v = critical_decode_element(copy.element_type, src);
-                let _ = shared.heap.set_array_element(oref, i, v);
+                let _ = shared.mem.heap.set_array_element(oref, i, v);
             }
             Some(())
         });
@@ -4277,7 +4302,7 @@ extern "C" fn jni_release_primitive_array_critical(
         // the generational collector.
         if !copy.pinned_regions.is_empty() {
             with_shared_vm(|shared| {
-                shared.heap.unpin_critical_regions(&copy.pinned_regions);
+                shared.mem.heap.unpin_critical_regions(&copy.pinned_regions);
                 Some(())
             });
         }
@@ -4394,7 +4419,7 @@ fn get_int_field_raw(obj: JObject, field_id: JFieldID) -> JInt {
     with_shared_vm(|shared| {
         let oref = jobject_to_obj(obj)?;
         let (_, field_index) = decode_field_id(field_id);
-        match shared.heap.get_field(oref, field_index) {
+        match shared.mem.heap.get_field(oref, field_index) {
             Value::Int(i) => Some(i),
             _ => Some(0),
         }
@@ -4410,7 +4435,10 @@ fn set_int_field_raw(obj: JObject, field_id: JFieldID, val: i32) {
     with_shared_vm(|shared| {
         let oref = jobject_to_obj(obj)?;
         let (_, field_index) = decode_field_id(field_id);
-        shared.heap.set_field(oref, field_index, Value::Int(val));
+        shared
+            .mem
+            .heap
+            .set_field(oref, field_index, Value::Int(val));
         Some(())
     });
 }
@@ -4697,7 +4725,7 @@ pub unsafe fn dispatch_jni_native(
             let bits = raw_result;
             if bits != 0 && bits & 0x7 == 0 {
                 with_shared_vm(|shared| {
-                    if shared.heap.is_object_address(bits as usize).is_some() {
+                    if shared.mem.heap.is_object_address(bits as usize).is_some() {
                         crate::memory::smuggled_longs::record_minted_long(bits);
                     }
                     Some(())
@@ -5201,7 +5229,7 @@ extern "C" fn jni_register_natives(
     // Resolve the class name from the JClass mirror
     let class_name = with_shared_vm(|shared| {
         let oref = jobject_to_obj(clazz)?;
-        let class_id = shared.heap.class_id_of(oref);
+        let class_id = shared.mem.heap.class_id_of(oref);
         shared
             .classes
             .class_manager
@@ -5242,7 +5270,7 @@ extern "C" fn jni_unregister_natives(_env: JNIEnv, clazz: JClass) -> JInt {
     // to reconstruct the keys. If we can't resolve the class, best-effort no-op.
     let class_name = with_shared_vm(|shared| {
         let oref = jobject_to_obj(clazz)?;
-        let class_id = shared.heap.class_id_of(oref);
+        let class_id = shared.mem.heap.class_id_of(oref);
         shared
             .classes
             .class_manager
@@ -5320,7 +5348,7 @@ extern "C" fn jni_alloc_object(_env: JNIEnv, clazz: JClass) -> JObject {
                 return 0;
             }
         };
-        let obj = shared.heap.alloc_object(class_id, num_fields);
+        let obj = shared.mem.heap.alloc_object(class_id, num_fields);
         obj_to_jobject(obj)
     })
     .unwrap_or(0)
@@ -5418,7 +5446,7 @@ extern "C" fn jni_get_string_length(_env: JNIEnv, str_obj: JString) -> JSize {
     }
     with_shared_vm(|shared| {
         let oref = jobject_to_obj(str_obj)?;
-        let s = read_java_string(&shared.heap, oref)?;
+        let s = read_java_string(&shared.mem.heap, oref)?;
         // Java String length is the UTF-16 code unit count.
         Some(s.chars().map(|c| c.len_utf16()).sum::<usize>() as JSize)
     })
@@ -5437,7 +5465,7 @@ extern "C" fn jni_get_string_chars(
     }
     let result = with_shared_vm(|shared| {
         let oref = jobject_to_obj(str_obj)?;
-        let s = read_java_string(&shared.heap, oref)?;
+        let s = read_java_string(&shared.mem.heap, oref)?;
         // Encode as UTF-16 and heap-allocate the buffer.
         let utf16: Vec<u16> = s.encode_utf16().collect();
         let len = utf16.len();
@@ -6044,12 +6072,15 @@ extern "C" fn jni_new_direct_byte_buffer(
             .read()
             .get_class(dbb_class_id)
             .map_or(2, |c| c.num_total_fields.max(2));
-        let obj = shared.heap.alloc_object(dbb_class_id, num_fields);
+        let obj = shared.mem.heap.alloc_object(dbb_class_id, num_fields);
         let handle = obj_to_jobject(obj);
         // Store the address as a long in field 0.
-        shared.heap.set_field(obj, 0, Value::Long(address as i64));
+        shared
+            .mem
+            .heap
+            .set_field(obj, 0, Value::Long(address as i64));
         // Store the capacity in field 1.
-        shared.heap.set_field(obj, 1, Value::Long(capacity));
+        shared.mem.heap.set_field(obj, 1, Value::Long(capacity));
         // Also register in our side-table for GetDirectBufferAddress.
         DIRECT_BUFFERS
             .lock()
@@ -6071,7 +6102,7 @@ extern "C" fn jni_get_direct_buffer_address(_env: JNIEnv, buf: JObject) -> *mut 
     // Fall back to reading the address field from the object.
     with_shared_vm(|shared| {
         let oref = jobject_to_obj(buf)?;
-        match shared.heap.get_field(oref, 0) {
+        match shared.mem.heap.get_field(oref, 0) {
             Value::Long(addr) => Some(addr as *mut u8),
             _ => None,
         }
@@ -6092,7 +6123,7 @@ extern "C" fn jni_get_direct_buffer_capacity(_env: JNIEnv, buf: JObject) -> JLon
     // Fall back to reading the capacity field.
     with_shared_vm(|shared| {
         let oref = jobject_to_obj(buf)?;
-        match shared.heap.get_field(oref, 1) {
+        match shared.mem.heap.get_field(oref, 1) {
             Value::Long(cap) => Some(cap),
             _ => None,
         }
@@ -6523,7 +6554,7 @@ fn attach_current_thread_impl(
         // Not counted in any active STW's `expected` (we registered after its
         // `request_stw`), so we must NOT arrive even if one is in progress —
         // hence the pre_stw return is intentionally ignored here.
-        let _ = shared.gc_barrier.mark_blocked_region_enter();
+        let _ = shared.mem.gc_barrier.mark_blocked_region_enter();
         // Publish the TLS context LAST.
         set_jni_context_arc(shared);
         set_jni_thread(raw);
@@ -6555,14 +6586,14 @@ extern "C" fn jni_detach_current_thread(_vm: JavaVM) -> JInt {
             // from seeing either an unwalkable tail or a dead thread that is
             // still counted as blocked.
             if let Some(tid) = tid {
-                shared.gc_barrier.mark_blocked_region_leave_after(|| {
+                shared.mem.gc_barrier.mark_blocked_region_leave_after(|| {
                     with_foreign_thread(|jt| jt.tlab.retire());
                     shared.threads.thread_registry.clear_tlab_addr(tid);
                     shared.threads.thread_registry.mark_dead(tid);
                     shared.threads.monitors.release_monitors_held_by(tid);
                 });
             } else {
-                shared.gc_barrier.mark_blocked_region_leave();
+                shared.mem.gc_barrier.mark_blocked_region_leave();
             }
             // Reclaim the already-retired attachment.
             detach_foreign_thread(&shared);
@@ -6665,6 +6696,7 @@ mod tests {
         use crate::vm::SharedVm;
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let obj = shared
+            .mem
             .heap
             .alloc_object(crate::classloading::ClassId::new(0), 1);
         let mut refs = JniGlobalRefs::new();
@@ -6686,6 +6718,7 @@ mod tests {
         use crate::vm::SharedVm;
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let obj = shared
+            .mem
             .heap
             .alloc_object(crate::classloading::ClassId::new(0), 1);
         let mut frame = JniLocalFrame::new();
@@ -6788,7 +6821,7 @@ mod tests {
         // pushed into the JvmThread's snapshot is visible to the cross-thread
         // collector (`collect_all_root_snapshots`), which is how a GC initiator
         // on another thread scans this foreign thread's roots.
-        let obj = shared.heap.alloc_object(ClassId::new(0), 1);
+        let obj = shared.mem.heap.alloc_object(ClassId::new(0), 1);
         jt.root_snapshot.lock().push(obj);
         let collected = shared.threads.thread_registry.collect_all_root_snapshots();
         assert!(
@@ -6848,25 +6881,25 @@ mod tests {
                 .in_blocked_region
                 .store(true, std::sync::atomic::Ordering::Release)
         });
-        let _ = shared.gc_barrier.mark_blocked_region_enter();
+        let _ = shared.mem.gc_barrier.mark_blocked_region_enter();
 
         // Two alive threads (main + foreign), but the idle foreign thread is
         // excluded from `expected`, so the initiator waits for nobody.
         let alive = shared.threads.thread_registry.alive_count() as u32;
         assert_eq!(alive, 2);
-        assert!(shared.gc_barrier.request_stw(main_tid, alive));
+        assert!(shared.mem.gc_barrier.request_stw(main_tid, alive));
         assert_eq!(
-            shared.gc_barrier.pending_count(),
+            shared.mem.gc_barrier.pending_count(),
             0,
             "idle foreign thread must be excluded from the STW expected-set"
         );
-        shared.gc_barrier.wait_for_all(); // returns immediately — no deadlock
-        shared.gc_barrier.complete_gc(HashMap::new());
+        shared.mem.gc_barrier.wait_for_all(); // returns immediately — no deadlock
+        shared.mem.gc_barrier.complete_gc(HashMap::new());
 
         // Teardown mirrors detach: mark dead, leave the region, reclaim.
         let tid = with_foreign_thread(|jt| jt.thread_id).unwrap();
         shared.threads.thread_registry.mark_dead(tid);
-        shared.gc_barrier.mark_blocked_region_leave();
+        shared.mem.gc_barrier.mark_blocked_region_leave();
         assert!(detach_foreign_thread(&shared));
     }
 
@@ -6888,14 +6921,14 @@ mod tests {
                 .in_blocked_region
                 .store(true, Ordering::Release)
         });
-        let _ = shared.gc_barrier.mark_blocked_region_enter();
-        assert_eq!(shared.gc_barrier.blocked_count(), 1);
+        let _ = shared.mem.gc_barrier.mark_blocked_region_enter();
+        assert_eq!(shared.mem.gc_barrier.blocked_count(), 1);
 
         {
             // Outermost call → leave blocked region, counted mutator.
             let _fg = ForeignCallGuard::enter();
             assert_eq!(
-                shared.gc_barrier.blocked_count(),
+                shared.mem.gc_barrier.blocked_count(),
                 0,
                 "outermost call must leave the blocked region"
             );
@@ -6908,14 +6941,14 @@ mod tests {
             {
                 // Nested call (e.g. a JNI up-call) → depth only, no transition.
                 let _fg2 = ForeignCallGuard::enter();
-                assert_eq!(shared.gc_barrier.blocked_count(), 0);
+                assert_eq!(shared.mem.gc_barrier.blocked_count(), 0);
                 assert_eq!(FOREIGN_CALL_DEPTH.with(|c| c.get()), 2);
             }
             assert_eq!(FOREIGN_CALL_DEPTH.with(|c| c.get()), 1);
         }
         // Outermost return → idle/blocked again.
         assert_eq!(
-            shared.gc_barrier.blocked_count(),
+            shared.mem.gc_barrier.blocked_count(),
             1,
             "outermost return must re-enter the blocked region"
         );
@@ -6929,11 +6962,11 @@ mod tests {
         // A non-foreign thread sees an entirely inert guard.
         let tid = with_foreign_thread(|jt| jt.thread_id).unwrap();
         shared.threads.thread_registry.mark_dead(tid);
-        shared.gc_barrier.mark_blocked_region_leave();
+        shared.mem.gc_barrier.mark_blocked_region_leave();
         assert!(detach_foreign_thread(&shared));
         {
             let _fg = ForeignCallGuard::enter();
-            assert_eq!(shared.gc_barrier.blocked_count(), 0);
+            assert_eq!(shared.mem.gc_barrier.blocked_count(), 0);
             assert_eq!(FOREIGN_CALL_DEPTH.with(|c| c.get()), 0);
         }
     }
@@ -6961,20 +6994,20 @@ mod tests {
 
         // This thread declares itself in-native (no foreign attachment present).
         assert!(host_thread_enter_native());
-        assert_eq!(shared.gc_barrier.blocked_count(), 1);
+        assert_eq!(shared.mem.gc_barrier.blocked_count(), 1);
 
         // A STW from the initiator excludes the in-native thread → waits for nobody.
-        assert!(shared.gc_barrier.request_stw(init, 2));
+        assert!(shared.mem.gc_barrier.request_stw(init, 2));
         assert_eq!(
-            shared.gc_barrier.pending_count(),
+            shared.mem.gc_barrier.pending_count(),
             0,
             "in-native thread must be excluded from the STW expected-set"
         );
-        shared.gc_barrier.wait_for_all();
-        shared.gc_barrier.complete_gc(HashMap::new());
+        shared.mem.gc_barrier.wait_for_all();
+        shared.mem.gc_barrier.complete_gc(HashMap::new());
 
         assert!(host_thread_leave_native());
-        assert_eq!(shared.gc_barrier.blocked_count(), 0);
+        assert_eq!(shared.mem.gc_barrier.blocked_count(), 0);
     }
 
     #[test]
@@ -7012,16 +7045,16 @@ mod tests {
             .native_pending_return
             .expect("ThrowNew must publish a GC-rooted exception");
         assert_eq!(
-            vm.shared.heap.class_id_of(exception),
+            vm.shared.mem.heap.class_id_of(exception),
             class_id,
             "ThrowNew must preserve the supplied jclass"
         );
 
-        let Value::Object(Some(message_object)) = vm.shared.heap.get_field(exception, 1) else {
+        let Value::Object(Some(message_object)) = vm.shared.mem.heap.get_field(exception, 1) else {
             panic!("ThrowNew exception must retain its detailMessage");
         };
         assert_eq!(
-            read_java_string(&vm.shared.heap, message_object).as_deref(),
+            read_java_string(&vm.shared.mem.heap, message_object).as_deref(),
             Some("native provider unavailable")
         );
 
@@ -7091,9 +7124,11 @@ mod tests {
         use std::sync::Arc;
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let obj1 = shared
+            .mem
             .heap
             .alloc_object(crate::classloading::ClassId::new(0), 1);
         let obj2 = shared
+            .mem
             .heap
             .alloc_object(crate::classloading::ClassId::new(0), 1);
         let local1 = obj_to_jobject(obj1);
@@ -7123,9 +7158,11 @@ mod tests {
         use crate::vm::SharedVm;
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let obj1 = shared
+            .mem
             .heap
             .alloc_object(crate::classloading::ClassId::new(0), 1);
         let obj2 = shared
+            .mem
             .heap
             .alloc_object(crate::classloading::ClassId::new(0), 1);
         let mut refs = JniGlobalRefs::new();
@@ -7186,6 +7223,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         set_jni_context_arc(shared.clone());
         let arr = shared
+            .mem
             .heap
             .alloc_array(ClassId::new(0), ArrayElementType::Int, 10);
         let jarray = obj_to_jobject(arr);
@@ -7201,7 +7239,7 @@ mod tests {
         use crate::vm::SharedVm;
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         set_jni_context_arc(shared.clone());
-        let obj = shared.heap.alloc_object(ClassId::new(0), 3);
+        let obj = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         let jobj = obj_to_jobject(obj);
         let fid = encode_field_id(ClassId::new(0), 1);
         let env = get_jni_env();
@@ -7453,6 +7491,7 @@ mod tests {
         use crate::vm::SharedVm;
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let obj = shared
+            .mem
             .heap
             .alloc_object(crate::classloading::ClassId::new(0), 1);
         let mut refs = JniGlobalRefs::new();
@@ -7474,6 +7513,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         set_jni_context_arc(shared.clone());
         let obj = shared
+            .mem
             .heap
             .alloc_object(crate::classloading::ClassId::new(0), 1);
         let handle = shared.natives.jni_global_refs.lock().add(obj);
@@ -7494,6 +7534,7 @@ mod tests {
         use crate::vm::SharedVm;
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let obj = shared
+            .mem
             .heap
             .alloc_object(crate::classloading::ClassId::new(0), 1);
         // Create a global ref via the shared state.
@@ -7513,6 +7554,7 @@ mod tests {
         use crate::vm::SharedVm;
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let obj = shared
+            .mem
             .heap
             .alloc_object(crate::classloading::ClassId::new(0), 1);
         let mut refs = JniGlobalRefs::new();
@@ -7570,6 +7612,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         set_jni_context_arc(shared.clone());
         let obj = shared
+            .mem
             .heap
             .alloc_object(crate::classloading::ClassId::new(0), 1);
         let local_ref = obj_to_jobject(obj); // raw local ref
@@ -7636,6 +7679,7 @@ mod tests {
     fn alloc_test_obj() -> (Arc<crate::vm::SharedVm>, ObjectRef) {
         let shared = Arc::new(crate::vm::SharedVm::new(crate::config::VmConfig::default()));
         let obj = shared
+            .mem
             .heap
             .alloc_object(crate::classloading::ClassId::new(0), 1);
         (shared, obj)

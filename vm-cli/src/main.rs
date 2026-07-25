@@ -2474,7 +2474,7 @@ fn run() -> Result<()> {
                 // uninitialized reference slots).  The fallback path uses our
                 // synthetic System.in/out/err so stdout/stderr still work.
                 if let cratonvm_vm::error::MethodCallFailed::ExceptionThrown(exc_ref) = &e {
-                    let exc_class_id = vm.shared.heap.class_id_of(*exc_ref);
+                    let exc_class_id = vm.shared.mem.heap.class_id_of(*exc_ref);
                     let exc_class_name = vm
                         .shared
                         .classes
@@ -2601,13 +2601,14 @@ fn run() -> Result<()> {
         .shared
         .load_class_concurrent("java/lang/String")
         .unwrap_or_else(|_| cratonvm_vm::ClassId::new(0));
-    let args_array = vm.shared.heap.alloc_array(
+    let args_array = vm.shared.mem.heap.alloc_array(
         string_array_class_id,
         cratonvm_vm::memory::heap::ArrayElementType::Reference,
         java_args.len(),
     );
     for (i, val) in java_args.into_iter().enumerate() {
         vm.shared
+            .mem
             .heap
             .set_array_element(args_array, i, val)
             .map_err(|idx| {
@@ -2741,7 +2742,7 @@ fn run() -> Result<()> {
         cratonvm_vm::jit::helpers::mic_prof::dump_now();
         eprintln!(
             "[MIC_PROF] gc_collections={} total_dispatches={}",
-            vm.shared.heap.collection_count(),
+            vm.shared.mem.heap.collection_count(),
             cratonvm_vm::dispatch_trace::total_dispatches()
         );
     }
@@ -2774,7 +2775,7 @@ fn run() -> Result<()> {
     // can collect the table without `RUST_LOG`. No-op for the generational
     // collector and when no G1 collection ran.
     if args.verbose_gc || std::env::var_os("CRATONVM_GC_STATS").is_some() {
-        vm.shared.heap.print_gc_summary();
+        vm.shared.mem.heap.print_gc_summary();
     }
 
     // T19.K1 — wait for non-daemon threads before exiting.
@@ -2890,7 +2891,7 @@ fn run() -> Result<()> {
             // exceptions are not silently truncated.
             const MAX_CAUSE_DEPTH: usize = 8;
             for depth in 0..MAX_CAUSE_DEPTH {
-                let cid = vm.shared.heap.class_id_of(cur);
+                let cid = vm.shared.mem.heap.class_id_of(cur);
                 // PERF: resolve the class name AND the Throwable field indices
                 // under a single read guard. These were two back-to-back
                 // `class_manager.read()` calls; both are pure reads with no
@@ -2942,9 +2943,10 @@ fn run() -> Result<()> {
                     (cname, msg_i, cause_i, stack_i, target_i)
                 };
                 let message = if let Some(i) = msg_idx {
-                    let v = vm.shared.heap.get_field(cur, i);
+                    let v = vm.shared.mem.heap.get_field(cur, i);
                     if let Value::Object(Some(s)) = v {
-                        cratonvm_vm::vm::read_java_string(&vm.shared.heap, s).unwrap_or_default()
+                        cratonvm_vm::vm::read_java_string(&vm.shared.mem.heap, s)
+                            .unwrap_or_default()
                     } else {
                         String::new()
                     }
@@ -2966,9 +2968,9 @@ fn run() -> Result<()> {
                 // Throwable fields above so we work regardless of layout.
                 let mut emitted_frames = false;
                 if let Some(si) = stack_idx {
-                    let stack_val = vm.shared.heap.get_field(cur, si);
+                    let stack_val = vm.shared.mem.heap.get_field(cur, si);
                     if let Value::Object(Some(arr)) = stack_val {
-                        let len = vm.shared.heap.array_length(arr);
+                        let len = vm.shared.mem.heap.array_length(arr);
                         if len > 0 {
                             emitted_frames = true;
                             // Resolve StackTraceElement field indices once
@@ -2976,16 +2978,18 @@ fn run() -> Result<()> {
                             let mut ste_idx: Option<(usize, usize, usize, usize)> = None;
                             for i in 0..len {
                                 let elem =
-                                    vm.shared.heap.get_array_element(arr, i).ok().and_then(|v| {
-                                        if let Value::Object(Some(o)) = v {
-                                            Some(o)
-                                        } else {
-                                            None
-                                        }
-                                    });
+                                    vm.shared.mem.heap.get_array_element(arr, i).ok().and_then(
+                                        |v| {
+                                            if let Value::Object(Some(o)) = v {
+                                                Some(o)
+                                            } else {
+                                                None
+                                            }
+                                        },
+                                    );
                                 let Some(elem_ref) = elem else { continue };
                                 if ste_idx.is_none() {
-                                    let ecid = vm.shared.heap.class_id_of(elem_ref);
+                                    let ecid = vm.shared.mem.heap.class_id_of(elem_ref);
                                     let cm = vm.shared.classes.class_manager.read();
                                     let mut dc: Option<usize> = None;
                                     let mut mn: Option<usize> = None;
@@ -3030,9 +3034,12 @@ fn run() -> Result<()> {
                                     continue;
                                 };
                                 let read_str = |idx: usize| -> Option<String> {
-                                    match vm.shared.heap.get_field(elem_ref, idx) {
+                                    match vm.shared.mem.heap.get_field(elem_ref, idx) {
                                         Value::Object(Some(s)) => {
-                                            cratonvm_vm::vm::read_java_string(&vm.shared.heap, s)
+                                            cratonvm_vm::vm::read_java_string(
+                                                &vm.shared.mem.heap,
+                                                s,
+                                            )
                                         }
                                         _ => None,
                                     }
@@ -3042,7 +3049,7 @@ fn run() -> Result<()> {
                                 let method_name =
                                     read_str(mn).unwrap_or_else(|| "<unknown>".to_string());
                                 let file_name = read_str(fn_);
-                                let line_no = match vm.shared.heap.get_field(elem_ref, ln) {
+                                let line_no = match vm.shared.mem.heap.get_field(elem_ref, ln) {
                                     Value::Int(i) => i,
                                     _ => -1,
                                 };
@@ -3093,7 +3100,7 @@ fn run() -> Result<()> {
                 let mut next_cause = {
                     let mut next = None;
                     if let Some(i) = cause_idx {
-                        if let Value::Object(Some(c)) = vm.shared.heap.get_field(cur, i) {
+                        if let Value::Object(Some(c)) = vm.shared.mem.heap.get_field(cur, i) {
                             if c != cur {
                                 next = Some(c);
                             }
@@ -3101,7 +3108,7 @@ fn run() -> Result<()> {
                     }
                     if next.is_none() {
                         if let Some(i) = target_idx {
-                            if let Value::Object(Some(t)) = vm.shared.heap.get_field(cur, i) {
+                            if let Value::Object(Some(t)) = vm.shared.mem.heap.get_field(cur, i) {
                                 if t != cur {
                                     next = Some(t);
                                 }
@@ -3194,16 +3201,16 @@ fn run() -> Result<()> {
                         found
                     };
                     if let Some(ai) = arr_idx {
-                        match vm.shared.heap.get_field(cur, ai) {
+                        match vm.shared.mem.heap.get_field(cur, ai) {
                             Value::Object(Some(arr)) => {
-                                let n = vm.shared.heap.array_length(arr);
+                                let n = vm.shared.mem.heap.array_length(arr);
                                 lines.push(format!(
                                     "[cratonvm-cli] PropertyBatchUpdateException.propertyAccessExceptions length={n}"
                                 ));
                                 for i in 0..n {
-                                    let elem = vm.shared.heap.get_array_element(arr, i).ok();
+                                    let elem = vm.shared.mem.heap.get_array_element(arr, i).ok();
                                     if let Some(Value::Object(Some(eref))) = elem {
-                                        let ecid = vm.shared.heap.class_id_of(eref);
+                                        let ecid = vm.shared.mem.heap.class_id_of(eref);
                                         // PERF: one read guard for the sub-exception class
                                         // name and its field indices (back-to-back reads).
                                         // Read detailMessage and cause from this sub-exception
@@ -3245,10 +3252,10 @@ fn run() -> Result<()> {
                                             }
                                             let read_s = |idx: Option<usize>| -> String {
                                                 idx.and_then(|i| {
-                                                    match vm.shared.heap.get_field(eref, i) {
+                                                    match vm.shared.mem.heap.get_field(eref, i) {
                                                         Value::Object(Some(s)) => {
                                                             cratonvm_vm::vm::read_java_string(
-                                                                &vm.shared.heap,
+                                                                &vm.shared.mem.heap,
                                                                 s,
                                                             )
                                                         }
@@ -3292,7 +3299,7 @@ fn run() -> Result<()> {
                                         // up to 6 deep just in case).
                                         let mut sub_cur = scause.and_then(|ci| {
                                             if let Value::Object(Some(c)) =
-                                                vm.shared.heap.get_field(eref, ci)
+                                                vm.shared.mem.heap.get_field(eref, ci)
                                             {
                                                 if c != eref {
                                                     Some(c)
@@ -3305,7 +3312,7 @@ fn run() -> Result<()> {
                                         });
                                         for _d in 0..6 {
                                             let Some(sc) = sub_cur else { break };
-                                            let sc_cid = vm.shared.heap.class_id_of(sc);
+                                            let sc_cid = vm.shared.mem.heap.class_id_of(sc);
                                             // PERF: one read guard for the sub-cause class
                                             // name and its field indices (back-to-back reads).
                                             let (sc_name, sc_msg, sc_cause_idx) = {
@@ -3345,10 +3352,10 @@ fn run() -> Result<()> {
                                                 }
                                                 let m = mi
                                                     .and_then(|i| {
-                                                        match vm.shared.heap.get_field(sc, i) {
+                                                        match vm.shared.mem.heap.get_field(sc, i) {
                                                             Value::Object(Some(s)) => {
                                                                 cratonvm_vm::vm::read_java_string(
-                                                                    &vm.shared.heap,
+                                                                    &vm.shared.mem.heap,
                                                                     s,
                                                                 )
                                                             }
@@ -3386,7 +3393,7 @@ fn run() -> Result<()> {
                                             }
                                             sub_cur = sc_cause_idx.and_then(|ci| {
                                                 if let Value::Object(Some(c)) =
-                                                    vm.shared.heap.get_field(sc, ci)
+                                                    vm.shared.mem.heap.get_field(sc, ci)
                                                 {
                                                     if c != sc {
                                                         Some(c)

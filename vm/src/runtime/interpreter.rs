@@ -170,7 +170,7 @@ pub fn weakref_null_referents_pre_gc(shared: &SharedVm) {
         return;
     }
     let pairs = {
-        let rp = shared.ref_processor.lock();
+        let rp = shared.mem.ref_processor.lock();
         rp.weak_phantom_active_pairs()
     };
     // RandomizedContext WeakHashMap<Thread,...> fix: publish this cycle's
@@ -204,7 +204,7 @@ pub fn weakref_null_referents_pre_gc(shared: &SharedVm) {
         .flat_map(|&(ref_obj, referent)| [ref_obj, referent])
         .collect();
     let queue_watch_addrs = {
-        let rp = shared.ref_processor.lock();
+        let rp = shared.mem.ref_processor.lock();
         rp.weak_phantom_active_queue_addrs()
     };
     let mut watched_reference_liveness = watch_addrs;
@@ -240,7 +240,7 @@ pub fn weakref_null_referents_pre_gc(shared: &SharedVm) {
         // Defensive: a real `java.lang.ref.Reference` always has >= 1 field
         // (the referent at slot 0). Skip an undersized/zeroed slot rather than
         // write OOB.
-        if shared.heap.num_fields(ref_obj) >= 1 {
+        if shared.mem.heap.num_fields(ref_obj) >= 1 {
             // Slot 0 = REF_FIELD_REFERENT (matches the real JDK Reference layout
             // and the synthetic constant in native-builtins).
             //
@@ -251,6 +251,7 @@ pub fn weakref_null_referents_pre_gc(shared: &SharedVm) {
             // pause, which kept weakly-reachable Old objects bitmap-marked
             // and made remark-time reference processing inert.
             shared
+                .mem
                 .heap
                 .set_field_suppress_satb(ref_obj, 0, Value::Object(None));
         }
@@ -393,7 +394,7 @@ fn mtroots_set_gc_ctx(shared: &SharedVm, thread: &JvmThread, reason: u8) {
             // Widening: smaller value -> u32 (value fits)
             thread.thread_id.0 as u32,
             // Widening: smaller value -> u32 (value fits)
-            shared.gc_barrier.blocked_count() as u32,
+            shared.mem.gc_barrier.blocked_count() as u32,
         );
     }
 }
@@ -414,13 +415,13 @@ fn mtroots_dump_initiator(shared: &SharedVm, thread: &JvmThread, reason: u8) {
         reason,
         thread.thread_id.0,
         shared.threads.thread_registry.alive_count(),
-        shared.gc_barrier.blocked_count(),
+        shared.mem.gc_barrier.blocked_count(),
         thread.frames.len(),
     );
     // Top frames only (the relevant Java call site).
     for frame in thread.frames.iter().rev().take(8) {
         let mut objs: Vec<ObjectRef> = Vec::new();
-        frame.scan_local_objects(&mut objs, &shared.heap);
+        frame.scan_local_objects(&mut objs, &shared.mem.heap);
         let _ = write!(
             buf,
             "\n[mtroots]   {}.{} locals=[",
@@ -572,8 +573,8 @@ fn stw_take_over_and_wait(
     // safe — non-moving, registry-walked sweep, and its mutators never hold
     // TLABs. The `supports_jit_tlab_skip` gate is retained for any future
     // backend that can't make one of those arguments.
-    if !xt::enabled() || !shared.heap.supports_jit_tlab_skip() {
-        shared.gc_barrier.wait_for_all();
+    if !xt::enabled() || !shared.mem.heap.supports_jit_tlab_skip() {
+        shared.mem.gc_barrier.wait_for_all();
         return xt::TakenOver::default();
     }
     let mut taken = xt::TakenOver::default();
@@ -592,7 +593,11 @@ fn stw_take_over_and_wait(
         let should_scan =
             stw_takeover_should_scan(rounds, crate::jit::conservative_roots::any_thread_in_jit());
         let newly = if should_scan {
-            xt::take_over_pass(&mut taken, &|a| shared.heap.is_object_address(a), xt_roots)
+            xt::take_over_pass(
+                &mut taken,
+                &|a| shared.mem.heap.is_object_address(a),
+                xt_roots,
+            )
         } else {
             0
         };
@@ -624,15 +629,15 @@ fn stw_take_over_and_wait(
                 }
             }
             if excuse > 0 {
-                shared.gc_barrier.reduce_expected(excuse);
+                shared.mem.gc_barrier.reduce_expected(excuse);
             }
         }
         rounds += 1;
-        if shared.gc_barrier.wait_for_all_timeout(WAIT_SLICE) {
+        if shared.mem.gc_barrier.wait_for_all_timeout(WAIT_SLICE) {
             break;
         }
         if !warned && rounds >= WARN_AFTER_ROUNDS {
-            let pending = shared.gc_barrier.pending_count();
+            let pending = shared.mem.gc_barrier.pending_count();
             tracing::warn!(
                 rounds,
                 pending,
@@ -663,7 +668,7 @@ fn stw_take_over_and_wait(
                 .threads
                 .thread_registry
                 .alive_count_blocked_and_os_tids();
-            let legacy_blocked = shared.gc_barrier.blocked_count() as usize;
+            let legacy_blocked = shared.mem.gc_barrier.blocked_count() as usize;
             if legacy_blocked > census_blocked {
                 eprintln!(
                     "[gcbarrier-tripwire] legacy blocked_count()={legacy_blocked} > \
@@ -681,7 +686,7 @@ fn stw_take_over_and_wait(
                 eprintln!(
                     "[stw-census] rounds={rounds} pending={pending} taken={} blocked={} alive={}{}",
                     taken.count(),
-                    shared.gc_barrier.blocked_count(),
+                    shared.mem.gc_barrier.blocked_count(),
                     shared.threads.thread_registry.alive_count(),
                     shared.threads.thread_registry.debug_thread_census()
                 );
@@ -730,16 +735,21 @@ fn stw_take_over_and_wait(
             let peer: &crate::threading::jvm_thread::JvmThread =
                 unsafe { &*(addr as *const crate::threading::jvm_thread::JvmThread) };
             for frame in peer.frames.iter() {
-                frame.scan_local_objects(xt_roots, &shared.heap);
+                frame.scan_local_objects(xt_roots, &shared.mem.heap);
                 let sb = xt_roots.len();
-                frame.stack.scan_object_refs(xt_roots, &shared.heap);
+                frame.stack.scan_object_refs(xt_roots, &shared.mem.heap);
                 if xt_roots.len() > sb {
                     // Operand-stack candidates are validated strictly, exactly
                     // like the deposit path (`scan_frame_roots`): a pointer-
                     // shaped primitive long must not become a root.
                     let added = xt_roots.split_off(sb);
                     for o in added {
-                        if shared.heap.is_object_address(o.as_ptr() as usize).is_some() {
+                        if shared
+                            .mem
+                            .heap
+                            .is_object_address(o.as_ptr() as usize)
+                            .is_some()
+                        {
                             xt_roots.push(o);
                         }
                     }
@@ -776,7 +786,7 @@ fn stw_take_over_and_wait(
     // exist at all: a blocked thread while some thread holds live JIT frames.
     let mut helper_windows = 0usize;
     if xt::helper_window_scan_enabled()
-        && shared.gc_barrier.blocked_count() > 0
+        && shared.mem.gc_barrier.blocked_count() > 0
         && crate::jit::conservative_roots::any_thread_in_jit()
     {
         // xt-hardening follow-up (2026-07-03): scope the pass to threads
@@ -788,7 +798,7 @@ fn stw_take_over_and_wait(
         let blocked_os_tids = shared.threads.thread_registry.blocked_os_tids();
         let (windows, _roots) = xt::helper_window_pass(
             &taken,
-            &|a| shared.heap.is_object_address(a),
+            &|a| shared.mem.heap.is_object_address(a),
             xt_roots,
             &blocked_os_tids,
         );
@@ -801,7 +811,7 @@ fn stw_take_over_and_wait(
     // Cleared by the caller after the collection completes.
     let regions = shared.threads.thread_registry.collect_reserved_tlab_tails();
     if taken.count() > 0 || helper_windows > 0 || !regions.is_empty() {
-        shared.heap.set_jit_tlab_skip_regions(&regions);
+        shared.mem.heap.set_jit_tlab_skip_regions(&regions);
     }
     if taken.count() > 0 || helper_windows > 0 {
         // Helper-window roots are conservative (unprovable coverage) — the
@@ -850,7 +860,7 @@ fn pin_frozen_peer_roots_for_g1(
     xt_roots: &[ObjectRef],
     taken: &crate::jit::xt_root_scan::TakenOver,
 ) {
-    if !shared.heap.is_g1() {
+    if !shared.mem.heap.is_g1() {
         return;
     }
     for r in xt_roots {
@@ -1045,7 +1055,7 @@ pub(crate) fn remap_trace_push(shared: &SharedVm, thread: &JvmThread, tag: &str,
         .unwrap_or_else(|| "<no-frame>".to_string());
     let line = format!(
         "e{} {} tid={} frames={} top={} {}",
-        shared.heap.collection_count(),
+        shared.mem.heap.collection_count(),
         tag,
         thread.thread_id.0,
         thread.frames.len(),
@@ -1101,8 +1111,9 @@ pub(crate) fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
     // First, check if another thread requested STW — if so, participate
     safepoint_check(shared, thread);
 
-    if shared.heap.needs_gc()
+    if shared.mem.heap.needs_gc()
         || shared
+            .mem
             .gc_requested
             .swap(false, std::sync::atomic::Ordering::Relaxed)
     {
@@ -1114,7 +1125,7 @@ pub(crate) fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
         // overwritten references vanish on every cycle; the bug bites
         // hardest in single-threaded mode where the initiator IS every
         // mutator.
-        shared.heap.flush_thread_satb();
+        shared.mem.heap.flush_thread_satb();
         // Update our root snapshot before requesting STW
         cratonvm_gc::gc_quiescence::begin_moving_young_coverage_cycle();
         update_root_snapshot(shared, thread);
@@ -1158,9 +1169,11 @@ pub(crate) fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
             // HIB-CV-24: null Weak/Phantom referents before marking (restored post-GC).
             weakref_null_referents_pre_gc(shared);
             let stw = unsafe { cratonvm_gc::collector::StopTheWorldToken::new() };
-            let result = shared
-                .heap
-                .collect_garbage(&stw, &mut roots, &shared.threads.monitors);
+            let result =
+                shared
+                    .mem
+                    .heap
+                    .collect_garbage(&stw, &mut roots, &shared.threads.monitors);
             process_references_after_gc(shared, &result.pointer_map);
             update_all_roots(shared, thread, &result.pointer_map);
             // DBG (bc math-ec, CRATONVM_DBG_ECWATCH): the moving collector
@@ -1270,7 +1283,8 @@ pub(crate) fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
                     gc_duration_ms * 1_000_000,
                 );
                 // Truncation-checked: heap bytes (usize) to i64; heaps > 8 EiB are unrealistic
-                let heap_used = i64::try_from(shared.heap.allocated_bytes()).unwrap_or(i64::MAX);
+                let heap_used =
+                    i64::try_from(shared.mem.heap.allocated_bytes()).unwrap_or(i64::MAX);
                 cratonvm_jfr::builtin::emit_gc_heap_summary_event(
                     &mut jfr,
                     1,
@@ -1286,6 +1300,7 @@ pub(crate) fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
             // measure GC frequency against the 0.2 Hz allocation-storm
             // target.
             shared
+                .mem
                 .gc_cycle_count
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             // After minor GC, check if old gen needs concurrent collection
@@ -1301,9 +1316,9 @@ pub(crate) fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
                 // (same closure, same barrier lock) for identity-based
                 // takeover excusal.
                 counted_os_tids.clear();
-                shared
-                    .gc_barrier
-                    .request_stw_counted_with_live_blocked(thread.thread_id, || {
+                shared.mem.gc_barrier.request_stw_counted_with_live_blocked(
+                    thread.thread_id,
+                    || {
                         let (n, blocked, tids, blocked_tids) = shared
                             .threads
                             .thread_registry
@@ -1330,7 +1345,8 @@ pub(crate) fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
                             u32::try_from(blocked).unwrap_or(u32::MAX),
                             blocked_tids,
                         )
-                    })
+                    },
+                )
             };
             if should_initiate_gc {
                 // We are the GC initiator. BUG-03 — forcibly stop in-JIT
@@ -1357,6 +1373,7 @@ pub(crate) fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
                 let stw = unsafe { cratonvm_gc::collector::StopTheWorldToken::new() };
                 let result =
                     shared
+                        .mem
                         .heap
                         .collect_garbage(&stw, &mut roots, &shared.threads.monitors);
                 process_references_after_gc(shared, &result.pointer_map);
@@ -1387,14 +1404,15 @@ pub(crate) fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
                 // tails. A resumed peer that immediately requests the next
                 // GC blocks until `complete_gc` anyway (the barrier is still
                 // closed here), so the reorder introduces no new window.
-                shared.heap.clear_jit_tlab_skip_regions();
+                shared.mem.heap.clear_jit_tlab_skip_regions();
                 crate::jit::xt_root_scan::resume(taken);
                 // Signal all threads with the pointer map
-                shared.gc_barrier.complete_gc(result.pointer_map);
+                shared.mem.gc_barrier.complete_gc(result.pointer_map);
 
                 // T19.3.G1 — bump the cycle counter (multi-threaded
                 // path, fires only on the GC initiator).
                 shared
+                    .mem
                     .gc_cycle_count
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 // After minor GC, check if old gen needs concurrent collection
@@ -1450,11 +1468,11 @@ fn maybe_gc_forced(shared: &SharedVm, thread: &mut JvmThread) {
     // GC-overhead accounting: live set BEFORE the collection (post-TLAB-retire),
     // so `note_gc_productivity` can compute how much this forced GC actually
     // freed (`before - after`). See `note_gc_productivity` / `gc_overhead_limit_exceeded`.
-    let before_live = shared.heap.allocated_bytes();
+    let before_live = shared.mem.heap.allocated_bytes();
     // Round-5 fix (CRIT — UAF): see comment in `maybe_gc`. The forced
     // path is also an initiator path; drain its per-thread SATB buffer
     // before scanning roots.
-    shared.heap.flush_thread_satb();
+    shared.mem.heap.flush_thread_satb();
     cratonvm_gc::gc_quiescence::begin_moving_young_coverage_cycle();
     update_root_snapshot(shared, thread);
     mtroots_set_gc_ctx(shared, thread, 3); // 3 = forced-alloc (maybe_gc_forced)
@@ -1468,6 +1486,7 @@ fn maybe_gc_forced(shared: &SharedVm, thread: &mut JvmThread) {
         weakref_null_referents_pre_gc(shared);
         let stw = unsafe { cratonvm_gc::collector::StopTheWorldToken::new() };
         let result = shared
+            .mem
             .heap
             .collect_garbage(&stw, &mut roots, &shared.threads.monitors);
         process_references_after_gc(shared, &result.pointer_map);
@@ -1475,6 +1494,7 @@ fn maybe_gc_forced(shared: &SharedVm, thread: &mut JvmThread) {
         crate::runtime::ec_watch::remap(&result.pointer_map);
         // T19.3.G1 — count forced cycles (allocation-failure-driven) too.
         shared
+            .mem
             .gc_cycle_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         note_gc_productivity(shared, before_live);
@@ -1485,6 +1505,7 @@ fn maybe_gc_forced(shared: &SharedVm, thread: &mut JvmThread) {
             // snapshot for identity-based takeover excusal.
             counted_os_tids.clear();
             shared
+                .mem
                 .gc_barrier
                 .request_stw_counted_with_live_blocked(thread.thread_id, || {
                     let (n, blocked, tids, blocked_tids) = shared
@@ -1516,9 +1537,11 @@ fn maybe_gc_forced(shared: &SharedVm, thread: &mut JvmThread) {
                                     // HIB-CV-24: null Weak/Phantom referents before marking (restored post-GC).
             weakref_null_referents_pre_gc(shared);
             let stw = unsafe { cratonvm_gc::collector::StopTheWorldToken::new() };
-            let result = shared
-                .heap
-                .collect_garbage(&stw, &mut roots, &shared.threads.monitors);
+            let result =
+                shared
+                    .mem
+                    .heap
+                    .collect_garbage(&stw, &mut roots, &shared.threads.monitors);
             process_references_after_gc(shared, &result.pointer_map);
             update_all_roots(shared, thread, &result.pointer_map);
             // Step 5 GAP D: remap the ec_watch corruption-watch table across this
@@ -1530,11 +1553,12 @@ fn maybe_gc_forced(shared: &SharedVm, thread: &mut JvmThread) {
             crate::runtime::ec_watch::remap(&result.pointer_map);
             // xt-hardening (2026-07-03): clear regions + resume BEFORE
             // complete_gc (see maybe_gc's epilogue for the race rationale).
-            shared.heap.clear_jit_tlab_skip_regions(); // BUG-03
+            shared.mem.heap.clear_jit_tlab_skip_regions(); // BUG-03
             crate::jit::xt_root_scan::resume(taken); // BUG-03 resume frozen peers
-            shared.gc_barrier.complete_gc(result.pointer_map);
+            shared.mem.gc_barrier.complete_gc(result.pointer_map);
             // T19.3.G1 — count forced cycles (multi-threaded initiator).
             shared
+                .mem
                 .gc_cycle_count
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             note_gc_productivity(shared, before_live);
@@ -1566,22 +1590,24 @@ const GC_OVERHEAD_LIMIT_CYCLES: u32 = 8;
 /// Forced GCs only happen on genuine allocation failure (young full *and*
 /// promotion blocked), so this never fires during ordinary young-GC churn.
 fn note_gc_productivity(shared: &SharedVm, before_live: usize) {
-    let cap = shared.heap.heap_capacity();
+    let cap = shared.mem.heap.heap_capacity();
     if cap == 0 {
         return;
     }
-    let after_live = shared.heap.allocated_bytes();
+    let after_live = shared.mem.heap.allocated_bytes();
     let freed = before_live.saturating_sub(after_live);
     // unproductive: freed < 2% of capacity
     // Cast: numeric/representation conversion
     let unproductive = (freed as u128) * 100 < (cap as u128) * 2;
     let streak = if unproductive {
         shared
+            .mem
             .gc_unproductive_streak
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             + 1
     } else {
         shared
+            .mem
             .gc_unproductive_streak
             .store(0, std::sync::atomic::Ordering::Relaxed);
         0
@@ -1616,6 +1642,7 @@ pub fn gc_overhead_limit_exceeded(shared: &SharedVm) -> bool {
         return false; // explicitly disabled
     }
     shared
+        .mem
         .gc_unproductive_streak
         .load(std::sync::atomic::Ordering::Relaxed)
         >= limit
@@ -1629,7 +1656,7 @@ pub fn force_gc_from_native(shared: &SharedVm, thread: &mut JvmThread) {
     thread.tlab.retire();
     // Round-5 fix (CRIT — UAF): drain this thread's per-thread SATB
     // buffer before initiating GC; see `maybe_gc` for the full rationale.
-    shared.heap.flush_thread_satb();
+    shared.mem.heap.flush_thread_satb();
     // Real HotSpot's `System.gc()` triggers a FULL (old-gen-inclusive)
     // collection by default — request one explicitly, since the collector's
     // own Phase 5 otherwise only runs a major cycle when old gen crosses an
@@ -1644,7 +1671,7 @@ pub fn force_gc_from_native(shared: &SharedVm, thread: &mut JvmThread) {
 
     // Snapshot finalizable object addresses so the GC can resurrect dead ones
     let fin_addrs: Vec<usize> = {
-        let rp = shared.ref_processor.lock();
+        let rp = shared.mem.ref_processor.lock();
         rp.finalizer_referent_addresses()
     };
 
@@ -1655,7 +1682,7 @@ pub fn force_gc_from_native(shared: &SharedVm, thread: &mut JvmThread) {
         // HIB-CV-24: null Weak/Phantom referents before marking (restored post-GC).
         weakref_null_referents_pre_gc(shared);
         let stw = unsafe { cratonvm_gc::collector::StopTheWorldToken::new() };
-        let (result, dead_finalizers) = shared.heap.collect_garbage_with_finalizers(
+        let (result, dead_finalizers) = shared.mem.heap.collect_garbage_with_finalizers(
             &stw,
             &mut roots,
             &fin_addrs,
@@ -1666,7 +1693,7 @@ pub fn force_gc_from_native(shared: &SharedVm, thread: &mut JvmThread) {
         crate::runtime::ec_watch::remap(&result.pointer_map);
         // Enqueue dead finalizable objects (their new addresses) for finalization
         for new_addr in &dead_finalizers {
-            shared.finalizer_thread.enqueue(*new_addr);
+            shared.mem.finalizer_thread.enqueue(*new_addr);
         }
         // Once-only finalization: flag the processor entries for the objects
         // just enqueued. `process_references_after_gc` above already ran
@@ -1676,6 +1703,7 @@ pub fn force_gc_from_native(shared: &SharedVm, thread: &mut JvmThread) {
         // re-enqueues it (finalize() observed running 3× per object).
         if !dead_finalizers.is_empty() {
             shared
+                .mem
                 .ref_processor
                 .lock()
                 .mark_finalizer_enqueued(&dead_finalizers);
@@ -1687,6 +1715,7 @@ pub fn force_gc_from_native(shared: &SharedVm, thread: &mut JvmThread) {
             // snapshot for identity-based takeover excusal.
             counted_os_tids.clear();
             shared
+                .mem
                 .gc_barrier
                 .request_stw_counted_with_live_blocked(thread.thread_id, || {
                     let (n, blocked, tids, blocked_tids) = shared
@@ -1718,7 +1747,7 @@ pub fn force_gc_from_native(shared: &SharedVm, thread: &mut JvmThread) {
                                     // HIB-CV-24: null Weak/Phantom referents before marking (restored post-GC).
             weakref_null_referents_pre_gc(shared);
             let stw = unsafe { cratonvm_gc::collector::StopTheWorldToken::new() };
-            let (result, dead_finalizers) = shared.heap.collect_garbage_with_finalizers(
+            let (result, dead_finalizers) = shared.mem.heap.collect_garbage_with_finalizers(
                 &stw,
                 &mut roots,
                 &fin_addrs,
@@ -1731,20 +1760,21 @@ pub fn force_gc_from_native(shared: &SharedVm, thread: &mut JvmThread) {
             // paths already remap it; this initiator path was missing the call).
             crate::runtime::ec_watch::remap(&result.pointer_map);
             for new_addr in &dead_finalizers {
-                shared.finalizer_thread.enqueue(*new_addr);
+                shared.mem.finalizer_thread.enqueue(*new_addr);
             }
             // Once-only finalization — see the single-threaded arm above.
             if !dead_finalizers.is_empty() {
                 shared
+                    .mem
                     .ref_processor
                     .lock()
                     .mark_finalizer_enqueued(&dead_finalizers);
             }
             // xt-hardening (2026-07-03): clear regions + resume BEFORE
             // complete_gc (see maybe_gc's epilogue for the race rationale).
-            shared.heap.clear_jit_tlab_skip_regions(); // BUG-03
+            shared.mem.heap.clear_jit_tlab_skip_regions(); // BUG-03
             crate::jit::xt_root_scan::resume(taken); // BUG-03 resume frozen peers
-            shared.gc_barrier.complete_gc(result.pointer_map);
+            shared.mem.gc_barrier.complete_gc(result.pointer_map);
         } else {
             safepoint_check(shared, thread);
         }
@@ -1759,7 +1789,7 @@ pub fn force_gc_from_native(shared: &SharedVm, thread: &mut JvmThread) {
     // full collection that processes every generation's references; this
     // IHOP/completion check is the closest cycle-machinery equivalent.
     maybe_concurrent_gc(shared, thread);
-    if shared.heap.is_g1() {
+    if shared.mem.heap.is_g1() {
         // An explicit System.gc() is a full-collection request, not merely an
         // Eden evacuation. Finish the G1 mark/remark/cleanup synchronously so
         // dead old regions, weak loaders, and their metadata are observable
@@ -1769,7 +1799,7 @@ pub fn force_gc_from_native(shared: &SharedVm, thread: &mut JvmThread) {
     // Run pending finalizers
     run_finalizers(shared, thread);
     // Run pending Cleaner actions (NEW-17). These were submitted to
-    // shared.cleaner_thread by process_references_after_gc.
+    // shared.mem.cleaner_thread by process_references_after_gc.
     run_cleaner_actions(shared, thread);
 }
 
@@ -1838,23 +1868,23 @@ fn run_cleaner_actions(shared: &SharedVm, thread: &mut JvmThread) {
     }
     let _cleaner_depth_guard = CleanerDepthGuard;
 
-    let addrs = shared.cleaner_thread.drain_actions();
+    let addrs = shared.mem.cleaner_thread.drain_actions();
     for addr in addrs {
         // SAFETY: addr was produced by the cleaner thread's drain_actions and points at a valid object header within the heap arena.
         let cleanable = unsafe { ObjectRef::from_raw(addr as *mut u8) };
         // Idempotency: skip if user code already invoked clean().
-        let already = matches!(shared.heap.get_field(cleanable, 1), Value::Int(1),);
+        let already = matches!(shared.mem.heap.get_field(cleanable, 1), Value::Int(1),);
         if already {
             continue;
         }
-        shared.heap.set_field(cleanable, 1, Value::Int(1));
-        let action = match shared.heap.get_field(cleanable, 0) {
+        shared.mem.heap.set_field(cleanable, 1, Value::Int(1));
+        let action = match shared.mem.heap.get_field(cleanable, 0) {
             Value::Object(Some(o)) => o,
             _ => continue,
         };
         // Clear the action slot so it can be GC'd on the next cycle.
-        shared.heap.set_field(cleanable, 0, Value::Object(None));
-        let class_id = shared.heap.class_id_of(action);
+        shared.mem.heap.set_field(cleanable, 0, Value::Object(None));
+        let class_id = shared.mem.heap.class_id_of(action);
 
         // Fast path: if the action is a lambda proxy (the common case —
         // `cleaner.register(buf, () -> {...})`), `invoke_shared` would
@@ -1903,13 +1933,13 @@ fn run_finalizers(shared: &SharedVm, thread: &mut JvmThread) {
         return;
     }
     loop {
-        let obj_addr = match shared.finalizer_thread.dequeue() {
+        let obj_addr = match shared.mem.finalizer_thread.dequeue() {
             Some(addr) => addr,
             None => break,
         };
         // SAFETY: obj_addr was produced by the finalizer thread's dequeue and points at a valid object header within the heap arena.
         let obj_ref = unsafe { ObjectRef::from_raw(obj_addr as *mut u8) };
-        let class_id = shared.heap.class_id_of(obj_ref);
+        let class_id = shared.mem.heap.class_id_of(obj_ref);
 
         let class_name = shared
             .classes
@@ -1955,7 +1985,7 @@ fn run_finalizers(shared: &SharedVm, thread: &mut JvmThread) {
 /// `createLayoutFromConfigClass` test). See
 /// docs/known-issues/springboot/thymeleaf-groovy-layoutdialect-metaclass-introspection-hang.md.
 fn gc_reference_next_slot(shared: &SharedVm, ref_obj: ObjectRef) -> usize {
-    if shared.heap.num_fields(ref_obj) <= 2 {
+    if shared.mem.heap.num_fields(ref_obj) <= 2 {
         return 0; // legacy synthetic 2-field shape: referent, queue only
     }
     let cm = shared.classes.class_manager.read();
@@ -1989,7 +2019,7 @@ fn process_references_after_gc(
     // dangling/stale ObjectRef after a collection, independent of that switch.
     {
         let is_marked = |addr: usize| -> bool {
-            pointer_map.contains_key(&addr) || shared.heap.is_addr_live(addr)
+            pointer_map.contains_key(&addr) || shared.mem.heap.is_addr_live(addr)
         };
         let dead_class_hints = cratonvm_native_builtins::classloader::gc_reconcile_defining_loaders(
             &is_marked,
@@ -2071,14 +2101,15 @@ fn process_references_after_gc(
     if no_refproc() {
         return;
     }
-    let mut ref_proc = shared.ref_processor.lock();
+    let mut ref_proc = shared.mem.ref_processor.lock();
 
     // An object is "marked" (survived GC) if:
     // 1. It appears in the pointer map (evacuated/copied during collection), OR
     // 2. It resides in a live (non-collected) heap region (G1: Old/Humongous regions
     //    that weren't in the collection set are still live).
-    let is_marked =
-        |addr: usize| -> bool { pointer_map.contains_key(&addr) || shared.heap.is_addr_live(addr) };
+    let is_marked = |addr: usize| -> bool {
+        pointer_map.contains_key(&addr) || shared.mem.heap.is_addr_live(addr)
+    };
 
     let result = ref_proc.process_references(&is_marked, 64, 0);
 
@@ -2101,8 +2132,12 @@ fn process_references_after_gc(
     // was hardwired inert for G1/ZGC — dead finalize/cleaner/enqueue
     // addresses flowed through unguarded and `run_finalizers` later
     // dereferenced freed CSet memory (finalize-on-recycled-object UAF).
-    let is_stale_young =
-        |addr: usize| -> bool { shared.heap.pre_gc_addr_did_not_survive(addr, pointer_map) };
+    let is_stale_young = |addr: usize| -> bool {
+        shared
+            .mem
+            .heap
+            .pre_gc_addr_did_not_survive(addr, pointer_map)
+    };
 
     // Null referent field (field 0) on cleared weak/soft references.
     // ROOT-CAUSE FIX (2026-06-10): once-only emission — the legacy
@@ -2130,17 +2165,17 @@ fn process_references_after_gc(
         // >= 2 instance fields (referent, queue); a reused/zeroed slot is a
         // bare 0-field `Object`. (Kept in addition to the precise
         // `is_stale_young` guard — also covers old-gen reuse after a major GC.)
-        if shared.heap.num_fields(obj_ref) < 2 {
+        if shared.mem.heap.num_fields(obj_ref) < 2 {
             if straystack_enabled() {
                 eprintln!(
                     "[refproc] SKIP stale CLEARED ref @0x{:x} (num_fields={})",
                     actual_addr,
-                    shared.heap.num_fields(obj_ref),
+                    shared.mem.heap.num_fields(obj_ref),
                 );
             }
             continue;
         }
-        shared.heap.set_field(obj_ref, 0, Value::Object(None));
+        shared.mem.heap.set_field(obj_ref, 0, Value::Object(None));
     }
 
     // Enqueue cleared/phantom references into their ReferenceQueues on the heap.
@@ -2176,7 +2211,7 @@ fn process_references_after_gc(
                                                                          // `pointer_map` and keeps its real layout, so legitimate enqueues are
                                                                          // unaffected. A dead queue has no consumer to `poll()` the reference
                                                                          // back out, so dropping the enqueue is correct.
-        if shared.heap.num_fields(q_obj) < 2 {
+        if shared.mem.heap.num_fields(q_obj) < 2 {
             continue;
         }
         // bc math-ec 0x4 STALE-REF FIX: the same reclaimed-and-reused hazard
@@ -2187,12 +2222,12 @@ fn process_references_after_gc(
         // strays into the reusing object (and `set_field(q_obj,0,ref_obj)` would
         // publish a dangling head). A live Reference has >= 2 fields; skip the
         // whole enqueue otherwise (a dead ref has no consumer to poll it back).
-        if shared.heap.num_fields(ref_obj) < 2 {
+        if shared.mem.heap.num_fields(ref_obj) < 2 {
             if straystack_enabled() {
                 eprintln!(
                     "[refproc] SKIP stale ENQUEUE ref @0x{:x} (num_fields={}) into q@0x{:x}",
                     actual_ref,
-                    shared.heap.num_fields(ref_obj),
+                    shared.mem.heap.num_fields(ref_obj),
                     actual_q,
                 );
             }
@@ -2211,20 +2246,21 @@ fn process_references_after_gc(
         // with fewer than 3 fields (legacy synthetic shape) fall back to the
         // old slot-0 linkage, which is at least consistent with the poll
         // side's identical fallback.
-        let old_head = shared.heap.get_field(q_obj, 0); // RQ_FIELD_HEAD
+        let old_head = shared.mem.heap.get_field(q_obj, 0); // RQ_FIELD_HEAD
         shared
+            .mem
             .heap
             .set_field(q_obj, 0, Value::Object(Some(ref_obj))); // new head
         let next_slot = gc_reference_next_slot(shared, ref_obj);
-        shared.heap.set_field(ref_obj, next_slot, old_head); // REF_FIELD_NEXT
-        let size = match shared.heap.get_field(q_obj, 1) {
+        shared.mem.heap.set_field(ref_obj, next_slot, old_head); // REF_FIELD_NEXT
+        let size = match shared.mem.heap.get_field(q_obj, 1) {
             // RQ_FIELD_SIZE
             Value::Int(v) => v,
             _ => 0,
         };
-        shared.heap.set_field(q_obj, 1, Value::Int(size + 1));
+        shared.mem.heap.set_field(q_obj, 1, Value::Int(size + 1));
         // Mark as enqueued — sentinel Int(1) distinguishes from "never had queue"
-        shared.heap.set_field(ref_obj, 1, Value::Int(1)); // REF_FIELD_QUEUE = enqueued sentinel
+        shared.mem.heap.set_field(ref_obj, 1, Value::Int(1)); // REF_FIELD_QUEUE = enqueued sentinel
     }
 
     // Enqueue objects for finalization (M8 fix: relocate via pointer_map
@@ -2240,16 +2276,16 @@ fn process_references_after_gc(
             continue;
         }
         let actual = pointer_map.get(obj_addr).copied().unwrap_or(*obj_addr);
-        shared.finalizer_thread.enqueue(actual);
+        shared.mem.finalizer_thread.enqueue(actual);
     }
 
     // Relocate any cleaner actions DEFERRED from earlier GC cycles (queued but
     // not yet run because a JIT borrow was live — see `run_cleaner_actions`).
     // Their cleanable objects may have been evacuated by this collection, so
     // remap their raw addresses before any later drain dereferences them.
-    shared.cleaner_thread.update_after_gc(pointer_map);
+    shared.mem.cleaner_thread.update_after_gc(pointer_map);
     // Same for any finalizers deferred from earlier GC cycles.
-    shared.finalizer_thread.update_after_gc(pointer_map);
+    shared.mem.finalizer_thread.update_after_gc(pointer_map);
 
     // Submit cleaner actions — same pre-GC→post-GC relocation as above.
     // Without this, run_cleaner_actions later derefs a stale address
@@ -2268,13 +2304,13 @@ fn process_references_after_gc(
             .get(action_addr)
             .copied()
             .unwrap_or(*action_addr);
-        shared.cleaner_thread.submit_action(actual);
+        shared.mem.cleaner_thread.submit_action(actual);
     }
 
     // Drain ref_processor's finalization_queue → FinalizerThread (inline
     // to avoid re-locking ref_processor which we already hold).
     while let Some(obj_addr) = ref_proc.dequeue_for_finalization() {
-        shared.finalizer_thread.enqueue(obj_addr);
+        shared.mem.finalizer_thread.enqueue(obj_addr);
     }
 
     // HIB-CV-24 (Manifestation B): restore the referent slots of Weak/Phantom
@@ -2301,7 +2337,7 @@ fn process_references_after_gc(
             // not itself survive — never write through freed/reused memory.
             let ref_obj_new = match pointer_map.get(&ref_obj_old) {
                 Some(&a) => a,
-                None if shared.heap.is_addr_live(ref_obj_old) => ref_obj_old,
+                None if shared.mem.heap.is_addr_live(ref_obj_old) => ref_obj_old,
                 None => continue,
             };
             // The referent survived (this entry was not cleared/enqueued): find
@@ -2309,7 +2345,7 @@ fn process_references_after_gc(
             // in place → live).
             let referent_new = match pointer_map.get(&referent_old) {
                 Some(&a) => a,
-                None if shared.heap.is_addr_live(referent_old) => referent_old,
+                None if shared.mem.heap.is_addr_live(referent_old) => referent_old,
                 // Defensive: should not happen for an active entry, but never
                 // write a stale referent — leave the slot null.
                 None => continue,
@@ -2320,7 +2356,7 @@ fn process_references_after_gc(
             // Slot 0 = REF_FIELD_REFERENT. `set_field` fires the write barrier,
             // so a young referent restored into a promoted (old-gen) Reference
             // re-marks the old→young card.
-            shared.heap.set_field(ro, 0, Value::Object(Some(rt)));
+            shared.mem.heap.set_field(ro, 0, Value::Object(Some(rt)));
         }
         // Drop entries whose Reference object was collected this cycle so the
         // side-lists stay bounded and the pre-GC null pass never dereferences a
@@ -2412,7 +2448,7 @@ pub fn init_primitive_fields(shared: &SharedVm, obj: ObjectRef, class_id: ClassI
                     _ => None, // Reference types: already Object(None) from zero memory
                 };
                 if let Some(val) = default {
-                    shared.heap.set_field(obj, inst_idx, val);
+                    shared.mem.heap.set_field(obj, inst_idx, val);
                 }
                 inst_idx += 1;
             }
@@ -2431,7 +2467,7 @@ pub fn init_primitive_fields(shared: &SharedVm, obj: ObjectRef, class_id: ClassI
 /// based on fill time and alloc count, so a thread that just burned
 /// through 64 KB in under a millisecond gets a 128 KB chunk next
 /// time and so on up to the documented cap. Each refill bumps
-/// `shared.tlab_refill_count` so operators can spot-check the
+/// `shared.mem.tlab_refill_count` so operators can spot-check the
 /// refill rate against the hit-rate target.
 #[inline(always)]
 pub(crate) fn tlab_alloc_object(
@@ -2463,15 +2499,16 @@ pub(crate) fn tlab_alloc_byte_array(
             ClassId::new(0),
             ObjectKind::Array,
             ArrayElementType::Byte,
-            shared.heap.next_identity_hash(),
+            shared.mem.heap.next_identity_hash(),
             length_u32,
             length_u32,
         );
         unsafe { std::ptr::write(ptr as *mut ObjectHeader, header) };
     })?;
     use std::sync::atomic::Ordering;
-    shared.tlab_hit_count.fetch_add(1, Ordering::Relaxed);
+    shared.mem.tlab_hit_count.fetch_add(1, Ordering::Relaxed);
     shared
+        .mem
         .bytes_allocated_total
         .fetch_add(total_size as u64, Ordering::Relaxed);
     cratonvm_gc::a2dbg::record(
@@ -2562,11 +2599,11 @@ fn dbg_refill_fail_state(shared: &SharedVm, requested: usize) {
     static N: AtomicU64 = AtomicU64::new(0);
     let n = N.fetch_add(1, Ordering::Relaxed) + 1;
     if n & 0xFFFFF == 1 {
-        let (used, cap, fl, largest) = shared.heap.young_arena_diag();
+        let (used, cap, fl, largest) = shared.mem.heap.young_arena_diag();
         eprintln!(
             "[gatefail] n={n} requested={requested} used={used}/{cap} free_list={fl} largest_free={largest} headroom={} has_free={}",
-            shared.heap.young_bump_headroom(requested),
-            shared.heap.young_has_free_block(requested),
+            shared.mem.heap.young_bump_headroom(requested),
+            shared.mem.heap.young_has_free_block(requested),
         );
     }
 }
@@ -2609,7 +2646,7 @@ fn dbg_refill_fail(stage: usize, requested: usize) {
 /// orchestrated collection so TLAB flow can resume.
 ///
 /// Storm guard: a forced break re-arms only after `WEDGE_REARM_BYTES` of
-/// further allocation (read from `shared.bytes_allocated_total`). If the
+/// further allocation (read from `shared.mem.bytes_allocated_total`). If the
 /// collection did not heal the free list (nothing coalescable — genuinely
 /// full young of live data), the gate keeps failing but no further forced
 /// collections fire until real allocation progress has been made, so the
@@ -2675,7 +2712,7 @@ fn tlab_refill_wedge_break(thread: &mut JvmThread, shared: &SharedVm) -> bool {
     if fails < WEDGE_BREAK_THRESHOLD {
         return false;
     }
-    let alloc_total = shared.bytes_allocated_total.load(Ordering::Relaxed);
+    let alloc_total = shared.mem.bytes_allocated_total.load(Ordering::Relaxed);
     let last = TLAB_LAST_BREAK_ALLOC_TOTAL.load(Ordering::Relaxed);
     if last != 0 && alloc_total.saturating_sub(last) < WEDGE_REARM_BYTES {
         return false;
@@ -2718,14 +2755,15 @@ fn tlab_alloc_object_inner(
         // allocators (`alloc_object`/`alloc_array`) and prevents the
         // stale-pointer detector in `execute_invoke` from mis-flagging
         // legitimate `new Object()` instances as stale memory.
-        let hash = shared.heap.next_identity_hash();
+        let hash = shared.mem.heap.next_identity_hash();
         init_object_header(ptr, class_id, num_fields, hash);
     }) {
-        shared.tlab_hit_count.fetch_add(1, Ordering::Relaxed);
+        shared.mem.tlab_hit_count.fetch_add(1, Ordering::Relaxed);
         // Truncation-checked: usize → u64 widening is loss-free on 64-bit
         // platforms; on 32-bit the upper bound (usize::MAX ≈ 4 GiB) still
         // fits in u64 so `as u64` is exact.
         shared
+            .mem
             .bytes_allocated_total
             // Widening: smaller integer -> 64-bit (zero/sign-extended, value preserved)
             .fetch_add(total_size as u64, Ordering::Relaxed);
@@ -2759,7 +2797,8 @@ fn tlab_alloc_object_inner(
         use std::sync::atomic::Ordering;
         const NEEDSGC_MIN_ENTRIES_BETWEEN_FIRES: u64 = 65_536;
         let entries = TLAB_SLOWPATH_ENTRIES_SINCE_GC.fetch_add(1, Ordering::Relaxed) + 1;
-        if entries >= NEEDSGC_MIN_ENTRIES_BETWEEN_FIRES && shared.heap.needs_gc_for_jit_allocation()
+        if entries >= NEEDSGC_MIN_ENTRIES_BETWEEN_FIRES
+            && shared.mem.heap.needs_gc_for_jit_allocation()
         {
             TLAB_SLOWPATH_ENTRIES_SINCE_GC.store(0, Ordering::Relaxed);
             thread.tlab.retire();
@@ -2810,8 +2849,8 @@ fn tlab_alloc_object_inner(
     // agree on satisfiability" rule, applied one level further down.
     let free_block_floor = cratonvm_gc::tlab::frag_tlab_floor().min(requested);
     if refill_needs_young_room
-        && !shared.heap.young_bump_headroom(requested)
-        && !shared.heap.young_has_free_block(free_block_floor)
+        && !shared.mem.heap.young_bump_headroom(requested)
+        && !shared.mem.heap.young_has_free_block(free_block_floor)
     {
         dbg_refill_fail_state(shared, requested);
         // Sustained gate failure = the wedge: per-object allocations keep
@@ -2819,8 +2858,8 @@ fn tlab_alloc_object_inner(
         // coalesces the free list. Force one (rate-limited) and re-probe.
         if !tlab_gc_trigger_enabled()
             || !tlab_refill_wedge_break(thread, shared)
-            || (!shared.heap.young_bump_headroom(requested)
-                && !shared.heap.young_has_free_block(free_block_floor))
+            || (!shared.mem.heap.young_bump_headroom(requested)
+                && !shared.mem.heap.young_has_free_block(free_block_floor))
         {
             return None;
         }
@@ -2853,7 +2892,7 @@ fn tlab_alloc_object_inner(
     // is already computed, so retiring here does not disturb the sizer.
     thread.tlab.retire();
 
-    let mut refill = shared.heap.refill_tlab(requested);
+    let mut refill = shared.mem.heap.refill_tlab(requested);
     if refill.is_none() {
         dbg_refill_fail(1, requested);
         // Second-wedge fix, stage-1 arm (perf/halfgap-20260717): the gate
@@ -2867,13 +2906,13 @@ fn tlab_alloc_object_inner(
             && tlab_gc_trigger_enabled()
             && tlab_refill_wedge_break(thread, shared)
         {
-            refill = shared.heap.refill_tlab(requested);
+            refill = shared.mem.heap.refill_tlab(requested);
         }
     } else {
         TLAB_GATE_CONSECUTIVE_FAILS.store(0, std::sync::atomic::Ordering::Relaxed);
     }
     if let Some((buf, size)) = refill {
-        shared.tlab_refill_count.fetch_add(1, Ordering::Relaxed);
+        shared.mem.tlab_refill_count.fetch_add(1, Ordering::Relaxed);
         // SAFETY: buf and size were just returned by the arena allocator and the memory is zeroed.
         thread.tlab = unsafe { cratonvm_gc::Tlab::new(buf, size) };
         // Start the new refill-window timer so `next_refill_size`
@@ -2881,11 +2920,12 @@ fn tlab_alloc_object_inner(
         thread.tlab.begin_refill(size);
         if let Some(ptr) = thread.tlab.alloc_initialized(total_size, 8, |ptr| {
             // H1: see fast-path comment above.
-            let hash = shared.heap.next_identity_hash();
+            let hash = shared.mem.heap.next_identity_hash();
             init_object_header(ptr, class_id, num_fields, hash);
         }) {
-            shared.tlab_hit_count.fetch_add(1, Ordering::Relaxed);
+            shared.mem.tlab_hit_count.fetch_add(1, Ordering::Relaxed);
             shared
+                .mem
                 .bytes_allocated_total
                 // Widening: smaller integer -> 64-bit (zero/sign-extended, value preserved)
                 .fetch_add(total_size as u64, Ordering::Relaxed);
@@ -2899,7 +2939,7 @@ fn tlab_alloc_object_inner(
 /// Initialize an object header at the given pointer.
 ///
 /// H1: `identity_hash_code` is now eagerly assigned at allocation time
-/// (caller passes `shared.heap.next_identity_hash()`). The previous
+/// (caller passes `shared.mem.heap.next_identity_hash()`). The previous
 /// behavior of storing 0 and "lazily" filling on first `hashCode()` call
 /// was not actually wired up anywhere — every fresh TLAB-allocated
 /// `new Object()` (cid=0, fields=0) produced an all-zero first 16 bytes
@@ -2947,12 +2987,13 @@ pub(crate) fn alloc_object_shared(
 ) -> Result<ObjectRef, MethodCallFailed> {
     use cratonvm_gc::heap::{HEADER_SIZE, SLOT_SIZE};
     let total_size = HEADER_SIZE + num_fields.saturating_mul(SLOT_SIZE);
-    if let Some(obj) = shared.heap.try_alloc_object(class_id, num_fields) {
+    if let Some(obj) = shared.mem.heap.try_alloc_object(class_id, num_fields) {
         // T19.3.G1 — slow-path bytes count toward the allocation rate
         // just like TLAB-served bytes, so `--verbose:gc` reflects true
         // throughput even for large objects that skipped the TLAB.
         // Widening: usize → u64 is loss-free on all supported targets.
         shared
+            .mem
             .bytes_allocated_total
             .fetch_add(total_size as u64, std::sync::atomic::Ordering::Relaxed);
         return Ok(obj);
@@ -2972,8 +3013,9 @@ pub(crate) fn alloc_object_shared(
             },
         )));
     }
-    if let Some(obj) = shared.heap.try_alloc_object(class_id, num_fields) {
+    if let Some(obj) = shared.mem.heap.try_alloc_object(class_id, num_fields) {
         shared
+            .mem
             .bytes_allocated_total
             // Widening: smaller integer -> 64-bit (zero/sign-extended, value preserved)
             .fetch_add(total_size as u64, std::sync::atomic::Ordering::Relaxed);
@@ -2983,10 +3025,12 @@ pub(crate) fn alloc_object_shared(
     // completed mark cycle's cleanup; run one synchronously and retry once.
     g1_force_full_cycle(shared, thread);
     shared
+        .mem
         .heap
         .try_alloc_object(class_id, num_fields)
         .map(|obj| {
             shared
+                .mem
                 .bytes_allocated_total
                 .fetch_add(total_size as u64, std::sync::atomic::Ordering::Relaxed);
             obj
@@ -3045,7 +3089,11 @@ fn gc_alloc_array(
     element_type: ArrayElementType,
     length: usize,
 ) -> Result<ObjectRef, MethodCallFailed> {
-    if let Some(arr) = shared.heap.try_alloc_array(class_id, element_type, length) {
+    if let Some(arr) = shared
+        .mem
+        .heap
+        .try_alloc_array(class_id, element_type, length)
+    {
         return Ok(arr);
     }
     // Retire TLAB before GC
@@ -3061,7 +3109,11 @@ fn gc_alloc_array(
             },
         )));
     }
-    if let Some(arr) = shared.heap.try_alloc_array(class_id, element_type, length) {
+    if let Some(arr) = shared
+        .mem
+        .heap
+        .try_alloc_array(class_id, element_type, length)
+    {
         return Ok(arr);
     }
     // G1 last-ditch: the young pause above cannot reclaim dead Old/humongous
@@ -3069,6 +3121,7 @@ fn gc_alloc_array(
     // synchronously and retry once before surfacing OOM.
     g1_force_full_cycle(shared, thread);
     shared
+        .mem
         .heap
         .try_alloc_array(class_id, element_type, length)
         .ok_or_else(|| {
@@ -3171,7 +3224,7 @@ pub(crate) fn update_root_snapshot(shared: &SharedVm, thread: &mut JvmThread) {
             .in_blocked_region
             .load(std::sync::atomic::Ordering::Acquire)
         {
-            shared.gc_barrier.leave_blocked_region_flagged(
+            shared.mem.gc_barrier.leave_blocked_region_flagged(
                 thread.thread_id,
                 &thread.gc_block_state.in_blocked_region,
             );
@@ -3192,14 +3245,14 @@ pub(crate) fn update_root_snapshot(shared: &SharedVm, thread: &mut JvmThread) {
         thread_local! {
             static LAST_CC: std::cell::Cell<u64> = const { std::cell::Cell::new(u64::MAX) };
         }
-        let cc = shared.heap.collection_count();
+        let cc = shared.mem.heap.collection_count();
         let prev = LAST_CC.with(|c| c.replace(cc));
         if cc != prev && prev != u64::MAX {
             for (fi, fr) in thread.frames.iter().enumerate() {
                 for li in 0..fr.locals_len() {
                     if let Value::Object(Some(o)) = fr.get_local(li as u16) {
                         let a = o.as_ptr() as usize;
-                        if let Some(new) = shared.heap.debug_forwarded_target(a) {
+                        if let Some(new) = shared.mem.heap.debug_forwarded_target(a) {
                             eprintln!(
                                 "[blockgc] SAFEPOINT-STALE e{cc} tid={} frame#{fi} {}.{} pc={} local[{li}] 0x{a:x}->0x{new:x}",
                                 thread.thread_id.0, fr.class_name(), fr.method_name(), fr.pc,
@@ -3210,7 +3263,7 @@ pub(crate) fn update_root_snapshot(shared: &SharedVm, thread: &mut JvmThread) {
                 for si in 0..fr.stack.len() {
                     if let Value::Object(Some(o)) = fr.stack.peek_at(si) {
                         let a = o.as_ptr() as usize;
-                        if let Some(new) = shared.heap.debug_forwarded_target(a) {
+                        if let Some(new) = shared.mem.heap.debug_forwarded_target(a) {
                             eprintln!(
                                 "[blockgc] SAFEPOINT-STALE e{cc} tid={} frame#{fi} {}.{} pc={} stack[{si}] 0x{a:x}->0x{new:x}",
                                 thread.thread_id.0, fr.class_name(), fr.method_name(), fr.pc,
@@ -3251,7 +3304,7 @@ pub(crate) fn update_root_snapshot(shared: &SharedVm, thread: &mut JvmThread) {
         // (you cannot pop the middle of a stack) — their cached roots are still
         // exact. A GC may have *moved/promoted* objects, changing addresses, so
         // the whole cache is only valid while `collection_count()` is unchanged.
-        let gen = shared.heap.collection_count();
+        let gen = shared.mem.heap.collection_count();
         let len = thread.frames.len();
         // Longest prefix whose frame instances are unchanged since the cache
         // was built (prefix-closed: a matching `frames[p]` implies every frame
@@ -3291,7 +3344,7 @@ pub(crate) fn update_root_snapshot(shared: &SharedVm, thread: &mut JvmThread) {
         //     snapshot and cached; the top is scanned into the snapshot only.
         for i in reuse..len {
             let start = snapshot.len();
-            scan_frame_roots(&thread.frames[i], &mut snapshot, &shared.heap);
+            scan_frame_roots(&thread.frames[i], &mut snapshot, &shared.mem.heap);
             if i + 1 < len {
                 new_cache.push((
                     (thread.frames[i].seq, thread.frames[i].exec_epoch),
@@ -3315,15 +3368,17 @@ pub(crate) fn update_root_snapshot(shared: &SharedVm, thread: &mut JvmThread) {
                 // liveness-filtered scan can drop an active task receiver at a
                 // call boundary; all-live reference scanning only over-retains
                 // in this collector and prevents reclaiming that receiver.
-                frame.scan_local_objects_all_live(&mut snapshot, &shared.heap);
+                frame.scan_local_objects_all_live(&mut snapshot, &shared.mem.heap);
             } else {
-                frame.scan_local_objects(&mut snapshot, &shared.heap);
+                frame.scan_local_objects(&mut snapshot, &shared.mem.heap);
             }
             if conservative_locals {
-                frame.scan_locals_conservative(&mut snapshot, &shared.heap);
+                frame.scan_locals_conservative(&mut snapshot, &shared.mem.heap);
             }
             let before = snapshot.len();
-            frame.stack.scan_object_refs(&mut snapshot, &shared.heap);
+            frame
+                .stack
+                .scan_object_refs(&mut snapshot, &shared.mem.heap);
             // Validate every operand-stack-sourced root against the heap.
             // `Frame::scan_local_objects` was already cleaned to drop the
             // pointer-shaped-Long heuristic; the operand-stack scanner is
@@ -3341,7 +3396,12 @@ pub(crate) fn update_root_snapshot(shared: &SharedVm, thread: &mut JvmThread) {
                 for read in before..len {
                     let o = snapshot[read];
                     // Cast: object/code pointer to integer address
-                    if shared.heap.is_object_address(o.as_ptr() as usize).is_some() {
+                    if shared
+                        .mem
+                        .heap
+                        .is_object_address(o.as_ptr() as usize)
+                        .is_some()
+                    {
                         snapshot[write] = o;
                         write += 1;
                     }
@@ -3351,7 +3411,7 @@ pub(crate) fn update_root_snapshot(shared: &SharedVm, thread: &mut JvmThread) {
             if conservative_locals {
                 frame
                     .stack
-                    .scan_object_refs_conservative(&mut snapshot, &shared.heap);
+                    .scan_object_refs_conservative(&mut snapshot, &shared.mem.heap);
             }
         }
     }
@@ -3441,7 +3501,7 @@ pub(crate) fn update_root_snapshot(shared: &SharedVm, thread: &mut JvmThread) {
         // snapshot paths, both of which already invalidate before publishing.
         crate::jit::conservative_roots::invalidate_scan_cache_for_gc();
         let jit_scan_start = snapshot.len();
-        crate::jit::conservative_roots::scan_active_jit_frames(&shared.heap, &mut snapshot);
+        crate::jit::conservative_roots::scan_active_jit_frames(&shared.mem.heap, &mut snapshot);
         // G1 pin-in-place, cross-thread half: the snapshot keeps these
         // conservatively-discovered objects ALIVE, but under G1 (a moving
         // collector) their regions must also be EXCLUDED from the collection
@@ -3452,14 +3512,14 @@ pub(crate) fn update_root_snapshot(shared: &SharedVm, thread: &mut JvmThread) {
         // consumed by `G1Collector::jit_pinned_region_set`. Replace
         // semantics: a deposit with no live JIT frames clears this thread's
         // stale pins.
-        if shared.heap.is_g1() {
+        if shared.mem.heap.is_g1() {
             let addrs: Vec<usize> = snapshot[jit_scan_start..]
                 .iter()
                 .map(|r| r.as_ptr() as usize)
                 .collect();
             cratonvm_gc::gc_quiescence::publish_pinned_jit_roots(&addrs);
         }
-    } else if shared.heap.is_g1() {
+    } else if shared.mem.heap.is_g1() {
         // Precise-relocation mode covers every JIT oop with rewritable
         // shadow-stack slots — no conservative pins needed; drop stale ones.
         cratonvm_gc::gc_quiescence::publish_pinned_jit_roots(&[]);
@@ -3476,7 +3536,7 @@ pub(crate) fn update_root_snapshot(shared: &SharedVm, thread: &mut JvmThread) {
     // No-op when the gate is off or the shadow stack is empty/unallocated.
     if crate::jit::conservative_roots::shadow_stack_enabled() {
         thread.shadow_stack.for_each_value(|v| {
-            if let Some(obj_ref) = shared.heap.is_object_address(v) {
+            if let Some(obj_ref) = shared.mem.heap.is_object_address(v) {
                 snapshot.push(obj_ref);
             }
         });
@@ -3546,7 +3606,7 @@ mod root_snapshot_cache_tests {
         assert_eq!(thread.rs_cache.len(), 2);
         assert!(thread.rs_cache[0].1.is_empty());
 
-        let obj = shared.heap.alloc_object(ClassId::new(7), 0);
+        let obj = shared.mem.heap.alloc_object(ClassId::new(7), 0);
         let obj_addr = obj.as_ptr();
         let cached_key = thread.rs_cache[0].0;
         thread.frames[0].set_local_unchecked(2, Value::Object(Some(obj)));
@@ -3622,7 +3682,7 @@ pub(crate) fn safepoint_check(shared: &SharedVm, thread: &mut JvmThread) {
                 // Widening: small integer index -> usize (non-negative, fits in pointer width)
                 let p = (raw & 0x0000_7fff_ffff_ffff) as usize;
                 let mut extra = String::new();
-                if p != 0 && p % 8 == 0 && shared.heap.is_heap_addr(p).is_some() {
+                if p != 0 && p % 8 == 0 && shared.mem.heap.is_heap_addr(p).is_some() {
                     // SAFETY: in-heap address; first 16 header bytes of managed
                     // memory are always readable (raw bytes, not enum fields).
                     let (kind_b, elem_b, alen) = unsafe {
@@ -3646,7 +3706,7 @@ pub(crate) fn safepoint_check(shared: &SharedVm, thread: &mut JvmThread) {
         }
         s
     });
-    if shared.gc_barrier.stw_requested.load(Ordering::Acquire) {
+    if shared.mem.gc_barrier.stw_requested.load(Ordering::Acquire) {
         // CRIT (TLAB UAF) — retire this thread's TLAB before parking for GC,
         // exactly as the GC initiator does in `maybe_gc`. The moving collector
         // run by the initiator can `grow()` (realloc) the young arena while we
@@ -3669,7 +3729,7 @@ pub(crate) fn safepoint_check(shared: &SharedVm, thread: &mut JvmThread) {
         // into a use-after-free. Must run on every mutator at every
         // safepoint arrival — `flush_thread_satb` short-circuits cheaply
         // on `is_active() == false` when concurrent marking is idle.
-        shared.heap.flush_thread_satb();
+        shared.mem.heap.flush_thread_satb();
 
         // Update root snapshot before pausing. This snapshot is the ONLY view a
         // cross-thread STW collector has of this (parked) thread's roots, so the
@@ -3689,7 +3749,7 @@ pub(crate) fn safepoint_check(shared: &SharedVm, thread: &mut JvmThread) {
         // a genuine safepoint arrival is normally counted, but if this pause's
         // census excluded us as blocked (a finding-1(a) window), participating
         // would fill a counted mutator's quota slot.
-        let pointer_map = shared.gc_barrier.arrive_and_wait_auto(thread.thread_id);
+        let pointer_map = shared.mem.gc_barrier.arrive_and_wait_auto(thread.thread_id);
 
         remap_trace_push(
             shared,
@@ -3703,9 +3763,9 @@ pub(crate) fn safepoint_check(shared: &SharedVm, thread: &mut JvmThread) {
         );
         // Apply pointer map to this thread's frames
         if !pointer_map.is_empty() {
-            apply_pointer_map_to_thread(thread, &pointer_map, &shared.heap);
+            apply_pointer_map_to_thread(thread, &pointer_map, &shared.mem.heap);
         }
-        mtroots_selfcheck(thread, &shared.heap, "safepoint-resume");
+        mtroots_selfcheck(thread, &shared.mem.heap, "safepoint-resume");
     }
     // T1.5.1 — pick up any async exception posted by another thread
     // (e.g. `Thread.stop0`). The cross-thread poster writes into the
@@ -4041,7 +4101,7 @@ pub(crate) fn remap_rs_cache_after_gc(
 /// with the marking phase running concurrently with application threads.
 fn maybe_concurrent_gc(shared: &SharedVm, thread: &mut JvmThread) {
     // G1 backend: trigger concurrent marking when IHOP threshold crossed
-    if shared.heap.is_g1() {
+    if shared.mem.heap.is_g1() {
         // Finish first, start second: if an active cycle's background marker
         // has drained to a fixed point, run the STW final remark + cleanup
         // NOW, on this thread (it has the STW-barrier context). The remark
@@ -4049,22 +4109,22 @@ fn maybe_concurrent_gc(shared: &SharedVm, thread: &mut JvmThread) {
         // the bitmap before cleanup acts on it (see
         // `g1_final_remark_and_cleanup`); the old completion path (a watcher
         // thread calling straight into cleanup) discarded both.
-        if shared.heap.g1_is_marking_active() && shared.heap.g1_concurrent_mark_finished() {
+        if shared.mem.heap.g1_is_marking_active() && shared.mem.heap.g1_concurrent_mark_finished() {
             g1_final_remark_cleanup(shared, thread);
             return;
         }
-        if shared.heap.g1_should_start_marking() && !shared.heap.g1_is_marking_active() {
+        if shared.mem.heap.g1_should_start_marking() && !shared.mem.heap.g1_is_marking_active() {
             g1_concurrent_mark_cycle(shared, thread);
         }
         return;
     }
 
     // Only proceed if old gen needs collection and we have a concurrent marker
-    if !shared.heap.old_gen_needs_gc() {
+    if !shared.mem.heap.old_gen_needs_gc() {
         return;
     }
 
-    let (old_gen_base, old_gen_size) = shared.heap.old_gen_info();
+    let (old_gen_base, old_gen_size) = shared.mem.heap.old_gen_info();
 
     // Create a temporary concurrent marker for this cycle.
     //
@@ -4079,8 +4139,8 @@ fn maybe_concurrent_gc(shared: &SharedVm, thread: &mut JvmThread) {
     let marker = cratonvm_gc::ConcurrentMarker::with_shared(
         old_gen_base,
         old_gen_size,
-        shared.concurrent_satb.clone(),
-        shared.concurrent_gc_state.clone(),
+        shared.mem.concurrent_satb.clone(),
+        shared.mem.concurrent_gc_state.clone(),
     );
 
     // Phase 1: Initial Mark — brief STW pause.
@@ -4095,6 +4155,7 @@ fn maybe_concurrent_gc(shared: &SharedVm, thread: &mut JvmThread) {
     let mut counted_os_tids: Vec<u32> = Vec::new();
     let initial_mark_done =
         shared
+            .mem
             .gc_barrier
             .request_stw_counted_with_live_blocked(thread.thread_id, || {
                 let (n, blocked, tids, blocked_tids) = shared
@@ -4138,25 +4199,27 @@ fn maybe_concurrent_gc(shared: &SharedVm, thread: &mut JvmThread) {
         // Safe here: brief STW, mutators quiesced, TLABs retired.
         root_ptrs.extend(
             shared
+                .mem
                 .heap
                 .collect_young_to_old_roots()
                 .into_iter()
                 .map(|a| a as *mut u8),
         );
-        if let Some(guard) = shared.heap.old_gen_lock() {
+        if let Some(guard) = shared.mem.heap.old_gen_lock() {
             marker.initial_mark(&root_ptrs, &*guard);
         }
         // Clear TLAB skip regions + resume frozen peers BEFORE reopening
         // the world (same race rationale as maybe_gc's epilogue).
-        shared.heap.clear_jit_tlab_skip_regions();
+        shared.mem.heap.clear_jit_tlab_skip_regions();
         crate::jit::xt_root_scan::resume(taken);
         shared
+            .mem
             .gc_barrier
             .complete_gc(std::collections::HashMap::new());
     }
 
     // Phase 2: Concurrent Mark — runs while app threads continue
-    if let Some(guard) = shared.heap.old_gen_lock() {
+    if let Some(guard) = shared.mem.heap.old_gen_lock() {
         marker.concurrent_mark(&*guard);
     }
 
@@ -4167,6 +4230,7 @@ fn maybe_concurrent_gc(shared: &SharedVm, thread: &mut JvmThread) {
     let mut counted_os_tids: Vec<u32> = Vec::new();
     let remark_done =
         shared
+            .mem
             .gc_barrier
             .request_stw_counted_with_live_blocked(thread.thread_id, || {
                 // Finding 1(a): remark pauses use the identity census too, so blocked
@@ -4192,7 +4256,7 @@ fn maybe_concurrent_gc(shared: &SharedVm, thread: &mut JvmThread) {
         // SATB buffer before remark drains the global queue. Other
         // mutators flushed when they arrived at the STW barrier;
         // the initiator must drain its own.
-        shared.heap.flush_thread_satb();
+        shared.mem.heap.flush_thread_satb();
         let roots = collect_roots(shared, thread);
         let snapshot_roots = shared.threads.thread_registry.collect_all_root_snapshots();
         let mut root_ptrs: Vec<*mut u8> = roots
@@ -4208,19 +4272,21 @@ fn maybe_concurrent_gc(shared: &SharedVm, thread: &mut JvmThread) {
         // be in the final bitmap before the sweep.
         root_ptrs.extend(
             shared
+                .mem
                 .heap
                 .collect_young_to_old_roots()
                 .into_iter()
                 .map(|a| a as *mut u8),
         );
-        if let Some(guard) = shared.heap.old_gen_lock() {
+        if let Some(guard) = shared.mem.heap.old_gen_lock() {
             marker.remark(&root_ptrs, &*guard);
         }
         // Clear TLAB skip regions + resume frozen peers BEFORE reopening
         // the world (same race rationale as maybe_gc's epilogue).
-        shared.heap.clear_jit_tlab_skip_regions();
+        shared.mem.heap.clear_jit_tlab_skip_regions();
         crate::jit::xt_root_scan::resume(taken);
         shared
+            .mem
             .gc_barrier
             .complete_gc(std::collections::HashMap::new());
     }
@@ -4239,7 +4305,7 @@ fn maybe_concurrent_gc(shared: &SharedVm, thread: &mut JvmThread) {
     }
 
     // Phase 4: Concurrent Sweep
-    if let Some(mut guard) = shared.heap.old_gen_lock() {
+    if let Some(mut guard) = shared.mem.heap.old_gen_lock() {
         let swept = marker.concurrent_sweep(&mut *guard);
         if swept > 0 {
             tracing::debug!("Concurrent GC: swept {} old-gen objects", swept,);
@@ -4276,6 +4342,7 @@ fn g1_concurrent_mark_cycle(shared: &SharedVm, thread: &mut JvmThread) {
     let mut counted_os_tids: Vec<u32> = Vec::new();
     let initial_mark_done =
         shared
+            .mem
             .gc_barrier
             .request_stw_counted_with_live_blocked(thread.thread_id, || {
                 let (n, blocked, tids, blocked_tids) = shared
@@ -4301,8 +4368,8 @@ fn g1_concurrent_mark_cycle(shared: &SharedVm, thread: &mut JvmThread) {
         // initiator hasn't, and any buffered overwrites from before
         // SATB activation must reach the global queue before the
         // marker starts consuming it.
-        shared.heap.flush_thread_satb();
-        shared.heap.g1_start_concurrent_mark();
+        shared.mem.heap.flush_thread_satb();
+        shared.mem.heap.g1_start_concurrent_mark();
         // INT-8: publish the referent-slot skip set for this cycle —
         // the Weak/Soft/Phantom Reference OBJECT addresses currently
         // registered. Inside this STW the snapshot is consistent (no
@@ -4311,8 +4378,8 @@ fn g1_concurrent_mark_cycle(shared: &SharedVm, thread: &mut JvmThread) {
         // Reference is ever scanned without the skip in force. G1
         // carries the set across every mid-cycle evacuation pause
         // internally (remap survivors, prune CSet casualties).
-        let ref_objs = shared.ref_processor.lock().reference_object_addresses();
-        shared.heap.g1_set_reference_skip_set(&ref_objs);
+        let ref_objs = shared.mem.ref_processor.lock().reference_object_addresses();
+        shared.mem.heap.g1_set_reference_skip_set(&ref_objs);
         // Mark roots into the G1 mark bitmap
         let roots =
             cratonvm_gc::gc_quiescence::with_class_unload_marking(|| collect_roots(shared, thread));
@@ -4323,13 +4390,14 @@ fn g1_concurrent_mark_cycle(shared: &SharedVm, thread: &mut JvmThread) {
             // INT-3 — frozen in-JIT peers' conservative register/stack roots.
             .chain(xt_roots.into_iter())
             .collect();
-        shared.heap.g1_mark_roots(&all_roots);
+        shared.mem.heap.g1_mark_roots(&all_roots);
         tracing::debug!("[G1] Initial mark: {} roots marked", all_roots.len());
         // Clear TLAB skip regions + resume frozen peers BEFORE reopening
         // the world (same race rationale as maybe_gc's epilogue).
-        shared.heap.clear_jit_tlab_skip_regions();
+        shared.mem.heap.clear_jit_tlab_skip_regions();
         crate::jit::xt_root_scan::resume(taken);
         shared
+            .mem
             .gc_barrier
             .complete_gc(std::collections::HashMap::new());
     }
@@ -4383,32 +4451,34 @@ fn g1_final_remark_cleanup(shared: &SharedVm, thread: &mut JvmThread) {
     // frozen-TLAB-tail publication (consumed by the region walkers' skip
     // checks) is load-bearing here too.
     let mut counted_os_tids: Vec<u32> = Vec::new();
-    let done = shared
-        .gc_barrier
-        .request_stw_counted_with_live_blocked(thread.thread_id, || {
-            // Finding 1(a): remark pauses use the identity census too, so blocked
-            // threads are excluded BY IDENTITY and their wake-time arrivals cannot
-            // satisfy this pause's quota (`arrive_and_wait_auto`). The anonymous
-            // `threads_blocked` subtraction this replaces excluded the same
-            // population without recording who it excluded.
-            let (n, blocked, tids, blocked_tids) = shared
-                .threads
-                .thread_registry
-                .alive_count_blocked_and_os_tids();
-            counted_os_tids = tids;
-            (
-                u32::try_from(n).unwrap_or(u32::MAX),
-                u32::try_from(blocked).unwrap_or(u32::MAX),
-                blocked_tids,
-            )
-        });
+    let done =
+        shared
+            .mem
+            .gc_barrier
+            .request_stw_counted_with_live_blocked(thread.thread_id, || {
+                // Finding 1(a): remark pauses use the identity census too, so blocked
+                // threads are excluded BY IDENTITY and their wake-time arrivals cannot
+                // satisfy this pause's quota (`arrive_and_wait_auto`). The anonymous
+                // `threads_blocked` subtraction this replaces excluded the same
+                // population without recording who it excluded.
+                let (n, blocked, tids, blocked_tids) = shared
+                    .threads
+                    .thread_registry
+                    .alive_count_blocked_and_os_tids();
+                counted_os_tids = tids;
+                (
+                    u32::try_from(n).unwrap_or(u32::MAX),
+                    u32::try_from(blocked).unwrap_or(u32::MAX),
+                    blocked_tids,
+                )
+            });
     if done {
         let mut xt_roots: Vec<ObjectRef> = Vec::new();
         let taken = stw_take_over_and_wait(shared, &mut xt_roots, &counted_os_tids);
         // Drain the initiator's per-thread SATB buffer; the other
         // mutators' buffers are pulled by `remark` itself
         // (`flush_all_thread_satb_buffers`) now that they are parked.
-        shared.heap.flush_thread_satb();
+        shared.mem.heap.flush_thread_satb();
         let roots =
             cratonvm_gc::gc_quiescence::with_class_unload_marking(|| collect_roots(shared, thread));
         let snapshot_roots = shared.threads.thread_registry.collect_all_root_snapshots();
@@ -4428,6 +4498,7 @@ fn g1_final_remark_cleanup(shared: &SharedVm, thread: &mut JvmThread) {
             g1_remark_process_references(shared, is_live)
         };
         let completed = shared
+            .mem
             .heap
             .g1_final_remark_and_cleanup(&all_roots, Some(&mut process));
         tracing::debug!(
@@ -4437,9 +4508,10 @@ fn g1_final_remark_cleanup(shared: &SharedVm, thread: &mut JvmThread) {
         );
         // Clear TLAB skip regions + resume frozen peers BEFORE reopening
         // the world (same race rationale as maybe_gc's epilogue).
-        shared.heap.clear_jit_tlab_skip_regions();
+        shared.mem.heap.clear_jit_tlab_skip_regions();
         crate::jit::xt_root_scan::resume(taken);
         shared
+            .mem
             .gc_barrier
             .complete_gc(std::collections::HashMap::new());
     } else {
@@ -4496,7 +4568,7 @@ fn g1_remark_process_references(
     if no_refproc() {
         return Vec::new();
     }
-    let mut ref_proc = shared.ref_processor.lock();
+    let mut ref_proc = shared.mem.ref_processor.lock();
     let result = ref_proc.process_references(is_marked, 64, 0);
 
     // Null the referent slot of newly-cleared references (once-only per
@@ -4511,13 +4583,14 @@ fn g1_remark_process_references(
         // SAFETY: `ref_addr` is a registry address kept current by the
         // per-pause `update_after_gc`; nothing has been freed since.
         let obj_ref = unsafe { ObjectRef::from_raw(ref_addr as *mut u8) };
-        if shared.heap.num_fields(obj_ref) < 2 {
+        if shared.mem.heap.num_fields(obj_ref) < 2 {
             continue; // belt-and-suspenders, mirrors the post-GC path
         }
         // SATB-suppressed: the clear is a decided verdict, not a semantic
         // overwrite — logging the old referent would resurrect it in the
         // re-drain below and retain the memory a full extra cycle.
         shared
+            .mem
             .heap
             .set_field_suppress_satb(obj_ref, 0, Value::Object(None));
     }
@@ -4534,24 +4607,25 @@ fn g1_remark_process_references(
         // SAFETY: registry addresses, current as above; both marked live.
         let ref_obj = unsafe { ObjectRef::from_raw(*ref_addr as *mut u8) };
         let q_obj = unsafe { ObjectRef::from_raw(*queue_addr as *mut u8) };
-        if shared.heap.num_fields(q_obj) < 2 || shared.heap.num_fields(ref_obj) < 2 {
+        if shared.mem.heap.num_fields(q_obj) < 2 || shared.mem.heap.num_fields(ref_obj) < 2 {
             continue;
         }
         // Same linked-list protocol as the post-GC path: head/size on the
         // queue, linkage through the Reference's `next` slot (slot 2 on the
         // real-JDK layout; legacy 2-field shape falls back to slot 0).
-        let old_head = shared.heap.get_field(q_obj, 0);
+        let old_head = shared.mem.heap.get_field(q_obj, 0);
         shared
+            .mem
             .heap
             .set_field(q_obj, 0, Value::Object(Some(ref_obj)));
         let next_slot = gc_reference_next_slot(shared, ref_obj);
-        shared.heap.set_field(ref_obj, next_slot, old_head);
-        let size = match shared.heap.get_field(q_obj, 1) {
+        shared.mem.heap.set_field(ref_obj, next_slot, old_head);
+        let size = match shared.mem.heap.get_field(q_obj, 1) {
             Value::Int(v) => v,
             _ => 0,
         };
-        shared.heap.set_field(q_obj, 1, Value::Int(size + 1));
-        shared.heap.set_field(ref_obj, 1, Value::Int(1)); // enqueued sentinel
+        shared.mem.heap.set_field(q_obj, 1, Value::Int(size + 1));
+        shared.mem.heap.set_field(ref_obj, 1, Value::Int(1)); // enqueued sentinel
     }
 
     // Everything handed out below must survive this cycle's cleanup — the
@@ -4565,18 +4639,18 @@ fn g1_remark_process_references(
     // cleanup and the post-GC staleness guard then (correctly) dropped its
     // stale submission — finalize() silently never ran.
     for obj_addr in &result.to_finalize {
-        shared.finalizer_thread.enqueue(*obj_addr);
+        shared.mem.finalizer_thread.enqueue(*obj_addr);
         resurrect.push(*obj_addr);
     }
     while let Some(obj_addr) = ref_proc.dequeue_for_finalization() {
-        shared.finalizer_thread.enqueue(obj_addr);
+        shared.mem.finalizer_thread.enqueue(obj_addr);
         resurrect.push(obj_addr);
     }
 
     // Cleaner actions fired by this round: submit + resurrect (the action
     // object is dereferenced later by run_cleaner_actions).
     for action_addr in &result.cleaner_actions {
-        shared.cleaner_thread.submit_action(*action_addr);
+        shared.mem.cleaner_thread.submit_action(*action_addr);
         resurrect.push(*action_addr);
     }
 
@@ -4628,17 +4702,17 @@ fn g1_remark_process_references(
 /// proceeds to OOM; this can delay an inevitable OOM slightly but never
 /// hangs the allocation path.
 pub(crate) fn g1_force_full_cycle(shared: &SharedVm, thread: &mut JvmThread) {
-    if !shared.heap.is_g1() {
+    if !shared.mem.heap.is_g1() {
         return;
     }
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     // If a cycle is already mid-flight we simply help finish it — its
     // cleanup reclaims the same dead spans a fresh cycle would.
-    let mut saw_active = shared.heap.g1_is_marking_active();
+    let mut saw_active = shared.mem.heap.g1_is_marking_active();
     loop {
-        if shared.heap.g1_is_marking_active() {
+        if shared.mem.heap.g1_is_marking_active() {
             saw_active = true;
-            if shared.heap.g1_concurrent_mark_finished() {
+            if shared.mem.heap.g1_concurrent_mark_finished() {
                 // Runs remark+cleanup under a brief STW; on a lost STW race
                 // the cycle stays open and the loop retries.
                 g1_final_remark_cleanup(shared, thread);
@@ -5135,8 +5209,8 @@ pub fn execute(
             //    declaration we just came from.
             if method_name != "<init>" && method_name != "<clinit>" {
                 if let Some(Value::Object(Some(recv_obj))) = args.first().copied() {
-                    let recv_cid = shared.heap.class_id_of(recv_obj);
-                    let recv_kind = shared.heap.kind_of(recv_obj);
+                    let recv_cid = shared.mem.heap.class_id_of(recv_obj);
+                    let recv_kind = shared.mem.heap.kind_of(recv_obj);
                     // Round 7 — receiver-is-lambda-proxy rescue. When an
                     // invokeinterface lands on an interface declaration with no
                     // Code (e.g. `CacheOverride.close()V`) but the receiver is
@@ -5221,7 +5295,7 @@ pub fn execute(
                             let unboxed = match ret_char {
                                 'I' | 'Z' | 'B' | 'C' | 'S' | 'J' | 'F' | 'D' => {
                                     if let Value::Object(Some(obj)) = value {
-                                        shared.heap.get_field(obj, 0)
+                                        shared.mem.heap.get_field(obj, 0)
                                     } else {
                                         value
                                     }
@@ -5426,7 +5500,7 @@ pub fn execute(
             if crate::runtime::env_cache::nocode_dbg() {
                 let recv_info = match args.first().copied() {
                     Some(Value::Object(Some(r))) => {
-                        let rc = shared.heap.class_id_of(r);
+                        let rc = shared.mem.heap.class_id_of(r);
                         let rn = shared
                             .classes
                             .class_manager
@@ -7161,6 +7235,7 @@ pub fn execute(
     }
     push_frame_and_fire_entry(thread, frame);
     if shared
+        .mem
         .gc_barrier
         .stw_requested
         .load(std::sync::atomic::Ordering::Acquire)
@@ -7420,6 +7495,7 @@ pub(crate) fn execute_prebuilt_frame(
     }
     push_frame_and_fire_entry(thread, frame);
     if shared
+        .mem
         .gc_barrier
         .stw_requested
         .load(std::sync::atomic::Ordering::Acquire)
@@ -7604,7 +7680,7 @@ pub fn pop_and_recycle_frame_with_reason(
                     .remove_jmx_locked_monitor(thread.thread_id, obj);
             }
         }
-        thread.recycle_frame_with_shared(f, &shared.operand_stack_pool, &shared.tag_pool);
+        thread.recycle_frame_with_shared(f, &shared.mem.operand_stack_pool, &shared.mem.tag_pool);
     }
 }
 
@@ -7897,6 +7973,7 @@ fn execute_frame_from_index(
         // hot path to one atomic load; call the full safepoint machinery only
         // while a pause is actually active.
         if shared
+            .mem
             .gc_barrier
             .stw_requested
             .load(std::sync::atomic::Ordering::Acquire)
@@ -8131,7 +8208,7 @@ fn execute_frame_from_index(
                     if b1 == 0xbe {
                         let arr_val = frame.get_local_unchecked(local_idx);
                         if let Value::Object(Some(arr_ref)) = arr_val {
-                            let len = shared.heap.array_length(arr_ref);
+                            let len = shared.mem.heap.array_length(arr_ref);
                             // JVM spec: arraylength returns i32; array length bounded by Integer.MAX_VALUE
                             frame.stack.push_int_unchecked(len as i32);
                             frame.pc = saved_pc + 2;
@@ -8771,10 +8848,12 @@ fn execute_frame_from_index(
                             let extra = match &value {
                                 Value::Object(Some(o)) => {
                                     let r = *o;
-                                    let cid = shared.heap.class_id_of(r);
-                                    let kind = shared.heap.kind_of(r);
+                                    let cid = shared.mem.heap.class_id_of(r);
+                                    let kind = shared.mem.heap.kind_of(r);
                                     // Try to read as String first
-                                    if let Some(s) = crate::vm::read_java_string(&shared.heap, r) {
+                                    if let Some(s) =
+                                        crate::vm::read_java_string(&shared.mem.heap, r)
+                                    {
                                         format!(" cid={:?} kind={:?} STRING=\"{}\"", cid, kind, s)
                                     } else if matches!(
                                         kind,
@@ -8784,7 +8863,7 @@ fn execute_frame_from_index(
                                         // field 0..3 to find any Int-typed field
                                         let mut fields_desc = String::new();
                                         for fi in 0..6usize {
-                                            let v = shared.heap.get_field(r, fi);
+                                            let v = shared.mem.heap.get_field(r, fi);
                                             fields_desc.push_str(&format!("f{}={:?} ", fi, v));
                                         }
                                         format!(
@@ -8793,17 +8872,17 @@ fn execute_frame_from_index(
                                         )
                                     } else {
                                         // Try array
-                                        let len = shared.heap.array_length(r);
+                                        let len = shared.mem.heap.array_length(r);
                                         let mut samples = String::new();
                                         let to_read = len.min(20);
                                         for i in 0..to_read {
-                                            match shared.heap.get_array_element(r, i) {
+                                            match shared.mem.heap.get_array_element(r, i) {
                                                 Ok(Value::Int(v)) => {
                                                     samples.push_str(&format!("{},", v))
                                                 }
                                                 Ok(Value::Object(Some(oo))) => {
                                                     if let Some(s) = crate::vm::read_java_string(
-                                                        &shared.heap,
+                                                        &shared.mem.heap,
                                                         oo,
                                                     ) {
                                                         samples.push_str(&format!("\"{}\",", s));
@@ -9767,7 +9846,7 @@ fn execute_frame_from_index(
                             continue;
                         }
                         // Widening: index conversion
-                        match shared.heap.get_array_element(arr_ref, index as usize) {
+                        match shared.mem.heap.get_array_element(arr_ref, index as usize) {
                             Ok(value) => {
                                 frame.stack.push_unchecked(value);
                                 frame.pc = saved_pc + 1;
@@ -9833,7 +9912,7 @@ fn execute_frame_from_index(
                             continue;
                         }
                         match shared
-                            .heap
+                            .mem.heap
                             .set_array_element(arr_ref, index as usize, value) // Widening: index conversion
                         {
                             Ok(()) => {
@@ -9883,8 +9962,8 @@ fn execute_frame_from_index(
                         // `aastore_element_assignable` fails open on imprecise
                         // type info, so this is additive and never a false ASE.
                         if let Value::Object(Some(elem_ref)) = value {
-                            if shared.heap.kind_of(arr_ref) == cratonvm_types::ObjectKind::Array
-                                && shared.heap.element_type_of(arr_ref)
+                            if shared.mem.heap.kind_of(arr_ref) == cratonvm_types::ObjectKind::Array
+                                && shared.mem.heap.element_type_of(arr_ref)
                                     == ArrayElementType::Reference
                                 && !aastore_element_assignable(shared, arr_ref, elem_ref)
                             {
@@ -9893,7 +9972,7 @@ fn execute_frame_from_index(
                                     .classes
                                     .class_manager
                                     .read()
-                                    .get_class(shared.heap.class_id_of(elem_ref))
+                                    .get_class(shared.mem.heap.class_id_of(elem_ref))
                                     .map(|c| c.name.to_string())
                                     .unwrap_or_else(|| "?".to_string());
                                 pending_runtime_error = Some((
@@ -9905,12 +9984,13 @@ fn execute_frame_from_index(
                         }
                         // SATB pre-barrier: log old array element before overwrite
                         // Widening: index conversion
-                        if let Ok(old_elem) = shared.heap.get_array_element(arr_ref, index as usize)
+                        if let Ok(old_elem) =
+                            shared.mem.heap.get_array_element(arr_ref, index as usize)
                         {
-                            shared.heap.satb_barrier(old_elem);
+                            shared.mem.heap.satb_barrier(old_elem);
                         }
                         match shared
-                            .heap
+                            .mem.heap
                             .set_array_element(arr_ref, index as usize, value) // Widening: index conversion
                         {
                             Ok(()) => {
@@ -9936,7 +10016,7 @@ fn execute_frame_from_index(
                 0xbe => {
                     let arr_val = frame.stack.pop_unchecked();
                     if let Value::Object(Some(arr_ref)) = arr_val {
-                        let len = shared.heap.array_length(arr_ref);
+                        let len = shared.mem.heap.array_length(arr_ref);
                         frame.stack.push_int_unchecked(len as i32); // Cast: array length to JVM int
                         frame.pc = saved_pc + 1;
                         continue;
@@ -10529,6 +10609,7 @@ fn execute_frame_from_index(
                 // can never survive to poison a later, unrelated exception.
                 let pending_return = thread.native_pending_return.take();
                 let exc = if shared
+                    .mem
                     .heap
                     .is_object_address(exc.as_ptr() as usize)
                     .is_some()
@@ -11070,7 +11151,7 @@ fn find_exception_handler_pc_unknown(
     frame: &Frame,
     exc: ObjectRef,
 ) -> Option<(usize, ObjectRef)> {
-    let exc_class_id = shared.heap.class_id_of(exc);
+    let exc_class_id = shared.mem.heap.class_id_of(exc);
     // `frame.code` is padded with 2 trailing bytes for the interpreter's
     // speculative reads; the real bytecode length is `len() - 2`.
     let code_len = frame.code.len().saturating_sub(2);
@@ -11141,7 +11222,7 @@ fn find_exception_handler_impl(
     pc: usize,
     exc: ObjectRef,
 ) -> Option<(usize, ObjectRef)> {
-    let exc_class_id = shared.heap.class_id_of(exc);
+    let exc_class_id = shared.mem.heap.class_id_of(exc);
 
     let mut cm_guard = shared.classes.class_manager.read();
     // Verify the owning class exists once — hoist this invariant out
@@ -11260,7 +11341,7 @@ fn route_jit_exception_through_method(
     // the real bytecode length is `len() - 2`. Used to recognise a catch-all
     // whose region covers the whole method when the throw PC is unknown.
     let code_len = cached.code.len().saturating_sub(2);
-    let exc_class_id = shared.heap.class_id_of(exc);
+    let exc_class_id = shared.mem.heap.class_id_of(exc);
     let mut handler_pc: Option<usize> = None;
     // HIGH — same fast-path treatment as `find_exception_handler`:
     // hold the class_manager read lock for the duration of the search
@@ -11382,8 +11463,8 @@ fn route_jit_exception_through_method(
     // T10.7 — if the per-thread pool has run dry, replenish it from the
     // shared VM-wide VecPool before building the frame.
     thread.refill_pools_from_shared(
-        &shared.operand_stack_pool,
-        &shared.tag_pool,
+        &shared.mem.operand_stack_pool,
+        &shared.mem.tag_pool,
         // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
         cached.max_locals as usize,
         // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
@@ -11576,8 +11657,8 @@ fn resume_from_ir_deopt(
     };
 
     thread.refill_pools_from_shared(
-        &shared.operand_stack_pool,
-        &shared.tag_pool,
+        &shared.mem.operand_stack_pool,
+        &shared.mem.tag_pool,
         // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
         cached.max_locals as usize,
         // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
@@ -11719,7 +11800,7 @@ fn verify_reconstructed_oops(
         for (i, v) in vals.iter().enumerate() {
             match v {
                 FrameValue::Object(addr) if *addr != 0 => {
-                    if shared.heap.is_heap_addr(*addr as usize).is_none() {
+                    if shared.mem.heap.is_heap_addr(*addr as usize).is_none() {
                         return Err(format!(
                             "{region}[{i}] = Object(0x{addr:x}) is not a valid heap address"
                         ));
@@ -11922,8 +12003,8 @@ pub(crate) fn build_deopt_frame_inner(
     }
 
     thread.refill_pools_from_shared(
-        &shared.operand_stack_pool,
-        &shared.tag_pool,
+        &shared.mem.operand_stack_pool,
+        &shared.mem.tag_pool,
         // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
         cached.max_locals as usize,
         // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
@@ -12604,7 +12685,10 @@ mod deopt_step3_tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
         let cached = minimal_cached();
 
-        let obj = shared.heap.alloc_object(cratonvm_types::ClassId::new(7), 0);
+        let obj = shared
+            .mem
+            .heap
+            .alloc_object(cratonvm_types::ClassId::new(7), 0);
         // Cast: object/code pointer to integer address
         let addr = obj.as_ptr() as usize as u64;
         let rf = rframe(
@@ -12707,7 +12791,10 @@ mod deopt_step3_tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
         let cached = minimal_cached();
-        let obj = shared.heap.alloc_object(cratonvm_types::ClassId::new(7), 0);
+        let obj = shared
+            .mem
+            .heap
+            .alloc_object(cratonvm_types::ClassId::new(7), 0);
         // Cast: object/code pointer to integer address
         let addr = obj.as_ptr() as usize as u64;
         let rf = rframe(vec![FrameValue::Object(addr)], vec![], 3);
@@ -12728,7 +12815,10 @@ mod deopt_step3_tests {
         assert_eq!(frame.pc, 3);
         match frame.get_local(0) {
             Value::Object(Some(o)) => {
-                assert_eq!(shared.heap.class_id_of(o), cratonvm_types::ClassId::new(7));
+                assert_eq!(
+                    shared.mem.heap.class_id_of(o),
+                    cratonvm_types::ClassId::new(7)
+                );
             }
             other => panic!("local 0 must survive GC via the pushed frame, got {other:?}"),
         }
@@ -12742,7 +12832,10 @@ mod deopt_step3_tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
         let cached = minimal_cached();
 
-        let obj = shared.heap.alloc_object(cratonvm_types::ClassId::new(7), 0);
+        let obj = shared
+            .mem
+            .heap
+            .alloc_object(cratonvm_types::ClassId::new(7), 0);
         // Cast: object/code pointer to integer address
         let addr = obj.as_ptr() as usize as u64;
         let rf = rframe(vec![FrameValue::Object(addr)], vec![], 0);
@@ -12753,7 +12846,10 @@ mod deopt_step3_tests {
                 .expect("must build under a forced GC");
         match frame.get_local(0) {
             Value::Object(Some(o)) => {
-                assert_eq!(shared.heap.class_id_of(o), cratonvm_types::ClassId::new(7));
+                assert_eq!(
+                    shared.mem.heap.class_id_of(o),
+                    cratonvm_types::ClassId::new(7)
+                );
             }
             other => panic!("local 0 must be a live object, got {other:?}"),
         }
@@ -12797,9 +12893,12 @@ mod deopt_step3_tests {
         assert_eq!(frame.pc, 4);
         match frame.get_local(0) {
             Value::Object(Some(o)) => {
-                assert_eq!(shared.heap.class_id_of(o), cratonvm_types::ClassId::new(5));
-                assert_eq!(shared.heap.get_field(o, 0), Value::Int(42));
-                assert_eq!(shared.heap.get_field(o, 1), Value::Int(0)); // Undefined -> 0
+                assert_eq!(
+                    shared.mem.heap.class_id_of(o),
+                    cratonvm_types::ClassId::new(5)
+                );
+                assert_eq!(shared.mem.heap.get_field(o, 0), Value::Int(42));
+                assert_eq!(shared.mem.heap.get_field(o, 1), Value::Int(0)); // Undefined -> 0
             }
             other => panic!("local 0 must be the materialized object, got {other:?}"),
         }
@@ -12829,8 +12928,8 @@ mod deopt_step3_tests {
             (Value::Object(Some(oa)), Value::Object(Some(ob))) => (oa, ob),
             other => panic!("both locals must be materialized objects, got {other:?}"),
         };
-        assert_eq!(shared.heap.get_field(oa, 0), Value::Object(Some(ob)));
-        assert_eq!(shared.heap.get_field(ob, 0), Value::Object(Some(oa)));
+        assert_eq!(shared.mem.heap.get_field(oa, 0), Value::Object(Some(ob)));
+        assert_eq!(shared.mem.heap.get_field(ob, 0), Value::Object(Some(oa)));
     }
 
     /// Phase C (monitors): a frame holding a `synchronized(scalarObj)` monitor
@@ -13200,7 +13299,10 @@ mod deopt_step3_tests {
     #[test]
     fn verify_oops_accepts_real_rejects_bogus() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
-        let obj = shared.heap.alloc_object(cratonvm_types::ClassId::new(7), 0);
+        let obj = shared
+            .mem
+            .heap
+            .alloc_object(cratonvm_types::ClassId::new(7), 0);
         let addr = obj.as_ptr() as usize as u64;
 
         // Real object + null pass.
@@ -13241,8 +13343,11 @@ mod deopt_step3_tests {
                 .expect("virtual frame must build under a forced GC");
         match frame.get_local(0) {
             Value::Object(Some(o)) => {
-                assert_eq!(shared.heap.class_id_of(o), cratonvm_types::ClassId::new(5));
-                assert_eq!(shared.heap.get_field(o, 0), Value::Int(7));
+                assert_eq!(
+                    shared.mem.heap.class_id_of(o),
+                    cratonvm_types::ClassId::new(5)
+                );
+                assert_eq!(shared.mem.heap.get_field(o, 0), Value::Int(7));
             }
             other => panic!("materialized shell must survive GC during build, got {other:?}"),
         }
@@ -13413,7 +13518,10 @@ mod deopt_step3_tests {
             0,
         );
 
-        let obj = shared.heap.alloc_object(cratonvm_types::ClassId::new(7), 0);
+        let obj = shared
+            .mem
+            .heap
+            .alloc_object(cratonvm_types::ClassId::new(7), 0);
         // Cast: object pointer to integer address.
         let addr = obj.as_ptr() as usize as u64;
         let advanced = rframe(
@@ -13431,7 +13539,10 @@ mod deopt_step3_tests {
         assert_eq!(frame.pc, 3);
         match frame.get_local(0) {
             Value::Object(Some(o)) => {
-                assert_eq!(shared.heap.class_id_of(o), cratonvm_types::ClassId::new(7));
+                assert_eq!(
+                    shared.mem.heap.class_id_of(o),
+                    cratonvm_types::ClassId::new(7)
+                );
             }
             other => panic!("local 0 must survive GC via the live frame, got {other:?}"),
         }
@@ -13682,11 +13793,15 @@ fn execute_instruction(
                 let npe_mname = thread.frames[frame_idx].method_name_arc();
                 let npe_mdesc = thread.frames[frame_idx].method_descriptor_arc();
                 let npe_bci = thread.frames[frame_idx].last_instr_pc;
-                pop_object_ref_ctx_with(&mut thread.frames[frame_idx].stack, &shared.heap, || {
-                    helpful_npe_opcode_message_parts(
-                        shared, npe_cid, &npe_code, &npe_mname, &npe_mdesc, npe_bci, &action, 1,
-                    )
-                })?
+                pop_object_ref_ctx_with(
+                    &mut thread.frames[frame_idx].stack,
+                    &shared.mem.heap,
+                    || {
+                        helpful_npe_opcode_message_parts(
+                            shared, npe_cid, &npe_code, &npe_mname, &npe_mdesc, npe_bci, &action, 1,
+                        )
+                    },
+                )?
             } else {
                 pop_object_ref_ctx(
                     &mut thread.frames[frame_idx].stack,
@@ -13694,6 +13809,7 @@ fn execute_instruction(
                 )?
             };
             let value = shared
+                .mem
                 .heap
                 .get_array_element(array_ref, index as usize) // Widening: index conversion
                 .map_err(|i| {
@@ -13701,7 +13817,7 @@ fn execute_instruction(
                         let cls = thread.frames[frame_idx].class_name().to_string();
                         let mth = thread.frames[frame_idx].method_name().to_string();
                         let pc = thread.frames[frame_idx].pc;
-                        let alen = shared.heap.array_length(array_ref);
+                        let alen = shared.mem.heap.array_length(array_ref);
                         eprintln!(
                             "AIOOBE-LOAD class={cls} method={mth} pc={pc} idx={i} len={alen}"
                         );
@@ -13769,8 +13885,10 @@ fn execute_instruction(
             let npe_mname = thread.frames[frame_idx].method_name_arc();
             let npe_mdesc = thread.frames[frame_idx].method_descriptor_arc();
             let npe_bci = thread.frames[frame_idx].last_instr_pc;
-            let array_ref =
-                pop_object_ref_ctx_with(&mut thread.frames[frame_idx].stack, &shared.heap, || {
+            let array_ref = pop_object_ref_ctx_with(
+                &mut thread.frames[frame_idx].stack,
+                &shared.mem.heap,
+                || {
                     if jep358 {
                         let action = crate::runtime::exceptions::helpful_npe::action_array_store(
                             crate::runtime::exceptions::helpful_npe::ArrayElemKind::Object,
@@ -13784,7 +13902,8 @@ fn execute_instruction(
                             _diag_class, _diag_method, _diag_pc
                         )
                     }
-                })?;
+                },
+            )?;
             // JVMS §aastore covariance check: a reference store into an
             // Object[]-family array whose element's runtime type is NOT
             // assignment-compatible with the array's component type throws
@@ -13794,15 +13913,15 @@ fn execute_instruction(
             // fails open (allows the store) on any imprecise type info, so this is
             // additive and never produces a false ArrayStoreException.
             if let Value::Object(Some(elem_ref)) = value {
-                if shared.heap.kind_of(array_ref) == cratonvm_types::ObjectKind::Array
-                    && shared.heap.element_type_of(array_ref) == ArrayElementType::Reference
+                if shared.mem.heap.kind_of(array_ref) == cratonvm_types::ObjectKind::Array
+                    && shared.mem.heap.element_type_of(array_ref) == ArrayElementType::Reference
                     && !aastore_element_assignable(shared, array_ref, elem_ref)
                 {
                     let elem_cls = shared
                         .classes
                         .class_manager
                         .read()
-                        .get_class(shared.heap.class_id_of(elem_ref))
+                        .get_class(shared.mem.heap.class_id_of(elem_ref))
                         .map(|c| c.name.to_string())
                         .unwrap_or_else(|| "?".to_string());
                     return Err(RuntimeError::ArrayStoreException { message: elem_cls }.into());
@@ -13810,15 +13929,15 @@ fn execute_instruction(
             }
             // SATB barrier: log old array element before overwriting
             // Widening: index conversion
-            if let Ok(old_elem) = shared.heap.get_array_element(array_ref, index as usize) {
-                shared.heap.satb_barrier(old_elem);
+            if let Ok(old_elem) = shared.mem.heap.get_array_element(array_ref, index as usize) {
+                shared.mem.heap.satb_barrier(old_elem);
             }
             shared
-                .heap
+                .mem.heap
                 .set_array_element(array_ref, index as usize, value) // Widening: index conversion
                 .map_err(|i| {
                     if aioobe_dbg() {
-                        let alen = shared.heap.array_length(array_ref);
+                        let alen = shared.mem.heap.array_length(array_ref);
                         eprintln!("AIOOBE-AASTORE class={_diag_class} method={_diag_method} pc={_diag_pc} idx={i} len={alen}");
                     }
                     RuntimeError::ArrayIndexOutOfBoundsException { index: i }
@@ -13843,8 +13962,10 @@ fn execute_instruction(
             let npe_mname = thread.frames[frame_idx].method_name_arc();
             let npe_mdesc = thread.frames[frame_idx].method_descriptor_arc();
             let npe_bci = thread.frames[frame_idx].last_instr_pc;
-            let array_ref =
-                pop_object_ref_ctx_with(&mut thread.frames[frame_idx].stack, &shared.heap, || {
+            let array_ref = pop_object_ref_ctx_with(
+                &mut thread.frames[frame_idx].stack,
+                &shared.mem.heap,
+                || {
                     if jep358 {
                         use crate::runtime::exceptions::helpful_npe::ArrayElemKind;
                         let elem = match instruction {
@@ -13865,17 +13986,18 @@ fn execute_instruction(
                             _diag_class, _diag_method, _diag_pc
                         )
                     }
-                })?;
+                },
+            )?;
             // bc math-ec 0x4 smear hunt — see the Lastore twin below.
             if arrstore_enabled() {
                 arrstore_check(shared, thread, array_ref, index, "iastore");
             }
             shared
-                .heap
+                .mem.heap
                 .set_array_element(array_ref, index as usize, value) // Widening: index conversion
                 .map_err(|i| {
                     if aioobe_dbg() {
-                        let alen = shared.heap.array_length(array_ref);
+                        let alen = shared.mem.heap.array_length(array_ref);
                         eprintln!("AIOOBE-XASTORE class={_diag_class} method={_diag_method} pc={_diag_pc} idx={i} len={alen}");
                     }
                     RuntimeError::ArrayIndexOutOfBoundsException { index: i }
@@ -13899,8 +14021,10 @@ fn execute_instruction(
             let npe_mname = thread.frames[frame_idx].method_name_arc();
             let npe_mdesc = thread.frames[frame_idx].method_descriptor_arc();
             let npe_bci = thread.frames[frame_idx].last_instr_pc;
-            let array_ref =
-                pop_object_ref_ctx_with(&mut thread.frames[frame_idx].stack, &shared.heap, || {
+            let array_ref = pop_object_ref_ctx_with(
+                &mut thread.frames[frame_idx].stack,
+                &shared.mem.heap,
+                || {
                     if jep358 {
                         let action = crate::runtime::exceptions::helpful_npe::action_array_store(
                             crate::runtime::exceptions::helpful_npe::ArrayElemKind::Long,
@@ -13914,7 +14038,8 @@ fn execute_instruction(
                             _diag_class, _diag_method, _diag_pc
                         )
                     }
-                })?;
+                },
+            )?;
             // bc math-ec 0x4 smear hunt (CRATONVM_DBG_ARRSTORE): validate the
             // receiver's header AT THE WRITE. A stale (GC-moved) long[] ref
             // points at reused memory whose "header" is garbage math data —
@@ -13927,6 +14052,7 @@ fn execute_instruction(
                 arrstore_check(shared, thread, array_ref, index, "lastore");
             }
             shared
+                .mem
                 .heap
                 // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
                 .set_array_element(array_ref, index as usize, Value::Long(v))
@@ -13945,8 +14071,10 @@ fn execute_instruction(
             let npe_mname = thread.frames[frame_idx].method_name_arc();
             let npe_mdesc = thread.frames[frame_idx].method_descriptor_arc();
             let npe_bci = thread.frames[frame_idx].last_instr_pc;
-            let array_ref =
-                pop_object_ref_ctx_with(&mut thread.frames[frame_idx].stack, &shared.heap, || {
+            let array_ref = pop_object_ref_ctx_with(
+                &mut thread.frames[frame_idx].stack,
+                &shared.mem.heap,
+                || {
                     if jep358 {
                         let action = crate::runtime::exceptions::helpful_npe::action_array_store(
                             crate::runtime::exceptions::helpful_npe::ArrayElemKind::Double,
@@ -13960,8 +14088,10 @@ fn execute_instruction(
                             _diag_class, _diag_method, _diag_pc
                         )
                     }
-                })?;
+                },
+            )?;
             shared
+                .mem
                 .heap
                 // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
                 .set_array_element(array_ref, index as usize, Value::Double(d))
@@ -14769,7 +14899,7 @@ fn execute_instruction(
                     };
                     if let Some(b) = boolean_const {
                         let obj = gc_alloc_object(shared, thread, field.declaring_class_id, 1)?;
-                        shared.heap.set_field(obj, 0, Value::Int(i32::from(b)));
+                        shared.mem.heap.set_field(obj, 0, Value::Int(i32::from(b)));
                         value = Value::Object(Some(obj));
                         set_static_shared(
                             shared,
@@ -14824,7 +14954,7 @@ fn execute_instruction(
             let value = pop_static_field_value(&mut thread.frames[frame_idx].stack, desc_byte)?;
             // SATB barrier: log old static field value before overwriting
             let old_static = get_static_shared(shared, field.declaring_class_id, field.field_index);
-            shared.heap.satb_barrier(old_static);
+            shared.mem.heap.satb_barrier(old_static);
             // Volatile static fields: emit memory fence before write
             if field.is_volatile {
                 std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
@@ -14861,8 +14991,10 @@ fn execute_instruction(
             } else {
                 None
             };
-            let obj_ref =
-                pop_object_ref_ctx_with(&mut thread.frames[frame_idx].stack, &shared.heap, || {
+            let obj_ref = pop_object_ref_ctx_with(
+                &mut thread.frames[frame_idx].stack,
+                &shared.mem.heap,
+                || {
                     let field_name = resolve_field_name(shared, current_class_id, *index);
                     if let Some((code, mname, mdesc, bci)) = &npe_parts {
                         let action = crate::runtime::exceptions::helpful_npe::action_read_field(
@@ -14884,7 +15016,8 @@ fn execute_instruction(
                             field_name.as_deref().unwrap_or("?")
                         )
                     }
-                });
+                },
+            );
             if crate::runtime::env_cache::any_field_diag()
                 && obj_ref.is_err()
                 && std::env::var_os("CRATONVM_DBG_NULLTHIS").is_some()
@@ -14931,14 +15064,14 @@ fn execute_instruction(
             // but dead from-space copy -- same shape as the native-call-arg
             // and getfield-loaded-value barriers elsewhere in this file, just
             // never applied to the getfield/putfield RECEIVER itself.
-            let obj_ref = shared.heap.load_and_forward(obj_ref);
+            let obj_ref = shared.mem.heap.load_and_forward(obj_ref);
             let mut field =
                 resolve_field_ref_loader_aware(shared, thread, current_class_id, *index)?;
             if let Some(retargeted) = retarget_instance_field_to_receiver(
                 shared,
                 current_class_id,
                 *index,
-                shared.heap.class_id_of(obj_ref),
+                shared.mem.heap.class_id_of(obj_ref),
                 &field,
             ) {
                 field = retargeted;
@@ -14963,14 +15096,14 @@ fn execute_instruction(
                                 | "runningThreads"
                                 | "submittedTaskCounter"
                         ) {
-                            let raw = shared.heap.get_field(obj_ref, field.field_index);
+                            let raw = shared.mem.heap.get_field(obj_ref, field.field_index);
                             eprintln!(
                             "[FIELDADDR] GET {} obj=0x{:x} slot={} num_slots={} readObj={} in {}",
                             fname,
                             // Cast: object/code pointer to integer address
                             obj_ref.as_ptr() as usize,
                             field.field_index,
-                            shared.heap.get_header(obj_ref).num_slots(),
+                            shared.mem.heap.get_header(obj_ref).num_slots(),
                             matches!(raw, Value::Object(Some(_))),
                             thread.frames[frame_idx].class_name(),
                         );
@@ -14986,7 +15119,7 @@ fn execute_instruction(
                 if crate::runtime::env_cache::badrecv_dbg() {
                     // Cast: object/code pointer to integer address
                     let p = obj_ref.as_ptr() as usize;
-                    if p != 0 && shared.heap.is_heap_addr(p).is_none() {
+                    if p != 0 && shared.mem.heap.is_heap_addr(p).is_none() {
                         use std::sync::atomic::{AtomicUsize, Ordering};
                         static N: AtomicUsize = AtomicUsize::new(0);
                         let n = N.fetch_add(1, Ordering::Relaxed);
@@ -15025,8 +15158,8 @@ fn execute_instruction(
                     // A getfield on a 0-slot object is always OOB, so this
                     // never fires for a legitimate zero-hash ClassId(0)
                     // container with fields.
-                    if p != 0 && shared.heap.is_heap_addr(p).is_some() {
-                        let h = shared.heap.get_header(obj_ref);
+                    if p != 0 && shared.mem.heap.is_heap_addr(p).is_some() {
+                        let h = shared.mem.heap.get_header(obj_ref);
                         if h.class_id.as_u32() == 0 && h.num_slots() == 0 {
                             use std::sync::atomic::{AtomicUsize, Ordering};
                             static NZ: AtomicUsize = AtomicUsize::new(0);
@@ -15057,7 +15190,7 @@ fn execute_instruction(
                     let mname = thread.frames[frame_idx].method_name();
                     if cname.contains("HashtableOfInt") {
                         let field_name = resolve_field_name(shared, current_class_id, *index);
-                        let v = shared.heap.get_field(obj_ref, field.field_index);
+                        let v = shared.mem.heap.get_field(obj_ref, field.field_index);
                         let nf = shared
                             .classes
                             .class_manager
@@ -15081,9 +15214,12 @@ fn execute_instruction(
                     if cname.contains("BigDecimal") && mname == "intValue" {
                         let field_name = resolve_field_name(shared, current_class_id, *index);
                         let v = if field.is_volatile {
-                            shared.heap.get_field_volatile(obj_ref, field.field_index)
+                            shared
+                                .mem
+                                .heap
+                                .get_field_volatile(obj_ref, field.field_index)
                         } else {
-                            shared.heap.get_field(obj_ref, field.field_index)
+                            shared.mem.heap.get_field(obj_ref, field.field_index)
                         };
                         eprintln!("[Getfield in BigDecimal.intValue] cp_index={} field_name={:?} field_index={} is_ref={} obj={:p} value={:?}",
                               *index, field_name, field.field_index, field.is_reference, obj_ref.as_ptr(), v);
@@ -15113,11 +15249,14 @@ fn execute_instruction(
             // cycle, `load_and_forward` returns the forwarded address
             // so subsequent field access hits the live copy. Under
             // stop-the-world GC this is always a no-op fast path.
-            let obj_ref = shared.heap.load_and_forward(obj_ref);
+            let obj_ref = shared.mem.heap.load_and_forward(obj_ref);
             let mut value = if field.is_volatile {
-                shared.heap.get_field_volatile(obj_ref, field.field_index)
+                shared
+                    .mem
+                    .heap
+                    .get_field_volatile(obj_ref, field.field_index)
             } else {
-                shared.heap.get_field(obj_ref, field.field_index)
+                shared.mem.heap.get_field(obj_ref, field.field_index)
             };
             // K2 (T10.9.E) — J/D direct-CompactValue fast path.
             //
@@ -15210,7 +15349,7 @@ fn execute_instruction(
                 // would otherwise leak a stale pointer into the next
                 // safepoint's root set.
                 if let Value::Object(Some(inner)) = value {
-                    value = Value::Object(Some(shared.heap.load_and_forward(inner)));
+                    value = Value::Object(Some(shared.mem.heap.load_and_forward(inner)));
                 }
                 if remap_trace_on() {
                     if let Value::Object(Some(inner)) = value {
@@ -15319,8 +15458,10 @@ fn execute_instruction(
             } else {
                 None
             };
-            let obj_ref =
-                pop_object_ref_ctx_with(&mut thread.frames[frame_idx].stack, &shared.heap, || {
+            let obj_ref = pop_object_ref_ctx_with(
+                &mut thread.frames[frame_idx].stack,
+                &shared.mem.heap,
+                || {
                     let field_name = resolve_field_name(shared, current_class_id, *index);
                     if let Some((code, mname, mdesc, bci)) = &npe_parts {
                         let action = crate::runtime::exceptions::helpful_npe::action_assign_field(
@@ -15342,7 +15483,8 @@ fn execute_instruction(
                             field_name.as_deref().unwrap_or("?")
                         )
                     }
-                });
+                },
+            );
             // CRATONVM_DBG_NULLTHIS — dump the Java frame stack + current-frame
             // locals when a putfield pops a null receiver. Diagnoses the
             // "Cannot write field X because the object is null" family (a JIT'd
@@ -15399,12 +15541,12 @@ fn execute_instruction(
             // num_slots/class_id sanity check does not catch. Heal it the
             // same way native-call arguments and the getfield RECEIVER
             // (see the identical fix just above) already are.
-            let obj_ref = shared.heap.load_and_forward(obj_ref);
+            let obj_ref = shared.mem.heap.load_and_forward(obj_ref);
             if let Some(retargeted) = retarget_instance_field_to_receiver(
                 shared,
                 current_class_id,
                 *index,
-                shared.heap.class_id_of(obj_ref),
+                shared.mem.heap.class_id_of(obj_ref),
                 &field,
             ) {
                 field = retargeted;
@@ -15475,7 +15617,7 @@ fn execute_instruction(
                             // Cast: object/code pointer to integer address
                             obj_ref.as_ptr() as usize,
                             field.field_index,
-                            shared.heap.get_header(obj_ref).num_slots(),
+                            shared.mem.heap.get_header(obj_ref).num_slots(),
                             matches!(value, Value::Object(Some(_))),
                             thread.frames[frame_idx].class_name(),
                         );
@@ -15491,7 +15633,7 @@ fn execute_instruction(
                 // stack + receiver so we can trace where the stale ref originates
                 // (operand-stack slot not remapped after a young GC). Rate-limited.
                 if straystack_enabled() {
-                    let h = shared.heap.get_header(obj_ref);
+                    let h = shared.mem.heap.get_header(obj_ref);
                     // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
                     let ns = h.num_slots() as usize;
                     if field.field_index >= ns || h.num_slots() > (1 << 24) {
@@ -15550,7 +15692,7 @@ fn execute_instruction(
                     let field_name = resolve_field_name(shared, current_class_id, *index);
                     if matches!(field_name.as_deref(), Some("buf") | Some("count")) {
                         let cm = shared.classes.class_manager.read();
-                        let recv_cid = shared.heap.class_id_of(obj_ref);
+                        let recv_cid = shared.mem.heap.class_id_of(obj_ref);
                         let rn = cm
                             .get_class(recv_cid)
                             .map(|c| c.name.to_string())
@@ -15602,9 +15744,12 @@ fn execute_instruction(
             // need the old `Value` for the pre-store check, but only
             // call the trait method on the ref-typed case — primitives
             // and nulls don't enter SATB.
-            let old_value = shared.heap.get_field(obj_ref, field.field_index);
+            let old_value = shared.mem.heap.get_field(obj_ref, field.field_index);
             if let Value::Object(Some(old_ref)) = old_value {
-                shared.heap.write_barrier_pre(std::ptr::null_mut(), old_ref);
+                shared
+                    .mem
+                    .heap
+                    .write_barrier_pre(std::ptr::null_mut(), old_ref);
             }
             // FIELD-WATCH (TestUpgrade RootReference/MVMap residual) — every
             // real putfield to any Page/RootReference field, unconditional
@@ -15637,7 +15782,7 @@ fn execute_instruction(
                 // (`AQLS.setState` — the writer-exclusive release path),
                 // matching the CAS-side ledger in native_unsafe_cas_long.
                 if cratonvm_native_builtins::aqs_trace_enabled() {
-                    let cid = shared.heap.class_id_of(obj_ref);
+                    let cid = shared.mem.heap.class_id_of(obj_ref);
                     let cls = {
                         let cm = shared.classes.class_manager.read();
                         cm.get_class(cid)
@@ -15657,10 +15802,11 @@ fn execute_instruction(
                     }
                 }
                 shared
+                    .mem
                     .heap
                     .set_field_volatile(obj_ref, field.field_index, value);
             } else {
-                shared.heap.set_field(obj_ref, field.field_index, value);
+                shared.mem.heap.set_field(obj_ref, field.field_index, value);
             }
             // DBG (bc math-ec, CRATONVM_DBG_ECWATCH): when a *valid* reference is
             // stored into an EC object's reference field, arm a software
@@ -15669,7 +15815,7 @@ fn execute_instruction(
             // that does it (checked in `safe_native_call`). See runtime::ec_watch.
             if crate::runtime::ec_watch::enabled() {
                 if let (true, Value::Object(Some(p))) = (field.is_reference, value) {
-                    let recv_cid = shared.heap.class_id_of(obj_ref);
+                    let recv_cid = shared.mem.heap.class_id_of(obj_ref);
                     if ec_is_watched_class(shared, recv_cid) {
                         crate::runtime::ec_watch::record(
                             obj_ref,
@@ -16069,7 +16215,7 @@ fn execute_instruction(
             // S111r14 diag: print full Java stack trace on arraylength failure
             let arr_ref = match pop_object_ref_ctx_with(
                 &mut thread.frames[frame_idx].stack,
-                &shared.heap,
+                &shared.mem.heap,
                 || {
                     if jep358 {
                         let action = crate::runtime::exceptions::helpful_npe::action_array_length();
@@ -16098,7 +16244,7 @@ fn execute_instruction(
                     return Err(e);
                 }
             };
-            let len = shared.heap.array_length(arr_ref);
+            let len = shared.mem.heap.array_length(arr_ref);
             thread.frames[frame_idx]
                 .stack
                 .push(Value::Int(len as i32))?; // Cast: array length to JVM int
@@ -16224,7 +16370,7 @@ fn execute_instruction(
                     // This catches IAEs that don't go through throw_runtime_error,
                     // e.g. Spring's Assert.notNull / validateBeanDefinition etc.
                     if crate::runtime::env_cache::iae_trace() {
-                        let exc_class_id = shared.heap.class_id_of(obj_ref);
+                        let exc_class_id = shared.mem.heap.class_id_of(obj_ref);
                         let exc_class_name = shared
                             .classes
                             .class_manager
@@ -16234,9 +16380,9 @@ fn execute_instruction(
                             .unwrap_or_default();
                         if exc_class_name.contains("IllegalArgumentException") {
                             // Try to read the detail message (field 0 = detailMessage)
-                            let msg = match shared.heap.get_field(obj_ref, 0) {
+                            let msg = match shared.mem.heap.get_field(obj_ref, 0) {
                                 Value::Object(Some(msg_ref)) => {
-                                    read_java_string(&shared.heap, msg_ref)
+                                    read_java_string(&shared.mem.heap, msg_ref)
                                         .unwrap_or_else(|| "<non-string>".to_string())
                                 }
                                 Value::Object(None) => "<null message>".to_string(),
@@ -16267,7 +16413,7 @@ fn execute_instruction(
                     // app exits silently (Kafka 4.2.0 main()'s catch-all
                     // around buildServer/startup is the canonical case).
                     if crate::runtime::env_cache::athrow_dbg() {
-                        let exc_class_id = shared.heap.class_id_of(obj_ref);
+                        let exc_class_id = shared.mem.heap.class_id_of(obj_ref);
                         let exc_class_name = shared
                             .classes
                             .class_manager
@@ -16277,9 +16423,10 @@ fn execute_instruction(
                             .unwrap_or_default();
                         let mut msg = String::from("<no msg>");
                         for fi in 0..8 {
-                            if let Value::Object(Some(msg_ref)) = shared.heap.get_field(obj_ref, fi)
+                            if let Value::Object(Some(msg_ref)) =
+                                shared.mem.heap.get_field(obj_ref, fi)
                             {
-                                if let Some(s) = read_java_string(&shared.heap, msg_ref) {
+                                if let Some(s) = read_java_string(&shared.mem.heap, msg_ref) {
                                     if !s.is_empty() {
                                         msg = format!("field{fi}={s}");
                                         break;
@@ -16313,7 +16460,7 @@ fn execute_instruction(
                     // CLI uncaught-exception renderer prints zero `\tat`
                     // frames (its `throwable_stacks` lookup having missed).
                     if crate::runtime::env_cache::charset_dbg() {
-                        let exc_class_id = shared.heap.class_id_of(obj_ref);
+                        let exc_class_id = shared.mem.heap.class_id_of(obj_ref);
                         let exc_class_name = shared
                             .classes
                             .class_manager
@@ -16326,9 +16473,10 @@ fn execute_instruction(
                         // but synthetic stubs may differ — so probe a range).
                         let mut detail = String::new();
                         for fi in 0..8 {
-                            if let Value::Object(Some(msg_ref)) = shared.heap.get_field(obj_ref, fi)
+                            if let Value::Object(Some(msg_ref)) =
+                                shared.mem.heap.get_field(obj_ref, fi)
                             {
-                                if let Some(s) = read_java_string(&shared.heap, msg_ref) {
+                                if let Some(s) = read_java_string(&shared.mem.heap, msg_ref) {
                                     if !s.is_empty() {
                                         detail = s;
                                         break;
@@ -16371,7 +16519,7 @@ fn execute_instruction(
                     // the emit-fn API contract — Errors are a fixed
                     // taxonomy).
                     if cratonvm_jfr::is_enabled() {
-                        let exc_class_id = shared.heap.class_id_of(obj_ref);
+                        let exc_class_id = shared.mem.heap.class_id_of(obj_ref);
                         let exc_class_name = shared
                             .classes
                             .class_manager
@@ -16415,9 +16563,9 @@ fn execute_instruction(
                             static EMPTY_MSG: std::sync::OnceLock<Arc<str>> =
                                 std::sync::OnceLock::new();
                             let empty_msg = EMPTY_MSG.get_or_init(|| Arc::from(""));
-                            let message: Arc<str> = match shared.heap.get_field(obj_ref, 1) {
+                            let message: Arc<str> = match shared.mem.heap.get_field(obj_ref, 1) {
                                 Value::Object(Some(msg_ref)) => Arc::from(
-                                    read_java_string(&shared.heap, msg_ref).unwrap_or_default(),
+                                    read_java_string(&shared.mem.heap, msg_ref).unwrap_or_default(),
                                 ),
                                 _ => Arc::clone(empty_msg),
                             };
@@ -16522,7 +16670,7 @@ fn execute_instruction(
                         let target_class_id = resolved.map_err(|e| {
                             convert_class_not_found(shared, thread, &target_class_name, e)
                         })?;
-                        let obj_class_id = shared.heap.class_id_of(obj_ref);
+                        let obj_class_id = shared.mem.heap.class_id_of(obj_ref);
                         shared
                             .classes
                             .class_manager
@@ -16544,7 +16692,7 @@ fn execute_instruction(
                             )
                     };
                     if !cast_ok {
-                        let actual_class_id = shared.heap.class_id_of(obj_ref);
+                        let actual_class_id = shared.mem.heap.class_id_of(obj_ref);
                         let obj_class_name = shared
                             .classes
                             .class_manager
@@ -16565,7 +16713,7 @@ fn execute_instruction(
                             && thread.frames[frame_idx].method_name()
                                 == "getAnnotationAttributes"
                             && obj_class_name == "java/lang/Class"
-                            && shared.heap.kind_of(obj_ref)
+                            && shared.mem.heap.kind_of(obj_ref)
                                 == cratonvm_types::ObjectKind::Array;
                         if source_class_parser_boundary {
                             if let Value::Object(Some(strings)) =
@@ -16827,7 +16975,7 @@ fn execute_instruction(
                         let target_class_id = resolved.map_err(|e| {
                             convert_class_not_found(shared, thread, &target_class_name, e)
                         })?;
-                        let obj_class_id = shared.heap.class_id_of(obj_ref);
+                        let obj_class_id = shared.mem.heap.class_id_of(obj_ref);
                         if shared
                             .classes
                             .class_manager
@@ -16900,7 +17048,7 @@ fn execute_instruction(
                 // Cast: reinterpret pointer/address to typed pointer
                 let mth_ptr = mth as *const str;
                 let stack = &mut thread.frames[frame_idx].stack;
-                pop_object_ref_ctx_with(stack, &shared.heap, || {
+                pop_object_ref_ctx_with(stack, &shared.mem.heap, || {
                     if jep358 {
                         let action = crate::runtime::exceptions::helpful_npe::action_monitor();
                         helpful_npe_opcode_message_parts(
@@ -16991,7 +17139,7 @@ fn execute_instruction(
                 // Cast: reinterpret pointer/address to typed pointer
                 let mth_ptr = frame_ref.method_name() as *const str;
                 let stack = &mut thread.frames[frame_idx].stack;
-                pop_object_ref_ctx_with(stack, &shared.heap, || {
+                pop_object_ref_ctx_with(stack, &shared.mem.heap, || {
                     if jep358 {
                         let action = crate::runtime::exceptions::helpful_npe::action_monitor();
                         helpful_npe_opcode_message_parts(
@@ -17117,7 +17265,7 @@ pub fn annotation_proxy_satisfies_target(
     obj_ref: ObjectRef,
     target_class_name: &str,
 ) -> bool {
-    let cid = shared.heap.class_id_of(obj_ref);
+    let cid = shared.mem.heap.class_id_of(obj_ref);
     let is_proxy = shared
         .classes
         .class_manager
@@ -17132,8 +17280,8 @@ pub fn annotation_proxy_satisfies_target(
         return true;
     }
     // Slot 0 holds the annotation's type descriptor, e.g. `Lpkg/Type;`.
-    if let Value::Object(Some(desc_ref)) = shared.heap.get_field(obj_ref, 0) {
-        if let Some(desc) = read_java_string(&shared.heap, desc_ref) {
+    if let Value::Object(Some(desc_ref)) = shared.mem.heap.get_field(obj_ref, 0) {
+        if let Some(desc) = read_java_string(&shared.mem.heap, desc_ref) {
             let internal = desc
                 .strip_prefix('L')
                 .and_then(|d| d.strip_suffix(';'))
@@ -17165,7 +17313,7 @@ pub(crate) fn proxy_instance_satisfies_target(
 ) -> bool {
     use crate::runtime::proxy::PROXY_FIELD_INTERFACES;
 
-    let obj_class_id = shared.heap.class_id_of(obj_ref);
+    let obj_class_id = shared.mem.heap.class_id_of(obj_ref);
     let obj_name = match shared.classes.class_manager.read().get_class(obj_class_id) {
         Some(c) => c.name.to_string(),
         None => return false,
@@ -17185,7 +17333,7 @@ pub(crate) fn proxy_instance_satisfies_target(
     // at slot 0; its interfaces are declared on the class. Do not probe the
     // synthetic interfaces slot on it: that is out of bounds and this helper
     // is hot in Spring's conversion/binding path.
-    let proxy_cid = shared.heap.class_id_of(obj_ref);
+    let proxy_cid = shared.mem.heap.class_id_of(obj_ref);
     let has_iface_slot = shared
         .classes
         .class_manager
@@ -17197,7 +17345,7 @@ pub(crate) fn proxy_instance_satisfies_target(
         return obj_name == "java/lang/reflect/Proxy$Instance";
     }
 
-    let interfaces_arr = match shared.heap.get_field(obj_ref, PROXY_FIELD_INTERFACES) {
+    let interfaces_arr = match shared.mem.heap.get_field(obj_ref, PROXY_FIELD_INTERFACES) {
         cratonvm_types::Value::Object(Some(a)) => a,
         _ => {
             // No CratonVM-internal interfaces array in slot 1. For a genuine
@@ -17232,14 +17380,14 @@ pub(crate) fn proxy_instance_satisfies_target(
     // `proxy_resolve_declaring_class_mirror`.
     let mut iface_cids: Vec<ClassId> = Vec::new();
     if has_iface_slot {
-        match shared.heap.get_field(obj_ref, PROXY_FIELD_INTERFACES) {
+        match shared.mem.heap.get_field(obj_ref, PROXY_FIELD_INTERFACES) {
             cratonvm_types::Value::Object(Some(arr)) => {
-                let n = shared.heap.array_length(arr);
+                let n = shared.mem.heap.array_length(arr);
                 for i in 0..n {
                     // Use the mirror→ClassId mapping we already maintain (slot 0
                     // on real-JDK Class is `cachedConstructor` — too fragile).
                     if let Ok(cratonvm_types::Value::Object(Some(m))) =
-                        shared.heap.get_array_element(arr, i)
+                        shared.mem.heap.get_array_element(arr, i)
                     {
                         if let Some(cid) = crate::vm::class_id_from_mirror(shared, m) {
                             iface_cids.push(cid);
@@ -17255,7 +17403,7 @@ pub(crate) fn proxy_instance_satisfies_target(
             }
         }
     };
-    let n = shared.heap.array_length(interfaces_arr);
+    let n = shared.mem.heap.array_length(interfaces_arr);
     let target_cid = shared
         .classes
         .class_manager
@@ -17263,7 +17411,7 @@ pub(crate) fn proxy_instance_satisfies_target(
         .load_class(target_class_name)
         .ok();
     for i in 0..n {
-        let mirror = match shared.heap.get_array_element(interfaces_arr, i) {
+        let mirror = match shared.mem.heap.get_array_element(interfaces_arr, i) {
             Ok(cratonvm_types::Value::Object(Some(m))) => m,
             _ => continue,
         };
@@ -17448,10 +17596,10 @@ pub(crate) fn array_descriptor_of(
     shared: &SharedVm,
     obj_ref: cratonvm_types::ObjectRef,
 ) -> Option<String> {
-    if shared.heap.kind_of(obj_ref) != cratonvm_types::ObjectKind::Array {
+    if shared.mem.heap.kind_of(obj_ref) != cratonvm_types::ObjectKind::Array {
         return None;
     }
-    let et = shared.heap.element_type_of(obj_ref);
+    let et = shared.mem.heap.element_type_of(obj_ref);
     match et {
         ArrayElementType::Boolean => Some("[Z".to_string()),
         ArrayElementType::Char => Some("[C".to_string()),
@@ -17463,7 +17611,7 @@ pub(crate) fn array_descriptor_of(
         ArrayElementType::Long => Some("[J".to_string()),
         ArrayElementType::Reference => {
             // The class_id on a Reference array holds the component class id.
-            let comp_id = shared.heap.class_id_of(obj_ref);
+            let comp_id = shared.mem.heap.class_id_of(obj_ref);
             let comp_name = shared
                 .classes
                 .class_manager
@@ -17661,7 +17809,7 @@ pub(crate) fn aastore_element_assignable(
 
     // Element is itself an array → use the array-vs-array assignability rules,
     // treating the component descriptor as the target.
-    if shared.heap.kind_of(value_ref) == cratonvm_types::ObjectKind::Array {
+    if shared.mem.heap.kind_of(value_ref) == cratonvm_types::ObjectKind::Array {
         let elem_desc = match array_descriptor_of(shared, value_ref) {
             Some(d) => d,
             None => return true,
@@ -17689,11 +17837,11 @@ pub(crate) fn aastore_element_assignable(
 
     // Resolve the element's runtime class id; an unknown/synthetic class id
     // (no loaded class entry) is treated as assignable (fail open).
-    let value_class_id = shared.heap.class_id_of(value_ref);
+    let value_class_id = shared.mem.heap.class_id_of(value_ref);
     if value_class_id == ClassId::new(0) {
         return true;
     }
-    let array_component_class_id = shared.heap.class_id_of(array_ref);
+    let array_component_class_id = shared.mem.heap.class_id_of(array_ref);
     let comp_id = {
         let cm = shared.classes.class_manager.read();
         if array_component_class_id != ClassId::new(0) {
@@ -18541,7 +18689,7 @@ fn is_global_resolution_namespace(name: &str) -> bool {
 /// unaffected by this check.
 fn is_groovy_class_loader(shared: &SharedVm, loader_obj: cratonvm_types::ObjectRef) -> bool {
     let cm = shared.classes.class_manager.read();
-    let loader_class_id = shared.heap.class_id_of(loader_obj);
+    let loader_class_id = shared.mem.heap.class_id_of(loader_obj);
     match cm.get_loaded_class_id("groovy/lang/GroovyClassLoader") {
         Some(groovy_cl_id) => {
             loader_class_id == groovy_cl_id || cm.is_subclass_of(loader_class_id, groovy_cl_id)
@@ -18582,7 +18730,7 @@ fn is_compile_with_forked_class_loader(
     loader_obj: cratonvm_types::ObjectRef,
 ) -> bool {
     let cm = shared.classes.class_manager.read();
-    let loader_class_id = shared.heap.class_id_of(loader_obj);
+    let loader_class_id = shared.mem.heap.class_id_of(loader_obj);
     match cm.get_loaded_class_id(
         "org/springframework/core/test/tools/CompileWithForkedClassLoaderClassLoader",
     ) {
@@ -19954,7 +20102,7 @@ fn decode_arg_kind_aware(cv: CompactValue, is_long: bool, pd_byte: u8) -> Value 
 fn refresh_stale_object_args(shared: &SharedVm, args: &mut [Value]) {
     for value in args.iter_mut() {
         if let Value::Object(Some(obj)) = value {
-            *obj = shared.heap.load_and_forward(*obj);
+            *obj = shared.mem.heap.load_and_forward(*obj);
         }
     }
 }
@@ -20462,7 +20610,7 @@ fn execute_invoke_kind(
     // still available, before any class lookup or native call can touch it.
     for value in &mut args {
         if let Value::Object(Some(obj)) = value {
-            *obj = shared.heap.load_and_forward(*obj);
+            *obj = shared.mem.heap.load_and_forward(*obj);
         }
     }
     if std::env::var("CRATONVM_DBG_LOADER_TRACE").is_ok()
@@ -20472,7 +20620,7 @@ fn execute_invoke_kind(
         let describe = |v: &Value| -> String {
             match v {
                 Value::Object(Some(obj)) => {
-                    let cid = shared.heap.class_id_of(*obj);
+                    let cid = shared.mem.heap.class_id_of(*obj);
                     let cn = shared
                         .classes
                         .class_manager
@@ -20498,7 +20646,7 @@ fn execute_invoke_kind(
         let describe = |v: &Value| -> String {
             match v {
                 Value::Object(Some(obj)) => {
-                    let cid = shared.heap.class_id_of(*obj);
+                    let cid = shared.mem.heap.class_id_of(*obj);
                     let cn = shared
                         .classes
                         .class_manager
@@ -20528,7 +20676,7 @@ fn execute_invoke_kind(
         let describe = |v: &Value| -> String {
             match v {
                 Value::Object(Some(obj)) => {
-                    let cid = shared.heap.class_id_of(*obj);
+                    let cid = shared.mem.heap.class_id_of(*obj);
                     let cn = shared
                         .classes
                         .class_manager
@@ -20561,7 +20709,7 @@ fn execute_invoke_kind(
         let describe = |v: &Value| -> String {
             match v {
                 Value::Object(Some(obj)) => {
-                    let cid = shared.heap.class_id_of(*obj);
+                    let cid = shared.mem.heap.class_id_of(*obj);
                     let cn = shared
                         .classes
                         .class_manager
@@ -20615,32 +20763,33 @@ fn execute_invoke_kind(
         if let (Some(Value::Object(Some(receiver))), Some(Value::Object(Some(array)))) =
             (args.first(), args.get(1))
         {
-            let receiver_name = match shared.heap.get_field(*receiver, 0) {
-                Value::Object(Some(name)) => read_java_string(&shared.heap, name),
+            let receiver_name = match shared.mem.heap.get_field(*receiver, 0) {
+                Value::Object(Some(name)) => read_java_string(&shared.mem.heap, name),
                 _ => None,
             };
-            let receiver_ordinal = shared.heap.get_field(*receiver, 1);
+            let receiver_ordinal = shared.mem.heap.get_field(*receiver, 1);
             let receiver_class_name = shared
                 .classes
                 .class_manager
                 .read()
-                .get_class(shared.heap.class_id_of(*receiver))
+                .get_class(shared.mem.heap.class_id_of(*receiver))
                 .map(|class| class.name.to_string());
-            for i in 0..shared.heap.array_length(*array) {
-                let Ok(Value::Object(Some(candidate))) = shared.heap.get_array_element(*array, i)
+            for i in 0..shared.mem.heap.array_length(*array) {
+                let Ok(Value::Object(Some(candidate))) =
+                    shared.mem.heap.get_array_element(*array, i)
                 else {
                     continue;
                 };
-                let candidate_name = match shared.heap.get_field(candidate, 0) {
-                    Value::Object(Some(name)) => read_java_string(&shared.heap, name),
+                let candidate_name = match shared.mem.heap.get_field(candidate, 0) {
+                    Value::Object(Some(name)) => read_java_string(&shared.mem.heap, name),
                     _ => None,
                 };
-                let candidate_ordinal = shared.heap.get_field(candidate, 1);
+                let candidate_ordinal = shared.mem.heap.get_field(candidate, 1);
                 let candidate_class_name = shared
                     .classes
                     .class_manager
                     .read()
-                    .get_class(shared.heap.class_id_of(candidate))
+                    .get_class(shared.mem.heap.class_id_of(candidate))
                     .map(|class| class.name.to_string());
                 let same_name = candidate_name
                     .as_deref()
@@ -20682,14 +20831,14 @@ fn execute_invoke_kind(
     if !is_special {
         let recovered: Option<ObjectRef> = if let Value::Object(Some(recv)) = &args[0] {
             let recv = *recv;
-            if shared.heap.class_id_of(recv) == ClassId::new(0) {
+            if shared.mem.heap.class_id_of(recv) == ClassId::new(0) {
                 shared
                     .threads
                     .thread_registry
                     .recover_stale_mirror(recv.as_ptr() as usize)
                     .filter(|live| {
                         live.as_ptr() != recv.as_ptr()
-                            && shared.heap.class_id_of(*live) != ClassId::new(0)
+                            && shared.mem.heap.class_id_of(*live) != ClassId::new(0)
                     })
             } else {
                 None
@@ -20715,7 +20864,7 @@ fn execute_invoke_kind(
     {
         let recv_desc = match args.first() {
             Some(Value::Object(Some(r))) => {
-                let cid = shared.heap.class_id_of(*r);
+                let cid = shared.mem.heap.class_id_of(*r);
                 let cn = shared
                     .classes
                     .class_manager
@@ -20733,7 +20882,7 @@ fn execute_invoke_kind(
             .skip(1)
             .map(|v| match v {
                 Value::Object(Some(r)) => {
-                    let cid = shared.heap.class_id_of(*r);
+                    let cid = shared.mem.heap.class_id_of(*r);
                     let cn = shared
                         .classes
                         .class_manager
@@ -20768,7 +20917,7 @@ fn execute_invoke_kind(
                 .classes
                 .lambda_proxies
                 .read()
-                .contains_key(&shared.heap.class_id_of(*obj_ref)),
+                .contains_key(&shared.mem.heap.class_id_of(*obj_ref)),
             _ => false,
         }
     } else {
@@ -20794,7 +20943,7 @@ fn execute_invoke_kind(
     // Check for lambda proxy dispatch
     if !effectively_special {
         if let Value::Object(Some(obj_ref)) = &args[0] {
-            let obj_class_id = shared.heap.class_id_of(*obj_ref);
+            let obj_class_id = shared.mem.heap.class_id_of(*obj_ref);
             if let Some(result) = try_lambda_dispatch(
                 shared,
                 thread,
@@ -20826,10 +20975,10 @@ fn execute_invoke_kind(
     let receiver_class_id = if !effectively_special {
         match &args[0] {
             Value::Object(Some(obj_ref)) => {
-                if shared.heap.kind_of(*obj_ref) == cratonvm_types::ObjectKind::Array {
+                if shared.mem.heap.kind_of(*obj_ref) == cratonvm_types::ObjectKind::Array {
                     None // Don't cache array dispatches — component class_id would conflict
                 } else {
-                    Some(shared.heap.class_id_of(*obj_ref))
+                    Some(shared.mem.heap.class_id_of(*obj_ref))
                 }
             }
             _ => None,
@@ -20860,7 +21009,7 @@ fn execute_invoke_kind(
                 // Arrays store the component class_id in their header, but
                 // method dispatch must go through java.lang.Object (JVMS §4.4.1).
                 // Check heap kind first to avoid misrouting clone()/toString()/etc.
-                if shared.heap.kind_of(*obj_ref) == cratonvm_types::ObjectKind::Array {
+                if shared.mem.heap.kind_of(*obj_ref) == cratonvm_types::ObjectKind::Array {
                     // S111r8: an Object[] array (cid=0 component class)
                     // being dispatched for a non-Object method like
                     // iterator()/hasNext()/size() typically means a
@@ -20882,7 +21031,7 @@ fn execute_invoke_kind(
                         Arc::from("java/lang/Object")
                     }
                 } else {
-                    let cid = shared.heap.class_id_of(*obj_ref);
+                    let cid = shared.mem.heap.class_id_of(*obj_ref);
 
                     // Stale pointer detection: if the header reads as all-zeros
                     // (class_id=0, kind=Object), the pointer likely targets
@@ -21124,7 +21273,7 @@ fn execute_invoke_kind(
                                         "[stale-recv] holder tid={} blocked={} epoch={} kind={:?}",
                                         thread.thread_id.0,
                                         blocked_flag,
-                                        shared.heap.collection_count(),
+                                        shared.mem.heap.collection_count(),
                                         thread.kind,
                                     );
                                     for (e, moved_to, mlen, as_dest) in
@@ -21168,10 +21317,14 @@ fn execute_invoke_kind(
                                         }
                                         for (ago, parent, fidx) in getfield_ring_find(stale_addr) {
                                             let cur = shared
+                                                .mem
                                                 .heap
                                                 .is_object_address(parent)
                                                 .map(|p| {
-                                                    format!("{:?}", shared.heap.get_field(p, fidx))
+                                                    format!(
+                                                        "{:?}",
+                                                        shared.mem.heap.get_field(p, fidx)
+                                                    )
                                                 })
                                                 .unwrap_or_else(|| "<parent-not-obj>".into());
                                             eprintln!(
@@ -21604,14 +21757,14 @@ fn execute_invoke_kind(
             Some(Value::Object(Some(receiver)))
                 if class_chain_reaches_proxy_instance(
                     shared,
-                    shared.heap.class_id_of(*receiver),
+                    shared.mem.heap.class_id_of(*receiver),
                 )
         );
     if is_proxy_dispatch && !is_special {
         // Handle getClass() directly — return the proxy's class mirror
         if &*method_name == "getClass" {
             if let Value::Object(Some(proxy_ref)) = &args[0] {
-                let class_id = shared.heap.class_id_of(*proxy_ref);
+                let class_id = shared.mem.heap.class_id_of(*proxy_ref);
                 let mirror = crate::vm::get_or_create_class_mirror(shared, class_id);
                 thread.frames[frame_idx]
                     .stack
@@ -21640,28 +21793,28 @@ fn execute_invoke_kind(
                 let unboxed = match ret_char {
                     'I' | 'Z' | 'B' | 'C' | 'S' => {
                         if let Value::Object(Some(obj)) = value {
-                            shared.heap.get_field(obj, 0)
+                            shared.mem.heap.get_field(obj, 0)
                         } else {
                             value
                         }
                     }
                     'J' => {
                         if let Value::Object(Some(obj)) = value {
-                            shared.heap.get_field(obj, 0)
+                            shared.mem.heap.get_field(obj, 0)
                         } else {
                             value
                         }
                     }
                     'F' => {
                         if let Value::Object(Some(obj)) = value {
-                            shared.heap.get_field(obj, 0)
+                            shared.mem.heap.get_field(obj, 0)
                         } else {
                             value
                         }
                     }
                     'D' => {
                         if let Value::Object(Some(obj)) = value {
-                            shared.heap.get_field(obj, 0)
+                            shared.mem.heap.get_field(obj, 0)
                         } else {
                             value
                         }
@@ -21695,7 +21848,7 @@ fn execute_invoke_kind(
         && !is_special
         && matches!(
             args.first(),
-            Some(Value::Object(Some(r))) if shared.heap.kind_of(*r) == cratonvm_types::ObjectKind::Object
+            Some(Value::Object(Some(r))) if shared.mem.heap.kind_of(*r) == cratonvm_types::ObjectKind::Object
         )
     {
         if let Value::Object(Some(ann_ref)) = &args[0] {
@@ -21719,7 +21872,7 @@ fn execute_invoke_kind(
                 let unboxed = match ret_char {
                     'I' | 'Z' | 'B' | 'C' | 'S' | 'J' | 'F' | 'D' => {
                         if let Value::Object(Some(obj)) = value {
-                            shared.heap.get_field(obj, 0)
+                            shared.mem.heap.get_field(obj, 0)
                         } else {
                             value
                         }
@@ -21939,7 +22092,7 @@ fn execute_invoke_kind(
         let receiver_self_ctor = if &*method_name == "<init>" {
             match args.first() {
                 Some(Value::Object(Some(recv))) => {
-                    let recv_cid = shared.heap.class_id_of(*recv);
+                    let recv_cid = shared.mem.heap.class_id_of(*recv);
                     if recv_cid != ClassId::new(0) {
                         let cm = shared.classes.class_manager.read();
                         let recv_matches_owner = cm
@@ -22224,13 +22377,13 @@ fn nth_param_tag_byte(descriptor: &str, n: usize) -> u8 {
 /// Returns the original value unchanged if it's not a recognized wrapper.
 fn unbox_wrapper(shared: &SharedVm, prim_char: char, v: Value) -> Value {
     match (prim_char, v) {
-        ('I' | 'B' | 'S' | 'C' | 'Z', Value::Object(Some(b))) => shared.heap.get_field(b, 0),
+        ('I' | 'B' | 'S' | 'C' | 'Z', Value::Object(Some(b))) => shared.mem.heap.get_field(b, 0),
         // Lambda metafactory adaptation permits unboxing followed by primitive
         // widening.  An Integer supplied to a `long` implementation method
         // must therefore become Value::Long, rather than carrying the raw
         // compact Int tag into an lload/putfield J path.
         ('J' | 'F' | 'D', Value::Object(Some(b))) => {
-            widen_unboxed_primitive(prim_char, shared.heap.get_field(b, 0))
+            widen_unboxed_primitive(prim_char, shared.mem.heap.get_field(b, 0))
         }
         (_, other) => other,
     }
@@ -22294,8 +22447,8 @@ fn box_aastore_value_fast(shared: &SharedVm, value: Value) -> Value {
         .write()
         .load_class(class_name)
         .unwrap_or(ClassId::new(0));
-    let wrapper = shared.heap.alloc_object(class_id, 1);
-    shared.heap.set_field(wrapper, 0, payload);
+    let wrapper = shared.mem.heap.alloc_object(class_id, 1);
+    shared.mem.heap.set_field(wrapper, 0, payload);
     Value::Object(Some(wrapper))
 }
 
@@ -22441,7 +22594,7 @@ fn checkcast_lambda_instantiated_args(
                 .classes
                 .class_manager
                 .read()
-                .get_class(shared.heap.class_id_of(obj_ref))
+                .get_class(shared.mem.heap.class_id_of(obj_ref))
                 .map(|c| c.name.to_string())
                 .unwrap_or_else(|| "?".to_string());
             let obj_display_name = cce_display_class_name(shared, obj_ref, &obj_class_name);
@@ -22496,18 +22649,18 @@ fn cce_display_class_name(shared: &SharedVm, obj_ref: ObjectRef, raw_name: &str)
     if raw_name != "cratonvm/internal/UnmodifiableMap" {
         return raw_name.to_string();
     }
-    if !matches!(shared.heap.get_field(obj_ref, 1), Value::Int(1)) {
+    if !matches!(shared.mem.heap.get_field(obj_ref, 1), Value::Int(1)) {
         return "java/util/Collections$UnmodifiableMap".to_string();
     }
-    let backing = match shared.heap.get_field(obj_ref, 0) {
+    let backing = match shared.mem.heap.get_field(obj_ref, 0) {
         Value::Object(Some(backing)) => backing,
         _ => return "java/util/ImmutableCollections$MapN".to_string(),
     };
     let size = {
-        let class_id = shared.heap.class_id_of(backing);
+        let class_id = shared.mem.heap.class_id_of(backing);
         let cm = shared.classes.class_manager.read();
         find_field_recursive(class_id, "size", &cm.class_store)
-            .map(|(field_index, _, _)| shared.heap.get_field(backing, field_index))
+            .map(|(field_index, _, _)| shared.mem.heap.get_field(backing, field_index))
     };
     if matches!(size, Some(Value::Int(1))) {
         "java/util/ImmutableCollections$Map1".to_string()
@@ -22537,7 +22690,7 @@ fn lambda_arg_provably_not_instance(shared: &SharedVm, obj_ref: ObjectRef, desc_
     if target == "java/lang/Object" {
         return false;
     }
-    let obj_class_id = shared.heap.class_id_of(obj_ref);
+    let obj_class_id = shared.mem.heap.class_id_of(obj_ref);
     // Lambda proxies use VM-only synthetic class IDs which intentionally do not
     // have ClassStore metadata.  Without a real class graph we cannot prove a
     // mismatch against the erased bridge parameter, so preserve this helper's
@@ -22932,7 +23085,7 @@ pub(crate) fn lambda_args_sam_compatible(
             // overloaded default, same as the concrete-class mismatch case
             // below.
             if let Some(Value::Object(Some(a))) = args.get(i) {
-                if shared.heap.kind_of(*a) != cratonvm_types::ObjectKind::Array {
+                if shared.mem.heap.kind_of(*a) != cratonvm_types::ObjectKind::Array {
                     return false;
                 }
             }
@@ -22946,7 +23099,7 @@ pub(crate) fn lambda_args_sam_compatible(
             _ => continue, // null / primitive / missing — don't second-guess
         };
         let target = &pd[1..pd.len() - 1];
-        let arg_cid = shared.heap.class_id_of(arg);
+        let arg_cid = shared.mem.heap.class_id_of(arg);
         let (target_cid, base) = {
             let cm = shared.classes.class_manager.read();
             match cm.get_loaded_class_id(target) {
@@ -23188,7 +23341,7 @@ fn try_tdigest_lambda_double_get(shared: &SharedVm, proxy: ObjectRef, index: i32
         TDIGEST_DOUBLE_GET_FIELD_CACHE.with(|cache| cache.borrow_mut().clear());
         return None;
     }
-    let proxy_class_id = shared.heap.class_id_of(proxy);
+    let proxy_class_id = shared.mem.heap.class_id_of(proxy);
     let call_site = shared
         .classes
         .lambda_proxies
@@ -23208,11 +23361,11 @@ fn try_tdigest_lambda_double_get(shared: &SharedVm, proxy: ObjectRef, index: i32
     {
         return None;
     }
-    let receiver = match shared.heap.get_field(proxy, 0) {
+    let receiver = match shared.mem.heap.get_field(proxy, 0) {
         Value::Object(Some(receiver)) => receiver,
         _ => return None,
     };
-    let receiver_class_id = shared.heap.class_id_of(receiver);
+    let receiver_class_id = shared.mem.heap.class_id_of(receiver);
     let key = (proxy_class_id.as_u32(), receiver_class_id.as_u32());
     let field_index = TDIGEST_DOUBLE_GET_FIELD_CACHE
         .with(|cache| cache.borrow().get(&key).copied())
@@ -23251,11 +23404,16 @@ fn try_tdigest_lambda_double_get(shared: &SharedVm, proxy: ObjectRef, index: i32
     if index < 0 {
         return None;
     }
-    let array = match shared.heap.get_field(receiver, field_index) {
+    let array = match shared.mem.heap.get_field(receiver, field_index) {
         Value::Object(Some(array)) => array,
         _ => return None,
     };
-    match shared.heap.get_array_element(array, index as usize).ok()? {
+    match shared
+        .mem
+        .heap
+        .get_array_element(array, index as usize)
+        .ok()?
+    {
         Value::Double(value) => Some(value),
         _ => None,
     }
@@ -23379,8 +23537,8 @@ fn try_invoke_cached_lambda_impl(
         }
     }
     thread.refill_pools_from_shared(
-        &shared.operand_stack_pool,
-        &shared.tag_pool,
+        &shared.mem.operand_stack_pool,
+        &shared.mem.tag_pool,
         cached.max_locals as usize,
         (cached.max_stack as usize).max(16) + 8,
     );
@@ -23523,11 +23681,11 @@ pub(crate) fn try_lambda_dispatch(
                     let v = call_args.get(i).copied().unwrap_or(Value::Object(None));
                     let u = match (ac, v) {
                         ('I' | 'Z' | 'B' | 'S' | 'C', Value::Object(Some(b))) => {
-                            shared.heap.get_field(b, 0)
+                            shared.mem.heap.get_field(b, 0)
                         }
-                        ('J', Value::Object(Some(b))) => shared.heap.get_field(b, 0),
-                        ('F', Value::Object(Some(b))) => shared.heap.get_field(b, 0),
-                        ('D', Value::Object(Some(b))) => shared.heap.get_field(b, 0),
+                        ('J', Value::Object(Some(b))) => shared.mem.heap.get_field(b, 0),
+                        ('F', Value::Object(Some(b))) => shared.mem.heap.get_field(b, 0),
+                        ('D', Value::Object(Some(b))) => shared.mem.heap.get_field(b, 0),
                         (_, other) => other,
                     };
                     unboxed.push(u);
@@ -23562,7 +23720,7 @@ pub(crate) fn try_lambda_dispatch(
                 let num_captures = lcs.capture_types.len();
                 let mut full_args: Vec<Value> = Vec::with_capacity(num_captures + unboxed.len());
                 for i in 0..num_captures {
-                    full_args.push(shared.heap.get_field(obj_ref, i));
+                    full_args.push(shared.mem.heap.get_field(obj_ref, i));
                 }
                 full_args.extend(unboxed);
                 let _ = sam_name; // sam path uses lcs.impl_handle
@@ -23604,7 +23762,7 @@ pub(crate) fn try_lambda_dispatch(
                             return Ok(None);
                         }
                         let rcv_id_opt = match &full_args[0] {
-                            Value::Object(Some(r)) => Some(shared.heap.class_id_of(*r)),
+                            Value::Object(Some(r)) => Some(shared.mem.heap.class_id_of(*r)),
                             _ => None,
                         };
                         let receiver_class = match rcv_id_opt {
@@ -23774,7 +23932,7 @@ pub(crate) fn try_lambda_dispatch(
     let num_captures = call_site.capture_types.len();
     let mut full_args: Vec<Value> = Vec::with_capacity(num_captures + call_args.len());
     for i in 0..num_captures {
-        full_args.push(shared.heap.get_field(obj_ref, i));
+        full_args.push(shared.mem.heap.get_field(obj_ref, i));
     }
     // Append the invocation arguments (passed by the caller after the receiver).
     full_args.extend_from_slice(call_args);
@@ -23879,7 +24037,7 @@ pub(crate) fn try_lambda_dispatch(
             // fields on `SoftReferenceConfigurationPropertyCache` — every
             // item is a lambda proxy, never a concrete CacheOverride.
             if let Value::Object(Some(r)) = &full_args[0] {
-                let rcv_class_id = shared.heap.class_id_of(*r);
+                let rcv_class_id = shared.mem.heap.class_id_of(*r);
                 let recv_is_lambda = shared
                     .classes
                     .lambda_proxies
@@ -23904,7 +24062,7 @@ pub(crate) fn try_lambda_dispatch(
             }
             // Resolve the actual class of the receiver for virtual dispatch.
             let recv_class_id_opt = match &full_args[0] {
-                Value::Object(Some(r)) => Some(shared.heap.class_id_of(*r)),
+                Value::Object(Some(r)) => Some(shared.mem.heap.class_id_of(*r)),
                 _ => None,
             };
             // Diagnostic (CRATONVM_DBG_LAMBDA): when a lambda dispatch receiver
@@ -23917,12 +24075,12 @@ pub(crate) fn try_lambda_dispatch(
             if crate::runtime::env_cache::lambda_dbg() {
                 if let (Some(cid), Value::Object(Some(r))) = (recv_class_id_opt, &full_args[0]) {
                     if cid == ClassId::new(0) {
-                        let fwd = shared.heap.load_and_forward(*r);
-                        let fwd_cid = shared.heap.class_id_of(fwd);
-                        let fresh = shared.heap.get_field(obj_ref, 0);
+                        let fwd = shared.mem.heap.load_and_forward(*r);
+                        let fwd_cid = shared.mem.heap.class_id_of(fwd);
+                        let fresh = shared.mem.heap.get_field(obj_ref, 0);
                         let (fresh_ptr, fresh_cid) = match fresh {
                             Value::Object(Some(f)) => {
-                                (f.as_ptr() as usize, Some(shared.heap.class_id_of(f)))
+                                (f.as_ptr() as usize, Some(shared.mem.heap.class_id_of(f)))
                             }
                             _ => (0, None),
                         };
@@ -24323,7 +24481,7 @@ pub(crate) fn try_lambda_dispatch(
             match &full_args[0] {
                 Value::Object(Some(target_ref)) => {
                     // We need to resolve the field index. For simplicity, do a field lookup.
-                    let target_class_id = shared.heap.class_id_of(*target_ref);
+                    let target_class_id = shared.mem.heap.class_id_of(*target_ref);
                     let field_index = {
                         let cm = shared.classes.class_manager.read();
                         find_field_recursive(
@@ -24339,7 +24497,7 @@ pub(crate) fn try_lambda_dispatch(
                             ),
                         })?
                     };
-                    let value = shared.heap.get_field(*target_ref, field_index);
+                    let value = shared.mem.heap.get_field(*target_ref, field_index);
                     Ok(Some(Some(value)))
                 }
                 _ => Err(VmError::Internal {
@@ -24385,7 +24543,7 @@ pub(crate) fn try_lambda_dispatch(
             }
             match &full_args[0] {
                 Value::Object(Some(target_ref)) => {
-                    let target_class_id = shared.heap.class_id_of(*target_ref);
+                    let target_class_id = shared.mem.heap.class_id_of(*target_ref);
                     let field_index = {
                         let cm = shared.classes.class_manager.read();
                         find_field_recursive(
@@ -24402,6 +24560,7 @@ pub(crate) fn try_lambda_dispatch(
                         })?
                     };
                     shared
+                        .mem
                         .heap
                         .set_field(*target_ref, field_index, full_args[1]);
                     Ok(Some(None))
@@ -29253,7 +29412,7 @@ fn threadpool_executor_has_real_workers(shared: &SharedVm, recv: &Value) -> bool
     let Value::Object(Some(recv)) = recv else {
         return false;
     };
-    let class_id = shared.heap.class_id_of(*recv);
+    let class_id = shared.mem.heap.class_id_of(*recv);
     let cm = shared.classes.class_manager.read();
     let Some(index) =
         crate::vm::vm_exec::resolve_field_index_in_hierarchy(class_id, "workers", &cm.class_store)
@@ -29261,7 +29420,10 @@ fn threadpool_executor_has_real_workers(shared: &SharedVm, recv: &Value) -> bool
         return false;
     };
     drop(cm);
-    matches!(shared.heap.get_field(*recv, index), Value::Object(Some(_)))
+    matches!(
+        shared.mem.heap.get_field(*recv, index),
+        Value::Object(Some(_))
+    )
 }
 
 fn intercept_force_registered_native(
@@ -29324,7 +29486,7 @@ fn intercept_force_registered_native(
         && matches!(
             args.first(),
             Some(Value::Object(Some(receiver))) if {
-                let receiver_cid = shared.heap.class_id_of(*receiver);
+                let receiver_cid = shared.mem.heap.class_id_of(*receiver);
                 shared
                     .classes.class_manager
                     .read()
@@ -29360,7 +29522,7 @@ fn intercept_force_registered_native(
     ) && matches!(
         args.first(),
         Some(Value::Object(Some(receiver))) if {
-            let receiver_cid = shared.heap.class_id_of(*receiver);
+            let receiver_cid = shared.mem.heap.class_id_of(*receiver);
             shared
                 .classes.class_manager
                 .read()
@@ -29417,7 +29579,7 @@ fn intercept_force_registered_native(
         && matches!(
             args.first(),
             Some(Value::Object(Some(receiver)))
-                if matches!(shared.heap.get_field(*receiver, 0), Value::Object(Some(_)))
+                if matches!(shared.mem.heap.get_field(*receiver, 0), Value::Object(Some(_)))
         )
     {
         if let Some(callback) = shared.natives.native_methods.find(
@@ -29565,7 +29727,7 @@ fn intercept_force_registered_native_cached(
     ) && matches!(
         args.first(),
         Some(Value::Object(Some(receiver))) if {
-            let receiver_cid = shared.heap.class_id_of(*receiver);
+            let receiver_cid = shared.mem.heap.class_id_of(*receiver);
             shared
                 .classes.class_manager
                 .read()
@@ -29935,7 +30097,7 @@ fn surefire_lazy_launcher_discover_native(
         .natives
         .native_methods
         .find(LAZY, "discover", DESC_DISCOVER)?;
-    let cid = shared.heap.class_id_of(recv_obj);
+    let cid = shared.mem.heap.class_id_of(recv_obj);
     let cm = shared.classes.class_manager.read();
     let ok = cm
         .get_class(cid)
@@ -30213,7 +30375,7 @@ fn try_stackless_invoke(
                 .classes
                 .class_manager
                 .read()
-                .get_class(shared.heap.class_id_of(*obj))
+                .get_class(shared.mem.heap.class_id_of(*obj))
                 .map(|class| class.name.as_ref() == "java/lang/foreign/DowncallHandle")
                 .unwrap_or(false);
             if is_downcall {
@@ -30233,7 +30395,7 @@ fn try_stackless_invoke(
                 .classes
                 .class_manager
                 .read()
-                .get_class(shared.heap.class_id_of(*obj))
+                .get_class(shared.mem.heap.class_id_of(*obj))
                 .map(|class| class.name.as_ref() == "java/lang/foreign/DowncallHandle")
                 .unwrap_or(false);
             if is_downcall {
@@ -30431,7 +30593,7 @@ fn try_stackless_invoke(
         // while the adapter itself is a concrete JDK subclass.
         let is_method_handle_adapter = {
             let cm = shared.classes.class_manager.read();
-            let adapter_class = shared.heap.class_id_of(adapter);
+            let adapter_class = shared.mem.heap.class_id_of(adapter);
             cm.get_loaded_class_id("java/lang/invoke/MethodHandle")
                 .map(|method_handle_class| {
                     adapter_class == method_handle_class
@@ -30442,7 +30604,7 @@ fn try_stackless_invoke(
         if !is_method_handle_adapter {
             return None;
         }
-        let target = match shared.heap.get_field(adapter, 0) {
+        let target = match shared.mem.heap.get_field(adapter, 0) {
             Value::Object(Some(target)) => target,
             _ => return None,
         };
@@ -30450,7 +30612,7 @@ fn try_stackless_invoke(
             .classes
             .class_manager
             .read()
-            .get_class(shared.heap.class_id_of(target))
+            .get_class(shared.mem.heap.class_id_of(target))
             .map(|class| class.name.as_ref() == "java/lang/foreign/DowncallHandle")
             .unwrap_or(false);
         if !is_downcall {
@@ -30521,7 +30683,7 @@ fn try_stackless_invoke(
         && descriptor == "(Ljava/lang/foreign/MemorySegment;Ljava/lang/foreign/MemorySegment;IILjava/lang/foreign/MemorySegment;)V"
     {
         if let Some(Value::Object(Some(receiver))) = args.first() {
-            let target = match shared.heap.get_field(*receiver, 0) {
+            let target = match shared.mem.heap.get_field(*receiver, 0) {
                 Value::Object(Some(target)) => Some(target),
                 _ => None,
             };
@@ -30529,22 +30691,22 @@ fn try_stackless_invoke(
                 shared
                     .classes.class_manager
                     .read()
-                    .get_class(shared.heap.class_id_of(target))
+                    .get_class(shared.mem.heap.class_id_of(target))
                     .map(|class| class.name.to_string())
             });
             eprintln!(
                 "[MH_ADAPTER] class={class_name} target={} f0={:?} f1={:?} f2={:?} f3={:?} f4={:?} f16={:?} f17={:?} f18={:?} f19={:?} f20={:?} arg1={:?}",
                 target_class.as_deref().unwrap_or("<unknown>"),
-                shared.heap.get_field(*receiver, 0),
-                shared.heap.get_field(*receiver, 1),
-                shared.heap.get_field(*receiver, 2),
-                shared.heap.get_field(*receiver, 3),
-                shared.heap.get_field(*receiver, 4),
-                shared.heap.get_field(*receiver, 16),
-                shared.heap.get_field(*receiver, 17),
-                shared.heap.get_field(*receiver, 18),
-                shared.heap.get_field(*receiver, 19),
-                shared.heap.get_field(*receiver, 20),
+                shared.mem.heap.get_field(*receiver, 0),
+                shared.mem.heap.get_field(*receiver, 1),
+                shared.mem.heap.get_field(*receiver, 2),
+                shared.mem.heap.get_field(*receiver, 3),
+                shared.mem.heap.get_field(*receiver, 4),
+                shared.mem.heap.get_field(*receiver, 16),
+                shared.mem.heap.get_field(*receiver, 17),
+                shared.mem.heap.get_field(*receiver, 18),
+                shared.mem.heap.get_field(*receiver, 19),
+                shared.mem.heap.get_field(*receiver, 20),
                 args.get(1),
             );
         }
@@ -30612,7 +30774,7 @@ fn try_stackless_invoke(
         && method_name == "<init>"
     {
         let recv_cid = match args.first() {
-            Some(Value::Object(Some(recv))) => Some(shared.heap.class_id_of(*recv)),
+            Some(Value::Object(Some(recv))) => Some(shared.mem.heap.class_id_of(*recv)),
             _ => None,
         };
         let name_resolved = shared
@@ -30971,8 +31133,8 @@ fn try_stackless_invoke(
     // 10. Push bytecode frame
     // T10.7 — replenish the per-thread pool from the shared pool if empty.
     thread.refill_pools_from_shared(
-        &shared.operand_stack_pool,
-        &shared.tag_pool,
+        &shared.mem.operand_stack_pool,
+        &shared.mem.tag_pool,
         // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
         code_attr.max_locals as usize,
         // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
@@ -32423,8 +32585,8 @@ fn execute_invokestatic_cached(
             // T10.7 — refill per-thread pool from the shared VM-wide VecPool
             // if it's empty so we reuse the promoted allocation.
             thread.refill_pools_from_shared(
-                &shared.operand_stack_pool,
-                &shared.tag_pool,
+                &shared.mem.operand_stack_pool,
+                &shared.mem.tag_pool,
                 // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
                 cached.max_locals as usize,
                 // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
@@ -33705,7 +33867,7 @@ fn try_osr(
     // (`Option<Option<Value>>`, no error channel).
     if let Some(exc) = crate::jit::helpers::take_jit_pending_exception() {
         if std::env::var_os("CRATONVM_DBG_OSR").is_some() {
-            let cid = shared.heap.class_id_of(exc);
+            let cid = shared.mem.heap.class_id_of(exc);
             let cname = shared
                 .classes
                 .class_manager
@@ -38346,14 +38508,14 @@ fn execute_invokevirtual_vtable_fast(
     // RootReference residual — refresh defensively before trusting it for
     // dispatch. See docs/known-issues/h2/
     // bug-h2-suite-residual-fail-triage.md.
-    let receiver_obj = shared.heap.load_and_forward(receiver_obj);
+    let receiver_obj = shared.mem.heap.load_and_forward(receiver_obj);
 
     // Arrays go through java/lang/Object — don't dispatch via the
     // receiver's array-component vtable. Let the slow path handle it.
-    if shared.heap.kind_of(receiver_obj) == cratonvm_types::ObjectKind::Array {
+    if shared.mem.heap.kind_of(receiver_obj) == cratonvm_types::ObjectKind::Array {
         return Ok(CachedCallResult::CacheMiss);
     }
-    let receiver_class_id = shared.heap.class_id_of(receiver_obj);
+    let receiver_class_id = shared.mem.heap.class_id_of(receiver_obj);
     // All-zero header = stale pointer from zeroed GC memory — fall back
     // to the slow path which has detailed recovery logic.
     if receiver_class_id == ClassId::new(0) {
@@ -38932,7 +39094,7 @@ fn execute_invokevirtual_vtable_fast(
         let describe = |v: &Value| -> String {
             match v {
                 Value::Object(Some(obj)) => {
-                    let cid = shared.heap.class_id_of(*obj);
+                    let cid = shared.mem.heap.class_id_of(*obj);
                     let cn = shared
                         .classes
                         .class_manager
@@ -38994,8 +39156,8 @@ fn execute_invokevirtual_vtable_fast(
     };
 
     thread.refill_pools_from_shared(
-        &shared.operand_stack_pool,
-        &shared.tag_pool,
+        &shared.mem.operand_stack_pool,
+        &shared.mem.tag_pool,
         // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
         entry_cached.max_locals as usize,
         // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
@@ -39120,7 +39282,7 @@ fn execute_invokevirtual_cached(
                 let caller_loader = cm.get_loader_id(caller_class_id);
                 let receiver = thread.frames[frame_idx].stack.peek_at(0);
                 let recv_info = if let Value::Object(Some(r)) = receiver {
-                    let rcid = shared.heap.class_id_of(r);
+                    let rcid = shared.mem.heap.class_id_of(r);
                     let rname = cm
                         .get_class(rcid)
                         .map(|c| c.name.to_string())
@@ -39351,8 +39513,8 @@ fn execute_invokevirtual_cached(
                     // came from a bare `peek_at`, not a `pop`. See
                     // docs/known-issues/h2/
                     // bug-h2-suite-residual-fail-triage.md.
-                    let obj_ref = shared.heap.load_and_forward(obj_ref);
-                    let actual_class_id = shared.heap.class_id_of(obj_ref);
+                    let obj_ref = shared.mem.heap.load_and_forward(obj_ref);
+                    let actual_class_id = shared.mem.heap.class_id_of(obj_ref);
                     if crate::jit::profile::is_profiling_enabled() {
                         let (cid, mn, md) = method_key_parts(&thread.frames[frame_idx]);
                         shared.jit.profile_store.record_receiver_borrowed(
@@ -39482,7 +39644,7 @@ fn execute_invokevirtual_cached(
                         let describe = |v: &Value| -> String {
                             match v {
                                 Value::Object(Some(obj)) => {
-                                    let cid = shared.heap.class_id_of(*obj);
+                                    let cid = shared.mem.heap.class_id_of(*obj);
                                     let cn = shared
                                         .classes
                                         .class_manager
@@ -39513,7 +39675,7 @@ fn execute_invokevirtual_cached(
                         let describe = |v: &Value| -> String {
                             match v {
                                 Value::Object(Some(obj)) => {
-                                    let cid = shared.heap.class_id_of(*obj);
+                                    let cid = shared.mem.heap.class_id_of(*obj);
                                     let cn = shared
                                         .classes
                                         .class_manager
@@ -39542,7 +39704,7 @@ fn execute_invokevirtual_cached(
                         let describe = |v: &Value| -> String {
                             match v {
                                 Value::Object(Some(obj)) => {
-                                    let cid = shared.heap.class_id_of(*obj);
+                                    let cid = shared.mem.heap.class_id_of(*obj);
                                     let cn = shared
                                         .classes
                                         .class_manager
@@ -39781,8 +39943,8 @@ fn execute_invokevirtual_cached(
                     // VM-wide VecPool when empty so sibling-thread releases
                     // bubble back into the hot path.
                     thread.refill_pools_from_shared(
-                        &shared.operand_stack_pool,
-                        &shared.tag_pool,
+                        &shared.mem.operand_stack_pool,
+                        &shared.mem.tag_pool,
                         // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
                         cached.max_locals as usize,
                         // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
@@ -39832,8 +39994,8 @@ fn execute_invokevirtual_cached(
                     // came from a bare `peek_at`, not a `pop`. See
                     // docs/known-issues/h2/
                     // bug-h2-suite-residual-fail-triage.md.
-                    let obj_ref = shared.heap.load_and_forward(obj_ref);
-                    let actual_class_id = shared.heap.class_id_of(obj_ref);
+                    let obj_ref = shared.mem.heap.load_and_forward(obj_ref);
+                    let actual_class_id = shared.mem.heap.class_id_of(obj_ref);
                     if crate::jit::profile::is_profiling_enabled() {
                         let (cid, mn, md) = method_key_parts(&thread.frames[frame_idx]);
                         shared.jit.profile_store.record_receiver_borrowed(
@@ -39981,8 +40143,8 @@ fn execute_invokevirtual_cached(
                         // receiver came from a bare `peek_at`, not a `pop`.
                         // See docs/known-issues/h2/
                         // bug-h2-suite-residual-fail-triage.md.
-                        let obj_ref = shared.heap.load_and_forward(obj_ref);
-                        let actual_class_id = shared.heap.class_id_of(obj_ref);
+                        let obj_ref = shared.mem.heap.load_and_forward(obj_ref);
+                        let actual_class_id = shared.mem.heap.class_id_of(obj_ref);
                         if crate::jit::profile::is_profiling_enabled() {
                             let (cid, mn, md) = method_key_parts(&thread.frames[frame_idx]);
                             shared.jit.profile_store.record_receiver_borrowed(
@@ -40094,7 +40256,7 @@ fn execute_invokevirtual_cached(
                 let describe = |v: &Value| -> String {
                     match v {
                         Value::Object(Some(obj)) => {
-                            let cid = shared.heap.class_id_of(*obj);
+                            let cid = shared.mem.heap.class_id_of(*obj);
                             let cn = shared
                                 .classes
                                 .class_manager
@@ -40124,7 +40286,7 @@ fn execute_invokevirtual_cached(
                 let describe = |v: &Value| -> String {
                     match v {
                         Value::Object(Some(obj)) => {
-                            let cid = shared.heap.class_id_of(*obj);
+                            let cid = shared.mem.heap.class_id_of(*obj);
                             let cn = shared
                                 .classes
                                 .class_manager
@@ -40153,7 +40315,7 @@ fn execute_invokevirtual_cached(
                 let describe = |v: &Value| -> String {
                     match v {
                         Value::Object(Some(obj)) => {
-                            let cid = shared.heap.class_id_of(*obj);
+                            let cid = shared.mem.heap.class_id_of(*obj);
                             let cn = shared
                                 .classes
                                 .class_manager
@@ -40186,7 +40348,7 @@ fn execute_invokevirtual_cached(
                 let describe = |v: &Value| -> String {
                     match v {
                         Value::Object(Some(obj)) => {
-                            let cid = shared.heap.class_id_of(*obj);
+                            let cid = shared.mem.heap.class_id_of(*obj);
                             let cn = shared
                                 .classes
                                 .class_manager
@@ -40270,8 +40432,8 @@ fn execute_invokevirtual_cached(
 
             // T10.7 — refill per-thread pool from the shared VecPool if empty.
             thread.refill_pools_from_shared(
-                &shared.operand_stack_pool,
-                &shared.tag_pool,
+                &shared.mem.operand_stack_pool,
+                &shared.mem.tag_pool,
                 // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
                 cached.max_locals as usize,
                 // Widening: small unsigned (u8/u16/i32 index) -> usize (non-negative, fits)
@@ -41759,6 +41921,7 @@ fn alloc_multi_array(
             ArrayElementType::Reference
         };
         let arr = shared
+            .mem
             .heap
             .try_alloc_array(level_class_id, element_type, length)
             .ok_or_else(|| {
@@ -41773,6 +41936,7 @@ fn alloc_multi_array(
     } else {
         // Intermediate dimensions: always Reference (array of arrays)
         let arr = shared
+            .mem
             .heap
             .try_alloc_array(level_class_id, ArrayElementType::Reference, length)
             .ok_or_else(|| {
@@ -41793,6 +41957,7 @@ fn alloc_multi_array(
                 component_ids,
             )?;
             shared
+                .mem
                 .heap
                 .set_array_element(arr, i, Value::Object(Some(sub_array)))
                 .map_err(|idx| RuntimeError::ArrayIndexOutOfBoundsException { index: idx })?;
@@ -41871,7 +42036,7 @@ fn double_to_long(v: f64) -> i64 {
 fn dump_imse_holdcount_state(shared: &SharedVm, thread: &JvmThread, exc: ObjectRef) {
     let exc_class = {
         let cm = shared.classes.class_manager.read();
-        cm.get_class(shared.heap.class_id_of(exc))
+        cm.get_class(shared.mem.heap.class_id_of(exc))
             .map(|c| c.name.to_string())
             .unwrap_or_default()
     };
@@ -41895,9 +42060,9 @@ fn dump_imse_holdcount_state(shared: &SharedVm, thread: &JvmThread, exc: ObjectR
     };
     let cm = shared.classes.class_manager.read();
     let field = |obj: ObjectRef, name: &str| -> Value {
-        let cid = shared.heap.class_id_of(obj);
+        let cid = shared.mem.heap.class_id_of(obj);
         match crate::vm::vm_exec::resolve_field_index_in_hierarchy(cid, name, &cm.class_store) {
-            Some(idx) => shared.heap.get_field(obj, idx),
+            Some(idx) => shared.mem.heap.get_field(obj, idx),
             None => Value::Uninitialized,
         }
     };
@@ -41949,14 +42114,14 @@ fn dump_imse_holdcount_state(shared: &SharedVm, thread: &JvmThread, exc: ObjectR
         );
         return;
     };
-    let len = shared.heap.array_length(table);
+    let len = shared.mem.heap.array_length(table);
     let mut found = false;
     for i in 0..len {
-        let Ok(Value::Object(Some(entry))) = shared.heap.get_array_element(table, i) else {
+        let Ok(Value::Object(Some(entry))) = shared.mem.heap.get_array_element(table, i) else {
             continue;
         };
         // Entry extends WeakReference<ThreadLocal>; referent is field 0.
-        let referent = shared.heap.get_field(entry, 0);
+        let referent = shared.mem.heap.get_field(entry, 0);
         let is_ours =
             matches!(referent, Value::Object(Some(r)) if r.as_ptr() == read_holds.as_ptr());
         if is_ours {
@@ -42126,9 +42291,9 @@ mod tests {
     fn weakref_pre_gc_watch_includes_reference_objects() {
         let shared =
             std::sync::Arc::new(crate::vm::SharedVm::new(crate::config::VmConfig::default()));
-        let referent = shared.heap.alloc_object(ClassId::new(0), 1);
-        let weak_ref = shared.heap.alloc_object(ClassId::new(0), 2);
-        shared.ref_processor.lock().discover_reference(
+        let referent = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        let weak_ref = shared.mem.heap.alloc_object(ClassId::new(0), 2);
+        shared.mem.ref_processor.lock().discover_reference(
             cratonvm_gc::reference::ReferenceType::Weak,
             weak_ref.as_ptr() as usize,
             referent.as_ptr() as usize,
@@ -44344,13 +44509,13 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(vm.shared.heap.array_length(outer), 3);
+        assert_eq!(vm.shared.mem.heap.array_length(outer), 3);
 
         for i in 0..3 {
-            let inner_val = vm.shared.heap.get_array_element(outer, i).unwrap();
+            let inner_val = vm.shared.mem.heap.get_array_element(outer, i).unwrap();
             match inner_val {
                 Value::Object(Some(inner_ref)) => {
-                    assert_eq!(vm.shared.heap.array_length(inner_ref), 4);
+                    assert_eq!(vm.shared.mem.heap.array_length(inner_ref), 4);
                 }
                 other => panic!("Expected non-null object at index {i}, got {other:?}"),
             }
@@ -44375,7 +44540,7 @@ mod tests {
             &[],
         )
         .unwrap();
-        assert_eq!(vm.shared.heap.array_length(outer), 0);
+        assert_eq!(vm.shared.mem.heap.array_length(outer), 0);
     }
 
     #[test]
@@ -44396,7 +44561,7 @@ mod tests {
             &[],
         )
         .unwrap();
-        assert_eq!(vm.shared.heap.array_length(arr), 7);
+        assert_eq!(vm.shared.mem.heap.array_length(arr), 7);
     }
 
     #[test]
@@ -44417,16 +44582,16 @@ mod tests {
             &[],
         )
         .unwrap();
-        assert_eq!(vm.shared.heap.array_length(outer), 2);
+        assert_eq!(vm.shared.mem.heap.array_length(outer), 2);
 
-        let mid_val = vm.shared.heap.get_array_element(outer, 0).unwrap();
+        let mid_val = vm.shared.mem.heap.get_array_element(outer, 0).unwrap();
         match mid_val {
             Value::Object(Some(mid_ref)) => {
-                assert_eq!(vm.shared.heap.array_length(mid_ref), 3);
-                let inner_val = vm.shared.heap.get_array_element(mid_ref, 0).unwrap();
+                assert_eq!(vm.shared.mem.heap.array_length(mid_ref), 3);
+                let inner_val = vm.shared.mem.heap.get_array_element(mid_ref, 0).unwrap();
                 match inner_val {
                     Value::Object(Some(inner_ref)) => {
-                        assert_eq!(vm.shared.heap.array_length(inner_ref), 4);
+                        assert_eq!(vm.shared.mem.heap.array_length(inner_ref), 4);
                     }
                     other => panic!("Expected inner array, got {other:?}"),
                 }
@@ -44448,7 +44613,7 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // Allocate a regular (non-proxy) object
-        let regular_obj = shared.heap.alloc_object(ClassId::new(0), 0);
+        let regular_obj = shared.mem.heap.alloc_object(ClassId::new(0), 0);
         let result = try_lambda_dispatch(
             &shared,
             &mut thread,
@@ -44496,15 +44661,15 @@ mod tests {
             .insert(proxy_class_id, call_site);
 
         // Allocate a proxy object with 3 captured values
-        let proxy_ref = shared.heap.alloc_object(proxy_class_id, 3);
-        shared.heap.set_field(proxy_ref, 0, Value::Int(10));
-        shared.heap.set_field(proxy_ref, 1, Value::Int(20));
-        shared.heap.set_field(proxy_ref, 2, Value::Long(30));
+        let proxy_ref = shared.mem.heap.alloc_object(proxy_class_id, 3);
+        shared.mem.heap.set_field(proxy_ref, 0, Value::Int(10));
+        shared.mem.heap.set_field(proxy_ref, 1, Value::Int(20));
+        shared.mem.heap.set_field(proxy_ref, 2, Value::Long(30));
 
         // Verify the captures are stored correctly
-        assert_eq!(shared.heap.get_field(proxy_ref, 0), Value::Int(10));
-        assert_eq!(shared.heap.get_field(proxy_ref, 1), Value::Int(20));
-        assert_eq!(shared.heap.get_field(proxy_ref, 2), Value::Long(30));
+        assert_eq!(shared.mem.heap.get_field(proxy_ref, 0), Value::Int(10));
+        assert_eq!(shared.mem.heap.get_field(proxy_ref, 1), Value::Int(20));
+        assert_eq!(shared.mem.heap.get_field(proxy_ref, 2), Value::Long(30));
 
         // Verify the proxy is recognized as a lambda
         let proxies = shared.classes.lambda_proxies.read();
@@ -44809,7 +44974,7 @@ mod tests {
         let config = VmConfig::new();
         let vm = Vm::new(config);
 
-        let obj = vm.shared.heap.alloc_object(ClassId::new(1), 0);
+        let obj = vm.shared.mem.heap.alloc_object(ClassId::new(1), 0);
         // Same object reference should be equal
         assert!(refs_equal(
             &Value::Object(Some(obj)),
@@ -44825,8 +44990,8 @@ mod tests {
         let config = VmConfig::new();
         let vm = Vm::new(config);
 
-        let obj1 = vm.shared.heap.alloc_object(ClassId::new(1), 0);
-        let obj2 = vm.shared.heap.alloc_object(ClassId::new(1), 0);
+        let obj1 = vm.shared.mem.heap.alloc_object(ClassId::new(1), 0);
+        let obj2 = vm.shared.mem.heap.alloc_object(ClassId::new(1), 0);
         // Different objects (same class) should NOT be equal
         assert!(!refs_equal(
             &Value::Object(Some(obj1)),
@@ -44842,7 +45007,7 @@ mod tests {
         let config = VmConfig::new();
         let vm = Vm::new(config);
 
-        let obj = vm.shared.heap.alloc_object(ClassId::new(1), 0);
+        let obj = vm.shared.mem.heap.alloc_object(ClassId::new(1), 0);
         assert!(!refs_equal(&Value::Object(None), &Value::Object(Some(obj))));
         assert!(!refs_equal(&Value::Object(Some(obj)), &Value::Object(None)));
     }
@@ -44925,14 +45090,14 @@ mod tests {
             &[],
         )
         .unwrap();
-        assert_eq!(vm.shared.heap.array_length(outer), 3);
+        assert_eq!(vm.shared.mem.heap.array_length(outer), 3);
 
-        let inner_val = vm.shared.heap.get_array_element(outer, 0).unwrap();
+        let inner_val = vm.shared.mem.heap.get_array_element(outer, 0).unwrap();
         match inner_val {
             Value::Object(Some(inner_ref)) => {
-                assert_eq!(vm.shared.heap.array_length(inner_ref), 4);
+                assert_eq!(vm.shared.mem.heap.array_length(inner_ref), 4);
                 // Inner elements should be default int (0)
-                let elem = vm.shared.heap.get_array_element(inner_ref, 0).unwrap();
+                let elem = vm.shared.mem.heap.get_array_element(inner_ref, 0).unwrap();
                 assert_eq!(elem, Value::Int(0));
             }
             other => panic!("Expected inner int array, got {other:?}"),
@@ -44958,29 +45123,29 @@ mod tests {
             &[],
         )
         .unwrap();
-        assert_eq!(vm.shared.heap.array_length(d0), 2);
+        assert_eq!(vm.shared.mem.heap.array_length(d0), 2);
 
         // Walk down to depth 3
-        let d1_val = vm.shared.heap.get_array_element(d0, 0).unwrap();
+        let d1_val = vm.shared.mem.heap.get_array_element(d0, 0).unwrap();
         let d1 = match d1_val {
             Value::Object(Some(r)) => r,
             other => panic!("d1: expected object, got {other:?}"),
         };
-        assert_eq!(vm.shared.heap.array_length(d1), 2);
+        assert_eq!(vm.shared.mem.heap.array_length(d1), 2);
 
-        let d2_val = vm.shared.heap.get_array_element(d1, 0).unwrap();
+        let d2_val = vm.shared.mem.heap.get_array_element(d1, 0).unwrap();
         let d2 = match d2_val {
             Value::Object(Some(r)) => r,
             other => panic!("d2: expected object, got {other:?}"),
         };
-        assert_eq!(vm.shared.heap.array_length(d2), 2);
+        assert_eq!(vm.shared.mem.heap.array_length(d2), 2);
 
-        let d3_val = vm.shared.heap.get_array_element(d2, 0).unwrap();
+        let d3_val = vm.shared.mem.heap.get_array_element(d2, 0).unwrap();
         let d3 = match d3_val {
             Value::Object(Some(r)) => r,
             other => panic!("d3: expected object, got {other:?}"),
         };
-        assert_eq!(vm.shared.heap.array_length(d3), 2);
+        assert_eq!(vm.shared.mem.heap.array_length(d3), 2);
     }
 
     #[test]
@@ -45003,25 +45168,25 @@ mod tests {
         let sizes = vec![5, 30, 6];
         let outer =
             alloc_multi_array(&vm.shared, &sizes, 0, ArrayElementType::Char, 4, &[]).unwrap();
-        assert_eq!(vm.shared.heap.array_length(outer), 5);
+        assert_eq!(vm.shared.mem.heap.array_length(outer), 5);
 
         // Walk to the inner (3rd) dim and verify it's a reference array of
         // length 6, not a char array.
-        let mid = match vm.shared.heap.get_array_element(outer, 0).unwrap() {
+        let mid = match vm.shared.mem.heap.get_array_element(outer, 0).unwrap() {
             Value::Object(Some(r)) => r,
             other => panic!("expected mid array, got {other:?}"),
         };
-        assert_eq!(vm.shared.heap.array_length(mid), 30);
-        let inner = match vm.shared.heap.get_array_element(mid, 0).unwrap() {
+        assert_eq!(vm.shared.mem.heap.array_length(mid), 30);
+        let inner = match vm.shared.mem.heap.get_array_element(mid, 0).unwrap() {
             Value::Object(Some(r)) => r,
             other => panic!("expected inner array, got {other:?}"),
         };
-        assert_eq!(vm.shared.heap.array_length(inner), 6);
+        assert_eq!(vm.shared.mem.heap.array_length(inner), 6);
 
         // The element type of the inner array must be Reference (so the user
         // can store char[] references into it via aastore). All slots start
         // as null Object refs.
-        let slot = vm.shared.heap.get_array_element(inner, 5).unwrap();
+        let slot = vm.shared.mem.heap.get_array_element(inner, 5).unwrap();
         assert!(
             matches!(slot, Value::Object(None)),
             "inner slot must be null Object, got {slot:?}"
@@ -45047,12 +45212,12 @@ mod tests {
             &[],
         )
         .unwrap();
-        assert_eq!(vm.shared.heap.array_length(outer), 1);
+        assert_eq!(vm.shared.mem.heap.array_length(outer), 1);
 
-        let inner_val = vm.shared.heap.get_array_element(outer, 0).unwrap();
+        let inner_val = vm.shared.mem.heap.get_array_element(outer, 0).unwrap();
         match inner_val {
             Value::Object(Some(inner_ref)) => {
-                assert_eq!(vm.shared.heap.array_length(inner_ref), 1);
+                assert_eq!(vm.shared.mem.heap.array_length(inner_ref), 1);
             }
             other => panic!("Expected inner array, got {other:?}"),
         }
@@ -45295,8 +45460,8 @@ mod tests {
         let _ = vm.shared.classes.shared_resolution.promoted_hit_count();
         let _ = vm.shared.classes.shared_resolution.promoted_insert_count();
         let _ = vm.shared.classes.shared_resolution.promoted_invoke_count();
-        let _ = vm.shared.operand_stack_pool.acquire_count();
-        let _ = vm.shared.tag_pool.acquire_count();
+        let _ = vm.shared.mem.operand_stack_pool.acquire_count();
+        let _ = vm.shared.mem.tag_pool.acquire_count();
     }
 
     #[test]
@@ -45385,28 +45550,28 @@ mod tests {
         let stats_were_enabled = VecPool::<u64>::stats_enabled();
         VecPool::<u64>::enable_stats();
 
-        let before_op_count = vm.shared.operand_stack_pool.acquire_count();
-        let before_op_hits = vm.shared.operand_stack_pool.acquire_hit_count();
-        let before_op_stored = vm.shared.operand_stack_pool.release_stored_count();
+        let before_op_count = vm.shared.mem.operand_stack_pool.acquire_count();
+        let before_op_hits = vm.shared.mem.operand_stack_pool.acquire_hit_count();
+        let before_op_stored = vm.shared.mem.operand_stack_pool.release_stored_count();
 
         // Acquire + release on the shared pools directly and confirm the
         // counters advance.  This exercises the exact API that
         // `JvmThread::refill_pools_from_shared` and
         // `JvmThread::recycle_frame_with_shared` drive during interpretation.
-        let v = vm.shared.operand_stack_pool.acquire(128);
+        let v = vm.shared.mem.operand_stack_pool.acquire(128);
         assert!(v.capacity() >= 128);
-        vm.shared.operand_stack_pool.release(v);
+        vm.shared.mem.operand_stack_pool.release(v);
         // Acquire again — this one must be a reuse hit.
-        let v2 = vm.shared.operand_stack_pool.acquire(64);
+        let v2 = vm.shared.mem.operand_stack_pool.acquire(64);
         assert!(v2.capacity() >= 128, "reused Vec must keep its capacity");
-        vm.shared.operand_stack_pool.release(v2);
+        vm.shared.mem.operand_stack_pool.release(v2);
 
         assert_eq!(
-            vm.shared.operand_stack_pool.acquire_count() - before_op_count,
+            vm.shared.mem.operand_stack_pool.acquire_count() - before_op_count,
             2
         );
-        assert!(vm.shared.operand_stack_pool.acquire_hit_count() > before_op_hits);
-        assert!(vm.shared.operand_stack_pool.release_stored_count() > before_op_stored);
+        assert!(vm.shared.mem.operand_stack_pool.acquire_hit_count() > before_op_hits);
+        assert!(vm.shared.mem.operand_stack_pool.release_stored_count() > before_op_stored);
 
         // FIX: restore the global stat gate to its prior state so this test
         // does not leak `VEC_POOL_STATS_ENABLED = true` into sibling tests
@@ -45424,18 +45589,18 @@ mod tests {
         // capacity round-trips cleanly even when VM bootstrap populated
         // mixed-sized entries.
         let vm = Vm::new(VmConfig::new());
-        while vm.shared.operand_stack_pool.pool_size() > 0 {
-            let _ = vm.shared.operand_stack_pool.acquire(0);
+        while vm.shared.mem.operand_stack_pool.pool_size() > 0 {
+            let _ = vm.shared.mem.operand_stack_pool.acquire(0);
         }
-        let v = vm.shared.operand_stack_pool.acquire(256);
+        let v = vm.shared.mem.operand_stack_pool.acquire(256);
         let cap = v.capacity();
         assert!(cap >= 256);
         let ptr = v.as_ptr();
-        vm.shared.operand_stack_pool.release(v);
-        let v2 = vm.shared.operand_stack_pool.acquire(1);
+        vm.shared.mem.operand_stack_pool.release(v);
+        let v2 = vm.shared.mem.operand_stack_pool.acquire(1);
         assert_eq!(v2.as_ptr(), ptr, "same allocation must come back");
         assert_eq!(v2.capacity(), cap, "capacity must be exactly preserved");
-        vm.shared.operand_stack_pool.release(v2);
+        vm.shared.mem.operand_stack_pool.release(v2);
     }
 
     // -----------------------------------------------------------------------
@@ -45925,7 +46090,7 @@ mod tests {
         // Allocate an object with a single long field slot.  The single
         // slot is enough — our `CompactValue` stores the whole 64-bit
         // long in one 8-byte slot, matching the interpreter's view.
-        let obj = vm.shared.heap.alloc_object(ClassId::new(1), 1);
+        let obj = vm.shared.mem.heap.alloc_object(ClassId::new(1), 1);
 
         // Store a non-trivial long value, then read it back via the K2
         // path: heap.get_field → CompactValue::long → push_compact →
@@ -45941,8 +46106,8 @@ mod tests {
             i64::MIN,
         ];
         for &v in cases {
-            vm.shared.heap.set_field(obj, 0, Value::Long(v));
-            let value = vm.shared.heap.get_field(obj, 0);
+            vm.shared.mem.heap.set_field(obj, 0, Value::Long(v));
+            let value = vm.shared.mem.heap.get_field(obj, 0);
             let bits: i64 = match value {
                 Value::Long(x) => x,
                 // Cast: float/double raw bit pattern stored in integer word (no value conversion)
@@ -45967,7 +46132,7 @@ mod tests {
 
         let config = VmConfig::new();
         let vm = Vm::new(config);
-        let obj = vm.shared.heap.alloc_object(ClassId::new(1), 1);
+        let obj = vm.shared.mem.heap.alloc_object(ClassId::new(1), 1);
 
         // Simulate a full putfield → getfield round trip: push a long via
         // `push_long` (mirroring an upstream `lconst` / `ldc2_w` / `lload`
@@ -45992,10 +46157,10 @@ mod tests {
                 CompactTag::Null | CompactTag::Uninitialized => 0,
                 other => panic!("unexpected tag for J-descriptor field: {other:?}"),
             };
-            vm.shared.heap.set_field(obj, 0, Value::Long(lv));
+            vm.shared.mem.heap.set_field(obj, 0, Value::Long(lv));
 
             // K2 getfield push: heap → CompactValue::long → push_compact.
-            let value = vm.shared.heap.get_field(obj, 0);
+            let value = vm.shared.mem.heap.get_field(obj, 0);
             let bits: i64 = match value {
                 Value::Long(x) => x,
                 // Cast: float/double raw bit pattern stored in integer word (no value conversion)
@@ -46021,7 +46186,7 @@ mod tests {
 
         let config = VmConfig::new();
         let vm = Vm::new(config);
-        let obj = vm.shared.heap.alloc_object(ClassId::new(1), 1);
+        let obj = vm.shared.mem.heap.alloc_object(ClassId::new(1), 1);
 
         let cases: &[f64] = &[
             0.0,
@@ -46034,8 +46199,8 @@ mod tests {
             f64::NEG_INFINITY,
         ];
         for &v in cases {
-            vm.shared.heap.set_field(obj, 0, Value::Double(v));
-            let value = vm.shared.heap.get_field(obj, 0);
+            vm.shared.mem.heap.set_field(obj, 0, Value::Double(v));
+            let value = vm.shared.mem.heap.get_field(obj, 0);
             let d: f64 = match value {
                 Value::Double(x) => x,
                 // Cast: integer word reinterpreted as float/double bit pattern
@@ -46062,7 +46227,7 @@ mod tests {
 
         let config = VmConfig::new();
         let vm = Vm::new(config);
-        let obj = vm.shared.heap.alloc_object(ClassId::new(1), 1);
+        let obj = vm.shared.mem.heap.alloc_object(ClassId::new(1), 1);
 
         let cases: &[f64] = &[0.0, 1.0, -1.0, std::f64::consts::E, f64::MAX];
         for &v in cases {
@@ -46083,10 +46248,10 @@ mod tests {
                 CompactTag::Null | CompactTag::Uninitialized => 0.0,
                 other => panic!("unexpected tag for D-descriptor field: {other:?}"),
             };
-            vm.shared.heap.set_field(obj, 0, Value::Double(dv));
+            vm.shared.mem.heap.set_field(obj, 0, Value::Double(dv));
 
             // K2 getfield push for D.
-            let value = vm.shared.heap.get_field(obj, 0);
+            let value = vm.shared.mem.heap.get_field(obj, 0);
             let d: f64 = match value {
                 Value::Double(x) => x,
                 // Cast: integer word reinterpreted as float/double bit pattern
@@ -46115,15 +46280,15 @@ mod tests {
 
         let config = VmConfig::new();
         let vm = Vm::new(config);
-        let obj = vm.shared.heap.alloc_object(ClassId::new(1), 1);
+        let obj = vm.shared.mem.heap.alloc_object(ClassId::new(1), 1);
 
         for &v in &[i32::MIN, -1, 0, 1, 42, i32::MAX] {
-            vm.shared.heap.set_field(obj, 0, Value::Int(v));
+            vm.shared.mem.heap.set_field(obj, 0, Value::Int(v));
 
             // The K2 path for non-J/D descriptors: read Value, apply the
             // legacy non-reference coercion (Object(None) → Int(0)), then
             // push(Value).
-            let mut value = vm.shared.heap.get_field(obj, 0);
+            let mut value = vm.shared.mem.heap.get_field(obj, 0);
             if matches!(value, Value::Object(None)) {
                 value = Value::Int(0);
             }

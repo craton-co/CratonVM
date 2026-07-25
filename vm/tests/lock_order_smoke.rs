@@ -77,7 +77,7 @@ fn shared_vm_descending_order_is_accepted() {
     let shared = fresh_shared_vm();
 
     let cm = shared.classes.class_manager.read();
-    let rp = shared.ref_processor.lock();
+    let rp = shared.mem.ref_processor.lock();
     let _monitors = shared.enter_monitors_rank();
 
     // Touch both protected values so the guards are not optimized away and we
@@ -114,7 +114,7 @@ fn shared_vm_monitors_then_class_manager_is_detected() {
 fn shared_vm_ref_processor_then_class_manager_is_detected() {
     let shared = fresh_shared_vm();
     expect_violation("ref_processor (L7) -> class_manager (L10)", || {
-        let _rp = shared.ref_processor.lock();
+        let _rp = shared.mem.ref_processor.lock();
         let _cm = shared.classes.class_manager.write();
     });
 }
@@ -126,7 +126,7 @@ fn shared_vm_monitors_then_ref_processor_is_detected() {
     let shared = fresh_shared_vm();
     expect_violation("monitors (L6) -> ref_processor (L7)", || {
         let _monitors = shared.enter_monitors_rank();
-        let _rp = shared.ref_processor.lock();
+        let _rp = shared.mem.ref_processor.lock();
     });
 }
 

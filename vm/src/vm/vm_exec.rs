@@ -112,7 +112,7 @@ fn debug_log_thread_mirror_identity(shared: &SharedVm, thread_id: u64, obj: Obje
     use std::sync::OnceLock;
     static SEEN: OnceLock<parking_lot::Mutex<std::collections::HashMap<u64, (usize, i32)>>> =
         OnceLock::new();
-    let hash = shared.heap.identity_hash_code(obj);
+    let hash = shared.mem.heap.identity_hash_code(obj);
     let addr = obj.as_ptr() as usize;
     let map = SEEN.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
     let mut m = map.lock();
@@ -270,7 +270,7 @@ pub fn coerce_value_for_return(value: Value, ret_type: u8) -> Value {
             // `Value::Object(None)` and force callers that legitimately surface
             // jobject-as-jlong handles (JNI / internal bridges) onto the
             // heap-validating sibling `coerce_value_for_return_validated`, which
-            // round-trips the bits through `shared.heap.is_object_address`.
+            // round-trips the bits through `shared.mem.heap.is_object_address`.
             //
             // Genuine object returns arrive as `Value::Object(Some(_))` and flow
             // unchanged through the `other` arm below — their behavior is
@@ -298,7 +298,7 @@ pub fn coerce_native_return(value: Option<Value>, descriptor: &str) -> Option<Va
 /// jobject pointer (the legacy bug that lets a `long` carrying e.g. a file
 /// size or hash code be reinterpreted as an `ObjectRef`, then later marked
 /// by GC -> Win32 SEGV / 0xC0000005), round-trip the bits through
-/// `shared.heap.is_object_address`. Real `Value::Object(_)` and primitive
+/// `shared.mem.heap.is_object_address`. Real `Value::Object(_)` and primitive
 /// return types are forwarded to the legacy coercer unchanged.
 ///
 /// This mirrors `value_as_validated_object_ref` and is the read-side fix
@@ -311,7 +311,7 @@ pub fn coerce_value_for_return_validated(shared: &SharedVm, value: Value, ret_ty
             Value::Int(0) | Value::Long(0) => Value::Object(None),
             Value::Object(_) => value,
             Value::Long(v) => match jlong_bits_as_aligned_object_ptr(v as u64) {
-                Some(p) => match shared.heap.is_object_address(p) {
+                Some(p) => match shared.mem.heap.is_object_address(p) {
                     Some(obj) => Value::Object(Some(obj)),
                     None => Value::Object(None),
                 },
@@ -360,7 +360,7 @@ pub fn coerce_value_against_ret_char(value: Value, ret_char: u8, shared: &Shared
     // Identify the wrapper class and unbox from field 0 (the `value` slot in
     // our synthetic wrapper layout, which matches how `box_primitive` lays
     // them out and how `Long.valueOf`/etc. store their payload).
-    let cid = shared.heap.class_id_of(obj);
+    let cid = shared.mem.heap.class_id_of(obj);
     let cm = shared.classes.class_manager.read();
     let cls_name = cm
         .get_class(cid)
@@ -387,7 +387,7 @@ pub fn coerce_value_against_ret_char(value: Value, ret_char: u8, shared: &Shared
             _ => Value::Int(0),
         };
     }
-    let inner = shared.heap.get_field(obj, 0);
+    let inner = shared.mem.heap.get_field(obj, 0);
     // C15: When the caller's bytecode expects a primitive (signature-polymorphic
     // invoke call-site), NEVER leave a reference on the stack. If the wrapper
     // class matches, unbox field 0 вЂ” coercing any variant (including malformed
@@ -467,7 +467,7 @@ pub fn value_as_validated_object_ref(shared: &SharedVm, v: Value) -> Option<Obje
         Value::Object(Some(o)) => Some(o),
         Value::Long(bits) => {
             let p = jlong_bits_as_aligned_object_ptr(bits as u64)?;
-            shared.heap.is_object_address(p)
+            shared.mem.heap.is_object_address(p)
         }
         _ => None,
     }
@@ -590,8 +590,8 @@ fn recover_stale_lambda_receiver_from_native_pins(
 
     let proxies = shared.classes.lambda_proxies.read();
     for pinned in thread.native_pin_roots.iter().rev().copied() {
-        let pinned = shared.heap.load_and_forward(pinned);
-        let pinned_class_id = shared.heap.class_id_of(pinned);
+        let pinned = shared.mem.heap.load_and_forward(pinned);
+        let pinned_class_id = shared.mem.heap.class_id_of(pinned);
         let Some(call_site) = proxies.get(&pinned_class_id) else {
             continue;
         };
@@ -811,7 +811,7 @@ fn safe_native_call_impl(
     };
     for value in forwarded_args.iter_mut() {
         if let Value::Object(Some(obj)) = value {
-            *obj = shared.heap.load_and_forward(*obj);
+            *obj = shared.mem.heap.load_and_forward(*obj);
         }
     }
     let args: &[Value] = forwarded_args;
@@ -842,6 +842,7 @@ fn safe_native_call_impl(
 
     let mut remapped_args = None;
     let stw_pending = shared
+        .mem
         .gc_barrier
         .stw_requested
         .load(std::sync::atomic::Ordering::Acquire);
@@ -858,6 +859,7 @@ fn safe_native_call_impl(
     // a collection for every native dispatch on allocation-heavy JIT paths.
     let native_array_gc = crate::runtime::env_cache::disable_jit()
         && shared
+            .mem
             .native_array_gc_requested
             .swap(false, std::sync::atomic::Ordering::Relaxed);
     let mut requested_gc = false;
@@ -883,9 +885,9 @@ fn safe_native_call_impl(
     // the GC-overhead limit so an all-live young cannot thrash boundary GCs;
     // the flag check itself is one relaxed load on the hot path.
     let mut pressure_gc = false;
-    if shared.heap.young_spill_pressure() {
+    if shared.mem.heap.young_spill_pressure() {
         if !crate::runtime::interpreter::gc_overhead_limit_exceeded(shared)
-            && shared.heap.needs_gc()
+            && shared.mem.heap.needs_gc()
         {
             // `maybe_gc_forced` retires this thread's TLAB itself.
             crate::runtime::interpreter::maybe_gc_forced_pub(shared, thread);
@@ -894,7 +896,7 @@ fn safe_native_call_impl(
         // Clear even when the gates said no: the flag was stale (another
         // thread's GC already relieved young) or the heap is genuinely full
         // of live data (overhead limit) — the next spill re-sets it.
-        shared.heap.clear_young_spill_pressure();
+        shared.mem.heap.clear_young_spill_pressure();
     }
     if stw_pending || requested_gc || pressure_gc {
         let mut fresh = args.to_vec();
@@ -1033,7 +1035,9 @@ fn safe_native_call_impl(
         static CTR: AtomicU64 = AtomicU64::new(0);
         let n = CTR.fetch_add(1, Ordering::Relaxed);
         if n % youngscan_stride() == 0 {
-            if let Some((addr, cid, fld, payload, nbr)) = shared.heap.dbg_first_young_small_ref() {
+            if let Some((addr, cid, fld, payload, nbr)) =
+                shared.mem.heap.dbg_first_young_small_ref()
+            {
                 if !youngscan_mark_found() {
                     let native = cratonvm_native_api::native_ring::name_of(callback as usize)
                         .unwrap_or_else(|| format!("<cb@{:#x}>", callback as usize));
@@ -1158,7 +1162,7 @@ fn safe_native_call_impl(
             // CRATONVM_DBG_STALE_OBJREF, name the producing native so the
             // site can be fixed at the source.
             if let Value::Object(Some(o)) = v {
-                let healed = shared.heap.load_and_forward(*o);
+                let healed = shared.mem.heap.load_and_forward(*o);
                 if healed.as_ptr() != o.as_ptr() && cratonvm_gc::stale_objref_debug::enabled() {
                     let callee = cratonvm_native_api::native_ring::name_of(callback as usize)
                         .unwrap_or_else(|| format!("<cb@{:#x}>", callback as usize));
@@ -1207,7 +1211,7 @@ fn safe_native_call_impl(
                 if let Value::Object(Some(o)) = v {
                     let callee = cratonvm_native_api::native_ring::name_of(callback as usize)
                         .unwrap_or_else(|| format!("<cb@{:#x}>", callback as usize));
-                    let cid = shared.heap.class_id_of(*o);
+                    let cid = shared.mem.heap.class_id_of(*o);
                     let cname = shared
                         .classes
                         .class_manager
@@ -1224,6 +1228,7 @@ fn safe_native_call_impl(
         }
         Err(MethodCallFailed::ExceptionThrown(exc)) => {
             let exc_is_current = shared
+                .mem
                 .heap
                 .is_object_address(exc.as_ptr() as usize)
                 .is_some();
@@ -1335,8 +1340,8 @@ pub(crate) fn apply_pending_blocked_fixups(shared: &SharedVm, thread: &mut JvmTh
     if !fixup.is_empty() {
         applied += fixup.len();
         for frame in &mut thread.frames {
-            frame.update_local_refs(&fixup, &shared.heap);
-            frame.stack.update_object_refs(&fixup, &shared.heap);
+            frame.update_local_refs(&fixup, &shared.mem.heap);
+            frame.stack.update_object_refs(&fixup, &shared.mem.heap);
             if let Some(ref mut obj_ref) = frame.monitor_on_exit {
                 let old_addr = obj_ref.as_ptr() as usize;
                 if let Some(&new_addr) = fixup.get(&old_addr) {
@@ -1444,7 +1449,7 @@ pub(crate) fn monitor_enter_blocking(
         crate::vm::vm_init::set_wait_site_snapshot(ctx.thread);
     }
     {
-        let blk = shared.gc_barrier.enter_blocked();
+        let blk = shared.mem.gc_barrier.enter_blocked();
         if blk.pre_stw {
             // A STW was already in progress when we became blocked —
             // arrive at the barrier so its `wait_for_all` completes.
@@ -1453,11 +1458,11 @@ pub(crate) fn monitor_enter_blocking(
             // raised `in_blocked_region`, so this pause's own census may
             // have already excluded us; only the exclusion snapshot the
             // census recorded (not this thread's guess) can say which.
-            let _ = shared.gc_barrier.arrive_and_wait_auto(tid);
+            let _ = shared.mem.gc_barrier.arrive_and_wait_auto(tid);
         }
         if dbg_mon_dump {
             let cls = {
-                let cid = shared.heap.class_id_of(obj);
+                let cid = shared.mem.heap.class_id_of(obj);
                 let cm = shared.classes.class_manager.read();
                 cm.get_class(cid).map(|c| c.name.to_string())
             };
@@ -1523,9 +1528,9 @@ pub(crate) fn monitor_enter_synchronized_method(
     ctx.thread.tlab.retire();
     ctx.deposit_root_snapshot();
     {
-        let blk = ctx.shared.gc_barrier.enter_blocked();
+        let blk = ctx.shared.mem.gc_barrier.enter_blocked();
         if blk.pre_stw {
-            let _ = ctx.shared.gc_barrier.arrive_and_wait_auto(tid);
+            let _ = ctx.shared.mem.gc_barrier.arrive_and_wait_auto(tid);
         }
         monitor.block_enter(tid);
         drop(blk);
@@ -2021,6 +2026,7 @@ fn resume_virtual_continuation(shared: std::sync::Arc<SharedVm>, vt_id: u64) {
 
     let result = if resumed {
         if shared
+            .mem
             .gc_barrier
             .stw_requested
             .load(std::sync::atomic::Ordering::Acquire)
@@ -2031,18 +2037,18 @@ fn resume_virtual_continuation(shared: std::sync::Arc<SharedVm>, vt_id: u64) {
     } else {
         crate::runtime::interpreter::init_thread_exec_depth_ceiling(8 * 1024 * 1024);
         loop {
-            let ready = shared.gc_barrier.run_if_no_stw_requested(|| {
+            let ready = shared.mem.gc_barrier.run_if_no_stw_requested(|| {
                 shared.threads.thread_registry.mark_stw_ready(tid);
             });
             if ready {
                 break;
             }
-            let pointer_map = shared.gc_barrier.arrive_and_wait_excluded(tid);
+            let pointer_map = shared.mem.gc_barrier.arrive_and_wait_excluded(tid);
             if !pointer_map.is_empty() {
                 crate::runtime::interpreter::apply_pointer_map_to_thread(
                     &mut thread,
                     &pointer_map,
-                    &shared.heap,
+                    &shared.mem.heap,
                 );
             }
         }
@@ -2051,7 +2057,7 @@ fn resume_virtual_continuation(shared: std::sync::Arc<SharedVm>, vt_id: u64) {
             return;
         };
         thread.java_thread_obj = Some(thread_obj);
-        let recv_cid = shared.heap.class_id_of(thread_obj);
+        let recv_cid = shared.mem.heap.class_id_of(thread_obj);
         let _ = super::ensure_class_initialized_shared(&shared, &mut thread, recv_cid);
         invoke_on_class_shared(
             &shared,
@@ -2083,7 +2089,7 @@ fn resume_virtual_continuation(shared: std::sync::Arc<SharedVm>, vt_id: u64) {
             let pin_base = thread.native_pin_roots.len();
             thread.native_pin_roots.push(*exception);
             if let Some(thread_obj) = shared.threads.thread_registry.java_thread_obj(tid) {
-                let receiver_class = shared.heap.class_id_of(thread_obj);
+                let receiver_class = shared.mem.heap.class_id_of(thread_obj);
                 let exception = thread.native_pin_roots[pin_base];
                 let _ = invoke_on_class_shared(
                     &shared,
@@ -2115,7 +2121,7 @@ fn resume_virtual_continuation(shared: std::sync::Arc<SharedVm>, vt_id: u64) {
             now_ns,
         );
     }
-    shared.heap.flush_thread_satb();
+    shared.mem.heap.flush_thread_satb();
 
     let wake_obj = shared.threads.thread_registry.java_thread_obj(tid);
     let term_monitor = wake_obj.and_then(|thread_obj| {
@@ -2131,9 +2137,9 @@ fn resume_virtual_continuation(shared: std::sync::Arc<SharedVm>, vt_id: u64) {
                         thread: &mut thread,
                     }
                     .deposit_root_snapshot();
-                    let blocked = shared.gc_barrier.enter_blocked();
+                    let blocked = shared.mem.gc_barrier.enter_blocked();
                     if blocked.pre_stw {
-                        let _ = shared.gc_barrier.arrive_and_wait_auto(tid);
+                        let _ = shared.mem.gc_barrier.arrive_and_wait_auto(tid);
                     }
                     monitor.block_enter(tid);
                     drop(blocked);
@@ -2150,9 +2156,9 @@ fn resume_virtual_continuation(shared: std::sync::Arc<SharedVm>, vt_id: u64) {
         thread: &mut thread,
     }
     .deposit_root_snapshot();
-    let blocked = shared.gc_barrier.enter_blocked();
+    let blocked = shared.mem.gc_barrier.enter_blocked();
     if blocked.pre_stw {
-        let _ = shared.gc_barrier.arrive_and_wait_auto(tid);
+        let _ = shared.mem.gc_barrier.arrive_and_wait_auto(tid);
     }
     blocked.finish_after(|| {
         shared.threads.thread_registry.clear_tlab_addr(tid);
@@ -2241,7 +2247,7 @@ impl<'a> NativeContextImpl<'a> {
         // to ~256 entries invisible in its thread-local buffer for the whole
         // blocked duration, and the sweep would free those still-live
         // targets. Cheap no-op whenever no marking cycle is active.
-        self.shared.heap.flush_thread_satb();
+        self.shared.mem.heap.flush_thread_satb();
         // Throttle-hang fix (ConcurrencyThrottleInterceptorTests, 2026-07-02):
         // this deposit is a GC-AUTHORITATIVE root publish — it is the ONLY view
         // a cross-thread STW collector has of this thread's roots for as long
@@ -2280,22 +2286,22 @@ impl<'a> NativeContextImpl<'a> {
                 // stress collector uses roots as pins, scoped-out references
                 // are cheaper than a live receiver reclaimed under a blocked
                 // native call.
-                frame.scan_local_objects_all_live(&mut snapshot, &self.shared.heap);
+                frame.scan_local_objects_all_live(&mut snapshot, &self.shared.mem.heap);
             } else {
-                frame.scan_local_objects(&mut snapshot, &self.shared.heap);
+                frame.scan_local_objects(&mut snapshot, &self.shared.mem.heap);
             }
             if conservative_locals {
-                frame.scan_locals_conservative(&mut snapshot, &self.shared.heap);
+                frame.scan_locals_conservative(&mut snapshot, &self.shared.mem.heap);
             }
             let before = snapshot.len();
             frame
                 .stack
-                .scan_object_refs(&mut snapshot, &self.shared.heap);
+                .scan_object_refs(&mut snapshot, &self.shared.mem.heap);
             if snapshot.len() > before {
                 let added = snapshot.split_off(before);
                 for o in added {
                     let addr = o.as_ptr() as usize;
-                    if self.shared.heap.is_object_address(addr).is_some() {
+                    if self.shared.mem.heap.is_object_address(addr).is_some() {
                         snapshot.push(o);
                     }
                 }
@@ -2303,7 +2309,7 @@ impl<'a> NativeContextImpl<'a> {
             if conservative_locals {
                 frame
                     .stack
-                    .scan_object_refs_conservative(&mut snapshot, &self.shared.heap);
+                    .scan_object_refs_conservative(&mut snapshot, &self.shared.mem.heap);
             }
             // A synchronized method's implicit monitorexit target. For
             // instance methods it duplicates local 0, but a STATIC
@@ -2442,7 +2448,7 @@ impl<'a> NativeContextImpl<'a> {
         if !moving_young_precise_only {
             let jit_scan_start = snapshot.len();
             crate::jit::conservative_roots::scan_active_jit_frames(
-                &self.shared.heap,
+                &self.shared.mem.heap,
                 &mut snapshot,
             );
             // G1 pin-in-place, cross-thread half (same as the safepoint path
@@ -2453,14 +2459,14 @@ impl<'a> NativeContextImpl<'a> {
             // roots must also PIN their regions out of the collection set;
             // the spill slots holding them cannot be rewritten. Replace
             // semantics per thread; entry dropped at thread exit.
-            if self.shared.heap.is_g1() {
+            if self.shared.mem.heap.is_g1() {
                 let addrs: Vec<usize> = snapshot[jit_scan_start..]
                     .iter()
                     .map(|r| r.as_ptr() as usize)
                     .collect();
                 cratonvm_gc::gc_quiescence::publish_pinned_jit_roots(&addrs);
             }
-        } else if self.shared.heap.is_g1() {
+        } else if self.shared.mem.heap.is_g1() {
             cratonvm_gc::gc_quiescence::publish_pinned_jit_roots(&[]);
         }
         // Shadow-stack precise roots (mirrors the same fold in
@@ -2470,7 +2476,7 @@ impl<'a> NativeContextImpl<'a> {
         // No-op when the gate is off or the shadow stack is empty.
         if crate::jit::conservative_roots::shadow_stack_enabled() {
             self.thread.shadow_stack.for_each_value(|v| {
-                if let Some(obj_ref) = self.shared.heap.is_object_address(v) {
+                if let Some(obj_ref) = self.shared.mem.heap.is_object_address(v) {
                     snapshot.push(obj_ref);
                 }
             });
@@ -2498,7 +2504,7 @@ impl<'a> NativeContextImpl<'a> {
                 for li in 0..fr.locals_len() {
                     if let Value::Object(Some(o)) = fr.get_local(li as u16) {
                         let a = o.as_ptr() as usize;
-                        if let Some(new) = self.shared.heap.debug_forwarded_target(a) {
+                        if let Some(new) = self.shared.mem.heap.debug_forwarded_target(a) {
                             eprintln!(
                                 "[blockgc] DEPOSIT-STALE tid={} frame#{fi} {}.{} pc={} local[{li}] 0x{a:x}->0x{new:x}",
                                 self.thread.thread_id.0, fr.class_name(), fr.method_name(), fr.pc,
@@ -2510,7 +2516,7 @@ impl<'a> NativeContextImpl<'a> {
                 for si in 0..fr.stack.len() {
                     if let Value::Object(Some(o)) = fr.stack.peek_at(si) {
                         let a = o.as_ptr() as usize;
-                        if let Some(new) = self.shared.heap.debug_forwarded_target(a) {
+                        if let Some(new) = self.shared.mem.heap.debug_forwarded_target(a) {
                             eprintln!(
                                 "[blockgc] DEPOSIT-STALE tid={} frame#{fi} {}.{} pc={} stack[{si}] 0x{a:x}->0x{new:x}",
                                 self.thread.thread_id.0, fr.class_name(), fr.method_name(), fr.pc,
@@ -2610,7 +2616,7 @@ impl<'a> NativeContextImpl<'a> {
         //    newer pause counts us in `expected` and cannot complete (or
         //    fold) until our next safepoint arrival, so the application can
         //    never race a fold or an evacuation.
-        self.shared.gc_barrier.leave_blocked_region_flagged(
+        self.shared.mem.gc_barrier.leave_blocked_region_flagged(
             self.thread.thread_id,
             &self.thread.gc_block_state.in_blocked_region,
         );
@@ -2636,7 +2642,7 @@ impl<'a> NativeContextImpl<'a> {
                     .unwrap_or(0);
                 eprintln!(
                     "[BUG03-fm] e{} path=blocked-wake(check_post_block) tid0 jto=0x{:x} jto_in_fixup={} fixup.len={}",
-                    self.shared.heap.collection_count(), jto, jto != 0 && fixup.contains_key(&jto), fixup.len()
+                    self.shared.mem.heap.collection_count(), jto, jto != 0 && fixup.contains_key(&jto), fixup.len()
                 );
             }
             if blockgc_dbg() {
@@ -2648,8 +2654,10 @@ impl<'a> NativeContextImpl<'a> {
                 );
             }
             for frame in &mut self.thread.frames {
-                frame.update_local_refs(&fixup, &self.shared.heap);
-                frame.stack.update_object_refs(&fixup, &self.shared.heap);
+                frame.update_local_refs(&fixup, &self.shared.mem.heap);
+                frame
+                    .stack
+                    .update_object_refs(&fixup, &self.shared.mem.heap);
                 // A blocked `synchronized` method must release the RELOCATED
                 // monitor object on frame-pop, not the stale address.
                 if let Some(ref mut obj_ref) = frame.monitor_on_exit {
@@ -2793,7 +2801,7 @@ impl<'a> NativeContextImpl<'a> {
                 for li in 0..fr.locals_len() {
                     if let Value::Object(Some(o)) = fr.get_local(li as u16) {
                         let a = o.as_ptr() as usize;
-                        if let Some(new) = self.shared.heap.debug_forwarded_target(a) {
+                        if let Some(new) = self.shared.mem.heap.debug_forwarded_target(a) {
                             eprintln!(
                                 "[blockgc] WAKE-STALE tid={} frame#{fi} {}.{} pc={} local[{li}] 0x{a:x}->0x{new:x} was_key={} was_val={} fixup_len={}",
                                 self.thread.thread_id.0, fr.class_name(), fr.method_name(), fr.pc,
@@ -2807,7 +2815,7 @@ impl<'a> NativeContextImpl<'a> {
                 for si in 0..fr.stack.len() {
                     if let Value::Object(Some(o)) = fr.stack.peek_at(si) {
                         let a = o.as_ptr() as usize;
-                        if let Some(new) = self.shared.heap.debug_forwarded_target(a) {
+                        if let Some(new) = self.shared.mem.heap.debug_forwarded_target(a) {
                             eprintln!(
                                 "[blockgc] WAKE-STALE tid={} frame#{fi} {}.{} pc={} stack[{si}] 0x{a:x}->0x{new:x} was_key={} was_val={} fixup_len={}",
                                 self.thread.thread_id.0, fr.class_name(), fr.method_name(), fr.pc,
@@ -2844,13 +2852,13 @@ impl<'a> NativeContextImpl<'a> {
     /// Synthetic-mode `Thread` doesn't have a `holder` field, so
     /// step 1 returns `None` and we fall through to `None` here.
     pub(crate) fn read_thread_daemon_flag(&self, thread_obj: ObjectRef) -> Option<bool> {
-        let header = self.shared.heap.get_header(thread_obj);
+        let header = self.shared.mem.heap.get_header(thread_obj);
         let cm = self.shared.classes.class_manager.read();
         // Step 1: locate `Thread.holder` slot.
         let holder_slot =
             resolve_field_index_in_hierarchy(header.class_id, "holder", &cm.class_store)?;
         // Step 2: read it.
-        let holder_obj = match self.shared.heap.get_field(thread_obj, holder_slot) {
+        let holder_obj = match self.shared.mem.heap.get_field(thread_obj, holder_slot) {
             Value::Object(Some(o)) => o,
             // Thread allocated but holder not yet wired up вЂ” treat as
             // non-daemon. The JDK bytecode would NPE here on
@@ -2861,11 +2869,11 @@ impl<'a> NativeContextImpl<'a> {
         // Step 3: locate `FieldHolder.daemon` slot. Real JDK 25 names it
         // exactly `daemon`; we walk the class hierarchy in case a
         // future JDK moves it to a parent.
-        let holder_header = self.shared.heap.get_header(holder_obj);
+        let holder_header = self.shared.mem.heap.get_header(holder_obj);
         let daemon_slot =
             resolve_field_index_in_hierarchy(holder_header.class_id, "daemon", &cm.class_store)?;
         // Step 4: read the boolean.
-        match self.shared.heap.get_field(holder_obj, daemon_slot) {
+        match self.shared.mem.heap.get_field(holder_obj, daemon_slot) {
             Value::Int(0) => Some(false),
             Value::Int(_) => Some(true),
             // Anything else (Object/Long/etc.) is layout corruption.
@@ -2876,12 +2884,14 @@ impl<'a> NativeContextImpl<'a> {
     }
 
     pub(crate) fn read_thread_task_object(&self, thread_obj: ObjectRef) -> Option<ObjectRef> {
-        let header = self.shared.heap.get_header(thread_obj);
+        let header = self.shared.mem.heap.get_header(thread_obj);
         let cm = self.shared.classes.class_manager.read();
         if let Some(target_slot) =
             resolve_field_index_in_hierarchy(header.class_id, "target", &cm.class_store)
         {
-            if let Value::Object(Some(task)) = self.shared.heap.get_field(thread_obj, target_slot) {
+            if let Value::Object(Some(task)) =
+                self.shared.mem.heap.get_field(thread_obj, target_slot)
+            {
                 return Some(task);
             }
         }
@@ -2889,16 +2899,16 @@ impl<'a> NativeContextImpl<'a> {
             resolve_field_index_in_hierarchy(header.class_id, "holder", &cm.class_store)
         {
             if let Value::Object(Some(holder_obj)) =
-                self.shared.heap.get_field(thread_obj, holder_slot)
+                self.shared.mem.heap.get_field(thread_obj, holder_slot)
             {
-                let holder_header = self.shared.heap.get_header(holder_obj);
+                let holder_header = self.shared.mem.heap.get_header(holder_obj);
                 if let Some(task_slot) = resolve_field_index_in_hierarchy(
                     holder_header.class_id,
                     "task",
                     &cm.class_store,
                 ) {
                     if let Value::Object(Some(task)) =
-                        self.shared.heap.get_field(holder_obj, task_slot)
+                        self.shared.mem.heap.get_field(holder_obj, task_slot)
                     {
                         return Some(task);
                     }
@@ -2906,7 +2916,7 @@ impl<'a> NativeContextImpl<'a> {
             }
         }
         if header.num_slots() > 3 {
-            if let Value::Object(Some(task)) = self.shared.heap.get_field(thread_obj, 3) {
+            if let Value::Object(Some(task)) = self.shared.mem.heap.get_field(thread_obj, 3) {
                 return Some(task);
             }
         }
@@ -2917,7 +2927,7 @@ impl<'a> NativeContextImpl<'a> {
         let Some(task) = self.read_thread_task_object(thread_obj) else {
             return false;
         };
-        let task_cid = self.shared.heap.class_id_of(task);
+        let task_cid = self.shared.mem.heap.class_id_of(task);
         self.shared
             .classes
             .class_manager
@@ -2950,6 +2960,7 @@ impl<'a> NativeContextImpl<'a> {
         }
         let holder = self
             .shared
+            .mem
             .heap
             .alloc_object(holder_class, holder_num_fields);
         crate::runtime::interpreter::init_primitive_fields(self.shared, holder, holder_class);
@@ -3109,10 +3120,11 @@ impl<'a> NativeContextImpl<'a> {
             // cross-GC fixups before touching heap state again.
             self.thread.tlab.retire();
             self.deposit_root_snapshot();
-            let blk = self.shared.gc_barrier.enter_blocked();
+            let blk = self.shared.mem.gc_barrier.enter_blocked();
             if blk.pre_stw {
                 let _ = self
                     .shared
+                    .mem
                     .gc_barrier
                     .arrive_and_wait_auto(ThreadId(current_thread_id));
             }
@@ -3187,7 +3199,7 @@ impl<'a> NativeContextImpl<'a> {
         // the old address → the live group ends up with parent/name == null).
         let pin_base = self.thread.native_pin_roots.len();
 
-        let system_tg = self.shared.heap.alloc_object(tg_class, tg_num_fields);
+        let system_tg = self.shared.mem.heap.alloc_object(tg_class, tg_num_fields);
         crate::runtime::interpreter::init_primitive_fields(self.shared, system_tg, tg_class);
         let sys_idx = self.thread.native_pin_roots.len();
         self.thread.native_pin_roots.push(system_tg);
@@ -3223,7 +3235,7 @@ impl<'a> NativeContextImpl<'a> {
         // under "system", `InnocuousThreadGroup` becomes a SIBLING of "main"
         // (child of "system"), invisible to `enumerate(main, …)` — matching
         // HotSpot, where these cleaner threads never trip the leak detector.
-        let main_tg = self.shared.heap.alloc_object(tg_class, tg_num_fields);
+        let main_tg = self.shared.mem.heap.alloc_object(tg_class, tg_num_fields);
         crate::runtime::interpreter::init_primitive_fields(self.shared, main_tg, tg_class);
         let main_idx = self.thread.native_pin_roots.len();
         self.thread.native_pin_roots.push(main_tg);
@@ -3264,11 +3276,13 @@ impl<'a> NativeContextImpl<'a> {
             };
             if let Some(slot) = parent_slot {
                 self.shared
+                    .mem
                     .heap
                     .set_field(main_tg, slot, Value::Object(Some(system_tg)));
             }
             if let Some(slot) = name_slot {
                 self.shared
+                    .mem
                     .heap
                     .set_field(main_tg, slot, Value::Object(Some(main_str)));
             }
@@ -3294,14 +3308,14 @@ impl<'a> NativeContextImpl<'a> {
     /// field through the receiver's own class hierarchy, so it works for Thread
     /// subclasses (BackgroundWriterThread, ForkJoinWorkerThread, …) too.
     pub(crate) fn ensure_thread_interrupt_lock(&mut self, thread_obj: ObjectRef) {
-        let class_id = self.shared.heap.class_id_of(thread_obj);
+        let class_id = self.shared.mem.heap.class_id_of(thread_obj);
         let slot = {
             let cm = self.shared.classes.class_manager.read();
             resolve_field_index_in_hierarchy(class_id, "interruptLock", &cm.class_store)
         };
         let Some(slot) = slot else { return };
         if matches!(
-            self.shared.heap.get_field(thread_obj, slot),
+            self.shared.mem.heap.get_field(thread_obj, slot),
             Value::Object(Some(_))
         ) {
             return;
@@ -3325,10 +3339,11 @@ impl<'a> NativeContextImpl<'a> {
             // address (a stale `thread_obj` would drop the write → null interruptLock).
             let pin_base = self.thread.native_pin_roots.len();
             self.thread.native_pin_roots.push(thread_obj);
-            let lock = self.shared.heap.alloc_object(obj_class, 0);
+            let lock = self.shared.mem.heap.alloc_object(obj_class, 0);
             let thread_obj = self.thread.native_pin_roots[pin_base];
             self.thread.native_pin_roots.truncate(pin_base);
             self.shared
+                .mem
                 .heap
                 .set_field(thread_obj, slot, Value::Object(Some(lock)));
         }
@@ -3465,16 +3480,20 @@ impl NativeThreadBlocker for VmNativeThreadBlocker {
             .threads
             .thread_registry
             .mark_native_thread_blocked(self.thread_id);
-        let pre_stw = self.shared.gc_barrier.mark_blocked_region_enter();
+        let pre_stw = self.shared.mem.gc_barrier.mark_blocked_region_enter();
         if pre_stw {
             // GCAUDIT-0711-FIX (finding 1a): `mark_native_thread_blocked`
             // above already raised `in_blocked_region`, so `_auto`.
-            let _ = self.shared.gc_barrier.arrive_and_wait_auto(self.thread_id);
+            let _ = self
+                .shared
+                .mem
+                .gc_barrier
+                .arrive_and_wait_auto(self.thread_id);
         }
     }
 
     fn leave_blocked(&self) {
-        self.shared.gc_barrier.mark_blocked_region_leave();
+        self.shared.mem.gc_barrier.mark_blocked_region_leave();
         self.shared
             .threads
             .thread_registry
@@ -3495,13 +3514,13 @@ impl NativeThreadBlocker for VmNativeThreadBlocker {
 pub(crate) fn read_java_thread_tid(shared: &SharedVm, thread_obj: ObjectRef) -> Option<u64> {
     // Callers pass mirrors that can be stale (an unpark racing a moving GC);
     // don't dereference anything that isn't a live heap address.
-    shared.heap.is_heap_addr(thread_obj.as_ptr() as usize)?;
-    let header = shared.heap.get_header(thread_obj);
+    shared.mem.heap.is_heap_addr(thread_obj.as_ptr() as usize)?;
+    let header = shared.mem.heap.get_header(thread_obj);
     let slot = {
         let cm = shared.classes.class_manager.read();
         resolve_field_index_in_hierarchy(header.class_id, "tid", &cm.class_store)?
     };
-    match shared.heap.get_field(thread_obj, slot) {
+    match shared.mem.heap.get_field(thread_obj, slot) {
         Value::Long(v) if v > 0 => Some(v as u64),
         _ => None,
     }
@@ -3534,7 +3553,7 @@ fn resolve_thread_id_from_thread_obj(shared: &SharedVm, thread_obj: ObjectRef) -
         .threads
         .thread_registry
         .find_thread_id_by_thread_obj(thread_obj)
-        .or_else(|| match shared.heap.get_field(thread_obj, 2) {
+        .or_else(|| match shared.mem.heap.get_field(thread_obj, 2) {
             Value::Long(id) => Some(ThreadId(id as u64)),
             _ => None,
         })
@@ -3542,14 +3561,14 @@ fn resolve_thread_id_from_thread_obj(shared: &SharedVm, thread_obj: ObjectRef) -
 
 /// Whether an object is the real bootstrap `java/lang/String` class.
 fn is_real_java_string(shared: &SharedVm, object: ObjectRef) -> bool {
-    if shared.heap.kind_of(object) != ObjectKind::Object {
+    if shared.mem.heap.kind_of(object) != ObjectKind::Object {
         return false;
     }
     shared
         .classes
         .class_manager
         .read()
-        .get_class(shared.heap.class_id_of(object))
+        .get_class(shared.mem.heap.class_id_of(object))
         .is_some_and(|class| class.name.as_ref() == "java/lang/String")
 }
 
@@ -3559,19 +3578,20 @@ fn compact_java_string_hash(shared: &SharedVm, object: ObjectRef) -> Option<i32>
         return None;
     }
     let (Value::Object(Some(bytes)), Value::Int(coder)) = (
-        shared.heap.get_field(object, 0),
-        shared.heap.get_field(object, 1),
+        shared.mem.heap.get_field(object, 0),
+        shared.mem.heap.get_field(object, 1),
     ) else {
         return None;
     };
     if !matches!(coder, 0 | 1)
-        || shared.heap.array_element_type(bytes) != Some(ArrayElementType::Byte)
+        || shared.mem.heap.array_element_type(bytes) != Some(ArrayElementType::Byte)
     {
         return None;
     }
-    let ptr = shared.heap.array_data_ptr(bytes)?;
-    let raw =
-        unsafe { std::slice::from_raw_parts(ptr as *const u8, shared.heap.array_length(bytes)) };
+    let ptr = shared.mem.heap.array_data_ptr(bytes)?;
+    let raw = unsafe {
+        std::slice::from_raw_parts(ptr as *const u8, shared.mem.heap.array_length(bytes))
+    };
     let mut hash = 0i32;
     if coder == 0 {
         for &byte in raw {
@@ -3598,36 +3618,36 @@ fn compact_java_strings_equal(shared: &SharedVm, left: ObjectRef, right: ObjectR
     if left == right {
         return true;
     }
-    if shared.heap.class_id_of(left) != shared.heap.class_id_of(right) {
+    if shared.mem.heap.class_id_of(left) != shared.mem.heap.class_id_of(right) {
         return false;
     }
     let (Value::Object(Some(left_bytes)), Value::Int(left_coder)) = (
-        shared.heap.get_field(left, 0),
-        shared.heap.get_field(left, 1),
+        shared.mem.heap.get_field(left, 0),
+        shared.mem.heap.get_field(left, 1),
     ) else {
         return false;
     };
     let (Value::Object(Some(right_bytes)), Value::Int(right_coder)) = (
-        shared.heap.get_field(right, 0),
-        shared.heap.get_field(right, 1),
+        shared.mem.heap.get_field(right, 0),
+        shared.mem.heap.get_field(right, 1),
     ) else {
         return false;
     };
     if !matches!(left_coder, 0 | 1)
         || !matches!(right_coder, 0 | 1)
-        || shared.heap.array_element_type(left_bytes) != Some(ArrayElementType::Byte)
-        || shared.heap.array_element_type(right_bytes) != Some(ArrayElementType::Byte)
+        || shared.mem.heap.array_element_type(left_bytes) != Some(ArrayElementType::Byte)
+        || shared.mem.heap.array_element_type(right_bytes) != Some(ArrayElementType::Byte)
     {
         return false;
     }
     let (Some(left_ptr), Some(right_ptr)) = (
-        shared.heap.array_data_ptr(left_bytes),
-        shared.heap.array_data_ptr(right_bytes),
+        shared.mem.heap.array_data_ptr(left_bytes),
+        shared.mem.heap.array_data_ptr(right_bytes),
     ) else {
         return false;
     };
-    let left_len = shared.heap.array_length(left_bytes);
-    let right_len = shared.heap.array_length(right_bytes);
+    let left_len = shared.mem.heap.array_length(left_bytes);
+    let right_len = shared.mem.heap.array_length(right_bytes);
     let left_raw = unsafe { std::slice::from_raw_parts(left_ptr as *const u8, left_len) };
     let right_raw = unsafe { std::slice::from_raw_parts(right_ptr as *const u8, right_len) };
     if left_coder == right_coder {
@@ -3688,6 +3708,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             .unwrap_or(0);
         let obj_ref = self
             .shared
+            .mem
             .heap
             .try_alloc_object_full(class_id, num_fields)
             .ok_or_else(|| {
@@ -3719,6 +3740,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 .unwrap_or(0);
             let obj_ref = self
                 .shared
+                .mem
                 .heap
                 .try_alloc_object_full(class_id, num_fields)
                 .ok_or_else(|| {
@@ -3793,7 +3815,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 .get_class(class_id)
                 .map(|c| c.num_total_fields)
                 .unwrap_or(0);
-            let obj_ref = self.shared.heap.alloc_object(class_id, num_fields);
+            let obj_ref = self.shared.mem.heap.alloc_object(class_id, num_fields);
             crate::runtime::interpreter::init_primitive_fields(self.shared, obj_ref, class_id);
 
             // Pin across `<init>` exactly like the name-based path above.
@@ -3849,6 +3871,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         if blockgc_dbg() {
             if let Some(new) = self
                 .shared
+                .mem
                 .heap
                 .debug_forwarded_target(obj.as_ptr() as usize)
             {
@@ -3857,7 +3880,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                     // Identify WHAT went stale: read the class off the
                     // forwarded (live) copy.
                     let fwd_ref = unsafe { cratonvm_types::ObjectRef::from_raw(new as *mut u8) };
-                    let fwd_cid = self.shared.heap.class_id_of(fwd_ref);
+                    let fwd_cid = self.shared.mem.heap.class_id_of(fwd_ref);
                     let fwd_class = self
                         .shared
                         .classes
@@ -3945,6 +3968,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         if handle != usize::MAX && blockgc_dbg() {
             if let Some(new) = self
                 .shared
+                .mem
                 .heap
                 .debug_forwarded_target(entry.as_ptr() as usize)
             {
@@ -4090,7 +4114,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 index += 1;
                 continue;
             }
-            let Value::Int(mod_count) = self.shared.heap.get_field(map, entry.mod_count_slot)
+            let Value::Int(mod_count) = self.shared.mem.heap.get_field(map, entry.mod_count_slot)
             else {
                 self.thread.jit_hashmap_string_node_cache.swap_remove(index);
                 continue;
@@ -4099,12 +4123,13 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 self.thread.jit_hashmap_string_node_cache.swap_remove(index);
                 continue;
             }
-            let Value::Object(Some(node_key)) = self.shared.heap.get_field(entry.node, 1) else {
+            let Value::Object(Some(node_key)) = self.shared.mem.heap.get_field(entry.node, 1)
+            else {
                 self.thread.jit_hashmap_string_node_cache.swap_remove(index);
                 continue;
             };
             if compact_java_strings_equal(self.shared, key, node_key) {
-                return Some(self.shared.heap.get_field(entry.node, 2));
+                return Some(self.shared.mem.heap.get_field(entry.node, 2));
             }
             index += 1;
         }
@@ -4119,7 +4144,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 index += 1;
                 continue;
             }
-            let Value::Int(mod_count) = self.shared.heap.get_field(map, entry.mod_count_slot)
+            let Value::Int(mod_count) = self.shared.mem.heap.get_field(map, entry.mod_count_slot)
             else {
                 self.thread.jit_hashmap_string_node_cache.swap_remove(index);
                 continue;
@@ -4128,13 +4153,13 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 self.thread.jit_hashmap_string_node_cache.swap_remove(index);
                 continue;
             }
-            return Some(self.shared.heap.get_field(entry.node, 2));
+            return Some(self.shared.mem.heap.get_field(entry.node, 2));
         }
         None
     }
 
     fn hashmap_string_node_cache_put(&mut self, map: ObjectRef, key: &str, node: ObjectRef) {
-        let class_id = self.shared.heap.class_id_of(map);
+        let class_id = self.shared.mem.heap.class_id_of(map);
         let fields = self.shared.classes.class_manager.read();
         let Some(mod_count_slot) =
             resolve_field_index_in_hierarchy(class_id, "modCount", &fields.class_store)
@@ -4142,7 +4167,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             return;
         };
         drop(fields);
-        let Value::Int(mod_count) = self.shared.heap.get_field(map, mod_count_slot) else {
+        let Value::Int(mod_count) = self.shared.mem.heap.get_field(map, mod_count_slot) else {
             return;
         };
         if let Some(entry) = self
@@ -4268,7 +4293,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // What remains here is now just a last-resort guard against a 0
         // making it back out of the heap at all (it shouldn't, but this
         // keeps the "never 0" contract airtight regardless).
-        match self.shared.heap.identity_hash_code(obj) {
+        match self.shared.mem.heap.identity_hash_code(obj) {
             0 => i32::MAX,
             h => h,
         }
@@ -4280,14 +4305,14 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         method_name: &str,
         descriptor: &str,
     ) -> bool {
-        let receiver = self.shared.heap.load_and_forward(receiver);
+        let receiver = self.shared.mem.heap.load_and_forward(receiver);
         self.thread.frames.iter().rev().any(|frame| {
             if frame.method_name() != method_name || frame.method_descriptor() != descriptor {
                 return false;
             }
             matches!(
                 frame.get_local(0),
-                Value::Object(Some(this)) if self.shared.heap.load_and_forward(this) == receiver
+                Value::Object(Some(this)) if self.shared.mem.heap.load_and_forward(this) == receiver
             )
         })
     }
@@ -4306,7 +4331,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // their `static final` holder slots remap correctly across a move.
         // Keyed by identity hash (stable across moves) for dedup.
         let key = self.identity_hash_code(vh);
-        self.shared.var_handle_roots.write().insert(key, vh);
+        self.shared.mem.var_handle_roots.write().insert(key, vh);
     }
 
     fn read_var_handle_root(&self, identity_key: i32) -> Option<ObjectRef> {
@@ -4314,6 +4339,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // ObjectRef copies cached in native statics do NOT get rewritten, so
         // long-lived native singletons re-read the current address here.
         self.shared
+            .mem
             .var_handle_roots
             .read()
             .get(&identity_key)
@@ -4334,11 +4360,11 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     }
 
     fn class_id_of_object(&self, obj: ObjectRef) -> ClassId {
-        self.shared.heap.class_id_of(obj)
+        self.shared.mem.heap.class_id_of(obj)
     }
 
     fn fast_unbox_primitive_wrapper(&self, obj: ObjectRef) -> Option<Option<Value>> {
-        let class_id = self.shared.heap.class_id_of(obj);
+        let class_id = self.shared.mem.heap.class_id_of(obj);
         let vm_key = self.shared as *const SharedVm as usize;
         let cached =
             PRIMITIVE_WRAPPER_CLASS_CACHE.with(|cache| cache.get() == Some((vm_key, class_id)));
@@ -4373,7 +4399,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         if !is_wrapper {
             return Some(None);
         }
-        Some(match self.shared.heap.get_field(obj, 0) {
+        Some(match self.shared.mem.heap.get_field(obj, 0) {
             value @ (Value::Int(_) | Value::Long(_) | Value::Float(_) | Value::Double(_)) => {
                 Some(value)
             }
@@ -4668,7 +4694,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         #[cfg(feature = "gpu-offload")]
         {
             use crate::classloading::resolution::MethodHandleKind;
-            let cid = self.shared.heap.class_id_of(callable);
+            let cid = self.shared.mem.heap.class_id_of(callable);
             let proxies = self.shared.classes.lambda_proxies.read();
             let lcs = proxies.get(&cid)?;
             // Phase 9 #2 — admit InvokeStatic, InvokeVirtual, and
@@ -4703,7 +4729,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             drop(proxies);
             let mut captures = Vec::with_capacity(n_captures);
             for i in 0..n_captures {
-                captures.push(self.shared.heap.get_field(callable, i));
+                captures.push(self.shared.mem.heap.get_field(callable, i));
             }
             Some((class_name, member_name, descriptor, captures))
         }
@@ -4837,10 +4863,10 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // the raw storage happens to hold. Missing class metadata or an
         // unknown slot falls back to the legacy raw read via
         // `coerce_field_value_by_descriptor`'s default arm.
-        let class_id = self.shared.heap.class_id_of(obj);
+        let class_id = self.shared.mem.heap.class_id_of(obj);
         match resolve_field_descriptor_byte_cached(self.shared, class_id, index) {
-            Some(desc) => self.shared.heap.get_field_as(obj, index, desc),
-            None => self.shared.heap.get_field(obj, index),
+            Some(desc) => self.shared.mem.heap.get_field_as(obj, index, desc),
+            None => self.shared.mem.heap.get_field(obj, index),
         }
     }
 
@@ -4850,7 +4876,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // GC completed INSIDE a plain ref store (and names the stack);
         // zero deltas across a firing run pins all staleness on producers.
         let epoch_entry = if blockgc_dbg() {
-            Some(self.shared.heap.debug_minor_gc_count())
+            Some(self.shared.mem.heap.debug_minor_gc_count())
         } else {
             None
         };
@@ -4878,7 +4904,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             }
         }
         let _epoch_guard = EpochGuard {
-            heap: &self.shared.heap,
+            heap: &self.shared.mem.heap,
             entry: epoch_entry,
         };
         // bc math-ec 0x4 (CRATONVM_DBG_STRAYSTACK): a NATIVE writing through a
@@ -4886,7 +4912,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // header signature as the interpreter putfield check. Dumps the native
         // caller's Java stack so we can trace the cached-receiver use-after-move.
         if youngscan_straystack_enabled() {
-            let h = self.shared.heap.get_header(obj);
+            let h = self.shared.mem.heap.get_header(obj);
             if index >= h.num_slots() as usize || h.num_slots() > (1 << 24) {
                 use std::sync::atomic::{AtomicUsize, Ordering};
                 static N: AtomicUsize = AtomicUsize::new(0);
@@ -4930,7 +4956,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // `Value` variant to the declared field type prevents tag drift
         // from leaking across subsequent reads. Fallback: legacy
         // `set_field` when the descriptor is unresolvable.
-        let class_id = self.shared.heap.class_id_of(obj);
+        let class_id = self.shared.mem.heap.class_id_of(obj);
         match resolve_field_descriptor_byte_cached(self.shared, class_id, index) {
             Some(desc) => {
                 // Overlay-corruption hunter (CRATONVM_DBG_OVERLAY): a native
@@ -4950,31 +4976,31 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                         desc,
                     );
                 }
-                self.shared.heap.set_field_as(obj, index, value, desc)
+                self.shared.mem.heap.set_field_as(obj, index, value, desc)
             }
-            None => self.shared.heap.set_field(obj, index, value),
+            None => self.shared.mem.heap.set_field(obj, index, value),
         }
         // write_barrier fires automatically inside set_field / set_field_as
     }
 
     fn get_field_by_name(&self, obj: ObjectRef, field_name: &str) -> Value {
-        let class_id = self.shared.heap.class_id_of(obj);
+        let class_id = self.shared.mem.heap.class_id_of(obj);
         let cm = self.shared.classes.class_manager.read();
         if let Some(index) = resolve_field_index_in_hierarchy(class_id, field_name, &cm.class_store)
         {
-            self.shared.heap.get_field(obj, index)
+            self.shared.mem.heap.get_field(obj, index)
         } else {
             Value::Object(None)
         }
     }
 
     fn set_field_by_name(&self, obj: ObjectRef, field_name: &str, value: Value) {
-        let class_id = self.shared.heap.class_id_of(obj);
+        let class_id = self.shared.mem.heap.class_id_of(obj);
         let cm = self.shared.classes.class_manager.read();
         if let Some(index) = resolve_field_index_in_hierarchy(class_id, field_name, &cm.class_store)
         {
             drop(cm);
-            self.shared.heap.set_field(obj, index, value);
+            self.shared.mem.heap.set_field(obj, index, value);
             // write_barrier fires automatically inside set_field
         }
     }
@@ -5050,7 +5076,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // the offending call site is pinned. is_heap_addr is region-membership
         // only (no header read) so it is safe on an arbitrary address.
         if std::env::var_os("CRATONVM_DBG_HEAPCOPY").is_some()
-            && self.shared.heap.is_heap_addr(addr as usize).is_some()
+            && self.shared.mem.heap.is_heap_addr(addr as usize).is_some()
         {
             let n = data.len().min(16);
             eprintln!(
@@ -5144,10 +5170,12 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     fn new_array(&mut self, element_type: ArrayElementType, length: usize) -> ObjectRef {
         let array = self
             .shared
+            .mem
             .heap
             .alloc_array(ClassId::new(0), element_type, length);
-        if crate::runtime::env_cache::disable_jit() && self.shared.heap.needs_gc() {
+        if crate::runtime::env_cache::disable_jit() && self.shared.mem.heap.needs_gc() {
             self.shared
+                .mem
                 .native_array_gc_requested
                 .store(true, std::sync::atomic::Ordering::Relaxed);
         }
@@ -5169,10 +5197,12 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         }
         let array = self
             .shared
+            .mem
             .heap
             .alloc_array(class_id, ArrayElementType::Reference, length);
-        if crate::runtime::env_cache::disable_jit() && self.shared.heap.needs_gc() {
+        if crate::runtime::env_cache::disable_jit() && self.shared.mem.heap.needs_gc() {
             self.shared
+                .mem
                 .native_array_gc_requested
                 .store(true, std::sync::atomic::Ordering::Relaxed);
         }
@@ -5185,6 +5215,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // aborting, so native callers (e.g. `ArrayList(int)`) can raise a
         // catchable OutOfMemoryError matching HotSpot.
         self.shared
+            .mem
             .heap
             .try_alloc_array_full(class_id, ArrayElementType::Reference, length)
     }
@@ -5197,6 +5228,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // Fallible sibling of `new_array` (primitive arrays) — see
         // `try_new_ref_array`.
         self.shared
+            .mem
             .heap
             .try_alloc_array_full(ClassId::new(0), element_type, length)
     }
@@ -5214,13 +5246,13 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
 
     #[track_caller]
     fn array_length(&self, obj: ObjectRef) -> usize {
-        let kind = self.shared.heap.kind_of(obj);
+        let kind = self.shared.mem.heap.kind_of(obj);
         if kind != ObjectKind::Array {
             // Only emit the (noisy) diagnostic when explicitly requested — the
             // `#[track_caller]` location pinpoints the offending native/opcode
             // far more reliably than the previously-broken symbolized backtrace.
             if std::env::var("CRATONVM_DBG_ARRLEN").is_ok() {
-                let class_id = self.shared.heap.class_id_of(obj);
+                let class_id = self.shared.mem.heap.class_id_of(obj);
                 let class_name = self
                     .shared
                     .classes
@@ -5251,22 +5283,23 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             }
             return 0;
         }
-        self.shared.heap.array_length(obj)
+        self.shared.mem.heap.array_length(obj)
     }
 
     fn get_array_element(&self, obj: ObjectRef, index: usize) -> Value {
         self.shared
+            .mem
             .heap
             .get_array_element_unboxing(obj, index)
             .unwrap_or(Value::Int(0))
     }
 
     fn object_is_array(&self, obj: ObjectRef) -> bool {
-        self.shared.heap.kind_of(obj) == ObjectKind::Array
+        self.shared.mem.heap.kind_of(obj) == ObjectKind::Array
     }
 
     fn set_array_element(&self, obj: ObjectRef, index: usize, value: Value) {
-        let _ = self.shared.heap.set_array_element(obj, index, value);
+        let _ = self.shared.mem.heap.set_array_element(obj, index, value);
         // write_barrier fires automatically inside set_array_element for ref arrays
     }
 
@@ -5289,14 +5322,14 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // bounds check up front; callers may rely on `true` meaning the
         // full slice was written and `false` meaning nothing was written.
         // Verify destination is a byte/boolean array (both store 1 byte per element).
-        if self.shared.heap.kind_of(arr) != ObjectKind::Array {
+        if self.shared.mem.heap.kind_of(arr) != ObjectKind::Array {
             return false;
         }
-        let et = self.shared.heap.element_type_of(arr);
+        let et = self.shared.mem.heap.element_type_of(arr);
         if !matches!(et, ArrayElementType::Byte | ArrayElementType::Boolean) {
             return false;
         }
-        let len = self.shared.heap.array_length(arr);
+        let len = self.shared.mem.heap.array_length(arr);
         let end = match dst_off.checked_add(src.len()) {
             Some(e) => e,
             None => return false,
@@ -5315,7 +5348,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // by a Rust-side `&mut [u8]`). The destination range is
         // `[dst_off, dst_off + src.len())` which lies wholly within the
         // array's payload of `len` bytes.
-        match self.shared.heap.array_data_ptr(arr) {
+        match self.shared.mem.heap.array_data_ptr(arr) {
             Some(base) => unsafe {
                 // gcstress face-1 hunt (no-op unless CRATONVM_DBG_WATCH_CELL set).
                 cratonvm_gc::heap::cell_watch_check(
@@ -5334,6 +5367,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 for (i, &b) in src.iter().enumerate() {
                     if self
                         .shared
+                        .mem
                         .heap
                         .set_array_element(arr, dst_off + i, Value::Int(b as i8 as i32))
                         .is_err()
@@ -5347,14 +5381,14 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     }
 
     fn read_byte_array_into(&self, arr: ObjectRef, src_off: usize, dst: &mut [u8]) -> usize {
-        if self.shared.heap.kind_of(arr) != ObjectKind::Array {
+        if self.shared.mem.heap.kind_of(arr) != ObjectKind::Array {
             return 0;
         }
-        let et = self.shared.heap.element_type_of(arr);
+        let et = self.shared.mem.heap.element_type_of(arr);
         if !matches!(et, ArrayElementType::Byte | ArrayElementType::Boolean) {
             return 0;
         }
-        let len = self.shared.heap.array_length(arr);
+        let len = self.shared.mem.heap.array_length(arr);
         if src_off > len {
             return 0;
         }
@@ -5367,7 +5401,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // `n <= dst.len()`). Source pointer comes from `array_data_ptr`
         // (compact 1-byte-per-element payload). Destination is a caller-
         // owned `&mut [u8]` which cannot alias the heap arena.
-        match self.shared.heap.array_data_ptr(arr) {
+        match self.shared.mem.heap.array_data_ptr(arr) {
             Some(base) => unsafe {
                 std::ptr::copy_nonoverlapping(base.add(src_off), dst.as_mut_ptr(), n);
             },
@@ -5376,7 +5410,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             // 8-bit value.
             None => {
                 for (i, slot) in dst.iter_mut().take(n).enumerate() {
-                    match self.shared.heap.get_array_element(arr, src_off + i) {
+                    match self.shared.mem.heap.get_array_element(arr, src_off + i) {
                         Ok(Value::Int(x)) => *slot = x as u8,
                         _ => return i,
                     }
@@ -5387,13 +5421,13 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     }
 
     fn read_char_array_into(&self, arr: ObjectRef, src_off: usize, dst: &mut [u16]) -> usize {
-        if self.shared.heap.kind_of(arr) != ObjectKind::Array {
+        if self.shared.mem.heap.kind_of(arr) != ObjectKind::Array {
             return 0;
         }
-        if self.shared.heap.element_type_of(arr) != ArrayElementType::Char {
+        if self.shared.mem.heap.element_type_of(arr) != ArrayElementType::Char {
             return 0;
         }
-        let len = self.shared.heap.array_length(arr);
+        let len = self.shared.mem.heap.array_length(arr);
         if src_off > len {
             return 0;
         }
@@ -5408,7 +5442,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // Same host-endian convention as `VmHeap::read_char_array_bulk`,
         // which already uses `copy_nonoverlapping` between this payload and
         // a host `[u16]`.
-        match self.shared.heap.array_data_ptr(arr) {
+        match self.shared.mem.heap.array_data_ptr(arr) {
             Some(base) => unsafe {
                 std::ptr::copy_nonoverlapping(
                     base.add(src_off * 2),
@@ -5420,7 +5454,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             // decode to `Value::Int(u16 as i32)`; mask back to the code unit.
             None => {
                 for (i, slot) in dst.iter_mut().take(n).enumerate() {
-                    match self.shared.heap.get_array_element(arr, src_off + i) {
+                    match self.shared.mem.heap.get_array_element(arr, src_off + i) {
                         Ok(Value::Int(x)) => *slot = x as u16,
                         _ => return i,
                     }
@@ -5434,13 +5468,13 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // AUDIT 2026-05-17: symmetric to `read_char_array_into` above.
         // Used by `stream_decoder::refill` to populate the read-ahead
         // char buffer in one `memcpy` instead of N virtual dispatches.
-        if self.shared.heap.kind_of(arr) != ObjectKind::Array {
+        if self.shared.mem.heap.kind_of(arr) != ObjectKind::Array {
             return false;
         }
-        if self.shared.heap.element_type_of(arr) != ArrayElementType::Char {
+        if self.shared.mem.heap.element_type_of(arr) != ArrayElementType::Char {
             return false;
         }
-        let len = self.shared.heap.array_length(arr);
+        let len = self.shared.mem.heap.array_length(arr);
         let end = match dst_off.checked_add(src.len()) {
             Some(e) => e,
             None => return false,
@@ -5453,7 +5487,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         }
         // SAFETY: bounds checked above. Char arrays store 2 bytes per
         // element matching host-endian `u16` (see `read_char_array_into`).
-        match self.shared.heap.array_data_ptr(arr) {
+        match self.shared.mem.heap.array_data_ptr(arr) {
             Some(base) => unsafe {
                 std::ptr::copy_nonoverlapping(
                     src.as_ptr() as *const u8,
@@ -5467,6 +5501,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 for (i, &c) in src.iter().enumerate() {
                     if self
                         .shared
+                        .mem
                         .heap
                         .set_array_element(arr, dst_off + i, Value::Int(c as i32))
                         .is_err()
@@ -5490,13 +5525,13 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         if len == 0 {
             return true;
         }
-        if self.shared.heap.kind_of(src) != ObjectKind::Array
-            || self.shared.heap.kind_of(dst) != ObjectKind::Array
+        if self.shared.mem.heap.kind_of(src) != ObjectKind::Array
+            || self.shared.mem.heap.kind_of(dst) != ObjectKind::Array
         {
             return false;
         }
-        let src_et = self.shared.heap.element_type_of(src);
-        let dst_et = self.shared.heap.element_type_of(dst);
+        let src_et = self.shared.mem.heap.element_type_of(src);
+        let dst_et = self.shared.mem.heap.element_type_of(dst);
         // Primitive arrays only — reference arrays need per-element store
         // checks (ArrayStoreException) and the GC write barrier, which we
         // intentionally do not bypass here.
@@ -5510,8 +5545,8 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             ArrayElementType::Long | ArrayElementType::Double => 8,
             ArrayElementType::Reference => return false, // unreachable, guarded above
         };
-        let src_len = self.shared.heap.array_length(src);
-        let dst_len = self.shared.heap.array_length(dst);
+        let src_len = self.shared.mem.heap.array_length(src);
+        let dst_len = self.shared.mem.heap.array_length(dst);
         let src_end = match src_off.checked_add(len) {
             Some(e) => e,
             None => return false,
@@ -5536,8 +5571,8 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // per-element copy through `get_array_element` / `set_array_element`
         // (both route humongous objects through `humongous_copy`).
         match (
-            self.shared.heap.array_data_ptr(src),
-            self.shared.heap.array_data_ptr(dst),
+            self.shared.mem.heap.array_data_ptr(src),
+            self.shared.mem.heap.array_data_ptr(dst),
         ) {
             (Some(src_base), Some(dst_base)) => unsafe {
                 let src_ptr = src_base.add(src_off * stride);
@@ -5551,10 +5586,11 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 let same_array = src.as_ptr() == dst.as_ptr();
                 if same_array && dst_off > src_off {
                     for i in (0..len).rev() {
-                        match self.shared.heap.get_array_element(src, src_off + i) {
+                        match self.shared.mem.heap.get_array_element(src, src_off + i) {
                             Ok(v) => {
                                 if self
                                     .shared
+                                    .mem
                                     .heap
                                     .set_array_element(dst, dst_off + i, v)
                                     .is_err()
@@ -5567,10 +5603,11 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                     }
                 } else {
                     for i in 0..len {
-                        match self.shared.heap.get_array_element(src, src_off + i) {
+                        match self.shared.mem.heap.get_array_element(src, src_off + i) {
                             Ok(v) => {
                                 if self
                                     .shared
+                                    .mem
                                     .heap
                                     .set_array_element(dst, dst_off + i, v)
                                     .is_err()
@@ -5588,11 +5625,11 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     }
 
     fn heap_kind_of(&self, obj: ObjectRef) -> ObjectKind {
-        self.shared.heap.kind_of(obj)
+        self.shared.mem.heap.kind_of(obj)
     }
 
     fn heap_element_type_of(&self, obj: ObjectRef) -> ArrayElementType {
-        self.shared.heap.element_type_of(obj)
+        self.shared.mem.heap.element_type_of(obj)
     }
 
     fn create_string(&mut self, text: &str) -> ObjectRef {
@@ -5613,14 +5650,17 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         const STRING_ALLOCATION_HEADROOM: usize = 256;
         if !self
             .shared
+            .mem
             .heap
             .young_bump_headroom(STRING_ALLOCATION_HEADROOM)
             && !self
                 .shared
+                .mem
                 .heap
                 .young_has_free_block(STRING_ALLOCATION_HEADROOM)
         {
             self.shared
+                .mem
                 .gc_requested
                 .store(true, std::sync::atomic::Ordering::Relaxed);
             crate::runtime::interpreter::maybe_gc(self.shared, self.thread);
@@ -5699,10 +5739,10 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     }
 
     fn read_string(&self, obj: ObjectRef) -> Option<String> {
-        let class_id = self.shared.heap.class_id_of(obj);
+        let class_id = self.shared.mem.heap.class_id_of(obj);
         // Reference arrays carry their component class ID; a String[] is not
         // a String.
-        if self.shared.heap.kind_of(obj) != ObjectKind::Object {
+        if self.shared.mem.heap.kind_of(obj) != ObjectKind::Object {
             return None;
         }
         // Guard by class identity BEFORE the structural reader. `read_java_string`
@@ -5725,24 +5765,24 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 }
             }
         }
-        if let Some(s) = super::read_java_string(&self.shared.heap, obj) {
+        if let Some(s) = super::read_java_string(&self.shared.mem.heap, obj) {
             return Some(s);
         }
         let cm = self.shared.classes.class_manager.read();
         let vidx = resolve_field_index_in_hierarchy(class_id, "value", &cm.class_store)?;
         let cidx = resolve_field_index_in_hierarchy(class_id, "coder", &cm.class_store);
         drop(cm);
-        let value_array = match self.shared.heap.get_field(obj, vidx) {
+        let value_array = match self.shared.mem.heap.get_field(obj, vidx) {
             Value::Object(Some(a)) => a,
             _ => return None,
         };
         let coder = cidx
-            .map(|idx| match self.shared.heap.get_field(obj, idx) {
+            .map(|idx| match self.shared.mem.heap.get_field(obj, idx) {
                 Value::Int(c) => c,
                 _ => 0,
             })
             .unwrap_or(0);
-        super::vm_object::decode_java_string_value_array(&self.shared.heap, value_array, coder)
+        super::vm_object::decode_java_string_value_array(&self.shared.mem.heap, value_array, coder)
     }
 
     fn get_class_mirror(&mut self, class_id: ClassId) -> ObjectRef {
@@ -5850,6 +5890,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 if cached != 0 {
                     return self
                         .shared
+                        .mem
                         .heap
                         .alloc_object(ClassId::new(cached), num_fields);
                 }
@@ -6023,6 +6064,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         if self.thread.native_alloc_pool.is_empty() {
             let mut batch = self
                 .shared
+                .mem
                 .heap
                 .try_alloc_objects_old_batch(class_id, slots, 2048);
             if let Some(obj) = batch.pop() {
@@ -6035,7 +6077,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 return obj;
             }
         }
-        self.shared.heap.alloc_object(class_id, slots)
+        self.shared.mem.heap.alloc_object(class_id, slots)
     }
 
     fn ensure_class_initialized(&mut self, name: &str) -> Result<ClassId, MethodCallFailed> {
@@ -6409,7 +6451,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     }
 
     fn object_num_fields(&self, obj: ObjectRef) -> usize {
-        self.shared.heap.get_header(obj).num_slots() as usize
+        self.shared.mem.heap.get_header(obj).num_slots() as usize
     }
 
     fn class_num_total_fields(&self, class_id: ClassId) -> usize {
@@ -6563,7 +6605,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // (TLAB already retired above, before the root-snapshot deposit —
         // see the GCAUDIT-0711-FIX comment there.)
         let was_interrupted = {
-            let blk = self.shared.gc_barrier.enter_blocked();
+            let blk = self.shared.mem.gc_barrier.enter_blocked();
             if blk.pre_stw {
                 // A STW was already in progress when we became blocked —
                 // arrive at the barrier so its `wait_for_all` completes.
@@ -6588,6 +6630,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 // only the `arrived` quota bookkeeping differs.
                 let pm = self
                     .shared
+                    .mem
                     .gc_barrier
                     .arrive_and_wait_auto(self.thread.thread_id);
                 if let Some(&new) = pm.get(&(obj.as_ptr() as usize)) {
@@ -6680,18 +6723,18 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     fn thread_start(&mut self, thread_obj: ObjectRef) -> MethodCallResult {
         let shared_arc = self.shared.get_arc();
         let tid = self.shared.threads.thread_registry.next_thread_id();
-        let header = self.shared.heap.get_header(thread_obj);
+        let header = self.shared.mem.heap.get_header(thread_obj);
 
         // Read thread name from the real-JDK `name` field, falling back to the
         // legacy synthetic slot 0 layout.
         let name_value = {
             let cm = self.shared.classes.class_manager.read();
             resolve_field_index_in_hierarchy(header.class_id, "name", &cm.class_store)
-                .map(|slot| self.shared.heap.get_field(thread_obj, slot))
+                .map(|slot| self.shared.mem.heap.get_field(thread_obj, slot))
         }
-        .unwrap_or_else(|| self.shared.heap.get_field(thread_obj, 0));
+        .unwrap_or_else(|| self.shared.mem.heap.get_field(thread_obj, 0));
         let name = match name_value {
-            Value::Object(Some(str_ref)) => super::read_java_string(&self.shared.heap, str_ref)
+            Value::Object(Some(str_ref)) => super::read_java_string(&self.shared.mem.heap, str_ref)
                 .unwrap_or_else(|| format!("Thread-{}", tid.0)),
             _ => format!("Thread-{}", tid.0),
         };
@@ -6710,7 +6753,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         //      release the carrier semaphore on `Thread.sleep`/`park`,
         //      starving the carrier pool under load (e.g. 10K vthreads).
         let is_virtual_synthetic = header.num_slots() >= 5
-            && matches!(self.shared.heap.get_field(thread_obj, 4), Value::Int(1));
+            && matches!(self.shared.mem.heap.get_field(thread_obj, 4), Value::Int(1));
         let is_virtual_real_jdk = {
             let cm = self.shared.classes.class_manager.read();
             // Look up `BaseVirtualThread`'s class id once. If not loaded
@@ -6811,6 +6854,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         };
         if !is_real_jdk_thread && header.num_slots() >= 3 {
             self.shared
+                .mem
                 .heap
                 .set_field(thread_obj, 2, Value::Long(tid.0 as i64));
         }
@@ -6988,24 +7032,24 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             shared_arc.threads.thread_registry.set_os_tid_current(tid);
             jvm_thread.set_vm_state("thread-start:registered");
             loop {
-                let marked_ready = shared_arc.gc_barrier.run_if_no_stw_requested(|| {
+                let marked_ready = shared_arc.mem.gc_barrier.run_if_no_stw_requested(|| {
                     shared_arc.threads.thread_registry.mark_stw_ready(tid);
                 });
                 if marked_ready {
                     break;
                 }
 
-                let pointer_map = shared_arc.gc_barrier.arrive_and_wait_excluded(tid);
+                let pointer_map = shared_arc.mem.gc_barrier.arrive_and_wait_excluded(tid);
                 if !pointer_map.is_empty() {
                     crate::runtime::interpreter::apply_pointer_map_to_thread(
                         &mut jvm_thread,
                         &pointer_map,
-                        &shared_arc.heap,
+                        &shared_arc.mem.heap,
                     );
                 }
             }
             if shared_arc
-                .gc_barrier
+                .mem.gc_barrier
                 .stw_requested
                 .load(std::sync::atomic::Ordering::Acquire)
             {
@@ -7030,7 +7074,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 .threads.thread_registry
                 .java_thread_obj(tid)
                 .unwrap_or(thread_obj_for_spawn);
-            let recv_cid = shared_arc.heap.class_id_of(run_thread_obj);
+            let recv_cid = shared_arc.mem.heap.class_id_of(run_thread_obj);
             // Gated diagnostic (CRATONVM_DBG_THREADSTART): log each spawned
             // thread's run-class on entry and its result on exit — surfaces
             // threads that never start their target or block inside run().
@@ -7050,7 +7094,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             let _ = super::ensure_class_initialized_shared(&shared_arc, &mut jvm_thread, recv_cid);
             jvm_thread.set_vm_state("thread-start:invoke-run");
             if shared_arc
-                .gc_barrier
+                .mem.gc_barrier
                 .stw_requested
                 .load(std::sync::atomic::Ordering::Acquire)
             {
@@ -7120,7 +7164,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                     // the uncaught exception's reported class. Always drain
                     // the slot so a leftover can't poison a later event.
                     let pending_return = jvm_thread.native_pending_return.take();
-                    let exc = if shared_arc.heap.is_object_address(exc.as_ptr() as usize).is_some() {
+                    let exc = if shared_arc.mem.heap.is_object_address(exc.as_ptr() as usize).is_some() {
                         *exc
                     } else {
                         pending_return.unwrap_or(*exc)
@@ -7144,7 +7188,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                     jvm_thread.native_pin_roots.push(exc);
                     let exc_ref = jvm_thread.native_pin_roots[pin_base];
                     if std::env::var_os("CRATONVM_DBG_UNCAUGHT").is_some() {
-                        let cid = shared_arc.heap.class_id_of(exc_ref);
+                        let cid = shared_arc.mem.heap.class_id_of(exc_ref);
                         let cname = shared_arc
                             .classes.class_manager
                             .read()
@@ -7162,7 +7206,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                         .ok()
                         .flatten()
                         .and_then(|v| match v {
-                            Value::Object(Some(s)) => super::read_java_string(&shared_arc.heap, s),
+                            Value::Object(Some(s)) => super::read_java_string(&shared_arc.mem.heap, s),
                             _ => None,
                         })
                         .unwrap_or_else(|| "<toString unavailable>".to_string());
@@ -7310,7 +7354,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                             thread: &mut jvm_thread,
                         }
                         .deposit_root_snapshot();
-                        let blk = shared_arc.gc_barrier.enter_blocked();
+                        let blk = shared_arc.mem.gc_barrier.enter_blocked();
                         if blk.pre_stw {
                             // GCAUDIT-0711-FIX (finding 1a): `_auto` for
                             // uniformity with every other barrier arrival —
@@ -7319,7 +7363,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                             // excluded us; only the exclusion snapshot the
                             // census recorded (not this thread's guess) can
                             // say which.
-                            let _ = shared_arc.gc_barrier.arrive_and_wait_auto(tid);
+                            let _ = shared_arc.mem.gc_barrier.arrive_and_wait_auto(tid);
                         }
                         monitor.block_enter(tid);
                         drop(blk);
@@ -7346,7 +7390,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             // take its only gray-source to the grave, and cleanup could then
             // free a live region. Cheap no-op when no marking cycle is
             // active.
-            shared_arc.heap.flush_thread_satb();
+            shared_arc.mem.heap.flush_thread_satb();
 
             // CRIT (multi-thread STW deadlock / undercount): transition from
             // alive mutator to dead thread through the blocked-region protocol.
@@ -7365,11 +7409,11 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             // `finish_after` serializes `mark_dead` with `request_stw_counted`,
             // so a GC initiator cannot observe this thread as both dead and
             // still included in `threads_blocked`.
-            let term_blk = shared_arc.gc_barrier.enter_blocked();
+            let term_blk = shared_arc.mem.gc_barrier.enter_blocked();
             if term_blk.pre_stw {
                 // GCAUDIT-0711-FIX (finding 1a): `_auto` for uniformity —
                 // see the identical note a few lines up.
-                let _ = shared_arc.gc_barrier.arrive_and_wait_auto(tid);
+                let _ = shared_arc.mem.gc_barrier.arrive_and_wait_auto(tid);
             }
             term_blk.finish_after(|| {
                 // BUG-03 — stop publishing this worker's TLAB address before
@@ -7439,12 +7483,13 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // Deposit root snapshot before blocking so GC can scan this thread
         self.deposit_root_snapshot();
         {
-            let blk = self.shared.gc_barrier.enter_blocked();
+            let blk = self.shared.mem.gc_barrier.enter_blocked();
             if blk.pre_stw {
                 // GCAUDIT-0711-FIX (finding 1a): `_auto` — the deposit above
                 // already raised `in_blocked_region` before this check.
                 let _ = self
                     .shared
+                    .mem
                     .gc_barrier
                     .arrive_and_wait_auto(self.thread.thread_id);
             }
@@ -7517,7 +7562,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         let thread_id =
             read_java_thread_tid(self.shared, thread_obj).unwrap_or(registry_tid.0) as i64;
         let thread_name = match self.get_field_by_name(thread_obj, "name") {
-            Value::Object(Some(name)) => super::read_java_string(&self.shared.heap, name),
+            Value::Object(Some(name)) => super::read_java_string(&self.shared.mem.heap, name),
             _ => None,
         }
         .unwrap_or_else(|| format!("Thread-{thread_id}"));
@@ -7594,7 +7639,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // `currentThread().getThreadGroup()` then NPEs ("this.holder is null").
         // FIX: keep `thread_obj` in sync with the GC-remapped field by re-reading it
         // after every allocating step (the field is the authoritative live address).
-        let mut thread_obj = self.shared.heap.alloc_object(class_id, num_fields);
+        let mut thread_obj = self.shared.mem.heap.alloc_object(class_id, num_fields);
         if is_real_jdk {
             crate::runtime::interpreter::init_primitive_fields(self.shared, thread_obj, class_id);
         }
@@ -7628,6 +7673,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             };
             if let Some(slot) = name_slot {
                 self.shared
+                    .mem
                     .heap
                     .set_field(thread_obj, slot, Value::Object(Some(name_str)));
             }
@@ -7652,13 +7698,17 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 // per-process uniqueness and positivity of threadId().
                 let tid = (1i64 << 40) + self.thread.thread_id.0 as i64;
                 self.shared
+                    .mem
                     .heap
                     .set_field(thread_obj, slot, Value::Long(tid));
             }
             if let Some(slot) = priority_slot {
                 // In JDK 19+ priority lives on FieldHolder, but older
                 // (or stubbed) Thread layouts keep the outer field.
-                self.shared.heap.set_field(thread_obj, slot, Value::Int(5));
+                self.shared
+                    .mem
+                    .heap
+                    .set_field(thread_obj, slot, Value::Int(5));
             }
             if let Some(slot) = holder_slot {
                 if let Some(holder) = self.build_thread_field_holder() {
@@ -7669,17 +7719,18 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                     // holder==null (the BUG-03 crash).
                     thread_obj = self.thread.java_thread_obj.unwrap_or(thread_obj);
                     self.shared
+                        .mem
                         .heap
                         .set_field(thread_obj, slot, Value::Object(Some(holder)));
                     if let Some(group_slot) = group_slot {
                         let holder_group = {
                             let cm = self.shared.classes.class_manager.read();
-                            let holder_class = self.shared.heap.class_id_of(holder);
+                            let holder_class = self.shared.mem.heap.class_id_of(holder);
                             resolve_field_index_in_hierarchy(holder_class, "group", &cm.class_store)
-                                .map(|slot| self.shared.heap.get_field(holder, slot))
+                                .map(|slot| self.shared.mem.heap.get_field(holder, slot))
                         };
                         if let Some(Value::Object(Some(group))) = holder_group {
-                            self.shared.heap.set_field(
+                            self.shared.mem.heap.set_field(
                                 thread_obj,
                                 group_slot,
                                 Value::Object(Some(group)),
@@ -7694,6 +7745,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                     // bypassing Thread.getThreadGroup()/holder.group.
                     thread_obj = self.thread.java_thread_obj.unwrap_or(thread_obj);
                     self.shared
+                        .mem
                         .heap
                         .set_field(thread_obj, slot, Value::Object(Some(group)));
                 }
@@ -7719,6 +7771,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                     // System-CL construction allocates → may relocate the mirror.
                     thread_obj = self.thread.java_thread_obj.unwrap_or(thread_obj);
                     self.shared
+                        .mem
                         .heap
                         .set_field(thread_obj, slot, Value::Object(Some(loader)));
                 }
@@ -7740,10 +7793,12 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // (same BUG-03 hazard as the real-JDK path).
         thread_obj = self.thread.java_thread_obj.unwrap_or(thread_obj);
         self.shared
+            .mem
             .heap
             .set_field(thread_obj, 0, Value::Object(Some(name_str)));
-        self.shared.heap.set_field(thread_obj, 1, Value::Int(5)); // NORM_PRIORITY
+        self.shared.mem.heap.set_field(thread_obj, 1, Value::Int(5)); // NORM_PRIORITY
         self.shared
+            .mem
             .heap
             .set_field(thread_obj, 2, Value::Long(self.thread.thread_id.0 as i64));
         thread_obj
@@ -8067,7 +8122,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     }
 
     fn heap_allocated_bytes(&self) -> usize {
-        self.shared.heap.allocated_bytes()
+        self.shared.mem.heap.allocated_bytes()
     }
 
     fn available_processor_count(&self) -> i32 {
@@ -8109,7 +8164,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     }
 
     fn gc_collection_count(&self) -> u64 {
-        self.shared.heap.collection_count()
+        self.shared.mem.heap.collection_count()
     }
 
     fn force_gc(&mut self) {
@@ -8127,7 +8182,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     fn end_blocking_region(&mut self) {
         // T19.H1 — leave the blocked region; clear the mark and re-sync
         // with any GC that ran while we were blocked.
-        self.shared.gc_barrier.mark_blocked_region_leave();
+        self.shared.mem.gc_barrier.mark_blocked_region_leave();
         self.check_post_block_gc();
     }
 
@@ -8136,7 +8191,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // native-local raw `Value` refs through the accumulated blocked-GC
         // fixup (the `ReferenceQueue.remove` poll receiver would otherwise
         // keep its stale pre-GC address — the stale-receiver writer).
-        self.shared.gc_barrier.mark_blocked_region_leave();
+        self.shared.mem.gc_barrier.mark_blocked_region_leave();
         self.check_post_block_gc_refs(refs);
     }
 
@@ -8379,17 +8434,17 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
 
     fn get_field_volatile(&self, obj: ObjectRef, index: usize) -> Value {
         // T10.9.E вЂ” descriptor-aware volatile read.
-        let class_id = self.shared.heap.class_id_of(obj);
+        let class_id = self.shared.mem.heap.class_id_of(obj);
         match resolve_field_descriptor_byte_cached(self.shared, class_id, index) {
-            Some(desc) => self.shared.heap.get_field_volatile_as(obj, index, desc),
-            None => self.shared.heap.get_field_volatile(obj, index),
+            Some(desc) => self.shared.mem.heap.get_field_volatile_as(obj, index, desc),
+            None => self.shared.mem.heap.get_field_volatile(obj, index),
         }
     }
 
     fn set_field_volatile(&self, obj: ObjectRef, index: usize, value: Value) {
         if std::env::var_os("CRATONVM_DBG_LOADER_TRACE").is_some() {
             if let Value::Object(Some(o)) = value {
-                let new_cid = self.shared.heap.class_id_of(o);
+                let new_cid = self.shared.mem.heap.class_id_of(o);
                 let cn = self
                     .shared
                     .classes
@@ -8407,13 +8462,14 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             }
         }
         // T10.9.E вЂ” descriptor-aware volatile write.
-        let class_id = self.shared.heap.class_id_of(obj);
+        let class_id = self.shared.mem.heap.class_id_of(obj);
         match resolve_field_descriptor_byte_cached(self.shared, class_id, index) {
             Some(desc) => self
                 .shared
+                .mem
                 .heap
                 .set_field_volatile_as(obj, index, value, desc),
-            None => self.shared.heap.set_field_volatile(obj, index, value),
+            None => self.shared.mem.heap.set_field_volatile(obj, index, value),
         }
         // write_barrier fires automatically inside set_field_volatile в†’ set_field
     }
@@ -8427,8 +8483,8 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     ) -> bool {
         // T19_H6: descriptor-aware CAS read+write so a long instance field
         // (`J`) always decodes as `Value::Long`, never as `Value::Double`.
-        let is_array = self.shared.heap.kind_of(obj) == cratonvm_types::ObjectKind::Array;
-        let class_id = self.shared.heap.class_id_of(obj);
+        let is_array = self.shared.mem.heap.kind_of(obj) == cratonvm_types::ObjectKind::Array;
+        let class_id = self.shared.mem.heap.class_id_of(obj);
         let descriptor = if is_array {
             None
         } else {
@@ -8437,13 +8493,14 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         let swapped = self.shared.threads.monitors.with_cas_lock(obj, || {
             let current = if is_array {
                 self.shared
+                    .mem
                     .heap
                     .get_array_element(obj, index)
                     .unwrap_or(Value::Object(None))
             } else if let Some(desc) = descriptor {
-                self.shared.heap.get_field_volatile_as(obj, index, desc)
+                self.shared.mem.heap.get_field_volatile_as(obj, index, desc)
             } else {
-                self.shared.heap.get_field_volatile(obj, index)
+                self.shared.mem.heap.get_field_volatile(obj, index)
             };
             if values_equal_for_cas(&current, &expected) {
                 // Task #42 (deferred from #25): SATB pre-barrier on
@@ -8462,15 +8519,16 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 // (pre, store, post) ordering. On a non-G1
                 // generational backend the call is also a cheap
                 // tag-test no-op.
-                self.shared.heap.satb_barrier(current);
+                self.shared.mem.heap.satb_barrier(current);
                 if is_array {
-                    let _ = self.shared.heap.set_array_element(obj, index, new_val);
+                    let _ = self.shared.mem.heap.set_array_element(obj, index, new_val);
                 } else if let Some(desc) = descriptor {
                     self.shared
+                        .mem
                         .heap
                         .set_field_volatile_as(obj, index, new_val, desc);
                 } else {
-                    self.shared.heap.set_field_volatile(obj, index, new_val);
+                    self.shared.mem.heap.set_field_volatile(obj, index, new_val);
                 }
                 true
             } else {
@@ -8480,7 +8538,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         if swapped {
             if std::env::var_os("CRATONVM_DBG_LOADER_TRACE").is_some() {
                 if let Value::Object(Some(o)) = new_val {
-                    let new_cid = self.shared.heap.class_id_of(o);
+                    let new_cid = self.shared.mem.heap.class_id_of(o);
                     let cn = self
                         .shared
                         .classes
@@ -8490,7 +8548,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                         .map(|c| c.name.to_string())
                         .unwrap_or_default();
                     if cn.contains("RootReference") {
-                        let holder_cid = self.shared.heap.class_id_of(obj);
+                        let holder_cid = self.shared.mem.heap.class_id_of(obj);
                         let holder_cn = self
                             .shared
                             .classes
@@ -8506,7 +8564,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                     }
                 }
             }
-            self.shared.heap.write_barrier(obj, new_val);
+            self.shared.mem.heap.write_barrier(obj, new_val);
         }
         // T19.H7 diag: count CAS failures so we can spot a livelock.
         // Static counter gated to ~5 emissions then 1 every 1M.
@@ -8627,7 +8685,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // return it re-enters the interpreter loop, whose top-of-loop poll
         // emits its current frames — no per-park snapshot cost needed.
         {
-            let blk = self.shared.gc_barrier.enter_blocked();
+            let blk = self.shared.mem.gc_barrier.enter_blocked();
             // DIAGNOSTIC (2026-07-13, STW takeover 5-class cluster
             // investigation): correlate against [stw-expected]'s identity
             // list to see whether this thread's park() call landed before
@@ -8644,6 +8702,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 // already raised `in_blocked_region` before this check.
                 let _ = self
                     .shared
+                    .mem
                     .gc_barrier
                     .arrive_and_wait_auto(self.thread.thread_id);
             }
@@ -8710,7 +8769,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             // stale address, what its header currently claims to be, and the
             // registry's live mirror addresses so the delta (e.g. a young
             // address whose thread was promoted to old gen) is visible.
-            let class_id = self.shared.heap.class_id_of(thread_obj);
+            let class_id = self.shared.mem.heap.class_id_of(thread_obj);
             eprintln!(
                 "[unpark] MISS obj={:p} header_class_id={:?} registry={:x?}",
                 thread_obj.as_ptr(),
@@ -8736,7 +8795,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             .get_class(class_id)
             .map(|c| c.num_total_fields)
             .unwrap_or(0);
-        let obj = self.shared.heap.alloc_object(class_id, num_fields);
+        let obj = self.shared.mem.heap.alloc_object(class_id, num_fields);
         crate::runtime::interpreter::init_primitive_fields(self.shared, obj, class_id);
         Some(obj)
     }
@@ -8748,8 +8807,8 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         descriptor: &str,
         args: &[Value],
     ) -> MethodCallResult {
-        let mut receiver = self.shared.heap.load_and_forward(receiver);
-        let mut receiver_class_id = self.shared.heap.class_id_of(receiver);
+        let mut receiver = self.shared.mem.heap.load_and_forward(receiver);
+        let mut receiver_class_id = self.shared.mem.heap.class_id_of(receiver);
         if let Some(recovered) = recover_stale_lambda_receiver_from_native_pins(
             self.shared,
             &*self.thread,
@@ -8759,7 +8818,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             args,
         ) {
             receiver = recovered;
-            receiver_class_id = self.shared.heap.class_id_of(receiver);
+            receiver_class_id = self.shared.mem.heap.class_id_of(receiver);
         }
         // Check if the receiver is a lambda proxy.
         let call_site = {
@@ -8817,7 +8876,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             let num_captures = lcs.capture_types.len();
             let mut full_args: Vec<Value> = Vec::with_capacity(num_captures + refreshed_args.len());
             for i in 0..num_captures {
-                full_args.push(self.shared.heap.get_field(receiver, i));
+                full_args.push(self.shared.mem.heap.get_field(receiver, i));
             }
             full_args.extend_from_slice(&refreshed_args);
 
@@ -8895,7 +8954,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                     // ordinary objects correctly.
                     let receiver_is_lambda_proxy = match &full_args[0] {
                         Value::Object(Some(r)) => {
-                            let rcv_id = self.shared.heap.class_id_of(*r);
+                            let rcv_id = self.shared.mem.heap.class_id_of(*r);
                             self.shared
                                 .classes
                                 .lambda_proxies
@@ -8923,7 +8982,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                                 &lcs,
                             );
                         let rcv_id_opt = match &full_args[0] {
-                            Value::Object(Some(r)) => Some(self.shared.heap.class_id_of(*r)),
+                            Value::Object(Some(r)) => Some(self.shared.mem.heap.class_id_of(*r)),
                             _ => None,
                         };
                         let target_class = match rcv_id_opt {
@@ -9114,7 +9173,11 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                             .get_class(class_id)
                             .map(|c| c.num_total_fields)
                             .unwrap_or(0);
-                        let new_obj = match self.shared.heap.try_alloc_object(class_id, num_fields)
+                        let new_obj = match self
+                            .shared
+                            .mem
+                            .heap
+                            .try_alloc_object(class_id, num_fields)
                         {
                             Some(obj) => obj,
                             None => {
@@ -9123,7 +9186,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                                     self.shared,
                                     self.thread,
                                 );
-                                self.shared.heap.try_alloc_object(class_id, num_fields).ok_or_else(|| {
+                                self.shared.mem.heap.try_alloc_object(class_id, num_fields).ok_or_else(|| {
                                     MethodCallFailed::InternalError(crate::error::VmError::Runtime(
                                         crate::error::RuntimeError::OutOfMemoryError {
                                             message: format!("Java heap space (MethodHandle newInvokeSpecial, {} fields)", num_fields),
@@ -9258,7 +9321,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             // name-based path, so the flag is false there.
             let mut resolved_from_receiver = false;
             let class_name =
-                if self.shared.heap.kind_of(receiver) == cratonvm_types::ObjectKind::Array {
+                if self.shared.mem.heap.kind_of(receiver) == cratonvm_types::ObjectKind::Array {
                     "java/lang/Object".to_string()
                 } else {
                     let lambda_iface = {
@@ -9329,7 +9392,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                     let unboxed = match ret {
                         'I' | 'Z' | 'B' | 'C' | 'S' | 'J' | 'F' | 'D' => {
                             if let Value::Object(Some(obj)) = value {
-                                self.shared.heap.get_field(obj, 0)
+                                self.shared.mem.heap.get_field(obj, 0)
                             } else {
                                 value
                             }
@@ -9522,8 +9585,8 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // infinite recursion (confirmed via a depth-counter probe: `execute`
         // called itself on the same receiver until the native stack
         // overflowed) instead of actually reaching bytecode.
-        let receiver = self.shared.heap.load_and_forward(receiver);
-        let class_id = self.shared.heap.class_id_of(receiver);
+        let receiver = self.shared.mem.heap.load_and_forward(receiver);
+        let class_id = self.shared.mem.heap.class_id_of(receiver);
         let declaring_class_id = {
             let cm = self.shared.classes.class_manager.read();
             crate::classloading::find_method_recursive(
@@ -10628,7 +10691,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         let ref_addr = reference_obj.as_ptr() as usize;
         let referent_addr = referent.as_ptr() as usize;
         let queue_addr = queue.map(|q| q.as_ptr() as usize);
-        self.shared.ref_processor.lock().discover_reference(
+        self.shared.mem.ref_processor.lock().discover_reference(
             rt,
             ref_addr,
             referent_addr,
@@ -10649,6 +10712,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             .unwrap_or(0);
         let ref_addr = reference_obj.as_ptr() as usize;
         self.shared
+            .mem
             .ref_processor
             .lock()
             .touch_soft_reference(ref_addr, now_ms);
@@ -10663,7 +10727,10 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // This is a keep-alive, not a reference store. `write_barrier_pre`
         // must pair with a post-store barrier; using the standalone SATB
         // enqueue avoids leaving that debug triad armed.
-        self.shared.heap.satb_barrier(Value::Object(Some(referent)));
+        self.shared
+            .mem
+            .heap
+            .satb_barrier(Value::Object(Some(referent)));
     }
 
     fn record_thread_sleep(&mut self, sleep_nanos: i64, actual_duration_nanos: u64) {
@@ -11297,7 +11364,7 @@ pub fn invoke_or_native(
                 .classes
                 .class_manager
                 .read()
-                .get_class(shared.heap.class_id_of(*receiver))
+                .get_class(shared.mem.heap.class_id_of(*receiver))
                 .map(|class| class.name.as_ref() == "java/lang/foreign/DowncallHandle")
                 .unwrap_or(false);
             if is_downcall {
@@ -11319,7 +11386,7 @@ pub fn invoke_or_native(
                 .classes
                 .class_manager
                 .read()
-                .get_class(shared.heap.class_id_of(*receiver))
+                .get_class(shared.mem.heap.class_id_of(*receiver))
                 .map(|class| class.name.as_ref() == "java/lang/foreign/DowncallHandle")
                 .unwrap_or(false);
             if is_downcall {
@@ -11351,7 +11418,7 @@ pub fn invoke_or_native(
     // class) is unaffected.
     if effective_class == "java/lang/annotation/AnnotationProxy" {
         if let Some(Value::Object(Some(recv))) = args.first().copied() {
-            note_annotation_proxy_cid(shared.heap.class_id_of(recv).as_u32());
+            note_annotation_proxy_cid(shared.mem.heap.class_id_of(recv).as_u32());
             return annotation_proxy_invoke_shared(shared, thread, recv, method_name, &args[1..]);
         }
     }
@@ -11466,7 +11533,7 @@ pub fn invoke_or_native(
             // Resolve the receiver's actual class for virtual dispatch.
             let recv_class = match args.first() {
                 Some(Value::Object(Some(o))) => {
-                    let cid = shared.heap.class_id_of(*o);
+                    let cid = shared.mem.heap.class_id_of(*o);
                     shared
                         .classes
                         .class_manager
@@ -11497,7 +11564,7 @@ pub fn invoke_or_native(
     {
         let cm = shared.classes.class_manager.read();
         let recv_cid = match args.first() {
-            Some(Value::Object(Some(o))) => Some(shared.heap.class_id_of(*o)),
+            Some(Value::Object(Some(o))) => Some(shared.mem.heap.class_id_of(*o)),
             _ => None,
         };
         let name_cid = cm.get_loaded_class_id(effective_class);
@@ -11538,11 +11605,16 @@ pub fn invoke_or_native(
         && descriptor == "(Ljava/lang/Runnable;)V"
     {
         if let Some(Value::Object(Some(recv))) = args.first() {
-            let recv_class_id = shared.heap.class_id_of(*recv);
+            let recv_class_id = shared.mem.heap.class_id_of(*recv);
             let has_real_workers = {
                 let cm = shared.classes.class_manager.read();
                 resolve_field_index_in_hierarchy(recv_class_id, "workers", &cm.class_store)
-                    .map(|idx| matches!(shared.heap.get_field(*recv, idx), Value::Object(Some(_))))
+                    .map(|idx| {
+                        matches!(
+                            shared.mem.heap.get_field(*recv, idx),
+                            Value::Object(Some(_))
+                        )
+                    })
                     .unwrap_or(false)
             };
             if has_real_workers {
@@ -11714,7 +11786,7 @@ pub fn invoke_or_native(
             );
             // Read field 0,1,2,3,4 to see what's there
             for i in 0..6 {
-                let v = shared.heap.get_field(*recv, i);
+                let v = shared.mem.heap.get_field(*recv, i);
                 eprintln!("  field[{}] = {:?}", i, v);
             }
         }
@@ -11843,13 +11915,14 @@ impl<'a> NativeContextImpl<'a> {
         // collector's `wait_for_all` deadlocks waiting for this thread
         // to reach an interpreter safepoint it will never reach.
         self.deposit_root_snapshot();
-        if self.shared.gc_barrier.mark_blocked_region_enter() {
+        if self.shared.mem.gc_barrier.mark_blocked_region_enter() {
             // A STW was already in progress — arrive at the barrier so
             // the initiator's `wait_for_all` can complete.
             // GCAUDIT-0711-FIX (finding 1a): `_auto` — the deposit above
             // already raised `in_blocked_region` before this check.
             let _ = self
                 .shared
+                .mem
                 .gc_barrier
                 .arrive_and_wait_auto(self.thread.thread_id);
         }
@@ -12320,11 +12393,11 @@ fn proxy_method_set_field_by_name(
     field_name: &str,
     value: Value,
 ) {
-    let class_id = shared.heap.class_id_of(method_obj);
+    let class_id = shared.mem.heap.class_id_of(method_obj);
     let cm = shared.classes.class_manager.read();
     if let Some(idx) = resolve_field_index_in_hierarchy(class_id, field_name, &cm.class_store) {
         drop(cm);
-        shared.heap.set_field(method_obj, idx, value);
+        shared.mem.heap.set_field(method_obj, idx, value);
     }
 }
 
@@ -12354,7 +12427,7 @@ fn proxy_method_write_extra_slots(
     const METHOD_EXTRA_OFFSET_DESC: usize = 0;
     const METHOD_EXTRA_OFFSET_PARAM_COUNT: usize = 1;
 
-    let class_id = shared.heap.class_id_of(method_obj);
+    let class_id = shared.mem.heap.class_id_of(method_obj);
     let total_fields = shared
         .classes
         .class_manager
@@ -12370,7 +12443,7 @@ fn proxy_method_write_extra_slots(
     // us at least the JDK width, but no extra slots when running against
     // a synthetic-stub Method class. In that case skip the writes; the
     // legacy hard-coded slots above already covered the synthetic path.
-    let num_obj_fields = shared.heap.num_fields(method_obj);
+    let num_obj_fields = shared.mem.heap.num_fields(method_obj);
     let extra_desc_slot = base + METHOD_EXTRA_OFFSET_DESC;
     let extra_pc_slot = base + METHOD_EXTRA_OFFSET_PARAM_COUNT;
     if num_obj_fields <= extra_pc_slot {
@@ -12378,9 +12451,11 @@ fn proxy_method_write_extra_slots(
     }
     let desc_str = super::create_java_string(shared, descriptor);
     shared
+        .mem
         .heap
         .set_field(method_obj, extra_desc_slot, Value::Object(Some(desc_str)));
     shared
+        .mem
         .heap
         .set_field(method_obj, extra_pc_slot, Value::Int(param_count as i32));
 }
@@ -12404,7 +12479,7 @@ pub(super) fn proxy_invoke_handler(
     args: &[Value],
 ) -> MethodCallResult {
     // Get the InvocationHandler from proxy field 0
-    let handler_ref = match ctx.shared.heap.get_field(proxy, 0) {
+    let handler_ref = match ctx.shared.mem.heap.get_field(proxy, 0) {
         Value::Object(Some(h)) => h,
         _ => {
             return Err(RuntimeError::NullPointerException { message: None }.into());
@@ -12458,6 +12533,7 @@ pub(super) fn proxy_invoke_handler(
     let alloc_base = core::cmp::max(METHOD_NUM_FIELDS_LEGACY_FLOOR, total_fields);
     let method_obj = ctx
         .shared
+        .mem
         .heap
         .alloc_object(method_class_id, alloc_base + METHOD_EXTRA_SLOTS);
     let zero_mirror = super::get_or_create_class_mirror(ctx.shared, ClassId::new(0));
@@ -12478,7 +12554,7 @@ pub(super) fn proxy_invoke_handler(
     let (param_descs, ret_desc) = proxy_split_descriptor(descriptor);
     let return_type_mirror = proxy_descriptor_to_class_mirror(ctx.shared, &ret_desc);
     let param_count = param_descs.len();
-    let param_arr = ctx.shared.heap.alloc_array(
+    let param_arr = ctx.shared.mem.heap.alloc_array(
         ClassId::new(0),
         crate::memory::heap::ArrayElementType::Reference,
         param_count,
@@ -12486,6 +12562,7 @@ pub(super) fn proxy_invoke_handler(
     for (i, pdesc) in param_descs.iter().enumerate() {
         let pmirror = proxy_descriptor_to_class_mirror(ctx.shared, pdesc);
         ctx.shared
+            .mem
             .heap
             .set_array_element(param_arr, i, Value::Object(Some(pmirror)))
             .ok();
@@ -12551,25 +12628,32 @@ pub(super) fn proxy_invoke_handler(
         // Skip вЂ” class layout already has the JDK fields populated above.
     } else {
         ctx.shared
+            .mem
             .heap
             .set_field(method_obj, 0, Value::Object(Some(declaring_mirror)));
         ctx.shared
+            .mem
             .heap
             .set_field(method_obj, 1, Value::Object(Some(name_str)));
         ctx.shared
+            .mem
             .heap
             .set_field(method_obj, 2, Value::Object(Some(return_type_mirror)));
         ctx.shared
+            .mem
             .heap
             .set_field(method_obj, 3, Value::Object(Some(param_arr)));
-        ctx.shared.heap.set_field(method_obj, 4, Value::Int(1));
+        ctx.shared.mem.heap.set_field(method_obj, 4, Value::Int(1));
         ctx.shared
+            .mem
             .heap
             .set_field(method_obj, 5, Value::Object(Some(desc_str)));
         ctx.shared
+            .mem
             .heap
             .set_field(method_obj, 6, Value::Int(param_count as i32));
         ctx.shared
+            .mem
             .heap
             .set_field(method_obj, 9, Value::Object(Some(exception_arr)));
         // Silence "zero_mirror unused" — kept above to preserve the
@@ -12593,7 +12677,7 @@ pub(super) fn proxy_invoke_handler(
     let args_value = if args.is_empty() {
         Value::Object(None)
     } else {
-        let args_arr = ctx.shared.heap.alloc_array(
+        let args_arr = ctx.shared.mem.heap.alloc_array(
             ClassId::new(0),
             crate::memory::heap::ArrayElementType::Reference,
             args.len(),
@@ -12605,14 +12689,18 @@ pub(super) fn proxy_invoke_handler(
                 Some(pdesc) => proxy_box_value_for_desc(ctx.shared, *arg, pdesc),
                 None => proxy_box_value(ctx.shared, *arg),
             };
-            ctx.shared.heap.set_array_element(args_arr, i, boxed).ok();
+            ctx.shared
+                .mem
+                .heap
+                .set_array_element(args_arr, i, boxed)
+                .ok();
         }
         Value::Object(Some(args_arr))
     };
 
     // Call InvocationHandler.invoke(Object proxy, Method method, Object[] args)
     // Resolve the handler's actual class for dispatch (may be anonymous).
-    let handler_class_id = ctx.shared.heap.class_id_of(handler_ref);
+    let handler_class_id = ctx.shared.mem.heap.class_id_of(handler_ref);
 
     // WP2.5: lambda InvocationHandler вЂ” see `proxy_invoke_handler_shared`
     // for the rationale. The lambda's class_id is synthetic and not in
@@ -12759,7 +12847,7 @@ fn class_name_is(shared: &SharedVm, obj: ObjectRef, name: &str) -> bool {
         .classes
         .class_manager
         .read()
-        .get_class(shared.heap.class_id_of(obj))
+        .get_class(shared.mem.heap.class_id_of(obj))
         .map(|c| &*c.name == name)
         .unwrap_or(false)
 }
@@ -12788,7 +12876,7 @@ fn proxy_unbox_primitive_return(
     match ret {
         'I' | 'Z' | 'B' | 'C' | 'S' | 'J' | 'F' | 'D' => {
             if let Value::Object(Some(wrapper)) = value {
-                Ok(Some(shared.heap.get_field(wrapper, 0)))
+                Ok(Some(shared.mem.heap.get_field(wrapper, 0)))
             } else {
                 Ok(Some(value))
             }
@@ -12808,7 +12896,7 @@ fn proxy_annotation_handler_invoke(
 ) -> MethodCallResult {
     if method_name == "equals" {
         if let Some(Value::Object(Some(other))) = args.first().copied() {
-            if let Value::Object(Some(other_handler)) = shared.heap.get_field(other, 0) {
+            if let Value::Object(Some(other_handler)) = shared.mem.heap.get_field(other, 0) {
                 if class_name_is(
                     shared,
                     other_handler,
@@ -12837,7 +12925,7 @@ pub(crate) fn proxy_invoke_handler_shared(
     args: &[Value],
 ) -> MethodCallResult {
     // Get the InvocationHandler from proxy field 0
-    let handler_ref = match shared.heap.get_field(proxy, 0) {
+    let handler_ref = match shared.mem.heap.get_field(proxy, 0) {
         Value::Object(Some(h)) => h,
         _ => {
             return Err(RuntimeError::NullPointerException { message: None }.into());
@@ -12880,6 +12968,7 @@ pub(crate) fn proxy_invoke_handler_shared(
     const METHOD_NUM_FIELDS_LEGACY_FLOOR: usize = 13;
     let alloc_base = core::cmp::max(METHOD_NUM_FIELDS_LEGACY_FLOOR, total_fields);
     let method_obj = shared
+        .mem
         .heap
         .alloc_object(method_class_id, alloc_base + METHOD_EXTRA_SLOTS);
     let zero_mirror = super::get_or_create_class_mirror(shared, ClassId::new(0));
@@ -12894,7 +12983,7 @@ pub(crate) fn proxy_invoke_handler_shared(
     let (param_descs, ret_desc) = proxy_split_descriptor(descriptor);
     let return_type_mirror = proxy_descriptor_to_class_mirror(shared, &ret_desc);
     let param_count = param_descs.len();
-    let param_arr = shared.heap.alloc_array(
+    let param_arr = shared.mem.heap.alloc_array(
         ClassId::new(0),
         crate::memory::heap::ArrayElementType::Reference,
         param_count,
@@ -12902,6 +12991,7 @@ pub(crate) fn proxy_invoke_handler_shared(
     for (i, pdesc) in param_descs.iter().enumerate() {
         let pmirror = proxy_descriptor_to_class_mirror(shared, pdesc);
         shared
+            .mem
             .heap
             .set_array_element(param_arr, i, Value::Object(Some(pmirror)))
             .ok();
@@ -12951,25 +13041,32 @@ pub(crate) fn proxy_invoke_handler_shared(
         // old hard-coded layout so callers reading raw slots still find
         // the values.
         shared
+            .mem
             .heap
             .set_field(method_obj, 0, Value::Object(Some(declaring_mirror)));
         shared
+            .mem
             .heap
             .set_field(method_obj, 1, Value::Object(Some(name_str)));
         shared
+            .mem
             .heap
             .set_field(method_obj, 2, Value::Object(Some(return_type_mirror)));
         shared
+            .mem
             .heap
             .set_field(method_obj, 3, Value::Object(Some(param_arr)));
-        shared.heap.set_field(method_obj, 4, Value::Int(1));
+        shared.mem.heap.set_field(method_obj, 4, Value::Int(1));
         shared
+            .mem
             .heap
             .set_field(method_obj, 5, Value::Object(Some(desc_str)));
         shared
+            .mem
             .heap
             .set_field(method_obj, 6, Value::Int(param_count as i32));
         shared
+            .mem
             .heap
             .set_field(method_obj, 9, Value::Object(Some(exception_arr)));
     }
@@ -12985,7 +13082,7 @@ pub(crate) fn proxy_invoke_handler_shared(
     let args_value = if args.is_empty() {
         Value::Object(None)
     } else {
-        let args_arr = shared.heap.alloc_array(
+        let args_arr = shared.mem.heap.alloc_array(
             ClassId::new(0),
             crate::memory::heap::ArrayElementType::Reference,
             args.len(),
@@ -12998,7 +13095,7 @@ pub(crate) fn proxy_invoke_handler_shared(
                 Some(pdesc) => proxy_box_value_for_desc(shared, *arg, pdesc),
                 None => proxy_box_value(shared, *arg),
             };
-            shared.heap.set_array_element(args_arr, i, boxed).ok();
+            shared.mem.heap.set_array_element(args_arr, i, boxed).ok();
         }
         Value::Object(Some(args_arr))
     };
@@ -13006,7 +13103,7 @@ pub(crate) fn proxy_invoke_handler_shared(
     // Call InvocationHandler.invoke(Object proxy, Method method, Object[] args)
     // Resolve the handler's actual class for dispatch (it may be an anonymous class
     // implementing InvocationHandler, so we can't use the interface name directly).
-    let handler_class_id = shared.heap.class_id_of(handler_ref);
+    let handler_class_id = shared.mem.heap.class_id_of(handler_ref);
 
     // WP2.5: if the handler is a synthetic lambda proxy (e.g. the user
     // passed `(proxy, m, a) -> ...` directly to `Proxy.newProxyInstance`),
@@ -13122,7 +13219,7 @@ fn proxy_wrap_undeclared_if_needed(
         Err(MethodCallFailed::ExceptionThrown(t)) => t,
         other => return other,
     };
-    let thrown_cid = shared.heap.class_id_of(thrown);
+    let thrown_cid = shared.mem.heap.class_id_of(thrown);
 
     // RuntimeException / Error (or subclasses) propagate verbatim.
     for base in ["java/lang/RuntimeException", "java/lang/Error"] {
@@ -13182,7 +13279,7 @@ fn proxy_wrap_undeclared_if_needed(
         .map(|c| c.num_total_fields)
         .unwrap_or(8)
         .max(4);
-    let ute = shared.heap.alloc_object(ute_cid, n_fields);
+    let ute = shared.mem.heap.alloc_object(ute_cid, n_fields);
     let ctor_args = [Value::Object(Some(ute)), Value::Object(Some(thrown))];
     // Run the real `<init>(Throwable)` so `getUndeclaredThrowable()` /
     // `getCause()` observe the wrapped exception. On ctor failure fall back to
@@ -13266,7 +13363,7 @@ fn proxy_method_exception_types(
     let declared = declaring_class
         .map(|class_id| proxy_method_declared_exceptions(shared, class_id, method_name, descriptor))
         .unwrap_or_default();
-    let exception_arr = shared.heap.alloc_array(
+    let exception_arr = shared.mem.heap.alloc_array(
         class_component,
         crate::memory::heap::ArrayElementType::Reference,
         declared.len(),
@@ -13274,7 +13371,7 @@ fn proxy_method_exception_types(
     for (index, exception_name) in declared.iter().enumerate() {
         let exception_mirror =
             proxy_descriptor_to_class_mirror(shared, &format!("L{exception_name};"));
-        let _ = shared.heap.set_array_element(
+        let _ = shared.mem.heap.set_array_element(
             exception_arr,
             index,
             Value::Object(Some(exception_mirror)),
@@ -13338,10 +13435,10 @@ pub(crate) fn annotation_proxy_invoke_shared(
     if method_name == "equals" {
         if let Some(other_val @ Value::Object(Some(other))) = args.first().copied() {
             if other != proxy
-                && shared.heap.kind_of(other) == crate::memory::heap::ObjectKind::Object
+                && shared.mem.heap.kind_of(other) == crate::memory::heap::ObjectKind::Object
                 && !class_name_is(shared, other, "java/lang/annotation/AnnotationProxy")
             {
-                let other_cid = shared.heap.class_id_of(other);
+                let other_cid = shared.mem.heap.class_id_of(other);
                 let proxy_desc = annotation_proxy_type_descriptor(shared, proxy);
                 let ann_cid = proxy_desc
                     .strip_prefix('L')
@@ -13395,7 +13492,7 @@ fn annotation_proxy_as_map(
 
     let factory = match args.first() {
         Some(Value::Object(Some(o))) => {
-            if shared.heap.kind_of(*o) == ObjectKind::Object {
+            if shared.mem.heap.kind_of(*o) == ObjectKind::Object {
                 Some(*o)
             } else {
                 None
@@ -13405,7 +13502,7 @@ fn annotation_proxy_as_map(
     };
 
     let dest_map = if let Some(f) = factory {
-        let f_cid = shared.heap.class_id_of(f);
+        let f_cid = shared.mem.heap.class_id_of(f);
         let is_lambda = shared.classes.lambda_proxies.read().contains_key(&f_cid);
         let res = if is_lambda {
             let dispatch = crate::runtime::interpreter::try_lambda_dispatch(
@@ -13437,14 +13534,14 @@ fn annotation_proxy_as_map(
                     )
                     .or_else(|_| shared.load_class_concurrent("java/util/LinkedHashMap"))
                     .unwrap_or_else(|_| cratonvm_types::ClassId::new(0));
-                shared.heap.alloc_object(cid, 4)
+                shared.mem.heap.alloc_object(cid, 4)
             }
         }
     } else {
         let cid = shared
             .load_class_concurrent("java/util/LinkedHashMap")
             .unwrap_or_else(|_| cratonvm_types::ClassId::new(0));
-        shared.heap.alloc_object(cid, 4)
+        shared.mem.heap.alloc_object(cid, 4)
     };
 
     // S111r32 — detect Adapt.CLASS_TO_STRING in the varargs Adapt[] arg
@@ -13461,21 +13558,21 @@ fn annotation_proxy_as_map(
     // of type Class[], but String[] was expected`.
     let class_to_string = adapt_array_contains(shared, args.get(1).copied(), "CLASS_TO_STRING");
 
-    let names_arr = match shared.heap.get_field(proxy, 2) {
+    let names_arr = match shared.mem.heap.get_field(proxy, 2) {
         Value::Object(Some(a)) => a,
         _ => return Ok(Some(Value::Object(Some(dest_map)))),
     };
-    let values_arr = match shared.heap.get_field(proxy, 3) {
+    let values_arr = match shared.mem.heap.get_field(proxy, 3) {
         Value::Object(Some(a)) => a,
         _ => return Ok(Some(Value::Object(Some(dest_map)))),
     };
-    let n = shared.heap.array_length(names_arr);
+    let n = shared.mem.heap.array_length(names_arr);
     for i in 0..n {
-        let name_val = match shared.heap.get_array_element(names_arr, i) {
+        let name_val = match shared.mem.heap.get_array_element(names_arr, i) {
             Ok(v) => v,
             Err(_) => continue,
         };
-        let elem_val = match shared.heap.get_array_element(values_arr, i) {
+        let elem_val = match shared.mem.heap.get_array_element(values_arr, i) {
             Ok(v) => v,
             Err(_) => continue,
         };
@@ -13486,7 +13583,7 @@ fn annotation_proxy_as_map(
         } else {
             adapted
         };
-        let dest_cid = shared.heap.class_id_of(dest_map);
+        let dest_cid = shared.mem.heap.class_id_of(dest_map);
         let _ = invoke_on_class_shared(
             shared,
             thread,
@@ -13517,9 +13614,9 @@ pub(crate) fn annotation_proxy_to_annotation_attributes_array(
     // no member data, so its faithful AnnotationAttributes representation is
     // the declared empty array.
     if class_name_is(shared, value, "jakarta/servlet/annotation/WebInitParam")
-        && shared.heap.num_fields(value) == 0
+        && shared.mem.heap.num_fields(value) == 0
     {
-        return Ok(Some(shared.heap.alloc_array(
+        return Ok(Some(shared.mem.heap.alloc_array(
             attrs_cid,
             cratonvm_types::ArrayElementType::Reference,
             0,
@@ -13528,7 +13625,7 @@ pub(crate) fn annotation_proxy_to_annotation_attributes_array(
     let proxy = if class_name_is(shared, value, "java/lang/annotation/AnnotationProxy") {
         Some(value)
     } else {
-        match shared.heap.get_field(value, 0) {
+        match shared.mem.heap.get_field(value, 0) {
             Value::Object(Some(handler))
                 if class_name_is(shared, handler, "java/lang/annotation/AnnotationProxy") =>
             {
@@ -13549,10 +13646,13 @@ pub(crate) fn annotation_proxy_to_annotation_attributes_array(
         Some(Value::Object(Some(attrs))) => attrs,
         _ => return Ok(None),
     };
-    let array = shared
-        .heap
-        .alloc_array(attrs_cid, cratonvm_types::ArrayElementType::Reference, 1);
+    let array =
+        shared
+            .mem
+            .heap
+            .alloc_array(attrs_cid, cratonvm_types::ArrayElementType::Reference, 1);
     shared
+        .mem
         .heap
         .set_array_element(array, 0, Value::Object(Some(attrs)))
         .ok();
@@ -13567,12 +13667,12 @@ fn adapt_array_contains(shared: &SharedVm, arr_val: Option<Value>, target_name: 
         Some(Value::Object(Some(o))) => o,
         _ => return false,
     };
-    if shared.heap.kind_of(arr_obj) != ObjectKind::Array {
+    if shared.mem.heap.kind_of(arr_obj) != ObjectKind::Array {
         return false;
     }
-    let n = shared.heap.array_length(arr_obj);
+    let n = shared.mem.heap.array_length(arr_obj);
     for i in 0..n {
-        let elem = match shared.heap.get_array_element(arr_obj, i) {
+        let elem = match shared.mem.heap.get_array_element(arr_obj, i) {
             Ok(Value::Object(Some(o))) => o,
             _ => continue,
         };
@@ -13581,11 +13681,15 @@ fn adapt_array_contains(shared: &SharedVm, arr_val: Option<Value>, target_name: 
         // assuming slot 0 causes CLASS_TO_STRING to be silently skipped.
         let name_index = {
             let cm = shared.classes.class_manager.read();
-            resolve_field_index_in_hierarchy(shared.heap.class_id_of(elem), "name", &cm.class_store)
+            resolve_field_index_in_hierarchy(
+                shared.mem.heap.class_id_of(elem),
+                "name",
+                &cm.class_store,
+            )
         };
         if let Some(name_index) = name_index {
-            if let Value::Object(Some(name_obj)) = shared.heap.get_field(elem, name_index) {
-                if let Some(s) = super::read_java_string(&shared.heap, name_obj) {
+            if let Value::Object(Some(name_obj)) = shared.mem.heap.get_field(elem, name_index) {
+                if let Some(s) = super::read_java_string(&shared.mem.heap, name_obj) {
                     if s == target_name {
                         return true;
                     }
@@ -13607,12 +13711,12 @@ pub(crate) fn convert_class_values_to_strings(shared: &SharedVm, val: Value) -> 
         Value::Object(Some(o)) => o,
         _ => return val,
     };
-    let kind = shared.heap.kind_of(obj);
+    let kind = shared.mem.heap.kind_of(obj);
     if kind == ObjectKind::Object {
         // Detect Class mirror: class_id resolves to java/lang/Class, or the
         // object has a non-null `name` slot we can convert. The simplest
         // detection: the class name of `obj` is "java/lang/Class".
-        let cid = shared.heap.class_id_of(obj);
+        let cid = shared.mem.heap.class_id_of(obj);
         let class_name = shared
             .classes
             .class_manager
@@ -13628,7 +13732,7 @@ pub(crate) fn convert_class_values_to_strings(shared: &SharedVm, val: Value) -> 
     }
     if kind == ObjectKind::Array {
         // Reference array whose component class is `java/lang/Class`.
-        let comp_cid = shared.heap.class_id_of(obj);
+        let comp_cid = shared.mem.heap.class_id_of(obj);
         let comp_name = shared
             .classes
             .class_manager
@@ -13637,16 +13741,18 @@ pub(crate) fn convert_class_values_to_strings(shared: &SharedVm, val: Value) -> 
             .map(|c| c.name.to_string())
             .unwrap_or_default();
         if comp_name == "java/lang/Class" {
-            let n = shared.heap.array_length(obj);
+            let n = shared.mem.heap.array_length(obj);
             let str_cid = shared
                 .load_class_concurrent("java/lang/String")
                 .unwrap_or_else(|_| cratonvm_types::ClassId::new(0));
-            let new_arr =
-                shared
-                    .heap
-                    .alloc_array(str_cid, cratonvm_types::ArrayElementType::Reference, n);
+            let new_arr = shared.mem.heap.alloc_array(
+                str_cid,
+                cratonvm_types::ArrayElementType::Reference,
+                n,
+            );
             for i in 0..n {
                 let elem = shared
+                    .mem
                     .heap
                     .get_array_element(obj, i)
                     .unwrap_or(Value::Object(None));
@@ -13657,7 +13763,7 @@ pub(crate) fn convert_class_values_to_strings(shared: &SharedVm, val: Value) -> 
                     }
                     _ => Value::Object(None),
                 };
-                shared.heap.set_array_element(new_arr, i, s_val).ok();
+                shared.mem.heap.set_array_element(new_arr, i, s_val).ok();
             }
             return Value::Object(Some(new_arr));
         }
@@ -13683,8 +13789,8 @@ fn class_mirror_fqn(shared: &SharedVm, mirror: ObjectRef) -> String {
             return name.replace('/', ".");
         }
     }
-    if let Value::Object(Some(name_obj)) = shared.heap.get_field(mirror, 1) {
-        if let Some(s) = super::read_java_string(&shared.heap, name_obj) {
+    if let Value::Object(Some(name_obj)) = shared.mem.heap.get_field(mirror, 1) {
+        if let Some(s) = super::read_java_string(&shared.mem.heap, name_obj) {
             return s.replace('/', ".");
         }
     }
@@ -13705,8 +13811,8 @@ fn adapt_annotation_value_for_map(
         Value::Object(Some(o)) => o,
         _ => return Ok(val),
     };
-    let cid = shared.heap.class_id_of(obj);
-    let kind = shared.heap.kind_of(obj);
+    let cid = shared.mem.heap.class_id_of(obj);
+    let kind = shared.mem.heap.kind_of(obj);
     let class_name = shared
         .classes
         .class_manager
@@ -13719,16 +13825,16 @@ fn adapt_annotation_value_for_map(
             .map(|res| res.unwrap_or(Value::Object(None)));
     }
     if kind == ObjectKind::Array {
-        let len = shared.heap.array_length(obj);
+        let len = shared.mem.heap.array_length(obj);
         let any_proxy = (0..len).any(|i| {
             matches!(
-                shared.heap.get_array_element(obj, i),
+                shared.mem.heap.get_array_element(obj, i),
                 Ok(Value::Object(Some(e)))
-                    if shared.heap.kind_of(e) == ObjectKind::Object
+                    if shared.mem.heap.kind_of(e) == ObjectKind::Object
                         && shared
                             .classes.class_manager
                             .read()
-                            .get_class(shared.heap.class_id_of(e))
+                            .get_class(shared.mem.heap.class_id_of(e))
                             .map(|c| &*c.name == "java/lang/annotation/AnnotationProxy")
                             .unwrap_or(false)
             )
@@ -13737,17 +13843,19 @@ fn adapt_annotation_value_for_map(
             let aa_cid = shared
                 .load_class_concurrent("org/springframework/core/annotation/AnnotationAttributes")
                 .unwrap_or_else(|_| cratonvm_types::ClassId::new(0));
-            let new_arr =
-                shared
-                    .heap
-                    .alloc_array(aa_cid, cratonvm_types::ArrayElementType::Reference, len);
+            let new_arr = shared.mem.heap.alloc_array(
+                aa_cid,
+                cratonvm_types::ArrayElementType::Reference,
+                len,
+            );
             for i in 0..len {
                 let elem = shared
+                    .mem
                     .heap
                     .get_array_element(obj, i)
                     .unwrap_or(Value::Object(None));
                 let adapted = adapt_annotation_value_for_map(shared, thread, elem, asmap_args)?;
-                shared.heap.set_array_element(new_arr, i, adapted).ok();
+                shared.mem.heap.set_array_element(new_arr, i, adapted).ok();
             }
             return Ok(Value::Object(Some(new_arr)));
         }
@@ -13763,24 +13871,25 @@ fn adapt_annotation_value_for_map(
 /// Returns `(name, value)` pairs in the order they were stored at proxy build
 /// time (which is the source-declaration order from the .class file).
 fn annotation_proxy_elements(shared: &SharedVm, proxy: ObjectRef) -> Vec<(String, Value)> {
-    let names_arr = match shared.heap.get_field(proxy, 2) {
+    let names_arr = match shared.mem.heap.get_field(proxy, 2) {
         Value::Object(Some(a)) => a,
         _ => return Vec::new(),
     };
-    let values_arr = match shared.heap.get_field(proxy, 3) {
+    let values_arr = match shared.mem.heap.get_field(proxy, 3) {
         Value::Object(Some(a)) => a,
         _ => return Vec::new(),
     };
-    let n = shared.heap.array_length(names_arr);
+    let n = shared.mem.heap.array_length(names_arr);
     let mut out = Vec::with_capacity(n);
     for i in 0..n {
-        let name = match shared.heap.get_array_element(names_arr, i) {
+        let name = match shared.mem.heap.get_array_element(names_arr, i) {
             Ok(Value::Object(Some(name_ref))) => {
-                super::read_java_string(&shared.heap, name_ref).unwrap_or_default()
+                super::read_java_string(&shared.mem.heap, name_ref).unwrap_or_default()
             }
             _ => continue,
         };
         let val = shared
+            .mem
             .heap
             .get_array_element(values_arr, i)
             .unwrap_or(Value::Object(None));
@@ -13791,8 +13900,8 @@ fn annotation_proxy_elements(shared: &SharedVm, proxy: ObjectRef) -> Vec<(String
 
 /// Read the annotation's type descriptor (field 0) вЂ” e.g. "Ljava/lang/Override;".
 fn annotation_proxy_type_descriptor(shared: &SharedVm, proxy: ObjectRef) -> String {
-    if let Value::Object(Some(s)) = shared.heap.get_field(proxy, 0) {
-        super::read_java_string(&shared.heap, s).unwrap_or_default()
+    if let Value::Object(Some(s)) = shared.mem.heap.get_field(proxy, 0) {
+        super::read_java_string(&shared.mem.heap, s).unwrap_or_default()
     } else {
         String::new()
     }
@@ -13838,11 +13947,11 @@ fn format_annotation_value(shared: &SharedVm, val: Value) -> String {
         Value::Double(d) => d.to_string(),
         Value::Object(Some(obj)) => {
             // Decide based on object class name + heap kind.
-            let kind = shared.heap.kind_of(obj);
+            let kind = shared.mem.heap.kind_of(obj);
             if kind == crate::memory::heap::ObjectKind::Array {
                 return format_annotation_array(shared, obj);
             }
-            let cid = shared.heap.class_id_of(obj);
+            let cid = shared.mem.heap.class_id_of(obj);
             let cname = shared
                 .classes
                 .class_manager
@@ -13856,7 +13965,7 @@ fn format_annotation_value(shared: &SharedVm, val: Value) -> String {
             }
             // String вЂ” render as Java-string-literal "text"
             if cname == "java/lang/String" {
-                if let Some(s) = super::read_java_string(&shared.heap, obj) {
+                if let Some(s) = super::read_java_string(&shared.mem.heap, obj) {
                     return format!("\"{}\"", java_string_escape(&s));
                 }
             }
@@ -13869,7 +13978,7 @@ fn format_annotation_value(shared: &SharedVm, val: Value) -> String {
             }
             // Boxed wrapper (1-field synthetic): unbox and recurse
             if let Some(prim_name) = wrapper_class_to_primitive(&cname) {
-                let inner = shared.heap.get_field(obj, 0);
+                let inner = shared.mem.heap.get_field(obj, 0);
                 let mut s = format_annotation_value(shared, inner);
                 if prim_name == "long" {
                     s.push('L');
@@ -13880,8 +13989,8 @@ fn format_annotation_value(shared: &SharedVm, val: Value) -> String {
             }
             // Enum constant вЂ” return its `name` field. Standard layout has
             // field 0 = String name (set by `Enum.<init>`).
-            if let Value::Object(Some(name_ref)) = shared.heap.get_field(obj, 0) {
-                if let Some(name) = super::read_java_string(&shared.heap, name_ref) {
+            if let Value::Object(Some(name_ref)) = shared.mem.heap.get_field(obj, 0) {
+                if let Some(name) = super::read_java_string(&shared.mem.heap, name_ref) {
                     if !name.is_empty() {
                         return name;
                     }
@@ -13897,13 +14006,13 @@ fn format_annotation_value(shared: &SharedVm, val: Value) -> String {
 /// Render an array element (reference or primitive) the way
 /// `Arrays.toString` does for annotation values: `[a, b, c]`.
 fn format_annotation_array(shared: &SharedVm, arr: ObjectRef) -> String {
-    let n = shared.heap.array_length(arr);
+    let n = shared.mem.heap.array_length(arr);
     let mut s = String::from("[");
     for i in 0..n {
         if i > 0 {
             s.push_str(", ");
         }
-        match shared.heap.get_array_element(arr, i) {
+        match shared.mem.heap.get_array_element(arr, i) {
             Ok(v) => s.push_str(&format_annotation_value(shared, v)),
             Err(_) => s.push_str("null"),
         }
@@ -13973,8 +14082,8 @@ fn java_string_escape(s: &str) -> String {
 ///   field 0 = class id (Int)
 ///   field 1 = name (String вЂ” internal slash form)
 fn class_mirror_name(shared: &SharedVm, mirror: ObjectRef) -> Option<String> {
-    if let Value::Object(Some(name_ref)) = shared.heap.get_field(mirror, 1) {
-        return super::read_java_string(&shared.heap, name_ref);
+    if let Value::Object(Some(name_ref)) = shared.mem.heap.get_field(mirror, 1) {
+        return super::read_java_string(&shared.mem.heap, name_ref);
     }
     None
 }
@@ -14025,11 +14134,11 @@ fn annotation_value_hash(shared: &SharedVm, val: Value) -> i32 {
         }
         Value::Object(None) | Value::Uninitialized => 0,
         Value::Object(Some(obj)) => {
-            let kind = shared.heap.kind_of(obj);
+            let kind = shared.mem.heap.kind_of(obj);
             if kind == crate::memory::heap::ObjectKind::Array {
                 return annotation_array_hash(shared, obj);
             }
-            let cid = shared.heap.class_id_of(obj);
+            let cid = shared.mem.heap.class_id_of(obj);
             let cname = shared
                 .classes
                 .class_manager
@@ -14039,12 +14148,12 @@ fn annotation_value_hash(shared: &SharedVm, val: Value) -> i32 {
                 .unwrap_or_default();
             // Boxed wrapper вЂ” hash the boxed primitive
             if wrapper_class_to_primitive(&cname).is_some() {
-                let inner = shared.heap.get_field(obj, 0);
+                let inner = shared.mem.heap.get_field(obj, 0);
                 return annotation_value_hash(shared, inner);
             }
             // String вЂ” Java's String.hashCode contract
             if cname == "java/lang/String" {
-                if let Some(s) = super::read_java_string(&shared.heap, obj) {
+                if let Some(s) = super::read_java_string(&shared.mem.heap, obj) {
                     return java_string_hash(&s);
                 }
             }
@@ -14062,7 +14171,7 @@ fn annotation_value_hash(shared: &SharedVm, val: Value) -> i32 {
             // hash codes differed, breaking `MergedAnnotation` synthesis.) Both
             // sides reference the same singleton mirror / enum constant within a
             // run, so the identity hashes agree.
-            shared.heap.identity_hash_code(obj)
+            shared.mem.heap.identity_hash_code(obj)
         }
         _ => 0,
     }
@@ -14070,10 +14179,10 @@ fn annotation_value_hash(shared: &SharedVm, val: Value) -> i32 {
 
 /// Per `Arrays.hashCode` for the relevant element type.
 fn annotation_array_hash(shared: &SharedVm, arr: ObjectRef) -> i32 {
-    let n = shared.heap.array_length(arr);
+    let n = shared.mem.heap.array_length(arr);
     let mut h: i32 = 1;
     for i in 0..n {
-        let elem_hash = match shared.heap.get_array_element(arr, i) {
+        let elem_hash = match shared.mem.heap.get_array_element(arr, i) {
             Ok(v) => annotation_value_hash(shared, v),
             Err(_) => 0,
         };
@@ -14104,11 +14213,11 @@ pub(crate) fn annotation_proxy_equals(shared: &SharedVm, a: ObjectRef, b: Value)
         return true;
     }
     // The other side must also be an annotation proxy of the same type.
-    let other_kind = shared.heap.kind_of(other);
+    let other_kind = shared.mem.heap.kind_of(other);
     if other_kind != crate::memory::heap::ObjectKind::Object {
         return false;
     }
-    let other_cid = shared.heap.class_id_of(other);
+    let other_cid = shared.mem.heap.class_id_of(other);
     let other_cname = shared
         .classes
         .class_manager
@@ -14159,25 +14268,27 @@ fn annotation_values_equal(shared: &SharedVm, a: Value, b: Value) -> bool {
             if x == y {
                 return true;
             }
-            let xk = shared.heap.kind_of(x);
-            let yk = shared.heap.kind_of(y);
+            let xk = shared.mem.heap.kind_of(x);
+            let yk = shared.mem.heap.kind_of(y);
             if xk == crate::memory::heap::ObjectKind::Array
                 || yk == crate::memory::heap::ObjectKind::Array
             {
                 if xk != yk {
                     return false;
                 }
-                let nx = shared.heap.array_length(x);
-                let ny = shared.heap.array_length(y);
+                let nx = shared.mem.heap.array_length(x);
+                let ny = shared.mem.heap.array_length(y);
                 if nx != ny {
                     return false;
                 }
                 for i in 0..nx {
                     let av = shared
+                        .mem
                         .heap
                         .get_array_element(x, i)
                         .unwrap_or(Value::Object(None));
                     let bv = shared
+                        .mem
                         .heap
                         .get_array_element(y, i)
                         .unwrap_or(Value::Object(None));
@@ -14187,8 +14298,8 @@ fn annotation_values_equal(shared: &SharedVm, a: Value, b: Value) -> bool {
                 }
                 return true;
             }
-            let xcid = shared.heap.class_id_of(x);
-            let ycid = shared.heap.class_id_of(y);
+            let xcid = shared.mem.heap.class_id_of(x);
+            let ycid = shared.mem.heap.class_id_of(y);
             let xname = shared
                 .classes
                 .class_manager
@@ -14211,14 +14322,14 @@ fn annotation_values_equal(shared: &SharedVm, a: Value, b: Value) -> bool {
             }
             // String compare
             if xname == "java/lang/String" && yname == "java/lang/String" {
-                let sx = super::read_java_string(&shared.heap, x).unwrap_or_default();
-                let sy = super::read_java_string(&shared.heap, y).unwrap_or_default();
+                let sx = super::read_java_string(&shared.mem.heap, x).unwrap_or_default();
+                let sy = super::read_java_string(&shared.mem.heap, y).unwrap_or_default();
                 return sx == sy;
             }
             // Class mirror compare by class id
             if xname == "java/lang/Class" && yname == "java/lang/Class" {
-                let xcid_field = shared.heap.get_field(x, 0);
-                let ycid_field = shared.heap.get_field(y, 0);
+                let xcid_field = shared.mem.heap.get_field(x, 0);
+                let ycid_field = shared.mem.heap.get_field(y, 0);
                 return matches!(
                     (xcid_field, ycid_field),
                     (Value::Int(a), Value::Int(b)) if a == b
@@ -14228,16 +14339,17 @@ fn annotation_values_equal(shared: &SharedVm, a: Value, b: Value) -> bool {
             if wrapper_class_to_primitive(&xname).is_some()
                 && wrapper_class_to_primitive(&yname).is_some()
             {
-                let xv = shared.heap.get_field(x, 0);
-                let yv = shared.heap.get_field(y, 0);
+                let xv = shared.mem.heap.get_field(x, 0);
+                let yv = shared.mem.heap.get_field(y, 0);
                 return annotation_values_equal(shared, xv, yv);
             }
             // Enum / generic вЂ” compare name field if present.
-            if let (Value::Object(Some(xn)), Value::Object(Some(yn))) =
-                (shared.heap.get_field(x, 0), shared.heap.get_field(y, 0))
-            {
-                let sx = super::read_java_string(&shared.heap, xn).unwrap_or_default();
-                let sy = super::read_java_string(&shared.heap, yn).unwrap_or_default();
+            if let (Value::Object(Some(xn)), Value::Object(Some(yn))) = (
+                shared.mem.heap.get_field(x, 0),
+                shared.mem.heap.get_field(y, 0),
+            ) {
+                let sx = super::read_java_string(&shared.mem.heap, xn).unwrap_or_default();
+                let sy = super::read_java_string(&shared.mem.heap, yn).unwrap_or_default();
                 if !sx.is_empty() && !sy.is_empty() {
                     return sx == sy && xname == yname;
                 }
@@ -14277,20 +14389,23 @@ pub(crate) fn annotation_proxy_dispatch_impl(
             if let Some(Value::Object(Some(method_obj))) = args.get(1).copied() {
                 if class_name_is(shared, method_obj, "java/lang/reflect/Method") {
                     let name_val = {
-                        let method_cid = shared.heap.class_id_of(method_obj);
+                        let method_cid = shared.mem.heap.class_id_of(method_obj);
                         let cm = shared.classes.class_manager.read();
                         resolve_field_index_in_hierarchy(method_cid, "name", &cm.class_store)
-                            .map(|idx| shared.heap.get_field(method_obj, idx))
+                            .map(|idx| shared.mem.heap.get_field(method_obj, idx))
                     };
                     if let Some(Value::Object(Some(name_ref))) = name_val {
-                        if let Some(real_name) = super::read_java_string(&shared.heap, name_ref) {
+                        if let Some(real_name) = super::read_java_string(&shared.mem.heap, name_ref)
+                        {
                             // Unpack the InvocationHandler args array (null for
                             // a 0-arg annotation method like `value()`).
                             let inner: Vec<Value> = match args.get(2).copied() {
                                 Some(Value::Object(Some(arr))) => {
-                                    let len = shared.heap.array_length(arr);
+                                    let len = shared.mem.heap.array_length(arr);
                                     (0..len)
-                                        .filter_map(|i| shared.heap.get_array_element(arr, i).ok())
+                                        .filter_map(|i| {
+                                            shared.mem.heap.get_array_element(arr, i).ok()
+                                        })
                                         .collect()
                                 }
                                 _ => Vec::new(),
@@ -14305,7 +14420,7 @@ pub(crate) fn annotation_proxy_dispatch_impl(
         }
         // annotationType() returns the cached Class mirror.
         "annotationType" => {
-            return Ok(Some(shared.heap.get_field(proxy, 1)));
+            return Ok(Some(shared.mem.heap.get_field(proxy, 1)));
         }
         // toString() вЂ” spec-compliant @Type(name=value, ...)
         "toString" => {
@@ -14340,7 +14455,7 @@ pub(crate) fn annotation_proxy_dispatch_impl(
         // interface, but Spring only needs *some* non-null Class with
         // `isArray()==false` and `isAnnotation()==true`.
         "getClass" => {
-            return Ok(Some(shared.heap.get_field(proxy, 1)));
+            return Ok(Some(shared.mem.heap.get_field(proxy, 1)));
         }
         // S111r20 — `getType()` is a `MergedAnnotation` interface method.
         // Spring's `TypeMappedAnnotation.adaptValueForMapOptions` treats
@@ -14351,23 +14466,25 @@ pub(crate) fn annotation_proxy_dispatch_impl(
         // named "getType", returns null, and AnnotationAttributes throws
         // `IllegalArgumentException: 'annotationType' must not be null`.
         "getType" => {
-            return Ok(Some(shared.heap.get_field(proxy, 1)));
+            return Ok(Some(shared.mem.heap.get_field(proxy, 1)));
         }
         _ => {}
     }
 
     // Element accessor: walk the parallel arrays for a matching name.
-    let names_arr = match shared.heap.get_field(proxy, 2) {
+    let names_arr = match shared.mem.heap.get_field(proxy, 2) {
         Value::Object(Some(a)) => a,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let values_arr = match shared.heap.get_field(proxy, 3) {
+    let values_arr = match shared.mem.heap.get_field(proxy, 3) {
         Value::Object(Some(a)) => a,
         _ => return Ok(Some(Value::Object(None))),
     };
     if std::env::var_os("CRATONVM_ANN_PROXY_DISPATCH_TRACE").is_some() && method_name == "value" {
-        let type_desc = match shared.heap.get_field(proxy, 0) {
-            Value::Object(Some(s)) => super::read_java_string(&shared.heap, s).unwrap_or_default(),
+        let type_desc = match shared.mem.heap.get_field(proxy, 0) {
+            Value::Object(Some(s)) => {
+                super::read_java_string(&shared.mem.heap, s).unwrap_or_default()
+            }
             _ => String::new(),
         };
         if type_desc.contains("Import") {
@@ -14379,12 +14496,12 @@ pub(crate) fn annotation_proxy_dispatch_impl(
             );
         }
     }
-    let n = shared.heap.array_length(names_arr);
+    let n = shared.mem.heap.array_length(names_arr);
     for i in 0..n {
-        if let Ok(Value::Object(Some(name_ref))) = shared.heap.get_array_element(names_arr, i) {
-            if let Some(name) = super::read_java_string(&shared.heap, name_ref) {
+        if let Ok(Value::Object(Some(name_ref))) = shared.mem.heap.get_array_element(names_arr, i) {
+            if let Some(name) = super::read_java_string(&shared.mem.heap, name_ref) {
                 if name == method_name {
-                    if let Ok(val) = shared.heap.get_array_element(values_arr, i) {
+                    if let Ok(val) = shared.mem.heap.get_array_element(values_arr, i) {
                         // Deferred `TypeNotPresentException`: a Class-valued member
                         // that could not be resolved through the declaring class's
                         // loader (classloader-isolation / filtering) was stored as a
@@ -14442,8 +14559,8 @@ fn annotation_member_declared_default(
     method_name: &str,
 ) -> Option<crate::native::registry::AnnotationElementValue> {
     // Proxy field 0 holds the annotation type descriptor, e.g. `Lpkg/Ann;`.
-    let desc = match shared.heap.get_field(proxy, 0) {
-        Value::Object(Some(s)) => super::read_java_string(&shared.heap, s)?,
+    let desc = match shared.mem.heap.get_field(proxy, 0) {
+        Value::Object(Some(s)) => super::read_java_string(&shared.mem.heap, s)?,
         _ => return None,
     };
     let class_name = desc
@@ -14669,7 +14786,7 @@ pub(super) fn proxy_resolve_declaring_class_mirror(
     // never read slot 1 out of bounds on the 1-field real-super proxy (which
     // would trip the gen_heap OOB guard and mis-resolve `getDeclaringClass()` to
     // `Object`).
-    let proxy_cid = shared.heap.class_id_of(proxy);
+    let proxy_cid = shared.mem.heap.class_id_of(proxy);
     let has_iface_slot = shared
         .classes
         .class_manager
@@ -14683,10 +14800,10 @@ pub(super) fn proxy_resolve_declaring_class_mirror(
     let mut iface_cids: Vec<ClassId> = Vec::new();
     let mut first_iface_mirror: Option<ObjectRef> = None;
     if has_iface_slot {
-        if let Value::Object(Some(arr)) = shared.heap.get_field(proxy, 1) {
-            let n = shared.heap.array_length(arr);
+        if let Value::Object(Some(arr)) = shared.mem.heap.get_field(proxy, 1) {
+            let n = shared.mem.heap.array_length(arr);
             for i in 0..n {
-                if let Ok(Value::Object(Some(m))) = shared.heap.get_array_element(arr, i) {
+                if let Ok(Value::Object(Some(m))) = shared.mem.heap.get_array_element(arr, i) {
                     if first_iface_mirror.is_none() {
                         first_iface_mirror = Some(m);
                     }
@@ -14781,8 +14898,8 @@ pub(super) fn proxy_box_value_for_desc(shared: &SharedVm, value: Value, pdesc: &
                 .write()
                 .load_class(wname)
                 .unwrap_or(ClassId::new(0));
-            let obj = shared.heap.alloc_object(class_id, 1);
-            shared.heap.set_field(obj, 0, Value::Int(v));
+            let obj = shared.mem.heap.alloc_object(class_id, 1);
+            shared.mem.heap.set_field(obj, 0, Value::Int(v));
             return Value::Object(Some(obj));
         }
     }
@@ -14799,8 +14916,8 @@ pub(super) fn proxy_box_value(shared: &SharedVm, value: Value) -> Value {
                 .write()
                 .load_class("java/lang/Integer")
                 .unwrap_or(ClassId::new(0));
-            let obj = shared.heap.alloc_object(class_id, 1);
-            shared.heap.set_field(obj, 0, Value::Int(v));
+            let obj = shared.mem.heap.alloc_object(class_id, 1);
+            shared.mem.heap.set_field(obj, 0, Value::Int(v));
             Value::Object(Some(obj))
         }
         Value::Long(v) => {
@@ -14810,8 +14927,8 @@ pub(super) fn proxy_box_value(shared: &SharedVm, value: Value) -> Value {
                 .write()
                 .load_class("java/lang/Long")
                 .unwrap_or(ClassId::new(0));
-            let obj = shared.heap.alloc_object(class_id, 1);
-            shared.heap.set_field(obj, 0, Value::Long(v));
+            let obj = shared.mem.heap.alloc_object(class_id, 1);
+            shared.mem.heap.set_field(obj, 0, Value::Long(v));
             Value::Object(Some(obj))
         }
         Value::Float(v) => {
@@ -14821,8 +14938,8 @@ pub(super) fn proxy_box_value(shared: &SharedVm, value: Value) -> Value {
                 .write()
                 .load_class("java/lang/Float")
                 .unwrap_or(ClassId::new(0));
-            let obj = shared.heap.alloc_object(class_id, 1);
-            shared.heap.set_field(obj, 0, Value::Float(v));
+            let obj = shared.mem.heap.alloc_object(class_id, 1);
+            shared.mem.heap.set_field(obj, 0, Value::Float(v));
             Value::Object(Some(obj))
         }
         Value::Double(v) => {
@@ -14832,8 +14949,8 @@ pub(super) fn proxy_box_value(shared: &SharedVm, value: Value) -> Value {
                 .write()
                 .load_class("java/lang/Double")
                 .unwrap_or(ClassId::new(0));
-            let obj = shared.heap.alloc_object(class_id, 1);
-            shared.heap.set_field(obj, 0, Value::Double(v));
+            let obj = shared.mem.heap.alloc_object(class_id, 1);
+            shared.mem.heap.set_field(obj, 0, Value::Double(v));
             Value::Object(Some(obj))
         }
         other => other, // already an Object reference or null
@@ -14933,7 +15050,7 @@ fn invoke_on_class_shared_inner(
 ) -> MethodCallResult {
     if method_name != "<init>" && method_name != "<clinit>" {
         if let Some(Value::Object(Some(recv))) = args.first().copied() {
-            let recv_cid = shared.heap.class_id_of(recv);
+            let recv_cid = shared.mem.heap.class_id_of(recv);
             if shared.classes.lambda_proxies.read().contains_key(&recv_cid) {
                 if let Some(result) = crate::runtime::interpreter::try_lambda_dispatch(
                     shared,
@@ -14970,7 +15087,7 @@ fn invoke_on_class_shared_inner(
     let class_id = if !no_retarget && method_name != "<init>" && method_name != "<clinit>" {
         let recv_cid = args.get(0).and_then(|v| {
             if let Value::Object(Some(o)) = v {
-                Some(shared.heap.class_id_of(*o))
+                Some(shared.mem.heap.class_id_of(*o))
             } else {
                 None
             }
@@ -15125,7 +15242,7 @@ fn invoke_on_class_shared_inner(
     // (`file:java.nio.file.Path@<hash>` instead of the real path).
     if method_name == "toString" && descriptor == "()Ljava/lang/String;" {
         if let Some(Value::Object(Some(recv))) = args.first().copied() {
-            let recv_cid = shared.heap.class_id_of(recv);
+            let recv_cid = shared.mem.heap.class_id_of(recv);
             let is_path = {
                 let cm = shared.classes.class_manager.read();
                 cm.find_class_by_name("java/nio/file/Path")
@@ -15267,7 +15384,7 @@ fn invoke_on_class_shared_inner(
     // prefer its concrete bridge before inherited-native lookup.
     if method_name == "accept" && descriptor == "()Ljava/net/Socket;" {
         if let Some(Value::Object(Some(receiver))) = args.first() {
-            let receiver_class = shared.heap.class_id_of(*receiver);
+            let receiver_class = shared.mem.heap.class_id_of(*receiver);
             let receiver_name = shared
                 .classes
                 .class_manager
@@ -15304,7 +15421,7 @@ fn invoke_on_class_shared_inner(
         )
     {
         if let Some(Value::Object(Some(receiver))) = args.first() {
-            let receiver_class = shared.heap.class_id_of(*receiver);
+            let receiver_class = shared.mem.heap.class_id_of(*receiver);
             let receiver_name = shared
                 .classes
                 .class_manager
@@ -17964,7 +18081,7 @@ fn invoke_on_class_shared_inner(
                     {
                         let recv_actual_cid = args.first().and_then(|v| {
                             if let Value::Object(Some(o)) = v {
-                                let rc = shared.heap.class_id_of(*o);
+                                let rc = shared.mem.heap.class_id_of(*o);
                                 if rc != ClassId::new(0) && rc != declaring_id {
                                     Some(rc)
                                 } else {
@@ -17994,7 +18111,7 @@ fn invoke_on_class_shared_inner(
                         && descriptor == "(Ljava/lang/String;)Lorg/python/core/PyObject;"
                     {
                         if let Some(Value::Object(Some(recv))) = args.first().copied() {
-                            let recv_cid = shared.heap.class_id_of(recv);
+                            let recv_cid = shared.mem.heap.class_id_of(recv);
                             let recv_name = store.get(recv_cid).map(|c| &*c.name).unwrap_or("");
                             if matches!(
                                 recv_name,
@@ -18017,7 +18134,7 @@ fn invoke_on_class_shared_inner(
                         && descriptor == "(Ljava/lang/String;)Lorg/python/core/PyObject;"
                     {
                         if let Some(Value::Object(Some(recv))) = args.first().copied() {
-                            let recv_cid = shared.heap.class_id_of(recv);
+                            let recv_cid = shared.mem.heap.class_id_of(recv);
                             let recv_name = store.get(recv_cid).map(|c| &*c.name).unwrap_or("");
                             if recv_name == "org/python/core/PyModule"
                                 && shared
@@ -18038,7 +18155,7 @@ fn invoke_on_class_shared_inner(
                         && descriptor == "(Ljava/lang/String;)Lorg/python/core/PyObject;"
                     {
                         if let Some(Value::Object(Some(recv))) = args.first().copied() {
-                            let recv_cid = shared.heap.class_id_of(recv);
+                            let recv_cid = shared.mem.heap.class_id_of(recv);
                             let recv_name = store.get(recv_cid).map(|c| &*c.name).unwrap_or("");
                             if recv_name == "org/python/core/PyJavaType"
                                 && shared
@@ -18182,7 +18299,7 @@ fn invoke_on_class_shared_inner(
                                     .classes
                                     .class_manager
                                     .read()
-                                    .get_class(shared.heap.class_id_of(*receiver))
+                                    .get_class(shared.mem.heap.class_id_of(*receiver))
                                     .map(|class| {
                                         class.name.as_ref() == "java/lang/foreign/DowncallHandle"
                                     }),
@@ -18346,7 +18463,7 @@ fn invoke_on_class_shared_inner(
                     // route and dispatch the functional-interface SAM through the
                     // lambda metadata before trying generic Object fallbacks.
                     if let Some(Value::Object(Some(recv))) = args.first().copied() {
-                        let recv_cid = shared.heap.class_id_of(recv);
+                        let recv_cid = shared.mem.heap.class_id_of(recv);
                         if shared.classes.lambda_proxies.read().contains_key(&recv_cid) {
                             if let Some(result) = crate::runtime::interpreter::try_lambda_dispatch(
                                 shared,
@@ -18379,7 +18496,7 @@ fn invoke_on_class_shared_inner(
                     // because the candidate list is exactly the synthetic
                     // types we allocate with ClassId 0.
                     if let Some(Value::Object(Some(recv))) = args.first().copied() {
-                        let recv_cid = shared.heap.class_id_of(recv);
+                        let recv_cid = shared.mem.heap.class_id_of(recv);
                         if recv_cid == ClassId::new(0)
                             || shared
                                 .classes
@@ -18413,7 +18530,7 @@ fn invoke_on_class_shared_inner(
                     // recv_cid is a valid non-Object class but the CP
                     // dispatch resolved to Object due to a synthetic alloc.
                     if let Some(Value::Object(Some(recv))) = args.first().copied() {
-                        let recv_cid = shared.heap.class_id_of(recv);
+                        let recv_cid = shared.mem.heap.class_id_of(recv);
                         let cm2 = shared.classes.class_manager.read();
                         let recv_name = cm2
                             .class_store
@@ -18472,7 +18589,7 @@ fn invoke_on_class_shared_inner(
                     // mismatch) shows up in logs without rebuilding.
                     let recv_dbg = match args.first() {
                         Some(Value::Object(Some(o))) => {
-                            let cid = shared.heap.class_id_of(*o);
+                            let cid = shared.mem.heap.class_id_of(*o);
                             let cm3 = shared.classes.class_manager.read();
                             cm3.get_class(cid)
                                 .map(|c| c.name.to_string())
@@ -18556,7 +18673,7 @@ fn invoke_on_class_shared_inner(
                 // CP-interface or native-only rescues.
                 if !no_retarget && method_name != "<init>" && method_name != "<clinit>" {
                     if let Some(Value::Object(Some(recv))) = args.first().copied() {
-                        let recv_cid = shared.heap.class_id_of(recv);
+                        let recv_cid = shared.mem.heap.class_id_of(recv);
                         if recv_cid != class_id && recv_cid != ClassId::new(0) {
                             let cm_recv = shared.classes.class_manager.read();
                             if let Some((m, declaring_id)) =
@@ -18660,7 +18777,7 @@ fn invoke_on_class_shared_inner(
                         }
                     }
                     if let Some(Value::Object(Some(recv))) = args.first().copied() {
-                        let recv_cid = shared.heap.class_id_of(recv);
+                        let recv_cid = shared.mem.heap.class_id_of(recv);
                         let mut probe_cid = Some(recv_cid);
                         while let Some(cid) = probe_cid {
                             if cid == class_id {
@@ -18692,13 +18809,13 @@ fn invoke_on_class_shared_inner(
                 // proxy's stored name/value element arrays, so route there
                 // as the last resort before surfacing NoSuchMethodError.
                 if let Some(Value::Object(Some(recv))) = args.first().copied() {
-                    let recv_is_ann_proxy = shared.heap.kind_of(recv)
+                    let recv_is_ann_proxy = shared.mem.heap.kind_of(recv)
                         == cratonvm_types::ObjectKind::Object
                         && shared
                             .classes
                             .class_manager
                             .read()
-                            .get_class(shared.heap.class_id_of(recv))
+                            .get_class(shared.mem.heap.class_id_of(recv))
                             .map(|c| &*c.name == "java/lang/annotation/AnnotationProxy")
                             .unwrap_or(false);
                     if recv_is_ann_proxy {
@@ -18794,7 +18911,7 @@ fn invoke_on_class_shared_inner(
                             "  NSME-RECV addr=0x{addr:x} tid={} blocked={} epoch={}",
                             thread.thread_id.0,
                             blocked_flag,
-                            shared.heap.collection_count(),
+                            shared.mem.heap.collection_count(),
                         );
                         for (e, moved_to, mlen, as_dest) in crate::memory::gc::gcpart_probe(addr) {
                             eprintln!(
@@ -18833,9 +18950,10 @@ fn invoke_on_class_shared_inner(
                                 crate::runtime::interpreter::getfield_ring_find(addr)
                             {
                                 let cur = shared
+                                    .mem
                                     .heap
                                     .is_object_address(parent)
-                                    .map(|p| format!("{:?}", shared.heap.get_field(p, fidx)))
+                                    .map(|p| format!("{:?}", shared.mem.heap.get_field(p, fidx)))
                                     .unwrap_or_else(|| "<parent-not-obj>".into());
                                 eprintln!(
                                     "  NSME-RECV [getfield] pushed {} getfields ago from parent=0x{parent:x} fld[{fidx}] — parent's field NOW = {cur}",
@@ -18917,7 +19035,7 @@ fn invoke_on_class_shared_inner(
             // For virtual methods, extract receiver type from args[0]
             let receiver_type = if !is_static {
                 if let Some(Value::Object(Some(receiver_obj))) = args.first() {
-                    let receiver_class_id = shared.heap.class_id_of(*receiver_obj);
+                    let receiver_class_id = shared.mem.heap.class_id_of(*receiver_obj);
                     cm.class_store
                         .get(receiver_class_id)
                         .map(|c| c.name.to_string())
@@ -18960,10 +19078,10 @@ fn invoke_on_class_shared_inner(
             == "java/util/concurrent/ThreadPoolExecutor"
             && method_name == "execute"
             && matches!(args.first(), Some(Value::Object(Some(recv))) if {
-                let recv_class_id = shared.heap.class_id_of(*recv);
+                let recv_class_id = shared.mem.heap.class_id_of(*recv);
                 let cm = shared.classes.class_manager.read();
                 resolve_field_index_in_hierarchy(recv_class_id, "workers", &cm.class_store)
-                    .map(|idx| matches!(shared.heap.get_field(*recv, idx), Value::Object(Some(_))))
+                    .map(|idx| matches!(shared.mem.heap.get_field(*recv, idx), Value::Object(Some(_))))
                     .unwrap_or(false)
             });
         if !force_native_receiver_exempt
@@ -19617,6 +19735,7 @@ mod tests {
         );
         assert!(
             shared
+                .mem
                 .heap
                 .is_object_address(thrown.as_ptr() as usize)
                 .is_some(),
@@ -20000,7 +20119,7 @@ mod tests {
     #[test]
     fn cas_one_null_one_not() {
         let shared = test_shared();
-        let obj = shared.heap.alloc_object(ClassId::new(0), 0);
+        let obj = shared.mem.heap.alloc_object(ClassId::new(0), 0);
         assert!(!values_equal_for_cas(
             &Value::Object(Some(obj)),
             &Value::Object(None)
@@ -20014,7 +20133,7 @@ mod tests {
     #[test]
     fn cas_same_object_ref() {
         let shared = test_shared();
-        let obj = shared.heap.alloc_object(ClassId::new(0), 0);
+        let obj = shared.mem.heap.alloc_object(ClassId::new(0), 0);
         assert!(values_equal_for_cas(
             &Value::Object(Some(obj)),
             &Value::Object(Some(obj))
@@ -20024,8 +20143,8 @@ mod tests {
     #[test]
     fn cas_different_object_refs() {
         let shared = test_shared();
-        let obj1 = shared.heap.alloc_object(ClassId::new(0), 0);
-        let obj2 = shared.heap.alloc_object(ClassId::new(0), 0);
+        let obj1 = shared.mem.heap.alloc_object(ClassId::new(0), 0);
+        let obj2 = shared.mem.heap.alloc_object(ClassId::new(0), 0);
         assert!(!values_equal_for_cas(
             &Value::Object(Some(obj1)),
             &Value::Object(Some(obj2))
@@ -20216,8 +20335,8 @@ mod tests {
         let shared = test_shared();
         let (boolean_cid, _) =
             add_real_class_with_field_descriptors(&shared, "java/lang/Boolean", &["Z"]);
-        let boolean = shared.heap.alloc_object(boolean_cid, 1);
-        shared.heap.set_field(boolean, 0, Value::Int(1));
+        let boolean = shared.mem.heap.alloc_object(boolean_cid, 1);
+        shared.mem.heap.set_field(boolean, 0, Value::Int(1));
 
         assert_eq!(
             unbox_poly_return(
@@ -20239,7 +20358,7 @@ mod tests {
     #[test]
     fn poly_return_reference_passthrough() {
         let shared = test_shared();
-        let obj = shared.heap.alloc_object(ClassId::new(0), 0);
+        let obj = shared.mem.heap.alloc_object(ClassId::new(0), 0);
         let r = unbox_poly_return(
             &shared,
             Some(Value::Object(Some(obj))),
@@ -20280,7 +20399,7 @@ mod tests {
         let boxed = proxy_box_value(&shared, Value::Int(42));
         match boxed {
             Value::Object(Some(obj)) => {
-                assert_eq!(shared.heap.get_field(obj, 0), Value::Int(42));
+                assert_eq!(shared.mem.heap.get_field(obj, 0), Value::Int(42));
             }
             _ => panic!("Expected Object(Some(...))"),
         }
@@ -20292,7 +20411,7 @@ mod tests {
         let boxed = proxy_box_value(&shared, Value::Long(123456));
         match boxed {
             Value::Object(Some(obj)) => {
-                assert_eq!(shared.heap.get_field(obj, 0), Value::Long(123456));
+                assert_eq!(shared.mem.heap.get_field(obj, 0), Value::Long(123456));
             }
             _ => panic!("Expected Object(Some(...))"),
         }
@@ -20304,7 +20423,7 @@ mod tests {
         let boxed = proxy_box_value(&shared, Value::Float(3.25));
         match boxed {
             Value::Object(Some(obj)) => {
-                assert_eq!(shared.heap.get_field(obj, 0), Value::Float(3.25));
+                assert_eq!(shared.mem.heap.get_field(obj, 0), Value::Float(3.25));
             }
             _ => panic!("Expected Object(Some(...))"),
         }
@@ -20316,7 +20435,7 @@ mod tests {
         let boxed = proxy_box_value(&shared, Value::Double(2.5));
         match boxed {
             Value::Object(Some(obj)) => {
-                assert_eq!(shared.heap.get_field(obj, 0), Value::Double(2.5));
+                assert_eq!(shared.mem.heap.get_field(obj, 0), Value::Double(2.5));
             }
             _ => panic!("Expected Object(Some(...))"),
         }
@@ -20325,7 +20444,7 @@ mod tests {
     #[test]
     fn box_object_passthrough() {
         let shared = test_shared();
-        let obj = shared.heap.alloc_object(ClassId::new(0), 0);
+        let obj = shared.mem.heap.alloc_object(ClassId::new(0), 0);
         let boxed = proxy_box_value(&shared, Value::Object(Some(obj)));
         assert_eq!(boxed, Value::Object(Some(obj)));
     }
@@ -20421,7 +20540,7 @@ mod tests {
     fn unregister_native_thread_releases_monitors_held_by_the_dying_thread() {
         let shared = test_shared();
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let obj = shared.heap.alloc_object(ClassId::new(0), 0);
+        let obj = shared.mem.heap.alloc_object(ClassId::new(0), 0);
         let native_tid = {
             let mut ctx = NativeContextImpl {
                 shared: &shared,
@@ -20466,7 +20585,7 @@ mod tests {
     fn native_context_identity_hash_code() {
         let shared = test_shared();
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let obj = shared.heap.alloc_object(ClassId::new(0), 0);
+        let obj = shared.mem.heap.alloc_object(ClassId::new(0), 0);
         let ctx = NativeContextImpl {
             shared: &shared,
             thread: &mut thread,
@@ -20479,7 +20598,7 @@ mod tests {
     fn native_context_class_id_of_object() {
         let shared = test_shared();
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let obj = shared.heap.alloc_object(ClassId::new(7), 2);
+        let obj = shared.mem.heap.alloc_object(ClassId::new(7), 2);
         let ctx = NativeContextImpl {
             shared: &shared,
             thread: &mut thread,
@@ -20491,7 +20610,7 @@ mod tests {
     fn native_context_field_access() {
         let shared = test_shared();
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let obj = shared.heap.alloc_object(ClassId::new(0), 3);
+        let obj = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         let ctx = NativeContextImpl {
             shared: &shared,
             thread: &mut thread,
@@ -20618,8 +20737,8 @@ mod tests {
     #[test]
     fn native_context_throwable_trace_survives_producer_thread_context() {
         let shared = test_shared();
-        let throwable = shared.heap.alloc_object(ClassId::new(0), 0);
-        let hash = shared.heap.identity_hash_code(throwable);
+        let throwable = shared.mem.heap.alloc_object(ClassId::new(0), 0);
+        let hash = shared.mem.heap.identity_hash_code(throwable);
         {
             let mut producer = JvmThread::new(ThreadId(1), "producer");
             let mut ctx = NativeContextImpl {
@@ -20790,11 +20909,12 @@ mod tests {
         // Even without the NativeContext path, confirm the heap-level
         // descriptor-aware API normalizes a drifted Double back to Long.
         let shared = test_shared();
-        let obj = shared.heap.alloc_object(ClassId::new(1), 1);
+        let obj = shared.mem.heap.alloc_object(ClassId::new(1), 1);
         shared
+            .mem
             .heap
             .set_field(obj, 0, Value::Double(f64::from_bits(777)));
-        match shared.heap.get_field_as(obj, 0, b'J') {
+        match shared.mem.heap.get_field_as(obj, 0, b'J') {
             Value::Long(l) => assert_eq!(l, 777),
             other => panic!("expected Long(777), got {other:?}"),
         }
@@ -20912,9 +21032,10 @@ mod tests {
             cls.fields[0].name = Arc::from("target");
         }
 
-        let thread_obj = shared.heap.alloc_object(thread_cid, 1);
-        let target = shared.heap.alloc_object(ClassId::new(0), 0);
+        let thread_obj = shared.mem.heap.alloc_object(thread_cid, 1);
+        let target = shared.mem.heap.alloc_object(ClassId::new(0), 0);
         shared
+            .mem
             .heap
             .set_field(thread_obj, 0, Value::Object(Some(target)));
 
@@ -20969,10 +21090,11 @@ mod tests {
         let shared = test_shared();
         let (cid, _n) =
             add_real_class_with_field_descriptors(&shared, "cratonvm/test/T19H6_LongField", &["J"]);
-        let obj = shared.heap.alloc_object(cid, 1);
+        let obj = shared.mem.heap.alloc_object(cid, 1);
         // Inject a Double-tagged store at slot 0 with the bit pattern of 42L.
         // This mimics the upstream operand-stack tag drift.
         shared
+            .mem
             .heap
             .set_field(obj, 0, Value::Double(f64::from_bits(42)));
 
@@ -21003,8 +21125,8 @@ mod tests {
             "cratonvm/test/T19H6_DoubleField",
             &["D"],
         );
-        let obj = shared.heap.alloc_object(cid, 1);
-        shared.heap.set_field(obj, 0, Value::Double(2.5));
+        let obj = shared.mem.heap.alloc_object(cid, 1);
+        shared.mem.heap.set_field(obj, 0, Value::Double(2.5));
 
         let mut thread = JvmThread::new(ThreadId(0), "test");
         let mut ctx = NativeContextImpl {
@@ -21023,8 +21145,8 @@ mod tests {
         let shared = test_shared();
         let (cid, _n) =
             add_real_class_with_field_descriptors(&shared, "cratonvm/test/T19H6_IntField", &["I"]);
-        let obj = shared.heap.alloc_object(cid, 1);
-        shared.heap.set_field(obj, 0, Value::Int(7));
+        let obj = shared.mem.heap.alloc_object(cid, 1);
+        shared.mem.heap.set_field(obj, 0, Value::Int(7));
 
         let mut thread = JvmThread::new(ThreadId(0), "test");
         let mut ctx = NativeContextImpl {
@@ -21050,9 +21172,9 @@ mod tests {
             "cratonvm/test/T19H6_LongFieldDoubleExpected",
             &["J"],
         );
-        let obj = shared.heap.alloc_object(cid, 1);
+        let obj = shared.mem.heap.alloc_object(cid, 1);
         // Storage is correctly Long(0).
-        shared.heap.set_field(obj, 0, Value::Long(0));
+        shared.mem.heap.set_field(obj, 0, Value::Long(0));
 
         let mut thread = JvmThread::new(ThreadId(0), "test");
         let mut ctx = NativeContextImpl {

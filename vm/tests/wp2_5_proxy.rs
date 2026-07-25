@@ -333,8 +333,8 @@ fn proxy_invoke_handler_shared_with_object_handler_smoke() {
     // verifying.
     use cratonvm_types::ClassId;
     let cls = ClassId::new(1);
-    let handler = shared.heap.alloc_object(cls, 0);
-    let handler_class_id = shared.heap.class_id_of(handler);
+    let handler = shared.mem.heap.alloc_object(cls, 0);
+    let handler_class_id = shared.mem.heap.class_id_of(handler);
     // Confirm the heap object isn't classified as a lambda proxy.
     let in_lambda_table = shared
         .classes

@@ -459,7 +459,7 @@ fn poll_submission_status_unknown_handle_returns_none() {
 // missing at integration altitude is the same round trip through a real
 // `SharedVm`'s heap and its real `enter_gpu_critical()` (the
 // process-wide `GPU_CRITICAL_COUNT` gate `dispatch_method_from_native`
-// actually uses via `GcCriticalGuard`/`shared.heap.enter_gpu_critical()`),
+// actually uses via `GcCriticalGuard`/`shared.mem.heap.enter_gpu_critical()`),
 // rather than a synthetic per-test counter. Added here.
 //
 // NOTE on "via ResidencyTracker if applicable" (task item d): it is not
@@ -478,14 +478,15 @@ fn poll_submission_status_unknown_handle_returns_none() {
 #[test]
 fn host_view_i16_round_trips_through_shared_vm_heap() {
     let shared = Arc::new(SharedVm::new(VmConfig::new()));
-    let token = shared.heap.enter_gpu_critical();
+    let token = shared.mem.heap.enter_gpu_critical();
     let arr = shared
+        .mem
         .heap
         .alloc_array(ClassId::new(1), ArrayElementType::Short, 6);
 
     let src: Vec<i16> = vec![0, -1, 12345, i16::MIN, i16::MAX, 7];
-    write_back_i16(arr, &shared.heap, &src, &token);
-    let view = host_view_i16(arr, &shared.heap, &token);
+    write_back_i16(arr, &shared.mem.heap, &src, &token);
+    let view = host_view_i16(arr, &shared.mem.heap, &token);
     assert_eq!(view, src);
 
     // Cross-check the tail element through the value-based accessor too
@@ -493,7 +494,11 @@ fn host_view_i16_round_trips_through_shared_vm_heap() {
     // SharedVm-heap-specific aliasing bug wouldn't hide behind a
     // matching-length comparison alone.
     assert_eq!(
-        shared.heap.get_array_element(arr, src.len() - 1).unwrap(),
+        shared
+            .mem
+            .heap
+            .get_array_element(arr, src.len() - 1)
+            .unwrap(),
         Value::Int(*src.last().unwrap() as i32)
     );
     drop(token);
@@ -502,18 +507,23 @@ fn host_view_i16_round_trips_through_shared_vm_heap() {
 #[test]
 fn host_view_i8_round_trips_through_shared_vm_heap() {
     let shared = Arc::new(SharedVm::new(VmConfig::new()));
-    let token = shared.heap.enter_gpu_critical();
+    let token = shared.mem.heap.enter_gpu_critical();
     let arr = shared
+        .mem
         .heap
         .alloc_array(ClassId::new(1), ArrayElementType::Byte, 5);
 
     let src: Vec<i8> = vec![0, -1, 1, i8::MIN, i8::MAX];
-    write_back_i8(arr, &shared.heap, &src, &token);
-    let view = host_view_i8(arr, &shared.heap, &token);
+    write_back_i8(arr, &shared.mem.heap, &src, &token);
+    let view = host_view_i8(arr, &shared.mem.heap, &token);
     assert_eq!(view, src);
 
     assert_eq!(
-        shared.heap.get_array_element(arr, src.len() - 1).unwrap(),
+        shared
+            .mem
+            .heap
+            .get_array_element(arr, src.len() - 1)
+            .unwrap(),
         Value::Int(*src.last().unwrap() as i32)
     );
     drop(token);
@@ -528,13 +538,13 @@ fn gpu_critical_count_reflects_live_tokens_on_shared_vm_heap() {
     // `GcCriticalGuard` and the GC's `wait_for_gpu_critical_drain` depend
     // on to avoid moving arrays out from under an in-flight kernel.
     let shared = Arc::new(SharedVm::new(VmConfig::new()));
-    let before = shared.heap.gpu_critical_count();
+    let before = shared.mem.heap.gpu_critical_count();
     {
-        let _token = shared.heap.enter_gpu_critical();
-        assert_eq!(shared.heap.gpu_critical_count(), before + 1);
+        let _token = shared.mem.heap.enter_gpu_critical();
+        assert_eq!(shared.mem.heap.gpu_critical_count(), before + 1);
     }
     assert_eq!(
-        shared.heap.gpu_critical_count(),
+        shared.mem.heap.gpu_critical_count(),
         before,
         "the token's Drop must release the process-wide critical count"
     );
@@ -568,14 +578,17 @@ fn device_vector_add_handled_with_correct_output() {
 
     let a = vm
         .shared
+        .mem
         .heap
         .alloc_array(ClassId::new(1), ArrayElementType::Int, n);
     let b = vm
         .shared
+        .mem
         .heap
         .alloc_array(ClassId::new(1), ArrayElementType::Int, n);
     let out = vm
         .shared
+        .mem
         .heap
         .alloc_array(ClassId::new(1), ArrayElementType::Int, n);
     let mut expected = vec![0i32; n];
@@ -583,10 +596,12 @@ fn device_vector_add_handled_with_correct_output() {
         let av = i as i32;
         let bv = 2 * i as i32;
         vm.shared
+            .mem
             .heap
             .set_array_element(a, i, Value::Int(av))
             .unwrap();
         vm.shared
+            .mem
             .heap
             .set_array_element(b, i, Value::Int(bv))
             .unwrap();
@@ -617,7 +632,7 @@ fn device_vector_add_handled_with_correct_output() {
 
     for i in 0..n {
         assert_eq!(
-            vm.shared.heap.get_array_element(out, i).unwrap(),
+            vm.shared.mem.heap.get_array_element(out, i).unwrap(),
             Value::Int(expected[i]),
             "out[{i}] mismatch"
         );
@@ -646,10 +661,12 @@ fn device_dot_product_handled_with_value_matches_host_reference() {
 
     let a = vm
         .shared
+        .mem
         .heap
         .alloc_array(ClassId::new(1), ArrayElementType::Int, n);
     let b = vm
         .shared
+        .mem
         .heap
         .alloc_array(ClassId::new(1), ArrayElementType::Int, n);
     let mut expected: i64 = 0;
@@ -657,10 +674,12 @@ fn device_dot_product_handled_with_value_matches_host_reference() {
         let av = (i % 13) as i32 - 6;
         let bv = (i % 7) as i32 - 3;
         vm.shared
+            .mem
             .heap
             .set_array_element(a, i, Value::Int(av))
             .unwrap();
         vm.shared
+            .mem
             .heap
             .set_array_element(b, i, Value::Int(bv))
             .unwrap();
@@ -709,22 +728,27 @@ fn device_vector_add_below_min_work_keeps_call_site_hooked() {
 
     let a = vm
         .shared
+        .mem
         .heap
         .alloc_array(ClassId::new(1), ArrayElementType::Int, n);
     let b = vm
         .shared
+        .mem
         .heap
         .alloc_array(ClassId::new(1), ArrayElementType::Int, n);
     let out = vm
         .shared
+        .mem
         .heap
         .alloc_array(ClassId::new(1), ArrayElementType::Int, n);
     for i in 0..n {
         vm.shared
+            .mem
             .heap
             .set_array_element(a, i, Value::Int(i as i32))
             .unwrap();
         vm.shared
+            .mem
             .heap
             .set_array_element(b, i, Value::Int(1))
             .unwrap();
@@ -785,14 +809,17 @@ fn device_submission_completes_spontaneously_without_any_poll_call() {
 
     let a = vm
         .shared
+        .mem
         .heap
         .alloc_array(ClassId::new(1), ArrayElementType::Int, n);
     let b = vm
         .shared
+        .mem
         .heap
         .alloc_array(ClassId::new(1), ArrayElementType::Int, n);
     let out = vm
         .shared
+        .mem
         .heap
         .alloc_array(ClassId::new(1), ArrayElementType::Int, n);
     let mut expected = vec![0i32; n];
@@ -800,10 +827,12 @@ fn device_submission_completes_spontaneously_without_any_poll_call() {
         let av = i as i32;
         let bv = 2 * i as i32;
         vm.shared
+            .mem
             .heap
             .set_array_element(a, i, Value::Int(av))
             .unwrap();
         vm.shared
+            .mem
             .heap
             .set_array_element(b, i, Value::Int(bv))
             .unwrap();
@@ -859,7 +888,7 @@ fn device_submission_completes_spontaneously_without_any_poll_call() {
 
     for i in 0..n {
         assert_eq!(
-            vm.shared.heap.get_array_element(out, i).unwrap(),
+            vm.shared.mem.heap.get_array_element(out, i).unwrap(),
             Value::Int(expected[i]),
             "out[{i}] mismatch — reaper-driven finalize must drain writebacks correctly, not just flip status",
         );

@@ -34,7 +34,7 @@ fn test_vm() -> Vm {
 }
 
 fn read_test_java_string(vm: &Vm, obj: ObjectRef) -> Option<String> {
-    let heap = &vm.shared.heap;
+    let heap = &vm.shared.mem.heap;
     let value_array = match heap.get_field(obj, 0) {
         Value::Object(Some(arr)) => arr,
         _ => return None,
@@ -76,10 +76,10 @@ fn read_test_java_string(vm: &Vm, obj: ObjectRef) -> Option<String> {
 }
 
 fn throwable_detail_message(vm: &Vm, exc: ObjectRef) -> Option<String> {
-    let class_id = vm.shared.heap.class_id_of(exc);
+    let class_id = vm.shared.mem.heap.class_id_of(exc);
     let msg_ref = vm
         .instance_field_index(class_id, "detailMessage")
-        .and_then(|idx| match vm.shared.heap.get_field(exc, idx) {
+        .and_then(|idx| match vm.shared.mem.heap.get_field(exc, idx) {
             Value::Object(Some(msg)) => Some(msg),
             _ => None,
         })?;
@@ -89,7 +89,7 @@ fn throwable_detail_message(vm: &Vm, exc: ObjectRef) -> Option<String> {
 fn describe_result(vm: &Vm, result: &MethodCallResult) -> String {
     match result {
         Err(MethodCallFailed::ExceptionThrown(exc)) => {
-            let class_id = vm.shared.heap.class_id_of(*exc);
+            let class_id = vm.shared.mem.heap.class_id_of(*exc);
             let class_name = vm
                 .shared
                 .classes

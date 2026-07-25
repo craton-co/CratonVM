@@ -413,7 +413,7 @@ fn bench_object_allocation(c: &mut Criterion) {
                 // Fresh VM per iteration to avoid OOM across warmup/samples
                 let shared = Arc::new(SharedVm::new(VmConfig::default()));
                 for _ in 0..n {
-                    let obj = shared.heap.alloc_object(ClassId::new(1), 4);
+                    let obj = shared.mem.heap.alloc_object(ClassId::new(1), 4);
                     black_box(obj);
                 }
             });
@@ -429,13 +429,14 @@ fn bench_gc_cycle(c: &mut Criterion) {
             let shared = Arc::new(SharedVm::new(VmConfig::default()));
             let mut roots = Vec::new();
             for _ in 0..1000 {
-                let obj = shared.heap.alloc_object(ClassId::new(1), 2);
+                let obj = shared.mem.heap.alloc_object(ClassId::new(1), 2);
                 roots.push(obj);
             }
-            if shared.heap.needs_gc() {
+            if shared.mem.heap.needs_gc() {
                 // Single-threaded benchmark — no other mutator exists.
                 let stw = unsafe { cratonvm_gc::collector::StopTheWorldToken::new() };
                 let _ = shared
+                    .mem
                     .heap
                     .collect_garbage(&stw, &mut roots, &shared.threads.monitors);
             }
@@ -1043,8 +1044,8 @@ fn bench_gc_write_barrier(c: &mut Criterion) {
     let shared = Arc::new(SharedVm::new(VmConfig::default()));
     // One holder object + one referent — the canonical "store ref into
     // field" shape the barrier triggers on.
-    let holder = shared.heap.alloc_object(ClassId::new(1), 4);
-    let referent = shared.heap.alloc_object(ClassId::new(1), 4);
+    let holder = shared.mem.heap.alloc_object(ClassId::new(1), 4);
+    let referent = shared.mem.heap.alloc_object(ClassId::new(1), 4);
 
     c.bench_function("gc_write_barrier_lower_bound_touch_loop", |b| {
         b.iter(|| {
@@ -1072,7 +1073,7 @@ fn bench_gc_write_barrier(c: &mut Criterion) {
 /// the monitor table at the same rate.
 fn bench_monitor_enter_exit(c: &mut Criterion) {
     let shared = Arc::new(SharedVm::new(VmConfig::default()));
-    let obj = shared.heap.alloc_object(ClassId::new(1), 4);
+    let obj = shared.mem.heap.alloc_object(ClassId::new(1), 4);
 
     c.bench_function("monitor_enter_exit_lower_bound_touch_loop", |b| {
         b.iter(|| {
@@ -1112,7 +1113,7 @@ fn bench_exception_throw_catch(c: &mut Criterion) {
                 // iteration approximates that without needing the
                 // unwinder. Replace with a `throw + catch` invocation
                 // once the bytecode fixture lands.
-                let exc = shared.heap.alloc_object(ClassId::new(1), 4);
+                let exc = shared.mem.heap.alloc_object(ClassId::new(1), 4);
                 black_box(exc);
             }
         });

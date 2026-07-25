@@ -851,7 +851,7 @@ pub mod helpful_npe {
 /// `Throwable.backtrace` (slot 0) with a String reference and leave
 /// `detailMessage` (slot 1) and `cause` (slot 2) untouched.
 fn set_detail_message_by_name(shared: &SharedVm, obj: ObjectRef, string_ref: ObjectRef) {
-    let class_id = shared.heap.class_id_of(obj);
+    let class_id = shared.mem.heap.class_id_of(obj);
     let cm = shared.classes.class_manager.read();
     let mut walk = Some(class_id);
     // Real-JDK bootstrap metadata intentionally represents a few core fields
@@ -880,6 +880,7 @@ fn set_detail_message_by_name(shared: &SharedVm, obj: ObjectRef, string_ref: Obj
                 let idx = cls.first_field_index + inst;
                 drop(cm);
                 shared
+                    .mem
                     .heap
                     .set_field(obj, idx, Value::Object(Some(string_ref)));
                 return;
@@ -891,6 +892,7 @@ fn set_detail_message_by_name(shared: &SharedVm, obj: ObjectRef, string_ref: Obj
     if let Some(idx) = opaque_throwable_detail_message {
         drop(cm);
         shared
+            .mem
             .heap
             .set_field(obj, idx, Value::Object(Some(string_ref)));
     }
@@ -903,7 +905,7 @@ fn set_detail_message_by_name(shared: &SharedVm, obj: ObjectRef, string_ref: Obj
 /// needing to know the field's numeric slot (differs between real-JDK and
 /// synthetic layouts). See `raise_no_class_def_found_with_cause`.
 fn set_cause_by_name(shared: &SharedVm, obj: ObjectRef, cause_ref: ObjectRef) {
-    let class_id = shared.heap.class_id_of(obj);
+    let class_id = shared.mem.heap.class_id_of(obj);
     let cm = shared.classes.class_manager.read();
     let mut walk = Some(class_id);
     while let Some(cid) = walk {
@@ -919,6 +921,7 @@ fn set_cause_by_name(shared: &SharedVm, obj: ObjectRef, cause_ref: ObjectRef) {
                 let idx = cls.first_field_index + inst;
                 drop(cm);
                 shared
+                    .mem
                     .heap
                     .set_field(obj, idx, Value::Object(Some(cause_ref)));
                 return;
@@ -1002,7 +1005,7 @@ pub fn create_exception_object_for_class(
         .get_class(class_id)
         .map(|c| c.num_total_fields)
         .unwrap_or(0);
-    let obj_ref = match shared.heap.try_alloc_object(class_id, num_fields) {
+    let obj_ref = match shared.mem.heap.try_alloc_object(class_id, num_fields) {
         Some(obj) => obj,
         None => {
             // Young gen full — force a GC cycle and retry.
@@ -1021,6 +1024,7 @@ pub fn create_exception_object_for_class(
                 )));
             }
             shared
+                .mem
                 .heap
                 .try_alloc_object(class_id, num_fields)
                 .ok_or_else(|| {
@@ -1568,7 +1572,7 @@ pub fn throw_runtime_error(
                 ))
             );
             if is_oom {
-                if let Some(oom) = *shared.singleton_oom.read() {
+                if let Some(oom) = *shared.mem.singleton_oom.read() {
                     return MethodCallFailed::ExceptionThrown(oom);
                 }
             }
@@ -1590,7 +1594,7 @@ pub fn throw_runtime_error(
 /// loadable) it leaves the slot empty and the OOM paths keep their prior
 /// behaviour — never worse.
 pub fn ensure_singleton_oom(shared: &SharedVm, thread: &mut JvmThread) {
-    if shared.singleton_oom.read().is_some() {
+    if shared.mem.singleton_oom.read().is_some() {
         return;
     }
     if let Ok(obj) = create_exception_object(
@@ -1599,7 +1603,7 @@ pub fn ensure_singleton_oom(shared: &SharedVm, thread: &mut JvmThread) {
         "java/lang/OutOfMemoryError",
         Some("Java heap space"),
     ) {
-        *shared.singleton_oom.write() = Some(obj);
+        *shared.mem.singleton_oom.write() = Some(obj);
     }
 }
 

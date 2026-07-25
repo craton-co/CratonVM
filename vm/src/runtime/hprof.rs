@@ -242,7 +242,7 @@ impl<'a> HprofDumper<'a> {
         self.write_class_dumps(&mut seg);
 
         // 5c: walk heap objects
-        let objects = self.vm.heap.walk_objects();
+        let objects = self.vm.mem.heap.walk_objects();
         for (ptr, _size) in &objects {
             // SAFETY: `walk_objects()` returns raw pointers that are
             // guaranteed to point at live object headers in the heap
@@ -253,7 +253,7 @@ impl<'a> HprofDumper<'a> {
             // HPROF dump is in progress — dump is serialized against
             // concurrent GC via the SharedVm's gc_barrier).
             let obj = unsafe { ObjectRef::from_raw(*ptr) };
-            let header = self.vm.heap.get_header(obj);
+            let header = self.vm.mem.heap.get_header(obj);
 
             match header.kind {
                 ObjectKind::Object => self.write_instance_dump_with_values(&mut seg, obj),
@@ -391,7 +391,7 @@ impl<'a> HprofDumper<'a> {
     // ---- OBJ_ARRAY_DUMP sub-records -------------------------------------
 
     fn write_obj_array_dump(&self, seg: &mut SegmentBuilder, obj: ObjectRef) {
-        let header = self.vm.heap.get_header(obj);
+        let header = self.vm.mem.heap.get_header(obj);
         let length = header.array_length() as usize;
         let class_id = header.class_id;
 
@@ -404,6 +404,7 @@ impl<'a> HprofDumper<'a> {
         for i in 0..length {
             let val = self
                 .vm
+                .mem
                 .heap
                 .get_array_element(obj, i)
                 .unwrap_or(cratonvm_types::Value::Object(None));
@@ -417,7 +418,7 @@ impl<'a> HprofDumper<'a> {
     // ---- PRIM_ARRAY_DUMP sub-records ------------------------------------
 
     fn write_prim_array_dump(&self, seg: &mut SegmentBuilder, obj: ObjectRef) {
-        let header = self.vm.heap.get_header(obj);
+        let header = self.vm.mem.heap.get_header(obj);
         let length = header.array_length() as usize;
         let elem_type = header.element_type;
         let hprof_type = array_element_to_hprof(elem_type);
@@ -431,6 +432,7 @@ impl<'a> HprofDumper<'a> {
         for i in 0..length {
             let val = self
                 .vm
+                .mem
                 .heap
                 .get_array_element(obj, i)
                 .unwrap_or(cratonvm_types::Value::Int(0));
@@ -639,7 +641,7 @@ fn class_hierarchy_chain(
 impl<'a> HprofDumper<'a> {
     /// Improved write_instance_dump that reads actual field values from the heap.
     fn write_instance_dump_with_values(&self, seg: &mut SegmentBuilder, obj: ObjectRef) {
-        let header = self.vm.heap.get_header(obj);
+        let header = self.vm.mem.heap.get_header(obj);
         let class_id = header.class_id;
         let num_fields = header.num_slots() as usize;
 
@@ -658,7 +660,7 @@ impl<'a> HprofDumper<'a> {
                     }
                     let htype = descriptor_to_hprof_type(&f.descriptor);
                     let val = if slot_idx < num_fields {
-                        self.vm.heap.get_field(obj, slot_idx)
+                        self.vm.mem.heap.get_field(obj, slot_idx)
                     } else {
                         cratonvm_types::Value::Int(0)
                     };

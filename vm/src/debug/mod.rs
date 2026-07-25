@@ -1251,6 +1251,7 @@ impl DebuggerVmBridge for SharedVmBridge {
 
         let array_ref = self
             .shared
+            .mem
             .heap
             .alloc_array(class_id, element_type, length as usize);
         let wire_id = array_ref.as_ptr() as u64;

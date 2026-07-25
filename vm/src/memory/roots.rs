@@ -132,20 +132,20 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
             // drop an active FJP receiver while it is also parked in a callee
             // frame. Over-retaining a dead reference is harmless here; missing
             // the receiver lets selective promotion zero it under `join()`.
-            frame.scan_local_objects_all_live(&mut roots, &shared.heap);
+            frame.scan_local_objects_all_live(&mut roots, &shared.mem.heap);
         } else {
-            frame.scan_local_objects(&mut roots, &shared.heap);
+            frame.scan_local_objects(&mut roots, &shared.mem.heap);
         }
         if conservative_locals {
-            frame.scan_locals_conservative(&mut roots, &shared.heap);
+            frame.scan_locals_conservative(&mut roots, &shared.mem.heap);
         }
         let before = roots.len();
-        frame.stack.scan_object_refs(&mut roots, &shared.heap);
+        frame.stack.scan_object_refs(&mut roots, &shared.mem.heap);
         if roots.len() > before {
             let added = roots.split_off(before);
             for o in added {
                 let addr = o.as_ptr() as usize;
-                if shared.heap.is_object_address(addr).is_some() {
+                if shared.mem.heap.is_object_address(addr).is_some() {
                     roots.push(o);
                 }
             }
@@ -153,7 +153,7 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
         if conservative_locals {
             frame
                 .stack
-                .scan_object_refs_conservative(&mut roots, &shared.heap);
+                .scan_object_refs_conservative(&mut roots, &shared.mem.heap);
         }
     }
 
@@ -254,7 +254,7 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
 
     // 5. Interned string pool — all interned String objects
     {
-        let string_pool = shared.string_pool.read();
+        let string_pool = shared.mem.string_pool.read();
         for obj_ref in string_pool.values() {
             roots.push(*obj_ref);
         }
@@ -394,7 +394,7 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     //     fields and are used for lock-free CAS; without rooting them here a
     //     moving GC reclaimed them and left their static holder slots stale.
     {
-        let vhs = shared.var_handle_roots.read();
+        let vhs = shared.mem.var_handle_roots.read();
         for obj_ref in vhs.values() {
             roots.push(*obj_ref);
         }
@@ -405,7 +405,7 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     //     permanently (it is held only by `SharedVm`, not any Java field), so a
     //     moving collector cannot reclaim it and leave the OOM-fallback dangling.
     {
-        if let Some(oom_ref) = *shared.singleton_oom.read() {
+        if let Some(oom_ref) = *shared.mem.singleton_oom.read() {
             roots.push(oom_ref);
         }
     }
@@ -484,7 +484,7 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     //     after a move is `cratonvm_gc::pinned::update_after_gc` (gc.rs).
     if cratonvm_gc::pinned::any_pinned() {
         for addr in cratonvm_gc::pinned::pinned_addrs() {
-            if let Some(obj) = shared.heap.is_object_address(addr) {
+            if let Some(obj) = shared.mem.heap.is_object_address(addr) {
                 roots.push(obj);
             }
         }
@@ -596,7 +596,7 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
         && crate::jit::conservative_roots::refresh_moving_young_coverage_for_current_thread()
         && !cratonvm_gc::gc_quiescence::moving_young_coverage_incomplete();
     if !moving_young_precise_only {
-        crate::jit::conservative_roots::scan_active_jit_frames(&shared.heap, &mut roots);
+        crate::jit::conservative_roots::scan_active_jit_frames(&shared.mem.heap, &mut roots);
     }
     // G1 pin-in-place for conservative JIT roots: the generational collector
     // protects a conservatively-scanned JIT root (a register/spill slot the
@@ -610,7 +610,7 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     // Publish each conservative JIT-frame root so the G1 collector can pin its
     // region. Gated on G1 (the generational path doesn't read this set) and on
     // there actually being JIT roots this cycle.
-    if shared.heap.is_g1() && roots.len() > jit_scan_start {
+    if shared.mem.heap.is_g1() && roots.len() > jit_scan_start {
         for r in &roots[jit_scan_start..] {
             cratonvm_gc::gc_quiescence::add_pinned_jit_root(r.as_ptr() as usize);
         }
@@ -653,7 +653,7 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
             }
         }
         thread.shadow_stack.for_each_value(|v| {
-            if let Some(obj_ref) = shared.heap.is_object_address(v) {
+            if let Some(obj_ref) = shared.mem.heap.is_object_address(v) {
                 roots.push(obj_ref);
                 if !pin {
                     // B-K kafka fix: shadow-stack oops are precise AND
@@ -870,7 +870,7 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
         let rooted = roots.iter().any(|o| o.as_ptr() as usize == w);
         eprintln!(
             "[watch] roots GC#{} addr=0x{w:x} rooted={rooted} frames={} pins={}",
-            shared.heap.collection_count(),
+            shared.mem.heap.collection_count(),
             thread.frames.len(),
             thread.native_pin_roots.len()
         );
@@ -900,7 +900,7 @@ mod tests {
     use crate::classloading::ClassId;
     use crate::config::VmConfig;
     // FIX: `Heap` import removed — the locals/stack root tests now allocate
-    // from `shared.heap` (the heap actually scanned) instead of an orphan
+    // from `shared.mem.heap` (the heap actually scanned) instead of an orphan
     // `Heap::new()`, so the standalone `Heap` type is no longer referenced.
     use crate::runtime::frame::Frame;
     use crate::threading::jvm_thread::ThreadId;
@@ -913,11 +913,11 @@ mod tests {
     #[test]
     fn roots_from_frame_locals() {
         let shared = test_shared_vm();
-        // FIX: allocate from `shared.heap` (the heap the scanner validates
+        // FIX: allocate from `shared.mem.heap` (the heap the scanner validates
         // against via `is_object_address`), not an orphan `Heap::new()`.
         // The frame scanner drops any slot whose address is not resident in
         // the heap being scanned — a foreign-heap object can never be a root.
-        let obj = shared.heap.alloc_object(ClassId::new(0), 0);
+        let obj = shared.mem.heap.alloc_object(ClassId::new(0), 0);
 
         let mut thread = JvmThread::new(ThreadId(0), "test");
         let frame = Frame::new(
@@ -941,12 +941,12 @@ mod tests {
     #[test]
     fn roots_from_frame_stack() {
         let shared = test_shared_vm();
-        // FIX: allocate from `shared.heap` so the operand-stack scanner's
+        // FIX: allocate from `shared.mem.heap` so the operand-stack scanner's
         // `is_heap_addr` validation recognizes the objects as live heap
         // residents. Objects from a disconnected `Heap::new()` are correctly
         // rejected by the scanner and would never appear as roots.
-        let obj1 = shared.heap.alloc_object(ClassId::new(0), 0);
-        let obj2 = shared.heap.alloc_object(ClassId::new(0), 0);
+        let obj1 = shared.mem.heap.alloc_object(ClassId::new(0), 0);
+        let obj2 = shared.mem.heap.alloc_object(ClassId::new(0), 0);
 
         let mut thread = JvmThread::new(ThreadId(0), "test");
         let mut frame = Frame::new(
@@ -974,7 +974,7 @@ mod tests {
     #[test]
     fn roots_from_statics() {
         let shared = test_shared_vm();
-        let obj = shared.heap.alloc_object(ClassId::new(0), 0);
+        let obj = shared.mem.heap.alloc_object(ClassId::new(0), 0);
 
         {
             let mut statics = shared.classes.statics.write();
@@ -992,7 +992,7 @@ mod tests {
     #[test]
     fn roots_from_printed() {
         let shared = test_shared_vm();
-        let obj = shared.heap.alloc_object(ClassId::new(0), 0);
+        let obj = shared.mem.heap.alloc_object(ClassId::new(0), 0);
 
         let mut thread = JvmThread::new(ThreadId(0), "test");
         thread.printed.push(Value::Object(Some(obj)));
@@ -1009,6 +1009,7 @@ mod tests {
         let roots = collect_roots(&shared, &thread);
         assert!(
             roots.iter().all(|root| shared
+                .mem
                 .heap
                 .is_object_address(root.as_ptr() as usize)
                 .is_none()),
@@ -1026,6 +1027,7 @@ mod tests {
     fn conservative_jit_root_scan_finds_spilled_object() {
         let shared = test_shared_vm();
         let obj = shared
+            .mem
             .heap
             .alloc_object(crate::classloading::ClassId::new(0), 0);
         let thread = JvmThread::new(ThreadId(0), "test");
@@ -1073,6 +1075,7 @@ mod tests {
     fn conservative_jit_root_scan_skips_inactive_threads() {
         let shared = test_shared_vm();
         let obj = shared
+            .mem
             .heap
             .alloc_object(crate::classloading::ClassId::new(0), 0);
         let thread = JvmThread::new(ThreadId(0), "test");

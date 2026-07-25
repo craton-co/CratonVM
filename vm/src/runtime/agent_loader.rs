@@ -393,7 +393,7 @@ fn invoke_one_premain(
         Err(MethodCallFailed::ExceptionThrown(exc_ref)) => {
             let exc_class_name = {
                 let cm = shared.classes.class_manager.read();
-                let cid = shared.heap.class_id_of(exc_ref);
+                let cid = shared.mem.heap.class_id_of(exc_ref);
                 cm.get_class(cid)
                     .map(|c| c.name.to_string())
                     .unwrap_or_else(|| format!("class#{cid}"))
@@ -436,7 +436,7 @@ fn build_instrumentation_mirror(
             .map(|c| c.num_total_fields)
             .unwrap_or(0)
     };
-    let inst_obj = shared.heap.alloc_object(class_id, num_fields);
+    let inst_obj = shared.mem.heap.alloc_object(class_id, num_fields);
 
     // The real-JDK constructor enters VM-private instrumentation setup.  The
     // mirror is instead backed by CratonVM's Instrumentation operations, so it
