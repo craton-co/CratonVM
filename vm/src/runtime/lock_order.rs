@@ -64,28 +64,54 @@
 //!
 //! ## Usage
 //!
-//! Wiring is incremental, starting with the highest-level locks. As of the
-//! V11 hardening pass the **L6 `monitors` registry** is wired: both internal
-//! maps of [`crate::threading::monitor::MonitorTable`] (`monitors` and
-//! `cas_locks`) are [`OrderedMutex`] at [`LockLevel::Monitors`].
+//! Two wrapper families implement the enforcement, differing only in the
+//! backing primitive and hence in guard shape:
+//!
+//! - [`OrderedMutex`] / [`OrderedRwLock`] wrap `std::sync` and therefore return
+//!   a `LockResult` (std locks are poisonable).
+//! - [`OrderedPlMutex`] / [`OrderedPlRwLock`] wrap `parking_lot` and are
+//!   **drop-in replacements** for `parking_lot::Mutex` / `parking_lot::RwLock`:
+//!   `.lock()` / `.read()` / `.write()` / `.read_recursive()` return the guard
+//!   directly. This is what makes converting a hot VM-wide lock with hundreds
+//!   of call sites a one-line change at the declaration.
+//!
+//! Both families drive the *same* per-thread held-level tracker, so an
+//! inversion between them (e.g. an L6 monitor held across an L10
+//! `class_manager` acquisition) is detected.
+//!
+//! For a lock whose type genuinely cannot change — one defined in a crate that
+//! cannot see [`LockLevel`], or whose mutual exclusion is spread across many
+//! fine-grained inner locks — [`enter_level`] returns a [`LevelScope`] that
+//! records the level for the duration of the region without owning a lock.
 //!
 //! ### Runtime enforcement status
 //!
 //! Authoritative, non-aspirational list of which locks are checked vs still
 //! raw:
-//! - **Wired (checked):** L6 `monitors` (both `MonitorTable` maps).
-//! - **Not wired (not observed by the checker):** L10 `class_manager` and
-//!   L8 `heap`, for the reasons below; the remaining levels are documented
-//!   here for ordering purposes but not yet wrapped.
-//!
-//! The two high-level locks above are **not** wired and the checker therefore
-//! does not observe them:
-//! - `class_manager` (L10) is a `parking_lot::RwLock` reached from ~19 modules
-//!   (including FFI/JNI surfaces this pass is not permitted to touch); swapping
-//!   its type would ripple guard-API changes through those files.
-//! - `heap` (L8) is defined in the separate `gc` crate (`gc/src/vm_heap.rs`),
-//!   which cannot depend on `vm::runtime::lock_order` without a circular crate
-//!   dependency.
+//! - **Wired (checked):**
+//!   - L10 `class_manager` — `SharedVm::class_manager` is an
+//!     [`OrderedPlRwLock`]; every `.read()` / `.write()` / `.read_recursive()`
+//!     call site in the workspace is checked.
+//!   - L7 `ref_processor` — `SharedVm::ref_processor` is an
+//!     [`OrderedPlMutex`].
+//!   - L6 `monitors` — both `MonitorTable` maps
+//!     ([`crate::threading::monitor::MonitorTable`]'s `monitors` and
+//!     `cas_locks`) are [`OrderedMutex`].
+//! - **Not wired:**
+//!   - L9 `native_methods` — the level exists in the hierarchy, but there is
+//!     currently **no lock instance to wrap**: `SharedVm::native_methods` is a
+//!     bare `NativeMethodRegistry`, immutable after construction (all ~3,100
+//!     registrations happen during `SharedVm::new`, before the VM is shared).
+//!     The table row is retained so that if the registry ever becomes mutable
+//!     at runtime its lock lands at L9, between `class_manager` and `heap`.
+//!   - L8 `heap` — `VmHeap` and its interior locks are defined in the separate
+//!     `cratonvm-gc` crate, which cannot depend on `vm::runtime::lock_order`
+//!     without inverting the existing `vm -> gc` dependency edge. Call sites in
+//!     `vm` that hold heap locks across other acquisitions can announce the
+//!     level with [`enter_level`]; moving [`LockLevel`] down into
+//!     `cratonvm-types` (visible to both crates) is the clean fix and is not
+//!     attempted here.
+//!   - L5..L0 are documented for ordering purposes and are not wrapped.
 
 use std::fmt;
 use std::sync::{LockResult, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -314,6 +340,75 @@ mod tracking {
         if enforced() {
             release(level);
         }
+    }
+
+    /// Whether this thread currently holds a lock at `level`.
+    #[inline]
+    pub(super) fn is_held(level: LockLevel) -> bool {
+        HELD.with(|cell| cell.get()[level as u8 as usize])
+    }
+
+    /// Like [`check_and_acquire`], but reports whether the level was actually
+    /// recorded so the caller's guard can decide whether to release it on drop.
+    ///
+    /// Returns `false` (and does nothing) when enforcement is off, `true` after
+    /// a successful check-and-record.
+    ///
+    /// # Panics
+    ///
+    /// Panics with a [`super::LockOrderViolation`] message if `level` is not
+    /// strictly less than the minimum currently-held level.
+    #[inline]
+    pub(super) fn check_and_acquire_tracked(level: LockLevel) -> bool {
+        if !enforced() {
+            return false;
+        }
+        if let Some(held) = lowest_held() {
+            assert!(
+                level < held,
+                "{}",
+                super::LockOrderViolation {
+                    attempted: level,
+                    held,
+                }
+            );
+        }
+        acquire(level);
+        true
+    }
+
+    /// Reentrant variant of [`check_and_acquire_tracked`] for deliberately
+    /// recursive acquisitions (`parking_lot::RwLock::read_recursive`).
+    ///
+    /// Re-entering a lock this thread already holds introduces no new edge in
+    /// the wait-for graph, so when `level` is already recorded we neither check
+    /// nor re-record (returning `false`, so the guard leaves the outer
+    /// acquisition's record intact). When `level` is *not* held this behaves
+    /// exactly like [`check_and_acquire_tracked`].
+    ///
+    /// # Panics
+    ///
+    /// Panics on a descending-order violation when `level` is not already held.
+    #[inline]
+    pub(super) fn check_and_acquire_reentrant(level: LockLevel) -> bool {
+        if !enforced() {
+            return false;
+        }
+        if is_held(level) {
+            return false;
+        }
+        if let Some(held) = lowest_held() {
+            assert!(
+                level < held,
+                "{}",
+                super::LockOrderViolation {
+                    attempted: level,
+                    held,
+                }
+            );
+        }
+        acquire(level);
+        true
     }
 }
 
@@ -559,6 +654,414 @@ impl<T> Drop for OrderedRwLockWriteGuard<'_, T> {
 }
 
 impl<T: fmt::Debug> fmt::Debug for OrderedRwLockWriteGuard<'_, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&*self.guard, f)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Level scopes (for locks whose *type* cannot be changed)
+// ---------------------------------------------------------------------------
+
+/// RAII scope that records "this thread holds a lock at `level`" in the
+/// per-thread order tracker without owning any lock itself.
+///
+/// This is the escape hatch for locks whose type cannot be changed — either
+/// because they live in a crate that cannot see [`LockLevel`] (the `gc` crate's
+/// heap interior locks, see this module's docs) or because the mutual exclusion
+/// is spread over many fine-grained inner locks (the monitor table). Wrapping
+/// the lock itself in [`OrderedMutex`] / [`OrderedPlRwLock`] is always
+/// preferable: a scope is only as accurate as the discipline of its callers.
+#[must_use = "a LevelScope must be held for the whole locked region"]
+pub struct LevelScope {
+    level: LockLevel,
+    /// Whether this scope actually recorded `level`. False when enforcement is
+    /// off, so `Drop` never clears a level it did not set.
+    tracked: bool,
+}
+
+impl LevelScope {
+    /// The level recorded by this scope.
+    pub fn level(&self) -> LockLevel {
+        self.level
+    }
+}
+
+impl Drop for LevelScope {
+    #[inline]
+    fn drop(&mut self) {
+        if self.tracked {
+            tracking::release(self.level);
+        }
+    }
+}
+
+impl fmt::Debug for LevelScope {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LevelScope")
+            .field("level", &self.level)
+            .field("tracked", &self.tracked)
+            .finish()
+    }
+}
+
+/// Enter a [`LevelScope`] at `level`, enforcing the descending-order rule.
+///
+/// # Panics
+///
+/// When enforcement is active, panics if the calling thread already holds a
+/// lock at an equal or *lower* level.
+#[inline]
+pub fn enter_level(level: LockLevel) -> LevelScope {
+    LevelScope {
+        level,
+        tracked: tracking::check_and_acquire_tracked(level),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// parking_lot-backed wrappers (drop-in)
+// ---------------------------------------------------------------------------
+//
+// DESIGN NOTE — why a second family of wrappers.
+//
+// `OrderedMutex`/`OrderedRwLock` above wrap `std::sync`, whose guards come
+// wrapped in a `LockResult` because std locks are poisonable. CratonVM's hot
+// VM-wide locks (`class_manager`, `ref_processor`, …) are `parking_lot` locks,
+// whose `.read()`/`.write()`/`.lock()` return the guard *directly*.
+//
+// Converting `SharedVm::class_manager` to the std-backed `OrderedRwLock` would
+// therefore mean adding `.unwrap()` (or `.expect(..)`) to ~615 call sites
+// across `vm`, `vm-cli` and `libcratonvm` — a mechanical but enormous diff that
+// buries the actual change, and it would also silently swap parking_lot's
+// fairness and `read_recursive` behaviour for std's. So the types below are
+// instead **API-compatible drop-in replacements for `parking_lot::Mutex` /
+// `parking_lot::RwLock`**: same method names, same "guard returned directly"
+// shape, `Deref`/`DerefMut` to the protected value. Converting a lock is then a
+// one-line change at the field declaration plus one at the constructor, and
+// every call site compiles unchanged.
+
+/// A `parking_lot::Mutex<T>` wrapper that enforces lock-ordering discipline.
+///
+/// Drop-in for `parking_lot::Mutex`: [`lock`](Self::lock) returns the guard
+/// directly (no `LockResult`). The ordering check happens inside `lock`, gated
+/// on [`tracking::enforced`] — always on in debug builds, opt-in in release via
+/// `CRATONVM_LOCK_ORDER_CHECK`. When off, the added cost is one cached relaxed
+/// atomic load per acquire.
+pub struct OrderedPlMutex<T> {
+    inner: parking_lot::Mutex<T>,
+    level: LockLevel,
+}
+
+impl<T> OrderedPlMutex<T> {
+    /// Create a new ordered mutex at `level`.
+    pub const fn new(value: T, level: LockLevel) -> Self {
+        Self {
+            inner: parking_lot::Mutex::new(value),
+            level,
+        }
+    }
+
+    /// The lock level of this mutex.
+    #[inline]
+    pub fn level(&self) -> LockLevel {
+        self.level
+    }
+
+    /// Acquire the mutex.
+    ///
+    /// # Panics
+    ///
+    /// When enforcement is active, panics if the calling thread already holds a
+    /// lock at an equal or *lower* [`LockLevel`].
+    #[inline]
+    pub fn lock(&self) -> OrderedPlMutexGuard<'_, T> {
+        let tracked = tracking::check_and_acquire_tracked(self.level);
+        OrderedPlMutexGuard {
+            guard: self.inner.lock(),
+            level: self.level,
+            tracked,
+        }
+    }
+
+    /// Try to acquire the mutex without blocking. The order check runs (and can
+    /// panic) only when the underlying `try_lock` actually succeeded.
+    #[inline]
+    pub fn try_lock(&self) -> Option<OrderedPlMutexGuard<'_, T>> {
+        let guard = self.inner.try_lock()?;
+        let tracked = tracking::check_and_acquire_tracked(self.level);
+        Some(OrderedPlMutexGuard {
+            guard,
+            level: self.level,
+            tracked,
+        })
+    }
+
+    /// Whether the mutex is currently locked by anyone.
+    #[inline]
+    pub fn is_locked(&self) -> bool {
+        self.inner.is_locked()
+    }
+
+    /// Direct access to the protected value via `&mut self` — no lock is taken,
+    /// hence no order check.
+    #[inline]
+    pub fn get_mut(&mut self) -> &mut T {
+        self.inner.get_mut()
+    }
+
+    /// Consume the mutex, returning the protected value.
+    pub fn into_inner(self) -> T {
+        self.inner.into_inner()
+    }
+}
+
+impl<T: fmt::Debug> fmt::Debug for OrderedPlMutex<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OrderedPlMutex")
+            .field("level", &self.level)
+            .field("inner", &self.inner)
+            .finish()
+    }
+}
+
+/// RAII guard for [`OrderedPlMutex`]. Drop-in for `parking_lot::MutexGuard`.
+#[must_use = "if unused the mutex is immediately unlocked"]
+pub struct OrderedPlMutexGuard<'a, T> {
+    guard: parking_lot::MutexGuard<'a, T>,
+    level: LockLevel,
+    tracked: bool,
+}
+
+impl<T> std::ops::Deref for OrderedPlMutexGuard<'_, T> {
+    type Target = T;
+    #[inline]
+    fn deref(&self) -> &T {
+        &self.guard
+    }
+}
+
+impl<T> std::ops::DerefMut for OrderedPlMutexGuard<'_, T> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.guard
+    }
+}
+
+impl<T> Drop for OrderedPlMutexGuard<'_, T> {
+    #[inline]
+    fn drop(&mut self) {
+        if self.tracked {
+            tracking::release(self.level);
+        }
+    }
+}
+
+impl<T: fmt::Debug> fmt::Debug for OrderedPlMutexGuard<'_, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&*self.guard, f)
+    }
+}
+
+/// A `parking_lot::RwLock<T>` wrapper that enforces lock-ordering discipline.
+///
+/// Drop-in for `parking_lot::RwLock`: [`read`](Self::read),
+/// [`write`](Self::write) and [`read_recursive`](Self::read_recursive) return
+/// their guards directly. See the design note above for why this family exists
+/// alongside the std-backed [`OrderedRwLock`].
+pub struct OrderedPlRwLock<T> {
+    inner: parking_lot::RwLock<T>,
+    level: LockLevel,
+}
+
+impl<T> OrderedPlRwLock<T> {
+    /// Create a new ordered rwlock at `level`.
+    pub const fn new(value: T, level: LockLevel) -> Self {
+        Self {
+            inner: parking_lot::RwLock::new(value),
+            level,
+        }
+    }
+
+    /// The lock level of this rwlock.
+    #[inline]
+    pub fn level(&self) -> LockLevel {
+        self.level
+    }
+
+    /// Acquire shared (read) access.
+    ///
+    /// # Panics
+    ///
+    /// When enforcement is active, panics if the calling thread already holds a
+    /// lock at an equal or *lower* [`LockLevel`] — including *this* lock, since
+    /// `parking_lot`'s plain `read()` is not reentrant. Use
+    /// [`read_recursive`](Self::read_recursive) for a deliberately reentrant
+    /// read.
+    #[inline]
+    pub fn read(&self) -> OrderedPlRwLockReadGuard<'_, T> {
+        let tracked = tracking::check_and_acquire_tracked(self.level);
+        OrderedPlRwLockReadGuard {
+            guard: self.inner.read(),
+            level: self.level,
+            tracked,
+        }
+    }
+
+    /// Acquire shared access, tolerating a read this thread already holds.
+    ///
+    /// `parking_lot::RwLock::read_recursive` exists precisely so a thread that
+    /// may already hold a read guard can take another one without deadlocking
+    /// against a queued writer. Re-entering a lock the thread *already* holds
+    /// adds no new edge to the wait-for graph, so when this level is already
+    /// recorded the order check is skipped and the guard does not re-record it.
+    /// If the level is *not* already held, the full descending check applies.
+    ///
+    /// # Panics
+    ///
+    /// When enforcement is active and this level is not already held, panics on
+    /// a descending-order violation exactly like [`read`](Self::read).
+    #[inline]
+    pub fn read_recursive(&self) -> OrderedPlRwLockReadGuard<'_, T> {
+        let tracked = tracking::check_and_acquire_reentrant(self.level);
+        OrderedPlRwLockReadGuard {
+            guard: self.inner.read_recursive(),
+            level: self.level,
+            tracked,
+        }
+    }
+
+    /// Acquire exclusive (write) access.
+    ///
+    /// # Panics
+    ///
+    /// When enforcement is active, panics on a descending-order violation.
+    #[inline]
+    pub fn write(&self) -> OrderedPlRwLockWriteGuard<'_, T> {
+        let tracked = tracking::check_and_acquire_tracked(self.level);
+        OrderedPlRwLockWriteGuard {
+            guard: self.inner.write(),
+            level: self.level,
+            tracked,
+        }
+    }
+
+    /// Try to acquire shared access without blocking.
+    #[inline]
+    pub fn try_read(&self) -> Option<OrderedPlRwLockReadGuard<'_, T>> {
+        let guard = self.inner.try_read()?;
+        let tracked = tracking::check_and_acquire_tracked(self.level);
+        Some(OrderedPlRwLockReadGuard {
+            guard,
+            level: self.level,
+            tracked,
+        })
+    }
+
+    /// Try to acquire exclusive access without blocking.
+    #[inline]
+    pub fn try_write(&self) -> Option<OrderedPlRwLockWriteGuard<'_, T>> {
+        let guard = self.inner.try_write()?;
+        let tracked = tracking::check_and_acquire_tracked(self.level);
+        Some(OrderedPlRwLockWriteGuard {
+            guard,
+            level: self.level,
+            tracked,
+        })
+    }
+
+    /// Whether the lock is currently held (shared or exclusive) by anyone.
+    #[inline]
+    pub fn is_locked(&self) -> bool {
+        self.inner.is_locked()
+    }
+
+    /// Direct access to the protected value via `&mut self` — no lock is taken,
+    /// hence no order check.
+    #[inline]
+    pub fn get_mut(&mut self) -> &mut T {
+        self.inner.get_mut()
+    }
+
+    /// Consume the lock, returning the protected value.
+    pub fn into_inner(self) -> T {
+        self.inner.into_inner()
+    }
+}
+
+impl<T: fmt::Debug> fmt::Debug for OrderedPlRwLock<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OrderedPlRwLock")
+            .field("level", &self.level)
+            .field("inner", &self.inner)
+            .finish()
+    }
+}
+
+/// RAII read guard for [`OrderedPlRwLock`].
+#[must_use = "if unused the lock is immediately released"]
+pub struct OrderedPlRwLockReadGuard<'a, T> {
+    guard: parking_lot::RwLockReadGuard<'a, T>,
+    level: LockLevel,
+    tracked: bool,
+}
+
+impl<T> std::ops::Deref for OrderedPlRwLockReadGuard<'_, T> {
+    type Target = T;
+    #[inline]
+    fn deref(&self) -> &T {
+        &self.guard
+    }
+}
+
+impl<T> Drop for OrderedPlRwLockReadGuard<'_, T> {
+    #[inline]
+    fn drop(&mut self) {
+        if self.tracked {
+            tracking::release(self.level);
+        }
+    }
+}
+
+impl<T: fmt::Debug> fmt::Debug for OrderedPlRwLockReadGuard<'_, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&*self.guard, f)
+    }
+}
+
+/// RAII write guard for [`OrderedPlRwLock`].
+#[must_use = "if unused the lock is immediately released"]
+pub struct OrderedPlRwLockWriteGuard<'a, T> {
+    guard: parking_lot::RwLockWriteGuard<'a, T>,
+    level: LockLevel,
+    tracked: bool,
+}
+
+impl<T> std::ops::Deref for OrderedPlRwLockWriteGuard<'_, T> {
+    type Target = T;
+    #[inline]
+    fn deref(&self) -> &T {
+        &self.guard
+    }
+}
+
+impl<T> std::ops::DerefMut for OrderedPlRwLockWriteGuard<'_, T> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.guard
+    }
+}
+
+impl<T> Drop for OrderedPlRwLockWriteGuard<'_, T> {
+    #[inline]
+    fn drop(&mut self) {
+        if self.tracked {
+            tracking::release(self.level);
+        }
+    }
+}
+
+impl<T: fmt::Debug> fmt::Debug for OrderedPlRwLockWriteGuard<'_, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Debug::fmt(&*self.guard, f)
     }
@@ -1031,5 +1534,224 @@ mod tests {
         // Nothing held now: a higher-level lock must be acquirable.
         let b = OrderedMutex::new((), LockLevel::ClassManager);
         let _gb = b.lock().unwrap();
+    }
+
+    // -- Drop-in parking_lot-backed wrappers (top-of-hierarchy wiring) ------
+    //
+    // `class_manager` (L10) and `ref_processor` (L7) are `OrderedPlRwLock` /
+    // `OrderedPlMutex` in `SharedVm`. The tests below pin the behaviour those
+    // fields now rely on: descending acquisition succeeds, every inversion is
+    // detected, and the parking_lot family shares one per-thread tracker with
+    // the std-backed family so a monitor (L6, `OrderedMutex`) held across a
+    // `class_manager` (L10, `OrderedPlRwLock`) acquisition is caught.
+
+    #[test]
+    fn pl_mutex_basic() {
+        let m = OrderedPlMutex::new(42, LockLevel::RefProcessor);
+        assert_eq!(m.level(), LockLevel::RefProcessor);
+        assert!(!m.is_locked());
+        {
+            let mut g = m.lock();
+            assert_eq!(*g, 42);
+            *g = 7;
+        }
+        {
+            let g = m.try_lock().expect("uncontended try_lock must succeed");
+            assert_eq!(*g, 7);
+        }
+        let mut m = m;
+        *m.get_mut() = 11;
+        assert_eq!(m.into_inner(), 11);
+    }
+
+    #[test]
+    fn pl_rwlock_basic() {
+        let rw = OrderedPlRwLock::new(String::from("hello"), LockLevel::ClassManager);
+        assert_eq!(rw.level(), LockLevel::ClassManager);
+        {
+            let r = rw.read();
+            assert_eq!(&*r, "hello");
+        }
+        {
+            let mut w = rw.write();
+            w.push_str(" world");
+        }
+        {
+            let r = rw.try_read().expect("uncontended try_read must succeed");
+            assert_eq!(&*r, "hello world");
+        }
+        {
+            let w = rw.try_write().expect("uncontended try_write must succeed");
+            assert_eq!(&**w, "hello world");
+        }
+        let mut rw = rw;
+        rw.get_mut().push('!');
+        assert_eq!(rw.into_inner(), "hello world!");
+    }
+
+    /// The four top levels of the documented hierarchy, acquired highest-first
+    /// exactly as the table in this module's doc comment prescribes:
+    /// `class_manager` (L10) -> `native_methods` (L9) -> `heap` (L8) ->
+    /// `ref_processor` (L7) -> `monitors` (L6). This mixes all three
+    /// enforcement mechanisms — `OrderedPlRwLock` (class_manager),
+    /// `OrderedPlMutex` (ref_processor), `LevelScope` (heap, which lives in the
+    /// `gc` crate and cannot be wrapped) and `OrderedMutex` (monitors) — to
+    /// prove they share one per-thread tracker.
+    #[test]
+    fn top_of_hierarchy_descending_order_ok() {
+        let class_manager = OrderedPlRwLock::new(10_u8, LockLevel::ClassManager);
+        let native_methods = OrderedPlMutex::new(9_u8, LockLevel::NativeMethods);
+        let ref_processor = OrderedPlMutex::new(7_u8, LockLevel::RefProcessor);
+        let monitors = OrderedMutex::new(6_u8, LockLevel::Monitors);
+
+        let cm = class_manager.write();
+        let nm = native_methods.lock();
+        let heap = enter_level(LockLevel::Heap);
+        let rp = ref_processor.lock();
+        let mon = monitors.lock().unwrap();
+
+        assert_eq!(*cm + *nm + *rp + *mon, 10 + 9 + 7 + 6);
+        assert_eq!(heap.level(), LockLevel::Heap);
+        // Guards drop in reverse (LIFO) order here: L6, L7, L8, L9, L10.
+    }
+
+    #[test]
+    fn pl_release_then_higher_ok() {
+        let rp = OrderedPlMutex::new((), LockLevel::RefProcessor);
+        let cm = OrderedPlRwLock::new((), LockLevel::ClassManager);
+        {
+            let _g = rp.lock();
+        }
+        // Nothing held: the higher level is acquirable again.
+        let _cm = cm.read();
+    }
+
+    /// `read_recursive` on a lock this thread already reads is the documented
+    /// reentrant case (`interpreter.rs::resolve_method_ref`) and must not trip.
+    #[test]
+    fn pl_read_recursive_reentrant_ok() {
+        let cm = OrderedPlRwLock::new(1_u8, LockLevel::ClassManager);
+        let outer = cm.read();
+        let inner = cm.read_recursive();
+        assert_eq!(*outer, *inner);
+        drop(inner);
+        // The outer guard still holds the level, so a same-level plain read is
+        // still (correctly) refused — see `pl_read_recursive_does_not_release`.
+        assert!(tracking::is_held(LockLevel::ClassManager));
+        drop(outer);
+        assert!(!tracking::is_held(LockLevel::ClassManager));
+    }
+
+    /// A reentrant read must not clear the outer acquisition's record when it
+    /// drops — otherwise the tracker would forget a still-held L10 lock.
+    #[test]
+    fn pl_read_recursive_does_not_release_outer() {
+        let cm = OrderedPlRwLock::new((), LockLevel::ClassManager);
+        let _outer = cm.read();
+        {
+            let _inner = cm.read_recursive();
+        }
+        assert!(
+            tracking::is_held(LockLevel::ClassManager),
+            "dropping the reentrant read guard must leave the outer record intact"
+        );
+    }
+
+    #[test]
+    fn level_scope_descending_ok() {
+        let _heap = enter_level(LockLevel::Heap);
+        let _monitors = enter_level(LockLevel::Monitors);
+        let _scratch = enter_level(LockLevel::Scratch);
+    }
+
+    #[test]
+    fn pl_debug_impls() {
+        let m = OrderedPlMutex::new(42_i32, LockLevel::RefProcessor);
+        let dbg = format!("{:?}", m);
+        assert!(dbg.contains("OrderedPlMutex"));
+        assert!(dbg.contains("RefProcessor"));
+        let g = m.lock();
+        assert!(format!("{:?}", g).contains("42"));
+        drop(g);
+
+        let rw = OrderedPlRwLock::new(7_i32, LockLevel::ClassManager);
+        let dbg = format!("{:?}", rw);
+        assert!(dbg.contains("OrderedPlRwLock"));
+        assert!(dbg.contains("ClassManager"));
+        assert!(format!("{:?}", rw.read()).contains('7'));
+        assert!(format!("{:?}", rw.write()).contains('7'));
+        assert!(format!("{:?}", enter_level(LockLevel::Scratch)).contains("Scratch"));
+    }
+
+    // ---- inversions that must be detected --------------------------------
+
+    /// The historically real defect: holding a monitor (L6, std-backed
+    /// `OrderedMutex`) and then reaching *up* for `class_manager` (L10,
+    /// parking_lot-backed). This is the class_manager/vtable ABBA shape, and it
+    /// only fires because both wrapper families share one per-thread tracker.
+    #[test]
+    #[should_panic(expected = "lock order violation")]
+    fn pl_monitor_then_class_manager_inverts_across_families() {
+        let monitors = OrderedMutex::new((), LockLevel::Monitors);
+        let class_manager = OrderedPlRwLock::new((), LockLevel::ClassManager);
+        let _m = monitors.lock().unwrap();
+        let _cm = class_manager.read(); // L10 under L6 => violation
+    }
+
+    /// `ref_processor` (L7) held while acquiring `class_manager` (L10) — the
+    /// inversion the GC reference-processing path must never take.
+    #[test]
+    #[should_panic(expected = "lock order violation")]
+    fn pl_ref_processor_then_class_manager_inverts() {
+        let ref_processor = OrderedPlMutex::new((), LockLevel::RefProcessor);
+        let class_manager = OrderedPlRwLock::new((), LockLevel::ClassManager);
+        let _rp = ref_processor.lock();
+        let _cm = class_manager.write(); // L10 under L7 => violation
+    }
+
+    #[test]
+    #[should_panic(expected = "lock order violation")]
+    fn pl_rwlock_same_level_panics() {
+        let a = OrderedPlRwLock::new((), LockLevel::ClassManager);
+        let b = OrderedPlRwLock::new((), LockLevel::ClassManager);
+        let _ga = a.read();
+        let _gb = b.write(); // same level (L10) on a *different* lock => violation
+    }
+
+    #[test]
+    #[should_panic(expected = "lock order violation")]
+    fn pl_mutex_ascending_panics() {
+        let low = OrderedPlMutex::new((), LockLevel::Monitors);
+        let high = OrderedPlMutex::new((), LockLevel::NativeMethods);
+        let _l = low.lock();
+        let _h = high.lock(); // L9 under L6 => violation
+    }
+
+    /// `read_recursive` is only exempt for a level this thread *already* holds.
+    /// Reaching up to L10 from a held L6 must still be rejected.
+    #[test]
+    #[should_panic(expected = "lock order violation")]
+    fn pl_read_recursive_under_lower_level_panics() {
+        let monitors = OrderedMutex::new((), LockLevel::Monitors);
+        let class_manager = OrderedPlRwLock::new((), LockLevel::ClassManager);
+        let _m = monitors.lock().unwrap();
+        let _cm = class_manager.read_recursive(); // L10 under L6 => violation
+    }
+
+    /// A `LevelScope` standing in for the `gc`-crate heap locks (L8) must be
+    /// observed by the tracker: taking `class_manager` (L10) under it inverts.
+    #[test]
+    #[should_panic(expected = "lock order violation")]
+    fn level_scope_then_higher_lock_panics() {
+        let _heap = enter_level(LockLevel::Heap);
+        let class_manager = OrderedPlRwLock::new((), LockLevel::ClassManager);
+        let _cm = class_manager.read(); // L10 under L8 => violation
+    }
+
+    #[test]
+    #[should_panic(expected = "lock order violation")]
+    fn level_scope_ascending_panics() {
+        let _monitors = enter_level(LockLevel::Monitors);
+        let _heap = enter_level(LockLevel::Heap); // L8 under L6 => violation
     }
 }
