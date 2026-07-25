@@ -1730,6 +1730,7 @@ unsafe fn try_resume_trapped_callee(
             is_static: method.is_static(),
             force_native_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
+            jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
         })
     };
     if bci as usize >= cached.code.len() {

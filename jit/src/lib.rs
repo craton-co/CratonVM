@@ -4582,6 +4582,20 @@ pub fn pin_jit_entry(entry: usize) -> Option<Arc<CompiledMethod>> {
 }
 
 /// Monotonic publication/invalidation generation for external entry caches.
+///
+/// Advanced by EVERY mutation of a [`JitCache`] — `put`, `put_osr`, any
+/// `invalidate_*`, and `clear_all` — including a first-time insertion of a key
+/// that was not previously present.
+///
+/// That last case matters: until T2.2 the two `put` paths bumped only when they
+/// *replaced* an existing entry, which was sufficient for the original consumer
+/// (`vm/src/jit/helpers.rs`'s thread-local raw-entry dispatch caches, a purely
+/// *positive* cache that a brand-new key cannot invalidate). The interpreter's
+/// invoke-cache epoch check is a *negative* cache — "this method has no compiled
+/// body" — and a first-time publication is precisely what falsifies it, so the
+/// bump has to be unconditional. Under-bumping there would leave an interpreted
+/// call site pinned to the interpreter forever after a background compile
+/// published its body.
 pub fn jit_cache_generation() -> u64 {
     JIT_CACHE_GENERATION.load(std::sync::atomic::Ordering::Acquire)
 }
@@ -4748,11 +4762,14 @@ impl JitCache {
             .insert(arc.entry_ptr() as usize, Arc::downgrade(&arc));
         let shard = &self.shards[Self::shard_index(h)];
         let mut next = (**shard.methods.load()).clone();
-        let replaced = next.insert(h, (key, arc)).is_some();
+        next.insert(h, (key, arc));
         shard.methods.store(Arc::new(next));
-        if replaced {
-            JIT_CACHE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
-        }
+        // T2.2 — bump on EVERY publication, not just replacements. A first-time
+        // insertion is exactly the event the interpreter's negative
+        // "no compiled body for this method" memo
+        // (`CachedBytecodeMethod::jit_probe_generation`) must observe. See
+        // `jit_cache_generation`.
+        JIT_CACHE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
     }
 
     /// Publish an OSR body without superseding the method-entry body.
@@ -4801,11 +4818,10 @@ impl JitCache {
             .insert(arc.entry_ptr() as usize, Arc::downgrade(&arc));
         let shard = &self.shards[Self::shard_index(h)];
         let mut next = (**shard.osr_methods.load()).clone();
-        let replaced = next.insert(h, (key, arc)).is_some();
+        next.insert(h, (key, arc));
         shard.osr_methods.store(Arc::new(next));
-        if replaced {
-            JIT_CACHE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
-        }
+        // T2.2 — unconditional, for the same reason as `put` above.
+        JIT_CACHE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
     }
 
     pub fn len(&self) -> usize {
@@ -9052,6 +9068,7 @@ mod tests {
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
+            jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
         };
         let resolver = |idx: u16| -> Option<(String, String, String)> {
             (idx == 1).then(|| ("pkg/Rec".to_string(), "f".to_string(), "(I)I".to_string()))
@@ -9272,6 +9289,7 @@ mod tests {
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
+            jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
         };
         // SAFETY: every `JitRuntimeHelpers` field is a `usize` and the struct is
         // `#[repr(C)]`, so an all-zero bit pattern is valid (no niches/padding).
@@ -9347,6 +9365,7 @@ mod tests {
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
+            jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
         };
         // SAFETY: see `step3_optimize_toggle_…`; an all-zero `JitRuntimeHelpers`
         // is valid and never called (the inline getfield emits no helper call,
@@ -9806,6 +9825,7 @@ mod tests {
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
+            jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
         };
         let helpers: JitRuntimeHelpers = unsafe { std::mem::zeroed() };
         let new_resolver = |cp: u16| -> Option<(u32, usize, bool, bool)> {
@@ -9941,6 +9961,7 @@ mod tests {
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
+            jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
         };
         // SAFETY: all-zero `JitRuntimeHelpers` is valid; this test only COMPILES
         // (never executes the body), so the baked `invoke_dispatch` is not called.
@@ -10054,6 +10075,7 @@ mod tests {
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
+            jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
         };
         // SAFETY: all-zero `JitRuntimeHelpers` is valid; this test only COMPILES
         // (never executes the body), so the baked `invoke_dispatch` is not called.
@@ -10171,6 +10193,7 @@ mod tests {
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
+            jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
         };
         // SAFETY: all-zero `JitRuntimeHelpers` is valid; this test only COMPILES
         // (never executes), and a pure long-arithmetic method calls no helper.
@@ -10230,6 +10253,7 @@ mod tests {
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
+            jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
         };
         // SAFETY: all-zero `JitRuntimeHelpers` is valid; this test only COMPILES
         // (never executes), and a pure FP-arithmetic method calls no helper.
@@ -10292,6 +10316,7 @@ mod tests {
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
+            jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
         };
         // SAFETY: all-zero `JitRuntimeHelpers` is valid; this test only COMPILES
         // (never executes the body), so the baked `invoke_dispatch` is not called.
@@ -11504,6 +11529,214 @@ mod tests {
     /// `Weak` to each body keeps its `Arc` allocation (not the body) alive, so
     /// `own_*` can never be recycled underneath the comparison and
     /// `strong_count() == 0` proves *our* `Drop` ran.
+    // T2.2 epoch invalidation for the interpreter's Bytecode invoke cache
+    //
+    // These tests guard the contract the interpreter's cached-invoke `Bytecode`
+    // arms now rely on: instead of calling `JitCache::get` (three string hashes
+    // + three string compares) on every interpreted call just to notice that a
+    // background compile published a body, they memoize
+    // `jit_cache_generation()` in `CachedBytecodeMethod::jit_probe_generation`
+    // and only re-probe when the live generation differs.
+    //
+    // Every assertion below is written to be robust under a parallel `cargo
+    // test`: the generation is a process-global, so other tests can advance it
+    // concurrently. That can only push two sampled values FURTHER apart, so
+    // "must differ" assertions are race-free; no test here asserts that the
+    // generation stayed equal across a window in which another test could run.
+
+    fn probe_test_method(
+        class: &str,
+        method: &str,
+        desc: &str,
+        cid: cratonvm_types::ClassId,
+    ) -> CachedBytecodeMethod {
+        CachedBytecodeMethod {
+            declaring_class_id: cid,
+            class_name: Arc::from(class),
+            method_name: Arc::from(method),
+            method_descriptor: Arc::from(desc),
+            source_file: None,
+            code: Arc::from([0xb1u8].as_slice()),
+            exception_table: Arc::from(Vec::new().as_slice()),
+            max_stack: 0,
+            max_locals: 0,
+            num_params: 0,
+            is_synchronized: false,
+            is_static: true,
+            force_native_cache: std::sync::OnceLock::new(),
+            native_callback_cache: std::sync::OnceLock::new(),
+            jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    fn probe_ret_body() -> CompiledMethod {
+        let mut buf = ExecutableBuffer::new(16).expect("alloc failed");
+        buf.emit(&[0xC3]); // RET
+        CompiledMethod::new(buf)
+    }
+
+    /// THE staleness test. Replays the interpreter's exact epoch protocol
+    /// end-to-end and proves that a **first-time** publication (not a
+    /// replacement) forces the memoized call site back onto the slow path,
+    /// where it picks up the newly published body.
+    ///
+    /// This is the case that used to be broken: `JitCache::put` advanced the
+    /// generation only when it *replaced* an existing entry, so a call site that
+    /// had already memoized "no compiled body for this method" would have stayed
+    /// pinned to the interpreter forever after the background worker published
+    /// its first body.
+    #[test]
+    fn jit_probe_epoch_forces_reprobe_after_first_publication() {
+        let cache = JitCache::new();
+        let cid = cratonvm_types::ClassId::new(4101);
+        let class: Arc<str> = Arc::from("ProbeEpochA");
+        let method: Arc<str> = Arc::from("hot");
+        let desc: Arc<str> = Arc::from("()V");
+        let cached = probe_test_method(&class, &method, &desc, cid);
+
+        // 1. Cold: the call site probes, misses, and memoizes the miss --
+        //    exactly what the `Bytecode` arm does on its first interpreted call.
+        let gen_at_probe = jit_cache_generation();
+        assert!(
+            cache.get(&class, &method, &desc, cid).is_none(),
+            "nothing published yet"
+        );
+        cached.record_jit_probe_miss(gen_at_probe);
+        assert!(
+            cached.jit_probe_is_current(gen_at_probe),
+            "the memo must suppress a re-probe while the generation is unchanged"
+        );
+
+        // 2. A background compile publishes this method's FIRST body.
+        cache.put(
+            class.clone(),
+            method.clone(),
+            desc.clone(),
+            cid,
+            probe_ret_body(),
+        );
+
+        // 3. The memo must now report stale, so the interpreter re-probes...
+        let gen_after_publish = jit_cache_generation();
+        assert!(
+            !cached.jit_probe_is_current(gen_after_publish),
+            "a first-time publication MUST advance the JIT cache generation, or an \
+             interpreted call site that already memoized a probe miss would never \
+             notice the new body"
+        );
+        // ...and the re-probe finds the freshly published body.
+        assert!(
+            cache.get(&class, &method, &desc, cid).is_some(),
+            "the re-probe must pick up the published body"
+        );
+    }
+
+    /// An OSR publication lands in a separate map (`osr_methods`) but reaches the
+    /// same `Bytecode` call sites, so it must advance the generation too. Same
+    /// first-publication (non-replacement) shape as above.
+    #[test]
+    fn jit_probe_epoch_forces_reprobe_after_first_osr_publication() {
+        let cache = JitCache::new();
+        let cid = cratonvm_types::ClassId::new(4102);
+        let class: Arc<str> = Arc::from("ProbeEpochB");
+        let method: Arc<str> = Arc::from("loopy");
+        let desc: Arc<str> = Arc::from("(I)I");
+        let cached = probe_test_method(&class, &method, &desc, cid);
+
+        let gen_at_probe = jit_cache_generation();
+        cached.record_jit_probe_miss(gen_at_probe);
+
+        let mut osr = probe_ret_body();
+        osr.compiled_via_osr = true;
+        cache.put_osr(class.clone(), method.clone(), desc.clone(), cid, osr);
+
+        assert!(
+            !cached.jit_probe_is_current(jit_cache_generation()),
+            "put_osr must advance the generation on a first publication"
+        );
+        assert!(cache.get_osr(&class, &method, &desc, cid).is_some());
+    }
+
+    /// A C1->C2 supersede republishes under an existing key. That path already
+    /// bumped (it is a replacement), but it is part of the audited contract, so
+    /// pin it: a call site that had flipped to `Jit` and then been downgraded
+    /// back to `Bytecode` must still re-probe and find the C2 body.
+    #[test]
+    fn jit_probe_epoch_forces_reprobe_after_supersede_republication() {
+        let cache = JitCache::new();
+        let cid = cratonvm_types::ClassId::new(4103);
+        let class: Arc<str> = Arc::from("ProbeEpochC");
+        let method: Arc<str> = Arc::from("tiered");
+        let desc: Arc<str> = Arc::from("()J");
+        cache.put(
+            class.clone(),
+            method.clone(),
+            desc.clone(),
+            cid,
+            probe_ret_body(),
+        );
+        let c1_entry = cache
+            .get(&class, &method, &desc, cid)
+            .expect("C1 body")
+            .entry_ptr() as usize;
+
+        let cached = probe_test_method(&class, &method, &desc, cid);
+        let gen_at_probe = jit_cache_generation();
+        cached.record_jit_probe_miss(gen_at_probe);
+
+        // C2 replaces the C1 entry under the same key.
+        cache.put(
+            class.clone(),
+            method.clone(),
+            desc.clone(),
+            cid,
+            probe_ret_body(),
+        );
+
+        assert!(
+            !cached.jit_probe_is_current(jit_cache_generation()),
+            "a superseding republication must advance the generation"
+        );
+        let c2_entry = cache
+            .get(&class, &method, &desc, cid)
+            .expect("C2 body")
+            .entry_ptr() as usize;
+        assert_ne!(c1_entry, c2_entry, "C2 must have replaced the C1 artifact");
+    }
+
+    /// Invalidation/eviction must advance the generation as well. It is not a
+    /// staleness hazard for the negative memo (a removal cannot make "there is
+    /// no body" wrong), but the interpreter's `Jit` entries are re-derived
+    /// through this same probe, so pin the behaviour rather than leave it to
+    /// chance.
+    #[test]
+    fn jit_probe_epoch_advances_on_invalidation() {
+        let cache = JitCache::new();
+        let cid = cratonvm_types::ClassId::new(4104);
+        let class: Arc<str> = Arc::from("ProbeEpochD");
+        let method: Arc<str> = Arc::from("gone");
+        let desc: Arc<str> = Arc::from("()V");
+        cache.put(
+            class.clone(),
+            method.clone(),
+            desc.clone(),
+            cid,
+            probe_ret_body(),
+        );
+        assert!(cache.get(&class, &method, &desc, cid).is_some());
+
+        let cached = probe_test_method(&class, &method, &desc, cid);
+        let gen_before_remove = jit_cache_generation();
+        cached.record_jit_probe_miss(gen_before_remove);
+
+        cache.remove(&class, &method, &desc, cid);
+        assert!(cache.get(&class, &method, &desc, cid).is_none());
+        assert!(
+            !cached.jit_probe_is_current(jit_cache_generation()),
+            "an eviction must advance the generation"
+        );
+    }
+
     #[test]
     fn test_jit_cache_clear_all_evicts_entries() {
         let cache = JitCache::new();
@@ -11839,6 +12072,7 @@ mod tests {
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
+            jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
         };
         let b_cached = CachedBytecodeMethod {
             declaring_class_id: cratonvm_types::ClassId::new(2),
@@ -11855,6 +12089,7 @@ mod tests {
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
+            jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
         };
         // SAFETY: every helper address is an integer slot. This test only
         // inspects emitted metadata and never executes the generated code.

@@ -7009,6 +7009,9 @@ pub fn execute(
                                             is_static,
                                             force_native_cache: std::sync::OnceLock::new(),
                                             native_callback_cache: std::sync::OnceLock::new(),
+                                            jit_probe_generation: std::sync::atomic::AtomicU64::new(
+                                                0,
+                                            ),
                                         });
                                         let pin_base = thread.native_pin_roots.len();
                                         if let Some(frame) = build_deopt_frame_inner(
@@ -12439,6 +12442,7 @@ mod deopt_step3_tests {
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
+            jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -12460,6 +12464,7 @@ mod deopt_step3_tests {
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
+            jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -12956,6 +12961,7 @@ mod deopt_step3_tests {
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
+            jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
         });
         let key = "DespecFuC.loop:()V";
         cratonvm_jit::deopt::despec_clear_for_test();
@@ -23176,6 +23182,7 @@ fn try_invoke_cached_lambda_impl(
                 is_static: false,
                 force_native_cache: std::sync::OnceLock::new(),
                 native_callback_cache: std::sync::OnceLock::new(),
+                jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
             });
             drop(cm);
             LAMBDA_IMPL_BYTECODE_CACHE.with(|cache| cache.borrow_mut().insert(key, Arc::clone(&c)));
@@ -31688,6 +31695,7 @@ fn populate_invoke_cache(
         is_static: method.is_static(),
         force_native_cache: std::sync::OnceLock::new(),
         native_callback_cache: std::sync::OnceLock::new(),
+        jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
     };
 
     // WP2.4-F1: snapshot the redefine generation BEFORE dropping the
@@ -31882,14 +31890,43 @@ fn execute_invokestatic_cached(
 
             // Fast path: check if the method was already JIT-compiled (e.g. by OSR)
             // before going through the invocation counter.
+            //
+            // T2.2 -- `JitCache::get` hashes class name + method name +
+            // descriptor and then re-compares all three with full string
+            // equality, and this probe used to run on EVERY interpreted call of
+            // a not-yet-compiled method purely to discover whether a background
+            // compile had published a body. That is exactly the re-resolution
+            // this per-call-site inline cache exists to avoid.
+            //
+            // It is now epoch-guarded: `jit_cache_generation()` advances on every
+            // JIT-cache publication AND every invalidation (see
+            // `jit::JitCache::put`/`put_osr`/`invalidate_matching`/`clear_all` --
+            // the only mutators), so while this entry's snapshot still equals the
+            // live generation the cache content is unchanged since we last looked
+            // and missed, and looking again cannot find anything. Steady state is
+            // two integer loads plus a compare: no hashing, no string compares.
             if !redefine_jit_quiesced && !continuation_interpreted {
-                let jit_cache = shared.jit_cache.read();
-                if let Some(compiled) = jit_cache.get(
-                    &cached.class_name,
-                    &cached.method_name,
-                    &cached.method_descriptor,
-                    cached.declaring_class_id,
-                ) {
+                // Read the generation BEFORE probing. A publication racing in
+                // after the probe leaves us memoizing an older generation, which
+                // compares unequal next time and re-probes -- safe. Memoizing a
+                // generation NEWER than the probe would be the unsound direction,
+                // and this ordering makes it impossible.
+                let jit_generation = cratonvm_jit::jit_cache_generation();
+                let compiled_probe = if cached.jit_probe_is_current(jit_generation) {
+                    None
+                } else {
+                    let found = shared.jit_cache.read().get(
+                        &cached.class_name,
+                        &cached.method_name,
+                        &cached.method_descriptor,
+                        cached.declaring_class_id,
+                    );
+                    if found.is_none() {
+                        cached.record_jit_probe_miss(jit_generation);
+                    }
+                    found
+                };
+                if let Some(compiled) = compiled_probe {
                     let ret = crate::jit::return_type(&cached.method_descriptor);
                     let heap = compiled.needs_heap();
                     // WP2.4-F1: inherit the gate from the bytecode entry —
@@ -34705,6 +34742,7 @@ fn try_jit_upgrade_with_gate(
                 is_static: method.is_static(),
                 force_native_cache: std::sync::OnceLock::new(),
                 native_callback_cache: std::sync::OnceLock::new(),
+                jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
             };
             drop(cm);
 
@@ -35593,6 +35631,7 @@ fn try_jit_compile_callee_slow(
         is_static: method.is_static(),
         force_native_cache: std::sync::OnceLock::new(),
         native_callback_cache: std::sync::OnceLock::new(),
+        jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
     };
     drop(cm);
 
@@ -39367,14 +39406,29 @@ fn execute_invokevirtual_cached(
                         && crate::runtime::env_cache::jit_virtual_tierup()
                     {
                         // Fast path: already compiled (by this counter or OSR)?
-                        let compiled_opt = {
-                            let jc = shared.jit_cache.read();
-                            jc.get(
+                        //
+                        // T2.2 -- epoch-guarded exactly like the invokestatic twin
+                        // in `execute_invokestatic_cached`: skip the string-keyed
+                        // `JitCache::get` while this entry's snapshot of
+                        // `jit_cache_generation()` is still current, because no
+                        // publication or invalidation has happened since the probe
+                        // that missed. Read the generation before probing so a
+                        // racing publication can only cause a redundant re-probe,
+                        // never a missed one.
+                        let jit_generation = cratonvm_jit::jit_cache_generation();
+                        let compiled_opt = if cached.jit_probe_is_current(jit_generation) {
+                            None
+                        } else {
+                            let found = shared.jit_cache.read().get(
                                 &cached.class_name,
                                 &cached.method_name,
                                 &cached.method_descriptor,
                                 cached.declaring_class_id,
-                            )
+                            );
+                            if found.is_none() {
+                                cached.record_jit_probe_miss(jit_generation);
+                            }
+                            found
                         }
                         .or_else(|| {
                             // Warmup counter mirroring execute_invokestatic_cached.
@@ -40777,6 +40831,7 @@ fn populate_virtual_invoke_cache(
         is_static: method.is_static(),
         force_native_cache: std::sync::OnceLock::new(),
         native_callback_cache: std::sync::OnceLock::new(),
+        jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
     };
 
     // WP2.4-F1: snapshot before dropping the class_manager read-lock so
@@ -44983,6 +45038,7 @@ mod tests {
             is_static: false,
             force_native_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
+            jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
         });
         let key: PromotedInvokeKey = (ClassId::new(9999), 17, false, Some(ClassId::new(12345)));
         vm.shared.shared_resolution.insert_promoted_invoke(

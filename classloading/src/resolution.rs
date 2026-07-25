@@ -1671,6 +1671,7 @@ mod tests {
                 is_static: false,
                 force_native_cache: std::sync::OnceLock::new(),
                 native_callback_cache: std::sync::OnceLock::new(),
+                jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
             })
         };
 
@@ -1741,6 +1742,7 @@ mod tests {
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
+            jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
         });
         let entry = CachedInvokeTarget::Bytecode {
             cached,
@@ -1776,6 +1778,7 @@ mod tests {
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
+            jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
         });
         cache.put(
             caller,
