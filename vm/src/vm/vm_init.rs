@@ -1353,9 +1353,18 @@ impl SharedVm {
                 // they got.
                 match cratonvm_gc::compressed_oops::enable_for_live_heap() {
                     Ok((base, shift)) => {
+                        // The bootstrap class set was loaded and laid out
+                        // BEFORE this point, with 8-byte reference fields,
+                        // while the accessors are now going to read 4-byte
+                        // narrow slots. Re-lay every loaded class out at the
+                        // narrow width. This is the one moment it is safe:
+                        // the heap was created a few lines above, so not a
+                        // single instance of any of those classes exists yet.
+                        let relaid = class_manager.recompute_all_compact_layouts();
                         eprintln!(
                             "[cratonvm] compressed oops ON: HeapBased base={base:#x} \
-                             shift={shift} (reference fields and array elements are 4 bytes)"
+                             shift={shift} (reference fields and array elements are 4 \
+                             bytes; {relaid} class layouts re-laid out)"
                         );
                     }
                     Err(why) => {
