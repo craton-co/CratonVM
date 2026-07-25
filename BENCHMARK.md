@@ -171,10 +171,29 @@ numbers up to N = 2²⁸, kernel sources, and eligibility rules — are in
 
 ## Reproducing
 
+> **⚠ Build with fat LTO for any number you intend to compare against the
+> baselines.** `[profile.release]` is `lto = "fat"` + `codegen-units = 1`, and the
+> anchored baselines in `cratonbench-baseline-azure-epyc.tsv` were measured that
+> way. Building with `CARGO_PROFILE_RELEASE_LTO=off` — the usual workaround for
+> the OOM SIGKILL below — produces a **materially slower** binary whose absolute
+> times are not comparable to those baselines. Measured 2026-07-25 on the Azure
+> host, an LTO=off build failed 4 of the 7 gate phases *with no source changes at
+> all* (sieve 10249 vs a 6090 budget, hashmap 23215 vs 4515, stringregex 494 vs
+> 173, bintrees 2720 vs 1627). If the gate fails on an unmodified checkout, check
+> how you built before concluding there is a regression.
+>
+> LTO=off is still fine for **relative** A/B work — comparing two binaries built
+> the same way is valid and is how the layout-registry win was measured — but say
+> so when reporting, and never quote an LTO=off absolute against a baseline.
+
 ```bash
-# Build. On a memory-constrained or contended host, disable fat LTO: the
-# release profile's lto="fat" + codegen-units=1 can get the final cratonvm-cli
-# rustc OOM-SIGKILLed (shows up as "signal: 9, SIGKILL", NOT a compile error).
+# Build. Fat LTO — required for baseline-comparable numbers.
+cargo build --release -p cratonvm-cli
+
+# If the final cratonvm-cli rustc dies with "signal: 9, SIGKILL" that is the OOM
+# killer during fat-LTO codegen, NOT a compile error. Lower parallelism first:
+cargo build --release -p cratonvm-cli -j2
+# Only as a last resort, and only for relative A/B (see the warning above):
 CARGO_PROFILE_RELEASE_LTO=off cargo build --release -p cratonvm-cli -j6
 
 # CPU, all seven phases in-process:
