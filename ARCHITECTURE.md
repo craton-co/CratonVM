@@ -92,12 +92,16 @@ actually is:
 | `native-io` | 50,000 | `types` | 9,500 |
 | `classloading` | 50,000 | remaining 6 | < 6,000 each |
 
-Several individual files are far larger than is comfortable —
-`native-builtins/src/phases_late.rs` (~77,000 lines), `vm/src/vm.rs` (~68,000),
-`vm/src/runtime/interpreter.rs` (~45,000), and `jit/src/x64.rs` (~39,000).
-`native-builtins/src/lib.rs` was ~90,000 and is now ~39,000, split into 13
-per-domain modules (`util_concurrent_ext`, `antlr_intrinsics`, `test_frameworks`,
-`regex_matcher`, `math_bignum`, …) on 2026-07-25.
+Several individual files are far larger than is comfortable — `vm/src/vm.rs`
+(~68,000 lines), `vm/src/runtime/interpreter.rs` (~45,000), and
+`jit/src/x64.rs` (~39,000). Two `native-builtins` files were worse and were
+split on 2026-07-25: `lib.rs` went ~90,000 → ~39,000 across 13 per-domain
+modules (`util_concurrent_ext`, `antlr_intrinsics`, `regex_matcher`,
+`math_bignum`, …), and `phases_late.rs` went ~77,000 → ~8,000 across 18
+modules under `native-builtins/src/phases_late/` (`nio_file`, `bouncycastle`,
+`concurrent`, `ssl_security`, `net_channels`, `streams`, `jdbc`, …).
+`phases_late.rs` itself now holds only the shared preamble, the per-phase
+dispatchers, and cross-domain leftovers.
 
 **Splitting a file does not speed up incremental builds, and it cannot.** Rust's
 compilation unit is the *crate*, not the file: moving code into modules of the
@@ -105,8 +109,8 @@ same crate leaves that crate — and everything downstream of it — rebuilding 
 full. Measured over the 90k→39k split above, `touch lib.rs && cargo build
 --release -p cratonvm-cli` went 1m58s/2m00s before to 2m03s/2m03s after, i.e.
 noise. The payoff of splitting is **merge-conflict surface and reviewability**
-(the worst file is 57% smaller and edits now land in 13 separate files), not
-build time.
+(the two worst files are 57% and 89% smaller, and edits now land in 31 separate
+files instead of colliding in two), not build time.
 
 An actual incremental-build win requires splitting into **separate crates**. The
 module boundaries established by that split are the natural seams for it, and
