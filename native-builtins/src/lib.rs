@@ -6653,6 +6653,201 @@ fn strip_zone_id(addr: &str) -> Option<&str> {
 }
 
 
+// Thread-layout helpers shared by `register_essential_natives` and
+// `register_synthetic_overrides`.
+//
+// These MUST stay at module scope: they were originally nested inside
+// `register_essential_natives`, which made every call from
+// `register_synthetic_overrides` fail to resolve (22 x E0425) whenever the
+// `synthetic-jdk` feature was enabled -- a configuration nothing ever built,
+// so the breakage went unnoticed. Do not re-nest them inside a function.
+
+// The real JDK 25 Thread mirror can be compact at allocation time, so its
+// field count overlaps the synthetic compatibility layout. Classify the
+// layout from the declared real-only fields instead of the object size.
+fn has_real_jdk_thread_layout(ctx: &dyn NativeContext, thread: ObjectRef) -> bool {
+    // Resolve from the receiver: bootstrap class aliases can make a
+    // class-name lookup miss Thread even though the real field is present.
+    matches!(ctx.get_field_by_name(thread, "tid"), Value::Long(_))
+}
+
+// Real-JDK Thread layout: `priority`, `daemon`, `threadStatus`,
+// `stackSize` live inside a nested `java.lang.Thread$FieldHolder`
+// referenced by `Thread.holder`; only `name`/`holder`/`tid`/etc. are
+// direct fields.  When these `<init>` natives intercept a real-JDK
+// Thread they must populate a genuine `FieldHolder` — otherwise
+// `Thread.setPriority` (`holder.priority = ...`), `getState`
+// (`holder.threadStatus`) and `isDaemon` (`holder.daemon`) all NPE,
+// and `jdk.internal.ref.CleanerImpl.getCleanerImpl` (used by the real
+// `Cleaner.create()` bytecode) fails downstream.  Allocate + run the
+// real `FieldHolder(ThreadGroup, Runnable, long, int, boolean)` ctor.
+fn populate_real_thread_holder(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    group: Value,
+    target: Value,
+    name: Value,
+) {
+    // GC-safety: `this` (the Thread under construction) and `holder`
+    // (freshly allocated below) are both bare Rust locals held across
+    // `ctx.invoke("...FieldHolder", "<init>", ...)`, which runs real Java
+    // bytecode and can trigger a moving/promoting GC. `safe_native_call`
+    // pins/remaps this function's *incoming* args (`this` included) only
+    // once, at native-call entry — it does not protect a GC that happens
+    // *during* this callback's own re-entrant `invoke`. `holder` in
+    // particular has no Java-side reference anywhere until the final
+    // `set_field_by_name(this, "holder", ...)` below, so it is protected
+    // ONLY by an explicit native pin. Without this, a GC inside the
+    // FieldHolder ctor invoke relocates `holder` (and/or `this`), and the
+    // stale address then gets written into `this.holder` (or used to
+    // read/write fields on a dead object) — reads of `Thread.holder`
+    // downstream (`setPriority`/`getState`/`isDaemon`) then NPE or read
+    // garbage. Mirrors the identical BUG-03 pin pattern already used by
+    // `NativeContextImpl::build_thread_field_holder` (vm/src/vm/vm_exec.rs)
+    // for the bootstrap main-thread holder construction. See
+    // docs/known-issues/gc-blocked-thread-frame-stale-thread-mirror.md.
+    let pin_base = ctx.pin_native_root(this);
+    let target_handle = match target {
+        Value::Object(Some(o)) => Some((ctx.pin_native_root(o), o)),
+        _ => None,
+    };
+    ctx.set_field_by_name(this, "name", name);
+    let tid = next_java_thread_tid();
+    ctx.set_field_by_name(this, "tid", Value::Long(tid));
+    if let Some(tid_slot) = ctx.resolve_field_index("java/lang/Thread", "tid") {
+        ctx.set_field(this, tid_slot, Value::Long(tid));
+    }
+    // JDK 17 keeps the Runnable directly on Thread.target and has no
+    // Thread$FieldHolder. Seed the direct field before attempting the newer
+    // holder layout so app-created threads still run on that JDK shape.
+    ctx.set_field_by_name(this, "target", target);
+    // On some real subclass mirrors, name-based lookup from the concrete
+    // receiver can miss legacy fields declared by java.lang.Thread. Seed
+    // the resolved Thread slot explicitly so bytecode `Thread.run()` bodies
+    // that read `this.target` observe the Runnable.
+    if let Some(target_slot) = ctx.resolve_field_index("java/lang/Thread", "target") {
+        ctx.set_field(this, target_slot, target);
+    }
+    // Don't clobber an already-populated holder (e.g. if the real
+    // Java constructor somehow ran first, or a re-entrant call).
+    if let Value::Object(Some(_)) = ctx.get_field_by_name(this, "holder") {
+        ctx.unpin_native_roots(pin_base);
+        return;
+    }
+    let holder_class = match ctx.ensure_class_initialized("java/lang/Thread$FieldHolder") {
+        Ok(cid) => cid,
+        Err(_) => {
+            ctx.unpin_native_roots(pin_base);
+            return;
+        }
+    };
+    let nfields = ctx.class_num_total_fields(holder_class).max(1);
+    let holder = ctx.alloc_object(holder_class, nfields);
+    let holder_handle = ctx.pin_native_root(holder);
+    // A real ThreadGroup is required: the FieldHolder ctor stores it,
+    // and `Thread.getThreadGroup()` returns `holder.group`.  Fall back
+    // to the current thread's group when the caller passed null.
+    //
+    // GCBARRIER-CDLWAIT-FIX (2026-07-17): this block's `get_field_by_name`
+    // calls (and, under `CRATONVM_DBG_GC_STRESS` / real allocation
+    // pressure, any heap touch at all) can trigger a moving collection.
+    // `holder` was pinned right above via `holder_handle`, but nothing
+    // re-read it through that pin before this point -- so a GC landing
+    // in this exact window silently relocates the just-allocated
+    // FieldHolder while the bare `holder` local still names its dead
+    // from-space address. That address remains a *structurally valid*
+    // read (headers of already-evacuated copies stay intact until the
+    // space is reused), so nothing downstream ever threw; it just meant
+    // `args[0]` below handed the FieldHolder ctor invoke a receiver that
+    // pointed at reclaimed memory. Root-caused live: under
+    // `CRATONVM_DBG_GC_STRESS`, the FIRST-ever `new Thread(Runnable,
+    // String)` in a process reliably hit this window (this call's own
+    // `ensure_class_initialized("java/lang/Thread$FieldHolder")` above
+    // loads+links that class for the first time, doing enough
+    // allocating work to make a GC land here on cold runs; every
+    // subsequent construction is warm and never triggers a GC in this
+    // narrow span) -- the constructed `Thread.holder.task` field then
+    // read back as a zero/default slot (decoded as `Int(0)`, not even a
+    // stale `Object` ref) because the ctor's `putfield` landed on the
+    // abandoned copy, and that worker's `Runnable.run()` (and therefore
+    // its `CountDownLatch.countDown()`) was silently never invoked.
+    // Re-read `holder` through its pin now, immediately before it is
+    // used to build `args`, exactly like `target`/`this` already are
+    // re-read (via `target_handle`/`pin_base`) after the invoke below --
+    // this closes the identical gap on the WAY IN.
+    let holder = ctx.read_native_pin(holder_handle, holder);
+    let group = match group {
+        Value::Object(Some(_)) => group,
+        _ => {
+            let cur = ctx.current_thread_object();
+            let g = ctx.get_field_by_name(cur, "holder");
+            match g {
+                Value::Object(Some(h)) => ctx.get_field_by_name(h, "group"),
+                _ => Value::Object(None),
+            }
+        }
+    };
+    // Same fix, applied again: the group-resolution block just above is
+    // itself a further opportunity for a GC to land before `args` is
+    // built, so re-read `holder` (and the `target` object, if any, via
+    // `target_handle`) one more time right at the point of use.
+    let holder = ctx.read_native_pin(holder_handle, holder);
+    let target = match target_handle {
+        Some((handle, old)) => Value::Object(Some(ctx.read_native_pin(handle, old))),
+        None => target,
+    };
+    let args = [
+        Value::Object(Some(holder)),
+        group,
+        target,
+        Value::Long(0), // stackSize
+        Value::Int(5),  // priority = NORM_PRIORITY
+        Value::Int(0),  // daemon = false
+    ];
+    let ctor_ok = ctx
+        .invoke(
+            "java/lang/Thread$FieldHolder",
+            "<init>",
+            "(Ljava/lang/ThreadGroup;Ljava/lang/Runnable;JIZ)V",
+            &args,
+        )
+        .is_ok();
+    // Re-read both pinned objects: the invoke above may have GC'd and
+    // relocated either (or both) of them.
+    let holder = ctx.read_native_pin(holder_handle, holder);
+    let this = ctx.read_native_pin(pin_base, this);
+    let target = match target_handle {
+        Some((handle, old)) => Value::Object(Some(ctx.read_native_pin(handle, old))),
+        None => target,
+    };
+    ctx.set_field_by_name(this, "target", target);
+    if let Some(target_slot) = ctx.resolve_field_index("java/lang/Thread", "target") {
+        ctx.set_field(this, target_slot, target);
+    }
+    if !ctor_ok {
+        // Constructor unavailable — populate the known fields directly
+        // so the holder is still usable by getPriority/isDaemon/getState.
+        ctx.set_field_by_name(holder, "group", args[1]);
+        ctx.set_field_by_name(holder, "task", target);
+        ctx.set_field_by_name(holder, "stackSize", Value::Long(0));
+        ctx.set_field_by_name(holder, "priority", Value::Int(5));
+        ctx.set_field_by_name(holder, "daemon", Value::Int(0));
+        ctx.set_field_by_name(holder, "threadStatus", Value::Int(0));
+    }
+    ctx.set_field_by_name(this, "holder", Value::Object(Some(holder)));
+    if let Some(holder_slot) = ctx.resolve_field_index("java/lang/Thread", "holder") {
+        ctx.set_field(this, holder_slot, Value::Object(Some(holder)));
+    }
+    if matches!(ctx.get_field_by_name(this, "target"), Value::Object(None))
+        && matches!(ctx.get_field_by_name(this, "holder"), Value::Object(None))
+        && ctx.object_num_fields(this) >= 4
+    {
+        ctx.set_field(this, 2, group);
+        ctx.set_field(this, 3, target);
+    }
+    ctx.unpin_native_roots(pin_base);
+}
+
 pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // ModifiedClassPathClassLoader can legitimately materialize a second
     // Spring-core namespace. Spring's package-private Adapt.isIn helper is
@@ -12983,191 +13178,6 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         num_fields <= 8
     }
 
-    // The real JDK 25 Thread mirror can be compact at allocation time, so its
-    // field count overlaps the synthetic compatibility layout. Classify the
-    // layout from the declared real-only fields instead of the object size.
-    fn has_real_jdk_thread_layout(ctx: &dyn NativeContext, thread: ObjectRef) -> bool {
-        // Resolve from the receiver: bootstrap class aliases can make a
-        // class-name lookup miss Thread even though the real field is present.
-        matches!(ctx.get_field_by_name(thread, "tid"), Value::Long(_))
-    }
-
-    // Real-JDK Thread layout: `priority`, `daemon`, `threadStatus`,
-    // `stackSize` live inside a nested `java.lang.Thread$FieldHolder`
-    // referenced by `Thread.holder`; only `name`/`holder`/`tid`/etc. are
-    // direct fields.  When these `<init>` natives intercept a real-JDK
-    // Thread they must populate a genuine `FieldHolder` — otherwise
-    // `Thread.setPriority` (`holder.priority = ...`), `getState`
-    // (`holder.threadStatus`) and `isDaemon` (`holder.daemon`) all NPE,
-    // and `jdk.internal.ref.CleanerImpl.getCleanerImpl` (used by the real
-    // `Cleaner.create()` bytecode) fails downstream.  Allocate + run the
-    // real `FieldHolder(ThreadGroup, Runnable, long, int, boolean)` ctor.
-    fn populate_real_thread_holder(
-        ctx: &mut dyn NativeContext,
-        this: ObjectRef,
-        group: Value,
-        target: Value,
-        name: Value,
-    ) {
-        // GC-safety: `this` (the Thread under construction) and `holder`
-        // (freshly allocated below) are both bare Rust locals held across
-        // `ctx.invoke("...FieldHolder", "<init>", ...)`, which runs real Java
-        // bytecode and can trigger a moving/promoting GC. `safe_native_call`
-        // pins/remaps this function's *incoming* args (`this` included) only
-        // once, at native-call entry — it does not protect a GC that happens
-        // *during* this callback's own re-entrant `invoke`. `holder` in
-        // particular has no Java-side reference anywhere until the final
-        // `set_field_by_name(this, "holder", ...)` below, so it is protected
-        // ONLY by an explicit native pin. Without this, a GC inside the
-        // FieldHolder ctor invoke relocates `holder` (and/or `this`), and the
-        // stale address then gets written into `this.holder` (or used to
-        // read/write fields on a dead object) — reads of `Thread.holder`
-        // downstream (`setPriority`/`getState`/`isDaemon`) then NPE or read
-        // garbage. Mirrors the identical BUG-03 pin pattern already used by
-        // `NativeContextImpl::build_thread_field_holder` (vm/src/vm/vm_exec.rs)
-        // for the bootstrap main-thread holder construction. See
-        // docs/known-issues/gc-blocked-thread-frame-stale-thread-mirror.md.
-        let pin_base = ctx.pin_native_root(this);
-        let target_handle = match target {
-            Value::Object(Some(o)) => Some((ctx.pin_native_root(o), o)),
-            _ => None,
-        };
-        ctx.set_field_by_name(this, "name", name);
-        let tid = next_java_thread_tid();
-        ctx.set_field_by_name(this, "tid", Value::Long(tid));
-        if let Some(tid_slot) = ctx.resolve_field_index("java/lang/Thread", "tid") {
-            ctx.set_field(this, tid_slot, Value::Long(tid));
-        }
-        // JDK 17 keeps the Runnable directly on Thread.target and has no
-        // Thread$FieldHolder. Seed the direct field before attempting the newer
-        // holder layout so app-created threads still run on that JDK shape.
-        ctx.set_field_by_name(this, "target", target);
-        // On some real subclass mirrors, name-based lookup from the concrete
-        // receiver can miss legacy fields declared by java.lang.Thread. Seed
-        // the resolved Thread slot explicitly so bytecode `Thread.run()` bodies
-        // that read `this.target` observe the Runnable.
-        if let Some(target_slot) = ctx.resolve_field_index("java/lang/Thread", "target") {
-            ctx.set_field(this, target_slot, target);
-        }
-        // Don't clobber an already-populated holder (e.g. if the real
-        // Java constructor somehow ran first, or a re-entrant call).
-        if let Value::Object(Some(_)) = ctx.get_field_by_name(this, "holder") {
-            ctx.unpin_native_roots(pin_base);
-            return;
-        }
-        let holder_class = match ctx.ensure_class_initialized("java/lang/Thread$FieldHolder") {
-            Ok(cid) => cid,
-            Err(_) => {
-                ctx.unpin_native_roots(pin_base);
-                return;
-            }
-        };
-        let nfields = ctx.class_num_total_fields(holder_class).max(1);
-        let holder = ctx.alloc_object(holder_class, nfields);
-        let holder_handle = ctx.pin_native_root(holder);
-        // A real ThreadGroup is required: the FieldHolder ctor stores it,
-        // and `Thread.getThreadGroup()` returns `holder.group`.  Fall back
-        // to the current thread's group when the caller passed null.
-        //
-        // GCBARRIER-CDLWAIT-FIX (2026-07-17): this block's `get_field_by_name`
-        // calls (and, under `CRATONVM_DBG_GC_STRESS` / real allocation
-        // pressure, any heap touch at all) can trigger a moving collection.
-        // `holder` was pinned right above via `holder_handle`, but nothing
-        // re-read it through that pin before this point -- so a GC landing
-        // in this exact window silently relocates the just-allocated
-        // FieldHolder while the bare `holder` local still names its dead
-        // from-space address. That address remains a *structurally valid*
-        // read (headers of already-evacuated copies stay intact until the
-        // space is reused), so nothing downstream ever threw; it just meant
-        // `args[0]` below handed the FieldHolder ctor invoke a receiver that
-        // pointed at reclaimed memory. Root-caused live: under
-        // `CRATONVM_DBG_GC_STRESS`, the FIRST-ever `new Thread(Runnable,
-        // String)` in a process reliably hit this window (this call's own
-        // `ensure_class_initialized("java/lang/Thread$FieldHolder")` above
-        // loads+links that class for the first time, doing enough
-        // allocating work to make a GC land here on cold runs; every
-        // subsequent construction is warm and never triggers a GC in this
-        // narrow span) -- the constructed `Thread.holder.task` field then
-        // read back as a zero/default slot (decoded as `Int(0)`, not even a
-        // stale `Object` ref) because the ctor's `putfield` landed on the
-        // abandoned copy, and that worker's `Runnable.run()` (and therefore
-        // its `CountDownLatch.countDown()`) was silently never invoked.
-        // Re-read `holder` through its pin now, immediately before it is
-        // used to build `args`, exactly like `target`/`this` already are
-        // re-read (via `target_handle`/`pin_base`) after the invoke below --
-        // this closes the identical gap on the WAY IN.
-        let holder = ctx.read_native_pin(holder_handle, holder);
-        let group = match group {
-            Value::Object(Some(_)) => group,
-            _ => {
-                let cur = ctx.current_thread_object();
-                let g = ctx.get_field_by_name(cur, "holder");
-                match g {
-                    Value::Object(Some(h)) => ctx.get_field_by_name(h, "group"),
-                    _ => Value::Object(None),
-                }
-            }
-        };
-        // Same fix, applied again: the group-resolution block just above is
-        // itself a further opportunity for a GC to land before `args` is
-        // built, so re-read `holder` (and the `target` object, if any, via
-        // `target_handle`) one more time right at the point of use.
-        let holder = ctx.read_native_pin(holder_handle, holder);
-        let target = match target_handle {
-            Some((handle, old)) => Value::Object(Some(ctx.read_native_pin(handle, old))),
-            None => target,
-        };
-        let args = [
-            Value::Object(Some(holder)),
-            group,
-            target,
-            Value::Long(0), // stackSize
-            Value::Int(5),  // priority = NORM_PRIORITY
-            Value::Int(0),  // daemon = false
-        ];
-        let ctor_ok = ctx
-            .invoke(
-                "java/lang/Thread$FieldHolder",
-                "<init>",
-                "(Ljava/lang/ThreadGroup;Ljava/lang/Runnable;JIZ)V",
-                &args,
-            )
-            .is_ok();
-        // Re-read both pinned objects: the invoke above may have GC'd and
-        // relocated either (or both) of them.
-        let holder = ctx.read_native_pin(holder_handle, holder);
-        let this = ctx.read_native_pin(pin_base, this);
-        let target = match target_handle {
-            Some((handle, old)) => Value::Object(Some(ctx.read_native_pin(handle, old))),
-            None => target,
-        };
-        ctx.set_field_by_name(this, "target", target);
-        if let Some(target_slot) = ctx.resolve_field_index("java/lang/Thread", "target") {
-            ctx.set_field(this, target_slot, target);
-        }
-        if !ctor_ok {
-            // Constructor unavailable — populate the known fields directly
-            // so the holder is still usable by getPriority/isDaemon/getState.
-            ctx.set_field_by_name(holder, "group", args[1]);
-            ctx.set_field_by_name(holder, "task", target);
-            ctx.set_field_by_name(holder, "stackSize", Value::Long(0));
-            ctx.set_field_by_name(holder, "priority", Value::Int(5));
-            ctx.set_field_by_name(holder, "daemon", Value::Int(0));
-            ctx.set_field_by_name(holder, "threadStatus", Value::Int(0));
-        }
-        ctx.set_field_by_name(this, "holder", Value::Object(Some(holder)));
-        if let Some(holder_slot) = ctx.resolve_field_index("java/lang/Thread", "holder") {
-            ctx.set_field(this, holder_slot, Value::Object(Some(holder)));
-        }
-        if matches!(ctx.get_field_by_name(this, "target"), Value::Object(None))
-            && matches!(ctx.get_field_by_name(this, "holder"), Value::Object(None))
-            && ctx.object_num_fields(this) >= 4
-        {
-            ctx.set_field(this, 2, group);
-            ctx.set_field(this, 3, target);
-        }
-        ctx.unpin_native_roots(pin_base);
-    }
     registry.register(
         "java/lang/Thread$FieldHolder",
         "<init>",

@@ -51,6 +51,8 @@ use crate::types::{ObjectRef, Value};
 #[cfg(all(test, feature = "synthetic-jdk"))]
 use cratonvm_native_api::NativeContext;
 #[cfg(all(test, feature = "synthetic-jdk"))]
+use cratonvm_reader::attribute::LazyAttribute;
+#[cfg(all(test, feature = "synthetic-jdk"))]
 use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
@@ -60,6 +62,13 @@ use std::sync::Arc;
 #[cfg(all(test, feature = "synthetic-jdk"))]
 mod tests {
     use super::*;
+
+    /// `ClassId` that `SharedVm::invalidate_jit_for_class` and
+    /// `DeoptimizationController::deoptimize` fall back to when a class name
+    /// is not registered with the class manager. The `JitCache` fixtures below
+    /// own their cache end-to-end and never register their fake classes, so
+    /// keying on this id is what makes a later name-driven eviction match.
+    const CID0: cratonvm_types::ClassId = cratonvm_types::ClassId::new(0);
 
     fn test_vm() -> Vm {
         Vm::new(VmConfig::default())
@@ -2467,16 +2476,16 @@ mod tests {
         let proxy_class_id = shared.alloc_lambda_proxy_id();
         let call_site = LambdaCallSite {
             functional_interface_id: None,
-            functional_interface: "java/util/function/IntUnaryOperator".to_string(),
-            sam_method_name: "applyAsInt".to_string(),
-            sam_descriptor: "(I)I".to_string(),
+            functional_interface: "java/util/function/IntUnaryOperator".into(),
+            sam_method_name: "applyAsInt".into(),
+            sam_descriptor: "(I)I".into(),
             impl_handle: MethodHandle {
                 kind: MethodHandleKind::InvokeStatic,
-                class_name: "java/lang/Math".to_string(),
-                member_name: "abs".to_string(),
-                descriptor: "(I)I".to_string(),
+                class_name: "java/lang/Math".into(),
+                member_name: "abs".into(),
+                descriptor: "(I)I".into(),
             },
-            instantiated_descriptor: "(I)I".to_string(),
+            instantiated_descriptor: "(I)I".into(),
             capture_types: vec![],
             proxy_class_id,
         };
@@ -2504,8 +2513,8 @@ mod tests {
         // Verify proxy is registered
         let proxies = shared.classes.lambda_proxies.read();
         let lcs = proxies.get(&proxy_class_id).unwrap();
-        assert_eq!(lcs.impl_handle.member_name, "abs");
-        assert_eq!(lcs.impl_handle.class_name, "java/lang/Math");
+        assert_eq!(&*lcs.impl_handle.member_name, "abs");
+        assert_eq!(&*lcs.impl_handle.class_name, "java/lang/Math");
         assert_eq!(lcs.capture_types.len(), 0);
         drop(proxies);
 
@@ -2524,16 +2533,16 @@ mod tests {
         let proxy_class_id = shared.alloc_lambda_proxy_id();
         let call_site = LambdaCallSite {
             functional_interface_id: None,
-            functional_interface: "java/util/function/IntUnaryOperator".to_string(),
-            sam_method_name: "applyAsInt".to_string(),
-            sam_descriptor: "(I)I".to_string(),
+            functional_interface: "java/util/function/IntUnaryOperator".into(),
+            sam_method_name: "applyAsInt".into(),
+            sam_descriptor: "(I)I".into(),
             impl_handle: MethodHandle {
                 kind: MethodHandleKind::InvokeStatic,
-                class_name: "java/lang/Math".to_string(),
-                member_name: "max".to_string(),
-                descriptor: "(II)I".to_string(),
+                class_name: "java/lang/Math".into(),
+                member_name: "max".into(),
+                descriptor: "(II)I".into(),
             },
-            instantiated_descriptor: "(I)I".to_string(),
+            instantiated_descriptor: "(I)I".into(),
             capture_types: vec!['I'],
             proxy_class_id,
         };
@@ -2589,16 +2598,16 @@ mod tests {
         let proxy_class_id = shared.alloc_lambda_proxy_id();
         let call_site = LambdaCallSite {
             functional_interface_id: None,
-            functional_interface: "java/util/function/Consumer".to_string(),
-            sam_method_name: "accept".to_string(),
-            sam_descriptor: "(Ljava/lang/Object;)V".to_string(),
+            functional_interface: "java/util/function/Consumer".into(),
+            sam_method_name: "accept".into(),
+            sam_descriptor: "(Ljava/lang/Object;)V".into(),
             impl_handle: MethodHandle {
                 kind: MethodHandleKind::InvokeVirtual,
-                class_name: "java/io/PrintStream".to_string(),
-                member_name: "println".to_string(),
-                descriptor: "(Ljava/lang/String;)V".to_string(),
+                class_name: "java/io/PrintStream".into(),
+                member_name: "println".into(),
+                descriptor: "(Ljava/lang/String;)V".into(),
             },
-            instantiated_descriptor: "(Ljava/lang/String;)V".to_string(),
+            instantiated_descriptor: "(Ljava/lang/String;)V".into(),
             capture_types: vec!['L'],
             proxy_class_id,
         };
@@ -2633,10 +2642,10 @@ mod tests {
         // Verify proxy structure
         let proxies = shared.classes.lambda_proxies.read();
         let lcs = proxies.get(&proxy_class_id).unwrap();
-        assert_eq!(lcs.functional_interface, "java/util/function/Consumer");
-        assert_eq!(lcs.sam_method_name, "accept");
+        assert_eq!(&*lcs.functional_interface, "java/util/function/Consumer");
+        assert_eq!(&*lcs.sam_method_name, "accept");
         assert_eq!(lcs.impl_handle.kind, MethodHandleKind::InvokeVirtual);
-        assert_eq!(lcs.impl_handle.class_name, "java/io/PrintStream");
+        assert_eq!(&*lcs.impl_handle.class_name, "java/io/PrintStream");
         assert_eq!(lcs.capture_types, vec!['L']);
     }
 
@@ -2662,16 +2671,16 @@ mod tests {
         let proxy_class_id = shared.alloc_lambda_proxy_id();
         let call_site = ResolvedCallSite::Lambda(LambdaCallSite {
             functional_interface_id: None,
-            functional_interface: "java/lang/Runnable".to_string(),
-            sam_method_name: "run".to_string(),
-            sam_descriptor: "()V".to_string(),
+            functional_interface: "java/lang/Runnable".into(),
+            sam_method_name: "run".into(),
+            sam_descriptor: "()V".into(),
             impl_handle: MethodHandle {
                 kind: MethodHandleKind::InvokeStatic,
-                class_name: "test/App".to_string(),
-                member_name: "lambda$main$0".to_string(),
-                descriptor: "()V".to_string(),
+                class_name: "test/App".into(),
+                member_name: "lambda$main$0".into(),
+                descriptor: "()V".into(),
             },
-            instantiated_descriptor: "()V".to_string(),
+            instantiated_descriptor: "()V".into(),
             capture_types: vec![],
             proxy_class_id,
         });
@@ -2692,8 +2701,8 @@ mod tests {
         assert!(cached.is_some());
         match cached.unwrap() {
             ResolvedCallSite::Lambda(lcs) => {
-                assert_eq!(lcs.functional_interface, "java/lang/Runnable");
-                assert_eq!(lcs.sam_method_name, "run");
+                assert_eq!(&*lcs.functional_interface, "java/lang/Runnable");
+                assert_eq!(&*lcs.sam_method_name, "run");
                 assert_eq!(lcs.proxy_class_id, proxy_class_id);
             }
             _ => panic!("Expected Lambda call site"),
@@ -2723,16 +2732,16 @@ mod tests {
             proxy1,
             LambdaCallSite {
                 functional_interface_id: None,
-                functional_interface: "java/lang/Runnable".to_string(),
-                sam_method_name: "run".to_string(),
-                sam_descriptor: "()V".to_string(),
+                functional_interface: "java/lang/Runnable".into(),
+                sam_method_name: "run".into(),
+                sam_descriptor: "()V".into(),
                 impl_handle: MethodHandle {
                     kind: MethodHandleKind::InvokeStatic,
-                    class_name: "test/A".to_string(),
-                    member_name: "lambda$0".to_string(),
-                    descriptor: "()V".to_string(),
+                    class_name: "test/A".into(),
+                    member_name: "lambda$0".into(),
+                    descriptor: "()V".into(),
                 },
-                instantiated_descriptor: "()V".to_string(),
+                instantiated_descriptor: "()V".into(),
                 capture_types: vec![],
                 proxy_class_id: proxy1,
             },
@@ -2741,16 +2750,16 @@ mod tests {
             proxy2,
             LambdaCallSite {
                 functional_interface_id: None,
-                functional_interface: "java/util/function/Supplier".to_string(),
-                sam_method_name: "get".to_string(),
-                sam_descriptor: "()Ljava/lang/Object;".to_string(),
+                functional_interface: "java/util/function/Supplier".into(),
+                sam_method_name: "get".into(),
+                sam_descriptor: "()Ljava/lang/Object;".into(),
                 impl_handle: MethodHandle {
                     kind: MethodHandleKind::InvokeStatic,
-                    class_name: "test/B".to_string(),
-                    member_name: "lambda$1".to_string(),
-                    descriptor: "(I)Ljava/lang/String;".to_string(),
+                    class_name: "test/B".into(),
+                    member_name: "lambda$1".into(),
+                    descriptor: "(I)Ljava/lang/String;".into(),
                 },
-                instantiated_descriptor: "(I)Ljava/lang/String;".to_string(),
+                instantiated_descriptor: "(I)Ljava/lang/String;".into(),
                 capture_types: vec!['I'],
                 proxy_class_id: proxy2,
             },
@@ -2764,11 +2773,11 @@ mod tests {
         // Verify independent lookup
         let proxies = shared.classes.lambda_proxies.read();
         assert_eq!(
-            proxies.get(&proxy1).unwrap().functional_interface,
+            &*proxies.get(&proxy1).unwrap().functional_interface,
             "java/lang/Runnable"
         );
         assert_eq!(
-            proxies.get(&proxy2).unwrap().functional_interface,
+            &*proxies.get(&proxy2).unwrap().functional_interface,
             "java/util/function/Supplier"
         );
         drop(proxies);
@@ -7538,16 +7547,16 @@ mod tests {
         let proxy_class_id = shared.alloc_lambda_proxy_id();
         let call_site = LambdaCallSite {
             functional_interface_id: None,
-            functional_interface: functional_interface.to_string(),
-            sam_method_name: sam_name.to_string(),
-            sam_descriptor: sam_desc.to_string(),
+            functional_interface: functional_interface.into(),
+            sam_method_name: sam_name.into(),
+            sam_descriptor: sam_desc.into(),
             impl_handle: MethodHandle {
                 kind,
-                class_name: impl_class.to_string(),
-                member_name: impl_method.to_string(),
-                descriptor: impl_desc.to_string(),
+                class_name: impl_class.into(),
+                member_name: impl_method.into(),
+                descriptor: impl_desc.into(),
             },
-            instantiated_descriptor: sam_desc.to_string(),
+            instantiated_descriptor: sam_desc.into(),
             capture_types: capture_types.clone(),
             proxy_class_id,
         };
@@ -34287,13 +34296,13 @@ mod tests {
                 name: Arc::from("doNothing"),
                 descriptor: Arc::from("()V"),
                 access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
-                attributes: vec![Attribute::Code(CodeAttribute {
+                attributes: vec![LazyAttribute::Decoded(Attribute::Code(CodeAttribute {
                     max_stack: 0,
                     max_locals: 0,
                     code: cratonvm_reader::ByteView::from_vec(vec![0xB1]), // return (void)
                     exception_table: vec![],
                     attributes: vec![],
-                })],
+                }))],
             }],
         );
         let mirror = get_or_create_class_mirror(&shared, class_id);
@@ -34355,7 +34364,7 @@ mod tests {
                 name: Arc::from("getFortyTwo"),
                 descriptor: Arc::from("()I"),
                 access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
-                attributes: vec![Attribute::Code(CodeAttribute {
+                attributes: vec![LazyAttribute::Decoded(Attribute::Code(CodeAttribute {
                     max_stack: 1,
                     max_locals: 0,
                     code: cratonvm_reader::ByteView::from_vec(vec![
@@ -34364,7 +34373,7 @@ mod tests {
                     ]),
                     exception_table: vec![],
                     attributes: vec![],
-                })],
+                }))],
             }],
         );
         let mirror = get_or_create_class_mirror(&shared, class_id);
@@ -34431,7 +34440,7 @@ mod tests {
                 name: Arc::from("doubleIt"),
                 descriptor: Arc::from("(I)I"),
                 access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
-                attributes: vec![Attribute::Code(CodeAttribute {
+                attributes: vec![LazyAttribute::Decoded(Attribute::Code(CodeAttribute {
                     max_stack: 2,
                     max_locals: 1,
                     code: cratonvm_reader::ByteView::from_vec(vec![
@@ -34442,7 +34451,7 @@ mod tests {
                     ]),
                     exception_table: vec![],
                     attributes: vec![],
-                })],
+                }))],
             }],
         );
         let mirror = get_or_create_class_mirror(&shared, class_id);
@@ -34547,7 +34556,7 @@ mod tests {
                 name: Arc::from("identity"),
                 descriptor: Arc::from("(I)I"),
                 access_flags: MethodAccessFlags::PUBLIC,
-                attributes: vec![Attribute::Code(CodeAttribute {
+                attributes: vec![LazyAttribute::Decoded(Attribute::Code(CodeAttribute {
                     max_stack: 1,
                     max_locals: 2, // this + int param
                     code: cratonvm_reader::ByteView::from_vec(vec![
@@ -34556,7 +34565,7 @@ mod tests {
                     ]),
                     exception_table: vec![],
                     attributes: vec![],
-                })],
+                }))],
             }],
         );
         let mirror = get_or_create_class_mirror(&shared, class_id);
@@ -34655,13 +34664,13 @@ mod tests {
                 name: Arc::from("run"),
                 descriptor: Arc::from("()V"),
                 access_flags: MethodAccessFlags::PUBLIC, // instance method (not static)
-                attributes: vec![Attribute::Code(CodeAttribute {
+                attributes: vec![LazyAttribute::Decoded(Attribute::Code(CodeAttribute {
                     max_stack: 0,
                     max_locals: 1,
                     code: cratonvm_reader::ByteView::from_vec(vec![0xB1]), // return
                     exception_table: vec![],
                     attributes: vec![],
-                })],
+                }))],
             }],
         );
         let mirror = get_or_create_class_mirror(&shared, class_id);
@@ -34723,7 +34732,7 @@ mod tests {
                 name: Arc::from("add"),
                 descriptor: Arc::from("(II)I"),
                 access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
-                attributes: vec![Attribute::Code(CodeAttribute {
+                attributes: vec![LazyAttribute::Decoded(Attribute::Code(CodeAttribute {
                     max_stack: 2,
                     max_locals: 2,
                     code: cratonvm_reader::ByteView::from_vec(vec![
@@ -34734,7 +34743,7 @@ mod tests {
                     ]),
                     exception_table: vec![],
                     attributes: vec![],
-                })],
+                }))],
             }],
         );
         let mirror = get_or_create_class_mirror(&shared, class_id);
@@ -34839,7 +34848,7 @@ mod tests {
                 name: Arc::from("getOne"),
                 descriptor: Arc::from("()J"),
                 access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
-                attributes: vec![Attribute::Code(CodeAttribute {
+                attributes: vec![LazyAttribute::Decoded(Attribute::Code(CodeAttribute {
                     max_stack: 2,
                     max_locals: 0,
                     code: cratonvm_reader::ByteView::from_vec(vec![
@@ -34848,7 +34857,7 @@ mod tests {
                     ]),
                     exception_table: vec![],
                     attributes: vec![],
-                })],
+                }))],
             }],
         );
         let mirror = get_or_create_class_mirror(&shared, class_id);
@@ -35073,13 +35082,13 @@ mod tests {
                 name: Arc::from("finalize"),
                 descriptor: Arc::from("()V"),
                 access_flags: MethodAccessFlags::PROTECTED,
-                attributes: vec![Attribute::Code(CodeAttribute {
+                attributes: vec![LazyAttribute::Decoded(Attribute::Code(CodeAttribute {
                     max_stack: 0,
                     max_locals: 1,
                     code: cratonvm_reader::ByteView::from_vec(vec![0xB1]), // return
                     exception_table: vec![],
                     attributes: vec![],
-                })],
+                }))],
             }],
         );
         let cm = shared.classes.class_manager.read();
@@ -35136,13 +35145,13 @@ mod tests {
                 name: Arc::from("finalize"),
                 descriptor: Arc::from("()V"),
                 access_flags: MethodAccessFlags::PROTECTED,
-                attributes: vec![Attribute::Code(CodeAttribute {
+                attributes: vec![LazyAttribute::Decoded(Attribute::Code(CodeAttribute {
                     max_stack: 0,
                     max_locals: 1,
                     code: cratonvm_reader::ByteView::from_vec(vec![0xB1]), // return
                     exception_table: vec![],
                     attributes: vec![],
-                })],
+                }))],
             }],
         );
 
@@ -35152,7 +35161,7 @@ mod tests {
         // Build a Vm that wraps the same shared state
         let mut vm = Vm {
             shared: shared.clone(),
-            main_thread: JvmThread::new(ThreadId(0), "test"),
+            main_thread: Box::new(JvmThread::new(ThreadId(0), "test")),
         };
         let count = vm.run_pending_finalizers();
         assert_eq!(count, 1, "Should have finalized 1 object");
@@ -35178,13 +35187,13 @@ mod tests {
                 name: Arc::from("finalize"),
                 descriptor: Arc::from("()V"),
                 access_flags: MethodAccessFlags::PROTECTED,
-                attributes: vec![Attribute::Code(CodeAttribute {
+                attributes: vec![LazyAttribute::Decoded(Attribute::Code(CodeAttribute {
                     max_stack: 0,
                     max_locals: 1,
                     code: cratonvm_reader::ByteView::from_vec(vec![0xB1]), // return
                     exception_table: vec![],
                     attributes: vec![],
-                })],
+                }))],
             }],
         );
 
@@ -35197,7 +35206,7 @@ mod tests {
 
         let mut vm = Vm {
             shared: shared.clone(),
-            main_thread: JvmThread::new(ThreadId(0), "test"),
+            main_thread: Box::new(JvmThread::new(ThreadId(0), "test")),
         };
         let count = vm.run_pending_finalizers();
         assert_eq!(count, 3, "Should have finalized 3 objects");
@@ -38356,7 +38365,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let cipher_ref = cipher.as_object().unwrap().unwrap();
+        let cipher_ref = cipher.as_object().unwrap();
         let result = call_native(
             &shared,
             &mut thread,
@@ -38367,7 +38376,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let algo_ref = result.as_object().unwrap().unwrap();
+        let algo_ref = result.as_object().unwrap();
         assert_eq!(
             read_java_string(&shared.mem.heap, algo_ref),
             Some("AES".to_string())
@@ -38389,7 +38398,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let cipher_ref = cipher.as_object().unwrap().unwrap();
+        let cipher_ref = cipher.as_object().unwrap();
         let key = shared.mem.heap.alloc_object(ClassId::new(0), 1);
         call_native(
             &shared,
@@ -38454,7 +38463,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let kg_ref = kg.as_object().unwrap().unwrap();
+        let kg_ref = kg.as_object().unwrap();
         call_native(
             &shared,
             &mut thread,
@@ -38474,8 +38483,8 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert!(sk.as_object().unwrap().is_some());
-        let sk_ref = sk.as_object().unwrap().unwrap();
+        assert!(sk.as_object().is_some());
+        let sk_ref = sk.as_object().unwrap();
         let encoded = call_native(
             &shared,
             &mut thread,
@@ -38486,7 +38495,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let arr_ref = encoded.as_object().unwrap().unwrap();
+        let arr_ref = encoded.as_object().unwrap();
         assert_eq!(shared.mem.heap.array_length(arr_ref), 32);
     }
 
@@ -38524,7 +38533,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let algo_ref = result.as_object().unwrap().unwrap();
+        let algo_ref = result.as_object().unwrap();
         assert_eq!(
             read_java_string(&shared.mem.heap, algo_ref),
             Some("AES".to_string())
@@ -38550,7 +38559,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let fmt_ref = fmt.as_object().unwrap().unwrap();
+        let fmt_ref = fmt.as_object().unwrap();
         assert_eq!(
             read_java_string(&shared.mem.heap, fmt_ref),
             Some("RAW".to_string())
@@ -38571,14 +38580,14 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let arr = provs.as_object().unwrap().unwrap();
+        let arr = provs.as_object().unwrap();
         // T2.6.15 seeded the registry with the five standard Sun providers
         // (SUN, SunJCE, SunRsaSign, SunEC, SunJSSE) to match the JDK's
         // default provider list; earlier revisions of this test asserted a
         // single "CratonVM" entry, which predated that work.
         assert_eq!(shared.mem.heap.array_length(arr), 5);
         let prov = shared.mem.heap.get_array_element(arr, 0).unwrap();
-        let prov_ref = prov.as_object().unwrap().unwrap();
+        let prov_ref = prov.as_object().unwrap();
         let name = call_native(
             &shared,
             &mut thread,
@@ -38589,7 +38598,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let name_ref = name.as_object().unwrap().unwrap();
+        let name_ref = name.as_object().unwrap();
         assert_eq!(
             read_java_string(&shared.mem.heap, name_ref),
             Some("SUN".to_string())
@@ -38622,7 +38631,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let ks_ref = ks.as_object().unwrap().unwrap();
+        let ks_ref = ks.as_object().unwrap();
         let tp = call_native(
             &shared,
             &mut thread,
@@ -38633,7 +38642,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let tp_ref = tp.as_object().unwrap().unwrap();
+        let tp_ref = tp.as_object().unwrap();
         assert_eq!(
             read_java_string(&shared.mem.heap, tp_ref),
             Some("PKCS12".to_string())
@@ -38671,7 +38680,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let dt_ref = dt.as_object().unwrap().unwrap();
+        let dt_ref = dt.as_object().unwrap();
         assert_eq!(
             read_java_string(&shared.mem.heap, dt_ref),
             Some("PKCS12".to_string())
@@ -38693,7 +38702,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let kpg_ref = kpg.as_object().unwrap().unwrap();
+        let kpg_ref = kpg.as_object().unwrap();
         call_native(
             &shared,
             &mut thread,
@@ -38713,7 +38722,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let kp_ref = kp.as_object().unwrap().unwrap();
+        let kp_ref = kp.as_object().unwrap();
         let pub_key = call_native(
             &shared,
             &mut thread,
@@ -38724,7 +38733,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert!(pub_key.as_object().unwrap().is_some());
+        assert!(pub_key.as_object().is_some());
         let priv_key = call_native(
             &shared,
             &mut thread,
@@ -38735,7 +38744,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert!(priv_key.as_object().unwrap().is_some());
+        assert!(priv_key.as_object().is_some());
         let alg = call_native(
             &shared,
             &mut thread,
@@ -38746,7 +38755,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let alg_ref = alg.as_object().unwrap().unwrap();
+        let alg_ref = alg.as_object().unwrap();
         assert_eq!(
             read_java_string(&shared.mem.heap, alg_ref),
             Some("RSA".to_string())
@@ -38768,7 +38777,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let sig_ref = sig.as_object().unwrap().unwrap();
+        let sig_ref = sig.as_object().unwrap();
         let alg = call_native(
             &shared,
             &mut thread,
@@ -38779,7 +38788,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let alg_ref = alg.as_object().unwrap().unwrap();
+        let alg_ref = alg.as_object().unwrap();
         assert_eq!(
             read_java_string(&shared.mem.heap, alg_ref),
             Some("SHA256withRSA".to_string())
@@ -38804,7 +38813,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let arr = signed.as_object().unwrap().unwrap();
+        let arr = signed.as_object().unwrap();
         // RSA signature length is 256 bytes (2048-bit key)
         assert_eq!(shared.mem.heap.array_length(arr), 256);
         let pub_key = shared.mem.heap.alloc_object(ClassId::new(0), 5);
@@ -39017,7 +39026,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let sl_ref = sl.as_object().unwrap().unwrap();
+        let sl_ref = sl.as_object().unwrap();
         let itr = call_native(
             &shared,
             &mut thread,
@@ -39028,7 +39037,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert!(itr.as_object().unwrap().is_some());
+        assert!(itr.as_object().is_some());
         let stream = call_native(
             &shared,
             &mut thread,
@@ -39039,7 +39048,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert!(stream.as_object().unwrap().is_some());
+        assert!(stream.as_object().is_some());
         let opt = call_native(
             &shared,
             &mut thread,
@@ -39050,7 +39059,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert!(opt.as_object().unwrap().is_some());
+        assert!(opt.as_object().is_some());
         let s = call_native(
             &shared,
             &mut thread,
@@ -39061,7 +39070,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let s_ref = s.as_object().unwrap().unwrap();
+        let s_ref = s.as_object().unwrap();
         let s_str = read_java_string(&shared.mem.heap, s_ref).unwrap_or_default();
         assert!(s_str.contains("ServiceLoader"));
     }
@@ -39139,7 +39148,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let s_ref = s.as_object().unwrap().unwrap();
+        let s_ref = s.as_object().unwrap();
         let s_str = read_java_string(&shared.mem.heap, s_ref).unwrap_or_default();
         // toString with no record components uses fallback format: ClassName@hex or @hex
         assert!(
@@ -39188,7 +39197,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let subs_ref = subs.as_object().unwrap().unwrap();
+        let subs_ref = subs.as_object().unwrap();
         assert_eq!(shared.mem.heap.array_length(subs_ref), 0);
         let comps = call_native(
             &shared,
@@ -39200,7 +39209,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let comps_ref = comps.as_object().unwrap().unwrap();
+        let comps_ref = comps.as_object().unwrap();
         assert_eq!(shared.mem.heap.array_length(comps_ref), 0);
     }
 
@@ -39219,7 +39228,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let cipher_ref = cipher.as_object().unwrap().unwrap();
+        let cipher_ref = cipher.as_object().unwrap();
         let input = shared.mem.heap.alloc_array(
             ClassId::new(0),
             crate::memory::heap::ArrayElementType::Byte,
@@ -39271,7 +39280,7 @@ mod tests {
         .unwrap()
         .unwrap();
         // Host is empty string from default init, InetAddress still created
-        assert!(addr.as_object().unwrap().is_some());
+        assert!(addr.as_object().is_some());
     }
 
     #[test]
@@ -39344,7 +39353,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let algo_ref = algo.as_object().unwrap().unwrap();
+        let algo_ref = algo.as_object().unwrap();
         assert_eq!(
             read_java_string(&shared.mem.heap, algo_ref),
             Some("AES".to_string())
@@ -39359,7 +39368,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let fmt_ref = fmt.as_object().unwrap().unwrap();
+        let fmt_ref = fmt.as_object().unwrap();
         assert_eq!(
             read_java_string(&shared.mem.heap, fmt_ref),
             Some("RAW".to_string())
@@ -39886,7 +39895,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let mt_ref = mt.as_object().unwrap().unwrap();
+        let mt_ref = mt.as_object().unwrap();
         let pc = call_native(
             &shared,
             &mut thread,
@@ -39925,16 +39934,16 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert!(lookup.as_object().unwrap().is_some());
+        assert!(lookup.as_object().is_some());
         // findVirtual returns a MethodHandle stub
         let cls = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         let name = create_java_string(&shared, "toString");
         let mt = shared.mem.heap.alloc_object(ClassId::new(0), 2);
-        let lk_ref = lookup.as_object().unwrap().unwrap();
+        let lk_ref = lookup.as_object().unwrap();
         let mh = call_native(&shared, &mut thread, "java/lang/invoke/MethodHandles$Lookup", "findVirtual",
             "(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/invoke/MethodType;)Ljava/lang/invoke/MethodHandle;",
             &[Value::Object(Some(lk_ref)), Value::Object(Some(cls)), Value::Object(Some(name)), Value::Object(Some(mt))]).unwrap().unwrap();
-        assert!(mh.as_object().unwrap().is_some());
+        assert!(mh.as_object().is_some());
     }
 
     #[test]
@@ -39969,7 +39978,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let m_ref = m.as_object().unwrap().unwrap();
+        let m_ref = m.as_object().unwrap();
         assert_eq!(
             read_java_string(&shared.mem.heap, m_ref),
             Some("test message".to_string())
@@ -40002,7 +40011,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let s_ref = scheme.as_object().unwrap().unwrap();
+        let s_ref = scheme.as_object().unwrap();
         assert_eq!(
             read_java_string(&shared.mem.heap, s_ref),
             Some("https".to_string())
@@ -40018,7 +40027,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let h_ref = host.as_object().unwrap().unwrap();
+        let h_ref = host.as_object().unwrap();
         assert_eq!(
             read_java_string(&shared.mem.heap, h_ref),
             Some("example.com".to_string())
@@ -40046,7 +40055,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let p_ref = path.as_object().unwrap().unwrap();
+        let p_ref = path.as_object().unwrap();
         assert_eq!(
             read_java_string(&shared.mem.heap, p_ref),
             Some("/path".to_string())
@@ -40062,7 +40071,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let q_ref = query.as_object().unwrap().unwrap();
+        let q_ref = query.as_object().unwrap();
         assert_eq!(
             read_java_string(&shared.mem.heap, q_ref),
             Some("q=1".to_string())
@@ -40078,7 +40087,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let f_ref = frag.as_object().unwrap().unwrap();
+        let f_ref = frag.as_object().unwrap();
         assert_eq!(
             read_java_string(&shared.mem.heap, f_ref),
             Some("frag".to_string())
@@ -40139,7 +40148,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let addr_ref = addr.as_object().unwrap().unwrap();
+        let addr_ref = addr.as_object().unwrap();
         let name = call_native(
             &shared,
             &mut thread,
@@ -40150,7 +40159,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let n_ref = name.as_object().unwrap().unwrap();
+        let n_ref = name.as_object().unwrap();
         assert_eq!(
             read_java_string(&shared.mem.heap, n_ref),
             Some("example.com".to_string())
@@ -40182,7 +40191,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let n_ref = n.as_object().unwrap().unwrap();
+        let n_ref = n.as_object().unwrap();
         assert_eq!(
             read_java_string(&shared.mem.heap, n_ref),
             Some("test.txt".to_string())
@@ -40306,7 +40315,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let lb_ref = lb.as_object().unwrap().unwrap();
+        let lb_ref = lb.as_object().unwrap();
         let addr = call_native(
             &shared,
             &mut thread,
@@ -40317,7 +40326,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let a_ref = addr.as_object().unwrap().unwrap();
+        let a_ref = addr.as_object().unwrap();
         assert_eq!(
             read_java_string(&shared.mem.heap, a_ref),
             Some("127.0.0.1".to_string())
@@ -40343,7 +40352,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let cs_ref = cs.as_object().unwrap().unwrap();
+        let cs_ref = cs.as_object().unwrap();
         let n = call_native(
             &shared,
             &mut thread,
@@ -40354,7 +40363,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let n_ref = n.as_object().unwrap().unwrap();
+        let n_ref = n.as_object().unwrap();
         assert_eq!(
             read_java_string(&shared.mem.heap, n_ref),
             Some("UTF-8".to_string())
@@ -40405,7 +40414,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let cs_ref = utf8.as_object().unwrap().unwrap();
+        let cs_ref = utf8.as_object().unwrap();
         let n = call_native(
             &shared,
             &mut thread,
@@ -40416,7 +40425,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let n_ref = n.as_object().unwrap().unwrap();
+        let n_ref = n.as_object().unwrap();
         assert_eq!(
             read_java_string(&shared.mem.heap, n_ref),
             Some("UTF-8".to_string())
@@ -40437,7 +40446,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let es_ref = es.as_object().unwrap().unwrap();
+        let es_ref = es.as_object().unwrap();
         let shut = call_native(
             &shared,
             &mut thread,
@@ -40599,7 +40608,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let s_ref = s.as_object().unwrap().unwrap();
+        let s_ref = s.as_object().unwrap();
         let text = read_java_string(&shared.mem.heap, s_ref).unwrap_or_default();
         assert!(text.contains("public"));
         assert!(text.contains("static"));
@@ -40620,7 +40629,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let list_ref = list.as_object().unwrap().unwrap();
+        let list_ref = list.as_object().unwrap();
         // size
         let sz = call_native(
             &shared,
@@ -40649,7 +40658,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let list_ref = list.as_object().unwrap().unwrap();
+        let list_ref = list.as_object().unwrap();
         let sz = call_native(
             &shared,
             &mut thread,
@@ -40720,7 +40729,7 @@ mod tests {
         .unwrap()
         .unwrap();
         // Returns a valid list (may be same or copy)
-        let wr = wrapped.as_object().unwrap().unwrap();
+        let wr = wrapped.as_object().unwrap();
         let sz = call_native(
             &shared,
             &mut thread,
@@ -40749,7 +40758,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let cf_ref = cf.as_object().unwrap().unwrap();
+        let cf_ref = cf.as_object().unwrap();
         // get
         let result = call_native(
             &shared,
@@ -40832,9 +40841,9 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let r_ref = result.as_object().unwrap().unwrap();
+        let r_ref = result.as_object().unwrap();
         let arr_val = shared.mem.heap.get_field(r_ref, 0);
-        let new_arr = arr_val.as_object().unwrap().unwrap();
+        let new_arr = arr_val.as_object().unwrap();
         assert_eq!(shared.mem.heap.array_length(new_arr), 3); // all kept
     }
 
@@ -40884,9 +40893,9 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let r_ref = result.as_object().unwrap().unwrap();
+        let r_ref = result.as_object().unwrap();
         let arr_val = shared.mem.heap.get_field(r_ref, 0);
-        let new_arr = arr_val.as_object().unwrap().unwrap();
+        let new_arr = arr_val.as_object().unwrap();
         assert_eq!(shared.mem.heap.array_length(new_arr), 0); // all dropped
     }
 
@@ -40920,9 +40929,9 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let r_ref = result.as_object().unwrap().unwrap();
+        let r_ref = result.as_object().unwrap();
         let arr_val = shared.mem.heap.get_field(r_ref, 0);
-        let new_arr = arr_val.as_object().unwrap().unwrap();
+        let new_arr = arr_val.as_object().unwrap();
         assert_eq!(shared.mem.heap.array_length(new_arr), 4);
     }
 
@@ -40940,9 +40949,9 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let r_ref = result.as_object().unwrap().unwrap();
+        let r_ref = result.as_object().unwrap();
         let arr_val = shared.mem.heap.get_field(r_ref, 0);
-        let arr_ref = arr_val.as_object().unwrap().unwrap();
+        let arr_ref = arr_val.as_object().unwrap();
         assert_eq!(shared.mem.heap.array_length(arr_ref), 1);
         let result2 = call_native(
             &shared,
@@ -40954,9 +40963,9 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let r_ref2 = result2.as_object().unwrap().unwrap();
+        let r_ref2 = result2.as_object().unwrap();
         let arr_val2 = shared.mem.heap.get_field(r_ref2, 0);
-        let arr_ref2 = arr_val2.as_object().unwrap().unwrap();
+        let arr_ref2 = arr_val2.as_object().unwrap();
         assert_eq!(shared.mem.heap.array_length(arr_ref2), 0);
     }
 
@@ -41023,7 +41032,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let s_ref = stats.as_object().unwrap().unwrap();
+        let s_ref = stats.as_object().unwrap();
         let cnt = call_native(
             &shared,
             &mut thread,
@@ -41106,7 +41115,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let s_ref = stats.as_object().unwrap().unwrap();
+        let s_ref = stats.as_object().unwrap();
         let cnt = call_native(
             &shared,
             &mut thread,
@@ -41166,7 +41175,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let s_ref = stats.as_object().unwrap().unwrap();
+        let s_ref = stats.as_object().unwrap();
         let cnt = call_native(
             &shared,
             &mut thread,
@@ -41227,9 +41236,9 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let b_ref = boxed.as_object().unwrap().unwrap();
+        let b_ref = boxed.as_object().unwrap();
         let arr_val = shared.mem.heap.get_field(b_ref, 0);
-        let new_arr = arr_val.as_object().unwrap().unwrap();
+        let new_arr = arr_val.as_object().unwrap();
         assert_eq!(shared.mem.heap.array_length(new_arr), 2);
         // Boxed values stored directly (simplified)
         assert_eq!(
@@ -41275,13 +41284,13 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let ls = long_stream.as_object().unwrap().unwrap();
+        let ls = long_stream.as_object().unwrap();
         let ls_arr = shared
             .mem
             .heap
             .get_field(ls, 0)
             .as_object()
-            .unwrap()
+            
             .unwrap();
         assert_eq!(
             shared
@@ -41323,9 +41332,9 @@ mod tests {
         let result = call_native(&shared, &mut thread, "java/util/stream/IntStream", "concat",
             "(Ljava/util/stream/IntStream;Ljava/util/stream/IntStream;)Ljava/util/stream/IntStream;",
             &[Value::Object(Some(sa)), Value::Object(Some(sb))]).unwrap().unwrap();
-        let r_ref = result.as_object().unwrap().unwrap();
+        let r_ref = result.as_object().unwrap();
         let arr_val = shared.mem.heap.get_field(r_ref, 0);
-        let new_arr = arr_val.as_object().unwrap().unwrap();
+        let new_arr = arr_val.as_object().unwrap();
         assert_eq!(shared.mem.heap.array_length(new_arr), 3);
     }
 
@@ -41344,7 +41353,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let c_ref = collector.as_object().unwrap().unwrap();
+        let c_ref = collector.as_object().unwrap();
         assert_eq!(shared.mem.heap.get_field(c_ref, 0), Value::Int(9));
     }
 
@@ -41363,7 +41372,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let c_ref = collector.as_object().unwrap().unwrap();
+        let c_ref = collector.as_object().unwrap();
         assert_eq!(shared.mem.heap.get_field(c_ref, 0), Value::Int(10));
     }
 
@@ -41376,7 +41385,7 @@ mod tests {
         let collector = call_native(&shared, &mut thread, "java/util/stream/Collectors", "mapping",
             "(Ljava/util/function/Function;Ljava/util/stream/Collector;)Ljava/util/stream/Collector;",
             &[Value::Object(Some(func)), Value::Object(Some(downstream))]).unwrap().unwrap();
-        let c_ref = collector.as_object().unwrap().unwrap();
+        let c_ref = collector.as_object().unwrap();
         assert_eq!(shared.mem.heap.get_field(c_ref, 0), Value::Int(11));
     }
 
@@ -41389,7 +41398,7 @@ mod tests {
         let collector = call_native(&shared, &mut thread, "java/util/stream/Collectors", "filtering",
             "(Ljava/util/function/Predicate;Ljava/util/stream/Collector;)Ljava/util/stream/Collector;",
             &[Value::Object(Some(pred)), Value::Object(Some(downstream))]).unwrap().unwrap();
-        let c_ref = collector.as_object().unwrap().unwrap();
+        let c_ref = collector.as_object().unwrap();
         assert_eq!(shared.mem.heap.get_field(c_ref, 0), Value::Int(12));
     }
 
@@ -41408,7 +41417,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let c_ref = collector.as_object().unwrap().unwrap();
+        let c_ref = collector.as_object().unwrap();
         assert_eq!(shared.mem.heap.get_field(c_ref, 0), Value::Int(13));
     }
 
@@ -41427,7 +41436,7 @@ mod tests {
         .unwrap()
         .unwrap();
         // collections.rs overrides with toList (tag 1) РІР‚вЂќ verify it returns a valid collector
-        let c_ref = collector.as_object().unwrap().unwrap();
+        let c_ref = collector.as_object().unwrap();
         assert_eq!(shared.mem.heap.get_field(c_ref, 0), Value::Int(1));
     }
 
@@ -41446,7 +41455,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let c_ref = collector.as_object().unwrap().unwrap();
+        let c_ref = collector.as_object().unwrap();
         assert_eq!(shared.mem.heap.get_field(c_ref, 0), Value::Int(19));
     }
 
@@ -41465,7 +41474,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let c_ref = collector.as_object().unwrap().unwrap();
+        let c_ref = collector.as_object().unwrap();
         assert_eq!(shared.mem.heap.get_field(c_ref, 0), Value::Int(22));
     }
 
@@ -41605,13 +41614,13 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let r_ref = result.as_object().unwrap().unwrap();
+        let r_ref = result.as_object().unwrap();
         let r_arr = shared
             .mem
             .heap
             .get_field(r_ref, 0)
             .as_object()
-            .unwrap()
+            
             .unwrap();
         assert_eq!(shared.mem.heap.array_length(r_arr), 2);
         assert_eq!(
@@ -41666,9 +41675,9 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let n_ref = norm.as_object().unwrap().unwrap();
+        let n_ref = norm.as_object().unwrap();
         let s_val = shared.mem.heap.get_field(n_ref, 0);
-        let s_ref = s_val.as_object().unwrap().unwrap();
+        let s_ref = s_val.as_object().unwrap();
         assert_eq!(
             read_java_string(&shared.mem.heap, s_ref),
             Some(expected.to_string())
@@ -41798,9 +41807,9 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let r_ref = result.as_object().unwrap().unwrap();
+        let r_ref = result.as_object().unwrap();
         let s_val = shared.mem.heap.get_field(r_ref, 0);
-        let s_ref = s_val.as_object().unwrap().unwrap();
+        let s_ref = s_val.as_object().unwrap();
         assert_eq!(
             read_java_string(&shared.mem.heap, s_ref),
             Some("/tmp/test.txt".to_string())
@@ -41821,7 +41830,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let c_ref = cont.as_object().unwrap().unwrap();
+        let c_ref = cont.as_object().unwrap();
         assert_eq!(shared.mem.heap.get_field(c_ref, 1), Value::Int(0)); // ordinal 0
     }
 
@@ -41887,7 +41896,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let p_ref = proc.as_object().unwrap().unwrap();
+        let p_ref = proc.as_object().unwrap();
         // waitFor returns exit code 0
         let exit = call_native(
             &shared,
@@ -41928,7 +41937,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let h_ref = handle.as_object().unwrap().unwrap();
+        let h_ref = handle.as_object().unwrap();
         let pid = call_native(
             &shared,
             &mut thread,
@@ -41971,14 +41980,14 @@ mod tests {
         .unwrap()
         .unwrap()
         .as_object()
-        .unwrap()
+        
         .unwrap();
         let parent_handle = shared
             .mem
             .heap
             .get_field(parent, 0)
             .as_object()
-            .unwrap()
+            
             .unwrap();
         assert!(matches!(shared.mem.heap.get_field(parent_handle, 0), Value::Long(pid) if pid > 0));
     }
@@ -42008,7 +42017,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let r_ref = result.as_object().unwrap().unwrap();
+        let r_ref = result.as_object().unwrap();
         let text = read_java_string(&shared.mem.heap, r_ref).unwrap_or_default();
         assert!(text.starts_with("1.23")); // 3 decimal places max
     }
@@ -42038,7 +42047,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let p_ref = pat_result.as_object().unwrap().unwrap();
+        let p_ref = pat_result.as_object().unwrap();
         assert_eq!(
             read_java_string(&shared.mem.heap, p_ref),
             Some("#.00".to_string())
@@ -42059,7 +42068,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert!(nf.as_object().unwrap().is_some());
+        assert!(nf.as_object().is_some());
     }
 
     #[test]
@@ -42087,7 +42096,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let p_ref = pat.as_object().unwrap().unwrap();
+        let p_ref = pat.as_object().unwrap();
         assert_eq!(
             read_java_string(&shared.mem.heap, p_ref),
             Some("yyyy-MM-dd HH:mm:ss".to_string())
@@ -42120,7 +42129,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let r_ref = result.as_object().unwrap().unwrap();
+        let r_ref = result.as_object().unwrap();
         let text = read_java_string(&shared.mem.heap, r_ref).unwrap_or_default();
         assert!(text.contains("Alice"));
         assert!(text.contains("30"));
@@ -42151,7 +42160,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let p_ref = pat.as_object().unwrap().unwrap();
+        let p_ref = pat.as_object().unwrap();
         assert_eq!(
             read_java_string(&shared.mem.heap, p_ref),
             Some("Count: {0}".to_string())
@@ -42172,7 +42181,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let r_ref = read_opt.as_object().unwrap().unwrap();
+        let r_ref = read_opt.as_object().unwrap();
         assert_eq!(shared.mem.heap.get_field(r_ref, 1), Value::Int(0)); // ordinal
     }
 
@@ -42196,9 +42205,9 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let n_ref = name.as_object().unwrap().unwrap();
+        let n_ref = name.as_object().unwrap();
         let s_val = shared.mem.heap.get_field(n_ref, 0);
-        let s_ref = s_val.as_object().unwrap().unwrap();
+        let s_ref = s_val.as_object().unwrap();
         assert_eq!(
             read_java_string(&shared.mem.heap, s_ref),
             Some("local".to_string())
@@ -42228,7 +42237,7 @@ mod tests {
         .unwrap();
         // thenCompose needs a Function that returns a CF РІР‚вЂќ use identity via System.identityHashCode
         // Instead, test thenRun which is simpler
-        let cf_ref = cf.as_object().unwrap().unwrap();
+        let cf_ref = cf.as_object().unwrap();
         let done = call_native(
             &shared,
             &mut thread,
@@ -42257,7 +42266,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let cf_ref = cf.as_object().unwrap().unwrap();
+        let cf_ref = cf.as_object().unwrap();
         // Create a Function proxy for exceptionally РІР‚вЂќ but since no exception, result passes through
         // Test via get instead
         let result = call_native(
@@ -42292,7 +42301,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let r_ref = result.as_object().unwrap().unwrap();
+        let r_ref = result.as_object().unwrap();
         let done = call_native(
             &shared,
             &mut thread,
@@ -42347,7 +42356,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let r_ref = result.as_object().unwrap().unwrap();
+        let r_ref = result.as_object().unwrap();
         let val = call_native(
             &shared,
             &mut thread,
@@ -42381,7 +42390,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let cf_ref = cf.as_object().unwrap().unwrap();
+        let cf_ref = cf.as_object().unwrap();
         let done = call_native(
             &shared,
             &mut thread,
@@ -42455,7 +42464,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let sc_ref = sc.as_object().unwrap().unwrap();
+        let sc_ref = sc.as_object().unwrap();
         let is_open = call_native(
             &shared,
             &mut thread,
@@ -42514,7 +42523,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let ssc_ref = ssc.as_object().unwrap().unwrap();
+        let ssc_ref = ssc.as_object().unwrap();
         let is_open = call_native(
             &shared,
             &mut thread,
@@ -42566,7 +42575,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let sel_ref = sel.as_object().unwrap().unwrap();
+        let sel_ref = sel.as_object().unwrap();
         let is_open = call_native(
             &shared,
             &mut thread,
@@ -42857,7 +42866,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let cs_ref = cs.as_object().unwrap().unwrap();
+        let cs_ref = cs.as_object().unwrap();
         // Create encoder
         let enc = call_native(
             &shared,
@@ -42869,7 +42878,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let enc_ref = enc.as_object().unwrap().unwrap();
+        let enc_ref = enc.as_object().unwrap();
         // Check charset
         let enc_cs = call_native(
             &shared,
@@ -42912,7 +42921,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let cs_ref = cs.as_object().unwrap().unwrap();
+        let cs_ref = cs.as_object().unwrap();
         let enc = call_native(
             &shared,
             &mut thread,
@@ -42923,7 +42932,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let enc_ref = enc.as_object().unwrap().unwrap();
+        let enc_ref = enc.as_object().unwrap();
         // Encode returns CoderResult (UNDERFLOW = success)
         let cr = call_native(
             &shared,
@@ -42940,7 +42949,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let cr_ref = cr.as_object().unwrap().unwrap();
+        let cr_ref = cr.as_object().unwrap();
         let is_underflow = call_native(
             &shared,
             &mut thread,
@@ -43166,7 +43175,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let sc_ref = sc.as_object().unwrap().unwrap();
+        let sc_ref = sc.as_object().unwrap();
         // Not connected initially
         let conn = call_native(
             &shared,
@@ -43224,7 +43233,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let bean_ref = bean.as_object().unwrap().unwrap();
+        let bean_ref = bean.as_object().unwrap();
         let usage = call_native(
             &shared,
             &mut thread,
@@ -43235,7 +43244,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let usage_ref = usage.as_object().unwrap().unwrap();
+        let usage_ref = usage.as_object().unwrap();
         let used = call_native(
             &shared,
             &mut thread,
@@ -43274,7 +43283,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let bean_ref = bean.as_object().unwrap().unwrap();
+        let bean_ref = bean.as_object().unwrap();
         let name = call_native(
             &shared,
             &mut thread,
@@ -43285,7 +43294,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let name_ref = name.as_object().unwrap().unwrap();
+        let name_ref = name.as_object().unwrap();
         assert_eq!(
             read_java_string(&shared.mem.heap, name_ref),
             Some("CratonVM".to_string())
@@ -43300,7 +43309,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let ver_ref = version.as_object().unwrap().unwrap();
+        let ver_ref = version.as_object().unwrap();
         assert_eq!(
             read_java_string(&shared.mem.heap, ver_ref),
             Some("0.1.0".to_string())
@@ -43321,7 +43330,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let bean_ref = bean.as_object().unwrap().unwrap();
+        let bean_ref = bean.as_object().unwrap();
         let count = call_native(
             &shared,
             &mut thread,
@@ -43377,7 +43386,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let bean_ref = bean.as_object().unwrap().unwrap();
+        let bean_ref = bean.as_object().unwrap();
         let procs = call_native(
             &shared,
             &mut thread,
@@ -43451,7 +43460,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let name_ref = name.as_object().unwrap().unwrap();
+        let name_ref = name.as_object().unwrap();
         assert_eq!(
             read_java_string(&shared.mem.heap, name_ref),
             Some(jar_path_str.clone())
@@ -43495,7 +43504,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let n_ref = got_name.as_object().unwrap().unwrap();
+        let n_ref = got_name.as_object().unwrap();
         assert_eq!(
             read_java_string(&shared.mem.heap, n_ref),
             Some("META-INF/MANIFEST.MF".to_string())
@@ -43569,7 +43578,7 @@ mod tests {
         .unwrap();
         assert!(matches!(stream, Value::Object(Some(_))));
         // The stream should have the same backing array
-        let s_ref = stream.as_object().unwrap().unwrap();
+        let s_ref = stream.as_object().unwrap();
         let stream_arr = shared.mem.heap.get_field(s_ref, 0);
         assert_eq!(stream_arr, Value::Object(Some(arr)));
     }
@@ -43612,7 +43621,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let lk_ref = lookup.as_object().unwrap().unwrap();
+        let lk_ref = lookup.as_object().unwrap();
         // Use Class.forName to get a proper class mirror whose slot 1 is the
         // class-name string РІР‚вЂќ findVarHandle's mirror_class_name walks that
         // slot and needs a real value to resolve the class.
@@ -43627,7 +43636,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let holder_ref = holder_cls.as_object().unwrap().unwrap();
+        let holder_ref = holder_cls.as_object().unwrap();
         let field_name = create_java_string(&shared, "value");
         // Primitive `long` is not loadable via Class.forName (spec behavior);
         // obtain the primitive mirror via Class.getPrimitiveClass, matching
@@ -43643,7 +43652,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let type_ref = type_cls.as_object().unwrap().unwrap();
+        let type_ref = type_cls.as_object().unwrap();
         let vh = call_native(
             &shared,
             &mut thread,
@@ -43677,7 +43686,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let pkg_ref = pkg.as_object().unwrap().unwrap();
+        let pkg_ref = pkg.as_object().unwrap();
         let got_name = call_native(
             &shared,
             &mut thread,
@@ -43688,7 +43697,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let n_ref = got_name.as_object().unwrap().unwrap();
+        let n_ref = got_name.as_object().unwrap();
         assert_eq!(
             read_java_string(&shared.mem.heap, n_ref),
             Some("java.util".to_string())
@@ -43749,7 +43758,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let c_ref = got_cls.as_object().unwrap().unwrap();
+        let c_ref = got_cls.as_object().unwrap();
         assert_eq!(
             read_java_string(&shared.mem.heap, c_ref),
             Some("com.example.Test".to_string())
@@ -43781,7 +43790,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let ft_ref = ft.as_object().unwrap().unwrap();
+        let ft_ref = ft.as_object().unwrap();
         let millis = call_native(
             &shared,
             &mut thread,
@@ -43814,7 +43823,7 @@ mod tests {
             "readAttributes",
             "(Ljava/nio/file/Path;Ljava/lang/Class;[Ljava/nio/file/LinkOption;)Ljava/nio/file/attribute/BasicFileAttributes;",
             &[Value::Object(Some(path)), Value::Object(None), Value::Object(Some(opts))]).unwrap().unwrap();
-        let a_ref = attrs.as_object().unwrap().unwrap();
+        let a_ref = attrs.as_object().unwrap();
         let is_dir = call_native(
             &shared,
             &mut thread,
@@ -43854,7 +43863,7 @@ mod tests {
         .unwrap()
         .unwrap();
         assert!(matches!(layer, Value::Object(Some(_))));
-        let layer_ref = layer.as_object().unwrap().unwrap();
+        let layer_ref = layer.as_object().unwrap();
         let modules = call_native(
             &shared,
             &mut thread,
@@ -43882,7 +43891,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let bean_ref = bean.as_object().unwrap().unwrap();
+        let bean_ref = bean.as_object().unwrap();
         let name = call_native(
             &shared,
             &mut thread,
@@ -43893,7 +43902,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let name_ref = name.as_object().unwrap().unwrap();
+        let name_ref = name.as_object().unwrap();
         assert_eq!(
             read_java_string(&shared.mem.heap, name_ref),
             Some("CratonVM JIT".to_string())
@@ -43914,7 +43923,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let bean_ref = bean.as_object().unwrap().unwrap();
+        let bean_ref = bean.as_object().unwrap();
         let count = call_native(
             &shared,
             &mut thread,
@@ -43955,7 +43964,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let client_ref = client.as_object().unwrap().unwrap();
+        let client_ref = client.as_object().unwrap();
         let ver = call_native(
             &shared,
             &mut thread,
@@ -43983,7 +43992,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let builder_ref = builder.as_object().unwrap().unwrap();
+        let builder_ref = builder.as_object().unwrap();
         // Set method to POST
         call_native(
             &shared,
@@ -44005,7 +44014,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let req_ref = req.as_object().unwrap().unwrap();
+        let req_ref = req.as_object().unwrap();
         let method = call_native(
             &shared,
             &mut thread,
@@ -44016,7 +44025,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let method_ref = method.as_object().unwrap().unwrap();
+        let method_ref = method.as_object().unwrap();
         assert_eq!(
             read_java_string(&shared.mem.heap, method_ref).unwrap(),
             "POST"
@@ -44037,11 +44046,11 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let client_ref = client.as_object().unwrap().unwrap();
+        let client_ref = client.as_object().unwrap();
         let resp = call_native(&shared, &mut thread, "java/net/http/HttpClient",
             "send", "(Ljava/net/http/HttpRequest;Ljava/net/http/HttpResponse$BodyHandler;)Ljava/net/http/HttpResponse;",
             &[Value::Object(Some(client_ref)), Value::Object(None), Value::Object(None)]).unwrap().unwrap();
-        let resp_ref = resp.as_object().unwrap().unwrap();
+        let resp_ref = resp.as_object().unwrap();
         let status = call_native(
             &shared,
             &mut thread,
@@ -44076,11 +44085,11 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let client_ref = client.as_object().unwrap().unwrap();
+        let client_ref = client.as_object().unwrap();
         let cf = call_native(&shared, &mut thread, "java/net/http/HttpClient",
             "sendAsync", "(Ljava/net/http/HttpRequest;Ljava/net/http/HttpResponse$BodyHandler;)Ljava/util/concurrent/CompletableFuture;",
             &[Value::Object(Some(client_ref)), Value::Object(None), Value::Object(None)]).unwrap().unwrap();
-        let cf_ref = cf.as_object().unwrap().unwrap();
+        let cf_ref = cf.as_object().unwrap();
         // CompletableFuture should be done
         let done = call_native(
             &shared,
@@ -44109,7 +44118,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert!(handler.as_object().unwrap().is_some());
+        assert!(handler.as_object().is_some());
         let discard = call_native(
             &shared,
             &mut thread,
@@ -44120,7 +44129,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert!(discard.as_object().unwrap().is_some());
+        assert!(discard.as_object().is_some());
     }
 
     #[test]
@@ -44138,7 +44147,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert!(pub_obj.as_object().unwrap().is_some());
+        assert!(pub_obj.as_object().is_some());
         let no_body = call_native(
             &shared,
             &mut thread,
@@ -44149,7 +44158,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert!(no_body.as_object().unwrap().is_some());
+        assert!(no_body.as_object().is_some());
     }
 
     #[test]
@@ -44323,7 +44332,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let group_ref = group.as_object().unwrap().unwrap();
+        let group_ref = group.as_object().unwrap();
         assert_eq!(
             read_java_string(&shared.mem.heap, group_ref).unwrap(),
             "world"
@@ -44466,7 +44475,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let ts_ref = ts.as_object().unwrap().unwrap();
+        let ts_ref = ts.as_object().unwrap();
         let ts_str = read_java_string(&shared.mem.heap, ts_ref).unwrap();
         // toString with no record components uses fallback format: ClassName@hex or @hex
         assert!(
@@ -44495,7 +44504,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let got_name_ref = got_name.as_object().unwrap().unwrap();
+        let got_name_ref = got_name.as_object().unwrap();
         assert_eq!(
             read_java_string(&shared.mem.heap, got_name_ref).unwrap(),
             "x"
@@ -44522,7 +44531,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert!(stream.as_object().unwrap().is_some());
+        assert!(stream.as_object().is_some());
     }
 
     #[test]
@@ -44540,7 +44549,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let cf_ref = cf.as_object().unwrap().unwrap();
+        let cf_ref = cf.as_object().unwrap();
         let done = call_native(
             &shared,
             &mut thread,
@@ -44569,7 +44578,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let info_ref = info.as_object().unwrap().unwrap();
+        let info_ref = info.as_object().unwrap();
         let cmd = call_native(
             &shared,
             &mut thread,
@@ -44631,7 +44640,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let ts_ref = ts.as_object().unwrap().unwrap();
+        let ts_ref = ts.as_object().unwrap();
         assert_eq!(
             read_java_string(&shared.mem.heap, ts_ref).unwrap(),
             "{size=5}"
@@ -44682,7 +44691,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert!(v1.as_object().unwrap().is_some());
+        assert!(v1.as_object().is_some());
         let v2 = call_native(
             &shared,
             &mut thread,
@@ -44693,7 +44702,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert!(v2.as_object().unwrap().is_some());
+        assert!(v2.as_object().is_some());
     }
 
     #[test]
@@ -44710,7 +44719,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert!(never.as_object().unwrap().is_some());
+        assert!(never.as_object().is_some());
         let always = call_native(
             &shared,
             &mut thread,
@@ -44721,7 +44730,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert!(always.as_object().unwrap().is_some());
+        assert!(always.as_object().is_some());
     }
 
     // =====================================================================
@@ -44897,12 +44906,12 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let wd_arr = weekdays.as_object().unwrap().unwrap();
+        let wd_arr = weekdays.as_object().unwrap();
         let len = shared.mem.heap.array_length(wd_arr);
         assert_eq!(len, 8); // 0=empty, 1=Sunday..7=Saturday
                             // Check index 1 is "Sunday"
         let sunday = shared.mem.heap.get_array_element(wd_arr, 1).unwrap();
-        let s_ref = sunday.as_object().unwrap().unwrap();
+        let s_ref = sunday.as_object().unwrap();
         assert_eq!(read_java_string(&shared.mem.heap, s_ref).unwrap(), "Sunday");
     }
 
@@ -44930,11 +44939,11 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let m_arr = months.as_object().unwrap().unwrap();
+        let m_arr = months.as_object().unwrap();
         let len = shared.mem.heap.array_length(m_arr);
         assert_eq!(len, 13); // 12 months + trailing empty
         let jan = shared.mem.heap.get_array_element(m_arr, 0).unwrap();
-        let j_ref = jan.as_object().unwrap().unwrap();
+        let j_ref = jan.as_object().unwrap();
         assert_eq!(
             read_java_string(&shared.mem.heap, j_ref).unwrap(),
             "January"
@@ -44955,7 +44964,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert!(nfc.as_object().unwrap().is_some());
+        assert!(nfc.as_object().is_some());
         let nfd = call_native(
             &shared,
             &mut thread,
@@ -44966,7 +44975,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert!(nfd.as_object().unwrap().is_some());
+        assert!(nfd.as_object().is_some());
     }
 
     #[test]
@@ -45002,7 +45011,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let h_arr = handlers.as_object().unwrap().unwrap();
+        let h_arr = handlers.as_object().unwrap();
         assert_eq!(shared.mem.heap.array_length(h_arr), 0);
     }
 
@@ -45020,7 +45029,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert!(mgr.as_object().unwrap().is_some());
+        assert!(mgr.as_object().is_some());
         let prop = call_native(
             &shared,
             &mut thread,
@@ -45089,7 +45098,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let n_ref = got_name.as_object().unwrap().unwrap();
+        let n_ref = got_name.as_object().unwrap();
         assert_eq!(read_java_string(&shared.mem.heap, n_ref).unwrap(), "UTF-8");
         let reg = call_native(
             &shared,
@@ -45134,7 +45143,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let map_ref = map.as_object().unwrap().unwrap();
+        let map_ref = map.as_object().unwrap();
         let size = shared.mem.heap.get_field(map_ref, 1);
         assert_eq!(size, Value::Int(6)); // 6 standard charsets
     }
@@ -45172,7 +45181,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert!(cl.as_object().unwrap().is_some());
+        assert!(cl.as_object().is_some());
     }
 
     #[test]
@@ -45197,7 +45206,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let g_ref = got.as_object().unwrap().unwrap();
+        let g_ref = got.as_object().unwrap();
         assert_eq!(read_java_string(&shared.mem.heap, g_ref).unwrap(), "count");
         let varargs = call_native(
             &shared,
@@ -45227,7 +45236,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let a_arr = anns.as_object().unwrap().unwrap();
+        let a_arr = anns.as_object().unwrap();
         assert_eq!(shared.mem.heap.array_length(a_arr), 0);
     }
 
@@ -45254,9 +45263,9 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let fname_ref = fname.as_object().unwrap().unwrap();
+        let fname_ref = fname.as_object().unwrap();
         let fname_str_val = shared.mem.heap.get_field(fname_ref, 0);
-        let fname_str_ref = fname_str_val.as_object().unwrap().unwrap();
+        let fname_str_ref = fname_str_val.as_object().unwrap();
         assert_eq!(
             read_java_string(&shared.mem.heap, fname_str_ref).unwrap(),
             "file.txt"
@@ -45287,9 +45296,9 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let r_ref = resolved.as_object().unwrap().unwrap();
+        let r_ref = resolved.as_object().unwrap();
         let r_str_val = shared.mem.heap.get_field(r_ref, 0);
-        let r_str_ref = r_str_val.as_object().unwrap().unwrap();
+        let r_str_ref = r_str_val.as_object().unwrap();
         let r_str = read_java_string(&shared.mem.heap, r_str_ref).unwrap();
         assert!(r_str.contains("subdir"));
     }
@@ -45313,7 +45322,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let buf_ref = buf.as_object().unwrap().unwrap();
+        let buf_ref = buf.as_object().unwrap();
         let cap = call_native(
             &shared,
             &mut thread,
@@ -45407,7 +45416,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let buf_ref = buf.as_object().unwrap().unwrap();
+        let buf_ref = buf.as_object().unwrap();
         let rem = call_native(
             &shared,
             &mut thread,
@@ -45429,7 +45438,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let ts_ref = ts.as_object().unwrap().unwrap();
+        let ts_ref = ts.as_object().unwrap();
         assert_eq!(read_java_string(&shared.mem.heap, ts_ref).unwrap(), "hello");
     }
 
@@ -45447,7 +45456,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let yr_ref = yr.as_object().unwrap().unwrap();
+        let yr_ref = yr.as_object().unwrap();
         let val = call_native(
             &shared,
             &mut thread,
@@ -45481,7 +45490,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let yr2_ref = yr2.as_object().unwrap().unwrap();
+        let yr2_ref = yr2.as_object().unwrap();
         let leap2 = call_native(
             &shared,
             &mut thread,
@@ -45509,7 +45518,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let yr_ref = yr.as_object().unwrap().unwrap();
+        let yr_ref = yr.as_object().unwrap();
         let plus = call_native(
             &shared,
             &mut thread,
@@ -45520,7 +45529,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let plus_ref = plus.as_object().unwrap().unwrap();
+        let plus_ref = plus.as_object().unwrap();
         let val = call_native(
             &shared,
             &mut thread,
@@ -45548,7 +45557,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let ym_ref = ym.as_object().unwrap().unwrap();
+        let ym_ref = ym.as_object().unwrap();
         let yr = call_native(
             &shared,
             &mut thread,
@@ -45598,7 +45607,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let ym_ref = ym.as_object().unwrap().unwrap();
+        let ym_ref = ym.as_object().unwrap();
         let plus = call_native(
             &shared,
             &mut thread,
@@ -45609,7 +45618,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let p_ref = plus.as_object().unwrap().unwrap();
+        let p_ref = plus.as_object().unwrap();
         let yr = call_native(
             &shared,
             &mut thread,
@@ -45648,7 +45657,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let md_ref = md.as_object().unwrap().unwrap();
+        let md_ref = md.as_object().unwrap();
         let m = call_native(
             &shared,
             &mut thread,
@@ -45711,7 +45720,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert!(nf.as_object().unwrap().is_some());
+        assert!(nf.as_object().is_some());
         let cf = call_native(
             &shared,
             &mut thread,
@@ -45722,7 +45731,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert!(cf.as_object().unwrap().is_some());
+        assert!(cf.as_object().is_some());
         let pf = call_native(
             &shared,
             &mut thread,
@@ -45733,7 +45742,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert!(pf.as_object().unwrap().is_some());
+        assert!(pf.as_object().is_some());
     }
 
     #[test]
@@ -45750,7 +45759,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert!(df.as_object().unwrap().is_some());
+        assert!(df.as_object().is_some());
         let tf = call_native(
             &shared,
             &mut thread,
@@ -45761,7 +45770,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert!(tf.as_object().unwrap().is_some());
+        assert!(tf.as_object().is_some());
         let dtf = call_native(
             &shared,
             &mut thread,
@@ -45772,7 +45781,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert!(dtf.as_object().unwrap().is_some());
+        assert!(dtf.as_object().is_some());
     }
 
     #[test]
@@ -46008,7 +46017,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let n_ref = got_name.as_object().unwrap().unwrap();
+        let n_ref = got_name.as_object().unwrap();
         assert_eq!(
             read_java_string(&shared.mem.heap, n_ref).unwrap(),
             "META-INF/"
@@ -46468,7 +46477,7 @@ mod tests {
         assert!(matches!(itr, Value::Object(Some(_))));
 
         // hasNext() should be false (no services loaded for unknown class)
-        let itr_ref = itr.as_object().unwrap().unwrap();
+        let itr_ref = itr.as_object().unwrap();
         let has_next = call_native(
             &shared,
             &mut thread,
@@ -53394,7 +53403,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let ts_ref = ts.as_object().unwrap().unwrap();
+        let ts_ref = ts.as_object().unwrap();
         let ts_str = read_java_string(&shared.mem.heap, ts_ref).unwrap();
         assert_eq!(ts_str, "Point[x=10, y=20]");
     }
@@ -54194,10 +54203,10 @@ mod tests {
         let cid = ClassId::new(99);
         let labels = vec![
             SwitchLabel::Type {
-                class_name: "java/lang/Integer".to_string(),
+                class_name: "java/lang/Integer".into(),
                 class_id: ClassId::new(99999),
             },
-            SwitchLabel::Str("hello".to_string()),
+            SwitchLabel::Str("hello".into()),
             SwitchLabel::Int(42),
         ];
         cache.put_call_site(cid, 10, ResolvedCallSite::TypeSwitch { labels });
@@ -54207,12 +54216,12 @@ mod tests {
                 assert_eq!(labels.len(), 3);
                 match &labels[0] {
                     SwitchLabel::Type { class_name, .. } => {
-                        assert_eq!(class_name, "java/lang/Integer")
+                        assert_eq!(&**class_name, "java/lang/Integer")
                     }
                     _ => panic!("expected Type label"),
                 }
                 match &labels[1] {
-                    SwitchLabel::Str(s) => assert_eq!(s, "hello"),
+                    SwitchLabel::Str(s) => assert_eq!(&**s, "hello"),
                     _ => panic!("expected Str label"),
                 }
                 match &labels[2] {
@@ -54230,12 +54239,15 @@ mod tests {
 
         let mut cache = crate::classloading::resolution::ResolutionCache::new();
         let cid = ClassId::new(100);
-        let labels = vec!["RED".to_string(), "GREEN".to_string(), "BLUE".to_string()];
+        let labels: Vec<std::sync::Arc<str>> = vec!["RED".into(), "GREEN".into(), "BLUE".into()];
         cache.put_call_site(cid, 20, ResolvedCallSite::EnumSwitch { labels });
         let site = cache.get_call_site(cid, 20).unwrap();
         match site {
             ResolvedCallSite::EnumSwitch { labels } => {
-                assert_eq!(labels, &["RED", "GREEN", "BLUE"]);
+                assert_eq!(
+                    labels.iter().map(|s| &**s).collect::<Vec<_>>(),
+                    ["RED", "GREEN", "BLUE"]
+                );
             }
             _ => panic!("expected EnumSwitch"),
         }
@@ -54272,7 +54284,7 @@ mod tests {
         use crate::classloading::resolution::SwitchLabel;
         let labels = vec![
             SwitchLabel::Type {
-                class_name: "java/lang/String".to_string(),
+                class_name: "java/lang/String".into(),
                 class_id: ClassId::new(99999),
             },
             SwitchLabel::Int(42),
@@ -54334,7 +54346,7 @@ mod tests {
         // Use a ClassId that won't match Integer (99999 is not a real class)
         let labels = vec![
             SwitchLabel::Type {
-                class_name: "java/lang/String".to_string(),
+                class_name: "java/lang/String".into(),
                 class_id: ClassId::new(99999),
             },
             SwitchLabel::Int(42),
@@ -54387,8 +54399,8 @@ mod tests {
         use crate::classloading::resolution::SwitchLabel;
         let labels = vec![
             SwitchLabel::Int(99),
-            SwitchLabel::Str("hello".to_string()),
-            SwitchLabel::Str("world".to_string()),
+            SwitchLabel::Str("hello".into()),
+            SwitchLabel::Str("world".into()),
         ];
 
         let result =
@@ -54436,7 +54448,7 @@ mod tests {
         thread.frames.push(frame);
 
         use crate::classloading::resolution::SwitchLabel;
-        let labels = vec![SwitchLabel::Str("nope".to_string()), SwitchLabel::Int(999)];
+        let labels = vec![SwitchLabel::Str("nope".into()), SwitchLabel::Int(999)];
 
         let result =
             crate::runtime::invokedynamic::execute_type_switch(&shared, &mut thread, 0, &labels);
@@ -54485,8 +54497,8 @@ mod tests {
         use crate::classloading::resolution::SwitchLabel;
         let labels = vec![
             SwitchLabel::Int(1),
-            SwitchLabel::Str("hello".to_string()),
-            SwitchLabel::Str("world".to_string()),
+            SwitchLabel::Str("hello".into()),
+            SwitchLabel::Str("world".into()),
         ];
 
         let result =
@@ -54540,7 +54552,7 @@ mod tests {
         let _ = frame.stack.push(Value::Int(0));
         thread.frames.push(frame);
 
-        let labels = vec!["RED".to_string(), "GREEN".to_string(), "BLUE".to_string()];
+        let labels: Vec<std::sync::Arc<str>> = vec!["RED".into(), "GREEN".into(), "BLUE".into()];
 
         let result =
             crate::runtime::invokedynamic::execute_enum_switch(&shared, &mut thread, 0, &labels);
@@ -54572,7 +54584,7 @@ mod tests {
         let _ = frame.stack.push(Value::Int(0));
         thread.frames.push(frame);
 
-        let labels = vec!["A".to_string(), "B".to_string()];
+        let labels: Vec<std::sync::Arc<str>> = vec!["A".into(), "B".into()];
 
         let result =
             crate::runtime::invokedynamic::execute_enum_switch(&shared, &mut thread, 0, &labels);
@@ -56300,7 +56312,7 @@ mod tests {
             descriptor: Arc::from(
                 "(Ljava/lang/String;Ljava/util/regex/Pattern;)Ljava/util/regex/Matcher;",
             ),
-            attributes: vec![Attribute::Code(code)],
+            attributes: vec![LazyAttribute::Decoded(Attribute::Code(code))],
         };
 
         let class = Class {
@@ -56372,7 +56384,7 @@ mod tests {
         .unwrap()
         .unwrap();
 
-        let proxy_ref = proxy_val.as_object().unwrap().unwrap();
+        let proxy_ref = proxy_val.as_object().unwrap();
 
         // Verify that proxy is a Proxy$Instance (class name check)
         let proxy_class_id = shared.mem.heap.class_id_of(proxy_ref);
@@ -66296,16 +66308,16 @@ mod tests {
                     cid,
                     crate::classloading::resolution::LambdaCallSite {
                         functional_interface_id: None,
-                        functional_interface: "test/Func".to_string(),
-                        sam_method_name: "apply".to_string(),
-                        sam_descriptor: "()V".to_string(),
+                        functional_interface: "test/Func".into(),
+                        sam_method_name: "apply".into(),
+                        sam_descriptor: "()V".into(),
                         impl_handle: crate::classloading::resolution::MethodHandle {
                             kind: MethodHandleKind::InvokeStatic,
-                            class_name: "test/Impl".to_string(),
-                            member_name: "target".to_string(),
-                            descriptor: "()V".to_string(),
+                            class_name: "test/Impl".into(),
+                            member_name: "target".into(),
+                            descriptor: "()V".into(),
                         },
-                        instantiated_descriptor: "()V".to_string(),
+                        instantiated_descriptor: "()V".into(),
                         capture_types: vec![],
                         proxy_class_id: cid,
                     },
@@ -69790,7 +69802,7 @@ mod tests {
                     cratonvm_reader::class_access_flags::MethodAccessFlags::from_bits_truncate(
                         0x0009,
                     ),
-                attributes: vec![cratonvm_reader::attribute::Attribute::Code(
+                attributes: vec![LazyAttribute::Decoded(cratonvm_reader::attribute::Attribute::Code(
                     cratonvm_reader::attribute::CodeAttribute {
                         max_stack: 1,
                         max_locals: 0,
@@ -69798,7 +69810,7 @@ mod tests {
                         exception_table: vec![],
                         attributes: vec![],
                     },
-                )],
+                ))],
             }],
         );
 
@@ -72086,6 +72098,7 @@ public class SkippedTest {
             "TestClass".into(),
             "testMethod".into(),
             "()V".into(),
+            CID0,
             compiled,
         );
         assert_eq!(vm.jit.jit_cache.read().len(), 1);
@@ -72365,12 +72378,12 @@ public class SkippedTest {
         vm.jit
             .jit_cache
             .write()
-            .put("Animal".into(), "speak".into(), "()V".into(), compiled);
+            .put("Animal".into(), "speak".into(), "()V".into(), animal_id, compiled);
         let cn: std::sync::Arc<str> = "Animal".into();
         let mn: std::sync::Arc<str> = "speak".into();
         let desc: std::sync::Arc<str> = "()V".into();
         assert!(
-            vm.jit.jit_cache.read().get(&cn, &mn, &desc).is_some(),
+            vm.jit.jit_cache.read().get(&cn, &mn, &desc, animal_id).is_some(),
             "JIT entry must be present before invalidation"
         );
 
@@ -72394,7 +72407,7 @@ public class SkippedTest {
             "CHA listener must evict exactly one matching entry"
         );
         assert!(
-            vm.jit.jit_cache.read().get(&cn, &mn, &desc).is_none(),
+            vm.jit.jit_cache.read().get(&cn, &mn, &desc, animal_id).is_none(),
             "the compiled entry should have been removed"
         );
     }
@@ -72423,7 +72436,7 @@ public class SkippedTest {
         vm.jit
             .jit_cache
             .write()
-            .put("Other".into(), "run".into(), "()V".into(), compiled);
+            .put("Other".into(), "run".into(), "()V".into(), CID0, compiled);
         assert_eq!(vm.jit.jit_cache.read().len(), 1);
 
         let evicted = vm.invalidate_jit_for_class("Unrelated");
@@ -72591,14 +72604,14 @@ public class SkippedTest {
             buf.emit(&[0xC3]);
             let cm = cratonvm_jit::CompiledMethod::new(buf);
             let mut cache = vm.jit.jit_cache.write();
-            cache.put("Deopt".into(), "target".into(), "()I".into(), cm);
+            cache.put("Deopt".into(), "target".into(), "()I".into(), CID0, cm);
         }
 
         // Verify it's in the cache
         let cn: std::sync::Arc<str> = "Deopt".into();
         let mn: std::sync::Arc<str> = "target".into();
         let desc: std::sync::Arc<str> = "()I".into();
-        assert!(vm.jit.jit_cache.read().get(&cn, &mn, &desc).is_some());
+        assert!(vm.jit.jit_cache.read().get(&cn, &mn, &desc, CID0).is_some());
 
         // Trigger deoptimization via the controller
         let action = crate::jit::helpers::DeoptimizationController::deoptimize(
@@ -72611,7 +72624,7 @@ public class SkippedTest {
         );
 
         // Method should be evicted from JIT cache
-        assert!(vm.jit.jit_cache.read().get(&cn, &mn, &desc).is_none());
+        assert!(vm.jit.jit_cache.read().get(&cn, &mn, &desc, CID0).is_none());
         // First deopt РІвЂ вЂ™ recompile (not blacklist)
         assert_ne!(action, cratonvm_jit::deopt::DeoptAction::MakeNotCompilable);
 
@@ -72687,13 +72700,13 @@ public class SkippedTest {
         // Insert a compiled method with no inlined methods
         let buf1 = cratonvm_jit::ExecutableBuffer::new(64).unwrap();
         let cm1 = cratonvm_jit::CompiledMethod::new(buf1);
-        cache.put("Caller".into(), "methodA".into(), "()V".into(), cm1);
+        cache.put("Caller".into(), "methodA".into(), "()V".into(), CID0, cm1);
 
         // Insert a compiled method that inlined from "Helper"
         let buf2 = cratonvm_jit::ExecutableBuffer::new(64).unwrap();
         let mut cm2 = cratonvm_jit::CompiledMethod::new(buf2);
         cm2.inlined_methods = vec![("Helper".to_string(), "getX".to_string(), "()I".to_string())];
-        cache.put("Caller".into(), "methodB".into(), "()V".into(), cm2);
+        cache.put("Caller".into(), "methodB".into(), "()V".into(), CID0, cm2);
 
         // Insert another method that also inlined from "Helper"
         let buf3 = cratonvm_jit::ExecutableBuffer::new(64).unwrap();
@@ -72702,7 +72715,7 @@ public class SkippedTest {
             ("Helper".to_string(), "getY".to_string(), "()I".to_string()),
             ("Other".to_string(), "foo".to_string(), "()V".to_string()),
         ];
-        cache.put("Caller".into(), "methodC".into(), "()V".into(), cm3);
+        cache.put("Caller".into(), "methodC".into(), "()V".into(), CID0, cm3);
 
         assert_eq!(cache.len(), 3);
 
@@ -72713,13 +72726,13 @@ public class SkippedTest {
 
         // methodA should still be in the cache
         assert!(cache
-            .get(&"Caller".into(), &"methodA".into(), &"()V".into())
+            .get("Caller", "methodA", "()V", CID0)
             .is_some());
         assert!(cache
-            .get(&"Caller".into(), &"methodB".into(), &"()V".into())
+            .get("Caller", "methodB", "()V", CID0)
             .is_none());
         assert!(cache
-            .get(&"Caller".into(), &"methodC".into(), &"()V".into())
+            .get("Caller", "methodC", "()V", CID0)
             .is_none());
     }
 
@@ -72730,7 +72743,7 @@ public class SkippedTest {
         let buf = cratonvm_jit::ExecutableBuffer::new(64).unwrap();
         let mut cm = cratonvm_jit::CompiledMethod::new(buf);
         cm.inlined_methods = vec![("Alpha".to_string(), "foo".to_string(), "()V".to_string())];
-        cache.put("Main".into(), "run".into(), "()V".into(), cm);
+        cache.put("Main".into(), "run".into(), "()V".into(), CID0, cm);
 
         assert_eq!(cache.len(), 1);
 
@@ -73917,13 +73930,13 @@ public class SkippedTest {
             access_flags: MethodAccessFlags::PUBLIC,
             name: cratonvm_types::intern_arc("tick"),
             descriptor: cratonvm_types::intern_arc("()V"),
-            attributes: vec![Attribute::Code(CodeAttribute {
+            attributes: vec![LazyAttribute::Decoded(Attribute::Code(CodeAttribute {
                 max_stack: 0,
                 max_locals: 1,
                 code: cratonvm_reader::ByteView::from_vec(vec![0xb1]), // return
                 exception_table: vec![],
                 attributes: vec![],
-            })],
+            }))],
         };
         let class_id = register_test_class(
             &shared,
@@ -73962,12 +73975,17 @@ public class SkippedTest {
                 num_params: 0,
                 is_synchronized: false,
                 is_static: false,
+                force_native_cache: std::sync::OnceLock::new(),
+                native_callback_cache: std::sync::OnceLock::new(),
+                invoc_key: std::sync::OnceLock::new(),
+                jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
+                quickened: std::sync::OnceLock::new(),
             });
             let entry = crate::runtime::vtable::VtableEntry {
                 declaring_class_id: class_id.as_u32() as u64,
                 method_index: 0,
-                method_name: "tick".to_string(),
-                descriptor: "()V".to_string(),
+                method_name: "tick".into(),
+                descriptor: "()V".into(),
                 resolved: true,
                 resolved_method: Some(cached),
                 is_native: false,
@@ -73988,7 +74006,7 @@ public class SkippedTest {
             .expect("vtable slot must be populated by the install adapter");
         assert_eq!(entry.declaring_class_id, class_id.as_u32() as u64);
         assert_eq!(entry.method_index, 0);
-        assert_eq!(entry.method_name, "tick");
+        assert_eq!(&*entry.method_name, "tick");
         assert!(
             entry.resolved_method.is_some(),
             "fast-path dispatch requires Arc<CachedBytecodeMethod> to be populated",
