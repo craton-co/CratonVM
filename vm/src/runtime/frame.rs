@@ -498,19 +498,57 @@ fn compact_to_local_slot(cv: CompactValue) -> (u64, u8) {
 /// When this returns `true`, `execute_frame` skips the fast path and uses
 /// full `Instruction::decode` dispatch (`is_jdk_class` on [`Frame`]).
 ///
-/// TODO(round-4-wave-3): narrow the fast-path exclusion further.  The
-/// original blacklist forced ~95% of executed bytecode through the slow
-/// path (every JDK + Spring class). Empirically, two well-trodden
-/// sub-trees — `java/util/*` collection classes and the pure-math
-/// `java/lang/Math` / `StrictMath` — never hit the long/double-on-int
-/// stack shape that the fast path's `pop_unchecked` rejects (they were
-/// stress-tested against the existing super-instruction loop without
-/// regressions during round-4-wave-2 perf work). Allow them onto the
-/// fast path while keeping the broader exclusion for the
-/// invoke-bridge-heavy paths (`java/lang/invoke/*`, JNI bridges,
-/// Spring's `enhance` callback chain) that originally motivated the
-/// gate. Future rounds should replace the prefix check with a
-/// per-method `unsafe_for_fast_path` flag computed at install time.
+/// The whitelist below re-admits two well-trodden sub-trees —
+/// `java/util/*` collection classes and the pure-math `java/lang/Math` /
+/// `StrictMath` — which were stress-tested against the super-instruction
+/// loop without regressions during round-4-wave-2 perf work. Everything
+/// else in the JDK / Spring prefixes stays on the slow path.
+///
+/// ## Why this is still a prefix check (2026-07-25 audit)
+///
+/// An earlier TODO here proposed replacing the prefix test with a
+/// per-method `unsafe_for_fast_path` flag computed at install/verification
+/// time, on the theory that the gate exists to protect the fast path's
+/// `pop_unchecked` / `set_local_unchecked` / `push_*_unchecked` sites from
+/// stack shapes the verifier would have ruled out. **That theory does not
+/// survive an audit of those helpers**, so the flag cannot replace this
+/// check:
+///
+/// * Their preconditions are exactly `stack.len >= 1` (pop), `stack.len <
+///   max_size` (push), and `index < locals.len()` (locals). None of them
+///   use `get_unchecked`; every one indexes a `Vec`, so a violation is a
+///   bounds panic caught by the `catch_unwind` in `execute_frame_impl`,
+///   never a memory-safety hazard.
+/// * All three preconditions are *already implied* by successful
+///   type-checking verification — the verifier proves the operand-stack
+///   depth and every local index at every pc, and the runtime stack is
+///   strictly shallower than `max_stack` because a category-2 value
+///   occupies one runtime slot where the verifier models two. So a
+///   verification-derived flag would be `false` for essentially every JDK
+///   and Spring method, i.e. it would re-enable the fast path everywhere
+///   the deny list currently blocks it.
+///
+/// What actually keeps the JDK / Spring prefixes off the fast path is that
+/// the fast path and `execute_instruction` are two independently-maintained
+/// implementations that **differ per opcode**, and the differences are not
+/// a property any verifier can certify. Concrete live examples:
+///
+/// * `astore_<n>`: the slow path applies `coerce_value_for_return(v, b'L')`
+///   unconditionally; the fast path applies the *different*
+///   `coerce_value_for_return_validated` and only when the popped slot is
+///   `CompactTag::Long`, storing the raw `CompactValue` otherwise.
+/// * the array-load family (`iaload`..`saload`): the slow path has
+///   per-opcode element typing and JEP-358 helpful-NPE message
+///   construction; the fast path handles all eight opcodes with one
+///   untyped `get_array_element` and re-pushes to fall through when the
+///   shape does not match.
+///
+/// Closing this properly means proving per-opcode equivalence between the
+/// two implementations (or collapsing them into one), not computing a
+/// stack-shape flag. Until then the prefix check stays, and it stays as a
+/// *fallback* for the classes that skip verification entirely
+/// (`-Xverify:none`, per-class `DefineClassOptions::skip_verification`),
+/// where even the unchecked-helper preconditions are unproven.
 #[inline]
 pub(crate) fn class_disables_interp_fast_path(class_name: &str) -> bool {
     // Whitelist sub-trees that have been validated as fast-path-safe.
