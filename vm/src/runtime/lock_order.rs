@@ -19,7 +19,7 @@
 //! | Level | Name | Lock |
 //! |------:|------|------|
 //! | L10 | `class_manager`   | `SharedVm::class_manager` (RwLock) — acquired first |
-//! | L9  | `native_methods`  | `SharedVm::native_methods` (append-only Mutex) |
+//! | L9  | `native_methods`  | *reserved* — `SharedVm::native_methods` holds no lock today |
 //! | L8  | `heap`            | `SharedVm::heap` interior locks (in the `gc` crate) |
 //! | L7  | `ref_processor`   | `SharedVm::ref_processor` (Mutex) |
 //! | L6  | `monitors`        | per-object monitor registry (`MonitorTable`) |
@@ -147,7 +147,10 @@ pub enum LockLevel {
     RefProcessor = 7,
     /// L8 — `SharedVm::heap` interior locks.
     Heap = 8,
-    /// L9 — `SharedVm::native_methods` (append-only Mutex).
+    /// L9 — reserved for `SharedVm::native_methods`. The registry is
+    /// currently immutable after construction and holds no lock; the level
+    /// is kept so a future runtime-mutable registry lands here, between
+    /// `class_manager` and `heap`. See this module's enforcement-status list.
     NativeMethods = 9,
     /// L10 — `SharedVm::class_manager` (RwLock). Highest level / acquired first.
     ClassManager = 10,
