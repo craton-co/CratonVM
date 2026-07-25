@@ -84,6 +84,20 @@ pub struct CachedBytecodeMethod {
     /// used for `force_native_cache`. See docs/known-issues/tomcat-08-07/
     /// silent-hang-no-signature-cluster.md.
     pub native_callback_cache: std::sync::OnceLock<Option<cratonvm_native_api::NativeCallback>>,
+    /// T2.5 — memoized JIT invocation-counter key for this method, i.e. the
+    /// packed `(declaring_class_id << 32) | hash(method_name ++ descriptor)`
+    /// u64 that the interpreter uses to index
+    /// `ProfileStore::increment_invocation`.
+    ///
+    /// The interpreter's `Bytecode` / `VirtualBytecode` dispatch arms recomputed
+    /// this key on EVERY interpreted invocation of a not-yet-compiled method by
+    /// running a 31-multiplier byte loop over both the method name and the full
+    /// descriptor — pure per-call overhead on the hottest interpreter path, for
+    /// a value that is a pure function of three immutable fields of this entry.
+    /// Memoized here for exactly the same reason (and by exactly the same
+    /// argument) as [`Self::force_native_cache`] and
+    /// [`Self::native_callback_cache`] above. Read via [`Self::invoc_key`].
+    pub invoc_key: std::sync::OnceLock<u64>,
     /// T2.2 — epoch memo for "this method has no published JIT body".
     ///
     /// Holds the value of `cratonvm_jit::jit_cache_generation()` as of the last
@@ -128,6 +142,7 @@ impl Clone for CachedBytecodeMethod {
             is_static: self.is_static,
             force_native_cache: self.force_native_cache.clone(),
             native_callback_cache: self.native_callback_cache.clone(),
+            invoc_key: self.invoc_key.clone(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(
                 self.jit_probe_generation
                     .load(std::sync::atomic::Ordering::Relaxed),
@@ -137,6 +152,30 @@ impl Clone for CachedBytecodeMethod {
 }
 
 impl CachedBytecodeMethod {
+    /// The memoized JIT invocation-counter key for this method — see
+    /// [`Self::invoc_key`]. Computed on first use, then read straight out of the
+    /// `OnceLock`.
+    ///
+    /// The hash must stay bit-identical to the two open-coded loops this
+    /// replaced (`vm/src/runtime/interpreter.rs`, the invokestatic `Bytecode`
+    /// arm and the instance tier-up path), because both keyed the *same*
+    /// `ProfileStore` invocation counters: a different key would silently reset
+    /// every method's warmup count.
+    #[inline]
+    pub fn invoc_key(&self) -> u64 {
+        *self.invoc_key.get_or_init(|| {
+            let mut h = 0u32;
+            for &b in self.method_name.as_bytes() {
+                h = h.wrapping_mul(31).wrapping_add(b as u32); // Widening: hash computation
+            }
+            for &b in self.method_descriptor.as_bytes() {
+                h = h.wrapping_mul(31).wrapping_add(b as u32); // Widening: hash computation
+            }
+            // Widening: class ID to u64 for hash key
+            ((self.declaring_class_id.as_u32() as u64) << 32) | (h as u64)
+        })
+    }
+
     /// T2.2 — has this method already been probed against the shared JIT cache
     /// at generation `current_generation` and found to have no compiled body?
     ///
@@ -816,6 +855,7 @@ mod tests {
             is_static: false,
             force_native_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
+            invoc_key: std::sync::OnceLock::new(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
         }
     }
@@ -851,10 +891,12 @@ mod tests {
     fn clone_preserves_the_memo_fields() {
         let cached = make_cached_method();
         cached.record_jit_probe_miss(99);
+        let key = cached.invoc_key();
         let _ = cached.force_native_cache.set(true);
 
         let copy = cached.clone();
         assert!(copy.jit_probe_is_current(99));
+        assert_eq!(copy.invoc_key(), key);
         assert_eq!(copy.force_native_cache.get(), Some(&true));
 
         // The clone's atomic is independent of the original's.

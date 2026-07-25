@@ -146,6 +146,7 @@ fn cached(
         is_static: true,
         force_native_cache: std::sync::OnceLock::new(),
         native_callback_cache: std::sync::OnceLock::new(),
+        invoc_key: std::sync::OnceLock::new(),
         jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
     }
 }

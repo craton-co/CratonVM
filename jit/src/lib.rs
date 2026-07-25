@@ -9068,6 +9068,7 @@ mod tests {
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
+            invoc_key: std::sync::OnceLock::new(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
         };
         let resolver = |idx: u16| -> Option<(String, String, String)> {
@@ -9289,6 +9290,7 @@ mod tests {
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
+            invoc_key: std::sync::OnceLock::new(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
         };
         // SAFETY: every `JitRuntimeHelpers` field is a `usize` and the struct is
@@ -9365,6 +9367,7 @@ mod tests {
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
+            invoc_key: std::sync::OnceLock::new(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
         };
         // SAFETY: see `step3_optimize_toggle_…`; an all-zero `JitRuntimeHelpers`
@@ -9825,6 +9828,7 @@ mod tests {
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
+            invoc_key: std::sync::OnceLock::new(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
         };
         let helpers: JitRuntimeHelpers = unsafe { std::mem::zeroed() };
@@ -9961,6 +9965,7 @@ mod tests {
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
+            invoc_key: std::sync::OnceLock::new(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
         };
         // SAFETY: all-zero `JitRuntimeHelpers` is valid; this test only COMPILES
@@ -10075,6 +10080,7 @@ mod tests {
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
+            invoc_key: std::sync::OnceLock::new(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
         };
         // SAFETY: all-zero `JitRuntimeHelpers` is valid; this test only COMPILES
@@ -10193,6 +10199,7 @@ mod tests {
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
+            invoc_key: std::sync::OnceLock::new(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
         };
         // SAFETY: all-zero `JitRuntimeHelpers` is valid; this test only COMPILES
@@ -10253,6 +10260,7 @@ mod tests {
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
+            invoc_key: std::sync::OnceLock::new(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
         };
         // SAFETY: all-zero `JitRuntimeHelpers` is valid; this test only COMPILES
@@ -10316,6 +10324,7 @@ mod tests {
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
+            invoc_key: std::sync::OnceLock::new(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
         };
         // SAFETY: all-zero `JitRuntimeHelpers` is valid; this test only COMPILES
@@ -11565,6 +11574,7 @@ mod tests {
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
+            invoc_key: std::sync::OnceLock::new(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
         }
     }
@@ -11735,6 +11745,31 @@ mod tests {
             !cached.jit_probe_is_current(jit_cache_generation()),
             "an eviction must advance the generation"
         );
+    }
+
+    /// The memoized invocation-counter key must stay bit-identical to the two
+    /// open-coded 31-multiplier loops it replaced in the interpreter -- the key
+    /// indexes `ProfileStore`'s per-method warmup counters, so a different value
+    /// would silently reset every method's tier-up progress.
+    #[test]
+    fn memoized_invoc_key_matches_the_open_coded_hash() {
+        let cid = cratonvm_types::ClassId::new(7);
+        let cached = probe_test_method("pkg/Hash", "someMethod", "(Ljava/lang/String;I)Z", cid);
+        let expected = {
+            let mut h = 0u32;
+            for &b in cached.method_name.as_bytes() {
+                h = h.wrapping_mul(31).wrapping_add(b as u32);
+            }
+            for &b in cached.method_descriptor.as_bytes() {
+                h = h.wrapping_mul(31).wrapping_add(b as u32);
+            }
+            ((cid.as_u32() as u64) << 32) | (h as u64)
+        };
+        assert_eq!(cached.invoc_key(), expected);
+        // Memoized: stable across calls.
+        assert_eq!(cached.invoc_key(), expected);
+        // And it survives a clone (the manual `Clone` impl).
+        assert_eq!(cached.clone().invoc_key(), expected);
     }
 
     #[test]
@@ -12072,6 +12107,7 @@ mod tests {
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
+            invoc_key: std::sync::OnceLock::new(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
         };
         let b_cached = CachedBytecodeMethod {
@@ -12089,6 +12125,7 @@ mod tests {
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
+            invoc_key: std::sync::OnceLock::new(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
         };
         // SAFETY: every helper address is an integer slot. This test only

@@ -7009,6 +7009,7 @@ pub fn execute(
                                             is_static,
                                             force_native_cache: std::sync::OnceLock::new(),
                                             native_callback_cache: std::sync::OnceLock::new(),
+                                            invoc_key: std::sync::OnceLock::new(),
                                             jit_probe_generation: std::sync::atomic::AtomicU64::new(
                                                 0,
                                             ),
@@ -12442,6 +12443,7 @@ mod deopt_step3_tests {
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
+            invoc_key: std::sync::OnceLock::new(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
         })
     }
@@ -12464,6 +12466,7 @@ mod deopt_step3_tests {
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
+            invoc_key: std::sync::OnceLock::new(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
         })
     }
@@ -12961,6 +12964,7 @@ mod deopt_step3_tests {
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
+            invoc_key: std::sync::OnceLock::new(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
         });
         let key = "DespecFuC.loop:()V";
@@ -23182,6 +23186,7 @@ fn try_invoke_cached_lambda_impl(
                 is_static: false,
                 force_native_cache: std::sync::OnceLock::new(),
                 native_callback_cache: std::sync::OnceLock::new(),
+                invoc_key: std::sync::OnceLock::new(),
                 jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
             });
             drop(cm);
@@ -31695,6 +31700,7 @@ fn populate_invoke_cache(
         is_static: method.is_static(),
         force_native_cache: std::sync::OnceLock::new(),
         native_callback_cache: std::sync::OnceLock::new(),
+        invoc_key: std::sync::OnceLock::new(),
         jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
     };
 
@@ -31972,17 +31978,15 @@ fn execute_invokestatic_cached(
             // Gate JIT compilation behind an invocation counter (warmup threshold).
             // Pack class_id and a hash of method name+descriptor into a u64 key
             // for cheap per-method counting without allocating strings.
-            let invoc_key = {
-                let mut h = 0u32;
-                for &b in cached.method_name.as_bytes() {
-                    h = h.wrapping_mul(31).wrapping_add(b as u32); // Widening: hash computation
-                }
-                for &b in cached.method_descriptor.as_bytes() {
-                    h = h.wrapping_mul(31).wrapping_add(b as u32); // Widening: hash computation
-                }
-                ((cached.declaring_class_id.as_u32() as u64) << 32) | (h as u64)
-                // Widening: class ID to u64 for hash key
-            };
+            //
+            // T2.5 -- the 31-multiplier byte loops over method name AND full
+            // descriptor used to run inline here on every interpreted call.
+            // `cached` is `Arc`-shared per call site, so the key is memoized in
+            // it (same precedent as `force_native_cache` /
+            // `native_callback_cache`) and computed once per call site instead of
+            // once per call. The hash is bit-identical, so existing warmup counts
+            // keep the same keys.
+            let invoc_key = cached.invoc_key();
             // BUG-2: hot-method promotion for short-but-very-hot methods.
             //
             // The old gate `invoc_count >= T && invoc_count % T == 0` fired
@@ -34742,6 +34746,7 @@ fn try_jit_upgrade_with_gate(
                 is_static: method.is_static(),
                 force_native_cache: std::sync::OnceLock::new(),
                 native_callback_cache: std::sync::OnceLock::new(),
+                invoc_key: std::sync::OnceLock::new(),
                 jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
             };
             drop(cm);
@@ -35631,6 +35636,7 @@ fn try_jit_compile_callee_slow(
         is_static: method.is_static(),
         force_native_cache: std::sync::OnceLock::new(),
         native_callback_cache: std::sync::OnceLock::new(),
+        invoc_key: std::sync::OnceLock::new(),
         jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
     };
     drop(cm);
@@ -38608,9 +38614,7 @@ fn execute_invokevirtual_vtable_fast(
         // `CachedBytecodeMethod` retains the resolved declaring method, so
         // memoize this pure, 55-branch decision on that shared entry instead
         // of reopening `class_manager` and re-evaluating it for every vtable
-        // hit. The native-registry probe remains live: registrations can
-        // differ between VM configurations, while the cache only avoids the
-        // deterministic name/descriptor classification work.
+        // hit.
         let force_native = *cached.force_native_cache.get_or_init(|| {
             force_native_over_real_jdk_bytecode(
                 cached.class_name.as_ref(),
@@ -38618,16 +38622,33 @@ fn execute_invokevirtual_vtable_fast(
                 cached.method_descriptor.as_ref(),
             )
         });
-        if force_native
-            && shared
-                .native_methods
-                .find(
-                    cached.class_name.as_ref(),
-                    cached.method_name.as_ref(),
-                    cached.method_descriptor.as_ref(),
-                )
-                .is_some()
-        {
+        // T2.5 -- the registry probe is memoized too, via the SAME
+        // `native_callback_cache` the force-native interception path
+        // (`intercept_force_registered_native_cached`) and the instance tier-up
+        // gate already use. It is keyed on exactly this triple, and
+        // `NativeMethodRegistry::find` re-hashes all three strings on every
+        // call. The previous comment here kept the probe live because
+        // "registrations can differ between VM configurations" -- true, but that
+        // is a difference between *processes*: every `register` call in the tree
+        // runs in `vm_init.rs` against the `&mut` registry BEFORE `SharedVm` is
+        // constructed, and `SharedVm.native_methods` is a plain immutable
+        // `NativeMethodRegistry` thereafter, so within one process the triple's
+        // answer can never change. That is the same immutability argument
+        // `native_callback_cache`'s own doc comment already relies on.
+        // `entry.resolved_method` is a long-lived `Arc` held by the vtable slot,
+        // so the memo really does persist across vtable hits.
+        let force_native_registered = force_native
+            && cached
+                .native_callback_cache
+                .get_or_init(|| {
+                    shared.native_methods.find(
+                        cached.class_name.as_ref(),
+                        cached.method_name.as_ref(),
+                        cached.method_descriptor.as_ref(),
+                    )
+                })
+                .is_some();
+        if force_native_registered {
             return Ok(CachedCallResult::CacheMiss);
         }
         (cached, is_native)
@@ -39432,19 +39453,9 @@ fn execute_invokevirtual_cached(
                         }
                         .or_else(|| {
                             // Warmup counter mirroring execute_invokestatic_cached.
-                            let invoc_key = {
-                                let mut h = 0u32;
-                                for &b in cached.method_name.as_bytes() {
-                                    // Widening: smaller value -> u32 (value fits)
-                                    h = h.wrapping_mul(31).wrapping_add(b as u32);
-                                }
-                                for &b in cached.method_descriptor.as_bytes() {
-                                    // Widening: smaller value -> u32 (value fits)
-                                    h = h.wrapping_mul(31).wrapping_add(b as u32);
-                                }
-                                // Widening: smaller integer -> 64-bit (zero/sign-extended, value preserved)
-                                ((cached.declaring_class_id.as_u32() as u64) << 32) | (h as u64)
-                            };
+                            // T2.5 -- memoized per call site; see
+                            // `CachedBytecodeMethod::invoc_key`.
+                            let invoc_key = cached.invoc_key();
                             const JIT_RETRY_STRIDE: u32 = 64;
                             let threshold = crate::runtime::env_cache::jit_invocation_threshold();
                             let cnt = shared.profile_store.increment_invocation(invoc_key);
@@ -40831,6 +40842,7 @@ fn populate_virtual_invoke_cache(
         is_static: method.is_static(),
         force_native_cache: std::sync::OnceLock::new(),
         native_callback_cache: std::sync::OnceLock::new(),
+        invoc_key: std::sync::OnceLock::new(),
         jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
     };
 
@@ -45038,6 +45050,7 @@ mod tests {
             is_static: false,
             force_native_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
+            invoc_key: std::sync::OnceLock::new(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
         });
         let key: PromotedInvokeKey = (ClassId::new(9999), 17, false, Some(ClassId::new(12345)));
