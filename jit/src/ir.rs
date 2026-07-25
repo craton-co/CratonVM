@@ -2642,7 +2642,33 @@ pub fn ir_compatible(scan: &super::x64::JitScanResult) -> bool {
 
     // Cap simple invokes (invokestatic / invokevirtual / invokespecial /
     // invokeinterface). Invokedynamic is rejected upstream by `jit_scan`.
-    if scan.invoke_ops.len() > 5 {
+    //
+    // Raised 5 -> 32 by the IR direct-call slice. The old cap of 5 was not a
+    // codegen limit at all: the IR path lowered EVERY invoke through the generic
+    // `jit_invoke_dispatch` helper (no direct calls, no inline caches), so a
+    // call-heavy method's "optimizing" IR recompile paid a full helper round trip
+    // per call and could come out SLOWER than the single-pass body, which binds a
+    // statically-resolved callee with a raw `CALL`. The cap was a blunt way of
+    // saying "don't route call-heavy methods here". `ir_lower`'s
+    // `emit_direct_cross_call` now closes that gap for the statically-bound kinds
+    // (`invokestatic` and non-`<init>` `invokespecial` — the only kinds admitted
+    // in a default configuration, since `CRATONVM_JIT_IR_CALL_VIRTUAL` is
+    // default-OFF), so the original reason no longer applies to them.
+    //
+    // Why 32 rather than no cap at all: a cap still buys two things the direct
+    // calls do not remove. (1) Each `Op::Call` widens the frame's argument
+    // staging region and forces `needs_context`, and `lower()` bails outright
+    // when `1 + num_params` exceeds the ABI register file — a very call-dense
+    // method is more likely to hit a lowering bail after doing all the graph
+    // work. (2) A callee the `callee_compiler` cannot compile (a native method,
+    // an unloaded class) still falls back to helper dispatch, so a method whose
+    // invokes are mostly unresolvable gains nothing from the direct path and
+    // would only pay IR compile time. 32 is far above the invoke count of any
+    // method the other caps (5 field ops, 5 static field ops, 3 `new`s, 200
+    // bytecode bytes in `ir_compatible_sized`) still admit, so in practice it is
+    // no longer the binding constraint — while still bounding the pathological
+    // case rather than removing the guard rail entirely.
+    if scan.invoke_ops.len() > 32 {
         return false;
     }
     // Cap getfield/putfield.
@@ -3053,9 +3079,18 @@ mod tests {
             has_newarray: false,
             ldc_ops: vec![],
         };
-        // Too many invokes.
+        // Too many invokes. The cap is 32 (raised from 5 by the IR direct-call
+        // slice — see `ir_compatible`); 6 invokes must now be ACCEPTED and 33
+        // rejected.
         scan.invoke_ops = (0..6).map(|i| (i, i as u16, 0xb8)).collect();
-        assert!(!ir_compatible(&scan));
+        assert!(
+            ir_compatible(&scan),
+            "6 invokes are within the raised cap and must be admitted"
+        );
+        scan.invoke_ops = (0..33).map(|i| (i, i as u16, 0xb8)).collect();
+        assert!(!ir_compatible(&scan), "33 invokes must exceed the cap");
+        scan.invoke_ops = (0..32).map(|i| (i, i as u16, 0xb8)).collect();
+        assert!(ir_compatible(&scan), "exactly 32 invokes must be admitted");
         scan.invoke_ops.clear();
         // checkcast still rejected outright.
         scan.typecheck_ops = vec![(0, 1)];

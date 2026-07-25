@@ -6938,11 +6938,12 @@ fn try_compile_inner(
                     if all_emittable && !info_map.is_empty() {
                         if std::env::var_os("CRATONVM_DBG_IR_CALL").is_some() {
                             eprintln!(
-                                "[cratonvm-ircall] {}.{}{}: emitting {} invoke(static/special/virtual/interface) Op::Call(s)",
+                                "[cratonvm-ircall] {}.{}{}: emitting {} invoke(static/special/virtual/interface) Op::Call(s), {} bound as DIRECT calls",
                                 cached.class_name,
                                 cached.method_name,
                                 cached.method_descriptor,
                                 info_map.len(),
+                                ir_direct_calls.len(),
                             );
                         }
                         builder.set_invoke_info(info_map);
