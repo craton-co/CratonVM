@@ -93,10 +93,24 @@ actually is:
 | `classloading` | 50,000 | remaining 6 | < 6,000 each |
 
 Several individual files are far larger than is comfortable —
-`native-builtins/src/lib.rs` (~86,000 lines), `native-builtins/src/phases_late.rs`
-(~73,000), `vm/src/vm.rs` (~68,000), `vm/src/runtime/interpreter.rs` (~45,000),
-and `jit/src/x64.rs` (~39,000). Splitting these is tracked work, not a design
-intent; expect slow incremental builds and merge friction when touching them.
+`native-builtins/src/phases_late.rs` (~77,000 lines), `vm/src/vm.rs` (~68,000),
+`vm/src/runtime/interpreter.rs` (~45,000), and `jit/src/x64.rs` (~39,000).
+`native-builtins/src/lib.rs` was ~90,000 and is now ~39,000, split into 13
+per-domain modules (`util_concurrent_ext`, `antlr_intrinsics`, `test_frameworks`,
+`regex_matcher`, `math_bignum`, …) on 2026-07-25.
+
+**Splitting a file does not speed up incremental builds, and it cannot.** Rust's
+compilation unit is the *crate*, not the file: moving code into modules of the
+same crate leaves that crate — and everything downstream of it — rebuilding in
+full. Measured over the 90k→39k split above, `touch lib.rs && cargo build
+--release -p cratonvm-cli` went 1m58s/2m00s before to 2m03s/2m03s after, i.e.
+noise. The payoff of splitting is **merge-conflict surface and reviewability**
+(the worst file is 57% smaller and edits now land in 13 separate files), not
+build time.
+
+An actual incremental-build win requires splitting into **separate crates**. The
+module boundaries established by that split are the natural seams for it, and
+that is the tracked follow-up.
 
 ### Runtime (`vm/src/runtime/`)
 
