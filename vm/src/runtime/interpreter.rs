@@ -413,7 +413,7 @@ fn mtroots_dump_initiator(shared: &SharedVm, thread: &JvmThread, reason: u8) {
         "[mtroots] GC reason={} initiator_tid={} alive={} blocked={} frames={}",
         reason,
         thread.thread_id.0,
-        shared.thread_registry.alive_count(),
+        shared.threads.thread_registry.alive_count(),
         shared.gc_barrier.blocked_count(),
         thread.frames.len(),
     );
@@ -438,7 +438,7 @@ fn mtroots_dump_initiator(shared: &SharedVm, thread: &JvmThread, reason: u8) {
     // Per-thread blocked-state census: a thread holding a live oop while counted
     // BLOCKED here is excluded from `expected` and its (possibly stale) deposit
     // snapshot is used instead of its current frames — the suspected gap.
-    let states = shared.thread_registry.dump_blocked_states();
+    let states = shared.threads.thread_registry.dump_blocked_states();
     let nblk = states.iter().filter(|(_, b, _)| *b).count();
     let _ = write!(
         buf,
@@ -659,8 +659,10 @@ fn stw_take_over_and_wait(
             // rare, already-anomalous path — and a mismatch here is the
             // single fastest signal to root-cause a recurrence of this bug
             // class at any OTHER call site.
-            let (census_alive, census_blocked, _tids, _blocked_tids) =
-                shared.thread_registry.alive_count_blocked_and_os_tids();
+            let (census_alive, census_blocked, _tids, _blocked_tids) = shared
+                .threads
+                .thread_registry
+                .alive_count_blocked_and_os_tids();
             let legacy_blocked = shared.gc_barrier.blocked_count() as usize;
             if legacy_blocked > census_blocked {
                 eprintln!(
@@ -670,7 +672,7 @@ fn stw_take_over_and_wait(
                      WITHOUT first depositing a root snapshot, so it is invisible to the \
                      production STW census but still occupies an `expected` slot no arrival \
                      can ever satisfy. Set CRATONVM_DBG_STW_CENSUS=1 for a full per-thread dump.\n{}",
-                    shared.thread_registry.debug_thread_census()
+                    shared.threads.thread_registry.debug_thread_census()
                 );
             }
             if std::env::var_os("CRATONVM_DBG_STW_CENSUS").is_some()
@@ -680,8 +682,8 @@ fn stw_take_over_and_wait(
                     "[stw-census] rounds={rounds} pending={pending} taken={} blocked={} alive={}{}",
                     taken.count(),
                     shared.gc_barrier.blocked_count(),
-                    shared.thread_registry.alive_count(),
-                    shared.thread_registry.debug_thread_census()
+                    shared.threads.thread_registry.alive_count(),
+                    shared.threads.thread_registry.debug_thread_census()
                 );
                 if std::env::var_os("CRATONVM_DBG_STW_NATIVE_RING").is_some() {
                     cratonvm_native_api::native_ring::dump_to_stderr();
@@ -718,7 +720,10 @@ fn stw_take_over_and_wait(
     // so a stale or dead value can only over-retain — never relocate or
     // corrupt.
     if taken.count() > 0 {
-        let peer_addrs = shared.thread_registry.frozen_peer_thread_addrs(&taken.tids);
+        let peer_addrs = shared
+            .threads
+            .thread_registry
+            .frozen_peer_thread_addrs(&taken.tids);
         let contributed_from = xt_roots.len();
         for addr in peer_addrs {
             // SAFETY: see the block comment above.
@@ -780,7 +785,7 @@ fn stw_take_over_and_wait(
         // mutator already published its JIT roots via update_root_snapshot;
         // re-scanning it only widens the conservative-candidate volume that
         // feeds the mark-phase writer, with zero coverage benefit.
-        let blocked_os_tids = shared.thread_registry.blocked_os_tids();
+        let blocked_os_tids = shared.threads.thread_registry.blocked_os_tids();
         let (windows, _roots) = xt::helper_window_pass(
             &taken,
             &|a| shared.heap.is_object_address(a),
@@ -794,7 +799,7 @@ fn stw_take_over_and_wait(
     // all live threads also hardens the sweep against a blocked/tearing-down
     // thread that missed its retire before it left the counted mutator set.
     // Cleared by the caller after the collection completes.
-    let regions = shared.thread_registry.collect_reserved_tlab_tails();
+    let regions = shared.threads.thread_registry.collect_reserved_tlab_tails();
     if taken.count() > 0 || helper_windows > 0 || !regions.is_empty() {
         shared.heap.set_jit_tlab_skip_regions(&regions);
     }
@@ -852,6 +857,7 @@ fn pin_frozen_peer_roots_for_g1(
         cratonvm_gc::gc_quiescence::add_pinned_jit_root(r.as_ptr() as usize);
     }
     for r in shared
+        .threads
         .thread_registry
         .root_snapshots_for_os_tids(&taken.tids)
     {
@@ -1140,7 +1146,8 @@ pub(crate) fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
         }
 
         // Truncation-checked: alive_count (usize) to u32; thread count realistically bounded
-        let alive_count = u32::try_from(shared.thread_registry.alive_count()).unwrap_or(u32::MAX);
+        let alive_count =
+            u32::try_from(shared.threads.thread_registry.alive_count()).unwrap_or(u32::MAX);
         if alive_count <= 1 {
             // Single-threaded fast path: no barrier needed
             let gc_start = std::time::Instant::now();
@@ -1153,7 +1160,7 @@ pub(crate) fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
             let stw = unsafe { cratonvm_gc::collector::StopTheWorldToken::new() };
             let result = shared
                 .heap
-                .collect_garbage(&stw, &mut roots, &shared.monitors);
+                .collect_garbage(&stw, &mut roots, &shared.threads.monitors);
             process_references_after_gc(shared, &result.pointer_map);
             update_all_roots(shared, thread, &result.pointer_map);
             // DBG (bc math-ec, CRATONVM_DBG_ECWATCH): the moving collector
@@ -1297,8 +1304,10 @@ pub(crate) fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
                 shared
                     .gc_barrier
                     .request_stw_counted_with_live_blocked(thread.thread_id, || {
-                        let (n, blocked, tids, blocked_tids) =
-                            shared.thread_registry.alive_count_blocked_and_os_tids();
+                        let (n, blocked, tids, blocked_tids) = shared
+                            .threads
+                            .thread_registry
+                            .alive_count_blocked_and_os_tids();
                         counted_os_tids = tids;
                         // DIAGNOSTIC (2026-07-13, STW takeover 5-class cluster
                         // investigation): print the EXACT identity set counted
@@ -1308,6 +1317,7 @@ pub(crate) fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
                         // excluded at request time or genuinely raced in.
                         if std::env::var_os("CRATONVM_DBG_STW_EXPECTED_IDS").is_some() {
                             let expected_ids: Vec<u64> = shared
+                                .threads
                                 .thread_registry
                                 .alive_thread_ids_excluding(&blocked_tids);
                             eprintln!(
@@ -1331,7 +1341,7 @@ pub(crate) fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
 
                 // Collect roots: current thread + all snapshots + shared state
                 let mut roots = collect_roots(shared, thread);
-                let snapshot_roots = shared.thread_registry.collect_all_root_snapshots();
+                let snapshot_roots = shared.threads.thread_registry.collect_all_root_snapshots();
                 roots.extend(snapshot_roots);
                 // INT-3 (G1) — everything a frozen peer can address must not
                 // move; must follow collect_roots (which clears the pins).
@@ -1345,9 +1355,10 @@ pub(crate) fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
                 // HIB-CV-24: null Weak/Phantom referents before marking (restored post-GC).
                 weakref_null_referents_pre_gc(shared);
                 let stw = unsafe { cratonvm_gc::collector::StopTheWorldToken::new() };
-                let result = shared
-                    .heap
-                    .collect_garbage(&stw, &mut roots, &shared.monitors);
+                let result =
+                    shared
+                        .heap
+                        .collect_garbage(&stw, &mut roots, &shared.threads.monitors);
                 process_references_after_gc(shared, &result.pointer_map);
 
                 // Update shared VM state (statics, string pool, etc.)
@@ -1449,7 +1460,7 @@ fn maybe_gc_forced(shared: &SharedVm, thread: &mut JvmThread) {
     mtroots_set_gc_ctx(shared, thread, 3); // 3 = forced-alloc (maybe_gc_forced)
     mtroots_dump_initiator(shared, thread, 3);
 
-    let alive_count = shared.thread_registry.alive_count() as u32; // Widening: thread count to u32
+    let alive_count = shared.threads.thread_registry.alive_count() as u32; // Widening: thread count to u32
     if alive_count <= 1 {
         let mut roots = collect_roots(shared, thread);
         // STW invariant: single-threaded fast path — see `maybe_gc`.
@@ -1458,7 +1469,7 @@ fn maybe_gc_forced(shared: &SharedVm, thread: &mut JvmThread) {
         let stw = unsafe { cratonvm_gc::collector::StopTheWorldToken::new() };
         let result = shared
             .heap
-            .collect_garbage(&stw, &mut roots, &shared.monitors);
+            .collect_garbage(&stw, &mut roots, &shared.threads.monitors);
         process_references_after_gc(shared, &result.pointer_map);
         update_all_roots(shared, thread, &result.pointer_map);
         crate::runtime::ec_watch::remap(&result.pointer_map);
@@ -1476,8 +1487,10 @@ fn maybe_gc_forced(shared: &SharedVm, thread: &mut JvmThread) {
             shared
                 .gc_barrier
                 .request_stw_counted_with_live_blocked(thread.thread_id, || {
-                    let (n, blocked, tids, blocked_tids) =
-                        shared.thread_registry.alive_count_blocked_and_os_tids();
+                    let (n, blocked, tids, blocked_tids) = shared
+                        .threads
+                        .thread_registry
+                        .alive_count_blocked_and_os_tids();
                     counted_os_tids = tids;
                     (
                         u32::try_from(n).unwrap_or(u32::MAX),
@@ -1491,7 +1504,7 @@ fn maybe_gc_forced(shared: &SharedVm, thread: &mut JvmThread) {
             let mut xt_roots: Vec<ObjectRef> = Vec::new();
             let taken = stw_take_over_and_wait(shared, &mut xt_roots, &counted_os_tids);
             let mut roots = collect_roots(shared, thread);
-            let snapshot_roots = shared.thread_registry.collect_all_root_snapshots();
+            let snapshot_roots = shared.threads.thread_registry.collect_all_root_snapshots();
             roots.extend(snapshot_roots);
             // INT-3 (G1) — everything a frozen peer can address must not
             // move; must follow collect_roots (which clears the pins).
@@ -1505,7 +1518,7 @@ fn maybe_gc_forced(shared: &SharedVm, thread: &mut JvmThread) {
             let stw = unsafe { cratonvm_gc::collector::StopTheWorldToken::new() };
             let result = shared
                 .heap
-                .collect_garbage(&stw, &mut roots, &shared.monitors);
+                .collect_garbage(&stw, &mut roots, &shared.threads.monitors);
             process_references_after_gc(shared, &result.pointer_map);
             update_all_roots(shared, thread, &result.pointer_map);
             // Step 5 GAP D: remap the ec_watch corruption-watch table across this
@@ -1635,7 +1648,7 @@ pub fn force_gc_from_native(shared: &SharedVm, thread: &mut JvmThread) {
         rp.finalizer_referent_addresses()
     };
 
-    let alive_count = shared.thread_registry.alive_count() as u32; // Widening: thread count to u32
+    let alive_count = shared.threads.thread_registry.alive_count() as u32; // Widening: thread count to u32
     if alive_count <= 1 {
         let mut roots = collect_roots(shared, thread);
         // STW invariant: single-threaded fast path — see `maybe_gc`.
@@ -1646,7 +1659,7 @@ pub fn force_gc_from_native(shared: &SharedVm, thread: &mut JvmThread) {
             &stw,
             &mut roots,
             &fin_addrs,
-            &shared.monitors,
+            &shared.threads.monitors,
         );
         process_references_after_gc(shared, &result.pointer_map);
         update_all_roots(shared, thread, &result.pointer_map);
@@ -1676,8 +1689,10 @@ pub fn force_gc_from_native(shared: &SharedVm, thread: &mut JvmThread) {
             shared
                 .gc_barrier
                 .request_stw_counted_with_live_blocked(thread.thread_id, || {
-                    let (n, blocked, tids, blocked_tids) =
-                        shared.thread_registry.alive_count_blocked_and_os_tids();
+                    let (n, blocked, tids, blocked_tids) = shared
+                        .threads
+                        .thread_registry
+                        .alive_count_blocked_and_os_tids();
                     counted_os_tids = tids;
                     (
                         u32::try_from(n).unwrap_or(u32::MAX),
@@ -1691,7 +1706,7 @@ pub fn force_gc_from_native(shared: &SharedVm, thread: &mut JvmThread) {
             let mut xt_roots: Vec<ObjectRef> = Vec::new();
             let taken = stw_take_over_and_wait(shared, &mut xt_roots, &counted_os_tids);
             let mut roots = collect_roots(shared, thread);
-            let snapshot_roots = shared.thread_registry.collect_all_root_snapshots();
+            let snapshot_roots = shared.threads.thread_registry.collect_all_root_snapshots();
             roots.extend(snapshot_roots);
             // INT-3 (G1) — everything a frozen peer can address must not
             // move; must follow collect_roots (which clears the pins).
@@ -1707,7 +1722,7 @@ pub fn force_gc_from_native(shared: &SharedVm, thread: &mut JvmThread) {
                 &stw,
                 &mut roots,
                 &fin_addrs,
-                &shared.monitors,
+                &shared.threads.monitors,
             );
             process_references_after_gc(shared, &result.pointer_map);
             update_all_roots(shared, thread, &result.pointer_map);
@@ -3702,6 +3717,7 @@ pub(crate) fn safepoint_check(shared: &SharedVm, thread: &mut JvmThread) {
     // throwable as a `MethodCallFailed`.
     if thread.pending_async_exception.is_none() {
         if let Some(throwable) = shared
+            .threads
             .thread_registry
             .take_async_exception(thread.thread_id)
         {
@@ -4081,8 +4097,10 @@ fn maybe_concurrent_gc(shared: &SharedVm, thread: &mut JvmThread) {
         shared
             .gc_barrier
             .request_stw_counted_with_live_blocked(thread.thread_id, || {
-                let (n, blocked, tids, blocked_tids) =
-                    shared.thread_registry.alive_count_blocked_and_os_tids();
+                let (n, blocked, tids, blocked_tids) = shared
+                    .threads
+                    .thread_registry
+                    .alive_count_blocked_and_os_tids();
                 counted_os_tids = tids;
                 (
                     u32::try_from(n).unwrap_or(u32::MAX),
@@ -4101,7 +4119,7 @@ fn maybe_concurrent_gc(shared: &SharedVm, thread: &mut JvmThread) {
         let taken = stw_take_over_and_wait(shared, &mut xt_roots, &counted_os_tids);
         // Collect root pointers for old-gen marking
         let roots = collect_roots(shared, thread);
-        let snapshot_roots = shared.thread_registry.collect_all_root_snapshots();
+        let snapshot_roots = shared.threads.thread_registry.collect_all_root_snapshots();
         let mut root_ptrs: Vec<*mut u8> = roots
             .iter()
             .chain(snapshot_roots.iter())
@@ -4156,8 +4174,10 @@ fn maybe_concurrent_gc(shared: &SharedVm, thread: &mut JvmThread) {
                 // satisfy this pause's quota (`arrive_and_wait_auto`). The anonymous
                 // `threads_blocked` subtraction this replaces excluded the same
                 // population without recording who it excluded.
-                let (n, blocked, tids, blocked_tids) =
-                    shared.thread_registry.alive_count_blocked_and_os_tids();
+                let (n, blocked, tids, blocked_tids) = shared
+                    .threads
+                    .thread_registry
+                    .alive_count_blocked_and_os_tids();
                 counted_os_tids = tids;
                 (
                     u32::try_from(n).unwrap_or(u32::MAX),
@@ -4174,7 +4194,7 @@ fn maybe_concurrent_gc(shared: &SharedVm, thread: &mut JvmThread) {
         // the initiator must drain its own.
         shared.heap.flush_thread_satb();
         let roots = collect_roots(shared, thread);
-        let snapshot_roots = shared.thread_registry.collect_all_root_snapshots();
+        let snapshot_roots = shared.threads.thread_registry.collect_all_root_snapshots();
         let mut root_ptrs: Vec<*mut u8> = roots
             .iter()
             .chain(snapshot_roots.iter())
@@ -4258,8 +4278,10 @@ fn g1_concurrent_mark_cycle(shared: &SharedVm, thread: &mut JvmThread) {
         shared
             .gc_barrier
             .request_stw_counted_with_live_blocked(thread.thread_id, || {
-                let (n, blocked, tids, blocked_tids) =
-                    shared.thread_registry.alive_count_blocked_and_os_tids();
+                let (n, blocked, tids, blocked_tids) = shared
+                    .threads
+                    .thread_registry
+                    .alive_count_blocked_and_os_tids();
                 counted_os_tids = tids;
                 (
                     u32::try_from(n).unwrap_or(u32::MAX),
@@ -4294,7 +4316,7 @@ fn g1_concurrent_mark_cycle(shared: &SharedVm, thread: &mut JvmThread) {
         // Mark roots into the G1 mark bitmap
         let roots =
             cratonvm_gc::gc_quiescence::with_class_unload_marking(|| collect_roots(shared, thread));
-        let snapshot_roots = shared.thread_registry.collect_all_root_snapshots();
+        let snapshot_roots = shared.threads.thread_registry.collect_all_root_snapshots();
         let all_roots: Vec<cratonvm_types::ObjectRef> = roots
             .into_iter()
             .chain(snapshot_roots.into_iter())
@@ -4369,8 +4391,10 @@ fn g1_final_remark_cleanup(shared: &SharedVm, thread: &mut JvmThread) {
             // satisfy this pause's quota (`arrive_and_wait_auto`). The anonymous
             // `threads_blocked` subtraction this replaces excluded the same
             // population without recording who it excluded.
-            let (n, blocked, tids, blocked_tids) =
-                shared.thread_registry.alive_count_blocked_and_os_tids();
+            let (n, blocked, tids, blocked_tids) = shared
+                .threads
+                .thread_registry
+                .alive_count_blocked_and_os_tids();
             counted_os_tids = tids;
             (
                 u32::try_from(n).unwrap_or(u32::MAX),
@@ -4387,7 +4411,7 @@ fn g1_final_remark_cleanup(shared: &SharedVm, thread: &mut JvmThread) {
         shared.heap.flush_thread_satb();
         let roots =
             cratonvm_gc::gc_quiescence::with_class_unload_marking(|| collect_roots(shared, thread));
-        let snapshot_roots = shared.thread_registry.collect_all_root_snapshots();
+        let snapshot_roots = shared.threads.thread_registry.collect_all_root_snapshots();
         let all_roots: Vec<cratonvm_types::ObjectRef> = roots
             .into_iter()
             .chain(snapshot_roots.into_iter())
@@ -7561,7 +7585,7 @@ pub fn pop_and_recycle_frame_with_reason(
             // but silently swallowing loses diagnostics on monitor-state
             // corruption (e.g. user code that manually `monitorexit`ed past
             // the sync method's own counter). Log via tracing for visibility.
-            if let Err(e) = shared.monitors.exit(obj, thread.thread_id) {
+            if let Err(e) = shared.threads.monitors.exit(obj, thread.thread_id) {
                 tracing::warn!(
                     class = %f.class_name(),
                     method = %f.method_name(),
@@ -7571,8 +7595,9 @@ pub fn pop_and_recycle_frame_with_reason(
                     "implicit monitorexit on synchronized-method-frame-pop failed"
                 );
             }
-            if !shared.monitors.holds(obj, thread.thread_id) {
+            if !shared.threads.monitors.holds(obj, thread.thread_id) {
                 shared
+                    .threads
                     .thread_registry
                     .remove_jmx_locked_monitor(thread.thread_id, obj);
             }
@@ -11816,7 +11841,7 @@ pub(crate) fn build_deopt_frame_inner(
         // scalar-replaced object may have had its `monitorenter`/`monitorexit`
         // elided, so a resumed frame that later runs `monitorexit` would hit an
         // un-entered monitor. Two layers protect against this:
-        //   1. A frame *holding* a monitor already bailed above (`rframe.monitors`).
+        //   1. A frame *holding* a monitor already bailed above (`rframe.threads.monitors`).
         //   2. `ACC_SYNCHRONIZED` methods bail here (the method monitor is elided
         //      under scalar replacement of `this`/the receiver).
         // The residual case — a `synchronized(obj)` *block* over a scalar-replaced
@@ -11973,7 +11998,7 @@ pub(crate) fn build_deopt_frame_inner(
     // contention, no GC).
     for &(obj, depth) in &monitors_fwd {
         for _ in 0..depth {
-            shared.monitors.enter(obj, thread.thread_id);
+            shared.threads.monitors.enter(obj, thread.thread_id);
         }
     }
     Some(frame)
@@ -12843,15 +12868,15 @@ mod deopt_step3_tests {
         };
         // The lock is held at depth 2: two exits succeed, a third fails (not owned).
         assert!(
-            shared.monitors.exit(obj, thread.thread_id).is_ok(),
+            shared.threads.monitors.exit(obj, thread.thread_id).is_ok(),
             "exit 1 (2->1)"
         );
         assert!(
-            shared.monitors.exit(obj, thread.thread_id).is_ok(),
+            shared.threads.monitors.exit(obj, thread.thread_id).is_ok(),
             "exit 2 (1->0)"
         );
         assert!(
-            shared.monitors.exit(obj, thread.thread_id).is_err(),
+            shared.threads.monitors.exit(obj, thread.thread_id).is_err(),
             "exit 3 must fail — monitor no longer held"
         );
     }
@@ -16942,6 +16967,7 @@ fn execute_instruction(
                     // exit handler below can safely consult it without
                     // re-checking the (potentially flipped) global flag.
                     shared
+                        .threads
                         .monitors
                         .set_jfr_enter_recorded(obj_ref, thread.thread_id);
                 }
@@ -16991,9 +17017,10 @@ fn execute_instruction(
             // acquire. If/when a paired `monitorexit` event is wired in, the
             // emission site must consult the snapshot itself — there's no
             // value in a dead pre-read here.
-            shared.monitors.exit(obj_ref, thread.thread_id)?;
-            if !shared.monitors.holds(obj_ref, thread.thread_id) {
+            shared.threads.monitors.exit(obj_ref, thread.thread_id)?;
+            if !shared.threads.monitors.holds(obj_ref, thread.thread_id) {
                 shared
+                    .threads
                     .thread_registry
                     .remove_jmx_locked_monitor(thread.thread_id, obj_ref);
             }
@@ -20655,6 +20682,7 @@ fn execute_invoke_kind(
             let recv = *recv;
             if shared.heap.class_id_of(recv) == ClassId::new(0) {
                 shared
+                    .threads
                     .thread_registry
                     .recover_stale_mirror(recv.as_ptr() as usize)
                     .filter(|live| {
@@ -20893,6 +20921,7 @@ fn execute_invoke_kind(
                                     .map(|o| o.as_ptr() as usize)
                                     .unwrap_or(0);
                                 let reg = shared
+                                    .threads
                                     .thread_registry
                                     .java_thread_obj(thread.thread_id)
                                     .map(|o| o.as_ptr() as usize)
@@ -30906,7 +30935,7 @@ fn try_stackless_invoke(
     if thread.frames.len() >= shared.config.max_stack_depth {
         dump_stack_on_soe(thread);
         if let Some(obj) = monitor_obj {
-            let _ = shared.monitors.exit(obj, thread.thread_id);
+            let _ = shared.threads.monitors.exit(obj, thread.thread_id);
         }
         return Err(MethodCallFailed::InternalError(VmError::Runtime(
             RuntimeError::StackOverflowError,

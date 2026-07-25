@@ -314,7 +314,7 @@ pub enum MainThreadGroupInit {
 /// is *not* scanned as a GC root; `remap_and_sweep_throwable_stack_traces`
 /// forwards it after a move and drops the trace once its Throwable dies.
 #[derive(Debug, Clone)]
-struct ThrowableStackTrace {
+pub(crate) struct ThrowableStackTrace {
     throwable: ObjectRef,
     frames: Vec<StackTraceEntry>,
 }
@@ -366,24 +366,18 @@ pub struct SharedVm {
 
     /// Native method registry (immutable after construction).
     pub native_methods: NativeMethodRegistry,
-
-    /// Captured Throwable backtraces, shared by every Java thread in this VM.
+    /// Java threads: registry, monitors, virtual-thread scheduling and the main ThreadGroup.
     ///
-    /// Java exposes a Throwable's stack trace independently of the thread that
-    /// filled it in. Keeping this in `SharedVm` also lets the registry survive
-    /// the producer thread's teardown. Entries are non-owning and swept after
-    /// each collection, so completed exception-heavy workloads do not retain
-    /// stale frame vectors indefinitely.
-    throwable_stacks: RwLock<FxHashMap<i32, ThrowableStackTrace>>,
+    /// See [`crate::vm::realms::ThreadRealm`]. Access paths are
+    /// `shared.threads.<field>`; lock types and levels are
+    /// unchanged by the move.
+    pub threads: crate::vm::realms::ThreadRealm,
 
     /// T10 — pool for reusing operand stack Vec<u64> allocations.
     pub operand_stack_pool: crate::runtime::alloc_fastpath::VecPool<u64>,
 
     /// T10 — pool for reusing tag Vec<u8> allocations.
     pub tag_pool: crate::runtime::alloc_fastpath::VecPool<u8>,
-
-    /// Monitor table for JVM intrinsic locks (monitorenter/monitorexit).
-    pub monitors: MonitorTable,
 
     /// Interned string pool: maps Rust strings to Java String ObjectRefs.
     /// Used by `ldc` string constants and `String.intern()`.
@@ -401,29 +395,6 @@ pub struct SharedVm {
     /// reads `System.in` before `System.initPhase1` completes; must be non-null).
     pub system_in: RwLock<Option<ObjectRef>>,
 
-    /// Cached "main" `java.lang.ThreadGroup` object used by every
-    /// VM-created `Thread` as `holder.group`.  Lazily created the first
-    /// time `NativeContextImpl::current_thread_object` builds a Thread
-    /// in real-JDK mode — the ThreadGroup constructor invokes bytecode,
-    /// so it can't run during `SharedVm::new`.
-    pub main_thread_group: RwLock<Option<ObjectRef>>,
-
-    /// Claim/wait coordination for the lazy `main_thread_group` build
-    /// (`NativeContextImpl::get_or_create_main_thread_group`,
-    /// `vm/src/vm/vm_exec.rs`). Mirrors `class_init_waiters`'s JVMS §5.5
-    /// claim/wait/notify shape: exactly one thread transitions
-    /// `Idle -> InProgress` and performs the (allocating, bytecode-running)
-    /// build; every other concurrent caller blocks on the `InProgress`
-    /// waiter's condvar instead of redundantly building its own
-    /// `ThreadGroup` pair. Fixes a confirmed TOCTOU race (see
-    /// docs/known-issues/CRATONVM-SPRING-GENUINE-BUGLIST.md, "5.8
-    /// follow-up #4") where several `cratonvm-aio-dispatch-N` threads
-    /// lazily building their first `Thread` mirror at the same instant
-    /// could each observe `main_thread_group == None` and independently
-    /// race through the whole unguarded build, corrupting whichever
-    /// build's objects lost the final write.
-    pub main_thread_group_init: parking_lot::Mutex<MainThreadGroupInit>,
-
     /// Pre-allocated singleton `java.lang.OutOfMemoryError`, thrown when the
     /// heap is too full to even materialize a fresh exception object (the
     /// OOM-during-OOM case — see `runtime::exceptions::ensure_singleton_oom`,
@@ -434,9 +405,6 @@ pub struct SharedVm {
 
     /// System properties: populated with platform defaults + user overrides.
     pub system_properties: RwLock<HashMap<String, String>>,
-
-    /// Registry of all JVM threads (main + spawned).
-    pub thread_registry: ThreadRegistry,
 
     /// B-J: permanent GC-root registry for `java.lang.invoke.VarHandle` objects.
     /// VarHandles are long-lived singletons stored in `static final` fields
@@ -471,15 +439,6 @@ pub struct SharedVm {
     /// `shared.jit.<field>`; lock types and levels are
     /// unchanged by the move.
     pub jit: crate::vm::realms::JitRealm,
-
-    /// Virtual thread scheduler — bounds concurrent virtual thread execution
-    /// to a carrier-thread pool (JEP 444, Java 21).
-    pub virtual_scheduler: Arc<crate::threading::VirtualThreadScheduler>,
-
-    /// Continuation scheduler and heap-resident virtual-thread execution
-    /// states. Unlike `virtual_scheduler`'s legacy permit semaphore, this
-    /// manager owns a bounded set of carrier OS threads.
-    pub virtual_thread_manager: Arc<crate::threading::VirtualThreadManager>,
 
     /// Off-heap memory allocations for Panama FFI (JEP 454).
     pub native_memory: parking_lot::Mutex<crate::native::ffi::NativeMemoryTable>,
@@ -595,7 +554,8 @@ impl SharedVm {
     /// thread. The entry is non-owning and is swept by the GC remap hook.
     pub fn store_throwable_stack_trace(&self, throwable: ObjectRef, frames: Vec<StackTraceEntry>) {
         let hash = self.heap.identity_hash_code(throwable);
-        self.throwable_stacks
+        self.threads
+            .throwable_stacks
             .write()
             .insert(hash, ThrowableStackTrace { throwable, frames });
     }
@@ -603,7 +563,8 @@ impl SharedVm {
     /// Return an owned snapshot so readers never borrow through the shared
     /// registry lock while another thread refreshes a Throwable's trace.
     pub fn throwable_stack_trace(&self, hash: i32) -> Option<Vec<StackTraceEntry>> {
-        self.throwable_stacks
+        self.threads
+            .throwable_stacks
             .read()
             .get(&hash)
             .map(|trace| trace.frames.clone())
@@ -614,7 +575,7 @@ impl SharedVm {
     /// not keep its key object alive; `is_object_address` is the collector's
     /// stable post-collection liveness probe.
     pub fn remap_and_sweep_throwable_stack_traces(&self, pointer_map: &HashMap<usize, usize>) {
-        let mut traces = self.throwable_stacks.write();
+        let mut traces = self.threads.throwable_stacks.write();
         traces.retain(|_, trace| {
             let old_addr = trace.throwable.as_ptr() as usize;
             if let Some(&new_addr) = pointer_map.get(&old_addr) {
@@ -2534,19 +2495,27 @@ impl SharedVm {
             concurrent_satb,
             concurrent_gc_state,
             native_methods,
-            throwable_stacks: RwLock::new(FxHashMap::default()),
+            threads: crate::vm::realms::ThreadRealm {
+                throwable_stacks: RwLock::new(FxHashMap::default()),
+                monitors: MonitorTable::new(),
+                main_thread_group: RwLock::new(None),
+                main_thread_group_init: parking_lot::Mutex::new(MainThreadGroupInit::Idle),
+                thread_registry: ThreadRegistry::new(),
+
+                virtual_scheduler: crate::threading::VirtualThreadScheduler::new_default(),
+                virtual_thread_manager: Arc::new(
+                    crate::threading::VirtualThreadManager::with_default_parallelism(),
+                ),
+            },
+
             operand_stack_pool: crate::runtime::alloc_fastpath::VecPool::new(64),
             tag_pool: crate::runtime::alloc_fastpath::VecPool::new(64),
-            monitors: MonitorTable::new(),
             string_pool: RwLock::new(FxHashMap::default()),
             system_out: RwLock::new(None),
             system_err: RwLock::new(None),
             system_in: RwLock::new(None),
-            main_thread_group: RwLock::new(None),
-            main_thread_group_init: parking_lot::Mutex::new(MainThreadGroupInit::Idle),
             singleton_oom: RwLock::new(None),
             system_properties: RwLock::new(sys_props),
-            thread_registry: ThreadRegistry::new(),
             var_handle_roots: RwLock::new(FxHashMap::default()),
             self_arc: RwLock::new(None),
             debug: crate::vm::realms::DebugRealm {
@@ -2588,11 +2557,6 @@ impl SharedVm {
                 // JIT slow-path allocation: per-class init recipe cache.
                 jit_alloc_class_cache: crate::jit::alloc_class_cache::JitAllocClassCache::new(),
             },
-
-            virtual_scheduler: crate::threading::VirtualThreadScheduler::new_default(),
-            virtual_thread_manager: Arc::new(
-                crate::threading::VirtualThreadManager::with_default_parallelism(),
-            ),
             native_memory: parking_lot::Mutex::new(crate::native::ffi::NativeMemoryTable::new()),
             native_libraries: parking_lot::Mutex::new(Vec::new()),
             upcall_table: parking_lot::Mutex::new(crate::native::ffi::UpcallTable::new()),
@@ -4059,10 +4023,10 @@ impl SharedVm {
         // line above signals, so without this they stay invisible to the
         // watchdog. They wake, emit their park-site snapshot / current
         // frames, and the process aborts right after.
-        self.thread_registry.unpark_all_for_stack_dump();
+        self.threads.thread_registry.unpark_all_for_stack_dump();
         // Summarize every registered thread (incl. those with no dumpable
         // interpreter frames — blocked in a native lock, or never started).
-        self.thread_registry.dump_thread_summary_to_stderr();
+        self.threads.thread_registry.dump_thread_summary_to_stderr();
     }
 
     /// T19.H1 — fast-path check used by the interpreter hot loop.
@@ -4502,11 +4466,16 @@ impl SharedVm {
         thread_obj: ObjectRef,
     ) -> Option<std::sync::Arc<crate::threading::ParkState>> {
         if let Some(java_tid) = super::vm_exec::read_java_thread_tid(self, thread_obj) {
-            if let Some(ps) = self.thread_registry.find_park_state_by_java_tid(java_tid) {
+            if let Some(ps) = self
+                .threads
+                .thread_registry
+                .find_park_state_by_java_tid(java_tid)
+            {
                 return Some(ps);
             }
         }
-        self.thread_registry
+        self.threads
+            .thread_registry
             .find_park_state_by_thread_obj(thread_obj)
     }
 }
@@ -4917,37 +4886,46 @@ impl Vm {
 
         // Register the main thread (id 0) in the thread registry.
         let main_thread = Box::new(JvmThread::new(ThreadId(0), "main"));
-        shared.thread_registry.register(ThreadId(0), "main", None);
+        shared
+            .threads
+            .thread_registry
+            .register(ThreadId(0), "main", None);
         // Share the interrupted flag so cross-thread interrupt works on the main thread
         shared
+            .threads
             .thread_registry
             .set_interrupted_flag(ThreadId(0), main_thread.interrupted.clone());
         // Share the park state so LockSupport.unpark(mainThread) works
         shared
+            .threads
             .thread_registry
             .set_park_state(ThreadId(0), main_thread.park_state.clone());
         // Share root snapshot so GC cross-thread collection includes main thread roots
         shared
+            .threads
             .thread_registry
             .set_root_snapshot(ThreadId(0), main_thread.root_snapshot.clone());
         // Match spawned threads: the watchdog summary and cross-thread stack
         // probes must see the primordial thread's parked Java frames too.
         shared
+            .threads
             .thread_registry
             .set_frame_trace(ThreadId(0), main_thread.frame_trace.clone());
         shared
+            .threads
             .thread_registry
             .set_vm_state(ThreadId(0), main_thread.vm_state.clone());
         // Share blocked-region GC state so initiators can maintain the main
         // thread's roots while it parks in a blocking native (wait/join/park)
         shared
+            .threads
             .thread_registry
             .set_gc_block_state(ThreadId(0), main_thread.gc_block_state.clone());
         // A worker-initiated non-moving GC can forcibly stop the primordial
         // thread in JIT code. Publish its reserved TLAB tail just as we do for
         // workers and JNI-attached threads. The Box keeps this pointee stable
         // across the return/moves of `Vm::new`.
-        shared.thread_registry.set_tlab_addr(
+        shared.threads.thread_registry.set_tlab_addr(
             ThreadId(0),
             &main_thread.tlab as *const cratonvm_gc::Tlab as usize,
         );
@@ -4955,13 +4933,17 @@ impl Vm {
         // too (the same Box keeps it stable) so a worker-initiated takeover
         // that freezes main mid-JIT can walk its interpreter frames.
         shared
+            .threads
             .thread_registry
             .set_jvm_thread_addr(ThreadId(0), &*main_thread as *const JvmThread as usize);
         // Publish the primordial thread's OS id too. A worker can initiate a
         // multi-threaded STW while the main thread is running JIT code; without
         // this id the takeover backend can freeze and scan main but cannot prove
         // it was part of the counted barrier snapshot.
-        shared.thread_registry.set_os_tid_current(ThreadId(0));
+        shared
+            .threads
+            .thread_registry
+            .set_os_tid_current(ThreadId(0));
 
         // Start JDWP debug server if configured
         #[cfg(feature = "experimental-debug")]
@@ -5420,11 +5402,11 @@ impl crate::runtime::serviceability::VmDiagnosticState for SharedVm {
     fn thread_snapshots(&self) -> Vec<crate::runtime::serviceability::ThreadSnapshot> {
         use crate::runtime::serviceability::{ThreadSnapshot, ThreadState};
 
-        let names = self.thread_registry.all_thread_names();
+        let names = self.threads.thread_registry.all_thread_names();
         let mut snapshots = Vec::with_capacity(names.len());
 
         for (tid, name) in &names {
-            let alive = self.thread_registry.is_alive(*tid);
+            let alive = self.threads.thread_registry.is_alive(*tid);
             let state = if alive {
                 ThreadState::Runnable
             } else {
@@ -6081,7 +6063,10 @@ mod tests {
         // the `JvmThread` lives in its dedicated Box.
         let vm = vm;
         assert_eq!(
-            vm.shared.thread_registry.collect_reserved_tlab_tails(),
+            vm.shared
+                .threads
+                .thread_registry
+                .collect_reserved_tlab_tails(),
             vec![(base as usize + 32, base as usize + size)],
         );
     }
@@ -11534,7 +11519,7 @@ mod tests {
         let obj = shared
             .heap
             .alloc_object(crate::classloading::ClassId::new(0), 1);
-        shared.monitors.enter(obj, thread.thread_id);
+        shared.threads.monitors.enter(obj, thread.thread_id);
 
         // Push a frame with monitor_on_exit set
         let mut frame = crate::runtime::frame::Frame::new(
@@ -11556,8 +11541,8 @@ mod tests {
         crate::runtime::interpreter::pop_and_recycle_frame(&shared, &mut thread);
 
         // Verify monitor was released — entering again should succeed without deadlock
-        shared.monitors.enter(obj, thread.thread_id);
-        let _ = shared.monitors.exit(obj, thread.thread_id);
+        shared.threads.monitors.enter(obj, thread.thread_id);
+        let _ = shared.threads.monitors.exit(obj, thread.thread_id);
     }
 
     // -----------------------------------------------------------------------

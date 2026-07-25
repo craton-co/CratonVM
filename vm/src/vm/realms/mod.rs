@@ -44,7 +44,9 @@
 pub mod class_realm;
 pub mod debug_realm;
 pub mod jit_realm;
+pub mod thread_realm;
 
 pub use class_realm::ClassRealm;
 pub use debug_realm::DebugRealm;
 pub use jit_realm::JitRealm;
+pub use thread_realm::ThreadRealm;

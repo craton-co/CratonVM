@@ -424,7 +424,7 @@ pub fn attach_foreign_thread(
     daemon: bool,
     name: Option<&str>,
 ) -> *mut JvmThread {
-    let tid = shared.thread_registry.next_thread_id();
+    let tid = shared.threads.thread_registry.next_thread_id();
     // Caller-supplied name (from `JavaVMAttachArgs.name`) when present, else the
     // JDK's default platform-thread naming `Thread-N`. A real java.lang.Thread
     // object + group is deferred to §3.5.
@@ -441,21 +441,27 @@ pub fn attach_foreign_thread(
     // wiring). register_with_daemon constructs fresh Arcs; the set_* calls
     // overwrite them with the thread-owned ones.
     shared
+        .threads
         .thread_registry
         .register_with_daemon(tid, &name, None, daemon);
     shared
+        .threads
         .thread_registry
         .set_interrupted_flag(tid, jt.interrupted.clone());
     shared
+        .threads
         .thread_registry
         .set_park_state(tid, jt.park_state.clone());
     shared
+        .threads
         .thread_registry
         .set_root_snapshot(tid, jt.root_snapshot.clone());
     shared
+        .threads
         .thread_registry
         .set_frame_trace(tid, jt.frame_trace.clone());
     shared
+        .threads
         .thread_registry
         .set_gc_block_state(tid, jt.gc_block_state.clone());
     // BUG-03 — publish this foreign thread's TLAB address (the box is
@@ -463,6 +469,7 @@ pub fn attach_foreign_thread(
     // un-retired reserved tail if forcibly stopped mid-JIT. Cleared in
     // `detach_foreign_thread` before the box is dropped.
     shared
+        .threads
         .thread_registry
         .set_tlab_addr(tid, &jt.tlab as *const cratonvm_gc::Tlab as usize);
     // XT-FRAME-SCAN: publish this foreign thread's `JvmThread` address too
@@ -470,6 +477,7 @@ pub fn attach_foreign_thread(
     // can walk its interpreter frames. Cleared with the TLAB address in
     // `detach_foreign_thread`.
     shared
+        .threads
         .thread_registry
         .set_jvm_thread_addr(tid, &*jt as *const JvmThread as usize);
 
@@ -510,15 +518,15 @@ pub fn detach_foreign_thread(shared: &SharedVm) -> bool {
     jt.tlab.retire();
     // The tail is now a real walker-visible filler, so it is safe to remove
     // the address before the boxed `JvmThread` is dropped.
-    shared.thread_registry.clear_tlab_addr(tid);
+    shared.threads.thread_registry.clear_tlab_addr(tid);
     // Drop out of `alive_count` / STW `expected` before reclaiming the TLAB so a
     // subsequent `request_stw` no longer waits for this thread.
-    shared.thread_registry.mark_dead(tid);
+    shared.threads.thread_registry.mark_dead(tid);
     // A thread torn down while blocked inside a native call made from within
     // a `synchronized` region never executes its `monitorexit` bytecode —
     // release anything it still holds so no future locker waits forever
     // (see `MonitorTable::release_monitors_held_by`).
-    shared.monitors.release_monitors_held_by(tid);
+    shared.threads.monitors.release_monitors_held_by(tid);
     drop(jt);
     FOREIGN_CALL_DEPTH.with(|c| c.set(0));
     true
@@ -726,9 +734,9 @@ fn aio_dispatcher_main() {
                 // barrier-serialized closure. A new STW must not observe this
                 // thread as dead before the tail has become walkable.
                 with_foreign_thread(|jt| jt.tlab.retire());
-                shared.thread_registry.clear_tlab_addr(tid);
-                shared.thread_registry.mark_dead(tid);
-                shared.monitors.release_monitors_held_by(tid);
+                shared.threads.thread_registry.clear_tlab_addr(tid);
+                shared.threads.thread_registry.mark_dead(tid);
+                shared.threads.monitors.release_monitors_held_by(tid);
             });
         } else {
             shared.gc_barrier.mark_blocked_region_leave();
@@ -3687,7 +3695,7 @@ extern "C" fn jni_monitor_enter(_env: JNIEnv, obj: JObject) -> JInt {
         // so a concurrent STW proceeds without us (no JvmThread in this
         // context; the calling thread's Java roots are covered by its own
         // registry snapshot).
-        if let Some(m) = shared.monitors.enter_or_contend(oref, ThreadId(0)) {
+        if let Some(m) = shared.threads.monitors.enter_or_contend(oref, ThreadId(0)) {
             let blk = shared.gc_barrier.enter_blocked();
             if blk.pre_stw {
                 // GCAUDIT-0711-FIX (finding 1a): auto for uniformity.
@@ -3709,7 +3717,7 @@ extern "C" fn jni_monitor_exit(_env: JNIEnv, obj: JObject) -> JInt {
     }
     with_shared_vm(|shared| {
         let oref = jobject_to_obj(obj)?;
-        let _ = shared.monitors.exit(oref, ThreadId(0));
+        let _ = shared.threads.monitors.exit(oref, ThreadId(0));
         Some(JNI_OK)
     })
     .flatten()
@@ -6549,9 +6557,9 @@ extern "C" fn jni_detach_current_thread(_vm: JavaVM) -> JInt {
             if let Some(tid) = tid {
                 shared.gc_barrier.mark_blocked_region_leave_after(|| {
                     with_foreign_thread(|jt| jt.tlab.retire());
-                    shared.thread_registry.clear_tlab_addr(tid);
-                    shared.thread_registry.mark_dead(tid);
-                    shared.monitors.release_monitors_held_by(tid);
+                    shared.threads.thread_registry.clear_tlab_addr(tid);
+                    shared.threads.thread_registry.mark_dead(tid);
+                    shared.threads.monitors.release_monitors_held_by(tid);
                 });
             } else {
                 shared.gc_barrier.mark_blocked_region_leave();
@@ -6760,13 +6768,13 @@ mod tests {
         let _guard = PROCESS_VM_TEST_LOCK.lock();
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         // A bare SharedVm has no registered threads (Vm::new registers main).
-        let baseline = shared.thread_registry.alive_count();
+        let baseline = shared.threads.thread_registry.alive_count();
 
         let raw = attach_foreign_thread(&shared, false, None);
         assert!(!raw.is_null());
         assert!(is_foreign_attached());
         assert_eq!(
-            shared.thread_registry.alive_count(),
+            shared.threads.thread_registry.alive_count(),
             baseline + 1,
             "attach must add exactly one alive thread"
         );
@@ -6782,7 +6790,7 @@ mod tests {
         // on another thread scans this foreign thread's roots.
         let obj = shared.heap.alloc_object(ClassId::new(0), 1);
         jt.root_snapshot.lock().push(obj);
-        let collected = shared.thread_registry.collect_all_root_snapshots();
+        let collected = shared.threads.thread_registry.collect_all_root_snapshots();
         assert!(
             collected.contains(&obj),
             "registry must observe the foreign thread's root via the shared snapshot Arc"
@@ -6795,7 +6803,7 @@ mod tests {
         jt.gc_block_state
             .in_blocked_region
             .store(true, std::sync::atomic::Ordering::Release);
-        let blocked = shared.thread_registry.dump_blocked_states();
+        let blocked = shared.threads.thread_registry.dump_blocked_states();
         assert!(
             blocked.iter().any(|(t, blk, _)| *t == tid.0 && *blk),
             "registry must observe the foreign thread's blocked state via the shared Arc"
@@ -6805,7 +6813,7 @@ mod tests {
         assert!(detach_foreign_thread(&shared));
         assert!(!is_foreign_attached());
         assert_eq!(
-            shared.thread_registry.alive_count(),
+            shared.threads.thread_registry.alive_count(),
             baseline,
             "detach must restore alive_count to baseline"
         );
@@ -6826,8 +6834,11 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
 
         // A "main" initiator thread, registered alive.
-        let main_tid = shared.thread_registry.next_thread_id();
-        shared.thread_registry.register(main_tid, "main", None);
+        let main_tid = shared.threads.thread_registry.next_thread_id();
+        shared
+            .threads
+            .thread_registry
+            .register(main_tid, "main", None);
 
         // Attach a foreign thread and put it in the idle blocked region exactly
         // as `attach_current_thread_impl` does.
@@ -6841,7 +6852,7 @@ mod tests {
 
         // Two alive threads (main + foreign), but the idle foreign thread is
         // excluded from `expected`, so the initiator waits for nobody.
-        let alive = shared.thread_registry.alive_count() as u32;
+        let alive = shared.threads.thread_registry.alive_count() as u32;
         assert_eq!(alive, 2);
         assert!(shared.gc_barrier.request_stw(main_tid, alive));
         assert_eq!(
@@ -6854,7 +6865,7 @@ mod tests {
 
         // Teardown mirrors detach: mark dead, leave the region, reclaim.
         let tid = with_foreign_thread(|jt| jt.thread_id).unwrap();
-        shared.thread_registry.mark_dead(tid);
+        shared.threads.thread_registry.mark_dead(tid);
         shared.gc_barrier.mark_blocked_region_leave();
         assert!(detach_foreign_thread(&shared));
     }
@@ -6917,7 +6928,7 @@ mod tests {
 
         // A non-foreign thread sees an entirely inert guard.
         let tid = with_foreign_thread(|jt| jt.thread_id).unwrap();
-        shared.thread_registry.mark_dead(tid);
+        shared.threads.thread_registry.mark_dead(tid);
         shared.gc_barrier.mark_blocked_region_leave();
         assert!(detach_foreign_thread(&shared));
         {
@@ -6939,11 +6950,14 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         set_process_vm(&shared);
 
-        let init = shared.thread_registry.next_thread_id();
-        shared.thread_registry.register(init, "init", None);
-        let coord = shared.thread_registry.next_thread_id();
-        shared.thread_registry.register(coord, "coordinator", None);
-        assert_eq!(shared.thread_registry.alive_count(), 2);
+        let init = shared.threads.thread_registry.next_thread_id();
+        shared.threads.thread_registry.register(init, "init", None);
+        let coord = shared.threads.thread_registry.next_thread_id();
+        shared
+            .threads
+            .thread_registry
+            .register(coord, "coordinator", None);
+        assert_eq!(shared.threads.thread_registry.alive_count(), 2);
 
         // This thread declares itself in-native (no foreign attachment present).
         assert!(host_thread_enter_native());

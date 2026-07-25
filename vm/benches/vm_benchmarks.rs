@@ -437,7 +437,7 @@ fn bench_gc_cycle(c: &mut Criterion) {
                 let stw = unsafe { cratonvm_gc::collector::StopTheWorldToken::new() };
                 let _ = shared
                     .heap
-                    .collect_garbage(&stw, &mut roots, &shared.monitors);
+                    .collect_garbage(&stw, &mut roots, &shared.threads.monitors);
             }
             black_box(&roots);
         });
@@ -1073,12 +1073,12 @@ fn bench_monitor_enter_exit(c: &mut Criterion) {
     c.bench_function("monitor_enter_exit_lower_bound_touch_loop", |b| {
         b.iter(|| {
             for _ in 0..1_000 {
-                // Drive the monitor table — `&shared.monitors` is the
+                // Drive the monitor table — `&shared.threads.monitors` is the
                 // same handle the interpreter consults on
                 // `monitorenter`. Without a public enter/exit hook this
                 // is a touch-only loop that establishes the baseline
                 // path-length the real bench will replace.
-                black_box(&shared.monitors);
+                black_box(&shared.threads.monitors);
                 black_box(&obj);
             }
         });

@@ -10218,7 +10218,11 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                         if let Ok(Some(Value::Object(Some(s)))) =
                             ctx.invoke_virtual(opt, "toString", "()Ljava/lang/String;", &[])
                         {
-                            if ctx.read_string(s).unwrap_or_default().contains("REPLACE_EXISTING") {
+                            if ctx
+                                .read_string(s)
+                                .unwrap_or_default()
+                                .contains("REPLACE_EXISTING")
+                            {
                                 replace_existing = true;
                             }
                         }
@@ -22381,8 +22385,7 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
             // this entry; avoids both re-parsing the whole central directory
             // on every entry AND decompressing entries nothing ever reads —
             // see `jar_entry_bytes_cached`).
-            let bytes: Option<std::sync::Arc<Vec<u8>>> =
-                jar_entry_bytes_cached(&path, &entry_name);
+            let bytes: Option<std::sync::Arc<Vec<u8>>> = jar_entry_bytes_cached(&path, &entry_name);
             let bytes = match bytes {
                 Some(b) => b,
                 None => return Ok(Some(Value::Object(None))),
@@ -23272,7 +23275,8 @@ fn spring_class_utils_for_name_impl(
     // docs/known-issues/springboot/classutils-forname-platform-loader-false-positive.md).
     if let Some(loader) = loader {
         let is_platform_or_boot = matches!(
-            ctx.class_name_of_id(ctx.class_id_of_object(loader)).as_deref(),
+            ctx.class_name_of_id(ctx.class_id_of_object(loader))
+                .as_deref(),
             Some("jdk/internal/loader/ClassLoaders$PlatformClassLoader")
                 | Some("jdk/internal/loader/ClassLoaders$BootClassLoader")
         );
@@ -23631,7 +23635,10 @@ pub(crate) fn jar_contents_cached(path: &str) -> Option<std::sync::Arc<JarConten
 /// than iterating — `by_name` on a `zip::ZipArchive` uses its already-parsed
 /// central-directory name index, so this stays cheap even on jars with
 /// thousands of entries.
-pub(crate) fn jar_entry_bytes_cached(path: &str, entry_name: &str) -> Option<std::sync::Arc<Vec<u8>>> {
+pub(crate) fn jar_entry_bytes_cached(
+    path: &str,
+    entry_name: &str,
+) -> Option<std::sync::Arc<Vec<u8>>> {
     use std::io::Read;
     use std::sync::{Arc, Mutex, OnceLock};
     static CACHE: OnceLock<Mutex<std::collections::HashMap<String, Arc<Vec<u8>>>>> =
@@ -43482,9 +43489,7 @@ pub fn register_classvalue_natives(r: &mut NativeMethodRegistry) {
                 }
                 if let Some(Value::Object(Some(v))) = result {
                     let owner_class_id = ctx.class_id_from_mirror(cls).map(|id| id.as_u32());
-                    let mut cache = classvalue_cache()
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner());
+                    let mut cache = classvalue_cache().lock().unwrap_or_else(|e| e.into_inner());
                     if !cache.contains_key(&key) && cache.len() >= CLASSVALUE_CACHE_CAP {
                         if let Some(victim) = cache.keys().next().copied() {
                             cache.remove(&victim);
@@ -74874,7 +74879,7 @@ fn register_new15_forkjoinpool_common(r: &mut NativeMethodRegistry) {
             let parallelism = (cpus - 1).max(1);
             // T16.7: tests run in parallel on multi-core hosts; clamp to 1 by
             // default so `forkjoin_pool_basic` is deterministic. The real
-            // carrier pool lives in `SharedVm.virtual_scheduler`, not this
+            // carrier pool lives in `SharedVm.threads.virtual_scheduler`, not this
             // synthetic proxy, so user code that wants real parallelism
             // should query that pool directly.
             let _ = parallelism;
@@ -74916,7 +74921,7 @@ fn register_new15_forkjoinpool_common(r: &mut NativeMethodRegistry) {
     });
 
     // getActiveThreadCount()I — always reports 0; the real carrier pool is
-    // tracked by `SharedVm.virtual_scheduler`, not by this synthetic proxy.
+    // tracked by `SharedVm.threads.virtual_scheduler`, not by this synthetic proxy.
     r.register(cls, "getActiveThreadCount", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
         match ctx.get_field(this, NEW15_FJP_ACTIVE) {

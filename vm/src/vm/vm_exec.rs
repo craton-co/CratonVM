@@ -1410,7 +1410,11 @@ pub(crate) fn monitor_enter_blocking(
     thread: &mut JvmThread,
     obj: ObjectRef,
 ) -> ObjectRef {
-    let Some(m) = shared.monitors.enter_or_contend(obj, thread.thread_id) else {
+    let Some(m) = shared
+        .threads
+        .monitors
+        .enter_or_contend(obj, thread.thread_id)
+    else {
         return obj;
     };
     let tid = thread.thread_id;
@@ -1490,7 +1494,11 @@ pub(crate) fn monitor_enter_synchronized_method(
     obj: ObjectRef,
     args: &mut [Value],
 ) -> ObjectRef {
-    let Some(monitor) = shared.monitors.enter_or_contend(obj, thread.thread_id) else {
+    let Some(monitor) = shared
+        .threads
+        .monitors
+        .enter_or_contend(obj, thread.thread_id)
+    else {
         return obj;
     };
 
@@ -1986,6 +1994,7 @@ fn cold_log_overlay_corruption(
 /// function releases the native carrier stack while preserving the Java stack.
 fn resume_virtual_continuation(shared: std::sync::Arc<SharedVm>, vt_id: u64) {
     let Some((mut thread, resumed)) = shared
+        .threads
         .virtual_thread_manager
         .take_runtime_for_mount(vt_id, vt_id)
     else {
@@ -2000,11 +2009,13 @@ fn resume_virtual_continuation(shared: std::sync::Arc<SharedVm>, vt_id: u64) {
         .gc_block_state
         .java_state
         .store(0, std::sync::atomic::Ordering::Release);
-    shared.thread_registry.set_os_tid_current(tid);
+    shared.threads.thread_registry.set_os_tid_current(tid);
     shared
+        .threads
         .thread_registry
         .set_jvm_thread_addr(tid, (&*thread as *const JvmThread) as usize);
     shared
+        .threads
         .thread_registry
         .set_tlab_addr(tid, &thread.tlab as *const cratonvm_gc::Tlab as usize);
 
@@ -2021,7 +2032,7 @@ fn resume_virtual_continuation(shared: std::sync::Arc<SharedVm>, vt_id: u64) {
         crate::runtime::interpreter::init_thread_exec_depth_ceiling(8 * 1024 * 1024);
         loop {
             let ready = shared.gc_barrier.run_if_no_stw_requested(|| {
-                shared.thread_registry.mark_stw_ready(tid);
+                shared.threads.thread_registry.mark_stw_ready(tid);
             });
             if ready {
                 break;
@@ -2035,8 +2046,8 @@ fn resume_virtual_continuation(shared: std::sync::Arc<SharedVm>, vt_id: u64) {
                 );
             }
         }
-        let Some(thread_obj) = shared.thread_registry.java_thread_obj(tid) else {
-            shared.virtual_thread_manager.terminate(vt_id);
+        let Some(thread_obj) = shared.threads.thread_registry.java_thread_obj(tid) else {
+            shared.threads.virtual_thread_manager.terminate(vt_id);
             return;
         };
         thread.java_thread_obj = Some(thread_obj);
@@ -2059,7 +2070,7 @@ fn resume_virtual_continuation(shared: std::sync::Arc<SharedVm>, vt_id: u64) {
             thread: &mut thread,
         }
         .deposit_root_snapshot();
-        shared.virtual_thread_manager.suspend_runtime(
+        shared.threads.virtual_thread_manager.suspend_runtime(
             vt_id,
             thread,
             std::time::Duration::from_nanos(*wake_after_nanos),
@@ -2071,7 +2082,7 @@ fn resume_virtual_continuation(shared: std::sync::Arc<SharedVm>, vt_id: u64) {
         if let MethodCallFailed::ExceptionThrown(exception) = error {
             let pin_base = thread.native_pin_roots.len();
             thread.native_pin_roots.push(*exception);
-            if let Some(thread_obj) = shared.thread_registry.java_thread_obj(tid) {
+            if let Some(thread_obj) = shared.threads.thread_registry.java_thread_obj(tid) {
                 let receiver_class = shared.heap.class_id_of(thread_obj);
                 let exception = thread.native_pin_roots[pin_base];
                 let _ = invoke_on_class_shared(
@@ -2106,9 +2117,13 @@ fn resume_virtual_continuation(shared: std::sync::Arc<SharedVm>, vt_id: u64) {
     }
     shared.heap.flush_thread_satb();
 
-    let wake_obj = shared.thread_registry.java_thread_obj(tid);
+    let wake_obj = shared.threads.thread_registry.java_thread_obj(tid);
     let term_monitor = wake_obj.and_then(|thread_obj| {
-        match shared.monitors.enter_inflated_or_contend(thread_obj, tid) {
+        match shared
+            .threads
+            .monitors
+            .enter_inflated_or_contend(thread_obj, tid)
+        {
             Ok((monitor, contended)) => {
                 if contended {
                     NativeContextImpl {
@@ -2140,10 +2155,11 @@ fn resume_virtual_continuation(shared: std::sync::Arc<SharedVm>, vt_id: u64) {
         let _ = shared.gc_barrier.arrive_and_wait_auto(tid);
     }
     blocked.finish_after(|| {
-        shared.thread_registry.clear_tlab_addr(tid);
-        shared.thread_registry.set_jvm_thread_addr(tid, 0);
-        shared.thread_registry.mark_dead(tid);
+        shared.threads.thread_registry.clear_tlab_addr(tid);
+        shared.threads.thread_registry.set_jvm_thread_addr(tid, 0);
+        shared.threads.thread_registry.mark_dead(tid);
         shared
+            .threads
             .monitors
             .release_monitors_held_by_except(tid, term_monitor.as_ref());
     });
@@ -2151,7 +2167,7 @@ fn resume_virtual_continuation(shared: std::sync::Arc<SharedVm>, vt_id: u64) {
         let _ = monitor.notify_all(tid);
         let _ = monitor.exit(tid);
     }
-    shared.virtual_thread_manager.terminate(vt_id);
+    shared.threads.virtual_thread_manager.terminate(vt_id);
 }
 
 pub struct NativeContextImpl<'a> {
@@ -3030,7 +3046,7 @@ impl<'a> NativeContextImpl<'a> {
     /// (now-published) result instead of racing its own independent build.
     pub(crate) fn get_or_create_main_thread_group(&mut self) -> Option<ObjectRef> {
         use std::sync::Arc;
-        if let Some(obj) = *self.shared.main_thread_group.read() {
+        if let Some(obj) = *self.shared.threads.main_thread_group.read() {
             return Some(obj);
         }
         let current_thread_id = self.thread.thread_id.0;
@@ -3040,7 +3056,7 @@ impl<'a> NativeContextImpl<'a> {
             // someone else; or discover the result already landed while we
             // were retrying.
             let waiter = {
-                let mut init = self.shared.main_thread_group_init.lock();
+                let mut init = self.shared.threads.main_thread_group_init.lock();
                 match &*init {
                     super::MainThreadGroupInit::InProgress {
                         owner_thread,
@@ -3064,7 +3080,7 @@ impl<'a> NativeContextImpl<'a> {
                         // finished (or failed) a build between our
                         // lock-free fast-path read above and acquiring
                         // this lock.
-                        if let Some(obj) = *self.shared.main_thread_group.read() {
+                        if let Some(obj) = *self.shared.threads.main_thread_group.read() {
                             return Some(obj);
                         }
                         *init = super::MainThreadGroupInit::InProgress {
@@ -3112,7 +3128,7 @@ impl<'a> NativeContextImpl<'a> {
             // Loop back to re-check: `Some` once the builder published a
             // result; `Idle` (no result) if the builder failed, in which
             // case we retry and may become the new builder ourselves.
-            if let Some(obj) = *self.shared.main_thread_group.read() {
+            if let Some(obj) = *self.shared.threads.main_thread_group.read() {
                 return Some(obj);
             }
         }
@@ -3129,7 +3145,7 @@ impl<'a> NativeContextImpl<'a> {
         impl Drop for FinishGuard<'_> {
             fn drop(&mut self) {
                 let prev = std::mem::replace(
-                    &mut *self.shared.main_thread_group_init.lock(),
+                    &mut *self.shared.threads.main_thread_group_init.lock(),
                     super::MainThreadGroupInit::Idle,
                 );
                 if let super::MainThreadGroupInit::InProgress { waiter, .. } = prev {
@@ -3258,7 +3274,7 @@ impl<'a> NativeContextImpl<'a> {
             }
         }
         self.thread.native_pin_roots.truncate(pin_base);
-        *self.shared.main_thread_group.write() = Some(main_tg);
+        *self.shared.threads.main_thread_group.write() = Some(main_tg);
         Some(main_tg)
     }
 
@@ -3439,12 +3455,14 @@ struct VmNativeThreadBlocker {
 impl NativeThreadBlocker for VmNativeThreadBlocker {
     fn publish_os_tid(&self) {
         self.shared
+            .threads
             .thread_registry
             .set_os_tid_current(self.thread_id);
     }
 
     fn enter_blocked(&self) {
         self.shared
+            .threads
             .thread_registry
             .mark_native_thread_blocked(self.thread_id);
         let pre_stw = self.shared.gc_barrier.mark_blocked_region_enter();
@@ -3458,6 +3476,7 @@ impl NativeThreadBlocker for VmNativeThreadBlocker {
     fn leave_blocked(&self) {
         self.shared.gc_barrier.mark_blocked_region_leave();
         self.shared
+            .threads
             .thread_registry
             .mark_native_thread_unblocked(self.thread_id);
     }
@@ -3497,16 +3516,22 @@ fn resolve_thread_id_from_thread_obj(shared: &SharedVm, thread_obj: ObjectRef) -
     // mirrors registered mid-construction (entry recorded before the ctor
     // assigned `tid`), backfilling the index for subsequent O(1) hits.
     if let Some(java_tid) = read_java_thread_tid(shared, thread_obj) {
-        if let Some(id) = shared.thread_registry.find_thread_id_by_java_tid(java_tid) {
+        if let Some(id) = shared
+            .threads
+            .thread_registry
+            .find_thread_id_by_java_tid(java_tid)
+        {
             return Some(id);
         }
         return shared
+            .threads
             .thread_registry
             .find_thread_id_by_thread_obj_tid_checked(thread_obj, java_tid);
     }
     // Synthetic-layout / pre-ctor mirrors: legacy pointer walk, then the
     // synthetic convention of the registry id stored as a Long at slot 2.
     shared
+        .threads
         .thread_registry
         .find_thread_id_by_thread_obj(thread_obj)
         .or_else(|| match shared.heap.get_field(thread_obj, 2) {
@@ -6433,7 +6458,10 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // `monitor_enter` therefore stays on this original, non-GC-blocked
         // path for everyone; `monitor_enter_gc_safe` (below) is the narrow,
         // opt-in escape hatch for the one call site with live evidence.
-        self.shared.monitors.enter(obj, self.thread.thread_id);
+        self.shared
+            .threads
+            .monitors
+            .enter(obj, self.thread.thread_id);
         if dbg_mon_dump {
             crate::vm::vm_init::clear_wait_site_snapshot();
         }
@@ -6468,7 +6496,11 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     }
 
     fn monitor_exit(&mut self, obj: ObjectRef) {
-        let _ = self.shared.monitors.exit(obj, self.thread.thread_id);
+        let _ = self
+            .shared
+            .threads
+            .monitors
+            .exit(obj, self.thread.thread_id);
         if matches!(self.thread.kind, crate::threading::ThreadKind::Virtual)
             && self.thread.pin_count > 0
         {
@@ -6481,7 +6513,10 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
 
     /// T1.6.7 вЂ” `Thread.holdsLock(Object)` real implementation.
     fn current_thread_holds_lock(&self, obj: ObjectRef) -> bool {
-        self.shared.monitors.holds(obj, self.thread.thread_id)
+        self.shared
+            .threads
+            .monitors
+            .holds(obj, self.thread.thread_id)
     }
 
     fn monitor_wait(&mut self, mut obj: ObjectRef, timeout_ms: Option<u64>) -> MethodCallResult {
@@ -6558,7 +6593,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                     obj = unsafe { ObjectRef::from_raw(new as *mut u8) };
                 }
             }
-            let r = self.shared.monitors.wait(
+            let r = self.shared.threads.monitors.wait(
                 obj,
                 self.thread.thread_id,
                 timeout_ms,
@@ -6624,12 +6659,16 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     }
 
     fn monitor_notify(&mut self, obj: ObjectRef) -> MethodCallResult {
-        self.shared.monitors.notify(obj, self.thread.thread_id)?;
+        self.shared
+            .threads
+            .monitors
+            .notify(obj, self.thread.thread_id)?;
         Ok(None)
     }
 
     fn monitor_notify_all(&mut self, obj: ObjectRef) -> MethodCallResult {
         self.shared
+            .threads
             .monitors
             .notify_all(obj, self.thread.thread_id)?;
         Ok(None)
@@ -6637,7 +6676,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
 
     fn thread_start(&mut self, thread_obj: ObjectRef) -> MethodCallResult {
         let shared_arc = self.shared.get_arc();
-        let tid = self.shared.thread_registry.next_thread_id();
+        let tid = self.shared.threads.thread_registry.next_thread_id();
         let header = self.shared.heap.get_header(thread_obj);
 
         // Read thread name from the real-JDK `name` field, falling back to the
@@ -6702,17 +6741,16 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         };
 
         // Register thread as alive before spawning
-        self.shared.thread_registry.register_starting_with_daemon(
-            tid,
-            &name,
-            Some(thread_obj),
-            is_daemon,
-        );
+        self.shared
+            .threads
+            .thread_registry
+            .register_starting_with_daemon(tid, &name, Some(thread_obj), is_daemon);
         // Record the mirror's Java `Thread.tid` (fully constructed by
         // `start()` time) so identity lookups take the aliasing-proof tid
         // index instead of comparing the mirror's recyclable heap address.
         if let Some(java_tid) = read_java_thread_tid(self.shared, thread_obj) {
             self.shared
+                .threads
                 .thread_registry
                 .set_java_thread_obj_with_tid(tid, thread_obj, java_tid);
         }
@@ -6779,9 +6817,11 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         let pre_park = std::sync::Arc::new(crate::threading::jvm_thread::ParkState::new());
         let pre_interrupted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         self.shared
+            .threads
             .thread_registry
             .set_park_state(tid, pre_park.clone());
         self.shared
+            .threads
             .thread_registry
             .set_interrupted_flag(tid, pre_interrupted.clone());
 
@@ -6794,10 +6834,12 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         self.ensure_thread_interrupt_lock(thread_obj);
         if is_virtual {
             self.shared
+                .threads
                 .virtual_thread_manager
                 .create_virtual_thread_with_id(tid.0, &name);
             let carrier_shared = shared_arc.clone();
             self.shared
+                .threads
                 .virtual_thread_manager
                 .start_carriers_once(move |vt_id| {
                     resume_virtual_continuation(carrier_shared.clone(), vt_id);
@@ -6829,32 +6871,39 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             virtual_runtime.interrupted = pre_interrupted;
             virtual_runtime.java_thread_obj = self
                 .shared
+                .threads
                 .thread_registry
                 .java_thread_obj(tid)
                 .or(Some(thread_obj_for_spawn));
             self.shared
+                .threads
                 .thread_registry
                 .set_root_snapshot(tid, virtual_runtime.root_snapshot.clone());
             self.shared
+                .threads
                 .thread_registry
                 .set_frame_trace(tid, virtual_runtime.frame_trace.clone());
             self.shared
+                .threads
                 .thread_registry
                 .set_vm_state(tid, virtual_runtime.vm_state.clone());
             self.shared
+                .threads
                 .thread_registry
                 .set_gc_block_state(tid, virtual_runtime.gc_block_state.clone());
-            self.shared.thread_registry.set_tlab_addr(
+            self.shared.threads.thread_registry.set_tlab_addr(
                 tid,
                 &virtual_runtime.tlab as *const cratonvm_gc::Tlab as usize,
             );
             self.shared
+                .threads
                 .thread_registry
                 .set_jvm_thread_addr(tid, (&*virtual_runtime as *const JvmThread) as usize);
             self.shared
+                .threads
                 .virtual_thread_manager
                 .install_runtime(tid.0, virtual_runtime);
-            self.shared.virtual_thread_manager.start(tid.0);
+            self.shared.threads.virtual_thread_manager.start(tid.0);
             std::thread::yield_now();
             return Ok(None);
         }
@@ -6886,32 +6935,32 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             // `wake_obj`).
             jvm_thread.java_thread_obj = Some(
                 shared_arc
-                    .thread_registry
+                    .threads.thread_registry
                     .java_thread_obj(tid)
                     .unwrap_or(thread_obj_for_spawn),
             );
             if is_virtual {
                 jvm_thread.kind = crate::threading::ThreadKind::Virtual;
                 // Acquire a carrier permit before executing (blocks if all carriers busy).
-                shared_arc.virtual_scheduler.acquire();
+                shared_arc.threads.virtual_scheduler.acquire();
             }
             // Share root snapshot with registry for GC cross-thread access
             shared_arc
-                .thread_registry
+                .threads.thread_registry
                 .set_root_snapshot(tid, jvm_thread.root_snapshot.clone());
             // Share the frame-trace slot too, so cross-thread getStackTrace /
             // dumpThreads can read this worker's parked call stack.
             shared_arc
-                .thread_registry
+                .threads.thread_registry
                 .set_frame_trace(tid, jvm_thread.frame_trace.clone());
             // Share the optional VM-side breadcrumb for STW diagnostics.
             shared_arc
-                .thread_registry
+                .threads.thread_registry
                 .set_vm_state(tid, jvm_thread.vm_state.clone());
             // Share blocked-region GC state so initiators can maintain this
             // thread's roots while it parks in a blocking native.
             shared_arc
-                .thread_registry
+                .threads.thread_registry
                 .set_gc_block_state(tid, jvm_thread.gc_block_state.clone());
             // BUG-03 — publish this worker's TLAB address so the cross-thread
             // STW JIT root scan can recover its un-retired reserved tail if it
@@ -6919,7 +6968,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             // is never moved after this point, so the address is stable for
             // the thread's life; cleared just before `mark_dead` below.
             shared_arc
-                .thread_registry
+                .threads.thread_registry
                 .set_tlab_addr(tid, &jvm_thread.tlab as *const cratonvm_gc::Tlab as usize);
             // XT-FRAME-SCAN: publish the whole `JvmThread` address too (same
             // address-stability argument as the TLAB line above) so a
@@ -6927,17 +6976,17 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             // interpreter frames for roots newer than its last snapshot
             // deposit. Cleared together with the TLAB address at teardown.
             shared_arc
-                .thread_registry
+                .threads.thread_registry
                 .set_jvm_thread_addr(tid, &jvm_thread as *const JvmThread as usize);
             // xt-hardening (2026-07-03): publish this worker's OS thread id
             // so the takeover's counted-set excusal can identify it (see
             // ThreadRegistry::set_os_tid_current). Must precede any Java/JIT
             // execution on this thread.
-            shared_arc.thread_registry.set_os_tid_current(tid);
+            shared_arc.threads.thread_registry.set_os_tid_current(tid);
             jvm_thread.set_vm_state("thread-start:registered");
             loop {
                 let marked_ready = shared_arc.gc_barrier.run_if_no_stw_requested(|| {
-                    shared_arc.thread_registry.mark_stw_ready(tid);
+                    shared_arc.threads.thread_registry.mark_stw_ready(tid);
                 });
                 if marked_ready {
                     break;
@@ -6975,7 +7024,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             // runtime class (e.g. BoundVirtualThread) and naturally finds
             // the override before falling back to Thread.run().
             let mut run_thread_obj = shared_arc
-                .thread_registry
+                .threads.thread_registry
                 .java_thread_obj(tid)
                 .unwrap_or(thread_obj_for_spawn);
             let recv_cid = shared_arc.heap.class_id_of(run_thread_obj);
@@ -7005,7 +7054,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 crate::runtime::interpreter::safepoint_check(&shared_arc, &mut jvm_thread);
             }
             run_thread_obj = shared_arc
-                .thread_registry
+                .threads.thread_registry
                 .java_thread_obj(tid)
                 .unwrap_or(thread_obj_for_spawn);
             let result = invoke_on_class_shared(
@@ -7027,16 +7076,16 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 }
                 .deposit_root_snapshot();
                 let boxed = Box::new(jvm_thread);
-                shared_arc.thread_registry.set_jvm_thread_addr(
+                shared_arc.threads.thread_registry.set_jvm_thread_addr(
                     tid,
                     (&*boxed as *const JvmThread) as usize,
                 );
-                shared_arc.virtual_thread_manager.suspend_runtime(
+                shared_arc.threads.virtual_thread_manager.suspend_runtime(
                     tid.0,
                     boxed,
                     std::time::Duration::from_nanos(*wake_after_nanos),
                 );
-                shared_arc.virtual_scheduler.release();
+                shared_arc.threads.virtual_scheduler.release();
                 return;
             }
             if dbg_ts {
@@ -7132,7 +7181,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                         &[
                             Value::Object(Some(
                                 shared_arc
-                                    .thread_registry
+                                    .threads.thread_registry
                                     .java_thread_obj(tid)
                                     .unwrap_or(thread_obj_for_spawn),
                             )),
@@ -7152,7 +7201,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             }
             if is_virtual {
                 // Release carrier permit on thread exit.
-                shared_arc.virtual_scheduler.release();
+                shared_arc.threads.virtual_scheduler.release();
             }
             // Record JFR thread end event
             {
@@ -7201,7 +7250,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             // from there while the thread is still registered (before
             // `mark_dead`), falling back to the captured ref only if absent.
             let wake_obj = shared_arc
-                .thread_registry
+                .threads.thread_registry
                 .java_thread_obj(tid)
                 .unwrap_or(thread_obj_for_spawn);
 
@@ -7213,7 +7262,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             // raw `Thread` object address; a moving GC may have remapped that
             // object and the monitor-table key. The `Arc<Monitor>` remains
             // valid across such remaps.
-            let term_monitor = match shared_arc.monitors.enter_inflated_or_contend(wake_obj, tid) {
+            let term_monitor = match shared_arc.threads.monitors.enter_inflated_or_contend(wake_obj, tid) {
                 Ok((monitor, contended)) => {
                     if contended {
                         // GCBARRIER-LIVELOCK-FIX (2026-07-18): every other
@@ -7323,8 +7372,8 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 // BUG-03 — stop publishing this worker's TLAB address before
                 // the `JvmThread` (and its TLAB) is dropped at closure end, so
                 // the collector can never read a dangling pointer.
-                shared_arc.thread_registry.clear_tlab_addr(tid);
-                shared_arc.thread_registry.mark_dead(tid);
+                shared_arc.threads.thread_registry.clear_tlab_addr(tid);
+                shared_arc.threads.thread_registry.mark_dead(tid);
                 // A thread that terminated while blocked inside a native call
                 // made from within a `synchronized` region never executes its
                 // `monitorexit` bytecode — sweep anything it still holds so no
@@ -7336,7 +7385,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 // notify silently no-ops as `NotOwner` (lost-wakeup bug, see
                 // `release_monitors_held_by_except`'s doc comment).
                 shared_arc
-                    .monitors
+                    .threads.monitors
                     .release_monitors_held_by_except(tid, term_monitor.as_ref());
             });
 
@@ -7347,7 +7396,10 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         })
         .expect("failed to spawn child Java thread (OS refused; check ulimit / thread count)");
 
-        self.shared.thread_registry.set_join_handle(tid, handle);
+        self.shared
+            .threads
+            .thread_registry
+            .set_join_handle(tid, handle);
         if !is_executor_worker {
             // Preserve HotSpot-like parent scheduling by default: Thread.start()
             // should not sleep the submitting thread. The env knob remains for
@@ -7393,7 +7445,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                     .gc_barrier
                     .arrive_and_wait_auto(self.thread.thread_id);
             }
-            self.shared.thread_registry.join(tid);
+            self.shared.threads.thread_registry.join(tid);
             drop(blk);
         }
         // Check if GC happened while we were blocked
@@ -7403,7 +7455,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
 
     fn thread_is_alive(&self, thread_obj: ObjectRef) -> bool {
         resolve_thread_id_from_thread_obj(self.shared, thread_obj)
-            .map(|id| self.shared.thread_registry.is_alive(id))
+            .map(|id| self.shared.threads.thread_registry.is_alive(id))
             .unwrap_or(false)
     }
 
@@ -7417,8 +7469,8 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         match tid {
             None => 0, // NEW — never started
             Some(id) => {
-                if self.shared.thread_registry.is_alive(id) {
-                    match self.shared.thread_registry.java_block_state(id) {
+                if self.shared.threads.thread_registry.is_alive(id) {
+                    match self.shared.threads.thread_registry.java_block_state(id) {
                         1 => 3, // WAITING
                         2 => 4, // BLOCKED
                         3 => 5, // TIMED_WAITING
@@ -7451,7 +7503,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // Line-less snapshot (class.method + BCI). The published entry doesn't
         // carry the ClassId/descriptor needed to resolve source lines, but
         // class.method is sufficient to pinpoint where a parked thread is stuck.
-        self.shared.thread_registry.frame_trace_of(tid)
+        self.shared.threads.thread_registry.frame_trace_of(tid)
     }
 
     fn thread_jmx_snapshot(
@@ -7551,11 +7603,10 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // tid-guarded lookup path backfills it on first use.
         self.thread.java_thread_obj = Some(thread_obj);
         let java_tid = read_java_thread_tid(self.shared, thread_obj).unwrap_or(0);
-        self.shared.thread_registry.set_java_thread_obj_with_tid(
-            self.thread.thread_id,
-            thread_obj,
-            java_tid,
-        );
+        self.shared
+            .threads
+            .thread_registry
+            .set_java_thread_obj_with_tid(self.thread.thread_id, thread_obj, java_tid);
 
         let name_str = super::create_java_string(self.shared, &self.thread.name);
         // Re-sync after the string allocation (may have moved the mirror).
@@ -7699,7 +7750,10 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         let tid = resolve_thread_id_from_thread_obj(self.shared, thread_obj);
         if let Some(tid) = tid {
             // Set the interrupted flag via the registry (cross-thread safe)
-            self.shared.thread_registry.set_interrupted(tid, true);
+            self.shared
+                .threads
+                .thread_registry
+                .set_interrupted(tid, true);
         }
         // Match HotSpot `Thread.interrupt0`: wake the target if it is parked in
         // `LockSupport.park` (e.g. AQS `ConditionObject.await`). Without this the
@@ -7719,6 +7773,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             return false;
         };
         self.shared
+            .threads
             .thread_registry
             .post_async_exception(tid, throwable)
     }
@@ -7752,7 +7807,12 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // through the tid-keyed resolver — a raw pointer walk here can alias
         // a recycled mirror address to a dead thread's entry.
         resolve_thread_id_from_thread_obj(self.shared, thread_obj)
-            .and_then(|tid| self.shared.thread_registry.get_interrupted_flag(tid))
+            .and_then(|tid| {
+                self.shared
+                    .threads
+                    .thread_registry
+                    .get_interrupted_flag(tid)
+            })
             .map(|flag| flag.load(std::sync::atomic::Ordering::Acquire))
             .unwrap_or(false)
     }
@@ -7787,13 +7847,13 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
 
     fn vt_release_carrier(&mut self) {
         if matches!(self.thread.kind, crate::threading::ThreadKind::Virtual) {
-            self.shared.virtual_scheduler.release();
+            self.shared.threads.virtual_scheduler.release();
         }
     }
 
     fn vt_acquire_carrier(&mut self) {
         if matches!(self.thread.kind, crate::threading::ThreadKind::Virtual) {
-            self.shared.virtual_scheduler.acquire();
+            self.shared.threads.virtual_scheduler.acquire();
         }
     }
 
@@ -7809,6 +7869,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             return false;
         }
         self.shared
+            .threads
             .virtual_thread_manager
             .wait_on_key(key, self.thread.thread_id.0);
         true
@@ -7816,12 +7877,13 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
 
     fn vt_cancel_wait_on_key(&mut self, key: u64) {
         self.shared
+            .threads
             .virtual_thread_manager
             .cancel_wait_on_key(key, self.thread.thread_id.0);
     }
 
     fn vt_wake_waiters(&mut self, key: u64) {
-        self.shared.virtual_thread_manager.wake_waiters(key);
+        self.shared.threads.virtual_thread_manager.wake_waiters(key);
     }
 
     fn emit_virtual_thread_pinned_jfr(&mut self, reason: &'static str) {
@@ -7847,11 +7909,14 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     }
 
     fn active_thread_count(&self) -> i32 {
-        self.shared.thread_registry.alive_count() as i32
+        self.shared.threads.thread_registry.alive_count() as i32
     }
 
     fn enumerate_threads(&self, max: usize) -> Vec<ObjectRef> {
-        self.shared.thread_registry.alive_thread_objects(max)
+        self.shared
+            .threads
+            .thread_registry
+            .alive_thread_objects(max)
     }
 
     /// T19_K2 вЂ” Register a native-spawned OS thread with the VM
@@ -7865,8 +7930,9 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     /// `unregister_native_thread(id)` from inside the spawned thread's
     /// exit path.
     fn register_native_thread(&mut self, name: &str, daemon: bool, join_handle_ptr: usize) -> u64 {
-        let tid = self.shared.thread_registry.next_thread_id();
+        let tid = self.shared.threads.thread_registry.next_thread_id();
         self.shared
+            .threads
             .thread_registry
             .register_with_daemon(tid, name, None, daemon);
         // Claim the raw pointer for exactly-once consumption BEFORE
@@ -7888,7 +7954,10 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             // daemon-on-shutdown teardown).
             let boxed: Box<std::thread::JoinHandle<()>> =
                 unsafe { Box::from_raw(join_handle_ptr as *mut std::thread::JoinHandle<()>) };
-            self.shared.thread_registry.set_join_handle(tid, *boxed);
+            self.shared
+                .threads
+                .thread_registry
+                .set_join_handle(tid, *boxed);
         }
         tid.0
     }
@@ -7914,8 +7983,8 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             return;
         }
         let tid = crate::threading::jvm_thread::ThreadId(thread_id);
-        self.shared.thread_registry.mark_dead(tid);
-        self.shared.monitors.release_monitors_held_by(tid);
+        self.shared.threads.thread_registry.mark_dead(tid);
+        self.shared.threads.monitors.release_monitors_held_by(tid);
     }
 
     /// T19_K2 вЂ” Attach a `Box<JoinHandle<()>>` to an already-registered
@@ -7933,7 +8002,13 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // Verify the thread is registered before consuming the pointer.
         // `is_alive` returns true on registration and false after
         // `mark_dead` вЂ” either way the entry exists.
-        if self.shared.thread_registry.thread_name(tid).is_none() {
+        if self
+            .shared
+            .threads
+            .thread_registry
+            .thread_name(tid)
+            .is_none()
+        {
             return false;
         }
         // Claim the raw pointer for exactly-once consumption before
@@ -7949,7 +8024,10 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // above guarantees this is the only reconstruction of this pointer.
         let boxed: Box<std::thread::JoinHandle<()>> =
             unsafe { Box::from_raw(join_handle_ptr as *mut std::thread::JoinHandle<()>) };
-        self.shared.thread_registry.set_join_handle(tid, *boxed);
+        self.shared
+            .threads
+            .thread_registry
+            .set_join_handle(tid, *boxed);
         true
     }
 
@@ -7968,11 +8046,18 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             return false;
         }
         let tid = crate::threading::jvm_thread::ThreadId(thread_id);
-        if self.shared.thread_registry.thread_name(tid).is_none() {
+        if self
+            .shared
+            .threads
+            .thread_registry
+            .thread_name(tid)
+            .is_none()
+        {
             return false;
         }
         let java_tid = read_java_thread_tid(self.shared, java_thread_obj).unwrap_or(0);
         self.shared
+            .threads
             .thread_registry
             .set_java_thread_obj_with_tid(tid, java_thread_obj, java_tid);
         true
@@ -8346,7 +8431,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         } else {
             resolve_field_descriptor_byte_cached(self.shared, class_id, index)
         };
-        let swapped = self.shared.monitors.with_cas_lock(obj, || {
+        let swapped = self.shared.threads.monitors.with_cas_lock(obj, || {
             let current = if is_array {
                 self.shared
                     .heap
@@ -8527,7 +8612,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             );
         }
         if release {
-            self.shared.virtual_scheduler.release();
+            self.shared.threads.virtual_scheduler.release();
         }
 
         let park_start = std::time::Instant::now();
@@ -8567,7 +8652,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         let park_dur = park_start.elapsed();
 
         if release {
-            self.shared.virtual_scheduler.acquire();
+            self.shared.threads.virtual_scheduler.acquire();
         }
         // Check if GC happened while we were blocked
         self.check_post_block_gc();
@@ -8600,9 +8685,15 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
 
     fn unpark(&self, thread_obj: ObjectRef) {
         if let Some(tid) = resolve_thread_id_from_thread_obj(self.shared, thread_obj) {
-            if self.shared.virtual_thread_manager.is_virtual(tid.0) {
-                self.shared.virtual_thread_manager.cancel_wakeup(tid.0);
-                self.shared.virtual_thread_manager.unpark_virtual(tid.0);
+            if self.shared.threads.virtual_thread_manager.is_virtual(tid.0) {
+                self.shared
+                    .threads
+                    .virtual_thread_manager
+                    .cancel_wakeup(tid.0);
+                self.shared
+                    .threads
+                    .virtual_thread_manager
+                    .unpark_virtual(tid.0);
                 return;
             }
         }
@@ -8621,7 +8712,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 "[unpark] MISS obj={:p} header_class_id={:?} registry={:x?}",
                 thread_obj.as_ptr(),
                 class_id,
-                self.shared.thread_registry.debug_thread_obj_addrs(),
+                self.shared.threads.thread_registry.debug_thread_obj_addrs(),
             );
         }
     }
@@ -18859,7 +18950,7 @@ fn invoke_on_class_shared_inner(
     // --- ACC_SYNCHRONIZED: acquire monitor before execution ---
     // B9: scope the monitor release as an RAII guard so it runs on BOTH the
     // normal-return path AND a panic unwind through the interpreter call.
-    // The previous `let _ = shared.monitors.exit(...)` after `result` (a)
+    // The previous `let _ = shared.threads.monitors.exit(...)` after `result` (a)
     // leaked the monitor entirely if `result` panicked (the line never
     // executed), and (b) silently swallowed the error on the normal path.
     let mut synchronized_args: Option<Vec<Value>> = None;
@@ -18900,7 +18991,7 @@ fn invoke_on_class_shared_inner(
         let monitor_pin = thread.native_pin_roots.len();
         thread.native_pin_roots.push(obj);
         Some(SynchronizedMethodGuard {
-            monitor_pool: &shared.monitors,
+            monitor_pool: &shared.threads.monitors,
             obj,
             monitor_pin,
             thread: thread as *mut JvmThread,
@@ -19294,7 +19385,7 @@ fn invoke_on_class_shared_inner(
 /// B9: RAII guard for ACC_SYNCHRONIZED method release. Constructed after the
 /// monitor has been entered; its `Drop` impl releases the monitor and logs
 /// any exit error via tracing so a diagnostic is preserved on the panic-unwind
-/// path (where the previous manual `let _ = shared.monitors.exit(...)` after
+/// path (where the previous manual `let _ = shared.threads.monitors.exit(...)` after
 /// the call leaked the monitor entirely because the line never executed).
 struct SynchronizedMethodGuard<'a> {
     monitor_pool: &'a crate::threading::monitor::MonitorTable,
@@ -20304,11 +20395,12 @@ mod tests {
         // thread would have -- `enter()`'s plain thin-lock fast path would
         // never exercise the code this test targets.
         let (_monitor, contended) = shared
+            .threads
             .monitors
             .enter_inflated_or_contend(obj, ThreadId(native_tid))
             .expect("inflate");
         assert!(!contended, "fresh monitor should be acquired immediately");
-        assert!(shared.monitors.holds(obj, ThreadId(native_tid)));
+        assert!(shared.threads.monitors.holds(obj, ThreadId(native_tid)));
         {
             let mut ctx = NativeContextImpl {
                 shared: &shared,
@@ -20317,15 +20409,15 @@ mod tests {
             ctx.unregister_native_thread(native_tid);
         }
         assert!(
-            !shared.monitors.holds(obj, ThreadId(native_tid)),
+            !shared.threads.monitors.holds(obj, ThreadId(native_tid)),
             "a dead thread must not still be recorded as holding the monitor"
         );
         // A different thread must now be able to acquire the same object's
         // monitor without blocking.
         let other_tid = ThreadId(native_tid + 1);
-        shared.monitors.enter(obj, other_tid);
-        assert!(shared.monitors.holds(obj, other_tid));
-        assert!(shared.monitors.exit(obj, other_tid).is_ok());
+        shared.threads.monitors.enter(obj, other_tid);
+        assert!(shared.threads.monitors.holds(obj, other_tid));
+        assert!(shared.threads.monitors.exit(obj, other_tid).is_ok());
     }
 
     #[test]

@@ -2051,7 +2051,7 @@ mod tests {
         assert!(result.is_err());
 
         // Now enter the monitor and try РІР‚вЂќ should succeed
-        shared.monitors.enter(obj, ThreadId(0));
+        shared.threads.monitors.enter(obj, ThreadId(0));
         call_native(
             &shared,
             &mut thread,
@@ -2070,7 +2070,7 @@ mod tests {
             &[Value::Object(Some(obj))],
         )
         .unwrap();
-        shared.monitors.exit(obj, ThreadId(0)).unwrap();
+        shared.threads.monitors.exit(obj, ThreadId(0)).unwrap();
     }
 
     // --- Phase 8 Part 2: Thread and Throwable stub tests ---
@@ -2134,7 +2134,10 @@ mod tests {
     fn thread_is_alive_via_registry() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         *shared.self_arc.write() = Some(Arc::downgrade(&shared));
-        shared.thread_registry.register(ThreadId(0), "main", None);
+        shared
+            .threads
+            .thread_registry
+            .register(ThreadId(0), "main", None);
         let mut thread = JvmThread::new(ThreadId(0), "main");
 
         // Get the current thread object (which stores ThreadId in field 2)
@@ -2162,7 +2165,7 @@ mod tests {
         assert_eq!(r, Some(Value::Int(1)));
 
         // Mark thread dead and check again
-        shared.thread_registry.mark_dead(ThreadId(0));
+        shared.threads.thread_registry.mark_dead(ThreadId(0));
         let r2 = call_native(
             &shared,
             &mut thread,
@@ -5731,11 +5734,12 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         *shared.self_arc.write() = Some(Arc::downgrade(&shared));
         let tid = ThreadId(1);
-        shared.thread_registry.register(tid, "worker", None);
+        shared.threads.thread_registry.register(tid, "worker", None);
 
         // Create a JvmThread and share its interrupted flag with the registry
         let jvm_thread = JvmThread::new(tid, "worker");
         shared
+            .threads
             .thread_registry
             .set_interrupted_flag(tid, jvm_thread.interrupted.clone());
 
@@ -5745,7 +5749,7 @@ mod tests {
             .load(std::sync::atomic::Ordering::Acquire));
 
         // Interrupt via registry (simulating cross-thread interrupt)
-        shared.thread_registry.set_interrupted(tid, true);
+        shared.threads.thread_registry.set_interrupted(tid, true);
 
         // JvmThread's flag should now be set
         assert!(jvm_thread
@@ -5758,10 +5762,11 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         *shared.self_arc.write() = Some(Arc::downgrade(&shared));
         let tid = ThreadId(1);
-        shared.thread_registry.register(tid, "worker", None);
+        shared.threads.thread_registry.register(tid, "worker", None);
 
         let jvm_thread = JvmThread::new(tid, "worker");
         shared
+            .threads
             .thread_registry
             .set_interrupted_flag(tid, jvm_thread.interrupted.clone());
 
@@ -5789,10 +5794,11 @@ mod tests {
     fn root_snapshot_deposit_and_collect() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let tid = ThreadId(1);
-        shared.thread_registry.register(tid, "worker", None);
+        shared.threads.thread_registry.register(tid, "worker", None);
 
         let jvm_thread = JvmThread::new(tid, "worker");
         shared
+            .threads
             .thread_registry
             .set_root_snapshot(tid, jvm_thread.root_snapshot.clone());
 
@@ -5806,7 +5812,7 @@ mod tests {
         }
 
         // Collect all root snapshots
-        let all_roots = shared.thread_registry.collect_all_root_snapshots();
+        let all_roots = shared.threads.thread_registry.collect_all_root_snapshots();
         assert!(all_roots.contains(&obj1));
         assert!(all_roots.contains(&obj2));
         assert_eq!(all_roots.len(), 2);
@@ -5817,15 +5823,23 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let tid1 = ThreadId(1);
         let tid2 = ThreadId(2);
-        shared.thread_registry.register(tid1, "worker-1", None);
-        shared.thread_registry.register(tid2, "worker-2", None);
+        shared
+            .threads
+            .thread_registry
+            .register(tid1, "worker-1", None);
+        shared
+            .threads
+            .thread_registry
+            .register(tid2, "worker-2", None);
 
         let thread1 = JvmThread::new(tid1, "worker-1");
         let thread2 = JvmThread::new(tid2, "worker-2");
         shared
+            .threads
             .thread_registry
             .set_root_snapshot(tid1, thread1.root_snapshot.clone());
         shared
+            .threads
             .thread_registry
             .set_root_snapshot(tid2, thread2.root_snapshot.clone());
 
@@ -5835,10 +5849,10 @@ mod tests {
         thread2.root_snapshot.lock().push(obj2);
 
         // Mark thread 2 as dead
-        shared.thread_registry.mark_dead(tid2);
+        shared.threads.thread_registry.mark_dead(tid2);
 
         // Only alive thread's roots should be collected
-        let all_roots = shared.thread_registry.collect_all_root_snapshots();
+        let all_roots = shared.threads.thread_registry.collect_all_root_snapshots();
         assert!(all_roots.contains(&obj1));
         assert!(!all_roots.contains(&obj2));
     }
@@ -5892,10 +5906,11 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         *shared.self_arc.write() = Some(Arc::downgrade(&shared));
         let tid = ThreadId(0);
-        shared.thread_registry.register(tid, "main", None);
+        shared.threads.thread_registry.register(tid, "main", None);
 
         let mut thread = JvmThread::new(tid, "main");
         shared
+            .threads
             .thread_registry
             .set_root_snapshot(tid, thread.root_snapshot.clone());
 
@@ -54107,7 +54122,7 @@ mod tests {
     fn virtual_scheduler_in_shared_vm() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         // Scheduler should be created with hardware parallelism count
-        assert!(shared.virtual_scheduler.carrier_count() > 0);
+        assert!(shared.threads.virtual_scheduler.carrier_count() > 0);
     }
 
     #[test]
@@ -61797,26 +61812,26 @@ mod tests {
         let t1 = std::thread::spawn(move || {
             let tid = ThreadId(100);
             for _ in 0..iterations {
-                s1.monitors.enter(lock_obj, tid);
+                s1.threads.monitors.enter(lock_obj, tid);
                 let val = match s1.heap.get_field(counter_obj, 0) {
                     Value::Int(v) => v,
                     _ => 0,
                 };
                 s1.heap.set_field(counter_obj, 0, Value::Int(val + 1));
-                s1.monitors.exit(lock_obj, tid).unwrap();
+                s1.threads.monitors.exit(lock_obj, tid).unwrap();
             }
         });
 
         let t2 = std::thread::spawn(move || {
             let tid = ThreadId(101);
             for _ in 0..iterations {
-                s2.monitors.enter(lock_obj, tid);
+                s2.threads.monitors.enter(lock_obj, tid);
                 let val = match s2.heap.get_field(counter_obj, 0) {
                     Value::Int(v) => v,
                     _ => 0,
                 };
                 s2.heap.set_field(counter_obj, 0, Value::Int(val + 1));
-                s2.monitors.exit(lock_obj, tid).unwrap();
+                s2.threads.monitors.exit(lock_obj, tid).unwrap();
             }
         });
 
@@ -61840,22 +61855,28 @@ mod tests {
     fn m6_thread_registry_tracks_concurrent_threads() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
 
-        let tid1 = shared.thread_registry.next_thread_id();
-        let tid2 = shared.thread_registry.next_thread_id();
+        let tid1 = shared.threads.thread_registry.next_thread_id();
+        let tid2 = shared.threads.thread_registry.next_thread_id();
         assert_ne!(tid1, tid2, "thread IDs should be unique");
 
-        shared.thread_registry.register(tid1, "worker-1", None);
-        shared.thread_registry.register(tid2, "worker-2", None);
+        shared
+            .threads
+            .thread_registry
+            .register(tid1, "worker-1", None);
+        shared
+            .threads
+            .thread_registry
+            .register(tid2, "worker-2", None);
 
-        assert!(shared.thread_registry.is_alive(tid1));
-        assert!(shared.thread_registry.is_alive(tid2));
+        assert!(shared.threads.thread_registry.is_alive(tid1));
+        assert!(shared.threads.thread_registry.is_alive(tid2));
 
-        shared.thread_registry.mark_dead(tid1);
-        assert!(!shared.thread_registry.is_alive(tid1));
-        assert!(shared.thread_registry.is_alive(tid2));
+        shared.threads.thread_registry.mark_dead(tid1);
+        assert!(!shared.threads.thread_registry.is_alive(tid1));
+        assert!(shared.threads.thread_registry.is_alive(tid2));
 
-        shared.thread_registry.mark_dead(tid2);
-        assert!(!shared.thread_registry.is_alive(tid2));
+        shared.threads.thread_registry.mark_dead(tid2);
+        assert!(!shared.threads.thread_registry.is_alive(tid2));
     }
 
     #[test]
@@ -61905,21 +61926,21 @@ mod tests {
         let tid = ThreadId(200);
 
         // Enter 3 times (reentrant)
-        shared.monitors.enter(lock_obj, tid);
-        shared.monitors.enter(lock_obj, tid);
-        shared.monitors.enter(lock_obj, tid);
+        shared.threads.monitors.enter(lock_obj, tid);
+        shared.threads.monitors.enter(lock_obj, tid);
+        shared.threads.monitors.enter(lock_obj, tid);
 
         // Exit 3 times
-        shared.monitors.exit(lock_obj, tid).unwrap();
-        shared.monitors.exit(lock_obj, tid).unwrap();
-        shared.monitors.exit(lock_obj, tid).unwrap();
+        shared.threads.monitors.exit(lock_obj, tid).unwrap();
+        shared.threads.monitors.exit(lock_obj, tid).unwrap();
+        shared.threads.monitors.exit(lock_obj, tid).unwrap();
 
         // Another thread should now be able to acquire
         let s2 = shared.clone();
         let t = std::thread::spawn(move || {
             let tid2 = ThreadId(201);
-            s2.monitors.enter(lock_obj, tid2);
-            s2.monitors.exit(lock_obj, tid2).unwrap();
+            s2.threads.monitors.enter(lock_obj, tid2);
+            s2.threads.monitors.exit(lock_obj, tid2).unwrap();
         });
         t.join().expect("reentrant test: second thread panicked");
     }
@@ -67168,6 +67189,7 @@ mod tests {
         let h1 = std::thread::spawn(move || {
             let mut thread = JvmThread::new(ThreadId(1), "sync-1");
             shared1
+                .threads
                 .thread_registry
                 .register(ThreadId(1), "sync-1", None);
             let cb = shared1
@@ -67184,6 +67206,7 @@ mod tests {
         let h2 = std::thread::spawn(move || {
             let mut thread = JvmThread::new(ThreadId(2), "sync-2");
             shared2
+                .threads
                 .thread_registry
                 .register(ThreadId(2), "sync-2", None);
             let cb = shared2
@@ -67275,6 +67298,7 @@ mod tests {
         let consumer = std::thread::spawn(move || {
             let mut thread = JvmThread::new(ThreadId(1), "consumer");
             shared1
+                .threads
                 .thread_registry
                 .register(ThreadId(1), "consumer", None);
             let cb = shared1
@@ -67291,6 +67315,7 @@ mod tests {
         let producer = std::thread::spawn(move || {
             let mut thread = JvmThread::new(ThreadId(2), "producer");
             shared2
+                .threads
                 .thread_registry
                 .register(ThreadId(2), "producer", None);
             let cb = shared2
@@ -67560,20 +67585,23 @@ mod tests {
 
         let shared = m6_shared_with_natives(&[]);
         let tid = ThreadId(99);
-        shared.thread_registry.register(tid, "joinable", None);
+        shared
+            .threads
+            .thread_registry
+            .register(tid, "joinable", None);
 
         let shared1 = shared.clone();
         let handle = std::thread::spawn(move || {
             // Simulate work
             std::thread::sleep(std::time::Duration::from_millis(30));
             RESULT.store(99, Ordering::Release);
-            shared1.thread_registry.mark_dead(tid);
+            shared1.threads.thread_registry.mark_dead(tid);
         });
 
-        shared.thread_registry.set_join_handle(tid, handle);
+        shared.threads.thread_registry.set_join_handle(tid, handle);
 
         // Join should block until the spawned thread completes
-        let joined = shared.thread_registry.join(tid);
+        let joined = shared.threads.thread_registry.join(tid);
         assert!(joined, "join should succeed");
         assert_eq!(
             RESULT.load(Ordering::Acquire),
@@ -67679,6 +67707,7 @@ mod tests {
         let producer = std::thread::spawn(move || {
             let mut thread = JvmThread::new(ThreadId(1), "producer");
             shared1
+                .threads
                 .thread_registry
                 .register(ThreadId(1), "producer", None);
             let cb = shared1
@@ -67703,6 +67732,7 @@ mod tests {
         let consumer = std::thread::spawn(move || {
             let mut thread = JvmThread::new(ThreadId(2), "consumer");
             shared2
+                .threads
                 .thread_registry
                 .register(ThreadId(2), "consumer", None);
             let cb = shared2
@@ -67780,8 +67810,11 @@ mod tests {
                 let s = shared.clone();
                 std::thread::spawn(move || {
                     let mut thread = JvmThread::new(ThreadId(i + 1), &format!("inc-{}", i));
-                    s.thread_registry
-                        .register(ThreadId(i + 1), &format!("inc-{}", i), None);
+                    s.threads.thread_registry.register(
+                        ThreadId(i + 1),
+                        &format!("inc-{}", i),
+                        None,
+                    );
                     let cb = s
                         .native_methods
                         .find("test/Inc", "increment", "(Ljava/lang/Object;I)V")
@@ -67997,9 +68030,18 @@ mod tests {
         let shared = p86_shared_with_builtins();
 
         // Register 3 threads as alive
-        shared.thread_registry.register(ThreadId(1), "t1", None);
-        shared.thread_registry.register(ThreadId(2), "t2", None);
-        shared.thread_registry.register(ThreadId(3), "t3", None);
+        shared
+            .threads
+            .thread_registry
+            .register(ThreadId(1), "t1", None);
+        shared
+            .threads
+            .thread_registry
+            .register(ThreadId(2), "t2", None);
+        shared
+            .threads
+            .thread_registry
+            .register(ThreadId(3), "t3", None);
 
         let tg = shared.heap.alloc_object(ClassId::new(0), 3);
         let mut thread = JvmThread::new(ThreadId(0), "main");
@@ -68043,7 +68085,7 @@ mod tests {
         );
 
         // Mark one dead
-        shared.thread_registry.mark_dead(ThreadId(2));
+        shared.threads.thread_registry.mark_dead(ThreadId(2));
         let mut ctx = NativeContextImpl {
             shared: &shared,
             thread: &mut thread,
@@ -68065,9 +68107,11 @@ mod tests {
         let t1_obj = shared.heap.alloc_object(ClassId::new(0), 2);
         let t2_obj = shared.heap.alloc_object(ClassId::new(0), 2);
         shared
+            .threads
             .thread_registry
             .register(ThreadId(1), "t1", Some(t1_obj));
         shared
+            .threads
             .thread_registry
             .register(ThreadId(2), "t2", Some(t2_obj));
 
@@ -68143,8 +68187,12 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let tid = ThreadId(1);
         let thread = JvmThread::new(tid, "test-interrupt");
-        shared.thread_registry.register(tid, "test-interrupt", None);
         shared
+            .threads
+            .thread_registry
+            .register(tid, "test-interrupt", None);
+        shared
+            .threads
             .thread_registry
             .set_interrupted_flag(tid, thread.interrupted.clone());
 
@@ -68154,7 +68202,7 @@ mod tests {
             .load(std::sync::atomic::Ordering::Acquire));
 
         // Set interrupt via registry (simulates Thread.interrupt() from another thread)
-        shared.thread_registry.set_interrupted(tid, true);
+        shared.threads.thread_registry.set_interrupted(tid, true);
         assert!(thread
             .interrupted
             .load(std::sync::atomic::Ordering::Acquire));
@@ -68175,10 +68223,14 @@ mod tests {
 
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let tid_b = ThreadId(2);
-        shared.thread_registry.register(tid_b, "thread-B", None);
+        shared
+            .threads
+            .thread_registry
+            .register(tid_b, "thread-B", None);
 
         let interrupted_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
         shared
+            .threads
             .thread_registry
             .set_interrupted_flag(tid_b, interrupted_flag.clone());
 
@@ -68198,7 +68250,7 @@ mod tests {
 
         // Thread A interrupts Thread B
         std::thread::sleep(std::time::Duration::from_millis(5));
-        shared1.thread_registry.set_interrupted(tid_b, true);
+        shared1.threads.thread_registry.set_interrupted(tid_b, true);
 
         let was_interrupted = thread_b.join().unwrap();
         assert!(
@@ -68216,8 +68268,9 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let tid = ThreadId(1);
         let mut thread = JvmThread::new(tid, "waiter");
-        shared.thread_registry.register(tid, "waiter", None);
+        shared.threads.thread_registry.register(tid, "waiter", None);
         shared
+            .threads
             .thread_registry
             .set_interrupted_flag(tid, thread.interrupted.clone());
 
@@ -68229,7 +68282,7 @@ mod tests {
         // Interrupt after a short delay
         let interrupter = std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(20));
-            shared1.thread_registry.set_interrupted(tid, true);
+            shared1.threads.thread_registry.set_interrupted(tid, true);
         });
 
         // Enter monitor and wait with timeout РІР‚вЂќ should return after interrupt
@@ -69011,8 +69064,11 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // Register a thread so alive_count > 0
-        shared.thread_registry.register(ThreadId(0), "main", None);
-        let real_count = shared.thread_registry.alive_count();
+        shared
+            .threads
+            .thread_registry
+            .register(ThreadId(0), "main", None);
+        let real_count = shared.threads.thread_registry.alive_count();
 
         let result = p90_call_native(
             &shared,

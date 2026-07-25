@@ -434,7 +434,7 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     //     system-streams scan rather than assume that can never coincide
     //     with a GC-safepoint poll.
     {
-        if let Some(g) = shared.main_thread_group.try_read() {
+        if let Some(g) = shared.threads.main_thread_group.try_read() {
             if let Some(tg_ref) = *g {
                 roots.push(tg_ref);
             }
@@ -503,7 +503,11 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     //      (a collected one resurfaces as the all-zero-header invokevirtual
     //      receiver). The matching remap is
     //      `ThreadRegistry::update_thread_objs_after_gc` (gc.rs step 21).
-    for obj_ref in shared.thread_registry.alive_thread_objects(usize::MAX) {
+    for obj_ref in shared
+        .threads
+        .thread_registry
+        .alive_thread_objects(usize::MAX)
+    {
         roots.push(obj_ref);
     }
 

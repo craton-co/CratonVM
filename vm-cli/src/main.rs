@@ -2194,10 +2194,16 @@ fn run() -> Result<()> {
     {
         let main_tlab = &vm.main_thread.tlab as *const _ as usize;
         let main_tid = vm.main_thread.thread_id;
-        vm.shared.thread_registry.set_tlab_addr(main_tid, main_tlab);
+        vm.shared
+            .threads
+            .thread_registry
+            .set_tlab_addr(main_tid, main_tlab);
         // xt-hardening (2026-07-03): publish main's OS thread id for the
         // takeover's counted-set excusal (workers publish at their start).
-        vm.shared.thread_registry.set_os_tid_current(main_tid);
+        vm.shared
+            .threads
+            .thread_registry
+            .set_os_tid_current(main_tid);
     }
 
     // T19.H1: optional watchdog that dumps interpreter frames and aborts when
@@ -2810,6 +2816,7 @@ fn run() -> Result<()> {
         // returned" forever.
         let pending = vm
             .shared
+            .threads
             .thread_registry
             .alive_non_daemon_thread_ids()
             .len();
@@ -2828,7 +2835,11 @@ fn run() -> Result<()> {
         // thread's roots and enter the full per-thread blocked-region protocol
         // for the whole wait, mirroring native socket/pipe waits.
         vm.begin_main_thread_blocking_region("vm-main:wait-non-daemon");
-        let joined = vm.shared.thread_registry.wait_for_non_daemon_threads(None);
+        let joined = vm
+            .shared
+            .threads
+            .thread_registry
+            .wait_for_non_daemon_threads(None);
         vm.end_main_thread_blocking_region();
         if joined > 0 {
             tracing::info!("cratonvm: joined {joined} non-daemon thread(s) after main() returned");

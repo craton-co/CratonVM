@@ -935,7 +935,7 @@ fn populate_class_metadata(shared: &crate::vm::SharedVm) {
 /// Populate DebugState with thread metadata from the thread registry.
 fn populate_thread_metadata(shared: &crate::vm::SharedVm) {
     let mut ds = shared.debug.debug_state.lock();
-    let names = shared.thread_registry.all_thread_names();
+    let names = shared.threads.thread_registry.all_thread_names();
     for (tid, name) in names {
         ds.thread_names.insert(tid.0 as u64, name);
     }

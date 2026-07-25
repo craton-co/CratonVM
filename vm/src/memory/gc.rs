@@ -412,12 +412,14 @@ pub fn update_all_roots(
     if std::env::var_os("CRATONVM_DBG_BUG03").is_some() {
         let epoch = shared.heap.collection_count();
         let main_old = shared
+            .threads
             .thread_registry
             .java_thread_obj(crate::threading::jvm_thread::ThreadId(0))
             .map(|o| o.as_ptr() as usize)
             .unwrap_or(0);
         let moves = main_old != 0 && pointer_map.contains_key(&main_old);
         let blocked = shared
+            .threads
             .thread_registry
             .dump_blocked_states()
             .into_iter()
@@ -726,7 +728,7 @@ pub fn update_all_roots(
     //     means that store is mid-flight and its value is about to be
     //     overwritten anyway.
     {
-        if let Some(mut tg) = shared.main_thread_group.try_write() {
+        if let Some(mut tg) = shared.threads.main_thread_group.try_write() {
             if let Some(ref mut obj_ref) = *tg {
                 let old_addr = obj_ref.as_ptr() as usize;
                 if let Some(&new_addr) = pointer_map.get(&old_addr) {
@@ -1039,6 +1041,7 @@ pub fn update_all_roots(
     //     place and composes this map into its pending wake-time frame
     //     fixup (applied in `check_post_block_gc`).
     shared
+        .threads
         .thread_registry
         .fold_pointer_map_into_blocked(pointer_map);
 
@@ -1048,6 +1051,7 @@ pub fn update_all_roots(
     //     back into bytecode and `LockSupport.unpark(Thread)` lookups by
     //     the relocated address silently miss (lost wakeups).
     shared
+        .threads
         .thread_registry
         .update_thread_objs_after_gc(pointer_map);
 

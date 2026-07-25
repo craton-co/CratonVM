@@ -3215,6 +3215,7 @@ mod tests {
         // cycle counter (to prove a collection actually fired under the churn).
         let baseline = cratonvm_vm::native::jni::process_vm()
             .expect("process_vm published")
+            .threads
             .thread_registry
             .alive_count();
         let gc_before = cratonvm_vm::native::jni::process_vm()
@@ -3358,14 +3359,14 @@ mod tests {
                 if let Some(vm) = cratonvm_vm::native::jni::process_vm() {
                     eprintln!(
                         "[soak/watchdog] alive={} stw_requested={} blocked={} pending(expected-arrived)={}",
-                        vm.thread_registry.alive_count(),
+                        vm.threads.thread_registry.alive_count(),
                         vm.gc_barrier
                             .stw_requested
                             .load(std::sync::atomic::Ordering::Acquire),
                         vm.gc_barrier.blocked_count(),
                         vm.gc_barrier.pending_count(),
                     );
-                    for (tid, blocked, snap) in vm.thread_registry.dump_blocked_states() {
+                    for (tid, blocked, snap) in vm.threads.thread_registry.dump_blocked_states() {
                         eprintln!(
                             "[soak/watchdog]   tid={tid} blocked={blocked} snapshot_len={snap}"
                         );
@@ -3403,6 +3404,7 @@ mod tests {
         // matched by a detach that deregistered its thread.
         let after = cratonvm_vm::native::jni::process_vm()
             .expect("process_vm still live")
+            .threads
             .thread_registry
             .alive_count();
         assert_eq!(

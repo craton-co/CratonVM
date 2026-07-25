@@ -41,18 +41,18 @@ fn t1_holdslock_returns_true_for_owned_monitor() {
     let tid = ThreadId(7);
 
     // Initially: nobody holds it.
-    assert!(!shared.monitors.holds(obj, tid));
+    assert!(!shared.threads.monitors.holds(obj, tid));
 
     // Acquire and verify true.
-    shared.monitors.enter(obj, tid);
-    assert!(shared.monitors.holds(obj, tid));
+    shared.threads.monitors.enter(obj, tid);
+    assert!(shared.threads.monitors.holds(obj, tid));
 
     // Other thread sees false.
-    assert!(!shared.monitors.holds(obj, ThreadId(8)));
+    assert!(!shared.threads.monitors.holds(obj, ThreadId(8)));
 
     // Release and verify false.
-    shared.monitors.exit(obj, tid).unwrap();
-    assert!(!shared.monitors.holds(obj, tid));
+    shared.threads.monitors.exit(obj, tid).unwrap();
+    assert!(!shared.threads.monitors.holds(obj, tid));
 }
 
 #[test]
@@ -61,16 +61,16 @@ fn t1_holdslock_handles_reentrancy() {
     let obj = shared.heap.alloc_object(ClassId::new(1), 0);
     let tid = ThreadId(11);
 
-    shared.monitors.enter(obj, tid);
-    shared.monitors.enter(obj, tid); // reentrant
-    assert!(shared.monitors.holds(obj, tid));
+    shared.threads.monitors.enter(obj, tid);
+    shared.threads.monitors.enter(obj, tid); // reentrant
+    assert!(shared.threads.monitors.holds(obj, tid));
 
-    shared.monitors.exit(obj, tid).unwrap();
+    shared.threads.monitors.exit(obj, tid).unwrap();
     // still holding inner level
-    assert!(shared.monitors.holds(obj, tid));
+    assert!(shared.threads.monitors.holds(obj, tid));
 
-    shared.monitors.exit(obj, tid).unwrap();
-    assert!(!shared.monitors.holds(obj, tid));
+    shared.threads.monitors.exit(obj, tid).unwrap();
+    assert!(!shared.threads.monitors.holds(obj, tid));
 }
 
 #[test]
@@ -78,7 +78,7 @@ fn t1_holdslock_returns_false_for_never_entered() {
     let shared = Arc::new(SharedVm::new(VmConfig::default()));
     let obj = shared.heap.alloc_object(ClassId::new(1), 0);
     // No one has ever called monitorenter on this object.
-    assert!(!shared.monitors.holds(obj, ThreadId(1)));
+    assert!(!shared.threads.monitors.holds(obj, ThreadId(1)));
 }
 
 // ===========================================================================
@@ -305,9 +305,9 @@ fn t1_vm_under_brief_load_does_not_deadlock() {
         handles.push(std::thread::spawn(move || {
             let obj = shared.heap.alloc_object(ClassId::new(1), 0);
             let t = ThreadId(tid);
-            shared.monitors.enter(obj, t);
-            assert!(shared.monitors.holds(obj, t));
-            shared.monitors.exit(obj, t).unwrap();
+            shared.threads.monitors.enter(obj, t);
+            assert!(shared.threads.monitors.holds(obj, t));
+            shared.threads.monitors.exit(obj, t).unwrap();
         }));
     }
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -907,17 +907,28 @@ fn t1_async_exception_round_trip_through_registry() {
 
     let shared = Arc::new(SharedVm::new(VmConfig::default()));
     let tid = ThreadId(42);
-    shared.thread_registry.register(tid, "target", None);
+    shared.threads.thread_registry.register(tid, "target", None);
 
     let throwable = shared.heap.alloc_object(ClassId::new(1), 2);
-    assert!(shared.thread_registry.post_async_exception(tid, throwable));
+    assert!(shared
+        .threads
+        .thread_registry
+        .post_async_exception(tid, throwable));
 
     // Target consumes the slot.
-    let taken = shared.thread_registry.take_async_exception(tid).unwrap();
+    let taken = shared
+        .threads
+        .thread_registry
+        .take_async_exception(tid)
+        .unwrap();
     assert_eq!(taken.as_ptr(), throwable.as_ptr());
 
     // Subsequent takes return None (slot is one-shot).
-    assert!(shared.thread_registry.take_async_exception(tid).is_none());
+    assert!(shared
+        .threads
+        .thread_registry
+        .take_async_exception(tid)
+        .is_none());
 
     // `check_pending_async_exception` drains the per-thread field.
     let mut jt = JvmThread::new(tid, "target");
@@ -1066,7 +1077,7 @@ fn t1_concurrent_mark_visits_every_reachable_object_once() {
         let stw = unsafe { cratonvm_gc::collector::StopTheWorldToken::new() };
         let _ = shared
             .heap
-            .collect_garbage(&stw, &mut roots, &shared.monitors);
+            .collect_garbage(&stw, &mut roots, &shared.threads.monitors);
     }
     // After GC, every root must still point into the live heap.
     let after: std::collections::HashSet<usize> =
@@ -1139,7 +1150,7 @@ fn t1_compare_and_swap_field_is_atomic_under_parallel_load() {
                         _ => 0,
                     };
                     let next = Value::Int(cur_v + 1);
-                    if shared.monitors.with_cas_lock(obj, || {
+                    if shared.threads.monitors.with_cas_lock(obj, || {
                         let c = shared.heap.get_field_volatile(obj, 0);
                         if let (Value::Int(a), Value::Int(b)) = (c, current) {
                             if a == b {

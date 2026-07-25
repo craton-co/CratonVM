@@ -215,7 +215,7 @@ impl<'a> HprofDumper<'a> {
         // Thread serial 1, stack trace serial 1, no frames.
         // Required so INSTANCE_DUMP / CLASS_DUMP can reference stack_trace_serial=0
         // (meaning "no trace"), or serial=1 for thread roots.
-        let thread_names = self.vm.thread_registry.all_thread_names();
+        let thread_names = self.vm.threads.thread_registry.all_thread_names();
         if thread_names.is_empty() {
             // Always emit at least one dummy trace
             w.write_all(&HprofWriter::write_stack_trace(1, 1, &[]))?;
@@ -282,10 +282,14 @@ impl<'a> HprofDumper<'a> {
 
     fn write_gc_roots(&self, seg: &mut SegmentBuilder) {
         // Thread object roots
-        let thread_names = self.vm.thread_registry.all_thread_names();
+        let thread_names = self.vm.threads.thread_registry.all_thread_names();
         for (i, _) in thread_names.iter().enumerate() {
             let thread_serial = (i + 1) as u32;
-            let objs = self.vm.thread_registry.alive_thread_objects(usize::MAX);
+            let objs = self
+                .vm
+                .threads
+                .thread_registry
+                .alive_thread_objects(usize::MAX);
             if let Some(obj) = objs.get(i) {
                 let obj_id = obj.as_ptr() as u64;
                 seg.push_u8(GC_ROOT_THREAD_OBJ);
@@ -308,7 +312,7 @@ impl<'a> HprofDumper<'a> {
         }
 
         // Thread stack frame roots (GC root snapshots)
-        let roots = self.vm.thread_registry.collect_all_root_snapshots();
+        let roots = self.vm.threads.thread_registry.collect_all_root_snapshots();
         for obj in &roots {
             seg.push_u8(GC_ROOT_JAVA_FRAME);
             seg.push_u64(obj.as_ptr() as u64);
