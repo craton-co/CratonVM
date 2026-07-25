@@ -31,7 +31,12 @@ use cratonvm_types::ClassId;
 
 /// Cached bytecode method info — everything needed to create a Frame without
 /// any lock acquisitions or string allocations.
-#[derive(Clone)]
+///
+/// `Clone` is implemented by hand rather than derived because
+/// [`Self::jit_probe_generation`] is an `AtomicU64` (not `Clone`). The manual
+/// impl snapshots its current value, which is semantically right: the field is
+/// a *memo*, and copying a memo forward is always sound (at worst the clone
+/// re-probes once).
 pub struct CachedBytecodeMethod {
     pub declaring_class_id: ClassId,
     pub class_name: Arc<str>,
@@ -79,6 +84,123 @@ pub struct CachedBytecodeMethod {
     /// used for `force_native_cache`. See docs/known-issues/tomcat-08-07/
     /// silent-hang-no-signature-cluster.md.
     pub native_callback_cache: std::sync::OnceLock<Option<cratonvm_native_api::NativeCallback>>,
+    /// T2.5 — memoized JIT invocation-counter key for this method, i.e. the
+    /// packed `(declaring_class_id << 32) | hash(method_name ++ descriptor)`
+    /// u64 that the interpreter uses to index
+    /// `ProfileStore::increment_invocation`.
+    ///
+    /// The interpreter's `Bytecode` / `VirtualBytecode` dispatch arms recomputed
+    /// this key on EVERY interpreted invocation of a not-yet-compiled method by
+    /// running a 31-multiplier byte loop over both the method name and the full
+    /// descriptor — pure per-call overhead on the hottest interpreter path, for
+    /// a value that is a pure function of three immutable fields of this entry.
+    /// Memoized here for exactly the same reason (and by exactly the same
+    /// argument) as [`Self::force_native_cache`] and
+    /// [`Self::native_callback_cache`] above. Read via [`Self::invoc_key`].
+    pub invoc_key: std::sync::OnceLock<u64>,
+    /// T2.2 — epoch memo for "this method has no published JIT body".
+    ///
+    /// Holds the value of `cratonvm_jit::jit_cache_generation()` as of the last
+    /// time an interpreter dispatch arm probed the shared JIT cache for this
+    /// method and found *nothing*. `0` means "never probed" (the live generation
+    /// starts at 1 and only ever increases, so `0` can never compare equal to
+    /// it).
+    ///
+    /// Why this exists: the interpreter's cached-invoke `Bytecode` arms had to
+    /// call `JitCache::get(class, method, descriptor, class_id)` on every single
+    /// interpreted call, purely to notice that a background compile had
+    /// published a body for this method. That lookup hashes all three strings
+    /// and then re-compares all three with full string equality — the exact
+    /// re-resolution the per-call-site inline cache exists to avoid. Because
+    /// *every* JIT-cache publication and invalidation bumps the global
+    /// generation, comparing this snapshot against it is an equivalent test:
+    /// equal ⇒ the cache content has not changed since we last looked and found
+    /// nothing, so looking again cannot find anything. Steady state therefore
+    /// costs two integer loads and a compare instead of three string hashes and
+    /// three string comparisons.
+    ///
+    /// Correctness rests on the generation being bumped by every writer of the
+    /// JIT cache; see `JitCache::put` / `put_osr` / `invalidate_matching` /
+    /// `clear_all` in `jit/src/lib.rs`, which are the only mutators.
+    pub jit_probe_generation: std::sync::atomic::AtomicU64,
+}
+
+impl Clone for CachedBytecodeMethod {
+    fn clone(&self) -> Self {
+        Self {
+            declaring_class_id: self.declaring_class_id,
+            class_name: Arc::clone(&self.class_name),
+            method_name: Arc::clone(&self.method_name),
+            method_descriptor: Arc::clone(&self.method_descriptor),
+            source_file: self.source_file.clone(),
+            code: Arc::clone(&self.code),
+            exception_table: Arc::clone(&self.exception_table),
+            max_stack: self.max_stack,
+            max_locals: self.max_locals,
+            num_params: self.num_params,
+            is_synchronized: self.is_synchronized,
+            is_static: self.is_static,
+            force_native_cache: self.force_native_cache.clone(),
+            native_callback_cache: self.native_callback_cache.clone(),
+            invoc_key: self.invoc_key.clone(),
+            jit_probe_generation: std::sync::atomic::AtomicU64::new(
+                self.jit_probe_generation
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ),
+        }
+    }
+}
+
+impl CachedBytecodeMethod {
+    /// The memoized JIT invocation-counter key for this method — see
+    /// [`Self::invoc_key`]. Computed on first use, then read straight out of the
+    /// `OnceLock`.
+    ///
+    /// The hash must stay bit-identical to the two open-coded loops this
+    /// replaced (`vm/src/runtime/interpreter.rs`, the invokestatic `Bytecode`
+    /// arm and the instance tier-up path), because both keyed the *same*
+    /// `ProfileStore` invocation counters: a different key would silently reset
+    /// every method's warmup count.
+    #[inline]
+    pub fn invoc_key(&self) -> u64 {
+        *self.invoc_key.get_or_init(|| {
+            let mut h = 0u32;
+            for &b in self.method_name.as_bytes() {
+                h = h.wrapping_mul(31).wrapping_add(b as u32); // Widening: hash computation
+            }
+            for &b in self.method_descriptor.as_bytes() {
+                h = h.wrapping_mul(31).wrapping_add(b as u32); // Widening: hash computation
+            }
+            // Widening: class ID to u64 for hash key
+            ((self.declaring_class_id.as_u32() as u64) << 32) | (h as u64)
+        })
+    }
+
+    /// T2.2 — has this method already been probed against the shared JIT cache
+    /// at generation `current_generation` and found to have no compiled body?
+    ///
+    /// `current_generation` must come from `cratonvm_jit::jit_cache_generation()`
+    /// (an `Acquire` load). A `true` answer means the caller may skip the
+    /// string-keyed `JitCache::get` entirely.
+    #[inline]
+    pub fn jit_probe_is_current(&self, current_generation: u64) -> bool {
+        self.jit_probe_generation
+            .load(std::sync::atomic::Ordering::Relaxed)
+            == current_generation
+    }
+
+    /// T2.2 — record that a `JitCache::get` for this method returned `None`
+    /// while the cache was at `generation`.
+    ///
+    /// `Relaxed` is sufficient: the value is only ever used to skip a lookup
+    /// that would have returned `None` anyway, and the *global* generation read
+    /// that guards it is an `Acquire` load, so a reader that observes a newer
+    /// generation also observes the publication that caused it.
+    #[inline]
+    pub fn record_jit_probe_miss(&self, generation: u64) {
+        self.jit_probe_generation
+            .store(generation, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// JEP 358 (helpful NPE) — operation-kind codes carried out-of-band from a
@@ -733,7 +855,54 @@ mod tests {
             is_static: false,
             force_native_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
+            invoc_key: std::sync::OnceLock::new(),
+            jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// T2.2 — the memo primitive, tested against literal generation values so
+    /// it is completely independent of the process-global counter (and therefore
+    /// race-free under a parallel `cargo test`). The end-to-end protocol against
+    /// a real `JitCache` is tested in the `cratonvm-jit` crate.
+    #[test]
+    fn jit_probe_generation_memo_reports_current_only_for_the_recorded_value() {
+        let cached = make_cached_method();
+        // A fresh entry has never probed: 0 can never equal a live generation
+        // (`JIT_CACHE_GENERATION` starts at 1 and only increases).
+        assert!(!cached.jit_probe_is_current(1));
+        assert!(!cached.jit_probe_is_current(u64::MAX));
+
+        cached.record_jit_probe_miss(17);
+        // Fast path engages only for the exact generation the probe ran at.
+        assert!(cached.jit_probe_is_current(17));
+        assert!(!cached.jit_probe_is_current(18));
+        assert!(!cached.jit_probe_is_current(16));
+
+        // A later probe at a newer generation replaces the memo.
+        cached.record_jit_probe_miss(18);
+        assert!(cached.jit_probe_is_current(18));
+        assert!(!cached.jit_probe_is_current(17));
+    }
+
+    /// The manual `Clone` impl must carry the memos forward, not silently drop
+    /// them (a dropped memo is only a perf regression, but a *wrong* one would
+    /// be a correctness bug, so pin the exact values).
+    #[test]
+    fn clone_preserves_the_memo_fields() {
+        let cached = make_cached_method();
+        cached.record_jit_probe_miss(99);
+        let key = cached.invoc_key();
+        let _ = cached.force_native_cache.set(true);
+
+        let copy = cached.clone();
+        assert!(copy.jit_probe_is_current(99));
+        assert_eq!(copy.invoc_key(), key);
+        assert_eq!(copy.force_native_cache.get(), Some(&true));
+
+        // The clone's atomic is independent of the original's.
+        copy.record_jit_probe_miss(100);
+        assert!(cached.jit_probe_is_current(99));
+        assert!(copy.jit_probe_is_current(100));
     }
 
     fn make_helpers() -> JitRuntimeHelpers {
