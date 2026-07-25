@@ -34,6 +34,7 @@ use crate::heap::{
     array_data_size, ArrayElementType, ObjectHeader, ObjectKind, GC_FLAG_MARKED, HEADER_SIZE,
     REF_ELEMENT_SIZE, SLOT_SIZE,
 };
+use cratonvm_types::narrow_oop::{read_ref_slot, ref_element_size, ref_field_size};
 use cratonvm_types::{ObjectRef, Value};
 
 /// Cached `CRATONVM_DBG_SEEDHUNT` gate (bc math-ec `0x4`). When on,
@@ -787,8 +788,8 @@ impl OldGen {
         if kind == ObjectKind::Array {
             if element_type == ArrayElementType::Reference {
                 for i in 0..array_length as usize {
-                    let slot = unsafe { obj_ptr.add(HEADER_SIZE + i * cratonvm_types::narrow_oop::ref_element_size()) };
-                    let raw: u64 = unsafe { cratonvm_types::narrow_oop::read_ref_slot(slot) };
+                    let slot = unsafe { obj_ptr.add(HEADER_SIZE + i * ref_element_size()) };
+                    let raw: u64 = unsafe { read_ref_slot(slot) };
                     if raw != 0 {
                         let ref_ptr = raw as usize;
                         if ref_ptr >= data_start && ref_ptr < data_end {
@@ -801,11 +802,11 @@ impl OldGen {
             // Compact object: 8-byte reference slots at the oop-map offsets.
             for &off in &layout.ref_offsets {
                 let off = off as usize;
-                if off + cratonvm_types::narrow_oop::ref_field_size() > body {
+                if off + ref_field_size() > body {
                     break;
                 }
                 let slot = unsafe { obj_ptr.add(HEADER_SIZE + off) };
-                let raw: u64 = unsafe { cratonvm_types::narrow_oop::read_ref_slot(slot) };
+                let raw: u64 = unsafe { read_ref_slot(slot) };
                 if raw != 0 {
                     let ref_ptr = raw as usize;
                     if ref_ptr >= data_start && ref_ptr < data_end {

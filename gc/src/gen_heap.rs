@@ -53,6 +53,7 @@ use cratonvm_types::GC_FLAG_COMPACT;
 use cratonvm_types::{
     ClassId, CompactLayout, FieldStorageKind, ObjectRef, Value,
 };
+use cratonvm_types::narrow_oop::{read_ref_slot, ref_element_size, ref_field_size, write_ref_slot};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -4239,10 +4240,10 @@ impl GenerationalHeap {
                 let slot_ptr = unsafe {
                     old_obj
                         .as_ptr()
-                        .add(HEADER_SIZE + slot_idx * cratonvm_types::narrow_oop::ref_element_size())
+                        .add(HEADER_SIZE + slot_idx * ref_element_size())
                 };
                 // SAFETY: `slot_ptr` points to a valid 8-byte ref element within the array.
-                let raw: u64 = unsafe { cratonvm_types::narrow_oop::read_ref_slot(slot_ptr) };
+                let raw: u64 = unsafe { read_ref_slot(slot_ptr) };
                 if raw != 0 {
                     let ref_ptr = raw as usize as *mut u8;
                     if young_from.contains(ref_ptr) {
@@ -4258,7 +4259,7 @@ impl GenerationalHeap {
                             force_promote_all,
                         );
                         // SAFETY: Writing the forwarded pointer back to the same valid slot.
-                        unsafe { cratonvm_types::narrow_oop::write_ref_slot(slot_ptr, new_ptr as u64) };
+                        unsafe { write_ref_slot(slot_ptr, new_ptr as u64) };
                         // Persistent old→young edge: re-remember if the referent
                         // stayed young (not promoted), so it survives clear_all().
                         if !old_gen.contains(new_ptr) {
@@ -4273,7 +4274,7 @@ impl GenerationalHeap {
                 // SAFETY: `slot_idx` (byte offset) was recorded by dirty-card
                 // scanning within this object's body; the 8-byte read is in-bounds.
                 let slot_ptr = unsafe { old_obj.as_ptr().add(HEADER_SIZE + slot_idx) };
-                let raw: u64 = unsafe { cratonvm_types::narrow_oop::read_ref_slot(slot_ptr) };
+                let raw: u64 = unsafe { read_ref_slot(slot_ptr) };
                 if raw != 0 {
                     let ref_ptr = raw as usize as *mut u8;
                     if young_from.contains(ref_ptr) {
@@ -4289,7 +4290,7 @@ impl GenerationalHeap {
                             force_promote_all,
                         );
                         // SAFETY: writing the forwarded pointer back to the slot.
-                        unsafe { cratonvm_types::narrow_oop::write_ref_slot(slot_ptr, new_ptr as u64) };
+                        unsafe { write_ref_slot(slot_ptr, new_ptr as u64) };
                         if !old_gen.contains(new_ptr) {
                             deferred_dirty_cards.push(old_obj.as_ptr() as usize);
                         }
@@ -5602,10 +5603,10 @@ impl GenerationalHeap {
                 let slot_ptr = unsafe {
                     old_obj
                         .as_ptr()
-                        .add(HEADER_SIZE + slot_idx * cratonvm_types::narrow_oop::ref_element_size())
+                        .add(HEADER_SIZE + slot_idx * ref_element_size())
                 };
                 // SAFETY: `slot_ptr` is a valid 8-byte ref element.
-                let raw: u64 = unsafe { cratonvm_types::narrow_oop::read_ref_slot(slot_ptr) };
+                let raw: u64 = unsafe { read_ref_slot(slot_ptr) };
                 if raw != 0 {
                     mark_young_precise(raw as usize as *mut u8, &mut worklist, &mut side_marks);
                 }
@@ -5614,7 +5615,7 @@ impl GenerationalHeap {
                 // reference slot (as recorded by scan_dirty_cards).
                 // SAFETY: byte offset within this object's body (from card scan).
                 let slot_ptr = unsafe { old_obj.as_ptr().add(HEADER_SIZE + slot_idx) };
-                let raw: u64 = unsafe { cratonvm_types::narrow_oop::read_ref_slot(slot_ptr) };
+                let raw: u64 = unsafe { read_ref_slot(slot_ptr) };
                 if raw != 0 {
                     mark_young_precise(raw as usize as *mut u8, &mut worklist, &mut side_marks);
                 }
@@ -9048,12 +9049,12 @@ impl GenerationalHeap {
             if header.kind == ObjectKind::Array {
                 if header.element_type == ArrayElementType::Reference {
                     // Cap element count at what the array's data region holds.
-                    let max_elems = body_bytes / cratonvm_types::narrow_oop::ref_element_size();
+                    let max_elems = body_bytes / ref_element_size();
                     let elems = (header.array_length() as usize).min(max_elems);
                     for i in 0..elems {
                         // SAFETY: `i` < capped element count; offset within array data region.
-                        let s_ptr = unsafe { obj_ptr.add(HEADER_SIZE + i * cratonvm_types::narrow_oop::ref_element_size()) };
-                        let raw: u64 = unsafe { cratonvm_types::narrow_oop::read_ref_slot(s_ptr) };
+                        let s_ptr = unsafe { obj_ptr.add(HEADER_SIZE + i * ref_element_size()) };
+                        let raw: u64 = unsafe { read_ref_slot(s_ptr) };
                         if raw != 0 {
                             let ref_ptr = raw as usize as *mut u8;
                             if young_from.contains(ref_ptr) {
@@ -9071,12 +9072,12 @@ impl GenerationalHeap {
                 let body = compact_body.min(body_bytes);
                 for &off in &layout.ref_offsets {
                     let off = off as usize;
-                    if off + cratonvm_types::narrow_oop::ref_field_size() > body {
+                    if off + ref_field_size() > body {
                         break;
                     }
                     // SAFETY: `off` is within the object's body (capped above).
                     let s_ptr = unsafe { obj_ptr.add(HEADER_SIZE + off) };
-                    let raw: u64 = unsafe { cratonvm_types::narrow_oop::read_ref_slot(s_ptr) };
+                    let raw: u64 = unsafe { read_ref_slot(s_ptr) };
                     if raw != 0 {
                         let ref_ptr = raw as usize as *mut u8;
                         if young_from.contains(ref_ptr) {
@@ -9678,8 +9679,8 @@ fn seedhunt_scan_obj(
     } else if h.kind == ObjectKind::Array && h.element_type == ArrayElementType::Reference {
         for i in 0..h.array_length() as usize {
             // SAFETY: `i < array_length`; offset stays within the array data.
-            let sp = unsafe { optr.add(HEADER_SIZE + i * cratonvm_types::narrow_oop::ref_element_size()) };
-            let raw = unsafe { cratonvm_types::narrow_oop::read_ref_slot(sp) } as usize;
+            let sp = unsafe { optr.add(HEADER_SIZE + i * ref_element_size()) };
+            let raw = unsafe { read_ref_slot(sp) } as usize;
             if raw != 0 && raw < 0x1000 {
                 count += 1;
                 if *printed < cap {
@@ -10050,8 +10051,8 @@ pub(crate) unsafe fn for_each_ref_slot(
     if header.kind == ObjectKind::Array {
         if header.element_type == ArrayElementType::Reference {
             for i in 0..header.array_length() as usize {
-                let s = obj_ptr.add(HEADER_SIZE + i * cratonvm_types::narrow_oop::ref_element_size());
-                let raw: u64 = cratonvm_types::narrow_oop::read_ref_slot(s);
+                let s = obj_ptr.add(HEADER_SIZE + i * ref_element_size());
+                let raw: u64 = read_ref_slot(s);
                 if raw != 0 {
                     f(raw as usize as *mut u8, i);
                 }
@@ -10060,11 +10061,11 @@ pub(crate) unsafe fn for_each_ref_slot(
     } else if let Some((layout, body)) = crate::heap::compact_oop_scan(header) {
         for &off in &layout.ref_offsets {
             let off = off as usize;
-            if off + cratonvm_types::narrow_oop::ref_field_size() > body {
+            if off + ref_field_size() > body {
                 break;
             }
             let s = obj_ptr.add(HEADER_SIZE + off);
-            let raw: u64 = cratonvm_types::narrow_oop::read_ref_slot(s);
+            let raw: u64 = read_ref_slot(s);
             if raw != 0 {
                 f(raw as usize as *mut u8, off);
             }
@@ -10100,8 +10101,8 @@ pub(crate) unsafe fn forward_ref_slots(
     if header.kind == ObjectKind::Array {
         if header.element_type == ArrayElementType::Reference {
             for i in 0..header.array_length() as usize {
-                let s = obj_ptr.add(HEADER_SIZE + i * cratonvm_types::narrow_oop::ref_element_size());
-                let raw: u64 = cratonvm_types::narrow_oop::read_ref_slot(s);
+                let s = obj_ptr.add(HEADER_SIZE + i * ref_element_size());
+                let raw: u64 = read_ref_slot(s);
                 if raw != 0 {
                     if let Some(n) = forward(raw as usize as *mut u8) {
                         // gcstress face-1 hunt (no-op unless gated) — a RAW
@@ -10114,7 +10115,7 @@ pub(crate) unsafe fn forward_ref_slots(
                             "forward_ref_slots-refarray",
                             &(n as usize),
                         );
-                        cratonvm_types::narrow_oop::write_ref_slot(s, n as u64);
+                        write_ref_slot(s, n as u64);
                     }
                 }
             }
@@ -10122,11 +10123,11 @@ pub(crate) unsafe fn forward_ref_slots(
     } else if let Some((layout, body)) = crate::heap::compact_oop_scan(header) {
         for &off in &layout.ref_offsets {
             let off = off as usize;
-            if off + cratonvm_types::narrow_oop::ref_field_size() > body {
+            if off + ref_field_size() > body {
                 break;
             }
             let s = obj_ptr.add(HEADER_SIZE + off);
-            let raw: u64 = cratonvm_types::narrow_oop::read_ref_slot(s);
+            let raw: u64 = read_ref_slot(s);
             if raw != 0 {
                 if let Some(n) = forward(raw as usize as *mut u8) {
                     // gcstress face-1 hunt (no-op unless gated).
@@ -10136,7 +10137,7 @@ pub(crate) unsafe fn forward_ref_slots(
                         "forward_ref_slots-compact",
                         &(n as usize),
                     );
-                    cratonvm_types::narrow_oop::write_ref_slot(s, n as u64);
+                    write_ref_slot(s, n as u64);
                 }
             }
         }

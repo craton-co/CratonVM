@@ -32,6 +32,7 @@ use crate::heap::{
 use crate::mark_bitmap::MarkBitmap;
 use crate::old_gen::OldGen;
 use crate::satb::SatbQueue;
+use cratonvm_types::narrow_oop::{read_ref_slot, ref_element_size, ref_field_size};
 use cratonvm_types::Value;
 
 // ---------------------------------------------------------------------------
@@ -798,9 +799,9 @@ impl ConcurrentMarker {
                 // Reference array: compact 8-byte pointer per element.
                 for i in 0..header.array_length() as usize {
                     // SAFETY: i < array_length, offset is within the allocated array object.
-                    let slot_ptr = unsafe { obj_ptr.add(HEADER_SIZE + i * cratonvm_types::narrow_oop::ref_element_size()) };
+                    let slot_ptr = unsafe { obj_ptr.add(HEADER_SIZE + i * ref_element_size()) };
                     // SAFETY: slot_ptr points to a valid 8-byte reference element in the array.
-                    let raw: u64 = unsafe { cratonvm_types::narrow_oop::read_ref_slot(slot_ptr) };
+                    let raw: u64 = unsafe { read_ref_slot(slot_ptr) };
                     if raw != 0 {
                         let ref_ptr = raw as usize as *mut u8;
                         if markable_old_object(ref_ptr, object_starts)
@@ -819,12 +820,12 @@ impl ConcurrentMarker {
             // needed even though this runs concurrently with mutators.
             for &off in &layout.ref_offsets {
                 let off = off as usize;
-                if off + cratonvm_types::narrow_oop::ref_field_size() > body {
+                if off + ref_field_size() > body {
                     break;
                 }
                 // SAFETY: `off` is within the object's body (capped above).
                 let slot_ptr = unsafe { obj_ptr.add(HEADER_SIZE + off) };
-                let raw: u64 = unsafe { cratonvm_types::narrow_oop::read_ref_slot(slot_ptr) };
+                let raw: u64 = unsafe { read_ref_slot(slot_ptr) };
                 if raw != 0 {
                     let ref_ptr = raw as usize as *mut u8;
                     if markable_old_object(ref_ptr, object_starts)

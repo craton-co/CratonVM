@@ -41,6 +41,7 @@ use crate::numa;
 use cratonvm_types::{ClassId, ObjectRef, Value};
 
 // Re-export heap types from the shared types crate.
+use cratonvm_types::narrow_oop::{read_ref_slot, ref_element_size, write_ref_slot};
 pub use cratonvm_types::{
     array_data_size, array_data_size_checked, array_element_type_from_tag, element_byte_size,
     object_kind_from_tag, ArrayElementType, ObjectHeader, ObjectKind, ARRAY_ELEMENT_TYPE_OFFSET,
@@ -84,9 +85,7 @@ pub(crate) fn compact_oop_scan(header: &ObjectHeader) -> Option<(Arc<CompactLayo
         {
             let cache = c.borrow();
             if let Some((cached_cid, cached_fields, cached_gen, arc)) = &*cache {
-                if *cached_cid == cid
-                    && *cached_fields == header.num_slots()
-                    && *cached_gen == gen
+                if *cached_cid == cid && *cached_fields == header.num_slots() && *cached_gen == gen
                 {
                     return Some(arc.clone());
                 }
@@ -313,8 +312,7 @@ impl Heap {
     /// # Panics
     /// Panics if `num_fields * SLOT_SIZE` overflows.
     pub fn alloc_object(&self, class_id: ClassId, num_fields: usize) -> ObjectRef {
-        let compact_body =
-            cratonvm_types::compact_object_body_size(class_id.as_u32(), num_fields);
+        let compact_body = cratonvm_types::compact_object_body_size(class_id.as_u32(), num_fields);
         let fields_size = compact_body.unwrap_or_else(|| {
             num_fields
                 .checked_mul(SLOT_SIZE)
@@ -422,10 +420,8 @@ impl Heap {
 
     /// Like `alloc_object`, but returns `None` instead of panicking on overflow.
     pub fn alloc_object_checked(&self, class_id: ClassId, num_fields: usize) -> Option<ObjectRef> {
-        let compact_body =
-            cratonvm_types::compact_object_body_size(class_id.as_u32(), num_fields);
-        let fields_size = compact_body
-            .or_else(|| num_fields.checked_mul(SLOT_SIZE))?;
+        let compact_body = cratonvm_types::compact_object_body_size(class_id.as_u32(), num_fields);
+        let fields_size = compact_body.or_else(|| num_fields.checked_mul(SLOT_SIZE))?;
         let total_size = HEADER_SIZE.checked_add(fields_size)?;
         // See `alloc_zeroed` for the NUMA hint rationale.
         let _node = self.refresh_numa_hint();
@@ -1611,9 +1607,9 @@ pub unsafe fn read_prim_element(base: *mut u8, index: usize, et: ArrayElementTyp
         ArrayElementType::Short => Value::Int(elem_ptr!(base, index, 2, i16) as i32),
         ArrayElementType::Reference => {
             let offset = index
-                .checked_mul(cratonvm_types::narrow_oop::ref_element_size())
+                .checked_mul(ref_element_size())
                 .expect("array ref element offset overflow");
-            let raw: u64 = cratonvm_types::narrow_oop::read_ref_slot(base.add(offset));
+            let raw: u64 = read_ref_slot(base.add(offset));
             // Defense-in-depth reference-slot decode. Mirrors the VTAG_OBJECT
             // degrade in `cratonvm_types::decode_value` (operand/local SoA path)
             // and `CompactValue::to_value`'s SUB_OBJECT plausibility gate, which
@@ -1780,10 +1776,7 @@ pub unsafe fn write_prim_element(base: *mut u8, index: usize, et: ArrayElementTy
                 Value::Object(None) => 0,
                 _ => 0,
             };
-            cratonvm_types::narrow_oop::write_ref_slot(
-                base.add(index * cratonvm_types::narrow_oop::ref_element_size()),
-                raw,
-            );
+            write_ref_slot(base.add(index * ref_element_size()), raw);
         }
     }
 }

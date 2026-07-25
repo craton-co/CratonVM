@@ -389,7 +389,10 @@ mod tests {
         assert!(is_encodable(0));
         assert!(!is_encodable(base), "base itself must be reserved for null");
         assert!(is_encodable(base + 8));
-        assert!(!is_encodable(base + 4), "misaligned address is not encodable");
+        assert!(
+            !is_encodable(base + 4),
+            "misaligned address is not encodable"
+        );
         assert!(!is_encodable(base - 8));
         assert!(!is_encodable(narrow_limit()));
         disable_for_test();

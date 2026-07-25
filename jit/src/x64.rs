@@ -58,6 +58,7 @@ use cratonvm_jit_api::JitRuntimeHelpers;
 // truth in jit-api (the VM crate maps these same codes to HotSpot strings).
 use cratonvm_jit_api::npe_action;
 #[allow(unused_imports)]
+use cratonvm_types::narrow_oop::{narrow_base, narrow_oops_enabled};
 use cratonvm_types::{
     ARRAY_LENGTH_OFFSET, FIELD_CELL_PAYLOAD32_OFFSET, FIELD_CELL_PAYLOAD64_OFFSET,
     FIELD_CELL_TAG_OFFSET, HEADER_SIZE, SLOT_SIZE,
@@ -2116,7 +2117,7 @@ pub fn precise_jit_maps_enabled() -> bool {
 /// which go through the width-aware `read_compact_field` / `write_compact_field`.
 #[inline]
 pub fn narrow_oops_block_inline_fields() -> bool {
-    cratonvm_types::narrow_oop::narrow_oops_enabled()
+    narrow_oops_enabled()
 }
 
 pub fn inline_putfield_enabled() -> bool {
@@ -17104,7 +17105,7 @@ impl Compiler {
     ///
     /// Emits: MOV RAX, QWORD [RAX + RCX*8 + HEADER_SIZE]
     fn emit_ref_aload_regs(&mut self) {
-        if cratonvm_types::narrow_oop::narrow_oops_enabled() {
+        if narrow_oops_enabled() {
             self.emit_narrow_ref_aload_regs();
             return;
         }
@@ -17134,16 +17135,11 @@ impl Compiler {
         self.buf.emit_byte(0x44); // ModRM: mod=01(disp8), reg=000(EAX), r/m=100(SIB)
         self.buf.emit_byte(0x88); // SIB: scale=10(*4), index=001(RCX), base=000(RAX)
         self.buf.emit_byte(HEADER_SIZE as u8); // Cast: x86-64 immediate encoding
-        // SHL RAX, 3
-        self.buf.emit(&[0x48, 0xC1, 0xE0, 0x03]);
-        // JZ +13 → skip the rebase, leaving RAX = 0 for a null element.
-        self.buf.emit(&[0x74, 0x0D]);
-        // MOV R11, imm64(base)
-        self.buf.emit(&[0x49, 0xBB]);
-        self.buf
-            .emit(&cratonvm_types::narrow_oop::narrow_base().to_le_bytes());
-        // ADD RAX, R11
-        self.buf.emit(&[0x4C, 0x01, 0xD8]);
+        self.buf.emit(&[0x48, 0xC1, 0xE0, 0x03]); // SHL RAX, 3
+        self.buf.emit(&[0x74, 0x0D]); // JZ +13 (past the rebase: null stays 0)
+        self.buf.emit(&[0x49, 0xBB]); // MOV R11, imm64
+        self.buf.emit(&narrow_base().to_le_bytes()); // ... = heap base
+        self.buf.emit(&[0x4C, 0x01, 0xD8]); // ADD RAX, R11
     }
 
     /// Inline ref element store to Object[] array (compact 8-byte pointers).
@@ -17154,7 +17150,7 @@ impl Compiler {
     /// Wired into the `aastore` opcode arm; the GC write-barrier is emitted
     /// separately as a call to `self.helpers.write_barrier` after the store.
     fn emit_ref_astore_regs(&mut self) {
-        if cratonvm_types::narrow_oop::narrow_oops_enabled() {
+        if narrow_oops_enabled() {
             self.emit_narrow_ref_astore_regs();
             return;
         }
@@ -17175,25 +17171,14 @@ impl Compiler {
     /// barrier after this store — so the subtraction is done as
     /// `R11 = (-base) + RDX` rather than in place.
     fn emit_narrow_ref_astore_regs(&mut self) {
-        // XOR R11, R11 — the null encoding, and the value stored if we branch.
-        self.buf.emit(&[0x4D, 0x31, 0xDB]);
-        // TEST RDX, RDX
-        self.buf.emit(&[0x48, 0x85, 0xD2]);
-        // JZ +17 → store the zero already in R11.
-        self.buf.emit(&[0x74, 0x11]);
-        // MOV R11, imm64(-base)
-        self.buf.emit(&[0x49, 0xBB]);
-        self.buf.emit(
-            &cratonvm_types::narrow_oop::narrow_base()
-                .wrapping_neg()
-                .to_le_bytes(),
-        );
-        // ADD R11, RDX  → R11 = addr - base
-        self.buf.emit(&[0x49, 0x01, 0xD3]);
-        // SHR R11, 3
-        self.buf.emit(&[0x49, 0xC1, 0xEB, 0x03]);
-        // MOV DWORD [RAX + RCX*4 + HEADER_SIZE], R11D
-        self.buf.emit_byte(0x44); // REX.R (R11 as reg field)
+        self.buf.emit(&[0x4D, 0x31, 0xDB]); // XOR R11, R11 (the null encoding)
+        self.buf.emit(&[0x48, 0x85, 0xD2]); // TEST RDX, RDX
+        self.buf.emit(&[0x74, 0x11]); // JZ +17 (store the zero already in R11)
+        self.buf.emit(&[0x49, 0xBB]); // MOV R11, imm64
+        self.buf.emit(&narrow_base().wrapping_neg().to_le_bytes()); // ... = -base
+        self.buf.emit(&[0x49, 0x01, 0xD3]); // ADD R11, RDX -> addr - base
+        self.buf.emit(&[0x49, 0xC1, 0xEB, 0x03]); // SHR R11, 3
+        self.buf.emit_byte(0x44); // MOV DWORD [..], R11D: REX.R (R11 as reg field)
         self.buf.emit_byte(0x89); // MOV r/m32, r32
         self.buf.emit_byte(0x5C); // ModRM: mod=01(disp8), reg=011(R11), r/m=100(SIB)
         self.buf.emit_byte(0x88); // SIB: scale=10(*4), index=001(RCX), base=000(RAX)

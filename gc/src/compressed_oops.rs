@@ -800,10 +800,10 @@ pub fn enable_for_live_heap() -> Result<(u64, u8), String> {
     let mut lo = u64::MAX;
     let mut hi = 0u64;
     for i in 0..3 {
-        let base = crate::gen_heap::JIT_REGION_BOUNDS.words[i * 2].load(AtomicOrdering::Acquire)
+        let base =
+            crate::gen_heap::JIT_REGION_BOUNDS.words[i * 2].load(AtomicOrdering::Acquire) as u64;
+        let end = crate::gen_heap::JIT_REGION_BOUNDS.words[i * 2 + 1].load(AtomicOrdering::Acquire)
             as u64;
-        let end = crate::gen_heap::JIT_REGION_BOUNDS.words[i * 2 + 1]
-            .load(AtomicOrdering::Acquire) as u64;
         if base == 0 || end <= base {
             continue;
         }
