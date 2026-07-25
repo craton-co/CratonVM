@@ -96,24 +96,26 @@ fn debug_assert_aligned(ptr: *mut u8) {
 // of the single-threaded scheduler"): single-OS-thread invariant tripwire.
 // ---------------------------------------------------------------------------
 //
-// The `unsafe impl Send/Sync for ObjectRef` below is justified *today* only
-// because every Java thread runs on a single OS thread under cooperative
-// scheduling (see soundness argument point (4)). That is a runtime property
-// the type system cannot encode. This tripwire turns it into a checkable,
-// fail-loud invariant: it records the first OS thread to construct an
-// `ObjectRef` and aborts if a *different* OS thread ever constructs one.
+// HISTORICAL NOTE — this tripwire was added when the VM ran every Java thread on
+// one OS thread under cooperative scheduling, to fail loudly if a future
+// threading change ever violated that assumption. **The assumption no longer
+// holds**: `Thread.start` spawns a real OS thread per Java thread (see soundness
+// argument point (4) below, which has been corrected). Any multithreaded Java
+// program now trips this guard by design.
 //
-// It is **opt-in**, gated on the `CRATONVM_ASSERT_SINGLE_OS_THREAD` env var,
-// for two reasons:
+// It therefore survives only as a narrow diagnostic: arming it confirms that a
+// particular workload really is single-OS-threaded, which is occasionally useful
+// when bisecting whether a bug requires parallelism to reproduce. A trip is NOT
+// evidence of a defect.
+//
+// It records the first OS thread to construct an `ObjectRef` and aborts if a
+// *different* OS thread ever constructs one. It stays **opt-in**, gated on the
+// `CRATONVM_ASSERT_SINGLE_OS_THREAD` env var, for two reasons:
 //   * the default (production) path must pay no atomic-load cost in the hot
 //     object-construction path beyond a single relaxed load;
 //   * the crate test harness (and parallel `cargo test`) legitimately
 //     constructs `ObjectRef`s from many worker threads, so an always-on guard
-//     would spuriously trip. Production VM launches that have NOT yet enabled
-//     multi-OS-thread Java execution can set the var to get a loud failure the
-//     instant a future threading change violates the assumption these
-//     `unsafe impl`s rest on — exactly the "fail loudly rather than silently
-//     becoming unsound" the review asks for.
+//     would spuriously trip — as would essentially every real Java workload.
 //
 // Sentinel `0` means "no thread recorded yet". `std::thread::ThreadId` is not
 // a stable integer, so we derive a non-zero u64 token from it via its `Hash`.
@@ -236,11 +238,25 @@ fn record_object_ref_payload(ptr: *mut u8) {
     // (published above, never freed); `word` is in-bounds by construction.
     let w = unsafe { &*leaf.add(word) };
     // In steady state the granule bit is already set (arena reuse), so the
-    // hot path is a single relaxed load with no store traffic. Relaxed is
-    // enough for the word itself: any cross-thread transfer of the pointer
-    // value synchronizes-with on its own (and today Java execution is
-    // single-OS-thread — see the tripwire above), ordering this record
-    // before any remote decode's check.
+    // hot path is a single relaxed load with no store traffic.
+    //
+    // Ordering rationale: `Relaxed` rests on the claim that any cross-thread
+    // transfer of the pointer value carries its own synchronizes-with edge
+    // (publishing the pointer through a field write, monitor, or safepoint
+    // orders this `fetch_or` before a remote decode's check). That argument is
+    // the load-bearing one and is *probably* fine.
+    //
+    // It was originally buttressed by "and today Java execution is
+    // single-OS-thread", which is no longer true — `Thread.start` spawns a real
+    // OS thread per Java thread. That clause has been removed rather than
+    // rewritten, because it was never the real justification; see the corrected
+    // soundness argument above `unsafe impl Send for ObjectRef` for why these
+    // orderings still want a proper concurrent audit.
+    //
+    // Worst case if the edge is ever missing: a decode observes a stale-clear
+    // bit and rejects a genuine reference, which degrades to the typed decode
+    // paths (`decode_value_checked` and friends) — those are the load-bearing
+    // defence, so a miss here is conservative, not memory-unsafe.
     if w.load(Ordering::Relaxed) & bit == 0 {
         w.fetch_or(bit, Ordering::Relaxed);
     }
@@ -443,42 +459,56 @@ impl ObjectRef {
 //    observes a half-moved object during relocation. Pointer updates happen
 //    atomically from each thread's perspective.
 //
-// 4. **Current execution model** — The VM currently executes Java threads
-//    on a single OS thread with cooperative scheduling. This makes the
-//    Send+Sync bounds sound only for the current scheduler. Before true
-//    OS-thread-parallel Java execution is enabled, this impl must be
-//    re-audited and either backed by a complete concurrent-root/relocation
-//    protocol or replaced with a narrower handle/transfer representation.
+// 4. **Current execution model** — one OS thread per Java thread. `Thread.start`
+//    spawns a real `std::thread::Builder` worker (see `thread_start` in
+//    `vm/src/vm/vm_exec.rs`, the `std::thread::Builder::new()` call around line
+//    6781); virtual threads are multiplexed over those carriers by
+//    `threading/virtual_scheduler.rs`. Java code therefore runs with genuine
+//    preemptive OS-level parallelism, and (1)-(3) must hold concurrently.
 //
-// !!! KNOWN LATENT RISK — RE-AUDIT BEFORE ENABLING MULTI-THREADED EXECUTION !!!
+// !!! THE RE-AUDIT THIS BLOCK DEMANDS IS OVERDUE — READ BEFORE TRUSTING (1)-(3) !!!
 //
-// Points (1)-(3) describe protocols that are NOT yet enforced under real
-// preemptive parallelism — today they hold only *because* point (4) keeps
-// every Java thread on one OS thread with cooperative yields. In other words,
-// these `unsafe impl`s are currently sound by accident of the single-threaded
-// scheduler, not by a self-contained argument. `ObjectRef` is a bare,
-// non-atomic, GC-unmanaged raw pointer with no lifetime tracking; once
-// `threading/jvm_thread.rs` spawns Java threads on multiple OS threads, the
-// `Send`/`Sync` claim must be re-derived from first principles. In particular
-// the following must be verified to actually hold concurrently:
+// This note previously stated that the VM executed all Java threads on a single
+// OS thread under cooperative scheduling, and that these `unsafe impl`s were
+// "sound by accident of the single-threaded scheduler" — with an explicit
+// instruction to re-derive the `Send`/`Sync` claim from first principles "once
+// `threading/jvm_thread.rs` spawns Java threads on multiple OS threads".
+//
+// **That trigger has already fired.** Multi-OS-thread Java execution is the
+// current, default behaviour (point (4) above), and the stated re-audit does not
+// appear to have happened — the premise simply went stale in place. Corrected
+// here so the next reader is not misled into thinking the single-thread
+// assumption still holds.
+//
+// What this correction does NOT do: it does not certify (1)-(3) as sound under
+// parallelism, and it does not claim they are broken. Neither conclusion has been
+// established. `ObjectRef` remains a bare, non-atomic, GC-unmanaged raw pointer
+// with no lifetime tracking, and the three properties it depends on are exactly
+// the ones that need a real concurrent audit:
 //   - GC roots are scanned at safepoints across ALL OS threads (no thread can
 //     hide an `ObjectRef` from the collector);
 //   - every field access genuinely routes through the monitor/atomic helpers
 //     in (2) — no raw pointer dereference escapes that protocol;
 //   - relocation during compaction is observed atomically by every thread.
-// If any of those cannot be guaranteed, this `unsafe impl` becomes unsound and
-// must be replaced (e.g. with a handle indirection or an explicit `!Send`
-// marker plus per-thread transfer barriers). Do NOT silently rely on it.
+// The plausible reason these hold in practice is that the safepoint/STW protocol
+// (`threading/gc_barrier.rs`) serialises relocation against every mutator, so no
+// thread observes a moving object — but "plausible" is not the audit. Until that
+// audit is written down, treat this `unsafe impl` as load-bearing and
+// under-justified. If any property cannot be established, the fix is a handle
+// indirection or an explicit `!Send` marker plus per-thread transfer barriers.
 //
-// TRIPWIRE: the single-OS-thread invariant in point (4) — the *only* property
-// that makes (1)-(3) hold today — is enforced at runtime by
-// `enforce_single_os_thread()` in `ObjectRef::from_raw` / `from_raw_nonnull`,
-// opt-in via the `CRATONVM_ASSERT_SINGLE_OS_THREAD` env var. With the tripwire
-// armed, the first OS thread to construct an `ObjectRef` claims ownership and
-// any construction from a *second* OS thread aborts loudly with a pointer to
-// this note. That turns "sound by accident of the scheduler" into a guarded
-// assumption that fails fast the instant a future multi-OS-thread Java
-// execution path violates it, rather than silently becoming unsound.
+// Knock-on: the object-reference provenance bitmap earlier in this file justifies
+// its `Ordering::Relaxed` accesses partly on the same now-false single-OS-thread
+// premise. Those orderings need re-deriving alongside this argument.
+//
+// TRIPWIRE: `enforce_single_os_thread()` in `ObjectRef::from_raw` /
+// `from_raw_nonnull`, opt-in via `CRATONVM_ASSERT_SINGLE_OS_THREAD`, aborts if a
+// second OS thread ever constructs an `ObjectRef`. Note what this means now that
+// point (4) has changed: it is no longer a guard against a *future* regression —
+// any multithreaded Java program trips it by design. It survives only as a
+// diagnostic for confirming that a specific workload really is single-threaded
+// (e.g. when bisecting whether a bug needs parallelism to reproduce). Do not
+// enable it in a multithreaded run and do not read a trip as evidence of a bug.
 unsafe impl Send for ObjectRef {}
 unsafe impl Sync for ObjectRef {}
 
