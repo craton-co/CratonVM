@@ -2469,15 +2469,47 @@ pub const MAX_INLINE_EXPANSION_COST: usize = 64;
 ///
 /// Mirrors the IR gate in `try_compile_inner` (`ir_compatible` + the
 /// category-2/FP admission clauses) with one deliberate extra restriction:
-/// only CALL-FREE and ALLOCATION-FREE methods qualify. The IR path lowers
-/// every invoke through the generic `invoke_dispatch` helper (no inline
-/// caches, no direct calls, no direct self-recursive CALL) and its
-/// allocation lowering differs from the single-pass inline-TLAB fast path —
-/// for such methods an "optimizing" recompile can be a net REGRESSION over
-/// the single-pass body (which has direct self-calls, ctor inlining, and the
-/// inline TLAB bump). Pure compute (int/long/FP arithmetic over locals,
-/// arrays and fields — sieve/matrix/reduction loop shapes) is where the IR
-/// backend reliably wins; that is exactly what this admits.
+/// only ALLOCATION-FREE methods qualify, and a call-bearing method qualifies
+/// only when the IR can lower its calls as well as the single-pass backend
+/// does. Pure compute (int/long/FP arithmetic over locals, arrays and fields —
+/// sieve/matrix/reduction loop shapes) is where the IR backend reliably wins.
+///
+/// # Why calls used to be excluded outright, and what changed
+///
+/// This predicate used to reject ANY method containing an invoke, because the
+/// IR path lowered every invoke through the generic `invoke_dispatch` helper —
+/// no direct calls, no inline caches — so an "optimizing" recompile of a
+/// call-bearing method could be a net REGRESSION over the single-pass body,
+/// which has always had direct calls and constructor inlining. That was the
+/// binding constraint on the whole IR pipeline: the tiered manager compiles a
+/// hot call-bearing method at C1 (`optimize == false`, which skips the IR
+/// pipeline entirely) and then declined to promote it here, so raising
+/// `ir_compatible`'s invoke cap alone changed nothing under tiered routing.
+///
+/// `ir_lower::emit_direct_cross_call` removed that per-call tax for the
+/// STATICALLY BOUND invoke kinds, so those are now admitted:
+///
+///  * `invokestatic` (0xb8) and `invokespecial` (0xb7) have exactly one
+///    possible target, so the IR binds them with the same raw `CALL` the
+///    single-pass backend emits — subject to `ir_direct_calls_enabled()`,
+///    without which the IR would be back to paying the helper per call and the
+///    original rejection is still the right answer.
+///  * `invokevirtual` (0xb6) / `invokeinterface` (0xb9) stay excluded: the IR
+///    has no monomorphic inline cache, so a virtual site still pays the full
+///    helper round trip with a dynamic target lookup. (They are also
+///    default-OFF for IR lowering entirely — `CRATONVM_JIT_IR_CALL_VIRTUAL` —
+///    so such a method's invokes would bail the IR builder anyway.)
+///
+/// ALLOCATION-bearing methods remain excluded, unchanged: the IR's allocation
+/// lowering differs from the single-pass inline-TLAB bump, and the IR call
+/// eligibility loop requires `new_ops.is_empty()` anyway, so an
+/// allocation-bearing method's invokes would bail the builder.
+///
+/// This predicate deliberately stays a cheap, scan-only approximation (it
+/// cannot resolve a constant pool), so it can admit a method the IR later
+/// bails on — e.g. a constructor whose `invokespecial` is an `<init>` super
+/// call. That costs a wasted optimizing compile whose result is discarded in
+/// favour of the single-pass body; it is never a correctness risk.
 pub fn c2_upgrade_would_engage(
     code: &[u8],
     code_len: usize,
@@ -2488,12 +2520,20 @@ pub fn c2_upgrade_would_engage(
     let Some(scan) = x64::jit_scan(code, code_len, descriptor) else {
         return false;
     };
-    if !scan.invoke_ops.is_empty()
-        || !scan.new_ops.is_empty()
-        || !scan.anewarray_ops.is_empty()
-        || !scan.indy_ops.is_empty()
-    {
+    if !scan.new_ops.is_empty() || !scan.anewarray_ops.is_empty() || !scan.indy_ops.is_empty() {
         return false;
+    }
+    if !scan.invoke_ops.is_empty() {
+        if !ir_direct_calls_enabled() {
+            return false;
+        }
+        if scan
+            .invoke_ops
+            .iter()
+            .any(|(_, _, opcode)| *opcode != 0xb8 && *opcode != 0xb7)
+        {
+            return false;
+        }
     }
     if !ir::ir_compatible(&scan) {
         return false;
@@ -5745,6 +5785,27 @@ pub fn jit_direct_call_requires_dispatch(
 /// this is checked at JIT-compile time, never on the runtime hot path within
 /// this crate, so re-reading the env var has no measurable cost — and caching
 /// would make the flag racy against whichever test/thread compiles first.
+/// IR direct-call lowering — may the optimizing IR pipeline bind a resolved,
+/// statically-bound `invokestatic` / non-`<init>` `invokespecial` straight to its
+/// callee's compiled entry (a raw `CALL`), the way the single-pass backend
+/// already does?
+///
+/// Subordinate to [`direct_jit_callee_calls_enabled`]: the IR path emits exactly
+/// the same raw JIT-to-JIT edge the single-pass backend emits, so it must respect
+/// the same master switch. `CRATONVM_JIT_IR_DIRECT_CALL=0` is an additional
+/// IR-only opt-out for bisecting a regression to this lowering specifically
+/// (which restores the historical `jit_invoke_dispatch` route for every IR call
+/// site) without also disabling single-pass direct calls.
+pub fn ir_direct_calls_enabled() -> bool {
+    if !direct_jit_callee_calls_enabled() {
+        return false;
+    }
+    match std::env::var("CRATONVM_JIT_IR_DIRECT_CALL") {
+        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+        Err(_) => true,
+    }
+}
+
 pub fn direct_jit_callee_calls_enabled() -> bool {
     match std::env::var("CRATONVM_JIT_DIRECT_CALLEE_CALLS") {
         Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
@@ -6701,6 +6762,13 @@ fn try_compile_inner(
         // `CompiledMethod` below so the baked `info_ptr`s outlive the code.
         let mut ir_call_infos: Vec<Box<JitInvokeInfo>> = Vec::new();
         let mut ir_call_strings: Vec<Box<str>> = Vec::new();
+        // IR direct-call lowering: `pc → (callee_entry, callee_needs_context)`
+        // for each statically-bound site the IR lowerer may bind directly, plus
+        // the flat entry list recorded on the finished `CompiledMethod` (see
+        // `_direct_callee_entries` — keep-alive + invalidation closure).
+        let mut ir_direct_calls: std::collections::HashMap<usize, (usize, bool)> =
+            std::collections::HashMap::new();
+        let mut ir_direct_callee_entries: Vec<usize> = Vec::new();
         if (ir_emit_calls || ir_emit_special_calls || ir_emit_virtual_calls)
             && !scan.invoke_ops.is_empty()
         {
@@ -6717,6 +6785,10 @@ fn try_compile_inner(
                     // Default-on when the native-stack guard helper is wired;
                     // the env flag remains an opt-out for diagnosis.
                     let selfrec_direct = selfrec_direct_enabled();
+                    // IR direct-call lowering (this slice) - see
+                    // `ir_direct_calls_enabled` and `ir_lower`'s
+                    // `emit_direct_cross_call`.
+                    let ir_direct = ir_direct_calls_enabled();
                     for &(pc, cp_idx, opcode) in &scan.invoke_ops {
                         // Admit `invokestatic` (under `ir_emit_calls`), resolved
                         // non-`<init>` `invokespecial` (inc 24, under
@@ -6821,6 +6893,67 @@ fn try_compile_inner(
                         } else {
                             3
                         };
+                        // IR direct-call lowering. `invokestatic` and a
+                        // non-`<init>` `invokespecial` are STATICALLY bound, so
+                        // the resolved callee is the only possible target and no
+                        // receiver type check is needed — exactly the property
+                        // that lets the single-pass backend bind them directly
+                        // (`x64.rs` `direct_calls`). Mirror its guards here:
+                        //
+                        //  * `note_jit_recursive_compile_cycle` — a call that
+                        //    closes an in-flight compile cycle (A-B-A) keeps the
+                        //    dispatch route, whose depth guard is the only stack
+                        //    protection such an edge has.
+                        //  * `jit_direct_call_requires_dispatch` — the deny-list
+                        //    of edges known to need the helper's rooting/return
+                        //    protocol (and every recorded cycle member).
+                        //  * self-recursion is handled by the dedicated
+                        //    `invoke_kind == 4` path above, not here.
+                        //  * JVMS §6.5 — for `invokespecial` the direct target is
+                        //    the *selection-start* class, not the plain CP class,
+                        //    so apply `cp_invokespecial_owner_resolver` first
+                        //    (single-pass does the same before its
+                        //    `callee_compiler` call). Without this a super call
+                        //    could be bound to the wrong method body.
+                        let mut direct_target: Option<(usize, bool)> = None;
+                        if ir_direct && (is_static || is_special) && !is_self_recursive {
+                            let special_owner: Option<String> = if is_special {
+                                cp_invokespecial_owner_resolver.and_then(|r| r(cp_idx))
+                            } else {
+                                None
+                            };
+                            let direct_class: &str =
+                                special_owner.as_deref().unwrap_or(cn.as_str());
+                            let closes_cycle =
+                                note_jit_recursive_compile_cycle(direct_class, &mn, &desc);
+                            if !closes_cycle
+                                && !jit_direct_call_requires_dispatch(direct_class, &mn, &desc)
+                            {
+                                if let Some(compiler) = callee_compiler.as_ref() {
+                                    if let Some((entry, callee_needs_ctx)) =
+                                        compiler(direct_class, &mn, &desc)
+                                    {
+                                        // Re-check: compiling the callee may have
+                                        // discovered a cycle through this edge.
+                                        if entry != 0
+                                            && !jit_direct_call_requires_dispatch(
+                                                direct_class,
+                                                &mn,
+                                                &desc,
+                                            )
+                                        {
+                                            direct_target = Some((entry, callee_needs_ctx));
+                                        } else {
+                                            mark_current_jit_compile_method_recursive_cycle();
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if let Some((entry, callee_needs_ctx)) = direct_target {
+                            ir_direct_calls.insert(pc, (entry, callee_needs_ctx));
+                            ir_direct_callee_entries.push(entry);
+                        }
                         let class_box: Box<str> = cn.into_boxed_str();
                         let method_box: Box<str> = mn.into_boxed_str();
                         let desc_box: Box<str> = desc.into_boxed_str();
@@ -6845,11 +6978,12 @@ fn try_compile_inner(
                     if all_emittable && !info_map.is_empty() {
                         if std::env::var_os("CRATONVM_DBG_IR_CALL").is_some() {
                             eprintln!(
-                                "[cratonvm-ircall] {}.{}{}: emitting {} invoke(static/special/virtual/interface) Op::Call(s)",
+                                "[cratonvm-ircall] {}.{}{}: emitting {} invoke(static/special/virtual/interface) Op::Call(s), {} bound as DIRECT calls",
                                 cached.class_name,
                                 cached.method_name,
                                 cached.method_descriptor,
                                 info_map.len(),
+                                ir_direct_calls.len(),
                             );
                         }
                         builder.set_invoke_info(info_map);
@@ -6859,6 +6993,8 @@ fn try_compile_inner(
                         // and drop the now-unreferenced boxes/strings.
                         ir_call_infos.clear();
                         ir_call_strings.clear();
+                        ir_direct_calls.clear();
+                        ir_direct_callee_entries.clear();
                     }
                 }
             }
@@ -7008,6 +7144,7 @@ fn try_compile_inner(
                         helpers,
                         &ir_branch_hints,
                         sr_map.as_ref(),
+                        &ir_direct_calls,
                     ) {
                         // Gap B: attach the leaked `JitInvokeInfo` boxes/strings
                         // so the `info_ptr`s baked into each `Op::Call` stay valid
@@ -7020,6 +7157,20 @@ fn try_compile_inner(
                             compiled._jit_invoke_infos = ir_call_infos;
                             compiled._jit_strings = ir_call_strings;
                             compiled.has_dispatch = true;
+                        }
+                        // IR direct-call lowering: record every raw JIT-to-JIT
+                        // callee entry baked into this body. `_direct_callee_roots`
+                        // (computed at publication) keeps the callee's executable
+                        // buffer alive, and the cache's invalidation pass walks
+                        // `_direct_callee_entries` to evict a caller whose callee
+                        // was invalidated — without this the baked address could
+                        // outlive the code it targets. Same contract the
+                        // single-pass backend's `direct_callee_entries` has.
+                        if !ir_direct_callee_entries.is_empty() {
+                            ir_direct_callee_entries.sort_unstable();
+                            ir_direct_callee_entries.dedup();
+                            compiled._direct_callee_entries =
+                                std::mem::take(&mut ir_direct_callee_entries);
                         }
                         // Backend-routing introspection (tests only): this body was
                         // produced by the optimizing IR pipeline. A method that
