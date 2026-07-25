@@ -597,6 +597,24 @@ pub fn is_watched_referent(addr: usize) -> bool {
     WATCHED_REFERENTS.with(|s| s.borrow().contains(&addr))
 }
 
+/// Snapshot of the watched-referent set, or `None` when it is empty.
+///
+/// The set lives in a `thread_local!` owned by the collecting thread, so a
+/// parallel sweep worker cannot consult it directly (it would see its own,
+/// always-empty, copy). The collector snapshots it once before spawning
+/// workers; the set is sized by the VM's reference processor, not by the
+/// young generation, so the clone is cheap and usually skipped entirely.
+pub fn watched_referents_snapshot() -> Option<std::collections::HashSet<usize>> {
+    WATCHED_REFERENTS.with(|s| {
+        let s = s.borrow();
+        if s.is_empty() {
+            None
+        } else {
+            Some(s.clone())
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -386,6 +386,16 @@ impl OldGen {
         ptr >= base && ptr < end
     }
 
+    /// Backing-storage extent as plain integers: `[lo, hi)`.
+    ///
+    /// `OldGen` is not `Sync` (it owns the storage), so a parallel young-sweep
+    /// worker cannot hold a `&OldGen` just to run `contains`. This exposes the
+    /// same range test as two `usize`s the workers can copy.
+    pub fn extent(&self) -> (usize, usize) {
+        let base = self.data.as_ptr() as usize;
+        (base, base + self.data.len())
+    }
+
     /// Get the base pointer of the backing storage.
     pub fn base_ptr(&self) -> *const u8 {
         self.data.as_ptr()

@@ -75,6 +75,9 @@ pub mod shadow_stack;
 pub mod stale_objref_debug;
 pub mod tlab;
 pub mod vm_heap;
+// Parallel young-generation marking (mark bitmap + scoped worker
+// drain). Crate-internal: only `gen_heap` drives it.
+mod young_mark;
 // Round-7 cross-cutting Fix 4: ZGC stub (1884 LOC) gated behind the `zgc`
 // feature. No in-workspace consumer references `zgc::*` today, so paying
 // the compile-time + binary-size cost on every build is pure waste. Flip
