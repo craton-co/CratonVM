@@ -762,7 +762,7 @@ fn fire_class_file_load_hook(
 /// Signature of the JIT-invalidation hook fired by `redefine_class`.
 ///
 /// Parameter: the `ClassId` (as `u32`) whose JIT entries must be evicted.
-/// The VM-side adapter walks `shared.jit_cache`, `shared.tiered`, and any
+/// The VM-side adapter walks `shared.jit.jit_cache`, `shared.tiered`, and any
 /// per-thread invoke caches that key by class id and removes matching
 /// entries. Method-index granularity is intentionally NOT exposed here —
 /// at redefine time we conservatively evict every method body for the

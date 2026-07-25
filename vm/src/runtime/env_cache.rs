@@ -434,7 +434,7 @@ cached_is_set!(jit_main_inline, "CRATONVM_JIT_MAIN_INLINE");
 // wire-tiered-manager: OFF-THREAD codegen for the invocation tier-up trigger.
 // When on, the interpreter's invocation tier-up trigger ENQUEUES a
 // `CompilationTask` for the background compile thread (which runs the real
-// codegen via `try_jit_compile_callee` and publishes into `shared.jit_cache`)
+// codegen via `try_jit_compile_callee` and publishes into `shared.jit.jit_cache`)
 // and DOES NOT compile inline on the mutator — the mutator keeps interpreting
 // until the worker publishes, at which point the `jit_cache` fast-path flips the
 // call site to `Jit`. Step-5 OSR likewise compiles off-thread when on.
@@ -469,7 +469,7 @@ pub fn bg_compile() -> bool {
 // wire-tiered-manager Step 4 (PGO handoff C1 → C2): opt-in profile collection.
 // When set, `SharedVm::new` calls `jit::profile::enable_profiling(true)` once at
 // VM init, so the interpreter's existing branch / receiver / back-edge recording
-// sites populate `shared.profile_store` during the interpreted ("C1"/warmup)
+// sites populate `shared.jit.profile_store` during the interpreted ("C1"/warmup)
 // phase. The optimizing C2 compile then consumes that profile — the single-pass
 // backend already biases branch layout + pre-populates virtual-call MICs from it,
 // and (Step 4) the optimizing IR pipeline now reads branch bias too. Default-OFF:

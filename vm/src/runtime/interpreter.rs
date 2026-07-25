@@ -1056,8 +1056,12 @@ pub(crate) fn remap_trace_push(shared: &SharedVm, thread: &JvmThread, tag: &str,
 }
 
 pub(crate) fn remap_trace_dump() -> String {
-    REMAP_TRACE.with(|t| t.borrow().join("
-    "))
+    REMAP_TRACE.with(|t| {
+        t.borrow().join(
+            "
+    ",
+        )
+    })
 }
 
 pub(crate) fn nret_record(cb: usize, addr: usize, site: &str) {
@@ -1970,13 +1974,11 @@ fn process_references_after_gc(
         let is_marked = |addr: usize| -> bool {
             pointer_map.contains_key(&addr) || shared.heap.is_addr_live(addr)
         };
-        let dead_class_hints =
-            cratonvm_native_builtins::classloader::gc_reconcile_defining_loaders(
+        let dead_class_hints = cratonvm_native_builtins::classloader::gc_reconcile_defining_loaders(
             &is_marked,
             pointer_map,
         );
-        let unload =
-            crate::memory::gc::unload_dead_class_metadata(shared, &dead_class_hints);
+        let unload = crate::memory::gc::unload_dead_class_metadata(shared, &dead_class_hints);
         if unload.classes_unloaded != 0 {
             tracing::debug!(
                 loaders = unload.loaders_unloaded,
@@ -4286,9 +4288,8 @@ fn g1_concurrent_mark_cycle(shared: &SharedVm, thread: &mut JvmThread) {
         let ref_objs = shared.ref_processor.lock().reference_object_addresses();
         shared.heap.g1_set_reference_skip_set(&ref_objs);
         // Mark roots into the G1 mark bitmap
-        let roots = cratonvm_gc::gc_quiescence::with_class_unload_marking(|| {
-            collect_roots(shared, thread)
-        });
+        let roots =
+            cratonvm_gc::gc_quiescence::with_class_unload_marking(|| collect_roots(shared, thread));
         let snapshot_roots = shared.thread_registry.collect_all_root_snapshots();
         let all_roots: Vec<cratonvm_types::ObjectRef> = roots
             .into_iter()
@@ -4380,9 +4381,8 @@ fn g1_final_remark_cleanup(shared: &SharedVm, thread: &mut JvmThread) {
         // mutators' buffers are pulled by `remark` itself
         // (`flush_all_thread_satb_buffers`) now that they are parked.
         shared.heap.flush_thread_satb();
-        let roots = cratonvm_gc::gc_quiescence::with_class_unload_marking(|| {
-            collect_roots(shared, thread)
-        });
+        let roots =
+            cratonvm_gc::gc_quiescence::with_class_unload_marking(|| collect_roots(shared, thread));
         let snapshot_roots = shared.thread_registry.collect_all_root_snapshots();
         let all_roots: Vec<cratonvm_types::ObjectRef> = roots
             .into_iter()
@@ -4453,12 +4453,8 @@ fn g1_remark_process_references(
     crate::memory::gc::reconcile_class_mirrors(shared, is_marked);
     let no_moves = std::collections::HashMap::new();
     let dead_class_hints =
-        cratonvm_native_builtins::classloader::gc_reconcile_defining_loaders(
-            is_marked,
-            &no_moves,
-        );
-    let unloaded =
-        crate::memory::gc::unload_dead_class_metadata(shared, &dead_class_hints);
+        cratonvm_native_builtins::classloader::gc_reconcile_defining_loaders(is_marked, &no_moves);
+    let unloaded = crate::memory::gc::unload_dead_class_metadata(shared, &dead_class_hints);
     if unloaded.classes_unloaded != 0 {
         tracing::debug!(
             loaders = unloaded.loaders_unloaded,
@@ -5461,7 +5457,7 @@ pub fn execute(
             Arc::from(method_name),
             Arc::from(method_descriptor),
         );
-        let already_skipped = shared.jit_skip_set.read().contains(&skip_key);
+        let already_skipped = shared.jit.jit_skip_set.read().contains(&skip_key);
         // PERF FIX (2026-07-15, companion to the invoke-cache + jit-bail-list
         // memoization fixes): `already_skipped` (a single `jit_skip_set`
         // RwLock-read + hash lookup) was computed first but NOT used to
@@ -5623,7 +5619,7 @@ pub fn execute(
             // poison this method's entry for future calls where those flags
             // may differ.
             if static_skip_reason.is_some() || fjp_skip || native_skip || is_synchronized {
-                shared.jit_skip_set.write().insert(skip_key.clone());
+                shared.jit.jit_skip_set.write().insert(skip_key.clone());
             }
         } else {
             {
@@ -5639,7 +5635,7 @@ pub fn execute(
                 // (the ~190s CPU-bound anomaly in
                 // docs/bc-jit-ban-investigation.md).
                 let compiled = {
-                    let jit_cache = shared.jit_cache.read();
+                    let jit_cache = shared.jit.jit_cache.read();
                     jit_cache.get(&class_name_str, method_name, method_descriptor, class_id)
                 };
                 // CRATONVM_JIT_C2_FIRST_CALL: set when the gated branch DEFERS a
@@ -5677,7 +5673,7 @@ pub fn execute(
                             // Widening: u32 → u64 (value preserved)
                             ((class_id.as_u32() as u64) << 32) | (h as u64)
                         };
-                        let n = shared.profile_store.increment_invocation(invoc_key);
+                        let n = shared.jit.profile_store.increment_invocation(invoc_key);
                         if n >= crate::runtime::env_cache::jit_invocation_threshold() {
                             ensure_bg_compiler_started(shared);
                             let tiered_key = crate::jit::tiered::MethodKey::new(
@@ -5691,7 +5687,7 @@ pub fn execute(
                             // hotness view 64x (first C1 recommendation at
                             // ~threshold + 64×c1_threshold real calls).
                             let _ = shared
-                                .tiered_manager
+                                .jit.tiered_manager
                                 .on_method_invocation_observed(&tiered_key, n as u64);
                         }
                         c2_not_hot = true; // keep the counter running; do not seal
@@ -5726,7 +5722,7 @@ pub fn execute(
                             // Widening: smaller integer -> 64-bit (zero/sign-extended, value preserved)
                             ((class_id.as_u32() as u64) << 32) | (h as u64)
                         };
-                        let n = shared.profile_store.increment_invocation(invoc_key);
+                        let n = shared.jit.profile_store.increment_invocation(invoc_key);
                         if n < crate::runtime::env_cache::jit_invocation_threshold() {
                             c2_not_hot = true; // defer, do NOT seal (counter must keep running)
                             return None; // not hot yet — interpret (dispatcher/OSR may reach IR)
@@ -5739,7 +5735,7 @@ pub fn execute(
                             true, // optimize = C2 / optimizing IR pipeline
                         ) {
                             Some(_) => {
-                                let jit_cache = shared.jit_cache.read();
+                                let jit_cache = shared.jit.jit_cache.read();
                                 jit_cache.get(&class_name_str, method_name, method_descriptor, class_id)
                             }
                             None => None,
@@ -5754,7 +5750,7 @@ pub fn execute(
                             // RBC.4 — seal scan-rejected methods so this path
                             // doesn't re-run jit_scan on every uncached
                             // invocation.
-                            shared.jit_skip_set.write().insert(skip_key.clone());
+                            shared.jit.jit_skip_set.write().insert(skip_key.clone());
                             return None;
                         }
                     };
@@ -5762,7 +5758,7 @@ pub fn execute(
                     // (mirrors jit::try_compile_inner); seal otherwise so the
                     // probe isn't re-run per call.
                     if scan.has_athrow && !code_attr.exception_table.is_empty() {
-                        shared.jit_skip_set.write().insert(skip_key.clone());
+                        shared.jit.jit_skip_set.write().insert(skip_key.clone());
                         return None;
                     }
                     let class_name_arc: Arc<str> = Arc::from(&*class_name_str);
@@ -6354,7 +6350,7 @@ pub fn execute(
                     // early-compiled; OSR handles such methods later.
                     if has_unsupported_ldc {
                         // Mark as skipped so we don't retry
-                        shared.jit_skip_set.write().insert(skip_key.clone());
+                        shared.jit.jit_skip_set.write().insert(skip_key.clone());
                     }
 
                     // Resolve ldc2_w constants (long, double)
@@ -6505,7 +6501,7 @@ pub fn execute(
                                             // the JIT cache write, drop it; (2) JFR event emitted with
                                             // only the flight_recorder lock held.
                     let cached_result = {
-                        let mut jit_cache = shared.jit_cache.write();
+                        let mut jit_cache = shared.jit.jit_cache.write();
                         jit_cache.put(
                             class_name_arc.clone(),
                             method_name_arc.clone(),
@@ -6611,7 +6607,7 @@ pub fn execute(
                     // method returned None on purpose (to interpret until its
                     // invocation counter crosses the threshold) — sealing it here
                     // would set `already_skipped` and permanently stop that counter.
-                    shared.jit_skip_set.write().insert(skip_key.clone());
+                    shared.jit.jit_skip_set.write().insert(skip_key.clone());
                 }
                 if let Some(compiled) = compiled {
                     if crate::runtime::env_cache::jit_entry_dbg() {
@@ -6992,9 +6988,7 @@ pub fn execute(
                                             class_name: Arc::from(class_name_str.as_str()),
                                             method_name: Arc::from(method_name),
                                             method_descriptor: Arc::from(method_descriptor),
-                                            source_file: source_file
-                                                .as_deref()
-                                                .map(Arc::from),
+                                            source_file: source_file.as_deref().map(Arc::from),
                                             code: crate::runtime::frame::padded_bytecode(
                                                 &code_attr.code,
                                             ),
@@ -7296,7 +7290,9 @@ pub fn execute(
     // virtual-thread manager can freeze the complete Java stack.
     if matches!(
         result,
-        Err(MethodCallFailed::InternalError(VmError::ContinuationYield { .. }))
+        Err(MethodCallFailed::InternalError(
+            VmError::ContinuationYield { .. }
+        ))
     ) {
         return result;
     }
@@ -7321,10 +7317,7 @@ pub fn execute(
 /// its exact bytecode PC, locals, operand stack, exception table, and method
 /// identity. Dispatch begins at the youngest frame and may return/unwind
 /// through all restored callers down to index zero.
-pub fn resume_continuation(
-    shared: &SharedVm,
-    thread: &mut JvmThread,
-) -> MethodCallResult {
+pub fn resume_continuation(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult {
     if thread.frames.is_empty() {
         return Ok(None);
     }
@@ -7344,7 +7337,9 @@ pub fn resume_continuation(
     let result = execute_frame_from_index(shared, thread, 0);
     if matches!(
         result,
-        Err(MethodCallFailed::InternalError(VmError::ContinuationYield { .. }))
+        Err(MethodCallFailed::InternalError(
+            VmError::ContinuationYield { .. }
+        ))
     ) {
         return result;
     }
@@ -7685,7 +7680,7 @@ pub(crate) fn try_osr_with_backoff(
             )
         };
         let reusable = {
-            let jc = shared.jit_cache.read();
+            let jc = shared.jit.jit_cache.read();
             matches!(
                 jc.get_osr(&cn, &mn, &md, frame_class_id),
                 Some(c) if c.compiled_via_osr && c.can_osr_enter(entry_pc)
@@ -7702,7 +7697,7 @@ pub(crate) fn try_osr_with_backoff(
                 return OsrBackoffOutcome::Skip;
             }
             ensure_bg_compiler_started(shared);
-            let _ = shared.tiered_manager.request_osr(&key, entry_pc as u32);
+            let _ = shared.jit.tiered_manager.request_osr(&key, entry_pc as u32);
             // Waiting for an off-thread compile is not a failed OSR attempt.
             // The old attempt counter reached its permanent cap within a few
             // thousand interpreted iterations, usually before the worker had
@@ -8027,7 +8022,7 @@ fn execute_frame_from_index(
                                 let taken = vx < vy;
                                 if pgo_enabled {
                                     let (cid, mn, md) = method_key_parts(frame);
-                                    shared.profile_store.record_branch_borrowed(
+                                    shared.jit.profile_store.record_branch_borrowed(
                                         cid,
                                         mn,
                                         md,
@@ -8042,7 +8037,7 @@ fn execute_frame_from_index(
                                     if offset < 0 {
                                         if pgo_enabled {
                                             let (cid, mn, md) = method_key_parts(frame);
-                                            shared.profile_store.record_backedge_borrowed(
+                                            shared.jit.profile_store.record_backedge_borrowed(
                                                 cid,
                                                 mn,
                                                 md,
@@ -8368,6 +8363,7 @@ fn execute_frame_from_index(
                         if pgo_enabled {
                             let (cid, mn, md) = method_key_parts(frame);
                             shared
+                                .jit
                                 .profile_store
                                 .record_backedge_borrowed(cid, mn, md, saved_pc);
                         }
@@ -8399,6 +8395,7 @@ fn execute_frame_from_index(
                     if pgo_enabled {
                         let (cid, mn, md) = method_key_parts(frame);
                         shared
+                            .jit
                             .profile_store
                             .record_branch_borrowed(cid, mn, md, saved_pc, taken);
                     }
@@ -8409,6 +8406,7 @@ fn execute_frame_from_index(
                             if pgo_enabled {
                                 let (cid, mn, md) = method_key_parts(frame);
                                 shared
+                                    .jit
                                     .profile_store
                                     .record_backedge_borrowed(cid, mn, md, saved_pc);
                             }
@@ -8442,6 +8440,7 @@ fn execute_frame_from_index(
                     if pgo_enabled {
                         let (cid, mn, md) = method_key_parts(frame);
                         shared
+                            .jit
                             .profile_store
                             .record_branch_borrowed(cid, mn, md, saved_pc, taken);
                     }
@@ -8452,6 +8451,7 @@ fn execute_frame_from_index(
                             if pgo_enabled {
                                 let (cid, mn, md) = method_key_parts(frame);
                                 shared
+                                    .jit
                                     .profile_store
                                     .record_backedge_borrowed(cid, mn, md, saved_pc);
                             }
@@ -8485,6 +8485,7 @@ fn execute_frame_from_index(
                     if pgo_enabled {
                         let (cid, mn, md) = method_key_parts(frame);
                         shared
+                            .jit
                             .profile_store
                             .record_branch_borrowed(cid, mn, md, saved_pc, taken);
                     }
@@ -8495,6 +8496,7 @@ fn execute_frame_from_index(
                             if pgo_enabled {
                                 let (cid, mn, md) = method_key_parts(frame);
                                 shared
+                                    .jit
                                     .profile_store
                                     .record_backedge_borrowed(cid, mn, md, saved_pc);
                             }
@@ -8527,6 +8529,7 @@ fn execute_frame_from_index(
                     if pgo_enabled {
                         let (cid, mn, md) = method_key_parts(frame);
                         shared
+                            .jit
                             .profile_store
                             .record_branch_borrowed(cid, mn, md, saved_pc, taken);
                     }
@@ -8537,6 +8540,7 @@ fn execute_frame_from_index(
                             if pgo_enabled {
                                 let (cid, mn, md) = method_key_parts(frame);
                                 shared
+                                    .jit
                                     .profile_store
                                     .record_backedge_borrowed(cid, mn, md, saved_pc);
                             }
@@ -8569,6 +8573,7 @@ fn execute_frame_from_index(
                     if pgo_enabled {
                         let (cid, mn, md) = method_key_parts(frame);
                         shared
+                            .jit
                             .profile_store
                             .record_branch_borrowed(cid, mn, md, saved_pc, taken);
                     }
@@ -8579,6 +8584,7 @@ fn execute_frame_from_index(
                             if pgo_enabled {
                                 let (cid, mn, md) = method_key_parts(frame);
                                 shared
+                                    .jit
                                     .profile_store
                                     .record_backedge_borrowed(cid, mn, md, saved_pc);
                             }
@@ -8611,6 +8617,7 @@ fn execute_frame_from_index(
                     if pgo_enabled {
                         let (cid, mn, md) = method_key_parts(frame);
                         shared
+                            .jit
                             .profile_store
                             .record_branch_borrowed(cid, mn, md, saved_pc, taken);
                     }
@@ -8621,6 +8628,7 @@ fn execute_frame_from_index(
                             if pgo_enabled {
                                 let (cid, mn, md) = method_key_parts(frame);
                                 shared
+                                    .jit
                                     .profile_store
                                     .record_backedge_borrowed(cid, mn, md, saved_pc);
                             }
@@ -8828,6 +8836,7 @@ fn execute_frame_from_index(
                     if pgo_enabled {
                         let (cid, mn, md) = method_key_parts(frame);
                         shared
+                            .jit
                             .profile_store
                             .record_branch_borrowed(cid, mn, md, saved_pc, taken);
                     }
@@ -8838,6 +8847,7 @@ fn execute_frame_from_index(
                             if pgo_enabled {
                                 let (cid, mn, md) = method_key_parts(frame);
                                 shared
+                                    .jit
                                     .profile_store
                                     .record_backedge_borrowed(cid, mn, md, saved_pc);
                             }
@@ -8869,6 +8879,7 @@ fn execute_frame_from_index(
                     if pgo_enabled {
                         let (cid, mn, md) = method_key_parts(frame);
                         shared
+                            .jit
                             .profile_store
                             .record_branch_borrowed(cid, mn, md, saved_pc, taken);
                     }
@@ -8879,6 +8890,7 @@ fn execute_frame_from_index(
                             if pgo_enabled {
                                 let (cid, mn, md) = method_key_parts(frame);
                                 shared
+                                    .jit
                                     .profile_store
                                     .record_backedge_borrowed(cid, mn, md, saved_pc);
                             }
@@ -8910,6 +8922,7 @@ fn execute_frame_from_index(
                     if pgo_enabled {
                         let (cid, mn, md) = method_key_parts(frame);
                         shared
+                            .jit
                             .profile_store
                             .record_branch_borrowed(cid, mn, md, saved_pc, taken);
                     }
@@ -8920,6 +8933,7 @@ fn execute_frame_from_index(
                             if pgo_enabled {
                                 let (cid, mn, md) = method_key_parts(frame);
                                 shared
+                                    .jit
                                     .profile_store
                                     .record_backedge_borrowed(cid, mn, md, saved_pc);
                             }
@@ -8951,6 +8965,7 @@ fn execute_frame_from_index(
                     if pgo_enabled {
                         let (cid, mn, md) = method_key_parts(frame);
                         shared
+                            .jit
                             .profile_store
                             .record_branch_borrowed(cid, mn, md, saved_pc, taken);
                     }
@@ -8961,6 +8976,7 @@ fn execute_frame_from_index(
                             if pgo_enabled {
                                 let (cid, mn, md) = method_key_parts(frame);
                                 shared
+                                    .jit
                                     .profile_store
                                     .record_backedge_borrowed(cid, mn, md, saved_pc);
                             }
@@ -8992,6 +9008,7 @@ fn execute_frame_from_index(
                     if pgo_enabled {
                         let (cid, mn, md) = method_key_parts(frame);
                         shared
+                            .jit
                             .profile_store
                             .record_branch_borrowed(cid, mn, md, saved_pc, taken);
                     }
@@ -9002,6 +9019,7 @@ fn execute_frame_from_index(
                             if pgo_enabled {
                                 let (cid, mn, md) = method_key_parts(frame);
                                 shared
+                                    .jit
                                     .profile_store
                                     .record_backedge_borrowed(cid, mn, md, saved_pc);
                             }
@@ -9033,6 +9051,7 @@ fn execute_frame_from_index(
                     if pgo_enabled {
                         let (cid, mn, md) = method_key_parts(frame);
                         shared
+                            .jit
                             .profile_store
                             .record_branch_borrowed(cid, mn, md, saved_pc, taken);
                     }
@@ -9043,6 +9062,7 @@ fn execute_frame_from_index(
                             if pgo_enabled {
                                 let (cid, mn, md) = method_key_parts(frame);
                                 shared
+                                    .jit
                                     .profile_store
                                     .record_backedge_borrowed(cid, mn, md, saved_pc);
                             }
@@ -12398,6 +12418,7 @@ fn real_frame_deopt_resume_and_despeculate(
     const PER_BCI_DESPEC_LIMIT: usize = 4;
     if rframe.bci != u32::MAX {
         let bci_deopts = shared
+            .jit
             .deopt_log
             .lock()
             .deopt_count_at_bci(&method_key, rframe.bci);
@@ -12900,7 +12921,7 @@ mod deopt_step3_tests {
         assert!(matches!(r, CachedCallResult::FramePushed));
         assert_eq!(thread.frames.len(), 1);
         // De-speculation recorded the event (reason recovered from the deopt point).
-        assert_eq!(shared.deopt_log.lock().deopt_count("T.m:()V"), 1);
+        assert_eq!(shared.jit.deopt_log.lock().deopt_count("T.m:()V"), 1);
     }
 
     /// A *superseded* artifact (epoch < live, simulating an invalidation since
@@ -12928,7 +12949,7 @@ mod deopt_step3_tests {
         assert!(matches!(r, CachedCallResult::FramePushed));
         assert_eq!(thread.frames.len(), 1);
         // Recorded for the deopt rate as before.
-        assert_eq!(shared.deopt_log.lock().deopt_count("T.m:()V"), 1);
+        assert_eq!(shared.jit.deopt_log.lock().deopt_count("T.m:()V"), 1);
     }
 
     /// deopt-osr Step 9 follow-up (c): per-bci de-spec. After
@@ -13069,7 +13090,7 @@ mod deopt_step3_tests {
             "no frame may be pushed for a mismatched stash"
         );
         // The deopt was attributed to the FRAME's method, not the sink's.
-        let log = shared.deopt_log.lock();
+        let log = shared.jit.deopt_log.lock();
         assert!(
             log.deopt_count_at_bci("Inner/Callee.trap:(I)I", 3) >= 1,
             "frame owner must receive the deopt accounting"
@@ -15753,9 +15774,7 @@ fn execute_instruction(
                         if addr != 0 {
                             eprintln!(
                                 "[REGCALL] caller_pc={} attr=0x{:x} tid={}",
-                                caller.pc,
-                                addr,
-                                thread.thread_id.0,
+                                caller.pc, addr, thread.thread_id.0,
                             );
                         }
                     }
@@ -15838,7 +15857,9 @@ fn execute_instruction(
                     thread.thread_id
                 );
                 if matches!(ref_loader, Some(cratonvm_types::ClassLoaderId::Application)) {
-                    eprintln!("[LOADER-TRACE-STACK] full Java stack for this Application-context 'new':");
+                    eprintln!(
+                        "[LOADER-TRACE-STACK] full Java stack for this Application-context 'new':"
+                    );
                     for (i, f) in thread.frames.iter().enumerate().rev() {
                         eprintln!(
                             "[LOADER-TRACE-STACK]   [{i}] {}.{}{} pc={}",
@@ -16657,7 +16678,9 @@ fn execute_instruction(
                                     );
                                 }
                                 for (ago, site) in push_prov_find(addr) {
-                                    eprintln!("  CCE-BT-PUSHPROV pushed {ago} pushes ago at {site}");
+                                    eprintln!(
+                                        "  CCE-BT-PUSHPROV pushed {ago} pushes ago at {site}"
+                                    );
                                 }
                                 for (age, site, tag, s, l) in
                                     cratonvm_gc::zero_forensics::probe(addr)
@@ -18739,7 +18762,9 @@ pub(crate) fn resolve_class_loader_aware(
             && matches!(ref_loader, Some(cratonvm_types::ClassLoaderId::Application))
         {
             drop(cm);
-            eprintln!("[RCLA-STACK] full Java stack at resolve_class_loader_aware for name={name}:");
+            eprintln!(
+                "[RCLA-STACK] full Java stack at resolve_class_loader_aware for name={name}:"
+            );
             for (i, f) in thread.frames.iter().enumerate().rev() {
                 eprintln!(
                     "[RCLA-STACK]   [{i}] {}.{}{} pc={}",
@@ -18762,53 +18787,51 @@ pub(crate) fn resolve_class_loader_aware(
     // misses an annotation that its name-keyed lookup just found.
     let loader_faithful = should_use_loader_initiated_resolution(shared, referencing_class_id)
         || isolated_url_definition;
-    let user_loader = if loader_faithful
-        && !name.starts_with('[')
-        && !is_global_resolution_namespace(name)
-    {
-        let direct_loader_id = shared
-            .class_manager
-            .read()
-            .get_loader_id(referencing_class_id);
-        match direct_loader_id {
-            Some(l @ cratonvm_types::ClassLoaderId::UserDefined(_)) => Some(l),
-            // `should_use_loader_initiated_resolution` just confirmed (via the
-            // `defining_loader_for` side table) that `referencing_class_id` WAS
-            // defined by a recognized user loader (Groovy or
-            // CompileWithForkedClassLoader) -- but `class_manager`'s own
-            // `loader_id` field for that same ClassId can disagree (return
-            // `Application`/`None`), silently discarding the gate's answer and
-            // falling all the way through to the loader-BLIND global fallback
-            // below. Observed for the `AotTestContextInitializers`/
-            // `AotTestContextInitializersFactory`/
-            // `DefaultCacheAwareContextLoaderDelegate`/
-            // `AotMergedContextConfiguration` family under
-            // `@CompileWithForkedClassLoader` (2026-07-22 AOT bean-override
-            // double-context-refresh session, see
-            // docs/known-issues/CRATONVM-SPRING-GENUINE-BUGLIST.md) -- a `new`
-            // instruction referencing one of these classes resolved via the
-            // global path instead of the fork's own already-loaded copy,
-            // busting a `Class`-identity-keyed cache
-            // (`AotMergedContextConfiguration.hashCode()`) and causing a
-            // second, uncustomized `ApplicationContext` to be created. Trust
-            // the side table `should_use_loader_initiated_resolution` already
-            // consulted directly instead of silently downgrading to "not a
-            // user loader" on a disagreement.
-            _ => cratonvm_native_builtins::classloader::defining_loader_for(
-                referencing_class_id.as_u32(),
-            )
-            .map(|loader_obj| {
-                let mut ctx = crate::vm::NativeContextImpl { shared, thread };
-                cratonvm_types::ClassLoaderId::UserDefined(
-                    cratonvm_native_builtins::classloader::loader_namespace_id(
-                        &mut ctx, loader_obj,
-                    ),
+    let user_loader =
+        if loader_faithful && !name.starts_with('[') && !is_global_resolution_namespace(name) {
+            let direct_loader_id = shared
+                .class_manager
+                .read()
+                .get_loader_id(referencing_class_id);
+            match direct_loader_id {
+                Some(l @ cratonvm_types::ClassLoaderId::UserDefined(_)) => Some(l),
+                // `should_use_loader_initiated_resolution` just confirmed (via the
+                // `defining_loader_for` side table) that `referencing_class_id` WAS
+                // defined by a recognized user loader (Groovy or
+                // CompileWithForkedClassLoader) -- but `class_manager`'s own
+                // `loader_id` field for that same ClassId can disagree (return
+                // `Application`/`None`), silently discarding the gate's answer and
+                // falling all the way through to the loader-BLIND global fallback
+                // below. Observed for the `AotTestContextInitializers`/
+                // `AotTestContextInitializersFactory`/
+                // `DefaultCacheAwareContextLoaderDelegate`/
+                // `AotMergedContextConfiguration` family under
+                // `@CompileWithForkedClassLoader` (2026-07-22 AOT bean-override
+                // double-context-refresh session, see
+                // docs/known-issues/CRATONVM-SPRING-GENUINE-BUGLIST.md) -- a `new`
+                // instruction referencing one of these classes resolved via the
+                // global path instead of the fork's own already-loaded copy,
+                // busting a `Class`-identity-keyed cache
+                // (`AotMergedContextConfiguration.hashCode()`) and causing a
+                // second, uncustomized `ApplicationContext` to be created. Trust
+                // the side table `should_use_loader_initiated_resolution` already
+                // consulted directly instead of silently downgrading to "not a
+                // user loader" on a disagreement.
+                _ => cratonvm_native_builtins::classloader::defining_loader_for(
+                    referencing_class_id.as_u32(),
                 )
-            }),
-        }
-    } else {
-        None
-    };
+                .map(|loader_obj| {
+                    let mut ctx = crate::vm::NativeContextImpl { shared, thread };
+                    cratonvm_types::ClassLoaderId::UserDefined(
+                        cratonvm_native_builtins::classloader::loader_namespace_id(
+                            &mut ctx, loader_obj,
+                        ),
+                    )
+                }),
+            }
+        } else {
+            None
+        };
     if dbg_trace {
         eprintln!("[LOADER-TRACE] name={name} user_loader={user_loader:?}");
     }
@@ -20276,13 +20299,8 @@ fn execute_invoke_kind(
         // loader too. The cache-preparation probe must not create a global
         // duplicate before the actual invokeinterface dispatch has a chance to
         // use its loader-local constant-pool identity.
-        let loaded = resolve_class_loader_aware(
-            shared,
-            thread,
-            current_class_id,
-            &method_class_name,
-        )
-        .ok();
+        let loaded =
+            resolve_class_loader_aware(shared, thread, current_class_id, &method_class_name).ok();
         loaded.and_then(|cid| {
             let cm = shared.class_manager.read();
             cm.get_class(cid).filter(|c| c.is_interface()).map(|_| cid)
@@ -21038,10 +21056,7 @@ fn execute_invoke_kind(
                                                 .heap
                                                 .is_object_address(parent)
                                                 .map(|p| {
-                                                    format!(
-                                                        "{:?}",
-                                                        shared.heap.get_field(p, fidx)
-                                                    )
+                                                    format!("{:?}", shared.heap.get_field(p, fidx))
                                                 })
                                                 .unwrap_or_else(|| "<parent-not-obj>".into());
                                             eprintln!(
@@ -21953,9 +21968,9 @@ fn execute_invoke_kind(
     let is_lambda_receiver = receiver_class_id
         .map(|c| shared.lambda_proxies.read().contains_key(&c))
         .unwrap_or(false);
-    let result = if let Some(rcv_cid) = dispatch_override.or_else(|| {
-        receiver_class_id.filter(|c| *c != ClassId::new(0) && !is_lambda_receiver)
-    }) {
+    let result = if let Some(rcv_cid) = dispatch_override
+        .or_else(|| receiver_class_id.filter(|c| *c != ClassId::new(0) && !is_lambda_receiver))
+    {
         crate::vm::invoke_on_class_shared(
             shared,
             thread,
@@ -23194,7 +23209,7 @@ fn try_invoke_cached_lambda_impl(
         && &*cached.method_descriptor == "(I)D"
     {
         let compiled = {
-            let cache = shared.jit_cache.read();
+            let cache = shared.jit.jit_cache.read();
             cache.get(
                 &cached.class_name,
                 &cached.method_name,
@@ -25287,8 +25302,13 @@ pub(crate) fn is_h2_parser_native_override(
     ) {
         return matches!(
             (method_name, descriptor),
-            ("assertThat", "(Ljava/lang/String;)Lorg/assertj/core/api/AbstractStringAssert;")
-                | ("assertThat", "(Ljava/lang/Comparable;)Lorg/assertj/core/api/AbstractComparableAssert;")
+            (
+                "assertThat",
+                "(Ljava/lang/String;)Lorg/assertj/core/api/AbstractStringAssert;"
+            ) | (
+                "assertThat",
+                "(Ljava/lang/Comparable;)Lorg/assertj/core/api/AbstractComparableAssert;"
+            )
         );
     }
     if matches!(
@@ -28774,8 +28794,14 @@ pub(crate) fn is_string_builder_layout_native_override(
         // writes through `String.checkIndex` against the compact
         // byte[]/coder layout, which CratonVM's synthetic builder doesn't
         // have, so it AIOOBE'd instead of writing the synthetic char[].
-        "<init>" | "append" | "charAt" | "delete" | "getChars" | "insert"
-            | "setCharAt" | "toString"
+        "<init>"
+            | "append"
+            | "charAt"
+            | "delete"
+            | "getChars"
+            | "insert"
+            | "setCharAt"
+            | "toString"
     ) {
         return true;
     }
@@ -31348,7 +31374,10 @@ fn populate_invoke_cache(
     is_special: bool,
 ) {
     // Check if already cached
-    if let Some(existing) = thread.invoke_cache.get(caller_class_id, cp_index, is_special) {
+    if let Some(existing) = thread
+        .invoke_cache
+        .get(caller_class_id, cp_index, is_special)
+    {
         if std::env::var("CRATONVM_DBG_LOADER_TRACE").is_ok() {
             let dbg_relevant = matches!(
                 resolve_method_ref(shared, caller_class_id, cp_index),
@@ -31358,11 +31387,22 @@ fn populate_invoke_cache(
                 let desc = match existing {
                     CachedInvokeTarget::Bytecode { cached, .. } => format!(
                         "Bytecode declaring={:?} class={} {}{}",
-                        cached.declaring_class_id, cached.class_name, cached.method_name, cached.method_descriptor
+                        cached.declaring_class_id,
+                        cached.class_name,
+                        cached.method_name,
+                        cached.method_descriptor
                     ),
-                    CachedInvokeTarget::VirtualBytecode { receiver_class_id, cached, .. } => format!(
+                    CachedInvokeTarget::VirtualBytecode {
+                        receiver_class_id,
+                        cached,
+                        ..
+                    } => format!(
                         "VirtualBytecode rc={:?} declaring={:?} class={} {}{}",
-                        receiver_class_id, cached.declaring_class_id, cached.class_name, cached.method_name, cached.method_descriptor
+                        receiver_class_id,
+                        cached.declaring_class_id,
+                        cached.class_name,
+                        cached.method_name,
+                        cached.method_descriptor
                     ),
                     CachedInvokeTarget::Native { .. } => "Native".to_string(),
                     CachedInvokeTarget::VirtualNative { .. } => "VirtualNative".to_string(),
@@ -31383,9 +31423,9 @@ fn populate_invoke_cache(
     // invokestatic/invokespecial sites may have a per-loader owner that differs
     // from the flat global owner.
     let resolved = match resolve_method_metadata(shared, caller_class_id, cp_index) {
-            Ok(resolved) => resolved,
-            Err(_) => return,
-        };
+        Ok(resolved) => resolved,
+        Err(_) => return,
+    };
     let symbolic_class_name = Arc::clone(&resolved.class_name);
     let mut class_name = Arc::clone(&resolved.class_name);
     let method_name = Arc::clone(&resolved.method_name);
@@ -31733,8 +31773,7 @@ fn execute_invokestatic_cached(
     cp_index: u16,
 ) -> Result<CachedCallResult, MethodCallFailed> {
     let caller_class_id = thread.frames[frame_idx].class_id;
-    let continuation_interpreted =
-        matches!(thread.kind, crate::threading::ThreadKind::Virtual);
+    let continuation_interpreted = matches!(thread.kind, crate::threading::ThreadKind::Virtual);
 
     // Thread-local invoke cache — no locking needed. invokestatic uses
     // is_special=false since static calls never collide cp_index with
@@ -31883,7 +31922,7 @@ fn execute_invokestatic_cached(
             // Fast path: check if the method was already JIT-compiled (e.g. by OSR)
             // before going through the invocation counter.
             if !redefine_jit_quiesced && !continuation_interpreted {
-                let jit_cache = shared.jit_cache.read();
+                let jit_cache = shared.jit.jit_cache.read();
                 if let Some(compiled) = jit_cache.get(
                     &cached.class_name,
                     &cached.method_name,
@@ -31983,7 +32022,7 @@ fn execute_invokestatic_cached(
             /// failure is retried within a few hundred calls rather than after
             /// another full warmup threshold.
             const JIT_RETRY_STRIDE: u32 = 64;
-            let invoc_count = shared.profile_store.increment_invocation(invoc_key);
+            let invoc_count = shared.jit.profile_store.increment_invocation(invoc_key);
             // Fire on the first crossing of the threshold, then re-attempt every
             // `JIT_RETRY_STRIDE` calls until the upgrade succeeds (after which
             // the invoke cache routes through JIT and this block is bypassed).
@@ -32007,7 +32046,7 @@ fn execute_invokestatic_cached(
                 //    (idempotent), then ENQUEUE-ONLY: the tiered manager's
                 //    `on_method_invocation` pushes a CompilationTask at the
                 //    recommended tier and the worker compiles it off the mutator
-                //    (publishing into `shared.jit_cache`). The mutator does NOT
+                //    (publishing into `shared.jit.jit_cache`). The mutator does NOT
                 //    compile inline; it keeps interpreting until the worker
                 //    publishes, at which point the `jit_cache` fast-path at the top
                 //    of the `Bytecode` arm flips this call site to `Jit`. (The
@@ -32029,6 +32068,7 @@ fn execute_invokestatic_cached(
                 // `+= 1` counting deflated its hotness view 64x (first C1
                 // recommendation at ~threshold + 64×c1_threshold real calls).
                 let recommended_tier = shared
+                    .jit
                     .tiered_manager
                     .on_method_invocation_observed(&tiered_key, invoc_count as u64);
                 if let Some(tier) = recommended_tier {
@@ -32235,7 +32275,7 @@ const OSR_THRESHOLD: u32 = 1_000;
 /// or `None` if OSR is not possible (method not JIT-compatible, compilation failed, etc.).
 /// wire-tiered-manager Step 5 (precise background OSR): compile (or reuse) an
 /// OSR-enterable artifact for `(class, method, descriptor)` and publish it into
-/// `shared.jit_cache`. Extracted verbatim from `try_osr`'s former inline compile
+/// `shared.jit.jit_cache`. Extracted verbatim from `try_osr`'s former inline compile
 /// closure so it can run **off the mutator** on the background compile worker
 /// (which holds no live frame): every input is method metadata, not runtime frame
 /// state. The mutator's `try_osr` then does the live-frame entry on the returned
@@ -32378,7 +32418,7 @@ fn compile_osr_artifact(
     // nuance, not correctness — so prefer it. Artifacts without an entry
     // here (or no cached artifact) recompile exactly as before.
     let cached_osr = {
-        let jit_cache = shared.jit_cache.read();
+        let jit_cache = shared.jit.jit_cache.read();
         jit_cache.get_osr(&class_name_arc, &method_name_arc, &descriptor_arc, class_id)
     };
     // Only reuse artifacts the OSR path itself produced: those carry the
@@ -33276,7 +33316,7 @@ fn compile_osr_artifact(
                 &descriptor_arc,
                 &mut cm,
             );
-            let mut jit_cache = shared.jit_cache.write();
+            let mut jit_cache = shared.jit.jit_cache.write();
             jit_cache.put_osr(
                 class_name_arc.clone(),
                 method_name_arc.clone(),
@@ -34281,7 +34321,7 @@ fn try_jit_upgrade_with_gate(
     }
     // Check shared JIT cache first
     {
-        let jit_cache = shared.jit_cache.read();
+        let jit_cache = shared.jit.jit_cache.read();
         if let Some(compiled) = jit_cache.get(
             &cached.class_name,
             &cached.method_name,
@@ -34595,7 +34635,7 @@ fn try_jit_upgrade_with_gate(
                     .read()
                     .find_class_by_name(callee_class)
                     .unwrap_or(ClassId::new(0));
-                let jit_cache = shared.jit_cache.read();
+                let jit_cache = shared.jit.jit_cache.read();
                 if let Some(compiled) = jit_cache.get(
                     &callee_class_arc,
                     &callee_method_arc,
@@ -34965,7 +35005,7 @@ fn try_jit_upgrade_with_gate(
                     method_name: callee_cached.method_name.clone(),
                     descriptor: callee_cached.method_descriptor.clone(),
                 };
-                shared.profile_store.get_profile(&profile_key)
+                shared.jit.profile_store.get_profile(&profile_key)
             };
             let c_helpers = crate::jit::helpers::build_helpers();
             let c_string_layout_resolver = || resolve_string_field_layout(shared);
@@ -35064,7 +35104,7 @@ fn try_jit_upgrade_with_gate(
                 &mut compiled,
             );
             {
-                let mut jit_cache = shared.jit_cache.write();
+                let mut jit_cache = shared.jit.jit_cache.write();
                 jit_cache.put(
                     callee_cached.class_name.clone(),
                     callee_cached.method_name.clone(),
@@ -35086,7 +35126,7 @@ fn try_jit_upgrade_with_gate(
             method_name: cached.method_name.clone(),
             descriptor: cached.method_descriptor.clone(),
         };
-        shared.profile_store.get_profile(&profile_key)
+        shared.jit.profile_store.get_profile(&profile_key)
     };
     let helpers = crate::jit::helpers::build_helpers();
     // Small-method inlining for the main tier-up compile. Without it, even a
@@ -35181,7 +35221,7 @@ fn try_jit_upgrade_with_gate(
         &mut compiled,
     );
     let compiled_arc = {
-        let mut jit_cache = shared.jit_cache.write();
+        let mut jit_cache = shared.jit.jit_cache.write();
         jit_cache.put(
             cached.class_name.clone(),
             cached.method_name.clone(),
@@ -35379,7 +35419,7 @@ pub fn try_jit_compile_callee(
             .read()
             .get_loaded_class_id(class_name)
             .unwrap_or(ClassId::new(0));
-        let jit_cache = shared.jit_cache.read();
+        let jit_cache = shared.jit.jit_cache.read();
         if let Some(compiled) = jit_cache.get(class_name, method_name, descriptor, probe_class_id) {
             // Cast: object/code pointer to integer address
             return Some((compiled.entry_ptr() as usize, compiled.needs_context()));
@@ -35854,7 +35894,7 @@ fn try_jit_compile_callee_slow(
             method_name: cached.method_name.clone(),
             descriptor: cached.method_descriptor.clone(),
         };
-        shared.profile_store.get_profile(&profile_key)
+        shared.jit.profile_store.get_profile(&profile_key)
     };
     let helpers = crate::jit::helpers::build_helpers();
 
@@ -36003,7 +36043,7 @@ fn try_jit_compile_callee_slow(
     // freshly compiled body becomes visible to mutators (their `jit_cache`
     // fast-path flips the call site to `Jit` on the next invocation, the
     // cross-thread analogue of flipping the invoke cache). The
-    // `shared.jit_cache.write()` is held for the MINIMAL scope: the receiver
+    // `shared.jit.jit_cache.write()` is held for the MINIMAL scope: the receiver
     // key `Arc` is built BEFORE the lock, the codegen + every resolver read of
     // `class_manager` already completed above (no VM lock is live here), and the
     // guard covers exactly the `put`. Holding nothing else means a mutator
@@ -36021,7 +36061,7 @@ fn try_jit_compile_callee_slow(
         &mut compiled,
     );
     {
-        let mut jit_cache = shared.jit_cache.write();
+        let mut jit_cache = shared.jit.jit_cache.write();
         jit_cache.put(
             receiver_key,
             method_name_key,
@@ -36046,7 +36086,7 @@ fn try_jit_compile_callee_slow(
 /// entry point the inline mutator path uses: [`try_jit_compile_callee`] does the
 /// by-name `(class, method, descriptor)` lookup, builds the constant-pool
 /// resolvers, calls `jit::try_compile`, and PUBLISHES the result into
-/// `shared.jit_cache`. Publishing into the shared cache is the cross-thread
+/// `shared.jit.jit_cache`. Publishing into the shared cache is the cross-thread
 /// "flip the invoke cache" mechanism: the per-thread `invoke_cache` is
 /// thread-local and cannot be mutated from here, but the `Bytecode` arm's
 /// `jit_cache` fast-path (interpreter.rs ~14366) upgrades the call site to
@@ -36109,7 +36149,7 @@ fn try_jit_compile_callee_slow(
 fn ensure_bg_compiler_started(shared: &SharedVm) {
     let weak_vm: std::sync::Weak<SharedVm> =
         shared.self_arc.read().as_ref().cloned().unwrap_or_default();
-    crate::jit::tiered::ensure_background_compiler(&shared.tiered_manager, || {
+    crate::jit::tiered::ensure_background_compiler(&shared.jit.tiered_manager, || {
         Box::new(
             move |task: &crate::jit::tiered::CompilationTask| -> crate::jit::tiered::CompileOutcome {
                 background_compile_task(&weak_vm, task)
@@ -38606,7 +38646,7 @@ fn execute_invokevirtual_vtable_fast(
 
     if crate::jit::profile::is_profiling_enabled() {
         let (cid, mn, md) = method_key_parts(&thread.frames[frame_idx]);
-        shared.profile_store.record_receiver_borrowed(
+        shared.jit.profile_store.record_receiver_borrowed(
             cid,
             mn,
             md,
@@ -38825,21 +38865,31 @@ fn execute_invokevirtual_cached(
     let caller_class_id = thread.frames[frame_idx].class_id;
 
     if std::env::var_os("CRATONVM_DBG_H2TRACE").is_some() {
-        if let Ok((owner, method, descriptor, _)) = resolve_method_ref(shared, caller_class_id, cp_index) {
+        if let Ok((owner, method, descriptor, _)) =
+            resolve_method_ref(shared, caller_class_id, cp_index)
+        {
             if method.as_ref() == "prepareJoinBatch" {
                 let cm = shared.class_manager.read();
-                let caller_name = cm.get_class(caller_class_id).map(|c| c.name.to_string()).unwrap_or_default();
+                let caller_name = cm
+                    .get_class(caller_class_id)
+                    .map(|c| c.name.to_string())
+                    .unwrap_or_default();
                 let caller_loader = cm.get_loader_id(caller_class_id);
                 let receiver = thread.frames[frame_idx].stack.peek_at(0);
                 let recv_info = if let Value::Object(Some(r)) = receiver {
                     let rcid = shared.heap.class_id_of(r);
-                    let rname = cm.get_class(rcid).map(|c| c.name.to_string()).unwrap_or_default();
+                    let rname = cm
+                        .get_class(rcid)
+                        .map(|c| c.name.to_string())
+                        .unwrap_or_default();
                     let rloader = cm.get_loader_id(rcid);
                     format!("class_id={rcid:?} class={rname} loader={rloader:?}")
                 } else {
                     format!("{receiver:?}")
                 };
-                let cached = thread.invoke_cache.get(caller_class_id, cp_index, is_special);
+                let cached = thread
+                    .invoke_cache
+                    .get(caller_class_id, cp_index, is_special);
                 let cached_info = cached.as_ref().map(|t| format!("{t:?}"));
                 drop(cm);
                 eprintln!(
@@ -39056,7 +39106,7 @@ fn execute_invokevirtual_cached(
                     let actual_class_id = shared.heap.class_id_of(obj_ref);
                     if crate::jit::profile::is_profiling_enabled() {
                         let (cid, mn, md) = method_key_parts(&thread.frames[frame_idx]);
-                        shared.profile_store.record_receiver_borrowed(
+                        shared.jit.profile_store.record_receiver_borrowed(
                             cid,
                             mn,
                             md,
@@ -39368,7 +39418,7 @@ fn execute_invokevirtual_cached(
                     {
                         // Fast path: already compiled (by this counter or OSR)?
                         let compiled_opt = {
-                            let jc = shared.jit_cache.read();
+                            let jc = shared.jit.jit_cache.read();
                             jc.get(
                                 &cached.class_name,
                                 &cached.method_name,
@@ -39393,7 +39443,7 @@ fn execute_invokevirtual_cached(
                             };
                             const JIT_RETRY_STRIDE: u32 = 64;
                             let threshold = crate::runtime::env_cache::jit_invocation_threshold();
-                            let cnt = shared.profile_store.increment_invocation(invoc_key);
+                            let cnt = shared.jit.profile_store.increment_invocation(invoc_key);
                             let should_attempt = cnt >= threshold
                                 && (cnt == threshold || (cnt - threshold) % JIT_RETRY_STRIDE == 0);
                             if should_attempt {
@@ -39415,6 +39465,7 @@ fn execute_invokevirtual_cached(
                                     // twin: stride-boundary `+= 1` counting deflated
                                     // the manager's hotness view 64x.
                                     let _ = shared
+                                        .jit
                                         .tiered_manager
                                         .on_method_invocation_observed(&tiered_key, cnt as u64);
                                 } else if let Some(CachedInvokeTarget::Jit { compiled, .. }) =
@@ -39527,7 +39578,7 @@ fn execute_invokevirtual_cached(
                     let actual_class_id = shared.heap.class_id_of(obj_ref);
                     if crate::jit::profile::is_profiling_enabled() {
                         let (cid, mn, md) = method_key_parts(&thread.frames[frame_idx]);
-                        shared.profile_store.record_receiver_borrowed(
+                        shared.jit.profile_store.record_receiver_borrowed(
                             cid,
                             mn,
                             md,
@@ -39669,7 +39720,7 @@ fn execute_invokevirtual_cached(
                         let actual_class_id = shared.heap.class_id_of(obj_ref);
                         if crate::jit::profile::is_profiling_enabled() {
                             let (cid, mn, md) = method_key_parts(&thread.frames[frame_idx]);
-                            shared.profile_store.record_receiver_borrowed(
+                            shared.jit.profile_store.record_receiver_borrowed(
                                 cid,
                                 mn,
                                 md,
@@ -40186,7 +40237,11 @@ fn populate_virtual_invoke_cache(
             // silently no-ops instead of throwing "wanted but not invoked".
             let declaring_redefined_not_immune = crate::classloading::any_class_redefined()
                 && cm.class_redefine_generation(declaring_id) > 0
-                && !redefine_immune_string_builder_native(declaring_name, &method_name, &descriptor)
+                && !redefine_immune_string_builder_native(
+                    declaring_name,
+                    &method_name,
+                    &descriptor,
+                )
                 && !redefine_immune_path_native(declaring_name, &method_name, &descriptor);
             let intrinsic_kind = if declaring_redefined_not_immune {
                 None
@@ -40313,16 +40368,14 @@ fn populate_virtual_invoke_cache(
             && !redefine_immune_reflection_native(&lookup_name, &method_name)
             && !redefine_immune_string_builder_native(&lookup_name, &method_name, &descriptor)
             && !redefine_immune_path_native(&lookup_name, &method_name, &descriptor);
-        let direct_native_callback = if native_signature_may_exist
-            && !is_real_tpe_execute
-            && !receiver_redefined
-        {
-            shared
-                .native_methods
-                .find(&lookup_name, &method_name, &descriptor)
-        } else {
-            None
-        };
+        let direct_native_callback =
+            if native_signature_may_exist && !is_real_tpe_execute && !receiver_redefined {
+                shared
+                    .native_methods
+                    .find(&lookup_name, &method_name, &descriptor)
+            } else {
+                None
+            };
         if let Some(callback) = direct_native_callback {
             // WP2.4-F1: gate bound to the receiver class (where dispatch
             // landed). A redefine of the receiver swaps the method body.
@@ -40903,11 +40956,10 @@ fn resolve_method_metadata(
         native_target,
         native_kind,
     };
-    shared.resolution_cache.write().put_method(
-        current_class_id,
-        cp_index,
-        resolved.clone(),
-    );
+    shared
+        .resolution_cache
+        .write()
+        .put_method(current_class_id, cp_index, resolved.clone());
 
     Ok(resolved)
 }

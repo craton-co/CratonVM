@@ -1192,9 +1192,7 @@ fn safe_native_call_impl(
                     let site = thread
                         .frames
                         .last()
-                        .map(|f| {
-                            format!("{}.{} pc={}", f.class_name(), f.method_name(), f.pc)
-                        })
+                        .map(|f| format!("{}.{} pc={}", f.class_name(), f.method_name(), f.pc))
                         .unwrap_or_default();
                     crate::runtime::interpreter::nret_record(
                         callback as usize,
@@ -2050,9 +2048,8 @@ fn resume_virtual_continuation(shared: std::sync::Arc<SharedVm>, vt_id: u64) {
             &[Value::Object(Some(thread_obj))],
         )
     };
-    if let Err(MethodCallFailed::InternalError(VmError::ContinuationYield {
-        wake_after_nanos,
-    })) = &result
+    if let Err(MethodCallFailed::InternalError(VmError::ContinuationYield { wake_after_nanos })) =
+        &result
     {
         NativeContextImpl {
             shared: &shared,
@@ -2080,7 +2077,10 @@ fn resume_virtual_continuation(shared: std::sync::Arc<SharedVm>, vt_id: u64) {
                     receiver_class,
                     "dispatchUncaughtException",
                     "(Ljava/lang/Throwable;)V",
-                    &[Value::Object(Some(thread_obj)), Value::Object(Some(exception))],
+                    &[
+                        Value::Object(Some(thread_obj)),
+                        Value::Object(Some(exception)),
+                    ],
                 );
             }
             thread.native_pin_roots.truncate(pin_base);
@@ -2104,8 +2104,8 @@ fn resume_virtual_continuation(shared: std::sync::Arc<SharedVm>, vt_id: u64) {
     shared.heap.flush_thread_satb();
 
     let wake_obj = shared.thread_registry.java_thread_obj(tid);
-    let term_monitor = wake_obj.and_then(
-        |thread_obj| match shared.monitors.enter_inflated_or_contend(thread_obj, tid) {
+    let term_monitor = wake_obj.and_then(|thread_obj| {
+        match shared.monitors.enter_inflated_or_contend(thread_obj, tid) {
             Ok((monitor, contended)) => {
                 if contended {
                     NativeContextImpl {
@@ -2123,8 +2123,8 @@ fn resume_virtual_continuation(shared: std::sync::Arc<SharedVm>, vt_id: u64) {
                 Some(monitor)
             }
             Err(_) => None,
-        },
-    );
+        }
+    });
 
     thread.tlab.retire();
     NativeContextImpl {
@@ -3353,7 +3353,7 @@ impl<'a> NativeContextImpl<'a> {
         // JVMTI redefinition can stale caller-side direct calls and inline
         // dispatch caches, not just compiled bodies declared by `name`. Full
         // eviction is rare and keeps agent-woven bytecode authoritative.
-        let evicted = self.shared.jit_cache.write().clear_all();
+        let evicted = self.shared.jit.jit_cache.write().clear_all();
         if evicted > 0 {
             tracing::debug!(
                 "JIT: fully invalidated {evicted} method(s) due to redefineClass: {name}"
@@ -3527,20 +3527,33 @@ fn compact_java_string_hash(shared: &SharedVm, object: ObjectRef) -> Option<i32>
     if !is_real_java_string(shared, object) {
         return None;
     }
-    let (Value::Object(Some(bytes)), Value::Int(coder)) =
-        (shared.heap.get_field(object, 0), shared.heap.get_field(object, 1))
-    else { return None; };
+    let (Value::Object(Some(bytes)), Value::Int(coder)) = (
+        shared.heap.get_field(object, 0),
+        shared.heap.get_field(object, 1),
+    ) else {
+        return None;
+    };
     if !matches!(coder, 0 | 1)
-        || shared.heap.array_element_type(bytes) != Some(ArrayElementType::Byte) { return None; }
+        || shared.heap.array_element_type(bytes) != Some(ArrayElementType::Byte)
+    {
+        return None;
+    }
     let ptr = shared.heap.array_data_ptr(bytes)?;
-    let raw = unsafe { std::slice::from_raw_parts(ptr as *const u8, shared.heap.array_length(bytes)) };
+    let raw =
+        unsafe { std::slice::from_raw_parts(ptr as *const u8, shared.heap.array_length(bytes)) };
     let mut hash = 0i32;
     if coder == 0 {
-        for &byte in raw { hash = hash.wrapping_mul(31).wrapping_add(byte as i32); }
+        for &byte in raw {
+            hash = hash.wrapping_mul(31).wrapping_add(byte as i32);
+        }
     } else {
-        if raw.len() & 1 != 0 { return None; }
+        if raw.len() & 1 != 0 {
+            return None;
+        }
         for unit in raw.chunks_exact(2) {
-            hash = hash.wrapping_mul(31).wrapping_add(u16::from_le_bytes([unit[0], unit[1]]) as i32);
+            hash = hash
+                .wrapping_mul(31)
+                .wrapping_add(u16::from_le_bytes([unit[0], unit[1]]) as i32);
         }
     }
     Some(hash)
@@ -3557,14 +3570,16 @@ fn compact_java_strings_equal(shared: &SharedVm, left: ObjectRef, right: ObjectR
     if shared.heap.class_id_of(left) != shared.heap.class_id_of(right) {
         return false;
     }
-    let (Value::Object(Some(left_bytes)), Value::Int(left_coder)) =
-        (shared.heap.get_field(left, 0), shared.heap.get_field(left, 1))
-    else {
+    let (Value::Object(Some(left_bytes)), Value::Int(left_coder)) = (
+        shared.heap.get_field(left, 0),
+        shared.heap.get_field(left, 1),
+    ) else {
         return false;
     };
-    let (Value::Object(Some(right_bytes)), Value::Int(right_coder)) =
-        (shared.heap.get_field(right, 0), shared.heap.get_field(right, 1))
-    else {
+    let (Value::Object(Some(right_bytes)), Value::Int(right_coder)) = (
+        shared.heap.get_field(right, 0),
+        shared.heap.get_field(right, 1),
+    ) else {
         return false;
     };
     if !matches!(left_coder, 0 | 1)
@@ -3954,7 +3969,9 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     // `handle_slots` splice.
 
     fn handle_scope_push(&mut self) {
-        self.thread.handle_scope_bases.push(self.thread.handle_slots.len());
+        self.thread
+            .handle_scope_bases
+            .push(self.thread.handle_slots.len());
     }
 
     fn handle_scope_pop(&mut self) {
@@ -3995,7 +4012,11 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     }
 
     fn handle_get(&self, slot: u32) -> Option<ObjectRef> {
-        self.thread.handle_slots.get(slot as usize).copied().flatten()
+        self.thread
+            .handle_slots
+            .get(slot as usize)
+            .copied()
+            .flatten()
     }
 
     fn add_global_root(&mut self, obj: ObjectRef) -> usize {
@@ -4032,7 +4053,8 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 index += 1;
                 continue;
             }
-            let Value::Int(mod_count) = self.shared.heap.get_field(map, entry.mod_count_slot) else {
+            let Value::Int(mod_count) = self.shared.heap.get_field(map, entry.mod_count_slot)
+            else {
                 self.thread.jit_hashmap_string_node_cache.swap_remove(index);
                 continue;
             };
@@ -4060,7 +4082,8 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 index += 1;
                 continue;
             }
-            let Value::Int(mod_count) = self.shared.heap.get_field(map, entry.mod_count_slot) else {
+            let Value::Int(mod_count) = self.shared.heap.get_field(map, entry.mod_count_slot)
+            else {
                 self.thread.jit_hashmap_string_node_cache.swap_remove(index);
                 continue;
             };
@@ -4076,11 +4099,9 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     fn hashmap_string_node_cache_put(&mut self, map: ObjectRef, key: &str, node: ObjectRef) {
         let class_id = self.shared.heap.class_id_of(map);
         let fields = self.shared.class_manager.read();
-        let Some(mod_count_slot) = resolve_field_index_in_hierarchy(
-            class_id,
-            "modCount",
-            &fields.class_store,
-        ) else {
+        let Some(mod_count_slot) =
+            resolve_field_index_in_hierarchy(class_id, "modCount", &fields.class_store)
+        else {
             return;
         };
         drop(fields);
@@ -5080,7 +5101,8 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     }
 
     fn new_array(&mut self, element_type: ArrayElementType, length: usize) -> ObjectRef {
-        let array = self.shared
+        let array = self
+            .shared
             .heap
             .alloc_array(ClassId::new(0), element_type, length);
         if crate::runtime::env_cache::disable_jit() && self.shared.heap.needs_gc() {
@@ -5104,7 +5126,8 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 length, frame
             );
         }
-        let array = self.shared
+        let array = self
+            .shared
             .heap
             .alloc_array(class_id, ArrayElementType::Reference, length);
         if crate::runtime::env_cache::disable_jit() && self.shared.heap.needs_gc() {
@@ -5562,13 +5585,21 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         super::create_java_string_uninterned_gc_safe_threaded(self.shared, self.thread, text)
     }
 
-    fn get_ascii_case_string_cached(&mut self, source: ObjectRef, upper: bool) -> Option<ObjectRef> {
+    fn get_ascii_case_string_cached(
+        &mut self,
+        source: ObjectRef,
+        upper: bool,
+    ) -> Option<ObjectRef> {
         let entry = self
             .thread
             .string_case_cache
             .iter_mut()
             .find(|entry| entry.source == source && entry.upper == upper)?;
-        let result = if entry.next { entry.second } else { entry.first };
+        let result = if entry.next {
+            entry.second
+        } else {
+            entry.first
+        };
         entry.next = !entry.next;
         Some(result)
     }
@@ -5597,15 +5628,15 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         if self.thread.string_case_cache.len() >= 32 {
             self.thread.string_case_cache.remove(0);
         }
-        self.thread.string_case_cache.push(
-            crate::threading::jvm_thread::StringCaseCacheEntry {
+        self.thread
+            .string_case_cache
+            .push(crate::threading::jvm_thread::StringCaseCacheEntry {
                 source,
                 upper,
                 first,
                 second,
                 next: true,
-            },
-        );
+            });
         first
     }
 
@@ -6766,10 +6797,9 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 tid,
                 &virtual_runtime.tlab as *const cratonvm_gc::Tlab as usize,
             );
-            self.shared.thread_registry.set_jvm_thread_addr(
-                tid,
-                (&*virtual_runtime as *const JvmThread) as usize,
-            );
+            self.shared
+                .thread_registry
+                .set_jvm_thread_addr(tid, (&*virtual_runtime as *const JvmThread) as usize);
             self.shared
                 .virtual_thread_manager
                 .install_runtime(tid.0, virtual_runtime);
@@ -7378,8 +7408,8 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         thread_obj: ObjectRef,
     ) -> Option<cratonvm_native_api::ThreadJmxSnapshot> {
         let registry_tid = resolve_thread_id_from_thread_obj(self.shared, thread_obj)?;
-        let thread_id = read_java_thread_tid(self.shared, thread_obj)
-            .unwrap_or(registry_tid.0) as i64;
+        let thread_id =
+            read_java_thread_tid(self.shared, thread_obj).unwrap_or(registry_tid.0) as i64;
         let thread_name = match self.get_field_by_name(thread_obj, "name") {
             Value::Object(Some(name)) => super::read_java_string(&self.shared.heap, name),
             _ => None,
@@ -10150,7 +10180,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 // the same manager).
                 drop(cm);
                 // Invalidate JIT-compiled methods that inlined from this class (Session 31)
-                let evicted = self.shared.jit_cache.write().invalidate_for_class(name);
+                let evicted = self.shared.jit.jit_cache.write().invalidate_for_class(name);
                 if evicted > 0 {
                     tracing::debug!(
                         "JIT: invalidated {evicted} method(s) due to class reload: {name}"
@@ -10194,6 +10224,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 // JIT cache defensively.
                 let evicted = self
                     .shared
+                    .jit
                     .jit_cache
                     .write()
                     .invalidate_for_class(stored_name);
@@ -10219,7 +10250,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         match cm.define_class(name, bytes, ClassLoaderId::UserDefined(loader_id)) {
             Ok(cid) => {
                 drop(cm);
-                let evicted = self.shared.jit_cache.write().invalidate_for_class(name);
+                let evicted = self.shared.jit.jit_cache.write().invalidate_for_class(name);
                 if evicted > 0 {
                     tracing::debug!(
                         "JIT: invalidated {evicted} method(s) due to class reload: {name}"
@@ -10298,7 +10329,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         };
 
         // Invalidate JIT for any class with the same name (handles redefine).
-        let evicted = self.shared.jit_cache.write().invalidate_for_class(name);
+        let evicted = self.shared.jit.jit_cache.write().invalidate_for_class(name);
         if evicted > 0 {
             tracing::debug!("JIT: invalidated {evicted} method(s) due to defineClass: {name}");
         }
@@ -11323,9 +11354,10 @@ pub fn invoke_or_native(
         }
     }
 
-    if let Some((callback, native_kind)) = shared
-        .native_methods
-        .find_with_kind(effective_class, method_name, descriptor)
+    if let Some((callback, native_kind)) =
+        shared
+            .native_methods
+            .find_with_kind(effective_class, method_name, descriptor)
     {
         if crate::runtime::env_cache::bd_debug() && method_name == "intValue" {
             eprintln!("[invoke_or_native] direct native hit");
@@ -11343,8 +11375,7 @@ pub fn invoke_or_native(
         // above -- a full byte-walk of all three strings, twice, on every
         // single native dispatch VM-wide. `find_with_kind` above folds both
         // lookups into one hash computation. See its doc comment.
-        let synthetic_stub_native =
-            native_kind == cratonvm_native_api::NativeKind::SyntheticStub;
+        let synthetic_stub_native = native_kind == cratonvm_native_api::NativeKind::SyntheticStub;
         let real_protected_stub = synthetic_stub_native
             && (crate::runtime::env_cache::real_bytecode_selector().prefers_real(effective_class)
                 || matches!(
@@ -15021,17 +15052,17 @@ fn invoke_on_class_shared_inner(
                     | "sun/security/ssl/SSLServerSocketFactoryImpl"
             ) {
                 if let Some(callback) = shared
-                        .native_methods
-                        // The real JDK factory carries its SSLContext in the
-                        // same first instance slot consumed by the bridge.
-                        // Reuse the bridge registered on its public API type
-                        // rather than interpreting `SSLServerSocketImpl`,
-                        // whose host socket path bypasses the TLS registry.
-                        .find(
-                            "javax/net/ssl/SSLServerSocketFactory",
-                            method_name,
-                            descriptor,
-                        )
+                    .native_methods
+                    // The real JDK factory carries its SSLContext in the
+                    // same first instance slot consumed by the bridge.
+                    // Reuse the bridge registered on its public API type
+                    // rather than interpreting `SSLServerSocketImpl`,
+                    // whose host socket path bypasses the TLS registry.
+                    .find(
+                        "javax/net/ssl/SSLServerSocketFactory",
+                        method_name,
+                        descriptor,
+                    )
                 {
                     return safe_native_call(shared, thread, callback, args)
                         .map(|value| coerce_native_return(value, descriptor));
@@ -18485,7 +18516,9 @@ fn invoke_on_class_shared_inner(
                             );
                         }
                         for (ago, site) in crate::runtime::interpreter::push_prov_find(addr) {
-                            eprintln!("  NSME-RECV [pushprov] pushed {ago} invoke-returns ago at {site}");
+                            eprintln!(
+                                "  NSME-RECV [pushprov] pushed {ago} invoke-returns ago at {site}"
+                            );
                         }
                         for (ago, desc) in crate::runtime::interpreter::deposit_gap_find(addr) {
                             eprintln!("  NSME-RECV [deposit-gap] {ago} entries ago: {desc}");
@@ -19328,7 +19361,9 @@ mod tests {
             ctx: &mut dyn cratonvm_native_api::NativeContext,
             _args: &[Value],
         ) -> MethodCallResult {
-            Ok(Some(Value::Object(Some(ctx.alloc_object(ClassId::new(0), 0)))))
+            Ok(Some(Value::Object(Some(
+                ctx.alloc_object(ClassId::new(0), 0),
+            ))))
         }
 
         let shared = test_shared();

@@ -3780,7 +3780,7 @@ extern "C" fn jni_define_class(
         // that may have inlined from a previously-loaded class of this name so
         // a redefinition is honoured rather than served stale.
         if let Some(n) = class_name.as_deref() {
-            let _ = shared.jit_cache.write().invalidate_for_class(n);
+            let _ = shared.jit.jit_cache.write().invalidate_for_class(n);
             let _ = shared.invalidate_jit_for_class(n);
         }
         Some(cid.as_u32() as JClass)

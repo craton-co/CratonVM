@@ -69,8 +69,8 @@ fn direct_static_compiled_callee_entry_enabled() -> bool {
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CACHE.get_or_init(
         || match std::env::var("CRATONVM_JIT_DISPATCH_CACHE_DIRECT_ENTRY") {
-        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
-        Err(_) => true,
+            Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+            Err(_) => true,
         },
     )
 }
@@ -1206,8 +1206,7 @@ unsafe fn try_call_compiled_entry_reentrant(
         // can be identified.
         let own = compiled.needs_context();
         if own != needs_ctx {
-            static MISMATCHES: std::sync::atomic::AtomicU64 =
-                std::sync::atomic::AtomicU64::new(0);
+            static MISMATCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let n = MISMATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if n < 16 || n.is_power_of_two() {
                 tracing::warn!(
@@ -1632,7 +1631,7 @@ pub(crate) fn compiled_entry_has_indy_trap(
         .read()
         .get_loaded_class_id(class_name)
         .unwrap_or(cratonvm_types::ClassId::new(0));
-    let jit_cache = vm.jit_cache.read();
+    let jit_cache = vm.jit.jit_cache.read();
     jit_cache
         .get(class_name, method_name, descriptor, class_id)
         .map_or(false, |c| c.has_indy_trap)
@@ -2187,10 +2186,8 @@ unsafe fn jit_newarray_finish(obj_ref: ObjectRef, atype: i64, length: i64) -> i6
         let class_id_raw = std::ptr::read(raw as *const u32);
         let kind_byte = *raw.add(4);
         let elem_byte = *raw.add(5);
-        let stored_len =
-            std::ptr::read(raw.add(cratonvm_types::ARRAY_LENGTH_OFFSET) as *const u32);
-        let num_slots =
-            std::ptr::read(raw.add(cratonvm_types::NUM_SLOTS_OFFSET) as *const u32);
+        let stored_len = std::ptr::read(raw.add(cratonvm_types::ARRAY_LENGTH_OFFSET) as *const u32);
+        let num_slots = std::ptr::read(raw.add(cratonvm_types::NUM_SLOTS_OFFSET) as *const u32);
         eprintln!(
             "[JIT-NA] ptr={:p} atype={} len={} cid={} kind={} elem={} arrlen={} num_slots={}",
             raw, atype, length, class_id_raw, kind_byte, elem_byte, stored_len, num_slots
@@ -2584,7 +2581,7 @@ fn jit_post_alloc_init(vm: &SharedVm, obj: ObjectRef, class_id: ClassId) {
     use crate::jit::alloc_class_cache::{alloc_class_cache_enabled, ClassAllocInfo, PrimKind};
 
     let cached = if alloc_class_cache_enabled() {
-        match vm.jit_alloc_class_cache.get(class_id.as_u32()) {
+        match vm.jit.jit_alloc_class_cache.get(class_id.as_u32()) {
             Some(info) => Some(info),
             None => {
                 // First slow-path allocation of this class: build the recipe
@@ -2632,7 +2629,7 @@ fn jit_post_alloc_init(vm: &SharedVm, obj: ObjectRef, class_id: ClassId) {
                         })
                     })
                 };
-                recipe.and_then(|r| vm.jit_alloc_class_cache.insert(class_id.as_u32(), r))
+                recipe.and_then(|r| vm.jit.jit_alloc_class_cache.insert(class_id.as_u32(), r))
             }
         }
     } else {
@@ -3230,16 +3227,13 @@ unsafe fn jit_compact_field_slot(
         return None;
     }
     // GC_FLAG_COMPACT is in the exported gc_flags byte.
-    let gc_flags = std::ptr::read(
-        (obj_ptr as *const u8).add(cratonvm_types::GC_FLAGS_OFFSET)
-    );
+    let gc_flags = std::ptr::read((obj_ptr as *const u8).add(cratonvm_types::GC_FLAGS_OFFSET));
     if gc_flags & cratonvm_types::GC_FLAG_COMPACT == 0 {
         return None;
     }
     let class_id = std::ptr::read(obj_ptr as *const u32); // class_id @ offset 0
-    let field_count = std::ptr::read(
-        (obj_ptr as *const u8).add(cratonvm_types::NUM_SLOTS_OFFSET) as *const u32,
-    );
+    let field_count =
+        std::ptr::read((obj_ptr as *const u8).add(cratonvm_types::NUM_SLOTS_OFFSET) as *const u32);
     let layout = cratonvm_types::class_layout_for_fields(class_id, field_count)?;
     Some((
         layout.field_offset(field_index as usize)? as usize,
@@ -3343,11 +3337,8 @@ pub unsafe extern "C" fn jit_getfield(vm_ptr: i64, obj_ptr: i64, field_index: i6
         // `firstReaderHoldCount`) -- see
         // docs/known-issues/elasticsearch-lucene-binary-docvalues-range-hangs.md
         // #3 for the interpreter-side counterpart of this same gap.
-        let val: Value = cratonvm_types::read_compact_field(
-            ptr,
-            storage,
-            std::sync::atomic::Ordering::Relaxed,
-        );
+        let val: Value =
+            cratonvm_types::read_compact_field(ptr, storage, std::sync::atomic::Ordering::Relaxed);
         return match val {
             Value::Int(i) => i as i64,
             Value::Long(l) => l,
@@ -3416,9 +3407,8 @@ unsafe fn jit_putfield_slot_in_bounds(obj_ptr: i64, field_index: i64) -> bool {
         return false;
     }
     // shape/num_slots is a u32 at the exported NUM_SLOTS_OFFSET.
-    let num_slots = std::ptr::read(
-        (obj_ptr as *const u8).add(cratonvm_types::NUM_SLOTS_OFFSET) as *const u32
-    );
+    let num_slots =
+        std::ptr::read((obj_ptr as *const u8).add(cratonvm_types::NUM_SLOTS_OFFSET) as *const u32);
     (field_index as u64) < num_slots as u64
 }
 
@@ -3467,11 +3457,7 @@ pub unsafe extern "C" fn jit_putfield_int(obj_ptr: i64, field_index: i64, val: i
     if crate::runtime::env_cache::jit_pfi_trace() {
         // Read existing value to see if we're overwriting a ref with an int
         let existing = if let Some(storage) = storage {
-            cratonvm_types::read_compact_field(
-                ptr,
-                storage,
-                std::sync::atomic::Ordering::Relaxed,
-            )
+            cratonvm_types::read_compact_field(ptr, storage, std::sync::atomic::Ordering::Relaxed)
         } else {
             cratonvm_types::read_value_atomic(ptr as *const Value)
         };
@@ -4661,17 +4647,14 @@ pub unsafe extern "C" fn jit_throw_aioobe(
             let elem_ty = std::ptr::read_unaligned(base.add(5) as *const u8);
             let ident_hash = std::ptr::read_unaligned(base.add(8) as *const i32);
             let arr_len_hdr = std::ptr::read_unaligned(
-                base.add(cratonvm_types::ARRAY_LENGTH_OFFSET) as *const u32
+                base.add(cratonvm_types::ARRAY_LENGTH_OFFSET) as *const u32,
             );
-            let num_slots = std::ptr::read_unaligned(
-                base.add(cratonvm_types::NUM_SLOTS_OFFSET) as *const u32
-            );
-            let gc_age = std::ptr::read_unaligned(
-                base.add(cratonvm_types::GC_AGE_OFFSET) as *const u8
-            );
-            let gc_flags = std::ptr::read_unaligned(
-                base.add(cratonvm_types::GC_FLAGS_OFFSET) as *const u8
-            );
+            let num_slots =
+                std::ptr::read_unaligned(base.add(cratonvm_types::NUM_SLOTS_OFFSET) as *const u32);
+            let gc_age =
+                std::ptr::read_unaligned(base.add(cratonvm_types::GC_AGE_OFFSET) as *const u8);
+            let gc_flags =
+                std::ptr::read_unaligned(base.add(cratonvm_types::GC_FLAGS_OFFSET) as *const u8);
             let fwd_ptr = std::ptr::read_unaligned(
                 base.add(cratonvm_types::FORWARDING_PTR_OFFSET) as *const usize
             );
@@ -5619,10 +5602,13 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
             .read()
             .get_loaded_class_id(info.class_name)
             .unwrap_or(cratonvm_types::ClassId::new(0));
-        let jit_cache = vm.jit_cache.read();
-        if let Some(compiled) =
-            jit_cache.get(info.class_name, info.method_name, info.descriptor, info_class_id)
-        {
+        let jit_cache = vm.jit.jit_cache.read();
+        if let Some(compiled) = jit_cache.get(
+            info.class_name,
+            info.method_name,
+            info.descriptor,
+            info_class_id,
+        ) {
             let entry = compiled.entry_ptr() as usize;
             let needs_ctx = compiled.needs_context();
             if crate::runtime::env_cache::jit_dispatch_dbg() {
@@ -5861,7 +5847,8 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
             // `virtual_dispatch_target_for_receiver` preserves the real receiver
             // class when available and otherwise supplies the CP-resolved class;
             // `invoke_or_native` then applies the VM's interface/abstract retarget.
-            let dispatch_class = virtual_dispatch_target_for_receiver(vm, receiver_ref, info).class_name;
+            let dispatch_class =
+                virtual_dispatch_target_for_receiver(vm, receiver_ref, info).class_name;
             let virt_result = crate::vm::invoke_or_native(
                 vm,
                 thread,
@@ -6319,7 +6306,10 @@ unsafe fn jit_concurrent_hashmap_receiver_is_exact(vm: &SharedVm, receiver: i64)
     if CONCURRENT_HASHMAP_CLASS_CACHE.with(|c| c.get() == Some((vm_key, cid))) {
         return !crate::classloading::any_class_redefined();
     }
-    let exact = vm.class_manager.read().get_class(ClassId::new(cid))
+    let exact = vm
+        .class_manager
+        .read()
+        .get_class(ClassId::new(cid))
         .map(|class| class.name.as_ref() == "java/util/concurrent/ConcurrentHashMap")
         .unwrap_or(false);
     if exact {
@@ -6332,18 +6322,25 @@ unsafe fn jit_concurrent_hashmap_receiver_is_exact(vm: &SharedVm, receiver: i64)
 /// receiver is exactly ConcurrentHashMap. All other receivers retain the
 /// canonical interface dispatcher.
 pub unsafe extern "C" fn jit_concurrent_hashmap_get_direct(
-    vm_ptr: i64, receiver: i64, key: i64,
+    vm_ptr: i64,
+    receiver: i64,
+    key: i64,
 ) -> i64 {
     crate::jit::conservative_roots::note_jit_boundary();
     jit_safepoint_flush_satb(vm_ptr);
     let vm = &*(vm_ptr as *const SharedVm);
-    if receiver != 0 && (receiver as u64 & 0x7) == 0 && (receiver as u64) < (1u64 << 48)
+    if receiver != 0
+        && (receiver as u64 & 0x7) == 0
+        && (receiver as u64) < (1u64 << 48)
         && jit_concurrent_hashmap_receiver_is_exact(vm, receiver)
     {
-        if let (Some(recv), Some((thread, _guard))) =
-            (vm.heap.is_object_address(receiver as usize), jit_thread_mut())
-        {
-            let key = if key == 0 { Value::Object(None) } else if let Some(key) = vm.heap.is_object_address(key as usize) {
+        if let (Some(recv), Some((thread, _guard))) = (
+            vm.heap.is_object_address(receiver as usize),
+            jit_thread_mut(),
+        ) {
+            let key = if key == 0 {
+                Value::Object(None)
+            } else if let Some(key) = vm.heap.is_object_address(key as usize) {
                 Value::Object(Some(key))
             } else {
                 return 0;
@@ -6366,13 +6363,25 @@ pub unsafe extern "C" fn jit_concurrent_hashmap_get_direct(
                     return object.as_ptr() as i64;
                 }
                 Ok(Some(Value::Object(None))) | Ok(None) => return 0,
-                Ok(_) => {},
-                Err(error) => return handle_jit_dispatch_error(vm, thread, error, &CONCURRENT_HASHMAP_GET_DIRECT_INFO),
+                Ok(_) => {}
+                Err(error) => {
+                    return handle_jit_dispatch_error(
+                        vm,
+                        thread,
+                        error,
+                        &CONCURRENT_HASHMAP_GET_DIRECT_INFO,
+                    )
+                }
             }
         }
     }
     let args = [receiver, key];
-    jit_invoke_dispatch(vm_ptr, &CONCURRENT_HASHMAP_GET_DIRECT_INFO as *const JitInvokeInfo as i64, args.as_ptr() as i64, 2)
+    jit_invoke_dispatch(
+        vm_ptr,
+        &CONCURRENT_HASHMAP_GET_DIRECT_INFO as *const JitInvokeInfo as i64,
+        args.as_ptr() as i64,
+        2,
+    )
 }
 
 /// Thin direct-call target for JIT `invokevirtual HashMap.get(Object)` sites
@@ -6463,10 +6472,7 @@ pub unsafe extern "C" fn jit_hashmap_get_direct(vm_ptr: i64, receiver: i64, key:
                 return handle_jit_dispatch_error(vm, thread, error, &HASHMAP_GET_DIRECT_INFO)
             }
             None => {
-                let values = [
-                    Value::Object(Some(recv_obj)),
-                    key_val,
-                ];
+                let values = [Value::Object(Some(recv_obj)), key_val];
                 match crate::vm::safe_native_call_prevalidated_objects(
                     vm,
                     thread,
@@ -6525,14 +6531,41 @@ pub unsafe extern "C" fn jit_string_latin1_to_lower_direct(
     crate::jit::conservative_roots::note_jit_boundary();
     jit_safepoint_flush_satb(vm_ptr);
     let vm = &*(vm_ptr as *const SharedVm);
-    if source == 0 { return 0; }
-    let Some(source) = vm.heap.is_object_address(source as usize) else { return 0; };
-    let Some((thread, _guard)) = jit_thread_mut() else { return 0; };
-    let mut ctx = crate::vm::NativeContextImpl { shared: vm, thread: &mut *thread };
-    let result = if let Some(cached) = ctx.get_ascii_case_string_cached(source, false) { cached } else {
+    if source == 0 {
+        return 0;
+    }
+    let Some(source) = vm.heap.is_object_address(source as usize) else {
+        return 0;
+    };
+    let Some((thread, _guard)) = jit_thread_mut() else {
+        return 0;
+    };
+    let mut ctx = crate::vm::NativeContextImpl {
+        shared: vm,
+        thread: &mut *thread,
+    };
+    let result = if let Some(cached) = ctx.get_ascii_case_string_cached(source, false) {
+        cached
+    } else {
         let mut lower = ctx.read_string(source).unwrap_or_default();
-        let changed = if lower.is_ascii() { let changed = lower.bytes().any(|byte| byte.is_ascii_uppercase()); lower.make_ascii_lowercase(); changed } else { let folded = lower.to_lowercase(); if folded == lower { false } else { lower = folded; true } };
-        if changed { ctx.create_ascii_case_string_cached(source, &lower, false) } else { source }
+        let changed = if lower.is_ascii() {
+            let changed = lower.bytes().any(|byte| byte.is_ascii_uppercase());
+            lower.make_ascii_lowercase();
+            changed
+        } else {
+            let folded = lower.to_lowercase();
+            if folded == lower {
+                false
+            } else {
+                lower = folded;
+                true
+            }
+        };
+        if changed {
+            ctx.create_ascii_case_string_cached(source, &lower, false)
+        } else {
+            source
+        }
     };
     thread.native_pending_return = Some(result);
     result.as_ptr() as i64
@@ -7023,7 +7056,7 @@ pub unsafe extern "C" fn jit_lambda_int_to_double(vm_ptr: i64, proxy_raw: i64, i
         None => return f64::NAN.to_bits() as i64,
     };
     let mut compiled = {
-        let cache = vm.jit_cache.read();
+        let cache = vm.jit.jit_cache.read();
         cache.get(&class_name, "get", "(I)D", receiver_class_id)
     };
     if compiled.is_none() {
@@ -7036,7 +7069,11 @@ pub unsafe extern "C" fn jit_lambda_int_to_double(vm_ptr: i64, proxy_raw: i64, i
             "(I)D",
             true,
         );
-        compiled = vm.jit_cache.read().get(&class_name, "get", "(I)D", receiver_class_id);
+        compiled = vm
+            .jit
+            .jit_cache
+            .read()
+            .get(&class_name, "get", "(I)D", receiver_class_id);
     }
     if let Some(compiled) = compiled {
         let args = [receiver.as_ptr() as i64, index as i32 as i64];
@@ -7119,7 +7156,7 @@ unsafe fn try_fast_lambda_int_to_double_apply(
         None => return Ok(None),
     };
     let compiled = {
-        let cache = vm.jit_cache.read();
+        let cache = vm.jit.jit_cache.read();
         cache.get(&class_name, "get", "(I)D", receiver_class_id)
     };
     let Some(compiled) = compiled else {
@@ -8038,7 +8075,7 @@ impl DeoptimizationController {
                 .read()
                 .get_loaded_class_id(class_name)
                 .unwrap_or(cratonvm_types::ClassId::new(0));
-            let mut jit_cache = vm.jit_cache.write();
+            let mut jit_cache = vm.jit.jit_cache.write();
             jit_cache.remove(class_name, method_name, descriptor, class_id);
         }
 
@@ -8061,7 +8098,7 @@ impl DeoptimizationController {
                 | cratonvm_jit::deopt::DeoptReason::ClassCheck
                 | cratonvm_jit::deopt::DeoptReason::ClassLoading
         ) {
-            let mut inv_mgr = vm.invalidation_manager.lock();
+            let mut inv_mgr = vm.jit.invalidation_manager.lock();
             // Clear stale assumptions for the deoptimized method
             inv_mgr.clear_assumptions(&method_key);
         }
@@ -8082,7 +8119,7 @@ impl DeoptimizationController {
         // this fix exists to stop. See docs/known-issues/tomcat-08-07/
         // silent-hang-no-signature-cluster.md.
         if action == cratonvm_jit::deopt::DeoptAction::MakeNotCompilable {
-            let mut skip = vm.jit_skip_set.write();
+            let mut skip = vm.jit.jit_skip_set.write();
             skip.insert((class_name.into(), method_name.into(), descriptor.into()));
             cratonvm_jit::mark_jit_bail_listed(class_name, method_name, descriptor);
         }
@@ -8100,13 +8137,14 @@ impl DeoptimizationController {
         // hotness-retry path still recompiles, so behaviour never regresses.
         if cratonvm_jit::deopt_real_enabled()
             && action == cratonvm_jit::deopt::DeoptAction::RecompileAndReinterpret
-            && vm.tiered_manager.compiler_active()
+            && vm.jit.tiered_manager.compiler_active()
         {
             let now_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0);
-            vm.tiered_manager
+            vm.jit
+                .tiered_manager
                 .enqueue_compilation(cratonvm_jit::tiered::CompilationTask {
                     method_key: tiered_key.clone(),
                     target_tier: cratonvm_jit::tiered::CompilationTier::C1,
@@ -9681,9 +9719,15 @@ pub fn build_helpers() -> JitRuntimeHelpers {
     );
     cratonvm_jit::set_hashmap_put_direct_fn(jit_hashmap_put_direct as *const () as usize);
     cratonvm_jit::set_hashmap_get_direct_fn(jit_hashmap_get_direct as *const () as usize);
-    cratonvm_jit::set_string_latin1_lower_direct_fn(jit_string_latin1_to_lower_direct as *const () as usize);
-    cratonvm_jit::set_string_locale_lower_direct_fn(jit_string_locale_to_lower_direct as *const () as usize);
-    cratonvm_jit::set_concurrent_hashmap_get_direct_fn(jit_concurrent_hashmap_get_direct as *const () as usize);
+    cratonvm_jit::set_string_latin1_lower_direct_fn(
+        jit_string_latin1_to_lower_direct as *const () as usize,
+    );
+    cratonvm_jit::set_string_locale_lower_direct_fn(
+        jit_string_locale_to_lower_direct as *const () as usize,
+    );
+    cratonvm_jit::set_concurrent_hashmap_get_direct_fn(
+        jit_concurrent_hashmap_get_direct as *const () as usize,
+    );
 
     let (jit_card_table_addr, jit_card_old_base, jit_card_old_end) =
         crate::native::jni::process_vm()

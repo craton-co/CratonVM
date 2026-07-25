@@ -584,9 +584,12 @@ pub struct SharedVm {
 
     /// GC barrier for stop-the-world coordination across threads.
     pub gc_barrier: GcBarrier,
-
-    /// JIT compiler cache — maps method identity to compiled native code.
-    pub jit_cache: JitCache,
+    /// JIT compilation state: code cache, PGO profiles, tiering policy, deopt log and invalidation.
+    ///
+    /// See [`crate::vm::realms::JitRealm`]. Access paths are
+    /// `shared.jit.<field>`; lock types and levels are
+    /// unchanged by the move.
+    pub jit: crate::vm::realms::JitRealm,
 
     /// Virtual thread scheduler — bounds concurrent virtual thread execution
     /// to a carrier-thread pool (JEP 444, Java 21).
@@ -656,50 +659,6 @@ pub struct SharedVm {
     /// suitable as a committed baseline that can be diffed against new
     /// releases.
     pub missing_natives_log: parking_lot::Mutex<Vec<MissingNativeEntry>>,
-
-    /// PGO profile store — branch and receiver type counts collected during
-    /// interpreted warmup, consumed by the JIT at compile time.
-    pub profile_store: ProfileStore,
-
-    /// Negative cache for JIT compilation: methods that failed `jit_scan` are
-    /// recorded here so subsequent invocations skip the scan entirely.
-    /// T10.9.B: FxHashSet — keys are internal (class, method, desc) triples
-    /// from already-loaded class files.
-    pub jit_skip_set: parking_lot::RwLock<FxHashSet<(Arc<str>, Arc<str>, Arc<str>)>>,
-
-    /// Tiered compilation manager — decides when and at which tier to compile.
-    pub tiered_manager: crate::jit::tiered::TieredCompilationManager,
-
-    /// Deoptimization log — records deopt events and drives adaptive recompilation.
-    pub deopt_log: parking_lot::Mutex<crate::jit::deopt::DeoptimizationLog>,
-
-    /// deopt-osr Step 9 — per-method *live* compilation epoch (a monotonic
-    /// invalidation generation), keyed by the same `"<class>.<method>:<descriptor>"`
-    /// string the deopt log uses. `DeoptimizationController::deoptimize` advances
-    /// it on every invalidation; a freshly installed `CompiledMethod` is stamped
-    /// (`CompiledMethod::compilation_epoch`) with the value live at install time.
-    /// The real-frame-deopt resume sink refuses to resume a frame whose artifact
-    /// epoch has fallen behind the live epoch — a compilation superseded since it
-    /// started — so an invalidated speculation is never resumed; it falls back to
-    /// the safe whole-method re-run. Empty + unread unless `deopt_real_enabled()`
-    /// (the resume sink that consumes it is itself gated), so production VMs are
-    /// unaffected.
-    ///
-    /// Step 9 follow-up (a): the value is a **boxed** `AtomicU64` rather than a
-    /// bare `u64` so each method's epoch lives at a STABLE heap address (a
-    /// `Box`'s payload does not move when the map rehashes, and entries are never
-    /// removed). [`Self::live_epoch_cell_ptr`] hands that address to the
-    /// `DeoptEpochGuard` baked into the method's frame-deopt stubs, so
-    /// `x64_deopt_entry` can read the live epoch lock-free, BEFORE dereferencing
-    /// the deopt box, to detect a superseded compilation.
-    pub method_epochs: parking_lot::RwLock<FxHashMap<String, Box<std::sync::atomic::AtomicU64>>>,
-    /// Shared fail-closed epoch for methods admitted after the bounded
-    /// per-method epoch table reaches capacity.
-    method_epoch_overflow: std::sync::atomic::AtomicU64,
-
-    /// Invalidation manager — tracks class-hierarchy assumptions and invalidates
-    /// dependent compiled methods when class loading breaks those assumptions.
-    pub invalidation_manager: parking_lot::Mutex<cratonvm_jit::deopt::InvalidationManager>,
 
     /// Java Flight Recorder — records VM events (GC, thread, class loading, compilation).
     pub flight_recorder: parking_lot::Mutex<cratonvm_jfr::FlightRecorder>,
@@ -861,13 +820,6 @@ pub struct SharedVm {
     /// because class bytecode is immutable after loading.
     pub field_descriptor_cache:
         parking_lot::RwLock<crate::runtime::fx_collections::FxHashMap<(ClassId, usize), u8>>,
-
-    /// Per-class allocation-init cache for the JIT slow-path allocators
-    /// (`jit_new_object` + the guarded TLAB-refill arm): primitive-field
-    /// default-init recipe + `has_finalizer`, computed once per class and
-    /// then read lock-free — replaces two `class_manager.read()` round trips
-    /// per slow-path allocation. See `crate::jit::alloc_class_cache`.
-    pub jit_alloc_class_cache: crate::jit::alloc_class_cache::JitAllocClassCache,
 
     /// WP0.2 — per-class cache of `ObjectStreamClass` descriptor
     /// mirrors. Populated by the first call to
@@ -1335,9 +1287,7 @@ impl SharedVm {
         let direct_memory_cap = config
             .max_direct_memory_size
             .unwrap_or(config.max_heap_size);
-        cratonvm_native_io::direct_buffer::configure_max_direct_memory(
-            direct_memory_cap as i64,
-        );
+        cratonvm_native_io::direct_buffer::configure_max_direct_memory(direct_memory_cap as i64);
 
         // fork6 GC_STRESS fix — wire the SATB write barrier to the concurrent
         // old-gen cycle. `enable_concurrent_gc` previously had NO production
@@ -2304,9 +2254,7 @@ impl SharedVm {
             // `register_url_codec` is wanted here, not the whole
             // `deprecated_io_util` module (which would re-clobber
             // `deprecated_util.rs`'s correct `java/util/Date` natives).
-            cratonvm_native_builtins::deprecated_io_util::register_url_codec(
-                &mut native_methods,
-            );
+            cratonvm_native_builtins::deprecated_io_util::register_url_codec(&mut native_methods);
             cratonvm_native_builtins::register_charset_natives_pub(&mut native_methods);
             cratonvm_native_builtins::phases_late::register_p58_charset_coder(&mut native_methods);
             cratonvm_native_builtins::charset::register_real_charset_natives(&mut native_methods);
@@ -2864,7 +2812,24 @@ impl SharedVm {
             oom_dump_written: std::sync::atomic::AtomicBool::new(false),
             fd_table: FileDescriptorTable::new(),
             gc_barrier: GcBarrier::new(),
-            jit_cache: JitCache::new(),
+            jit: crate::vm::realms::JitRealm {
+                jit_cache: JitCache::new(),
+                profile_store: ProfileStore::new(),
+                jit_skip_set: parking_lot::RwLock::new(FxHashSet::default()),
+                // wire-tiered-manager Step 6: honor the CRATONVM_TIER_* threshold
+                // overrides (c1/c2/osr/c2_min/enabled). Identical to the default
+                // policy when the environment is unset.
+                tiered_manager: crate::jit::tiered::TieredCompilationManager::with_env_policy(),
+                deopt_log: parking_lot::Mutex::new(crate::jit::deopt::DeoptimizationLog::new()),
+                method_epochs: parking_lot::RwLock::new(FxHashMap::default()),
+                method_epoch_overflow: std::sync::atomic::AtomicU64::new(0),
+                invalidation_manager: parking_lot::Mutex::new(
+                    cratonvm_jit::deopt::InvalidationManager::new(),
+                ),
+                // JIT slow-path allocation: per-class init recipe cache.
+                jit_alloc_class_cache: crate::jit::alloc_class_cache::JitAllocClassCache::new(),
+            },
+
             virtual_scheduler: crate::threading::VirtualThreadScheduler::new_default(),
             virtual_thread_manager: Arc::new(
                 crate::threading::VirtualThreadManager::with_default_parallelism(),
@@ -2881,18 +2846,6 @@ impl SharedVm {
             compact_strings: std::sync::atomic::AtomicBool::new(false),
             cached_class_mirror_num_fields: AtomicUsize::new(0),
             missing_natives_log: parking_lot::Mutex::new(Vec::new()),
-            profile_store: ProfileStore::new(),
-            jit_skip_set: parking_lot::RwLock::new(FxHashSet::default()),
-            // wire-tiered-manager Step 6: honor the CRATONVM_TIER_* threshold
-            // overrides (c1/c2/osr/c2_min/enabled). Identical to the default
-            // policy when the environment is unset.
-            tiered_manager: crate::jit::tiered::TieredCompilationManager::with_env_policy(),
-            deopt_log: parking_lot::Mutex::new(crate::jit::deopt::DeoptimizationLog::new()),
-            method_epochs: parking_lot::RwLock::new(FxHashMap::default()),
-            method_epoch_overflow: std::sync::atomic::AtomicU64::new(0),
-            invalidation_manager: parking_lot::Mutex::new(
-                cratonvm_jit::deopt::InvalidationManager::new(),
-            ),
             flight_recorder: parking_lot::Mutex::new(cratonvm_jfr::create_flight_recorder()),
             #[cfg(feature = "experimental-debug")]
             debug_state: parking_lot::Mutex::new(crate::debug::DebugState::new()),
@@ -2924,8 +2877,6 @@ impl SharedVm {
             field_descriptor_cache: parking_lot::RwLock::new(
                 crate::runtime::fx_collections::FxHashMap::default(),
             ),
-            // JIT slow-path allocation: per-class init recipe cache.
-            jit_alloc_class_cache: crate::jit::alloc_class_cache::JitAllocClassCache::new(),
             // WP0.2 — ObjectStreamClass.lookup(cls) cache.
             osc_cache: crate::runtime::serialization::OscCache::new(),
             // WP1.3 — bootstrap init-level state machine. Starts at 0
@@ -3203,7 +3154,7 @@ fn jit_invalidate_adapter(class_id: u32) {
         Some(s) => s,
         None => return, // VM has been dropped; nothing to invalidate
     };
-    let evicted = shared.jit_cache.write().clear_all();
+    let evicted = shared.jit.jit_cache.write().clear_all();
     if evicted > 0 {
         tracing::debug!(
             "JIT: fully invalidated {evicted} method(s) due to a class layout \
@@ -3985,7 +3936,7 @@ impl SharedVm {
                 .get_class(*class_id)
                 .and_then(|c| c.superclass.map(|s| s.to_string()));
             {
-                let mut jit = self.jit_cache.write();
+                let mut jit = self.jit.jit_cache.write();
                 let _ = jit.invalidate_for_class_change(name);
                 if let Some(ref sup) = superclass {
                     let _ = jit.invalidate_for_class_change(sup);
@@ -4114,10 +4065,10 @@ impl SharedVm {
         event: crate::jit::deopt::DeoptEvent,
         tiered_key: &crate::jit::tiered::MethodKey,
     ) -> crate::jit::deopt::DeoptAction {
-        let mut log = self.deopt_log.lock();
+        let mut log = self.jit.deopt_log.lock();
         let action = log.recommend_action(method_key, event.reason);
         log.record_deopt(method_key, event);
-        self.tiered_manager.on_deoptimization(tiered_key);
+        self.jit.tiered_manager.on_deoptimization(tiered_key);
         action
     }
 
@@ -4125,12 +4076,14 @@ impl SharedVm {
     /// (`"<class>.<method>:<descriptor>"`), `0` if the method has never been
     /// invalidated. See [`Self::method_epochs`].
     pub fn compilation_epoch_for(&self, method_key: &str) -> u64 {
-        self.method_epochs
+        self.jit
+            .method_epochs
             .read()
             .get(method_key)
             .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
             .unwrap_or_else(|| {
-                self.method_epoch_overflow
+                self.jit
+                    .method_epoch_overflow
                     .load(std::sync::atomic::Ordering::Relaxed)
             })
     }
@@ -4141,16 +4094,17 @@ impl SharedVm {
     /// `DeoptimizationController::deoptimize`). See [`Self::method_epochs`].
     pub fn bump_compilation_epoch(&self, method_key: &str) -> u64 {
         const METHOD_EPOCH_CAP: usize = 65_536;
-        let mut map = self.method_epochs.write();
+        let mut map = self.jit.method_epochs.write();
         if !map.contains_key(method_key) && map.len() >= METHOD_EPOCH_CAP {
             return self
+                .jit
                 .method_epoch_overflow
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                 + 1;
         }
-        let cell = map.entry(method_key.to_string()).or_insert_with(|| {
-            Box::new(std::sync::atomic::AtomicU64::new(0))
-        });
+        let cell = map
+            .entry(method_key.to_string())
+            .or_insert_with(|| Box::new(std::sync::atomic::AtomicU64::new(0)));
         // fetch_add returns the PREVIOUS value; the new live epoch is +1.
         cell.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
     }
@@ -4164,9 +4118,9 @@ impl SharedVm {
     /// `deopt_real_enabled()` (at install, by `stamp_compilation_epoch`).
     pub fn live_epoch_cell_ptr(&self, method_key: &str) -> *const std::sync::atomic::AtomicU64 {
         const METHOD_EPOCH_CAP: usize = 65_536;
-        let mut map = self.method_epochs.write();
+        let mut map = self.jit.method_epochs.write();
         if !map.contains_key(method_key) && map.len() >= METHOD_EPOCH_CAP {
-            return &self.method_epoch_overflow;
+            return &self.jit.method_epoch_overflow;
         }
         let cell = map
             .entry(method_key.to_string())
@@ -4198,7 +4152,7 @@ impl SharedVm {
 
         // Ask the invalidation manager which method keys are now invalid.
         let invalidated_keys: Vec<String> = {
-            let inv = self.invalidation_manager.lock();
+            let inv = self.jit.invalidation_manager.lock();
             inv.on_class_loaded(class_id_u32)
         };
         if invalidated_keys.is_empty() {
@@ -4208,7 +4162,7 @@ impl SharedVm {
         // Parse each "<class>.<method>:<descriptor>" key and remove the
         // matching entry from the JIT cache.
         let mut evicted = 0usize;
-        let mut jit = self.jit_cache.write();
+        let mut jit = self.jit.jit_cache.write();
         for key in &invalidated_keys {
             // Split on the last ':' to isolate the descriptor (the descriptor
             // itself may not contain ':', but the class name / method name
@@ -4253,7 +4207,7 @@ impl SharedVm {
             return 0;
         }
 
-        let snapshots = self.profile_store.snapshot_all();
+        let snapshots = self.jit.profile_store.snapshot_all();
         let class_mgr = self.class_manager.read();
 
         // Collect branch data

@@ -13,6 +13,7 @@
 //! The interpreter and all helper functions take `(shared: &SharedVm, thread: &mut JvmThread)`
 //! instead of `(vm: &mut Vm)`.
 
+pub mod realms;
 pub(crate) mod vm_exec;
 mod vm_init;
 mod vm_object;
@@ -2444,7 +2445,7 @@ mod tests {
         // Register a lambda proxy: applyAsInt(x) РІвЂ вЂ™ Math.abs(x)
         let proxy_class_id = shared.alloc_lambda_proxy_id();
         let call_site = LambdaCallSite {
-                functional_interface_id: None,
+            functional_interface_id: None,
             functional_interface: "java/util/function/IntUnaryOperator".to_string(),
             sam_method_name: "applyAsInt".to_string(),
             sam_descriptor: "(I)I".to_string(),
@@ -2500,7 +2501,7 @@ mod tests {
         // Register a lambda: applyAsInt(x) РІвЂ вЂ™ Math.max(captured_val, x)
         let proxy_class_id = shared.alloc_lambda_proxy_id();
         let call_site = LambdaCallSite {
-                functional_interface_id: None,
+            functional_interface_id: None,
             functional_interface: "java/util/function/IntUnaryOperator".to_string(),
             sam_method_name: "applyAsInt".to_string(),
             sam_descriptor: "(I)I".to_string(),
@@ -2564,7 +2565,7 @@ mod tests {
         // Register a lambda: accept(s) РІвЂ вЂ™ ps.println(s) via captured PrintStream
         let proxy_class_id = shared.alloc_lambda_proxy_id();
         let call_site = LambdaCallSite {
-                functional_interface_id: None,
+            functional_interface_id: None,
             functional_interface: "java/util/function/Consumer".to_string(),
             sam_method_name: "accept".to_string(),
             sam_descriptor: "(Ljava/lang/Object;)V".to_string(),
@@ -2634,7 +2635,7 @@ mod tests {
         // Insert a Lambda call site
         let proxy_class_id = shared.alloc_lambda_proxy_id();
         let call_site = ResolvedCallSite::Lambda(LambdaCallSite {
-                functional_interface_id: None,
+            functional_interface_id: None,
             functional_interface: "java/lang/Runnable".to_string(),
             sam_method_name: "run".to_string(),
             sam_descriptor: "()V".to_string(),
@@ -7441,7 +7442,7 @@ mod tests {
         use crate::classloading::resolution::{LambdaCallSite, MethodHandle};
         let proxy_class_id = shared.alloc_lambda_proxy_id();
         let call_site = LambdaCallSite {
-                functional_interface_id: None,
+            functional_interface_id: None,
             functional_interface: functional_interface.to_string(),
             sam_method_name: sam_name.to_string(),
             sam_descriptor: sam_desc.to_string(),
@@ -60966,7 +60967,7 @@ mod tests {
     fn m5_jit_skip_set_does_not_block_user_classes() {
         // Verify the JIT skip set starts empty РІР‚вЂќ user classes are not pre-blocked
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
-        let skip_set = shared.jit_skip_set.read();
+        let skip_set = shared.jit.jit_skip_set.read();
         assert!(skip_set.is_empty(), "JIT skip set should start empty");
     }
 
@@ -65659,7 +65660,7 @@ mod tests {
                 proxies.insert(
                     cid,
                     crate::classloading::resolution::LambdaCallSite {
-                functional_interface_id: None,
+                        functional_interface_id: None,
                         functional_interface: "test/Func".to_string(),
                         sam_method_name: "apply".to_string(),
                         sam_descriptor: "()V".to_string(),
@@ -71354,13 +71355,13 @@ public class SkippedTest {
         // Insert a dummy compiled method
         let buf = cratonvm_jit::ExecutableBuffer::new(64).unwrap();
         let compiled = cratonvm_jit::CompiledMethod::new(buf);
-        vm.jit_cache.write().put(
+        vm.jit.jit_cache.write().put(
             "TestClass".into(),
             "testMethod".into(),
             "()V".into(),
             compiled,
         );
-        assert_eq!(vm.jit_cache.read().len(), 1);
+        assert_eq!(vm.jit.jit_cache.read().len(), 1);
 
         // Deoptimize
         let action = crate::jit::helpers::DeoptimizationController::deoptimize(
@@ -71373,7 +71374,7 @@ public class SkippedTest {
         );
 
         // The compiled method should be evicted from the JIT cache
-        assert_eq!(vm.jit_cache.read().len(), 0);
+        assert_eq!(vm.jit.jit_cache.read().len(), 0);
         // First deopt for NullCheck should recommend Reinterpret (count-based: first occurrence)
         assert_eq!(action, cratonvm_jit::deopt::DeoptAction::Reinterpret);
     }
@@ -71446,7 +71447,7 @@ public class SkippedTest {
         assert_eq!(action, cratonvm_jit::deopt::DeoptAction::MakeNotCompilable);
 
         // Method should be in the jit_skip_set
-        let skip = vm.jit_skip_set.read();
+        let skip = vm.jit.jit_skip_set.read();
         assert!(skip.contains(&("Foo".into(), "bar".into(), "()V".into())));
     }
 
@@ -71461,7 +71462,7 @@ public class SkippedTest {
 
         // Register an assumption in the invalidation manager
         {
-            let mut inv = vm.invalidation_manager.lock();
+            let mut inv = vm.jit.invalidation_manager.lock();
             inv.register_assumption(
                 "MyClass.myMethod:()V",
                 cratonvm_jit::deopt::CompilationAssumption::LeafClass(42),
@@ -71479,7 +71480,7 @@ public class SkippedTest {
         );
 
         // After deopt, assumptions for that method key should be cleared
-        let inv = vm.invalidation_manager.lock();
+        let inv = vm.jit.invalidation_manager.lock();
         let invalidated = inv.on_class_loaded(42);
         // The assumption was cleared so no methods should be invalidated
         assert!(
@@ -71510,7 +71511,7 @@ public class SkippedTest {
         }
 
         // Verify the deopt log recorded all 5 events
-        let log = vm.deopt_log.lock();
+        let log = vm.jit.deopt_log.lock();
         assert_eq!(log.deopt_count("Hot.loop:(I)I"), 5);
     }
 
@@ -71563,6 +71564,7 @@ public class SkippedTest {
 
         // Method should now be in skip set
         assert!(vm
+            .jit
             .jit_skip_set
             .read()
             .contains(&("C".into(), "m".into(), "()V".into())));
@@ -71579,7 +71581,7 @@ public class SkippedTest {
 
         // Register multiple assumptions from different compiled methods
         {
-            let mut inv = vm.invalidation_manager.lock();
+            let mut inv = vm.jit.invalidation_manager.lock();
             inv.register_assumption(
                 "A.foo:()V",
                 cratonvm_jit::deopt::CompilationAssumption::LeafClass(100),
@@ -71595,7 +71597,7 @@ public class SkippedTest {
         }
 
         // Loading class 100 should invalidate A.foo and B.bar but not C.baz
-        let inv = vm.invalidation_manager.lock();
+        let inv = vm.jit.invalidation_manager.lock();
         let invalidated = inv.on_class_loaded(100);
         assert!(invalidated.contains(&"A.foo:()V".to_string()));
         assert!(invalidated.contains(&"B.bar:()V".to_string()));
@@ -71629,14 +71631,15 @@ public class SkippedTest {
         let buf =
             cratonvm_jit::ExecutableBuffer::new(64).expect("failed to allocate executable buffer");
         let compiled = cratonvm_jit::CompiledMethod::new(buf);
-        vm.jit_cache
+        vm.jit
+            .jit_cache
             .write()
             .put("Animal".into(), "speak".into(), "()V".into(), compiled);
         let cn: std::sync::Arc<str> = "Animal".into();
         let mn: std::sync::Arc<str> = "speak".into();
         let desc: std::sync::Arc<str> = "()V".into();
         assert!(
-            vm.jit_cache.read().get(&cn, &mn, &desc).is_some(),
+            vm.jit.jit_cache.read().get(&cn, &mn, &desc).is_some(),
             "JIT entry must be present before invalidation"
         );
 
@@ -71644,7 +71647,7 @@ public class SkippedTest {
         // cache uses. The InvalidationManager stores method keys in
         // `<class>.<method>:<descriptor>` form.
         {
-            let mut inv = vm.invalidation_manager.lock();
+            let mut inv = vm.jit.invalidation_manager.lock();
             inv.register_assumption(
                 "Animal.speak:()V",
                 cratonvm_jit::deopt::CompilationAssumption::LeafClass(animal_cid_u32),
@@ -71660,7 +71663,7 @@ public class SkippedTest {
             "CHA listener must evict exactly one matching entry"
         );
         assert!(
-            vm.jit_cache.read().get(&cn, &mn, &desc).is_none(),
+            vm.jit.jit_cache.read().get(&cn, &mn, &desc).is_none(),
             "the compiled entry should have been removed"
         );
     }
@@ -71685,10 +71688,11 @@ public class SkippedTest {
         let buf =
             cratonvm_jit::ExecutableBuffer::new(64).expect("failed to allocate executable buffer");
         let compiled = cratonvm_jit::CompiledMethod::new(buf);
-        vm.jit_cache
+        vm.jit
+            .jit_cache
             .write()
             .put("Other".into(), "run".into(), "()V".into(), compiled);
-        assert_eq!(vm.jit_cache.read().len(), 1);
+        assert_eq!(vm.jit.jit_cache.read().len(), 1);
 
         let evicted = vm.invalidate_jit_for_class("Unrelated");
         assert_eq!(
@@ -71696,7 +71700,7 @@ public class SkippedTest {
             "no assumptions on `Unrelated` РІР‚вЂќ nothing to evict"
         );
         assert_eq!(
-            vm.jit_cache.read().len(),
+            vm.jit.jit_cache.read().len(),
             1,
             "unrelated cache entry must remain"
         );
@@ -71854,7 +71858,7 @@ public class SkippedTest {
         if let Some(mut buf) = cratonvm_jit::ExecutableBuffer::new(64) {
             buf.emit(&[0xC3]);
             let cm = cratonvm_jit::CompiledMethod::new(buf);
-            let mut cache = vm.jit_cache.write();
+            let mut cache = vm.jit.jit_cache.write();
             cache.put("Deopt".into(), "target".into(), "()I".into(), cm);
         }
 
@@ -71862,7 +71866,7 @@ public class SkippedTest {
         let cn: std::sync::Arc<str> = "Deopt".into();
         let mn: std::sync::Arc<str> = "target".into();
         let desc: std::sync::Arc<str> = "()I".into();
-        assert!(vm.jit_cache.read().get(&cn, &mn, &desc).is_some());
+        assert!(vm.jit.jit_cache.read().get(&cn, &mn, &desc).is_some());
 
         // Trigger deoptimization via the controller
         let action = crate::jit::helpers::DeoptimizationController::deoptimize(
@@ -71875,7 +71879,7 @@ public class SkippedTest {
         );
 
         // Method should be evicted from JIT cache
-        assert!(vm.jit_cache.read().get(&cn, &mn, &desc).is_none());
+        assert!(vm.jit.jit_cache.read().get(&cn, &mn, &desc).is_none());
         // First deopt РІвЂ вЂ™ recompile (not blacklist)
         assert_ne!(action, cratonvm_jit::deopt::DeoptAction::MakeNotCompilable);
 
@@ -71892,7 +71896,7 @@ public class SkippedTest {
         }
 
         // After many deopts, should be blacklisted (in skip set)
-        let skip = vm.jit_skip_set.read();
+        let skip = vm.jit.jit_skip_set.read();
         assert!(skip.contains(&("Deopt".into(), "target".into(), "()I".into(),)));
     }
 

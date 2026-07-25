@@ -124,16 +124,24 @@ pub fn unload_dead_class_metadata(
         }
     }
     for class in &unloaded {
-        shared.jit_alloc_class_cache.invalidate(class.id.as_u32());
-        shared.profile_store.invalidate_class(class.id.as_u32());
-        shared.tiered_manager.invalidate_class(class.name.as_ref());
-        shared.deopt_log.lock().clear_class(class.name.as_ref());
+        shared
+            .jit
+            .jit_alloc_class_cache
+            .invalidate(class.id.as_u32());
+        shared.jit.profile_store.invalidate_class(class.id.as_u32());
+        shared
+            .jit
+            .tiered_manager
+            .invalidate_class(class.name.as_ref());
+        shared.jit.deopt_log.lock().clear_class(class.name.as_ref());
         jit_entries_retired += shared
+            .jit
             .jit_cache
             .invalidate_unloaded_class(class.id, class.name.as_ref());
     }
-    shared.invalidation_manager.lock().clear_all();
+    shared.jit.invalidation_manager.lock().clear_all();
     shared
+        .jit
         .jit_skip_set
         .write()
         .retain(|(class_name, _, _)| {
