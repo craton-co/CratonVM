@@ -315,9 +315,49 @@ pub fn class_layout(class_id: u32) -> Option<Arc<CompactLayout>> {
     v.get(class_id as usize).and_then(|o| o.clone())
 }
 
+/// Small per-thread working set for the `(class_id, field_count) -> layout`
+/// lookup. The GC scans long runs of same-class objects, so a handful of entries
+/// captures essentially all traffic; 8 matches the sibling cache in
+/// [`compact_field_storage`].
+const VERSION_CACHE_LEN: usize = 8;
+
+struct VersionCache {
+    /// `(class_id, field_count, generation, resolved)`. `resolved` is `None` for
+    /// a cached negative lookup — see [`class_layout_for_fields`] for why
+    /// negatives are cached too.
+    entries: [Option<(u32, u32, u64, Option<Arc<CompactLayout>>)>; VERSION_CACHE_LEN],
+    next: usize,
+    /// Index of the entry that satisfied the previous lookup, checked before the
+    /// linear scan.
+    ///
+    /// The GC scans long *runs* of same-class objects (a binary tree of one node
+    /// type; a young gen full of `HashMap$Node`s), so consecutive calls almost
+    /// always want the same entry. Probing it first turns the common case from a
+    /// scan of up to `VERSION_CACHE_LEN` tuples into one comparison.
+    mru: usize,
+}
+
+impl VersionCache {
+    const fn new() -> Self {
+        Self {
+            entries: [None, None, None, None, None, None, None, None],
+            next: 0,
+            mru: 0,
+        }
+    }
+}
+
+thread_local! {
+    static VERSION_CACHE: std::cell::RefCell<VersionCache> =
+        const { std::cell::RefCell::new(VersionCache::new()) };
+}
+
 /// Resolve the immutable layout version used by an object with this exact
 /// hierarchy-wide field count. Retaining versions makes object size and oop
 /// maps stable across append-only synthetic-class upgrades.
+///
+/// Prefer [`with_class_layout`] on hot read-only paths: it serves the same cache
+/// without the `Arc` clone/drop pair of atomics.
 ///
 /// PERF: this is called **once per scanned object** by the Cheney collector's
 /// copy/scan loops (three sites in `gc/src/gc.rs`, plus the G1, concurrent-mark
@@ -339,39 +379,23 @@ pub fn class_layout(class_id: u32) -> Option<Arc<CompactLayout>> {
 /// [`LAYOUT_GENERATION`] was introduced for precisely this purpose (see its
 /// doc: "lets hot-path consumers (the GC scan) cache a lookup and cheaply
 /// validate it with a single atomic load instead of re-taking the registry
-/// `RwLock` per scanned object"). A hit costs one relaxed atomic load, a small
-/// linear scan of an 8-entry array, and an `Arc` clone; a registration or
-/// redefine bumps the generation and invalidates every thread's cache at once.
+/// `RwLock` per scanned object"). A hit costs one relaxed atomic load, one
+/// comparison against the MRU entry (the GC scans runs of same-class objects, so
+/// that hits on nearly every call; a miss falls back to scanning the 8-entry
+/// array), and an `Arc` clone; a registration or redefine bumps the generation
+/// and invalidates every thread's cache at once.
+///
+/// Remaining known cost: the `Arc` clone/drop is two atomic RMWs paid per
+/// scanned object, even though the GC scan sites only read `ref_offsets` and drop
+/// the handle immediately. A borrowing accessor would remove that, but it
+/// requires restructuring the three Cheney scan loops in `gc/src/gc.rs`; tracked
+/// separately rather than done opportunistically inside the collector.
 ///
 /// Negative results are cached too (`None`): callers that do not pre-filter
 /// with [`is_compact_object`] would otherwise re-probe the registry for every
 /// legacy object, which is the same cost this exists to avoid.
 #[inline]
 pub fn class_layout_for_fields(class_id: u32, field_count: u32) -> Option<Arc<CompactLayout>> {
-    /// Small per-thread working set. The GC scans long runs of same-class
-    /// objects, so a handful of entries captures essentially all traffic; 8
-    /// matches the sibling cache in `compact_field_storage`.
-    const VERSION_CACHE_LEN: usize = 8;
-
-    struct VersionCache {
-        /// `(class_id, field_count, generation, resolved)`. `resolved` is
-        /// `None` for a cached negative lookup.
-        entries: [Option<(u32, u32, u64, Option<Arc<CompactLayout>>)>; VERSION_CACHE_LEN],
-        next: usize,
-    }
-    impl VersionCache {
-        const fn new() -> Self {
-            Self {
-                entries: [None, None, None, None, None, None, None, None],
-                next: 0,
-            }
-        }
-    }
-    thread_local! {
-        static VERSION_CACHE: std::cell::RefCell<VersionCache> =
-            const { std::cell::RefCell::new(VersionCache::new()) };
-    }
-
     let generation = layout_generation();
     VERSION_CACHE.with(|cell| {
         // `try_borrow_mut` rather than `borrow_mut`: this function is reachable
@@ -383,10 +407,19 @@ pub fn class_layout_for_fields(class_id: u32, field_count: u32) -> Option<Arc<Co
                 .get(&(class_id, field_count))
                 .cloned();
         };
-        for entry in &cache.entries {
+        // MRU probe: the GC scans runs of same-class objects, so this hits on
+        // nearly every call and skips the scan below entirely.
+        if let Some((cid, fc, gen, resolved)) = &cache.entries[cache.mru] {
+            if *cid == class_id && *fc == field_count && *gen == generation {
+                return resolved.clone();
+            }
+        }
+        for (idx, entry) in cache.entries.iter().enumerate() {
             if let Some((cid, fc, gen, resolved)) = entry {
                 if *cid == class_id && *fc == field_count && *gen == generation {
-                    return resolved.clone();
+                    let hit = resolved.clone();
+                    cache.mru = idx;
+                    return hit;
                 }
             }
         }
@@ -396,6 +429,7 @@ pub fn class_layout_for_fields(class_id: u32, field_count: u32) -> Option<Arc<Co
             .cloned();
         let slot = cache.next % VERSION_CACHE_LEN;
         cache.next = cache.next.wrapping_add(1);
+        cache.mru = slot;
         cache.entries[slot] = Some((class_id, field_count, generation, resolved.clone()));
         resolved
     })
