@@ -20,7 +20,9 @@ and the only defence is knowing what the full set was beforehand.
 | Rust *read* sites (excludes `set_var`/`env_remove`/`option_env!`) | **1155** |
 | Read sites **outside** `native-builtins/` (this refactor's scope) | **789** |
 | Read sites inside `native-builtins/` (deliberately deferred, see §6) | **366** |
-| Read sites that are **not** `OnceLock`-cached | **958** |
+| …of which still call `std::env::var` / `var_os` directly | **1018** |
+| …already reading a `VmFlags` field instead | **137** |
+| Remaining direct read sites that are **not** `OnceLock`-cached | **821** |
 | In-process `set_var` / `remove_var` / `Command::env` sites | **72** |
 
 ### Classification
@@ -945,7 +947,7 @@ follow-up has the same evidence base.
 ## 8. Caching status and the per-call readers
 
 `std::env::var` takes a process-global lock in libc `getenv` and allocates. Of the
-1155 read sites, **958** are not behind a `OnceLock`. Most of those are cold
+1155 read sites, **821** are not behind a `OnceLock`. Most of those are cold
 (startup, class load, JIT compile), but three are genuinely hot and are the reason
 the typed config is worth doing on performance grounds alone:
 
@@ -1010,7 +1012,34 @@ was lifted from, and a unit test asserts that they still disagree — so the
 divergence cannot be tidied away by accident and can instead be retired
 deliberately, flag by flag, with benchmarks.
 
-## 11. Reproducing this census
+## 11. Migration status
+
+Read sites still calling `std::env::var` / `var_os` directly, by crate.
+A crate at zero reads every flag from `cratonvm_types::flags()`.
+
+Counted here are only sites with a literal `std::env::var` / `var_os` call —
+the thing the migration removes. A flag name that merely appears in an
+assertion message or as a label argument is not one, and `types/src/flags.rs`,
+where the parse now lives, is excluded by construction.
+
+| Crate | Read sites remaining | Status |
+| --- | ---: | --- |
+| `classloading` | 0 | **migrated** |
+| `difftest` | 1 | not started |
+| `fuzz` | 1 | not started |
+| `gc` | 0 | **migrated** |
+| `jit` | 112 | not started |
+| `libcratonvm` | 5 | not started |
+| `native-api` | 5 | not started |
+| `native-builtins` | 362 | deferred — see §7 |
+| `native-collections` | 16 | not started |
+| `native-io` | 0 | **migrated** |
+| `reader` | 1 | not started |
+| `types` | 7 | not started |
+| `vm` | 378 | not started |
+| `vm-cli` | 18 | not started |
+
+## 12. Reproducing this census
 
 ```sh
 python3 tools/flag-census/census.py            # totals, from the repo root

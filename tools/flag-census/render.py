@@ -32,6 +32,7 @@ for r in rows:
     r['pol'] = r['polarity']
     r['nb_only'] = '1' if r['nb_only'] else '0'
     r['reads'] = str(r['reads'])
+    r['consumer_reads'] = str(r['consumer_reads'])
     r['cached'] = str(r['cached'])
     r['uncached'] = str(r['uncached'])
     r['setters'] = str(r['setters'])
@@ -63,7 +64,9 @@ w(f'| Rust code literal sites (all kinds) | **{len(sites)}** |')
 w(f'| Rust *read* sites (excludes `set_var`/`env_remove`/`option_env!`) | **{sum(int(r["reads"]) for r in rows)}** |')
 w(f'| Read sites **outside** `native-builtins/` (this refactor\'s scope) | **{sum(int(r["reads"]) - 0 for r in rows) - sum(len([s for s in bysite[r["name"]] if s["crate"] == "native-builtins" and s["kind"] not in ("set", "unset", "option_env")]) for r in rows)}** |')
 w(f'| Read sites inside `native-builtins/` (deliberately deferred, see §6) | **{sum(len([s for s in bysite[r["name"]] if s["crate"] == "native-builtins" and s["kind"] not in ("set", "unset", "option_env")]) for r in rows)}** |')
-w(f'| Read sites that are **not** `OnceLock`-cached | **{sum(int(r["uncached"]) for r in rows)}** |')
+w(f'| …of which still call `std::env::var` / `var_os` directly | **{sum(int(r["consumer_reads"]) for r in rows)}** |')
+w(f'| …already reading a `VmFlags` field instead | **{sum(int(r["reads"]) - int(r["consumer_reads"]) for r in rows)}** |')
+w(f'| Remaining direct read sites that are **not** `OnceLock`-cached | **{sum(int(r["uncached"]) for r in rows)}** |')
 w(f'| In-process `set_var` / `remove_var` / `Command::env` sites | **{sum(int(r["setters"]) for r in rows)}** |')
 w('')
 w('### Classification')
@@ -263,7 +266,36 @@ w('was lifted from, and a unit test asserts that they still disagree — so the'
 w('divergence cannot be tidied away by accident and can instead be retired')
 w('deliberately, flag by flag, with benchmarks.')
 w('')
-w('## 11. Reproducing this census')
+# ── migration status ────────────────────────────────────────────────────────
+w('## 11. Migration status')
+w('')
+w('Read sites still calling `std::env::var` / `var_os` directly, by crate.')
+w('A crate at zero reads every flag from `cratonvm_types::flags()`.')
+w('')
+w('Counted here are only sites with a literal `std::env::var` / `var_os` call —')
+w('the thing the migration removes. A flag name that merely appears in an')
+w('assertion message or as a label argument is not one, and `types/src/flags.rs`,')
+w('where the parse now lives, is excluded by construction.')
+w('')
+w('| Crate | Read sites remaining | Status |')
+w('| --- | ---: | --- |')
+crate_reads = collections.Counter()
+for s in sites:
+    if s['kind'] == 'read' and s['direct']:
+        crate_reads[s['crate']] += 1
+MIGRATED = {'gc', 'classloading', 'native-io'}
+for crate in sorted(set(list(crate_reads) + sorted(MIGRATED))):
+    n = crate_reads.get(crate, 0)
+    if crate in MIGRATED:
+        state = '**migrated**' if n == 0 else '**INCOMPLETE**'
+    elif crate == 'native-builtins':
+        state = 'deferred — see §7'
+    else:
+        state = 'not started'
+    w(f'| `{crate}` | {n} | {state} |')
+w('')
+
+w('## 12. Reproducing this census')
 w('')
 w('```sh')
 w('python3 tools/flag-census/census.py            # totals, from the repo root')

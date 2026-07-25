@@ -33,6 +33,12 @@ SKIP_DIRS = {'target', '.git', 'jdk25src', 'node_modules'}
 # them would make the totals self-referential and drift on every regeneration.
 SKIP_FILES = {'docs/internal/flag-census.md', 'tools/flag-census/census.py',
               'tools/flag-census/render.py'}
+
+# The typed configuration itself. Its sites ARE read sites — they are where the
+# parse now happens — so they must be scanned or every migrated flag would be
+# misclassified as dead. But they are not *consumer* sites, so they are tagged
+# and excluded from the "still reads the environment directly" metrics.
+CONFIG_FILE = 'types/src/flags.rs'
 TEXT_EXT = {'.md', '.sh', '.py', '.java', '.toml', '.yml', '.yaml', '.txt',
             '.ps1', '.cmd', '.bat', '.json', '.xml', ''}
 
@@ -124,6 +130,12 @@ def scan(root):
                             'test': '/tests/' in rel or '/benches/' in rel
                                     or rel.startswith('difftest/'),
                             'text': line.strip()[:200],
+                            'config': rel == CONFIG_FILE,
+                            # A literal `std::env::var` / `var_os` call on this
+                            # line: the thing the migration removes. A name
+                            # that merely appears in an assertion message or as
+                            # a label argument is not one.
+                            'direct': 'env::var' in code and rel != CONFIG_FILE,
                         })
                 continue
             if rel.startswith('libcratonvm/include') or fn == 'cbindgen.toml':
@@ -190,6 +202,7 @@ def aggregate(sites, nonrust):
         reads = [s for s in own if s['kind'] == 'read']
         prod = [s for s in reads if not s['test']]
         nb_reads = [s for s in reads if s['crate'] == DEFERRED_CRATE]
+        consumer = [s for s in reads if not s['config']]
         if not reads:
             klass = 'd-dead'
         elif not prod:
@@ -204,8 +217,10 @@ def aggregate(sites, nonrust):
             klass = 'b-semantics'
         out.append({
             'name': name, 'klass': klass, 'reads': len(reads),
-            'cached': sum(1 for s in reads if s['cached']),
-            'uncached': sum(1 for s in reads if not s['cached']),
+            'consumer_reads': len(consumer),
+            'migrated': bool(reads) and not consumer,
+            'cached': sum(1 for s in consumer if s['cached']),
+            'uncached': sum(1 for s in consumer if not s['cached']),
             'nb_reads': len(nb_reads),
             'nb_only': bool(reads) and len(nb_reads) == len(reads),
             'crates': ','.join(sorted({s['crate'] for s in reads})),
@@ -240,7 +255,11 @@ def main():
     print('read sites         : %d (%d outside %s)' % (
         sum(n['reads'] for n in names),
         sum(n['reads'] - n['nb_reads'] for n in names), DEFERRED_CRATE))
-    print('uncached reads     : %d' % sum(n['uncached'] for n in names))
+    print('consumer reads     : %d (still call env::var directly)'
+          % sum(n['consumer_reads'] for n in names))
+    print('flags fully migrated onto VmFlags: %d'
+          % sum(1 for n in names if n['migrated']))
+    print('uncached consumer reads : %d' % sum(n['uncached'] for n in names))
     print('distinct flags     : %d' % len(names))
     for k in ('a-diag', 'b-semantics', 'c-test', 'd-dead'):
         print('  %-12s %d' % (k, counts[k]))
