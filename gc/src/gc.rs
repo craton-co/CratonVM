@@ -261,25 +261,38 @@ pub fn collect(from_space: &mut Arena, to_space: &mut Arena, roots: &mut [Object
             }
         } else {
             if cratonvm_types::is_compact_object(header) {
-                if let Some(layout) = cratonvm_types::class_layout_for_fields(
+                // `with_class_layout` rather than `class_layout_for_fields`:
+                // this loop only reads `ref_offsets` and would drop the handle
+                // immediately, so borrowing the cached layout in place saves an
+                // `Arc` clone/drop — two atomic RMWs — per scanned object.
+                //
+                // `forward_object` re-enters the layout cache (via
+                // `object_total_size` -> `object_body_size`) for the *referent's*
+                // class on every object it copies. That is supported: the
+                // accessor holds only a shared borrow, so the nested lookup
+                // still hits the cache. See `with_class_layout`'s doc.
+                let _ = cratonvm_types::with_class_layout(
                     header.class_id.as_u32(),
                     header.num_slots(),
-                ) {
-                    for &offset in &layout.ref_offsets {
-                        let slot_ptr = unsafe { obj_ptr.add(HEADER_SIZE + offset as usize) };
-                        let raw = unsafe { std::ptr::read(slot_ptr as *const u64) };
-                        if raw != 0 && from_space.contains(raw as usize as *mut u8) {
-                            let new_ref_ptr = forward_object(
-                                from_space,
-                                to_space,
-                                raw as usize as *mut u8,
-                                &mut objects_copied,
-                                &mut pointer_map,
-                            );
-                            unsafe { std::ptr::write(slot_ptr as *mut u64, new_ref_ptr as u64) };
+                    |layout| {
+                        for &offset in &layout.ref_offsets {
+                            let slot_ptr = unsafe { obj_ptr.add(HEADER_SIZE + offset as usize) };
+                            let raw = unsafe { std::ptr::read(slot_ptr as *const u64) };
+                            if raw != 0 && from_space.contains(raw as usize as *mut u8) {
+                                let new_ref_ptr = forward_object(
+                                    from_space,
+                                    to_space,
+                                    raw as usize as *mut u8,
+                                    &mut objects_copied,
+                                    &mut pointer_map,
+                                );
+                                unsafe {
+                                    std::ptr::write(slot_ptr as *mut u64, new_ref_ptr as u64)
+                                };
+                            }
                         }
-                    }
-                }
+                    },
+                );
             } else {
                 let num_slots = header.num_slots() as usize;
                 for slot_idx in 0..num_slots {
@@ -680,25 +693,38 @@ pub fn collect_with_finalizers(
             }
         } else {
             if cratonvm_types::is_compact_object(header) {
-                if let Some(layout) = cratonvm_types::class_layout_for_fields(
+                // `with_class_layout` rather than `class_layout_for_fields`:
+                // this loop only reads `ref_offsets` and would drop the handle
+                // immediately, so borrowing the cached layout in place saves an
+                // `Arc` clone/drop — two atomic RMWs — per scanned object.
+                //
+                // `forward_object` re-enters the layout cache (via
+                // `object_total_size` -> `object_body_size`) for the *referent's*
+                // class on every object it copies. That is supported: the
+                // accessor holds only a shared borrow, so the nested lookup
+                // still hits the cache. See `with_class_layout`'s doc.
+                let _ = cratonvm_types::with_class_layout(
                     header.class_id.as_u32(),
                     header.num_slots(),
-                ) {
-                    for &offset in &layout.ref_offsets {
-                        let slot_ptr = unsafe { obj_ptr.add(HEADER_SIZE + offset as usize) };
-                        let raw = unsafe { std::ptr::read(slot_ptr as *const u64) };
-                        if raw != 0 && from_space.contains(raw as usize as *mut u8) {
-                            let new_ref_ptr = forward_object(
-                                from_space,
-                                to_space,
-                                raw as usize as *mut u8,
-                                &mut objects_copied,
-                                &mut pointer_map,
-                            );
-                            unsafe { std::ptr::write(slot_ptr as *mut u64, new_ref_ptr as u64) };
+                    |layout| {
+                        for &offset in &layout.ref_offsets {
+                            let slot_ptr = unsafe { obj_ptr.add(HEADER_SIZE + offset as usize) };
+                            let raw = unsafe { std::ptr::read(slot_ptr as *const u64) };
+                            if raw != 0 && from_space.contains(raw as usize as *mut u8) {
+                                let new_ref_ptr = forward_object(
+                                    from_space,
+                                    to_space,
+                                    raw as usize as *mut u8,
+                                    &mut objects_copied,
+                                    &mut pointer_map,
+                                );
+                                unsafe {
+                                    std::ptr::write(slot_ptr as *mut u64, new_ref_ptr as u64)
+                                };
+                            }
                         }
-                    }
-                }
+                    },
+                );
             } else {
                 let num_slots = header.num_slots() as usize;
                 for slot_idx in 0..num_slots {
@@ -838,28 +864,32 @@ pub fn collect_with_finalizers(
                 }
             } else {
                 if cratonvm_types::is_compact_object(header) {
-                    if let Some(layout) = cratonvm_types::class_layout_for_fields(
+                    // Borrowing accessor: see the identical scan arm above for
+                    // why, and for why the nested `forward_object` re-entry into
+                    // the layout cache is safe.
+                    let _ = cratonvm_types::with_class_layout(
                         header.class_id.as_u32(),
                         header.num_slots(),
-                    ) {
-                        for &offset in &layout.ref_offsets {
-                            let slot_ptr =
-                                unsafe { obj_ptr.add(HEADER_SIZE + offset as usize) };
-                            let raw = unsafe { std::ptr::read(slot_ptr as *const u64) };
-                            if raw != 0 && from_space.contains(raw as usize as *mut u8) {
-                                let new_ref_ptr = forward_object(
-                                    from_space,
-                                    to_space,
-                                    raw as usize as *mut u8,
-                                    &mut objects_copied,
-                                    &mut pointer_map,
-                                );
-                                unsafe {
-                                    std::ptr::write(slot_ptr as *mut u64, new_ref_ptr as u64)
-                                };
+                        |layout| {
+                            for &offset in &layout.ref_offsets {
+                                let slot_ptr =
+                                    unsafe { obj_ptr.add(HEADER_SIZE + offset as usize) };
+                                let raw = unsafe { std::ptr::read(slot_ptr as *const u64) };
+                                if raw != 0 && from_space.contains(raw as usize as *mut u8) {
+                                    let new_ref_ptr = forward_object(
+                                        from_space,
+                                        to_space,
+                                        raw as usize as *mut u8,
+                                        &mut objects_copied,
+                                        &mut pointer_map,
+                                    );
+                                    unsafe {
+                                        std::ptr::write(slot_ptr as *mut u64, new_ref_ptr as u64)
+                                    };
+                                }
                             }
-                        }
-                    }
+                        },
+                    );
                 } else {
                     let num_slots = header.num_slots() as usize;
                     for slot_idx in 0..num_slots {

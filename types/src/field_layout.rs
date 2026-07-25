@@ -326,7 +326,9 @@ struct VersionCache {
     /// a cached negative lookup — see [`class_layout_for_fields`] for why
     /// negatives are cached too.
     entries: [Option<(u32, u32, u64, Option<Arc<CompactLayout>>)>; VERSION_CACHE_LEN],
-    next: usize,
+    /// Round-robin insertion cursor. A [`Cell`](std::cell::Cell) so that the
+    /// lookup path needs only a *shared* `RefCell` borrow — see [`Self::find`].
+    next: std::cell::Cell<usize>,
     /// Index of the entry that satisfied the previous lookup, checked before the
     /// linear scan.
     ///
@@ -334,22 +336,78 @@ struct VersionCache {
     /// type; a young gen full of `HashMap$Node`s), so consecutive calls almost
     /// always want the same entry. Probing it first turns the common case from a
     /// scan of up to `VERSION_CACHE_LEN` tuples into one comparison.
-    mru: usize,
+    mru: std::cell::Cell<usize>,
 }
 
 impl VersionCache {
     const fn new() -> Self {
         Self {
             entries: [None, None, None, None, None, None, None, None],
-            next: 0,
-            mru: 0,
+            next: std::cell::Cell::new(0),
+            mru: std::cell::Cell::new(0),
         }
+    }
+
+    /// Index of the live entry matching `(class_id, field_count)` at
+    /// `generation`, or `None` for a miss.
+    ///
+    /// Takes `&self`, not `&mut self` — the MRU bookkeeping goes through
+    /// [`std::cell::Cell`] specifically so the *whole lookup path* runs under a
+    /// shared `RefCell` borrow. That is what makes the cache re-entrant: see
+    /// [`with_class_layout`], which holds a shared borrow across a user closure
+    /// that calls back into this cache. Only insertion needs `&mut self`.
+    #[inline]
+    fn find(&self, class_id: u32, field_count: u32, generation: u64) -> Option<usize> {
+        let matches = |entry: &Option<(u32, u32, u64, Option<Arc<CompactLayout>>)>| {
+            matches!(entry, Some((cid, fc, gen, _))
+                if *cid == class_id && *fc == field_count && *gen == generation)
+        };
+        // MRU probe: the GC scans runs of same-class objects, so this hits on
+        // nearly every call and skips the scan below entirely.
+        let mru = self.mru.get();
+        if self.entries.get(mru).is_some_and(matches) {
+            return Some(mru);
+        }
+        for (idx, entry) in self.entries.iter().enumerate() {
+            if matches(entry) {
+                // Self-tune the probe to the run the caller is currently in.
+                self.mru.set(idx);
+                return Some(idx);
+            }
+        }
+        None
+    }
+
+    /// Install `resolved` (which may be a cached negative) and return its slot.
+    #[inline]
+    fn install(
+        &mut self,
+        class_id: u32,
+        field_count: u32,
+        generation: u64,
+        resolved: Option<Arc<CompactLayout>>,
+    ) -> usize {
+        let slot = self.next.get() % VERSION_CACHE_LEN;
+        self.next.set(self.next.get().wrapping_add(1));
+        self.mru.set(slot);
+        self.entries[slot] = Some((class_id, field_count, generation, resolved));
+        slot
     }
 }
 
 thread_local! {
     static VERSION_CACHE: std::cell::RefCell<VersionCache> =
         const { std::cell::RefCell::new(VersionCache::new()) };
+}
+
+/// The uncached registry probe both accessors fall back to: an `RwLock` reader
+/// acquire plus a SipHash probe. Everything above exists to avoid this.
+#[inline]
+fn registry_layout_for_fields(class_id: u32, field_count: u32) -> Option<Arc<CompactLayout>> {
+    CLASS_LAYOUT_VERSIONS
+        .read()
+        .get(&(class_id, field_count))
+        .cloned()
 }
 
 /// Resolve the immutable layout version used by an object with this exact
@@ -359,22 +417,26 @@ thread_local! {
 /// Prefer [`with_class_layout`] on hot read-only paths: it serves the same cache
 /// without the `Arc` clone/drop pair of atomics.
 ///
-/// PERF: this is called **once per scanned object** by the Cheney collector's
-/// copy/scan loops (three sites in `gc/src/gc.rs`, plus the G1, concurrent-mark
-/// and ZGC equivalents), and the naked registry lookup underneath — an
-/// `RwLock` reader acquire, a hash probe, and an `Arc` clone/drop pair of
-/// atomics — dominated allocation-heavy workloads. A `perf record` of
-/// `BinTreesClassic d=18` (whose young gen is entirely `Node` objects, so the
-/// collector re-resolves the same one or two layouts for every object it
-/// scans, every collection) attributed **37.8%** of all samples to this
-/// function and another **4.8%** to SipHash inside it.
+/// PERF: this is called **once per scanned object** by the collectors' scan
+/// loops, and the naked registry lookup underneath — an `RwLock` reader
+/// acquire, a hash probe, and an `Arc` clone/drop pair of atomics — dominated
+/// allocation-heavy workloads. A `perf record` of `BinTreesClassic d=18` (whose
+/// young gen is entirely `Node` objects, so the collector re-resolves the same
+/// one or two layouts for every object it scans, every collection) attributed
+/// **37.8%** of all samples to this function and another **4.8%** to SipHash
+/// inside it.
+///
+/// The scan sites themselves have since moved to [`with_class_layout`]; what
+/// still calls *this* form is code that genuinely needs to own the handle —
+/// notably `compact_oop_scan` in `gc/src/heap.rs`, which returns it.
 ///
 /// This is a recurrence of a fix already applied elsewhere: `compact_field_slot`
 /// below, and `compact_oop_scan` in `gc/src/heap.rs`, each grew their own
 /// generation-validated thread-local cache for exactly this reason — but they
-/// are per-caller band-aids around one uncached primitive, and `gc.rs`'s scan
-/// loops call the primitive directly and so were never covered. Caching *here*
-/// covers every call site at once, including the ones added next.
+/// are per-caller band-aids around one uncached primitive, and the `gc.rs` scan
+/// loops called the primitive directly and so were never covered. Caching *here*
+/// covers every call site at once. (`compact_field_slot`'s private copy has been
+/// deleted as redundant; `compact_oop_scan`'s remains.)
 ///
 /// [`LAYOUT_GENERATION`] was introduced for precisely this purpose (see its
 /// doc: "lets hot-path consumers (the GC scan) cache a lookup and cheaply
@@ -385,11 +447,10 @@ thread_local! {
 /// array), and an `Arc` clone; a registration or redefine bumps the generation
 /// and invalidates every thread's cache at once.
 ///
-/// Remaining known cost: the `Arc` clone/drop is two atomic RMWs paid per
-/// scanned object, even though the GC scan sites only read `ref_offsets` and drop
-/// the handle immediately. A borrowing accessor would remove that, but it
-/// requires restructuring the three Cheney scan loops in `gc/src/gc.rs`; tracked
-/// separately rather than done opportunistically inside the collector.
+/// The `Arc` clone/drop is two atomic RMWs paid per call. Callers that only
+/// *read* the layout and drop the handle immediately — which is every GC scan
+/// site — should use [`with_class_layout`] instead, which serves the same cache
+/// entry by reference and pays neither.
 ///
 /// Negative results are cached too (`None`): callers that do not pre-filter
 /// with [`is_compact_object`] would otherwise re-probe the registry for every
@@ -398,40 +459,110 @@ thread_local! {
 pub fn class_layout_for_fields(class_id: u32, field_count: u32) -> Option<Arc<CompactLayout>> {
     let generation = layout_generation();
     VERSION_CACHE.with(|cell| {
-        // `try_borrow_mut` rather than `borrow_mut`: this function is reachable
-        // from GC scan paths, and a panic-on-reentrancy here would abort a
-        // collection. A failed borrow just skips the cache.
-        let Ok(mut cache) = cell.try_borrow_mut() else {
-            return CLASS_LAYOUT_VERSIONS
-                .read()
-                .get(&(class_id, field_count))
-                .cloned();
-        };
-        // MRU probe: the GC scans runs of same-class objects, so this hits on
-        // nearly every call and skips the scan below entirely.
-        if let Some((cid, fc, gen, resolved)) = &cache.entries[cache.mru] {
-            if *cid == class_id && *fc == field_count && *gen == generation {
-                return resolved.clone();
-            }
-        }
-        for (idx, entry) in cache.entries.iter().enumerate() {
-            if let Some((cid, fc, gen, resolved)) = entry {
-                if *cid == class_id && *fc == field_count && *gen == generation {
-                    let hit = resolved.clone();
-                    cache.mru = idx;
-                    return hit;
+        // `try_borrow`/`try_borrow_mut` rather than the panicking forms: this
+        // function is reachable from GC scan paths (and from inside a
+        // `with_class_layout` closure), and a panic-on-reentrancy here would
+        // abort a collection. A failed borrow just skips the cache.
+        //
+        // Taking the *shared* borrow for the lookup is what makes re-entrancy
+        // cheap rather than merely survivable: a nested call still hits the
+        // cache, because shared borrows nest. Only a nested call that also
+        // *misses* falls through to the registry — installing needs the
+        // exclusive borrow, which the enclosing `with_class_layout` frame's
+        // shared borrow rules out.
+        match cell.try_borrow() {
+            Ok(cache) => {
+                if let Some(idx) = cache.find(class_id, field_count, generation) {
+                    return cache.entries[idx].as_ref().and_then(|e| e.3.clone());
                 }
             }
+            Err(_) => return registry_layout_for_fields(class_id, field_count),
         }
-        let resolved = CLASS_LAYOUT_VERSIONS
-            .read()
-            .get(&(class_id, field_count))
-            .cloned();
-        let slot = cache.next % VERSION_CACHE_LEN;
-        cache.next = cache.next.wrapping_add(1);
-        cache.mru = slot;
-        cache.entries[slot] = Some((class_id, field_count, generation, resolved.clone()));
+        let resolved = registry_layout_for_fields(class_id, field_count);
+        if let Ok(mut cache) = cell.try_borrow_mut() {
+            cache.install(class_id, field_count, generation, resolved.clone());
+        }
         resolved
+    })
+}
+
+/// Borrowing form of [`class_layout_for_fields`]: runs `f` against the cached
+/// layout in place and returns its result, or `None` if no layout is registered
+/// for `(class_id, field_count)`.
+///
+/// PERF: this exists for the GC scan loops, which call the lookup **once per
+/// scanned object**, read only `ref_offsets` / `field_offsets` / `body_size`,
+/// and drop the handle immediately. [`class_layout_for_fields`] hands them an
+/// `Arc`, so each of those calls pays a clone/drop pair of atomic RMWs for a
+/// handle that never outlives the statement. Serving the same cache entry by
+/// reference removes both.
+///
+/// # `f` runs with the cache borrowed
+///
+/// `f` executes while this thread's cache is borrowed *shared*, which has two
+/// consequences callers must know about:
+///
+///   * Re-entrancy is safe and still fast. A call back into
+///     [`class_layout_for_fields`] or [`with_class_layout`] from inside `f`
+///     takes another shared borrow and hits normally. This is not hypothetical:
+///     the Cheney scan loops call `forward_object` from inside `f`, which
+///     reaches [`object_body_size`] and back into this cache for the *referent's*
+///     class on every object it copies.
+///   * A re-entrant call that *misses* cannot install its result — installation
+///     needs the exclusive borrow — so it degrades to one uncached registry
+///     probe. That is a correctness-preserving slow path, not a stale answer,
+///     and it self-heals as soon as a non-nested call caches the class.
+///
+/// Borrowing rather than cloning is sound across `f` for the same reason: the
+/// shared borrow blocks any `install` that could overwrite the entry, and the
+/// entry owns an `Arc`, so the layout stays alive even if a concurrent redefine
+/// drops the registry's own handle.
+#[inline]
+pub fn with_class_layout<R>(
+    class_id: u32,
+    field_count: u32,
+    f: impl FnOnce(&CompactLayout) -> R,
+) -> Option<R> {
+    let generation = layout_generation();
+    VERSION_CACHE.with(|cell| {
+        match cell.try_borrow() {
+            Ok(cache) => {
+                if let Some(idx) = cache.find(class_id, field_count, generation) {
+                    // Cache hit. `f` runs with the shared borrow live.
+                    return cache.entries[idx]
+                        .as_ref()
+                        .and_then(|e| e.3.as_deref())
+                        .map(f);
+                }
+            }
+            // Cache unusable (an `install` is on this thread's stack). Fall back
+            // to an owning registry read; the `Arc` here is unavoidable but this
+            // path is not reachable from steady-state GC scanning.
+            Err(_) => return registry_layout_for_fields(class_id, field_count).map(|a| f(&a)),
+        }
+        // Miss: resolve and install under a *short* exclusive borrow that never
+        // spans user code, then re-borrow shared to run `f` against the entry.
+        let resolved = registry_layout_for_fields(class_id, field_count);
+        match cell.try_borrow_mut() {
+            Ok(mut cache) => {
+                let idx = cache.install(class_id, field_count, generation, resolved);
+                drop(cache);
+                // `try_borrow`, not `borrow`: nothing can be holding a borrow
+                // here (the exclusive one was just dropped and no user code has
+                // run since), but this is a GC path where a panic aborts the
+                // collection, so re-resolve rather than rely on that reasoning.
+                // Falling through to `None` would be worse than slow — it would
+                // claim the class has no layout.
+                match cell.try_borrow() {
+                    Ok(cache) => cache.entries[idx]
+                        .as_ref()
+                        .and_then(|e| e.3.as_deref())
+                        .map(f),
+                    Err(_) => registry_layout_for_fields(class_id, field_count).map(|a| f(&a)),
+                }
+            }
+            Err(_) => resolved.map(|a| f(&a)),
+        }
     })
 }
 
@@ -683,9 +814,15 @@ pub fn is_compact_object(header: &ObjectHeader) -> bool {
 #[inline]
 pub fn object_body_size(header: &ObjectHeader) -> usize {
     if is_compact_object(header) {
-        class_layout_for_fields(header.class_id.as_u32(), header.num_slots())
-            .map(|layout| layout.body_size as usize)
-            .unwrap_or(0)
+        // `with_class_layout`, not `class_layout_for_fields`: this reads one
+        // `u32` and drops the handle. It is also the hottest *nested* consumer
+        // of the layout cache — the Cheney collector reaches it once per copied
+        // object, from `object_total_size` inside `forward_object`, which the
+        // scan loops call from inside their own `with_class_layout` closure.
+        with_class_layout(header.class_id.as_u32(), header.num_slots(), |layout| {
+            layout.body_size as usize
+        })
+        .unwrap_or(0)
     } else {
         header.num_slots() as usize * SLOT_SIZE
     }
@@ -1024,6 +1161,105 @@ mod tests {
         for h in handles {
             h.join().expect("lookup worker should not panic");
         }
+        clear_class_layouts();
+    }
+
+    /// `with_class_layout` must agree with `class_layout_for_fields` on both
+    /// the miss (first call) and hit (second call) paths, and must report a
+    /// missing layout as `None` rather than running `f`.
+    #[test]
+    fn with_class_layout_matches_owning_accessor() {
+        let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
+        clear_class_layouts();
+        register_class_layout(60, one_ref_layout(40));
+        // First call is a cache miss (installs), second is a hit.
+        for pass in 0..2 {
+            assert_eq!(
+                with_class_layout(60, 1, |l| l.body_size),
+                Some(40),
+                "pass {pass}"
+            );
+            assert_eq!(
+                with_class_layout(60, 1, |l| l.ref_offsets.clone()),
+                Some(vec![0]),
+                "pass {pass}"
+            );
+        }
+        // Unregistered: `f` must not run.
+        let mut ran = false;
+        let got = with_class_layout(61, 1, |_| {
+            ran = true;
+        });
+        assert!(got.is_none());
+        assert!(!ran, "`f` ran for a class with no registered layout");
+        clear_class_layouts();
+    }
+
+    /// Generation invalidation must apply to the borrowing accessor too — it
+    /// shares one cache with `class_layout_for_fields`, so a replacement that
+    /// the owning accessor sees must not be hidden from this one.
+    #[test]
+    fn with_class_layout_sees_replacement_and_unregister() {
+        let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
+        clear_class_layouts();
+        register_class_layout(62, one_ref_layout(8));
+        assert_eq!(with_class_layout(62, 1, |l| l.body_size), Some(8));
+        register_class_layout(62, one_ref_layout(24));
+        assert_eq!(
+            with_class_layout(62, 1, |l| l.body_size),
+            Some(24),
+            "borrowed entry survived a replacement — generation bump missing"
+        );
+        unregister_class_layout(62);
+        assert_eq!(
+            with_class_layout(62, 1, |l| l.body_size),
+            None,
+            "borrowed entry survived unregister_class_layout"
+        );
+        clear_class_layouts();
+    }
+
+    /// `f` runs while this thread's cache is borrowed, and the GC calls back
+    /// into the cache from inside `f` (`forward_object` -> `object_body_size`)
+    /// on every object it copies. Nested lookups must therefore return correct
+    /// layouts — for the same class and for a different one — and must not
+    /// panic on the `RefCell`.
+    ///
+    /// This is the property that makes the borrowing accessor usable inside the
+    /// Cheney scan loops at all; without it every nested lookup would fall
+    /// through to the registry and the change would be a net slowdown.
+    #[test]
+    fn with_class_layout_is_reentrant() {
+        let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
+        clear_class_layouts();
+        register_class_layout(63, one_ref_layout(8));
+        register_class_layout(64, one_ref_layout(16));
+        // Warm both so the nested lookups exercise the hit path.
+        assert_eq!(class_layout_for_fields(63, 1).unwrap().body_size, 8);
+        assert_eq!(class_layout_for_fields(64, 1).unwrap().body_size, 16);
+
+        let observed = with_class_layout(63, 1, |outer| {
+            // Same class, owning accessor (what `object_body_size` used to do).
+            let same = class_layout_for_fields(63, 1).map(|l| l.body_size);
+            // Different class, borrowing accessor (what it does now) — this is
+            // the referent-sizing call the scan loops make per copied object.
+            let other = with_class_layout(64, 1, |inner| inner.body_size);
+            // Three levels deep, to confirm nesting is not merely depth-1.
+            let deep = with_class_layout(64, 1, |_| with_class_layout(63, 1, |l| l.body_size));
+            (outer.body_size, same, other, deep)
+        });
+        assert_eq!(observed, Some((8, Some(8), Some(16), Some(Some(8)))));
+
+        // A nested lookup for a class that is NOT cached cannot install (the
+        // outer shared borrow blocks it), so it falls through to the registry.
+        // It must still return the right answer.
+        register_class_layout(65, one_ref_layout(32));
+        let uncached = with_class_layout(63, 1, |_| with_class_layout(65, 1, |l| l.body_size));
+        assert_eq!(
+            uncached,
+            Some(Some(32)),
+            "a nested miss must fall through to the registry, not fail"
+        );
         clear_class_layouts();
     }
 

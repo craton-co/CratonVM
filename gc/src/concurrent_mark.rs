@@ -1000,8 +1000,11 @@ impl ConcurrentMarkHeaderSnapshot {
 
     #[inline]
     fn compact_body_size(&self) -> Option<usize> {
-        cratonvm_types::class_layout_for_fields(self.class_id, self.num_slots())
-            .map(|layout| layout.body_size as usize)
+        // Borrowing accessor: reads one `u32` and drops the handle, so there is
+        // no reason to pay an `Arc` clone/drop for it.
+        cratonvm_types::with_class_layout(self.class_id, self.num_slots(), |layout| {
+            layout.body_size as usize
+        })
     }
 }
 

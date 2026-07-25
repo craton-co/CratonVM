@@ -10006,48 +10006,20 @@ fn compact_field_slot(
     }
     let cid = header.class_id.as_u32();
     let field_count = header.num_slots();
-    // A single-entry cache thrashes on the common alternating-class pattern
-    // (for example Integer.value plus HashMap.size). Keep a tiny round-robin
-    // working set and resolve the requested slot while the cache is borrowed,
-    // avoiding both registry locks and Arc clone/drop traffic on hits.
-    struct FieldSlotCache {
-        entries: [Option<(u32, u32, u64, Arc<CompactLayout>)>; 8],
-        next: usize,
-    }
-    impl FieldSlotCache {
-        const fn new() -> Self {
-            Self {
-                entries: [None, None, None, None, None, None, None, None],
-                next: 0,
-            }
-        }
-    }
-    thread_local! {
-        static FIELD_SLOT_CACHE: std::cell::RefCell<FieldSlotCache> =
-            const { std::cell::RefCell::new(FieldSlotCache::new()) };
-    }
-    let gen = cratonvm_types::layout_generation();
-    FIELD_SLOT_CACHE.with(|cell| {
-        let mut cache = cell.borrow_mut();
-        for entry in &cache.entries {
-            if let Some((cached_cid, cached_fields, cached_gen, layout)) = entry {
-                if *cached_cid == cid
-                    && *cached_fields == field_count
-                    && *cached_gen == gen
-                {
-                    let offset = layout.field_offset(index)? as usize;
-                    return Some((offset, layout.field_storage(index)?));
-                }
-            }
-        }
-        let layout = cratonvm_types::class_layout_for_fields(cid, field_count)?;
-        let offset = layout.field_offset(index)? as usize;
-        let storage = layout.field_storage(index)?;
-        let replace = cache.next;
-        cache.entries[replace] = Some((cid, field_count, gen, layout));
-        cache.next = (replace + 1) % cache.entries.len();
-        Some((offset, storage))
+    // This used to keep its own 8-entry generation-validated thread-local cache
+    // (a single-entry one thrashes on the common alternating-class pattern, for
+    // example `Integer.value` plus `HashMap.size`). `class_layout_for_fields` now
+    // has exactly that cache itself, so the local copy was a cache in front of a
+    // cache; `with_class_layout` serves the shared one and resolves the slot
+    // while the entry is borrowed, so hits still avoid both the registry lock and
+    // the `Arc` clone/drop.
+    cratonvm_types::with_class_layout(cid, field_count, |layout| {
+        Some((
+            layout.field_offset(index)? as usize,
+            layout.field_storage(index)?,
+        ))
     })
+    .flatten()
 }
 
 /// Visit every reference slot of an object/array (read-only), invoking
