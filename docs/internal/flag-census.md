@@ -1,6 +1,6 @@
 # CratonVM `CRATONVM_*` environment-flag census
 
-*Generated 2026-07-25 from `dev` @ `531f5f710` by a mechanical scan of every
+*Generated 2026-07-25 from `dev` @ `4f426bedb` by a mechanical scan of every
 `.rs` file in the workspace plus every `.md` / `.sh` / `.java` / `.toml` under the
 repo root. Regenerate with the scripts recorded at the bottom of this file.*
 
@@ -16,12 +16,12 @@ and the only defence is knowing what the full set was beforehand.
 | --- | ---: |
 | Distinct `CRATONVM_*` identifiers seen anywhere (code, docs, scripts) | **692** |
 | …of which have at least one Rust read site | **559** |
-| Rust code literal sites (all kinds) | **1009** |
-| Rust *read* sites (excludes `set_var`/`env_remove`/`option_env!`) | **928** |
-| Read sites **outside** `native-builtins/` (this refactor's scope) | **913** |
+| Rust code literal sites (all kinds) | **1014** |
+| Rust *read* sites (excludes `set_var`/`env_remove`/`option_env!`) | **933** |
+| Read sites **outside** `native-builtins/` (this refactor's scope) | **918** |
 | Read sites inside `native-builtins/` (deliberately deferred, see §6) | **15** |
-| …of which still call `std::env::var` / `var_os` directly | **641** |
-| …already reading a `VmFlags` field instead | **287** |
+| …of which still call `std::env::var` / `var_os` directly | **638** |
+| …already reading a `VmFlags` field instead | **295** |
 | Remaining direct read sites that are **not** `OnceLock`-cached | **464** |
 | In-process `set_var` / `remove_var` / `Command::env` sites | **72** |
 
@@ -234,22 +234,22 @@ read would silently turn the feature off*).
 | Flag | Reads | Cached | Polarity | Crates | First site |
 | --- | ---: | :---: | --- | --- | --- |
 | `CRATONVM_ALLOW_JSR_RET` | 2 | **no** | value/other | classloading,types | `classloading/src/verifier.rs:2842` |
-| `CRATONVM_ALLOW_MOVING_YOUNG` | 1 | **no** | value/other | types | `types/src/flags.rs:600` |
+| `CRATONVM_ALLOW_MOVING_YOUNG` | 1 | **no** | value/other | types | `types/src/flags.rs:614` |
 | `CRATONVM_AOT_HMAC_KEY` | 1 | **no** | value/other | native-builtins | `native-builtins/src/aot.rs:265` |
-| `CRATONVM_ASYNC_HANDOFF_SLEEP_FLOOR_MS` | 1 | **no** | value/other | types | `types/src/flags.rs:1391` |
-| `CRATONVM_ASYNC_SUBMIT_GRACE_MS` | 1 | **no** | value/other | types | `types/src/flags.rs:1392` |
-| `CRATONVM_ASYNC_WORKER_SLEEP_FLOOR_MS` | 1 | **no** | value/other | types | `types/src/flags.rs:1393` |
-| `CRATONVM_AWAIT_NO_SHORTCIRCUIT` | 1 | **no** | value/other | types | `types/src/flags.rs:1394` |
+| `CRATONVM_ASYNC_HANDOFF_SLEEP_FLOOR_MS` | 1 | **no** | value/other | types | `types/src/flags.rs:1413` |
+| `CRATONVM_ASYNC_SUBMIT_GRACE_MS` | 1 | **no** | value/other | types | `types/src/flags.rs:1415` |
+| `CRATONVM_ASYNC_WORKER_SLEEP_FLOOR_MS` | 1 | **no** | value/other | types | `types/src/flags.rs:1418` |
+| `CRATONVM_AWAIT_NO_SHORTCIRCUIT` | 1 | **no** | value/other | types | `types/src/flags.rs:1420` |
 | `CRATONVM_BG_COMPILE` | 1 | yes | value/other | vm | `vm/src/runtime/env_cache.rs:464` |
-| `CRATONVM_BLOCK_PRIVATE_NETS` | 1 | **no** | value/other | types | `types/src/flags.rs:858` |
-| `CRATONVM_BOOT_MODULE_REGISTRY` | 2 | **no** | value/other | types | `types/src/flags.rs:759` |
+| `CRATONVM_BLOCK_PRIVATE_NETS` | 1 | **no** | value/other | types | `types/src/flags.rs:878` |
+| `CRATONVM_BOOT_MODULE_REGISTRY` | 2 | **no** | value/other | types | `types/src/flags.rs:779` |
 | `CRATONVM_C2_SUPERSEDE` | 1 | yes | value/other | vm | `vm/src/runtime/env_cache.rs:832` |
-| `CRATONVM_CANON_OPENFILE` | 1 | **no** | value/other | types | `types/src/flags.rs:1396` |
-| `CRATONVM_CARD_TABLE_ONLY` | 2 | **no** | value/other | types | `types/src/flags.rs:606` |
-| `CRATONVM_CL_BOOTSTRAP_SCOPED` | 1 | **no** | value/other | types | `types/src/flags.rs:1397` |
+| `CRATONVM_CANON_OPENFILE` | 1 | **no** | value/other | types | `types/src/flags.rs:1422` |
+| `CRATONVM_CARD_TABLE_ONLY` | 2 | **no** | value/other | types | `types/src/flags.rs:620` |
+| `CRATONVM_CL_BOOTSTRAP_SCOPED` | 1 | **no** | value/other | types | `types/src/flags.rs:1423` |
 | `CRATONVM_COMPACT_REF_FIELDS` | 1 | yes | value/other | types | `types/src/field_layout.rs:175` |
 | `CRATONVM_COMPRESSED_OOPS` | 1 | **no** | value/other | vm | `vm/src/vm/vm_init.rs:859` |
-| `CRATONVM_CONFINE_IO` | 2 | **no** | value/other | types | `types/src/flags.rs:856` |
+| `CRATONVM_CONFINE_IO` | 2 | **no** | value/other | types | `types/src/flags.rs:876` |
 | `CRATONVM_DEFAULT_HEAP_ERGONOMICS` | 1 | **no** | value/other | vm-cli | `vm-cli/src/main.rs:3878` |
 | `CRATONVM_DEFAULT_HEAP_MAX_MB` | 1 | **no** | value/other | vm-cli | `vm-cli/src/main.rs:3881` |
 | `CRATONVM_DEFAULT_WATCHDOG_SEC` | 1 | **no** | value/other | vm-cli | `vm-cli/src/main.rs:2228` |
@@ -260,34 +260,34 @@ read would silently turn the feature off*).
 | `CRATONVM_DISABLE_ARITH_LICM` | 1 | **no** | opt-in (default OFF) | jit | `jit/src/x64.rs:28088` |
 | `CRATONVM_DISABLE_DEFAULT_WATCHDOG` | 1 | **no** | value/other | vm-cli | `vm-cli/src/main.rs:2221` |
 | `CRATONVM_DISABLE_INTRINSICS` | 3 | partial | value/other | difftest,vm | `vm/src/runtime/env_cache.rs:284` |
-| `CRATONVM_DISABLE_JAR_MMAP` | 1 | **no** | value/other | types | `types/src/flags.rs:765` |
+| `CRATONVM_DISABLE_JAR_MMAP` | 1 | **no** | value/other | types | `types/src/flags.rs:785` |
 | `CRATONVM_DISABLE_JIT` | 5 | partial | value/other | difftest,vm | `vm/tests/wave2_bc_probe.rs:296` |
 | `CRATONVM_DISABLE_SCALAR_REPLACEMENT` | 1 | **no** | opt-in (default OFF) | jit | `jit/src/x64.rs:28365` |
 | `CRATONVM_DISABLE_UNROLL` | 1 | **no** | opt-in (default OFF) | jit | `jit/src/x64.rs:28214` |
 | `CRATONVM_EAGER_STREAMS` | 1 | yes | opt-out (default ON) | native-collections | `native-collections/src/lib.rs:13160` |
 | `CRATONVM_ENABLE_NATIVE_RING` | 1 | **no** | value/other | vm-cli | `vm-cli/src/main.rs:2220` |
-| `CRATONVM_EQE_SYNC_EXECUTE` | 1 | **no** | value/other | types | `types/src/flags.rs:1488` |
+| `CRATONVM_EQE_SYNC_EXECUTE` | 1 | **no** | value/other | types | `types/src/flags.rs:1514` |
 | `CRATONVM_EXEC_DEPTH_CEILING` | 1 | **no** | value/other | vm | `vm/src/runtime/interpreter.rs:4823` |
 | `CRATONVM_FORCE_WIN_BUILD` | 1 | **no** | value/other | vm | `vm/src/vm/vm_init.rs:180` |
 | `CRATONVM_FOREIGN_ATTACH` | 1 | **no** | value/other | vm | `vm/src/native/jni.rs:761` |
 | `CRATONVM_FUZZ_BOOTCP` | 1 | **no** | value/other | fuzz | `fuzz/fuzz_targets/fuzz_verifier.rs:55` |
-| `CRATONVM_G1_NO_EVAC_RETRY` | 1 | **no** | value/other | types | `types/src/flags.rs:609` |
-| `CRATONVM_G1_PARALLEL_EVAC` | 5 | **no** | value/other | types | `types/src/flags.rs:608` |
-| `CRATONVM_G1_WORKERS` | 4 | **no** | value/other | types | `types/src/flags.rs:610` |
+| `CRATONVM_G1_NO_EVAC_RETRY` | 1 | **no** | value/other | types | `types/src/flags.rs:623` |
+| `CRATONVM_G1_PARALLEL_EVAC` | 5 | **no** | value/other | types | `types/src/flags.rs:622` |
+| `CRATONVM_G1_WORKERS` | 5 | **no** | value/other | types | `types/src/flags.rs:624` |
 | `CRATONVM_GC_OVERHEAD_LIMIT` | 1 | yes | value/other | vm | `vm/src/runtime/interpreter.rs:1637` |
-| `CRATONVM_GC_PAR_MIN_BYTES` | 1 | yes | value/other | gc | `gc/src/young_mark.rs:193` |
-| `CRATONVM_GC_PAR_THREADS` | 1 | yes | value/other | gc | `gc/src/young_mark.rs:170` |
-| `CRATONVM_GC_STRESS` | 4 | **no** | value/other | types | `types/src/flags.rs:612` |
-| `CRATONVM_GC_SWEEP_ANCHOR_STRIDE` | 1 | yes | value/other | gc | `gc/src/gen_heap.rs:99` |
+| `CRATONVM_GC_PAR_MIN_BYTES` | 1 | **no** | value/other | types | `types/src/flags.rs:629` |
+| `CRATONVM_GC_PAR_THREADS` | 2 | **no** | value/other | types | `types/src/flags.rs:628` |
+| `CRATONVM_GC_STRESS` | 4 | **no** | value/other | types | `types/src/flags.rs:632` |
+| `CRATONVM_GC_SWEEP_ANCHOR_STRIDE` | 4 | **no** | value/other | types | `types/src/flags.rs:625` |
 | `CRATONVM_GPU_NO_ZEROCOPY` | 1 | yes | opt-out (default ON) | vm | `vm/src/runtime/gpu_marshal.rs:689` |
-| `CRATONVM_HARDEN_MANIFEST_CLASSPATH` | 1 | **no** | value/other | types | `types/src/flags.rs:763` |
+| `CRATONVM_HARDEN_MANIFEST_CLASSPATH` | 1 | **no** | value/other | types | `types/src/flags.rs:783` |
 | `CRATONVM_HELPFUL_NPE_OPCODES` | 1 | yes | value/other | vm | `vm/src/runtime/env_cache.rs:326` |
-| `CRATONVM_HTTP_MAX_BODY` | 1 | **no** | value/other | types | `types/src/flags.rs:1490` |
-| `CRATONVM_INHERIT_THREAD_CCL` | 1 | **no** | value/other | types | `types/src/flags.rs:1494` |
-| `CRATONVM_INHERIT_TL_WORKAROUND` | 1 | **no** | value/other | types | `types/src/flags.rs:1495` |
+| `CRATONVM_HTTP_MAX_BODY` | 1 | **no** | value/other | types | `types/src/flags.rs:1516` |
+| `CRATONVM_INHERIT_THREAD_CCL` | 1 | **no** | value/other | types | `types/src/flags.rs:1520` |
+| `CRATONVM_INHERIT_TL_WORKAROUND` | 1 | **no** | value/other | types | `types/src/flags.rs:1521` |
 | `CRATONVM_INLINE_ALLOW_STATIC` | 1 | yes | opt-in (default OFF) | vm | `vm/src/runtime/env_cache.rs:869` |
 | `CRATONVM_IR_DEOPT_RESUME` | 1 | yes | opt-in (default OFF) | vm | `vm/src/runtime/interpreter.rs:11621` |
-| `CRATONVM_JBOSS_BRUTE_FORCE_JARS` | 1 | **no** | value/other | types | `types/src/flags.rs:1497` |
+| `CRATONVM_JBOSS_BRUTE_FORCE_JARS` | 1 | **no** | value/other | types | `types/src/flags.rs:1523` |
 | `CRATONVM_JBOSS_MP_ROOT` | 8 | **no** | value/other | native-builtins | `native-builtins/src/lib.rs:71` |
 | `CRATONVM_JIT_ALLOW_PACKAGES` | 2 | yes | value/other | jit,vm | `jit/src/lib.rs:5527` |
 | `CRATONVM_JIT_C2_FIRST_CALL` | 1 | yes | opt-in (default OFF) | vm | `vm/src/runtime/interpreter.rs:4950` |
@@ -339,22 +339,22 @@ read would silently turn the feature off*).
 | `CRATONVM_JIT_VIRTUAL_TIERUP` | 1 | yes | value/other | vm | `vm/src/runtime/env_cache.rs:494` |
 | `CRATONVM_LAZY_STREAMS` | 1 | yes | opt-in (default OFF) | native-collections | `native-collections/src/lib.rs:13157` |
 | `CRATONVM_LENIENT_CLINIT` | 2 | partial | value/other | vm | `vm/src/vm/vm_util.rs:53` |
-| `CRATONVM_LOADER_AWARE_RESOLUTION` | 2 | **no** | value/other | types | `types/src/flags.rs:757` |
-| `CRATONVM_LOADER_UNLOAD` | 2 | partial | value/other | types | `types/src/flags.rs:1499` |
+| `CRATONVM_LOADER_AWARE_RESOLUTION` | 2 | **no** | value/other | types | `types/src/flags.rs:777` |
+| `CRATONVM_LOADER_UNLOAD` | 2 | partial | value/other | types | `types/src/flags.rs:1525` |
 | `CRATONVM_LONGREWRITE_LOOSE` | 1 | yes | opt-in (default OFF) | vm | `vm/src/runtime/value_stack.rs:198` |
 | `CRATONVM_MAVEN_REPO_LOCAL` | 2 | **no** | value/other | native-builtins | `native-builtins/src/jboss_module_loader.rs:301` |
-| `CRATONVM_MAX_INFLATED_BYTES` | 1 | **no** | value/other | types | `types/src/flags.rs:1500` |
+| `CRATONVM_MAX_INFLATED_BYTES` | 1 | **no** | value/other | types | `types/src/flags.rs:1526` |
 | `CRATONVM_MOVING_YOUNG` | 5 | partial | opt-in (default OFF) | jit,types,vm | `jit/src/x64.rs:2458` |
-| `CRATONVM_MOVING_YOUNG_FALLBACKS` | 1 | **no** | value/other | types | `types/src/flags.rs:601` |
-| `CRATONVM_MSC_REAL_START` | 1 | **no** | value/other | types | `types/src/flags.rs:1501` |
-| `CRATONVM_NATIVE_EC_MULTIPLY` | 1 | **no** | value/other | types | `types/src/flags.rs:1502` |
+| `CRATONVM_MOVING_YOUNG_FALLBACKS` | 1 | **no** | value/other | types | `types/src/flags.rs:615` |
+| `CRATONVM_MSC_REAL_START` | 1 | **no** | value/other | types | `types/src/flags.rs:1527` |
+| `CRATONVM_NATIVE_EC_MULTIPLY` | 1 | **no** | value/other | types | `types/src/flags.rs:1528` |
 | `CRATONVM_NATIVE_MATCHER_FIND` | 2 | partial | value/other | types,vm | `vm/src/runtime/env_cache.rs:562` |
-| `CRATONVM_NATIVE_PBE_KEYFACTORY` | 1 | **no** | value/other | types | `types/src/flags.rs:1504` |
+| `CRATONVM_NATIVE_PBE_KEYFACTORY` | 1 | **no** | value/other | types | `types/src/flags.rs:1530` |
 | `CRATONVM_NATIVE_STRING_REGEX` | 2 | partial | value/other | types,vm | `vm/src/runtime/env_cache.rs:520` |
-| `CRATONVM_NETTY_QUEUE_BRIDGE` | 1 | **no** | value/other | types | `types/src/flags.rs:1506` |
+| `CRATONVM_NETTY_QUEUE_BRIDGE` | 1 | **no** | value/other | types | `types/src/flags.rs:1532` |
 | `CRATONVM_NO_CONSERVATIVE_LOCALS` | 1 | yes | opt-out (default ON) | vm | `vm/src/memory/roots.rs:36` |
 | `CRATONVM_NO_CTOR_DIRECT_CALL` | 1 | **no** | value/other | vm | `vm/src/runtime/env_cache.rs:587` |
-| `CRATONVM_NO_GC_PROMOTION_GUARD` | 1 | **no** | value/other | types | `types/src/flags.rs:602` |
+| `CRATONVM_NO_GC_PROMOTION_GUARD` | 1 | **no** | value/other | types | `types/src/flags.rs:616` |
 | `CRATONVM_NO_IR_BRANCHY` | 1 | yes | opt-out (default ON) | jit | `jit/src/ir_optimize.rs:98` |
 | `CRATONVM_NO_JIT_ALLOC_CLASS_CACHE` | 1 | yes | opt-out (default ON) | vm | `vm/src/jit/alloc_class_cache.rs:218` |
 | `CRATONVM_NO_JIT_INLINE_PUTFIELD` | 1 | yes | opt-out (default ON) | jit | `jit/src/x64.rs:2126` |
@@ -366,55 +366,55 @@ read would silently turn the feature off*).
 | `CRATONVM_NO_PRECISE_REG_SPILL` | 1 | yes | opt-in (default OFF) | jit | `jit/src/x64.rs:2661` |
 | `CRATONVM_NO_SELECTIVE_PROMOTE` | 3 | **no** | value/other | difftest,types | `difftest/src/runner.rs:179` |
 | `CRATONVM_NO_STUBS` | 1 | **no** | value/other | native-api | `native-api/src/registry.rs:3886` |
-| `CRATONVM_OLD_SWEEP_JIT` | 4 | **no** | value/other | types | `types/src/flags.rs:607` |
+| `CRATONVM_OLD_SWEEP_JIT` | 4 | **no** | value/other | types | `types/src/flags.rs:621` |
 | `CRATONVM_OSR_EXIT_AFTER` | 1 | yes | value/other | jit | `jit/src/lib.rs:1062` |
 | `CRATONVM_OSR_EXIT_TEST` | 1 | yes | opt-in (default OFF) | jit | `jit/src/lib.rs:1042` |
 | `CRATONVM_OSR_NEWARRAY` | 1 | yes | value/other | vm | `vm/src/runtime/env_cache.rs:266` |
 | `CRATONVM_PRECISE_COVERAGE_PIN` | 1 | yes | opt-in (default OFF) | vm | `vm/src/jit/conservative_roots.rs:1913` |
-| `CRATONVM_PROMOTION_OOM_GUARD_BROAD` | 1 | **no** | value/other | types | `types/src/flags.rs:603` |
+| `CRATONVM_PROMOTION_OOM_GUARD_BROAD` | 1 | **no** | value/other | types | `types/src/flags.rs:617` |
 | `CRATONVM_REAL` | 2 | partial | value/other | vm | `vm/tests/synthetic_diff.rs:289` |
-| `CRATONVM_REAL_AGROAL` | 1 | **no** | value/other | types | `types/src/flags.rs:1507` |
+| `CRATONVM_REAL_AGROAL` | 1 | **no** | value/other | types | `types/src/flags.rs:1533` |
 | `CRATONVM_REAL_ANNOTATIONS` | 3 | **no** | value/other | types,vm | `vm/tests/synthetic_diff.rs:290` |
 | `CRATONVM_REAL_AQS` | 3 | **no** | value/other | types,vm | `vm/tests/synthetic_diff.rs:291` |
 | `CRATONVM_REAL_FORKJOINPOOL` | 6 | partial | opt-out (default ON) | native-api,vm | `vm/tests/synthetic_diff.rs:294` |
 | `CRATONVM_REAL_JCA` | 2 | partial | value/other | types,vm | `vm/src/runtime/env_cache.rs:966` |
 | `CRATONVM_REAL_NET_SOCKETS` | 4 | partial | opt-in (default OFF) | native-api,types,vm | `vm/tests/synthetic_diff.rs:293` |
-| `CRATONVM_REAL_PROXY` | 1 | **no** | value/other | types | `types/src/flags.rs:1511` |
-| `CRATONVM_REAL_PROXY_STRICT` | 1 | **no** | value/other | types | `types/src/flags.rs:1512` |
+| `CRATONVM_REAL_PROXY` | 1 | **no** | value/other | types | `types/src/flags.rs:1537` |
+| `CRATONVM_REAL_PROXY_STRICT` | 1 | **no** | value/other | types | `types/src/flags.rs:1538` |
 | `CRATONVM_REAL_PROXY_SUPER` | 3 | partial | value/other | types,vm | `vm/src/runtime/env_cache.rs:354` |
-| `CRATONVM_REAL_QUARKUS_START` | 1 | **no** | value/other | types | `types/src/flags.rs:1515` |
-| `CRATONVM_REAL_STAX_FACTORY` | 1 | **no** | value/other | types | `types/src/flags.rs:1516` |
-| `CRATONVM_REAL_VERTX` | 1 | **no** | value/other | types | `types/src/flags.rs:1517` |
+| `CRATONVM_REAL_QUARKUS_START` | 1 | **no** | value/other | types | `types/src/flags.rs:1541` |
+| `CRATONVM_REAL_STAX_FACTORY` | 1 | **no** | value/other | types | `types/src/flags.rs:1542` |
+| `CRATONVM_REAL_VERTX` | 1 | **no** | value/other | types | `types/src/flags.rs:1543` |
 | `CRATONVM_RECLAIM_DEAD_MONITORS` | 1 | yes | opt-in (default OFF) | vm | `vm/src/threading/monitor.rs:95` |
-| `CRATONVM_REQUIRE_POLICY` | 1 | **no** | value/other | types | `types/src/flags.rs:1518` |
+| `CRATONVM_REQUIRE_POLICY` | 1 | **no** | value/other | types | `types/src/flags.rs:1544` |
 | `CRATONVM_RESOLVE_CACHE_CAP` | 4 | **no** | value/other | vm | `vm/src/runtime/lockfree_resolve.rs:56` |
-| `CRATONVM_RESOLVE_OUTBOUND_HOST` | 1 | **no** | value/other | types | `types/src/flags.rs:859` |
+| `CRATONVM_RESOLVE_OUTBOUND_HOST` | 1 | **no** | value/other | types | `types/src/flags.rs:879` |
 | `CRATONVM_ROOTSNAP_CACHE` | 1 | yes | value/other | vm | `vm/src/runtime/env_cache.rs:389` |
 | `CRATONVM_ROOTSNAP_CACHE_SURVIVE_GC` | 1 | yes | value/other | vm | `vm/src/runtime/env_cache.rs:422` |
 | `CRATONVM_SCALAR_DEOPT` | 1 | yes | opt-in (default OFF) | jit | `jit/src/lib.rs:987` |
-| `CRATONVM_SELECT_MAX_BLOCK_MS` | 3 | **no** | value/other | types | `types/src/flags.rs:864` |
+| `CRATONVM_SELECT_MAX_BLOCK_MS` | 3 | **no** | value/other | types | `types/src/flags.rs:884` |
 | `CRATONVM_SHADOW_NOPUSH` | 2 | partial | opt-in (default OFF) | jit,vm | `jit/src/x64.rs:2501` |
 | `CRATONVM_SHADOW_NORELOAD` | 2 | partial | opt-in (default OFF) | jit,vm | `jit/src/x64.rs:2511` |
 | `CRATONVM_SHADOW_NO_SAVEBASE` | 1 | yes | opt-in (default OFF) | jit | `jit/src/x64.rs:2583` |
 | `CRATONVM_SHADOW_PIN` | 2 | yes | opt-in (default OFF) | jit,vm | `jit/src/x64.rs:2525` |
 | `CRATONVM_SHADOW_RAW_RELOAD` | 1 | yes | opt-in (default OFF) | jit | `jit/src/x64.rs:2572` |
 | `CRATONVM_SHADOW_STACK` | 4 | partial | opt-in (default OFF) | jit,types,vm | `jit/src/x64.rs:2436` |
-| `CRATONVM_SOFT_EXIT` | 1 | **no** | value/other | types | `types/src/flags.rs:1521` |
-| `CRATONVM_SP_NO_COALESCE` | 1 | **no** | value/other | types | `types/src/flags.rs:605` |
+| `CRATONVM_SOFT_EXIT` | 1 | **no** | value/other | types | `types/src/flags.rs:1547` |
+| `CRATONVM_SP_NO_COALESCE` | 1 | **no** | value/other | types | `types/src/flags.rs:619` |
 | `CRATONVM_STRICT_JIT_ROOTS` | 1 | yes | opt-in (default OFF) | vm | `vm/src/jit/conservative_roots.rs:1223` |
-| `CRATONVM_SYNTHETIC_AGROAL` | 1 | **no** | value/other | types | `types/src/flags.rs:1523` |
-| `CRATONVM_SYNTHETIC_ANNOTATIONS` | 1 | **no** | value/other | types | `types/src/flags.rs:1524` |
-| `CRATONVM_SYNTHETIC_AQS` | 1 | **no** | value/other | types | `types/src/flags.rs:1525` |
-| `CRATONVM_SYNTHETIC_BUFFERED_WRITER` | 1 | **no** | value/other | types | `types/src/flags.rs:1526` |
-| `CRATONVM_SYNTHETIC_DSA` | 1 | **no** | value/other | types | `types/src/flags.rs:1527` |
-| `CRATONVM_SYNTHETIC_EC` | 1 | **no** | value/other | types | `types/src/flags.rs:1528` |
-| `CRATONVM_SYNTHETIC_EQE` | 1 | **no** | value/other | types | `types/src/flags.rs:1529` |
-| `CRATONVM_SYNTHETIC_FILEWRITER` | 1 | **no** | value/other | types | `types/src/flags.rs:861` |
-| `CRATONVM_SYNTHETIC_PQC` | 1 | **no** | value/other | types | `types/src/flags.rs:1530` |
+| `CRATONVM_SYNTHETIC_AGROAL` | 1 | **no** | value/other | types | `types/src/flags.rs:1549` |
+| `CRATONVM_SYNTHETIC_ANNOTATIONS` | 1 | **no** | value/other | types | `types/src/flags.rs:1550` |
+| `CRATONVM_SYNTHETIC_AQS` | 1 | **no** | value/other | types | `types/src/flags.rs:1551` |
+| `CRATONVM_SYNTHETIC_BUFFERED_WRITER` | 1 | **no** | value/other | types | `types/src/flags.rs:1552` |
+| `CRATONVM_SYNTHETIC_DSA` | 1 | **no** | value/other | types | `types/src/flags.rs:1553` |
+| `CRATONVM_SYNTHETIC_EC` | 1 | **no** | value/other | types | `types/src/flags.rs:1554` |
+| `CRATONVM_SYNTHETIC_EQE` | 1 | **no** | value/other | types | `types/src/flags.rs:1555` |
+| `CRATONVM_SYNTHETIC_FILEWRITER` | 1 | **no** | value/other | types | `types/src/flags.rs:881` |
+| `CRATONVM_SYNTHETIC_PQC` | 1 | **no** | value/other | types | `types/src/flags.rs:1556` |
 | `CRATONVM_SYNTHETIC_QUARKUS_ARC` | 2 | **no** | value/other | native-builtins | `native-builtins/src/quarkus_arc.rs:374` |
-| `CRATONVM_SYNTHETIC_RAF` | 4 | **no** | value/other | types | `types/src/flags.rs:862` |
-| `CRATONVM_SYNTHETIC_RSA` | 1 | **no** | value/other | types | `types/src/flags.rs:1531` |
-| `CRATONVM_SYNTHETIC_VERTX` | 1 | **no** | value/other | types | `types/src/flags.rs:1532` |
+| `CRATONVM_SYNTHETIC_RAF` | 4 | **no** | value/other | types | `types/src/flags.rs:882` |
+| `CRATONVM_SYNTHETIC_RSA` | 1 | **no** | value/other | types | `types/src/flags.rs:1557` |
+| `CRATONVM_SYNTHETIC_VERTX` | 1 | **no** | value/other | types | `types/src/flags.rs:1558` |
 | `CRATONVM_THREAD_START_GRACE_MS` | 1 | yes | value/other | vm | `vm/src/vm/vm_exec.rs:139` |
 | `CRATONVM_TIER_C1_THRESHOLD` | 2 | **no** | value/other | jit | `jit/src/tiered.rs:211` |
 | `CRATONVM_TIER_C2_MIN_INVOCATIONS` | 2 | **no** | value/other | jit | `jit/src/tiered.rs:220` |
@@ -425,15 +425,15 @@ read would silently turn the feature off*).
 | `CRATONVM_TIER_PGO` | 1 | **no** | value/other | vm | `vm/src/runtime/env_cache.rs:479` |
 | `CRATONVM_TLAB_GC_TRIGGER` | 1 | yes | value/other | vm | `vm/src/runtime/interpreter.rs:2692` |
 | `CRATONVM_TRUST_PEM` | 2 | **no** | value/other | classloading,types | `classloading/src/jar_signer.rs:1941` |
-| `CRATONVM_UNTRUSTED_CODE` | 1 | **no** | value/other | types | `types/src/flags.rs:857` |
-| `CRATONVM_URI_STRICT_CHARS` | 1 | **no** | value/other | types | `types/src/flags.rs:1537` |
-| `CRATONVM_USE_WILDFLY_REFLECT_SHIM` | 1 | **no** | value/other | types | `types/src/flags.rs:1538` |
-| `CRATONVM_USE_WILDFLY_SYNTH_BYTECODE` | 1 | **no** | value/other | types | `types/src/flags.rs:1539` |
+| `CRATONVM_UNTRUSTED_CODE` | 1 | **no** | value/other | types | `types/src/flags.rs:877` |
+| `CRATONVM_URI_STRICT_CHARS` | 1 | **no** | value/other | types | `types/src/flags.rs:1563` |
+| `CRATONVM_USE_WILDFLY_REFLECT_SHIM` | 1 | **no** | value/other | types | `types/src/flags.rs:1564` |
+| `CRATONVM_USE_WILDFLY_SYNTH_BYTECODE` | 1 | **no** | value/other | types | `types/src/flags.rs:1565` |
 | `CRATONVM_WEAKREF_CLEAR` | 1 | yes | value/other | vm | `vm/src/runtime/interpreter.rs:148` |
 | `CRATONVM_XT_HELPER_WINDOW_SCAN` | 1 | **no** | value/other | vm | `vm/src/jit/xt_root_scan.rs:127` |
 | `CRATONVM_XT_JIT_ROOT_SCAN` | 2 | partial | value/other | jit,vm | `jit/src/lib.rs:879` |
 | `CRATONVM_YOUNGSCAN_STRIDE` | 1 | yes | value/other | vm | `vm/src/vm/vm_exec.rs:668` |
-| `CRATONVM_ZIP_MAX_ENTRY_BYTES` | 2 | **no** | value/other | types | `types/src/flags.rs:869` |
+| `CRATONVM_ZIP_MAX_ENTRY_BYTES` | 2 | **no** | value/other | types | `types/src/flags.rs:889` |
 
 ## 5. Class (a) — debug / diagnostic flags
 
@@ -1002,7 +1002,7 @@ was built from in place of the read count.
 ## 8. Caching status and the per-call readers
 
 `std::env::var` takes a process-global lock in libc `getenv` and allocates. Of the
-928 read sites, **464** are not behind a `OnceLock`. Most of those are cold
+933 read sites, **464** are not behind a `OnceLock`. Most of those are cold
 (startup, class load, JIT compile), but three are genuinely hot and are the reason
 the typed config is worth doing on performance grounds alone:
 
@@ -1097,7 +1097,7 @@ where the parse now lives, is excluded by construction.
 | `classloading` | 0 | **migrated** |
 | `difftest` | 1 | not started |
 | `fuzz` | 1 | not started |
-| `gc` | 3 | **INCOMPLETE** |
+| `gc` | 0 | **migrated** |
 | `jit` | 112 | not started |
 | `libcratonvm` | 5 | not started |
 | `native-api` | 5 | not started |

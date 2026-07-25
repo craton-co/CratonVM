@@ -85,23 +85,17 @@ const YOUNG_GC_THRESHOLD_PERCENT: usize = 50;
 /// turning every near-capacity refill into an allocation-failure collection.
 const NON_MOVING_YOUNG_GC_THRESHOLD_PERCENT: usize = 90;
 
-/// Byte spacing of the sweep anchors the exact-base oracle walk records for
-/// the parallel sweep. Small enough that a multi-hundred-megabyte young gen
-/// yields far more chunks than workers (so a chunk that stops early cannot
-/// skew the split), large enough that the anchor list stays trivial.
+/// Byte spacing at which the parallel sweep SUBSAMPLES the object grid the
+/// allocator records (`arena.rs`). Small enough that a multi-hundred-megabyte
+/// young gen yields far more chunks than workers (so a chunk that stops early
+/// cannot skew the split), large enough that the anchor list stays trivial.
 ///
 /// `CRATONVM_GC_SWEEP_ANCHOR_STRIDE` overrides it. Lowering it is how the
 /// GC-stress matrix drives the parallel sweep on a small young gen, where the
 /// 8 MiB default would produce a single chunk and silently never exercise it.
+#[inline]
 fn sweep_anchor_stride() -> usize {
-    static G: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *G.get_or_init(|| {
-        std::env::var("CRATONVM_GC_SWEEP_ANCHOR_STRIDE")
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            .filter(|&n| n >= 64)
-            .unwrap_or(8 * 1024 * 1024)
-    })
+    crate::gc_flags().gc_sweep_anchor_stride
 }
 
 #[inline]

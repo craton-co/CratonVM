@@ -490,6 +490,20 @@ pub struct GcFlags {
     /// `CRATONVM_G1_WORKERS` — override the G1 worker count, clamped to `>= 1`.
     /// [`parse::usize_min1`].
     pub g1_workers: Option<usize>,
+    /// `CRATONVM_GC_SWEEP_ANCHOR_STRIDE` — byte spacing at which the parallel
+    /// young sweep subsamples the allocator-recorded object grid. Values below
+    /// 64 are ignored; default 8 MiB. Lowering it is how the GC-stress matrix
+    /// forces multiple sweep chunks on a small young gen.
+    pub gc_sweep_anchor_stride: usize,
+    /// `CRATONVM_GC_PAR_THREADS` — explicit young-collector worker count.
+    /// `0`/`1` disable parallelism; `>= 2` forces that many workers regardless
+    /// of heap size. `None` = automatic. **Not** clamped to `>= 1`: zero is a
+    /// meaningful value here, so this is [`parse::usize_opt`], not
+    /// [`parse::usize_min1`].
+    pub gc_par_threads: Option<usize>,
+    /// `CRATONVM_GC_PAR_MIN_BYTES` — young-gen size below which parallelism
+    /// never pays for itself; default 16 MiB.
+    pub gc_par_min_bytes: usize,
     /// `CRATONVM_DBG_GC_STRESS`, falling back to `CRATONVM_GC_STRESS` — force
     /// a GC every N bytes allocated. Values `<= 0` and unparseable values are
     /// treated as unset. Despite the `DBG_` name this changes GC scheduling,
@@ -608,6 +622,12 @@ impl GcFlags {
             g1_parallel_evac: one_or_true(src, "CRATONVM_G1_PARALLEL_EVAC"),
             g1_no_evac_retry: present(src, "CRATONVM_G1_NO_EVAC_RETRY"),
             g1_workers: usize_min1(src, "CRATONVM_G1_WORKERS"),
+            gc_sweep_anchor_stride: usize_opt(src, "CRATONVM_GC_SWEEP_ANCHOR_STRIDE")
+                .filter(|&n| n >= 64)
+                .unwrap_or(8 * 1024 * 1024),
+            gc_par_threads: usize_opt(src, "CRATONVM_GC_PAR_THREADS"),
+            gc_par_min_bytes: usize_opt(src, "CRATONVM_GC_PAR_MIN_BYTES")
+                .unwrap_or(16 * 1024 * 1024),
             gc_stress_bytes: utf8(src, "CRATONVM_DBG_GC_STRESS")
                 .or_else(|| utf8(src, "CRATONVM_GC_STRESS"))
                 .and_then(|v| v.trim().parse::<usize>().ok())
@@ -1639,6 +1659,40 @@ mod tests {
         assert_eq!(f.gc.dbg_stale_objref_cycles, 1);
         assert_eq!(f.gc.dbg_watch_cell, 0);
         assert_eq!(f.gc.dbg_blocked_access, BlockedAccessMode::Off);
+    }
+
+    #[test]
+    fn gc_par_threads_keeps_zero_because_zero_disables_parallelism() {
+        // `CRATONVM_GC_PAR_THREADS=0` means "no parallel young GC". It is
+        // therefore `usize_opt`, NOT `usize_min1` like its neighbour
+        // `CRATONVM_G1_WORKERS` — clamping it to >= 1 would silently turn the
+        // documented kill-switch into "one worker", and the caller
+        // (`young_mark::young_gc_threads`) already does its own `.max(1)`.
+        let f = VmFlags::from_source(&src(&[("CRATONVM_GC_PAR_THREADS", "0")]));
+        assert_eq!(f.gc.gc_par_threads, Some(0));
+        // The lookalike really is clamped — the two must not be unified.
+        let g = VmFlags::from_source(&src(&[("CRATONVM_G1_WORKERS", "0")]));
+        assert_eq!(g.gc.g1_workers, Some(1));
+    }
+
+    #[test]
+    fn gc_sweep_anchor_stride_ignores_values_below_64() {
+        // Sub-64-byte strides would mint an anchor inside almost every object;
+        // the pre-config code filtered them out and fell back to the default.
+        let lo = VmFlags::from_source(&src(&[("CRATONVM_GC_SWEEP_ANCHOR_STRIDE", "32")]));
+        assert_eq!(lo.gc.gc_sweep_anchor_stride, 8 * 1024 * 1024);
+        let ok = VmFlags::from_source(&src(&[("CRATONVM_GC_SWEEP_ANCHOR_STRIDE", "64")]));
+        assert_eq!(ok.gc.gc_sweep_anchor_stride, 64);
+        let junk = VmFlags::from_source(&src(&[("CRATONVM_GC_SWEEP_ANCHOR_STRIDE", "nope")]));
+        assert_eq!(junk.gc.gc_sweep_anchor_stride, 8 * 1024 * 1024);
+    }
+
+    #[test]
+    fn gc_parallel_value_flags_default_as_documented() {
+        let f = VmFlags::from_source(&MapSource::empty());
+        assert_eq!(f.gc.gc_sweep_anchor_stride, 8 * 1024 * 1024);
+        assert_eq!(f.gc.gc_par_threads, None);
+        assert_eq!(f.gc.gc_par_min_bytes, 16 * 1024 * 1024);
     }
 
     #[test]
