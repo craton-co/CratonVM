@@ -25,6 +25,7 @@
 //!   defers compaction (it may still mark, but it does not relocate any
 //!   object — see `gen_heap::collect_garbage_inner`).
 
+use crate::gc_flags;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 #[cfg(not(test))]
@@ -103,9 +104,7 @@ pub static LEAVE_COUNT: AtomicUsize = AtomicUsize::new(0);
 /// validation against the bt18 = 68332206 invariant.
 #[inline]
 pub fn moving_young_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("CRATONVM_MOVING_YOUNG").is_some())
+    gc_flags().moving_young
 }
 
 static MOVING_YOUNG_COVERAGE_INCOMPLETE: AtomicBool = AtomicBool::new(false);

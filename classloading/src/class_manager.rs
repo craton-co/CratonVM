@@ -36,6 +36,7 @@ use crate::class::{
     InnerClassEntry, RecordComponentInfo,
 };
 use crate::class_path::ClassPath;
+use crate::loader_flags;
 use crate::loaders::{
     ApplicationClassFinder, BootstrapClassFinder, ClassFinder, ExtensionClassFinder,
     BUILTIN_LOADER_DELEGATION_CHAIN,
@@ -45,8 +46,8 @@ use crate::module::{
     packages_from_module_packages_attribute, ModuleRegistry,
 };
 use crate::vtype::ClassHierarchy;
-use cratonvm_types::error::{ClassFileError, LinkageError, RuntimeError, VmError};
 use cratonvm_reader::SharedBytes;
+use cratonvm_types::error::{ClassFileError, LinkageError, RuntimeError, VmError};
 
 /// Default soft cap for [`ClassManager::class_bytes_cache`]. 16 MiB.
 ///
@@ -136,12 +137,7 @@ fn loaded_classes_probe(
 /// Empty / `"0"` ⇒ off; any other value (including unset) ⇒ on. Read once
 /// and cached in a `OnceLock` — the env var is not re-read after first use.
 pub fn loader_aware_resolution() -> bool {
-    use std::sync::OnceLock;
-    static GATE: OnceLock<bool> = OnceLock::new();
-    *GATE.get_or_init(|| match std::env::var("CRATONVM_LOADER_AWARE_RESOLUTION") {
-        Ok(v) => !v.is_empty() && v != "0",
-        Err(_) => true,
-    })
+    loader_flags().loader_aware_resolution
 }
 
 /// Diagnostic-only gate mirroring `CRATONVM_TRACE_UNIMPLEMENTED` (see
@@ -156,9 +152,7 @@ pub fn loader_aware_resolution() -> bool {
 /// `NoClassDefFoundError` with no further detail). Off by default to avoid
 /// spamming normal runs.
 fn trace_stub_fallback() -> bool {
-    use std::sync::OnceLock;
-    static GATE: OnceLock<bool> = OnceLock::new();
-    *GATE.get_or_init(|| std::env::var_os("CRATONVM_TRACE_UNIMPLEMENTED").is_some())
+    loader_flags().trace_unimplemented
 }
 
 /// H5 (HIGH): return `true` if `internal_name` (a `/`-separated internal
@@ -1739,10 +1733,7 @@ impl ClassManager {
         // service-provider discovery (`ServiceLoader` via module `provides`,
         // e.g. ToolProvider.getSystemJavaCompiler) and module labelling match
         // the real JDK.
-        let register_modules = !matches!(
-            std::env::var("CRATONVM_BOOT_MODULE_REGISTRY").as_deref(),
-            Ok("0") | Ok("false") | Ok("no")
-        );
+        let register_modules = loader_flags().boot_module_registry;
         if register_modules {
             // `automatic = true` for the application class path: those jars are
             // on the class path (not a module path), so the real JDK puts them in
@@ -1803,7 +1794,7 @@ impl ClassManager {
     /// Parse a `module-info.class` byte array and register the contained
     /// module descriptor in `registry`.  Silently ignores parse failures.
     fn try_register_module_info(registry: &mut ModuleRegistry, bytes: &[u8], automatic: bool) {
-        let diag_mp = std::env::var("CRATONVM_DBG_MODPROV").is_ok();
+        let diag_mp = loader_flags().dbg_modprov;
         let mut class_file = match cratonvm_reader::read_class(bytes) {
             Ok(cf) => cf,
             Err(e) => {
@@ -2789,14 +2780,14 @@ impl ClassManager {
         if is_user_loader_answer && self.find_class_bytes_delegated(name).is_err() {
             return Some(candidate);
         }
-        if std::env::var("CRATONVM_DBG_DUPCLASS").is_ok() {
+        if loader_flags().dbg_dupclass {
             eprintln!(
                 "[DBG_DUPCLASS] rejecting existing UserDefined-loader candidate {:?} (loader={:?}) for {:?} -- delegation chain also has it, so a SEPARATE ClassId will be created under Application",
                 candidate,
                 self.class_store.get(candidate).map(|c| c.loader_id),
                 name,
             );
-            if std::env::var_os("CRATONVM_DBG_DUPCLASS_BT").is_some() {
+            if loader_flags().dbg_dupclass_bt {
                 let bt = std::backtrace::Backtrace::force_capture();
                 eprintln!("[DBG_DUPCLASS_BT] {name}\n{bt}");
             }
@@ -2805,7 +2796,7 @@ impl ClassManager {
     }
 
     pub fn load_class(&mut self, name: &str) -> Result<ClassId, VmError> {
-        if std::env::var_os("CRATONVM_DBG_LOADCLASS").is_some() && name.contains("GroupsMetadata") {
+        if loader_flags().dbg_loadclass && name.contains("GroupsMetadata") {
             let bt = std::backtrace::Backtrace::force_capture();
             eprintln!(
                 "[DBG_LOADCLASS] load_class({name}) already_loaded={:?}\n{bt}",
@@ -3060,7 +3051,7 @@ impl ClassManager {
         loader_id: ClassLoaderId,
         options: DefineClassOptions,
     ) -> Result<ClassId, VmError> {
-        if std::env::var("CRATONVM_DBG_DEFINE").is_ok()
+        if loader_flags().dbg_define
             && (name.contains("TestNGTestEngine") || name.contains("IsTestNGTestClass"))
         {
             eprintln!(
@@ -3070,7 +3061,7 @@ impl ClassManager {
                 bytes.len()
             );
         }
-        if std::env::var_os("CRATONVM_DBG_FBCGLIB").is_some()
+        if loader_flags().dbg_fbcglib
             && (name.contains("RepositoryConfiguration") || name.contains("RawFactoryMethod"))
         {
             let haystack = String::from_utf8_lossy(&bytes);
@@ -3082,7 +3073,7 @@ impl ClassManager {
                 bytes.len(),
             );
         }
-        if std::env::var_os("CRATONVM_DBG_OBSREG").is_some()
+        if loader_flags().dbg_obsreg
             && (name.contains("ObservationRegistry")
                 || name.contains("RestClientObservationAutoConfigurationWithoutMetricsTests")
                 || name.contains("TestObservationRegistry"))
@@ -3261,7 +3252,7 @@ impl ClassManager {
             // confirms whether a same-name collision was actually detected
             // and rejected here (as opposed to real cglib silently
             // succeeding under a different name).
-            if std::env::var_os("CRATONVM_DBG_FBCGLIB").is_some() && dup.is_some() {
+            if loader_flags().dbg_fbcglib && dup.is_some() {
                 eprintln!(
                     "[FBCGLIB-DBG] duplicate-define rejected: name={stored_name_preview} loader_id={loader_id:?} existing={:?}",
                     dup
@@ -4333,8 +4324,7 @@ impl ClassManager {
                     self.class_bytes_cache_size.saturating_sub(bytes.len());
             }
         }
-        self.class_bytes_cache_fifo
-            .retain(|id| !ids.contains(id));
+        self.class_bytes_cache_fifo.retain(|id| !ids.contains(id));
 
         let mut unloaded = Vec::with_capacity(ids.len());
         for id in ids {
@@ -5396,11 +5386,7 @@ impl ClassManager {
     /// size accounting and move the entry to the tail of the FIFO so
     /// it is the *last* candidate for eviction — agents that redefine
     /// hot classes keep them in cache.
-    pub fn insert_class_bytes(
-        &mut self,
-        class_id: ClassId,
-        bytes: impl Into<SharedBytes>,
-    ) {
+    pub fn insert_class_bytes(&mut self, class_id: ClassId, bytes: impl Into<SharedBytes>) {
         let bytes = bytes.into();
         let new_size = bytes.len();
         // If we already had an entry for this class, subtract its size

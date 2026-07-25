@@ -37,6 +37,7 @@
 //!
 //! All public surface is registered via `register_socket_channel_real`.
 
+use crate::io_flags;
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ClassId, ObjectRef, Value};
@@ -49,12 +50,7 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 fn ipc_dbg_enabled() -> bool {
-    std::env::var("CRATONVM_SUREFIRE_IPC_DBG")
-        .map(|v| {
-            let t = v.trim();
-            !t.is_empty() && t != "0" && !t.eq_ignore_ascii_case("false")
-        })
-        .unwrap_or(false)
+    crate::io_flags().surefire_ipc_dbg
 }
 
 fn ipc_dbg(msg: impl AsRef<str>) {
@@ -1010,7 +1006,7 @@ fn sc_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
             // permanent opt-in hook (zero cost when unset) for whoever
             // continues that investigation, matching CRATONVM_DBG_NET /
             // CRATONVM_DBG_STALE_RECV etc.
-            if std::env::var_os("CRATONVM_DBG_SC_CLOSE").is_some() {
+            if io_flags().dbg_sc_close {
                 let (local, peer) = match tcp_registry().read().get(&id) {
                     Some(TcpHandle::Stream(s)) => (
                         s.local_addr().map(|a| a.to_string()).unwrap_or_default(),
@@ -1295,12 +1291,12 @@ fn sc_connect_bound(
             verdict.map_err(|e| map_err(&target, e))?;
             (stream, true)
         } // NOTE: a second `DeferredFailure` arm here would be unreachable —
-        // the unconditional `DeferredFailure(_stream, error) => return
-        // Err(...)` arm above already matches every case this one used to
-        // guard on (`allow_block == true`, since the `if !allow_block` arm
-        // earlier in this match consumes the `false` case). The compiler
-        // flagged the old duplicate arm as a hard unreachable-pattern
-        // warning; removed rather than left as dead code.
+          // the unconditional `DeferredFailure(_stream, error) => return
+          // Err(...)` arm above already matches every case this one used to
+          // guard on (`allow_block == true`, since the `if !allow_block` arm
+          // earlier in this match consumes the `false` case). The compiler
+          // flagged the old duplicate arm as a hard unreachable-pattern
+          // warning; removed rather than left as dead code.
     };
     if connected && blocking {
         stream
@@ -1868,7 +1864,7 @@ fn sc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         // investigation at Jetty's/Tomcat's own frame-parser instead). Kept
         // as a permanent opt-in hook, zero cost when unset, matching
         // CRATONVM_DBG_SC_CLOSE's precedent in this same file.
-        if std::env::var_os("CRATONVM_DBG_SC_READ").is_some() {
+        if io_flags().dbg_sc_read {
             let pos_before = match ctx.get_field_by_name(bb, "position") {
                 Value::Int(v) => v,
                 _ => -1,
@@ -1948,7 +1944,7 @@ fn sc_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     };
     let id = read_reg_id(ctx, this).ok_or_else(|| ioex("write: channel not connected"))?;
     let data = buffer_read_bytes(ctx, bb).unwrap_or_default();
-    if std::env::var_os("CRATONVM_DBG_SC_WRITE").is_some() {
+    if io_flags().dbg_sc_write {
         let position = ctx.get_field_by_name(bb, "position");
         let limit = ctx.get_field_by_name(bb, "limit");
         let address = ctx.get_field_by_name(bb, "address");
@@ -2014,7 +2010,7 @@ fn sc_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     };
     if n > 0 {
         crate::net::socket_capture('w', id, &data[..n as usize]);
-        if std::env::var_os("CRATONVM_DBG_SC_WRITE").is_some() {
+        if io_flags().dbg_sc_write {
             eprintln!("[SC_WRITE] id={id:#x} wrote={n}");
         }
         let bb = ctx.read_native_pin(bb_pin, bb);
@@ -2627,7 +2623,7 @@ fn ssc_accept(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // double-accept bug upstream of `sc_read` entirely; if it shows only
     // ONE id (as expected), the duplicate-CONNECT-dispatch investigation
     // stays focused on `sc_read` / the buffer fill-and-parse path.
-    if std::env::var_os("CRATONVM_DBG_SC_READ").is_some() {
+    if io_flags().dbg_sc_read {
         let ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis())
@@ -3173,7 +3169,7 @@ fn ssc_socket(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // java.net.ServerSocket subclass whose bind/accept/setSoTimeout delegate to
     // the channel and whose construction runs the ServerSocket instance
     // initializers (socketLock = new Object()), so getImpl() is never reached.
-    if std::env::var_os("CRATONVM_REAL_NET_SOCKETS").is_some() {
+    if io_flags().real_net_sockets {
         if let Ok(Some(v @ Value::Object(Some(adaptor)))) = ctx.invoke(
             "sun/nio/ch/ServerSocketAdaptor",
             "create",

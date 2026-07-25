@@ -13,6 +13,7 @@ pub mod compact_value;
 pub mod error;
 pub mod field_layout;
 pub mod field_watch;
+pub mod flags;
 pub mod float_format;
 pub mod handle;
 mod heap_types;
@@ -37,6 +38,10 @@ pub use field_layout::{
     read_compact_field, register_class_layout, set_compact_ref_fields_enabled,
     unregister_class_layout, with_class_layout, write_compact_field, CompactLayout,
     FieldStorageKind,
+};
+pub use flags::{
+    flags, install as install_flags, BlockedAccessMode, EnvSource, FlagSource, GcFlags, IoFlags,
+    JitFlags, LoaderFlags, MapSource, OverlaySource, VmFlags,
 };
 pub use float_format::{java_double_to_string, java_float_to_string};
 pub use handle::{HandleScope, HandleStorage, RootedHandle};

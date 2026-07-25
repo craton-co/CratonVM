@@ -93,6 +93,7 @@ use super::class::{find_method_recursive, Class, ClassStore};
 use super::verify_frame::VerificationFrame;
 use super::verify_insn::verify_instruction;
 use super::vtype::{param_types_from_descriptor, ClassHierarchy, VType};
+use crate::loader_flags;
 use cratonvm_types::error::LinkageError;
 
 /// Verify a class: structural (Pass 2) + bytecode (Pass 3).
@@ -165,11 +166,7 @@ static ALLOW_JSR_RET: OnceLock<bool> = OnceLock::new();
 /// value. Computed once and cached for the process lifetime. See
 /// [`ALLOW_JSR_RET`].
 fn allow_jsr_ret() -> bool {
-    *ALLOW_JSR_RET.get_or_init(|| {
-        std::env::var("CRATONVM_ALLOW_JSR_RET")
-            .map(|v| v != "0" && !v.is_empty())
-            .unwrap_or(false)
-    })
+    loader_flags().allow_jsr_ret
 }
 
 pub fn verify_class_bytecode(
@@ -988,8 +985,7 @@ fn verify_method_structural_only(
             insn: decoded.instruction.clone(),
         })
         .collect();
-    let instruction_starts: HashSet<_> =
-        decoded.iter().map(|instruction| instruction.pc).collect();
+    let instruction_starts: HashSet<_> = decoded.iter().map(|instruction| instruction.pc).collect();
     let instruction_by_pc: HashMap<_, _> = decoded
         .iter()
         .enumerate()
