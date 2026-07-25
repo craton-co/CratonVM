@@ -266,6 +266,57 @@ numbers up to N = 2²⁸, kernel sources, and eligibility rules — are in
 > `taskset -cp <pid>` on any competing `CratonBench` and use `--cpu N` on a
 > verified-idle core, or wait for `pgrep -f CratonBench` to come back empty.
 
+> **⚠ The gate CANNOT see the parallel young GC — it measures it at its worst
+> configuration.** `regression-suite/perf/run-cratonbench-gate.sh` (line 89) pins with `taskset -c $CPU`, and
+> the Rust `available_parallelism()` call honours the affinity mask, so
+> `young_gc_threads` resolves to **1** on every gated run. Both the parallel
+> mark drain and the parallel sweep are therefore disabled for the numbers the
+> gate reports. A change that only helps multi-core GC will read as flat, or
+> slightly negative from its added bookkeeping, on the gate — and a GC
+> regression that only bites multi-core will not be caught at all.
+>
+> Before concluding a GC change did nothing, re-measure unpinned (or pinned to
+> a CPU *set*, e.g. `taskset -c 8-15`) with `CRATONVM_DBG_GCPHASE=1` for the
+> phase table. Worked example: the allocator-anchor change below measures
+> −13.8% wall on `taskset -c 8-15`, and its headline 241 → 0 ms phase win is
+> invisible to a single-CPU gate run.
+
+> **✅ FIXED 2026-07-25: the young-GC mark-oracle walk (241 ms/collection) is
+> gone**, replaced by allocator-recorded object-grid anchors (`gc/src/arena.rs`,
+> `gc/src/gen_heap.rs`; merged `26e866b82`).
+>
+> The sweep parallel split points used to be a by-product of a full-arena
+> exact-base walk. That walk chased 2 147 483 592 bytes of headers per
+> collection. Anchors are now recorded by the allocator as objects are handed
+> out — one verified start per 4 KiB bucket — so the grid is known without
+> rediscovering it, and the remaining conservative-candidate oracle visits only
+> intervals that contain a candidate: **4 718 536 bytes walked, a 455× drop**.
+>
+> Interleaved A/B, 12 pairs, `taskset -c 8-15`, quiet host: bintrees-18 median
+> **1777 → 1531 ms (−13.8%)**, non-overlapping ranges, B won 12/12. Phase table
+> (`CRATONVM_DBG_GCPHASE=1`): `mark-oracle-walk` **241 → 0 ms**, young GC total
+> **419 → 170 ms**. Single-CPU (parallel sweep disabled): 2033 → 1800 ms wall,
+> GC 916 → 393 ms.
+>
+> **The obvious alternative was measured, not assumed.** Dropping the
+> `cand_idx` early-exit so the walk covers the whole arena and the sweep
+> parallelises unconditionally is a **no-op on this workload**: the bintrees-18
+> 126 candidates already spanned the full 2 GiB, the walk already reached
+> `used`, and the sequential sweep tail was already 0 ms. It would have bought
+> nothing while leaving the 241 ms in place. Allocator-sourced anchors make the
+> grid independent of the candidate set entirely, which subsumes it.
+>
+> Correctness: 336 checksum-verified runs, 0 mismatches (7 multi-collection
+> configs × 4 `CRATONVM_GC_SWEEP_ANCHOR_STRIDE` values × 4 worker counts × 3
+> reps, each compared against the baseline binary own answer), plus a new
+> 8-thread mixed-size-class stress matching HotSpot 12/12, and all 7 CratonBench
+> phase checksums exact.
+>
+> Known residual: with full-arena anchors, a single mid-arena grid anomaly now
+> aborts the *whole* parallel sweep rather than truncating the prefix. Still
+> correct (it falls back to the sequential walk) and never observed across 336+
+> runs, but it is a sharper failure edge than before.
+
 > **✅ FIXED 2026-07-25: 130 million `getenv` calls per hashmap run.**
 > −13.1% on hashmap, −15.4% on stringregex, neutral elsewhere.
 >

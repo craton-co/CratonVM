@@ -169,9 +169,26 @@ by several workers over a lock-free mark bitmap (one bit per 8 bytes of
 from-space) — sound because the phase is pure and read-only on a frozen
 heap and the only write is an atomic bit claim. The sweep walk, a linear
 header chase that is inherently sequential, is split at anchors the
-mark phase's exact-base oracle walk records for free: every offset that
-walk parsed an object at is a verified grid position, and nothing
-allocates, frees or resizes an object between the two walks. Each chunk
+ALLOCATOR supplies rather than ones a walk rediscovers. `arena.rs` keeps
+one verified object start per 4 KiB bucket, armed on `new`/`grow`,
+cleared on `reset`, and recorded by the TLAB-refill, young slow-path and
+Cheney-copy paths for a shift, a bounds-checked load, a compare and a
+per-bucket-once store under a lock the caller already holds. The grid is
+completed by the END of every pre-existing free/TLAB-skip block -- a
+sweep coalesces dead spans up to a survivor and never past one, so a
+region that survived an earlier collection is never re-handed-out and
+would otherwise contribute no anchor -- plus offset 0 and `used` as
+terminals. Anchors landing inside a free block are filtered out, because
+one minted by adjacent uncoalesced blocks would abort the whole parallel
+attempt. This replaced a full-arena exact-base oracle walk costing ~240
+ms and 2 GiB walked per collection; the same grid, subsampled at
+`CRATONVM_GC_SWEEP_ANCHOR_STRIDE`, now costs ~0 ms and 4.7 MB walked,
+and the conservative-candidate oracle traverses only those anchor
+intervals that actually contain a candidate. The 2026-07-18
+truncated-oracle fail-safe survives as `verified_spans`: an interval
+counts as proved only if its chain lands EXACTLY on the next anchor, an
+unproved interval has its ranges discarded rather than trusted, and a
+candidate outside every proved span falls back to direct validation. Each chunk
 re-proves its own anchor by requiring its chain to land exactly on the
 next one, and the parallel walker writes nothing — on any grid anomaly
 it is abandoned wholesale and the untouched sequential walk (which owns
