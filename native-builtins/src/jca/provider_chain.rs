@@ -1910,7 +1910,7 @@ fn resolve_service(
     algo: &str,
 ) -> Option<ObjectRef> {
     let entry = get_service_entry(provider, type_str, algo);
-    if std::env::var_os("CRATONVM_DIAG_JCA").is_some() {
+    if crate::nbflags().diag_jca {
         match &entry {
             Some(e) => eprintln!(
                 "[JCA-DIAG] getService({provider},{type_str},{algo}) -> entry algo={:?} class={:?}",

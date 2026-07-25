@@ -620,7 +620,7 @@ fn native_url_to_uri(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     } else {
         String::new()
     };
-    if std::env::var_os("CRATONVM_DBG_SBLOAD").is_some() {
+    if crate::nbflags().dbg_sbload {
         eprintln!(
             "[DBG_SBLOAD] URL.toURI() nfields={} full={:?}",
             nfields, full
@@ -1000,9 +1000,7 @@ pub(crate) fn native_uri_init(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     // rejected unconditionally even with the opt-out gate (preserves the
     // keycloak fix); the broader ASCII check is gated default-ON so it can be
     // disabled (CRATONVM_URI_STRICT_CHARS=0) if a regression surfaces.
-    let strict_uri_chars = std::env::var("CRATONVM_URI_STRICT_CHARS")
-        .map(|v| v != "0")
-        .unwrap_or(true);
+    let strict_uri_chars = crate::nbflags().uri_strict_chars;
     let illegal = if strict_uri_chars {
         uri_first_illegal_index(&url_str)
     } else {

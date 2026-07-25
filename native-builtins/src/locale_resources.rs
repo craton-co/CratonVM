@@ -959,7 +959,7 @@ fn rb_get_bundle(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
         _ => String::new(),
     };
-    if std::env::var("CRATONVM_DBG_CATALINA").is_ok() {
+    if crate::nbflags().dbg_catalina {
         eprintln!("CATALINA-DBG: ResourceBundle.getBundle native — name={bundle_name:?}");
     }
 

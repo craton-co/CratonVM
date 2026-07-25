@@ -6182,7 +6182,7 @@ fn register_s2_selector(r: &mut NativeMethodRegistry) {
     let sel = "java/nio/channels/Selector";
 
     r.register(sel, "open", "()Ljava/nio/channels/Selector;", |ctx, _| {
-        if std::env::var_os("CRATONVM_DBG_SEL").is_some() {
+        if crate::nbflags().dbg_sel {
             eprintln!("[SEL] Selector.open()");
         }
         let s = alloc_concurrent_synthetic(ctx, "java/nio/channels/Selector", 3);
@@ -6197,7 +6197,7 @@ fn register_s2_selector(r: &mut NativeMethodRegistry) {
     // "wait forever" sentinel.)
     r.register(sel, "select", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        if std::env::var_os("CRATONVM_DBG_SEL").is_some() {
+        if crate::nbflags().dbg_sel {
             let open = ctx.get_field(this, S2SEL_OPEN).as_int().unwrap_or(-1);
             let nkeys = ctx.get_field(this, S2SEL_NKEYS).as_int().unwrap_or(-1);
             eprintln!("[SEL] select() open={open} nkeys={nkeys}");
@@ -6266,7 +6266,7 @@ fn register_s2_selector(r: &mut NativeMethodRegistry) {
     r.register(sel, "isOpen", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let v = ctx.get_field(this, S2SEL_OPEN);
-        if std::env::var_os("CRATONVM_DBG_SEL").is_some() {
+        if crate::nbflags().dbg_sel {
             eprintln!("[SEL] isOpen() = {:?}", v);
         }
         Ok(Some(v))

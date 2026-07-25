@@ -71,10 +71,7 @@ const MALFORMED_UNICODE_MESSAGE: &str = "Malformed \\uxxxx encoding.";
 
 #[inline]
 fn props_stderr_diag() -> bool {
-    matches!(
-        std::env::var("CRATONVM_DIAG_PROPERTIES").as_deref(),
-        Ok("1") | Ok("true") | Ok("yes")
-    )
+    crate::nbflags().diag_properties
 }
 
 fn throw_malformed_unicode_escape(ctx: &mut dyn NativeContext) -> MethodCallFailed {

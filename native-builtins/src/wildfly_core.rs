@@ -1510,7 +1510,7 @@ fn drain_all_pending_runnables(ctx: &mut dyn NativeContext) {
             None => break,
         }
     }
-    if std::env::var_os("CRATONVM_DBG_EQE").is_some() {
+    if crate::nbflags().dbg_eqe {
         eprintln!("[eqe] drained {} runnables", iterations);
     }
     let _ = iterations;
@@ -1608,7 +1608,7 @@ fn native_exec_execute(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     // Submit a bookkeeping marker so pool stats reflect activity.
     let _ = pool.submit(|| {});
 
-    if std::env::var_os("CRATONVM_EQE_SYNC_EXECUTE").is_some() {
+    if crate::nbflags().eqe_sync_execute {
         // Round-69 behaviour (sync on caller). Escape hatch.
         let _ = ctx.invoke_virtual(runnable_ref, "run", "()V", &[]);
         return Ok(None);
@@ -1631,7 +1631,7 @@ fn native_exec_execute(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         map.entry(this)
             .or_insert_with(VecDeque::new)
             .push_back((identity_key, runnable_ref));
-        if std::env::var_os("CRATONVM_DBG_EQE").is_some() {
+        if crate::nbflags().dbg_eqe {
             eprintln!("[eqe] enqueue pool={} pending_keys={}", name, map.len());
         }
     }
@@ -1741,7 +1741,7 @@ fn native_async_future_task_await(ctx: &mut dyn NativeContext, args: &[Value]) -
             // the future result, so the COMPLETE flip lets its boot proceed.
             // `CRATONVM_AWAIT_NO_SHORTCIRCUIT=1` opts out even under app-stubs
             // to surface the real WildFly hang (Object.wait) for diagnosis.
-            if std::env::var_os("CRATONVM_AWAIT_NO_SHORTCIRCUIT").is_some() {
+            if crate::nbflags().await_no_shortcircuit {
                 std::thread::yield_now();
                 return Ok(Some(status));
             }
@@ -1808,7 +1808,7 @@ pub fn register_wildfly_core_natives(r: &mut NativeMethodRegistry) {
     // under CratonVM tolerant evaluates false and boot fails. Both
     // methods are trivial field getters — the overrides read the same
     // field by name and log, so behavior is preserved.
-    if std::env::var_os("CRATONVM_DBG_CAPVAL").is_some() {
+    if crate::nbflags().dbg_capval {
         let aoc = "org/jboss/as/controller/AbstractOperationContext";
         r.register(aoc, "isBooting", "()Z", |ctx, args| {
             let this = match args.first() {
@@ -2058,7 +2058,7 @@ pub fn register_wildfly_core_natives(r: &mut NativeMethodRegistry) {
     // `CRATONVM_SYNTHETIC_EQE=1`. Same partial-shadow fix pattern as Phaser /
     // BlockingQueue. See gap-phaser-real-bytecode-state.md + the WildFly
     // testSubsystem write-up.
-    if std::env::var("CRATONVM_SYNTHETIC_EQE").is_ok() {
+    if crate::nbflags().synthetic_eqe {
         r.register(
             "org/jboss/threads/EnhancedQueueExecutor$Builder",
             "build",

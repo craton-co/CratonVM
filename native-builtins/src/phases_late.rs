@@ -1348,7 +1348,7 @@ pub(crate) fn register_phase57_process(r: &mut NativeMethodRegistry) {
         // FIX (finding 5): this was an UNCONDITIONAL stderr print on every
         // ProcessBuilder.start() — noisy in production. Gate it behind the
         // standard CRATONVM_DBG_PB debug flag.
-        if std::env::var_os("CRATONVM_DBG_PB").is_some() {
+        if crate::vmflags().io.dbg_pb {
             eprintln!("[PB-START-ENTRY] this={:?}", this);
         }
 
@@ -1429,7 +1429,7 @@ pub(crate) fn register_phase57_process(r: &mut NativeMethodRegistry) {
                         let cmd_cname = ctx.class_name_of_id(cmd_cid).unwrap_or_else(|| "<?>".into());
                         // Gated behind the same debug flag (finding 5): keep the
                         // diagnostic available but off by default in production.
-                        if std::env::var_os("CRATONVM_DBG_PB").is_some() {
+                        if crate::vmflags().io.dbg_pb {
                             eprintln!("[PB-DIAG] data field is not an array: data_class={} cmd_class={} cmd_obj={:?} data={:?} size_by_name={:?}", cname, cmd_cname, cmd_obj, data, size_by_name);
                         }
                         // Skip the array_length call to avoid noisy guard print.
@@ -4821,7 +4821,7 @@ pub fn register_classvalue_natives(r: &mut NativeMethodRegistry) {
                 // malformed-argument silent-null path below.
                 let cv_trace = {
                     static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-                    *G.get_or_init(|| std::env::var_os("CRATONVM_TRACE_CLASSVALUE").is_some())
+                    *G.get_or_init(|| crate::nbflags().trace_classvalue)
                 };
                 let this = obj_arg(args, 0)?;
                 let cls = match args.get(1) {
@@ -5136,7 +5136,7 @@ pub(crate) fn register_pbe_diagnostic(r: &mut NativeMethodRegistry) {
             // Diagnostic block — gated on env var so production runs stay
             // silent. Best-effort: any failure in the diagnostic itself is
             // swallowed so we never break the failing-bean path further.
-            if std::env::var_os("CRATONVM_DBG_PBE").is_some() {
+            if crate::nbflags().dbg_pbe {
                 if let Value::Object(Some(arr)) = arr_val {
                     let n = ctx.array_length(arr);
                     eprintln!("[PBE] PropertyBatchUpdateException constructed with {} inner PropertyAccessException(s)", n);

@@ -2048,7 +2048,7 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
                 }
             }
 
-            if std::env::var_os("CRATONVM_DBG_LINKER").is_some() {
+            if crate::nbflags().dbg_linker {
                 eprintln!(
                     "[LATE_LINKER] option downcall addr=0x{fn_addr:x} options={}",
                     args.get(3).is_some()
