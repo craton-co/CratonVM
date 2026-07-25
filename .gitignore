@@ -68,3 +68,13 @@ build-*.log
 
 # stray repro probe output under docs/internal
 docs/internal/**/cld*.out
+
+# Merge-conflict side-copies of crate sources. Resolving a conflict in a file
+# the size of native-builtins/src/lib.rs (~86k lines) tends to leave 3 MB
+# `*.dev.rs` / `*.merge.rs` scratch copies at the repo root; two of them were
+# committed and carried ~6.7 MB of dead duplicate source before being removed.
+# They are never build inputs (no Cargo.toml or build.rs references them).
+/*-lib.dev.rs
+/*-lib.merge.rs
+/*.dev.rs
+/*.merge.rs

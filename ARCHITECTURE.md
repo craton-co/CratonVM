@@ -74,16 +74,62 @@ independently to inspect `.class` files.
 
 ## vm — Virtual Machine
 
-The VM is the core of the project (~323,000+ LoC across 20 workspace member crates, plus the separate `fuzz` harness workspace). It contains six
-major subsystems (several now extracted into their own crates):
+The VM is the core of the project (~1,290,000 LoC across the 20 workspace
+member crates as of 2026-07-25, plus the separate `fuzz` harness workspace).
+It contains six major subsystems (several now extracted into their own
+crates).
+
+Rough size distribution, largest first, so newcomers know where the mass
+actually is:
+
+| Crate | LoC | Crate | LoC |
+|-------|----:|-------|----:|
+| `native-builtins` | 565,000 | `native-awt` | 17,000 |
+| `vm` | 319,000 | `native-api` | 15,000 |
+| `jit` | 97,000 | `jfr` | 14,000 |
+| `gc` | 58,000 | `reader` | 13,000 |
+| `native-collections` | 53,000 | `jit-cuda` | 10,000 |
+| `native-io` | 50,000 | `types` | 9,500 |
+| `classloading` | 50,000 | remaining 6 | < 6,000 each |
+
+Several individual files are far larger than is comfortable —
+`native-builtins/src/lib.rs` (~86,000 lines), `native-builtins/src/phases_late.rs`
+(~73,000), `vm/src/vm.rs` (~68,000), `vm/src/runtime/interpreter.rs` (~45,000),
+and `jit/src/x64.rs` (~39,000). Splitting these is tracked work, not a design
+intent; expect slow incremental builds and merge friction when touching them.
 
 ### Runtime (`vm/src/runtime/`)
 
 The bytecode execution engine.
 
-- **`interpreter.rs`** — Main dispatch loop. 140+ fast-path opcodes via
-  a match on the bytecode. Each opcode reads operands, manipulates the
-  operand stack and local variables, and advances the program counter.
+- **`interpreter.rs`** — Main dispatch loop (~45,000 lines). Each opcode reads
+  operands, manipulates the operand stack and local variables, and advances the
+  program counter.
+
+  There are **two dispatch paths**, and which one a frame gets is decided by its
+  class name:
+
+  * a *fast path* that reads opcodes straight from the raw bytecode and fuses
+    common sequences (e.g. `iload_X; iload_Y; iadd`) as superinstructions; and
+  * a *slow path* that calls `Instruction::decode` and matches on the decoded
+    `Instruction` enum.
+
+  The fast path uses `pop_unchecked` / `set_local_unchecked` at sites that
+  assume verifier-narrow stack shapes, so it is **not** spec-correct for
+  arbitrary bytecode. `class_disables_interp_fast_path`
+  (`vm/src/runtime/frame.rs`) therefore excludes whole package prefixes —
+  `java/`, `jdk/`, `sun/`, `com/sun/`, `org/springframework/` — with
+  `java/util/*` and `Math`/`StrictMath` whitelisted back in. Two consequences
+  worth knowing before you touch this file:
+
+  1. Correctness of the fast path rests on a class-name deny-list, not on a
+     property of the bytecode. The intended fix (recorded in that function's
+     own TODO) is a per-method `unsafe_for_fast_path` flag computed at
+     verification time.
+  2. JDK and Spring bytecode runs on the slow path, which re-decodes every
+     instruction on **every execution** — and `Instruction`'s `Tableswitch` /
+     `Lookupswitch` variants own `Vec`s, so each execution of a switch
+     allocates. A one-time link-time quickening pass is the tracked fix.
 - **`frame.rs`** — Stack frame: local variables + operand stack, stored
   in SoA (Structure-of-Arrays) layout for cache efficiency.
 - **`call_stack.rs`** — Per-thread call stack of frames.
@@ -121,15 +167,42 @@ Garbage collectors, extracted into the `cratonvm-gc` crate. The default is the g
 
 **Object layout:**
 ```
-[ObjectHeader (32 bytes)] [field0 (16 bytes)] [field1 (16 bytes)] ...
+[ObjectHeader (32 bytes)] [field0] [field1] ...
 ```
 
-Arrays use compact element sizes (1/2/4/8 bytes per element depending on type).
+Field cell width depends on the field's type and on the layout in force
+(`types/src/heap_types.rs`, `types/src/field_layout.rs`):
+
+| Field kind | Width | Notes |
+|------------|------:|-------|
+| Reference | 8 B | `REF_FIELD_SIZE` — bare pointer, `0` = null. Default (compact reference-field layout; `CRATONVM_COMPACT_REF_FIELDS=0` opts back out to a 16 B tagged cell). |
+| Primitive | 16 B | `SLOT_SIZE` — the full tagged `Value` enum: 4 B discriminant, then the payload. |
+
+So an `int` field currently costs 16 bytes for 4 bytes of data. `CompactLayout`
+already computes natural 1/2/4/8-byte offsets and a precise GC oop-map
+(`ref_offsets`) for *all* field kinds, so extending the tagless representation
+from references to primitives is a completion of existing work rather than a
+new subsystem — see the tracked layout work.
+
+The 32-byte header (`ObjectHeader`, `types/src/heap_types.rs`) spends 8 bytes on
+an always-resident `forwarding_ptr` and 4 on an always-resident
+`identity_hash_code`. HotSpot keeps both in the mark word transiently; folding
+them in the same way would take the header to 16 bytes.
+
+Arrays use compact element sizes (1/2/4/8 bytes per element depending on type;
+`element_byte_size`), with reference elements at `REF_ELEMENT_SIZE` = 8 B.
+
+**Compressed oops** (`gc/src/compressed_oops.rs`) are implemented and tested but
+**not wired into the live heap** — `use_compressed_oops` defaults to `false`
+(`vm/src/config.rs`). The encode/decode surface is ready; narrow-oop field
+layout, JIT load/store barriers, GC root re-encoding, and klass-pointer
+compression are the remaining work.
 
 ### JIT Compiler (`jit/` crate)
 
-Custom x86-64 / AArch64 JIT compiler (~7,200 LoC). Extracted into the `cratonvm-jit`
-crate, with shared API types in `cratonvm-jit-api`.
+Custom x86-64 / AArch64 JIT compiler (~97,000 LoC; `x64.rs` alone is ~39,000).
+Extracted into the `cratonvm-jit` crate, with shared API types in
+`cratonvm-jit-api`.
 
 - **`lib.rs`** — JIT infrastructure: compiled code cache, OSR entry points.
 - **`x64.rs`** — x86-64 machine code emitter with 26 optimization rounds.
@@ -146,12 +219,39 @@ in `ir.rs`, `ir_optimize.rs`, `ir_schedule.rs`, `ir_lower.rs`), which
 decouples optimization from instruction selection; others fall back to the
 direct single-pass path.
 
+**The IR path's reach is currently narrow, and the split is not on the axis
+you might expect.** `ir_compatible()` (`jit/src/ir.rs`) declines a method that
+contains any `athrow`, any `invokedynamic`, more than 5 invokes, more than 5
+instance-field accesses, more than 5 static-field accesses, or more than 3
+allocations; `ir_compatible_sized` adds a 200-byte bytecode cap. The reason is
+structural: the IR lowers every invoke through the generic `invoke_dispatch`
+helper — no inline caches, no direct calls, no direct self-recursive call — so
+for anything call-heavy an "optimizing" recompile can be a net *regression*
+against the single-pass body, which does have direct calls, constructor
+inlining, and the inline TLAB bump.
+
+The practical consequence: the single-pass backend has the good call support and
+the IR has the good optimization, and **neither has both**. Small arithmetic
+kernels (sieve/matrix/reduction shapes) get the optimizing pipeline; ordinary
+application methods do not. Teaching the IR to lower calls with inline caches,
+then lifting the caps, is the tracked path out.
+
 Key optimizations: register allocation for locals, magic division,
 LICM, bounds check elimination, AVX2 SIMD, on-stack replacement (OSR).
+Method inlining exists but is budgeted conservatively —
+`MAX_INLINE_BYTECODE_SIZE` = 35 bytes per callee and `MAX_INLINE_BUDGET` = 250
+bytes total per compiled method (`jit/src/lib.rs`), against HotSpot's
+`FreqInlineSize` = 325 for a single hot callee. There is no cross-call register
+allocation and no recursion inlining; see [BENCHMARK.md](BENCHMARK.md) for what
+that costs on the recursion-bound rows.
 
-Methods are compiled after 100 invocations (configurable). Two calling
-conventions: **pure** methods (direct call) and **context** methods
-(receive `SharedVm` pointer as hidden first argument).
+Methods are compiled after `CRATONVM_JIT_THRESHOLD` invocations (default 500;
+see `vm/src/runtime/env_cache.rs`). Codegen runs **off-thread by default** — the
+tiered manager enqueues a `CompilationTask` and a background worker publishes
+into `shared.jit_cache`, while the mutator keeps interpreting until the entry
+appears (`CRATONVM_BG_COMPILE=0` restores inline compilation). Two calling
+conventions: **pure** methods (direct call) and **context** methods (receive
+`SharedVm` pointer as hidden first argument).
 
 ### Native Methods (`native-builtins/`, `native-collections/`, `native-io/` crates)
 
@@ -223,8 +323,8 @@ pointer.
 
 ## vm-cli — Command-Line Interface
 
-Thin wrapper (~200 LoC) using `clap` for argument parsing. Constructs a
-`Vm`, calls `main(String[])`, and handles exit codes.
+`clap`-based entry point (~6,000 LoC; `main.rs` is ~4,900). Parses arguments and
+`-XX:` flags, constructs a `Vm`, calls `main(String[])`, and handles exit codes.
 
 ## Key Design Decisions
 
@@ -248,7 +348,29 @@ Thin wrapper (~200 LoC) using `clap` for argument parsing. Constructs a
 
 5. **FNV-1a native dispatch.** Native methods are looked up by hashing
    `"class_name.method_name:descriptor"`. O(1) dispatch with collision
-   detection at registration time.
+   detection at registration time. Note that `NativeMethodRegistry::find`
+   re-hashes all three strings on **every** call; the JIT path memoizes the
+   resolved callback per call site (`CachedBytecodeMethod::native_callback_cache`),
+   but several interpreter sites still re-resolve per invocation.
+
+6. **Threading: one OS thread per Java thread.** `thread_start`
+   (`vm/src/vm/vm_exec.rs`) spawns a real `std::thread::Builder` per
+   `Thread.start()`; virtual threads are multiplexed over carriers by
+   `virtual_scheduler.rs`. Beware stale comments elsewhere in the tree that
+   describe Java execution as single-OS-threaded under cooperative scheduling —
+   that has not been true since real thread spawning landed, and anything
+   resting on it (notably the `unsafe impl Send/Sync for ObjectRef` argument in
+   `types/src/value.rs`) should be read with that in mind.
+
+7. **Configuration is env-var-driven, and the surface is large.** There are
+   ~560 distinct `CRATONVM_*` identifiers across the workspace. Most are debug
+   or diagnostic gates, but a meaningful subset changes semantics
+   (`CRATONVM_COMPACT_REF_FIELDS`, `CRATONVM_REAL_NET_SOCKETS`,
+   `CRATONVM_REAL_FORKJOINPOOL`, `CRATONVM_JIT_GETFIELD_HELPER`,
+   `CRATONVM_BG_COMPILE`, …). Most are cached in a `OnceLock` on first read, but
+   not all — check before adding one to a hot path, and prefer extending
+   `VmConfig` / `runtime::env_cache` over introducing a new bare
+   `std::env::var` call.
 
 ## Data Flow
 

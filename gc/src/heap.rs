@@ -5,12 +5,27 @@
 //!
 //! Objects are laid out as contiguous blocks:
 //! ```text
-//! [ObjectHeader (32 bytes)] [field0 (16 bytes)] [field1 (16 bytes)] ... [fieldN (16 bytes)]
+//! [ObjectHeader (HEADER_SIZE = 32 bytes)] [field0] [field1] ... [fieldN]
 //! ```
 //!
-//! Arrays use SLOT_SIZE (16 bytes) per element for all types:
+//! Field cell width depends on the field's type:
+//!
+//! * **primitive** fields occupy `SLOT_SIZE` (16 bytes) — the full tagged
+//!   [`cratonvm_types::Value`] enum (4-byte discriminant, then payload);
+//! * **reference** fields occupy `REF_FIELD_SIZE` (8 bytes) — a bare pointer,
+//!   `0` meaning null — under the compact reference-field layout, which is the
+//!   default (`CRATONVM_COMPACT_REF_FIELDS=0` opts back out to a 16-byte tagged
+//!   cell). Such objects are flagged [`GC_FLAG_COMPACT`] and the collector
+//!   scans them via the per-class oop-map ([`CompactLayout::ref_offsets`])
+//!   instead of tag-scanning uniform cells — see [`compact_oop_scan`].
+//!
+//! Arrays use **compact, natural element widths**, not `SLOT_SIZE` — 1 byte for
+//! `boolean`/`byte`, 2 for `char`/`short`, 4 for `int`/`float`, 8 for
+//! `long`/`double`, and `REF_ELEMENT_SIZE` (8) for reference elements. See
+//! [`element_byte_size`] and [`array_data_size`], which are the authority:
 //! ```text
-//! [ObjectHeader (32 bytes)] [elem0 (16 bytes)] [elem1 (16 bytes)] ... [elemN (16 bytes)]
+//! [ObjectHeader (32 bytes)] [elem0] [elem1] ... [elemN]   // element_byte_size(elem_type) each,
+//!                                                        // data area rounded up to 8 bytes
 //! ```
 //!
 //! The heap uses two arenas (from-space and to-space) for a semi-space
