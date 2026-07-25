@@ -4256,7 +4256,7 @@ pub(crate) fn register_p69_spliterator(r: &mut NativeMethodRegistry) {
                 }
             };
             let field0 = ctx.get_field(spliterator, 0);
-            if std::env::var("CRATONVM_DBG_STREAMSUPP").is_ok() {
+            if crate::nbflags().dbg_streamsupp {
                 let cid = ctx.class_id_of_object(spliterator);
                 let cn = ctx.class_name_of_id(cid).unwrap_or_default();
                 let f0_kind = match field0 {

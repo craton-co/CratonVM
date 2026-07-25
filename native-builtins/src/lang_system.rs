@@ -207,7 +207,7 @@ pub(crate) fn native_system_arraycopy(
             }
             return Ok(None);
         }
-        if std::env::var("CRATONVM_DBG_ARRAYCOPY").as_deref() == Ok("1") {
+        if crate::nbflags().dbg_arraycopy {
             let src_cls = ctx.class_id_of_object(src);
             let dest_cls = ctx.class_id_of_object(dest);
             let src_name = ctx.class_name_of_id(src_cls).unwrap_or_default();
@@ -568,7 +568,7 @@ pub(crate) fn native_thread_sleep(ctx: &mut dyn NativeContext, args: &[Value]) -
         // stuck in a Thread.sleep poll-loop; sample the Java caller chain so we
         // can identify which loop and what it polls. Sampled + capped to avoid
         // flooding; off by default (one env check per real sleep call).
-        if std::env::var_os("CRATONVM_DBG_SLEEP_TRACE").is_some() {
+        if crate::nbflags().dbg_sleep_trace {
             use std::sync::atomic::{AtomicUsize, Ordering};
             static N: AtomicUsize = AtomicUsize::new(0);
             static PRINTED: AtomicUsize = AtomicUsize::new(0);
@@ -749,10 +749,7 @@ pub(crate) fn native_thread_start0(
     // the child has no CCL of its own (preserve an explicit
     // `setContextClassLoader` issued before `start()`). Opt-out:
     // `CRATONVM_INHERIT_THREAD_CCL=0` restores the prior (no-inherit) behavior.
-    let inherit_ccl = match std::env::var("CRATONVM_INHERIT_THREAD_CCL") {
-        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
-        Err(_) => true,
-    };
+    let inherit_ccl = crate::nbflags().inherit_thread_ccl;
     if inherit_ccl
         && !matches!(
             ctx.get_field_by_name(this, "contextClassLoader"),
@@ -790,10 +787,7 @@ pub(crate) fn native_thread_start0(
     // regain inheritance. That combination is rare in practice (the 5-arg
     // opt-out constructor itself is rarely used); documented pending a real
     // interpreter-level fix. Opt-out: `CRATONVM_INHERIT_TL_WORKAROUND=0`.
-    let apply_itl_workaround = match std::env::var("CRATONVM_INHERIT_TL_WORKAROUND") {
-        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
-        Err(_) => true,
-    };
+    let apply_itl_workaround = crate::nbflags().inherit_tl_workaround;
     // The buggy path doesn't leave this field as `Object(None)` (the normal
     // "never written" value real bytecode `getfield` would observe) — a raw
     // native heap read here sees `Int(0)` instead, matching CratonVM's
@@ -858,7 +852,7 @@ pub(crate) fn native_thread_join_timed(
     // target thread is still alive. Poll isAlive at a small cadence so we
     // don't block beyond the deadline.
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(millis as u64);
-    if std::env::var_os("CRATONVM_DBG_SLEEP_TRACE").is_some() {
+    if crate::nbflags().dbg_sleep_trace {
         use std::sync::atomic::{AtomicUsize, Ordering};
         static N: AtomicUsize = AtomicUsize::new(0);
         if N.fetch_add(1, Ordering::Relaxed) % 64 == 0 {
@@ -1096,7 +1090,7 @@ pub(crate) fn native_system_exit(ctx: &mut dyn NativeContext, args: &[Value]) ->
     // either soft-return or terminate. Helps identify which class/method in
     // the upstream code invoked System.exit. Env-gated so default output is
     // unchanged.
-    if std::env::var("CRATONVM_DBG_EXIT").as_deref() == Ok("1") {
+    if crate::nbflags().dbg_exit {
         let mut rendered = String::new();
         for (i, entry) in trace.iter().take(20).enumerate() {
             use std::fmt::Write as _;
@@ -1137,7 +1131,7 @@ pub(crate) fn native_system_exit(ctx: &mut dyn NativeContext, args: &[Value]) ->
     // return so the calling Java frame keeps executing (and `main` can reach
     // further). Used to expose downstream failures hidden behind an explicit
     // upstream exit. Default behaviour (env unset) is unchanged: terminate.
-    if std::env::var("CRATONVM_SOFT_EXIT").as_deref() == Ok("1") {
+    if crate::nbflags().soft_exit {
         tracing::warn!(
             target: "cratonvm::system_exit",
             "[cratonvm] System.exit({code}) soft-returned (CRATONVM_SOFT_EXIT=1)"
@@ -1411,7 +1405,7 @@ pub(crate) fn native_runtime_exit(ctx: &mut dyn NativeContext, args: &[Value]) -
     };
 
     // Mirror native_system_exit: env-gated caller-chain dump and soft-return.
-    if std::env::var("CRATONVM_DBG_EXIT").as_deref() == Ok("1") {
+    if crate::nbflags().dbg_exit {
         let trace = ctx.capture_stack_trace(0);
         let mut rendered = String::new();
         for (i, entry) in trace.iter().take(20).enumerate() {
@@ -1430,7 +1424,7 @@ pub(crate) fn native_runtime_exit(ctx: &mut dyn NativeContext, args: &[Value]) -
         );
     }
 
-    if std::env::var("CRATONVM_SOFT_EXIT").as_deref() == Ok("1") {
+    if crate::nbflags().soft_exit {
         tracing::warn!(
             target: "cratonvm::system_exit",
             "[cratonvm] Runtime.exit({code}) soft-returned (CRATONVM_SOFT_EXIT=1)"
@@ -2251,7 +2245,7 @@ pub(crate) fn native_thread_sleep_nanos(
         // Keycloak Gap 9 localization (CRATONVM_DBG_SLEEP_TRACE): JDK25
         // Thread.sleep(millis) routes through Thread.sleepNanos -> here, so the
         // worker's poll-loop sleeps land in THIS native (not the millis one).
-        if std::env::var_os("CRATONVM_DBG_SLEEP_TRACE").is_some() {
+        if crate::nbflags().dbg_sleep_trace {
             use std::sync::atomic::{AtomicUsize, Ordering};
             static N: AtomicUsize = AtomicUsize::new(0);
             static PRINTED: AtomicUsize = AtomicUsize::new(0);
@@ -2732,7 +2726,7 @@ pub(crate) fn native_array_new_array(
         _ => "java/lang/Object".to_string(),
     };
 
-    if std::env::var("CRATONVM_DBG_TOARRAY").is_ok() {
+    if crate::nbflags().dbg_toarray_ok {
         eprintln!(
             "[DBG_TOARRAY] newArray comp_name={:?} len={}",
             comp_name, length

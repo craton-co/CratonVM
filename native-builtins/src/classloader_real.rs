@@ -62,7 +62,7 @@ fn register_url_array(ctx: &mut dyn NativeContext, this: ObjectRef, urls: Value)
     // callers like Tomcat's `StandardJarScanner`. Runs before classpath
     // registration so it happens even when no path is extractable.
     crate::classloader::record_ucl_urls(ctx, this, urls);
-    let dbg = std::env::var_os("CRATONVM_DBG_UCLREG").is_some();
+    let dbg = crate::nbflags().dbg_uclreg;
     let arr = match urls {
         Value::Object(Some(a)) => a,
         _ => {
@@ -253,7 +253,7 @@ fn init_urlclassloader_fields(ctx: &mut dyn NativeContext, this: ObjectRef) {
     // constructor appears to have initialized it. Tomcat's
     // WebappLoader.buildClassPath then immediately dereferences that field.
     let this_pin = ctx.pin_native_root(this);
-    let diag = std::env::var_os("CRATONVM_DBG_URLCL").is_some();
+    let diag = crate::nbflags().dbg_urlcl;
     // `closeables` — WeakHashMap. `getResourceAsStream` synchronizes on it.
     // Only populate when currently null so a real `<init>` that already ran
     // (e.g. the name-carrying constructor whose bytecode we don't override)
@@ -1021,8 +1021,8 @@ fn cl_real_load_class_base(
 ) -> cratonvm_types::error::MethodCallResult {
     let class_name = ctx.read_string(class_name_obj).unwrap_or_default();
     let internal = class_name.replace('.', "/");
-    let __obsreg_dbg = std::env::var_os("CRATONVM_DBG_OBSREG").is_some()
-        && internal.contains("ObservationRegistry");
+    let __obsreg_dbg =
+        crate::vmflags().loader.dbg_obsreg && internal.contains("ObservationRegistry");
     if __obsreg_dbg {
         let this_cls = ctx.class_name_of_id(ctx.class_id_of_object(this));
         let parent_field = ctx.get_field_by_name(this, "parent");

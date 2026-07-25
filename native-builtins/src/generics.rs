@@ -171,8 +171,7 @@ fn class_id_in_generic_scope(
     ctx: &dyn NativeContext,
     name: &str,
 ) -> Option<cratonvm_types::ClassId> {
-    let dbg = std::env::var("CRATONVM_DBG_LAMBDA_GENERIC").is_ok()
-        && name.contains("ApplicationContextInitializer");
+    let dbg = crate::nbflags().dbg_lambda_generic && name.contains("ApplicationContextInitializer");
     let decl_opt = GENERIC_DECL_SCOPE.with(|scope| scope.get());
     let near_opt = decl_opt.and_then(|decl| ctx.class_id_from_mirror(decl));
     let scoped = near_opt.and_then(|near| ctx.class_id_by_name_near(name, near));
@@ -942,7 +941,7 @@ pub(crate) fn typesig_to_real_type(ctx: &mut dyn NativeContext, sig: &TypeSig) -
                 ctx.set_array_element(args, i, v);
             }
             args = ctx.read_native_pin(args_pin, args);
-            if std::env::var_os("CRATONVM_TRACE_PTI_ARGS").is_some() {
+            if crate::nbflags().trace_pti_args {
                 let observed_len = ctx.array_length(args);
                 if observed_len != type_args.len() {
                     eprintln!(

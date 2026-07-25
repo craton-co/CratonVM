@@ -1540,7 +1540,7 @@ pub(crate) fn p59_jar_file_stream(ctx: &mut dyn NativeContext, args: &[Value]) -
         _ => String::new(),
     };
     let elems = p59_jar_collect_entries(ctx, &path);
-    if std::env::var_os("CRATONVM_DBG_SBLOAD").is_some() {
+    if crate::nbflags().dbg_sbload {
         eprintln!(
             "[DBG_SBLOAD] JarFile.stream() path={:?} entries={}",
             path,
@@ -1629,7 +1629,7 @@ pub(crate) fn p59_spring_boot_jar_archive_get_class_path_urls(
         }
         _ => String::new(),
     };
-    if std::env::var_os("CRATONVM_DBG_SBLOAD").is_some() {
+    if crate::nbflags().dbg_sbload {
         eprintln!(
             "[DBG_SBLOAD] JarFileArchive.getClassPathUrls jar_path={:?}",
             jar_path
@@ -1691,7 +1691,7 @@ pub(crate) fn p59_spring_boot_jar_archive_get_class_path_urls(
         ctx.unpin_native_roots(jar_entry_pin);
     }
 
-    if std::env::var_os("CRATONVM_DBG_SBLOAD").is_some() {
+    if crate::nbflags().dbg_sbload {
         eprintln!(
             "[DBG_SBLOAD] JarFileArchive.getClassPathUrls -> {} urls",
             urls.len()
@@ -1744,7 +1744,7 @@ pub(crate) fn p59_spring_boot_exploded_archive_get_class_path_urls(
         Value::Object(Some(file)) => file_read_path(ctx, file),
         _ => String::new(),
     };
-    if std::env::var_os("CRATONVM_DBG_SBLOAD").is_some() {
+    if crate::nbflags().dbg_sbload {
         eprintln!(
             "[DBG_SBLOAD] ExplodedArchive.getClassPathUrls root_directory={:?}",
             root_directory
@@ -1845,7 +1845,7 @@ pub(crate) fn p59_spring_boot_exploded_archive_get_class_path_urls(
         ctx.unpin_native_roots(file_pin);
         ctx.unpin_native_roots(archive_entry_pin);
     }
-    if std::env::var_os("CRATONVM_DBG_SBLOAD").is_some() {
+    if crate::nbflags().dbg_sbload {
         eprintln!(
             "[DBG_SBLOAD] ExplodedArchive.getClassPathUrls -> {} urls",
             urls.len()
@@ -1905,7 +1905,7 @@ pub(crate) fn sb3_executable_archive_launcher_create_class_loader_collection(
     let cid = ctx.class_id_of_object(this);
     let cn = ctx.class_name_of_id(cid).unwrap_or_default();
     let jar_path = ctx.find_class_source_path(&cn).unwrap_or_default();
-    if std::env::var_os("CRATONVM_DBG_SBLOAD").is_some() {
+    if crate::nbflags().dbg_sbload {
         eprintln!(
             "[DBG_SBLOAD] SB3 EAL.createClassLoader(Collection) class={} jar_path={:?}",
             cn, jar_path
@@ -1988,7 +1988,7 @@ pub(crate) fn sb2_launcher_get_main_class(
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let jar_path = sb2_launcher_jar_path(ctx, this).unwrap_or_default();
-    if std::env::var_os("CRATONVM_DBG_SBLOAD").is_some() {
+    if crate::nbflags().dbg_sbload {
         eprintln!(
             "[DBG_SBLOAD] SB2 ExecutableArchiveLauncher.getMainClass jar_path={:?}",
             jar_path
@@ -2069,7 +2069,7 @@ pub(crate) fn sb2_launcher_build_archive_list(
             *v = Value::Object(Some(ctx.read_native_pin(*h, *o)));
         }
     }
-    if std::env::var_os("CRATONVM_DBG_SBLOAD").is_some() {
+    if crate::nbflags().dbg_sbload {
         eprintln!(
             "[DBG_SBLOAD] SB2 ExecutableArchiveLauncher.getClassPathArchives -> {} entries",
             archives.len()
@@ -2140,7 +2140,7 @@ pub(crate) fn sb2_launcher_get_class_path_archives_iterator(
     ctx.set_field(itr, 1, Value::Int(0));
     let first_pin = pins.iter().flatten().next().map(|(h, _)| *h);
     ctx.unpin_native_roots(first_pin.unwrap_or(arr_pin));
-    if std::env::var_os("CRATONVM_DBG_SBLOAD").is_some() {
+    if crate::nbflags().dbg_sbload {
         eprintln!(
             "[DBG_SBLOAD] SB2 ExecutableArchiveLauncher.getClassPathArchivesIterator -> {} entries",
             archives.len()
@@ -2356,7 +2356,7 @@ pub(crate) fn p59_jar_file_init_file(
     } else {
         String::new()
     };
-    if std::env::var_os("CRATONVM_DBG_SBLOAD").is_some() {
+    if crate::nbflags().dbg_sbload {
         eprintln!("[DBG_SBLOAD] JarFile.<init>(File) path={:?}", path);
     }
     // Pin across the manifest parse below — a moving young GC there would

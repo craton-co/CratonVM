@@ -164,13 +164,9 @@ impl Drop for YoungMarkBits {
 /// `0`/`1` disables parallelism entirely; `>= 2` forces that many workers
 /// regardless of heap size (this is what the GC-stress matrix uses to
 /// exercise the parallel path on a tiny heap). Unset = automatic.
+#[inline]
 fn configured_threads() -> Option<usize> {
-    static G: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
-    *G.get_or_init(|| {
-        std::env::var("CRATONVM_GC_PAR_THREADS")
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-    })
+    crate::gc_flags().gc_par_threads
 }
 
 /// Automatic worker count when `CRATONVM_GC_PAR_THREADS` is unset.
@@ -187,14 +183,9 @@ fn auto_threads() -> usize {
 /// Young-gen bytes below which parallelism never pays for itself (thread
 /// spawn + bitmap iteration dominate). Override with
 /// `CRATONVM_GC_PAR_MIN_BYTES`.
+#[inline]
 fn min_parallel_bytes() -> usize {
-    static G: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *G.get_or_init(|| {
-        std::env::var("CRATONVM_GC_PAR_MIN_BYTES")
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            .unwrap_or(16 * 1024 * 1024)
-    })
+    crate::gc_flags().gc_par_min_bytes
 }
 
 /// Workers to use for a collection whose from-space holds `used` bytes.

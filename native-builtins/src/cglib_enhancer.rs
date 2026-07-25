@@ -3953,7 +3953,7 @@ fn cce_enhance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult 
         .unwrap_or_else(|e| e.into_inner())
         .get(&cache_key)
         .cloned();
-    if std::env::var_os("CRATONVM_DBG_CCECACHE").is_some() {
+    if crate::nbflags().dbg_ccecache {
         eprintln!(
             "[CCECACHE-DBG] enhance called: super_class_id={:?} cache_key={:?} receiver_loader_id={} hit={}",
             super_class_id,
@@ -4546,7 +4546,7 @@ fn enhance_factory_bean_reference(ctx: &mut dyn NativeContext, args: &[Value]) -
     let class_final = ctx.class_access_flags(concrete_cid) & ACC_FINAL != 0;
     let (sigs, method_final) = factory_bean_getobject_signatures(ctx, concrete_cid);
     let needs_interface_proxy = class_final || method_final;
-    if std::env::var_os("CRATONVM_DBG_FBREF").is_some() {
+    if crate::nbflags().dbg_fbref {
         eprintln!(
             "[FBREF] enter bean_name={bean_name} exposed_type={exposed_type_internal} concrete={:?} class_final={class_final} method_final={method_final} sigs={:?} needs_interface_proxy={needs_interface_proxy}",
             ctx.class_name_of_id(concrete_cid),
@@ -4584,7 +4584,7 @@ fn enhance_factory_bean_reference(ctx: &mut dyn NativeContext, args: &[Value]) -
         }
         // Final class/method with a non-interface (or unresolvable) exposed
         // type: no proxy possible — mirrors real Spring's own fallback.
-        if std::env::var_os("CRATONVM_DBG_FBREF").is_some() {
+        if crate::nbflags().dbg_fbref {
             eprintln!("[FBREF] identity fallback (no interface proxy possible)");
         }
         return Ok(Some(Value::Object(Some(raw_factory))));
@@ -4595,7 +4595,7 @@ fn enhance_factory_bean_reference(ctx: &mut dyn NativeContext, args: &[Value]) -
     ctx.unpin_native_roots(pin_base);
     let subclass_result =
         build_factory_bean_subclass_wrapper(ctx, concrete_cid, raw_factory, bean_factory, &bean_name);
-    if std::env::var_os("CRATONVM_DBG_FBREF").is_some() {
+    if crate::nbflags().dbg_fbref {
         let class_name = subclass_result.map(|o| ctx.class_name_of_id(ctx.class_id_of_object(o)));
         eprintln!(
             "[FBREF] subclass wrapper: present={} class={:?}",

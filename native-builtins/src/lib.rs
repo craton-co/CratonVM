@@ -19,7 +19,7 @@ use cratonvm_types::{ObjectRef, Value};
 #[inline]
 fn dbg_toarray_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("CRATONVM_DBG_TOARRAY").is_some())
+    *ENABLED.get_or_init(|| crate::nbflags().dbg_toarray)
 }
 
 
@@ -4143,7 +4143,7 @@ pub mod jca;
 /// JDK 25 + BouncyCastle provider bytecode and yield concrete
 /// `ECPrivateKey`/`RSAPublicKey` instances instead of bare-interface synthetics.
 pub fn real_jca_mode() -> bool {
-    std::env::var_os("CRATONVM_REAL_JCA").is_some()
+    crate::nbflags().real_jca
 }
 
 /// EC-scoped real-JCA routing (default ON). Unlike [`real_jca_mode`] — which
@@ -4169,7 +4169,7 @@ pub fn real_jca_mode() -> bool {
 pub fn route_ec_to_real() -> bool {
     use std::sync::OnceLock;
     static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(|| std::env::var_os("CRATONVM_SYNTHETIC_EC").is_none())
+    *CACHE.get_or_init(|| !crate::nbflags().synthetic_ec)
 }
 
 /// Route DSA `Signature` sign/verify to the real JDK 25 `sun.security
@@ -4188,7 +4188,7 @@ pub fn route_ec_to_real() -> bool {
 pub fn route_dsa_to_real() -> bool {
     use std::sync::OnceLock;
     static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(|| std::env::var_os("CRATONVM_SYNTHETIC_DSA").is_none())
+    *CACHE.get_or_init(|| !crate::nbflags().synthetic_dsa)
 }
 
 /// Route the post-quantum families (ML-DSA via the SUN provider, ML-KEM via
@@ -4205,7 +4205,7 @@ pub fn route_dsa_to_real() -> bool {
 pub fn route_pqc_to_real() -> bool {
     use std::sync::OnceLock;
     static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(|| std::env::var_os("CRATONVM_SYNTHETIC_PQC").is_none())
+    *CACHE.get_or_init(|| !crate::nbflags().synthetic_pqc)
 }
 
 /// Hand out *real* RSA key objects (`sun.security.rsa.RSAPublic/PrivateKeyImpl`)
@@ -4236,7 +4236,7 @@ pub fn route_pqc_to_real() -> bool {
 pub fn route_rsa_to_real() -> bool {
     use std::sync::OnceLock;
     static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(|| std::env::var_os("CRATONVM_SYNTHETIC_RSA").is_none())
+    *CACHE.get_or_init(|| !crate::nbflags().synthetic_rsa)
 }
 
 /// DBG: trace every `Reference.refersTo`/`refersTo0` call that answers
@@ -4248,7 +4248,7 @@ pub fn route_rsa_to_real() -> bool {
 pub(crate) fn dbg_refers_to() -> bool {
     use std::sync::OnceLock;
     static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(|| std::env::var_os("CRATONVM_DBG_REFERSTO").is_some())
+    *CACHE.get_or_init(|| crate::nbflags().dbg_refersto)
 }
 
 pub mod apps_h2;
@@ -5414,7 +5414,7 @@ fn netty_jctools_queue_store() -> &'static std::sync::Mutex<
 }
 
 fn netty_queue_dbg_enabled() -> bool {
-    std::env::var_os("CRATONVM_DBG_NETTY_QUEUE").is_some()
+    crate::nbflags().dbg_netty_queue
 }
 
 fn netty_queue_obj_class(ctx: &dyn NativeContext, obj: ObjectRef) -> String {
@@ -7020,10 +7020,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // with the SAME default-ON / opt-out (`=0`/`false`) semantics as
     // `env_cache::native_string_regex`; registration runs once at VM init so the
     // lookup cost is negligible.
-    let native_string_regex_enabled = match std::env::var("CRATONVM_NATIVE_STRING_REGEX") {
-        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
-        Err(_) => true,
-    };
+    let native_string_regex_enabled = crate::nbflags().native_string_regex;
     if native_string_regex_enabled {
         registry.register(
             "java/lang/String",
@@ -7072,10 +7069,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // results to HotSpot; read directly (native-builtins cannot depend on
     // vm::env_cache) with the SAME semantics as
     // `env_cache::native_matcher_find`.
-    let native_matcher_find_enabled = match std::env::var("CRATONVM_NATIVE_MATCHER_FIND") {
-        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
-        Err(_) => true,
-    };
+    let native_matcher_find_enabled = crate::nbflags().native_matcher_find;
     if native_matcher_find_enabled {
         // `NativeKind::Intrinsic`: required so `NativeMethodRegistry::register`'s
         // `keep_real_matcher_find_fastpath` exception (registry.rs) applies —
@@ -7225,8 +7219,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // Condition bridge steal LinkedBlockingQueue's real lock operations and hang
     // executor shutdown. Keep the legacy surface opt-in and aligned with
     // `register_concurrent_natives` below.
-    let synthetic_aqs = std::env::var_os("CRATONVM_SYNTHETIC_AQS").is_some()
-        && std::env::var_os("CRATONVM_REAL_AQS").is_none();
+    let synthetic_aqs = crate::nbflags().synthetic_aqs && !crate::nbflags().real_aqs;
     if synthetic_aqs {
         registry.with_category(cratonvm_native_api::NativeKind::SyntheticStub, |registry| {
             let rl = "java/util/concurrent/locks/ReentrantLock";
@@ -8941,7 +8934,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
                 _ => return Ok(Some(Value::Int(0))),
             };
             let len = ctx.array_length(arr);
-            let trace = std::env::var_os("CRATONVM_TRACE_ARRAYS_HASHCODE").is_some();
+            let trace = crate::nbflags().trace_arrays_hashcode;
             if trace {
                 let mut desc = String::new();
                 for i in 0..len {
@@ -10378,8 +10371,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // intercepted.  Libraries such as Oracle UCP call the inherited protected
     // Sync.reducePermits() directly; with a synthetic holder that method sees
     // an int[] instead of Semaphore$Sync and retries its CAS forever.
-    let synthetic_aqs = std::env::var_os("CRATONVM_SYNTHETIC_AQS").is_some()
-        && std::env::var_os("CRATONVM_REAL_AQS").is_none();
+    let synthetic_aqs = crate::nbflags().synthetic_aqs && !crate::nbflags().real_aqs;
     if synthetic_aqs {
         let surefire_sem = "java/util/concurrent/Semaphore";
         registry.register(surefire_sem, "<init>", "(I)V", native_sem_init);
@@ -22694,7 +22686,7 @@ pub(crate) fn native_return_false(
 /// `assert` statements in real bytecode (e.g. keycloak JWKUtil.toIntegerBytes)
 /// actually throw `AssertionError` on violation instead of being no-ops.
 pub(crate) fn assertion_status_default() -> i32 {
-    if std::env::var_os("CRATONVM_ENABLE_ASSERTIONS").is_some() {
+    if crate::nbflags().enable_assertions {
         1
     } else {
         0
@@ -22977,7 +22969,7 @@ pub(crate) fn obj_arg(
             // Gated so production NPEs stay quiet — Java code legally
             // throws NPE in many places (`HashMap.get(null)` etc.) and
             // we don't want to drown those in backtraces.
-            if std::env::var_os("CRATONVM_DBG_NULL_NATIVE").is_some() {
+            if crate::nbflags().dbg_null_native {
                 eprintln!(
                     "[obj_arg] null at idx={} args.len={}\n{}",
                     idx,
@@ -23069,7 +23061,7 @@ fn native_object_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 fn dbg_vdisp_cached() -> bool {
     use std::sync::OnceLock;
     static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(|| std::env::var_os("CRATONVM_DBG_VDISP").is_some())
+    *CACHE.get_or_init(|| crate::nbflags().dbg_vdisp)
 }
 
 /// Map a synthetic object's stamped class — an interface, an abstract class, or
@@ -23600,7 +23592,7 @@ fn native_object_equals(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 fn dbg_obj_equals_cached() -> bool {
     use std::sync::OnceLock;
     static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(|| std::env::var_os("CRATONVM_DBG_OBJ_EQUALS").is_some())
+    *CACHE.get_or_init(|| crate::nbflags().dbg_obj_equals)
 }
 
 /// Cached `CRATONVM_DBG_CLONE` check -- `Object.clone()` is far less hot
@@ -23611,7 +23603,7 @@ fn dbg_obj_equals_cached() -> bool {
 fn dbg_clone_cached() -> bool {
     use std::sync::OnceLock;
     static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(|| std::env::var_os("CRATONVM_DBG_CLONE").is_some())
+    *CACHE.get_or_init(|| crate::nbflags().dbg_clone)
 }
 
 fn native_object_clone(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -25950,7 +25942,7 @@ fn objects_values_equal(
             // `ConsumerGroupDescription.equals` false for two value-equal
             // objects (via `Optional<MemberAssignment>` / `Optional<List>`).
             // Mirrors `values_equal` in native-collections.
-            if std::env::var_os("CRATONVM_DBG_OBJECTS").is_some() {
+            if crate::nbflags().dbg_objects {
                 eprintln!(
                     "[objects-native] objects_values_equal -> invoke_virtual equals on ra={:?}",
                     ra
@@ -25962,7 +25954,7 @@ fn objects_values_equal(
                 "(Ljava/lang/Object;)Z",
                 &[Value::Object(Some(*rb))],
             )?;
-            if std::env::var_os("CRATONVM_DBG_OBJECTS").is_some() {
+            if crate::nbflags().dbg_objects {
                 eprintln!(
                     "[objects-native] objects_values_equal invoke_virtual returned {:?}",
                     r
@@ -26051,7 +26043,7 @@ fn native_objects_require_non_null_else_get(
 }
 
 fn native_objects_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    if std::env::var_os("CRATONVM_DBG_OBJECTS").is_some() {
+    if crate::nbflags().dbg_objects {
         eprintln!(
             "[objects-native] native_objects_equals CALLED args={:?}",
             args
@@ -26118,7 +26110,7 @@ fn native_objects_value_hash_code(
 }
 
 fn native_objects_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    if std::env::var_os("CRATONVM_DBG_OBJECTS").is_some() {
+    if crate::nbflags().dbg_objects {
         eprintln!(
             "[objects-native] native_objects_hash_code CALLED args={:?}",
             args
@@ -31052,10 +31044,7 @@ fn note_async_runnable_submitted() {
 fn async_submit_handoff_grace() -> std::time::Duration {
     static GRACE: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
     *GRACE.get_or_init(|| {
-        let millis = std::env::var("CRATONVM_ASYNC_SUBMIT_GRACE_MS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(20);
+        let millis = crate::nbflags().async_submit_grace_ms.unwrap_or(20);
         std::time::Duration::from_millis(millis)
     })
 }
@@ -31081,16 +31070,14 @@ pub(crate) fn async_handoff_sleep_millis(requested: i64) -> i64 {
         return requested;
     }
     if (1..=10).contains(&requested) {
-        let handoff_floor = std::env::var("CRATONVM_ASYNC_HANDOFF_SLEEP_FLOOR_MS")
-            .ok()
-            .and_then(|v| v.parse::<i64>().ok())
+        let handoff_floor = crate::nbflags()
+            .async_handoff_sleep_floor_ms
             .filter(|v| *v >= requested)
             .unwrap_or(DEFAULT_ASYNC_HANDOFF_SLEEP_FLOOR_MS);
         requested.max(handoff_floor)
     } else if (50..=100).contains(&requested) {
-        let worker_floor = std::env::var("CRATONVM_ASYNC_WORKER_SLEEP_FLOOR_MS")
-            .ok()
-            .and_then(|v| v.parse::<i64>().ok())
+        let worker_floor = crate::nbflags()
+            .async_worker_sleep_floor_ms
             .filter(|v| *v >= requested)
             .unwrap_or(DEFAULT_ASYNC_WORKER_SHORT_SLEEP_FLOOR_MS);
         requested.max(worker_floor)
@@ -31239,7 +31226,7 @@ pub(crate) fn executor_has_real_workers(ctx: &mut dyn NativeContext, exec: Objec
 pub(crate) fn interrupt_executor_workers(ctx: &mut dyn NativeContext, exec: ObjectRef) -> bool {
     // Unwrap Executors$DelegatedExecutorService / AutoShutdownDelegated...
     // (field `e` -> the inner executor) if present.
-    let dbg = std::env::var_os("CRATONVM_DBG_EXEC").is_some();
+    let dbg = crate::nbflags().dbg_exec;
     if dbg {
         let has_e = matches!(ctx.get_field_by_name(exec, "e"), Value::Object(Some(_)));
         eprintln!(
@@ -36192,7 +36179,7 @@ fn wrap_undeclared_throwable(
 ) -> cratonvm_types::ObjectRef {
     // 1) RuntimeException / Error — always propagate.
     let thrown_cid = ctx.class_id_of_object(thrown);
-    if std::env::var_os("CRATONVM_DBG_UTE").is_some() {
+    if crate::nbflags().dbg_ute {
         let thrown_name = ctx
             .class_name_of_id(thrown_cid)
             .unwrap_or_else(|| "<unknown>".to_string());
@@ -36433,8 +36420,7 @@ fn native_invocation_handler_invoke_default(
 /// opt-out (`CRATONVM_SYNTHETIC_AGROAL`), mirroring the AQS / Spring-startup
 /// precedents.
 pub fn real_agroal() -> bool {
-    std::env::var_os("CRATONVM_REAL_AGROAL").is_some()
-        && std::env::var_os("CRATONVM_SYNTHETIC_AGROAL").is_none()
+    crate::nbflags().real_agroal && !crate::nbflags().synthetic_agroal
 }
 
 /// Vert.x / Netty event loop (Keycloak Gap 9). Under `CRATONVM_REAL_VERTX` the
@@ -36447,8 +36433,7 @@ pub fn real_agroal() -> bool {
 /// binds but never accepts. Opt-in while the real path is validated; flips to
 /// opt-out (`CRATONVM_SYNTHETIC_VERTX`) once green by default, mirroring `real_agroal`.
 pub fn real_vertx() -> bool {
-    std::env::var_os("CRATONVM_REAL_VERTX").is_some()
-        && std::env::var_os("CRATONVM_SYNTHETIC_VERTX").is_none()
+    crate::nbflags().real_vertx && !crate::nbflags().synthetic_vertx
 }
 
 
@@ -38863,4 +38848,34 @@ fn real_charset_cache() -> &'static std::sync::Mutex<std::collections::HashMap<S
     static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, usize>>> =
         std::sync::OnceLock::new();
     CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Typed flag access (T3.5b)
+// ───────────────────────────────────────────────────────────────────────────
+
+/// The whole typed configuration.
+///
+/// Used for the handful of flags this crate shares with `gc`, `classloading`
+/// and `native-io`, which already carry fields on their own sub-structs; the
+/// native-builtins-only flags live behind [`nbflags`].
+#[inline(always)]
+pub(crate) fn vmflags() -> &'static cratonvm_types::flags::VmFlags {
+    cratonvm_types::flags()
+}
+
+/// The `native-builtins`-only slice of the typed configuration.
+///
+/// Replaces ~360 direct `std::env::var`/`var_os` probes. A field read here is
+/// one relaxed-acquire load of an already-initialised `OnceLock` plus a load
+/// from a static — cheaper than the per-flag `OnceLock<bool>` helpers it
+/// subsumes, and *far* cheaper than `getenv`, which takes the process environ
+/// lock and linearly scans `environ`. That matters: several of these probes sit
+/// on the interpreter's `new`-opcode and native-invoke paths, where an uncached
+/// probe cost 130M `getenv` calls per CratonBench `hashmap` run before
+/// `c258662e4`. Keep these reads as the LEFT operand of any `&&` whose right
+/// operand is a string compare, exactly as that fix required.
+#[inline(always)]
+pub(crate) fn nbflags() -> &'static cratonvm_types::flags::NativeFlags {
+    &cratonvm_types::flags().natives
 }

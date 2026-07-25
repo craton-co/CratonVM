@@ -2784,7 +2784,7 @@ fn check_revocation(
             revocation,
             timeout,
         );
-        if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+        if crate::nbflags().dbg_tls_auth_ok {
             eprintln!(
                 "[dbg-tls-auth] check_revocation cert_index={} outcome={:?}",
                 i, outcome
@@ -3230,7 +3230,7 @@ pub(crate) fn build_and_register_tm_state_from_mfp(
             insert_anchor(&mut state, der);
         }
         state.revocation = extract_revocation_config(ctx, mfp);
-        if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+        if crate::nbflags().dbg_tls_auth_ok {
             eprintln!(
                 "[dbg-tls-auth] build_and_register_tm_state_from_mfp revocation_config={:?}",
                 state.revocation
@@ -4088,7 +4088,7 @@ fn do_check_trusted(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
             }
         }
     };
-    if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+    if crate::nbflags().dbg_tls_auth_ok {
         eprintln!(
             "[dbg-tls-auth] do_check_trusted id={} registry_hit={} anchor_ders={} anchors_groups={} chain_len={}",
             id,
@@ -4174,7 +4174,7 @@ fn kmf_engine_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
             .get(2)
             .map(|value| crate::keystore::read_password(ctx, value))
             .unwrap_or_default();
-        if std::env::var_os("CRATONVM_DBG_TLS_AUTH").is_some() {
+        if crate::nbflags().dbg_tls_auth {
             eprintln!(
                 "[dbg-tls-auth] kmf_engine_init this_ptr={:?} ks_id={} password_len={}",
                 this.as_ptr(),
@@ -4220,7 +4220,7 @@ fn tmf_engine_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     let state = build_trust_manager_state(ks_id);
     crate::t27_tls::set_pending_tm_trust_roots(state.anchor_ders.clone());
     let id = register_trust_manager_state(state);
-    if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+    if crate::nbflags().dbg_tls_auth_ok {
         eprintln!(
             "[dbg-tls-auth] tmf_engine_init this_ptr={:?} ks_id={} new_tm_id={}",
             this.as_ptr(),
@@ -4235,7 +4235,7 @@ fn tmf_engine_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
 fn tmf_engine_get_trust_managers(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
     let id = get_tm_id(ctx, this);
-    if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+    if crate::nbflags().dbg_tls_auth_ok {
         eprintln!(
             "[dbg-tls-auth] tmf_engine_get_trust_managers this_ptr={:?} read_id={}",
             this.as_ptr(),
@@ -4249,7 +4249,7 @@ fn tmf_engine_get_trust_managers(ctx: &mut dyn NativeContext, args: &[Value]) ->
     let arr = ctx.new_ref_array(cls_id, 1);
     let tm = alloc_concurrent_synthetic(ctx, FQN_X509_TM, 2);
     set_tm_id(ctx, tm, id);
-    if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+    if crate::nbflags().dbg_tls_auth_ok {
         eprintln!(
             "[dbg-tls-auth] tmf_engine_get_trust_managers stamped tm_ptr={:?} id={}",
             tm.as_ptr(),

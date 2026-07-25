@@ -222,7 +222,7 @@ pub(crate) fn set_pending_tm_trust_roots(root_ders: Vec<Vec<u8>>) {
             deduped.push(der);
         }
     }
-    if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+    if crate::nbflags().dbg_tls_auth_ok {
         eprintln!(
             "[dbg-tls-auth] set_pending_tm_trust_roots count={}",
             deduped.len()
@@ -266,7 +266,7 @@ pub(crate) fn set_pending_tm_revocation(revocation: Option<crate::x509_manager::
 
 fn take_pending_tm_trust_roots() -> Option<TlsTrustRoots> {
     let out = PENDING_TM_TRUST_ROOTS.with(|c| c.borrow_mut().take());
-    if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+    if crate::nbflags().dbg_tls_auth_ok {
         eprintln!(
             "[dbg-tls-auth] take_pending_tm_trust_roots -> {:?}",
             out.as_ref().map(|r| r.root_ders.len())
@@ -370,7 +370,7 @@ pub(crate) fn attach_trust_managers_to_ctx(
             }
         }
     }
-    if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+    if crate::nbflags().dbg_tls_auth_ok {
         eprintln!(
             "[dbg-tls-auth] attach_trust_managers_to_ctx key={} tms_array_present={} count={}",
             key,
@@ -438,7 +438,7 @@ pub(crate) fn attach_key_managers_to_ctx(
             }
         }
     }
-    if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+    if crate::nbflags().dbg_tls_auth_ok {
         eprintln!(
             "[dbg-tls-auth] attach_key_managers_to_ctx key={} kms_array_present={} count={}",
             key,
@@ -481,7 +481,7 @@ pub(crate) fn attach_pending_identity_to_ctx(
     let key = ctx_obj_key(ctx, ctx_obj);
     let pending = take_pending_km_identity();
     if let Some(ident) = resolved_km_identity.or(pending) {
-        if std::env::var_os("CRATONVM_DBG_TLS_AUTH").is_some() {
+        if crate::nbflags().dbg_tls_auth {
             eprintln!(
                 "[dbg-tls-auth] attach_pending_identity_to_ctx key={} STORING km identity key_pem_len={} cert_pem_len={}",
                 key,
@@ -490,14 +490,14 @@ pub(crate) fn attach_pending_identity_to_ctx(
             );
         }
         ctx_identity_table().lock().insert(key, ident);
-    } else if std::env::var_os("CRATONVM_DBG_TLS_AUTH").is_some() {
+    } else if crate::nbflags().dbg_tls_auth {
         eprintln!(
             "[dbg-tls-auth] attach_pending_identity_to_ctx key={} NO pending km identity to store",
             key
         );
     }
     if let Some(roots) = take_pending_tm_trust_roots() {
-        if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+        if crate::nbflags().dbg_tls_auth_ok {
             eprintln!(
                 "[dbg-tls-auth] attach_pending_identity_to_ctx key={} storing {} roots",
                 key,
@@ -505,7 +505,7 @@ pub(crate) fn attach_pending_identity_to_ctx(
             );
         }
         ctx_trust_roots_table().lock().insert(key, roots);
-    } else if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+    } else if crate::nbflags().dbg_tls_auth_ok {
         eprintln!(
             "[dbg-tls-auth] attach_pending_identity_to_ctx key={} NO pending roots to store",
             key
@@ -520,7 +520,7 @@ pub(crate) fn ctx_identity(
 ) -> Option<(String, String)> {
     let key = ctx_obj_key(ctx, ctx_obj);
     let trust_roots = ctx_trust_roots_table().lock().get(&key).cloned();
-    if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+    if crate::nbflags().dbg_tls_auth_ok {
         eprintln!(
             "[dbg-tls-auth] ctx_identity key={} trust_roots={:?}",
             key,
@@ -576,7 +576,7 @@ pub(crate) fn build_engine_client_config_with_identity(
     let trust_roots = active_client_trust_roots();
     let revocation = trust_roots.as_ref().and_then(|r| r.revocation.clone());
     let roots = root_store_for_trust_roots(trust_roots.as_ref());
-    if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+    if crate::nbflags().dbg_tls_auth_ok {
         eprintln!(
             "[dbg-tls-auth] build_engine_client_config_with_identity km_ctx_key={:?} client_identity_present={}",
             km_ctx_key,
@@ -597,7 +597,7 @@ pub(crate) fn build_engine_client_config_with_identity(
             .get(&key)
             .map(|v| !v.is_empty())
             .unwrap_or(false);
-        if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+        if crate::nbflags().dbg_tls_auth_ok {
             eprintln!(
                 "[dbg-tls-auth] build_engine_client_config_with_identity key={} has_kms={}",
                 key, has_kms
@@ -759,7 +759,7 @@ pub(crate) fn set_huc_default_client_identity(ident: Option<(String, String)>) {
     clear_huc_default_client_config();
     *huc_default_identity_slot().lock() = ident;
     let roots = selected_context_trust_roots();
-    if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+    if crate::nbflags().dbg_tls_auth_ok {
         eprintln!(
             "[dbg-tls-auth] set_huc_default_client_identity capturing roots={:?}",
             roots.as_ref().map(|r| r.root_ders.len())
@@ -829,7 +829,7 @@ pub(crate) fn huc_default_trust_managers_ctx_key() -> Option<u64> {
 pub(crate) fn capture_huc_key_managers_ctx_key(ctx: &mut dyn NativeContext, ctx_obj: ObjectRef) {
     let key = ctx_obj_key(ctx, ctx_obj);
     let has_kms = ctx_key_managers_table().lock().contains_key(&key);
-    if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+    if crate::nbflags().dbg_tls_auth_ok {
         eprintln!(
             "[dbg-tls-auth] capture_huc_key_managers_ctx_key key={} has_kms={}",
             key, has_kms
@@ -1013,7 +1013,7 @@ fn root_store_for_trust_roots(trust_roots: Option<&TlsTrustRoots>) -> RootCertSt
 fn active_client_trust_roots() -> Option<TlsTrustRoots> {
     let selected = take_selected_context_trust_roots();
     let result = selected.or_else(huc_default_trust_roots);
-    if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+    if crate::nbflags().dbg_tls_auth_ok {
         eprintln!(
             "[dbg-tls-auth] active_client_trust_roots -> {:?}",
             result.as_ref().map(|r| r.root_ders.len())
@@ -1113,7 +1113,7 @@ pub fn install_identity_from_der(key_pkcs8_der: &[u8], chain_der: &[Vec<u8>]) {
         cert_pem.push_str(&der_to_pem("CERTIFICATE", c));
     }
     let __sniffed = sniff_private_key_pem_header(key_pkcs8_der);
-    if std::env::var_os("CRATONVM_DBG_TLS_HS").is_some() {
+    if crate::nbflags().dbg_tls_hs {
         eprintln!(
             "[dbg-tls-hs] install_identity_from_der: key_der_len={} full_hex={} sniffed_header={}",
             key_pkcs8_der.len(),
@@ -2068,7 +2068,7 @@ impl JavaKeyManagerResolver {
         root_hint_subjects: &[&[u8]],
         sigschemes: &[SignatureScheme],
     ) -> Option<Arc<CertifiedKey>> {
-        let dbg = std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok();
+        let dbg = crate::nbflags().dbg_tls_auth_ok;
         let mut km_list = ctx_key_managers_table()
             .lock()
             .get(&self.km_ctx_key)?
@@ -2262,7 +2262,7 @@ impl ResolvesClientCert for JavaKeyManagerResolver {
         root_hint_subjects: &[&[u8]],
         sigschemes: &[SignatureScheme],
     ) -> Option<Arc<CertifiedKey>> {
-        let dbg = std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok();
+        let dbg = crate::nbflags().dbg_tls_auth_ok;
         if dbg {
             eprintln!(
                 "[dbg-tls-auth] JavaKeyManagerResolver::resolve CALLED km_ctx_key={} root_hint_subjects={}",
@@ -2289,7 +2289,7 @@ impl ResolvesClientCert for JavaKeyManagerResolver {
             .get(&self.km_ctx_key)
             .map(|v| !v.is_empty())
             .unwrap_or(false);
-        if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+        if crate::nbflags().dbg_tls_auth_ok {
             eprintln!(
                 "[dbg-tls-auth] JavaKeyManagerResolver::has_certs CALLED km_ctx_key={} -> {}",
                 self.km_ctx_key, out
@@ -2646,7 +2646,7 @@ pub(crate) fn rustls_client_connect(
 /// `accept()` non-blockingly outside the lock so a `close()` call can always
 /// acquire the mutex immediately and is noticed within one poll interval.
 pub(crate) fn rustls_server_accept(listener_id: i32) -> Result<i32, String> {
-    let debug_hs = std::env::var_os("CRATONVM_DBG_TLS_HS").is_some();
+    let debug_hs = crate::nbflags().dbg_tls_hs;
     // Step 1: pop the config + a cloned tcp listener handle + the closed
     // flag, then accept *without* the mutex held so long handshakes (or a
     // long wait for a peer that never connects) don't stall every other TLS
@@ -2806,7 +2806,7 @@ pub(crate) fn rustls_server_handshake_over_stream(
     cert_pem: &str,
     key_pem: &str,
 ) -> Result<i32, String> {
-    let debug_srv = std::env::var_os("CRATONVM_DBG_TLS_SRV").is_some();
+    let debug_srv = crate::nbflags().dbg_tls_srv;
     if debug_srv {
         eprintln!("[dbg-tls-srv] wrap_existing_socket: got raw stream");
     }
@@ -3096,7 +3096,7 @@ pub(crate) fn stash_pending_layered_socket(
     extra_roots: Vec<Vec<u8>>,
     java_tm_key: Option<u64>,
 ) -> Result<i32, String> {
-    let debug_pls = std::env::var_os("CRATONVM_DBG_TLS_PLS").is_some();
+    let debug_pls = crate::nbflags().dbg_tls_pls;
     let stream = match crate::net_phase_e::take_raw_socket_stream_for_tls(ctx, wrapped) {
         Ok(tcp) => {
             if debug_pls {
@@ -3198,7 +3198,7 @@ pub(crate) fn drive_pending_layered_handshake(pending_id: i32) -> Result<i32, St
         .lock()
         .remove(&pending_id)
         .ok_or_else(|| "layered socket handshake state missing".to_string())?;
-    if std::env::var_os("CRATONVM_DBG_TLS_PLS").is_some() {
+    if crate::nbflags().dbg_tls_pls {
         eprintln!(
             "[dbg-tls-pls] drive: pending_id={} client_mode={} stream={} host={}",
             pending_id,
@@ -3271,7 +3271,7 @@ pub(crate) fn drive_pending_layered_handshake(pending_id: i32) -> Result<i32, St
 }
 
 pub(crate) fn rustls_stream_read(id: i32, buf: &mut [u8]) -> std::io::Result<usize> {
-    let debug_srv = std::env::var_os("CRATONVM_DBG_TLS_SRV").is_some();
+    let debug_srv = crate::nbflags().dbg_tls_srv;
     let mut reg = sreg().lock();
     if let Some(e) = reg.client_streams.get_mut(&id) {
         // FIX (TestSsl.testSni[JSSE]): a plain `SSLSocket.getInputStream()
@@ -3317,7 +3317,7 @@ pub(crate) fn rustls_stream_read(id: i32, buf: &mut [u8]) -> std::io::Result<usi
 
 /// Write to either a client- or server-side rustls stream.
 pub(crate) fn rustls_stream_write(id: i32, data: &[u8]) -> std::io::Result<usize> {
-    let debug_srv = std::env::var_os("CRATONVM_DBG_TLS_SRV").is_some();
+    let debug_srv = crate::nbflags().dbg_tls_srv;
     let mut reg = sreg().lock();
     if let Some(e) = reg.client_streams.get_mut(&id) {
         return e.stream.write(data);
@@ -5906,7 +5906,7 @@ fn enum_const(
     match ctx.invoke(cls, "valueOf", valueof_desc, &[Value::Object(Some(n))]) {
         Ok(Some(v)) => v,
         other => {
-            if std::env::var_os("CRATONVM_DBG_TLS_HS").is_some() {
+            if crate::nbflags().dbg_tls_hs {
                 eprintln!(
                     "[dbg-tls-hs] thread={:?} enum_const FAILED cls={} name={} result={:?}",
                     std::thread::current().id(),
@@ -5988,7 +5988,7 @@ fn alloc_engine_result(
     // comparison fail → the NIO handshake state machine spun → native SO.)
     let st = real_status_enum(ctx, status);
     let hss = real_handshake_status_enum(ctx, hs);
-    let __dbg_hs = std::env::var_os("CRATONVM_DBG_TLS_HS").is_some();
+    let __dbg_hs = crate::nbflags().dbg_tls_hs;
     if matches!(st, Value::Object(Some(_))) && matches!(hss, Value::Object(Some(_))) {
         match ctx.new_object_initialized(
             "javax/net/ssl/SSLEngineResult",
@@ -6490,7 +6490,7 @@ fn default_engine_server_config(
 /// configs (or defaults) and stash it on the engine.
 fn engine_begin(state: &mut EngineState) -> Result<(), String> {
     if state.conn.is_some() {
-        if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+        if crate::nbflags().dbg_tls_auth_ok {
             eprintln!(
                 "[dbg-tls-auth] engine_begin SHORT-CIRCUIT (conn already realized) need={} want={}",
                 state.need_client_auth, state.want_client_auth
@@ -6706,7 +6706,7 @@ fn engine_begin(state: &mut EngineState) -> Result<(), String> {
                                     .unwrap_or(false)
                             })
                             .unwrap_or(false);
-                    if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+                    if crate::nbflags().dbg_tls_auth_ok {
                         eprintln!(
                             "[dbg-tls-auth] engine_begin request={} client_ca_none={} trust_ctx_key={:?} has_custom_trust_managers={}",
                             request, client_ca.is_none(), state.trust_managers_ctx_key, has_custom_trust_managers
@@ -6735,7 +6735,7 @@ fn engine_begin(state: &mut EngineState) -> Result<(), String> {
                     built?
                 }
                 None => {
-                    if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+                    if crate::nbflags().dbg_tls_auth_ok {
                         eprintln!(
                             "[dbg-tls-auth] engine_begin(default_engine_server_config) need={} want={}",
                             state.need_client_auth, state.want_client_auth
@@ -7004,7 +7004,7 @@ fn engine_run_trust_check(
     } else {
         "checkClientTrusted"
     };
-    let dbg = std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok();
+    let dbg = crate::nbflags().dbg_tls_auth_ok;
     if dbg {
         eprintln!(
             "[dbg-tls-auth] engine_run_trust_check: {} trust manager(s), method={}, chain_len={}, auth_type={}",
@@ -7235,7 +7235,7 @@ fn register_engine_impl_natives(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let v = args.get(1).and_then(|x| x.as_int()).unwrap_or(0) != 0;
         let id = engine_id_or_alloc(ctx, this);
-        if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+        if crate::nbflags().dbg_tls_auth_ok {
             let conn_is_some = with_engine(id, |s| s.conn.is_some()).unwrap_or(false);
             eprintln!(
                 "[dbg-tls-auth] DIRECT setNeedClientAuth id={} v={} conn_already_realized={}",
@@ -7502,7 +7502,7 @@ fn register_engine_impl_natives(r: &mut NativeMethodRegistry) {
     r.register(cls_impl, "closeOutbound", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let id = engine_id_or_alloc(ctx, this);
-        if std::env::var("CRATONVM_DBG_TLS_HS").is_ok() {
+        if crate::nbflags().dbg_tls_hs_ok {
             eprintln!(
                 "[dbg-tls-hs] thread={:?} JAVA_CALLED closeOutbound() id={}",
                 std::thread::current().id(),
@@ -7751,7 +7751,7 @@ fn do_wrap(
     dst: ObjectRef,
 ) -> cratonvm_types::error::MethodCallResult {
     let id = engine_id_or_alloc(ctx, this);
-    let __dbg_hs = std::env::var("CRATONVM_DBG_TLS_HS").is_ok();
+    let __dbg_hs = crate::nbflags().dbg_tls_hs_ok;
     if __dbg_hs {
         eprintln!(
             "[dbg-tls-hs] thread={:?} do_wrap ENTER id={}",
@@ -7780,7 +7780,7 @@ fn do_wrap(
         if let Some(s) = g.get_mut(&id) {
             if s.conn.is_none() {
                 if let Err(e) = engine_begin(s) {
-                    if std::env::var("CRATONVM_DBG_TLS_HS").is_ok() {
+                    if crate::nbflags().dbg_tls_hs_ok {
                         eprintln!(
                             "[dbg-tls-hs] thread={:?} do_unwrap/do_wrap id={} RETURN(engine_begin ERROR) err={}",
                             std::thread::current().id(), id, e
@@ -7978,7 +7978,7 @@ fn do_unwrap(
     dsts: Vec<ObjectRef>,
 ) -> cratonvm_types::error::MethodCallResult {
     let id = engine_id_or_alloc(ctx, this);
-    let __dbg_hs = std::env::var("CRATONVM_DBG_TLS_HS").is_ok();
+    let __dbg_hs = crate::nbflags().dbg_tls_hs_ok;
     if __dbg_hs {
         eprintln!(
             "[dbg-tls-hs] thread={:?} do_unwrap ENTER id={}",
@@ -8005,7 +8005,7 @@ fn do_unwrap(
         if let Some(s) = g.get_mut(&id) {
             if s.conn.is_none() {
                 if let Err(e) = engine_begin(s) {
-                    if std::env::var("CRATONVM_DBG_TLS_HS").is_ok() {
+                    if crate::nbflags().dbg_tls_hs_ok {
                         eprintln!(
                             "[dbg-tls-hs] thread={:?} do_unwrap/do_wrap id={} RETURN(engine_begin ERROR) err={}",
                             std::thread::current().id(), id, e
@@ -8190,7 +8190,7 @@ fn do_unwrap(
                     break;
                 }
                 let __pnp_result = conn.process_new_packets();
-                if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+                if crate::nbflags().dbg_tls_auth_ok {
                     eprintln!(
                         "[dbg-tls-auth] do_unwrap id={} process_new_packets -> {} is_handshaking={} peer_certs_present={}",
                         id,
@@ -8481,7 +8481,7 @@ fn register_apply_parameters(r: &mut NativeMethodRegistry) {
                     .as_int()
                     .unwrap_or(0)
                     != 0;
-                if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+                if crate::nbflags().dbg_tls_auth_ok {
                     eprintln!(
                         "[dbg-tls-auth] setSSLParameters id={} need={} want={}",
                         id, need, want
@@ -8634,7 +8634,7 @@ pub(crate) fn set_engine_trust_ctx_key(
 ) {
     let key = ctx_obj_key(ctx, ctx_obj);
     let id = engine_id_or_alloc(ctx, engine_obj);
-    if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+    if crate::nbflags().dbg_tls_auth_ok {
         let has_entry = ctx_trust_managers_table().lock().contains_key(&key);
         eprintln!(
             "[dbg-tls-auth] set_engine_trust_ctx_key engine_id={} ctx_key={} table_has_entry={}",
@@ -8737,7 +8737,7 @@ fn default_ssl_context_slot() -> &'static Mutex<Option<ObjectRef>> {
 /// this SAME object. See `default_ssl_context_slot`'s doc for why identity,
 /// not a copy, is what makes this work.
 pub(crate) fn set_runtime_default_ssl_context(ctx_obj: ObjectRef) {
-    if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+    if crate::nbflags().dbg_tls_auth_ok {
         eprintln!(
             "[dbg-tls-auth] set_runtime_default_ssl_context ptr={:p}",
             ctx_obj.as_ptr()

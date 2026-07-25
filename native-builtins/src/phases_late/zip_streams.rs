@@ -31,13 +31,13 @@ pub(crate) const GZIP_DEFAULT_MAX_INFLATED: u64 = 256 * 1024 * 1024;
 /// Resolve the configured max inflated-size cap. Returns `None` when the cap is
 /// explicitly disabled (`CRATONVM_MAX_INFLATED_BYTES=0`).
 pub(crate) fn gzip_max_inflated_bytes() -> Option<u64> {
-    match std::env::var("CRATONVM_MAX_INFLATED_BYTES") {
-        Ok(s) => match s.trim().parse::<u64>() {
+    match crate::nbflags().max_inflated_bytes.as_deref() {
+        Some(s) => match s.trim().parse::<u64>() {
             Ok(0) => None, // explicitly disabled
             Ok(n) => Some(n),
             Err(_) => Some(GZIP_DEFAULT_MAX_INFLATED),
         },
-        Err(_) => Some(GZIP_DEFAULT_MAX_INFLATED),
+        None => Some(GZIP_DEFAULT_MAX_INFLATED),
     }
 }
 

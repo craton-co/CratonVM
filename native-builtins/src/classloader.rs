@@ -225,7 +225,7 @@ pub fn gc_reconcile_defining_loaders(
     is_marked: &dyn Fn(usize) -> bool,
     pointer_map: &std::collections::HashMap<usize, usize>,
 ) -> Vec<u32> {
-    let dbg = std::env::var_os("CRATONVM_DBG_MIRRORPIN").is_some();
+    let dbg = crate::vmflags().gc.dbg_mirrorpin;
     let mut dead_class_ids = Vec::new();
     let mut map = defining_loader_store()
         .lock()
@@ -1025,12 +1025,7 @@ pub(crate) fn is_loader_aware_resolution_eligible(
 /// legacy permissive behavior (bootstrap native resolves any app class) as the
 /// safety net.
 pub(crate) fn cl_bootstrap_scoped() -> bool {
-    static GATE: OnceLock<bool> = OnceLock::new();
-    *GATE.get_or_init(|| {
-        std::env::var("CRATONVM_CL_BOOTSTRAP_SCOPED")
-            .map(|v| v != "0")
-            .unwrap_or(true)
-    })
+    crate::nbflags().cl_bootstrap_scoped
 }
 
 /// HIB-CV-24 (Manifestation B) gate. When ON (default), a user-defined
@@ -1051,12 +1046,7 @@ pub(crate) fn cl_bootstrap_scoped() -> bool {
 /// keeps its loader alive forever too, defeating this gate for any loader that
 /// ever had a class reflected on (`getClass()`, annotations, ...).
 pub fn loader_unload_enabled() -> bool {
-    static GATE: OnceLock<bool> = OnceLock::new();
-    *GATE.get_or_init(|| {
-        std::env::var("CRATONVM_LOADER_UNLOAD")
-            .map(|v| v != "0")
-            .unwrap_or(true)
-    })
+    crate::nbflags().loader_unload
 }
 
 /// `CRATONVM_LOADER_AWARE_RESOLUTION` gate (default ON). Gates the
@@ -1517,7 +1507,7 @@ pub(crate) fn find_loaded_class_for_loader(
     this: ObjectRef,
     internal_name: &str,
 ) -> Option<ObjectRef> {
-    let __obsreg_dbg = std::env::var_os("CRATONVM_DBG_OBSREG").is_some()
+    let __obsreg_dbg = crate::vmflags().loader.dbg_obsreg
         && (internal_name.contains("ObservationRegistry")
             || internal_name.contains("SecurityFilterAutoConfigurationEarlyInitializationTests")
             || internal_name.contains("PathRequestTests")
@@ -1874,8 +1864,8 @@ fn cl_load_class_base_delegation(
 ) -> MethodCallResult {
     let dotted = ctx.read_string(name_obj).unwrap_or_default();
     let internal = dotted.replace('.', "/");
-    let __obsreg_dbg = std::env::var_os("CRATONVM_DBG_OBSREG").is_some()
-        && internal.contains("ObservationRegistry");
+    let __obsreg_dbg =
+        crate::vmflags().loader.dbg_obsreg && internal.contains("ObservationRegistry");
     if __obsreg_dbg {
         let parent = classloader_parent(ctx, this);
         let this_cls = ctx.class_name_of_id(ctx.class_id_of_object(this));
@@ -3946,9 +3936,7 @@ fn cl_get_resource(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     } else if ctx.find_resource(resource_name).is_some() {
         format!("classpath:{name}")
     } else {
-        let dbg_all = std::env::var("CRATONVM_DBG_GETRESOURCES")
-            .map(|v| v != "0" && !v.is_empty())
-            .unwrap_or(false);
+        let dbg_all = crate::vmflags().loader.dbg_getresources;
         if dbg_all {
             eprintln!(
                 "[GRES-DBG] getResource({}) -> NULL (no urls, no bytes)",
@@ -3958,9 +3946,7 @@ fn cl_get_resource(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         return Ok(Some(Value::Object(None)));
     };
 
-    let dbg_all = std::env::var("CRATONVM_DBG_GETRESOURCES")
-        .map(|v| v != "0" && !v.is_empty())
-        .unwrap_or(false);
+    let dbg_all = crate::vmflags().loader.dbg_getresources;
     if dbg_all {
         eprintln!("[GRES-DBG] getResource({}) -> {}", resource_name, url_str);
     }
@@ -4436,9 +4422,7 @@ fn cl_get_resources_impl(
     // (resource, count, urls) triple. We also keep the legacy
     // spring-specific trace as a no-op fall-through condition because some
     // older debug runs rely on it being always-on.
-    let dbg_all = std::env::var("CRATONVM_DBG_GETRESOURCES")
-        .map(|v| v != "0" && !v.is_empty())
-        .unwrap_or(false);
+    let dbg_all = crate::vmflags().loader.dbg_getresources;
     if dbg_all {
         eprintln!(
             "[GRES-DBG] getResources({}) -> {} URLs",
@@ -4620,7 +4604,7 @@ fn expanded_manifest_urls(
         } else {
             Vec::new()
         };
-        if std::env::var_os("CRATONVM_DBG_UCLRES").is_some() {
+        if crate::nbflags().dbg_uclres {
             eprintln!(
                 "[UCLURLS-DBG] path={path:?} manifest_entries={}",
                 manifest_paths.len()
@@ -5952,7 +5936,7 @@ fn loader_local_resource_urls(
 ) -> Vec<String> {
     let paths = loader_constructor_url_paths(ctx, loader);
     if paths.is_empty() {
-        if std::env::var_os("CRATONVM_DBG_UCLRES").is_some() {
+        if crate::nbflags().dbg_uclres {
             eprintln!("[UCLRES-DBG] loader={loader:?} resource={resource_name} paths=[]");
         }
         return Vec::new();
@@ -5966,7 +5950,7 @@ fn loader_local_resource_urls(
     // `classloading/src/class_path.rs`) and expands to the module's full,
     // possibly 100s-of-jars dependency list.
     let urls = cached_class_path_for_paths(&paths).find_all_resource_urls(resource_name);
-    if std::env::var_os("CRATONVM_DBG_UCLRES").is_some() {
+    if crate::nbflags().dbg_uclres {
         eprintln!(
             "[UCLRES-DBG] loader={loader:?} resource={resource_name} paths={paths:?} urls={urls:?}"
         );

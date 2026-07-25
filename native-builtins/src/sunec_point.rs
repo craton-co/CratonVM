@@ -54,9 +54,7 @@ fn gate_enabled() -> bool {
     // by real SunEC `ECOperations.multiply`, which only runs once EC is routed
     // real — so it stays inert under the `CRATONVM_SYNTHETIC_EC=1` kill-switch.
     // The explicit `CRATONVM_NATIVE_EC_MULTIPLY` env still force-enables it.
-    *G.get_or_init(|| {
-        std::env::var_os("CRATONVM_NATIVE_EC_MULTIPLY").is_some() || crate::route_ec_to_real()
-    })
+    *G.get_or_init(|| crate::nbflags().native_ec_multiply || crate::route_ec_to_real())
 }
 
 fn obj(v: Option<Value>) -> Option<ObjectRef> {

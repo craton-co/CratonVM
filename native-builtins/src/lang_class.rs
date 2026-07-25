@@ -37,7 +37,7 @@ static DBG_BB: OnceLock<bool> = OnceLock::new();
 
 #[inline]
 pub(crate) fn dbg_bb_enabled() -> bool {
-    *DBG_BB.get_or_init(|| std::env::var("CRATONVM_DBG_BB").is_ok())
+    *DBG_BB.get_or_init(|| crate::nbflags().dbg_bb)
 }
 
 // ---------------------------------------------------------------------------
@@ -1394,7 +1394,7 @@ fn i18n_logger_locale_suffix(name: &str) -> bool {
 /// `CRATONVM_S111_DBG=1` to re-enable.
 fn s111_dbg_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var("CRATONVM_S111_DBG").is_ok())
+    *ENABLED.get_or_init(|| crate::nbflags().s111_dbg)
 }
 
 macro_rules! s111_dbg {
@@ -1599,7 +1599,7 @@ fn wf7_synthesise_entry_class_if_missing(
     // would then be invoked as the entry-point вЂ” short-circuiting any
     // real boot. The guard above ("if class already loaded, return None")
     // limits scope, but the gate-off is the safer default.
-    if std::env::var("CRATONVM_USE_WILDFLY_SYNTH_BYTECODE").as_deref() != Ok("1") {
+    if !crate::nbflags().use_wildfly_synth_bytecode {
         let _ = internal_name;
         return None;
     }
@@ -1800,7 +1800,7 @@ pub(crate) fn native_class_for_name(
     // The initialize flag belongs to the explicit-null-loader overload too.
     // Loading a bootstrap class with initialize=false must not run clinit.
     let bootstrap_initialize = matches!(args.get(1), Some(v) if v.as_int().unwrap_or(0) != 0);
-    if std::env::var_os("CRATONVM_FORNAME_TRACE").is_some() {
+    if crate::nbflags().forname_trace {
         eprintln!(
             "[FORNAME-TRACE] name={} args.len()={} args={:?} effective_loader_is_some={}",
             dotted_name,
@@ -2042,8 +2042,7 @@ pub(crate) fn native_class_for_name(
                         }
                     }
                 }
-                if std::env::var("CRATONVM_IAE_TRACE").is_ok() && dbg_is_entity_name(&internal_name)
-                {
+                if crate::nbflags().iae_trace_ok && dbg_is_entity_name(&internal_name) {
                     if let Value::Object(Some(mr)) = mirror {
                         if let Some(cid) = ctx.class_id_from_mirror(mr) {
                             let enh = dbg_class_enhanced(ctx, cid);
@@ -2216,7 +2215,7 @@ pub(crate) fn native_class_for_name(
                     .into(),
                 );
             }
-            if std::env::var("CRATONVM_IAE_TRACE").is_ok() && dbg_is_entity_name(&internal_name) {
+            if crate::nbflags().iae_trace_ok && dbg_is_entity_name(&internal_name) {
                 let enh = dbg_class_enhanced(ctx, class_id);
                 eprintln!(
                     "FORNAME-RET name={dotted_name} cid={} enhanced={enh} (global-fallback)",
@@ -2507,7 +2506,7 @@ pub(crate) fn native_class_is_instance(
     {
         return Ok(Some(Value::Int(1)));
     }
-    if std::env::var_os("CRATONVM_DBG_ISINSTANCE").is_some() {
+    if crate::nbflags().dbg_isinstance {
         let ifaces = ctx.class_interfaces(target_class_id);
         let iface_names: Vec<String> = ifaces
             .iter()
@@ -2792,7 +2791,7 @@ pub(crate) fn native_class_is_assignable_from(
         // underlying type-system gap.
         let this_name = mirror_class_name(ctx, this).unwrap_or_default();
         let other_name = mirror_class_name(ctx, other).unwrap_or_default();
-        if std::env::var_os("CRATONVM_DBG_OBSREG").is_some()
+        if crate::vmflags().loader.dbg_obsreg
             && (this_name.contains("ObservationRegistry")
                 || other_name.contains("ObservationRegistry"))
         {
@@ -3858,7 +3857,7 @@ pub(crate) fn coerce_arg_strict(
                             if !ctx.is_interface_class(expected_cid) {
                                 let arg_cid = ctx.class_id_of_object(obj);
                                 if !ctx.is_subclass(arg_cid, expected_cid) {
-                                    if std::env::var_os("CRATONVM_DBG_COERCE").is_some() {
+                                    if crate::nbflags().dbg_coerce {
                                         let arg_name =
                                             ctx.class_name_of_id(arg_cid).unwrap_or_default();
                                         let near_name = near
@@ -4689,7 +4688,7 @@ fn reject_array_field_receiver(
 }
 
 fn dbg_field_get_enabled() -> bool {
-    std::env::var("CRATONVM_DBG_FIELD_GET").is_ok()
+    crate::nbflags().dbg_field_get
 }
 
 fn dbg_field_get(
@@ -5577,7 +5576,7 @@ pub(crate) fn native_class_get_declared_field(
         }
     };
     let target_name = ctx.read_string(name_obj).unwrap_or_default();
-    if std::env::var_os("CRATONVM_DBG_FBCGLIB").is_some() && target_name.starts_with("CGLIB$") {
+    if crate::vmflags().loader.dbg_fbcglib && target_name.starts_with("CGLIB$") {
         eprintln!("[FBCGLIB-DBG] Class.getDeclaredField({target_name})");
     }
 
@@ -6550,7 +6549,7 @@ pub(crate) fn native_method_invoke(
             // degraded Method object so the producer can be identified
             // (observed: Gradle DefaultServiceRegistry configure-method
             // dispatch receiving a Method whose clazz slot reads null).
-            if std::env::var_os("CRATONVM_DBG_MINVOKE").is_some() {
+            if crate::nbflags().dbg_minvoke {
                 let name = match method_name_value(ctx, this) {
                     Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
                     _ => "<no name>".to_string(),
@@ -6813,7 +6812,7 @@ pub(crate) fn native_method_invoke(
                     // CRATONVM_DBG_INVOKE_COERCE=1 вЂ” dump the method, formal
                     // descriptors, actual arg runtime types, and innermost Java
                     // caller frames on a coercion mismatch. Env-gated.
-                    if std::env::var("CRATONVM_DBG_INVOKE_COERCE").as_deref() == Ok("1") {
+                    if crate::nbflags().dbg_invoke_coerce {
                         let arg_types: Vec<String> = raw_args
                             .iter()
                             .map(|v| match v {
@@ -6895,7 +6894,7 @@ pub(crate) fn native_method_invoke(
             .unwrap_or(false);
     let use_virtual_dispatch = !is_static && !is_private && !is_init && !crosses_package;
 
-    let iae_trace = std::env::var_os("CRATONVM_IAE_TRACE").is_some();
+    let iae_trace = crate::nbflags().iae_trace;
     if iae_trace {
         eprintln!("[Method.invoke] about to invoke: class={} method={} desc={} is_static={} use_virtual={}",
                   class_name, method_name, descriptor, is_static, use_virtual_dispatch);
@@ -6914,7 +6913,7 @@ pub(crate) fn native_method_invoke(
             }
         };
         let virtual_args: &[Value] = &invoke_args[1..];
-        if std::env::var_os("CRATONVM_BD_DEBUG").is_some() {
+        if crate::nbflags().bd_debug {
             eprintln!(
                 "[Method.invoke] virtual class={} method={} desc={} recv={:p}",
                 class_name,
@@ -6979,7 +6978,7 @@ pub(crate) fn native_method_invoke(
         }
     };
 
-    if std::env::var_os("CRATONVM_DIAG_METHOD_INVOKE_NULL").is_some() {
+    if crate::nbflags().diag_method_invoke_null {
         let void_ret = ret_desc == "V" || ret_desc.is_empty();
         if !void_ret {
             match &result {
@@ -7710,7 +7709,7 @@ pub(crate) fn native_class_get_declared_methods(
         };
 
         let methods = declared_methods_with_synthetic(ctx, class_id);
-        if std::env::var_os("CRATONVM_DBG_OBSREG").is_some() {
+        if crate::vmflags().loader.dbg_obsreg {
             let __cname = ctx.class_name_of_id(class_id).unwrap_or_default();
             if __cname.contains("SecurityFilterAutoConfigurationEarlyInitializationTests")
                 || __cname.contains("PathRequestTests")
@@ -8079,7 +8078,7 @@ fn wf_shim_synth_main_method(
     // intercepting reflective lookup even when the real bytecode had
     // already been loaded. Re-enable via `CRATONVM_USE_WILDFLY_REFLECT_SHIM=1`
     // for boot-test (exit-rc-only) diagnostics.
-    if std::env::var("CRATONVM_USE_WILDFLY_REFLECT_SHIM").as_deref() != Ok("1") {
+    if !crate::nbflags().use_wildfly_reflect_shim {
         let _ = (this, name, param_types_arr);
         return None;
     }
@@ -8786,7 +8785,7 @@ pub(crate) fn native_constructor_new_instance(
         }
         .into());
     }
-    if std::env::var("CRATONVM_IAE_TRACE").is_ok() && dbg_is_entity_name(&class_name) {
+    if crate::nbflags().iae_trace_ok && dbg_is_entity_name(&class_name) {
         let (cidv, enh) = match declaring_cid {
             Some(cid) => (cid.as_u32() as i64, dbg_class_enhanced(ctx, cid)),
             None => (-1, false),
@@ -9365,7 +9364,7 @@ pub(crate) fn native_class_get_field(
         }
     };
 
-    if std::env::var_os("CRATONVM_DBG_FBCGLIB").is_some() && target_name.starts_with("CGLIB$") {
+    if crate::vmflags().loader.dbg_fbcglib && target_name.starts_with("CGLIB$") {
         let cname = ctx.class_name_of_id(class_id);
         eprintln!(
             "[FBCGLIB-DBG] Class.getField({target_name}) on class_id={class_id:?} name={cname:?}"
@@ -10226,7 +10225,7 @@ fn cached_annotation_proxy_for_key(
     // deferred `TypeNotPresentException` for filtered types. `None` for built-in
     // loaders keeps the global resolution.
     let container_loader = crate::classloader::defining_loader_for(holder_class_id.as_u32());
-    if std::env::var("CRATONVM_IAE_TRACE").is_ok() {
+    if crate::nbflags().iae_trace_ok {
         let holder = ctx.class_name_of_id(holder_class_id).unwrap_or_default();
         eprintln!(
             "ANN-HOLDER cid={} holder={holder} ann={} container_loader={}",
@@ -10372,16 +10371,7 @@ pub fn gc_update_annotation_proxy_refs(pointer_map: &HashMap<usize, usize>) {
 /// `CRATONVM_SYNTHETIC_ANNOTATIONS=1` or `CRATONVM_REAL_ANNOTATIONS=0` to retain
 /// the old bare-`AnnotationProxy` representation for debugging.
 fn real_annotations_enabled() -> bool {
-    static E: OnceLock<bool> = OnceLock::new();
-    *E.get_or_init(|| {
-        if std::env::var_os("CRATONVM_SYNTHETIC_ANNOTATIONS").is_some() {
-            return false;
-        }
-        !matches!(
-            std::env::var("CRATONVM_REAL_ANNOTATIONS").ok().as_deref(),
-            Some("0") | Some("false") | Some("FALSE") | Some("off") | Some("OFF")
-        )
-    })
+    !crate::nbflags().synthetic_annotations && crate::nbflags().real_annotations
 }
 
 /// Wrap a synthetic `AnnotationProxy` data object (`handler`) in a real
@@ -10420,7 +10410,7 @@ fn wrap_annotation_in_real_proxy(
         // even when the proxy STRICT mode is on.
         _ => return None,
     };
-    if std::env::var_os("CRATONVM_DBG_ANNPROXY_WRAP").is_some() {
+    if crate::nbflags().dbg_annproxy_wrap {
         let ann_name = ctx.class_name_of_id(ann_cid).unwrap_or_default();
         eprintln!(
             "[DBG_WRAP] ann_cid={} ann_name={ann_name} loader_namespace={loader_namespace} proxy_cid={}",
@@ -11074,11 +11064,11 @@ fn create_annotation_proxy(
             child_roots.push(mirror);
             proxy = ctx.read_native_pin(proxy_pin, proxy);
             ctx.set_field(proxy, ANN_PROXY_TYPE_MIRROR, Value::Object(Some(mirror)));
-        } else if std::env::var("CRATONVM_IAE_TRACE").is_ok() {
+        } else if crate::nbflags().iae_trace_ok {
             eprintln!("ANN-PROXY-NULL-MIRROR: annotation={} type_descriptor={} class_name={class_name} вЂ” type mirror NOT set (class load failed)",
                 ann.type_descriptor, ann.type_descriptor);
         }
-    } else if std::env::var("CRATONVM_IAE_TRACE").is_ok() {
+    } else if crate::nbflags().iae_trace_ok {
         eprintln!("ANN-PROXY-NULL-MIRROR: type_descriptor={} вЂ” annotation_desc_to_class_name returned None",
             ann.type_descriptor);
     }
@@ -11175,7 +11165,7 @@ fn create_annotation_proxy(
                 container_class_id,
                 container_loader,
             );
-        if std::env::var("CRATONVM_IAE_TRACE2").is_ok() {
+        if crate::nbflags().iae_trace2 {
             let desc = match &java_val {
                 Value::Object(Some(o)) => {
                     let cid = ctx.class_id_of_object(*o);
@@ -11389,7 +11379,7 @@ pub(crate) fn annotation_element_to_java_typed(
             // `container_loader` is present, resolve the enum type through it
             // first via `loadClass`, so the SAME loader's copy backs both the
             // default value and the bytecode's own reference to the constant.
-            let iae_trace = std::env::var("CRATONVM_IAE_TRACE").is_ok();
+            let iae_trace = crate::nbflags().iae_trace_ok;
             let via_loader = container_loader.and_then(|loader| {
                 match resolve_annotation_class_via_loader(ctx, loader, class_name) {
                     Ok(mirror) => ctx.class_id_from_mirror(mirror),
@@ -11452,7 +11442,7 @@ pub(crate) fn annotation_element_to_java_typed(
             // (common for annotation defaults that reference sibling classes
             // like picocli's NoOpModelTransformer), load it on demand. A null
             // return here causes downstream NullPointerExceptions (C29).
-            let iae_trace_cls = std::env::var("CRATONVM_IAE_TRACE").is_ok();
+            let iae_trace_cls = crate::nbflags().iae_trace_ok;
             if let Some(class_name) = annotation_desc_to_class_name(desc) {
                 // Classloader-isolation: when the declaring class was loaded by a
                 // user-defined loader, resolve the Class member THROUGH that loader
@@ -12025,7 +12015,7 @@ pub(crate) fn native_class_get_declared_annotations(
         }
     };
     let annotations = ctx.class_annotations(class_id);
-    if std::env::var("CRATONVM_ANN_TRACE").is_ok() {
+    if crate::nbflags().ann_trace {
         let cn = ctx.class_name_of_id(class_id).unwrap_or_default();
         if cn.contains("SpringBootApplication")
             || cn.contains("EnableAutoConfiguration")
@@ -12678,7 +12668,7 @@ pub(crate) fn native_method_get_annotations(
         }
     };
     let annotations = ctx.method_annotations(class_id, &method_name, &method_desc);
-    if std::env::var("CRATONVM_ANN_TRACE").is_ok() {
+    if crate::nbflags().ann_trace {
         let cn = ctx.class_name_of_id(class_id).unwrap_or_default();
         if cn.contains("SpringBootApplication")
             || cn.contains("EnableAutoConfiguration")
@@ -12764,7 +12754,7 @@ pub(crate) fn native_method_get_annotation(
     };
     let target_desc = format!("L{};", ann_class_name);
     let annotations = ctx.method_annotations(class_id, &method_name, &method_desc);
-    if std::env::var("CRATONVM_ANN_TRACE").is_ok() {
+    if crate::nbflags().ann_trace {
         let cn = ctx.class_name_of_id(class_id).unwrap_or_default();
         if cn.contains("SpringBootApplication")
             || cn.ends_with("/Import")
@@ -13242,9 +13232,7 @@ pub(crate) fn native_class_get_generic_interfaces(
             return Ok(Some(Value::Object(Some(arr))));
         }
     };
-    if std::env::var("CRATONVM_DBG_LAMBDA_GENERIC").is_ok()
-        && this_name.contains("ApplicationContextInitializer")
-    {
+    if crate::nbflags().dbg_lambda_generic && this_name.contains("ApplicationContextInitializer") {
         eprintln!(
             "[LAMBDA-GENERIC] getGenericInterfaces ENTRY this_name={this_name} class_id={class_id:?}"
         );
@@ -13291,7 +13279,7 @@ pub(crate) fn native_class_get_generic_interfaces(
                 }
                 arr = ctx.read_native_pin(arr_pin, arr);
                 ctx.unpin_native_roots(class_mirror_pin);
-                if std::env::var("CRATONVM_DBG_LAMBDA_GENERIC").is_ok()
+                if crate::nbflags().dbg_lambda_generic
                     && this_name.contains("ApplicationContextInitializer")
                 {
                     eprintln!(
@@ -13326,7 +13314,7 @@ pub(crate) fn native_class_get_generic_interfaces(
             // require one and throw on a bare raw `Class`. Falls back to the
             // long-standing raw-mirror behavior for non-generic SAM interfaces
             // or whenever the type variable(s) can't be matched.
-            let dbg_lg = std::env::var("CRATONVM_DBG_LAMBDA_GENERIC").is_ok();
+            let dbg_lg = crate::nbflags().dbg_lambda_generic;
             if let Some((sam_name, sam_desc, inst_desc)) =
                 ctx.lambda_call_site_descriptors(class_id)
             {
@@ -13915,7 +13903,7 @@ pub(crate) fn native_class_get_component_type(
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => {
-            if std::env::var("CRATONVM_DBG_COMPONENT_TYPE").is_ok() {
+            if crate::nbflags().dbg_component_type {
                 eprintln!("[CT-DBG] getComponentType receiver=null");
             }
             return Ok(Some(Value::Object(None)));
@@ -15494,7 +15482,7 @@ pub(crate) fn native_class_as_subclass(
         let name = mirror_class_name(ctx, this)
             .unwrap_or_default()
             .replace('/', ".");
-        if std::env::var_os("CRATONVM_DBG_CCE_BT").is_some() {
+        if crate::nbflags().dbg_cce_bt {
             let this_cid_map = ctx.class_id_from_mirror(this);
             let this_field0 = ctx.get_field(this, 0);
             let this_field1 = ctx.get_field(this, 1);
