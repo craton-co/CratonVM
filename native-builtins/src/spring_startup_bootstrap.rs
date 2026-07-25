@@ -522,7 +522,7 @@ fn get_or_create_bean_factory(ctx: &mut dyn NativeContext, receiver: ObjectRef) 
     // actually runs, vs. the bytecode constructor already having set the field.
     // Ruled OUT as Bug B's cause: all 159 calls observed in that investigation
     // showed fast_path=true, so the recovery path never even ran.
-    if std::env::var_os("CRATONVM_DBG_GOCBF").is_some() {
+    if crate::nbflags().dbg_gocbf {
         let rcid = ctx.class_id_of_object(receiver);
         let rname = ctx.class_name_of_id(rcid).unwrap_or_default();
         eprintln!(
@@ -2965,7 +2965,7 @@ fn try_build_replace_override(
     for c in &candidates {
         *name_counts.entry(c.name.clone()).or_insert(0) += 1;
     }
-    let dbg_replovr = std::env::var_os("CRATONVM_DBG_REPLOVR").is_some();
+    let dbg_replovr = crate::nbflags().dbg_replovr;
     let mut specs: Vec<crate::cglib_enhancer::ReplaceMethodSpec> = Vec::new();
     for c in &candidates {
         let cfgs = &replacers[&c.name];
@@ -3482,7 +3482,7 @@ fn resolve_bean_class_field(ctx: &mut dyn NativeContext, recv: ObjectRef) -> Bea
     // `ensure_class_initialized` below (both can trigger class-init that
     // allocates/collects); pin it for the whole function.
     let recv_pin = ctx.pin_native_root(recv);
-    let dbg = std::env::var_os("CRATONVM_DBG_RESOLVE_SHIM").is_some();
+    let dbg = crate::nbflags().dbg_resolve_shim;
     // Primary: the `beanClass` Object field (a Class mirror or a String name).
     let name: Option<String> = match ctx.get_field_by_name(recv, "beanClass") {
         Value::Object(Some(o)) => {

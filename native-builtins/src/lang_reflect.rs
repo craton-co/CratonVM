@@ -58,8 +58,7 @@ static DBG_METHOD_INVOKE_BOX: OnceLock<bool> = OnceLock::new();
 
 #[inline]
 fn dbg_method_invoke_box_enabled() -> bool {
-    *DBG_METHOD_INVOKE_BOX
-        .get_or_init(|| std::env::var_os("CRATONVM_DBG_METHOD_INVOKE_BOX").is_some())
+    *DBG_METHOD_INVOKE_BOX.get_or_init(|| crate::nbflags().dbg_method_invoke_box)
 }
 
 // ---------------------------------------------------------------------------

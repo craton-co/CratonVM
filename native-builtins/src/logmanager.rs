@@ -4213,7 +4213,7 @@ pub fn register_logmanager_natives(registry: &mut NativeMethodRegistry) {
     // Log4j2Logger, Log4jLogger), so `WFLY*` boot messages still reach stderr.
     // Set CRATONVM_JBOSS_LOGGER_BASE_EMIT=1 to restore the old blanket
     // base-class emit if a logger outside that set ever needs it.
-    if std::env::var("CRATONVM_JBOSS_LOGGER_BASE_EMIT").as_deref() == Ok("1") {
+    if crate::nbflags().jboss_logger_base_emit {
         let jlog = "org/jboss/logging/Logger";
         // info family
         // The `(String loggerFqcn, Object message, Throwable)` forms get the

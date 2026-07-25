@@ -222,7 +222,10 @@ def aggregate(sites, nonrust):
             'cached': sum(1 for s in consumer if s['cached']),
             'uncached': sum(1 for s in consumer if not s['cached']),
             'nb_reads': len(nb_reads),
-            'nb_only': bool(reads) and len(nb_reads) == len(reads),
+            'nb_only': bool(consumer) and all(
+                s['crate'] == DEFERRED_CRATE for s in consumer),
+            'nb_direct': sum(1 for s in own
+                             if s['crate'] == DEFERRED_CRATE and s['direct']),
             'crates': ','.join(sorted({s['crate'] for s in reads})),
             'setters': sum(1 for s in own if s['kind'] in ('set', 'unset')),
             'nonrust': ','.join('%s:%d' % kv for kv in

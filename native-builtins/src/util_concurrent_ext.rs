@@ -10,10 +10,7 @@
 use super::*;
 
 pub(crate) fn register_queue_bridge_natives(registry: &mut NativeMethodRegistry) {
-    let bridge_enabled = match std::env::var("CRATONVM_NETTY_QUEUE_BRIDGE") {
-        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
-        Err(_) => true,
-    };
+    let bridge_enabled = crate::nbflags().netty_queue_bridge;
     if !bridge_enabled {
         return;
     }
@@ -74,7 +71,7 @@ pub(crate) fn register_queue_bridge_natives(registry: &mut NativeMethodRegistry)
 pub fn aqs_trace_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("CRATONVM_DBG_AQS_TRACE").is_some())
+    *ON.get_or_init(|| crate::nbflags().dbg_aqs_trace)
 }
 
 pub fn aqs_trace_line(line: &str) {
@@ -519,7 +516,7 @@ fn native_atomic_ref_init_value(ctx: &mut dyn NativeContext, args: &[Value]) -> 
 fn native_atomic_ref_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = unsafe_obj(args, 0).unwrap();
     let val = ctx.get_field_volatile(this, 0);
-    if loader_trace_enabled() {
+    if crate::nbflags().dbg_loader_trace {
         if let Value::Object(Some(o)) = val {
             let val_cid = ctx.class_id_of_object(o);
             let val_cn = ctx.class_name_of_id(val_cid).unwrap_or_default();
@@ -550,7 +547,7 @@ fn native_atomic_ref_cas(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     let this = unsafe_obj(args, 0).unwrap();
     let expected = args.get(1).copied().unwrap_or(Value::Object(None));
     let new_val = args.get(2).copied().unwrap_or(Value::Object(None));
-    if loader_trace_enabled() {
+    if crate::nbflags().dbg_loader_trace {
         if let Value::Object(Some(o)) = new_val {
             let val_cid = ctx.class_id_of_object(o);
             let val_cn = ctx.class_name_of_id(val_cid).unwrap_or_default();
@@ -842,8 +839,7 @@ pub fn register_concurrent_natives(registry: &mut NativeMethodRegistry) {
     // ByteSizeValueTests suite reaches HotSpot parity (42/42, clean exit).
     // Opt OUT with CRATONVM_SYNTHETIC_AQS=1 (legacy synthetic lock/condition).
     // CountDownLatch/CyclicBarrier synthetic natives below are unaffected.
-    let real_aqs = std::env::var_os("CRATONVM_SYNTHETIC_AQS").is_none()
-        || std::env::var_os("CRATONVM_REAL_AQS").is_some();
+    let real_aqs = !crate::nbflags().synthetic_aqs || crate::nbflags().real_aqs;
     if !real_aqs {
         // --- ReentrantLock ---
         let rl = "java/util/concurrent/locks/ReentrantLock";
@@ -5252,8 +5248,7 @@ pub(crate) fn register_rwlock_natives(registry: &mut NativeMethodRegistry) {
     // Keep the complete RWL family on real bytecode in this mode; the JIT
     // skip list already protects the AQS family.  StampedLock remains an
     // independent native implementation and must stay registered.
-    let real_aqs = std::env::var_os("CRATONVM_SYNTHETIC_AQS").is_none()
-        || std::env::var_os("CRATONVM_REAL_AQS").is_some();
+    let real_aqs = !crate::nbflags().synthetic_aqs || crate::nbflags().real_aqs;
     if real_aqs {
         register_stamped_lock_natives(registry);
         return;
@@ -7485,9 +7480,7 @@ mod concurrency_tests {
         // This test deliberately leaves the process environment untouched:
         // production's default is real AQS. Synthetic-AQS test runs exercise
         // the legacy registration surface instead.
-        if std::env::var_os("CRATONVM_SYNTHETIC_AQS").is_some()
-            && std::env::var_os("CRATONVM_REAL_AQS").is_none()
-        {
+        if crate::nbflags().synthetic_aqs && !crate::nbflags().real_aqs {
             return;
         }
 
@@ -8986,13 +8979,4 @@ mod concurrency_tests {
         );
         assert!(ok.is_ok());
     }
-}
-
-/// PERF (2026-07-25): `CRATONVM_DBG_LOADER_TRACE` was probed with an uncached
-/// `std::env::var_os` at every call site. `getenv` takes the process environ
-/// lock and linearly scans environ; an LD_PRELOAD tally over the CratonBench
-/// `hashmap` phase counted 60M probes of this one flag. Read once, then reuse.
-fn loader_trace_enabled() -> bool {
-    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *CACHED.get_or_init(|| std::env::var_os("CRATONVM_DBG_LOADER_TRACE").is_some())
 }

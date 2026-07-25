@@ -960,7 +960,7 @@ pub(crate) fn new13_do_create_socket(
     let tls_id = new13_connect_and_handshake(ctx, host, port, extra_root_ders, java_tm_key)?;
     let sock = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocket", NEW13_SSL_SOCK_FIELDS);
     let sock = new13_finish_socket(ctx, sock, host, port, tls_id);
-    if std::env::var_os("CRATONVM_DBG_TLS_SOCK").is_some() {
+    if crate::nbflags().dbg_tls_sock {
         eprintln!(
             "[dbg-tls-sock] thread={:?} new13_do_create_socket built sock={:?} tls_id={}",
             std::thread::current().id(),
@@ -1643,7 +1643,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             // hasn't run yet.
             ensure_layered_handshake_started(ctx, this)?;
             let session = ctx.get_field(this, 4);
-            if std::env::var_os("CRATONVM_DBG_TLS_SOCK").is_some() {
+            if crate::nbflags().dbg_tls_sock {
                 eprintln!(
                     "[dbg-tls-sock] thread={:?} getSession sock={:?} -> {:?}",
                     std::thread::current().id(),
@@ -1803,7 +1803,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let alpn = ssl_sock_negotiated_alpn(ctx, this).unwrap_or_default();
-            if std::env::var_os("CRATONVM_DBG_TLS_SOCK").is_some() {
+            if crate::nbflags().dbg_tls_sock {
                 eprintln!(
                     "[dbg-tls-sock] thread={:?} getApplicationProtocol sock={:?} -> {:?}",
                     std::thread::current().id(),
@@ -1821,7 +1821,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let alpn = ssl_sock_negotiated_alpn(ctx, this).unwrap_or_default();
-            if std::env::var_os("CRATONVM_DBG_TLS_SOCK").is_some() {
+            if crate::nbflags().dbg_tls_sock {
                 eprintln!(
                     "[dbg-tls-sock] thread={:?} getHandshakeApplicationProtocol sock={:?} -> {:?}",
                     std::thread::current().id(),
@@ -1849,7 +1849,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         "()Ljavax/net/ssl/SSLParameters;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            if std::env::var_os("CRATONVM_DBG_TLS_SOCK").is_some() {
+            if crate::nbflags().dbg_tls_sock {
                 eprintln!(
                     "[dbg-tls-sock] thread={:?} getSSLParameters ENTER sock={:?}",
                     std::thread::current().id(),
@@ -1888,7 +1888,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         "setSSLParameters",
         "(Ljavax/net/ssl/SSLParameters;)V",
         |ctx, args| {
-            if std::env::var_os("CRATONVM_DBG_TLS_SOCK").is_some() {
+            if crate::nbflags().dbg_tls_sock {
                 eprintln!(
                     "[dbg-tls-sock] thread={:?} setSSLParameters sock={:?}",
                     std::thread::current().id(),
@@ -2087,7 +2087,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             // if one hasn't run yet — this socket may still be pending (see
             // `createSocket(Socket wrapped, ...)`'s doc comment).
             let fd_id = ensure_layered_handshake_started(ctx, this)?;
-            if std::env::var_os("CRATONVM_DBG_TLS_SOCK").is_some() {
+            if crate::nbflags().dbg_tls_sock {
                 eprintln!(
                     "[dbg-tls-sock] thread={:?} getInputStream sock={:?} tls_id={}",
                     std::thread::current().id(),
@@ -2111,7 +2111,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let fd_id = ensure_layered_handshake_started(ctx, this)?;
-            if std::env::var_os("CRATONVM_DBG_TLS_SOCK").is_some() {
+            if crate::nbflags().dbg_tls_sock {
                 eprintln!(
                     "[dbg-tls-sock] thread={:?} getOutputStream sock={:?} tls_id={}",
                     std::thread::current().id(),
@@ -2128,7 +2128,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
     r.register(ssl_sock, "close", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let tls_id = new13_resolve_tls_id(ctx, this);
-        if std::env::var_os("CRATONVM_DBG_TLS_SOCK").is_some() {
+        if crate::nbflags().dbg_tls_sock {
             eprintln!(
                 "[dbg-tls-sock] thread={:?} JAVA_CALLED Socket.close() tls_id={}",
                 std::thread::current().id(),
@@ -2162,7 +2162,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             Value::Int(c) => c != 0,
             _ => crate::net_phase_e::sock_is_closed_for_upcall(ctx, this),
         };
-        if std::env::var_os("CRATONVM_DBG_TLS_SOCK").is_some() {
+        if crate::nbflags().dbg_tls_sock {
             eprintln!(
                 "[dbg-tls-sock] thread={:?} isClosed sock={:?} -> {}",
                 std::thread::current().id(),
@@ -2178,7 +2178,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             Value::Int(c) => c != 0,
             _ => crate::net_phase_e::sock_is_closed_for_upcall(ctx, this),
         };
-        if std::env::var_os("CRATONVM_DBG_TLS_SOCK").is_some() {
+        if crate::nbflags().dbg_tls_sock {
             eprintln!(
                 "[dbg-tls-sock] thread={:?} isConnected sock={:?} -> {}",
                 std::thread::current().id(),
@@ -2384,7 +2384,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             .as_int()
             .filter(|id| *id >= 0)
             .unwrap_or_else(|| crate::net_phase_e::sock_stream_id_for_upcall(ctx, this));
-        if std::env::var_os("CRATONVM_DBG_TLS_SOCK").is_some() {
+        if crate::nbflags().dbg_tls_sock {
             eprintln!(
                 "[dbg-tls-sock] thread={:?} SSLSocketOutputStream.write(int) tls_id={}",
                 std::thread::current().id(),
@@ -2411,7 +2411,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             .filter(|id| *id >= 0)
             .unwrap_or_else(|| crate::net_phase_e::sock_stream_id_for_upcall(ctx, this));
         let len_arg = args.get(3).and_then(|v| v.as_int()).unwrap_or(-1);
-        if std::env::var_os("CRATONVM_DBG_TLS_SOCK").is_some() {
+        if crate::nbflags().dbg_tls_sock {
             eprintln!(
                 "[dbg-tls-sock] thread={:?} SSLSocketOutputStream.write([BII) tls_id={} len={}",
                 std::thread::current().id(),
@@ -2790,7 +2790,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
         // rustls-backed native) scopes trust to them.
         if let Some(Value::Object(Some(ks))) = args.get(1) {
             let ks_id = crate::tls::read_keystore_registry_id(ctx, *ks);
-            if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+            if crate::nbflags().dbg_tls_auth_ok {
                 eprintln!(
                     "[dbg-tls-auth] tmf(phases_late).init(KeyStore) this_ih={} ks_id={}",
                     ctx.identity_hash_code(this),
@@ -2854,7 +2854,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                 _ => None,
             };
             let tm_id = crate::x509_manager::build_and_register_tm_state_from_mfp(ctx, mfp);
-            if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+            if crate::nbflags().dbg_tls_auth_ok {
                 eprintln!(
                     "[dbg-tls-auth] tmf(phases_late).init(ManagerFactoryParameters) this_ih={} tm_id={}",
                     ctx.identity_hash_code(this),
@@ -2938,7 +2938,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             } else {
                 0
             };
-            if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+            if crate::nbflags().dbg_tls_auth_ok {
                 eprintln!(
                     "[dbg-tls-auth] tmf(phases_late).getTrustManagers this_ih={} looked_up_tm_id={}",
                     ih, tm_id
@@ -3074,7 +3074,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
                 .get(2)
                 .map(|value| crate::keystore::read_password(ctx, value))
                 .unwrap_or_default();
-            if std::env::var_os("CRATONVM_DBG_TLS_AUTH").is_some() {
+            if crate::nbflags().dbg_tls_auth {
                 let this_ih = obj_arg(args, 0)
                     .map(|t| ctx.identity_hash_code(t))
                     .unwrap_or(0);

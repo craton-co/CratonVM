@@ -258,14 +258,14 @@ pub(crate) fn register_p58_nio_channels(r: &mut NativeMethodRegistry) {
             let this = obj_arg(args, 0)?;
             let addr_obj = args.get(1).copied().unwrap_or(Value::Object(None));
             let addr_str = p98_extract_socket_addr(ctx, addr_obj);
-            if std::env::var_os("CRATONVM_DBG_NIO_BIND").is_some() {
+            if crate::nbflags().dbg_nio_bind {
                 eprintln!("[NIO_BIND] ssc.bind 1-arg addr='{}'", addr_str);
             }
             match ctx.fd_table().open_tcp_listener(&addr_str) {
                 Ok(fd) => {
                     ctx.set_field(this, 1, Value::Int(1));
                     ctx.set_field(this, 2, Value::Int(fd as i32));
-                    if std::env::var_os("CRATONVM_DBG_NIO_BIND").is_some() {
+                    if crate::nbflags().dbg_nio_bind {
                         eprintln!("[NIO_BIND] ssc.bind ok fd={fd}");
                     }
                     // If a wrapper ServerSocket has been cached, mirror the actual local port
@@ -283,7 +283,7 @@ pub(crate) fn register_p58_nio_channels(r: &mut NativeMethodRegistry) {
                     Ok(Some(Value::Object(Some(this))))
                 }
                 Err(e) => {
-                    if std::env::var_os("CRATONVM_DBG_NIO_BIND").is_some() {
+                    if crate::nbflags().dbg_nio_bind {
                         eprintln!("[NIO_BIND] ssc.bind FAILED addr='{}' err={}", addr_str, e);
                     }
                     Err(RuntimeError::IOException {
@@ -307,7 +307,7 @@ pub(crate) fn register_p58_nio_channels(r: &mut NativeMethodRegistry) {
             let this = obj_arg(args, 0)?;
             let addr_obj = args.get(1).copied().unwrap_or(Value::Object(None));
             let addr_str = p98_extract_socket_addr(ctx, addr_obj);
-            if std::env::var_os("CRATONVM_DBG_NIO_BIND").is_some() {
+            if crate::nbflags().dbg_nio_bind {
                 let backlog = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
                 eprintln!(
                     "[NIO_BIND] ssc.bind 2-arg addr='{}' backlog={}",
@@ -318,7 +318,7 @@ pub(crate) fn register_p58_nio_channels(r: &mut NativeMethodRegistry) {
                 Ok(fd) => {
                     ctx.set_field(this, 1, Value::Int(1));
                     ctx.set_field(this, 2, Value::Int(fd as i32));
-                    if std::env::var_os("CRATONVM_DBG_NIO_BIND").is_some() {
+                    if crate::nbflags().dbg_nio_bind {
                         eprintln!("[NIO_BIND] ssc.bind 2-arg ok fd={fd}");
                     }
                     if let Value::Object(Some(s)) = ctx.get_field(this, 3) {
@@ -334,7 +334,7 @@ pub(crate) fn register_p58_nio_channels(r: &mut NativeMethodRegistry) {
                     Ok(Some(Value::Object(Some(this))))
                 }
                 Err(e) => {
-                    if std::env::var_os("CRATONVM_DBG_NIO_BIND").is_some() {
+                    if crate::nbflags().dbg_nio_bind {
                         eprintln!(
                             "[NIO_BIND] ssc.bind 2-arg FAILED addr='{}' err={}",
                             addr_str, e
@@ -490,7 +490,7 @@ pub(crate) fn register_p58_nio_channels(r: &mut NativeMethodRegistry) {
         "open",
         "()Ljava/nio/channels/Selector;",
         |ctx, _args| {
-            if std::env::var_os("CRATONVM_DBG_SEL").is_some() {
+            if crate::nbflags().dbg_sel {
                 eprintln!("[SEL/p98] Selector.open()");
             }
             let sel = alloc_concurrent_synthetic(ctx, "java/nio/channels/Selector", 4);
@@ -4034,7 +4034,7 @@ pub(crate) fn register_p72_server_socket(r: &mut NativeMethodRegistry) {
     // (with phases_early::register_phase53_socket_stubs and
     // net_phase_e::register_re1_socket/register_re2_server_socket). See
     // `reference_server_socket_gap`.
-    if std::env::var_os("CRATONVM_REAL_NET_SOCKETS").is_some() {
+    if crate::vmflags().io.real_net_sockets {
         return;
     }
     let __prev_cat = r.current_category();

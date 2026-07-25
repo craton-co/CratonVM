@@ -40,11 +40,51 @@ for r in rows:
 cnt = collections.Counter(r['klass'] for r in rows)
 nbonly = [r for r in rows if r['nb_only'] == '1']
 
+_TODAY = __import__('datetime').date.today().isoformat()
+try:
+    _HEAD = __import__('subprocess').run(
+        ['git', '-C', ROOT, 'rev-parse', '--short', 'HEAD'],
+        capture_output=True, text=True, check=True).stdout.strip()
+except Exception:
+    _HEAD = 'unknown'
+
+# Curated: why each surviving direct read site in `native-builtins` stays put.
+_HOLDOUT = {
+    'CRATONVM_JBOSS_MP_ROOT':
+        '`find_mp_argument()` is exercised by unit tests that `set_var` / '
+        '`remove_var` it in-process and assert the read changes '
+        '(`jboss_module_loader.rs:3880`, `:3897`, `lib.rs:2383`..`:2478`)',
+    'CRATONVM_SYNTHETIC_QUARKUS_ARC':
+        '`quarkus_arc.rs:1330`/`:1345` flips it in-process and asserts '
+        '`synthetic_arc_opted_in()` follows',
+    'CRATONVM_MAVEN_REPO_LOCAL':
+        '`jboss_module_loader.rs:4034` sets it in-process, then calls '
+        '`resolve_module()` and asserts the new repo is used',
+}
+
+
+def _native_flag_fields(root):
+    """(flag, field, parser) for every field on `NativeFlags`, read back from
+    `types/src/flags.rs` so the table cannot drift from the code."""
+    import re as _re
+    text = open(os.path.join(root, 'types', 'src', 'flags.rs'),
+                encoding='utf-8').read()
+    body = text.split('impl NativeFlags {', 1)[1].split('\n}\n', 1)[0]
+    out = []
+    for m in _re.finditer(
+            r'(\w+):\s*(\w+)\(\s*src,\s*"(CRATONVM_[A-Z0-9_]+)"\s*,?\s*\)',
+            body):
+        out.append((m.group(3), m.group(1), m.group(2)))
+    if not out:
+        raise SystemExit('could not read NativeFlags fields back from flags.rs')
+    return sorted(out)
+
+
 L = []
 w = L.append
 w('# CratonVM `CRATONVM_*` environment-flag census')
 w('')
-w('*Generated 2026-07-25 from `origin/dev` @ `197ed836b` by a mechanical scan of every')
+w(f'*Generated {_TODAY} from `dev` @ `{_HEAD}` by a mechanical scan of every')
 w('`.rs` file in the workspace plus every `.md` / `.sh` / `.java` / `.toml` under the')
 w('repo root. Regenerate with the scripts recorded at the bottom of this file.*')
 w('')
@@ -179,21 +219,51 @@ for r in sorted([r for r in rows if r['klass'] == 'c-test'], key=lambda x: x['na
     w(f'| `{r["name"]}` | {r["reads"]} | {r["crates"]} | {r["sample"]} |')
 w('')
 
-w('## 7. Scope boundary: `native-builtins/`')
+w('## 7. `native-builtins/` — migrated (T3.5b)')
 w('')
 nb_reads = sum(len([s for s in bysite[r['name']] if s['crate'] == 'native-builtins'
                     and s['kind'] not in ('set', 'unset', 'option_env')]) for r in rows)
-w(f'`native-builtins/` holds **{nb_reads}** read sites across **{len(set(s["name"] for s in sites if s["crate"] == "native-builtins"))}** flag names, of which')
-w(f'**{len(nbonly)}** appear *only* there. None of them are touched by this branch: that crate is')
-w('concurrently being split from a single 86 000-line `lib.rs` into per-domain modules,')
-w('and editing it now would guarantee a destructive conflict. Migrating those sites is')
-w('a deliberate follow-up once the split lands. They are catalogued here so the')
-w('follow-up has the same evidence base.')
+nb_direct = sum(int(r['nb_direct']) for r in rows)
+w('Before T3.5b this crate held **359** direct read sites across **156** flag names,')
+w('**127** of which were read only there. It was deliberately deferred while it was')
+w('being split from a single 86 000-line `lib.rs` into per-domain modules; T3.5b')
+w('migrated it once the split landed. It now names a flag on')
+w(f'**{nb_reads}** lines in total.')
 w('')
-w('| Flag | Reads in native-builtins | Class |')
+w(f'**{nb_direct}** direct `std::env::var` / `var_os` sites remain, down from 359. Every')
+w('one of them is a flag whose value is mutated **in-process** with `set_var` /')
+w('`remove_var` and then re-read — a latched typed config cannot reproduce that, so')
+w('migrating them would be a silent behaviour change rather than plumbing:')
+w('')
+w('| Flag | Direct sites left | Why it stays on `std::env` |')
 w('| --- | ---: | --- |')
-for r in sorted(nbonly, key=lambda x: x['name']):
-    w(f'| `{r["name"]}` | {r["reads"]} | {r["klass"]} |')
+for r in sorted(rows, key=lambda x: x['name']):
+    if int(r['nb_direct']):
+        w(f'| `{r["name"]}` | {r["nb_direct"]} | {_HOLDOUT.get(r["name"], "in-process `set_var`")} |')
+w('')
+w('The other 348 sites now read `cratonvm_types::flags()`: the flags read only by')
+w('this crate live on `VmFlags::natives` (`NativeFlags`), and the eight it shares')
+w('with `gc` / `classloading` / `native-io` reuse those crates\' existing fields')
+w('rather than being duplicated. Four parsers had to be added for truth tables no')
+w('existing parser matched — see §10, where the count went from seven to eleven.')
+w('')
+w('The migration also absorbed the three local `OnceLock<bool>` helpers added by')
+w('`c258662e4` (`h2trace_enabled`, and two byte-identical copies of')
+w('`loader_trace_enabled`). They existed because `native-builtins` cannot reach')
+w('`vm`, where `env_cache` lives — but it *can* reach `types`, so the typed config')
+w('subsumes them. The call sites keep the flag read as the LEFT operand of their')
+w('`&&`, which is what that fix required.')
+w('')
+w('Once a crate is migrated the scan can no longer tell which flags *belong* to')
+w('it — the call sites no longer name them. So the catalogue below is read back')
+w('out of `NativeFlags::from_source`, which is the new home of record. It is the')
+w('same evidence the pre-migration §7 table carried, with the parser each field')
+w('was built from in place of the read count.')
+w('')
+w(f'| Flag | `NativeFlags` field | Parser |')
+w('| --- | --- | --- |')
+for flag, field, parser in _native_flag_fields(ROOT):
+    w(f'| `{flag}` | `{field}` | `{parser}` |')
 w('')
 
 w('## 8. Caching status and the per-call readers')
@@ -205,7 +275,7 @@ w('the typed config is worth doing on performance grounds alone:')
 w('')
 w('| Site | Frequency | Note |')
 w('| --- | --- | --- |')
-w('| `native-builtins/src/lang_system.rs:752` `CRATONVM_INHERIT_THREAD_CCL` | once per `Thread.start0` | out of scope this branch |')
+w('| `native-builtins/src/lang_system.rs:752` `CRATONVM_INHERIT_THREAD_CCL` | once per `Thread.start0` | **migrated** in T3.5b — now `flags().natives.inherit_thread_ccl` |')
 w('| `jit/src/x64.rs:2231` `CRATONVM_JIT_GETFIELD_HELPER` | once per compiled `getfield` **call site** | deliberately uncached — see the comment at `x64.rs:2225`, which argues caching would make the off-switch racy against whichever thread first triggers a getfield compile. Preserved as-is. |')
 w('| `gc/src/gen_heap.rs:3702` `CRATONVM_NO_GC_PROMOTION_GUARD` | per promotion-OOM check | per young-GC, not per object |')
 w('')
@@ -235,12 +305,14 @@ w('* `types/src/lock_order.rs` — the precedent for putting a cross-crate conce
 w('  `cratonvm-types`, the crate every other crate already depends on.')
 w('')
 
-w('## 10. Finding: seven disagreeing boolean truth tables')
+w('## 10. Finding: eleven disagreeing boolean truth tables')
 w('')
 w('There is no single answer to "what does `CRATONVM_FOO=false` mean". The tree')
-w('contains at least these seven, all of them live. The first four were found by')
-w('the census scan; the last three surfaced while migrating `classloading` and')
-w('`native-io`, which is a reminder that the count is a lower bound.')
+w('contains at least these eleven, all of them live. The first four were found by')
+w('the census scan; three more surfaced while migrating `classloading` and')
+w('`native-io`; the last four surfaced while migrating `native-builtins`. The')
+w('count has gone up at every single migration, which is the finding: it is a')
+w('lower bound, not a total.')
 w('')
 w('| Parser | `unset` | `""` | `"0"` | `"false"` | `"off"` | `"no"` | `"NO"` | else |')
 w('| --- | --- | --- | --- | --- | --- | --- | --- | --- |')
@@ -251,6 +323,17 @@ w('| `TieredParams::tiered_enabled` (`tiered.rs:223`) | **true** | **true** | fa
 w('| `lock_order::compute_enforced` (`lock_order.rs:242`) | false | false | false | false | false | false | false | **only `1`/`true`/`yes`/`on`** |')
 w('| `class_manager::loader_aware_resolution` (`:141`) | **true** | false | false | true | true | true | true | true |')
 w('| `class_path::dbg_getresources` + `nio_selector::sel_dbg_enabled` | false | false | false | *differs*: `dbg_getresources` true, `sel_dbg_enabled` **false** | true | true | true | true |')
+w('| `service_loader::diag_serviceloader` (`one_true_yes_exact`) | false | false | false | false | **false** | false | false | **only exact `1`/`true`/`yes`** |')
+w('| `lang_system::inherit_thread_ccl` (`on_unless_zero_or_false`) | **true** | **true** | false | false | **true** | **true** | **true** | true |')
+w('| `jboss_msc::msc_real_start` (`on_unless_off_word_cased`) | **true** | **true** | false | false | false | **true** | **true** | true |')
+w('| `reflect_annotations::real_proxy_enabled` (`truthy_word_default_true`) | **true** | **true** | false | false | false | false | false | true |')
+w('')
+w('The four `native-builtins` additions are not near-duplicates of the earlier')
+w('seven. `on_unless_zero_or_false` and `truthy_word_default_true` disagree with')
+w('each other on `off` and `no`; `on_unless_off_word_cased` accepts `off`/`OFF`')
+w('but not `Off`, while `on_unless_off_word` accepts `off` but not `OFF`; and')
+w('`one_true_yes_exact` rejects `on`, which `affirmative_word` accepts, and')
+w('rejects `" 1 "`, which `affirmative_word` trims and accepts.')
 w('')
 w('So `CRATONVM_X=0` *enables* the feature at roughly 600 sites and *disables* it')
 w('at six others, and `CRATONVM_X=false` splits two flags that look like siblings.')
@@ -258,13 +341,15 @@ w('This is a genuine footgun and the single strongest argument for one typed')
 w('config: the parse happens once, in one place, and each field records which')
 w('table it uses.')
 w('')
-w('**This branch does not unify the truth tables.** Each migrated flag keeps its')
-w('own parse function byte-for-byte, because changing what `X=0` means for 600')
-w('flags is a behaviour change, not a plumbing change. All seven now live side by')
-w('side in `cratonvm_types::flags::parse`, each documented with the call site it')
-w('was lifted from, and a unit test asserts that they still disagree — so the')
-w('divergence cannot be tidied away by accident and can instead be retired')
-w('deliberately, flag by flag, with benchmarks.')
+w('**No branch has unified the truth tables.** Each migrated flag keeps its own')
+w('parse function byte-for-byte, because changing what `X=0` means for 600 flags')
+w('is a behaviour change, not a plumbing change. All eleven now live side by side')
+w('in `cratonvm_types::flags::parse`, each documented with the call site it was')
+w('lifted from, and two unit tests')
+w('(`boolean_parsers_disagree_exactly_as_documented`,')
+w('`native_builtins_parsers_add_four_more_truth_tables`) assert that they still')
+w('disagree — so the divergence cannot be tidied away by accident and can instead')
+w('be retired deliberately, flag by flag, with benchmarks.')
 w('')
 # ── migration status ────────────────────────────────────────────────────────
 w('## 11. Migration status')
@@ -289,10 +374,17 @@ for crate in sorted(set(list(crate_reads) + sorted(MIGRATED))):
     if crate in MIGRATED:
         state = '**migrated**' if n == 0 else '**INCOMPLETE**'
     elif crate == 'native-builtins':
-        state = 'deferred — see §7'
+        state = ('**migrated** — %d holdouts, all in-process `set_var` targets; see §7'
+                 % n) if n <= 11 else '**INCOMPLETE**'
     else:
         state = 'not started'
     w(f'| `{crate}` | {n} | {state} |')
+w('')
+w('`native-builtins` is listed as migrated with a non-zero count on purpose. The')
+w('eleven remaining sites read a variable that something in the same process')
+w('rewrites with `set_var` before re-reading it; a config latched once at startup')
+w('cannot express that. Retiring them means retiring the in-process mutation, not')
+w('plumbing the read differently.')
 w('')
 
 w('## 12. Reproducing this census')

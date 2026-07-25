@@ -29,7 +29,7 @@ pub(crate) fn register_phase57_natives(registry: &mut NativeMethodRegistry) {
     // shadows the real ctor via native-override priority. Opt back into synthetic
     // with CRATONVM_SYNTHETIC_RAF=1. (SEGV/Cleaner crashes that once gated this are
     // fixed: docs/internal/app-jvm-bugs/real-raf-segv-root-cause.md.)
-    if std::env::var("CRATONVM_SYNTHETIC_RAF").as_deref() == Ok("1") {
+    if crate::vmflags().io.synthetic_raf_forced {
         register_phase57_random_access_file(registry);
     }
     register_phase57_file(registry);
@@ -445,7 +445,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                 break;
             }
             let os_path = p57_to_os_path(&path_str);
-            if std::env::var_os("CRATONVM_DBG_SBLOAD").is_some() {
+            if crate::nbflags().dbg_sbload {
                 eprintln!("[DBG_SBLOAD] Path.of(URI) -> {:?}", os_path);
             }
             let result = p57_alloc_path(ctx, &os_path);
@@ -1235,7 +1235,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             // docs/known-issues/h2-suite-bugs/bug-h2-files-setposixfilepermissions-unsupported.md.
             let is_posix = !cfg!(windows) && view_name.ends_with("PosixFileAttributeView");
             let supported = is_dos || is_basic || is_posix;
-            if std::env::var("CRATONVM_DBG_FSP").is_ok() {
+            if crate::nbflags().dbg_fsp {
                 eprintln!(
                     "[FSP-DBG] getFileAttributeView requested view={view_name} -> {}",
                     if is_dos { "dos-view" } else if is_posix { "posix-view" } else if is_basic { "basic-view" } else { "null" }
@@ -3797,14 +3797,14 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         let class_id = match ctx.ensure_class_initialized(style_cls) {
             Ok(id) => id,
             Err(_) => {
-                if std::env::var("CRATONVM_DBG_PICOCLI_STYLE").is_ok() {
+                if crate::nbflags().dbg_picocli_style {
                     eprintln!("[picocli-style] ensure_class_initialized failed");
                 }
                 return cratonvm_types::Value::Object(None);
             }
         };
         let name = ctx.read_string(raw_name).unwrap_or_default().to_lowercase();
-        let dbg = std::env::var("CRATONVM_DBG_PICOCLI_STYLE").is_ok();
+        let dbg = crate::nbflags().dbg_picocli_style;
         // Round 93: Style constants are STATIC enum fields — must use
         // `static_field_index_by_name`, not `resolve_field_index` (which
         // only walks INSTANCE fields). Round 92's fallback was reaching
@@ -5641,7 +5641,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     // `bw_delegate_out` BufferedWriter natives below. Opt back into the broken
     // synthetic with `CRATONVM_SYNTHETIC_BUFFERED_WRITER=1`. See
     // docs/known-issues/filewriter-newbufferedwriter-synthetic-data-loss.md.
-    if std::env::var("CRATONVM_SYNTHETIC_BUFFERED_WRITER").as_deref() == Ok("1") {
+    if crate::nbflags().synthetic_buffered_writer {
         r.register(
             files,
             "newBufferedWriter",
@@ -8703,7 +8703,7 @@ pub(crate) fn register_phase57_random_access_file(r: &mut NativeMethodRegistry) 
                 }
                 _ => String::new(),
             };
-            if std::env::var_os("CRATONVM_DBG_RAF_INIT").is_some() {
+            if crate::nbflags().dbg_raf_init {
                 eprintln!("[RAF_INIT] file ctor path='{}'", path);
             }
             let mode_str = match args.get(2) {
@@ -9274,7 +9274,7 @@ pub(crate) fn register_phase57_random_access_file(r: &mut NativeMethodRegistry) 
         // would NPE the bytecode caller. The `<init>` natives now ensure
         // `this.fd` is populated for real-JDK receivers.
         if let Some(existing) = raf_fd_object(ctx, this) {
-            if std::env::var_os("CRATONVM_DBG_RAF_GETFD").is_some() {
+            if crate::nbflags().dbg_raf_getfd {
                 eprintln!("[RAF_GETFD] existing fd_obj returned");
             }
             return Ok(Some(Value::Object(Some(existing))));
@@ -9305,7 +9305,7 @@ pub(crate) fn register_phase57_random_access_file(r: &mut NativeMethodRegistry) 
             };
             ctx.set_field_by_name(fd, "handle", id_long);
         }
-        if std::env::var_os("CRATONVM_DBG_RAF_GETFD").is_some() {
+        if crate::nbflags().dbg_raf_getfd {
             eprintln!("[RAF_GETFD] synthetic fd_obj allocated, fd_id={:?}", fd_id);
         }
         Ok(Some(Value::Object(Some(fd))))
@@ -9812,7 +9812,7 @@ pub(crate) fn file_canonicalize_path_uncached(path: &str) -> String {
         //
         // Escape hatch: set `CRATONVM_CANON_OPENFILE=1` to restore the old, symlink-
         // resolving, file-opening behavior if an app genuinely needs realpath semantics.
-        if std::env::var_os("CRATONVM_CANON_OPENFILE").is_some() {
+        if crate::nbflags().canon_openfile {
             if let Ok(c) = std::fs::canonicalize(path) {
                 return strip_unc(&c.to_string_lossy());
             }
@@ -10274,7 +10274,7 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let path = file_read_path(ctx, this);
         let exists = std::path::Path::new(&path).exists();
-        if std::env::var_os("CRATONVM_DBG_SBLOAD").is_some() {
+        if crate::nbflags().dbg_sbload {
             eprintln!("[DBG_SBLOAD] File.exists() path={:?} -> {}", path, exists);
         }
         Ok(Some(Value::Int(if exists { 1 } else { 0 })))
@@ -10293,7 +10293,7 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
         let result = std::fs::metadata(&path)
             .map(|m| m.is_dir())
             .unwrap_or(false);
-        if std::env::var_os("CRATONVM_DBG_SBLOAD").is_some() {
+        if crate::nbflags().dbg_sbload {
             eprintln!(
                 "[DBG_SBLOAD] File.isDirectory() path={:?} -> {}",
                 path, result
@@ -12744,7 +12744,7 @@ pub(crate) fn p98_walk_file_tree(
     let skip_file_callbacks = visitor_class_name
         .as_deref()
         .is_some_and(|name| name == "com/sun/tools/javac/file/JavacFileManager$ArchiveContainer$1");
-    if std::env::var_os("CRATONVM_DBG_VISITFILE").is_some() {
+    if crate::nbflags().dbg_visitfile {
         eprintln!(
             "[p98-walkfiletree] visitor_class_id={:?} visitor_class_name={:?} skip_file_callbacks={}",
             visitor_class_id, visitor_class_name, skip_file_callbacks

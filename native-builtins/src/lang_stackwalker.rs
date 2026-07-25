@@ -322,7 +322,7 @@ pub(crate) fn native_call_stack_walk(
     };
 
     let trace = ctx.capture_stack_trace(0);
-    if std::env::var_os("CRATONVM_DEBUG_STACKWALK").is_some() {
+    if crate::nbflags().debug_stackwalk {
         eprintln!(
             "[SW-DBG] callStackWalk capture len={} skip={} batch={}",
             trace.len(),
@@ -338,7 +338,7 @@ pub(crate) fn native_call_stack_walk(
     let capacity = if batch == 0 { slack } else { slack.min(batch) };
 
     let ordered = Rc::new(ordered_stack_walk_frames(&trace));
-    if std::env::var_os("CRATONVM_DEBUG_STACKWALK").is_some() {
+    if crate::nbflags().debug_stackwalk {
         eprintln!("[SW-DBG] ordered len={}", ordered.len());
         for (i, e) in ordered.iter().enumerate() {
             eprintln!("  ord[{}] {}.{}", i, e.class_name, e.method_name);
@@ -380,7 +380,7 @@ pub(crate) fn native_call_stack_walk(
     // the SpringApplication banner never fires.
     let end_index = (start_index + written) as i32;
     let _ = mode_long;
-    if std::env::var_os("CRATONVM_DEBUG_STACKWALK").is_some() {
+    if crate::nbflags().debug_stackwalk {
         eprintln!(
             "[SW-DBG] callStackWalk consumed={} written={} end_index={}",
             consumed, written, end_index
@@ -479,7 +479,7 @@ pub(crate) fn native_fetch_stack_frames(
         None => return Ok(Some(Value::Int(0))),
     };
 
-    if std::env::var_os("CRATONVM_DEBUG_STACKWALK").is_some() {
+    if crate::nbflags().debug_stackwalk {
         eprintln!(
             "[SW-DBG] fetchStackFrames parsed anchor={} start_index={}",
             anchor, start_index
@@ -502,7 +502,7 @@ pub(crate) fn native_fetch_stack_frames(
             Rc::new(ordered_stack_walk_frames(&trace))
         }
     };
-    if std::env::var_os("CRATONVM_DEBUG_STACKWALK").is_some() {
+    if crate::nbflags().debug_stackwalk {
         eprintln!(
             "[SW-DBG] fetchStackFrames anchor={} start_index={} ordered_len={} from_cache={}",
             cursor,
@@ -768,7 +768,7 @@ pub fn register_lang_stackwalker(registry: &mut NativeMethodRegistry) {
                     return Ok(Some(v));
                 }
             }
-            if std::env::var_os("CRATONVM_SFI_NULL_TRACE").is_some() {
+            if crate::nbflags().sfi_null_trace {
                 eprintln!("[SFI-NULL-TRACE getDeclaringClass] both internal={internal:?} lookup and classOrMemberName fallback failed");
             }
             Ok(Some(Value::Object(None)))
@@ -937,9 +937,7 @@ pub fn register_lang_stackwalker(registry: &mut NativeMethodRegistry) {
         if let Value::Object(Some(s)) = ctx.get_field(this, SF_DECL_INTERNAL) {
             let internal = ctx.read_string(s).unwrap_or_default();
             if !internal.is_empty() {
-                if std::env::var_os("CRATONVM_DEBUG_SFI").is_some()
-                    && internal.contains("InsuranceProjectApplication")
-                {
+                if crate::nbflags().debug_sfi && internal.contains("InsuranceProjectApplication") {
                     eprintln!(
                         "[SFI-DBG] declaringClass internal={internal:?} class_id={:?}",
                         ctx.class_id_by_name(&internal)
@@ -959,7 +957,7 @@ pub fn register_lang_stackwalker(registry: &mut NativeMethodRegistry) {
                 return Ok(Some(v));
             }
         }
-        if std::env::var_os("CRATONVM_SFI_NULL_TRACE").is_some() {
+        if crate::nbflags().sfi_null_trace {
             let internal = match ctx.get_field(this, SF_DECL_INTERNAL) {
                 Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
                 _ => String::from("<no SF_DECL_INTERNAL>"),

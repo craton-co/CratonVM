@@ -244,7 +244,7 @@ pub(crate) fn write_throwable_detail_message(
 /// the mirror clobbered the message field whenever both helpers ran
 /// (e.g. via `<init>(String, Throwable)`).
 pub(crate) fn write_throwable_cause(ctx: &mut dyn NativeContext, this: ObjectRef, cause: Value) {
-    if std::env::var_os("CRATONVM_DBG_CAUSE").is_some() {
+    if crate::nbflags().dbg_cause {
         let this_cls = ctx
             .class_name_of_id(ctx.class_id_of_object(this))
             .unwrap_or_default();
@@ -278,7 +278,7 @@ pub(crate) fn write_throwable_cause(ctx: &mut dyn NativeContext, this: ObjectRef
     // instance will end up being the one that's actually printed/observed.
     if let Value::Object(Some(c)) = cause {
         if c == this {
-            if let Ok(watch_cls) = std::env::var("CRATONVM_DBG_WATCH_CAUSE_SELF") {
+            if let Some(watch_cls) = crate::nbflags().dbg_watch_cause_self.as_deref() {
                 let this_cls = ctx
                     .class_name_of_id(ctx.class_id_of_object(this))
                     .unwrap_or_default();
@@ -327,7 +327,7 @@ pub(crate) fn write_throwable_cause(ctx: &mut dyn NativeContext, this: ObjectRef
 /// Error base classes — which those lists omit — kept a working trace).
 pub(crate) fn capture_throwable_trace(ctx: &mut dyn NativeContext, this: ObjectRef) {
     let hash = ctx.identity_hash_code(this);
-    if std::env::var_os("CRATONVM_DBG_STTRACE").is_some() {
+    if crate::nbflags().dbg_sttrace {
         eprintln!("STTRACE_DBG_CTOR_CAP this={:?} hash={hash}", this.as_ptr());
     }
     let trace = ctx.capture_throwable_stack_trace(this);
@@ -608,7 +608,7 @@ pub(crate) fn native_init_stack_trace_elements(
         .unwrap_or_default();
 
     let cap = ctx.array_length(elements);
-    if std::env::var_os("CRATONVM_DBG_STTRACE").is_some() {
+    if crate::nbflags().dbg_sttrace {
         eprintln!(
             "[STTRACE init] cap={cap} trace_data.len={}",
             trace_data.len()
@@ -1036,7 +1036,7 @@ fn throwable_cause(ctx: &mut dyn NativeContext, t: ObjectRef) -> Option<ObjectRe
         if c == t {
             return None;
         }
-        if std::env::var_os("CRATONVM_DBG_CAUSE").is_some() {
+        if crate::nbflags().dbg_cause {
             let t_cls = ctx
                 .class_name_of_id(ctx.class_id_of_object(t))
                 .unwrap_or_default();
@@ -1432,7 +1432,7 @@ pub(crate) fn native_throwable_get_stack_trace_array(
     // must be returned verbatim instead of re-deriving from the backtrace.
     if let Value::Object(Some(set_arr)) = ctx.get_field_by_name(this, "stackTrace") {
         if ctx.array_length(set_arr) > 0 {
-            if std::env::var_os("CRATONVM_DBG_STTRACE").is_some() {
+            if crate::nbflags().dbg_sttrace {
                 let n = ctx.array_length(set_arr);
                 for i in 0..n {
                     if let Value::Object(Some(e)) = ctx.get_array_element(set_arr, i) {
@@ -1447,7 +1447,7 @@ pub(crate) fn native_throwable_get_stack_trace_array(
         }
     }
     let hash = ctx.identity_hash_code(this);
-    if std::env::var_os("CRATONVM_DBG_STTRACE").is_some() {
+    if crate::nbflags().dbg_sttrace {
         eprintln!("STTRACE_DBG_GET_ARRAY this={:?} hash={hash}", this.as_ptr());
     }
     // Clone trace data to avoid borrow conflict with ctx. We keep the
@@ -1495,7 +1495,7 @@ pub(crate) fn native_throwable_get_stack_trace_array(
         );
         ctx.set_array_element(arr, i, Value::Object(Some(ste)));
     }
-    if std::env::var_os("CRATONVM_DBG_STTRACE").is_some() {
+    if crate::nbflags().dbg_sttrace {
         let n = ctx.array_length(arr);
         for i in 0..n {
             if let Value::Object(Some(e)) = ctx.get_array_element(arr, i) {

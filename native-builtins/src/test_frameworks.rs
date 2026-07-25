@@ -3611,7 +3611,7 @@ pub(crate) fn native_surefire_forkedbooter_acknowledged_exit(
         );
     }
 
-    if std::env::var("CRATONVM_SOFT_EXIT").as_deref() == Ok("1") {
+    if crate::nbflags().soft_exit {
         eprintln!("[SUREFIRE-ACK-EXIT] soft-returning due to CRATONVM_SOFT_EXIT=1");
         return Ok(None);
     }
@@ -3637,7 +3637,7 @@ pub(crate) fn native_surefire_forkedbooter_exit1(
         is_null(sc),
         is_null(ts),
     );
-    if std::env::var("CRATONVM_SOFT_EXIT").as_deref() == Ok("1") {
+    if crate::nbflags().soft_exit {
         eprintln!("[SUREFIRE-EXIT] soft-returning due to CRATONVM_SOFT_EXIT=1");
         return Ok(None);
     }
@@ -3662,7 +3662,7 @@ pub(crate) fn native_surefire_forkedbooter_exit_code(
         is_null(ev),
         is_null(cr),
     );
-    if std::env::var("CRATONVM_SOFT_EXIT").as_deref() == Ok("1") {
+    if crate::nbflags().soft_exit {
         eprintln!("[SUREFIRE-EXIT] soft-returning due to CRATONVM_SOFT_EXIT=1");
         return Ok(None);
     }
@@ -4347,7 +4347,7 @@ fn assertj_arrays_equal(
     let right_type = ctx.heap_element_type_of(right);
     let left_is_reference_array = left_type == cratonvm_types::ArrayElementType::Reference;
     let right_is_reference_array = right_type == cratonvm_types::ArrayElementType::Reference;
-    if std::env::var_os("CRATONVM_DBG_ASSERTJ_ARR").is_some() {
+    if crate::nbflags().dbg_assertj_arr {
         eprintln!(
             "[ASSERTJ-ARR-DBG] left_type={left_type:?} right_type={right_type:?} left_ref={left_is_reference_array}"
         );
@@ -4359,7 +4359,7 @@ fn assertj_arrays_equal(
     if left_is_reference_array != right_is_reference_array
         || (!left_is_reference_array && left_type != right_type)
     {
-        if std::env::var_os("CRATONVM_DBG_ASSERTJ_ARR").is_some() {
+        if crate::nbflags().dbg_assertj_arr {
             eprintln!("[ASSERTJ-ARR-DBG] early-false: mismatched array element type");
         }
         return Ok(false);
@@ -4387,7 +4387,7 @@ fn assertj_arrays_equal(
                         assertj_objects_equal(ctx, left, right)?
                     }
                     _ => {
-                        if std::env::var_os("CRATONVM_DBG_ASSERTJ_ARR").is_some() {
+                        if crate::nbflags().dbg_assertj_arr {
                             eprintln!(
                                 "[ASSERTJ-ARR-DBG] index={index} non-object element value(s): left={left_value:?} right={right_value:?}"
                             );
@@ -4398,7 +4398,7 @@ fn assertj_arrays_equal(
             } else {
                 assertj_array_values_equal(left_value, right_value)
             };
-            if std::env::var_os("CRATONVM_DBG_ASSERTJ_ARR").is_some() {
+            if crate::nbflags().dbg_assertj_arr {
                 eprintln!("[ASSERTJ-ARR-DBG] index={index} equal={equal}");
             }
             if !equal {
@@ -4451,7 +4451,7 @@ fn assertj_objects_equal(
 
     let left_name = ctx.class_name_of_id(ctx.class_id_of_object(left));
     let right_name = ctx.class_name_of_id(ctx.class_id_of_object(right));
-    if std::env::var_os("CRATONVM_DBG_ASSERTJ_ARR").is_some() {
+    if crate::nbflags().dbg_assertj_arr {
         eprintln!("[ASSERTJ-OBJ-DBG] left_name={left_name:?} right_name={right_name:?}");
     }
     let left_name = left_name.as_deref().unwrap_or_default();
@@ -4578,7 +4578,7 @@ pub(crate) fn native_assertj_standard_comparison_are_equal(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    if std::env::var_os("CRATONVM_DBG_ASSERTJ_ARR").is_some() {
+    if crate::nbflags().dbg_assertj_arr {
         eprintln!("[ASSERTJ-ENTRY-DBG] native_assertj_standard_comparison_are_equal args.len()={} args={args:?}", args.len());
         for (i, a) in args.iter().enumerate() {
             if let Value::Object(Some(o)) = a {
@@ -4600,7 +4600,7 @@ pub(crate) fn native_assertj_standard_comparison_are_equal(
         _ => None,
     };
     let out = assertj_objects_equal(ctx, left, right)?;
-    if std::env::var_os("CRATONVM_DBG_ASSERTJ_ARR").is_some() {
+    if crate::nbflags().dbg_assertj_arr {
         eprintln!("[ASSERTJ-ENTRY-DBG] result={out}");
     }
     Ok(Some(Value::Int(i32::from(out))))

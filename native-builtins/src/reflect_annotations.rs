@@ -3262,14 +3262,7 @@ fn native_proxy_dispatch_invoke(ctx: &mut dyn NativeContext, args: &[Value]) -> 
 /// so the flip can be reverted per-process without a rebuild while the
 /// reflection suites soak; it is NOT a `#[cfg]` feature.
 pub fn real_proxy_enabled() -> bool {
-    match std::env::var("CRATONVM_REAL_PROXY") {
-        Ok(v) => {
-            let v = v.trim().to_ascii_lowercase();
-            !(v == "0" || v == "false" || v == "off" || v == "no")
-        }
-        // Unset (the default): the real generated-classfile path is canonical.
-        Err(_) => true,
-    }
+    crate::nbflags().real_proxy
 }
 
 /// proxy-real-classfile increment 3 (design §3) — STRICT mode. Default **OFF**.
@@ -3284,10 +3277,7 @@ pub fn real_proxy_enabled() -> bool {
 /// (or `true`/`on`/`yes`) to opt in. Step 5 (deleting the shim outright) is the
 /// follow-up once this soaks clean.
 pub fn real_proxy_strict() -> bool {
-    matches!(std::env::var("CRATONVM_REAL_PROXY_STRICT"), Ok(v) if {
-        let v = v.trim().to_ascii_lowercase();
-        v == "1" || v == "true" || v == "on" || v == "yes"
-    })
+    crate::nbflags().real_proxy_strict
 }
 
 /// proxy-real-classfile real-super gate — generate `$ProxyN` classes that extend
@@ -3304,14 +3294,7 @@ pub fn real_proxy_strict() -> bool {
 /// `crate::runtime::env_cache::real_proxy_super()` (same env var) — the VM reads
 /// it to recognise real-`Proxy`-super proxies in the dispatch chain walk.
 pub fn real_proxy_super() -> bool {
-    match std::env::var("CRATONVM_REAL_PROXY_SUPER") {
-        Ok(v) => {
-            let v = v.trim().to_ascii_lowercase();
-            !(v == "0" || v == "false" || v == "off" || v == "no")
-        }
-        // Unset (the default): real `java.lang.reflect.Proxy` super.
-        Err(_) => true,
-    }
+    crate::nbflags().real_proxy_super
 }
 
 /// The internal name of the super class generated `$ProxyN` proxies extend,
@@ -3365,7 +3348,7 @@ mod proxy_strict_gate_tests {
     #[test]
     fn real_proxy_super_defaults_on() {
         // Only meaningful when the env var is not set in the test environment.
-        if std::env::var_os("CRATONVM_REAL_PROXY_SUPER").is_none() {
+        if !crate::nbflags().real_proxy_super_set {
             assert!(super::real_proxy_super());
             assert_eq!(super::proxy_super_class_name(), "java/lang/reflect/Proxy");
         }
@@ -3392,7 +3375,7 @@ pub(crate) fn define_or_get_proxy_class(
     loader_id: u32,
     iface_class_ids: &[cratonvm_types::ClassId],
 ) -> ProxyClassOutcome {
-    let dbg = std::env::var("CRATONVM_DBG_PROXY").is_ok();
+    let dbg = crate::nbflags().dbg_proxy;
 
     // Gate-off path: explicit opt-out keeps the synthetic shim canonical.
     if !real_proxy_enabled() {
