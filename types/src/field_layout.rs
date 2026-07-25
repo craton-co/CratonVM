@@ -173,8 +173,20 @@ pub fn set_compact_ref_fields_enabled(enabled: bool) {
 /// Dense `class_id -> layout` registry. `class_id`s are assigned densely from 0,
 /// so a `Vec` indexed by id is compact. Only populated when the flag is on.
 static CLASS_LAYOUTS: RwLock<Vec<Option<Arc<CompactLayout>>>> = RwLock::new(Vec::new());
-static CLASS_LAYOUT_VERSIONS: LazyLock<RwLock<HashMap<(u32, u32), Arc<CompactLayout>>>> =
-    LazyLock::new(|| RwLock::new(HashMap::new()));
+/// Version registry: `(class_id, field_count) -> layout`.
+///
+/// `parking_lot::RwLock<FxHashMap<..>>`, not `std::sync::RwLock<HashMap<..>>`.
+/// The std pairing cost real time: `class_layout_for_fields` is called once per
+/// scanned object by the Cheney collector's scan loops (`gc/src/gc.rs`), and
+/// `std::collections::HashMap`'s default hasher is SipHash — a cryptographic
+/// hash over an 8-byte `(u32, u32)` key. A `perf record` of
+/// `BinTreesClassic d=18` attributed **37.8%** of all samples to
+/// `class_layout_for_fields` and a further **4.8%** to
+/// `<sip::Hasher as Hasher>::write`. FxHash over two words is a couple of
+/// multiplies, and `parking_lot`'s reader acquire is cheaper than std's.
+static CLASS_LAYOUT_VERSIONS: LazyLock<
+    parking_lot::RwLock<rustc_hash::FxHashMap<(u32, u32), Arc<CompactLayout>>>,
+> = LazyLock::new(|| parking_lot::RwLock::new(rustc_hash::FxHashMap::default()));
 
 /// Maximum slot count for the dense layout registry.
 ///
@@ -250,7 +262,7 @@ pub fn register_class_layout(class_id: u32, layout: Arc<CompactLayout>) {
     let field_count = u32::try_from(layout.field_count())
         .expect("compact field count exceeds u32");
     {
-        let mut versions = CLASS_LAYOUT_VERSIONS.write().unwrap();
+        let mut versions = CLASS_LAYOUT_VERSIONS.write();
         versions.insert((class_id, field_count), Arc::clone(&layout));
     }
     let mut v = CLASS_LAYOUTS.write().unwrap();
@@ -283,7 +295,6 @@ pub fn unregister_class_layout(class_id: u32) {
     };
     CLASS_LAYOUT_VERSIONS
         .write()
-        .unwrap()
         .retain(|(id, _), _| *id != class_id);
     let mut layouts = CLASS_LAYOUTS.write().unwrap();
     if let Some(slot) = layouts.get_mut(index) {
@@ -307,16 +318,87 @@ pub fn class_layout(class_id: u32) -> Option<Arc<CompactLayout>> {
 /// Resolve the immutable layout version used by an object with this exact
 /// hierarchy-wide field count. Retaining versions makes object size and oop
 /// maps stable across append-only synthetic-class upgrades.
+///
+/// PERF: this is called **once per scanned object** by the Cheney collector's
+/// copy/scan loops (three sites in `gc/src/gc.rs`, plus the G1, concurrent-mark
+/// and ZGC equivalents), and the naked registry lookup underneath — an
+/// `RwLock` reader acquire, a hash probe, and an `Arc` clone/drop pair of
+/// atomics — dominated allocation-heavy workloads. A `perf record` of
+/// `BinTreesClassic d=18` (whose young gen is entirely `Node` objects, so the
+/// collector re-resolves the same one or two layouts for every object it
+/// scans, every collection) attributed **37.8%** of all samples to this
+/// function and another **4.8%** to SipHash inside it.
+///
+/// This is a recurrence of a fix already applied elsewhere: `compact_field_slot`
+/// below, and `compact_oop_scan` in `gc/src/heap.rs`, each grew their own
+/// generation-validated thread-local cache for exactly this reason — but they
+/// are per-caller band-aids around one uncached primitive, and `gc.rs`'s scan
+/// loops call the primitive directly and so were never covered. Caching *here*
+/// covers every call site at once, including the ones added next.
+///
+/// [`LAYOUT_GENERATION`] was introduced for precisely this purpose (see its
+/// doc: "lets hot-path consumers (the GC scan) cache a lookup and cheaply
+/// validate it with a single atomic load instead of re-taking the registry
+/// `RwLock` per scanned object"). A hit costs one relaxed atomic load, a small
+/// linear scan of an 8-entry array, and an `Arc` clone; a registration or
+/// redefine bumps the generation and invalidates every thread's cache at once.
+///
+/// Negative results are cached too (`None`): callers that do not pre-filter
+/// with [`is_compact_object`] would otherwise re-probe the registry for every
+/// legacy object, which is the same cost this exists to avoid.
 #[inline]
-pub fn class_layout_for_fields(
-    class_id: u32,
-    field_count: u32,
-) -> Option<Arc<CompactLayout>> {
-    CLASS_LAYOUT_VERSIONS
-        .read()
-        .unwrap()
-        .get(&(class_id, field_count))
-        .cloned()
+pub fn class_layout_for_fields(class_id: u32, field_count: u32) -> Option<Arc<CompactLayout>> {
+    /// Small per-thread working set. The GC scans long runs of same-class
+    /// objects, so a handful of entries captures essentially all traffic; 8
+    /// matches the sibling cache in `compact_field_storage`.
+    const VERSION_CACHE_LEN: usize = 8;
+
+    struct VersionCache {
+        /// `(class_id, field_count, generation, resolved)`. `resolved` is
+        /// `None` for a cached negative lookup.
+        entries: [Option<(u32, u32, u64, Option<Arc<CompactLayout>>)>; VERSION_CACHE_LEN],
+        next: usize,
+    }
+    impl VersionCache {
+        const fn new() -> Self {
+            Self {
+                entries: [None, None, None, None, None, None, None, None],
+                next: 0,
+            }
+        }
+    }
+    thread_local! {
+        static VERSION_CACHE: std::cell::RefCell<VersionCache> =
+            const { std::cell::RefCell::new(VersionCache::new()) };
+    }
+
+    let generation = layout_generation();
+    VERSION_CACHE.with(|cell| {
+        // `try_borrow_mut` rather than `borrow_mut`: this function is reachable
+        // from GC scan paths, and a panic-on-reentrancy here would abort a
+        // collection. A failed borrow just skips the cache.
+        let Ok(mut cache) = cell.try_borrow_mut() else {
+            return CLASS_LAYOUT_VERSIONS
+                .read()
+                .get(&(class_id, field_count))
+                .cloned();
+        };
+        for entry in &cache.entries {
+            if let Some((cid, fc, gen, resolved)) = entry {
+                if *cid == class_id && *fc == field_count && *gen == generation {
+                    return resolved.clone();
+                }
+            }
+        }
+        let resolved = CLASS_LAYOUT_VERSIONS
+            .read()
+            .get(&(class_id, field_count))
+            .cloned();
+        let slot = cache.next % VERSION_CACHE_LEN;
+        cache.next = cache.next.wrapping_add(1);
+        cache.entries[slot] = Some((class_id, field_count, generation, resolved.clone()));
+        resolved
+    })
 }
 
 /// `(byte_offset, is_ref)` for field `index` of `class_id`, if a compact layout
@@ -540,7 +622,12 @@ pub unsafe fn write_compact_field(
 #[cfg(any(test, debug_assertions))]
 pub fn clear_class_layouts() {
     CLASS_LAYOUTS.write().unwrap().clear();
-    CLASS_LAYOUT_VERSIONS.write().unwrap().clear();
+    CLASS_LAYOUT_VERSIONS.write().clear();
+    // The per-thread `class_layout_for_fields` cache is validated against
+    // `layout_generation()`, so bump it here: without this, a test that clears
+    // the registry and re-registers could be served a pre-clear entry from
+    // whichever thread had already warmed its cache.
+    LAYOUT_GENERATION.fetch_add(1, Ordering::AcqRel);
 }
 
 // --- Object body size --------------------------------------------------------
@@ -785,6 +872,124 @@ mod tests {
         assert_eq!(class_layout(7).unwrap().body_size, 16);
         assert_eq!(class_layout_for_fields(7, 1).unwrap().body_size, 8);
         assert_eq!(class_layout_for_fields(7, 2).unwrap().body_size, 16);
+        clear_class_layouts();
+    }
+
+    // --- class_layout_for_fields thread-local cache invalidation -------------
+    //
+    // The cache is validated against `layout_generation()`. Every registry
+    // mutation must bump it, or a warmed thread would keep serving a stale
+    // layout — which for the GC scan means walking an object with the wrong
+    // oop-map (missed or fabricated reference slots => heap corruption). These
+    // tests pin each mutation path.
+
+    fn one_ref_layout(body_size: u32) -> Arc<CompactLayout> {
+        Arc::new(CompactLayout {
+            field_offsets: vec![0],
+            is_ref: vec![true],
+            field_kinds: vec![FieldStorageKind::Reference],
+            ref_offsets: vec![0],
+            body_size,
+        })
+    }
+
+    /// Replacing a layout for the SAME (class_id, field_count) must be visible
+    /// to a thread that already cached the old one.
+    #[test]
+    fn version_cache_sees_replacement() {
+        let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
+        clear_class_layouts();
+        register_class_layout(21, one_ref_layout(8));
+        // Warm the cache.
+        assert_eq!(class_layout_for_fields(21, 1).unwrap().body_size, 8);
+        // Replace with a different layout at the same field count.
+        register_class_layout(21, one_ref_layout(24));
+        assert_eq!(
+            class_layout_for_fields(21, 1).unwrap().body_size,
+            24,
+            "cached entry survived a replacement — generation bump missing"
+        );
+        clear_class_layouts();
+    }
+
+    /// A cached NEGATIVE lookup must not hide a subsequent registration.
+    #[test]
+    fn version_cache_sees_registration_after_negative_lookup() {
+        let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
+        clear_class_layouts();
+        // Warm a negative entry.
+        assert!(class_layout_for_fields(22, 1).is_none());
+        register_class_layout(22, one_ref_layout(8));
+        assert!(
+            class_layout_for_fields(22, 1).is_some(),
+            "cached negative lookup hid a later registration"
+        );
+        clear_class_layouts();
+    }
+
+    /// `unregister_class_layout` must invalidate a warmed positive entry —
+    /// otherwise an unloaded class's layout could be applied to a recycled id.
+    #[test]
+    fn version_cache_sees_unregister() {
+        let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
+        clear_class_layouts();
+        register_class_layout(23, one_ref_layout(8));
+        assert!(class_layout_for_fields(23, 1).is_some());
+        unregister_class_layout(23);
+        assert!(
+            class_layout_for_fields(23, 1).is_none(),
+            "cached entry survived unregister_class_layout"
+        );
+        clear_class_layouts();
+    }
+
+    /// `clear_class_layouts` must invalidate too (it is used between tests, so
+    /// a surviving entry would cross-contaminate them).
+    #[test]
+    fn version_cache_sees_clear() {
+        let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
+        clear_class_layouts();
+        register_class_layout(24, one_ref_layout(8));
+        assert!(class_layout_for_fields(24, 1).is_some());
+        clear_class_layouts();
+        assert!(
+            class_layout_for_fields(24, 1).is_none(),
+            "cached entry survived clear_class_layouts"
+        );
+    }
+
+    /// Every thread must agree with the registry, and repeated lookups (which
+    /// exercise hits) must agree with the first (which was a miss). Also
+    /// exercises eviction: more distinct keys than the 8-entry cache holds.
+    #[test]
+    fn version_cache_consistent_across_threads_and_evictions() {
+        let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
+        clear_class_layouts();
+        // 20 distinct classes > VERSION_CACHE_LEN (8), so entries get evicted
+        // and re-resolved; each body_size encodes its class id.
+        for cid in 30..50u32 {
+            register_class_layout(cid, one_ref_layout(cid * 8));
+        }
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            handles.push(std::thread::spawn(|| {
+                // Two passes: the second pass hits entries the first warmed.
+                for _ in 0..2 {
+                    for cid in 30..50u32 {
+                        let got = class_layout_for_fields(cid, 1)
+                            .expect("registered layout must resolve");
+                        assert_eq!(
+                            got.body_size,
+                            cid * 8,
+                            "cache returned another class's layout for {cid}"
+                        );
+                    }
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("lookup worker should not panic");
+        }
         clear_class_layouts();
     }
 
