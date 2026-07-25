@@ -29,6 +29,7 @@ use crate::native::register_essential_natives;
 use crate::native::register_io_natives;
 use crate::native::registry::{NativeMethodRegistry, StackTraceEntry};
 use crate::native::{register_builtins, register_collections_natives};
+use crate::runtime::lock_order::{LockLevel, OrderedPlMutex};
 use crate::threading::gc_barrier::GcBarrier;
 use crate::threading::jvm_thread::{JvmThread, ThreadId};
 use crate::threading::monitor::MonitorTable;
@@ -602,7 +603,11 @@ pub struct SharedVm {
     pub jni_global_refs: parking_lot::Mutex<crate::native::jni::JniGlobalRefs>,
 
     /// Reference processor for weak/soft/phantom reference tracking during GC.
-    pub ref_processor: parking_lot::Mutex<cratonvm_gc::ReferenceProcessor>,
+    ///
+    /// L7 in the global lock hierarchy — see [`crate::runtime::lock_order`].
+    /// [`OrderedPlMutex`] is a drop-in for `parking_lot::Mutex` that asserts the
+    /// descending acquisition order on every `.lock()`.
+    pub ref_processor: OrderedPlMutex<cratonvm_gc::ReferenceProcessor>,
 
     /// Cached field count for java/lang/String (0 = not yet resolved).
     /// Once resolved, this is the actual `num_total_fields` from the loaded
@@ -2861,7 +2866,10 @@ impl SharedVm {
             native_libraries: parking_lot::Mutex::new(Vec::new()),
             upcall_table: parking_lot::Mutex::new(crate::native::ffi::UpcallTable::new()),
             jni_global_refs: parking_lot::Mutex::new(crate::native::jni::JniGlobalRefs::new()),
-            ref_processor: parking_lot::Mutex::new(cratonvm_gc::ReferenceProcessor::new()),
+            ref_processor: OrderedPlMutex::new(
+                cratonvm_gc::ReferenceProcessor::new(),
+                LockLevel::RefProcessor,
+            ),
             cached_string_num_fields: AtomicUsize::new(0),
             compact_strings: std::sync::atomic::AtomicBool::new(false),
             cached_class_mirror_num_fields: AtomicUsize::new(0),
@@ -5134,16 +5142,18 @@ impl SharedVm {
         }
     }
 
-    /// Acquire `ref_processor` with debug-only rank tracking.
+    /// Acquire `ref_processor` (L7).
+    ///
+    /// Retained as a compatibility alias: the field is now an
+    /// [`OrderedPlMutex`] at [`LockLevel::RefProcessor`], so a plain
+    /// `shared.ref_processor.lock()` is already order-checked and this helper
+    /// adds nothing. Taking a *second* rank scope here would double-record L7
+    /// and trip the same-level assertion.
     #[inline]
     pub fn ref_processor_lock_ranked(
         &self,
-    ) -> RankedGuard<parking_lot::MutexGuard<'_, cratonvm_gc::ReferenceProcessor>> {
-        let rank = ranked_locks::enter(ranked_locks::REF_PROCESSOR);
-        RankedGuard {
-            lock: self.ref_processor.lock(),
-            rank_scope: rank,
-        }
+    ) -> crate::runtime::lock_order::OrderedPlMutexGuard<'_, cratonvm_gc::ReferenceProcessor> {
+        self.ref_processor.lock()
     }
 
     /// Enter the `monitors` rank scope. The monitor table itself uses
