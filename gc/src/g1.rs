@@ -73,26 +73,31 @@ fn for_each_flat_object_reference(
     mut visit: impl FnMut(*mut u8, usize, bool),
 ) {
     if cratonvm_types::is_compact_object(header) {
-        if let Some(layout) = cratonvm_types::class_layout_for_fields(
+        // Borrowing accessor: only `field_offsets` / `is_ref` are read here.
+        // `visit` is caller-supplied and may re-enter the layout cache (G1's
+        // evacuation visitor sizes the referent); that is supported — the
+        // accessor holds a shared borrow, so nested lookups still hit.
+        let _ = cratonvm_types::with_class_layout(
             header.class_id.as_u32(),
             header.num_slots(),
-        ) {
-            for (index, (&offset, &is_ref)) in layout
-                .field_offsets
-                .iter()
-                .zip(layout.is_ref.iter())
-                .enumerate()
-            {
-                if !is_ref || index < first_index {
-                    continue;
+            |layout| {
+                for (index, (&offset, &is_ref)) in layout
+                    .field_offsets
+                    .iter()
+                    .zip(layout.is_ref.iter())
+                    .enumerate()
+                {
+                    if !is_ref || index < first_index {
+                        continue;
+                    }
+                    let slot = unsafe { obj_ptr.add(HEADER_SIZE + offset as usize) } as *mut u8;
+                    let raw = unsafe { std::ptr::read(slot as *const u64) } as usize;
+                    if raw != 0 {
+                        visit(slot, raw, true);
+                    }
                 }
-                let slot = unsafe { obj_ptr.add(HEADER_SIZE + offset as usize) } as *mut u8;
-                let raw = unsafe { std::ptr::read(slot as *const u64) } as usize;
-                if raw != 0 {
-                    visit(slot, raw, true);
-                }
-            }
-        }
+            },
+        );
     } else {
         for index in first_index..header.num_slots() as usize {
             let slot = unsafe { obj_ptr.add(HEADER_SIZE + index * SLOT_SIZE) } as *mut u8;
@@ -5299,35 +5304,40 @@ impl G1Collector {
                 }
             };
             if cratonvm_types::is_compact_object(header) {
-                if let Some(layout) = cratonvm_types::class_layout_for_fields(
+                // Borrowing accessor: the mark walk only reads `field_offsets` /
+                // `is_ref`, so it need not pay an `Arc` clone/drop per marked
+                // object.
+                let _ = cratonvm_types::with_class_layout(
                     header.class_id.as_u32(),
                     header.num_slots(),
-                ) {
-                    for (slot_idx, (&payload_off, &is_ref)) in layout
-                        .field_offsets
-                        .iter()
-                        .zip(layout.is_ref.iter())
-                        .enumerate()
-                    {
-                        if !is_ref || slot_idx < first_slot {
-                            continue;
-                        }
-                        let raw = read_ref(payload_off as usize);
-                        if raw == 0 {
-                            continue;
-                        }
-                        let ref_ptr = raw as usize as *mut u8;
-                        if let Some(idx) = region_for(ref_ptr) {
-                            if !regions[idx].mark_bitmap.is_marked(ref_ptr as usize) {
-                                if worklist.len() >= MARK_WORKLIST_CAP {
-                                    self.mark_worklist_overflowed.store(true, Ordering::Relaxed);
-                                } else {
-                                    worklist.push(ref_ptr as usize);
+                    |layout| {
+                        for (slot_idx, (&payload_off, &is_ref)) in layout
+                            .field_offsets
+                            .iter()
+                            .zip(layout.is_ref.iter())
+                            .enumerate()
+                        {
+                            if !is_ref || slot_idx < first_slot {
+                                continue;
+                            }
+                            let raw = read_ref(payload_off as usize);
+                            if raw == 0 {
+                                continue;
+                            }
+                            let ref_ptr = raw as usize as *mut u8;
+                            if let Some(idx) = region_for(ref_ptr) {
+                                if !regions[idx].mark_bitmap.is_marked(ref_ptr as usize) {
+                                    if worklist.len() >= MARK_WORKLIST_CAP {
+                                        self.mark_worklist_overflowed
+                                            .store(true, Ordering::Relaxed);
+                                    } else {
+                                        worklist.push(ref_ptr as usize);
+                                    }
                                 }
                             }
                         }
-                    }
-                }
+                    },
+                );
             } else {
                 // Legacy object: 16-byte Value slot per field.
                 for slot_idx in first_slot..header.num_slots() as usize {

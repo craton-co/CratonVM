@@ -34,7 +34,7 @@ pub use field_layout::{
     is_compact_object,
     layout_generation, layout_replace_guard, object_body_size, read_compact_field,
     register_class_layout, set_compact_ref_fields_enabled, unregister_class_layout,
-    write_compact_field,
+    with_class_layout, write_compact_field,
     CompactLayout, FieldStorageKind,
 };
 pub use float_format::{java_double_to_string, java_float_to_string};

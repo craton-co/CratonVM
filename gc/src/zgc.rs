@@ -1769,26 +1769,30 @@ impl ZgcRealHeap {
         match header.kind {
             ObjectKind::Object => {
                 if cratonvm_types::is_compact_object(header) {
-                    if let Some(layout) = cratonvm_types::class_layout_for_fields(
+                    // Borrowing accessor: this walk only reads `field_offsets` /
+                    // `is_ref` and drops the handle, so it need not pay the
+                    // `Arc` clone/drop that `class_layout_for_fields` implies.
+                    let _ = cratonvm_types::with_class_layout(
                         header.class_id.as_u32(),
                         header.num_slots(),
-                    ) {
-                        for (index, (&offset, &is_ref)) in layout
-                            .field_offsets
-                            .iter()
-                            .zip(layout.is_ref.iter())
-                            .enumerate()
-                        {
-                            if !is_ref || skip_index == Some(index) {
-                                continue;
+                        |layout| {
+                            for (index, (&offset, &is_ref)) in layout
+                                .field_offsets
+                                .iter()
+                                .zip(layout.is_ref.iter())
+                                .enumerate()
+                            {
+                                if !is_ref || skip_index == Some(index) {
+                                    continue;
+                                }
+                                let slot = unsafe { base.add(HEADER_SIZE + offset as usize) };
+                                let raw = unsafe { std::ptr::read(slot as *const u64) };
+                                if raw != 0 {
+                                    work.push(raw as usize);
+                                }
                             }
-                            let slot = unsafe { base.add(HEADER_SIZE + offset as usize) };
-                            let raw = unsafe { std::ptr::read(slot as *const u64) };
-                            if raw != 0 {
-                                work.push(raw as usize);
-                            }
-                        }
-                    }
+                        },
+                    );
                 } else {
                     let n = header.num_slots() as usize;
                     for i in 0..n {
