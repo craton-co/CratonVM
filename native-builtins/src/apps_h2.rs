@@ -1245,7 +1245,11 @@ fn h2_prune_nested_unnest_range(ctx: &mut dyn NativeContext, expression: ObjectR
 /// `TableFilter.getValue(Column)` for every nested-range candidate. All other
 /// resolver shapes retain H2's virtual dispatch as the fallback.
 fn h2trace_enabled() -> bool {
-    std::env::var_os("CRATONVM_DBG_H2TRACE").is_some()
+    // PERF (2026-07-25): was an uncached `var_os` per call. `getenv` takes the
+    // process environ lock and linearly scans environ; an LD_PRELOAD tally over
+    // CratonBench `hashmap` counted 10M probes of this flag alone. Read once.
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| std::env::var_os("CRATONVM_DBG_H2TRACE").is_some())
 }
 
 fn h2trace_seq() -> u32 {

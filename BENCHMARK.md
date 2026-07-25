@@ -255,16 +255,8 @@ numbers up to N = 2²⁸, kernel sources, and eligibility rules — are in
 > 2.6%. `hashMapPutGet` is entered *once* with two 10M-iteration loops, so
 > invocation-count tier-up can never fire on it.
 >
-> **~10% of hashmap CPU is pure waste in `getenv`** (`std::sys::env::unix::getenv`
-> 4.9% + `_var_os` 2.0% + libc `getenv` 1.6% + `_var` 1.6%). Two uncached probes
-> sit on per-operation paths, both predating the anchor (added 2026-07-21), so
-> they are long-standing rather than new:
-> - `vm/src/vm/vm_exec.rs:8828` — `std::env::var_os("CRATONVM_INVOKE_VIRTUAL_ENTRY_TRACE").is_some() && method_name == "…"`
->   on every `invokevirtual` entry. The `getenv` is evaluated *before* the cheap
->   string compare; swapping the operands (or caching in `env_cache`) is a
->   one-line fix.
-> - `vm/src/vm/vm_exec.rs:5254` — a String-allocating `std::env::var("CRATONVM_DBG_ARRLEN")`
->   per `array_length` miss.
+> **~11% of hashmap CPU was pure waste in `getenv` — now FIXED** (−13.1% on
+> hashmap, −15.4% on stringregex; see the note below this one).
 >
 > **Methodology warning for whoever picks this up:** the gate's default pin is
 > **cpu 13**, and concurrent sessions on this shared host run their own
@@ -273,6 +265,92 @@ numbers up to N = 2²⁸, kernel sources, and eligibility rules — are in
 > load average suggests, and `--max-load` does not catch it. Check
 > `taskset -cp <pid>` on any competing `CratonBench` and use `--cpu N` on a
 > verified-idle core, or wait for `pgrep -f CratonBench` to come back empty.
+
+> **✅ FIXED 2026-07-25: 130 million `getenv` calls per hashmap run.**
+> −13.1% on hashmap, −15.4% on stringregex, neutral elsewhere.
+>
+> **How it was found — and how the first attempt got it wrong.** A sampled
+> `perf` profile showed ~11% of the hashmap phase in the `getenv` family. A
+> `--call-graph=dwarf` profile attributed it to `invoke_on_class_shared_inner`,
+> which pointed at an uncached `CRATONVM_INVOKE_VIRTUAL_ENTRY_TRACE` probe on
+> the `invokevirtual` path. **That attribution was wrong** — the dwarf stacks
+> only resolved ~15% of samples, and caching that flag produced *no measurable
+> change* (hashmap 25444 → 25536 ms, i.e. nothing). Do not trust partial dwarf
+> unwinds on this binary; it is built `debug = "line-tables-only"` with no frame
+> pointers.
+>
+> **What actually worked** was an `LD_PRELOAD` shim that intercepts `getenv` and
+> tallies calls *by variable name* — no unwinding, no sampling, exact counts.
+> Over one hashmap run (10M put/get) it recorded **~130,000,000 calls, ≈13 per
+> benchmark iteration**:
+>
+> | calls | variable |
+> |---:|---|
+> | 60,008,062 | `CRATONVM_DBG_LOADER_TRACE` |
+> | 20,001,011 | `CRATONVM_DBG_MH_STACK` |
+> | 20,001,011 | `CRATONVM_DBG_MH_ADAPTER` |
+> | 20,001,005 | `CRATONVM_DBG_STACKLESS` |
+> | 10,002,013 | `CRATONVM_DBG_H2TRACE` |
+>
+> All were uncached `std::env::var`/`var_os` probes on the `new` opcode and
+> `try_stackless_invoke` paths (~40 call sites, `CRATONVM_DBG_LOADER_TRACE`
+> alone had 33). `getenv` takes the process environ lock and linearly scans
+> environ, so each one is far from free. Most had the env probe as the **left**
+> operand of an `&&` whose right operand is a cheap string compare, so the
+> `getenv` ran unconditionally and the cheap test could never short-circuit it.
+>
+> Fix: cached predicates in `vm/src/runtime/env_cache.rs` (`cached_is_set!` /
+> `cached_is_ok!`, the idiom already used for ~80 other flags) plus local
+> `OnceLock` helpers in `native-builtins`, which cannot reach the vm crate.
+> Total `getenv` calls per hashmap run: **130,000,000 → ~8,000**.
+>
+> Measured interleaved on a quiet host, same base commit, both arms fat-LTO,
+> with `arithmetic` as an unaffected control:
+>
+> | phase | before | after | delta |
+> |---|---|---|---|
+> | hashmap | 21961 ms | 19078 ms | **−13.1%** |
+> | stringregex | 462 ms | 391 ms | **−15.4%** |
+> | bintrees | 1988 ms | 2000 ms | ~0 |
+> | arithmetic (control) | 4098 ms | 4078 ms | ~0 |
+>
+> This does **not** close any gate phase — hashmap is still ~4.2x over a budget
+> that nothing reproduces. It is an independent, real win on the interpreter's
+> native-invoke path.
+>
+> **Generalisable lesson:** when a profile says "time is in `getenv`" (or any
+> libc leaf), an `LD_PRELOAD` counting shim identifies the culprit by *name* in
+> one run and cannot be fooled by missing unwind info. Reach for it before
+> trusting a call-graph attribution.
+
+> **bintrees 1.24x: investigated, NOT the bt18 regression.** The `anchored`
+> 1550 row derives from `binarytrees-half-gap-20260718.md`'s 1468 ms, and
+> `bt18-inline-tlab-regression-20260724.md` verified the fix at 1527–1533 ms.
+> Quiet-host measurement is ~1990–2200 ms. All of the bt18 doc's own acceptance
+> criteria still hold on current dev, so the regression it describes has **not**
+> recurred:
+> - **single** young GC cycle under `CRATONVM_DBG_GCPHASE=1` (the doc's
+>   "method of record"; the regressed state showed two), checksum `68332206`;
+> - `CRATONVM_NO_JIT_INLINE_TLAB_NEW=1` → 5884 ms vs 1988 ms default (**2.96x**),
+>   so the inline TLAB `new` fast path is active and carrying its weight;
+> - `CRATONVM_NO_JIT_INLINE_PUTFIELD=1` → 4973 ms vs 1988 ms (**2.5x**), so the
+>   inline constructor stores are being emitted — this is exactly the "regains a
+>   measurable delta" check the doc asks for.
+>
+> Nor is it a harness-transfer artifact: the CratonBench `bintrees` phase and
+> the standalone `bench/BinTreesClassic.java` the 1468 ms number came from are
+> **byte-identical kernels**, and measured head-to-head on the same binary they
+> agree — 2204 ms vs 2152 ms. The original harness no longer reproduces its own
+> recorded number either.
+>
+> Also refuted: memory fragmentation / transparent huge pages. Despite the host
+> showing 96% compaction failure after 3 days uptime, the running VM's heap is
+> `AnonHugePages: 1912832 kB` of `Anonymous: 1914180 kB` — **99.93% huge-page
+> backed** — so TLB pressure is not the mechanism.
+>
+> bintrees therefore joins the other three rows: in the documented fixed state,
+> with the optimisations verifiably active, measuring ~1.3x its recorded number
+> for reasons not yet explained by code, load, harness, heap size, or paging.
 
 ```bash
 # Build. Fat LTO — required for baseline-comparable numbers.
