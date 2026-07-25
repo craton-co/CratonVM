@@ -1298,7 +1298,7 @@ pub(crate) fn register_bigdecimal_arithmetic_overrides(registry: &mut NativeMeth
     registry.set_category(__prev_cat);
 }
 
-fn register_biginteger_natives(registry: &mut NativeMethodRegistry) {
+pub(crate) fn register_biginteger_natives(registry: &mut NativeMethodRegistry) {
     // census-tag: BigInteger spec-exact arithmetic/factories → Intrinsic.
     let __prev_cat = registry.current_category();
     registry.set_category(cratonvm_native_api::NativeKind::Intrinsic);
@@ -2436,7 +2436,7 @@ fn bd_alloc(ctx: &mut dyn NativeContext, value: &str, scale: i32) -> ObjectRef {
     obj
 }
 
-fn register_bigdecimal_natives(registry: &mut NativeMethodRegistry) {
+pub(crate) fn register_bigdecimal_natives(registry: &mut NativeMethodRegistry) {
     // census-tag: BigDecimal spec-exact arithmetic/factories → Intrinsic.
     let __prev_cat = registry.current_category();
     registry.set_category(cratonvm_native_api::NativeKind::Intrinsic);

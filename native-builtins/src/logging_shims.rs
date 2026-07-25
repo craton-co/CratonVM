@@ -574,7 +574,7 @@ pub(crate) fn emit_framework_log(ctx: &mut dyn NativeContext, text: &str) {
     }
 }
 
-fn native_print_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_print_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let text = match args.get(1) {
         Some(Value::Object(Some(obj))) => {
             ctx.read_string(*obj).unwrap_or_else(|| "null".to_string())
@@ -587,7 +587,7 @@ fn native_print_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     Ok(None)
 }
 
-fn native_print_int(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_print_int(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let val = match args.get(1) {
         Some(Value::Int(v)) => *v,
         _ => 0,
@@ -598,7 +598,7 @@ fn native_print_int(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     Ok(None)
 }
 
-fn native_print_char(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_print_char(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let ch = match args.get(1) {
         Some(Value::Int(v)) => char::from_u32(*v as u32).unwrap_or('\0'),
         _ => '\0',
@@ -609,7 +609,10 @@ fn native_print_char(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     Ok(None)
 }
 
-fn native_print_boolean(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_print_boolean(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let val = match args.get(1) {
         Some(Value::Int(v)) => *v != 0,
         _ => false,
@@ -620,7 +623,7 @@ fn native_print_boolean(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     Ok(None)
 }
 
-fn native_print_long(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_print_long(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // CompactValue tag-erasure: a long pushed via `CompactValue::long(v)` is
     // stored with the Double tag (no embedded marker — see
     // `types/src/compact_value.rs::pub fn long`). When `invokevirtual` pops
@@ -643,7 +646,7 @@ fn native_print_long(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     Ok(None)
 }
 
-fn native_print_float(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_print_float(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let val = match args.get(1) {
         Some(Value::Float(v)) => *v,
         _ => 0.0,
@@ -654,7 +657,7 @@ fn native_print_float(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     Ok(None)
 }
 
-fn native_print_double(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_print_double(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let val = match args.get(1) {
         Some(Value::Double(v)) => *v,
         _ => 0.0,
@@ -665,7 +668,7 @@ fn native_print_double(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     Ok(None)
 }
 
-fn native_print_object(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_print_object(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let text = match args.get(1) {
         Some(Value::Object(Some(obj))) => invoke_to_string(ctx, *obj)?,
         Some(Value::Object(None)) => "null".to_string(),
@@ -760,7 +763,10 @@ fn native_printwriter_init_outputstream(
     Ok(None)
 }
 
-fn native_printwriter_printf(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_printwriter_printf(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this_opt = match args.first() {
         Some(Value::Object(obj)) => *obj,
         _ => None,
@@ -817,7 +823,10 @@ fn native_printwriter_printf(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     Ok(Some(Value::Object(this_opt)))
 }
 
-fn native_printstream_flush(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_printstream_flush(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     // User/Tee streams: propagate flush() to the real underlying stream so a
     // redirected file (e.g. DaCapo stdout.log) is durable before its digest is
     // read. Canonical synthetic out/err (out==null) flush the fd directly.
@@ -833,12 +842,18 @@ fn native_printstream_flush(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     Ok(None)
 }
 
-fn native_printstream_close(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_printstream_close(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
     // Don't actually close stdout/stderr
     Ok(None)
 }
 
-fn native_printstream_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_printstream_write(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     // args[0]=this, args[1]=byte[], args[2]=off, args[3]=len
     let arr = match args.get(1) {
         Some(Value::Object(Some(a))) => *a,
@@ -874,7 +889,10 @@ fn native_printstream_write(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     Ok(None)
 }
 
-fn native_printstream_write_int(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_printstream_write_int(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     // args[0]=this, args[1]=int. Java PrintStream.write(int) writes the low
     // eight bits of the argument to the underlying byte stream.
     let b = match args.get(1) {
@@ -898,7 +916,7 @@ fn native_printstream_write_int(ctx: &mut dyn NativeContext, args: &[Value]) -> 
 
 /// `PrintStream.write(String)` — the package-private writer-path entry used by
 /// `print(String)`. Writes the whole string to the underlying stream.
-fn native_printstream_write_string(
+pub(crate) fn native_printstream_write_string(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
@@ -934,7 +952,7 @@ fn native_printstream_append(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
 /// to the underlying stream. This is the writer-path 3-arg entry that JUnit's
 /// console output reaches via `Writer.write(String,int,int)` when a system
 /// `PrintStream` is used through the character-writer chain.
-fn native_printstream_write_string_range(
+pub(crate) fn native_printstream_write_string_range(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
@@ -1053,7 +1071,10 @@ fn native_printwriter_write_string_range(
 /// so single-char writes (e.g. JSON-quoting `"` from `ModelNode.toString()`)
 /// reach the Writer.  No-op for fd-backed streams (those are handled by
 /// `print*`/`println*` natives).
-fn native_printwriter_write_int(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_printwriter_write_int(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     if let Some(Value::Object(Some(this))) = args.first().copied() {
         if let Some(out_obj) = printwriter_get_backing_writer(ctx, this) {
             let ch = args.get(1).cloned().unwrap_or(Value::Int(0));
@@ -1172,7 +1193,7 @@ pub(crate) fn register_log4j_stacklocator_bridge(registry: &mut NativeMethodRegi
     );
 }
 
-fn register_logging_natives(registry: &mut NativeMethodRegistry) {
+pub(crate) fn register_logging_natives(registry: &mut NativeMethodRegistry) {
     let logger = "java/util/logging/Logger";
     let level = "java/util/logging/Level";
 
@@ -1890,7 +1911,7 @@ pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
 /// and through `apply()`'s own try/finally.
 pub fn register_spring_boot_logback_apply(_registry: &mut NativeMethodRegistry) {}
 
-fn register_slf4j_natives(registry: &mut NativeMethodRegistry) {
+pub(crate) fn register_slf4j_natives(registry: &mut NativeMethodRegistry) {
     let lf = "org/slf4j/LoggerFactory";
 
     // LoggerFactory.getLogger(String) → Logger

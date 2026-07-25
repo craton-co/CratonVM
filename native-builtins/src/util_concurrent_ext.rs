@@ -1457,7 +1457,7 @@ pub fn register_concurrent_natives(registry: &mut NativeMethodRegistry) {
 // M18: ConcurrentHashMap atomic ops, LinkedBlockingQueue, ArrayBlockingQueue
 // ===========================================================================
 
-fn register_m18_concurrent_fixes(registry: &mut NativeMethodRegistry) {
+pub(crate) fn register_m18_concurrent_fixes(registry: &mut NativeMethodRegistry) {
     // --- ConcurrentHashMap: monitor-wrapped atomic operations ---
     let chm = "java/util/concurrent/ConcurrentHashMap";
 
@@ -2522,7 +2522,7 @@ fn register_m18_concurrent_fixes(registry: &mut NativeMethodRegistry) {
 /// ConcurrentSkipListMap — backed by a sorted array of key-value pairs.
 /// Fields: 0=keys_array, 1=values_array, 2=size
 /// Uses binary search on keys (via compareTo) for NavigableMap operations.
-fn register_t31_concurrent_extras(registry: &mut NativeMethodRegistry) {
+pub(crate) fn register_t31_concurrent_extras(registry: &mut NativeMethodRegistry) {
     let cslm = "java/util/concurrent/ConcurrentSkipListMap";
 
     registry.register(cslm, "<init>", "()V", |ctx, args| {
@@ -4664,7 +4664,7 @@ pub(crate) fn spawn_runnable_on_real_thread(
     Ok(None)
 }
 
-fn register_completable_future_natives(registry: &mut NativeMethodRegistry) {
+pub(crate) fn register_completable_future_natives(registry: &mut NativeMethodRegistry) {
     let cf = "java/util/concurrent/CompletableFuture";
     let fut = "java/util/concurrent/Future";
     let ft = "java/util/concurrent/FutureTask";
