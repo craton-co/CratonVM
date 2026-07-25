@@ -176,15 +176,44 @@ numbers up to N = 2²⁸, kernel sources, and eligibility rules — are in
 > anchored baselines in `cratonbench-baseline-azure-epyc.tsv` were measured that
 > way. Building with `CARGO_PROFILE_RELEASE_LTO=off` — the usual workaround for
 > the OOM SIGKILL below — produces a **materially slower** binary whose absolute
-> times are not comparable to those baselines. Measured 2026-07-25 on the Azure
-> host, an LTO=off build failed 4 of the 7 gate phases *with no source changes at
-> all* (sieve 10249 vs a 6090 budget, hashmap 23215 vs 4515, stringregex 494 vs
-> 173, bintrees 2720 vs 1627). If the gate fails on an unmodified checkout, check
-> how you built before concluding there is a regression.
+> times are not comparable to those baselines. Measured 2026-07-25, same commit,
+> two binaries differing only in LTO, interleaved, 3 pairs per phase (host load
+> ~6-7, so absolutes are inflated and the spread is wide — hashmap ranged
+> 23461-31120 *within one arm*):
 >
-> LTO=off is still fine for **relative** A/B work — comparing two binaries built
-> the same way is valid and is how the layout-registry win was measured — but say
-> so when reporting, and never quote an LTO=off absolute against a baseline.
+> | phase | LTO=off median | fat-LTO median | fat-LTO effect |
+> |---|---|---|---|
+> | bintrees | 3019 ms | 2262 ms | **−25%** |
+> | hashmap | 25484 ms | 26196 ms | none |
+> | sieve | 10262 ms | 9552 ms | ~−7% |
+>
+> Fat LTO is worth a real amount on bintrees and close to nothing on hashmap and
+> sieve. Use it for anything baseline-comparable — but note what it does NOT
+> explain, below.
+>
+> LTO=off is fine for **relative** A/B between two binaries built the same way —
+> that is how the layout-registry win was measured — but say so when reporting,
+> and never quote an LTO=off absolute against a baseline.
+
+> **⚠ OPEN: the gate fails on an unmodified checkout, and build config does not
+> account for it.** On 2026-07-25 an unmodified `dev` failed 4 of 7 phases
+> (sieve, hashmap, stringregex, bintrees); arithmetic/fib/matrix passed. The
+> first hypothesis was that this was just the LTO=off build above — **the A/B
+> disproves that.** Even with fat LTO the gap remains: hashmap ~26200 ms against
+> a 4515 ms budget (**5.8x**), sieve ~9550 vs 6090 (1.6x), bintrees ~2260 vs
+> 1627 (1.4x).
+>
+> Two candidate explanations remain and have not been separated:
+> 1. **Host load.** These runs sat at load 6-7 with several sessions building.
+>    The gate refuses to measure above 2.0 for exactly this reason, and the
+>    within-arm spread above shows why. Nobody has re-measured on a quiet host.
+> 2. **A real regression** accumulated since the baselines were taken
+>    (2026-07-24 — one day before these measurements).
+>
+> hashmap is the one to attack first: 5.8x is a lot to pin on load, and it is the
+> only phase fat LTO did not move at all. **Do not re-anchor these baselines to
+> make the gate go green** — that erases the signal. Measure on a quiet host and
+> find out which explanation is true.
 
 ```bash
 # Build. Fat LTO — required for baseline-comparable numbers.
