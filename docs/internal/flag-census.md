@@ -16,11 +16,11 @@ and the only defence is knowing what the full set was beforehand.
 | --- | ---: |
 | Distinct `CRATONVM_*` identifiers seen anywhere (code, docs, scripts) | **689** |
 | …of which have at least one Rust read site | **556** |
-| Rust code literal sites (all kinds) | **1226** |
-| Rust *read* sites (excludes `set_var`/`env_remove`/`option_env!`) | **1145** |
-| Read sites **outside** `native-builtins/` (this refactor's scope) | **779** |
+| Rust code literal sites (all kinds) | **1236** |
+| Rust *read* sites (excludes `set_var`/`env_remove`/`option_env!`) | **1155** |
+| Read sites **outside** `native-builtins/` (this refactor's scope) | **789** |
 | Read sites inside `native-builtins/` (deliberately deferred, see §6) | **366** |
-| Read sites that are **not** `OnceLock`-cached | **911** |
+| Read sites that are **not** `OnceLock`-cached | **958** |
 | In-process `set_var` / `remove_var` / `Command::env` sites | **72** |
 
 ### Classification
@@ -231,23 +231,23 @@ read would silently turn the feature off*).
 
 | Flag | Reads | Cached | Polarity | Crates | First site |
 | --- | ---: | :---: | --- | --- | --- |
-| `CRATONVM_ALLOW_JSR_RET` | 2 | partial | value/other | classloading | `classloading/src/verifier.rs:169` |
-| `CRATONVM_ALLOW_MOVING_YOUNG` | 2 | **no** | opt-in (default OFF) | gc | `gc/src/gen_heap.rs:3323` |
+| `CRATONVM_ALLOW_JSR_RET` | 2 | **no** | value/other | classloading,types | `classloading/src/verifier.rs:2842` |
+| `CRATONVM_ALLOW_MOVING_YOUNG` | 1 | **no** | value/other | types | `types/src/flags.rs:504` |
 | `CRATONVM_AOT_HMAC_KEY` | 1 | **no** | value/other | native-builtins | `native-builtins/src/aot.rs:265` |
 | `CRATONVM_ASYNC_HANDOFF_SLEEP_FLOOR_MS` | 1 | **no** | value/other | native-builtins | `native-builtins/src/lib.rs:71210` |
 | `CRATONVM_ASYNC_SUBMIT_GRACE_MS` | 1 | yes | value/other | native-builtins | `native-builtins/src/lib.rs:71181` |
 | `CRATONVM_ASYNC_WORKER_SLEEP_FLOOR_MS` | 1 | **no** | value/other | native-builtins | `native-builtins/src/lib.rs:71217` |
 | `CRATONVM_AWAIT_NO_SHORTCIRCUIT` | 1 | **no** | opt-in (default OFF) | native-builtins | `native-builtins/src/wildfly_core.rs:1744` |
 | `CRATONVM_BG_COMPILE` | 1 | yes | value/other | vm | `vm/src/runtime/env_cache.rs:464` |
-| `CRATONVM_BLOCK_PRIVATE_NETS` | 1 | **no** | value/other | native-io | `native-io/src/outbound_policy.rs:282` |
-| `CRATONVM_BOOT_MODULE_REGISTRY` | 1 | **no** | value/other | classloading | `classloading/src/class_manager.rs:1743` |
+| `CRATONVM_BLOCK_PRIVATE_NETS` | 1 | **no** | value/other | types | `types/src/flags.rs:762` |
+| `CRATONVM_BOOT_MODULE_REGISTRY` | 2 | **no** | value/other | types | `types/src/flags.rs:663` |
 | `CRATONVM_C2_SUPERSEDE` | 1 | yes | value/other | vm | `vm/src/runtime/env_cache.rs:777` |
 | `CRATONVM_CANON_OPENFILE` | 1 | **no** | opt-in (default OFF) | native-builtins | `native-builtins/src/phases_late.rs:16243` |
-| `CRATONVM_CARD_TABLE_ONLY` | 1 | yes | opt-in (default OFF) | gc | `gc/src/gen_heap.rs:8910` |
+| `CRATONVM_CARD_TABLE_ONLY` | 2 | **no** | value/other | types | `types/src/flags.rs:510` |
 | `CRATONVM_CL_BOOTSTRAP_SCOPED` | 1 | yes | value/other | native-builtins | `native-builtins/src/classloader.rs:1030` |
 | `CRATONVM_COMPACT_REF_FIELDS` | 1 | yes | value/other | types | `types/src/field_layout.rs:175` |
 | `CRATONVM_COMPRESSED_OOPS` | 1 | **no** | value/other | vm | `vm/src/vm/vm_init.rs:859` |
-| `CRATONVM_CONFINE_IO` | 1 | **no** | value/other | native-io | `native-io/src/lib.rs:180` |
+| `CRATONVM_CONFINE_IO` | 2 | **no** | value/other | types | `types/src/flags.rs:760` |
 | `CRATONVM_DEFAULT_HEAP_ERGONOMICS` | 1 | **no** | value/other | vm-cli | `vm-cli/src/main.rs:3878` |
 | `CRATONVM_DEFAULT_HEAP_MAX_MB` | 1 | **no** | value/other | vm-cli | `vm-cli/src/main.rs:3881` |
 | `CRATONVM_DEFAULT_WATCHDOG_SEC` | 1 | **no** | value/other | vm-cli | `vm-cli/src/main.rs:2228` |
@@ -258,7 +258,7 @@ read would silently turn the feature off*).
 | `CRATONVM_DISABLE_ARITH_LICM` | 1 | **no** | opt-in (default OFF) | jit | `jit/src/x64.rs:28088` |
 | `CRATONVM_DISABLE_DEFAULT_WATCHDOG` | 1 | **no** | value/other | vm-cli | `vm-cli/src/main.rs:2221` |
 | `CRATONVM_DISABLE_INTRINSICS` | 3 | partial | value/other | difftest,vm | `vm/src/runtime/env_cache.rs:284` |
-| `CRATONVM_DISABLE_JAR_MMAP` | 1 | **no** | opt-in (default OFF) | classloading | `classloading/src/class_path.rs:132` |
+| `CRATONVM_DISABLE_JAR_MMAP` | 1 | **no** | value/other | types | `types/src/flags.rs:669` |
 | `CRATONVM_DISABLE_JIT` | 5 | partial | value/other | difftest,vm | `vm/tests/wave2_bc_probe.rs:296` |
 | `CRATONVM_DISABLE_SCALAR_REPLACEMENT` | 1 | **no** | opt-in (default OFF) | jit | `jit/src/x64.rs:28365` |
 | `CRATONVM_DISABLE_UNROLL` | 1 | **no** | opt-in (default OFF) | jit | `jit/src/x64.rs:28214` |
@@ -269,13 +269,13 @@ read would silently turn the feature off*).
 | `CRATONVM_FORCE_WIN_BUILD` | 1 | **no** | value/other | vm | `vm/src/vm/vm_init.rs:180` |
 | `CRATONVM_FOREIGN_ATTACH` | 1 | **no** | value/other | vm | `vm/src/native/jni.rs:761` |
 | `CRATONVM_FUZZ_BOOTCP` | 1 | **no** | value/other | fuzz | `fuzz/fuzz_targets/fuzz_verifier.rs:55` |
-| `CRATONVM_G1_NO_EVAC_RETRY` | 1 | **no** | opt-in (default OFF) | gc | `gc/src/g1.rs:1879` |
-| `CRATONVM_G1_PARALLEL_EVAC` | 1 | yes | value/other | gc | `gc/src/g1.rs:223` |
-| `CRATONVM_G1_WORKERS` | 1 | **no** | value/other | gc | `gc/src/g1.rs:2886` |
+| `CRATONVM_G1_NO_EVAC_RETRY` | 1 | **no** | value/other | types | `types/src/flags.rs:513` |
+| `CRATONVM_G1_PARALLEL_EVAC` | 5 | **no** | value/other | types | `types/src/flags.rs:512` |
+| `CRATONVM_G1_WORKERS` | 4 | **no** | value/other | types | `types/src/flags.rs:514` |
 | `CRATONVM_GC_OVERHEAD_LIMIT` | 1 | yes | value/other | vm | `vm/src/runtime/interpreter.rs:1637` |
-| `CRATONVM_GC_STRESS` | 1 | yes | value/other | gc | `gc/src/gen_heap.rs:278` |
+| `CRATONVM_GC_STRESS` | 4 | **no** | value/other | types | `types/src/flags.rs:516` |
 | `CRATONVM_GPU_NO_ZEROCOPY` | 1 | yes | opt-out (default ON) | vm | `vm/src/runtime/gpu_marshal.rs:689` |
-| `CRATONVM_HARDEN_MANIFEST_CLASSPATH` | 1 | yes | value/other | classloading | `classloading/src/class_path.rs:223` |
+| `CRATONVM_HARDEN_MANIFEST_CLASSPATH` | 1 | **no** | value/other | types | `types/src/flags.rs:667` |
 | `CRATONVM_HELPFUL_NPE_OPCODES` | 1 | yes | value/other | vm | `vm/src/runtime/env_cache.rs:326` |
 | `CRATONVM_HTTP_MAX_BODY` | 1 | yes | value/other | native-builtins | `native-builtins/src/net_phase_e.rs:10791` |
 | `CRATONVM_INHERIT_THREAD_CCL` | 1 | **no** | value/other | native-builtins | `native-builtins/src/lang_system.rs:752` |
@@ -334,13 +334,13 @@ read would silently turn the feature off*).
 | `CRATONVM_JIT_VIRTUAL_TIERUP` | 1 | yes | value/other | vm | `vm/src/runtime/env_cache.rs:494` |
 | `CRATONVM_LAZY_STREAMS` | 1 | yes | opt-in (default OFF) | native-collections | `native-collections/src/lib.rs:13157` |
 | `CRATONVM_LENIENT_CLINIT` | 2 | partial | value/other | vm | `vm/src/vm/vm_util.rs:53` |
-| `CRATONVM_LOADER_AWARE_RESOLUTION` | 1 | yes | value/other | classloading | `classloading/src/class_manager.rs:141` |
+| `CRATONVM_LOADER_AWARE_RESOLUTION` | 2 | **no** | value/other | types | `types/src/flags.rs:661` |
 | `CRATONVM_LOADER_UNLOAD` | 2 | yes | value/other | native-builtins,types | `native-builtins/src/classloader.rs:1056` |
 | `CRATONVM_LONGREWRITE_LOOSE` | 1 | yes | opt-in (default OFF) | vm | `vm/src/runtime/value_stack.rs:198` |
 | `CRATONVM_MAVEN_REPO_LOCAL` | 2 | **no** | value/other | native-builtins | `native-builtins/src/jboss_module_loader.rs:301` |
 | `CRATONVM_MAX_INFLATED_BYTES` | 1 | **no** | value/other | native-builtins | `native-builtins/src/phases_late.rs:19788` |
-| `CRATONVM_MOVING_YOUNG` | 3 | yes | opt-in (default OFF) | gc,jit,vm | `jit/src/x64.rs:2458` |
-| `CRATONVM_MOVING_YOUNG_FALLBACKS` | 1 | **no** | opt-in (default OFF) | gc | `gc/src/gen_heap.rs:3792` |
+| `CRATONVM_MOVING_YOUNG` | 5 | partial | opt-in (default OFF) | jit,types,vm | `jit/src/x64.rs:2458` |
+| `CRATONVM_MOVING_YOUNG_FALLBACKS` | 1 | **no** | value/other | types | `types/src/flags.rs:505` |
 | `CRATONVM_MSC_REAL_START` | 1 | yes | value/other | native-builtins | `native-builtins/src/jboss_msc.rs:2599` |
 | `CRATONVM_NATIVE_EC_MULTIPLY` | 1 | yes | opt-in (default OFF) | native-builtins | `native-builtins/src/sunec_point.rs:58` |
 | `CRATONVM_NATIVE_MATCHER_FIND` | 2 | partial | value/other | native-builtins,vm | `native-builtins/src/lib.rs:26365` |
@@ -349,7 +349,7 @@ read would silently turn the feature off*).
 | `CRATONVM_NETTY_QUEUE_BRIDGE` | 1 | **no** | value/other | native-builtins | `native-builtins/src/lib.rs:20704` |
 | `CRATONVM_NO_CONSERVATIVE_LOCALS` | 1 | yes | opt-out (default ON) | vm | `vm/src/memory/roots.rs:36` |
 | `CRATONVM_NO_CTOR_DIRECT_CALL` | 1 | **no** | value/other | vm | `vm/src/runtime/env_cache.rs:587` |
-| `CRATONVM_NO_GC_PROMOTION_GUARD` | 1 | **no** | opt-out (default ON) | gc | `gc/src/gen_heap.rs:3702` |
+| `CRATONVM_NO_GC_PROMOTION_GUARD` | 1 | **no** | value/other | types | `types/src/flags.rs:506` |
 | `CRATONVM_NO_IR_BRANCHY` | 1 | yes | opt-out (default ON) | jit | `jit/src/ir_optimize.rs:98` |
 | `CRATONVM_NO_JIT_ALLOC_CLASS_CACHE` | 1 | yes | opt-out (default ON) | vm | `vm/src/jit/alloc_class_cache.rs:218` |
 | `CRATONVM_NO_JIT_INLINE_PUTFIELD` | 1 | yes | opt-out (default ON) | jit | `jit/src/x64.rs:2126` |
@@ -359,21 +359,21 @@ read would silently turn the feature off*).
 | `CRATONVM_NO_PRECISE_INLINE_FRAME_RECORD` | 1 | yes | opt-out (default ON) | jit | `jit/src/x64.rs:2288` |
 | `CRATONVM_NO_PRECISE_JIT_MAPS` | 1 | yes | opt-out (default ON) | jit | `jit/src/x64.rs:2085` |
 | `CRATONVM_NO_PRECISE_REG_SPILL` | 1 | yes | opt-in (default OFF) | jit | `jit/src/x64.rs:2661` |
-| `CRATONVM_NO_SELECTIVE_PROMOTE` | 3 | **no** | opt-out (default ON) | difftest,gc | `difftest/src/runner.rs:179` |
+| `CRATONVM_NO_SELECTIVE_PROMOTE` | 3 | **no** | value/other | difftest,types | `difftest/src/runner.rs:179` |
 | `CRATONVM_NO_STUBS` | 1 | **no** | value/other | native-api | `native-api/src/registry.rs:3886` |
-| `CRATONVM_OLD_SWEEP_JIT` | 1 | **no** | value/other | gc | `gc/src/gen_heap.rs:3546` |
+| `CRATONVM_OLD_SWEEP_JIT` | 4 | **no** | value/other | types | `types/src/flags.rs:511` |
 | `CRATONVM_OSR_EXIT_AFTER` | 1 | yes | value/other | jit | `jit/src/lib.rs:1062` |
 | `CRATONVM_OSR_EXIT_TEST` | 1 | yes | opt-in (default OFF) | jit | `jit/src/lib.rs:1042` |
 | `CRATONVM_OSR_NEWARRAY` | 1 | yes | value/other | vm | `vm/src/runtime/env_cache.rs:266` |
 | `CRATONVM_PRECISE_COVERAGE_PIN` | 1 | yes | opt-in (default OFF) | vm | `vm/src/jit/conservative_roots.rs:1913` |
-| `CRATONVM_PROMOTION_OOM_GUARD_BROAD` | 1 | **no** | opt-in (default OFF) | gc | `gc/src/gen_heap.rs:3756` |
+| `CRATONVM_PROMOTION_OOM_GUARD_BROAD` | 1 | **no** | value/other | types | `types/src/flags.rs:507` |
 | `CRATONVM_REAL` | 2 | partial | value/other | vm | `vm/tests/synthetic_diff.rs:289` |
 | `CRATONVM_REAL_AGROAL` | 1 | **no** | opt-in (default OFF) | native-builtins | `native-builtins/src/lib.rs:83081` |
 | `CRATONVM_REAL_ANNOTATIONS` | 3 | partial | value/other | native-builtins,vm | `native-builtins/src/lang_class.rs:10381` |
 | `CRATONVM_REAL_AQS` | 7 | **no** | opt-out (default ON) | native-builtins,vm | `native-builtins/src/lib.rs:26519` |
 | `CRATONVM_REAL_FORKJOINPOOL` | 6 | partial | opt-out (default ON) | native-api,vm | `vm/tests/synthetic_diff.rs:294` |
 | `CRATONVM_REAL_JCA` | 2 | partial | opt-in (default OFF) | native-builtins,vm | `native-builtins/src/lib.rs:8913` |
-| `CRATONVM_REAL_NET_SOCKETS` | 8 | partial | opt-in (default OFF) | native-api,native-builtins,native-io,vm | `native-builtins/src/phases_early.rs:15080` |
+| `CRATONVM_REAL_NET_SOCKETS` | 8 | partial | opt-in (default OFF) | native-api,native-builtins,types,vm | `native-builtins/src/phases_early.rs:15080` |
 | `CRATONVM_REAL_PROXY` | 1 | **no** | value/other | native-builtins | `native-builtins/src/lib.rs:83010` |
 | `CRATONVM_REAL_PROXY_STRICT` | 1 | **no** | value/other | native-builtins | `native-builtins/src/lib.rs:83032` |
 | `CRATONVM_REAL_PROXY_SUPER` | 3 | partial | opt-out (default ON) | native-builtins,vm | `native-builtins/src/lib.rs:83052` |
@@ -383,19 +383,19 @@ read would silently turn the feature off*).
 | `CRATONVM_RECLAIM_DEAD_MONITORS` | 1 | yes | opt-in (default OFF) | vm | `vm/src/threading/monitor.rs:95` |
 | `CRATONVM_REQUIRE_POLICY` | 1 | yes | opt-in (default OFF) | native-builtins | `native-builtins/src/security_manager.rs:61` |
 | `CRATONVM_RESOLVE_CACHE_CAP` | 4 | **no** | value/other | vm | `vm/src/runtime/lockfree_resolve.rs:56` |
-| `CRATONVM_RESOLVE_OUTBOUND_HOST` | 1 | **no** | value/other | native-io | `native-io/src/outbound_policy.rs:256` |
+| `CRATONVM_RESOLVE_OUTBOUND_HOST` | 1 | **no** | value/other | types | `types/src/flags.rs:763` |
 | `CRATONVM_ROOTSNAP_CACHE` | 1 | yes | value/other | vm | `vm/src/runtime/env_cache.rs:389` |
 | `CRATONVM_ROOTSNAP_CACHE_SURVIVE_GC` | 1 | yes | value/other | vm | `vm/src/runtime/env_cache.rs:422` |
 | `CRATONVM_SCALAR_DEOPT` | 1 | yes | opt-in (default OFF) | jit | `jit/src/lib.rs:987` |
-| `CRATONVM_SELECT_MAX_BLOCK_MS` | 1 | yes | value/other | native-io | `native-io/src/nio_selector.rs:125` |
+| `CRATONVM_SELECT_MAX_BLOCK_MS` | 3 | **no** | value/other | types | `types/src/flags.rs:768` |
 | `CRATONVM_SHADOW_NOPUSH` | 2 | partial | opt-in (default OFF) | jit,vm | `jit/src/x64.rs:2501` |
 | `CRATONVM_SHADOW_NORELOAD` | 2 | partial | opt-in (default OFF) | jit,vm | `jit/src/x64.rs:2511` |
 | `CRATONVM_SHADOW_NO_SAVEBASE` | 1 | yes | opt-in (default OFF) | jit | `jit/src/x64.rs:2583` |
 | `CRATONVM_SHADOW_PIN` | 2 | yes | opt-in (default OFF) | jit,vm | `jit/src/x64.rs:2525` |
 | `CRATONVM_SHADOW_RAW_RELOAD` | 1 | yes | opt-in (default OFF) | jit | `jit/src/x64.rs:2572` |
-| `CRATONVM_SHADOW_STACK` | 4 | partial | opt-in (default OFF) | gc,jit,vm | `jit/src/x64.rs:2436` |
+| `CRATONVM_SHADOW_STACK` | 4 | partial | opt-in (default OFF) | jit,types,vm | `jit/src/x64.rs:2436` |
 | `CRATONVM_SOFT_EXIT` | 5 | **no** | value/other | native-builtins | `native-builtins/src/lib.rs:44233` |
-| `CRATONVM_SP_NO_COALESCE` | 1 | **no** | opt-out (default ON) | gc | `gc/src/gen_heap.rs:7533` |
+| `CRATONVM_SP_NO_COALESCE` | 1 | **no** | value/other | types | `types/src/flags.rs:509` |
 | `CRATONVM_STRICT_JIT_ROOTS` | 1 | yes | opt-in (default OFF) | vm | `vm/src/jit/conservative_roots.rs:1223` |
 | `CRATONVM_SYNTHETIC_AGROAL` | 1 | **no** | opt-out (default ON) | native-builtins | `native-builtins/src/lib.rs:83082` |
 | `CRATONVM_SYNTHETIC_ANNOTATIONS` | 1 | yes | opt-in (default OFF) | native-builtins | `native-builtins/src/lang_class.rs:10377` |
@@ -404,10 +404,10 @@ read would silently turn the feature off*).
 | `CRATONVM_SYNTHETIC_DSA` | 1 | yes | opt-out (default ON) | native-builtins | `native-builtins/src/lib.rs:8958` |
 | `CRATONVM_SYNTHETIC_EC` | 1 | yes | opt-out (default ON) | native-builtins | `native-builtins/src/lib.rs:8939` |
 | `CRATONVM_SYNTHETIC_EQE` | 1 | **no** | opt-in (default OFF) | native-builtins | `native-builtins/src/wildfly_core.rs:2061` |
-| `CRATONVM_SYNTHETIC_FILEWRITER` | 1 | yes | value/other | native-io | `native-io/src/lib.rs:4569` |
+| `CRATONVM_SYNTHETIC_FILEWRITER` | 1 | **no** | value/other | types | `types/src/flags.rs:765` |
 | `CRATONVM_SYNTHETIC_PQC` | 1 | yes | opt-out (default ON) | native-builtins | `native-builtins/src/lib.rs:8975` |
 | `CRATONVM_SYNTHETIC_QUARKUS_ARC` | 2 | **no** | value/other | native-builtins | `native-builtins/src/quarkus_arc.rs:374` |
-| `CRATONVM_SYNTHETIC_RAF` | 2 | partial | value/other | native-builtins,native-io | `native-builtins/src/phases_late.rs:4856` |
+| `CRATONVM_SYNTHETIC_RAF` | 5 | **no** | value/other | native-builtins,types | `native-builtins/src/phases_late.rs:4856` |
 | `CRATONVM_SYNTHETIC_RSA` | 1 | yes | opt-out (default ON) | native-builtins | `native-builtins/src/lib.rs:9006` |
 | `CRATONVM_SYNTHETIC_VERTX` | 1 | **no** | opt-out (default ON) | native-builtins | `native-builtins/src/lib.rs:83096` |
 | `CRATONVM_THREAD_START_GRACE_MS` | 1 | yes | value/other | vm | `vm/src/vm/vm_exec.rs:139` |
@@ -419,8 +419,8 @@ read would silently turn the feature off*).
 | `CRATONVM_TIER_OSR_THRESHOLD` | 2 | **no** | value/other | jit | `jit/src/tiered.rs:217` |
 | `CRATONVM_TIER_PGO` | 1 | **no** | value/other | vm | `vm/src/runtime/env_cache.rs:479` |
 | `CRATONVM_TLAB_GC_TRIGGER` | 1 | yes | value/other | vm | `vm/src/runtime/interpreter.rs:2692` |
-| `CRATONVM_TRUST_PEM` | 2 | **no** | value/other | classloading | `classloading/src/jar_signer.rs:1939` |
-| `CRATONVM_UNTRUSTED_CODE` | 1 | **no** | value/other | native-io | `native-io/src/lib.rs:181` |
+| `CRATONVM_TRUST_PEM` | 2 | **no** | value/other | classloading,types | `classloading/src/jar_signer.rs:1941` |
+| `CRATONVM_UNTRUSTED_CODE` | 1 | **no** | value/other | types | `types/src/flags.rs:761` |
 | `CRATONVM_URI_STRICT_CHARS` | 2 | **no** | value/other | native-builtins | `native-builtins/src/lib.rs:73154` |
 | `CRATONVM_USE_WILDFLY_REFLECT_SHIM` | 1 | **no** | value/other | native-builtins | `native-builtins/src/lang_class.rs:8082` |
 | `CRATONVM_USE_WILDFLY_SYNTH_BYTECODE` | 2 | **no** | value/other | native-builtins | `native-builtins/src/lang_class.rs:1602` |
@@ -428,7 +428,7 @@ read would silently turn the feature off*).
 | `CRATONVM_XT_HELPER_WINDOW_SCAN` | 1 | **no** | value/other | vm | `vm/src/jit/xt_root_scan.rs:127` |
 | `CRATONVM_XT_JIT_ROOT_SCAN` | 2 | partial | value/other | jit,vm | `jit/src/lib.rs:879` |
 | `CRATONVM_YOUNGSCAN_STRIDE` | 1 | yes | value/other | vm | `vm/src/vm/vm_exec.rs:668` |
-| `CRATONVM_ZIP_MAX_ENTRY_BYTES` | 1 | yes | value/other | native-io | `native-io/src/zip_real_jar.rs:88` |
+| `CRATONVM_ZIP_MAX_ENTRY_BYTES` | 2 | **no** | value/other | types | `types/src/flags.rs:773` |
 
 ## 5. Class (a) — debug / diagnostic flags
 
@@ -446,73 +446,74 @@ accessor becomes `const false` and the whole diagnostic block folds away.
 | `CRATONVM_DBG_TLS_HS` | 15 | no | native-builtins |
 | `CRATONVM_DBG_TLS_SOCK` | 14 | no | native-builtins |
 | `CRATONVM_IAE_TRACE` | 12 | partial | native-builtins,vm |
-| `CRATONVM_DBG_A2` | 8 | partial | gc,vm |
 | `CRATONVM_DBG_BLOCKGC` | 8 | partial | vm |
 | `CRATONVM_DBG_SCALAR_DEOPT` | 8 | no | jit,vm |
 | `CRATONVM_DBG_STTRACE` | 8 | no | native-builtins,vm |
 | `CRATONVM_DBG_TOARRAY` | 8 | partial | native-builtins,native-collections,vm |
-| `CRATONVM_G1_DBG_REACH` | 8 | no | gc |
 | `CRATONVM_DBG_ARGS` | 7 | no | vm-cli |
 | `CRATONVM_DBG_ASSERTJ_ARR` | 7 | no | native-builtins |
 | `CRATONVM_DBG_MH_DISPATCH` | 6 | no | native-builtins |
 | `CRATONVM_DBG_NIO_BIND` | 6 | no | native-builtins |
-| `CRATONVM_DBG_OBSREG` | 6 | no | classloading,native-builtins |
+| `CRATONVM_DBG_OBSREG` | 6 | no | native-builtins,types |
 | `CRATONVM_DBG_BUG03` | 5 | no | vm |
 | `CRATONVM_DBG_DEFLATE` | 5 | no | native-builtins |
-| `CRATONVM_DBG_MIRRORPIN` | 5 | no | gc,native-builtins,native-collections,vm |
+| `CRATONVM_DBG_MIRRORPIN` | 5 | no | native-builtins,native-collections,types,vm |
 | `CRATONVM_DBG_XNIO_TCP` | 5 | no | native-builtins |
 | `CRATONVM_DEBUG_STACKWALK` | 5 | no | native-builtins |
 | `CRATONVM_DIAG_SERVICELOADER` | 5 | no | native-builtins |
-| `CRATONVM_DBG_FBCGLIB` | 4 | no | classloading,native-builtins |
+| `CRATONVM_DBG_BLOCKED_ACCESS` | 4 | no | types |
 | `CRATONVM_DBG_FIELD_WATCH` | 4 | partial | types,vm |
-| `CRATONVM_DBG_GETRESOURCES` | 4 | partial | classloading,native-builtins |
+| `CRATONVM_DBG_GETRESOURCES` | 4 | no | native-builtins,types |
 | `CRATONVM_DBG_JITC` | 4 | no | jit,vm |
 | `CRATONVM_DBG_JIT_GEN` | 4 | no | jit |
 | `CRATONVM_DBG_LAMBDA_GENERIC` | 4 | no | native-builtins |
-| `CRATONVM_DBG_NET` | 4 | no | native-builtins,native-io |
 | `CRATONVM_DBG_OBJECTS` | 4 | no | native-builtins |
-| `CRATONVM_DBG_OOBFIELD` | 4 | no | gc |
 | `CRATONVM_DBG_RBC6` | 4 | partial | jit,vm |
 | `CRATONVM_DBG_REFLECTION_FACTORY` | 4 | no | native-builtins,vm |
 | `CRATONVM_DBG_RETRANSFORM` | 4 | no | vm |
 | `CRATONVM_DBG_SEL` | 4 | no | native-builtins |
+| `CRATONVM_DBG_STALE_OBJREF_CYCLES` | 4 | no | types |
 | `CRATONVM_DBG_STW_CENSUS` | 4 | no | vm |
-| `CRATONVM_DBG_WATCHREF` | 4 | partial | gc,vm |
+| `CRATONVM_DBG_WATCH_CELL` | 4 | no | types |
 | `CRATONVM_DBG_WF` | 4 | no | native-builtins |
 | `CRATONVM_ANN_TRACE` | 3 | no | native-builtins |
 | `CRATONVM_DBG_ALTRACE` | 3 | partial | native-collections,vm |
 | `CRATONVM_DBG_CCE_BT` | 3 | partial | native-builtins,native-collections,vm |
 | `CRATONVM_DBG_COMPACT_INLINE` | 3 | no | jit |
 | `CRATONVM_DBG_EXIT` | 3 | no | native-builtins,vm-cli |
+| `CRATONVM_DBG_FBCGLIB` | 3 | no | native-builtins,types |
 | `CRATONVM_DBG_FBREF` | 3 | no | native-builtins |
-| `CRATONVM_DBG_FORCE_MOVING` | 3 | no | gc,vm |
 | `CRATONVM_DBG_H2TRACE` | 3 | no | native-builtins,vm |
-| `CRATONVM_DBG_JETTY` | 3 | no | native-io,vm |
+| `CRATONVM_DBG_NET` | 3 | no | native-builtins,types |
 | `CRATONVM_DBG_NULLTHIS` | 3 | no | vm |
-| `CRATONVM_DBG_PB` | 3 | no | native-builtins,native-io |
-| `CRATONVM_DBG_PRECISE` | 3 | no | gc,vm |
+| `CRATONVM_DBG_OOBFIELD` | 3 | no | types |
+| `CRATONVM_DBG_PB` | 3 | no | native-builtins,types |
+| `CRATONVM_DBG_PRECISE` | 3 | no | types,vm |
 | `CRATONVM_DBG_SLEEP_TRACE` | 3 | no | native-builtins |
 | `CRATONVM_DBG_SOCK` | 3 | no | native-builtins |
 | `CRATONVM_DBG_STRAYSTACK` | 3 | partial | vm |
-| `CRATONVM_DBG_SWEEP_CENSUS` | 3 | no | gc |
 | `CRATONVM_DBG_TLABMISS` | 3 | yes | vm |
 | `CRATONVM_DBG_TLS_SRV` | 3 | no | native-builtins |
 | `CRATONVM_DBG_UCLRES` | 3 | no | native-builtins |
 | `CRATONVM_DBG_UNROLL` | 3 | no | jit |
+| `CRATONVM_DBG_WATCHREF` | 3 | no | types,vm |
 | `CRATONVM_DBG_XT_JIT_ROOT_SCAN` | 3 | no | vm |
+| `CRATONVM_SOCKET_CAPTURE` | 3 | no | types |
 | `CRATONVM_TRACE_CLASSVALUE` | 3 | partial | native-builtins,vm |
 | `CRATONVM_BD_DEBUG` | 2 | no | native-builtins,vm |
+| `CRATONVM_DBG_A2` | 2 | no | types,vm |
 | `CRATONVM_DBG_AIOOBE` | 2 | partial | vm |
-| `CRATONVM_DBG_BADREF` | 2 | no | gc |
 | `CRATONVM_DBG_CATALINA` | 2 | no | native-builtins,vm |
 | `CRATONVM_DBG_CAUSE` | 2 | no | native-builtins |
 | `CRATONVM_DBG_CORRUPT_FRAMES` | 2 | no | vm |
 | `CRATONVM_DBG_CTOR_FIX` | 2 | no | vm |
 | `CRATONVM_DBG_EQE` | 2 | no | native-builtins |
 | `CRATONVM_DBG_EXEC` | 2 | no | native-builtins,native-collections |
+| `CRATONVM_DBG_FORCE_MOVING` | 2 | no | types,vm |
+| `CRATONVM_DBG_GC_STRESS` | 2 | no | types |
 | `CRATONVM_DBG_HMPUT` | 2 | partial | native-collections |
 | `CRATONVM_DBG_HTTPSRV` | 2 | no | native-builtins |
-| `CRATONVM_DBG_JAR` | 2 | no | native-io |
+| `CRATONVM_DBG_JETTY` | 2 | no | types,vm |
 | `CRATONVM_DBG_JLM` | 2 | no | native-builtins |
 | `CRATONVM_DBG_LAMBDA_DISPATCH` | 2 | no | vm |
 | `CRATONVM_DBG_LETSGO` | 2 | no | vm |
@@ -523,27 +524,24 @@ accessor becomes `const false` and the whole diagnostic block folds away.
 | `CRATONVM_DBG_PICOCLI_STYLE` | 2 | no | native-builtins |
 | `CRATONVM_DBG_RAF_GETFD` | 2 | no | native-builtins |
 | `CRATONVM_DBG_SCALAR_NEW` | 2 | no | jit |
-| `CRATONVM_DBG_SC_READ` | 2 | no | native-io |
-| `CRATONVM_DBG_SC_WRITE` | 2 | no | native-io |
-| `CRATONVM_DBG_SEEDHUNT` | 2 | yes | gc |
+| `CRATONVM_DBG_SELECTOR` | 2 | no | types |
 | `CRATONVM_DBG_SHADOW` | 2 | no | vm |
 | `CRATONVM_DBG_SOCK_BYTES` | 2 | no | native-builtins |
 | `CRATONVM_DBG_SPID` | 2 | no | jit |
-| `CRATONVM_DBG_STALE_OBJREF` | 2 | partial | gc |
+| `CRATONVM_DBG_STALE_OBJREF` | 2 | no | gc,types |
 | `CRATONVM_DBG_STW_EXPECTED_IDS` | 2 | no | vm |
 | `CRATONVM_DBG_TLS_PLS` | 2 | no | native-builtins |
 | `CRATONVM_DBG_VDISP` | 2 | partial | native-builtins,vm |
-| `CRATONVM_DBG_YOUNGSTATE` | 2 | no | gc |
 | `CRATONVM_GC_VERIFY_STALE` | 2 | partial | vm |
 | `CRATONVM_INVOKE_VIRTUAL_ENTRY_TRACE` | 2 | no | vm |
 | `CRATONVM_SFI_NULL_TRACE` | 2 | no | native-builtins |
-| `CRATONVM_TRACE_UNIMPLEMENTED` | 2 | partial | classloading,vm |
+| `CRATONVM_TRACE_UNIMPLEMENTED` | 2 | no | types,vm |
 | `CRATONVM_ACTIVE_PROFILES_IDENTITY_TRACE` | 1 | no | vm |
 | `CRATONVM_ANN_PROXY_DISPATCH_TRACE` | 1 | no | vm |
 | `CRATONVM_ASSERT_SINGLE_OS_THREAD` | 1 | no | types |
 | `CRATONVM_DBG` | 1 | no | native-builtins |
-| `CRATONVM_DBG_ACCESS` | 1 | no | classloading |
-| `CRATONVM_DBG_AIO` | 1 | yes | native-io |
+| `CRATONVM_DBG_ACCESS` | 1 | no | types |
+| `CRATONVM_DBG_AIO` | 1 | no | types |
 | `CRATONVM_DBG_AIOOBE2` | 1 | yes | vm |
 | `CRATONVM_DBG_AIOOBE3` | 1 | yes | vm |
 | `CRATONVM_DBG_ANNPROXY_WRAP` | 1 | no | native-builtins |
@@ -556,9 +554,9 @@ accessor becomes `const false` and the whole diagnostic block folds away.
 | `CRATONVM_DBG_ATHROW` | 1 | no | vm |
 | `CRATONVM_DBG_ATOMIC_UPDATER` | 1 | no | native-builtins |
 | `CRATONVM_DBG_BADRECV` | 1 | no | vm |
+| `CRATONVM_DBG_BADREF` | 1 | no | types |
 | `CRATONVM_DBG_BB` | 1 | yes | native-builtins |
 | `CRATONVM_DBG_BBLP` | 1 | no | vm |
-| `CRATONVM_DBG_BLOCKED_ACCESS` | 1 | yes | gc |
 | `CRATONVM_DBG_BUFUNDER` | 1 | no | vm |
 | `CRATONVM_DBG_BYTECODE_DUMP` | 1 | no | vm |
 | `CRATONVM_DBG_CALLER` | 1 | no | native-builtins |
@@ -566,22 +564,22 @@ accessor becomes `const false` and the whole diagnostic block folds away.
 | `CRATONVM_DBG_CCE` | 1 | no | vm |
 | `CRATONVM_DBG_CCECACHE` | 1 | no | native-builtins |
 | `CRATONVM_DBG_CCSPROBE` | 1 | no | vm |
-| `CRATONVM_DBG_CELLCORRUPT` | 1 | yes | gc |
+| `CRATONVM_DBG_CELLCORRUPT` | 1 | no | types |
 | `CRATONVM_DBG_CHARSET` | 1 | no | vm |
-| `CRATONVM_DBG_CLASSPATH` | 1 | no | classloading |
+| `CRATONVM_DBG_CLASSPATH` | 1 | no | types |
 | `CRATONVM_DBG_CLONE` | 1 | yes | native-builtins |
 | `CRATONVM_DBG_COERCE` | 1 | no | native-builtins |
 | `CRATONVM_DBG_COMPACTVALUE` | 1 | no | types |
-| `CRATONVM_DBG_COMPACT_LEGACY` | 1 | no | gc |
+| `CRATONVM_DBG_COMPACT_LEGACY` | 1 | no | types |
 | `CRATONVM_DBG_COMPONENT_TYPE` | 1 | no | native-builtins |
-| `CRATONVM_DBG_DEFINE` | 1 | no | classloading |
-| `CRATONVM_DBG_DESCTRACE` | 1 | yes | gc |
+| `CRATONVM_DBG_DEFINE` | 1 | no | types |
+| `CRATONVM_DBG_DESCTRACE` | 1 | no | types |
 | `CRATONVM_DBG_DOPRIV` | 1 | yes | native-builtins |
 | `CRATONVM_DBG_DROPPED_STUBS` | 1 | no | native-api |
 | `CRATONVM_DBG_DUMP_JIT` | 1 | no | jit |
 | `CRATONVM_DBG_DUPCALL_FILTER` | 1 | no | vm |
-| `CRATONVM_DBG_DUPCLASS` | 1 | no | classloading |
-| `CRATONVM_DBG_DUPCLASS_BT` | 1 | no | classloading |
+| `CRATONVM_DBG_DUPCLASS` | 1 | no | types |
+| `CRATONVM_DBG_DUPCLASS_BT` | 1 | no | types |
 | `CRATONVM_DBG_DUPX_METHODS` | 1 | no | jit |
 | `CRATONVM_DBG_ECWATCH` | 1 | yes | vm |
 | `CRATONVM_DBG_ECWATCH_NATIVE` | 1 | yes | vm |
@@ -589,19 +587,18 @@ accessor becomes `const false` and the whole diagnostic block folds away.
 | `CRATONVM_DBG_FIELD_GET` | 1 | no | native-builtins |
 | `CRATONVM_DBG_FSP` | 1 | no | native-builtins |
 | `CRATONVM_DBG_FULLSTACK_SCAN` | 1 | yes | vm |
-| `CRATONVM_DBG_FWDGUARD` | 1 | yes | gc |
+| `CRATONVM_DBG_FWDGUARD` | 1 | no | types |
 | `CRATONVM_DBG_GCPART` | 1 | yes | vm |
-| `CRATONVM_DBG_GCPAUSE` | 1 | yes | gc |
-| `CRATONVM_DBG_GCPHASE` | 1 | no | gc |
-| `CRATONVM_DBG_GCWRITE` | 1 | yes | gc |
+| `CRATONVM_DBG_GCPAUSE` | 1 | no | types |
+| `CRATONVM_DBG_GCPHASE` | 1 | no | types |
+| `CRATONVM_DBG_GCWRITE` | 1 | no | types |
 | `CRATONVM_DBG_GC_OVERHEAD` | 1 | no | vm |
-| `CRATONVM_DBG_GC_STRESS` | 1 | yes | gc |
 | `CRATONVM_DBG_GOCBF` | 1 | no | native-builtins |
 | `CRATONVM_DBG_HANGWALK` | 1 | no | vm |
 | `CRATONVM_DBG_HANG_SAMPLE` | 1 | no | vm |
 | `CRATONVM_DBG_HEAPCOPY` | 1 | no | vm |
 | `CRATONVM_DBG_HEAP_STALE` | 1 | no | vm |
-| `CRATONVM_DBG_HEAP_TRACE` | 1 | no | gc |
+| `CRATONVM_DBG_HEAP_TRACE` | 1 | no | types |
 | `CRATONVM_DBG_HEARTBEAT` | 1 | no | vm |
 | `CRATONVM_DBG_HOTPATH_COUNTS` | 1 | no | vm |
 | `CRATONVM_DBG_IMSE` | 1 | no | vm |
@@ -614,6 +611,7 @@ accessor becomes `const false` and the whole diagnostic block folds away.
 | `CRATONVM_DBG_IR_CALL` | 1 | no | jit |
 | `CRATONVM_DBG_IR_LONG` | 1 | no | jit |
 | `CRATONVM_DBG_ISINSTANCE` | 1 | no | native-builtins |
+| `CRATONVM_DBG_JAR` | 1 | no | types |
 | `CRATONVM_DBG_JETTY2` | 1 | no | vm |
 | `CRATONVM_DBG_JIT_ALLOC` | 1 | yes | vm |
 | `CRATONVM_DBG_JIT_CODE` | 1 | no | jit |
@@ -628,10 +626,10 @@ accessor becomes `const false` and the whole diagnostic block folds away.
 | `CRATONVM_DBG_JIT_SAFEPOINTS` | 1 | no | vm |
 | `CRATONVM_DBG_KCBOOL` | 1 | yes | native-collections |
 | `CRATONVM_DBG_LAMBDA` | 1 | no | vm |
-| `CRATONVM_DBG_LAYOUT` | 1 | no | classloading |
+| `CRATONVM_DBG_LAYOUT` | 1 | no | types |
 | `CRATONVM_DBG_LHM_EVICT` | 1 | no | native-collections |
 | `CRATONVM_DBG_LICM` | 1 | no | jit |
-| `CRATONVM_DBG_LOADCLASS` | 1 | no | classloading |
+| `CRATONVM_DBG_LOADCLASS` | 1 | no | types |
 | `CRATONVM_DBG_LOGPROV` | 1 | no | native-builtins |
 | `CRATONVM_DBG_LONGROOT` | 1 | yes | vm |
 | `CRATONVM_DBG_MCL` | 1 | no | native-builtins |
@@ -641,7 +639,7 @@ accessor becomes `const false` and the whole diagnostic block folds away.
 | `CRATONVM_DBG_MH_STACK` | 1 | no | vm |
 | `CRATONVM_DBG_MIC_PROF` | 1 | yes | vm |
 | `CRATONVM_DBG_MINVOKE` | 1 | no | native-builtins |
-| `CRATONVM_DBG_MODPROV` | 1 | no | classloading |
+| `CRATONVM_DBG_MODPROV` | 1 | no | types |
 | `CRATONVM_DBG_MODSTATIC` | 1 | no | vm |
 | `CRATONVM_DBG_MONENTER` | 1 | yes | vm |
 | `CRATONVM_DBG_MONEXIT` | 1 | yes | vm |
@@ -651,7 +649,7 @@ accessor becomes `const false` and the whole diagnostic block folds away.
 | `CRATONVM_DBG_NETTY_QUEUE` | 1 | yes | native-builtins |
 | `CRATONVM_DBG_NOCODE` | 1 | no | vm |
 | `CRATONVM_DBG_NO_CLEANERS` | 1 | yes | vm |
-| `CRATONVM_DBG_NO_NONMOVING_RECLAIM` | 1 | no | gc |
+| `CRATONVM_DBG_NO_NONMOVING_RECLAIM` | 1 | no | types |
 | `CRATONVM_DBG_NO_PRUNE` | 1 | yes | vm |
 | `CRATONVM_DBG_NO_REFPROC` | 1 | yes | vm |
 | `CRATONVM_DBG_NPE_INVOKE` | 1 | no | vm |
@@ -676,15 +674,17 @@ accessor becomes `const false` and the whole diagnostic block folds away.
 | `CRATONVM_DBG_REMAP_TRACE` | 1 | yes | vm |
 | `CRATONVM_DBG_REPLOVR` | 1 | no | native-builtins |
 | `CRATONVM_DBG_RESOLVE_SHIM` | 1 | no | native-builtins |
-| `CRATONVM_DBG_RESOURCE_TIMING` | 1 | yes | classloading |
+| `CRATONVM_DBG_RESOURCE_TIMING` | 1 | no | types |
 | `CRATONVM_DBG_RESUME_PC` | 1 | no | vm |
 | `CRATONVM_DBG_ROOTSNAP` | 1 | yes | vm |
-| `CRATONVM_DBG_RSET_AUDIT` | 1 | no | gc |
-| `CRATONVM_DBG_RSET_AUDIT_YOUNG_SCAN` | 1 | no | gc |
+| `CRATONVM_DBG_RSET_AUDIT` | 1 | no | types |
+| `CRATONVM_DBG_RSET_AUDIT_YOUNG_SCAN` | 1 | no | types |
 | `CRATONVM_DBG_RVAS` | 1 | no | libcratonvm |
-| `CRATONVM_DBG_SC_CLOSE` | 1 | no | native-io |
-| `CRATONVM_DBG_SEED_ALL_OLD` | 1 | no | gc |
-| `CRATONVM_DBG_SELECTOR` | 1 | yes | native-io |
+| `CRATONVM_DBG_SC_CLOSE` | 1 | no | types |
+| `CRATONVM_DBG_SC_READ` | 1 | no | types |
+| `CRATONVM_DBG_SC_WRITE` | 1 | no | types |
+| `CRATONVM_DBG_SEEDHUNT` | 1 | no | types |
+| `CRATONVM_DBG_SEED_ALL_OLD` | 1 | no | types |
 | `CRATONVM_DBG_SHADOW2` | 1 | yes | jit |
 | `CRATONVM_DBG_SHADOW2_FILTER` | 1 | no | jit |
 | `CRATONVM_DBG_SHADOW_DEPTH` | 1 | no | vm |
@@ -692,12 +692,12 @@ accessor becomes `const false` and the whole diagnostic block folds away.
 | `CRATONVM_DBG_SOE` | 1 | no | vm |
 | `CRATONVM_DBG_STACKLESS` | 1 | no | vm |
 | `CRATONVM_DBG_STALELONG` | 1 | yes | vm |
-| `CRATONVM_DBG_STALE_OBJREF_CYCLES` | 1 | yes | gc |
 | `CRATONVM_DBG_STALE_RECV` | 1 | no | vm |
 | `CRATONVM_DBG_STREAMSUPP` | 1 | no | native-builtins |
 | `CRATONVM_DBG_STW_NATIVE_RING` | 1 | no | vm |
-| `CRATONVM_DBG_SWEEP_EDGES` | 1 | no | gc |
-| `CRATONVM_DBG_SWEEP_ZERO` | 1 | yes | gc |
+| `CRATONVM_DBG_SWEEP_CENSUS` | 1 | no | types |
+| `CRATONVM_DBG_SWEEP_EDGES` | 1 | no | types |
+| `CRATONVM_DBG_SWEEP_ZERO` | 1 | no | types |
 | `CRATONVM_DBG_THREADREG_PERF` | 1 | yes | vm |
 | `CRATONVM_DBG_THREADSTART` | 1 | no | vm |
 | `CRATONVM_DBG_TIER_ENQUEUE` | 1 | no | jit |
@@ -717,16 +717,16 @@ accessor becomes `const false` and the whole diagnostic block folds away.
 | `CRATONVM_DBG_VM_STATE` | 1 | yes | vm |
 | `CRATONVM_DBG_WATCHADDR` | 1 | yes | vm |
 | `CRATONVM_DBG_WATCH_CAUSE_SELF` | 1 | no | native-builtins |
-| `CRATONVM_DBG_WATCH_CELL` | 1 | yes | gc |
 | `CRATONVM_DBG_WEAKREF` | 1 | yes | vm |
 | `CRATONVM_DBG_WF_NPE` | 1 | no | vm |
 | `CRATONVM_DBG_YOUNGSCAN` | 1 | yes | vm |
-| `CRATONVM_DBG_ZERO_RANGES` | 1 | yes | gc |
+| `CRATONVM_DBG_YOUNGSTATE` | 1 | no | types |
+| `CRATONVM_DBG_ZERO_RANGES` | 1 | no | types |
 | `CRATONVM_DEBUG_SFI` | 1 | no | native-builtins |
 | `CRATONVM_DEBUG_STACK_TAG` | 1 | no | vm |
 | `CRATONVM_DEOPT_VERIFY` | 1 | yes | jit |
-| `CRATONVM_DIAG_HIB32` | 1 | no | gc |
-| `CRATONVM_DIAG_JAR_LIST` | 1 | no | native-io |
+| `CRATONVM_DIAG_HIB32` | 1 | no | types |
+| `CRATONVM_DIAG_JAR_LIST` | 1 | no | types |
 | `CRATONVM_DIAG_JBOSS_SERVICES` | 1 | no | native-builtins |
 | `CRATONVM_DIAG_JCA` | 1 | no | native-builtins |
 | `CRATONVM_DIAG_METHOD_INVOKE_NULL` | 1 | no | native-builtins |
@@ -735,12 +735,13 @@ accessor becomes `const false` and the whole diagnostic block folds away.
 | `CRATONVM_EXEC_FRAME_TRACE` | 1 | no | vm |
 | `CRATONVM_FORNAME_TRACE` | 1 | no | native-builtins |
 | `CRATONVM_FRAME_TRACE` | 1 | no | vm |
-| `CRATONVM_FWD_RESOLVE_STRICT` | 1 | yes | gc |
-| `CRATONVM_G1_DBG_HEADERS` | 1 | no | gc |
-| `CRATONVM_G1_DBG_PINS` | 1 | no | gc |
-| `CRATONVM_G1_DBG_ROOTCENSUS` | 1 | no | gc |
-| `CRATONVM_G1_DBG_ZERO` | 1 | no | gc |
-| `CRATONVM_GC_ARRAY_GUARD_BT` | 1 | no | gc |
+| `CRATONVM_FWD_RESOLVE_STRICT` | 1 | no | types |
+| `CRATONVM_G1_DBG_HEADERS` | 1 | no | types |
+| `CRATONVM_G1_DBG_PINS` | 1 | no | types |
+| `CRATONVM_G1_DBG_REACH` | 1 | no | types |
+| `CRATONVM_G1_DBG_ROOTCENSUS` | 1 | no | types |
+| `CRATONVM_G1_DBG_ZERO` | 1 | no | types |
+| `CRATONVM_GC_ARRAY_GUARD_BT` | 1 | no | types |
 | `CRATONVM_GC_STATS` | 1 | no | vm-cli |
 | `CRATONVM_GPU_TRACE_BYTES` | 1 | yes | vm |
 | `CRATONVM_HM_TRACE` | 1 | yes | native-collections |
@@ -756,22 +757,21 @@ accessor becomes `const false` and the whole diagnostic block folds away.
 | `CRATONVM_LOCK_ORDER_CHECK` | 1 | no | types |
 | `CRATONVM_LONGROOT_STRICT` | 1 | yes | vm |
 | `CRATONVM_MOVING_YOUNG_COVERAGE_DBG` | 1 | no | vm |
-| `CRATONVM_MOVING_YOUNG_VERIFY` | 1 | yes | gc |
+| `CRATONVM_MOVING_YOUNG_VERIFY` | 1 | no | types |
 | `CRATONVM_NEEDS_EXACT_TRACE` | 1 | no | vm |
-| `CRATONVM_NO_SELECTOR_CONNECT_PROBE` | 1 | yes | native-io |
+| `CRATONVM_NO_SELECTOR_CONNECT_PROBE` | 1 | no | types |
 | `CRATONVM_NSEE_TRACE` | 1 | no | vm |
 | `CRATONVM_OOP_SPAN_PROBE` | 1 | no | types |
 | `CRATONVM_QUICKEN_STATS` | 1 | yes | reader |
 | `CRATONVM_S111_DBG` | 1 | yes | native-builtins |
 | `CRATONVM_SHADOW_SENTINEL` | 1 | yes | jit |
 | `CRATONVM_SHADOW_WATCH` | 1 | yes | jit |
-| `CRATONVM_SOCKET_CAPTURE` | 1 | yes | native-io |
 | `CRATONVM_SPRING_DBG` | 1 | yes | native-builtins |
-| `CRATONVM_SP_STATS` | 1 | no | gc |
-| `CRATONVM_SP_TRACE` | 1 | no | gc |
-| `CRATONVM_SP_VERIFY` | 1 | no | gc |
+| `CRATONVM_SP_STATS` | 1 | no | types |
+| `CRATONVM_SP_TRACE` | 1 | no | types |
+| `CRATONVM_SP_VERIFY` | 1 | no | types |
 | `CRATONVM_STRICT_SWALLOWS` | 1 | yes | vm |
-| `CRATONVM_SUREFIRE_IPC_DBG` | 1 | yes | native-io |
+| `CRATONVM_SUREFIRE_IPC_DBG` | 1 | no | types |
 | `CRATONVM_SYMBOLIZE` | 1 | no | vm-cli |
 | `CRATONVM_SYMBOLIZE_DBG` | 1 | no | vm |
 | `CRATONVM_TRACE_ARRAYS_HASHCODE` | 1 | no | native-builtins |
@@ -945,7 +945,7 @@ follow-up has the same evidence base.
 ## 8. Caching status and the per-call readers
 
 `std::env::var` takes a process-global lock in libc `getenv` and allocates. Of the
-1145 read sites, **911** are not behind a `OnceLock`. Most of those are cold
+1155 read sites, **958** are not behind a `OnceLock`. Most of those are cold
 (startup, class load, JIT compile), but three are genuinely hot and are the reason
 the typed config is worth doing on performance grounds alone:
 
@@ -979,27 +979,36 @@ The refactor extends what is already there rather than inventing a parallel syst
 * `types/src/lock_order.rs` — the precedent for putting a cross-crate concept in
   `cratonvm-types`, the crate every other crate already depends on.
 
-## 10. Finding: four disagreeing boolean truth tables
+## 10. Finding: seven disagreeing boolean truth tables
 
 There is no single answer to "what does `CRATONVM_FOO=false` mean". The tree
-contains at least these four:
+contains at least these seven, all of them live. The first four were found by
+the census scan; the last three surfaced while migrating `classloading` and
+`native-io`, which is a reminder that the count is a lower bound.
 
-| Parser | `unset` | `""` | `"0"` | `"false"` | `"off"` | `"no"` | anything else |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| `var_os(..).is_some()` (the ~600-site majority) | false | **true** | **true** | true | true | true | true |
-| `env_cache::disable_jit` (`env_cache.rs:70`) | false | **false** | **false** | true | true | true | true |
-| `native_io::env_flag_enabled` (`lib.rs:168`) | false | false | false | **false** | **false** | **false** | true |
-| `TieredParams` `tiered_enabled` (`tiered.rs:223`) | true | true | **false** | **false** | true | true | true |
+| Parser | `unset` | `""` | `"0"` | `"false"` | `"off"` | `"no"` | `"NO"` | else |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `var_os(..).is_some()` — the ~600-site majority | false | **true** | **true** | true | true | true | true | true |
+| `env_cache::disable_jit` (`env_cache.rs:70`) | false | **false** | **false** | true | true | true | true | true |
+| `native_io::env_flag_enabled` (was `lib.rs:168`) | false | false | false | **false** | **false** | **false** | **false** | true |
+| `TieredParams::tiered_enabled` (`tiered.rs:223`) | **true** | **true** | false | false | **true** | **true** | **true** | true |
+| `lock_order::compute_enforced` (`lock_order.rs:242`) | false | false | false | false | false | false | false | **only `1`/`true`/`yes`/`on`** |
+| `class_manager::loader_aware_resolution` (`:141`) | **true** | false | false | true | true | true | true | true |
+| `class_path::dbg_getresources` + `nio_selector::sel_dbg_enabled` | false | false | false | *differs*: `dbg_getresources` true, `sel_dbg_enabled` **false** | true | true | true | true |
 
-So `CRATONVM_X=0` *enables* the feature at ~600 sites and *disables* it at three
-others. This is a genuine footgun and the single strongest argument for one typed
-config: the parse happens once, in one place, with one documented truth table.
+So `CRATONVM_X=0` *enables* the feature at roughly 600 sites and *disables* it
+at six others, and `CRATONVM_X=false` splits two flags that look like siblings.
+This is a genuine footgun and the single strongest argument for one typed
+config: the parse happens once, in one place, and each field records which
+table it uses.
 
-**This branch does not unify the truth tables.** Each migrated flag keeps its own
-parse function byte-for-byte, because changing `X=0` from "on" to "off" for 600
-flags is a behaviour change, not a plumbing change. The typed config makes the
-divergence *visible* (each field records which parser it uses) so it can be
-retired deliberately, flag by flag, with benchmarks.
+**This branch does not unify the truth tables.** Each migrated flag keeps its
+own parse function byte-for-byte, because changing what `X=0` means for 600
+flags is a behaviour change, not a plumbing change. All seven now live side by
+side in `cratonvm_types::flags::parse`, each documented with the call site it
+was lifted from, and a unit test asserts that they still disagree — so the
+divergence cannot be tidied away by accident and can instead be retired
+deliberately, flag by flag, with benchmarks.
 
 ## 11. Reproducing this census
 

@@ -40,8 +40,8 @@ pub use field_layout::{
     FieldStorageKind,
 };
 pub use flags::{
-    flags, install as install_flags, BlockedAccessMode, EnvSource, FlagSource, GcFlags, JitFlags,
-    MapSource, OverlaySource, VmFlags,
+    flags, install as install_flags, BlockedAccessMode, EnvSource, FlagSource, GcFlags, IoFlags,
+    JitFlags, LoaderFlags, MapSource, OverlaySource, VmFlags,
 };
 pub use float_format::{java_double_to_string, java_float_to_string};
 pub use handle::{HandleScope, HandleStorage, RootedHandle};

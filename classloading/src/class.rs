@@ -10,6 +10,7 @@
 use std::fmt;
 use std::sync::Arc;
 
+use crate::loader_flags;
 use cratonvm_reader::class_access_flags::{ClassAccessFlags, FieldAccessFlags};
 use cratonvm_reader::class_file_version::ClassFileVersion;
 use cratonvm_reader::constant_pool::ConstantPool;
@@ -961,7 +962,7 @@ impl ClassStore {
         let built = self.build_compact_layout(id);
         // Diagnostic for compressed-oops / layout work: shows whether a class
         // got the compact tagless layout at all, and how wide its body is.
-        if std::env::var_os("CRATONVM_DBG_LAYOUT").is_some() {
+        if loader_flags().dbg_layout {
             let name = self.get(id).map(|c| c.name.to_string()).unwrap_or_default();
             match &built {
                 Some(l) => eprintln!(
@@ -1006,8 +1007,7 @@ impl ClassStore {
         let total = self.get(id)?.num_total_fields;
         let mut field_offsets: Vec<u32> = Vec::with_capacity(total);
         let mut is_ref: Vec<bool> = Vec::with_capacity(total);
-        let mut field_kinds: Vec<cratonvm_types::FieldStorageKind> =
-            Vec::with_capacity(total);
+        let mut field_kinds: Vec<cratonvm_types::FieldStorageKind> = Vec::with_capacity(total);
         let mut ref_offsets: Vec<u32> = Vec::new();
         let mut off: u32 = 0;
         let mut count: usize = 0;

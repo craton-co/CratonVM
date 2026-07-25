@@ -11,6 +11,7 @@ use cratonvm_reader::class_access_flags::{FieldAccessFlags, MethodAccessFlags};
 use std::sync::Arc;
 
 use super::class::{Class, ClassStore};
+use crate::loader_flags;
 use crate::module::{package_of as module_pkg_of, ModuleRegistry, UNNAMED_MODULE};
 use cratonvm_types::error::LinkageError;
 
@@ -30,7 +31,7 @@ pub fn check_class_access(accessor: &Class, target: &Class) -> Result<(), Linkag
         return Ok(());
     }
 
-    if std::env::var("CRATONVM_DBG_ACCESS").is_ok() {
+    if loader_flags().dbg_access {
         eprintln!(
             "[ACCESS-DBG] DENY accessor={} accessor.loader_id={:?} target={} target.loader_id={:?}",
             accessor.name, accessor.loader_id, target.name, target.loader_id

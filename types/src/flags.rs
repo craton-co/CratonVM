@@ -265,6 +265,76 @@ pub mod parse {
             })
             .unwrap_or(0)
     }
+
+    /// `match var(NAME) { Ok(v) => !v.is_empty() && v != "0", Err(_) => true }`
+    ///
+    /// The default-**ON** twin of [`non_empty_non_zero`]. Used by
+    /// `classloading::class_manager::loader_aware_resolution`.
+    #[inline]
+    pub fn non_empty_non_zero_default_true(src: &dyn FlagSource, name: &str) -> bool {
+        match utf8(src, name) {
+            Some(v) => !v.is_empty() && v != "0",
+            None => true,
+        }
+    }
+
+    /// `!matches!(value.as_deref(), Ok("0") | Ok("false") | Ok("no"))` — default
+    /// ON, disabled only by those three exact lowercase spellings. Used by
+    /// `classloading`'s boot module registry.
+    #[inline]
+    pub fn on_unless_off_word(src: &dyn FlagSource, name: &str) -> bool {
+        !matches!(
+            utf8(src, name).as_deref(),
+            Some("0") | Some("false") | Some("no")
+        )
+    }
+
+    /// Trimmed `!empty && != "0" && !~ "false"` — default OFF. Used by
+    /// `native_io::nio_selector` and `native_io::socket_channel`.
+    #[inline]
+    pub fn non_empty_non_zero_non_false(src: &dyn FlagSource, name: &str) -> bool {
+        utf8(src, name)
+            .map(|v| {
+                let t = v.trim();
+                !t.is_empty() && t != "0" && !t.eq_ignore_ascii_case("false")
+            })
+            .unwrap_or(false)
+    }
+
+    /// `var(NAME).as_deref() == Ok("1")` — only the exact string `1` counts.
+    #[inline]
+    pub fn exactly_one(src: &dyn FlagSource, name: &str) -> bool {
+        utf8(src, name).as_deref() == Some("1")
+    }
+
+    /// A non-empty value, `None` when unset or empty.
+    #[inline]
+    pub fn non_empty_string(src: &dyn FlagSource, name: &str) -> Option<String> {
+        utf8(src, name).filter(|s| !s.is_empty())
+    }
+
+    /// Trimmed decimal `usize` with no trimming of the *input* — matches the
+    /// `s.parse::<usize>()` call sites that do not trim.
+    #[inline]
+    pub fn usize_opt_untrimmed(src: &dyn FlagSource, name: &str) -> Option<usize> {
+        utf8(src, name).and_then(|v| v.parse::<usize>().ok())
+    }
+
+    /// Trimmed decimal `i32`, kept only when `> 0`.
+    #[inline]
+    pub fn i32_positive(src: &dyn FlagSource, name: &str) -> Option<i32> {
+        utf8(src, name)
+            .and_then(|v| v.trim().parse::<i32>().ok())
+            .filter(|&n| n > 0)
+    }
+
+    /// Trimmed decimal `u64`, kept only when `> 0`.
+    #[inline]
+    pub fn u64_positive(src: &dyn FlagSource, name: &str) -> Option<u64> {
+        utf8(src, name)
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|&n| n > 0)
+    }
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -451,7 +521,7 @@ impl GcFlags {
             dbg_compact_legacy: present(src, "CRATONVM_DBG_COMPACT_LEGACY"),
             dbg_seed_all_old: present(src, "CRATONVM_DBG_SEED_ALL_OLD"),
             dbg_stale_objref: present(src, "CRATONVM_DBG_STALE_OBJREF"),
-            dbg_stale_objref_cycles: usize_opt(src, "CRATONVM_DBG_STALE_OBJREF_CYCLES")
+            dbg_stale_objref_cycles: usize_opt_untrimmed(src, "CRATONVM_DBG_STALE_OBJREF_CYCLES")
                 .filter(|&n| n >= 1)
                 .unwrap_or(1),
             dbg_blocked_access: match utf8(src, "CRATONVM_DBG_BLOCKED_ACCESS") {
@@ -523,6 +593,200 @@ impl JitFlags {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
+// Class-loading flags
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Flags read by `cratonvm-classloading`.
+#[derive(Debug, Clone)]
+pub struct LoaderFlags {
+    /// `CRATONVM_LOADER_AWARE_RESOLUTION` — resolve implicit class constants
+    /// through the defining class's own loader. **Default ON**; empty or `0`
+    /// turns it off. [`parse::non_empty_non_zero_default_true`].
+    pub loader_aware_resolution: bool,
+    /// `CRATONVM_BOOT_MODULE_REGISTRY` — register JDK modules at boot.
+    /// **Default ON**; `0` / `false` / `no` turn it off.
+    /// [`parse::on_unless_off_word`].
+    pub boot_module_registry: bool,
+    /// `CRATONVM_ALLOW_JSR_RET` — accept `jsr`/`ret` in the verifier.
+    /// [`parse::non_empty_non_zero`].
+    pub allow_jsr_ret: bool,
+    /// `CRATONVM_HARDEN_MANIFEST_CLASSPATH` — drop manifest `Class-Path`
+    /// entries that escape the JAR's directory. [`parse::non_empty_non_zero`].
+    pub harden_manifest_classpath: bool,
+    /// `CRATONVM_DISABLE_JAR_MMAP` — read JARs with `read()` instead of `mmap`.
+    pub disable_jar_mmap: bool,
+    /// `CRATONVM_TRUST_PEM` — path to an extra PEM trust bundle.
+    /// [`parse::utf8`].
+    pub trust_pem: Option<String>,
+    /// `CRATONVM_TRACE_UNIMPLEMENTED`
+    pub trace_unimplemented: bool,
+    /// `CRATONVM_DBG_ACCESS` — [`parse::present_utf8`].
+    pub dbg_access: bool,
+    /// `CRATONVM_DBG_CLASSPATH`
+    pub dbg_classpath: bool,
+    /// `CRATONVM_DBG_DEFINE` — [`parse::present_utf8`].
+    pub dbg_define: bool,
+    /// `CRATONVM_DBG_DUPCLASS` — [`parse::present_utf8`].
+    pub dbg_dupclass: bool,
+    /// `CRATONVM_DBG_DUPCLASS_BT`
+    pub dbg_dupclass_bt: bool,
+    /// `CRATONVM_DBG_FBCGLIB`
+    pub dbg_fbcglib: bool,
+    /// `CRATONVM_DBG_GETRESOURCES` — [`parse::non_empty_non_zero`].
+    pub dbg_getresources: bool,
+    /// `CRATONVM_DBG_LAYOUT`
+    pub dbg_layout: bool,
+    /// `CRATONVM_DBG_LOADCLASS`
+    pub dbg_loadclass: bool,
+    /// `CRATONVM_DBG_MODPROV` — [`parse::present_utf8`].
+    pub dbg_modprov: bool,
+    /// `CRATONVM_DBG_OBSREG`
+    pub dbg_obsreg: bool,
+    /// `CRATONVM_DBG_RESOURCE_TIMING`
+    pub dbg_resource_timing: bool,
+}
+
+impl Default for LoaderFlags {
+    fn default() -> Self {
+        Self::from_source(&MapSource::empty())
+    }
+}
+
+impl LoaderFlags {
+    fn from_source(src: &dyn FlagSource) -> Self {
+        use parse::*;
+        Self {
+            loader_aware_resolution: non_empty_non_zero_default_true(
+                src,
+                "CRATONVM_LOADER_AWARE_RESOLUTION",
+            ),
+            boot_module_registry: on_unless_off_word(src, "CRATONVM_BOOT_MODULE_REGISTRY"),
+            allow_jsr_ret: non_empty_non_zero(src, "CRATONVM_ALLOW_JSR_RET"),
+            harden_manifest_classpath: non_empty_non_zero(
+                src,
+                "CRATONVM_HARDEN_MANIFEST_CLASSPATH",
+            ),
+            disable_jar_mmap: present(src, "CRATONVM_DISABLE_JAR_MMAP"),
+            trust_pem: utf8(src, "CRATONVM_TRUST_PEM"),
+            trace_unimplemented: present(src, "CRATONVM_TRACE_UNIMPLEMENTED"),
+            dbg_access: present_utf8(src, "CRATONVM_DBG_ACCESS"),
+            dbg_classpath: present(src, "CRATONVM_DBG_CLASSPATH"),
+            dbg_define: present_utf8(src, "CRATONVM_DBG_DEFINE"),
+            dbg_dupclass: present_utf8(src, "CRATONVM_DBG_DUPCLASS"),
+            dbg_dupclass_bt: present(src, "CRATONVM_DBG_DUPCLASS_BT"),
+            dbg_fbcglib: present(src, "CRATONVM_DBG_FBCGLIB"),
+            dbg_getresources: non_empty_non_zero(src, "CRATONVM_DBG_GETRESOURCES"),
+            dbg_layout: present(src, "CRATONVM_DBG_LAYOUT"),
+            dbg_loadclass: present(src, "CRATONVM_DBG_LOADCLASS"),
+            dbg_modprov: present_utf8(src, "CRATONVM_DBG_MODPROV"),
+            dbg_obsreg: present(src, "CRATONVM_DBG_OBSREG"),
+            dbg_resource_timing: present(src, "CRATONVM_DBG_RESOURCE_TIMING"),
+        }
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// I/O and networking flags
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Flags read by `cratonvm-native-io`.
+#[derive(Debug, Clone, Default)]
+pub struct IoFlags {
+    /// `CRATONVM_CONFINE_IO` — certified deployment profile: enable CWD
+    /// confinement, fail closed. [`parse::truthy_word`].
+    pub confine_io: bool,
+    /// `CRATONVM_UNTRUSTED_CODE` — untrusted-bytecode profile: enable CWD
+    /// confinement, warn loudly. [`parse::truthy_word`].
+    pub untrusted_code: bool,
+    /// `CRATONVM_BLOCK_PRIVATE_NETS` — deny outbound to loopback and RFC1918.
+    /// [`parse::truthy_word`].
+    pub block_private_nets: bool,
+    /// `CRATONVM_RESOLVE_OUTBOUND_HOST` — resolve outbound hostnames and apply
+    /// the per-IP policy to every address. [`parse::truthy_word`].
+    pub resolve_outbound_host: bool,
+    /// `CRATONVM_REAL_NET_SOCKETS` — use real OS sockets instead of the
+    /// synthetic implementations.
+    pub real_net_sockets: bool,
+    /// `CRATONVM_SYNTHETIC_FILEWRITER=1` — opt back into the synthetic (known
+    /// lossy) `FileWriter`. Consumers want `!synthetic_filewriter_forced`.
+    /// [`parse::exactly_one`].
+    pub synthetic_filewriter_forced: bool,
+    /// `CRATONVM_SYNTHETIC_RAF=1` — opt back into the synthetic
+    /// `RandomAccessFile`. Consumers want `!synthetic_raf_forced`.
+    /// [`parse::exactly_one`].
+    pub synthetic_raf_forced: bool,
+    /// `CRATONVM_SOCKET_CAPTURE` — non-empty path prefix for socket capture
+    /// files. [`parse::non_empty_string`].
+    pub socket_capture_prefix: Option<String>,
+    /// `CRATONVM_SELECT_MAX_BLOCK_MS` — cap on an indefinite
+    /// `Selector.select()`, in ms; the caller supplies the default.
+    /// [`parse::i32_positive`].
+    pub select_max_block_ms: Option<i32>,
+    /// `CRATONVM_NO_SELECTOR_CONNECT_PROBE` — disable the Windows selector's
+    /// connect-completion probe. [`parse::non_empty_non_zero_non_false`].
+    pub no_selector_connect_probe: bool,
+    /// `CRATONVM_ZIP_MAX_ENTRY_BYTES` — per-entry inflate cap; the caller
+    /// supplies the default. [`parse::u64_positive`].
+    pub zip_max_entry_bytes: Option<u64>,
+    /// `CRATONVM_DIAG_JAR_LIST` — path to a classpath file for the jar-open
+    /// timing probe. [`parse::utf8`].
+    pub diag_jar_list: Option<String>,
+    /// `CRATONVM_DBG_SELECTOR` — [`parse::non_empty_non_zero_non_false`].
+    pub dbg_selector: bool,
+    /// `CRATONVM_SUREFIRE_IPC_DBG` — [`parse::non_empty_non_zero_non_false`].
+    pub surefire_ipc_dbg: bool,
+    /// `CRATONVM_DBG_AIO`
+    pub dbg_aio: bool,
+    /// `CRATONVM_DBG_JAR`
+    pub dbg_jar: bool,
+    /// `CRATONVM_DBG_JETTY` — [`parse::present_utf8`].
+    pub dbg_jetty: bool,
+    /// `CRATONVM_DBG_NET`
+    pub dbg_net: bool,
+    /// `CRATONVM_DBG_PB`
+    pub dbg_pb: bool,
+    /// `CRATONVM_DBG_SC_CLOSE`
+    pub dbg_sc_close: bool,
+    /// `CRATONVM_DBG_SC_READ`
+    pub dbg_sc_read: bool,
+    /// `CRATONVM_DBG_SC_WRITE`
+    pub dbg_sc_write: bool,
+}
+
+impl IoFlags {
+    fn from_source(src: &dyn FlagSource) -> Self {
+        use parse::*;
+        Self {
+            confine_io: truthy_word(src, "CRATONVM_CONFINE_IO"),
+            untrusted_code: truthy_word(src, "CRATONVM_UNTRUSTED_CODE"),
+            block_private_nets: truthy_word(src, "CRATONVM_BLOCK_PRIVATE_NETS"),
+            resolve_outbound_host: truthy_word(src, "CRATONVM_RESOLVE_OUTBOUND_HOST"),
+            real_net_sockets: present(src, "CRATONVM_REAL_NET_SOCKETS"),
+            synthetic_filewriter_forced: exactly_one(src, "CRATONVM_SYNTHETIC_FILEWRITER"),
+            synthetic_raf_forced: exactly_one(src, "CRATONVM_SYNTHETIC_RAF"),
+            socket_capture_prefix: non_empty_string(src, "CRATONVM_SOCKET_CAPTURE"),
+            select_max_block_ms: i32_positive(src, "CRATONVM_SELECT_MAX_BLOCK_MS"),
+            no_selector_connect_probe: non_empty_non_zero_non_false(
+                src,
+                "CRATONVM_NO_SELECTOR_CONNECT_PROBE",
+            ),
+            zip_max_entry_bytes: u64_positive(src, "CRATONVM_ZIP_MAX_ENTRY_BYTES"),
+            diag_jar_list: utf8(src, "CRATONVM_DIAG_JAR_LIST"),
+            dbg_selector: non_empty_non_zero_non_false(src, "CRATONVM_DBG_SELECTOR"),
+            surefire_ipc_dbg: non_empty_non_zero_non_false(src, "CRATONVM_SUREFIRE_IPC_DBG"),
+            dbg_aio: present(src, "CRATONVM_DBG_AIO"),
+            dbg_jar: present(src, "CRATONVM_DBG_JAR"),
+            dbg_jetty: present_utf8(src, "CRATONVM_DBG_JETTY"),
+            dbg_net: present(src, "CRATONVM_DBG_NET"),
+            dbg_pb: present(src, "CRATONVM_DBG_PB"),
+            dbg_sc_close: present(src, "CRATONVM_DBG_SC_CLOSE"),
+            dbg_sc_read: present(src, "CRATONVM_DBG_SC_READ"),
+            dbg_sc_write: present(src, "CRATONVM_DBG_SC_WRITE"),
+        }
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
 // Root
 // ───────────────────────────────────────────────────────────────────────────
 
@@ -533,6 +797,10 @@ pub struct VmFlags {
     pub gc: GcFlags,
     /// JIT flags.
     pub jit: JitFlags,
+    /// Class-loading flags.
+    pub loader: LoaderFlags,
+    /// I/O and networking flags.
+    pub io: IoFlags,
 }
 
 impl VmFlags {
@@ -543,6 +811,8 @@ impl VmFlags {
         Self {
             gc: GcFlags::from_source(src),
             jit: JitFlags::from_source(src),
+            loader: LoaderFlags::from_source(src),
+            io: IoFlags::from_source(src),
         }
     }
 
@@ -765,6 +1035,157 @@ mod tests {
         // No env var set for this name, so the overlay is what shows through.
         let overlay = OverlaySource::new(MapSource::empty().with("CRATONVM_CARD_TABLE_ONLY", "1"));
         assert!(VmFlags::from_source(&overlay).gc.card_table_only);
+    }
+
+    #[test]
+    fn loader_defaults_are_on_where_the_call_sites_defaulted_on() {
+        let f = VmFlags::from_source(&MapSource::empty());
+        assert!(f.loader.loader_aware_resolution);
+        assert!(f.loader.boot_module_registry);
+        assert!(!f.loader.allow_jsr_ret);
+        assert!(!f.loader.harden_manifest_classpath);
+    }
+
+    #[test]
+    fn loader_aware_resolution_is_off_only_for_empty_or_zero() {
+        for (v, want) in [("", false), ("0", false), ("1", true), ("no", true)] {
+            assert_eq!(
+                VmFlags::from_source(&src(&[("CRATONVM_LOADER_AWARE_RESOLUTION", v)]))
+                    .loader
+                    .loader_aware_resolution,
+                want,
+                "value {v:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn boot_module_registry_off_words_are_exact_and_lowercase() {
+        for (v, want) in [
+            ("0", false),
+            ("false", false),
+            ("no", false),
+            ("NO", true),
+            ("", true),
+        ] {
+            assert_eq!(
+                VmFlags::from_source(&src(&[("CRATONVM_BOOT_MODULE_REGISTRY", v)]))
+                    .loader
+                    .boot_module_registry,
+                want,
+                "value {v:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn io_profile_flags_use_the_word_truth_table() {
+        for (v, want) in [
+            ("1", true),
+            ("yes", true),
+            ("0", false),
+            ("off", false),
+            ("FALSE", false),
+            ("", false),
+        ] {
+            assert_eq!(
+                VmFlags::from_source(&src(&[("CRATONVM_CONFINE_IO", v)]))
+                    .io
+                    .confine_io,
+                want,
+                "value {v:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn synthetic_opt_ins_need_the_exact_string_one() {
+        assert!(
+            VmFlags::from_source(&src(&[("CRATONVM_SYNTHETIC_RAF", "1")]))
+                .io
+                .synthetic_raf_forced
+        );
+        assert!(
+            !VmFlags::from_source(&src(&[("CRATONVM_SYNTHETIC_RAF", "true")]))
+                .io
+                .synthetic_raf_forced
+        );
+        assert!(
+            !VmFlags::from_source(&src(&[("CRATONVM_SYNTHETIC_RAF", "01")]))
+                .io
+                .synthetic_raf_forced
+        );
+    }
+
+    #[test]
+    fn selector_flags_reject_zero_empty_and_false() {
+        for (v, want) in [
+            ("1", true),
+            ("  x ", true),
+            ("0", false),
+            ("", false),
+            ("FaLsE", false),
+        ] {
+            assert_eq!(
+                VmFlags::from_source(&src(&[("CRATONVM_DBG_SELECTOR", v)]))
+                    .io
+                    .dbg_selector,
+                want,
+                "value {v:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn numeric_io_caps_reject_non_positive() {
+        assert_eq!(
+            VmFlags::from_source(&src(&[("CRATONVM_SELECT_MAX_BLOCK_MS", "0")]))
+                .io
+                .select_max_block_ms,
+            None
+        );
+        assert_eq!(
+            VmFlags::from_source(&src(&[("CRATONVM_SELECT_MAX_BLOCK_MS", "250")]))
+                .io
+                .select_max_block_ms,
+            Some(250)
+        );
+        assert_eq!(
+            VmFlags::from_source(&src(&[("CRATONVM_ZIP_MAX_ENTRY_BYTES", "0")]))
+                .io
+                .zip_max_entry_bytes,
+            None
+        );
+    }
+
+    #[test]
+    fn socket_capture_empty_is_none() {
+        assert_eq!(
+            VmFlags::from_source(&src(&[("CRATONVM_SOCKET_CAPTURE", "")]))
+                .io
+                .socket_capture_prefix,
+            None
+        );
+        assert_eq!(
+            VmFlags::from_source(&src(&[("CRATONVM_SOCKET_CAPTURE", "/tmp/cap")]))
+                .io
+                .socket_capture_prefix
+                .as_deref(),
+            Some("/tmp/cap")
+        );
+    }
+
+    #[test]
+    fn stale_objref_cycles_does_not_trim_matching_the_original_call_site() {
+        // The pre-refactor parse was `s.parse::<usize>()` with no `.trim()`,
+        // so a padded value fell back to the default. Locked down so the
+        // migration is byte-exact rather than merely "reasonable".
+        assert_eq!(
+            VmFlags::from_source(&src(&[("CRATONVM_DBG_STALE_OBJREF_CYCLES", " 4 ")]))
+                .gc
+                .dbg_stale_objref_cycles,
+            1
+        );
     }
 
     #[test]

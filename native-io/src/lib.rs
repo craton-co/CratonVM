@@ -34,6 +34,19 @@
 //! [`docs/PLATFORMS.md`](https://github.com/craton-co/cratonvm/blob/main/docs/PLATFORMS.md)
 //! in the workspace root.
 
+/// The I/O and networking slice of the process-wide typed configuration.
+///
+/// Every `CRATONVM_*` flag this crate reads is a field on
+/// [`cratonvm_types::IoFlags`], parsed once at first use. This crate used to
+/// carry its own `env_flag_enabled` boolean parser, one of the five
+/// inconsistent truth tables catalogued in `docs/internal/flag-census.md`; the
+/// parser now lives in `cratonvm_types::flags::parse::truthy_word` with its
+/// semantics unchanged.
+#[inline]
+pub(crate) fn io_flags() -> &'static cratonvm_types::IoFlags {
+    &cratonvm_types::flags().io
+}
+
 use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -164,21 +177,11 @@ pub fn add_sandbox_root<P: AsRef<Path>>(path: P) {
 //                                  fail closed (hard error) if it can't.
 //   * `CRATONVM_UNTRUSTED_CODE`  — untrusted-code mode: enable confinement,
 //                                  loud warning if it isn't actually on.
-fn env_flag_enabled(name: &str) -> bool {
-    match std::env::var(name) {
-        Ok(v) => {
-            let v = v.trim().to_ascii_lowercase();
-            !(v.is_empty() || v == "0" || v == "false" || v == "off" || v == "no")
-        }
-        Err(_) => false,
-    }
-}
-
 /// SECURITY FIX (V12): apply the certified/untrusted deployment profile at
 /// startup. Idempotent; safe to call more than once.
 fn apply_certified_deployment_profile() {
-    let certified = env_flag_enabled("CRATONVM_CONFINE_IO");
-    let untrusted = env_flag_enabled("CRATONVM_UNTRUSTED_CODE");
+    let certified = io_flags().confine_io;
+    let untrusted = io_flags().untrusted_code;
 
     if !certified && !untrusted {
         return; // default permissive (JDK) behaviour — unchanged.
@@ -1111,7 +1114,7 @@ fn native_file_list(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         _ => return Ok(Some(Value::Object(None))),
     };
     let path = read_file_path(ctx, this).unwrap_or_default();
-    let dbg_jetty = std::env::var("CRATONVM_DBG_JETTY").is_ok();
+    let dbg_jetty = io_flags().dbg_jetty;
     let path = validated_path(&path)?;
     let entries: Vec<String> = match fs::read_dir(&path) {
         Ok(rd) => rd
@@ -4564,9 +4567,7 @@ fn native_jimage_get_native_map(ctx: &mut dyn NativeContext, args: &[Value]) -> 
 /// `CRATONVM_SYNTHETIC_FILEWRITER=1`. See
 /// docs/known-issues/filewriter-newbufferedwriter-synthetic-data-loss.md.
 fn real_filewriter_enabled() -> bool {
-    use std::sync::OnceLock;
-    static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var("CRATONVM_SYNTHETIC_FILEWRITER").as_deref() != Ok("1"))
+    !io_flags().synthetic_filewriter_forced
 }
 
 pub fn register_io_natives(registry: &mut NativeMethodRegistry) {
@@ -10814,9 +10815,7 @@ fn native_files_is_writable(_ctx: &mut dyn NativeContext, args: &[Value]) -> Met
 /// docs/internal/app-jvm-bugs/real-raf-segv-root-cause.md, 2026-06-02). Opt back
 /// into the (broken) synthetic path with `CRATONVM_SYNTHETIC_RAF=1`.
 pub(crate) fn real_raf_enabled() -> bool {
-    use std::sync::OnceLock;
-    static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var("CRATONVM_SYNTHETIC_RAF").as_deref() != Ok("1"))
+    !io_flags().synthetic_raf_forced
 }
 
 fn register_io_extras_natives(registry: &mut NativeMethodRegistry) {
@@ -14723,7 +14722,7 @@ fn collect_dir_entries_inner(
     recursive: bool,
     results: &mut Vec<Value>,
 ) {
-    let dbg_jetty = std::env::var("CRATONVM_DBG_JETTY").is_ok();
+    let dbg_jetty = io_flags().dbg_jetty;
     let entries = match fs::read_dir(dir) {
         Ok(rd) => rd,
         Err(e) => {
