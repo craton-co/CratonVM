@@ -5142,7 +5142,7 @@ fn native_sr_next_int_bound(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     )))
 }
 
-fn native_sr_next_long(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_sr_next_long(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Long(0))),
@@ -5190,7 +5190,10 @@ fn native_sr_next_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     Ok(None)
 }
 
-fn native_sr_next_double(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_sr_next_double(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Double(0.0))),
@@ -5200,7 +5203,10 @@ fn native_sr_next_double(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     Ok(Some(Value::Double(d)))
 }
 
-fn native_sr_next_boolean(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn native_sr_next_boolean(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
