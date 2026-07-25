@@ -9780,17 +9780,54 @@ fn victim8_neighbor_explains_zero_prefix(candidate: *mut u8, old_gen: &OldGen) -
         && old_gen.contains(unsafe { neighbor.add(total - 1) })
 }
 
+/// Cold diagnostic for a corrupt array header. Split out of
+/// [`gen_object_total_size`] so the `tracing::warn!` expansion (argument
+/// formatting, a `&dyn Value` table) does not sit inline in a function called
+/// once per object on every linear heap walk — that bulk is what stopped LLVM
+/// inlining the size computation at its 41 call sites.
+#[cold]
+#[inline(never)]
+fn warn_corrupt_array_header(header: &ObjectHeader) {
+    tracing::warn!(
+        "GC: implausible array_length {} (element_type={:?}) in heap object \
+         header — treating as corrupt; caller will stop/skip the walk",
+        header.array_length(),
+        header.element_type,
+    );
+}
+
+/// Cold diagnostic for an implausible `num_slots` on a legacy object header.
+/// See [`warn_corrupt_array_header`] for why this is out-of-line.
+#[cold]
+#[inline(never)]
+fn warn_implausible_num_slots(header: &ObjectHeader) {
+    if crate::a2dbg::enabled() {
+        tracing::warn!(
+            "GC: implausible num_slots {} on kind=Object header (class_id={}); \
+             treating as corrupt so the walker can re-sync.",
+            header.num_slots(),
+            header.class_id.as_u32(),
+        );
+    }
+}
+
+/// Total heap footprint of the object at `header`, or 0 if the header is
+/// self-inconsistent (callers treat `< HEADER_SIZE` as corruption and re-sync).
+///
+/// PERF: called once per object by every linear collector walk, and at 41 call
+/// sites in this module. A depth-18 `BinTreesClassic` profile put this at 22.1%
+/// of samples — not because the arithmetic is expensive (a few loads, a branch
+/// and an add) but because the `tracing::warn!` expansions inline into it made
+/// the function large enough that LLVM declined to inline it, so every object in
+/// the walk paid a real call. The diagnostics now live in `#[cold]` helpers and
+/// this is `#[inline]`.
+#[inline]
 fn gen_object_total_size(header: &ObjectHeader) -> usize {
     let raw_size = if header.kind == ObjectKind::Array {
         match array_data_size(header.array_length() as usize, header.element_type) {
             Ok(data) => HEADER_SIZE + data,
             Err(_) => {
-                tracing::warn!(
-                    "GC: implausible array_length {} (element_type={:?}) in heap object \
-                     header — treating as corrupt; caller will stop/skip the walk",
-                    header.array_length(),
-                    header.element_type,
-                );
+                warn_corrupt_array_header(header);
                 0
             }
         }
@@ -9815,37 +9852,32 @@ fn gen_object_total_size(header: &ObjectHeader) -> usize {
         // reading String char-array bytes as a header (the `"Data"` /
         // `0x61746144` signature observed in the diag dumps).
         //
-        // Return 0 here to flag the inconsistency. The non-moving sweep
-        // walker (line ~2579) interprets `total_size < HEADER_SIZE` as
-        // corruption and falls through to its re-sync path, which finds the
-        // next plausible header and resumes walking — losing only the
-        // skipped region (recovered by the next major-GC compaction)
-        // instead of aborting the whole arena sweep.
-        if header.kind == ObjectKind::Array {
-            if crate::a2dbg::enabled() {
-                tracing::warn!(
-                    "GC: inconsistent header — kind=Object but array_length={} (num_slots={}, \
-                 class_id={}); inline-alloc forgot to set kind=Array. Treating as corrupt \
-                 so the walker can re-sync.",
-                    header.shape >> 16,
-                    header.num_slots(),
-                    header.class_id.as_u32(),
-                );
-            }
-            return 0;
-        }
+        // Return 0 to flag an inconsistency. The non-moving sweep walker
+        // interprets `total_size < HEADER_SIZE` as corruption and falls through
+        // to its re-sync path, which finds the next plausible header and resumes
+        // walking — losing only the skipped region (recovered by the next
+        // major-GC compaction) instead of aborting the whole arena sweep.
+        //
+        // NOTE (2026-07-25): a `if header.kind == ObjectKind::Array { … return 0 }`
+        // check used to sit here, intended to catch exactly the
+        // kind=Object-with-a-nonzero-array_length shape described above. It was
+        // **dead code**: this is the `else` arm of `if header.kind ==
+        // ObjectKind::Array`, so the condition is unreachable by construction and
+        // its `return 0` never fired. Removed as part of making this function
+        // inlinable — removal is behaviour-preserving precisely because it could
+        // never execute.
+        //
+        // That means the JIT-inline-allocation corruption it was written for is
+        // NOT currently detected here. Reinstating a working check (testing the
+        // array-length field rather than `kind`) would make the walker stricter
+        // and could re-sync over objects it accepts today, so it is tracked
+        // separately rather than changed blind.
+
         // Defensive cap on num_slots: no real class has 1<<24 fields, and a
         // value above this is almost certainly garbage from an uninitialised
-        // region.  Same fallthrough — walker re-syncs.
+        // region. Walker re-syncs.
         if header.num_slots() > (1 << 24) {
-            if crate::a2dbg::enabled() {
-                tracing::warn!(
-                    "GC: implausible num_slots {} on kind=Object header (class_id={}); \
-                 treating as corrupt so the walker can re-sync.",
-                    header.num_slots(),
-                    header.class_id.as_u32(),
-                );
-            }
+            warn_implausible_num_slots(header);
             return 0;
         }
         HEADER_SIZE + header.num_slots() as usize * SLOT_SIZE
