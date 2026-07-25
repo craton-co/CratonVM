@@ -40,10 +40,9 @@ fall back on if the unified harness goes missing again:
 | `QuickBenchLong2.java` | arithmetic / fib / sieve / matrix kernels | (printed) |
 | `BinT.java`, `IntrinsicBench.java`, `HmSemanticsProbe.java` | targeted probes | (printed) |
 
-Rebuilding a unified `CratonBench` harness plus the gate script is tracked
-work. Until then, use the per-kernel files above and compare **before/after on
-one host with one binary pair**, which is the methodologically sound comparison
-regardless of harness.
+Whichever harness you use, compare **before/after on one host with one binary
+pair**. That is the methodologically sound comparison regardless of harness, and
+on this shared box it is often the only trustworthy one.
 
 ### Methodology
 
