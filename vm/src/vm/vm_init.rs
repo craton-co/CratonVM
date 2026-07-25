@@ -1322,6 +1322,52 @@ impl SharedVm {
         };
         let mut heap = VmHeap::new_with_overrides(gc_backend, config.max_heap_size, g1_overrides);
 
+        // --- Compressed oops -------------------------------------------------
+        //
+        // Opt-in (`-XX:+UseCompressedOops`, or `CRATONVM_COMPRESSED_OOPS=1` for
+        // A/B runs); OFF by default. This is the ONE point where the narrow-oop
+        // base/shift is fixed: the heap's backing stores now exist, so their
+        // addresses are known, and no object has been allocated and no class
+        // layout registered yet — both of which must observe a stable reference
+        // width for the whole process.
+        //
+        // Only the generational backend publishes the region bounds the
+        // geometry is derived from, and only its collector has been audited for
+        // narrow slots; G1/ZGC keep full 64-bit references.
+        let want_compressed_oops = config.use_compressed_oops
+            || matches!(
+                std::env::var("CRATONVM_COMPRESSED_OOPS").as_deref(),
+                Ok("1") | Ok("true")
+            );
+        if want_compressed_oops {
+            if gc_backend != GcBackend::Generational {
+                eprintln!(
+                    "[cratonvm] compressed oops requested but the selected GC backend \
+                     is not generational - running with 64-bit references"
+                );
+            } else {
+                // Reported on stderr, not just through `tracing`: a silent
+                // fallback to 64-bit references would look identical to a
+                // successful run apart from the footprint, and this gate is
+                // experimental enough that the operator must see which one
+                // they got.
+                match cratonvm_gc::compressed_oops::enable_for_live_heap() {
+                    Ok((base, shift)) => {
+                        eprintln!(
+                            "[cratonvm] compressed oops ON: HeapBased base={base:#x} \
+                             shift={shift} (reference fields and array elements are 4 bytes)"
+                        );
+                    }
+                    Err(why) => {
+                        eprintln!(
+                            "[cratonvm] compressed oops requested but unusable ({why}) \
+                             - running with 64-bit references"
+                        );
+                    }
+                }
+            }
+        }
+
         // bug-h2-largeblob-direct-memory-oom fix — resolve the process-wide
         // direct-buffer accounting cap (java.nio.Bits.reserveMemory's ceiling)
         // the same way real JDK resolves `-XX:MaxDirectMemorySize`: an

@@ -82,6 +82,28 @@ impl FieldStorageKind {
     pub const fn is_reference(self) -> bool {
         matches!(self, Self::Reference)
     }
+
+    /// Storage width honouring the process-wide narrow-oop setting.
+    ///
+    /// Identical to [`Self::size`] for every primitive kind and for references
+    /// while compressed oops are off (the default). With compressed oops on, a
+    /// reference occupies [`crate::narrow_oop::NARROW_REF_SIZE`] bytes instead
+    /// of 8. This is the width the layout builder must use — [`Self::size`]
+    /// stays `const` for the compile-time layout assertions.
+    #[inline]
+    pub fn size_runtime(self) -> u32 {
+        match self {
+            Self::Reference => crate::narrow_oop::ref_field_size() as u32,
+            other => other.size(),
+        }
+    }
+
+    /// Alignment honouring the process-wide narrow-oop setting. A narrow
+    /// reference is 4-byte aligned, matching its width.
+    #[inline]
+    pub fn alignment_runtime(self) -> u32 {
+        self.size_runtime()
+    }
 }
 
 /// Per-class instance-field layout for the compact reference-field model.
@@ -677,7 +699,15 @@ pub unsafe fn read_compact_field(
 ) -> Value {
     match storage {
         FieldStorageKind::Reference => {
-            let raw = unsafe { (&*(ptr as *const AtomicU64)).load(ordering) };
+            // Narrow oops: the slot is a 4-byte `(addr - base) >> shift`. The
+            // branch reads a process-wide flag written once at VM init, so it
+            // predicts perfectly and folds away in the common case.
+            let raw = if crate::narrow_oop::narrow_oops_enabled() {
+                let n = unsafe { (&*(ptr as *const AtomicU32)).load(ordering) };
+                crate::narrow_oop::decode(n)
+            } else {
+                unsafe { (&*(ptr as *const AtomicU64)).load(ordering) }
+            };
             if raw == 0 {
                 Value::Object(None)
             } else {
@@ -732,7 +762,13 @@ pub unsafe fn write_compact_field(
                 Value::Object(None) => 0,
                 _ => 0,
             };
-            unsafe { (&*(ptr as *const AtomicU64)).store(raw, ordering) };
+            crate::narrow_oop::probe(raw);
+            if crate::narrow_oop::narrow_oops_enabled() {
+                let n = crate::narrow_oop::encode(raw);
+                unsafe { (&*(ptr as *const AtomicU32)).store(n, ordering) };
+            } else {
+                unsafe { (&*(ptr as *const AtomicU64)).store(raw, ordering) };
+            }
         }
         FieldStorageKind::Boolean => {
             let raw = matches!(value, Value::Int(v) if v != 0) as u8;

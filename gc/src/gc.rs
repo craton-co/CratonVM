@@ -235,11 +235,11 @@ pub fn collect(from_space: &mut Arena, to_space: &mut Arena, roots: &mut [Object
             // Reference arrays use compact 8-byte pointer storage (REF_ELEMENT_SIZE).
             if header.element_type == ArrayElementType::Reference {
                 for i in 0..header.array_length() as usize {
-                    // SAFETY: i < array_length, so HEADER_SIZE + i * REF_ELEMENT_SIZE
-                    // is within the allocated object bounds.
-                    let s_ptr = unsafe { obj_ptr.add(HEADER_SIZE + i * REF_ELEMENT_SIZE) };
+                    // SAFETY: i < array_length, so HEADER_SIZE + i * the reference
+                    // element width is within the allocated object bounds.
+                    let s_ptr = unsafe { obj_ptr.add(HEADER_SIZE + i * cratonvm_types::narrow_oop::ref_element_size()) };
                     // SAFETY: s_ptr points to a valid 8-byte reference slot in the array.
-                    let raw: u64 = unsafe { std::ptr::read(s_ptr as *const u64) };
+                    let raw: u64 = unsafe { cratonvm_types::narrow_oop::read_ref_slot(s_ptr) };
                     if raw != 0 {
                         let ref_ptr = raw as usize as *mut u8;
                         if from_space.contains(ref_ptr) {
@@ -253,7 +253,7 @@ pub fn collect(from_space: &mut Arena, to_space: &mut Arena, roots: &mut [Object
                             // SAFETY: s_ptr is a valid slot within the copied array;
                             // writing the forwarded pointer back.
                             unsafe {
-                                std::ptr::write(s_ptr as *mut u64, new_ref_ptr as u64);
+                                cratonvm_types::narrow_oop::write_ref_slot(s_ptr, new_ref_ptr as u64);
                             }
                         }
                     }
@@ -277,7 +277,7 @@ pub fn collect(from_space: &mut Arena, to_space: &mut Arena, roots: &mut [Object
                     |layout| {
                         for &offset in &layout.ref_offsets {
                             let slot_ptr = unsafe { obj_ptr.add(HEADER_SIZE + offset as usize) };
-                            let raw = unsafe { std::ptr::read(slot_ptr as *const u64) };
+                            let raw = unsafe { cratonvm_types::narrow_oop::read_ref_slot(slot_ptr) };
                             if raw != 0 && from_space.contains(raw as usize as *mut u8) {
                                 let new_ref_ptr = forward_object(
                                     from_space,
@@ -287,7 +287,7 @@ pub fn collect(from_space: &mut Arena, to_space: &mut Arena, roots: &mut [Object
                                     &mut pointer_map,
                                 );
                                 unsafe {
-                                    std::ptr::write(slot_ptr as *mut u64, new_ref_ptr as u64)
+                                    cratonvm_types::narrow_oop::write_ref_slot(slot_ptr, new_ref_ptr as u64)
                                 };
                             }
                         }
@@ -672,8 +672,8 @@ pub fn collect_with_finalizers(
         if header.kind == ObjectKind::Array {
             if header.element_type == ArrayElementType::Reference {
                 for i in 0..header.array_length() as usize {
-                    let s_ptr = unsafe { obj_ptr.add(HEADER_SIZE + i * REF_ELEMENT_SIZE) };
-                    let raw: u64 = unsafe { std::ptr::read(s_ptr as *const u64) };
+                    let s_ptr = unsafe { obj_ptr.add(HEADER_SIZE + i * cratonvm_types::narrow_oop::ref_element_size()) };
+                    let raw: u64 = unsafe { cratonvm_types::narrow_oop::read_ref_slot(s_ptr) };
                     if raw != 0 {
                         let ref_ptr = raw as usize as *mut u8;
                         if from_space.contains(ref_ptr) {
@@ -685,7 +685,7 @@ pub fn collect_with_finalizers(
                                 &mut pointer_map,
                             );
                             unsafe {
-                                std::ptr::write(s_ptr as *mut u64, new_ref_ptr as u64);
+                                cratonvm_types::narrow_oop::write_ref_slot(s_ptr, new_ref_ptr as u64);
                             }
                         }
                     }
@@ -709,7 +709,7 @@ pub fn collect_with_finalizers(
                     |layout| {
                         for &offset in &layout.ref_offsets {
                             let slot_ptr = unsafe { obj_ptr.add(HEADER_SIZE + offset as usize) };
-                            let raw = unsafe { std::ptr::read(slot_ptr as *const u64) };
+                            let raw = unsafe { cratonvm_types::narrow_oop::read_ref_slot(slot_ptr) };
                             if raw != 0 && from_space.contains(raw as usize as *mut u8) {
                                 let new_ref_ptr = forward_object(
                                     from_space,
@@ -719,7 +719,7 @@ pub fn collect_with_finalizers(
                                     &mut pointer_map,
                                 );
                                 unsafe {
-                                    std::ptr::write(slot_ptr as *mut u64, new_ref_ptr as u64)
+                                    cratonvm_types::narrow_oop::write_ref_slot(slot_ptr, new_ref_ptr as u64)
                                 };
                             }
                         }
@@ -843,8 +843,8 @@ pub fn collect_with_finalizers(
             if header.kind == ObjectKind::Array {
                 if header.element_type == ArrayElementType::Reference {
                     for i in 0..header.array_length() as usize {
-                        let s_ptr = unsafe { obj_ptr.add(HEADER_SIZE + i * REF_ELEMENT_SIZE) };
-                        let raw: u64 = unsafe { std::ptr::read(s_ptr as *const u64) };
+                        let s_ptr = unsafe { obj_ptr.add(HEADER_SIZE + i * cratonvm_types::narrow_oop::ref_element_size()) };
+                        let raw: u64 = unsafe { cratonvm_types::narrow_oop::read_ref_slot(s_ptr) };
                         if raw != 0 {
                             let ref_ptr = raw as usize as *mut u8;
                             if from_space.contains(ref_ptr) {
@@ -856,7 +856,7 @@ pub fn collect_with_finalizers(
                                     &mut pointer_map,
                                 );
                                 unsafe {
-                                    std::ptr::write(s_ptr as *mut u64, new_ref_ptr as u64);
+                                    cratonvm_types::narrow_oop::write_ref_slot(s_ptr, new_ref_ptr as u64);
                                 }
                             }
                         }
@@ -874,7 +874,7 @@ pub fn collect_with_finalizers(
                             for &offset in &layout.ref_offsets {
                                 let slot_ptr =
                                     unsafe { obj_ptr.add(HEADER_SIZE + offset as usize) };
-                                let raw = unsafe { std::ptr::read(slot_ptr as *const u64) };
+                                let raw = unsafe { cratonvm_types::narrow_oop::read_ref_slot(slot_ptr) };
                                 if raw != 0 && from_space.contains(raw as usize as *mut u8) {
                                     let new_ref_ptr = forward_object(
                                         from_space,
@@ -884,7 +884,7 @@ pub fn collect_with_finalizers(
                                         &mut pointer_map,
                                     );
                                     unsafe {
-                                        std::ptr::write(slot_ptr as *mut u64, new_ref_ptr as u64)
+                                        cratonvm_types::narrow_oop::write_ref_slot(slot_ptr, new_ref_ptr as u64)
                                     };
                                 }
                             }

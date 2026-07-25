@@ -974,7 +974,7 @@ impl ClassStore {
         let mut padded = false;
 
         let mut push = |storage: cratonvm_types::FieldStorageKind, off: &mut u32| {
-            let alignment = storage.alignment();
+            let alignment = storage.alignment_runtime();
             *off = (*off + alignment - 1) & !(alignment - 1);
             field_offsets.push(*off);
             let r = storage.is_reference();
@@ -983,7 +983,7 @@ impl ClassStore {
             if r {
                 ref_offsets.push(*off);
             }
-            *off += storage.size();
+            *off += storage.size_runtime();
         };
 
         for cid in chain {

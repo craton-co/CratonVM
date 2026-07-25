@@ -787,8 +787,8 @@ impl OldGen {
         if kind == ObjectKind::Array {
             if element_type == ArrayElementType::Reference {
                 for i in 0..array_length as usize {
-                    let slot = unsafe { obj_ptr.add(HEADER_SIZE + i * REF_ELEMENT_SIZE) };
-                    let raw: u64 = unsafe { std::ptr::read(slot as *const u64) };
+                    let slot = unsafe { obj_ptr.add(HEADER_SIZE + i * cratonvm_types::narrow_oop::ref_element_size()) };
+                    let raw: u64 = unsafe { cratonvm_types::narrow_oop::read_ref_slot(slot) };
                     if raw != 0 {
                         let ref_ptr = raw as usize;
                         if ref_ptr >= data_start && ref_ptr < data_end {
@@ -801,11 +801,11 @@ impl OldGen {
             // Compact object: 8-byte reference slots at the oop-map offsets.
             for &off in &layout.ref_offsets {
                 let off = off as usize;
-                if off + crate::heap::REF_FIELD_SIZE > body {
+                if off + cratonvm_types::narrow_oop::ref_field_size() > body {
                     break;
                 }
                 let slot = unsafe { obj_ptr.add(HEADER_SIZE + off) };
-                let raw: u64 = unsafe { std::ptr::read(slot as *const u64) };
+                let raw: u64 = unsafe { cratonvm_types::narrow_oop::read_ref_slot(slot) };
                 if raw != 0 {
                     let ref_ptr = raw as usize;
                     if ref_ptr >= data_start && ref_ptr < data_end {

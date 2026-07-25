@@ -1611,9 +1611,9 @@ pub unsafe fn read_prim_element(base: *mut u8, index: usize, et: ArrayElementTyp
         ArrayElementType::Short => Value::Int(elem_ptr!(base, index, 2, i16) as i32),
         ArrayElementType::Reference => {
             let offset = index
-                .checked_mul(REF_ELEMENT_SIZE)
+                .checked_mul(cratonvm_types::narrow_oop::ref_element_size())
                 .expect("array ref element offset overflow");
-            let raw: u64 = std::ptr::read(base.add(offset) as *const u64);
+            let raw: u64 = cratonvm_types::narrow_oop::read_ref_slot(base.add(offset));
             // Defense-in-depth reference-slot decode. Mirrors the VTAG_OBJECT
             // degrade in `cratonvm_types::decode_value` (operand/local SoA path)
             // and `CompactValue::to_value`'s SUB_OBJECT plausibility gate, which
@@ -1780,7 +1780,10 @@ pub unsafe fn write_prim_element(base: *mut u8, index: usize, et: ArrayElementTy
                 Value::Object(None) => 0,
                 _ => 0,
             };
-            std::ptr::write(base.add(index * REF_ELEMENT_SIZE) as *mut u64, raw);
+            cratonvm_types::narrow_oop::write_ref_slot(
+                base.add(index * cratonvm_types::narrow_oop::ref_element_size()),
+                raw,
+            );
         }
     }
 }

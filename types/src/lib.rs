@@ -21,6 +21,7 @@ pub mod jit_activation;
 pub mod loader_pin;
 pub mod metadata_pin;
 pub mod mirror_pin;
+pub mod narrow_oop;
 pub mod reflective_probe;
 mod value;
 
@@ -51,6 +52,9 @@ pub use heap_types::{
     THIN_LOCK_RECURSION_SHIFT,
 };
 pub use intern::{intern, intern_arc, StringPool};
+pub use narrow_oop::{
+    narrow_oops_enabled, ref_element_size, ref_field_size, NARROW_REF_SIZE, WIDE_REF_SIZE,
+};
 pub use value::{
     decode_value, decode_value_checked, encode_value, is_object_tag,
     jlong_bits_as_aligned_object_ptr, plausible_heap_pointer, read_value_atomic,

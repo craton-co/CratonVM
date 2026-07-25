@@ -798,9 +798,9 @@ impl ConcurrentMarker {
                 // Reference array: compact 8-byte pointer per element.
                 for i in 0..header.array_length() as usize {
                     // SAFETY: i < array_length, offset is within the allocated array object.
-                    let slot_ptr = unsafe { obj_ptr.add(HEADER_SIZE + i * REF_ELEMENT_SIZE) };
+                    let slot_ptr = unsafe { obj_ptr.add(HEADER_SIZE + i * cratonvm_types::narrow_oop::ref_element_size()) };
                     // SAFETY: slot_ptr points to a valid 8-byte reference element in the array.
-                    let raw: u64 = unsafe { std::ptr::read(slot_ptr as *const u64) };
+                    let raw: u64 = unsafe { cratonvm_types::narrow_oop::read_ref_slot(slot_ptr) };
                     if raw != 0 {
                         let ref_ptr = raw as usize as *mut u8;
                         if markable_old_object(ref_ptr, object_starts)
@@ -819,12 +819,12 @@ impl ConcurrentMarker {
             // needed even though this runs concurrently with mutators.
             for &off in &layout.ref_offsets {
                 let off = off as usize;
-                if off + crate::heap::REF_FIELD_SIZE > body {
+                if off + cratonvm_types::narrow_oop::ref_field_size() > body {
                     break;
                 }
                 // SAFETY: `off` is within the object's body (capped above).
                 let slot_ptr = unsafe { obj_ptr.add(HEADER_SIZE + off) };
-                let raw: u64 = unsafe { std::ptr::read(slot_ptr as *const u64) };
+                let raw: u64 = unsafe { cratonvm_types::narrow_oop::read_ref_slot(slot_ptr) };
                 if raw != 0 {
                     let ref_ptr = raw as usize as *mut u8;
                     if markable_old_object(ref_ptr, object_starts)

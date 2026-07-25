@@ -198,7 +198,12 @@ const _: () = assert!(
 /// Returns the per-element byte size for a given array element type.
 /// Used for compact array storage -- primitive arrays use their native
 /// byte size instead of the full SLOT_SIZE (16 bytes).
-/// Reference arrays use REF_ELEMENT_SIZE (8 bytes) -- compact pointer storage.
+///
+/// Reference arrays use [`crate::narrow_oop::ref_element_size`]: the
+/// [`REF_ELEMENT_SIZE`] (8-byte) raw pointer by default, or 4 bytes when
+/// compressed oops are active for this process. The width is fixed at VM init
+/// before the first allocation, so an array is never read back under a
+/// different element width than it was written with.
 #[inline]
 pub fn element_byte_size(element_type: ArrayElementType) -> usize {
     match element_type {
@@ -206,7 +211,7 @@ pub fn element_byte_size(element_type: ArrayElementType) -> usize {
         ArrayElementType::Char | ArrayElementType::Short => 2,
         ArrayElementType::Int | ArrayElementType::Float => 4,
         ArrayElementType::Long | ArrayElementType::Double => 8,
-        ArrayElementType::Reference => REF_ELEMENT_SIZE,
+        ArrayElementType::Reference => crate::narrow_oop::ref_element_size(),
     }
 }
 

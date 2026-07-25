@@ -1544,11 +1544,13 @@ impl HprofWriter {
 
         // Read each element as an 8-byte reference
         for i in 0..obj.array_length as usize {
-            let elem_offset = HEADER_SIZE + i * REF_ELEMENT_SIZE;
-            let val = if elem_offset + 8 <= obj.total_size {
+            let elem_offset = HEADER_SIZE + i * cratonvm_types::narrow_oop::ref_element_size();
+            let val = if elem_offset + cratonvm_types::narrow_oop::ref_element_size()
+                <= obj.total_size
+            {
                 unsafe {
                     let ptr = obj.data_ptr.add(elem_offset);
-                    std::ptr::read_unaligned(ptr as *const u64)
+                    cratonvm_types::narrow_oop::read_ref_slot_unaligned(ptr)
                 }
             } else {
                 0u64
@@ -3230,7 +3232,7 @@ mod tests {
         };
         // Simulate an Object[2] array
         let array_length: u32 = 2;
-        let data_size = array_length as usize * REF_ELEMENT_SIZE;
+        let data_size = array_length as usize * cratonvm_types::narrow_oop::ref_element_size();
         let total_size = HEADER_SIZE + ((data_size + 7) & !7);
         let mut mem = vec![0u8; total_size];
 
@@ -3248,7 +3250,7 @@ mod tests {
 
         // Write element references: [0xCAFE, 0xBEEF]
         for (i, val) in [0xCAFEu64, 0xBEEF].iter().enumerate() {
-            let offset = HEADER_SIZE + i * REF_ELEMENT_SIZE;
+            let offset = HEADER_SIZE + i * cratonvm_types::narrow_oop::ref_element_size();
             unsafe {
                 std::ptr::write_unaligned(mem.as_mut_ptr().add(offset) as *mut u64, *val);
             }

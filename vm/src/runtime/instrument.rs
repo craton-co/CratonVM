@@ -288,7 +288,7 @@ pub fn approximate_object_size(
     let body = match kind {
         ObjectKind::Object => (num_slots * SLOT_SIZE) as i64,
         ObjectKind::Array => match element_type {
-            ArrayElementType::Reference => (length * REF_ELEMENT_SIZE) as i64,
+            ArrayElementType::Reference => (length * cratonvm_types::narrow_oop::ref_element_size()) as i64,
             other => {
                 let raw = length.saturating_mul(element_byte_size(other));
                 // 8-byte align like the heap does.

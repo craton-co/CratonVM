@@ -2105,6 +2105,20 @@ pub fn precise_jit_maps_enabled() -> bool {
 /// (null/alignment/published-region containment): G1/ZGC never publish
 /// region bounds, so every receiver bails to the full-barrier helper there,
 /// making the switch safe to enable on any backend.
+/// Whether narrow oops force every compact-field access through the helpers.
+///
+/// The inline compact-field fast paths bake an 8-byte reference load/store at a
+/// compile-time offset. Under compressed oops a reference slot is 4 bytes
+/// holding `(addr - base) >> shift`, so those emissions would read/write the
+/// wrong width and the wrong value. Until the codegen learns to emit the narrow
+/// load plus the base+shift transform, compressed oops disable the inline path
+/// and `getfield`/`putfield` fall back to `jit_getfield` / `jit_putfield_object`,
+/// which go through the width-aware `read_compact_field` / `write_compact_field`.
+#[inline]
+pub fn narrow_oops_block_inline_fields() -> bool {
+    cratonvm_types::narrow_oop::narrow_oops_enabled()
+}
+
 pub fn inline_putfield_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
@@ -16477,6 +16491,7 @@ impl Compiler {
                             let fresh_ctor_first_store =
                                 inline_site_is_fresh_ctor_first_store(&site, cpc, field_index);
                             if inline_putfield_enabled()
+                                && !narrow_oops_block_inline_fields()
                                 && cratonvm_types::compact_ref_fields_enabled()
                                 && self.helpers.region_bounds_addr != 0
                             {
@@ -21959,9 +21974,10 @@ impl Compiler {
                         pc += 3;
                     } else if let Some(&(c_off, c_is_ref)) =
                         self.compact_field_off.get(&pc).filter(|_| {
-                            inline_getfield_enabled()
-                                || (guarded_inline_getfield_enabled()
-                                    && self.helpers.region_bounds_addr != 0)
+                            !narrow_oops_block_inline_fields()
+                                && (inline_getfield_enabled()
+                                    || (guarded_inline_getfield_enabled()
+                                        && self.helpers.region_bounds_addr != 0))
                         })
                     {
                         if std::env::var_os("CRATONVM_DBG_COMPACT_INLINE").is_some() {
@@ -22423,6 +22439,7 @@ impl Compiler {
                                     // scribble a Value cell during Tomcat's
                                     // repeated webapp start/stop cycles.
                                     inline_putfield_enabled()
+                                        && !narrow_oops_block_inline_fields()
                                         && cratonvm_types::compact_ref_fields_enabled()
                                         && self.helpers.region_bounds_addr != 0
                                 })
