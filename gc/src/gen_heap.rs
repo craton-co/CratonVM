@@ -86,6 +86,25 @@ const YOUNG_GC_THRESHOLD_PERCENT: usize = 50;
 /// turning every near-capacity refill into an allocation-failure collection.
 const NON_MOVING_YOUNG_GC_THRESHOLD_PERCENT: usize = 90;
 
+/// Byte spacing of the sweep anchors the exact-base oracle walk records for
+/// the parallel sweep. Small enough that a multi-hundred-megabyte young gen
+/// yields far more chunks than workers (so a chunk that stops early cannot
+/// skew the split), large enough that the anchor list stays trivial.
+///
+/// `CRATONVM_GC_SWEEP_ANCHOR_STRIDE` overrides it. Lowering it is how the
+/// GC-stress matrix drives the parallel sweep on a small young gen, where the
+/// 8 MiB default would produce a single chunk and silently never exercise it.
+fn sweep_anchor_stride() -> usize {
+    static G: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *G.get_or_init(|| {
+        std::env::var("CRATONVM_GC_SWEEP_ANCHOR_STRIDE")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&n| n >= 64)
+            .unwrap_or(8 * 1024 * 1024)
+    })
+}
+
 #[inline]
 const fn young_gc_trigger_bytes(
     capacity: usize,
@@ -5191,9 +5210,27 @@ impl GenerationalHeap {
         let exact_skips = merge_skips(young_from.free_blocks_sorted());
         let mut exact_free_iter = exact_skips.iter().peekable();
         let mut exact_cursor = 0usize;
+        // perf/parallel-young-gc (2026-07-25): every offset this walk parses an
+        // object at is a VERIFIED point on the object grid. Recording one per
+        // `SWEEP_ANCHOR_STRIDE` bytes costs a compare and a push, and hands the
+        // sweep walk below a set of split points -- the one thing a linear
+        // header-chase walk needs to become parallelisable. Nothing allocates,
+        // frees or resizes an object between here and the sweep (the mark phase
+        // is read-only and selective promotion only writes forwarding pointers,
+        // which do not change an object's size), so the anchors stay valid.
+        // Offset 0 is where the sweep walk itself starts, so it is always a
+        // valid first anchor even if the arena opens with a free block (the
+        // chunk walker's own free-block skip handles that).
+        let anchor_stride = sweep_anchor_stride();
+        let mut sweep_anchors: Vec<usize> = vec![0];
+        let mut next_anchor = anchor_stride;
         while exact_cursor < young_from.used() && cand_idx < conservative_candidates.len() {
             if skip_free_blocks(&mut exact_cursor, &mut exact_free_iter).0 {
                 continue;
+            }
+            if exact_cursor >= next_anchor {
+                sweep_anchors.push(exact_cursor);
+                next_anchor = exact_cursor - exact_cursor % anchor_stride + anchor_stride;
             }
             let ptr = (from_base + exact_cursor) as *mut u8;
             // SAFETY: free/TLAB ranges were skipped; this cursor is on an
@@ -5277,6 +5314,13 @@ impl GenerationalHeap {
         // direct validation of the candidate address (the pre-oracle
         // behavior) — over-retention-safe, never a header write.
         let oracle_trusted_abs = from_base + exact_cursor;
+        // Terminate the anchor list at the frontier the walk actually reached
+        // (candidates exhausted, arena end, or an anomaly break -- in every
+        // case `exact_cursor` is a grid position the chain landed on).
+        if sweep_anchors.last().is_some_and(|&a| a < exact_cursor) {
+            sweep_anchors.push(exact_cursor);
+        }
+        report_phase("mark-oracle-walk");
 
         // ----- Mark phase -------------------------------------------------
         //
@@ -5286,7 +5330,7 @@ impl GenerationalHeap {
         // still traverse *through* an old-gen object if a dirty card says
         // it may reference young gen (handled below via the dirty-card
         // seed). Marking uses `GC_FLAG_MARKED` in the object header.
-        let mut worklist: Vec<*mut u8> = Vec::new();
+        let mut worklist: Vec<usize> = Vec::new();
 
         // xt-hardening (2026-07-03): per-cycle SIDE mark set for candidates
         // that must never be header-written. The mark write
@@ -5305,13 +5349,36 @@ impl GenerationalHeap {
         // correctly (pinned + traced, never written). Zero-word0 candidates
         // are the overwhelming false-positive volume — routing them here
         // removes the writer from the entire zeroed-span/misalign family.
-        let mut side_marks: FxHashSet<usize> = FxHashSet::default();
+        //
+        // perf/parallel-young-gc (2026-07-25): the side channel is now a
+        // lock-free BITMAP over from-space (one bit per 8 bytes) instead of an
+        // `FxHashSet<usize>`. Same semantics (a marked address is retained and
+        // never header-written), three wins: the claim is a single atomic
+        // `fetch_or`, so several marker threads can share it; `side_sorted`
+        // falls out of a bitmap scan instead of an O(n log n) sort of millions
+        // of addresses; and the per-object hash+probe disappears.
+        let side_bits = crate::young_mark::YoungMarkBits::new(from_base, from_end - from_base);
+        // Everything the precise marker needs that is constant for the whole
+        // collection. The pin registries are snapshotted HERE, once, rather
+        // than locked per marked object: the mutators are stopped, so a
+        // snapshot is exactly equivalent, and a per-object `Mutex` would
+        // serialise the parallel drain below.
+        let mark_ctx = YoungMarkCtx {
+            from_base,
+            from_end,
+            // HIB-CV-24: a live object keeps its class's defining ClassLoader
+            // alive (instance->loader). No-op for the common
+            // no-custom-loader case.
+            loader_pin_on: cratonvm_types::loader_pin::loader_pinning_enabled(),
+            overlay_owners: cratonvm_native_collections::gc_overlay_owner_addrs(),
+            metadata_pins: cratonvm_types::metadata_pin::snapshot(),
+        };
         // mark_if_young: mark a candidate young pointer and enqueue it.
         // SAFETY contract: `ptr` is only dereferenced after `in_young`
         // confirms it lands inside the live from-space region.
-        let mut mark_young = |ptr: *mut u8,
-                              worklist: &mut Vec<*mut u8>,
-                              side_marks: &mut FxHashSet<usize>| {
+        let mark_young = |ptr: *mut u8,
+                          worklist: &mut Vec<usize>,
+                          bits: &crate::young_mark::YoungMarkBits| {
             let addr = ptr as usize;
             if !in_young(addr) {
                 return;
@@ -5494,8 +5561,8 @@ impl GenerationalHeap {
             // header-written. Unconditional side-marking (this fix)
             // has no such gap: every candidate is treated as
             // never-write-through, full stop.
-            if side_marks.insert(addr) {
-                worklist.push(ptr);
+            if bits.try_mark(addr) {
+                worklist.push(addr);
             }
         };
 
@@ -5511,52 +5578,27 @@ impl GenerationalHeap {
         // the pre-oracle robustness property that a truncated oracle walk
         // (corrupt header mid-arena) cannot silently unroot every precise
         // edge above the truncation point.
-        let mut mark_young_precise =
-            |ptr: *mut u8, worklist: &mut Vec<*mut u8>, side_marks: &mut FxHashSet<usize>| {
-            let addr = ptr as usize;
-            if !in_young(addr) {
-                return;
-            }
-            // SAFETY: `in_young` confirmed an 8-aligned address inside the
-            // live from-space region; reading an ObjectHeader there is valid.
-            let header = unsafe { &mut *(ptr as *mut ObjectHeader) };
-            let kind_byte = header.kind as u8;
-            let is_array = header.kind == ObjectKind::Array;
-            if kind_byte > 1
-                || (!is_array && header.num_slots() > (1 << 24))
-                || (is_array && header.array_length() > i32::MAX as u32)
-            {
-                return;
-            }
-            let total = gen_object_total_size(header);
-            if total < HEADER_SIZE || addr + total > from_end {
-                let n = SWEEP_BAD_EXTENT_HITS.fetch_add(1, Ordering::Relaxed);
-                if emit_conservative_candidate_diagnostic(n, crate::a2dbg::enabled()) {
-                    tracing::warn!(
-                        "mark_young_precise: ignoring edge referent at {:#x} with implausible extent {} (kind={}, array_len={}, num_slots={}); safe reject",
-                        addr,
-                        total,
-                        kind_byte,
-                        header.array_length(),
-                        header.num_slots(),
-                    );
-                }
-                return;
-            }
-            if side_marks.insert(addr) {
-                worklist.push(ptr);
-            }
-        };
+        // (What used to be the `mark_young_precise` closure is now the free
+        // function `mark_edge_precise` at the bottom of this module. A closure
+        // capturing `&mut` marker state cannot be shared by the parallel mark
+        // workers; a free function taking `&YoungMarkCtx` + `&YoungMarkBits`
+        // can. The body is unchanged: same header-plausibility rejection, same
+        // extent check, same never-write-through side-mark channel, and it
+        // still skips the conservative interior-pointer oracle because a value
+        // read out of a real reference slot is an object BASE by
+        // construction.)
 
         // Seed: precise + conservative roots gathered by the caller.
         for root in roots.iter() {
-            mark_young(root.as_ptr(), &mut worklist, &mut side_marks);
+            mark_young(root.as_ptr(), &mut worklist, &side_bits);
         }
 
         // Seed: finalizable objects — keep them alive so finalize() runs.
         for &addr in finalizer_addrs {
-            mark_young(addr as *mut u8, &mut worklist, &mut side_marks);
+            mark_young(addr as *mut u8, &mut worklist, &side_bits);
         }
+
+        report_phase("mark-root-seed");
 
         // DIAG/EXPERIMENT (CRATONVM_SWEEP_FULL_OLD_SCAN): seed old→young edges
         // by walking EVERY old-gen object's reference slots instead of trusting
@@ -5572,7 +5614,7 @@ impl GenerationalHeap {
                 // SAFETY: `optr`/`oh` form a valid live object.
                 unsafe {
                     for_each_ref_slot(optr, oh, |raw, _slot| {
-                        mark_young_precise(raw, &mut worklist, &mut side_marks);
+                        mark_edge_precise(raw as usize, &mark_ctx, &side_bits, &mut worklist);
                     });
                 }
             }
@@ -5608,7 +5650,7 @@ impl GenerationalHeap {
                 // SAFETY: `slot_ptr` is a valid 8-byte ref element.
                 let raw: u64 = unsafe { read_ref_slot(slot_ptr) };
                 if raw != 0 {
-                    mark_young_precise(raw as usize as *mut u8, &mut worklist, &mut side_marks);
+                    mark_edge_precise(raw as usize, &mark_ctx, &side_bits, &mut worklist);
                 }
             } else if is_compact_object(header) {
                 // Compact object: `slot_idx` is the BYTE OFFSET of an 8-byte
@@ -5617,7 +5659,7 @@ impl GenerationalHeap {
                 let slot_ptr = unsafe { old_obj.as_ptr().add(HEADER_SIZE + slot_idx) };
                 let raw: u64 = unsafe { read_ref_slot(slot_ptr) };
                 if raw != 0 {
-                    mark_young_precise(raw as usize as *mut u8, &mut worklist, &mut side_marks);
+                    mark_edge_precise(raw as usize, &mark_ctx, &side_bits, &mut worklist);
                 }
             } else {
                 // SAFETY: `slot_idx` is within `num_slots` (from card scan).
@@ -5625,7 +5667,12 @@ impl GenerationalHeap {
                 // SAFETY: `slot_ptr` is a valid Value-sized slot.
                 let value = unsafe { std::ptr::read(slot_ptr as *const Value) };
                 if let Value::Object(Some(ref_obj)) = value {
-                    mark_young_precise(ref_obj.as_ptr(), &mut worklist, &mut side_marks);
+                    mark_edge_precise(
+                        ref_obj.as_ptr() as usize,
+                        &mark_ctx,
+                        &side_bits,
+                        &mut worklist,
+                    );
                 }
             }
         }
@@ -5645,7 +5692,12 @@ impl GenerationalHeap {
                 old_gen.contains(owner_addr as *mut u8)
             })
         {
-            mark_young_precise(overlay_ref.as_ptr(), &mut worklist, &mut side_marks);
+            mark_edge_precise(
+                overlay_ref.as_ptr() as usize,
+                &mark_ctx,
+                &side_bits,
+                &mut worklist,
+            );
         }
 
         // DBG (CRATONVM_DBG_SEED_ALL_OLD): decisive test for the sweep-edges
@@ -5661,85 +5713,44 @@ impl GenerationalHeap {
                 // SAFETY: `op`/`oh` are a valid live old-gen object.
                 unsafe {
                     for_each_ref_slot(op, oh, |r, _| {
-                        mark_young_precise(r, &mut worklist, &mut side_marks)
+                        mark_edge_precise(r as usize, &mark_ctx, &side_bits, &mut worklist)
                     });
                 }
             }
         }
 
-        // HIB-CV-24: a live object keeps its class's defining ClassLoader alive
-        // (instance→loader). No-op for the common no-custom-loader case.
-        let loader_pin_on = cratonvm_types::loader_pin::loader_pinning_enabled();
-        // BFS: transitively mark every young object reachable from a root.
-        while let Some(obj_ptr) = worklist.pop() {
-            // SAFETY: `obj_ptr` was validated by `mark_young` before being
-            // pushed — it is a sane young-gen object header.
-            let header = unsafe { &*(obj_ptr as *const ObjectHeader) };
-            // Mark every referent (arrays + compact objects: 8-byte pointers;
-            // legacy objects: 16-byte Value cells).
-            // SAFETY: `obj_ptr`/`header` are a validated young object.
-            unsafe {
-                for_each_ref_slot(obj_ptr, header, |ref_ptr, _| {
-                    mark_young_precise(ref_ptr, &mut worklist, &mut side_marks);
-                });
-            }
-            // Collection-overlay liveness pin: an overlay is an out-of-heap
-            // edge owned by its backing collection, not a process-global root.
-            // This non-moving marker has stable object addresses, so once this
-            // collection itself is marked we can follow only ITS side-table
-            // references. The root gatherer omits the unconditional overlay
-            // scan for this exact collector mode.
-            for overlay_ref in
-                cratonvm_native_collections::gc_overlay_roots_for_collection(obj_ptr as usize)
-            {
-                mark_young_precise(overlay_ref.as_ptr(), &mut worklist, &mut side_marks);
-            }
-            // HIB-CV-24: also mark this object's defining ClassLoader so a live
-            // (e.g. leaked-via-ThreadLocal) instance keeps its loader alive.
-            if loader_pin_on {
-                if let Some(loader_addr) =
-                    cratonvm_types::loader_pin::loader_pin_addr(header.class_id.as_u32())
-                {
-                    mark_young_precise(loader_addr as *mut u8, &mut worklist, &mut side_marks);
-                }
-            }
-            // Class-mirror liveness pin (mirror_pin, companion to loader_pin
-            // above — see `vm::memory::roots` step 6 and
-            // `cratonvm_types::mirror_pin`): this object is non-moving here,
-            // so `obj_ptr` is a stable key. If it IS itself a user-defined
-            // `ClassLoader` that has defined mirror-having classes, mark
-            // those mirrors alive too — the edge a real JDK's
-            // `ClassLoader.classes` field gives for free, which this VM's
-            // synthetic `ClassLoader` doesn't carry as a heap-traceable
-            // field.
-            if let Some(mirror_addrs) =
-                cratonvm_types::mirror_pin::mirrors_for_loader(obj_ptr as usize)
-            {
-                for mirror_addr in mirror_addrs {
-                    mark_young_precise(mirror_addr as *mut u8, &mut worklist, &mut side_marks);
-                }
-            }
-            // Loader-owned metadata roots (static reference fields, class
-            // monitor, condy and reflective descriptor caches) are conditional
-            // edges: follow them only after the loader itself is live.
-            if let Some(metadata_addrs) =
-                cratonvm_types::metadata_pin::roots_for_loader(obj_ptr as usize)
-            {
-                for metadata_addr in metadata_addrs {
-                    mark_young_precise(
-                        metadata_addr as *mut u8,
-                        &mut worklist,
-                        &mut side_marks,
-                    );
-                }
-            }
-        }
+        report_phase("mark-card-seed");
+
+        // ----- Transitive closure ------------------------------------------
+        //
+        // perf/parallel-young-gc (2026-07-25): the mark closure is drained by
+        // `young_gc_threads` workers. This is sound because the phase is a
+        // PURE, READ-ONLY transitive closure: every mutator is stopped, object
+        // bodies are only read (`for_each_ref_slot`), the sole write is the
+        // atomic bit claim in `YoungMarkBits::try_mark`, and an object is
+        // enqueued only by the worker whose claim won -- so each object is
+        // scanned exactly once and the final marked set is independent of
+        // traversal order. `std::thread::scope` joins every worker before
+        // `collect_marked` reads the bitmap.
+        //
+        // `young_gc_threads` returns 1 for a small young gen (thread setup
+        // would dominate) or when `CRATONVM_GC_PAR_THREADS` is 0/1, and
+        // `drain_parallel` then runs a plain loop on this thread -- the
+        // pre-parallel code path, unchanged.
+        let mark_threads = crate::young_mark::young_gc_threads(bytes_before);
+        crate::young_mark::drain_parallel(
+            std::mem::take(&mut worklist),
+            mark_threads,
+            |addr, work| scan_young_object(addr, &mark_ctx, &side_bits, work),
+        );
+        report_phase("mark-closure");
 
         // Sorted view of the side mark set for O(1)-amortized lockstep checks
         // in the linear walks below (same pattern as the free-block skip).
         // ABSOLUTE addresses.
-        let mut side_sorted: Vec<usize> = side_marks.iter().copied().collect();
-        side_sorted.sort_unstable();
+        // Ascending by construction: iterating the bitmap replaces both the
+        // hash-set iteration and its O(n log n) sort.
+        let side_sorted: Vec<usize> = side_bits.collect_marked();
         report_phase("mark");
 
         // ----- Selective promotion -----------------------------------------
@@ -6033,7 +6044,7 @@ impl GenerationalHeap {
                     // relieve).
                     let aged = header.gc_age + 1 >= PROMOTION_AGE;
                     let header_marked = header.gc_flags & GC_FLAG_MARKED != 0;
-                    let marked = header_marked || side_marks.contains(&addr);
+                    let marked = header_marked || side_bits.contains(addr);
                     if marked && !aged && !header_marked {
                         // Deferred, anchor-verified age bump — applied with
                         // the forwarding installs below. Header-marked
@@ -6490,7 +6501,7 @@ impl GenerationalHeap {
                 // every root registered as a bogus (1)/(2)/(3) edge hit),
                 // drowning the real signal. A side-marked object is live and
                 // will NOT be swept; only side-UNmarked objects matter here.
-                if side_marks.contains(&a) {
+                if side_bits.contains(a) {
                     return false;
                 }
                 // SAFETY: `is_young` confirmed an 8-aligned addr inside live
@@ -6581,7 +6592,7 @@ impl GenerationalHeap {
                     // Family-A: side-marked objects are live survivors even
                     // though their header GC_FLAG_MARKED bit is never written
                     // (see `is_unmarked_young` above).
-                    if h.gc_flags & GC_FLAG_MARKED != 0 || side_marks.contains(&(optr as usize)) {
+                    if h.gc_flags & GC_FLAG_MARKED != 0 || side_bits.contains(optr as usize) {
                         marked_total += 1;
                         let cid = h.class_id.as_u32();
                         let oaddr = optr as usize;
@@ -6733,6 +6744,84 @@ impl GenerationalHeap {
         // re-read). Indexed in lockstep with `walked`.
         let mut walked_ext: std::collections::VecDeque<(u8, u64)> =
             std::collections::VecDeque::new();
+
+        // ----- Anchored parallel prefix -------------------------------------
+        //
+        // perf/parallel-young-gc (2026-07-25): sweep `[0, last_anchor)` on
+        // `young_gc_threads` workers, one chunk per anchor interval, then let
+        // the sequential walk below finish the tail from `cursor`.
+        //
+        // Why this is sound. The sweep walk is a linear header chase: offset
+        // N+1 is only knowable from the object at offset N, which is exactly
+        // why it has always been single-threaded. The anchors break that chain
+        // WITHOUT guessing -- each one is an offset the oracle walk above
+        // already parsed an object at, on a heap that has not been mutated
+        // since. Each chunk additionally re-proves its anchor: its chain must
+        // land EXACTLY on the next anchor or the attempt is abandoned.
+        //
+        // Why an abort is free. `parallel_sweep_walk` writes nothing: no
+        // zeroing, no free-list publication, no header mark-clear (survivor
+        // header writes are deferred to the merge below). On ANY disagreement
+        // -- implausible header, unlisted zero span, free-block overshoot,
+        // hole-crossing extent, malformed GAP filler, or a chain that misses
+        // its anchor -- it returns `None`, `cursor` stays 0, and the
+        // sequential walk below runs from scratch exactly as before, keeping
+        // sole ownership of the diagnostics and the unwind/re-anchor recovery
+        // policy. The forensic gates fall back for the same reason: this fast
+        // path deliberately does not reimplement them.
+        let sweep_threads = crate::young_mark::young_gc_threads(bytes_before);
+        if sweep_threads > 1
+            && sweep_anchors.len() > 2
+            && !retain_dead_objects
+            && !retain_full_walk
+            && !watchref_dbg()
+            && sweep_anchors[0] == 0
+            && sweep_anchors[sweep_anchors.len() - 1] <= used
+            && sweep_anchors.windows(2).all(|w| w[0] < w[1])
+        {
+            let watched = crate::gc_quiescence::watched_referents_snapshot();
+            let (old_lo, old_hi) = old_gen.extent();
+            let sweep_ctx = SweepCtx {
+                from_base,
+                used,
+                existing_free: &existing_free,
+                side_bits: &side_bits,
+                old_lo,
+                old_hi,
+                watched: watched.as_ref(),
+            };
+            if let Some(chunks) = parallel_sweep_walk(&sweep_ctx, &sweep_anchors, sweep_threads) {
+                for chunk in chunks {
+                    for (off, sz, cid, kind, count) in chunk.dead {
+                        match dead_regions.last_mut() {
+                            Some(last) if last.0 + last.1 == off => {
+                                last.1 += sz;
+                                last.4 += count;
+                            }
+                            _ => dead_regions.push((off, sz, cid, kind, count)),
+                        }
+                    }
+                    for off in chunk.survivors {
+                        // SAFETY: `off` is an object start the chunk walk
+                        // verified inside the live from-space region.
+                        let h =
+                            unsafe { &mut *((from_base + off) as *mut u8 as *mut ObjectHeader) };
+                        h.gc_flags &= !GC_FLAG_MARKED;
+                        h.gc_age = h.gc_age.saturating_add(1);
+                    }
+                    objects_live += chunk.live;
+                    for addr in chunk.watched {
+                        evac_map.insert(addr, addr);
+                    }
+                }
+                // The parallel prefix is verified ground truth: it is the
+                // sequential walk's trustworthy anchor for any later unwind.
+                dead_watermark = dead_regions.len();
+                cursor = sweep_anchors[sweep_anchors.len() - 1];
+            }
+        }
+        report_phase("sweep-walk-parallel-prefix");
+
         while cursor < used {
             // Skip known free blocks ROBUSTLY. The free list (`existing_free`) is
             // sorted ascending and the walk advances `cursor` monotonically, so we
@@ -7386,14 +7475,27 @@ impl GenerationalHeap {
                 bytes_swept += sz;
                 objects_swept += object_count;
             }
+            // perf/parallel-young-gc: zero the reclaimed spans on the same
+            // worker count as the mark. `reclaimed_regions` is the coalesced,
+            // ascending, pairwise-DISJOINT union of the dead spans the
+            // verified walk collected, so the workers touch strictly separate
+            // memory and need no synchronisation at all. Publication to the
+            // arena free list stays on this thread (it mutates `young_from`).
+            // SAFETY: every span is inside the live from-space region (the
+            // walk bounded each `dead_regions` entry by `used`) and the spans
+            // are pairwise disjoint after coalescing.
+            unsafe {
+                crate::young_mark::zero_spans_parallel(
+                    from_base,
+                    &reclaimed_regions,
+                    crate::young_mark::young_gc_threads(bytes_before),
+                )
+            };
             for &(off, sz) in &reclaimed_regions {
                 let obj_addr = from_base + off;
                 // stw-residual-close forensics: site 1 = non-moving sweep
                 // dead-span zero+freelist, tagged with the sweep cycle.
                 crate::zero_forensics::record(1, sweep_zero_cycle, obj_addr, sz);
-                // SAFETY: this is the union of adjacent/overlapping spans that the
-                // verified walk collected, all within the live from-space region.
-                unsafe { std::ptr::write_bytes(obj_addr as *mut u8, 0, sz) };
                 young_from.add_free_block(off, sz);
             }
         } else if !dead_regions.is_empty() {
@@ -9830,6 +9932,372 @@ fn warn_implausible_num_slots(header: &ObjectHeader) {
             header.class_id.as_u32(),
         );
     }
+}
+
+/// Constant-for-the-collection context for the precise young marker.
+///
+/// Shared by `&` across the parallel mark workers, so every field is `Sync`.
+/// The two registry snapshots are taken once at safepoint instead of being
+/// re-locked per marked object (see the `YoungMarkCtx` construction in
+/// `sweep_young_non_moving`).
+struct YoungMarkCtx {
+    from_base: usize,
+    from_end: usize,
+    loader_pin_on: bool,
+    /// Overlay-backed collection owners; `None` when none is registered.
+    overlay_owners: Option<std::collections::HashSet<usize>>,
+    /// Loader-owned metadata roots; `None` when the registry is empty.
+    metadata_pins: Option<FxHashMap<usize, Vec<usize>>>,
+}
+
+/// Precise-edge marker: mark + enqueue a value read out of an actual
+/// reference slot (a BFS `for_each_ref_slot` referent, a dirty-card slot
+/// read, an overlay/loader/mirror side-channel address).
+///
+/// These are object BASES by construction -- a store wrote a real reference
+/// there -- so the conservative interior-pointer oracle used by `mark_young`
+/// is a semantic no-op for them and is skipped. Keeps the same header
+/// plausibility + extent rejection and the same never-write-through side-mark
+/// channel: nothing here writes to the heap.
+#[inline]
+fn mark_edge_precise(
+    addr: usize,
+    ctx: &YoungMarkCtx,
+    bits: &crate::young_mark::YoungMarkBits,
+    worklist: &mut Vec<usize>,
+) {
+    if addr < ctx.from_base || addr >= ctx.from_end || addr & 0x7 != 0 {
+        return;
+    }
+    // SAFETY: the test above confirmed an 8-byte-aligned address inside the
+    // live from-space region, so reading an `ObjectHeader` there is valid.
+    let header = unsafe { &*(addr as *const ObjectHeader) };
+    let kind_byte = header.kind as u8;
+    let is_array = header.kind == ObjectKind::Array;
+    if kind_byte > 1
+        || (!is_array && header.num_slots() > (1 << 24))
+        || (is_array && header.array_length() > i32::MAX as u32)
+    {
+        return;
+    }
+    let total = gen_object_total_size(header);
+    if total < HEADER_SIZE || addr + total > ctx.from_end {
+        let n = SWEEP_BAD_EXTENT_HITS.fetch_add(1, Ordering::Relaxed);
+        if emit_conservative_candidate_diagnostic(n, crate::a2dbg::enabled()) {
+            tracing::warn!(
+                "mark_young_precise: ignoring edge referent at {:#x} with implausible extent {} (kind={}, array_len={}, num_slots={}); safe reject",
+                addr,
+                total,
+                kind_byte,
+                header.array_length(),
+                header.num_slots(),
+            );
+        }
+        return;
+    }
+    if bits.try_mark(addr) {
+        worklist.push(addr);
+    }
+}
+
+/// Scan one already-marked young object: every reference slot, plus the
+/// conditional out-of-heap edges (collection overlay, defining ClassLoader,
+/// class mirrors, loader-owned metadata) that only become roots once their
+/// owner is itself known live.
+///
+/// Read-only on the heap. Callable from any marker worker.
+fn scan_young_object(
+    obj_addr: usize,
+    ctx: &YoungMarkCtx,
+    bits: &crate::young_mark::YoungMarkBits,
+    worklist: &mut Vec<usize>,
+) {
+    let obj_ptr = obj_addr as *mut u8;
+    // SAFETY: `obj_addr` was validated by `mark_young`/`mark_edge_precise`
+    // before it was enqueued -- it is a sane young-gen object header.
+    let header = unsafe { &*(obj_ptr as *const ObjectHeader) };
+    // Mark every referent (arrays + compact objects: 8-byte pointers;
+    // legacy objects: 16-byte Value cells).
+    // SAFETY: `obj_ptr`/`header` are a validated young object.
+    unsafe {
+        for_each_ref_slot(obj_ptr, header, |ref_ptr, _| {
+            mark_edge_precise(ref_ptr as usize, ctx, bits, worklist);
+        });
+    }
+    // Collection-overlay liveness pin: an overlay is an out-of-heap edge owned
+    // by its backing collection, not a process-global root. This non-moving
+    // marker has stable object addresses, so once this collection itself is
+    // marked we can follow only ITS side-table references. The root gatherer
+    // omits the unconditional overlay scan for this exact collector mode.
+    // The owner-set probe is the STW snapshot of the same index the lookup
+    // would consult, so gating on it is exactly equivalent to calling
+    // unconditionally and getting an empty `Vec` back.
+    if ctx
+        .overlay_owners
+        .as_ref()
+        .is_some_and(|owners| owners.contains(&obj_addr))
+    {
+        for overlay_ref in cratonvm_native_collections::gc_overlay_roots_for_collection(obj_addr) {
+            mark_edge_precise(overlay_ref.as_ptr() as usize, ctx, bits, worklist);
+        }
+    }
+    // HIB-CV-24: also mark this object's defining ClassLoader so a live
+    // (e.g. leaked-via-ThreadLocal) instance keeps its loader alive.
+    if ctx.loader_pin_on {
+        if let Some(loader_addr) =
+            cratonvm_types::loader_pin::loader_pin_addr(header.class_id.as_u32())
+        {
+            mark_edge_precise(loader_addr, ctx, bits, worklist);
+        }
+    }
+    // Class-mirror liveness pin (companion to loader_pin): if this object IS
+    // itself a user-defined `ClassLoader` that has defined mirror-having
+    // classes, mark those mirrors alive too -- the edge a real JDK's
+    // `ClassLoader.classes` field gives for free.
+    if let Some(mirror_addrs) = cratonvm_types::mirror_pin::mirrors_for_loader(obj_addr) {
+        for mirror_addr in mirror_addrs {
+            mark_edge_precise(mirror_addr, ctx, bits, worklist);
+        }
+    }
+    // Loader-owned metadata roots (static reference fields, class monitor,
+    // condy and reflective descriptor caches) are conditional edges: follow
+    // them only after the loader itself is live.
+    if let Some(metadata_addrs) = ctx
+        .metadata_pins
+        .as_ref()
+        .and_then(|pins| pins.get(&obj_addr))
+    {
+        for &metadata_addr in metadata_addrs {
+            mark_edge_precise(metadata_addr, ctx, bits, worklist);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Parallel non-moving sweep walk (perf/parallel-young-gc, 2026-07-25)
+// ---------------------------------------------------------------------------
+
+/// One anchored chunk's sweep decisions. Produced READ-ONLY: nothing here has
+/// been zeroed, published, or header-written yet, so the whole attempt can be
+/// thrown away and re-run sequentially at zero cost.
+#[derive(Default)]
+pub(crate) struct SweepChunkResult {
+    /// `(offset, size, class_id, kind_byte, object_count)` — same shape as the
+    /// sequential walk's `dead_regions`.
+    dead: Vec<(usize, usize, u32, u8, usize)>,
+    /// Offsets of header-marked survivors whose `GC_FLAG_MARKED` must be
+    /// cleared and whose `gc_age` must be bumped. Deferred out of the walk so
+    /// an aborted attempt never leaves a partially-aged arena.
+    survivors: Vec<usize>,
+    /// Live-object count (header-marked + side-marked).
+    live: usize,
+    /// Survivor ADDRESSES that are watched Weak/Soft/Phantom referents.
+    watched: Vec<usize>,
+}
+
+/// Everything a sweep worker needs, as plain `Sync` data.
+struct SweepCtx<'a> {
+    from_base: usize,
+    used: usize,
+    existing_free: &'a [(usize, usize)],
+    side_bits: &'a crate::young_mark::YoungMarkBits,
+    /// Old-gen extent as raw integers — `OldGen` itself is not `Sync`
+    /// (it owns a `Vec<u8>` behind a `MutexGuard`), but `OldGen::contains`
+    /// is exactly this range test.
+    old_lo: usize,
+    old_hi: usize,
+    /// Watched-referent snapshot for this collection; `None` when empty.
+    watched: Option<&'a std::collections::HashSet<usize>>,
+}
+
+/// Walk `[lo, hi)` of the young from-space and classify every object.
+///
+/// Returns `None` on ANY grid anomaly (implausible header, unlisted zero span,
+/// free-block overshoot, hole-crossing extent, malformed GAP filler, or a
+/// chain that fails to land exactly on `hi`). The caller then discards every
+/// chunk and re-runs the original sequential walk, which owns all the
+/// diagnostic reporting and the unwind/re-anchor recovery policy. That keeps
+/// this fast path small enough to audit: it only ever runs on a grid that the
+/// oracle walk already verified, and it bails the moment anything disagrees.
+fn sweep_chunk(ctx: &SweepCtx<'_>, lo: usize, hi: usize) -> Option<SweepChunkResult> {
+    let mut out = SweepChunkResult::default();
+    let from_base = ctx.from_base;
+
+    // Position a free-block iterator at the first block that can still matter
+    // for `[lo, hi)`.
+    let start = ctx
+        .existing_free
+        .partition_point(|&(off, sz)| off + sz <= lo);
+    let mut free_iter = ctx.existing_free[start..].iter().peekable();
+
+    let mut cursor = lo;
+    while cursor < hi {
+        let (resynced, overshot) = skip_free_blocks(&mut cursor, &mut free_iter);
+        if overshot {
+            // The grid and the free list disagree — sequential recovery only.
+            return None;
+        }
+        if resynced {
+            continue;
+        }
+        if cursor >= hi {
+            break;
+        }
+        let obj_ptr = (from_base + cursor) as *mut u8;
+        // SAFETY: `cursor < hi <= used`, so this is inside the mapped
+        // from-space region, and the anchor chain has kept it on the object
+        // grid the oracle walk verified.
+        let header = unsafe { &*(obj_ptr as *const ObjectHeader) };
+
+        // GAP-filler sentinel: an under-`HEADER_SIZE` TLAB tail carrying its
+        // byte length at offset 4. Skipped, never freed (same as sequential).
+        if header.class_id.as_u32() == crate::tlab::GAP_FILLER_CLASS_ID.as_u32() {
+            // SAFETY: offset 4 lies within the >=8-byte gap.
+            let gap =
+                unsafe { std::ptr::read((obj_ptr as *const u8).add(4) as *const u32) } as usize;
+            if (8..HEADER_SIZE).contains(&gap) && gap & 7 == 0 && cursor + gap <= ctx.used {
+                cursor += gap;
+                continue;
+            }
+            return None;
+        }
+
+        // Unlisted all-zero span: never parseable, and its presence is
+        // evidence the grid broke. Sequential path owns the recovery.
+        // SAFETY: in-bounds 8-byte header read, as above.
+        if unsafe { *(obj_ptr as *const u64) } == 0 {
+            let limit = free_iter
+                .peek()
+                .map(|&&(off, _)| off)
+                .unwrap_or(ctx.used)
+                .min(ctx.used);
+            if zero_run_end(from_base, cursor, limit) - cursor >= HEADER_SIZE {
+                return None;
+            }
+        }
+
+        let total_size = gen_object_total_size(header);
+        if total_size < HEADER_SIZE || cursor + total_size > ctx.used {
+            return None;
+        }
+        // An object can never span a pre-existing free hole.
+        if let Some(&&(foff, _)) = free_iter.peek() {
+            if foff > cursor && foff < cursor + total_size {
+                return None;
+            }
+        }
+
+        let abs = from_base + cursor;
+        if header.is_forwarded() {
+            // Evacuated to old gen by selective promotion: reclaim the young
+            // slot, unless the forwarding target is not actually in old gen
+            // (a phantom write) — in which case retain, as the sequential
+            // walk does.
+            let fwd = header.forwarding_ptr as usize;
+            if fwd >= ctx.old_lo && fwd < ctx.old_hi {
+                push_dead(&mut out.dead, cursor, total_size, header);
+            }
+        } else if ctx.side_bits.contains(abs) {
+            // Side-marked survivor: pure retention, no header writes.
+            out.live += 1;
+            if ctx.watched.is_some_and(|w| w.contains(&abs)) {
+                out.watched.push(abs);
+            }
+        } else if header.gc_flags & GC_FLAG_MARKED != 0 {
+            out.live += 1;
+            out.survivors.push(cursor);
+            if ctx.watched.is_some_and(|w| w.contains(&abs)) {
+                out.watched.push(abs);
+            }
+        } else {
+            push_dead(&mut out.dead, cursor, total_size, header);
+        }
+        cursor += total_size;
+    }
+    // The chain must land EXACTLY on the next anchor; anything else means the
+    // anchor was not a real object start after all.
+    if cursor != hi {
+        return None;
+    }
+    Some(out)
+}
+
+/// Append a dead span, merging with the immediately preceding one (the
+/// sequential walk's `retain_dead_objects == false` behaviour).
+#[inline]
+fn push_dead(
+    dead: &mut Vec<(usize, usize, u32, u8, usize)>,
+    cursor: usize,
+    total_size: usize,
+    header: &ObjectHeader,
+) {
+    if let Some(last) = dead.last_mut() {
+        if last.0 + last.1 == cursor {
+            last.1 += total_size;
+            last.4 += 1;
+            return;
+        }
+    }
+    dead.push((
+        cursor,
+        total_size,
+        header.class_id.as_u32(),
+        header.kind as u8,
+        1,
+    ));
+}
+
+/// Sweep `[anchors[0], anchors[last])` with `threads` workers, one chunk per
+/// anchor interval. Returns `None` if ANY chunk saw a grid anomaly.
+#[allow(clippy::too_many_arguments)]
+fn parallel_sweep_walk(
+    ctx: &SweepCtx<'_>,
+    anchors: &[usize],
+    threads: usize,
+) -> Option<Vec<SweepChunkResult>> {
+    let nchunks = anchors.len() - 1;
+    let next: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let results: Vec<std::sync::Mutex<Option<SweepChunkResult>>> =
+        (0..nchunks).map(|_| std::sync::Mutex::new(None)).collect();
+    let failed = std::sync::atomic::AtomicBool::new(false);
+
+    let worker = || loop {
+        if failed.load(Ordering::Relaxed) {
+            return;
+        }
+        let i = next.fetch_add(1, Ordering::Relaxed);
+        if i >= nchunks {
+            return;
+        }
+        match sweep_chunk(ctx, anchors[i], anchors[i + 1]) {
+            Some(r) => {
+                *results[i].lock().unwrap_or_else(|e| e.into_inner()) = Some(r);
+            }
+            None => {
+                failed.store(true, Ordering::Relaxed);
+                return;
+            }
+        }
+    };
+
+    if threads <= 1 {
+        worker();
+    } else {
+        std::thread::scope(|s| {
+            for _ in 1..threads {
+                s.spawn(&worker);
+            }
+            worker();
+        });
+    }
+    if failed.load(Ordering::Relaxed) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(nchunks);
+    for r in results {
+        out.push(r.into_inner().unwrap_or_else(|e| e.into_inner())?);
+    }
+    Some(out)
 }
 
 /// Total heap footprint of the object at `header`, or 0 if the header is

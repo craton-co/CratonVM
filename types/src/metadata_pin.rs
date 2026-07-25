@@ -60,6 +60,24 @@ pub fn roots_for_loader(loader: usize) -> Option<Vec<usize>> {
     store().read().get(&loader).cloned()
 }
 
+/// Whole-registry snapshot for a stop-the-world marker.
+///
+/// `roots_for_loader` takes the registry `RwLock` and clones a `Vec` for
+/// EVERY marked object, which on a multi-million-object young collection is
+/// both a measurable cost and (once the marker runs on several threads) a
+/// shared-cache-line hot spot -- for a registry that is empty in essentially
+/// every run. The marker is at a safepoint, so one snapshot taken before the
+/// closure starts is exactly equivalent, and `None` (the common case) lets it
+/// skip the lookup entirely.
+pub fn snapshot() -> Option<FxHashMap<usize, Vec<usize>>> {
+    let g = store().read();
+    if g.is_empty() {
+        None
+    } else {
+        Some(g.clone())
+    }
+}
+
 pub fn clear_metadata_pins() {
     store().write().clear();
     WEAK_MODE.store(false, Ordering::Release);
