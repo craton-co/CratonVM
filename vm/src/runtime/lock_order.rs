@@ -660,6 +660,24 @@ impl<T: fmt::Debug> fmt::Debug for OrderedRwLockWriteGuard<'_, T> {
 }
 
 // ---------------------------------------------------------------------------
+// Enforcement query
+// ---------------------------------------------------------------------------
+
+/// Whether lock-order enforcement is active in this process.
+///
+/// Always `true` in debug builds. In release builds it is `true` only when
+/// `CRATONVM_LOCK_ORDER_CHECK` was set to a truthy value (`1`, `true`, `yes`,
+/// `on`) before the first lock acquisition — the decision is computed once and
+/// cached, so flipping the variable later has no effect.
+///
+/// Exposed so tests and diagnostics can tell "the ordering assertion held" from
+/// "the ordering assertion was never evaluated".
+#[inline]
+pub fn enforcement_active() -> bool {
+    tracking::enforced()
+}
+
+// ---------------------------------------------------------------------------
 // Level scopes (for locks whose *type* cannot be changed)
 // ---------------------------------------------------------------------------
 
@@ -1753,5 +1771,15 @@ mod tests {
     fn level_scope_ascending_panics() {
         let _monitors = enter_level(LockLevel::Monitors);
         let _heap = enter_level(LockLevel::Heap); // L8 under L6 => violation
+    }
+
+    #[test]
+    fn enforcement_active_matches_debug_assertions() {
+        // The test runner is a debug build, so enforcement must be on and the
+        // public query must agree with the internal one.
+        assert_eq!(enforcement_active(), tracking::enforced());
+        if cfg!(debug_assertions) {
+            assert!(enforcement_active());
+        }
     }
 }
