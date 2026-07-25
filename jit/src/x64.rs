@@ -17104,6 +17104,10 @@ impl Compiler {
     ///
     /// Emits: MOV RAX, QWORD [RAX + RCX*8 + HEADER_SIZE]
     fn emit_ref_aload_regs(&mut self) {
+        if cratonvm_types::narrow_oop::narrow_oops_enabled() {
+            self.emit_narrow_ref_aload_regs();
+            return;
+        }
         // MOV RAX, QWORD [RAX + RCX*8 + HEADER_SIZE]
         // REX.W + 0x8B + ModRM(mod=01, reg=RAX, r/m=SIB) + SIB(scale=3, idx=RCX, base=RAX) + disp8
         self.rex_w();
@@ -17111,6 +17115,35 @@ impl Compiler {
         self.buf.emit_byte(0x44); // ModRM: mod=01(disp8), reg=000(RAX), r/m=100(SIB)
         self.buf.emit_byte(0xC8); // SIB: scale=11(*8), index=001(RCX), base=000(RAX)
         self.buf.emit_byte(HEADER_SIZE as u8); // Cast: x86-64 immediate encoding
+    }
+
+    /// Compressed-oops reference element load. RAX=array, RCX=index; result in
+    /// RAX as a full 64-bit pointer, so every consumer downstream is unchanged.
+    ///
+    /// The element is a 4-byte `(addr - base) >> 3`, with 0 meaning null, so the
+    /// decode is `base + (narrow << 3)` — except for null, which must stay 0
+    /// rather than becoming `base`. `SHL` sets ZF from its result (the count is
+    /// a non-zero literal), so the null test is free: branch over the rebase
+    /// when the shifted value is zero.
+    ///
+    /// R11 is the scratch: it is neither an `ARG_REGS` nor a `SCRATCH_REGS`
+    /// member, so the operand-stack register cache never parks a value there.
+    fn emit_narrow_ref_aload_regs(&mut self) {
+        // MOV EAX, DWORD [RAX + RCX*4 + HEADER_SIZE]   (32-bit dst zero-extends)
+        self.buf.emit_byte(0x8B); // MOV r32, r/m32
+        self.buf.emit_byte(0x44); // ModRM: mod=01(disp8), reg=000(EAX), r/m=100(SIB)
+        self.buf.emit_byte(0x88); // SIB: scale=10(*4), index=001(RCX), base=000(RAX)
+        self.buf.emit_byte(HEADER_SIZE as u8); // Cast: x86-64 immediate encoding
+        // SHL RAX, 3
+        self.buf.emit(&[0x48, 0xC1, 0xE0, 0x03]);
+        // JZ +13 → skip the rebase, leaving RAX = 0 for a null element.
+        self.buf.emit(&[0x74, 0x0D]);
+        // MOV R11, imm64(base)
+        self.buf.emit(&[0x49, 0xBB]);
+        self.buf
+            .emit(&cratonvm_types::narrow_oop::narrow_base().to_le_bytes());
+        // ADD RAX, R11
+        self.buf.emit(&[0x4C, 0x01, 0xD8]);
     }
 
     /// Inline ref element store to Object[] array (compact 8-byte pointers).
@@ -17121,12 +17154,49 @@ impl Compiler {
     /// Wired into the `aastore` opcode arm; the GC write-barrier is emitted
     /// separately as a call to `self.helpers.write_barrier` after the store.
     fn emit_ref_astore_regs(&mut self) {
+        if cratonvm_types::narrow_oop::narrow_oops_enabled() {
+            self.emit_narrow_ref_astore_regs();
+            return;
+        }
         // MOV QWORD [RAX + RCX*8 + HEADER_SIZE], RDX
         // REX.W + 0x89 + ModRM(mod=01, reg=RDX, r/m=SIB) + SIB(scale=3, idx=RCX, base=RAX) + disp8
         self.rex_w();
         self.buf.emit_byte(0x89); // MOV r/m64, r64
         self.buf.emit_byte(0x54); // ModRM: mod=01(disp8), reg=010(RDX), r/m=100(SIB)
         self.buf.emit_byte(0xC8); // SIB: scale=11(*8), index=001(RCX), base=000(RAX)
+        self.buf.emit_byte(HEADER_SIZE as u8); // Cast: x86-64 immediate encoding
+    }
+
+    /// Compressed-oops reference element store. RAX=array, RCX=index,
+    /// RDX=value (raw 64-bit pointer, 0 for null).
+    ///
+    /// Encodes to `(addr - base) >> 3` in R11 and stores 4 bytes; a null value
+    /// stores 0. **RDX is preserved** — the `aastore` arm hands it to the write
+    /// barrier after this store — so the subtraction is done as
+    /// `R11 = (-base) + RDX` rather than in place.
+    fn emit_narrow_ref_astore_regs(&mut self) {
+        // XOR R11, R11 — the null encoding, and the value stored if we branch.
+        self.buf.emit(&[0x4D, 0x31, 0xDB]);
+        // TEST RDX, RDX
+        self.buf.emit(&[0x48, 0x85, 0xD2]);
+        // JZ +17 → store the zero already in R11.
+        self.buf.emit(&[0x74, 0x11]);
+        // MOV R11, imm64(-base)
+        self.buf.emit(&[0x49, 0xBB]);
+        self.buf.emit(
+            &cratonvm_types::narrow_oop::narrow_base()
+                .wrapping_neg()
+                .to_le_bytes(),
+        );
+        // ADD R11, RDX  → R11 = addr - base
+        self.buf.emit(&[0x49, 0x01, 0xD3]);
+        // SHR R11, 3
+        self.buf.emit(&[0x49, 0xC1, 0xEB, 0x03]);
+        // MOV DWORD [RAX + RCX*4 + HEADER_SIZE], R11D
+        self.buf.emit_byte(0x44); // REX.R (R11 as reg field)
+        self.buf.emit_byte(0x89); // MOV r/m32, r32
+        self.buf.emit_byte(0x5C); // ModRM: mod=01(disp8), reg=011(R11), r/m=100(SIB)
+        self.buf.emit_byte(0x88); // SIB: scale=10(*4), index=001(RCX), base=000(RAX)
         self.buf.emit_byte(HEADER_SIZE as u8); // Cast: x86-64 immediate encoding
     }
 
