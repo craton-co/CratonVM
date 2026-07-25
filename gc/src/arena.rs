@@ -98,6 +98,35 @@ pub struct Arena {
     /// sum incrementally instead of gating a from-scratch recompute makes
     /// `free_list_bytes()` unconditionally O(1), including under churn.
     free_bytes_total: usize,
+    /// perf/gc-oracle-anchors (2026-07-25): allocator-recorded object starts,
+    /// one per `1 << anchor_shift`-byte bucket of this arena. `usize::MAX`
+    /// means "nothing recorded in this bucket during the current epoch".
+    ///
+    /// WHY the allocator and not a GC-time walk. Both consumers of an "object
+    /// grid split point" — the parallel sweep's chunk anchors and the mark
+    /// oracle's exact-base lookup for CONSERVATIVE candidates — used to get
+    /// their split points from one sequential linear header chase over the
+    /// whole young arena (`report_phase("mark-oracle-walk")`), which on a
+    /// 2 GiB from-space measured 233–368 ms, the single largest young-GC
+    /// phase left after the sweep went parallel. But the allocator already
+    /// KNOWS every boundary it hands out; rediscovering them by chasing
+    /// `gen_object_total_size` over 36M objects is redundant work. Recording
+    /// them here costs a shift, a bounds-checked load, a compare and a
+    /// per-bucket-once store on the arena slow path (TLAB refill + non-TLAB
+    /// young object), all of which already hold this arena's lock.
+    ///
+    /// COVERAGE IS A HINT, NEVER A CORRECTNESS INPUT. The JIT's inline TLAB
+    /// fast path bumps a pointer without ever entering this file, so the
+    /// objects inside a TLAB are not individually recorded — only the TLAB's
+    /// start is (a TLAB is 256 KiB–1 MiB, see `tlab::DEFAULT_TLAB_SIZE`), and
+    /// regions holding survivors of an earlier collection are not re-recorded
+    /// at all. That is fine by construction: every consumer re-proves an
+    /// anchor by chaining to the next one, so a MISSING anchor only means a
+    /// longer chunk / a longer local walk, and a WRONG one only means the
+    /// chain fails to land and the caller falls back to its sequential path.
+    alloc_anchors: Vec<usize>,
+    /// `log2` of the anchor bucket width. See [`Arena::rearm_alloc_anchors`].
+    anchor_shift: u32,
 }
 
 /// Alignment tripwire (perf/halfgap residuals, 2026-07-18): every free-list
@@ -137,14 +166,99 @@ impl Arena {
         // We need the Vec to have length == capacity so we can
         // hand out pointers into it. We zero-initialize for safety.
         let data = vec![0u8; capacity];
-        Self {
+        let mut a = Self {
             data,
             cursor: 0,
             free_small: Vec::new(),
             free_large: Vec::new(),
             max_free_upper: 0,
             free_bytes_total: 0,
+            alloc_anchors: Vec::new(),
+            anchor_shift: 0,
+        };
+        a.rearm_alloc_anchors();
+        a
+    }
+
+    /// (Re)size the allocator-anchor bucket table for the current capacity.
+    ///
+    /// Called from [`Arena::new`] and [`Arena::grow`] — the only two places
+    /// `data.len()` changes. Armed on EVERY arena rather than only the young
+    /// from-space so that the moving collector's `mem::swap` of from/to (and
+    /// the `Arena::new(0)` + `grow` reuse path in the major collector) cannot
+    /// hand out an un-armed arena; recording only happens where a caller
+    /// explicitly calls [`Arena::note_object_start`], so an unused table costs
+    /// nothing but its (bounded) allocation.
+    fn rearm_alloc_anchors(&mut self) {
+        const MAX_BUCKETS: usize = 1 << 16;
+        let cap = self.data.len().max(1);
+        // Bucket width. Deliberately NOT `sweep_anchor_stride()`: this table
+        // feeds the mark oracle's per-candidate local walk as well as the
+        // sweep's chunk split, and those want opposite things — the oracle
+        // wants the FINEST grid it can get (its walk is `O(bucket width)` per
+        // candidate cluster), the sweep wants ~one chunk per few MiB. So
+        // record fine here and let `sweep_young_non_moving` subsample down to
+        // the sweep stride. It also keeps the GC-stress knob
+        // `CRATONVM_GC_SWEEP_ANCHOR_STRIDE` (legal down to 64 bytes) from
+        // sizing this table: at 64 bytes a 2 GiB arena would want 256 MB of
+        // buckets.
+        //
+        // 4 KiB is already finer than the smallest TLAB (`MIN_TLAB_SIZE`,
+        // 8 KiB), so the recording rate — not the bucket width — is what
+        // actually bounds anchor density; widening only kicks in to cap the
+        // table at MAX_BUCKETS (512 KiB of table on a 2 GiB from-space).
+        let mut shift = 12u32;
+        while (cap >> shift) >= MAX_BUCKETS {
+            shift += 1;
         }
+        self.anchor_shift = shift;
+        self.alloc_anchors = vec![usize::MAX; (cap >> shift) + 1];
+    }
+
+    /// Record `offset` as a VERIFIED object start (the allocator just handed
+    /// this exact offset out as the base of an object or of a TLAB, whose
+    /// first byte is an object base too — a TLAB is tail-filled at retire, so
+    /// it is object-covered end to end).
+    ///
+    /// One store per bucket per epoch; every later offset in the same bucket
+    /// is a load + compare + not-taken branch.
+    #[inline]
+    pub fn note_object_start(&mut self, offset: usize) {
+        if let Some(slot) = self.alloc_anchors.get_mut(offset >> self.anchor_shift) {
+            if *slot == usize::MAX {
+                *slot = offset;
+            }
+        }
+    }
+
+    /// Drain the epoch's anchors as a strictly-increasing offset list, leaving
+    /// the table empty for the next epoch.
+    ///
+    /// STRICTLY INCREASING BY CONSTRUCTION: bucket `i` only ever stores an
+    /// offset in `[i << shift, (i+1) << shift)`, so iterating buckets in order
+    /// yields offsets in order with no duplicates. Consumers rely on that (a
+    /// non-monotonic anchor list would make the sweep's chunk split invalid).
+    ///
+    /// DRAINING IS MANDATORY, NOT AN OPTIMISATION: an anchor describes the
+    /// object grid of the epoch that just ended. The collection about to run
+    /// reclaims dead spans into the free list, so an offset kept across it can
+    /// end up INSIDE a free block, where a chunk walk resyncs past its own
+    /// upper bound and the whole parallel attempt aborts. Cheap to be wrong,
+    /// but pointlessly so.
+    pub fn take_alloc_anchors(&mut self) -> Vec<usize> {
+        let mut out = Vec::new();
+        for slot in self.alloc_anchors.iter_mut() {
+            let v = std::mem::replace(slot, usize::MAX);
+            if v != usize::MAX {
+                out.push(v);
+            }
+        }
+        out
+    }
+
+    /// Forget every recorded anchor without collecting them.
+    pub fn clear_alloc_anchors(&mut self) {
+        self.alloc_anchors.fill(usize::MAX);
     }
 
     /// Route a block to its size tier. Does NOT touch `max_free_upper` — the
@@ -555,6 +669,8 @@ impl Arena {
         self.free_large.clear();
         self.max_free_upper = 0;
         self.free_bytes_total = 0;
+        // Every recorded object start just became zeroed bytes.
+        self.clear_alloc_anchors();
     }
 
     /// Reset the arena without zeroing memory.
@@ -579,6 +695,7 @@ impl Arena {
         self.free_large.clear();
         self.max_free_upper = 0;
         self.free_bytes_total = 0;
+        self.clear_alloc_anchors();
     }
 
     /// Returns true if the given pointer falls within this arena's storage.
@@ -642,6 +759,10 @@ impl Arena {
         let old_base = self.data.as_ptr();
         let old_capacity = self.data.len();
         self.data.resize(new_capacity, 0);
+        // The bucket table is indexed by capacity; `grow` is the only other
+        // place `data.len()` moves. `cursor == 0` was just asserted, so there
+        // is nothing recorded to preserve.
+        self.rearm_alloc_anchors();
         if gc_flags().dbg_youngstate {
             eprintln!("[youngstate] arena-grow {old_capacity} -> {new_capacity} bytes");
         }
@@ -927,5 +1048,62 @@ mod tests {
         assert!(arena.alloc(64, 8).is_none());
         // Fits the hole → allocates from the free list.
         assert!(arena.alloc(16, 8).is_some());
+    }
+
+    // ----- Allocator-recorded sweep anchors (perf/gc-oracle-anchors) --------
+
+    #[test]
+    fn alloc_anchors_are_one_per_bucket_and_strictly_increasing() {
+        let mut arena = Arena::new(64 * 1024);
+        let bucket = 1usize << arena.anchor_shift;
+        // Three offsets in bucket 0, one in bucket 1, one in bucket 3 —
+        // recorded out of bucket order on purpose.
+        arena.note_object_start(3 * bucket + 24);
+        arena.note_object_start(0);
+        arena.note_object_start(64);
+        arena.note_object_start(128);
+        arena.note_object_start(bucket + 8);
+        let a = arena.take_alloc_anchors();
+        // First-in-bucket wins, and draining yields ascending offsets.
+        assert_eq!(a, vec![0, bucket + 8, 3 * bucket + 24]);
+        assert!(a.windows(2).all(|w| w[0] < w[1]));
+        // Draining leaves the table empty for the next epoch.
+        assert!(arena.take_alloc_anchors().is_empty());
+    }
+
+    #[test]
+    fn alloc_anchors_bucket_table_stays_bounded_and_in_range() {
+        // A 2 GiB arena must not mint a per-4 KiB table (that would be 512 K
+        // entries); the shift widens until the bucket count fits the cap.
+        let mut arena = Arena::new(64 * 1024);
+        arena.rearm_alloc_anchors();
+        assert!(arena.alloc_anchors.len() <= (1 << 16) + 1);
+        // Out-of-range offsets are ignored rather than panicking (a caller
+        // handing over a stale offset must never take the VM down).
+        arena.note_object_start(usize::MAX);
+        arena.note_object_start(arena.capacity() * 4);
+        assert!(arena.take_alloc_anchors().is_empty());
+    }
+
+    #[test]
+    fn reset_clears_alloc_anchors() {
+        // An anchor describes the object grid of the epoch that just ended;
+        // `reset` zeroes the arena, so every recorded offset is now dead.
+        let mut arena = Arena::new(64 * 1024);
+        assert!(arena.alloc(64, 8).is_some());
+        arena.note_object_start(0);
+        arena.reset();
+        assert!(arena.take_alloc_anchors().is_empty());
+    }
+
+    #[test]
+    fn grow_rearms_alloc_anchors_for_the_new_capacity() {
+        let mut arena = Arena::new(4 * 1024);
+        arena.grow(1024 * 1024);
+        // The table must cover the grown capacity, or every offset past the
+        // old end would silently fail to record.
+        let last = arena.capacity() - 8;
+        arena.note_object_start(last);
+        assert_eq!(arena.take_alloc_anchors(), vec![last]);
     }
 }
