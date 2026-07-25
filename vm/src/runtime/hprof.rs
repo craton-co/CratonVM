@@ -150,7 +150,7 @@ impl<'a> HprofDumper<'a> {
     // ------------------------------------------------------------------
 
     fn collect_metadata(&mut self) {
-        let cm = self.vm.class_manager.read();
+        let cm = self.vm.classes.class_manager.read();
         for class in cm.class_store.iter() {
             self.intern(&class.name);
             self.class_serial(class.id);
@@ -192,7 +192,7 @@ impl<'a> HprofDumper<'a> {
     // ------------------------------------------------------------------
 
     fn write_load_classes<W: Write>(&self, w: &mut W) -> io::Result<()> {
-        let cm = self.vm.class_manager.read();
+        let cm = self.vm.classes.class_manager.read();
         for class in cm.class_store.iter() {
             let serial = self.class_serials[&class.id];
             let class_obj_id = class_obj_id_for(class.id);
@@ -317,7 +317,7 @@ impl<'a> HprofDumper<'a> {
         }
 
         // Sticky class roots (system classes)
-        let cm = self.vm.class_manager.read();
+        let cm = self.vm.classes.class_manager.read();
         for class in cm.class_store.iter() {
             if class.name.starts_with("java/") || class.name.starts_with("[") {
                 seg.push_u8(GC_ROOT_STICKY_CLASS);
@@ -329,8 +329,8 @@ impl<'a> HprofDumper<'a> {
     // ---- CLASS_DUMP sub-records -----------------------------------------
 
     fn write_class_dumps(&mut self, seg: &mut SegmentBuilder) {
-        let cm = self.vm.class_manager.read();
-        let statics = self.vm.statics.read();
+        let cm = self.vm.classes.class_manager.read();
+        let statics = self.vm.classes.statics.read();
 
         for class in cm.class_store.iter() {
             let class_obj_id = class_obj_id_for(class.id);
@@ -639,7 +639,7 @@ impl<'a> HprofDumper<'a> {
         let class_id = header.class_id;
         let num_fields = header.num_slots() as usize;
 
-        let cm = self.vm.class_manager.read();
+        let cm = self.vm.classes.class_manager.read();
         let chain = class_hierarchy_chain(class_id, &cm.class_store);
 
         // Serialize field values in hierarchy order

@@ -569,7 +569,7 @@ fn bootstrap(vm: &mut Vm) {
             .is_err()
         {
             vm.main_thread.invoke_cache.clear();
-            vm.shared.resolution_cache.write().clear();
+            vm.shared.classes.resolution_cache.write().clear();
         }
         vm.shared.set_init_level(2);
     }
@@ -1874,6 +1874,7 @@ pub extern "C" fn cratonvm_field_count(vm: *mut CratonVm, obj: CratonRef) -> JIn
                 let class_id = h.vm.shared.heap.class_id_of(oref);
                 let n =
                     h.vm.shared
+                        .classes
                         .class_manager
                         .read()
                         .get_class(class_id)
@@ -1926,6 +1927,7 @@ pub extern "C" fn cratonvm_get_field(
                 let class_id = h.vm.shared.heap.class_id_of(oref);
                 let nfields =
                     h.vm.shared
+                        .classes
                         .class_manager
                         .read()
                         .get_class(class_id)

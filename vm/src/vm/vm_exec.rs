@@ -361,7 +361,7 @@ pub fn coerce_value_against_ret_char(value: Value, ret_char: u8, shared: &Shared
     // our synthetic wrapper layout, which matches how `box_primitive` lays
     // them out and how `Long.valueOf`/etc. store their payload).
     let cid = shared.heap.class_id_of(obj);
-    let cm = shared.class_manager.read();
+    let cm = shared.classes.class_manager.read();
     let cls_name = cm
         .get_class(cid)
         .map(|c| c.name.to_string())
@@ -542,6 +542,7 @@ fn object_class_id(shared: &SharedVm) -> Option<ClassId> {
         return Some(*id);
     }
     let resolved = shared
+        .classes
         .class_manager
         .read()
         .find_class_by_name("java/lang/Object")?;
@@ -587,7 +588,7 @@ fn recover_stale_lambda_receiver_from_native_pins(
         return None;
     }
 
-    let proxies = shared.lambda_proxies.read();
+    let proxies = shared.classes.lambda_proxies.read();
     for pinned in thread.native_pin_roots.iter().rev().copied() {
         let pinned = shared.heap.load_and_forward(pinned);
         let pinned_class_id = shared.heap.class_id_of(pinned);
@@ -1208,6 +1209,7 @@ fn safe_native_call_impl(
                         .unwrap_or_else(|| format!("<cb@{:#x}>", callback as usize));
                     let cid = shared.heap.class_id_of(*o);
                     let cname = shared
+                        .classes
                         .class_manager
                         .read()
                         .get_class(cid)
@@ -1452,7 +1454,7 @@ pub(crate) fn monitor_enter_blocking(
         if dbg_mon_dump {
             let cls = {
                 let cid = shared.heap.class_id_of(obj);
-                let cm = shared.class_manager.read();
+                let cm = shared.classes.class_manager.read();
                 cm.get_class(cid).map(|c| c.name.to_string())
             };
             m.block_enter_labeled(tid, cls.as_deref());
@@ -1695,7 +1697,7 @@ fn field_descriptor_remember(vm_key: usize, class_id: u32, slot_index: usize, by
 const FIELD_DESCRIPTOR_CACHE_CAP: usize = 1 << 16;
 
 fn cache_field_descriptor(shared: &SharedVm, key: (ClassId, usize), byte: u8) {
-    let mut cache = shared.field_descriptor_cache.write();
+    let mut cache = shared.classes.field_descriptor_cache.write();
     if !cache.contains_key(&key) && cache.len() >= FIELD_DESCRIPTOR_CACHE_CAP {
         if let Some(victim) = cache.keys().next().copied() {
             cache.remove(&victim);
@@ -1751,7 +1753,7 @@ fn resolve_field_descriptor_byte_cached(
     // on every miss. TRANSIENT misses (unloaded class/ancestor, or a synthetic
     // stub that may be promoted) are deliberately NOT cached — see below.
     {
-        let cache = shared.field_descriptor_cache.read();
+        let cache = shared.classes.field_descriptor_cache.read();
         if let Some(&b) = cache.get(&(class_id, slot_index)) {
             field_descriptor_remember(vm_key, class_id.as_u32(), slot_index, b);
             return if b == 0 { None } else { Some(b) };
@@ -1780,7 +1782,7 @@ fn resolve_field_descriptor_byte_cached(
     // descriptor once the class is loaded/promoted.
     let mut cacheable = false;
     let desc_byte = {
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         if let Some(concrete_cls) = cm.get_class(class_id) {
             if concrete_cls.is_synthetic_stub {
                 // Transient: stub may be promoted to the real class later.
@@ -1942,7 +1944,7 @@ fn cold_log_overlay_corruption(
     desc: u8,
 ) {
     let class_name = {
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         // Suppress the dominant benign case: a synthetic `<init>` native
         // writing placeholder `size`/`capacity` Ints to a `java.util.Map`
         // subtype. The map's real fields at those slots are references
@@ -2164,7 +2166,7 @@ fn normalize_system_property_key(key: &str) -> &str {
 
 impl<'a> NativeContextImpl<'a> {
     fn capture_current_stack_trace(&self) -> Vec<StackTraceEntry> {
-        let cm = self.shared.class_manager.read();
+        let cm = self.shared.classes.class_manager.read();
         let trace =
             crate::runtime::stackwalker::capture_full_trace(&cm.class_store, &self.thread.frames);
         drop(cm);
@@ -2827,7 +2829,7 @@ impl<'a> NativeContextImpl<'a> {
     /// step 1 returns `None` and we fall through to `None` here.
     pub(crate) fn read_thread_daemon_flag(&self, thread_obj: ObjectRef) -> Option<bool> {
         let header = self.shared.heap.get_header(thread_obj);
-        let cm = self.shared.class_manager.read();
+        let cm = self.shared.classes.class_manager.read();
         // Step 1: locate `Thread.holder` slot.
         let holder_slot =
             resolve_field_index_in_hierarchy(header.class_id, "holder", &cm.class_store)?;
@@ -2859,7 +2861,7 @@ impl<'a> NativeContextImpl<'a> {
 
     pub(crate) fn read_thread_task_object(&self, thread_obj: ObjectRef) -> Option<ObjectRef> {
         let header = self.shared.heap.get_header(thread_obj);
-        let cm = self.shared.class_manager.read();
+        let cm = self.shared.classes.class_manager.read();
         if let Some(target_slot) =
             resolve_field_index_in_hierarchy(header.class_id, "target", &cm.class_store)
         {
@@ -2901,6 +2903,7 @@ impl<'a> NativeContextImpl<'a> {
         };
         let task_cid = self.shared.heap.class_id_of(task);
         self.shared
+            .classes
             .class_manager
             .read()
             .class_store
@@ -2920,7 +2923,7 @@ impl<'a> NativeContextImpl<'a> {
             <Self as NativeContext>::ensure_class_initialized(self, "java/lang/Thread$FieldHolder")
                 .ok()?;
         let holder_num_fields = {
-            let cm = self.shared.class_manager.read();
+            let cm = self.shared.classes.class_manager.read();
             cm.class_store
                 .get(holder_class)
                 .map(|c| c.num_total_fields)
@@ -3144,7 +3147,7 @@ impl<'a> NativeContextImpl<'a> {
             <Self as NativeContext>::ensure_class_initialized(self, "java/lang/ThreadGroup")
                 .ok()?;
         let tg_num_fields = {
-            let cm = self.shared.class_manager.read();
+            let cm = self.shared.classes.class_manager.read();
             cm.class_store
                 .get(tg_class)
                 .map(|c| c.num_total_fields)
@@ -3237,7 +3240,7 @@ impl<'a> NativeContextImpl<'a> {
         // is still correct.
         if !ctor_ok {
             let (parent_slot, name_slot) = {
-                let cm = self.shared.class_manager.read();
+                let cm = self.shared.classes.class_manager.read();
                 (
                     resolve_field_index_in_hierarchy(tg_class, "parent", &cm.class_store),
                     resolve_field_index_in_hierarchy(tg_class, "name", &cm.class_store),
@@ -3277,7 +3280,7 @@ impl<'a> NativeContextImpl<'a> {
     pub(crate) fn ensure_thread_interrupt_lock(&mut self, thread_obj: ObjectRef) {
         let class_id = self.shared.heap.class_id_of(thread_obj);
         let slot = {
-            let cm = self.shared.class_manager.read();
+            let cm = self.shared.classes.class_manager.read();
             resolve_field_index_in_hierarchy(class_id, "interruptLock", &cm.class_store)
         };
         let Some(slot) = slot else { return };
@@ -3288,11 +3291,12 @@ impl<'a> NativeContextImpl<'a> {
             return;
         }
         let obj_class = {
-            let cm = self.shared.class_manager.read();
+            let cm = self.shared.classes.class_manager.read();
             cm.get_loaded_class_id("java/lang/Object")
         }
         .or_else(|| {
             self.shared
+                .classes
                 .class_manager
                 .write()
                 .load_class("java/lang/Object")
@@ -3328,7 +3332,7 @@ impl<'a> NativeContextImpl<'a> {
     ) -> Result<(), String> {
         use cratonvm_classloading::RedefineOptions;
         let name = {
-            let cm = self.shared.class_manager.read();
+            let cm = self.shared.classes.class_manager.read();
             let cls = cm
                 .class_store
                 .get(class_id)
@@ -3336,7 +3340,7 @@ impl<'a> NativeContextImpl<'a> {
             cls.name.to_string()
         };
         {
-            let mut cm = self.shared.class_manager.write();
+            let mut cm = self.shared.classes.class_manager.write();
             let options = RedefineOptions {
                 preserve_original_bytes: preserve_original,
                 ..RedefineOptions::default()
@@ -3350,7 +3354,7 @@ impl<'a> NativeContextImpl<'a> {
         // so cached entries SHOULD stay valid, but clear the cache here as a
         // conservative guard against any future relaxation of that invariant.
         // Redefinition is rare, so the rebuild cost is negligible.
-        self.shared.field_descriptor_cache.write().clear();
+        self.shared.classes.field_descriptor_cache.write().clear();
         // JVMTI redefinition can stale caller-side direct calls and inline
         // dispatch caches, not just compiled bodies declared by `name`. Full
         // eviction is rare and keeps agent-woven bytecode authoritative.
@@ -3475,7 +3479,7 @@ pub(crate) fn read_java_thread_tid(shared: &SharedVm, thread_obj: ObjectRef) -> 
     shared.heap.is_heap_addr(thread_obj.as_ptr() as usize)?;
     let header = shared.heap.get_header(thread_obj);
     let slot = {
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         resolve_field_index_in_hierarchy(header.class_id, "tid", &cm.class_store)?
     };
     match shared.heap.get_field(thread_obj, slot) {
@@ -3517,6 +3521,7 @@ fn is_real_java_string(shared: &SharedVm, object: ObjectRef) -> bool {
         return false;
     }
     shared
+        .classes
         .class_manager
         .read()
         .get_class(shared.heap.class_id_of(object))
@@ -3650,6 +3655,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         let class_id = self.shared.load_class_concurrent(class_name)?;
         let num_fields = self
             .shared
+            .classes
             .class_manager
             .read()
             .get_class(class_id)
@@ -3680,6 +3686,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             let class_id = self.shared.load_class_concurrent(class_name)?;
             let num_fields = self
                 .shared
+                .classes
                 .class_manager
                 .read()
                 .get_class(class_id)
@@ -3755,6 +3762,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             // re-resolving the name (which collapses to the first/global definer).
             let num_fields = self
                 .shared
+                .classes
                 .class_manager
                 .read()
                 .get_class(class_id)
@@ -3827,6 +3835,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                     let fwd_cid = self.shared.heap.class_id_of(fwd_ref);
                     let fwd_class = self
                         .shared
+                        .classes
                         .class_manager
                         .read()
                         .get_class(fwd_cid)
@@ -4099,7 +4108,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
 
     fn hashmap_string_node_cache_put(&mut self, map: ObjectRef, key: &str, node: ObjectRef) {
         let class_id = self.shared.heap.class_id_of(map);
-        let fields = self.shared.class_manager.read();
+        let fields = self.shared.classes.class_manager.read();
         let Some(mod_count_slot) =
             resolve_field_index_in_hierarchy(class_id, "modCount", &fields.class_store)
         else {
@@ -4290,6 +4299,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
 
     fn class_name_of_id(&self, class_id: ClassId) -> Option<String> {
         self.shared
+            .classes
             .class_manager
             .read()
             .get_class(class_id)
@@ -4308,6 +4318,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         let is_wrapper = cached || {
             let class_name = self
                 .shared
+                .classes
                 .class_manager
                 .read()
                 .get_class(class_id)
@@ -4631,7 +4642,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         {
             use crate::classloading::resolution::MethodHandleKind;
             let cid = self.shared.heap.class_id_of(callable);
-            let proxies = self.shared.lambda_proxies.read();
+            let proxies = self.shared.classes.lambda_proxies.read();
             let lcs = proxies.get(&cid)?;
             // Phase 9 #2 — admit InvokeStatic, InvokeVirtual, and
             // InvokeSpecial. The analyzer's non-static relaxation
@@ -4732,6 +4743,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         match self.shared.load_class_concurrent(class_name) {
             Ok(class_id) => self
                 .shared
+                .classes
                 .class_manager
                 .read()
                 .get_class(class_id)
@@ -4742,7 +4754,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
 
     fn loader_id_of_class(&self, class_id: ClassId) -> i32 {
         use cratonvm_types::ClassLoaderId;
-        let cm = self.shared.class_manager.read();
+        let cm = self.shared.classes.class_manager.read();
         match cm.get_loader_id(class_id) {
             Some(ClassLoaderId::Bootstrap) => 0,
             Some(ClassLoaderId::Extension) => 1,
@@ -4920,7 +4932,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
 
     fn get_field_by_name(&self, obj: ObjectRef, field_name: &str) -> Value {
         let class_id = self.shared.heap.class_id_of(obj);
-        let cm = self.shared.class_manager.read();
+        let cm = self.shared.classes.class_manager.read();
         if let Some(index) = resolve_field_index_in_hierarchy(class_id, field_name, &cm.class_store)
         {
             self.shared.heap.get_field(obj, index)
@@ -4931,7 +4943,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
 
     fn set_field_by_name(&self, obj: ObjectRef, field_name: &str, value: Value) {
         let class_id = self.shared.heap.class_id_of(obj);
-        let cm = self.shared.class_manager.read();
+        let cm = self.shared.classes.class_manager.read();
         if let Some(index) = resolve_field_index_in_hierarchy(class_id, field_name, &cm.class_store)
         {
             drop(cm);
@@ -4941,7 +4953,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     }
 
     fn resolve_field_index(&self, class_name: &str, field_name: &str) -> Option<usize> {
-        let cm = self.shared.class_manager.read();
+        let cm = self.shared.classes.class_manager.read();
         let class_id = cm.get_loaded_class_id(class_name)?;
         resolve_field_index_in_hierarchy(class_id, field_name, &cm.class_store)
     }
@@ -4951,7 +4963,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         class_id: ClassId,
         field_name: &str,
     ) -> Option<usize> {
-        let cm = self.shared.class_manager.read();
+        let cm = self.shared.classes.class_manager.read();
         resolve_field_index_in_hierarchy(class_id, field_name, &cm.class_store)
     }
 
@@ -5038,7 +5050,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     }
 
     fn method_exists(&self, class_name: &str, method_name: &str, descriptor: &str) -> bool {
-        let cm = self.shared.class_manager.read();
+        let cm = self.shared.classes.class_manager.read();
         let class_id = match cm.get_loaded_class_id(class_name) {
             Some(id) => id,
             None => return false,
@@ -5092,7 +5104,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // a `ClassLoader.findResources` override probe) are unaffected:
         // constructors can never be bridges, and `findResources`'s fixed,
         // non-generic signature is never bridge-erased in practice.
-        let cm = self.shared.class_manager.read();
+        let cm = self.shared.classes.class_manager.read();
         match cm.class_store.get(class_id) {
             Some(class) => class
                 .find_method(name, descriptor)
@@ -5165,6 +5177,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // `array_info` is `Some` only for array classes; its `component_class_id`
         // is the immediate element type (e.g. `String[]` for `String[][]`).
         self.shared
+            .classes
             .class_manager
             .read()
             .get_class(class_id)
@@ -5182,6 +5195,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 let class_id = self.shared.heap.class_id_of(obj);
                 let class_name = self
                     .shared
+                    .classes
                     .class_manager
                     .read()
                     .get_class(class_id)
@@ -5676,7 +5690,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // class is genuinely unresolvable (early bootstrap, before String itself
         // is loaded) do we fall through to the best-effort structural reader.
         {
-            let cm = self.shared.class_manager.read();
+            let cm = self.shared.classes.class_manager.read();
             if let Some(cls) = cm.get_class(class_id) {
                 if &*cls.name != "java/lang/String" {
                     return None;
@@ -5686,7 +5700,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         if let Some(s) = super::read_java_string(&self.shared.heap, obj) {
             return Some(s);
         }
-        let cm = self.shared.class_manager.read();
+        let cm = self.shared.classes.class_manager.read();
         let vidx = resolve_field_index_in_hierarchy(class_id, "value", &cm.class_store)?;
         let cidx = resolve_field_index_in_hierarchy(class_id, "coder", &cm.class_store);
         drop(cm);
@@ -5726,12 +5740,16 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
 
     fn get_cached_module_mirror(&self, module_name: Option<&str>) -> Option<ObjectRef> {
         let key = module_name.unwrap_or("");
-        self.shared.module_mirrors.read().get(key).copied()
+        self.shared.classes.module_mirrors.read().get(key).copied()
     }
 
     fn cache_module_mirror(&mut self, module_name: Option<&str>, module: ObjectRef) {
         let key = module_name.unwrap_or("").to_string();
-        self.shared.module_mirrors.write().insert(key, module);
+        self.shared
+            .classes
+            .module_mirrors
+            .write()
+            .insert(key, module);
     }
 
     fn get_system_property(&self, key: &str) -> Option<String> {
@@ -5787,7 +5805,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             //
             // Hot path (every HashMap/LinkedHashMap node, view backing, …):
             // the resolved `AnonymousObject$N` ClassId is cached lock-free in
-            // `shared.anon_class_cache`, so repeat allocations skip the name
+            // `shared.classes.anon_class_cache`, so repeat allocations skip the name
             // `format!`, the `class_manager` write-lock, and the synthetic-class
             // hash probe. The stub declares exactly `num_fields` fields, so the
             // slot-count clamp below is provably a no-op and is skipped too —
@@ -5799,7 +5817,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 *DBG.get_or_init(|| std::env::var("CRATONVM_DBG_ANONALLOC").is_ok())
             };
             if !dbg && num_fields < crate::vm::ANON_CLASS_CACHE_LEN {
-                let cached = self.shared.anon_class_cache[num_fields]
+                let cached = self.shared.classes.anon_class_cache[num_fields]
                     .load(std::sync::atomic::Ordering::Relaxed);
                 if cached != 0 {
                     return self
@@ -5832,6 +5850,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             }
             let cid = self
                 .shared
+                .classes
                 .class_manager
                 .write()
                 .ensure_synthetic_class(&name, num_fields);
@@ -5839,7 +5858,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             // `ensure_synthetic_class` is idempotent, so any racing thread
             // stores the same id.
             if num_fields < crate::vm::ANON_CLASS_CACHE_LEN {
-                self.shared.anon_class_cache[num_fields]
+                self.shared.classes.anon_class_cache[num_fields]
                     .store(cid.as_u32(), std::sync::atomic::Ordering::Relaxed);
             }
             cid
@@ -5904,6 +5923,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             None => {
                 let resolved = self
                     .shared
+                    .classes
                     .class_manager
                     .read()
                     .get_class(class_id)
@@ -6017,6 +6037,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // (`java/lang/Object`, zero declared fields) which the GC's
         // `get_field` bounds guard rejects as an undersized layout.
         self.shared
+            .classes
             .class_manager
             .write()
             .ensure_synthetic_class(name, num_fields)
@@ -6059,7 +6080,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             capture_types: capture_types.chars().collect(),
             proxy_class_id,
         };
-        let mut proxies = self.shared.lambda_proxies.write();
+        let mut proxies = self.shared.classes.lambda_proxies.write();
         if proxies.len() < crate::vm::MAX_LAMBDA_PROXIES {
             proxies.insert(proxy_class_id, call_site);
             proxy_class_id.as_u32()
@@ -6070,6 +6091,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
 
     fn lambda_functional_interface(&self, class_id: ClassId) -> Option<String> {
         self.shared
+            .classes
             .lambda_proxies
             .read()
             .get(&class_id)
@@ -6077,13 +6099,18 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     }
 
     fn lambda_call_site_descriptors(&self, class_id: ClassId) -> Option<(String, String, String)> {
-        self.shared.lambda_proxies.read().get(&class_id).map(|cs| {
-            (
-                cs.sam_method_name.to_string(),
-                cs.sam_descriptor.to_string(),
-                cs.instantiated_descriptor.to_string(),
-            )
-        })
+        self.shared
+            .classes
+            .lambda_proxies
+            .read()
+            .get(&class_id)
+            .map(|cs| {
+                (
+                    cs.sam_method_name.to_string(),
+                    cs.sam_descriptor.to_string(),
+                    cs.instantiated_descriptor.to_string(),
+                )
+            })
     }
 
     fn lambda_proxy_host(&self, class_id: ClassId) -> Option<String> {
@@ -6093,6 +6120,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // implementation method lives in a different class.
         if let Some(host_id) = self
             .shared
+            .classes
             .lambda_proxy_hosts
             .read()
             .get(&class_id)
@@ -6100,6 +6128,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         {
             if let Some(name) = self
                 .shared
+                .classes
                 .class_manager
                 .read()
                 .get_class(host_id)
@@ -6112,6 +6141,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // tests): the implementation method handle's owner — correct for genuine
         // lambdas and same-class method references.
         self.shared
+            .classes
             .lambda_proxies
             .read()
             .get(&class_id)
@@ -6122,8 +6152,12 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         &self,
         class_id: ClassId,
     ) -> Option<cratonvm_native_api::LambdaSerialMetadata> {
-        self.shared.lambda_proxies.read().get(&class_id).map(|cs| {
-            cratonvm_native_api::LambdaSerialMetadata {
+        self.shared
+            .classes
+            .lambda_proxies
+            .read()
+            .get(&class_id)
+            .map(|cs| cratonvm_native_api::LambdaSerialMetadata {
                 functional_interface: cs.functional_interface.to_string(),
                 sam_method_name: cs.sam_method_name.to_string(),
                 sam_descriptor: cs.sam_descriptor.to_string(),
@@ -6133,13 +6167,13 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 impl_ref_kind: cs.impl_handle.kind.as_tag(),
                 instantiated_descriptor: cs.instantiated_descriptor.to_string(),
                 capture_types: cs.capture_types.iter().collect(),
-            }
-        })
+            })
     }
 
     fn is_subclass(&self, child: ClassId, parent: ClassId) -> bool {
         if self
             .shared
+            .classes
             .class_manager
             .read()
             .is_subclass_of(child, parent)
@@ -6166,6 +6200,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
 
     fn superclass_of(&self, class_id: ClassId) -> Option<ClassId> {
         self.shared
+            .classes
             .class_manager
             .read()
             .get_class(class_id)
@@ -6174,6 +6209,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
 
     fn is_interface_class(&self, class_id: ClassId) -> bool {
         self.shared
+            .classes
             .class_manager
             .read()
             .get_class(class_id)
@@ -6182,11 +6218,15 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     }
 
     fn class_id_by_name(&self, name: &str) -> Option<ClassId> {
-        self.shared.class_manager.read().find_class_by_name(name)
+        self.shared
+            .classes
+            .class_manager
+            .read()
+            .find_class_by_name(name)
     }
 
     fn class_id_by_name_near(&self, name: &str, near: ClassId) -> Option<ClassId> {
-        let cm = self.shared.class_manager.read();
+        let cm = self.shared.classes.class_manager.read();
         if let Some(loader) = cm.get_loader_id(near) {
             if let Some(id) = cm.find_class_by_name_in_loader(name, loader) {
                 return Some(id);
@@ -6210,6 +6250,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
 
     fn is_record_class(&self, class_id: ClassId) -> bool {
         self.shared
+            .classes
             .class_manager
             .read()
             .get_class(class_id)
@@ -6219,6 +6260,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
 
     fn record_components(&self, class_id: ClassId) -> Vec<(String, String)> {
         self.shared
+            .classes
             .class_manager
             .read()
             .get_class(class_id)
@@ -6233,6 +6275,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
 
     fn is_sealed_class(&self, class_id: ClassId) -> bool {
         self.shared
+            .classes
             .class_manager
             .read()
             .get_class(class_id)
@@ -6242,6 +6285,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
 
     fn permitted_subclasses(&self, class_id: ClassId) -> Vec<String> {
         self.shared
+            .classes
             .class_manager
             .read()
             .get_class(class_id)
@@ -6253,6 +6297,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
 
     fn class_file_version(&self, class_id: ClassId) -> u16 {
         self.shared
+            .classes
             .class_manager
             .read()
             .get_class(class_id)
@@ -6262,6 +6307,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
 
     fn inner_classes(&self, class_id: ClassId) -> Vec<(String, String, String, u16)> {
         self.shared
+            .classes
             .class_manager
             .read()
             .get_class(class_id)
@@ -6283,6 +6329,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
 
     fn enclosing_method(&self, class_id: ClassId) -> Option<(String, String, String)> {
         self.shared
+            .classes
             .class_manager
             .read()
             .get_class(class_id)
@@ -6298,7 +6345,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     }
 
     fn declaring_class(&self, class_id: ClassId) -> Option<ClassId> {
-        let cm = self.shared.class_manager.read();
+        let cm = self.shared.classes.class_manager.read();
         let class = cm.get_class(class_id)?;
         let this_name = &class.name;
         // Find the InnerClasses entry where inner_class == this class
@@ -6316,6 +6363,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
 
     fn nest_host_name(&self, class_id: ClassId) -> Option<String> {
         self.shared
+            .classes
             .class_manager
             .read()
             .get_class(class_id)
@@ -6324,6 +6372,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
 
     fn nest_member_names(&self, class_id: ClassId) -> Vec<String> {
         self.shared
+            .classes
             .class_manager
             .read()
             .get_class(class_id)
@@ -6337,6 +6386,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
 
     fn class_num_total_fields(&self, class_id: ClassId) -> usize {
         self.shared
+            .classes
             .class_manager
             .read()
             .get_class(class_id)
@@ -6593,7 +6643,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // Read thread name from the real-JDK `name` field, falling back to the
         // legacy synthetic slot 0 layout.
         let name_value = {
-            let cm = self.shared.class_manager.read();
+            let cm = self.shared.classes.class_manager.read();
             resolve_field_index_in_hierarchy(header.class_id, "name", &cm.class_store)
                 .map(|slot| self.shared.heap.get_field(thread_obj, slot))
         }
@@ -6620,7 +6670,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         let is_virtual_synthetic = header.num_slots() >= 5
             && matches!(self.shared.heap.get_field(thread_obj, 4), Value::Int(1));
         let is_virtual_real_jdk = {
-            let cm = self.shared.class_manager.read();
+            let cm = self.shared.classes.class_manager.read();
             // Look up `BaseVirtualThread`'s class id once. If not loaded
             // (synthetic-only run), this returns None and we skip the
             // hierarchy walk. The class is loaded the moment any
@@ -6712,7 +6762,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // the `register(tid, name, Some(thread_obj))` call above.  This
         // also matches how `find_park_state_by_thread_obj` works.
         let is_real_jdk_thread = {
-            let cm = self.shared.class_manager.read();
+            let cm = self.shared.classes.class_manager.read();
             cm.class_store
                 .get(header.class_id)
                 .map(|c| !c.is_synthetic_stub)
@@ -6935,7 +6985,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             let dbg_ts = std::env::var("CRATONVM_DBG_THREADSTART").is_ok();
             if dbg_ts {
                 let cn = shared_arc
-                    .class_manager
+                    .classes.class_manager
                     .read()
                     .class_store
                     .get(recv_cid)
@@ -7044,7 +7094,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                     if std::env::var_os("CRATONVM_DBG_UNCAUGHT").is_some() {
                         let cid = shared_arc.heap.class_id_of(exc_ref);
                         let cname = shared_arc
-                            .class_manager
+                            .classes.class_manager
                             .read()
                             .get_class(cid)
                             .map(|c| c.name.to_string())
@@ -7384,7 +7434,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     fn thread_stack_trace(&self, thread_obj: ObjectRef) -> Vec<StackTraceEntry> {
         // The current thread: walk its LIVE frames (full trace with line numbers).
         if self.thread.java_thread_obj == Some(thread_obj) {
-            let cm = self.shared.class_manager.read();
+            let cm = self.shared.classes.class_manager.read();
             return crate::runtime::stackwalker::capture_full_trace(
                 &cm.class_store,
                 &self.thread.frames,
@@ -7443,12 +7493,13 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         }
         // Use the real java/lang/Thread class ID so virtual dispatch works.
         let class_id = {
-            let cm = self.shared.class_manager.read();
+            let cm = self.shared.classes.class_manager.read();
             cm.get_loaded_class_id("java/lang/Thread")
         }
         .unwrap_or_else(|| {
             // Thread class not loaded yet вЂ” load it now
             self.shared
+                .classes
                 .class_manager
                 .write()
                 .load_class("java/lang/Thread")
@@ -7466,7 +7517,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // slots made Thread.get/setContextClassLoader hit an undersized
         // object as soon as reflection users resolved that field.
         let (is_real_jdk, num_fields) = {
-            let cm = self.shared.class_manager.read();
+            let cm = self.shared.classes.class_manager.read();
             match cm.class_store.get(class_id) {
                 Some(c) if !c.is_synthetic_stub => (true, c.num_total_fields.max(3)),
                 Some(c) => (false, c.num_total_fields.max(3)),
@@ -7512,7 +7563,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
 
         if is_real_jdk {
             let (name_slot, tid_slot, holder_slot, priority_slot, group_slot) = {
-                let cm = self.shared.class_manager.read();
+                let cm = self.shared.classes.class_manager.read();
                 (
                     resolve_field_index_in_hierarchy(class_id, "name", &cm.class_store),
                     resolve_field_index_in_hierarchy(class_id, "tid", &cm.class_store),
@@ -7568,7 +7619,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                         .set_field(thread_obj, slot, Value::Object(Some(holder)));
                     if let Some(group_slot) = group_slot {
                         let holder_group = {
-                            let cm = self.shared.class_manager.read();
+                            let cm = self.shared.classes.class_manager.read();
                             let holder_class = self.shared.heap.class_id_of(holder);
                             resolve_field_index_in_hierarchy(holder_class, "group", &cm.class_store)
                                 .map(|slot| self.shared.heap.get_field(holder, slot))
@@ -7600,7 +7651,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             // null field means ServiceLoader's internal getResources()
             // call will NPE.
             let ccl_slot = {
-                let cm = self.shared.class_manager.read();
+                let cm = self.shared.classes.class_manager.read();
                 resolve_field_index_in_hierarchy(class_id, "contextClassLoader", &cm.class_store)
             };
             if let Some(slot) = ccl_slot {
@@ -7958,7 +8009,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     }
 
     fn loaded_class_count(&self) -> usize {
-        self.shared.class_manager.read().loaded_count()
+        self.shared.classes.class_manager.read().loaded_count()
     }
 
     fn unloaded_class_count(&self) -> u64 {
@@ -8002,7 +8053,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     }
 
     fn declared_fields(&self, class_id: ClassId) -> Vec<FieldMetadata> {
-        let cm = self.shared.class_manager.read();
+        let cm = self.shared.classes.class_manager.read();
         let Some(class) = cm.get_class(class_id) else {
             return Vec::new();
         };
@@ -8034,7 +8085,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     }
 
     fn declared_methods(&self, class_id: ClassId) -> Vec<MethodMetadata> {
-        let cm = self.shared.class_manager.read();
+        let cm = self.shared.classes.class_manager.read();
         let Some(class) = cm.get_class(class_id) else {
             return Vec::new();
         };
@@ -8076,7 +8127,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     }
 
     fn class_interfaces(&self, class_id: ClassId) -> Vec<ClassId> {
-        let cm = self.shared.class_manager.read();
+        let cm = self.shared.classes.class_manager.read();
         cm.get_class(class_id)
             .map(|c| c.interfaces.clone())
             .unwrap_or_default()
@@ -8097,7 +8148,12 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         descriptor: &str,
     ) -> Option<(ClassId, u32)> {
         use cratonvm_classloading::resolution::ResolvedMember;
-        match self.shared.link_resolver.get(class_id, name, descriptor)? {
+        match self
+            .shared
+            .classes
+            .link_resolver
+            .get(class_id, name, descriptor)?
+        {
             ResolvedMember::Method {
                 declaring_class_id,
                 index,
@@ -8126,7 +8182,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         index: u32,
     ) {
         use cratonvm_classloading::resolution::ResolvedMember;
-        self.shared.link_resolver.insert(
+        self.shared.classes.link_resolver.insert(
             class_id,
             cratonvm_types::intern_arc(name),
             cratonvm_types::intern_arc(descriptor),
@@ -8144,7 +8200,12 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         descriptor: &str,
     ) -> Option<(ClassId, u32, bool)> {
         use cratonvm_classloading::resolution::ResolvedMember;
-        match self.shared.link_resolver.get(class_id, name, descriptor)? {
+        match self
+            .shared
+            .classes
+            .link_resolver
+            .get(class_id, name, descriptor)?
+        {
             ResolvedMember::Field {
                 declaring_class_id,
                 absolute_index,
@@ -8165,7 +8226,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         is_static: bool,
     ) {
         use cratonvm_classloading::resolution::ResolvedMember;
-        self.shared.link_resolver.insert(
+        self.shared.classes.link_resolver.insert(
             class_id,
             cratonvm_types::intern_arc(name),
             cratonvm_types::intern_arc(descriptor),
@@ -8178,7 +8239,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     }
 
     fn class_access_flags(&self, class_id: ClassId) -> u16 {
-        let cm = self.shared.class_manager.read();
+        let cm = self.shared.classes.class_manager.read();
         cm.get_class(class_id)
             .map(|c| c.access_flags.bits())
             .unwrap_or(0)
@@ -8193,7 +8254,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     }
 
     fn static_field_index_by_name(&self, class_id: ClassId, field_name: &str) -> Option<usize> {
-        let cm = self.shared.class_manager.read();
+        let cm = self.shared.classes.class_manager.read();
         let class = cm.get_class(class_id)?;
         let mut static_idx = 0usize;
         for f in &class.fields {
@@ -8218,11 +8279,14 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     // -- WP0.2 ObjectStreamClass cache --
 
     fn osc_cache_get(&self, class_id: ClassId) -> Option<ObjectRef> {
-        self.shared.osc_cache.get(class_id)
+        self.shared.classes.osc_cache.get(class_id)
     }
 
     fn osc_cache_put(&self, class_id: ClassId, desc: ObjectRef) -> ObjectRef {
-        self.shared.osc_cache.insert_if_absent(class_id, desc)
+        self.shared
+            .classes
+            .osc_cache
+            .insert_if_absent(class_id, desc)
     }
 
     fn get_field_volatile(&self, obj: ObjectRef, index: usize) -> Value {
@@ -8240,6 +8304,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 let new_cid = self.shared.heap.class_id_of(o);
                 let cn = self
                     .shared
+                    .classes
                     .class_manager
                     .read()
                     .get_class(new_cid)
@@ -8330,6 +8395,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                     let new_cid = self.shared.heap.class_id_of(o);
                     let cn = self
                         .shared
+                        .classes
                         .class_manager
                         .read()
                         .get_class(new_cid)
@@ -8339,6 +8405,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                         let holder_cid = self.shared.heap.class_id_of(obj);
                         let holder_cn = self
                             .shared
+                            .classes
                             .class_manager
                             .read()
                             .get_class(holder_cid)
@@ -8365,6 +8432,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             if n < 5 || n % 1_000_000 == 0 {
                 let cn = self
                     .shared
+                    .classes
                     .class_manager
                     .read()
                     .get_class(class_id)
@@ -8561,12 +8629,14 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     fn allocate_instance(&mut self, class_name: &str) -> Option<ObjectRef> {
         let class_id = self
             .shared
+            .classes
             .class_manager
             .write()
             .load_class(class_name)
             .ok()?;
         let num_fields = self
             .shared
+            .classes
             .class_manager
             .read()
             .get_class(class_id)
@@ -8599,7 +8669,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         }
         // Check if the receiver is a lambda proxy.
         let call_site = {
-            let proxies = self.shared.lambda_proxies.read();
+            let proxies = self.shared.classes.lambda_proxies.read();
             proxies.get(&receiver_class_id).cloned()
         };
         if std::env::var_os("CRATONVM_INVOKE_VIRTUAL_ENTRY_TRACE").is_some()
@@ -8732,7 +8802,11 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                     let receiver_is_lambda_proxy = match &full_args[0] {
                         Value::Object(Some(r)) => {
                             let rcv_id = self.shared.heap.class_id_of(*r);
-                            self.shared.lambda_proxies.read().contains_key(&rcv_id)
+                            self.shared
+                                .classes
+                                .lambda_proxies
+                                .read()
+                                .contains_key(&rcv_id)
                         }
                         _ => false,
                     };
@@ -8761,6 +8835,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                         let target_class = match rcv_id_opt {
                             Some(rcv_id) => self
                                 .shared
+                                .classes
                                 .class_manager
                                 .read()
                                 .get_class(rcv_id)
@@ -8774,9 +8849,9 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                         let vov = if crate::runtime::env_cache::loader_aware_resolution() {
                             rcv_id_opt.filter(|rcv| {
                                 *rcv != ClassId::new(0)
-                                    && !self.shared.lambda_proxies.read().contains_key(rcv)
+                                    && !self.shared.classes.lambda_proxies.read().contains_key(rcv)
                                     && {
-                                        let cm = self.shared.class_manager.read();
+                                        let cm = self.shared.classes.class_manager.read();
                                         cm.get_class(*rcv)
                                             .map(|c| &*c.name == target_class.as_str())
                                             .unwrap_or(false)
@@ -8875,6 +8950,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                         Some(cid) => cid,
                         None => self
                             .shared
+                            .classes
                             .class_manager
                             .write()
                             .load_class(&lcs.impl_handle.class_name)?,
@@ -8890,6 +8966,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                     // the real array type.
                     let array_info = self
                         .shared
+                        .classes
                         .class_manager
                         .read()
                         .get_class(class_id)
@@ -8937,6 +9014,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                         // bounds guard on every inherited-field access.
                         let num_fields = self
                             .shared
+                            .classes
                             .class_manager
                             .read()
                             .get_class(class_id)
@@ -9090,7 +9168,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                     "java/lang/Object".to_string()
                 } else {
                     let lambda_iface = {
-                        let proxies = self.shared.lambda_proxies.read();
+                        let proxies = self.shared.classes.lambda_proxies.read();
                         proxies
                             .get(&receiver_class_id)
                             .map(|lcs| lcs.functional_interface.to_string())
@@ -9100,6 +9178,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                         None => {
                             let by_id = self
                                 .shared
+                                .classes
                                 .class_manager
                                 .read()
                                 .get_class(receiver_class_id)
@@ -9202,7 +9281,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 && resolved_from_receiver
             {
                 let use_base_loader_native = {
-                    let cm = self.shared.class_manager.read();
+                    let cm = self.shared.classes.class_manager.read();
                     cm.get_class(receiver_class_id)
                         .map(|receiver_class| {
                             receiver_class.name.as_ref() == "java/lang/ClassLoader"
@@ -9262,6 +9341,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 && (method_name == "toString" && descriptor == "()Ljava/lang/String;"
                     || self
                         .shared
+                        .classes
                         .class_manager
                         .read()
                         .get_loaded_class_id(&class_name)
@@ -9271,6 +9351,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             {
                 let global_id = self
                     .shared
+                    .classes
                     .class_manager
                     .read()
                     .get_loaded_class_id(&class_name);
@@ -9350,7 +9431,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         let receiver = self.shared.heap.load_and_forward(receiver);
         let class_id = self.shared.heap.class_id_of(receiver);
         let declaring_class_id = {
-            let cm = self.shared.class_manager.read();
+            let cm = self.shared.classes.class_manager.read();
             crate::classloading::find_method_recursive(
                 class_id,
                 method_name,
@@ -9374,7 +9455,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     }
 
     fn class_annotations(&self, class_id: ClassId) -> Vec<crate::native::registry::AnnotationData> {
-        let cm = self.shared.class_manager.read();
+        let cm = self.shared.classes.class_manager.read();
         let class = match cm.get_class(class_id) {
             Some(c) => c,
             None => return Vec::new(),
@@ -9394,7 +9475,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         method_name: &str,
         method_desc: &str,
     ) -> Vec<crate::native::registry::AnnotationData> {
-        let cm = self.shared.class_manager.read();
+        let cm = self.shared.classes.class_manager.read();
         let class = match cm.get_class(class_id) {
             Some(c) => c,
             None => return Vec::new(),
@@ -9412,7 +9493,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         class_id: ClassId,
         field_name: &str,
     ) -> Vec<crate::native::registry::AnnotationData> {
-        let cm = self.shared.class_manager.read();
+        let cm = self.shared.classes.class_manager.read();
         let class = match cm.get_class(class_id) {
             Some(c) => c,
             None => return Vec::new(),
@@ -9426,7 +9507,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     }
 
     fn class_signature(&self, class_id: ClassId) -> Option<String> {
-        let cm = self.shared.class_manager.read();
+        let cm = self.shared.classes.class_manager.read();
         let class = cm.get_class(class_id)?;
         class.signature.clone()
     }
@@ -9437,7 +9518,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         method_name: &str,
         method_desc: &str,
     ) -> Option<String> {
-        let cm = self.shared.class_manager.read();
+        let cm = self.shared.classes.class_manager.read();
         let class = cm.get_class(class_id)?;
         for m in &class.methods {
             if &*m.name == method_name && &*m.descriptor == method_desc {
@@ -9462,7 +9543,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         method_name: &str,
         method_desc: &str,
     ) -> Vec<(String, u16)> {
-        let cm = self.shared.class_manager.read();
+        let cm = self.shared.classes.class_manager.read();
         let class = match cm.get_class(class_id) {
             Some(c) => c,
             None => return Vec::new(),
@@ -9500,7 +9581,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     }
 
     fn field_signature(&self, class_id: ClassId, field_name: &str) -> Option<String> {
-        let cm = self.shared.class_manager.read();
+        let cm = self.shared.classes.class_manager.read();
         let class = cm.get_class(class_id)?;
         for f in &class.fields {
             if &*f.name == field_name {
@@ -9525,7 +9606,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         method_name: &str,
         method_desc: &str,
     ) -> Vec<Vec<crate::native::registry::AnnotationData>> {
-        let cm = self.shared.class_manager.read();
+        let cm = self.shared.classes.class_manager.read();
         let class = match cm.get_class(class_id) {
             Some(c) => c,
             None => return Vec::new(),
@@ -9544,7 +9625,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         method_name: &str,
         method_desc: &str,
     ) -> Vec<crate::native::registry::AnnotationData> {
-        let cm = self.shared.class_manager.read();
+        let cm = self.shared.classes.class_manager.read();
         let class = match cm.get_class(class_id) {
             Some(c) => c,
             None => return Vec::new(),
@@ -9563,7 +9644,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         method_name: &str,
         method_desc: &str,
     ) -> Vec<crate::native::registry::TypeArgAnnotations> {
-        let cm = self.shared.class_manager.read();
+        let cm = self.shared.classes.class_manager.read();
         let class = match cm.get_class(class_id) {
             Some(c) => c,
             None => return Vec::new(),
@@ -9585,7 +9666,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         method_name: &str,
         method_desc: &str,
     ) -> Vec<Vec<crate::native::registry::AnnotationData>> {
-        let cm = self.shared.class_manager.read();
+        let cm = self.shared.classes.class_manager.read();
         let class = match cm.get_class(class_id) {
             Some(c) => c,
             None => return Vec::new(),
@@ -9603,7 +9684,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         class_id: ClassId,
         field_name: &str,
     ) -> Vec<crate::native::registry::AnnotationData> {
-        let cm = self.shared.class_manager.read();
+        let cm = self.shared.classes.class_manager.read();
         let class = match cm.get_class(class_id) {
             Some(c) => c,
             None => return Vec::new(),
@@ -9621,7 +9702,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         class_id: ClassId,
         field_name: &str,
     ) -> Vec<crate::native::registry::TypeArgAnnotations> {
-        let cm = self.shared.class_manager.read();
+        let cm = self.shared.classes.class_manager.read();
         let class = match cm.get_class(class_id) {
             Some(c) => c,
             None => return Vec::new(),
@@ -9643,7 +9724,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         method_name: &str,
         method_desc: &str,
     ) -> Vec<Vec<crate::native::registry::TypeArgAnnotations>> {
-        let cm = self.shared.class_manager.read();
+        let cm = self.shared.classes.class_manager.read();
         let class = match cm.get_class(class_id) {
             Some(c) => c,
             None => return Vec::new(),
@@ -9669,7 +9750,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         supertype_index: u16,
     ) -> crate::native::registry::TypeArgAnnotations {
         let bytes = {
-            let cm = self.shared.class_manager.read();
+            let cm = self.shared.classes.class_manager.read();
             match cm.class_bytes_cache.get(&class_id) {
                 Some(b) => b.clone(),
                 None => return Default::default(),
@@ -9684,7 +9765,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         method_name: &str,
         method_desc: &str,
     ) -> Option<crate::native::registry::AnnotationElementValue> {
-        let cm = self.shared.class_manager.read();
+        let cm = self.shared.classes.class_manager.read();
         let class = match cm.get_class(class_id) {
             Some(c) => c,
             None => return None,
@@ -9710,7 +9791,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         method_name: &str,
         method_desc: &str,
     ) -> Vec<String> {
-        let cm = self.shared.class_manager.read();
+        let cm = self.shared.classes.class_manager.read();
         let class = match cm.get_class(class_id) {
             Some(c) => c,
             None => return Vec::new(),
@@ -9865,6 +9946,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
 
     fn module_name_of_class(&self, class_id: ClassId) -> Option<String> {
         self.shared
+            .classes
             .class_manager
             .read()
             .get_class(class_id)
@@ -9872,7 +9954,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     }
 
     fn reads_module(&self, reader: &str, provider: &str) -> bool {
-        let cm = self.shared.class_manager.read();
+        let cm = self.shared.classes.class_manager.read();
         if cm.module_registry.is_empty() {
             return true;
         }
@@ -9880,7 +9962,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     }
 
     fn is_package_exported_unqualified(&self, module_name: &str, pkg: &str) -> bool {
-        let cm = self.shared.class_manager.read();
+        let cm = self.shared.classes.class_manager.read();
         if cm.module_registry.is_empty() {
             return true;
         }
@@ -9889,7 +9971,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     }
 
     fn is_package_exported_to(&self, module_name: &str, pkg: &str, to_module: &str) -> bool {
-        let cm = self.shared.class_manager.read();
+        let cm = self.shared.classes.class_manager.read();
         if cm.module_registry.is_empty() {
             return true;
         }
@@ -9898,7 +9980,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     }
 
     fn is_package_open_unqualified(&self, module_name: &str, pkg: &str) -> bool {
-        let cm = self.shared.class_manager.read();
+        let cm = self.shared.classes.class_manager.read();
         if cm.module_registry.is_empty() {
             return true;
         }
@@ -9907,7 +9989,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     }
 
     fn is_package_open_to(&self, module_name: &str, pkg: &str, to_module: &str) -> bool {
-        let cm = self.shared.class_manager.read();
+        let cm = self.shared.classes.class_manager.read();
         if cm.module_registry.is_empty() {
             return true;
         }
@@ -9917,6 +9999,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
 
     fn module_add_reads(&mut self, reader: &str, provider: &str) {
         self.shared
+            .classes
             .class_manager
             .write()
             .module_registry
@@ -9925,6 +10008,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
 
     fn module_add_exports(&mut self, module_name: &str, pkg: &str, target: &str) {
         self.shared
+            .classes
             .class_manager
             .write()
             .module_registry
@@ -9933,6 +10017,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
 
     fn module_add_opens(&mut self, module_name: &str, pkg: &str, target: &str) {
         self.shared
+            .classes
             .class_manager
             .write()
             .module_registry
@@ -9941,6 +10026,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
 
     fn module_packages(&self, module_name: &str) -> Vec<String> {
         self.shared
+            .classes
             .class_manager
             .read()
             .module_registry
@@ -9949,6 +10035,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
 
     fn module_uses(&self, module_name: &str) -> Vec<String> {
         self.shared
+            .classes
             .class_manager
             .read()
             .module_registry
@@ -9959,6 +10046,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
 
     fn module_is_open(&self, module_name: &str) -> bool {
         self.shared
+            .classes
             .class_manager
             .read()
             .module_registry
@@ -9968,6 +10056,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
 
     fn all_module_names(&self) -> Vec<String> {
         self.shared
+            .classes
             .class_manager
             .read()
             .module_registry
@@ -9976,6 +10065,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
 
     fn module_for_package(&self, pkg: &str) -> Option<String> {
         self.shared
+            .classes
             .class_manager
             .read()
             .module_registry
@@ -9984,14 +10074,14 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     }
 
     fn set_class_hidden(&mut self, class_id: ClassId) {
-        let mut cm = self.shared.class_manager.write();
+        let mut cm = self.shared.classes.class_manager.write();
         if let Some(class) = cm.get_class_mut(class_id) {
             class.hidden = true;
         }
     }
 
     fn is_class_hidden(&self, class_id: ClassId) -> bool {
-        let cm = self.shared.class_manager.read();
+        let cm = self.shared.classes.class_manager.read();
         cm.get_class(class_id)
             .map(|c| c.is_hidden())
             .unwrap_or(false)
@@ -10002,7 +10092,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // inherit the lookup class's nest host and nest members. We copy
         // the relevant fields onto the target so that member access
         // checks see the hidden class as a legitimate nestmate.
-        let mut cm = self.shared.class_manager.write();
+        let mut cm = self.shared.classes.class_manager.write();
         // Grab the nest info from the source class first (release the
         // immutable borrow before we take a mutable one).
         let (nest_host, nest_members) = match cm.get_class(source_class) {
@@ -10048,6 +10138,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
 
     fn service_providers_from_modules(&self, service_class: &str) -> Vec<String> {
         self.shared
+            .classes
             .class_manager
             .read()
             .module_registry
@@ -10059,7 +10150,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         accessor_class_id: ClassId,
         target_class_id: ClassId,
     ) -> Result<(), String> {
-        let cm = self.shared.class_manager.read();
+        let cm = self.shared.classes.class_manager.read();
         // No modules registered в†’ classpath-only mode, allow.
         if cm.module_registry.is_empty() {
             return Ok(());
@@ -10086,11 +10177,11 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     }
 
     fn find_resource(&self, name: &str) -> Option<Vec<u8>> {
-        self.shared.class_manager.read().find_resource(name)
+        self.shared.classes.class_manager.read().find_resource(name)
     }
 
     fn class_bytes(&self, class_id: ClassId) -> Option<Vec<u8>> {
-        let cm = self.shared.class_manager.read();
+        let cm = self.shared.classes.class_manager.read();
         cm.class_bytes_cache
             .get(&class_id)
             .map(|bytes| bytes.to_vec())
@@ -10098,6 +10189,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
 
     fn find_all_resource_urls(&self, name: &str) -> Vec<String> {
         self.shared
+            .classes
             .class_manager
             .read()
             .find_all_resource_urls(name)
@@ -10105,6 +10197,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
 
     fn find_all_resource_bytes(&self, name: &str) -> Vec<Vec<u8>> {
         self.shared
+            .classes
             .class_manager
             .read()
             .find_all_resource_bytes(name)
@@ -10112,19 +10205,20 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
 
     fn find_class_source_path(&self, class_name: &str) -> Option<String> {
         self.shared
+            .classes
             .class_manager
             .read()
             .find_class_source_path(class_name)
     }
 
     fn class_code_base(&self, class_id: ClassId) -> Option<String> {
-        let cm = self.shared.class_manager.read();
+        let cm = self.shared.classes.class_manager.read();
         let cls = cm.class_store.get(class_id)?;
         cls.code_source.as_ref()?.url.clone()
     }
 
     fn class_code_source_cert_digests(&self, class_id: ClassId) -> Vec<String> {
-        let cm = self.shared.class_manager.read();
+        let cm = self.shared.classes.class_manager.read();
         match cm.class_store.get(class_id) {
             Some(cls) => cls
                 .code_source
@@ -10136,7 +10230,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     }
 
     fn class_code_source_certs(&self, class_id: ClassId) -> Vec<Vec<u8>> {
-        let cm = self.shared.class_manager.read();
+        let cm = self.shared.classes.class_manager.read();
         match cm.class_store.get(class_id) {
             Some(cls) => cls
                 .code_source
@@ -10153,6 +10247,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
 
     fn list_application_class_names(&self) -> Vec<String> {
         self.shared
+            .classes
             .class_manager
             .read()
             .list_application_class_names()
@@ -10160,6 +10255,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
 
     fn register_dynamic_classpath(&mut self, paths: &[String]) {
         self.shared
+            .classes
             .class_manager
             .write()
             .extend_application_classpath(paths);
@@ -10167,6 +10263,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
 
     fn register_bootstrap_classpath(&mut self, paths: &[String]) {
         self.shared
+            .classes
             .class_manager
             .write()
             .extend_bootstrap_classpath(paths);
@@ -10174,7 +10271,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
 
     fn define_class_from_bytes(&mut self, name: &str, bytes: &[u8]) -> Option<ClassId> {
         use cratonvm_types::ClassLoaderId;
-        let mut cm = self.shared.class_manager.write();
+        let mut cm = self.shared.classes.class_manager.write();
         match cm.define_class(name, bytes, ClassLoaderId::Application) {
             Ok(cid) => {
                 // Release the ClassManager write lock before calling
@@ -10212,7 +10309,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     ) -> Result<ClassId, String> {
         use cratonvm_classloading::DefineClassOptions;
         use cratonvm_types::ClassLoaderId;
-        let mut cm = self.shared.class_manager.write();
+        let mut cm = self.shared.classes.class_manager.write();
         let options = DefineClassOptions {
             override_name: Some(stored_name.to_string()),
             hidden: true,
@@ -10248,7 +10345,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         loader_id: u32,
     ) -> Option<ClassId> {
         use cratonvm_types::ClassLoaderId;
-        let mut cm = self.shared.class_manager.write();
+        let mut cm = self.shared.classes.class_manager.write();
         match cm.define_class(name, bytes, ClassLoaderId::UserDefined(loader_id)) {
             Ok(cid) => {
                 drop(cm);
@@ -10276,13 +10373,13 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
 
     fn class_id_by_name_and_loader(&self, name: &str, loader_id: u32) -> Option<ClassId> {
         use cratonvm_types::ClassLoaderId;
-        let cm = self.shared.class_manager.read();
+        let cm = self.shared.classes.class_manager.read();
         cm.find_class_by_name_in_loader(name, ClassLoaderId::UserDefined(loader_id))
     }
 
     fn class_id_defined_by_loader_exact(&self, name: &str, loader_id: u32) -> Option<ClassId> {
         use cratonvm_types::ClassLoaderId;
-        let cm = self.shared.class_manager.read();
+        let cm = self.shared.classes.class_manager.read();
         cm.class_defined_by_loader_exact(name, ClassLoaderId::UserDefined(loader_id))
     }
 
@@ -10325,7 +10422,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         };
 
         let cid = {
-            let mut cm = self.shared.class_manager.write();
+            let mut cm = self.shared.classes.class_manager.write();
             cm.define_class_with_options(name, bytes, cl_id, define_opts)
                 .map_err(|e| format!("{e:?}"))?
         };
@@ -10376,7 +10473,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     }
 
     fn list_loaded_class_ids(&self) -> Vec<ClassId> {
-        let cm = self.shared.class_manager.read();
+        let cm = self.shared.classes.class_manager.read();
         cm.class_store.iter().map(|c| c.id).collect()
     }
 
@@ -10387,7 +10484,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         } else {
             ClassLoaderId::UserDefined(loader_id)
         };
-        let cm = self.shared.class_manager.read();
+        let cm = self.shared.classes.class_manager.read();
         cm.class_store
             .iter()
             .filter(|c| c.loader_id == cl_id)
@@ -11098,6 +11195,7 @@ pub fn invoke_or_native(
     if method_name == "type" && descriptor == "()Ljava/lang/invoke/MethodType;" {
         if let Some(Value::Object(Some(receiver))) = args.first() {
             let is_downcall = shared
+                .classes
                 .class_manager
                 .read()
                 .get_class(shared.heap.class_id_of(*receiver))
@@ -11119,6 +11217,7 @@ pub fn invoke_or_native(
     if matches!(method_name, "invoke" | "invokeExact" | "invokeBasic") {
         if let Some(Value::Object(Some(receiver))) = args.first() {
             let is_downcall = shared
+                .classes
                 .class_manager
                 .read()
                 .get_class(shared.heap.class_id_of(*receiver))
@@ -11267,6 +11366,7 @@ pub fn invoke_or_native(
                 Some(Value::Object(Some(o))) => {
                     let cid = shared.heap.class_id_of(*o);
                     shared
+                        .classes
                         .class_manager
                         .read()
                         .get_class(cid)
@@ -11293,7 +11393,7 @@ pub fn invoke_or_native(
         && effective_class == "java/util/Optional"
         && (method_name == "hashCode" || method_name == "equals")
     {
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let recv_cid = match args.first() {
             Some(Value::Object(Some(o))) => Some(shared.heap.class_id_of(*o)),
             _ => None,
@@ -11338,7 +11438,7 @@ pub fn invoke_or_native(
         if let Some(Value::Object(Some(recv))) = args.first() {
             let recv_class_id = shared.heap.class_id_of(*recv);
             let has_real_workers = {
-                let cm = shared.class_manager.read();
+                let cm = shared.classes.class_manager.read();
                 resolve_field_index_in_hierarchy(recv_class_id, "workers", &cm.class_store)
                     .map(|idx| matches!(shared.heap.get_field(*recv, idx), Value::Object(Some(_))))
                     .unwrap_or(false)
@@ -11394,7 +11494,7 @@ pub fn invoke_or_native(
                         | "java/lang/management/ManagementFactory"
                 ));
         let has_real = real_protected_stub && {
-            let cm = shared.class_manager.read();
+            let cm = shared.classes.class_manager.read();
             cm.get_loaded_class_id(effective_class)
                 .and_then(|cid| {
                     cm.get_class(cid).and_then(|cls| {
@@ -11442,7 +11542,7 @@ pub fn invoke_or_native(
     if method_name != "<init>" {
         // Check if the target class has its own bytecode for this method.
         let has_own_bytecode = {
-            let cm = shared.class_manager.read();
+            let cm = shared.classes.class_manager.read();
             cm.get_loaded_class_id(effective_class)
                 .and_then(|cid| cm.get_class(cid))
                 .map(|cls| cls.find_method(method_name, descriptor).is_some())
@@ -11452,7 +11552,7 @@ pub fn invoke_or_native(
             eprintln!("[invoke_or_native] has_own_bytecode={}", has_own_bytecode);
         }
         if !has_own_bytecode {
-            let cm = shared.class_manager.read();
+            let cm = shared.classes.class_manager.read();
             if let Some(mut cid) = cm.get_loaded_class_id(effective_class) {
                 while let Some(parent_id) = cm.get_class(cid).and_then(|c| c.superclass) {
                     if let Some(parent) = cm.get_class(parent_id) {
@@ -11552,7 +11652,7 @@ pub fn invoke_or_native(
     // cheap (a single atomic load) once initialized and can never
     // regress an already-initialized class back to needing the check.
     {
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         if let Some(class_id) = cm.get_loaded_class_id(effective_class) {
             if let Some(class) = cm.class_store.get(class_id) {
                 if !class.is_synthetic_stub {
@@ -11936,7 +12036,7 @@ pub fn invoke_special_shared(
     // class so we land on the interface that owns the bytecode. This
     // ensures we don't re-resolve via the receiver's overriding method.
     let target_class_id = {
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let store = &cm.class_store;
         match crate::classloading::find_method_recursive(class_id, method_name, descriptor, store) {
             Some((_, declaring_id)) => declaring_id,
@@ -12046,7 +12146,7 @@ pub fn invoke_special_bytecode_only_shared(
     // receiver's dynamic class) to the declaring class -- true static
     // binding, matching `invoke_special_shared`.
     let target_class_id = {
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let store = &cm.class_store;
         match crate::classloading::find_method_recursive(class_id, method_name, descriptor, store) {
             Some((_, declaring_id)) => declaring_id,
@@ -12115,7 +12215,7 @@ fn proxy_method_set_field_by_name(
     value: Value,
 ) {
     let class_id = shared.heap.class_id_of(method_obj);
-    let cm = shared.class_manager.read();
+    let cm = shared.classes.class_manager.read();
     if let Some(idx) = resolve_field_index_in_hierarchy(class_id, field_name, &cm.class_store) {
         drop(cm);
         shared.heap.set_field(method_obj, idx, value);
@@ -12150,6 +12250,7 @@ fn proxy_method_write_extra_slots(
 
     let class_id = shared.heap.class_id_of(method_obj);
     let total_fields = shared
+        .classes
         .class_manager
         .read()
         .get_class(class_id)
@@ -12230,12 +12331,14 @@ pub(super) fn proxy_invoke_handler(
     // multi-interface and default-method tests) silently returns null.
     let method_class_id = ctx
         .shared
+        .classes
         .class_manager
         .write()
         .load_class("java/lang/reflect/Method")
         .unwrap_or(ClassId::new(0));
     let total_fields = ctx
         .shared
+        .classes
         .class_manager
         .read()
         .get_class(method_class_id)
@@ -12411,6 +12514,7 @@ pub(super) fn proxy_invoke_handler(
     // interface method (no Code attribute).
     let handler_is_lambda = ctx
         .shared
+        .classes
         .lambda_proxies
         .read()
         .contains_key(&handler_class_id);
@@ -12463,6 +12567,7 @@ pub(super) fn proxy_invoke_handler(
 
     let handler_class_name = ctx
         .shared
+        .classes
         .class_manager
         .read()
         .get_class(handler_class_id)
@@ -12545,6 +12650,7 @@ fn annotation_proxy_invoke(
 /// Whether `obj`'s runtime class has the given internal name.
 fn class_name_is(shared: &SharedVm, obj: ObjectRef, name: &str) -> bool {
     shared
+        .classes
         .class_manager
         .read()
         .get_class(shared.heap.class_id_of(obj))
@@ -12651,11 +12757,13 @@ pub(crate) fn proxy_invoke_handler_shared(
     // See `proxy_method_set_field_by_name` for the rationale; mirrors the
     // fix applied to `proxy_invoke_handler` above.
     let method_class_id = shared
+        .classes
         .class_manager
         .write()
         .load_class("java/lang/reflect/Method")
         .unwrap_or(ClassId::new(0));
     let total_fields = shared
+        .classes
         .class_manager
         .read()
         .get_class(method_class_id)
@@ -12802,7 +12910,11 @@ pub(crate) fn proxy_invoke_handler_shared(
     // interface method, which has no Code attribute) and crash with
     // "no Code attribute". Route through `try_lambda_dispatch` which
     // resolves the lambda's `impl_handle` and runs the SAM body.
-    let handler_is_lambda = shared.lambda_proxies.read().contains_key(&handler_class_id);
+    let handler_is_lambda = shared
+        .classes
+        .lambda_proxies
+        .read()
+        .contains_key(&handler_class_id);
     if handler_is_lambda {
         let call_args = [
             Value::Object(Some(proxy)),
@@ -12848,6 +12960,7 @@ pub(crate) fn proxy_invoke_handler_shared(
     }
 
     let handler_class_name = shared
+        .classes
         .class_manager
         .read()
         .get_class(handler_class_id)
@@ -12908,7 +13021,13 @@ fn proxy_wrap_undeclared_if_needed(
     // RuntimeException / Error (or subclasses) propagate verbatim.
     for base in ["java/lang/RuntimeException", "java/lang/Error"] {
         if let Ok(bcid) = shared.load_class_concurrent(base) {
-            if thrown_cid == bcid || shared.class_manager.read().is_subclass_of(thrown_cid, bcid) {
+            if thrown_cid == bcid
+                || shared
+                    .classes
+                    .class_manager
+                    .read()
+                    .is_subclass_of(thrown_cid, bcid)
+            {
                 return Err(MethodCallFailed::ExceptionThrown(thrown));
             }
         }
@@ -12919,6 +13038,7 @@ fn proxy_wrap_undeclared_if_needed(
     // interface, so its `Exceptions` attribute is authoritative for (name,desc).
     let decl_mirror = proxy_resolve_declaring_class_mirror(shared, proxy, method_name, descriptor);
     let decl_cid = shared
+        .classes
         .class_mirrors_reverse
         .read()
         .get(&decl_mirror)
@@ -12928,6 +13048,7 @@ fn proxy_wrap_undeclared_if_needed(
             if let Ok(ex_cid) = shared.load_class_concurrent(&ex_name) {
                 if thrown_cid == ex_cid
                     || shared
+                        .classes
                         .class_manager
                         .read()
                         .is_subclass_of(thrown_cid, ex_cid)
@@ -12948,6 +13069,7 @@ fn proxy_wrap_undeclared_if_needed(
         return Err(MethodCallFailed::ExceptionThrown(thrown));
     }
     let n_fields = shared
+        .classes
         .class_manager
         .read()
         .get_class(ute_cid)
@@ -12984,7 +13106,7 @@ fn proxy_method_declared_exceptions(
     method_name: &str,
     descriptor: &str,
 ) -> Vec<String> {
-    let cm = shared.class_manager.read();
+    let cm = shared.classes.class_manager.read();
     let Some(class) = cm.get_class(class_id) else {
         return Vec::new();
     };
@@ -13024,11 +13146,13 @@ fn proxy_method_exception_types(
     descriptor: &str,
 ) -> ObjectRef {
     let class_component = shared
+        .classes
         .class_manager
         .write()
         .load_class("java/lang/Class")
         .unwrap_or(ClassId::new(0));
     let declaring_class = shared
+        .classes
         .class_mirrors_reverse
         .read()
         .get(&declaring_mirror)
@@ -13116,11 +13240,17 @@ pub(crate) fn annotation_proxy_invoke_shared(
                 let ann_cid = proxy_desc
                     .strip_prefix('L')
                     .and_then(|s| s.strip_suffix(';'))
-                    .and_then(|n| shared.class_manager.read().get_loaded_class_id(n));
-                let same_annotation_type = ann_cid
-                    .is_some_and(|ac| shared.class_manager.read().is_subclass_of(other_cid, ac));
+                    .and_then(|n| shared.classes.class_manager.read().get_loaded_class_id(n));
+                let same_annotation_type = ann_cid.is_some_and(|ac| {
+                    shared
+                        .classes
+                        .class_manager
+                        .read()
+                        .is_subclass_of(other_cid, ac)
+                });
                 if same_annotation_type {
                     let other_cname = shared
+                        .classes
                         .class_manager
                         .read()
                         .get_class(other_cid)
@@ -13170,7 +13300,7 @@ fn annotation_proxy_as_map(
 
     let dest_map = if let Some(f) = factory {
         let f_cid = shared.heap.class_id_of(f);
-        let is_lambda = shared.lambda_proxies.read().contains_key(&f_cid);
+        let is_lambda = shared.classes.lambda_proxies.read().contains_key(&f_cid);
         let res = if is_lambda {
             let dispatch = crate::runtime::interpreter::try_lambda_dispatch(
                 shared,
@@ -13344,7 +13474,7 @@ fn adapt_array_contains(shared: &SharedVm, arr_val: Option<Value>, target_name: 
         // subclasses may have fields before their inherited Enum fields, so
         // assuming slot 0 causes CLASS_TO_STRING to be silently skipped.
         let name_index = {
-            let cm = shared.class_manager.read();
+            let cm = shared.classes.class_manager.read();
             resolve_field_index_in_hierarchy(shared.heap.class_id_of(elem), "name", &cm.class_store)
         };
         if let Some(name_index) = name_index {
@@ -13378,6 +13508,7 @@ pub(crate) fn convert_class_values_to_strings(shared: &SharedVm, val: Value) -> 
         // detection: the class name of `obj` is "java/lang/Class".
         let cid = shared.heap.class_id_of(obj);
         let class_name = shared
+            .classes
             .class_manager
             .read()
             .get_class(cid)
@@ -13393,6 +13524,7 @@ pub(crate) fn convert_class_values_to_strings(shared: &SharedVm, val: Value) -> 
         // Reference array whose component class is `java/lang/Class`.
         let comp_cid = shared.heap.class_id_of(obj);
         let comp_name = shared
+            .classes
             .class_manager
             .read()
             .get_class(comp_cid)
@@ -13436,6 +13568,7 @@ fn class_mirror_fqn(shared: &SharedVm, mirror: ObjectRef) -> String {
     let mirror_cid = super::class_id_from_mirror(shared, mirror);
     if let Some(cid) = mirror_cid {
         if let Some(name) = shared
+            .classes
             .class_manager
             .read()
             .get_class(cid)
@@ -13469,6 +13602,7 @@ fn adapt_annotation_value_for_map(
     let cid = shared.heap.class_id_of(obj);
     let kind = shared.heap.kind_of(obj);
     let class_name = shared
+        .classes
         .class_manager
         .read()
         .get_class(cid)
@@ -13486,7 +13620,7 @@ fn adapt_annotation_value_for_map(
                 Ok(Value::Object(Some(e)))
                     if shared.heap.kind_of(e) == ObjectKind::Object
                         && shared
-                            .class_manager
+                            .classes.class_manager
                             .read()
                             .get_class(shared.heap.class_id_of(e))
                             .map(|c| &*c.name == "java/lang/annotation/AnnotationProxy")
@@ -13604,6 +13738,7 @@ fn format_annotation_value(shared: &SharedVm, val: Value) -> String {
             }
             let cid = shared.heap.class_id_of(obj);
             let cname = shared
+                .classes
                 .class_manager
                 .read()
                 .get_class(cid)
@@ -13790,6 +13925,7 @@ fn annotation_value_hash(shared: &SharedVm, val: Value) -> i32 {
             }
             let cid = shared.heap.class_id_of(obj);
             let cname = shared
+                .classes
                 .class_manager
                 .read()
                 .get_class(cid)
@@ -13868,6 +14004,7 @@ pub(crate) fn annotation_proxy_equals(shared: &SharedVm, a: ObjectRef, b: Value)
     }
     let other_cid = shared.heap.class_id_of(other);
     let other_cname = shared
+        .classes
         .class_manager
         .read()
         .get_class(other_cid)
@@ -13947,12 +14084,14 @@ fn annotation_values_equal(shared: &SharedVm, a: Value, b: Value) -> bool {
             let xcid = shared.heap.class_id_of(x);
             let ycid = shared.heap.class_id_of(y);
             let xname = shared
+                .classes
                 .class_manager
                 .read()
                 .get_class(xcid)
                 .map(|c| c.name.to_string())
                 .unwrap_or_default();
             let yname = shared
+                .classes
                 .class_manager
                 .read()
                 .get_class(ycid)
@@ -14033,7 +14172,7 @@ pub(crate) fn annotation_proxy_dispatch_impl(
                 if class_name_is(shared, method_obj, "java/lang/reflect/Method") {
                     let name_val = {
                         let method_cid = shared.heap.class_id_of(method_obj);
-                        let cm = shared.class_manager.read();
+                        let cm = shared.classes.class_manager.read();
                         resolve_field_index_in_hierarchy(method_cid, "name", &cm.class_store)
                             .map(|idx| shared.heap.get_field(method_obj, idx))
                     };
@@ -14207,10 +14346,11 @@ fn annotation_member_declared_default(
         .unwrap_or(&desc)
         .to_string();
     let cid = shared
+        .classes
         .class_manager
         .read()
         .find_class_by_name(&class_name)?;
-    let cm = shared.class_manager.read();
+    let cm = shared.classes.class_manager.read();
     let class = cm.get_class(cid)?;
     for m in &class.methods {
         // Annotation members are no-arg abstract methods.
@@ -14352,6 +14492,7 @@ pub(super) fn proxy_descriptor_to_class_mirror(shared: &SharedVm, desc: &str) ->
         return super::get_or_create_class_mirror(shared, ClassId::new(0));
     };
     let cid = shared
+        .classes
         .class_manager
         .write()
         .load_class(&load_name)
@@ -14424,6 +14565,7 @@ pub(super) fn proxy_resolve_declaring_class_mirror(
     // `Object`).
     let proxy_cid = shared.heap.class_id_of(proxy);
     let has_iface_slot = shared
+        .classes
         .class_manager
         .read()
         .get_class(proxy_cid)
@@ -14442,7 +14584,8 @@ pub(super) fn proxy_resolve_declaring_class_mirror(
                     if first_iface_mirror.is_none() {
                         first_iface_mirror = Some(m);
                     }
-                    if let Some(cid) = shared.class_mirrors_reverse.read().get(&m).copied() {
+                    if let Some(cid) = shared.classes.class_mirrors_reverse.read().get(&m).copied()
+                    {
                         iface_cids.push(cid);
                     }
                 }
@@ -14452,6 +14595,7 @@ pub(super) fn proxy_resolve_declaring_class_mirror(
         // Real-super layout: the proxy class's declared interfaces ARE the proxy
         // interface set (the generated `$ProxyN` declares them directly).
         let cids = shared
+            .classes
             .class_manager
             .read()
             .get_class(proxy_cid)
@@ -14475,7 +14619,7 @@ pub(super) fn proxy_resolve_declaring_class_mirror(
                 continue;
             }
             let supers: Vec<ClassId> = {
-                let cm = shared.class_manager.read();
+                let cm = shared.classes.class_manager.read();
                 let Some(class) = cm.get_class(cid) else {
                     continue;
                 };
@@ -14526,6 +14670,7 @@ pub(super) fn proxy_box_value_for_desc(shared: &SharedVm, value: Value, pdesc: &
         };
         if let Some(wname) = wrapper {
             let class_id = shared
+                .classes
                 .class_manager
                 .write()
                 .load_class(wname)
@@ -14543,6 +14688,7 @@ pub(super) fn proxy_box_value(shared: &SharedVm, value: Value) -> Value {
     match value {
         Value::Int(v) => {
             let class_id = shared
+                .classes
                 .class_manager
                 .write()
                 .load_class("java/lang/Integer")
@@ -14553,6 +14699,7 @@ pub(super) fn proxy_box_value(shared: &SharedVm, value: Value) -> Value {
         }
         Value::Long(v) => {
             let class_id = shared
+                .classes
                 .class_manager
                 .write()
                 .load_class("java/lang/Long")
@@ -14563,6 +14710,7 @@ pub(super) fn proxy_box_value(shared: &SharedVm, value: Value) -> Value {
         }
         Value::Float(v) => {
             let class_id = shared
+                .classes
                 .class_manager
                 .write()
                 .load_class("java/lang/Float")
@@ -14573,6 +14721,7 @@ pub(super) fn proxy_box_value(shared: &SharedVm, value: Value) -> Value {
         }
         Value::Double(v) => {
             let class_id = shared
+                .classes
                 .class_manager
                 .write()
                 .load_class("java/lang/Double")
@@ -14679,7 +14828,7 @@ fn invoke_on_class_shared_inner(
     if method_name != "<init>" && method_name != "<clinit>" {
         if let Some(Value::Object(Some(recv))) = args.first().copied() {
             let recv_cid = shared.heap.class_id_of(recv);
-            if shared.lambda_proxies.read().contains_key(&recv_cid) {
+            if shared.classes.lambda_proxies.read().contains_key(&recv_cid) {
                 if let Some(result) = crate::runtime::interpreter::try_lambda_dispatch(
                     shared,
                     thread,
@@ -14722,7 +14871,7 @@ fn invoke_on_class_shared_inner(
         });
         if let Some(rc) = recv_cid {
             if rc != class_id && rc != ClassId::new(0) {
-                let cm = shared.class_manager.read();
+                let cm = shared.classes.class_manager.read();
                 let this_is_iface_or_abs = cm
                     .get_class(class_id)
                     .map(|c| c.is_interface() || c.is_abstract())
@@ -14771,7 +14920,7 @@ fn invoke_on_class_shared_inner(
     // bytecode selection, so it cannot dispatch through the unsupported
     // socket/provider protocol.
     let class_name = {
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         cm.get_class(class_id)
             .map(|class| class.name.to_string())
             .unwrap_or_default()
@@ -14814,6 +14963,7 @@ fn invoke_on_class_shared_inner(
     // they never reach this branch.
     if class_name.starts_with("cratonvm/internal/")
         || shared
+            .classes
             .class_manager
             .read()
             .get_class(class_id)
@@ -14869,7 +15019,7 @@ fn invoke_on_class_shared_inner(
         if let Some(Value::Object(Some(recv))) = args.first().copied() {
             let recv_cid = shared.heap.class_id_of(recv);
             let is_path = {
-                let cm = shared.class_manager.read();
+                let cm = shared.classes.class_manager.read();
                 cm.find_class_by_name("java/nio/file/Path")
                     .map(|path_cid| cm.is_subclass_of(recv_cid, path_cid))
                     .unwrap_or(false)
@@ -15008,6 +15158,7 @@ fn invoke_on_class_shared_inner(
         if let Some(Value::Object(Some(receiver))) = args.first() {
             let receiver_class = shared.heap.class_id_of(*receiver);
             let receiver_name = shared
+                .classes
                 .class_manager
                 .read()
                 .get_class(receiver_class)
@@ -15043,6 +15194,7 @@ fn invoke_on_class_shared_inner(
         if let Some(Value::Object(Some(receiver))) = args.first() {
             let receiver_class = shared.heap.class_id_of(*receiver);
             let receiver_name = shared
+                .classes
                 .class_manager
                 .read()
                 .get_class(receiver_class)
@@ -15094,7 +15246,7 @@ fn invoke_on_class_shared_inner(
     }
     // Find the method (walking the superclass chain)
     let (is_native, is_synchronized, is_static, declaring_class_id) = {
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let store = &cm.class_store;
         match crate::classloading::find_method_recursive(class_id, method_name, descriptor, store) {
             Some((method, declaring_id)) => {
@@ -17905,6 +18057,7 @@ fn invoke_on_class_shared_inner(
                             .first()
                             .and_then(|value| match value {
                                 Value::Object(Some(receiver)) => shared
+                                    .classes
                                     .class_manager
                                     .read()
                                     .get_class(shared.heap.class_id_of(*receiver))
@@ -17973,7 +18126,7 @@ fn invoke_on_class_shared_inner(
                 // ServiceLoader-driven Spliterator returned 0 elements,
                 // surfacing as IAE during WildFly boot).
                 {
-                    let cm2 = shared.class_manager.read();
+                    let cm2 = shared.classes.class_manager.read();
                     if let Some(class) = cm2.class_store.get(class_id) {
                         // Collect transitive interfaces (BFS over super-ifaces)
                         // so we find default methods declared on a parent
@@ -18069,7 +18222,7 @@ fn invoke_on_class_shared_inner(
                     // lambda metadata before trying generic Object fallbacks.
                     if let Some(Value::Object(Some(recv))) = args.first().copied() {
                         let recv_cid = shared.heap.class_id_of(recv);
-                        if shared.lambda_proxies.read().contains_key(&recv_cid) {
+                        if shared.classes.lambda_proxies.read().contains_key(&recv_cid) {
                             if let Some(result) = crate::runtime::interpreter::try_lambda_dispatch(
                                 shared,
                                 thread,
@@ -18104,6 +18257,7 @@ fn invoke_on_class_shared_inner(
                         let recv_cid = shared.heap.class_id_of(recv);
                         if recv_cid == ClassId::new(0)
                             || shared
+                                .classes
                                 .class_manager
                                 .read()
                                 .get_class(recv_cid)
@@ -18133,7 +18287,7 @@ fn invoke_on_class_shared_inner(
                     // dispatch resolved to Object due to a synthetic alloc.
                     if let Some(Value::Object(Some(recv))) = args.first().copied() {
                         let recv_cid = shared.heap.class_id_of(recv);
-                        let cm2 = shared.class_manager.read();
+                        let cm2 = shared.classes.class_manager.read();
                         let recv_name = cm2
                             .class_store
                             .get(recv_cid)
@@ -18143,7 +18297,7 @@ fn invoke_on_class_shared_inner(
                         if !recv_name.is_empty() && recv_name != "java/lang/Object" {
                             // Native registered on the receiver's class
                             // (or any superclass on the chain).
-                            let cm3 = shared.class_manager.read();
+                            let cm3 = shared.classes.class_manager.read();
                             let mut walk_cid = Some(recv_cid);
                             while let Some(cid) = walk_cid {
                                 if let Some(cls) = cm3.class_store.get(cid) {
@@ -18192,7 +18346,7 @@ fn invoke_on_class_shared_inner(
                     let recv_dbg = match args.first() {
                         Some(Value::Object(Some(o))) => {
                             let cid = shared.heap.class_id_of(*o);
-                            let cm3 = shared.class_manager.read();
+                            let cm3 = shared.classes.class_manager.read();
                             cm3.get_class(cid)
                                 .map(|c| c.name.to_string())
                                 .unwrap_or_else(|| format!("<cid {cid}>"))
@@ -18221,7 +18375,7 @@ fn invoke_on_class_shared_inner(
                     // invoke originates from real bytecode several frames up
                     // (e.g. real JDK URLClassPath machinery) or from a native
                     // helper reusing the wrong object as a receiver.
-                    let cm4 = shared.class_manager.read();
+                    let cm4 = shared.classes.class_manager.read();
                     eprintln!("[NSME_DBG] full stack:");
                     for (i, f) in thread.frames.iter().enumerate().rev().take(30) {
                         let cn = cm4
@@ -18277,7 +18431,7 @@ fn invoke_on_class_shared_inner(
                     if let Some(Value::Object(Some(recv))) = args.first().copied() {
                         let recv_cid = shared.heap.class_id_of(recv);
                         if recv_cid != class_id && recv_cid != ClassId::new(0) {
-                            let cm_recv = shared.class_manager.read();
+                            let cm_recv = shared.classes.class_manager.read();
                             if let Some((m, declaring_id)) =
                                 crate::classloading::find_method_recursive(
                                     recv_cid,
@@ -18313,7 +18467,7 @@ fn invoke_on_class_shared_inner(
                 // before raising NSME.
                 if let Some(cp_iface_cid) = pending_cp_iface() {
                     if cp_iface_cid != class_id {
-                        let cm_iface = shared.class_manager.read();
+                        let cm_iface = shared.classes.class_manager.read();
                         if let Some((m, declaring_id)) = crate::classloading::find_method_recursive(
                             cp_iface_cid,
                             method_name,
@@ -18348,7 +18502,7 @@ fn invoke_on_class_shared_inner(
                 // dispatch class chain and the receiver class chain probing
                 // the native registry before surfacing NSME.
                 {
-                    let cm_nat = shared.class_manager.read();
+                    let cm_nat = shared.classes.class_manager.read();
                     let mut probe_cid = Some(class_id);
                     while let Some(cid) = probe_cid {
                         if let Some(cls) = cm_nat.class_store.get(cid) {
@@ -18413,6 +18567,7 @@ fn invoke_on_class_shared_inner(
                     let recv_is_ann_proxy = shared.heap.kind_of(recv)
                         == cratonvm_types::ObjectKind::Object
                         && shared
+                            .classes
                             .class_manager
                             .read()
                             .get_class(shared.heap.class_id_of(recv))
@@ -18454,6 +18609,7 @@ fn invoke_on_class_shared_inner(
                 // (previously required `RUST_LOG=debug` to see the separate
                 // "Falling back to synthetic stub" line and correlate it).
                 let stub_hint = if shared
+                    .classes
                     .class_manager
                     .read()
                     .get_class(class_id)
@@ -18624,7 +18780,7 @@ fn invoke_on_class_shared_inner(
     #[cfg(feature = "experimental-aot")]
     {
         if crate::native::builtins::aot::is_aot_training() {
-            let cm = shared.class_manager.read();
+            let cm = shared.classes.class_manager.read();
             let class_name = cm
                 .class_store
                 .get(class_id)
@@ -18655,6 +18811,7 @@ fn invoke_on_class_shared_inner(
 
     if !is_native {
         let class_name_for_force = shared
+            .classes
             .class_manager
             .read()
             .get_class(declaring_class_id)
@@ -18676,7 +18833,7 @@ fn invoke_on_class_shared_inner(
             && method_name == "execute"
             && matches!(args.first(), Some(Value::Object(Some(recv))) if {
                 let recv_class_id = shared.heap.class_id_of(*recv);
-                let cm = shared.class_manager.read();
+                let cm = shared.classes.class_manager.read();
                 resolve_field_index_in_hierarchy(recv_class_id, "workers", &cm.class_store)
                     .map(|idx| matches!(shared.heap.get_field(*recv, idx), Value::Object(Some(_))))
                     .unwrap_or(false)
@@ -18757,6 +18914,7 @@ fn invoke_on_class_shared_inner(
     let result = if is_native {
         // Look up native implementation
         let class_name = shared
+            .classes
             .class_manager
             .read()
             .get_class(declaring_class_id)
@@ -19007,7 +19165,7 @@ fn invoke_on_class_shared_inner(
         // Deliberate interface-default overrides belong in
         // `force_native_over_real_jdk_bytecode`.
         let (class_name_for_override, declaring_is_interface) = {
-            let cm = shared.class_manager.read();
+            let cm = shared.classes.class_manager.read();
             let cls = cm.get_class(declaring_class_id);
             (
                 cls.map(|c| c.name.to_string()).unwrap_or_default(),
@@ -20423,7 +20581,7 @@ mod tests {
     #[test]
     fn t10_9_e_descriptor_cache_empty_on_startup() {
         let shared = test_shared();
-        let cache = shared.field_descriptor_cache.read();
+        let cache = shared.classes.field_descriptor_cache.read();
         assert!(
             cache.is_empty(),
             "field_descriptor_cache should start empty, got {} entries",
@@ -20436,10 +20594,10 @@ mod tests {
         let shared = test_shared();
         // ClassId::new(9999) is not loaded вЂ” resolver returns None and does
         // not populate the cache.
-        let before = shared.field_descriptor_cache.read().len();
+        let before = shared.classes.field_descriptor_cache.read().len();
         let result = resolve_field_descriptor_byte_cached(&shared, ClassId::new(9999), 0);
         assert_eq!(result, None);
-        let after = shared.field_descriptor_cache.read().len();
+        let after = shared.classes.field_descriptor_cache.read().len();
         assert_eq!(
             before, after,
             "cache must not record an entry on miss (would mask later class loads)"
@@ -20454,7 +20612,11 @@ mod tests {
         // introduced for confirmed misses on real, fully-loaded hierarchies.
         let shared = test_shared();
         let key = (ClassId::new(4242), 7usize);
-        shared.field_descriptor_cache.write().insert(key, 0u8);
+        shared
+            .classes
+            .field_descriptor_cache
+            .write()
+            .insert(key, 0u8);
         let result = resolve_field_descriptor_byte_cached(&shared, key.0, key.1);
         assert_eq!(
             result, None,
@@ -20462,7 +20624,12 @@ mod tests {
         );
         // The lookup must NOT mutate the cached sentinel.
         assert_eq!(
-            shared.field_descriptor_cache.read().get(&key).copied(),
+            shared
+                .classes
+                .field_descriptor_cache
+                .read()
+                .get(&key)
+                .copied(),
             Some(0u8)
         );
     }
@@ -20474,12 +20641,12 @@ mod tests {
         // class load is observed. Only CONFIRMED misses on real hierarchies
         // get the sentinel.
         let shared = test_shared();
-        let before = shared.field_descriptor_cache.read().len();
+        let before = shared.classes.field_descriptor_cache.read().len();
         let result = resolve_field_descriptor_byte_cached(&shared, ClassId::new(31337), 0);
         assert_eq!(result, None);
         assert_eq!(
             before,
-            shared.field_descriptor_cache.read().len(),
+            shared.classes.field_descriptor_cache.read().len(),
             "an unloaded-class miss is transient and must not be memoized"
         );
     }
@@ -20509,12 +20676,12 @@ mod tests {
         let shared = test_shared();
         // Register a synthetic stub so field_at_index resolves.
         let cid = {
-            let mut cm = shared.class_manager.write();
+            let mut cm = shared.classes.class_manager.write();
             cm.ensure_synthetic_class("cratonvm/test/SyntheticStubProbe", 2)
         };
         // Sanity: that class is a stub.
         {
-            let cm = shared.class_manager.read();
+            let cm = shared.classes.class_manager.read();
             let cls = cm.get_class(cid).expect("stub registered");
             assert!(cls.is_synthetic_stub, "expected a synthetic stub");
         }
@@ -20556,7 +20723,7 @@ mod tests {
             .collect();
         let num_fields = fields.len();
 
-        let mut cm = shared.class_manager.write();
+        let mut cm = shared.classes.class_manager.write();
         let id = cm.class_store.next_id();
         cm.class_store.add(Class {
             id,
@@ -20604,7 +20771,7 @@ mod tests {
             &["Ljava/lang/Runnable;"],
         );
         {
-            let mut cm = shared.class_manager.write();
+            let mut cm = shared.classes.class_manager.write();
             let cls = cm
                 .get_class_mut(thread_cid)
                 .expect("test thread layout class registered");

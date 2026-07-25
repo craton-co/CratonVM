@@ -49,9 +49,7 @@ fn conditional_loader_metadata(shared: &SharedVm) -> bool {
                 || cratonvm_gc::gc_quiescence::unregistered_jit_frame_on_stack()
                 || cratonvm_gc::gc_quiescence::major_gc_requested()
         }
-        crate::config::GcAlgorithm::G1 => {
-            cratonvm_gc::gc_quiescence::class_unload_marking()
-        }
+        crate::config::GcAlgorithm::G1 => cratonvm_gc::gc_quiescence::class_unload_marking(),
         crate::config::GcAlgorithm::Zgc => true,
     }
 }
@@ -100,9 +98,7 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
         }
     }
     for class_id in cratonvm_types::jit_activation::active_class_ids() {
-        if let Some(loader) =
-            cratonvm_native_builtins::classloader::defining_loader_for(class_id)
-        {
+        if let Some(loader) = cratonvm_native_builtins::classloader::defining_loader_for(class_id) {
             roots.push(loader);
         }
     }
@@ -163,7 +159,7 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
 
     // 2. Static fields — all classes
     {
-        let statics = shared.statics.read();
+        let statics = shared.classes.statics.read();
         for (&class_id, fields) in statics.iter() {
             for val in fields {
                 if let Value::Object(Some(obj_ref)) = val {
@@ -186,11 +182,10 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
 
     // 3. Class lock objects — synthetic objects for static synchronized methods
     {
-        let class_locks = shared.class_locks.read();
+        let class_locks = shared.classes.class_locks.read();
         for (&class_id, obj_ref) in class_locks.iter() {
             if conditional_metadata {
-                if let Some(loader) =
-                    cratonvm_types::loader_pin::loader_pin_addr(class_id.as_u32())
+                if let Some(loader) = cratonvm_types::loader_pin::loader_pin_addr(class_id.as_u32())
                 {
                     cratonvm_types::metadata_pin::add_metadata_pin(
                         loader,
@@ -321,9 +316,9 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     // legitimately means "does this class currently have a live pairing,"
     // which is exactly what that machinery wants.
     {
-        let class_mirrors = shared.class_mirrors.read();
+        let class_mirrors = shared.classes.class_mirrors.read();
         if conditional_metadata {
-            let cm = shared.class_manager.read();
+            let cm = shared.classes.class_manager.read();
             for (&class_id, obj_ref) in class_mirrors.iter() {
                 let is_user_defined = cm.get_class(class_id).is_some_and(|c| {
                     matches!(
@@ -378,7 +373,7 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
 
     // 8. Primitive type Class mirrors (int.class, boolean.class, etc.)
     {
-        let prim_mirrors = shared.primitive_mirrors.read();
+        let prim_mirrors = shared.classes.primitive_mirrors.read();
         for obj_ref in prim_mirrors.values() {
             roots.push(*obj_ref);
         }
@@ -387,9 +382,9 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     // 8a. Canonical java.lang.Module mirrors (one per module name). These are
     //     long-lived singletons handed back by `Class.getModule()`; without
     //     rooting them a moving GC would reclaim/relocate them and the cache
-    //     in `shared.module_mirrors` would hand out a stale ref.
+    //     in `shared.classes.module_mirrors` would hand out a stale ref.
     {
-        let module_mirrors = shared.module_mirrors.read();
+        let module_mirrors = shared.classes.module_mirrors.read();
         for obj_ref in module_mirrors.values() {
             roots.push(*obj_ref);
         }
@@ -538,11 +533,10 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
 
     // 13. Resolution cache — CONSTANT_Dynamic values may hold ObjectRefs
     {
-        let cache = shared.resolution_cache.read();
+        let cache = shared.classes.resolution_cache.read();
         cache.for_each_condy_root(|class_id, object| {
             if conditional_metadata {
-                if let Some(loader) =
-                    cratonvm_types::loader_pin::loader_pin_addr(class_id.as_u32())
+                if let Some(loader) = cratonvm_types::loader_pin::loader_pin_addr(class_id.as_u32())
                 {
                     cratonvm_types::metadata_pin::add_metadata_pin(
                         loader,
@@ -861,7 +855,7 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     //     a no-op (byte-identical to baseline) until a subsystem registers, so
     //     it is safe to land ahead of any adopter. The matching post-move remap
     //     is `native_roots::remap_all_native_roots` in `gc.rs`.
-    shared.osc_cache.scan_roots(&mut roots);
+    shared.classes.osc_cache.scan_roots(&mut roots);
     crate::memory::native_roots::scan_all_native_roots(&mut roots);
 
     if let Some(w) = crate::memory::gc::watch_addr() {
@@ -975,7 +969,7 @@ mod tests {
         let obj = shared.heap.alloc_object(ClassId::new(0), 0);
 
         {
-            let mut statics = shared.statics.write();
+            let mut statics = shared.classes.statics.write();
             statics.insert(
                 ClassId::new(1),
                 vec![Value::Object(Some(obj)), Value::Int(0)],

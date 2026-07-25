@@ -165,7 +165,7 @@ pub fn ensure_system_stdin_object(
     let fis_class_id = shared.load_class_concurrent("java/io/FileInputStream")?;
     ensure_class_initialized_shared(shared, thread, fis_class_id)?;
     let num_fields = {
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         cm.get_class(fis_class_id)
             .map(|c| c.num_total_fields.max(2))
             .unwrap_or(2)
@@ -197,7 +197,7 @@ pub fn ensure_system_stdin_object(
         let fd_class_id = shared.load_class_concurrent("java/io/FileDescriptor")?;
         ensure_class_initialized_shared(shared, thread, fd_class_id)?;
         let fd_num_fields = {
-            let cm = shared.class_manager.read();
+            let cm = shared.classes.class_manager.read();
             cm.get_class(fd_class_id)
                 .map(|c| c.num_total_fields.max(2))
                 .unwrap_or(2)
@@ -223,7 +223,7 @@ pub fn ensure_system_stdin_object(
     // real JDK layout. Setting both keeps `fis_get_fd` happy on either
     // platform.
     let (fd_field_idx, handle_field_idx) = {
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let fd_idx = find_field_recursive(fd_class_id, "fd", &cm.class_store).map(|(i, _, _)| i);
         let h_idx = find_field_recursive(fd_class_id, "handle", &cm.class_store).map(|(i, _, _)| i);
         (fd_idx, h_idx)
@@ -237,7 +237,7 @@ pub fn ensure_system_stdin_object(
 
     // Pin the FileDescriptor object on the FIS's `fd` slot.
     let fis_fd_slot = {
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         find_field_recursive(fis_class_id, "fd", &cm.class_store).map(|(i, _, _)| i)
     };
     if let Some(idx) = fis_fd_slot {
@@ -299,6 +299,7 @@ pub fn ensure_class_initialized_shared(
     // `Class` we just borrowed.
     if crate::runtime::env_cache::modstatic_dbg() {
         let nm = shared
+            .classes
             .class_manager
             .read()
             .get_class(class_id)
@@ -306,6 +307,7 @@ pub fn ensure_class_initialized_shared(
         if nm.as_deref() == Some("org/jboss/modules/Module") {
             let fast = is_class_initialized_via_manager(shared, class_id);
             let st = shared
+                .classes
                 .class_manager
                 .read()
                 .get_class(class_id)
@@ -341,6 +343,7 @@ pub fn ensure_class_initialized_shared(
     // on the same-thread Initializing check, so recursion terminates.
     {
         let is_primitive_class_desc = shared
+            .classes
             .class_manager
             .read()
             .get_class(class_id)
@@ -357,6 +360,7 @@ pub fn ensure_class_initialized_shared(
     let class_state_name = if JvmThread::vm_state_diagnostics_enabled() {
         Some(
             shared
+                .classes
                 .class_manager
                 .read()
                 .get_class(class_id)
@@ -369,7 +373,7 @@ pub fn ensure_class_initialized_shared(
 
     loop {
         let (state, init_thread) = {
-            let cm = shared.class_manager.read();
+            let cm = shared.classes.class_manager.read();
             match cm.get_class(class_id) {
                 Some(c) => (c.state, c.initializing_thread),
                 None => (ClassState::Loaded, None),
@@ -408,7 +412,12 @@ pub fn ensure_class_initialized_shared(
                 // other thread, then release LC and block the current thread
                 // until informed that the in-progress initialization has
                 // completed."
-                let waiter = shared.class_init_waiters.lock().get(&class_id).cloned();
+                let waiter = shared
+                    .classes
+                    .class_init_waiters
+                    .lock()
+                    .get(&class_id)
+                    .cloned();
                 if let Some(pair) = waiter {
                     if let Some(name) = &class_state_name {
                         thread.set_vm_state(format!("class-init:wait:{name}"));
@@ -472,6 +481,7 @@ pub fn ensure_class_initialized_shared(
 
             ClassState::InitializationError => {
                 let class_name = shared
+                    .classes
                     .class_manager
                     .read()
                     .get_class(class_id)
@@ -500,7 +510,7 @@ pub fn ensure_class_initialized_shared(
                 // Use a write lock to prevent two threads from both entering
                 // initialize_class_shared (TOCTOU race).
                 let claimed = {
-                    let mut cm = shared.class_manager.write();
+                    let mut cm = shared.classes.class_manager.write();
                     if let Some(class) = cm.get_class_mut(class_id) {
                         if class.initializing_thread.is_some() {
                             // Another thread claimed it between our read and this write
@@ -516,7 +526,7 @@ pub fn ensure_class_initialized_shared(
                                     // raise a catchable
                                     // `NoClassDefFoundError` instead of an
                                     // internal error. `raise_no_class_def_found`
-                                    // needs `shared.class_manager` itself (to
+                                    // needs `shared.classes.class_manager` itself (to
                                     // resolve/allocate the exception object),
                                     // so the write-lock guard `cm` (which the
                                     // `class` borrow above is tied to) must be
@@ -541,7 +551,11 @@ pub fn ensure_class_initialized_shared(
                                         parking_lot::Mutex::new(false),
                                         parking_lot::Condvar::new(),
                                     ));
-                                    shared.class_init_waiters.lock().insert(class_id, waiter);
+                                    shared
+                                        .classes
+                                        .class_init_waiters
+                                        .lock()
+                                        .insert(class_id, waiter);
                                     true
                                 }
                             }
@@ -594,7 +608,7 @@ pub fn is_class_initialized_fast(class: &Class) -> bool {
 /// full Err-returning machinery.
 #[inline]
 pub fn is_class_initialized_via_manager(shared: &SharedVm, class_id: ClassId) -> bool {
-    let cm = shared.class_manager.read();
+    let cm = shared.classes.class_manager.read();
     match cm.get_class(class_id) {
         Some(class) => is_class_initialized_fast(class),
         None => false,
@@ -667,7 +681,7 @@ fn verifier_skip_eligible(class: &Class) -> bool {
 /// (SB-15, ReleaseScheduleTests). HotSpot uses the default-method criterion and
 /// does not init `KotlinTypeChecker` there.
 fn interface_has_default_method(shared: &SharedVm, iface_id: ClassId) -> bool {
-    let cm = shared.class_manager.read();
+    let cm = shared.classes.class_manager.read();
     let mut stack = vec![iface_id];
     let mut seen = rustc_hash::FxHashSet::default();
     while let Some(id) = stack.pop() {
@@ -703,7 +717,7 @@ fn interface_has_default_method(shared: &SharedVm, iface_id: ClassId) -> bool {
 /// `NoClassDefFoundError`.
 fn finalize_class_init(shared: &SharedVm, class_id: ClassId, new_state: ClassState) {
     {
-        let mut cm = shared.class_manager.write();
+        let mut cm = shared.classes.class_manager.write();
         if let Some(class) = cm.get_class_mut(class_id) {
             class.state = new_state;
             class.initializing_thread = None;
@@ -716,7 +730,7 @@ fn finalize_class_init(shared: &SharedVm, class_id: ClassId, new_state: ClassSta
         super::vm_object::pre_init_wrapper_type_field_for_class(shared, class_id);
     }
     // Remove waiter and notify all blocked threads.
-    let removed = shared.class_init_waiters.lock().remove(&class_id);
+    let removed = shared.classes.class_init_waiters.lock().remove(&class_id);
     if let Some(pair) = removed {
         let (lock, cvar) = &*pair;
         // Round-9 HIGH-4: parking_lot — no poison/unwrap.
@@ -780,6 +794,7 @@ fn initialize_class_shared(
 
     // Step 1: Initialize the superclass first
     let superclass_id = shared
+        .classes
         .class_manager
         .read()
         .get_class(class_id)
@@ -790,7 +805,7 @@ fn initialize_class_shared(
 
     // Step 2: Structural verification (Loaded -> Verifying -> Verified)
     {
-        let mut cm = shared.class_manager.write();
+        let mut cm = shared.classes.class_manager.write();
         if let Some(class) = cm.get_class_mut(class_id) {
             if class.state == ClassState::Loaded {
                 class.state = ClassState::Verifying;
@@ -810,7 +825,7 @@ fn initialize_class_shared(
     // defining loader's delegation order. It is deliberately not repeated
     // here; see the comment at the former call site below.
     if !shared.config.skip_verification {
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let store = &cm.class_store;
         // A class DEFINED with `skip_verification` (trusted runtime-generated
         // bytecode — ByteBuddy / CGLIB / JDK Proxy / `Lookup.defineClass` /
@@ -872,7 +887,7 @@ fn initialize_class_shared(
         }
     }
     {
-        let mut cm = shared.class_manager.write();
+        let mut cm = shared.classes.class_manager.write();
         if let Some(class) = cm.get_class_mut(class_id) {
             if class.state == ClassState::Verifying {
                 class.state = ClassState::Verified;
@@ -882,7 +897,7 @@ fn initialize_class_shared(
 
     // Step 3: Preparation (Verified -> Preparing -> Prepared)
     {
-        let mut cm = shared.class_manager.write();
+        let mut cm = shared.classes.class_manager.write();
         if let Some(class) = cm.get_class_mut(class_id) {
             if class.state == ClassState::Verified {
                 class.state = ClassState::Preparing;
@@ -891,7 +906,7 @@ fn initialize_class_shared(
     }
     prepare_class_shared(shared, class_id)?;
     {
-        let mut cm = shared.class_manager.write();
+        let mut cm = shared.classes.class_manager.write();
         if let Some(class) = cm.get_class_mut(class_id) {
             if class.state == ClassState::Preparing {
                 class.state = ClassState::Prepared;
@@ -907,6 +922,7 @@ fn initialize_class_shared(
     // doc — the old static-field criterion broke kotlin-reflect circular init.)
     {
         let iface_ids: Vec<ClassId> = shared
+            .classes
             .class_manager
             .read()
             .get_class(class_id)
@@ -914,6 +930,7 @@ fn initialize_class_shared(
             .unwrap_or_default();
         for iface_id in iface_ids {
             let not_inited = shared
+                .classes
                 .class_manager
                 .read()
                 .get_class(iface_id)
@@ -935,7 +952,7 @@ fn initialize_class_shared(
     // steps above that may have changed it to Verified/Prepared.
     let current_thread_id = thread.thread_id.0;
     {
-        let mut cm = shared.class_manager.write();
+        let mut cm = shared.classes.class_manager.write();
         if let Some(class) = cm.get_class_mut(class_id) {
             class.state = ClassState::Initializing;
             class.initializing_thread = Some(current_thread_id);
@@ -944,10 +961,11 @@ fn initialize_class_shared(
 
     // Special hook: inject System.out/System.err into static fields.
     // The synthetic PrintStream objects live in SharedVm.system_out/system_err,
-    // but GETSTATIC reads from SharedVm.statics. We bridge them here so that
+    // but GETSTATIC reads from SharedVm.classes.statics. We bridge them here so that
     // `System.out` resolves correctly via the normal static field path.
     {
         let class_name = shared
+            .classes
             .class_manager
             .read()
             .get_class(class_id)
@@ -957,7 +975,7 @@ fn initialize_class_shared(
             let in_ref = ensure_system_stdin_object(shared, thread)?;
             // Find the static field indices for "out", "err", and "in"
             let field_indices = {
-                let cm = shared.class_manager.read();
+                let cm = shared.classes.class_manager.read();
                 if let Some(class) = cm.get_class(class_id) {
                     let mut out_idx = None;
                     let mut err_idx = None;
@@ -996,6 +1014,7 @@ fn initialize_class_shared(
     // because synthetic stubs have no bytecode methods but may have native <clinit>.
     let has_clinit = {
         let in_class = shared
+            .classes
             .class_manager
             .read()
             .get_class(class_id)
@@ -1005,6 +1024,7 @@ fn initialize_class_shared(
             true
         } else {
             let class_name = shared
+                .classes
                 .class_manager
                 .read()
                 .get_class(class_id)
@@ -1019,6 +1039,7 @@ fn initialize_class_shared(
 
     // Get class name once before clinit (avoids lock ordering issues)
     let class_name_for_jfr = shared
+        .classes
         .class_manager
         .read()
         .get_class(class_id)
@@ -1083,7 +1104,7 @@ fn initialize_class_shared(
                 if crate::runtime::env_cache::modstatic_dbg()
                     && &*class_name_for_jfr == "org/jboss/modules/Module"
                 {
-                    let cm = shared.class_manager.read();
+                    let cm = shared.classes.class_manager.read();
                     if let Some(class) = cm.get_class(class_id) {
                         let mut sidx = 0usize;
                         for f in &class.fields {
@@ -1338,7 +1359,7 @@ fn initialize_class_shared(
                 // incomplete native support.
                 let is_swallowable = if let MethodCallFailed::ExceptionThrown(exc_ref) = &e {
                     let eid = shared.heap.class_id_of(*exc_ref);
-                    let cm = shared.class_manager.read();
+                    let cm = shared.classes.class_manager.read();
                     let exc_name = cm
                         .get_class(eid)
                         .map(|c| c.name.clone())
@@ -1432,6 +1453,7 @@ fn initialize_class_shared(
                         MethodCallFailed::ExceptionThrown(exc_ref) => {
                             let exc_cid = shared.heap.class_id_of(*exc_ref);
                             let exc_class = shared
+                                .classes
                                 .class_manager
                                 .read()
                                 .get_class(exc_cid)
@@ -1523,7 +1545,7 @@ fn initialize_class_shared(
                                     );
                                 }
                             } else {
-                                let cm = shared.class_manager.read();
+                                let cm = shared.classes.class_manager.read();
                                 for (i, f) in thread.frames.iter().enumerate().rev().take(25) {
                                     let cn = cm
                                         .get_class(f.class_id)
@@ -1564,6 +1586,7 @@ fn initialize_class_shared(
                         MethodCallFailed::ExceptionThrown(exc_ref) => {
                             let eid = shared.heap.class_id_of(*exc_ref);
                             shared
+                                .classes
                                 .class_manager
                                 .read()
                                 .get_class(eid)
@@ -1584,7 +1607,7 @@ fn initialize_class_shared(
                     MethodCallFailed::ExceptionThrown(exc_ref) => {
                         let exc_class_id = shared.heap.class_id_of(*exc_ref);
                         let is_error = {
-                            let cm = shared.class_manager.read();
+                            let cm = shared.classes.class_manager.read();
                             let error_id = cm.find_class_by_name("java/lang/Error");
                             match error_id {
                                 Some(eid) => cm.is_subclass_of(exc_class_id, eid),
@@ -1605,6 +1628,7 @@ fn initialize_class_shared(
                             // drift) falls back to empty string.
                             {
                                 let cause_class = shared
+                                    .classes
                                     .class_manager
                                     .read()
                                     .get_class(exc_class_id)
@@ -1619,7 +1643,7 @@ fn initialize_class_shared(
                                 // non-String) for most exceptions, so the
                                 // message field looked empty.
                                 let cause_msg = {
-                                    let cm = shared.class_manager.read();
+                                    let cm = shared.classes.class_manager.read();
                                     let mut walk = Some(exc_class_id);
                                     let mut found: Option<crate::types::ObjectRef> = None;
                                     while let Some(cid) = walk {
@@ -1683,7 +1707,7 @@ fn initialize_class_shared(
                                     // typically the <clinit> we are about to
                                     // wrap, plus all surviving callers. This
                                     // beats no info at all.
-                                    let cm = shared.class_manager.read();
+                                    let cm = shared.classes.class_manager.read();
                                     for (i, f) in thread.frames.iter().enumerate().rev().take(30) {
                                         let cn = cm
                                             .get_class(f.class_id)
@@ -1702,7 +1726,7 @@ fn initialize_class_shared(
                                 // wrappers re-throw RuntimeException over a
                                 // deeper NPE/IAE. Print up to 4 levels.
                                 {
-                                    let cm = shared.class_manager.read();
+                                    let cm = shared.classes.class_manager.read();
                                     // Resolve Throwable.cause field index by name
                                     let cause_idx_of =
                                         |obj: crate::types::ObjectRef| -> Option<usize> {
@@ -1786,7 +1810,7 @@ fn initialize_class_shared(
                                     // Set the cause field directly on Throwable (field "cause")
                                     // so the stack-trace printer can follow the chain.
                                     let cause_idx = {
-                                        let cm = shared.class_manager.read();
+                                        let cm = shared.classes.class_manager.read();
                                         let mut found: Option<usize> = None;
                                         let mut walk = Some(shared.heap.class_id_of(eiie_ref));
                                         while let Some(k) = walk {
@@ -1855,6 +1879,7 @@ fn initialize_class_shared(
         // because every fixup arm only writes a fresh value when the
         // existing value is null/uninitialized.
         let is_synthetic_stub = shared
+            .classes
             .class_manager
             .read()
             .get_class(class_id)
@@ -1926,6 +1951,7 @@ fn make_prepared_value_layout(
 ) -> Option<ObjectRef> {
     let layout_class_id = shared.load_class_concurrent(class_name).ok()?;
     let num_fields = shared
+        .classes
         .class_manager
         .read()
         .get_class(layout_class_id)
@@ -1952,7 +1978,7 @@ fn prepare_class_shared(shared: &SharedVm, class_id: ClassId) -> Result<(), VmEr
     }
 
     let (class_name, static_field_info): (String, Vec<(String, String, Option<CvSeed>)>) = {
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let class = cm.get_class(class_id).ok_or_else(|| VmError::Internal {
             message: format!("prepare_class: class {class_id} not found"),
         })?;
@@ -2035,7 +2061,7 @@ fn prepare_class_shared(shared: &SharedVm, class_id: ClassId) -> Result<(), VmEr
         }
     }
 
-    shared.statics.write().insert(class_id, statics);
+    shared.classes.statics.write().insert(class_id, statics);
     Ok(())
 }
 
@@ -2203,7 +2229,7 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
     // "0 0 OK" output and the cascade NPE on signum during BigDecimal
     // <clinit>.
     let set_static_by_name = |field_name: &str, value: Value| {
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         if let Some(cls) = cm.get_class(class_id) {
             let mut static_idx = 0usize;
             for f in &cls.fields {
@@ -2328,7 +2354,7 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
                 Some(_) => "WARN",
             };
             let unsafe_option_slot = {
-                let cm = shared.class_manager.read();
+                let cm = shared.classes.class_manager.read();
                 cm.get_class(class_id).and_then(|unsafe_class| {
                     let mut static_idx = 0usize;
                     for field in &unsafe_class.fields {
@@ -2367,6 +2393,7 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
             // this lookup-only repair pass runs. See docs/internal once the
             // regression is closed.
             let enum_class_id = shared
+                .classes
                 .class_manager
                 .read()
                 .find_class_by_name("sun/misc/Unsafe$MemoryAccessOption");
@@ -2389,7 +2416,7 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
                 }
             });
             let enum_slot = {
-                let cm = shared.class_manager.read();
+                let cm = shared.classes.class_manager.read();
                 enum_class_id
                     .and_then(|enum_class_id| cm.get_class(enum_class_id))
                     .and_then(|enum_class| {
@@ -2450,7 +2477,7 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
                 super::vm_object::create_java_string(shared, &path_sep_char.to_string());
             let set_instance_by_name =
                 |obj: ObjectRef, obj_class_id: ClassId, field_name: &str, value: Value| {
-                    let cm = shared.class_manager.read();
+                    let cm = shared.classes.class_manager.read();
                     if let Some(cls) = cm.get_class(obj_class_id) {
                         let mut instance_idx = 0usize;
                         for f in &cls.fields {
@@ -2474,7 +2501,7 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
             let fs_class_name = "java/io/UnixFileSystem";
             let fs_class_id = shared.load_class_concurrent(fs_class_name).ok();
             let fs_class = fs_class_id.and_then(|id| {
-                let cm = shared.class_manager.read();
+                let cm = shared.classes.class_manager.read();
                 cm.get_class(id).map(|cls| {
                     let fields = cls.fields.iter().filter(|f| !f.is_static()).count();
                     (id, fields)
@@ -2584,7 +2611,7 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
             let mode_impl_name = "jdk/internal/icu/text/NormalizerBase$ModeImpl";
             let noop_name = "jdk/internal/icu/impl/Norm2AllModes$NoopNormalizer2";
             let (mode_impl_id, noop_id) = {
-                let cm = shared.class_manager.read();
+                let cm = shared.classes.class_manager.read();
                 (
                     cm.find_class_by_name(mode_impl_name),
                     cm.find_class_by_name(noop_name),
@@ -2641,7 +2668,7 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
             // getstatic + constructor chains proceed.
             let varform_name = "java/lang/invoke/VarForm";
             let varform_id = {
-                let cm = shared.class_manager.read();
+                let cm = shared.classes.class_manager.read();
                 cm.find_class_by_name(varform_name)
             };
             if let Some(vfid) = varform_id {
@@ -2667,7 +2694,7 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
             // Allocate a synthetic QuarkusDelayedHandler.
             let handler_class_name = "io/quarkus/bootstrap/logging/QuarkusDelayedHandler";
             let handler_id = {
-                let cm = shared.class_manager.read();
+                let cm = shared.classes.class_manager.read();
                 cm.find_class_by_name(handler_class_name)
             };
             if let Some(hid) = handler_id {
@@ -2697,7 +2724,7 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
         "org/jboss/modules/DefaultBootModuleLoaderHolder" => {
             let loader_class_name = "org/jboss/modules/LocalModuleLoader";
             let loader_id = {
-                let cm = shared.class_manager.read();
+                let cm = shared.classes.class_manager.read();
                 cm.find_class_by_name(loader_class_name)
             };
             let target_id = loader_id.unwrap_or(class_id);
@@ -2723,7 +2750,7 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
             // `try_alloc_object` or downstream `getfield` reads land beyond
             // the allocated slot bound.
             let (signum_idx, mag_idx, num_fields) = {
-                let cm = shared.class_manager.read();
+                let cm = shared.classes.class_manager.read();
                 if let Some(cls) = cm.get_class(class_id) {
                     let mut sig = None;
                     let mut mag = None;
@@ -2747,7 +2774,7 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
             if let (Some(sig_i), Some(mag_i)) = (signum_idx, mag_idx) {
                 // Look up an existing static; returns Some(ref) if non-null.
                 let lookup_existing = |name: &str| -> Option<crate::types::ObjectRef> {
-                    let cm = shared.class_manager.read();
+                    let cm = shared.classes.class_manager.read();
                     let cls = cm.get_class(class_id)?;
                     let mut static_idx = 0usize;
                     for f in &cls.fields {
@@ -2973,7 +3000,7 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
                 "DAYS",
             ];
             let read_static_named = |field_name: &str| -> Option<Value> {
-                let cm = shared.class_manager.read();
+                let cm = shared.classes.class_manager.read();
                 let cls = cm.get_class(class_id)?;
                 let mut static_idx = 0usize;
                 for f in &cls.fields {
@@ -2990,7 +3017,7 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
                 None
             };
             let find_instance_field_index = |field_name: &str| -> Option<usize> {
-                let cm = shared.class_manager.read();
+                let cm = shared.classes.class_manager.read();
                 let store = &cm.class_store;
                 let mut current_id = Some(class_id);
                 while let Some(cid) = current_id {
@@ -3013,7 +3040,7 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
                 None
             };
             let num_fields = {
-                let cm = shared.class_manager.read();
+                let cm = shared.classes.class_manager.read();
                 cm.get_class(class_id)
                     .map(|c| c.num_total_fields)
                     .unwrap_or(0)
@@ -3085,7 +3112,7 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
                 "OTHERS_EXECUTE",
             ];
             let read_static_named = |field_name: &str| -> Option<Value> {
-                let cm = shared.class_manager.read();
+                let cm = shared.classes.class_manager.read();
                 let cls = cm.get_class(class_id)?;
                 let mut static_idx = 0usize;
                 for f in &cls.fields {
@@ -3108,7 +3135,7 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
                 return;
             }
             let ord_idx = {
-                let cm = shared.class_manager.read();
+                let cm = shared.classes.class_manager.read();
                 let store = &cm.class_store;
                 let mut current_id = Some(class_id);
                 let mut found = None;
@@ -3134,7 +3161,7 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
                 found
             };
             let name_idx = {
-                let cm = shared.class_manager.read();
+                let cm = shared.classes.class_manager.read();
                 let store = &cm.class_store;
                 let mut current_id = Some(class_id);
                 let mut found = None;
@@ -3160,7 +3187,7 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
                 found
             };
             let num_fields = {
-                let cm = shared.class_manager.read();
+                let cm = shared.classes.class_manager.read();
                 cm.get_class(class_id)
                     .map(|c| c.num_total_fields)
                     .unwrap_or(0)
@@ -3231,7 +3258,7 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
             // Honour the full slot count (inherited + own) so `try_alloc_object`
             // matches the layout that resolve_field_index_in_hierarchy expects.
             let (intval_idx, scale_idx, prec_idx, intcompact_idx, num_fields) = {
-                let cm = shared.class_manager.read();
+                let cm = shared.classes.class_manager.read();
                 if let Some(cls) = cm.get_class(class_id) {
                     let mut iv = None;
                     let mut sc = None;
@@ -3261,12 +3288,12 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
             // the fixup above).  These become the `intVal` slot for our
             // synthetic BigDecimal constants.
             let bi_class_id = {
-                let cm = shared.class_manager.read();
+                let cm = shared.classes.class_manager.read();
                 cm.find_class_by_name("java/math/BigInteger")
             };
             let lookup_bi_static = |name: &str| -> Option<crate::types::ObjectRef> {
                 let bi_cid = bi_class_id?;
-                let cm = shared.class_manager.read();
+                let cm = shared.classes.class_manager.read();
                 let cls = cm.get_class(bi_cid)?;
                 // Static-only indexing — see set_static_by_name comment.
                 let mut static_idx = 0usize;
@@ -3360,11 +3387,11 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
         "org/jboss/msc/service/ServiceContainerImpl" => {
             let ai_name = "java/util/concurrent/atomic/AtomicInteger";
             let ai_id = {
-                let cm = shared.class_manager.read();
+                let cm = shared.classes.class_manager.read();
                 cm.find_class_by_name(ai_name)
             };
             let read_static = |field_name: &str| -> Option<Value> {
-                let cm = shared.class_manager.read();
+                let cm = shared.classes.class_manager.read();
                 let cls = cm.get_class(class_id)?;
                 let mut idx = 0usize;
                 for f in &cls.fields {
@@ -3430,7 +3457,7 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
         "org/wildfly/security/auth/server/_private/ElytronMessages" => {
             let impl_name = "org/wildfly/security/auth/server/_private/ElytronMessages_$logger";
             let impl_id = {
-                let cm = shared.class_manager.read();
+                let cm = shared.classes.class_manager.read();
                 cm.find_class_by_name(impl_name)
             };
             let target_id = impl_id.unwrap_or(class_id);
@@ -3439,7 +3466,7 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
             // be safe — extra slots are harmless, missing slots NPE on access.
             let num_fields = 2usize;
             let cur = {
-                let cm = shared.class_manager.read();
+                let cm = shared.classes.class_manager.read();
                 cm.get_class(class_id).and_then(|cls| {
                     let mut idx = 0usize;
                     for f in &cls.fields {
@@ -3477,7 +3504,7 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
         "org/jboss/msc/service/ServiceLogger" => {
             let impl_name = "org/jboss/msc/service/ServiceLogger_$logger";
             let impl_id = {
-                let cm = shared.class_manager.read();
+                let cm = shared.classes.class_manager.read();
                 cm.find_class_by_name(impl_name)
             };
             // Fall back to allocating on the interface's own class_id when
@@ -3488,7 +3515,7 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
             for fname in ["ROOT", "SERVICE", "FAIL"] {
                 // Only fix nulls.
                 let cur = {
-                    let cm = shared.class_manager.read();
+                    let cm = shared.classes.class_manager.read();
                     cm.get_class(class_id).and_then(|cls| {
                         let mut idx = 0usize;
                         for f in &cls.fields {
@@ -3705,7 +3732,7 @@ mod tests {
     #[test]
     fn hierarchy_same_class_is_subclass() {
         let shared = test_shared();
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let hierarchy = ClassStoreHierarchy {
             store: &cm.class_store,
         };
@@ -3716,7 +3743,7 @@ mod tests {
     #[test]
     fn hierarchy_everything_is_subclass_of_object() {
         let shared = test_shared();
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let hierarchy = ClassStoreHierarchy {
             store: &cm.class_store,
         };
@@ -3728,7 +3755,7 @@ mod tests {
     #[test]
     fn hierarchy_direct_superclass_uses_linked_class_edge() {
         let shared = test_shared();
-        let mut cm = shared.class_manager.write();
+        let mut cm = shared.classes.class_manager.write();
         cm.load_class("java/lang/String").unwrap();
         let hierarchy = ClassStoreHierarchy {
             store: &cm.class_store,
@@ -3741,7 +3768,7 @@ mod tests {
     #[test]
     fn hierarchy_common_superclass_same() {
         let shared = test_shared();
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let hierarchy = ClassStoreHierarchy {
             store: &cm.class_store,
         };
@@ -3755,7 +3782,7 @@ mod tests {
     #[test]
     fn hierarchy_common_superclass_unknown_returns_object() {
         let shared = test_shared();
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let hierarchy = ClassStoreHierarchy {
             store: &cm.class_store,
         };
@@ -3770,7 +3797,7 @@ mod tests {
     #[test]
     fn hierarchy_common_superclass_xstream_exception_siblings() {
         let shared = test_shared();
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let hierarchy = ClassStoreHierarchy {
             store: &cm.class_store,
         };
@@ -3787,7 +3814,7 @@ mod tests {
     #[test]
     fn hierarchy_is_interface_unknown() {
         let shared = test_shared();
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let hierarchy = ClassStoreHierarchy {
             store: &cm.class_store,
         };
@@ -3861,7 +3888,7 @@ mod tests {
 
         let shared = test_shared();
         let class_id = {
-            let mut cm = shared.class_manager.write();
+            let mut cm = shared.classes.class_manager.write();
             let id = cm.class_store.next_id();
             cm.class_store.add(Class {
                 id,
@@ -3903,7 +3930,7 @@ mod tests {
 
         // Verify each static slot got the right ConstantValue (slots are
         // indexed by position among static fields, i.e. 0..6).
-        let statics = shared.statics.read();
+        let statics = shared.classes.statics.read();
         let slots = statics.get(&class_id).expect("statics for class");
 
         assert_eq!(slots[0], Value::Int(42), "I_CONST");
@@ -4041,7 +4068,7 @@ mod tests {
         let shared = test_shared();
         let mut thread = JvmThread::new(ThreadId(0), "test");
         let class_id = {
-            let mut cm = shared.class_manager.write();
+            let mut cm = shared.classes.class_manager.write();
             let id = cm.class_store.next_id();
             let mut c = make_malformed_class("java/lang/EvilString", ClassLoaderId::Application);
             c.id = id;
@@ -4072,7 +4099,7 @@ mod tests {
         let shared = test_shared();
         let mut thread = JvmThread::new(ThreadId(0), "test");
         let class_id = {
-            let mut cm = shared.class_manager.write();
+            let mut cm = shared.classes.class_manager.write();
             let id = cm.class_store.next_id();
             // FINAL+ABSTRACT user-classpath class -> verification runs and fails.
             let mut c = make_malformed_class("com/example/Boom", ClassLoaderId::Application);
@@ -4089,7 +4116,7 @@ mod tests {
 
         // (1) State is Erroneous, and (2) the init claim is cleared.
         {
-            let cm = shared.class_manager.read();
+            let cm = shared.classes.class_manager.read();
             let class = cm.get_class(class_id).expect("class still registered");
             assert_eq!(
                 class.state,
@@ -4106,7 +4133,11 @@ mod tests {
         // immediately rather than waiting out the timeout. This is the core of
         // the leak the guard fixes.
         assert!(
-            !shared.class_init_waiters.lock().contains_key(&class_id),
+            !shared
+                .classes
+                .class_init_waiters
+                .lock()
+                .contains_key(&class_id),
             "failed init must remove the class_init_waiters entry (waiter leak)"
         );
 
@@ -4130,7 +4161,7 @@ mod tests {
         let shared = test_shared();
         let mut thread = JvmThread::new(ThreadId(0), "test");
         let class_id = {
-            let mut cm = shared.class_manager.write();
+            let mut cm = shared.classes.class_manager.write();
             let id = cm.class_store.next_id();
             let mut c = make_malformed_class("java/lang/String", ClassLoaderId::Bootstrap);
             c.id = id;
@@ -4145,7 +4176,7 @@ mod tests {
         // Sanity: the class must have reached `Initialized` (no
         // <clinit>, no superclass — full init runs to completion only
         // because verification was skipped).
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let final_state = cm.get_class(class_id).map(|c| c.state);
         assert_eq!(
             final_state,

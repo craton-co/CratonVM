@@ -677,7 +677,7 @@ pub trait NativeContext {
     /// ```
     ///
     /// the lambda is materialised as a proxy object whose class is
-    /// recorded in `shared.lambda_proxies`. This method looks the
+    /// recorded in `shared.classes.lambda_proxies`. This method looks the
     /// proxy up and returns
     /// `Some((target_class, target_method, target_descriptor,
     ///        captured_values))` so the dispatcher can route through

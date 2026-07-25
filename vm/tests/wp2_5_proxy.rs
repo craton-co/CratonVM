@@ -336,7 +336,11 @@ fn proxy_invoke_handler_shared_with_object_handler_smoke() {
     let handler = shared.heap.alloc_object(cls, 0);
     let handler_class_id = shared.heap.class_id_of(handler);
     // Confirm the heap object isn't classified as a lambda proxy.
-    let in_lambda_table = shared.lambda_proxies.read().contains_key(&handler_class_id);
+    let in_lambda_table = shared
+        .classes
+        .lambda_proxies
+        .read()
+        .contains_key(&handler_class_id);
     assert!(
         !in_lambda_table,
         "regular allocated object must not be in lambda_proxies",

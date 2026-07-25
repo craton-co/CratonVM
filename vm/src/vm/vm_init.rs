@@ -342,16 +342,12 @@ pub struct SharedVm {
     /// exist on the CPU-only build.
     #[cfg(feature = "gpu-offload")]
     pub offload_registry: std::sync::Arc<crate::runtime::offload::OffloadCacheRegistry>,
-
-    /// Class loader and cache, protected by an RwLock.
+    /// Class loading, linking, resolution and per-class caches. Owns the L10 lock.
     ///
-    /// L10 in the global lock hierarchy — the coarsest lock, acquired first.
-    /// See [`crate::runtime::lock_order`]. [`OrderedPlRwLock`] is a drop-in for
-    /// `parking_lot::RwLock` that asserts the descending acquisition order on
-    /// every `.read()` / `.write()` / `.read_recursive()`, so holding any
-    /// lower-level lock (a monitor, `ref_processor`, …) across a class-manager
-    /// acquisition is caught instead of deadlocking.
-    pub class_manager: OrderedPlRwLock<ClassManager>,
+    /// See [`crate::vm::realms::ClassRealm`]. Access paths are
+    /// `shared.classes.<field>`; lock types and levels are
+    /// unchanged by the move.
+    pub classes: crate::vm::realms::ClassRealm,
 
     /// Object/array heap — generational GC with young + old gen.
     pub heap: VmHeap,
@@ -368,32 +364,8 @@ pub struct SharedVm {
     /// `concurrent_satb`).
     pub concurrent_gc_state: std::sync::Arc<cratonvm_gc::ConcurrentGcState>,
 
-    /// Lock-free cache of the shared `cratonvm/synthetic/AnonymousObject$N`
-    /// ClassId, indexed by field count `N` (slot 0 is unused — `num_fields > 0`
-    /// always on this path). `0` means "not yet resolved" — a valid sentinel
-    /// because these synthetic classes are minted with non-zero ClassIds
-    /// (`ClassId(0)` is `java/lang/Object`).
-    ///
-    /// `vm_exec::alloc_object` rewrites every `ClassId(0)`-with-fields
-    /// allocation (e.g. a `HashMap` node) to one of these synthetic classes.
-    /// The first allocation for a given `N` resolves it through
-    /// `ClassManager::ensure_synthetic_class` (a write-lock + name `format!` +
-    /// hash probe) and stores the id here; every later allocation reads the id
-    /// with a single relaxed atomic load and skips the class-manager locks
-    /// entirely. The synthetic stub declares exactly `N` fields, so the
-    /// field-count clamp is a provable no-op and is skipped on the fast path.
-    pub anon_class_cache: [std::sync::atomic::AtomicU32; ANON_CLASS_CACHE_LEN],
-
     /// Native method registry (immutable after construction).
     pub native_methods: NativeMethodRegistry,
-
-    /// Static fields: class_id -> field_index -> Value.
-    /// T10.9.B: FxHashMap — keys are internal ClassId, hot path accessed
-    /// on every getstatic/putstatic bytecode.
-    pub statics: RwLock<FxHashMap<ClassId, Vec<Value>>>,
-
-    /// Cache of resolved symbolic references (fields and methods).
-    pub resolution_cache: RwLock<ResolutionCache>,
 
     /// Captured Throwable backtraces, shared by every Java thread in this VM.
     ///
@@ -404,27 +376,6 @@ pub struct SharedVm {
     /// stale frame vectors indefinitely.
     throwable_stacks: RwLock<FxHashMap<i32, ThrowableStackTrace>>,
 
-    /// Round 8 audit fix (CRIT #2): the reflective `(class, name,
-    /// descriptor)` cache. Previously built (`LinkResolver::new()`) but
-    /// never wired into any caller, so the entire dedupe win was dead
-    /// code. Now reachable from native reflective callers
-    /// (`Class.getDeclaredMethod`, `Class.getMethod`, JNI
-    /// `GetMethodID`/`GetFieldID`) via `vm.link_resolver()`. The
-    /// cache is invalidated on `redefine_class` through the same
-    /// hook that drops `ResolutionCache` entries (see
-    /// `link_resolver_invalidate_adapter`).
-    pub link_resolver: LinkResolver,
-
-    /// T10 — vtable manager for virtual/interface dispatch.
-    ///
-    /// Shared as an `Arc` so the class-loader install hook (a plain
-    /// `fn` pointer with no captured state) can reach the same manager
-    /// via the `crate::runtime::vtable::global_vtable_manager()` cell.
-    pub vtable_manager: std::sync::Arc<parking_lot::RwLock<crate::runtime::vtable::VtableManager>>,
-
-    /// T10 — read-optimized shared resolution cache (uses RwLock internally).
-    pub shared_resolution: crate::runtime::lockfree_resolve::SharedResolutionState,
-
     /// T10 — pool for reusing operand stack Vec<u64> allocations.
     pub operand_stack_pool: crate::runtime::alloc_fastpath::VecPool<u64>,
 
@@ -434,48 +385,11 @@ pub struct SharedVm {
     /// Monitor table for JVM intrinsic locks (monitorenter/monitorexit).
     pub monitors: MonitorTable,
 
-    /// Per-class synthetic lock objects for static synchronized methods.
-    /// When a static synchronized method is called, we need an object to use
-    /// as the monitor (since there's no `this`). We allocate a dummy object
-    /// per class and store it here.
-    /// T10.9.B: FxHashMap — ClassId-keyed internal cache.
-    pub class_locks: RwLock<FxHashMap<ClassId, ObjectRef>>,
-
     /// Interned string pool: maps Rust strings to Java String ObjectRefs.
     /// Used by `ldc` string constants and `String.intern()`.
     /// T10.9.B: FxHashMap — keys come from `ldc` constant-pool strings and
     /// internal `String.intern()` calls, not untrusted runtime input.
     pub string_pool: RwLock<FxHashMap<String, ObjectRef>>,
-
-    /// Class mirror cache: maps ClassId to java/lang/Class ObjectRef.
-    /// Used by `Object.getClass()`.
-    /// T10.9.B: FxHashMap — ClassId-keyed.
-    pub class_mirrors: RwLock<FxHashMap<ClassId, ObjectRef>>,
-
-    /// Reverse of `class_mirrors`: maps a Class mirror back to its ClassId.
-    /// Populated whenever `get_or_create_class_mirror` allocates a new mirror.
-    /// This lets `mirror_class_id` recover the ClassId without storing it in
-    /// the mirror's Java-visible fields (which would clash with the real-JDK
-    /// `java/lang/Class` layout).
-    /// T10.9.B: FxHashMap — ObjectRef pointer keys.
-    pub class_mirrors_reverse: RwLock<FxHashMap<ObjectRef, ClassId>>,
-
-    /// Loader-faithful resolution cache (gated by
-    /// `CRATONVM_LOADER_AWARE_RESOLUTION`). Maps an *initiating* loader and an
-    /// internal class name to the `ClassId` that loader resolves it to —
-    /// CratonVM's analogue of the JVMS §5.4.3 *initiating loader* table. Only
-    /// populated for references reached from bytecode defined by a user-defined
-    /// loader: once `resolve_class_loader_aware` has driven that loader's
-    /// `loadClass` (or proved the name is bootstrap/global) for a given name,
-    /// the answer is memoised here so subsequent references skip the re-entrant
-    /// `loadClass` invocation. Grow-only — CratonVM does not unload classes, and
-    /// in-place `redefine_class` keeps the `ClassId` stable. Empty (and never
-    /// read) when the gate is off.
-    ///
-    /// Nested `loader -> (name -> id)` so a hot-path read can probe by borrowed
-    /// `&str` (`Arc<str>: Borrow<str>`) without allocating an `Arc` per lookup.
-    pub initiating_resolution_cache:
-        RwLock<FxHashMap<cratonvm_types::ClassLoaderId, FxHashMap<Arc<str>, ClassId>>>,
 
     /// Synthetic System.out PrintStream object.
     pub system_out: RwLock<Option<ObjectRef>>,
@@ -521,43 +435,8 @@ pub struct SharedVm {
     /// System properties: populated with platform defaults + user overrides.
     pub system_properties: RwLock<HashMap<String, String>>,
 
-    /// Lambda proxy registry: maps synthetic proxy ClassId → LambdaCallSite metadata.
-    /// Used by the interpreter to dispatch method calls on lambda proxy objects.
-    /// T10.9.B: FxHashMap — ClassId-keyed.
-    pub lambda_proxies: RwLock<FxHashMap<ClassId, LambdaCallSite>>,
-
-    /// Defining class (the class whose `invokedynamic` created this lambda /
-    /// method-ref) for each lambda proxy id — what HotSpot names the proxy after
-    /// and reports as its nest host. Kept as a side table so the reflection name
-    /// natives report `<host>$$Lambda/0x<id>` and a correct `getNestHost()` even
-    /// for a cross-class method reference, whose implementation method lives in a
-    /// different class than the one that defines the reference. bug-06 fam5 #1.
-    pub lambda_proxy_hosts: RwLock<FxHashMap<ClassId, ClassId>>,
-
-    /// Counter for generating unique synthetic lambda proxy ClassIds.
-    /// Starts at 0x8000_0000 to avoid collisions with real ClassIds from the ClassStore.
-    pub next_lambda_id: AtomicU32,
-
     /// Registry of all JVM threads (main + spawned).
     pub thread_registry: ThreadRegistry,
-
-    /// Primitive type Class mirrors: "int" → ObjectRef, "boolean" → ObjectRef, etc.
-    /// T10.9.B: FxHashMap — keys are fixed primitive type names, not user input.
-    pub primitive_mirrors: RwLock<FxHashMap<String, ObjectRef>>,
-
-    /// Canonical `java.lang.Module` mirrors keyed by module name (e.g.
-    /// "java.base"), with `""` reserved for the unnamed module. `Class.getModule()`
-    /// MUST hand back the SAME `Module` instance for every class in a module,
-    /// because the JDK compares modules by identity (`Module` does not override
-    /// `equals`). Real bytecode relies on this — e.g.
-    /// `Throwable.validateSuppressedExceptionsList` deserializes a Throwable's
-    /// suppressed-exceptions list and throws `StreamCorruptedException("List
-    /// implementation not in base module.")` unless
-    /// `Object.class.getModule() == deserializedList.getClass().getModule()`.
-    /// Allocating a fresh Module per `getModule()` call (the old behaviour) made
-    /// that comparison always false and broke ObjectInputStream round-trips of any
-    /// object holding a `java.util` List (HIB-CV-29).
-    pub module_mirrors: RwLock<FxHashMap<String, ObjectRef>>,
 
     /// B-J: permanent GC-root registry for `java.lang.invoke.VarHandle` objects.
     /// VarHandles are long-lived singletons stored in `static final` fields
@@ -621,19 +500,6 @@ pub struct SharedVm {
     /// descending acquisition order on every `.lock()`.
     pub ref_processor: OrderedPlMutex<cratonvm_gc::ReferenceProcessor>,
 
-    /// Cached field count for java/lang/String (0 = not yet resolved).
-    /// Once resolved, this is the actual `num_total_fields` from the loaded
-    /// String class, avoiding lock contention in `create_java_string()`.
-    pub cached_string_num_fields: AtomicUsize,
-
-    /// True when the loaded java/lang/String uses JDK 9+ compact strings
-    /// (byte[] value + byte coder) instead of pre-JDK-9 char[] layout.
-    /// Set once during bootstrap; read by create_java_string / read_java_string.
-    pub compact_strings: std::sync::atomic::AtomicBool,
-
-    /// Cached field count for java/lang/Class mirror objects (0 = not yet resolved).
-    pub cached_class_mirror_num_fields: AtomicUsize,
-
     /// Finalizer thread queue — objects with `finalize()` overrides are enqueued
     /// here when the GC determines they are unreachable.  The VM drains this
     /// queue and invokes each object's `finalize()` method (JLS §12.6).
@@ -643,37 +509,12 @@ pub struct SharedVm {
     /// referent becomes unreachable.  The VM drains and executes them.
     pub cleaner_thread: cratonvm_gc::reference::CleanerThread,
 
-    /// Per-class initialization condition variables (JVM spec §5.5).
-    ///
-    /// When a thread starts initializing a class, it inserts an entry here.
-    /// Other threads that try to initialize the same class will wait on the
-    /// condvar until the initializing thread completes (success or error).
-    /// Entries are removed once initialization finishes.
-    /// T10.9.B: FxHashMap — ClassId-keyed.
-    /// Round-9 HIGH-4: inner `std::sync::Mutex<bool>` + `std::sync::Condvar`
-    /// migrated to `parking_lot` equivalents — removes poison handling and
-    /// yields a smaller, faster condvar with the same wait/notify API.
-    pub class_init_waiters: parking_lot::Mutex<
-        FxHashMap<ClassId, Arc<(parking_lot::Mutex<bool>, parking_lot::Condvar)>>,
-    >,
-
     /// Flag to request an explicit GC at next safepoint (set by System.gc() / GC.run).
     pub gc_requested: std::sync::atomic::AtomicBool,
 
     /// A native array allocation crossed the occupancy threshold. The next
     /// native-call boundary collects after pinning and remapping its arguments.
     pub native_array_gc_requested: std::sync::atomic::AtomicBool,
-
-    /// Per-class-name loading locks (Session 30: Thread-Safe Class Loading).
-    ///
-    /// When a thread starts loading a class, it acquires the per-name lock.
-    /// Other threads that try to load the *same* class will block on this lock
-    /// instead of blocking the global ClassManager write lock, which allows
-    /// concurrent loading of *different* classes to proceed without contention.
-    /// The bool inside the Mutex indicates whether loading is in-progress.
-    /// T10.9.B: FxHashMap — keys are internal class names.
-    pub class_loading_locks:
-        parking_lot::Mutex<FxHashMap<String, Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>>>,
 
     /// T19.3.G1 — number of TLAB refills across all threads since VM start.
     ///
@@ -716,41 +557,6 @@ pub struct SharedVm {
     /// Sampled by diagnostics and written to `--verbose:gc` after
     /// each cycle so operators can compute allocation rate.
     pub bytes_allocated_total: std::sync::atomic::AtomicU64,
-
-    /// T10.9.E — Per-(class, slot-index) cache of the field's declared
-    /// descriptor byte (the first byte of the JVM type descriptor:
-    /// `b'J'` for `long`, `b'D'` for `double`, `b'L'` or `b'['` for
-    /// reference types, etc.).
-    ///
-    /// Populated lazily on the first native-side field access that
-    /// resolves the descriptor via the class manager, then consulted by
-    /// `NativeContextImpl::get_field`/`set_field` on every subsequent
-    /// access to the same slot so the hot path stays O(1) after the
-    /// first resolution. Missing entries (never-seen class or index)
-    /// fall back to the legacy descriptor-unaware `get_field`/`set_field`
-    /// paths so the cache is strictly a correctness normalizer +
-    /// performance acceleration, never a correctness hazard.
-    ///
-    /// Sizing: unbounded by design — total entries are bounded by
-    /// `(loaded_classes * avg_fields)`, typically ~O(10k) for large
-    /// applications like WildFly/Keycloak. The hottest access pattern
-    /// (Unsafe-style concurrent data structures re-reading a handful
-    /// of offsets) produces at most a few dozen entries per class.
-    /// No eviction: entries are stable for the lifetime of the VM
-    /// because class bytecode is immutable after loading.
-    pub field_descriptor_cache:
-        parking_lot::RwLock<crate::runtime::fx_collections::FxHashMap<(ClassId, usize), u8>>,
-
-    /// WP0.2 — per-class cache of `ObjectStreamClass` descriptor
-    /// mirrors. Populated by the first call to
-    /// `ObjectStreamClass.lookup(cls)` for any given class; every
-    /// subsequent lookup returns the same `ObjectRef`, matching the
-    /// real-JDK singleton-per-class semantics (`ObjectStreamClass.
-    /// Caches.localDescs`).
-    ///
-    /// See `crate::runtime::serialization::oscache` for the cache
-    /// implementation and rationale.
-    pub osc_cache: crate::runtime::serialization::OscCache,
 
     /// WP1.3 — JVM bootstrap init level, matching HotSpot's
     /// `VM._init_level` integer state machine:
@@ -2691,29 +2497,48 @@ impl SharedVm {
             config,
             #[cfg(feature = "gpu-offload")]
             offload_registry,
-            class_manager: OrderedPlRwLock::new(class_manager, LockLevel::ClassManager),
+            classes: crate::vm::realms::ClassRealm {
+                class_manager: OrderedPlRwLock::new(class_manager, LockLevel::ClassManager),
+                anon_class_cache: std::array::from_fn(|_| AtomicU32::new(0)),
+                statics: RwLock::new(FxHashMap::default()),
+                resolution_cache: RwLock::new(ResolutionCache::new()),
+                // Round 8 audit fix (CRIT #2): reflective lookup cache.
+                link_resolver: LinkResolver::new(),
+                vtable_manager: std::sync::Arc::new(parking_lot::RwLock::new(
+                    crate::runtime::vtable::VtableManager::new(),
+                )),
+                shared_resolution: crate::runtime::lockfree_resolve::SharedResolutionState::new(),
+                class_locks: RwLock::new(FxHashMap::default()),
+                class_mirrors: RwLock::new(FxHashMap::default()),
+                class_mirrors_reverse: RwLock::new(FxHashMap::default()),
+                initiating_resolution_cache: RwLock::new(FxHashMap::default()),
+                lambda_proxies: RwLock::new(FxHashMap::default()),
+                lambda_proxy_hosts: RwLock::new(FxHashMap::default()),
+                next_lambda_id: AtomicU32::new(0x8000_0000),
+                primitive_mirrors: RwLock::new(FxHashMap::default()),
+                module_mirrors: RwLock::new(FxHashMap::default()),
+                cached_string_num_fields: AtomicUsize::new(0),
+                compact_strings: std::sync::atomic::AtomicBool::new(false),
+                cached_class_mirror_num_fields: AtomicUsize::new(0),
+                class_init_waiters: parking_lot::Mutex::new(FxHashMap::default()),
+                class_loading_locks: parking_lot::Mutex::new(FxHashMap::default()),
+                // T10.9.E — lazy per-(ClassId, slot_index) field descriptor cache.
+                field_descriptor_cache: parking_lot::RwLock::new(
+                    crate::runtime::fx_collections::FxHashMap::default(),
+                ),
+                // WP0.2 — ObjectStreamClass.lookup(cls) cache.
+                osc_cache: crate::runtime::serialization::OscCache::new(),
+            },
+
             heap,
             concurrent_satb,
             concurrent_gc_state,
-            anon_class_cache: std::array::from_fn(|_| AtomicU32::new(0)),
             native_methods,
-            statics: RwLock::new(FxHashMap::default()),
-            resolution_cache: RwLock::new(ResolutionCache::new()),
             throwable_stacks: RwLock::new(FxHashMap::default()),
-            // Round 8 audit fix (CRIT #2): reflective lookup cache.
-            link_resolver: LinkResolver::new(),
-            vtable_manager: std::sync::Arc::new(parking_lot::RwLock::new(
-                crate::runtime::vtable::VtableManager::new(),
-            )),
-            shared_resolution: crate::runtime::lockfree_resolve::SharedResolutionState::new(),
             operand_stack_pool: crate::runtime::alloc_fastpath::VecPool::new(64),
             tag_pool: crate::runtime::alloc_fastpath::VecPool::new(64),
             monitors: MonitorTable::new(),
-            class_locks: RwLock::new(FxHashMap::default()),
             string_pool: RwLock::new(FxHashMap::default()),
-            class_mirrors: RwLock::new(FxHashMap::default()),
-            class_mirrors_reverse: RwLock::new(FxHashMap::default()),
-            initiating_resolution_cache: RwLock::new(FxHashMap::default()),
             system_out: RwLock::new(None),
             system_err: RwLock::new(None),
             system_in: RwLock::new(None),
@@ -2721,12 +2546,7 @@ impl SharedVm {
             main_thread_group_init: parking_lot::Mutex::new(MainThreadGroupInit::Idle),
             singleton_oom: RwLock::new(None),
             system_properties: RwLock::new(sys_props),
-            lambda_proxies: RwLock::new(FxHashMap::default()),
-            lambda_proxy_hosts: RwLock::new(FxHashMap::default()),
-            next_lambda_id: AtomicU32::new(0x8000_0000),
             thread_registry: ThreadRegistry::new(),
-            primitive_mirrors: RwLock::new(FxHashMap::default()),
-            module_mirrors: RwLock::new(FxHashMap::default()),
             var_handle_roots: RwLock::new(FxHashMap::default()),
             self_arc: RwLock::new(None),
             debug: crate::vm::realms::DebugRealm {
@@ -2781,13 +2601,8 @@ impl SharedVm {
                 cratonvm_gc::ReferenceProcessor::new(),
                 LockLevel::RefProcessor,
             ),
-            cached_string_num_fields: AtomicUsize::new(0),
-            compact_strings: std::sync::atomic::AtomicBool::new(false),
-            cached_class_mirror_num_fields: AtomicUsize::new(0),
             finalizer_thread: cratonvm_gc::reference::FinalizerThread::new(),
             cleaner_thread: cratonvm_gc::reference::CleanerThread::new(),
-            class_init_waiters: parking_lot::Mutex::new(FxHashMap::default()),
-            class_loading_locks: parking_lot::Mutex::new(FxHashMap::default()),
             gc_requested: std::sync::atomic::AtomicBool::new(false),
             native_array_gc_requested: std::sync::atomic::AtomicBool::new(false),
             // T19.3.G1 — allocation-storm observability counters.
@@ -2796,12 +2611,6 @@ impl SharedVm {
             gc_cycle_count: std::sync::atomic::AtomicU64::new(0),
             gc_unproductive_streak: std::sync::atomic::AtomicU32::new(0),
             bytes_allocated_total: std::sync::atomic::AtomicU64::new(0),
-            // T10.9.E — lazy per-(ClassId, slot_index) field descriptor cache.
-            field_descriptor_cache: parking_lot::RwLock::new(
-                crate::runtime::fx_collections::FxHashMap::default(),
-            ),
-            // WP0.2 — ObjectStreamClass.lookup(cls) cache.
-            osc_cache: crate::runtime::serialization::OscCache::new(),
             // WP1.3 — bootstrap init-level state machine. Starts at 0
             // ("VM construction in progress"); `Vm::new` bumps it to 1
             // after `SharedVm` is wrapped in `Arc` and the main thread
@@ -2867,7 +2676,7 @@ impl SharedVm {
         cratonvm_classloading::install_class_prepare_hook(class_prepare_adapter);
 
         // T10.5 — register the class loader's vtable-install hook so each
-        // class-link emits its descriptor vec into `shared.vtable_manager`.
+        // class-link emits its descriptor vec into `shared.classes.vtable_manager`.
         //
         // Two things have to be registered here, in this order:
         //   1. The global `VtableManager` Arc so the adapter has something
@@ -2880,7 +2689,7 @@ impl SharedVm {
         // be lazily replayed into the manager by the explicit catch-up
         // loop right below.
         crate::runtime::vtable::install_global_vtable_manager(std::sync::Arc::clone(
-            &vm.vtable_manager,
+            &vm.classes.vtable_manager,
         ));
         cratonvm_classloading::install_vtable_install_hook(
             crate::runtime::vtable::vtable_install_adapter,
@@ -2923,7 +2732,7 @@ impl SharedVm {
         // during ClassManager bootstrap (before the hook was live) end up
         // in the VM's VtableManager too.
         {
-            let cm = vm.class_manager.read();
+            let cm = vm.classes.class_manager.read();
             let store_len = cm.class_store.len() as u32;
             for cid in 0..store_len {
                 let cid = crate::classloading::ClassId::new(cid);
@@ -3016,7 +2825,11 @@ fn resolution_invalidate_adapter(class_id: u32) {
         None => return, // VM has been dropped; nothing to invalidate
     };
     let cid = crate::classloading::ClassId::new(class_id);
-    shared.resolution_cache.write().invalidate_class(cid);
+    shared
+        .classes
+        .resolution_cache
+        .write()
+        .invalidate_class(cid);
     // Round 8 audit fix (CRIT #3): the `LinkResolver` reflective cache
     // was missing from the redefine-invalidation cascade. Without
     // this, any cached `(class, name, descriptor)` triple resolved
@@ -3027,7 +2840,7 @@ fn resolution_invalidate_adapter(class_id: u32) {
     // `LinkResolver::invalidate_class` mirrors
     // `ResolutionCache::invalidate_class` (drops by key-class OR
     // resolved-declaring-class match).
-    shared.link_resolver.invalidate_class(cid);
+    shared.classes.link_resolver.invalidate_class(cid);
 }
 
 /// The `JitInvalidateHook` adapter handed to
@@ -3101,7 +2914,7 @@ fn class_info_adapter(class_id: u32) -> Option<(String, usize)> {
     let weak = RESOLUTION_INVALIDATE_VM.get()?;
     let shared = weak.upgrade()?;
     let cid = crate::classloading::ClassId::new(class_id);
-    let cm = shared.class_manager.read();
+    let cm = shared.classes.class_manager.read();
     let class = cm.class_store.get(cid)?;
     Some((class.name.to_string(), class.num_total_fields))
 }
@@ -3116,7 +2929,7 @@ impl SharedVm {
             .as_deref()
             .unwrap_or("classes.jsa");
 
-        let cm = self.class_manager.read();
+        let cm = self.classes.class_manager.read();
         let mut generator = cratonvm_native_builtins::cds::CdsArchiveGenerator::new(archive_path);
 
         // Iterate all loaded classes and add non-synthetic ones with cached bytes
@@ -3156,7 +2969,7 @@ impl SharedVm {
     /// These IDs start at 0x8000_0000 and increment, avoiding collision
     /// with real ClassIds assigned by the ClassStore.
     pub fn alloc_lambda_proxy_id(&self) -> ClassId {
-        ClassId::new(self.next_lambda_id.fetch_add(1, Ordering::Relaxed))
+        ClassId::new(self.classes.next_lambda_id.fetch_add(1, Ordering::Relaxed))
     }
 
     /// Get an `Arc<SharedVm>` from the stored weak self-reference.
@@ -3684,10 +3497,15 @@ impl SharedVm {
         // only the built-in delegation chain, matching what the slow path
         // can actually produce: a hit here is always right, a miss falls
         // through to the real load below instead of a stray loader's class.
-        let fast_id = self.class_manager.read().resolve_fast_path_class_id(name);
+        let fast_id = self
+            .classes
+            .class_manager
+            .read()
+            .resolve_fast_path_class_id(name);
         if let Some(id) = fast_id {
             // Check if it's a synthetic stub that needs upgrading
             let is_synthetic = self
+                .classes
                 .class_manager
                 .read()
                 .class_store
@@ -3702,7 +3520,7 @@ impl SharedVm {
 
         // Get or create per-class-name lock
         let class_lock = {
-            let mut locks = self.class_loading_locks.lock();
+            let mut locks = self.classes.class_loading_locks.lock();
             locks
                 .entry(name.to_string())
                 .or_insert_with(|| {
@@ -3720,7 +3538,7 @@ impl SharedVm {
         // Same loader-faithful lookup as the fast path above -- see that
         // comment for why the bare `get_loaded_class_id` is unsound here.
         {
-            let cm = self.class_manager.read();
+            let cm = self.classes.class_manager.read();
             if let Some(id) = cm.resolve_fast_path_class_id(name) {
                 let is_synthetic = cm
                     .class_store
@@ -3743,7 +3561,7 @@ impl SharedVm {
             // loader-faithful lookup as the fast path above (see that
             // comment) -- a lone unrelated user-defined loader's copy must
             // not be handed back here either.
-            let cm = self.class_manager.read();
+            let cm = self.classes.class_manager.read();
             if let Some(id) = cm.resolve_fast_path_class_id(name) {
                 let is_synthetic = cm
                     .class_store
@@ -3810,7 +3628,7 @@ impl SharedVm {
         }
 
         // Actually load the class (this takes the global write lock briefly)
-        let mut cm_guard = self.class_manager.write();
+        let mut cm_guard = self.classes.class_manager.write();
         let result = cm_guard.load_class(name);
         drop(cm_guard);
 
@@ -3854,6 +3672,7 @@ impl SharedVm {
             // devirtualized under the assumption that `A` had no
             // subclasses, loading `B` breaks that assumption.
             let superclass = self
+                .classes
                 .class_manager
                 .read()
                 .get_class(*class_id)
@@ -3892,7 +3711,7 @@ impl SharedVm {
             #[cfg(feature = "gpu-offload")]
             {
                 let class_id = *class_id;
-                let cm = self.class_manager.read();
+                let cm = self.classes.class_manager.read();
                 if let Some(class) = cm.get_class(class_id) {
                     crate::runtime::offload::maybe_warmup_gpu(self, class, class_id);
                 }
@@ -3910,7 +3729,7 @@ impl SharedVm {
         // guard drop so waiters have already been notified.
         if Arc::strong_count(&class_lock) <= 2 {
             // 2 = our local + the HashMap entry — no other thread holds it
-            self.class_loading_locks.lock().remove(name);
+            self.classes.class_loading_locks.lock().remove(name);
         }
 
         result
@@ -4068,7 +3887,12 @@ impl SharedVm {
         // Resolve ClassId — if the class isn't loaded yet (e.g. a caller
         // invoked us before registration completed), there can be no
         // LeafClass assumption on it, so there's nothing to evict.
-        let class_id_u32: u32 = match self.class_manager.read().get_loaded_class_id(class_name) {
+        let class_id_u32: u32 = match self
+            .classes
+            .class_manager
+            .read()
+            .get_loaded_class_id(class_name)
+        {
             Some(cid) => cid.as_u32(),
             None => return 0,
         };
@@ -4103,6 +3927,7 @@ impl SharedVm {
             };
             let before = jit.len();
             let part_class_id = self
+                .classes
                 .class_manager
                 .read()
                 .get_loaded_class_id(class_part)
@@ -4131,7 +3956,7 @@ impl SharedVm {
         }
 
         let snapshots = self.jit.profile_store.snapshot_all();
-        let class_mgr = self.class_manager.read();
+        let class_mgr = self.classes.class_manager.read();
 
         // Collect branch data
         let mut _branch_entries: Vec<(&str, &str, u32, u32, u32)> = Vec::new();
@@ -4474,11 +4299,11 @@ impl SharedVm {
     /// monitor target for static synchronized methods (which have no `this`).
     pub fn get_class_lock_object(&self, class_id: ClassId) -> ObjectRef {
         // Fast path: check if we already have a lock object
-        if let Some(&obj) = self.class_locks.read().get(&class_id) {
+        if let Some(&obj) = self.classes.class_locks.read().get(&class_id) {
             return obj;
         }
         // Slow path: allocate one
-        let mut locks = self.class_locks.write();
+        let mut locks = self.classes.class_locks.write();
         // Double-check after acquiring write lock
         if let Some(&obj) = locks.get(&class_id) {
             return obj;
@@ -4488,6 +4313,7 @@ impl SharedVm {
         // creating zero-slot "instances" of fieldful classes, which the GC
         // reports as undersized object layouts when scanning class-lock roots.
         let lock_class_id = self
+            .classes
             .class_manager
             .read()
             .get_loaded_class_id("java/lang/Object")
@@ -4572,7 +4398,7 @@ impl SharedVm {
         // present (pure synthetic-jdk mode) the load fails harmlessly
         // and we fall back to the 1-field synthetic stub below.
         let _ = self.load_class_concurrent("java/io/PrintStream");
-        let ps_class_id = self.class_manager.write().ensure_synthetic_class(
+        let ps_class_id = self.classes.class_manager.write().ensure_synthetic_class(
             "java/io/PrintStream",
             1, // 1 field: fd_id — used only when the real class isn't loaded
         );
@@ -4581,7 +4407,7 @@ impl SharedVm {
         // stay in-bounds. `max(1)` guarantees slot 0 (our fd tag) is always
         // writable even for synthetic stub classes declared with 0 fields.
         let num_fields = {
-            let cm = self.class_manager.read();
+            let cm = self.classes.class_manager.read();
             cm.get_class(ps_class_id)
                 .map(|c| c.num_total_fields.max(1))
                 .unwrap_or(1)
@@ -4635,7 +4461,7 @@ impl SharedVm {
         // static slot by name so this is robust to the real-JDK field layout;
         // a missing field (pure synthetic-jdk System stub) is skipped harmlessly.
         let sys_initial_err_slot = {
-            let cm = self.class_manager.read();
+            let cm = self.classes.class_manager.read();
             cm.get_loaded_class_id("java/lang/System").and_then(|sid| {
                 cm.get_class(sid).and_then(|c| {
                     let mut static_idx = 0usize;
@@ -4886,14 +4712,14 @@ impl SharedVm {
     ///
     /// Retained as a compatibility alias: the field is now an
     /// [`OrderedPlRwLock`] at [`LockLevel::ClassManager`], so a plain
-    /// `shared.class_manager.read()` is already order-checked and this helper
+    /// `shared.classes.class_manager.read()` is already order-checked and this helper
     /// adds nothing. Taking a *second* rank scope here would double-record L10
     /// and trip the same-level assertion.
     #[inline]
     pub fn class_manager_read_ranked(
         &self,
     ) -> crate::runtime::lock_order::OrderedPlRwLockReadGuard<'_, ClassManager> {
-        self.class_manager.read()
+        self.classes.class_manager.read()
     }
 
     /// Acquire `class_manager` (L10) for write. See
@@ -4902,7 +4728,7 @@ impl SharedVm {
     pub fn class_manager_write_ranked(
         &self,
     ) -> crate::runtime::lock_order::OrderedPlRwLockWriteGuard<'_, ClassManager> {
-        self.class_manager.write()
+        self.classes.class_manager.write()
     }
 
     /// Acquire `ref_processor` (L7).
@@ -4971,7 +4797,10 @@ impl SharedVm {
 impl std::fmt::Debug for SharedVm {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SharedVm")
-            .field("classes_loaded", &self.class_manager.read().loaded_count())
+            .field(
+                "classes_loaded",
+                &self.classes.class_manager.read().loaded_count(),
+            )
             .field("heap_bytes", &self.heap.allocated_bytes())
             .field("native_methods", &self.native_methods.len())
             .finish()
@@ -5057,7 +4886,7 @@ impl Vm {
         // Round 4 audit fix (CRIT) — publish the same weak handle to the
         // module-private slot used by `resolution_invalidate_adapter` so
         // JVMTI `RedefineClasses` can reach back into
-        // `shared.resolution_cache` and drop stale resolutions.
+        // `shared.classes.resolution_cache` and drop stale resolutions.
         // Idempotent — first writer wins, repeated calls (e.g. test
         // fixtures that build multiple Vms in-process) are silently
         // ignored, which matches the global vtable hook pattern.
@@ -5235,6 +5064,7 @@ impl Vm {
     /// Get the name of a class by its id.
     pub fn class_name(&self, class_id: ClassId) -> Option<String> {
         self.shared
+            .classes
             .class_manager
             .read()
             .get_class(class_id)
@@ -5248,6 +5078,7 @@ impl Vm {
         let class_id = self.shared.load_class_concurrent(class_name)?;
         let num_fields = self
             .shared
+            .classes
             .class_manager
             .read()
             .get_class(class_id)
@@ -5329,6 +5160,7 @@ impl Vm {
             // Look up the class name for virtual dispatch of finalize()
             let class_name = self
                 .shared
+                .classes
                 .class_manager
                 .read()
                 .get_class(class_id)
@@ -5379,7 +5211,7 @@ impl Vm {
     /// only; use [`Vm::instance_field_index_desc`] to disambiguate a shadowed
     /// same-name field by its descriptor.
     pub fn instance_field_index(&self, class_id: ClassId, field_name: &str) -> Option<usize> {
-        let cm = self.shared.class_manager.read();
+        let cm = self.shared.classes.class_manager.read();
         super::vm_exec::resolve_field_index_in_hierarchy(class_id, field_name, &cm.class_store)
     }
 
@@ -5397,7 +5229,7 @@ impl Vm {
         field_name: &str,
         descriptor: Option<&str>,
     ) -> Option<usize> {
-        let cm = self.shared.class_manager.read();
+        let cm = self.shared.classes.class_manager.read();
         super::vm_exec::resolve_field_index_in_hierarchy_desc(
             class_id,
             field_name,
@@ -5410,6 +5242,7 @@ impl Vm {
     /// range `[0, count)` for the instance-field accessors.
     pub fn instance_field_count(&self, class_id: ClassId) -> usize {
         self.shared
+            .classes
             .class_manager
             .read()
             .get_class(class_id)
@@ -5455,6 +5288,7 @@ impl Vm {
     /// Check if `child_id` is a subclass of (or implements) `parent_id`.
     pub fn is_subclass_of(&self, child_id: ClassId, parent_id: ClassId) -> bool {
         self.shared
+            .classes
             .class_manager
             .read()
             .is_subclass_of(child_id, parent_id)
@@ -5500,7 +5334,7 @@ impl std::fmt::Debug for Vm {
         f.debug_struct("Vm")
             .field(
                 "classes_loaded",
-                &self.shared.class_manager.read().loaded_count(),
+                &self.shared.classes.class_manager.read().loaded_count(),
             )
             .field("heap_bytes", &self.shared.heap.allocated_bytes())
             .field("native_methods", &self.shared.native_methods.len())
@@ -5637,7 +5471,7 @@ impl crate::runtime::serviceability::VmDiagnosticState for SharedVm {
         let (old_used, old_cap) = self.heap.old_gen_stats();
         // Metaspace approximation: count loaded classes × estimated per-class overhead
         let class_count = {
-            let cm = self.class_manager.read();
+            let cm = self.classes.class_manager.read();
             cm.loaded_count()
         };
         let metaspace_used = class_count * 4096; // ~4 KB per class average
@@ -5667,7 +5501,7 @@ impl crate::runtime::serviceability::VmDiagnosticState for SharedVm {
             let cid = header.class_id.as_u32();
             let entry = histogram.entry(cid).or_insert_with(|| {
                 let name = {
-                    let cm = self.class_manager.read();
+                    let cm = self.classes.class_manager.read();
                     cm.get_class(crate::classloading::ClassId::new(cid))
                         .map(|c| c.name.to_string())
                         .unwrap_or_else(|| format!("class#{}", cid))
@@ -5767,7 +5601,7 @@ impl crate::runtime::serviceability::VmDiagnosticState for SharedVm {
         let walked = self.heap.walk_objects();
 
         // Step 2: Build class info from ClassManager
-        let cm = self.class_manager.read();
+        let cm = self.classes.class_manager.read();
         let mut classes: Vec<HprofClassInfo> = Vec::new();
         let mut class_ids_seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
 
@@ -6052,11 +5886,11 @@ mod tests {
         // grew from 5 as bootstrap work landed; if it changes again, verify
         // the new value against `SharedVm::new`'s class-loading calls rather
         // than assuming a regression.
-        assert_eq!(shared.class_manager.read().loaded_count(), 29);
-        assert!(shared.statics.read().is_empty());
+        assert_eq!(shared.classes.class_manager.read().loaded_count(), 29);
+        assert!(shared.classes.statics.read().is_empty());
         assert!(shared.string_pool.read().is_empty());
-        assert!(shared.class_mirrors.read().is_empty());
-        assert!(shared.lambda_proxies.read().is_empty());
+        assert!(shared.classes.class_mirrors.read().is_empty());
+        assert!(shared.classes.lambda_proxies.read().is_empty());
     }
 
     #[test]
@@ -6164,10 +5998,12 @@ mod tests {
     fn class_lock_object_for_fieldful_class_is_plain_zero_slot_object() {
         let shared = SharedVm::new(VmConfig::default());
         let fieldful_id = shared
+            .classes
             .class_manager
             .write()
             .ensure_synthetic_class("cratonvm/test/FieldfulStaticLockTarget", 3);
         let object_id = shared
+            .classes
             .class_manager
             .read()
             .get_loaded_class_id("java/lang/Object")
@@ -6257,7 +6093,7 @@ mod tests {
         let arc = vm.shared.get_arc();
         // Same bootstrap class set as `shared_vm_default_config` — see that
         // test's comment for what's currently in it and why the count moves.
-        assert_eq!(arc.class_manager.read().loaded_count(), 29);
+        assert_eq!(arc.classes.class_manager.read().loaded_count(), 29);
     }
 
     #[test]
@@ -6326,7 +6162,13 @@ mod tests {
     #[test]
     fn cached_string_num_fields_starts_at_zero() {
         let shared = SharedVm::new(VmConfig::default());
-        assert_eq!(shared.cached_string_num_fields.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            shared
+                .classes
+                .cached_string_num_fields
+                .load(Ordering::Relaxed),
+            0
+        );
     }
 
     #[test]
@@ -6334,6 +6176,7 @@ mod tests {
         let shared = SharedVm::new(VmConfig::default());
         assert_eq!(
             shared
+                .classes
                 .cached_class_mirror_num_fields
                 .load(Ordering::Relaxed),
             0
@@ -6344,11 +6187,20 @@ mod tests {
     fn create_java_string_caches_field_count() {
         let shared = SharedVm::new(VmConfig::default());
         // Before first call, cached is 0
-        assert_eq!(shared.cached_string_num_fields.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            shared
+                .classes
+                .cached_string_num_fields
+                .load(Ordering::Relaxed),
+            0
+        );
         // Create a string — should resolve and cache the field count
         let s = crate::vm::vm_object::create_java_string(&shared, "hello");
         // After first call, cached should be nonzero (2 for synthetic stub)
-        let cached = shared.cached_string_num_fields.load(Ordering::Relaxed);
+        let cached = shared
+            .classes
+            .cached_string_num_fields
+            .load(Ordering::Relaxed);
         assert!(
             cached >= 2,
             "cached field count should be at least 2, got {}",
@@ -6364,12 +6216,14 @@ mod tests {
         let shared = SharedVm::new(VmConfig::default());
         assert_eq!(
             shared
+                .classes
                 .cached_class_mirror_num_fields
                 .load(Ordering::Relaxed),
             0
         );
         let _mirror = crate::vm::vm_object::get_or_create_class_mirror(&shared, ClassId::new(1));
         let cached = shared
+            .classes
             .cached_class_mirror_num_fields
             .load(Ordering::Relaxed);
         assert!(
@@ -6383,7 +6237,10 @@ mod tests {
     fn pre_set_cached_field_count_used() {
         let shared = SharedVm::new(VmConfig::default());
         // Pre-set to 4 (simulating real JDK String with 4 fields)
-        shared.cached_string_num_fields.store(4, Ordering::Relaxed);
+        shared
+            .classes
+            .cached_string_num_fields
+            .store(4, Ordering::Relaxed);
         let s = crate::vm::vm_object::create_java_string(&shared, "test4fields");
         // The string should have been allocated with 4 fields, so writing field 3 should work
         shared.heap.set_field(s, 3, Value::Int(42));
@@ -6821,7 +6678,7 @@ mod tests {
     #[ignore] // requires JDK on host
     fn s7_object_loaded_from_real_bytecode() {
         let shared = create_real_jdk_vm().expect("No JDK found");
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
 
         // java.lang.Object should be loaded during bootstrap
         let obj_id = cm.get_loaded_class_id("java/lang/Object");
@@ -6965,6 +6822,7 @@ mod tests {
 
         // Load Object class
         let obj_class_id = shared
+            .classes
             .class_manager
             .write()
             .load_class("java/lang/Object")
@@ -6972,6 +6830,7 @@ mod tests {
 
         // Get field count for allocation
         let num_fields = shared
+            .classes
             .class_manager
             .read()
             .class_store
@@ -7015,12 +6874,14 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(1), "test");
 
         let obj_class_id = shared
+            .classes
             .class_manager
             .write()
             .load_class("java/lang/Object")
             .expect("Should load Object");
 
         let num_fields = shared
+            .classes
             .class_manager
             .read()
             .class_store
@@ -7073,12 +6934,14 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(1), "test");
 
         let obj_class_id = shared
+            .classes
             .class_manager
             .write()
             .load_class("java/lang/Object")
             .expect("Should load Object");
 
         let num_fields = shared
+            .classes
             .class_manager
             .read()
             .class_store
@@ -7122,7 +6985,7 @@ mod tests {
     #[ignore] // requires JDK on host
     fn s7_object_class_state_initialized() {
         let shared = create_real_jdk_vm().expect("No JDK found");
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
 
         let obj_id = cm
             .get_loaded_class_id("java/lang/Object")
@@ -7146,7 +7009,7 @@ mod tests {
     #[ignore] // requires JDK on host
     fn s7_bootstrap_loads_multiple_real_classes() {
         let shared = create_real_jdk_vm().expect("No JDK found");
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
 
         // bootstrap_core_classes should have loaded many real classes
         let modules = cm.list_boot_modules();
@@ -7187,7 +7050,7 @@ mod tests {
     #[ignore] // requires real JDK on PATH
     fn s8_string_loaded_from_real_bytecode() {
         let shared = create_real_jdk_vm().expect("No JDK found");
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let id = cm
             .get_loaded_class_id("java/lang/String")
             .expect("String not loaded");
@@ -7252,7 +7115,7 @@ mod tests {
     #[ignore] // requires real JDK on PATH
     fn s8_class_loaded_from_real_bytecode() {
         let shared = create_real_jdk_vm().expect("No JDK found");
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let id = cm
             .get_loaded_class_id("java/lang/Class")
             .expect("Class not loaded");
@@ -7297,13 +7160,14 @@ mod tests {
         // The compact_strings flag should be set by pre_init_string_statics
         assert!(
             shared
+                .classes
                 .compact_strings
                 .load(std::sync::atomic::Ordering::Relaxed),
             "compact_strings should be true for real JDK"
         );
 
         // Verify COMPACT_STRINGS static field is set
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let string_id = cm
             .get_loaded_class_id("java/lang/String")
             .expect("class java/lang/String should be loaded");
@@ -7410,7 +7274,7 @@ mod tests {
     fn s8_class_mirror_with_real_layout() {
         let shared = Arc::new(create_real_jdk_vm().expect("No JDK found"));
 
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let string_id = cm
             .get_loaded_class_id("java/lang/String")
             .expect("class java/lang/String should be loaded");
@@ -7467,7 +7331,7 @@ mod tests {
     #[ignore] // requires real JDK on PATH
     fn s8_string_and_class_both_real() {
         let shared = create_real_jdk_vm().expect("No JDK found");
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
 
         for class_name in &["java/lang/String", "java/lang/Class"] {
             let id = cm
@@ -7493,6 +7357,7 @@ mod tests {
         let (shared, mut thread) = create_real_jdk_vm_with_thread().expect("No JDK found");
 
         let string_id = shared
+            .classes
             .class_manager
             .write()
             .load_class("java/lang/String")
@@ -7567,6 +7432,7 @@ mod tests {
         let (shared, mut thread) = create_real_jdk_vm_with_thread().expect("No JDK found");
 
         let class_id = shared
+            .classes
             .class_manager
             .write()
             .load_class("java/lang/Class")
@@ -7597,7 +7463,7 @@ mod tests {
             Some(Value::Object(Some(mirror))) => {
                 // The returned mirror should be for java/lang/String
                 let stored_id = shared.heap.get_field(mirror, 0);
-                let cm = shared.class_manager.read();
+                let cm = shared.classes.class_manager.read();
                 let string_id = cm
                     .get_loaded_class_id("java/lang/String")
                     .expect("class java/lang/String should be loaded");
@@ -7655,11 +7521,13 @@ mod tests {
         // Force a new allocation by not using interning
         let s2 = {
             let string_id = shared
+                .classes
                 .class_manager
                 .read()
                 .get_loaded_class_id("java/lang/String")
                 .expect("class java/lang/String should be loaded");
             let cls = shared
+                .classes
                 .class_manager
                 .read()
                 .get_class(string_id)
@@ -7789,7 +7657,7 @@ mod tests {
     fn s8_class_getname_execution() {
         let (shared, mut thread) = create_real_jdk_vm_with_thread().expect("No JDK found");
 
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let string_id = cm
             .get_loaded_class_id("java/lang/String")
             .expect("class java/lang/String should be loaded");
@@ -7868,7 +7736,7 @@ mod tests {
     fn s8_class_isinstance_execution() {
         let (shared, mut thread) = create_real_jdk_vm_with_thread().expect("No JDK found");
 
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let string_id = cm
             .get_loaded_class_id("java/lang/String")
             .expect("class java/lang/String should be loaded");
@@ -7925,7 +7793,7 @@ mod tests {
     #[ignore] // requires real JDK on PATH
     fn s9_all_core_lang_classes_real() {
         let shared = create_real_jdk_vm().expect("No JDK found");
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
 
         let core_classes = [
             "java/lang/Object",
@@ -8100,7 +7968,7 @@ mod tests {
         ];
 
         for (wrapper_name, prim_name) in &wrappers {
-            let cm = shared.class_manager.read();
+            let cm = shared.classes.class_manager.read();
             let class_id = cm
                 .get_loaded_class_id(wrapper_name)
                 .unwrap_or_else(|| panic!("{wrapper_name} should be loaded"));
@@ -8145,7 +8013,7 @@ mod tests {
     #[ignore] // requires real JDK on PATH
     fn s9_number_class_hierarchy() {
         let shared = create_real_jdk_vm().expect("No JDK found");
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
 
         // Number extends Object
         let number_id = cm
@@ -8193,7 +8061,7 @@ mod tests {
     #[ignore] // requires real JDK on PATH
     fn s9_throwable_hierarchy() {
         let shared = create_real_jdk_vm().expect("No JDK found");
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
 
         let throwable_id = cm
             .get_loaded_class_id("java/lang/Throwable")
@@ -8242,7 +8110,7 @@ mod tests {
     #[ignore] // requires real JDK on PATH
     fn s9_system_class_has_methods() {
         let shared = create_real_jdk_vm().expect("No JDK found");
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
 
         let sys_id = cm
             .get_loaded_class_id("java/lang/System")
@@ -8279,7 +8147,7 @@ mod tests {
     #[ignore] // requires real JDK on PATH
     fn s9_integer_class_structure() {
         let shared = create_real_jdk_vm().expect("No JDK found");
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
 
         let int_id = cm
             .get_loaded_class_id("java/lang/Integer")
@@ -8346,7 +8214,7 @@ mod tests {
     #[ignore] // requires real JDK on PATH
     fn s9_thread_class_structure() {
         let shared = create_real_jdk_vm().expect("No JDK found");
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
 
         let thread_id = cm
             .get_loaded_class_id("java/lang/Thread")
@@ -8484,12 +8352,13 @@ mod tests {
         // Resolve the `holder` slot via the class store — the slot index
         // is layout-dependent so we must not hardcode it.
         let thread_class = shared
+            .classes
             .class_manager
             .read()
             .get_loaded_class_id("java/lang/Thread")
             .expect("Thread class should be loaded");
         let holder_slot = {
-            let cm = shared.class_manager.read();
+            let cm = shared.classes.class_manager.read();
             crate::vm::resolve_field_index_for_test(thread_class, "holder", &cm.class_store)
         }
         .expect("Thread.holder field should be resolvable");
@@ -8503,7 +8372,7 @@ mod tests {
         // Confirm `holder.group` is non-null.
         let holder_class = shared.heap.class_id_of(holder);
         let group_slot = {
-            let cm = shared.class_manager.read();
+            let cm = shared.classes.class_manager.read();
             crate::vm::resolve_field_index_for_test(holder_class, "group", &cm.class_store)
         }
         .expect("FieldHolder.group field should be resolvable");
@@ -8514,7 +8383,7 @@ mod tests {
 
         // Confirm `holder.priority == 5` (NORM_PRIORITY).
         let prio_slot = {
-            let cm = shared.class_manager.read();
+            let cm = shared.classes.class_manager.read();
             crate::vm::resolve_field_index_for_test(holder_class, "priority", &cm.class_store)
         }
         .expect("FieldHolder.priority field should be resolvable");
@@ -8881,6 +8750,7 @@ mod tests {
         init_args: &[Value],
     ) -> ObjectRef {
         let class_id = shared
+            .classes
             .class_manager
             .write()
             .load_class(class_name)
@@ -8888,6 +8758,7 @@ mod tests {
         crate::vm::ensure_class_initialized_shared(shared, thread, class_id)
             .unwrap_or_else(|e| panic!("Failed to initialize {class_name}: {e:?}"));
         let num_fields = shared
+            .classes
             .class_manager
             .read()
             .get_class(class_id)
@@ -8911,7 +8782,7 @@ mod tests {
     #[ignore]
     fn s11_hashmap_loaded_from_real_bytecode() {
         let shared = create_real_jdk_vm().expect("No JDK found");
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
 
         let hm_id = cm.get_loaded_class_id("java/util/HashMap");
         assert!(hm_id.is_some(), "HashMap should be loaded during bootstrap");
@@ -8960,7 +8831,7 @@ mod tests {
     #[ignore]
     fn s11_arraylist_loaded_from_real_bytecode() {
         let shared = create_real_jdk_vm().expect("No JDK found");
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
 
         let al_id = cm.get_loaded_class_id("java/util/ArrayList");
         assert!(
@@ -9010,7 +8881,7 @@ mod tests {
     #[ignore]
     fn s11_abstract_collection_hierarchy() {
         let shared = create_real_jdk_vm().expect("No JDK found");
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
 
         for name in &[
             "java/util/AbstractCollection",
@@ -9068,7 +8939,7 @@ mod tests {
     #[ignore]
     fn s11_collection_interfaces_loaded() {
         let shared = create_real_jdk_vm().expect("No JDK found");
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
 
         for name in &[
             "java/util/Collection",
@@ -9097,6 +8968,7 @@ mod tests {
     fn s11_hashmap_initializes() {
         let (shared, mut thread) = create_real_jdk_vm_with_thread().expect("No JDK found");
         let hm_id = shared
+            .classes
             .class_manager
             .read()
             .get_loaded_class_id("java/util/HashMap")
@@ -9105,6 +8977,7 @@ mod tests {
             .expect("HashMap <clinit> should execute successfully");
 
         let state = shared
+            .classes
             .class_manager
             .read()
             .get_class(hm_id)
@@ -9122,6 +8995,7 @@ mod tests {
     fn s11_arraylist_initializes() {
         let (shared, mut thread) = create_real_jdk_vm_with_thread().expect("No JDK found");
         let al_id = shared
+            .classes
             .class_manager
             .read()
             .get_loaded_class_id("java/util/ArrayList")
@@ -9130,6 +9004,7 @@ mod tests {
             .expect("ArrayList <clinit> should execute successfully");
 
         let state = shared
+            .classes
             .class_manager
             .read()
             .get_class(al_id)
@@ -9158,12 +9033,17 @@ mod tests {
         ];
 
         for name in &collection_classes {
-            let id = shared.class_manager.read().get_loaded_class_id(name);
+            let id = shared
+                .classes
+                .class_manager
+                .read()
+                .get_loaded_class_id(name);
             assert!(id.is_some(), "{name} should be loaded");
             let id = id.expect("id should be Some");
             crate::vm::ensure_class_initialized_shared(&shared, &mut thread, id)
                 .unwrap_or_else(|e| panic!("{name} <clinit> failed: {e:?}"));
             let state = shared
+                .classes
                 .class_manager
                 .read()
                 .get_class(id)
@@ -9186,6 +9066,7 @@ mod tests {
 
         // Initialize HashMap first (may trigger inner class loading)
         let hm_id = shared
+            .classes
             .class_manager
             .read()
             .get_loaded_class_id("java/util/HashMap")
@@ -9195,6 +9076,7 @@ mod tests {
 
         // HashMap$Node should be loadable (may or may not be bootstrapped yet)
         let node_id = shared
+            .classes
             .class_manager
             .write()
             .load_class("java/util/HashMap$Node");
@@ -9205,7 +9087,7 @@ mod tests {
         );
         let node_id = node_id.expect("node_id should be Some");
 
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let node = cm
             .get_class(node_id)
             .expect("class should exist in class store");
@@ -9283,7 +9165,7 @@ mod tests {
 
         // Inspect raw instance fields of HashMap to see what put() did
         {
-            let cm = shared.class_manager.read();
+            let cm = shared.classes.class_manager.read();
             let cls = cm
                 .get_class(hm_id)
                 .expect("class should exist in class store");
@@ -9387,6 +9269,7 @@ mod tests {
 
         // Box an integer: create Integer.valueOf(42)
         let int_class_id = shared
+            .classes
             .class_manager
             .write()
             .load_class("java/lang/Integer")
@@ -9491,7 +9374,7 @@ mod tests {
     #[ignore]
     fn s11_linkedlist_loaded_and_initializes() {
         let (shared, mut thread) = create_real_jdk_vm_with_thread().expect("No JDK found");
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
 
         let ll_id = cm.get_loaded_class_id("java/util/LinkedList");
         assert!(ll_id.is_some(), "LinkedList should be loaded");
@@ -9526,13 +9409,14 @@ mod tests {
         let (shared, mut thread) = create_real_jdk_vm_with_thread().expect("No JDK found");
 
         let hs_id = shared
+            .classes
             .class_manager
             .read()
             .get_loaded_class_id("java/util/HashSet");
         assert!(hs_id.is_some(), "HashSet should be loaded");
         let hs_id = hs_id.expect("hs_id should be Some");
         {
-            let cm = shared.class_manager.read();
+            let cm = shared.classes.class_manager.read();
             let cls = cm
                 .get_class(hs_id)
                 .expect("class should exist in class store");
@@ -9555,13 +9439,14 @@ mod tests {
 
         // TreeMap may not be in tier 2 bootstrap but should be loadable
         let tm_id = shared
+            .classes
             .class_manager
             .write()
             .load_class("java/util/TreeMap")
             .expect("TreeMap should be loadable");
 
         {
-            let cm = shared.class_manager.read();
+            let cm = shared.classes.class_manager.read();
             let cls = cm
                 .get_class(tm_id)
                 .expect("class should exist in class store");
@@ -9587,12 +9472,13 @@ mod tests {
         let (shared, _thread) = create_real_jdk_vm_with_thread().expect("No JDK found");
 
         let sp_id = shared
+            .classes
             .class_manager
             .write()
             .load_class("java/util/Spliterator")
             .expect("Spliterator should be loadable");
 
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let cls = cm
             .get_class(sp_id)
             .expect("class should exist in class store");
@@ -9817,7 +9703,7 @@ mod tests {
     #[ignore] // requires real JDK on PATH
     fn s13_concurrent_classes_loaded_from_real_bytecode() {
         let shared = create_real_jdk_vm().expect("No JDK found");
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
 
         let concurrent_classes = [
             // Atomic classes
@@ -9973,7 +9859,7 @@ mod tests {
     #[ignore] // requires real JDK on PATH
     fn s13_aqs_structure() {
         let shared = create_real_jdk_vm().expect("No JDK found");
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
 
         let aqs_id = cm
             .get_loaded_class_id("java/util/concurrent/locks/AbstractQueuedSynchronizer")
@@ -10004,7 +9890,7 @@ mod tests {
     #[ignore] // requires real JDK on PATH
     fn s13_reentrant_lock_structure() {
         let shared = create_real_jdk_vm().expect("No JDK found");
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
 
         let rl_id = cm
             .get_loaded_class_id("java/util/concurrent/locks/ReentrantLock")
@@ -10042,7 +9928,7 @@ mod tests {
     #[ignore] // requires real JDK on PATH
     fn s13_atomic_integer_structure() {
         let shared = create_real_jdk_vm().expect("No JDK found");
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
 
         let ai_id = cm
             .get_loaded_class_id("java/util/concurrent/atomic/AtomicInteger")
@@ -10334,7 +10220,7 @@ mod tests {
     #[ignore] // requires real JDK on PATH
     fn s13_count_down_latch_structure() {
         let shared = create_real_jdk_vm().expect("No JDK found");
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
 
         let cdl_id = cm
             .get_loaded_class_id("java/util/concurrent/CountDownLatch")
@@ -10367,7 +10253,7 @@ mod tests {
     #[ignore] // requires real JDK on PATH
     fn s13_semaphore_structure() {
         let shared = create_real_jdk_vm().expect("No JDK found");
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
 
         let sem_id = cm
             .get_loaded_class_id("java/util/concurrent/Semaphore")
@@ -10401,7 +10287,7 @@ mod tests {
     #[ignore] // requires real JDK on PATH
     fn s13_cyclic_barrier_structure() {
         let shared = create_real_jdk_vm().expect("No JDK found");
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
 
         let cb_id = cm
             .get_loaded_class_id("java/util/concurrent/CyclicBarrier")
@@ -10434,7 +10320,7 @@ mod tests {
     #[ignore] // requires real JDK on PATH
     fn s13_executor_framework_structure() {
         let shared = create_real_jdk_vm().expect("No JDK found");
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
 
         // ExecutorService is an interface
         let es_id = cm
@@ -10503,7 +10389,7 @@ mod tests {
     #[ignore] // requires real JDK on PATH
     fn s13_atomic_long_structure() {
         let shared = create_real_jdk_vm().expect("No JDK found");
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
 
         let al_id = cm
             .get_loaded_class_id("java/util/concurrent/atomic/AtomicLong")
@@ -10525,7 +10411,7 @@ mod tests {
     #[ignore] // requires real JDK on PATH
     fn s13_atomic_reference_structure() {
         let shared = create_real_jdk_vm().expect("No JDK found");
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
 
         let ar_id = cm
             .get_loaded_class_id("java/util/concurrent/atomic/AtomicReference")
@@ -10547,7 +10433,7 @@ mod tests {
     #[ignore] // requires real JDK on PATH
     fn s13_stamped_lock_structure() {
         let shared = create_real_jdk_vm().expect("No JDK found");
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
 
         let sl_id = cm
             .get_loaded_class_id("java/util/concurrent/locks/StampedLock")
@@ -10581,7 +10467,7 @@ mod tests {
     #[ignore] // requires real JDK on PATH
     fn s13_phaser_structure() {
         let shared = create_real_jdk_vm().expect("No JDK found");
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
 
         let ph_id = cm
             .get_loaded_class_id("java/util/concurrent/Phaser")
@@ -10607,7 +10493,7 @@ mod tests {
     #[ignore] // requires real JDK on PATH
     fn s13_adders_loaded() {
         let shared = create_real_jdk_vm().expect("No JDK found");
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
 
         for class_name in &[
             "java/util/concurrent/atomic/LongAdder",
@@ -10644,6 +10530,7 @@ mod tests {
 
         // Executors.newSingleThreadExecutor()
         let exec_class = shared
+            .classes
             .class_manager
             .write()
             .load_class("java/util/concurrent/Executors")
@@ -10721,6 +10608,7 @@ mod tests {
 
         // Executors.newFixedThreadPool(2)
         let exec_class = shared
+            .classes
             .class_manager
             .write()
             .load_class("java/util/concurrent/Executors")
@@ -10774,7 +10662,7 @@ mod tests {
     #[ignore] // requires real JDK on PATH
     fn s14_boot_modules_discovered() {
         let shared = create_real_jdk_vm().expect("No JDK found");
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
 
         let modules = cm.list_boot_modules();
         assert!(
@@ -10799,7 +10687,7 @@ mod tests {
     #[ignore] // requires real JDK on PATH
     fn s14_module_registry_populated() {
         let shared = create_real_jdk_vm().expect("No JDK found");
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
 
         eprintln!("Module registry size: {}", cm.module_registry.len());
 
@@ -10822,7 +10710,7 @@ mod tests {
     #[ignore] // requires real JDK on PATH
     fn s14_readability_graph() {
         let shared = create_real_jdk_vm().expect("No JDK found");
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
 
         // java.base reads itself
         assert!(
@@ -10848,7 +10736,7 @@ mod tests {
     #[ignore] // requires real JDK on PATH
     fn s14_object_in_java_base_module() {
         let shared = create_real_jdk_vm().expect("No JDK found");
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
 
         let obj_id = cm
             .get_loaded_class_id("java/lang/Object")
@@ -10874,7 +10762,7 @@ mod tests {
 
         // Load a test class from the test classpath (not a JDK class)
         // Use a synthetic class that would be created with no module
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
 
         // Any synthetic stub or test class should have no module_name
         // Check that unnamed module classes can still access java.base exports
@@ -10901,7 +10789,7 @@ mod tests {
     #[ignore] // requires real JDK on PATH
     fn s14_java_base_exports_java_lang() {
         let shared = create_real_jdk_vm().expect("No JDK found");
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
 
         // Module access from any module to java.lang.Object should succeed
         // because java.base exports java/lang unconditionally
@@ -10944,6 +10832,7 @@ mod tests {
 
         // Try to load java.sql.Connection (interface in java.sql module)
         let result = shared
+            .classes
             .class_manager
             .write()
             .load_class("java/sql/Connection");
@@ -10953,7 +10842,7 @@ mod tests {
         }
         let conn_id = result.expect("result should be Ok");
 
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let conn = cm
             .get_class(conn_id)
             .expect("class should exist in class store");
@@ -11050,7 +10939,7 @@ mod tests {
     #[ignore] // requires real JDK on PATH
     fn s14_opens_infrastructure() {
         let shared = create_real_jdk_vm().expect("No JDK found");
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
 
         // Verify module registry exists and has readability data
         if cm.module_registry.is_empty() {
@@ -11203,6 +11092,7 @@ mod tests {
         };
 
         let string_id = shared
+            .classes
             .class_manager
             .write()
             .load_class("java/lang/String")
@@ -11250,6 +11140,7 @@ mod tests {
 
         // Load and initialize HashMap from real JDK bytecode
         let hm_id = shared
+            .classes
             .class_manager
             .write()
             .load_class("java/util/HashMap")
@@ -11258,7 +11149,7 @@ mod tests {
             .expect("class initialization should succeed");
 
         // Verify HashMap class loaded successfully with real field layout
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let hm_class = cm
             .get_class(hm_id)
             .expect("class should exist in class store");
@@ -11321,6 +11212,7 @@ mod tests {
         };
 
         let string_id = shared
+            .classes
             .class_manager
             .write()
             .load_class("java/lang/String")
@@ -11418,6 +11310,7 @@ mod tests {
             "test",
         );
         let class_id = shared
+            .classes
             .class_manager
             .write()
             .load_class("cratonvm/DeepCallTest")
@@ -11447,6 +11340,7 @@ mod tests {
             "test",
         );
         let class_id = shared
+            .classes
             .class_manager
             .write()
             .load_class("cratonvm/DeepCallTest")
@@ -11480,6 +11374,7 @@ mod tests {
             "test",
         );
         let class_id = shared
+            .classes
             .class_manager
             .write()
             .load_class("cratonvm/DeepCallTest")
@@ -11515,6 +11410,7 @@ mod tests {
             "test",
         );
         let class_id = shared
+            .classes
             .class_manager
             .write()
             .load_class("cratonvm/DeepCallTest")
@@ -11548,6 +11444,7 @@ mod tests {
             "test",
         );
         let class_id = shared
+            .classes
             .class_manager
             .write()
             .load_class("cratonvm/DeepCallTest")
@@ -11859,7 +11756,7 @@ mod tests {
 
         // Load a class so there's class info available
         {
-            let mut cm = shared.class_manager.write();
+            let mut cm = shared.classes.class_manager.write();
             let _ = cm.load_class("java/lang/Object");
         }
 

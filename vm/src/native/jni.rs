@@ -1194,7 +1194,7 @@ fn jni_call_instance(obj: JObject, mid: JMethodID, args: *const JValue) -> Optio
         let obj_class_id = shared.heap.class_id_of(oref);
         let (decl_class_id, method_index) = decode_method_id(mid);
         let (method_name, descriptor) = {
-            let cm = shared.class_manager.read();
+            let cm = shared.classes.class_manager.read();
             let class = cm.class_store.get(decl_class_id)?;
             let method = class.methods.get(method_index as usize)?;
             (method.name.clone(), method.descriptor.clone())
@@ -1239,7 +1239,7 @@ fn jni_call_nonvirtual(
         };
         let (_, method_index) = decode_method_id(mid);
         let (method_name, descriptor) = {
-            let cm = shared.class_manager.read();
+            let cm = shared.classes.class_manager.read();
             let class = cm.class_store.get(dispatch_class_id)?;
             let method = class.methods.get(method_index as usize)?;
             (method.name.clone(), method.descriptor.clone())
@@ -1276,7 +1276,7 @@ fn jni_call_static(clazz: JClass, mid: JMethodID, args: *const JValue) -> Option
             decl_class_id
         };
         let (method_name, descriptor) = {
-            let cm = shared.class_manager.read();
+            let cm = shared.classes.class_manager.read();
             let class = cm.class_store.get(decl_class_id)?;
             let method = class.methods.get(method_index as usize)?;
             (method.name.clone(), method.descriptor.clone())
@@ -1853,7 +1853,7 @@ extern "C" fn jni_get_superclass(_env: JNIEnv, clazz: JClass) -> JClass {
     }
     with_shared_vm(|shared| {
         let class_id = ClassId::new(clazz as u32);
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let class = cm.get_class(class_id)?;
         class.superclass.map(|sc| sc.as_u32() as JClass)
     })
@@ -1872,7 +1872,7 @@ extern "C" fn jni_is_assignable_from(_env: JNIEnv, sub: JClass, sup: JClass) -> 
         if sub_id == sup_id {
             return JNI_TRUE;
         }
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let mut current = sub_id;
         loop {
             let class = match cm.get_class(current) {
@@ -1925,7 +1925,7 @@ extern "C" fn jni_throw_new(_env: JNIEnv, clazz: JClass, msg: *const c_char) -> 
     let result = with_jni_context(|shared, thread| {
         let class_id = ClassId::new(clazz as u32);
         let class_name = {
-            let cm = shared.class_manager.read();
+            let cm = shared.classes.class_manager.read();
             cm.get_class(class_id).map(|class| class.name.to_string())
         };
         let Some(class_name) = class_name else {
@@ -2091,7 +2091,7 @@ extern "C" fn jni_is_instance_of(_env: JNIEnv, obj: JObject, clazz: JClass) -> J
             return Some(JNI_TRUE);
         }
         // Walk superclass chain
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let mut current = obj_class_id;
         loop {
             let class = cm.get_class(current)?;
@@ -2144,8 +2144,9 @@ extern "C" fn jni_get_method_id(
         use cratonvm_classloading::resolution::ResolvedMember;
         let class_id = ClassId::new(clazz as u32);
         let resolved = {
-            let cm = shared.class_manager.read();
+            let cm = shared.classes.class_manager.read();
             shared
+                .classes
                 .link_resolver
                 .resolve_or_compute(class_id, name_str, sig_str, || {
                     let result =
@@ -2600,8 +2601,9 @@ extern "C" fn jni_get_field_id(
         use cratonvm_classloading::resolution::ResolvedMember;
         let class_id = ClassId::new(clazz as u32);
         let resolved = {
-            let cm = shared.class_manager.read();
+            let cm = shared.classes.class_manager.read();
             shared
+                .classes
                 .link_resolver
                 .resolve_or_compute(class_id, name_str, sig_str, || {
                     let result = find_field_recursive(class_id, name_str, &cm.class_store);
@@ -2850,7 +2852,7 @@ extern "C" fn jni_get_static_object_field(
     }
     with_shared_vm(|shared| {
         let (decl_class_id, field_index) = decode_field_id(field_id);
-        let statics = shared.statics.read();
+        let statics = shared.classes.statics.read();
         let fields = statics.get(&decl_class_id)?;
         match fields.get(field_index) {
             Some(Value::Object(Some(r))) => Some(obj_to_jobject(*r)),
@@ -2895,7 +2897,7 @@ extern "C" fn jni_get_static_long_field(_env: JNIEnv, clazz: JClass, field_id: J
     }
     with_shared_vm(|shared| {
         let (decl_class_id, field_index) = decode_field_id(field_id);
-        let statics = shared.statics.read();
+        let statics = shared.classes.statics.read();
         let fields = statics.get(&decl_class_id)?;
         match fields.get(field_index) {
             Some(Value::Long(l)) => Some(*l),
@@ -2917,7 +2919,7 @@ extern "C" fn jni_get_static_float_field(
     }
     with_shared_vm(|shared| {
         let (decl_class_id, field_index) = decode_field_id(field_id);
-        let statics = shared.statics.read();
+        let statics = shared.classes.statics.read();
         let fields = statics.get(&decl_class_id)?;
         match fields.get(field_index) {
             Some(Value::Float(f)) => Some(*f),
@@ -2938,7 +2940,7 @@ extern "C" fn jni_get_static_double_field(
     }
     with_shared_vm(|shared| {
         let (decl_class_id, field_index) = decode_field_id(field_id);
-        let statics = shared.statics.read();
+        let statics = shared.classes.statics.read();
         let fields = statics.get(&decl_class_id)?;
         match fields.get(field_index) {
             Some(Value::Double(d)) => Some(*d),
@@ -2965,7 +2967,7 @@ extern "C" fn jni_set_static_object_field(
             Some(r) => Value::Object(Some(r)),
             None => Value::Object(None),
         };
-        let mut statics = shared.statics.write();
+        let mut statics = shared.classes.statics.write();
         if let Some(fields) = statics.get_mut(&decl_class_id) {
             if field_index < fields.len() {
                 fields[field_index] = value;
@@ -2994,7 +2996,7 @@ extern "C" fn jni_set_static_long_field(
     }
     with_shared_vm(|shared| {
         let (decl_class_id, field_index) = decode_field_id(field_id);
-        let mut statics = shared.statics.write();
+        let mut statics = shared.classes.statics.write();
         if let Some(fields) = statics.get_mut(&decl_class_id) {
             if field_index < fields.len() {
                 fields[field_index] = Value::Long(val);
@@ -3014,7 +3016,7 @@ extern "C" fn jni_set_static_float_field(
     }
     with_shared_vm(|shared| {
         let (decl_class_id, field_index) = decode_field_id(field_id);
-        let mut statics = shared.statics.write();
+        let mut statics = shared.classes.statics.write();
         if let Some(fields) = statics.get_mut(&decl_class_id) {
             if field_index < fields.len() {
                 fields[field_index] = Value::Float(val);
@@ -3034,7 +3036,7 @@ extern "C" fn jni_set_static_double_field(
     }
     with_shared_vm(|shared| {
         let (decl_class_id, field_index) = decode_field_id(field_id);
-        let mut statics = shared.statics.write();
+        let mut statics = shared.classes.statics.write();
         if let Some(fields) = statics.get_mut(&decl_class_id) {
             if field_index < fields.len() {
                 fields[field_index] = Value::Double(val);
@@ -3767,7 +3769,7 @@ extern "C" fn jni_define_class(
         // from the class file's `this_class` entry; use the empty string as a
         // placeholder that `define_class` overrides from the bytes.
         let define_name = class_name.as_deref().unwrap_or("");
-        let mut cm = shared.class_manager.write();
+        let mut cm = shared.classes.class_manager.write();
         let cid = cm
             .define_class(
                 define_name,
@@ -3903,11 +3905,13 @@ extern "C" fn jni_to_reflected_method(
             .load_class_concurrent("java/lang/reflect/Method")
             .unwrap_or_else(|_| {
                 shared
+                    .classes
                     .class_manager
                     .write()
                     .ensure_synthetic_class("java/lang/reflect/Method", 4)
             });
         let num_fields = shared
+            .classes
             .class_manager
             .read()
             .get_class(method_class_id)
@@ -3950,11 +3954,13 @@ extern "C" fn jni_to_reflected_field(
             .load_class_concurrent("java/lang/reflect/Field")
             .unwrap_or_else(|_| {
                 shared
+                    .classes
                     .class_manager
                     .write()
                     .ensure_synthetic_class("java/lang/reflect/Field", 4)
             });
         let num_fields = shared
+            .classes
             .class_manager
             .read()
             .get_class(field_class_id)
@@ -4407,7 +4413,7 @@ fn get_static_int_raw(clazz: JClass, field_id: JFieldID) -> JInt {
     }
     with_shared_vm(|shared| {
         let (decl_class_id, field_index) = decode_field_id(field_id);
-        let statics = shared.statics.read();
+        let statics = shared.classes.statics.read();
         let fields = statics.get(&decl_class_id)?;
         match fields.get(field_index) {
             Some(Value::Int(i)) => Some(*i),
@@ -4424,7 +4430,7 @@ fn set_static_int_raw(field_id: JFieldID, val: JInt) {
     }
     with_shared_vm(|shared| {
         let (decl_class_id, field_index) = decode_field_id(field_id);
-        let mut statics = shared.statics.write();
+        let mut statics = shared.classes.statics.write();
         if let Some(fields) = statics.get_mut(&decl_class_id) {
             if field_index < fields.len() {
                 fields[field_index] = Value::Int(val);
@@ -5189,6 +5195,7 @@ extern "C" fn jni_register_natives(
         let oref = jobject_to_obj(clazz)?;
         let class_id = shared.heap.class_id_of(oref);
         shared
+            .classes
             .class_manager
             .read()
             .get_class(class_id)
@@ -5229,6 +5236,7 @@ extern "C" fn jni_unregister_natives(_env: JNIEnv, clazz: JClass) -> JInt {
         let oref = jobject_to_obj(clazz)?;
         let class_id = shared.heap.class_id_of(oref);
         shared
+            .classes
             .class_manager
             .read()
             .get_class(class_id)
@@ -5239,7 +5247,7 @@ extern "C" fn jni_unregister_natives(_env: JNIEnv, clazz: JClass) -> JInt {
     if let Some(class_name) = class_name {
         // Get all methods for this class and remove their native registrations
         let methods_to_remove: Vec<u64> = with_shared_vm(|shared| {
-            let cm = shared.class_manager.read();
+            let cm = shared.classes.class_manager.read();
             let mut keys = Vec::new();
             // Find the class and iterate its methods
             if let Some(class_id) = cm.find_class_by_name(&class_name) {
@@ -5288,6 +5296,7 @@ extern "C" fn jni_alloc_object(_env: JNIEnv, clazz: JClass) -> JObject {
         // an unresolved/`ClassId(0)` class: a wrongly-classed object whose
         // declared field count is unknown corrupts every later field access.
         let num_fields = match shared
+            .classes
             .class_manager
             .read()
             .get_class(class_id)
@@ -5334,7 +5343,7 @@ extern "C" fn jni_new_object_a(
         let oref = jobject_to_obj(obj_handle)?;
         let (decl_class_id, method_index) = decode_method_id(mid);
         let (method_name, descriptor) = {
-            let cm = shared.class_manager.read();
+            let cm = shared.classes.class_manager.read();
             let class = cm.class_store.get(decl_class_id)?;
             let method = class.methods.get(method_index as usize)?;
             (method.name.clone(), method.descriptor.clone())
@@ -5493,7 +5502,7 @@ fn va_list_to_jvalues(mid: JMethodID, mut va: VaList) -> (*const JValue, usize) 
     // Look up the method descriptor to know argument types.
     let descriptor = with_shared_vm(|shared| {
         let (decl_class_id, method_index) = decode_method_id(mid);
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let class = cm.class_store.get(decl_class_id)?;
         let method = class.methods.get(method_index as usize)?;
         Some(method.descriptor.clone())
@@ -6016,11 +6025,13 @@ extern "C" fn jni_new_direct_byte_buffer(
             .load_class_concurrent("java/nio/DirectByteBuffer")
             .unwrap_or_else(|_| {
                 shared
+                    .classes
                     .class_manager
                     .write()
                     .ensure_synthetic_class("java/nio/DirectByteBuffer", 2)
             });
         let num_fields = shared
+            .classes
             .class_manager
             .read()
             .get_class(dbb_class_id)

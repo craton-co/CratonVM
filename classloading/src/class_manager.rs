@@ -896,7 +896,7 @@ fn fire_resolution_invalidate_hook(class_id: u32) {
 // vtable has already been built) the class loader fires a `VtableInstallHook`
 // that hands a pre-built vec of slot descriptors to the VM. The VM's installed
 // adapter converts each descriptor into a `crate::runtime::vtable::VtableEntry`
-// and stores the whole vec in `shared.vtable_manager` via `install_vtable`.
+// and stores the whole vec in `shared.classes.vtable_manager` via `install_vtable`.
 // The vtable is then queryable by slot in O(1) for the lifetime of the class.
 //
 // The hook delivers OWNED data (moved `Vec`) so the adapter doesn't need to
@@ -1329,7 +1329,7 @@ pub struct ClassManager {
     /// subclasses of the same class as the "parent vtable" when computing
     /// their own layout. The VM's installed `VtableInstallHook` receives a
     /// clone of the owned vec per class and funnels it into
-    /// `shared.vtable_manager.install_vtable(...)`.
+    /// `shared.classes.vtable_manager.install_vtable(...)`.
     ///
     /// Keying on ClassId (not name) keeps the superclass-lookup O(1) even
     /// for classes loaded by many different classloaders.
@@ -1383,7 +1383,7 @@ pub struct ClassManager {
     ///
     /// WP2.4-F1 — wrapped in a `RwLock` so the hot per-thread invoke-cache
     /// populate path can acquire a handle through a `&ClassManager`
-    /// borrow (which is what `shared.class_manager.read()` provides) and
+    /// borrow (which is what `shared.classes.class_manager.read()` provides) and
     /// share the *same* `Arc<AtomicU32>` that `redefine_class` will
     /// later bump.  Without this, populate-time and redefine-time would
     /// hand out two unrelated counters and the cache would never see a

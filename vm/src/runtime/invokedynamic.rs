@@ -118,7 +118,7 @@ pub fn execute_invokedynamic(
     // with every resolver queued behind the writers. The clone is cheap:
     // `ResolvedCallSite`'s strings are `Arc<str>` (refcount bumps).
     let cached_site = {
-        let cache = shared.resolution_cache.read();
+        let cache = shared.classes.resolution_cache.read();
         cache.get_call_site(current_class_id, cp_index).cloned()
     };
     if let Some(site) = cached_site {
@@ -129,7 +129,7 @@ pub fn execute_invokedynamic(
     // Extract all needed data under the class_manager read lock, then drop it.
     // This avoids deadlocking when create_java_string needs a write lock.
     let info = {
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let class = cm
             .get_class(current_class_id)
             .ok_or_else(|| VmError::Internal {
@@ -213,7 +213,7 @@ pub fn execute_invokedynamic(
 
     if std::env::var_os("CRATONVM_DBG_INDY_ALL").is_some() {
         let caller_name = {
-            let cm = shared.class_manager.read();
+            let cm = shared.classes.class_manager.read();
             cm.get_class(current_class_id)
                 .map(|c| c.name.to_string())
                 .unwrap_or_default()
@@ -235,6 +235,7 @@ pub fn execute_invokedynamic(
             target_descriptor: Arc::from(info.target_descriptor.clone()),
         };
         shared
+            .classes
             .resolution_cache
             .write()
             .put_call_site(current_class_id, cp_index, site);
@@ -264,6 +265,7 @@ pub fn execute_invokedynamic(
             target_descriptor: Arc::from(info.target_descriptor.clone()),
         };
         shared
+            .classes
             .resolution_cache
             .write()
             .put_call_site(current_class_id, cp_index, site);
@@ -429,7 +431,7 @@ fn bootstrap_generic(
 ) -> Result<(), MethodCallFailed> {
     // --- Re-resolve the BSM (with descriptor) + static args under the lock. ---
     let (bsm_class, bsm_method, bsm_desc, static_args) = {
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let class = cm
             .get_class(current_class_id)
             .ok_or_else(|| VmError::Internal {
@@ -966,7 +968,7 @@ fn bootstrap_lambda(
     // Parse bootstrap arguments from constant pool
     // We need to re-acquire the class manager lock briefly to resolve the BSM args
     let (sam_erased_desc, impl_handle, instantiated_desc, host_loader) = {
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let class = cm
             .get_class(current_class_id)
             .ok_or_else(|| VmError::Internal {
@@ -1019,6 +1021,7 @@ fn bootstrap_lambda(
     // checks (Spring AOT `ArgumentCodeGenerator.and()` → javapoet
     // `TypeName.equals` getClass() mismatch).
     let functional_interface_id = shared
+        .classes
         .class_manager
         .read()
         .get_loaded_class_id_for_requester(&functional_interface, host_loader);
@@ -1046,7 +1049,7 @@ fn bootstrap_lambda(
 
     // Register the lambda proxy and cache the call site
     let registered = {
-        let mut proxies = shared.lambda_proxies.write();
+        let mut proxies = shared.classes.lambda_proxies.write();
         if proxies.len() < crate::vm::MAX_LAMBDA_PROXIES {
             proxies.insert(proxy_class_id, call_site.clone());
             true
@@ -1060,11 +1063,12 @@ fn bootstrap_lambda(
     // Bounded by the same cap as `lambda_proxies`. bug-06 fam5 #1.
     if registered {
         shared
+            .classes
             .lambda_proxy_hosts
             .write()
             .insert(proxy_class_id, current_class_id);
     }
-    shared.resolution_cache.write().put_call_site(
+    shared.classes.resolution_cache.write().put_call_site(
         current_class_id,
         cp_index,
         ResolvedCallSite::Lambda(call_site),
@@ -1710,6 +1714,7 @@ fn value_to_string(
                     Value::Int(v) => {
                         let class_id = shared.heap.class_id_of(*obj_ref);
                         let name = shared
+                            .classes
                             .class_manager
                             .read()
                             .get_class(class_id)
@@ -1767,6 +1772,7 @@ fn value_to_string(
                     .class_id_by_name("java/nio/file/Path")
                     .is_some_and(|path_cid| {
                         shared
+                            .classes
                             .class_manager
                             .read()
                             .is_subclass_of(obj_class_id, path_cid)
@@ -1796,6 +1802,7 @@ fn value_to_string(
             } else {
                 let class_id = shared.heap.class_id_of(*obj_ref);
                 shared
+                    .classes
                     .class_manager
                     .read()
                     .get_class(class_id)
@@ -1845,7 +1852,7 @@ fn bootstrap_type_switch(
 
     // Phase 1: extract label names from constant pool (read lock only).
     let raw_labels: Vec<RawSwitchLabel> = {
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let class = cm
             .get_class(current_class_id)
             .ok_or_else(|| VmError::Internal {
@@ -1940,6 +1947,7 @@ fn bootstrap_type_switch(
         labels: labels.clone(),
     };
     shared
+        .classes
         .resolution_cache
         .write()
         .put_call_site(current_class_id, cp_index, site);
@@ -1986,6 +1994,7 @@ pub fn execute_type_switch(
             let obj_class_id = shared.heap.class_id_of(obj_ref);
             // Read the object's class name once for boxed-type matching.
             let obj_class_name = shared
+                .classes
                 .class_manager
                 .read()
                 .get_class(obj_class_id)
@@ -2043,6 +2052,7 @@ fn type_switch_match(
                 // A Long does NOT match `case Integer i` — only exact type or
                 // supertype matches are valid.
                 shared
+                    .classes
                     .class_manager
                     .read()
                     .is_subclass_of(obj_class_id, *class_id)
@@ -2312,7 +2322,7 @@ fn bootstrap_record_object_method(
 
     // Parse component names and field descriptors from bootstrap arguments.
     let (component_names, field_indices, field_descriptors) = {
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let class = cm
             .get_class(current_class_id)
             .ok_or_else(|| VmError::Internal {
@@ -2359,7 +2369,7 @@ fn bootstrap_record_object_method(
         // Determine the field indices for each component.
         let field_indices: Vec<usize> = if let Some(ref rec_name) = record_class_name {
             let rec_cid = shared.load_class_concurrent(rec_name)?;
-            let cm = shared.class_manager.read();
+            let cm = shared.classes.class_manager.read();
             if let Some(rec_class) = cm.get_class(rec_cid) {
                 let first_field = rec_class.first_field_index;
                 (0..component_names.len())
@@ -2383,6 +2393,7 @@ fn bootstrap_record_object_method(
         field_descriptors: field_descriptors.clone(),
     };
     shared
+        .classes
         .resolution_cache
         .write()
         .put_call_site(current_class_id, cp_index, site);
@@ -2529,6 +2540,7 @@ fn execute_record_object_method(
                 Value::Object(Some(obj)) => {
                     let cid = shared.heap.class_id_of(obj);
                     let class_name = shared
+                        .classes
                         .class_manager
                         .read()
                         .get_class(cid)
@@ -2611,6 +2623,7 @@ fn values_equal_deep(
             let x_cid = ctx.shared.heap.class_id_of(*x);
             let x_name = ctx
                 .shared
+                .classes
                 .class_manager
                 .read()
                 .get_class(x_cid)
@@ -2643,6 +2656,7 @@ fn value_hash_deep(ctx: &mut NativeContextImpl<'_>, v: &Value) -> Result<i32, Me
             let cid = ctx.shared.heap.class_id_of(*obj);
             let name = ctx
                 .shared
+                .classes
                 .class_manager
                 .read()
                 .get_class(cid)
@@ -2710,6 +2724,7 @@ fn values_equal(shared: &SharedVm, a: &Value, b: &Value) -> bool {
             // For String objects, compare by content
             let x_cid = shared.heap.class_id_of(*x);
             let x_name = shared
+                .classes
                 .class_manager
                 .read()
                 .get_class(x_cid)
@@ -2740,6 +2755,7 @@ fn value_hash(shared: &SharedVm, v: &Value) -> i32 {
             // For strings, hash the content
             let cid = shared.heap.class_id_of(*obj);
             let name = shared
+                .classes
                 .class_manager
                 .read()
                 .get_class(cid)
@@ -2805,7 +2821,7 @@ fn bootstrap_enum_switch(
 
     // Resolve bootstrap arguments — all are string constants (enum constant names).
     let labels = {
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let class = cm
             .get_class(current_class_id)
             .ok_or_else(|| VmError::Internal {
@@ -2825,6 +2841,7 @@ fn bootstrap_enum_switch(
         labels: labels.clone(),
     };
     shared
+        .classes
         .resolution_cache
         .write()
         .put_call_site(current_class_id, cp_index, site);

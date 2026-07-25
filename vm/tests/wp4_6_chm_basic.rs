@@ -123,6 +123,7 @@ fn describe_result(vm: &Vm, result: &MethodCallResult) -> String {
             let class_id = vm.shared.heap.class_id_of(*exc);
             let class_name = vm
                 .shared
+                .classes
                 .class_manager
                 .read()
                 .get_class(class_id)

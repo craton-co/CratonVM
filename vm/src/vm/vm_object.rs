@@ -3,11 +3,11 @@
 
 //! Object helpers: Java String interning, Class mirrors, static field access.
 
-use std::cell::Cell;
 use crate::classloading::ClassId;
 use crate::memory::heap::ArrayElementType;
 use crate::memory::vm_heap::VmHeap;
 use crate::types::{ObjectRef, Value};
+use std::cell::Cell;
 
 use super::SharedVm;
 
@@ -99,27 +99,47 @@ pub fn create_java_string_uninterned_gc_safe_threaded(
     thread: &mut crate::threading::jvm_thread::JvmThread,
     text: &str,
 ) -> ObjectRef {
-    if shared.compact_strings.load(std::sync::atomic::Ordering::Relaxed) && text.is_ascii() {
+    if shared
+        .classes
+        .compact_strings
+        .load(std::sync::atomic::Ordering::Relaxed)
+        && text.is_ascii()
+    {
         let (class_id, fields) = java_string_allocation_layout(shared);
         use cratonvm_gc::heap::{HEADER_SIZE, SLOT_SIZE};
         let object_size = HEADER_SIZE + fields.saturating_mul(SLOT_SIZE);
         let str_obj = crate::runtime::interpreter::tlab_alloc_object(
-            thread, shared, class_id, fields, object_size,
+            thread,
+            shared,
+            class_id,
+            fields,
+            object_size,
         )
         .or_else(|| shared.heap.try_alloc_object_full(class_id, fields))
         .unwrap_or_else(|| alloc_java_string_object(shared, text));
-        let byte_array = crate::runtime::interpreter::tlab_alloc_byte_array(thread, shared, text.len())
-            .or_else(|| shared.heap.try_alloc_array_full(ClassId::new(0), ArrayElementType::Byte, text.len()))
-            .unwrap_or_else(|| return alloc_java_string_object(shared, text));
+        let byte_array =
+            crate::runtime::interpreter::tlab_alloc_byte_array(thread, shared, text.len())
+                .or_else(|| {
+                    shared.heap.try_alloc_array_full(
+                        ClassId::new(0),
+                        ArrayElementType::Byte,
+                        text.len(),
+                    )
+                })
+                .unwrap_or_else(|| return alloc_java_string_object(shared, text));
         if let Some(base) = shared.heap.array_data_ptr(byte_array) {
             // SAFETY: the fresh byte array has exactly `text.len()` elements.
             unsafe { std::ptr::copy_nonoverlapping(text.as_ptr(), base, text.len()) };
         } else {
             for (index, byte) in text.bytes().enumerate() {
-                let _ = shared.heap.set_array_element(byte_array, index, Value::Int(byte as i32));
+                let _ = shared
+                    .heap
+                    .set_array_element(byte_array, index, Value::Int(byte as i32));
             }
         }
-        shared.heap.set_field(str_obj, 0, Value::Object(Some(byte_array)));
+        shared
+            .heap
+            .set_field(str_obj, 0, Value::Object(Some(byte_array)));
         shared.heap.set_field(str_obj, 1, Value::Int(CODER_LATIN1));
         shared.heap.set_field(str_obj, 2, Value::Int(0));
         shared.heap.set_field(str_obj, 3, Value::Int(0));
@@ -151,6 +171,7 @@ pub fn try_create_java_string_from_units(shared: &SharedVm, units: &[u16]) -> Op
 /// Performs no pool lookup or insertion — callers decide pooling policy.
 fn alloc_java_string_object(shared: &SharedVm, text: &str) -> ObjectRef {
     if shared
+        .classes
         .compact_strings
         .load(std::sync::atomic::Ordering::Relaxed)
         && text.is_ascii()
@@ -205,6 +226,7 @@ fn java_string_allocation_layout(shared: &SharedVm) -> (ClassId, usize) {
     // restoring full parallelism. The write lock is reserved for the genuine
     // cache-miss / first-resolution path below.
     let cached = shared
+        .classes
         .cached_string_num_fields
         .load(std::sync::atomic::Ordering::Relaxed);
     // Every dynamic compact String reaches this function. After first
@@ -226,6 +248,7 @@ fn java_string_allocation_layout(shared: &SharedVm) -> (ClassId, usize) {
             }
             _ => {
                 let resolved = shared
+                    .classes
                     .class_manager
                     .read()
                     .get_loaded_class_id("java/lang/String")
@@ -244,7 +267,7 @@ fn java_string_allocation_layout(shared: &SharedVm) -> (ClassId, usize) {
         None => {
             // Slow path: first resolution (or read-probe miss). Take the write
             // lock to load the class and compute + cache the field count.
-            let mut cm = shared.class_manager.write();
+            let mut cm = shared.classes.class_manager.write();
             let id = cm.load_class("java/lang/String").unwrap_or(ClassId::new(0));
             let count = if cached != 0 {
                 cached
@@ -266,6 +289,7 @@ fn java_string_allocation_layout(shared: &SharedVm) -> (ClassId, usize) {
                 // Safety net: never allocate zero fields
                 let c = if c == 0 { STRING_NUM_FIELDS_DEFAULT } else { c };
                 shared
+                    .classes
                     .cached_string_num_fields
                     .store(c, std::sync::atomic::Ordering::Relaxed);
                 c
@@ -284,6 +308,7 @@ fn java_string_allocation_layout(shared: &SharedVm) -> (ClassId, usize) {
 fn try_alloc_java_string_object_from_ascii(shared: &SharedVm, ascii: &[u8]) -> Option<ObjectRef> {
     debug_assert!(ascii.is_ascii());
     debug_assert!(shared
+        .classes
         .compact_strings
         .load(std::sync::atomic::Ordering::Relaxed));
     let (string_class_id, field_count) = java_string_allocation_layout(shared);
@@ -365,6 +390,7 @@ fn try_alloc_java_string_object_from_units(shared: &SharedVm, units: &[u16]) -> 
 /// string-creation call sites that use the aborting `alloc_*` wrappers.
 pub fn populate_java_string_fields(shared: &SharedVm, str_obj: ObjectRef, units: &[u16]) -> bool {
     let compact = shared
+        .classes
         .compact_strings
         .load(std::sync::atomic::Ordering::Relaxed);
 
@@ -658,10 +684,15 @@ fn read_java_string_inner(
 const CLASS_MIRROR_NUM_FIELDS: usize = 2;
 
 /// Look up the ClassId backing a java.lang.Class mirror via the reverse
-/// map in `SharedVm.class_mirrors_reverse`.  Returns `None` for primitive
+/// map in `SharedVm.classes.class_mirrors_reverse`.  Returns `None` for primitive
 /// mirrors and for non-mirror objects.
 pub fn class_id_from_mirror(shared: &SharedVm, mirror: ObjectRef) -> Option<ClassId> {
-    shared.class_mirrors_reverse.read().get(&mirror).copied()
+    shared
+        .classes
+        .class_mirrors_reverse
+        .read()
+        .get(&mirror)
+        .copied()
 }
 
 /// Absolute heap-slot indices of the `java/lang/Class` instance fields that
@@ -771,7 +802,7 @@ fn dbg_toarray_enabled() -> bool {
 
 /// Get or create a java.lang.Class mirror object for the given ClassId.
 ///
-/// Class mirrors are cached in `SharedVm.class_mirrors` to ensure identity:
+/// Class mirrors are cached in `SharedVm.classes.class_mirrors` to ensure identity:
 /// `a.getClass() == a.getClass()` is always true.
 ///
 /// Layout: the mirror is sized to the real `java/lang/Class` class
@@ -783,8 +814,8 @@ fn dbg_toarray_enabled() -> bool {
 /// [`resolve_class_mirror_slots`]) so the mirror stays correct regardless of the
 /// JDK's private field order.
 ///
-/// The class_id ↔ mirror mapping is maintained by `SharedVm.class_mirrors`
-/// (forward) and `SharedVm.class_mirrors_reverse` (reverse), which lets
+/// The class_id ↔ mirror mapping is maintained by `SharedVm.classes.class_mirrors`
+/// (forward) and `SharedVm.classes.class_mirrors_reverse` (reverse), which lets
 /// `mirror_class_id` recover the ClassId without encoding it in the mirror's
 /// Java-visible fields.
 pub fn get_or_create_class_mirror(shared: &SharedVm, class_id: ClassId) -> ObjectRef {
@@ -795,6 +826,7 @@ pub fn get_or_create_class_mirror(shared: &SharedVm, class_id: ClassId) -> Objec
     // process lifetime).
     if dbg_toarray_enabled() {
         let nm = shared
+            .classes
             .class_manager
             .read()
             .get_class(class_id)
@@ -805,12 +837,12 @@ pub fn get_or_create_class_mirror(shared: &SharedVm, class_id: ClassId) -> Objec
         );
     }
     // Fast path: check cache
-    if let Some(&mirror) = shared.class_mirrors.read().get(&class_id) {
+    if let Some(&mirror) = shared.classes.class_mirrors.read().get(&class_id) {
         return mirror;
     }
 
     // Slow path: create new mirror
-    let mut mirrors = shared.class_mirrors.write();
+    let mut mirrors = shared.classes.class_mirrors.write();
     // Double-check after acquiring write lock
     if let Some(&mirror) = mirrors.get(&class_id) {
         return mirror;
@@ -818,10 +850,11 @@ pub fn get_or_create_class_mirror(shared: &SharedVm, class_id: ClassId) -> Objec
 
     // Load java/lang/Class and resolve field count (cached after first call).
     let cached = shared
+        .classes
         .cached_class_mirror_num_fields
         .load(std::sync::atomic::Ordering::Relaxed);
     let (class_class_id, mirror_field_count) = {
-        let mut cm = shared.class_manager.write();
+        let mut cm = shared.classes.class_manager.write();
         let id = cm.load_class("java/lang/Class").unwrap_or(ClassId::new(0));
         let count = if cached != 0 {
             cached
@@ -838,6 +871,7 @@ pub fn get_or_create_class_mirror(shared: &SharedVm, class_id: ClassId) -> Objec
                 .unwrap_or(CLASS_MIRROR_NUM_FIELDS);
             let c = if c == 0 { CLASS_MIRROR_NUM_FIELDS } else { c };
             shared
+                .classes
                 .cached_class_mirror_num_fields
                 .store(c, std::sync::atomic::Ordering::Relaxed);
             c
@@ -857,7 +891,7 @@ pub fn get_or_create_class_mirror(shared: &SharedVm, class_id: ClassId) -> Objec
     // value differs from that default — and only when the field is present in
     // the loaded layout (synthetic stubs resolve nothing).
     let (class_name, access_flags, slots) = {
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let name = cm
             .get_class(class_id)
             .map(|c| c.name.to_string())
@@ -931,6 +965,7 @@ pub fn get_or_create_class_mirror(shared: &SharedVm, class_id: ClassId) -> Objec
     mirrors.insert(class_id, mirror);
     // Reverse map for mirror_class_id (`class_id_from_mirror`).
     shared
+        .classes
         .class_mirrors_reverse
         .write()
         .insert(mirror, class_id);
@@ -953,6 +988,7 @@ pub fn get_or_create_class_mirror(shared: &SharedVm, class_id: ClassId) -> Objec
     {
         if std::env::var_os("CRATONVM_DBG_MIRRORPIN").is_some() {
             let name = shared
+                .classes
                 .class_manager
                 .read()
                 .get_class(class_id)
@@ -983,12 +1019,12 @@ pub fn get_or_create_primitive_mirror(shared: &SharedVm, prim_name: &str) -> Obj
     let prim_name = canonical_primitive_mirror_name(prim_name);
 
     // Fast path: check cache
-    if let Some(&mirror) = shared.primitive_mirrors.read().get(prim_name) {
+    if let Some(&mirror) = shared.classes.primitive_mirrors.read().get(prim_name) {
         return mirror;
     }
 
     // Slow path
-    let mut mirrors = shared.primitive_mirrors.write();
+    let mut mirrors = shared.classes.primitive_mirrors.write();
     if let Some(&mirror) = mirrors.get(prim_name) {
         return mirror;
     }
@@ -998,10 +1034,11 @@ pub fn get_or_create_primitive_mirror(shared: &SharedVm, prim_name: &str) -> Obj
     // allocated with the correct number of fields when running against
     // real JDK classes. Falls back to CLASS_MIRROR_NUM_FIELDS for synthetic mode.
     let cached = shared
+        .classes
         .cached_class_mirror_num_fields
         .load(std::sync::atomic::Ordering::Relaxed);
     let (class_class_id, mirror_field_count) = {
-        let mut cm = shared.class_manager.write();
+        let mut cm = shared.classes.class_manager.write();
         let id = cm.load_class("java/lang/Class").unwrap_or(ClassId::new(0));
         let count = if cached != 0 {
             cached
@@ -1018,6 +1055,7 @@ pub fn get_or_create_primitive_mirror(shared: &SharedVm, prim_name: &str) -> Obj
                 .unwrap_or(CLASS_MIRROR_NUM_FIELDS);
             let c = if c == 0 { CLASS_MIRROR_NUM_FIELDS } else { c };
             shared
+                .classes
                 .cached_class_mirror_num_fields
                 .store(c, std::sync::atomic::Ordering::Relaxed);
             c
@@ -1030,7 +1068,7 @@ pub fn get_or_create_primitive_mirror(shared: &SharedVm, prim_name: &str) -> Obj
     // Resolve the writable `java/lang/Class` mirror slots by name (see
     // `get_or_create_class_mirror` for why this is layout-independent).
     let slots = {
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         cm.get_class(class_class_id)
             .map(|c| resolve_class_mirror_slots(c, mirror_field_count))
             .unwrap_or_default()
@@ -1082,6 +1120,7 @@ fn canonical_primitive_mirror_name(name: &str) -> &str {
 /// Get a static field value from the shared state.
 pub fn get_static_shared(shared: &SharedVm, class_id: ClassId, field_index: usize) -> Value {
     shared
+        .classes
         .statics
         .read()
         .get(&class_id)
@@ -1092,12 +1131,13 @@ pub fn get_static_shared(shared: &SharedVm, class_id: ClassId, field_index: usiz
 
 /// Set a static field value in the shared state.
 pub fn set_static_shared(shared: &SharedVm, class_id: ClassId, field_index: usize, value: Value) {
-    let mut statics = shared.statics.write();
+    let mut statics = shared.classes.statics.write();
     let fields = statics.entry(class_id).or_insert_with(|| {
         // Reading class_manager while holding statics write is fine because
         // class_manager read is non-exclusive, and no code path holds
         // class_manager write while trying to acquire statics.
         let num_fields = shared
+            .classes
             .class_manager
             .read()
             .get_class(class_id)
@@ -1143,10 +1183,10 @@ pub fn set_static_shared(shared: &SharedVm, class_id: ClassId, field_index: usiz
 ///   - LATIN1 = 0 (field "LATIN1")
 ///   - UTF16 = 1 (field "UTF16")
 ///
-/// Also sets `SharedVm.compact_strings` flag so `create_java_string` and
+/// Also sets `SharedVm.classes.compact_strings` flag so `create_java_string` and
 /// `read_java_string` use the correct layout.
 pub fn pre_init_string_statics(shared: &SharedVm) {
-    let cm = shared.class_manager.read();
+    let cm = shared.classes.class_manager.read();
     let string_id = match cm.get_loaded_class_id("java/lang/String") {
         Some(id) => id,
         None => return, // String not loaded yet
@@ -1192,6 +1232,7 @@ pub fn pre_init_string_statics(shared: &SharedVm) {
 
     // Enable compact string mode in the VM
     shared
+        .classes
         .compact_strings
         .store(true, std::sync::atomic::Ordering::Relaxed);
     tracing::info!(
@@ -1206,7 +1247,7 @@ pub fn pre_init_string_statics(shared: &SharedVm) {
 /// static fields, we pre-set:
 ///   - EMPTY_CLASS_ARRAY = new Class[0] (so Class.getInterfaces() etc. work)
 pub fn pre_init_class_statics(shared: &SharedVm) {
-    let cm = shared.class_manager.read();
+    let cm = shared.classes.class_manager.read();
     let class_id = match cm.get_loaded_class_id("java/lang/Class") {
         Some(id) => id,
         None => return,
@@ -1290,7 +1331,7 @@ fn wrapper_type_static_index(class: &crate::classloading::Class) -> Option<usize
 /// This helper repairs that already-initialized path and is idempotent.
 pub fn pre_init_wrapper_type_field_for_class(shared: &SharedVm, class_id: ClassId) -> bool {
     let (type_idx, prim_name) = {
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let Some(cls) = cm.get_class(class_id) else {
             return false;
         };
@@ -1317,7 +1358,7 @@ pub fn pre_init_wrapper_type_field_for_class(shared: &SharedVm, class_id: ClassI
 
 pub fn pre_init_wrapper_type_fields(shared: &SharedVm) {
     let class_ids: Vec<ClassId> = {
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         [
             "java/lang/Integer",
             "java/lang/Long",
@@ -1422,7 +1463,7 @@ pub fn validate_native_coverage(shared: &SharedVm) -> NativeCoverageReport {
     let mut covered = Vec::new();
     let mut missing = Vec::new();
 
-    let cm = shared.class_manager.read();
+    let cm = shared.classes.class_manager.read();
     // Iterate over all loaded classes in the ClassStore
     for class_id_u32 in 0..cm.class_store.len() as u32 {
         let class_id = ClassId::new(class_id_u32);
@@ -1462,7 +1503,7 @@ pub fn validate_native_coverage(shared: &SharedVm) -> NativeCoverageReport {
 
 /// Scan a single class for its ACC_NATIVE methods.
 pub fn scan_class_natives(shared: &SharedVm, class_name: &str) -> Vec<NativeMethodInfo> {
-    let cm = shared.class_manager.read();
+    let cm = shared.classes.class_manager.read();
     let class_id = match cm.get_loaded_class_id(class_name) {
         Some(id) => id,
         None => return Vec::new(),
@@ -1625,11 +1666,13 @@ mod tests {
         let shared = test_shared();
         // Enable compact string mode
         shared
+            .classes
             .compact_strings
             .store(true, std::sync::atomic::Ordering::Relaxed);
         // Reset cached field count so it re-resolves (synthetic stub → 2 fields,
         // but we need 4 for compact layout). Manually set to 4.
         shared
+            .classes
             .cached_string_num_fields
             .store(4, std::sync::atomic::Ordering::Relaxed);
 
@@ -1642,9 +1685,11 @@ mod tests {
     fn compact_string_utf16_roundtrip() {
         let shared = test_shared();
         shared
+            .classes
             .compact_strings
             .store(true, std::sync::atomic::Ordering::Relaxed);
         shared
+            .classes
             .cached_string_num_fields
             .store(4, std::sync::atomic::Ordering::Relaxed);
 
@@ -1657,9 +1702,11 @@ mod tests {
     fn compact_string_empty_roundtrip() {
         let shared = test_shared();
         shared
+            .classes
             .compact_strings
             .store(true, std::sync::atomic::Ordering::Relaxed);
         shared
+            .classes
             .cached_string_num_fields
             .store(4, std::sync::atomic::Ordering::Relaxed);
 
@@ -1672,9 +1719,11 @@ mod tests {
     fn compact_string_latin1_boundary() {
         let shared = test_shared();
         shared
+            .classes
             .compact_strings
             .store(true, std::sync::atomic::Ordering::Relaxed);
         shared
+            .classes
             .cached_string_num_fields
             .store(4, std::sync::atomic::Ordering::Relaxed);
 
@@ -1688,9 +1737,11 @@ mod tests {
     fn compact_string_beyond_latin1() {
         let shared = test_shared();
         shared
+            .classes
             .compact_strings
             .store(true, std::sync::atomic::Ordering::Relaxed);
         shared
+            .classes
             .cached_string_num_fields
             .store(4, std::sync::atomic::Ordering::Relaxed);
 
@@ -1704,9 +1755,11 @@ mod tests {
     fn compact_string_pool_deduplicates() {
         let shared = test_shared();
         shared
+            .classes
             .compact_strings
             .store(true, std::sync::atomic::Ordering::Relaxed);
         shared
+            .classes
             .cached_string_num_fields
             .store(4, std::sync::atomic::Ordering::Relaxed);
 
@@ -1719,9 +1772,11 @@ mod tests {
     fn compact_ascii_uninterned_strings_are_fresh_and_roundtrip() {
         let shared = test_shared();
         shared
+            .classes
             .compact_strings
             .store(true, std::sync::atomic::Ordering::Relaxed);
         shared
+            .classes
             .cached_string_num_fields
             .store(4, std::sync::atomic::Ordering::Relaxed);
 
@@ -1835,7 +1890,12 @@ mod tests {
         // Field 0 still stores Int(class_id) for legacy compatibility.
         assert_eq!(shared.heap.get_field(mirror, 0), Value::Int(42));
         // But class_id is also recoverable via the reverse map.
-        let recovered = shared.class_mirrors_reverse.read().get(&mirror).copied();
+        let recovered = shared
+            .classes
+            .class_mirrors_reverse
+            .read()
+            .get(&mirror)
+            .copied();
         assert_eq!(recovered, Some(class_id));
     }
 

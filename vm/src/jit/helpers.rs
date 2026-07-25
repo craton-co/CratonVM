@@ -1375,7 +1375,7 @@ unsafe fn virtual_dispatch_target_for_receiver(
         };
     }
 
-    let cm = vm.class_manager.read();
+    let cm = vm.classes.class_manager.read();
     let Some(recv_class) = cm.get_class(cid) else {
         return VirtualDispatchTarget {
             class_name: std::sync::Arc::from(info.class_name),
@@ -1431,7 +1431,7 @@ unsafe fn virtual_dispatch_class(
 /// SAFETY: `vm` must be a live `SharedVm`; `info` must point to a valid
 /// `JitInvokeInfo` whose name fields are live `&str`s.
 unsafe fn callee_has_exception_table(vm: &SharedVm, info: &JitInvokeInfo) -> bool {
-    let cm = vm.class_manager.read();
+    let cm = vm.classes.class_manager.read();
     let Some(class_id) = cm.find_class_by_name(info.class_name) else {
         return false;
     };
@@ -1462,7 +1462,7 @@ unsafe fn mic_callee_has_exception_table(
     receiver_class_id: ClassId,
     info: &JitInvokeInfo,
 ) -> bool {
-    let cm = vm.class_manager.read();
+    let cm = vm.classes.class_manager.read();
     let store = cm.class_store();
     let Some((method, _decl)) = crate::classloading::find_method_recursive(
         receiver_class_id,
@@ -1627,6 +1627,7 @@ pub(crate) fn compiled_entry_has_indy_trap(
     // globally by name preserves this helper's existing, not loader-aware,
     // behavior rather than threading a `ClassId` through its 3 call sites.
     let class_id = vm
+        .classes
         .class_manager
         .read()
         .get_loaded_class_id(class_name)
@@ -1694,7 +1695,7 @@ unsafe fn try_resume_trapped_callee(
     // Resolve the trapping method from ITS OWN declaring class (baked in the
     // key) — mirrors the `callee_compiler` resolution recipe.
     let cached = {
-        let cm = vm.class_manager.read();
+        let cm = vm.classes.class_manager.read();
         let class_id = cm.find_class_by_name(key_class)?;
         let store = cm.class_store();
         let (method, declaring_id) =
@@ -2590,7 +2591,7 @@ fn jit_post_alloc_init(vm: &SharedVm, obj: ObjectRef, class_id: ClassId) {
                 // complete recipe — bail to the legacy path if any class in
                 // the hierarchy is missing from the store.
                 let recipe = {
-                    let cm = vm.class_manager.read();
+                    let cm = vm.classes.class_manager.read();
                     let store = &cm.class_store;
                     store.get(class_id).and_then(|root| {
                         let has_finalizer = root.has_finalizer;
@@ -2655,6 +2656,7 @@ fn jit_post_alloc_init(vm: &SharedVm, obj: ObjectRef, class_id: ClassId) {
     // Legacy fallback: per-allocation class-manager lookups.
     jit_init_primitive_fields(vm, obj, class_id);
     let has_fin = vm
+        .classes
         .class_manager
         .read()
         .class_store
@@ -2667,7 +2669,7 @@ fn jit_post_alloc_init(vm: &SharedVm, obj: ObjectRef, class_id: ClassId) {
 
 /// Initialize primitive-typed fields of a newly allocated object (JIT version).
 fn jit_init_primitive_fields(vm: &SharedVm, obj: ObjectRef, class_id: ClassId) {
-    let cm = vm.class_manager.read();
+    let cm = vm.classes.class_manager.read();
     let store = &cm.class_store;
     let mut cid = Some(class_id);
     while let Some(current_id) = cid {
@@ -3082,6 +3084,7 @@ pub unsafe extern "C" fn jit_aastore(vm_ptr: i64, array_ptr: i64, index: i64, va
             // corrupting VM state (degrades to the pre-fix behaviour only in
             // that rare construction-failure case).
             let elem_cls = vm
+                .classes
                 .class_manager
                 .read()
                 .get_class(vm.heap.class_id_of(value_ref))
@@ -3840,15 +3843,20 @@ pub unsafe extern "C" fn jit_getstatic(vm_ptr: i64, class_id_raw: i64, field_ind
     // pre-built synthetic streams for these three fields. The JIT must do the same,
     // or jit_getstatic falls through to get_static_shared → Object(None) → null
     // receiver → println silently no-ops (arg0=0x0 in jit_invoke_dispatch).
-    let field_name = vm.class_manager.read().get_class(class_id).and_then(|c| {
-        if &*c.name == "java/lang/System" {
-            c.fields
-                .get(field_index as usize)
-                .map(|f| f.name.to_string())
-        } else {
-            None
-        }
-    });
+    let field_name = vm
+        .classes
+        .class_manager
+        .read()
+        .get_class(class_id)
+        .and_then(|c| {
+            if &*c.name == "java/lang/System" {
+                c.fields
+                    .get(field_index as usize)
+                    .map(|f| f.name.to_string())
+            } else {
+                None
+            }
+        });
     if let Some(ref fname) = field_name {
         if fname == "out" || fname == "err" {
             // Honor System.setOut/setErr: if the static field was explicitly set
@@ -4223,7 +4231,11 @@ unsafe fn jit_typecheck_resolve(
     let target_class_id_opt = if cached_target.is_some() {
         cached_target
     } else {
-        let resolved = vm.class_manager.read().find_class_by_name(class_name);
+        let resolved = vm
+            .classes
+            .class_manager
+            .read()
+            .find_class_by_name(class_name);
         if let Some(target) = resolved {
             JIT_TYPECHECK_TARGET_CACHE.with(|cache| {
                 cache.set(Some((
@@ -4241,6 +4253,7 @@ unsafe fn jit_typecheck_resolve(
             return true;
         }
         let is_subclass = vm
+            .classes
             .class_manager
             .read()
             .is_subclass_of(obj_class_id, target_class_id);
@@ -4318,6 +4331,7 @@ unsafe fn jit_typecheck_resolve(
                 return true;
             }
             let is_subclass = vm
+                .classes
                 .class_manager
                 .read()
                 .is_subclass_of(obj_class_id, target_class_id);
@@ -4348,6 +4362,7 @@ unsafe fn jit_typecheck_resolve(
     // the accepted `is_subclass_of_by_name` tradeoff used for exception
     // catch_type resolution.
     if vm
+        .classes
         .class_manager
         .read()
         .is_assignable_to_name(obj_class_id, class_name)
@@ -4481,7 +4496,7 @@ pub unsafe extern "C" fn jit_checkcast(
         obj_ref.as_ptr() as i64
     } else {
         if cv_trace_enabled() {
-            let cm = vm.class_manager.read();
+            let cm = vm.classes.class_manager.read();
             let obj_cls_name = cm
                 .get_class(obj_class_id)
                 .map(|c| c.name.to_string())
@@ -4510,6 +4525,7 @@ pub unsafe extern "C" fn jit_checkcast(
         // failures.
         if let Some((thread, _jit_thread_guard)) = jit_thread_mut() {
             let obj_cls_name = vm
+                .classes
                 .class_manager
                 .read()
                 .get_class(obj_class_id)
@@ -4936,7 +4952,8 @@ fn raise_jit_stack_overflow(vm: &SharedVm) -> i64 {
 #[cold]
 fn throwable_class_name(vm: &SharedVm, obj: ObjectRef) -> Option<String> {
     let cid = vm.heap.class_id_of(obj);
-    vm.class_manager
+    vm.classes
+        .class_manager
         .read()
         .get_class(cid)
         .map(|c| c.name.to_string())
@@ -4946,7 +4963,7 @@ fn throwable_class_name(vm: &SharedVm, obj: ObjectRef) -> Option<String> {
 fn throwable_detail_message(vm: &SharedVm, obj: ObjectRef) -> Option<String> {
     let cid = vm.heap.class_id_of(obj);
     let msg_ref = {
-        let cm = vm.class_manager.read();
+        let cm = vm.classes.class_manager.read();
         let idx =
             crate::vm::resolve_field_index_in_hierarchy(cid, "detailMessage", &cm.class_store)?;
         match vm.heap.get_field(obj, idx) {
@@ -5459,6 +5476,7 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
             let target = virtual_dispatch_target_for_receiver(vm, receiver, info);
             let globally_named = target.cacheable_receiver
                 && vm
+                    .classes
                     .class_manager
                     .read()
                     .get_loaded_class_id(&target.class_name)
@@ -5598,6 +5616,7 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
         // see `JitKey::declaring_class_id`'s doc comment for the interpreter-
         // side fix this mirrors.
         let info_class_id = vm
+            .classes
             .class_manager
             .read()
             .get_loaded_class_id(info.class_name)
@@ -5752,7 +5771,7 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
                         ObjectNativeKind::StringBuilder => "java/lang/StringBuilder",
                     };
                     let is_exact_receiver = {
-                        let classes = vm.class_manager.read();
+                        let classes = vm.classes.class_manager.read();
                         classes
                             .get_class(ClassId::new(receiver_class_id))
                             .map(|class| class.name.as_ref() == expected_class)
@@ -5793,7 +5812,12 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
     if matches!(info.invoke_kind, 0 | 2) && args_slice.len() == 2 {
         if let Some(proxy) = vm.heap.is_object_address(args_slice[0] as usize) {
             let proxy_class_id = vm.heap.class_id_of(proxy);
-            if vm.lambda_proxies.read().contains_key(&proxy_class_id) {
+            if vm
+                .classes
+                .lambda_proxies
+                .read()
+                .contains_key(&proxy_class_id)
+            {
                 match try_fast_lambda_int_to_double_apply(
                     vm,
                     thread,
@@ -5875,7 +5899,7 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
                     if !info.class_name.is_empty() {
                         let recv_cid = vm.heap.class_id_of(receiver_ref);
                         let recv_name_opt = {
-                            let cm = vm.class_manager.read();
+                            let cm = vm.classes.class_manager.read();
                             cm.get_class(recv_cid).map(|c| c.name.to_string())
                         };
                         let cp_differs = recv_name_opt
@@ -6076,6 +6100,7 @@ pub unsafe extern "C" fn jit_integer_value_of_direct(vm_ptr: i64, value: i64) ->
                         }
                     }
                     let resolved = vm
+                        .classes
                         .class_manager
                         .read()
                         .get_class(class_id)
@@ -6288,6 +6313,7 @@ unsafe fn jit_hashmap_receiver_is_exact(vm: &SharedVm, receiver: i64) -> bool {
         return !crate::classloading::any_class_redefined();
     }
     let is_exact = vm
+        .classes
         .class_manager
         .read()
         .get_class(ClassId::new(cid))
@@ -6307,6 +6333,7 @@ unsafe fn jit_concurrent_hashmap_receiver_is_exact(vm: &SharedVm, receiver: i64)
         return !crate::classloading::any_class_redefined();
     }
     let exact = vm
+        .classes
         .class_manager
         .read()
         .get_class(ClassId::new(cid))
@@ -6884,6 +6911,7 @@ fn is_exact_matcher_class(vm: &SharedVm, class_id: ClassId) -> bool {
     }
 
     let is_exact = vm
+        .classes
         .class_manager
         .read()
         .get_class(class_id)
@@ -7028,7 +7056,13 @@ pub unsafe extern "C" fn jit_lambda_int_to_double(vm_ptr: i64, proxy_raw: i64, i
         return f64::NAN.to_bits() as i64;
     };
     let proxy_class_id = vm.heap.class_id_of(proxy);
-    let call_site = match vm.lambda_proxies.read().get(&proxy_class_id).cloned() {
+    let call_site = match vm
+        .classes
+        .lambda_proxies
+        .read()
+        .get(&proxy_class_id)
+        .cloned()
+    {
         Some(call_site) => call_site,
         None => return f64::NAN.to_bits() as i64,
     };
@@ -7051,7 +7085,7 @@ pub unsafe extern "C" fn jit_lambda_int_to_double(vm_ptr: i64, proxy_raw: i64, i
         _ => return f64::NAN.to_bits() as i64,
     };
     let receiver_class_id = vm.heap.class_id_of(receiver);
-    let class_name = match vm.class_manager.read().get_class(receiver_class_id) {
+    let class_name = match vm.classes.class_manager.read().get_class(receiver_class_id) {
         Some(class) => class.name.clone(),
         None => return f64::NAN.to_bits() as i64,
     };
@@ -7122,7 +7156,13 @@ unsafe fn try_fast_lambda_int_to_double_apply(
     {
         return Ok(None);
     }
-    let call_site = match vm.lambda_proxies.read().get(&proxy_class_id).cloned() {
+    let call_site = match vm
+        .classes
+        .lambda_proxies
+        .read()
+        .get(&proxy_class_id)
+        .cloned()
+    {
         Some(call_site) => call_site,
         None => return Ok(None),
     };
@@ -7151,7 +7191,7 @@ unsafe fn try_fast_lambda_int_to_double_apply(
         _ => return Ok(None),
     };
     let receiver_class_id = vm.heap.class_id_of(receiver);
-    let class_name = match vm.class_manager.read().get_class(receiver_class_id) {
+    let class_name = match vm.classes.class_manager.read().get_class(receiver_class_id) {
         Some(class) => class.name.clone(),
         None => return Ok(None),
     };
@@ -7507,7 +7547,12 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
     // `CollectionUtils.forEachInReverseOrder` (JUnit5 listener notification)
     // died on the first compiled execution. Mirror the interpreter's
     // invokeinterface route: dispatch through the lambda's SAM impl_handle.
-    if vm.lambda_proxies.read().contains_key(&receiver_class_id) {
+    if vm
+        .classes
+        .lambda_proxies
+        .read()
+        .contains_key(&receiver_class_id)
+    {
         mic_prof::bump(&mic_prof::MIC_LAMBDA);
         match try_fast_lambda_int_to_double_apply(
             vm,
@@ -8071,6 +8116,7 @@ impl DeoptimizationController {
             // rather than threading a new `ClassId` parameter through every
             // caller. See `JitKey::declaring_class_id`'s doc comment.
             let class_id = vm
+                .classes
                 .class_manager
                 .read()
                 .get_loaded_class_id(class_name)

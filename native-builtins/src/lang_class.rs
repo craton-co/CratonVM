@@ -5454,7 +5454,7 @@ fn capture_field_descriptor(type_char: char) -> String {
 /// Synthesize the captured-variable fields (`arg$1`, `arg$2`, ...) that
 /// real HotSpot's `LambdaMetafactory`-spun proxy classes carry, for a
 /// CratonVM lambda-proxy `class_id`. Lambda proxies are never registered in
-/// `class_manager` (they live in `shared.lambda_proxies` instead — see
+/// `class_manager` (they live in `shared.classes.lambda_proxies` instead — see
 /// `docs/internal/comparable-classcast-lambda-proxy-unknown-class-RESOLVED.md`
 /// for the same root cause in a sibling `Comparable` check), so
 /// `NativeContext::declared_fields` can't see them and reflective access to

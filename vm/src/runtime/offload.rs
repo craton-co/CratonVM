@@ -512,7 +512,7 @@ pub fn try_dispatch(
     // (`execute_invokestatic` calls `ensure_class_initialized_shared`
     // before reaching this hook), so the class is guaranteed in the
     // manager.
-    let cm = shared.class_manager.read();
+    let cm = shared.classes.class_manager.read();
     let class_id = match cm.get_loaded_class_id(class_name) {
         Some(id) => id,
         None => return Ok(DispatchOutcome::FallThrough),
@@ -2274,7 +2274,7 @@ pub fn dispatch_method_from_native_on_stream(
                 format!("submitMethod: load class failed for {class_name}: {e:?}"),
             );
         }
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let class_id = match cm.get_loaded_class_id(class_name) {
             Some(id) => id,
             None => {
@@ -2537,7 +2537,7 @@ pub fn dispatch_method_from_native_on_stream(
             // declared class (which equals receiver_class_id when the
             // receiver is exactly that class) or on a superclass.
             let slot: usize = {
-                let cm = shared.class_manager.read();
+                let cm = shared.classes.class_manager.read();
                 let mut current = Some(receiver_class_id);
                 let mut found: Option<usize> = None;
                 while let Some(cid) = current {
@@ -3851,7 +3851,7 @@ fn try_gpu_array_snapshot(
     obj_ref: cratonvm_types::ObjectRef,
 ) -> Option<(cratonvm_types::ArrayElementType, usize, Vec<u8>, u64)> {
     let cid = shared.heap.class_id_of(obj_ref);
-    let cm = shared.class_manager.read();
+    let cm = shared.classes.class_manager.read();
     let cls_name = cm.get_class(cid).map(|c| c.name.to_string())?;
     drop(cm);
     if cls_name != "craton/gpu/GpuArray" {
@@ -3992,7 +3992,7 @@ fn try_unbox_primitive(
     obj_ref: cratonvm_types::ObjectRef,
 ) -> Option<cratonvm_types::Value> {
     let cid = shared.heap.class_id_of(obj_ref);
-    let cm = shared.class_manager.read();
+    let cm = shared.classes.class_manager.read();
     let cls_name = cm.get_class(cid).map(|c| c.name.to_string())?;
     drop(cm);
     let inner = shared.heap.get_field(obj_ref, 0);

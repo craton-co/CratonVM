@@ -2471,6 +2471,7 @@ fn run() -> Result<()> {
                     let exc_class_id = vm.shared.heap.class_id_of(*exc_ref);
                     let exc_class_name = vm
                         .shared
+                        .classes
                         .class_manager
                         .read()
                         .get_class(exc_class_id)
@@ -2488,7 +2489,7 @@ fn run() -> Result<()> {
                 // cached for a synthetic 1-slot object). Clear both caches so the next
                 // invocation re-resolves cleanly via the native-override registry.
                 vm.main_thread.invoke_cache.clear();
-                vm.shared.resolution_cache.write().clear();
+                vm.shared.classes.resolution_cache.write().clear();
                 // WP1.3: even though initPhase1 threw mid-flight, the
                 // early system-properties / stream installation ran
                 // before the failure — enough for callers gated on
@@ -2890,7 +2891,7 @@ fn run() -> Result<()> {
                 // in lieu of Throwable.cause — see its `getCause()` override)
                 // so that `Caused by:` chains still walk through the wrapper.
                 let (cname, msg_idx, cause_idx, stack_idx, target_idx) = {
-                    let cm = vm.shared.class_manager.read();
+                    let cm = vm.shared.classes.class_manager.read();
                     let cname = cm
                         .get_class(cid)
                         .map(|c| c.name.to_string())
@@ -2974,7 +2975,7 @@ fn run() -> Result<()> {
                                 let Some(elem_ref) = elem else { continue };
                                 if ste_idx.is_none() {
                                     let ecid = vm.shared.heap.class_id_of(elem_ref);
-                                    let cm = vm.shared.class_manager.read();
+                                    let cm = vm.shared.classes.class_manager.read();
                                     let mut dc: Option<usize> = None;
                                     let mut mn: Option<usize> = None;
                                     let mut fn_: Option<usize> = None;
@@ -3101,6 +3102,7 @@ fn run() -> Result<()> {
                 if next_cause.is_none() && cname == "java/lang/reflect/InvocationTargetException" {
                     let ite_decl = vm
                         .shared
+                        .classes
                         .class_manager
                         .read()
                         .get_loaded_class_id("java/lang/reflect/InvocationTargetException");
@@ -3157,7 +3159,7 @@ fn run() -> Result<()> {
                 if cname == "org/springframework/beans/PropertyBatchUpdateException" {
                     // Find the propertyAccessExceptions field by name.
                     let arr_idx = {
-                        let cm = vm.shared.class_manager.read();
+                        let cm = vm.shared.classes.class_manager.read();
                         let mut found: Option<usize> = None;
                         let mut walk = Some(cid);
                         while let Some(k) = walk {
@@ -3195,7 +3197,7 @@ fn run() -> Result<()> {
                                         // name and its field indices (back-to-back reads).
                                         // Read detailMessage and cause from this sub-exception
                                         let (ename, smsg, scause, spname) = {
-                                            let cm = vm.shared.class_manager.read();
+                                            let cm = vm.shared.classes.class_manager.read();
                                             let ename = cm
                                                 .get_class(ecid)
                                                 .map(|c| c.name.to_string())
@@ -3296,7 +3298,7 @@ fn run() -> Result<()> {
                                             // PERF: one read guard for the sub-cause class
                                             // name and its field indices (back-to-back reads).
                                             let (sc_name, sc_msg, sc_cause_idx) = {
-                                                let cm = vm.shared.class_manager.read();
+                                                let cm = vm.shared.classes.class_manager.read();
                                                 let sc_name = cm
                                                     .get_class(sc_cid)
                                                     .map(|c| c.name.to_string())

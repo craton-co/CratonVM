@@ -328,7 +328,7 @@ fn offload_cache_registry_skip_for_eligible_method_without_device() {
         .load_class_concurrent("EligibleVectorAdd")
         .expect("EligibleVectorAdd must load from the fixtures classpath");
 
-    let cm = shared.class_manager.read();
+    let cm = shared.classes.class_manager.read();
     let class = cm.get_class(class_id).expect("class must be resolvable");
     let method_index = class
         .methods

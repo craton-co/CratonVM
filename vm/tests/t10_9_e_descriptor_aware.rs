@@ -186,7 +186,7 @@ fn t10_9_e_3_coerce_unknown_descriptor_preserves_value() {
 #[test]
 fn t10_9_e_4_cache_is_empty_at_startup() {
     let vm = shared();
-    assert_eq!(vm.field_descriptor_cache.read().len(), 0);
+    assert_eq!(vm.classes.field_descriptor_cache.read().len(), 0);
 }
 
 #[test]
@@ -194,13 +194,13 @@ fn t10_9_e_4_cache_miss_on_unloaded_class_does_not_poison() {
     // When a class isn't loaded, the cache MUST NOT record an entry —
     // a later class-load must be able to resolve the descriptor fresh.
     let vm = shared();
-    let before = vm.field_descriptor_cache.read().len();
+    let before = vm.classes.field_descriptor_cache.read().len();
     // Access via the heap API to trigger the cache path indirectly —
     // but since we don't have a class loaded here, no cache entry
     // should be written. (The NativeContextImpl::get_field path is
     // exercised by the interpreter smoke; here we just assert the
     // cache semantics.)
     let _ = vm.heap; // keep the heap alive for the scope
-    let after = vm.field_descriptor_cache.read().len();
+    let after = vm.classes.field_descriptor_cache.read().len();
     assert_eq!(before, after);
 }

@@ -42,7 +42,7 @@ pub fn unload_dead_class_metadata(
     }
 
     let loaders: FxHashSet<ClassLoaderId> = {
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         dead_class_hints
             .iter()
             .filter_map(|id| cm.get_loader_id(ClassId::new(*id)))
@@ -55,7 +55,7 @@ pub fn unload_dead_class_metadata(
     }
 
     let unloaded = {
-        let mut cm = shared.class_manager.write();
+        let mut cm = shared.classes.class_manager.write();
         let mut classes = Vec::new();
         for loader in &loaders {
             classes.extend(cm.unload_user_loader(*loader));
@@ -70,37 +70,50 @@ pub fn unload_dead_class_metadata(
     let ids: FxHashSet<ClassId> = unloaded.iter().map(|class| class.id).collect();
     let raw_ids: Vec<u32> = unloaded.iter().map(|class| class.id.as_u32()).collect();
 
-    shared.statics.write().retain(|id, _| !ids.contains(id));
-    shared.class_locks.write().retain(|id, _| !ids.contains(id));
     shared
+        .classes
+        .statics
+        .write()
+        .retain(|id, _| !ids.contains(id));
+    shared
+        .classes
+        .class_locks
+        .write()
+        .retain(|id, _| !ids.contains(id));
+    shared
+        .classes
         .field_descriptor_cache
         .write()
         .retain(|(id, _), _| !ids.contains(id));
     shared
+        .classes
         .class_init_waiters
         .lock()
         .retain(|id, _| !ids.contains(id));
     shared
+        .classes
         .lambda_proxies
         .write()
         .retain(|id, _| !ids.contains(id));
     shared
+        .classes
         .lambda_proxy_hosts
         .write()
         .retain(|proxy, host| !ids.contains(proxy) && !ids.contains(host));
 
     let dead_mirrors: Vec<ObjectRef> = {
-        let mut mirrors = shared.class_mirrors.write();
+        let mut mirrors = shared.classes.class_mirrors.write();
         ids.iter().filter_map(|id| mirrors.remove(id)).collect()
     };
     shared
+        .classes
         .class_mirrors_reverse
         .write()
         .retain(|_, id| !ids.contains(id));
     cratonvm_native_builtins::classloader::forget_unloaded_class_mirrors(&dead_mirrors);
 
     {
-        let mut cache = shared.initiating_resolution_cache.write();
+        let mut cache = shared.classes.initiating_resolution_cache.write();
         cache.retain(|loader, entries| {
             if loaders.contains(loader) {
                 return false;
@@ -113,12 +126,12 @@ pub fn unload_dead_class_metadata(
     // These caches are pure memoizers. A conservative clear is preferable to
     // retaining a value that mentions an unloaded class through an indirect
     // target not represented in its key.
-    shared.shared_resolution.invalidate_all();
-    shared.osc_cache.remove_classes(&ids);
+    shared.classes.shared_resolution.invalidate_all();
+    shared.classes.osc_cache.remove_classes(&ids);
 
     let mut jit_entries_retired = 0;
     {
-        let mut vtables = shared.vtable_manager.write();
+        let mut vtables = shared.classes.vtable_manager.write();
         for class in &unloaded {
             vtables.unload_class(class.id.as_u32() as u64);
         }
@@ -183,9 +196,9 @@ pub fn unload_dead_class_metadata(
 /// `is_marked` is always true and nothing is pruned.
 pub fn reconcile_class_mirrors(shared: &crate::vm::SharedVm, is_marked: &dyn Fn(usize) -> bool) {
     let dbg = std::env::var_os("CRATONVM_DBG_MIRRORPIN").is_some();
-    let mut mirrors = shared.class_mirrors.write();
+    let mut mirrors = shared.classes.class_mirrors.write();
     if dbg {
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         for (&class_id, obj_ref) in mirrors.iter() {
             let name = cm
                 .get_class(class_id)
@@ -216,7 +229,7 @@ pub fn reconcile_class_mirrors(shared: &crate::vm::SharedVm, is_marked: &dyn Fn(
 /// `defining_loader_for` hash lookup that returns `None` (skipped) for every
 /// built-in-loader class — the overwhelmingly common case.
 pub fn rebuild_mirror_pins(shared: &crate::vm::SharedVm, pointer_map: &HashMap<usize, usize>) {
-    let class_mirrors = shared.class_mirrors.read();
+    let class_mirrors = shared.classes.class_mirrors.read();
     let mut entries: Vec<(usize, usize)> = Vec::new();
     for (&class_id, mirror_ref) in class_mirrors.iter() {
         if let Some(loader) =
@@ -602,7 +615,7 @@ pub fn update_all_roots(
 
     // 2. Static fields
     {
-        let mut statics = shared.statics.write();
+        let mut statics = shared.classes.statics.write();
         for fields in statics.values_mut() {
             for val in fields.iter_mut() {
                 update_value_ref(val, pointer_map);
@@ -612,7 +625,7 @@ pub fn update_all_roots(
 
     // 3. Class lock objects
     {
-        let mut class_locks = shared.class_locks.write();
+        let mut class_locks = shared.classes.class_locks.write();
         for obj_ref in class_locks.values_mut() {
             let old_addr = obj_ref.as_ptr() as usize;
             if let Some(&new_addr) = pointer_map.get(&old_addr) {
@@ -647,7 +660,7 @@ pub fn update_all_roots(
 
     // 6. Class mirror cache
     {
-        let mut class_mirrors = shared.class_mirrors.write();
+        let mut class_mirrors = shared.classes.class_mirrors.write();
         for obj_ref in class_mirrors.values_mut() {
             let old_addr = obj_ref.as_ptr() as usize;
             if let Some(&new_addr) = pointer_map.get(&old_addr) {
@@ -776,7 +789,7 @@ pub fn update_all_roots(
 
     // 8. Primitive type Class mirrors
     {
-        let mut prim_mirrors = shared.primitive_mirrors.write();
+        let mut prim_mirrors = shared.classes.primitive_mirrors.write();
         for obj_ref in prim_mirrors.values_mut() {
             let old_addr = obj_ref.as_ptr() as usize;
             if let Some(&new_addr) = pointer_map.get(&old_addr) {
@@ -792,7 +805,7 @@ pub fn update_all_roots(
     // 8a. Canonical java.lang.Module mirrors (companion to root scan in
     //     roots.rs section 8a).
     {
-        let mut module_mirrors = shared.module_mirrors.write();
+        let mut module_mirrors = shared.classes.module_mirrors.write();
         for obj_ref in module_mirrors.values_mut() {
             let old_addr = obj_ref.as_ptr() as usize;
             if let Some(&new_addr) = pointer_map.get(&old_addr) {
@@ -875,14 +888,14 @@ pub fn update_all_roots(
 
     // 13. Resolution cache — CONSTANT_Dynamic values may hold ObjectRefs
     {
-        let mut cache = shared.resolution_cache.write();
+        let mut cache = shared.classes.resolution_cache.write();
         cache.update_condy_refs(pointer_map);
     }
 
     // 14. Class mirrors reverse map — rebuild keys from updated forward map
     {
-        let class_mirrors = shared.class_mirrors.read();
-        let mut reverse = shared.class_mirrors_reverse.write();
+        let class_mirrors = shared.classes.class_mirrors.read();
+        let mut reverse = shared.classes.class_mirrors_reverse.write();
         reverse.clear();
         for (&class_id, obj_ref) in class_mirrors.iter() {
             reverse.insert(*obj_ref, class_id);
@@ -1070,7 +1083,7 @@ pub fn validate_object_sizes(shared: &crate::vm::SharedVm) {
         return;
     }
     let heap = &shared.heap;
-    let cm = shared.class_manager.read();
+    let cm = shared.classes.class_manager.read();
     // One-shot: dump the class_id -> (name, num_total_fields) table for the
     // low class_ids that show up in the JUnitCore-corruption walks (6, 12, 34,
     // 36, ...), so the corrupted object types can be identified by name.
@@ -1156,6 +1169,7 @@ pub fn verify_heap_object_fields(
     let heap = &shared.heap;
     let class_name = |cid: cratonvm_types::ClassId| -> String {
         shared
+            .classes
             .class_manager
             .read()
             .get_class(cid)

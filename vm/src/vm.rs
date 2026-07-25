@@ -71,7 +71,7 @@ mod tests {
         // Session 85 (C25): `SharedVm::new` pre-registers `Enumeration$Impl`
         // as a synthetic stub so iterator-backed Enumeration dispatch routes
         // through the native registry. Baseline is 1.
-        assert_eq!(vm.shared.class_manager.read().loaded_count(), 1);
+        assert_eq!(vm.shared.classes.class_manager.read().loaded_count(), 1);
         assert!(vm.main_thread.printed.is_empty());
         assert!(!vm.shared.native_methods.is_empty());
     }
@@ -279,7 +279,12 @@ mod tests {
         let stored_id = shared.heap.get_field(mirror, 0);
         assert_eq!(stored_id.as_int(), Some(42));
         // Also recoverable via the reverse map.
-        let recovered = shared.class_mirrors_reverse.read().get(&mirror).copied();
+        let recovered = shared
+            .classes
+            .class_mirrors_reverse
+            .read()
+            .get(&mirror)
+            .copied();
         assert_eq!(recovered, Some(class_id));
     }
 
@@ -2460,6 +2465,7 @@ mod tests {
             proxy_class_id,
         };
         shared
+            .classes
             .lambda_proxies
             .write()
             .insert(proxy_class_id, call_site);
@@ -2480,7 +2486,7 @@ mod tests {
         assert_eq!(result, Some(Value::Int(42)));
 
         // Verify proxy is registered
-        let proxies = shared.lambda_proxies.read();
+        let proxies = shared.classes.lambda_proxies.read();
         let lcs = proxies.get(&proxy_class_id).unwrap();
         assert_eq!(lcs.impl_handle.member_name, "abs");
         assert_eq!(lcs.impl_handle.class_name, "java/lang/Math");
@@ -2516,6 +2522,7 @@ mod tests {
             proxy_class_id,
         };
         shared
+            .classes
             .lambda_proxies
             .write()
             .insert(proxy_class_id, call_site);
@@ -2580,6 +2587,7 @@ mod tests {
             proxy_class_id,
         };
         shared
+            .classes
             .lambda_proxies
             .write()
             .insert(proxy_class_id, call_site);
@@ -2606,7 +2614,7 @@ mod tests {
         assert_eq!(thread.printed_lines, vec!["Hello Lambda"]);
 
         // Verify proxy structure
-        let proxies = shared.lambda_proxies.read();
+        let proxies = shared.classes.lambda_proxies.read();
         let lcs = proxies.get(&proxy_class_id).unwrap();
         assert_eq!(lcs.functional_interface, "java/util/function/Consumer");
         assert_eq!(lcs.sam_method_name, "accept");
@@ -2627,6 +2635,7 @@ mod tests {
 
         // Verify cache is empty
         assert!(shared
+            .classes
             .resolution_cache
             .read()
             .get_call_site(class_id, cp_index)
@@ -2651,12 +2660,14 @@ mod tests {
         });
 
         shared
+            .classes
             .resolution_cache
             .write()
             .put_call_site(class_id, cp_index, call_site);
 
         // Verify cache hit
         let cached = shared
+            .classes
             .resolution_cache
             .read()
             .get_call_site(class_id, cp_index)
@@ -2673,6 +2684,7 @@ mod tests {
 
         // Verify a different key misses the cache
         assert!(shared
+            .classes
             .resolution_cache
             .read()
             .get_call_site(class_id, 99)
@@ -2690,7 +2702,7 @@ mod tests {
         let proxy2 = shared.alloc_lambda_proxy_id();
         assert_ne!(proxy1, proxy2);
 
-        shared.lambda_proxies.write().insert(
+        shared.classes.lambda_proxies.write().insert(
             proxy1,
             LambdaCallSite {
                 functional_interface_id: None,
@@ -2708,7 +2720,7 @@ mod tests {
                 proxy_class_id: proxy1,
             },
         );
-        shared.lambda_proxies.write().insert(
+        shared.classes.lambda_proxies.write().insert(
             proxy2,
             LambdaCallSite {
                 functional_interface_id: None,
@@ -2733,7 +2745,7 @@ mod tests {
         shared.heap.set_field(obj2, 0, Value::Int(42));
 
         // Verify independent lookup
-        let proxies = shared.lambda_proxies.read();
+        let proxies = shared.classes.lambda_proxies.read();
         assert_eq!(
             proxies.get(&proxy1).unwrap().functional_interface,
             "java/lang/Runnable"
@@ -2764,7 +2776,7 @@ mod tests {
         use cratonvm_reader::class_file_version::ClassFileVersion;
         use cratonvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
 
-        let mut cm = shared.class_manager.write();
+        let mut cm = shared.classes.class_manager.write();
         let id = cm.class_store.next_id();
         let num_fields = fields.iter().filter(|f| !f.is_static()).count();
         cm.class_store.add(Class {
@@ -2816,7 +2828,7 @@ mod tests {
         use cratonvm_reader::class_file_version::ClassFileVersion;
         use cratonvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
 
-        let mut cm = shared.class_manager.write();
+        let mut cm = shared.classes.class_manager.write();
         let id = cm.class_store.next_id();
         let num_fields = fields.iter().filter(|f| !f.is_static()).count();
         let class_name = name.to_string();
@@ -7457,7 +7469,7 @@ mod tests {
             proxy_class_id,
         };
         {
-            let mut proxies = shared.lambda_proxies.write();
+            let mut proxies = shared.classes.lambda_proxies.write();
             if proxies.len() < MAX_LAMBDA_PROXIES {
                 proxies.insert(proxy_class_id, call_site);
             }
@@ -7599,6 +7611,7 @@ mod tests {
                 let cid = ctx.shared.heap.class_id_of(r);
                 let name = ctx
                     .shared
+                    .classes
                     .class_manager
                     .read()
                     .get_class(cid)
@@ -24038,6 +24051,7 @@ mod tests {
         // Register a class with no ACC_ANNOTATION flag
         register_test_class(&shared, "test/NotAnAnnotation", 0x0021, &[], &[]); // PUBLIC|SUPER
         let cid = shared
+            .classes
             .class_manager
             .read()
             .find_class_by_name("test/NotAnAnnotation")
@@ -24071,6 +24085,7 @@ mod tests {
         // ACC_ANNOTATION=0x2000 | ACC_INTERFACE=0x0200 | ACC_ABSTRACT=0x0400
         register_test_class(&shared, "test/MyAnnotation", 0x2600, &[], &[]);
         let cid = shared
+            .classes
             .class_manager
             .read()
             .find_class_by_name("test/MyAnnotation")
@@ -34199,6 +34214,7 @@ mod tests {
 
         // Create args array: [Integer.valueOf(7)]
         let int_class_id = shared
+            .classes
             .class_manager
             .write()
             .load_class("java/lang/Integer")
@@ -34313,6 +34329,7 @@ mod tests {
 
         // Create args: [Integer(55)]
         let int_class_id = shared
+            .classes
             .class_manager
             .write()
             .load_class("java/lang/Integer")
@@ -34488,6 +34505,7 @@ mod tests {
 
         // Args: [Integer(10), Integer(32)]
         let int_class_id = shared
+            .classes
             .class_manager
             .write()
             .load_class("java/lang/Integer")
@@ -34759,7 +34777,7 @@ mod tests {
         // A class with no finalize() override should have has_finalizer == false
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let class_id = register_test_class(&shared, "test/NoFinalizer", 0x0021, &[], &[]);
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let cls = cm.class_store.get(class_id).unwrap();
         assert!(!cls.has_finalizer);
     }
@@ -34789,7 +34807,7 @@ mod tests {
                 })],
             }],
         );
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let cls = cm.class_store.get(class_id).unwrap();
         // register_test_class sets has_finalizer to false, but declares_finalize
         // should return true based on the method list
@@ -46055,11 +46073,11 @@ mod tests {
 
         // Load String to get a known ClassId
         {
-            let mut cm = shared.class_manager.write();
+            let mut cm = shared.classes.class_manager.write();
             let _ = cm.load_class("java/lang/String");
         }
         let string_id = {
-            let cm = shared.class_manager.read();
+            let cm = shared.classes.class_manager.read();
             cm.find_class_by_name("java/lang/String")
         };
 
@@ -46081,13 +46099,13 @@ mod tests {
 
             // Add the JAR to the VM classpath dynamically
             {
-                let mut cm = shared.class_manager.write();
+                let mut cm = shared.classes.class_manager.write();
                 cm.extend_application_classpath(&[tmp.to_string_lossy().into_owned()]);
             }
 
             // Verify find_resource can find the services file
             let found = {
-                let cm = shared.class_manager.read();
+                let cm = shared.classes.class_manager.read();
                 cm.find_resource("META-INF/services/java.lang.String")
             };
             assert!(
@@ -52829,7 +52847,7 @@ mod tests {
 
         // Register a class with record components in the class manager
         let class_id = {
-            let mut cm = shared.class_manager.write();
+            let mut cm = shared.classes.class_manager.write();
             let id = cm.class_store.next_id();
             cm.class_store.add(Class {
                 id,
@@ -52911,7 +52929,7 @@ mod tests {
 
         // Register two different record classes with same field count
         let (cid1, cid2) = {
-            let mut cm = shared.class_manager.write();
+            let mut cm = shared.classes.class_manager.write();
             let id1 = cm.class_store.next_id();
             cm.class_store.add(Class {
                 id: id1,
@@ -53062,7 +53080,7 @@ mod tests {
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
 
         let (rec_id, sealed_id, plain_id) = {
-            let mut cm = shared.class_manager.write();
+            let mut cm = shared.classes.class_manager.write();
             let rid = cm.class_store.next_id();
             cm.class_store.add(Class {
                 id: rid,
@@ -53805,6 +53823,7 @@ mod tests {
         .ok(); // warm up registry
 
         let int_class_id = shared
+            .classes
             .class_manager
             .write()
             .load_class("java/lang/Integer")
@@ -55415,11 +55434,12 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         // Classes loaded normally should not be hidden
         let cid = shared
+            .classes
             .class_manager
             .write()
             .load_class("java/lang/Object")
             .unwrap();
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let class = cm.get_class(cid).unwrap();
         assert!(!class.is_hidden());
     }
@@ -55430,11 +55450,12 @@ mod tests {
     fn class_module_name_default_none() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let cid = shared
+            .classes
             .class_manager
             .write()
             .load_class("java/lang/Object")
             .unwrap();
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let class = cm.get_class(cid).unwrap();
         // Regular classes don't have Module attribute
         assert!(class.module_name.is_none());
@@ -55638,11 +55659,11 @@ mod tests {
         let config = VmConfig::default();
         let shared = Arc::new(SharedVm::new(config));
         {
-            let mut cm = shared.class_manager.write();
+            let mut cm = shared.classes.class_manager.write();
             // Loading String causes its interfaces (including CharSequence) to be loaded too.
             cm.load_class("java/lang/String").unwrap();
         }
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let store = &cm.class_store;
         let hierarchy = ClassStoreHierarchy { store };
 
@@ -55671,7 +55692,7 @@ mod tests {
         // fallback should return true (compiler guarantees type safety).
         let config = VmConfig::default();
         let shared = Arc::new(SharedVm::new(config));
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let store = &cm.class_store;
         let hierarchy = ClassStoreHierarchy { store };
 
@@ -55705,7 +55726,7 @@ mod tests {
             "org/renaissance/jdk/streams/MnemonicsCoderWithStream",
         ];
         for class_name in &classes {
-            let result = shared.class_manager.write().load_class(class_name);
+            let result = shared.classes.class_manager.write().load_class(class_name);
             assert!(
                 result.is_ok(),
                 "Loading {class_name} should succeed: {result:?}"
@@ -55732,10 +55753,10 @@ mod tests {
         //   actual = ObjectRef("String")  РІвЂ вЂ™  is_subclass("String", "CharSequence") must be true
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         {
-            let mut cm = shared.class_manager.write();
+            let mut cm = shared.classes.class_manager.write();
             cm.load_class("java/lang/String").unwrap();
         }
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let store = &cm.class_store;
         let hierarchy = ClassStoreHierarchy { store };
 
@@ -55866,6 +55887,7 @@ mod tests {
         // Verify that proxy is a Proxy$Instance (class name check)
         let proxy_class_id = shared.heap.class_id_of(proxy_ref);
         let proxy_class_name = shared
+            .classes
             .class_manager
             .read()
             .get_class(proxy_class_id)
@@ -56820,11 +56842,12 @@ mod tests {
         // Load a synthetic class by requesting a JDK class that doesn't have
         // a .class file on the classpath (which it won't in test env)
         let class_id = shared
+            .classes
             .class_manager
             .write()
             .load_class("java/lang/StringBuilder")
             .unwrap();
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let class = cm.class_store.get(class_id).unwrap();
         assert!(
             class.is_synthetic_stub,
@@ -56867,7 +56890,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(config));
 
         // Verify Object was loaded from real .class file (not synthetic)
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let obj_id = cm
             .get_loaded_class_id("java/lang/Object")
             .expect("Object should be loaded");
@@ -57112,7 +57135,7 @@ mod tests {
             return;
         };
 
-        let cm = vm.shared.class_manager.read();
+        let cm = vm.shared.classes.class_manager.read();
         let obj_id = cm.get_loaded_class_id("java/lang/Object").unwrap();
         let obj_class = cm.class_store.get(obj_id).unwrap();
 
@@ -57163,7 +57186,7 @@ mod tests {
         };
 
         // Allocate objects with correct field count for real Object class
-        let cm = vm.shared.class_manager.read();
+        let cm = vm.shared.classes.class_manager.read();
         let obj_id = cm.get_loaded_class_id("java/lang/Object").unwrap();
         let nfields = cm
             .class_store
@@ -57348,7 +57371,7 @@ mod tests {
 
         // Check Boolean field layout
         {
-            let cm = vm.shared.class_manager.read();
+            let cm = vm.shared.classes.class_manager.read();
             if let Some(bool_id) = cm.get_loaded_class_id("java/lang/Boolean") {
                 let cls = cm.class_store.get(bool_id).unwrap();
                 eprintln!("[real_jdk] Boolean: is_synthetic={}, fields={}, first_field_index={}, num_total_fields={}, methods={}",
@@ -57575,7 +57598,7 @@ mod tests {
         }
 
         // ---- Step 5: Object.equals via real bytecode (simple control flow) ----
-        let cm = vm.shared.class_manager.read();
+        let cm = vm.shared.classes.class_manager.read();
         let obj_id = cm.get_loaded_class_id("java/lang/Object").unwrap();
         let nfields = cm
             .class_store
@@ -57598,7 +57621,7 @@ mod tests {
 
         // ---- Step 6: Verify bytecode methods have Code attributes ----
         {
-            let cm = vm.shared.class_manager.read();
+            let cm = vm.shared.classes.class_manager.read();
             let int_id = cm.get_loaded_class_id("java/lang/Integer").unwrap();
             let int_class = cm.class_store.get(int_id).unwrap();
             assert!(
@@ -61370,7 +61393,7 @@ mod tests {
         .unwrap();
 
         // Verify the Function$AndThen class is loaded with correct interfaces
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         if let Some(and_then_class) = cm
             .class_store
             .find_by_name("java/util/function/Function$AndThen")
@@ -61408,7 +61431,7 @@ mod tests {
         match composite {
             Value::Object(Some(r)) => {
                 let cid = shared.heap.class_id_of(r);
-                let cm = shared.class_manager.read();
+                let cm = shared.classes.class_manager.read();
                 let name = cm.get_class(cid).map(|c| &*c.name);
                 assert_eq!(name, Some("java/util/function/Function$AndThen"));
             }
@@ -61436,7 +61459,7 @@ mod tests {
         match composite {
             Value::Object(Some(r)) => {
                 let cid = shared.heap.class_id_of(r);
-                let cm = shared.class_manager.read();
+                let cm = shared.classes.class_manager.read();
                 let name = cm.get_class(cid).map(|c| &*c.name);
                 assert_eq!(name, Some("java/util/function/Function$Compose"));
             }
@@ -62100,7 +62123,7 @@ mod tests {
 
         let class_id;
         {
-            let mut cm = shared.class_manager.write();
+            let mut cm = shared.classes.class_manager.write();
             class_id = cm.class_store.next_id();
             cm.class_store.add(Class {
                 id: class_id,
@@ -62183,7 +62206,7 @@ mod tests {
 
         let class_id;
         {
-            let mut cm = shared.class_manager.write();
+            let mut cm = shared.classes.class_manager.write();
             class_id = cm.class_store.next_id();
             cm.class_store.add(Class {
                 id: class_id,
@@ -62318,7 +62341,7 @@ mod tests {
             use cratonvm_reader::class_access_flags::ClassAccessFlags;
             use cratonvm_reader::class_file_version::ClassFileVersion;
 
-            let mut cm = shared.class_manager.write();
+            let mut cm = shared.classes.class_manager.write();
             class_id = cm.class_store.next_id();
             cm.class_store.add(Class {
                 id: class_id,
@@ -64891,7 +64914,7 @@ mod tests {
         shared.load_class_concurrent("java/lang/Byte").unwrap();
         shared.load_class_concurrent("java/lang/Short").unwrap();
         // The locks should be cleaned up (strong_count check)
-        let lock_count = shared.class_loading_locks.lock().len();
+        let lock_count = shared.classes.class_loading_locks.lock().len();
         assert!(
             lock_count <= 2,
             "S30: class loading locks should be cleaned up after loading (got {})",
@@ -65654,7 +65677,7 @@ mod tests {
 
         // Pre-fill the lambda_proxies map to MAX_LAMBDA_PROXIES
         {
-            let mut proxies = shared.lambda_proxies.write();
+            let mut proxies = shared.classes.lambda_proxies.write();
             for i in 0..MAX_LAMBDA_PROXIES {
                 let cid = ClassId::new(0x8000_0000 + i as u32);
                 proxies.insert(
@@ -65694,7 +65717,7 @@ mod tests {
             &[],
         );
 
-        let proxies = shared.lambda_proxies.read();
+        let proxies = shared.classes.lambda_proxies.read();
         assert_eq!(
             proxies.len(),
             MAX_LAMBDA_PROXIES,
@@ -66773,22 +66796,25 @@ mod tests {
 
         // --- Load collection classes explicitly ---
         let arraylist_id = shared
+            .classes
             .class_manager
             .write()
             .load_class("java/util/ArrayList")
             .expect("ArrayList should load from real JDK");
         let collections_id = shared
+            .classes
             .class_manager
             .write()
             .load_class("java/util/Collections")
             .expect("Collections should load from real JDK");
         let hashmap_id = shared
+            .classes
             .class_manager
             .write()
             .load_class("java/util/HashMap")
             .expect("HashMap should load from real JDK");
 
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
 
         // --- Verify classes are NOT synthetic stubs ---
         let arraylist = cm.class_store.get(arraylist_id).unwrap();
@@ -66950,12 +66976,13 @@ mod tests {
         // Load ArrayList and allocate an instance
         let al_id = vm
             .shared
+            .classes
             .class_manager
             .write()
             .load_class("java/util/ArrayList")
             .expect("ArrayList should load");
         let al_nfields = {
-            let cm = vm.shared.class_manager.read();
+            let cm = vm.shared.classes.class_manager.read();
             cm.class_store
                 .get(al_id)
                 .map(|c| c.num_total_fields)
@@ -68627,7 +68654,7 @@ mod tests {
         match err {
             MethodCallFailed::ExceptionThrown(obj) => {
                 let class_id = shared.heap.class_id_of(obj);
-                let cm = shared.class_manager.read();
+                let cm = shared.classes.class_manager.read();
                 let class_name = cm.get_class(class_id).map(|c| &*c.name);
                 assert_eq!(
                     class_name,
@@ -69036,7 +69063,7 @@ mod tests {
         };
         // The real class_manager.loaded_count() should match what the MXBean stored
         // (the MXBean reads it at allocation time via ctx.loaded_class_count())
-        let current_loaded = shared.class_manager.read().loaded_count();
+        let current_loaded = shared.classes.class_manager.read().loaded_count();
         // The count in the bean was captured at alloc time, which may be <= current
         assert!(
             loaded_count >= 0,
@@ -70750,7 +70777,7 @@ public class SkippedTest {
 
         // The CDS cache should have the class bytes
         {
-            let cm = shared.class_manager.read();
+            let cm = shared.classes.class_manager.read();
             assert!(
                 cm.cds_class_cache.contains_key("test/CdsLoaded"),
                 "CDS cache should contain the archived class"
@@ -71626,7 +71653,11 @@ public class SkippedTest {
 
         // Register `Animal` as a loaded class so the InvalidationManager
         // has a ClassId to key off of.
-        let animal_id = vm.class_manager.write().ensure_synthetic_class("Animal", 0);
+        let animal_id = vm
+            .classes
+            .class_manager
+            .write()
+            .ensure_synthetic_class("Animal", 0);
         let animal_cid_u32 = animal_id.as_u32();
 
         // Install a compiled entry for `Animal.speak:()V`. The JitCache
@@ -71683,6 +71714,7 @@ public class SkippedTest {
         *vm.self_arc.write() = Some(std::sync::Arc::downgrade(&vm));
 
         let _unrelated_id = vm
+            .classes
             .class_manager
             .write()
             .ensure_synthetic_class("Unrelated", 0);
@@ -72372,7 +72404,7 @@ public class SkippedTest {
         let _ = vm.load_class_concurrent("java/lang/Object");
 
         // Dump and verify class count matches loaded classes
-        let cm = vm.class_manager.read();
+        let cm = vm.classes.class_manager.read();
         let class_count = cm.class_store.len();
         drop(cm);
 
@@ -73243,6 +73275,7 @@ public class SkippedTest {
                 is_native: false,
             };
             shared
+                .classes
                 .vtable_manager
                 .write()
                 .install_vtable(class_id.as_u32() as u64, vec![Some(entry)]);
@@ -73251,7 +73284,7 @@ public class SkippedTest {
         // Now the vtable must be queryable without taking the
         // class_manager lock РІР‚вЂќ the resolved entry carries its own
         // Arc<CachedBytecodeMethod>.
-        let guard = shared.vtable_manager.read();
+        let guard = shared.classes.vtable_manager.read();
         let entry = guard
             .resolve_virtual_slot(class_id.as_u32() as u64, 0)
             .expect("vtable slot must be populated by the install adapter");
@@ -73279,10 +73312,11 @@ public class SkippedTest {
         // (The global `vtable_override_adapter` would target whichever
         // SharedVm was first constructed РІР‚вЂќ see note above.)
         shared
+            .classes
             .vtable_manager
             .write()
             .invalidate_for_override(class_id.as_u32() as u64, 0);
-        let guard = shared.vtable_manager.read();
+        let guard = shared.classes.vtable_manager.read();
         assert!(
             guard
                 .resolve_virtual_slot(class_id.as_u32() as u64, 0)

@@ -354,7 +354,7 @@ fn ec_is_watched_class(shared: &SharedVm, cid: cratonvm_types::ClassId) -> bool 
         return v;
     }
     let v = {
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         cm.get_class(cid)
             .map(|c| {
                 c.name.contains("/asn1/x9/")
@@ -1411,7 +1411,7 @@ pub(crate) fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
 /// never rebind the target; `UserDefined` loaders (enhancement/duplicating
 /// loaders) return false and keep the dispatch route.
 fn self_call_identity_stable(shared: &SharedVm, class_id: ClassId) -> bool {
-    let cm = shared.class_manager.read();
+    let cm = shared.classes.class_manager.read();
     let Some(class) = cm.get_class(class_id) else {
         return false;
     };
@@ -1846,7 +1846,7 @@ fn run_cleaner_actions(shared: &SharedVm, thread: &mut JvmThread) {
         // fall through to the abstract `Runnable.run()` declaration which
         // has no Code attribute. Route through `try_lambda_dispatch` so
         // the proxy's SAM impl_handle actually fires.
-        let is_lambda = shared.lambda_proxies.read().contains_key(&class_id);
+        let is_lambda = shared.classes.lambda_proxies.read().contains_key(&class_id);
         if is_lambda {
             // Errors are silently swallowed per the Cleaner contract.
             let _ = try_lambda_dispatch(shared, thread, action, class_id, "run", "()V", &[]);
@@ -1854,6 +1854,7 @@ fn run_cleaner_actions(shared: &SharedVm, thread: &mut JvmThread) {
         }
 
         let class_name = shared
+            .classes
             .class_manager
             .read()
             .get_class(class_id)
@@ -1896,6 +1897,7 @@ fn run_finalizers(shared: &SharedVm, thread: &mut JvmThread) {
         let class_id = shared.heap.class_id_of(obj_ref);
 
         let class_name = shared
+            .classes
             .class_manager
             .read()
             .get_class(class_id)
@@ -1941,7 +1943,7 @@ fn gc_reference_next_slot(shared: &SharedVm, ref_obj: ObjectRef) -> usize {
     if shared.heap.num_fields(ref_obj) <= 2 {
         return 0; // legacy synthetic 2-field shape: referent, queue only
     }
-    let cm = shared.class_manager.read();
+    let cm = shared.classes.class_manager.read();
     cm.find_class_by_name("java/lang/ref/Reference")
         .and_then(|reference_cid| {
             crate::vm::vm_exec::resolve_field_index_in_hierarchy(
@@ -2347,6 +2349,7 @@ fn gc_alloc_object(
     // If the class overrides finalize(), register the object with the
     // reference processor so GC can enqueue it for finalization (JLS §12.6).
     let has_fin = shared
+        .classes
         .class_manager
         .read()
         .class_store
@@ -2375,7 +2378,7 @@ fn gc_alloc_object(
 /// We walk the class hierarchy to find all primitive instance fields and write
 /// the proper typed zero value to their heap slots.
 pub fn init_primitive_fields(shared: &SharedVm, obj: ObjectRef, class_id: ClassId) {
-    let cm = shared.class_manager.read();
+    let cm = shared.classes.class_manager.read();
     let store = &cm.class_store;
     let mut cid = Some(class_id);
     while let Some(current_id) = cid {
@@ -4864,7 +4867,7 @@ pub fn execute(
         && method_name == "aotContributedInitializerStartsManagementContext"
     {
         let (cname, loader) = {
-            let cm = shared.class_manager.read();
+            let cm = shared.classes.class_manager.read();
             (
                 cm.get_class(class_id).map(|c| c.name.to_string()),
                 cm.get_loader_id(class_id),
@@ -4943,6 +4946,7 @@ pub fn execute(
     // (cheap atomic-bool check on the disabled path).
     if crate::dispatch_trace::is_enabled() {
         let class_name_owned = shared
+            .classes
             .class_manager
             .read()
             .get_class(class_id)
@@ -4975,6 +4979,7 @@ pub fn execute(
     // identical — `method_name == "<init>"` was already a required conjunct.
     if method_name == "<init>" && crate::runtime::env_cache::iae_trace_os() {
         let class_name_for_trace = shared
+            .classes
             .class_manager
             .read()
             .get_class(class_id)
@@ -5003,7 +5008,7 @@ pub fn execute(
     // failure path, and at least produce a partial banner / startup-failure
     // banner before exiting.
     let (code_attr, source_file, class_name_str, is_synchronized, is_static) = {
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let class = cm.get_class(class_id).ok_or_else(|| VmError::Internal {
             message: format!("class {class_id} not found"),
         })?;
@@ -5057,6 +5062,7 @@ pub fn execute(
             // body and the advice fires. Fast-pathed on `any_class_redefined`.
             let class_redefined = crate::classloading::any_class_redefined()
                 && shared
+                    .classes
                     .class_manager
                     .read()
                     .class_redefine_generation(class_id)
@@ -5115,7 +5121,8 @@ pub fn execute(
                     // declared as `CacheOverride o = () -> {}`), route through
                     // try_lambda_dispatch so the proxy's SAM impl_handle runs
                     // instead of throwing AbstractMethodError.
-                    let recv_is_lambda = shared.lambda_proxies.read().contains_key(&recv_cid);
+                    let recv_is_lambda =
+                        shared.classes.lambda_proxies.read().contains_key(&recv_cid);
                     if recv_is_lambda {
                         let rest = if args.is_empty() { &[][..] } else { &args[1..] };
                         if let Some(inner) = try_lambda_dispatch(
@@ -5152,6 +5159,7 @@ pub fn execute(
                     // instead of throwing AbstractMethodError.
                     if recv_kind == cratonvm_types::ObjectKind::Object
                         && shared
+                            .classes
                             .class_manager
                             .read()
                             .get_class(recv_cid)
@@ -5217,7 +5225,7 @@ pub fn execute(
                     // `AbstractMethodError: Future.cancel(Z)Z has no Code`.
                     if recv_cid != ClassId::new(0) {
                         let (recv_native_cb, has_bytecode) = {
-                            let cm2 = shared.class_manager.read();
+                            let cm2 = shared.classes.class_manager.read();
                             let bytecode = crate::classloading::find_method_recursive(
                                 recv_cid,
                                 method_name,
@@ -5262,7 +5270,7 @@ pub fn execute(
                     //   to the abstract Set.iterator declaration.
                     if recv_cid != ClassId::new(0) {
                         let (recv_concrete, has_better, better_decl) = {
-                            let cm2 = shared.class_manager.read();
+                            let cm2 = shared.classes.class_manager.read();
                             let concrete = cm2
                                 .get_class(recv_cid)
                                 .map(|c| !c.is_interface())
@@ -5283,7 +5291,7 @@ pub fn execute(
                             (concrete, better, decl)
                         };
                         let recv_native = if recv_concrete {
-                            let cm2 = shared.class_manager.read();
+                            let cm2 = shared.classes.class_manager.read();
                             let mut walk = Some(recv_cid);
                             let mut found = false;
                             while let Some(cid) = walk {
@@ -5334,7 +5342,7 @@ pub fn execute(
                     //   the cp dispatch class is the *interface* itself
                     //   (Set/Iterator/Collection/Map/List).
                     let recv_is_iface = {
-                        let cm2 = shared.class_manager.read();
+                        let cm2 = shared.classes.class_manager.read();
                         cm2.get_class(recv_cid)
                             .map(|c| c.is_interface())
                             .unwrap_or(false)
@@ -5395,6 +5403,7 @@ pub fn execute(
                     Some(Value::Object(Some(r))) => {
                         let rc = shared.heap.class_id_of(r);
                         let rn = shared
+                            .classes
                             .class_manager
                             .read()
                             .get_class(rc)
@@ -5482,7 +5491,7 @@ pub fn execute(
             // policy mapping (each entry is documented against a roadmap item in
             // docs/roadmap.md Phase A1).
             let is_interface_default = {
-                let cm = shared.class_manager.read();
+                let cm = shared.classes.class_manager.read();
                 cm.get_class(class_id).map_or(false, |c| c.is_interface())
             };
             let policy = if shared.config.jit_aggressive_compilation {
@@ -5768,7 +5777,7 @@ pub fn execute(
                     // Resolve multianewarray entries if present
                     let mut mna_info = Vec::new();
                     if !scan.multianewarray_ops.is_empty() {
-                        let cm = shared.class_manager.read();
+                        let cm = shared.classes.class_manager.read();
                         let class = cm.get_class(class_id)?;
                         for &(pc, cp_idx, _ndims) in &scan.multianewarray_ops {
                             let class_name_ref = class.constant_pool.get_class_name(cp_idx)?;
@@ -5791,7 +5800,7 @@ pub fn execute(
                     let mut typecheck_info: Vec<(usize, *const u8, usize)> = Vec::new();
                     let mut owned_jit_strings: Vec<Box<str>> = Vec::new();
                     if !scan.typecheck_ops.is_empty() {
-                        let cm_lock = shared.class_manager.read();
+                        let cm_lock = shared.classes.class_manager.read();
                         let class = cm_lock.get_class(class_id)?;
                         for &(pc, cp_idx) in &scan.typecheck_ops {
                             let class_name = class.constant_pool.get_class_name(cp_idx)?;
@@ -5807,7 +5816,7 @@ pub fn execute(
                     if !scan.static_field_ops.is_empty() {
                         for &(pc, cp_idx) in &scan.static_field_ops {
                             let field = resolve_field_ref(shared, class_id, cp_idx).ok()?;
-                            let cm_lock = shared.class_manager.read();
+                            let cm_lock = shared.classes.class_manager.read();
                             let class = cm_lock.get_class(class_id)?;
                             let nat_idx = match class.constant_pool.get(cp_idx) {
                                 Some(ConstantPoolEntry::FieldReference {
@@ -5857,7 +5866,7 @@ pub fn execute(
                     // resolves classes the same way for the same reason).
                     let mut pending_ctor_sites: Vec<(usize, String, usize)> = Vec::new();
                     if !scan.invoke_ops.is_empty() {
-                        let cm_lock = shared.class_manager.read();
+                        let cm_lock = shared.classes.class_manager.read();
                         let class = cm_lock.get_class(class_id)?;
                         for &(pc, cp_idx, opcode) in &scan.invoke_ops {
                             // Resolve method reference from constant pool
@@ -6051,7 +6060,7 @@ pub fn execute(
                             .load_class_concurrent(&tclass)
                             .ok()
                             .map(|tid| {
-                                let cm2 = shared.class_manager.read();
+                                let cm2 = shared.classes.class_manager.read();
                                 is_elidable_construction(&cm2, tid)
                             })
                             .unwrap_or(false);
@@ -6105,7 +6114,7 @@ pub fn execute(
                     let mut new_info: Vec<(usize, u32, usize, bool, bool)> = Vec::new();
                     let mut anewarray_info: Vec<(usize, u32)> = Vec::new();
                     let is_real_class = shared
-                        .class_manager
+                        .classes.class_manager
                         .read()
                         .get_class(class_id)
                         .map(|c| !c.is_synthetic_stub)
@@ -6114,7 +6123,7 @@ pub fn execute(
                     {
                         // Collect class names from constant pool (read lock)
                         let new_class_names: Vec<(usize, Option<String>)> = {
-                            let cm_lock = shared.class_manager.read();
+                            let cm_lock = shared.classes.class_manager.read();
                             if let Some(class) = cm_lock.get_class(class_id) {
                                 scan.new_ops
                                     .iter()
@@ -6133,7 +6142,7 @@ pub fn execute(
                             }
                         };
                         let arr_class_names: Vec<(usize, Option<String>)> = {
-                            let cm_lock = shared.class_manager.read();
+                            let cm_lock = shared.classes.class_manager.read();
                             if let Some(class) = cm_lock.get_class(class_id) {
                                 scan.anewarray_ops
                                     .iter()
@@ -6171,7 +6180,7 @@ pub fn execute(
                                     // its first *interpreted* execution could
                                     // silently bypass access control.
                                     let accessible = {
-                                        let cm_lock = shared.class_manager.read();
+                                        let cm_lock = shared.classes.class_manager.read();
                                         match (cm_lock.get_class(class_id), cm_lock.get_class(target_id)) {
                                             (Some(accessor), Some(target)) => {
                                                 crate::classloading::access_control::check_class_access(accessor, target).is_ok()
@@ -6184,7 +6193,7 @@ pub fn execute(
                                     };
                                     if accessible {
                                         let num_fields = shared
-                                            .class_manager
+                                            .classes.class_manager
                                             .read()
                                             .get_class(target_id)
                                             .map(|c| c.num_total_fields)
@@ -6225,7 +6234,7 @@ pub fn execute(
                     // guessing, exactly like the OSR/hot-path resolvers.
                     let mut indy_info: Vec<(usize, usize, u8, Vec<u8>)> = Vec::new();
                     if !scan.indy_ops.is_empty() {
-                        let cm_lock = shared.class_manager.read();
+                        let cm_lock = shared.classes.class_manager.read();
                         if let Some(class) = cm_lock.get_class(class_id) {
                             for &(pc_indy, cp_idx) in &scan.indy_ops {
                                 if let Some(ConstantPoolEntry::InvokeDynamic {
@@ -6256,7 +6265,7 @@ pub fn execute(
                     if !scan.field_ops.is_empty() {
                         for &(pc_f, cp_idx) in &scan.field_ops {
                             if let Ok(field) = resolve_field_ref(shared, class_id, cp_idx) {
-                                let cm_lock = shared.class_manager.read();
+                                let cm_lock = shared.classes.class_manager.read();
                                 if let Some(class) = cm_lock.get_class(class_id) {
                                     let nat_idx = match class.constant_pool.get(cp_idx) {
                                         Some(ConstantPoolEntry::FieldReference {
@@ -6298,7 +6307,7 @@ pub fn execute(
                     let mut ldc_string_info_early: Vec<(usize, *const u8, usize)> = Vec::new();
                     let mut has_unsupported_ldc = false;
                     if !scan.ldc_ops.is_empty() {
-                        let cm_lock = shared.class_manager.read();
+                        let cm_lock = shared.classes.class_manager.read();
                         if let Some(class) = cm_lock.get_class(class_id) {
                             for &(pc_ldc, cp_idx) in &scan.ldc_ops {
                                 match class.constant_pool.get(cp_idx) {
@@ -6357,7 +6366,7 @@ pub fn execute(
                     // Resolve ldc2_w constants (long, double)
                     let mut ldc2w_info_early: Vec<(usize, i64)> = Vec::new();
                     if !scan.ldc2w_ops.is_empty() {
-                        let cm_lock = shared.class_manager.read();
+                        let cm_lock = shared.classes.class_manager.read();
                         if let Some(class) = cm_lock.get_class(class_id) {
                             for &(pc_ldc, cp_idx) in &scan.ldc2w_ops {
                                 let val = match class.constant_pool.get(cp_idx) {
@@ -6411,7 +6420,7 @@ pub fn execute(
                     // mask lines up with the `&[]`/`0` legacy layout. Gate on the
                     // precise-maps flag so the gate-off path stays byte-identical.
                     let early_is_static = shared
-                        .class_manager
+                        .classes.class_manager
                         .read()
                         .get_class(class_id)
                         .and_then(|class| {
@@ -8678,6 +8687,7 @@ fn execute_frame_from_index(
                         let mname = frame.method_name().to_string();
                         let mdesc = frame.method_descriptor().to_string();
                         let cname = shared
+                            .classes
                             .class_manager
                             .read()
                             .get_class(frame.class_id)
@@ -9853,6 +9863,7 @@ fn execute_frame_from_index(
                             {
                                 let _ = frame;
                                 let elem_cls = shared
+                                    .classes
                                     .class_manager
                                     .read()
                                     .get_class(shared.heap.class_id_of(elem_ref))
@@ -11036,7 +11047,7 @@ fn find_exception_handler_pc_unknown(
     // `frame.code` is padded with 2 trailing bytes for the interpreter's
     // speculative reads; the real bytecode length is `len() - 2`.
     let code_len = frame.code.len().saturating_sub(2);
-    let mut cm_guard = shared.class_manager.read();
+    let mut cm_guard = shared.classes.class_manager.read();
     cm_guard.get_class(frame.class_id)?;
     for entry in frame.exception_table().iter() {
         // PC unknown → cannot verify range membership. Honour a catch-all only
@@ -11066,7 +11077,7 @@ fn find_exception_handler_pc_unknown(
                 let owned = catch_class_name.to_string();
                 drop(cm_guard);
                 let loaded = shared.load_class_concurrent(&owned);
-                cm_guard = shared.class_manager.read();
+                cm_guard = shared.classes.class_manager.read();
                 match loaded {
                     Ok(id) => id,
                     Err(_) => continue,
@@ -11105,7 +11116,7 @@ fn find_exception_handler_impl(
 ) -> Option<(usize, ObjectRef)> {
     let exc_class_id = shared.heap.class_id_of(exc);
 
-    let mut cm_guard = shared.class_manager.read();
+    let mut cm_guard = shared.classes.class_manager.read();
     // Verify the owning class exists once — hoist this invariant out
     // of the per-entry loop. We re-fetch the (shared-borrowed) class
     // inside the loop to get the constant pool; that's a cheap
@@ -11148,7 +11159,7 @@ fn find_exception_handler_impl(
                 let owned = catch_class_name.to_string();
                 drop(cm_guard);
                 let loaded = shared.load_class_concurrent(&owned);
-                cm_guard = shared.class_manager.read();
+                cm_guard = shared.classes.class_manager.read();
                 match loaded {
                     Ok(id) => id,
                     Err(_) => continue, // Can't load catch type — skip handler
@@ -11227,7 +11238,7 @@ fn route_jit_exception_through_method(
     // HIGH — same fast-path treatment as `find_exception_handler`:
     // hold the class_manager read lock for the duration of the search
     // and avoid `to_string()` on catch-type names.
-    let mut cm_guard = shared.class_manager.read();
+    let mut cm_guard = shared.classes.class_manager.read();
     for entry in cached.exception_table.iter() {
         // Mirror the PC-range check used by `find_exception_handler_any_pc`:
         // a handler only applies when the throw site is inside its
@@ -11277,7 +11288,7 @@ fn route_jit_exception_through_method(
                 let owned = catch_class_name.to_string();
                 drop(cm_guard);
                 let loaded = shared.load_class_concurrent(&owned);
-                cm_guard = shared.class_manager.read();
+                cm_guard = shared.classes.class_manager.read();
                 match loaded {
                     Ok(id) => id,
                     Err(_) => continue,
@@ -13761,6 +13772,7 @@ fn execute_instruction(
                     && !aastore_element_assignable(shared, array_ref, elem_ref)
                 {
                     let elem_cls = shared
+                        .classes
                         .class_manager
                         .read()
                         .get_class(shared.heap.class_id_of(elem_ref))
@@ -14469,6 +14481,7 @@ fn execute_instruction(
                     Value::Object(Some(mirror)) => crate::vm::class_id_from_mirror(shared, *mirror)
                         .and_then(|cid| {
                             shared
+                                .classes
                                 .class_manager
                                 .read()
                                 .get_class(cid)
@@ -14628,7 +14641,7 @@ fn execute_instruction(
             // synthetic PrintStream objects. `System.in` uses the same
             // early pinning strategy via [`ensure_system_stdin_object`].
             let field_name_for_intercept = {
-                let cm = shared.class_manager.read();
+                let cm = shared.classes.class_manager.read();
                 cm.get_class(field.declaring_class_id)
                     .filter(|c| &*c.name == "java/lang/System")
                     .and_then(|c| c.fields.get(field.field_index).map(|f| f.name.to_string()))
@@ -14707,7 +14720,7 @@ fn execute_instruction(
                     get_static_shared(shared, field.declaring_class_id, field.field_index);
                 if matches!(value, Value::Object(None)) {
                     let boolean_const = {
-                        let cm = shared.class_manager.read();
+                        let cm = shared.classes.class_manager.read();
                         cm.get_class(field.declaring_class_id)
                             .filter(|c| &*c.name == "java/lang/Boolean")
                             .and_then(|c| {
@@ -15019,6 +15032,7 @@ fn execute_instruction(
                         let field_name = resolve_field_name(shared, current_class_id, *index);
                         let v = shared.heap.get_field(obj_ref, field.field_index);
                         let nf = shared
+                            .classes
                             .class_manager
                             .read()
                             .get_class(field.declaring_class_id)
@@ -15487,6 +15501,7 @@ fn execute_instruction(
                     if cname.contains("HashtableOfInt") {
                         let field_name = resolve_field_name(shared, current_class_id, *index);
                         let nf = shared
+                            .classes
                             .class_manager
                             .read()
                             .get_class(field.declaring_class_id)
@@ -15507,7 +15522,7 @@ fn execute_instruction(
                 if crate::runtime::env_cache::baos_dbg() {
                     let field_name = resolve_field_name(shared, current_class_id, *index);
                     if matches!(field_name.as_deref(), Some("buf") | Some("count")) {
-                        let cm = shared.class_manager.read();
+                        let cm = shared.classes.class_manager.read();
                         let recv_cid = shared.heap.class_id_of(obj_ref);
                         let rn = cm
                             .get_class(recv_cid)
@@ -15571,6 +15586,7 @@ fn execute_instruction(
             // bug-h2-suite-residual-fail-triage.md.
             if std::env::var_os("CRATONVM_DBG_FIELD_WATCH").is_some() {
                 let decl_name = shared
+                    .classes
                     .class_manager
                     .read()
                     .get_class(field.declaring_class_id)
@@ -15596,7 +15612,7 @@ fn execute_instruction(
                 if cratonvm_native_builtins::aqs_trace_enabled() {
                     let cid = shared.heap.class_id_of(obj_ref);
                     let cls = {
-                        let cm = shared.class_manager.read();
+                        let cm = shared.classes.class_manager.read();
                         cm.get_class(cid)
                             .map(|c| c.name.to_string())
                             .unwrap_or_default()
@@ -15810,7 +15826,7 @@ fn execute_instruction(
         Instruction::New(index) => {
             let referencing_class_id = thread.frames[frame_idx].class_id;
             let class_name = {
-                let cm = shared.class_manager.read();
+                let cm = shared.classes.class_manager.read();
                 let class =
                     cm.get_class(referencing_class_id)
                         .ok_or_else(|| VmError::Internal {
@@ -15834,7 +15850,7 @@ fn execute_instruction(
                     || class_name == "org/h2/command/ParserBase"
                     || class_name == "org/h2/command/Token")
             {
-                let cm = shared.class_manager.read();
+                let cm = shared.classes.class_manager.read();
                 let ref_loader = cm.get_loader_id(referencing_class_id);
                 let target_loader = cm.get_loader_id(target_class_id);
                 let ref_name = cm
@@ -15850,7 +15866,7 @@ fn execute_instruction(
             if std::env::var("CRATONVM_DBG_LOADER_TRACE").is_ok()
                 && class_name.contains("RootReference")
             {
-                let cm = shared.class_manager.read();
+                let cm = shared.classes.class_manager.read();
                 let ref_loader = cm.get_loader_id(referencing_class_id);
                 let target_loader = cm.get_loader_id(target_class_id);
                 eprintln!(
@@ -15884,7 +15900,7 @@ fn execute_instruction(
             // while ordinary same-loader package-private instantiation
             // (by far the common case) is unaffected.
             {
-                let cm = shared.class_manager.read();
+                let cm = shared.classes.class_manager.read();
                 if let (Some(accessor), Some(target)) = (
                     cm.get_class(referencing_class_id),
                     cm.get_class(target_class_id),
@@ -15896,6 +15912,7 @@ fn execute_instruction(
             ensure_class_initialized_shared(shared, thread, target_class_id)?;
 
             let num_fields = shared
+                .classes
                 .class_manager
                 .read()
                 .get_class(target_class_id)
@@ -15907,7 +15924,7 @@ fn execute_instruction(
                 && crate::runtime::env_cache::nsee_trace()
             {
                 eprintln!("[NSEE-TRACE] new java/util/NoSuchElementException at:");
-                let cm = shared.class_manager.read();
+                let cm = shared.classes.class_manager.read();
                 for (i, f) in thread.frames.iter().enumerate().rev().take(30) {
                     let cn = cm
                         .get_class(f.class_id)
@@ -15968,7 +15985,7 @@ fn execute_instruction(
             }
             let referencing_class_id = thread.frames[frame_idx].class_id;
             let component_class_name = {
-                let cm = shared.class_manager.read();
+                let cm = shared.classes.class_manager.read();
                 let class =
                     cm.get_class(referencing_class_id)
                         .ok_or_else(|| VmError::Internal {
@@ -16085,7 +16102,7 @@ fn execute_instruction(
             // hold references (not the leaf type) — see `alloc_multi_array`.
             let referencing_class_id = thread.frames[frame_idx].class_id;
             let (leaf_et, total_array_depth, leaf_desc) = {
-                let cm = shared.class_manager.read();
+                let cm = shared.classes.class_manager.read();
                 let class =
                     cm.get_class(referencing_class_id)
                         .ok_or_else(|| VmError::Internal {
@@ -16182,6 +16199,7 @@ fn execute_instruction(
                     if crate::runtime::env_cache::iae_trace() {
                         let exc_class_id = shared.heap.class_id_of(obj_ref);
                         let exc_class_name = shared
+                            .classes
                             .class_manager
                             .read()
                             .get_class(exc_class_id)
@@ -16200,6 +16218,7 @@ fn execute_instruction(
                             eprintln!("IAE-ATHROW class={exc_class_name} message={msg:?}");
                             for (i, f) in thread.frames.iter().enumerate().rev().take(30) {
                                 let cn = shared
+                                    .classes
                                     .class_manager
                                     .read()
                                     .get_class(f.class_id)
@@ -16223,6 +16242,7 @@ fn execute_instruction(
                     if crate::runtime::env_cache::athrow_dbg() {
                         let exc_class_id = shared.heap.class_id_of(obj_ref);
                         let exc_class_name = shared
+                            .classes
                             .class_manager
                             .read()
                             .get_class(exc_class_id)
@@ -16243,6 +16263,7 @@ fn execute_instruction(
                         eprintln!("ATHROW class={exc_class_name} msg={msg:?}");
                         for (i, f) in thread.frames.iter().enumerate().rev().take(15) {
                             let cn = shared
+                                .classes
                                 .class_manager
                                 .read()
                                 .get_class(f.class_id)
@@ -16267,6 +16288,7 @@ fn execute_instruction(
                     if crate::runtime::env_cache::charset_dbg() {
                         let exc_class_id = shared.heap.class_id_of(obj_ref);
                         let exc_class_name = shared
+                            .classes
                             .class_manager
                             .read()
                             .get_class(exc_class_id)
@@ -16296,6 +16318,7 @@ fn execute_instruction(
                             );
                             for (i, f) in thread.frames.iter().enumerate().rev() {
                                 let cn = shared
+                                    .classes
                                     .class_manager
                                     .read()
                                     .get_class(f.class_id)
@@ -16323,6 +16346,7 @@ fn execute_instruction(
                     if cratonvm_jfr::is_enabled() {
                         let exc_class_id = shared.heap.class_id_of(obj_ref);
                         let exc_class_name = shared
+                            .classes
                             .class_manager
                             .read()
                             .get_class(exc_class_id)
@@ -16422,7 +16446,7 @@ fn execute_instruction(
                 Value::Object(Some(mut obj_ref)) => {
                     let referencing_class_id = thread.frames[frame_idx].class_id;
                     let target_class_name = {
-                        let cm = shared.class_manager.read();
+                        let cm = shared.classes.class_manager.read();
                         let class = cm.get_class(referencing_class_id).ok_or_else(|| {
                             VmError::Internal {
                                 message: "current class not found".to_string(),
@@ -16473,6 +16497,7 @@ fn execute_instruction(
                         })?;
                         let obj_class_id = shared.heap.class_id_of(obj_ref);
                         shared
+                            .classes
                             .class_manager
                             .read()
                             .is_subclass_of(obj_class_id, target_class_id)
@@ -16494,6 +16519,7 @@ fn execute_instruction(
                     if !cast_ok {
                         let actual_class_id = shared.heap.class_id_of(obj_ref);
                         let obj_class_name = shared
+                            .classes
                             .class_manager
                             .read()
                             .get_class(actual_class_id)
@@ -16640,6 +16666,7 @@ fn execute_instruction(
                             // frame for the family's residual shapes.
                             for (i, f) in thread.frames.iter().enumerate().rev().take(15) {
                                 let cn = shared
+                                    .classes
                                     .class_manager
                                     .read()
                                     .get_class(f.class_id)
@@ -16724,7 +16751,7 @@ fn execute_instruction(
                 Value::Object(Some(mut obj_ref)) => {
                     let referencing_class_id = thread.frames[frame_idx].class_id;
                     let target_class_name = {
-                        let cm = shared.class_manager.read();
+                        let cm = shared.classes.class_manager.read();
                         let class = cm.get_class(referencing_class_id).ok_or_else(|| {
                             VmError::Internal {
                                 message: "current class not found".to_string(),
@@ -16775,6 +16802,7 @@ fn execute_instruction(
                         })?;
                         let obj_class_id = shared.heap.class_id_of(obj_ref);
                         if shared
+                            .classes
                             .class_manager
                             .read()
                             .is_subclass_of(obj_class_id, target_class_id)
@@ -17062,6 +17090,7 @@ pub fn annotation_proxy_satisfies_target(
 ) -> bool {
     let cid = shared.heap.class_id_of(obj_ref);
     let is_proxy = shared
+        .classes
         .class_manager
         .read()
         .get_class(cid)
@@ -17108,7 +17137,7 @@ pub(crate) fn proxy_instance_satisfies_target(
     use crate::runtime::proxy::PROXY_FIELD_INTERFACES;
 
     let obj_class_id = shared.heap.class_id_of(obj_ref);
-    let obj_name = match shared.class_manager.read().get_class(obj_class_id) {
+    let obj_name = match shared.classes.class_manager.read().get_class(obj_class_id) {
         Some(c) => c.name.to_string(),
         None => return false,
     };
@@ -17129,6 +17158,7 @@ pub(crate) fn proxy_instance_satisfies_target(
     // is hot in Spring's conversion/binding path.
     let proxy_cid = shared.heap.class_id_of(obj_ref);
     let has_iface_slot = shared
+        .classes
         .class_manager
         .read()
         .get_class(proxy_cid)
@@ -17198,6 +17228,7 @@ pub(crate) fn proxy_instance_satisfies_target(
     };
     let n = shared.heap.array_length(interfaces_arr);
     let target_cid = shared
+        .classes
         .class_manager
         .write()
         .load_class(target_class_name)
@@ -17220,12 +17251,17 @@ pub(crate) fn proxy_instance_satisfies_target(
         }
         // Superinterface walk: target is a superinterface of `iface_cid`?
         if let Some(tcid) = target_cid {
-            if shared.class_manager.read().is_subclass_of(iface_cid, tcid) {
+            if shared
+                .classes
+                .class_manager
+                .read()
+                .is_subclass_of(iface_cid, tcid)
+            {
                 return true;
             }
         }
         // Name fallback (synthetic interfaces that may not be loaded yet).
-        if let Some(iface_class) = shared.class_manager.read().get_class(iface_cid) {
+        if let Some(iface_class) = shared.classes.class_manager.read().get_class(iface_cid) {
             if &*iface_class.name == target_class_name {
                 return true;
             }
@@ -17244,7 +17280,7 @@ fn lambda_proxy_satisfies(
     target_class_id: ClassId,
 ) -> bool {
     let dbg_aci = std::env::var("CRATONVM_DBG_LOADER_TRACE").is_ok();
-    let proxies = shared.lambda_proxies.read();
+    let proxies = shared.classes.lambda_proxies.read();
     if dbg_aci && !proxies.contains_key(&obj_class_id) {
         eprintln!(
             "[LOADER-TRACE] lambda_proxy_satisfies: obj_class_id={obj_class_id:?} NOT a registered lambda proxy target_class_id={target_class_id:?}"
@@ -17255,6 +17291,7 @@ fn lambda_proxy_satisfies(
         drop(proxies); // release lock before loading
         if dbg_aci {
             let target_name_dbg = shared
+                .classes
                 .class_manager
                 .read()
                 .get_class(target_class_id)
@@ -17271,6 +17308,7 @@ fn lambda_proxy_satisfies(
         // with FLAG_SERIALIZABLE and keeps the checkcast at pc=11 in
         // `Comparator.comparing(Function)` from failing.
         let target_name = shared
+            .classes
             .class_manager
             .read()
             .get_class(target_class_id)
@@ -17299,6 +17337,7 @@ fn lambda_proxy_satisfies(
             // non-lambda receivers (see `loader_aware_name_assignable`'s call site
             // in `Instruction::Checkcast`) instead of only trusting ClassId identity.
             return shared
+                .classes
                 .class_manager
                 .read()
                 .is_subclass_of(iface_id, target_class_id)
@@ -17320,7 +17359,7 @@ fn loader_aware_name_assignable(
         return false;
     }
 
-    let cm = shared.class_manager.read();
+    let cm = shared.classes.class_manager.read();
     let Some(obj_class) = cm.get_class(obj_class_id) else {
         return false;
     };
@@ -17397,6 +17436,7 @@ pub(crate) fn array_descriptor_of(
             // The class_id on a Reference array holds the component class id.
             let comp_id = shared.heap.class_id_of(obj_ref);
             let comp_name = shared
+                .classes
                 .class_manager
                 .read()
                 .get_class(comp_id)
@@ -17527,6 +17567,7 @@ fn array_is_assignable_to_impl(
     // warm path through an exclusive lock.
     let resolve_component = |name: &str| {
         shared
+            .classes
             .class_manager
             .read()
             .find_class_by_name(name)
@@ -17540,7 +17581,11 @@ fn array_is_assignable_to_impl(
         Some(id) => id,
         None => return false,
     };
-    shared.class_manager.read().is_subclass_of(src_id, tgt_id)
+    shared
+        .classes
+        .class_manager
+        .read()
+        .is_subclass_of(src_id, tgt_id)
 }
 
 /// JVMS §aastore covariance check: returns `true` if the (non-null) element
@@ -17621,7 +17666,7 @@ pub(crate) fn aastore_element_assignable(
     }
     let array_component_class_id = shared.heap.class_id_of(array_ref);
     let comp_id = {
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         if array_component_class_id != ClassId::new(0) {
             cm.get_class(array_component_class_id)
                 .filter(|c| &*c.name == comp_name)
@@ -17630,9 +17675,15 @@ pub(crate) fn aastore_element_assignable(
             None
         }
     }
-    .or_else(|| shared.class_manager.read().find_class_by_name(comp_name))
+    .or_else(|| {
+        shared
+            .classes
+            .class_manager
+            .read()
+            .find_class_by_name(comp_name)
+    })
     .unwrap_or_else(
-        || match shared.class_manager.write().load_class(comp_name) {
+        || match shared.classes.class_manager.write().load_class(comp_name) {
             Ok(id) => id,
             Err(_) => ClassId::new(0),
         },
@@ -17642,7 +17693,7 @@ pub(crate) fn aastore_element_assignable(
     }
     // The element class must exist in the hierarchy; if not, fail open.
     {
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let Some(value_class) = cm.get_class(value_class_id) else {
             return true;
         };
@@ -17699,7 +17750,7 @@ pub(crate) fn aastore_element_assignable(
     //     an interface[] is legal on a real JVM (regression: hibernate-smoke
     //     stored an AnnotationProxy into an annotation-type array). Fail open.
     {
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         if let Some(cls) = cm.get_class(value_class_id) {
             let vn: &str = &*cls.name;
             if vn == "java/lang/annotation/AnnotationProxy"
@@ -17749,7 +17800,7 @@ pub(crate) fn class_chain_reaches_proxy_instance(shared: &SharedVm, class_id: Cl
     const PROXY_INSTANCE: &str = "java/lang/reflect/Proxy$Instance";
     const REAL_PROXY_BASE: &str = "java/lang/reflect/Proxy";
 
-    let cm = shared.class_manager.read();
+    let cm = shared.classes.class_manager.read();
     let mut current = Some(class_id);
     for _ in 0..MAX_DEPTH {
         let cid = match current {
@@ -17783,6 +17834,7 @@ pub(crate) fn class_chain_reaches_proxy_instance(shared: &SharedVm, class_id: Cl
 /// for common patterns where a concrete inner class should satisfy an interface.
 fn synthetic_implements(shared: &SharedVm, obj_class_id: ClassId, target_class_name: &str) -> bool {
     let obj_class_name = shared
+        .classes
         .class_manager
         .read()
         .get_class(obj_class_id)
@@ -18006,7 +18058,7 @@ fn execute_ldc(
     }
 
     let ldc_val = {
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let class = cm
             .get_class(frame_class_id)
             .ok_or_else(|| VmError::Internal {
@@ -18152,7 +18204,7 @@ fn execute_ldc(
         } => {
             // Check condy cache first
             {
-                let cache = shared.resolution_cache.read();
+                let cache = shared.classes.resolution_cache.read();
                 if let Some(val) = cache.get_condy(frame_class_id, index) {
                     if remap_trace_on() {
                         if let Value::Object(Some(o)) = val {
@@ -18168,7 +18220,7 @@ fn execute_ldc(
             // The bootstrap method receives (Lookup, String name, Class type, extra_args...).
             // We resolve the bootstrap method handle, then dispatch based on known BSMs.
             let (bsm_class, bsm_method, bsm_extra_args) = {
-                let cm = shared.class_manager.read();
+                let cm = shared.classes.class_manager.read();
                 let class = cm
                     .get_class(frame_class_id)
                     .ok_or_else(|| VmError::Internal {
@@ -18220,6 +18272,7 @@ fn execute_ldc(
 
             // Cache the result
             shared
+                .classes
                 .resolution_cache
                 .write()
                 .put_condy(frame_class_id, index, result);
@@ -18269,7 +18322,7 @@ fn resolve_condy_value(
                     return Ok(default_for_descriptor(descriptor));
                 }
                 let class_id = shared.load_class_concurrent(declaring_class)?;
-                let cm = shared.class_manager.read();
+                let cm = shared.classes.class_manager.read();
                 if let Some(class) = cm.get_class(class_id) {
                     for (i, f) in class.fields.iter().enumerate() {
                         if &*f.name == name && f.is_static() {
@@ -18291,7 +18344,7 @@ fn resolve_condy_value(
                 .unwrap_or(descriptor);
             let result = (|| -> Result<Value, MethodCallFailed> {
                 let class_id = shared.load_class_concurrent(enum_class)?;
-                let cm = shared.class_manager.read();
+                let cm = shared.classes.class_manager.read();
                 if let Some(class) = cm.get_class(class_id) {
                     for (i, f) in class.fields.iter().enumerate() {
                         if &*f.name == name && f.is_static() {
@@ -18364,7 +18417,7 @@ pub fn default_for_descriptor(descriptor: &str) -> Value {
 }
 
 fn execute_ldc2w(shared: &SharedVm, frame: &mut Frame, index: u16) -> Result<(), MethodCallFailed> {
-    let cm = shared.class_manager.read();
+    let cm = shared.classes.class_manager.read();
     let class = cm
         .get_class(frame.class_id)
         .ok_or_else(|| VmError::Internal {
@@ -18458,7 +18511,7 @@ fn is_global_resolution_namespace(name: &str) -> bool {
 /// `GroovyClassLoader` instances, so their resolution order is completely
 /// unaffected by this check.
 fn is_groovy_class_loader(shared: &SharedVm, loader_obj: cratonvm_types::ObjectRef) -> bool {
-    let cm = shared.class_manager.read();
+    let cm = shared.classes.class_manager.read();
     let loader_class_id = shared.heap.class_id_of(loader_obj);
     match cm.get_loaded_class_id("groovy/lang/GroovyClassLoader") {
         Some(groovy_cl_id) => {
@@ -18499,7 +18552,7 @@ fn is_compile_with_forked_class_loader(
     shared: &SharedVm,
     loader_obj: cratonvm_types::ObjectRef,
 ) -> bool {
-    let cm = shared.class_manager.read();
+    let cm = shared.classes.class_manager.read();
     let loader_class_id = shared.heap.class_id_of(loader_obj);
     match cm.get_loaded_class_id(
         "org/springframework/core/test/tools/CompileWithForkedClassLoaderClassLoader",
@@ -18560,6 +18613,7 @@ fn lookup_loader_initiated(
         return None;
     }
     let loader = match shared
+        .classes
         .class_manager
         .read()
         .get_loader_id(referencing_class_id)
@@ -18577,6 +18631,7 @@ fn lookup_loader_initiated(
     // the application class and lets stale static invoke-cache entries mix
     // the two identities (for example MergedAnnotation$Adapt).
     if let Some(id) = shared
+        .classes
         .class_manager
         .read()
         .class_defined_by_loader_exact(name, loader)
@@ -18587,6 +18642,7 @@ fn lookup_loader_initiated(
         return Some(id);
     }
     let cache_hit = shared
+        .classes
         .initiating_resolution_cache
         .read()
         .get(&loader)
@@ -18609,7 +18665,7 @@ fn cache_loader_initiated(
     name: &str,
     class_id: ClassId,
 ) {
-    let mut caches = shared.initiating_resolution_cache.write();
+    let mut caches = shared.classes.initiating_resolution_cache.write();
     let cache = caches.entry(loader).or_default();
     let key = cratonvm_types::intern_arc(name);
     if !cache.contains_key(key.as_ref()) && cache.len() >= INITIATING_RESOLUTION_CACHE_CAP {
@@ -18645,6 +18701,7 @@ fn lookup_loader_defined_exact(
         return None;
     }
     let loader = match shared
+        .classes
         .class_manager
         .read()
         .get_loader_id(referencing_class_id)
@@ -18653,6 +18710,7 @@ fn lookup_loader_defined_exact(
         _ => return None,
     };
     shared
+        .classes
         .class_manager
         .read()
         .class_defined_by_loader_exact(name, loader)
@@ -18750,7 +18808,7 @@ pub(crate) fn resolve_class_loader_aware(
             || name.contains("PathRequestTests")
             || name.contains("ManagementWebSecurityAutoConfigurationTests"));
     if dbg_trace {
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let ref_name = cm
             .get_class(referencing_class_id)
             .map(|c| c.name.to_string())
@@ -18791,6 +18849,7 @@ pub(crate) fn resolve_class_loader_aware(
     let user_loader =
         if loader_faithful && !name.starts_with('[') && !is_global_resolution_namespace(name) {
             let direct_loader_id = shared
+                .classes
                 .class_manager
                 .read()
                 .get_loader_id(referencing_class_id);
@@ -18854,7 +18913,7 @@ pub(crate) fn resolve_class_loader_aware(
             let owner = fallback
                 .as_ref()
                 .ok()
-                .and_then(|id| shared.class_manager.read().get_loader_id(*id));
+                .and_then(|id| shared.classes.class_manager.read().get_loader_id(*id));
             eprintln!(
                 "[LOADER-TRACE] name={name} GATE-ON global fallback after drive-miss result={fallback:?} owner_loader={owner:?}"
             );
@@ -18877,7 +18936,7 @@ pub(crate) fn resolve_class_loader_aware(
     match shared.load_class_concurrent(name) {
         Ok(id) => {
             if dbg_trace {
-                let cm = shared.class_manager.read();
+                let cm = shared.classes.class_manager.read();
                 let owner = cm.get_loader_id(id);
                 eprintln!(
                     "[LOADER-TRACE] name={name} resolved via GLOBAL-FIRST fallback cid={id:?} owner_loader={owner:?}"
@@ -18934,6 +18993,7 @@ fn drive_defining_loader_load(
         return None;
     }
     let cache_loader = shared
+        .classes
         .class_manager
         .read()
         .get_loader_id(referencing_class_id);
@@ -19014,7 +19074,7 @@ fn resolve_field_ref(
     cp_index: u16,
 ) -> Result<ResolvedField, MethodCallFailed> {
     let (field_class_name, field_name) = {
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let class = cm
             .get_class(current_class_id)
             .ok_or_else(|| VmError::Internal {
@@ -19059,7 +19119,11 @@ fn resolve_field_ref(
         && !field_class_name.starts_with('[')
         && !is_global_resolution_namespace(&field_class_name)
         && matches!(
-            shared.class_manager.read().get_loader_id(current_class_id),
+            shared
+                .classes
+                .class_manager
+                .read()
+                .get_loader_id(current_class_id),
             Some(cratonvm_types::ClassLoaderId::UserDefined(_))
         );
     let loader_local_id = if loader_sensitive {
@@ -19068,6 +19132,7 @@ fn resolve_field_ref(
         None
     };
     if let Some(cached) = shared
+        .classes
         .resolution_cache
         .read()
         .get_field(current_class_id, cp_index)
@@ -19151,13 +19216,14 @@ fn resolve_field_ref_loader_aware(
     // the caller's initiating-loader namespace, then validate that the cached
     // declaring class is that owner or one of its actual ancestors.
     let cached = shared
+        .classes
         .resolution_cache
         .read()
         .get_field(current_class_id, cp_index)
         .cloned();
 
     let (field_class_name, field_name) = {
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let class = cm
             .get_class(current_class_id)
             .ok_or_else(|| VmError::Internal {
@@ -19201,7 +19267,11 @@ fn resolve_field_ref_loader_aware(
         && !field_class_name.starts_with('[')
         && !is_global_resolution_namespace(&field_class_name)
         && matches!(
-            shared.class_manager.read().get_loader_id(current_class_id),
+            shared
+                .classes
+                .class_manager
+                .read()
+                .get_loader_id(current_class_id),
             Some(cratonvm_types::ClassLoaderId::UserDefined(_))
         );
     // An isolated URL loader must not accept an initiating-cache entry here:
@@ -19226,7 +19296,7 @@ fn resolve_field_ref_loader_aware(
     };
     if let Some(cached) = cached {
         let cache_matches_owner = {
-            let cm = shared.class_manager.read();
+            let cm = shared.classes.class_manager.read();
             cached.declaring_class_id == field_class_id
                 || cm.is_subclass_of(field_class_id, cached.declaring_class_id)
         };
@@ -19271,7 +19341,7 @@ fn resolve_field_in_class(
     // ("Drop the read lock before acquiring write lock"); mirror it here:
     // resolve under `cm`, DROP it at block end, then cache + return.
     let own_resolved = {
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let mut found: Option<ResolvedField> = None;
         if let Some(class) = cm.get_class(field_class_id) {
             let mut static_idx = 0usize;
@@ -19322,16 +19392,17 @@ fn resolve_field_in_class(
         found
     };
     if let Some(resolved) = own_resolved {
-        shared
-            .resolution_cache
-            .write()
-            .put_field(current_class_id, cp_index, resolved.clone());
+        shared.classes.resolution_cache.write().put_field(
+            current_class_id,
+            cp_index,
+            resolved.clone(),
+        );
         return Ok(resolved);
     }
 
     // Walk the superclass chain for inherited fields
     let (idx, is_static, is_volatile, declaring_id, is_ref, desc_byte) = {
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let (field_idx, field, decl_id) =
             find_field_recursive(field_class_id, &field_name, &cm.class_store).ok_or_else(
                 || {
@@ -19371,7 +19442,7 @@ fn resolve_field_in_class(
         desc_byte,
     };
     if std::env::var("CRATON_FIELD_TRACE").is_ok() && !is_static {
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let decl = cm.get_class(declaring_id);
         let ntf = decl.map(|c| c.num_total_fields).unwrap_or(0);
         let ffi = decl.map(|c| c.first_field_index).unwrap_or(0);
@@ -19381,6 +19452,7 @@ fn resolve_field_in_class(
         }
     }
     shared
+        .classes
         .resolution_cache
         .write()
         .put_field(current_class_id, cp_index, resolved.clone());
@@ -19410,7 +19482,7 @@ fn retarget_instance_field_to_receiver(
             // should_use_loader_initiated_resolution — worth knowing this
             // gate is the reason retargeting was skipped for a genuinely
             // mismatched receiver.
-            let cm = shared.class_manager.read();
+            let cm = shared.classes.class_manager.read();
             let decl_name = cm
                 .get_class(field.declaring_class_id)
                 .map(|c| c.name.to_string())
@@ -19429,7 +19501,7 @@ fn retarget_instance_field_to_receiver(
         return None;
     }
 
-    let cm = shared.class_manager.read();
+    let cm = shared.classes.class_manager.read();
     let current_class = cm.get_class(current_class_id)?;
     let name_and_type_index = match current_class.constant_pool.get(cp_index)? {
         ConstantPoolEntry::FieldReference {
@@ -19499,7 +19571,7 @@ fn retarget_instance_field_to_receiver(
 /// Used at the getstatic/putstatic opcode boundary to build a
 /// `NoClassDefFoundError` message when class resolution fails.
 fn field_ref_class_name(shared: &SharedVm, class_id: ClassId, cp_index: u16) -> Option<String> {
-    let cm = shared.class_manager.read();
+    let cm = shared.classes.class_manager.read();
     let class = cm.get_class(class_id)?;
     if let Some(ConstantPoolEntry::FieldReference { class_index, .. }) =
         class.constant_pool.get(cp_index)
@@ -19515,7 +19587,7 @@ fn field_ref_class_name(shared: &SharedVm, class_id: ClassId, cp_index: u16) -> 
 
 /// Extract the field name from a constant pool FieldReference (for enhanced NPE messages).
 pub fn resolve_field_name(shared: &SharedVm, class_id: ClassId, cp_index: u16) -> Option<String> {
-    let cm = shared.class_manager.read();
+    let cm = shared.classes.class_manager.read();
     let class = cm.get_class(class_id)?;
     if let Some(ConstantPoolEntry::FieldReference {
         name_and_type_index,
@@ -19983,7 +20055,7 @@ struct CpPoolResolver<'a> {
 impl crate::runtime::exceptions::helpful_npe::CpResolver for CpPoolResolver<'_> {
     fn field_ref(&self, cp_index: u16) -> Option<crate::runtime::exceptions::helpful_npe::CpRef> {
         use crate::runtime::exceptions::helpful_npe::CpRef;
-        let cm = self.shared.class_manager.read_recursive();
+        let cm = self.shared.classes.class_manager.read_recursive();
         let class = cm.get_class(self.class_id)?;
         if let Some(ConstantPoolEntry::FieldReference {
             class_index,
@@ -20008,7 +20080,7 @@ impl crate::runtime::exceptions::helpful_npe::CpResolver for CpPoolResolver<'_> 
 
     fn method_ref(&self, cp_index: u16) -> Option<crate::runtime::exceptions::helpful_npe::CpRef> {
         use crate::runtime::exceptions::helpful_npe::CpRef;
-        let cm = self.shared.class_manager.read_recursive();
+        let cm = self.shared.classes.class_manager.read_recursive();
         let class = cm.get_class(self.class_id)?;
         let (class_index, nat_index) = match class.constant_pool.get(cp_index) {
             Some(ConstantPoolEntry::MethodReference {
@@ -20040,7 +20112,7 @@ impl crate::runtime::exceptions::helpful_npe::CpResolver for CpPoolResolver<'_> 
     /// `this` spelling.
     fn local_name(&self, slot: u16, bci: usize) -> Option<String> {
         use cratonvm_reader::attribute::Attribute;
-        let cm = self.shared.class_manager.read_recursive();
+        let cm = self.shared.classes.class_manager.read_recursive();
         let class = cm.get_class(self.class_id)?;
         let method = class.find_method(self.method_name, self.method_descriptor)?;
         let code = method.code()?;
@@ -20069,7 +20141,7 @@ impl crate::runtime::exceptions::helpful_npe::CpResolver for CpPoolResolver<'_> 
     /// up from the method's access flags; a method we can't resolve defaults to
     /// instance (legacy `this` spelling), matching the trait default.
     fn is_static_method(&self) -> bool {
-        let cm = self.shared.class_manager.read_recursive();
+        let cm = self.shared.classes.class_manager.read_recursive();
         let Some(class) = cm.get_class(self.class_id) else {
             return false;
         };
@@ -20204,7 +20276,7 @@ fn resolved_private_invokevirtual_target(
     // docs/known-issues/h2/bug-h2-suite-residual-fail-triage.md
     // (TestUpgrade's `RootReference.tryUpdate`/`hasChangesSince` residual).
     let self_match = {
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         cm.get_class(current_class_id)
             .map(|c| &*c.name == method_class_name)
             .unwrap_or(false)
@@ -20214,13 +20286,14 @@ fn resolved_private_invokevirtual_target(
     } else {
         lookup_loader_initiated(shared, current_class_id, method_class_name).or_else(|| {
             shared
+                .classes
                 .class_manager
                 .read()
                 .get_loaded_class_id(method_class_name)
         })
     }?;
 
-    let cm = shared.class_manager.read();
+    let cm = shared.classes.class_manager.read();
     let store = &cm.class_store;
     let (method, declaring_id) = crate::classloading::find_method_recursive(
         target_class_id,
@@ -20263,7 +20336,7 @@ fn execute_invoke_kind(
         && method_owner_name.contains("RootReference")
         && &*method_name == "<init>"
     {
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let cur_loader = cm.get_loader_id(current_class_id);
         drop(cm);
         eprintln!(
@@ -20303,7 +20376,7 @@ fn execute_invoke_kind(
         let loaded =
             resolve_class_loader_aware(shared, thread, current_class_id, &method_class_name).ok();
         loaded.and_then(|cid| {
-            let cm = shared.class_manager.read();
+            let cm = shared.classes.class_manager.read();
             cm.get_class(cid).filter(|c| c.is_interface()).map(|_| cid)
         })
     } else {
@@ -20372,6 +20445,7 @@ fn execute_invoke_kind(
                 Value::Object(Some(obj)) => {
                     let cid = shared.heap.class_id_of(*obj);
                     let cn = shared
+                        .classes
                         .class_manager
                         .read()
                         .get_class(cid)
@@ -20397,6 +20471,7 @@ fn execute_invoke_kind(
                 Value::Object(Some(obj)) => {
                     let cid = shared.heap.class_id_of(*obj);
                     let cn = shared
+                        .classes
                         .class_manager
                         .read()
                         .get_class(cid)
@@ -20426,6 +20501,7 @@ fn execute_invoke_kind(
                 Value::Object(Some(obj)) => {
                     let cid = shared.heap.class_id_of(*obj);
                     let cn = shared
+                        .classes
                         .class_manager
                         .read()
                         .get_class(cid)
@@ -20458,6 +20534,7 @@ fn execute_invoke_kind(
                 Value::Object(Some(obj)) => {
                     let cid = shared.heap.class_id_of(*obj);
                     let cn = shared
+                        .classes
                         .class_manager
                         .read()
                         .get_class(cid)
@@ -20515,6 +20592,7 @@ fn execute_invoke_kind(
             };
             let receiver_ordinal = shared.heap.get_field(*receiver, 1);
             let receiver_class_name = shared
+                .classes
                 .class_manager
                 .read()
                 .get_class(shared.heap.class_id_of(*receiver))
@@ -20530,6 +20608,7 @@ fn execute_invoke_kind(
                 };
                 let candidate_ordinal = shared.heap.get_field(candidate, 1);
                 let candidate_class_name = shared
+                    .classes
                     .class_manager
                     .read()
                     .get_class(shared.heap.class_id_of(candidate))
@@ -20608,6 +20687,7 @@ fn execute_invoke_kind(
             Some(Value::Object(Some(r))) => {
                 let cid = shared.heap.class_id_of(*r);
                 let cn = shared
+                    .classes
                     .class_manager
                     .read()
                     .get_class(cid)
@@ -20625,6 +20705,7 @@ fn execute_invoke_kind(
                 Value::Object(Some(r)) => {
                     let cid = shared.heap.class_id_of(*r);
                     let cn = shared
+                        .classes
                         .class_manager
                         .read()
                         .get_class(cid)
@@ -20654,6 +20735,7 @@ fn execute_invoke_kind(
     let is_lambda_proxy_receiver = if !is_special {
         match args.first() {
             Some(Value::Object(Some(obj_ref))) => shared
+                .classes
                 .lambda_proxies
                 .read()
                 .contains_key(&shared.heap.class_id_of(*obj_ref)),
@@ -20839,6 +20921,7 @@ fn execute_invoke_kind(
                                 // path; never risk a re-entrant class_manager
                                 // deadlock — fall back to the raw class_id.
                                 let orig = shared
+                                    .classes
                                     .class_manager
                                     .try_read()
                                     .and_then(|cm| {
@@ -21160,7 +21243,7 @@ fn execute_invoke_kind(
                         // (e.g. Function.andThen), dispatch on the functional
                         // interface class so the native default method is found.
                         let lambda_iface = {
-                            let proxies = shared.lambda_proxies.read();
+                            let proxies = shared.classes.lambda_proxies.read();
                             proxies
                                 .get(&cid)
                                 .map(|lcs| lcs.functional_interface.clone())
@@ -21198,7 +21281,7 @@ fn execute_invoke_kind(
                             // `Logger.getMessageLogger` can dispatch the
                             // subsequent `loadClass` instead of NSME'ing on
                             // `Object.loadClass`.
-                            let cm_read = shared.class_manager.read();
+                            let cm_read = shared.classes.class_manager.read();
                             let recv_class = cm_read.get_class(cid);
                             let recv_is_iface =
                                 recv_class.map(|c| c.is_interface()).unwrap_or(false);
@@ -21227,7 +21310,7 @@ fn execute_invoke_kind(
             }
             Value::Object(None) => {
                 if crate::runtime::env_cache::dbg_jetty2() {
-                    let cm = shared.class_manager.read();
+                    let cm = shared.classes.class_manager.read();
                     eprintln!(
                         "[jetty2] NULL-RECEIVER invoke {}.{}{} — Java stack:",
                         &*method_class_name, &*method_name, &*method_descriptor
@@ -21295,6 +21378,7 @@ fn execute_invoke_kind(
                         }
                         if &*method_name == "getInterfaces" {
                             let class_class_id = shared
+                                .classes
                                 .class_manager
                                 .read()
                                 .get_loaded_class_id("java/lang/Class")
@@ -21392,7 +21476,7 @@ fn execute_invoke_kind(
                     // version "null"` (Felix framework bootstrap). The hack
                     // is removed so the spec-compliant NPE below fires.
                     if crate::runtime::env_cache::modstatic_dbg() && &*method_name == "set" {
-                        let cm = shared.class_manager.read();
+                        let cm = shared.classes.class_manager.read();
                         eprintln!("MODSTATIC: NPE 'set on null' frames:");
                         for (i, f) in thread.frames.iter().enumerate().rev().take(12) {
                             let cn = cm
@@ -21410,7 +21494,7 @@ fn execute_invoke_kind(
                     if crate::runtime::env_cache::dbg_jetty()
                         && method_class_name.starts_with("org/eclipse/jetty/start/")
                     {
-                        let cm = shared.class_manager.read();
+                        let cm = shared.classes.class_manager.read();
                         eprintln!(
                             "[cratonvm-jetty] NULL-RECEIVER invoke {}.{}{} — Java stack:",
                             &*method_class_name, &*method_name, &*method_descriptor
@@ -21430,7 +21514,7 @@ fn execute_invoke_kind(
                         }
                     }
                     if std::env::var_os("CRATONVM_DBG_NPE_STACK").is_some() {
-                        let cm = shared.class_manager.read();
+                        let cm = shared.classes.class_manager.read();
                         eprintln!(
                             "[CRATONVM_DBG_NPE_STACK] NPE invoke {}.{}{} — stack:",
                             &*method_class_name, &*method_name, &*method_descriptor
@@ -21741,7 +21825,7 @@ fn execute_invoke_kind(
     let loader_interface_override =
         if is_interface && !is_special && crate::runtime::env_cache::loader_aware_resolution() {
             receiver_class_id.and_then(|receiver_id| {
-                let cm = shared.class_manager.read();
+                let cm = shared.classes.class_manager.read();
                 let receiver_has_class_override = crate::classloading::find_method_recursive(
                     receiver_id,
                     &method_name,
@@ -21786,11 +21870,12 @@ fn execute_invoke_kind(
         // `ArgumentCodeGenerator.and()` chain, 2026-07-15).
         let lambda_iface_override = receiver_class_id.and_then(|rcv_cid| {
             let iface_id = shared
+                .classes
                 .lambda_proxies
                 .read()
                 .get(&rcv_cid)
                 .and_then(|lcs| lcs.functional_interface_id)?;
-            let cm = shared.class_manager.read();
+            let cm = shared.classes.class_manager.read();
             let iface_matches_invoke = cm
                 .get_class(iface_id)
                 .map(|c| &*c.name == &*invoke_class)
@@ -21801,7 +21886,7 @@ fn execute_invoke_kind(
         lambda_iface_override.or_else(|| {
             receiver_class_id.filter(|rcv_cid| {
                 *rcv_cid != ClassId::new(0) && {
-                    let cm = shared.class_manager.read();
+                    let cm = shared.classes.class_manager.read();
                     cm.get_loaded_class_id(&invoke_class) != Some(*rcv_cid)
                         && cm
                             .get_class(*rcv_cid)
@@ -21825,7 +21910,7 @@ fn execute_invoke_kind(
                 Some(Value::Object(Some(recv))) => {
                     let recv_cid = shared.heap.class_id_of(*recv);
                     if recv_cid != ClassId::new(0) {
-                        let cm = shared.class_manager.read();
+                        let cm = shared.classes.class_manager.read();
                         let recv_matches_owner = cm
                             .get_class(recv_cid)
                             .map(|c| {
@@ -21851,6 +21936,7 @@ fn execute_invoke_kind(
             lookup_loader_initiated(shared, current_class_id, &invoke_class).filter(|owner_cid| {
                 *owner_cid != ClassId::new(0)
                     && shared
+                        .classes
                         .class_manager
                         .read()
                         .get_loaded_class_id(&invoke_class)
@@ -21864,7 +21950,7 @@ fn execute_invoke_kind(
     if std::env::var("CRATONVM_DBG_LOADER_TRACE").is_ok()
         && (invoke_class.contains("RootReference") || &*method_name == "compareAndSetRoot")
     {
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let invoke_class_resolved = cm.get_loaded_class_id(&invoke_class);
         let cur_loader = cm.get_loader_id(current_class_id);
         let recv_loader = receiver_class_id.and_then(|c| cm.get_loader_id(c));
@@ -21958,7 +22044,7 @@ fn execute_invoke_kind(
     //    entry in `class_manager` (it has no real method table of its own
     //    for `invoke_on_class_shared`'s `find_method_recursive` to walk).
     //    `invoke_on_class_shared_inner` DOES also re-check
-    //    `shared.lambda_proxies` on the receiver up front and redirect to
+    //    `shared.classes.lambda_proxies` on the receiver up front and redirect to
     //    `try_lambda_dispatch`, but only when passed the RECEIVER's own
     //    class_id — routing a lambda receiver's SAM method call (e.g.
     //    `Consumer.accept`) through this branch at all, instead of the
@@ -21967,7 +22053,7 @@ fn execute_invoke_kind(
     //    `ProcessInfoTests.memoryInfoIsAvailable`'s `allSatisfy(lambda)`
     //    with `NoSuchMethodError: <unknown class N>.accept(...)`.
     let is_lambda_receiver = receiver_class_id
-        .map(|c| shared.lambda_proxies.read().contains_key(&c))
+        .map(|c| shared.classes.lambda_proxies.read().contains_key(&c))
         .unwrap_or(false);
     let result = if let Some(rcv_cid) = dispatch_override
         .or_else(|| receiver_class_id.filter(|c| *c != ClassId::new(0) && !is_lambda_receiver))
@@ -22172,6 +22258,7 @@ fn box_aastore_value_fast(shared: &SharedVm, value: Value) -> Value {
         _ => return value,
     };
     let class_id = shared
+        .classes
         .class_manager
         .write()
         .load_class(class_name)
@@ -22320,6 +22407,7 @@ fn checkcast_lambda_instantiated_args(
         };
         if lambda_arg_provably_not_instance(shared, obj_ref, inst_tok) {
             let obj_class_name = shared
+                .classes
                 .class_manager
                 .read()
                 .get_class(shared.heap.class_id_of(obj_ref))
@@ -22386,7 +22474,7 @@ fn cce_display_class_name(shared: &SharedVm, obj_ref: ObjectRef, raw_name: &str)
     };
     let size = {
         let class_id = shared.heap.class_id_of(backing);
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         find_field_recursive(class_id, "size", &cm.class_store)
             .map(|(field_index, _, _)| shared.heap.get_field(backing, field_index))
     };
@@ -22424,6 +22512,7 @@ fn lambda_arg_provably_not_instance(shared: &SharedVm, obj_ref: ObjectRef, desc_
     // mismatch against the erased bridge parameter, so preserve this helper's
     // fail-open contract and let the normal lambda dispatch validate it.
     if shared
+        .classes
         .class_manager
         .read()
         .get_class(obj_class_id)
@@ -22432,7 +22521,7 @@ fn lambda_arg_provably_not_instance(shared: &SharedVm, obj_ref: ObjectRef, desc_
         return false;
     }
     let (target_cid, is_sub, target_is_interface) = {
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         match cm.get_loaded_class_id(target) {
             // Not loaded → no instance could exist, but don't guess; fail open.
             None => return false,
@@ -22453,7 +22542,7 @@ fn lambda_arg_provably_not_instance(shared: &SharedVm, obj_ref: ObjectRef, desc_
     // loader-aware checkcast path.  Restrict it to user loaders so ordinary
     // bootstrap/application delegation remains unchanged.
     let loader_scoped_is_sub = if crate::runtime::env_cache::loader_aware_resolution() {
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         cm.get_loader_id(obj_class_id)
             .filter(|loader| matches!(loader, cratonvm_types::ClassLoaderId::UserDefined(_)))
             .and_then(|loader| cm.class_defined_by_loader_exact(target, loader))
@@ -22501,6 +22590,7 @@ fn lambda_arg_provably_not_instance(shared: &SharedVm, obj_ref: ObjectRef, desc_
     // only same-named cross-loader pairs are affected, never distinct types.
     if crate::runtime::env_cache::loader_aware_resolution() {
         let same_name = shared
+            .classes
             .class_manager
             .read()
             .get_class(obj_class_id)
@@ -22528,6 +22618,7 @@ fn lambda_arg_provably_not_instance(shared: &SharedVm, obj_ref: ObjectRef, desc_
     // target as interface-like too, matching the conservative posture above.
     let obj_is_bare = obj_class_id == ClassId::new(0)
         || shared
+            .classes
             .class_manager
             .read()
             .get_class(obj_class_id)
@@ -22540,7 +22631,7 @@ fn lambda_arg_provably_not_instance(shared: &SharedVm, obj_ref: ObjectRef, desc_
 }
 
 fn target_used_as_interface(shared: &SharedVm, target_cid: ClassId) -> bool {
-    let cm = shared.class_manager.read();
+    let cm = shared.classes.class_manager.read();
     let is_interface = cm
         .class_store()
         .iter()
@@ -22826,7 +22917,7 @@ pub(crate) fn lambda_args_sam_compatible(
         let target = &pd[1..pd.len() - 1];
         let arg_cid = shared.heap.class_id_of(arg);
         let (target_cid, base) = {
-            let cm = shared.class_manager.read();
+            let cm = shared.classes.class_manager.read();
             match cm.get_loaded_class_id(target) {
                 Some(tcid) => (tcid, arg_cid == tcid || cm.is_subclass_of(arg_cid, tcid)),
                 None => continue, // SAM param type not loaded — can't judge → compatible
@@ -22873,6 +22964,7 @@ pub(crate) fn lambda_impl_dispatch_override(
         return None;
     }
     let host = *shared
+        .classes
         .lambda_proxy_hosts
         .read()
         .get(&call_site.proxy_class_id)?;
@@ -22924,11 +23016,12 @@ pub(crate) fn lambda_impl_dispatch_override_driven(
         return None;
     }
     let host = *shared
+        .classes
         .lambda_proxy_hosts
         .read()
         .get(&call_site.proxy_class_id)?;
     if !matches!(
-        shared.class_manager.read().get_loader_id(host),
+        shared.classes.class_manager.read().get_loader_id(host),
         Some(cratonvm_types::ClassLoaderId::UserDefined(_))
     ) {
         return None;
@@ -22950,11 +23043,12 @@ pub(crate) fn lambda_private_impl_dispatch_class(
 ) -> Option<ClassId> {
     let owner_id = lambda_impl_dispatch_override(shared, call_site).or_else(|| {
         shared
+            .classes
             .class_manager
             .read()
             .get_loaded_class_id(&call_site.impl_handle.class_name)
     })?;
-    let cm = shared.class_manager.read();
+    let cm = shared.classes.class_manager.read();
     let (method, declaring_id) = crate::classloading::find_method_recursive(
         owner_id,
         &call_site.impl_handle.member_name,
@@ -22987,7 +23081,7 @@ fn try_lambda_default_method_dispatch(
     full_args: &[Value],
 ) -> Result<Option<Option<Value>>, MethodCallFailed> {
     let (interface_name, interface_id_hint) = {
-        let proxies = shared.lambda_proxies.read();
+        let proxies = shared.classes.lambda_proxies.read();
         match proxies.get(&obj_class_id) {
             Some(call_site) => (
                 call_site.functional_interface.clone(),
@@ -23004,7 +23098,7 @@ fn try_lambda_default_method_dispatch(
         );
     }
     let declaring_id = {
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         // Prefer the loader-resolved interface captured at bootstrap time:
         // a bare name lookup returns an arbitrary copy when several loaders
         // define the same interface, executing the default method in the
@@ -23064,7 +23158,12 @@ fn try_tdigest_lambda_double_get(shared: &SharedVm, proxy: ObjectRef, index: i32
         return None;
     }
     let proxy_class_id = shared.heap.class_id_of(proxy);
-    let call_site = shared.lambda_proxies.read().get(&proxy_class_id).cloned()?;
+    let call_site = shared
+        .classes
+        .lambda_proxies
+        .read()
+        .get(&proxy_class_id)
+        .cloned()?;
     if call_site.functional_interface.as_ref() != "java/util/function/Function"
         || call_site.sam_method_name.as_ref() != "apply"
         || call_site.sam_descriptor.as_ref() != "(Ljava/lang/Object;)Ljava/lang/Object;"
@@ -23088,7 +23187,7 @@ fn try_tdigest_lambda_double_get(shared: &SharedVm, proxy: ObjectRef, index: i32
         .with(|cache| cache.borrow().get(&key).copied())
         .or_else(|| {
             let (declaring_id, field_cp_index) = {
-                let cm = shared.class_manager.read();
+                let cm = shared.classes.class_manager.read();
                 let (method, declaring_id) = crate::classloading::find_method_recursive(
                     receiver_class_id,
                     "get",
@@ -23150,7 +23249,7 @@ fn try_invoke_cached_lambda_impl(
         Some(c) if &*c.method_name == method_name && &*c.method_descriptor == descriptor => c,
         Some(_) => return Ok(None),
         None => {
-            let cm = shared.class_manager.read();
+            let cm = shared.classes.class_manager.read();
             let store = cm.class_store();
             let Some((method, declaring_id)) = crate::classloading::find_method_recursive(
                 receiver_class_id,
@@ -23321,7 +23420,7 @@ pub(crate) fn try_lambda_dispatch(
 
     // Look up the lambda proxy metadata for this ClassId.
     let call_site = {
-        let proxies = shared.lambda_proxies.read();
+        let proxies = shared.classes.lambda_proxies.read();
         match proxies.get(&obj_class_id) {
             Some(lcs) => lcs.clone(),
             None => return Ok(None), // Not a lambda proxy
@@ -23411,7 +23510,7 @@ pub(crate) fn try_lambda_dispatch(
                 drop(call_site);
                 // Reborrow fresh to avoid use-after-move.
                 let lcs = {
-                    let proxies = shared.lambda_proxies.read();
+                    let proxies = shared.classes.lambda_proxies.read();
                     proxies.get(&obj_class_id).cloned()
                 };
                 let lcs = match lcs {
@@ -23478,6 +23577,7 @@ pub(crate) fn try_lambda_dispatch(
                         };
                         let receiver_class = match rcv_id_opt {
                             Some(rcv) => shared
+                                .classes
                                 .class_manager
                                 .read()
                                 .get_class(rcv)
@@ -23490,9 +23590,9 @@ pub(crate) fn try_lambda_dispatch(
                         let vov = if crate::runtime::env_cache::loader_aware_resolution() {
                             rcv_id_opt.filter(|rcv| {
                                 *rcv != ClassId::new(0)
-                                    && !shared.lambda_proxies.read().contains_key(rcv)
+                                    && !shared.classes.lambda_proxies.read().contains_key(rcv)
                                     && {
-                                        let cm = shared.class_manager.read();
+                                        let cm = shared.classes.class_manager.read();
                                         cm.get_class(*rcv)
                                             .map(|c| &*c.name == receiver_class.as_str())
                                             .unwrap_or(false)
@@ -23748,7 +23848,11 @@ pub(crate) fn try_lambda_dispatch(
             // item is a lambda proxy, never a concrete CacheOverride.
             if let Value::Object(Some(r)) = &full_args[0] {
                 let rcv_class_id = shared.heap.class_id_of(*r);
-                let recv_is_lambda = shared.lambda_proxies.read().contains_key(&rcv_class_id);
+                let recv_is_lambda = shared
+                    .classes
+                    .lambda_proxies
+                    .read()
+                    .contains_key(&rcv_class_id);
                 if recv_is_lambda {
                     let inner = try_lambda_dispatch(
                         shared,
@@ -23809,6 +23913,7 @@ pub(crate) fn try_lambda_dispatch(
             }
             let receiver_class = match recv_class_id_opt {
                 Some(rcv_class_id) => shared
+                    .classes
                     .class_manager
                     .read()
                     .get_class(rcv_class_id)
@@ -23826,17 +23931,19 @@ pub(crate) fn try_lambda_dispatch(
             // invoke_virtual divergence override.
             let virtual_override = if crate::runtime::env_cache::loader_aware_resolution() {
                 recv_class_id_opt.filter(|rcv| {
-                    *rcv != ClassId::new(0) && !shared.lambda_proxies.read().contains_key(rcv) && {
-                        let cm = shared.class_manager.read();
-                        // Only when `receiver_class` truly names the receiver's
-                        // own real class (not the impl-handle fallback for a
-                        // lambda-proxy / generic-ClassId receiver) AND that name
-                        // globally resolves to a DIFFERENT (per-loader) copy.
-                        cm.get_class(*rcv)
-                            .map(|c| &*c.name == receiver_class.as_str())
-                            .unwrap_or(false)
-                            && cm.get_loaded_class_id(&receiver_class) != Some(*rcv)
-                    }
+                    *rcv != ClassId::new(0)
+                        && !shared.classes.lambda_proxies.read().contains_key(rcv)
+                        && {
+                            let cm = shared.classes.class_manager.read();
+                            // Only when `receiver_class` truly names the receiver's
+                            // own real class (not the impl-handle fallback for a
+                            // lambda-proxy / generic-ClassId receiver) AND that name
+                            // globally resolves to a DIFFERENT (per-loader) copy.
+                            cm.get_class(*rcv)
+                                .map(|c| &*c.name == receiver_class.as_str())
+                                .unwrap_or(false)
+                                && cm.get_loaded_class_id(&receiver_class) != Some(*rcv)
+                        }
                 })
             } else {
                 None
@@ -23851,12 +23958,14 @@ pub(crate) fn try_lambda_dispatch(
             // different private body with the same name and descriptor.
             let impl_owner_id = lambda_impl_dispatch_override(shared, &call_site).or_else(|| {
                 shared
+                    .classes
                     .class_manager
                     .read()
                     .get_loaded_class_id(&call_site.impl_handle.class_name)
             });
             let private_impl_owner = impl_owner_id.filter(|owner_id| {
                 shared
+                    .classes
                     .class_manager
                     .read()
                     .get_class(*owner_id)
@@ -23913,8 +24022,13 @@ pub(crate) fn try_lambda_dispatch(
                 )
             } else if let Some(rcv_cid) = recv_class_id_opt.filter(|rcv| {
                 *rcv != ClassId::new(0)
-                    && !shared.lambda_proxies.read().contains_key(rcv)
-                    && shared.class_manager.read().get_class(*rcv).is_some()
+                    && !shared.classes.lambda_proxies.read().contains_key(rcv)
+                    && shared
+                        .classes
+                        .class_manager
+                        .read()
+                        .get_class(*rcv)
+                        .is_some()
             }) {
                 // The captured receiver is already a loaded, concrete object.
                 // Dispatch by its ClassId instead of converting it back to a class
@@ -24013,6 +24127,7 @@ pub(crate) fn try_lambda_dispatch(
             let class_id = match lambda_impl_dispatch_override_driven(shared, thread, &call_site) {
                 Some(cid) => cid,
                 None => shared
+                    .classes
                     .class_manager
                     .write()
                     .load_class(&call_site.impl_handle.class_name)?,
@@ -24056,6 +24171,7 @@ pub(crate) fn try_lambda_dispatch(
             let class_id = match lambda_impl_dispatch_override_driven(shared, thread, &call_site) {
                 Some(cid) => cid,
                 None => shared
+                    .classes
                     .class_manager
                     .write()
                     .load_class(&call_site.impl_handle.class_name)?,
@@ -24078,6 +24194,7 @@ pub(crate) fn try_lambda_dispatch(
             // Detect the array case up front and dispatch to real array
             // allocation instead.
             let array_info = shared
+                .classes
                 .class_manager
                 .read()
                 .get_class(class_id)
@@ -24126,6 +24243,7 @@ pub(crate) fn try_lambda_dispatch(
             // reference would under-allocate and trip the GC `get_field`
             // bounds guard on any inherited-field access.
             let num_fields = shared
+                .classes
                 .class_manager
                 .read()
                 .get_class(class_id)
@@ -24175,7 +24293,7 @@ pub(crate) fn try_lambda_dispatch(
                     // We need to resolve the field index. For simplicity, do a field lookup.
                     let target_class_id = shared.heap.class_id_of(*target_ref);
                     let field_index = {
-                        let cm = shared.class_manager.read();
+                        let cm = shared.classes.class_manager.read();
                         find_field_recursive(
                             target_class_id,
                             &call_site.impl_handle.member_name,
@@ -24202,13 +24320,14 @@ pub(crate) fn try_lambda_dispatch(
             let class_id = match lambda_impl_dispatch_override_driven(shared, thread, &call_site) {
                 Some(cid) => cid,
                 None => shared
+                    .classes
                     .class_manager
                     .write()
                     .load_class(&call_site.impl_handle.class_name)?,
             };
             ensure_class_initialized_shared(shared, thread, class_id)?;
             let field_index = {
-                let cm = shared.class_manager.read();
+                let cm = shared.classes.class_manager.read();
                 find_field_recursive(
                     class_id,
                     &call_site.impl_handle.member_name,
@@ -24236,7 +24355,7 @@ pub(crate) fn try_lambda_dispatch(
                 Value::Object(Some(target_ref)) => {
                     let target_class_id = shared.heap.class_id_of(*target_ref);
                     let field_index = {
-                        let cm = shared.class_manager.read();
+                        let cm = shared.classes.class_manager.read();
                         find_field_recursive(
                             target_class_id,
                             &call_site.impl_handle.member_name,
@@ -24271,13 +24390,14 @@ pub(crate) fn try_lambda_dispatch(
             let class_id = match lambda_impl_dispatch_override_driven(shared, thread, &call_site) {
                 Some(cid) => cid,
                 None => shared
+                    .classes
                     .class_manager
                     .write()
                     .load_class(&call_site.impl_handle.class_name)?,
             };
             ensure_class_initialized_shared(shared, thread, class_id)?;
             let field_index = {
-                let cm = shared.class_manager.read();
+                let cm = shared.classes.class_manager.read();
                 find_field_recursive(
                     class_id,
                     &call_site.impl_handle.member_name,
@@ -28685,7 +28805,7 @@ fn native_shadow_suppressed_by_redefine(shared: &SharedVm, class_name: &str) -> 
     if !crate::classloading::any_class_redefined() {
         return false;
     }
-    let cm = shared.class_manager.read();
+    let cm = shared.classes.class_manager.read();
     native_shadow_suppressed_by_redefine_in(&cm, class_name)
 }
 
@@ -29102,7 +29222,7 @@ fn threadpool_executor_has_real_workers(shared: &SharedVm, recv: &Value) -> bool
         return false;
     };
     let class_id = shared.heap.class_id_of(*recv);
-    let cm = shared.class_manager.read();
+    let cm = shared.classes.class_manager.read();
     let Some(index) =
         crate::vm::vm_exec::resolve_field_index_in_hierarchy(class_id, "workers", &cm.class_store)
     else {
@@ -29173,7 +29293,7 @@ fn intercept_force_registered_native(
             Some(Value::Object(Some(receiver))) if {
                 let receiver_cid = shared.heap.class_id_of(*receiver);
                 shared
-                    .class_manager
+                    .classes.class_manager
                     .read()
                     .get_class(receiver_cid)
                     .map(|class| &*class.name == "java/lang/Class")
@@ -29209,7 +29329,7 @@ fn intercept_force_registered_native(
         Some(Value::Object(Some(receiver))) if {
             let receiver_cid = shared.heap.class_id_of(*receiver);
             shared
-                .class_manager
+                .classes.class_manager
                 .read()
                 .get_class(receiver_cid)
                 .map(|class| &*class.name == "java/lang/Class")
@@ -29411,7 +29531,7 @@ fn intercept_force_registered_native_cached(
         Some(Value::Object(Some(receiver))) if {
             let receiver_cid = shared.heap.class_id_of(*receiver);
             shared
-                .class_manager
+                .classes.class_manager
                 .read()
                 .get_class(receiver_cid)
                 .map(|class| &*class.name == "java/lang/Class")
@@ -29517,7 +29637,7 @@ fn intercept_jython_pyjavatype_findattr_ex(
     }
     let recv_cid = receiver_class_id?;
     let recv_name = {
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         cm.get_class(recv_cid).map(|c| c.name.to_string())?
     };
     if recv_name != "org/python/core/PyJavaType" {
@@ -29558,7 +29678,7 @@ fn intercept_jython_pymodule_findattr(
     }
     let recv_cid = receiver_class_id?;
     let recv_name = {
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         cm.get_class(recv_cid).map(|c| c.name.to_string())?
     };
     if recv_name != "org/python/core/PyModule" {
@@ -29624,7 +29744,7 @@ fn intercept_urlclassloader_subclass_native_method(
     }
     let recv_cid = receiver_class_id?;
     let declaring_name = {
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let store = &cm.class_store;
         let (_m, declaring_id) = crate::classloading::find_method_recursive(
             recv_cid,
@@ -29694,7 +29814,7 @@ fn intercept_classloader_subclass_resource_native(
     }
     let recv_cid = receiver_class_id?;
     let declaring_name = {
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let store = &cm.class_store;
         let (_m, declaring_id) = crate::classloading::find_method_recursive(
             recv_cid,
@@ -29771,7 +29891,7 @@ fn surefire_lazy_launcher_discover_native(
         .native_methods
         .find(LAZY, "discover", DESC_DISCOVER)?;
     let cid = shared.heap.class_id_of(recv_obj);
-    let cm = shared.class_manager.read();
+    let cm = shared.classes.class_manager.read();
     let ok = cm
         .get_class(cid)
         .map(|c| c.name.as_ref() == LAZY)
@@ -29822,7 +29942,7 @@ fn synthetic_stub_kind_should_yield_to_real_bytecode(
         return false;
     }
 
-    let cm = shared.class_manager.read();
+    let cm = shared.classes.class_manager.read();
     cm.get_loaded_class_id(class_name)
         .and_then(|cid| {
             cm.get_class(cid).and_then(|cls| {
@@ -30042,6 +30162,7 @@ fn try_stackless_invoke(
             if method_name == "type" && descriptor == "()Ljava/lang/invoke/MethodType;" =>
         {
             let is_downcall = shared
+                .classes
                 .class_manager
                 .read()
                 .get_class(shared.heap.class_id_of(*obj))
@@ -30061,6 +30182,7 @@ fn try_stackless_invoke(
             if matches!(method_name, "invoke" | "invokeExact" | "invokeBasic") =>
         {
             let is_downcall = shared
+                .classes
                 .class_manager
                 .read()
                 .get_class(shared.heap.class_id_of(*obj))
@@ -30128,7 +30250,7 @@ fn try_stackless_invoke(
         }
         // For virtual calls, skip hierarchy walk if the class has its own bytecode
         if !walk_native_hierarchy {
-            let cm = shared.class_manager.read();
+            let cm = shared.classes.class_manager.read();
             let has_own_bytecode = cm
                 .get_loaded_class_id(class_name)
                 .and_then(|cid| cm.get_class(cid))
@@ -30138,7 +30260,7 @@ fn try_stackless_invoke(
                 return None;
             }
         }
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let mut cid = cm.get_loaded_class_id(class_name)?;
         loop {
             let parent_id = cm.get_class(cid)?.superclass?;
@@ -30257,7 +30379,7 @@ fn try_stackless_invoke(
         // invoked method can be resolved on an inherited MethodHandle owner
         // while the adapter itself is a concrete JDK subclass.
         let is_method_handle_adapter = {
-            let cm = shared.class_manager.read();
+            let cm = shared.classes.class_manager.read();
             let adapter_class = shared.heap.class_id_of(adapter);
             cm.get_loaded_class_id("java/lang/invoke/MethodHandle")
                 .map(|method_handle_class| {
@@ -30274,6 +30396,7 @@ fn try_stackless_invoke(
             _ => return None,
         };
         let is_downcall = shared
+            .classes
             .class_manager
             .read()
             .get_class(shared.heap.class_id_of(target))
@@ -30353,7 +30476,7 @@ fn try_stackless_invoke(
             };
             let target_class = target.and_then(|target| {
                 shared
-                    .class_manager
+                    .classes.class_manager
                     .read()
                     .get_class(shared.heap.class_id_of(target))
                     .map(|class| class.name.to_string())
@@ -30441,21 +30564,29 @@ fn try_stackless_invoke(
             Some(Value::Object(Some(recv))) => Some(shared.heap.class_id_of(*recv)),
             _ => None,
         };
-        let name_resolved = shared.class_manager.read().get_loaded_class_id(class_name);
+        let name_resolved = shared
+            .classes
+            .class_manager
+            .read()
+            .get_loaded_class_id(class_name);
         eprintln!(
             "[TSI-CTOR-TRACE] class_name={class_name} descriptor={descriptor} is_special={is_special} dispatch_class_override={dispatch_class_override:?} name_resolved={name_resolved:?} receiver_actual_cid={recv_cid:?}"
         );
     }
-    let class_id = match dispatch_class_override
-        .or_else(|| shared.class_manager.read().get_loaded_class_id(class_name))
-    {
+    let class_id = match dispatch_class_override.or_else(|| {
+        shared
+            .classes
+            .class_manager
+            .read()
+            .get_loaded_class_id(class_name)
+    }) {
         Some(id) => id,
         None => return Ok(CachedCallResult::CacheMiss),
     };
 
     // 3. Synthetic stubs need the recursive path
     {
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         if let Some(class) = cm.class_store.get(class_id) {
             if class.is_synthetic_stub {
                 return Ok(CachedCallResult::CacheMiss);
@@ -30464,7 +30595,7 @@ fn try_stackless_invoke(
     }
 
     // 4. Find method in class hierarchy
-    let cm = shared.class_manager.read();
+    let cm = shared.classes.class_manager.read();
     let (method, declaring_id) = match crate::classloading::find_method_recursive(
         class_id,
         method_name,
@@ -30852,7 +30983,7 @@ fn execute_invokestatic(
     let direct_native = direct_native_registered && !direct_synthetic_stub_may_yield;
     let is_native = direct_native
         || (method_name.as_ref() != "<init>" && {
-            let cm = shared.class_manager.read();
+            let cm = shared.classes.class_manager.read();
             let mut found = false;
             if let Some(mut cid) = cm.get_loaded_class_id(&method_class_name) {
                 while let Some(pid) = cm.get_class(cid).and_then(|c| c.superclass) {
@@ -30915,6 +31046,7 @@ fn execute_invokestatic(
     // lookup itself (not just class initialization) uses the correct,
     // already-known identity for a self-call.
     let self_class_id = shared
+        .classes
         .class_manager
         .read()
         .get_class(current_class_id)
@@ -30995,19 +31127,26 @@ fn execute_invokestatic(
             || (method_class_name.as_ref() == "java/lang/Class"
                 && method_name.as_ref() == "forName"))
     {
-        let cur_loader = shared.class_manager.read().get_loader_id(current_class_id);
+        let cur_loader = shared
+            .classes
+            .class_manager
+            .read()
+            .get_loader_id(current_class_id);
         let cur_name = shared
+            .classes
             .class_manager
             .read()
             .get_class(current_class_id)
             .map(|c| c.name.to_string());
-        let resolved_loader =
-            static_dispatch_class_id.and_then(|id| shared.class_manager.read().get_loader_id(id));
+        let resolved_loader = static_dispatch_class_id
+            .and_then(|id| shared.classes.class_manager.read().get_loader_id(id));
         let global_id = shared
+            .classes
             .class_manager
             .read()
             .get_loaded_class_id(&method_class_name);
-        let global_loader = global_id.and_then(|id| shared.class_manager.read().get_loader_id(id));
+        let global_loader =
+            global_id.and_then(|id| shared.classes.class_manager.read().get_loader_id(id));
         eprintln!(
             "[INVOKESTATIC-LOADER-TRACE] method_class={} method={} current_class_id={:?} current_class_name={:?} current_loader={:?} is_native={} self_class_id={:?} static_dispatch_class_id={:?} static_dispatch_loader={:?} global_lookup_id={:?} global_lookup_loader={:?}",
             method_class_name, method_name, current_class_id, cur_name, cur_loader, is_native, self_class_id, static_dispatch_class_id, resolved_loader, global_id, global_loader
@@ -31481,7 +31620,11 @@ fn populate_invoke_cache(
     let promoted_key: crate::runtime::lockfree_resolve::PromotedInvokeKey =
         (caller_class_id, cp_index, is_special, None);
     if loader_owner_override.is_none() {
-        if let Some(target) = shared.shared_resolution.get_promoted_invoke(&promoted_key) {
+        if let Some(target) = shared
+            .classes
+            .shared_resolution
+            .get_promoted_invoke(&promoted_key)
+        {
             thread
                 .invoke_cache
                 .put(caller_class_id, cp_index, is_special, target);
@@ -31526,7 +31669,7 @@ fn populate_invoke_cache(
             )
         })
     {
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let gate = match cm.get_loaded_class_id(&class_name) {
             Some(cid) => RedefineGate::snapshot(cm.class_redefine_generation_handle(cid)),
             None => RedefineGate::never_stale(),
@@ -31562,6 +31705,7 @@ fn populate_invoke_cache(
                     gate,
                 };
                 shared
+                    .classes
                     .shared_resolution
                     .insert_promoted_invoke(promoted_key, target.clone());
                 thread
@@ -31576,6 +31720,7 @@ fn populate_invoke_cache(
             gate,
         };
         shared
+            .classes
             .shared_resolution
             .insert_promoted_invoke(promoted_key, target.clone());
         thread
@@ -31587,15 +31732,19 @@ fn populate_invoke_cache(
     // Find the bytecode method. For static/special refs from a loader-private class,
     // the symbolic owner must stay in that loader's namespace; resolving through
     // the flat global store would cache the app-loader method body.
-    let target_class_id = match loader_owner_override
-        .or_else(|| shared.class_manager.read().get_loaded_class_id(&class_name))
-    {
+    let target_class_id = match loader_owner_override.or_else(|| {
+        shared
+            .classes
+            .class_manager
+            .read()
+            .get_loaded_class_id(&class_name)
+    }) {
         Some(id) => id,
         None => return,
     };
 
     if std::env::var("CRATONVM_DBG_LOADER_TRACE").is_ok() && class_name.contains("RootReference") {
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let caller_loader = cm.get_loader_id(caller_class_id);
         let target_loader = cm.get_loader_id(target_class_id);
         drop(cm);
@@ -31605,7 +31754,7 @@ fn populate_invoke_cache(
         );
     }
 
-    let cm = shared.class_manager.read();
+    let cm = shared.classes.class_manager.read();
     let Some(class) = cm.get_class(target_class_id) else {
         return;
     };
@@ -31670,6 +31819,7 @@ fn populate_invoke_cache(
                     gate,
                 };
                 shared
+                    .classes
                     .shared_resolution
                     .insert_promoted_invoke(promoted_key, target.clone());
                 thread
@@ -31698,6 +31848,7 @@ fn populate_invoke_cache(
                 gate,
             };
             shared
+                .classes
                 .shared_resolution
                 .insert_promoted_invoke(promoted_key, target.clone());
             thread
@@ -31744,6 +31895,7 @@ fn populate_invoke_cache(
     };
     // T10.4 — promote so sibling threads skip the class_manager walk.
     shared
+        .classes
         .shared_resolution
         .insert_promoted_invoke(promoted_key, target.clone());
     thread
@@ -32250,7 +32402,7 @@ fn execute_invokestatic_cached(
 /// intrinsics bail to dispatch) when String is not yet loaded or lacks the
 /// mandatory `value` / `hash` fields. Cheap enough to call once per compilation.
 fn resolve_string_field_layout(shared: &SharedVm) -> Option<cratonvm_jit::StringFieldLayout> {
-    let cm = shared.class_manager.read();
+    let cm = shared.classes.class_manager.read();
     let string_id = cm.find_class_by_name("java/lang/String")?;
     let class = cm.get_class(string_id)?;
     let (value_idx, _) = class.find_own_field("value")?;
@@ -32314,6 +32466,7 @@ fn compile_osr_artifact(
     // Keep synchronized methods out of OSR until that monitor contract is
     // implemented for compiled frames.
     if shared
+        .classes
         .class_manager
         .read()
         .get_class(class_id)
@@ -32346,7 +32499,7 @@ fn compile_osr_artifact(
         // OSR needs the raw bytecode; read it from the frame's code
         // attribute via the class manager. If we can't get it, fall
         // back to `Unknown` which preserves the historical ban.
-        match shared.class_manager.read().get_class(class_id) {
+        match shared.classes.class_manager.read().get_class(class_id) {
             Some(class) => class
                 .methods
                 .iter()
@@ -32510,25 +32663,26 @@ fn compile_osr_artifact(
             // `try { resp.resetBuffer(); } catch (IllegalStateException)`)
             // silently stopped catching. Permanent for this bytecode, like
             // the sibling RBC bails above.
-            let has_exception_handlers = match shared.class_manager.read().get_class(class_id) {
-                Some(class) => class
-                    .methods
-                    .iter()
-                    .find(|m| {
-                        &*m.name == method_name_check
-                            && &*m.descriptor == method_descriptor.as_str()
-                    })
-                    .and_then(|m| {
-                        m.attributes.iter().find_map(|a| match a.as_decoded() {
-                            Some(cratonvm_reader::attribute::Attribute::Code(ca)) => {
-                                Some(!ca.exception_table.is_empty())
-                            }
-                            _ => None,
+            let has_exception_handlers =
+                match shared.classes.class_manager.read().get_class(class_id) {
+                    Some(class) => class
+                        .methods
+                        .iter()
+                        .find(|m| {
+                            &*m.name == method_name_check
+                                && &*m.descriptor == method_descriptor.as_str()
                         })
-                    })
-                    .unwrap_or(false),
-                None => false,
-            };
+                        .and_then(|m| {
+                            m.attributes.iter().find_map(|a| match a.as_decoded() {
+                                Some(cratonvm_reader::attribute::Attribute::Code(ca)) => {
+                                    Some(!ca.exception_table.is_empty())
+                                }
+                                _ => None,
+                            })
+                        })
+                        .unwrap_or(false),
+                    None => false,
+                };
             if has_exception_handlers {
                 crate::jit::mark_jit_bail_listed(&class_name, &method_name, &method_descriptor);
                 return None;
@@ -32564,7 +32718,7 @@ fn compile_osr_artifact(
             // Resolve multianewarray
             let mut mna_info = Vec::new();
             if !scan.multianewarray_ops.is_empty() {
-                let cm = shared.class_manager.read();
+                let cm = shared.classes.class_manager.read();
                 let class = cm.get_class(class_id)?;
                 for &(pc, cp_idx, _ndims) in &scan.multianewarray_ops {
                     let class_name_ref = class.constant_pool.get_class_name(cp_idx)?;
@@ -32588,7 +32742,7 @@ fn compile_osr_artifact(
             let mut typecheck_info: Vec<(usize, *const u8, usize)> = Vec::new();
             let mut owned_jit_strings2: Vec<Box<str>> = Vec::new();
             if !scan.typecheck_ops.is_empty() {
-                let cm_lock = shared.class_manager.read();
+                let cm_lock = shared.classes.class_manager.read();
                 let class = cm_lock.get_class(class_id)?;
                 for &(pc, cp_idx) in &scan.typecheck_ops {
                     let cn = class.constant_pool.get_class_name(cp_idx)?;
@@ -32605,7 +32759,7 @@ fn compile_osr_artifact(
             if !scan.static_field_ops.is_empty() {
                 for &(pc, cp_idx) in &scan.static_field_ops {
                     let field = resolve_field_ref(shared, class_id, cp_idx).ok()?;
-                    let cm_lock = shared.class_manager.read();
+                    let cm_lock = shared.classes.class_manager.read();
                     let class = cm_lock.get_class(class_id)?;
                     let nat_idx = match class.constant_pool.get(cp_idx) {
                         Some(ConstantPoolEntry::FieldReference {
@@ -32647,7 +32801,7 @@ fn compile_osr_artifact(
             if !scan.field_ops.is_empty() {
                 for &(pc, cp_idx) in &scan.field_ops {
                     let field = resolve_field_ref(shared, class_id, cp_idx).ok()?;
-                    let cm_lock = shared.class_manager.read();
+                    let cm_lock = shared.classes.class_manager.read();
                     let class = cm_lock.get_class(class_id)?;
                     let nat_idx = match class.constant_pool.get(cp_idx) {
                         Some(ConstantPoolEntry::FieldReference {
@@ -32685,7 +32839,7 @@ fn compile_osr_artifact(
             let ctor_direct_call_off = crate::runtime::env_cache::ctor_direct_call_disabled();
             let mut pending_ctor_sites: Vec<(usize, String, usize)> = Vec::new();
             if !scan.invoke_ops.is_empty() {
-                let cm_lock = shared.class_manager.read();
+                let cm_lock = shared.classes.class_manager.read();
                 let class = cm_lock.get_class(class_id)?;
                 for &(pc, cp_idx, opcode) in &scan.invoke_ops {
                     let (ref_class_idx, nat_idx) = match class.constant_pool.get(cp_idx) {
@@ -32902,7 +33056,7 @@ fn compile_osr_artifact(
             // bails the whole compile (`return false`) rather than guessing.
             let mut indy_info: Vec<(usize, usize, u8, Vec<u8>)> = Vec::new();
             if !scan.indy_ops.is_empty() {
-                let cm_lock = shared.class_manager.read();
+                let cm_lock = shared.classes.class_manager.read();
                 if let Some(class) = cm_lock.get_class(class_id) {
                     for &(pc_indy, cp_idx) in &scan.indy_ops {
                         if let Some(ConstantPoolEntry::InvokeDynamic {
@@ -33000,7 +33154,7 @@ fn compile_osr_artifact(
                     .load_class_concurrent(&tclass)
                     .ok()
                     .map(|tid| {
-                        let cm2 = shared.class_manager.read();
+                        let cm2 = shared.classes.class_manager.read();
                         is_elidable_construction(&cm2, tid)
                     })
                     .unwrap_or(false);
@@ -33045,7 +33199,7 @@ fn compile_osr_artifact(
             let mut ldc_info2: Vec<(usize, i64)> = Vec::new();
             let mut ldc_string_info2: Vec<(usize, *const u8, usize)> = Vec::new();
             if !scan.ldc_ops.is_empty() {
-                let cm_lock = shared.class_manager.read();
+                let cm_lock = shared.classes.class_manager.read();
                 let class = cm_lock.get_class(class_id)?;
                 for &(pc, cp_idx) in &scan.ldc_ops {
                     let val = match class.constant_pool.get(cp_idx) {
@@ -33075,7 +33229,7 @@ fn compile_osr_artifact(
             // Resolve ldc2_w constants
             let mut ldc2w_info2: Vec<(usize, i64)> = Vec::new();
             if !scan.ldc2w_ops.is_empty() {
-                let cm_lock = shared.class_manager.read();
+                let cm_lock = shared.classes.class_manager.read();
                 let class = cm_lock.get_class(class_id)?;
                 for &(pc, cp_idx) in &scan.ldc2w_ops {
                     let val = match class.constant_pool.get(cp_idx)? {
@@ -33091,6 +33245,7 @@ fn compile_osr_artifact(
             let mut new_info2: Vec<(usize, u32, usize, bool, bool)> = Vec::new();
             let mut anewarray_info2: Vec<(usize, u32)> = Vec::new();
             let is_real_class2 = shared
+                .classes
                 .class_manager
                 .read()
                 .get_class(class_id)
@@ -33098,7 +33253,7 @@ fn compile_osr_artifact(
                 .unwrap_or(false);
             if is_real_class2 && (!scan.new_ops.is_empty() || !scan.anewarray_ops.is_empty()) {
                 let new_class_names: Vec<(usize, Option<String>)> = {
-                    let cm_lock = shared.class_manager.read();
+                    let cm_lock = shared.classes.class_manager.read();
                     if let Some(class) = cm_lock.get_class(class_id) {
                         scan.new_ops
                             .iter()
@@ -33117,7 +33272,7 @@ fn compile_osr_artifact(
                     }
                 };
                 let arr_class_names: Vec<(usize, Option<String>)> = {
-                    let cm_lock = shared.class_manager.read();
+                    let cm_lock = shared.classes.class_manager.read();
                     if let Some(class) = cm_lock.get_class(class_id) {
                         scan.anewarray_ops
                             .iter()
@@ -33146,7 +33301,7 @@ fn compile_osr_artifact(
                             // sentinel entry so the interpreter's real check
                             // (`Instruction::New`) is what actually fires).
                             let accessible = {
-                                let cm_lock = shared.class_manager.read();
+                                let cm_lock = shared.classes.class_manager.read();
                                 match (cm_lock.get_class(class_id), cm_lock.get_class(target_id)) {
                                     (Some(accessor), Some(target)) => {
                                         crate::classloading::access_control::check_class_access(
@@ -33159,6 +33314,7 @@ fn compile_osr_artifact(
                             };
                             if accessible {
                                 let num_fields = shared
+                                    .classes
                                     .class_manager
                                     .read()
                                     .get_class(target_id)
@@ -33197,6 +33353,7 @@ fn compile_osr_artifact(
             // makes the prologue zero-init local 0 — the OSR-compiled method
             // would then run with a null receiver.
             let osr_method_is_static = shared
+                .classes
                 .class_manager
                 .read()
                 .get_class(class_id)
@@ -33486,6 +33643,7 @@ fn try_osr(
         if std::env::var_os("CRATONVM_DBG_OSR").is_some() {
             let cid = shared.heap.class_id_of(exc);
             let cname = shared
+                .classes
                 .class_manager
                 .read()
                 .get_class(cid)
@@ -33913,7 +34071,7 @@ fn jit_invoke_targets_native_shadow(
     cp_idx: u16,
 ) -> bool {
     let (target_class, method_name, descriptor, declaring_class, is_interface_ref) = {
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let Some(caller) = cm.get_class(caller_class_id) else {
             return true;
         };
@@ -34059,7 +34217,7 @@ fn resolve_jit_elidable_init_loading(shared: &SharedVm, holder_cid: ClassId, cp_
     // 1. Extract the target class name + confirm a no-arg `<init>()V` ref
     //    (brief `cm` read, dropped before the load).
     let target_name = {
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let Some(holder) = cm.get_class(holder_cid) else {
             return false;
         };
@@ -34084,7 +34242,7 @@ fn resolve_jit_elidable_init_loading(shared: &SharedVm, holder_cid: ClassId, cp_
         return false;
     };
     // 3. Check elidability (brief `cm` read).
-    let cm = shared.class_manager.read();
+    let cm = shared.classes.class_manager.read();
     let elidable = is_elidable_construction(&cm, target_id);
     // DBG (CRATONVM_DBG_CTOR_FIX): when this resolves an elidable ctor whose
     // target `find_class_by_name` could NOT see, it is the app-class gap being
@@ -34121,6 +34279,7 @@ fn try_jit_upgrade(
     // staleness invalidation.
     let gate = RedefineGate::snapshot(
         shared
+            .classes
             .class_manager
             .read()
             .class_redefine_generation_handle(cached.declaring_class_id),
@@ -34290,7 +34449,7 @@ fn try_jit_upgrade_with_gate(
                 crate::jit::skip_list::InitComplexity::Unknown
             };
         let is_interface_default = {
-            let cm = shared.class_manager.read();
+            let cm = shared.classes.class_manager.read();
             cm.get_class(cached.declaring_class_id)
                 .map_or(false, |c| c.is_interface())
         };
@@ -34346,7 +34505,7 @@ fn try_jit_upgrade_with_gate(
     // Try to compile — build CP resolvers for multianewarray and field access
     let class_id = cached.declaring_class_id;
     let resolver = |cp_idx: u16| -> Option<String> {
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let class = cm.get_class(class_id)?;
         class
             .constant_pool
@@ -34357,7 +34516,7 @@ fn try_jit_upgrade_with_gate(
         // Resolve the field using the standard resolution mechanism
         let field = resolve_field_ref(shared, class_id, cp_idx).ok()?;
         // Get the field descriptor from the constant pool
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let class = cm.get_class(class_id)?;
         let nat_idx = match class.constant_pool.get(cp_idx) {
             Some(ConstantPoolEntry::FieldReference {
@@ -34388,7 +34547,7 @@ fn try_jit_upgrade_with_gate(
     };
     let static_field_resolver = |cp_idx: u16| -> Option<(u32, usize, u8, bool)> {
         let field = resolve_field_ref(shared, class_id, cp_idx).ok()?;
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let class = cm.get_class(class_id)?;
         let nat_idx = match class.constant_pool.get(cp_idx) {
             Some(ConstantPoolEntry::FieldReference {
@@ -34407,7 +34566,7 @@ fn try_jit_upgrade_with_gate(
         ))
     };
     let invoke_resolver = |cp_idx: u16| -> Option<(String, String, String)> {
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let class = cm.get_class(class_id)?;
         // Read method_ref or interface_method_ref from constant pool
         let (class_idx, nat_idx) = match class.constant_pool.get(cp_idx) {
@@ -34439,7 +34598,7 @@ fn try_jit_upgrade_with_gate(
     // not apply, which is the overwhelming majority of `invokespecial` sites
     // (constructors, private methods, ordinary direct-superclass supers).
     let invokespecial_owner_resolver = |cp_idx: u16| -> Option<String> {
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let class = cm.get_class(class_id)?;
         let (class_idx, nat_idx, is_iface) = match class.constant_pool.get(cp_idx) {
             Some(ConstantPoolEntry::MethodReference {
@@ -34474,7 +34633,7 @@ fn try_jit_upgrade_with_gate(
     // just its target descriptor (no bootstrap/CallSite resolution needed —
     // the codegen only needs the call site's arg/return stack effect).
     let indy_descriptor_resolver = |cp_idx: u16| -> Option<String> {
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let class = cm.get_class(class_id)?;
         match class.constant_pool.get(cp_idx)? {
             ConstantPoolEntry::InvokeDynamic {
@@ -34490,7 +34649,7 @@ fn try_jit_upgrade_with_gate(
     // new/anewarray resolver: maps CP index of `new`/`anewarray` to
     // (class_id_raw, num_fields, has_nonzero_tag_primitive_init, has_finalizer).
     let new_resolver = |cp_idx: u16| -> Option<(u32, usize, bool, bool)> {
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         resolve_jit_new_site(&cm, class_id, cp_idx)
     };
     // activate-ir-optimizer: elidable-`<init>` resolver for `new` scalar
@@ -34505,7 +34664,7 @@ fn try_jit_upgrade_with_gate(
     // its declared (Methodref) class. Used by the CRC32/CRC32C `update`
     // call-site intrinsics for the receiver class-id guard.
     let invoke_class_id_resolver = |cp_idx: u16| -> Option<u32> {
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let class = cm.get_class(class_id)?;
         let class_idx = match class.constant_pool.get(cp_idx) {
             Some(ConstantPoolEntry::MethodReference { class_index, .. }) => *class_index,
@@ -34517,7 +34676,7 @@ fn try_jit_upgrade_with_gate(
     };
 
     let ldc2w_resolver = |cp_idx: u16| -> Option<(i64, bool)> {
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let class = cm.get_class(class_id)?;
         // inc 35: report `(bits, is_double)` so the IR builder lowers a `double`
         // constant to `dconst` and a `long` to `lconst`.
@@ -34548,7 +34707,7 @@ fn try_jit_upgrade_with_gate(
     // BC-suite 34-64× interpreter gap. String/Class ldc returns None →
     // compile bails (matches the OSR path's `_ => return None`).
     let ldc_resolver = |cp_idx: u16| -> Option<cratonvm_jit::JitLdcConstant> {
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let class = cm.get_class(class_id)?;
         match class.constant_pool.get(cp_idx)? {
             ConstantPoolEntry::Integer(v) => {
@@ -34608,7 +34767,7 @@ fn try_jit_upgrade_with_gate(
             // own exception table. Callees without a table keep the fast direct
             // call (no perf change on the bench/gauntlet hot paths).
             {
-                let cm = shared.class_manager.read();
+                let cm = shared.classes.class_manager.read();
                 if let Some(callee_cid) = cm.find_class_by_name(callee_class) {
                     let store = cm.class_store();
                     if let Some((method, _decl)) = crate::classloading::find_method_recursive(
@@ -34632,6 +34791,7 @@ fn try_jit_upgrade_with_gate(
             let callee_desc_arc: Arc<str> = Arc::from(callee_desc);
             {
                 let callee_class_id = shared
+                    .classes
                     .class_manager
                     .read()
                     .find_class_by_name(callee_class)
@@ -34661,7 +34821,7 @@ fn try_jit_upgrade_with_gate(
             }
 
             // Look up the callee class and method
-            let cm = shared.class_manager.read();
+            let cm = shared.classes.class_manager.read();
             let callee_class_id = cm.find_class_by_name(callee_class)?;
             let store = cm.class_store();
             let (method, declaring_id) = crate::classloading::find_method_recursive(
@@ -34771,7 +34931,7 @@ fn try_jit_upgrade_with_gate(
                     crate::jit::skip_list::InitComplexity::Unknown
                 };
                 let is_iface_default = {
-                    let cm2 = shared.class_manager.read();
+                    let cm2 = shared.classes.class_manager.read();
                     cm2.get_class(callee_cached.declaring_class_id)
                         .map_or(false, |c| c.is_interface())
                 };
@@ -34803,7 +34963,7 @@ fn try_jit_upgrade_with_gate(
             // Build resolvers for the callee's constant pool
             let callee_cid = declaring_id;
             let c_resolver = |cp_idx: u16| -> Option<String> {
-                let cm = shared.class_manager.read();
+                let cm = shared.classes.class_manager.read();
                 let class = cm.get_class(callee_cid)?;
                 class
                     .constant_pool
@@ -34812,7 +34972,7 @@ fn try_jit_upgrade_with_gate(
             };
             let c_field_resolver = |cp_idx: u16| -> Option<(usize, u8, Option<(u32, bool)>)> {
                 let field = resolve_field_ref(shared, callee_cid, cp_idx).ok()?;
-                let cm = shared.class_manager.read();
+                let cm = shared.classes.class_manager.read();
                 let class = cm.get_class(callee_cid)?;
                 let nat_idx = match class.constant_pool.get(cp_idx) {
                     Some(ConstantPoolEntry::FieldReference {
@@ -34837,7 +34997,7 @@ fn try_jit_upgrade_with_gate(
             };
             let c_static_field_resolver = |cp_idx: u16| -> Option<(u32, usize, u8, bool)> {
                 let field = resolve_field_ref(shared, callee_cid, cp_idx).ok()?;
-                let cm = shared.class_manager.read();
+                let cm = shared.classes.class_manager.read();
                 let class = cm.get_class(callee_cid)?;
                 let nat_idx = match class.constant_pool.get(cp_idx) {
                     Some(ConstantPoolEntry::FieldReference {
@@ -34856,7 +35016,7 @@ fn try_jit_upgrade_with_gate(
                 ))
             };
             let c_invoke_resolver = |cp_idx: u16| -> Option<(String, String, String)> {
-                let cm = shared.class_manager.read();
+                let cm = shared.classes.class_manager.read();
                 let class = cm.get_class(callee_cid)?;
                 let (class_idx, nat_idx) = match class.constant_pool.get(cp_idx) {
                     Some(ConstantPoolEntry::MethodReference {
@@ -34885,7 +35045,7 @@ fn try_jit_upgrade_with_gate(
             // bytecode is being compiled here (the eagerly-compiled callee),
             // i.e. the calling class for every invoke site in ITS bytecode.
             let c_invokespecial_owner_resolver = |cp_idx: u16| -> Option<String> {
-                let cm = shared.class_manager.read();
+                let cm = shared.classes.class_manager.read();
                 let class = cm.get_class(callee_cid)?;
                 let (class_idx, nat_idx, is_iface) = match class.constant_pool.get(cp_idx) {
                     Some(ConstantPoolEntry::MethodReference {
@@ -34919,7 +35079,7 @@ fn try_jit_upgrade_with_gate(
             // invokedynamic-uncommon-trap fix: resolves an invokedynamic CP
             // index to its target descriptor for the callee's constant pool.
             let c_indy_descriptor_resolver = |cp_idx: u16| -> Option<String> {
-                let cm = shared.class_manager.read();
+                let cm = shared.classes.class_manager.read();
                 let class = cm.get_class(callee_cid)?;
                 match class.constant_pool.get(cp_idx)? {
                     ConstantPoolEntry::InvokeDynamic {
@@ -34935,7 +35095,7 @@ fn try_jit_upgrade_with_gate(
 
             // new/anewarray resolver for callee's constant pool
             let c_new_resolver = |cp_idx: u16| -> Option<(u32, usize, bool, bool)> {
-                let cm = shared.class_manager.read();
+                let cm = shared.classes.class_manager.read();
                 resolve_jit_new_site(&cm, callee_cid, cp_idx)
             };
             // Elidable-`<init>` resolver for `new` scalar replacement, default-ON
@@ -34948,7 +35108,7 @@ fn try_jit_upgrade_with_gate(
             // an invoke* CP index to its declared class id, for the CRC32/
             // CRC32C `update` receiver class-id guard.
             let c_invoke_class_id_resolver = |cp_idx: u16| -> Option<u32> {
-                let cm = shared.class_manager.read();
+                let cm = shared.classes.class_manager.read();
                 let class = cm.get_class(callee_cid)?;
                 let class_idx = match class.constant_pool.get(cp_idx) {
                     Some(ConstantPoolEntry::MethodReference { class_index, .. }) => *class_index,
@@ -34962,7 +35122,7 @@ fn try_jit_upgrade_with_gate(
             };
 
             let c_ldc2w_resolver = |cp_idx: u16| -> Option<(i64, bool)> {
-                let cm = shared.class_manager.read();
+                let cm = shared.classes.class_manager.read();
                 let class = cm.get_class(callee_cid)?;
                 // inc 35: `(bits, is_double)`.
                 match class.constant_pool.get(cp_idx)? {
@@ -34978,7 +35138,7 @@ fn try_jit_upgrade_with_gate(
             // interpreted forever. String/Class ldc returns None → compile
             // bails (matches the OSR path's behaviour).
             let c_ldc_resolver = |cp_idx: u16| -> Option<cratonvm_jit::JitLdcConstant> {
-                let cm = shared.class_manager.read();
+                let cm = shared.classes.class_manager.read();
                 let class = cm.get_class(callee_cid)?;
                 match class.constant_pool.get(cp_idx)? {
                     ConstantPoolEntry::Integer(v) => {
@@ -35292,7 +35452,7 @@ pub fn is_fjp_subclass_blocklisted(shared: &SharedVm, class_name: &str) -> bool 
     {
         return true;
     }
-    let cm = shared.class_manager.read();
+    let cm = shared.classes.class_manager.read();
     let Some(start_cid) = cm.find_class_by_name(class_name) else {
         return false;
     };
@@ -35416,6 +35576,7 @@ pub fn try_jit_compile_callee(
         // / `try_jit_upgrade_with_gate`), which is what a same-named class
         // loaded by a user `ClassLoader` actually dispatches through.
         let probe_class_id = shared
+            .classes
             .class_manager
             .read()
             .get_loaded_class_id(class_name)
@@ -35541,7 +35702,7 @@ fn try_jit_compile_callee_slow(
         return None;
     }
     // Look up the method bytecode
-    let cm = shared.class_manager.read();
+    let cm = shared.classes.class_manager.read();
     let callee_class_id = match cm.find_class_by_name(class_name) {
         Some(id) => id,
         None => {
@@ -35655,7 +35816,7 @@ fn try_jit_compile_callee_slow(
             crate::jit::skip_list::InitComplexity::Unknown
         };
         let is_iface_default = {
-            let cm2 = shared.class_manager.read();
+            let cm2 = shared.classes.class_manager.read();
             cm2.get_class(cached.declaring_class_id)
                 .map_or(false, |c| c.is_interface())
         };
@@ -35687,7 +35848,7 @@ fn try_jit_compile_callee_slow(
     // Build resolvers for the callee's constant pool
     let cid = declaring_id;
     let resolver = |cp_idx: u16| -> Option<String> {
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let class = cm.get_class(cid)?;
         class
             .constant_pool
@@ -35696,7 +35857,7 @@ fn try_jit_compile_callee_slow(
     };
     let field_resolver = |cp_idx: u16| -> Option<(usize, u8, Option<(u32, bool)>)> {
         let field = resolve_field_ref(shared, cid, cp_idx).ok()?;
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let class = cm.get_class(cid)?;
         let nat_idx = match class.constant_pool.get(cp_idx) {
             Some(ConstantPoolEntry::FieldReference {
@@ -35727,7 +35888,7 @@ fn try_jit_compile_callee_slow(
     };
     let static_field_resolver = |cp_idx: u16| -> Option<(u32, usize, u8, bool)> {
         let field = resolve_field_ref(shared, cid, cp_idx).ok()?;
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let class = cm.get_class(cid)?;
         let nat_idx = match class.constant_pool.get(cp_idx) {
             Some(ConstantPoolEntry::FieldReference {
@@ -35746,7 +35907,7 @@ fn try_jit_compile_callee_slow(
         ))
     };
     let invoke_resolver = |cp_idx: u16| -> Option<(String, String, String)> {
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let class = cm.get_class(cid)?;
         let (class_idx, nat_idx) = match class.constant_pool.get(cp_idx) {
             Some(ConstantPoolEntry::MethodReference {
@@ -35774,7 +35935,7 @@ fn try_jit_compile_callee_slow(
     // `cid` is this callee's own declaring class, i.e. the calling class for
     // every invoke site scanned in its bytecode.
     let invokespecial_owner_resolver = |cp_idx: u16| -> Option<String> {
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let class = cm.get_class(cid)?;
         let (class_idx, nat_idx, is_iface) = match class.constant_pool.get(cp_idx) {
             Some(ConstantPoolEntry::MethodReference {
@@ -35808,7 +35969,7 @@ fn try_jit_compile_callee_slow(
     // invokedynamic-uncommon-trap fix: resolves an invokedynamic CP index to
     // its target descriptor (no bootstrap/CallSite resolution needed).
     let indy_descriptor_resolver = |cp_idx: u16| -> Option<String> {
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let class = cm.get_class(cid)?;
         match class.constant_pool.get(cp_idx)? {
             ConstantPoolEntry::InvokeDynamic {
@@ -35822,7 +35983,7 @@ fn try_jit_compile_callee_slow(
         }
     };
     let new_resolver = |cp_idx: u16| -> Option<(u32, usize, bool, bool)> {
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         resolve_jit_new_site(&cm, cid, cp_idx)
     };
     // Elidable-`<init>` resolver for `new` scalar replacement, default-ON
@@ -35833,7 +35994,7 @@ fn try_jit_compile_callee_slow(
     // invoke class-id resolver — maps an invoke* CP index to its declared
     // class id, consumed by the CRC32/CRC32C `update` receiver class-id guard.
     let invoke_class_id_resolver = |cp_idx: u16| -> Option<u32> {
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let class = cm.get_class(cid)?;
         let class_idx = match class.constant_pool.get(cp_idx) {
             Some(ConstantPoolEntry::MethodReference { class_index, .. }) => *class_index,
@@ -35844,7 +36005,7 @@ fn try_jit_compile_callee_slow(
         Some(cm.find_class_by_name(target_class)?.as_u32())
     };
     let ldc2w_resolver = |cp_idx: u16| -> Option<(i64, bool)> {
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let class = cm.get_class(cid)?;
         // inc 35: `(bits, is_double)`.
         let val = match class.constant_pool.get(cp_idx)? {
@@ -35868,7 +36029,7 @@ fn try_jit_compile_callee_slow(
     // RBC.2 — `ldc`/`ldc_w` int/float constants; see the matching resolver
     // in `try_jit_upgrade_with_gate`. String/Class ldc → None → compile bail.
     let ldc_resolver = |cp_idx: u16| -> Option<cratonvm_jit::JitLdcConstant> {
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let class = cm.get_class(cid)?;
         match class.constant_pool.get(cp_idx)? {
             ConstantPoolEntry::Integer(v) => {
@@ -36173,7 +36334,7 @@ fn fetch_osr_compile_inputs(
     method_name: &str,
     descriptor: &str,
 ) -> Option<(ClassId, std::sync::Arc<[u8]>, u16)> {
-    let cm = shared.class_manager.read();
+    let cm = shared.classes.class_manager.read();
     let class_id = cm.get_loaded_class_id(class_name)?;
     let class = cm.get_class(class_id)?;
     let method = class
@@ -36214,7 +36375,7 @@ fn promote_scalar_selfrec_to_ir(shared: &SharedVm, key: &crate::jit::tiered::Met
     let Some(scan) = crate::jit::x64::jit_scan(&padded, code_len, &key.descriptor) else {
         return false;
     };
-    let cm = shared.class_manager.read();
+    let cm = shared.classes.class_manager.read();
     let Some(class) = cm.get_class(class_id) else {
         return false;
     };
@@ -36283,7 +36444,7 @@ fn background_compile_task(
         crate::jit::skip_list::SkipPolicy::Conservative
     };
     let is_interface_default = {
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         cm.get_loaded_class_id(&task.method_key.class_name)
             .and_then(|id| cm.get_class(id))
             .map_or(false, |class| class.is_interface())
@@ -36529,7 +36690,7 @@ fn resolve_inline_site(
 ) -> Option<cratonvm_jit::InlineSite> {
     use cratonvm_reader::constant_pool::ConstantPoolEntry;
 
-    let cm = shared.class_manager.read();
+    let cm = shared.classes.class_manager.read();
     let callee_class_id = cm.find_class_by_name(callee_class)?;
     let store = cm.class_store();
     let (method, declaring_id) = crate::classloading::find_method_recursive(
@@ -37440,6 +37601,7 @@ fn execute_jit_call(
                 );
                 for (i, f) in thread.frames.iter().enumerate().rev().take(15) {
                     let cn = shared
+                        .classes
                         .class_manager
                         .read()
                         .get_class(f.class_id)
@@ -37914,10 +38076,10 @@ fn execute_jit_call_decoded(
 ///   1. `thread.invoke_cache` — cheapest, purely thread-local. If hit,
 ///      the VtableManager read is skipped.
 ///   2. The receiver object itself (peek; may be null → NPE).
-///   3. `shared.resolution_cache.read()` — may yield the
+///   3. `shared.classes.resolution_cache.read()` — may yield the
 ///      `(method_name, descriptor, num_params)` triple without
 ///      touching `class_manager`.
-///   4. `shared.vtable_manager.read()` → `resolve_virtual_slot`.
+///   4. `shared.classes.vtable_manager.read()` → `resolve_virtual_slot`.
 ///   5. Frame push using the entry's `resolved_method` Arc.
 ///
 /// Returns:
@@ -37988,7 +38150,7 @@ fn execute_invokevirtual_vtable_fast(
     // already-populated `resolution_cache`. On a cold cache we return
     // `CacheMiss` and let the slow path populate it.
     let (method_class_name, method_name, method_descriptor, num_params_slots) = {
-        let rc = shared.resolution_cache.read();
+        let rc = shared.classes.resolution_cache.read();
         match rc.get_method(caller_class_id, cp_index) {
             Some(rm) => (
                 Arc::clone(&rm.class_name),
@@ -38130,6 +38292,7 @@ fn execute_invokevirtual_vtable_fast(
     // Synthetic lambda proxies implement their SAM through
     // `try_lambda_dispatch`, not a vtable body.
     if shared
+        .classes
         .lambda_proxies
         .read()
         .contains_key(&receiver_class_id)
@@ -38154,7 +38317,7 @@ fn execute_invokevirtual_vtable_fast(
             || method_name.as_ref() == "equals"
             || method_name.as_ref() == "run")
     {
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let caller = cm
             .get_class(caller_class_id)
             .map(|c| c.name.to_string())
@@ -38203,7 +38366,7 @@ fn execute_invokevirtual_vtable_fast(
             &method_descriptor,
         )
     {
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let store = &cm.class_store;
         let is_intrinsic = crate::classloading::find_method_recursive(
             receiver_class_id,
@@ -38268,7 +38431,7 @@ fn execute_invokevirtual_vtable_fast(
     // `CachedInvokeTarget::VirtualNative` correctly — ensuring the
     // invoke_cache entry populated by prior slow-path calls is honored.
     {
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let rcv_name_owned = cm.get_class(receiver_class_id).map(|c| c.name.clone());
         if let Some(rcv_name) = rcv_name_owned.as_ref() {
             // JVMTI redefine guard: a class redefined in place by an agent has
@@ -38316,7 +38479,7 @@ fn execute_invokevirtual_vtable_fast(
             //
             // NOTE: walk the chain using the ALREADY-HELD `cm` guard rather
             // than calling `class_chain_reaches_proxy_instance` (which takes
-            // its own `shared.class_manager.read()`) — a nested second read
+            // its own `shared.classes.class_manager.read()`) — a nested second read
             // acquisition on the same thread self-deadlocks under
             // parking_lot's writer-preferring fairness once any writer is
             // queued, since the outer guard here is never dropped before the
@@ -38525,7 +38688,7 @@ fn execute_invokevirtual_vtable_fast(
     // entry. A miss here (no installed vtable, no matching slot, slot
     // invalidated by CHA) falls through to invoke_cache / slow path.
     let (entry_cached, entry_is_native) = {
-        let guard = shared.vtable_manager.read();
+        let guard = shared.classes.vtable_manager.read();
         // Widening: smaller integer -> 64-bit (zero/sign-extended, value preserved)
         let vtable = match guard.get_vtable(receiver_class_id.as_u32() as u64) {
             Some(v) => v,
@@ -38586,6 +38749,7 @@ fn execute_invokevirtual_vtable_fast(
         // cede to the slow, redefine-aware path instead of trusting it.
         if crate::classloading::any_class_redefined()
             && shared
+                .classes
                 .class_manager
                 .read()
                 .class_redefine_generation(cached.declaring_class_id)
@@ -38695,6 +38859,7 @@ fn execute_invokevirtual_vtable_fast(
                 Value::Object(Some(obj)) => {
                     let cid = shared.heap.class_id_of(*obj);
                     let cn = shared
+                        .classes
                         .class_manager
                         .read()
                         .get_class(cid)
@@ -38778,6 +38943,7 @@ fn execute_invokevirtual_vtable_fast(
     // here will auto-evict.
     let gate = RedefineGate::snapshot(
         shared
+            .classes
             .class_manager
             .read()
             .class_redefine_generation_handle(entry_cached.declaring_class_id),
@@ -38792,6 +38958,7 @@ fn execute_invokevirtual_vtable_fast(
     let promoted_key: crate::runtime::lockfree_resolve::PromotedInvokeKey =
         (caller_class_id, cp_index, false, Some(receiver_class_id));
     shared
+        .classes
         .shared_resolution
         .insert_promoted_invoke(promoted_key, target.clone());
     thread.invoke_cache.put_poly(
@@ -38870,7 +39037,7 @@ fn execute_invokevirtual_cached(
             resolve_method_ref(shared, caller_class_id, cp_index)
         {
             if method.as_ref() == "prepareJoinBatch" {
-                let cm = shared.class_manager.read();
+                let cm = shared.classes.class_manager.read();
                 let caller_name = cm
                     .get_class(caller_class_id)
                     .map(|c| c.name.to_string())
@@ -39003,7 +39170,13 @@ fn execute_invokevirtual_cached(
             _ => None,
         };
         if let Some(cid) = shadow_cid {
-            if shared.class_manager.read().class_redefine_generation(cid) > 0 {
+            if shared
+                .classes
+                .class_manager
+                .read()
+                .class_redefine_generation(cid)
+                > 0
+            {
                 thread
                     .invoke_cache
                     .evict(caller_class_id, cp_index, is_special);
@@ -39165,14 +39338,20 @@ fn execute_invokevirtual_cached(
                     // Lambda proxy classes have no bytecode implementation of
                     // their functional-interface method. They must reach the
                     // slow path, which dispatches their SAM method handle.
-                    if !is_special && shared.lambda_proxies.read().contains_key(&actual_class_id) {
+                    if !is_special
+                        && shared
+                            .classes
+                            .lambda_proxies
+                            .read()
+                            .contains_key(&actual_class_id)
+                    {
                         return Ok(CachedCallResult::CacheMiss);
                     }
                     // WP2.7 — AnnotationProxy methods (incl. Object.equals/hashCode/
                     // toString from Object) must dispatch through the spec-compliant
                     // interception in `execute_invoke`, not Object's bytecode.
                     if !is_special {
-                        let cm = shared.class_manager.read();
+                        let cm = shared.classes.class_manager.read();
                         let is_ann_proxy = cm
                             .get_class(actual_class_id)
                             .map(|c| &*c.name == "java/lang/annotation/AnnotationProxy")
@@ -39230,6 +39409,7 @@ fn execute_invokevirtual_cached(
                                 Value::Object(Some(obj)) => {
                                     let cid = shared.heap.class_id_of(*obj);
                                     let cn = shared
+                                        .classes
                                         .class_manager
                                         .read()
                                         .get_class(cid)
@@ -39260,6 +39440,7 @@ fn execute_invokevirtual_cached(
                                 Value::Object(Some(obj)) => {
                                     let cid = shared.heap.class_id_of(*obj);
                                     let cn = shared
+                                        .classes
                                         .class_manager
                                         .read()
                                         .get_class(cid)
@@ -39288,6 +39469,7 @@ fn execute_invokevirtual_cached(
                                 Value::Object(Some(obj)) => {
                                     let cid = shared.heap.class_id_of(*obj);
                                     let cn = shared
+                                        .classes
                                         .class_manager
                                         .read()
                                         .get_class(cid)
@@ -39600,6 +39782,7 @@ fn execute_invokevirtual_cached(
                         resolve_method_ref(shared, caller_class_id, cp_index)
                     {
                         let receiver_name = shared
+                            .classes
                             .class_manager
                             .read()
                             .get_class(actual_class_id)
@@ -39646,14 +39829,20 @@ fn execute_invokevirtual_cached(
                     }
                     // Lambda proxies require the slow `try_lambda_dispatch`
                     // route instead of a cached interface target.
-                    if !is_special && shared.lambda_proxies.read().contains_key(&actual_class_id) {
+                    if !is_special
+                        && shared
+                            .classes
+                            .lambda_proxies
+                            .read()
+                            .contains_key(&actual_class_id)
+                    {
                         return Ok(CachedCallResult::CacheMiss);
                     }
                     // WP2.7 — same escape hatch as in the bytecode branch:
                     // AnnotationProxy method dispatch must always go through
                     // `execute_invoke`'s spec-compliant interception layer.
                     if !is_special {
-                        let cm = shared.class_manager.read();
+                        let cm = shared.classes.class_manager.read();
                         let is_ann_proxy = cm
                             .get_class(actual_class_id)
                             .map(|c| &*c.name == "java/lang/annotation/AnnotationProxy")
@@ -39832,6 +40021,7 @@ fn execute_invokevirtual_cached(
                         Value::Object(Some(obj)) => {
                             let cid = shared.heap.class_id_of(*obj);
                             let cn = shared
+                                .classes
                                 .class_manager
                                 .read()
                                 .get_class(cid)
@@ -39861,6 +40051,7 @@ fn execute_invokevirtual_cached(
                         Value::Object(Some(obj)) => {
                             let cid = shared.heap.class_id_of(*obj);
                             let cn = shared
+                                .classes
                                 .class_manager
                                 .read()
                                 .get_class(cid)
@@ -39889,6 +40080,7 @@ fn execute_invokevirtual_cached(
                         Value::Object(Some(obj)) => {
                             let cid = shared.heap.class_id_of(*obj);
                             let cn = shared
+                                .classes
                                 .class_manager
                                 .read()
                                 .get_class(cid)
@@ -39921,6 +40113,7 @@ fn execute_invokevirtual_cached(
                         Value::Object(Some(obj)) => {
                             let cid = shared.heap.class_id_of(*obj);
                             let cn = shared
+                                .classes
                                 .class_manager
                                 .read()
                                 .get_class(cid)
@@ -40072,7 +40265,11 @@ fn populate_virtual_invoke_cache(
     // the class_manager + resolution_cache write locks below.
     let promoted_key: crate::runtime::lockfree_resolve::PromotedInvokeKey =
         (caller_class_id, cp_index, false, Some(receiver_class_id));
-    if let Some(target) = shared.shared_resolution.get_promoted_invoke(&promoted_key) {
+    if let Some(target) = shared
+        .classes
+        .shared_resolution
+        .get_promoted_invoke(&promoted_key)
+    {
         thread.invoke_cache.put_poly(
             caller_class_id,
             cp_index,
@@ -40088,6 +40285,7 @@ fn populate_virtual_invoke_cache(
 
     // Don't cache lambda proxy dispatch (they have special capture semantics)
     if shared
+        .classes
         .lambda_proxies
         .read()
         .contains_key(&receiver_class_id)
@@ -40118,7 +40316,7 @@ fn populate_virtual_invoke_cache(
             || method_name.as_ref() == "equals"
             || method_name.as_ref() == "run")
     {
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let caller = cm
             .get_class(caller_class_id)
             .map(|c| c.name.to_string())
@@ -40169,7 +40367,7 @@ fn populate_virtual_invoke_cache(
             &descriptor,
         )
     {
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let store = &cm.class_store;
         if let Some((_method, declaring_id)) = crate::classloading::find_method_recursive(
             receiver_class_id,
@@ -40281,6 +40479,7 @@ fn populate_virtual_invoke_cache(
                     gate,
                 };
                 shared
+                    .classes
                     .shared_resolution
                     .insert_promoted_invoke(promoted_key, target.clone());
                 thread.invoke_cache.put_poly(
@@ -40310,7 +40509,7 @@ fn populate_virtual_invoke_cache(
         // Determine the class name for native lookup.  Arrays dispatch
         // through java/lang/Object; for normal classes use the receiver's
         // name directly.
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let rcv_name = cm
             .get_class(receiver_class_id)
             .map(|c| c.name.to_string())
@@ -40392,6 +40591,7 @@ fn populate_virtual_invoke_cache(
             };
             // T10.4 — promote so sibling threads skip the class_manager walk.
             shared
+                .classes
                 .shared_resolution
                 .insert_promoted_invoke(promoted_key, target.clone());
             thread.invoke_cache.put_poly(
@@ -40504,6 +40704,7 @@ fn populate_virtual_invoke_cache(
                                 gate,
                             };
                             shared
+                                .classes
                                 .shared_resolution
                                 .insert_promoted_invoke(promoted_key, target.clone());
                             thread.invoke_cache.put_poly(
@@ -40537,6 +40738,7 @@ fn populate_virtual_invoke_cache(
                             gate,
                         };
                         shared
+                            .classes
                             .shared_resolution
                             .insert_promoted_invoke(promoted_key, target.clone());
                         thread.invoke_cache.put_poly(
@@ -40558,7 +40760,7 @@ fn populate_virtual_invoke_cache(
     }
 
     // Look up method on the receiver's actual class (virtual dispatch resolution)
-    let cm = shared.class_manager.read();
+    let cm = shared.classes.class_manager.read();
     let store = &cm.class_store;
     let Some((method, declaring_id)) = crate::classloading::find_method_recursive(
         receiver_class_id,
@@ -40587,6 +40789,7 @@ fn populate_virtual_invoke_cache(
             };
             // T10.4 — promote so sibling threads skip this walk.
             shared
+                .classes
                 .shared_resolution
                 .insert_promoted_invoke(promoted_key, target.clone());
             thread.invoke_cache.put_poly(
@@ -40677,6 +40880,7 @@ fn populate_virtual_invoke_cache(
                     gate,
                 };
                 shared
+                    .classes
                     .shared_resolution
                     .insert_promoted_invoke(promoted_key, target.clone());
                 thread.invoke_cache.put_poly(
@@ -40720,6 +40924,7 @@ fn populate_virtual_invoke_cache(
                     gate,
                 };
                 shared
+                    .classes
                     .shared_resolution
                     .insert_promoted_invoke(promoted_key, target.clone());
                 thread.invoke_cache.put_poly(
@@ -40759,6 +40964,7 @@ fn populate_virtual_invoke_cache(
                     gate,
                 };
                 shared
+                    .classes
                     .shared_resolution
                     .insert_promoted_invoke(promoted_key, target.clone());
                 thread.invoke_cache.put_poly(
@@ -40793,6 +40999,7 @@ fn populate_virtual_invoke_cache(
             gate,
         };
         shared
+            .classes
             .shared_resolution
             .insert_promoted_invoke(promoted_key, target.clone());
         thread.invoke_cache.put_poly(
@@ -40847,6 +41054,7 @@ fn populate_virtual_invoke_cache(
     // T10.4 — promote so sibling threads dispatching the same call-site
     // skip the class_manager read-lock and find_method_recursive walk.
     shared
+        .classes
         .shared_resolution
         .insert_promoted_invoke(promoted_key, target.clone());
     thread.invoke_cache.put_poly(
@@ -40875,6 +41083,7 @@ fn resolve_method_metadata(
     // Check cache first. Cloning is Arc bumps plus two copied function-pointer
     // metadata fields; there is no string allocation or registry hash.
     if let Some(cached) = shared
+        .classes
         .resolution_cache
         .read()
         .get_method(current_class_id, cp_index)
@@ -40888,7 +41097,7 @@ fn resolve_method_metadata(
     // thread. parking_lot's write-preferring policy blocks new read() calls
     // when a writer is queued, so a recursive plain read() → deadlock;
     // read_recursive() succeeds immediately for an existing read-holder.
-    let cm = shared.class_manager.read_recursive();
+    let cm = shared.classes.class_manager.read_recursive();
     let class = cm
         .get_class(current_class_id)
         .ok_or_else(|| VmError::Internal {
@@ -40957,10 +41166,11 @@ fn resolve_method_metadata(
         native_target,
         native_kind,
     };
-    shared
-        .resolution_cache
-        .write()
-        .put_method(current_class_id, cp_index, resolved.clone());
+    shared.classes.resolution_cache.write().put_method(
+        current_class_id,
+        cp_index,
+        resolved.clone(),
+    );
 
     Ok(resolved)
 }
@@ -41013,7 +41223,7 @@ fn invokespecial_owner_class_name(
     if method_name == "<init>" {
         return Arc::clone(method_class_name);
     }
-    let cm = shared.class_manager.read();
+    let cm = shared.classes.class_manager.read();
     let Some(class) = cm.get_class(current_class_id) else {
         return Arc::clone(method_class_name);
     };
@@ -41577,7 +41787,7 @@ fn double_to_long(v: f64) -> i64 {
 /// ThreadLocalMap entry) for the ES `testAllEqual` hold-count-loss face.
 fn dump_imse_holdcount_state(shared: &SharedVm, thread: &JvmThread, exc: ObjectRef) {
     let exc_class = {
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         cm.get_class(shared.heap.class_id_of(exc))
             .map(|c| c.name.to_string())
             .unwrap_or_default()
@@ -41600,7 +41810,7 @@ fn dump_imse_holdcount_state(shared: &SharedVm, thread: &JvmThread, exc: ObjectR
         eprintln!("[imse] IllegalMonitorStateException thrown but no tryReleaseShared frame");
         return;
     };
-    let cm = shared.class_manager.read();
+    let cm = shared.classes.class_manager.read();
     let field = |obj: ObjectRef, name: &str| -> Value {
         let cid = shared.heap.class_id_of(obj);
         match crate::vm::vm_exec::resolve_field_index_in_hierarchy(cid, name, &cm.class_store) {
@@ -44197,6 +44407,7 @@ mod tests {
             proxy_class_id,
         };
         shared
+            .classes
             .lambda_proxies
             .write()
             .insert(proxy_class_id, call_site);
@@ -44213,7 +44424,7 @@ mod tests {
         assert_eq!(shared.heap.get_field(proxy_ref, 2), Value::Long(30));
 
         // Verify the proxy is recognized as a lambda
-        let proxies = shared.lambda_proxies.read();
+        let proxies = shared.classes.lambda_proxies.read();
         let lcs = proxies.get(&proxy_class_id).unwrap();
         assert_eq!(&*lcs.functional_interface, "test/Func");
         assert_eq!(&*lcs.sam_method_name, "apply");
@@ -44998,9 +45209,9 @@ mod tests {
         // Some JDK bootstrap may have populated the invoke path, so we only
         // assert the counters are accessible and non-negative (u64 cannot
         // be negative, so the check is that the getters compile and return).
-        let _ = vm.shared.shared_resolution.promoted_hit_count();
-        let _ = vm.shared.shared_resolution.promoted_insert_count();
-        let _ = vm.shared.shared_resolution.promoted_invoke_count();
+        let _ = vm.shared.classes.shared_resolution.promoted_hit_count();
+        let _ = vm.shared.classes.shared_resolution.promoted_insert_count();
+        let _ = vm.shared.classes.shared_resolution.promoted_invoke_count();
         let _ = vm.shared.operand_stack_pool.acquire_count();
         let _ = vm.shared.tag_pool.acquire_count();
     }
@@ -45018,8 +45229,8 @@ mod tests {
         use crate::vm::Vm;
         let vm = Vm::new(VmConfig::new());
 
-        let before_hits = vm.shared.shared_resolution.promoted_hit_count();
-        let before_inserts = vm.shared.shared_resolution.promoted_insert_count();
+        let before_hits = vm.shared.classes.shared_resolution.promoted_hit_count();
+        let before_inserts = vm.shared.classes.shared_resolution.promoted_insert_count();
 
         let cached = std::sync::Arc::new(CachedBytecodeMethod {
             declaring_class_id: ClassId::new(12345),
@@ -45038,7 +45249,7 @@ mod tests {
             native_callback_cache: std::sync::OnceLock::new(),
         });
         let key: PromotedInvokeKey = (ClassId::new(9999), 17, false, Some(ClassId::new(12345)));
-        vm.shared.shared_resolution.insert_promoted_invoke(
+        vm.shared.classes.shared_resolution.insert_promoted_invoke(
             key,
             CachedInvokeTarget::VirtualBytecode {
                 receiver_class_id: ClassId::new(12345),
@@ -45046,7 +45257,11 @@ mod tests {
                 gate: RedefineGate::never_stale(),
             },
         );
-        let got = vm.shared.shared_resolution.get_promoted_invoke(&key);
+        let got = vm
+            .shared
+            .classes
+            .shared_resolution
+            .get_promoted_invoke(&key);
         match got {
             Some(CachedInvokeTarget::VirtualBytecode {
                 receiver_class_id,
@@ -45060,11 +45275,11 @@ mod tests {
         }
         // Exactly one insert and one hit attributable to this test.
         assert_eq!(
-            vm.shared.shared_resolution.promoted_insert_count() - before_inserts,
+            vm.shared.classes.shared_resolution.promoted_insert_count() - before_inserts,
             1
         );
         assert_eq!(
-            vm.shared.shared_resolution.promoted_hit_count() - before_hits,
+            vm.shared.classes.shared_resolution.promoted_hit_count() - before_hits,
             1
         );
     }

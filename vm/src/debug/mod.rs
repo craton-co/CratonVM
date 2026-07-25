@@ -882,7 +882,7 @@ pub fn send_thread_event(shared: &crate::vm::SharedVm, kind: events::EventKind, 
 
 /// Populate DebugState with class metadata from the class manager.
 fn populate_class_metadata(shared: &crate::vm::SharedVm) {
-    let cm = shared.class_manager.read();
+    let cm = shared.classes.class_manager.read();
     let mut ds = shared.debug.debug_state.lock();
 
     for class in cm.class_store.iter() {
@@ -998,7 +998,7 @@ impl SharedVmBridge {
 
     /// Look up a class name by its wire class_id (= `Class::id.as_u32()`).
     fn class_name_for(&self, class_id: u64) -> Option<String> {
-        let cm = self.shared.class_manager.read();
+        let cm = self.shared.classes.class_manager.read();
         let cid = crate::classloading::ClassId::new(class_id as u32);
         cm.class_store.get(cid).map(|c| c.name.to_string())
     }
@@ -1240,7 +1240,7 @@ impl DebuggerVmBridge for SharedVmBridge {
         // still succeeds — the debugger's subsequent `ArrayReference.Length`
         // call will see the correct length regardless.
         let class_id = {
-            let cm = self.shared.class_manager.read();
+            let cm = self.shared.classes.class_manager.read();
             let cid = crate::classloading::ClassId::new(array_type_id as u32);
             if cm.class_store.get(cid).is_some() {
                 cid
