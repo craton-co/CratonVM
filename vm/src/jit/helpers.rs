@@ -6841,7 +6841,8 @@ fn stringbuilder_native_callback(
     vm: &SharedVm,
     info: &JitInvokeInfo,
 ) -> Option<cratonvm_native_api::NativeCallback> {
-    vm.native_methods
+    vm.natives
+        .native_methods
         .find("java/lang/StringBuilder", info.method_name, info.descriptor)
 }
 
@@ -7469,10 +7470,11 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
                 )
         )
     {
-        if let Some(callback) =
-            vm.native_methods
-                .find("java/lang/ClassLoader", info.method_name, info.descriptor)
-        {
+        if let Some(callback) = vm.natives.native_methods.find(
+            "java/lang/ClassLoader",
+            info.method_name,
+            info.descriptor,
+        ) {
             let values = decode_values();
             return match crate::vm::safe_native_call(vm, thread, callback, &values) {
                 Ok(Some(Value::Int(v))) => v as i64,

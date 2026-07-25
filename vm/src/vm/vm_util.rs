@@ -1031,6 +1031,7 @@ fn initialize_class_shared(
                 .map(|c| c.name.clone())
                 .unwrap_or_default();
             shared
+                .natives
                 .native_methods
                 .find(&class_name, "<clinit>", "()V")
                 .is_some()

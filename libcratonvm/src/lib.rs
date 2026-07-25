@@ -930,7 +930,7 @@ impl CratonValue {
 // before it is ever turned back into an `ObjectRef`.
 //
 // The table is layered on top of the VM's existing `JniGlobalRefs`
-// (`shared.jni_global_refs`), which is the only channel that (a) keeps the
+// (`shared.natives.jni_global_refs`), which is the only channel that (a) keeps the
 // referenced object alive as a GC root and (b) has its stored `ObjectRef`s
 // rewritten by the moving collector via `update_after_gc`. We never retain a
 // raw object address in this table; dedup compares against the current address
@@ -997,7 +997,7 @@ fn register_handle(shared: &SharedVm, o: Option<ObjectRef>) -> CratonRef {
         Err(_) => return 0,
     };
     let table = tables.entry(vm_key(shared)).or_default();
-    let mut grefs = shared.jni_global_refs.lock();
+    let mut grefs = shared.natives.jni_global_refs.lock();
     // Dedup by resolving each global ref to its current post-GC address. This
     // keeps the table correct when a moving collector rewrites the global refs.
     for (&tok, entry) in &mut table.by_token {
@@ -1030,7 +1030,7 @@ fn resolve_handle(shared: &SharedVm, h: CratonRef) -> Option<ObjectRef> {
     let gref = tables.get(&vm_key(shared))?.by_token.get(&h)?.gref;
     // `JniGlobalRefs::resolve` validates the gref is still live and returns the
     // current (post-GC) address.
-    shared.jni_global_refs.lock().resolve(gref)
+    shared.natives.jni_global_refs.lock().resolve(gref)
 }
 
 fn release_handle(shared: &SharedVm, h: CratonRef) -> bool {
@@ -1055,7 +1055,7 @@ fn release_handle(shared: &SharedVm, h: CratonRef) -> bool {
         .by_token
         .remove(&h)
         .expect("entry was present while releasing handle");
-    shared.jni_global_refs.lock().remove(entry.gref)
+    shared.natives.jni_global_refs.lock().remove(entry.gref)
 }
 
 fn decode_craton_args(api: &str, shared: &SharedVm, args: &[CratonValue]) -> Option<Vec<Value>> {
@@ -1087,7 +1087,7 @@ fn decode_craton_value(api: &str, shared: &SharedVm, value: CratonValue) -> Opti
 fn drop_handle_table(shared: &SharedVm) {
     if let Ok(mut tables) = handle_tables().lock() {
         if let Some(table) = tables.remove(&vm_key(shared)) {
-            let mut grefs = shared.jni_global_refs.lock();
+            let mut grefs = shared.natives.jni_global_refs.lock();
             for entry in table.by_token.into_values() {
                 grefs.remove(entry.gref);
             }
@@ -2494,7 +2494,11 @@ mod tests {
         let first = register_handle(&shared, Some(old));
         let mut pointer_map = std::collections::HashMap::new();
         pointer_map.insert(old.as_ptr() as usize, moved.as_ptr() as usize);
-        shared.jni_global_refs.lock().update_after_gc(&pointer_map);
+        shared
+            .natives
+            .jni_global_refs
+            .lock()
+            .update_after_gc(&pointer_map);
 
         let after_move = register_handle(&shared, Some(moved));
         assert_eq!(

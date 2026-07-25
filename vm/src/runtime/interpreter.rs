@@ -5099,11 +5099,11 @@ pub fn execute(
                 )
                 && !redefine_immune_path_native(&class_name_owned, method_name, method_descriptor);
             if method_name != "<init>" && method_name != "<clinit>" && !class_redefined {
-                if let Some(cb) =
-                    shared
-                        .native_methods
-                        .find(&class_name_owned, method_name, method_descriptor)
-                {
+                if let Some(cb) = shared.natives.native_methods.find(
+                    &class_name_owned,
+                    method_name,
+                    method_descriptor,
+                ) {
                     return crate::vm::safe_native_call(shared, thread, cb, args);
                 }
             }
@@ -5262,7 +5262,7 @@ pub fn execute(
                             let mut walk = Some(recv_cid);
                             while let Some(cid) = walk {
                                 if let Some(cls) = cm2.class_store.get(cid) {
-                                    if let Some(found) = shared.native_methods.find(
+                                    if let Some(found) = shared.natives.native_methods.find(
                                         &cls.name,
                                         method_name,
                                         method_descriptor,
@@ -5321,6 +5321,7 @@ pub fn execute(
                             while let Some(cid) = walk {
                                 if let Some(cls) = cm2.class_store.get(cid) {
                                     if shared
+                                        .natives
                                         .native_methods
                                         .find(&cls.name, method_name, method_descriptor)
                                         .is_some()
@@ -5390,7 +5391,7 @@ pub fn execute(
                             _ => "",
                         };
                         if !canonical.is_empty() {
-                            if let Some(cb) = shared.native_methods.find(
+                            if let Some(cb) = shared.natives.native_methods.find(
                                 canonical,
                                 method_name,
                                 method_descriptor,
@@ -5400,7 +5401,7 @@ pub fn execute(
                             }
                             // Also try the cp class itself — natives may be
                             // registered directly on the interface name.
-                            if let Some(cb) = shared.native_methods.find(
+                            if let Some(cb) = shared.natives.native_methods.find(
                                 &class_name_owned,
                                 method_name,
                                 method_descriptor,
@@ -5560,6 +5561,7 @@ pub fn execute(
             // methods whose own bytecode contains an invoke that resolves to a
             // native-shadowed target such as `Object.equals`.
             let native_skip = if shared
+                .natives
                 .native_methods
                 .find(&class_name_str, method_name, method_descriptor)
                 .is_some()
@@ -23293,6 +23295,7 @@ fn try_invoke_cached_lambda_impl(
             };
             // Cached bytecode bypasses native dispatch, which must retain precedence.
             if shared
+                .natives
                 .native_methods
                 .find(&class.name, method_name, descriptor)
                 .is_some()
@@ -23753,7 +23756,7 @@ pub(crate) fn try_lambda_dispatch(
             format!("()L{iface};"),          // negate/identity
         ];
         for desc in &descriptors {
-            if let Some(callback) = shared.native_methods.find(iface, method_name, desc) {
+            if let Some(callback) = shared.natives.native_methods.find(iface, method_name, desc) {
                 let mut ctx = crate::vm::NativeContextImpl { shared, thread };
                 // Widening: small integer index -> usize (non-negative, fits in pointer width)
                 let _ring_idx = cratonvm_native_api::native_ring::record_enter(callback as usize);
@@ -29293,10 +29296,11 @@ fn intercept_force_registered_native(
                 )
         )
     {
-        let cb =
-            shared
-                .native_methods
-                .find("java/lang/ClassLoader", method_name, method_descriptor)?;
+        let cb = shared.natives.native_methods.find(
+            "java/lang/ClassLoader",
+            method_name,
+            method_descriptor,
+        )?;
         return Some((|| {
             let result = crate::vm::safe_native_call(shared, thread, cb, args)?;
             if let Some(value) = result {
@@ -29330,7 +29334,7 @@ fn intercept_force_registered_native(
             }
         )
     {
-        let callback = shared.native_methods.find(
+        let callback = shared.natives.native_methods.find(
             "java/lang/Class",
             "getClassLoader",
             "()Ljava/lang/ClassLoader;",
@@ -29365,10 +29369,11 @@ fn intercept_force_registered_native(
                 .unwrap_or(false)
         }
     ) {
-        let callback =
-            shared
-                .native_methods
-                .find("java/lang/Class", method_name, method_descriptor)?;
+        let callback = shared.natives.native_methods.find(
+            "java/lang/Class",
+            method_name,
+            method_descriptor,
+        )?;
         return Some((|| {
             let result = crate::vm::safe_native_call(shared, thread, callback, args)?;
             if let Some(value) = result {
@@ -29415,11 +29420,11 @@ fn intercept_force_registered_native(
                 if matches!(shared.heap.get_field(*receiver, 0), Value::Object(Some(_)))
         )
     {
-        if let Some(callback) =
-            shared
-                .native_methods
-                .find("java/net/HttpURLConnection", method_name, method_descriptor)
-        {
+        if let Some(callback) = shared.natives.native_methods.find(
+            "java/net/HttpURLConnection",
+            method_name,
+            method_descriptor,
+        ) {
             return Some((|| {
                 let result = crate::vm::safe_native_call(shared, thread, callback, args)?;
                 if let Some(value) = result {
@@ -29468,6 +29473,7 @@ fn intercept_force_registered_native(
         return None;
     }
     let cb = shared
+        .natives
         .native_methods
         .find(class_name, method_name, method_descriptor)?;
     if method_name == "getTarget" && crate::runtime::env_cache::dbg_ccsprobe() {
@@ -29532,10 +29538,11 @@ fn intercept_force_registered_native_cached(
                 )
         )
     {
-        let cb =
-            shared
-                .native_methods
-                .find("java/lang/ClassLoader", method_name, method_descriptor)?;
+        let cb = shared.natives.native_methods.find(
+            "java/lang/ClassLoader",
+            method_name,
+            method_descriptor,
+        )?;
         let ret_type = crate::jit::return_type(method_descriptor);
         return Some((|| {
             let result = crate::vm::safe_native_call(shared, thread, cb, args)?;
@@ -29567,10 +29574,11 @@ fn intercept_force_registered_native_cached(
                 .unwrap_or(false)
         }
     ) {
-        let callback =
-            shared
-                .native_methods
-                .find("java/lang/Class", method_name, method_descriptor)?;
+        let callback = shared.natives.native_methods.find(
+            "java/lang/Class",
+            method_name,
+            method_descriptor,
+        )?;
         return Some((|| {
             let result = crate::vm::safe_native_call(shared, thread, callback, args)?;
             if let Some(value) = result {
@@ -29623,6 +29631,7 @@ fn intercept_force_registered_native_cached(
     // symbol (~7% of samples) on this exact benchmark before this fix.
     let cb = (*cached.native_callback_cache.get_or_init(|| {
         shared
+            .natives
             .native_methods
             .find(class_name, method_name, method_descriptor)
     }))?;
@@ -29672,10 +29681,11 @@ fn intercept_jython_pyjavatype_findattr_ex(
     if recv_name != "org/python/core/PyJavaType" {
         return None;
     }
-    let cb =
-        shared
-            .native_methods
-            .find("org/python/core/PyJavaType", method_name, method_descriptor)?;
+    let cb = shared.natives.native_methods.find(
+        "org/python/core/PyJavaType",
+        method_name,
+        method_descriptor,
+    )?;
     let ret_type = crate::jit::return_type(method_descriptor);
     Some((|| {
         let result = crate::vm::safe_native_call(shared, thread, cb, args)?;
@@ -29713,10 +29723,11 @@ fn intercept_jython_pymodule_findattr(
     if recv_name != "org/python/core/PyModule" {
         return None;
     }
-    let cb =
-        shared
-            .native_methods
-            .find("org/python/core/PyModule", method_name, method_descriptor)?;
+    let cb = shared.natives.native_methods.find(
+        "org/python/core/PyModule",
+        method_name,
+        method_descriptor,
+    )?;
     let ret_type = crate::jit::return_type(method_descriptor);
     Some((|| {
         let result = crate::vm::safe_native_call(shared, thread, cb, args)?;
@@ -29791,10 +29802,11 @@ fn intercept_urlclassloader_subclass_native_method(
     if native_shadow_suppressed_by_redefine(shared, "java/net/URLClassLoader") {
         return None;
     }
-    let cb =
-        shared
-            .native_methods
-            .find("java/net/URLClassLoader", method_name, method_descriptor)?;
+    let cb = shared.natives.native_methods.find(
+        "java/net/URLClassLoader",
+        method_name,
+        method_descriptor,
+    )?;
     let ret_type = crate::jit::return_type(method_descriptor);
     Some((|| {
         let result = crate::vm::safe_native_call(shared, thread, cb, args)?;
@@ -29858,9 +29870,11 @@ fn intercept_classloader_subclass_resource_native(
     {
         return None;
     }
-    let cb = shared
-        .native_methods
-        .find("java/lang/ClassLoader", method_name, method_descriptor)?;
+    let cb = shared.natives.native_methods.find(
+        "java/lang/ClassLoader",
+        method_name,
+        method_descriptor,
+    )?;
     let ret_type = crate::jit::return_type(method_descriptor);
     Some((|| {
         let result = crate::vm::safe_native_call(shared, thread, cb, args)?;
@@ -29891,10 +29905,11 @@ fn intercept_classloader_set_default_assertion_status(
     if method_name != "setDefaultAssertionStatus" || method_descriptor != "(Z)V" {
         return None;
     }
-    let cb =
-        shared
-            .native_methods
-            .find("java/lang/ClassLoader", "setDefaultAssertionStatus", "(Z)V")?;
+    let cb = shared.natives.native_methods.find(
+        "java/lang/ClassLoader",
+        "setDefaultAssertionStatus",
+        "(Z)V",
+    )?;
     Some(crate::vm::safe_native_call(shared, thread, cb, args).map(|_| CachedCallResult::Handled))
 }
 
@@ -29917,6 +29932,7 @@ fn surefire_lazy_launcher_discover_native(
         return None;
     }
     let cb = shared
+        .natives
         .native_methods
         .find(LAZY, "discover", DESC_DISCOVER)?;
     let cid = shared.heap.class_id_of(recv_obj);
@@ -29942,6 +29958,7 @@ pub(crate) fn synthetic_stub_should_yield_to_real_bytecode(
     descriptor: &str,
 ) -> bool {
     let kind = shared
+        .natives
         .native_methods
         .kind_of(class_name, method_name, descriptor);
     synthetic_stub_kind_should_yield_to_real_bytecode(
@@ -30097,6 +30114,7 @@ fn try_stackless_invoke(
     {
         if let Some(callback) =
             shared
+                .natives
                 .native_methods
                 .find("java/util/zip/ZipFile", method_name, descriptor)
         {
@@ -30139,6 +30157,7 @@ fn try_stackless_invoke(
     {
         if let Some(callback) =
             shared
+                .natives
                 .native_methods
                 .find("java/lang/reflect/Method", method_name, descriptor)
         {
@@ -30160,11 +30179,11 @@ fn try_stackless_invoke(
         && method_name == "newInstance"
         && descriptor == "([Ljava/lang/Object;)Ljava/lang/Object;"
     {
-        if let Some(callback) =
-            shared
-                .native_methods
-                .find("java/lang/reflect/Constructor", method_name, descriptor)
-        {
+        if let Some(callback) = shared.natives.native_methods.find(
+            "java/lang/reflect/Constructor",
+            method_name,
+            descriptor,
+        ) {
             let result = safe_native_call(shared, thread, callback, args)?;
             if let Some(value) = result.filter(|_| ret_type != b'V') {
                 push_invoke_return_value(
@@ -30198,7 +30217,7 @@ fn try_stackless_invoke(
                 .map(|class| class.name.as_ref() == "java/lang/foreign/DowncallHandle")
                 .unwrap_or(false);
             if is_downcall {
-                shared.native_methods.find(
+                shared.natives.native_methods.find(
                     "java/lang/foreign/DowncallHandle",
                     "type",
                     "()Ljava/lang/invoke/MethodType;",
@@ -30218,7 +30237,7 @@ fn try_stackless_invoke(
                 .map(|class| class.name.as_ref() == "java/lang/foreign/DowncallHandle")
                 .unwrap_or(false);
             if is_downcall {
-                shared.native_methods.find(
+                shared.natives.native_methods.find(
                     "java/lang/foreign/DowncallHandle",
                     method_name,
                     "([Ljava/lang/Object;)Ljava/lang/Object;",
@@ -30234,13 +30253,14 @@ fn try_stackless_invoke(
     }
     .or_else(|| {
         shared
+            .natives
             .native_methods
             .find(class_name, method_name, descriptor)
             .or_else(|| {
                 class_name
                     .starts_with("sun/security/ssl/SSLContextImpl")
                     .then(|| {
-                        shared.native_methods.find(
+                        shared.natives.native_methods.find(
                             "javax/net/ssl/SSLContext",
                             method_name,
                             descriptor,
@@ -30252,7 +30272,7 @@ fn try_stackless_invoke(
                 class_name
                     .starts_with("sun/security/ssl/SSLSocketFactoryImpl")
                     .then(|| {
-                        shared.native_methods.find(
+                        shared.natives.native_methods.find(
                             "javax/net/ssl/SSLSocketFactory",
                             method_name,
                             descriptor,
@@ -30264,7 +30284,7 @@ fn try_stackless_invoke(
                 class_name
                     .starts_with("sun/security/ssl/SSLSocketImpl")
                     .then(|| {
-                        shared.native_methods.find(
+                        shared.natives.native_methods.find(
                             "javax/net/ssl/SSLSocket",
                             method_name,
                             descriptor,
@@ -30315,9 +30335,11 @@ fn try_stackless_invoke(
             let parent_redefined = native_shadow_suppressed_by_redefine_in(&cm, &parent.name)
                 && !redefine_immune_forced_native(&parent.name, method_name, descriptor);
             if !parent_redefined {
-                if let Some(cb) = shared
-                    .native_methods
-                    .find(&parent.name, method_name, descriptor)
+                if let Some(cb) =
+                    shared
+                        .natives
+                        .native_methods
+                        .find(&parent.name, method_name, descriptor)
                 {
                     return Some(cb);
                 }
@@ -30434,7 +30456,7 @@ fn try_stackless_invoke(
         if !is_downcall {
             return None;
         }
-        let callback = shared.native_methods.find(
+        let callback = shared.natives.native_methods.find(
             "java/lang/foreign/DowncallHandle",
             method_name,
             "([Ljava/lang/Object;)Ljava/lang/Object;",
@@ -30476,7 +30498,7 @@ fn try_stackless_invoke(
         if class_name == "java/lang/invoke/MethodHandle"
             && matches!(method_name, "invoke" | "invokeExact" | "invokeBasic")
         {
-            shared.native_methods.find(
+            shared.natives.native_methods.find(
                 "java/lang/invoke/MethodHandle",
                 method_name,
                 "([Ljava/lang/Object;)Ljava/lang/Object;",
@@ -30649,9 +30671,11 @@ fn try_stackless_invoke(
             .map(|c| c.name.to_string())
             .unwrap_or_default();
         drop(cm);
-        if let Some(callback) = shared
-            .native_methods
-            .find(&declaring_name, method_name, descriptor)
+        if let Some(callback) =
+            shared
+                .natives
+                .native_methods
+                .find(&declaring_name, method_name, descriptor)
         {
             let result = safe_native_call(shared, thread, callback, args)?;
             if let Some(value) = result.filter(|_| ret_type != b'V') {
@@ -30725,9 +30749,11 @@ fn try_stackless_invoke(
         && (!native_shadow_suppressed_by_redefine(shared, &class_name_arc)
             || redefine_immune_forced_native(&class_name_arc, method_name, descriptor))
     {
-        if let Some(callback) = shared
-            .native_methods
-            .find(&class_name_arc, method_name, descriptor)
+        if let Some(callback) =
+            shared
+                .natives
+                .native_methods
+                .find(&class_name_arc, method_name, descriptor)
         {
             // Same ThreadPoolExecutor.execute(Runnable) receiver-aware
             // exemption as step 1 above -- this is a SEPARATE, independent
@@ -31000,14 +31026,16 @@ fn execute_invokestatic(
     // loading the real owner. Otherwise the first call materializes a stub and
     // seeds a native invoke-cache entry before real bytecode can take over.
     let direct_native_registered = shared
+        .natives
         .native_methods
         .find(&method_class_name, &method_name, &method_descriptor)
         .is_some();
     let direct_synthetic_stub_may_yield = direct_native_registered
-        && shared
-            .native_methods
-            .kind_of(&method_class_name, &method_name, &method_descriptor)
-            == Some(cratonvm_native_api::NativeKind::SyntheticStub)
+        && shared.natives.native_methods.kind_of(
+            &method_class_name,
+            &method_name,
+            &method_descriptor,
+        ) == Some(cratonvm_native_api::NativeKind::SyntheticStub)
         && real_protected_stub_class(&method_class_name);
     let direct_native = direct_native_registered && !direct_synthetic_stub_may_yield;
     let is_native = direct_native
@@ -31018,6 +31046,7 @@ fn execute_invokestatic(
                 while let Some(pid) = cm.get_class(cid).and_then(|c| c.superclass) {
                     if let Some(p) = cm.get_class(pid) {
                         if shared
+                            .natives
                             .native_methods
                             .find(&p.name, &method_name, &method_descriptor)
                             .is_some()
@@ -31685,6 +31714,7 @@ fn populate_invoke_cache(
     if let Some((callback, kind)) = cached_exact_native
         .or_else(|| {
             shared
+                .natives
                 .native_methods
                 .find_with_kind(&class_name, &method_name, &descriptor)
         })
@@ -31822,19 +31852,22 @@ fn populate_invoke_cache(
         // real bytecode yields — do not cache the stub. `method`/`declaring_id`
         // are the already-resolved real method/class from
         // `find_method_recursive` above.
-        let stub_yields = shared
-            .native_methods
-            .kind_of(declaring_name, &method_name, &descriptor)
-            == Some(cratonvm_native_api::NativeKind::SyntheticStub)
-            && real_protected_stub_class(declaring_name)
-            && store
-                .get(declaring_id)
-                .is_some_and(|c| !c.is_synthetic_stub)
-            && !method.is_native()
-            && method.code().is_some();
+        let stub_yields =
+            shared
+                .natives
+                .native_methods
+                .kind_of(declaring_name, &method_name, &descriptor)
+                == Some(cratonvm_native_api::NativeKind::SyntheticStub)
+                && real_protected_stub_class(declaring_name)
+                && store
+                    .get(declaring_id)
+                    .is_some_and(|c| !c.is_synthetic_stub)
+                && !method.is_native()
+                && method.code().is_some();
         if !stub_yields {
             if let Some(callback) =
                 shared
+                    .natives
                     .native_methods
                     .find(declaring_name, &method_name, &descriptor)
             {
@@ -31864,6 +31897,7 @@ fn populate_invoke_cache(
         let declaring_name = store.get(declaring_id).map(|c| &*c.name).unwrap_or("");
         if let Some(callback) =
             shared
+                .natives
                 .native_methods
                 .find(declaring_name, &method_name, &descriptor)
         {
@@ -32577,6 +32611,7 @@ fn compile_osr_artifact(
     // (`try_jit_compile_callee`, `try_jit_upgrade_with_gate`, first-call
     // compile path). OSR must respect the native registration too.
     if shared
+        .natives
         .native_methods
         .find(class_name_check, method_name_check, &method_descriptor)
         .is_some()
@@ -34152,11 +34187,13 @@ fn jit_invoke_targets_native_shadow(
         return false;
     }
     let direct = shared
+        .natives
         .native_methods
         .find(&target_class, &method_name, &descriptor)
         .is_some();
     let inherited = declaring_class.as_ref().is_some_and(|declaring_class| {
         shared
+            .natives
             .native_methods
             .find(declaring_class, &method_name, &descriptor)
             .is_some()
@@ -34185,6 +34222,7 @@ fn jit_invoke_targets_native_shadow(
         && !direct
         && !inherited
         && shared
+            .natives
             .native_methods
             .might_have_method_descriptor(&method_name, &descriptor);
     if (direct || inherited || interface_blind_possible_shadow)
@@ -34373,6 +34411,7 @@ fn try_jit_upgrade_with_gate(
     // somewhere up its ancestor chain is allowed to compile.
     {
         if shared
+            .natives
             .native_methods
             .find(
                 &cached.class_name,
@@ -34778,6 +34817,7 @@ fn try_jit_upgrade_with_gate(
             // `r\0\0\0\0\0\0\0-\0\0\0\0\0\0` for `bannerMode`, tripping
             // `InvalidConfigurationPropertyNameException` in SportMe.
             if shared
+                .natives
                 .native_methods
                 .find(callee_class, callee_method, callee_desc)
                 .is_some()
@@ -35724,6 +35764,7 @@ fn try_jit_compile_callee_slow(
     // compiled, ~100x slower than HotSpot (Spring Boot buildSrc
     // `SpringRepositoriesExtensionTests` hang).
     if shared
+        .natives
         .native_methods
         .find(class_name, method_name, descriptor)
         .is_some()
@@ -35796,6 +35837,7 @@ fn try_jit_compile_callee_slow(
     // already returned None, so this only fires for genuinely inherited natives.)
     if declaring_class_name != class_name
         && shared
+            .natives
             .native_methods
             .find(declaring_class_name, method_name, descriptor)
             .is_some()
@@ -38599,11 +38641,13 @@ fn execute_invokevirtual_vtable_fast(
             }
             if cached_native_shadow != Some(false)
                 && shared
+                    .natives
                     .native_methods
                     .might_have_method_descriptor(&method_name, &method_descriptor)
             {
                 let direct_native_shadow = !receiver_redefined
                     && shared
+                        .natives
                         .native_methods
                         .find(rcv_name, &method_name, &method_descriptor)
                         .is_some();
@@ -38685,6 +38729,7 @@ fn execute_invokevirtual_vtable_fast(
                                 );
                             let has_native = !parent_redefined
                                 && shared
+                                    .natives
                                     .native_methods
                                     .find(&parent.name, &method_name, &method_descriptor)
                                     .is_some();
@@ -38815,6 +38860,7 @@ fn execute_invokevirtual_vtable_fast(
         });
         if force_native
             && shared
+                .natives
                 .native_methods
                 .find(
                     cached.class_name.as_ref(),
@@ -39021,7 +39067,7 @@ fn native_override_for_cached_reflect_invoke(
             "java/lang/reflect/Method",
             "invoke",
             "(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;",
-        ) => shared.native_methods.find(
+        ) => shared.natives.native_methods.find(
             "java/lang/reflect/Method",
             "invoke",
             "(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;",
@@ -39030,7 +39076,7 @@ fn native_override_for_cached_reflect_invoke(
             "java/lang/reflect/Constructor",
             "newInstance",
             "([Ljava/lang/Object;)Ljava/lang/Object;",
-        ) => shared.native_methods.find(
+        ) => shared.natives.native_methods.find(
             "java/lang/reflect/Constructor",
             "newInstance",
             "([Ljava/lang/Object;)Ljava/lang/Object;",
@@ -39039,7 +39085,7 @@ fn native_override_for_cached_reflect_invoke(
             "org/apache/maven/surefire/junitplatform/LazyLauncher",
             "discover",
             "(Lorg/junit/platform/launcher/LauncherDiscoveryRequest;)Lorg/junit/platform/launcher/TestPlan;",
-        ) => shared.native_methods.find(
+        ) => shared.natives.native_methods.find(
             "org/apache/maven/surefire/junitplatform/LazyLauncher",
             "discover",
             "(Lorg/junit/platform/launcher/LauncherDiscoveryRequest;)Lorg/junit/platform/launcher/TestPlan;",
@@ -39614,7 +39660,7 @@ fn execute_invokevirtual_cached(
                     let has_registered_native = cached
                         .native_callback_cache
                         .get_or_init(|| {
-                            shared.native_methods.find(
+                            shared.natives.native_methods.find(
                                 &cached.class_name,
                                 &cached.method_name,
                                 &cached.method_descriptor,
@@ -40420,6 +40466,7 @@ fn populate_virtual_invoke_cache(
             // so `NamespacedHierarchicalStore` lookups missed and every
             // @ParameterizedTest died in `getDeclarationContext` (NPE).
             let native_override_below_declaring = if shared
+                .natives
                 .native_methods
                 .might_have_method_descriptor(&method_name, &descriptor)
             {
@@ -40431,6 +40478,7 @@ fn populate_virtual_invoke_cache(
                     }
                     let Some(class) = store.get(cid) else { break };
                     if shared
+                        .natives
                         .native_methods
                         .find(&class.name, &method_name, &descriptor)
                         .is_some()
@@ -40549,6 +40597,7 @@ fn populate_virtual_invoke_cache(
             rcv_name
         };
         let native_signature_may_exist = shared
+            .natives
             .native_methods
             .might_have_method_descriptor(&method_name, &descriptor);
         // ThreadPoolExecutor.execute(Runnable): same receiver-aware
@@ -40600,6 +40649,7 @@ fn populate_virtual_invoke_cache(
         let direct_native_callback =
             if native_signature_may_exist && !is_real_tpe_execute && !receiver_redefined {
                 shared
+                    .natives
                     .native_methods
                     .find(&lookup_name, &method_name, &descriptor)
             } else {
@@ -40716,11 +40766,11 @@ fn populate_virtual_invoke_cache(
                         break;
                     }
                     if parent.find_method(&method_name, &descriptor).is_some() {
-                        if let Some(callback) =
-                            shared
-                                .native_methods
-                                .find(&parent_name, &method_name, &descriptor)
-                        {
+                        if let Some(callback) = shared.natives.native_methods.find(
+                            &parent_name,
+                            &method_name,
+                            &descriptor,
+                        ) {
                             let gate = RedefineGate::snapshot(
                                 cm.class_redefine_generation_handle(receiver_class_id),
                             );
@@ -40752,6 +40802,7 @@ fn populate_virtual_invoke_cache(
                     }
                     if let Some(callback) =
                         shared
+                            .natives
                             .native_methods
                             .find(&parent_name, &method_name, &descriptor)
                     {
@@ -40804,6 +40855,7 @@ fn populate_virtual_invoke_cache(
         let declaring_name = store.get(declaring_id).map(|c| &*c.name).unwrap_or("");
         if let Some(callback) =
             shared
+                .natives
                 .native_methods
                 .find(declaring_name, &method_name, &descriptor)
         {
@@ -40895,6 +40947,7 @@ fn populate_virtual_invoke_cache(
         if force {
             if let Some(callback) =
                 shared
+                    .natives
                     .native_methods
                     .find(declaring_name, &method_name, &descriptor)
             {
@@ -40938,11 +40991,11 @@ fn populate_virtual_invoke_cache(
     {
         let receiver_name = store.get(receiver_class_id).map(|c| &*c.name).unwrap_or("");
         if receiver_name == "org/python/core/PyModule" {
-            if let Some(callback) =
-                shared
-                    .native_methods
-                    .find("org/python/core/PyModule", &method_name, &descriptor)
-            {
+            if let Some(callback) = shared.natives.native_methods.find(
+                "org/python/core/PyModule",
+                &method_name,
+                &descriptor,
+            ) {
                 let gate =
                     RedefineGate::snapshot(cm.class_redefine_generation_handle(receiver_class_id));
                 drop(cm);
@@ -40978,11 +41031,11 @@ fn populate_virtual_invoke_cache(
     {
         let receiver_name = store.get(receiver_class_id).map(|c| &*c.name).unwrap_or("");
         if receiver_name == "org/python/core/PyJavaType" {
-            if let Some(callback) =
-                shared
-                    .native_methods
-                    .find("org/python/core/PyJavaType", &method_name, &descriptor)
-            {
+            if let Some(callback) = shared.natives.native_methods.find(
+                "org/python/core/PyJavaType",
+                &method_name,
+                &descriptor,
+            ) {
                 let gate =
                     RedefineGate::snapshot(cm.class_redefine_generation_handle(receiver_class_id));
                 drop(cm);
@@ -41182,6 +41235,7 @@ fn resolve_method_metadata(
     drop(cm);
 
     let (native_target, native_kind) = shared
+        .natives
         .native_methods
         .find_with_kind(&class_name, &method_name, &method_descriptor)
         .map(|(target, kind)| (Some(target), Some(kind)))

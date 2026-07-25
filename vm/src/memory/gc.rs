@@ -819,7 +819,11 @@ pub fn update_all_roots(
 
     // 9. JNI global references — update stored ObjectRefs inside each Box<ObjectRef>.
     {
-        shared.jni_global_refs.lock().update_after_gc(pointer_map);
+        shared
+            .natives
+            .jni_global_refs
+            .lock()
+            .update_after_gc(pointer_map);
     }
 
     // 9a. Native upcall table — rewrite each live slot's callback `target` to its
@@ -827,7 +831,11 @@ pub fn update_all_roots(
     //     does not read a stale pointer after a moving collection (root scan in
     //     roots.rs section 9a).
     {
-        shared.upcall_table.lock().update_after_gc(pointer_map);
+        shared
+            .natives
+            .upcall_table
+            .lock()
+            .update_after_gc(pointer_map);
     }
 
     // 9b. NIO selector side-table — the `sun.nio.ch.SelectionKeyImpl` registry

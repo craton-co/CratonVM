@@ -363,9 +363,13 @@ pub struct SharedVm {
     /// `satb_barrier` `is_marking_active()` fast-path gate (see
     /// `concurrent_satb`).
     pub concurrent_gc_state: std::sync::Arc<cratonvm_gc::ConcurrentGcState>,
+    /// Native-method registry, Panama FFI tables, JNI globals and the fd table.
+    ///
+    /// See [`crate::vm::realms::NativeRealm`]. Access paths are
+    /// `shared.natives.<field>`; lock types and levels are
+    /// unchanged by the move.
+    pub natives: crate::vm::realms::NativeRealm,
 
-    /// Native method registry (immutable after construction).
-    pub native_methods: NativeMethodRegistry,
     /// Java threads: registry, monitors, virtual-thread scheduling and the main ThreadGroup.
     ///
     /// See [`crate::vm::realms::ThreadRealm`]. Access paths are
@@ -428,9 +432,6 @@ pub struct SharedVm {
     /// unchanged by the move.
     pub debug: crate::vm::realms::DebugRealm,
 
-    /// File descriptor table for I/O operations.
-    pub fd_table: FileDescriptorTable,
-
     /// GC barrier for stop-the-world coordination across threads.
     pub gc_barrier: GcBarrier,
     /// JIT compilation state: code cache, PGO profiles, tiering policy, deopt log and invalidation.
@@ -439,18 +440,6 @@ pub struct SharedVm {
     /// `shared.jit.<field>`; lock types and levels are
     /// unchanged by the move.
     pub jit: crate::vm::realms::JitRealm,
-
-    /// Off-heap memory allocations for Panama FFI (JEP 454).
-    pub native_memory: parking_lot::Mutex<crate::native::ffi::NativeMemoryTable>,
-
-    /// Loaded native libraries for Panama SymbolLookup (JEP 454).
-    pub native_libraries: parking_lot::Mutex<Vec<libloading::Library>>,
-
-    /// Upcall table for Panama upcall handles (C calling Java).
-    pub upcall_table: parking_lot::Mutex<crate::native::ffi::UpcallTable>,
-
-    /// JNI global reference table — prevents GC of referenced objects.
-    pub jni_global_refs: parking_lot::Mutex<crate::native::jni::JniGlobalRefs>,
 
     /// Reference processor for weak/soft/phantom reference tracking during GC.
     ///
@@ -2494,7 +2483,16 @@ impl SharedVm {
             heap,
             concurrent_satb,
             concurrent_gc_state,
-            native_methods,
+            natives: crate::vm::realms::NativeRealm {
+                native_methods,
+
+                fd_table: FileDescriptorTable::new(),
+                native_memory: parking_lot::Mutex::new(crate::native::ffi::NativeMemoryTable::new()),
+                native_libraries: parking_lot::Mutex::new(Vec::new()),
+                upcall_table: parking_lot::Mutex::new(crate::native::ffi::UpcallTable::new()),
+                jni_global_refs: parking_lot::Mutex::new(crate::native::jni::JniGlobalRefs::new()),
+            },
+
             threads: crate::vm::realms::ThreadRealm {
                 throwable_stacks: RwLock::new(FxHashMap::default()),
                 monitors: MonitorTable::new(),
@@ -2537,8 +2535,6 @@ impl SharedVm {
                 stack_dump_requested: std::sync::atomic::AtomicBool::new(false),
                 stack_dump_ack_count: std::sync::atomic::AtomicU32::new(0),
             },
-
-            fd_table: FileDescriptorTable::new(),
             gc_barrier: GcBarrier::new(),
             jit: crate::vm::realms::JitRealm {
                 jit_cache: JitCache::new(),
@@ -2557,10 +2553,6 @@ impl SharedVm {
                 // JIT slow-path allocation: per-class init recipe cache.
                 jit_alloc_class_cache: crate::jit::alloc_class_cache::JitAllocClassCache::new(),
             },
-            native_memory: parking_lot::Mutex::new(crate::native::ffi::NativeMemoryTable::new()),
-            native_libraries: parking_lot::Mutex::new(Vec::new()),
-            upcall_table: parking_lot::Mutex::new(crate::native::ffi::UpcallTable::new()),
-            jni_global_refs: parking_lot::Mutex::new(crate::native::jni::JniGlobalRefs::new()),
             ref_processor: OrderedPlMutex::new(
                 cratonvm_gc::ReferenceProcessor::new(),
                 LockLevel::RefProcessor,
@@ -3106,7 +3098,7 @@ impl SharedVm {
         path: impl AsRef<std::path::Path>,
     ) -> std::io::Result<(usize, usize, usize)> {
         use cratonvm_native_api::NativeKind;
-        let mut rows = self.native_methods.dump_registrations();
+        let mut rows = self.natives.native_methods.dump_registrations();
         rows.sort_by(|a, b| (a.0, a.1, a.2).cmp(&(b.0, b.1, b.2)));
         let mut n_intrinsic = 0usize;
         let mut n_bridge = 0usize;
@@ -4757,7 +4749,7 @@ impl SharedVm {
     ) -> RankedGuard<parking_lot::MutexGuard<'_, crate::native::ffi::NativeMemoryTable>> {
         let rank = ranked_locks::enter(ranked_locks::NATIVE_MEMORY);
         RankedGuard {
-            lock: self.native_memory.lock(),
+            lock: self.natives.native_memory.lock(),
             rank_scope: rank,
         }
     }
@@ -4771,7 +4763,7 @@ impl std::fmt::Debug for SharedVm {
                 &self.classes.class_manager.read().loaded_count(),
             )
             .field("heap_bytes", &self.heap.allocated_bytes())
-            .field("native_methods", &self.native_methods.len())
+            .field("native_methods", &self.natives.native_methods.len())
             .finish()
     }
 }
@@ -5319,7 +5311,7 @@ impl std::fmt::Debug for Vm {
                 &self.shared.classes.class_manager.read().loaded_count(),
             )
             .field("heap_bytes", &self.shared.heap.allocated_bytes())
-            .field("native_methods", &self.shared.native_methods.len())
+            .field("native_methods", &self.shared.natives.native_methods.len())
             .field("printed_values", &self.main_thread.printed.len())
             .finish()
     }
@@ -5851,7 +5843,7 @@ mod tests {
     #[test]
     fn shared_vm_default_config() {
         let shared = SharedVm::new(VmConfig::default());
-        assert!(shared.native_methods.len() > 0);
+        assert!(shared.natives.native_methods.len() > 0);
         // C25 synthetic stubs plus wired super/interfaces (`Enumeration$Impl`,
         // `java/lang/Object`, `java/util/Enumeration`, `Comparator$Native`,
         // `java/util/Comparator`), PLUS the unmodifiable-collection-view
@@ -5920,10 +5912,12 @@ mod tests {
         let shared = SharedVm::new(VmConfig::default());
         // Check a few known native methods are registered
         assert!(shared
+            .natives
             .native_methods
             .find("java/io/PrintStream", "println", "(Ljava/lang/String;)V")
             .is_some());
         assert!(shared
+            .natives
             .native_methods
             .find("java/io/PrintStream", "println", "(I)V")
             .is_some());
@@ -6448,12 +6442,20 @@ mod tests {
         let mut real_config = VmConfig::default();
         real_config.use_synthetic_jdk = false;
         let real_shared = SharedVm::new(real_config);
-        let real_count = real_shared.native_methods.dump_registrations().len();
+        let real_count = real_shared
+            .natives
+            .native_methods
+            .dump_registrations()
+            .len();
 
         let mut synthetic_config = VmConfig::default();
         synthetic_config.use_synthetic_jdk = true;
         let synthetic_shared = SharedVm::new(synthetic_config);
-        let synthetic_count = synthetic_shared.native_methods.dump_registrations().len();
+        let synthetic_count = synthetic_shared
+            .natives
+            .native_methods
+            .dump_registrations()
+            .len();
 
         assert!(
             real_count <= synthetic_count,
@@ -6500,9 +6502,9 @@ mod tests {
         let shared = SharedVm::new(VmConfig::default());
         // Synthetic mode should have 5000+ registrations
         assert!(
-            shared.native_methods.len() > 4000,
+            shared.natives.native_methods.len() > 4000,
             "Synthetic mode should have > 4000 natives, got {}",
-            shared.native_methods.len()
+            shared.natives.native_methods.len()
         );
     }
 
@@ -6754,6 +6756,7 @@ mod tests {
         // Verify all Object native methods are registered in the native registry
         assert!(
             shared
+                .natives
                 .native_methods
                 .find("java/lang/Object", "hashCode", "()I")
                 .is_some(),
@@ -6761,6 +6764,7 @@ mod tests {
         );
         assert!(
             shared
+                .natives
                 .native_methods
                 .find("java/lang/Object", "getClass", "()Ljava/lang/Class;")
                 .is_some(),
@@ -6768,6 +6772,7 @@ mod tests {
         );
         assert!(
             shared
+                .natives
                 .native_methods
                 .find("java/lang/Object", "clone", "()Ljava/lang/Object;")
                 .is_some(),
@@ -6775,6 +6780,7 @@ mod tests {
         );
         assert!(
             shared
+                .natives
                 .native_methods
                 .find("java/lang/Object", "notify", "()V")
                 .is_some(),
@@ -6782,6 +6788,7 @@ mod tests {
         );
         assert!(
             shared
+                .natives
                 .native_methods
                 .find("java/lang/Object", "notifyAll", "()V")
                 .is_some(),
@@ -6790,6 +6797,7 @@ mod tests {
         // JDK 19+: wait0 is the actual native (wait is bytecode)
         assert!(
             shared
+                .natives
                 .native_methods
                 .find("java/lang/Object", "wait0", "(J)V")
                 .is_some(),
@@ -7213,10 +7221,11 @@ mod tests {
         let shared = create_real_jdk_vm().expect("No JDK found");
 
         // String.intern() should be in the native registry
-        let found =
-            shared
-                .native_methods
-                .find("java/lang/String", "intern", "()Ljava/lang/String;");
+        let found = shared.natives.native_methods.find(
+            "java/lang/String",
+            "intern",
+            "()Ljava/lang/String;",
+        );
         assert!(
             found.is_some(),
             "String.intern() native should be registered"
@@ -7245,7 +7254,10 @@ mod tests {
         ];
 
         for (method, desc) in &critical_natives {
-            let found = shared.native_methods.find("java/lang/Class", method, desc);
+            let found = shared
+                .natives
+                .native_methods
+                .find("java/lang/Class", method, desc);
             assert!(
                 found.is_some(),
                 "Class.{method}{desc} native should be registered"
@@ -7841,6 +7853,7 @@ mod tests {
         for (method, desc) in &system_natives {
             assert!(
                 shared
+                    .natives
                     .native_methods
                     .find("java/lang/System", method, desc)
                     .is_some(),
@@ -7880,6 +7893,7 @@ mod tests {
         for (method, desc) in &thread_natives {
             assert!(
                 shared
+                    .natives
                     .native_methods
                     .find("java/lang/Thread", method, desc)
                     .is_some(),
@@ -7897,6 +7911,7 @@ mod tests {
         // VM natives
         assert!(
             shared
+                .natives
                 .native_methods
                 .find(
                     "jdk/internal/misc/VM",
@@ -7908,6 +7923,7 @@ mod tests {
         );
         assert!(
             shared
+                .natives
                 .native_methods
                 .find("jdk/internal/misc/VM", "initLevel", "()I")
                 .is_some(),
@@ -7917,6 +7933,7 @@ mod tests {
         // CDS natives
         assert!(
             shared
+                .natives
                 .native_methods
                 .find(
                     "jdk/internal/misc/CDS",
@@ -7928,6 +7945,7 @@ mod tests {
         );
         assert!(
             shared
+                .natives
                 .native_methods
                 .find("jdk/internal/misc/CDS", "isSharingEnabled", "()Z")
                 .is_some(),
@@ -8507,6 +8525,7 @@ mod tests {
         eprintln!("jdk/internal/misc/Unsafe: {} native methods", natives.len());
         for n in &natives {
             let registered = shared
+                .natives
                 .native_methods
                 .find(&n.class_name, &n.method_name, &n.descriptor)
                 .is_some();
@@ -8530,6 +8549,7 @@ mod tests {
         eprintln!("ClassLoader: {} native methods", natives.len());
         for n in &natives {
             let registered = shared
+                .natives
                 .native_methods
                 .find(&n.class_name, &n.method_name, &n.descriptor)
                 .is_some();
@@ -8551,6 +8571,7 @@ mod tests {
         eprintln!("Reference: {} native methods", natives.len());
         for n in &natives {
             let registered = shared
+                .natives
                 .native_methods
                 .find(&n.class_name, &n.method_name, &n.descriptor)
                 .is_some();
@@ -8573,6 +8594,7 @@ mod tests {
         eprintln!("MethodHandle: {} native methods", natives.len());
         for n in &natives {
             let registered = shared
+                .natives
                 .native_methods
                 .find(&n.class_name, &n.method_name, &n.descriptor)
                 .is_some();
@@ -8619,6 +8641,7 @@ mod tests {
         eprintln!("FileInputStream: {} native methods", fis.len());
         for n in &fis {
             let registered = shared
+                .natives
                 .native_methods
                 .find(&n.class_name, &n.method_name, &n.descriptor)
                 .is_some();
@@ -8630,6 +8653,7 @@ mod tests {
         eprintln!("FileOutputStream: {} native methods", fos.len());
         for n in &fos {
             let registered = shared
+                .natives
                 .native_methods
                 .find(&n.class_name, &n.method_name, &n.descriptor)
                 .is_some();
@@ -8647,6 +8671,7 @@ mod tests {
         eprintln!("VM: {} native methods", vm_natives.len());
         for n in &vm_natives {
             let registered = shared
+                .natives
                 .native_methods
                 .find(&n.class_name, &n.method_name, &n.descriptor)
                 .is_some();
@@ -8659,6 +8684,7 @@ mod tests {
         eprintln!("CDS: {} native methods", cds_natives.len());
         for n in &cds_natives {
             let registered = shared
+                .natives
                 .native_methods
                 .find(&n.class_name, &n.method_name, &n.descriptor)
                 .is_some();
@@ -8685,6 +8711,7 @@ mod tests {
         ];
         for class in &classes_with_register_natives {
             let found = shared
+                .natives
                 .native_methods
                 .find(class, "registerNatives", "()V")
                 .is_some();
@@ -9794,7 +9821,11 @@ mod tests {
 
         for (method, desc) in &cas_methods {
             assert!(
-                shared.native_methods.find(u, method, desc).is_some(),
+                shared
+                    .natives
+                    .native_methods
+                    .find(u, method, desc)
+                    .is_some(),
                 "Unsafe.{method}{desc} should be registered on {u}"
             );
         }
@@ -9812,7 +9843,11 @@ mod tests {
 
         for (method, desc) in &legacy_cas {
             assert!(
-                shared.native_methods.find(u_legacy, method, desc).is_some(),
+                shared
+                    .natives
+                    .native_methods
+                    .find(u_legacy, method, desc)
+                    .is_some(),
                 "{u_legacy}.{method}{desc} should be registered"
             );
         }
@@ -9833,7 +9868,11 @@ mod tests {
 
         for (method, desc) in &methods {
             assert!(
-                shared.native_methods.find(ls, method, desc).is_some(),
+                shared
+                    .natives
+                    .native_methods
+                    .find(ls, method, desc)
+                    .is_some(),
                 "LockSupport.{method}{desc} should be registered"
             );
         }
@@ -10955,7 +10994,7 @@ mod tests {
                 return;
             }
         };
-        let count = shared.native_methods.len();
+        let count = shared.natives.native_methods.len();
         // Essential natives + I/O natives should be well under 2000
         assert!(
             count < 2000,
@@ -10984,6 +11023,7 @@ mod tests {
         // Object.hashCode must be registered
         assert!(
             shared
+                .natives
                 .native_methods
                 .find("java/lang/Object", "hashCode", "()I")
                 .is_some(),
@@ -10992,6 +11032,7 @@ mod tests {
         // System.arraycopy must be registered
         assert!(
             shared
+                .natives
                 .native_methods
                 .find(
                     "java/lang/System",
@@ -11002,12 +11043,13 @@ mod tests {
             "System.arraycopy must be an essential native"
         );
         // Class.forName0 must be registered
-        assert!(shared.native_methods.find("java/lang/Class", "forName0",
+        assert!(shared.natives.native_methods.find("java/lang/Class", "forName0",
             "(Ljava/lang/String;ZLjava/lang/ClassLoader;Ljava/lang/Class;)Ljava/lang/Class;").is_some(),
             "Class.forName0 must be an essential native");
         // Thread.currentThread must be registered
         assert!(
             shared
+                .natives
                 .native_methods
                 .find("java/lang/Thread", "currentThread", "()Ljava/lang/Thread;")
                 .is_some(),
@@ -11029,6 +11071,7 @@ mod tests {
         // StringBuilder.append should NOT be registered — it's JDK bytecode
         assert!(
             shared
+                .natives
                 .native_methods
                 .find(
                     "java/lang/StringBuilder",
@@ -11041,6 +11084,7 @@ mod tests {
         // HashMap.put should NOT be registered
         assert!(
             shared
+                .natives
                 .native_methods
                 .find(
                     "java/util/HashMap",
@@ -11053,6 +11097,7 @@ mod tests {
         // BigInteger.add should NOT be registered
         assert!(
             shared
+                .natives
                 .native_methods
                 .find(
                     "java/math/BigInteger",

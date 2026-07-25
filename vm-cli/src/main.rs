@@ -2254,7 +2254,7 @@ fn run() -> Result<()> {
 
     if ring_recording_requested {
         cratonvm_native_api::native_ring::enable(true);
-        vm.shared.native_methods.flush_native_ring_names();
+        vm.shared.natives.native_methods.flush_native_ring_names();
         cratonvm_vm::dispatch_trace::enable();
     }
 
@@ -2272,7 +2272,7 @@ fn run() -> Result<()> {
         // frames; ring detail is reserved for runs that asked for it.
         if ring_recording_requested {
             cratonvm_native_api::native_ring::enable(true);
-            vm.shared.native_methods.flush_native_ring_names();
+            vm.shared.natives.native_methods.flush_native_ring_names();
             // T19.H1 — also enable the dispatch-trace ring. The native-call
             // ring records only opaque fn-pointers from two dispatch sites;
             // the dispatch trace records *named* class.method.desc for every

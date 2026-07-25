@@ -1485,6 +1485,7 @@ pub fn validate_native_coverage(shared: &SharedVm) -> NativeCoverageReport {
                 descriptor: method.descriptor.to_string(),
             };
             if shared
+                .natives
                 .native_methods
                 .find(&class.name, &method.name, &method.descriptor)
                 .is_some()

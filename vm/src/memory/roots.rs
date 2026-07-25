@@ -443,7 +443,11 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
 
     // 9. JNI global references — prevent GC from collecting objects held by native code.
     {
-        shared.jni_global_refs.lock().collect_roots(&mut roots);
+        shared
+            .natives
+            .jni_global_refs
+            .lock()
+            .collect_roots(&mut roots);
     }
 
     // 9a. Native upcall table — each live slot holds a `target: ObjectRef` for the
@@ -453,7 +457,7 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     //     copy, but this table's copy was previously neither scanned nor remapped
     //     — see gc.rs section 9a counterpart).
     {
-        shared.upcall_table.lock().collect_roots(&mut roots);
+        shared.natives.upcall_table.lock().collect_roots(&mut roots);
     }
 
     // 9b. JNI LOCAL references (vm-jni-roots #1).

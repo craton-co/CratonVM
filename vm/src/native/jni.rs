@@ -1630,7 +1630,7 @@ pub fn jobject_to_obj(jobj: JObject) -> Option<ObjectRef> {
         JNI_SHARED_VM.with(|c| {
             let borrow = c.borrow();
             match borrow.as_ref() {
-                Some(shared) => shared.jni_global_refs.lock().resolve(jobj),
+                Some(shared) => shared.natives.jni_global_refs.lock().resolve(jobj),
                 None => {
                     tracing::warn!(
                         "jobject_to_obj: global ref {jobj:#x} resolved outside JNI context"
@@ -2015,7 +2015,7 @@ extern "C" fn jni_new_global_ref(_env: JNIEnv, obj: JObject) -> JObject {
         None => return 0,
     };
     with_shared_vm(|shared| {
-        let handle = shared.jni_global_refs.lock().add(oref);
+        let handle = shared.natives.jni_global_refs.lock().add(oref);
         Some(handle)
     })
     .flatten()
@@ -2031,7 +2031,7 @@ extern "C" fn jni_delete_global_ref(_env: JNIEnv, gref: JObject) {
         return; // not a global ref handle
     }
     with_shared_vm(|shared| {
-        shared.jni_global_refs.lock().remove(gref);
+        shared.natives.jni_global_refs.lock().remove(gref);
     });
 }
 
@@ -3326,7 +3326,7 @@ macro_rules! get_array_elements {
                 // collection, so the copy-back at Release follows the array to
                 // its current address (see the module comment above). Deleted on
                 // the final Release.
-                let array_gref = shared.jni_global_refs.lock().add(oref);
+                let array_gref = shared.natives.jni_global_refs.lock().add(oref);
                 JNI_ARRAY_ELEM_BUFFERS.with(|c| {
                     c.borrow_mut().insert(
                         ptr as usize,
@@ -3416,7 +3416,7 @@ macro_rules! release_array_elements {
                 // we neither read past the end of our buffer nor write out of the
                 // array's bounds if it has since shrunk.
                 with_shared_vm(|shared| {
-                    let oref = shared.jni_global_refs.lock().resolve(array_gref)?;
+                    let oref = shared.natives.jni_global_refs.lock().resolve(array_gref)?;
                     let arr_len = shared.heap.array_length(oref);
                     let copy_len = stored_len.min(arr_len);
                     for i in 0..copy_len {
@@ -3434,7 +3434,7 @@ macro_rules! release_array_elements {
                 // recorded at allocation time. On JNI_COMMIT (1) both the entry
                 // and its global ref intentionally persist for a later release.
                 with_shared_vm(|shared| {
-                    shared.jni_global_refs.lock().remove(array_gref);
+                    shared.natives.jni_global_refs.lock().remove(array_gref);
                     Some(())
                 });
                 unsafe {
@@ -4324,7 +4324,7 @@ extern "C" fn jni_new_weak_global_ref(_env: JNIEnv, obj: JObject) -> JObject {
     }
     with_shared_vm(|shared| {
         let oref = jobject_to_obj(obj)?;
-        let mut refs = shared.jni_global_refs.lock();
+        let mut refs = shared.natives.jni_global_refs.lock();
         Some(refs.add(oref))
     })
     .flatten()
@@ -4337,7 +4337,7 @@ extern "C" fn jni_delete_weak_global_ref(_env: JNIEnv, wref: JObject) {
         return;
     }
     with_shared_vm(|shared| {
-        let mut refs = shared.jni_global_refs.lock();
+        let mut refs = shared.natives.jni_global_refs.lock();
         refs.remove(wref);
         Some(())
     });
@@ -7476,7 +7476,7 @@ mod tests {
         let obj = shared
             .heap
             .alloc_object(crate::classloading::ClassId::new(0), 1);
-        let handle = shared.jni_global_refs.lock().add(obj);
+        let handle = shared.natives.jni_global_refs.lock().add(obj);
         let resolved = jobject_to_obj(handle).expect("global ref must resolve to Some");
         assert_eq!(
             resolved, obj,
@@ -7497,7 +7497,7 @@ mod tests {
             .heap
             .alloc_object(crate::classloading::ClassId::new(0), 1);
         // Create a global ref via the shared state.
-        shared.jni_global_refs.lock().add(obj);
+        shared.natives.jni_global_refs.lock().add(obj);
         let thread = JvmThread::new(ThreadId(0), "test");
         let roots = collect_roots(&shared, &thread);
         assert!(
@@ -7573,7 +7573,7 @@ mod tests {
             .heap
             .alloc_object(crate::classloading::ClassId::new(0), 1);
         let local_ref = obj_to_jobject(obj); // raw local ref
-        let global_ref = shared.jni_global_refs.lock().add(obj);
+        let global_ref = shared.natives.jni_global_refs.lock().add(obj);
         // Both refer to the same object → IsSameObject must return true.
         let resolved_local = jobject_to_obj(local_ref).unwrap();
         let resolved_global = jobject_to_obj(global_ref).unwrap();

@@ -4059,11 +4059,12 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // GC-remapped root. Used by the async-socket completion path to hold a
         // CompletionHandler / attachment / ByteBuffer parked on a worker thread
         // and delivered later on the AIO dispatcher thread.
-        self.shared.jni_global_refs.lock().add(obj) as usize
+        self.shared.natives.jni_global_refs.lock().add(obj) as usize
     }
 
     fn resolve_global_root(&self, handle: usize) -> Option<ObjectRef> {
         self.shared
+            .natives
             .jni_global_refs
             .lock()
             .resolve(handle as crate::native::jni::JObject)
@@ -4071,6 +4072,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
 
     fn remove_global_root(&mut self, handle: usize) -> bool {
         self.shared
+            .natives
             .jni_global_refs
             .lock()
             .remove(handle as crate::native::jni::JObject)
@@ -5099,6 +5101,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         }
         // Also check native method registry
         self.shared
+            .natives
             .native_methods
             .find(class_name, method_name, descriptor)
             .is_some()
@@ -8358,7 +8361,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     }
 
     fn fd_table(&self) -> &FileDescriptorTable {
-        &self.shared.fd_table
+        &self.shared.natives.fd_table
     }
 
     // -- WP0.2 ObjectStreamClass cache --
@@ -9949,11 +9952,15 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     // -- Panama FFI (JEP 454) --
 
     fn allocate_native_memory(&mut self, size: usize, align: usize) -> Option<(i64, *mut u8)> {
-        self.shared.native_memory.lock().allocate(size, align)
+        self.shared
+            .natives
+            .native_memory
+            .lock()
+            .allocate(size, align)
     }
 
     fn free_native_memory(&mut self, alloc_id: i64) {
-        self.shared.native_memory.lock().free(alloc_id);
+        self.shared.natives.native_memory.lock().free(alloc_id);
     }
 
     fn load_native_library(&mut self, path: &str) -> Result<i64, crate::error::MethodCallFailed> {
@@ -10017,18 +10024,19 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             }
         }
 
-        let mut libs = self.shared.native_libraries.lock();
+        let mut libs = self.shared.natives.native_libraries.lock();
         let index = libs.len() as i64;
         libs.push(lib);
         Ok(index)
     }
 
     fn register_upcall(&mut self, entry: crate::native::ffi::UpcallEntry) -> usize {
-        self.shared.upcall_table.lock().register(entry)
+        self.shared.natives.upcall_table.lock().register(entry)
     }
 
     fn get_upcall_info(&self, slot: usize) -> Option<(ObjectRef, Vec<i32>, i32)> {
         self.shared
+            .natives
             .upcall_table
             .lock()
             .get(slot)
@@ -10709,7 +10717,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     }
 
     fn find_native_symbol(&self, lib_index: i64, name: &str) -> Option<usize> {
-        let libs = self.shared.native_libraries.lock();
+        let libs = self.shared.natives.native_libraries.lock();
         let c_name = std::ffi::CString::new(name).ok()?;
 
         if lib_index >= 0 && (lib_index as usize) < libs.len() {
@@ -11293,7 +11301,7 @@ pub fn invoke_or_native(
                 .map(|class| class.name.as_ref() == "java/lang/foreign/DowncallHandle")
                 .unwrap_or(false);
             if is_downcall {
-                if let Some(callback) = shared.native_methods.find(
+                if let Some(callback) = shared.natives.native_methods.find(
                     "java/lang/foreign/DowncallHandle",
                     "type",
                     "()Ljava/lang/invoke/MethodType;",
@@ -11315,7 +11323,7 @@ pub fn invoke_or_native(
                 .map(|class| class.name.as_ref() == "java/lang/foreign/DowncallHandle")
                 .unwrap_or(false);
             if is_downcall {
-                if let Some(callback) = shared.native_methods.find(
+                if let Some(callback) = shared.natives.native_methods.find(
                     "java/lang/foreign/DowncallHandle",
                     method_name,
                     "([Ljava/lang/Object;)Ljava/lang/Object;",
@@ -11356,6 +11364,7 @@ pub fn invoke_or_native(
     if method_name == "setDefaultAssertionStatus" && descriptor == "(Z)V" {
         if let Some(callback) =
             shared
+                .natives
                 .native_methods
                 .find("java/lang/ClassLoader", method_name, descriptor)
         {
@@ -11386,6 +11395,7 @@ pub fn invoke_or_native(
     {
         if let Some(callback) =
             shared
+                .natives
                 .native_methods
                 .find("java/lang/ClassLoader", method_name, descriptor)
         {
@@ -11409,6 +11419,7 @@ pub fn invoke_or_native(
     {
         if let Some(callback) =
             shared
+                .natives
                 .native_methods
                 .find("java/lang/ClassLoader", method_name, descriptor)
         {
@@ -11549,6 +11560,7 @@ pub fn invoke_or_native(
 
     if let Some((callback, native_kind)) =
         shared
+            .natives
             .native_methods
             .find_with_kind(effective_class, method_name, descriptor)
     {
@@ -11615,9 +11627,11 @@ pub fn invoke_or_native(
     // Also try the original class name in case the caller registered a
     // specific override for the array type.
     if effective_class != class_name {
-        if let Some(callback) = shared
-            .native_methods
-            .find(class_name, method_name, descriptor)
+        if let Some(callback) =
+            shared
+                .natives
+                .native_methods
+                .find(class_name, method_name, descriptor)
         {
             return safe_native_call(shared, thread, callback, args)
                 .map(|v| coerce_native_return(v, descriptor));
@@ -11659,22 +11673,22 @@ pub fn invoke_or_native(
                         // native wins. See `populate_virtual_invoke_cache` for
                         // the full LinkedHashMap-overlay rationale.
                         if parent.find_method(method_name, descriptor).is_some() {
-                            if let Some(callback) =
-                                shared
-                                    .native_methods
-                                    .find(&parent.name, method_name, descriptor)
-                            {
+                            if let Some(callback) = shared.natives.native_methods.find(
+                                &parent.name,
+                                method_name,
+                                descriptor,
+                            ) {
                                 drop(cm);
                                 return safe_native_call(shared, thread, callback, args)
                                     .map(|v| coerce_native_return(v, descriptor));
                             }
                             break;
                         }
-                        if let Some(callback) =
-                            shared
-                                .native_methods
-                                .find(&parent.name, method_name, descriptor)
-                        {
+                        if let Some(callback) = shared.natives.native_methods.find(
+                            &parent.name,
+                            method_name,
+                            descriptor,
+                        ) {
                             if crate::runtime::env_cache::bd_debug() && method_name == "intValue" {
                                 eprintln!(
                                     "[invoke_or_native] hierarchy walk hit on parent={}",
@@ -12084,6 +12098,7 @@ pub fn invoke_special_shared(
     // the stub ctor never built the real StreamEncoder, so the real
     // OSW.flush() bytecode NPE'd on `this.se`).
     if let Some(callback) = shared
+        .natives
         .native_methods
         .find(class_name, method_name, descriptor)
     {
@@ -15077,9 +15092,11 @@ fn invoke_on_class_shared_inner(
         // `GenericTypeResolver`-based debug output. Once a class's real
         // bytecode loads, `is_synthetic_stub` flips false and this check
         // naturally stops applying to it.
-        if let Some(callback) = shared
-            .native_methods
-            .find(&class_name, method_name, descriptor)
+        if let Some(callback) =
+            shared
+                .natives
+                .native_methods
+                .find(&class_name, method_name, descriptor)
         {
             return safe_native_call(shared, thread, callback, args)
                 .map(|value| coerce_native_return(value, descriptor));
@@ -15116,7 +15133,7 @@ fn invoke_on_class_shared_inner(
                     .unwrap_or(false)
             };
             if is_path {
-                if let Some(callback) = shared.native_methods.find(
+                if let Some(callback) = shared.natives.native_methods.find(
                     "java/nio/file/Path",
                     "toString",
                     "()Ljava/lang/String;",
@@ -15144,7 +15161,7 @@ fn invoke_on_class_shared_inner(
         )
     {
         if let Some(callback) = shared
-            .native_methods
+            .natives.native_methods
             .find("javax/net/ssl/SSLContext", method_name, descriptor)
         {
             return safe_native_call(shared, thread, callback, args)
@@ -15166,11 +15183,11 @@ fn invoke_on_class_shared_inner(
                 | "(Ljava/net/Socket;Ljava/lang/String;IZ)Ljava/net/Socket;"
         )
     {
-        if let Some(callback) =
-            shared
-                .native_methods
-                .find("javax/net/ssl/SSLSocketFactory", method_name, descriptor)
-        {
+        if let Some(callback) = shared.natives.native_methods.find(
+            "javax/net/ssl/SSLSocketFactory",
+            method_name,
+            descriptor,
+        ) {
             return safe_native_call(shared, thread, callback, args)
                 .map(|value| coerce_native_return(value, descriptor));
         }
@@ -15204,6 +15221,7 @@ fn invoke_on_class_shared_inner(
     {
         if let Some(callback) =
             shared
+                .natives
                 .native_methods
                 .find("javax/net/ssl/SSLSocket", method_name, descriptor)
         {
@@ -15222,9 +15240,11 @@ fn invoke_on_class_shared_inner(
                 | ("detach", "()V")
         )
     {
-        if let Some(callback) = shared
-            .native_methods
-            .find(&class_name, method_name, descriptor)
+        if let Some(callback) =
+            shared
+                .natives
+                .native_methods
+                .find(&class_name, method_name, descriptor)
         {
             return safe_native_call(shared, thread, callback, args)
                 .map(|value| coerce_native_return(value, descriptor));
@@ -15258,6 +15278,7 @@ fn invoke_on_class_shared_inner(
             if receiver_name == "javax/net/ssl/SSLServerSocket" {
                 if let Some(callback) =
                     shared
+                        .natives
                         .native_methods
                         .find(&receiver_name, method_name, descriptor)
                 {
@@ -15297,6 +15318,7 @@ fn invoke_on_class_shared_inner(
                     | "sun/security/ssl/SSLServerSocketFactoryImpl"
             ) {
                 if let Some(callback) = shared
+                    .natives
                     .native_methods
                     // The real JDK factory carries its SSLContext in the
                     // same first instance slot consumed by the bridge.
@@ -15327,9 +15349,11 @@ fn invoke_on_class_shared_inner(
                 | ("setContextClassLoader", "(Ljava/lang/ClassLoader;)V")
         )
     {
-        if let Some(callback) = shared
-            .native_methods
-            .find(&class_name, method_name, descriptor)
+        if let Some(callback) =
+            shared
+                .natives
+                .native_methods
+                .find(&class_name, method_name, descriptor)
         {
             return safe_native_call(shared, thread, callback, args)
                 .map(|value| coerce_native_return(value, descriptor));
@@ -17851,6 +17875,7 @@ fn invoke_on_class_shared_inner(
                             && descriptor == "(Ljava/lang/Class;)Ljava/lang/Object;");
                     if check_override
                         && shared
+                            .natives
                             .native_methods
                             .find(class_name, method_name, descriptor)
                             .is_some()
@@ -17886,6 +17911,7 @@ fn invoke_on_class_shared_inner(
                         let recv_name = store.get(class_id).map(|c| &*c.name).unwrap_or("");
                         if !recv_name.is_empty()
                             && shared
+                                .natives
                                 .native_methods
                                 .find(recv_name, method_name, descriptor)
                                 .is_some()
@@ -17952,6 +17978,7 @@ fn invoke_on_class_shared_inner(
                             let recv_name = store.get(rc).map(|c| &*c.name).unwrap_or("");
                             if !recv_name.is_empty()
                                 && shared
+                                    .natives
                                     .native_methods
                                     .find(recv_name, method_name, descriptor)
                                     .is_some()
@@ -17974,6 +18001,7 @@ fn invoke_on_class_shared_inner(
                                 "org/python/core/PyNullImporter"
                                     | "org/python/modules/zipimport/zipimporter"
                             ) && shared
+                                .natives
                                 .native_methods
                                 .find(recv_name, method_name, descriptor)
                                 .is_some()
@@ -17993,6 +18021,7 @@ fn invoke_on_class_shared_inner(
                             let recv_name = store.get(recv_cid).map(|c| &*c.name).unwrap_or("");
                             if recv_name == "org/python/core/PyModule"
                                 && shared
+                                    .natives
                                     .native_methods
                                     .find(recv_name, method_name, descriptor)
                                     .is_some()
@@ -18013,6 +18042,7 @@ fn invoke_on_class_shared_inner(
                             let recv_name = store.get(recv_cid).map(|c| &*c.name).unwrap_or("");
                             if recv_name == "org/python/core/PyJavaType"
                                 && shared
+                                    .natives
                                     .native_methods
                                     .find(recv_name, method_name, descriptor)
                                     .is_some()
@@ -18042,6 +18072,7 @@ fn invoke_on_class_shared_inner(
                     if let Some(cls) = store.get(cid) {
                         if let Some(cb) =
                             shared
+                                .natives
                                 .native_methods
                                 .find(&cls.name, method_name, descriptor)
                         {
@@ -18165,11 +18196,11 @@ fn invoke_on_class_shared_inner(
                         };
                         if prefer_exact || dynamic_downcall {
                             for poly_desc in &poly_descs {
-                                if let Some(cb) =
-                                    shared
-                                        .native_methods
-                                        .find(exact_class, method_name, poly_desc)
-                                {
+                                if let Some(cb) = shared.natives.native_methods.find(
+                                    exact_class,
+                                    method_name,
+                                    poly_desc,
+                                ) {
                                     let r = safe_native_call(shared, thread, cb, args)?;
                                     return Ok(unbox_poly_return(shared, r, descriptor));
                                 }
@@ -18177,7 +18208,10 @@ fn invoke_on_class_shared_inner(
                         }
                         for poly_desc in &poly_descs {
                             if let Some(cb) =
-                                shared.native_methods.find(base, method_name, poly_desc)
+                                shared
+                                    .natives
+                                    .native_methods
+                                    .find(base, method_name, poly_desc)
                             {
                                 let r = safe_native_call(shared, thread, cb, args)?;
                                 return Ok(unbox_poly_return(shared, r, descriptor));
@@ -18186,11 +18220,11 @@ fn invoke_on_class_shared_inner(
                         if !prefer_exact {
                             // Also try the exact class name
                             for poly_desc in &poly_descs {
-                                if let Some(cb) =
-                                    shared
-                                        .native_methods
-                                        .find(&class_name, method_name, poly_desc)
-                                {
+                                if let Some(cb) = shared.natives.native_methods.find(
+                                    &class_name,
+                                    method_name,
+                                    poly_desc,
+                                ) {
                                     let r = safe_native_call(shared, thread, cb, args)?;
                                     return Ok(unbox_poly_return(shared, r, descriptor));
                                 }
@@ -18270,11 +18304,11 @@ fn invoke_on_class_shared_inner(
                         // Second pass: fall back to a native registered on
                         // any interface name (legacy behavior).
                         for iface_name in &iface_names {
-                            if let Some(callback) =
-                                shared
-                                    .native_methods
-                                    .find(iface_name, method_name, descriptor)
-                            {
+                            if let Some(callback) = shared.natives.native_methods.find(
+                                iface_name,
+                                method_name,
+                                descriptor,
+                            ) {
                                 return safe_native_call(shared, thread, callback, args);
                             }
                         }
@@ -18358,9 +18392,11 @@ fn invoke_on_class_shared_inner(
                             const SYNTH_RECEIVER_CANDIDATES: &[&str] =
                                 &["java/util/regex/Pattern", "java/util/regex/Matcher"];
                             for cand in SYNTH_RECEIVER_CANDIDATES {
-                                if let Some(cb) =
-                                    shared.native_methods.find(cand, method_name, descriptor)
-                                {
+                                if let Some(cb) = shared.natives.native_methods.find(
+                                    cand,
+                                    method_name,
+                                    descriptor,
+                                ) {
                                     tracing::warn!(
                                         target: "cratonvm_vm::dispatch::synth_rescue",
                                         rescued_via = %cand,
@@ -18392,7 +18428,7 @@ fn invoke_on_class_shared_inner(
                             let mut walk_cid = Some(recv_cid);
                             while let Some(cid) = walk_cid {
                                 if let Some(cls) = cm3.class_store.get(cid) {
-                                    if let Some(cb) = shared.native_methods.find(
+                                    if let Some(cb) = shared.natives.native_methods.find(
                                         &cls.name,
                                         method_name,
                                         descriptor,
@@ -18493,11 +18529,11 @@ fn invoke_on_class_shared_inner(
                     format!("{descriptor};")
                 };
                 if alt_descriptor != descriptor {
-                    if let Some(cb) =
-                        shared
-                            .native_methods
-                            .find(&class_name, method_name, &alt_descriptor)
-                    {
+                    if let Some(cb) = shared.natives.native_methods.find(
+                        &class_name,
+                        method_name,
+                        &alt_descriptor,
+                    ) {
                         return safe_native_call(shared, thread, cb, args);
                     }
                 }
@@ -18604,16 +18640,17 @@ fn invoke_on_class_shared_inner(
                                     method_name,
                                     descriptor,
                                     shared
+                                        .natives
                                         .native_methods
                                         .find(&cls.name, method_name, descriptor)
                                         .is_some()
                                 );
                             }
-                            if let Some(cb) =
-                                shared
-                                    .native_methods
-                                    .find(&cls.name, method_name, descriptor)
-                            {
+                            if let Some(cb) = shared.natives.native_methods.find(
+                                &cls.name,
+                                method_name,
+                                descriptor,
+                            ) {
                                 drop(cm_nat);
                                 return safe_native_call(shared, thread, cb, args);
                             }
@@ -18630,11 +18667,11 @@ fn invoke_on_class_shared_inner(
                                 break;
                             }
                             if let Some(cls) = cm_nat.class_store.get(cid) {
-                                if let Some(cb) =
-                                    shared
-                                        .native_methods
-                                        .find(&cls.name, method_name, descriptor)
-                                {
+                                if let Some(cb) = shared.natives.native_methods.find(
+                                    &cls.name,
+                                    method_name,
+                                    descriptor,
+                                ) {
                                     drop(cm_nat);
                                     return safe_native_call(shared, thread, cb, args);
                                 }
@@ -18939,6 +18976,7 @@ fn invoke_on_class_shared_inner(
         {
             if let Some(callback) =
                 shared
+                    .natives
                     .native_methods
                     .find(&class_name_for_force, method_name, descriptor)
             {
@@ -19021,9 +19059,11 @@ fn invoke_on_class_shared_inner(
         let skip_jni_incompatible_host_lib = class_name.starts_with("org/apache/tomcat/jni/")
             || class_name.starts_with("io/netty/internal/tcnative/");
 
-        if let Some(callback) = shared
-            .native_methods
-            .find(&class_name, method_name, descriptor)
+        if let Some(callback) =
+            shared
+                .natives
+                .native_methods
+                .find(&class_name, method_name, descriptor)
         {
             // Fast path: Rust NativeCallback registered in the built-in registry.
             safe_native_call(shared, thread, callback, args)
@@ -19116,7 +19156,7 @@ fn invoke_on_class_shared_inner(
             None
         } else {
             crate::native::jni::resolve_jni_native_in_libraries(
-                &shared.native_libraries,
+                &shared.natives.native_libraries,
                 &class_name,
                 method_name,
                 descriptor,
@@ -19265,6 +19305,7 @@ fn invoke_on_class_shared_inner(
         };
         if crate::runtime::env_cache::bd_debug() && method_name == "intValue" {
             let found = shared
+                .natives
                 .native_methods
                 .find(&class_name_for_override, method_name, descriptor)
                 .is_some();
@@ -19355,6 +19396,7 @@ fn invoke_on_class_shared_inner(
             None
         } else {
             shared
+                .natives
                 .native_methods
                 .find(&class_name_for_override, method_name, descriptor)
         };

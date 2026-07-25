@@ -446,15 +446,17 @@ fn bench_gc_cycle(c: &mut Criterion) {
 
 fn bench_native_method_dispatch(c: &mut Criterion) {
     let mut shared_vm = SharedVm::new(VmConfig::default());
-    register_builtins(&mut shared_vm.native_methods);
+    register_builtins(&mut shared_vm.natives.native_methods);
     let shared = Arc::new(shared_vm);
 
     c.bench_function("native_dispatch_noop", |b| {
         let mut thread = JvmThread::new(ThreadId(0), "bench");
         b.iter(|| {
-            if let Some(cb) = shared
-                .native_methods
-                .find("java/lang/Object", "<init>", "()V")
+            if let Some(cb) =
+                shared
+                    .natives
+                    .native_methods
+                    .find("java/lang/Object", "<init>", "()V")
             {
                 let mut ctx = cratonvm_vm::vm::NativeContextImpl {
                     shared: &shared,
@@ -679,16 +681,18 @@ fn bench_specjvm_compiler(c: &mut Criterion) {
 /// measure the dispatch overhead that a real crypto workload would hit.
 fn bench_specjvm_crypto_dispatch(c: &mut Criterion) {
     let mut shared_vm = SharedVm::new(VmConfig::default());
-    register_builtins(&mut shared_vm.native_methods);
+    register_builtins(&mut shared_vm.natives.native_methods);
     let shared = Arc::new(shared_vm);
 
     c.bench_function("specjvm_crypto_dispatch_10k", |b| {
         let mut thread = JvmThread::new(ThreadId(0), "bench");
         b.iter(|| {
             for _ in 0..10_000 {
-                if let Some(cb) = shared
-                    .native_methods
-                    .find("java/lang/Object", "<init>", "()V")
+                if let Some(cb) =
+                    shared
+                        .natives
+                        .native_methods
+                        .find("java/lang/Object", "<init>", "()V")
                 {
                     let mut ctx = cratonvm_vm::vm::NativeContextImpl {
                         shared: &shared,

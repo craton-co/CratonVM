@@ -73,7 +73,7 @@ mod tests {
         // through the native registry. Baseline is 1.
         assert_eq!(vm.shared.classes.class_manager.read().loaded_count(), 1);
         assert!(vm.main_thread.printed.is_empty());
-        assert!(!vm.shared.native_methods.is_empty());
+        assert!(!vm.shared.natives.native_methods.is_empty());
     }
 
     #[test]
@@ -35570,7 +35570,7 @@ mod tests {
             &[Value::Object(Some(tl)), Value::Object(Some(s))],
         )
         .unwrap();
-        assert_eq!(shared.jni_global_refs.lock().count(), 1);
+        assert_eq!(shared.natives.jni_global_refs.lock().count(), 1);
         // get returns the value
         let val = call_native(
             &shared,
@@ -35600,7 +35600,7 @@ mod tests {
             &[Value::Object(Some(tl)), Value::Object(Some(s2))],
         )
         .unwrap();
-        assert_eq!(shared.jni_global_refs.lock().count(), 1);
+        assert_eq!(shared.natives.jni_global_refs.lock().count(), 1);
         let val = call_native(
             &shared,
             &mut thread,
@@ -35622,7 +35622,7 @@ mod tests {
             &[Value::Object(Some(tl))],
         )
         .unwrap();
-        assert_eq!(shared.jni_global_refs.lock().count(), 0);
+        assert_eq!(shared.natives.jni_global_refs.lock().count(), 0);
         let val = call_native(
             &shared,
             &mut thread,
@@ -35634,7 +35634,7 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(val, Value::Object(None));
-        assert_eq!(shared.jni_global_refs.lock().count(), 0);
+        assert_eq!(shared.natives.jni_global_refs.lock().count(), 0);
     }
 
     #[test]
@@ -54748,7 +54748,12 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
 
         // Allocate via SharedVm
-        let (id, ptr) = shared.native_memory.lock().allocate(128, 8).unwrap();
+        let (id, ptr) = shared
+            .natives
+            .native_memory
+            .lock()
+            .allocate(128, 8)
+            .unwrap();
         assert!(!ptr.is_null());
 
         // Write and read
@@ -54760,7 +54765,7 @@ mod tests {
         }
 
         // Free
-        assert!(shared.native_memory.lock().free(id));
+        assert!(shared.natives.native_memory.lock().free(id));
     }
 
     #[test]
@@ -56721,6 +56726,7 @@ mod tests {
         // requires classpath for ArrayList allocation within <init>)
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         assert!(shared
+            .natives
             .native_methods
             .find(
                 "java/util/StringJoiner",
@@ -56729,6 +56735,7 @@ mod tests {
             )
             .is_some());
         assert!(shared
+            .natives
             .native_methods
             .find(
                 "java/util/StringJoiner",
@@ -56737,6 +56744,7 @@ mod tests {
             )
             .is_some());
         assert!(shared
+            .natives
             .native_methods
             .find("java/util/StringJoiner", "toString", "()Ljava/lang/String;")
             .is_some());
@@ -57522,7 +57530,7 @@ mod tests {
         let mut vm = Vm::new(config);
 
         // ---- Step 1: Verify we are in real-JDK mode (fewer natives) ----
-        let native_count = vm.shared.native_methods.len();
+        let native_count = vm.shared.natives.native_methods.len();
         eprintln!("[real_jdk_e2e] Native methods registered: {}", native_count);
         // Session 85: corrective overrides grew the count to ~2568; keep +100 headroom.
         assert!(
@@ -67050,6 +67058,7 @@ mod tests {
         let mut shared = SharedVm::new(VmConfig::default());
         for &(class_name, method_name, descriptor, callback) in registrations {
             shared
+                .natives
                 .native_methods
                 .register(class_name, method_name, descriptor, callback);
         }
@@ -67096,6 +67105,7 @@ mod tests {
         let h1 = std::thread::spawn(move || {
             let mut thread = JvmThread::new(ThreadId(1), "worker-1");
             let cb = shared1
+                .natives
                 .native_methods
                 .find("test/Compute", "add", "(II)I")
                 .unwrap();
@@ -67113,6 +67123,7 @@ mod tests {
         let h2 = std::thread::spawn(move || {
             let mut thread = JvmThread::new(ThreadId(2), "worker-2");
             let cb = shared2
+                .natives
                 .native_methods
                 .find("test/Compute", "add", "(II)I")
                 .unwrap();
@@ -67193,6 +67204,7 @@ mod tests {
                 .thread_registry
                 .register(ThreadId(1), "sync-1", None);
             let cb = shared1
+                .natives
                 .native_methods
                 .find("test/Sync", "incrementSync", "(Ljava/lang/Object;I)V")
                 .unwrap();
@@ -67210,6 +67222,7 @@ mod tests {
                 .thread_registry
                 .register(ThreadId(2), "sync-2", None);
             let cb = shared2
+                .natives
                 .native_methods
                 .find("test/Sync", "incrementSync", "(Ljava/lang/Object;I)V")
                 .unwrap();
@@ -67302,6 +67315,7 @@ mod tests {
                 .thread_registry
                 .register(ThreadId(1), "consumer", None);
             let cb = shared1
+                .natives
                 .native_methods
                 .find("test/WaitNotify", "consume", "(Ljava/lang/Object;)V")
                 .unwrap();
@@ -67319,6 +67333,7 @@ mod tests {
                 .thread_registry
                 .register(ThreadId(2), "producer", None);
             let cb = shared2
+                .natives
                 .native_methods
                 .find("test/WaitNotify", "produce", "(Ljava/lang/Object;)V")
                 .unwrap();
@@ -67377,6 +67392,7 @@ mod tests {
         let h1 = std::thread::spawn(move || {
             let mut thread = JvmThread::new(ThreadId(1), "alloc-1");
             let cb = shared1
+                .natives
                 .native_methods
                 .find("test/Alloc", "allocMany", "(I)I")
                 .unwrap();
@@ -67394,6 +67410,7 @@ mod tests {
         let h2 = std::thread::spawn(move || {
             let mut thread = JvmThread::new(ThreadId(2), "alloc-2");
             let cb = shared2
+                .natives
                 .native_methods
                 .find("test/Alloc", "allocMany", "(I)I")
                 .unwrap();
@@ -67437,6 +67454,7 @@ mod tests {
         let h1 = std::thread::spawn(move || {
             let mut thread = JvmThread::new(ThreadId(1), "loader-1");
             let cb = shared1
+                .natives
                 .native_methods
                 .find("test/ClassA", "run", "()I")
                 .unwrap();
@@ -67453,6 +67471,7 @@ mod tests {
         let h2 = std::thread::spawn(move || {
             let mut thread = JvmThread::new(ThreadId(2), "loader-2");
             let cb = shared2
+                .natives
                 .native_methods
                 .find("test/ClassB", "run", "()I")
                 .unwrap();
@@ -67541,6 +67560,7 @@ mod tests {
         let writer = std::thread::spawn(move || {
             let mut thread = JvmThread::new(ThreadId(1), "writer");
             let cb = shared1
+                .natives
                 .native_methods
                 .find("test/Vol", "write", "(Ljava/lang/Object;)V")
                 .unwrap();
@@ -67554,6 +67574,7 @@ mod tests {
         let reader = std::thread::spawn(move || {
             let mut thread = JvmThread::new(ThreadId(2), "reader");
             let cb = shared2
+                .natives
                 .native_methods
                 .find("test/Vol", "read", "(Ljava/lang/Object;)I")
                 .unwrap();
@@ -67711,6 +67732,7 @@ mod tests {
                 .thread_registry
                 .register(ThreadId(1), "producer", None);
             let cb = shared1
+                .natives
                 .native_methods
                 .find(
                     "test/PC",
@@ -67736,6 +67758,7 @@ mod tests {
                 .thread_registry
                 .register(ThreadId(2), "consumer", None);
             let cb = shared2
+                .natives
                 .native_methods
                 .find(
                     "test/PC",
@@ -67816,6 +67839,7 @@ mod tests {
                         None,
                     );
                     let cb = s
+                        .natives
                         .native_methods
                         .find("test/Inc", "increment", "(Ljava/lang/Object;I)V")
                         .unwrap();
@@ -67875,6 +67899,7 @@ mod tests {
         let h1 = std::thread::spawn(move || {
             let mut thread = JvmThread::new(ThreadId(1), "reent-1");
             let cb = shared1
+                .natives
                 .native_methods
                 .find("test/Reent", "reenter", "(Ljava/lang/Object;)I")
                 .unwrap();
@@ -67892,6 +67917,7 @@ mod tests {
         let h2 = std::thread::spawn(move || {
             let mut thread = JvmThread::new(ThreadId(2), "reent-2");
             let cb = shared2
+                .natives
                 .native_methods
                 .find("test/Reent", "reenter", "(Ljava/lang/Object;)I")
                 .unwrap();
@@ -67917,7 +67943,7 @@ mod tests {
     /// Helper: create SharedVm with builtins registered (for ThreadGroup tests).
     fn p86_shared_with_builtins() -> Arc<SharedVm> {
         let mut shared = SharedVm::new(VmConfig::default());
-        crate::native::builtins::register_builtins(&mut shared.native_methods);
+        crate::native::builtins::register_builtins(&mut shared.natives.native_methods);
         let shared = Arc::new(shared);
         *shared.self_arc.write() = Some(Arc::downgrade(&shared));
         shared
@@ -67940,6 +67966,7 @@ mod tests {
             ctx.create_string("system")
         };
         let cb = shared
+            .natives
             .native_methods
             .find(tg_class, "<init>", "(Ljava/lang/String;)V")
             .unwrap();
@@ -67966,6 +67993,7 @@ mod tests {
             ctx.create_string("main")
         };
         let cb = shared
+            .natives
             .native_methods
             .find(
                 tg_class,
@@ -67989,6 +68017,7 @@ mod tests {
 
         // Verify hierarchy
         let cb = shared
+            .natives
             .native_methods
             .find(tg_class, "getParent", "()Ljava/lang/ThreadGroup;")
             .unwrap();
@@ -68004,6 +68033,7 @@ mod tests {
         );
 
         let cb = shared
+            .natives
             .native_methods
             .find(tg_class, "getName", "()Ljava/lang/String;")
             .unwrap();
@@ -68053,6 +68083,7 @@ mod tests {
             ctx.create_string("main")
         };
         let cb_init = shared
+            .natives
             .native_methods
             .find("java/lang/ThreadGroup", "<init>", "(Ljava/lang/String;)V")
             .unwrap();
@@ -68067,6 +68098,7 @@ mod tests {
         .unwrap();
 
         let cb = shared
+            .natives
             .native_methods
             .find("java/lang/ThreadGroup", "activeCount", "()I")
             .unwrap();
@@ -68125,6 +68157,7 @@ mod tests {
             ctx.create_string("main")
         };
         let cb_init = shared
+            .natives
             .native_methods
             .find("java/lang/ThreadGroup", "<init>", "(Ljava/lang/String;)V")
             .unwrap();
@@ -68147,6 +68180,7 @@ mod tests {
             ctx.new_ref_array(ClassId::new(0), 10)
         };
         let cb = shared
+            .natives
             .native_methods
             .find(
                 "java/lang/ThreadGroup",
@@ -68324,7 +68358,9 @@ mod tests {
     /// Helper: create SharedVm with collection natives registered (for CHM tests).
     fn p86_shared_with_collections() -> Arc<SharedVm> {
         let mut shared = SharedVm::new(VmConfig::default());
-        crate::native::collections::register_collections_natives(&mut shared.native_methods);
+        crate::native::collections::register_collections_natives(
+            &mut shared.natives.native_methods,
+        );
         let shared = Arc::new(shared);
         *shared.self_arc.write() = Some(Arc::downgrade(&shared));
         shared
@@ -68340,6 +68376,7 @@ mod tests {
         args: &[Value],
     ) -> crate::error::MethodCallResult {
         let cb = shared
+            .natives
             .native_methods
             .find(class, method, descriptor)
             .unwrap_or_else(|| panic!("{class}.{method}{descriptor} not found"));
@@ -68381,6 +68418,7 @@ mod tests {
                 let val = shared1.heap.alloc_object(ClassId::new(0), 1);
                 shared1.heap.set_field(val, 0, Value::Int(i * 10));
                 let cb = shared1
+                    .natives
                     .native_methods
                     .find(
                         "java/util/concurrent/ConcurrentHashMap",
@@ -68413,6 +68451,7 @@ mod tests {
                 let val = shared2.heap.alloc_object(ClassId::new(0), 1);
                 shared2.heap.set_field(val, 0, Value::Int(i * 10));
                 let cb = shared2
+                    .natives
                     .native_methods
                     .find(
                         "java/util/concurrent/ConcurrentHashMap",
@@ -68491,6 +68530,7 @@ mod tests {
                 let val = shared1.heap.alloc_object(ClassId::new(0), 1);
                 shared1.heap.set_field(val, 0, Value::Int(i));
                 let cb = shared1
+                    .natives
                     .native_methods
                     .find(
                         "java/util/concurrent/ConcurrentHashMap",
@@ -68520,6 +68560,7 @@ mod tests {
             let mut max_seen = 0i32;
             for _ in 0..200 {
                 let cb = shared2
+                    .natives
                     .native_methods
                     .find("java/util/concurrent/ConcurrentHashMap", "size", "()I")
                     .unwrap();
@@ -68580,6 +68621,7 @@ mod tests {
                         let val = s.heap.alloc_object(ClassId::new(0), 1);
                         s.heap.set_field(val, 0, Value::Int(unique_key));
                         let cb = s
+                            .natives
                             .native_methods
                             .find(
                                 "java/util/concurrent/ConcurrentHashMap",
@@ -68769,7 +68811,7 @@ mod tests {
 
     fn p90_shared_with_builtins() -> Arc<SharedVm> {
         let mut shared = SharedVm::new(VmConfig::default());
-        crate::native::builtins::register_builtins(&mut shared.native_methods);
+        crate::native::builtins::register_builtins(&mut shared.natives.native_methods);
         let shared = Arc::new(shared);
         *shared.self_arc.write() = Some(Arc::downgrade(&shared));
         shared
@@ -69005,6 +69047,7 @@ mod tests {
         args: &[Value],
     ) -> MethodCallResult {
         let cb = shared
+            .natives
             .native_methods
             .find(class, method, descriptor)
             .unwrap_or_else(|| panic!("native not found: {}.{}{}", class, method, descriptor));
@@ -72597,7 +72640,7 @@ public class SkippedTest {
             ..Default::default()
         };
         let vm = std::sync::Arc::new(crate::vm::vm_init::SharedVm::new(config));
-        let registry = &vm.native_methods;
+        let registry = &vm.natives.native_methods;
 
         // Joiner factories
         assert!(
@@ -72648,7 +72691,7 @@ public class SkippedTest {
             ..Default::default()
         };
         let vm = std::sync::Arc::new(crate::vm::vm_init::SharedVm::new(config));
-        let registry = &vm.native_methods;
+        let registry = &vm.natives.native_methods;
 
         assert!(
             registry
@@ -72753,7 +72796,7 @@ public class SkippedTest {
             ..Default::default()
         };
         let vm = std::sync::Arc::new(crate::vm::vm_init::SharedVm::new(config));
-        let registry = &vm.native_methods;
+        let registry = &vm.natives.native_methods;
 
         // Verify ScopedValue natives (from S51 + S52 enhancements)
         let methods = [
@@ -72794,7 +72837,7 @@ public class SkippedTest {
             ..Default::default()
         };
         let vm = std::sync::Arc::new(crate::vm::vm_init::SharedVm::new(config));
-        let registry = &vm.native_methods;
+        let registry = &vm.natives.native_methods;
 
         // ShutdownOnFailure has its own fork/join/close registrations
         let cls = "java/util/concurrent/StructuredTaskScope$ShutdownOnFailure";
@@ -73070,8 +73113,8 @@ public class SkippedTest {
     fn new17_direct_byte_buffer_allocates_native_memory() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let before = shared.native_memory.lock().live_count();
-        let before_bytes = shared.native_memory.lock().live_bytes();
+        let before = shared.natives.native_memory.lock().live_count();
+        let before_bytes = shared.natives.native_memory.lock().live_bytes();
 
         let cap: i32 = 4096;
         let buf = call_native(
@@ -73089,8 +73132,8 @@ public class SkippedTest {
             _ => panic!("allocateDirect returned null"),
         }
 
-        let after = shared.native_memory.lock().live_count();
-        let after_bytes = shared.native_memory.lock().live_bytes();
+        let after = shared.natives.native_memory.lock().live_count();
+        let after_bytes = shared.natives.native_memory.lock().live_bytes();
         assert_eq!(after, before + 1, "one new native allocation");
         assert!(after_bytes >= before_bytes + cap as usize);
     }
@@ -73118,7 +73161,7 @@ public class SkippedTest {
             Value::Object(Some(o)) => o,
             _ => panic!(),
         };
-        let alloc_count_after_alloc = shared.native_memory.lock().live_count();
+        let alloc_count_after_alloc = shared.natives.native_memory.lock().live_count();
         assert!(alloc_count_after_alloc >= 1);
 
         // Sanity: the cleaner ref processor saw the phantom-cleaner.
@@ -73172,7 +73215,7 @@ public class SkippedTest {
             );
         }
 
-        let alloc_count_after_drain = shared.native_memory.lock().live_count();
+        let alloc_count_after_drain = shared.natives.native_memory.lock().live_count();
         assert!(
             alloc_count_after_drain < alloc_count_after_alloc,
             "cleaner drain should have released native memory: {alloc_count_after_alloc} -> {alloc_count_after_drain}",
@@ -73198,7 +73241,7 @@ public class SkippedTest {
         .unwrap()
         .unwrap();
         let _ = buf;
-        let live_before = shared.native_memory.lock().live_count();
+        let live_before = shared.natives.native_memory.lock().live_count();
         assert!(live_before >= 1);
 
         // Pull the cleanable straight from the ref processor.
@@ -73230,7 +73273,7 @@ public class SkippedTest {
             &[Value::Object(Some(cleanable))],
         )
         .unwrap();
-        let live_after_first = shared.native_memory.lock().live_count();
+        let live_after_first = shared.natives.native_memory.lock().live_count();
         assert_eq!(live_after_first, live_before - 1);
 
         // Second call must be a no-op (cleaned flag guards it).
@@ -73243,7 +73286,7 @@ public class SkippedTest {
             &[Value::Object(Some(cleanable))],
         )
         .unwrap();
-        let live_after_second = shared.native_memory.lock().live_count();
+        let live_after_second = shared.natives.native_memory.lock().live_count();
         assert_eq!(
             live_after_second, live_after_first,
             "second clean() must be a no-op"

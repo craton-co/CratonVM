@@ -301,7 +301,7 @@ impl<'a> HprofDumper<'a> {
 
         // JNI global roots
         {
-            let globals = self.vm.jni_global_refs.lock();
+            let globals = self.vm.natives.jni_global_refs.lock();
             let mut roots = Vec::new();
             globals.collect_roots(&mut roots);
             for obj in &roots {
