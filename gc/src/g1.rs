@@ -28,6 +28,7 @@ use std::sync::Arc;
 use crate::collector::{GarbageCollector, MonitorCleanup};
 use crate::concurrent_mark::{ConcurrentGcPhase, ConcurrentGcState};
 use crate::gc::{GcResult, GcStats};
+use crate::gc_flags;
 use crate::heap::{
     array_data_size, array_element_type_from_tag, object_kind_from_tag, ArrayElementType,
     ObjectHeader, ObjectKind, ARRAY_ELEMENT_TYPE_OFFSET, HEADER_SIZE, OBJECT_KIND_OFFSET,
@@ -37,7 +38,6 @@ use crate::mark_bitmap::MarkBitmap;
 use crate::region::{RegionType, RememberedSet};
 use crate::satb::SatbQueue;
 use cratonvm_types::{ClassId, ObjectRef, Value};
-use crate::gc_flags;
 
 #[inline]
 unsafe fn value_from_unaligned_ptr(ptr: *const u8) -> Value {
@@ -623,7 +623,6 @@ impl<'a> SharedEvac<'a> {
                 }
             }
         }
-
     }
 
     /// Seed phase (driver/main thread, single-threaded): walk a non-CSet
@@ -3795,33 +3794,29 @@ impl G1Collector {
             for_each_flat_object_reference(obj_ptr, header, 0, |slot_ptr, raw, compact| {
                 let ref_ptr = raw as *mut u8;
                 if let Some(region_idx) = self.region_for_ptr(regions, ref_ptr) {
-                        if cset.contains(&region_idx) {
-                            // Round-5 fix (CRIT, O(N²)): only push the
-                            // forwarded target onto the worklist when this
-                            // call site actually evacuated it. Step 9: the
-                            // freshness comes from the evacuation outcome
-                            // (`fresh`), not a separate `contains_key`
-                            // pre-check (a TOCTOU under parallel evacuation).
-                            if let Some((new_ptr, fresh)) = self.evacuate_object(
-                                regions,
-                                ref_ptr,
-                                pointer_map,
-                                objects_copied,
-                                bytes_copied,
-                                cset,
-                            ) {
-                                write_flat_object_reference(
-                                    slot_ptr,
-                                    new_ptr as usize,
-                                    compact,
-                                );
-                                if fresh {
-                                    work_list.push(new_ptr);
-                                }
+                    if cset.contains(&region_idx) {
+                        // Round-5 fix (CRIT, O(N²)): only push the
+                        // forwarded target onto the worklist when this
+                        // call site actually evacuated it. Step 9: the
+                        // freshness comes from the evacuation outcome
+                        // (`fresh`), not a separate `contains_key`
+                        // pre-check (a TOCTOU under parallel evacuation).
+                        if let Some((new_ptr, fresh)) = self.evacuate_object(
+                            regions,
+                            ref_ptr,
+                            pointer_map,
+                            objects_copied,
+                            bytes_copied,
+                            cset,
+                        ) {
+                            write_flat_object_reference(slot_ptr, new_ptr as usize, compact);
+                            if fresh {
+                                work_list.push(new_ptr);
                             }
-                        } else if let Some(&new_addr) = pointer_map.get(&raw) {
-                            write_flat_object_reference(slot_ptr, new_addr, compact);
                         }
+                    } else if let Some(&new_addr) = pointer_map.get(&raw) {
+                        write_flat_object_reference(slot_ptr, new_addr, compact);
+                    }
                 }
             });
         }
@@ -3931,34 +3926,25 @@ impl G1Collector {
                     }
                 }
             } else {
-                for_each_flat_object_reference(
-                    obj_ptr,
-                    header,
-                    0,
-                    |slot_ptr, raw, compact| {
-                        let ref_ptr = raw as *mut u8;
-                        if let Some(ridx) = self.region_for_ptr(regions, ref_ptr) {
-                            if cset.contains(&ridx) {
-                                // Step 9: `fresh` ignored (see the Array branch).
-                                if let Some((new_ptr, _fresh)) = self.evacuate_object(
-                                    regions,
-                                    ref_ptr,
-                                    pointer_map,
-                                    objects_copied,
-                                    bytes_copied,
-                                    cset,
-                                ) {
-                                    write_flat_object_reference(
-                                        slot_ptr,
-                                        new_ptr as usize,
-                                        compact,
-                                    );
-                                    work_list.push(new_ptr);
-                                }
+                for_each_flat_object_reference(obj_ptr, header, 0, |slot_ptr, raw, compact| {
+                    let ref_ptr = raw as *mut u8;
+                    if let Some(ridx) = self.region_for_ptr(regions, ref_ptr) {
+                        if cset.contains(&ridx) {
+                            // Step 9: `fresh` ignored (see the Array branch).
+                            if let Some((new_ptr, _fresh)) = self.evacuate_object(
+                                regions,
+                                ref_ptr,
+                                pointer_map,
+                                objects_copied,
+                                bytes_copied,
+                                cset,
+                            ) {
+                                write_flat_object_reference(slot_ptr, new_ptr as usize, compact);
+                                work_list.push(new_ptr);
                             }
                         }
-                    },
-                );
+                    }
+                });
             }
 
             offset += obj_size;
@@ -4101,11 +4087,11 @@ impl G1Collector {
             }
         } else {
             for_each_flat_object_reference(obj_ptr, header, 0, |_, raw, _| {
-                    if let Some(j) = self.lookup_region_for_addr(raw) {
-                        if j != holder && is_collectable_region_type(regions[j].region_type) {
-                            out.push((j, holder));
-                        }
+                if let Some(j) = self.lookup_region_for_addr(raw) {
+                    if j != holder && is_collectable_region_type(regions[j].region_type) {
+                        out.push((j, holder));
                     }
+                }
             });
         }
     }
@@ -4611,15 +4597,7 @@ impl G1Collector {
                 }
             } else {
                 for_each_flat_object_reference(addr as *mut u8, header, 0, |_, raw, _| {
-                        check_push(
-                            raw,
-                            addr,
-                            "field",
-                            0,
-                            &mut stack,
-                            &mut seen,
-                            &mut bad,
-                        );
+                    check_push(raw, addr, "field", 0, &mut stack, &mut seen, &mut bad);
                 });
             }
         }
@@ -5355,19 +5333,19 @@ impl G1Collector {
                     };
                     if let Value::Object(Some(ref_obj)) = value {
                         let ref_ptr = ref_obj.as_ptr();
-                    if let Some(idx) = region_for(ref_ptr) {
-                        if !regions[idx].mark_bitmap.is_marked(ref_ptr as usize) {
-                            // Round-9 gc HIGH-5: graceful overflow — drop
-                            // the push and record the event so remark
-                            // can run a conservative full re-walk.
-                            if worklist.len() >= MARK_WORKLIST_CAP {
-                                self.mark_worklist_overflowed.store(true, Ordering::Relaxed);
-                            } else {
-                                worklist.push(ref_ptr as usize);
+                        if let Some(idx) = region_for(ref_ptr) {
+                            if !regions[idx].mark_bitmap.is_marked(ref_ptr as usize) {
+                                // Round-9 gc HIGH-5: graceful overflow — drop
+                                // the push and record the event so remark
+                                // can run a conservative full re-walk.
+                                if worklist.len() >= MARK_WORKLIST_CAP {
+                                    self.mark_worklist_overflowed.store(true, Ordering::Relaxed);
+                                } else {
+                                    worklist.push(ref_ptr as usize);
+                                }
                             }
                         }
                     }
-                }
                 }
             }
         }
@@ -5387,29 +5365,23 @@ impl G1Collector {
             if let Some(idx) = region_for(ptr) {
                 if !regions[idx].mark_bitmap.is_marked(addr) {
                     if worklist.len() >= MARK_WORKLIST_CAP {
-                        self.mark_worklist_overflowed
-                            .store(true, Ordering::Relaxed);
+                        self.mark_worklist_overflowed.store(true, Ordering::Relaxed);
                     } else {
                         worklist.push(addr);
                     }
                 }
             }
         };
-        if let Some(loader) =
-            cratonvm_types::loader_pin::loader_pin_addr(header.class_id.as_u32())
+        if let Some(loader) = cratonvm_types::loader_pin::loader_pin_addr(header.class_id.as_u32())
         {
             enqueue(loader);
         }
-        if let Some(mirrors) =
-            cratonvm_types::mirror_pin::mirrors_for_loader(obj_ptr as usize)
-        {
+        if let Some(mirrors) = cratonvm_types::mirror_pin::mirrors_for_loader(obj_ptr as usize) {
             for mirror in mirrors {
                 enqueue(mirror);
             }
         }
-        if let Some(metadata) =
-            cratonvm_types::metadata_pin::roots_for_loader(obj_ptr as usize)
-        {
+        if let Some(metadata) = cratonvm_types::metadata_pin::roots_for_loader(obj_ptr as usize) {
             for object in metadata {
                 enqueue(object);
             }
@@ -6939,8 +6911,7 @@ impl G1Collector {
 
 impl GarbageCollector for G1Collector {
     fn alloc_object(&self, class_id: ClassId, num_fields: usize) -> ObjectRef {
-        let compact_body =
-            cratonvm_types::compact_object_body_size(class_id.as_u32(), num_fields);
+        let compact_body = cratonvm_types::compact_object_body_size(class_id.as_u32(), num_fields);
         let body_size = compact_body.unwrap_or(num_fields * SLOT_SIZE);
         let total_size = HEADER_SIZE + body_size;
         let (ptr, _region) = self.alloc_in_region(total_size).unwrap_or_else(|| {
@@ -7092,9 +7063,8 @@ impl GarbageCollector for G1Collector {
                             )
                         }
                     } else {
-                        let bytes = unsafe {
-                            &*(tmp.as_ptr().cast::<u8>() as *const [u8; SLOT_SIZE])
-                        };
+                        let bytes =
+                            unsafe { &*(tmp.as_ptr().cast::<u8>() as *const [u8; SLOT_SIZE]) };
                         value_from_bytes(bytes)
                     };
                 }
@@ -7195,9 +7165,8 @@ impl GarbageCollector for G1Collector {
                         )
                     };
                 } else {
-                    let bytes = unsafe {
-                        &mut *(tmp.as_mut_ptr().cast::<u8>() as *mut [u8; SLOT_SIZE])
-                    };
+                    let bytes =
+                        unsafe { &mut *(tmp.as_mut_ptr().cast::<u8>() as *mut [u8; SLOT_SIZE]) };
                     value_to_bytes(value, bytes);
                 }
                 self.humongous_copy(
@@ -7219,12 +7188,7 @@ impl GarbageCollector for G1Collector {
                 let ptr = unsafe { obj.as_ptr().add(HEADER_SIZE + payload_off) };
                 if let Some((_, storage)) = compact {
                     unsafe {
-                        cratonvm_types::write_compact_field(
-                            ptr,
-                            storage,
-                            value,
-                            Ordering::Relaxed,
-                        )
+                        cratonvm_types::write_compact_field(ptr, storage, value, Ordering::Relaxed)
                     };
                 } else {
                     unsafe {

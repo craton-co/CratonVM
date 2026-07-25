@@ -57,7 +57,6 @@ pub(crate) fn gc_flags() -> &'static cratonvm_types::GcFlags {
 }
 
 pub mod a2dbg;
-pub mod zero_forensics;
 pub mod arena;
 pub mod blocked_access_debug;
 pub mod card_table;
@@ -87,6 +86,7 @@ pub mod shadow_stack;
 pub mod stale_objref_debug;
 pub mod tlab;
 pub mod vm_heap;
+pub mod zero_forensics;
 // Round-7 cross-cutting Fix 4: ZGC stub (1884 LOC) gated behind the `zgc`
 // feature. No in-workspace consumer references `zgc::*` today, so paying
 // the compile-time + binary-size cost on every build is pure waste. Flip

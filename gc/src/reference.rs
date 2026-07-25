@@ -16,9 +16,9 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+use crate::gc_flags;
 use parking_lot::Mutex;
 use rustc_hash::{FxHashMap, FxHashSet};
-use crate::gc_flags;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -2046,7 +2046,7 @@ mod tests {
         proc.discover_reference(ReferenceType::Cleaner, 0x50, 0x51, None); // pending
         proc.discover_reference(ReferenceType::Cleaner, 0x60, 0x60, None); // self-referent
         proc.discover_reference(ReferenceType::Cleaner, 0x70, 0x71, None); // will fire
-        // Fire 0x70's action: its referent 0x71 is dead.
+                                                                           // Fire 0x70's action: its referent 0x71 is dead.
         let result = proc.process_references(&|addr| addr != 0x71, 64, 0);
         assert!(result.cleaner_actions.contains(&0x70));
         let addrs = proc.cleaner_pending_object_addresses();

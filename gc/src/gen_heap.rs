@@ -47,14 +47,12 @@ use crate::heap::{
 use crate::old_gen::OldGen;
 // Compact reference-field layout (CRATONVM_COMPACT_REF_FIELDS). Reference
 // instance fields are stored as 8-byte pointers per the per-class oop-map.
+use crate::gc_flags;
 use crate::satb::SatbQueue;
 use crate::{class_layout, compact_ref_fields_enabled, is_compact_object, object_body_size};
-use cratonvm_types::GC_FLAG_COMPACT;
-use cratonvm_types::{
-    ClassId, CompactLayout, FieldStorageKind, ObjectRef, Value,
-};
 use cratonvm_types::narrow_oop::{read_ref_slot, ref_element_size, ref_field_size, write_ref_slot};
-use crate::gc_flags;
+use cratonvm_types::GC_FLAG_COMPACT;
+use cratonvm_types::{ClassId, CompactLayout, FieldStorageKind, ObjectRef, Value};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -2237,15 +2235,15 @@ impl GenerationalHeap {
                     }
                 }
             } // end rate-limited OOB-read diagnostics
-            // RESID-DIAG (dohead residuals investigation, 20260718): narrow,
-            // unconditional backtrace for the zero-slot-receiver shape seen in
-            // the known-issues residual logs — confirmed (2026-07-19) to
-            // occur ONLY within the exact failing parameterization's test
-            // case in every repro sample checked (zero occurrences in the
-            // preceding passing cases of the same class), so this is NOT the
-            // benign high-frequency case (B) the OOB_DIAG_CAP above guards
-            // against — widened from the original index-4/5-only guess to
-            // any index once indices 0/1/3 were also observed correlating.
+              // RESID-DIAG (dohead residuals investigation, 20260718): narrow,
+              // unconditional backtrace for the zero-slot-receiver shape seen in
+              // the known-issues residual logs — confirmed (2026-07-19) to
+              // occur ONLY within the exact failing parameterization's test
+              // case in every repro sample checked (zero occurrences in the
+              // preceding passing cases of the same class), so this is NOT the
+              // benign high-frequency case (B) the OOB_DIAG_CAP above guards
+              // against — widened from the original index-4/5-only guess to
+              // any index once indices 0/1/3 were also observed correlating.
             if num_slots == 0 {
                 // RATE-LIMIT (2026-07-21): the WildFly real-JDK boot hits this
                 // shape on EVERY framework log line (a delegating stream whose
@@ -3738,9 +3736,8 @@ impl GenerationalHeap {
         // makes all three disappear, confirming the moving path is clean here.
         // Opt out (restore the old broad diversion) with
         // `CRATONVM_PROMOTION_OOM_GUARD_BROAD=1`.
-        let honor_promotion_oom_risk = promotion_oom_risk
-            && (has_conservative_roots
-                || gc_flags().promotion_oom_guard_broad);
+        let honor_promotion_oom_risk =
+            promotion_oom_risk && (has_conservative_roots || gc_flags().promotion_oom_guard_broad);
         // Default moving young gen (`CRATONVM_MOVING_YOUNG`): the JIT publishes a
         // COMPLETE rewritable precise root map (shadow stack) for every live frame
         // and the conservative scan is suppressed (see roots.rs), so a live JIT
@@ -3756,8 +3753,8 @@ impl GenerationalHeap {
         // moving-young as unavailable and uses the conservative/non-moving
         // fallback instead.
         let moving_young_requested = crate::gc_quiescence::moving_young_enabled();
-        let fail_closed_non_moving = crate::gc_quiescence::is_active()
-            && !gc_flags().allow_moving_young;
+        let fail_closed_non_moving =
+            crate::gc_quiescence::is_active() && !gc_flags().allow_moving_young;
         let force_non_moving_jit_roots = crate::gc_quiescence::force_non_moving_jit_roots();
         let coverage_incomplete = crate::gc_quiescence::moving_young_coverage_incomplete();
         let divert_for_incomplete_moving_coverage =
@@ -3939,74 +3936,74 @@ impl GenerationalHeap {
             // old→young remembered-set check (fixed and verified above)
             // usable without inheriting this walk's fragility.
             if gc_flags().dbg_rset_audit_young_scan {
-            let ybase = young_from.base_ptr_mut() as usize;
-            let yused = young_from.used();
-            let mut ycur = 0usize;
-            let mut found4 = 0usize;
-            while ycur < yused {
-                // SAFETY: the young space is bump-allocated and contiguous; `ycur < yused`
-                // keeps `ybase + ycur` inside the live region, where a valid `ObjectHeader`
-                // begins (a bad header is detected by the size check below).
-                let h = unsafe { &*((ybase + ycur) as *const ObjectHeader) };
-                let size = gen_object_total_size(h);
-                // stw-residual-close FIX (2026-07-23): this walk (unlike the
-                // free-list/TLAB-gap-aware `young_object_starts` walk further
-                // below, hardened 2026-07-16 for the cce0079 desync) has no
-                // protection against landing mid-object on a stale/leftover
-                // TLAB-tail header: a garbage-but-plausible `num_slots` (e.g.
-                // ~200K, observed) still produces a `size` that fits within
-                // the remaining `yused` budget, so the existing `size == 0 ||
-                // ycur + size > yused` guard doesn't catch it, and the field
-                // loop below then walks `num_slots` slots off the end of the
-                // real (much smaller) object into unmapped memory — SIGSEGV.
-                // No real class has anywhere near this many declared fields;
-                // cap `num_slots` the same way `set_field`/`get_field` cap
-                // theirs against corrupt headers, then bail the whole
-                // best-effort walk rather than trust a header that fails it.
-                let implausible_slots =
-                    h.kind == ObjectKind::Object && h.num_slots() as usize > 4096;
-                if size == 0 || ycur + size > yused || implausible_slots {
-                    eprintln!(
-                        "[small4] young walk truncated at off={} used={} implausible_slots={}",
-                        ycur, yused, implausible_slots,
-                    );
-                    break;
+                let ybase = young_from.base_ptr_mut() as usize;
+                let yused = young_from.used();
+                let mut ycur = 0usize;
+                let mut found4 = 0usize;
+                while ycur < yused {
+                    // SAFETY: the young space is bump-allocated and contiguous; `ycur < yused`
+                    // keeps `ybase + ycur` inside the live region, where a valid `ObjectHeader`
+                    // begins (a bad header is detected by the size check below).
+                    let h = unsafe { &*((ybase + ycur) as *const ObjectHeader) };
+                    let size = gen_object_total_size(h);
+                    // stw-residual-close FIX (2026-07-23): this walk (unlike the
+                    // free-list/TLAB-gap-aware `young_object_starts` walk further
+                    // below, hardened 2026-07-16 for the cce0079 desync) has no
+                    // protection against landing mid-object on a stale/leftover
+                    // TLAB-tail header: a garbage-but-plausible `num_slots` (e.g.
+                    // ~200K, observed) still produces a `size` that fits within
+                    // the remaining `yused` budget, so the existing `size == 0 ||
+                    // ycur + size > yused` guard doesn't catch it, and the field
+                    // loop below then walks `num_slots` slots off the end of the
+                    // real (much smaller) object into unmapped memory — SIGSEGV.
+                    // No real class has anywhere near this many declared fields;
+                    // cap `num_slots` the same way `set_field`/`get_field` cap
+                    // theirs against corrupt headers, then bail the whole
+                    // best-effort walk rather than trust a header that fails it.
+                    let implausible_slots =
+                        h.kind == ObjectKind::Object && h.num_slots() as usize > 4096;
+                    if size == 0 || ycur + size > yused || implausible_slots {
+                        eprintln!(
+                            "[small4] young walk truncated at off={} used={} implausible_slots={}",
+                            ycur, yused, implausible_slots,
+                        );
+                        break;
+                    }
+                    let optr = (ybase + ycur) as *mut u8;
+                    // stw-residual-close FIX (2026-07-23): same compact-ref-layout
+                    // gap as the old-gen audit above (`for_each_ref_slot` handles
+                    // array/compact/legacy uniformly instead of hand-deriving a
+                    // legacy-only 16-byte stride, which walked off compact
+                    // objects' real bodies and SIGSEGV'd). The one-shot HEXDUMP is
+                    // dropped: with three different offset semantics (byte offset
+                    // for compact, slot index for legacy, element index for
+                    // arrays) a single "corrupt payload" marker can no longer be
+                    // computed generically, and the victim/size boundaries alone
+                    // (still printed via the eprintln above it) are what mattered
+                    // for the "smear vs surgical" triage this was added for.
+                    // SAFETY: `optr`/`h` are a valid, fully-initialized young-gen
+                    // object/header pair (the `size`/`yused` bounds were checked
+                    // above before entering this iteration).
+                    unsafe {
+                        for_each_ref_slot(optr, h, |raw, slot_idx| {
+                            let p = raw as usize;
+                            if p != 0 && p < 0x1000 && found4 < 40 {
+                                found4 += 1;
+                                let cn = crate::gc::resolve_class_info(h.class_id.as_u32())
+                                    .map(|(n, _)| n)
+                                    .unwrap_or_else(|| "<unresolved>".to_string());
+                                eprintln!(
+                                    "[small4] PRE-GC YOUNG {} @0x{:x} fld[{}] -> 0x{:x}",
+                                    cn,
+                                    ybase + ycur,
+                                    slot_idx,
+                                    p,
+                                );
+                            }
+                        });
+                    }
+                    ycur += size;
                 }
-                let optr = (ybase + ycur) as *mut u8;
-                // stw-residual-close FIX (2026-07-23): same compact-ref-layout
-                // gap as the old-gen audit above (`for_each_ref_slot` handles
-                // array/compact/legacy uniformly instead of hand-deriving a
-                // legacy-only 16-byte stride, which walked off compact
-                // objects' real bodies and SIGSEGV'd). The one-shot HEXDUMP is
-                // dropped: with three different offset semantics (byte offset
-                // for compact, slot index for legacy, element index for
-                // arrays) a single "corrupt payload" marker can no longer be
-                // computed generically, and the victim/size boundaries alone
-                // (still printed via the eprintln above it) are what mattered
-                // for the "smear vs surgical" triage this was added for.
-                // SAFETY: `optr`/`h` are a valid, fully-initialized young-gen
-                // object/header pair (the `size`/`yused` bounds were checked
-                // above before entering this iteration).
-                unsafe {
-                    for_each_ref_slot(optr, h, |raw, slot_idx| {
-                        let p = raw as usize;
-                        if p != 0 && p < 0x1000 && found4 < 40 {
-                            found4 += 1;
-                            let cn = crate::gc::resolve_class_info(h.class_id.as_u32())
-                                .map(|(n, _)| n)
-                                .unwrap_or_else(|| "<unresolved>".to_string());
-                            eprintln!(
-                                "[small4] PRE-GC YOUNG {} @0x{:x} fld[{}] -> 0x{:x}",
-                                cn,
-                                ybase + ycur,
-                                slot_idx,
-                                p,
-                            );
-                        }
-                    });
-                }
-                ycur += size;
-            }
             }
         }
         // -------------------------------------------------------------------
@@ -5500,26 +5497,26 @@ impl GenerationalHeap {
         // edge above the truncation point.
         let mut mark_young_precise =
             |ptr: *mut u8, worklist: &mut Vec<*mut u8>, side_marks: &mut FxHashSet<usize>| {
-            let addr = ptr as usize;
-            if !in_young(addr) {
-                return;
-            }
-            // SAFETY: `in_young` confirmed an 8-aligned address inside the
-            // live from-space region; reading an ObjectHeader there is valid.
-            let header = unsafe { &mut *(ptr as *mut ObjectHeader) };
-            let kind_byte = header.kind as u8;
-            let is_array = header.kind == ObjectKind::Array;
-            if kind_byte > 1
-                || (!is_array && header.num_slots() > (1 << 24))
-                || (is_array && header.array_length() > i32::MAX as u32)
-            {
-                return;
-            }
-            let total = gen_object_total_size(header);
-            if total < HEADER_SIZE || addr + total > from_end {
-                let n = SWEEP_BAD_EXTENT_HITS.fetch_add(1, Ordering::Relaxed);
-                if emit_conservative_candidate_diagnostic(n, crate::a2dbg::enabled()) {
-                    tracing::warn!(
+                let addr = ptr as usize;
+                if !in_young(addr) {
+                    return;
+                }
+                // SAFETY: `in_young` confirmed an 8-aligned address inside the
+                // live from-space region; reading an ObjectHeader there is valid.
+                let header = unsafe { &mut *(ptr as *mut ObjectHeader) };
+                let kind_byte = header.kind as u8;
+                let is_array = header.kind == ObjectKind::Array;
+                if kind_byte > 1
+                    || (!is_array && header.num_slots() > (1 << 24))
+                    || (is_array && header.array_length() > i32::MAX as u32)
+                {
+                    return;
+                }
+                let total = gen_object_total_size(header);
+                if total < HEADER_SIZE || addr + total > from_end {
+                    let n = SWEEP_BAD_EXTENT_HITS.fetch_add(1, Ordering::Relaxed);
+                    if emit_conservative_candidate_diagnostic(n, crate::a2dbg::enabled()) {
+                        tracing::warn!(
                         "mark_young_precise: ignoring edge referent at {:#x} with implausible extent {} (kind={}, array_len={}, num_slots={}); safe reject",
                         addr,
                         total,
@@ -5527,13 +5524,13 @@ impl GenerationalHeap {
                         header.array_length(),
                         header.num_slots(),
                     );
+                    }
+                    return;
                 }
-                return;
-            }
-            if side_marks.insert(addr) {
-                worklist.push(ptr);
-            }
-        };
+                if side_marks.insert(addr) {
+                    worklist.push(ptr);
+                }
+            };
 
         // Seed: precise + conservative roots gathered by the caller.
         for root in roots.iter() {
@@ -5713,11 +5710,7 @@ impl GenerationalHeap {
                 cratonvm_types::metadata_pin::roots_for_loader(obj_ptr as usize)
             {
                 for metadata_addr in metadata_addrs {
-                    mark_young_precise(
-                        metadata_addr as *mut u8,
-                        &mut worklist,
-                        &mut side_marks,
-                    );
+                    mark_young_precise(metadata_addr as *mut u8, &mut worklist, &mut side_marks);
                 }
             }
         }
@@ -6686,9 +6679,8 @@ impl GenerationalHeap {
         // implausible header) can UNWIND the suspect entries collected since
         // the last trustworthy anchor (`dead_watermark`) instead of having
         // already zeroed what may be a live object's interior.
-        let retain_dead_objects = sweep_zero_enabled()
-            || crate::a2dbg::enabled()
-            || gc_flags().dbg_sweep_census;
+        let retain_dead_objects =
+            sweep_zero_enabled() || crate::a2dbg::enabled() || gc_flags().dbg_sweep_census;
         let mut dead_regions: Vec<(usize, usize, u32, u8, usize)> = Vec::new();
         let mut bytes_swept: usize = 0;
         let mut objects_swept: usize = 0;
@@ -6918,9 +6910,7 @@ impl GenerationalHeap {
                 // prior object's exact element_type/elem-bytes and resolve the
                 // Value cells at `cursor` (disc + payload, and whether the payload
                 // points into the young arena).
-                if gc_flags().dbg_a2
-                    && A2_PROBE_HITS.fetch_add(1, Ordering::Relaxed) < 4
-                {
+                if gc_flags().dbg_a2 && A2_PROBE_HITS.fetch_add(1, Ordering::Relaxed) < 4 {
                     if let Some(&(loff, lsz, lcid, lkind, lns, lal)) = walked.back() {
                         // SAFETY: loff < used, header mapped.
                         let lhdr = unsafe { &*((from_base + loff) as *const ObjectHeader) };
@@ -7078,9 +7068,7 @@ impl GenerationalHeap {
             // object instead of an overstep cascade.
             if let Some(&&(foff, _fsz)) = free_iter.peek() {
                 if foff > cursor && foff < cursor + total_size {
-                    if gc_flags().dbg_a2
-                        && A2_FL_OVERLAP_HITS.load(Ordering::Relaxed) < 30
-                    {
+                    if gc_flags().dbg_a2 && A2_FL_OVERLAP_HITS.load(Ordering::Relaxed) < 30 {
                         eprintln!(
                             "[A2-FL] CLAMP over-sized object @{} computed_size={} (kind={:?} class_id={}) oversteps free hole at {} — retaining + resyncing",
                             cursor, total_size, header.kind, header.class_id.as_u32(), foff,
@@ -9976,10 +9964,7 @@ fn plan_object_alloc(class_id: ClassId, num_fields: usize) -> Option<(usize, u32
 /// uses the uniform `index * SLOT_SIZE` 16-byte cell). Keys on the per-object
 /// `GC_FLAG_COMPACT` bit, so legacy and compact objects coexist correctly.
 #[inline]
-fn compact_field_slot(
-    header: &ObjectHeader,
-    index: usize,
-) -> Option<(usize, FieldStorageKind)> {
+fn compact_field_slot(header: &ObjectHeader, index: usize) -> Option<(usize, FieldStorageKind)> {
     if !is_compact_object(header) {
         return None;
     }
