@@ -9780,72 +9780,163 @@ fn victim8_neighbor_explains_zero_prefix(candidate: *mut u8, old_gen: &OldGen) -
         && old_gen.contains(unsafe { neighbor.add(total - 1) })
 }
 
+/// Cold diagnostic for a corrupt array header. Split out of
+/// [`gen_object_total_size`] so the `tracing::warn!` expansion (argument
+/// formatting, a `&dyn Value` table) does not sit inline in a function called
+/// once per object on every linear heap walk — that bulk is what stopped LLVM
+/// inlining the size computation at its 41 call sites.
+#[cold]
+#[inline(never)]
+fn warn_corrupt_array_header(header: &ObjectHeader) {
+    tracing::warn!(
+        "GC: implausible array_length {} (element_type={:?}) in heap object \
+         header — treating as corrupt; caller will stop/skip the walk",
+        header.array_length(),
+        header.element_type,
+    );
+}
+
+/// Cold diagnostic for a non-`Object` kind reaching the legacy-object sizing
+/// arm. See [`warn_corrupt_array_header`] for why this is out-of-line.
+#[cold]
+#[inline(never)]
+fn warn_non_object_kind_in_object_arm(header: &ObjectHeader) {
+    tracing::warn!(
+        "GC: header kind={:?} reached the legacy-object sizing arm (shape={}, \
+         class_id={}); a region sentinel is not a sizable object — treating as \
+         corrupt so the walker can re-sync.",
+        header.kind,
+        header.num_slots(),
+        header.class_id.as_u32(),
+    );
+}
+
+/// Cold diagnostic for an implausible `num_slots` on a legacy object header.
+/// See [`warn_corrupt_array_header`] for why this is out-of-line.
+#[cold]
+#[inline(never)]
+fn warn_implausible_num_slots(header: &ObjectHeader) {
+    if crate::a2dbg::enabled() {
+        tracing::warn!(
+            "GC: implausible num_slots {} on kind=Object header (class_id={}); \
+             treating as corrupt so the walker can re-sync.",
+            header.num_slots(),
+            header.class_id.as_u32(),
+        );
+    }
+}
+
+/// Total heap footprint of the object at `header`, or 0 if the header is
+/// self-inconsistent (callers treat `< HEADER_SIZE` as corruption and re-sync).
+///
+/// PERF: called once per object by every linear collector walk, and at 41 call
+/// sites in this module. A depth-18 `BinTreesClassic` profile put this at 22.1%
+/// of samples — not because the arithmetic is expensive (a few loads, a branch
+/// and an add) but because the `tracing::warn!` expansions inline into it made
+/// the function large enough that LLVM declined to inline it, so every object in
+/// the walk paid a real call. The diagnostics now live in `#[cold]` helpers and
+/// this is `#[inline]`.
+#[inline]
 fn gen_object_total_size(header: &ObjectHeader) -> usize {
     let raw_size = if header.kind == ObjectKind::Array {
         match array_data_size(header.array_length() as usize, header.element_type) {
             Ok(data) => HEADER_SIZE + data,
             Err(_) => {
-                tracing::warn!(
-                    "GC: implausible array_length {} (element_type={:?}) in heap object \
-                     header — treating as corrupt; caller will stop/skip the walk",
-                    header.array_length(),
-                    header.element_type,
-                );
+                warn_corrupt_array_header(header);
                 0
             }
         }
     } else if is_compact_object(header) {
-        // Compact object: the body size in bytes is stored in `array_length`
-        // (objects don't otherwise use it; `kind` disambiguates from arrays).
-        // The sum is bounded by the u32 body size + HEADER_SIZE, no overflow.
+        // Compact object: `shape` holds the logical field count (as for any
+        // object — see the note in the legacy arm below); the body size comes
+        // from the class's registered layout via `object_body_size`. The sum is
+        // bounded by the u32 body size + HEADER_SIZE, no overflow.
         HEADER_SIZE + object_body_size(header)
     } else {
-        // Header-coherence sanity check: a correctly-allocated legacy
-        // `kind = Object` header always has `array_length = 0` (see
-        // `try_alloc_object` / the ObjectHeader::new contract — only
-        // `alloc_array` writes a non-zero array_length, and it sets
-        // `kind = Array` together with it).
+        // Header-coherence sanity checks. Anything reaching here must be a
+        // coherent `kind = Object` header; otherwise return 0. The non-moving
+        // sweep walker interprets `total_size < HEADER_SIZE` as corruption and
+        // falls through to its re-sync path, which finds the next plausible
+        // header and resumes walking — losing only the skipped region
+        // (recovered by the next major-GC compaction) instead of aborting the
+        // whole arena sweep.
         //
-        // The binary-trees workload exposed a JIT inline-allocation path that
-        // writes `array_length` into the header but leaves `kind` at its
-        // TLAB-zeroed default of `Object`. The walker, trusting `kind`, would
-        // then compute size = HEADER_SIZE + num_slots * SLOT_SIZE (using
-        // whatever garbage `num_slots` happened to be — e.g. 55, yielding 920
-        // bytes) and overshoot into the next object's payload, eventually
-        // reading String char-array bytes as a header (the `"Data"` /
-        // `0x61746144` signature observed in the diag dumps).
+        // ---------------------------------------------------------------
+        // Why there is no `array_length != 0` check here any more
+        // ---------------------------------------------------------------
+        // Until `d46e70521` ("gc: compact object headers and field storage")
+        // this arm opened with a live `if header.array_length != 0 { … return
+        // 0 }`. Back then `array_length: u32` and `num_slots: u32` were two
+        // *separate* header words, so "an Object whose array-length word is
+        // non-zero" was a decidable statement about a field that a correct
+        // `kind = Object` allocation always left at 0.
         //
-        // Return 0 here to flag the inconsistency. The non-moving sweep
-        // walker (line ~2579) interprets `total_size < HEADER_SIZE` as
-        // corruption and falls through to its re-sync path, which finds the
-        // next plausible header and resumes walking — losing only the
-        // skipped region (recovered by the next major-GC compaction)
-        // instead of aborting the whole arena sweep.
-        if header.kind == ObjectKind::Array {
-            if crate::a2dbg::enabled() {
-                tracing::warn!(
-                    "GC: inconsistent header — kind=Object but array_length={} (num_slots={}, \
-                 class_id={}); inline-alloc forgot to set kind=Array. Treating as corrupt \
-                 so the walker can re-sync.",
-                    header.shape >> 16,
-                    header.num_slots(),
-                    header.class_id.as_u32(),
-                );
-            }
+        // `d46e70521` merged both words into the single `shape: u32` at
+        // `ARRAY_LENGTH_OFFSET == NUM_SLOTS_OFFSET == 12`. `array_length()`
+        // now returns `shape` only when `kind == Array` and 0 otherwise, and
+        // `num_slots()` returns `shape` unconditionally — so for a
+        // `kind = Object` header the array length *is* the field count, the
+        // same four bytes. The merge silently rewrote the condition to
+        // `if header.kind == ObjectKind::Array`, dead by construction inside
+        // the `else` of that very test, and rewrote its `warn!` argument to
+        // `header.shape >> 16` — the high half of the field count, not an
+        // array length; `shape` was never a packed pair. `821bb2cb1` removed
+        // the corpse.
+        //
+        // The check is therefore **not reinstatable**: post-merge no
+        // header-local predicate can distinguish "shape holds an array length"
+        // from "shape holds a field count", and any `array_length() != 0` test
+        // in this arm is dead for the same reason the old one was. Nor can the
+        // layout registry adjudicate it — `plan_object_alloc` routes an object
+        // to *this* legacy arm precisely when no registered layout matches its
+        // field count, so a registry miss is the defined normal here, not
+        // evidence of corruption. See `gen_object_total_size_undecidability`.
+        //
+        // The defect the old check was written for is fixed at the producer.
+        // Its comment blamed "a JIT inline-allocation path that writes
+        // array_length but leaves kind at its TLAB-zeroed default" — that was a
+        // misdiagnosis. Per the fix's own notes in `jit/src/x64.rs`
+        // (`emit_inline_tlab_new`), the observed "kind=Object but
+        // array_length=1 (num_slots=384, class_id=4)" reports came from the
+        // walker stepping HEADER_SIZE into a *committed-but-unheadered* object
+        // and decoding its first `Value` field cell as a header — a walker
+        // desync, not a mis-allocated object. That path now writes the whole
+        // header (kind and shape included) *before* the cursor-commit store
+        // that publishes the object, and it allocates objects only: every array
+        // allocation goes through the `newarray` / `anewarray_object` /
+        // `multianewarray_2d` helpers, which set `kind` and `shape` together
+        // via `ObjectHeader::new`.
+        //
+        // What *is* still decidable is the kind itself. `ObjectKind` has a
+        // third variant: `HumongousFiller`, the sentinel the regional collector
+        // installs at the start of every humongous continuation region. It is
+        // explicitly "not a real object, no oops to scan" (see `ObjectKind`),
+        // yet only 2 of this function's 26 call sites screen it out before
+        // calling; at the other 24 it lands here and gets sized as
+        // `HEADER_SIZE + shape * SLOT_SIZE` — a stride computed from a word
+        // that means nothing for a sentinel. Return 0 so those callers re-sync
+        // instead. The generational heap never allocates humongous, so this is
+        // defence-in-depth rather than a live fix.
+        //
+        // Testing `!= Object` rather than `== HumongousFiller` also covers a
+        // header whose kind byte is not a valid `ObjectKind` discriminant at
+        // all — notably a `GAP_FILLER_CLASS_ID` sentinel, whose 8-byte span
+        // puts the low byte of its length field (8/16/24/32) where `kind`
+        // lives and has no valid `shape` word at offset 12. Every call site is
+        // already required to screen gap fillers out first (see the "must
+        // precede `gen_object_total_size`" notes); this is the backstop if one
+        // does not. Note the optimiser is entitled to assume `kind` is in
+        // 0..=2, so treat that second case as belt-and-braces, not a guarantee.
+        if header.kind != ObjectKind::Object {
+            warn_non_object_kind_in_object_arm(header);
             return 0;
         }
+
         // Defensive cap on num_slots: no real class has 1<<24 fields, and a
         // value above this is almost certainly garbage from an uninitialised
-        // region.  Same fallthrough — walker re-syncs.
+        // region. Walker re-syncs.
         if header.num_slots() > (1 << 24) {
-            if crate::a2dbg::enabled() {
-                tracing::warn!(
-                    "GC: implausible num_slots {} on kind=Object header (class_id={}); \
-                 treating as corrupt so the walker can re-sync.",
-                    header.num_slots(),
-                    header.class_id.as_u32(),
-                );
-            }
+            warn_implausible_num_slots(header);
             return 0;
         }
         HEADER_SIZE + header.num_slots() as usize * SLOT_SIZE
@@ -10463,6 +10554,118 @@ mod tests {
         unsafe {
             (obj.as_ptr() as *mut u8).add(offset).write(value);
         }
+    }
+
+    /// A `HumongousFiller` sentinel is not a sizable object. Only 2 of this
+    /// function's 26 call sites screen the kind out before calling; at the
+    /// other 24 it used to fall into the legacy-object arm and be sized as
+    /// `HEADER_SIZE + shape * SLOT_SIZE`. Return 0 so those callers re-sync.
+    #[test]
+    fn gen_object_total_size_rejects_humongous_filler_sentinel() {
+        let filler = ObjectHeader::new(
+            ClassId::new(0),
+            ObjectKind::HumongousFiller,
+            ArrayElementType::Reference,
+            0,
+            0,
+            0,
+        );
+        assert_eq!(
+            gen_object_total_size(&filler),
+            0,
+            "a region sentinel must not be sized as an object"
+        );
+
+        // The sentinel is installed with shape = 0, but a stale/garbage shape
+        // must not produce a plausible-looking stride either.
+        let mut noisy = ObjectHeader::new(
+            ClassId::new(0),
+            ObjectKind::HumongousFiller,
+            ArrayElementType::Reference,
+            0,
+            0,
+            0,
+        );
+        noisy.shape = 55;
+        assert_eq!(gen_object_total_size(&noisy), 0);
+    }
+
+    /// Ordinary headers are unaffected by the kind guard.
+    #[test]
+    fn gen_object_total_size_still_sizes_objects_and_arrays() {
+        let obj = ObjectHeader::new(
+            ClassId::new(7),
+            ObjectKind::Object,
+            ArrayElementType::Reference,
+            0,
+            0,
+            3,
+        );
+        assert_eq!(gen_object_total_size(&obj), HEADER_SIZE + 3 * SLOT_SIZE);
+
+        let arr = ObjectHeader::new(
+            ClassId::new(8),
+            ObjectKind::Array,
+            ArrayElementType::Int,
+            0,
+            10,
+            0,
+        );
+        assert_eq!(gen_object_total_size(&arr), HEADER_SIZE + 10 * 4);
+
+        // The `num_slots` cap still re-syncs the walker.
+        let mut huge = ObjectHeader::new(
+            ClassId::new(9),
+            ObjectKind::Object,
+            ArrayElementType::Reference,
+            0,
+            0,
+            0,
+        );
+        huge.shape = (1 << 24) + 1;
+        assert_eq!(gen_object_total_size(&huge), 0);
+    }
+
+    /// Pin the reason `gen_object_total_size` carries no `array_length != 0`
+    /// guard for legacy objects, so the check is not attempted a third time.
+    ///
+    /// `d46e70521` merged the separate `array_length` and `num_slots` words
+    /// into one `shape` word. For a `kind = Object` header the array length and
+    /// the field count are now literally the same four bytes, and
+    /// `array_length()` reports 0 by construction — so `array_length() != 0` in
+    /// the legacy arm is dead code, exactly as the guard removed in `821bb2cb1`
+    /// was. If this test ever fails, the two words have been split again and a
+    /// real coherence check becomes possible; see the note in that arm.
+    #[test]
+    fn gen_object_total_size_undecidability() {
+        let mut header = ObjectHeader::new(
+            ClassId::new(1),
+            ObjectKind::Object,
+            ArrayElementType::Reference,
+            0,
+            0,
+            0,
+        );
+        // Whatever an errant writer puts in the shape word, an Object header
+        // reports array_length 0 — there is nothing left to test against.
+        for shape in [1_u32, 55, 384, 0x0101_0101] {
+            header.shape = shape;
+            assert_eq!(
+                header.array_length(),
+                0,
+                "array_length() is 0 for kind=Object by construction"
+            );
+            assert_eq!(
+                header.num_slots(),
+                shape,
+                "num_slots() is the same word an array length would occupy"
+            );
+        }
+        assert_eq!(
+            cratonvm_types::ARRAY_LENGTH_OFFSET,
+            cratonvm_types::NUM_SLOTS_OFFSET,
+            "array length and field count share one header word"
+        );
     }
 
     #[test]
