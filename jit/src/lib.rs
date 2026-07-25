@@ -11489,6 +11489,21 @@ mod tests {
         }
     }
 
+    /// `clear_all` must evict every entry and drop every published body —
+    /// `CompiledMethod::drop` is what returns the executable mapping AND
+    /// withdraws that body's `JIT_CODE_RANGES` registration.
+    ///
+    /// The post-conditions below are deliberately phrased against state this
+    /// test OWNS rather than against the process-global range table. This lib
+    /// test binary runs its tests on a thread pool and `JIT_CODE_RANGES` is
+    /// process-global, so the old `lookup_jit_code_range(entry).is_none()`
+    /// assertion was order-dependent: `clear_all` unmaps our code pages, a
+    /// concurrently-running test then gets one of those very addresses back
+    /// from `ExecutableBuffer::new` and registers ITS range over it, and the
+    /// lookup correctly reports `Some(<that other test's body>)`. Holding a
+    /// `Weak` to each body keeps its `Arc` allocation (not the body) alive, so
+    /// `own_*` can never be recycled underneath the comparison and
+    /// `strong_count() == 0` proves *our* `Drop` ran.
     #[test]
     fn test_jit_cache_clear_all_evicts_entries() {
         let cache = JitCache::new();
@@ -11521,47 +11536,124 @@ mod tests {
             CompiledMethod::new(buf_b),
         );
 
-        let entry_a = cache
+        let cm_a = cache
             .get(&class_a, &method_a, &desc_a, cid_a)
-            .expect("compiled A")
-            .entry_ptr() as usize;
-        let entry_b = cache
+            .expect("compiled A");
+        let cm_b = cache
             .get(&class_b, &method_b, &desc_b, cid_b)
-            .expect("compiled B")
-            .entry_ptr() as usize;
+            .expect("compiled B");
+        let entry_a = cm_a.entry_ptr() as usize;
+        let entry_b = cm_b.entry_ptr() as usize;
+        // The `cm_ptr` each body registered in `JIT_CODE_RANGES` (see
+        // `JitCache::put`), used below to tell our own registration apart from a
+        // recycled-address one belonging to another test.
+        let own_a = Arc::as_ptr(&cm_a) as usize;
+        let own_b = Arc::as_ptr(&cm_b) as usize;
+        let weak_a = Arc::downgrade(&cm_a);
+        let weak_b = Arc::downgrade(&cm_b);
+        drop(cm_a);
+        drop(cm_b);
 
         assert_eq!(cache.len(), 2);
         assert_eq!(cache.clear_all(), 2);
         assert!(cache.is_empty());
         assert!(cache.get(&class_a, &method_a, &desc_a, cid_a).is_none());
         assert!(cache.get(&class_b, &method_b, &desc_b, cid_b).is_none());
-        assert!(lookup_jit_code_range(entry_a).is_none());
-        assert!(lookup_jit_code_range(entry_b).is_none());
+
+        // The cache held the last strong reference, so eviction must have run
+        // `CompiledMethod::drop` — which unmaps the code and unregisters the
+        // range — for both bodies.
+        assert_eq!(
+            weak_a.strong_count(),
+            0,
+            "clear_all must release the last owner of body A"
+        );
+        assert_eq!(
+            weak_b.strong_count(),
+            0,
+            "clear_all must release the last owner of body B"
+        );
+        // And no code range still binds our entry addresses to OUR bodies. A
+        // `Some(other)` here just means a concurrently-running test has already
+        // been handed the freed page back; that is not this cache's business.
+        assert_ne!(
+            lookup_jit_code_range(entry_a),
+            Some(own_a),
+            "clear_all must withdraw body A's own code-range registration"
+        );
+        assert_ne!(
+            lookup_jit_code_range(entry_b),
+            Some(own_b),
+            "clear_all must withdraw body B's own code-range registration"
+        );
     }
 
+    /// `clear_all` must return every unreferenced executable mapping, and with
+    /// it the `COMMITTED_JIT_CODE_BYTES` those mappings account for.
+    ///
+    /// `COMMITTED_JIT_CODE_BYTES` is process-global and this lib test binary
+    /// runs its tests on a thread pool, so absolute before/after totals are NOT
+    /// a stable observable: every other test that allocates or drops an
+    /// `ExecutableBuffer` moves the same counter. The old
+    /// `populated >= before + 8 * 4096` / `reclaimed <= populated - 8 * 4096`
+    /// pair therefore failed whenever concurrent frees (resp. allocations)
+    /// happened to outpace this test's own bookkeeping between the two loads.
+    ///
+    /// What this test owns instead:
+    ///  * the counter is an exact ledger — `ExecutableBuffer::new` adds
+    ///    `capacity` and its `Drop` subtracts the same `capacity` — so at any
+    ///    instant it equals the summed capacity of all *live* buffers. That
+    ///    makes `>= our own live bytes` a sound lower bound no matter what
+    ///    other threads are doing.
+    ///  * `Drop` is the *only* site that decrements the counter and releases
+    ///    the mapping, so proving `clear_all` dropped the last owner of each
+    ///    body proves exactly `committed_by_test` bytes went back.
     #[test]
     fn test_clear_all_releases_committed_executable_bytes() {
+        const BODY_BYTES: usize = 4096;
+        const BODIES: u32 = 8;
+
         let cache = JitCache::new();
-        let before = COMMITTED_JIT_CODE_BYTES.load(std::sync::atomic::Ordering::SeqCst);
-        for i in 0..8u32 {
-            let mut buf = ExecutableBuffer::new(4096).expect("alloc cache body");
+        let mut bodies = Vec::with_capacity(BODIES as usize);
+        for i in 0..BODIES {
+            let mut buf = ExecutableBuffer::new(BODY_BYTES).expect("alloc cache body");
             buf.emit(&[0xC3]);
+            let class: Arc<str> = Arc::from("ReclaimBytes");
+            let method: Arc<str> = Arc::from(format!("m{i}"));
+            let desc: Arc<str> = Arc::from("()V");
+            let cid = cratonvm_types::ClassId::new(i + 1);
             cache.put(
-                Arc::from("ReclaimBytes"),
-                Arc::from(format!("m{i}")),
-                Arc::from("()V"),
-                cratonvm_types::ClassId::new(i + 1),
+                class.clone(),
+                method.clone(),
+                desc.clone(),
+                cid,
                 CompiledMethod::new(buf),
             );
+            let cm = cache.get(&class, &method, &desc, cid).expect("published");
+            bodies.push(Arc::downgrade(&cm));
         }
+        let committed_by_test = BODIES as usize * BODY_BYTES;
+
+        // Our eight mappings are live, so the global ledger must be at least
+        // that large — every other contribution to it is a live buffer too.
         let populated = COMMITTED_JIT_CODE_BYTES.load(std::sync::atomic::Ordering::SeqCst);
-        assert!(populated >= before + 8 * 4096);
-        assert_eq!(cache.clear_all(), 8);
-        let reclaimed = COMMITTED_JIT_CODE_BYTES.load(std::sync::atomic::Ordering::SeqCst);
         assert!(
-            reclaimed <= populated - 8 * 4096,
-            "clear_all must return all unreferenced executable mappings"
+            populated >= committed_by_test,
+            "committed ledger {populated} is below this test's own live mappings \
+             ({committed_by_test} bytes)"
         );
+
+        assert_eq!(cache.clear_all(), BODIES as usize);
+
+        // Every body lost its last owner, so `CompiledMethod::drop` ran for all
+        // eight — unmapping the code and returning `committed_by_test` bytes.
+        for (i, weak) in bodies.iter().enumerate() {
+            assert_eq!(
+                weak.strong_count(),
+                0,
+                "clear_all must return body m{i}'s executable mapping"
+            );
+        }
     }
 
     #[test]
