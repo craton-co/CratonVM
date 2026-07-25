@@ -30,6 +30,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
+use crate::gc_flags;
 use crate::heap::{
     array_data_size, ArrayElementType, ObjectHeader, ObjectKind, GC_FLAG_MARKED, HEADER_SIZE,
     REF_ELEMENT_SIZE, SLOT_SIZE,
@@ -44,9 +45,7 @@ use cratonvm_types::{ObjectRef, Value};
 /// compaction. See docs/bc-math-ec-gc-0x4-handoff.md §6.1.
 #[inline]
 fn seedhunt_enabled() -> bool {
-    use std::sync::OnceLock;
-    static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| std::env::var_os("CRATONVM_DBG_SEEDHUNT").is_some())
+    gc_flags().dbg_seedhunt
 }
 
 /// A contiguous free block in the old generation.

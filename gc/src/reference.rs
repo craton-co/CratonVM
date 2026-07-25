@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use parking_lot::Mutex;
 use rustc_hash::{FxHashMap, FxHashSet};
+use crate::gc_flags;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -608,7 +609,7 @@ impl ReferenceProcessor {
     // -- Phase 2: WeakReferences -------------------------------------------
 
     fn process_weak_refs(&mut self, is_marked: &dyn Fn(usize) -> bool) {
-        let dbg = std::env::var_os("CRATONVM_DBG_WATCHREF").is_some();
+        let dbg = gc_flags().dbg_watchref;
         for entry in &mut self.weak_refs {
             if entry.cleared {
                 continue;

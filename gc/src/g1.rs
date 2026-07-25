@@ -37,6 +37,7 @@ use crate::mark_bitmap::MarkBitmap;
 use crate::region::{RegionType, RememberedSet};
 use crate::satb::SatbQueue;
 use cratonvm_types::{ClassId, ObjectRef, Value};
+use crate::gc_flags;
 
 #[inline]
 unsafe fn value_from_unaligned_ptr(ptr: *const u8) -> Value {
@@ -218,13 +219,7 @@ fn array_element_to_bytes(element_type: ArrayElementType, value: Value, raw: &mu
 /// freshness signal that removes the `pointer_map.contains_key` evacuation
 /// TOCTOU at the ref-scan sites.
 fn parallel_evac_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("CRATONVM_G1_PARALLEL_EVAC")
-            .ok()
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
-    })
+    gc_flags().g1_parallel_evac
 }
 
 // ===========================================================================
@@ -1818,7 +1813,7 @@ impl G1Collector {
                     regions[cset_idx].region_type = RegionType::Survivor;
                 }
             } else {
-                if std::env::var_os("CRATONVM_G1_DBG_REACH").is_some() {
+                if gc_flags().g1_dbg_reach {
                     eprintln!(
                         "[g1][FREED] evac region={cset_idx} type={:?} cursor={:#x}",
                         regions[cset_idx].region_type, regions[cset_idx].cursor
@@ -1876,7 +1871,7 @@ impl G1Collector {
         // Diagnostic kill-switch (bisection aid): CRATONVM_G1_NO_EVAC_RETRY=1
         // restores the single-pass behaviour (and with it, the kept-region
         // death spiral under to-space exhaustion).
-        if std::env::var_os("CRATONVM_G1_NO_EVAC_RETRY").is_some() {
+        if gc_flags().g1_no_evac_retry {
             return first;
         }
 
@@ -1914,7 +1909,7 @@ impl G1Collector {
         let mut passes = 1usize;
         while !seeds.is_empty() && passes < MAX_EVAC_RETRY_PASSES {
             let drain = self.drain_kept_self_forwards(&seeds, roots, monitors);
-            if std::env::var_os("CRATONVM_G1_DBG_REACH").is_some() {
+            if gc_flags().g1_dbg_reach {
                 eprintln!(
                     "[g1][RETRY] drain pass={} seeds={} copied={} freed={} forwards={}",
                     passes + 1,
@@ -2205,7 +2200,7 @@ impl G1Collector {
         // from the CSet, exactly like JNI-pinned regions. Empty unless a thread
         // is in JIT (the common case for a JIT-triggered young GC).
         let jit_pinned_regions = self.jit_pinned_region_set();
-        if std::env::var_os("CRATONVM_G1_DBG_PINS").is_some() {
+        if gc_flags().g1_dbg_pins {
             eprintln!(
                 "[g1][PINS] young pause: jit_active={} pin_addrs={} pin_regions={:?}",
                 crate::gc_quiescence::is_active(),
@@ -2327,7 +2322,7 @@ impl G1Collector {
             .iter()
             .flat_map(|(_, srcs)| srcs.iter().copied())
             .collect();
-        let dbg_phases = std::env::var_os("CRATONVM_G1_DBG_REACH").is_some();
+        let dbg_phases = gc_flags().g1_dbg_reach;
         let p1_forwards = pointer_map.len();
         unique_sources.extend(jit_pinned_regions.iter().copied());
         if dbg_phases {
@@ -2883,10 +2878,8 @@ impl G1Collector {
         // Diagnostic override: `CRATONVM_G1_WORKERS=N` forces the worker count
         // (e.g. =1 to drain the parallel path serially and isolate concurrency
         // races from logic divergences). Falls back to the config otherwise.
-        if let Some(v) = std::env::var_os("CRATONVM_G1_WORKERS") {
-            if let Some(n) = v.to_str().and_then(|s| s.trim().parse::<usize>().ok()) {
-                return n.max(1);
-            }
+        if let Some(n) = gc_flags().g1_workers {
+            return n;
         }
         let cfg = self.config.gc_worker_threads.max(1);
         let avail = std::thread::available_parallelism()
@@ -3891,7 +3884,7 @@ impl G1Collector {
             }
             let obj_size = object_total_size(header);
             if obj_size < HEADER_SIZE || offset + obj_size > cursor {
-                if std::env::var_os("CRATONVM_G1_DBG_REACH").is_some() {
+                if gc_flags().g1_dbg_reach {
                     eprintln!(
                         "[g1][WALKBRK] source-scan region={source_idx} off={offset:#x} \
                          cursor={cursor:#x} obj_size={obj_size:#x}"
@@ -4043,7 +4036,7 @@ impl G1Collector {
                 let obj_size = object_total_size(header);
 
                 if obj_size < HEADER_SIZE || offset + obj_size > cursor {
-                    if std::env::var_os("CRATONVM_G1_DBG_REACH").is_some() {
+                    if gc_flags().g1_dbg_reach {
                         eprintln!(
                             "[g1][WALKBRK] phase4 region={i} off={offset:#x} \
                              cursor={cursor:#x} obj_size={obj_size:#x}"
@@ -4277,7 +4270,7 @@ impl G1Collector {
         pointer_map: &HashMap<usize, usize>,
         roots: &[ObjectRef],
     ) {
-        if std::env::var_os("CRATONVM_G1_DBG_HEADERS").is_none() {
+        if !gc_flags().g1_dbg_headers {
             return;
         }
         // (0) OVERLAP DETECTOR: two distinct from-space objects forwarded to the
@@ -4429,7 +4422,7 @@ impl G1Collector {
         cset_set: &std::collections::HashSet<usize>,
         roots: &[ObjectRef],
     ) {
-        if std::env::var_os("CRATONVM_G1_DBG_ZERO").is_none() {
+        if !gc_flags().g1_dbg_zero {
             return;
         }
         let mut hits = 0usize;
@@ -4526,7 +4519,7 @@ impl G1Collector {
         roots: &[ObjectRef],
         label: &str,
     ) {
-        if std::env::var_os("CRATONVM_G1_DBG_REACH").is_none() {
+        if !gc_flags().g1_dbg_reach {
             return;
         }
         static PAUSE_NO: AtomicUsize = AtomicUsize::new(0);
@@ -4642,7 +4635,7 @@ impl G1Collector {
         // reach counts, to identify a stale root anchoring a large dead
         // subgraph (e.g. a historical list node retaining everything appended
         // after it through `next` chains).
-        if std::env::var_os("CRATONVM_G1_DBG_ROOTCENSUS").is_some() {
+        if gc_flags().g1_dbg_rootcensus {
             for (ri, r) in roots.iter().enumerate() {
                 let addr = r.as_ptr() as usize;
                 if addr == 0 || self.lookup_region_for_addr(addr).is_none() {
@@ -5678,7 +5671,7 @@ impl G1Collector {
                 && region.region_type == RegionType::Old
                 && !region.pinned
             {
-                if std::env::var_os("CRATONVM_G1_DBG_REACH").is_some() {
+                if gc_flags().g1_dbg_reach {
                     eprintln!(
                         "[g1][FREED] cleanup region={region_idx} cursor={:#x}",
                         region.cursor
@@ -6006,7 +5999,7 @@ impl G1Collector {
             stats.objects_copied,
             stats.bytes_copied,
             stats.bytes_freed,
-            if std::env::var_os("CRATONVM_G1_DBG_REACH").is_some() {
+            if gc_flags().g1_dbg_reach {
                 // try_lock: the collection paths call this while still holding
                 // the regions guard (diagnostic-only; skip the counts then).
                 if let Some(regions) = self.regions.try_lock() {

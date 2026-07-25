@@ -54,6 +54,7 @@ use cratonvm_types::{
     ClassId, CompactLayout, FieldStorageKind, ObjectRef, Value,
 };
 use cratonvm_types::narrow_oop::{read_ref_slot, ref_element_size, ref_field_size, write_ref_slot};
+use crate::gc_flags;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -260,9 +261,7 @@ pub static SWEEP_PROMOTION_ABORT_HITS: AtomicU64 = AtomicU64::new(0);
 /// perturb GC timing enough to mask/create the races it's meant to diagnose.
 #[inline]
 fn watchref_dbg() -> bool {
-    use std::sync::OnceLock;
-    static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| std::env::var_os("CRATONVM_DBG_WATCHREF").is_some())
+    gc_flags().dbg_watchref
 }
 
 /// DBG: optional young-GC stress threshold (bytes). Read from
@@ -271,15 +270,7 @@ fn watchref_dbg() -> bool {
 /// documented `CRATONVM_GC_STRESS=<bytes> …` command silently does nothing).
 /// `CRATONVM_DBG_GC_STRESS` wins if both are set.
 fn gc_stress_threshold() -> Option<usize> {
-    use std::sync::OnceLock;
-    static S: OnceLock<Option<usize>> = OnceLock::new();
-    *S.get_or_init(|| {
-        std::env::var("CRATONVM_DBG_GC_STRESS")
-            .or_else(|_| std::env::var("CRATONVM_GC_STRESS"))
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            .filter(|&v| v > 0)
-    })
+    gc_flags().gc_stress_bytes
 }
 
 // ---------------------------------------------------------------------------
@@ -349,9 +340,7 @@ pub fn current_sweep_cycle() -> u32 {
 }
 
 fn sweep_zero_enabled() -> bool {
-    use std::sync::OnceLock;
-    static S: OnceLock<bool> = OnceLock::new();
-    *S.get_or_init(|| std::env::var_os("CRATONVM_DBG_SWEEP_ZERO").is_some())
+    gc_flags().dbg_sweep_zero
 }
 
 fn swept_ring() -> &'static parking_lot::Mutex<SweptRing> {
@@ -2163,7 +2152,7 @@ impl GenerationalHeap {
             static OOB_DIAG_COUNT: std::sync::atomic::AtomicU64 =
                 std::sync::atomic::AtomicU64::new(0);
             const OOB_DIAG_CAP: u64 = 512;
-            let oob_dbg = std::env::var_os("CRATONVM_DBG_OOBFIELD").is_some();
+            let oob_dbg = gc_flags().dbg_oobfield;
             if oob_dbg
                 || OOB_DIAG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < OOB_DIAG_CAP
             {
@@ -2174,8 +2163,8 @@ impl GenerationalHeap {
                     };
                 // CRATONVM_DBG_OOBFIELD=<substr>: dump a backtrace for OOB field
                 // reads whose class name contains <substr>, to localize the reader.
-                if let Ok(want) = std::env::var("CRATONVM_DBG_OOBFIELD") {
-                    if !want.is_empty() && class_name.contains(&want) {
+                if let Some(want) = gc_flags().dbg_oobfield_value.as_deref() {
+                    if !want.is_empty() && class_name.contains(want) {
                         eprintln!(
                             "[OOBFIELD_ASRTAG_V1 READ] class={} index={} num_slots={}\n{}",
                             class_name,
@@ -2216,7 +2205,7 @@ impl GenerationalHeap {
                          receiver type)",
                     );
                 }
-                if std::env::var("CRATONVM_DBG_OOBFIELD").is_ok() {
+                if gc_flags().dbg_oobfield_value.is_some() {
                     eprintln!(
                     "[OOBFIELD_ASRTAG_V1 READ] class={class_name} index={index} num_slots={num_slots}\n{}",
                     std::backtrace::Backtrace::force_capture()
@@ -2355,7 +2344,7 @@ impl GenerationalHeap {
         // the heap set API (bytecode putfield, native ctx.set_field, reflection).
         if let Value::Object(Some(p)) = value {
             let a = p.as_ptr() as usize;
-            if a != 0 && a < 0x1_0000 && std::env::var_os("CRATONVM_DBG_BADREF").is_some() {
+            if a != 0 && a < 0x1_0000 && gc_flags().dbg_badref {
                 eprintln!(
                     "[BADREF:set_field] recv_class_id={} idx={} ptr=0x{:x}",
                     self.get_header(obj_ref).class_id.as_u32(),
@@ -2467,8 +2456,8 @@ impl GenerationalHeap {
                 };
             // CRATONVM_DBG_OOBFIELD=<substr>: dump a backtrace for OOB field
             // accesses whose class name contains <substr>, to localize the writer.
-            if let Ok(want) = std::env::var("CRATONVM_DBG_OOBFIELD") {
-                if !want.is_empty() && class_name.contains(&want) {
+            if let Some(want) = gc_flags().dbg_oobfield_value.as_deref() {
+                if !want.is_empty() && class_name.contains(want) {
                     eprintln!(
                         "[OOBFIELD_ASRTAG_V1 WRITE] class={} index={} num_slots={} value={:?}\n{}",
                         class_name,
@@ -2736,7 +2725,7 @@ impl GenerationalHeap {
                     let stored_len = (obj_ptr.add(12) as *const u32).read_unaligned();
                     (kind_byte, elem_byte, class_id_raw, stored_len)
                 };
-                let msg = if std::env::var_os("CRATONVM_GC_ARRAY_GUARD_BT").is_some() {
+                let msg = if gc_flags().gc_array_guard_bt {
                     let bt = Backtrace::force_capture();
                     format!(
                         "[GC-ARRAY-GUARD] array_length(non-array): kind_byte={} class_id={} elem_byte={} stored_len={} obj={:p} (#{}/{})\nbacktrace:\n{}\n",
@@ -2911,7 +2900,7 @@ impl GenerationalHeap {
         // native System.arraycopy / clone / reflection).
         if let Value::Object(Some(p)) = value {
             let a = p.as_ptr() as usize;
-            if a != 0 && a < 0x1_0000 && std::env::var_os("CRATONVM_DBG_BADREF").is_some() {
+            if a != 0 && a < 0x1_0000 && gc_flags().dbg_badref {
                 eprintln!("[BADREF:set_array_element] idx={} ptr=0x{:x}", index, a);
             }
         }
@@ -3320,8 +3309,8 @@ impl GenerationalHeap {
             crate::gc_quiescence::unregistered_jit_frame_on_stack(),
             jit_allocation_frame,
             crate::gc_quiescence::moving_young_enabled(),
-            std::env::var_os("CRATONVM_ALLOW_MOVING_YOUNG").is_some(),
-            std::env::var_os("CRATONVM_DBG_FORCE_MOVING").is_some(),
+            gc_flags().allow_moving_young,
+            gc_flags().dbg_force_moving,
         );
         let threshold = young_gc_trigger_bytes(
             from.capacity(),
@@ -3503,7 +3492,7 @@ impl GenerationalHeap {
         // OOM-INVESTIGATE (dohead-oom, 2026-07-19): track young-arena usage
         // across cycles to find where reclaimed bytes stop coming back as
         // usable free space. Gated so normal runs pay nothing.
-        if std::env::var_os("CRATONVM_DBG_HEAP_TRACE").is_some() {
+        if gc_flags().dbg_heap_trace {
             static CYCLE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let n = CYCLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let (used, free_bytes, cap) = {
@@ -3543,9 +3532,7 @@ impl GenerationalHeap {
         // over-marking and side-mark containment, but this old sweep
         // frees purely on GC_FLAG_MARKED, so any root-set gap frees a
         // LIVE promoted object). Read once per GC cycle — not hot.
-        let old_sweep_enabled = std::env::var("CRATONVM_OLD_SWEEP_JIT")
-            .map(|v| v != "0")
-            .unwrap_or(true);
+        let old_sweep_enabled = gc_flags().old_sweep_jit;
         if old_sweep_enabled
             && old_capacity > 0
             && (self.old_gen_used() >= old_capacity * 75 / 100 || major_requested)
@@ -3575,7 +3562,7 @@ impl GenerationalHeap {
         // DBG (CRATONVM_DBG_YOUNGSTATE): post-collection young/old arena
         // state — the bimodal-bt18 discriminator (is young allocatable
         // after this sweep, and from which structure?).
-        if std::env::var_os("CRATONVM_DBG_YOUNGSTATE").is_some() {
+        if gc_flags().dbg_youngstate {
             let from = self.young_from.lock();
             let og = self.old_gen.lock();
             eprintln!(
@@ -3614,7 +3601,7 @@ impl GenerationalHeap {
         let _pause_timer = {
             use std::sync::OnceLock;
             static G: OnceLock<bool> = OnceLock::new();
-            let on = *G.get_or_init(|| std::env::var_os("CRATONVM_DBG_GCPAUSE").is_some());
+            let on = *G.get_or_init(|| gc_flags().dbg_gcpause);
             PauseTimer(on.then(std::time::Instant::now))
         };
         // Phase 6 #1: spin-yield until every live `SafepointToken` has
@@ -3659,7 +3646,7 @@ impl GenerationalHeap {
         // non-moving sweep (wedged on by a leaked JitEntryGuard) is the
         // heap-corruption source. UNSAFE if a JIT frame is genuinely live
         // (relocates JIT-held raw pointers); diagnostic only.
-        let force_moving = std::env::var_os("CRATONVM_DBG_FORCE_MOVING").is_some();
+        let force_moving = gc_flags().dbg_force_moving;
         // Fix A (2026-06-05): under live JIT frames the CORRECT young collector is
         // the NON-MOVING sweep + selective promotion — now DEFAULT-ON (see
         // `selective_on` in `sweep_young_non_moving`), giving bt18 = 68332206 =
@@ -3683,7 +3670,7 @@ impl GenerationalHeap {
         // not relocated). The reload is then a no-op (pinned objects never move),
         // so the "incompatible with non-moving" concern does not apply. This keeps
         // bt18 = 68332206 while closing the kafka register-invisible reclamation.
-        let _shadow_roots = std::env::var_os("CRATONVM_SHADOW_STACK").is_some();
+        let _shadow_roots = cratonvm_types::flags().jit.shadow_stack;
         // Promotion-OOM avoidance: a MOVING (Cheney) young collection aborts the
         // PROCESS when it cannot relocate a survivor — old gen is full AND the
         // young to-space overflowed while promotion fell back to it (see the
@@ -3699,7 +3686,7 @@ impl GenerationalHeap {
         // young collector while JIT frames are active, so this only widens when
         // it runs. Opt out with `CRATONVM_NO_GC_PROMOTION_GUARD` (reverts to the
         // moving collector, which may abort the process on a full heap).
-        let promotion_oom_risk = std::env::var_os("CRATONVM_NO_GC_PROMOTION_GUARD").is_none() && {
+        let promotion_oom_risk = !gc_flags().no_gc_promotion_guard && {
             // The moving collector's promotion abort needs BOTH generations
             // nearly full at once: old gen cannot absorb the aged survivors AND
             // the young to-space cannot hold the (then unpromotable) surviving
@@ -3753,7 +3740,7 @@ impl GenerationalHeap {
         // `CRATONVM_PROMOTION_OOM_GUARD_BROAD=1`.
         let honor_promotion_oom_risk = promotion_oom_risk
             && (has_conservative_roots
-                || std::env::var_os("CRATONVM_PROMOTION_OOM_GUARD_BROAD").is_some());
+                || gc_flags().promotion_oom_guard_broad);
         // Default moving young gen (`CRATONVM_MOVING_YOUNG`): the JIT publishes a
         // COMPLETE rewritable precise root map (shadow stack) for every live frame
         // and the conservative scan is suppressed (see roots.rs), so a live JIT
@@ -3770,7 +3757,7 @@ impl GenerationalHeap {
         // fallback instead.
         let moving_young_requested = crate::gc_quiescence::moving_young_enabled();
         let fail_closed_non_moving = crate::gc_quiescence::is_active()
-            && std::env::var_os("CRATONVM_ALLOW_MOVING_YOUNG").is_none();
+            && !gc_flags().allow_moving_young;
         let force_non_moving_jit_roots = crate::gc_quiescence::force_non_moving_jit_roots();
         let coverage_incomplete = crate::gc_quiescence::moving_young_coverage_incomplete();
         let divert_for_incomplete_moving_coverage =
@@ -3789,7 +3776,7 @@ impl GenerationalHeap {
         if divert_non_moving && (!force_moving || divert_for_incomplete_moving_coverage) {
             if divert_for_incomplete_moving_coverage {
                 let n = crate::gc_quiescence::record_moving_young_coverage_fallback();
-                if std::env::var_os("CRATONVM_MOVING_YOUNG_FALLBACKS").is_some() {
+                if gc_flags().moving_young_fallbacks {
                     eprintln!(
                         "[moving-young] coverage fallback #{n}: incomplete live JIT safepoint map; running non-moving young sweep"
                     );
@@ -3864,7 +3851,7 @@ impl GenerationalHeap {
         // still reachable — the FixedPointTest premature-reclamation corruption
         // (ECCurve$Fp/ECFieldElement$Fp fields decaying to ZEROED/OFF-HEAP).
         // Caught at GC entry, BEFORE reclamation, with the offending old obj.
-        if std::env::var_os("CRATONVM_DBG_RSET_AUDIT").is_some() {
+        if gc_flags().dbg_rset_audit {
             let cbase = card_table.base_addr();
             let csize = crate::card_table::CARD_SIZE;
             let mut edges = 0usize;
@@ -3951,7 +3938,7 @@ impl GenerationalHeap {
             // Splitting the flag keeps `RSET_AUDIT`'s actually-load-bearing
             // old→young remembered-set check (fixed and verified above)
             // usable without inheriting this walk's fragility.
-            if std::env::var_os("CRATONVM_DBG_RSET_AUDIT_YOUNG_SCAN").is_some() {
+            if gc_flags().dbg_rset_audit_young_scan {
             let ybase = young_from.base_ptr_mut() as usize;
             let yused = young_from.used();
             let mut ycur = 0usize;
@@ -4850,7 +4837,7 @@ impl GenerationalHeap {
         // unrelated allocation-triggered minor GC into a major cycle it never
         // asked for. See `gc_quiescence`'s doc comment for the full rationale.
         let major_requested = crate::gc_quiescence::take_major_gc_request();
-        if std::env::var_os("CRATONVM_DBG_MIRRORPIN").is_some() {
+        if gc_flags().dbg_mirrorpin {
             eprintln!(
                 "[DBG_MIRRORPIN] Phase5 old_gen_used={} old_gen_cap={} major_requested={} will_run_major={}",
                 old_gen.used(),
@@ -5102,7 +5089,7 @@ impl GenerationalHeap {
         roots: &[ObjectRef],
         finalizer_addrs: &[usize],
     ) -> (GcResult, Vec<usize>) {
-        let phase_diag = std::env::var_os("CRATONVM_DBG_GCPHASE").is_some();
+        let phase_diag = gc_flags().dbg_gcphase;
         let phase_start = std::time::Instant::now();
         let mut phase_last = phase_start;
         let mut report_phase = |name: &str| {
@@ -5352,7 +5339,7 @@ impl GenerationalHeap {
                 // is IMPLAUSIBLE gets dropped from marking entirely — if it
                 // was actually a live object with a scarred header, the
                 // sweep will reclaim it. Surface the drop (bounded).
-                if std::env::var_os("CRATONVM_DBG_SWEEP_CENSUS").is_some() {
+                if gc_flags().dbg_sweep_census {
                     let n = SWEEP_BAD_EXTENT_HITS.load(Ordering::Relaxed);
                     if n < 12 {
                         eprintln!(
@@ -5654,7 +5641,7 @@ impl GenerationalHeap {
         // this corrects the checksum, the bug is a card/barrier gap (a promotion
         // that failed to dirty the promoted object's card); if it does NOT, the
         // missed reference is not a clean-card old→young edge (older verdict).
-        if std::env::var_os("CRATONVM_DBG_SEED_ALL_OLD").is_some() {
+        if gc_flags().dbg_seed_all_old {
             for (op, _sz) in old_gen.walk_objects() {
                 // SAFETY: `op` is a live old-gen object header from walk_objects.
                 let oh = unsafe { &*(op as *const ObjectHeader) };
@@ -5800,7 +5787,7 @@ impl GenerationalHeap {
         let promotion_age_reachable = self.stats.minor_gc_count.load(Ordering::Relaxed)
             >= u64::from(PROMOTION_AGE.saturating_sub(1));
         let selective_on = promotion_age_reachable
-            && std::env::var_os("CRATONVM_NO_SELECTIVE_PROMOTE").is_none()
+            && !gc_flags().no_selective_promote
             && !crate::gc_quiescence::moving_young_coverage_incomplete();
         if selective_on {
             let is_y = |a: usize| -> bool { a >= from_base && a < from_end && (a & 0x7) == 0 };
@@ -6143,7 +6130,7 @@ impl GenerationalHeap {
             // whether selective promotion is actually evacuating at a given
             // heap size, or whether the only active effect is the free-block
             // coalescing below.
-            if std::env::var_os("CRATONVM_SP_STATS").is_some() {
+            if gc_flags().sp_stats {
                 eprintln!(
                     "[sp-stats] gc: pinned={} evac={} aged={}",
                     pinned.len(),
@@ -6158,7 +6145,7 @@ impl GenerationalHeap {
             // corrupt one copy's field data → a child reference reads the wrong
             // subtree → inflated check() count. Detect overlapping dst ranges and
             // duplicate dst values among this GC's evacuations.
-            if std::env::var_os("CRATONVM_SP_TRACE").is_some() && !evacuated.is_empty() {
+            if gc_flags().sp_trace && !evacuated.is_empty() {
                 let mut ranges: Vec<(usize, usize)> = evacuated
                     .iter()
                     .map(|&d| {
@@ -6385,7 +6372,7 @@ impl GenerationalHeap {
                 // slot). Splits old-gen vs surviving-young so we know which path
                 // (3a/3b/3c) has the gap. Zero on both ⇒ the corruption is a
                 // WRONG-address rewrite, not a missed one.
-                if std::env::var_os("CRATONVM_SP_VERIFY").is_some() {
+                if gc_flags().sp_verify {
                     // Incoming-reference count to each evacuated destination. In a
                     // forest of trees every node has exactly ONE parent, so any
                     // evacuated object with >=2 incoming heap refs is ALIASING — a
@@ -6473,7 +6460,7 @@ impl GenerationalHeap {
         // register/native-stack root the sweep cannot see (case "a"), or a
         // sweep-walk/sizing defect. Routine dead garbage has no inbound edge,
         // so a clean (no-edge) sweep is NORMAL — only edge hits are bugs.
-        if std::env::var_os("CRATONVM_DBG_SWEEP_EDGES").is_some() {
+        if gc_flags().dbg_sweep_edges {
             use std::collections::HashSet;
             // Local young-membership test (the `in_young` closure above is
             // borrowed by `mark_young` for the rest of the fn; use a fresh one).
@@ -6673,7 +6660,7 @@ impl GenerationalHeap {
         // output + the alloc/split bookkeeping between sweeps. A self-overlap here
         // means the BETWEEN-SWEEP maintenance (Arena::alloc split, or a stale block
         // never removed) is the source — vs. this sweep's frees overlapping it.
-        if std::env::var_os("CRATONVM_DBG_A2").is_some() {
+        if gc_flags().dbg_a2 {
             for w in existing_free.windows(2) {
                 let (a_off, a_sz) = w[0];
                 let (b_off, _b_sz) = w[1];
@@ -6701,7 +6688,7 @@ impl GenerationalHeap {
         // already zeroed what may be a live object's interior.
         let retain_dead_objects = sweep_zero_enabled()
             || crate::a2dbg::enabled()
-            || std::env::var_os("CRATONVM_DBG_SWEEP_CENSUS").is_some();
+            || gc_flags().dbg_sweep_census;
         let mut dead_regions: Vec<(usize, usize, u32, u8, usize)> = Vec::new();
         let mut bytes_swept: usize = 0;
         let mut objects_swept: usize = 0;
@@ -6723,7 +6710,7 @@ impl GenerationalHeap {
         // forensic gate. The old default path retained every object (and a
         // later bounded-ring attempt still updated a deque per object), adding
         // gigabytes of metadata traffic across bintrees18's ~19M-node sweep.
-        let retain_full_walk = std::env::var_os("CRATONVM_DBG_A2").is_some();
+        let retain_full_walk = gc_flags().dbg_a2;
         let mut walked_count = 0usize;
         let mut walked: std::collections::VecDeque<(usize, usize, u32, ObjectKind, u32, u32)> =
             std::collections::VecDeque::new();
@@ -6931,7 +6918,7 @@ impl GenerationalHeap {
                 // prior object's exact element_type/elem-bytes and resolve the
                 // Value cells at `cursor` (disc + payload, and whether the payload
                 // points into the young arena).
-                if std::env::var_os("CRATONVM_DBG_A2").is_some()
+                if gc_flags().dbg_a2
                     && A2_PROBE_HITS.fetch_add(1, Ordering::Relaxed) < 4
                 {
                     if let Some(&(loff, lsz, lcid, lkind, lns, lal)) = walked.back() {
@@ -7091,7 +7078,7 @@ impl GenerationalHeap {
             // object instead of an overstep cascade.
             if let Some(&&(foff, _fsz)) = free_iter.peek() {
                 if foff > cursor && foff < cursor + total_size {
-                    if std::env::var_os("CRATONVM_DBG_A2").is_some()
+                    if gc_flags().dbg_a2
                         && A2_FL_OVERLAP_HITS.load(Ordering::Relaxed) < 30
                     {
                         eprintln!(
@@ -7333,7 +7320,7 @@ impl GenerationalHeap {
         // an OVER-free (a too-large dead object whose span covers a free hole).
         // Either way it is the direct source of the overlapping free blocks the
         // coalescer then has to merge.
-        if std::env::var_os("CRATONVM_DBG_A2").is_some() {
+        if gc_flags().dbg_a2 {
             for &(doff, dsz, _, _, _) in &dead_regions {
                 for &(foff, fsz) in &existing_free {
                     if doff < foff + fsz && foff < doff + dsz {
@@ -7377,7 +7364,7 @@ impl GenerationalHeap {
         // root scan cannot resurrect a stale header inside the hole) and
         // publish it to the free list. Per-object forensic records remain
         // available without forcing per-object arena publication.
-        let defer_reclamation = std::env::var_os("CRATONVM_DBG_NO_NONMOVING_RECLAIM").is_some();
+        let defer_reclamation = gc_flags().dbg_no_nonmoving_reclaim;
         if !defer_reclamation {
             for &(off, sz, class_id, kind_byte, object_count) in &dead_regions {
                 let obj_addr = from_base + off;
@@ -7413,7 +7400,7 @@ impl GenerationalHeap {
         // RRWL probe's ThreadLocalMap$Entry / HoldCounter chain) showing up
         // here names the wrongly-swept set directly at reclamation time —
         // no use-time face (zero-header receiver / OOB read) required.
-        if std::env::var_os("CRATONVM_DBG_SWEEP_CENSUS").is_some() && !dead_regions.is_empty() {
+        if gc_flags().dbg_sweep_census && !dead_regions.is_empty() {
             let mut counts: std::collections::HashMap<u32, (usize, usize)> =
                 std::collections::HashMap::new();
             for &(off, sz, class_id, _kind, object_count) in &dead_regions {
@@ -7530,7 +7517,7 @@ impl GenerationalHeap {
         // its overlap-merge safety invariant, 6e3ddb05) regardless of
         // `selective_on` — with promotion disabled the free list still
         // fragments and overlapping blocks would still double-serve.
-        if std::env::var_os("CRATONVM_SP_NO_COALESCE").is_none() {
+        if !gc_flags().sp_no_coalesce {
             let sorted = young_from.free_blocks_sorted();
             if sorted.len() > 1 {
                 young_from.clear_free_list();
@@ -7554,7 +7541,7 @@ impl GenerationalHeap {
                         if off <= last_end {
                             if off < last_end {
                                 A2_FL_OVERLAP_HITS.fetch_add(1, Ordering::Relaxed);
-                                if std::env::var_os("CRATONVM_DBG_A2").is_some()
+                                if gc_flags().dbg_a2
                                     && A2_FL_OVERLAP_HITS.load(Ordering::Relaxed) <= 6
                                 {
                                     eprintln!(
@@ -7603,7 +7590,7 @@ impl GenerationalHeap {
 
         self.stats.minor_gc_count.fetch_add(1, Ordering::Relaxed);
 
-        if std::env::var_os("CRATONVM_DBG_PRECISE").is_some() && !evac_map.is_empty() {
+        if gc_flags().dbg_precise && !evac_map.is_empty() {
             eprintln!(
                 "[PRECISE] sweep_young_non_moving returning evac_map.len()={}",
                 evac_map.len()
@@ -8906,8 +8893,7 @@ impl GenerationalHeap {
     /// an object for one extra minor GC is safe, reclaiming it is not.
     #[inline]
     fn full_old_rset_scan_enabled() -> bool {
-        static CARD_TABLE_ONLY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        !*CARD_TABLE_ONLY.get_or_init(|| std::env::var_os("CRATONVM_CARD_TABLE_ONLY").is_some())
+        !gc_flags().card_table_only
     }
 
     /// Append all old-to-young slots using the same slot encoding as the card
@@ -9426,8 +9412,7 @@ impl GenerationalHeap {
 /// gcstress residual face-1 gate — see `dump_corrupt_cell_holder`.
 #[inline]
 fn cell_corrupt_diag_enabled() -> bool {
-    static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *G.get_or_init(|| std::env::var_os("CRATONVM_DBG_CELLCORRUPT").is_some())
+    gc_flags().dbg_cellcorrupt
 }
 
 /// gcstress residual face-1 hunt (`CRATONVM_DBG_CELLCORRUPT`) — validate a
@@ -9578,9 +9563,7 @@ fn for_each_ref(obj: *mut u8, header: &ObjectHeader, mut f: impl FnMut(usize)) {
 /// `OnceLock` so the per-object-copy check in `forward_object` does NOT pay an
 /// `env::var_os` lookup on the hot GC path when the gate is off.
 fn gcw_enabled() -> bool {
-    use std::sync::OnceLock;
-    static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| std::env::var_os("CRATONVM_DBG_GCWRITE").is_some())
+    gc_flags().dbg_gcwrite
 }
 
 /// Cached CRATONVM_DBG_DESCTRACE gate (temp investigation aid, ALV5th GC
@@ -9589,9 +9572,7 @@ fn gcw_enabled() -> bool {
 /// instance (old addr -> new addr, identity hash, promoted-or-not, age).
 #[inline]
 fn desc_trace_enabled() -> bool {
-    use std::sync::OnceLock;
-    static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| std::env::var_os("CRATONVM_DBG_DESCTRACE").is_some())
+    gc_flags().dbg_desctrace
 }
 
 /// Cached `CRATONVM_DBG_FWDGUARD` gate (bc math-ec 0x4): log forward_object
@@ -9599,18 +9580,14 @@ fn desc_trace_enabled() -> bool {
 /// roots that would get a forwarding_ptr smashed into live-object interiors).
 #[inline]
 fn fwdguard_enabled() -> bool {
-    use std::sync::OnceLock;
-    static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| std::env::var_os("CRATONVM_DBG_FWDGUARD").is_some())
+    gc_flags().dbg_fwdguard
 }
 
 /// Cached `CRATONVM_FWD_RESOLVE_STRICT` gate: REJECT (leave unmoved, no
 /// forwarding install) forward_object candidates with unresolvable class_id.
 #[inline]
 fn fwd_resolve_strict() -> bool {
-    use std::sync::OnceLock;
-    static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| std::env::var_os("CRATONVM_FWD_RESOLVE_STRICT").is_some())
+    gc_flags().fwd_resolve_strict
 }
 
 /// Cached `CRATONVM_DBG_SEEDHUNT` gate (bc math-ec `0x4` seed-phase bisect).
@@ -9623,9 +9600,7 @@ fn fwd_resolve_strict() -> bool {
 /// docs/bc-math-ec-gc-0x4-handoff.md §6.4.
 #[inline]
 fn seedhunt_enabled() -> bool {
-    use std::sync::OnceLock;
-    static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| std::env::var_os("CRATONVM_DBG_SEEDHUNT").is_some())
+    gc_flags().dbg_seedhunt
 }
 
 /// Moving-young diagnostic: after Cheney scanning but before from-space reset,
@@ -9634,9 +9609,7 @@ fn seedhunt_enabled() -> bool {
 /// with a wrong result points at an unenumerated root/home outside the heap.
 #[inline]
 fn moving_young_dangling_verify_enabled() -> bool {
-    use std::sync::OnceLock;
-    static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| std::env::var_os("CRATONVM_MOVING_YOUNG_VERIFY").is_some())
+    gc_flags().moving_young_verify
 }
 
 /// Scan a single object's reference slots for the `0x4` seed signature
@@ -9980,7 +9953,7 @@ fn plan_object_alloc(class_id: ClassId, num_fields: usize) -> Option<(usize, u32
             if layout.field_count() == num_fields {
                 let total = HEADER_SIZE.checked_add(layout.body_size as usize)?;
                 return Some((total, layout.body_size, GC_FLAG_COMPACT));
-            } else if std::env::var_os("CRATONVM_DBG_COMPACT_LEGACY").is_some() {
+            } else if gc_flags().dbg_compact_legacy {
                 let name = crate::gc::resolve_class_info(class_id.as_u32())
                     .map(|(n, _)| n)
                     .unwrap_or_else(|| "<unresolved>".to_string());
@@ -10404,7 +10377,7 @@ unsafe fn read_slot(ptr: *mut u8) -> Value {
             static CORRUPT_HITS: std::sync::atomic::AtomicU64 =
                 std::sync::atomic::AtomicU64::new(0);
             let n = CORRUPT_HITS.fetch_add(1, Ordering::Relaxed);
-            if n < 32 || std::env::var_os("CRATONVM_DIAG_HIB32").is_some() {
+            if n < 32 || gc_flags().diag_hib32 {
                 // SAFETY: `ptr` is a readable, 8-byte-aligned 16-byte slot
                 // (caller contract) -- read atomically (PLAIN-SLOT TEARING
                 // FIX, 2026-07-06) so this diagnostic dump itself can't tear
