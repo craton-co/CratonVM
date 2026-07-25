@@ -735,7 +735,7 @@ impl WakeupTimer {
             loop {
                 // `Instant` is `Copy`, so read the head deadline and end the
                 // immutable borrow before popping (avoids a peek/pop borrow
-                // conflict on `state.heap`).
+                // conflict on `state.mem.heap`).
                 let head_deadline = state.heap.peek().map(|r| r.0.deadline);
                 match head_deadline {
                     Some(deadline) if deadline <= now => {
@@ -899,7 +899,8 @@ impl VirtualThreadManager {
         threads
             .entry(id)
             .or_insert_with(|| VirtualThread::new(id, name.to_string()));
-        self.next_id.fetch_max(id.saturating_add(1), Ordering::Relaxed);
+        self.next_id
+            .fetch_max(id.saturating_add(1), Ordering::Relaxed);
     }
 
     /// Install the heap-resident execution state before first submission.

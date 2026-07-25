@@ -849,8 +849,8 @@ pub mod helpful_npe {
 /// `Throwable.backtrace` (slot 0) with a String reference and leave
 /// `detailMessage` (slot 1) and `cause` (slot 2) untouched.
 fn set_detail_message_by_name(shared: &SharedVm, obj: ObjectRef, string_ref: ObjectRef) {
-    let class_id = shared.heap.class_id_of(obj);
-    let cm = shared.class_manager.read();
+    let class_id = shared.mem.heap.class_id_of(obj);
+    let cm = shared.classes.class_manager.read();
     let mut walk = Some(class_id);
     // Real-JDK bootstrap metadata intentionally represents a few core fields
     // as `_fN`.  Throwable's first two instance slots nevertheless retain the
@@ -878,6 +878,7 @@ fn set_detail_message_by_name(shared: &SharedVm, obj: ObjectRef, string_ref: Obj
                 let idx = cls.first_field_index + inst;
                 drop(cm);
                 shared
+                    .mem
                     .heap
                     .set_field(obj, idx, Value::Object(Some(string_ref)));
                 return;
@@ -889,6 +890,7 @@ fn set_detail_message_by_name(shared: &SharedVm, obj: ObjectRef, string_ref: Obj
     if let Some(idx) = opaque_throwable_detail_message {
         drop(cm);
         shared
+            .mem
             .heap
             .set_field(obj, idx, Value::Object(Some(string_ref)));
     }
@@ -901,8 +903,8 @@ fn set_detail_message_by_name(shared: &SharedVm, obj: ObjectRef, string_ref: Obj
 /// needing to know the field's numeric slot (differs between real-JDK and
 /// synthetic layouts). See `raise_no_class_def_found_with_cause`.
 fn set_cause_by_name(shared: &SharedVm, obj: ObjectRef, cause_ref: ObjectRef) {
-    let class_id = shared.heap.class_id_of(obj);
-    let cm = shared.class_manager.read();
+    let class_id = shared.mem.heap.class_id_of(obj);
+    let cm = shared.classes.class_manager.read();
     let mut walk = Some(class_id);
     while let Some(cid) = walk {
         let Some(cls) = cm.get_class(cid) else {
@@ -917,6 +919,7 @@ fn set_cause_by_name(shared: &SharedVm, obj: ObjectRef, cause_ref: ObjectRef) {
                 let idx = cls.first_field_index + inst;
                 drop(cm);
                 shared
+                    .mem
                     .heap
                     .set_field(obj, idx, Value::Object(Some(cause_ref)));
                 return;
@@ -951,6 +954,7 @@ pub fn create_exception_object(
 ) -> Result<ObjectRef, MethodCallFailed> {
     // 1. Load the exception class
     let class_id = shared
+        .classes
         .class_manager
         .write()
         .load_class(class_name)
@@ -979,7 +983,13 @@ pub fn create_exception_object_for_class(
 ) -> Result<ObjectRef, MethodCallFailed> {
     // The caller may have received a stale/bogus `jclass`; reject it before
     // allocating an object with an unknown layout.
-    if shared.class_manager.read().get_class(class_id).is_none() {
+    if shared
+        .classes
+        .class_manager
+        .read()
+        .get_class(class_id)
+        .is_none()
+    {
         return Err(MethodCallFailed::InternalError(VmError::Internal {
             message: format!("exception class {class_name} is not loaded"),
         }));
@@ -987,12 +997,13 @@ pub fn create_exception_object_for_class(
 
     // 2. Allocate the exception object
     let num_fields = shared
+        .classes
         .class_manager
         .read()
         .get_class(class_id)
         .map(|c| c.num_total_fields)
         .unwrap_or(0);
-    let obj_ref = match shared.heap.try_alloc_object(class_id, num_fields) {
+    let obj_ref = match shared.mem.heap.try_alloc_object(class_id, num_fields) {
         Some(obj) => obj,
         None => {
             // Young gen full — force a GC cycle and retry.
@@ -1011,6 +1022,7 @@ pub fn create_exception_object_for_class(
                 )));
             }
             shared
+                .mem
                 .heap
                 .try_alloc_object(class_id, num_fields)
                 .ok_or_else(|| {
@@ -1192,6 +1204,7 @@ pub fn throw_runtime_error(
             );
             for (i, f) in thread.frames.iter().enumerate().rev().take(15) {
                 let cn = shared
+                    .classes
                     .class_manager
                     .read()
                     .get_class(f.class_id)
@@ -1222,6 +1235,7 @@ pub fn throw_runtime_error(
         );
         for (i, f) in thread.frames.iter().enumerate().rev().take(25) {
             let cn = shared
+                .classes
                 .class_manager
                 .read()
                 .get_class(f.class_id)
@@ -1246,6 +1260,7 @@ pub fn throw_runtime_error(
                 );
                 for (i, f) in thread.frames.iter().enumerate().rev() {
                     let cn = shared
+                        .classes
                         .class_manager
                         .read()
                         .get_class(f.class_id)
@@ -1285,6 +1300,7 @@ pub fn throw_runtime_error(
         let class_name = frame
             .and_then(|f| {
                 shared
+                    .classes
                     .class_manager
                     .read()
                     .get_class(f.class_id)
@@ -1301,6 +1317,7 @@ pub fn throw_runtime_error(
             if has_dorun {
                 for (i, f) in thread.frames.iter().enumerate().rev().take(15) {
                     let _cn = shared
+                        .classes
                         .class_manager
                         .read()
                         .get_class(f.class_id)
@@ -1314,6 +1331,7 @@ pub fn throw_runtime_error(
                     if m.contains("isInterface") {
                         for (i, f) in thread.frames.iter().enumerate().rev().take(20) {
                             let cn = shared
+                                .classes
                                 .class_manager
                                 .read()
                                 .get_class(f.class_id)
@@ -1326,6 +1344,7 @@ pub fn throw_runtime_error(
                         eprintln!("SUREFIRE-NPE-TRACE msg={m}");
                         for (i, f) in thread.frames.iter().enumerate().rev().take(30) {
                             let cn = shared
+                                .classes
                                 .class_manager
                                 .read()
                                 .get_class(f.class_id)
@@ -1349,6 +1368,7 @@ pub fn throw_runtime_error(
             if std::env::var_os("CRATONVM_DBG_WF_NPE").is_some() {
                 let in_log4j_init = thread.frames.iter().any(|f| {
                     let cn = shared
+                        .classes
                         .class_manager
                         .read()
                         .get_class(f.class_id)
@@ -1361,6 +1381,7 @@ pub fn throw_runtime_error(
                     eprintln!("[WF-NPE-TRACE] msg={:?}", error);
                     for (i, f) in thread.frames.iter().enumerate().rev().take(40) {
                         let cn = shared
+                            .classes
                             .class_manager
                             .read()
                             .get_class(f.class_id)
@@ -1375,6 +1396,7 @@ pub fn throw_runtime_error(
                 eprintln!("NPE-TRACE msg={:?}", error);
                 for (i, f) in thread.frames.iter().enumerate().rev().take(30) {
                     let cn = shared
+                        .classes
                         .class_manager
                         .read()
                         .get_class(f.class_id)
@@ -1389,6 +1411,7 @@ pub fn throw_runtime_error(
             eprintln!("IAE-TRACE error={error:?}");
             for (i, f) in thread.frames.iter().enumerate().rev().take(25) {
                 let cn = shared
+                    .classes
                     .class_manager
                     .read()
                     .get_class(f.class_id)
@@ -1547,7 +1570,7 @@ pub fn throw_runtime_error(
                 ))
             );
             if is_oom {
-                if let Some(oom) = *shared.singleton_oom.read() {
+                if let Some(oom) = *shared.mem.singleton_oom.read() {
                     return MethodCallFailed::ExceptionThrown(oom);
                 }
             }
@@ -1569,7 +1592,7 @@ pub fn throw_runtime_error(
 /// loadable) it leaves the slot empty and the OOM paths keep their prior
 /// behaviour — never worse.
 pub fn ensure_singleton_oom(shared: &SharedVm, thread: &mut JvmThread) {
-    if shared.singleton_oom.read().is_some() {
+    if shared.mem.singleton_oom.read().is_some() {
         return;
     }
     if let Ok(obj) = create_exception_object(
@@ -1578,7 +1601,7 @@ pub fn ensure_singleton_oom(shared: &SharedVm, thread: &mut JvmThread) {
         "java/lang/OutOfMemoryError",
         Some("Java heap space"),
     ) {
-        *shared.singleton_oom.write() = Some(obj);
+        *shared.mem.singleton_oom.write() = Some(obj);
     }
 }
 
@@ -1691,7 +1714,12 @@ fn linkage_throwable(error: &LinkageError) -> (&'static str, String) {
             // class+method (`R2dbcMappingContext.class.getName() +
             // ".setForceQuote("`), which a slash-separated class name can
             // never satisfy.
-            format!("{}.{}{}", class_name.replace('/', "."), method_name, method_descriptor),
+            format!(
+                "{}.{}{}",
+                class_name.replace('/', "."),
+                method_name,
+                method_descriptor
+            ),
         ),
         LinkageError::IncompatibleClassChangeError { message } => {
             ("java/lang/IncompatibleClassChangeError", message.clone())
@@ -1778,7 +1806,7 @@ pub fn convert_class_not_found(
 ) -> MethodCallFailed {
     if std::env::var_os("CRATONVM_DBG_NCDFE").is_some() {
         eprintln!("[NCDFE] class={} err={:?}", class_name, err);
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         for (i, f) in thread.frames.iter().enumerate().rev().take(20) {
             let cn = cm
                 .get_class(f.class_id)

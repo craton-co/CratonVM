@@ -16533,7 +16533,7 @@ impl Compiler {
                 //
                 // MED-2 bail (round-2 JIT review): same gap as the top-level
                 // 0xb2 handler at line ~9620 — see the long comment there
-                // for the full unblocking plan. Briefly: `SharedVm.statics`
+                // for the full unblocking plan. Briefly: `SharedVm.classes.statics`
                 // slot addresses aren't stable (Vec resize, lazy entry),
                 // so we can't bake them as `imm64` and emit `MOV reg,
                 // [imm64]`. Stay on the helper-call path.
@@ -21776,7 +21776,7 @@ impl Compiler {
                 // currently emit that form. Bail rationale (see round-1 TLAB
                 // bail at 10783-10807 for the same pattern):
                 //
-                //   1. Slot storage is `SharedVm.statics:
+                //   1. Slot storage is `SharedVm.classes.statics:
                 //      RwLock<HashMap<ClassId, Vec<Value>>>` (see
                 //      `vm/src/vm/vm_object.rs::get_static_shared` at line
                 //      472). The slot address is NOT stable:
@@ -21813,7 +21813,7 @@ impl Compiler {
                 //      only.
                 //
                 // To wire inlining later, the prerequisites are:
-                //   * Change `SharedVm.statics` to use a stable allocation
+                //   * Change `SharedVm.classes.statics` to use a stable allocation
                 //     for each class's static area (e.g. `Box<[AtomicU64]>`
                 //     allocated once per `<clinit>` and pinned for the
                 //     class's life). Volatile fields then use
@@ -21892,7 +21892,7 @@ impl Compiler {
                 //
                 // MED-2 (round-2 JIT review): same bail as 0xb2 above. The
                 // symmetric inline form would be `MOV [imm64], reg`, but
-                // (a) `SharedVm.statics` slot addresses aren't stable
+                // (a) `SharedVm.classes.statics` slot addresses aren't stable
                 // (the Vec resizes; the HashMap entry is created lazily),
                 // (b) writes need to go through `set_static_shared` so the
                 // GC and finalizer paths see the new object reference, and

@@ -143,16 +143,16 @@ fn sharedvm_exposes_oscache_field() {
     // Smoke: constructing a SharedVm with the default synthetic-jdk
     // config must initialize `osc_cache` to an empty cache.
     let shared = Arc::new(SharedVm::new(VmConfig::default()));
-    assert!(shared.osc_cache.is_empty());
-    assert_eq!(shared.osc_cache.len(), 0);
+    assert!(shared.classes.osc_cache.is_empty());
+    assert_eq!(shared.classes.osc_cache.len(), 0);
 
     // And it must behave as a regular OscCache: insert + get roundtrip.
     let cid = ClassId::new(555);
     let r = fake_ref(7);
-    let installed = shared.osc_cache.insert_if_absent(cid, r);
+    let installed = shared.classes.osc_cache.insert_if_absent(cid, r);
     assert_eq!(installed, r);
-    assert_eq!(shared.osc_cache.get(cid), Some(r));
-    assert_eq!(shared.osc_cache.len(), 1);
+    assert_eq!(shared.classes.osc_cache.get(cid), Some(r));
+    assert_eq!(shared.classes.osc_cache.len(), 1);
 }
 
 #[test]
@@ -160,7 +160,9 @@ fn sharedvm_oscache_is_independent_per_vm() {
     // Two VMs each keep their own cache.
     let v1 = Arc::new(SharedVm::new(VmConfig::default()));
     let v2 = Arc::new(SharedVm::new(VmConfig::default()));
-    v1.osc_cache.insert_if_absent(ClassId::new(1), fake_ref(1));
-    assert_eq!(v1.osc_cache.len(), 1);
-    assert_eq!(v2.osc_cache.len(), 0);
+    v1.classes
+        .osc_cache
+        .insert_if_absent(ClassId::new(1), fake_ref(1));
+    assert_eq!(v1.classes.osc_cache.len(), 1);
+    assert_eq!(v2.classes.osc_cache.len(), 0);
 }

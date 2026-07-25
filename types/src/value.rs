@@ -65,7 +65,7 @@ pub struct ObjectRef {
 
 // SAFETY: ObjectRef is a Copy wrapper around a non-null pointer.  We implement
 // Hash based on the pointer value so ObjectRef can be used as a HashMap key
-// (e.g. in SharedVm.class_mirrors_reverse).  Hashing a raw pointer is
+// (e.g. in SharedVm.classes.class_mirrors_reverse).  Hashing a raw pointer is
 // deterministic within a single process run.
 impl std::hash::Hash for ObjectRef {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {

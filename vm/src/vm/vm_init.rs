@@ -314,7 +314,7 @@ pub enum MainThreadGroupInit {
 /// is *not* scanned as a GC root; `remap_and_sweep_throwable_stack_traces`
 /// forwards it after a move and drops the trace once its Throwable dies.
 #[derive(Debug, Clone)]
-struct ThrowableStackTrace {
+pub(crate) struct ThrowableStackTrace {
     throwable: ObjectRef,
     frames: Vec<StackTraceEntry>,
 }
@@ -342,140 +342,32 @@ pub struct SharedVm {
     /// exist on the CPU-only build.
     #[cfg(feature = "gpu-offload")]
     pub offload_registry: std::sync::Arc<crate::runtime::offload::OffloadCacheRegistry>,
-
-    /// Class loader and cache, protected by an RwLock.
+    /// Class loading, linking, resolution and per-class caches. Owns the L10 lock.
     ///
-    /// L10 in the global lock hierarchy — the coarsest lock, acquired first.
-    /// See [`crate::runtime::lock_order`]. [`OrderedPlRwLock`] is a drop-in for
-    /// `parking_lot::RwLock` that asserts the descending acquisition order on
-    /// every `.read()` / `.write()` / `.read_recursive()`, so holding any
-    /// lower-level lock (a monitor, `ref_processor`, …) across a class-manager
-    /// acquisition is caught instead of deadlocking.
-    pub class_manager: OrderedPlRwLock<ClassManager>,
-
-    /// Object/array heap — generational GC with young + old gen.
-    pub heap: VmHeap,
-
-    /// fork6 GC_STRESS fix — SATB queue shared between the heap's write
-    /// barrier (`satb_barrier`, attached via `enable_concurrent_gc` at
-    /// construction) and every concurrent old-gen cycle's marker
-    /// (`ConcurrentMarker::with_shared` in `maybe_concurrent_gc`). Without
-    /// this shared instance the barrier logs nowhere and remark drains
-    /// nothing — the concurrent mark had no write barrier.
-    pub concurrent_satb: std::sync::Arc<cratonvm_gc::SatbQueue>,
-    /// Concurrent old-gen cycle phase state, shared with the heap for the
-    /// `satb_barrier` `is_marking_active()` fast-path gate (see
-    /// `concurrent_satb`).
-    pub concurrent_gc_state: std::sync::Arc<cratonvm_gc::ConcurrentGcState>,
-
-    /// Lock-free cache of the shared `cratonvm/synthetic/AnonymousObject$N`
-    /// ClassId, indexed by field count `N` (slot 0 is unused — `num_fields > 0`
-    /// always on this path). `0` means "not yet resolved" — a valid sentinel
-    /// because these synthetic classes are minted with non-zero ClassIds
-    /// (`ClassId(0)` is `java/lang/Object`).
+    /// See [`crate::vm::realms::ClassRealm`]. Access paths are
+    /// `shared.classes.<field>`; lock types and levels are
+    /// unchanged by the move.
+    pub classes: crate::vm::realms::ClassRealm,
+    /// Native-method registry, Panama FFI tables, JNI globals and the fd table.
     ///
-    /// `vm_exec::alloc_object` rewrites every `ClassId(0)`-with-fields
-    /// allocation (e.g. a `HashMap` node) to one of these synthetic classes.
-    /// The first allocation for a given `N` resolves it through
-    /// `ClassManager::ensure_synthetic_class` (a write-lock + name `format!` +
-    /// hash probe) and stores the id here; every later allocation reads the id
-    /// with a single relaxed atomic load and skips the class-manager locks
-    /// entirely. The synthetic stub declares exactly `N` fields, so the
-    /// field-count clamp is a provable no-op and is skipped on the fast path.
-    pub anon_class_cache: [std::sync::atomic::AtomicU32; ANON_CLASS_CACHE_LEN],
+    /// See [`crate::vm::realms::NativeRealm`]. Access paths are
+    /// `shared.natives.<field>`; lock types and levels are
+    /// unchanged by the move.
+    pub natives: crate::vm::realms::NativeRealm,
 
-    /// Native method registry (immutable after construction).
-    pub native_methods: NativeMethodRegistry,
-
-    /// Static fields: class_id -> field_index -> Value.
-    /// T10.9.B: FxHashMap — keys are internal ClassId, hot path accessed
-    /// on every getstatic/putstatic bytecode.
-    pub statics: RwLock<FxHashMap<ClassId, Vec<Value>>>,
-
-    /// Cache of resolved symbolic references (fields and methods).
-    pub resolution_cache: RwLock<ResolutionCache>,
-
-    /// Captured Throwable backtraces, shared by every Java thread in this VM.
+    /// Object heap, GC coordination and the VM-wide GC root tables.
     ///
-    /// Java exposes a Throwable's stack trace independently of the thread that
-    /// filled it in. Keeping this in `SharedVm` also lets the registry survive
-    /// the producer thread's teardown. Entries are non-owning and swept after
-    /// each collection, so completed exception-heavy workloads do not retain
-    /// stale frame vectors indefinitely.
-    throwable_stacks: RwLock<FxHashMap<i32, ThrowableStackTrace>>,
+    /// See [`crate::vm::realms::HeapRealm`]. Access paths are
+    /// `shared.mem.<field>`; lock types and levels are
+    /// unchanged by the move.
+    pub mem: crate::vm::realms::HeapRealm,
 
-    /// Round 8 audit fix (CRIT #2): the reflective `(class, name,
-    /// descriptor)` cache. Previously built (`LinkResolver::new()`) but
-    /// never wired into any caller, so the entire dedupe win was dead
-    /// code. Now reachable from native reflective callers
-    /// (`Class.getDeclaredMethod`, `Class.getMethod`, JNI
-    /// `GetMethodID`/`GetFieldID`) via `vm.link_resolver()`. The
-    /// cache is invalidated on `redefine_class` through the same
-    /// hook that drops `ResolutionCache` entries (see
-    /// `link_resolver_invalidate_adapter`).
-    pub link_resolver: LinkResolver,
-
-    /// T10 — vtable manager for virtual/interface dispatch.
+    /// Java threads: registry, monitors, virtual-thread scheduling and the main ThreadGroup.
     ///
-    /// Shared as an `Arc` so the class-loader install hook (a plain
-    /// `fn` pointer with no captured state) can reach the same manager
-    /// via the `crate::runtime::vtable::global_vtable_manager()` cell.
-    pub vtable_manager: std::sync::Arc<parking_lot::RwLock<crate::runtime::vtable::VtableManager>>,
-
-    /// T10 — read-optimized shared resolution cache (uses RwLock internally).
-    pub shared_resolution: crate::runtime::lockfree_resolve::SharedResolutionState,
-
-    /// T10 — pool for reusing operand stack Vec<u64> allocations.
-    pub operand_stack_pool: crate::runtime::alloc_fastpath::VecPool<u64>,
-
-    /// T10 — pool for reusing tag Vec<u8> allocations.
-    pub tag_pool: crate::runtime::alloc_fastpath::VecPool<u8>,
-
-    /// Monitor table for JVM intrinsic locks (monitorenter/monitorexit).
-    pub monitors: MonitorTable,
-
-    /// Per-class synthetic lock objects for static synchronized methods.
-    /// When a static synchronized method is called, we need an object to use
-    /// as the monitor (since there's no `this`). We allocate a dummy object
-    /// per class and store it here.
-    /// T10.9.B: FxHashMap — ClassId-keyed internal cache.
-    pub class_locks: RwLock<FxHashMap<ClassId, ObjectRef>>,
-
-    /// Interned string pool: maps Rust strings to Java String ObjectRefs.
-    /// Used by `ldc` string constants and `String.intern()`.
-    /// T10.9.B: FxHashMap — keys come from `ldc` constant-pool strings and
-    /// internal `String.intern()` calls, not untrusted runtime input.
-    pub string_pool: RwLock<FxHashMap<String, ObjectRef>>,
-
-    /// Class mirror cache: maps ClassId to java/lang/Class ObjectRef.
-    /// Used by `Object.getClass()`.
-    /// T10.9.B: FxHashMap — ClassId-keyed.
-    pub class_mirrors: RwLock<FxHashMap<ClassId, ObjectRef>>,
-
-    /// Reverse of `class_mirrors`: maps a Class mirror back to its ClassId.
-    /// Populated whenever `get_or_create_class_mirror` allocates a new mirror.
-    /// This lets `mirror_class_id` recover the ClassId without storing it in
-    /// the mirror's Java-visible fields (which would clash with the real-JDK
-    /// `java/lang/Class` layout).
-    /// T10.9.B: FxHashMap — ObjectRef pointer keys.
-    pub class_mirrors_reverse: RwLock<FxHashMap<ObjectRef, ClassId>>,
-
-    /// Loader-faithful resolution cache (gated by
-    /// `CRATONVM_LOADER_AWARE_RESOLUTION`). Maps an *initiating* loader and an
-    /// internal class name to the `ClassId` that loader resolves it to —
-    /// CratonVM's analogue of the JVMS §5.4.3 *initiating loader* table. Only
-    /// populated for references reached from bytecode defined by a user-defined
-    /// loader: once `resolve_class_loader_aware` has driven that loader's
-    /// `loadClass` (or proved the name is bootstrap/global) for a given name,
-    /// the answer is memoised here so subsequent references skip the re-entrant
-    /// `loadClass` invocation. Grow-only — CratonVM does not unload classes, and
-    /// in-place `redefine_class` keeps the `ClassId` stable. Empty (and never
-    /// read) when the gate is off.
-    ///
-    /// Nested `loader -> (name -> id)` so a hot-path read can probe by borrowed
-    /// `&str` (`Arc<str>: Borrow<str>`) without allocating an `Arc` per lookup.
-    pub initiating_resolution_cache:
-        RwLock<FxHashMap<cratonvm_types::ClassLoaderId, FxHashMap<Arc<str>, ClassId>>>,
+    /// See [`crate::vm::realms::ThreadRealm`]. Access paths are
+    /// `shared.threads.<field>`; lock types and levels are
+    /// unchanged by the move.
+    pub threads: crate::vm::realms::ThreadRealm,
 
     /// Synthetic System.out PrintStream object.
     pub system_out: RwLock<Option<ObjectRef>>,
@@ -487,398 +379,24 @@ pub struct SharedVm {
     /// reads `System.in` before `System.initPhase1` completes; must be non-null).
     pub system_in: RwLock<Option<ObjectRef>>,
 
-    /// Cached "main" `java.lang.ThreadGroup` object used by every
-    /// VM-created `Thread` as `holder.group`.  Lazily created the first
-    /// time `NativeContextImpl::current_thread_object` builds a Thread
-    /// in real-JDK mode — the ThreadGroup constructor invokes bytecode,
-    /// so it can't run during `SharedVm::new`.
-    pub main_thread_group: RwLock<Option<ObjectRef>>,
-
-    /// Claim/wait coordination for the lazy `main_thread_group` build
-    /// (`NativeContextImpl::get_or_create_main_thread_group`,
-    /// `vm/src/vm/vm_exec.rs`). Mirrors `class_init_waiters`'s JVMS §5.5
-    /// claim/wait/notify shape: exactly one thread transitions
-    /// `Idle -> InProgress` and performs the (allocating, bytecode-running)
-    /// build; every other concurrent caller blocks on the `InProgress`
-    /// waiter's condvar instead of redundantly building its own
-    /// `ThreadGroup` pair. Fixes a confirmed TOCTOU race (see
-    /// docs/known-issues/CRATONVM-SPRING-GENUINE-BUGLIST.md, "5.8
-    /// follow-up #4") where several `cratonvm-aio-dispatch-N` threads
-    /// lazily building their first `Thread` mirror at the same instant
-    /// could each observe `main_thread_group == None` and independently
-    /// race through the whole unguarded build, corrupting whichever
-    /// build's objects lost the final write.
-    pub main_thread_group_init: parking_lot::Mutex<MainThreadGroupInit>,
-
-    /// Pre-allocated singleton `java.lang.OutOfMemoryError`, thrown when the
-    /// heap is too full to even materialize a fresh exception object (the
-    /// OOM-during-OOM case — see `runtime::exceptions::ensure_singleton_oom`,
-    /// which fills this once before user `main`). Kept alive permanently by the
-    /// GC root scan (`memory::roots`). `None` until pre-allocated; the OOM-throw
-    /// sites fall back to their prior behaviour while it is empty.
-    pub singleton_oom: RwLock<Option<ObjectRef>>,
-
     /// System properties: populated with platform defaults + user overrides.
     pub system_properties: RwLock<HashMap<String, String>>,
-
-    /// Lambda proxy registry: maps synthetic proxy ClassId → LambdaCallSite metadata.
-    /// Used by the interpreter to dispatch method calls on lambda proxy objects.
-    /// T10.9.B: FxHashMap — ClassId-keyed.
-    pub lambda_proxies: RwLock<FxHashMap<ClassId, LambdaCallSite>>,
-
-    /// Defining class (the class whose `invokedynamic` created this lambda /
-    /// method-ref) for each lambda proxy id — what HotSpot names the proxy after
-    /// and reports as its nest host. Kept as a side table so the reflection name
-    /// natives report `<host>$$Lambda/0x<id>` and a correct `getNestHost()` even
-    /// for a cross-class method reference, whose implementation method lives in a
-    /// different class than the one that defines the reference. bug-06 fam5 #1.
-    pub lambda_proxy_hosts: RwLock<FxHashMap<ClassId, ClassId>>,
-
-    /// Counter for generating unique synthetic lambda proxy ClassIds.
-    /// Starts at 0x8000_0000 to avoid collisions with real ClassIds from the ClassStore.
-    pub next_lambda_id: AtomicU32,
-
-    /// Registry of all JVM threads (main + spawned).
-    pub thread_registry: ThreadRegistry,
-
-    /// Primitive type Class mirrors: "int" → ObjectRef, "boolean" → ObjectRef, etc.
-    /// T10.9.B: FxHashMap — keys are fixed primitive type names, not user input.
-    pub primitive_mirrors: RwLock<FxHashMap<String, ObjectRef>>,
-
-    /// Canonical `java.lang.Module` mirrors keyed by module name (e.g.
-    /// "java.base"), with `""` reserved for the unnamed module. `Class.getModule()`
-    /// MUST hand back the SAME `Module` instance for every class in a module,
-    /// because the JDK compares modules by identity (`Module` does not override
-    /// `equals`). Real bytecode relies on this — e.g.
-    /// `Throwable.validateSuppressedExceptionsList` deserializes a Throwable's
-    /// suppressed-exceptions list and throws `StreamCorruptedException("List
-    /// implementation not in base module.")` unless
-    /// `Object.class.getModule() == deserializedList.getClass().getModule()`.
-    /// Allocating a fresh Module per `getModule()` call (the old behaviour) made
-    /// that comparison always false and broke ObjectInputStream round-trips of any
-    /// object holding a `java.util` List (HIB-CV-29).
-    pub module_mirrors: RwLock<FxHashMap<String, ObjectRef>>,
-
-    /// B-J: permanent GC-root registry for `java.lang.invoke.VarHandle` objects.
-    /// VarHandles are long-lived singletons stored in `static final` fields
-    /// (e.g. `ConcurrentLinkedDeque.NEXT`) and used for lock-free CAS. They were
-    /// not being traced as live, so a moving GC left their static holder slots
-    /// pointing at a zeroed (all-zero header) location → `VarHandle.set` /
-    /// `compareAndSet` misdispatched onto `java/lang/Object` and the heap
-    /// appeared corrupt (kafka consumer-suite crashes — see B-J). Registering
-    /// each VarHandle here gets it copied into the GC pointer-map, which lets
-    /// the existing static-field remap fix the holder slot. Keyed by identity
-    /// hash (stable across moves); values are remapped in `update_all_roots`.
-    pub var_handle_roots: RwLock<FxHashMap<i32, ObjectRef>>,
 
     /// Weak self-reference so native methods can obtain `Arc<SharedVm>` for
     /// spawning new threads. Set by `Vm::new()` after wrapping in `Arc`.
     pub self_arc: RwLock<Option<Weak<SharedVm>>>,
-
-    /// T1.7.7 — set to `true` after the first HPROF dump-on-OOM so a
-    /// tight allocation loop doesn't write thousands of dumps.
-    pub oom_dump_written: std::sync::atomic::AtomicBool,
-
-    /// File descriptor table for I/O operations.
-    pub fd_table: FileDescriptorTable,
-
-    /// GC barrier for stop-the-world coordination across threads.
-    pub gc_barrier: GcBarrier,
-
-    /// JIT compiler cache — maps method identity to compiled native code.
-    pub jit_cache: JitCache,
-
-    /// Virtual thread scheduler — bounds concurrent virtual thread execution
-    /// to a carrier-thread pool (JEP 444, Java 21).
-    pub virtual_scheduler: Arc<crate::threading::VirtualThreadScheduler>,
-
-    /// Continuation scheduler and heap-resident virtual-thread execution
-    /// states. Unlike `virtual_scheduler`'s legacy permit semaphore, this
-    /// manager owns a bounded set of carrier OS threads.
-    pub virtual_thread_manager: Arc<crate::threading::VirtualThreadManager>,
-
-    /// Off-heap memory allocations for Panama FFI (JEP 454).
-    pub native_memory: parking_lot::Mutex<crate::native::ffi::NativeMemoryTable>,
-
-    /// Loaded native libraries for Panama SymbolLookup (JEP 454).
-    pub native_libraries: parking_lot::Mutex<Vec<libloading::Library>>,
-
-    /// Upcall table for Panama upcall handles (C calling Java).
-    pub upcall_table: parking_lot::Mutex<crate::native::ffi::UpcallTable>,
-
-    /// JNI global reference table — prevents GC of referenced objects.
-    pub jni_global_refs: parking_lot::Mutex<crate::native::jni::JniGlobalRefs>,
-
-    /// Reference processor for weak/soft/phantom reference tracking during GC.
+    /// Observability, diagnostics and the JVMTI/JDWP debug plumbing.
     ///
-    /// L7 in the global lock hierarchy — see [`crate::runtime::lock_order`].
-    /// [`OrderedPlMutex`] is a drop-in for `parking_lot::Mutex` that asserts the
-    /// descending acquisition order on every `.lock()`.
-    pub ref_processor: OrderedPlMutex<cratonvm_gc::ReferenceProcessor>,
-
-    /// Cached field count for java/lang/String (0 = not yet resolved).
-    /// Once resolved, this is the actual `num_total_fields` from the loaded
-    /// String class, avoiding lock contention in `create_java_string()`.
-    pub cached_string_num_fields: AtomicUsize,
-
-    /// True when the loaded java/lang/String uses JDK 9+ compact strings
-    /// (byte[] value + byte coder) instead of pre-JDK-9 char[] layout.
-    /// Set once during bootstrap; read by create_java_string / read_java_string.
-    pub compact_strings: std::sync::atomic::AtomicBool,
-
-    /// Cached field count for java/lang/Class mirror objects (0 = not yet resolved).
-    pub cached_class_mirror_num_fields: AtomicUsize,
-
-    /// Structured audit log of ACC_NATIVE methods that were invoked but had no
-    /// Rust implementation. Populated when `config.audit_missing_natives` is
-    /// true. Entries are deduped by `(class, method, descriptor)`; the first
-    /// occurrence records the caller frame as a sample call-site which is
-    /// useful for diagnosing which Java code transitively reaches the missing
-    /// native.
+    /// See [`crate::vm::realms::DebugRealm`]. Access paths are
+    /// `shared.debug.<field>`; lock types and levels are
+    /// unchanged by the move.
+    pub debug: crate::vm::realms::DebugRealm,
+    /// JIT compilation state: code cache, PGO profiles, tiering policy, deopt log and invalidation.
     ///
-    /// Schema written to disk by [`Self::dump_missing_natives_json`]:
-    ///
-    /// ```json
-    /// {
-    ///   "missing_natives": [
-    ///     {
-    ///       "class": "java/lang/Foo",
-    ///       "name": "bar",
-    ///       "descriptor": "(I)V",
-    ///       "sample_call_site": "com/example/Main.main([Ljava/lang/String;)V"
-    ///     }
-    ///   ]
-    /// }
-    /// ```
-    ///
-    /// The ordering is the order of first occurrence. Two consecutive runs on
-    /// the same program produce byte-identical JSON, which makes the file
-    /// suitable as a committed baseline that can be diffed against new
-    /// releases.
-    pub missing_natives_log: parking_lot::Mutex<Vec<MissingNativeEntry>>,
-
-    /// PGO profile store — branch and receiver type counts collected during
-    /// interpreted warmup, consumed by the JIT at compile time.
-    pub profile_store: ProfileStore,
-
-    /// Negative cache for JIT compilation: methods that failed `jit_scan` are
-    /// recorded here so subsequent invocations skip the scan entirely.
-    /// T10.9.B: FxHashSet — keys are internal (class, method, desc) triples
-    /// from already-loaded class files.
-    pub jit_skip_set: parking_lot::RwLock<FxHashSet<(Arc<str>, Arc<str>, Arc<str>)>>,
-
-    /// Tiered compilation manager — decides when and at which tier to compile.
-    pub tiered_manager: crate::jit::tiered::TieredCompilationManager,
-
-    /// Deoptimization log — records deopt events and drives adaptive recompilation.
-    pub deopt_log: parking_lot::Mutex<crate::jit::deopt::DeoptimizationLog>,
-
-    /// deopt-osr Step 9 — per-method *live* compilation epoch (a monotonic
-    /// invalidation generation), keyed by the same `"<class>.<method>:<descriptor>"`
-    /// string the deopt log uses. `DeoptimizationController::deoptimize` advances
-    /// it on every invalidation; a freshly installed `CompiledMethod` is stamped
-    /// (`CompiledMethod::compilation_epoch`) with the value live at install time.
-    /// The real-frame-deopt resume sink refuses to resume a frame whose artifact
-    /// epoch has fallen behind the live epoch — a compilation superseded since it
-    /// started — so an invalidated speculation is never resumed; it falls back to
-    /// the safe whole-method re-run. Empty + unread unless `deopt_real_enabled()`
-    /// (the resume sink that consumes it is itself gated), so production VMs are
-    /// unaffected.
-    ///
-    /// Step 9 follow-up (a): the value is a **boxed** `AtomicU64` rather than a
-    /// bare `u64` so each method's epoch lives at a STABLE heap address (a
-    /// `Box`'s payload does not move when the map rehashes, and entries are never
-    /// removed). [`Self::live_epoch_cell_ptr`] hands that address to the
-    /// `DeoptEpochGuard` baked into the method's frame-deopt stubs, so
-    /// `x64_deopt_entry` can read the live epoch lock-free, BEFORE dereferencing
-    /// the deopt box, to detect a superseded compilation.
-    pub method_epochs: parking_lot::RwLock<FxHashMap<String, Box<std::sync::atomic::AtomicU64>>>,
-    /// Shared fail-closed epoch for methods admitted after the bounded
-    /// per-method epoch table reaches capacity.
-    method_epoch_overflow: std::sync::atomic::AtomicU64,
-
-    /// Invalidation manager — tracks class-hierarchy assumptions and invalidates
-    /// dependent compiled methods when class loading breaks those assumptions.
-    pub invalidation_manager: parking_lot::Mutex<cratonvm_jit::deopt::InvalidationManager>,
-
-    /// Java Flight Recorder — records VM events (GC, thread, class loading, compilation).
-    pub flight_recorder: parking_lot::Mutex<cratonvm_jfr::FlightRecorder>,
-
-    /// JVMTI debug state — breakpoints, step requests, and event callbacks.
-    #[cfg(feature = "experimental-debug")]
-    pub debug_state: parking_lot::Mutex<crate::debug::DebugState>,
-
-    /// JVMTI environment — exposes the JVMTI interface to attached agents.
-    #[cfg(feature = "experimental-debug")]
-    pub jvmti_env: parking_lot::Mutex<crate::jvmti::JvmtiEnv>,
-
-    /// Fast-path flag: true when at least one breakpoint is active.
-    /// Checked on every interpreted instruction to skip the debug_state lock
-    /// when no breakpoints are set.
-    #[cfg(feature = "experimental-debug")]
-    pub breakpoints_active: std::sync::atomic::AtomicBool,
-
-    /// Event channel: interpreter threads send debug events here; the JDWP
-    /// server thread drains and forwards them as composite event packets.
-    #[cfg(feature = "experimental-debug")]
-    pub debug_event_tx: std::sync::Mutex<Option<std::sync::mpsc::Sender<crate::debug::DebugEvent>>>,
-    #[cfg(feature = "experimental-debug")]
-    pub debug_event_rx:
-        std::sync::Mutex<Option<std::sync::mpsc::Receiver<crate::debug::DebugEvent>>>,
-
-    /// Finalizer thread queue — objects with `finalize()` overrides are enqueued
-    /// here when the GC determines they are unreachable.  The VM drains this
-    /// queue and invokes each object's `finalize()` method (JLS §12.6).
-    pub finalizer_thread: cratonvm_gc::reference::FinalizerThread,
-
-    /// Cleaner thread queue — Cleaner actions are enqueued when the associated
-    /// referent becomes unreachable.  The VM drains and executes them.
-    pub cleaner_thread: cratonvm_gc::reference::CleanerThread,
-
-    /// Per-class initialization condition variables (JVM spec §5.5).
-    ///
-    /// When a thread starts initializing a class, it inserts an entry here.
-    /// Other threads that try to initialize the same class will wait on the
-    /// condvar until the initializing thread completes (success or error).
-    /// Entries are removed once initialization finishes.
-    /// T10.9.B: FxHashMap — ClassId-keyed.
-    /// Round-9 HIGH-4: inner `std::sync::Mutex<bool>` + `std::sync::Condvar`
-    /// migrated to `parking_lot` equivalents — removes poison handling and
-    /// yields a smaller, faster condvar with the same wait/notify API.
-    pub class_init_waiters: parking_lot::Mutex<
-        FxHashMap<ClassId, Arc<(parking_lot::Mutex<bool>, parking_lot::Condvar)>>,
-    >,
-
-    /// Diagnostic counters — atomic counters for bytecodes, GC, classes, etc.
-    pub diagnostic_counters: crate::runtime::diagnostics::DiagnosticCounters,
-
-    /// Flag to request an explicit GC at next safepoint (set by System.gc() / GC.run).
-    pub gc_requested: std::sync::atomic::AtomicBool,
-
-    /// A native array allocation crossed the occupancy threshold. The next
-    /// native-call boundary collects after pinning and remapping its arguments.
-    pub native_array_gc_requested: std::sync::atomic::AtomicBool,
-
-    /// B6: Counter of silent swallows during class init / invokedynamic / native calls.
-    /// Incremented whenever an error is swallowed (converted to a WARN) so the CLI
-    /// can surface a summary after main() completes silently. Visible via tracing
-    /// at WARN level. Setting CRATONVM_STRICT_SWALLOWS=1 escalates swallows to panics.
-    pub swallow_counter: std::sync::atomic::AtomicU64,
-
-    /// Per-class-name loading locks (Session 30: Thread-Safe Class Loading).
-    ///
-    /// When a thread starts loading a class, it acquires the per-name lock.
-    /// Other threads that try to load the *same* class will block on this lock
-    /// instead of blocking the global ClassManager write lock, which allows
-    /// concurrent loading of *different* classes to proceed without contention.
-    /// The bool inside the Mutex indicates whether loading is in-progress.
-    /// T10.9.B: FxHashMap — keys are internal class names.
-    pub class_loading_locks:
-        parking_lot::Mutex<FxHashMap<String, Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>>>,
-
-    /// T19.H1 — cross-thread stack-dump-on-timeout flag.
-    ///
-    /// Set by the CLI watchdog thread (see `--stack-dump-on-timeout`) after
-    /// the configured deadline elapses. Interpreter threads poll this flag
-    /// on every dispatch loop iteration with a cheap `Ordering::Relaxed`
-    /// load; when set, each thread writes its frame chain to stderr via
-    /// [`Self::dump_current_thread_frames`] and increments
-    /// [`stack_dump_ack_count`] so the watchdog can confirm all runtime
-    /// threads responded before calling `std::process::abort`.
-    ///
-    /// This is a diagnostic-only mechanism — the flag is one-shot and is
-    /// never cleared; the process is expected to abort soon after.
-    pub stack_dump_requested: std::sync::atomic::AtomicBool,
-
-    /// T19.H1 — count of threads that have flushed their frame dump to
-    /// stderr in response to [`stack_dump_requested`]. The watchdog uses
-    /// this to decide how long to wait for interpreter threads to respond
-    /// before aborting the process.
-    pub stack_dump_ack_count: std::sync::atomic::AtomicU32,
-
-    /// T19.3.G1 — number of TLAB refills across all threads since VM start.
-    ///
-    /// Incremented inside `tlab_alloc_object` in the interpreter each
-    /// time a thread exhausts its current TLAB and requests a new
-    /// buffer from the shared arena. Visible to `--verbose:gc` and
-    /// used by the allocation-storm regression tests to prove that
-    /// the adaptive sizer is keeping refill pressure below the
-    /// Quarkus static-init baseline (~330 Hz on the old 64 KB TLAB).
-    pub tlab_refill_count: std::sync::atomic::AtomicU64,
-
-    /// T19.3.G1 — number of TLAB fast-path (bump-only) allocations.
-    ///
-    /// Incremented on every successful `thread.tlab.alloc()` that did
-    /// not need a refill. Ratio to [`tlab_refill_count`] must stay
-    /// above ~100:1 for a healthy hot allocation loop; drops below 10:1
-    /// when the adaptive sizer is mis-tuned.
-    pub tlab_hit_count: std::sync::atomic::AtomicU64,
-
-    /// T19.3.G1 — number of minor/major GC cycles completed.
-    ///
-    /// Incremented by the interpreter's `maybe_gc` / `maybe_gc_forced`
-    /// helpers after a collection finishes. Used by the
-    /// allocation-storm regression tests to assert that GC frequency
-    /// stays below the 0.2 Hz target under synthetic 25 MB/s load.
-    pub gc_cycle_count: std::sync::atomic::AtomicU64,
-
-    /// Consecutive allocation-failure GCs that freed almost nothing (post-GC
-    /// heap still ≥98% full). When this reaches the GC-overhead limit
-    /// (`runtime::interpreter::gc_overhead_limit_exceeded`), the allocation
-    /// paths surface a catchable `OutOfMemoryError` (the pre-allocated
-    /// `singleton_oom`) instead of spinning in an O(n²) GC death-spiral on a
-    /// heap that is full of live (retained) objects. Reset to 0 by any
-    /// productive forced GC. Mirrors HotSpot's `UseGCOverheadLimit`.
-    pub gc_unproductive_streak: std::sync::atomic::AtomicU32,
-
-    /// T19.3.G1 — total bytes allocated across all TLAB and
-    /// slow-path heap allocations since VM start.
-    ///
-    /// Sampled by diagnostics and written to `--verbose:gc` after
-    /// each cycle so operators can compute allocation rate.
-    pub bytes_allocated_total: std::sync::atomic::AtomicU64,
-
-    /// T10.9.E — Per-(class, slot-index) cache of the field's declared
-    /// descriptor byte (the first byte of the JVM type descriptor:
-    /// `b'J'` for `long`, `b'D'` for `double`, `b'L'` or `b'['` for
-    /// reference types, etc.).
-    ///
-    /// Populated lazily on the first native-side field access that
-    /// resolves the descriptor via the class manager, then consulted by
-    /// `NativeContextImpl::get_field`/`set_field` on every subsequent
-    /// access to the same slot so the hot path stays O(1) after the
-    /// first resolution. Missing entries (never-seen class or index)
-    /// fall back to the legacy descriptor-unaware `get_field`/`set_field`
-    /// paths so the cache is strictly a correctness normalizer +
-    /// performance acceleration, never a correctness hazard.
-    ///
-    /// Sizing: unbounded by design — total entries are bounded by
-    /// `(loaded_classes * avg_fields)`, typically ~O(10k) for large
-    /// applications like WildFly/Keycloak. The hottest access pattern
-    /// (Unsafe-style concurrent data structures re-reading a handful
-    /// of offsets) produces at most a few dozen entries per class.
-    /// No eviction: entries are stable for the lifetime of the VM
-    /// because class bytecode is immutable after loading.
-    pub field_descriptor_cache:
-        parking_lot::RwLock<crate::runtime::fx_collections::FxHashMap<(ClassId, usize), u8>>,
-
-    /// Per-class allocation-init cache for the JIT slow-path allocators
-    /// (`jit_new_object` + the guarded TLAB-refill arm): primitive-field
-    /// default-init recipe + `has_finalizer`, computed once per class and
-    /// then read lock-free — replaces two `class_manager.read()` round trips
-    /// per slow-path allocation. See `crate::jit::alloc_class_cache`.
-    pub jit_alloc_class_cache: crate::jit::alloc_class_cache::JitAllocClassCache,
-
-    /// WP0.2 — per-class cache of `ObjectStreamClass` descriptor
-    /// mirrors. Populated by the first call to
-    /// `ObjectStreamClass.lookup(cls)` for any given class; every
-    /// subsequent lookup returns the same `ObjectRef`, matching the
-    /// real-JDK singleton-per-class semantics (`ObjectStreamClass.
-    /// Caches.localDescs`).
-    ///
-    /// See `crate::runtime::serialization::oscache` for the cache
-    /// implementation and rationale.
-    pub osc_cache: crate::runtime::serialization::OscCache,
+    /// See [`crate::vm::realms::JitRealm`]. Access paths are
+    /// `shared.jit.<field>`; lock types and levels are
+    /// unchanged by the move.
+    pub jit: crate::vm::realms::JitRealm,
 
     /// WP1.3 — JVM bootstrap init level, matching HotSpot's
     /// `VM._init_level` integer state machine:
@@ -916,8 +434,9 @@ impl SharedVm {
     /// Retain a captured Throwable trace independently of the producing Java
     /// thread. The entry is non-owning and is swept by the GC remap hook.
     pub fn store_throwable_stack_trace(&self, throwable: ObjectRef, frames: Vec<StackTraceEntry>) {
-        let hash = self.heap.identity_hash_code(throwable);
-        self.throwable_stacks
+        let hash = self.mem.heap.identity_hash_code(throwable);
+        self.threads
+            .throwable_stacks
             .write()
             .insert(hash, ThrowableStackTrace { throwable, frames });
     }
@@ -925,7 +444,8 @@ impl SharedVm {
     /// Return an owned snapshot so readers never borrow through the shared
     /// registry lock while another thread refreshes a Throwable's trace.
     pub fn throwable_stack_trace(&self, hash: i32) -> Option<Vec<StackTraceEntry>> {
-        self.throwable_stacks
+        self.threads
+            .throwable_stacks
             .read()
             .get(&hash)
             .map(|trace| trace.frames.clone())
@@ -936,14 +456,14 @@ impl SharedVm {
     /// not keep its key object alive; `is_object_address` is the collector's
     /// stable post-collection liveness probe.
     pub fn remap_and_sweep_throwable_stack_traces(&self, pointer_map: &HashMap<usize, usize>) {
-        let mut traces = self.throwable_stacks.write();
+        let mut traces = self.threads.throwable_stacks.write();
         traces.retain(|_, trace| {
             let old_addr = trace.throwable.as_ptr() as usize;
             if let Some(&new_addr) = pointer_map.get(&old_addr) {
                 trace.throwable = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
                 true
             } else {
-                self.heap.is_object_address(old_addr).is_some()
+                self.mem.heap.is_object_address(old_addr).is_some()
             }
         });
     }
@@ -1335,9 +855,7 @@ impl SharedVm {
         let direct_memory_cap = config
             .max_direct_memory_size
             .unwrap_or(config.max_heap_size);
-        cratonvm_native_io::direct_buffer::configure_max_direct_memory(
-            direct_memory_cap as i64,
-        );
+        cratonvm_native_io::direct_buffer::configure_max_direct_memory(direct_memory_cap as i64);
 
         // fork6 GC_STRESS fix — wire the SATB write barrier to the concurrent
         // old-gen cycle. `enable_concurrent_gc` previously had NO production
@@ -2304,9 +1822,7 @@ impl SharedVm {
             // `register_url_codec` is wanted here, not the whole
             // `deprecated_io_util` module (which would re-clobber
             // `deprecated_util.rs`'s correct `java/util/Date` natives).
-            cratonvm_native_builtins::deprecated_io_util::register_url_codec(
-                &mut native_methods,
-            );
+            cratonvm_native_builtins::deprecated_io_util::register_url_codec(&mut native_methods);
             cratonvm_native_builtins::register_charset_natives_pub(&mut native_methods);
             cratonvm_native_builtins::phases_late::register_p58_charset_coder(&mut native_methods);
             cratonvm_native_builtins::charset::register_real_charset_natives(&mut native_methods);
@@ -2823,111 +2339,128 @@ impl SharedVm {
             config,
             #[cfg(feature = "gpu-offload")]
             offload_registry,
-            class_manager: OrderedPlRwLock::new(class_manager, LockLevel::ClassManager),
-            heap,
-            concurrent_satb,
-            concurrent_gc_state,
-            anon_class_cache: std::array::from_fn(|_| AtomicU32::new(0)),
-            native_methods,
-            statics: RwLock::new(FxHashMap::default()),
-            resolution_cache: RwLock::new(ResolutionCache::new()),
-            throwable_stacks: RwLock::new(FxHashMap::default()),
-            // Round 8 audit fix (CRIT #2): reflective lookup cache.
-            link_resolver: LinkResolver::new(),
-            vtable_manager: std::sync::Arc::new(parking_lot::RwLock::new(
-                crate::runtime::vtable::VtableManager::new(),
-            )),
-            shared_resolution: crate::runtime::lockfree_resolve::SharedResolutionState::new(),
-            operand_stack_pool: crate::runtime::alloc_fastpath::VecPool::new(64),
-            tag_pool: crate::runtime::alloc_fastpath::VecPool::new(64),
-            monitors: MonitorTable::new(),
-            class_locks: RwLock::new(FxHashMap::default()),
-            string_pool: RwLock::new(FxHashMap::default()),
-            class_mirrors: RwLock::new(FxHashMap::default()),
-            class_mirrors_reverse: RwLock::new(FxHashMap::default()),
-            initiating_resolution_cache: RwLock::new(FxHashMap::default()),
+            classes: crate::vm::realms::ClassRealm {
+                class_manager: OrderedPlRwLock::new(class_manager, LockLevel::ClassManager),
+                anon_class_cache: std::array::from_fn(|_| AtomicU32::new(0)),
+                statics: RwLock::new(FxHashMap::default()),
+                resolution_cache: RwLock::new(ResolutionCache::new()),
+                // Round 8 audit fix (CRIT #2): reflective lookup cache.
+                link_resolver: LinkResolver::new(),
+                vtable_manager: std::sync::Arc::new(parking_lot::RwLock::new(
+                    crate::runtime::vtable::VtableManager::new(),
+                )),
+                shared_resolution: crate::runtime::lockfree_resolve::SharedResolutionState::new(),
+                class_locks: RwLock::new(FxHashMap::default()),
+                class_mirrors: RwLock::new(FxHashMap::default()),
+                class_mirrors_reverse: RwLock::new(FxHashMap::default()),
+                initiating_resolution_cache: RwLock::new(FxHashMap::default()),
+                lambda_proxies: RwLock::new(FxHashMap::default()),
+                lambda_proxy_hosts: RwLock::new(FxHashMap::default()),
+                next_lambda_id: AtomicU32::new(0x8000_0000),
+                primitive_mirrors: RwLock::new(FxHashMap::default()),
+                module_mirrors: RwLock::new(FxHashMap::default()),
+                cached_string_num_fields: AtomicUsize::new(0),
+                compact_strings: std::sync::atomic::AtomicBool::new(false),
+                cached_class_mirror_num_fields: AtomicUsize::new(0),
+                class_init_waiters: parking_lot::Mutex::new(FxHashMap::default()),
+                class_loading_locks: parking_lot::Mutex::new(FxHashMap::default()),
+                // T10.9.E — lazy per-(ClassId, slot_index) field descriptor cache.
+                field_descriptor_cache: parking_lot::RwLock::new(
+                    crate::runtime::fx_collections::FxHashMap::default(),
+                ),
+                // WP0.2 — ObjectStreamClass.lookup(cls) cache.
+                osc_cache: crate::runtime::serialization::OscCache::new(),
+            },
+            mem: crate::vm::realms::HeapRealm {
+                heap,
+                concurrent_satb,
+                concurrent_gc_state,
+
+                operand_stack_pool: crate::runtime::alloc_fastpath::VecPool::new(64),
+                tag_pool: crate::runtime::alloc_fastpath::VecPool::new(64),
+                string_pool: RwLock::new(FxHashMap::default()),
+                singleton_oom: RwLock::new(None),
+                var_handle_roots: RwLock::new(FxHashMap::default()),
+                gc_barrier: GcBarrier::new(),
+                ref_processor: OrderedPlMutex::new(
+                    cratonvm_gc::ReferenceProcessor::new(),
+                    LockLevel::RefProcessor,
+                ),
+                finalizer_thread: cratonvm_gc::reference::FinalizerThread::new(),
+                cleaner_thread: cratonvm_gc::reference::CleanerThread::new(),
+                gc_requested: std::sync::atomic::AtomicBool::new(false),
+                native_array_gc_requested: std::sync::atomic::AtomicBool::new(false),
+                // T19.3.G1 — allocation-storm observability counters.
+                tlab_refill_count: std::sync::atomic::AtomicU64::new(0),
+                tlab_hit_count: std::sync::atomic::AtomicU64::new(0),
+                gc_cycle_count: std::sync::atomic::AtomicU64::new(0),
+                gc_unproductive_streak: std::sync::atomic::AtomicU32::new(0),
+                bytes_allocated_total: std::sync::atomic::AtomicU64::new(0),
+            },
+
+            natives: crate::vm::realms::NativeRealm {
+                native_methods,
+
+                fd_table: FileDescriptorTable::new(),
+                native_memory: parking_lot::Mutex::new(crate::native::ffi::NativeMemoryTable::new()),
+                native_libraries: parking_lot::Mutex::new(Vec::new()),
+                upcall_table: parking_lot::Mutex::new(crate::native::ffi::UpcallTable::new()),
+                jni_global_refs: parking_lot::Mutex::new(crate::native::jni::JniGlobalRefs::new()),
+            },
+
+            threads: crate::vm::realms::ThreadRealm {
+                throwable_stacks: RwLock::new(FxHashMap::default()),
+                monitors: MonitorTable::new(),
+                main_thread_group: RwLock::new(None),
+                main_thread_group_init: parking_lot::Mutex::new(MainThreadGroupInit::Idle),
+                thread_registry: ThreadRegistry::new(),
+
+                virtual_scheduler: crate::threading::VirtualThreadScheduler::new_default(),
+                virtual_thread_manager: Arc::new(
+                    crate::threading::VirtualThreadManager::with_default_parallelism(),
+                ),
+            },
             system_out: RwLock::new(None),
             system_err: RwLock::new(None),
             system_in: RwLock::new(None),
-            main_thread_group: RwLock::new(None),
-            main_thread_group_init: parking_lot::Mutex::new(MainThreadGroupInit::Idle),
-            singleton_oom: RwLock::new(None),
             system_properties: RwLock::new(sys_props),
-            lambda_proxies: RwLock::new(FxHashMap::default()),
-            lambda_proxy_hosts: RwLock::new(FxHashMap::default()),
-            next_lambda_id: AtomicU32::new(0x8000_0000),
-            thread_registry: ThreadRegistry::new(),
-            primitive_mirrors: RwLock::new(FxHashMap::default()),
-            module_mirrors: RwLock::new(FxHashMap::default()),
-            var_handle_roots: RwLock::new(FxHashMap::default()),
             self_arc: RwLock::new(None),
-            oom_dump_written: std::sync::atomic::AtomicBool::new(false),
-            fd_table: FileDescriptorTable::new(),
-            gc_barrier: GcBarrier::new(),
-            jit_cache: JitCache::new(),
-            virtual_scheduler: crate::threading::VirtualThreadScheduler::new_default(),
-            virtual_thread_manager: Arc::new(
-                crate::threading::VirtualThreadManager::with_default_parallelism(),
-            ),
-            native_memory: parking_lot::Mutex::new(crate::native::ffi::NativeMemoryTable::new()),
-            native_libraries: parking_lot::Mutex::new(Vec::new()),
-            upcall_table: parking_lot::Mutex::new(crate::native::ffi::UpcallTable::new()),
-            jni_global_refs: parking_lot::Mutex::new(crate::native::jni::JniGlobalRefs::new()),
-            ref_processor: OrderedPlMutex::new(
-                cratonvm_gc::ReferenceProcessor::new(),
-                LockLevel::RefProcessor,
-            ),
-            cached_string_num_fields: AtomicUsize::new(0),
-            compact_strings: std::sync::atomic::AtomicBool::new(false),
-            cached_class_mirror_num_fields: AtomicUsize::new(0),
-            missing_natives_log: parking_lot::Mutex::new(Vec::new()),
-            profile_store: ProfileStore::new(),
-            jit_skip_set: parking_lot::RwLock::new(FxHashSet::default()),
-            // wire-tiered-manager Step 6: honor the CRATONVM_TIER_* threshold
-            // overrides (c1/c2/osr/c2_min/enabled). Identical to the default
-            // policy when the environment is unset.
-            tiered_manager: crate::jit::tiered::TieredCompilationManager::with_env_policy(),
-            deopt_log: parking_lot::Mutex::new(crate::jit::deopt::DeoptimizationLog::new()),
-            method_epochs: parking_lot::RwLock::new(FxHashMap::default()),
-            method_epoch_overflow: std::sync::atomic::AtomicU64::new(0),
-            invalidation_manager: parking_lot::Mutex::new(
-                cratonvm_jit::deopt::InvalidationManager::new(),
-            ),
-            flight_recorder: parking_lot::Mutex::new(cratonvm_jfr::create_flight_recorder()),
-            #[cfg(feature = "experimental-debug")]
-            debug_state: parking_lot::Mutex::new(crate::debug::DebugState::new()),
-            #[cfg(feature = "experimental-debug")]
-            jvmti_env: parking_lot::Mutex::new(jvmti_env),
-            #[cfg(feature = "experimental-debug")]
-            breakpoints_active: std::sync::atomic::AtomicBool::new(false),
-            #[cfg(feature = "experimental-debug")]
-            debug_event_tx: std::sync::Mutex::new(None),
-            #[cfg(feature = "experimental-debug")]
-            debug_event_rx: std::sync::Mutex::new(None),
-            finalizer_thread: cratonvm_gc::reference::FinalizerThread::new(),
-            cleaner_thread: cratonvm_gc::reference::CleanerThread::new(),
-            class_init_waiters: parking_lot::Mutex::new(FxHashMap::default()),
-            class_loading_locks: parking_lot::Mutex::new(FxHashMap::default()),
-            diagnostic_counters: crate::runtime::diagnostics::DiagnosticCounters::new(),
-            gc_requested: std::sync::atomic::AtomicBool::new(false),
-            native_array_gc_requested: std::sync::atomic::AtomicBool::new(false),
-            swallow_counter: std::sync::atomic::AtomicU64::new(0),
-            stack_dump_requested: std::sync::atomic::AtomicBool::new(false),
-            stack_dump_ack_count: std::sync::atomic::AtomicU32::new(0),
-            // T19.3.G1 — allocation-storm observability counters.
-            tlab_refill_count: std::sync::atomic::AtomicU64::new(0),
-            tlab_hit_count: std::sync::atomic::AtomicU64::new(0),
-            gc_cycle_count: std::sync::atomic::AtomicU64::new(0),
-            gc_unproductive_streak: std::sync::atomic::AtomicU32::new(0),
-            bytes_allocated_total: std::sync::atomic::AtomicU64::new(0),
-            // T10.9.E — lazy per-(ClassId, slot_index) field descriptor cache.
-            field_descriptor_cache: parking_lot::RwLock::new(
-                crate::runtime::fx_collections::FxHashMap::default(),
-            ),
-            // JIT slow-path allocation: per-class init recipe cache.
-            jit_alloc_class_cache: crate::jit::alloc_class_cache::JitAllocClassCache::new(),
-            // WP0.2 — ObjectStreamClass.lookup(cls) cache.
-            osc_cache: crate::runtime::serialization::OscCache::new(),
+            debug: crate::vm::realms::DebugRealm {
+                oom_dump_written: std::sync::atomic::AtomicBool::new(false),
+                missing_natives_log: parking_lot::Mutex::new(Vec::new()),
+                flight_recorder: parking_lot::Mutex::new(cratonvm_jfr::create_flight_recorder()),
+                #[cfg(feature = "experimental-debug")]
+                debug_state: parking_lot::Mutex::new(crate::debug::DebugState::new()),
+                #[cfg(feature = "experimental-debug")]
+                jvmti_env: parking_lot::Mutex::new(jvmti_env),
+                #[cfg(feature = "experimental-debug")]
+                breakpoints_active: std::sync::atomic::AtomicBool::new(false),
+                #[cfg(feature = "experimental-debug")]
+                debug_event_tx: std::sync::Mutex::new(None),
+                #[cfg(feature = "experimental-debug")]
+                debug_event_rx: std::sync::Mutex::new(None),
+                diagnostic_counters: crate::runtime::diagnostics::DiagnosticCounters::new(),
+                swallow_counter: std::sync::atomic::AtomicU64::new(0),
+                stack_dump_requested: std::sync::atomic::AtomicBool::new(false),
+                stack_dump_ack_count: std::sync::atomic::AtomicU32::new(0),
+            },
+            jit: crate::vm::realms::JitRealm {
+                jit_cache: JitCache::new(),
+                profile_store: ProfileStore::new(),
+                jit_skip_set: parking_lot::RwLock::new(FxHashSet::default()),
+                // wire-tiered-manager Step 6: honor the CRATONVM_TIER_* threshold
+                // overrides (c1/c2/osr/c2_min/enabled). Identical to the default
+                // policy when the environment is unset.
+                tiered_manager: crate::jit::tiered::TieredCompilationManager::with_env_policy(),
+                deopt_log: parking_lot::Mutex::new(crate::jit::deopt::DeoptimizationLog::new()),
+                method_epochs: parking_lot::RwLock::new(FxHashMap::default()),
+                method_epoch_overflow: std::sync::atomic::AtomicU64::new(0),
+                invalidation_manager: parking_lot::Mutex::new(
+                    cratonvm_jit::deopt::InvalidationManager::new(),
+                ),
+                // JIT slow-path allocation: per-class init recipe cache.
+                jit_alloc_class_cache: crate::jit::alloc_class_cache::JitAllocClassCache::new(),
+            },
             // WP1.3 — bootstrap init-level state machine. Starts at 0
             // ("VM construction in progress"); `Vm::new` bumps it to 1
             // after `SharedVm` is wrapped in `Arc` and the main thread
@@ -2993,7 +2526,7 @@ impl SharedVm {
         cratonvm_classloading::install_class_prepare_hook(class_prepare_adapter);
 
         // T10.5 — register the class loader's vtable-install hook so each
-        // class-link emits its descriptor vec into `shared.vtable_manager`.
+        // class-link emits its descriptor vec into `shared.classes.vtable_manager`.
         //
         // Two things have to be registered here, in this order:
         //   1. The global `VtableManager` Arc so the adapter has something
@@ -3006,7 +2539,7 @@ impl SharedVm {
         // be lazily replayed into the manager by the explicit catch-up
         // loop right below.
         crate::runtime::vtable::install_global_vtable_manager(std::sync::Arc::clone(
-            &vm.vtable_manager,
+            &vm.classes.vtable_manager,
         ));
         cratonvm_classloading::install_vtable_install_hook(
             crate::runtime::vtable::vtable_install_adapter,
@@ -3049,7 +2582,7 @@ impl SharedVm {
         // during ClassManager bootstrap (before the hook was live) end up
         // in the VM's VtableManager too.
         {
-            let cm = vm.class_manager.read();
+            let cm = vm.classes.class_manager.read();
             let store_len = cm.class_store.len() as u32;
             for cid in 0..store_len {
                 let cid = crate::classloading::ClassId::new(cid);
@@ -3142,7 +2675,11 @@ fn resolution_invalidate_adapter(class_id: u32) {
         None => return, // VM has been dropped; nothing to invalidate
     };
     let cid = crate::classloading::ClassId::new(class_id);
-    shared.resolution_cache.write().invalidate_class(cid);
+    shared
+        .classes
+        .resolution_cache
+        .write()
+        .invalidate_class(cid);
     // Round 8 audit fix (CRIT #3): the `LinkResolver` reflective cache
     // was missing from the redefine-invalidation cascade. Without
     // this, any cached `(class, name, descriptor)` triple resolved
@@ -3153,7 +2690,7 @@ fn resolution_invalidate_adapter(class_id: u32) {
     // `LinkResolver::invalidate_class` mirrors
     // `ResolutionCache::invalidate_class` (drops by key-class OR
     // resolved-declaring-class match).
-    shared.link_resolver.invalidate_class(cid);
+    shared.classes.link_resolver.invalidate_class(cid);
 }
 
 /// The `JitInvalidateHook` adapter handed to
@@ -3203,7 +2740,7 @@ fn jit_invalidate_adapter(class_id: u32) {
         Some(s) => s,
         None => return, // VM has been dropped; nothing to invalidate
     };
-    let evicted = shared.jit_cache.write().clear_all();
+    let evicted = shared.jit.jit_cache.write().clear_all();
     if evicted > 0 {
         tracing::debug!(
             "JIT: fully invalidated {evicted} method(s) due to a class layout \
@@ -3227,7 +2764,7 @@ fn class_info_adapter(class_id: u32) -> Option<(String, usize)> {
     let weak = RESOLUTION_INVALIDATE_VM.get()?;
     let shared = weak.upgrade()?;
     let cid = crate::classloading::ClassId::new(class_id);
-    let cm = shared.class_manager.read();
+    let cm = shared.classes.class_manager.read();
     let class = cm.class_store.get(cid)?;
     Some((class.name.to_string(), class.num_total_fields))
 }
@@ -3242,7 +2779,7 @@ impl SharedVm {
             .as_deref()
             .unwrap_or("classes.jsa");
 
-        let cm = self.class_manager.read();
+        let cm = self.classes.class_manager.read();
         let mut generator = cratonvm_native_builtins::cds::CdsArchiveGenerator::new(archive_path);
 
         // Iterate all loaded classes and add non-synthetic ones with cached bytes
@@ -3282,7 +2819,7 @@ impl SharedVm {
     /// These IDs start at 0x8000_0000 and increment, avoiding collision
     /// with real ClassIds assigned by the ClassStore.
     pub fn alloc_lambda_proxy_id(&self) -> ClassId {
-        ClassId::new(self.next_lambda_id.fetch_add(1, Ordering::Relaxed))
+        ClassId::new(self.classes.next_lambda_id.fetch_add(1, Ordering::Relaxed))
     }
 
     /// Get an `Arc<SharedVm>` from the stored weak self-reference.
@@ -3314,7 +2851,7 @@ impl SharedVm {
     /// Prints a sorted, deduplicated list of ACC_NATIVE methods that were
     /// invoked during execution but had no Rust implementation.
     pub fn dump_missing_natives(&self) {
-        let log = self.missing_natives_log.lock();
+        let log = self.debug.missing_natives_log.lock();
         if log.is_empty() {
             return;
         }
@@ -3348,7 +2885,7 @@ impl SharedVm {
     /// implementation registered. Only populated when `config.audit_missing_natives`
     /// is `true`.
     pub fn get_missing_natives(&self) -> Vec<String> {
-        let log = self.missing_natives_log.lock();
+        let log = self.debug.missing_natives_log.lock();
         let mut sigs: Vec<String> = log.iter().map(MissingNativeEntry::full_signature).collect();
         sigs.sort();
         sigs.dedup();
@@ -3386,7 +2923,7 @@ impl SharedVm {
         &self,
         path: impl AsRef<std::path::Path>,
     ) -> std::io::Result<()> {
-        let log = self.missing_natives_log.lock();
+        let log = self.debug.missing_natives_log.lock();
         let mut sorted: Vec<MissingNativeEntry> = log.clone();
         sorted.sort_by(|a, b| {
             (&a.class_name, &a.method_name, &a.descriptor).cmp(&(
@@ -3455,7 +2992,7 @@ impl SharedVm {
         path: impl AsRef<std::path::Path>,
     ) -> std::io::Result<(usize, usize, usize)> {
         use cratonvm_native_api::NativeKind;
-        let mut rows = self.native_methods.dump_registrations();
+        let mut rows = self.natives.native_methods.dump_registrations();
         rows.sort_by(|a, b| (a.0, a.1, a.2).cmp(&(b.0, b.1, b.2)));
         let mut n_intrinsic = 0usize;
         let mut n_bridge = 0usize;
@@ -3508,7 +3045,7 @@ impl SharedVm {
         descriptor: &str,
         sample_call_site: Option<String>,
     ) {
-        let mut log = self.missing_natives_log.lock();
+        let mut log = self.debug.missing_natives_log.lock();
         let already = log.iter().any(|e| {
             e.class_name == class_name && e.method_name == method_name && e.descriptor == descriptor
         });
@@ -3536,7 +3073,7 @@ impl SharedVm {
     pub fn classify_missing_natives_by_module(
         &self,
     ) -> std::collections::BTreeMap<&'static str, Vec<MissingNativeEntry>> {
-        let log = self.missing_natives_log.lock();
+        let log = self.debug.missing_natives_log.lock();
         let mut grouped: std::collections::BTreeMap<&'static str, Vec<MissingNativeEntry>> =
             std::collections::BTreeMap::new();
         for entry in log.iter() {
@@ -3810,10 +3347,15 @@ impl SharedVm {
         // only the built-in delegation chain, matching what the slow path
         // can actually produce: a hit here is always right, a miss falls
         // through to the real load below instead of a stray loader's class.
-        let fast_id = self.class_manager.read().resolve_fast_path_class_id(name);
+        let fast_id = self
+            .classes
+            .class_manager
+            .read()
+            .resolve_fast_path_class_id(name);
         if let Some(id) = fast_id {
             // Check if it's a synthetic stub that needs upgrading
             let is_synthetic = self
+                .classes
                 .class_manager
                 .read()
                 .class_store
@@ -3828,7 +3370,7 @@ impl SharedVm {
 
         // Get or create per-class-name lock
         let class_lock = {
-            let mut locks = self.class_loading_locks.lock();
+            let mut locks = self.classes.class_loading_locks.lock();
             locks
                 .entry(name.to_string())
                 .or_insert_with(|| {
@@ -3846,7 +3388,7 @@ impl SharedVm {
         // Same loader-faithful lookup as the fast path above -- see that
         // comment for why the bare `get_loaded_class_id` is unsound here.
         {
-            let cm = self.class_manager.read();
+            let cm = self.classes.class_manager.read();
             if let Some(id) = cm.resolve_fast_path_class_id(name) {
                 let is_synthetic = cm
                     .class_store
@@ -3869,7 +3411,7 @@ impl SharedVm {
             // loader-faithful lookup as the fast path above (see that
             // comment) -- a lone unrelated user-defined loader's copy must
             // not be handed back here either.
-            let cm = self.class_manager.read();
+            let cm = self.classes.class_manager.read();
             if let Some(id) = cm.resolve_fast_path_class_id(name) {
                 let is_synthetic = cm
                     .class_store
@@ -3936,7 +3478,7 @@ impl SharedVm {
         }
 
         // Actually load the class (this takes the global write lock briefly)
-        let mut cm_guard = self.class_manager.write();
+        let mut cm_guard = self.classes.class_manager.write();
         let result = cm_guard.load_class(name);
         drop(cm_guard);
 
@@ -3956,7 +3498,7 @@ impl SharedVm {
         if let Ok(class_id) = &result {
             #[cfg(feature = "experimental-debug")]
             {
-                let env = self.jvmti_env.lock();
+                let env = self.debug.jvmti_env.lock();
                 if env
                     .event_manager
                     .is_enabled(crate::jvmti::JvmtiEvent::ClassLoad)
@@ -3980,12 +3522,13 @@ impl SharedVm {
             // devirtualized under the assumption that `A` had no
             // subclasses, loading `B` breaks that assumption.
             let superclass = self
+                .classes
                 .class_manager
                 .read()
                 .get_class(*class_id)
                 .and_then(|c| c.superclass.map(|s| s.to_string()));
             {
-                let mut jit = self.jit_cache.write();
+                let mut jit = self.jit.jit_cache.write();
                 let _ = jit.invalidate_for_class_change(name);
                 if let Some(ref sup) = superclass {
                     let _ = jit.invalidate_for_class_change(sup);
@@ -4018,7 +3561,7 @@ impl SharedVm {
             #[cfg(feature = "gpu-offload")]
             {
                 let class_id = *class_id;
-                let cm = self.class_manager.read();
+                let cm = self.classes.class_manager.read();
                 if let Some(class) = cm.get_class(class_id) {
                     crate::runtime::offload::maybe_warmup_gpu(self, class, class_id);
                 }
@@ -4036,7 +3579,7 @@ impl SharedVm {
         // guard drop so waiters have already been notified.
         if Arc::strong_count(&class_lock) <= 2 {
             // 2 = our local + the HashMap entry — no other thread holds it
-            self.class_loading_locks.lock().remove(name);
+            self.classes.class_loading_locks.lock().remove(name);
         }
 
         result
@@ -4048,7 +3591,7 @@ impl SharedVm {
     /// The object address is registered with the reference processor as a
     /// Finalizer reference so GC can enqueue it for `finalize()` invocation.
     pub fn register_finalizable(&self, obj_addr: usize) {
-        let mut rp = self.ref_processor.lock();
+        let mut rp = self.mem.ref_processor.lock();
         rp.discover_reference(
             cratonvm_gc::reference::ReferenceType::Finalizer,
             obj_addr, // reference_obj = the object itself
@@ -4065,10 +3608,10 @@ impl SharedVm {
     pub fn drain_finalizers(&self) -> usize {
         // Move objects from ref_processor's finalization_queue to the
         // FinalizerThread queue (mirrors HotSpot's two-stage pipeline).
-        let mut rp = self.ref_processor.lock();
+        let mut rp = self.mem.ref_processor.lock();
         let mut count = 0usize;
         while let Some(obj_addr) = rp.dequeue_for_finalization() {
-            self.finalizer_thread.enqueue(obj_addr);
+            self.mem.finalizer_thread.enqueue(obj_addr);
             count += 1;
         }
         count
@@ -4077,7 +3620,7 @@ impl SharedVm {
     /// Drain the cleaner queue and return the addresses of cleaner actions
     /// to execute.  The caller is responsible for actually running them.
     pub fn drain_cleaners(&self) -> Vec<usize> {
-        self.cleaner_thread.drain_actions()
+        self.mem.cleaner_thread.drain_actions()
     }
 
     /// Process all reference types after a GC marking phase.
@@ -4090,17 +3633,17 @@ impl SharedVm {
         free_heap_mb: usize,
         current_time_ms: u64,
     ) {
-        let mut rp = self.ref_processor.lock();
+        let mut rp = self.mem.ref_processor.lock();
         let result = rp.process_references(is_marked, free_heap_mb, current_time_ms);
 
         // Enqueue objects needing finalization
         for obj_addr in &result.to_finalize {
-            self.finalizer_thread.enqueue(*obj_addr);
+            self.mem.finalizer_thread.enqueue(*obj_addr);
         }
 
         // Submit cleaner actions
         for action_addr in &result.cleaner_actions {
-            self.cleaner_thread.submit_action(*action_addr);
+            self.mem.cleaner_thread.submit_action(*action_addr);
         }
     }
 }
@@ -4114,10 +3657,10 @@ impl SharedVm {
         event: crate::jit::deopt::DeoptEvent,
         tiered_key: &crate::jit::tiered::MethodKey,
     ) -> crate::jit::deopt::DeoptAction {
-        let mut log = self.deopt_log.lock();
+        let mut log = self.jit.deopt_log.lock();
         let action = log.recommend_action(method_key, event.reason);
         log.record_deopt(method_key, event);
-        self.tiered_manager.on_deoptimization(tiered_key);
+        self.jit.tiered_manager.on_deoptimization(tiered_key);
         action
     }
 
@@ -4125,12 +3668,14 @@ impl SharedVm {
     /// (`"<class>.<method>:<descriptor>"`), `0` if the method has never been
     /// invalidated. See [`Self::method_epochs`].
     pub fn compilation_epoch_for(&self, method_key: &str) -> u64 {
-        self.method_epochs
+        self.jit
+            .method_epochs
             .read()
             .get(method_key)
             .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
             .unwrap_or_else(|| {
-                self.method_epoch_overflow
+                self.jit
+                    .method_epoch_overflow
                     .load(std::sync::atomic::Ordering::Relaxed)
             })
     }
@@ -4141,16 +3686,17 @@ impl SharedVm {
     /// `DeoptimizationController::deoptimize`). See [`Self::method_epochs`].
     pub fn bump_compilation_epoch(&self, method_key: &str) -> u64 {
         const METHOD_EPOCH_CAP: usize = 65_536;
-        let mut map = self.method_epochs.write();
+        let mut map = self.jit.method_epochs.write();
         if !map.contains_key(method_key) && map.len() >= METHOD_EPOCH_CAP {
             return self
+                .jit
                 .method_epoch_overflow
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                 + 1;
         }
-        let cell = map.entry(method_key.to_string()).or_insert_with(|| {
-            Box::new(std::sync::atomic::AtomicU64::new(0))
-        });
+        let cell = map
+            .entry(method_key.to_string())
+            .or_insert_with(|| Box::new(std::sync::atomic::AtomicU64::new(0)));
         // fetch_add returns the PREVIOUS value; the new live epoch is +1.
         cell.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
     }
@@ -4164,9 +3710,9 @@ impl SharedVm {
     /// `deopt_real_enabled()` (at install, by `stamp_compilation_epoch`).
     pub fn live_epoch_cell_ptr(&self, method_key: &str) -> *const std::sync::atomic::AtomicU64 {
         const METHOD_EPOCH_CAP: usize = 65_536;
-        let mut map = self.method_epochs.write();
+        let mut map = self.jit.method_epochs.write();
         if !map.contains_key(method_key) && map.len() >= METHOD_EPOCH_CAP {
-            return &self.method_epoch_overflow;
+            return &self.jit.method_epoch_overflow;
         }
         let cell = map
             .entry(method_key.to_string())
@@ -4191,14 +3737,19 @@ impl SharedVm {
         // Resolve ClassId — if the class isn't loaded yet (e.g. a caller
         // invoked us before registration completed), there can be no
         // LeafClass assumption on it, so there's nothing to evict.
-        let class_id_u32: u32 = match self.class_manager.read().get_loaded_class_id(class_name) {
+        let class_id_u32: u32 = match self
+            .classes
+            .class_manager
+            .read()
+            .get_loaded_class_id(class_name)
+        {
             Some(cid) => cid.as_u32(),
             None => return 0,
         };
 
         // Ask the invalidation manager which method keys are now invalid.
         let invalidated_keys: Vec<String> = {
-            let inv = self.invalidation_manager.lock();
+            let inv = self.jit.invalidation_manager.lock();
             inv.on_class_loaded(class_id_u32)
         };
         if invalidated_keys.is_empty() {
@@ -4208,7 +3759,7 @@ impl SharedVm {
         // Parse each "<class>.<method>:<descriptor>" key and remove the
         // matching entry from the JIT cache.
         let mut evicted = 0usize;
-        let mut jit = self.jit_cache.write();
+        let mut jit = self.jit.jit_cache.write();
         for key in &invalidated_keys {
             // Split on the last ':' to isolate the descriptor (the descriptor
             // itself may not contain ':', but the class name / method name
@@ -4226,6 +3777,7 @@ impl SharedVm {
             };
             let before = jit.len();
             let part_class_id = self
+                .classes
                 .class_manager
                 .read()
                 .get_loaded_class_id(class_part)
@@ -4253,8 +3805,8 @@ impl SharedVm {
             return 0;
         }
 
-        let snapshots = self.profile_store.snapshot_all();
-        let class_mgr = self.class_manager.read();
+        let snapshots = self.jit.profile_store.snapshot_all();
+        let class_mgr = self.classes.class_manager.read();
 
         // Collect branch data
         let mut _branch_entries: Vec<(&str, &str, u32, u32, u32)> = Vec::new();
@@ -4341,7 +3893,8 @@ impl SharedVm {
     /// the configured deadline elapses. The flag is sticky and never
     /// cleared — the process is expected to abort shortly after.
     pub fn request_stack_dump(&self) {
-        self.stack_dump_requested
+        self.debug
+            .stack_dump_requested
             .store(true, std::sync::atomic::Ordering::Release);
         // KC16-watchdog: also wake every thread parked in Object.wait().
         // The interpreter top-of-loop poll only fires when the thread is
@@ -4356,10 +3909,10 @@ impl SharedVm {
         // line above signals, so without this they stay invisible to the
         // watchdog. They wake, emit their park-site snapshot / current
         // frames, and the process aborts right after.
-        self.thread_registry.unpark_all_for_stack_dump();
+        self.threads.thread_registry.unpark_all_for_stack_dump();
         // Summarize every registered thread (incl. those with no dumpable
         // interpreter frames — blocked in a native lock, or never started).
-        self.thread_registry.dump_thread_summary_to_stderr();
+        self.threads.thread_registry.dump_thread_summary_to_stderr();
     }
 
     /// T19.H1 — fast-path check used by the interpreter hot loop.
@@ -4370,7 +3923,8 @@ impl SharedVm {
     /// dispatched bytecode (the typical case is `false` forever).
     #[inline(always)]
     pub fn stack_dump_pending(&self) -> bool {
-        self.stack_dump_requested
+        self.debug
+            .stack_dump_requested
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
@@ -4487,13 +4041,15 @@ impl SharedVm {
         let _ = handle.write_all(footer.as_bytes());
         let _ = handle.flush();
 
-        self.stack_dump_ack_count
+        self.debug
+            .stack_dump_ack_count
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     }
 
     /// T19.H1 — count of threads that have completed their dump.
     pub fn stack_dump_ack_count(&self) -> u32 {
-        self.stack_dump_ack_count
+        self.debug
+            .stack_dump_ack_count
             .load(std::sync::atomic::Ordering::Acquire)
     }
 }
@@ -4569,6 +4125,7 @@ pub fn dump_wait_site_thread_local(shared: &SharedVm) {
         let _ = handle.write_all(buf.as_bytes());
         let _ = handle.flush();
         shared
+            .debug
             .stack_dump_ack_count
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     } else {
@@ -4592,11 +4149,11 @@ impl SharedVm {
     /// monitor target for static synchronized methods (which have no `this`).
     pub fn get_class_lock_object(&self, class_id: ClassId) -> ObjectRef {
         // Fast path: check if we already have a lock object
-        if let Some(&obj) = self.class_locks.read().get(&class_id) {
+        if let Some(&obj) = self.classes.class_locks.read().get(&class_id) {
             return obj;
         }
         // Slow path: allocate one
-        let mut locks = self.class_locks.write();
+        let mut locks = self.classes.class_locks.write();
         // Double-check after acquiring write lock
         if let Some(&obj) = locks.get(&class_id) {
             return obj;
@@ -4606,11 +4163,12 @@ impl SharedVm {
         // creating zero-slot "instances" of fieldful classes, which the GC
         // reports as undersized object layouts when scanning class-lock roots.
         let lock_class_id = self
+            .classes
             .class_manager
             .read()
             .get_loaded_class_id("java/lang/Object")
             .unwrap_or(ClassId::new(0));
-        let obj = self.heap.alloc_object(lock_class_id, 0);
+        let obj = self.mem.heap.alloc_object(lock_class_id, 0);
         locks.insert(class_id, obj);
         obj
     }
@@ -4690,7 +4248,7 @@ impl SharedVm {
         // present (pure synthetic-jdk mode) the load fails harmlessly
         // and we fall back to the 1-field synthetic stub below.
         let _ = self.load_class_concurrent("java/io/PrintStream");
-        let ps_class_id = self.class_manager.write().ensure_synthetic_class(
+        let ps_class_id = self.classes.class_manager.write().ensure_synthetic_class(
             "java/io/PrintStream",
             1, // 1 field: fd_id — used only when the real class isn't loaded
         );
@@ -4699,13 +4257,13 @@ impl SharedVm {
         // stay in-bounds. `max(1)` guarantees slot 0 (our fd tag) is always
         // writable even for synthetic stub classes declared with 0 fields.
         let num_fields = {
-            let cm = self.class_manager.read();
+            let cm = self.classes.class_manager.read();
             cm.get_class(ps_class_id)
                 .map(|c| c.num_total_fields.max(1))
                 .unwrap_or(1)
         };
-        let out_obj = self.heap.alloc_object(ps_class_id, num_fields);
-        let err_obj = self.heap.alloc_object(ps_class_id, num_fields);
+        let out_obj = self.mem.heap.alloc_object(ps_class_id, num_fields);
+        let err_obj = self.mem.heap.alloc_object(ps_class_id, num_fields);
         // Store fd_id: stdout=1, stderr=2 at slot 0 so the synthetic-jdk
         // natives (which read field 0 in `native-io/src/lib.rs`) keep
         // working. The real-JDK native-override path uses pointer
@@ -4727,8 +4285,8 @@ impl SharedVm {
             .and_then(|l| l.field_is_ref(0))
             .unwrap_or(false);
         if !slot0_is_ref {
-            self.heap.set_field(out_obj, 0, Value::Int(1));
-            self.heap.set_field(err_obj, 0, Value::Int(2));
+            self.mem.heap.set_field(out_obj, 0, Value::Int(1));
+            self.mem.heap.set_field(err_obj, 0, Value::Int(2));
         }
         *out = Some(out_obj);
         *err = Some(err_obj);
@@ -4753,7 +4311,7 @@ impl SharedVm {
         // static slot by name so this is robust to the real-JDK field layout;
         // a missing field (pure synthetic-jdk System stub) is skipped harmlessly.
         let sys_initial_err_slot = {
-            let cm = self.class_manager.read();
+            let cm = self.classes.class_manager.read();
             cm.get_loaded_class_id("java/lang/System").and_then(|sid| {
                 cm.get_class(sid).and_then(|c| {
                     let mut static_idx = 0usize;
@@ -4794,11 +4352,16 @@ impl SharedVm {
         thread_obj: ObjectRef,
     ) -> Option<std::sync::Arc<crate::threading::ParkState>> {
         if let Some(java_tid) = super::vm_exec::read_java_thread_tid(self, thread_obj) {
-            if let Some(ps) = self.thread_registry.find_park_state_by_java_tid(java_tid) {
+            if let Some(ps) = self
+                .threads
+                .thread_registry
+                .find_park_state_by_java_tid(java_tid)
+            {
                 return Some(ps);
             }
         }
-        self.thread_registry
+        self.threads
+            .thread_registry
             .find_park_state_by_thread_obj(thread_obj)
     }
 }
@@ -5004,14 +4567,14 @@ impl SharedVm {
     ///
     /// Retained as a compatibility alias: the field is now an
     /// [`OrderedPlRwLock`] at [`LockLevel::ClassManager`], so a plain
-    /// `shared.class_manager.read()` is already order-checked and this helper
+    /// `shared.classes.class_manager.read()` is already order-checked and this helper
     /// adds nothing. Taking a *second* rank scope here would double-record L10
     /// and trip the same-level assertion.
     #[inline]
     pub fn class_manager_read_ranked(
         &self,
     ) -> crate::runtime::lock_order::OrderedPlRwLockReadGuard<'_, ClassManager> {
-        self.class_manager.read()
+        self.classes.class_manager.read()
     }
 
     /// Acquire `class_manager` (L10) for write. See
@@ -5020,21 +4583,21 @@ impl SharedVm {
     pub fn class_manager_write_ranked(
         &self,
     ) -> crate::runtime::lock_order::OrderedPlRwLockWriteGuard<'_, ClassManager> {
-        self.class_manager.write()
+        self.classes.class_manager.write()
     }
 
     /// Acquire `ref_processor` (L7).
     ///
     /// Retained as a compatibility alias: the field is now an
     /// [`OrderedPlMutex`] at [`LockLevel::RefProcessor`], so a plain
-    /// `shared.ref_processor.lock()` is already order-checked and this helper
+    /// `shared.mem.ref_processor.lock()` is already order-checked and this helper
     /// adds nothing. Taking a *second* rank scope here would double-record L7
     /// and trip the same-level assertion.
     #[inline]
     pub fn ref_processor_lock_ranked(
         &self,
     ) -> crate::runtime::lock_order::OrderedPlMutexGuard<'_, cratonvm_gc::ReferenceProcessor> {
-        self.ref_processor.lock()
+        self.mem.ref_processor.lock()
     }
 
     /// Enter the `monitors` rank scope. The monitor table itself uses
@@ -5065,7 +4628,7 @@ impl SharedVm {
     ) -> RankedGuard<parking_lot::MutexGuard<'_, cratonvm_jfr::FlightRecorder>> {
         let rank = ranked_locks::enter(ranked_locks::FLIGHT_RECORDER);
         RankedGuard {
-            lock: self.flight_recorder.lock(),
+            lock: self.debug.flight_recorder.lock(),
             rank_scope: rank,
         }
     }
@@ -5080,7 +4643,7 @@ impl SharedVm {
     ) -> RankedGuard<parking_lot::MutexGuard<'_, crate::native::ffi::NativeMemoryTable>> {
         let rank = ranked_locks::enter(ranked_locks::NATIVE_MEMORY);
         RankedGuard {
-            lock: self.native_memory.lock(),
+            lock: self.natives.native_memory.lock(),
             rank_scope: rank,
         }
     }
@@ -5089,9 +4652,12 @@ impl SharedVm {
 impl std::fmt::Debug for SharedVm {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SharedVm")
-            .field("classes_loaded", &self.class_manager.read().loaded_count())
-            .field("heap_bytes", &self.heap.allocated_bytes())
-            .field("native_methods", &self.native_methods.len())
+            .field(
+                "classes_loaded",
+                &self.classes.class_manager.read().loaded_count(),
+            )
+            .field("heap_bytes", &self.mem.heap.allocated_bytes())
+            .field("native_methods", &self.natives.native_methods.len())
             .finish()
     }
 }
@@ -5132,11 +4698,12 @@ impl Vm {
             };
             ctx.deposit_root_snapshot();
         }
-        if self.shared.gc_barrier.mark_blocked_region_enter() {
+        if self.shared.mem.gc_barrier.mark_blocked_region_enter() {
             // GCAUDIT-0711-FIX (finding 1a): auto - the deposit above
             // already raised in_blocked_region.
             let _ = self
                 .shared
+                .mem
                 .gc_barrier
                 .arrive_and_wait_auto(self.main_thread.thread_id);
         }
@@ -5144,7 +4711,7 @@ impl Vm {
 
     /// Leave a region opened by [`Self::begin_main_thread_blocking_region`].
     pub fn end_main_thread_blocking_region(&mut self) {
-        self.shared.gc_barrier.mark_blocked_region_leave();
+        self.shared.mem.gc_barrier.mark_blocked_region_leave();
         let mut ctx = crate::vm::vm_exec::NativeContextImpl {
             shared: &self.shared,
             thread: &mut self.main_thread,
@@ -5175,7 +4742,7 @@ impl Vm {
         // Round 4 audit fix (CRIT) — publish the same weak handle to the
         // module-private slot used by `resolution_invalidate_adapter` so
         // JVMTI `RedefineClasses` can reach back into
-        // `shared.resolution_cache` and drop stale resolutions.
+        // `shared.classes.resolution_cache` and drop stale resolutions.
         // Idempotent — first writer wins, repeated calls (e.g. test
         // fixtures that build multiple Vms in-process) are silently
         // ignored, which matches the global vtable hook pattern.
@@ -5206,37 +4773,46 @@ impl Vm {
 
         // Register the main thread (id 0) in the thread registry.
         let main_thread = Box::new(JvmThread::new(ThreadId(0), "main"));
-        shared.thread_registry.register(ThreadId(0), "main", None);
+        shared
+            .threads
+            .thread_registry
+            .register(ThreadId(0), "main", None);
         // Share the interrupted flag so cross-thread interrupt works on the main thread
         shared
+            .threads
             .thread_registry
             .set_interrupted_flag(ThreadId(0), main_thread.interrupted.clone());
         // Share the park state so LockSupport.unpark(mainThread) works
         shared
+            .threads
             .thread_registry
             .set_park_state(ThreadId(0), main_thread.park_state.clone());
         // Share root snapshot so GC cross-thread collection includes main thread roots
         shared
+            .threads
             .thread_registry
             .set_root_snapshot(ThreadId(0), main_thread.root_snapshot.clone());
         // Match spawned threads: the watchdog summary and cross-thread stack
         // probes must see the primordial thread's parked Java frames too.
         shared
+            .threads
             .thread_registry
             .set_frame_trace(ThreadId(0), main_thread.frame_trace.clone());
         shared
+            .threads
             .thread_registry
             .set_vm_state(ThreadId(0), main_thread.vm_state.clone());
         // Share blocked-region GC state so initiators can maintain the main
         // thread's roots while it parks in a blocking native (wait/join/park)
         shared
+            .threads
             .thread_registry
             .set_gc_block_state(ThreadId(0), main_thread.gc_block_state.clone());
         // A worker-initiated non-moving GC can forcibly stop the primordial
         // thread in JIT code. Publish its reserved TLAB tail just as we do for
         // workers and JNI-attached threads. The Box keeps this pointee stable
         // across the return/moves of `Vm::new`.
-        shared.thread_registry.set_tlab_addr(
+        shared.threads.thread_registry.set_tlab_addr(
             ThreadId(0),
             &main_thread.tlab as *const cratonvm_gc::Tlab as usize,
         );
@@ -5244,13 +4820,17 @@ impl Vm {
         // too (the same Box keeps it stable) so a worker-initiated takeover
         // that freezes main mid-JIT can walk its interpreter frames.
         shared
+            .threads
             .thread_registry
             .set_jvm_thread_addr(ThreadId(0), &*main_thread as *const JvmThread as usize);
         // Publish the primordial thread's OS id too. A worker can initiate a
         // multi-threaded STW while the main thread is running JIT code; without
         // this id the takeover backend can freeze and scan main but cannot prove
         // it was part of the counted barrier snapshot.
-        shared.thread_registry.set_os_tid_current(ThreadId(0));
+        shared
+            .threads
+            .thread_registry
+            .set_os_tid_current(ThreadId(0));
 
         // Start JDWP debug server if configured
         #[cfg(feature = "experimental-debug")]
@@ -5312,7 +4892,7 @@ impl Vm {
         // scope while keeping the field non-zero so the consumer-side
         // schema check passes.
         let total = shared.config.max_heap_size as i64;
-        let mut jfr = shared.flight_recorder.lock();
+        let mut jfr = shared.debug.flight_recorder.lock();
         cratonvm_jfr::builtin::emit_physical_memory_event(&mut jfr, total, total, now_ns);
 
         // Round-5 JFR Fix 4: emit `jdk.InitialEnvironmentVariable` for
@@ -5353,6 +4933,7 @@ impl Vm {
     /// Get the name of a class by its id.
     pub fn class_name(&self, class_id: ClassId) -> Option<String> {
         self.shared
+            .classes
             .class_manager
             .read()
             .get_class(class_id)
@@ -5366,18 +4947,20 @@ impl Vm {
         let class_id = self.shared.load_class_concurrent(class_name)?;
         let num_fields = self
             .shared
+            .classes
             .class_manager
             .read()
             .get_class(class_id)
             .map(|c| c.num_total_fields)
             .unwrap_or(0);
-        let obj_ref = self.shared.heap.alloc_object(class_id, num_fields);
+        let obj_ref = self.shared.mem.heap.alloc_object(class_id, num_fields);
         Ok(obj_ref)
     }
 
     /// Allocate a new primitive array.
     pub fn new_array(&mut self, element_type: ArrayElementType, length: usize) -> ObjectRef {
         self.shared
+            .mem
             .heap
             .alloc_array(ClassId::new(0), element_type, length)
     }
@@ -5385,6 +4968,7 @@ impl Vm {
     /// Allocate a new reference array of the given component class.
     pub fn new_ref_array(&mut self, component_class_id: ClassId, length: usize) -> ObjectRef {
         self.shared
+            .mem
             .heap
             .alloc_array(component_class_id, ArrayElementType::Reference, length)
     }
@@ -5438,15 +5022,16 @@ impl Vm {
         // First transfer from ref_processor → finalizer_thread
         self.shared.drain_finalizers();
 
-        while let Some(obj_addr) = self.shared.finalizer_thread.dequeue() {
+        while let Some(obj_addr) = self.shared.mem.finalizer_thread.dequeue() {
             // SAFETY: obj_addr was obtained from a heap allocation and registered
             // by register_finalizable, so the pointer is valid.
             let obj_ref = unsafe { ObjectRef::from_raw(obj_addr as *mut u8) };
-            let class_id = self.shared.heap.class_id_of(obj_ref);
+            let class_id = self.shared.mem.heap.class_id_of(obj_ref);
 
             // Look up the class name for virtual dispatch of finalize()
             let class_name = self
                 .shared
+                .classes
                 .class_manager
                 .read()
                 .get_class(class_id)
@@ -5456,7 +5041,7 @@ impl Vm {
                 // Virtual dispatch: invoke finalize()V on the actual class.
                 // Errors from finalize() are silently swallowed per JLS §12.6.
                 // Track execution time to detect long-running finalizers.
-                let timeout_ms = self.shared.finalizer_thread.timeout_ms();
+                let timeout_ms = self.shared.mem.finalizer_thread.timeout_ms();
                 let start = std::time::Instant::now();
                 let _ = self.invoke(&name, "finalize", "()V", &[Value::Object(Some(obj_ref))]);
                 let elapsed = start.elapsed().as_millis() as u64;
@@ -5497,7 +5082,7 @@ impl Vm {
     /// only; use [`Vm::instance_field_index_desc`] to disambiguate a shadowed
     /// same-name field by its descriptor.
     pub fn instance_field_index(&self, class_id: ClassId, field_name: &str) -> Option<usize> {
-        let cm = self.shared.class_manager.read();
+        let cm = self.shared.classes.class_manager.read();
         super::vm_exec::resolve_field_index_in_hierarchy(class_id, field_name, &cm.class_store)
     }
 
@@ -5515,7 +5100,7 @@ impl Vm {
         field_name: &str,
         descriptor: Option<&str>,
     ) -> Option<usize> {
-        let cm = self.shared.class_manager.read();
+        let cm = self.shared.classes.class_manager.read();
         super::vm_exec::resolve_field_index_in_hierarchy_desc(
             class_id,
             field_name,
@@ -5528,6 +5113,7 @@ impl Vm {
     /// range `[0, count)` for the instance-field accessors.
     pub fn instance_field_count(&self, class_id: ClassId) -> usize {
         self.shared
+            .classes
             .class_manager
             .read()
             .get_class(class_id)
@@ -5537,7 +5123,7 @@ impl Vm {
 
     /// Read instance-field slot `index` of `obj`.
     pub fn get_instance_field(&self, obj: ObjectRef, index: usize) -> Value {
-        self.shared.heap.get_field(obj, index)
+        self.shared.mem.heap.get_field(obj, index)
     }
 
     /// Write `value` into instance-field slot `index` of `obj`, **GC-barrier
@@ -5550,15 +5136,16 @@ impl Vm {
     pub fn set_instance_field(&self, obj: ObjectRef, index: usize, value: Value) {
         // SATB pre-barrier on the old reference (no-op for primitives/null and
         // for non-SATB collectors), mirroring `interpreter.rs` putfield.
-        let old = self.shared.heap.get_field(obj, index);
+        let old = self.shared.mem.heap.get_field(obj, index);
         if let Value::Object(Some(old_ref)) = old {
             self.shared
+                .mem
                 .heap
                 .write_barrier_pre(std::ptr::null_mut(), old_ref);
         }
         // The post write-barrier (card marking / remembered set) fires inside
         // `set_field` itself.
-        self.shared.heap.set_field(obj, index, value);
+        self.shared.mem.heap.set_field(obj, index, value);
     }
 
     // ----- Class initialization (delegating to free functions) ---------------
@@ -5573,6 +5160,7 @@ impl Vm {
     /// Check if `child_id` is a subclass of (or implements) `parent_id`.
     pub fn is_subclass_of(&self, child_id: ClassId, parent_id: ClassId) -> bool {
         self.shared
+            .classes
             .class_manager
             .read()
             .is_subclass_of(child_id, parent_id)
@@ -5580,7 +5168,7 @@ impl Vm {
 
     /// Display-friendly snapshot of one frame in a captured Throwable trace.
     pub fn throwable_stack_for(&self, throwable: ObjectRef) -> Option<Vec<StackTraceFrame>> {
-        let h = self.shared.heap.identity_hash_code(throwable);
+        let h = self.shared.mem.heap.identity_hash_code(throwable);
         let frames = self.shared.throwable_stack_trace(h)?;
         Some(
             frames
@@ -5618,10 +5206,10 @@ impl std::fmt::Debug for Vm {
         f.debug_struct("Vm")
             .field(
                 "classes_loaded",
-                &self.shared.class_manager.read().loaded_count(),
+                &self.shared.classes.class_manager.read().loaded_count(),
             )
-            .field("heap_bytes", &self.shared.heap.allocated_bytes())
-            .field("native_methods", &self.shared.native_methods.len())
+            .field("heap_bytes", &self.shared.mem.heap.allocated_bytes())
+            .field("native_methods", &self.shared.natives.native_methods.len())
             .field("printed_values", &self.main_thread.printed.len())
             .finish()
     }
@@ -5704,11 +5292,11 @@ impl crate::runtime::serviceability::VmDiagnosticState for SharedVm {
     fn thread_snapshots(&self) -> Vec<crate::runtime::serviceability::ThreadSnapshot> {
         use crate::runtime::serviceability::{ThreadSnapshot, ThreadState};
 
-        let names = self.thread_registry.all_thread_names();
+        let names = self.threads.thread_registry.all_thread_names();
         let mut snapshots = Vec::with_capacity(names.len());
 
         for (tid, name) in &names {
-            let alive = self.thread_registry.is_alive(*tid);
+            let alive = self.threads.thread_registry.is_alive(*tid);
             let state = if alive {
                 ThreadState::Runnable
             } else {
@@ -5751,11 +5339,11 @@ impl crate::runtime::serviceability::VmDiagnosticState for SharedVm {
     fn heap_summary(&self) -> crate::runtime::serviceability::HeapSummary {
         use crate::runtime::serviceability::HeapSummary;
 
-        let (young_used, young_cap) = self.heap.young_gen_stats();
-        let (old_used, old_cap) = self.heap.old_gen_stats();
+        let (young_used, young_cap) = self.mem.heap.young_gen_stats();
+        let (old_used, old_cap) = self.mem.heap.old_gen_stats();
         // Metaspace approximation: count loaded classes × estimated per-class overhead
         let class_count = {
-            let cm = self.class_manager.read();
+            let cm = self.classes.class_manager.read();
             cm.loaded_count()
         };
         let metaspace_used = class_count * 4096; // ~4 KB per class average
@@ -5777,7 +5365,7 @@ impl crate::runtime::serviceability::VmDiagnosticState for SharedVm {
         use crate::runtime::serviceability::ClassHistogramEntry;
 
         // Walk all heap objects and build per-class histogram
-        let walked = self.heap.walk_objects();
+        let walked = self.mem.heap.walk_objects();
         let mut histogram: HashMap<u32, (String, u64, u64)> = HashMap::new();
 
         for &(ptr, size) in &walked {
@@ -5785,7 +5373,7 @@ impl crate::runtime::serviceability::VmDiagnosticState for SharedVm {
             let cid = header.class_id.as_u32();
             let entry = histogram.entry(cid).or_insert_with(|| {
                 let name = {
-                    let cm = self.class_manager.read();
+                    let cm = self.classes.class_manager.read();
                     cm.get_class(crate::classloading::ClassId::new(cid))
                         .map(|c| c.name.to_string())
                         .unwrap_or_else(|| format!("class#{}", cid))
@@ -5812,13 +5400,14 @@ impl crate::runtime::serviceability::VmDiagnosticState for SharedVm {
 
     fn trigger_gc(&self) -> bool {
         // Set the flag — interpreter's maybe_gc will pick it up at the next safepoint
-        self.gc_requested
+        self.mem
+            .gc_requested
             .store(true, std::sync::atomic::Ordering::Relaxed);
         true
     }
 
     fn uptime_secs(&self) -> f64 {
-        self.diagnostic_counters.uptime_secs()
+        self.debug.diagnostic_counters.uptime_secs()
     }
 
     fn command_line(&self) -> String {
@@ -5882,10 +5471,10 @@ impl crate::runtime::serviceability::VmDiagnosticState for SharedVm {
         use cratonvm_gc::heap::{ObjectHeader, ObjectKind, HEADER_SIZE, SLOT_SIZE};
 
         // Step 1: Walk all heap objects
-        let walked = self.heap.walk_objects();
+        let walked = self.mem.heap.walk_objects();
 
         // Step 2: Build class info from ClassManager
-        let cm = self.class_manager.read();
+        let cm = self.classes.class_manager.read();
         let mut classes: Vec<HprofClassInfo> = Vec::new();
         let mut class_ids_seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
 
@@ -6153,7 +5742,7 @@ mod tests {
     #[test]
     fn shared_vm_default_config() {
         let shared = SharedVm::new(VmConfig::default());
-        assert!(shared.native_methods.len() > 0);
+        assert!(shared.natives.native_methods.len() > 0);
         // C25 synthetic stubs plus wired super/interfaces (`Enumeration$Impl`,
         // `java/lang/Object`, `java/util/Enumeration`, `Comparator$Native`,
         // `java/util/Comparator`), PLUS the unmodifiable-collection-view
@@ -6170,11 +5759,11 @@ mod tests {
         // grew from 5 as bootstrap work landed; if it changes again, verify
         // the new value against `SharedVm::new`'s class-loading calls rather
         // than assuming a regression.
-        assert_eq!(shared.class_manager.read().loaded_count(), 29);
-        assert!(shared.statics.read().is_empty());
-        assert!(shared.string_pool.read().is_empty());
-        assert!(shared.class_mirrors.read().is_empty());
-        assert!(shared.lambda_proxies.read().is_empty());
+        assert_eq!(shared.classes.class_manager.read().loaded_count(), 29);
+        assert!(shared.classes.statics.read().is_empty());
+        assert!(shared.mem.string_pool.read().is_empty());
+        assert!(shared.classes.class_mirrors.read().is_empty());
+        assert!(shared.classes.lambda_proxies.read().is_empty());
     }
 
     #[test]
@@ -6222,10 +5811,12 @@ mod tests {
         let shared = SharedVm::new(VmConfig::default());
         // Check a few known native methods are registered
         assert!(shared
+            .natives
             .native_methods
             .find("java/io/PrintStream", "println", "(Ljava/lang/String;)V")
             .is_some());
         assert!(shared
+            .natives
             .native_methods
             .find("java/io/PrintStream", "println", "(I)V")
             .is_some());
@@ -6282,17 +5873,19 @@ mod tests {
     fn class_lock_object_for_fieldful_class_is_plain_zero_slot_object() {
         let shared = SharedVm::new(VmConfig::default());
         let fieldful_id = shared
+            .classes
             .class_manager
             .write()
             .ensure_synthetic_class("cratonvm/test/FieldfulStaticLockTarget", 3);
         let object_id = shared
+            .classes
             .class_manager
             .read()
             .get_loaded_class_id("java/lang/Object")
             .unwrap_or(ClassId::new(0));
 
         let lock = shared.get_class_lock_object(fieldful_id);
-        let header = shared.heap.get_header(lock);
+        let header = shared.mem.heap.get_header(lock);
 
         assert_eq!(header.class_id, object_id);
         assert_eq!(header.num_slots(), 0);
@@ -6306,8 +5899,8 @@ mod tests {
     fn ensure_system_streams_creates_objects() {
         let shared = SharedVm::new(VmConfig::default());
         let (out, err) = shared.ensure_system_streams();
-        let out_header = shared.heap.get_header(out);
-        let err_header = shared.heap.get_header(err);
+        let out_header = shared.mem.heap.get_header(out);
+        let err_header = shared.mem.heap.get_header(err);
         assert_ne!(out.as_ptr(), err.as_ptr());
         assert_eq!(out_header.class_id, err_header.class_id);
         assert!(out_header.num_slots() >= 1);
@@ -6321,11 +5914,11 @@ mod tests {
             .and_then(|layout| layout.field_is_ref(0))
             .unwrap_or(false);
         if slot0_is_ref {
-            assert!(!matches!(shared.heap.get_field(out, 0), Value::Int(1)));
-            assert!(!matches!(shared.heap.get_field(err, 0), Value::Int(2)));
+            assert!(!matches!(shared.mem.heap.get_field(out, 0), Value::Int(1)));
+            assert!(!matches!(shared.mem.heap.get_field(err, 0), Value::Int(2)));
         } else {
-            assert_eq!(shared.heap.get_field(out, 0), Value::Int(1));
-            assert_eq!(shared.heap.get_field(err, 0), Value::Int(2));
+            assert_eq!(shared.mem.heap.get_field(out, 0), Value::Int(1));
+            assert_eq!(shared.mem.heap.get_field(err, 0), Value::Int(2));
         }
     }
 
@@ -6363,7 +5956,10 @@ mod tests {
         // the `JvmThread` lives in its dedicated Box.
         let vm = vm;
         assert_eq!(
-            vm.shared.thread_registry.collect_reserved_tlab_tails(),
+            vm.shared
+                .threads
+                .thread_registry
+                .collect_reserved_tlab_tails(),
             vec![(base as usize + 32, base as usize + size)],
         );
     }
@@ -6375,7 +5971,7 @@ mod tests {
         let arc = vm.shared.get_arc();
         // Same bootstrap class set as `shared_vm_default_config` — see that
         // test's comment for what's currently in it and why the count moves.
-        assert_eq!(arc.class_manager.read().loaded_count(), 29);
+        assert_eq!(arc.classes.class_manager.read().loaded_count(), 29);
     }
 
     #[test]
@@ -6427,14 +6023,14 @@ mod tests {
     fn vm_new_array() {
         let mut vm = Vm::new(VmConfig::default());
         let arr = vm.new_array(ArrayElementType::Int, 10);
-        assert_eq!(vm.shared.heap.array_length(arr), 10);
+        assert_eq!(vm.shared.mem.heap.array_length(arr), 10);
     }
 
     #[test]
     fn vm_new_ref_array() {
         let mut vm = Vm::new(VmConfig::default());
         let arr = vm.new_ref_array(ClassId::new(3), 5);
-        assert_eq!(vm.shared.heap.array_length(arr), 5);
+        assert_eq!(vm.shared.mem.heap.array_length(arr), 5);
     }
 
     // -----------------------------------------------------------------------
@@ -6444,7 +6040,13 @@ mod tests {
     #[test]
     fn cached_string_num_fields_starts_at_zero() {
         let shared = SharedVm::new(VmConfig::default());
-        assert_eq!(shared.cached_string_num_fields.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            shared
+                .classes
+                .cached_string_num_fields
+                .load(Ordering::Relaxed),
+            0
+        );
     }
 
     #[test]
@@ -6452,6 +6054,7 @@ mod tests {
         let shared = SharedVm::new(VmConfig::default());
         assert_eq!(
             shared
+                .classes
                 .cached_class_mirror_num_fields
                 .load(Ordering::Relaxed),
             0
@@ -6462,11 +6065,20 @@ mod tests {
     fn create_java_string_caches_field_count() {
         let shared = SharedVm::new(VmConfig::default());
         // Before first call, cached is 0
-        assert_eq!(shared.cached_string_num_fields.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            shared
+                .classes
+                .cached_string_num_fields
+                .load(Ordering::Relaxed),
+            0
+        );
         // Create a string — should resolve and cache the field count
         let s = crate::vm::vm_object::create_java_string(&shared, "hello");
         // After first call, cached should be nonzero (2 for synthetic stub)
-        let cached = shared.cached_string_num_fields.load(Ordering::Relaxed);
+        let cached = shared
+            .classes
+            .cached_string_num_fields
+            .load(Ordering::Relaxed);
         assert!(
             cached >= 2,
             "cached field count should be at least 2, got {}",
@@ -6482,12 +6094,14 @@ mod tests {
         let shared = SharedVm::new(VmConfig::default());
         assert_eq!(
             shared
+                .classes
                 .cached_class_mirror_num_fields
                 .load(Ordering::Relaxed),
             0
         );
         let _mirror = crate::vm::vm_object::get_or_create_class_mirror(&shared, ClassId::new(1));
         let cached = shared
+            .classes
             .cached_class_mirror_num_fields
             .load(Ordering::Relaxed);
         assert!(
@@ -6501,11 +6115,14 @@ mod tests {
     fn pre_set_cached_field_count_used() {
         let shared = SharedVm::new(VmConfig::default());
         // Pre-set to 4 (simulating real JDK String with 4 fields)
-        shared.cached_string_num_fields.store(4, Ordering::Relaxed);
+        shared
+            .classes
+            .cached_string_num_fields
+            .store(4, Ordering::Relaxed);
         let s = crate::vm::vm_object::create_java_string(&shared, "test4fields");
         // The string should have been allocated with 4 fields, so writing field 3 should work
-        shared.heap.set_field(s, 3, Value::Int(42));
-        assert_eq!(shared.heap.get_field(s, 3), Value::Int(42));
+        shared.mem.heap.set_field(s, 3, Value::Int(42));
+        assert_eq!(shared.mem.heap.get_field(s, 3), Value::Int(42));
     }
 
     // -----------------------------------------------------------------------
@@ -6515,7 +6132,7 @@ mod tests {
     #[test]
     fn missing_natives_log_initially_empty() {
         let shared = SharedVm::new(VmConfig::default());
-        assert!(shared.missing_natives_log.lock().is_empty());
+        assert!(shared.debug.missing_natives_log.lock().is_empty());
     }
 
     #[test]
@@ -6544,7 +6161,7 @@ mod tests {
         shared.record_missing_native("java/lang/Foo", "bar", "()V", None);
         shared.record_missing_native("java/lang/Baz", "qux", "(I)I", Some("main".into()));
         shared.record_missing_native("java/lang/Foo", "bar", "()V", None); // dup
-        let log = shared.missing_natives_log.lock();
+        let log = shared.debug.missing_natives_log.lock();
         assert_eq!(log.len(), 2);
         // dump_missing_natives prints without panicking even on a
         // populated log.
@@ -6724,12 +6341,20 @@ mod tests {
         let mut real_config = VmConfig::default();
         real_config.use_synthetic_jdk = false;
         let real_shared = SharedVm::new(real_config);
-        let real_count = real_shared.native_methods.dump_registrations().len();
+        let real_count = real_shared
+            .natives
+            .native_methods
+            .dump_registrations()
+            .len();
 
         let mut synthetic_config = VmConfig::default();
         synthetic_config.use_synthetic_jdk = true;
         let synthetic_shared = SharedVm::new(synthetic_config);
-        let synthetic_count = synthetic_shared.native_methods.dump_registrations().len();
+        let synthetic_count = synthetic_shared
+            .natives
+            .native_methods
+            .dump_registrations()
+            .len();
 
         assert!(
             real_count <= synthetic_count,
@@ -6776,9 +6401,9 @@ mod tests {
         let shared = SharedVm::new(VmConfig::default());
         // Synthetic mode should have 5000+ registrations
         assert!(
-            shared.native_methods.len() > 4000,
+            shared.natives.native_methods.len() > 4000,
             "Synthetic mode should have > 4000 natives, got {}",
-            shared.native_methods.len()
+            shared.natives.native_methods.len()
         );
     }
 
@@ -6789,31 +6414,31 @@ mod tests {
     #[test]
     fn m19_shared_vm_has_reference_processor() {
         let shared = SharedVm::new(VmConfig::default());
-        let rp = shared.ref_processor.lock();
+        let rp = shared.mem.ref_processor.lock();
         assert_eq!(rp.pending_finalization_count(), 0);
     }
 
     #[test]
     fn m19_shared_vm_has_finalizer_thread() {
         let shared = SharedVm::new(VmConfig::default());
-        assert_eq!(shared.finalizer_thread.pending_count(), 0);
-        assert!(!shared.finalizer_thread.is_running());
+        assert_eq!(shared.mem.finalizer_thread.pending_count(), 0);
+        assert!(!shared.mem.finalizer_thread.is_running());
     }
 
     #[test]
     fn m19_shared_vm_has_cleaner_thread() {
         let shared = SharedVm::new(VmConfig::default());
-        assert_eq!(shared.cleaner_thread.pending_count(), 0);
-        assert!(!shared.cleaner_thread.is_running());
+        assert_eq!(shared.mem.cleaner_thread.pending_count(), 0);
+        assert!(!shared.mem.cleaner_thread.is_running());
     }
 
     #[test]
     fn m19_register_finalizable_enqueues() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         // Allocate a dummy object to get a valid address
-        let obj = shared.heap.alloc_object(ClassId::new(0), 0);
+        let obj = shared.mem.heap.alloc_object(ClassId::new(0), 0);
         shared.register_finalizable(obj.as_ptr() as usize);
-        let rp = shared.ref_processor.lock();
+        let rp = shared.mem.ref_processor.lock();
         // Should have one finalizer reference discovered
         assert!(
             rp.stats().finalizer_refs_discovered == 0,
@@ -6824,7 +6449,7 @@ mod tests {
     #[test]
     fn m19_process_references_enqueues_dead_finalizable() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
-        let obj = shared.heap.alloc_object(ClassId::new(0), 0);
+        let obj = shared.mem.heap.alloc_object(ClassId::new(0), 0);
         let addr = obj.as_ptr() as usize;
         shared.register_finalizable(addr);
 
@@ -6832,15 +6457,15 @@ mod tests {
         shared.process_references(&|_| false, 100, 0);
 
         // The finalizer thread should have the object enqueued
-        assert_eq!(shared.finalizer_thread.pending_count(), 1);
-        let dequeued = shared.finalizer_thread.dequeue();
+        assert_eq!(shared.mem.finalizer_thread.pending_count(), 1);
+        let dequeued = shared.mem.finalizer_thread.dequeue();
         assert_eq!(dequeued, Some(addr));
     }
 
     #[test]
     fn m19_process_references_keeps_live_finalizable() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
-        let obj = shared.heap.alloc_object(ClassId::new(0), 0);
+        let obj = shared.mem.heap.alloc_object(ClassId::new(0), 0);
         let addr = obj.as_ptr() as usize;
         shared.register_finalizable(addr);
 
@@ -6848,18 +6473,18 @@ mod tests {
         shared.process_references(&|_| true, 100, 0);
 
         // The finalizer thread should NOT have the object
-        assert_eq!(shared.finalizer_thread.pending_count(), 0);
+        assert_eq!(shared.mem.finalizer_thread.pending_count(), 0);
     }
 
     #[test]
     fn m19_drain_finalizers_transfers_to_thread() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
-        let obj = shared.heap.alloc_object(ClassId::new(0), 0);
+        let obj = shared.mem.heap.alloc_object(ClassId::new(0), 0);
         let addr = obj.as_ptr() as usize;
 
         // Directly enqueue in ref_processor's finalization_queue
         {
-            let mut rp = shared.ref_processor.lock();
+            let mut rp = shared.mem.ref_processor.lock();
             rp.discover_reference(
                 cratonvm_gc::reference::ReferenceType::Finalizer,
                 addr,
@@ -6872,37 +6497,37 @@ mod tests {
 
         // drain_finalizers should report 0 because process_references already
         // pushed directly to the finalizer_thread
-        assert_eq!(shared.finalizer_thread.pending_count(), 1);
+        assert_eq!(shared.mem.finalizer_thread.pending_count(), 1);
     }
 
     #[test]
     fn m19_cleaner_actions_drained() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
-        shared.cleaner_thread.submit_action(0x1000);
-        shared.cleaner_thread.submit_action(0x2000);
+        shared.mem.cleaner_thread.submit_action(0x1000);
+        shared.mem.cleaner_thread.submit_action(0x2000);
         let actions = shared.drain_cleaners();
         assert_eq!(actions, vec![0x1000, 0x2000]);
-        assert_eq!(shared.cleaner_thread.pending_count(), 0);
+        assert_eq!(shared.mem.cleaner_thread.pending_count(), 0);
     }
 
     #[test]
     fn m19_finalizer_thread_lifecycle() {
         let shared = SharedVm::new(VmConfig::default());
-        assert!(!shared.finalizer_thread.is_running());
-        shared.finalizer_thread.start();
-        assert!(shared.finalizer_thread.is_running());
-        shared.finalizer_thread.stop();
-        assert!(!shared.finalizer_thread.is_running());
+        assert!(!shared.mem.finalizer_thread.is_running());
+        shared.mem.finalizer_thread.start();
+        assert!(shared.mem.finalizer_thread.is_running());
+        shared.mem.finalizer_thread.stop();
+        assert!(!shared.mem.finalizer_thread.is_running());
     }
 
     #[test]
     fn m19_cleaner_thread_lifecycle() {
         let shared = SharedVm::new(VmConfig::default());
-        assert!(!shared.cleaner_thread.is_running());
-        shared.cleaner_thread.start();
-        assert!(shared.cleaner_thread.is_running());
-        shared.cleaner_thread.stop();
-        assert!(!shared.cleaner_thread.is_running());
+        assert!(!shared.mem.cleaner_thread.is_running());
+        shared.mem.cleaner_thread.start();
+        assert!(shared.mem.cleaner_thread.is_running());
+        shared.mem.cleaner_thread.stop();
+        assert!(!shared.mem.cleaner_thread.is_running());
     }
 
     // -----------------------------------------------------------------------
@@ -6939,7 +6564,7 @@ mod tests {
     #[ignore] // requires JDK on host
     fn s7_object_loaded_from_real_bytecode() {
         let shared = create_real_jdk_vm().expect("No JDK found");
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
 
         // java.lang.Object should be loaded during bootstrap
         let obj_id = cm.get_loaded_class_id("java/lang/Object");
@@ -7030,6 +6655,7 @@ mod tests {
         // Verify all Object native methods are registered in the native registry
         assert!(
             shared
+                .natives
                 .native_methods
                 .find("java/lang/Object", "hashCode", "()I")
                 .is_some(),
@@ -7037,6 +6663,7 @@ mod tests {
         );
         assert!(
             shared
+                .natives
                 .native_methods
                 .find("java/lang/Object", "getClass", "()Ljava/lang/Class;")
                 .is_some(),
@@ -7044,6 +6671,7 @@ mod tests {
         );
         assert!(
             shared
+                .natives
                 .native_methods
                 .find("java/lang/Object", "clone", "()Ljava/lang/Object;")
                 .is_some(),
@@ -7051,6 +6679,7 @@ mod tests {
         );
         assert!(
             shared
+                .natives
                 .native_methods
                 .find("java/lang/Object", "notify", "()V")
                 .is_some(),
@@ -7058,6 +6687,7 @@ mod tests {
         );
         assert!(
             shared
+                .natives
                 .native_methods
                 .find("java/lang/Object", "notifyAll", "()V")
                 .is_some(),
@@ -7066,6 +6696,7 @@ mod tests {
         // JDK 19+: wait0 is the actual native (wait is bytecode)
         assert!(
             shared
+                .natives
                 .native_methods
                 .find("java/lang/Object", "wait0", "(J)V")
                 .is_some(),
@@ -7083,6 +6714,7 @@ mod tests {
 
         // Load Object class
         let obj_class_id = shared
+            .classes
             .class_manager
             .write()
             .load_class("java/lang/Object")
@@ -7090,6 +6722,7 @@ mod tests {
 
         // Get field count for allocation
         let num_fields = shared
+            .classes
             .class_manager
             .read()
             .class_store
@@ -7098,7 +6731,7 @@ mod tests {
             .unwrap_or(0);
 
         // Allocate a new Object (equivalent to `new Object()`)
-        let obj_ref = shared.heap.alloc_object(obj_class_id, num_fields);
+        let obj_ref = shared.mem.heap.alloc_object(obj_class_id, num_fields);
 
         // Call hashCode() via native dispatch
         let result = crate::vm::vm_exec::invoke_on_class_shared(
@@ -7133,12 +6766,14 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(1), "test");
 
         let obj_class_id = shared
+            .classes
             .class_manager
             .write()
             .load_class("java/lang/Object")
             .expect("Should load Object");
 
         let num_fields = shared
+            .classes
             .class_manager
             .read()
             .class_store
@@ -7146,8 +6781,8 @@ mod tests {
             .map(|c| c.num_total_fields)
             .unwrap_or(0);
 
-        let obj1 = shared.heap.alloc_object(obj_class_id, num_fields);
-        let obj2 = shared.heap.alloc_object(obj_class_id, num_fields);
+        let obj1 = shared.mem.heap.alloc_object(obj_class_id, num_fields);
+        let obj2 = shared.mem.heap.alloc_object(obj_class_id, num_fields);
 
         // equals(this) should return true (identity)
         let result = crate::vm::vm_exec::invoke_on_class_shared(
@@ -7191,12 +6826,14 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(1), "test");
 
         let obj_class_id = shared
+            .classes
             .class_manager
             .write()
             .load_class("java/lang/Object")
             .expect("Should load Object");
 
         let num_fields = shared
+            .classes
             .class_manager
             .read()
             .class_store
@@ -7204,7 +6841,7 @@ mod tests {
             .map(|c| c.num_total_fields)
             .unwrap_or(0);
 
-        let obj = shared.heap.alloc_object(obj_class_id, num_fields);
+        let obj = shared.mem.heap.alloc_object(obj_class_id, num_fields);
 
         let result = crate::vm::vm_exec::invoke_on_class_shared(
             &shared,
@@ -7221,7 +6858,7 @@ mod tests {
         match ret {
             Some(Value::Object(Some(str_ref))) => {
                 // Read the string content and verify it starts with "java.lang.Object@"
-                let text = crate::vm::vm_object::read_java_string(&shared.heap, str_ref);
+                let text = crate::vm::vm_object::read_java_string(&shared.mem.heap, str_ref);
                 assert!(
                     text.is_some(),
                     "toString() returned an object but could not read string value"
@@ -7240,7 +6877,7 @@ mod tests {
     #[ignore] // requires JDK on host
     fn s7_object_class_state_initialized() {
         let shared = create_real_jdk_vm().expect("No JDK found");
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
 
         let obj_id = cm
             .get_loaded_class_id("java/lang/Object")
@@ -7264,7 +6901,7 @@ mod tests {
     #[ignore] // requires JDK on host
     fn s7_bootstrap_loads_multiple_real_classes() {
         let shared = create_real_jdk_vm().expect("No JDK found");
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
 
         // bootstrap_core_classes should have loaded many real classes
         let modules = cm.list_boot_modules();
@@ -7305,7 +6942,7 @@ mod tests {
     #[ignore] // requires real JDK on PATH
     fn s8_string_loaded_from_real_bytecode() {
         let shared = create_real_jdk_vm().expect("No JDK found");
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let id = cm
             .get_loaded_class_id("java/lang/String")
             .expect("String not loaded");
@@ -7370,7 +7007,7 @@ mod tests {
     #[ignore] // requires real JDK on PATH
     fn s8_class_loaded_from_real_bytecode() {
         let shared = create_real_jdk_vm().expect("No JDK found");
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let id = cm
             .get_loaded_class_id("java/lang/Class")
             .expect("Class not loaded");
@@ -7415,13 +7052,14 @@ mod tests {
         // The compact_strings flag should be set by pre_init_string_statics
         assert!(
             shared
+                .classes
                 .compact_strings
                 .load(std::sync::atomic::Ordering::Relaxed),
             "compact_strings should be true for real JDK"
         );
 
         // Verify COMPACT_STRINGS static field is set
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let string_id = cm
             .get_loaded_class_id("java/lang/String")
             .expect("class java/lang/String should be loaded");
@@ -7456,12 +7094,12 @@ mod tests {
 
         // Create a Latin-1 string
         let hello = crate::vm::vm_object::create_java_string(&shared, "hello");
-        let result = crate::vm::vm_object::read_java_string(&shared.heap, hello);
+        let result = crate::vm::vm_object::read_java_string(&shared.mem.heap, hello);
         assert_eq!(result, Some("hello".to_string()));
 
         // Create a non-Latin-1 string (forces UTF16 coder)
         let emoji = crate::vm::vm_object::create_java_string(&shared, "\u{1F600} smile");
-        let result = crate::vm::vm_object::read_java_string(&shared.heap, emoji);
+        let result = crate::vm::vm_object::read_java_string(&shared.mem.heap, emoji);
         assert_eq!(result, Some("\u{1F600} smile".to_string()));
 
         // Verify interning works
@@ -7482,10 +7120,11 @@ mod tests {
         let shared = create_real_jdk_vm().expect("No JDK found");
 
         // String.intern() should be in the native registry
-        let found =
-            shared
-                .native_methods
-                .find("java/lang/String", "intern", "()Ljava/lang/String;");
+        let found = shared.natives.native_methods.find(
+            "java/lang/String",
+            "intern",
+            "()Ljava/lang/String;",
+        );
         assert!(
             found.is_some(),
             "String.intern() native should be registered"
@@ -7514,7 +7153,10 @@ mod tests {
         ];
 
         for (method, desc) in &critical_natives {
-            let found = shared.native_methods.find("java/lang/Class", method, desc);
+            let found = shared
+                .natives
+                .native_methods
+                .find("java/lang/Class", method, desc);
             assert!(
                 found.is_some(),
                 "Class.{method}{desc} native should be registered"
@@ -7528,7 +7170,7 @@ mod tests {
     fn s8_class_mirror_with_real_layout() {
         let shared = Arc::new(create_real_jdk_vm().expect("No JDK found"));
 
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let string_id = cm
             .get_loaded_class_id("java/lang/String")
             .expect("class java/lang/String should be loaded");
@@ -7538,14 +7180,14 @@ mod tests {
         let mirror = crate::vm::vm_object::get_or_create_class_mirror(&shared, string_id);
 
         // Field 0 stores Int(class_id) for legacy compatibility.
-        let stored_id = shared.heap.get_field(mirror, 0);
+        let stored_id = shared.mem.heap.get_field(mirror, 0);
         assert_eq!(stored_id.as_int(), Some(string_id.as_u32() as i32));
 
         // Field 1 should store the name
-        let name_val = shared.heap.get_field(mirror, 1);
+        let name_val = shared.mem.heap.get_field(mirror, 1);
         match name_val {
             Value::Object(Some(name_ref)) => {
-                let name = crate::vm::vm_object::read_java_string(&shared.heap, name_ref);
+                let name = crate::vm::vm_object::read_java_string(&shared.mem.heap, name_ref);
                 assert_eq!(name, Some("java/lang/String".to_string()));
             }
             _ => panic!("Expected name string in field 1"),
@@ -7573,7 +7215,7 @@ mod tests {
             let mirror = crate::vm::vm_object::get_or_create_primitive_mirror(&shared, prim);
             // Field 0 = Int(-1) marker for primitive mirrors.
             assert_eq!(
-                shared.heap.get_field(mirror, 0),
+                shared.mem.heap.get_field(mirror, 0),
                 Value::Int(-1),
                 "Primitive mirror for '{prim}' should have Int(-1) marker"
             );
@@ -7585,7 +7227,7 @@ mod tests {
     #[ignore] // requires real JDK on PATH
     fn s8_string_and_class_both_real() {
         let shared = create_real_jdk_vm().expect("No JDK found");
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
 
         for class_name in &["java/lang/String", "java/lang/Class"] {
             let id = cm
@@ -7611,6 +7253,7 @@ mod tests {
         let (shared, mut thread) = create_real_jdk_vm_with_thread().expect("No JDK found");
 
         let string_id = shared
+            .classes
             .class_manager
             .write()
             .load_class("java/lang/String")
@@ -7631,7 +7274,7 @@ mod tests {
 
         match result {
             Some(Value::Object(Some(str_ref))) => {
-                let s = crate::vm::vm_object::read_java_string(&shared.heap, str_ref);
+                let s = crate::vm::vm_object::read_java_string(&shared.mem.heap, str_ref);
                 assert_eq!(
                     s,
                     Some("42".to_string()),
@@ -7655,7 +7298,7 @@ mod tests {
         // Create the Java string "hello"
         let hello = crate::vm::vm_object::create_java_string(&shared, "hello");
 
-        let string_class_id = shared.heap.class_id_of(hello);
+        let string_class_id = shared.mem.heap.class_id_of(hello);
         crate::vm::ensure_class_initialized_shared(&shared, &mut thread, string_class_id)
             .expect("class initialization should succeed");
 
@@ -7685,6 +7328,7 @@ mod tests {
         let (shared, mut thread) = create_real_jdk_vm_with_thread().expect("No JDK found");
 
         let class_id = shared
+            .classes
             .class_manager
             .write()
             .load_class("java/lang/Class")
@@ -7714,8 +7358,8 @@ mod tests {
         match result {
             Some(Value::Object(Some(mirror))) => {
                 // The returned mirror should be for java/lang/String
-                let stored_id = shared.heap.get_field(mirror, 0);
-                let cm = shared.class_manager.read();
+                let stored_id = shared.mem.heap.get_field(mirror, 0);
+                let cm = shared.classes.class_manager.read();
                 let string_id = cm
                     .get_loaded_class_id("java/lang/String")
                     .expect("class java/lang/String should be loaded");
@@ -7740,7 +7384,7 @@ mod tests {
         let (shared, mut thread) = create_real_jdk_vm_with_thread().expect("No JDK found");
 
         let hello = crate::vm::vm_object::create_java_string(&shared, "hello");
-        let string_class_id = shared.heap.class_id_of(hello);
+        let string_class_id = shared.mem.heap.class_id_of(hello);
         crate::vm::ensure_class_initialized_shared(&shared, &mut thread, string_class_id)
             .expect("class initialization should succeed");
 
@@ -7773,27 +7417,29 @@ mod tests {
         // Force a new allocation by not using interning
         let s2 = {
             let string_id = shared
+                .classes
                 .class_manager
                 .read()
                 .get_loaded_class_id("java/lang/String")
                 .expect("class java/lang/String should be loaded");
             let cls = shared
+                .classes
                 .class_manager
                 .read()
                 .get_class(string_id)
                 .expect("class should exist in class store")
                 .num_total_fields;
-            let obj = shared.heap.alloc_object(string_id, cls);
+            let obj = shared.mem.heap.alloc_object(string_id, cls);
             crate::runtime::interpreter::init_primitive_fields(&shared, obj, string_id);
             // Copy the value array and coder from s1
-            let val = shared.heap.get_field(s1, 0); // value byte[]
-            shared.heap.set_field(obj, 0, val);
-            let coder = shared.heap.get_field(s1, 1); // coder
-            shared.heap.set_field(obj, 1, coder);
+            let val = shared.mem.heap.get_field(s1, 0); // value byte[]
+            shared.mem.heap.set_field(obj, 0, val);
+            let coder = shared.mem.heap.get_field(s1, 1); // coder
+            shared.mem.heap.set_field(obj, 1, coder);
             obj
         };
 
-        let string_class_id = shared.heap.class_id_of(s1);
+        let string_class_id = shared.mem.heap.class_id_of(s1);
         crate::vm::ensure_class_initialized_shared(&shared, &mut thread, string_class_id)
             .expect("class initialization should succeed");
 
@@ -7841,7 +7487,7 @@ mod tests {
         let (shared, mut thread) = create_real_jdk_vm_with_thread().expect("No JDK found");
 
         let hello = crate::vm::vm_object::create_java_string(&shared, "hello");
-        let string_class_id = shared.heap.class_id_of(hello);
+        let string_class_id = shared.mem.heap.class_id_of(hello);
         crate::vm::ensure_class_initialized_shared(&shared, &mut thread, string_class_id)
             .expect("class initialization should succeed");
 
@@ -7907,14 +7553,14 @@ mod tests {
     fn s8_class_getname_execution() {
         let (shared, mut thread) = create_real_jdk_vm_with_thread().expect("No JDK found");
 
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let string_id = cm
             .get_loaded_class_id("java/lang/String")
             .expect("class java/lang/String should be loaded");
         drop(cm);
 
         let mirror = crate::vm::vm_object::get_or_create_class_mirror(&shared, string_id);
-        let class_class_id = shared.heap.class_id_of(mirror);
+        let class_class_id = shared.mem.heap.class_id_of(mirror);
         crate::vm::ensure_class_initialized_shared(&shared, &mut thread, class_class_id)
             .expect("class initialization should succeed");
 
@@ -7931,7 +7577,7 @@ mod tests {
 
         match result {
             Some(Value::Object(Some(name_ref))) => {
-                let name = crate::vm::vm_object::read_java_string(&shared.heap, name_ref);
+                let name = crate::vm::vm_object::read_java_string(&shared.mem.heap, name_ref);
                 assert_eq!(
                     name,
                     Some("java.lang.String".to_string()),
@@ -7952,7 +7598,7 @@ mod tests {
         let (shared, mut thread) = create_real_jdk_vm_with_thread().expect("No JDK found");
 
         let hello = crate::vm::vm_object::create_java_string(&shared, "hello");
-        let string_class_id = shared.heap.class_id_of(hello);
+        let string_class_id = shared.mem.heap.class_id_of(hello);
         crate::vm::ensure_class_initialized_shared(&shared, &mut thread, string_class_id)
             .expect("class initialization should succeed");
 
@@ -7968,7 +7614,7 @@ mod tests {
 
         match result {
             Some(Value::Object(Some(sub_ref))) => {
-                let s = crate::vm::vm_object::read_java_string(&shared.heap, sub_ref);
+                let s = crate::vm::vm_object::read_java_string(&shared.mem.heap, sub_ref);
                 assert_eq!(
                     s,
                     Some("ell".to_string()),
@@ -7986,14 +7632,14 @@ mod tests {
     fn s8_class_isinstance_execution() {
         let (shared, mut thread) = create_real_jdk_vm_with_thread().expect("No JDK found");
 
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let string_id = cm
             .get_loaded_class_id("java/lang/String")
             .expect("class java/lang/String should be loaded");
         drop(cm);
 
         let mirror = crate::vm::vm_object::get_or_create_class_mirror(&shared, string_id);
-        let class_class_id = shared.heap.class_id_of(mirror);
+        let class_class_id = shared.mem.heap.class_id_of(mirror);
         crate::vm::ensure_class_initialized_shared(&shared, &mut thread, class_class_id)
             .expect("class initialization should succeed");
 
@@ -8043,7 +7689,7 @@ mod tests {
     #[ignore] // requires real JDK on PATH
     fn s9_all_core_lang_classes_real() {
         let shared = create_real_jdk_vm().expect("No JDK found");
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
 
         let core_classes = [
             "java/lang/Object",
@@ -8106,6 +7752,7 @@ mod tests {
         for (method, desc) in &system_natives {
             assert!(
                 shared
+                    .natives
                     .native_methods
                     .find("java/lang/System", method, desc)
                     .is_some(),
@@ -8145,6 +7792,7 @@ mod tests {
         for (method, desc) in &thread_natives {
             assert!(
                 shared
+                    .natives
                     .native_methods
                     .find("java/lang/Thread", method, desc)
                     .is_some(),
@@ -8162,6 +7810,7 @@ mod tests {
         // VM natives
         assert!(
             shared
+                .natives
                 .native_methods
                 .find(
                     "jdk/internal/misc/VM",
@@ -8173,6 +7822,7 @@ mod tests {
         );
         assert!(
             shared
+                .natives
                 .native_methods
                 .find("jdk/internal/misc/VM", "initLevel", "()I")
                 .is_some(),
@@ -8182,6 +7832,7 @@ mod tests {
         // CDS natives
         assert!(
             shared
+                .natives
                 .native_methods
                 .find(
                     "jdk/internal/misc/CDS",
@@ -8193,6 +7844,7 @@ mod tests {
         );
         assert!(
             shared
+                .natives
                 .native_methods
                 .find("jdk/internal/misc/CDS", "isSharingEnabled", "()Z")
                 .is_some(),
@@ -8218,7 +7870,7 @@ mod tests {
         ];
 
         for (wrapper_name, prim_name) in &wrappers {
-            let cm = shared.class_manager.read();
+            let cm = shared.classes.class_manager.read();
             let class_id = cm
                 .get_loaded_class_id(wrapper_name)
                 .unwrap_or_else(|| panic!("{wrapper_name} should be loaded"));
@@ -8246,7 +7898,7 @@ mod tests {
                 Value::Object(Some(mirror)) => {
                     // The mirror should be a primitive class mirror (field 0 = Int(-1))
                     assert_eq!(
-                        shared.heap.get_field(mirror, 0),
+                        shared.mem.heap.get_field(mirror, 0),
                         Value::Int(-1),
                         "{wrapper_name}.TYPE should be a primitive mirror for '{prim_name}'"
                     );
@@ -8263,7 +7915,7 @@ mod tests {
     #[ignore] // requires real JDK on PATH
     fn s9_number_class_hierarchy() {
         let shared = create_real_jdk_vm().expect("No JDK found");
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
 
         // Number extends Object
         let number_id = cm
@@ -8311,7 +7963,7 @@ mod tests {
     #[ignore] // requires real JDK on PATH
     fn s9_throwable_hierarchy() {
         let shared = create_real_jdk_vm().expect("No JDK found");
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
 
         let throwable_id = cm
             .get_loaded_class_id("java/lang/Throwable")
@@ -8360,7 +8012,7 @@ mod tests {
     #[ignore] // requires real JDK on PATH
     fn s9_system_class_has_methods() {
         let shared = create_real_jdk_vm().expect("No JDK found");
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
 
         let sys_id = cm
             .get_loaded_class_id("java/lang/System")
@@ -8397,7 +8049,7 @@ mod tests {
     #[ignore] // requires real JDK on PATH
     fn s9_integer_class_structure() {
         let shared = create_real_jdk_vm().expect("No JDK found");
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
 
         let int_id = cm
             .get_loaded_class_id("java/lang/Integer")
@@ -8464,7 +8116,7 @@ mod tests {
     #[ignore] // requires real JDK on PATH
     fn s9_thread_class_structure() {
         let shared = create_real_jdk_vm().expect("No JDK found");
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
 
         let thread_id = cm
             .get_loaded_class_id("java/lang/Thread")
@@ -8602,42 +8254,43 @@ mod tests {
         // Resolve the `holder` slot via the class store — the slot index
         // is layout-dependent so we must not hardcode it.
         let thread_class = shared
+            .classes
             .class_manager
             .read()
             .get_loaded_class_id("java/lang/Thread")
             .expect("Thread class should be loaded");
         let holder_slot = {
-            let cm = shared.class_manager.read();
+            let cm = shared.classes.class_manager.read();
             crate::vm::resolve_field_index_for_test(thread_class, "holder", &cm.class_store)
         }
         .expect("Thread.holder field should be resolvable");
 
-        let holder_val = shared.heap.get_field(t_obj, holder_slot);
+        let holder_val = shared.mem.heap.get_field(t_obj, holder_slot);
         let holder = match holder_val {
             Value::Object(Some(r)) => r,
             other => panic!("Thread.holder must not be null on VM-created Thread, got {other:?}"),
         };
 
         // Confirm `holder.group` is non-null.
-        let holder_class = shared.heap.class_id_of(holder);
+        let holder_class = shared.mem.heap.class_id_of(holder);
         let group_slot = {
-            let cm = shared.class_manager.read();
+            let cm = shared.classes.class_manager.read();
             crate::vm::resolve_field_index_for_test(holder_class, "group", &cm.class_store)
         }
         .expect("FieldHolder.group field should be resolvable");
-        match shared.heap.get_field(holder, group_slot) {
+        match shared.mem.heap.get_field(holder, group_slot) {
             Value::Object(Some(_)) => {}
             other => panic!("holder.group must not be null, got {other:?}"),
         }
 
         // Confirm `holder.priority == 5` (NORM_PRIORITY).
         let prio_slot = {
-            let cm = shared.class_manager.read();
+            let cm = shared.classes.class_manager.read();
             crate::vm::resolve_field_index_for_test(holder_class, "priority", &cm.class_store)
         }
         .expect("FieldHolder.priority field should be resolvable");
         assert!(
-            matches!(shared.heap.get_field(holder, prio_slot), Value::Int(5)),
+            matches!(shared.mem.heap.get_field(holder, prio_slot), Value::Int(5)),
             "holder.priority should be NORM_PRIORITY (5)"
         );
     }
@@ -8654,23 +8307,28 @@ mod tests {
 
         // Create source array [10, 20, 30]
         let src = shared
+            .mem
             .heap
             .alloc_array(ClassId::new(0), ArrayElementType::Int, 3);
         shared
+            .mem
             .heap
             .set_array_element(src, 0, Value::Int(10))
             .expect("array element set should succeed");
         shared
+            .mem
             .heap
             .set_array_element(src, 1, Value::Int(20))
             .expect("array element set should succeed");
         shared
+            .mem
             .heap
             .set_array_element(src, 2, Value::Int(30))
             .expect("array element set should succeed");
 
         // Create destination array [0, 0, 0]
         let dst = shared
+            .mem
             .heap
             .alloc_array(ClassId::new(0), ArrayElementType::Int, 3);
 
@@ -8698,6 +8356,7 @@ mod tests {
         // Verify destination has copied values
         assert_eq!(
             shared
+                .mem
                 .heap
                 .get_array_element(dst, 0)
                 .expect("array element get should succeed"),
@@ -8705,6 +8364,7 @@ mod tests {
         );
         assert_eq!(
             shared
+                .mem
                 .heap
                 .get_array_element(dst, 1)
                 .expect("array element get should succeed"),
@@ -8712,6 +8372,7 @@ mod tests {
         );
         assert_eq!(
             shared
+                .mem
                 .heap
                 .get_array_element(dst, 2)
                 .expect("array element get should succeed"),
@@ -8771,6 +8432,7 @@ mod tests {
         eprintln!("jdk/internal/misc/Unsafe: {} native methods", natives.len());
         for n in &natives {
             let registered = shared
+                .natives
                 .native_methods
                 .find(&n.class_name, &n.method_name, &n.descriptor)
                 .is_some();
@@ -8794,6 +8456,7 @@ mod tests {
         eprintln!("ClassLoader: {} native methods", natives.len());
         for n in &natives {
             let registered = shared
+                .natives
                 .native_methods
                 .find(&n.class_name, &n.method_name, &n.descriptor)
                 .is_some();
@@ -8815,6 +8478,7 @@ mod tests {
         eprintln!("Reference: {} native methods", natives.len());
         for n in &natives {
             let registered = shared
+                .natives
                 .native_methods
                 .find(&n.class_name, &n.method_name, &n.descriptor)
                 .is_some();
@@ -8837,6 +8501,7 @@ mod tests {
         eprintln!("MethodHandle: {} native methods", natives.len());
         for n in &natives {
             let registered = shared
+                .natives
                 .native_methods
                 .find(&n.class_name, &n.method_name, &n.descriptor)
                 .is_some();
@@ -8883,6 +8548,7 @@ mod tests {
         eprintln!("FileInputStream: {} native methods", fis.len());
         for n in &fis {
             let registered = shared
+                .natives
                 .native_methods
                 .find(&n.class_name, &n.method_name, &n.descriptor)
                 .is_some();
@@ -8894,6 +8560,7 @@ mod tests {
         eprintln!("FileOutputStream: {} native methods", fos.len());
         for n in &fos {
             let registered = shared
+                .natives
                 .native_methods
                 .find(&n.class_name, &n.method_name, &n.descriptor)
                 .is_some();
@@ -8911,6 +8578,7 @@ mod tests {
         eprintln!("VM: {} native methods", vm_natives.len());
         for n in &vm_natives {
             let registered = shared
+                .natives
                 .native_methods
                 .find(&n.class_name, &n.method_name, &n.descriptor)
                 .is_some();
@@ -8923,6 +8591,7 @@ mod tests {
         eprintln!("CDS: {} native methods", cds_natives.len());
         for n in &cds_natives {
             let registered = shared
+                .natives
                 .native_methods
                 .find(&n.class_name, &n.method_name, &n.descriptor)
                 .is_some();
@@ -8949,6 +8618,7 @@ mod tests {
         ];
         for class in &classes_with_register_natives {
             let found = shared
+                .natives
                 .native_methods
                 .find(class, "registerNatives", "()V")
                 .is_some();
@@ -8999,6 +8669,7 @@ mod tests {
         init_args: &[Value],
     ) -> ObjectRef {
         let class_id = shared
+            .classes
             .class_manager
             .write()
             .load_class(class_name)
@@ -9006,12 +8677,13 @@ mod tests {
         crate::vm::ensure_class_initialized_shared(shared, thread, class_id)
             .unwrap_or_else(|e| panic!("Failed to initialize {class_name}: {e:?}"));
         let num_fields = shared
+            .classes
             .class_manager
             .read()
             .get_class(class_id)
             .map(|c| c.num_total_fields)
             .unwrap_or(0);
-        let obj = shared.heap.alloc_object(class_id, num_fields);
+        let obj = shared.mem.heap.alloc_object(class_id, num_fields);
         crate::runtime::interpreter::init_primitive_fields(shared, obj, class_id);
         // Call <init>
         let mut full_args = vec![Value::Object(Some(obj))];
@@ -9029,7 +8701,7 @@ mod tests {
     #[ignore]
     fn s11_hashmap_loaded_from_real_bytecode() {
         let shared = create_real_jdk_vm().expect("No JDK found");
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
 
         let hm_id = cm.get_loaded_class_id("java/util/HashMap");
         assert!(hm_id.is_some(), "HashMap should be loaded during bootstrap");
@@ -9078,7 +8750,7 @@ mod tests {
     #[ignore]
     fn s11_arraylist_loaded_from_real_bytecode() {
         let shared = create_real_jdk_vm().expect("No JDK found");
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
 
         let al_id = cm.get_loaded_class_id("java/util/ArrayList");
         assert!(
@@ -9128,7 +8800,7 @@ mod tests {
     #[ignore]
     fn s11_abstract_collection_hierarchy() {
         let shared = create_real_jdk_vm().expect("No JDK found");
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
 
         for name in &[
             "java/util/AbstractCollection",
@@ -9186,7 +8858,7 @@ mod tests {
     #[ignore]
     fn s11_collection_interfaces_loaded() {
         let shared = create_real_jdk_vm().expect("No JDK found");
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
 
         for name in &[
             "java/util/Collection",
@@ -9215,6 +8887,7 @@ mod tests {
     fn s11_hashmap_initializes() {
         let (shared, mut thread) = create_real_jdk_vm_with_thread().expect("No JDK found");
         let hm_id = shared
+            .classes
             .class_manager
             .read()
             .get_loaded_class_id("java/util/HashMap")
@@ -9223,6 +8896,7 @@ mod tests {
             .expect("HashMap <clinit> should execute successfully");
 
         let state = shared
+            .classes
             .class_manager
             .read()
             .get_class(hm_id)
@@ -9240,6 +8914,7 @@ mod tests {
     fn s11_arraylist_initializes() {
         let (shared, mut thread) = create_real_jdk_vm_with_thread().expect("No JDK found");
         let al_id = shared
+            .classes
             .class_manager
             .read()
             .get_loaded_class_id("java/util/ArrayList")
@@ -9248,6 +8923,7 @@ mod tests {
             .expect("ArrayList <clinit> should execute successfully");
 
         let state = shared
+            .classes
             .class_manager
             .read()
             .get_class(al_id)
@@ -9276,12 +8952,17 @@ mod tests {
         ];
 
         for name in &collection_classes {
-            let id = shared.class_manager.read().get_loaded_class_id(name);
+            let id = shared
+                .classes
+                .class_manager
+                .read()
+                .get_loaded_class_id(name);
             assert!(id.is_some(), "{name} should be loaded");
             let id = id.expect("id should be Some");
             crate::vm::ensure_class_initialized_shared(&shared, &mut thread, id)
                 .unwrap_or_else(|e| panic!("{name} <clinit> failed: {e:?}"));
             let state = shared
+                .classes
                 .class_manager
                 .read()
                 .get_class(id)
@@ -9304,6 +8985,7 @@ mod tests {
 
         // Initialize HashMap first (may trigger inner class loading)
         let hm_id = shared
+            .classes
             .class_manager
             .read()
             .get_loaded_class_id("java/util/HashMap")
@@ -9313,6 +8995,7 @@ mod tests {
 
         // HashMap$Node should be loadable (may or may not be bootstrapped yet)
         let node_id = shared
+            .classes
             .class_manager
             .write()
             .load_class("java/util/HashMap$Node");
@@ -9323,7 +9006,7 @@ mod tests {
         );
         let node_id = node_id.expect("node_id should be Some");
 
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let node = cm
             .get_class(node_id)
             .expect("class should exist in class store");
@@ -9365,7 +9048,7 @@ mod tests {
         let val = crate::vm::vm_object::create_java_string(&shared, "myvalue");
 
         // HashMap.put(key, value)
-        let hm_id = shared.heap.class_id_of(hm);
+        let hm_id = shared.mem.heap.class_id_of(hm);
         let put_result = crate::vm::invoke_on_class_shared(
             &shared,
             &mut thread,
@@ -9388,7 +9071,7 @@ mod tests {
 
         // Check audit log for missing natives
         {
-            let log = shared.missing_natives_log.lock();
+            let log = shared.debug.missing_natives_log.lock();
             if !log.is_empty() {
                 eprintln!("Missing natives called during put():");
                 for entry in log.iter() {
@@ -9401,7 +9084,7 @@ mod tests {
 
         // Inspect raw instance fields of HashMap to see what put() did
         {
-            let cm = shared.class_manager.read();
+            let cm = shared.classes.class_manager.read();
             let cls = cm
                 .get_class(hm_id)
                 .expect("class should exist in class store");
@@ -9412,7 +9095,7 @@ mod tests {
             let mut inst_idx = cls.first_field_index;
             for f in &cls.fields {
                 if !f.is_static() {
-                    let val = shared.heap.get_field(hm, inst_idx);
+                    let val = shared.mem.heap.get_field(hm, inst_idx);
                     eprintln!(
                         "  slot[{}] {} ({}) = {:?}",
                         inst_idx, f.name, f.descriptor, val
@@ -9432,7 +9115,7 @@ mod tests {
                 let mut si = super_cls.first_field_index;
                 for f in &super_cls.fields {
                     if !f.is_static() {
-                        let val = shared.heap.get_field(hm, si);
+                        let val = shared.mem.heap.get_field(hm, si);
                         eprintln!("  slot[{}] {} ({}) = {:?}", si, f.name, f.descriptor, val);
                         si += 1;
                     }
@@ -9479,7 +9162,7 @@ mod tests {
         let retrieved = get_result.expect("get_result should be Ok");
         match retrieved {
             Some(Value::Object(Some(obj_ref))) => {
-                let text = crate::vm::vm_object::read_java_string(&shared.heap, obj_ref);
+                let text = crate::vm::vm_object::read_java_string(&shared.mem.heap, obj_ref);
                 assert_eq!(
                     text.as_deref(),
                     Some("myvalue"),
@@ -9505,6 +9188,7 @@ mod tests {
 
         // Box an integer: create Integer.valueOf(42)
         let int_class_id = shared
+            .classes
             .class_manager
             .write()
             .load_class("java/lang/Integer")
@@ -9526,7 +9210,7 @@ mod tests {
         };
 
         // ArrayList.add(Integer.valueOf(42))
-        let al_id = shared.heap.class_id_of(al);
+        let al_id = shared.mem.heap.class_id_of(al);
         let add_result = crate::vm::invoke_on_class_shared(
             &shared,
             &mut thread,
@@ -9585,7 +9269,7 @@ mod tests {
                 let int_val = crate::vm::invoke_on_class_shared(
                     &shared,
                     &mut thread,
-                    shared.heap.class_id_of(obj_ref),
+                    shared.mem.heap.class_id_of(obj_ref),
                     "intValue",
                     "()I",
                     &[Value::Object(Some(obj_ref))],
@@ -9609,7 +9293,7 @@ mod tests {
     #[ignore]
     fn s11_linkedlist_loaded_and_initializes() {
         let (shared, mut thread) = create_real_jdk_vm_with_thread().expect("No JDK found");
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
 
         let ll_id = cm.get_loaded_class_id("java/util/LinkedList");
         assert!(ll_id.is_some(), "LinkedList should be loaded");
@@ -9644,13 +9328,14 @@ mod tests {
         let (shared, mut thread) = create_real_jdk_vm_with_thread().expect("No JDK found");
 
         let hs_id = shared
+            .classes
             .class_manager
             .read()
             .get_loaded_class_id("java/util/HashSet");
         assert!(hs_id.is_some(), "HashSet should be loaded");
         let hs_id = hs_id.expect("hs_id should be Some");
         {
-            let cm = shared.class_manager.read();
+            let cm = shared.classes.class_manager.read();
             let cls = cm
                 .get_class(hs_id)
                 .expect("class should exist in class store");
@@ -9673,13 +9358,14 @@ mod tests {
 
         // TreeMap may not be in tier 2 bootstrap but should be loadable
         let tm_id = shared
+            .classes
             .class_manager
             .write()
             .load_class("java/util/TreeMap")
             .expect("TreeMap should be loadable");
 
         {
-            let cm = shared.class_manager.read();
+            let cm = shared.classes.class_manager.read();
             let cls = cm
                 .get_class(tm_id)
                 .expect("class should exist in class store");
@@ -9705,12 +9391,13 @@ mod tests {
         let (shared, _thread) = create_real_jdk_vm_with_thread().expect("No JDK found");
 
         let sp_id = shared
+            .classes
             .class_manager
             .write()
             .load_class("java/util/Spliterator")
             .expect("Spliterator should be loadable");
 
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let cls = cm
             .get_class(sp_id)
             .expect("class should exist in class store");
@@ -9735,7 +9422,7 @@ mod tests {
         let (shared, mut thread) = create_real_jdk_vm_with_thread().expect("No JDK found");
 
         let hm = new_object_initialized(&shared, &mut thread, "java/util/HashMap", "()V", &[]);
-        let hm_id = shared.heap.class_id_of(hm);
+        let hm_id = shared.mem.heap.class_id_of(hm);
 
         let key = crate::vm::vm_object::create_java_string(&shared, "testkey");
         let val = crate::vm::vm_object::create_java_string(&shared, "testval");
@@ -9779,7 +9466,7 @@ mod tests {
         .expect("remove failed");
         match removed {
             Some(Value::Object(Some(obj_ref))) => {
-                let text = crate::vm::vm_object::read_java_string(&shared.heap, obj_ref);
+                let text = crate::vm::vm_object::read_java_string(&shared.mem.heap, obj_ref);
                 assert_eq!(text.as_deref(), Some("testval"));
             }
             other => panic!("remove should return old value, got: {:?}", other),
@@ -9806,7 +9493,7 @@ mod tests {
         let (shared, mut thread) = create_real_jdk_vm_with_thread().expect("No JDK found");
 
         let hm = new_object_initialized(&shared, &mut thread, "java/util/HashMap", "()V", &[]);
-        let hm_id = shared.heap.class_id_of(hm);
+        let hm_id = shared.mem.heap.class_id_of(hm);
 
         // Put 10 entries
         for i in 0..10 {
@@ -9852,7 +9539,7 @@ mod tests {
             .unwrap_or_else(|e| panic!("get(key{i}) failed: {e:?}"));
             match result {
                 Some(Value::Object(Some(obj_ref))) => {
-                    let text = crate::vm::vm_object::read_java_string(&shared.heap, obj_ref);
+                    let text = crate::vm::vm_object::read_java_string(&shared.mem.heap, obj_ref);
                     assert_eq!(
                         text.as_deref(),
                         Some(&format!("val{i}") as &str),
@@ -9874,7 +9561,7 @@ mod tests {
         let (shared, mut thread) = create_real_jdk_vm_with_thread().expect("No JDK found");
 
         let al = new_object_initialized(&shared, &mut thread, "java/util/ArrayList", "()V", &[]);
-        let al_id = shared.heap.class_id_of(al);
+        let al_id = shared.mem.heap.class_id_of(al);
 
         // Add 20 strings (triggers internal array resize from default capacity 10)
         for i in 0..20 {
@@ -9917,7 +9604,7 @@ mod tests {
         .expect("get(15) failed");
         match get_result {
             Some(Value::Object(Some(obj_ref))) => {
-                let text = crate::vm::vm_object::read_java_string(&shared.heap, obj_ref);
+                let text = crate::vm::vm_object::read_java_string(&shared.mem.heap, obj_ref);
                 assert_eq!(text.as_deref(), Some("item15"));
             }
             other => panic!("get(15) should return 'item15', got: {:?}", other),
@@ -9935,7 +9622,7 @@ mod tests {
     #[ignore] // requires real JDK on PATH
     fn s13_concurrent_classes_loaded_from_real_bytecode() {
         let shared = create_real_jdk_vm().expect("No JDK found");
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
 
         let concurrent_classes = [
             // Atomic classes
@@ -10041,7 +9728,11 @@ mod tests {
 
         for (method, desc) in &cas_methods {
             assert!(
-                shared.native_methods.find(u, method, desc).is_some(),
+                shared
+                    .natives
+                    .native_methods
+                    .find(u, method, desc)
+                    .is_some(),
                 "Unsafe.{method}{desc} should be registered on {u}"
             );
         }
@@ -10059,7 +9750,11 @@ mod tests {
 
         for (method, desc) in &legacy_cas {
             assert!(
-                shared.native_methods.find(u_legacy, method, desc).is_some(),
+                shared
+                    .natives
+                    .native_methods
+                    .find(u_legacy, method, desc)
+                    .is_some(),
                 "{u_legacy}.{method}{desc} should be registered"
             );
         }
@@ -10080,7 +9775,11 @@ mod tests {
 
         for (method, desc) in &methods {
             assert!(
-                shared.native_methods.find(ls, method, desc).is_some(),
+                shared
+                    .natives
+                    .native_methods
+                    .find(ls, method, desc)
+                    .is_some(),
                 "LockSupport.{method}{desc} should be registered"
             );
         }
@@ -10091,7 +9790,7 @@ mod tests {
     #[ignore] // requires real JDK on PATH
     fn s13_aqs_structure() {
         let shared = create_real_jdk_vm().expect("No JDK found");
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
 
         let aqs_id = cm
             .get_loaded_class_id("java/util/concurrent/locks/AbstractQueuedSynchronizer")
@@ -10122,7 +9821,7 @@ mod tests {
     #[ignore] // requires real JDK on PATH
     fn s13_reentrant_lock_structure() {
         let shared = create_real_jdk_vm().expect("No JDK found");
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
 
         let rl_id = cm
             .get_loaded_class_id("java/util/concurrent/locks/ReentrantLock")
@@ -10160,7 +9859,7 @@ mod tests {
     #[ignore] // requires real JDK on PATH
     fn s13_atomic_integer_structure() {
         let shared = create_real_jdk_vm().expect("No JDK found");
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
 
         let ai_id = cm
             .get_loaded_class_id("java/util/concurrent/atomic/AtomicInteger")
@@ -10223,7 +9922,7 @@ mod tests {
             "(I)V",
             &[Value::Int(0)],
         );
-        let ai_id = shared.heap.class_id_of(ai);
+        let ai_id = shared.mem.heap.class_id_of(ai);
 
         // incrementAndGet() should return 1
         let result = crate::vm::invoke_on_class_shared(
@@ -10297,7 +9996,7 @@ mod tests {
             "(I)V",
             &[Value::Int(42)],
         );
-        let ai_id = shared.heap.class_id_of(ai);
+        let ai_id = shared.mem.heap.class_id_of(ai);
 
         // compareAndSet(42, 100) should succeed (return true)
         let result = crate::vm::invoke_on_class_shared(
@@ -10365,7 +10064,7 @@ mod tests {
             "()V",
             &[],
         );
-        let chm_id = shared.heap.class_id_of(chm);
+        let chm_id = shared.mem.heap.class_id_of(chm);
 
         // Create key and value strings
         let key = crate::vm::vm_object::create_java_string(&shared, "testKey");
@@ -10412,7 +10111,7 @@ mod tests {
         );
         match get_result.expect("get_result should be Ok") {
             Some(Value::Object(Some(obj_ref))) => {
-                let text = crate::vm::vm_object::read_java_string(&shared.heap, obj_ref);
+                let text = crate::vm::vm_object::read_java_string(&shared.mem.heap, obj_ref);
                 assert_eq!(
                     text.as_deref(),
                     Some("testValue"),
@@ -10452,7 +10151,7 @@ mod tests {
     #[ignore] // requires real JDK on PATH
     fn s13_count_down_latch_structure() {
         let shared = create_real_jdk_vm().expect("No JDK found");
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
 
         let cdl_id = cm
             .get_loaded_class_id("java/util/concurrent/CountDownLatch")
@@ -10485,7 +10184,7 @@ mod tests {
     #[ignore] // requires real JDK on PATH
     fn s13_semaphore_structure() {
         let shared = create_real_jdk_vm().expect("No JDK found");
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
 
         let sem_id = cm
             .get_loaded_class_id("java/util/concurrent/Semaphore")
@@ -10519,7 +10218,7 @@ mod tests {
     #[ignore] // requires real JDK on PATH
     fn s13_cyclic_barrier_structure() {
         let shared = create_real_jdk_vm().expect("No JDK found");
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
 
         let cb_id = cm
             .get_loaded_class_id("java/util/concurrent/CyclicBarrier")
@@ -10552,7 +10251,7 @@ mod tests {
     #[ignore] // requires real JDK on PATH
     fn s13_executor_framework_structure() {
         let shared = create_real_jdk_vm().expect("No JDK found");
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
 
         // ExecutorService is an interface
         let es_id = cm
@@ -10621,7 +10320,7 @@ mod tests {
     #[ignore] // requires real JDK on PATH
     fn s13_atomic_long_structure() {
         let shared = create_real_jdk_vm().expect("No JDK found");
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
 
         let al_id = cm
             .get_loaded_class_id("java/util/concurrent/atomic/AtomicLong")
@@ -10643,7 +10342,7 @@ mod tests {
     #[ignore] // requires real JDK on PATH
     fn s13_atomic_reference_structure() {
         let shared = create_real_jdk_vm().expect("No JDK found");
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
 
         let ar_id = cm
             .get_loaded_class_id("java/util/concurrent/atomic/AtomicReference")
@@ -10665,7 +10364,7 @@ mod tests {
     #[ignore] // requires real JDK on PATH
     fn s13_stamped_lock_structure() {
         let shared = create_real_jdk_vm().expect("No JDK found");
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
 
         let sl_id = cm
             .get_loaded_class_id("java/util/concurrent/locks/StampedLock")
@@ -10699,7 +10398,7 @@ mod tests {
     #[ignore] // requires real JDK on PATH
     fn s13_phaser_structure() {
         let shared = create_real_jdk_vm().expect("No JDK found");
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
 
         let ph_id = cm
             .get_loaded_class_id("java/util/concurrent/Phaser")
@@ -10725,7 +10424,7 @@ mod tests {
     #[ignore] // requires real JDK on PATH
     fn s13_adders_loaded() {
         let shared = create_real_jdk_vm().expect("No JDK found");
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
 
         for class_name in &[
             "java/util/concurrent/atomic/LongAdder",
@@ -10758,10 +10457,11 @@ mod tests {
             "(I)V",
             &[Value::Int(0)],
         );
-        let ai_id = shared.heap.class_id_of(ai);
+        let ai_id = shared.mem.heap.class_id_of(ai);
 
         // Executors.newSingleThreadExecutor()
         let exec_class = shared
+            .classes
             .class_manager
             .write()
             .load_class("java/util/concurrent/Executors")
@@ -10784,7 +10484,7 @@ mod tests {
             Value::Object(Some(o)) => o,
             _ => panic!("Executor should be an object"),
         };
-        let exec_id = shared.heap.class_id_of(exec_obj);
+        let exec_id = shared.mem.heap.class_id_of(exec_obj);
 
         // Verify shutdown/isShutdown contract
         let is_shutdown = crate::vm::invoke_on_class_shared(
@@ -10839,6 +10539,7 @@ mod tests {
 
         // Executors.newFixedThreadPool(2)
         let exec_class = shared
+            .classes
             .class_manager
             .write()
             .load_class("java/util/concurrent/Executors")
@@ -10860,7 +10561,7 @@ mod tests {
         };
 
         // awaitTermination should return true (all tasks done)
-        let exec_id = shared.heap.class_id_of(exec_obj);
+        let exec_id = shared.mem.heap.class_id_of(exec_obj);
         let result = crate::vm::invoke_on_class_shared(
             &shared,
             &mut thread,
@@ -10892,7 +10593,7 @@ mod tests {
     #[ignore] // requires real JDK on PATH
     fn s14_boot_modules_discovered() {
         let shared = create_real_jdk_vm().expect("No JDK found");
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
 
         let modules = cm.list_boot_modules();
         assert!(
@@ -10917,7 +10618,7 @@ mod tests {
     #[ignore] // requires real JDK on PATH
     fn s14_module_registry_populated() {
         let shared = create_real_jdk_vm().expect("No JDK found");
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
 
         eprintln!("Module registry size: {}", cm.module_registry.len());
 
@@ -10940,7 +10641,7 @@ mod tests {
     #[ignore] // requires real JDK on PATH
     fn s14_readability_graph() {
         let shared = create_real_jdk_vm().expect("No JDK found");
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
 
         // java.base reads itself
         assert!(
@@ -10966,7 +10667,7 @@ mod tests {
     #[ignore] // requires real JDK on PATH
     fn s14_object_in_java_base_module() {
         let shared = create_real_jdk_vm().expect("No JDK found");
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
 
         let obj_id = cm
             .get_loaded_class_id("java/lang/Object")
@@ -10992,7 +10693,7 @@ mod tests {
 
         // Load a test class from the test classpath (not a JDK class)
         // Use a synthetic class that would be created with no module
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
 
         // Any synthetic stub or test class should have no module_name
         // Check that unnamed module classes can still access java.base exports
@@ -11019,7 +10720,7 @@ mod tests {
     #[ignore] // requires real JDK on PATH
     fn s14_java_base_exports_java_lang() {
         let shared = create_real_jdk_vm().expect("No JDK found");
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
 
         // Module access from any module to java.lang.Object should succeed
         // because java.base exports java/lang unconditionally
@@ -11062,6 +10763,7 @@ mod tests {
 
         // Try to load java.sql.Connection (interface in java.sql module)
         let result = shared
+            .classes
             .class_manager
             .write()
             .load_class("java/sql/Connection");
@@ -11071,7 +10773,7 @@ mod tests {
         }
         let conn_id = result.expect("result should be Ok");
 
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let conn = cm
             .get_class(conn_id)
             .expect("class should exist in class store");
@@ -11168,7 +10870,7 @@ mod tests {
     #[ignore] // requires real JDK on PATH
     fn s14_opens_infrastructure() {
         let shared = create_real_jdk_vm().expect("No JDK found");
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
 
         // Verify module registry exists and has readability data
         if cm.module_registry.is_empty() {
@@ -11199,7 +10901,7 @@ mod tests {
                 return;
             }
         };
-        let count = shared.native_methods.len();
+        let count = shared.natives.native_methods.len();
         // Essential natives + I/O natives should be well under 2000
         assert!(
             count < 2000,
@@ -11228,6 +10930,7 @@ mod tests {
         // Object.hashCode must be registered
         assert!(
             shared
+                .natives
                 .native_methods
                 .find("java/lang/Object", "hashCode", "()I")
                 .is_some(),
@@ -11236,6 +10939,7 @@ mod tests {
         // System.arraycopy must be registered
         assert!(
             shared
+                .natives
                 .native_methods
                 .find(
                     "java/lang/System",
@@ -11246,12 +10950,13 @@ mod tests {
             "System.arraycopy must be an essential native"
         );
         // Class.forName0 must be registered
-        assert!(shared.native_methods.find("java/lang/Class", "forName0",
+        assert!(shared.natives.native_methods.find("java/lang/Class", "forName0",
             "(Ljava/lang/String;ZLjava/lang/ClassLoader;Ljava/lang/Class;)Ljava/lang/Class;").is_some(),
             "Class.forName0 must be an essential native");
         // Thread.currentThread must be registered
         assert!(
             shared
+                .natives
                 .native_methods
                 .find("java/lang/Thread", "currentThread", "()Ljava/lang/Thread;")
                 .is_some(),
@@ -11273,6 +10978,7 @@ mod tests {
         // StringBuilder.append should NOT be registered — it's JDK bytecode
         assert!(
             shared
+                .natives
                 .native_methods
                 .find(
                     "java/lang/StringBuilder",
@@ -11285,6 +10991,7 @@ mod tests {
         // HashMap.put should NOT be registered
         assert!(
             shared
+                .natives
                 .native_methods
                 .find(
                     "java/util/HashMap",
@@ -11297,6 +11004,7 @@ mod tests {
         // BigInteger.add should NOT be registered
         assert!(
             shared
+                .natives
                 .native_methods
                 .find(
                     "java/math/BigInteger",
@@ -11321,6 +11029,7 @@ mod tests {
         };
 
         let string_id = shared
+            .classes
             .class_manager
             .write()
             .load_class("java/lang/String")
@@ -11340,7 +11049,7 @@ mod tests {
 
         match result {
             Some(Value::Object(Some(str_ref))) => {
-                let s = crate::vm::vm_object::read_java_string(&shared.heap, str_ref);
+                let s = crate::vm::vm_object::read_java_string(&shared.mem.heap, str_ref);
                 assert_eq!(
                     s,
                     Some("42".to_string()),
@@ -11368,6 +11077,7 @@ mod tests {
 
         // Load and initialize HashMap from real JDK bytecode
         let hm_id = shared
+            .classes
             .class_manager
             .write()
             .load_class("java/util/HashMap")
@@ -11376,7 +11086,7 @@ mod tests {
             .expect("class initialization should succeed");
 
         // Verify HashMap class loaded successfully with real field layout
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let hm_class = cm
             .get_class(hm_id)
             .expect("class should exist in class store");
@@ -11439,6 +11149,7 @@ mod tests {
         };
 
         let string_id = shared
+            .classes
             .class_manager
             .write()
             .load_class("java/lang/String")
@@ -11460,7 +11171,7 @@ mod tests {
 
             match result {
                 Some(Value::Object(Some(str_ref))) => {
-                    let s = crate::vm::vm_object::read_java_string(&shared.heap, str_ref);
+                    let s = crate::vm::vm_object::read_java_string(&shared.mem.heap, str_ref);
                     assert_eq!(
                         s,
                         Some(expected.to_string()),
@@ -11536,6 +11247,7 @@ mod tests {
             "test",
         );
         let class_id = shared
+            .classes
             .class_manager
             .write()
             .load_class("cratonvm/DeepCallTest")
@@ -11565,6 +11277,7 @@ mod tests {
             "test",
         );
         let class_id = shared
+            .classes
             .class_manager
             .write()
             .load_class("cratonvm/DeepCallTest")
@@ -11598,6 +11311,7 @@ mod tests {
             "test",
         );
         let class_id = shared
+            .classes
             .class_manager
             .write()
             .load_class("cratonvm/DeepCallTest")
@@ -11633,6 +11347,7 @@ mod tests {
             "test",
         );
         let class_id = shared
+            .classes
             .class_manager
             .write()
             .load_class("cratonvm/DeepCallTest")
@@ -11666,6 +11381,7 @@ mod tests {
             "test",
         );
         let class_id = shared
+            .classes
             .class_manager
             .write()
             .load_class("cratonvm/DeepCallTest")
@@ -11753,9 +11469,10 @@ mod tests {
         );
         // Create a monitor object and acquire it
         let obj = shared
+            .mem
             .heap
             .alloc_object(crate::classloading::ClassId::new(0), 1);
-        shared.monitors.enter(obj, thread.thread_id);
+        shared.threads.monitors.enter(obj, thread.thread_id);
 
         // Push a frame with monitor_on_exit set
         let mut frame = crate::runtime::frame::Frame::new(
@@ -11777,8 +11494,8 @@ mod tests {
         crate::runtime::interpreter::pop_and_recycle_frame(&shared, &mut thread);
 
         // Verify monitor was released — entering again should succeed without deadlock
-        shared.monitors.enter(obj, thread.thread_id);
-        let _ = shared.monitors.exit(obj, thread.thread_id);
+        shared.threads.monitors.enter(obj, thread.thread_id);
+        let _ = shared.threads.monitors.exit(obj, thread.thread_id);
     }
 
     // -----------------------------------------------------------------------
@@ -11818,9 +11535,9 @@ mod tests {
         use crate::runtime::serviceability::VmDiagnosticState;
         let shared = SharedVm::new(VmConfig::default());
         // Allocate some objects
-        let _obj1 = shared.heap.alloc_object(ClassId::new(1), 2);
-        let _obj2 = shared.heap.alloc_object(ClassId::new(1), 2);
-        let _obj3 = shared.heap.alloc_object(ClassId::new(2), 3);
+        let _obj1 = shared.mem.heap.alloc_object(ClassId::new(1), 2);
+        let _obj2 = shared.mem.heap.alloc_object(ClassId::new(1), 2);
+        let _obj3 = shared.mem.heap.alloc_object(ClassId::new(2), 3);
         let hist = shared.class_histogram();
         assert!(hist.len() >= 2); // at least 2 classes
         let total_instances: u64 = hist.iter().map(|e| e.instance_count).sum();
@@ -11832,11 +11549,13 @@ mod tests {
         use crate::runtime::serviceability::VmDiagnosticState;
         let shared = SharedVm::new(VmConfig::default());
         assert!(!shared
+            .mem
             .gc_requested
             .load(std::sync::atomic::Ordering::Relaxed));
         let ran = shared.trigger_gc();
         assert!(ran);
         assert!(shared
+            .mem
             .gc_requested
             .load(std::sync::atomic::Ordering::Relaxed));
     }
@@ -11895,6 +11614,7 @@ mod tests {
         assert!(result.success);
         assert!(result.output.contains("completed"));
         assert!(shared
+            .mem
             .gc_requested
             .load(std::sync::atomic::Ordering::Relaxed));
 
@@ -11930,17 +11650,18 @@ mod tests {
         // Counters should be initialized to zero
         assert_eq!(
             crate::runtime::diagnostics::DiagnosticCounters::get(
-                &shared.diagnostic_counters.gc_cycles
+                &shared.debug.diagnostic_counters.gc_cycles
             ),
             0
         );
         // Increment and check
         shared
+            .debug
             .diagnostic_counters
-            .inc(&shared.diagnostic_counters.classes_loaded);
+            .inc(&shared.debug.diagnostic_counters.classes_loaded);
         assert_eq!(
             crate::runtime::diagnostics::DiagnosticCounters::get(
-                &shared.diagnostic_counters.classes_loaded
+                &shared.debug.diagnostic_counters.classes_loaded
             ),
             1
         );
@@ -11976,13 +11697,13 @@ mod tests {
 
         // Load a class so there's class info available
         {
-            let mut cm = shared.class_manager.write();
+            let mut cm = shared.classes.class_manager.write();
             let _ = cm.load_class("java/lang/Object");
         }
 
         // Allocate some objects on the heap
-        let _obj1 = shared.heap.alloc_object(ClassId::new(0), 2);
-        let _obj2 = shared.heap.alloc_object(ClassId::new(0), 0);
+        let _obj1 = shared.mem.heap.alloc_object(ClassId::new(0), 2);
+        let _obj2 = shared.mem.heap.alloc_object(ClassId::new(0), 0);
 
         let tmp_path = std::env::temp_dir().join("cratonvm_test_objects_heap.hprof");
         let result = shared.heap_dump(tmp_path.to_str().expect("heap dump should succeed"));
@@ -12048,10 +11769,10 @@ mod tests {
     fn t19_storm_counters_default_zero() {
         use std::sync::atomic::Ordering;
         let shared = SharedVm::new(VmConfig::default());
-        assert_eq!(shared.tlab_refill_count.load(Ordering::Relaxed), 0);
-        assert_eq!(shared.tlab_hit_count.load(Ordering::Relaxed), 0);
-        assert_eq!(shared.gc_cycle_count.load(Ordering::Relaxed), 0);
-        assert_eq!(shared.bytes_allocated_total.load(Ordering::Relaxed), 0);
+        assert_eq!(shared.mem.tlab_refill_count.load(Ordering::Relaxed), 0);
+        assert_eq!(shared.mem.tlab_hit_count.load(Ordering::Relaxed), 0);
+        assert_eq!(shared.mem.gc_cycle_count.load(Ordering::Relaxed), 0);
+        assert_eq!(shared.mem.bytes_allocated_total.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -12059,26 +11780,27 @@ mod tests {
         use std::sync::atomic::Ordering;
         let shared = SharedVm::new(VmConfig::default());
         let before = (
-            shared.tlab_refill_count.load(Ordering::Relaxed),
-            shared.tlab_hit_count.load(Ordering::Relaxed),
-            shared.gc_cycle_count.load(Ordering::Relaxed),
-            shared.bytes_allocated_total.load(Ordering::Relaxed),
+            shared.mem.tlab_refill_count.load(Ordering::Relaxed),
+            shared.mem.tlab_hit_count.load(Ordering::Relaxed),
+            shared.mem.gc_cycle_count.load(Ordering::Relaxed),
+            shared.mem.bytes_allocated_total.load(Ordering::Relaxed),
         );
         // Simulate N allocations bumping the counters (fetch_add is
         // the same path the interpreter uses).
         for _ in 0..32 {
-            shared.tlab_hit_count.fetch_add(1, Ordering::Relaxed);
+            shared.mem.tlab_hit_count.fetch_add(1, Ordering::Relaxed);
             shared
+                .mem
                 .bytes_allocated_total
                 .fetch_add(24, Ordering::Relaxed);
         }
-        shared.tlab_refill_count.fetch_add(1, Ordering::Relaxed);
-        shared.gc_cycle_count.fetch_add(1, Ordering::Relaxed);
+        shared.mem.tlab_refill_count.fetch_add(1, Ordering::Relaxed);
+        shared.mem.gc_cycle_count.fetch_add(1, Ordering::Relaxed);
         let after = (
-            shared.tlab_refill_count.load(Ordering::Relaxed),
-            shared.tlab_hit_count.load(Ordering::Relaxed),
-            shared.gc_cycle_count.load(Ordering::Relaxed),
-            shared.bytes_allocated_total.load(Ordering::Relaxed),
+            shared.mem.tlab_refill_count.load(Ordering::Relaxed),
+            shared.mem.tlab_hit_count.load(Ordering::Relaxed),
+            shared.mem.gc_cycle_count.load(Ordering::Relaxed),
+            shared.mem.bytes_allocated_total.load(Ordering::Relaxed),
         );
         assert!(after.0 >= before.0, "tlab_refill_count went backwards");
         assert!(after.1 >= before.1, "tlab_hit_count went backwards");
@@ -12101,17 +11823,17 @@ mod tests {
             let s = std::sync::Arc::clone(&shared);
             handles.push(std::thread::spawn(move || {
                 for _ in 0..1000 {
-                    s.tlab_hit_count.fetch_add(1, Ordering::Relaxed);
-                    s.bytes_allocated_total.fetch_add(48, Ordering::Relaxed);
+                    s.mem.tlab_hit_count.fetch_add(1, Ordering::Relaxed);
+                    s.mem.bytes_allocated_total.fetch_add(48, Ordering::Relaxed);
                 }
             }));
         }
         for h in handles {
             h.join().unwrap();
         }
-        assert_eq!(shared.tlab_hit_count.load(Ordering::Relaxed), 8 * 1000);
+        assert_eq!(shared.mem.tlab_hit_count.load(Ordering::Relaxed), 8 * 1000);
         assert_eq!(
-            shared.bytes_allocated_total.load(Ordering::Relaxed),
+            shared.mem.bytes_allocated_total.load(Ordering::Relaxed),
             8 * 1000 * 48
         );
     }

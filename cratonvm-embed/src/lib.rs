@@ -92,6 +92,7 @@ pub fn make_string_array(vm: &mut Vm, items: &[&str]) -> Result<ObjectRef, VmErr
         // (the `Err(i32)` AIOOBE index) cannot fire; ignore it.
         let _ = vm
             .shared
+            .mem
             .heap
             .set_array_element(arr, i, Value::Object(Some(js)));
     }
@@ -101,13 +102,13 @@ pub fn make_string_array(vm: &mut Vm, items: &[&str]) -> Result<ObjectRef, VmErr
 /// Read a `java.lang.String` handle back into a Rust `String`. Returns `None`
 /// if the handle is not a `java.lang.String`.
 pub fn read_string(vm: &Vm, obj: ObjectRef) -> Option<String> {
-    cratonvm_vm::vm::read_java_string(&vm.shared.heap, obj)
+    cratonvm_vm::vm::read_java_string(&vm.shared.mem.heap, obj)
 }
 
 /// The runtime-class internal name of a heap object (`"java/lang/String"`),
 /// or `None` if the class is unresolvable.
 pub fn object_class_name(vm: &Vm, obj: ObjectRef) -> Option<String> {
-    let class_id = vm.shared.heap.class_id_of(obj);
+    let class_id = vm.shared.mem.heap.class_id_of(obj);
     vm.class_name(class_id)
 }
 
@@ -151,7 +152,7 @@ pub fn field_index_desc(
 /// Read a named instance field of `obj`, resolved against its **runtime** class.
 /// `None` if the field name is unknown.
 pub fn get_field_by_name(vm: &Vm, obj: ObjectRef, name: &str) -> Option<Value> {
-    let class_id = vm.shared.heap.class_id_of(obj);
+    let class_id = vm.shared.mem.heap.class_id_of(obj);
     let idx = vm.instance_field_index(class_id, name)?;
     Some(vm.get_instance_field(obj, idx))
 }
@@ -162,7 +163,7 @@ pub fn get_field_by_name(vm: &Vm, obj: ObjectRef, name: &str) -> Option<Value> {
 /// unknown. No type coercion is performed; the `Value` variant should match the
 /// field's declared type.
 pub fn set_field_by_name(vm: &Vm, obj: ObjectRef, name: &str, value: Value) -> bool {
-    let class_id = vm.shared.heap.class_id_of(obj);
+    let class_id = vm.shared.mem.heap.class_id_of(obj);
     match vm.instance_field_index(class_id, name) {
         Some(idx) => {
             vm.set_instance_field(obj, idx, value);

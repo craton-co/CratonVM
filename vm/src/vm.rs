@@ -13,6 +13,7 @@
 //! The interpreter and all helper functions take `(shared: &SharedVm, thread: &mut JvmThread)`
 //! instead of `(vm: &mut Vm)`.
 
+pub mod realms;
 pub(crate) mod vm_exec;
 mod vm_init;
 mod vm_object;
@@ -70,9 +71,9 @@ mod tests {
         // Session 85 (C25): `SharedVm::new` pre-registers `Enumeration$Impl`
         // as a synthetic stub so iterator-backed Enumeration dispatch routes
         // through the native registry. Baseline is 1.
-        assert_eq!(vm.shared.class_manager.read().loaded_count(), 1);
+        assert_eq!(vm.shared.classes.class_manager.read().loaded_count(), 1);
         assert!(vm.main_thread.printed.is_empty());
-        assert!(!vm.shared.native_methods.is_empty());
+        assert!(!vm.shared.natives.native_methods.is_empty());
     }
 
     #[test]
@@ -99,7 +100,7 @@ mod tests {
     fn vm_array_creation() {
         let mut vm = test_vm();
         let arr = vm.new_array(ArrayElementType::Int, 5);
-        assert_eq!(vm.shared.heap.array_length(arr), 5);
+        assert_eq!(vm.shared.mem.heap.array_length(arr), 5);
     }
 
     // --- Tests for default_value_for_descriptor ---
@@ -227,7 +228,7 @@ mod tests {
     fn create_and_read_java_string() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let obj = create_java_string(&shared, "Hello, World!");
-        let result = read_java_string(&shared.heap, obj);
+        let result = read_java_string(&shared.mem.heap, obj);
         assert_eq!(result, Some("Hello, World!".to_string()));
     }
 
@@ -253,7 +254,7 @@ mod tests {
     fn create_empty_string() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let obj = create_java_string(&shared, "");
-        let result = read_java_string(&shared.heap, obj);
+        let result = read_java_string(&shared.mem.heap, obj);
         assert_eq!(result, Some(String::new()));
     }
 
@@ -261,7 +262,7 @@ mod tests {
     fn create_unicode_string() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let obj = create_java_string(&shared, "Р¶вЂ”ТђР¶СљВ¬РёР„С›РіС“вЂ РівЂљв„–РіС“в‚¬");
-        let result = read_java_string(&shared.heap, obj);
+        let result = read_java_string(&shared.mem.heap, obj);
         assert_eq!(
             result,
             Some("Р¶вЂ”ТђР¶СљВ¬РёР„С›РіС“вЂ РівЂљв„–РіС“в‚¬".to_string())
@@ -275,10 +276,15 @@ mod tests {
         let mirror = get_or_create_class_mirror(&shared, class_id);
 
         // Field 0 stores Int(class_id) for legacy compatibility.
-        let stored_id = shared.heap.get_field(mirror, 0);
+        let stored_id = shared.mem.heap.get_field(mirror, 0);
         assert_eq!(stored_id.as_int(), Some(42));
         // Also recoverable via the reverse map.
-        let recovered = shared.class_mirrors_reverse.read().get(&mirror).copied();
+        let recovered = shared
+            .classes
+            .class_mirrors_reverse
+            .read()
+            .get(&mirror)
+            .copied();
         assert_eq!(recovered, Some(class_id));
     }
 
@@ -331,7 +337,7 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         let str_obj = create_java_string(&shared, "Hello World");
-        let dummy_ps = shared.heap.alloc_object(ClassId::new(0), 0);
+        let dummy_ps = shared.mem.heap.alloc_object(ClassId::new(0), 0);
 
         let mut ctx = NativeContextImpl {
             shared: &shared,
@@ -357,7 +363,7 @@ mod tests {
     fn println_int_captures_output() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let dummy_ps = shared.heap.alloc_object(ClassId::new(0), 0);
+        let dummy_ps = shared.mem.heap.alloc_object(ClassId::new(0), 0);
 
         let mut ctx = NativeContextImpl {
             shared: &shared,
@@ -382,7 +388,7 @@ mod tests {
     fn println_null_string() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let dummy_ps = shared.heap.alloc_object(ClassId::new(0), 0);
+        let dummy_ps = shared.mem.heap.alloc_object(ClassId::new(0), 0);
 
         let mut ctx = NativeContextImpl {
             shared: &shared,
@@ -407,7 +413,7 @@ mod tests {
     fn println_void_empty_line() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let dummy_ps = shared.heap.alloc_object(ClassId::new(0), 0);
+        let dummy_ps = shared.mem.heap.alloc_object(ClassId::new(0), 0);
 
         let mut ctx = NativeContextImpl {
             shared: &shared,
@@ -551,7 +557,7 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // Allocate a StringBuilder-like object with 2 fields
-        let sb = shared.heap.alloc_object(ClassId::new(0), 2);
+        let sb = shared.mem.heap.alloc_object(ClassId::new(0), 2);
 
         // Call <init>()V
         call_native(
@@ -587,7 +593,7 @@ mod tests {
         )
         .unwrap();
         if let Some(Value::Object(Some(str_obj))) = result {
-            let text = read_java_string(&shared.heap, str_obj);
+            let text = read_java_string(&shared.mem.heap, str_obj);
             assert_eq!(text, Some(String::new()));
         } else {
             panic!("Expected string result");
@@ -599,7 +605,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let sb = shared.heap.alloc_object(ClassId::new(0), 2);
+        let sb = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -656,7 +662,7 @@ mod tests {
         )
         .unwrap();
         if let Some(Value::Object(Some(str_obj))) = result {
-            let text = read_java_string(&shared.heap, str_obj);
+            let text = read_java_string(&shared.mem.heap, str_obj);
             assert_eq!(text, Some("Hello 42".to_string()));
         } else {
             panic!("Expected string result");
@@ -668,7 +674,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let sb = shared.heap.alloc_object(ClassId::new(0), 2);
+        let sb = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -722,7 +728,7 @@ mod tests {
         )
         .unwrap();
         if let Some(Value::Object(Some(str_obj))) = result {
-            let text = read_java_string(&shared.heap, str_obj);
+            let text = read_java_string(&shared.mem.heap, str_obj);
             assert_eq!(text, Some("true!100".to_string()));
         } else {
             panic!("Expected string result");
@@ -734,7 +740,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let sb = shared.heap.alloc_object(ClassId::new(0), 2);
+        let sb = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         let init_str = create_java_string(&shared, "World");
         call_native(
             &shared,
@@ -767,7 +773,7 @@ mod tests {
         )
         .unwrap();
         if let Some(Value::Object(Some(str_obj))) = result {
-            let text = read_java_string(&shared.heap, str_obj);
+            let text = read_java_string(&shared.mem.heap, str_obj);
             assert_eq!(text, Some("World".to_string()));
         } else {
             panic!("Expected string result");
@@ -779,7 +785,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let sb = shared.heap.alloc_object(ClassId::new(0), 2);
+        let sb = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         let init_str = create_java_string(&shared, "abcde");
         call_native(
             &shared,
@@ -811,7 +817,7 @@ mod tests {
         )
         .unwrap();
         if let Some(Value::Object(Some(str_obj))) = result {
-            let text = read_java_string(&shared.heap, str_obj);
+            let text = read_java_string(&shared.mem.heap, str_obj);
             assert_eq!(text, Some("edcba".to_string()));
         } else {
             panic!("Expected string result");
@@ -823,7 +829,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let sb = shared.heap.alloc_object(ClassId::new(0), 2);
+        let sb = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -953,7 +959,7 @@ mod tests {
         .unwrap();
         if let Some(Value::Object(Some(obj))) = r {
             assert_eq!(
-                read_java_string(&shared.heap, obj),
+                read_java_string(&shared.mem.heap, obj),
                 Some("hello".to_string())
             );
         } else {
@@ -982,7 +988,7 @@ mod tests {
         .unwrap();
         if let Some(Value::Object(Some(obj))) = r {
             assert_eq!(
-                read_java_string(&shared.heap, obj),
+                read_java_string(&shared.mem.heap, obj),
                 Some("herro".to_string())
             );
         } else {
@@ -1007,7 +1013,7 @@ mod tests {
         .unwrap();
         if let Some(Value::Object(Some(obj))) = r {
             assert_eq!(
-                read_java_string(&shared.heap, obj),
+                read_java_string(&shared.mem.heap, obj),
                 Some("hello world".to_string())
             );
         }
@@ -1024,7 +1030,7 @@ mod tests {
         .unwrap();
         if let Some(Value::Object(Some(obj))) = r {
             assert_eq!(
-                read_java_string(&shared.heap, obj),
+                read_java_string(&shared.mem.heap, obj),
                 Some("HELLO WORLD".to_string())
             );
         }
@@ -1112,7 +1118,7 @@ mod tests {
         .unwrap();
         if let Some(Value::Object(Some(obj))) = r {
             assert_eq!(
-                read_java_string(&shared.heap, obj),
+                read_java_string(&shared.mem.heap, obj),
                 Some("Hello World".to_string())
             );
         } else {
@@ -1140,7 +1146,7 @@ mod tests {
         if let Some(Value::Object(Some(obj))) = r {
             // VM now targets JDK 25; java.version reflects that.
             assert_eq!(
-                read_java_string(&shared.heap, obj),
+                read_java_string(&shared.mem.heap, obj),
                 Some("25.0.1".to_string())
             );
         } else {
@@ -1217,7 +1223,7 @@ mod tests {
         .unwrap();
         if let Some(Value::Object(Some(obj))) = r {
             assert_eq!(
-                read_java_string(&shared.heap, obj),
+                read_java_string(&shared.mem.heap, obj),
                 Some("test_value".to_string())
             );
         } else {
@@ -1645,7 +1651,10 @@ mod tests {
         )
         .unwrap();
         if let Some(Value::Object(Some(obj))) = r {
-            assert_eq!(read_java_string(&shared.heap, obj), Some("-42".to_string()));
+            assert_eq!(
+                read_java_string(&shared.mem.heap, obj),
+                Some("-42".to_string())
+            );
         } else {
             panic!("Expected string");
         }
@@ -1666,7 +1675,10 @@ mod tests {
         )
         .unwrap();
         if let Some(Value::Object(Some(obj))) = r {
-            assert_eq!(read_java_string(&shared.heap, obj), Some("ff".to_string()));
+            assert_eq!(
+                read_java_string(&shared.mem.heap, obj),
+                Some("ff".to_string())
+            );
         } else {
             panic!("Expected string");
         }
@@ -1708,7 +1720,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let sb = shared.heap.alloc_object(ClassId::new(0), 2);
+        let sb = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -1743,7 +1755,7 @@ mod tests {
         .unwrap();
         if let Some(Value::Object(Some(str_obj))) = result {
             assert_eq!(
-                read_java_string(&shared.heap, str_obj),
+                read_java_string(&shared.mem.heap, str_obj),
                 Some("Hello World".to_string())
             );
         } else {
@@ -1756,7 +1768,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let dummy_ps = shared.heap.alloc_object(ClassId::new(0), 0);
+        let dummy_ps = shared.mem.heap.alloc_object(ClassId::new(0), 0);
         let str_obj = create_java_string(&shared, "Hello World");
 
         call_native(
@@ -1941,7 +1953,7 @@ mod tests {
     fn object_to_string_format() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let obj = shared.heap.alloc_object(ClassId::new(0), 2);
+        let obj = shared.mem.heap.alloc_object(ClassId::new(0), 2);
 
         let result = call_native(
             &shared,
@@ -1955,7 +1967,7 @@ mod tests {
 
         // Should return a String in the format "ClassName@hexHash"
         if let Some(Value::Object(Some(str_obj))) = result {
-            let text = read_java_string(&shared.heap, str_obj).unwrap();
+            let text = read_java_string(&shared.mem.heap, str_obj).unwrap();
             // Should contain "@" separator
             assert!(
                 text.contains('@'),
@@ -1970,8 +1982,8 @@ mod tests {
     fn object_equals_identity() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let obj_a = shared.heap.alloc_object(ClassId::new(0), 0);
-        let obj_b = shared.heap.alloc_object(ClassId::new(0), 0);
+        let obj_a = shared.mem.heap.alloc_object(ClassId::new(0), 0);
+        let obj_b = shared.mem.heap.alloc_object(ClassId::new(0), 0);
 
         // Same object РІР‚вЂќ equals returns true
         let r = call_native(
@@ -2002,9 +2014,9 @@ mod tests {
     fn object_clone_shallow_copy() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let obj = shared.heap.alloc_object(ClassId::new(0), 2);
-        shared.heap.set_field(obj, 0, Value::Int(42));
-        shared.heap.set_field(obj, 1, Value::Int(99));
+        let obj = shared.mem.heap.alloc_object(ClassId::new(0), 2);
+        shared.mem.heap.set_field(obj, 0, Value::Int(42));
+        shared.mem.heap.set_field(obj, 1, Value::Int(99));
 
         let result = call_native(
             &shared,
@@ -2020,8 +2032,8 @@ mod tests {
             // Clone should be a different object
             assert_ne!(clone_ref.as_ptr(), obj.as_ptr());
             // Fields should be copied
-            assert_eq!(shared.heap.get_field(clone_ref, 0), Value::Int(42));
-            assert_eq!(shared.heap.get_field(clone_ref, 1), Value::Int(99));
+            assert_eq!(shared.mem.heap.get_field(clone_ref, 0), Value::Int(42));
+            assert_eq!(shared.mem.heap.get_field(clone_ref, 1), Value::Int(99));
         } else {
             panic!("Expected object result from clone");
         }
@@ -2031,7 +2043,7 @@ mod tests {
     fn object_wait_notify_requires_monitor() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let obj = shared.heap.alloc_object(ClassId::new(0), 0);
+        let obj = shared.mem.heap.alloc_object(ClassId::new(0), 0);
 
         // wait/notify without owning the monitor should fail with IllegalMonitorStateException
         let result = call_native(
@@ -2045,7 +2057,7 @@ mod tests {
         assert!(result.is_err());
 
         // Now enter the monitor and try РІР‚вЂќ should succeed
-        shared.monitors.enter(obj, ThreadId(0));
+        shared.threads.monitors.enter(obj, ThreadId(0));
         call_native(
             &shared,
             &mut thread,
@@ -2064,7 +2076,7 @@ mod tests {
             &[Value::Object(Some(obj))],
         )
         .unwrap();
-        shared.monitors.exit(obj, ThreadId(0)).unwrap();
+        shared.threads.monitors.exit(obj, ThreadId(0)).unwrap();
     }
 
     // --- Phase 8 Part 2: Thread and Throwable stub tests ---
@@ -2117,7 +2129,7 @@ mod tests {
         .unwrap();
 
         if let Some(Value::Object(Some(str_ref))) = result {
-            let name = read_java_string(&shared.heap, str_ref).unwrap();
+            let name = read_java_string(&shared.mem.heap, str_ref).unwrap();
             assert_eq!(name, "main");
         } else {
             panic!("Expected string result from getName");
@@ -2128,7 +2140,10 @@ mod tests {
     fn thread_is_alive_via_registry() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         *shared.self_arc.write() = Some(Arc::downgrade(&shared));
-        shared.thread_registry.register(ThreadId(0), "main", None);
+        shared
+            .threads
+            .thread_registry
+            .register(ThreadId(0), "main", None);
         let mut thread = JvmThread::new(ThreadId(0), "main");
 
         // Get the current thread object (which stores ThreadId in field 2)
@@ -2156,7 +2171,7 @@ mod tests {
         assert_eq!(r, Some(Value::Int(1)));
 
         // Mark thread dead and check again
-        shared.thread_registry.mark_dead(ThreadId(0));
+        shared.threads.thread_registry.mark_dead(ThreadId(0));
         let r2 = call_native(
             &shared,
             &mut thread,
@@ -2306,7 +2321,10 @@ mod tests {
             Some(Value::Object(Some(o))) => o,
             _ => panic!("expected string obj"),
         };
-        assert_eq!(read_java_string(&shared.heap, obj), Some("ff".to_string()));
+        assert_eq!(
+            read_java_string(&shared.mem.heap, obj),
+            Some("ff".to_string())
+        );
 
         // 10 in binary = "1010"
         let r = call_native(
@@ -2323,7 +2341,7 @@ mod tests {
             _ => panic!("expected string obj"),
         };
         assert_eq!(
-            read_java_string(&shared.heap, obj),
+            read_java_string(&shared.mem.heap, obj),
             Some("1010".to_string())
         );
     }
@@ -2356,16 +2374,19 @@ mod tests {
         let fmt = create_java_string(&shared, "Hello, %s! You are %d.");
         let name = create_java_string(&shared, "World");
         // For the integer argument, we'll put a boxed int (alloc object with int field)
-        let int_obj = shared.heap.alloc_object(ClassId::new(0), 1);
-        shared.heap.set_field(int_obj, 0, Value::Int(42));
+        let int_obj = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        shared.mem.heap.set_field(int_obj, 0, Value::Int(42));
 
         let arr = shared
+            .mem
             .heap
             .alloc_array(ClassId::new(0), ArrayElementType::Reference, 2);
         let _ = shared
+            .mem
             .heap
             .set_array_element(arr, 0, Value::Object(Some(name)));
         let _ = shared
+            .mem
             .heap
             .set_array_element(arr, 1, Value::Object(Some(int_obj)));
 
@@ -2383,7 +2404,7 @@ mod tests {
             _ => panic!("expected string obj"),
         };
         assert_eq!(
-            read_java_string(&shared.heap, obj),
+            read_java_string(&shared.mem.heap, obj),
             Some("Hello, World! You are 42.".to_string())
         );
     }
@@ -2397,6 +2418,7 @@ mod tests {
 
         let fmt = create_java_string(&shared, "100%% done%n");
         let arr = shared
+            .mem
             .heap
             .alloc_array(ClassId::new(0), ArrayElementType::Reference, 0);
 
@@ -2414,7 +2436,7 @@ mod tests {
             _ => panic!("expected string obj"),
         };
         assert_eq!(
-            read_java_string(&shared.heap, obj),
+            read_java_string(&shared.mem.heap, obj),
             Some("100% done\n".to_string())
         );
     }
@@ -2444,7 +2466,7 @@ mod tests {
         // Register a lambda proxy: applyAsInt(x) РІвЂ вЂ™ Math.abs(x)
         let proxy_class_id = shared.alloc_lambda_proxy_id();
         let call_site = LambdaCallSite {
-                functional_interface_id: None,
+            functional_interface_id: None,
             functional_interface: "java/util/function/IntUnaryOperator".to_string(),
             sam_method_name: "applyAsInt".to_string(),
             sam_descriptor: "(I)I".to_string(),
@@ -2459,12 +2481,13 @@ mod tests {
             proxy_class_id,
         };
         shared
+            .classes
             .lambda_proxies
             .write()
             .insert(proxy_class_id, call_site);
 
         // Allocate proxy with no captures
-        let proxy_ref = shared.heap.alloc_object(proxy_class_id, 0);
+        let proxy_ref = shared.mem.heap.alloc_object(proxy_class_id, 0);
 
         // Directly call Math.abs via native to verify it works
         let result = call_native(
@@ -2479,7 +2502,7 @@ mod tests {
         assert_eq!(result, Some(Value::Int(42)));
 
         // Verify proxy is registered
-        let proxies = shared.lambda_proxies.read();
+        let proxies = shared.classes.lambda_proxies.read();
         let lcs = proxies.get(&proxy_class_id).unwrap();
         assert_eq!(lcs.impl_handle.member_name, "abs");
         assert_eq!(lcs.impl_handle.class_name, "java/lang/Math");
@@ -2487,7 +2510,7 @@ mod tests {
         drop(proxies);
 
         // Verify the proxy object is on the heap with the right class
-        assert_eq!(shared.heap.class_id_of(proxy_ref), proxy_class_id);
+        assert_eq!(shared.mem.heap.class_id_of(proxy_ref), proxy_class_id);
     }
 
     #[test]
@@ -2500,7 +2523,7 @@ mod tests {
         // Register a lambda: applyAsInt(x) РІвЂ вЂ™ Math.max(captured_val, x)
         let proxy_class_id = shared.alloc_lambda_proxy_id();
         let call_site = LambdaCallSite {
-                functional_interface_id: None,
+            functional_interface_id: None,
             functional_interface: "java/util/function/IntUnaryOperator".to_string(),
             sam_method_name: "applyAsInt".to_string(),
             sam_descriptor: "(I)I".to_string(),
@@ -2515,16 +2538,17 @@ mod tests {
             proxy_class_id,
         };
         shared
+            .classes
             .lambda_proxies
             .write()
             .insert(proxy_class_id, call_site);
 
         // Allocate proxy with captured value 100
-        let proxy_ref = shared.heap.alloc_object(proxy_class_id, 1);
-        shared.heap.set_field(proxy_ref, 0, Value::Int(100));
+        let proxy_ref = shared.mem.heap.alloc_object(proxy_class_id, 1);
+        shared.mem.heap.set_field(proxy_ref, 0, Value::Int(100));
 
         // Verify captured value stored correctly
-        assert_eq!(shared.heap.get_field(proxy_ref, 0), Value::Int(100));
+        assert_eq!(shared.mem.heap.get_field(proxy_ref, 0), Value::Int(100));
 
         // Call Math.max(100, 42) directly via native РІвЂ вЂ™ should be 100
         let r1 = call_native(
@@ -2559,12 +2583,12 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // Create a PrintStream object for System.out
-        let ps_ref = shared.heap.alloc_object(ClassId::new(0), 0);
+        let ps_ref = shared.mem.heap.alloc_object(ClassId::new(0), 0);
 
         // Register a lambda: accept(s) РІвЂ вЂ™ ps.println(s) via captured PrintStream
         let proxy_class_id = shared.alloc_lambda_proxy_id();
         let call_site = LambdaCallSite {
-                functional_interface_id: None,
+            functional_interface_id: None,
             functional_interface: "java/util/function/Consumer".to_string(),
             sam_method_name: "accept".to_string(),
             sam_descriptor: "(Ljava/lang/Object;)V".to_string(),
@@ -2579,13 +2603,15 @@ mod tests {
             proxy_class_id,
         };
         shared
+            .classes
             .lambda_proxies
             .write()
             .insert(proxy_class_id, call_site);
 
         // Allocate proxy with captured PrintStream
-        let proxy_ref = shared.heap.alloc_object(proxy_class_id, 1);
+        let proxy_ref = shared.mem.heap.alloc_object(proxy_class_id, 1);
         shared
+            .mem
             .heap
             .set_field(proxy_ref, 0, Value::Object(Some(ps_ref)));
 
@@ -2605,7 +2631,7 @@ mod tests {
         assert_eq!(thread.printed_lines, vec!["Hello Lambda"]);
 
         // Verify proxy structure
-        let proxies = shared.lambda_proxies.read();
+        let proxies = shared.classes.lambda_proxies.read();
         let lcs = proxies.get(&proxy_class_id).unwrap();
         assert_eq!(lcs.functional_interface, "java/util/function/Consumer");
         assert_eq!(lcs.sam_method_name, "accept");
@@ -2626,6 +2652,7 @@ mod tests {
 
         // Verify cache is empty
         assert!(shared
+            .classes
             .resolution_cache
             .read()
             .get_call_site(class_id, cp_index)
@@ -2634,7 +2661,7 @@ mod tests {
         // Insert a Lambda call site
         let proxy_class_id = shared.alloc_lambda_proxy_id();
         let call_site = ResolvedCallSite::Lambda(LambdaCallSite {
-                functional_interface_id: None,
+            functional_interface_id: None,
             functional_interface: "java/lang/Runnable".to_string(),
             sam_method_name: "run".to_string(),
             sam_descriptor: "()V".to_string(),
@@ -2650,12 +2677,14 @@ mod tests {
         });
 
         shared
+            .classes
             .resolution_cache
             .write()
             .put_call_site(class_id, cp_index, call_site);
 
         // Verify cache hit
         let cached = shared
+            .classes
             .resolution_cache
             .read()
             .get_call_site(class_id, cp_index)
@@ -2672,6 +2701,7 @@ mod tests {
 
         // Verify a different key misses the cache
         assert!(shared
+            .classes
             .resolution_cache
             .read()
             .get_call_site(class_id, 99)
@@ -2689,7 +2719,7 @@ mod tests {
         let proxy2 = shared.alloc_lambda_proxy_id();
         assert_ne!(proxy1, proxy2);
 
-        shared.lambda_proxies.write().insert(
+        shared.classes.lambda_proxies.write().insert(
             proxy1,
             LambdaCallSite {
                 functional_interface_id: None,
@@ -2707,7 +2737,7 @@ mod tests {
                 proxy_class_id: proxy1,
             },
         );
-        shared.lambda_proxies.write().insert(
+        shared.classes.lambda_proxies.write().insert(
             proxy2,
             LambdaCallSite {
                 functional_interface_id: None,
@@ -2727,12 +2757,12 @@ mod tests {
         );
 
         // Allocate proxy objects
-        let obj1 = shared.heap.alloc_object(proxy1, 0);
-        let obj2 = shared.heap.alloc_object(proxy2, 1);
-        shared.heap.set_field(obj2, 0, Value::Int(42));
+        let obj1 = shared.mem.heap.alloc_object(proxy1, 0);
+        let obj2 = shared.mem.heap.alloc_object(proxy2, 1);
+        shared.mem.heap.set_field(obj2, 0, Value::Int(42));
 
         // Verify independent lookup
-        let proxies = shared.lambda_proxies.read();
+        let proxies = shared.classes.lambda_proxies.read();
         assert_eq!(
             proxies.get(&proxy1).unwrap().functional_interface,
             "java/lang/Runnable"
@@ -2744,9 +2774,9 @@ mod tests {
         drop(proxies);
 
         // Verify objects are on the heap with correct class IDs
-        assert_eq!(shared.heap.class_id_of(obj1), proxy1);
-        assert_eq!(shared.heap.class_id_of(obj2), proxy2);
-        assert_eq!(shared.heap.get_field(obj2, 0), Value::Int(42));
+        assert_eq!(shared.mem.heap.class_id_of(obj1), proxy1);
+        assert_eq!(shared.mem.heap.class_id_of(obj2), proxy2);
+        assert_eq!(shared.mem.heap.get_field(obj2, 0), Value::Int(42));
     }
 
     // -- Phase 8 Part 3: Reflection integration tests --
@@ -2763,7 +2793,7 @@ mod tests {
         use cratonvm_reader::class_file_version::ClassFileVersion;
         use cratonvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
 
-        let mut cm = shared.class_manager.write();
+        let mut cm = shared.classes.class_manager.write();
         let id = cm.class_store.next_id();
         let num_fields = fields.iter().filter(|f| !f.is_static()).count();
         cm.class_store.add(Class {
@@ -2815,7 +2845,7 @@ mod tests {
         use cratonvm_reader::class_file_version::ClassFileVersion;
         use cratonvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
 
-        let mut cm = shared.class_manager.write();
+        let mut cm = shared.classes.class_manager.write();
         let id = cm.class_store.next_id();
         let num_fields = fields.iter().filter(|f| !f.is_static()).count();
         let class_name = name.to_string();
@@ -2899,7 +2929,7 @@ mod tests {
             Some(Value::Object(Some(a))) => a,
             _ => panic!("getDeclaredFields should return an array"),
         };
-        assert_eq!(shared.heap.array_length(arr), 2);
+        assert_eq!(shared.mem.heap.array_length(arr), 2);
     }
 
     #[test]
@@ -2995,8 +3025,8 @@ mod tests {
         };
 
         // Allocate an instance with 1 field
-        let obj = shared.heap.alloc_object(class_id, 1);
-        shared.heap.set_field(obj, 0, Value::Int(0));
+        let obj = shared.mem.heap.alloc_object(class_id, 1);
+        shared.mem.heap.set_field(obj, 0, Value::Int(0));
 
         // Field.setInt(obj, 42)
         call_native(
@@ -3075,7 +3105,7 @@ mod tests {
             Some(Value::Object(Some(s))) => s,
             _ => panic!("Expected string"),
         };
-        let name = read_java_string(&shared.heap, name_ref).unwrap();
+        let name = read_java_string(&shared.mem.heap, name_ref).unwrap();
         assert_eq!(name, "count");
 
         // getModifiers should have PUBLIC (0x0001) | STATIC (0x0008) = 0x0009
@@ -3140,7 +3170,7 @@ mod tests {
             _ => panic!("Expected array"),
         };
         // run + helper = 2 (init filtered out)
-        assert_eq!(shared.heap.array_length(arr), 2);
+        assert_eq!(shared.mem.heap.array_length(arr), 2);
     }
 
     #[test]
@@ -3192,7 +3222,7 @@ mod tests {
             _ => panic!("Expected array"),
         };
         // Two <init> constructors, doStuff excluded
-        assert_eq!(shared.heap.array_length(arr), 2);
+        assert_eq!(shared.mem.heap.array_length(arr), 2);
     }
 
     #[test]
@@ -3321,9 +3351,10 @@ mod tests {
 
         // Create a File object pointing to temp dir
         let tmp = std::env::temp_dir().to_string_lossy().to_string();
-        let file_obj = shared.heap.alloc_object(ClassId::new(0), 1);
+        let file_obj = shared.mem.heap.alloc_object(ClassId::new(0), 1);
         let path_str = create_java_string(&shared, &tmp);
         shared
+            .mem
             .heap
             .set_field(file_obj, 0, Value::Object(Some(path_str)));
 
@@ -3377,7 +3408,7 @@ mod tests {
         let path_obj = create_java_string(&shared, &tmp);
 
         // Create FileOutputStream (1 field: fd_id)
-        let fos = shared.heap.alloc_object(ClassId::new(0), 1);
+        let fos = shared.mem.heap.alloc_object(ClassId::new(0), 1);
         call_native(
             &shared,
             &mut thread,
@@ -3391,10 +3422,14 @@ mod tests {
         // Write "hello" as bytes
         let data = b"hello";
         let arr = shared
+            .mem
             .heap
             .alloc_array(ClassId::new(0), ArrayElementType::Byte, data.len());
         for (i, &b) in data.iter().enumerate() {
-            let _ = shared.heap.set_array_element(arr, i, Value::Int(b as i32));
+            let _ = shared
+                .mem
+                .heap
+                .set_array_element(arr, i, Value::Int(b as i32));
         }
         call_native(
             &shared,
@@ -3419,7 +3454,7 @@ mod tests {
 
         // Read it back with FileInputStream
         let path_obj2 = create_java_string(&shared, &tmp);
-        let fis = shared.heap.alloc_object(ClassId::new(0), 1);
+        let fis = shared.mem.heap.alloc_object(ClassId::new(0), 1);
         call_native(
             &shared,
             &mut thread,
@@ -3467,7 +3502,7 @@ mod tests {
 
         // Write initial content
         let path1 = create_java_string(&shared, &tmp);
-        let fos1 = shared.heap.alloc_object(ClassId::new(0), 1);
+        let fos1 = shared.mem.heap.alloc_object(ClassId::new(0), 1);
         call_native(
             &shared,
             &mut thread,
@@ -3499,7 +3534,7 @@ mod tests {
 
         // Append
         let path2 = create_java_string(&shared, &tmp);
-        let fos2 = shared.heap.alloc_object(ClassId::new(0), 1);
+        let fos2 = shared.mem.heap.alloc_object(ClassId::new(0), 1);
         call_native(
             &shared,
             &mut thread,
@@ -3553,7 +3588,7 @@ mod tests {
 
         // Open FileInputStream (stores fd at field 0)
         let path_obj = create_java_string(&shared, &tmp);
-        let fis = shared.heap.alloc_object(ClassId::new(0), 1);
+        let fis = shared.mem.heap.alloc_object(ClassId::new(0), 1);
         call_native(
             &shared,
             &mut thread,
@@ -3569,7 +3604,7 @@ mod tests {
         // later dispatch to fd_table().read_line(fd), we need field 0 of the
         // synthetic Reader to carry the fd itself, so we propagate it
         // manually after construction.
-        let isr = shared.heap.alloc_object(ClassId::new(0), 1);
+        let isr = shared.mem.heap.alloc_object(ClassId::new(0), 1);
         call_native(
             &shared,
             &mut thread,
@@ -3582,11 +3617,11 @@ mod tests {
         // Propagate fd FISРІвЂ вЂ™ISR so the synthetic native_br_init below sees
         // the fd Int (what fd_table().read_line wants) when it copies
         // reader.field(0) into BR.field(0).
-        let fis_fd = shared.heap.get_field(fis, 0);
-        shared.heap.set_field(isr, 0, fis_fd);
+        let fis_fd = shared.mem.heap.get_field(fis, 0);
+        shared.mem.heap.set_field(isr, 0, fis_fd);
 
         // Wrap in BufferedReader
-        let br = shared.heap.alloc_object(ClassId::new(0), 1);
+        let br = shared.mem.heap.alloc_object(ClassId::new(0), 1);
         call_native(
             &shared,
             &mut thread,
@@ -3608,7 +3643,10 @@ mod tests {
         )
         .unwrap();
         if let Some(Value::Object(Some(s))) = line1 {
-            assert_eq!(read_java_string(&shared.heap, s), Some("line1".to_string()));
+            assert_eq!(
+                read_java_string(&shared.mem.heap, s),
+                Some("line1".to_string())
+            );
         } else {
             panic!("expected String, got {line1:?}");
         }
@@ -3624,7 +3662,10 @@ mod tests {
         )
         .unwrap();
         if let Some(Value::Object(Some(s))) = line2 {
-            assert_eq!(read_java_string(&shared.heap, s), Some("line2".to_string()));
+            assert_eq!(
+                read_java_string(&shared.mem.heap, s),
+                Some("line2".to_string())
+            );
         } else {
             panic!("expected String, got {line2:?}");
         }
@@ -3667,9 +3708,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
 
         // Create File object for the directory
-        let dir_obj = shared.heap.alloc_object(ClassId::new(0), 1);
+        let dir_obj = shared.mem.heap.alloc_object(ClassId::new(0), 1);
         let dir_str = create_java_string(&shared, &dir);
         shared
+            .mem
             .heap
             .set_field(dir_obj, 0, Value::Object(Some(dir_str)));
 
@@ -3700,11 +3742,11 @@ mod tests {
         )
         .unwrap();
         if let Some(Value::Object(Some(arr))) = listing {
-            let len = shared.heap.array_length(arr);
+            let len = shared.mem.heap.array_length(arr);
             assert_eq!(len, 1);
-            if let Ok(Value::Object(Some(name_obj))) = shared.heap.get_array_element(arr, 0) {
+            if let Ok(Value::Object(Some(name_obj))) = shared.mem.heap.get_array_element(arr, 0) {
                 assert_eq!(
-                    read_java_string(&shared.heap, name_obj),
+                    read_java_string(&shared.mem.heap, name_obj),
                     Some("test.txt".to_string())
                 );
             }
@@ -3722,7 +3764,7 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         let path = create_java_string(&shared, "/nonexistent/path/file.txt");
-        let fis = shared.heap.alloc_object(ClassId::new(0), 1);
+        let fis = shared.mem.heap.alloc_object(ClassId::new(0), 1);
 
         let result = call_native(
             &shared,
@@ -3744,11 +3786,11 @@ mod tests {
         let (out, err) = shared.ensure_system_streams();
 
         // System.out should have fd_id = 1
-        let out_fd = shared.heap.get_field(out, 0);
+        let out_fd = shared.mem.heap.get_field(out, 0);
         assert_eq!(out_fd, Value::Int(1));
 
         // System.err should have fd_id = 2
-        let err_fd = shared.heap.get_field(err, 0);
+        let err_fd = shared.mem.heap.get_field(err, 0);
         assert_eq!(err_fd, Value::Int(2));
     }
 
@@ -3764,7 +3806,7 @@ mod tests {
 
         // Open FileOutputStream
         let path_obj = create_java_string(&shared, &tmp);
-        let fos = shared.heap.alloc_object(ClassId::new(0), 1);
+        let fos = shared.mem.heap.alloc_object(ClassId::new(0), 1);
         call_native(
             &shared,
             &mut thread,
@@ -3776,7 +3818,7 @@ mod tests {
         .unwrap();
 
         // Wrap in OutputStreamWriter
-        let osw = shared.heap.alloc_object(ClassId::new(0), 1);
+        let osw = shared.mem.heap.alloc_object(ClassId::new(0), 1);
         call_native(
             &shared,
             &mut thread,
@@ -3788,7 +3830,7 @@ mod tests {
         .unwrap();
 
         // Wrap in BufferedWriter
-        let bw = shared.heap.alloc_object(ClassId::new(0), 1);
+        let bw = shared.mem.heap.alloc_object(ClassId::new(0), 1);
         call_native(
             &shared,
             &mut thread,
@@ -3845,8 +3887,8 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // Allocate a 1-field object and set field 0 to Int(42)
-        let obj = shared.heap.alloc_object(ClassId::new(0), 1);
-        shared.heap.set_field(obj, 0, Value::Int(42));
+        let obj = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        shared.mem.heap.set_field(obj, 0, Value::Int(42));
 
         // CAS: expected=42, new=99 РІвЂ вЂ™ should succeed
         let result = call_native(
@@ -3867,7 +3909,7 @@ mod tests {
         assert_eq!(result, Some(Value::Int(1))); // true
 
         // Verify field changed
-        assert_eq!(shared.heap.get_field(obj, 0), Value::Int(99));
+        assert_eq!(shared.mem.heap.get_field(obj, 0), Value::Int(99));
 
         // CAS: expected=42 but actual=99 РІвЂ вЂ™ should fail
         let result = call_native(
@@ -3888,7 +3930,7 @@ mod tests {
         assert_eq!(result, Some(Value::Int(0))); // false
 
         // Field should be unchanged
-        assert_eq!(shared.heap.get_field(obj, 0), Value::Int(99));
+        assert_eq!(shared.mem.heap.get_field(obj, 0), Value::Int(99));
     }
 
     #[test]
@@ -3897,8 +3939,8 @@ mod tests {
         *shared.self_arc.write() = Some(Arc::downgrade(&shared));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let obj = shared.heap.alloc_object(ClassId::new(0), 1);
-        shared.heap.set_field(obj, 0, Value::Long(100));
+        let obj = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        shared.mem.heap.set_field(obj, 0, Value::Long(100));
 
         let result = call_native(
             &shared,
@@ -3916,7 +3958,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result, Some(Value::Int(1)));
-        assert_eq!(shared.heap.get_field(obj, 0), Value::Long(200));
+        assert_eq!(shared.mem.heap.get_field(obj, 0), Value::Long(200));
     }
 
     #[test]
@@ -3925,11 +3967,11 @@ mod tests {
         *shared.self_arc.write() = Some(Arc::downgrade(&shared));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let obj = shared.heap.alloc_object(ClassId::new(0), 1);
-        let a = shared.heap.alloc_object(ClassId::new(0), 0);
-        let b = shared.heap.alloc_object(ClassId::new(0), 0);
+        let obj = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        let a = shared.mem.heap.alloc_object(ClassId::new(0), 0);
+        let b = shared.mem.heap.alloc_object(ClassId::new(0), 0);
 
-        shared.heap.set_field(obj, 0, Value::Object(Some(a)));
+        shared.mem.heap.set_field(obj, 0, Value::Object(Some(a)));
 
         // CAS: expected=a, new=b РІвЂ вЂ™ should succeed (identity)
         let result = call_native(
@@ -3950,7 +3992,7 @@ mod tests {
         assert_eq!(result, Some(Value::Int(1)));
 
         // Verify field points to b
-        if let Value::Object(Some(val)) = shared.heap.get_field(obj, 0) {
+        if let Value::Object(Some(val)) = shared.mem.heap.get_field(obj, 0) {
             assert!(std::ptr::eq(val.as_ptr(), b.as_ptr()));
         } else {
             panic!("Expected Object(Some)");
@@ -3963,7 +4005,7 @@ mod tests {
         *shared.self_arc.write() = Some(Arc::downgrade(&shared));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let obj = shared.heap.alloc_object(ClassId::new(0), 1);
+        let obj = shared.mem.heap.alloc_object(ClassId::new(0), 1);
 
         // putIntVolatile
         call_native(
@@ -4041,8 +4083,8 @@ mod tests {
         *shared.self_arc.write() = Some(Arc::downgrade(&shared));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let obj = shared.heap.alloc_object(ClassId::new(0), 1);
-        shared.heap.set_field(obj, 0, Value::Int(10));
+        let obj = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        shared.mem.heap.set_field(obj, 0, Value::Int(10));
 
         let result = call_native(
             &shared,
@@ -4062,7 +4104,7 @@ mod tests {
         // Returns old value
         assert_eq!(result, Some(Value::Int(10)));
         // Field should be 15
-        assert_eq!(shared.heap.get_field(obj, 0), Value::Int(15));
+        assert_eq!(shared.mem.heap.get_field(obj, 0), Value::Int(15));
     }
 
     #[test]
@@ -4072,7 +4114,7 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // Create a 1-field object for AtomicInteger
-        let ai = shared.heap.alloc_object(ClassId::new(0), 1);
+        let ai = shared.mem.heap.alloc_object(ClassId::new(0), 1);
 
         // init with value 42
         call_native(
@@ -4139,7 +4181,7 @@ mod tests {
         *shared.self_arc.write() = Some(Arc::downgrade(&shared));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let ai = shared.heap.alloc_object(ClassId::new(0), 1);
+        let ai = shared.mem.heap.alloc_object(ClassId::new(0), 1);
         call_native(
             &shared,
             &mut thread,
@@ -4181,7 +4223,7 @@ mod tests {
         *shared.self_arc.write() = Some(Arc::downgrade(&shared));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let ai = shared.heap.alloc_object(ClassId::new(0), 1);
+        let ai = shared.mem.heap.alloc_object(ClassId::new(0), 1);
         call_native(
             &shared,
             &mut thread,
@@ -4223,7 +4265,7 @@ mod tests {
         *shared.self_arc.write() = Some(Arc::downgrade(&shared));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let al = shared.heap.alloc_object(ClassId::new(0), 1);
+        let al = shared.mem.heap.alloc_object(ClassId::new(0), 1);
         call_native(
             &shared,
             &mut thread,
@@ -4279,7 +4321,7 @@ mod tests {
         *shared.self_arc.write() = Some(Arc::downgrade(&shared));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let al = shared.heap.alloc_object(ClassId::new(0), 1);
+        let al = shared.mem.heap.alloc_object(ClassId::new(0), 1);
         call_native(
             &shared,
             &mut thread,
@@ -4331,9 +4373,9 @@ mod tests {
         *shared.self_arc.write() = Some(Arc::downgrade(&shared));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let ar = shared.heap.alloc_object(ClassId::new(0), 1);
-        let obj_a = shared.heap.alloc_object(ClassId::new(0), 0);
-        let obj_b = shared.heap.alloc_object(ClassId::new(0), 0);
+        let ar = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        let obj_a = shared.mem.heap.alloc_object(ClassId::new(0), 0);
+        let obj_b = shared.mem.heap.alloc_object(ClassId::new(0), 0);
 
         // init with obj_a
         call_native(
@@ -4401,9 +4443,9 @@ mod tests {
         *shared.self_arc.write() = Some(Arc::downgrade(&shared));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let ar = shared.heap.alloc_object(ClassId::new(0), 1);
-        let obj_a = shared.heap.alloc_object(ClassId::new(0), 0);
-        let obj_c = shared.heap.alloc_object(ClassId::new(0), 0); // different identity
+        let ar = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        let obj_a = shared.mem.heap.alloc_object(ClassId::new(0), 0);
+        let obj_c = shared.mem.heap.alloc_object(ClassId::new(0), 0); // different identity
 
         // init with obj_a
         call_native(
@@ -4539,7 +4581,7 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // Create ArrayList (2 fields: elementData, size)
-        let list = shared.heap.alloc_object(ClassId::new(0), 2);
+        let list = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -4633,7 +4675,10 @@ mod tests {
         )
         .unwrap();
         if let Some(Value::Object(Some(s))) = elem {
-            assert_eq!(read_java_string(&shared.heap, s), Some("hello".to_string()));
+            assert_eq!(
+                read_java_string(&shared.mem.heap, s),
+                Some("hello".to_string())
+            );
         } else {
             panic!("expected String, got {elem:?}");
         }
@@ -4649,7 +4694,10 @@ mod tests {
         )
         .unwrap();
         if let Some(Value::Object(Some(s))) = elem {
-            assert_eq!(read_java_string(&shared.heap, s), Some("world".to_string()));
+            assert_eq!(
+                read_java_string(&shared.mem.heap, s),
+                Some("world".to_string())
+            );
         } else {
             panic!("expected String, got {elem:?}");
         }
@@ -4660,7 +4708,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let list = shared.heap.alloc_object(ClassId::new(0), 2);
+        let list = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -4710,7 +4758,7 @@ mod tests {
         )
         .unwrap();
         if let Some(Value::Object(Some(s))) = removed {
-            assert_eq!(read_java_string(&shared.heap, s), Some("b".to_string()));
+            assert_eq!(read_java_string(&shared.mem.heap, s), Some("b".to_string()));
         } else {
             panic!("expected String");
         }
@@ -4738,7 +4786,7 @@ mod tests {
         )
         .unwrap();
         if let Some(Value::Object(Some(s))) = elem {
-            assert_eq!(read_java_string(&shared.heap, s), Some("c".to_string()));
+            assert_eq!(read_java_string(&shared.mem.heap, s), Some("c".to_string()));
         } else {
             panic!("expected String");
         }
@@ -4750,7 +4798,7 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // Init with capacity 2
-        let list = shared.heap.alloc_object(ClassId::new(0), 2);
+        let list = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -4799,7 +4847,7 @@ mod tests {
         .unwrap();
         if let Some(Value::Object(Some(s))) = elem {
             assert_eq!(
-                read_java_string(&shared.heap, s),
+                read_java_string(&shared.mem.heap, s),
                 Some("item19".to_string())
             );
         } else {
@@ -4812,7 +4860,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let list = shared.heap.alloc_object(ClassId::new(0), 2);
+        let list = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -4848,7 +4896,7 @@ mod tests {
         .unwrap();
         if let Some(Value::Object(Some(s))) = ts {
             assert_eq!(
-                read_java_string(&shared.heap, s),
+                read_java_string(&shared.mem.heap, s),
                 Some("[a, b]".to_string())
             );
         } else {
@@ -4861,7 +4909,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let list = shared.heap.alloc_object(ClassId::new(0), 2);
+        let list = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -4924,7 +4972,7 @@ mod tests {
         )
         .unwrap();
         if let Some(Value::Object(Some(s))) = n {
-            assert_eq!(read_java_string(&shared.heap, s), Some("x".to_string()));
+            assert_eq!(read_java_string(&shared.mem.heap, s), Some("x".to_string()));
         } else {
             panic!("expected String");
         }
@@ -4940,7 +4988,7 @@ mod tests {
         )
         .unwrap();
         if let Some(Value::Object(Some(s))) = n {
-            assert_eq!(read_java_string(&shared.heap, s), Some("y".to_string()));
+            assert_eq!(read_java_string(&shared.mem.heap, s), Some("y".to_string()));
         } else {
             panic!("expected String");
         }
@@ -4963,7 +5011,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let list = shared.heap.alloc_object(ClassId::new(0), 2);
+        let list = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -5004,7 +5052,7 @@ mod tests {
         )
         .unwrap();
         if let Some(Value::Object(Some(s))) = old {
-            assert_eq!(read_java_string(&shared.heap, s), Some("a".to_string()));
+            assert_eq!(read_java_string(&shared.mem.heap, s), Some("a".to_string()));
         } else {
             panic!("expected String");
         }
@@ -5037,7 +5085,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let list = shared.heap.alloc_object(ClassId::new(0), 2);
+        let list = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -5096,7 +5144,7 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // Create HashMap (3 fields: buckets, size, capacity)
-        let map = shared.heap.alloc_object(ClassId::new(0), 3);
+        let map = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -5161,7 +5209,10 @@ mod tests {
         )
         .unwrap();
         if let Some(Value::Object(Some(s))) = val {
-            assert_eq!(read_java_string(&shared.heap, s), Some("val1".to_string()));
+            assert_eq!(
+                read_java_string(&shared.mem.heap, s),
+                Some("val1".to_string())
+            );
         } else {
             panic!("expected String, got {val:?}");
         }
@@ -5172,7 +5223,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let map = shared.heap.alloc_object(ClassId::new(0), 3);
+        let map = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -5227,7 +5278,7 @@ mod tests {
         .unwrap();
         if let Some(Value::Object(Some(s))) = val {
             assert_eq!(
-                read_java_string(&shared.heap, s),
+                read_java_string(&shared.mem.heap, s),
                 Some("yellow".to_string())
             );
         } else {
@@ -5266,7 +5317,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let map = shared.heap.alloc_object(ClassId::new(0), 3);
+        let map = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -5305,7 +5356,7 @@ mod tests {
         )
         .unwrap();
         if let Some(Value::Object(Some(s))) = removed {
-            assert_eq!(read_java_string(&shared.heap, s), Some("v".to_string()));
+            assert_eq!(read_java_string(&shared.mem.heap, s), Some("v".to_string()));
         } else {
             panic!("expected String");
         }
@@ -5328,7 +5379,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let map = shared.heap.alloc_object(ClassId::new(0), 3);
+        let map = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -5373,7 +5424,10 @@ mod tests {
         )
         .unwrap();
         if let Some(Value::Object(Some(s))) = old {
-            assert_eq!(read_java_string(&shared.heap, s), Some("val1".to_string()));
+            assert_eq!(
+                read_java_string(&shared.mem.heap, s),
+                Some("val1".to_string())
+            );
         } else {
             panic!("expected String");
         }
@@ -5402,7 +5456,10 @@ mod tests {
         )
         .unwrap();
         if let Some(Value::Object(Some(s))) = val {
-            assert_eq!(read_java_string(&shared.heap, s), Some("val2".to_string()));
+            assert_eq!(
+                read_java_string(&shared.mem.heap, s),
+                Some("val2".to_string())
+            );
         } else {
             panic!("expected String");
         }
@@ -5414,7 +5471,7 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // Start with capacity 4 to force early resize
-        let map = shared.heap.alloc_object(ClassId::new(0), 3);
+        let map = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -5469,7 +5526,10 @@ mod tests {
             )
             .unwrap();
             if let Some(Value::Object(Some(s))) = val {
-                assert_eq!(read_java_string(&shared.heap, s), Some(format!("val{}", i)));
+                assert_eq!(
+                    read_java_string(&shared.mem.heap, s),
+                    Some(format!("val{}", i))
+                );
             } else {
                 panic!("expected String for key{}", i);
             }
@@ -5482,7 +5542,7 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // Create HashSet (1 field: backing map)
-        let set = shared.heap.alloc_object(ClassId::new(0), 1);
+        let set = shared.mem.heap.alloc_object(ClassId::new(0), 1);
         call_native(
             &shared,
             &mut thread,
@@ -5562,7 +5622,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let set = shared.heap.alloc_object(ClassId::new(0), 1);
+        let set = shared.mem.heap.alloc_object(ClassId::new(0), 1);
         call_native(
             &shared,
             &mut thread,
@@ -5617,18 +5677,22 @@ mod tests {
 
         // Create an array [a, b, c]
         let arr = shared
+            .mem
             .heap
             .alloc_array(ClassId::new(0), ArrayElementType::Reference, 3);
         let a = create_java_string(&shared, "a");
         let b = create_java_string(&shared, "b");
         let c = create_java_string(&shared, "c");
         let _ = shared
+            .mem
             .heap
             .set_array_element(arr, 0, Value::Object(Some(a)));
         let _ = shared
+            .mem
             .heap
             .set_array_element(arr, 1, Value::Object(Some(b)));
         let _ = shared
+            .mem
             .heap
             .set_array_element(arr, 2, Value::Object(Some(c)));
 
@@ -5643,16 +5707,16 @@ mod tests {
         )
         .unwrap();
         if let Some(Value::Object(Some(new_arr))) = result {
-            assert_eq!(shared.heap.array_length(new_arr), 5);
+            assert_eq!(shared.mem.heap.array_length(new_arr), 5);
             // First 3 elements copied
-            if let Ok(Value::Object(Some(s))) = shared.heap.get_array_element(new_arr, 0) {
-                assert_eq!(read_java_string(&shared.heap, s), Some("a".to_string()));
+            if let Ok(Value::Object(Some(s))) = shared.mem.heap.get_array_element(new_arr, 0) {
+                assert_eq!(read_java_string(&shared.mem.heap, s), Some("a".to_string()));
             }
-            if let Ok(Value::Object(Some(s))) = shared.heap.get_array_element(new_arr, 2) {
-                assert_eq!(read_java_string(&shared.heap, s), Some("c".to_string()));
+            if let Ok(Value::Object(Some(s))) = shared.mem.heap.get_array_element(new_arr, 2) {
+                assert_eq!(read_java_string(&shared.mem.heap, s), Some("c".to_string()));
             }
             // Element 3 should be null
-            let e3 = shared.heap.get_array_element(new_arr, 3);
+            let e3 = shared.mem.heap.get_array_element(new_arr, 3);
             assert_eq!(e3, Ok(Value::Object(None)));
         } else {
             panic!("expected array");
@@ -5669,7 +5733,7 @@ mod tests {
         )
         .unwrap();
         if let Some(Value::Object(Some(new_arr))) = result {
-            assert_eq!(shared.heap.array_length(new_arr), 2);
+            assert_eq!(shared.mem.heap.array_length(new_arr), 2);
         } else {
             panic!("expected array");
         }
@@ -5681,14 +5745,17 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         let arr = shared
+            .mem
             .heap
             .alloc_array(ClassId::new(0), ArrayElementType::Reference, 2);
         let a = create_java_string(&shared, "x");
         let b = create_java_string(&shared, "y");
         let _ = shared
+            .mem
             .heap
             .set_array_element(arr, 0, Value::Object(Some(a)));
         let _ = shared
+            .mem
             .heap
             .set_array_element(arr, 1, Value::Object(Some(b)));
 
@@ -5703,7 +5770,7 @@ mod tests {
         .unwrap();
         if let Some(Value::Object(Some(s))) = result {
             assert_eq!(
-                read_java_string(&shared.heap, s),
+                read_java_string(&shared.mem.heap, s),
                 Some("[x, y]".to_string())
             );
         } else {
@@ -5718,11 +5785,12 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         *shared.self_arc.write() = Some(Arc::downgrade(&shared));
         let tid = ThreadId(1);
-        shared.thread_registry.register(tid, "worker", None);
+        shared.threads.thread_registry.register(tid, "worker", None);
 
         // Create a JvmThread and share its interrupted flag with the registry
         let jvm_thread = JvmThread::new(tid, "worker");
         shared
+            .threads
             .thread_registry
             .set_interrupted_flag(tid, jvm_thread.interrupted.clone());
 
@@ -5732,7 +5800,7 @@ mod tests {
             .load(std::sync::atomic::Ordering::Acquire));
 
         // Interrupt via registry (simulating cross-thread interrupt)
-        shared.thread_registry.set_interrupted(tid, true);
+        shared.threads.thread_registry.set_interrupted(tid, true);
 
         // JvmThread's flag should now be set
         assert!(jvm_thread
@@ -5745,16 +5813,18 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         *shared.self_arc.write() = Some(Arc::downgrade(&shared));
         let tid = ThreadId(1);
-        shared.thread_registry.register(tid, "worker", None);
+        shared.threads.thread_registry.register(tid, "worker", None);
 
         let jvm_thread = JvmThread::new(tid, "worker");
         shared
+            .threads
             .thread_registry
             .set_interrupted_flag(tid, jvm_thread.interrupted.clone());
 
         // Create a synthetic Thread object with ThreadId stored in field 2
-        let thread_obj = shared.heap.alloc_object(ClassId::new(0), 3);
+        let thread_obj = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         shared
+            .mem
             .heap
             .set_field(thread_obj, 2, Value::Long(tid.0 as i64));
 
@@ -5776,16 +5846,17 @@ mod tests {
     fn root_snapshot_deposit_and_collect() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let tid = ThreadId(1);
-        shared.thread_registry.register(tid, "worker", None);
+        shared.threads.thread_registry.register(tid, "worker", None);
 
         let jvm_thread = JvmThread::new(tid, "worker");
         shared
+            .threads
             .thread_registry
             .set_root_snapshot(tid, jvm_thread.root_snapshot.clone());
 
         // Deposit some roots
-        let obj1 = shared.heap.alloc_object(ClassId::new(0), 0);
-        let obj2 = shared.heap.alloc_object(ClassId::new(0), 0);
+        let obj1 = shared.mem.heap.alloc_object(ClassId::new(0), 0);
+        let obj2 = shared.mem.heap.alloc_object(ClassId::new(0), 0);
         {
             let mut snapshot = jvm_thread.root_snapshot.lock();
             snapshot.push(obj1);
@@ -5793,7 +5864,7 @@ mod tests {
         }
 
         // Collect all root snapshots
-        let all_roots = shared.thread_registry.collect_all_root_snapshots();
+        let all_roots = shared.threads.thread_registry.collect_all_root_snapshots();
         assert!(all_roots.contains(&obj1));
         assert!(all_roots.contains(&obj2));
         assert_eq!(all_roots.len(), 2);
@@ -5804,28 +5875,36 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let tid1 = ThreadId(1);
         let tid2 = ThreadId(2);
-        shared.thread_registry.register(tid1, "worker-1", None);
-        shared.thread_registry.register(tid2, "worker-2", None);
+        shared
+            .threads
+            .thread_registry
+            .register(tid1, "worker-1", None);
+        shared
+            .threads
+            .thread_registry
+            .register(tid2, "worker-2", None);
 
         let thread1 = JvmThread::new(tid1, "worker-1");
         let thread2 = JvmThread::new(tid2, "worker-2");
         shared
+            .threads
             .thread_registry
             .set_root_snapshot(tid1, thread1.root_snapshot.clone());
         shared
+            .threads
             .thread_registry
             .set_root_snapshot(tid2, thread2.root_snapshot.clone());
 
-        let obj1 = shared.heap.alloc_object(ClassId::new(0), 0);
-        let obj2 = shared.heap.alloc_object(ClassId::new(0), 0);
+        let obj1 = shared.mem.heap.alloc_object(ClassId::new(0), 0);
+        let obj2 = shared.mem.heap.alloc_object(ClassId::new(0), 0);
         thread1.root_snapshot.lock().push(obj1);
         thread2.root_snapshot.lock().push(obj2);
 
         // Mark thread 2 as dead
-        shared.thread_registry.mark_dead(tid2);
+        shared.threads.thread_registry.mark_dead(tid2);
 
         // Only alive thread's roots should be collected
-        let all_roots = shared.thread_registry.collect_all_root_snapshots();
+        let all_roots = shared.threads.thread_registry.collect_all_root_snapshots();
         assert!(all_roots.contains(&obj1));
         assert!(!all_roots.contains(&obj2));
     }
@@ -5879,15 +5958,16 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         *shared.self_arc.write() = Some(Arc::downgrade(&shared));
         let tid = ThreadId(0);
-        shared.thread_registry.register(tid, "main", None);
+        shared.threads.thread_registry.register(tid, "main", None);
 
         let mut thread = JvmThread::new(tid, "main");
         shared
+            .threads
             .thread_registry
             .set_root_snapshot(tid, thread.root_snapshot.clone());
 
         // Add some objects to thread frames
-        let obj = shared.heap.alloc_object(ClassId::new(0), 0);
+        let obj = shared.mem.heap.alloc_object(ClassId::new(0), 0);
         let frame = crate::runtime::frame::Frame::new(
             ClassId::new(0),
             "TestClass".to_string(),
@@ -5938,19 +6018,19 @@ mod tests {
         .unwrap();
 
         if let Some(Value::Object(Some(arr))) = result {
-            assert_eq!(shared.heap.array_length(arr), 3);
-            if let Ok(Value::Object(Some(e0))) = shared.heap.get_array_element(arr, 0) {
-                assert_eq!(read_java_string(&shared.heap, e0), Some("a".into()));
+            assert_eq!(shared.mem.heap.array_length(arr), 3);
+            if let Ok(Value::Object(Some(e0))) = shared.mem.heap.get_array_element(arr, 0) {
+                assert_eq!(read_java_string(&shared.mem.heap, e0), Some("a".into()));
             } else {
                 panic!("expected string at index 0");
             }
-            if let Ok(Value::Object(Some(e1))) = shared.heap.get_array_element(arr, 1) {
-                assert_eq!(read_java_string(&shared.heap, e1), Some("b".into()));
+            if let Ok(Value::Object(Some(e1))) = shared.mem.heap.get_array_element(arr, 1) {
+                assert_eq!(read_java_string(&shared.mem.heap, e1), Some("b".into()));
             } else {
                 panic!("expected string at index 1");
             }
-            if let Ok(Value::Object(Some(e2))) = shared.heap.get_array_element(arr, 2) {
-                assert_eq!(read_java_string(&shared.heap, e2), Some("c".into()));
+            if let Ok(Value::Object(Some(e2))) = shared.mem.heap.get_array_element(arr, 2) {
+                assert_eq!(read_java_string(&shared.mem.heap, e2), Some("c".into()));
             } else {
                 panic!("expected string at index 2");
             }
@@ -5982,12 +6062,12 @@ mod tests {
         .unwrap();
 
         if let Some(Value::Object(Some(arr))) = result {
-            assert_eq!(shared.heap.array_length(arr), 2);
-            if let Ok(Value::Object(Some(e0))) = shared.heap.get_array_element(arr, 0) {
-                assert_eq!(read_java_string(&shared.heap, e0), Some("a".into()));
+            assert_eq!(shared.mem.heap.array_length(arr), 2);
+            if let Ok(Value::Object(Some(e0))) = shared.mem.heap.get_array_element(arr, 0) {
+                assert_eq!(read_java_string(&shared.mem.heap, e0), Some("a".into()));
             }
-            if let Ok(Value::Object(Some(e1))) = shared.heap.get_array_element(arr, 1) {
-                assert_eq!(read_java_string(&shared.heap, e1), Some("b,c".into()));
+            if let Ok(Value::Object(Some(e1))) = shared.mem.heap.get_array_element(arr, 1) {
+                assert_eq!(read_java_string(&shared.mem.heap, e1), Some("b,c".into()));
             }
         } else {
             panic!("expected array result");
@@ -6006,15 +6086,19 @@ mod tests {
 
         // Create a ref array with 3 elements
         let arr = shared
+            .mem
             .heap
             .alloc_array(ClassId::new(0), ArrayElementType::Reference, 3);
         let _ = shared
+            .mem
             .heap
             .set_array_element(arr, 0, Value::Object(Some(a)));
         let _ = shared
+            .mem
             .heap
             .set_array_element(arr, 1, Value::Object(Some(b)));
         let _ = shared
+            .mem
             .heap
             .set_array_element(arr, 2, Value::Object(Some(c)));
 
@@ -6030,7 +6114,10 @@ mod tests {
         .unwrap();
 
         if let Some(Value::Object(Some(r))) = result {
-            assert_eq!(read_java_string(&shared.heap, r), Some("a, b, c".into()));
+            assert_eq!(
+                read_java_string(&shared.mem.heap, r),
+                Some("a, b, c".into())
+            );
         } else {
             panic!("expected string result");
         }
@@ -6060,7 +6147,7 @@ mod tests {
         .unwrap();
 
         if let Some(Value::Object(Some(r))) = result {
-            assert_eq!(read_java_string(&shared.heap, r), Some("a-b-c".into()));
+            assert_eq!(read_java_string(&shared.mem.heap, r), Some("a-b-c".into()));
         } else {
             panic!("expected string result");
         }
@@ -6090,7 +6177,7 @@ mod tests {
         .unwrap();
 
         if let Some(Value::Object(Some(r))) = result {
-            assert_eq!(read_java_string(&shared.heap, r), Some("a-bXc".into()));
+            assert_eq!(read_java_string(&shared.mem.heap, r), Some("a-bXc".into()));
         } else {
             panic!("expected string result");
         }
@@ -6146,7 +6233,7 @@ mod tests {
         .unwrap();
 
         if let Some(Value::Object(Some(r))) = result {
-            assert_eq!(read_java_string(&shared.heap, r), Some("hello".into()));
+            assert_eq!(read_java_string(&shared.mem.heap, r), Some("hello".into()));
         } else {
             panic!("expected string result");
         }
@@ -6385,7 +6472,7 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // Allocate an enum-like object with 2 fields (name + ordinal)
-        let obj = shared.heap.alloc_object(ClassId::new(0), 2);
+        let obj = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         let name = create_java_string(&shared, "RED");
 
         call_native(
@@ -6403,10 +6490,13 @@ mod tests {
         .unwrap();
 
         // Verify field 0 = name, field 1 = ordinal
-        let f0 = shared.heap.get_field(obj, 0);
-        let f1 = shared.heap.get_field(obj, 1);
+        let f0 = shared.mem.heap.get_field(obj, 0);
+        let f1 = shared.mem.heap.get_field(obj, 1);
         if let Value::Object(Some(name_ref)) = f0 {
-            assert_eq!(read_java_string(&shared.heap, name_ref), Some("RED".into()));
+            assert_eq!(
+                read_java_string(&shared.mem.heap, name_ref),
+                Some("RED".into())
+            );
         } else {
             panic!("expected string in field 0");
         }
@@ -6418,7 +6508,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let obj = shared.heap.alloc_object(ClassId::new(0), 2);
+        let obj = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         let name = create_java_string(&shared, "GREEN");
 
         call_native(
@@ -6458,7 +6548,7 @@ mod tests {
         )
         .unwrap();
         if let Some(Value::Object(Some(n))) = r {
-            assert_eq!(read_java_string(&shared.heap, n), Some("GREEN".into()));
+            assert_eq!(read_java_string(&shared.mem.heap, n), Some("GREEN".into()));
         } else {
             panic!("expected string result");
         }
@@ -6469,7 +6559,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let obj1 = shared.heap.alloc_object(ClassId::new(0), 2);
+        let obj1 = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         let name1 = create_java_string(&shared, "A");
         call_native(
             &shared,
@@ -6485,7 +6575,7 @@ mod tests {
         )
         .unwrap();
 
-        let obj2 = shared.heap.alloc_object(ClassId::new(0), 2);
+        let obj2 = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         let name2 = create_java_string(&shared, "B");
         call_native(
             &shared,
@@ -6519,7 +6609,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let obj = shared.heap.alloc_object(ClassId::new(0), 2);
+        let obj = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         let name = create_java_string(&shared, "X");
         call_native(
             &shared,
@@ -6535,7 +6625,7 @@ mod tests {
         )
         .unwrap();
 
-        let other = shared.heap.alloc_object(ClassId::new(0), 2);
+        let other = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         let name2 = create_java_string(&shared, "X");
         call_native(
             &shared,
@@ -6720,7 +6810,7 @@ mod tests {
         )
         .unwrap();
         if let Some(Value::Object(Some(sr))) = r {
-            assert_eq!(read_java_string(&shared.heap, sr), Some("null".into()));
+            assert_eq!(read_java_string(&shared.mem.heap, sr), Some("null".into()));
         } else {
             panic!("expected string result");
         }
@@ -6957,7 +7047,7 @@ mod tests {
         .unwrap();
         if let Some(Value::Object(Some(sr))) = r {
             assert_eq!(
-                read_java_string(&shared.heap, sr),
+                read_java_string(&shared.mem.heap, sr),
                 Some("Optional[hello]".into())
             );
         } else {
@@ -6989,7 +7079,7 @@ mod tests {
         .unwrap();
         if let Some(Value::Object(Some(sr))) = r {
             assert_eq!(
-                read_java_string(&shared.heap, sr),
+                read_java_string(&shared.mem.heap, sr),
                 Some("Optional.empty".into())
             );
         } else {
@@ -7004,13 +7094,14 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         let arr = shared
+            .mem
             .heap
             .alloc_array(ClassId::new(0), ArrayElementType::Int, 5);
-        let _ = shared.heap.set_array_element(arr, 0, Value::Int(3));
-        let _ = shared.heap.set_array_element(arr, 1, Value::Int(1));
-        let _ = shared.heap.set_array_element(arr, 2, Value::Int(4));
-        let _ = shared.heap.set_array_element(arr, 3, Value::Int(1));
-        let _ = shared.heap.set_array_element(arr, 4, Value::Int(5));
+        let _ = shared.mem.heap.set_array_element(arr, 0, Value::Int(3));
+        let _ = shared.mem.heap.set_array_element(arr, 1, Value::Int(1));
+        let _ = shared.mem.heap.set_array_element(arr, 2, Value::Int(4));
+        let _ = shared.mem.heap.set_array_element(arr, 3, Value::Int(1));
+        let _ = shared.mem.heap.set_array_element(arr, 4, Value::Int(5));
 
         call_native(
             &shared,
@@ -7022,11 +7113,11 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(shared.heap.get_array_element(arr, 0), Ok(Value::Int(1)));
-        assert_eq!(shared.heap.get_array_element(arr, 1), Ok(Value::Int(1)));
-        assert_eq!(shared.heap.get_array_element(arr, 2), Ok(Value::Int(3)));
-        assert_eq!(shared.heap.get_array_element(arr, 3), Ok(Value::Int(4)));
-        assert_eq!(shared.heap.get_array_element(arr, 4), Ok(Value::Int(5)));
+        assert_eq!(shared.mem.heap.get_array_element(arr, 0), Ok(Value::Int(1)));
+        assert_eq!(shared.mem.heap.get_array_element(arr, 1), Ok(Value::Int(1)));
+        assert_eq!(shared.mem.heap.get_array_element(arr, 2), Ok(Value::Int(3)));
+        assert_eq!(shared.mem.heap.get_array_element(arr, 3), Ok(Value::Int(4)));
+        assert_eq!(shared.mem.heap.get_array_element(arr, 4), Ok(Value::Int(5)));
     }
 
     #[test]
@@ -7036,6 +7127,7 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         let arr = shared
+            .mem
             .heap
             .alloc_array(ClassId::new(0), ArrayElementType::Int, 5);
 
@@ -7050,7 +7142,10 @@ mod tests {
         .unwrap();
 
         for i in 0..5 {
-            assert_eq!(shared.heap.get_array_element(arr, i), Ok(Value::Int(42)));
+            assert_eq!(
+                shared.mem.heap.get_array_element(arr, i),
+                Ok(Value::Int(42))
+            );
         }
     }
 
@@ -7061,13 +7156,14 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         let arr = shared
+            .mem
             .heap
             .alloc_array(ClassId::new(0), ArrayElementType::Int, 5);
-        let _ = shared.heap.set_array_element(arr, 0, Value::Int(1));
-        let _ = shared.heap.set_array_element(arr, 1, Value::Int(3));
-        let _ = shared.heap.set_array_element(arr, 2, Value::Int(5));
-        let _ = shared.heap.set_array_element(arr, 3, Value::Int(7));
-        let _ = shared.heap.set_array_element(arr, 4, Value::Int(9));
+        let _ = shared.mem.heap.set_array_element(arr, 0, Value::Int(1));
+        let _ = shared.mem.heap.set_array_element(arr, 1, Value::Int(3));
+        let _ = shared.mem.heap.set_array_element(arr, 2, Value::Int(5));
+        let _ = shared.mem.heap.set_array_element(arr, 3, Value::Int(7));
+        let _ = shared.mem.heap.set_array_element(arr, 4, Value::Int(9));
 
         // Search for 5 РІвЂ вЂ™ index 2
         let r = call_native(
@@ -7102,7 +7198,7 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // Create ArrayList with ["cherry", "apple", "banana"]
-        let list = shared.heap.alloc_object(ClassId::new(0), 2); // 2 fields: data, size
+        let list = shared.mem.heap.alloc_object(ClassId::new(0), 2); // 2 fields: data, size
         call_native(
             &shared,
             &mut thread,
@@ -7167,7 +7263,7 @@ mod tests {
         )
         .unwrap();
         if let Some(Value::Object(Some(s))) = r0 {
-            assert_eq!(read_java_string(&shared.heap, s), Some("apple".into()));
+            assert_eq!(read_java_string(&shared.mem.heap, s), Some("apple".into()));
         } else {
             panic!("expected string at index 0");
         }
@@ -7182,7 +7278,7 @@ mod tests {
         )
         .unwrap();
         if let Some(Value::Object(Some(s))) = r1 {
-            assert_eq!(read_java_string(&shared.heap, s), Some("banana".into()));
+            assert_eq!(read_java_string(&shared.mem.heap, s), Some("banana".into()));
         } else {
             panic!("expected string at index 1");
         }
@@ -7197,7 +7293,7 @@ mod tests {
         )
         .unwrap();
         if let Some(Value::Object(Some(s))) = r2 {
-            assert_eq!(read_java_string(&shared.heap, s), Some("cherry".into()));
+            assert_eq!(read_java_string(&shared.mem.heap, s), Some("cherry".into()));
         } else {
             panic!("expected string at index 2");
         }
@@ -7276,7 +7372,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let list = shared.heap.alloc_object(ClassId::new(0), 2);
+        let list = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -7324,7 +7420,7 @@ mod tests {
         )
         .unwrap();
         if let Some(Value::Object(Some(s))) = r0 {
-            assert_eq!(read_java_string(&shared.heap, s), Some("c".into()));
+            assert_eq!(read_java_string(&shared.mem.heap, s), Some("c".into()));
         }
 
         let r2 = call_native(
@@ -7337,7 +7433,7 @@ mod tests {
         )
         .unwrap();
         if let Some(Value::Object(Some(s))) = r2 {
-            assert_eq!(read_java_string(&shared.heap, s), Some("a".into()));
+            assert_eq!(read_java_string(&shared.mem.heap, s), Some("a".into()));
         }
     }
 
@@ -7441,7 +7537,7 @@ mod tests {
         use crate::classloading::resolution::{LambdaCallSite, MethodHandle};
         let proxy_class_id = shared.alloc_lambda_proxy_id();
         let call_site = LambdaCallSite {
-                functional_interface_id: None,
+            functional_interface_id: None,
             functional_interface: functional_interface.to_string(),
             sam_method_name: sam_name.to_string(),
             sam_descriptor: sam_desc.to_string(),
@@ -7456,14 +7552,14 @@ mod tests {
             proxy_class_id,
         };
         {
-            let mut proxies = shared.lambda_proxies.write();
+            let mut proxies = shared.classes.lambda_proxies.write();
             if proxies.len() < MAX_LAMBDA_PROXIES {
                 proxies.insert(proxy_class_id, call_site);
             }
         }
-        let proxy = shared.heap.alloc_object(proxy_class_id, captures.len());
+        let proxy = shared.mem.heap.alloc_object(proxy_class_id, captures.len());
         for (i, val) in captures.iter().enumerate() {
-            shared.heap.set_field(proxy, i, *val);
+            shared.mem.heap.set_field(proxy, i, *val);
         }
         proxy
     }
@@ -7595,9 +7691,10 @@ mod tests {
         // default (the pre-fix bug surfaced an empty ArrayList here).
         match result {
             Some(Value::Object(Some(r))) => {
-                let cid = ctx.shared.heap.class_id_of(r);
+                let cid = ctx.shared.mem.heap.class_id_of(r);
                 let name = ctx
                     .shared
+                    .classes
                     .class_manager
                     .read()
                     .get_class(cid)
@@ -7643,7 +7740,7 @@ mod tests {
         .unwrap();
         match result {
             Value::Object(Some(r)) => {
-                let s = read_java_string(&shared.heap, r).unwrap();
+                let s = read_java_string(&shared.mem.heap, r).unwrap();
                 assert_eq!(s, "42");
             }
             _ => panic!("expected string"),
@@ -7656,7 +7753,7 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // Create ArrayList with ["a", "b", "c"]
-        let list_ref = shared.heap.alloc_object(ClassId::new(0), 2);
+        let list_ref = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -7684,7 +7781,7 @@ mod tests {
         // it's a static that takes Object. Instead, use a simpler approach:
         // Create a lambda that calls a native to record output.
         // Let's use PrintStream.println(String) with a captured PrintStream.
-        let ps = shared.heap.alloc_object(ClassId::new(0), 0);
+        let ps = shared.mem.heap.alloc_object(ClassId::new(0), 0);
         let consumer = make_lambda_proxy(
             &shared,
             "java/util/function/Consumer",
@@ -7717,7 +7814,7 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // Create HashSet and add "x"
-        let set_ref = shared.heap.alloc_object(ClassId::new(0), 1);
+        let set_ref = shared.mem.heap.alloc_object(ClassId::new(0), 1);
         call_native(
             &shared,
             &mut thread,
@@ -7739,7 +7836,7 @@ mod tests {
         .unwrap();
 
         // Consumer lambda РІвЂ вЂ™ PrintStream.println
-        let ps = shared.heap.alloc_object(ClassId::new(0), 0);
+        let ps = shared.mem.heap.alloc_object(ClassId::new(0), 0);
         let consumer = make_lambda_proxy(
             &shared,
             "java/util/function/Consumer",
@@ -7772,7 +7869,7 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // Create HashMap with "k" РІвЂ вЂ™ "v"
-        let map_ref = shared.heap.alloc_object(ClassId::new(0), 3);
+        let map_ref = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -7826,7 +7923,7 @@ mod tests {
         //
         // Let's just verify forEach runs to completion without errors.
         // The lambda will call a no-op: tempPrint(key).
-        let ps = shared.heap.alloc_object(ClassId::new(0), 0);
+        let ps = shared.mem.heap.alloc_object(ClassId::new(0), 0);
         // We'll create a lambda: accept(k, v) РІвЂ вЂ™ println(k)
         // This works by: capture PrintStream, then impl is
         // PrintStream.println(String) with descriptor (Ljava/lang/String;)V
@@ -7898,7 +7995,7 @@ mod tests {
         };
 
         // Consumer: println(value)
-        let ps = shared.heap.alloc_object(ClassId::new(0), 0);
+        let ps = shared.mem.heap.alloc_object(ClassId::new(0), 0);
         let consumer = make_lambda_proxy(
             &shared,
             "java/util/function/Consumer",
@@ -7945,7 +8042,7 @@ mod tests {
             _ => panic!("expected Optional object"),
         };
 
-        let ps = shared.heap.alloc_object(ClassId::new(0), 0);
+        let ps = shared.mem.heap.alloc_object(ClassId::new(0), 0);
         let consumer = make_lambda_proxy(
             &shared,
             "java/util/function/Consumer",
@@ -8051,7 +8148,7 @@ mod tests {
         .unwrap();
         match inner {
             Value::Object(Some(r)) => {
-                let s = read_java_string(&shared.heap, r).unwrap();
+                let s = read_java_string(&shared.mem.heap, r).unwrap();
                 assert_eq!(s, "HELLO");
             }
             _ => panic!("expected string"),
@@ -8225,7 +8322,7 @@ mod tests {
         // Result should be Integer(99)
         match result {
             Value::Object(Some(r)) => {
-                let int_val = shared.heap.get_field(r, 0);
+                let int_val = shared.mem.heap.get_field(r, 0);
                 assert_eq!(int_val, Value::Int(99));
             }
             _ => panic!("expected Integer object"),
@@ -8311,7 +8408,7 @@ mod tests {
         .unwrap();
         match inner {
             Value::Object(Some(r)) => {
-                let s = read_java_string(&shared.heap, r).unwrap();
+                let s = read_java_string(&shared.mem.heap, r).unwrap();
                 assert_eq!(s, "hi");
             }
             _ => panic!("expected string"),
@@ -8324,7 +8421,7 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // Create ArrayList with [3, 1, 2] as Integers
-        let list_ref = shared.heap.alloc_object(ClassId::new(0), 2);
+        let list_ref = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -8468,7 +8565,7 @@ mod tests {
             .unwrap();
             match elem {
                 Value::Object(Some(r)) => {
-                    sorted_strs.push(read_java_string(&shared.heap, r).unwrap());
+                    sorted_strs.push(read_java_string(&shared.mem.heap, r).unwrap());
                 }
                 _ => panic!("expected string at index {i}"),
             }
@@ -8482,7 +8579,7 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // Create ArrayList with ["z", "a", "m"]
-        let list_ref = shared.heap.alloc_object(ClassId::new(0), 2);
+        let list_ref = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -8547,7 +8644,7 @@ mod tests {
             .unwrap();
             match elem {
                 Value::Object(Some(r)) => {
-                    sorted_strs.push(read_java_string(&shared.heap, r).unwrap());
+                    sorted_strs.push(read_java_string(&shared.mem.heap, r).unwrap());
                 }
                 _ => panic!("expected string"),
             }
@@ -8567,9 +8664,9 @@ mod tests {
 
         let k = create_java_string(&shared, "hello");
         let v = create_java_string(&shared, "world");
-        let entry = shared.heap.alloc_object(ClassId::new(0), 2);
-        shared.heap.set_field(entry, 0, Value::Object(Some(k)));
-        shared.heap.set_field(entry, 1, Value::Object(Some(v)));
+        let entry = shared.mem.heap.alloc_object(ClassId::new(0), 2);
+        shared.mem.heap.set_field(entry, 0, Value::Object(Some(k)));
+        shared.mem.heap.set_field(entry, 1, Value::Object(Some(v)));
 
         let got_key = call_native(
             &shared,
@@ -8594,8 +8691,8 @@ mod tests {
 
         match (got_key, got_val) {
             (Value::Object(Some(kr)), Value::Object(Some(vr))) => {
-                assert_eq!(read_java_string(&shared.heap, kr).unwrap(), "hello");
-                assert_eq!(read_java_string(&shared.heap, vr).unwrap(), "world");
+                assert_eq!(read_java_string(&shared.mem.heap, kr).unwrap(), "hello");
+                assert_eq!(read_java_string(&shared.mem.heap, vr).unwrap(), "world");
             }
             _ => panic!("expected objects"),
         }
@@ -8609,9 +8706,9 @@ mod tests {
         let k = create_java_string(&shared, "k");
         let v1 = create_java_string(&shared, "old");
         let v2 = create_java_string(&shared, "new");
-        let entry = shared.heap.alloc_object(ClassId::new(0), 2);
-        shared.heap.set_field(entry, 0, Value::Object(Some(k)));
-        shared.heap.set_field(entry, 1, Value::Object(Some(v1)));
+        let entry = shared.mem.heap.alloc_object(ClassId::new(0), 2);
+        shared.mem.heap.set_field(entry, 0, Value::Object(Some(k)));
+        shared.mem.heap.set_field(entry, 1, Value::Object(Some(v1)));
 
         let old = call_native(
             &shared,
@@ -8626,12 +8723,16 @@ mod tests {
 
         // Old value should be "old"
         match old {
-            Value::Object(Some(r)) => assert_eq!(read_java_string(&shared.heap, r).unwrap(), "old"),
+            Value::Object(Some(r)) => {
+                assert_eq!(read_java_string(&shared.mem.heap, r).unwrap(), "old")
+            }
             _ => panic!("expected object"),
         }
         // New value should be "new"
-        match shared.heap.get_field(entry, 1) {
-            Value::Object(Some(r)) => assert_eq!(read_java_string(&shared.heap, r).unwrap(), "new"),
+        match shared.mem.heap.get_field(entry, 1) {
+            Value::Object(Some(r)) => {
+                assert_eq!(read_java_string(&shared.mem.heap, r).unwrap(), "new")
+            }
             _ => panic!("expected object"),
         }
     }
@@ -8642,7 +8743,7 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // Create ArrayList with [10, 20, 30]
-        let list = shared.heap.alloc_object(ClassId::new(0), 2);
+        let list = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -8654,8 +8755,8 @@ mod tests {
         .unwrap();
         for val in [10, 20, 30] {
             // We'll box ints as Integer objects: alloc 1-field, set field 0 = Int
-            let int_obj = shared.heap.alloc_object(ClassId::new(0), 1);
-            shared.heap.set_field(int_obj, 0, Value::Int(val));
+            let int_obj = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+            shared.mem.heap.set_field(int_obj, 0, Value::Int(val));
             call_native(
                 &shared,
                 &mut thread,
@@ -8719,7 +8820,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let list = shared.heap.alloc_object(ClassId::new(0), 2);
+        let list = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -8793,7 +8894,7 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // Create ArrayList with [10, 20]
-        let list = shared.heap.alloc_object(ClassId::new(0), 2);
+        let list = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -8804,8 +8905,8 @@ mod tests {
         )
         .unwrap();
         for val in [Value::Int(10), Value::Int(20)] {
-            let obj = shared.heap.alloc_object(ClassId::new(0), 1);
-            shared.heap.set_field(obj, 0, val);
+            let obj = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+            shared.mem.heap.set_field(obj, 0, val);
             call_native(
                 &shared,
                 &mut thread,
@@ -8861,7 +8962,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let map = shared.heap.alloc_object(ClassId::new(0), 3);
+        let map = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -8924,7 +9025,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let map = shared.heap.alloc_object(ClassId::new(0), 3);
+        let map = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -8983,7 +9084,7 @@ mod tests {
         // Should return existing value
         match result {
             Value::Object(Some(r)) => {
-                assert_eq!(read_java_string(&shared.heap, r).unwrap(), "existing");
+                assert_eq!(read_java_string(&shared.mem.heap, r).unwrap(), "existing");
             }
             _ => panic!("expected existing value"),
         }
@@ -8994,7 +9095,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let map = shared.heap.alloc_object(ClassId::new(0), 3);
+        let map = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -9059,7 +9160,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let map = shared.heap.alloc_object(ClassId::new(0), 3);
+        let map = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -9117,7 +9218,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let map = shared.heap.alloc_object(ClassId::new(0), 3);
+        let map = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -9261,7 +9362,9 @@ mod tests {
         .unwrap()
         .unwrap();
         match elem0 {
-            Value::Object(Some(r)) => assert_eq!(read_java_string(&shared.heap, r).unwrap(), "a"),
+            Value::Object(Some(r)) => {
+                assert_eq!(read_java_string(&shared.mem.heap, r).unwrap(), "a")
+            }
             _ => panic!("expected string"),
         }
     }
@@ -9273,11 +9376,13 @@ mod tests {
 
         // Create Object[] with 3 elements
         let arr = shared
+            .mem
             .heap
             .alloc_array(ClassId::new(0), ArrayElementType::Reference, 3);
         for (i, s) in ["x", "y", "z"].iter().enumerate() {
             let sr = create_java_string(&shared, s);
             let _ = shared
+                .mem
                 .heap
                 .set_array_element(arr, i, Value::Object(Some(sr)));
         }
@@ -9421,7 +9526,9 @@ mod tests {
         .unwrap()
         .unwrap();
         match got {
-            Value::Object(Some(r)) => assert_eq!(read_java_string(&shared.heap, r).unwrap(), "val"),
+            Value::Object(Some(r)) => {
+                assert_eq!(read_java_string(&shared.mem.heap, r).unwrap(), "val")
+            }
             _ => panic!("expected val"),
         }
     }
@@ -9472,8 +9579,8 @@ mod tests {
 
         match (got_key, got_val) {
             (Value::Object(Some(kr)), Value::Object(Some(vr))) => {
-                assert_eq!(read_java_string(&shared.heap, kr).unwrap(), "ek");
-                assert_eq!(read_java_string(&shared.heap, vr).unwrap(), "ev");
+                assert_eq!(read_java_string(&shared.mem.heap, kr).unwrap(), "ek");
+                assert_eq!(read_java_string(&shared.mem.heap, vr).unwrap(), "ev");
             }
             _ => panic!("expected objects"),
         }
@@ -9520,11 +9627,13 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         let arr = shared
+            .mem
             .heap
             .alloc_array(ClassId::new(0), ArrayElementType::Reference, 3);
         for (i, s) in ["a", "b", "c"].iter().enumerate() {
             let sr = create_java_string(&shared, s);
             let _ = shared
+                .mem
                 .heap
                 .set_array_element(arr, i, Value::Object(Some(sr)));
         }
@@ -9585,7 +9694,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let list = shared.heap.alloc_object(ClassId::new(0), 2);
+        let list = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -9640,11 +9749,13 @@ mod tests {
 
         // Create stream of 3 elements
         let arr = shared
+            .mem
             .heap
             .alloc_array(ClassId::new(0), ArrayElementType::Reference, 3);
         for (i, s) in ["a", "b", "c"].iter().enumerate() {
             let sr = create_java_string(&shared, s);
             let _ = shared
+                .mem
                 .heap
                 .set_array_element(arr, i, Value::Object(Some(sr)));
         }
@@ -9756,11 +9867,13 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         let arr = shared
+            .mem
             .heap
             .alloc_array(ClassId::new(0), ArrayElementType::Reference, 3);
         for (i, s) in ["c", "a", "b"].iter().enumerate() {
             let sr = create_java_string(&shared, s);
             let _ = shared
+                .mem
                 .heap
                 .set_array_element(arr, i, Value::Object(Some(sr)));
         }
@@ -9810,7 +9923,9 @@ mod tests {
         .unwrap()
         .unwrap();
         match val {
-            Value::Object(Some(r)) => assert_eq!(read_java_string(&shared.heap, r).unwrap(), "a"),
+            Value::Object(Some(r)) => {
+                assert_eq!(read_java_string(&shared.mem.heap, r).unwrap(), "a")
+            }
             _ => panic!("expected string"),
         }
     }
@@ -9825,6 +9940,7 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         let arr = shared
+            .mem
             .heap
             .alloc_array(ClassId::new(0), ArrayElementType::Reference, 4);
         let a1 = create_java_string(&shared, "a");
@@ -9832,15 +9948,19 @@ mod tests {
         let b = create_java_string(&shared, "b");
         let a3 = create_java_string(&shared, "a");
         let _ = shared
+            .mem
             .heap
             .set_array_element(arr, 0, Value::Object(Some(a1)));
         let _ = shared
+            .mem
             .heap
             .set_array_element(arr, 1, Value::Object(Some(a2)));
         let _ = shared
+            .mem
             .heap
             .set_array_element(arr, 2, Value::Object(Some(b)));
         let _ = shared
+            .mem
             .heap
             .set_array_element(arr, 3, Value::Object(Some(a3)));
 
@@ -9883,11 +10003,13 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         let arr = shared
+            .mem
             .heap
             .alloc_array(ClassId::new(0), ArrayElementType::Reference, 5);
         for i in 0..5 {
             let sr = create_java_string(&shared, &format!("e{i}"));
             let _ = shared
+                .mem
                 .heap
                 .set_array_element(arr, i, Value::Object(Some(sr)));
         }
@@ -9930,11 +10052,13 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         let arr = shared
+            .mem
             .heap
             .alloc_array(ClassId::new(0), ArrayElementType::Reference, 5);
         for i in 0..5 {
             let sr = create_java_string(&shared, &format!("e{i}"));
             let _ = shared
+                .mem
                 .heap
                 .set_array_element(arr, i, Value::Object(Some(sr)));
         }
@@ -9979,11 +10103,13 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         let arr = shared
+            .mem
             .heap
             .alloc_array(ClassId::new(0), ArrayElementType::Reference, 2);
         for (i, s) in ["hi", "world"].iter().enumerate() {
             let sr = create_java_string(&shared, s);
             let _ = shared
+                .mem
                 .heap
                 .set_array_element(arr, i, Value::Object(Some(sr)));
         }
@@ -9998,7 +10124,7 @@ mod tests {
         .unwrap()
         .unwrap();
 
-        let ps = shared.heap.alloc_object(ClassId::new(0), 0);
+        let ps = shared.mem.heap.alloc_object(ClassId::new(0), 0);
         let consumer = make_lambda_proxy(
             &shared,
             "java/util/function/Consumer",
@@ -10031,14 +10157,17 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         let arr = shared
+            .mem
             .heap
             .alloc_array(ClassId::new(0), ArrayElementType::Reference, 2);
         let a = create_java_string(&shared, "a");
         let b = create_java_string(&shared, "b");
         let _ = shared
+            .mem
             .heap
             .set_array_element(arr, 0, Value::Object(Some(a)));
         let _ = shared
+            .mem
             .heap
             .set_array_element(arr, 1, Value::Object(Some(b)));
         let stream = call_native(
@@ -10066,7 +10195,7 @@ mod tests {
             Value::Object(Some(r)) => r,
             _ => panic!("expected array"),
         };
-        assert_eq!(shared.heap.array_length(result_arr), 2);
+        assert_eq!(shared.mem.heap.array_length(result_arr), 2);
     }
 
     #[test]
@@ -10207,11 +10336,12 @@ mod tests {
 
         // Stream of 3 Int values РІР‚вЂќ reduce with identity using a BinaryOperator
         let arr = shared
+            .mem
             .heap
             .alloc_array(ClassId::new(0), ArrayElementType::Reference, 3);
-        let _ = shared.heap.set_array_element(arr, 0, Value::Int(10));
-        let _ = shared.heap.set_array_element(arr, 1, Value::Int(20));
-        let _ = shared.heap.set_array_element(arr, 2, Value::Int(30));
+        let _ = shared.mem.heap.set_array_element(arr, 0, Value::Int(10));
+        let _ = shared.mem.heap.set_array_element(arr, 1, Value::Int(20));
+        let _ = shared.mem.heap.set_array_element(arr, 2, Value::Int(30));
 
         let stream = call_native(
             &shared,
@@ -10251,7 +10381,7 @@ mod tests {
         // reduce(T identity, BinaryOperator<T>) returns T (object reference).
         // coerce_return boxes the primitive result to Integer; verify it holds 30.
         match result {
-            Value::Object(Some(r)) => assert_eq!(shared.heap.get_field(r, 0), Value::Int(30)),
+            Value::Object(Some(r)) => assert_eq!(shared.mem.heap.get_field(r, 0), Value::Int(30)),
             Value::Int(n) => assert_eq!(n, 30), // tolerate already-unboxed path
             other => panic!("unexpected reduce result: {:?}", other),
         }
@@ -10265,14 +10395,17 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         let arr = shared
+            .mem
             .heap
             .alloc_array(ClassId::new(0), ArrayElementType::Reference, 2);
         let a = create_java_string(&shared, "a");
         let b = create_java_string(&shared, "b");
         let _ = shared
+            .mem
             .heap
             .set_array_element(arr, 0, Value::Object(Some(a)));
         let _ = shared
+            .mem
             .heap
             .set_array_element(arr, 1, Value::Object(Some(b)));
         let stream = call_native(
@@ -10387,11 +10520,13 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         let arr = shared
+            .mem
             .heap
             .alloc_array(ClassId::new(0), ArrayElementType::Reference, 3);
         for (i, s) in ["a", "b", "c"].iter().enumerate() {
             let sr = create_java_string(&shared, s);
             let _ = shared
+                .mem
                 .heap
                 .set_array_element(arr, i, Value::Object(Some(sr)));
         }
@@ -10431,7 +10566,7 @@ mod tests {
 
         match result {
             Value::Object(Some(r)) => {
-                assert_eq!(read_java_string(&shared.heap, r).unwrap(), "a,b,c")
+                assert_eq!(read_java_string(&shared.mem.heap, r).unwrap(), "a,b,c")
             }
             _ => panic!("expected string"),
         }
@@ -10632,11 +10767,13 @@ mod tests {
 
         // Stream of ["a", "b", "c"]
         let arr = shared
+            .mem
             .heap
             .alloc_array(ClassId::new(0), ArrayElementType::Reference, 3);
         for (i, s) in ["a", "b", "c"].iter().enumerate() {
             let sr = create_java_string(&shared, s);
             let _ = shared
+                .mem
                 .heap
                 .set_array_element(arr, i, Value::Object(Some(sr)));
         }
@@ -10744,14 +10881,17 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         let arr = shared
+            .mem
             .heap
             .alloc_array(ClassId::new(0), ArrayElementType::Reference, 2);
         let a = create_java_string(&shared, "a");
         let b = create_java_string(&shared, "b");
         let _ = shared
+            .mem
             .heap
             .set_array_element(arr, 0, Value::Object(Some(a)));
         let _ = shared
+            .mem
             .heap
             .set_array_element(arr, 1, Value::Object(Some(b)));
         let stream = call_native(
@@ -10804,9 +10944,9 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // Allocate a Throwable object (2 fields: detailMessage, cause)
-        let obj = shared.heap.alloc_object(ClassId::new(0), 2);
+        let obj = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         let msg = create_java_string(&shared, "test error message");
-        shared.heap.set_field(obj, 0, Value::Object(Some(msg)));
+        shared.mem.heap.set_field(obj, 0, Value::Object(Some(msg)));
 
         let result = call_native(
             &shared,
@@ -10821,7 +10961,7 @@ mod tests {
 
         match result {
             Value::Object(Some(str_ref)) => {
-                let text = read_java_string(&shared.heap, str_ref).unwrap();
+                let text = read_java_string(&shared.mem.heap, str_ref).unwrap();
                 assert_eq!(text, "test error message");
             }
             _ => panic!("expected string, got {:?}", result),
@@ -10834,7 +10974,7 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // Throwable with 2 fields: detailMessage=null, cause=null
-        let obj = shared.heap.alloc_object(ClassId::new(0), 2);
+        let obj = shared.mem.heap.alloc_object(ClassId::new(0), 2);
 
         let result = call_native(
             &shared,
@@ -10855,8 +10995,8 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let throwable = shared.heap.alloc_object(ClassId::new(0), 2);
-        let cause = shared.heap.alloc_object(ClassId::new(0), 2);
+        let throwable = shared.mem.heap.alloc_object(ClassId::new(0), 2);
+        let cause = shared.mem.heap.alloc_object(ClassId::new(0), 2);
 
         let result = call_native(
             &shared,
@@ -10897,9 +11037,9 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let obj = shared.heap.alloc_object(ClassId::new(0), 2);
+        let obj = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         let msg = create_java_string(&shared, "oops");
-        shared.heap.set_field(obj, 0, Value::Object(Some(msg)));
+        shared.mem.heap.set_field(obj, 0, Value::Object(Some(msg)));
 
         let result = call_native(
             &shared,
@@ -10914,7 +11054,7 @@ mod tests {
 
         match result {
             Value::Object(Some(sr)) => {
-                let text = read_java_string(&shared.heap, sr).unwrap();
+                let text = read_java_string(&shared.mem.heap, sr).unwrap();
                 // ClassId(0) has no class name in the store, so it'll use a fallback
                 // The toString should contain ": oops"
                 assert!(
@@ -10931,7 +11071,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let obj = shared.heap.alloc_object(ClassId::new(0), 2);
+        let obj = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         // no message set РІР‚вЂќ field 0 defaults to uninitialized
 
         let result = call_native(
@@ -10947,7 +11087,7 @@ mod tests {
 
         match result {
             Value::Object(Some(sr)) => {
-                let text = read_java_string(&shared.heap, sr).unwrap();
+                let text = read_java_string(&shared.mem.heap, sr).unwrap();
                 // Should be just the class name, no ": "
                 assert!(
                     !text.contains(": "),
@@ -10963,9 +11103,9 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let obj = shared.heap.alloc_object(ClassId::new(0), 2);
+        let obj = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         let msg = create_java_string(&shared, "test error");
-        shared.heap.set_field(obj, 0, Value::Object(Some(msg)));
+        shared.mem.heap.set_field(obj, 0, Value::Object(Some(msg)));
 
         // Should not crash
         let result = call_native(
@@ -10991,7 +11131,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let obj = shared.heap.alloc_object(ClassId::new(0), 2);
+        let obj = shared.mem.heap.alloc_object(ClassId::new(0), 2);
 
         let result = call_native(
             &shared,
@@ -11006,7 +11146,7 @@ mod tests {
 
         match result {
             Value::Object(Some(arr)) => {
-                let len = shared.heap.array_length(arr);
+                let len = shared.mem.heap.array_length(arr);
                 assert_eq!(len, 0);
             }
             _ => panic!("expected empty array"),
@@ -11018,7 +11158,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let obj = shared.heap.alloc_object(ClassId::new(0), 2);
+        let obj = shared.mem.heap.alloc_object(ClassId::new(0), 2);
 
         let result = call_native(
             &shared,
@@ -11033,7 +11173,7 @@ mod tests {
 
         match result {
             Value::Object(Some(arr)) => {
-                let len = shared.heap.array_length(arr);
+                let len = shared.mem.heap.array_length(arr);
                 assert_eq!(len, 0);
             }
             _ => panic!("expected empty array"),
@@ -11048,7 +11188,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let list = shared.heap.alloc_object(ClassId::new(0), 2);
+        let list = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -11090,7 +11230,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let list = shared.heap.alloc_object(ClassId::new(0), 2);
+        let list = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -11145,7 +11285,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let list = shared.heap.alloc_object(ClassId::new(0), 2);
+        let list = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -11179,7 +11319,7 @@ mod tests {
         .unwrap();
         match elem {
             Value::Object(Some(r)) => {
-                let text = read_java_string(&shared.heap, r).unwrap();
+                let text = read_java_string(&shared.mem.heap, r).unwrap();
                 assert_eq!(text, "val");
             }
             _ => panic!("expected string"),
@@ -11194,7 +11334,7 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // Create source list with 2 elements
-        let src = shared.heap.alloc_object(ClassId::new(0), 2);
+        let src = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -11226,7 +11366,7 @@ mod tests {
         .unwrap();
 
         // Create copy via copy constructor
-        let copy = shared.heap.alloc_object(ClassId::new(0), 2);
+        let copy = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -11262,7 +11402,9 @@ mod tests {
         .unwrap()
         .unwrap();
         match e0 {
-            Value::Object(Some(r)) => assert_eq!(read_java_string(&shared.heap, r).unwrap(), "a"),
+            Value::Object(Some(r)) => {
+                assert_eq!(read_java_string(&shared.mem.heap, r).unwrap(), "a")
+            }
             _ => panic!("expected string"),
         }
     }
@@ -11273,7 +11415,7 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // Create source list with elements
-        let src = shared.heap.alloc_object(ClassId::new(0), 2);
+        let src = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -11305,7 +11447,7 @@ mod tests {
         .unwrap();
 
         // Create HashSet from the list
-        let set = shared.heap.alloc_object(ClassId::new(0), 1);
+        let set = shared.mem.heap.alloc_object(ClassId::new(0), 1);
         call_native(
             &shared,
             &mut thread,
@@ -11335,7 +11477,7 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // Create source map with one entry
-        let src = shared.heap.alloc_object(ClassId::new(0), 3);
+        let src = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -11362,7 +11504,7 @@ mod tests {
         .unwrap();
 
         // Copy constructor
-        let copy = shared.heap.alloc_object(ClassId::new(0), 3);
+        let copy = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -11398,7 +11540,9 @@ mod tests {
         .unwrap()
         .unwrap();
         match got {
-            Value::Object(Some(r)) => assert_eq!(read_java_string(&shared.heap, r).unwrap(), "val"),
+            Value::Object(Some(r)) => {
+                assert_eq!(read_java_string(&shared.mem.heap, r).unwrap(), "val")
+            }
             _ => panic!("expected string value"),
         }
     }
@@ -11427,7 +11571,7 @@ mod tests {
 
         match result {
             Value::Object(Some(sr)) => {
-                let text = read_java_string(&shared.heap, sr).unwrap();
+                let text = read_java_string(&shared.mem.heap, sr).unwrap();
                 assert_eq!(text, "hello");
             }
             _ => panic!("expected string"),
@@ -11468,6 +11612,7 @@ mod tests {
 
         // Create Object[] with two elements: String "x" and Integer 42
         let arr = shared
+            .mem
             .heap
             .alloc_array(ClassId::new(0), ArrayElementType::Reference, 2);
         let x_str = create_java_string(&shared, "x");
@@ -11483,9 +11628,10 @@ mod tests {
         .unwrap()
         .unwrap();
         let _ = shared
+            .mem
             .heap
             .set_array_element(arr, 0, Value::Object(Some(x_str)));
-        let _ = shared.heap.set_array_element(arr, 1, boxed_42);
+        let _ = shared.mem.heap.set_array_element(arr, 1, boxed_42);
 
         let result = call_native(
             &shared,
@@ -11500,7 +11646,7 @@ mod tests {
 
         match result {
             Value::Object(Some(sr)) => {
-                let text = read_java_string(&shared.heap, sr).unwrap();
+                let text = read_java_string(&shared.mem.heap, sr).unwrap();
                 assert_eq!(text, "x=42");
             }
             _ => panic!("expected string"),
@@ -11514,6 +11660,7 @@ mod tests {
 
         let fmt = create_java_string(&shared, "100%%\nhello%n");
         let arr = shared
+            .mem
             .heap
             .alloc_array(ClassId::new(0), ArrayElementType::Reference, 0);
 
@@ -11530,7 +11677,7 @@ mod tests {
 
         match result {
             Value::Object(Some(sr)) => {
-                let text = read_java_string(&shared.heap, sr).unwrap();
+                let text = read_java_string(&shared.mem.heap, sr).unwrap();
                 assert!(
                     text.contains("100%"),
                     "should contain literal %, got: {text}"
@@ -11548,18 +11695,22 @@ mod tests {
 
         let delim = create_java_string(&shared, ",");
         let arr = shared
+            .mem
             .heap
             .alloc_array(ClassId::new(0), ArrayElementType::Reference, 3);
         let a = create_java_string(&shared, "a");
         let b = create_java_string(&shared, "b");
         let c = create_java_string(&shared, "c");
         let _ = shared
+            .mem
             .heap
             .set_array_element(arr, 0, Value::Object(Some(a)));
         let _ = shared
+            .mem
             .heap
             .set_array_element(arr, 1, Value::Object(Some(b)));
         let _ = shared
+            .mem
             .heap
             .set_array_element(arr, 2, Value::Object(Some(c)));
 
@@ -11576,7 +11727,7 @@ mod tests {
 
         match result {
             Value::Object(Some(sr)) => {
-                let text = read_java_string(&shared.heap, sr).unwrap();
+                let text = read_java_string(&shared.mem.heap, sr).unwrap();
                 assert_eq!(text, "a,b,c");
             }
             _ => panic!("expected string"),
@@ -11590,7 +11741,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let map = shared.heap.alloc_object(ClassId::new(0), 3);
+        let map = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -11620,7 +11771,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let map = shared.heap.alloc_object(ClassId::new(0), 3);
+        let map = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -11663,7 +11814,9 @@ mod tests {
         .unwrap();
 
         match got {
-            Value::Object(Some(r)) => assert_eq!(read_java_string(&shared.heap, r).unwrap(), "v"),
+            Value::Object(Some(r)) => {
+                assert_eq!(read_java_string(&shared.mem.heap, r).unwrap(), "v")
+            }
             _ => panic!("expected string"),
         }
     }
@@ -11674,7 +11827,7 @@ mod tests {
 
     /// Helper: create a StringBuilder, init it, append a string, return the sb ref
     fn make_sb(shared: &Arc<SharedVm>, thread: &mut JvmThread, initial: &str) -> ObjectRef {
-        let sb = shared.heap.alloc_object(ClassId::new(0), 2);
+        let sb = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             shared,
             thread,
@@ -11711,7 +11864,7 @@ mod tests {
         .unwrap()
         .unwrap();
         match result {
-            Value::Object(Some(sr)) => read_java_string(&shared.heap, sr).unwrap(),
+            Value::Object(Some(sr)) => read_java_string(&shared.mem.heap, sr).unwrap(),
             _ => panic!("expected string"),
         }
     }
@@ -11863,7 +12016,7 @@ mod tests {
         .unwrap();
         match result {
             Value::Object(Some(sr)) => {
-                assert_eq!(read_java_string(&shared.heap, sr).unwrap(), "world")
+                assert_eq!(read_java_string(&shared.mem.heap, sr).unwrap(), "world")
             }
             _ => panic!("expected string"),
         }
@@ -11946,10 +12099,12 @@ mod tests {
 
         let fmt = create_java_string(&shared, "Hello %s!");
         let arr = shared
+            .mem
             .heap
             .alloc_array(ClassId::new(0), ArrayElementType::Reference, 1);
         let name = create_java_string(&shared, "World");
         let _ = shared
+            .mem
             .heap
             .set_array_element(arr, 0, Value::Object(Some(name)));
 
@@ -11988,7 +12143,7 @@ mod tests {
         .unwrap();
         match result {
             Value::Object(Some(sr)) => {
-                assert_eq!(read_java_string(&shared.heap, sr).unwrap(), "ababab")
+                assert_eq!(read_java_string(&shared.mem.heap, sr).unwrap(), "ababab")
             }
             _ => panic!("expected string"),
         }
@@ -12091,7 +12246,7 @@ mod tests {
     fn hashmap_null_key_put_get() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let map = shared.heap.alloc_object(ClassId::new(0), 3);
+        let map = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -12130,7 +12285,7 @@ mod tests {
 
         match got {
             Value::Object(Some(r)) => {
-                assert_eq!(read_java_string(&shared.heap, r).unwrap(), "null_value")
+                assert_eq!(read_java_string(&shared.mem.heap, r).unwrap(), "null_value")
             }
             _ => panic!("expected string, got {:?}", got),
         }
@@ -12140,7 +12295,7 @@ mod tests {
     fn hashmap_null_key_overwrite() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let map = shared.heap.alloc_object(ClassId::new(0), 3);
+        let map = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -12192,7 +12347,9 @@ mod tests {
         .unwrap();
 
         match got {
-            Value::Object(Some(r)) => assert_eq!(read_java_string(&shared.heap, r).unwrap(), "b"),
+            Value::Object(Some(r)) => {
+                assert_eq!(read_java_string(&shared.mem.heap, r).unwrap(), "b")
+            }
             _ => panic!("expected string"),
         }
 
@@ -12214,7 +12371,7 @@ mod tests {
     fn hashmap_null_key_contains() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let map = shared.heap.alloc_object(ClassId::new(0), 3);
+        let map = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -12275,8 +12432,8 @@ mod tests {
     fn integer_cross_type_conversions() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let int_obj = shared.heap.alloc_object(ClassId::new(0), 1);
-        shared.heap.set_field(int_obj, 0, Value::Int(42));
+        let int_obj = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        shared.mem.heap.set_field(int_obj, 0, Value::Int(42));
 
         let r = call_native(
             &shared,
@@ -12319,8 +12476,8 @@ mod tests {
     fn long_cross_type_conversions() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let obj = shared.heap.alloc_object(ClassId::new(0), 1);
-        shared.heap.set_field(obj, 0, Value::Long(100_000));
+        let obj = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        shared.mem.heap.set_field(obj, 0, Value::Long(100_000));
 
         let r = call_native(
             &shared,
@@ -12363,8 +12520,8 @@ mod tests {
     fn float_cross_type_conversions() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let obj = shared.heap.alloc_object(ClassId::new(0), 1);
-        shared.heap.set_field(obj, 0, Value::Float(3.5));
+        let obj = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        shared.mem.heap.set_field(obj, 0, Value::Float(3.5));
 
         let r = call_native(
             &shared,
@@ -12407,8 +12564,8 @@ mod tests {
     fn double_cross_type_conversions() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let obj = shared.heap.alloc_object(ClassId::new(0), 1);
-        shared.heap.set_field(obj, 0, Value::Double(2.99));
+        let obj = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        shared.mem.heap.set_field(obj, 0, Value::Double(2.99));
 
         let r = call_native(
             &shared,
@@ -12451,8 +12608,8 @@ mod tests {
     fn byte_cross_type_conversions() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let obj = shared.heap.alloc_object(ClassId::new(0), 1);
-        shared.heap.set_field(obj, 0, Value::Int(127));
+        let obj = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        shared.mem.heap.set_field(obj, 0, Value::Int(127));
 
         let r = call_native(
             &shared,
@@ -12495,8 +12652,8 @@ mod tests {
     fn short_cross_type_conversions() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let obj = shared.heap.alloc_object(ClassId::new(0), 1);
-        shared.heap.set_field(obj, 0, Value::Int(1000));
+        let obj = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        shared.mem.heap.set_field(obj, 0, Value::Int(1000));
 
         let r = call_native(
             &shared,
@@ -12543,8 +12700,8 @@ mod tests {
     fn integer_instance_to_string() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let obj = shared.heap.alloc_object(ClassId::new(0), 1);
-        shared.heap.set_field(obj, 0, Value::Int(42));
+        let obj = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        shared.mem.heap.set_field(obj, 0, Value::Int(42));
         let r = call_native(
             &shared,
             &mut thread,
@@ -12557,7 +12714,7 @@ mod tests {
         .unwrap();
         match r {
             Value::Object(Some(sr)) => {
-                assert_eq!(read_java_string(&shared.heap, sr).unwrap(), "42")
+                assert_eq!(read_java_string(&shared.mem.heap, sr).unwrap(), "42")
             }
             _ => panic!("expected string"),
         }
@@ -12567,8 +12724,11 @@ mod tests {
     fn long_instance_to_string() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let obj = shared.heap.alloc_object(ClassId::new(0), 1);
-        shared.heap.set_field(obj, 0, Value::Long(999_999_999_999));
+        let obj = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        shared
+            .mem
+            .heap
+            .set_field(obj, 0, Value::Long(999_999_999_999));
         let r = call_native(
             &shared,
             &mut thread,
@@ -12581,7 +12741,10 @@ mod tests {
         .unwrap();
         match r {
             Value::Object(Some(sr)) => {
-                assert_eq!(read_java_string(&shared.heap, sr).unwrap(), "999999999999")
+                assert_eq!(
+                    read_java_string(&shared.mem.heap, sr).unwrap(),
+                    "999999999999"
+                )
             }
             _ => panic!("expected string"),
         }
@@ -12592,8 +12755,8 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let t = shared.heap.alloc_object(ClassId::new(0), 1);
-        shared.heap.set_field(t, 0, Value::Int(1));
+        let t = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        shared.mem.heap.set_field(t, 0, Value::Int(1));
         let r = call_native(
             &shared,
             &mut thread,
@@ -12606,13 +12769,13 @@ mod tests {
         .unwrap();
         match r {
             Value::Object(Some(sr)) => {
-                assert_eq!(read_java_string(&shared.heap, sr).unwrap(), "true")
+                assert_eq!(read_java_string(&shared.mem.heap, sr).unwrap(), "true")
             }
             _ => panic!("expected string"),
         }
 
-        let f = shared.heap.alloc_object(ClassId::new(0), 1);
-        shared.heap.set_field(f, 0, Value::Int(0));
+        let f = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        shared.mem.heap.set_field(f, 0, Value::Int(0));
         let r = call_native(
             &shared,
             &mut thread,
@@ -12625,7 +12788,7 @@ mod tests {
         .unwrap();
         match r {
             Value::Object(Some(sr)) => {
-                assert_eq!(read_java_string(&shared.heap, sr).unwrap(), "false")
+                assert_eq!(read_java_string(&shared.mem.heap, sr).unwrap(), "false")
             }
             _ => panic!("expected string"),
         }
@@ -12635,8 +12798,8 @@ mod tests {
     fn character_instance_to_string() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let obj = shared.heap.alloc_object(ClassId::new(0), 1);
-        shared.heap.set_field(obj, 0, Value::Int('A' as i32));
+        let obj = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        shared.mem.heap.set_field(obj, 0, Value::Int('A' as i32));
         let r = call_native(
             &shared,
             &mut thread,
@@ -12648,7 +12811,9 @@ mod tests {
         .unwrap()
         .unwrap();
         match r {
-            Value::Object(Some(sr)) => assert_eq!(read_java_string(&shared.heap, sr).unwrap(), "A"),
+            Value::Object(Some(sr)) => {
+                assert_eq!(read_java_string(&shared.mem.heap, sr).unwrap(), "A")
+            }
             _ => panic!("expected string"),
         }
     }
@@ -12658,12 +12823,12 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let a = shared.heap.alloc_object(ClassId::new(0), 1);
-        shared.heap.set_field(a, 0, Value::Int(42));
-        let b = shared.heap.alloc_object(ClassId::new(0), 1);
-        shared.heap.set_field(b, 0, Value::Int(42));
-        let c = shared.heap.alloc_object(ClassId::new(0), 1);
-        shared.heap.set_field(c, 0, Value::Int(43));
+        let a = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        shared.mem.heap.set_field(a, 0, Value::Int(42));
+        let b = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        shared.mem.heap.set_field(b, 0, Value::Int(42));
+        let c = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        shared.mem.heap.set_field(c, 0, Value::Int(43));
 
         // hashCode = 42
         let h = call_native(
@@ -12709,8 +12874,8 @@ mod tests {
     fn long_hash_code() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let obj = shared.heap.alloc_object(ClassId::new(0), 1);
-        shared.heap.set_field(obj, 0, Value::Long(42));
+        let obj = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        shared.mem.heap.set_field(obj, 0, Value::Long(42));
         let h = call_native(
             &shared,
             &mut thread,
@@ -12730,8 +12895,8 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let t = shared.heap.alloc_object(ClassId::new(0), 1);
-        shared.heap.set_field(t, 0, Value::Int(1));
+        let t = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        shared.mem.heap.set_field(t, 0, Value::Int(1));
         let h = call_native(
             &shared,
             &mut thread,
@@ -12744,8 +12909,8 @@ mod tests {
         .unwrap();
         assert_eq!(h, Value::Int(1231));
 
-        let f = shared.heap.alloc_object(ClassId::new(0), 1);
-        shared.heap.set_field(f, 0, Value::Int(0));
+        let f = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        shared.mem.heap.set_field(f, 0, Value::Int(0));
         let h = call_native(
             &shared,
             &mut thread,
@@ -12764,10 +12929,10 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let a = shared.heap.alloc_object(ClassId::new(0), 1);
-        shared.heap.set_field(a, 0, Value::Double(f64::NAN));
-        let b = shared.heap.alloc_object(ClassId::new(0), 1);
-        shared.heap.set_field(b, 0, Value::Double(f64::NAN));
+        let a = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        shared.mem.heap.set_field(a, 0, Value::Double(f64::NAN));
+        let b = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        shared.mem.heap.set_field(b, 0, Value::Double(f64::NAN));
 
         // Double.equals: NaN == NaN is true (unlike ==)
         let eq = call_native(
@@ -12788,10 +12953,10 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let a = shared.heap.alloc_object(ClassId::new(0), 1);
-        shared.heap.set_field(a, 0, Value::Float(f32::NAN));
-        let b = shared.heap.alloc_object(ClassId::new(0), 1);
-        shared.heap.set_field(b, 0, Value::Float(f32::NAN));
+        let a = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        shared.mem.heap.set_field(a, 0, Value::Float(f32::NAN));
+        let b = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        shared.mem.heap.set_field(b, 0, Value::Float(f32::NAN));
 
         let eq = call_native(
             &shared,
@@ -13006,7 +13171,7 @@ mod tests {
         .unwrap();
         match r {
             Value::Object(Some(sr)) => {
-                assert_eq!(read_java_string(&shared.heap, sr).unwrap(), "true")
+                assert_eq!(read_java_string(&shared.mem.heap, sr).unwrap(), "true")
             }
             _ => panic!("expected string"),
         }
@@ -13048,7 +13213,7 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // Create ArrayList with ["z", "a", "m"]
-        let list = shared.heap.alloc_object(ClassId::new(0), 2);
+        let list = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -13112,7 +13277,7 @@ mod tests {
             .unwrap();
             match val {
                 Value::Object(Some(sr)) => {
-                    assert_eq!(read_java_string(&shared.heap, sr).unwrap(), *expected)
+                    assert_eq!(read_java_string(&shared.mem.heap, sr).unwrap(), *expected)
                 }
                 _ => panic!("expected string at index {i}"),
             }
@@ -13124,7 +13289,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let list = shared.heap.alloc_object(ClassId::new(0), 2);
+        let list = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -13186,7 +13351,7 @@ mod tests {
             .unwrap();
             match val {
                 Value::Object(Some(sr)) => {
-                    assert_eq!(read_java_string(&shared.heap, sr).unwrap(), *expected)
+                    assert_eq!(read_java_string(&shared.mem.heap, sr).unwrap(), *expected)
                 }
                 _ => panic!("expected string at index {i}"),
             }
@@ -13229,7 +13394,7 @@ mod tests {
         };
 
         // Create list and sort
-        let list = shared.heap.alloc_object(ClassId::new(0), 2);
+        let list = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -13276,7 +13441,7 @@ mod tests {
             .unwrap();
             match val {
                 Value::Object(Some(sr)) => {
-                    assert_eq!(read_java_string(&shared.heap, sr).unwrap(), *expected)
+                    assert_eq!(read_java_string(&shared.mem.heap, sr).unwrap(), *expected)
                 }
                 _ => panic!("expected string at index {i}"),
             }
@@ -13289,7 +13454,7 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // Create ArrayList with Integer wrappers [3, 1, 2]
-        let list = shared.heap.alloc_object(ClassId::new(0), 2);
+        let list = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -13300,8 +13465,8 @@ mod tests {
         )
         .unwrap();
         for v in [3, 1, 2] {
-            let w = shared.heap.alloc_object(ClassId::new(0), 1);
-            shared.heap.set_field(w, 0, Value::Int(v));
+            let w = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+            shared.mem.heap.set_field(w, 0, Value::Int(v));
             call_native(
                 &shared,
                 &mut thread,
@@ -13352,7 +13517,7 @@ mod tests {
             .unwrap();
             match val {
                 Value::Object(Some(wr)) => {
-                    let inner = shared.heap.get_field(wr, 0);
+                    let inner = shared.mem.heap.get_field(wr, 0);
                     assert_eq!(inner, Value::Int(*expected));
                 }
                 _ => panic!("expected wrapper at index {i}"),
@@ -13370,7 +13535,7 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // Create ArrayList with [10, 20, 30]
-        let list = shared.heap.alloc_object(ClassId::new(0), 2);
+        let list = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -13381,8 +13546,8 @@ mod tests {
         )
         .unwrap();
         for v in [10, 20, 30] {
-            let w = shared.heap.alloc_object(ClassId::new(0), 1);
-            shared.heap.set_field(w, 0, Value::Int(v));
+            let w = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+            shared.mem.heap.set_field(w, 0, Value::Int(v));
             call_native(
                 &shared,
                 &mut thread,
@@ -13420,7 +13585,7 @@ mod tests {
         .unwrap();
 
         // forEach should have been called 3 times
-        assert_eq!(shared.heap.get_field(list, 1), Value::Int(3)); // size is still 3
+        assert_eq!(shared.mem.heap.get_field(list, 1), Value::Int(3)); // size is still 3
     }
 
     #[test]
@@ -13466,7 +13631,9 @@ mod tests {
         .unwrap()
         .unwrap();
         match r {
-            Value::Object(Some(sr)) => assert_eq!(read_java_string(&shared.heap, sr).unwrap(), "X"),
+            Value::Object(Some(sr)) => {
+                assert_eq!(read_java_string(&shared.mem.heap, sr).unwrap(), "X")
+            }
             _ => panic!("expected string"),
         }
     }
@@ -14302,7 +14469,7 @@ mod tests {
         .unwrap();
         match r {
             Value::Object(Some(sr)) => {
-                let s = read_java_string(&shared.heap, sr).unwrap();
+                let s = read_java_string(&shared.mem.heap, sr).unwrap();
                 assert!(!s.is_empty());
                 // On Windows it's \r\n, on Unix it's \n
                 assert!(s == "\n" || s == "\r\n");
@@ -14317,7 +14484,7 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // Create StringJoiner with ", " delimiter
-        let sj = shared.heap.alloc_object(ClassId::new(0), 5);
+        let sj = shared.mem.heap.alloc_object(ClassId::new(0), 5);
         let delim = {
             let mut ctx = NativeContextImpl {
                 shared: &shared,
@@ -14399,7 +14566,7 @@ mod tests {
         .unwrap();
         match r {
             Value::Object(Some(sr)) => {
-                assert_eq!(read_java_string(&shared.heap, sr).unwrap(), "a, b, c")
+                assert_eq!(read_java_string(&shared.mem.heap, sr).unwrap(), "a, b, c")
             }
             _ => panic!("expected string"),
         }
@@ -14410,7 +14577,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let sj = shared.heap.alloc_object(ClassId::new(0), 5);
+        let sj = shared.mem.heap.alloc_object(ClassId::new(0), 5);
         let (delim, prefix, suffix) = {
             let mut ctx = NativeContextImpl {
                 shared: &shared,
@@ -14482,7 +14649,7 @@ mod tests {
         .unwrap();
         match r {
             Value::Object(Some(sr)) => {
-                assert_eq!(read_java_string(&shared.heap, sr).unwrap(), "[x, y]")
+                assert_eq!(read_java_string(&shared.mem.heap, sr).unwrap(), "[x, y]")
             }
             _ => panic!("expected string"),
         }
@@ -14493,7 +14660,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let sj = shared.heap.alloc_object(ClassId::new(0), 5);
+        let sj = shared.mem.heap.alloc_object(ClassId::new(0), 5);
         let delim = {
             let mut ctx = NativeContextImpl {
                 shared: &shared,
@@ -14523,7 +14690,9 @@ mod tests {
         .unwrap()
         .unwrap();
         match r {
-            Value::Object(Some(sr)) => assert_eq!(read_java_string(&shared.heap, sr).unwrap(), ""),
+            Value::Object(Some(sr)) => {
+                assert_eq!(read_java_string(&shared.mem.heap, sr).unwrap(), "")
+            }
             _ => panic!("expected string"),
         }
 
@@ -14557,7 +14726,7 @@ mod tests {
         .unwrap();
         match r {
             Value::Object(Some(sr)) => {
-                assert_eq!(read_java_string(&shared.heap, sr).unwrap(), "NONE")
+                assert_eq!(read_java_string(&shared.mem.heap, sr).unwrap(), "NONE")
             }
             _ => panic!("expected string"),
         }
@@ -14569,8 +14738,8 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // Create two joiners
-        let sj1 = shared.heap.alloc_object(ClassId::new(0), 5);
-        let sj2 = shared.heap.alloc_object(ClassId::new(0), 5);
+        let sj1 = shared.mem.heap.alloc_object(ClassId::new(0), 5);
+        let sj2 = shared.mem.heap.alloc_object(ClassId::new(0), 5);
         let delim = {
             let mut ctx = NativeContextImpl {
                 shared: &shared,
@@ -14693,7 +14862,7 @@ mod tests {
         .unwrap();
         match r {
             Value::Object(Some(sr)) => {
-                let s = read_java_string(&shared.heap, sr).unwrap();
+                let s = read_java_string(&shared.mem.heap, sr).unwrap();
                 // sj1 had "a", merge adds "b-c-d" as single element
                 assert_eq!(s, "a, b-c-d");
             }
@@ -14707,7 +14876,7 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // Create a HashMap entry (2-field: key, value)
-        let entry = shared.heap.alloc_object(ClassId::new(0), 2);
+        let entry = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         let key = {
             let mut ctx = NativeContextImpl {
                 shared: &shared,
@@ -14744,7 +14913,7 @@ mod tests {
         .unwrap();
         match r {
             Value::Object(Some(sr)) => {
-                assert_eq!(read_java_string(&shared.heap, sr).unwrap(), "hello")
+                assert_eq!(read_java_string(&shared.mem.heap, sr).unwrap(), "hello")
             }
             _ => panic!("expected string key"),
         }
@@ -14762,7 +14931,7 @@ mod tests {
         .unwrap();
         match r {
             Value::Object(Some(sr)) => {
-                assert_eq!(read_java_string(&shared.heap, sr).unwrap(), "world")
+                assert_eq!(read_java_string(&shared.mem.heap, sr).unwrap(), "world")
             }
             _ => panic!("expected string value"),
         }
@@ -14773,7 +14942,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let entry = shared.heap.alloc_object(ClassId::new(0), 2);
+        let entry = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         let key = {
             let mut ctx = NativeContextImpl {
                 shared: &shared,
@@ -14803,7 +14972,7 @@ mod tests {
         .unwrap();
         match r {
             Value::Object(Some(sr)) => {
-                assert_eq!(read_java_string(&shared.heap, sr).unwrap(), "foo")
+                assert_eq!(read_java_string(&shared.mem.heap, sr).unwrap(), "foo")
             }
             _ => panic!("expected string key"),
         }
@@ -14827,7 +14996,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let sj = shared.heap.alloc_object(ClassId::new(0), 5);
+        let sj = shared.mem.heap.alloc_object(ClassId::new(0), 5);
         let delim = {
             let mut ctx = NativeContextImpl {
                 shared: &shared,
@@ -14902,8 +15071,8 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // Create two Randoms with the same seed
-        let r1 = shared.heap.alloc_object(ClassId::new(0), 2);
-        let r2 = shared.heap.alloc_object(ClassId::new(0), 2);
+        let r1 = shared.mem.heap.alloc_object(ClassId::new(0), 2);
+        let r2 = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -14952,7 +15121,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let rng = shared.heap.alloc_object(ClassId::new(0), 2);
+        let rng = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -14987,7 +15156,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let rng = shared.heap.alloc_object(ClassId::new(0), 2);
+        let rng = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -15021,7 +15190,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let rng = shared.heap.alloc_object(ClassId::new(0), 2);
+        let rng = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -15080,7 +15249,7 @@ mod tests {
         .unwrap();
         match s {
             Value::Object(Some(sr)) => {
-                let str_val = read_java_string(&shared.heap, sr).unwrap();
+                let str_val = read_java_string(&shared.mem.heap, sr).unwrap();
                 // UUID format: 8-4-4-4-12
                 let parts: Vec<&str> = str_val.split('-').collect();
                 assert_eq!(parts.len(), 5);
@@ -15135,7 +15304,7 @@ mod tests {
         match s {
             Value::Object(Some(sr)) => {
                 assert_eq!(
-                    read_java_string(&shared.heap, sr).unwrap(),
+                    read_java_string(&shared.mem.heap, sr).unwrap(),
                     "550e8400-e29b-41d4-a716-446655440000"
                 );
             }
@@ -15149,8 +15318,8 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // Create two UUIDs with the same bits
-        let u1 = shared.heap.alloc_object(ClassId::new(0), 2);
-        let u2 = shared.heap.alloc_object(ClassId::new(0), 2);
+        let u1 = shared.mem.heap.alloc_object(ClassId::new(0), 2);
+        let u2 = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -15316,7 +15485,7 @@ mod tests {
         .unwrap();
         match r {
             Value::Object(Some(sr)) => {
-                let indented = read_java_string(&shared.heap, sr).unwrap();
+                let indented = read_java_string(&shared.mem.heap, sr).unwrap();
                 assert!(indented.starts_with("  hello"));
                 assert!(indented.contains("  world"));
             }
@@ -15530,7 +15699,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let ll = shared.heap.alloc_object(ClassId::new(0), 3);
+        let ll = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -15587,7 +15756,7 @@ mod tests {
         .unwrap();
         match r {
             Value::Object(Some(sr)) => {
-                assert_eq!(read_java_string(&shared.heap, sr).unwrap(), "item0")
+                assert_eq!(read_java_string(&shared.mem.heap, sr).unwrap(), "item0")
             }
             _ => panic!("expected string"),
         }
@@ -15605,7 +15774,7 @@ mod tests {
         .unwrap();
         match r {
             Value::Object(Some(sr)) => {
-                assert_eq!(read_java_string(&shared.heap, sr).unwrap(), "item4")
+                assert_eq!(read_java_string(&shared.mem.heap, sr).unwrap(), "item4")
             }
             _ => panic!("expected string"),
         }
@@ -15616,7 +15785,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let ll = shared.heap.alloc_object(ClassId::new(0), 3);
+        let ll = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -15690,7 +15859,7 @@ mod tests {
         .unwrap();
         match r {
             Value::Object(Some(sr)) => {
-                assert_eq!(read_java_string(&shared.heap, sr).unwrap(), "first")
+                assert_eq!(read_java_string(&shared.mem.heap, sr).unwrap(), "first")
             }
             _ => panic!("expected string"),
         }
@@ -15708,7 +15877,7 @@ mod tests {
         .unwrap();
         match r {
             Value::Object(Some(sr)) => {
-                assert_eq!(read_java_string(&shared.heap, sr).unwrap(), "last")
+                assert_eq!(read_java_string(&shared.mem.heap, sr).unwrap(), "last")
             }
             _ => panic!("expected string"),
         }
@@ -15719,7 +15888,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let ll = shared.heap.alloc_object(ClassId::new(0), 3);
+        let ll = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -15787,7 +15956,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let ll = shared.heap.alloc_object(ClassId::new(0), 3);
+        let ll = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -15838,7 +16007,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let ll = shared.heap.alloc_object(ClassId::new(0), 3);
+        let ll = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -15923,7 +16092,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let ll = shared.heap.alloc_object(ClassId::new(0), 3);
+        let ll = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -16037,7 +16206,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let ll = shared.heap.alloc_object(ClassId::new(0), 3);
+        let ll = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -16164,7 +16333,9 @@ mod tests {
         .unwrap()
         .unwrap();
         match group {
-            Value::Object(Some(r)) => assert_eq!(read_java_string(&shared.heap, r).unwrap(), "123"),
+            Value::Object(Some(r)) => {
+                assert_eq!(read_java_string(&shared.mem.heap, r).unwrap(), "123")
+            }
             _ => panic!("expected string"),
         }
 
@@ -16270,7 +16441,9 @@ mod tests {
         .unwrap()
         .unwrap();
         match g1 {
-            Value::Object(Some(r)) => assert_eq!(read_java_string(&shared.heap, r).unwrap(), "key"),
+            Value::Object(Some(r)) => {
+                assert_eq!(read_java_string(&shared.mem.heap, r).unwrap(), "key")
+            }
             _ => panic!("expected string"),
         }
 
@@ -16287,7 +16460,7 @@ mod tests {
         .unwrap();
         match g2 {
             Value::Object(Some(r)) => {
-                assert_eq!(read_java_string(&shared.heap, r).unwrap(), "value")
+                assert_eq!(read_java_string(&shared.mem.heap, r).unwrap(), "value")
             }
             _ => panic!("expected string"),
         }
@@ -16327,11 +16500,11 @@ mod tests {
             Value::Object(Some(r)) => r,
             _ => panic!("expected array"),
         };
-        assert_eq!(shared.heap.array_length(arr), 3);
-        let e0 = shared.heap.get_array_element(arr, 0).unwrap();
+        assert_eq!(shared.mem.heap.array_length(arr), 3);
+        let e0 = shared.mem.heap.get_array_element(arr, 0).unwrap();
         match e0 {
             Value::Object(Some(r)) => {
-                assert_eq!(read_java_string(&shared.heap, r).unwrap(), "hello")
+                assert_eq!(read_java_string(&shared.mem.heap, r).unwrap(), "hello")
             }
             _ => panic!("expected string"),
         }
@@ -16380,7 +16553,7 @@ mod tests {
         .unwrap();
         match result {
             Value::Object(Some(r)) => {
-                assert_eq!(read_java_string(&shared.heap, r).unwrap(), "abc#def#")
+                assert_eq!(read_java_string(&shared.mem.heap, r).unwrap(), "abc#def#")
             }
             _ => panic!("expected string"),
         }
@@ -16523,7 +16696,10 @@ mod tests {
         .unwrap();
         match result {
             Value::Object(Some(r)) => {
-                assert_eq!(read_java_string(&shared.heap, r).unwrap(), "h*ll* w*rld")
+                assert_eq!(
+                    read_java_string(&shared.mem.heap, r).unwrap(),
+                    "h*ll* w*rld"
+                )
             }
             _ => panic!("expected string"),
         }
@@ -16596,17 +16772,17 @@ mod tests {
             Value::Object(Some(r)) => r,
             _ => panic!("expected array"),
         };
-        assert_eq!(shared.heap.array_length(arr), 3);
+        assert_eq!(shared.mem.heap.array_length(arr), 3);
         assert_eq!(
-            shared.heap.get_array_element(arr, 0).unwrap(),
+            shared.mem.heap.get_array_element(arr, 0).unwrap(),
             Value::Long(10)
         );
         assert_eq!(
-            shared.heap.get_array_element(arr, 1).unwrap(),
+            shared.mem.heap.get_array_element(arr, 1).unwrap(),
             Value::Long(11)
         );
         assert_eq!(
-            shared.heap.get_array_element(arr, 2).unwrap(),
+            shared.mem.heap.get_array_element(arr, 2).unwrap(),
             Value::Long(12)
         );
     }
@@ -16727,9 +16903,9 @@ mod tests {
             Value::Object(Some(r)) => r,
             _ => panic!("expected array"),
         };
-        assert_eq!(shared.heap.array_length(arr), 1);
+        assert_eq!(shared.mem.heap.array_length(arr), 1);
         assert_eq!(
-            shared.heap.get_array_element(arr, 0).unwrap(),
+            shared.mem.heap.get_array_element(arr, 0).unwrap(),
             Value::Double(1.5)
         );
     }
@@ -16817,7 +16993,7 @@ mod tests {
 
         match collector {
             Value::Object(Some(c)) => {
-                let tag = shared.heap.get_field(c, 0);
+                let tag = shared.mem.heap.get_field(c, 0);
                 assert_eq!(tag, Value::Int(7)); // COLLECTOR_TAG_GROUPING_BY
             }
             _ => panic!("expected collector"),
@@ -16842,7 +17018,7 @@ mod tests {
 
         match collector {
             Value::Object(Some(c)) => {
-                let tag = shared.heap.get_field(c, 0);
+                let tag = shared.mem.heap.get_field(c, 0);
                 assert_eq!(tag, Value::Int(8)); // COLLECTOR_TAG_PARTITIONING_BY
             }
             _ => panic!("expected collector"),
@@ -16854,7 +17030,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let lhm = shared.heap.alloc_object(ClassId::new(0), 5);
+        let lhm = shared.mem.heap.alloc_object(ClassId::new(0), 5);
         call_native(
             &shared,
             &mut thread,
@@ -16899,7 +17075,7 @@ mod tests {
         .unwrap();
         match ts {
             Value::Object(Some(r)) => {
-                let s = read_java_string(&shared.heap, r).unwrap();
+                let s = read_java_string(&shared.mem.heap, r).unwrap();
                 assert_eq!(s, "{c=1, a=1, b=1}");
             }
             _ => panic!("expected string"),
@@ -16911,7 +17087,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let lhm = shared.heap.alloc_object(ClassId::new(0), 5);
+        let lhm = shared.mem.heap.alloc_object(ClassId::new(0), 5);
         call_native(
             &shared,
             &mut thread,
@@ -16968,7 +17144,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let lhm = shared.heap.alloc_object(ClassId::new(0), 5);
+        let lhm = shared.mem.heap.alloc_object(ClassId::new(0), 5);
         call_native(
             &shared,
             &mut thread,
@@ -17035,7 +17211,7 @@ mod tests {
         .unwrap();
         match ts {
             Value::Object(Some(r)) => {
-                let s = read_java_string(&shared.heap, r).unwrap();
+                let s = read_java_string(&shared.mem.heap, r).unwrap();
                 assert_eq!(s, "{a=0, c=0}"); // "a", "c" РІР‚вЂќ "b" removed, order preserved
             }
             _ => panic!("expected string"),
@@ -17047,7 +17223,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let lhm = shared.heap.alloc_object(ClassId::new(0), 5);
+        let lhm = shared.mem.heap.alloc_object(ClassId::new(0), 5);
         call_native(
             &shared,
             &mut thread,
@@ -17111,7 +17287,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let lhm = shared.heap.alloc_object(ClassId::new(0), 5);
+        let lhm = shared.mem.heap.alloc_object(ClassId::new(0), 5);
         call_native(
             &shared,
             &mut thread,
@@ -17214,7 +17390,7 @@ mod tests {
             Value::Object(Some(r)) => r,
             _ => panic!("expected array"),
         };
-        assert_eq!(shared.heap.array_length(arr), 4);
+        assert_eq!(shared.mem.heap.array_length(arr), 4);
     }
 
     // ===== Phase 16: ArrayDeque, PriorityQueue, Vector/Stack, bulk ops =====
@@ -17224,7 +17400,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let deque = shared.heap.alloc_object(ClassId::new(0), 4);
+        let deque = shared.mem.heap.alloc_object(ClassId::new(0), 4);
         call_native(
             &shared,
             &mut thread,
@@ -17287,7 +17463,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let deque = shared.heap.alloc_object(ClassId::new(0), 4);
+        let deque = shared.mem.heap.alloc_object(ClassId::new(0), 4);
         call_native(
             &shared,
             &mut thread,
@@ -17365,7 +17541,7 @@ mod tests {
             _ => panic!("expected object"),
         };
         assert_eq!(
-            read_java_string(&shared.heap, first_obj),
+            read_java_string(&shared.mem.heap, first_obj),
             Some("A".to_string())
         );
 
@@ -17385,7 +17561,7 @@ mod tests {
             _ => panic!("expected object"),
         };
         assert_eq!(
-            read_java_string(&shared.heap, last_obj),
+            read_java_string(&shared.mem.heap, last_obj),
             Some("C".to_string())
         );
     }
@@ -17395,7 +17571,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let deque = shared.heap.alloc_object(ClassId::new(0), 4);
+        let deque = shared.mem.heap.alloc_object(ClassId::new(0), 4);
         call_native(
             &shared,
             &mut thread,
@@ -17456,7 +17632,7 @@ mod tests {
             _ => panic!("expected object"),
         };
         assert_eq!(
-            read_java_string(&shared.heap, polled_obj),
+            read_java_string(&shared.mem.heap, polled_obj),
             Some("X".to_string())
         );
 
@@ -17476,7 +17652,7 @@ mod tests {
             _ => panic!("expected object"),
         };
         assert_eq!(
-            read_java_string(&shared.heap, polled2_obj),
+            read_java_string(&shared.mem.heap, polled2_obj),
             Some("Y".to_string())
         );
 
@@ -17499,7 +17675,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let deque = shared.heap.alloc_object(ClassId::new(0), 4);
+        let deque = shared.mem.heap.alloc_object(ClassId::new(0), 4);
         call_native(
             &shared,
             &mut thread,
@@ -17546,7 +17722,7 @@ mod tests {
             _ => panic!("expected object"),
         };
         assert_eq!(
-            read_java_string(&shared.heap, pop1_obj),
+            read_java_string(&shared.mem.heap, pop1_obj),
             Some("3".to_string())
         );
     }
@@ -17556,7 +17732,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let deque = shared.heap.alloc_object(ClassId::new(0), 4);
+        let deque = shared.mem.heap.alloc_object(ClassId::new(0), 4);
         call_native(
             &shared,
             &mut thread,
@@ -17628,7 +17804,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let deque = shared.heap.alloc_object(ClassId::new(0), 4);
+        let deque = shared.mem.heap.alloc_object(ClassId::new(0), 4);
         call_native(
             &shared,
             &mut thread,
@@ -17665,17 +17841,17 @@ mod tests {
             Value::Object(Some(r)) => r,
             _ => panic!("expected array"),
         };
-        assert_eq!(shared.heap.array_length(arr), 3);
+        assert_eq!(shared.mem.heap.array_length(arr), 3);
         assert_eq!(
-            shared.heap.get_array_element_unboxing(arr, 0).unwrap(),
+            shared.mem.heap.get_array_element_unboxing(arr, 0).unwrap(),
             Value::Int(0)
         );
         assert_eq!(
-            shared.heap.get_array_element_unboxing(arr, 1).unwrap(),
+            shared.mem.heap.get_array_element_unboxing(arr, 1).unwrap(),
             Value::Int(10)
         );
         assert_eq!(
-            shared.heap.get_array_element_unboxing(arr, 2).unwrap(),
+            shared.mem.heap.get_array_element_unboxing(arr, 2).unwrap(),
             Value::Int(20)
         );
     }
@@ -17685,7 +17861,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let pq = shared.heap.alloc_object(ClassId::new(0), 3);
+        let pq = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -17744,7 +17920,7 @@ mod tests {
             _ => panic!("expected object"),
         };
         assert_eq!(
-            read_java_string(&shared.heap, p1_obj),
+            read_java_string(&shared.mem.heap, p1_obj),
             Some("10".to_string())
         );
 
@@ -17764,7 +17940,7 @@ mod tests {
             _ => panic!("expected object"),
         };
         assert_eq!(
-            read_java_string(&shared.heap, p2_obj),
+            read_java_string(&shared.mem.heap, p2_obj),
             Some("20".to_string())
         );
 
@@ -17784,7 +17960,7 @@ mod tests {
             _ => panic!("expected object"),
         };
         assert_eq!(
-            read_java_string(&shared.heap, p3_obj),
+            read_java_string(&shared.mem.heap, p3_obj),
             Some("30".to_string())
         );
 
@@ -17807,7 +17983,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let pq = shared.heap.alloc_object(ClassId::new(0), 3);
+        let pq = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -17868,7 +18044,7 @@ mod tests {
             _ => panic!("expected object"),
         };
         assert_eq!(
-            read_java_string(&shared.heap, pk_obj),
+            read_java_string(&shared.mem.heap, pk_obj),
             Some("apple".to_string())
         );
 
@@ -17891,7 +18067,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let pq = shared.heap.alloc_object(ClassId::new(0), 3);
+        let pq = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -17992,7 +18168,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let vec = shared.heap.alloc_object(ClassId::new(0), 2);
+        let vec = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -18080,7 +18256,7 @@ mod tests {
             _ => panic!("expected object"),
         };
         assert_eq!(
-            read_java_string(&shared.heap, first_obj),
+            read_java_string(&shared.mem.heap, first_obj),
             Some("a".to_string())
         );
 
@@ -18099,7 +18275,7 @@ mod tests {
             _ => panic!("expected object"),
         };
         assert_eq!(
-            read_java_string(&shared.heap, last_obj),
+            read_java_string(&shared.mem.heap, last_obj),
             Some("c".to_string())
         );
 
@@ -18118,7 +18294,7 @@ mod tests {
             _ => panic!("expected object"),
         };
         assert_eq!(
-            read_java_string(&shared.heap, elem_obj),
+            read_java_string(&shared.mem.heap, elem_obj),
             Some("b".to_string())
         );
     }
@@ -18128,7 +18304,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let vec = shared.heap.alloc_object(ClassId::new(0), 2);
+        let vec = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -18157,7 +18333,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let stack = shared.heap.alloc_object(ClassId::new(0), 2);
+        let stack = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -18224,7 +18400,7 @@ mod tests {
             _ => panic!("expected object"),
         };
         assert_eq!(
-            read_java_string(&shared.heap, pk_obj),
+            read_java_string(&shared.mem.heap, pk_obj),
             Some("second".to_string())
         );
 
@@ -18244,7 +18420,7 @@ mod tests {
             _ => panic!("expected object"),
         };
         assert_eq!(
-            read_java_string(&shared.heap, popped_obj),
+            read_java_string(&shared.mem.heap, popped_obj),
             Some("second".to_string())
         );
 
@@ -18264,7 +18440,7 @@ mod tests {
             _ => panic!("expected object"),
         };
         assert_eq!(
-            read_java_string(&shared.heap, pk2_obj),
+            read_java_string(&shared.mem.heap, pk2_obj),
             Some("first".to_string())
         );
     }
@@ -18274,7 +18450,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let stack = shared.heap.alloc_object(ClassId::new(0), 2);
+        let stack = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -18399,7 +18575,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let stack = shared.heap.alloc_object(ClassId::new(0), 2);
+        let stack = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -18451,7 +18627,7 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // Create main list [A, B, C, A]
-        let list = shared.heap.alloc_object(ClassId::new(0), 2);
+        let list = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -18529,7 +18705,7 @@ mod tests {
         .unwrap();
 
         // Create removal list [A]
-        let removal = shared.heap.alloc_object(ClassId::new(0), 2);
+        let removal = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -18589,7 +18765,7 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // Create main list [1, 2, 3, 4, 5]
-        let list = shared.heap.alloc_object(ClassId::new(0), 2);
+        let list = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -18612,7 +18788,7 @@ mod tests {
         }
 
         // Create retain list [2, 4]
-        let retain = shared.heap.alloc_object(ClassId::new(0), 2);
+        let retain = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -18696,7 +18872,7 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // Create linked list
-        let ll = shared.heap.alloc_object(ClassId::new(0), 3);
+        let ll = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -18725,7 +18901,7 @@ mod tests {
         .unwrap();
 
         // Create source ArrayList [Y, Z]
-        let src = shared.heap.alloc_object(ClassId::new(0), 2);
+        let src = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -18797,7 +18973,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let deque = shared.heap.alloc_object(ClassId::new(0), 4);
+        let deque = shared.mem.heap.alloc_object(ClassId::new(0), 4);
         call_native(
             &shared,
             &mut thread,
@@ -18880,7 +19056,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let deque = shared.heap.alloc_object(ClassId::new(0), 4);
+        let deque = shared.mem.heap.alloc_object(ClassId::new(0), 4);
         call_native(
             &shared,
             &mut thread,
@@ -18950,7 +19126,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let pq = shared.heap.alloc_object(ClassId::new(0), 3);
+        let pq = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -19020,7 +19196,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let vec = shared.heap.alloc_object(ClassId::new(0), 2);
+        let vec = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -19084,7 +19260,7 @@ mod tests {
             _ => panic!("expected object"),
         };
         assert_eq!(
-            read_java_string(&shared.heap, elem_obj),
+            read_java_string(&shared.mem.heap, elem_obj),
             Some("new".to_string())
         );
     }
@@ -19095,7 +19271,7 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // Create target HashSet
-        let set = shared.heap.alloc_object(ClassId::new(0), 1);
+        let set = shared.mem.heap.alloc_object(ClassId::new(0), 1);
         call_native(
             &shared,
             &mut thread,
@@ -19124,7 +19300,7 @@ mod tests {
         .unwrap();
 
         // Create source ArrayList [B, C]
-        let src = shared.heap.alloc_object(ClassId::new(0), 2);
+        let src = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -19198,7 +19374,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let deque = shared.heap.alloc_object(ClassId::new(0), 4);
+        let deque = shared.mem.heap.alloc_object(ClassId::new(0), 4);
         call_native(
             &shared,
             &mut thread,
@@ -19210,7 +19386,7 @@ mod tests {
         .unwrap();
 
         // Create source ArrayList [10, 20, 30]
-        let src = shared.heap.alloc_object(ClassId::new(0), 2);
+        let src = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -19369,7 +19545,7 @@ mod tests {
             _ => panic!("expected string"),
         };
         assert_eq!(
-            read_java_string(&shared.heap, ts_obj),
+            read_java_string(&shared.mem.heap, ts_obj),
             Some("2023-12-25".to_string())
         );
     }
@@ -19425,7 +19601,7 @@ mod tests {
             _ => panic!("expected string"),
         };
         assert_eq!(
-            read_java_string(&shared.heap, ts_obj),
+            read_java_string(&shared.mem.heap, ts_obj),
             Some("2024-02-02".to_string())
         );
     }
@@ -19673,7 +19849,7 @@ mod tests {
             _ => panic!("expected"),
         };
         assert_eq!(
-            read_java_string(&shared.heap, ts_obj),
+            read_java_string(&shared.mem.heap, ts_obj),
             Some("1970-01-01".to_string())
         );
     }
@@ -19811,7 +19987,7 @@ mod tests {
             _ => panic!("expected"),
         };
         assert_eq!(
-            read_java_string(&shared.heap, ts_obj),
+            read_java_string(&shared.mem.heap, ts_obj),
             Some("09:15:30".to_string())
         );
     }
@@ -20575,7 +20751,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let tm = shared.heap.alloc_object(ClassId::new(0), 3);
+        let tm = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -20692,7 +20868,7 @@ mod tests {
         .unwrap()
         .unwrap();
         let got_str = match got {
-            Value::Object(Some(r)) => read_java_string(&shared.heap, r),
+            Value::Object(Some(r)) => read_java_string(&shared.mem.heap, r),
             _ => None,
         };
         assert_eq!(got_str, Some("yellow".to_string()));
@@ -20703,7 +20879,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let tm = shared.heap.alloc_object(ClassId::new(0), 3);
+        let tm = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -20755,7 +20931,7 @@ mod tests {
         .unwrap()
         .unwrap();
         let first_s = match first {
-            Value::Object(Some(r)) => read_java_string(&shared.heap, r),
+            Value::Object(Some(r)) => read_java_string(&shared.mem.heap, r),
             _ => None,
         };
         assert_eq!(first_s, Some("apple".to_string()));
@@ -20771,7 +20947,7 @@ mod tests {
         .unwrap()
         .unwrap();
         let last_s = match last {
-            Value::Object(Some(r)) => read_java_string(&shared.heap, r),
+            Value::Object(Some(r)) => read_java_string(&shared.mem.heap, r),
             _ => None,
         };
         assert_eq!(last_s, Some("cherry".to_string()));
@@ -20787,7 +20963,7 @@ mod tests {
         .unwrap()
         .unwrap();
         let ts_s = match ts {
-            Value::Object(Some(r)) => read_java_string(&shared.heap, r),
+            Value::Object(Some(r)) => read_java_string(&shared.mem.heap, r),
             _ => None,
         };
         assert_eq!(ts_s, Some("{apple=1, banana=2, cherry=3}".to_string()));
@@ -20798,7 +20974,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let tm = shared.heap.alloc_object(ClassId::new(0), 3);
+        let tm = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -20857,7 +21033,7 @@ mod tests {
         .unwrap()
         .unwrap();
         let removed_s = match removed {
-            Value::Object(Some(r)) => read_java_string(&shared.heap, r),
+            Value::Object(Some(r)) => read_java_string(&shared.mem.heap, r),
             _ => None,
         };
         assert_eq!(removed_s, Some("2".to_string()));
@@ -20885,7 +21061,7 @@ mod tests {
         .unwrap()
         .unwrap();
         let ts_s = match ts {
-            Value::Object(Some(r)) => read_java_string(&shared.heap, r),
+            Value::Object(Some(r)) => read_java_string(&shared.mem.heap, r),
             _ => None,
         };
         assert_eq!(ts_s, Some("{a=1, c=3}".to_string()));
@@ -20896,7 +21072,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let tm = shared.heap.alloc_object(ClassId::new(0), 3);
+        let tm = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -20948,7 +21124,7 @@ mod tests {
         .unwrap()
         .unwrap();
         let cs = match ceiling {
-            Value::Object(Some(r)) => read_java_string(&shared.heap, r),
+            Value::Object(Some(r)) => read_java_string(&shared.mem.heap, r),
             _ => None,
         };
         assert_eq!(cs, Some("d".to_string()));
@@ -20971,7 +21147,7 @@ mod tests {
         .unwrap()
         .unwrap();
         let fs = match floor {
-            Value::Object(Some(r)) => read_java_string(&shared.heap, r),
+            Value::Object(Some(r)) => read_java_string(&shared.mem.heap, r),
             _ => None,
         };
         assert_eq!(fs, Some("b".to_string()));
@@ -20994,7 +21170,7 @@ mod tests {
         .unwrap()
         .unwrap();
         let hs = match higher {
-            Value::Object(Some(r)) => read_java_string(&shared.heap, r),
+            Value::Object(Some(r)) => read_java_string(&shared.mem.heap, r),
             _ => None,
         };
         assert_eq!(hs, Some("f".to_string()));
@@ -21017,7 +21193,7 @@ mod tests {
         .unwrap()
         .unwrap();
         let ls = match lower {
-            Value::Object(Some(r)) => read_java_string(&shared.heap, r),
+            Value::Object(Some(r)) => read_java_string(&shared.mem.heap, r),
             _ => None,
         };
         assert_eq!(ls, Some("b".to_string()));
@@ -21028,7 +21204,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let tm = shared.heap.alloc_object(ClassId::new(0), 3);
+        let tm = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -21094,7 +21270,7 @@ mod tests {
         .unwrap()
         .unwrap();
         let ks = match key_val {
-            Value::Object(Some(r)) => read_java_string(&shared.heap, r),
+            Value::Object(Some(r)) => read_java_string(&shared.mem.heap, r),
             _ => None,
         };
         assert_eq!(ks, Some("a".to_string()));
@@ -21124,7 +21300,7 @@ mod tests {
         .unwrap()
         .unwrap();
         let lks = match lkey {
-            Value::Object(Some(r)) => read_java_string(&shared.heap, r),
+            Value::Object(Some(r)) => read_java_string(&shared.mem.heap, r),
             _ => None,
         };
         assert_eq!(lks, Some("x".to_string()));
@@ -21135,7 +21311,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let tm = shared.heap.alloc_object(ClassId::new(0), 3);
+        let tm = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -21194,7 +21370,7 @@ mod tests {
         .unwrap()
         .unwrap();
         let pks = match pk {
-            Value::Object(Some(r)) => read_java_string(&shared.heap, r),
+            Value::Object(Some(r)) => read_java_string(&shared.mem.heap, r),
             _ => None,
         };
         assert_eq!(pks, Some("a".to_string()));
@@ -21217,7 +21393,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let tm = shared.heap.alloc_object(ClassId::new(0), 3);
+        let tm = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -21319,7 +21495,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let tm = shared.heap.alloc_object(ClassId::new(0), 3);
+        let tm = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -21476,7 +21652,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let tm = shared.heap.alloc_object(ClassId::new(0), 3);
+        let tm = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -21546,7 +21722,7 @@ mod tests {
         .unwrap()
         .unwrap();
         let prev_s = match prev {
-            Value::Object(Some(r)) => read_java_string(&shared.heap, r),
+            Value::Object(Some(r)) => read_java_string(&shared.mem.heap, r),
             _ => None,
         };
         assert_eq!(prev_s, Some("old".to_string()));
@@ -21569,7 +21745,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let tm = shared.heap.alloc_object(ClassId::new(0), 3);
+        let tm = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -21629,7 +21805,7 @@ mod tests {
         .unwrap()
         .unwrap();
         let ts_s = match ts_str {
-            Value::Object(Some(r)) => read_java_string(&shared.heap, r),
+            Value::Object(Some(r)) => read_java_string(&shared.mem.heap, r),
             _ => None,
         };
         assert_eq!(ts_s, Some("[apple, banana, cherry]".to_string()));
@@ -21640,7 +21816,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let ts = shared.heap.alloc_object(ClassId::new(0), 3);
+        let ts = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -21726,7 +21902,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let ts = shared.heap.alloc_object(ClassId::new(0), 3);
+        let ts = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -21767,7 +21943,7 @@ mod tests {
         .unwrap()
         .unwrap();
         let fs = match first {
-            Value::Object(Some(r)) => read_java_string(&shared.heap, r),
+            Value::Object(Some(r)) => read_java_string(&shared.mem.heap, r),
             _ => None,
         };
         assert_eq!(fs, Some("ant".to_string()));
@@ -21783,7 +21959,7 @@ mod tests {
         .unwrap()
         .unwrap();
         let ls = match last {
-            Value::Object(Some(r)) => read_java_string(&shared.heap, r),
+            Value::Object(Some(r)) => read_java_string(&shared.mem.heap, r),
             _ => None,
         };
         assert_eq!(ls, Some("dog".to_string()));
@@ -21799,7 +21975,7 @@ mod tests {
         .unwrap()
         .unwrap();
         let ss = match str_val {
-            Value::Object(Some(r)) => read_java_string(&shared.heap, r),
+            Value::Object(Some(r)) => read_java_string(&shared.mem.heap, r),
             _ => None,
         };
         assert_eq!(ss, Some("[ant, bat, cat, dog]".to_string()));
@@ -21810,7 +21986,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let ts = shared.heap.alloc_object(ClassId::new(0), 3);
+        let ts = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -21870,7 +22046,7 @@ mod tests {
         .unwrap()
         .unwrap();
         let ss = match str_val {
-            Value::Object(Some(r)) => read_java_string(&shared.heap, r),
+            Value::Object(Some(r)) => read_java_string(&shared.mem.heap, r),
             _ => None,
         };
         assert_eq!(ss, Some("[a, c]".to_string()));
@@ -21881,7 +22057,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let ts = shared.heap.alloc_object(ClassId::new(0), 3);
+        let ts = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -21929,7 +22105,7 @@ mod tests {
         .unwrap()
         .unwrap();
         let cs = match ceiling {
-            Value::Object(Some(r)) => read_java_string(&shared.heap, r),
+            Value::Object(Some(r)) => read_java_string(&shared.mem.heap, r),
             _ => None,
         };
         assert_eq!(cs, Some("d".to_string()));
@@ -21952,7 +22128,7 @@ mod tests {
         .unwrap()
         .unwrap();
         let fs = match floor {
-            Value::Object(Some(r)) => read_java_string(&shared.heap, r),
+            Value::Object(Some(r)) => read_java_string(&shared.mem.heap, r),
             _ => None,
         };
         assert_eq!(fs, Some("b".to_string()));
@@ -21975,7 +22151,7 @@ mod tests {
         .unwrap()
         .unwrap();
         let hs = match higher {
-            Value::Object(Some(r)) => read_java_string(&shared.heap, r),
+            Value::Object(Some(r)) => read_java_string(&shared.mem.heap, r),
             _ => None,
         };
         assert_eq!(hs, Some("f".to_string()));
@@ -21998,7 +22174,7 @@ mod tests {
         .unwrap()
         .unwrap();
         let ls = match lower {
-            Value::Object(Some(r)) => read_java_string(&shared.heap, r),
+            Value::Object(Some(r)) => read_java_string(&shared.mem.heap, r),
             _ => None,
         };
         assert_eq!(ls, Some("b".to_string()));
@@ -22009,7 +22185,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let ts = shared.heap.alloc_object(ClassId::new(0), 3);
+        let ts = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -22155,7 +22331,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let ts = shared.heap.alloc_object(ClassId::new(0), 3);
+        let ts = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -22226,7 +22402,7 @@ mod tests {
             .unwrap()
             .unwrap();
             if let Value::Object(Some(r)) = val {
-                if let Some(s) = read_java_string(&shared.heap, r) {
+                if let Some(s) = read_java_string(&shared.mem.heap, r) {
                     collected.push(s);
                 }
             }
@@ -22239,7 +22415,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let al = shared.heap.alloc_object(ClassId::new(0), 2);
+        let al = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -22268,7 +22444,7 @@ mod tests {
             .unwrap();
         }
 
-        let ts = shared.heap.alloc_object(ClassId::new(0), 3);
+        let ts = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -22300,7 +22476,7 @@ mod tests {
         .unwrap()
         .unwrap();
         let ss = match str_val {
-            Value::Object(Some(r)) => read_java_string(&shared.heap, r),
+            Value::Object(Some(r)) => read_java_string(&shared.mem.heap, r),
             _ => None,
         };
         assert_eq!(ss, Some("[a, m, z]".to_string()));
@@ -22311,7 +22487,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let tm = shared.heap.alloc_object(ClassId::new(0), 3);
+        let tm = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -22379,7 +22555,7 @@ mod tests {
         .unwrap()
         .unwrap();
         let gs = match got {
-            Value::Object(Some(r)) => read_java_string(&shared.heap, r),
+            Value::Object(Some(r)) => read_java_string(&shared.mem.heap, r),
             _ => None,
         };
         assert_eq!(gs, Some("val".to_string()));
@@ -22413,7 +22589,7 @@ mod tests {
         .unwrap()
         .unwrap();
         let gs2 = match got2 {
-            Value::Object(Some(r)) => read_java_string(&shared.heap, r),
+            Value::Object(Some(r)) => read_java_string(&shared.mem.heap, r),
             _ => None,
         };
         assert_eq!(gs2, Some("fallback".to_string()));
@@ -22424,7 +22600,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let tm = shared.heap.alloc_object(ClassId::new(0), 3);
+        let tm = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -22492,7 +22668,7 @@ mod tests {
         .unwrap()
         .unwrap();
         let es = match existing {
-            Value::Object(Some(r)) => read_java_string(&shared.heap, r),
+            Value::Object(Some(r)) => read_java_string(&shared.mem.heap, r),
             _ => None,
         };
         assert_eq!(es, Some("first".to_string()));
@@ -22515,7 +22691,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let tm = shared.heap.alloc_object(ClassId::new(0), 3);
+        let tm = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -22594,7 +22770,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let ts = shared.heap.alloc_object(ClassId::new(0), 3);
+        let ts = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -22655,17 +22831,17 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // Create byte[] with values [65, 66, 67] = A, B, C
-        let arr = shared.heap.alloc_array(
+        let arr = shared.mem.heap.alloc_array(
             ClassId::new(0),
             crate::memory::heap::ArrayElementType::Byte,
             3,
         );
-        let _ = shared.heap.set_array_element(arr, 0, Value::Int(65));
-        let _ = shared.heap.set_array_element(arr, 1, Value::Int(66));
-        let _ = shared.heap.set_array_element(arr, 2, Value::Int(67));
+        let _ = shared.mem.heap.set_array_element(arr, 0, Value::Int(65));
+        let _ = shared.mem.heap.set_array_element(arr, 1, Value::Int(66));
+        let _ = shared.mem.heap.set_array_element(arr, 2, Value::Int(67));
 
         // BAIS requires 4 slots: buf/pos/mark/count (Session 83 layout).
-        let bais = shared.heap.alloc_object(ClassId::new(0), 4);
+        let bais = shared.mem.heap.alloc_object(ClassId::new(0), 4);
         call_native(
             &shared,
             &mut thread,
@@ -22732,17 +22908,20 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let arr = shared.heap.alloc_array(
+        let arr = shared.mem.heap.alloc_array(
             ClassId::new(0),
             crate::memory::heap::ArrayElementType::Byte,
             5,
         );
         for i in 0..5 {
-            let _ = shared.heap.set_array_element(arr, i, Value::Int(i as i32));
+            let _ = shared
+                .mem
+                .heap
+                .set_array_element(arr, i, Value::Int(i as i32));
         }
 
         // BAIS requires 4 slots: buf/pos/mark/count (Session 83 layout).
-        let bais = shared.heap.alloc_object(ClassId::new(0), 4);
+        let bais = shared.mem.heap.alloc_object(ClassId::new(0), 4);
         call_native(
             &shared,
             &mut thread,
@@ -22826,19 +23005,20 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let arr = shared.heap.alloc_array(
+        let arr = shared.mem.heap.alloc_array(
             ClassId::new(0),
             crate::memory::heap::ArrayElementType::Byte,
             4,
         );
         for i in 0..4u8 {
             let _ = shared
+                .mem
                 .heap
                 .set_array_element(arr, i as usize, Value::Int(10 + i as i32));
         }
 
         // BAIS requires 4 slots: buf/pos/mark/count (Session 83 layout).
-        let bais = shared.heap.alloc_object(ClassId::new(0), 4);
+        let bais = shared.mem.heap.alloc_object(ClassId::new(0), 4);
         call_native(
             &shared,
             &mut thread,
@@ -22849,7 +23029,7 @@ mod tests {
         )
         .unwrap();
 
-        let buf = shared.heap.alloc_array(
+        let buf = shared.mem.heap.alloc_array(
             ClassId::new(0),
             crate::memory::heap::ArrayElementType::Byte,
             10,
@@ -22871,11 +23051,11 @@ mod tests {
         .unwrap();
         assert_eq!(count, Value::Int(4));
         assert_eq!(
-            shared.heap.get_array_element(buf, 0).unwrap(),
+            shared.mem.heap.get_array_element(buf, 0).unwrap(),
             Value::Int(10)
         );
         assert_eq!(
-            shared.heap.get_array_element(buf, 3).unwrap(),
+            shared.mem.heap.get_array_element(buf, 3).unwrap(),
             Value::Int(13)
         );
     }
@@ -22885,7 +23065,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let baos = shared.heap.alloc_object(ClassId::new(0), 2);
+        let baos = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -22951,17 +23131,17 @@ mod tests {
             Value::Object(Some(r)) => r,
             _ => panic!("expected array"),
         };
-        assert_eq!(shared.heap.array_length(result_arr), 3);
+        assert_eq!(shared.mem.heap.array_length(result_arr), 3);
         assert_eq!(
-            shared.heap.get_array_element(result_arr, 0).unwrap(),
+            shared.mem.heap.get_array_element(result_arr, 0).unwrap(),
             Value::Int(72)
         );
         assert_eq!(
-            shared.heap.get_array_element(result_arr, 1).unwrap(),
+            shared.mem.heap.get_array_element(result_arr, 1).unwrap(),
             Value::Int(105)
         );
         assert_eq!(
-            shared.heap.get_array_element(result_arr, 2).unwrap(),
+            shared.mem.heap.get_array_element(result_arr, 2).unwrap(),
             Value::Int(33)
         );
     }
@@ -22971,7 +23151,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let baos = shared.heap.alloc_object(ClassId::new(0), 2);
+        let baos = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -23005,7 +23185,7 @@ mod tests {
         .unwrap()
         .unwrap();
         let text = match s {
-            Value::Object(Some(r)) => read_java_string(&shared.heap, r),
+            Value::Object(Some(r)) => read_java_string(&shared.mem.heap, r),
             _ => None,
         };
         assert_eq!(text, Some("Hello".to_string()));
@@ -23016,7 +23196,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let baos = shared.heap.alloc_object(ClassId::new(0), 2);
+        let baos = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -23086,7 +23266,7 @@ mod tests {
             };
             ctx.create_string("hello world  foo")
         };
-        let sc = shared.heap.alloc_object(ClassId::new(0), 5);
+        let sc = shared.mem.heap.alloc_object(ClassId::new(0), 5);
         call_native(
             &shared,
             &mut thread,
@@ -23122,7 +23302,7 @@ mod tests {
         .unwrap()
         .unwrap();
         let s1 = match t1 {
-            Value::Object(Some(r)) => read_java_string(&shared.heap, r),
+            Value::Object(Some(r)) => read_java_string(&shared.mem.heap, r),
             _ => None,
         };
         assert_eq!(s1, Some("hello".to_string()));
@@ -23139,7 +23319,7 @@ mod tests {
         .unwrap()
         .unwrap();
         let s2 = match t2 {
-            Value::Object(Some(r)) => read_java_string(&shared.heap, r),
+            Value::Object(Some(r)) => read_java_string(&shared.mem.heap, r),
             _ => None,
         };
         assert_eq!(s2, Some("world".to_string()));
@@ -23156,7 +23336,7 @@ mod tests {
         .unwrap()
         .unwrap();
         let s3 = match t3 {
-            Value::Object(Some(r)) => read_java_string(&shared.heap, r),
+            Value::Object(Some(r)) => read_java_string(&shared.mem.heap, r),
             _ => None,
         };
         assert_eq!(s3, Some("foo".to_string()));
@@ -23187,7 +23367,7 @@ mod tests {
             };
             ctx.create_string("42 1000000000000 2.75")
         };
-        let sc = shared.heap.alloc_object(ClassId::new(0), 5);
+        let sc = shared.mem.heap.alloc_object(ClassId::new(0), 5);
         call_native(
             &shared,
             &mut thread,
@@ -23247,7 +23427,7 @@ mod tests {
             };
             ctx.create_string("line one\nline two\nline three")
         };
-        let sc = shared.heap.alloc_object(ClassId::new(0), 5);
+        let sc = shared.mem.heap.alloc_object(ClassId::new(0), 5);
         call_native(
             &shared,
             &mut thread,
@@ -23269,7 +23449,7 @@ mod tests {
         .unwrap()
         .unwrap();
         let s1 = match l1 {
-            Value::Object(Some(r)) => read_java_string(&shared.heap, r),
+            Value::Object(Some(r)) => read_java_string(&shared.mem.heap, r),
             _ => None,
         };
         assert_eq!(s1, Some("line one".to_string()));
@@ -23285,7 +23465,7 @@ mod tests {
         .unwrap()
         .unwrap();
         let s2 = match l2 {
-            Value::Object(Some(r)) => read_java_string(&shared.heap, r),
+            Value::Object(Some(r)) => read_java_string(&shared.mem.heap, r),
             _ => None,
         };
         assert_eq!(s2, Some("line two".to_string()));
@@ -23313,7 +23493,7 @@ mod tests {
         .unwrap()
         .unwrap();
         let s3 = match l3 {
-            Value::Object(Some(r)) => read_java_string(&shared.heap, r),
+            Value::Object(Some(r)) => read_java_string(&shared.mem.heap, r),
             _ => None,
         };
         assert_eq!(s3, Some("line three".to_string()));
@@ -23343,7 +23523,7 @@ mod tests {
             };
             ctx.create_string("a,b,,c")
         };
-        let sc = shared.heap.alloc_object(ClassId::new(0), 5);
+        let sc = shared.mem.heap.alloc_object(ClassId::new(0), 5);
         call_native(
             &shared,
             &mut thread,
@@ -23382,7 +23562,7 @@ mod tests {
         .unwrap()
         .unwrap();
         let s1 = match t1 {
-            Value::Object(Some(r)) => read_java_string(&shared.heap, r),
+            Value::Object(Some(r)) => read_java_string(&shared.mem.heap, r),
             _ => None,
         };
         assert_eq!(s1, Some("a".to_string()));
@@ -23398,7 +23578,7 @@ mod tests {
         .unwrap()
         .unwrap();
         let s2 = match t2 {
-            Value::Object(Some(r)) => read_java_string(&shared.heap, r),
+            Value::Object(Some(r)) => read_java_string(&shared.mem.heap, r),
             _ => None,
         };
         assert_eq!(s2, Some("b".to_string()));
@@ -23414,7 +23594,7 @@ mod tests {
         .unwrap()
         .unwrap();
         let s3 = match t3 {
-            Value::Object(Some(r)) => read_java_string(&shared.heap, r),
+            Value::Object(Some(r)) => read_java_string(&shared.mem.heap, r),
             _ => None,
         };
         assert_eq!(s3, Some("c".to_string()));
@@ -23432,7 +23612,7 @@ mod tests {
             };
             ctx.create_string("42 hello 3.14")
         };
-        let sc = shared.heap.alloc_object(ClassId::new(0), 5);
+        let sc = shared.mem.heap.alloc_object(ClassId::new(0), 5);
         call_native(
             &shared,
             &mut thread,
@@ -23529,7 +23709,7 @@ mod tests {
             };
             ctx.create_string("true false TRUE")
         };
-        let sc = shared.heap.alloc_object(ClassId::new(0), 5);
+        let sc = shared.mem.heap.alloc_object(ClassId::new(0), 5);
         call_native(
             &shared,
             &mut thread,
@@ -23589,7 +23769,7 @@ mod tests {
             };
             ctx.create_string("")
         };
-        let sc = shared.heap.alloc_object(ClassId::new(0), 5);
+        let sc = shared.mem.heap.alloc_object(ClassId::new(0), 5);
         call_native(
             &shared,
             &mut thread,
@@ -23637,7 +23817,7 @@ mod tests {
             };
             ctx.create_string("name 25 3.5 true")
         };
-        let sc = shared.heap.alloc_object(ClassId::new(0), 5);
+        let sc = shared.mem.heap.alloc_object(ClassId::new(0), 5);
         call_native(
             &shared,
             &mut thread,
@@ -23660,7 +23840,7 @@ mod tests {
         .unwrap()
         .unwrap();
         let s1 = match t1 {
-            Value::Object(Some(r)) => read_java_string(&shared.heap, r),
+            Value::Object(Some(r)) => read_java_string(&shared.mem.heap, r),
             _ => None,
         };
         assert_eq!(s1, Some("name".to_string()));
@@ -23712,17 +23892,20 @@ mod tests {
 
         // Create ByteArrayInputStream from bytes "10 20"
         let text = b"10 20";
-        let arr = shared.heap.alloc_array(
+        let arr = shared.mem.heap.alloc_array(
             ClassId::new(0),
             crate::memory::heap::ArrayElementType::Byte,
             text.len(),
         );
         for (i, &b) in text.iter().enumerate() {
-            let _ = shared.heap.set_array_element(arr, i, Value::Int(b as i32));
+            let _ = shared
+                .mem
+                .heap
+                .set_array_element(arr, i, Value::Int(b as i32));
         }
 
         // BAIS real-JDK layout = 4 fields (buf, pos, mark, count).
-        let bais = shared.heap.alloc_object(ClassId::new(0), 4);
+        let bais = shared.mem.heap.alloc_object(ClassId::new(0), 4);
         call_native(
             &shared,
             &mut thread,
@@ -23734,7 +23917,7 @@ mod tests {
         .unwrap();
 
         // Create Scanner from InputStream
-        let sc = shared.heap.alloc_object(ClassId::new(0), 5);
+        let sc = shared.mem.heap.alloc_object(ClassId::new(0), 5);
         call_native(
             &shared,
             &mut thread,
@@ -23782,7 +23965,7 @@ mod tests {
             };
             ctx.create_string("data")
         };
-        let sc = shared.heap.alloc_object(ClassId::new(0), 5);
+        let sc = shared.mem.heap.alloc_object(ClassId::new(0), 5);
         call_native(
             &shared,
             &mut thread,
@@ -23829,7 +24012,7 @@ mod tests {
             };
             ctx.create_string("FF 77")
         };
-        let sc = shared.heap.alloc_object(ClassId::new(0), 5);
+        let sc = shared.mem.heap.alloc_object(ClassId::new(0), 5);
         call_native(
             &shared,
             &mut thread,
@@ -23887,7 +24070,7 @@ mod tests {
             };
             ctx.create_string("age: 25 years")
         };
-        let sc = shared.heap.alloc_object(ClassId::new(0), 5);
+        let sc = shared.mem.heap.alloc_object(ClassId::new(0), 5);
         call_native(
             &shared,
             &mut thread,
@@ -23916,7 +24099,7 @@ mod tests {
         .unwrap()
         .unwrap();
         let fs = match found {
-            Value::Object(Some(r)) => read_java_string(&shared.heap, r),
+            Value::Object(Some(r)) => read_java_string(&shared.mem.heap, r),
             _ => None,
         };
         assert_eq!(fs, Some("25".to_string()));
@@ -23934,7 +24117,7 @@ mod tests {
             };
             ctx.create_string("1010")
         };
-        let sc = shared.heap.alloc_object(ClassId::new(0), 5);
+        let sc = shared.mem.heap.alloc_object(ClassId::new(0), 5);
         call_native(
             &shared,
             &mut thread,
@@ -23968,8 +24151,8 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // Create a class mirror (2-field: field 0 = ClassId Int, field 1 = name String)
-        let mirror = shared.heap.alloc_object(ClassId::new(0), 2);
-        shared.heap.set_field(mirror, 0, Value::Int(0));
+        let mirror = shared.mem.heap.alloc_object(ClassId::new(0), 2);
+        shared.mem.heap.set_field(mirror, 0, Value::Int(0));
         let name = {
             let mut ctx = NativeContextImpl {
                 shared: &shared,
@@ -23977,7 +24160,10 @@ mod tests {
             };
             ctx.create_string("test/MyClass")
         };
-        shared.heap.set_field(mirror, 1, Value::Object(Some(name)));
+        shared
+            .mem
+            .heap
+            .set_field(mirror, 1, Value::Object(Some(name)));
 
         let result = call_native(
             &shared,
@@ -23993,7 +24179,7 @@ mod tests {
             Value::Object(Some(a)) => a,
             _ => panic!("expected array"),
         };
-        assert_eq!(shared.heap.array_length(arr), 0);
+        assert_eq!(shared.mem.heap.array_length(arr), 0);
     }
 
     #[test]
@@ -24001,8 +24187,8 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let mirror = shared.heap.alloc_object(ClassId::new(0), 2);
-        shared.heap.set_field(mirror, 0, Value::Int(0));
+        let mirror = shared.mem.heap.alloc_object(ClassId::new(0), 2);
+        shared.mem.heap.set_field(mirror, 0, Value::Int(0));
         let name = {
             let mut ctx = NativeContextImpl {
                 shared: &shared,
@@ -24010,7 +24196,10 @@ mod tests {
             };
             ctx.create_string("test/Empty")
         };
-        shared.heap.set_field(mirror, 1, Value::Object(Some(name)));
+        shared
+            .mem
+            .heap
+            .set_field(mirror, 1, Value::Object(Some(name)));
 
         let result = call_native(
             &shared,
@@ -24026,7 +24215,7 @@ mod tests {
             Value::Object(Some(a)) => a,
             _ => panic!("expected array"),
         };
-        assert_eq!(shared.heap.array_length(arr), 0);
+        assert_eq!(shared.mem.heap.array_length(arr), 0);
     }
 
     #[test]
@@ -24037,6 +24226,7 @@ mod tests {
         // Register a class with no ACC_ANNOTATION flag
         register_test_class(&shared, "test/NotAnAnnotation", 0x0021, &[], &[]); // PUBLIC|SUPER
         let cid = shared
+            .classes
             .class_manager
             .read()
             .find_class_by_name("test/NotAnAnnotation")
@@ -24070,6 +24260,7 @@ mod tests {
         // ACC_ANNOTATION=0x2000 | ACC_INTERFACE=0x0200 | ACC_ABSTRACT=0x0400
         register_test_class(&shared, "test/MyAnnotation", 0x2600, &[], &[]);
         let cid = shared
+            .classes
             .class_manager
             .read()
             .find_class_by_name("test/MyAnnotation")
@@ -24101,8 +24292,8 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // Class mirror for the class we're checking
-        let mirror = shared.heap.alloc_object(ClassId::new(0), 2);
-        shared.heap.set_field(mirror, 0, Value::Int(0));
+        let mirror = shared.mem.heap.alloc_object(ClassId::new(0), 2);
+        shared.mem.heap.set_field(mirror, 0, Value::Int(0));
         let name = {
             let mut ctx = NativeContextImpl {
                 shared: &shared,
@@ -24110,11 +24301,14 @@ mod tests {
             };
             ctx.create_string("test/Plain")
         };
-        shared.heap.set_field(mirror, 1, Value::Object(Some(name)));
+        shared
+            .mem
+            .heap
+            .set_field(mirror, 1, Value::Object(Some(name)));
 
         // Class mirror for the annotation type we're looking for
-        let ann_mirror = shared.heap.alloc_object(ClassId::new(0), 2);
-        shared.heap.set_field(ann_mirror, 0, Value::Int(999));
+        let ann_mirror = shared.mem.heap.alloc_object(ClassId::new(0), 2);
+        shared.mem.heap.set_field(ann_mirror, 0, Value::Int(999));
         let ann_name = {
             let mut ctx = NativeContextImpl {
                 shared: &shared,
@@ -24123,6 +24317,7 @@ mod tests {
             ctx.create_string("java/lang/Deprecated")
         };
         shared
+            .mem
             .heap
             .set_field(ann_mirror, 1, Value::Object(Some(ann_name)));
 
@@ -24145,7 +24340,7 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // Create an annotation proxy manually (2 fields)
-        let proxy = shared.heap.alloc_object(ClassId::new(0), 2);
+        let proxy = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         let desc = {
             let mut ctx = NativeContextImpl {
                 shared: &shared,
@@ -24153,9 +24348,12 @@ mod tests {
             };
             ctx.create_string("Ljava/lang/Override;")
         };
-        shared.heap.set_field(proxy, 0, Value::Object(Some(desc)));
+        shared
+            .mem
+            .heap
+            .set_field(proxy, 0, Value::Object(Some(desc)));
         // field 1 = Class mirror (leave as null for this test)
-        shared.heap.set_field(proxy, 1, Value::Object(None));
+        shared.mem.heap.set_field(proxy, 1, Value::Object(None));
 
         // Call annotationType() РІР‚вЂќ should return null since no mirror was set
         let result = call_native(
@@ -24177,8 +24375,8 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // Create a class mirror for the annotation type
-        let ann_mirror = shared.heap.alloc_object(ClassId::new(0), 2);
-        shared.heap.set_field(ann_mirror, 0, Value::Int(42));
+        let ann_mirror = shared.mem.heap.alloc_object(ClassId::new(0), 2);
+        shared.mem.heap.set_field(ann_mirror, 0, Value::Int(42));
         let ann_name = {
             let mut ctx = NativeContextImpl {
                 shared: &shared,
@@ -24187,11 +24385,12 @@ mod tests {
             ctx.create_string("java/lang/Override")
         };
         shared
+            .mem
             .heap
             .set_field(ann_mirror, 1, Value::Object(Some(ann_name)));
 
         // Create an annotation proxy with the mirror
-        let proxy = shared.heap.alloc_object(ClassId::new(0), 2);
+        let proxy = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         let desc = {
             let mut ctx = NativeContextImpl {
                 shared: &shared,
@@ -24199,8 +24398,12 @@ mod tests {
             };
             ctx.create_string("Ljava/lang/Override;")
         };
-        shared.heap.set_field(proxy, 0, Value::Object(Some(desc)));
         shared
+            .mem
+            .heap
+            .set_field(proxy, 0, Value::Object(Some(desc)));
+        shared
+            .mem
             .heap
             .set_field(proxy, 1, Value::Object(Some(ann_mirror)));
 
@@ -24218,7 +24421,7 @@ mod tests {
         match result {
             Value::Object(Some(r)) => {
                 // Verify it's the same mirror
-                assert_eq!(shared.heap.get_field(r, 0), Value::Int(42));
+                assert_eq!(shared.mem.heap.get_field(r, 0), Value::Int(42));
             }
             _ => panic!("expected Class mirror"),
         }
@@ -24229,8 +24432,8 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let mirror = shared.heap.alloc_object(ClassId::new(0), 2);
-        shared.heap.set_field(mirror, 0, Value::Int(0));
+        let mirror = shared.mem.heap.alloc_object(ClassId::new(0), 2);
+        shared.mem.heap.set_field(mirror, 0, Value::Int(0));
         let name = {
             let mut ctx = NativeContextImpl {
                 shared: &shared,
@@ -24238,10 +24441,13 @@ mod tests {
             };
             ctx.create_string("test/NoAnns")
         };
-        shared.heap.set_field(mirror, 1, Value::Object(Some(name)));
+        shared
+            .mem
+            .heap
+            .set_field(mirror, 1, Value::Object(Some(name)));
 
-        let ann_mirror = shared.heap.alloc_object(ClassId::new(0), 2);
-        shared.heap.set_field(ann_mirror, 0, Value::Int(999));
+        let ann_mirror = shared.mem.heap.alloc_object(ClassId::new(0), 2);
+        shared.mem.heap.set_field(ann_mirror, 0, Value::Int(999));
         let ann_name = {
             let mut ctx = NativeContextImpl {
                 shared: &shared,
@@ -24250,6 +24456,7 @@ mod tests {
             ctx.create_string("java/lang/Override")
         };
         shared
+            .mem
             .heap
             .set_field(ann_mirror, 1, Value::Object(Some(ann_name)));
 
@@ -24271,8 +24478,8 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let mirror = shared.heap.alloc_object(ClassId::new(0), 2);
-        shared.heap.set_field(mirror, 0, Value::Int(0));
+        let mirror = shared.mem.heap.alloc_object(ClassId::new(0), 2);
+        shared.mem.heap.set_field(mirror, 0, Value::Int(0));
         let name = {
             let mut ctx = NativeContextImpl {
                 shared: &shared,
@@ -24280,10 +24487,13 @@ mod tests {
             };
             ctx.create_string("test/X")
         };
-        shared.heap.set_field(mirror, 1, Value::Object(Some(name)));
+        shared
+            .mem
+            .heap
+            .set_field(mirror, 1, Value::Object(Some(name)));
 
-        let ann_mirror = shared.heap.alloc_object(ClassId::new(0), 2);
-        shared.heap.set_field(ann_mirror, 0, Value::Int(999));
+        let ann_mirror = shared.mem.heap.alloc_object(ClassId::new(0), 2);
+        shared.mem.heap.set_field(ann_mirror, 0, Value::Int(999));
         let ann_name = {
             let mut ctx = NativeContextImpl {
                 shared: &shared,
@@ -24292,6 +24502,7 @@ mod tests {
             ctx.create_string("java/lang/Deprecated")
         };
         shared
+            .mem
             .heap
             .set_field(ann_mirror, 1, Value::Object(Some(ann_name)));
 
@@ -24309,7 +24520,7 @@ mod tests {
             Value::Object(Some(a)) => a,
             _ => panic!("expected array"),
         };
-        assert_eq!(shared.heap.array_length(arr), 0);
+        assert_eq!(shared.mem.heap.array_length(arr), 0);
     }
 
     #[test]
@@ -24318,9 +24529,9 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // Create a Field object (6 fields: 0=class mirror, 1=name, 2=type, 3=modifiers, 4=slot, 5=descriptor)
-        let field_obj = shared.heap.alloc_object(ClassId::new(0), 6);
-        let class_mirror = shared.heap.alloc_object(ClassId::new(0), 2);
-        shared.heap.set_field(class_mirror, 0, Value::Int(0));
+        let field_obj = shared.mem.heap.alloc_object(ClassId::new(0), 6);
+        let class_mirror = shared.mem.heap.alloc_object(ClassId::new(0), 2);
+        shared.mem.heap.set_field(class_mirror, 0, Value::Int(0));
         let cls_name = {
             let mut ctx = NativeContextImpl {
                 shared: &shared,
@@ -24329,9 +24540,11 @@ mod tests {
             ctx.create_string("test/Cls")
         };
         shared
+            .mem
             .heap
             .set_field(class_mirror, 1, Value::Object(Some(cls_name)));
         shared
+            .mem
             .heap
             .set_field(field_obj, 0, Value::Object(Some(class_mirror)));
         let fname = {
@@ -24342,6 +24555,7 @@ mod tests {
             ctx.create_string("myField")
         };
         shared
+            .mem
             .heap
             .set_field(field_obj, 1, Value::Object(Some(fname)));
 
@@ -24359,7 +24573,7 @@ mod tests {
             Value::Object(Some(a)) => a,
             _ => panic!("expected array"),
         };
-        assert_eq!(shared.heap.array_length(arr), 0);
+        assert_eq!(shared.mem.heap.array_length(arr), 0);
     }
 
     #[test]
@@ -24368,9 +24582,9 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // Create a Method object (7 fields: 0=class mirror, 1=name, 2=ret type, 3=param types, 4=modifiers, 5=descriptor, 6=param count)
-        let method_obj = shared.heap.alloc_object(ClassId::new(0), 7);
-        let class_mirror = shared.heap.alloc_object(ClassId::new(0), 2);
-        shared.heap.set_field(class_mirror, 0, Value::Int(0));
+        let method_obj = shared.mem.heap.alloc_object(ClassId::new(0), 7);
+        let class_mirror = shared.mem.heap.alloc_object(ClassId::new(0), 2);
+        shared.mem.heap.set_field(class_mirror, 0, Value::Int(0));
         let cls_name = {
             let mut ctx = NativeContextImpl {
                 shared: &shared,
@@ -24379,9 +24593,11 @@ mod tests {
             ctx.create_string("test/Cls")
         };
         shared
+            .mem
             .heap
             .set_field(class_mirror, 1, Value::Object(Some(cls_name)));
         shared
+            .mem
             .heap
             .set_field(method_obj, 0, Value::Object(Some(class_mirror)));
         let mname = {
@@ -24392,6 +24608,7 @@ mod tests {
             ctx.create_string("myMethod")
         };
         shared
+            .mem
             .heap
             .set_field(method_obj, 1, Value::Object(Some(mname)));
         let mdesc = {
@@ -24402,6 +24619,7 @@ mod tests {
             ctx.create_string("()V")
         };
         shared
+            .mem
             .heap
             .set_field(method_obj, 5, Value::Object(Some(mdesc)));
 
@@ -24419,7 +24637,7 @@ mod tests {
             Value::Object(Some(a)) => a,
             _ => panic!("expected array"),
         };
-        assert_eq!(shared.heap.array_length(arr), 0);
+        assert_eq!(shared.mem.heap.array_length(arr), 0);
     }
 
     #[test]
@@ -24597,8 +24815,8 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let referent = shared.heap.alloc_object(ClassId::new(0), 0);
-        let weak = shared.heap.alloc_object(ClassId::new(0), 2);
+        let referent = shared.mem.heap.alloc_object(ClassId::new(0), 0);
+        let weak = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -24627,8 +24845,8 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let referent = shared.heap.alloc_object(ClassId::new(0), 0);
-        let weak = shared.heap.alloc_object(ClassId::new(0), 2);
+        let referent = shared.mem.heap.alloc_object(ClassId::new(0), 0);
+        let weak = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -24667,8 +24885,8 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let referent = shared.heap.alloc_object(ClassId::new(0), 0);
-        let soft = shared.heap.alloc_object(ClassId::new(0), 2);
+        let referent = shared.mem.heap.alloc_object(ClassId::new(0), 0);
+        let soft = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -24697,8 +24915,8 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let referent = shared.heap.alloc_object(ClassId::new(0), 0);
-        let queue = shared.heap.alloc_object(ClassId::new(0), 2);
+        let referent = shared.mem.heap.alloc_object(ClassId::new(0), 0);
+        let queue = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -24709,7 +24927,7 @@ mod tests {
         )
         .unwrap();
 
-        let phantom = shared.heap.alloc_object(ClassId::new(0), 2);
+        let phantom = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -24754,8 +24972,8 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let referent = shared.heap.alloc_object(ClassId::new(0), 0);
-        let weak = shared.heap.alloc_object(ClassId::new(0), 2);
+        let referent = shared.mem.heap.alloc_object(ClassId::new(0), 0);
+        let weak = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -24784,8 +25002,8 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let referent = shared.heap.alloc_object(ClassId::new(0), 0);
-        let weak = shared.heap.alloc_object(ClassId::new(0), 2);
+        let referent = shared.mem.heap.alloc_object(ClassId::new(0), 0);
+        let weak = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -24824,7 +25042,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let queue = shared.heap.alloc_object(ClassId::new(0), 2);
+        let queue = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -24854,7 +25072,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let queue = shared.heap.alloc_object(ClassId::new(0), 2);
+        let queue = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -24865,8 +25083,8 @@ mod tests {
         )
         .unwrap();
 
-        let referent = shared.heap.alloc_object(ClassId::new(0), 0);
-        let weak = shared.heap.alloc_object(ClassId::new(0), 2);
+        let referent = shared.mem.heap.alloc_object(ClassId::new(0), 0);
+        let weak = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -24926,8 +25144,8 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let referent = shared.heap.alloc_object(ClassId::new(0), 0);
-        let weak = shared.heap.alloc_object(ClassId::new(0), 2);
+        let referent = shared.mem.heap.alloc_object(ClassId::new(0), 0);
+        let weak = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -24956,7 +25174,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let queue = shared.heap.alloc_object(ClassId::new(0), 2);
+        let queue = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -24967,8 +25185,8 @@ mod tests {
         )
         .unwrap();
 
-        let r1 = shared.heap.alloc_object(ClassId::new(0), 0);
-        let w1 = shared.heap.alloc_object(ClassId::new(0), 2);
+        let r1 = shared.mem.heap.alloc_object(ClassId::new(0), 0);
+        let w1 = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -24983,8 +25201,8 @@ mod tests {
         )
         .unwrap();
 
-        let r2 = shared.heap.alloc_object(ClassId::new(0), 0);
-        let w2 = shared.heap.alloc_object(ClassId::new(0), 2);
+        let r2 = shared.mem.heap.alloc_object(ClassId::new(0), 0);
+        let w2 = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -25050,7 +25268,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let queue = shared.heap.alloc_object(ClassId::new(0), 2);
+        let queue = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -25061,8 +25279,8 @@ mod tests {
         )
         .unwrap();
 
-        let referent = shared.heap.alloc_object(ClassId::new(0), 0);
-        let weak = shared.heap.alloc_object(ClassId::new(0), 2);
+        let referent = shared.mem.heap.alloc_object(ClassId::new(0), 0);
+        let weak = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -25096,7 +25314,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let queue = shared.heap.alloc_object(ClassId::new(0), 2);
+        let queue = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -25107,8 +25325,8 @@ mod tests {
         )
         .unwrap();
 
-        let referent = shared.heap.alloc_object(ClassId::new(0), 0);
-        let soft = shared.heap.alloc_object(ClassId::new(0), 2);
+        let referent = shared.mem.heap.alloc_object(ClassId::new(0), 0);
+        let soft = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -25141,7 +25359,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let queue = shared.heap.alloc_object(ClassId::new(0), 2);
+        let queue = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -25172,8 +25390,8 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // Test that methods work via base Reference class name too
-        let referent = shared.heap.alloc_object(ClassId::new(0), 0);
-        let weak = shared.heap.alloc_object(ClassId::new(0), 2);
+        let referent = shared.mem.heap.alloc_object(ClassId::new(0), 0);
+        let weak = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -25228,7 +25446,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let chm = shared.heap.alloc_object(ClassId::new(0), 3);
+        let chm = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -25279,7 +25497,10 @@ mod tests {
         .unwrap();
         match got {
             Value::Object(Some(r)) => {
-                assert_eq!(read_java_string(&shared.heap, r), Some("val1".to_string()))
+                assert_eq!(
+                    read_java_string(&shared.mem.heap, r),
+                    Some("val1".to_string())
+                )
             }
             _ => panic!("expected val1"),
         }
@@ -25290,7 +25511,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let chm = shared.heap.alloc_object(ClassId::new(0), 3);
+        let chm = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -25371,7 +25592,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let chm = shared.heap.alloc_object(ClassId::new(0), 3);
+        let chm = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -25428,7 +25649,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let chm = shared.heap.alloc_object(ClassId::new(0), 3);
+        let chm = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -25495,7 +25716,10 @@ mod tests {
         .unwrap();
         match r2 {
             Value::Object(Some(r)) => {
-                assert_eq!(read_java_string(&shared.heap, r), Some("first".to_string()))
+                assert_eq!(
+                    read_java_string(&shared.mem.heap, r),
+                    Some("first".to_string())
+                )
             }
             _ => panic!("expected 'first'"),
         }
@@ -25506,7 +25730,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let chm = shared.heap.alloc_object(ClassId::new(0), 3);
+        let chm = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -25588,7 +25812,10 @@ mod tests {
         .unwrap();
         match r2 {
             Value::Object(Some(r)) => {
-                assert_eq!(read_java_string(&shared.heap, r), Some("old".to_string()))
+                assert_eq!(
+                    read_java_string(&shared.mem.heap, r),
+                    Some("old".to_string())
+                )
             }
             _ => panic!("expected 'old'"),
         }
@@ -25599,7 +25826,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let chm = shared.heap.alloc_object(ClassId::new(0), 3);
+        let chm = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -25702,7 +25929,10 @@ mod tests {
         .unwrap();
         match got {
             Value::Object(Some(r)) => {
-                assert_eq!(read_java_string(&shared.heap, r), Some("val2".to_string()))
+                assert_eq!(
+                    read_java_string(&shared.mem.heap, r),
+                    Some("val2".to_string())
+                )
             }
             _ => panic!("expected val2"),
         }
@@ -25713,7 +25943,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let chm = shared.heap.alloc_object(ClassId::new(0), 3);
+        let chm = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -25813,7 +26043,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let chm = shared.heap.alloc_object(ClassId::new(0), 3);
+        let chm = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -25903,7 +26133,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let chm = shared.heap.alloc_object(ClassId::new(0), 3);
+        let chm = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -25970,7 +26200,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let chm = shared.heap.alloc_object(ClassId::new(0), 3);
+        let chm = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -26012,7 +26242,7 @@ mod tests {
         .unwrap();
         match got {
             Value::Object(Some(r)) => assert_eq!(
-                read_java_string(&shared.heap, r),
+                read_java_string(&shared.mem.heap, r),
                 Some("default".to_string())
             ),
             _ => panic!("expected default"),
@@ -26024,7 +26254,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let chm = shared.heap.alloc_object(ClassId::new(0), 3);
+        let chm = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -26053,7 +26283,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let chm = shared.heap.alloc_object(ClassId::new(0), 3);
+        let chm = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         // (initialCapacity, loadFactor, concurrencyLevel)
         call_native(
             &shared,
@@ -26937,12 +27167,13 @@ mod tests {
 
         // Create a byte array [5, 10, 15, 20]
         let arr = shared
+            .mem
             .heap
             .alloc_array(ClassId::new(0), ArrayElementType::Byte, 4);
-        let _ = shared.heap.set_array_element(arr, 0, Value::Int(5));
-        let _ = shared.heap.set_array_element(arr, 1, Value::Int(10));
-        let _ = shared.heap.set_array_element(arr, 2, Value::Int(15));
-        let _ = shared.heap.set_array_element(arr, 3, Value::Int(20));
+        let _ = shared.mem.heap.set_array_element(arr, 0, Value::Int(5));
+        let _ = shared.mem.heap.set_array_element(arr, 1, Value::Int(10));
+        let _ = shared.mem.heap.set_array_element(arr, 2, Value::Int(15));
+        let _ = shared.mem.heap.set_array_element(arr, 3, Value::Int(20));
 
         let bb = call_native(
             &shared,
@@ -27406,11 +27637,12 @@ mod tests {
 
         // Create source byte array [100, 101, 102]
         let src = shared
+            .mem
             .heap
             .alloc_array(ClassId::new(0), ArrayElementType::Byte, 3);
-        let _ = shared.heap.set_array_element(src, 0, Value::Int(100));
-        let _ = shared.heap.set_array_element(src, 1, Value::Int(101));
-        let _ = shared.heap.set_array_element(src, 2, Value::Int(102));
+        let _ = shared.mem.heap.set_array_element(src, 0, Value::Int(100));
+        let _ = shared.mem.heap.set_array_element(src, 1, Value::Int(101));
+        let _ = shared.mem.heap.set_array_element(src, 2, Value::Int(102));
 
         // Bulk put
         call_native(
@@ -27452,6 +27684,7 @@ mod tests {
         .unwrap();
 
         let dst = shared
+            .mem
             .heap
             .alloc_array(ClassId::new(0), ArrayElementType::Byte, 3);
         call_native(
@@ -27470,15 +27703,15 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            shared.heap.get_array_element(dst, 0).unwrap(),
+            shared.mem.heap.get_array_element(dst, 0).unwrap(),
             Value::Int(100)
         );
         assert_eq!(
-            shared.heap.get_array_element(dst, 1).unwrap(),
+            shared.mem.heap.get_array_element(dst, 1).unwrap(),
             Value::Int(101)
         );
         assert_eq!(
-            shared.heap.get_array_element(dst, 2).unwrap(),
+            shared.mem.heap.get_array_element(dst, 2).unwrap(),
             Value::Int(102)
         );
     }
@@ -27642,7 +27875,7 @@ mod tests {
             Value::Object(Some(o)) => o,
             _ => panic!("expected string obj"),
         };
-        let text = read_java_string(&shared.heap, s_ref).unwrap();
+        let text = read_java_string(&shared.mem.heap, s_ref).unwrap();
         assert_eq!(text, "java.nio.HeapByteBuffer[pos=0 lim=16 cap=16]");
     }
 
@@ -27698,7 +27931,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let lock = shared.heap.alloc_object(ClassId::new(0), 3);
+        let lock = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -27785,7 +28018,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let lock = shared.heap.alloc_object(ClassId::new(0), 3);
+        let lock = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -27892,7 +28125,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let lock = shared.heap.alloc_object(ClassId::new(0), 3);
+        let lock = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -27943,7 +28176,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let lock = shared.heap.alloc_object(ClassId::new(0), 3);
+        let lock = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -27972,7 +28205,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let lock = shared.heap.alloc_object(ClassId::new(0), 3);
+        let lock = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -28001,7 +28234,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let latch = shared.heap.alloc_object(ClassId::new(0), 1);
+        let latch = shared.mem.heap.alloc_object(ClassId::new(0), 1);
         call_native(
             &shared,
             &mut thread,
@@ -28055,7 +28288,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let latch = shared.heap.alloc_object(ClassId::new(0), 1);
+        let latch = shared.mem.heap.alloc_object(ClassId::new(0), 1);
         call_native(
             &shared,
             &mut thread,
@@ -28104,7 +28337,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let latch = shared.heap.alloc_object(ClassId::new(0), 1);
+        let latch = shared.mem.heap.alloc_object(ClassId::new(0), 1);
         call_native(
             &shared,
             &mut thread,
@@ -28166,7 +28399,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let sem = shared.heap.alloc_object(ClassId::new(0), 2);
+        let sem = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -28241,7 +28474,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let sem = shared.heap.alloc_object(ClassId::new(0), 2);
+        let sem = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -28284,7 +28517,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let sem = shared.heap.alloc_object(ClassId::new(0), 2);
+        let sem = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -28339,7 +28572,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let sem = shared.heap.alloc_object(ClassId::new(0), 2);
+        let sem = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -28380,7 +28613,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let sem = shared.heap.alloc_object(ClassId::new(0), 2);
+        let sem = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -28409,7 +28642,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let barrier = shared.heap.alloc_object(ClassId::new(0), 3);
+        let barrier = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -28462,7 +28695,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let barrier = shared.heap.alloc_object(ClassId::new(0), 3);
+        let barrier = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -28531,7 +28764,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let barrier = shared.heap.alloc_object(ClassId::new(0), 3);
+        let barrier = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -28582,7 +28815,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let list = shared.heap.alloc_object(ClassId::new(0), 2);
+        let list = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -28658,7 +28891,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let latch = shared.heap.alloc_object(ClassId::new(0), 1);
+        let latch = shared.mem.heap.alloc_object(ClassId::new(0), 1);
         let result = call_native(
             &shared,
             &mut thread,
@@ -28675,7 +28908,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let barrier = shared.heap.alloc_object(ClassId::new(0), 3);
+        let barrier = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         let result = call_native(
             &shared,
             &mut thread,
@@ -28697,7 +28930,7 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // Allocate with 4 fields (3 for HashMap + 1 for defaults)
-        let props = shared.heap.alloc_object(ClassId::new(0), 4);
+        let props = shared.mem.heap.alloc_object(ClassId::new(0), 4);
         call_native(
             &shared,
             &mut thread,
@@ -28738,7 +28971,7 @@ mod tests {
             _ => panic!("expected string"),
         };
         assert_eq!(
-            read_java_string(&shared.heap, result_obj),
+            read_java_string(&shared.mem.heap, result_obj),
             Some("localhost".to_string())
         );
     }
@@ -28748,7 +28981,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let props = shared.heap.alloc_object(ClassId::new(0), 4);
+        let props = shared.mem.heap.alloc_object(ClassId::new(0), 4);
         call_native(
             &shared,
             &mut thread,
@@ -28777,7 +29010,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let props = shared.heap.alloc_object(ClassId::new(0), 4);
+        let props = shared.mem.heap.alloc_object(ClassId::new(0), 4);
         call_native(
             &shared,
             &mut thread,
@@ -28808,7 +29041,7 @@ mod tests {
             _ => panic!("expected string"),
         };
         assert_eq!(
-            read_java_string(&shared.heap, result_obj),
+            read_java_string(&shared.mem.heap, result_obj),
             Some("default_val".to_string())
         );
     }
@@ -28819,7 +29052,7 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // Create defaults Properties with a key
-        let defaults = shared.heap.alloc_object(ClassId::new(0), 4);
+        let defaults = shared.mem.heap.alloc_object(ClassId::new(0), 4);
         call_native(
             &shared,
             &mut thread,
@@ -28846,7 +29079,7 @@ mod tests {
         .unwrap();
 
         // Create child Properties with defaults
-        let child = shared.heap.alloc_object(ClassId::new(0), 4);
+        let child = shared.mem.heap.alloc_object(ClassId::new(0), 4);
         call_native(
             &shared,
             &mut thread,
@@ -28873,7 +29106,7 @@ mod tests {
             _ => panic!("expected string"),
         };
         assert_eq!(
-            read_java_string(&shared.heap, result_obj),
+            read_java_string(&shared.mem.heap, result_obj),
             Some("blue".to_string())
         );
     }
@@ -28883,7 +29116,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let props = shared.heap.alloc_object(ClassId::new(0), 4);
+        let props = shared.mem.heap.alloc_object(ClassId::new(0), 4);
         call_native(
             &shared,
             &mut thread,
@@ -28940,19 +29173,22 @@ mod tests {
 
         // Create a BAIS with properties content
         let content = b"# comment\nhost=localhost\nport=8080\n";
-        let data = shared.heap.alloc_array(
+        let data = shared.mem.heap.alloc_array(
             ClassId::new(0),
             crate::memory::heap::ArrayElementType::Byte,
             content.len(),
         );
         for (i, &b) in content.iter().enumerate() {
-            let _ = shared.heap.set_array_element(data, i, Value::Int(b as i32));
+            let _ = shared
+                .mem
+                .heap
+                .set_array_element(data, i, Value::Int(b as i32));
         }
         // BAIS layout is {buf, pos, mark, count} РІР‚вЂќ 4 slots. Under-allocating
         // triggers the gen_heap layout-mismatch guard which silently drops
         // the count write and later reads back Object(None), making
         // Properties.load() see an empty stream.
-        let bais = shared.heap.alloc_object(ClassId::new(0), 4);
+        let bais = shared.mem.heap.alloc_object(ClassId::new(0), 4);
         call_native(
             &shared,
             &mut thread,
@@ -28964,7 +29200,7 @@ mod tests {
         .unwrap();
 
         // Create Properties and load
-        let props = shared.heap.alloc_object(ClassId::new(0), 4);
+        let props = shared.mem.heap.alloc_object(ClassId::new(0), 4);
         call_native(
             &shared,
             &mut thread,
@@ -29000,7 +29236,7 @@ mod tests {
             _ => panic!("expected string"),
         };
         assert_eq!(
-            read_java_string(&shared.heap, result_obj),
+            read_java_string(&shared.mem.heap, result_obj),
             Some("localhost".to_string())
         );
 
@@ -29019,7 +29255,7 @@ mod tests {
             _ => panic!("expected string"),
         };
         assert_eq!(
-            read_java_string(&shared.heap, result_obj),
+            read_java_string(&shared.mem.heap, result_obj),
             Some("8080".to_string())
         );
 
@@ -29042,17 +29278,20 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         let content = b"key1:value1\nkey2:value2\n";
-        let data = shared.heap.alloc_array(
+        let data = shared.mem.heap.alloc_array(
             ClassId::new(0),
             crate::memory::heap::ArrayElementType::Byte,
             content.len(),
         );
         for (i, &b) in content.iter().enumerate() {
-            let _ = shared.heap.set_array_element(data, i, Value::Int(b as i32));
+            let _ = shared
+                .mem
+                .heap
+                .set_array_element(data, i, Value::Int(b as i32));
         }
         // BAIS layout is {buf, pos, mark, count} РІР‚вЂќ 4 slots (see
         // properties_load_from_bais for the rationale).
-        let bais = shared.heap.alloc_object(ClassId::new(0), 4);
+        let bais = shared.mem.heap.alloc_object(ClassId::new(0), 4);
         call_native(
             &shared,
             &mut thread,
@@ -29063,7 +29302,7 @@ mod tests {
         )
         .unwrap();
 
-        let props = shared.heap.alloc_object(ClassId::new(0), 4);
+        let props = shared.mem.heap.alloc_object(ClassId::new(0), 4);
         call_native(
             &shared,
             &mut thread,
@@ -29098,7 +29337,7 @@ mod tests {
             _ => panic!("expected string"),
         };
         assert_eq!(
-            read_java_string(&shared.heap, result_obj),
+            read_java_string(&shared.mem.heap, result_obj),
             Some("value1".to_string())
         );
     }
@@ -29114,16 +29353,19 @@ mod tests {
 
         // Mix '=' and ':' separators plus comment lines and leading whitespace.
         let content = b"# mixed separators\nequals_key=eqValue\n  colon_key : colonValue\n! bang comment\nkey3=mix:ed\n";
-        let data = shared.heap.alloc_array(
+        let data = shared.mem.heap.alloc_array(
             ClassId::new(0),
             crate::memory::heap::ArrayElementType::Byte,
             content.len(),
         );
         for (i, &b) in content.iter().enumerate() {
-            let _ = shared.heap.set_array_element(data, i, Value::Int(b as i32));
+            let _ = shared
+                .mem
+                .heap
+                .set_array_element(data, i, Value::Int(b as i32));
         }
         // BAIS: {buf, pos, mark, count} РІР‚вЂќ 4 slots.
-        let bais = shared.heap.alloc_object(ClassId::new(0), 4);
+        let bais = shared.mem.heap.alloc_object(ClassId::new(0), 4);
         call_native(
             &shared,
             &mut thread,
@@ -29134,7 +29376,7 @@ mod tests {
         )
         .unwrap();
 
-        let props = shared.heap.alloc_object(ClassId::new(0), 4);
+        let props = shared.mem.heap.alloc_object(ClassId::new(0), 4);
         call_native(
             &shared,
             &mut thread,
@@ -29174,7 +29416,7 @@ mod tests {
                     key, other
                 ),
             };
-            read_java_string(&shared.heap, result_obj).unwrap_or_else(|| {
+            read_java_string(&shared.mem.heap, result_obj).unwrap_or_else(|| {
                 panic!("getProperty({:?}) did not return a valid Java String", key)
             })
         };
@@ -29225,13 +29467,16 @@ mod tests {
 
         // Create byte[] input: "Hello"
         let input = b"Hello";
-        let arr = shared.heap.alloc_array(
+        let arr = shared.mem.heap.alloc_array(
             ClassId::new(0),
             crate::memory::heap::ArrayElementType::Byte,
             input.len(),
         );
         for (i, &b) in input.iter().enumerate() {
-            let _ = shared.heap.set_array_element(arr, i, Value::Int(b as i32));
+            let _ = shared
+                .mem
+                .heap
+                .set_array_element(arr, i, Value::Int(b as i32));
         }
 
         // encodeToString
@@ -29249,7 +29494,7 @@ mod tests {
             _ => panic!("expected string"),
         };
         assert_eq!(
-            read_java_string(&shared.heap, result_obj),
+            read_java_string(&shared.mem.heap, result_obj),
             Some("SGVsbG8=".to_string())
         );
     }
@@ -29273,7 +29518,7 @@ mod tests {
             _ => panic!("expected encoder"),
         };
 
-        let arr = shared.heap.alloc_array(
+        let arr = shared.mem.heap.alloc_array(
             ClassId::new(0),
             crate::memory::heap::ArrayElementType::Byte,
             0,
@@ -29292,7 +29537,7 @@ mod tests {
             _ => panic!("expected string"),
         };
         assert_eq!(
-            read_java_string(&shared.heap, result_obj),
+            read_java_string(&shared.mem.heap, result_obj),
             Some(String::new())
         );
     }
@@ -29332,11 +29577,11 @@ mod tests {
             _ => panic!("expected byte array"),
         };
 
-        let len = shared.heap.array_length(result_arr);
+        let len = shared.mem.heap.array_length(result_arr);
         assert_eq!(len, 5);
         let mut decoded = Vec::new();
         for i in 0..len {
-            if let Value::Int(b) = shared.heap.get_array_element(result_arr, i).unwrap() {
+            if let Value::Int(b) = shared.mem.heap.get_array_element(result_arr, i).unwrap() {
                 decoded.push(b as u8);
             }
         }
@@ -29378,13 +29623,16 @@ mod tests {
 
         // Input: "Hello, World!" as byte array
         let input = b"Hello, World!";
-        let arr = shared.heap.alloc_array(
+        let arr = shared.mem.heap.alloc_array(
             ClassId::new(0),
             crate::memory::heap::ArrayElementType::Byte,
             input.len(),
         );
         for (i, &b) in input.iter().enumerate() {
-            let _ = shared.heap.set_array_element(arr, i, Value::Int(b as i32));
+            let _ = shared
+                .mem
+                .heap
+                .set_array_element(arr, i, Value::Int(b as i32));
         }
 
         // Encode
@@ -29420,11 +29668,11 @@ mod tests {
             _ => panic!("expected byte array"),
         };
 
-        let len = shared.heap.array_length(decoded_arr);
+        let len = shared.mem.heap.array_length(decoded_arr);
         assert_eq!(len, input.len());
         let mut result = Vec::new();
         for i in 0..len {
-            if let Value::Int(b) = shared.heap.get_array_element(decoded_arr, i).unwrap() {
+            if let Value::Int(b) = shared.mem.heap.get_array_element(decoded_arr, i).unwrap() {
                 result.push(b as u8);
             }
         }
@@ -29452,18 +29700,21 @@ mod tests {
 
         // Input with bytes that would produce + and / in basic encoding
         // Use bytes [0xFB, 0xFF, 0xFE] which produces +//+ in basic
-        let arr = shared.heap.alloc_array(
+        let arr = shared.mem.heap.alloc_array(
             ClassId::new(0),
             crate::memory::heap::ArrayElementType::Byte,
             3,
         );
         let _ = shared
+            .mem
             .heap
             .set_array_element(arr, 0, Value::Int(0xFBu8 as i32));
         let _ = shared
+            .mem
             .heap
             .set_array_element(arr, 1, Value::Int(0xFFu8 as i32));
         let _ = shared
+            .mem
             .heap
             .set_array_element(arr, 2, Value::Int(0xFEu8 as i32));
 
@@ -29480,7 +29731,7 @@ mod tests {
             Some(Value::Object(Some(o))) => o,
             _ => panic!("expected string"),
         };
-        let s = read_java_string(&shared.heap, result_obj).unwrap();
+        let s = read_java_string(&shared.mem.heap, result_obj).unwrap();
         // URL-safe encoding should not contain + or /
         assert!(!s.contains('+'));
         assert!(!s.contains('/'));
@@ -29520,13 +29771,16 @@ mod tests {
         };
 
         let input = b"test URL-safe encoding!";
-        let arr = shared.heap.alloc_array(
+        let arr = shared.mem.heap.alloc_array(
             ClassId::new(0),
             crate::memory::heap::ArrayElementType::Byte,
             input.len(),
         );
         for (i, &b) in input.iter().enumerate() {
-            let _ = shared.heap.set_array_element(arr, i, Value::Int(b as i32));
+            let _ = shared
+                .mem
+                .heap
+                .set_array_element(arr, i, Value::Int(b as i32));
         }
 
         let encoded = call_native(
@@ -29560,10 +29814,10 @@ mod tests {
             _ => panic!("expected byte array"),
         };
 
-        let len = shared.heap.array_length(decoded_arr);
+        let len = shared.mem.heap.array_length(decoded_arr);
         let mut result = Vec::new();
         for i in 0..len {
-            if let Value::Int(b) = shared.heap.get_array_element(decoded_arr, i).unwrap() {
+            if let Value::Int(b) = shared.mem.heap.get_array_element(decoded_arr, i).unwrap() {
                 result.push(b as u8);
             }
         }
@@ -29639,7 +29893,7 @@ mod tests {
             _ => panic!("expected string"),
         };
         assert_eq!(
-            read_java_string(&shared.heap, name_obj),
+            read_java_string(&shared.mem.heap, name_obj),
             Some("UTF-8".to_string())
         );
     }
@@ -29678,7 +29932,7 @@ mod tests {
             _ => panic!("expected string"),
         };
         assert_eq!(
-            read_java_string(&shared.heap, name_obj),
+            read_java_string(&shared.mem.heap, name_obj),
             Some("UTF-8".to_string())
         );
     }
@@ -29733,7 +29987,7 @@ mod tests {
             _ => panic!("expected string"),
         };
         assert_eq!(
-            read_java_string(&shared.heap, name_obj),
+            read_java_string(&shared.mem.heap, name_obj),
             Some("UTF-8".to_string())
         );
     }
@@ -29870,7 +30124,7 @@ mod tests {
             _ => panic!("expected string"),
         };
         assert_eq!(
-            read_java_string(&shared.heap, name_obj),
+            read_java_string(&shared.mem.heap, name_obj),
             Some("UTF-8".to_string())
         );
     }
@@ -29918,7 +30172,7 @@ mod tests {
                 _ => panic!("expected string for {}", field),
             };
             assert_eq!(
-                read_java_string(&shared.heap, name_obj),
+                read_java_string(&shared.mem.heap, name_obj),
                 Some(expected.to_string())
             );
         }
@@ -29952,7 +30206,7 @@ mod tests {
     fn string_reader_read_chars() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let sr = shared.heap.alloc_object(ClassId::new(0), 3);
+        let sr = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         let content = create_java_string(&shared, "Hello");
         let _ = call_native(
             &shared,
@@ -29992,7 +30246,7 @@ mod tests {
     fn string_reader_ready_and_eof() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let sr = shared.heap.alloc_object(ClassId::new(0), 3);
+        let sr = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         let content = create_java_string(&shared, "AB");
         let _ = call_native(
             &shared,
@@ -30049,7 +30303,7 @@ mod tests {
     fn string_reader_skip_and_reset() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let sr = shared.heap.alloc_object(ClassId::new(0), 3);
+        let sr = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         let content = create_java_string(&shared, "ABCDE");
         let _ = call_native(
             &shared,
@@ -30110,7 +30364,7 @@ mod tests {
     fn string_writer_write_and_to_string() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let sw = shared.heap.alloc_object(ClassId::new(0), 2);
+        let sw = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         let _ = call_native(
             &shared,
             &mut thread,
@@ -30149,7 +30403,7 @@ mod tests {
         .unwrap()
         .unwrap();
         if let Value::Object(Some(s)) = result {
-            assert_eq!(read_java_string(&shared.heap, s).unwrap(), "AB");
+            assert_eq!(read_java_string(&shared.mem.heap, s).unwrap(), "AB");
         } else {
             panic!("expected string");
         }
@@ -30159,7 +30413,7 @@ mod tests {
     fn string_writer_write_string() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let sw = shared.heap.alloc_object(ClassId::new(0), 2);
+        let sw = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         let _ = call_native(
             &shared,
             &mut thread,
@@ -30197,7 +30451,10 @@ mod tests {
         .unwrap()
         .unwrap();
         if let Value::Object(Some(s)) = result {
-            assert_eq!(read_java_string(&shared.heap, s).unwrap(), "Hello World");
+            assert_eq!(
+                read_java_string(&shared.mem.heap, s).unwrap(),
+                "Hello World"
+            );
         } else {
             panic!("expected string");
         }
@@ -30207,7 +30464,7 @@ mod tests {
     fn string_writer_append_char() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let sw = shared.heap.alloc_object(ClassId::new(0), 2);
+        let sw = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         let _ = call_native(
             &shared,
             &mut thread,
@@ -30243,7 +30500,7 @@ mod tests {
         .unwrap()
         .unwrap();
         if let Value::Object(Some(s)) = result {
-            assert_eq!(read_java_string(&shared.heap, s).unwrap(), "XY");
+            assert_eq!(read_java_string(&shared.mem.heap, s).unwrap(), "XY");
         } else {
             panic!("expected string");
         }
@@ -30257,7 +30514,7 @@ mod tests {
     fn biginteger_init_and_to_string() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let bi = shared.heap.alloc_object(ClassId::new(0), 2);
+        let bi = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         let val = create_java_string(&shared, "12345");
         let _ = call_native(
             &shared,
@@ -30278,7 +30535,7 @@ mod tests {
         .unwrap()
         .unwrap();
         if let Value::Object(Some(s)) = result {
-            assert_eq!(read_java_string(&shared.heap, s).unwrap(), "12345");
+            assert_eq!(read_java_string(&shared.mem.heap, s).unwrap(), "12345");
         } else {
             panic!("expected string");
         }
@@ -30288,8 +30545,8 @@ mod tests {
     fn biginteger_add_and_subtract() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let a = shared.heap.alloc_object(ClassId::new(0), 2);
-        let b = shared.heap.alloc_object(ClassId::new(0), 2);
+        let a = shared.mem.heap.alloc_object(ClassId::new(0), 2);
+        let b = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         let va = create_java_string(&shared, "100");
         let vb = create_java_string(&shared, "25");
         let _ = call_native(
@@ -30331,7 +30588,7 @@ mod tests {
             .unwrap()
             .unwrap();
             if let Value::Object(Some(rs)) = r {
-                assert_eq!(read_java_string(&shared.heap, rs).unwrap(), "125");
+                assert_eq!(read_java_string(&shared.mem.heap, rs).unwrap(), "125");
             } else {
                 panic!("expected string");
             }
@@ -30361,7 +30618,7 @@ mod tests {
             .unwrap()
             .unwrap();
             if let Value::Object(Some(rs)) = r {
-                assert_eq!(read_java_string(&shared.heap, rs).unwrap(), "75");
+                assert_eq!(read_java_string(&shared.mem.heap, rs).unwrap(), "75");
             } else {
                 panic!("expected string");
             }
@@ -30374,8 +30631,8 @@ mod tests {
     fn biginteger_multiply_and_divide() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let a = shared.heap.alloc_object(ClassId::new(0), 2);
-        let b = shared.heap.alloc_object(ClassId::new(0), 2);
+        let a = shared.mem.heap.alloc_object(ClassId::new(0), 2);
+        let b = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         let va = create_java_string(&shared, "12");
         let vb = create_java_string(&shared, "5");
         let _ = call_native(
@@ -30417,7 +30674,7 @@ mod tests {
             .unwrap()
             .unwrap();
             if let Value::Object(Some(rs)) = r {
-                assert_eq!(read_java_string(&shared.heap, rs).unwrap(), "60");
+                assert_eq!(read_java_string(&shared.mem.heap, rs).unwrap(), "60");
             } else {
                 panic!("expected string");
             }
@@ -30447,7 +30704,7 @@ mod tests {
             .unwrap()
             .unwrap();
             if let Value::Object(Some(rs)) = r {
-                assert_eq!(read_java_string(&shared.heap, rs).unwrap(), "2");
+                assert_eq!(read_java_string(&shared.mem.heap, rs).unwrap(), "2");
             } else {
                 panic!("expected string");
             }
@@ -30460,7 +30717,7 @@ mod tests {
     fn biginteger_negate_and_abs() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let a = shared.heap.alloc_object(ClassId::new(0), 2);
+        let a = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         let va = create_java_string(&shared, "42");
         let _ = call_native(
             &shared,
@@ -30493,7 +30750,7 @@ mod tests {
             .unwrap()
             .unwrap();
             if let Value::Object(Some(rs)) = r {
-                assert_eq!(read_java_string(&shared.heap, rs).unwrap(), "-42");
+                assert_eq!(read_java_string(&shared.mem.heap, rs).unwrap(), "-42");
             } else {
                 panic!("expected string");
             }
@@ -30520,7 +30777,7 @@ mod tests {
                 .unwrap()
                 .unwrap();
                 if let Value::Object(Some(rs2)) = r2 {
-                    assert_eq!(read_java_string(&shared.heap, rs2).unwrap(), "42");
+                    assert_eq!(read_java_string(&shared.mem.heap, rs2).unwrap(), "42");
                 } else {
                     panic!("expected string");
                 }
@@ -30536,9 +30793,9 @@ mod tests {
     fn biginteger_compare_and_equals() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let a = shared.heap.alloc_object(ClassId::new(0), 2);
-        let b = shared.heap.alloc_object(ClassId::new(0), 2);
-        let c = shared.heap.alloc_object(ClassId::new(0), 2);
+        let a = shared.mem.heap.alloc_object(ClassId::new(0), 2);
+        let b = shared.mem.heap.alloc_object(ClassId::new(0), 2);
+        let c = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         let va = create_java_string(&shared, "100");
         let vb = create_java_string(&shared, "200");
         let vc = create_java_string(&shared, "100");
@@ -30596,7 +30853,7 @@ mod tests {
     fn biginteger_int_value_and_long_value() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let bi = shared.heap.alloc_object(ClassId::new(0), 2);
+        let bi = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         let val = create_java_string(&shared, "42");
         let _ = call_native(
             &shared,
@@ -30656,7 +30913,7 @@ mod tests {
             .unwrap()
             .unwrap();
             if let Value::Object(Some(s)) = r {
-                assert_eq!(read_java_string(&shared.heap, s).unwrap(), "999");
+                assert_eq!(read_java_string(&shared.mem.heap, s).unwrap(), "999");
             } else {
                 panic!("expected string");
             }
@@ -30673,7 +30930,7 @@ mod tests {
     fn bigdecimal_init_and_to_string() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let bd = shared.heap.alloc_object(ClassId::new(0), 3);
+        let bd = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         let val = create_java_string(&shared, "3.14");
         let _ = call_native(
             &shared,
@@ -30694,7 +30951,7 @@ mod tests {
         .unwrap()
         .unwrap();
         if let Value::Object(Some(s)) = result {
-            assert_eq!(read_java_string(&shared.heap, s).unwrap(), "3.14");
+            assert_eq!(read_java_string(&shared.mem.heap, s).unwrap(), "3.14");
         } else {
             panic!("expected string");
         }
@@ -30704,8 +30961,8 @@ mod tests {
     fn bigdecimal_add_and_subtract() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let a = shared.heap.alloc_object(ClassId::new(0), 3);
-        let b = shared.heap.alloc_object(ClassId::new(0), 3);
+        let a = shared.mem.heap.alloc_object(ClassId::new(0), 3);
+        let b = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         let va = create_java_string(&shared, "10.5");
         let vb = create_java_string(&shared, "3.2");
         let _ = call_native(
@@ -30760,7 +31017,7 @@ mod tests {
     fn bigdecimal_scale_and_precision() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let bd = shared.heap.alloc_object(ClassId::new(0), 3);
+        let bd = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         let val = create_java_string(&shared, "123.456");
         let _ = call_native(
             &shared,
@@ -30798,8 +31055,8 @@ mod tests {
     fn bigdecimal_compare_to() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let a = shared.heap.alloc_object(ClassId::new(0), 3);
-        let b = shared.heap.alloc_object(ClassId::new(0), 3);
+        let a = shared.mem.heap.alloc_object(ClassId::new(0), 3);
+        let b = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         let va = create_java_string(&shared, "1.5");
         let vb = create_java_string(&shared, "2.5");
         let _ = call_native(
@@ -30921,7 +31178,7 @@ mod tests {
             .unwrap()
             .unwrap();
             if let Value::Object(Some(s)) = result {
-                assert_eq!(read_java_string(&shared.heap, s).unwrap(), "hello");
+                assert_eq!(read_java_string(&shared.mem.heap, s).unwrap(), "hello");
             } else {
                 panic!("expected string");
             }
@@ -30934,7 +31191,7 @@ mod tests {
     fn completable_future_complete() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let cf = shared.heap.alloc_object(ClassId::new(0), 2);
+        let cf = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         let _ = call_native(
             &shared,
             &mut thread,
@@ -30986,7 +31243,7 @@ mod tests {
     fn future_get_now_with_default() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let cf = shared.heap.alloc_object(ClassId::new(0), 2);
+        let cf = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         let _ = call_native(
             &shared,
             &mut thread,
@@ -31007,7 +31264,7 @@ mod tests {
         .unwrap()
         .unwrap();
         if let Value::Object(Some(s)) = result {
-            assert_eq!(read_java_string(&shared.heap, s).unwrap(), "default");
+            assert_eq!(read_java_string(&shared.mem.heap, s).unwrap(), "default");
         } else {
             panic!("expected string");
         }
@@ -31038,7 +31295,7 @@ mod tests {
     fn decimal_format_init_and_format() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let df = shared.heap.alloc_object(ClassId::new(0), 3);
+        let df = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         let _ = call_native(
             &shared,
             &mut thread,
@@ -31060,7 +31317,7 @@ mod tests {
         .unwrap();
         if let Value::Object(Some(s)) = result {
             // Default DecimalFormat uses grouping separators
-            assert_eq!(read_java_string(&shared.heap, s).unwrap(), "12,345");
+            assert_eq!(read_java_string(&shared.mem.heap, s).unwrap(), "12,345");
         } else {
             panic!("expected string");
         }
@@ -31070,7 +31327,7 @@ mod tests {
     fn decimal_format_pattern() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let df = shared.heap.alloc_object(ClassId::new(0), 3);
+        let df = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         let pattern = create_java_string(&shared, "#0.00");
         let _ = call_native(
             &shared,
@@ -31091,7 +31348,7 @@ mod tests {
         .unwrap()
         .unwrap();
         if let Value::Object(Some(s)) = pat {
-            assert_eq!(read_java_string(&shared.heap, s).unwrap(), "#0.00");
+            assert_eq!(read_java_string(&shared.mem.heap, s).unwrap(), "#0.00");
         } else {
             panic!("expected string");
         }
@@ -31105,7 +31362,7 @@ mod tests {
     fn url_parse_and_getters() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let url = shared.heap.alloc_object(ClassId::new(0), 6);
+        let url = shared.mem.heap.alloc_object(ClassId::new(0), 6);
         let url_str = create_java_string(&shared, "https://example.com:8080/path?key=value");
         let _ = call_native(
             &shared,
@@ -31127,7 +31384,7 @@ mod tests {
         .unwrap()
         .unwrap();
         if let Value::Object(Some(s)) = proto {
-            assert_eq!(read_java_string(&shared.heap, s).unwrap(), "https");
+            assert_eq!(read_java_string(&shared.mem.heap, s).unwrap(), "https");
         } else {
             panic!("expected string");
         }
@@ -31143,7 +31400,10 @@ mod tests {
         .unwrap()
         .unwrap();
         if let Value::Object(Some(s)) = host {
-            assert_eq!(read_java_string(&shared.heap, s).unwrap(), "example.com");
+            assert_eq!(
+                read_java_string(&shared.mem.heap, s).unwrap(),
+                "example.com"
+            );
         } else {
             panic!("expected string");
         }
@@ -31171,7 +31431,7 @@ mod tests {
         .unwrap()
         .unwrap();
         if let Value::Object(Some(s)) = path {
-            assert_eq!(read_java_string(&shared.heap, s).unwrap(), "/path");
+            assert_eq!(read_java_string(&shared.mem.heap, s).unwrap(), "/path");
         } else {
             panic!("expected string");
         }
@@ -31187,7 +31447,7 @@ mod tests {
         .unwrap()
         .unwrap();
         if let Value::Object(Some(s)) = query {
-            assert_eq!(read_java_string(&shared.heap, s).unwrap(), "key=value");
+            assert_eq!(read_java_string(&shared.mem.heap, s).unwrap(), "key=value");
         } else {
             panic!("expected string");
         }
@@ -31197,8 +31457,8 @@ mod tests {
     fn url_to_string_and_equals() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let url1 = shared.heap.alloc_object(ClassId::new(0), 6);
-        let url2 = shared.heap.alloc_object(ClassId::new(0), 6);
+        let url1 = shared.mem.heap.alloc_object(ClassId::new(0), 6);
+        let url2 = shared.mem.heap.alloc_object(ClassId::new(0), 6);
         let s1 = create_java_string(&shared, "http://test.com/page");
         let s2 = create_java_string(&shared, "http://test.com/page");
         let _ = call_native(
@@ -31242,7 +31502,7 @@ mod tests {
         .unwrap();
         if let Value::Object(Some(s)) = ts {
             assert_eq!(
-                read_java_string(&shared.heap, s).unwrap(),
+                read_java_string(&shared.mem.heap, s).unwrap(),
                 "http://test.com/page"
             );
         } else {
@@ -31277,7 +31537,7 @@ mod tests {
             .unwrap()
             .unwrap();
             if let Value::Object(Some(s)) = scheme {
-                assert_eq!(read_java_string(&shared.heap, s).unwrap(), "https");
+                assert_eq!(read_java_string(&shared.mem.heap, s).unwrap(), "https");
             } else {
                 panic!("expected string");
             }
@@ -31314,7 +31574,7 @@ mod tests {
             .unwrap()
             .unwrap();
             if let Value::Object(Some(s)) = host {
-                assert_eq!(read_java_string(&shared.heap, s).unwrap(), "localhost");
+                assert_eq!(read_java_string(&shared.mem.heap, s).unwrap(), "localhost");
             } else {
                 panic!("expected string");
             }
@@ -31329,7 +31589,7 @@ mod tests {
             .unwrap()
             .unwrap();
             if let Value::Object(Some(s)) = addr {
-                assert_eq!(read_java_string(&shared.heap, s).unwrap(), "127.0.0.1");
+                assert_eq!(read_java_string(&shared.mem.heap, s).unwrap(), "127.0.0.1");
             } else {
                 panic!("expected string");
             }
@@ -31371,7 +31631,7 @@ mod tests {
             .unwrap()
             .unwrap();
             if let Value::Object(Some(s)) = n {
-                assert_eq!(read_java_string(&shared.heap, s).unwrap(), "MyLogger");
+                assert_eq!(read_java_string(&shared.mem.heap, s).unwrap(), "MyLogger");
             } else {
                 panic!("expected string");
             }
@@ -31435,7 +31695,7 @@ mod tests {
             .unwrap()
             .unwrap();
             if let Value::Object(Some(s)) = name {
-                assert_eq!(read_java_string(&shared.heap, s).unwrap(), "INFO");
+                assert_eq!(read_java_string(&shared.mem.heap, s).unwrap(), "INFO");
             } else {
                 panic!("expected string");
             }
@@ -31481,7 +31741,7 @@ mod tests {
             .unwrap()
             .unwrap();
             if let Value::Object(Some(s)) = lang {
-                assert_eq!(read_java_string(&shared.heap, s).unwrap(), "en");
+                assert_eq!(read_java_string(&shared.mem.heap, s).unwrap(), "en");
             } else {
                 panic!("expected string");
             }
@@ -31496,7 +31756,7 @@ mod tests {
             .unwrap()
             .unwrap();
             if let Value::Object(Some(s)) = country {
-                assert_eq!(read_java_string(&shared.heap, s).unwrap(), "US");
+                assert_eq!(read_java_string(&shared.mem.heap, s).unwrap(), "US");
             } else {
                 panic!("expected string");
             }
@@ -31537,7 +31797,7 @@ mod tests {
     fn locale_to_string_and_to_tag() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let loc = shared.heap.alloc_object(ClassId::new(0), 3);
+        let loc = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         let lang = create_java_string(&shared, "en");
         let country = create_java_string(&shared, "US");
         let _ = call_native(
@@ -31564,7 +31824,7 @@ mod tests {
         .unwrap()
         .unwrap();
         if let Value::Object(Some(s)) = ts {
-            assert_eq!(read_java_string(&shared.heap, s).unwrap(), "en_US");
+            assert_eq!(read_java_string(&shared.mem.heap, s).unwrap(), "en_US");
         } else {
             panic!("expected string");
         }
@@ -31580,7 +31840,7 @@ mod tests {
         .unwrap()
         .unwrap();
         if let Value::Object(Some(s)) = tag {
-            assert_eq!(read_java_string(&shared.heap, s).unwrap(), "en-US");
+            assert_eq!(read_java_string(&shared.mem.heap, s).unwrap(), "en-US");
         } else {
             panic!("expected string");
         }
@@ -31613,7 +31873,7 @@ mod tests {
             .unwrap()
             .unwrap();
             if let Value::Object(Some(s)) = lang {
-                assert_eq!(read_java_string(&shared.heap, s).unwrap(), "fr");
+                assert_eq!(read_java_string(&shared.mem.heap, s).unwrap(), "fr");
             } else {
                 panic!("expected string");
             }
@@ -31654,7 +31914,7 @@ mod tests {
             .unwrap();
             if let Value::Object(Some(str_obj)) = ts {
                 assert_eq!(
-                    read_java_string(&shared.heap, str_obj).unwrap(),
+                    read_java_string(&shared.mem.heap, str_obj).unwrap(),
                     "/home/user/file.txt"
                 );
             } else {
@@ -31704,7 +31964,10 @@ mod tests {
                 .unwrap()
                 .unwrap();
                 if let Value::Object(Some(str_obj)) = ts {
-                    assert_eq!(read_java_string(&shared.heap, str_obj).unwrap(), "file.txt");
+                    assert_eq!(
+                        read_java_string(&shared.mem.heap, str_obj).unwrap(),
+                        "file.txt"
+                    );
                 } else {
                     panic!("expected string");
                 }
@@ -31814,13 +32077,14 @@ mod tests {
         .unwrap();
         if let Value::Object(Some(md_obj)) = md {
             // update with some bytes
-            let arr = shared.heap.alloc_array(
+            let arr = shared.mem.heap.alloc_array(
                 ClassId::new(0),
                 crate::memory::heap::ArrayElementType::Byte,
                 5,
             );
             for i in 0..5 {
                 let _ = shared
+                    .mem
                     .heap
                     .set_array_element(arr, i, Value::Int(i as i32 + 1));
             }
@@ -31844,7 +32108,7 @@ mod tests {
             .unwrap()
             .unwrap();
             if let Value::Object(Some(hash)) = result {
-                assert_eq!(shared.heap.array_length(hash), 32); // SHA-256 = 32 bytes
+                assert_eq!(shared.mem.heap.array_length(hash), 32); // SHA-256 = 32 bytes
             } else {
                 panic!("expected byte array");
             }
@@ -31860,7 +32124,7 @@ mod tests {
             .unwrap()
             .unwrap();
             if let Value::Object(Some(s)) = a {
-                assert_eq!(read_java_string(&shared.heap, s).unwrap(), "SHA-256");
+                assert_eq!(read_java_string(&shared.mem.heap, s).unwrap(), "SHA-256");
             } else {
                 panic!("expected string");
             }
@@ -31905,7 +32169,7 @@ mod tests {
     fn secure_random_next_int() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let sr = shared.heap.alloc_object(ClassId::new(0), 2);
+        let sr = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         let _ = call_native(
             &shared,
             &mut thread,
@@ -31951,7 +32215,7 @@ mod tests {
     fn rwlock_init_and_locks() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let rwl = shared.heap.alloc_object(ClassId::new(0), 3);
+        let rwl = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         let _ = call_native(
             &shared,
             &mut thread,
@@ -31990,7 +32254,7 @@ mod tests {
     fn long_adder_operations() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let la = shared.heap.alloc_object(ClassId::new(0), 1);
+        let la = shared.mem.heap.alloc_object(ClassId::new(0), 1);
         let _ = call_native(
             &shared,
             &mut thread,
@@ -32070,7 +32334,7 @@ mod tests {
     fn atomic_integer_array_ops() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let aia = shared.heap.alloc_object(ClassId::new(0), 2);
+        let aia = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         let _ = call_native(
             &shared,
             &mut thread,
@@ -32149,7 +32413,7 @@ mod tests {
     fn stack_trace_element_init_and_to_string() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let ste = shared.heap.alloc_object(ClassId::new(0), 4);
+        let ste = shared.mem.heap.alloc_object(ClassId::new(0), 4);
         let cls = create_java_string(&shared, "com.example.Main");
         let method = create_java_string(&shared, "main");
         let file = create_java_string(&shared, "Main.java");
@@ -32179,7 +32443,7 @@ mod tests {
         .unwrap()
         .unwrap();
         if let Value::Object(Some(s)) = ts {
-            let text = read_java_string(&shared.heap, s).unwrap();
+            let text = read_java_string(&shared.mem.heap, s).unwrap();
             assert!(text.contains("com.example.Main"));
             assert!(text.contains("main"));
             assert!(text.contains("42"));
@@ -32199,7 +32463,7 @@ mod tests {
         .unwrap();
         if let Value::Object(Some(s)) = cn {
             assert_eq!(
-                read_java_string(&shared.heap, s).unwrap(),
+                read_java_string(&shared.mem.heap, s).unwrap(),
                 "com.example.Main"
             );
         } else {
@@ -32327,7 +32591,7 @@ mod tests {
             .unwrap()
             .unwrap();
             if let Value::Object(Some(str_ref)) = s {
-                let text = read_java_string(&shared.heap, str_ref).unwrap();
+                let text = read_java_string(&shared.mem.heap, str_ref).unwrap();
                 assert!(text.contains("2024-12-25"));
                 assert!(text.contains("14:30"));
             } else {
@@ -32521,7 +32785,10 @@ mod tests {
                 .unwrap()
                 .unwrap();
                 if let Value::Object(Some(s)) = id {
-                    assert_eq!(read_java_string(&shared.heap, s).unwrap(), "Europe/Paris");
+                    assert_eq!(
+                        read_java_string(&shared.mem.heap, s).unwrap(),
+                        "Europe/Paris"
+                    );
                 } else {
                     panic!("expected string");
                 }
@@ -32593,7 +32860,7 @@ mod tests {
             .unwrap()
             .unwrap();
             if let Value::Object(Some(sr)) = s {
-                let text = read_java_string(&shared.heap, sr).unwrap();
+                let text = read_java_string(&shared.mem.heap, sr).unwrap();
                 assert_eq!(text, "P1Y6M15D");
             } else {
                 panic!("expected string");
@@ -32640,7 +32907,7 @@ mod tests {
             .unwrap()
             .unwrap();
             if let Value::Object(Some(s)) = id {
-                let text = read_java_string(&shared.heap, s).unwrap();
+                let text = read_java_string(&shared.mem.heap, s).unwrap();
                 assert!(text.contains("+05"));
             } else {
                 panic!("expected string");
@@ -32778,6 +33045,7 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
         // Create a BIS with null inner stream (testing init only)
         let bis = shared
+            .mem
             .heap
             .alloc_object(crate::classloading::ClassId::new(0), 4);
         call_native(
@@ -32827,6 +33095,7 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
         // Create LBQ
         let q = shared
+            .mem
             .heap
             .alloc_object(crate::classloading::ClassId::new(0), 4);
         call_native(
@@ -32899,7 +33168,7 @@ mod tests {
         .unwrap()
         .unwrap();
         if let Value::Object(Some(s)) = first {
-            assert_eq!(read_java_string(&shared.heap, s).unwrap(), "alpha");
+            assert_eq!(read_java_string(&shared.mem.heap, s).unwrap(), "alpha");
         } else {
             panic!("expected string");
         }
@@ -32923,6 +33192,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
         let q = shared
+            .mem
             .heap
             .alloc_object(crate::classloading::ClassId::new(0), 4);
         call_native(
@@ -33140,7 +33410,7 @@ mod tests {
             _ => panic!("expected string"),
         };
         assert_eq!(
-            read_java_string(&shared.heap, ts_obj),
+            read_java_string(&shared.mem.heap, ts_obj),
             Some("Hello NIO".to_string())
         );
 
@@ -33470,7 +33740,7 @@ mod tests {
             "java/lang/SecurityException",
         ] {
             let msg = create_java_string(&shared, "test error");
-            let exc = shared.heap.alloc_object(ClassId::new(0), 2);
+            let exc = shared.mem.heap.alloc_object(ClassId::new(0), 2);
             call_native(
                 &shared,
                 &mut thread,
@@ -33496,7 +33766,7 @@ mod tests {
                 _ => panic!("expected string for {}", exc_class),
             };
             assert_eq!(
-                read_java_string(&shared.heap, msg_obj),
+                read_java_string(&shared.mem.heap, msg_obj),
                 Some("test error".to_string())
             );
         }
@@ -33507,7 +33777,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let exc = shared.heap.alloc_object(ClassId::new(0), 2);
+        let exc = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -33543,24 +33813,28 @@ mod tests {
 
         // Create a snapshot iterator manually: field 0 = Object[], field 1 = cursor Int
         let arr = shared
+            .mem
             .heap
             .alloc_array(ClassId::new(0), ArrayElementType::Reference, 3);
         let s1 = create_java_string(&shared, "a");
         let s2 = create_java_string(&shared, "b");
         let s3 = create_java_string(&shared, "c");
         let _ = shared
+            .mem
             .heap
             .set_array_element(arr, 0, Value::Object(Some(s1)));
         let _ = shared
+            .mem
             .heap
             .set_array_element(arr, 1, Value::Object(Some(s2)));
         let _ = shared
+            .mem
             .heap
             .set_array_element(arr, 2, Value::Object(Some(s3)));
 
-        let itr = shared.heap.alloc_object(ClassId::new(0), 2);
-        shared.heap.set_field(itr, 0, Value::Object(Some(arr)));
-        shared.heap.set_field(itr, 1, Value::Int(0));
+        let itr = shared.mem.heap.alloc_object(ClassId::new(0), 2);
+        shared.mem.heap.set_field(itr, 0, Value::Object(Some(arr)));
+        shared.mem.heap.set_field(itr, 1, Value::Int(0));
 
         // hasNext via generic Iterator interface
         let has = call_native(
@@ -33590,7 +33864,10 @@ mod tests {
             Value::Object(Some(o)) => o,
             _ => panic!("expected obj"),
         };
-        assert_eq!(read_java_string(&shared.heap, o1), Some("a".to_string()));
+        assert_eq!(
+            read_java_string(&shared.mem.heap, o1),
+            Some("a".to_string())
+        );
 
         // Advance through all elements
         call_native(
@@ -33632,20 +33909,23 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         let arr = shared
+            .mem
             .heap
             .alloc_array(ClassId::new(0), ArrayElementType::Reference, 2);
         let s1 = create_java_string(&shared, "x");
         let s2 = create_java_string(&shared, "y");
         let _ = shared
+            .mem
             .heap
             .set_array_element(arr, 0, Value::Object(Some(s1)));
         let _ = shared
+            .mem
             .heap
             .set_array_element(arr, 1, Value::Object(Some(s2)));
 
-        let itr = shared.heap.alloc_object(ClassId::new(0), 2);
-        shared.heap.set_field(itr, 0, Value::Object(Some(arr)));
-        shared.heap.set_field(itr, 1, Value::Int(2)); // cursor at end
+        let itr = shared.mem.heap.alloc_object(ClassId::new(0), 2);
+        shared.mem.heap.set_field(itr, 0, Value::Object(Some(arr)));
+        shared.mem.heap.set_field(itr, 1, Value::Int(2)); // cursor at end
 
         let has_prev = call_native(
             &shared,
@@ -33673,7 +33953,7 @@ mod tests {
             Value::Object(Some(o)) => o,
             _ => panic!("expected obj"),
         };
-        assert_eq!(read_java_string(&shared.heap, o), Some("y".to_string()));
+        assert_eq!(read_java_string(&shared.mem.heap, o), Some("y".to_string()));
     }
 
     #[test]
@@ -33781,7 +34061,7 @@ mod tests {
             _ => panic!("expected string"),
         };
         assert_eq!(
-            read_java_string(&shared.heap, ts_obj),
+            read_java_string(&shared.mem.heap, ts_obj),
             Some("SystemClassLoader".to_string())
         );
     }
@@ -33795,7 +34075,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let iss = shared.heap.alloc_object(ClassId::new(0), 4);
+        let iss = shared.mem.heap.alloc_object(ClassId::new(0), 4);
         call_native(
             &shared,
             &mut thread,
@@ -33894,11 +34174,12 @@ mod tests {
 
         // Create int array [10, 20, 30]
         let arr = shared
+            .mem
             .heap
             .alloc_array(ClassId::new(0), ArrayElementType::Int, 3);
-        let _ = shared.heap.set_array_element(arr, 0, Value::Int(10));
-        let _ = shared.heap.set_array_element(arr, 1, Value::Int(20));
-        let _ = shared.heap.set_array_element(arr, 2, Value::Int(30));
+        let _ = shared.mem.heap.set_array_element(arr, 0, Value::Int(10));
+        let _ = shared.mem.heap.set_array_element(arr, 1, Value::Int(20));
+        let _ = shared.mem.heap.set_array_element(arr, 2, Value::Int(30));
 
         // getLength
         let len = call_native(
@@ -34128,7 +34409,7 @@ mod tests {
             other => panic!("Expected Integer object, got {:?}", other),
         };
         // Integer.intValue() РІР‚вЂќ field 0 should be 42
-        assert_eq!(shared.heap.get_field(int_obj, 0), Value::Int(42));
+        assert_eq!(shared.mem.heap.get_field(int_obj, 0), Value::Int(42));
     }
 
     #[test]
@@ -34169,12 +34450,13 @@ mod tests {
 
         // Create parameter types array: [int.class]
         let int_mirror = get_or_create_primitive_mirror(&shared, "int");
-        let param_types = shared.heap.alloc_array(
+        let param_types = shared.mem.heap.alloc_array(
             ClassId::new(0),
             crate::memory::heap::ArrayElementType::Reference,
             1,
         );
         let _ = shared
+            .mem
             .heap
             .set_array_element(param_types, 0, Value::Object(Some(int_mirror)));
 
@@ -34198,18 +34480,20 @@ mod tests {
 
         // Create args array: [Integer.valueOf(7)]
         let int_class_id = shared
+            .classes
             .class_manager
             .write()
             .load_class("java/lang/Integer")
             .unwrap();
-        let args_array = shared.heap.alloc_array(
+        let args_array = shared.mem.heap.alloc_array(
             ClassId::new(0),
             crate::memory::heap::ArrayElementType::Reference,
             1,
         );
-        let boxed_7 = shared.heap.alloc_object(int_class_id, 1);
-        shared.heap.set_field(boxed_7, 0, Value::Int(7));
+        let boxed_7 = shared.mem.heap.alloc_object(int_class_id, 1);
+        shared.mem.heap.set_field(boxed_7, 0, Value::Int(7));
         let _ = shared
+            .mem
             .heap
             .set_array_element(args_array, 0, Value::Object(Some(boxed_7)));
 
@@ -34233,7 +34517,7 @@ mod tests {
             Some(Value::Object(Some(obj))) => obj,
             other => panic!("Expected Integer, got {:?}", other),
         };
-        assert_eq!(shared.heap.get_field(int_obj, 0), Value::Int(14));
+        assert_eq!(shared.mem.heap.get_field(int_obj, 0), Value::Int(14));
     }
 
     #[test]
@@ -34278,17 +34562,18 @@ mod tests {
         let mirror = get_or_create_class_mirror(&shared, class_id);
 
         // Create receiver object
-        let receiver = shared.heap.alloc_object(class_id, 1);
-        shared.heap.set_field(receiver, 0, Value::Int(99));
+        let receiver = shared.mem.heap.alloc_object(class_id, 1);
+        shared.mem.heap.set_field(receiver, 0, Value::Int(99));
 
         let name_str = create_java_string(&shared, "identity");
         let int_mirror = get_or_create_primitive_mirror(&shared, "int");
-        let param_types = shared.heap.alloc_array(
+        let param_types = shared.mem.heap.alloc_array(
             ClassId::new(0),
             crate::memory::heap::ArrayElementType::Reference,
             1,
         );
         let _ = shared
+            .mem
             .heap
             .set_array_element(param_types, 0, Value::Object(Some(int_mirror)));
 
@@ -34312,18 +34597,20 @@ mod tests {
 
         // Create args: [Integer(55)]
         let int_class_id = shared
+            .classes
             .class_manager
             .write()
             .load_class("java/lang/Integer")
             .unwrap();
-        let args_array = shared.heap.alloc_array(
+        let args_array = shared.mem.heap.alloc_array(
             ClassId::new(0),
             crate::memory::heap::ArrayElementType::Reference,
             1,
         );
-        let boxed_55 = shared.heap.alloc_object(int_class_id, 1);
-        shared.heap.set_field(boxed_55, 0, Value::Int(55));
+        let boxed_55 = shared.mem.heap.alloc_object(int_class_id, 1);
+        shared.mem.heap.set_field(boxed_55, 0, Value::Int(55));
         let _ = shared
+            .mem
             .heap
             .set_array_element(args_array, 0, Value::Object(Some(boxed_55)));
 
@@ -34347,7 +34634,7 @@ mod tests {
             Some(Value::Object(Some(obj))) => obj,
             other => panic!("Expected Integer, got {:?}", other),
         };
-        assert_eq!(shared.heap.get_field(int_obj, 0), Value::Int(55));
+        assert_eq!(shared.mem.heap.get_field(int_obj, 0), Value::Int(55));
     }
 
     #[test]
@@ -34455,15 +34742,17 @@ mod tests {
 
         // Parameter types: [int.class, int.class]
         let int_mirror = get_or_create_primitive_mirror(&shared, "int");
-        let param_types = shared.heap.alloc_array(
+        let param_types = shared.mem.heap.alloc_array(
             ClassId::new(0),
             crate::memory::heap::ArrayElementType::Reference,
             2,
         );
         let _ = shared
+            .mem
             .heap
             .set_array_element(param_types, 0, Value::Object(Some(int_mirror)));
         let _ = shared
+            .mem
             .heap
             .set_array_element(param_types, 1, Value::Object(Some(int_mirror)));
 
@@ -34487,23 +34776,26 @@ mod tests {
 
         // Args: [Integer(10), Integer(32)]
         let int_class_id = shared
+            .classes
             .class_manager
             .write()
             .load_class("java/lang/Integer")
             .unwrap();
-        let args_array = shared.heap.alloc_array(
+        let args_array = shared.mem.heap.alloc_array(
             ClassId::new(0),
             crate::memory::heap::ArrayElementType::Reference,
             2,
         );
-        let boxed_10 = shared.heap.alloc_object(int_class_id, 1);
-        shared.heap.set_field(boxed_10, 0, Value::Int(10));
-        let boxed_32 = shared.heap.alloc_object(int_class_id, 1);
-        shared.heap.set_field(boxed_32, 0, Value::Int(32));
+        let boxed_10 = shared.mem.heap.alloc_object(int_class_id, 1);
+        shared.mem.heap.set_field(boxed_10, 0, Value::Int(10));
+        let boxed_32 = shared.mem.heap.alloc_object(int_class_id, 1);
+        shared.mem.heap.set_field(boxed_32, 0, Value::Int(32));
         let _ = shared
+            .mem
             .heap
             .set_array_element(args_array, 0, Value::Object(Some(boxed_10)));
         let _ = shared
+            .mem
             .heap
             .set_array_element(args_array, 1, Value::Object(Some(boxed_32)));
 
@@ -34525,7 +34817,7 @@ mod tests {
             Some(Value::Object(Some(obj))) => obj,
             other => panic!("Expected Integer, got {:?}", other),
         };
-        assert_eq!(shared.heap.get_field(int_obj, 0), Value::Int(42)); // 10 + 32
+        assert_eq!(shared.mem.heap.get_field(int_obj, 0), Value::Int(42)); // 10 + 32
     }
 
     #[test]
@@ -34599,7 +34891,7 @@ mod tests {
             Some(Value::Object(Some(obj))) => obj,
             other => panic!("Expected Long object, got {:?}", other),
         };
-        assert_eq!(shared.heap.get_field(long_obj, 0), Value::Long(1));
+        assert_eq!(shared.mem.heap.get_field(long_obj, 0), Value::Long(1));
     }
 
     #[test]
@@ -34626,12 +34918,13 @@ mod tests {
         let name_str = create_java_string(&shared, "compute");
 
         let int_mirror = get_or_create_primitive_mirror(&shared, "int");
-        let param_types = shared.heap.alloc_array(
+        let param_types = shared.mem.heap.alloc_array(
             ClassId::new(0),
             crate::memory::heap::ArrayElementType::Reference,
             1,
         );
         let _ = shared
+            .mem
             .heap
             .set_array_element(param_types, 0, Value::Object(Some(int_mirror)));
 
@@ -34667,7 +34960,7 @@ mod tests {
             Some(Value::Object(Some(s))) => s,
             other => panic!("Expected String, got {:?}", other),
         };
-        let name = read_java_string(&shared.heap, name_obj).unwrap();
+        let name = read_java_string(&shared.mem.heap, name_obj).unwrap();
         assert_eq!(name, "compute");
 
         // Method.getModifiers()
@@ -34725,9 +35018,10 @@ mod tests {
             Some(Value::Object(Some(a))) => a,
             _ => panic!("Expected array"),
         };
-        assert_eq!(shared.heap.array_length(methods_arr), 1);
+        assert_eq!(shared.mem.heap.array_length(methods_arr), 1);
 
         let method_obj = match shared
+            .mem
             .heap
             .get_array_element(methods_arr, 0)
             .unwrap_or(Value::Object(None))
@@ -34758,7 +35052,7 @@ mod tests {
         // A class with no finalize() override should have has_finalizer == false
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let class_id = register_test_class(&shared, "test/NoFinalizer", 0x0021, &[], &[]);
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let cls = cm.class_store.get(class_id).unwrap();
         assert!(!cls.has_finalizer);
     }
@@ -34788,7 +35082,7 @@ mod tests {
                 })],
             }],
         );
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let cls = cm.class_store.get(class_id).unwrap();
         // register_test_class sets has_finalizer to false, but declares_finalize
         // should return true based on the method list
@@ -34811,17 +35105,17 @@ mod tests {
     #[test]
     fn m19_finalizer_queue_enqueue_and_count() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
-        let obj = shared.heap.alloc_object(ClassId::new(0), 0);
+        let obj = shared.mem.heap.alloc_object(ClassId::new(0), 0);
         shared.register_finalizable(obj.as_ptr() as usize);
 
         // Before processing, finalizer_thread is empty
-        assert_eq!(shared.finalizer_thread.pending_count(), 0);
+        assert_eq!(shared.mem.finalizer_thread.pending_count(), 0);
 
         // Process with all-dead marking function
         shared.process_references(&|_| false, 100, 0);
 
         // Now finalizer_thread should have the object
-        assert_eq!(shared.finalizer_thread.pending_count(), 1);
+        assert_eq!(shared.mem.finalizer_thread.pending_count(), 1);
     }
 
     #[test]
@@ -34852,8 +35146,8 @@ mod tests {
             }],
         );
 
-        let obj = shared.heap.alloc_object(class_id, 0);
-        shared.finalizer_thread.enqueue(obj.as_ptr() as usize);
+        let obj = shared.mem.heap.alloc_object(class_id, 0);
+        shared.mem.finalizer_thread.enqueue(obj.as_ptr() as usize);
 
         // Build a Vm that wraps the same shared state
         let mut vm = Vm {
@@ -34863,7 +35157,7 @@ mod tests {
         let count = vm.run_pending_finalizers();
         assert_eq!(count, 1, "Should have finalized 1 object");
         assert_eq!(
-            vm.shared.finalizer_thread.pending_count(),
+            vm.shared.mem.finalizer_thread.pending_count(),
             0,
             "Queue should be empty"
         );
@@ -34894,12 +35188,12 @@ mod tests {
             }],
         );
 
-        let obj1 = shared.heap.alloc_object(class_id, 0);
-        let obj2 = shared.heap.alloc_object(class_id, 0);
-        let obj3 = shared.heap.alloc_object(class_id, 0);
-        shared.finalizer_thread.enqueue(obj1.as_ptr() as usize);
-        shared.finalizer_thread.enqueue(obj2.as_ptr() as usize);
-        shared.finalizer_thread.enqueue(obj3.as_ptr() as usize);
+        let obj1 = shared.mem.heap.alloc_object(class_id, 0);
+        let obj2 = shared.mem.heap.alloc_object(class_id, 0);
+        let obj3 = shared.mem.heap.alloc_object(class_id, 0);
+        shared.mem.finalizer_thread.enqueue(obj1.as_ptr() as usize);
+        shared.mem.finalizer_thread.enqueue(obj2.as_ptr() as usize);
+        shared.mem.finalizer_thread.enqueue(obj3.as_ptr() as usize);
 
         let mut vm = Vm {
             shared: shared.clone(),
@@ -34907,7 +35201,7 @@ mod tests {
         };
         let count = vm.run_pending_finalizers();
         assert_eq!(count, 3, "Should have finalized 3 objects");
-        assert_eq!(vm.shared.finalizer_thread.pending_count(), 0);
+        assert_eq!(vm.shared.mem.finalizer_thread.pending_count(), 0);
     }
 
     // ========================================================================
@@ -34922,7 +35216,7 @@ mod tests {
 
         let cls = "java/util/concurrent/atomic/AtomicBoolean";
         // Create with default (false)
-        let ab = shared.heap.alloc_object(ClassId::new(0), 1);
+        let ab = shared.mem.heap.alloc_object(ClassId::new(0), 1);
         call_native(
             &shared,
             &mut thread,
@@ -35010,7 +35304,7 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         let cls = "java/util/concurrent/atomic/AtomicBoolean";
-        let ab = shared.heap.alloc_object(ClassId::new(0), 1);
+        let ab = shared.mem.heap.alloc_object(ClassId::new(0), 1);
         // Init with true
         call_native(
             &shared,
@@ -35062,7 +35356,7 @@ mod tests {
             _ => panic!("expected string"),
         };
         assert_eq!(
-            read_java_string(&shared.heap, ts_obj),
+            read_java_string(&shared.mem.heap, ts_obj),
             Some("false".to_string())
         );
     }
@@ -35073,7 +35367,7 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         let cls = "java/util/concurrent/atomic/AtomicStampedReference";
-        let asr = shared.heap.alloc_object(ClassId::new(0), 2);
+        let asr = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         let str_val = create_java_string(&shared, "hello");
         call_native(
             &shared,
@@ -35170,7 +35464,7 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         let cls = "java/util/concurrent/atomic/AtomicMarkableReference";
-        let amr = shared.heap.alloc_object(ClassId::new(0), 2);
+        let amr = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         let val = create_java_string(&shared, "data");
         call_native(
             &shared,
@@ -35302,7 +35596,7 @@ mod tests {
             _ => panic!("expected string"),
         };
         assert_eq!(
-            read_java_string(&shared.heap, ts_obj),
+            read_java_string(&shared.mem.heap, ts_obj),
             Some("public static final".to_string())
         );
     }
@@ -35315,7 +35609,7 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         let cls = "java/util/Formatter";
-        let fmt = shared.heap.alloc_object(ClassId::new(0), 2);
+        let fmt = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -35330,12 +35624,17 @@ mod tests {
         let fmt_str = create_java_string(&shared, "%s is %d");
         let age_str = create_java_string(&shared, "age");
         let args_arr = shared
+            .mem
             .heap
             .alloc_array(ClassId::new(0), ArrayElementType::Reference, 2);
         let _ = shared
+            .mem
             .heap
             .set_array_element(args_arr, 0, Value::Object(Some(age_str)));
-        let _ = shared.heap.set_array_element(args_arr, 1, Value::Int(42));
+        let _ = shared
+            .mem
+            .heap
+            .set_array_element(args_arr, 1, Value::Int(42));
         call_native(
             &shared,
             &mut thread,
@@ -35365,7 +35664,7 @@ mod tests {
             _ => panic!("expected string"),
         };
         assert_eq!(
-            read_java_string(&shared.heap, ts_obj),
+            read_java_string(&shared.mem.heap, ts_obj),
             Some("age is 42".to_string())
         );
     }
@@ -35438,7 +35737,7 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // Create a list, wrap in unmodifiableList, check same size
-        let list = shared.heap.alloc_object(ClassId::new(0), 2);
+        let list = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -35497,7 +35796,7 @@ mod tests {
     fn thread_local_init_get_set_remove() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let tl = shared.heap.alloc_object(ClassId::new(0), 1);
+        let tl = shared.mem.heap.alloc_object(ClassId::new(0), 1);
         call_native(
             &shared,
             &mut thread,
@@ -35536,7 +35835,7 @@ mod tests {
             &[Value::Object(Some(tl)), Value::Object(Some(s))],
         )
         .unwrap();
-        assert_eq!(shared.jni_global_refs.lock().count(), 1);
+        assert_eq!(shared.natives.jni_global_refs.lock().count(), 1);
         // get returns the value
         let val = call_native(
             &shared,
@@ -35566,7 +35865,7 @@ mod tests {
             &[Value::Object(Some(tl)), Value::Object(Some(s2))],
         )
         .unwrap();
-        assert_eq!(shared.jni_global_refs.lock().count(), 1);
+        assert_eq!(shared.natives.jni_global_refs.lock().count(), 1);
         let val = call_native(
             &shared,
             &mut thread,
@@ -35588,7 +35887,7 @@ mod tests {
             &[Value::Object(Some(tl))],
         )
         .unwrap();
-        assert_eq!(shared.jni_global_refs.lock().count(), 0);
+        assert_eq!(shared.natives.jni_global_refs.lock().count(), 0);
         let val = call_native(
             &shared,
             &mut thread,
@@ -35600,14 +35899,14 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(val, Value::Object(None));
-        assert_eq!(shared.jni_global_refs.lock().count(), 0);
+        assert_eq!(shared.natives.jni_global_refs.lock().count(), 0);
     }
 
     #[test]
     fn string_tokenizer_basic_tokens() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let st = shared.heap.alloc_object(ClassId::new(0), 3);
+        let st = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         let input = {
             let mut ctx = NativeContextImpl {
                 shared: &shared,
@@ -35664,7 +35963,7 @@ mod tests {
             _ => panic!("expected string"),
         };
         assert_eq!(
-            read_java_string(&shared.heap, t1_obj),
+            read_java_string(&shared.mem.heap, t1_obj),
             Some("hello".to_string())
         );
         // nextToken again
@@ -35683,7 +35982,7 @@ mod tests {
             _ => panic!("expected string"),
         };
         assert_eq!(
-            read_java_string(&shared.heap, t2_obj),
+            read_java_string(&shared.mem.heap, t2_obj),
             Some("world".to_string())
         );
         // nextToken 3rd
@@ -35702,7 +36001,7 @@ mod tests {
             _ => panic!("expected string"),
         };
         assert_eq!(
-            read_java_string(&shared.heap, t3_obj),
+            read_java_string(&shared.mem.heap, t3_obj),
             Some("foo".to_string())
         );
         // hasMoreTokens = false
@@ -35723,7 +36022,7 @@ mod tests {
     fn string_tokenizer_custom_delimiter() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let st = shared.heap.alloc_object(ClassId::new(0), 3);
+        let st = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         let input = {
             let mut ctx = NativeContextImpl {
                 shared: &shared,
@@ -35768,7 +36067,7 @@ mod tests {
     fn bitset_set_get_clear_cardinality() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let bs = shared.heap.alloc_object(ClassId::new(0), 2);
+        let bs = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -35894,7 +36193,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
         // BitSet a: {1, 3}
-        let a = shared.heap.alloc_object(ClassId::new(0), 2);
+        let a = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -35923,7 +36222,7 @@ mod tests {
         )
         .unwrap();
         // BitSet b: {1, 2}
-        let b = shared.heap.alloc_object(ClassId::new(0), 2);
+        let b = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -36011,7 +36310,7 @@ mod tests {
     fn bitset_next_set_bit_and_to_string() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let bs = shared.heap.alloc_object(ClassId::new(0), 2);
+        let bs = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -36091,7 +36390,7 @@ mod tests {
             _ => panic!("expected string"),
         };
         assert_eq!(
-            read_java_string(&shared.heap, ts_obj),
+            read_java_string(&shared.mem.heap, ts_obj),
             Some("{2, 7}".to_string())
         );
     }
@@ -36100,7 +36399,7 @@ mod tests {
     fn bitset_grow_beyond_64_bits() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let bs = shared.heap.alloc_object(ClassId::new(0), 2);
+        let bs = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -36230,7 +36529,7 @@ mod tests {
     fn enum_map_put_get_size() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let em = shared.heap.alloc_object(ClassId::new(0), 3);
+        let em = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -36310,7 +36609,7 @@ mod tests {
     fn identity_hashmap_basic() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let map = shared.heap.alloc_object(ClassId::new(0), 3);
+        let map = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -36364,7 +36663,7 @@ mod tests {
     fn weak_hashmap_basic() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let map = shared.heap.alloc_object(ClassId::new(0), 3);
+        let map = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -36572,7 +36871,7 @@ mod tests {
     fn gregorian_calendar_leap_year() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
-        let cal = shared.heap.alloc_object(ClassId::new(0), 8);
+        let cal = shared.mem.heap.alloc_object(ClassId::new(0), 8);
         call_native(
             &shared,
             &mut thread,
@@ -36621,7 +36920,7 @@ mod tests {
     fn date_basic_operations() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
-        let d1 = shared.heap.alloc_object(ClassId::new(0), 1);
+        let d1 = shared.mem.heap.alloc_object(ClassId::new(0), 1);
         call_native(
             &shared,
             &mut thread,
@@ -36631,7 +36930,7 @@ mod tests {
             &[Value::Object(Some(d1)), Value::Long(1000)],
         )
         .unwrap();
-        let d2 = shared.heap.alloc_object(ClassId::new(0), 1);
+        let d2 = shared.mem.heap.alloc_object(ClassId::new(0), 1);
         call_native(
             &shared,
             &mut thread,
@@ -36763,7 +37062,7 @@ mod tests {
     fn phaser_arrive_and_advance() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
-        let ph = shared.heap.alloc_object(ClassId::new(0), 3);
+        let ph = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -36919,7 +37218,7 @@ mod tests {
     fn timer_basic() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
-        let timer = shared.heap.alloc_object(ClassId::new(0), 2);
+        let timer = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -36938,7 +37237,7 @@ mod tests {
             &[Value::Object(Some(timer))],
         )
         .unwrap();
-        let cancelled = shared.heap.get_field(timer, 1);
+        let cancelled = shared.mem.heap.get_field(timer, 1);
         assert_eq!(cancelled, Value::Int(1));
     }
 
@@ -36946,7 +37245,7 @@ mod tests {
     fn exchanger_basic() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
-        let ex = shared.heap.alloc_object(ClassId::new(0), 1);
+        let ex = shared.mem.heap.alloc_object(ClassId::new(0), 1);
         call_native(
             &shared,
             &mut thread,
@@ -37209,8 +37508,8 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
         // Create ZoneOffset(0) for UTC
-        let zo = shared.heap.alloc_object(ClassId::new(0), 1);
-        shared.heap.set_field(zo, 0, Value::Int(0));
+        let zo = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        shared.mem.heap.set_field(zo, 0, Value::Int(0));
         // OffsetDateTime.of(2024,6,15, 10,30,0,0, ZoneOffset)
         let odt = call_native(
             &shared,
@@ -37497,7 +37796,7 @@ mod tests {
             };
             ctx.create_string("localhost")
         };
-        let isa = shared.heap.alloc_object(ClassId::new(0), 3);
+        let isa = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -37581,15 +37880,16 @@ mod tests {
             ctx.create_string("Alice")
         };
         // Build Object[] with [name, 30]
-        let arr = shared.heap.alloc_array(
+        let arr = shared.mem.heap.alloc_array(
             ClassId::new(0),
             crate::memory::heap::ArrayElementType::Reference,
             2,
         );
         let _ = shared
+            .mem
             .heap
             .set_array_element(arr, 0, Value::Object(Some(name)));
-        let _ = shared.heap.set_array_element(arr, 1, Value::Int(30));
+        let _ = shared.mem.heap.set_array_element(arr, 1, Value::Int(30));
         let result = call_native(
             &shared,
             &mut thread,
@@ -37618,7 +37918,7 @@ mod tests {
     fn math_context_basics() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
-        let mc = shared.heap.alloc_object(ClassId::new(0), 2);
+        let mc = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -37764,7 +38064,7 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(r1, Value::Int(1));
-        let obj = shared.heap.alloc_object(ClassId::new(0), 1);
+        let obj = shared.mem.heap.alloc_object(ClassId::new(0), 1);
         let r2 = call_native(
             &shared,
             &mut thread,
@@ -37819,7 +38119,7 @@ mod tests {
     fn string_buffer_basics() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
-        let sb = shared.heap.alloc_object(ClassId::new(0), 2);
+        let sb = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -38009,8 +38309,8 @@ mod tests {
     fn objects_require_non_null_else() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
-        let obj = shared.heap.alloc_object(ClassId::new(0), 1);
-        let default = shared.heap.alloc_object(ClassId::new(0), 1);
+        let obj = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        let default = shared.mem.heap.alloc_object(ClassId::new(0), 1);
         // Non-null obj -> returns obj
         let r1 = call_native(
             &shared,
@@ -38069,7 +38369,7 @@ mod tests {
         .unwrap();
         let algo_ref = result.as_object().unwrap().unwrap();
         assert_eq!(
-            read_java_string(&shared.heap, algo_ref),
+            read_java_string(&shared.mem.heap, algo_ref),
             Some("AES".to_string())
         );
     }
@@ -38090,7 +38390,7 @@ mod tests {
         .unwrap()
         .unwrap();
         let cipher_ref = cipher.as_object().unwrap().unwrap();
-        let key = shared.heap.alloc_object(ClassId::new(0), 1);
+        let key = shared.mem.heap.alloc_object(ClassId::new(0), 1);
         call_native(
             &shared,
             &mut thread,
@@ -38187,7 +38487,7 @@ mod tests {
         .unwrap()
         .unwrap();
         let arr_ref = encoded.as_object().unwrap().unwrap();
-        assert_eq!(shared.heap.array_length(arr_ref), 32);
+        assert_eq!(shared.mem.heap.array_length(arr_ref), 32);
     }
 
     #[test]
@@ -38195,12 +38495,12 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
         let algo = create_java_string(&shared, "AES");
-        let key_bytes = shared.heap.alloc_array(
+        let key_bytes = shared.mem.heap.alloc_array(
             ClassId::new(0),
             crate::memory::heap::ArrayElementType::Byte,
             16,
         );
-        let sks = shared.heap.alloc_object(ClassId::new(0), 2);
+        let sks = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -38226,7 +38526,7 @@ mod tests {
         .unwrap();
         let algo_ref = result.as_object().unwrap().unwrap();
         assert_eq!(
-            read_java_string(&shared.heap, algo_ref),
+            read_java_string(&shared.mem.heap, algo_ref),
             Some("AES".to_string())
         );
         let enc = call_native(
@@ -38252,7 +38552,7 @@ mod tests {
         .unwrap();
         let fmt_ref = fmt.as_object().unwrap().unwrap();
         assert_eq!(
-            read_java_string(&shared.heap, fmt_ref),
+            read_java_string(&shared.mem.heap, fmt_ref),
             Some("RAW".to_string())
         );
     }
@@ -38276,8 +38576,8 @@ mod tests {
         // (SUN, SunJCE, SunRsaSign, SunEC, SunJSSE) to match the JDK's
         // default provider list; earlier revisions of this test asserted a
         // single "CratonVM" entry, which predated that work.
-        assert_eq!(shared.heap.array_length(arr), 5);
-        let prov = shared.heap.get_array_element(arr, 0).unwrap();
+        assert_eq!(shared.mem.heap.array_length(arr), 5);
+        let prov = shared.mem.heap.get_array_element(arr, 0).unwrap();
         let prov_ref = prov.as_object().unwrap().unwrap();
         let name = call_native(
             &shared,
@@ -38291,7 +38591,7 @@ mod tests {
         .unwrap();
         let name_ref = name.as_object().unwrap().unwrap();
         assert_eq!(
-            read_java_string(&shared.heap, name_ref),
+            read_java_string(&shared.mem.heap, name_ref),
             Some("SUN".to_string())
         );
         let ver = call_native(
@@ -38335,7 +38635,7 @@ mod tests {
         .unwrap();
         let tp_ref = tp.as_object().unwrap().unwrap();
         assert_eq!(
-            read_java_string(&shared.heap, tp_ref),
+            read_java_string(&shared.mem.heap, tp_ref),
             Some("PKCS12".to_string())
         );
         let sz = call_native(
@@ -38373,7 +38673,7 @@ mod tests {
         .unwrap();
         let dt_ref = dt.as_object().unwrap().unwrap();
         assert_eq!(
-            read_java_string(&shared.heap, dt_ref),
+            read_java_string(&shared.mem.heap, dt_ref),
             Some("PKCS12".to_string())
         );
     }
@@ -38448,7 +38748,7 @@ mod tests {
         .unwrap();
         let alg_ref = alg.as_object().unwrap().unwrap();
         assert_eq!(
-            read_java_string(&shared.heap, alg_ref),
+            read_java_string(&shared.mem.heap, alg_ref),
             Some("RSA".to_string())
         );
     }
@@ -38481,10 +38781,10 @@ mod tests {
         .unwrap();
         let alg_ref = alg.as_object().unwrap().unwrap();
         assert_eq!(
-            read_java_string(&shared.heap, alg_ref),
+            read_java_string(&shared.mem.heap, alg_ref),
             Some("SHA256withRSA".to_string())
         );
-        let priv_key = shared.heap.alloc_object(ClassId::new(0), 5);
+        let priv_key = shared.mem.heap.alloc_object(ClassId::new(0), 5);
         call_native(
             &shared,
             &mut thread,
@@ -38506,8 +38806,8 @@ mod tests {
         .unwrap();
         let arr = signed.as_object().unwrap().unwrap();
         // RSA signature length is 256 bytes (2048-bit key)
-        assert_eq!(shared.heap.array_length(arr), 256);
-        let pub_key = shared.heap.alloc_object(ClassId::new(0), 5);
+        assert_eq!(shared.mem.heap.array_length(arr), 256);
+        let pub_key = shared.mem.heap.alloc_object(ClassId::new(0), 5);
         call_native(
             &shared,
             &mut thread,
@@ -38535,7 +38835,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
         // Use default constructor (no connect) to test field layout
-        let sock = shared.heap.alloc_object(ClassId::new(0), 5);
+        let sock = shared.mem.heap.alloc_object(ClassId::new(0), 5);
         call_native(
             &shared,
             &mut thread,
@@ -38604,7 +38904,7 @@ mod tests {
     fn server_socket_basics() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
-        let ss = shared.heap.alloc_object(ClassId::new(0), 4);
+        let ss = shared.mem.heap.alloc_object(ClassId::new(0), 4);
         // Use port 0 for OS-assigned port to avoid conflicts
         call_native(
             &shared,
@@ -38706,7 +39006,7 @@ mod tests {
     fn service_loader_basics() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
-        let class_mirror = shared.heap.alloc_object(ClassId::new(0), 0);
+        let class_mirror = shared.mem.heap.alloc_object(ClassId::new(0), 0);
         let sl = call_native(
             &shared,
             &mut thread,
@@ -38762,7 +39062,7 @@ mod tests {
         .unwrap()
         .unwrap();
         let s_ref = s.as_object().unwrap().unwrap();
-        let s_str = read_java_string(&shared.heap, s_ref).unwrap_or_default();
+        let s_str = read_java_string(&shared.mem.heap, s_ref).unwrap_or_default();
         assert!(s_str.contains("ServiceLoader"));
     }
 
@@ -38770,12 +39070,12 @@ mod tests {
     fn record_equals_and_hash_code() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
-        let rec1 = shared.heap.alloc_object(ClassId::new(0), 2);
-        shared.heap.set_field(rec1, 0, Value::Int(42));
-        shared.heap.set_field(rec1, 1, Value::Int(100));
-        let rec2 = shared.heap.alloc_object(ClassId::new(0), 2);
-        shared.heap.set_field(rec2, 0, Value::Int(42));
-        shared.heap.set_field(rec2, 1, Value::Int(100));
+        let rec1 = shared.mem.heap.alloc_object(ClassId::new(0), 2);
+        shared.mem.heap.set_field(rec1, 0, Value::Int(42));
+        shared.mem.heap.set_field(rec1, 1, Value::Int(100));
+        let rec2 = shared.mem.heap.alloc_object(ClassId::new(0), 2);
+        shared.mem.heap.set_field(rec2, 0, Value::Int(42));
+        shared.mem.heap.set_field(rec2, 1, Value::Int(100));
         let eq = call_native(
             &shared,
             &mut thread,
@@ -38808,9 +39108,9 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(h1, h2);
-        let rec3 = shared.heap.alloc_object(ClassId::new(0), 2);
-        shared.heap.set_field(rec3, 0, Value::Int(42));
-        shared.heap.set_field(rec3, 1, Value::Int(999));
+        let rec3 = shared.mem.heap.alloc_object(ClassId::new(0), 2);
+        shared.mem.heap.set_field(rec3, 0, Value::Int(42));
+        shared.mem.heap.set_field(rec3, 1, Value::Int(999));
         let eq2 = call_native(
             &shared,
             &mut thread,
@@ -38828,7 +39128,7 @@ mod tests {
     fn record_to_string() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
-        let rec = shared.heap.alloc_object(ClassId::new(0), 1);
+        let rec = shared.mem.heap.alloc_object(ClassId::new(0), 1);
         let s = call_native(
             &shared,
             &mut thread,
@@ -38840,7 +39140,7 @@ mod tests {
         .unwrap()
         .unwrap();
         let s_ref = s.as_object().unwrap().unwrap();
-        let s_str = read_java_string(&shared.heap, s_ref).unwrap_or_default();
+        let s_str = read_java_string(&shared.mem.heap, s_ref).unwrap_or_default();
         // toString with no record components uses fallback format: ClassName@hex or @hex
         assert!(
             s_str.contains('@'),
@@ -38854,8 +39154,8 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
         // Class mirror needs at least 2 fields: field 0 = ClassId (Int), field 1 = name (String)
-        let class_mirror = shared.heap.alloc_object(ClassId::new(0), 2);
-        shared.heap.set_field(class_mirror, 0, Value::Int(0)); // ClassId(0) - no record/sealed metadata
+        let class_mirror = shared.mem.heap.alloc_object(ClassId::new(0), 2);
+        shared.mem.heap.set_field(class_mirror, 0, Value::Int(0)); // ClassId(0) - no record/sealed metadata
         let sealed = call_native(
             &shared,
             &mut thread,
@@ -38889,7 +39189,7 @@ mod tests {
         .unwrap()
         .unwrap();
         let subs_ref = subs.as_object().unwrap().unwrap();
-        assert_eq!(shared.heap.array_length(subs_ref), 0);
+        assert_eq!(shared.mem.heap.array_length(subs_ref), 0);
         let comps = call_native(
             &shared,
             &mut thread,
@@ -38901,7 +39201,7 @@ mod tests {
         .unwrap()
         .unwrap();
         let comps_ref = comps.as_object().unwrap().unwrap();
-        assert_eq!(shared.heap.array_length(comps_ref), 0);
+        assert_eq!(shared.mem.heap.array_length(comps_ref), 0);
     }
 
     #[test]
@@ -38920,15 +39220,15 @@ mod tests {
         .unwrap()
         .unwrap();
         let cipher_ref = cipher.as_object().unwrap().unwrap();
-        let input = shared.heap.alloc_array(
+        let input = shared.mem.heap.alloc_array(
             ClassId::new(0),
             crate::memory::heap::ArrayElementType::Byte,
             4,
         );
-        let _ = shared.heap.set_array_element(input, 0, Value::Int(1));
-        let _ = shared.heap.set_array_element(input, 1, Value::Int(2));
-        let _ = shared.heap.set_array_element(input, 2, Value::Int(3));
-        let _ = shared.heap.set_array_element(input, 3, Value::Int(4));
+        let _ = shared.mem.heap.set_array_element(input, 0, Value::Int(1));
+        let _ = shared.mem.heap.set_array_element(input, 1, Value::Int(2));
+        let _ = shared.mem.heap.set_array_element(input, 2, Value::Int(3));
+        let _ = shared.mem.heap.set_array_element(input, 3, Value::Int(4));
         let result = call_native(
             &shared,
             &mut thread,
@@ -38949,7 +39249,7 @@ mod tests {
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
         // Use default constructor + set host field manually to test getInetAddress
         // without needing a real TCP connection
-        let sock = shared.heap.alloc_object(ClassId::new(0), 5);
+        let sock = shared.mem.heap.alloc_object(ClassId::new(0), 5);
         call_native(
             &shared,
             &mut thread,
@@ -38978,7 +39278,7 @@ mod tests {
     fn server_socket_with_backlog() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
-        let ss = shared.heap.alloc_object(ClassId::new(0), 4);
+        let ss = shared.mem.heap.alloc_object(ClassId::new(0), 4);
         // Use port 0 for OS-assigned to avoid conflicts
         call_native(
             &shared,
@@ -39016,13 +39316,13 @@ mod tests {
     fn key_interface_methods() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
-        let key = shared.heap.alloc_object(ClassId::new(0), 1);
-        let arr = shared.heap.alloc_array(
+        let key = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        let arr = shared.mem.heap.alloc_array(
             ClassId::new(0),
             crate::memory::heap::ArrayElementType::Byte,
             16,
         );
-        shared.heap.set_field(key, 0, Value::Object(Some(arr)));
+        shared.mem.heap.set_field(key, 0, Value::Object(Some(arr)));
         let enc = call_native(
             &shared,
             &mut thread,
@@ -39046,7 +39346,7 @@ mod tests {
         .unwrap();
         let algo_ref = algo.as_object().unwrap().unwrap();
         assert_eq!(
-            read_java_string(&shared.heap, algo_ref),
+            read_java_string(&shared.mem.heap, algo_ref),
             Some("AES".to_string())
         );
         let fmt = call_native(
@@ -39061,7 +39361,7 @@ mod tests {
         .unwrap();
         let fmt_ref = fmt.as_object().unwrap().unwrap();
         assert_eq!(
-            read_java_string(&shared.heap, fmt_ref),
+            read_java_string(&shared.mem.heap, fmt_ref),
             Some("RAW".to_string())
         );
     }
@@ -39074,7 +39374,7 @@ mod tests {
     fn atomic_integer_basics() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
-        let ai = shared.heap.alloc_object(ClassId::new(0), 1);
+        let ai = shared.mem.heap.alloc_object(ClassId::new(0), 1);
         call_native(
             &shared,
             &mut thread,
@@ -39136,7 +39436,7 @@ mod tests {
     fn atomic_integer_compare_and_set() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
-        let ai = shared.heap.alloc_object(ClassId::new(0), 1);
+        let ai = shared.mem.heap.alloc_object(ClassId::new(0), 1);
         call_native(
             &shared,
             &mut thread,
@@ -39187,7 +39487,7 @@ mod tests {
     fn atomic_long_basics() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
-        let al = shared.heap.alloc_object(ClassId::new(0), 1);
+        let al = shared.mem.heap.alloc_object(ClassId::new(0), 1);
         call_native(
             &shared,
             &mut thread,
@@ -39236,7 +39536,7 @@ mod tests {
     fn atomic_boolean_basics() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
-        let ab = shared.heap.alloc_object(ClassId::new(0), 1);
+        let ab = shared.mem.heap.alloc_object(ClassId::new(0), 1);
         call_native(
             &shared,
             &mut thread,
@@ -39286,8 +39586,8 @@ mod tests {
     fn atomic_reference_basics() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
-        let ar = shared.heap.alloc_object(ClassId::new(0), 1);
-        let obj1 = shared.heap.alloc_object(ClassId::new(0), 0);
+        let ar = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        let obj1 = shared.mem.heap.alloc_object(ClassId::new(0), 0);
         call_native(
             &shared,
             &mut thread,
@@ -39309,7 +39609,7 @@ mod tests {
         .unwrap();
         assert_eq!(v, Value::Object(Some(obj1)));
         // CAS
-        let obj2 = shared.heap.alloc_object(ClassId::new(0), 0);
+        let obj2 = shared.mem.heap.alloc_object(ClassId::new(0), 0);
         let ok = call_native(
             &shared,
             &mut thread,
@@ -39331,7 +39631,7 @@ mod tests {
     fn long_adder_basics() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
-        let la = shared.heap.alloc_object(ClassId::new(0), 1);
+        let la = shared.mem.heap.alloc_object(ClassId::new(0), 1);
         call_native(
             &shared,
             &mut thread,
@@ -39408,7 +39708,7 @@ mod tests {
     fn double_adder_basics() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
-        let da = shared.heap.alloc_object(ClassId::new(0), 1);
+        let da = shared.mem.heap.alloc_object(ClassId::new(0), 1);
         call_native(
             &shared,
             &mut thread,
@@ -39453,7 +39753,7 @@ mod tests {
     fn atomic_integer_array_basics() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
-        let aia = shared.heap.alloc_object(ClassId::new(0), 2);
+        let aia = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -39513,8 +39813,8 @@ mod tests {
     fn atomic_stamped_reference_basics() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
-        let asr = shared.heap.alloc_object(ClassId::new(0), 2);
-        let obj1 = shared.heap.alloc_object(ClassId::new(0), 0);
+        let asr = shared.mem.heap.alloc_object(ClassId::new(0), 2);
+        let obj1 = shared.mem.heap.alloc_object(ClassId::new(0), 0);
         call_native(
             &shared,
             &mut thread,
@@ -39540,7 +39840,7 @@ mod tests {
         .unwrap();
         assert_eq!(stamp, Value::Int(0));
         // CAS with correct stamp
-        let obj2 = shared.heap.alloc_object(ClassId::new(0), 0);
+        let obj2 = shared.mem.heap.alloc_object(ClassId::new(0), 0);
         let ok = call_native(
             &shared,
             &mut thread,
@@ -39575,7 +39875,7 @@ mod tests {
     fn method_type_basics() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
-        let ret_class = shared.heap.alloc_object(ClassId::new(0), 0);
+        let ret_class = shared.mem.heap.alloc_object(ClassId::new(0), 0);
         let mt = call_native(
             &shared,
             &mut thread,
@@ -39627,9 +39927,9 @@ mod tests {
         .unwrap();
         assert!(lookup.as_object().unwrap().is_some());
         // findVirtual returns a MethodHandle stub
-        let cls = shared.heap.alloc_object(ClassId::new(0), 2);
+        let cls = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         let name = create_java_string(&shared, "toString");
-        let mt = shared.heap.alloc_object(ClassId::new(0), 2);
+        let mt = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         let lk_ref = lookup.as_object().unwrap().unwrap();
         let mh = call_native(&shared, &mut thread, "java/lang/invoke/MethodHandles$Lookup", "findVirtual",
             "(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/invoke/MethodType;)Ljava/lang/invoke/MethodHandle;",
@@ -39641,11 +39941,11 @@ mod tests {
     fn log_record_basics() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
-        let level = shared.heap.alloc_object(ClassId::new(0), 0);
+        let level = shared.mem.heap.alloc_object(ClassId::new(0), 0);
         let msg = create_java_string(&shared, "test message");
         // LogRecord native handler requires 7 instance fields
         // (level, message, loggerName, thrown, parameters, millis, sequence).
-        let lr = shared.heap.alloc_object(ClassId::new(0), 7);
+        let lr = shared.mem.heap.alloc_object(ClassId::new(0), 7);
         call_native(
             &shared,
             &mut thread,
@@ -39671,7 +39971,7 @@ mod tests {
         .unwrap();
         let m_ref = m.as_object().unwrap().unwrap();
         assert_eq!(
-            read_java_string(&shared.heap, m_ref),
+            read_java_string(&shared.mem.heap, m_ref),
             Some("test message".to_string())
         );
     }
@@ -39681,7 +39981,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
         let raw = create_java_string(&shared, "https://example.com:8080/path?q=1#frag");
-        let uri = shared.heap.alloc_object(ClassId::new(0), 7);
+        let uri = shared.mem.heap.alloc_object(ClassId::new(0), 7);
         call_native(
             &shared,
             &mut thread,
@@ -39704,7 +40004,7 @@ mod tests {
         .unwrap();
         let s_ref = scheme.as_object().unwrap().unwrap();
         assert_eq!(
-            read_java_string(&shared.heap, s_ref),
+            read_java_string(&shared.mem.heap, s_ref),
             Some("https".to_string())
         );
         // host
@@ -39720,7 +40020,7 @@ mod tests {
         .unwrap();
         let h_ref = host.as_object().unwrap().unwrap();
         assert_eq!(
-            read_java_string(&shared.heap, h_ref),
+            read_java_string(&shared.mem.heap, h_ref),
             Some("example.com".to_string())
         );
         // port
@@ -39748,7 +40048,7 @@ mod tests {
         .unwrap();
         let p_ref = path.as_object().unwrap().unwrap();
         assert_eq!(
-            read_java_string(&shared.heap, p_ref),
+            read_java_string(&shared.mem.heap, p_ref),
             Some("/path".to_string())
         );
         // query
@@ -39764,7 +40064,7 @@ mod tests {
         .unwrap();
         let q_ref = query.as_object().unwrap().unwrap();
         assert_eq!(
-            read_java_string(&shared.heap, q_ref),
+            read_java_string(&shared.mem.heap, q_ref),
             Some("q=1".to_string())
         );
         // fragment
@@ -39780,7 +40080,7 @@ mod tests {
         .unwrap();
         let f_ref = frag.as_object().unwrap().unwrap();
         assert_eq!(
-            read_java_string(&shared.heap, f_ref),
+            read_java_string(&shared.mem.heap, f_ref),
             Some("frag".to_string())
         );
     }
@@ -39790,7 +40090,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
         let raw = create_java_string(&shared, "https://example.com/path");
-        let uri1 = shared.heap.alloc_object(ClassId::new(0), 7);
+        let uri1 = shared.mem.heap.alloc_object(ClassId::new(0), 7);
         call_native(
             &shared,
             &mut thread,
@@ -39801,7 +40101,7 @@ mod tests {
         )
         .unwrap();
         let raw2 = create_java_string(&shared, "https://example.com/path");
-        let uri2 = shared.heap.alloc_object(ClassId::new(0), 7);
+        let uri2 = shared.mem.heap.alloc_object(ClassId::new(0), 7);
         call_native(
             &shared,
             &mut thread,
@@ -39852,7 +40152,7 @@ mod tests {
         .unwrap();
         let n_ref = name.as_object().unwrap().unwrap();
         assert_eq!(
-            read_java_string(&shared.heap, n_ref),
+            read_java_string(&shared.mem.heap, n_ref),
             Some("example.com".to_string())
         );
     }
@@ -39862,7 +40162,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
         let name = create_java_string(&shared, "test.txt");
-        let ze = shared.heap.alloc_object(ClassId::new(0), 4);
+        let ze = shared.mem.heap.alloc_object(ClassId::new(0), 4);
         call_native(
             &shared,
             &mut thread,
@@ -39884,7 +40184,7 @@ mod tests {
         .unwrap();
         let n_ref = n.as_object().unwrap().unwrap();
         assert_eq!(
-            read_java_string(&shared.heap, n_ref),
+            read_java_string(&shared.mem.heap, n_ref),
             Some("test.txt".to_string())
         );
         let is_dir = call_native(
@@ -39900,7 +40200,7 @@ mod tests {
         assert_eq!(is_dir, Value::Int(0));
         // Directory entry
         let dir_name = create_java_string(&shared, "lib/");
-        let ze2 = shared.heap.alloc_object(ClassId::new(0), 4);
+        let ze2 = shared.mem.heap.alloc_object(ClassId::new(0), 4);
         call_native(
             &shared,
             &mut thread,
@@ -39927,7 +40227,7 @@ mod tests {
     fn crc32_basics() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
-        let crc = shared.heap.alloc_object(ClassId::new(0), 1);
+        let crc = shared.mem.heap.alloc_object(ClassId::new(0), 1);
         call_native(
             &shared,
             &mut thread,
@@ -39938,16 +40238,16 @@ mod tests {
         )
         .unwrap();
         // Update with bytes for "hello" = [104, 101, 108, 108, 111]
-        let data = shared.heap.alloc_array(
+        let data = shared.mem.heap.alloc_array(
             ClassId::new(0),
             crate::memory::heap::ArrayElementType::Byte,
             5,
         );
-        let _ = shared.heap.set_array_element(data, 0, Value::Int(104));
-        let _ = shared.heap.set_array_element(data, 1, Value::Int(101));
-        let _ = shared.heap.set_array_element(data, 2, Value::Int(108));
-        let _ = shared.heap.set_array_element(data, 3, Value::Int(108));
-        let _ = shared.heap.set_array_element(data, 4, Value::Int(111));
+        let _ = shared.mem.heap.set_array_element(data, 0, Value::Int(104));
+        let _ = shared.mem.heap.set_array_element(data, 1, Value::Int(101));
+        let _ = shared.mem.heap.set_array_element(data, 2, Value::Int(108));
+        let _ = shared.mem.heap.set_array_element(data, 3, Value::Int(108));
+        let _ = shared.mem.heap.set_array_element(data, 4, Value::Int(111));
         call_native(
             &shared,
             &mut thread,
@@ -40019,7 +40319,7 @@ mod tests {
         .unwrap();
         let a_ref = addr.as_object().unwrap().unwrap();
         assert_eq!(
-            read_java_string(&shared.heap, a_ref),
+            read_java_string(&shared.mem.heap, a_ref),
             Some("127.0.0.1".to_string())
         );
     }
@@ -40056,7 +40356,7 @@ mod tests {
         .unwrap();
         let n_ref = n.as_object().unwrap().unwrap();
         assert_eq!(
-            read_java_string(&shared.heap, n_ref),
+            read_java_string(&shared.mem.heap, n_ref),
             Some("UTF-8".to_string())
         );
     }
@@ -40118,7 +40418,7 @@ mod tests {
         .unwrap();
         let n_ref = n.as_object().unwrap().unwrap();
         assert_eq!(
-            read_java_string(&shared.heap, n_ref),
+            read_java_string(&shared.mem.heap, n_ref),
             Some("UTF-8".to_string())
         );
     }
@@ -40175,9 +40475,9 @@ mod tests {
     fn future_get_and_is_done() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
-        let future = shared.heap.alloc_object(ClassId::new(0), 2);
-        shared.heap.set_field(future, 0, Value::Int(42));
-        shared.heap.set_field(future, 1, Value::Int(1));
+        let future = shared.mem.heap.alloc_object(ClassId::new(0), 2);
+        shared.mem.heap.set_field(future, 0, Value::Int(42));
+        shared.mem.heap.set_field(future, 1, Value::Int(1));
         let v = call_native(
             &shared,
             &mut thread,
@@ -40207,8 +40507,8 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
         // Create SECONDS TimeUnit (ordinal 3)
-        let sec = shared.heap.alloc_object(ClassId::new(0), 1);
-        shared.heap.set_field(sec, 0, Value::Int(3));
+        let sec = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        shared.mem.heap.set_field(sec, 0, Value::Int(3));
         let millis = call_native(
             &shared,
             &mut thread,
@@ -40300,7 +40600,7 @@ mod tests {
         .unwrap()
         .unwrap();
         let s_ref = s.as_object().unwrap().unwrap();
-        let text = read_java_string(&shared.heap, s_ref).unwrap_or_default();
+        let text = read_java_string(&shared.mem.heap, s_ref).unwrap_or_default();
         assert!(text.contains("public"));
         assert!(text.contains("static"));
     }
@@ -40390,7 +40690,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
         // Build an ArrayList with one element
-        let list = shared.heap.alloc_object(ClassId::new(0), 2);
+        let list = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -40489,19 +40789,26 @@ mod tests {
         let s2 = create_java_string(&shared, "b");
         let s3 = create_java_string(&shared, "c");
         let arr = shared
+            .mem
             .heap
             .alloc_array(ClassId::new(0), ArrayElementType::Reference, 3);
         let _ = shared
+            .mem
             .heap
             .set_array_element(arr, 0, Value::Object(Some(s1)));
         let _ = shared
+            .mem
             .heap
             .set_array_element(arr, 1, Value::Object(Some(s2)));
         let _ = shared
+            .mem
             .heap
             .set_array_element(arr, 2, Value::Object(Some(s3)));
-        let stream = shared.heap.alloc_object(ClassId::new(0), 1);
-        shared.heap.set_field(stream, 0, Value::Object(Some(arr)));
+        let stream = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        shared
+            .mem
+            .heap
+            .set_field(stream, 0, Value::Object(Some(arr)));
         // Predicate: identityHashCode always returns non-zero (true) РІвЂ вЂ™ takeWhile keeps all
         let pred = make_lambda_proxy(
             &shared,
@@ -40526,9 +40833,9 @@ mod tests {
         .unwrap()
         .unwrap();
         let r_ref = result.as_object().unwrap().unwrap();
-        let arr_val = shared.heap.get_field(r_ref, 0);
+        let arr_val = shared.mem.heap.get_field(r_ref, 0);
         let new_arr = arr_val.as_object().unwrap().unwrap();
-        assert_eq!(shared.heap.array_length(new_arr), 3); // all kept
+        assert_eq!(shared.mem.heap.array_length(new_arr), 3); // all kept
     }
 
     #[test]
@@ -40538,16 +40845,22 @@ mod tests {
         let s1 = create_java_string(&shared, "a");
         let s2 = create_java_string(&shared, "b");
         let arr = shared
+            .mem
             .heap
             .alloc_array(ClassId::new(0), ArrayElementType::Reference, 2);
         let _ = shared
+            .mem
             .heap
             .set_array_element(arr, 0, Value::Object(Some(s1)));
         let _ = shared
+            .mem
             .heap
             .set_array_element(arr, 1, Value::Object(Some(s2)));
-        let stream = shared.heap.alloc_object(ClassId::new(0), 1);
-        shared.heap.set_field(stream, 0, Value::Object(Some(arr)));
+        let stream = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        shared
+            .mem
+            .heap
+            .set_field(stream, 0, Value::Object(Some(arr)));
         // Predicate: identityHashCode always returns non-zero (true) РІвЂ вЂ™ dropWhile drops all
         let pred = make_lambda_proxy(
             &shared,
@@ -40572,9 +40885,9 @@ mod tests {
         .unwrap()
         .unwrap();
         let r_ref = result.as_object().unwrap().unwrap();
-        let arr_val = shared.heap.get_field(r_ref, 0);
+        let arr_val = shared.mem.heap.get_field(r_ref, 0);
         let new_arr = arr_val.as_object().unwrap().unwrap();
-        assert_eq!(shared.heap.array_length(new_arr), 0); // all dropped
+        assert_eq!(shared.mem.heap.array_length(new_arr), 0); // all dropped
     }
 
     #[test]
@@ -40582,19 +40895,21 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
         let arr_a = shared
+            .mem
             .heap
             .alloc_array(ClassId::new(0), ArrayElementType::Reference, 2);
-        let _ = shared.heap.set_array_element(arr_a, 0, Value::Int(1));
-        let _ = shared.heap.set_array_element(arr_a, 1, Value::Int(2));
-        let sa = shared.heap.alloc_object(ClassId::new(0), 1);
-        shared.heap.set_field(sa, 0, Value::Object(Some(arr_a)));
+        let _ = shared.mem.heap.set_array_element(arr_a, 0, Value::Int(1));
+        let _ = shared.mem.heap.set_array_element(arr_a, 1, Value::Int(2));
+        let sa = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        shared.mem.heap.set_field(sa, 0, Value::Object(Some(arr_a)));
         let arr_b = shared
+            .mem
             .heap
             .alloc_array(ClassId::new(0), ArrayElementType::Reference, 2);
-        let _ = shared.heap.set_array_element(arr_b, 0, Value::Int(3));
-        let _ = shared.heap.set_array_element(arr_b, 1, Value::Int(4));
-        let sb = shared.heap.alloc_object(ClassId::new(0), 1);
-        shared.heap.set_field(sb, 0, Value::Object(Some(arr_b)));
+        let _ = shared.mem.heap.set_array_element(arr_b, 0, Value::Int(3));
+        let _ = shared.mem.heap.set_array_element(arr_b, 1, Value::Int(4));
+        let sb = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        shared.mem.heap.set_field(sb, 0, Value::Object(Some(arr_b)));
         let result = call_native(
             &shared,
             &mut thread,
@@ -40606,9 +40921,9 @@ mod tests {
         .unwrap()
         .unwrap();
         let r_ref = result.as_object().unwrap().unwrap();
-        let arr_val = shared.heap.get_field(r_ref, 0);
+        let arr_val = shared.mem.heap.get_field(r_ref, 0);
         let new_arr = arr_val.as_object().unwrap().unwrap();
-        assert_eq!(shared.heap.array_length(new_arr), 4);
+        assert_eq!(shared.mem.heap.array_length(new_arr), 4);
     }
 
     #[test]
@@ -40626,9 +40941,9 @@ mod tests {
         .unwrap()
         .unwrap();
         let r_ref = result.as_object().unwrap().unwrap();
-        let arr_val = shared.heap.get_field(r_ref, 0);
+        let arr_val = shared.mem.heap.get_field(r_ref, 0);
         let arr_ref = arr_val.as_object().unwrap().unwrap();
-        assert_eq!(shared.heap.array_length(arr_ref), 1);
+        assert_eq!(shared.mem.heap.array_length(arr_ref), 1);
         let result2 = call_native(
             &shared,
             &mut thread,
@@ -40640,20 +40955,24 @@ mod tests {
         .unwrap()
         .unwrap();
         let r_ref2 = result2.as_object().unwrap().unwrap();
-        let arr_val2 = shared.heap.get_field(r_ref2, 0);
+        let arr_val2 = shared.mem.heap.get_field(r_ref2, 0);
         let arr_ref2 = arr_val2.as_object().unwrap().unwrap();
-        assert_eq!(shared.heap.array_length(arr_ref2), 0);
+        assert_eq!(shared.mem.heap.array_length(arr_ref2), 0);
     }
 
     #[test]
     fn stream_parallel_sequential_stubs() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
-        let stream = shared.heap.alloc_object(ClassId::new(0), 1);
+        let stream = shared.mem.heap.alloc_object(ClassId::new(0), 1);
         let arr = shared
+            .mem
             .heap
             .alloc_array(ClassId::new(0), ArrayElementType::Reference, 0);
-        shared.heap.set_field(stream, 0, Value::Object(Some(arr)));
+        shared
+            .mem
+            .heap
+            .set_field(stream, 0, Value::Object(Some(arr)));
         let p = call_native(
             &shared,
             &mut thread,
@@ -40683,13 +41002,17 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
         let arr = shared
+            .mem
             .heap
             .alloc_array(ClassId::new(0), ArrayElementType::Reference, 3);
-        let _ = shared.heap.set_array_element(arr, 0, Value::Int(10));
-        let _ = shared.heap.set_array_element(arr, 1, Value::Int(20));
-        let _ = shared.heap.set_array_element(arr, 2, Value::Int(30));
-        let stream = shared.heap.alloc_object(ClassId::new(0), 1);
-        shared.heap.set_field(stream, 0, Value::Object(Some(arr)));
+        let _ = shared.mem.heap.set_array_element(arr, 0, Value::Int(10));
+        let _ = shared.mem.heap.set_array_element(arr, 1, Value::Int(20));
+        let _ = shared.mem.heap.set_array_element(arr, 2, Value::Int(30));
+        let stream = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        shared
+            .mem
+            .heap
+            .set_field(stream, 0, Value::Object(Some(arr)));
         let stats = call_native(
             &shared,
             &mut thread,
@@ -40763,12 +41086,16 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
         let arr = shared
+            .mem
             .heap
             .alloc_array(ClassId::new(0), ArrayElementType::Reference, 2);
-        let _ = shared.heap.set_array_element(arr, 0, Value::Long(100));
-        let _ = shared.heap.set_array_element(arr, 1, Value::Long(200));
-        let stream = shared.heap.alloc_object(ClassId::new(0), 1);
-        shared.heap.set_field(stream, 0, Value::Object(Some(arr)));
+        let _ = shared.mem.heap.set_array_element(arr, 0, Value::Long(100));
+        let _ = shared.mem.heap.set_array_element(arr, 1, Value::Long(200));
+        let stream = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        shared
+            .mem
+            .heap
+            .set_field(stream, 0, Value::Object(Some(arr)));
         let stats = call_native(
             &shared,
             &mut thread,
@@ -40809,13 +41136,26 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
         let arr = shared
+            .mem
             .heap
             .alloc_array(ClassId::new(0), ArrayElementType::Reference, 3);
-        let _ = shared.heap.set_array_element(arr, 0, Value::Double(1.5));
-        let _ = shared.heap.set_array_element(arr, 1, Value::Double(2.5));
-        let _ = shared.heap.set_array_element(arr, 2, Value::Double(3.0));
-        let stream = shared.heap.alloc_object(ClassId::new(0), 1);
-        shared.heap.set_field(stream, 0, Value::Object(Some(arr)));
+        let _ = shared
+            .mem
+            .heap
+            .set_array_element(arr, 0, Value::Double(1.5));
+        let _ = shared
+            .mem
+            .heap
+            .set_array_element(arr, 1, Value::Double(2.5));
+        let _ = shared
+            .mem
+            .heap
+            .set_array_element(arr, 2, Value::Double(3.0));
+        let stream = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        shared
+            .mem
+            .heap
+            .set_field(stream, 0, Value::Object(Some(arr)));
         let stats = call_native(
             &shared,
             &mut thread,
@@ -40867,12 +41207,16 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
         let arr = shared
+            .mem
             .heap
             .alloc_array(ClassId::new(0), ArrayElementType::Reference, 2);
-        let _ = shared.heap.set_array_element(arr, 0, Value::Int(5));
-        let _ = shared.heap.set_array_element(arr, 1, Value::Int(10));
-        let stream = shared.heap.alloc_object(ClassId::new(0), 1);
-        shared.heap.set_field(stream, 0, Value::Object(Some(arr)));
+        let _ = shared.mem.heap.set_array_element(arr, 0, Value::Int(5));
+        let _ = shared.mem.heap.set_array_element(arr, 1, Value::Int(10));
+        let stream = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        shared
+            .mem
+            .heap
+            .set_field(stream, 0, Value::Object(Some(arr)));
         let boxed = call_native(
             &shared,
             &mut thread,
@@ -40884,16 +41228,24 @@ mod tests {
         .unwrap()
         .unwrap();
         let b_ref = boxed.as_object().unwrap().unwrap();
-        let arr_val = shared.heap.get_field(b_ref, 0);
+        let arr_val = shared.mem.heap.get_field(b_ref, 0);
         let new_arr = arr_val.as_object().unwrap().unwrap();
-        assert_eq!(shared.heap.array_length(new_arr), 2);
+        assert_eq!(shared.mem.heap.array_length(new_arr), 2);
         // Boxed values stored directly (simplified)
         assert_eq!(
-            shared.heap.get_array_element_unboxing(new_arr, 0).unwrap(),
+            shared
+                .mem
+                .heap
+                .get_array_element_unboxing(new_arr, 0)
+                .unwrap(),
             Value::Int(5)
         );
         assert_eq!(
-            shared.heap.get_array_element_unboxing(new_arr, 1).unwrap(),
+            shared
+                .mem
+                .heap
+                .get_array_element_unboxing(new_arr, 1)
+                .unwrap(),
             Value::Int(10)
         );
     }
@@ -40903,12 +41255,16 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
         let arr = shared
+            .mem
             .heap
             .alloc_array(ClassId::new(0), ArrayElementType::Reference, 2);
-        let _ = shared.heap.set_array_element(arr, 0, Value::Int(42));
-        let _ = shared.heap.set_array_element(arr, 1, Value::Int(99));
-        let stream = shared.heap.alloc_object(ClassId::new(0), 1);
-        shared.heap.set_field(stream, 0, Value::Object(Some(arr)));
+        let _ = shared.mem.heap.set_array_element(arr, 0, Value::Int(42));
+        let _ = shared.mem.heap.set_array_element(arr, 1, Value::Int(99));
+        let stream = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        shared
+            .mem
+            .heap
+            .set_field(stream, 0, Value::Object(Some(arr)));
         let long_stream = call_native(
             &shared,
             &mut thread,
@@ -40920,13 +41276,27 @@ mod tests {
         .unwrap()
         .unwrap();
         let ls = long_stream.as_object().unwrap().unwrap();
-        let ls_arr = shared.heap.get_field(ls, 0).as_object().unwrap().unwrap();
+        let ls_arr = shared
+            .mem
+            .heap
+            .get_field(ls, 0)
+            .as_object()
+            .unwrap()
+            .unwrap();
         assert_eq!(
-            shared.heap.get_array_element_unboxing(ls_arr, 0).unwrap(),
+            shared
+                .mem
+                .heap
+                .get_array_element_unboxing(ls_arr, 0)
+                .unwrap(),
             Value::Long(42)
         );
         assert_eq!(
-            shared.heap.get_array_element_unboxing(ls_arr, 1).unwrap(),
+            shared
+                .mem
+                .heap
+                .get_array_element_unboxing(ls_arr, 1)
+                .unwrap(),
             Value::Long(99)
         );
     }
@@ -40936,32 +41306,34 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
         let arr_a = shared
+            .mem
             .heap
             .alloc_array(ClassId::new(0), ArrayElementType::Reference, 2);
-        let _ = shared.heap.set_array_element(arr_a, 0, Value::Int(1));
-        let _ = shared.heap.set_array_element(arr_a, 1, Value::Int(2));
-        let sa = shared.heap.alloc_object(ClassId::new(0), 1);
-        shared.heap.set_field(sa, 0, Value::Object(Some(arr_a)));
+        let _ = shared.mem.heap.set_array_element(arr_a, 0, Value::Int(1));
+        let _ = shared.mem.heap.set_array_element(arr_a, 1, Value::Int(2));
+        let sa = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        shared.mem.heap.set_field(sa, 0, Value::Object(Some(arr_a)));
         let arr_b = shared
+            .mem
             .heap
             .alloc_array(ClassId::new(0), ArrayElementType::Reference, 1);
-        let _ = shared.heap.set_array_element(arr_b, 0, Value::Int(3));
-        let sb = shared.heap.alloc_object(ClassId::new(0), 1);
-        shared.heap.set_field(sb, 0, Value::Object(Some(arr_b)));
+        let _ = shared.mem.heap.set_array_element(arr_b, 0, Value::Int(3));
+        let sb = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        shared.mem.heap.set_field(sb, 0, Value::Object(Some(arr_b)));
         let result = call_native(&shared, &mut thread, "java/util/stream/IntStream", "concat",
             "(Ljava/util/stream/IntStream;Ljava/util/stream/IntStream;)Ljava/util/stream/IntStream;",
             &[Value::Object(Some(sa)), Value::Object(Some(sb))]).unwrap().unwrap();
         let r_ref = result.as_object().unwrap().unwrap();
-        let arr_val = shared.heap.get_field(r_ref, 0);
+        let arr_val = shared.mem.heap.get_field(r_ref, 0);
         let new_arr = arr_val.as_object().unwrap().unwrap();
-        assert_eq!(shared.heap.array_length(new_arr), 3);
+        assert_eq!(shared.mem.heap.array_length(new_arr), 3);
     }
 
     #[test]
     fn collectors_max_by_p56() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
-        let comparator = shared.heap.alloc_object(ClassId::new(0), 0);
+        let comparator = shared.mem.heap.alloc_object(ClassId::new(0), 0);
         let collector = call_native(
             &shared,
             &mut thread,
@@ -40973,14 +41345,14 @@ mod tests {
         .unwrap()
         .unwrap();
         let c_ref = collector.as_object().unwrap().unwrap();
-        assert_eq!(shared.heap.get_field(c_ref, 0), Value::Int(9));
+        assert_eq!(shared.mem.heap.get_field(c_ref, 0), Value::Int(9));
     }
 
     #[test]
     fn collectors_min_by_p56() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
-        let comparator = shared.heap.alloc_object(ClassId::new(0), 0);
+        let comparator = shared.mem.heap.alloc_object(ClassId::new(0), 0);
         let collector = call_native(
             &shared,
             &mut thread,
@@ -40992,40 +41364,40 @@ mod tests {
         .unwrap()
         .unwrap();
         let c_ref = collector.as_object().unwrap().unwrap();
-        assert_eq!(shared.heap.get_field(c_ref, 0), Value::Int(10));
+        assert_eq!(shared.mem.heap.get_field(c_ref, 0), Value::Int(10));
     }
 
     #[test]
     fn collectors_mapping_p56() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
-        let func = shared.heap.alloc_object(ClassId::new(0), 0);
-        let downstream = shared.heap.alloc_object(ClassId::new(0), 3);
+        let func = shared.mem.heap.alloc_object(ClassId::new(0), 0);
+        let downstream = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         let collector = call_native(&shared, &mut thread, "java/util/stream/Collectors", "mapping",
             "(Ljava/util/function/Function;Ljava/util/stream/Collector;)Ljava/util/stream/Collector;",
             &[Value::Object(Some(func)), Value::Object(Some(downstream))]).unwrap().unwrap();
         let c_ref = collector.as_object().unwrap().unwrap();
-        assert_eq!(shared.heap.get_field(c_ref, 0), Value::Int(11));
+        assert_eq!(shared.mem.heap.get_field(c_ref, 0), Value::Int(11));
     }
 
     #[test]
     fn collectors_filtering_p56() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
-        let pred = shared.heap.alloc_object(ClassId::new(0), 0);
-        let downstream = shared.heap.alloc_object(ClassId::new(0), 3);
+        let pred = shared.mem.heap.alloc_object(ClassId::new(0), 0);
+        let downstream = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         let collector = call_native(&shared, &mut thread, "java/util/stream/Collectors", "filtering",
             "(Ljava/util/function/Predicate;Ljava/util/stream/Collector;)Ljava/util/stream/Collector;",
             &[Value::Object(Some(pred)), Value::Object(Some(downstream))]).unwrap().unwrap();
         let c_ref = collector.as_object().unwrap().unwrap();
-        assert_eq!(shared.heap.get_field(c_ref, 0), Value::Int(12));
+        assert_eq!(shared.mem.heap.get_field(c_ref, 0), Value::Int(12));
     }
 
     #[test]
     fn collectors_summarizing_int_p56() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
-        let func = shared.heap.alloc_object(ClassId::new(0), 0);
+        let func = shared.mem.heap.alloc_object(ClassId::new(0), 0);
         let collector = call_native(
             &shared,
             &mut thread,
@@ -41037,7 +41409,7 @@ mod tests {
         .unwrap()
         .unwrap();
         let c_ref = collector.as_object().unwrap().unwrap();
-        assert_eq!(shared.heap.get_field(c_ref, 0), Value::Int(13));
+        assert_eq!(shared.mem.heap.get_field(c_ref, 0), Value::Int(13));
     }
 
     #[test]
@@ -41056,14 +41428,14 @@ mod tests {
         .unwrap();
         // collections.rs overrides with toList (tag 1) РІР‚вЂќ verify it returns a valid collector
         let c_ref = collector.as_object().unwrap().unwrap();
-        assert_eq!(shared.heap.get_field(c_ref, 0), Value::Int(1));
+        assert_eq!(shared.mem.heap.get_field(c_ref, 0), Value::Int(1));
     }
 
     #[test]
     fn collectors_averaging_int_p56() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
-        let func = shared.heap.alloc_object(ClassId::new(0), 0);
+        let func = shared.mem.heap.alloc_object(ClassId::new(0), 0);
         let collector = call_native(
             &shared,
             &mut thread,
@@ -41075,14 +41447,14 @@ mod tests {
         .unwrap()
         .unwrap();
         let c_ref = collector.as_object().unwrap().unwrap();
-        assert_eq!(shared.heap.get_field(c_ref, 0), Value::Int(19));
+        assert_eq!(shared.mem.heap.get_field(c_ref, 0), Value::Int(19));
     }
 
     #[test]
     fn collectors_summing_int_p56() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
-        let func = shared.heap.alloc_object(ClassId::new(0), 0);
+        let func = shared.mem.heap.alloc_object(ClassId::new(0), 0);
         let collector = call_native(
             &shared,
             &mut thread,
@@ -41094,14 +41466,14 @@ mod tests {
         .unwrap()
         .unwrap();
         let c_ref = collector.as_object().unwrap().unwrap();
-        assert_eq!(shared.heap.get_field(c_ref, 0), Value::Int(22));
+        assert_eq!(shared.mem.heap.get_field(c_ref, 0), Value::Int(22));
     }
 
     #[test]
     fn int_summary_stats_accept_and_getters() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
-        let stats = shared.heap.alloc_object(ClassId::new(0), 4);
+        let stats = shared.mem.heap.alloc_object(ClassId::new(0), 4);
         call_native(
             &shared,
             &mut thread,
@@ -41194,16 +41566,22 @@ mod tests {
         let s1 = create_java_string(&shared, "abc");
         let s2 = create_java_string(&shared, "de");
         let arr = shared
+            .mem
             .heap
             .alloc_array(ClassId::new(0), ArrayElementType::Reference, 2);
         let _ = shared
+            .mem
             .heap
             .set_array_element(arr, 0, Value::Object(Some(s1)));
         let _ = shared
+            .mem
             .heap
             .set_array_element(arr, 1, Value::Object(Some(s2)));
-        let stream = shared.heap.alloc_object(ClassId::new(0), 1);
-        shared.heap.set_field(stream, 0, Value::Object(Some(arr)));
+        let stream = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        shared
+            .mem
+            .heap
+            .set_field(stream, 0, Value::Object(Some(arr)));
         // mapToInt with String.length as the ToIntFunction
         let func = make_lambda_proxy(
             &shared,
@@ -41229,18 +41607,27 @@ mod tests {
         .unwrap();
         let r_ref = result.as_object().unwrap().unwrap();
         let r_arr = shared
+            .mem
             .heap
             .get_field(r_ref, 0)
             .as_object()
             .unwrap()
             .unwrap();
-        assert_eq!(shared.heap.array_length(r_arr), 2);
+        assert_eq!(shared.mem.heap.array_length(r_arr), 2);
         assert_eq!(
-            shared.heap.get_array_element_unboxing(r_arr, 0).unwrap(),
+            shared
+                .mem
+                .heap
+                .get_array_element_unboxing(r_arr, 0)
+                .unwrap(),
             Value::Int(3)
         ); // "abc".length
         assert_eq!(
-            shared.heap.get_array_element_unboxing(r_arr, 1).unwrap(),
+            shared
+                .mem
+                .heap
+                .get_array_element_unboxing(r_arr, 1)
+                .unwrap(),
             Value::Int(2)
         ); // "de".length
     }
@@ -41264,8 +41651,9 @@ mod tests {
             "/a/c/d"
         };
         let path_str = create_java_string(&shared, input);
-        let path = shared.heap.alloc_object(ClassId::new(0), 1);
+        let path = shared.mem.heap.alloc_object(ClassId::new(0), 1);
         shared
+            .mem
             .heap
             .set_field(path, 0, Value::Object(Some(path_str)));
         let norm = call_native(
@@ -41279,10 +41667,10 @@ mod tests {
         .unwrap()
         .unwrap();
         let n_ref = norm.as_object().unwrap().unwrap();
-        let s_val = shared.heap.get_field(n_ref, 0);
+        let s_val = shared.mem.heap.get_field(n_ref, 0);
         let s_ref = s_val.as_object().unwrap().unwrap();
         assert_eq!(
-            read_java_string(&shared.heap, s_ref),
+            read_java_string(&shared.mem.heap, s_ref),
             Some(expected.to_string())
         );
     }
@@ -41292,8 +41680,9 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
         let path_str = create_java_string(&shared, "/usr/local/bin");
-        let path = shared.heap.alloc_object(ClassId::new(0), 1);
+        let path = shared.mem.heap.alloc_object(ClassId::new(0), 1);
         shared
+            .mem
             .heap
             .set_field(path, 0, Value::Object(Some(path_str)));
         let cnt = call_native(
@@ -41314,8 +41703,9 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
         let path_str = create_java_string(&shared, "/usr/local/bin");
-        let path = shared.heap.alloc_object(ClassId::new(0), 1);
+        let path = shared.mem.heap.alloc_object(ClassId::new(0), 1);
         shared
+            .mem
             .heap
             .set_field(path, 0, Value::Object(Some(path_str)));
         let prefix = create_java_string(&shared, "/usr");
@@ -41354,8 +41744,9 @@ mod tests {
             "/home/user"
         };
         let abs_str = create_java_string(&shared, abs_input);
-        let abs_path = shared.heap.alloc_object(ClassId::new(0), 1);
+        let abs_path = shared.mem.heap.alloc_object(ClassId::new(0), 1);
         shared
+            .mem
             .heap
             .set_field(abs_path, 0, Value::Object(Some(abs_str)));
         let is_abs = call_native(
@@ -41370,8 +41761,9 @@ mod tests {
         .unwrap();
         assert_eq!(is_abs, Value::Int(1));
         let rel_str = create_java_string(&shared, "relative/path");
-        let rel_path = shared.heap.alloc_object(ClassId::new(0), 1);
+        let rel_path = shared.mem.heap.alloc_object(ClassId::new(0), 1);
         shared
+            .mem
             .heap
             .set_field(rel_path, 0, Value::Object(Some(rel_str)));
         let is_rel = call_native(
@@ -41393,6 +41785,7 @@ mod tests {
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
         let name = create_java_string(&shared, "/tmp/test.txt");
         let arr = shared
+            .mem
             .heap
             .alloc_array(ClassId::new(0), ArrayElementType::Reference, 0);
         let result = call_native(
@@ -41406,10 +41799,10 @@ mod tests {
         .unwrap()
         .unwrap();
         let r_ref = result.as_object().unwrap().unwrap();
-        let s_val = shared.heap.get_field(r_ref, 0);
+        let s_val = shared.mem.heap.get_field(r_ref, 0);
         let s_ref = s_val.as_object().unwrap().unwrap();
         assert_eq!(
-            read_java_string(&shared.heap, s_ref),
+            read_java_string(&shared.mem.heap, s_ref),
             Some("/tmp/test.txt".to_string())
         );
     }
@@ -41429,14 +41822,14 @@ mod tests {
         .unwrap()
         .unwrap();
         let c_ref = cont.as_object().unwrap().unwrap();
-        assert_eq!(shared.heap.get_field(c_ref, 1), Value::Int(0)); // ordinal 0
+        assert_eq!(shared.mem.heap.get_field(c_ref, 1), Value::Int(0)); // ordinal 0
     }
 
     #[test]
     fn process_builder_basics_p57() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
-        let pb = shared.heap.alloc_object(ClassId::new(0), 4);
+        let pb = shared.mem.heap.alloc_object(ClassId::new(0), 4);
         // Start with no command should return an error
         let result = call_native(
             &shared,
@@ -41457,27 +41850,33 @@ mod tests {
                 "hello"
             },
         );
-        let cmd_arr = shared.heap.alloc_array(
+        let cmd_arr = shared.mem.heap.alloc_array(
             ClassId::new(0),
             crate::memory::heap::ArrayElementType::Reference,
             2,
         );
         shared
+            .mem
             .heap
             .set_array_element(cmd_arr, 0, Value::Object(Some(cmd_str)))
             .unwrap();
         shared
+            .mem
             .heap
             .set_array_element(cmd_arr, 1, Value::Object(Some(arg_str)))
             .unwrap();
         // Store command array as an ArrayList-like object in field 0
-        let cmd_list = shared.heap.alloc_object(ClassId::new(0), 2);
+        let cmd_list = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         shared
+            .mem
             .heap
             .set_field(cmd_list, 0, Value::Object(Some(cmd_arr)));
-        shared.heap.set_field(cmd_list, 1, Value::Int(2));
-        let pb2 = shared.heap.alloc_object(ClassId::new(0), 4);
-        shared.heap.set_field(pb2, 0, Value::Object(Some(cmd_list)));
+        shared.mem.heap.set_field(cmd_list, 1, Value::Int(2));
+        let pb2 = shared.mem.heap.alloc_object(ClassId::new(0), 4);
+        shared
+            .mem
+            .heap
+            .set_field(pb2, 0, Value::Object(Some(cmd_list)));
         let proc = call_native(
             &shared,
             &mut thread,
@@ -41575,19 +41974,20 @@ mod tests {
         .unwrap()
         .unwrap();
         let parent_handle = shared
+            .mem
             .heap
             .get_field(parent, 0)
             .as_object()
             .unwrap()
             .unwrap();
-        assert!(matches!(shared.heap.get_field(parent_handle, 0), Value::Long(pid) if pid > 0));
+        assert!(matches!(shared.mem.heap.get_field(parent_handle, 0), Value::Long(pid) if pid > 0));
     }
 
     #[test]
     fn decimal_format_basics_p57() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
-        let df = shared.heap.alloc_object(ClassId::new(0), 3);
+        let df = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -41609,7 +42009,7 @@ mod tests {
         .unwrap()
         .unwrap();
         let r_ref = result.as_object().unwrap().unwrap();
-        let text = read_java_string(&shared.heap, r_ref).unwrap_or_default();
+        let text = read_java_string(&shared.mem.heap, r_ref).unwrap_or_default();
         assert!(text.starts_with("1.23")); // 3 decimal places max
     }
 
@@ -41617,7 +42017,7 @@ mod tests {
     fn decimal_format_custom_pattern_p57() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
-        let df = shared.heap.alloc_object(ClassId::new(0), 3);
+        let df = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         let pattern = create_java_string(&shared, "#.00");
         call_native(
             &shared,
@@ -41640,7 +42040,7 @@ mod tests {
         .unwrap();
         let p_ref = pat_result.as_object().unwrap().unwrap();
         assert_eq!(
-            read_java_string(&shared.heap, p_ref),
+            read_java_string(&shared.mem.heap, p_ref),
             Some("#.00".to_string())
         );
     }
@@ -41666,7 +42066,7 @@ mod tests {
     fn simple_date_format_basics_p57() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
-        let sdf = shared.heap.alloc_object(ClassId::new(0), 1);
+        let sdf = shared.mem.heap.alloc_object(ClassId::new(0), 1);
         let pattern = create_java_string(&shared, "yyyy-MM-dd HH:mm:ss");
         call_native(
             &shared,
@@ -41689,7 +42089,7 @@ mod tests {
         .unwrap();
         let p_ref = pat.as_object().unwrap().unwrap();
         assert_eq!(
-            read_java_string(&shared.heap, p_ref),
+            read_java_string(&shared.mem.heap, p_ref),
             Some("yyyy-MM-dd HH:mm:ss".to_string())
         );
     }
@@ -41702,12 +42102,14 @@ mod tests {
         // Create Object[] args
         let name = create_java_string(&shared, "Alice");
         let arr = shared
+            .mem
             .heap
             .alloc_array(ClassId::new(0), ArrayElementType::Reference, 2);
         let _ = shared
+            .mem
             .heap
             .set_array_element(arr, 0, Value::Object(Some(name)));
-        let _ = shared.heap.set_array_element(arr, 1, Value::Int(30));
+        let _ = shared.mem.heap.set_array_element(arr, 1, Value::Int(30));
         let result = call_native(
             &shared,
             &mut thread,
@@ -41719,7 +42121,7 @@ mod tests {
         .unwrap()
         .unwrap();
         let r_ref = result.as_object().unwrap().unwrap();
-        let text = read_java_string(&shared.heap, r_ref).unwrap_or_default();
+        let text = read_java_string(&shared.mem.heap, r_ref).unwrap_or_default();
         assert!(text.contains("Alice"));
         assert!(text.contains("30"));
     }
@@ -41728,7 +42130,7 @@ mod tests {
     fn message_format_instance_p57() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
-        let mf = shared.heap.alloc_object(ClassId::new(0), 1);
+        let mf = shared.mem.heap.alloc_object(ClassId::new(0), 1);
         let pattern = create_java_string(&shared, "Count: {0}");
         call_native(
             &shared,
@@ -41751,7 +42153,7 @@ mod tests {
         .unwrap();
         let p_ref = pat.as_object().unwrap().unwrap();
         assert_eq!(
-            read_java_string(&shared.heap, p_ref),
+            read_java_string(&shared.mem.heap, p_ref),
             Some("Count: {0}".to_string())
         );
     }
@@ -41771,7 +42173,7 @@ mod tests {
         .unwrap()
         .unwrap();
         let r_ref = read_opt.as_object().unwrap().unwrap();
-        assert_eq!(shared.heap.get_field(r_ref, 1), Value::Int(0)); // ordinal
+        assert_eq!(shared.mem.heap.get_field(r_ref, 1), Value::Int(0)); // ordinal
     }
 
     #[test]
@@ -41779,8 +42181,9 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
         let path_str = create_java_string(&shared, "/usr/local/bin");
-        let path = shared.heap.alloc_object(ClassId::new(0), 1);
+        let path = shared.mem.heap.alloc_object(ClassId::new(0), 1);
         shared
+            .mem
             .heap
             .set_field(path, 0, Value::Object(Some(path_str)));
         let name = call_native(
@@ -41794,10 +42197,10 @@ mod tests {
         .unwrap()
         .unwrap();
         let n_ref = name.as_object().unwrap().unwrap();
-        let s_val = shared.heap.get_field(n_ref, 0);
+        let s_val = shared.mem.heap.get_field(n_ref, 0);
         let s_ref = s_val.as_object().unwrap().unwrap();
         assert_eq!(
-            read_java_string(&shared.heap, s_ref),
+            read_java_string(&shared.mem.heap, s_ref),
             Some("local".to_string())
         );
     }
@@ -41876,6 +42279,7 @@ mod tests {
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
         // allOf with empty array
         let arr = shared
+            .mem
             .heap
             .alloc_array(ClassId::new(0), ArrayElementType::Reference, 0);
         let result = call_native(
@@ -41928,10 +42332,11 @@ mod tests {
         .unwrap()
         .unwrap();
         let arr = shared
+            .mem
             .heap
             .alloc_array(ClassId::new(0), ArrayElementType::Reference, 2);
-        let _ = shared.heap.set_array_element(arr, 0, cf1);
-        let _ = shared.heap.set_array_element(arr, 1, cf2);
+        let _ = shared.mem.heap.set_array_element(arr, 0, cf1);
+        let _ = shared.mem.heap.set_array_element(arr, 1, cf2);
         let result = call_native(
             &shared,
             &mut thread,
@@ -41960,9 +42365,10 @@ mod tests {
     fn cf_failed_future_p58() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
-        let throwable = shared.heap.alloc_object(ClassId::new(0), 2);
+        let throwable = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         let msg = create_java_string(&shared, "test error");
         shared
+            .mem
             .heap
             .set_field(throwable, 0, Value::Object(Some(msg)));
         let cf = call_native(
@@ -41994,7 +42400,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
         // Create empty CF then complete exceptionally
-        let cf = shared.heap.alloc_object(ClassId::new(0), 2);
+        let cf = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -42004,7 +42410,7 @@ mod tests {
             &[Value::Object(Some(cf))],
         )
         .unwrap();
-        let throwable = shared.heap.alloc_object(ClassId::new(0), 2);
+        let throwable = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         let ok = call_native(
             &shared,
             &mut thread,
@@ -42211,12 +42617,13 @@ mod tests {
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
         // Test GZIPInputStream stub without stream delegation (invoke_virtual requires real class IDs)
         // Manually set up GZIPInputStream with null underlying stream
-        let gis = shared.heap.alloc_object(ClassId::new(0), 2);
-        shared.heap.set_field(gis, 0, Value::Object(None)); // no underlying stream
+        let gis = shared.mem.heap.alloc_object(ClassId::new(0), 2);
+        shared.mem.heap.set_field(gis, 0, Value::Object(None)); // no underlying stream
         let arr = shared
+            .mem
             .heap
             .alloc_array(ClassId::new(0), ArrayElementType::Byte, 0);
-        shared.heap.set_field(gis, 1, Value::Object(Some(arr)));
+        shared.mem.heap.set_field(gis, 1, Value::Object(Some(arr)));
         // Read from null stream returns -1
         let b1 = call_native(
             &shared,
@@ -42248,7 +42655,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
         // Create a BAOS
-        let baos = shared.heap.alloc_object(ClassId::new(0), 2);
+        let baos = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -42259,7 +42666,7 @@ mod tests {
         )
         .unwrap();
         // Create ZipOutputStream wrapping BAOS
-        let zos = shared.heap.alloc_object(ClassId::new(0), 2);
+        let zos = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -42271,7 +42678,7 @@ mod tests {
         .unwrap();
         // Put a new entry
         let name = create_java_string(&shared, "test.txt");
-        let entry = shared.heap.alloc_object(ClassId::new(0), 4);
+        let entry = shared.mem.heap.alloc_object(ClassId::new(0), 4);
         call_native(
             &shared,
             &mut thread,
@@ -42316,8 +42723,9 @@ mod tests {
     fn zip_input_stream_p58() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
-        let bais = shared.heap.alloc_object(ClassId::new(0), 3);
+        let bais = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         let data = shared
+            .mem
             .heap
             .alloc_array(ClassId::new(0), ArrayElementType::Byte, 0);
         call_native(
@@ -42329,7 +42737,7 @@ mod tests {
             &[Value::Object(Some(bais)), Value::Object(Some(data))],
         )
         .unwrap();
-        let zis = shared.heap.alloc_object(ClassId::new(0), 2);
+        let zis = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -42359,14 +42767,15 @@ mod tests {
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
         // Test pushback buffer directly (invoke_virtual requires real class IDs)
         // Create PushbackInputStream with null underlying stream, buf size 3
-        let pis = shared.heap.alloc_object(ClassId::new(0), 3);
-        shared.heap.set_field(pis, 0, Value::Object(None)); // no underlying stream
+        let pis = shared.mem.heap.alloc_object(ClassId::new(0), 3);
+        shared.mem.heap.set_field(pis, 0, Value::Object(None)); // no underlying stream
         let buf = shared
+            .mem
             .heap
             .alloc_array(ClassId::new(0), ArrayElementType::Byte, 3);
-        shared.heap.set_field(pis, 1, Value::Object(Some(buf)));
-        shared.heap.set_field(pis, 2, Value::Int(3)); // pos = 3 means buffer empty
-                                                      // Unread byte 42
+        shared.mem.heap.set_field(pis, 1, Value::Object(Some(buf)));
+        shared.mem.heap.set_field(pis, 2, Value::Int(3)); // pos = 3 means buffer empty
+                                                          // Unread byte 42
         call_native(
             &shared,
             &mut thread,
@@ -42561,13 +42970,15 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
         // makeConcatWithConstants returns a CallSite
-        let lookup = shared.heap.alloc_object(ClassId::new(0), 1);
+        let lookup = shared.mem.heap.alloc_object(ClassId::new(0), 1);
         let name = create_java_string(&shared, "makeConcatWithConstants");
-        let mt = shared.heap.alloc_object(ClassId::new(0), 2);
+        let mt = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         let recipe = create_java_string(&shared, "\u{0001}\u{0001}");
-        let constants = shared
-            .heap
-            .alloc_array(ClassId::new(0), ArrayElementType::Reference, 0);
+        let constants =
+            shared
+                .mem
+                .heap
+                .alloc_array(ClassId::new(0), ArrayElementType::Reference, 0);
         let cs = call_native(&shared, &mut thread, "java/lang/invoke/StringConcatFactory",
             "makeConcatWithConstants",
             "(Ljava/lang/invoke/MethodHandles$Lookup;Ljava/lang/String;Ljava/lang/invoke/MethodType;Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/invoke/CallSite;",
@@ -42580,7 +42991,7 @@ mod tests {
     fn synchronous_queue_put_take_p58() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
-        let sq = shared.heap.alloc_object(ClassId::new(0), 2);
+        let sq = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -42642,7 +43053,7 @@ mod tests {
     fn synchronous_queue_offer_poll_p58() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
-        let sq = shared.heap.alloc_object(ClassId::new(0), 2);
+        let sq = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -42876,7 +43287,7 @@ mod tests {
         .unwrap();
         let name_ref = name.as_object().unwrap().unwrap();
         assert_eq!(
-            read_java_string(&shared.heap, name_ref),
+            read_java_string(&shared.mem.heap, name_ref),
             Some("CratonVM".to_string())
         );
         let version = call_native(
@@ -42891,7 +43302,7 @@ mod tests {
         .unwrap();
         let ver_ref = version.as_object().unwrap().unwrap();
         assert_eq!(
-            read_java_string(&shared.heap, ver_ref),
+            read_java_string(&shared.mem.heap, ver_ref),
             Some("0.1.0".to_string())
         );
     }
@@ -43019,7 +43430,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
         let path = create_java_string(&shared, &jar_path_str);
-        let jf = shared.heap.alloc_object(ClassId::new(0), 2);
+        let jf = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -43042,7 +43453,7 @@ mod tests {
         .unwrap();
         let name_ref = name.as_object().unwrap().unwrap();
         assert_eq!(
-            read_java_string(&shared.heap, name_ref),
+            read_java_string(&shared.mem.heap, name_ref),
             Some(jar_path_str.clone())
         );
         // getManifest should return a Manifest object
@@ -43064,7 +43475,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
         let name = create_java_string(&shared, "META-INF/MANIFEST.MF");
-        let entry = shared.heap.alloc_object(ClassId::new(0), 4);
+        let entry = shared.mem.heap.alloc_object(ClassId::new(0), 4);
         call_native(
             &shared,
             &mut thread,
@@ -43086,7 +43497,7 @@ mod tests {
         .unwrap();
         let n_ref = got_name.as_object().unwrap().unwrap();
         assert_eq!(
-            read_java_string(&shared.heap, n_ref),
+            read_java_string(&shared.mem.heap, n_ref),
             Some("META-INF/MANIFEST.MF".to_string())
         );
     }
@@ -43136,14 +43547,15 @@ mod tests {
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
         // Create a spliterator with some data
         let arr = shared
+            .mem
             .heap
             .alloc_array(ClassId::new(0), ArrayElementType::Reference, 3);
-        let _ = shared.heap.set_array_element(arr, 0, Value::Int(1));
-        let _ = shared.heap.set_array_element(arr, 1, Value::Int(2));
-        let _ = shared.heap.set_array_element(arr, 2, Value::Int(3));
-        let spl = shared.heap.alloc_object(ClassId::new(0), 2);
-        shared.heap.set_field(spl, 0, Value::Object(Some(arr)));
-        shared.heap.set_field(spl, 1, Value::Int(0));
+        let _ = shared.mem.heap.set_array_element(arr, 0, Value::Int(1));
+        let _ = shared.mem.heap.set_array_element(arr, 1, Value::Int(2));
+        let _ = shared.mem.heap.set_array_element(arr, 2, Value::Int(3));
+        let spl = shared.mem.heap.alloc_object(ClassId::new(0), 2);
+        shared.mem.heap.set_field(spl, 0, Value::Object(Some(arr)));
+        shared.mem.heap.set_field(spl, 1, Value::Int(0));
         // Create stream from spliterator
         let stream = call_native(
             &shared,
@@ -43158,7 +43570,7 @@ mod tests {
         assert!(matches!(stream, Value::Object(Some(_))));
         // The stream should have the same backing array
         let s_ref = stream.as_object().unwrap().unwrap();
-        let stream_arr = shared.heap.get_field(s_ref, 0);
+        let stream_arr = shared.mem.heap.get_field(s_ref, 0);
         assert_eq!(stream_arr, Value::Object(Some(arr)));
     }
 
@@ -43168,9 +43580,10 @@ mod tests {
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
         // VarHandle.getVolatile with array arg
         let arr = shared
+            .mem
             .heap
             .alloc_array(ClassId::new(0), ArrayElementType::Reference, 1);
-        let _ = shared.heap.set_array_element(arr, 0, Value::Int(42));
+        let _ = shared.mem.heap.set_array_element(arr, 0, Value::Int(42));
         let val = call_native(
             &shared,
             &mut thread,
@@ -43277,7 +43690,7 @@ mod tests {
         .unwrap();
         let n_ref = got_name.as_object().unwrap().unwrap();
         assert_eq!(
-            read_java_string(&shared.heap, n_ref),
+            read_java_string(&shared.mem.heap, n_ref),
             Some("java.util".to_string())
         );
         let sealed = call_native(
@@ -43315,14 +43728,17 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
         // Create a StackFrame manually
-        let sf = shared.heap.alloc_object(ClassId::new(0), 4);
+        let sf = shared.mem.heap.alloc_object(ClassId::new(0), 4);
         let cls = create_java_string(&shared, "com.example.Test");
         let method = create_java_string(&shared, "main");
         let file = create_java_string(&shared, "Test.java");
-        shared.heap.set_field(sf, 0, Value::Object(Some(cls)));
-        shared.heap.set_field(sf, 1, Value::Object(Some(method)));
-        shared.heap.set_field(sf, 2, Value::Object(Some(file)));
-        shared.heap.set_field(sf, 3, Value::Int(42));
+        shared.mem.heap.set_field(sf, 0, Value::Object(Some(cls)));
+        shared
+            .mem
+            .heap
+            .set_field(sf, 1, Value::Object(Some(method)));
+        shared.mem.heap.set_field(sf, 2, Value::Object(Some(file)));
+        shared.mem.heap.set_field(sf, 3, Value::Int(42));
         let got_cls = call_native(
             &shared,
             &mut thread,
@@ -43335,7 +43751,7 @@ mod tests {
         .unwrap();
         let c_ref = got_cls.as_object().unwrap().unwrap();
         assert_eq!(
-            read_java_string(&shared.heap, c_ref),
+            read_java_string(&shared.mem.heap, c_ref),
             Some("com.example.Test".to_string())
         );
         let line = call_native(
@@ -43384,12 +43800,14 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
         // Read attributes from a stub path
-        let path = shared.heap.alloc_object(ClassId::new(0), 1);
+        let path = shared.mem.heap.alloc_object(ClassId::new(0), 1);
         let path_str = create_java_string(&shared, "/tmp/test.txt");
         shared
+            .mem
             .heap
             .set_field(path, 0, Value::Object(Some(path_str)));
         let opts = shared
+            .mem
             .heap
             .alloc_array(ClassId::new(0), ArrayElementType::Reference, 0);
         let attrs = call_native(&shared, &mut thread, "java/nio/file/Files",
@@ -43477,7 +43895,7 @@ mod tests {
         .unwrap();
         let name_ref = name.as_object().unwrap().unwrap();
         assert_eq!(
-            read_java_string(&shared.heap, name_ref),
+            read_java_string(&shared.mem.heap, name_ref),
             Some("CratonVM JIT".to_string())
         );
     }
@@ -43599,7 +44017,10 @@ mod tests {
         .unwrap()
         .unwrap();
         let method_ref = method.as_object().unwrap().unwrap();
-        assert_eq!(read_java_string(&shared.heap, method_ref).unwrap(), "POST");
+        assert_eq!(
+            read_java_string(&shared.mem.heap, method_ref).unwrap(),
+            "POST"
+        );
     }
 
     #[test]
@@ -43735,9 +44156,9 @@ mod tests {
     fn flow_subscription_request_cancel_p60() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
-        let sub = shared.heap.alloc_object(ClassId::new(0), 2);
-        shared.heap.set_field(sub, 0, Value::Int(0));
-        shared.heap.set_field(sub, 1, Value::Long(0));
+        let sub = shared.mem.heap.alloc_object(ClassId::new(0), 2);
+        shared.mem.heap.set_field(sub, 0, Value::Int(0));
+        shared.mem.heap.set_field(sub, 1, Value::Long(0));
         // Request 5 РІР‚вЂќ the streams.rs override keeps demand in a side map,
         // not in field 1, so the object field stays at 0. We only verify
         // that the call doesn't panic and doesn't flip the cancel flag.
@@ -43751,7 +44172,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            shared.heap.get_field(sub, 0),
+            shared.mem.heap.get_field(sub, 0),
             Value::Int(0),
             "cancel flag must stay 0 after request()"
         );
@@ -43775,7 +44196,7 @@ mod tests {
             &[Value::Object(Some(sub))],
         )
         .unwrap();
-        assert_eq!(shared.heap.get_field(sub, 0), Value::Int(1));
+        assert_eq!(shared.mem.heap.get_field(sub, 0), Value::Int(1));
     }
 
     #[test]
@@ -43799,7 +44220,7 @@ mod tests {
     fn submission_publisher_lifecycle_p60() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
-        let pub_obj = shared.heap.alloc_object(ClassId::new(0), 3);
+        let pub_obj = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -43862,13 +44283,14 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
         // Create a matcher-like object with 5 fields (pattern, input, offset, matchStart, matchEnd)
-        let matcher = shared.heap.alloc_object(ClassId::new(0), 5);
+        let matcher = shared.mem.heap.alloc_object(ClassId::new(0), 5);
         let input = create_java_string(&shared, "hello world");
         shared
+            .mem
             .heap
             .set_field(matcher, 1, Value::Object(Some(input))); // input
-        shared.heap.set_field(matcher, 3, Value::Int(6)); // matchStart
-        shared.heap.set_field(matcher, 4, Value::Int(11)); // matchEnd
+        shared.mem.heap.set_field(matcher, 3, Value::Int(6)); // matchStart
+        shared.mem.heap.set_field(matcher, 4, Value::Int(11)); // matchEnd
         let start = call_native(
             &shared,
             &mut thread,
@@ -43902,14 +44324,17 @@ mod tests {
         .unwrap()
         .unwrap();
         let group_ref = group.as_object().unwrap().unwrap();
-        assert_eq!(read_java_string(&shared.heap, group_ref).unwrap(), "world");
+        assert_eq!(
+            read_java_string(&shared.mem.heap, group_ref).unwrap(),
+            "world"
+        );
     }
 
     #[test]
     fn callsite_mutable_p60() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
-        let cs = shared.heap.alloc_object(ClassId::new(0), 1);
+        let cs = shared.mem.heap.alloc_object(ClassId::new(0), 1);
         let mh = create_java_string(&shared, "fake_mh");
         call_native(
             &shared,
@@ -43959,7 +44384,7 @@ mod tests {
     fn callsite_constant_p60() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
-        let cs = shared.heap.alloc_object(ClassId::new(0), 1);
+        let cs = shared.mem.heap.alloc_object(ClassId::new(0), 1);
         let mh = create_java_string(&shared, "const_mh");
         call_native(
             &shared,
@@ -43999,7 +44424,7 @@ mod tests {
     fn callsite_volatile_p60() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
-        let cs = shared.heap.alloc_object(ClassId::new(0), 1);
+        let cs = shared.mem.heap.alloc_object(ClassId::new(0), 1);
         let mh = create_java_string(&shared, "volatile_mh");
         call_native(
             &shared,
@@ -44027,9 +44452,9 @@ mod tests {
     fn record_tostring_p60() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
-        let rec = shared.heap.alloc_object(ClassId::new(0), 2);
-        shared.heap.set_field(rec, 0, Value::Int(42));
-        shared.heap.set_field(rec, 1, Value::Int(100));
+        let rec = shared.mem.heap.alloc_object(ClassId::new(0), 2);
+        shared.mem.heap.set_field(rec, 0, Value::Int(42));
+        shared.mem.heap.set_field(rec, 1, Value::Int(100));
         // toString
         let ts = call_native(
             &shared,
@@ -44042,7 +44467,7 @@ mod tests {
         .unwrap()
         .unwrap();
         let ts_ref = ts.as_object().unwrap().unwrap();
-        let ts_str = read_java_string(&shared.heap, ts_ref).unwrap();
+        let ts_str = read_java_string(&shared.mem.heap, ts_ref).unwrap();
         // toString with no record components uses fallback format: ClassName@hex or @hex
         assert!(
             ts_str.contains('@'),
@@ -44055,11 +44480,11 @@ mod tests {
     fn record_component_p60() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
-        let rc = shared.heap.alloc_object(ClassId::new(0), 3);
+        let rc = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         let name = create_java_string(&shared, "x");
-        shared.heap.set_field(rc, 0, Value::Object(Some(name)));
-        shared.heap.set_field(rc, 1, Value::Object(None)); // type class
-        shared.heap.set_field(rc, 2, Value::Object(None)); // declaring record
+        shared.mem.heap.set_field(rc, 0, Value::Object(Some(name)));
+        shared.mem.heap.set_field(rc, 1, Value::Object(None)); // type class
+        shared.mem.heap.set_field(rc, 2, Value::Object(None)); // declaring record
         let got_name = call_native(
             &shared,
             &mut thread,
@@ -44071,18 +44496,22 @@ mod tests {
         .unwrap()
         .unwrap();
         let got_name_ref = got_name.as_object().unwrap().unwrap();
-        assert_eq!(read_java_string(&shared.heap, got_name_ref).unwrap(), "x");
+        assert_eq!(
+            read_java_string(&shared.mem.heap, got_name_ref).unwrap(),
+            "x"
+        );
     }
 
     #[test]
     fn process_handle_children_empty_stream_p60() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
-        let ph = shared.heap.alloc_object(ClassId::new(0), 2);
+        let ph = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         shared
+            .mem
             .heap
             .set_field(ph, 0, Value::Long(std::process::id() as i64));
-        shared.heap.set_field(ph, 1, Value::Int(1));
+        shared.mem.heap.set_field(ph, 1, Value::Int(1));
         let stream = call_native(
             &shared,
             &mut thread,
@@ -44100,7 +44529,7 @@ mod tests {
     fn process_handle_on_exit_cf_p60() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
-        let ph = shared.heap.alloc_object(ClassId::new(0), 2);
+        let ph = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         let cf = call_native(
             &shared,
             &mut thread,
@@ -44129,7 +44558,7 @@ mod tests {
     fn process_handle_info_stubs_p60() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
-        let ph = shared.heap.alloc_object(ClassId::new(0), 2);
+        let ph = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         let info = call_native(
             &shared,
             &mut thread,
@@ -44159,8 +44588,8 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
         // 3-field map-like object (buckets=0, size=1, capacity=2)
-        let map = shared.heap.alloc_object(ClassId::new(0), 3);
-        shared.heap.set_field(map, 1, Value::Int(0)); // size = 0
+        let map = shared.mem.heap.alloc_object(ClassId::new(0), 3);
+        shared.mem.heap.set_field(map, 1, Value::Int(0)); // size = 0
         let empty = call_native(
             &shared,
             &mut thread,
@@ -44172,7 +44601,7 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(empty, Value::Int(1));
-        shared.heap.set_field(map, 1, Value::Int(3)); // size = 3
+        shared.mem.heap.set_field(map, 1, Value::Int(3)); // size = 3
         let empty2 = call_native(
             &shared,
             &mut thread,
@@ -44190,8 +44619,8 @@ mod tests {
     fn abstract_map_tostring_p60() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
-        let map = shared.heap.alloc_object(ClassId::new(0), 3);
-        shared.heap.set_field(map, 1, Value::Int(5));
+        let map = shared.mem.heap.alloc_object(ClassId::new(0), 3);
+        shared.mem.heap.set_field(map, 1, Value::Int(5));
         let ts = call_native(
             &shared,
             &mut thread,
@@ -44203,14 +44632,17 @@ mod tests {
         .unwrap()
         .unwrap();
         let ts_ref = ts.as_object().unwrap().unwrap();
-        assert_eq!(read_java_string(&shared.heap, ts_ref).unwrap(), "{size=5}");
+        assert_eq!(
+            read_java_string(&shared.mem.heap, ts_ref).unwrap(),
+            "{size=5}"
+        );
     }
 
     #[test]
     fn abstract_map_equals_p60() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
-        let map = shared.heap.alloc_object(ClassId::new(0), 3);
+        let map = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         let eq = call_native(
             &shared,
             &mut thread,
@@ -44222,7 +44654,7 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(eq, Value::Int(1));
-        let map2 = shared.heap.alloc_object(ClassId::new(0), 3);
+        let map2 = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         let eq2 = call_native(
             &shared,
             &mut thread,
@@ -44301,7 +44733,7 @@ mod tests {
     fn parse_position_p61() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
-        let pp = shared.heap.alloc_object(ClassId::new(0), 1);
+        let pp = shared.mem.heap.alloc_object(ClassId::new(0), 1);
         call_native(
             &shared,
             &mut thread,
@@ -44348,7 +44780,7 @@ mod tests {
     fn field_position_p61() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
-        let fp = shared.heap.alloc_object(ClassId::new(0), 2);
+        let fp = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -44375,7 +44807,7 @@ mod tests {
     fn decimal_format_symbols_p61() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
-        let dfs = shared.heap.alloc_object(ClassId::new(0), 6);
+        let dfs = shared.mem.heap.alloc_object(ClassId::new(0), 6);
         call_native(
             &shared,
             &mut thread,
@@ -44445,7 +44877,7 @@ mod tests {
     fn date_format_symbols_weekdays_p61() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
-        let dfsy = shared.heap.alloc_object(ClassId::new(0), 5);
+        let dfsy = shared.mem.heap.alloc_object(ClassId::new(0), 5);
         call_native(
             &shared,
             &mut thread,
@@ -44466,19 +44898,19 @@ mod tests {
         .unwrap()
         .unwrap();
         let wd_arr = weekdays.as_object().unwrap().unwrap();
-        let len = shared.heap.array_length(wd_arr);
+        let len = shared.mem.heap.array_length(wd_arr);
         assert_eq!(len, 8); // 0=empty, 1=Sunday..7=Saturday
                             // Check index 1 is "Sunday"
-        let sunday = shared.heap.get_array_element(wd_arr, 1).unwrap();
+        let sunday = shared.mem.heap.get_array_element(wd_arr, 1).unwrap();
         let s_ref = sunday.as_object().unwrap().unwrap();
-        assert_eq!(read_java_string(&shared.heap, s_ref).unwrap(), "Sunday");
+        assert_eq!(read_java_string(&shared.mem.heap, s_ref).unwrap(), "Sunday");
     }
 
     #[test]
     fn date_format_symbols_months_p61() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
-        let dfsy = shared.heap.alloc_object(ClassId::new(0), 5);
+        let dfsy = shared.mem.heap.alloc_object(ClassId::new(0), 5);
         call_native(
             &shared,
             &mut thread,
@@ -44499,11 +44931,14 @@ mod tests {
         .unwrap()
         .unwrap();
         let m_arr = months.as_object().unwrap().unwrap();
-        let len = shared.heap.array_length(m_arr);
+        let len = shared.mem.heap.array_length(m_arr);
         assert_eq!(len, 13); // 12 months + trailing empty
-        let jan = shared.heap.get_array_element(m_arr, 0).unwrap();
+        let jan = shared.mem.heap.get_array_element(m_arr, 0).unwrap();
         let j_ref = jan.as_object().unwrap().unwrap();
-        assert_eq!(read_java_string(&shared.heap, j_ref).unwrap(), "January");
+        assert_eq!(
+            read_java_string(&shared.mem.heap, j_ref).unwrap(),
+            "January"
+        );
     }
 
     #[test]
@@ -44556,7 +44991,7 @@ mod tests {
     fn logger_handlers_p61() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
-        let logger = shared.heap.alloc_object(ClassId::new(0), 3);
+        let logger = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         let handlers = call_native(
             &shared,
             &mut thread,
@@ -44568,7 +45003,7 @@ mod tests {
         .unwrap()
         .unwrap();
         let h_arr = handlers.as_object().unwrap().unwrap();
-        assert_eq!(shared.heap.array_length(h_arr), 0);
+        assert_eq!(shared.mem.heap.array_length(h_arr), 0);
     }
 
     #[test]
@@ -44603,7 +45038,7 @@ mod tests {
     fn stream_handler_lifecycle_p61() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
-        let handler = shared.heap.alloc_object(ClassId::new(0), 2);
+        let handler = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -44640,10 +45075,10 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
         // Create a Charset-like object: 2-field (name=0, flags=1)
-        let cs = shared.heap.alloc_object(ClassId::new(0), 2);
+        let cs = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         let name = create_java_string(&shared, "UTF-8");
-        shared.heap.set_field(cs, 0, Value::Object(Some(name)));
-        shared.heap.set_field(cs, 1, Value::Int(0));
+        shared.mem.heap.set_field(cs, 0, Value::Object(Some(name)));
+        shared.mem.heap.set_field(cs, 1, Value::Int(0));
         let got_name = call_native(
             &shared,
             &mut thread,
@@ -44655,7 +45090,7 @@ mod tests {
         .unwrap()
         .unwrap();
         let n_ref = got_name.as_object().unwrap().unwrap();
-        assert_eq!(read_java_string(&shared.heap, n_ref).unwrap(), "UTF-8");
+        assert_eq!(read_java_string(&shared.mem.heap, n_ref).unwrap(), "UTF-8");
         let reg = call_native(
             &shared,
             &mut thread,
@@ -44700,7 +45135,7 @@ mod tests {
         .unwrap()
         .unwrap();
         let map_ref = map.as_object().unwrap().unwrap();
-        let size = shared.heap.get_field(map_ref, 1);
+        let size = shared.mem.heap.get_field(map_ref, 1);
         assert_eq!(size, Value::Int(6)); // 6 standard charsets
     }
 
@@ -44708,7 +45143,7 @@ mod tests {
     fn classloader_get_resource_p61() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
-        let cl = shared.heap.alloc_object(ClassId::new(0), 1);
+        let cl = shared.mem.heap.alloc_object(ClassId::new(0), 1);
         let name = create_java_string(&shared, "nonexistent.txt");
         let url = call_native(
             &shared,
@@ -44744,11 +45179,14 @@ mod tests {
     fn parameter_reflect_p61() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
-        let param = shared.heap.alloc_object(ClassId::new(0), 3);
+        let param = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         let name = create_java_string(&shared, "count");
-        shared.heap.set_field(param, 0, Value::Object(Some(name)));
-        shared.heap.set_field(param, 1, Value::Int(0)); // modifiers
-        shared.heap.set_field(param, 2, Value::Object(None)); // declaring executable
+        shared
+            .mem
+            .heap
+            .set_field(param, 0, Value::Object(Some(name)));
+        shared.mem.heap.set_field(param, 1, Value::Int(0)); // modifiers
+        shared.mem.heap.set_field(param, 2, Value::Object(None)); // declaring executable
         let got = call_native(
             &shared,
             &mut thread,
@@ -44760,7 +45198,7 @@ mod tests {
         .unwrap()
         .unwrap();
         let g_ref = got.as_object().unwrap().unwrap();
-        assert_eq!(read_java_string(&shared.heap, g_ref).unwrap(), "count");
+        assert_eq!(read_java_string(&shared.mem.heap, g_ref).unwrap(), "count");
         let varargs = call_native(
             &shared,
             &mut thread,
@@ -44778,7 +45216,7 @@ mod tests {
     fn field_annotations_empty_p61() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
-        let field = shared.heap.alloc_object(ClassId::new(0), 5);
+        let field = shared.mem.heap.alloc_object(ClassId::new(0), 5);
         let anns = call_native(
             &shared,
             &mut thread,
@@ -44790,14 +45228,14 @@ mod tests {
         .unwrap()
         .unwrap();
         let a_arr = anns.as_object().unwrap().unwrap();
-        assert_eq!(shared.heap.array_length(a_arr), 0);
+        assert_eq!(shared.mem.heap.array_length(a_arr), 0);
     }
 
     #[test]
     fn path_get_filename_p61() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
-        let path = shared.heap.alloc_object(ClassId::new(0), 1);
+        let path = shared.mem.heap.alloc_object(ClassId::new(0), 1);
         let sep = if cfg!(windows) { "\\" } else { "/" };
         let path_str = if cfg!(windows) {
             "C:\\Users\\test\\file.txt"
@@ -44805,7 +45243,7 @@ mod tests {
             "/home/test/file.txt"
         };
         let s = create_java_string(&shared, path_str);
-        shared.heap.set_field(path, 0, Value::Object(Some(s)));
+        shared.mem.heap.set_field(path, 0, Value::Object(Some(s)));
         let fname = call_native(
             &shared,
             &mut thread,
@@ -44817,10 +45255,10 @@ mod tests {
         .unwrap()
         .unwrap();
         let fname_ref = fname.as_object().unwrap().unwrap();
-        let fname_str_val = shared.heap.get_field(fname_ref, 0);
+        let fname_str_val = shared.mem.heap.get_field(fname_ref, 0);
         let fname_str_ref = fname_str_val.as_object().unwrap().unwrap();
         assert_eq!(
-            read_java_string(&shared.heap, fname_str_ref).unwrap(),
+            read_java_string(&shared.mem.heap, fname_str_ref).unwrap(),
             "file.txt"
         );
         let _ = sep; // suppress unused
@@ -44830,14 +45268,14 @@ mod tests {
     fn path_resolve_string_p61() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
-        let path = shared.heap.alloc_object(ClassId::new(0), 1);
+        let path = shared.mem.heap.alloc_object(ClassId::new(0), 1);
         let base = if cfg!(windows) {
             "C:\\Users\\test"
         } else {
             "/home/test"
         };
         let s = create_java_string(&shared, base);
-        shared.heap.set_field(path, 0, Value::Object(Some(s)));
+        shared.mem.heap.set_field(path, 0, Value::Object(Some(s)));
         let child = create_java_string(&shared, "subdir");
         let resolved = call_native(
             &shared,
@@ -44850,9 +45288,9 @@ mod tests {
         .unwrap()
         .unwrap();
         let r_ref = resolved.as_object().unwrap().unwrap();
-        let r_str_val = shared.heap.get_field(r_ref, 0);
+        let r_str_val = shared.mem.heap.get_field(r_ref, 0);
         let r_str_ref = r_str_val.as_object().unwrap().unwrap();
-        let r_str = read_java_string(&shared.heap, r_str_ref).unwrap();
+        let r_str = read_java_string(&shared.mem.heap, r_str_ref).unwrap();
         assert!(r_str.contains("subdir"));
     }
 
@@ -44992,7 +45430,7 @@ mod tests {
         .unwrap()
         .unwrap();
         let ts_ref = ts.as_object().unwrap().unwrap();
-        assert_eq!(read_java_string(&shared.heap, ts_ref).unwrap(), "hello");
+        assert_eq!(read_java_string(&shared.mem.heap, ts_ref).unwrap(), "hello");
     }
 
     #[test]
@@ -45341,7 +45779,7 @@ mod tests {
     fn simple_entry_p62() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
-        let entry = shared.heap.alloc_object(ClassId::new(0), 2);
+        let entry = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         let key = create_java_string(&shared, "k1");
         let val = create_java_string(&shared, "v1");
         call_native(
@@ -45398,7 +45836,7 @@ mod tests {
     fn simple_immutable_entry_set_throws_p62() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
-        let entry = shared.heap.alloc_object(ClassId::new(0), 2);
+        let entry = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         let key = create_java_string(&shared, "k");
         let val = create_java_string(&shared, "v");
         call_native(
@@ -45429,7 +45867,7 @@ mod tests {
     fn stamped_lock_read_write_p62() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
-        let lock = shared.heap.alloc_object(ClassId::new(0), 2);
+        let lock = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -45512,7 +45950,7 @@ mod tests {
     fn stamped_lock_optimistic_read_p62() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
-        let lock = shared.heap.alloc_object(ClassId::new(0), 2);
+        let lock = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -45549,7 +45987,7 @@ mod tests {
     fn zip_entry_p62() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
-        let ze = shared.heap.alloc_object(ClassId::new(0), 4);
+        let ze = shared.mem.heap.alloc_object(ClassId::new(0), 4);
         let name = create_java_string(&shared, "META-INF/");
         call_native(
             &shared,
@@ -45571,7 +46009,10 @@ mod tests {
         .unwrap()
         .unwrap();
         let n_ref = got_name.as_object().unwrap().unwrap();
-        assert_eq!(read_java_string(&shared.heap, n_ref).unwrap(), "META-INF/");
+        assert_eq!(
+            read_java_string(&shared.mem.heap, n_ref).unwrap(),
+            "META-INF/"
+        );
         let is_dir = call_native(
             &shared,
             &mut thread,
@@ -45623,7 +46064,7 @@ mod tests {
     fn weak_hash_map_basic_p63() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let whm = shared.heap.alloc_object(ClassId::new(0), 3);
+        let whm = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -45663,7 +46104,7 @@ mod tests {
     fn weak_hash_map_init_capacity_p63() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let whm = shared.heap.alloc_object(ClassId::new(0), 3);
+        let whm = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -45690,7 +46131,7 @@ mod tests {
     fn weak_hash_map_clear_p63() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let whm = shared.heap.alloc_object(ClassId::new(0), 3);
+        let whm = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -45726,7 +46167,7 @@ mod tests {
     fn weak_hash_map_key_set_values_p63() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let whm = shared.heap.alloc_object(ClassId::new(0), 3);
+        let whm = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -45861,7 +46302,7 @@ mod tests {
         .unwrap();
         if let Value::Object(Some(s)) = ts {
             assert_eq!(
-                read_java_string(&shared.heap, s).unwrap(),
+                read_java_string(&shared.mem.heap, s).unwrap(),
                 "ServiceLoader[]"
             );
         } else {
@@ -45908,14 +46349,14 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // Build an empty URL[] array
-        let url_arr = shared.heap.alloc_array(
+        let url_arr = shared.mem.heap.alloc_array(
             ClassId::new(0),
             crate::memory::heap::ArrayElementType::Reference,
             0,
         );
 
         // Create URLClassLoader with the empty URL array (6 fields: parent=0, name=1, classes=2, package2module=3, urls=4, loader_id=5)
-        let ucl = shared.heap.alloc_object(ClassId::new(0), 6);
+        let ucl = shared.mem.heap.alloc_object(ClassId::new(0), 6);
 
         call_native(
             &shared,
@@ -45947,7 +46388,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let url_arr = shared.heap.alloc_array(
+        let url_arr = shared.mem.heap.alloc_array(
             ClassId::new(0),
             crate::memory::heap::ArrayElementType::Reference,
             0,
@@ -45997,8 +46438,8 @@ mod tests {
 
         // Build a Class mirror with a 1-field object storing ClassId(999) (unknown class).
         // s1_service_loader_ensure_loaded will call class_name_of_id(999) РІвЂ вЂ™ None РІвЂ вЂ™ return empty.
-        let mirror = shared.heap.alloc_object(ClassId::new(0), 1);
-        shared.heap.set_field(mirror, 0, Value::Int(999));
+        let mirror = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        shared.mem.heap.set_field(mirror, 0, Value::Int(999));
 
         // ServiceLoader.load(Class)
         let sl = call_native(
@@ -46054,11 +46495,11 @@ mod tests {
 
         // Load String to get a known ClassId
         {
-            let mut cm = shared.class_manager.write();
+            let mut cm = shared.classes.class_manager.write();
             let _ = cm.load_class("java/lang/String");
         }
         let string_id = {
-            let cm = shared.class_manager.read();
+            let cm = shared.classes.class_manager.read();
             cm.find_class_by_name("java/lang/String")
         };
 
@@ -46080,13 +46521,13 @@ mod tests {
 
             // Add the JAR to the VM classpath dynamically
             {
-                let mut cm = shared.class_manager.write();
+                let mut cm = shared.classes.class_manager.write();
                 cm.extend_application_classpath(&[tmp.to_string_lossy().into_owned()]);
             }
 
             // Verify find_resource can find the services file
             let found = {
-                let cm = shared.class_manager.read();
+                let cm = shared.classes.class_manager.read();
                 cm.find_resource("META-INF/services/java.lang.String")
             };
             assert!(
@@ -46097,8 +46538,9 @@ mod tests {
             assert!(content.contains("java.lang.String"));
 
             // Build a Class mirror with the real String ClassId
-            let mirror = shared.heap.alloc_object(ClassId::new(0), 1);
+            let mirror = shared.mem.heap.alloc_object(ClassId::new(0), 1);
             shared
+                .mem
                 .heap
                 .set_field(mirror, 0, Value::Int(sid.as_u32() as i32));
 
@@ -46198,7 +46640,7 @@ mod tests {
         .unwrap();
         if let Value::Object(Some(s)) = ts {
             assert_eq!(
-                read_java_string(&shared.heap, s).unwrap(),
+                read_java_string(&shared.mem.heap, s).unwrap(),
                 "MethodHandles.Lookup"
             );
         }
@@ -46208,7 +46650,7 @@ mod tests {
     fn scheduled_executor_basic_p63() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let ex = shared.heap.alloc_object(ClassId::new(0), 3);
+        let ex = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -46246,7 +46688,7 @@ mod tests {
     fn scheduled_executor_shutdown_p63() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let ex = shared.heap.alloc_object(ClassId::new(0), 3);
+        let ex = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -46311,7 +46753,7 @@ mod tests {
     fn formatter_out_p63() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let fmt = shared.heap.alloc_object(ClassId::new(0), 2);
+        let fmt = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -46440,7 +46882,7 @@ mod tests {
     fn scheduled_executor_shutdownnow_p63() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let ex = shared.heap.alloc_object(ClassId::new(0), 3);
+        let ex = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -46480,7 +46922,7 @@ mod tests {
     fn arraylist_get_first_last_p64() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let al = shared.heap.alloc_object(ClassId::new(0), 2);
+        let al = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -46547,7 +46989,7 @@ mod tests {
     fn arraylist_get_first_empty_throws_p64() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let al = shared.heap.alloc_object(ClassId::new(0), 2);
+        let al = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -46597,7 +47039,7 @@ mod tests {
             .unwrap()
             .unwrap();
             if let Value::Object(Some(s)) = hex {
-                assert_eq!(read_java_string(&shared.heap, s).unwrap(), "ab");
+                assert_eq!(read_java_string(&shared.mem.heap, s).unwrap(), "ab");
             }
         }
     }
@@ -46618,11 +47060,13 @@ mod tests {
         .unwrap();
         // formatHex([0x01, 0x02, 0xff])
         let arr = shared
+            .mem
             .heap
             .alloc_array(ClassId::new(0), ArrayElementType::Byte, 3);
-        let _ = shared.heap.set_array_element(arr, 0, Value::Int(0x01));
-        let _ = shared.heap.set_array_element(arr, 1, Value::Int(0x02));
+        let _ = shared.mem.heap.set_array_element(arr, 0, Value::Int(0x01));
+        let _ = shared.mem.heap.set_array_element(arr, 1, Value::Int(0x02));
         let _ = shared
+            .mem
             .heap
             .set_array_element(arr, 2, Value::Int(0xFF_u8 as i32));
         let hex = call_native(
@@ -46636,7 +47080,7 @@ mod tests {
         .unwrap()
         .unwrap();
         if let Value::Object(Some(s)) = hex {
-            assert_eq!(read_java_string(&shared.heap, s).unwrap(), "0102ff");
+            assert_eq!(read_java_string(&shared.mem.heap, s).unwrap(), "0102ff");
         }
         // parseHex back
         let hex_str = create_java_string(&shared, "0102ff");
@@ -46651,9 +47095,18 @@ mod tests {
         .unwrap()
         .unwrap();
         if let Value::Object(Some(p)) = parsed {
-            assert_eq!(shared.heap.get_array_element(p, 0).unwrap(), Value::Int(1));
-            assert_eq!(shared.heap.get_array_element(p, 1).unwrap(), Value::Int(2));
-            assert_eq!(shared.heap.get_array_element(p, 2).unwrap(), Value::Int(-1));
+            assert_eq!(
+                shared.mem.heap.get_array_element(p, 0).unwrap(),
+                Value::Int(1)
+            );
+            assert_eq!(
+                shared.mem.heap.get_array_element(p, 1).unwrap(),
+                Value::Int(2)
+            );
+            assert_eq!(
+                shared.mem.heap.get_array_element(p, 2).unwrap(),
+                Value::Int(-1)
+            );
             // 0xFF = -1 as signed byte
         }
     }
@@ -46720,13 +47173,17 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
         // Create a stream with 3 elements
         let arr = shared
+            .mem
             .heap
             .alloc_array(ClassId::new(0), ArrayElementType::Reference, 3);
-        let _ = shared.heap.set_array_element(arr, 0, Value::Int(1));
-        let _ = shared.heap.set_array_element(arr, 1, Value::Int(2));
-        let _ = shared.heap.set_array_element(arr, 2, Value::Int(3));
-        let stream = shared.heap.alloc_object(ClassId::new(0), 1);
-        shared.heap.set_field(stream, 0, Value::Object(Some(arr)));
+        let _ = shared.mem.heap.set_array_element(arr, 0, Value::Int(1));
+        let _ = shared.mem.heap.set_array_element(arr, 1, Value::Int(2));
+        let _ = shared.mem.heap.set_array_element(arr, 2, Value::Int(3));
+        let stream = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        shared
+            .mem
+            .heap
+            .set_field(stream, 0, Value::Object(Some(arr)));
         let list = call_native(
             &shared,
             &mut thread,
@@ -46790,18 +47247,20 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
         // Create two streams
         let arr1 = shared
+            .mem
             .heap
             .alloc_array(ClassId::new(0), ArrayElementType::Reference, 2);
-        let _ = shared.heap.set_array_element(arr1, 0, Value::Int(1));
-        let _ = shared.heap.set_array_element(arr1, 1, Value::Int(2));
-        let s1 = shared.heap.alloc_object(ClassId::new(0), 1);
-        shared.heap.set_field(s1, 0, Value::Object(Some(arr1)));
+        let _ = shared.mem.heap.set_array_element(arr1, 0, Value::Int(1));
+        let _ = shared.mem.heap.set_array_element(arr1, 1, Value::Int(2));
+        let s1 = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        shared.mem.heap.set_field(s1, 0, Value::Object(Some(arr1)));
         let arr2 = shared
+            .mem
             .heap
             .alloc_array(ClassId::new(0), ArrayElementType::Reference, 1);
-        let _ = shared.heap.set_array_element(arr2, 0, Value::Int(3));
-        let s2 = shared.heap.alloc_object(ClassId::new(0), 1);
-        shared.heap.set_field(s2, 0, Value::Object(Some(arr2)));
+        let _ = shared.mem.heap.set_array_element(arr2, 0, Value::Int(3));
+        let s2 = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        shared.mem.heap.set_field(s2, 0, Value::Object(Some(arr2)));
         let result = call_native(
             &shared,
             &mut thread,
@@ -46942,7 +47401,10 @@ mod tests {
         .unwrap()
         .unwrap();
         if let Value::Object(Some(s)) = result {
-            assert_eq!(read_java_string(&shared.heap, s).unwrap(), "hello\nworld");
+            assert_eq!(
+                read_java_string(&shared.mem.heap, s).unwrap(),
+                "hello\nworld"
+            );
         } else {
             panic!("expected string");
         }
@@ -46965,7 +47427,7 @@ mod tests {
         .unwrap();
         if let Value::Object(Some(s)) = result {
             assert_eq!(
-                read_java_string(&shared.heap, s).unwrap(),
+                read_java_string(&shared.mem.heap, s).unwrap(),
                 "hello\nworld\ttab"
             );
         } else {
@@ -47034,7 +47496,7 @@ mod tests {
     fn sequenced_collection_interface_p64() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let al = shared.heap.alloc_object(ClassId::new(0), 2);
+        let al = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -47075,7 +47537,7 @@ mod tests {
     fn priority_blocking_queue_basic_p65() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let pbq = shared.heap.alloc_object(ClassId::new(0), 3);
+        let pbq = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -47141,7 +47603,7 @@ mod tests {
     fn priority_blocking_queue_min_heap_p65() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let pbq = shared.heap.alloc_object(ClassId::new(0), 3);
+        let pbq = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -47230,7 +47692,7 @@ mod tests {
     fn delay_queue_basic_p65() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let dq = shared.heap.alloc_object(ClassId::new(0), 2);
+        let dq = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -47297,7 +47759,7 @@ mod tests {
     fn completion_service_basic_p65() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let ecs = shared.heap.alloc_object(ClassId::new(0), 2);
+        let ecs = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -47376,7 +47838,7 @@ mod tests {
     fn datetime_formatter_builder_p65() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let builder = shared.heap.alloc_object(ClassId::new(0), 2);
+        let builder = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -47427,7 +47889,7 @@ mod tests {
         .unwrap()
         .unwrap();
         if let Value::Object(Some(arr)) = vals {
-            let len = shared.heap.array_length(arr);
+            let len = shared.mem.heap.array_length(arr);
             assert_eq!(len, 4);
         } else {
             panic!("expected array");
@@ -47438,7 +47900,7 @@ mod tests {
     fn checked_collections_p65() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let al = shared.heap.alloc_object(ClassId::new(0), 2);
+        let al = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -47466,7 +47928,7 @@ mod tests {
     fn unmodifiable_sequenced_p65() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let al = shared.heap.alloc_object(ClassId::new(0), 2);
+        let al = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -47494,10 +47956,13 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
         // Create a Pattern object (2-field: source, flags)
-        let pat = shared.heap.alloc_object(ClassId::new(0), 2);
+        let pat = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         let source = create_java_string(&shared, ",");
-        shared.heap.set_field(pat, 0, Value::Object(Some(source)));
-        shared.heap.set_field(pat, 1, Value::Int(0));
+        shared
+            .mem
+            .heap
+            .set_field(pat, 0, Value::Object(Some(source)));
+        shared.mem.heap.set_field(pat, 1, Value::Int(0));
         let input = create_java_string(&shared, "a,b,c");
         let stream = call_native(
             &shared,
@@ -47787,10 +48252,10 @@ mod tests {
         // request with "WatchService is closed" when slot 2 (open) isn't
         // Int(1), so we must initialize the object to match the native
         // layout even though we never actually register a directory.
-        let ws_obj = shared.heap.alloc_object(ClassId::new(0), 3);
-        shared.heap.set_field(ws_obj, 0, Value::Object(None)); // regs
-        shared.heap.set_field(ws_obj, 1, Value::Int(0)); // count
-        shared.heap.set_field(ws_obj, 2, Value::Int(1)); // open = true
+        let ws_obj = shared.mem.heap.alloc_object(ClassId::new(0), 3);
+        shared.mem.heap.set_field(ws_obj, 0, Value::Object(None)); // regs
+        shared.mem.heap.set_field(ws_obj, 1, Value::Int(0)); // count
+        shared.mem.heap.set_field(ws_obj, 2, Value::Int(1)); // open = true
 
         // poll returns None (no events РІР‚вЂќ no directory registered)
         let key = call_native(
@@ -47850,7 +48315,7 @@ mod tests {
             .unwrap()
             .unwrap();
             if let Value::Object(Some(s)) = dn {
-                let text = read_java_string(&shared.heap, s).unwrap();
+                let text = read_java_string(&shared.mem.heap, s).unwrap();
                 assert_eq!(text, "java.lang.String");
             }
 
@@ -47914,7 +48379,7 @@ mod tests {
             .unwrap()
             .unwrap();
             if let Value::Object(Some(s)) = dn {
-                let text = read_java_string(&shared.heap, s).unwrap();
+                let text = read_java_string(&shared.mem.heap, s).unwrap();
                 assert_eq!(text, "com.example.MyClass");
             }
         }
@@ -48021,7 +48486,7 @@ mod tests {
         let pr = "java/io/PushbackReader";
 
         // Create PushbackReader (3-field synthetic)
-        let obj = shared.heap.alloc_object(ClassId::new(0), 3);
+        let obj = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -48101,7 +48566,7 @@ mod tests {
         let pr = "java/io/PushbackReader";
 
         // Create with buffer size 1
-        let obj = shared.heap.alloc_object(ClassId::new(0), 3);
+        let obj = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -48172,7 +48637,7 @@ mod tests {
         .unwrap()
         .unwrap();
         if let Value::Object(Some(s)) = create {
-            let text = read_java_string(&shared.heap, s).unwrap();
+            let text = read_java_string(&shared.mem.heap, s).unwrap();
             assert_eq!(text, "ENTRY_CREATE");
         }
 
@@ -48239,7 +48704,7 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
         let sts = "jdk/incubator/concurrent/StructuredTaskScope";
 
-        let obj = shared.heap.alloc_object(ClassId::new(0), 3);
+        let obj = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -48685,7 +49150,7 @@ mod tests {
             .unwrap()
             .unwrap();
             if let Value::Object(Some(s)) = result {
-                let txt = read_java_string(&shared.heap, s).unwrap();
+                let txt = read_java_string(&shared.mem.heap, s).unwrap();
                 assert_eq!(txt, "Hello World");
             }
         }
@@ -48711,15 +49176,15 @@ mod tests {
         let pt = "java/lang/reflect/ParameterizedType";
 
         // Create a synthetic ParameterizedType
-        let obj = shared.heap.alloc_object(ClassId::new(0), 2);
-        let raw = shared.heap.alloc_object(ClassId::new(0), 0); // mock raw type
-        shared.heap.set_field(obj, 0, Value::Object(Some(raw)));
-        let arr = shared.heap.alloc_array(
+        let obj = shared.mem.heap.alloc_object(ClassId::new(0), 2);
+        let raw = shared.mem.heap.alloc_object(ClassId::new(0), 0); // mock raw type
+        shared.mem.heap.set_field(obj, 0, Value::Object(Some(raw)));
+        let arr = shared.mem.heap.alloc_array(
             ClassId::new(0),
             crate::memory::heap::ArrayElementType::Reference,
             1,
         );
-        shared.heap.set_field(obj, 1, Value::Object(Some(arr)));
+        shared.mem.heap.set_field(obj, 1, Value::Object(Some(arr)));
 
         let raw_type = call_native(
             &shared,
@@ -48871,7 +49336,7 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
         let sos = "jdk/incubator/concurrent/StructuredTaskScope$ShutdownOnSuccess";
 
-        let obj = shared.heap.alloc_object(ClassId::new(0), 3);
+        let obj = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -49036,7 +49501,7 @@ mod tests {
             .unwrap()
             .unwrap();
             if let Value::Object(Some(s)) = alg {
-                let text = read_java_string(&shared.heap, s).unwrap();
+                let text = read_java_string(&shared.mem.heap, s).unwrap();
                 assert_eq!(text, "HmacSHA256");
             }
         }
@@ -49074,7 +49539,7 @@ mod tests {
             .unwrap()
             .unwrap();
             if let Value::Object(Some(s)) = proto {
-                let text = read_java_string(&shared.heap, s).unwrap();
+                let text = read_java_string(&shared.mem.heap, s).unwrap();
                 assert_eq!(text, "TLSv1.3");
             }
 
@@ -49110,7 +49575,7 @@ mod tests {
         .unwrap()
         .unwrap();
         if let Value::Object(Some(s)) = alg {
-            let text = read_java_string(&shared.heap, s).unwrap();
+            let text = read_java_string(&shared.mem.heap, s).unwrap();
             assert_eq!(text, "PKIX");
         }
 
@@ -49183,7 +49648,7 @@ mod tests {
             .unwrap()
             .unwrap();
             if let Value::Object(Some(s)) = sig {
-                let text = read_java_string(&shared.heap, s).unwrap();
+                let text = read_java_string(&shared.mem.heap, s).unwrap();
                 assert_eq!(text, "SHA256withRSA");
             }
         }
@@ -49478,9 +49943,9 @@ mod tests {
                 //   4 = enabled_cipher_suites, 5 = handshake_status,
                 //   6 = session. We allocate 8 slots to stay forward
                 //   compatible with future layout growth.
-                let test_eng = shared.heap.alloc_object(ClassId::new(0), 8);
-                shared.heap.set_field(test_eng, 0, Value::Int(1)); // client_mode
-                shared.heap.set_field(test_eng, 5, Value::Int(0)); // handshake_status = NOT_HANDSHAKING
+                let test_eng = shared.mem.heap.alloc_object(ClassId::new(0), 8);
+                shared.mem.heap.set_field(test_eng, 0, Value::Int(1)); // client_mode
+                shared.mem.heap.set_field(test_eng, 5, Value::Int(0)); // handshake_status = NOT_HANDSHAKING
 
                 // setUseClientMode on the directly-allocated engine
                 call_native(
@@ -49505,7 +49970,7 @@ mod tests {
                 .unwrap();
 
                 // Verify handshake status was set to NEED_WRAP (client mode)
-                let hs = shared.heap.get_field(test_eng, 5); // handshake_status
+                let hs = shared.mem.heap.get_field(test_eng, 5); // handshake_status
                 assert_eq!(hs, Value::Int(1)); // HS_NEED_WRAP
                 let _ = eng; // original engine from createSSLEngine also valid
             }
@@ -49572,21 +50037,22 @@ mod tests {
         let sp = "java/util/Spliterator";
 
         // Create spliterator with 3 elements
-        let arr = shared.heap.alloc_array(
+        let arr = shared.mem.heap.alloc_array(
             ClassId::new(0),
             crate::memory::heap::ArrayElementType::Reference,
             3,
         );
         for i in 0..3 {
             let _ = shared
+                .mem
                 .heap
                 .set_array_element(arr, i, Value::Int((i + 1) as i32));
         }
 
-        let obj = shared.heap.alloc_object(ClassId::new(0), 3);
-        shared.heap.set_field(obj, 0, Value::Object(Some(arr)));
-        shared.heap.set_field(obj, 1, Value::Int(0));
-        shared.heap.set_field(obj, 2, Value::Int(3));
+        let obj = shared.mem.heap.alloc_object(ClassId::new(0), 3);
+        shared.mem.heap.set_field(obj, 0, Value::Object(Some(arr)));
+        shared.mem.heap.set_field(obj, 1, Value::Int(0));
+        shared.mem.heap.set_field(obj, 2, Value::Int(3));
 
         // estimateSize
         let sz = call_native(
@@ -49667,15 +50133,15 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // Create a spliterator
-        let arr = shared.heap.alloc_array(
+        let arr = shared.mem.heap.alloc_array(
             ClassId::new(0),
             crate::memory::heap::ArrayElementType::Reference,
             2,
         );
-        let sp = shared.heap.alloc_object(ClassId::new(0), 3);
-        shared.heap.set_field(sp, 0, Value::Object(Some(arr)));
-        shared.heap.set_field(sp, 1, Value::Int(0));
-        shared.heap.set_field(sp, 2, Value::Int(2));
+        let sp = shared.mem.heap.alloc_object(ClassId::new(0), 3);
+        shared.mem.heap.set_field(sp, 0, Value::Object(Some(arr)));
+        shared.mem.heap.set_field(sp, 1, Value::Int(0));
+        shared.mem.heap.set_field(sp, 2, Value::Int(2));
 
         // stream from spliterator
         let stream = call_native(
@@ -49767,7 +50233,7 @@ mod tests {
             .unwrap()
             .unwrap();
             if let Value::Object(Some(s)) = result {
-                let text = read_java_string(&shared.heap, s).unwrap();
+                let text = read_java_string(&shared.mem.heap, s).unwrap();
                 assert_eq!(text, "1K");
             }
 
@@ -49788,7 +50254,7 @@ mod tests {
             .unwrap()
             .unwrap();
             if let Value::Object(Some(s)) = result2 {
-                let text = read_java_string(&shared.heap, s).unwrap();
+                let text = read_java_string(&shared.mem.heap, s).unwrap();
                 assert_eq!(text, "2M");
             }
         }
@@ -49800,7 +50266,7 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
         let sp = "java/util/concurrent/SubmissionPublisher";
 
-        let obj = shared.heap.alloc_object(ClassId::new(0), 3);
+        let obj = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -50090,7 +50556,7 @@ mod tests {
         .unwrap()
         .unwrap();
         if let Value::Object(Some(sref)) = s {
-            let text = read_java_string(&shared.heap, sref).unwrap();
+            let text = read_java_string(&shared.mem.heap, sref).unwrap();
             assert_eq!(text, "42ms");
         } else {
             panic!("Expected string");
@@ -50116,7 +50582,7 @@ mod tests {
 
         // Check ordinal = 0 (OWNER_READ)
         if let Value::Object(Some(obj)) = perm {
-            let ordinal = shared.heap.get_field(obj, 1);
+            let ordinal = shared.mem.heap.get_field(obj, 1);
             assert_eq!(ordinal, Value::Int(0));
         }
     }
@@ -50137,7 +50603,7 @@ mod tests {
         .unwrap()
         .unwrap();
         if let Value::Object(Some(sref)) = s {
-            let text = read_java_string(&shared.heap, sref).unwrap();
+            let text = read_java_string(&shared.mem.heap, sref).unwrap();
             assert_eq!(text, "rwxr-xr-x");
         } else {
             panic!("Expected string");
@@ -50149,7 +50615,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let gis = shared.heap.alloc_object(ClassId::new(0), 2);
+        let gis = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -50192,7 +50658,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let gos = shared.heap.alloc_object(ClassId::new(0), 2);
+        let gos = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -50238,7 +50704,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let oos = shared.heap.alloc_object(ClassId::new(0), 6);
+        let oos = shared.mem.heap.alloc_object(ClassId::new(0), 6);
         call_native(
             &shared,
             &mut thread,
@@ -50295,7 +50761,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let ois = shared.heap.alloc_object(ClassId::new(0), 6);
+        let ois = shared.mem.heap.alloc_object(ClassId::new(0), 6);
         call_native(
             &shared,
             &mut thread,
@@ -50362,7 +50828,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let acc = shared.heap.alloc_object(ClassId::new(0), 2);
+        let acc = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -50439,7 +50905,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let acc = shared.heap.alloc_object(ClassId::new(0), 2);
+        let acc = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -50512,7 +50978,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let adder = shared.heap.alloc_object(ClassId::new(0), 1);
+        let adder = shared.mem.heap.alloc_object(ClassId::new(0), 1);
         call_native(
             &shared,
             &mut thread,
@@ -50649,7 +51115,7 @@ mod tests {
         .unwrap()
         .unwrap();
         if let Value::Object(Some(s)) = r {
-            assert_eq!(read_java_string(&shared.heap, s).unwrap(), "101010");
+            assert_eq!(read_java_string(&shared.mem.heap, s).unwrap(), "101010");
         } else {
             panic!("Expected string");
         }
@@ -50671,7 +51137,7 @@ mod tests {
         .unwrap()
         .unwrap();
         if let Value::Object(Some(s)) = r {
-            assert_eq!(read_java_string(&shared.heap, s).unwrap(), "377");
+            assert_eq!(read_java_string(&shared.mem.heap, s).unwrap(), "377");
         } else {
             panic!("Expected string");
         }
@@ -50798,7 +51264,7 @@ mod tests {
         .unwrap()
         .unwrap();
         if let Value::Object(Some(s)) = r {
-            assert_eq!(read_java_string(&shared.heap, s).unwrap(), "11111111");
+            assert_eq!(read_java_string(&shared.mem.heap, s).unwrap(), "11111111");
         } else {
             panic!("Expected string");
         }
@@ -50890,15 +51356,15 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let a = shared.heap.alloc_object(ClassId::new(0), 2);
+        let a = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         let a_s = create_java_string(&shared, "12");
-        shared.heap.set_field(a, 0, Value::Object(Some(a_s)));
-        shared.heap.set_field(a, 1, Value::Int(1));
+        shared.mem.heap.set_field(a, 0, Value::Object(Some(a_s)));
+        shared.mem.heap.set_field(a, 1, Value::Int(1));
 
-        let b = shared.heap.alloc_object(ClassId::new(0), 2);
+        let b = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         let b_s = create_java_string(&shared, "8");
-        shared.heap.set_field(b, 0, Value::Object(Some(b_s)));
-        shared.heap.set_field(b, 1, Value::Int(1));
+        shared.mem.heap.set_field(b, 0, Value::Object(Some(b_s)));
+        shared.mem.heap.set_field(b, 1, Value::Int(1));
 
         let result = call_native(
             &shared,
@@ -50911,9 +51377,9 @@ mod tests {
         .unwrap()
         .unwrap();
         if let Value::Object(Some(r)) = result {
-            let val_str = shared.heap.get_field(r, 0);
+            let val_str = shared.mem.heap.get_field(r, 0);
             if let Value::Object(Some(s)) = val_str {
-                assert_eq!(read_java_string(&shared.heap, s).unwrap(), "4");
+                assert_eq!(read_java_string(&shared.mem.heap, s).unwrap(), "4");
             } else {
                 panic!("Expected BigInteger value string");
             }
@@ -50927,10 +51393,10 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let a = shared.heap.alloc_object(ClassId::new(0), 2);
+        let a = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         let a_s = create_java_string(&shared, "1");
-        shared.heap.set_field(a, 0, Value::Object(Some(a_s)));
-        shared.heap.set_field(a, 1, Value::Int(1));
+        shared.mem.heap.set_field(a, 0, Value::Object(Some(a_s)));
+        shared.mem.heap.set_field(a, 1, Value::Int(1));
 
         let result = call_native(
             &shared,
@@ -50943,9 +51409,9 @@ mod tests {
         .unwrap()
         .unwrap();
         if let Value::Object(Some(r)) = result {
-            let val_str = shared.heap.get_field(r, 0);
+            let val_str = shared.mem.heap.get_field(r, 0);
             if let Value::Object(Some(s)) = val_str {
-                assert_eq!(read_java_string(&shared.heap, s).unwrap(), "1024");
+                assert_eq!(read_java_string(&shared.mem.heap, s).unwrap(), "1024");
             } else {
                 panic!("Expected BigInteger value string");
             }
@@ -50959,10 +51425,10 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let a = shared.heap.alloc_object(ClassId::new(0), 2);
+        let a = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         let a_s = create_java_string(&shared, "12"); // 1100
-        shared.heap.set_field(a, 0, Value::Object(Some(a_s)));
-        shared.heap.set_field(a, 1, Value::Int(1));
+        shared.mem.heap.set_field(a, 0, Value::Object(Some(a_s)));
+        shared.mem.heap.set_field(a, 1, Value::Int(1));
 
         // testBit(2) should be true (bit 2 of 12 = 1100 is 1)
         let bit = call_native(
@@ -51023,7 +51489,7 @@ mod tests {
         assert!(matches!(state, Value::Object(Some(_))));
         if let Value::Object(Some(obj)) = state {
             // ordinal should be 1 (RUNNABLE)
-            assert_eq!(shared.heap.get_field(obj, 1), Value::Int(1));
+            assert_eq!(shared.mem.heap.get_field(obj, 1), Value::Int(1));
         }
     }
 
@@ -51032,7 +51498,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let tg = shared.heap.alloc_object(ClassId::new(0), 3);
+        let tg = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         let name = create_java_string(&shared, "test-group");
         call_native(
             &shared,
@@ -51055,7 +51521,7 @@ mod tests {
         .unwrap()
         .unwrap();
         if let Value::Object(Some(s)) = n {
-            assert_eq!(read_java_string(&shared.heap, s).unwrap(), "test-group");
+            assert_eq!(read_java_string(&shared.mem.heap, s).unwrap(), "test-group");
         } else {
             panic!("Expected name string");
         }
@@ -51078,7 +51544,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let ad = shared.heap.alloc_object(ClassId::new(0), 1);
+        let ad = shared.mem.heap.alloc_object(ClassId::new(0), 1);
         call_native(
             &shared,
             &mut thread,
@@ -51155,7 +51621,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let defl = shared.heap.alloc_object(ClassId::new(0), 4);
+        let defl = shared.mem.heap.alloc_object(ClassId::new(0), 4);
         call_native(
             &shared,
             &mut thread,
@@ -51234,7 +51700,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let zf = shared.heap.alloc_object(ClassId::new(0), 2);
+        let zf = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         let name = create_java_string(&shared, &zip_path_str);
         call_native(
             &shared,
@@ -51257,7 +51723,7 @@ mod tests {
         .unwrap()
         .unwrap();
         if let Value::Object(Some(s)) = n {
-            assert_eq!(read_java_string(&shared.heap, s).unwrap(), zip_path_str);
+            assert_eq!(read_java_string(&shared.mem.heap, s).unwrap(), zip_path_str);
         } else {
             panic!("Expected name");
         }
@@ -51340,7 +51806,7 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // Manually create a Preferences with a HashMap backing store
-        let map = shared.heap.alloc_object(ClassId::new(0), 3);
+        let map = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -51351,12 +51817,14 @@ mod tests {
         )
         .unwrap();
 
-        let prefs_ref = shared.heap.alloc_object(ClassId::new(0), 2);
+        let prefs_ref = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         shared
+            .mem
             .heap
             .set_field(prefs_ref, 0, Value::Object(Some(map)));
         let name_s = create_java_string(&shared, "");
         shared
+            .mem
             .heap
             .set_field(prefs_ref, 1, Value::Object(Some(name_s)));
 
@@ -51393,7 +51861,7 @@ mod tests {
         .unwrap()
         .unwrap();
         let s = match result {
-            Value::Object(Some(o)) => read_java_string(&shared.heap, o).unwrap(),
+            Value::Object(Some(o)) => read_java_string(&shared.mem.heap, o).unwrap(),
             _ => panic!("expected string: got {:?}", result),
         };
         assert_eq!(s, "myValue");
@@ -51415,7 +51883,7 @@ mod tests {
         .unwrap()
         .unwrap();
         let s2 = match result2 {
-            Value::Object(Some(o)) => read_java_string(&shared.heap, o).unwrap(),
+            Value::Object(Some(o)) => read_java_string(&shared.mem.heap, o).unwrap(),
             _ => panic!("expected string: got {:?}", result2),
         };
         assert_eq!(s2, "default");
@@ -51426,7 +51894,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let prefs_ref = shared.heap.alloc_object(ClassId::new(0), 2);
+        let prefs_ref = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -51506,7 +51974,7 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // Manually create Preferences with HashMap
-        let map = shared.heap.alloc_object(ClassId::new(0), 3);
+        let map = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -51516,12 +51984,14 @@ mod tests {
             &[Value::Object(Some(map))],
         )
         .unwrap();
-        let prefs_ref = shared.heap.alloc_object(ClassId::new(0), 2);
+        let prefs_ref = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         shared
+            .mem
             .heap
             .set_field(prefs_ref, 0, Value::Object(Some(map)));
         let name_s = create_java_string(&shared, "");
         shared
+            .mem
             .heap
             .set_field(prefs_ref, 1, Value::Object(Some(name_s)));
 
@@ -51568,7 +52038,7 @@ mod tests {
         .unwrap()
         .unwrap();
         let s = match result {
-            Value::Object(Some(o)) => read_java_string(&shared.heap, o).unwrap(),
+            Value::Object(Some(o)) => read_java_string(&shared.mem.heap, o).unwrap(),
             _ => panic!("expected string: got {:?}", result),
         };
         assert_eq!(s, "gone");
@@ -51579,7 +52049,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let pce = shared.heap.alloc_object(ClassId::new(0), 4);
+        let pce = shared.mem.heap.alloc_object(ClassId::new(0), 4);
         let source = create_java_string(&shared, "src");
         let name = create_java_string(&shared, "color");
         let old_val = create_java_string(&shared, "red");
@@ -51612,7 +52082,7 @@ mod tests {
         .unwrap()
         .unwrap();
         let pname = match gn {
-            Value::Object(Some(o)) => read_java_string(&shared.heap, o).unwrap(),
+            Value::Object(Some(o)) => read_java_string(&shared.mem.heap, o).unwrap(),
             _ => panic!("expected string"),
         };
         assert_eq!(pname, "color");
@@ -51628,7 +52098,7 @@ mod tests {
         .unwrap()
         .unwrap();
         let oval = match go {
-            Value::Object(Some(o)) => read_java_string(&shared.heap, o).unwrap(),
+            Value::Object(Some(o)) => read_java_string(&shared.mem.heap, o).unwrap(),
             _ => panic!("expected string"),
         };
         assert_eq!(oval, "red");
@@ -51644,7 +52114,7 @@ mod tests {
         .unwrap()
         .unwrap();
         let nval = match gnv {
-            Value::Object(Some(o)) => read_java_string(&shared.heap, o).unwrap(),
+            Value::Object(Some(o)) => read_java_string(&shared.mem.heap, o).unwrap(),
             _ => panic!("expected string"),
         };
         assert_eq!(nval, "blue");
@@ -51655,7 +52125,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let pcs = shared.heap.alloc_object(ClassId::new(0), 2);
+        let pcs = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         let source = create_java_string(&shared, "bean");
         call_native(
             &shared,
@@ -51681,7 +52151,7 @@ mod tests {
         assert_eq!(hl, Value::Int(0));
 
         // add a listener (just a dummy object)
-        let listener = shared.heap.alloc_object(ClassId::new(0), 0);
+        let listener = shared.mem.heap.alloc_object(ClassId::new(0), 0);
         call_native(
             &shared,
             &mut thread,
@@ -51722,7 +52192,7 @@ mod tests {
         .unwrap()
         .unwrap();
         let r1s = match r1 {
-            Value::Object(Some(o)) => read_java_string(&shared.heap, o).unwrap(),
+            Value::Object(Some(o)) => read_java_string(&shared.mem.heap, o).unwrap(),
             _ => panic!("expected string"),
         };
         assert_eq!(r1s, "fooBar");
@@ -51740,7 +52210,7 @@ mod tests {
         .unwrap()
         .unwrap();
         let r2s = match r2 {
-            Value::Object(Some(o)) => read_java_string(&shared.heap, o).unwrap(),
+            Value::Object(Some(o)) => read_java_string(&shared.mem.heap, o).unwrap(),
             _ => panic!("expected string"),
         };
         assert_eq!(r2s, "URL");
@@ -51751,7 +52221,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let ic = shared.heap.alloc_object(ClassId::new(0), 2);
+        let ic = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -51789,7 +52259,7 @@ mod tests {
         .unwrap()
         .unwrap();
         let rs = match result {
-            Value::Object(Some(o)) => read_java_string(&shared.heap, o).unwrap(),
+            Value::Object(Some(o)) => read_java_string(&shared.mem.heap, o).unwrap(),
             _ => panic!("expected string"),
         };
         assert_eq!(rs, "datasource");
@@ -51824,8 +52294,8 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let dp = shared.heap.alloc_object(ClassId::new(0), 4);
-        let data = shared.heap.alloc_array(
+        let dp = shared.mem.heap.alloc_object(ClassId::new(0), 4);
+        let data = shared.mem.heap.alloc_array(
             ClassId::new(0),
             crate::memory::heap::ArrayElementType::Byte,
             10,
@@ -51883,7 +52353,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let ds = shared.heap.alloc_object(ClassId::new(0), 3);
+        let ds = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -51987,7 +52457,7 @@ mod tests {
         .unwrap()
         .unwrap();
         let ps = match gp {
-            Value::Object(Some(o)) => read_java_string(&shared.heap, o).unwrap(),
+            Value::Object(Some(o)) => read_java_string(&shared.mem.heap, o).unwrap(),
             _ => panic!("expected string"),
         };
         assert_eq!(ps, "/api/test");
@@ -52018,7 +52488,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let ss = shared.heap.alloc_object(ClassId::new(0), 4);
+        let ss = shared.mem.heap.alloc_object(ClassId::new(0), 4);
         call_native(
             &shared,
             &mut thread,
@@ -52085,7 +52555,7 @@ mod tests {
         .unwrap()
         .unwrap();
         let tss = match ts {
-            Value::Object(Some(o)) => read_java_string(&shared.heap, o).unwrap(),
+            Value::Object(Some(o)) => read_java_string(&shared.mem.heap, o).unwrap(),
             _ => panic!("expected string"),
         };
         assert!(tss.contains("8080"));
@@ -52096,7 +52566,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let ms = shared.heap.alloc_object(ClassId::new(0), 3);
+        let ms = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -52135,7 +52605,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let hd = shared.heap.alloc_object(ClassId::new(0), 3);
+        let hd = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -52164,7 +52634,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let exc = shared.heap.alloc_object(ClassId::new(0), 2);
+        let exc = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         let msg_str = create_java_string(&shared, "name not found");
         call_native(
             &shared,
@@ -52187,7 +52657,7 @@ mod tests {
         .unwrap()
         .unwrap();
         let ms = match msg {
-            Value::Object(Some(o)) => read_java_string(&shared.heap, o).unwrap(),
+            Value::Object(Some(o)) => read_java_string(&shared.mem.heap, o).unwrap(),
             _ => panic!("expected string"),
         };
         assert_eq!(ms, "name not found");
@@ -52198,7 +52668,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let prefs_ref = shared.heap.alloc_object(ClassId::new(0), 2);
+        let prefs_ref = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -52239,7 +52709,7 @@ mod tests {
         .unwrap()
         .unwrap();
         let ns = match n {
-            Value::Object(Some(o)) => read_java_string(&shared.heap, o).unwrap(),
+            Value::Object(Some(o)) => read_java_string(&shared.mem.heap, o).unwrap(),
             _ => panic!("expected string"),
         };
         assert_eq!(ns, "myNode");
@@ -52255,7 +52725,7 @@ mod tests {
         .unwrap()
         .unwrap();
         let tss = match ts {
-            Value::Object(Some(o)) => read_java_string(&shared.heap, o).unwrap(),
+            Value::Object(Some(o)) => read_java_string(&shared.mem.heap, o).unwrap(),
             _ => panic!("expected string"),
         };
         assert!(tss.contains("myNode"));
@@ -52268,33 +52738,39 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         // Allocate Object[3] and store object references
         let arr = shared
+            .mem
             .heap
             .alloc_array(ClassId::new(0), ArrayElementType::Reference, 3);
-        let obj0 = shared.heap.alloc_object(ClassId::new(1), 1);
-        shared.heap.set_field(obj0, 0, Value::Int(42));
-        let obj1 = shared.heap.alloc_object(ClassId::new(2), 1);
-        shared.heap.set_field(obj1, 0, Value::Int(99));
+        let obj0 = shared.mem.heap.alloc_object(ClassId::new(1), 1);
+        shared.mem.heap.set_field(obj0, 0, Value::Int(42));
+        let obj1 = shared.mem.heap.alloc_object(ClassId::new(2), 1);
+        shared.mem.heap.set_field(obj1, 0, Value::Int(99));
 
         let _ = shared
+            .mem
             .heap
             .set_array_element(arr, 0, Value::Object(Some(obj0)));
-        let _ = shared.heap.set_array_element(arr, 1, Value::Object(None));
         let _ = shared
+            .mem
+            .heap
+            .set_array_element(arr, 1, Value::Object(None));
+        let _ = shared
+            .mem
             .heap
             .set_array_element(arr, 2, Value::Object(Some(obj1)));
 
         // Read back
-        let v0 = shared.heap.get_array_element(arr, 0).unwrap();
-        let v1 = shared.heap.get_array_element(arr, 1).unwrap();
-        let v2 = shared.heap.get_array_element(arr, 2).unwrap();
+        let v0 = shared.mem.heap.get_array_element(arr, 0).unwrap();
+        let v1 = shared.mem.heap.get_array_element(arr, 1).unwrap();
+        let v2 = shared.mem.heap.get_array_element(arr, 2).unwrap();
 
         match v0 {
-            Value::Object(Some(r)) => assert_eq!(shared.heap.get_field(r, 0), Value::Int(42)),
+            Value::Object(Some(r)) => assert_eq!(shared.mem.heap.get_field(r, 0), Value::Int(42)),
             _ => panic!("expected Object(Some) for arr[0]"),
         }
         assert_eq!(v1, Value::Object(None));
         match v2 {
-            Value::Object(Some(r)) => assert_eq!(shared.heap.get_field(r, 0), Value::Int(99)),
+            Value::Object(Some(r)) => assert_eq!(shared.mem.heap.get_field(r, 0), Value::Int(99)),
             _ => panic!("expected Object(Some) for arr[2]"),
         }
     }
@@ -52304,38 +52780,44 @@ mod tests {
         // Storing non-Object values in Reference arrays auto-boxes them
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let arr = shared
+            .mem
             .heap
             .alloc_array(ClassId::new(0), ArrayElementType::Reference, 5);
 
-        let _ = shared.heap.set_array_element(arr, 0, Value::Int(10));
+        let _ = shared.mem.heap.set_array_element(arr, 0, Value::Int(10));
         let _ = shared
+            .mem
             .heap
             .set_array_element(arr, 1, Value::Long(9999999999i64));
-        let _ = shared.heap.set_array_element(arr, 2, Value::Float(3.5));
+        let _ = shared.mem.heap.set_array_element(arr, 2, Value::Float(3.5));
         let _ = shared
+            .mem
             .heap
             .set_array_element(arr, 3, Value::Double(1.23456789012345));
-        let _ = shared.heap.set_array_element(arr, 4, Value::Object(None));
+        let _ = shared
+            .mem
+            .heap
+            .set_array_element(arr, 4, Value::Object(None));
 
         // Read back via unboxing path РІР‚вЂќ auto-unboxing should return original values
         assert_eq!(
-            shared.heap.get_array_element_unboxing(arr, 0).unwrap(),
+            shared.mem.heap.get_array_element_unboxing(arr, 0).unwrap(),
             Value::Int(10)
         );
         assert_eq!(
-            shared.heap.get_array_element_unboxing(arr, 1).unwrap(),
+            shared.mem.heap.get_array_element_unboxing(arr, 1).unwrap(),
             Value::Long(9999999999i64)
         );
         assert_eq!(
-            shared.heap.get_array_element_unboxing(arr, 2).unwrap(),
+            shared.mem.heap.get_array_element_unboxing(arr, 2).unwrap(),
             Value::Float(3.5)
         );
         assert_eq!(
-            shared.heap.get_array_element_unboxing(arr, 3).unwrap(),
+            shared.mem.heap.get_array_element_unboxing(arr, 3).unwrap(),
             Value::Double(1.23456789012345)
         );
         assert_eq!(
-            shared.heap.get_array_element_unboxing(arr, 4).unwrap(),
+            shared.mem.heap.get_array_element_unboxing(arr, 4).unwrap(),
             Value::Object(None)
         );
     }
@@ -52356,32 +52838,36 @@ mod tests {
         // Allocate int[3][3] РІР‚вЂќ outer Object[] with inner int[] arrays
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let outer = shared
+            .mem
             .heap
             .alloc_array(ClassId::new(0), ArrayElementType::Reference, 3);
 
         for row in 0..3 {
             let inner = shared
+                .mem
                 .heap
                 .alloc_array(ClassId::new(0), ArrayElementType::Int, 3);
             for col in 0..3 {
-                let _ =
-                    shared
-                        .heap
-                        .set_array_element(inner, col, Value::Int((row * 3 + col) as i32));
+                let _ = shared.mem.heap.set_array_element(
+                    inner,
+                    col,
+                    Value::Int((row * 3 + col) as i32),
+                );
             }
             let _ = shared
+                .mem
                 .heap
                 .set_array_element(outer, row, Value::Object(Some(inner)));
         }
 
         // Read back the matrix
         for row in 0..3 {
-            let inner = match shared.heap.get_array_element(outer, row).unwrap() {
+            let inner = match shared.mem.heap.get_array_element(outer, row).unwrap() {
                 Value::Object(Some(r)) => r,
                 _ => panic!("expected inner array at row {row}"),
             };
             for col in 0..3 {
-                let v = shared.heap.get_array_element(inner, col).unwrap();
+                let v = shared.mem.heap.get_array_element(inner, col).unwrap();
                 assert_eq!(v, Value::Int((row * 3 + col) as i32));
             }
         }
@@ -52392,14 +52878,16 @@ mod tests {
         // Stress test: Object[1000] filled with references
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let arr = shared
+            .mem
             .heap
             .alloc_array(ClassId::new(0), ArrayElementType::Reference, 1000);
 
         let mut objs = Vec::new();
         for i in 0..1000 {
-            let obj = shared.heap.alloc_object(ClassId::new(1), 1);
-            shared.heap.set_field(obj, 0, Value::Int(i as i32));
+            let obj = shared.mem.heap.alloc_object(ClassId::new(1), 1);
+            shared.mem.heap.set_field(obj, 0, Value::Int(i as i32));
             let _ = shared
+                .mem
                 .heap
                 .set_array_element(arr, i, Value::Object(Some(obj)));
             objs.push(obj);
@@ -52407,10 +52895,10 @@ mod tests {
 
         // Verify all 1000 elements
         for i in 0..1000 {
-            let v = shared.heap.get_array_element(arr, i).unwrap();
+            let v = shared.mem.heap.get_array_element(arr, i).unwrap();
             match v {
                 Value::Object(Some(r)) => {
-                    assert_eq!(shared.heap.get_field(r, 0), Value::Int(i as i32));
+                    assert_eq!(shared.mem.heap.get_field(r, 0), Value::Int(i as i32));
                 }
                 _ => panic!("expected Object at index {i}"),
             }
@@ -52422,22 +52910,27 @@ mod tests {
         // Alternate null and non-null in a ref array
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let arr = shared
+            .mem
             .heap
             .alloc_array(ClassId::new(0), ArrayElementType::Reference, 6);
 
         for i in 0..6 {
             if i % 2 == 0 {
-                let obj = shared.heap.alloc_object(ClassId::new(1), 0);
+                let obj = shared.mem.heap.alloc_object(ClassId::new(1), 0);
                 let _ = shared
+                    .mem
                     .heap
                     .set_array_element(arr, i, Value::Object(Some(obj)));
             } else {
-                let _ = shared.heap.set_array_element(arr, i, Value::Object(None));
+                let _ = shared
+                    .mem
+                    .heap
+                    .set_array_element(arr, i, Value::Object(None));
             }
         }
 
         for i in 0..6 {
-            let v = shared.heap.get_array_element(arr, i).unwrap();
+            let v = shared.mem.heap.get_array_element(arr, i).unwrap();
             if i % 2 == 0 {
                 assert!(
                     matches!(v, Value::Object(Some(_))),
@@ -52454,31 +52947,38 @@ mod tests {
         // Overwrite elements in a ref array
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let arr = shared
+            .mem
             .heap
             .alloc_array(ClassId::new(0), ArrayElementType::Reference, 2);
 
-        let obj_a = shared.heap.alloc_object(ClassId::new(1), 0);
-        let obj_b = shared.heap.alloc_object(ClassId::new(2), 0);
+        let obj_a = shared.mem.heap.alloc_object(ClassId::new(1), 0);
+        let obj_b = shared.mem.heap.alloc_object(ClassId::new(2), 0);
         let _ = shared
+            .mem
             .heap
             .set_array_element(arr, 0, Value::Object(Some(obj_a)));
         let _ = shared
+            .mem
             .heap
             .set_array_element(arr, 1, Value::Object(Some(obj_b)));
 
         // Overwrite arr[0] with obj_b
         let _ = shared
+            .mem
             .heap
             .set_array_element(arr, 0, Value::Object(Some(obj_b)));
         // Overwrite arr[1] with null
-        let _ = shared.heap.set_array_element(arr, 1, Value::Object(None));
+        let _ = shared
+            .mem
+            .heap
+            .set_array_element(arr, 1, Value::Object(None));
 
-        match shared.heap.get_array_element(arr, 0).unwrap() {
+        match shared.mem.heap.get_array_element(arr, 0).unwrap() {
             Value::Object(Some(r)) => assert_eq!(r.as_ptr(), obj_b.as_ptr()),
             _ => panic!("expected obj_b"),
         }
         assert_eq!(
-            shared.heap.get_array_element(arr, 1).unwrap(),
+            shared.mem.heap.get_array_element(arr, 1).unwrap(),
             Value::Object(None)
         );
     }
@@ -52489,7 +52989,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let list = shared.heap.alloc_object(ClassId::new(0), 2);
+        let list = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -52545,7 +53045,7 @@ mod tests {
         .unwrap();
         match v0 {
             Value::Object(Some(r)) => {
-                assert_eq!(read_java_string(&shared.heap, r).unwrap(), "hello")
+                assert_eq!(read_java_string(&shared.mem.heap, r).unwrap(), "hello")
             }
             _ => panic!("expected string"),
         }
@@ -52763,7 +53263,7 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // Create ArrayList with 3 string elements
-        let list = shared.heap.alloc_object(ClassId::new(0), 2);
+        let list = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -52802,17 +53302,17 @@ mod tests {
             Some(Value::Object(Some(r))) => r,
             _ => panic!("expected array"),
         };
-        assert_eq!(shared.heap.array_length(arr_ref), 3);
+        assert_eq!(shared.mem.heap.array_length(arr_ref), 3);
         assert_eq!(
-            shared.heap.get_array_element(arr_ref, 0).unwrap(),
+            shared.mem.heap.get_array_element(arr_ref, 0).unwrap(),
             Value::Object(Some(s1))
         );
         assert_eq!(
-            shared.heap.get_array_element(arr_ref, 1).unwrap(),
+            shared.mem.heap.get_array_element(arr_ref, 1).unwrap(),
             Value::Object(Some(s2))
         );
         assert_eq!(
-            shared.heap.get_array_element(arr_ref, 2).unwrap(),
+            shared.mem.heap.get_array_element(arr_ref, 2).unwrap(),
             Value::Object(Some(s3))
         );
     }
@@ -52828,7 +53328,7 @@ mod tests {
 
         // Register a class with record components in the class manager
         let class_id = {
-            let mut cm = shared.class_manager.write();
+            let mut cm = shared.classes.class_manager.write();
             let id = cm.class_store.next_id();
             cm.class_store.add(Class {
                 id,
@@ -52879,9 +53379,9 @@ mod tests {
         };
 
         // Allocate a record object with this class id
-        let rec = shared.heap.alloc_object(class_id, 2);
-        shared.heap.set_field(rec, 0, Value::Int(10));
-        shared.heap.set_field(rec, 1, Value::Int(20));
+        let rec = shared.mem.heap.alloc_object(class_id, 2);
+        shared.mem.heap.set_field(rec, 0, Value::Int(10));
+        shared.mem.heap.set_field(rec, 1, Value::Int(20));
 
         // Test toString produces ClassName[x=10, y=20]
         let ts = call_native(
@@ -52895,7 +53395,7 @@ mod tests {
         .unwrap()
         .unwrap();
         let ts_ref = ts.as_object().unwrap().unwrap();
-        let ts_str = read_java_string(&shared.heap, ts_ref).unwrap();
+        let ts_str = read_java_string(&shared.mem.heap, ts_ref).unwrap();
         assert_eq!(ts_str, "Point[x=10, y=20]");
     }
 
@@ -52910,7 +53410,7 @@ mod tests {
 
         // Register two different record classes with same field count
         let (cid1, cid2) = {
-            let mut cm = shared.class_manager.write();
+            let mut cm = shared.classes.class_manager.write();
             let id1 = cm.class_store.next_id();
             cm.class_store.add(Class {
                 id: id1,
@@ -53005,12 +53505,12 @@ mod tests {
         };
 
         // Two records, different classes, same field values
-        let rec1 = shared.heap.alloc_object(cid1, 2);
-        shared.heap.set_field(rec1, 0, Value::Int(42));
-        shared.heap.set_field(rec1, 1, Value::Int(99));
-        let rec2 = shared.heap.alloc_object(cid2, 2);
-        shared.heap.set_field(rec2, 0, Value::Int(42));
-        shared.heap.set_field(rec2, 1, Value::Int(99));
+        let rec1 = shared.mem.heap.alloc_object(cid1, 2);
+        shared.mem.heap.set_field(rec1, 0, Value::Int(42));
+        shared.mem.heap.set_field(rec1, 1, Value::Int(99));
+        let rec2 = shared.mem.heap.alloc_object(cid2, 2);
+        shared.mem.heap.set_field(rec2, 0, Value::Int(42));
+        shared.mem.heap.set_field(rec2, 1, Value::Int(99));
 
         // equals should return false because classes differ
         let eq = call_native(
@@ -53030,9 +53530,9 @@ mod tests {
         );
 
         // Same class, same values РІвЂ вЂ™ equal
-        let rec3 = shared.heap.alloc_object(cid1, 2);
-        shared.heap.set_field(rec3, 0, Value::Int(42));
-        shared.heap.set_field(rec3, 1, Value::Int(99));
+        let rec3 = shared.mem.heap.alloc_object(cid1, 2);
+        shared.mem.heap.set_field(rec3, 0, Value::Int(42));
+        shared.mem.heap.set_field(rec3, 1, Value::Int(99));
         let eq2 = call_native(
             &shared,
             &mut thread,
@@ -53061,7 +53561,7 @@ mod tests {
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
 
         let (rec_id, sealed_id, plain_id) = {
-            let mut cm = shared.class_manager.write();
+            let mut cm = shared.classes.class_manager.write();
             let rid = cm.class_store.next_id();
             cm.class_store.add(Class {
                 id: rid,
@@ -53213,7 +53713,7 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // Create ArrayList with [10, 20, 30]
-        let al = shared.heap.alloc_object(ClassId::new(0), 2);
+        let al = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -53290,7 +53790,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let ll = shared.heap.alloc_object(ClassId::new(0), 3);
+        let ll = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -53355,7 +53855,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let lhm = shared.heap.alloc_object(ClassId::new(0), 5);
+        let lhm = shared.mem.heap.alloc_object(ClassId::new(0), 5);
         call_native(
             &shared,
             &mut thread,
@@ -53455,7 +53955,7 @@ mod tests {
             _ => panic!("expected builder"),
         };
         // Check the builder's virtual flag
-        let vflag = shared.heap.get_field(builder_obj, 1);
+        let vflag = shared.mem.heap.get_field(builder_obj, 1);
         assert_eq!(vflag, Value::Int(1));
 
         // ofPlatform() returns virtual=false
@@ -53472,11 +53972,11 @@ mod tests {
             Some(Value::Object(Some(o))) => o,
             _ => panic!("expected builder"),
         };
-        let vflag2 = shared.heap.get_field(builder2_obj, 1);
+        let vflag2 = shared.mem.heap.get_field(builder2_obj, 1);
         assert_eq!(vflag2, Value::Int(0));
 
         // isVirtual on a regular 3-field thread should return 0
-        let regular_thread = shared.heap.alloc_object(ClassId::new(0), 3);
+        let regular_thread = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         let result = call_native(
             &shared,
             &mut thread,
@@ -53489,8 +53989,8 @@ mod tests {
         assert_eq!(result, Some(Value::Int(0)));
 
         // isVirtual on a 5-field virtual thread should return 1
-        let vthread = shared.heap.alloc_object(ClassId::new(0), 5);
-        shared.heap.set_field(vthread, 4, Value::Int(1));
+        let vthread = shared.mem.heap.alloc_object(ClassId::new(0), 5);
+        shared.mem.heap.set_field(vthread, 4, Value::Int(1));
         let result2 = call_native(
             &shared,
             &mut thread,
@@ -53562,7 +54062,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let sb = shared.heap.alloc_object(ClassId::new(0), 2);
+        let sb = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -53615,7 +54115,7 @@ mod tests {
             Some(Value::Object(Some(o))) => o,
             _ => panic!("expected string"),
         };
-        let text = read_java_string(&shared.heap, str_obj).unwrap();
+        let text = read_java_string(&shared.mem.heap, str_obj).unwrap();
         assert_eq!(text, "abxyxyxy");
     }
 
@@ -53626,7 +54126,7 @@ mod tests {
 
         // Create StructuredTaskScope (java.util.concurrent package)
         // Phase 82: 8 fields (name, state, task_count, completed_count, exception, policy, joined, suppressed_count)
-        let scope = shared.heap.alloc_object(ClassId::new(0), 8);
+        let scope = shared.mem.heap.alloc_object(ClassId::new(0), 8);
         call_native(
             &shared,
             &mut thread,
@@ -53638,14 +54138,14 @@ mod tests {
         .unwrap();
 
         // field 0 = name_ref, field 1 = state (OPEN=0), field 2 = task_count, field 3 = completed_count
-        let state = shared.heap.get_field(scope, 1);
+        let state = shared.mem.heap.get_field(scope, 1);
         assert_eq!(state, Value::Int(0), "state should be OPEN (0)");
 
-        let task_count = shared.heap.get_field(scope, 2);
+        let task_count = shared.mem.heap.get_field(scope, 2);
         assert_eq!(task_count, Value::Int(0), "task_count should be 0");
 
         // Phase 82: verify policy field is BASE (0)
-        let policy = shared.heap.get_field(scope, 5);
+        let policy = shared.mem.heap.get_field(scope, 5);
         assert_eq!(policy, Value::Int(0), "policy should be BASE (0)");
     }
 
@@ -53655,8 +54155,8 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // Create a 5-field Thread with no target (field 3 = None)
-        let thr = shared.heap.alloc_object(ClassId::new(0), 5);
-        shared.heap.set_field(thr, 3, Value::Object(None));
+        let thr = shared.mem.heap.alloc_object(ClassId::new(0), 5);
+        shared.mem.heap.set_field(thr, 3, Value::Object(None));
 
         // Thread.run() should succeed without error even with no target
         let result = call_native(
@@ -53670,7 +54170,7 @@ mod tests {
         assert!(result.is_ok());
 
         // Thread.run() on a 3-field thread should also succeed (no target field)
-        let thr2 = shared.heap.alloc_object(ClassId::new(0), 3);
+        let thr2 = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         let result2 = call_native(
             &shared,
             &mut thread,
@@ -53804,12 +54304,13 @@ mod tests {
         .ok(); // warm up registry
 
         let int_class_id = shared
+            .classes
             .class_manager
             .write()
             .load_class("java/lang/Integer")
             .unwrap();
-        let int_obj = shared.heap.alloc_object(int_class_id, 1);
-        shared.heap.set_field(int_obj, 0, Value::Int(42));
+        let int_obj = shared.mem.heap.alloc_object(int_class_id, 1);
+        shared.mem.heap.set_field(int_obj, 0, Value::Int(42));
 
         use crate::runtime::frame::Frame;
         let code: Vec<u8> = vec![0xb1];
@@ -53914,7 +54415,7 @@ mod tests {
         .ok();
 
         // Create a generic object that won't match any label
-        let obj = shared.heap.alloc_object(ClassId::new(0), 1);
+        let obj = shared.mem.heap.alloc_object(ClassId::new(0), 1);
 
         use crate::runtime::frame::Frame;
         let code: Vec<u8> = vec![0xb1];
@@ -54014,11 +54515,12 @@ mod tests {
 
         // Create an enum-like object: field 0 = name (String), field 1 = ordinal (int)
         let name_obj = create_java_string(&shared, "GREEN");
-        let enum_obj = shared.heap.alloc_object(ClassId::new(0), 2);
+        let enum_obj = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         shared
+            .mem
             .heap
             .set_field(enum_obj, 0, Value::Object(Some(name_obj)));
-        shared.heap.set_field(enum_obj, 1, Value::Int(1));
+        shared.mem.heap.set_field(enum_obj, 1, Value::Int(1));
 
         use crate::runtime::frame::Frame;
         let code: Vec<u8> = vec![0xb1];
@@ -54087,7 +54589,7 @@ mod tests {
     fn virtual_scheduler_in_shared_vm() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         // Scheduler should be created with hardware parallelism count
-        assert!(shared.virtual_scheduler.carrier_count() > 0);
+        assert!(shared.threads.virtual_scheduler.carrier_count() > 0);
     }
 
     #[test]
@@ -54104,20 +54606,20 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
 
         // 5-field Thread with field 4 = 1 (virtual)
-        let vt = shared.heap.alloc_object(ClassId::new(0), 5);
-        shared.heap.set_field(vt, 4, Value::Int(1));
-        let header = shared.heap.get_header(vt);
+        let vt = shared.mem.heap.alloc_object(ClassId::new(0), 5);
+        shared.mem.heap.set_field(vt, 4, Value::Int(1));
+        let header = shared.mem.heap.get_header(vt);
         assert!(header.num_slots() >= 5);
-        assert!(matches!(shared.heap.get_field(vt, 4), Value::Int(1)));
+        assert!(matches!(shared.mem.heap.get_field(vt, 4), Value::Int(1)));
 
         // 5-field Thread with field 4 = 0 (platform)
-        let pt = shared.heap.alloc_object(ClassId::new(0), 5);
-        shared.heap.set_field(pt, 4, Value::Int(0));
-        assert!(matches!(shared.heap.get_field(pt, 4), Value::Int(0)));
+        let pt = shared.mem.heap.alloc_object(ClassId::new(0), 5);
+        shared.mem.heap.set_field(pt, 4, Value::Int(0));
+        assert!(matches!(shared.mem.heap.get_field(pt, 4), Value::Int(0)));
 
         // 3-field Thread (no field 4, platform by default)
-        let st = shared.heap.alloc_object(ClassId::new(0), 3);
-        let h = shared.heap.get_header(st);
+        let st = shared.mem.heap.alloc_object(ClassId::new(0), 3);
+        let h = shared.mem.heap.get_header(st);
         assert!(h.num_slots() < 5);
     }
 
@@ -54142,7 +54644,7 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // Create a dummy integrator object (lambda proxy not needed for registration test)
-        let integrator = shared.heap.alloc_object(ClassId::new(0), 1);
+        let integrator = shared.mem.heap.alloc_object(ClassId::new(0), 1);
 
         let result = call_native(
             &shared,
@@ -54156,10 +54658,13 @@ mod tests {
 
         // Should return a 4-field Gatherer with integrator in field 1
         if let Some(Value::Object(Some(g))) = result {
-            let integrator_val = shared.heap.get_field(g, 1);
+            let integrator_val = shared.mem.heap.get_field(g, 1);
             assert!(matches!(integrator_val, Value::Object(Some(_))));
             // field 0 (initializer) should be null
-            assert!(matches!(shared.heap.get_field(g, 0), Value::Object(None)));
+            assert!(matches!(
+                shared.mem.heap.get_field(g, 0),
+                Value::Object(None)
+            ));
         } else {
             panic!("Expected Gatherer object");
         }
@@ -54236,7 +54741,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let scope = shared.heap.alloc_object(ClassId::new(0), 8);
+        let scope = shared.mem.heap.alloc_object(ClassId::new(0), 8);
         call_native(
             &shared,
             &mut thread,
@@ -54248,7 +54753,7 @@ mod tests {
         .unwrap();
 
         // State should be OPEN (0)
-        assert_eq!(shared.heap.get_field(scope, 1), Value::Int(0));
+        assert_eq!(shared.mem.heap.get_field(scope, 1), Value::Int(0));
 
         // Join
         call_native(
@@ -54261,7 +54766,7 @@ mod tests {
         )
         .unwrap();
         // join does not change state in new impl РІР‚вЂќ state remains OPEN(0)
-        assert_eq!(shared.heap.get_field(scope, 1), Value::Int(0));
+        assert_eq!(shared.mem.heap.get_field(scope, 1), Value::Int(0));
 
         // Close
         call_native(
@@ -54273,7 +54778,7 @@ mod tests {
             &[Value::Object(Some(scope))],
         )
         .unwrap();
-        assert_eq!(shared.heap.get_field(scope, 1), Value::Int(2)); // CLOSED
+        assert_eq!(shared.mem.heap.get_field(scope, 1), Value::Int(2)); // CLOSED
     }
 
     #[test]
@@ -54693,12 +55198,12 @@ mod tests {
         .unwrap();
 
         // Create empty param array
-        let params = shared.heap.alloc_array(
+        let params = shared.mem.heap.alloc_array(
             ClassId::new(0),
             crate::memory::heap::ArrayElementType::Reference,
             1,
         );
-        let _ = shared.heap.set_array_element(params, 0, int_layout);
+        let _ = shared.mem.heap.set_array_element(params, 0, int_layout);
 
         // Create descriptor: int(int) РІвЂ вЂ™ int
         let desc = call_native(&shared, &mut thread, fd, "of",
@@ -54713,7 +55218,12 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
 
         // Allocate via SharedVm
-        let (id, ptr) = shared.native_memory.lock().allocate(128, 8).unwrap();
+        let (id, ptr) = shared
+            .natives
+            .native_memory
+            .lock()
+            .allocate(128, 8)
+            .unwrap();
         assert!(!ptr.is_null());
 
         // Write and read
@@ -54725,7 +55235,7 @@ mod tests {
         }
 
         // Free
-        assert!(shared.native_memory.lock().free(id));
+        assert!(shared.natives.native_memory.lock().free(id));
     }
 
     #[test]
@@ -54811,13 +55321,13 @@ mod tests {
         .unwrap()
         .unwrap();
 
-        let members = shared.heap.alloc_array(
+        let members = shared.mem.heap.alloc_array(
             ClassId::new(0),
             crate::memory::heap::ArrayElementType::Reference,
             2,
         );
-        let _ = shared.heap.set_array_element(members, 0, int_layout);
-        let _ = shared.heap.set_array_element(members, 1, long_layout);
+        let _ = shared.mem.heap.set_array_element(members, 0, int_layout);
+        let _ = shared.mem.heap.set_array_element(members, 1, long_layout);
 
         // Create struct layout
         let struct_layout = call_native(
@@ -54900,7 +55410,7 @@ mod tests {
         .unwrap();
 
         if let Value::Object(Some(s)) = seq {
-            let size = shared.heap.get_field(s, 1);
+            let size = shared.mem.heap.get_field(s, 1);
             assert_eq!(size, Value::Long(40));
         }
     }
@@ -54954,7 +55464,7 @@ mod tests {
         .unwrap()
         .unwrap();
         if let Value::Object(Some(str_ref)) = read_back {
-            let s = read_java_string(&shared.heap, str_ref).unwrap();
+            let s = read_java_string(&shared.mem.heap, str_ref).unwrap();
             assert_eq!(s, "Hello, Panama!");
         } else {
             panic!("Expected String");
@@ -54975,7 +55485,7 @@ mod tests {
     fn panama_upcall_table_pe2() {
         // Test UpcallTable directly РІР‚вЂќ use a real heap object as target
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
-        let target_obj = shared.heap.alloc_object(ClassId::new(0), 1);
+        let target_obj = shared.mem.heap.alloc_object(ClassId::new(0), 1);
 
         let mut table = crate::native::ffi::UpcallTable::new();
         let entry = crate::native::ffi::UpcallEntry {
@@ -55041,7 +55551,7 @@ mod tests {
         .unwrap()
         .unwrap();
         if let Value::Object(Some(r)) = reinterpreted {
-            let size = shared.heap.get_field(r, 1);
+            let size = shared.mem.heap.get_field(r, 1);
             assert_eq!(size, Value::Long(128));
         }
 
@@ -55236,12 +55746,12 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let members = shared.heap.alloc_array(
+        let members = shared.mem.heap.alloc_array(
             ClassId::new(0),
             crate::memory::heap::ArrayElementType::Reference,
             1,
         );
-        let _ = shared.heap.set_array_element(members, 0, int_layout);
+        let _ = shared.mem.heap.set_array_element(members, 0, int_layout);
 
         let sl = call_native(
             &shared,
@@ -55256,8 +55766,8 @@ mod tests {
 
         if let Value::Object(Some(s)) = sl {
             // Single int field: size=4, alignment=4
-            assert_eq!(shared.heap.get_field(s, 1), Value::Long(4));
-            assert_eq!(shared.heap.get_field(s, 5), Value::Long(4));
+            assert_eq!(shared.mem.heap.get_field(s, 1), Value::Long(4));
+            assert_eq!(shared.mem.heap.get_field(s, 5), Value::Long(4));
         }
     }
 
@@ -55288,13 +55798,13 @@ mod tests {
         .unwrap()
         .unwrap();
 
-        let members = shared.heap.alloc_array(
+        let members = shared.mem.heap.alloc_array(
             ClassId::new(0),
             crate::memory::heap::ArrayElementType::Reference,
             2,
         );
-        let _ = shared.heap.set_array_element(members, 0, byte_layout);
-        let _ = shared.heap.set_array_element(members, 1, int_layout);
+        let _ = shared.mem.heap.set_array_element(members, 0, byte_layout);
+        let _ = shared.mem.heap.set_array_element(members, 1, int_layout);
 
         let sl = call_native(
             &shared,
@@ -55309,17 +55819,17 @@ mod tests {
 
         if let Value::Object(Some(s)) = sl {
             // byte(1) at offset 0, pad to 4, int(4) at offset 4, total = 8
-            assert_eq!(shared.heap.get_field(s, 1), Value::Long(8));
-            assert_eq!(shared.heap.get_field(s, 5), Value::Long(4)); // alignment = max(1,4) = 4
+            assert_eq!(shared.mem.heap.get_field(s, 1), Value::Long(8));
+            assert_eq!(shared.mem.heap.get_field(s, 5), Value::Long(4)); // alignment = max(1,4) = 4
 
             // Check offsets array
-            if let Value::Object(Some(offsets)) = shared.heap.get_field(s, 4) {
+            if let Value::Object(Some(offsets)) = shared.mem.heap.get_field(s, 4) {
                 assert_eq!(
-                    shared.heap.get_array_element(offsets, 0).unwrap(),
+                    shared.mem.heap.get_array_element(offsets, 0).unwrap(),
                     Value::Long(0)
                 ); // byte at 0
                 assert_eq!(
-                    shared.heap.get_array_element(offsets, 1).unwrap(),
+                    shared.mem.heap.get_array_element(offsets, 1).unwrap(),
                     Value::Long(4)
                 ); // int at 4
             }
@@ -55352,13 +55862,13 @@ mod tests {
         .unwrap()
         .unwrap();
 
-        let members = shared.heap.alloc_array(
+        let members = shared.mem.heap.alloc_array(
             ClassId::new(0),
             crate::memory::heap::ArrayElementType::Reference,
             2,
         );
-        let _ = shared.heap.set_array_element(members, 0, int_layout);
-        let _ = shared.heap.set_array_element(members, 1, long_layout);
+        let _ = shared.mem.heap.set_array_element(members, 0, int_layout);
+        let _ = shared.mem.heap.set_array_element(members, 1, long_layout);
 
         let ul = call_native(
             &shared,
@@ -55373,7 +55883,7 @@ mod tests {
 
         if let Value::Object(Some(u)) = ul {
             // union(int, long) РІвЂ вЂ™ size = max(4, 8) = 8
-            assert_eq!(shared.heap.get_field(u, 1), Value::Long(8));
+            assert_eq!(shared.mem.heap.get_field(u, 1), Value::Long(8));
         }
     }
 
@@ -55414,11 +55924,12 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         // Classes loaded normally should not be hidden
         let cid = shared
+            .classes
             .class_manager
             .write()
             .load_class("java/lang/Object")
             .unwrap();
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let class = cm.get_class(cid).unwrap();
         assert!(!class.is_hidden());
     }
@@ -55429,11 +55940,12 @@ mod tests {
     fn class_module_name_default_none() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let cid = shared
+            .classes
             .class_manager
             .write()
             .load_class("java/lang/Object")
             .unwrap();
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let class = cm.get_class(cid).unwrap();
         // Regular classes don't have Module attribute
         assert!(class.module_name.is_none());
@@ -55637,11 +56149,11 @@ mod tests {
         let config = VmConfig::default();
         let shared = Arc::new(SharedVm::new(config));
         {
-            let mut cm = shared.class_manager.write();
+            let mut cm = shared.classes.class_manager.write();
             // Loading String causes its interfaces (including CharSequence) to be loaded too.
             cm.load_class("java/lang/String").unwrap();
         }
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let store = &cm.class_store;
         let hierarchy = ClassStoreHierarchy { store };
 
@@ -55670,7 +56182,7 @@ mod tests {
         // fallback should return true (compiler guarantees type safety).
         let config = VmConfig::default();
         let shared = Arc::new(SharedVm::new(config));
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let store = &cm.class_store;
         let hierarchy = ClassStoreHierarchy { store };
 
@@ -55704,7 +56216,7 @@ mod tests {
             "org/renaissance/jdk/streams/MnemonicsCoderWithStream",
         ];
         for class_name in &classes {
-            let result = shared.class_manager.write().load_class(class_name);
+            let result = shared.classes.class_manager.write().load_class(class_name);
             assert!(
                 result.is_ok(),
                 "Loading {class_name} should succeed: {result:?}"
@@ -55731,10 +56243,10 @@ mod tests {
         //   actual = ObjectRef("String")  РІвЂ вЂ™  is_subclass("String", "CharSequence") must be true
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         {
-            let mut cm = shared.class_manager.write();
+            let mut cm = shared.classes.class_manager.write();
             cm.load_class("java/lang/String").unwrap();
         }
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let store = &cm.class_store;
         let hierarchy = ClassStoreHierarchy { store };
 
@@ -55842,7 +56354,7 @@ mod tests {
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
 
         // Create a dummy handler object
-        let handler = shared.heap.alloc_object(ClassId::new(0), 0);
+        let handler = shared.mem.heap.alloc_object(ClassId::new(0), 0);
 
         // Call Proxy.newProxyInstance
         let proxy_val = call_native(
@@ -55863,8 +56375,9 @@ mod tests {
         let proxy_ref = proxy_val.as_object().unwrap().unwrap();
 
         // Verify that proxy is a Proxy$Instance (class name check)
-        let proxy_class_id = shared.heap.class_id_of(proxy_ref);
+        let proxy_class_id = shared.mem.heap.class_id_of(proxy_ref);
         let proxy_class_name = shared
+            .classes
             .class_manager
             .read()
             .get_class(proxy_class_id)
@@ -55876,7 +56389,7 @@ mod tests {
         );
 
         // Verify field 0 is the handler
-        let stored_handler = shared.heap.get_field(proxy_ref, 0);
+        let stored_handler = shared.mem.heap.get_field(proxy_ref, 0);
         assert_eq!(
             stored_handler,
             Value::Object(Some(handler)),
@@ -55965,21 +56478,21 @@ mod tests {
             Value::Object(Some(a)) => a,
             _ => panic!("expected array"),
         };
-        assert_eq!(vm.shared.heap.array_length(byte_arr), 4);
+        assert_eq!(vm.shared.mem.heap.array_length(byte_arr), 4);
         assert_eq!(
-            vm.shared.heap.get_array_element(byte_arr, 0),
+            vm.shared.mem.heap.get_array_element(byte_arr, 0),
             Ok(Value::Int(0x12))
         );
         assert_eq!(
-            vm.shared.heap.get_array_element(byte_arr, 1),
+            vm.shared.mem.heap.get_array_element(byte_arr, 1),
             Ok(Value::Int(0x34))
         );
         assert_eq!(
-            vm.shared.heap.get_array_element(byte_arr, 2),
+            vm.shared.mem.heap.get_array_element(byte_arr, 2),
             Ok(Value::Int(0x56))
         );
         assert_eq!(
-            vm.shared.heap.get_array_element(byte_arr, 3),
+            vm.shared.mem.heap.get_array_element(byte_arr, 3),
             Ok(Value::Int(0x78))
         );
 
@@ -56073,7 +56586,7 @@ mod tests {
             Value::Object(Some(a)) => a,
             _ => panic!("expected array"),
         };
-        assert_eq!(vm.shared.heap.array_length(byte_arr), 8);
+        assert_eq!(vm.shared.mem.heap.array_length(byte_arr), 8);
 
         let bais = alloc_named(&mut vm, "java/io/ByteArrayInputStream", 4);
         call_native(
@@ -56163,7 +56676,7 @@ mod tests {
             _ => panic!("expected array"),
         };
         // 2 bytes length prefix + 5 bytes "Hello"
-        assert_eq!(vm.shared.heap.array_length(byte_arr), 7);
+        assert_eq!(vm.shared.mem.heap.array_length(byte_arr), 7);
 
         let bais = alloc_named(&mut vm, "java/io/ByteArrayInputStream", 4);
         call_native(
@@ -56201,7 +56714,7 @@ mod tests {
             Value::Object(Some(o)) => o,
             _ => panic!("expected string"),
         };
-        let s = read_java_string(&vm.shared.heap, sref).unwrap();
+        let s = read_java_string(&vm.shared.mem.heap, sref).unwrap();
         assert_eq!(s, "Hello");
     }
 
@@ -56297,11 +56810,13 @@ mod tests {
         // Source: ByteArrayInputStream([1,2,3,4,5])
         let src_arr = vm
             .shared
+            .mem
             .heap
             .alloc_array(ClassId::new(0), ArrayElementType::Byte, 5);
         for i in 0..5usize {
             let _ = vm
                 .shared
+                .mem
                 .heap
                 .set_array_element(src_arr, i, Value::Int((i + 1) as i32));
         }
@@ -56354,10 +56869,10 @@ mod tests {
             Value::Object(Some(a)) => a,
             _ => panic!("expected array"),
         };
-        assert_eq!(vm.shared.heap.array_length(dest_ref), 5);
+        assert_eq!(vm.shared.mem.heap.array_length(dest_ref), 5);
         for i in 0..5usize {
             assert_eq!(
-                vm.shared.heap.get_array_element(dest_ref, i),
+                vm.shared.mem.heap.get_array_element(dest_ref, i),
                 Ok(Value::Int((i + 1) as i32))
             );
         }
@@ -56370,11 +56885,24 @@ mod tests {
 
         let src_arr = vm
             .shared
+            .mem
             .heap
             .alloc_array(ClassId::new(0), ArrayElementType::Byte, 3);
-        let _ = vm.shared.heap.set_array_element(src_arr, 0, Value::Int(10));
-        let _ = vm.shared.heap.set_array_element(src_arr, 1, Value::Int(20));
-        let _ = vm.shared.heap.set_array_element(src_arr, 2, Value::Int(30));
+        let _ = vm
+            .shared
+            .mem
+            .heap
+            .set_array_element(src_arr, 0, Value::Int(10));
+        let _ = vm
+            .shared
+            .mem
+            .heap
+            .set_array_element(src_arr, 1, Value::Int(20));
+        let _ = vm
+            .shared
+            .mem
+            .heap
+            .set_array_element(src_arr, 2, Value::Int(30));
 
         let bais = alloc_named(&mut vm, "java/io/ByteArrayInputStream", 4);
         call_native(
@@ -56401,10 +56929,19 @@ mod tests {
             Value::Object(Some(a)) => a,
             _ => panic!("expected array"),
         };
-        assert_eq!(vm.shared.heap.array_length(arr), 3);
-        assert_eq!(vm.shared.heap.get_array_element(arr, 0), Ok(Value::Int(10)));
-        assert_eq!(vm.shared.heap.get_array_element(arr, 1), Ok(Value::Int(20)));
-        assert_eq!(vm.shared.heap.get_array_element(arr, 2), Ok(Value::Int(30)));
+        assert_eq!(vm.shared.mem.heap.array_length(arr), 3);
+        assert_eq!(
+            vm.shared.mem.heap.get_array_element(arr, 0),
+            Ok(Value::Int(10))
+        );
+        assert_eq!(
+            vm.shared.mem.heap.get_array_element(arr, 1),
+            Ok(Value::Int(20))
+        );
+        assert_eq!(
+            vm.shared.mem.heap.get_array_element(arr, 2),
+            Ok(Value::Int(30))
+        );
     }
 
     /// DIS: readBoolean, readByte, readShort, readUnsignedShort all decode correctly.
@@ -56415,30 +56952,44 @@ mod tests {
         // [1, 0xFF, 0x01, 0x02, 0x00, 0x41, 0]
         let src_arr = vm
             .shared
+            .mem
             .heap
             .alloc_array(ClassId::new(0), ArrayElementType::Byte, 7);
-        let _ = vm.shared.heap.set_array_element(src_arr, 0, Value::Int(1)); // readBoolean РІвЂ вЂ™ true
         let _ = vm
             .shared
+            .mem
+            .heap
+            .set_array_element(src_arr, 0, Value::Int(1)); // readBoolean РІвЂ вЂ™ true
+        let _ = vm
+            .shared
+            .mem
             .heap
             .set_array_element(src_arr, 1, Value::Int(0xFF)); // readByte РІвЂ вЂ™ -1
         let _ = vm
             .shared
+            .mem
             .heap
             .set_array_element(src_arr, 2, Value::Int(0x01)); // readShort hi
         let _ = vm
             .shared
+            .mem
             .heap
             .set_array_element(src_arr, 3, Value::Int(0x02)); // readShort lo РІвЂ вЂ™ 258
         let _ = vm
             .shared
+            .mem
             .heap
             .set_array_element(src_arr, 4, Value::Int(0x00)); // readUnsignedShort hi
         let _ = vm
             .shared
+            .mem
             .heap
             .set_array_element(src_arr, 5, Value::Int(0x41)); // readUnsignedShort lo РІвЂ вЂ™ 65
-        let _ = vm.shared.heap.set_array_element(src_arr, 6, Value::Int(0));
+        let _ = vm
+            .shared
+            .mem
+            .heap
+            .set_array_element(src_arr, 6, Value::Int(0));
 
         let bais = alloc_named(&mut vm, "java/io/ByteArrayInputStream", 4);
         call_native(
@@ -56683,6 +57234,7 @@ mod tests {
         // requires classpath for ArrayList allocation within <init>)
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         assert!(shared
+            .natives
             .native_methods
             .find(
                 "java/util/StringJoiner",
@@ -56691,6 +57243,7 @@ mod tests {
             )
             .is_some());
         assert!(shared
+            .natives
             .native_methods
             .find(
                 "java/util/StringJoiner",
@@ -56699,6 +57252,7 @@ mod tests {
             )
             .is_some());
         assert!(shared
+            .natives
             .native_methods
             .find("java/util/StringJoiner", "toString", "()Ljava/lang/String;")
             .is_some());
@@ -56710,7 +57264,7 @@ mod tests {
         let mut vm = Vm::new(VmConfig::default());
 
         // Allocate StringJoiner with enough fields (use heap directly to avoid class resolution)
-        let sj = vm.shared.heap.alloc_object(ClassId::new(0), 4);
+        let sj = vm.shared.mem.heap.alloc_object(ClassId::new(0), 4);
         let delim = {
             let mut ctx = NativeContextImpl {
                 shared: &vm.shared,
@@ -56797,7 +57351,7 @@ mod tests {
         let mut vm = Vm::new(VmConfig::default());
 
         // StringBuilder is a synthetic stub РІР‚вЂќ verify its <init> dispatches to native
-        let sb = vm.shared.heap.alloc_object(ClassId::new(0), 2);
+        let sb = vm.shared.mem.heap.alloc_object(ClassId::new(0), 2);
         let result = call_native(
             &vm.shared,
             &mut vm.main_thread,
@@ -56819,11 +57373,12 @@ mod tests {
         // Load a synthetic class by requesting a JDK class that doesn't have
         // a .class file on the classpath (which it won't in test env)
         let class_id = shared
+            .classes
             .class_manager
             .write()
             .load_class("java/lang/StringBuilder")
             .unwrap();
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let class = cm.class_store.get(class_id).unwrap();
         assert!(
             class.is_synthetic_stub,
@@ -56866,7 +57421,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(config));
 
         // Verify Object was loaded from real .class file (not synthetic)
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let obj_id = cm
             .get_loaded_class_id("java/lang/Object")
             .expect("Object should be loaded");
@@ -57053,7 +57608,7 @@ mod tests {
         };
 
         // Allocate an Object
-        let obj = vm.shared.heap.alloc_object(ClassId::new(0), 0);
+        let obj = vm.shared.mem.heap.alloc_object(ClassId::new(0), 0);
 
         let result = invoke_or_native(
             &vm.shared,
@@ -57111,7 +57666,7 @@ mod tests {
             return;
         };
 
-        let cm = vm.shared.class_manager.read();
+        let cm = vm.shared.classes.class_manager.read();
         let obj_id = cm.get_loaded_class_id("java/lang/Object").unwrap();
         let obj_class = cm.class_store.get(obj_id).unwrap();
 
@@ -57162,7 +57717,7 @@ mod tests {
         };
 
         // Allocate objects with correct field count for real Object class
-        let cm = vm.shared.class_manager.read();
+        let cm = vm.shared.classes.class_manager.read();
         let obj_id = cm.get_loaded_class_id("java/lang/Object").unwrap();
         let nfields = cm
             .class_store
@@ -57171,8 +57726,8 @@ mod tests {
             .unwrap_or(0);
         drop(cm);
 
-        let obj1 = vm.shared.heap.alloc_object(obj_id, nfields);
-        let obj2 = vm.shared.heap.alloc_object(obj_id, nfields);
+        let obj1 = vm.shared.mem.heap.alloc_object(obj_id, nfields);
+        let obj2 = vm.shared.mem.heap.alloc_object(obj_id, nfields);
 
         // Diagnostic: verify refs_equal works for this ObjectRef pair
         let v1 = Value::Object(Some(obj1));
@@ -57347,7 +57902,7 @@ mod tests {
 
         // Check Boolean field layout
         {
-            let cm = vm.shared.class_manager.read();
+            let cm = vm.shared.classes.class_manager.read();
             if let Some(bool_id) = cm.get_loaded_class_id("java/lang/Boolean") {
                 let cls = cm.class_store.get(bool_id).unwrap();
                 eprintln!("[real_jdk] Boolean: is_synthetic={}, fields={}, first_field_index={}, num_total_fields={}, methods={}",
@@ -57483,7 +58038,7 @@ mod tests {
         let mut vm = Vm::new(config);
 
         // ---- Step 1: Verify we are in real-JDK mode (fewer natives) ----
-        let native_count = vm.shared.native_methods.len();
+        let native_count = vm.shared.natives.native_methods.len();
         eprintln!("[real_jdk_e2e] Native methods registered: {}", native_count);
         // Session 85: corrective overrides grew the count to ~2568; keep +100 headroom.
         assert!(
@@ -57574,7 +58129,7 @@ mod tests {
         }
 
         // ---- Step 5: Object.equals via real bytecode (simple control flow) ----
-        let cm = vm.shared.class_manager.read();
+        let cm = vm.shared.classes.class_manager.read();
         let obj_id = cm.get_loaded_class_id("java/lang/Object").unwrap();
         let nfields = cm
             .class_store
@@ -57583,7 +58138,7 @@ mod tests {
             .unwrap_or(0);
         drop(cm);
 
-        let obj1 = vm.shared.heap.alloc_object(obj_id, nfields);
+        let obj1 = vm.shared.mem.heap.alloc_object(obj_id, nfields);
         let result = invoke_or_native(
             &vm.shared,
             &mut vm.main_thread,
@@ -57597,7 +58152,7 @@ mod tests {
 
         // ---- Step 6: Verify bytecode methods have Code attributes ----
         {
-            let cm = vm.shared.class_manager.read();
+            let cm = vm.shared.classes.class_manager.read();
             let int_id = cm.get_loaded_class_id("java/lang/Integer").unwrap();
             let int_class = cm.class_store.get(int_id).unwrap();
             assert!(
@@ -57644,8 +58199,8 @@ mod tests {
         *shared.self_arc.write() = Some(Arc::downgrade(&shared));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let obj = shared.heap.alloc_object(ClassId::new(0), 1);
-        shared.heap.set_field(obj, 0, Value::Long(100));
+        let obj = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        shared.mem.heap.set_field(obj, 0, Value::Long(100));
 
         let result = call_native(
             &shared,
@@ -57663,7 +58218,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(result, Some(Value::Long(100))); // old value
-        assert_eq!(shared.heap.get_field(obj, 0), Value::Long(125)); // updated
+        assert_eq!(shared.mem.heap.get_field(obj, 0), Value::Long(125)); // updated
     }
 
     #[test]
@@ -57672,8 +58227,8 @@ mod tests {
         *shared.self_arc.write() = Some(Arc::downgrade(&shared));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let obj = shared.heap.alloc_object(ClassId::new(0), 1);
-        shared.heap.set_field(obj, 0, Value::Long(42));
+        let obj = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        shared.mem.heap.set_field(obj, 0, Value::Long(42));
 
         let result = call_native(
             &shared,
@@ -57691,7 +58246,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(result, Some(Value::Long(42))); // old value
-        assert_eq!(shared.heap.get_field(obj, 0), Value::Long(99)); // new value
+        assert_eq!(shared.mem.heap.get_field(obj, 0), Value::Long(99)); // new value
     }
 
     #[test]
@@ -57700,8 +58255,8 @@ mod tests {
         *shared.self_arc.write() = Some(Arc::downgrade(&shared));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let obj = shared.heap.alloc_object(ClassId::new(0), 1);
-        shared.heap.set_field(obj, 0, Value::Int(7));
+        let obj = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        shared.mem.heap.set_field(obj, 0, Value::Int(7));
 
         // Use the jdk/internal/misc/Unsafe alias
         let result = call_native(
@@ -57721,7 +58276,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(result, Some(Value::Int(1))); // success
-        assert_eq!(shared.heap.get_field(obj, 0), Value::Int(42));
+        assert_eq!(shared.mem.heap.get_field(obj, 0), Value::Int(42));
     }
 
     #[test]
@@ -57730,7 +58285,7 @@ mod tests {
         *shared.self_arc.write() = Some(Arc::downgrade(&shared));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let obj = shared.heap.alloc_object(ClassId::new(0), 2);
+        let obj = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         // Store a float via putFloat
         call_native(
             &shared,
@@ -57774,7 +58329,7 @@ mod tests {
         *shared.self_arc.write() = Some(Arc::downgrade(&shared));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let obj = shared.heap.alloc_object(ClassId::new(0), 2);
+        let obj = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -57815,7 +58370,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let list = shared.heap.alloc_object(ClassId::new(0), 2);
+        let list = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -57863,7 +58418,7 @@ mod tests {
         )
         .unwrap();
         if let Some(Value::Object(Some(s))) = r0 {
-            assert_eq!(read_java_string(&shared.heap, s), Some("c".into()));
+            assert_eq!(read_java_string(&shared.mem.heap, s), Some("c".into()));
         } else {
             panic!("expected string at index 0");
         }
@@ -57878,7 +58433,7 @@ mod tests {
         )
         .unwrap();
         if let Some(Value::Object(Some(s))) = r2 {
-            assert_eq!(read_java_string(&shared.heap, s), Some("a".into()));
+            assert_eq!(read_java_string(&shared.mem.heap, s), Some("a".into()));
         } else {
             panic!("expected string at index 2");
         }
@@ -57889,7 +58444,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let list = shared.heap.alloc_object(ClassId::new(0), 2);
+        let list = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -57942,7 +58497,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let list = shared.heap.alloc_object(ClassId::new(0), 2);
+        let list = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -58016,7 +58571,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let list = shared.heap.alloc_object(ClassId::new(0), 2);
+        let list = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -58068,9 +58623,9 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // Create primary exception with 3+ fields (message, cause, suppressed)
-        let primary = shared.heap.alloc_object(ClassId::new(0), 4);
-        let supp1 = shared.heap.alloc_object(ClassId::new(0), 4);
-        let supp2 = shared.heap.alloc_object(ClassId::new(0), 4);
+        let primary = shared.mem.heap.alloc_object(ClassId::new(0), 4);
+        let supp1 = shared.mem.heap.alloc_object(ClassId::new(0), 4);
+        let supp2 = shared.mem.heap.alloc_object(ClassId::new(0), 4);
 
         // Add two suppressed exceptions
         call_native(
@@ -58106,13 +58661,13 @@ mod tests {
 
         match result {
             Value::Object(Some(arr)) => {
-                assert_eq!(shared.heap.array_length(arr), 2);
+                assert_eq!(shared.mem.heap.array_length(arr), 2);
                 assert_eq!(
-                    shared.heap.get_array_element(arr, 0).unwrap(),
+                    shared.mem.heap.get_array_element(arr, 0).unwrap(),
                     Value::Object(Some(supp1))
                 );
                 assert_eq!(
-                    shared.heap.get_array_element(arr, 1).unwrap(),
+                    shared.mem.heap.get_array_element(arr, 1).unwrap(),
                     Value::Object(Some(supp2))
                 );
             }
@@ -58168,15 +58723,19 @@ mod tests {
         let a2 = create_java_string(&shared, "a");
 
         let arr = shared
+            .mem
             .heap
             .alloc_array(ClassId::new(0), ArrayElementType::Reference, 3);
         let _ = shared
+            .mem
             .heap
             .set_array_element(arr, 0, Value::Object(Some(a)));
         let _ = shared
+            .mem
             .heap
             .set_array_element(arr, 1, Value::Object(Some(b)));
         let _ = shared
+            .mem
             .heap
             .set_array_element(arr, 2, Value::Object(Some(a2)));
 
@@ -58218,12 +58777,13 @@ mod tests {
         .unwrap();
 
         // Build GROUPING_BY_DOWNSTREAM collector manually
-        let collector = shared.heap.alloc_object(ClassId::new(0), 3);
-        shared.heap.set_field(collector, 0, Value::Int(9)); // GROUPING_BY_DOWNSTREAM
+        let collector = shared.mem.heap.alloc_object(ClassId::new(0), 3);
+        shared.mem.heap.set_field(collector, 0, Value::Int(9)); // GROUPING_BY_DOWNSTREAM
         shared
+            .mem
             .heap
             .set_field(collector, 1, Value::Object(Some(classifier)));
-        shared.heap.set_field(collector, 2, downstream);
+        shared.mem.heap.set_field(collector, 2, downstream);
 
         let result = call_native(
             &shared,
@@ -58247,11 +58807,12 @@ mod tests {
 
         // Create stream with [10, 20, 10]
         let arr = shared
+            .mem
             .heap
             .alloc_array(ClassId::new(0), ArrayElementType::Reference, 3);
-        let _ = shared.heap.set_array_element(arr, 0, Value::Int(10));
-        let _ = shared.heap.set_array_element(arr, 1, Value::Int(20));
-        let _ = shared.heap.set_array_element(arr, 2, Value::Int(10));
+        let _ = shared.mem.heap.set_array_element(arr, 0, Value::Int(10));
+        let _ = shared.mem.heap.set_array_element(arr, 1, Value::Int(20));
+        let _ = shared.mem.heap.set_array_element(arr, 2, Value::Int(10));
 
         let stream = call_native(
             &shared,
@@ -58290,12 +58851,13 @@ mod tests {
         .unwrap()
         .unwrap();
 
-        let collector = shared.heap.alloc_object(ClassId::new(0), 3);
-        shared.heap.set_field(collector, 0, Value::Int(9)); // GROUPING_BY_DOWNSTREAM
+        let collector = shared.mem.heap.alloc_object(ClassId::new(0), 3);
+        shared.mem.heap.set_field(collector, 0, Value::Int(9)); // GROUPING_BY_DOWNSTREAM
         shared
+            .mem
             .heap
             .set_field(collector, 1, Value::Object(Some(classifier)));
-        shared.heap.set_field(collector, 2, downstream);
+        shared.mem.heap.set_field(collector, 2, downstream);
 
         let result = call_native(
             &shared,
@@ -58341,7 +58903,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let exc = shared.heap.alloc_object(ClassId::new(0), 3);
+        let exc = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         let result = call_native(
             &shared,
             &mut thread,
@@ -58359,7 +58921,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let sr = shared.heap.alloc_object(ClassId::new(0), 2);
+        let sr = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         let result = call_native(
             &shared,
             &mut thread,
@@ -58384,9 +58946,10 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         let arr = shared
+            .mem
             .heap
             .alloc_array(ClassId::new(0), ArrayElementType::Byte, 32);
-        let sr = shared.heap.alloc_object(ClassId::new(0), 2);
+        let sr = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         let _ = call_native(
             &shared,
             &mut thread,
@@ -58400,7 +58963,7 @@ mod tests {
         // Check that at least some bytes were set to non-zero
         let mut any_nonzero = false;
         for i in 0..32 {
-            match shared.heap.get_array_element(arr, i) {
+            match shared.mem.heap.get_array_element(arr, i) {
                 Ok(Value::Int(v)) if v != 0 => {
                     any_nonzero = true;
                     break;
@@ -58478,7 +59041,7 @@ mod tests {
         .unwrap();
         match result {
             Some(Value::Object(Some(r))) => {
-                let s = read_java_string(&shared.heap, r).unwrap();
+                let s = read_java_string(&shared.mem.heap, r).unwrap();
                 assert!(s.contains("\\Q"), "Pattern.quote should wrap in \\Q...\\E");
                 assert!(s.contains("\\E"), "Pattern.quote should wrap in \\Q...\\E");
             }
@@ -58606,7 +59169,7 @@ mod tests {
 
         match result {
             Some(Value::Object(Some(s))) => {
-                let text = read_java_string(&shared.heap, s).unwrap();
+                let text = read_java_string(&shared.mem.heap, s).unwrap();
                 assert_eq!(text, "02/04/2026", "DTF format should produce dd/MM/yyyy");
             }
             other => panic!("expected string, got {:?}", other),
@@ -58654,7 +59217,7 @@ mod tests {
 
         match result {
             Some(Value::Object(Some(s))) => {
-                let text = read_java_string(&shared.heap, s).unwrap();
+                let text = read_java_string(&shared.mem.heap, s).unwrap();
                 assert_eq!(text, "14:30:05");
             }
             other => panic!("expected string, got {:?}", other),
@@ -58668,7 +59231,7 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         let pattern = create_java_string(&shared, "#,##0.00");
-        let df = shared.heap.alloc_object(ClassId::new(0), 3);
+        let df = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         let _ = call_native(
             &shared,
             &mut thread,
@@ -58691,7 +59254,7 @@ mod tests {
 
         match result {
             Some(Value::Object(Some(s))) => {
-                let text = read_java_string(&shared.heap, s).unwrap();
+                let text = read_java_string(&shared.mem.heap, s).unwrap();
                 // Should have grouping and 2 decimal places
                 assert!(text.contains(','), "should have grouping: {}", text);
                 assert!(text.contains('.'), "should have decimal: {}", text);
@@ -58706,7 +59269,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let cls = shared.heap.alloc_object(ClassId::new(0), 3);
+        let cls = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         let result = call_native(
             &shared,
             &mut thread,
@@ -58757,7 +59320,7 @@ mod tests {
                 .unwrap();
                 match addr {
                     Some(Value::Object(Some(s))) => {
-                        let text = read_java_string(&shared.heap, s).unwrap();
+                        let text = read_java_string(&shared.mem.heap, s).unwrap();
                         assert_eq!(text, "127.0.0.1");
                     }
                     _ => panic!("expected address string"),
@@ -58796,7 +59359,7 @@ mod tests {
                 .unwrap();
                 match addr {
                     Some(Value::Object(Some(s))) => {
-                        let text = read_java_string(&shared.heap, s).unwrap();
+                        let text = read_java_string(&shared.mem.heap, s).unwrap();
                         assert_eq!(text, "127.0.0.1");
                     }
                     _ => panic!("expected address string"),
@@ -58814,7 +59377,7 @@ mod tests {
 
         // Create BigInteger(12) and BigInteger(8), gcd should be 4
         let a_str = create_java_string(&shared, "12");
-        let a = shared.heap.alloc_object(ClassId::new(0), 2);
+        let a = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -58826,7 +59389,7 @@ mod tests {
         .unwrap();
 
         let b_str = create_java_string(&shared, "8");
-        let b = shared.heap.alloc_object(ClassId::new(0), 2);
+        let b = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -58849,9 +59412,9 @@ mod tests {
 
         match result {
             Some(Value::Object(Some(r))) => {
-                let s = match shared.heap.get_field(r, 0) {
+                let s = match shared.mem.heap.get_field(r, 0) {
                     Value::Object(Some(str_ref)) => {
-                        read_java_string(&shared.heap, str_ref).unwrap()
+                        read_java_string(&shared.mem.heap, str_ref).unwrap()
                     }
                     _ => panic!("expected string value"),
                 };
@@ -58868,7 +59431,7 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         let s = create_java_string(&shared, "255");
-        let bi = shared.heap.alloc_object(ClassId::new(0), 2);
+        let bi = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -58932,10 +59495,11 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         let arr = shared
+            .mem
             .heap
             .alloc_array(ClassId::new(0), ArrayElementType::Int, 5);
         for (i, v) in [5, 3, 1, 4, 2].iter().enumerate() {
-            let _ = shared.heap.set_array_element(arr, i, Value::Int(*v));
+            let _ = shared.mem.heap.set_array_element(arr, i, Value::Int(*v));
         }
         call_native(
             &shared,
@@ -58948,10 +59512,12 @@ mod tests {
         .unwrap();
 
         let sorted: Vec<i32> = (0..5)
-            .map(|i| match shared.heap.get_array_element(arr, i).unwrap() {
-                Value::Int(v) => v,
-                _ => -1,
-            })
+            .map(
+                |i| match shared.mem.heap.get_array_element(arr, i).unwrap() {
+                    Value::Int(v) => v,
+                    _ => -1,
+                },
+            )
             .collect();
         assert_eq!(sorted, vec![1, 2, 3, 4, 5]);
     }
@@ -58963,10 +59529,11 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         let arr = shared
+            .mem
             .heap
             .alloc_array(ClassId::new(0), ArrayElementType::Int, 3);
         for (i, v) in [10, 20, 30].iter().enumerate() {
-            let _ = shared.heap.set_array_element(arr, i, Value::Int(*v));
+            let _ = shared.mem.heap.set_array_element(arr, i, Value::Int(*v));
         }
         let result = call_native(
             &shared,
@@ -58980,13 +59547,13 @@ mod tests {
 
         match result {
             Some(Value::Object(Some(new_arr))) => {
-                assert_eq!(shared.heap.array_length(new_arr), 5);
+                assert_eq!(shared.mem.heap.array_length(new_arr), 5);
                 assert_eq!(
-                    shared.heap.get_array_element(new_arr, 0).unwrap(),
+                    shared.mem.heap.get_array_element(new_arr, 0).unwrap(),
                     Value::Int(10)
                 );
                 assert_eq!(
-                    shared.heap.get_array_element(new_arr, 2).unwrap(),
+                    shared.mem.heap.get_array_element(new_arr, 2).unwrap(),
                     Value::Int(30)
                 );
             }
@@ -59001,10 +59568,11 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         let arr = shared
+            .mem
             .heap
             .alloc_array(ClassId::new(0), ArrayElementType::Int, 5);
         for (i, v) in [10, 20, 30, 40, 50].iter().enumerate() {
-            let _ = shared.heap.set_array_element(arr, i, Value::Int(*v));
+            let _ = shared.mem.heap.set_array_element(arr, i, Value::Int(*v));
         }
         let result = call_native(
             &shared,
@@ -59069,7 +59637,7 @@ mod tests {
         .unwrap();
         match result {
             Some(Value::Object(Some(r))) => {
-                assert_eq!(read_java_string(&shared.heap, r).unwrap(), "ababab");
+                assert_eq!(read_java_string(&shared.mem.heap, r).unwrap(), "ababab");
             }
             _ => panic!("expected string"),
         }
@@ -59196,7 +59764,7 @@ mod tests {
         .unwrap();
         match result {
             Some(Value::Object(Some(r))) => {
-                let text = read_java_string(&shared.heap, r).unwrap();
+                let text = read_java_string(&shared.mem.heap, r).unwrap();
                 assert_eq!(text, "hello");
             }
             other => panic!("expected string, got {:?}", other),
@@ -59210,9 +59778,9 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // Create an empty CF
-        let cf = shared.heap.alloc_object(ClassId::new(0), 2);
-        shared.heap.set_field(cf, 0, Value::Object(None)); // result
-        shared.heap.set_field(cf, 1, Value::Int(0)); // not done
+        let cf = shared.mem.heap.alloc_object(ClassId::new(0), 2);
+        shared.mem.heap.set_field(cf, 0, Value::Object(None)); // result
+        shared.mem.heap.set_field(cf, 1, Value::Int(0)); // not done
 
         let val = create_java_string(&shared, "world");
         let completed = call_native(
@@ -59251,7 +59819,7 @@ mod tests {
         .unwrap();
         match result {
             Some(Value::Object(Some(r))) => {
-                let text = read_java_string(&shared.heap, r).unwrap();
+                let text = read_java_string(&shared.mem.heap, r).unwrap();
                 assert_eq!(text, "world");
             }
             _ => panic!("expected string"),
@@ -59458,12 +60026,12 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let sc = shared.heap.alloc_object(ClassId::new(0), 3);
+        let sc = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         let input = create_java_string(&shared, "line1\nline2\nline3");
-        shared.heap.set_field(sc, 0, Value::Object(Some(input)));
-        shared.heap.set_field(sc, 1, Value::Int(0));
+        shared.mem.heap.set_field(sc, 0, Value::Object(Some(input)));
+        shared.mem.heap.set_field(sc, 1, Value::Int(0));
         let delim = create_java_string(&shared, "\\s+");
-        shared.heap.set_field(sc, 2, Value::Object(Some(delim)));
+        shared.mem.heap.set_field(sc, 2, Value::Object(Some(delim)));
 
         let line1 = call_native(
             &shared,
@@ -59476,7 +60044,7 @@ mod tests {
         .unwrap();
         match line1 {
             Some(Value::Object(Some(s))) => {
-                assert_eq!(read_java_string(&shared.heap, s).unwrap(), "line1");
+                assert_eq!(read_java_string(&shared.mem.heap, s).unwrap(), "line1");
             }
             _ => panic!("expected string"),
         }
@@ -59492,7 +60060,7 @@ mod tests {
         .unwrap();
         match line2 {
             Some(Value::Object(Some(s))) => {
-                assert_eq!(read_java_string(&shared.heap, s).unwrap(), "line2");
+                assert_eq!(read_java_string(&shared.mem.heap, s).unwrap(), "line2");
             }
             _ => panic!("expected string"),
         }
@@ -59541,7 +60109,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let sv = shared.heap.alloc_object(ClassId::new(0), 3);
+        let sv = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -59582,7 +60150,7 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // Create two ScopedValues
-        let sv1 = shared.heap.alloc_object(ClassId::new(0), 3);
+        let sv1 = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -59593,7 +60161,7 @@ mod tests {
         )
         .unwrap();
 
-        let sv2 = shared.heap.alloc_object(ClassId::new(0), 3);
+        let sv2 = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -59650,9 +60218,9 @@ mod tests {
         .unwrap();
 
         // After run, both should be unbound
-        let bound1 = shared.heap.get_field(sv1, 1);
+        let bound1 = shared.mem.heap.get_field(sv1, 1);
         assert_eq!(bound1, Value::Int(0), "sv1 should be unbound after run");
-        let bound2 = shared.heap.get_field(sv2, 1);
+        let bound2 = shared.mem.heap.get_field(sv2, 1);
         assert_eq!(bound2, Value::Int(0), "sv2 should be unbound after run");
     }
 
@@ -59681,11 +60249,11 @@ mod tests {
         .unwrap();
 
         let ts1 = match snap1 {
-            Some(Value::Object(Some(r))) => shared.heap.get_field(r, 1),
+            Some(Value::Object(Some(r))) => shared.mem.heap.get_field(r, 1),
             _ => panic!("expected snapshot"),
         };
         let ts2 = match snap2 {
-            Some(Value::Object(Some(r))) => shared.heap.get_field(r, 1),
+            Some(Value::Object(Some(r))) => shared.mem.heap.get_field(r, 1),
             _ => panic!("expected snapshot"),
         };
         match (ts1, ts2) {
@@ -59703,7 +60271,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let scope = shared.heap.alloc_object(ClassId::new(0), 8);
+        let scope = shared.mem.heap.alloc_object(ClassId::new(0), 8);
         call_native(
             &shared,
             &mut thread,
@@ -59740,7 +60308,7 @@ mod tests {
         );
         if let Ok(Some(Value::Object(Some(subtask)))) = result {
             // Subtask state should be UNAVAILABLE (0)
-            assert_eq!(shared.heap.get_field(subtask, 0), Value::Int(0));
+            assert_eq!(shared.mem.heap.get_field(subtask, 0), Value::Int(0));
         }
     }
 
@@ -59749,7 +60317,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let scope = shared.heap.alloc_object(ClassId::new(0), 8);
+        let scope = shared.mem.heap.alloc_object(ClassId::new(0), 8);
         call_native(
             &shared,
             &mut thread,
@@ -59772,9 +60340,9 @@ mod tests {
         .unwrap();
 
         // Both task_count and completed_count should be 1 (synchronous execution)
-        let task_count = shared.heap.get_field(scope, 2);
+        let task_count = shared.mem.heap.get_field(scope, 2);
         assert_eq!(task_count, Value::Int(1));
-        let completed = shared.heap.get_field(scope, 3);
+        let completed = shared.mem.heap.get_field(scope, 3);
         assert_eq!(completed, Value::Int(1));
     }
 
@@ -59783,7 +60351,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let scope = shared.heap.alloc_object(ClassId::new(0), 8);
+        let scope = shared.mem.heap.alloc_object(ClassId::new(0), 8);
         call_native(
             &shared,
             &mut thread,
@@ -59822,7 +60390,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let scope = shared.heap.alloc_object(ClassId::new(0), 8);
+        let scope = shared.mem.heap.alloc_object(ClassId::new(0), 8);
         call_native(
             &shared,
             &mut thread,
@@ -59859,7 +60427,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let scope = shared.heap.alloc_object(ClassId::new(0), 8);
+        let scope = shared.mem.heap.alloc_object(ClassId::new(0), 8);
         call_native(
             &shared,
             &mut thread,
@@ -59887,7 +60455,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let scope = shared.heap.alloc_object(ClassId::new(0), 8);
+        let scope = shared.mem.heap.alloc_object(ClassId::new(0), 8);
         call_native(
             &shared,
             &mut thread,
@@ -59899,8 +60467,11 @@ mod tests {
         .unwrap();
 
         // Manually store an exception
-        let exc = shared.heap.alloc_object(ClassId::new(0), 1);
-        shared.heap.set_field(scope, 4, Value::Object(Some(exc)));
+        let exc = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        shared
+            .mem
+            .heap
+            .set_field(scope, 4, Value::Object(Some(exc)));
 
         // throwIfFailed should now error
         let result = call_native(
@@ -59922,7 +60493,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let scope = shared.heap.alloc_object(ClassId::new(0), 8);
+        let scope = shared.mem.heap.alloc_object(ClassId::new(0), 8);
         call_native(
             &shared,
             &mut thread,
@@ -60267,10 +60838,10 @@ mod tests {
         match result {
             Some(Value::Object(Some(species))) => {
                 // species field 1 = element_type (BYTE=0)
-                let elem = shared.heap.get_field(species, 1);
+                let elem = shared.mem.heap.get_field(species, 1);
                 assert_eq!(elem, Value::Int(0), "element type should be BYTE(0)");
                 // species field 3 = lane_count (256/8=32)
-                let lc = shared.heap.get_field(species, 3);
+                let lc = shared.mem.heap.get_field(species, 3);
                 assert_eq!(
                     lc,
                     Value::Int(32),
@@ -60300,11 +60871,11 @@ mod tests {
         match result {
             Some(Value::Object(Some(ch))) => {
                 // field 1 = open (should be 1)
-                assert_eq!(shared.heap.get_field(ch, 1), Value::Int(1));
+                assert_eq!(shared.mem.heap.get_field(ch, 1), Value::Int(1));
                 // field 2 = connected (should be 0)
-                assert_eq!(shared.heap.get_field(ch, 2), Value::Int(0));
+                assert_eq!(shared.mem.heap.get_field(ch, 2), Value::Int(0));
                 // field 3 = blocking (should be 1)
-                assert_eq!(shared.heap.get_field(ch, 3), Value::Int(1));
+                assert_eq!(shared.mem.heap.get_field(ch, 3), Value::Int(1));
             }
             _ => panic!("expected DatagramChannel object"),
         }
@@ -60330,7 +60901,7 @@ mod tests {
         };
 
         // Create a fake SocketAddress
-        let sa = shared.heap.alloc_object(ClassId::new(0), 2);
+        let sa = shared.mem.heap.alloc_object(ClassId::new(0), 2);
 
         // Connect
         call_native(
@@ -60343,7 +60914,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            shared.heap.get_field(ch, 2),
+            shared.mem.heap.get_field(ch, 2),
             Value::Int(1),
             "should be connected"
         );
@@ -60371,7 +60942,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            shared.heap.get_field(ch, 2),
+            shared.mem.heap.get_field(ch, 2),
             Value::Int(0),
             "should be disconnected"
         );
@@ -60450,7 +61021,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            shared.heap.get_field(ch, 3),
+            shared.mem.heap.get_field(ch, 3),
             Value::Int(0),
             "should be non-blocking"
         );
@@ -60562,9 +61133,9 @@ mod tests {
         .unwrap()
         .unwrap();
         if let Value::Object(Some(obj)) = gcd {
-            let val = shared.heap.get_field(obj, 0);
+            let val = shared.mem.heap.get_field(obj, 0);
             if let Value::Object(Some(s)) = val {
-                let text = read_java_string(&shared.heap, s).unwrap();
+                let text = read_java_string(&shared.mem.heap, s).unwrap();
                 assert_eq!(text, "6");
             } else {
                 panic!("expected string value field");
@@ -60654,9 +61225,9 @@ mod tests {
         .unwrap()
         .unwrap();
         if let Value::Object(Some(obj)) = shifted {
-            let val = shared.heap.get_field(obj, 0);
+            let val = shared.mem.heap.get_field(obj, 0);
             if let Value::Object(Some(s)) = val {
-                let text = read_java_string(&shared.heap, s).unwrap();
+                let text = read_java_string(&shared.mem.heap, s).unwrap();
                 assert_eq!(text, "1024");
             } else {
                 panic!("expected string value");
@@ -60705,8 +61276,8 @@ mod tests {
         .unwrap();
         if let Value::Object(Some(obj)) = and_result {
             let text = read_java_string(
-                &shared.heap,
-                match shared.heap.get_field(obj, 0) {
+                &shared.mem.heap,
+                match shared.mem.heap.get_field(obj, 0) {
                     Value::Object(Some(s)) => s,
                     _ => panic!("no str"),
                 },
@@ -60727,8 +61298,8 @@ mod tests {
         .unwrap();
         if let Value::Object(Some(obj)) = or_result {
             let text = read_java_string(
-                &shared.heap,
-                match shared.heap.get_field(obj, 0) {
+                &shared.mem.heap,
+                match shared.mem.heap.get_field(obj, 0) {
                     Value::Object(Some(s)) => s,
                     _ => panic!("no str"),
                 },
@@ -60749,8 +61320,8 @@ mod tests {
         .unwrap();
         if let Value::Object(Some(obj)) = xor_result {
             let text = read_java_string(
-                &shared.heap,
-                match shared.heap.get_field(obj, 0) {
+                &shared.mem.heap,
+                match shared.mem.heap.get_field(obj, 0) {
                     Value::Object(Some(s)) => s,
                     _ => panic!("no str"),
                 },
@@ -60809,8 +61380,8 @@ mod tests {
         .unwrap();
         if let Value::Object(Some(obj)) = result {
             let text = read_java_string(
-                &shared.heap,
-                match shared.heap.get_field(obj, 0) {
+                &shared.mem.heap,
+                match shared.mem.heap.get_field(obj, 0) {
                     Value::Object(Some(s)) => s,
                     _ => panic!("no str"),
                 },
@@ -60900,8 +61471,8 @@ mod tests {
         .unwrap();
         if let Value::Object(Some(obj)) = result {
             let text = read_java_string(
-                &shared.heap,
-                match shared.heap.get_field(obj, 0) {
+                &shared.mem.heap,
+                match shared.mem.heap.get_field(obj, 0) {
                     Value::Object(Some(s)) => s,
                     _ => panic!("no str"),
                 },
@@ -60966,7 +61537,7 @@ mod tests {
     fn m5_jit_skip_set_does_not_block_user_classes() {
         // Verify the JIT skip set starts empty РІР‚вЂќ user classes are not pre-blocked
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
-        let skip_set = shared.jit_skip_set.read();
+        let skip_set = shared.jit.jit_skip_set.read();
         assert!(skip_set.is_empty(), "JIT skip set should start empty");
     }
 
@@ -61244,8 +61815,8 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // Create a fake Function object (field 0 unused in this test)
-        let func1 = shared.heap.alloc_object(ClassId::new(0), 2);
-        let func2 = shared.heap.alloc_object(ClassId::new(0), 2);
+        let func1 = shared.mem.heap.alloc_object(ClassId::new(0), 2);
+        let func2 = shared.mem.heap.alloc_object(ClassId::new(0), 2);
 
         // Call Function.andThen РІР‚вЂќ should create a Function$AndThen composite
         let result = call_native(
@@ -61269,8 +61840,8 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let func1 = shared.heap.alloc_object(ClassId::new(0), 2);
-        let func2 = shared.heap.alloc_object(ClassId::new(0), 2);
+        let func1 = shared.mem.heap.alloc_object(ClassId::new(0), 2);
+        let func2 = shared.mem.heap.alloc_object(ClassId::new(0), 2);
 
         let result = call_native(
             &shared,
@@ -61305,7 +61876,7 @@ mod tests {
         .unwrap();
 
         // Apply identity to an object РІР‚вЂќ should return the same object
-        let obj = shared.heap.alloc_object(ClassId::new(0), 0);
+        let obj = shared.mem.heap.alloc_object(ClassId::new(0), 0);
         let identity_ref = match identity {
             Value::Object(Some(r)) => r,
             _ => panic!("Expected object"),
@@ -61331,8 +61902,8 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let cons1 = shared.heap.alloc_object(ClassId::new(0), 2);
-        let cons2 = shared.heap.alloc_object(ClassId::new(0), 2);
+        let cons1 = shared.mem.heap.alloc_object(ClassId::new(0), 2);
+        let cons2 = shared.mem.heap.alloc_object(ClassId::new(0), 2);
 
         let result = call_native(
             &shared,
@@ -61356,8 +61927,8 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // Create an andThen composite
-        let func1 = shared.heap.alloc_object(ClassId::new(0), 2);
-        let func2 = shared.heap.alloc_object(ClassId::new(0), 2);
+        let func1 = shared.mem.heap.alloc_object(ClassId::new(0), 2);
+        let func2 = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         let _composite = call_native(
             &shared,
             &mut thread,
@@ -61369,7 +61940,7 @@ mod tests {
         .unwrap();
 
         // Verify the Function$AndThen class is loaded with correct interfaces
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         if let Some(and_then_class) = cm
             .class_store
             .find_by_name("java/util/function/Function$AndThen")
@@ -61391,8 +61962,8 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // Create two Function objects and compose them with andThen
-        let f1 = shared.heap.alloc_object(ClassId::new(0), 2);
-        let f2 = shared.heap.alloc_object(ClassId::new(0), 2);
+        let f1 = shared.mem.heap.alloc_object(ClassId::new(0), 2);
+        let f2 = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         let composite = call_native(
             &shared,
             &mut thread,
@@ -61406,8 +61977,8 @@ mod tests {
         // Verify composite is a Function$AndThen with 2 fields
         match composite {
             Value::Object(Some(r)) => {
-                let cid = shared.heap.class_id_of(r);
-                let cm = shared.class_manager.read();
+                let cid = shared.mem.heap.class_id_of(r);
+                let cm = shared.classes.class_manager.read();
                 let name = cm.get_class(cid).map(|c| &*c.name);
                 assert_eq!(name, Some("java/util/function/Function$AndThen"));
             }
@@ -61420,8 +61991,8 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let f1 = shared.heap.alloc_object(ClassId::new(0), 2);
-        let f2 = shared.heap.alloc_object(ClassId::new(0), 2);
+        let f1 = shared.mem.heap.alloc_object(ClassId::new(0), 2);
+        let f2 = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         let composite = call_native(
             &shared,
             &mut thread,
@@ -61434,8 +62005,8 @@ mod tests {
         .unwrap();
         match composite {
             Value::Object(Some(r)) => {
-                let cid = shared.heap.class_id_of(r);
-                let cm = shared.class_manager.read();
+                let cid = shared.mem.heap.class_id_of(r);
+                let cm = shared.classes.class_manager.read();
                 let name = cm.get_class(cid).map(|c| &*c.name);
                 assert_eq!(name, Some("java/util/function/Function$Compose"));
             }
@@ -61448,8 +62019,8 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let p1 = shared.heap.alloc_object(ClassId::new(0), 2);
-        let p2 = shared.heap.alloc_object(ClassId::new(0), 2);
+        let p1 = shared.mem.heap.alloc_object(ClassId::new(0), 2);
+        let p2 = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         let composite = call_native(
             &shared,
             &mut thread,
@@ -61470,8 +62041,8 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let p1 = shared.heap.alloc_object(ClassId::new(0), 2);
-        let p2 = shared.heap.alloc_object(ClassId::new(0), 2);
+        let p1 = shared.mem.heap.alloc_object(ClassId::new(0), 2);
+        let p2 = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         let composite = call_native(
             &shared,
             &mut thread,
@@ -61492,7 +62063,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let p1 = shared.heap.alloc_object(ClassId::new(0), 2);
+        let p1 = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         let composite = call_native(
             &shared,
             &mut thread,
@@ -61519,7 +62090,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         // Allocate many objects РІР‚вЂќ should not panic
         for _i in 0..1000 {
-            let _obj = shared.heap.alloc_object(ClassId::new(0), 4);
+            let _obj = shared.mem.heap.alloc_object(ClassId::new(0), 4);
         }
     }
 
@@ -61553,14 +62124,15 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         // Allocate 5000 objects with fields (simulating 8+ test cycles)
         for _ in 0..5000 {
-            let _obj = shared.heap.alloc_object(ClassId::new(0), 8);
+            let _obj = shared.mem.heap.alloc_object(ClassId::new(0), 8);
         }
         // Allocate 2000 arrays
         for _ in 0..2000 {
-            let _arr =
-                shared
-                    .heap
-                    .alloc_array(ClassId::new(0), cratonvm_gc::ArrayElementType::Int, 100);
+            let _arr = shared.mem.heap.alloc_array(
+                ClassId::new(0),
+                cratonvm_gc::ArrayElementType::Int,
+                100,
+            );
         }
     }
 
@@ -61664,13 +62236,14 @@ mod tests {
         // what would fit in the old 8MB young gen without GC.
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         for _ in 0..20_000 {
-            let _obj = shared.heap.alloc_object(ClassId::new(0), 4);
+            let _obj = shared.mem.heap.alloc_object(ClassId::new(0), 4);
         }
         for _ in 0..5_000 {
-            let _arr =
-                shared
-                    .heap
-                    .alloc_array(ClassId::new(0), cratonvm_gc::ArrayElementType::Int, 50);
+            let _arr = shared.mem.heap.alloc_array(
+                ClassId::new(0),
+                cratonvm_gc::ArrayElementType::Int,
+                50,
+            );
         }
     }
 
@@ -61683,7 +62256,7 @@ mod tests {
                 let s = shared.clone();
                 std::thread::spawn(move || {
                     for _ in 0..2000 {
-                        let _obj = s.heap.alloc_object(ClassId::new(0), 4);
+                        let _obj = s.mem.heap.alloc_object(ClassId::new(0), 4);
                     }
                 })
             })
@@ -61706,12 +62279,12 @@ mod tests {
 
         let t1 = std::thread::spawn(move || {
             for _ in 0..500 {
-                let _obj = s1.heap.alloc_object(ClassId::new(0), 4);
+                let _obj = s1.mem.heap.alloc_object(ClassId::new(0), 4);
             }
         });
         let t2 = std::thread::spawn(move || {
             for _ in 0..500 {
-                let _obj = s2.heap.alloc_object(ClassId::new(0), 4);
+                let _obj = s2.mem.heap.alloc_object(ClassId::new(0), 4);
             }
         });
 
@@ -61723,23 +62296,23 @@ mod tests {
     fn m6_concurrent_field_read_write() {
         // Two threads read/write fields on a shared object.
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
-        let obj = shared.heap.alloc_object(ClassId::new(0), 4);
+        let obj = shared.mem.heap.alloc_object(ClassId::new(0), 4);
 
-        shared.heap.set_field(obj, 0, Value::Int(0));
+        shared.mem.heap.set_field(obj, 0, Value::Int(0));
 
         let s1 = shared.clone();
         let s2 = shared.clone();
 
         let t1 = std::thread::spawn(move || {
             for i in 0..1000 {
-                s1.heap.set_field(obj, 0, Value::Int(i));
-                let _ = s1.heap.get_field(obj, 1);
+                s1.mem.heap.set_field(obj, 0, Value::Int(i));
+                let _ = s1.mem.heap.get_field(obj, 1);
             }
         });
         let t2 = std::thread::spawn(move || {
             for i in 0..1000 {
-                s2.heap.set_field(obj, 1, Value::Int(i));
-                let _ = s2.heap.get_field(obj, 0);
+                s2.mem.heap.set_field(obj, 1, Value::Int(i));
+                let _ = s2.mem.heap.get_field(obj, 0);
             }
         });
 
@@ -61747,8 +62320,8 @@ mod tests {
         t2.join().expect("thread 2 panicked");
 
         // Both fields should have been written РІР‚вЂќ read final values
-        let v0 = shared.heap.get_field(obj, 0);
-        let v1 = shared.heap.get_field(obj, 1);
+        let v0 = shared.mem.heap.get_field(obj, 0);
+        let v1 = shared.mem.heap.get_field(obj, 1);
         match (v0, v1) {
             (Value::Int(a), Value::Int(b)) => {
                 assert!(a >= 0 && a < 1000, "field 0 should have a valid int");
@@ -61762,9 +62335,9 @@ mod tests {
     fn m6_monitor_mutual_exclusion() {
         // Two threads use monitorenter/monitorexit for mutual exclusion on a shared counter.
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
-        let lock_obj = shared.heap.alloc_object(ClassId::new(0), 1);
-        let counter_obj = shared.heap.alloc_object(ClassId::new(0), 1);
-        shared.heap.set_field(counter_obj, 0, Value::Int(0));
+        let lock_obj = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        let counter_obj = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        shared.mem.heap.set_field(counter_obj, 0, Value::Int(0));
 
         let s1 = shared.clone();
         let s2 = shared.clone();
@@ -61773,33 +62346,33 @@ mod tests {
         let t1 = std::thread::spawn(move || {
             let tid = ThreadId(100);
             for _ in 0..iterations {
-                s1.monitors.enter(lock_obj, tid);
-                let val = match s1.heap.get_field(counter_obj, 0) {
+                s1.threads.monitors.enter(lock_obj, tid);
+                let val = match s1.mem.heap.get_field(counter_obj, 0) {
                     Value::Int(v) => v,
                     _ => 0,
                 };
-                s1.heap.set_field(counter_obj, 0, Value::Int(val + 1));
-                s1.monitors.exit(lock_obj, tid).unwrap();
+                s1.mem.heap.set_field(counter_obj, 0, Value::Int(val + 1));
+                s1.threads.monitors.exit(lock_obj, tid).unwrap();
             }
         });
 
         let t2 = std::thread::spawn(move || {
             let tid = ThreadId(101);
             for _ in 0..iterations {
-                s2.monitors.enter(lock_obj, tid);
-                let val = match s2.heap.get_field(counter_obj, 0) {
+                s2.threads.monitors.enter(lock_obj, tid);
+                let val = match s2.mem.heap.get_field(counter_obj, 0) {
                     Value::Int(v) => v,
                     _ => 0,
                 };
-                s2.heap.set_field(counter_obj, 0, Value::Int(val + 1));
-                s2.monitors.exit(lock_obj, tid).unwrap();
+                s2.mem.heap.set_field(counter_obj, 0, Value::Int(val + 1));
+                s2.threads.monitors.exit(lock_obj, tid).unwrap();
             }
         });
 
         t1.join().expect("thread 1 panicked");
         t2.join().expect("thread 2 panicked");
 
-        let final_val = match shared.heap.get_field(counter_obj, 0) {
+        let final_val = match shared.mem.heap.get_field(counter_obj, 0) {
             Value::Int(v) => v,
             _ => panic!("Expected Int"),
         };
@@ -61816,45 +62389,55 @@ mod tests {
     fn m6_thread_registry_tracks_concurrent_threads() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
 
-        let tid1 = shared.thread_registry.next_thread_id();
-        let tid2 = shared.thread_registry.next_thread_id();
+        let tid1 = shared.threads.thread_registry.next_thread_id();
+        let tid2 = shared.threads.thread_registry.next_thread_id();
         assert_ne!(tid1, tid2, "thread IDs should be unique");
 
-        shared.thread_registry.register(tid1, "worker-1", None);
-        shared.thread_registry.register(tid2, "worker-2", None);
+        shared
+            .threads
+            .thread_registry
+            .register(tid1, "worker-1", None);
+        shared
+            .threads
+            .thread_registry
+            .register(tid2, "worker-2", None);
 
-        assert!(shared.thread_registry.is_alive(tid1));
-        assert!(shared.thread_registry.is_alive(tid2));
+        assert!(shared.threads.thread_registry.is_alive(tid1));
+        assert!(shared.threads.thread_registry.is_alive(tid2));
 
-        shared.thread_registry.mark_dead(tid1);
-        assert!(!shared.thread_registry.is_alive(tid1));
-        assert!(shared.thread_registry.is_alive(tid2));
+        shared.threads.thread_registry.mark_dead(tid1);
+        assert!(!shared.threads.thread_registry.is_alive(tid1));
+        assert!(shared.threads.thread_registry.is_alive(tid2));
 
-        shared.thread_registry.mark_dead(tid2);
-        assert!(!shared.thread_registry.is_alive(tid2));
+        shared.threads.thread_registry.mark_dead(tid2);
+        assert!(!shared.threads.thread_registry.is_alive(tid2));
     }
 
     #[test]
     fn m6_concurrent_array_operations() {
         // Two threads write to different elements of a shared array.
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
-        let arr = shared
-            .heap
-            .alloc_array(ClassId::new(0), cratonvm_gc::ArrayElementType::Int, 100);
+        let arr =
+            shared
+                .mem
+                .heap
+                .alloc_array(ClassId::new(0), cratonvm_gc::ArrayElementType::Int, 100);
 
         let s1 = shared.clone();
         let s2 = shared.clone();
 
         let t1 = std::thread::spawn(move || {
             for i in 0..50 {
-                s1.heap
+                s1.mem
+                    .heap
                     .set_array_element(arr, i, Value::Int(i as i32 * 10))
                     .unwrap();
             }
         });
         let t2 = std::thread::spawn(move || {
             for i in 50..100 {
-                s2.heap
+                s2.mem
+                    .heap
                     .set_array_element(arr, i, Value::Int(i as i32 * 10))
                     .unwrap();
             }
@@ -61865,7 +62448,7 @@ mod tests {
 
         // Verify all elements written correctly
         for i in 0..100 {
-            let val = shared.heap.get_array_element(arr, i).unwrap();
+            let val = shared.mem.heap.get_array_element(arr, i).unwrap();
             match val {
                 Value::Int(v) => assert_eq!(v, i as i32 * 10, "arr[{}] should be {}", i, i * 10),
                 _ => panic!("Expected Int at index {}", i),
@@ -61877,25 +62460,25 @@ mod tests {
     fn m6_monitor_reentrant_locking() {
         // A single thread can reenter the same monitor multiple times.
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
-        let lock_obj = shared.heap.alloc_object(ClassId::new(0), 0);
+        let lock_obj = shared.mem.heap.alloc_object(ClassId::new(0), 0);
         let tid = ThreadId(200);
 
         // Enter 3 times (reentrant)
-        shared.monitors.enter(lock_obj, tid);
-        shared.monitors.enter(lock_obj, tid);
-        shared.monitors.enter(lock_obj, tid);
+        shared.threads.monitors.enter(lock_obj, tid);
+        shared.threads.monitors.enter(lock_obj, tid);
+        shared.threads.monitors.enter(lock_obj, tid);
 
         // Exit 3 times
-        shared.monitors.exit(lock_obj, tid).unwrap();
-        shared.monitors.exit(lock_obj, tid).unwrap();
-        shared.monitors.exit(lock_obj, tid).unwrap();
+        shared.threads.monitors.exit(lock_obj, tid).unwrap();
+        shared.threads.monitors.exit(lock_obj, tid).unwrap();
+        shared.threads.monitors.exit(lock_obj, tid).unwrap();
 
         // Another thread should now be able to acquire
         let s2 = shared.clone();
         let t = std::thread::spawn(move || {
             let tid2 = ThreadId(201);
-            s2.monitors.enter(lock_obj, tid2);
-            s2.monitors.exit(lock_obj, tid2).unwrap();
+            s2.threads.monitors.enter(lock_obj, tid2);
+            s2.threads.monitors.exit(lock_obj, tid2).unwrap();
         });
         t.join().expect("reentrant test: second thread panicked");
     }
@@ -61909,8 +62492,8 @@ mod tests {
                 let s = shared.clone();
                 std::thread::spawn(move || {
                     for _ in 0..200 {
-                        let _obj = s.heap.alloc_object(ClassId::new(0), 2);
-                        let _arr = s.heap.alloc_array(
+                        let _obj = s.mem.heap.alloc_object(ClassId::new(0), 2);
+                        let _arr = s.mem.heap.alloc_array(
                             ClassId::new(0),
                             cratonvm_gc::ArrayElementType::Int,
                             10,
@@ -62099,7 +62682,7 @@ mod tests {
 
         let class_id;
         {
-            let mut cm = shared.class_manager.write();
+            let mut cm = shared.classes.class_manager.write();
             class_id = cm.class_store.next_id();
             cm.class_store.add(Class {
                 id: class_id,
@@ -62182,7 +62765,7 @@ mod tests {
 
         let class_id;
         {
-            let mut cm = shared.class_manager.write();
+            let mut cm = shared.classes.class_manager.write();
             class_id = cm.class_store.next_id();
             cm.class_store.add(Class {
                 id: class_id,
@@ -62317,7 +62900,7 @@ mod tests {
             use cratonvm_reader::class_access_flags::ClassAccessFlags;
             use cratonvm_reader::class_file_version::ClassFileVersion;
 
-            let mut cm = shared.class_manager.write();
+            let mut cm = shared.classes.class_manager.write();
             class_id = cm.class_store.next_id();
             cm.class_store.add(Class {
                 id: class_id,
@@ -62635,12 +63218,12 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let class_id = m16_register_class(&shared, "com/example/Point", &[("x", "I"), ("y", "I")]);
 
-        let obj = shared.heap.alloc_object(class_id, 2);
-        shared.heap.set_field(obj, 0, Value::Int(10));
-        shared.heap.set_field(obj, 1, Value::Int(20));
+        let obj = shared.mem.heap.alloc_object(class_id, 2);
+        shared.mem.heap.set_field(obj, 0, Value::Int(10));
+        shared.mem.heap.set_field(obj, 1, Value::Int(20));
 
         // Create ObjectMapper (2nd arg unused)
-        let mapper = shared.heap.alloc_object(ClassId::new(0), 1);
+        let mapper = shared.mem.heap.alloc_object(ClassId::new(0), 1);
 
         let mut thread = JvmThread::new(ThreadId(0), "test");
         let result = call_native(
@@ -62658,7 +63241,7 @@ mod tests {
             Value::Object(Some(r)) => r,
             _ => panic!("M16: expected String result"),
         };
-        let json = read_java_string(&shared.heap, json_ref).unwrap();
+        let json = read_java_string(&shared.mem.heap, json_ref).unwrap();
         assert!(json.contains("\"x\":10"), "M16: expected x:10 in {json}");
         assert!(json.contains("\"y\":20"), "M16: expected y:20 in {json}");
     }
@@ -62673,11 +63256,14 @@ mod tests {
         );
 
         let name_str = crate::vm::vm_object::create_java_string(&shared, "Alice");
-        let obj = shared.heap.alloc_object(class_id, 2);
-        shared.heap.set_field(obj, 0, Value::Object(Some(name_str)));
-        shared.heap.set_field(obj, 1, Value::Int(30));
+        let obj = shared.mem.heap.alloc_object(class_id, 2);
+        shared
+            .mem
+            .heap
+            .set_field(obj, 0, Value::Object(Some(name_str)));
+        shared.mem.heap.set_field(obj, 1, Value::Int(30));
 
-        let mapper = shared.heap.alloc_object(ClassId::new(0), 1);
+        let mapper = shared.mem.heap.alloc_object(ClassId::new(0), 1);
         let mut thread = JvmThread::new(ThreadId(0), "test");
         let result = call_native(
             &shared,
@@ -62694,7 +63280,7 @@ mod tests {
             Value::Object(Some(r)) => r,
             _ => panic!("M16: expected String"),
         };
-        let json = read_java_string(&shared.heap, json_ref).unwrap();
+        let json = read_java_string(&shared.mem.heap, json_ref).unwrap();
         assert!(
             json.contains("\"name\":\"Alice\""),
             "M16: expected name:Alice in {json}"
@@ -62714,11 +63300,11 @@ mod tests {
             &[("enabled", "Z"), ("count", "I")],
         );
 
-        let obj = shared.heap.alloc_object(class_id, 2);
-        shared.heap.set_field(obj, 0, Value::Int(1)); // true
-        shared.heap.set_field(obj, 1, Value::Int(42));
+        let obj = shared.mem.heap.alloc_object(class_id, 2);
+        shared.mem.heap.set_field(obj, 0, Value::Int(1)); // true
+        shared.mem.heap.set_field(obj, 1, Value::Int(42));
 
-        let mapper = shared.heap.alloc_object(ClassId::new(0), 1);
+        let mapper = shared.mem.heap.alloc_object(ClassId::new(0), 1);
         let mut thread = JvmThread::new(ThreadId(0), "test");
         let result = call_native(
             &shared,
@@ -62735,7 +63321,7 @@ mod tests {
             Value::Object(Some(r)) => r,
             _ => panic!("M16: expected String"),
         };
-        let json = read_java_string(&shared.heap, json_ref).unwrap();
+        let json = read_java_string(&shared.mem.heap, json_ref).unwrap();
         assert!(
             json.contains("\"enabled\":true"),
             "M16: expected enabled:true in {json}"
@@ -62749,7 +63335,7 @@ mod tests {
     #[test]
     fn m16_jackson_write_null_object() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
-        let mapper = shared.heap.alloc_object(ClassId::new(0), 1);
+        let mapper = shared.mem.heap.alloc_object(ClassId::new(0), 1);
         let mut thread = JvmThread::new(ThreadId(0), "test");
         let result = call_native(
             &shared,
@@ -62766,7 +63352,7 @@ mod tests {
             Value::Object(Some(r)) => r,
             _ => panic!("M16: expected String"),
         };
-        let json = read_java_string(&shared.heap, json_ref).unwrap();
+        let json = read_java_string(&shared.mem.heap, json_ref).unwrap();
         assert_eq!(json, "null", "M16: null object should serialize as 'null'");
     }
 
@@ -62779,7 +63365,7 @@ mod tests {
         let mirror = crate::vm::vm_object::get_or_create_class_mirror(&shared, class_id);
 
         let json_str = crate::vm::vm_object::create_java_string(&shared, r#"{"x":5,"y":10}"#);
-        let mapper = shared.heap.alloc_object(ClassId::new(0), 1);
+        let mapper = shared.mem.heap.alloc_object(ClassId::new(0), 1);
 
         let mut thread = JvmThread::new(ThreadId(0), "test");
         let result = call_native(
@@ -62801,8 +63387,8 @@ mod tests {
             Value::Object(Some(r)) => r,
             _ => panic!("M16: expected Object"),
         };
-        let x = shared.heap.get_field(obj, 0);
-        let y = shared.heap.get_field(obj, 1);
+        let x = shared.mem.heap.get_field(obj, 0);
+        let y = shared.mem.heap.get_field(obj, 1);
         assert_eq!(x.as_int(), Some(5), "M16: expected x=5");
         assert_eq!(y.as_int(), Some(10), "M16: expected y=10");
     }
@@ -62819,7 +63405,7 @@ mod tests {
         let mirror = crate::vm::vm_object::get_or_create_class_mirror(&shared, class_id);
         let json_str =
             crate::vm::vm_object::create_java_string(&shared, r#"{"label":"hello","count":7}"#);
-        let mapper = shared.heap.alloc_object(ClassId::new(0), 1);
+        let mapper = shared.mem.heap.alloc_object(ClassId::new(0), 1);
 
         let mut thread = JvmThread::new(ThreadId(0), "test");
         let result = call_native(
@@ -62841,13 +63427,13 @@ mod tests {
             Value::Object(Some(r)) => r,
             _ => panic!("M16: expected Object"),
         };
-        let label_val = shared.heap.get_field(obj, 0);
-        let count_val = shared.heap.get_field(obj, 1);
+        let label_val = shared.mem.heap.get_field(obj, 0);
+        let count_val = shared.mem.heap.get_field(obj, 1);
         let label_ref = match label_val {
             Value::Object(Some(r)) => r,
             _ => panic!("M16: expected String for label"),
         };
-        let label = read_java_string(&shared.heap, label_ref).unwrap();
+        let label = read_java_string(&shared.mem.heap, label_ref).unwrap();
         assert_eq!(label, "hello", "M16: expected label=hello");
         assert_eq!(count_val.as_int(), Some(7), "M16: expected count=7");
     }
@@ -62861,11 +63447,11 @@ mod tests {
             &[("port", "I"), ("debug", "Z")],
         );
 
-        let obj = shared.heap.alloc_object(class_id, 2);
-        shared.heap.set_field(obj, 0, Value::Int(8080));
-        shared.heap.set_field(obj, 1, Value::Int(1)); // true
+        let obj = shared.mem.heap.alloc_object(class_id, 2);
+        shared.mem.heap.set_field(obj, 0, Value::Int(8080));
+        shared.mem.heap.set_field(obj, 1, Value::Int(1)); // true
 
-        let gson = shared.heap.alloc_object(ClassId::new(0), 1);
+        let gson = shared.mem.heap.alloc_object(ClassId::new(0), 1);
         let mut thread = JvmThread::new(ThreadId(0), "test");
         let result = call_native(
             &shared,
@@ -62882,7 +63468,7 @@ mod tests {
             Value::Object(Some(r)) => r,
             _ => panic!("M16: expected String"),
         };
-        let json = read_java_string(&shared.heap, json_ref).unwrap();
+        let json = read_java_string(&shared.mem.heap, json_ref).unwrap();
         assert!(
             json.contains("\"port\":8080"),
             "M16: expected port:8080 in {json}"
@@ -62905,7 +63491,7 @@ mod tests {
         let mirror = crate::vm::vm_object::get_or_create_class_mirror(&shared, class_id);
         let json_str =
             crate::vm::vm_object::create_java_string(&shared, r#"{"timeout":30000,"retries":3}"#);
-        let gson = shared.heap.alloc_object(ClassId::new(0), 1);
+        let gson = shared.mem.heap.alloc_object(ClassId::new(0), 1);
 
         let mut thread = JvmThread::new(ThreadId(0), "test");
         let result = call_native(
@@ -62927,8 +63513,8 @@ mod tests {
             Value::Object(Some(r)) => r,
             _ => panic!("M16: expected Object"),
         };
-        let timeout = shared.heap.get_field(obj, 0);
-        let retries = shared.heap.get_field(obj, 1);
+        let timeout = shared.mem.heap.get_field(obj, 0);
+        let retries = shared.mem.heap.get_field(obj, 1);
         assert_eq!(
             timeout.as_long(),
             Some(30000),
@@ -62947,11 +63533,11 @@ mod tests {
             &[("value", "I"), ("flag", "Z")],
         );
 
-        let obj = shared.heap.alloc_object(class_id, 2);
-        shared.heap.set_field(obj, 0, Value::Int(999));
-        shared.heap.set_field(obj, 1, Value::Int(0)); // false
+        let obj = shared.mem.heap.alloc_object(class_id, 2);
+        shared.mem.heap.set_field(obj, 0, Value::Int(999));
+        shared.mem.heap.set_field(obj, 1, Value::Int(0)); // false
 
-        let mapper = shared.heap.alloc_object(ClassId::new(0), 1);
+        let mapper = shared.mem.heap.alloc_object(ClassId::new(0), 1);
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // Serialize
@@ -62992,12 +63578,12 @@ mod tests {
             _ => panic!("M16: expected Object"),
         };
         assert_eq!(
-            shared.heap.get_field(obj2, 0).as_int(),
+            shared.mem.heap.get_field(obj2, 0).as_int(),
             Some(999),
             "M16: roundtrip value"
         );
         assert_eq!(
-            shared.heap.get_field(obj2, 1).as_int(),
+            shared.mem.heap.get_field(obj2, 1).as_int(),
             Some(0),
             "M16: roundtrip flag"
         );
@@ -63013,10 +63599,10 @@ mod tests {
         );
 
         let text = crate::vm::vm_object::create_java_string(&shared, "hello\n\"world\"");
-        let obj = shared.heap.alloc_object(class_id, 1);
-        shared.heap.set_field(obj, 0, Value::Object(Some(text)));
+        let obj = shared.mem.heap.alloc_object(class_id, 1);
+        shared.mem.heap.set_field(obj, 0, Value::Object(Some(text)));
 
-        let mapper = shared.heap.alloc_object(ClassId::new(0), 1);
+        let mapper = shared.mem.heap.alloc_object(ClassId::new(0), 1);
         let mut thread = JvmThread::new(ThreadId(0), "test");
         let result = call_native(
             &shared,
@@ -63033,7 +63619,7 @@ mod tests {
             Value::Object(Some(r)) => r,
             _ => panic!("M16: expected String"),
         };
-        let json = read_java_string(&shared.heap, json_ref).unwrap();
+        let json = read_java_string(&shared.mem.heap, json_ref).unwrap();
         assert!(
             json.contains("\\n"),
             "M16: expected escaped newline in {json}"
@@ -63053,9 +63639,9 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
         // referent = some object with 1 field
-        let referent = shared.heap.alloc_object(ClassId::new(0), 1);
+        let referent = shared.mem.heap.alloc_object(ClassId::new(0), 1);
         // WeakReference object: field 0 = referent, field 1 = queue
-        let weak_ref = shared.heap.alloc_object(ClassId::new(0), 2);
+        let weak_ref = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -63090,8 +63676,8 @@ mod tests {
     fn m20_weak_ref_discovered_by_ref_processor() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let referent = shared.heap.alloc_object(ClassId::new(0), 1);
-        let weak_ref = shared.heap.alloc_object(ClassId::new(0), 2);
+        let referent = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        let weak_ref = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -63102,7 +63688,7 @@ mod tests {
         )
         .unwrap();
         // After init, the ref processor should have 1 weak ref
-        let proc = shared.ref_processor.lock();
+        let proc = shared.mem.ref_processor.lock();
         assert_eq!(
             proc.weak_ref_count(),
             1,
@@ -63114,8 +63700,8 @@ mod tests {
     fn m20_weak_ref_cleared_when_referent_unreachable() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let referent = shared.heap.alloc_object(ClassId::new(0), 1);
-        let weak_ref = shared.heap.alloc_object(ClassId::new(0), 2);
+        let referent = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        let weak_ref = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -63128,7 +63714,7 @@ mod tests {
         // Simulate GC: referent is NOT marked (unreachable)
         let weak_addr = weak_ref.as_ptr() as usize;
         {
-            let mut proc = shared.ref_processor.lock();
+            let mut proc = shared.mem.ref_processor.lock();
             let is_marked = |addr: usize| -> bool {
                 // Only the weak_ref itself survives, referent does not
                 addr == weak_addr
@@ -63139,7 +63725,7 @@ mod tests {
             // Null the referent field
             for ref_addr in cleared {
                 let obj = unsafe { ObjectRef::from_raw(ref_addr as *mut u8) };
-                shared.heap.set_field(obj, 0, Value::Object(None));
+                shared.mem.heap.set_field(obj, 0, Value::Object(None));
             }
         }
         // get() should now return null
@@ -63163,8 +63749,8 @@ mod tests {
     fn m20_weak_ref_not_cleared_when_referent_reachable() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let referent = shared.heap.alloc_object(ClassId::new(0), 1);
-        let weak_ref = shared.heap.alloc_object(ClassId::new(0), 2);
+        let referent = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        let weak_ref = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -63178,7 +63764,7 @@ mod tests {
         let referent_addr = referent.as_ptr() as usize;
         let weak_addr = weak_ref.as_ptr() as usize;
         {
-            let mut proc = shared.ref_processor.lock();
+            let mut proc = shared.mem.ref_processor.lock();
             let is_marked = |addr: usize| -> bool { addr == weak_addr || addr == referent_addr };
             let _result = proc.process_references(&is_marked, 64, 0);
             let cleared = proc.cleared_ref_objects();
@@ -63208,8 +63794,8 @@ mod tests {
     fn m20_soft_ref_init_stores_referent() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let referent = shared.heap.alloc_object(ClassId::new(0), 1);
-        let soft_ref = shared.heap.alloc_object(ClassId::new(0), 2);
+        let referent = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        let soft_ref = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -63243,8 +63829,8 @@ mod tests {
     fn m20_soft_ref_cleared_under_memory_pressure() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let referent = shared.heap.alloc_object(ClassId::new(0), 1);
-        let soft_ref = shared.heap.alloc_object(ClassId::new(0), 2);
+        let referent = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        let soft_ref = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -63256,7 +63842,7 @@ mod tests {
         .unwrap();
         let soft_addr = soft_ref.as_ptr() as usize;
         {
-            let mut proc = shared.ref_processor.lock();
+            let mut proc = shared.mem.ref_processor.lock();
             // free_heap_mb=0 simulates memory pressure; current_time_ms very high to exceed LRU threshold
             let is_marked = |addr: usize| -> bool { addr == soft_addr };
             let _result = proc.process_references(&is_marked, 0, 1_000_000);
@@ -63267,7 +63853,7 @@ mod tests {
             );
             for ref_addr in cleared {
                 let obj = unsafe { ObjectRef::from_raw(ref_addr as *mut u8) };
-                shared.heap.set_field(obj, 0, Value::Object(None));
+                shared.mem.heap.set_field(obj, 0, Value::Object(None));
             }
         }
         let result = call_native(
@@ -63290,8 +63876,8 @@ mod tests {
     fn m20_soft_ref_retained_with_plenty_of_memory() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let referent = shared.heap.alloc_object(ClassId::new(0), 1);
-        let soft_ref = shared.heap.alloc_object(ClassId::new(0), 2);
+        let referent = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        let soft_ref = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -63303,7 +63889,7 @@ mod tests {
         .unwrap();
         let soft_addr = soft_ref.as_ptr() as usize;
         {
-            let mut proc = shared.ref_processor.lock();
+            let mut proc = shared.mem.ref_processor.lock();
             // free_heap_mb=1024 means plenty of memory, current_time_ms=0 means recently accessed
             let is_marked = |addr: usize| -> bool { addr == soft_addr };
             let _result = proc.process_references(&is_marked, 1024, 0);
@@ -63333,9 +63919,9 @@ mod tests {
     fn m20_phantom_ref_discovered() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let referent = shared.heap.alloc_object(ClassId::new(0), 1);
-        let queue = shared.heap.alloc_object(ClassId::new(0), 2);
-        let phantom = shared.heap.alloc_object(ClassId::new(0), 2);
+        let referent = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        let queue = shared.mem.heap.alloc_object(ClassId::new(0), 2);
+        let phantom = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -63349,7 +63935,7 @@ mod tests {
             ],
         )
         .unwrap();
-        let proc = shared.ref_processor.lock();
+        let proc = shared.mem.ref_processor.lock();
         assert_eq!(
             proc.phantom_ref_count(),
             1,
@@ -63361,8 +63947,8 @@ mod tests {
     fn m20_ref_clear_nulls_referent() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let referent = shared.heap.alloc_object(ClassId::new(0), 1);
-        let weak_ref = shared.heap.alloc_object(ClassId::new(0), 2);
+        let referent = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        let weak_ref = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -63402,9 +63988,9 @@ mod tests {
     fn m20_multiple_weak_refs_same_referent() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let referent = shared.heap.alloc_object(ClassId::new(0), 1);
-        let weak1 = shared.heap.alloc_object(ClassId::new(0), 2);
-        let weak2 = shared.heap.alloc_object(ClassId::new(0), 2);
+        let referent = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        let weak1 = shared.mem.heap.alloc_object(ClassId::new(0), 2);
+        let weak2 = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -63425,7 +64011,7 @@ mod tests {
         .unwrap();
         // Both should be discovered
         assert_eq!(
-            shared.ref_processor.lock().weak_ref_count(),
+            shared.mem.ref_processor.lock().weak_ref_count(),
             2,
             "M20: should track 2 weak refs"
         );
@@ -63433,14 +64019,14 @@ mod tests {
         let w1_addr = weak1.as_ptr() as usize;
         let w2_addr = weak2.as_ptr() as usize;
         {
-            let mut proc = shared.ref_processor.lock();
+            let mut proc = shared.mem.ref_processor.lock();
             let is_marked = |addr: usize| -> bool { addr == w1_addr || addr == w2_addr };
             let _result = proc.process_references(&is_marked, 64, 0);
             let cleared = proc.cleared_ref_objects();
             assert_eq!(cleared.len(), 2, "M20: both weak refs should be cleared");
             for ref_addr in cleared {
                 let obj = unsafe { ObjectRef::from_raw(ref_addr as *mut u8) };
-                shared.heap.set_field(obj, 0, Value::Object(None));
+                shared.mem.heap.set_field(obj, 0, Value::Object(None));
             }
         }
         // Both get() should return null
@@ -63472,7 +64058,7 @@ mod tests {
     fn m16_json_read_value_null_input() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let mapper = shared.heap.alloc_object(ClassId::new(0), 1);
+        let mapper = shared.mem.heap.alloc_object(ClassId::new(0), 1);
         let result = call_native(
             &shared,
             &mut thread,
@@ -63497,7 +64083,7 @@ mod tests {
     fn m16_json_readtree_simple_object() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let mapper = shared.heap.alloc_object(ClassId::new(0), 1);
+        let mapper = shared.mem.heap.alloc_object(ClassId::new(0), 1);
         let json_str = create_java_string(&shared, r#"{"name":"Alice","age":30}"#);
         let result = call_native(
             &shared,
@@ -63514,12 +64100,12 @@ mod tests {
             _ => panic!("M16: readTree should return a JsonNode"),
         };
         assert_eq!(
-            shared.heap.get_field(node, 0),
+            shared.mem.heap.get_field(node, 0),
             Value::Int(1),
             "M16: should be object node"
         );
         assert_eq!(
-            shared.heap.get_field(node, 6),
+            shared.mem.heap.get_field(node, 6),
             Value::Int(2),
             "M16: should have 2 children"
         );
@@ -63529,7 +64115,7 @@ mod tests {
     fn m16_json_readtree_empty_string() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let mapper = shared.heap.alloc_object(ClassId::new(0), 1);
+        let mapper = shared.mem.heap.alloc_object(ClassId::new(0), 1);
         let json_str = create_java_string(&shared, "");
         let result = call_native(
             &shared,
@@ -63546,7 +64132,7 @@ mod tests {
             _ => panic!("M16: readTree of empty string should still return a node"),
         };
         assert_eq!(
-            shared.heap.get_field(node, 0),
+            shared.mem.heap.get_field(node, 0),
             Value::Int(0),
             "M16: empty input => null node"
         );
@@ -63556,7 +64142,7 @@ mod tests {
     fn m16_jsonnode_astext_string_node() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let mapper = shared.heap.alloc_object(ClassId::new(0), 1);
+        let mapper = shared.mem.heap.alloc_object(ClassId::new(0), 1);
         let json_str = create_java_string(&shared, r#""hello world""#);
         let result = call_native(
             &shared,
@@ -63572,7 +64158,7 @@ mod tests {
             Value::Object(Some(r)) => r,
             _ => panic!("expected node"),
         };
-        assert_eq!(shared.heap.get_field(node, 0), Value::Int(3)); // string type
+        assert_eq!(shared.mem.heap.get_field(node, 0), Value::Int(3)); // string type
         let text_result = call_native(
             &shared,
             &mut thread,
@@ -63588,7 +64174,7 @@ mod tests {
             _ => panic!("expected String"),
         };
         assert_eq!(
-            read_java_string(&shared.heap, text_ref).unwrap(),
+            read_java_string(&shared.mem.heap, text_ref).unwrap(),
             "hello world"
         );
     }
@@ -63597,7 +64183,7 @@ mod tests {
     fn m16_jsonnode_asint_number_node() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let mapper = shared.heap.alloc_object(ClassId::new(0), 1);
+        let mapper = shared.mem.heap.alloc_object(ClassId::new(0), 1);
         let json_str = create_java_string(&shared, "42");
         let result = call_native(
             &shared,
@@ -63613,7 +64199,7 @@ mod tests {
             Value::Object(Some(r)) => r,
             _ => panic!("expected node"),
         };
-        assert_eq!(shared.heap.get_field(node, 0), Value::Int(4)); // number type
+        assert_eq!(shared.mem.heap.get_field(node, 0), Value::Int(4)); // number type
         let int_result = call_native(
             &shared,
             &mut thread,
@@ -63631,7 +64217,7 @@ mod tests {
     fn m16_jsonnode_boolean_and_null() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let mapper = shared.heap.alloc_object(ClassId::new(0), 1);
+        let mapper = shared.mem.heap.alloc_object(ClassId::new(0), 1);
         // Boolean
         let json_true = create_java_string(&shared, "true");
         let result = call_native(
@@ -63648,7 +64234,7 @@ mod tests {
             Value::Object(Some(r)) => r,
             _ => panic!("expected node"),
         };
-        assert_eq!(shared.heap.get_field(node, 0), Value::Int(5)); // boolean type
+        assert_eq!(shared.mem.heap.get_field(node, 0), Value::Int(5)); // boolean type
         let bool_val = call_native(
             &shared,
             &mut thread,
@@ -63697,7 +64283,7 @@ mod tests {
     fn m16_jsonnode_array_size() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let mapper = shared.heap.alloc_object(ClassId::new(0), 1);
+        let mapper = shared.mem.heap.alloc_object(ClassId::new(0), 1);
         let json_str = create_java_string(&shared, "[1,2,3]");
         let result = call_native(
             &shared,
@@ -63713,7 +64299,7 @@ mod tests {
             Value::Object(Some(r)) => r,
             _ => panic!("expected node"),
         };
-        assert_eq!(shared.heap.get_field(node, 0), Value::Int(2)); // array type
+        assert_eq!(shared.mem.heap.get_field(node, 0), Value::Int(2)); // array type
         let size = call_native(
             &shared,
             &mut thread,
@@ -63733,14 +64319,18 @@ mod tests {
     fn m17_define_class_rejects_invalid_magic() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let bad_bytes =
-            shared
-                .heap
-                .alloc_array(ClassId::new(0), cratonvm_types::ArrayElementType::Byte, 10);
+        let bad_bytes = shared.mem.heap.alloc_array(
+            ClassId::new(0),
+            cratonvm_types::ArrayElementType::Byte,
+            10,
+        );
         for i in 0..10 {
-            let _ = shared.heap.set_array_element(bad_bytes, i, Value::Int(0));
+            let _ = shared
+                .mem
+                .heap
+                .set_array_element(bad_bytes, i, Value::Int(0));
         }
-        let cl = shared.heap.alloc_object(ClassId::new(0), 4);
+        let cl = shared.mem.heap.alloc_object(ClassId::new(0), 4);
         let name_str = create_java_string(&shared, "com/test/Bad");
         let result = call_native(
             &shared,
@@ -63768,11 +64358,12 @@ mod tests {
     fn m17_define_class_rejects_negative_offset() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let bytes =
-            shared
-                .heap
-                .alloc_array(ClassId::new(0), cratonvm_types::ArrayElementType::Byte, 10);
-        let cl = shared.heap.alloc_object(ClassId::new(0), 4);
+        let bytes = shared.mem.heap.alloc_array(
+            ClassId::new(0),
+            cratonvm_types::ArrayElementType::Byte,
+            10,
+        );
+        let cl = shared.mem.heap.alloc_object(ClassId::new(0), 4);
         let name_str = create_java_string(&shared, "com/test/Neg");
         let result = call_native(
             &shared,
@@ -63800,11 +64391,12 @@ mod tests {
     fn m17_define_class_rejects_out_of_bounds() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let bytes =
-            shared
-                .heap
-                .alloc_array(ClassId::new(0), cratonvm_types::ArrayElementType::Byte, 10);
-        let cl = shared.heap.alloc_object(ClassId::new(0), 4);
+        let bytes = shared.mem.heap.alloc_array(
+            ClassId::new(0),
+            cratonvm_types::ArrayElementType::Byte,
+            10,
+        );
+        let cl = shared.mem.heap.alloc_object(ClassId::new(0), 4);
         let name_str = create_java_string(&shared, "com/test/OOB");
         let result = call_native(
             &shared,
@@ -63834,10 +64426,10 @@ mod tests {
     fn m19_finalizer_enqueued_for_dead_objects() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let class_id = register_test_class(&shared, "com/test/Finalizable", 0x0021, &[], &[]);
-        let obj = shared.heap.alloc_object(class_id, 1);
+        let obj = shared.mem.heap.alloc_object(class_id, 1);
         shared.register_finalizable(obj.as_ptr() as usize);
         {
-            let mut proc = shared.ref_processor.lock();
+            let mut proc = shared.mem.ref_processor.lock();
             let result = proc.process_references(&|_| false, 64, 0);
             assert!(
                 !result.to_finalize.is_empty(),
@@ -63850,11 +64442,11 @@ mod tests {
     fn m19_finalizer_not_enqueued_for_live_objects() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let class_id = register_test_class(&shared, "com/test/FinalLive", 0x0021, &[], &[]);
-        let obj = shared.heap.alloc_object(class_id, 1);
+        let obj = shared.mem.heap.alloc_object(class_id, 1);
         let obj_addr = obj.as_ptr() as usize;
         shared.register_finalizable(obj_addr);
         {
-            let mut proc = shared.ref_processor.lock();
+            let mut proc = shared.mem.ref_processor.lock();
             let result = proc.process_references(&|addr| addr == obj_addr, 64, 0);
             assert!(
                 result.to_finalize.is_empty(),
@@ -63869,9 +64461,9 @@ mod tests {
     fn m20_phantom_ref_enqueued_but_not_cleared() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let referent = shared.heap.alloc_object(ClassId::new(0), 1);
-        let queue_obj = shared.heap.alloc_object(ClassId::new(0), 1);
-        let phantom = shared.heap.alloc_object(ClassId::new(0), 2);
+        let referent = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        let queue_obj = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        let phantom = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -63887,7 +64479,7 @@ mod tests {
         .unwrap();
         let phantom_addr = phantom.as_ptr() as usize;
         {
-            let mut proc = shared.ref_processor.lock();
+            let mut proc = shared.mem.ref_processor.lock();
             let result = proc.process_references(&|addr| addr == phantom_addr, 64, 0);
             assert!(
                 result.stats.phantom_refs_enqueued >= 1,
@@ -63900,8 +64492,8 @@ mod tests {
     fn m20_soft_ref_cleared_under_zero_memory() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let referent = shared.heap.alloc_object(ClassId::new(0), 1);
-        let soft = shared.heap.alloc_object(ClassId::new(0), 2);
+        let referent = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        let soft = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -63913,7 +64505,7 @@ mod tests {
         .unwrap();
         let soft_addr = soft.as_ptr() as usize;
         {
-            let mut proc = shared.ref_processor.lock();
+            let mut proc = shared.mem.ref_processor.lock();
             let result = proc.process_references(&|addr| addr == soft_addr, 0, 1000);
             assert!(
                 result.stats.soft_refs_cleared >= 1,
@@ -63930,9 +64522,9 @@ mod tests {
     fn s28_weak_ref_with_queue_enqueued_after_gc() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let referent = shared.heap.alloc_object(ClassId::new(0), 1);
-        let queue = shared.heap.alloc_object(ClassId::new(0), 2);
-        let weak_ref = shared.heap.alloc_object(ClassId::new(0), 2);
+        let referent = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        let queue = shared.mem.heap.alloc_object(ClassId::new(0), 2);
+        let weak_ref = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         // Init ReferenceQueue
         call_native(
             &shared,
@@ -63960,7 +64552,7 @@ mod tests {
         let weak_addr = weak_ref.as_ptr() as usize;
         let queue_addr = queue.as_ptr() as usize;
         {
-            let mut proc = shared.ref_processor.lock();
+            let mut proc = shared.mem.ref_processor.lock();
             // Referent is NOT marked (dead), weak_ref and queue survive
             let is_marked = |addr: usize| -> bool { addr == weak_addr || addr == queue_addr };
             let result = proc.process_references(&is_marked, 64, 0);
@@ -63972,21 +64564,24 @@ mod tests {
             let cleared = proc.cleared_ref_objects();
             for ref_addr in cleared {
                 let obj = unsafe { ObjectRef::from_raw(ref_addr as *mut u8) };
-                shared.heap.set_field(obj, 0, Value::Object(None));
+                shared.mem.heap.set_field(obj, 0, Value::Object(None));
             }
             // Enqueue into heap ReferenceQueue
             for (ra, qa) in &result.to_enqueue {
                 let robj = unsafe { ObjectRef::from_raw(*ra as *mut u8) };
                 let qobj = unsafe { ObjectRef::from_raw(*qa as *mut u8) };
-                let old_head = shared.heap.get_field(qobj, 0);
-                shared.heap.set_field(qobj, 0, Value::Object(Some(robj)));
-                shared.heap.set_field(robj, 0, old_head);
-                let size = match shared.heap.get_field(qobj, 1) {
+                let old_head = shared.mem.heap.get_field(qobj, 0);
+                shared
+                    .mem
+                    .heap
+                    .set_field(qobj, 0, Value::Object(Some(robj)));
+                shared.mem.heap.set_field(robj, 0, old_head);
+                let size = match shared.mem.heap.get_field(qobj, 1) {
                     Value::Int(v) => v,
                     _ => 0,
                 };
-                shared.heap.set_field(qobj, 1, Value::Int(size + 1));
-                shared.heap.set_field(robj, 1, Value::Int(1)); // enqueued sentinel
+                shared.mem.heap.set_field(qobj, 1, Value::Int(size + 1));
+                shared.mem.heap.set_field(robj, 1, Value::Int(1)); // enqueued sentinel
             }
         }
         // Poll from queue РІР‚вЂќ should return the weak ref
@@ -64029,9 +64624,9 @@ mod tests {
     fn s28_soft_ref_with_queue_enqueued_under_pressure() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let referent = shared.heap.alloc_object(ClassId::new(0), 1);
-        let queue = shared.heap.alloc_object(ClassId::new(0), 2);
-        let soft_ref = shared.heap.alloc_object(ClassId::new(0), 2);
+        let referent = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        let queue = shared.mem.heap.alloc_object(ClassId::new(0), 2);
+        let soft_ref = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -64057,7 +64652,7 @@ mod tests {
         let soft_addr = soft_ref.as_ptr() as usize;
         let queue_addr = queue.as_ptr() as usize;
         {
-            let mut proc = shared.ref_processor.lock();
+            let mut proc = shared.mem.ref_processor.lock();
             // free_heap=0 + high time = memory pressure clears soft ref
             let is_marked = |addr: usize| -> bool { addr == soft_addr || addr == queue_addr };
             let result = proc.process_references(&is_marked, 0, 1_000_000);
@@ -64068,20 +64663,23 @@ mod tests {
             let cleared = proc.cleared_ref_objects();
             for ref_addr in cleared {
                 let obj = unsafe { ObjectRef::from_raw(ref_addr as *mut u8) };
-                shared.heap.set_field(obj, 0, Value::Object(None));
+                shared.mem.heap.set_field(obj, 0, Value::Object(None));
             }
             for (ra, qa) in &result.to_enqueue {
                 let robj = unsafe { ObjectRef::from_raw(*ra as *mut u8) };
                 let qobj = unsafe { ObjectRef::from_raw(*qa as *mut u8) };
-                let old_head = shared.heap.get_field(qobj, 0);
-                shared.heap.set_field(qobj, 0, Value::Object(Some(robj)));
-                shared.heap.set_field(robj, 0, old_head);
-                let size = match shared.heap.get_field(qobj, 1) {
+                let old_head = shared.mem.heap.get_field(qobj, 0);
+                shared
+                    .mem
+                    .heap
+                    .set_field(qobj, 0, Value::Object(Some(robj)));
+                shared.mem.heap.set_field(robj, 0, old_head);
+                let size = match shared.mem.heap.get_field(qobj, 1) {
                     Value::Int(v) => v,
                     _ => 0,
                 };
-                shared.heap.set_field(qobj, 1, Value::Int(size + 1));
-                shared.heap.set_field(robj, 1, Value::Int(1));
+                shared.mem.heap.set_field(qobj, 1, Value::Int(size + 1));
+                shared.mem.heap.set_field(robj, 1, Value::Int(1));
             }
         }
         let poll_result = call_native(
@@ -64108,9 +64706,9 @@ mod tests {
     fn s28_phantom_ref_enqueued_to_queue() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let referent = shared.heap.alloc_object(ClassId::new(0), 1);
-        let queue = shared.heap.alloc_object(ClassId::new(0), 2);
-        let phantom = shared.heap.alloc_object(ClassId::new(0), 2);
+        let referent = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        let queue = shared.mem.heap.alloc_object(ClassId::new(0), 2);
+        let phantom = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -64136,7 +64734,7 @@ mod tests {
         let phantom_addr = phantom.as_ptr() as usize;
         let queue_addr = queue.as_ptr() as usize;
         {
-            let mut proc = shared.ref_processor.lock();
+            let mut proc = shared.mem.ref_processor.lock();
             let is_marked = |addr: usize| -> bool { addr == phantom_addr || addr == queue_addr };
             let result = proc.process_references(&is_marked, 64, 0);
             assert!(
@@ -64146,15 +64744,18 @@ mod tests {
             for (ra, qa) in &result.to_enqueue {
                 let robj = unsafe { ObjectRef::from_raw(*ra as *mut u8) };
                 let qobj = unsafe { ObjectRef::from_raw(*qa as *mut u8) };
-                let old_head = shared.heap.get_field(qobj, 0);
-                shared.heap.set_field(qobj, 0, Value::Object(Some(robj)));
-                shared.heap.set_field(robj, 0, old_head);
-                let size = match shared.heap.get_field(qobj, 1) {
+                let old_head = shared.mem.heap.get_field(qobj, 0);
+                shared
+                    .mem
+                    .heap
+                    .set_field(qobj, 0, Value::Object(Some(robj)));
+                shared.mem.heap.set_field(robj, 0, old_head);
+                let size = match shared.mem.heap.get_field(qobj, 1) {
                     Value::Int(v) => v,
                     _ => 0,
                 };
-                shared.heap.set_field(qobj, 1, Value::Int(size + 1));
-                shared.heap.set_field(robj, 1, Value::Int(1));
+                shared.mem.heap.set_field(qobj, 1, Value::Int(size + 1));
+                shared.mem.heap.set_field(robj, 1, Value::Int(1));
             }
         }
         let poll_result = call_native(
@@ -64181,7 +64782,7 @@ mod tests {
     fn s28_reference_queue_poll_empty_returns_null() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let queue = shared.heap.alloc_object(ClassId::new(0), 2);
+        let queue = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -64211,9 +64812,9 @@ mod tests {
     fn s28_reference_refers_to() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let referent = shared.heap.alloc_object(ClassId::new(0), 1);
-        let other = shared.heap.alloc_object(ClassId::new(0), 1);
-        let weak_ref = shared.heap.alloc_object(ClassId::new(0), 2);
+        let referent = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        let other = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        let weak_ref = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -64277,9 +64878,9 @@ mod tests {
     fn s28_is_enqueued_lifecycle() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let referent = shared.heap.alloc_object(ClassId::new(0), 1);
-        let queue = shared.heap.alloc_object(ClassId::new(0), 2);
-        let weak_ref = shared.heap.alloc_object(ClassId::new(0), 2);
+        let referent = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        let queue = shared.mem.heap.alloc_object(ClassId::new(0), 2);
+        let weak_ref = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -64352,11 +64953,11 @@ mod tests {
     fn s28_multiple_refs_same_queue() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let ref1_target = shared.heap.alloc_object(ClassId::new(0), 1);
-        let ref2_target = shared.heap.alloc_object(ClassId::new(0), 1);
-        let queue = shared.heap.alloc_object(ClassId::new(0), 2);
-        let weak1 = shared.heap.alloc_object(ClassId::new(0), 2);
-        let weak2 = shared.heap.alloc_object(ClassId::new(0), 2);
+        let ref1_target = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        let ref2_target = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        let queue = shared.mem.heap.alloc_object(ClassId::new(0), 2);
+        let weak1 = shared.mem.heap.alloc_object(ClassId::new(0), 2);
+        let weak2 = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -64396,7 +64997,7 @@ mod tests {
         let w2_addr = weak2.as_ptr() as usize;
         let q_addr = queue.as_ptr() as usize;
         {
-            let mut proc = shared.ref_processor.lock();
+            let mut proc = shared.mem.ref_processor.lock();
             let is_marked =
                 |addr: usize| -> bool { addr == w1_addr || addr == w2_addr || addr == q_addr };
             let result = proc.process_references(&is_marked, 64, 0);
@@ -64407,20 +65008,23 @@ mod tests {
             let cleared = proc.cleared_ref_objects();
             for ref_addr in cleared {
                 let obj = unsafe { ObjectRef::from_raw(ref_addr as *mut u8) };
-                shared.heap.set_field(obj, 0, Value::Object(None));
+                shared.mem.heap.set_field(obj, 0, Value::Object(None));
             }
             for (ra, qa) in &result.to_enqueue {
                 let robj = unsafe { ObjectRef::from_raw(*ra as *mut u8) };
                 let qobj = unsafe { ObjectRef::from_raw(*qa as *mut u8) };
-                let old_head = shared.heap.get_field(qobj, 0);
-                shared.heap.set_field(qobj, 0, Value::Object(Some(robj)));
-                shared.heap.set_field(robj, 0, old_head);
-                let size = match shared.heap.get_field(qobj, 1) {
+                let old_head = shared.mem.heap.get_field(qobj, 0);
+                shared
+                    .mem
+                    .heap
+                    .set_field(qobj, 0, Value::Object(Some(robj)));
+                shared.mem.heap.set_field(robj, 0, old_head);
+                let size = match shared.mem.heap.get_field(qobj, 1) {
                     Value::Int(v) => v,
                     _ => 0,
                 };
-                shared.heap.set_field(qobj, 1, Value::Int(size + 1));
-                shared.heap.set_field(robj, 1, Value::Int(1));
+                shared.mem.heap.set_field(qobj, 1, Value::Int(size + 1));
+                shared.mem.heap.set_field(robj, 1, Value::Int(1));
             }
         }
         // Poll should return both refs (LIFO order РІР‚вЂќ last enqueued is head)
@@ -64490,8 +65094,8 @@ mod tests {
     fn s28_enqueue_without_queue_returns_false() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let referent = shared.heap.alloc_object(ClassId::new(0), 1);
-        let weak_ref = shared.heap.alloc_object(ClassId::new(0), 2);
+        let referent = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        let weak_ref = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         // Init without queue
         call_native(
             &shared,
@@ -64524,9 +65128,9 @@ mod tests {
     fn s28_soft_ref_not_enqueued_when_retained() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let referent = shared.heap.alloc_object(ClassId::new(0), 1);
-        let queue = shared.heap.alloc_object(ClassId::new(0), 2);
-        let soft = shared.heap.alloc_object(ClassId::new(0), 2);
+        let referent = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        let queue = shared.mem.heap.alloc_object(ClassId::new(0), 2);
+        let soft = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -64552,7 +65156,7 @@ mod tests {
         let soft_addr = soft.as_ptr() as usize;
         let queue_addr = queue.as_ptr() as usize;
         {
-            let mut proc = shared.ref_processor.lock();
+            let mut proc = shared.mem.ref_processor.lock();
             // Plenty of memory РІР‚вЂќ soft ref should NOT be cleared
             let is_marked = |addr: usize| -> bool { addr == soft_addr || addr == queue_addr };
             let result = proc.process_references(&is_marked, 1024, 0);
@@ -64601,8 +65205,8 @@ mod tests {
     fn s28_weak_ref_get_returns_null_after_clear() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let referent = shared.heap.alloc_object(ClassId::new(0), 1);
-        let weak_ref = shared.heap.alloc_object(ClassId::new(0), 2);
+        let referent = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        let weak_ref = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -64659,9 +65263,9 @@ mod tests {
         // PhantomReference.get() always returns null per Java spec
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let referent = shared.heap.alloc_object(ClassId::new(0), 1);
-        let queue = shared.heap.alloc_object(ClassId::new(0), 2);
-        let phantom = shared.heap.alloc_object(ClassId::new(0), 2);
+        let referent = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        let queue = shared.mem.heap.alloc_object(ClassId::new(0), 2);
+        let phantom = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -64705,7 +65309,7 @@ mod tests {
     fn s28_reference_queue_remove_timeout_empty() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let queue = shared.heap.alloc_object(ClassId::new(0), 2);
+        let queue = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -64890,7 +65494,7 @@ mod tests {
         shared.load_class_concurrent("java/lang/Byte").unwrap();
         shared.load_class_concurrent("java/lang/Short").unwrap();
         // The locks should be cleaned up (strong_count check)
-        let lock_count = shared.class_loading_locks.lock().len();
+        let lock_count = shared.classes.class_loading_locks.lock().len();
         assert!(
             lock_count <= 2,
             "S30: class loading locks should be cleaned up after loading (got {})",
@@ -65012,22 +65616,30 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // Create a Field object: field 3 = modifiers (0x0002 = private), field 6 = accessible (0)
-        let field = shared.heap.alloc_object(ClassId::new(0), 8);
-        let class_mirror = shared.heap.alloc_object(ClassId::new(0), 2);
-        shared.heap.set_field(class_mirror, 0, Value::Int(0)); // class_id
+        let field = shared.mem.heap.alloc_object(ClassId::new(0), 8);
+        let class_mirror = shared.mem.heap.alloc_object(ClassId::new(0), 2);
+        shared.mem.heap.set_field(class_mirror, 0, Value::Int(0)); // class_id
         let class_name = create_java_string(&shared, "java/lang/Object");
         shared
+            .mem
             .heap
             .set_field(class_mirror, 1, Value::Object(Some(class_name)));
         shared
+            .mem
             .heap
             .set_field(field, 0, Value::Object(Some(class_mirror))); // declaring class
         let fname = create_java_string(&shared, "secret");
-        shared.heap.set_field(field, 1, Value::Object(Some(fname))); // field name
-        shared.heap.set_field(field, 3, Value::Int(0x0002)); // PRIVATE
+        shared
+            .mem
+            .heap
+            .set_field(field, 1, Value::Object(Some(fname))); // field name
+        shared.mem.heap.set_field(field, 3, Value::Int(0x0002)); // PRIVATE
         let desc = create_java_string(&shared, "I");
-        shared.heap.set_field(field, 5, Value::Object(Some(desc))); // descriptor
-        shared.heap.set_field(field, 6, Value::Int(0)); // NOT accessible
+        shared
+            .mem
+            .heap
+            .set_field(field, 5, Value::Object(Some(desc))); // descriptor
+        shared.mem.heap.set_field(field, 6, Value::Int(0)); // NOT accessible
 
         // Try Field.get on a private field without setAccessible РІР‚вЂќ should fail
         let result = call_native(
@@ -65059,24 +65671,30 @@ mod tests {
             .load_class_concurrent("java/lang/reflect/Field")
             .unwrap();
         let object_class_id = shared.load_class_concurrent("java/lang/Object").unwrap();
-        let field = shared.heap.alloc_object(field_class_id, 12);
-        let class_mirror = shared.heap.alloc_object(ClassId::new(0), 2);
+        let field = shared.mem.heap.alloc_object(field_class_id, 12);
+        let class_mirror = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         shared
+            .mem
             .heap
             .set_field(class_mirror, 0, Value::Int(object_class_id.as_u32() as i32));
         let class_name = create_java_string(&shared, "java/lang/Object");
         shared
+            .mem
             .heap
             .set_field(class_mirror, 1, Value::Object(Some(class_name)));
         // Populate real JDK-named fields.
         shared
+            .mem
             .heap
             .set_field(field, 1, Value::Object(Some(class_mirror))); // clazz
-        shared.heap.set_field(field, 2, Value::Int(0)); // slot
+        shared.mem.heap.set_field(field, 2, Value::Int(0)); // slot
         let fname = create_java_string(&shared, "value");
-        shared.heap.set_field(field, 3, Value::Object(Some(fname))); // name
-        shared.heap.set_field(field, 5, Value::Int(0x0009)); // modifiers = PUBLIC | STATIC
-        shared.heap.set_field(field, 6, Value::Int(0)); // trustedFinal
+        shared
+            .mem
+            .heap
+            .set_field(field, 3, Value::Object(Some(fname))); // name
+        shared.mem.heap.set_field(field, 5, Value::Int(0x0009)); // modifiers = PUBLIC | STATIC
+        shared.mem.heap.set_field(field, 6, Value::Int(0)); // trustedFinal
 
         // Public field access should succeed
         let result = call_native(
@@ -65105,38 +65723,46 @@ mod tests {
             .load_class_concurrent("java/lang/reflect/Field")
             .unwrap();
         let object_class_id = shared.load_class_concurrent("java/lang/Object").unwrap();
-        let class_mirror = shared.heap.alloc_object(ClassId::new(0), 2);
+        let class_mirror = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         shared
+            .mem
             .heap
             .set_field(class_mirror, 0, Value::Int(object_class_id.as_u32() as i32));
         let class_name = create_java_string(&shared, "java/lang/Object");
         shared
+            .mem
             .heap
             .set_field(class_mirror, 1, Value::Object(Some(class_name)));
 
         // Field 1: private+static, accessible=true РІвЂ вЂ™ should succeed.
-        let field = shared.heap.alloc_object(field_class_id, 12);
+        let field = shared.mem.heap.alloc_object(field_class_id, 12);
         shared
+            .mem
             .heap
             .set_field(field, 1, Value::Object(Some(class_mirror))); // clazz
-        shared.heap.set_field(field, 2, Value::Int(0)); // slot
+        shared.mem.heap.set_field(field, 2, Value::Int(0)); // slot
         let fname = create_java_string(&shared, "secret");
-        shared.heap.set_field(field, 3, Value::Object(Some(fname))); // name
-        shared.heap.set_field(field, 5, Value::Int(0x000A)); // modifiers: PRIVATE | STATIC
-        shared.heap.set_field(field, 9, Value::Int(1)); // extra: accessible=true
+        shared
+            .mem
+            .heap
+            .set_field(field, 3, Value::Object(Some(fname))); // name
+        shared.mem.heap.set_field(field, 5, Value::Int(0x000A)); // modifiers: PRIVATE | STATIC
+        shared.mem.heap.set_field(field, 9, Value::Int(1)); // extra: accessible=true
 
         // Field 2: private+static, accessible=false РІвЂ вЂ™ should be rejected.
-        let field2 = shared.heap.alloc_object(field_class_id, 12);
+        let field2 = shared.mem.heap.alloc_object(field_class_id, 12);
         shared
+            .mem
             .heap
             .set_field(field2, 1, Value::Object(Some(class_mirror))); // clazz
-        shared.heap.set_field(field2, 2, Value::Int(0)); // slot
+        shared.mem.heap.set_field(field2, 2, Value::Int(0)); // slot
         let fname2 = create_java_string(&shared, "secret2");
         shared
+            .mem
             .heap
             .set_field(field2, 3, Value::Object(Some(fname2))); // name
-        shared.heap.set_field(field2, 5, Value::Int(0x000A)); // modifiers
-        shared.heap.set_field(field2, 9, Value::Int(0)); // extra: accessible=false
+        shared.mem.heap.set_field(field2, 5, Value::Int(0x000A)); // modifiers
+        shared.mem.heap.set_field(field2, 9, Value::Int(0)); // extra: accessible=false
 
         let rejected = call_native(
             &shared,
@@ -65173,27 +65799,35 @@ mod tests {
 
         // Create an instance field that holds an Object РІР‚вЂќ test on an instance
         // First create a receiver object with a field that has an Object value
-        let receiver = shared.heap.alloc_object(ClassId::new(0), 4);
-        shared.heap.set_field(receiver, 0, Value::Object(None)); // slot 0 = null object
+        let receiver = shared.mem.heap.alloc_object(ClassId::new(0), 4);
+        shared.mem.heap.set_field(receiver, 0, Value::Object(None)); // slot 0 = null object
 
         // Create a public INSTANCE field descriptor
-        let field = shared.heap.alloc_object(ClassId::new(0), 8);
-        let class_mirror = shared.heap.alloc_object(ClassId::new(0), 2);
-        shared.heap.set_field(class_mirror, 0, Value::Int(0));
+        let field = shared.mem.heap.alloc_object(ClassId::new(0), 8);
+        let class_mirror = shared.mem.heap.alloc_object(ClassId::new(0), 2);
+        shared.mem.heap.set_field(class_mirror, 0, Value::Int(0));
         let class_name = create_java_string(&shared, "java/lang/Object");
         shared
+            .mem
             .heap
             .set_field(class_mirror, 1, Value::Object(Some(class_name)));
         shared
+            .mem
             .heap
             .set_field(field, 0, Value::Object(Some(class_mirror)));
         let fname = create_java_string(&shared, "obj");
-        shared.heap.set_field(field, 1, Value::Object(Some(fname)));
-        shared.heap.set_field(field, 3, Value::Int(0x0001)); // PUBLIC (instance)
-        shared.heap.set_field(field, 4, Value::Int(0)); // slot 0
+        shared
+            .mem
+            .heap
+            .set_field(field, 1, Value::Object(Some(fname)));
+        shared.mem.heap.set_field(field, 3, Value::Int(0x0001)); // PUBLIC (instance)
+        shared.mem.heap.set_field(field, 4, Value::Int(0)); // slot 0
         let desc = create_java_string(&shared, "Ljava/lang/Object;");
-        shared.heap.set_field(field, 5, Value::Object(Some(desc)));
-        shared.heap.set_field(field, 6, Value::Int(1)); // accessible
+        shared
+            .mem
+            .heap
+            .set_field(field, 5, Value::Object(Some(desc)));
+        shared.mem.heap.set_field(field, 6, Value::Int(1)); // accessible
 
         // getInt on an Object field (which holds Value::Object(None)) should fail
         let result = call_native(
@@ -65385,7 +66019,7 @@ mod tests {
         .unwrap();
         match name {
             Value::Object(Some(s)) => {
-                let str_val = crate::vm::vm_object::read_java_string(&shared.heap, s).unwrap();
+                let str_val = crate::vm::vm_object::read_java_string(&shared.mem.heap, s).unwrap();
                 assert_eq!(
                     str_val, "hello",
                     "M13: prepared query should return 'hello'"
@@ -65485,7 +66119,7 @@ mod tests {
         };
 
         // Manually set level to WARN (3)
-        shared.heap.set_field(lg, 1, Value::Int(3)); // SLF4J_LEVEL = WARN
+        shared.mem.heap.set_field(lg, 1, Value::Int(3)); // SLF4J_LEVEL = WARN
 
         // isDebugEnabled should be false (debug=1 < warn=3)
         let debug = call_native(
@@ -65583,12 +66217,13 @@ mod tests {
         };
 
         // Create a SEVERE level (1000)
-        let severe = shared.heap.alloc_object(ClassId::new(0), 2);
+        let severe = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         let severe_name = create_java_string(&shared, "SEVERE");
         shared
+            .mem
             .heap
             .set_field(severe, 0, Value::Object(Some(severe_name)));
-        shared.heap.set_field(severe, 1, Value::Int(1000));
+        shared.mem.heap.set_field(severe, 1, Value::Int(1000));
 
         // Set logger level to SEVERE
         call_native(
@@ -65602,12 +66237,13 @@ mod tests {
         .unwrap();
 
         // INFO (800) should NOT be loggable at SEVERE (1000)
-        let info = shared.heap.alloc_object(ClassId::new(0), 2);
+        let info = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         let info_name = create_java_string(&shared, "INFO");
         shared
+            .mem
             .heap
             .set_field(info, 0, Value::Object(Some(info_name)));
-        shared.heap.set_field(info, 1, Value::Int(800));
+        shared.mem.heap.set_field(info, 1, Value::Int(800));
 
         let loggable = call_native(
             &shared,
@@ -65653,13 +66289,13 @@ mod tests {
 
         // Pre-fill the lambda_proxies map to MAX_LAMBDA_PROXIES
         {
-            let mut proxies = shared.lambda_proxies.write();
+            let mut proxies = shared.classes.lambda_proxies.write();
             for i in 0..MAX_LAMBDA_PROXIES {
                 let cid = ClassId::new(0x8000_0000 + i as u32);
                 proxies.insert(
                     cid,
                     crate::classloading::resolution::LambdaCallSite {
-                functional_interface_id: None,
+                        functional_interface_id: None,
                         functional_interface: "test/Func".to_string(),
                         sam_method_name: "apply".to_string(),
                         sam_descriptor: "()V".to_string(),
@@ -65693,7 +66329,7 @@ mod tests {
             &[],
         );
 
-        let proxies = shared.lambda_proxies.read();
+        let proxies = shared.classes.lambda_proxies.read();
         assert_eq!(
             proxies.len(),
             MAX_LAMBDA_PROXIES,
@@ -65711,7 +66347,7 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // Create ArrayList with elements 1, 2, 3 (as Integer-like strings)
-        let list_ref = shared.heap.alloc_object(ClassId::new(0), 2);
+        let list_ref = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -65748,7 +66384,7 @@ mod tests {
 
         match result {
             Value::Object(Some(s)) => {
-                let text = read_java_string(&shared.heap, s).unwrap();
+                let text = read_java_string(&shared.mem.heap, s).unwrap();
                 assert_eq!(text, "[1, 2, 3]");
             }
             _ => panic!("expected string from ArrayList.toString"),
@@ -65760,7 +66396,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let map_ref = shared.heap.alloc_object(ClassId::new(0), 3);
+        let map_ref = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -65800,7 +66436,7 @@ mod tests {
 
         match result {
             Value::Object(Some(s)) => {
-                let text = read_java_string(&shared.heap, s).unwrap();
+                let text = read_java_string(&shared.mem.heap, s).unwrap();
                 assert_eq!(text, "{k=v}");
             }
             _ => panic!("expected string from HashMap.toString"),
@@ -65818,7 +66454,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let list = shared.heap.alloc_object(ClassId::new(0), 2);
+        let list = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -65864,7 +66500,7 @@ mod tests {
 
         match result {
             Value::Object(Some(s)) => {
-                let text = read_java_string(&shared.heap, s).unwrap();
+                let text = read_java_string(&shared.mem.heap, s).unwrap();
                 assert_eq!(
                     text, "[10, 20, 30]",
                     "ArrayList of Integers should show values, not ClassName@hash"
@@ -65880,7 +66516,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let map = shared.heap.alloc_object(ClassId::new(0), 3);
+        let map = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         call_native(
             &shared,
             &mut thread,
@@ -65925,7 +66561,7 @@ mod tests {
 
         match result {
             Value::Object(Some(s)) => {
-                let text = read_java_string(&shared.heap, s).unwrap();
+                let text = read_java_string(&shared.mem.heap, s).unwrap();
                 assert_eq!(
                     text, "{42=answer}",
                     "HashMap with Integer key should show value, not ClassName@hash"
@@ -65941,7 +66577,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let list = shared.heap.alloc_object(ClassId::new(0), 2);
+        let list = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -66004,7 +66640,7 @@ mod tests {
 
         match result {
             Value::Object(Some(s)) => {
-                let text = read_java_string(&shared.heap, s).unwrap();
+                let text = read_java_string(&shared.mem.heap, s).unwrap();
                 assert_eq!(
                     text, "[true, false]",
                     "ArrayList of Booleans should show true/false, not ClassName@hash"
@@ -66021,6 +66657,7 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         let arr = shared
+            .mem
             .heap
             .alloc_array(ClassId::new(0), ArrayElementType::Reference, 3);
         for i in 0..3 {
@@ -66034,7 +66671,7 @@ mod tests {
             )
             .unwrap()
             .unwrap();
-            let _ = shared.heap.set_array_element(arr, i as usize, boxed);
+            let _ = shared.mem.heap.set_array_element(arr, i as usize, boxed);
         }
 
         let result = call_native(
@@ -66050,7 +66687,7 @@ mod tests {
 
         match result {
             Value::Object(Some(s)) => {
-                let text = read_java_string(&shared.heap, s).unwrap();
+                let text = read_java_string(&shared.mem.heap, s).unwrap();
                 assert_eq!(
                     text, "[1, 2, 3]",
                     "Arrays.toString(Object[]) with Integers should show values"
@@ -66066,7 +66703,7 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let list = shared.heap.alloc_object(ClassId::new(0), 2);
+        let list = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         call_native(
             &shared,
             &mut thread,
@@ -66134,7 +66771,7 @@ mod tests {
 
         match result {
             Value::Object(Some(s)) => {
-                let text = read_java_string(&shared.heap, s).unwrap();
+                let text = read_java_string(&shared.mem.heap, s).unwrap();
                 assert_eq!(
                     text, "[42, null, hi]",
                     "ArrayList with Integer+null+String should format all correctly"
@@ -66273,13 +66910,14 @@ mod tests {
         .unwrap();
 
         // update(byte[])
-        let arr = shared.heap.alloc_array(
+        let arr = shared.mem.heap.alloc_array(
             ClassId::new(0),
             crate::memory::heap::ArrayElementType::Byte,
             data.len(),
         );
         for (i, &b) in data.iter().enumerate() {
             let _ = shared
+                .mem
                 .heap
                 .set_array_element(arr, i, Value::Int(b as i8 as i32));
         }
@@ -66350,13 +66988,14 @@ mod tests {
         .unwrap();
 
         // update(byte[])
-        let arr = shared.heap.alloc_array(
+        let arr = shared.mem.heap.alloc_array(
             ClassId::new(0),
             crate::memory::heap::ArrayElementType::Byte,
             data.len(),
         );
         for (i, &b) in data.iter().enumerate() {
             let _ = shared
+                .mem
                 .heap
                 .set_array_element(arr, i, Value::Int(b as i8 as i32));
         }
@@ -66393,11 +67032,11 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
         let (_kp, pub_key, priv_key) = m22_generate_keypair(&shared, &mut thread, "RSA", 512);
         // PublicKey field 0 = alg_idx (6=RSA), field 1 = key_size
-        let alg = shared.heap.get_field(pub_key, 0);
+        let alg = shared.mem.heap.get_field(pub_key, 0);
         assert_eq!(alg, Value::Int(6), "M22: RSA alg index should be 6");
-        let size = shared.heap.get_field(pub_key, 1);
+        let size = shared.mem.heap.get_field(pub_key, 1);
         assert_eq!(size, Value::Int(512), "M22: RSA key size should be 512");
-        let priv_alg = shared.heap.get_field(priv_key, 0);
+        let priv_alg = shared.mem.heap.get_field(priv_key, 0);
         assert_eq!(priv_alg, Value::Int(6));
     }
 
@@ -66408,7 +67047,7 @@ mod tests {
         let (_kp, pub_key, priv_key) = m22_generate_keypair(&shared, &mut thread, "RSA", 512);
         let data = b"Hello, RSA signing!";
         let signature = m22_sign(&shared, &mut thread, "SHA256withRSA", priv_key, data);
-        let sig_len = shared.heap.array_length(signature);
+        let sig_len = shared.mem.heap.array_length(signature);
         assert!(sig_len > 0, "M22: RSA signature should be non-empty");
         let valid = m22_verify(
             &shared,
@@ -66464,13 +67103,13 @@ mod tests {
             b"message B",
         );
         // Read first byte of each signature РІР‚вЂќ they should differ (with overwhelming probability)
-        let len1 = shared.heap.array_length(sig1);
-        let len2 = shared.heap.array_length(sig2);
+        let len1 = shared.mem.heap.array_length(sig1);
+        let len2 = shared.mem.heap.array_length(sig2);
         assert_eq!(len1, len2, "M22: signatures should be same length");
         let mut differ = false;
         for i in 0..len1 {
-            let b1 = shared.heap.get_array_element(sig1, i);
-            let b2 = shared.heap.get_array_element(sig2, i);
+            let b1 = shared.mem.heap.get_array_element(sig1, i);
+            let b2 = shared.mem.heap.get_array_element(sig2, i);
             if b1 != b2 {
                 differ = true;
                 break;
@@ -66484,9 +67123,9 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
         let (_kp, pub_key, _priv_key) = m22_generate_keypair(&shared, &mut thread, "EC", 256);
-        let alg = shared.heap.get_field(pub_key, 0);
+        let alg = shared.mem.heap.get_field(pub_key, 0);
         assert_eq!(alg, Value::Int(7), "M22: EC alg index should be 7");
-        let size = shared.heap.get_field(pub_key, 1);
+        let size = shared.mem.heap.get_field(pub_key, 1);
         assert_eq!(size, Value::Int(256), "M22: EC key size should be 256");
     }
 
@@ -66497,7 +67136,7 @@ mod tests {
         let (_kp, pub_key, priv_key) = m22_generate_keypair(&shared, &mut thread, "EC", 256);
         let data = b"Hello, ECDSA signing!";
         let signature = m22_sign(&shared, &mut thread, "SHA384withECDSA", priv_key, data);
-        let sig_len = shared.heap.array_length(signature);
+        let sig_len = shared.mem.heap.array_length(signature);
         assert!(sig_len > 0, "M22: ECDSA signature should be non-empty");
         let valid = m22_verify(
             &shared,
@@ -66641,13 +67280,14 @@ mod tests {
         .unwrap();
 
         let data = b"sign into buffer";
-        let arr = shared.heap.alloc_array(
+        let arr = shared.mem.heap.alloc_array(
             ClassId::new(0),
             crate::memory::heap::ArrayElementType::Byte,
             data.len(),
         );
         for (i, &b) in data.iter().enumerate() {
             let _ = shared
+                .mem
                 .heap
                 .set_array_element(arr, i, Value::Int(b as i8 as i32));
         }
@@ -66662,7 +67302,7 @@ mod tests {
         .unwrap();
 
         // sign(byte[] outbuf, int offset, int len) -> int
-        let outbuf = shared.heap.alloc_array(
+        let outbuf = shared.mem.heap.alloc_array(
             ClassId::new(0),
             crate::memory::heap::ArrayElementType::Byte,
             512,
@@ -66689,17 +67329,18 @@ mod tests {
         assert!(written_len > 0, "M22: sign into buffer should write bytes");
 
         // Copy written bytes into a new array for verification
-        let sig_arr = shared.heap.alloc_array(
+        let sig_arr = shared.mem.heap.alloc_array(
             ClassId::new(0),
             crate::memory::heap::ArrayElementType::Byte,
             written_len as usize,
         );
         for i in 0..written_len as usize {
             let b = shared
+                .mem
                 .heap
                 .get_array_element(outbuf, i)
                 .unwrap_or(Value::Int(0));
-            let _ = shared.heap.set_array_element(sig_arr, i, b);
+            let _ = shared.mem.heap.set_array_element(sig_arr, i, b);
         }
         let valid = m22_verify(
             &shared,
@@ -66772,22 +67413,25 @@ mod tests {
 
         // --- Load collection classes explicitly ---
         let arraylist_id = shared
+            .classes
             .class_manager
             .write()
             .load_class("java/util/ArrayList")
             .expect("ArrayList should load from real JDK");
         let collections_id = shared
+            .classes
             .class_manager
             .write()
             .load_class("java/util/Collections")
             .expect("Collections should load from real JDK");
         let hashmap_id = shared
+            .classes
             .class_manager
             .write()
             .load_class("java/util/HashMap")
             .expect("HashMap should load from real JDK");
 
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
 
         // --- Verify classes are NOT synthetic stubs ---
         let arraylist = cm.class_store.get(arraylist_id).unwrap();
@@ -66949,18 +67593,19 @@ mod tests {
         // Load ArrayList and allocate an instance
         let al_id = vm
             .shared
+            .classes
             .class_manager
             .write()
             .load_class("java/util/ArrayList")
             .expect("ArrayList should load");
         let al_nfields = {
-            let cm = vm.shared.class_manager.read();
+            let cm = vm.shared.classes.class_manager.read();
             cm.class_store
                 .get(al_id)
                 .map(|c| c.num_total_fields)
                 .unwrap_or(4)
         };
-        let al_obj = vm.shared.heap.alloc_object(al_id, al_nfields);
+        let al_obj = vm.shared.mem.heap.alloc_object(al_id, al_nfields);
 
         // Attempt to invoke ArrayList.<init>()V
         let init_result = invoke_or_native(
@@ -67001,6 +67646,7 @@ mod tests {
         let mut shared = SharedVm::new(VmConfig::default());
         for &(class_name, method_name, descriptor, callback) in registrations {
             shared
+                .natives
                 .native_methods
                 .register(class_name, method_name, descriptor, callback);
         }
@@ -67047,6 +67693,7 @@ mod tests {
         let h1 = std::thread::spawn(move || {
             let mut thread = JvmThread::new(ThreadId(1), "worker-1");
             let cb = shared1
+                .natives
                 .native_methods
                 .find("test/Compute", "add", "(II)I")
                 .unwrap();
@@ -67064,6 +67711,7 @@ mod tests {
         let h2 = std::thread::spawn(move || {
             let mut thread = JvmThread::new(ThreadId(2), "worker-2");
             let cb = shared2
+                .natives
                 .native_methods
                 .find("test/Compute", "add", "(II)I")
                 .unwrap();
@@ -67132,7 +67780,7 @@ mod tests {
         )]);
 
         // Create a shared lock object
-        let lock_obj = shared.heap.alloc_object(ClassId::new(0), 0);
+        let lock_obj = shared.mem.heap.alloc_object(ClassId::new(0), 0);
 
         let shared1 = shared.clone();
         let shared2 = shared.clone();
@@ -67140,9 +67788,11 @@ mod tests {
         let h1 = std::thread::spawn(move || {
             let mut thread = JvmThread::new(ThreadId(1), "sync-1");
             shared1
+                .threads
                 .thread_registry
                 .register(ThreadId(1), "sync-1", None);
             let cb = shared1
+                .natives
                 .native_methods
                 .find("test/Sync", "incrementSync", "(Ljava/lang/Object;I)V")
                 .unwrap();
@@ -67156,9 +67806,11 @@ mod tests {
         let h2 = std::thread::spawn(move || {
             let mut thread = JvmThread::new(ThreadId(2), "sync-2");
             shared2
+                .threads
                 .thread_registry
                 .register(ThreadId(2), "sync-2", None);
             let cb = shared2
+                .natives
                 .native_methods
                 .find("test/Sync", "incrementSync", "(Ljava/lang/Object;I)V")
                 .unwrap();
@@ -67240,16 +67892,18 @@ mod tests {
             ),
         ]);
 
-        let lock_obj = shared.heap.alloc_object(ClassId::new(0), 0);
+        let lock_obj = shared.mem.heap.alloc_object(ClassId::new(0), 0);
         let shared1 = shared.clone();
         let shared2 = shared.clone();
 
         let consumer = std::thread::spawn(move || {
             let mut thread = JvmThread::new(ThreadId(1), "consumer");
             shared1
+                .threads
                 .thread_registry
                 .register(ThreadId(1), "consumer", None);
             let cb = shared1
+                .natives
                 .native_methods
                 .find("test/WaitNotify", "consume", "(Ljava/lang/Object;)V")
                 .unwrap();
@@ -67263,9 +67917,11 @@ mod tests {
         let producer = std::thread::spawn(move || {
             let mut thread = JvmThread::new(ThreadId(2), "producer");
             shared2
+                .threads
                 .thread_registry
                 .register(ThreadId(2), "producer", None);
             let cb = shared2
+                .natives
                 .native_methods
                 .find("test/WaitNotify", "produce", "(Ljava/lang/Object;)V")
                 .unwrap();
@@ -67324,6 +67980,7 @@ mod tests {
         let h1 = std::thread::spawn(move || {
             let mut thread = JvmThread::new(ThreadId(1), "alloc-1");
             let cb = shared1
+                .natives
                 .native_methods
                 .find("test/Alloc", "allocMany", "(I)I")
                 .unwrap();
@@ -67341,6 +67998,7 @@ mod tests {
         let h2 = std::thread::spawn(move || {
             let mut thread = JvmThread::new(ThreadId(2), "alloc-2");
             let cb = shared2
+                .natives
                 .native_methods
                 .find("test/Alloc", "allocMany", "(I)I")
                 .unwrap();
@@ -67384,6 +68042,7 @@ mod tests {
         let h1 = std::thread::spawn(move || {
             let mut thread = JvmThread::new(ThreadId(1), "loader-1");
             let cb = shared1
+                .natives
                 .native_methods
                 .find("test/ClassA", "run", "()I")
                 .unwrap();
@@ -67400,6 +68059,7 @@ mod tests {
         let h2 = std::thread::spawn(move || {
             let mut thread = JvmThread::new(ThreadId(2), "loader-2");
             let cb = shared2
+                .natives
                 .native_methods
                 .find("test/ClassB", "run", "()I")
                 .unwrap();
@@ -67479,8 +68139,8 @@ mod tests {
             ),
         ]);
 
-        let obj = shared.heap.alloc_object(ClassId::new(0), 1);
-        shared.heap.set_field(obj, 0, Value::Int(0)); // initial value
+        let obj = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        shared.mem.heap.set_field(obj, 0, Value::Int(0)); // initial value
 
         let shared1 = shared.clone();
         let shared2 = shared.clone();
@@ -67488,6 +68148,7 @@ mod tests {
         let writer = std::thread::spawn(move || {
             let mut thread = JvmThread::new(ThreadId(1), "writer");
             let cb = shared1
+                .natives
                 .native_methods
                 .find("test/Vol", "write", "(Ljava/lang/Object;)V")
                 .unwrap();
@@ -67501,6 +68162,7 @@ mod tests {
         let reader = std::thread::spawn(move || {
             let mut thread = JvmThread::new(ThreadId(2), "reader");
             let cb = shared2
+                .natives
                 .native_methods
                 .find("test/Vol", "read", "(Ljava/lang/Object;)I")
                 .unwrap();
@@ -67532,20 +68194,23 @@ mod tests {
 
         let shared = m6_shared_with_natives(&[]);
         let tid = ThreadId(99);
-        shared.thread_registry.register(tid, "joinable", None);
+        shared
+            .threads
+            .thread_registry
+            .register(tid, "joinable", None);
 
         let shared1 = shared.clone();
         let handle = std::thread::spawn(move || {
             // Simulate work
             std::thread::sleep(std::time::Duration::from_millis(30));
             RESULT.store(99, Ordering::Release);
-            shared1.thread_registry.mark_dead(tid);
+            shared1.threads.thread_registry.mark_dead(tid);
         });
 
-        shared.thread_registry.set_join_handle(tid, handle);
+        shared.threads.thread_registry.set_join_handle(tid, handle);
 
         // Join should block until the spawned thread completes
-        let joined = shared.thread_registry.join(tid);
+        let joined = shared.threads.thread_registry.join(tid);
         assert!(joined, "join should succeed");
         assert_eq!(
             RESULT.load(Ordering::Acquire),
@@ -67641,9 +68306,9 @@ mod tests {
             ),
         ]);
 
-        let lock = shared.heap.alloc_object(ClassId::new(0), 0);
-        let queue = shared.heap.alloc_object(ClassId::new(0), 2); // field 0 = count, field 1 = last value
-        shared.heap.set_field(queue, 0, Value::Int(0));
+        let lock = shared.mem.heap.alloc_object(ClassId::new(0), 0);
+        let queue = shared.mem.heap.alloc_object(ClassId::new(0), 2); // field 0 = count, field 1 = last value
+        shared.mem.heap.set_field(queue, 0, Value::Int(0));
 
         let shared1 = shared.clone();
         let shared2 = shared.clone();
@@ -67651,9 +68316,11 @@ mod tests {
         let producer = std::thread::spawn(move || {
             let mut thread = JvmThread::new(ThreadId(1), "producer");
             shared1
+                .threads
                 .thread_registry
                 .register(ThreadId(1), "producer", None);
             let cb = shared1
+                .natives
                 .native_methods
                 .find(
                     "test/PC",
@@ -67675,9 +68342,11 @@ mod tests {
         let consumer = std::thread::spawn(move || {
             let mut thread = JvmThread::new(ThreadId(2), "consumer");
             shared2
+                .threads
                 .thread_registry
                 .register(ThreadId(2), "consumer", None);
             let cb = shared2
+                .natives
                 .native_methods
                 .find(
                     "test/PC",
@@ -67745,16 +68414,20 @@ mod tests {
             native_increment,
         )]);
 
-        let lock = shared.heap.alloc_object(ClassId::new(0), 0);
+        let lock = shared.mem.heap.alloc_object(ClassId::new(0), 0);
 
         let handles: Vec<_> = (0..4)
             .map(|i| {
                 let s = shared.clone();
                 std::thread::spawn(move || {
                     let mut thread = JvmThread::new(ThreadId(i + 1), &format!("inc-{}", i));
-                    s.thread_registry
-                        .register(ThreadId(i + 1), &format!("inc-{}", i), None);
+                    s.threads.thread_registry.register(
+                        ThreadId(i + 1),
+                        &format!("inc-{}", i),
+                        None,
+                    );
                     let cb = s
+                        .natives
                         .native_methods
                         .find("test/Inc", "increment", "(Ljava/lang/Object;I)V")
                         .unwrap();
@@ -67805,7 +68478,7 @@ mod tests {
             "(Ljava/lang/Object;)I",
             native_reentrant,
         )]);
-        let lock = shared.heap.alloc_object(ClassId::new(0), 0);
+        let lock = shared.mem.heap.alloc_object(ClassId::new(0), 0);
 
         let shared1 = shared.clone();
         let shared2 = shared.clone();
@@ -67814,6 +68487,7 @@ mod tests {
         let h1 = std::thread::spawn(move || {
             let mut thread = JvmThread::new(ThreadId(1), "reent-1");
             let cb = shared1
+                .natives
                 .native_methods
                 .find("test/Reent", "reenter", "(Ljava/lang/Object;)I")
                 .unwrap();
@@ -67831,6 +68505,7 @@ mod tests {
         let h2 = std::thread::spawn(move || {
             let mut thread = JvmThread::new(ThreadId(2), "reent-2");
             let cb = shared2
+                .natives
                 .native_methods
                 .find("test/Reent", "reenter", "(Ljava/lang/Object;)I")
                 .unwrap();
@@ -67856,7 +68531,7 @@ mod tests {
     /// Helper: create SharedVm with builtins registered (for ThreadGroup tests).
     fn p86_shared_with_builtins() -> Arc<SharedVm> {
         let mut shared = SharedVm::new(VmConfig::default());
-        crate::native::builtins::register_builtins(&mut shared.native_methods);
+        crate::native::builtins::register_builtins(&mut shared.natives.native_methods);
         let shared = Arc::new(shared);
         *shared.self_arc.write() = Some(Arc::downgrade(&shared));
         shared
@@ -67870,7 +68545,7 @@ mod tests {
         let tg_class = "java/lang/ThreadGroup";
 
         // Create system ThreadGroup
-        let system_tg = shared.heap.alloc_object(ClassId::new(0), 3);
+        let system_tg = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         let system_name = {
             let mut ctx = NativeContextImpl {
                 shared: &shared,
@@ -67879,6 +68554,7 @@ mod tests {
             ctx.create_string("system")
         };
         let cb = shared
+            .natives
             .native_methods
             .find(tg_class, "<init>", "(Ljava/lang/String;)V")
             .unwrap();
@@ -67896,7 +68572,7 @@ mod tests {
         .unwrap();
 
         // Create main ThreadGroup with system as parent
-        let main_tg = shared.heap.alloc_object(ClassId::new(0), 3);
+        let main_tg = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         let main_name = {
             let mut ctx = NativeContextImpl {
                 shared: &shared,
@@ -67905,6 +68581,7 @@ mod tests {
             ctx.create_string("main")
         };
         let cb = shared
+            .natives
             .native_methods
             .find(
                 tg_class,
@@ -67928,6 +68605,7 @@ mod tests {
 
         // Verify hierarchy
         let cb = shared
+            .natives
             .native_methods
             .find(tg_class, "getParent", "()Ljava/lang/ThreadGroup;")
             .unwrap();
@@ -67943,6 +68621,7 @@ mod tests {
         );
 
         let cb = shared
+            .natives
             .native_methods
             .find(tg_class, "getName", "()Ljava/lang/String;")
             .unwrap();
@@ -67969,11 +68648,20 @@ mod tests {
         let shared = p86_shared_with_builtins();
 
         // Register 3 threads as alive
-        shared.thread_registry.register(ThreadId(1), "t1", None);
-        shared.thread_registry.register(ThreadId(2), "t2", None);
-        shared.thread_registry.register(ThreadId(3), "t3", None);
+        shared
+            .threads
+            .thread_registry
+            .register(ThreadId(1), "t1", None);
+        shared
+            .threads
+            .thread_registry
+            .register(ThreadId(2), "t2", None);
+        shared
+            .threads
+            .thread_registry
+            .register(ThreadId(3), "t3", None);
 
-        let tg = shared.heap.alloc_object(ClassId::new(0), 3);
+        let tg = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         let mut thread = JvmThread::new(ThreadId(0), "main");
         let name = {
             let mut ctx = NativeContextImpl {
@@ -67983,6 +68671,7 @@ mod tests {
             ctx.create_string("main")
         };
         let cb_init = shared
+            .natives
             .native_methods
             .find("java/lang/ThreadGroup", "<init>", "(Ljava/lang/String;)V")
             .unwrap();
@@ -67997,6 +68686,7 @@ mod tests {
         .unwrap();
 
         let cb = shared
+            .natives
             .native_methods
             .find("java/lang/ThreadGroup", "activeCount", "()I")
             .unwrap();
@@ -68015,7 +68705,7 @@ mod tests {
         );
 
         // Mark one dead
-        shared.thread_registry.mark_dead(ThreadId(2));
+        shared.threads.thread_registry.mark_dead(ThreadId(2));
         let mut ctx = NativeContextImpl {
             shared: &shared,
             thread: &mut thread,
@@ -68034,16 +68724,18 @@ mod tests {
         let shared = p86_shared_with_builtins();
 
         // Create Java Thread objects and register them
-        let t1_obj = shared.heap.alloc_object(ClassId::new(0), 2);
-        let t2_obj = shared.heap.alloc_object(ClassId::new(0), 2);
+        let t1_obj = shared.mem.heap.alloc_object(ClassId::new(0), 2);
+        let t2_obj = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         shared
+            .threads
             .thread_registry
             .register(ThreadId(1), "t1", Some(t1_obj));
         shared
+            .threads
             .thread_registry
             .register(ThreadId(2), "t2", Some(t2_obj));
 
-        let tg = shared.heap.alloc_object(ClassId::new(0), 3);
+        let tg = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         let mut thread = JvmThread::new(ThreadId(0), "main");
         let name = {
             let mut ctx = NativeContextImpl {
@@ -68053,6 +68745,7 @@ mod tests {
             ctx.create_string("main")
         };
         let cb_init = shared
+            .natives
             .native_methods
             .find("java/lang/ThreadGroup", "<init>", "(Ljava/lang/String;)V")
             .unwrap();
@@ -68075,6 +68768,7 @@ mod tests {
             ctx.new_ref_array(ClassId::new(0), 10)
         };
         let cb = shared
+            .natives
             .native_methods
             .find(
                 "java/lang/ThreadGroup",
@@ -68097,8 +68791,8 @@ mod tests {
         assert_eq!(count, 2, "enumerate should return 2 threads");
 
         // Verify the array contains the thread objects
-        let elem0 = shared.heap.get_array_element(arr, 0).unwrap();
-        let elem1 = shared.heap.get_array_element(arr, 1).unwrap();
+        let elem0 = shared.mem.heap.get_array_element(arr, 0).unwrap();
+        let elem1 = shared.mem.heap.get_array_element(arr, 1).unwrap();
         let has_t1 = elem0 == Value::Object(Some(t1_obj)) || elem1 == Value::Object(Some(t1_obj));
         let has_t2 = elem0 == Value::Object(Some(t2_obj)) || elem1 == Value::Object(Some(t2_obj));
         assert!(has_t1, "enumerate should include t1 thread object");
@@ -68115,8 +68809,12 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let tid = ThreadId(1);
         let thread = JvmThread::new(tid, "test-interrupt");
-        shared.thread_registry.register(tid, "test-interrupt", None);
         shared
+            .threads
+            .thread_registry
+            .register(tid, "test-interrupt", None);
+        shared
+            .threads
             .thread_registry
             .set_interrupted_flag(tid, thread.interrupted.clone());
 
@@ -68126,7 +68824,7 @@ mod tests {
             .load(std::sync::atomic::Ordering::Acquire));
 
         // Set interrupt via registry (simulates Thread.interrupt() from another thread)
-        shared.thread_registry.set_interrupted(tid, true);
+        shared.threads.thread_registry.set_interrupted(tid, true);
         assert!(thread
             .interrupted
             .load(std::sync::atomic::Ordering::Acquire));
@@ -68147,10 +68845,14 @@ mod tests {
 
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let tid_b = ThreadId(2);
-        shared.thread_registry.register(tid_b, "thread-B", None);
+        shared
+            .threads
+            .thread_registry
+            .register(tid_b, "thread-B", None);
 
         let interrupted_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
         shared
+            .threads
             .thread_registry
             .set_interrupted_flag(tid_b, interrupted_flag.clone());
 
@@ -68170,7 +68872,7 @@ mod tests {
 
         // Thread A interrupts Thread B
         std::thread::sleep(std::time::Duration::from_millis(5));
-        shared1.thread_registry.set_interrupted(tid_b, true);
+        shared1.threads.thread_registry.set_interrupted(tid_b, true);
 
         let was_interrupted = thread_b.join().unwrap();
         assert!(
@@ -68188,12 +68890,13 @@ mod tests {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let tid = ThreadId(1);
         let mut thread = JvmThread::new(tid, "waiter");
-        shared.thread_registry.register(tid, "waiter", None);
+        shared.threads.thread_registry.register(tid, "waiter", None);
         shared
+            .threads
             .thread_registry
             .set_interrupted_flag(tid, thread.interrupted.clone());
 
-        let lock = shared.heap.alloc_object(ClassId::new(0), 0);
+        let lock = shared.mem.heap.alloc_object(ClassId::new(0), 0);
 
         let flag = thread.interrupted.clone();
         let shared1 = shared.clone();
@@ -68201,7 +68904,7 @@ mod tests {
         // Interrupt after a short delay
         let interrupter = std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(20));
-            shared1.thread_registry.set_interrupted(tid, true);
+            shared1.threads.thread_registry.set_interrupted(tid, true);
         });
 
         // Enter monitor and wait with timeout РІР‚вЂќ should return after interrupt
@@ -68243,7 +68946,9 @@ mod tests {
     /// Helper: create SharedVm with collection natives registered (for CHM tests).
     fn p86_shared_with_collections() -> Arc<SharedVm> {
         let mut shared = SharedVm::new(VmConfig::default());
-        crate::native::collections::register_collections_natives(&mut shared.native_methods);
+        crate::native::collections::register_collections_natives(
+            &mut shared.natives.native_methods,
+        );
         let shared = Arc::new(shared);
         *shared.self_arc.write() = Some(Arc::downgrade(&shared));
         shared
@@ -68259,6 +68964,7 @@ mod tests {
         args: &[Value],
     ) -> crate::error::MethodCallResult {
         let cb = shared
+            .natives
             .native_methods
             .find(class, method, descriptor)
             .unwrap_or_else(|| panic!("{class}.{method}{descriptor} not found"));
@@ -68274,7 +68980,7 @@ mod tests {
         let chm_class = "java/util/concurrent/ConcurrentHashMap";
 
         // Create CHM on main thread
-        let chm = shared.heap.alloc_object(ClassId::new(0), 2);
+        let chm = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         {
             let mut thread = JvmThread::new(ThreadId(0), "main");
             p86_chm_call(
@@ -68295,11 +69001,12 @@ mod tests {
         let h1 = std::thread::spawn(move || {
             let mut thread = JvmThread::new(ThreadId(1), "writer-1");
             for i in 0..50 {
-                let key = shared1.heap.alloc_object(ClassId::new(0), 1);
-                shared1.heap.set_field(key, 0, Value::Int(i));
-                let val = shared1.heap.alloc_object(ClassId::new(0), 1);
-                shared1.heap.set_field(val, 0, Value::Int(i * 10));
+                let key = shared1.mem.heap.alloc_object(ClassId::new(0), 1);
+                shared1.mem.heap.set_field(key, 0, Value::Int(i));
+                let val = shared1.mem.heap.alloc_object(ClassId::new(0), 1);
+                shared1.mem.heap.set_field(val, 0, Value::Int(i * 10));
                 let cb = shared1
+                    .natives
                     .native_methods
                     .find(
                         "java/util/concurrent/ConcurrentHashMap",
@@ -68327,11 +69034,12 @@ mod tests {
         let h2 = std::thread::spawn(move || {
             let mut thread = JvmThread::new(ThreadId(2), "writer-2");
             for i in 50..100 {
-                let key = shared2.heap.alloc_object(ClassId::new(0), 1);
-                shared2.heap.set_field(key, 0, Value::Int(i));
-                let val = shared2.heap.alloc_object(ClassId::new(0), 1);
-                shared2.heap.set_field(val, 0, Value::Int(i * 10));
+                let key = shared2.mem.heap.alloc_object(ClassId::new(0), 1);
+                shared2.mem.heap.set_field(key, 0, Value::Int(i));
+                let val = shared2.mem.heap.alloc_object(ClassId::new(0), 1);
+                shared2.mem.heap.set_field(val, 0, Value::Int(i * 10));
                 let cb = shared2
+                    .natives
                     .native_methods
                     .find(
                         "java/util/concurrent/ConcurrentHashMap",
@@ -68384,7 +69092,7 @@ mod tests {
         let shared = p86_shared_with_collections();
         let chm_class = "java/util/concurrent/ConcurrentHashMap";
 
-        let chm = shared.heap.alloc_object(ClassId::new(0), 2);
+        let chm = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         {
             let mut thread = JvmThread::new(ThreadId(0), "main");
             p86_chm_call(
@@ -68405,11 +69113,12 @@ mod tests {
         let writer = std::thread::spawn(move || {
             let mut thread = JvmThread::new(ThreadId(1), "writer");
             for i in 0..100 {
-                let key = shared1.heap.alloc_object(ClassId::new(0), 1);
-                shared1.heap.set_field(key, 0, Value::Int(i));
-                let val = shared1.heap.alloc_object(ClassId::new(0), 1);
-                shared1.heap.set_field(val, 0, Value::Int(i));
+                let key = shared1.mem.heap.alloc_object(ClassId::new(0), 1);
+                shared1.mem.heap.set_field(key, 0, Value::Int(i));
+                let val = shared1.mem.heap.alloc_object(ClassId::new(0), 1);
+                shared1.mem.heap.set_field(val, 0, Value::Int(i));
                 let cb = shared1
+                    .natives
                     .native_methods
                     .find(
                         "java/util/concurrent/ConcurrentHashMap",
@@ -68439,6 +69148,7 @@ mod tests {
             let mut max_seen = 0i32;
             for _ in 0..200 {
                 let cb = shared2
+                    .natives
                     .native_methods
                     .find("java/util/concurrent/ConcurrentHashMap", "size", "()I")
                     .unwrap();
@@ -68473,7 +69183,7 @@ mod tests {
         let shared = p86_shared_with_collections();
         let chm_class = "java/util/concurrent/ConcurrentHashMap";
 
-        let chm = shared.heap.alloc_object(ClassId::new(0), 2);
+        let chm = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         {
             let mut thread = JvmThread::new(ThreadId(0), "main");
             p86_chm_call(
@@ -68494,11 +69204,12 @@ mod tests {
                     let mut thread = JvmThread::new(ThreadId(t + 1), &format!("stress-{}", t));
                     for i in 0..25 {
                         let unique_key = t as i32 * 1000 + i;
-                        let key = s.heap.alloc_object(ClassId::new(0), 1);
-                        s.heap.set_field(key, 0, Value::Int(unique_key));
-                        let val = s.heap.alloc_object(ClassId::new(0), 1);
-                        s.heap.set_field(val, 0, Value::Int(unique_key));
+                        let key = s.mem.heap.alloc_object(ClassId::new(0), 1);
+                        s.mem.heap.set_field(key, 0, Value::Int(unique_key));
+                        let val = s.mem.heap.alloc_object(ClassId::new(0), 1);
+                        s.mem.heap.set_field(val, 0, Value::Int(unique_key));
                         let cb = s
+                            .natives
                             .native_methods
                             .find(
                                 "java/util/concurrent/ConcurrentHashMap",
@@ -68625,8 +69336,8 @@ mod tests {
         let err = jit_panic_to_exception(&shared, &mut thread, payload);
         match err {
             MethodCallFailed::ExceptionThrown(obj) => {
-                let class_id = shared.heap.class_id_of(obj);
-                let cm = shared.class_manager.read();
+                let class_id = shared.mem.heap.class_id_of(obj);
+                let cm = shared.classes.class_manager.read();
                 let class_name = cm.get_class(class_id).map(|c| &*c.name);
                 assert_eq!(
                     class_name,
@@ -68688,7 +69399,7 @@ mod tests {
 
     fn p90_shared_with_builtins() -> Arc<SharedVm> {
         let mut shared = SharedVm::new(VmConfig::default());
-        crate::native::builtins::register_builtins(&mut shared.native_methods);
+        crate::native::builtins::register_builtins(&mut shared.natives.native_methods);
         let shared = Arc::new(shared);
         *shared.self_arc.write() = Some(Arc::downgrade(&shared));
         shared
@@ -68702,7 +69413,7 @@ mod tests {
     fn p90_jdwp_set_breakpoint_and_check() {
         // Set a breakpoint in the JDWP EventManager and verify it matches.
         let shared = p90_shared();
-        let mut ds = shared.debug_state.lock();
+        let mut ds = shared.debug.debug_state.lock();
         use crate::debug::events::{EventKind, EventModifier, SuspendPolicy};
 
         let req_id = ds.events.set_event_request(
@@ -68728,13 +69439,16 @@ mod tests {
         let shared = p90_shared();
         use std::sync::atomic::Ordering;
 
-        assert!(!shared.breakpoints_active.load(Ordering::Relaxed));
-        shared.breakpoints_active.store(true, Ordering::Relaxed);
-        assert!(shared.breakpoints_active.load(Ordering::Relaxed));
+        assert!(!shared.debug.breakpoints_active.load(Ordering::Relaxed));
+        shared
+            .debug
+            .breakpoints_active
+            .store(true, Ordering::Relaxed);
+        assert!(shared.debug.breakpoints_active.load(Ordering::Relaxed));
 
         // When active, the interpreter loop checks debug_state for breakpoints.
         // Set a breakpoint and verify the debug_state is accessible.
-        let mut ds = shared.debug_state.lock();
+        let mut ds = shared.debug.debug_state.lock();
         use crate::debug::events::{EventKind, EventModifier, SuspendPolicy};
         ds.events.set_event_request(
             EventKind::Breakpoint,
@@ -68752,7 +69466,7 @@ mod tests {
     fn p90_jdwp_suspend_thread_on_breakpoint() {
         // Verify that hitting a breakpoint with SuspendPolicy::EventThread marks thread suspended.
         let shared = p90_shared();
-        let mut ds = shared.debug_state.lock();
+        let mut ds = shared.debug.debug_state.lock();
         use crate::debug::events::{EventKind, EventModifier, SuspendPolicy};
 
         ds.events.set_event_request(
@@ -68783,14 +69497,14 @@ mod tests {
         // JFR records a GC event when a recording is active.
         let shared = p90_shared();
         let rec_id = {
-            let mut fr = shared.flight_recorder.lock();
+            let mut fr = shared.debug.flight_recorder.lock();
             let id = fr.new_recording(cratonvm_jfr::RecordingSettings::new("test"));
             fr.start_recording(id);
             id
         };
         // Emit a GC event
         {
-            let mut fr = shared.flight_recorder.lock();
+            let mut fr = shared.debug.flight_recorder.lock();
             cratonvm_jfr::builtin::emit_gc_event(
                 &mut fr,
                 1,
@@ -68800,7 +69514,7 @@ mod tests {
                 500,
             );
         }
-        let mut fr = shared.flight_recorder.lock();
+        let mut fr = shared.debug.flight_recorder.lock();
         fr.stop_recording(rec_id);
         let rec = fr.get_recording_mut(rec_id).unwrap();
         let events = rec.get_events();
@@ -68816,13 +69530,13 @@ mod tests {
         // JFR records a class load event when a recording is active.
         let shared = p90_shared();
         let rec_id = {
-            let mut fr = shared.flight_recorder.lock();
+            let mut fr = shared.debug.flight_recorder.lock();
             let id = fr.new_recording(cratonvm_jfr::RecordingSettings::new("test"));
             fr.start_recording(id);
             id
         };
         {
-            let mut fr = shared.flight_recorder.lock();
+            let mut fr = shared.debug.flight_recorder.lock();
             cratonvm_jfr::builtin::emit_class_load_event(
                 &mut fr,
                 "java/lang/Object",
@@ -68832,7 +69546,7 @@ mod tests {
                 200,
             );
         }
-        let mut fr = shared.flight_recorder.lock();
+        let mut fr = shared.debug.flight_recorder.lock();
         fr.stop_recording(rec_id);
         let rec = fr.get_recording_mut(rec_id).unwrap();
         let events = rec.get_events();
@@ -68848,19 +69562,19 @@ mod tests {
         // JFR records thread start and end events.
         let shared = p90_shared();
         let rec_id = {
-            let mut fr = shared.flight_recorder.lock();
+            let mut fr = shared.debug.flight_recorder.lock();
             let id = fr.new_recording(cratonvm_jfr::RecordingSettings::new("test"));
             fr.start_recording(id);
             id
         };
         {
-            let mut fr = shared.flight_recorder.lock();
+            let mut fr = shared.debug.flight_recorder.lock();
             cratonvm_jfr::builtin::emit_thread_start_event(
                 &mut fr, "worker-1", "platform", 1, 1000,
             );
             cratonvm_jfr::builtin::emit_thread_end_event(&mut fr, "worker-1", 1, 2000);
         }
-        let mut fr = shared.flight_recorder.lock();
+        let mut fr = shared.debug.flight_recorder.lock();
         fr.stop_recording(rec_id);
         let rec = fr.get_recording_mut(rec_id).unwrap();
         let events = rec.get_events();
@@ -68876,13 +69590,13 @@ mod tests {
         // JFR records a compilation event.
         let shared = p90_shared();
         let rec_id = {
-            let mut fr = shared.flight_recorder.lock();
+            let mut fr = shared.debug.flight_recorder.lock();
             let id = fr.new_recording(cratonvm_jfr::RecordingSettings::new("test"));
             fr.start_recording(id);
             id
         };
         {
-            let mut fr = shared.flight_recorder.lock();
+            let mut fr = shared.debug.flight_recorder.lock();
             cratonvm_jfr::builtin::emit_compilation_event(
                 &mut fr,
                 "com/example/Main::main([Ljava/lang/String;)V",
@@ -68896,7 +69610,7 @@ mod tests {
                 500,
             );
         }
-        let mut fr = shared.flight_recorder.lock();
+        let mut fr = shared.debug.flight_recorder.lock();
         fr.stop_recording(rec_id);
         let rec = fr.get_recording_mut(rec_id).unwrap();
         let events = rec.get_events();
@@ -68921,6 +69635,7 @@ mod tests {
         args: &[Value],
     ) -> MethodCallResult {
         let cb = shared
+            .natives
             .native_methods
             .find(class, method, descriptor)
             .unwrap_or_else(|| panic!("native not found: {}.{}{}", class, method, descriptor));
@@ -68935,13 +69650,13 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // Allocate some objects to increase heap usage
-        let _obj1 = shared.heap.alloc_object(ClassId::new(1), 5);
-        let _obj2 = shared.heap.alloc_object(ClassId::new(1), 10);
+        let _obj1 = shared.mem.heap.alloc_object(ClassId::new(1), 5);
+        let _obj2 = shared.mem.heap.alloc_object(ClassId::new(1), 10);
 
         // Note: we capture heap BEFORE calling getMemoryMXBean, but the call itself
         // allocates objects. The MXBean reads heap_allocated_bytes() at call time,
         // so its value will be >= our pre-call measurement.
-        let heap_before = shared.heap.allocated_bytes();
+        let heap_before = shared.mem.heap.allocated_bytes();
 
         let result = p90_call_native(
             &shared,
@@ -68956,7 +69671,7 @@ mod tests {
             other => panic!("expected MemoryMXBean object, got {:?}", other),
         };
         // Field 0 = heapUsed, should be real heap bytes (>= pre-call)
-        let heap_used = match shared.heap.get_field(bean, 0) {
+        let heap_used = match shared.mem.heap.get_field(bean, 0) {
             Value::Long(v) => v,
             other => panic!("expected Long heapUsed, got {:?}", other),
         };
@@ -68980,8 +69695,11 @@ mod tests {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // Register a thread so alive_count > 0
-        shared.thread_registry.register(ThreadId(0), "main", None);
-        let real_count = shared.thread_registry.alive_count();
+        shared
+            .threads
+            .thread_registry
+            .register(ThreadId(0), "main", None);
+        let real_count = shared.threads.thread_registry.alive_count();
 
         let result = p90_call_native(
             &shared,
@@ -68996,7 +69714,7 @@ mod tests {
             other => panic!("expected ThreadMXBean object, got {:?}", other),
         };
         // Field 0 = threadCount, should be real count
-        let thread_count = match shared.heap.get_field(bean, 0) {
+        let thread_count = match shared.mem.heap.get_field(bean, 0) {
             Value::Int(v) => v,
             other => panic!("expected Int threadCount, got {:?}", other),
         };
@@ -69026,13 +69744,13 @@ mod tests {
             other => panic!("expected ClassLoadingMXBean object, got {:?}", other),
         };
         // Field 0 = loadedClassCount, should match what was loaded at call time
-        let loaded_count = match shared.heap.get_field(bean, 0) {
+        let loaded_count = match shared.mem.heap.get_field(bean, 0) {
             Value::Int(v) => v,
             other => panic!("expected Int loadedClassCount, got {:?}", other),
         };
         // The real class_manager.loaded_count() should match what the MXBean stored
         // (the MXBean reads it at allocation time via ctx.loaded_class_count())
-        let current_loaded = shared.class_manager.read().loaded_count();
+        let current_loaded = shared.classes.class_manager.read().loaded_count();
         // The count in the bean was captured at alloc time, which may be <= current
         assert!(
             loaded_count >= 0,
@@ -69087,7 +69805,7 @@ mod tests {
         let result = invoke_on_class_shared(&shared, &mut thread, class_id, "main", "()I", &[]);
         assert!(result.is_ok(), "HelloBudget main() should succeed");
 
-        let heap_bytes = shared.heap.allocated_bytes();
+        let heap_bytes = shared.mem.heap.allocated_bytes();
         let heap_mb = heap_bytes as f64 / (1024.0 * 1024.0);
         assert!(
             heap_bytes < 50 * 1024 * 1024,
@@ -69103,12 +69821,12 @@ mod tests {
 
         // Allocate 10,000 objects with 4 fields each
         for _ in 0..10_000 {
-            let obj = shared.heap.alloc_object(ClassId::new(1), 4);
+            let obj = shared.mem.heap.alloc_object(ClassId::new(1), 4);
             // Store something to prevent optimizing away
-            shared.heap.set_field(obj, 0, Value::Int(42));
+            shared.mem.heap.set_field(obj, 0, Value::Int(42));
         }
 
-        let heap_bytes = shared.heap.allocated_bytes();
+        let heap_bytes = shared.mem.heap.allocated_bytes();
         let heap_mb = heap_bytes as f64 / (1024.0 * 1024.0);
         assert!(
             heap_bytes < 300 * 1024 * 1024,
@@ -69533,9 +70251,9 @@ public class SkippedTest {
             Value::Object(Some(r)) => r,
             _ => panic!("expected date"),
         };
-        let ry = shared.heap.get_field(result_obj, 0).as_int().unwrap();
-        let rm = shared.heap.get_field(result_obj, 1).as_int().unwrap();
-        let rd = shared.heap.get_field(result_obj, 2).as_int().unwrap();
+        let ry = shared.mem.heap.get_field(result_obj, 0).as_int().unwrap();
+        let rm = shared.mem.heap.get_field(result_obj, 1).as_int().unwrap();
+        let rd = shared.mem.heap.get_field(result_obj, 2).as_int().unwrap();
         assert_eq!((ry, rm, rd), (2025, 3, 18));
     }
 
@@ -69581,7 +70299,7 @@ public class SkippedTest {
         .unwrap()
         .unwrap();
         let fmt_str = match formatted {
-            Value::Object(Some(r)) => read_java_string(&shared.heap, r).unwrap(),
+            Value::Object(Some(r)) => read_java_string(&shared.mem.heap, r).unwrap(),
             _ => panic!("expected string"),
         };
         assert_eq!(fmt_str, "2024-07-04");
@@ -69602,9 +70320,9 @@ public class SkippedTest {
             Value::Object(Some(r)) => r,
             _ => panic!("expected parsed object"),
         };
-        let py = shared.heap.get_field(parsed_obj, 0).as_int().unwrap();
-        let pm = shared.heap.get_field(parsed_obj, 1).as_int().unwrap();
-        let pd = shared.heap.get_field(parsed_obj, 2).as_int().unwrap();
+        let py = shared.mem.heap.get_field(parsed_obj, 0).as_int().unwrap();
+        let pm = shared.mem.heap.get_field(parsed_obj, 1).as_int().unwrap();
+        let pd = shared.mem.heap.get_field(parsed_obj, 2).as_int().unwrap();
         assert_eq!((py, pm, pd), (2024, 7, 4));
     }
 
@@ -69640,12 +70358,12 @@ public class SkippedTest {
             Value::Object(Some(r)) => r,
             _ => panic!("expected object"),
         };
-        assert_eq!(shared.heap.get_field(obj, 0).as_int().unwrap(), 2024);
-        assert_eq!(shared.heap.get_field(obj, 1).as_int().unwrap(), 12);
-        assert_eq!(shared.heap.get_field(obj, 2).as_int().unwrap(), 25);
-        assert_eq!(shared.heap.get_field(obj, 3).as_int().unwrap(), 14);
-        assert_eq!(shared.heap.get_field(obj, 4).as_int().unwrap(), 30);
-        assert_eq!(shared.heap.get_field(obj, 5).as_int().unwrap(), 45);
+        assert_eq!(shared.mem.heap.get_field(obj, 0).as_int().unwrap(), 2024);
+        assert_eq!(shared.mem.heap.get_field(obj, 1).as_int().unwrap(), 12);
+        assert_eq!(shared.mem.heap.get_field(obj, 2).as_int().unwrap(), 25);
+        assert_eq!(shared.mem.heap.get_field(obj, 3).as_int().unwrap(), 14);
+        assert_eq!(shared.mem.heap.get_field(obj, 4).as_int().unwrap(), 30);
+        assert_eq!(shared.mem.heap.get_field(obj, 5).as_int().unwrap(), 45);
     }
 
     #[test]
@@ -69668,7 +70386,7 @@ public class SkippedTest {
             Value::Object(Some(r)) => r,
             _ => panic!("expected date"),
         };
-        assert_eq!(shared.heap.get_field(date_obj, 2).as_int().unwrap(), 29);
+        assert_eq!(shared.mem.heap.get_field(date_obj, 2).as_int().unwrap(), 29);
 
         // isLeapYear(2024) should be true
         let is_leap = call_native(
@@ -69751,9 +70469,12 @@ public class SkippedTest {
             Value::Object(Some(r)) => r,
             _ => panic!("expected date"),
         };
-        assert_eq!(shared.heap.get_field(first_obj, 0).as_int().unwrap(), 2024);
-        assert_eq!(shared.heap.get_field(first_obj, 1).as_int().unwrap(), 3);
-        assert_eq!(shared.heap.get_field(first_obj, 2).as_int().unwrap(), 1);
+        assert_eq!(
+            shared.mem.heap.get_field(first_obj, 0).as_int().unwrap(),
+            2024
+        );
+        assert_eq!(shared.mem.heap.get_field(first_obj, 1).as_int().unwrap(), 3);
+        assert_eq!(shared.mem.heap.get_field(first_obj, 2).as_int().unwrap(), 1);
 
         // Get lastDayOfMonth adjuster
         let adj2 = call_native(
@@ -69782,7 +70503,7 @@ public class SkippedTest {
             Value::Object(Some(r)) => r,
             _ => panic!("expected date"),
         };
-        assert_eq!(shared.heap.get_field(last_obj, 2).as_int().unwrap(), 31);
+        assert_eq!(shared.mem.heap.get_field(last_obj, 2).as_int().unwrap(), 31);
     }
 
     // --- 93.2: BigInteger / BigDecimal ---
@@ -69793,7 +70514,7 @@ public class SkippedTest {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // Create BigInteger("12345678901234567890")
-        let a_obj = shared.heap.alloc_object(ClassId::new(0), 2);
+        let a_obj = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         let a_str = create_java_string(&shared, "12345678901234567890");
         call_native(
             &shared,
@@ -69806,7 +70527,7 @@ public class SkippedTest {
         .unwrap();
 
         // Create BigInteger("98765432109876543210")
-        let b_obj = shared.heap.alloc_object(ClassId::new(0), 2);
+        let b_obj = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         let b_str = create_java_string(&shared, "98765432109876543210");
         call_native(
             &shared,
@@ -69833,9 +70554,9 @@ public class SkippedTest {
             Value::Object(Some(r)) => r,
             _ => panic!("expected object"),
         };
-        let sum_str_val = shared.heap.get_field(sum_ref, 0);
+        let sum_str_val = shared.mem.heap.get_field(sum_ref, 0);
         let sum_str = match sum_str_val {
-            Value::Object(Some(r)) => read_java_string(&shared.heap, r).unwrap(),
+            Value::Object(Some(r)) => read_java_string(&shared.mem.heap, r).unwrap(),
             _ => panic!("expected string"),
         };
         assert_eq!(sum_str, "111111111011111111100");
@@ -69847,7 +70568,7 @@ public class SkippedTest {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // Very large: 10^50
-        let big = shared.heap.alloc_object(ClassId::new(0), 2);
+        let big = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         let big_str = create_java_string(
             &shared,
             "100000000000000000000000000000000000000000000000000",
@@ -69874,7 +70595,7 @@ public class SkippedTest {
         .unwrap()
         .unwrap();
         let ts_str = match ts {
-            Value::Object(Some(r)) => read_java_string(&shared.heap, r).unwrap(),
+            Value::Object(Some(r)) => read_java_string(&shared.mem.heap, r).unwrap(),
             _ => panic!(),
         };
         assert_eq!(
@@ -69889,7 +70610,7 @@ public class SkippedTest {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // Create BigDecimal("10")
-        let a_obj = shared.heap.alloc_object(ClassId::new(0), 3);
+        let a_obj = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         let a_str = create_java_string(&shared, "10");
         call_native(
             &shared,
@@ -69902,7 +70623,7 @@ public class SkippedTest {
         .unwrap();
 
         // Create BigDecimal("3")
-        let b_obj = shared.heap.alloc_object(ClassId::new(0), 3);
+        let b_obj = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         let b_str = create_java_string(&shared, "3");
         call_native(
             &shared,
@@ -69934,8 +70655,8 @@ public class SkippedTest {
             Value::Object(Some(r)) => r,
             _ => panic!("expected object"),
         };
-        let r_val = match shared.heap.get_field(r_ref, 0) {
-            Value::Object(Some(s)) => read_java_string(&shared.heap, s).unwrap(),
+        let r_val = match shared.mem.heap.get_field(r_ref, 0) {
+            Value::Object(Some(s)) => read_java_string(&shared.mem.heap, s).unwrap(),
             _ => panic!("expected string"),
         };
         // Result should be "3.33" or similar rounded value
@@ -69952,7 +70673,7 @@ public class SkippedTest {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let a = shared.heap.alloc_object(ClassId::new(0), 3);
+        let a = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         let a_str = create_java_string(&shared, "3.14");
         call_native(
             &shared,
@@ -69964,7 +70685,7 @@ public class SkippedTest {
         )
         .unwrap();
 
-        let b = shared.heap.alloc_object(ClassId::new(0), 3);
+        let b = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         let b_str = create_java_string(&shared, "2.71");
         call_native(
             &shared,
@@ -69995,7 +70716,7 @@ public class SkippedTest {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
-        let obj = shared.heap.alloc_object(ClassId::new(0), 3);
+        let obj = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         let s = create_java_string(&shared, "3.14159");
         call_native(
             &shared,
@@ -70018,7 +70739,7 @@ public class SkippedTest {
         .unwrap()
         .unwrap();
         let ts_str = match ts {
-            Value::Object(Some(r)) => read_java_string(&shared.heap, r).unwrap(),
+            Value::Object(Some(r)) => read_java_string(&shared.mem.heap, r).unwrap(),
             _ => panic!(),
         };
         assert_eq!(ts_str, "3.14159");
@@ -70030,7 +70751,7 @@ public class SkippedTest {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // gcd(12, 8) = 4
-        let a = shared.heap.alloc_object(ClassId::new(0), 2);
+        let a = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         let a_s = create_java_string(&shared, "12");
         call_native(
             &shared,
@@ -70042,7 +70763,7 @@ public class SkippedTest {
         )
         .unwrap();
 
-        let b = shared.heap.alloc_object(ClassId::new(0), 2);
+        let b = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         let b_s = create_java_string(&shared, "8");
         call_native(
             &shared,
@@ -70068,14 +70789,14 @@ public class SkippedTest {
             Value::Object(Some(r)) => r,
             _ => panic!("expected object"),
         };
-        let gcd_str = match shared.heap.get_field(gcd_ref, 0) {
-            Value::Object(Some(s)) => read_java_string(&shared.heap, s).unwrap(),
+        let gcd_str = match shared.mem.heap.get_field(gcd_ref, 0) {
+            Value::Object(Some(s)) => read_java_string(&shared.mem.heap, s).unwrap(),
             _ => panic!(),
         };
         assert_eq!(gcd_str, "4");
 
         // isProbablePrime(7) РІвЂ вЂ™ true
-        let seven = shared.heap.alloc_object(ClassId::new(0), 2);
+        let seven = shared.mem.heap.alloc_object(ClassId::new(0), 2);
         let seven_s = create_java_string(&shared, "7");
         call_native(
             &shared,
@@ -70134,7 +70855,7 @@ public class SkippedTest {
         .unwrap()
         .unwrap();
         let ts_str = match ts {
-            Value::Object(Some(r)) => read_java_string(&shared.heap, r).unwrap(),
+            Value::Object(Some(r)) => read_java_string(&shared.mem.heap, r).unwrap(),
             _ => panic!(),
         };
         // Default locale should have a language at minimum
@@ -70170,7 +70891,7 @@ public class SkippedTest {
         .unwrap()
         .unwrap();
         let fmt_str = match formatted {
-            Value::Object(Some(r)) => read_java_string(&shared.heap, r).unwrap(),
+            Value::Object(Some(r)) => read_java_string(&shared.mem.heap, r).unwrap(),
             _ => panic!(),
         };
         // Should contain grouping separators
@@ -70220,7 +70941,7 @@ public class SkippedTest {
             _ => panic!("expected number"),
         };
         // Should parse to Double(1234567.89)
-        let val = shared.heap.get_field(parsed_ref, 0);
+        let val = shared.mem.heap.get_field(parsed_ref, 0);
         match val {
             Value::Double(d) => assert!(
                 (d - 1234567.89).abs() < 0.01,
@@ -70239,14 +70960,18 @@ public class SkippedTest {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // Create primary exception with 3 fields (message, cause, suppressed[])
-        let primary = shared.heap.alloc_object(ClassId::new(0), 3);
+        let primary = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         let msg = create_java_string(&shared, "primary error");
-        shared.heap.set_field(primary, 0, Value::Object(Some(msg)));
+        shared
+            .mem
+            .heap
+            .set_field(primary, 0, Value::Object(Some(msg)));
 
         // Create suppressed exception
-        let suppressed = shared.heap.alloc_object(ClassId::new(0), 3);
+        let suppressed = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         let smsg = create_java_string(&shared, "close failed");
         shared
+            .mem
             .heap
             .set_field(suppressed, 0, Value::Object(Some(smsg)));
 
@@ -70279,7 +71004,7 @@ public class SkippedTest {
             Value::Object(Some(r)) => r,
             _ => panic!("expected array"),
         };
-        let elem = shared.heap.get_array_element(arr_ref, 0).unwrap();
+        let elem = shared.mem.heap.get_array_element(arr_ref, 0).unwrap();
         assert!(matches!(elem, Value::Object(Some(r)) if r == suppressed));
     }
 
@@ -70289,7 +71014,7 @@ public class SkippedTest {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // Exception with no suppressions РІвЂ вЂ™ empty array
-        let exc = shared.heap.alloc_object(ClassId::new(0), 3);
+        let exc = shared.mem.heap.alloc_object(ClassId::new(0), 3);
         let arr = call_native(
             &shared,
             &mut thread,
@@ -70304,7 +71029,7 @@ public class SkippedTest {
             Value::Object(Some(r)) => r,
             _ => panic!("expected array"),
         };
-        let len = shared.heap.array_length(arr_ref);
+        let len = shared.mem.heap.array_length(arr_ref);
         assert_eq!(len, 0, "no suppressions should give empty array");
     }
 
@@ -70314,9 +71039,9 @@ public class SkippedTest {
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
         // Primary with two suppressions
-        let primary = shared.heap.alloc_object(ClassId::new(0), 3);
-        let s1 = shared.heap.alloc_object(ClassId::new(0), 3);
-        let s2 = shared.heap.alloc_object(ClassId::new(0), 3);
+        let primary = shared.mem.heap.alloc_object(ClassId::new(0), 3);
+        let s1 = shared.mem.heap.alloc_object(ClassId::new(0), 3);
+        let s2 = shared.mem.heap.alloc_object(ClassId::new(0), 3);
 
         call_native(
             &shared,
@@ -70351,11 +71076,11 @@ public class SkippedTest {
             Value::Object(Some(r)) => r,
             _ => panic!("expected array"),
         };
-        let len = shared.heap.array_length(arr_ref);
+        let len = shared.mem.heap.array_length(arr_ref);
         assert_eq!(len, 2, "should have 2 suppressed exceptions");
-        let e0 = shared.heap.get_array_element(arr_ref, 0).unwrap();
+        let e0 = shared.mem.heap.get_array_element(arr_ref, 0).unwrap();
         assert!(matches!(e0, Value::Object(Some(r)) if r == s1));
-        let e1 = shared.heap.get_array_element(arr_ref, 1).unwrap();
+        let e1 = shared.mem.heap.get_array_element(arr_ref, 1).unwrap();
         assert!(matches!(e1, Value::Object(Some(r)) if r == s2));
     }
 
@@ -70369,7 +71094,7 @@ public class SkippedTest {
         // Create stream of strings: ["a", "bb", "cc", "ddd", "ee"]
         // Classifier: String::length РІвЂ вЂ™ groups by length
         let words = ["a", "bb", "cc", "ddd", "ee"];
-        let arr = shared.heap.alloc_array(
+        let arr = shared.mem.heap.alloc_array(
             ClassId::new(0),
             cratonvm_types::ArrayElementType::Reference,
             words.len(),
@@ -70377,6 +71102,7 @@ public class SkippedTest {
         for (i, w) in words.iter().enumerate() {
             let s = create_java_string(&shared, w);
             let _ = shared
+                .mem
                 .heap
                 .set_array_element(arr, i, Value::Object(Some(s)));
         }
@@ -70451,15 +71177,16 @@ public class SkippedTest {
 
         // Stream of integers: [1, 2, 3, 4, 5]
         let nums: Vec<i32> = vec![1, 2, 3, 4, 5];
-        let arr = shared.heap.alloc_array(
+        let arr = shared.mem.heap.alloc_array(
             ClassId::new(0),
             cratonvm_types::ArrayElementType::Reference,
             nums.len(),
         );
         for (i, n) in nums.iter().enumerate() {
-            let boxed = shared.heap.alloc_object(ClassId::new(0), 1);
-            shared.heap.set_field(boxed, 0, Value::Int(*n));
+            let boxed = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+            shared.mem.heap.set_field(boxed, 0, Value::Int(*n));
             let _ = shared
+                .mem
                 .heap
                 .set_array_element(arr, i, Value::Object(Some(boxed)));
         }
@@ -70517,7 +71244,7 @@ public class SkippedTest {
 
         // Stream of ["apple", "ant", "banana", "bat"]
         let words = ["apple", "ant", "banana", "bat"];
-        let arr = shared.heap.alloc_array(
+        let arr = shared.mem.heap.alloc_array(
             ClassId::new(0),
             cratonvm_types::ArrayElementType::Reference,
             words.len(),
@@ -70525,6 +71252,7 @@ public class SkippedTest {
         for (i, w) in words.iter().enumerate() {
             let s = create_java_string(&shared, w);
             let _ = shared
+                .mem
                 .heap
                 .set_array_element(arr, i, Value::Object(Some(s)));
         }
@@ -70746,7 +71474,7 @@ public class SkippedTest {
 
         // The CDS cache should have the class bytes
         {
-            let cm = shared.class_manager.read();
+            let cm = shared.classes.class_manager.read();
             assert!(
                 cm.cds_class_cache.contains_key("test/CdsLoaded"),
                 "CDS cache should contain the archived class"
@@ -71354,13 +72082,13 @@ public class SkippedTest {
         // Insert a dummy compiled method
         let buf = cratonvm_jit::ExecutableBuffer::new(64).unwrap();
         let compiled = cratonvm_jit::CompiledMethod::new(buf);
-        vm.jit_cache.write().put(
+        vm.jit.jit_cache.write().put(
             "TestClass".into(),
             "testMethod".into(),
             "()V".into(),
             compiled,
         );
-        assert_eq!(vm.jit_cache.read().len(), 1);
+        assert_eq!(vm.jit.jit_cache.read().len(), 1);
 
         // Deoptimize
         let action = crate::jit::helpers::DeoptimizationController::deoptimize(
@@ -71373,7 +72101,7 @@ public class SkippedTest {
         );
 
         // The compiled method should be evicted from the JIT cache
-        assert_eq!(vm.jit_cache.read().len(), 0);
+        assert_eq!(vm.jit.jit_cache.read().len(), 0);
         // First deopt for NullCheck should recommend Reinterpret (count-based: first occurrence)
         assert_eq!(action, cratonvm_jit::deopt::DeoptAction::Reinterpret);
     }
@@ -71446,7 +72174,7 @@ public class SkippedTest {
         assert_eq!(action, cratonvm_jit::deopt::DeoptAction::MakeNotCompilable);
 
         // Method should be in the jit_skip_set
-        let skip = vm.jit_skip_set.read();
+        let skip = vm.jit.jit_skip_set.read();
         assert!(skip.contains(&("Foo".into(), "bar".into(), "()V".into())));
     }
 
@@ -71461,7 +72189,7 @@ public class SkippedTest {
 
         // Register an assumption in the invalidation manager
         {
-            let mut inv = vm.invalidation_manager.lock();
+            let mut inv = vm.jit.invalidation_manager.lock();
             inv.register_assumption(
                 "MyClass.myMethod:()V",
                 cratonvm_jit::deopt::CompilationAssumption::LeafClass(42),
@@ -71479,7 +72207,7 @@ public class SkippedTest {
         );
 
         // After deopt, assumptions for that method key should be cleared
-        let inv = vm.invalidation_manager.lock();
+        let inv = vm.jit.invalidation_manager.lock();
         let invalidated = inv.on_class_loaded(42);
         // The assumption was cleared so no methods should be invalidated
         assert!(
@@ -71510,7 +72238,7 @@ public class SkippedTest {
         }
 
         // Verify the deopt log recorded all 5 events
-        let log = vm.deopt_log.lock();
+        let log = vm.jit.deopt_log.lock();
         assert_eq!(log.deopt_count("Hot.loop:(I)I"), 5);
     }
 
@@ -71563,6 +72291,7 @@ public class SkippedTest {
 
         // Method should now be in skip set
         assert!(vm
+            .jit
             .jit_skip_set
             .read()
             .contains(&("C".into(), "m".into(), "()V".into())));
@@ -71579,7 +72308,7 @@ public class SkippedTest {
 
         // Register multiple assumptions from different compiled methods
         {
-            let mut inv = vm.invalidation_manager.lock();
+            let mut inv = vm.jit.invalidation_manager.lock();
             inv.register_assumption(
                 "A.foo:()V",
                 cratonvm_jit::deopt::CompilationAssumption::LeafClass(100),
@@ -71595,7 +72324,7 @@ public class SkippedTest {
         }
 
         // Loading class 100 should invalidate A.foo and B.bar but not C.baz
-        let inv = vm.invalidation_manager.lock();
+        let inv = vm.jit.invalidation_manager.lock();
         let invalidated = inv.on_class_loaded(100);
         assert!(invalidated.contains(&"A.foo:()V".to_string()));
         assert!(invalidated.contains(&"B.bar:()V".to_string()));
@@ -71621,7 +72350,11 @@ public class SkippedTest {
 
         // Register `Animal` as a loaded class so the InvalidationManager
         // has a ClassId to key off of.
-        let animal_id = vm.class_manager.write().ensure_synthetic_class("Animal", 0);
+        let animal_id = vm
+            .classes
+            .class_manager
+            .write()
+            .ensure_synthetic_class("Animal", 0);
         let animal_cid_u32 = animal_id.as_u32();
 
         // Install a compiled entry for `Animal.speak:()V`. The JitCache
@@ -71629,14 +72362,15 @@ public class SkippedTest {
         let buf =
             cratonvm_jit::ExecutableBuffer::new(64).expect("failed to allocate executable buffer");
         let compiled = cratonvm_jit::CompiledMethod::new(buf);
-        vm.jit_cache
+        vm.jit
+            .jit_cache
             .write()
             .put("Animal".into(), "speak".into(), "()V".into(), compiled);
         let cn: std::sync::Arc<str> = "Animal".into();
         let mn: std::sync::Arc<str> = "speak".into();
         let desc: std::sync::Arc<str> = "()V".into();
         assert!(
-            vm.jit_cache.read().get(&cn, &mn, &desc).is_some(),
+            vm.jit.jit_cache.read().get(&cn, &mn, &desc).is_some(),
             "JIT entry must be present before invalidation"
         );
 
@@ -71644,7 +72378,7 @@ public class SkippedTest {
         // cache uses. The InvalidationManager stores method keys in
         // `<class>.<method>:<descriptor>` form.
         {
-            let mut inv = vm.invalidation_manager.lock();
+            let mut inv = vm.jit.invalidation_manager.lock();
             inv.register_assumption(
                 "Animal.speak:()V",
                 cratonvm_jit::deopt::CompilationAssumption::LeafClass(animal_cid_u32),
@@ -71660,7 +72394,7 @@ public class SkippedTest {
             "CHA listener must evict exactly one matching entry"
         );
         assert!(
-            vm.jit_cache.read().get(&cn, &mn, &desc).is_none(),
+            vm.jit.jit_cache.read().get(&cn, &mn, &desc).is_none(),
             "the compiled entry should have been removed"
         );
     }
@@ -71677,6 +72411,7 @@ public class SkippedTest {
         *vm.self_arc.write() = Some(std::sync::Arc::downgrade(&vm));
 
         let _unrelated_id = vm
+            .classes
             .class_manager
             .write()
             .ensure_synthetic_class("Unrelated", 0);
@@ -71685,10 +72420,11 @@ public class SkippedTest {
         let buf =
             cratonvm_jit::ExecutableBuffer::new(64).expect("failed to allocate executable buffer");
         let compiled = cratonvm_jit::CompiledMethod::new(buf);
-        vm.jit_cache
+        vm.jit
+            .jit_cache
             .write()
             .put("Other".into(), "run".into(), "()V".into(), compiled);
-        assert_eq!(vm.jit_cache.read().len(), 1);
+        assert_eq!(vm.jit.jit_cache.read().len(), 1);
 
         let evicted = vm.invalidate_jit_for_class("Unrelated");
         assert_eq!(
@@ -71696,7 +72432,7 @@ public class SkippedTest {
             "no assumptions on `Unrelated` РІР‚вЂќ nothing to evict"
         );
         assert_eq!(
-            vm.jit_cache.read().len(),
+            vm.jit.jit_cache.read().len(),
             1,
             "unrelated cache entry must remain"
         );
@@ -71854,7 +72590,7 @@ public class SkippedTest {
         if let Some(mut buf) = cratonvm_jit::ExecutableBuffer::new(64) {
             buf.emit(&[0xC3]);
             let cm = cratonvm_jit::CompiledMethod::new(buf);
-            let mut cache = vm.jit_cache.write();
+            let mut cache = vm.jit.jit_cache.write();
             cache.put("Deopt".into(), "target".into(), "()I".into(), cm);
         }
 
@@ -71862,7 +72598,7 @@ public class SkippedTest {
         let cn: std::sync::Arc<str> = "Deopt".into();
         let mn: std::sync::Arc<str> = "target".into();
         let desc: std::sync::Arc<str> = "()I".into();
-        assert!(vm.jit_cache.read().get(&cn, &mn, &desc).is_some());
+        assert!(vm.jit.jit_cache.read().get(&cn, &mn, &desc).is_some());
 
         // Trigger deoptimization via the controller
         let action = crate::jit::helpers::DeoptimizationController::deoptimize(
@@ -71875,7 +72611,7 @@ public class SkippedTest {
         );
 
         // Method should be evicted from JIT cache
-        assert!(vm.jit_cache.read().get(&cn, &mn, &desc).is_none());
+        assert!(vm.jit.jit_cache.read().get(&cn, &mn, &desc).is_none());
         // First deopt РІвЂ вЂ™ recompile (not blacklist)
         assert_ne!(action, cratonvm_jit::deopt::DeoptAction::MakeNotCompilable);
 
@@ -71892,7 +72628,7 @@ public class SkippedTest {
         }
 
         // After many deopts, should be blacklisted (in skip set)
-        let skip = vm.jit_skip_set.read();
+        let skip = vm.jit.jit_skip_set.read();
         assert!(skip.contains(&("Deopt".into(), "target".into(), "()I".into(),)));
     }
 
@@ -72054,7 +72790,7 @@ public class SkippedTest {
 
         // Start a JFR recording
         {
-            let mut jfr = vm.flight_recorder.lock();
+            let mut jfr = vm.debug.flight_recorder.lock();
             let rid = jfr.new_recording(cratonvm_jfr::RecordingSettings::new("test"));
             jfr.start_recording(rid);
         }
@@ -72070,7 +72806,7 @@ public class SkippedTest {
         );
 
         // Verify JFR event was recorded
-        let mut jfr = vm.flight_recorder.lock();
+        let mut jfr = vm.debug.flight_recorder.lock();
         let rec = jfr.get_recording_mut(1).unwrap();
         let events = rec.get_events();
         let deopt_events: Vec<_> = events
@@ -72326,7 +73062,7 @@ public class SkippedTest {
         let class_id = vm.load_class_concurrent("java/lang/Object").unwrap();
 
         // Allocate an object on the heap
-        let _obj = vm.heap.alloc_object(class_id, 0);
+        let _obj = vm.mem.heap.alloc_object(class_id, 0);
 
         let mut output = Vec::new();
         let mut dumper = crate::runtime::hprof::HprofDumper::new(&vm);
@@ -72365,7 +73101,7 @@ public class SkippedTest {
         let _ = vm.load_class_concurrent("java/lang/Object");
 
         // Dump and verify class count matches loaded classes
-        let cm = vm.class_manager.read();
+        let cm = vm.classes.class_manager.read();
         let class_count = cm.class_store.len();
         drop(cm);
 
@@ -72407,9 +73143,10 @@ public class SkippedTest {
         let _ = vm.load_class_concurrent("java/lang/Object");
 
         // Allocate a primitive array
-        let _arr = vm
-            .heap
-            .alloc_array(cratonvm_types::ClassId::new(0), ArrayElementType::Int, 10);
+        let _arr =
+            vm.mem
+                .heap
+                .alloc_array(cratonvm_types::ClassId::new(0), ArrayElementType::Int, 10);
 
         let mut output = Vec::new();
         let mut dumper = crate::runtime::hprof::HprofDumper::new(&vm);
@@ -72502,7 +73239,7 @@ public class SkippedTest {
             ..Default::default()
         };
         let vm = std::sync::Arc::new(crate::vm::vm_init::SharedVm::new(config));
-        let registry = &vm.native_methods;
+        let registry = &vm.natives.native_methods;
 
         // Joiner factories
         assert!(
@@ -72553,7 +73290,7 @@ public class SkippedTest {
             ..Default::default()
         };
         let vm = std::sync::Arc::new(crate::vm::vm_init::SharedVm::new(config));
-        let registry = &vm.native_methods;
+        let registry = &vm.natives.native_methods;
 
         assert!(
             registry
@@ -72658,7 +73395,7 @@ public class SkippedTest {
             ..Default::default()
         };
         let vm = std::sync::Arc::new(crate::vm::vm_init::SharedVm::new(config));
-        let registry = &vm.native_methods;
+        let registry = &vm.natives.native_methods;
 
         // Verify ScopedValue natives (from S51 + S52 enhancements)
         let methods = [
@@ -72699,7 +73436,7 @@ public class SkippedTest {
             ..Default::default()
         };
         let vm = std::sync::Arc::new(crate::vm::vm_init::SharedVm::new(config));
-        let registry = &vm.native_methods;
+        let registry = &vm.natives.native_methods;
 
         // ShutdownOnFailure has its own fork/join/close registrations
         let cls = "java/util/concurrent/StructuredTaskScope$ShutdownOnFailure";
@@ -72786,8 +73523,8 @@ public class SkippedTest {
         let _ = vm.load_class_concurrent("java/lang/Object");
 
         // Allocate a real VM object and create a HeaderView from its legacy header
-        let obj = vm.heap.alloc_object(cratonvm_types::ClassId::new(1), 2);
-        let header = vm.heap.get_header(obj);
+        let obj = vm.mem.heap.alloc_object(cratonvm_types::ClassId::new(1), 2);
+        let header = vm.mem.heap.get_header(obj);
         let view = HeaderView::from_legacy(header);
         assert!(!view.is_array());
         assert_eq!(view.header_size(), 32);
@@ -72907,12 +73644,12 @@ public class SkippedTest {
             Value::Object(Some(o)) => o,
             _ => panic!("Cleaner.create() returned null"),
         };
-        match shared.heap.get_field(cleaner_obj, 0) {
+        match shared.mem.heap.get_field(cleaner_obj, 0) {
             Value::Object(Some(_)) => {}
             v => panic!("Cleaner backing array missing: {v:?}"),
         }
         assert!(matches!(
-            shared.heap.get_field(cleaner_obj, 1),
+            shared.mem.heap.get_field(cleaner_obj, 1),
             Value::Int(0)
         ));
     }
@@ -72923,7 +73660,7 @@ public class SkippedTest {
     fn new17_cleaner_register_discovers_phantom_in_ref_processor() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let before = shared.ref_processor.lock().cleaner_ref_count();
+        let before = shared.mem.ref_processor.lock().cleaner_ref_count();
 
         let cleaner = call_native(
             &shared,
@@ -72939,8 +73676,8 @@ public class SkippedTest {
             Value::Object(Some(o)) => o,
             _ => panic!(),
         };
-        let referent = shared.heap.alloc_object(ClassId::new(0), 1);
-        let action = shared.heap.alloc_object(ClassId::new(0), 1);
+        let referent = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        let action = shared.mem.heap.alloc_object(ClassId::new(0), 1);
         let cleanable = call_native(
             &shared,
             &mut thread,
@@ -72960,12 +73697,12 @@ public class SkippedTest {
             _ => panic!("Cleanable was null"),
         }
 
-        let after = shared.ref_processor.lock().cleaner_ref_count();
+        let after = shared.mem.ref_processor.lock().cleaner_ref_count();
         assert_eq!(after, before + 1, "expected one new cleaner ref discovered");
 
         // Cleaner backing array now contains 1 entry.
         assert!(matches!(
-            shared.heap.get_field(cleaner_obj, 1),
+            shared.mem.heap.get_field(cleaner_obj, 1),
             Value::Int(1)
         ));
     }
@@ -72975,8 +73712,8 @@ public class SkippedTest {
     fn new17_direct_byte_buffer_allocates_native_memory() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let before = shared.native_memory.lock().live_count();
-        let before_bytes = shared.native_memory.lock().live_bytes();
+        let before = shared.natives.native_memory.lock().live_count();
+        let before_bytes = shared.natives.native_memory.lock().live_bytes();
 
         let cap: i32 = 4096;
         let buf = call_native(
@@ -72994,8 +73731,8 @@ public class SkippedTest {
             _ => panic!("allocateDirect returned null"),
         }
 
-        let after = shared.native_memory.lock().live_count();
-        let after_bytes = shared.native_memory.lock().live_bytes();
+        let after = shared.natives.native_memory.lock().live_count();
+        let after_bytes = shared.natives.native_memory.lock().live_bytes();
         assert_eq!(after, before + 1, "one new native allocation");
         assert!(after_bytes >= before_bytes + cap as usize);
     }
@@ -73023,11 +73760,11 @@ public class SkippedTest {
             Value::Object(Some(o)) => o,
             _ => panic!(),
         };
-        let alloc_count_after_alloc = shared.native_memory.lock().live_count();
+        let alloc_count_after_alloc = shared.natives.native_memory.lock().live_count();
         assert!(alloc_count_after_alloc >= 1);
 
         // Sanity: the cleaner ref processor saw the phantom-cleaner.
-        assert!(shared.ref_processor.lock().cleaner_ref_count() >= 1);
+        assert!(shared.mem.ref_processor.lock().cleaner_ref_count() >= 1);
 
         // Simulate GC: referent (buf) is unreachable, but every cleanable
         // and deallocator we registered survives (their addresses are
@@ -73035,7 +73772,7 @@ public class SkippedTest {
         // into `cleaner_actions`.
         let buf_addr = buf_obj.as_ptr() as usize;
         let result = {
-            let mut proc = shared.ref_processor.lock();
+            let mut proc = shared.mem.ref_processor.lock();
             // is_marked=false ONLY for the buffer itself; everything else
             // (cleanable, deallocator) is treated as reachable.
             let is_marked = |addr: usize| -> bool { addr != buf_addr };
@@ -73048,24 +73785,24 @@ public class SkippedTest {
 
         // Submit to CleanerThread (mimicking process_references_after_gc).
         for addr in &result.cleaner_actions {
-            shared.cleaner_thread.submit_action(*addr);
+            shared.mem.cleaner_thread.submit_action(*addr);
         }
-        assert!(shared.cleaner_thread.pending_count() >= 1);
+        assert!(shared.mem.cleaner_thread.pending_count() >= 1);
 
         // Drain and invoke (mimicking interpreter::run_cleaner_actions).
         // Done inline to avoid coupling the test to the private fn.
-        let pending = shared.cleaner_thread.drain_actions();
+        let pending = shared.mem.cleaner_thread.drain_actions();
         for addr in pending {
             let cleanable = unsafe { ObjectRef::from_raw(addr as *mut u8) };
-            if matches!(shared.heap.get_field(cleanable, 1), Value::Int(1)) {
+            if matches!(shared.mem.heap.get_field(cleanable, 1), Value::Int(1)) {
                 continue;
             }
-            shared.heap.set_field(cleanable, 1, Value::Int(1));
-            let action = match shared.heap.get_field(cleanable, 0) {
+            shared.mem.heap.set_field(cleanable, 1, Value::Int(1));
+            let action = match shared.mem.heap.get_field(cleanable, 0) {
                 Value::Object(Some(o)) => o,
                 _ => continue,
             };
-            shared.heap.set_field(cleanable, 0, Value::Object(None));
+            shared.mem.heap.set_field(cleanable, 0, Value::Object(None));
             // Invoke run()V on the deallocator via the native registry.
             let _ = call_native(
                 &shared,
@@ -73077,7 +73814,7 @@ public class SkippedTest {
             );
         }
 
-        let alloc_count_after_drain = shared.native_memory.lock().live_count();
+        let alloc_count_after_drain = shared.natives.native_memory.lock().live_count();
         assert!(
             alloc_count_after_drain < alloc_count_after_alloc,
             "cleaner drain should have released native memory: {alloc_count_after_alloc} -> {alloc_count_after_drain}",
@@ -73103,12 +73840,12 @@ public class SkippedTest {
         .unwrap()
         .unwrap();
         let _ = buf;
-        let live_before = shared.native_memory.lock().live_count();
+        let live_before = shared.natives.native_memory.lock().live_count();
         assert!(live_before >= 1);
 
         // Pull the cleanable straight from the ref processor.
         let cleanable_addr = {
-            let proc = shared.ref_processor.lock();
+            let proc = shared.mem.ref_processor.lock();
             // Find the most recently registered cleaner ref (just added above).
             // Tests do not poke private fields; we rely on cleaner_ref_count > 0
             // and submit-via-process to drive the rest.
@@ -73116,7 +73853,7 @@ public class SkippedTest {
             // Use process_references to surface the cleanable reference_obj
             // as cleaner_actions (forcing referent unreachable).
             drop(proc);
-            let mut proc = shared.ref_processor.lock();
+            let mut proc = shared.mem.ref_processor.lock();
             let result = proc.process_references(&|_addr| false, 64, 0);
             *result
                 .cleaner_actions
@@ -73135,7 +73872,7 @@ public class SkippedTest {
             &[Value::Object(Some(cleanable))],
         )
         .unwrap();
-        let live_after_first = shared.native_memory.lock().live_count();
+        let live_after_first = shared.natives.native_memory.lock().live_count();
         assert_eq!(live_after_first, live_before - 1);
 
         // Second call must be a no-op (cleaned flag guards it).
@@ -73148,7 +73885,7 @@ public class SkippedTest {
             &[Value::Object(Some(cleanable))],
         )
         .unwrap();
-        let live_after_second = shared.native_memory.lock().live_count();
+        let live_after_second = shared.natives.native_memory.lock().live_count();
         assert_eq!(
             live_after_second, live_after_first,
             "second clean() must be a no-op"
@@ -73236,6 +73973,7 @@ public class SkippedTest {
                 is_native: false,
             };
             shared
+                .classes
                 .vtable_manager
                 .write()
                 .install_vtable(class_id.as_u32() as u64, vec![Some(entry)]);
@@ -73244,7 +73982,7 @@ public class SkippedTest {
         // Now the vtable must be queryable without taking the
         // class_manager lock РІР‚вЂќ the resolved entry carries its own
         // Arc<CachedBytecodeMethod>.
-        let guard = shared.vtable_manager.read();
+        let guard = shared.classes.vtable_manager.read();
         let entry = guard
             .resolve_virtual_slot(class_id.as_u32() as u64, 0)
             .expect("vtable slot must be populated by the install adapter");
@@ -73272,10 +74010,11 @@ public class SkippedTest {
         // (The global `vtable_override_adapter` would target whichever
         // SharedVm was first constructed РІР‚вЂќ see note above.)
         shared
+            .classes
             .vtable_manager
             .write()
             .invalidate_for_override(class_id.as_u32() as u64, 0);
-        let guard = shared.vtable_manager.read();
+        let guard = shared.classes.vtable_manager.read();
         assert!(
             guard
                 .resolve_virtual_slot(class_id.as_u32() as u64, 0)
