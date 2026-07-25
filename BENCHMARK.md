@@ -9,13 +9,36 @@ bug, not a result.
 
 ### Harness
 
-All seven CPU rows come from one unified harness,
-[`bench/CratonBench.java`](bench/CratonBench.java): arithmetic, fib, sieve,
-matrix, hashmap, stringregex, and bintrees, each runnable in-process or as
-an isolated phase (`CratonBench <phase>`). Each phase prints its time **and
-its checksum**. The legacy single-purpose harnesses
-(`QuickBenchLong2.java`, `HashMapOnly.java`, `StringRegexOnly.java`,
-`BinTreesClassic.java`) remain in `bench/` for historical comparability.
+> **⚠ The harness this section described is not in the repository.**
+> Until 2026-07-25 this section stated that all seven CPU rows come from one
+> unified harness, `bench/CratonBench.java`, runnable per-phase as
+> `CratonBench <phase>`. **That file does not exist** — it is not tracked by
+> git and is not present untracked on either the Windows checkout or the Azure
+> Linux build host. Likewise the "mandatory" perf gate described below,
+> `regression-suite/perf/run-cratonbench-gate.sh`, does not exist:
+> `regression-suite/` has no `perf/` directory at all.
+>
+> So the table below **cannot currently be reproduced as documented**, and the
+> gate it claims to be guarded by cannot currently be run. Either the harness
+> and gate were never committed, or they were lost; the git history does not
+> show a deletion. Treat the numbers as historical measurements whose exact
+> harness is unavailable, not as something you can re-derive today.
+
+**What actually exists in `bench/`** and can be run right now — these are the
+per-kernel harnesses, each printing its own time **and checksum**:
+
+| File | Row it covers | Checksum |
+|------|---------------|----------|
+| `BinTreesClassic.java` | Binary Trees (takes depth as argv, e.g. `18`) | `68332206` at d=18 |
+| `HashMapOnly.java` | HashMap put/get | `15499991500000` at n=1,000,000 |
+| `StringRegexOnly.java` | String/Regex | (printed) |
+| `QuickBenchLong2.java` | arithmetic / fib / sieve / matrix kernels | (printed) |
+| `BinT.java`, `IntrinsicBench.java`, `HmSemanticsProbe.java` | targeted probes | (printed) |
+
+Rebuilding a unified `CratonBench` harness plus the gate script is tracked
+work. Until then, use the per-kernel files above and compare **before/after on
+one host with one binary pair**, which is the methodologically sound comparison
+regardless of harness.
 
 ### Methodology
 
@@ -58,15 +81,36 @@ Row notes:
   ~2% correctness hardening (explicit header initialization in the inline
   allocator) accepted after that fix.
 
-### The performance gate
+### The performance gate — DOES NOT CURRENTLY EXIST
 
-Perf regressions are guarded by a mandatory gate:
-[`regression-suite/perf/run-cratonbench-gate.sh`](regression-suite/perf/run-cratonbench-gate.sh)
-runs every phase isolated (pinned, `-Xmx8g`, median of 5), verifies the
-exact checksum on every run, enforces a 5% budget over per-host anchored
-baselines, and **refuses to measure on a loaded host** rather than produce
-noisy verdicts. Anchored baselines may only be re-anchored with a linked
-evidence document.
+This section previously described a mandatory gate,
+`regression-suite/perf/run-cratonbench-gate.sh`, that ran every phase isolated
+(pinned, `-Xmx8g`, median of 5), verified the exact checksum on every run,
+enforced a 5% budget over per-host anchored baselines, and refused to measure on
+a loaded host.
+
+**That script is not in the repository.** `regression-suite/` contains
+`README.md`, `run.sh`, `src/` and `build/` — there is no `perf/` directory, and
+no file matching `*cratonbench*` or a perf-gate name is tracked anywhere in the
+tree. It is also not present untracked on the Windows checkout or the Azure
+build host. So there is at present **no automated perf regression gate**, and
+the "anchored baseline" numbers quoted in the row notes above cannot be checked
+by any committed tooling.
+
+The described design is a good one and worth rebuilding. Until it exists, the
+honest process for a perf-affecting change is:
+
+1. Build the pre-change commit and the post-change commit as **two
+   uniquely-named binaries on the same host**.
+2. Run the relevant per-kernel harness from the table above against both,
+   alternating, several runs each.
+3. **Compare checksums first.** A changed checksum means the change is wrong;
+   a faster wrong answer is a bug, not a result.
+4. Report absolute times for both binaries and the host's load average, since
+   this host is shared and contended — ratios between your two binaries are
+   meaningful, absolute numbers across hosts and dates are not.
+5. `perf record -g --call-graph=dwarf -F 199` on both, and report the symbol
+   deltas, not just wall clock.
 
 ### Optimization history
 
@@ -122,15 +166,32 @@ numbers up to N = 2²⁸, kernel sources, and eligibility rules — are in
 
 ## Reproducing
 
+The commands previously listed here referenced `bench/CratonBench.java` and
+`regression-suite/perf/run-cratonbench-gate.sh`, neither of which exists (see
+the Harness and performance-gate sections above). What follows works today.
+
 ```bash
-# CPU, all phases in-process:
-cargo build --release -p cratonvm-cli
-javac -d bench-classes bench/CratonBench.java
-./target/release/cratonvm -Xmx8g -cp bench-classes CratonBench
+# Build. On a memory-constrained or contended host, disable fat LTO: the
+# release profile's lto="fat" + codegen-units=1 can get the final cratonvm-cli
+# rustc OOM-SIGKILLed (shows up as "signal: 9, SIGKILL", NOT a compile error).
+CARGO_PROFILE_RELEASE_LTO=off cargo build --release -p cratonvm-cli -j6
 
-# One isolated phase (the per-row methodology):
-./target/release/cratonvm -Xmx8g -cp bench-classes CratonBench bintrees
+# Compile the per-kernel harnesses that actually exist.
+javac -d bench-classes bench/BinTreesClassic.java bench/HashMapOnly.java
 
-# The gated regression check (Linux bench host):
-bash regression-suite/perf/run-cratonbench-gate.sh -Exe /abs/path/to/cratonvm
+# Binary Trees (depth as argv). Expected checksum at d=18: 68332206.
+./target/release/cratonvm -Xmx8g -cp bench-classes BinTreesClassic 18
+
+# HashMap put/get. Expected checksum at n=1,000,000: 15499991500000.
+./target/release/cratonvm -Xmx8g -cp bench-classes HashMapOnly
+
+# HotSpot reference on the same host, same flags:
+$JAVA_HOME/bin/java -Xmx8g -cp bench-classes BinTreesClassic 18
+
+# Profile rather than guess. This is how the layout-registry lookup was found
+# to be ~40% of the Binary Trees run (37.8% in class_layout_for_fields plus
+# 4.8% in the SipHash it used for a (u32,u32) key).
+perf record -g --call-graph=dwarf -F 199 -o bt.perf -- \
+  ./target/release/cratonvm -Xmx8g -cp bench-classes BinTreesClassic 18
+perf report -i bt.perf --no-children --percent-limit 1 --stdio
 ```
