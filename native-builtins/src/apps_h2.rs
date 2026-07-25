@@ -2318,6 +2318,11 @@ fn h2_parser_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
+    if std::env::var_os("CRATONVM_DBG_H2PARSERREAD").is_some() {
+        let cid = ctx.class_id_of_object(this);
+        let cname = ctx.class_name_of_id(cid).unwrap_or_default();
+        eprintln!("[H2PARSERREAD] this class_id={cid:?} class_name={cname}");
+    }
     let old_index = match ctx.get_field_by_name(this, "tokenIndex") {
         Value::Int(i) => i,
         _ => -1,

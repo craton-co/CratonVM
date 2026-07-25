@@ -37,15 +37,37 @@ install, no `rt.jar`, one self-contained binary.
 CPU, vs HotSpot JDK 25 C2 (same flags both sides, medians of alternating
 fresh-process runs — full methodology in [BENCHMARK.md](BENCHMARK.md)):
 
-| Benchmark                         | JDK 25 C2 | CratonVM  | Ratio |
-|-----------------------------------|-----------|-----------|-------|
-| Arithmetic (2B ops)               | 2,006 ms  | 4,895 ms  | 2.44x |
-| Fibonacci(44)                     | 1,719 ms  | 4,790 ms  | 2.79x |
-| Sieve (100K × 20,000)             | 2,851 ms  | 6,508 ms  | 2.28x |
-| Matrix 1280×1280                  | 2,349 ms  | 6,875 ms  | 2.93x |
-| HashMap (10M put/get)             | 1,471 ms  | 5,488 ms  | 3.73x |
-| String/Regex (100K)               | 54 ms     | 193 ms    | 3.57x |
-| Binary Trees (depth 18)           | 176 ms    | 1,468 ms  | 8.34x |
+| Benchmark                         | JDK 25 C2 | CratonVM  | Ratio | Measured |
+|-----------------------------------|-----------|-----------|-------|----------|
+| Arithmetic (2B ops)               | 2,006 ms  | 4,895 ms  | 2.44x | 07-18 |
+| Fibonacci(44)                     | 1,719 ms  | 4,790 ms  | 2.79x | 07-18 |
+| Sieve (100K × 20,000)             | 2,851 ms  | 6,508 ms  | 2.28x | 07-18 |
+| Matrix 1280×1280                  | 2,349 ms  | 6,875 ms  | 2.93x | 07-18 |
+| HashMap (10M put/get)             | 1,039 ms  | 22,077 ms | 21.2x | **07-25** |
+| String/Regex (100K)               | 55 ms     | 423 ms    | 7.7x  | **07-25** |
+| Binary Trees (depth 18)           | 176 ms    | 1,468 ms  | 8.34x | 07-18 |
+
+> **⚠ The two 07-25 rows are re-measurements and they regressed** — HashMap
+> 3.73x → **21.2x**, String/Regex 3.57x → **7.7x**. Both were re-run on
+> 2026-07-25 as alternating fresh-process pairs on one pinned core, all
+> checksums exact.
+>
+> The regression is **CratonVM's, not the host's**: on the same runs HotSpot
+> reproduced its own recorded numbers (String/Regex 55 vs 54 ms) or beat them
+> (HashMap 1,039 vs 1,471 ms), so the machine is not slower. CratonVM is 2.2x
+> (String/Regex) to 4.0x (HashMap) off its 07-18 figures.
+>
+> The other five rows are **not** re-measured here and remain 07-18 figures;
+> CratonVM-side re-runs suggest sieve and Binary Trees have also drifted, but
+> they have no fresh paired HotSpot number yet, so they are left alone rather
+> than half-updated.
+>
+> Root-causing is open and tracked in [BENCHMARK.md](BENCHMARK.md). What is
+> already established: it is not host load (the same gap appears on a quiet
+> host with <1% run-to-run spread), and it is not anything that landed since
+> the perf-gate baselines were anchored on 07-24 (the anchor commit measures
+> identically to current `dev`). That places the regression **before** 07-24,
+> which is where the bisect now points.
 
 GPU offload, vs HotSpot C2 and [TornadoVM](https://github.com/beehive-lab/TornadoVM)
 4.0.1 (RTX 2060, N = 2²⁴, warm, full H2D+kernel+D2H round-trip, checksums

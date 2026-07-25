@@ -21804,12 +21804,15 @@ fn execute_invoke_kind(
                                 .get_class(f.class_id)
                                 .map(|c| c.name.to_string())
                                 .unwrap_or_default();
+                            let loader = cm.get_loader_id(f.class_id);
                             eprintln!(
-                                "  [{i}] {}.{}{} pc={}",
+                                "  [{i}] {}.{}{} pc={} class_id={:?} loader={:?}",
                                 cn,
                                 f.method_name(),
                                 f.method_descriptor(),
-                                f.pc
+                                f.pc,
+                                f.class_id,
+                                loader
                             );
                         }
                     }
@@ -22227,6 +22230,18 @@ fn execute_invoke_kind(
         None
     };
 
+    if std::env::var_os("CRATONVM_DBG_INVSPECIAL").is_some() && is_special {
+        let cm = shared.classes.class_manager.read();
+        let cur_loader = cm.get_loader_id(current_class_id);
+        if matches!(cur_loader, Some(cratonvm_types::ClassLoaderId::UserDefined(_))) {
+            let invoke_class_resolved = cm.get_loaded_class_id(&invoke_class);
+            drop(cm);
+            eprintln!(
+                "[INVSPECIAL] method={}.{}{} current_class_id={:?} cur_loader={:?} invoke_class={} dispatch_override={:?} invoke_class_resolved(global)={:?}",
+                method_owner_name, method_name, method_descriptor, current_class_id, cur_loader, invoke_class, dispatch_override, invoke_class_resolved
+            );
+        }
+    }
     if crate::runtime::env_cache::dbg_loader_trace()
         && (invoke_class.contains("RootReference") || &*method_name == "compareAndSetRoot")
     {
@@ -30558,11 +30573,31 @@ fn try_stackless_invoke(
         if method_name == "<init>" {
             return None;
         }
+        // Loader-precise start: prefer the caller's own already-resolved
+        // dispatch class (computed by the caller via loader-aware
+        // resolution for invokespecial self/super calls and the private-
+        // invokevirtual fast path) over the flat, loader-blind
+        // `get_loaded_class_id` name lookup below, which collapses to
+        // whichever same-named class loaded FIRST process-wide. Two
+        // classloaders each defining their own class named `class_name`
+        // (e.g. `Upgrade.loadH2`'s old H2 driver vs. the current H2 build,
+        // both declaring `org/h2/command/Parser`) otherwise walk the
+        // WRONG class's hierarchy here: this native-override pre-check is
+        // an independent lookup from the bytecode-resolution one further
+        // below that already honors `dispatch_class_override`, so without
+        // this it could force a same-named ANCESTOR's native override
+        // (e.g. `org/h2/command/ParserBase.read()V`) onto a receiver whose
+        // own, unrelated class of the same name declares that method
+        // itself and doesn't extend that ancestor at all. See
+        // docs/known-issues/h2/bug-h2-suite-residual-fail-triage.md
+        // (TestUpgrade's `ParserBase.getSyntaxError`/`Token.start()` NPE).
+        let start_cid = |cm: &crate::classloading::ClassManager| {
+            dispatch_class_override.or_else(|| cm.get_loaded_class_id(class_name))
+        };
         // For virtual calls, skip hierarchy walk if the class has its own bytecode
         if !walk_native_hierarchy {
             let cm = shared.classes.class_manager.read();
-            let has_own_bytecode = cm
-                .get_loaded_class_id(class_name)
+            let has_own_bytecode = start_cid(&cm)
                 .and_then(|cid| cm.get_class(cid))
                 .map(|cls| cls.find_method(method_name, descriptor).is_some())
                 .unwrap_or(false);
@@ -30571,7 +30606,7 @@ fn try_stackless_invoke(
             }
         }
         let cm = shared.classes.class_manager.read();
-        let mut cid = cm.get_loaded_class_id(class_name)?;
+        let mut cid = start_cid(&cm)?;
         loop {
             let parent_id = cm.get_class(cid)?.superclass?;
             let parent = cm.get_class(parent_id)?;
@@ -39533,9 +39568,49 @@ fn execute_invokevirtual_cached(
         }
         None => {
             dbg_invoke_stats_record(1);
+            if std::env::var_os("CRATONVM_DBG_GSE").is_some() {
+                if let Ok((_, mn, _, _)) = resolve_method_ref(shared, caller_class_id, cp_index) {
+                    if mn.as_ref() == "getSyntaxError" {
+                        let cm = shared.classes.class_manager.read();
+                        let caller_loader = cm.get_loader_id(caller_class_id);
+                        eprintln!(
+                            "[GSE] CACHE-MISS caller_class_id={caller_class_id:?} caller_loader={caller_loader:?} cp_index={cp_index} is_special={is_special}"
+                        );
+                    }
+                }
+            }
             return Ok(CachedCallResult::CacheMiss);
         }
     };
+    if std::env::var_os("CRATONVM_DBG_GSE").is_some() {
+        if let Ok((_, mn, _, _)) = resolve_method_ref(shared, caller_class_id, cp_index) {
+            if mn.as_ref() == "getSyntaxError" {
+                let cm = shared.classes.class_manager.read();
+                let caller_loader = cm.get_loader_id(caller_class_id);
+                let target_desc = match &target {
+                    CachedInvokeTarget::Bytecode { cached, .. } => {
+                        let dcid = cached.declaring_class_id;
+                        let dloader = cm.get_loader_id(dcid);
+                        format!("Bytecode declaring_class_id={dcid:?} declaring_loader={dloader:?} declaring_name={}", cached.class_name)
+                    }
+                    CachedInvokeTarget::Native { .. } => "Native".to_string(),
+                    CachedInvokeTarget::VirtualBytecode { cached, receiver_class_id, .. } => {
+                        format!("VirtualBytecode receiver_class_id={receiver_class_id:?} declaring_name={}", cached.class_name)
+                    }
+                    CachedInvokeTarget::VirtualNative { receiver_class_id, .. } => {
+                        format!("VirtualNative receiver_class_id={receiver_class_id:?}")
+                    }
+                    CachedInvokeTarget::Jit { cached, .. } => {
+                        format!("Jit declaring_name={}", cached.class_name)
+                    }
+                    CachedInvokeTarget::Intrinsic { .. } => "Intrinsic".to_string(),
+                };
+                eprintln!(
+                    "[GSE] CACHE-HIT caller_class_id={caller_class_id:?} caller_loader={caller_loader:?} cp_index={cp_index} is_special={is_special} target={target_desc}"
+                );
+            }
+        }
+    }
     // JVMTI redefine guard: never serve a cached native/intrinsic SHADOW for a
     // class an agent has redefined in place — evict the entry and re-resolve
     // through the slow path, whose gates dispatch the woven bytecode so the
