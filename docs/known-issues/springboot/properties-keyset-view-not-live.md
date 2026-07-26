@@ -62,16 +62,47 @@ non-tagged list). `Log4j2LoggingSystemPropertiesTests` 3/3,
 `JakartaApiValidationExceptionFailureAnalyzerTests` (the `keySet()` fix's
 regression control) 2/2 — no regression.
 
-**Known, pre-existing, OUT OF SCOPE limitation found while verifying this:**
-`values().retainAll(...)` does NOT propagate to the source map for ANY
-`Map.values()` view — not just `Properties`'. `native_al_retain_all` (the
-shared `java/util/ArrayList.retainAll` native) never consults
-`values_view_source` at all, unlike `native_al_remove_obj`/`native_al_clear`.
-Confirmed with a plain `java.util.HashMap`: `new HashMap<>(Map.of("a","1",
-"b","2")).values().retainAll(List.of("1"))` leaves `b` in the map. This is a
-generic `ArrayList`/map-values-view gap, unrelated to the `Properties`
-side-table bridge this doc tracks, so it is left unfixed here — flagged for
-separate follow-up.
+**Fourth fix (2026-07-26, same day): `values()`-view `retainAll()` now
+propagates too.** The limitation above (found while verifying the `values()`
+fix) was closed same-session rather than left as a follow-up:
+`native_al_retain_all` (the shared `java/util/ArrayList.retainAll` native,
+`native-collections/src/lib.rs`) never consulted `values_view_source` at
+all, unlike `native_al_remove_obj`/`native_al_clear` — so `values().
+retainAll(...)` silently never touched the source map, for ANY `Map`, not
+just `Properties`. Confirmed with a plain `java.util.HashMap`: `new
+HashMap<>(Map.of("a","1","b","2")).values().retainAll(List.of("1"))` left
+`b` in the map before this fix.
+
+Fixed by having `native_al_retain_all` snapshot which elements are removed
+(alongside the existing `kept_idx` bookkeeping, reusing the same
+Family-1/cce0079 index-based GC-safety pattern already established there) and,
+if `values_view_source` finds a tagged source, calling the same
+`propagate_list_removal` helper `native_al_remove_obj` already uses, once per
+removed element, after the local array compaction completes. No change to
+the tail-nulling / sentinel-preservation logic that already made
+`values_view_source` safe for ordinary (non-tagged) `ArrayList`s.
+
+Verified: plain `HashMap`/`Properties`/`Hashtable` `values().retainAll()` all
+propagate now; a no-op `retainAll` (nothing removed) still correctly returns
+`false` and touches nothing; a plain (non-view) `ArrayList.retainAll()` —
+including the `capacity == size` full-backing-array edge case the existing
+tail-nulling comment calls out — is unchanged; chained view operations
+(`retainAll` then `remove` on the same live `values()` collection) work.
+Also re-verified the `keySet().retainAll()` idiom from the top of this doc
+still passes, and `Log4j2LoggingSystemPropertiesTests`/
+`JakartaApiValidationExceptionFailureAnalyzerTests` (the keySet fix's own
+regression controls) still pass.
+
+**Unrelated dev-drift note:** re-running `LoggingApplicationListenerTests`
+during this verification showed 34/41 failing (up from the 16/41 recorded
+above), with a NEW failure signature (`IllegalStateException: Unknown
+FilterReply value: DENY` from `ch.qos.logback.classic.Logger.
+isTraceEnabled`) not seen before. A/B-tested with a control build (same dev
+tip, this `retainAll()` fix reverted via `git stash`) — the control showed
+the IDENTICAL 34/41 failures, confirming this is unrelated `dev` drift
+(something Logback/`FilterReply`-related landed between the 25/41 baseline
+run and this one), not caused by this fix. Not investigated further here —
+out of scope for this doc.
 
 ## Residual sweep (2026-07-26): confirmed the remaining `LoggingApplicationListenerTests` failures are unrelated
 
