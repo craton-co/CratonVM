@@ -3034,6 +3034,29 @@ fn publish_to_jul_handlers_src(
         ctx.set_field_by_name(record, "level", Value::Object(Some(level)));
         ctx.set_field_by_name(record, "message", Value::Object(Some(message)));
         ctx.set_field(record, 4, Value::Object(Some(message)));
+        // FIX (logbackloggingsystemtests-julbridge-loggername-null): this
+        // synthetic `LogRecord` bypasses `Logger.log(LogRecord)`'s real
+        // bytecode (which sets `loggerName` to `this.getName()` before
+        // dispatch), so without this the record's `loggerName` field stays
+        // null all the way to the ancestor's handlers below — e.g.
+        // `org.slf4j.bridge.SLF4JBridgeHandler.publish()`, installed on the
+        // JUL root by Spring Boot's `LogbackLoggingSystem`/`jul-to-slf4j`,
+        // calls `LoggerFactory.getLogger(record.getLoggerName())` and
+        // silently no-ops (real JUL's `Logger.log()` catches and reports any
+        // `Handler.publish()` exception to `ErrorManager` rather than
+        // propagating it, so a `LoggerFactory.getLogger(null)` NPE inside the
+        // handler is never surfaced) — every JUL log call that must route
+        // through an ancestor's handler (rather than the exact logger's own)
+        // is silently dropped. Real-JDK A/B confirmed CratonVM-only
+        // (`LogbackLoggingSystemTests`/`Log4J2LoggingSystemTests`
+        // `loggingLevelIsPropagatedToJul`).
+        let record_logger_name_str = read_jul_logger_name(ctx, logger);
+        let record_logger_name = ctx.create_string(&record_logger_name_str);
+        ctx.set_field_by_name(
+            record,
+            "loggerName",
+            Value::Object(Some(record_logger_name)),
+        );
         if let Some((pin, obj)) = src_cls_pin {
             let src = ctx.read_native_pin(pin, obj);
             ctx.set_field_by_name(record, "sourceClassName", Value::Object(Some(src)));
