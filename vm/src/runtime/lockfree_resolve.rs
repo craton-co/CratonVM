@@ -734,10 +734,33 @@ impl SharedResolutionState {
 
     // -- housekeeping -----------------------------------------------------
 
-    /// Clear both method and field caches (e.g. after class redefinition).
+    /// Clear every cache this type owns: the promoted-invoke map **and** the
+    /// `global_methods` / `global_fields` maps.
+    ///
+    /// Note that the latter two have no production writers (see the module
+    /// header), so in a running VM this acquires two write locks to clear two
+    /// permanently-empty maps. Callers that only need the live cache gone
+    /// should say so with [`invalidate_promoted`](Self::invalidate_promoted) —
+    /// it is not a micro-optimisation but a statement of intent, so a future
+    /// reader does not conclude from a call site that the other two maps are
+    /// live.
     pub fn invalidate_all(&self) {
         self.global_methods.write().clear();
         self.global_fields.write().clear();
+        self.promoted_invokes.write().clear();
+    }
+
+    /// Clear the promoted-invoke cache — the only cache in this module with
+    /// production writers (`insert_promoted_invoke`, reached from the
+    /// interpreter's invoke paths).
+    ///
+    /// ARCH-2026-07-26 (`cross-owner-closeout`, request CR-LR-1 of
+    /// `docs/internal/arch-2026-07-26/stackwalk-and-vtable.md`). This is the
+    /// entry point the class-loader unload sweep in `vm/src/memory/gc.rs`
+    /// wants: a conservative wholesale clear of the live cache, without
+    /// asserting by implication that `global_methods` / `global_fields` are
+    /// live too.
+    pub fn invalidate_promoted(&self) {
         self.promoted_invokes.write().clear();
     }
 
@@ -1577,5 +1600,61 @@ mod tests {
             },
         );
         assert!(state.get_promoted_invoke(&key).is_some());
+    }
+
+    #[test]
+    fn invalidate_promoted_matches_invalidate_all_for_the_live_cache() {
+        // CR-LR-1: `gc.rs`'s loader-unload sweep needs a wholesale clear of the
+        // live cache. `invalidate_all` also clears two maps that have no
+        // production writers; `invalidate_promoted` says what the call site
+        // means. On the live cache the two must be indistinguishable.
+        let make = || {
+            let state = SharedResolutionState::new();
+            for cp in 0..4u16 {
+                let key: PromotedInvokeKey = (ClassId::new(1), cp, false, Some(ClassId::new(2)));
+                state.insert_promoted_invoke(
+                    key,
+                    CachedInvokeTarget::VirtualBytecode {
+                        receiver_class_id: ClassId::new(2),
+                        cached: sample_bytecode_method(2),
+                        gate: crate::classloading::resolution::RedefineGate::never_stale(),
+                    },
+                );
+            }
+            state
+        };
+
+        let via_all = make();
+        let via_promoted = make();
+        assert_eq!(via_all.promoted_invoke_count(), 4);
+        assert_eq!(via_promoted.promoted_invoke_count(), 4);
+
+        via_all.invalidate_all();
+        via_promoted.invalidate_promoted();
+        assert_eq!(via_all.promoted_invoke_count(), 0);
+        assert_eq!(
+            via_promoted.promoted_invoke_count(),
+            via_all.promoted_invoke_count()
+        );
+
+        // ...and the two maps `invalidate_all` additionally clears are empty
+        // either way, because nothing in production ever writes them.
+        assert_eq!(via_promoted.method_count(), 0);
+        assert_eq!(via_promoted.field_count(), 0);
+        assert_eq!(via_all.method_count(), 0);
+        assert_eq!(via_all.field_count(), 0);
+
+        // A cleared key is a miss, not a memoized negative.
+        let key: PromotedInvokeKey = (ClassId::new(1), 0, false, Some(ClassId::new(2)));
+        assert!(via_promoted.get_promoted_invoke(&key).is_none());
+        via_promoted.insert_promoted_invoke(
+            key,
+            CachedInvokeTarget::VirtualBytecode {
+                receiver_class_id: ClassId::new(2),
+                cached: sample_bytecode_method(2),
+                gate: crate::classloading::resolution::RedefineGate::never_stale(),
+            },
+        );
+        assert!(via_promoted.get_promoted_invoke(&key).is_some());
     }
 }

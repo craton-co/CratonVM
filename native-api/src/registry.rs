@@ -3657,6 +3657,30 @@ pub struct StackTraceEntry {
     /// self-frame and NPEs when `getDeclaringClass()` falls back to null.
     /// `None` only for synthetic entries with no backing interpreter frame.
     pub class_id: Option<ClassId>,
+    /// Index of this frame's method within its declaring class's
+    /// `Class::methods` list, when the capture path had a `ClassStore` borrow
+    /// and resolved it. `None` for synthetic entries and for the deliberately
+    /// lock-free cross-thread snapshot (`stackwalker::capture_frames_no_lines`,
+    /// which takes no `ClassStore` by design).
+    ///
+    /// ARCH-2026-07-26 (`cross-owner-closeout`, request CR-SW-1 of
+    /// `docs/internal/arch-2026-07-26/stackwalk-and-vtable.md`). This exists so
+    /// that *deferred* line-number resolution can be **exact**. `class_name` +
+    /// `method_name` + `byte_code_index` are not enough: a class may declare an
+    /// overload set under one name, the members have different
+    /// `LineNumberTable`s, and picking the wrong one prints a line from the
+    /// wrong method body. Carrying the index (rather than the descriptor) keeps
+    /// the entry `Arc`-free and makes both ends O(1).
+    ///
+    /// It is an *index*, never a borrow, and it is **never trusted on its own**:
+    /// `stackwalker::resolve_line_numbers_in_place` re-reads
+    /// `class.methods[idx]` from the live `ClassStore` and re-checks that its
+    /// name equals `method_name` before using it, so a class redefinition that
+    /// reorders or removes methods fails closed to "unknown line" rather than
+    /// resolving against the wrong body. `ClassId`s are monotonic and never
+    /// reused (`ClassStore::remove` leaves a tombstone), so a stale entry can
+    /// only ever miss, never alias a different class.
+    pub method_index: Option<u32>,
 }
 
 /// Callback signature for native method implementations.
@@ -5670,11 +5694,13 @@ mod tests {
             line_number: 42,
             byte_code_index: 17,
             class_id: None,
+            method_index: Some(3),
         };
         let cloned = entry.clone();
         assert_eq!(&*cloned.class_name, "java/lang/Object");
         assert_eq!(cloned.line_number, 42);
         assert_eq!(cloned.byte_code_index, 17);
+        assert_eq!(cloned.method_index, Some(3));
         let _ = format!("{:?}", entry);
     }
 
@@ -5687,10 +5713,15 @@ mod tests {
             line_number: -2, // native method
             byte_code_index: -1,
             class_id: None,
+            method_index: None,
         };
         assert_eq!(entry.line_number, -2);
         assert!(entry.source_file.is_none());
         assert_eq!(entry.byte_code_index, -1);
+        assert!(
+            entry.method_index.is_none(),
+            "a synthetic/native entry has no backing Class::methods slot"
+        );
     }
 
     // -----------------------------------------------------------------------
