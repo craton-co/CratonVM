@@ -177,3 +177,74 @@ msyt-admin, cglib_probe) — searched at full filesystem depth with no
 matches. These remain a real, structural gap (no equivalent generic
 open-source app was substituted, to avoid overclaiming coverage of a
 specific historical bug's exact trigger shape).
+
+## Update 2026-07-26 (later same day, round 4 — classloader fix, DoHead removal, javac-family consolidation refuted)
+
+**SPB.x package family re-confirmed genuinely absent**, this time with a
+proper per-name search (the combined multi-pattern `find ... -o -iname
+...` used earlier this session produced false-positive noise from
+coincidental substring collisions — e.g. `*sportme*` matches
+`TransportMessage` because "transportmessage" happens to contain the
+literal substring "sportme"; re-ran each name as its own separate `find`
+invocation to avoid this). Zero real matches for `SportMe-master`,
+`ms-course-youtube`, `insurance-backend`, `eureka-server` anywhere under
+`/data` or `/home`. This independently confirms the same conclusion the
+concurrent `fix/jit-ban-sweep-20260725` session already reached (see
+`docs/internal/jit-ban-sweep-20260725.md`'s own SPB.1 section) — this gap
+is real, not a search-methodology failure like the earlier Groovy/
+Hibernate/ES/Keycloak false negatives were.
+
+**Major new findings this round:**
+
+1. **Real VM bug fixed:** `Class.getResourceAsStream`/`getResource`
+   ignored the actual defining `ClassLoader`'s own override, falling back
+   to a global `-cp` scan — broke any custom (non-builtin,
+   non-`URLClassLoader`) loader whose backing jars aren't on the
+   process's own classpath (e.g. Quarkus's `RunnerClassLoader`, which
+   backs the real Keycloak 26.6.1 server). Fixed in
+   `native-builtins/src/lang_class.rs`, merged to `dev`
+   (`ceea4eb05`). Unblocked Keycloak's `Version.<clinit>` NPE entirely;
+   boot now hits a second, deeper, separate class-*resolution* gap
+   (`ClassManager::find_class_bytes_delegated` only checks bootstrap/
+   extension/application, no path to a custom loader's `findClass`) —
+   documented, not fixed, in
+   `docs/known-issues/keycloak-boot-blocked-version-null-20260726.md`.
+
+2. **TOMCAT-DOHEAD-JUNIT-ITERATOR.1 removed**, properly re-verified this
+   time (see item 3 below for why "properly" matters).
+
+3. **Discovered an undocumented blanket `org/junit/` ban** (Conservative-
+   only, no rationale comment, incidental in commit `60ef90d4b`) that
+   silently shadowed the first pass of TOMCAT-DOHEAD-JUNIT-ITERATOR.1's
+   re-test AND retroactively invalidates part of this session's earlier
+   `JUNIT.1` removal claim ("JIT-eligible unconditionally now" — corrected
+   to accurately describe a safe-but-shadowed no-op). Full writeup:
+   `docs/known-issues/blanket-org-junit-ban-undocumented-shadow-20260726.md`
+   — flagged as a high-value target for a future session (if liftable,
+   restores JIT eligibility to the entire JUnit test-running harness).
+
+4. **TYPES-ERASURE.1 consolidation hypothesis tested and REFUTED**: the
+   open question of whether banning `Types.erasure` alone subsumes the
+   other 7 javac-family bans (`SPRING-TESTCOMPILER.1-4`,
+   `HIB-STOREDPROC-JIT.1`) was tested directly — lifting all 7 others
+   while keeping only `Types.erasure` banned reproduces
+   `SPRING-TESTCOMPILER.2`'s original `ClassReader.readClass` NPE at
+   iteration 6/200. All 8 bans are independent, confirmed necessary.
+   `docs/known-issues/javac-family-consolidation-hypothesis-refuted-20260726.md`.
+
+5. **New, unrelated bug found while building the consolidation probe:**
+   any source containing `@SuppressWarnings("...")` fails in-process
+   javac compilation under CratonVM ("duplicate element 'value'") —
+   reproduces on the first-ever compile, with JIT fully disabled, so it's
+   NOT part of the javac-JIT-miscompile family at all. Not root-caused.
+   `docs/known-issues/suppresswarnings-annotation-duplicate-value-bug-20260726.md`.
+
+**Net this round:** 1 real VM bug fixed (classloader delegation), 1 ban
+removed (TOMCAT-DOHEAD-JUNIT-ITERATOR.1), 1 prior overclaim corrected
+(JUNIT.1), 1 major hypothesis tested-and-closed (javac-family
+consolidation, refuted), 2 new bugs found and documented for follow-up
+(Keycloak class-resolution gap, SuppressWarnings annotation bug), 1
+undocumented blanket ban surfaced and flagged (org/junit/), SPB.x family
+absence double-confirmed. All landed on `dev` incrementally with
+`cargo test --release -p cratonvm-vm --lib skip_list` green at every
+step (63 passed, 0 failed throughout).
