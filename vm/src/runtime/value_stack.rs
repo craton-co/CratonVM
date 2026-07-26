@@ -213,6 +213,46 @@ pub struct ValueStack {
     /// Parallel kind marks (see [`KIND_UNKNOWN`]). `kinds[i]` is meaningful for
     /// `i < len`; entries are (re)written by every push, so they cannot go
     /// stale across frame reuse.
+    ///
+    /// # Why this array cannot be collapsed into `slots` (2026-07-26 audit)
+    ///
+    /// It looks like redundant SoA: `Frame`'s doc says the parallel
+    /// `Vec<u64> + Vec<u8>` pair was collapsed into one NaN-boxed buffer, and
+    /// this is the leftover. It is not redundant, and collapsing it would be a
+    /// silent-heap-corruption bug. A `CompactValue` is exactly 8 bytes and
+    /// NaN-boxes its tag in the high bits, so **an arbitrary 64-bit `long`
+    /// cannot carry a tag at all** — its payload already uses all 64 bits.
+    /// Concretely:
+    ///
+    /// * A `long` whose top bits land in the NaN-tag space reads back with the
+    ///   wrong `tag()`. `0xfffd_…` words (BouncyCastle `LongArray`
+    ///   `lxor`/`lshl`/`lushr` over `long[]`) tag as `SUB_OBJECT`, so a
+    ///   context-free GC scan would treat the primitive as a heap reference and
+    ///   relocate it. That is exactly the corruption this array exists to stop
+    ///   (mirrored for locals by `Frame::local_kinds`).
+    /// * `SUB_INT` collisions are worse still: as `pop_long` documents, the
+    ///   real `Value::Int(0)` and the `long` `0xFFFC_0000_0000_0000` are
+    ///   *bit-identical*. No in-slot encoding can separate them.
+    ///
+    /// The only in-band alternative is widening the slot past 8 bytes, which
+    /// (a) doubles operand-stack and locals memory traffic — a pessimisation,
+    /// not an optimisation — and (b) breaks the `Vec<u64> <-> Vec<CompactValue>`
+    /// `repr(transparent)` transmute that the frame pool, `into_inner` /
+    /// `from_pooled`, `snapshot_raw` / `from_snapshot`, and the GC root
+    /// scanners in `memory/gc.rs`, `memory/roots.rs` and
+    /// `jit/conservative_roots.rs` all rely on.
+    ///
+    /// The real fix is out-of-band and out of this file's reach: consume the
+    /// verifier's per-pc operand-stack type maps (`classloading/type_maps.rs`,
+    /// `MethodTypeMaps`) so the *kind of every slot at every pc* is a static
+    /// fact and no per-slot runtime tag is needed at all. Until the interpreter
+    /// consumes those maps, this array stays.
+    ///
+    /// The per-frame *allocation* cost this array used to imply is separately
+    /// addressed: every `Frame` constructor now sources both halves from a
+    /// buffer pool (`Frame::new_pooled*` from the thread pool, `Frame::new` /
+    /// `Frame::new_from_arcs` from the per-OS-thread pool in `runtime::frame`),
+    /// so the steady state does no allocation and no zero-fill for either Vec.
     kinds: Vec<u8>,
     len: usize,
     max_size: usize,
@@ -2863,5 +2903,154 @@ mod tests {
             old_bits,
             "non-heap Double bits must be preserved"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // `kinds`-array load-bearing proof (2026-07-26 frame-arena audit)
+    // -----------------------------------------------------------------
+    //
+    // These lock in the invariant that makes the parallel `kinds` array
+    // impossible to collapse into the NaN-boxed `slots` buffer: an arbitrary
+    // 64-bit `long` uses every payload bit, so its kind CANNOT live in-slot.
+    // If someone later removes `kinds`, these fail.
+
+    /// Bit patterns that are known to collide with the NaN-box tag space, plus
+    /// the ordinary extremes. Every one must survive a push/pop round trip
+    /// bit-exactly.
+    const LONG_ROUND_TRIP_CASES: &[i64] = &[
+        0,
+        1,
+        -1,
+        i64::MAX,
+        i64::MIN,
+        0x7fff_ffff,
+        -0x8000_0000,
+        0x1_0000_0000,
+        // SUB_OBJECT-colliding pattern (BouncyCastle `LongArray` lxor/lshl).
+        0xfffd_1234_5678_9abcu64 as i64,
+        0xfffd_0000_0000_0000u64 as i64,
+        // SUB_INT-colliding patterns (BC safegcd `Mod.updateDE30`/`updateFG30`
+        // accumulators). `0xFFFC_0000_0000_0000` is bit-identical to a real
+        // `Value::Int(0)` — only the kind mark tells them apart.
+        0xfffc_0000_0000_0000u64 as i64,
+        0xfffc_0000_dead_beefu64 as i64,
+        0xfffe_0000_0000_0001u64 as i64,
+        0xffff_ffff_ffff_ffffu64 as i64,
+    ];
+
+    /// `push_long` → `pop_long` must be bit-exact for every case, including the
+    /// tag-colliding patterns that have no in-slot representation.
+    #[test]
+    fn long_round_trips_bit_exactly_through_operand_stack() {
+        for &v in LONG_ROUND_TRIP_CASES {
+            let mut stack = ValueStack::new(4);
+            stack.push_long(v).expect("push_long");
+            let got = stack.pop_long().expect("pop_long");
+            assert_eq!(
+                got as u64,
+                v as u64,
+                "push_long/pop_long lost bits for 0x{:016x}",
+                v as u64
+            );
+        }
+    }
+
+    /// Same via the generic `Value` API, which is what the slow interpreter
+    /// paths use.
+    #[test]
+    fn long_round_trips_through_value_api() {
+        for &v in LONG_ROUND_TRIP_CASES {
+            let mut stack = ValueStack::new(4);
+            stack.push(Value::Long(v)).expect("push");
+            match stack.pop().expect("pop") {
+                Value::Long(got) => assert_eq!(
+                    got as u64,
+                    v as u64,
+                    "Value::Long round trip lost bits for 0x{:016x}",
+                    v as u64
+                ),
+                other => panic!("expected Long for 0x{:016x}, got {other}", v as u64),
+            }
+        }
+    }
+
+    /// The `push_compact_long` fast path (`lload` forwarding a local without
+    /// the `Value` round trip) must also mark the slot, or a collision long
+    /// would be sign-extended as an int on the way out.
+    #[test]
+    fn compact_long_push_marks_kind_and_round_trips() {
+        for &v in LONG_ROUND_TRIP_CASES {
+            let mut stack = ValueStack::new(4);
+            stack.push_compact_long(CompactValue::long(v));
+            let (_, kind) = stack.peek_with_kind().expect("peek_with_kind");
+            assert_eq!(kind, KIND_LONG, "push_compact_long must mark KIND_LONG");
+            assert_eq!(
+                stack.pop_long().expect("pop_long") as u64,
+                v as u64,
+                "push_compact_long/pop_long lost bits for 0x{:016x}",
+                v as u64
+            );
+        }
+    }
+
+    /// The exact ambiguity that proves `kinds` is not redundant: the marked
+    /// long `0xFFFC_0000_0000_0000` and a real `Value::Int(0)` occupy
+    /// bit-identical slots and are told apart ONLY by the kind mark.
+    #[test]
+    fn collision_long_and_int_zero_are_bit_identical_and_need_the_kind_mark() {
+        let collision = 0xfffc_0000_0000_0000u64 as i64;
+
+        let mut as_long = ValueStack::new(4);
+        as_long.push_long(collision).expect("push_long");
+        let long_bits = as_long.get_compact(0).expect("slot").to_bits();
+
+        let mut as_int = ValueStack::new(4);
+        as_int.push(Value::Int(0)).expect("push int");
+        let int_bits = as_int.get_compact(0).expect("slot").to_bits();
+
+        assert_eq!(
+            long_bits, int_bits,
+            "the premise of this test changed: the collision long and Int(0) \
+             are no longer bit-identical"
+        );
+
+        // Same bits, different kinds, different decoded values.
+        assert_eq!(
+            as_long.peek_with_kind().expect("peek").1,
+            KIND_LONG,
+            "long slot must carry KIND_LONG"
+        );
+        assert_eq!(
+            as_int.peek_with_kind().expect("peek").1,
+            KIND_UNKNOWN,
+            "int slot must stay KIND_UNKNOWN"
+        );
+        assert_eq!(as_long.pop_long().expect("pop") as u64, collision as u64);
+        assert_eq!(as_int.pop_int().expect("pop"), 0);
+    }
+
+    /// Recycled buffers must never leak a stale kind mark into a fresh frame:
+    /// an over-marked slot would hide a genuine object reference from the GC
+    /// root scan. `from_pooled` clears + resizes the tag half for exactly this
+    /// reason; this pins the behaviour now that the non-pooled `Frame`
+    /// constructors also take buffers from a pool.
+    #[test]
+    fn from_pooled_clears_stale_kind_marks() {
+        let mut dirty = ValueStack::new(8);
+        dirty.push_long(-1).expect("push_long");
+        dirty.push_double(1.5).expect("push_double");
+        let (vals, tags) = dirty.into_inner();
+
+        let mut fresh = ValueStack::from_pooled(vals, tags, 8);
+        // Every slot starts UNKNOWN.
+        for i in 0..8 {
+            assert_eq!(
+                fresh.kinds[i], KIND_UNKNOWN,
+                "recycled slot {i} kept a stale kind mark"
+            );
+        }
+        // And an object-shaped push is still scannable as a reference.
+        fresh.push(Value::Int(7)).expect("push");
+        assert_eq!(fresh.pop_int().expect("pop"), 7);
     }
 }

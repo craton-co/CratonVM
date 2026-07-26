@@ -39,12 +39,34 @@ smaller/individual differences not yet clustered.
 > by `49d7834e9` (reactor-netty startup-hang residuals fix), confirmed via
 > reproduction rather than code reading alone.
 
+> Closure update (2026-07-23): the `module/spring-boot-data-redis` 4-class
+> HANG cluster (`DataRedisAutoConfigurationTests`,
+> `DataRedisAutoConfigurationJedisTests`,
+> `DataRedisAutoConfigurationLettuceWithoutCommonsPool2Tests`,
+> `DataRedisHealthContributorAutoConfigurationTests` — see
+> `RESULTS-20260723.md`'s residual table) is fixed — see
+> [`data-redis-urlclassloader-uncached-classpath-hang-FIXED.md`](data-redis-urlclassloader-uncached-classpath-hang-FIXED.md).
+> Root cause: `URLClassLoader.findClass`/`findResource` rebuilt the whole
+> classpath scan from scratch on every call (no caching), and `JarFile`
+> entry lookups eagerly decompressed every entry in a jar just to answer an
+> existence check — both general classloading bugs, not Redis-specific,
+> just tipped over the 300s timeout by this module's unusually large
+> (~121-jar) test classpath. Fixed in `native-builtins/src/classloader.rs`
+> and `phases_late.rs`. One pre-existing, narrower residual unmasked by the
+> fix (not caused by it) — **also now FIXED 2026-07-23**, moved to
+> [`../../internal/fixed-suite-bugs/springboot/data-redis-jedis-sslbundle-withpackageresources-classloader-leak-FIXED.md`](../../internal/fixed-suite-bugs/springboot/data-redis-jedis-sslbundle-withpackageresources-classloader-leak-FIXED.md).
+> Root cause: `classloader_real.rs::cl_real_load_class_base` silently
+> swallowed a user-defined parent loader's authoritative
+> `ClassNotFoundException` and fell through to CratonVM's loader-blind flat
+> global class store, un-doing `ModifiedClassPathClassLoader`'s
+> `@ClassPathExclusions` filtering.
+
 | Doc | Classes | Severity | Status |
 |---|---:|---|---|
 | `OnClassCondition.addAll` NPE-cast-to-`String[]` | 75 (348 occurrences) | CRITICAL | **FIXED/RETIRED 2026-07-13** — moved to [`../../internal/springboot/onclasscondition-npe-cast-string-array-cluster-FIXED.md`](../../internal/fixed-suite-bugs/springboot/onclasscondition-npe-cast-string-array-cluster-FIXED.md); `@ConditionalOnClass`'s unresolvable-`Class`-element handling now defers to a `TypeNotPresentException` sentinel matching HotSpot, instead of a bare `null`. Verified against all 75/75 originally-affected classes |
-| `DisposableBeanAdapter` "Invalid destruction signature" | 34 | HIGH | **RESOLVED 2026-07-12** — moved to [`../../internal/fixed-suite-bugs/spring-disposablebeanadapter-invalid-destruction-signature-cluster-RESOLVED.md`](../../internal/fixed-suite-bugs/spring-disposablebeanadapter-invalid-destruction-signature-cluster-RESOLVED.md); a direct probe against current dev found the destroy-method reflection path works fine, closing the cluster (no distinct residual identified) |
-| `sun.misc.Unsafe$MemoryAccessOption` NPE | 26 | HIGH | **FIXED/RETIRED 2026-07-12** — moved to [`../../internal/fixed-suite-bugs/spring-boot-unsafe-memoryaccessoption-npe-FIXED.md`](../../internal/fixed-suite-bugs/spring-boot-unsafe-memoryaccessoption-npe-FIXED.md); same bug independently found+fixed via a concurrent Keycloak investigation, canonical doc is `testsuite-model-unsafe-putorderedlong-memoryaccessoption-npe-FIXED.md` in the same directory |
-| `HttpClient.Builder` dead registration | 13 | HIGH | **RESOLVED 2026-07-12** — moved to [`../../internal/fixed-suite-bugs/springboot-httpclient-builder-dead-registration-abstractmethoderror-FIXED.md`](../../internal/fixed-suite-bugs/springboot-httpclient-builder-dead-registration-abstractmethoderror-FIXED.md); the active real-JDK registrar now covers every Java 17 fluent builder method |
+| `DisposableBeanAdapter` "Invalid destruction signature" | 34 | HIGH | **RESOLVED 2026-07-12** — moved to [`../../internal/fixed-suite-bugs/spring/spring-disposablebeanadapter-invalid-destruction-signature-cluster-RESOLVED.md`](../../internal/fixed-suite-bugs/spring/spring-disposablebeanadapter-invalid-destruction-signature-cluster-RESOLVED.md); a direct probe against current dev found the destroy-method reflection path works fine, closing the cluster (no distinct residual identified) |
+| `sun.misc.Unsafe$MemoryAccessOption` NPE | 26 | HIGH | **FIXED/RETIRED 2026-07-12** — moved to [`../../internal/fixed-suite-bugs/spring/spring-boot-unsafe-memoryaccessoption-npe-FIXED.md`](../../internal/fixed-suite-bugs/spring/spring-boot-unsafe-memoryaccessoption-npe-FIXED.md); same bug independently found+fixed via a concurrent Keycloak investigation, canonical doc is `testsuite-model-unsafe-putorderedlong-memoryaccessoption-npe-FIXED.md` in the same directory |
+| `HttpClient.Builder` dead registration | 13 | HIGH | **RESOLVED 2026-07-12** — moved to [`../../internal/fixed-suite-bugs/springboot/springboot-httpclient-builder-dead-registration-abstractmethoderror-FIXED.md`](../../internal/fixed-suite-bugs/springboot/springboot-httpclient-builder-dead-registration-abstractmethoderror-FIXED.md); the active real-JDK registrar now covers every Java 17 fluent builder method |
 | `zip-filedatablock-bulk-bytebuffer-put-aioobe.md` | 9 (whole `spring-boot-loader` module) | HIGH | **FIXED 2026-07-12** — moved to [`../../internal/springboot/zip-filedatablock-bulk-bytebuffer-put-aioobe-FIXED.md`](../../internal/fixed-suite-bugs/springboot/zip-filedatablock-bulk-bytebuffer-put-aioobe-FIXED.md) |
 | `flyway-cglib-heap-corruption-sigsegv-crash.md` | 1 (`FlywayAutoConfigurationTests`) | HIGH (SIGSEGV) | **FIXED 2026-07-12** — moved to [`../../internal/flyway-cglib-heap-corruption-sigsegv-crash-FIXED.md`](../../internal/flyway-cglib-heap-corruption-sigsegv-crash-FIXED.md); `read_string` misidentified a `String[]` array as `java/lang/String` by class ID alone |
 | `TestCompiler` annotation/platform listing cluster | 7 (`spring-boot-configuration-processor`) | MEDIUM | **FIXED/RETIRED 2026-07-13** — moved to [`../../internal/springboot/testcompiler-annotation-classes-not-found-cluster-FIXED.md`](../../internal/fixed-suite-bugs/springboot/testcompiler-annotation-classes-not-found-cluster-FIXED.md); full JRT package listing and generated in-memory `resource:` URL handling fixed, 94/94 tests pass |
@@ -80,6 +102,44 @@ breakdown, and reproduce instructions in
 the docs below this session — many residuals are very likely the same
 already-documented OPEN clusters, worth a dedicated confirmation pass
 rather than assuming closed or re-investigating from scratch.
+
+> Closure update (2026-07-23): `module/spring-boot-security`'s 4-class
+> residual from this rerun (`SecurityFilterAutoConfigurationEarlyInitializationTests`,
+> `PathRequestTests`, `ManagementWebSecurityAutoConfigurationTests`,
+> `ReactiveManagementWebSecurityAutoConfigurationTests`) — root cause was a
+> `ModifiedClassPathClassLoader` built from a "pathing JAR" launch (used when
+> a module's classpath is too long for a Windows command line) resolving to
+> an effectively empty classpath, since `ClassPath::new` never expanded a
+> plain jar's own manifest `Class-Path:` attribute. **FIXED** — see
+> [`../../internal/fixed-suite-bugs/springboot/springboot-security-modifiedclasspathextension-pathing-jar-classpath-manifest-FIXED.md`](../../internal/fixed-suite-bugs/springboot/springboot-security-modifiedclasspathextension-pathing-jar-classpath-manifest-FIXED.md).
+> `PathRequestTests` now passes outright; the other 3 narrowed to two distinct
+> residuals: [`onbeancondition-mergedannotations-intermittent-identity-mismatch.md`](onbeancondition-mergedannotations-intermittent-identity-mismatch.md)
+> (still OPEN) and `securityfilterautoconfig-capturedoutput-password-not-observed.md`
+> (was here, now **FIXED** — see below).
+
+> Closure update (2026-07-26): `SecurityFilterAutoConfigurationEarlyInitializationTests`
+> (the `securityfilterautoconfig-capturedoutput-password-not-observed.md` residual
+> above) is fixed — verified 5/5 PASS against current `dev`, resolved as a side
+> effect of unrelated classloader/reflection drift between 2026-07-23 and
+> 2026-07-26, not independently root-caused. Moved to
+> [`../../internal/fixed-suite-bugs/springboot/securityfilterautoconfig-capturedoutput-password-not-observed-FIXED.md`](../../internal/fixed-suite-bugs/springboot/securityfilterautoconfig-capturedoutput-password-not-observed-FIXED.md).
+> The sibling `onbeancondition-mergedannotations-intermittent-identity-mismatch.md`
+> residual remains OPEN (independently spot-checked the same session:
+> `ManagementWebSecurityAutoConfigurationTests` 3/3 clean; the reactive variant
+> shows a separate, likely-unrelated intermittent timeout — see the FIXED doc
+> above for details).
+
+> Investigation (2026-07-24): `module/spring-boot-micrometer-tracing-opentelemetry`'s
+> 2-class residual from this rerun (`OpenTelemetryBaggagePropagationIntegrationTests`,
+> `OpenTelemetryTracingAutoConfigurationTests`) — the former's 5 failing
+> parameterized cases all throw a CratonVM NPE from inside AssertJ's own
+> error-formatting path (`WritableAssertionInfo.representation` ends up null
+> only when `StringAssert`/`AbstractCharSequenceAssert` objects are
+> constructed via `Assertions.assertThat(String)`, not via direct
+> construction — reduced to a 100% reproducing ~15-line standalone repro, not
+> yet root-caused to file:line, likely masking real failure messages broadly
+> across the suite since `assertThat(someString)` is ubiquitous). OPEN — see
+> [`micrometer-tracing-opentelemetry-assertj-representation-npe-and-eventpublisher-residuals.md`](micrometer-tracing-opentelemetry-assertj-representation-npe-and-eventpublisher-residuals.md).
 
 ## 2026-07-17 rerun: 510-class set vs first-ever same-scope HotSpot baseline (429 CratonVM-specific)
 
@@ -130,7 +190,7 @@ open each doc for the full picture):
 | [`oncondition-report-window-isolation-residual.md`](oncondition-report-window-isolation-residual.md) | OPEN — found 2026-07-18, residual of the capturedoutput fix above |
 | [`propertiesmigration-logfactory-oom-residual.md`](propertiesmigration-logfactory-oom-residual.md) | OPEN — found 2026-07-18, residual of the capturedoutput fix above |
 | [Cassandra JNI `ThrowNew` payload-loss hang (fixed)](../../internal/fixed-suite-bugs/cassandra-jni-thrownew-discards-payload-hang-FIXED.md) | FIXED — 2026-07-17 |
-| [`CertificateMatcherTests` DSA KeyPairGenerator gap](../../internal/fixed-suite-bugs/springboot-certificatematchertests-dsa-keypairgenerator-FIXED.md) | FIXED — 2026-07-17 |
+| [`CertificateMatcherTests` DSA KeyPairGenerator gap](../../internal/fixed-suite-bugs/springboot/springboot-certificatematchertests-dsa-keypairgenerator-FIXED.md) | FIXED — 2026-07-17 |
 | [`Class.getMethods` override-shadowing duplicate-close cluster](../../internal/fixed-suite-bugs/springboot/class-getmethods-override-shadowing-duplicate-close-cluster-FIXED.md) | FIXED — 2026-07-17 |
 | [`Collections.singletonMap` real-wrapper regression](../../internal/fixed-suite-bugs/springboot/collections-singletonmap-hashmap-backed-not-real-class-FIXED.md) | FIXED — 2026-07-18 |
 | [Infinispan `getCacheNames()` null-return cluster](../../internal/fixed-suite-bugs/springboot/cacheautoconfigurationtests-infinispan-null-cachemanager-FIXED.md) | FIXED — 2026-07-19 |

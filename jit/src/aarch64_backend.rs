@@ -7,6 +7,132 @@
 //! represent the compilation result.  A separate encoding step (using `aarch64.rs`)
 //! can later lower these to raw machine code bytes.
 //!
+//! # SUPPORT STATUS — read before enabling this backend
+//!
+//! This is **not** a working second-tier JIT. It is an arithmetic-only
+//! prototype. `ARCHITECTURE.md` calls it "partial coverage"; the audit
+//! below (2026-07-26) is what that actually means. Do not ship an
+//! `aarch64` build on the assumption that it is x64-equivalent.
+//!
+//! ## What it can compile
+//!
+//! Whole-method compilation only (no OSR). A method compiles **iff** every
+//! one of its bytecodes is in the supported set below; a single unsupported
+//! opcode sets `Arm64CompileResult::success = false`, which makes
+//! `emit_machine_code` return `None` and `jit::try_compile` return `None`.
+//! The VM then permanently bail-lists the method and interprets it. That
+//! fallback is clean — an unsupported method is never mis-executed.
+//!
+//! Counts, for the 202 opcode values in `0x00..=0xc9`: **163** have a match
+//! arm, **39** do not (table below). Of the 163, five arms exist but always
+//! refuse the method — `invokestatic` (`0xb8`, no call-target resolution) and
+//! `idiv`/`ldiv`/`irem`/`lrem` (see the safety notes) — so **158** opcodes
+//! actually lower. For comparison, `x64.rs` has an arm for 192 of the same
+//! 202 and lacks only `pop2`, `dup2_x1`, `dup2_x2`, `frem`, `drem`, `jsr`,
+//! `ret`, `wide`, `goto_w`, `jsr_w`.
+//!
+//! What lowers: constants (`*const_*`, `bipush`, `sipush`,
+//! `ldc`/`ldc_w`/`ldc2_w` for numeric constants), local load/store for
+//! int/long/float/double/reference, `iinc`, int/long/float/double arithmetic
+//! and bitwise ops **except division and remainder**, the numeric conversions
+//! (`i2l` … `i2s`), `fcmp*`/`dcmp*`/`lcmp`, all
+//! `if*`/`if_icmp*`/`if_acmp*`/`goto`, `tableswitch`, `lookupswitch`, the
+//! stack shuffles (`dup*`, `swap`, `pop*`), `nop`, and all `*return`.
+//!
+//! ## What it CANNOT compile — the entire object model
+//!
+//! These 39 opcodes have **no lowering at all** and bail the method:
+//!
+//! | Area | Opcodes |
+//! |------|---------|
+//! | Array load | `0x2e..=0x35` (`iaload` … `saload`) |
+//! | Array store | `0x4f..=0x56` (`iastore` … `sastore`) |
+//! | Field access | `0xb2` `getstatic`, `0xb3` `putstatic`, `0xb4` `getfield`, `0xb5` `putfield` |
+//! | Dispatch | `0xb6` `invokevirtual`, `0xb7` `invokespecial`, `0xb9` `invokeinterface`, `0xba` `invokedynamic` |
+//! | Allocation | `0xbb` `new`, `0xbc` `newarray`, `0xbd` `anewarray`, `0xc5` `multianewarray`, `0xbe` `arraylength` |
+//! | Exceptions | `0xbf` `athrow` |
+//! | Type checks | `0xc0` `checkcast`, `0xc1` `instanceof` |
+//! | Monitors | `0xc2` `monitorenter`, `0xc3` `monitorexit` |
+//! | Misc | `0xc4` `wide`, `0xc8` `goto_w`, `0xa8`/`0xa9`/`0xc9` `jsr`/`ret`/`jsr_w` |
+//!
+//! `0xb8` `invokestatic` *has* a match arm, but [`Arm64Backend::emit_invoke`]
+//! unconditionally sets `self.failed` — there is no call-target resolution on
+//! this backend, so **no method containing any call of any kind compiles**.
+//! In practice the admissible population is: leaf methods that touch no
+//! object, no array, no field, no call, no monitor and no exception.
+//!
+//! Consequences worth stating plainly:
+//! - **No inline caches.** x64 has MIC/PIC inline caches for
+//!   `invokevirtual`/`invokeinterface`; this backend has neither those *nor*
+//!   the generic slow-path helper, because it has no calls.
+//! - **No inline TLAB bump allocation** (x64 has one) — there is no `new`.
+//! - **No exception handling**, no `exception_table` consultation, no
+//!   handler dispatch.
+//!
+//! ## Safety-critical gaps (these are the reason for the warning above)
+//!
+//! - **No GC safepoint polls.** x64 emits a cooperative poll of
+//!   `helpers.safepoint_flag_addr` at method entry and at every loop
+//!   back-edge (`x64::jit_safepoint_polls_enabled`, on by default). This
+//!   backend emits none. Since it also emits no calls, a compiled loop
+//!   contains *no* safepoint of any kind: a thread inside one never reaches
+//!   a stop-the-world request, so a GC that needs this thread hangs. Because
+//!   the compilable population is exactly "pure arithmetic, often loops",
+//!   this is the likely failure mode, not an edge case.
+//! - **Oop maps are always empty.** [`Arm64Backend::mark_top_operand_as_oop`]
+//!   is called from three opcode arms, but its only consumer,
+//!   [`Arm64Backend::emit_oop_map_for_safepoint`], has **zero call sites** —
+//!   so `Arm64CompileResult::oop_maps` is unconditionally `Vec::new()`. The
+//!   GC walker therefore always takes its conservative fallback for AArch64
+//!   frames. That is sound (a superset), but the "precise AArch64 oop maps"
+//!   the T1.1.3 comments describe do not exist at runtime.
+//! - **No deoptimization and no OSR.** Neither word appears in this file.
+//!   There is no frame reconstruction, no uncommon-trap stub, no
+//!   `osr_pc_to_native` table. There is nothing to tier down *from* (this is
+//!   the only tier), so a deopt cannot occur — but equally, no speculative
+//!   optimization may ever be added here without building that first.
+//! - **No stack-overflow bang** in the prologue (x64 emits one).
+//! - **32-bit int ops are lowered to 64-bit X-form instructions.** `iadd`,
+//!   `isub`, `imul`, `ineg`, `ishl`, `ishr`, `iand`, `ior`, `ixor` all use
+//!   the same emitters as their `l*` counterparts, so JVM 32-bit wrapping
+//!   does not happen (`Integer.MAX_VALUE + 1` yields `2147483648`, not
+//!   `Integer.MIN_VALUE`) and `ishl`/`ishr` do not mask the shift amount to
+//!   5 bits. `iushr` masks the *value* to 32 bits but not the shift.
+//!   Fixing this needs W-form variants threaded through the whole operand
+//!   pipeline (loads, compares, returns, `i2l`), which is a backend-wide
+//!   type-discipline change and is **not** attempted piecemeal.
+//! - **Loops were infinite self-branches** until this audit. Branch targets
+//!   were discovered lazily as each branch was decoded, so a back-edge target
+//!   (already walked past) never got a label bound, and the encoder left the
+//!   displacement-0 placeholder — `B .`. Fixed by giving
+//!   [`Arm64Backend::compile_method_with_info`] a discovery pass; any label
+//!   that is still unbound now bails the method rather than emitting a
+//!   self-branch. See `emit_machine_code`.
+//! - **`idiv`/`ldiv`/`irem`/`lrem` bail** as of this audit. `idiv`'s
+//!   divide-by-zero guard branched to `BRK #1`, which raises SIGTRAP — the
+//!   process dies instead of throwing `ArithmeticException` (nothing in the
+//!   VM converts SIGTRAP). `irem`/`lrem` had no zero check at all, and
+//!   AArch64 `SDIV` by zero yields 0 rather than trapping, so `x % 0`
+//!   silently returned `x`. Until a real exception path exists, these four
+//!   opcodes are refused; see the `0x6c`/`0x6d`/`0x70`/`0x71` arms.
+//!
+//! ## Reachability
+//!
+//! `jit/src/lib.rs` dispatches here from exactly one place: the
+//! `#[cfg(target_arch = "aarch64")]` block at the top of `try_compile_inner`,
+//! which returns unconditionally (the IR pipeline and the x64 backend are
+//! bypassed entirely on that target). Note that this is **not** the only
+//! compile entry the VM uses: `vm/src/runtime/interpreter.rs` and
+//! `vm/src/vm.rs` call `x64::compile*` directly from the eager first-call,
+//! OSR and probe paths with no `target_arch` guard. Those sites are outside
+//! this module and are not fixed here, but an `aarch64` build would emit
+//! x86-64 bytes from them.
+//!
+//! Both this module and `aarch64.rs` are compiled unconditionally on every
+//! host (`pub mod` in `lib.rs`, no `cfg`), so their unit tests — including
+//! every instruction-encoding test — run in ordinary x86-64 CI. The code is
+//! not rotting; it is simply far smaller in scope than its name suggests.
+//!
 //! ## Calling Convention (AAPCS64)
 //!
 //! - Integer args: X0-X7, return in X0
@@ -686,10 +812,14 @@ pub struct Arm64CompileResult {
     /// [`crate::OopMapEntry`] type as x64 so a single data format
     /// works across both backends.
     ///
-    /// Populated at safepoint call sites during codegen (`new`,
-    /// `anewarray`, `newarray`, method dispatch). When empty the
-    /// `CompiledMethod`'s oop-map table is also empty and the GC
-    /// root walker falls back to the conservative stack scan.
+    /// **Always empty today.** The intent was to populate this at safepoint
+    /// call sites (`new`, `anewarray`, `newarray`, method dispatch) — but
+    /// this backend lowers none of those opcodes, so it emits no safepoints,
+    /// and its only writer [`Arm64Backend::emit_oop_map_for_safepoint`] has
+    /// zero call sites. The GC root walker consequently always takes its
+    /// conservative stack-scan fallback for AArch64 frames (sound, since a
+    /// conservative scan is a superset). Asserted by
+    /// `tests::compiled_methods_carry_no_oop_maps`.
     pub oop_maps: Vec<crate::OopMapEntry>,
 }
 
@@ -879,6 +1009,7 @@ impl Arm64Backend {
             bytecode_pc: 0,
             frame_slot_offsets: slots,
             moving_young_coverage_complete: false,
+            live_frame_hi: 0,
         });
     }
 
@@ -1153,6 +1284,25 @@ impl Arm64Backend {
 
     /// Like [`compile_method`] but accepts an explicit method-info map for invoke
     /// resolution.
+    ///
+    /// Runs [`Arm64Backend::compile_pass`] **twice**. The walk binds a label at
+    /// bytecode pc `p` only if `p` is already known to be a branch target when
+    /// the walk reaches it, and targets are discovered lazily, as each branch
+    /// is decoded. For a forward branch that is fine — the branch is decoded
+    /// before its target is reached. For a BACKWARD branch (i.e. every loop
+    /// back-edge) it is not: the target pc was walked past before the label
+    /// existed, so the label was created and never bound, and the encoder's
+    /// patch loop left the placeholder — a displacement-0 branch, which on
+    /// AArch64 is a branch to itself. Every loop this backend "compiled" was
+    /// therefore an infinite self-branch.
+    ///
+    /// The first pass exists purely to discover the complete set of branch
+    /// target PCs; its output is discarded. The second pass re-walks the same
+    /// bytecode with that set in hand and binds a label at each target as it
+    /// passes, so back-edges resolve. Reusing the real walk for discovery
+    /// (rather than a separate scanner) means the two can never disagree about
+    /// instruction boundaries — this module has no bytecode length table to
+    /// keep in sync.
     pub fn compile_method_with_info(
         &mut self,
         num_locals: usize,
@@ -1160,6 +1310,49 @@ impl Arm64Backend {
         max_stack: usize,
         bytecode: &[u8],
         method_info: HashMap<u16, usize>,
+    ) -> Arm64CompileResult {
+        // Pass 1 — discovery. Label ids allocated here are NOT reused: pass 2
+        // resets the buffer (and with it the label-id counter), so it hands
+        // `compile_pass` bytecode PCs and lets it allocate its own ids.
+        drop(self.compile_pass(
+            num_locals,
+            num_params,
+            max_stack,
+            bytecode,
+            method_info.clone(),
+            &[],
+        ));
+        let mut branch_targets: Vec<usize> = self.pc_labels.keys().copied().collect();
+        branch_targets.sort_unstable();
+        // `failed` is sticky and intentionally NOT cleared between the two
+        // passes: whatever made pass 1 refuse the method (e.g. an unresolved
+        // invoke) makes pass 2 refuse it identically, and carrying the flag
+        // keeps the two passes' verdicts in lockstep.
+
+        // Pass 2 — emission, with every back-edge target known up front.
+        self.compile_pass(
+            num_locals,
+            num_params,
+            max_stack,
+            bytecode,
+            method_info,
+            &branch_targets,
+        )
+    }
+
+    /// One walk of the bytecode. See [`compile_method_with_info`] for why this
+    /// runs twice and what `branch_targets` carries between the passes: a
+    /// sorted list of every bytecode PC that is the target of some branch,
+    /// used to bind a label at each such PC as the walk passes it (the lazy
+    /// `label_for_pc` discovery below cannot see backward branches in time).
+    fn compile_pass(
+        &mut self,
+        num_locals: usize,
+        num_params: usize,
+        max_stack: usize,
+        bytecode: &[u8],
+        method_info: HashMap<u16, usize>,
+        branch_targets: &[usize],
     ) -> Arm64CompileResult {
         // Reset state.
         self.buffer = Arm64CodeBuffer::new();
@@ -1247,6 +1440,14 @@ impl Arm64Backend {
         let mut pc = 0;
         let mut success = true;
         while pc < bytecode.len() {
+            // Pre-seed this PC's label if the discovery pass saw a branch to
+            // it. Without this, only forward branches (whose target is reached
+            // after the branch is decoded) ever get bound — see
+            // `compile_method_with_info`.
+            if branch_targets.binary_search(&pc).is_ok() {
+                let _ = self.label_for_pc(pc);
+            }
+
             // Bind label if any branch targets this PC.
             if let Some(&label) = self.pc_labels.get(&pc) {
                 if !self.buffer.labels.contains_key(&label) {
@@ -1314,8 +1515,16 @@ impl Arm64Backend {
                 0x64 => self.emit_int_sub(),
                 // imul
                 0x68 => self.emit_int_mul(),
-                // idiv
-                0x6c => self.emit_int_div(),
+                // idiv — see the `division / remainder` note in the module
+                // header. `emit_int_div`'s zero guard branches to `BRK #1`,
+                // which raises SIGTRAP; nothing in the VM converts that into
+                // an `ArithmeticException`, so a `x / 0` in compiled code
+                // killed the process instead of throwing. Refuse the method
+                // until a real exception path exists.
+                0x6c => {
+                    success = false;
+                    break;
+                }
                 // ineg
                 0x74 => self.emit_int_neg(),
                 // iand
@@ -2045,48 +2254,26 @@ impl Arm64Backend {
                     self.push_operand(dst);
                 }
 
-                // -- ldiv --
-                0x6d => self.emit_int_div(),
-
-                // -- irem --
-                0x70 => {
-                    // a % b = a - (a / b) * b
-                    let b = self.pop_operand();
-                    let a = self.pop_operand();
-                    let quot = self.alloc_scratch();
-                    let dst = self.alloc_scratch();
-                    self.buffer.emit(Arm64Instruction::SDiv {
-                        rd: quot,
-                        rn: a,
-                        rm: b,
-                    });
-                    self.buffer.emit(Arm64Instruction::Msub {
-                        rd: dst,
-                        rn: quot,
-                        rm: b,
-                        ra: a,
-                    });
-                    self.push_operand(dst);
+                // -- ldiv -- (refused; same reason as `idiv` above)
+                0x6d => {
+                    success = false;
+                    break;
                 }
 
-                // -- lrem --
-                0x71 => {
-                    let b = self.pop_operand();
-                    let a = self.pop_operand();
-                    let quot = self.alloc_scratch();
-                    let dst = self.alloc_scratch();
-                    self.buffer.emit(Arm64Instruction::SDiv {
-                        rd: quot,
-                        rn: a,
-                        rm: b,
-                    });
-                    self.buffer.emit(Arm64Instruction::Msub {
-                        rd: dst,
-                        rn: quot,
-                        rm: b,
-                        ra: a,
-                    });
-                    self.push_operand(dst);
+                // -- irem / lrem --
+                //
+                // Both lowered to `a - (a / b) * b` via `SDIV` + `MSUB` with
+                // NO divisor check at all. On AArch64 `SDIV` by zero does not
+                // trap — it yields 0 — so the sequence quietly computed
+                // `a - 0 * b == a`: `x % 0` returned `x` instead of throwing
+                // `ArithmeticException`. A silent wrong answer is worse than
+                // a bail, and there is no exception path on this backend to
+                // route a correct throw through, so refuse the method.
+                // (`Integer.MIN_VALUE % -1` is separately wrong for the same
+                // 64-bit-lowering reason described in the module header.)
+                0x70 | 0x71 => {
+                    success = false;
+                    break;
                 }
 
                 // -- dup_x1 (0x5a) --
@@ -2475,11 +2662,19 @@ impl Arm64Backend {
         self.push_operand(dst);
     }
 
+    /// NOT WIRED — no opcode arm calls this. `idiv`/`ldiv` (`0x6c`/`0x6d`)
+    /// refuse the method instead, because the divide-by-zero path below is
+    /// `BRK #1` (SIGTRAP → process death), not an `ArithmeticException`
+    /// throw. Retained as the shape a correct lowering should take once this
+    /// backend has an exception path: replace the `Brk` with a branch to a
+    /// stub that calls the VM's throw helper. Exercised by
+    /// `backend_int_div_emits_sdiv` only.
     pub fn emit_int_div(&mut self) {
         let rhs = self.pop_operand();
         let lhs = self.pop_operand();
         let dst = self.alloc_scratch();
-        // Guard: if divisor is zero, trap (ArithmeticException).
+        // Guard: if divisor is zero, trap — NOT an ArithmeticException; see
+        // the doc comment above for why this helper is currently unwired.
         // CBZ rhs, trap_label; SDIV; B continue; trap: BRK
         let trap_label = self.buffer.new_label();
         let continue_label = self.buffer.new_label();
@@ -3804,6 +3999,21 @@ fn emit_addsub_imm_safe(
 
 /// Emit machine code bytes from the ARM64 pseudo-instruction sequence.
 /// Uses `Aarch64Emitter` from `aarch64.rs` to encode each instruction.
+///
+/// Returns `None` — bail this method to the interpreter — when the pseudo-op
+/// sequence cannot be encoded soundly. Three independent reasons:
+///
+/// 1. `result.success == false` (an opcode arm refused the method);
+/// 2. a branch or literal reference whose label is never bound (see the patch
+///    loops at the end — an unbound label used to be left as "branch to
+///    self", i.e. an infinite loop in *successfully* compiled code);
+/// 3. `Aarch64Emitter::overflowed()` — a branch displacement that did not fit
+///    its encoding field. `aarch64.rs` sets that sticky flag precisely so a
+///    release build (where the parallel `debug_assert!` is compiled out) can
+///    discard the buffer instead of executing a truncated branch. Until this
+///    check was added the flag had **no production reader** anywhere in the
+///    crate, so on a release `aarch64` build an out-of-range branch was
+///    silently truncated and emitted as executable code.
 pub fn emit_machine_code(result: &Arm64CompileResult) -> Option<Vec<u8>> {
     use crate::aarch64::Aarch64Emitter;
 
@@ -4153,26 +4363,51 @@ pub fn emit_machine_code(result: &Arm64CompileResult) -> Option<Vec<u8>> {
         }
     }
 
-    // Patch branches
+    // Patch branches.
+    //
+    // An unbound label is NOT recoverable here. The emitted placeholder is a
+    // branch with displacement 0 — i.e. a branch to itself, an infinite loop —
+    // and nothing downstream patches it: `jit::try_compile_inner`'s aarch64
+    // arm copies these bytes straight into an `ExecutableBuffer` and hands the
+    // entry point to the VM. The previous code deliberately left the
+    // placeholder "for unresolved calls"; since `emit_invoke` always fails the
+    // method and `compile_method_with_info`'s discovery pass now binds every
+    // back-edge target, an unbound label can only mean a branch target that is
+    // not a valid instruction boundary (malformed or truncated bytecode), so
+    // the only safe action is to discard the method and interpret it.
     for &(offset, label, is_cond) in &branch_patches {
-        if let Some(&target) = label_offsets.get(&label) {
-            if is_cond {
-                emitter.patch_bcond(offset, target);
-            } else {
-                emitter.patch_branch(offset, target);
-            }
+        let target = match label_offsets.get(&label) {
+            Some(&t) => t,
+            None => return None,
+        };
+        if is_cond {
+            emitter.patch_bcond(offset, target);
+        } else {
+            emitter.patch_branch(offset, target);
         }
-        // If label not found, leave the placeholder (branch to self) — this can
-        // happen for unresolved calls; the caller is expected to patch them.
     }
 
     // Patch LDR literal instructions to point to their target labels.
     // The label should reference a position containing a 64-bit constant
-    // (e.g. a literal pool entry appended after all code).
+    // (e.g. a literal pool entry appended after all code). Same reasoning as
+    // above: an unpatched LDR-literal reads whatever happens to sit at
+    // `pc + 0`, which is the instruction itself — garbage, not a constant.
     for &(offset, label) in &literal_patches {
-        if let Some(&target) = label_offsets.get(&label) {
-            emitter.patch_ldr_literal(offset, target);
-        }
+        let target = match label_offsets.get(&label) {
+            Some(&t) => t,
+            None => return None,
+        };
+        emitter.patch_ldr_literal(offset, target);
+    }
+
+    // Sticky encoding-overflow check — see this function's doc comment. Must
+    // come AFTER the patch loops: `patch_branch`/`patch_bcond`/
+    // `patch_ldr_literal` are themselves able to trip the flag, and in a
+    // release build they are the *only* thing that reports an out-of-range
+    // patch (the `debug_assert!` inside `mark_branch_overflow` is compiled
+    // out).
+    if emitter.overflowed() {
+        return None;
     }
 
     Some(emitter.code().to_vec())
@@ -4689,14 +4924,23 @@ mod tests {
         assert!(has_mul, "imul should emit Mul instruction");
     }
 
+    /// `idiv` is REFUSED (see the module header and
+    /// `backend_idiv_bails_to_interpreter`), and the refusal must survive
+    /// compile-time-constant operands too: a constant-folding or peephole path
+    /// that resolved `iconst_1 / iconst_2` before the opcode arm ran would
+    /// reintroduce the `BRK #1`/SIGTRAP lowering for the shape that looks
+    /// safest. Written as "no `SDiv` is emitted" rather than only
+    /// "`!success`", so it still fails if the arm is re-wired.
     #[test]
-    fn backend_int_div_emits_sdiv() {
+    fn backend_int_div_bails_with_constant_operands() {
+        // iconst_1, iconst_2, idiv, ireturn
         let result = make_backend_with_method(0, 0, &[0x04, 0x05, 0x6c, 0xac]);
+        assert!(!result.success, "idiv must bail, constant operands included");
         let has_div = result
             .instructions
             .iter()
             .any(|inst| matches!(inst, Arm64Instruction::SDiv { .. }));
-        assert!(has_div, "idiv should emit SDiv instruction");
+        assert!(!has_div, "no SDiv may be emitted for a refused idiv");
     }
 
     #[test]
@@ -5279,13 +5523,10 @@ mod tests {
         assert!(result.success, "lcmp should compile successfully");
     }
 
-    #[test]
-    fn backend_idiv_opcode() {
-        // iconst_2, iconst_1, idiv, ireturn
-        // 0x05=iconst_2, 0x04=iconst_1, 0x6c=idiv, 0xac=ireturn
-        let result = make_backend_with_method(0, 0, &[0x05, 0x04, 0x6c, 0xac]);
-        assert!(result.success, "idiv should compile successfully");
-    }
+    // `backend_idiv_opcode` (iconst_2, iconst_1, idiv, ireturn — asserted
+    // `success`) was removed with the 82a9d08fc div/rem refusal: inverted it
+    // would assert strictly less than
+    // `backend_int_div_bails_with_constant_operands` above, on the same shape.
 
     #[test]
     fn backend_ifeq_uses_label_not_raw_target() {
@@ -5431,16 +5672,25 @@ mod tests {
         assert!(has_lsr, "iushr should emit Lsr");
     }
 
+    /// Constant-operand counterpart of
+    /// `backend_irem_and_lrem_bail_to_interpreter`. The old `a - (a/b)*b`
+    /// lowering is what made `x % 0` return `x` (AArch64 `SDIV` by zero yields
+    /// 0 instead of trapping), so the assertion is that no `Msub` is emitted,
+    /// not merely that the method bailed.
     #[test]
-    fn p95_irem_compiles() {
+    fn p95_irem_bails_with_constant_operands() {
         // iconst_5, iconst_2, irem, ireturn
         let result = make_backend_with_method(0, 0, &[0x08, 0x05, 0x70, 0xac]);
-        assert!(result.success, "irem should compile");
+        assert!(!result.success, "irem must bail, constant operands included");
         let has_msub = result
             .instructions
             .iter()
             .any(|inst| matches!(inst, Arm64Instruction::Msub { .. }));
-        assert!(has_msub, "irem should emit Msub (a - (a/b)*b)");
+        assert!(
+            !has_msub,
+            "no Msub may be emitted: `a - (a/b)*b` is exactly the lowering that \
+             returned `a` for `a % 0`"
+        );
     }
 
     #[test]
@@ -5729,6 +5979,309 @@ mod tests {
         assert!(
             bytes.iter().any(|&b| b != 0),
             "encoded bytes should be non-trivial"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // aarch64-coverage audit (2026-07-26): `emit_machine_code` soundness gates
+    // -----------------------------------------------------------------------
+
+    /// Build a minimal `Arm64CompileResult` around a caller-supplied
+    /// instruction sequence, with `success = true` so the only thing under
+    /// test is `emit_machine_code`'s own validation.
+    fn result_from_instructions(instructions: Vec<Arm64Instruction>) -> Arm64CompileResult {
+        Arm64CompileResult {
+            instructions,
+            frame: Arm64FrameLayout::compute(0, 0, &[]),
+            labels: HashMap::new(),
+            success: true,
+            oop_maps: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn emit_machine_code_bails_on_unbound_branch_label() {
+        // `B <label 7>` where label 7 is never bound. The old patch loop left
+        // the displacement-0 placeholder in place — a branch to itself, i.e.
+        // an infinite loop inside successfully-"compiled" code.
+        let result = result_from_instructions(vec![
+            Arm64Instruction::B { label: 7 },
+            Arm64Instruction::Ret,
+        ]);
+        assert!(
+            emit_machine_code(&result).is_none(),
+            "an unbound branch label must bail the method, not emit `B .`"
+        );
+    }
+
+    #[test]
+    fn emit_machine_code_bails_on_unbound_conditional_branch_label() {
+        let result = result_from_instructions(vec![
+            Arm64Instruction::Cbz {
+                rt: Arm64Register::X0,
+                label: 3,
+            },
+            Arm64Instruction::Ret,
+        ]);
+        assert!(
+            emit_machine_code(&result).is_none(),
+            "an unbound CBZ label must bail the method"
+        );
+    }
+
+    #[test]
+    fn emit_machine_code_bails_on_unbound_ldr_literal_label() {
+        // An unpatched LDR (literal) reads at `pc + 0` — the instruction
+        // itself — rather than a constant-pool entry.
+        let result = result_from_instructions(vec![
+            Arm64Instruction::LdrLiteral {
+                rt: Arm64Register::X0,
+                label: 11,
+            },
+            Arm64Instruction::Ret,
+        ]);
+        assert!(
+            emit_machine_code(&result).is_none(),
+            "an unbound LDR-literal label must bail the method"
+        );
+    }
+
+    #[test]
+    fn emit_machine_code_accepts_bound_labels() {
+        // Companion to the three bail tests: a correctly bound forward branch
+        // must still encode, so the new checks cannot be satisfied by a
+        // blanket refusal.
+        let result = result_from_instructions(vec![
+            Arm64Instruction::B { label: 1 },
+            Arm64Instruction::Nop,
+            Arm64Instruction::Label(1),
+            Arm64Instruction::Ret,
+        ]);
+        let bytes = emit_machine_code(&result).expect("bound labels must encode");
+        // 3 real instructions (Label emits nothing) × 4 bytes.
+        assert_eq!(bytes.len(), 3 * 4);
+        // The `B` at offset 0 targets offset 8 → imm26 == 2.
+        let b = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        assert_eq!(b >> 26, 0b000101, "opcode must be unconditional B");
+        assert_eq!(b & 0x03ff_ffff, 2, "B displacement must be +2 instructions");
+    }
+
+    /// `B.cond`/`CBZ` carry a signed imm19 → ±1 MiB. A conditional branch
+    /// over more than 2^18 instructions cannot be encoded.
+    ///
+    /// `Aarch64Emitter::mark_branch_overflow` does two things: trips a
+    /// `debug_assert!` (active in debug/test builds) AND sets the sticky
+    /// `overflowed` flag (always). `debug_assert!` is compiled out under
+    /// `--release`, so the assertion this test can make differs per profile —
+    /// same split as `aarch64::tests::assert_branch_overflow_detected`.
+    #[test]
+    fn emit_machine_code_bails_on_out_of_range_conditional_branch() {
+        const SPAN: usize = (1 << 18) + 4; // > 2^18 instructions ⇒ > ±1 MiB
+
+        let build = || {
+            let mut insts = Vec::with_capacity(SPAN + 3);
+            insts.push(Arm64Instruction::Cbz {
+                rt: Arm64Register::X0,
+                label: 1,
+            });
+            insts.resize(SPAN + 1, Arm64Instruction::Nop);
+            insts.push(Arm64Instruction::Label(1));
+            insts.push(Arm64Instruction::Ret);
+            result_from_instructions(insts)
+        };
+
+        if cfg!(debug_assertions) {
+            let prev = std::panic::take_hook();
+            std::panic::set_hook(Box::new(|_| {}));
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                emit_machine_code(&build())
+            }));
+            std::panic::set_hook(prev);
+            assert!(
+                outcome.is_err(),
+                "an out-of-range CBZ patch must trip the debug_assert! in debug builds"
+            );
+        } else {
+            assert!(
+                emit_machine_code(&build()).is_none(),
+                "an out-of-range CBZ patch must set the sticky overflow flag and bail"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Division / remainder are refused — see the module header.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn backend_idiv_bails_to_interpreter() {
+        // iload_0; iload_1; idiv; ireturn
+        let result = make_backend_with_method(2, 2, &[0x1a, 0x1b, 0x6c, 0xac]);
+        assert!(
+            !result.success,
+            "idiv must bail: its zero guard is BRK #1 (SIGTRAP), not ArithmeticException"
+        );
+        assert!(emit_machine_code(&result).is_none());
+    }
+
+    #[test]
+    fn backend_ldiv_bails_to_interpreter() {
+        // lload_0; lload_1; ldiv; lreturn
+        let result = make_backend_with_method(2, 2, &[0x1e, 0x1f, 0x6d, 0xad]);
+        assert!(
+            !result.success,
+            "ldiv must bail for the same reason as idiv"
+        );
+    }
+
+    #[test]
+    fn backend_irem_and_lrem_bail_to_interpreter() {
+        // AArch64 SDIV by zero yields 0 (it does not trap), so the old
+        // `a - (a/b)*b` lowering returned `a` for `a % 0` instead of throwing.
+        for &(op, name) in &[(0x70u8, "irem"), (0x71u8, "lrem")] {
+            let result = make_backend_with_method(2, 2, &[0x1a, 0x1b, op, 0xac]);
+            assert!(
+                !result.success,
+                "{name} must bail: SDIV-by-zero silently yields 0 on AArch64"
+            );
+        }
+    }
+
+    /// The refusal must be specific to div/rem — the surrounding integer
+    /// arithmetic still compiles.
+    #[test]
+    fn backend_imul_still_compiles_after_div_refusal() {
+        // iload_0; iload_1; imul; ireturn
+        let result = make_backend_with_method(2, 2, &[0x1a, 0x1b, 0x68, 0xac]);
+        assert!(
+            result.success,
+            "imul must be unaffected by the div/rem bail"
+        );
+        assert!(emit_machine_code(&result).is_some());
+    }
+
+    /// Coverage guard for the module header's "39 unsupported opcodes" claim:
+    /// every opcode of the object model must refuse the method. If someone
+    /// implements one, this test tells them to update the header table.
+    #[test]
+    fn object_model_opcodes_are_all_unsupported() {
+        // One representative per documented unsupported area, plus every
+        // field/dispatch/allocation opcode (the ones whose absence defines
+        // this backend's scope).
+        let unsupported: &[u8] = &[
+            0x2e, 0x32, 0x35, // iaload / aaload / saload
+            0x4f, 0x53, 0x56, // iastore / aastore / sastore
+            0xb2, 0xb3, 0xb4, 0xb5, // getstatic / putstatic / getfield / putfield
+            0xb6, 0xb7, 0xb9, 0xba, // invokevirtual/special/interface/dynamic
+            0xbb, 0xbc, 0xbd, 0xbe, // new / newarray / anewarray / arraylength
+            0xbf, // athrow
+            0xc0, 0xc1, // checkcast / instanceof
+            0xc2, 0xc3, // monitorenter / monitorexit
+            0xc4, 0xc5, 0xc8, // wide / multianewarray / goto_w
+        ];
+        for &op in unsupported {
+            // Two operand bytes cover the widest of these; trailing bytes are
+            // irrelevant because the arm bails before consuming them.
+            let result = make_backend_with_method(2, 2, &[op, 0x00, 0x01, 0xb1]);
+            assert!(
+                !result.success,
+                "opcode 0x{op:02x} unexpectedly compiled — update the coverage \
+                 table in this module's header before landing that"
+            );
+        }
+    }
+
+    /// `invokestatic` has a match arm but `emit_invoke` always fails, so no
+    /// method containing a call of any kind compiles on this backend.
+    #[test]
+    fn invokestatic_arm_exists_but_always_bails() {
+        let result = make_backend_with_method(1, 1, &[0xb8, 0x00, 0x01, 0xb1]);
+        assert!(
+            !result.success,
+            "there is no call-target resolution on this backend; invokestatic must bail"
+        );
+    }
+
+    /// A loop back-edge must resolve to a real target, not the `B .`
+    /// self-branch the lazy label discovery used to leave behind.
+    ///
+    /// ```text
+    /// 0: iconst_0        0x03        // sum = 0
+    /// 1: istore_1        0x3c
+    /// 2: iload_1         0x1b   <-- back-edge target
+    /// 3: iconst_1        0x04
+    /// 4: iadd            0x60
+    /// 5: istore_1        0x3c
+    /// 6: goto -4         0xa7 ff fc  // back to pc 2
+    /// ```
+    ///
+    /// (The `goto` is unconditional, so the loop never exits — irrelevant
+    /// here: the point is purely that the branch encodes a nonzero backward
+    /// displacement rather than targeting itself.)
+    #[test]
+    fn backward_branch_resolves_to_its_target_not_itself() {
+        let code = [0x03, 0x3c, 0x1b, 0x04, 0x60, 0x3c, 0xa7, 0xff, 0xfc];
+        let result = make_backend_with_method(2, 1, &code);
+        assert!(result.success, "a pure-arithmetic loop must compile");
+
+        // The Label pseudo-op for the back-edge target must be present, and
+        // must sit BEFORE the terminating branch rather than after it.
+        let label_idx = result
+            .instructions
+            .iter()
+            .position(|i| matches!(i, Arm64Instruction::Label(_)))
+            .expect("back-edge target must be bound to a Label");
+        let branch_idx = result
+            .instructions
+            .iter()
+            .rposition(|i| matches!(i, Arm64Instruction::B { .. }))
+            .expect("the goto must lower to a B");
+        assert!(
+            label_idx < branch_idx,
+            "back-edge label must be bound before the branch that targets it"
+        );
+
+        let bytes = emit_machine_code(&result).expect("loop must encode");
+        // Locate the last unconditional B (opcode bits 31:26 == 0b000101 —
+        // no other instruction this method emits shares that pattern) and
+        // check that it does NOT branch to itself.
+        let mut last_b: Option<(usize, u32)> = None;
+        for (i, w) in bytes.chunks_exact(4).enumerate() {
+            let word = u32::from_le_bytes([w[0], w[1], w[2], w[3]]);
+            if word >> 26 == 0b000101 {
+                last_b = Some((i, word));
+            }
+        }
+        let (b_index, b_word) = last_b.expect("an unconditional B must be present");
+        let imm26 = b_word & 0x03ff_ffff;
+        assert_ne!(
+            imm26, 0,
+            "displacement 0 is `B .` — an infinite self-branch, the bug this guards"
+        );
+        // Sign-extend imm26 and confirm it points backwards, at a real
+        // instruction inside the buffer.
+        let signed = ((imm26 << 6) as i32) >> 6;
+        assert!(signed < 0, "a back-edge must branch backwards");
+        let target = (b_index as i64 + signed as i64) * 4;
+        assert!(
+            target >= 0 && (target as usize) < bytes.len(),
+            "back-edge target {target} must land inside the emitted buffer"
+        );
+    }
+
+    /// `Arm64CompileResult::oop_maps` is unconditionally empty:
+    /// `emit_oop_map_for_safepoint` has no call sites. Documented in the
+    /// module header; asserted here so the claim cannot silently rot.
+    #[test]
+    fn compiled_methods_carry_no_oop_maps() {
+        // aload_0; areturn — the reference path that *does* call
+        // `mark_top_operand_as_oop`.
+        let result = make_backend_with_method(1, 1, &[0x2a, 0xb0]);
+        assert!(result.success);
+        assert!(
+            result.oop_maps.is_empty(),
+            "oop_maps is always empty (no safepoints are emitted); if this \
+             fires, precise AArch64 maps became real — update the header"
         );
     }
 }

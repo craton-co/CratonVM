@@ -19,6 +19,7 @@
 // internal map/set in this file now uses `FxHashMap` / `FxHashSet`
 // (faster non-cryptographic hash, safe because keys are trusted internal
 // data: ClassId, interned class names, etc.).
+use std::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 
@@ -36,6 +37,7 @@ use crate::class::{
     InnerClassEntry, RecordComponentInfo,
 };
 use crate::class_path::ClassPath;
+use crate::loader_flags;
 use crate::loaders::{
     ApplicationClassFinder, BootstrapClassFinder, ClassFinder, ExtensionClassFinder,
     BUILTIN_LOADER_DELEGATION_CHAIN,
@@ -45,6 +47,7 @@ use crate::module::{
     packages_from_module_packages_attribute, ModuleRegistry,
 };
 use crate::vtype::ClassHierarchy;
+use cratonvm_reader::SharedBytes;
 use cratonvm_types::error::{ClassFileError, LinkageError, RuntimeError, VmError};
 
 /// Default soft cap for [`ClassManager::class_bytes_cache`]. 16 MiB.
@@ -113,26 +116,29 @@ fn loaded_classes_probe(
         .map(|(_, &id)| id)
 }
 
-/// `CRATONVM_LOADER_AWARE_RESOLUTION` gate (default ON). Mirrors
-/// `cratonvm_vm::runtime::env_cache::loader_aware_resolution` and the
-/// native-builtins twin so the classloading half of loader-faithful class
-/// resolution (loader-faithful supertype linking in `define_class_with_options`)
-/// stays in lock-step. This copy had drifted out of lock-step (still default
-/// OFF) after `env_cache::loader_aware_resolution` flipped to default ON for
-/// the `context.groovy` bug-cluster fix, which silently disabled this crate's
-/// share of the loader-faithful fixes (superclass/interface linking, verifier
-/// hierarchy lookup) by default — see
-/// `docs/known-issues/hib-bytecode-enhancement-loader-faithful-linking.md`.
-/// Flip on links an enhanced subclass to its same-loader (enhanced) supertype
-/// copy rather than the un-enhanced global one returned by
-/// `get_loaded_class_id`. Empty / `"0"` ⇒ off; any other value ⇒ on.
-fn loader_aware_resolution() -> bool {
-    use std::sync::OnceLock;
-    static GATE: OnceLock<bool> = OnceLock::new();
-    *GATE.get_or_init(|| match std::env::var("CRATONVM_LOADER_AWARE_RESOLUTION") {
-        Ok(v) => !v.is_empty() && v != "0",
-        Err(_) => true,
-    })
+/// `CRATONVM_LOADER_AWARE_RESOLUTION` gate (default ON) — **the single
+/// source of truth**. `vm::runtime::env_cache::loader_aware_resolution` and
+/// the `native-builtins::classloader::loader_aware_resolution` twin both now
+/// delegate here (see their doc comments) instead of re-parsing the env var
+/// through their own `OnceLock`, so the three copies cannot drift again.
+///
+/// **History (why this consolidation happened):** this crate's copy had
+/// drifted out of lock-step with the VM copy — it stayed default **OFF**
+/// after `env_cache::loader_aware_resolution` flipped to default **ON** for
+/// the `context.groovy` bug-cluster fix, which silently disabled this
+/// crate's share of the loader-faithful fixes (superclass/interface
+/// linking, verifier hierarchy lookup) by default even though the
+/// interpreter half of the same fix was live — a production desync between
+/// three independently-read env-var copies. See
+/// `docs/known-issues/hib-bytecode-enhancement-loader-faithful-linking.md`
+/// and `docs/internal/loader-identity.md` for the consolidation. Flip on
+/// links an enhanced subclass to its same-loader (enhanced) supertype copy
+/// rather than the un-enhanced global one returned by `get_loaded_class_id`.
+///
+/// Empty / `"0"` ⇒ off; any other value (including unset) ⇒ on. Read once
+/// and cached in a `OnceLock` — the env var is not re-read after first use.
+pub fn loader_aware_resolution() -> bool {
+    loader_flags().loader_aware_resolution
 }
 
 /// Diagnostic-only gate mirroring `CRATONVM_TRACE_UNIMPLEMENTED` (see
@@ -147,9 +153,7 @@ fn loader_aware_resolution() -> bool {
 /// `NoClassDefFoundError` with no further detail). Off by default to avoid
 /// spamming normal runs.
 fn trace_stub_fallback() -> bool {
-    use std::sync::OnceLock;
-    static GATE: OnceLock<bool> = OnceLock::new();
-    *GATE.get_or_init(|| std::env::var_os("CRATONVM_TRACE_UNIMPLEMENTED").is_some())
+    loader_flags().trace_unimplemented
 }
 
 /// H5 (HIGH): return `true` if `internal_name` (a `/`-separated internal
@@ -620,17 +624,62 @@ impl<'a> ClassHierarchy for ClassStoreHierarchy<'a> {
 // `AtomicBool` load and branches past the call — the cost of the hook is
 // zero for embedded/test scenarios that do not attach an agent.
 //
-// The hooks receive `(class_id_u32, class_name, thread_id)`. Thread id is
-// supplied by the caller; when unknown (e.g. bootstrap class loading before
-// any thread exists) the caller should pass 0 and the JVMTI layer routes
-// the event to the VM-init thread.
+// The hooks receive `(class_id_u32, class_name, thread_id)`. `thread_id` is
+// `current_thread_id()` (see below) when a VM thread has registered itself
+// via [`set_current_thread_id`], else 0 — the documented "unknown/bootstrap"
+// sentinel that the JVMTI layer routes to the VM-init thread. The three VM
+// thread-creation sites (main thread in `vm_init.rs`, `Thread.start` workers
+// in `vm_exec.rs`, foreign attach in `native/jni.rs`) call
+// `set_current_thread_id` once, at registration, on the OS thread that will
+// go on to run that Java thread's bytecode — so ordinary interpreter-driven
+// class loading reports the real `jthread` an agent can key on to skip its
+// own instrumentation thread.
 //
-// Calls are made AFTER the class manager releases its internal locks so
-// agent callbacks can safely re-enter the class loader (e.g. to call
-// GetLoadedClasses) without self-deadlock.
+// DEFERRED FIRING (2026-07-26, obsaudit D1). `fire_class_load_hook` /
+// `fire_class_prepare_hook` do not call the installed hook synchronously.
+// They push onto a thread-local queue; the queue is drained — and the hook
+// actually invoked — only after the caller's L10 `ClassRealm::class_manager`
+// write guard (`vm/src/vm/realms/class_realm.rs`) has been released. See
+// `ClassRealm::class_manager_write` / `ClassManagerWriteGuard::drop`, which
+// is now the *only* way to acquire that write lock (every former
+// `.class_manager_write()` call site was mechanically renamed to
+// `.class_manager_write()` so no site can bypass the drain).
+//
+// This was previously documented as a deliberate "fire under the guard"
+// design, on the theory that deferring would require buffering and draining
+// at every one of the ~50 `class_manager.write()` sites in `vm/`, any one of
+// which could "miss the drain" and leak a stale event. That risk is what the
+// guard-wrapper closes: there is now exactly one place a write guard can be
+// obtained, and exactly one place it is dropped, so there is no site left
+// that could miss the drain. `define_class` recursion through `load_class`
+// (superclass/interface resolution) still holds `&mut self` across nested
+// calls without re-locking, so nested class loads queue several events and
+// they fire together, in push order, the instant the *outermost* guard for
+// that acquisition is released — which is also the earliest instant another
+// thread could observe the new class via a fresh `.read()`/`.write()`, so a
+// listener that reacts to ClassLoad by immediately querying the class (e.g.
+// `GetClassSignature`) no longer blocks on a lock its own event delivery is
+// still holding.
+//
+// A hook may now freely re-enter the class manager (take a fresh read or
+// write lock, call back into `load_class`, etc.) — by the time it runs, the
+// lock that used to make that a self-deadlock has already been released on
+// this thread. This matches the contract already documented for
+// [`VtableInstallHook`] below only insofar as both fire from the same
+// place; unlike that hook, class-lifecycle hooks are no longer required to
+// avoid calling back in.
+//
+// The in-tree adapters (`class_load_adapter` / `class_prepare_adapter`,
+// `vm/src/vm/vm_init.rs`) forward to `runtime::jvmti::fire_class_{load,
+// prepare}`, which take the JVMTI manager's own `callbacks` lock and invoke
+// a `Box<dyn Fn>`.
 
 /// Signature of the JVMTI class-lifecycle hook installed by the VM crate.
 /// Parameters: `(class_id_u32, class_name, thread_id)`.
+///
+/// Called after the class manager's write guard for this define has been
+/// released (see the DEFERRED FIRING notes on the hook registry above) — a
+/// conforming hook may safely call back into the class manager.
 pub type JvmtiClassHook = fn(u32, &str, u64);
 
 static CLASS_LOAD_HOOK: OnceLock<JvmtiClassHook> = OnceLock::new();
@@ -652,27 +701,112 @@ pub fn install_class_prepare_hook(hook: JvmtiClassHook) {
     }
 }
 
+thread_local! {
+    /// This OS thread's `ThreadId.0`, as last set by [`set_current_thread_id`].
+    /// 0 (the default) means "no VM thread has registered on this OS thread
+    /// yet" — bootstrap class loading before `SharedVm::new` finishes, or a
+    /// background/pool thread that never became a Java thread.
+    static CURRENT_VM_THREAD_ID: Cell<u64> = const { Cell::new(0) };
+
+    /// Class-lifecycle events queued by [`fire_class_load_hook`] /
+    /// [`fire_class_prepare_hook`] on this OS thread, awaiting drain by
+    /// [`drain_pending_class_hooks`] once the write guard that produced them
+    /// is released. See the DEFERRED FIRING notes above.
+    static PENDING_CLASS_HOOKS: RefCell<Vec<PendingClassHook>> = const { RefCell::new(Vec::new()) };
+}
+
+enum PendingClassHook {
+    Load(u32, String, u64),
+    Prepare(u32, String, u64),
+}
+
+/// Bind this OS thread's current `jthread` for class-lifecycle event
+/// attribution. Called once by the VM at Java-thread registration (main
+/// thread, `Thread.start` workers, foreign JNI attach) — see the hook
+/// registry notes above. `id` is the VM's `ThreadId.0`.
+pub fn set_current_thread_id(id: u64) {
+    CURRENT_VM_THREAD_ID.with(|c| c.set(id));
+}
+
+/// This OS thread's bound `jthread`, or 0 if none has registered
+/// (bootstrap / non-Java thread) — the documented "unknown" sentinel.
+fn current_thread_id() -> u64 {
+    CURRENT_VM_THREAD_ID.with(|c| c.get())
+}
+
 /// Invoke the class-load hook if one is installed. Hot path: a single
-/// relaxed atomic load + branch when no agent is attached.
+/// relaxed atomic load + branch when no agent is attached. Queues rather
+/// than fires — see the DEFERRED FIRING notes above.
 #[inline]
 fn fire_class_load_hook(class_id: u32, class_name: &str, thread_id: u64) {
     if !CLASS_HOOKS_ACTIVE.load(Ordering::Acquire) {
         return;
     }
-    if let Some(hook) = CLASS_LOAD_HOOK.get() {
-        hook(class_id, class_name, thread_id);
+    if CLASS_LOAD_HOOK.get().is_some() {
+        PENDING_CLASS_HOOKS.with(|q| {
+            q.borrow_mut()
+                .push(PendingClassHook::Load(class_id, class_name.to_string(), thread_id))
+        });
     }
 }
 
-/// Invoke the class-prepare hook if one is installed.
+/// Invoke the class-prepare hook if one is installed. Queues rather than
+/// fires — see the DEFERRED FIRING notes above.
 #[inline]
 fn fire_class_prepare_hook(class_id: u32, class_name: &str, thread_id: u64) {
     if !CLASS_HOOKS_ACTIVE.load(Ordering::Acquire) {
         return;
     }
-    if let Some(hook) = CLASS_PREPARE_HOOK.get() {
-        hook(class_id, class_name, thread_id);
+    if CLASS_PREPARE_HOOK.get().is_some() {
+        PENDING_CLASS_HOOKS.with(|q| {
+            q.borrow_mut()
+                .push(PendingClassHook::Prepare(class_id, class_name.to_string(), thread_id))
+        });
     }
+}
+
+/// Drain and fire every class-lifecycle event queued on this OS thread by
+/// [`fire_class_load_hook`] / [`fire_class_prepare_hook`]. Must be called
+/// after (never while holding) the L10 `class_manager` write guard that
+/// produced the events — [`ClassManagerWriteGuard`] in
+/// `vm/src/vm/realms/class_realm.rs` is the sole caller in production code.
+///
+/// Drains in FIFO (push) order via `Vec::drain`, so a hook that itself
+/// triggers new class loads (now legal — see DEFERRED FIRING above) has its
+/// own queued events appended and drained within the same call rather than
+/// interleaved with the ones already in flight.
+pub fn drain_pending_class_hooks() {
+    if !CLASS_HOOKS_ACTIVE.load(Ordering::Acquire) {
+        return;
+    }
+    PENDING_CLASS_HOOKS.with(|q| {
+        let mut i = 0;
+        loop {
+            let next = {
+                let mut queue = q.borrow_mut();
+                if i >= queue.len() {
+                    if i > 0 {
+                        queue.clear();
+                    }
+                    break;
+                }
+                std::mem::replace(&mut queue[i], PendingClassHook::Load(0, String::new(), 0))
+            };
+            i += 1;
+            match next {
+                PendingClassHook::Load(class_id, name, thread_id) => {
+                    if let Some(hook) = CLASS_LOAD_HOOK.get() {
+                        hook(class_id, &name, thread_id);
+                    }
+                }
+                PendingClassHook::Prepare(class_id, name, thread_id) => {
+                    if let Some(hook) = CLASS_PREPARE_HOOK.get() {
+                        hook(class_id, &name, thread_id);
+                    }
+                }
+            }
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -753,7 +887,7 @@ fn fire_class_file_load_hook(
 /// Signature of the JIT-invalidation hook fired by `redefine_class`.
 ///
 /// Parameter: the `ClassId` (as `u32`) whose JIT entries must be evicted.
-/// The VM-side adapter walks `shared.jit_cache`, `shared.tiered`, and any
+/// The VM-side adapter walks `shared.jit.jit_cache`, `shared.tiered`, and any
 /// per-thread invoke caches that key by class id and removes matching
 /// entries. Method-index granularity is intentionally NOT exposed here —
 /// at redefine time we conservatively evict every method body for the
@@ -887,7 +1021,7 @@ fn fire_resolution_invalidate_hook(class_id: u32) {
 // vtable has already been built) the class loader fires a `VtableInstallHook`
 // that hands a pre-built vec of slot descriptors to the VM. The VM's installed
 // adapter converts each descriptor into a `crate::runtime::vtable::VtableEntry`
-// and stores the whole vec in `shared.vtable_manager` via `install_vtable`.
+// and stores the whole vec in `shared.classes.vtable_manager` via `install_vtable`.
 // The vtable is then queryable by slot in O(1) for the lifetime of the class.
 //
 // The hook delivers OWNED data (moved `Vec`) so the adapter doesn't need to
@@ -1261,7 +1395,7 @@ pub struct ClassManager {
     /// classes averaging 6 KB each). The default 16 MiB cap covers
     /// JVMTI agents (re-fetch typically targets recently-defined
     /// classes) without bounding the heap of an idle process.
-    pub class_bytes_cache: FxHashMap<ClassId, Vec<u8>>,
+    pub class_bytes_cache: FxHashMap<ClassId, SharedBytes>,
 
     /// Insertion-order tracker for [`Self::class_bytes_cache`] FIFO
     /// eviction. Deque front = oldest entry. Entries re-inserted
@@ -1320,7 +1454,7 @@ pub struct ClassManager {
     /// subclasses of the same class as the "parent vtable" when computing
     /// their own layout. The VM's installed `VtableInstallHook` receives a
     /// clone of the owned vec per class and funnels it into
-    /// `shared.vtable_manager.install_vtable(...)`.
+    /// `shared.classes.vtable_manager.install_vtable(...)`.
     ///
     /// Keying on ClassId (not name) keeps the superclass-lookup O(1) even
     /// for classes loaded by many different classloaders.
@@ -1374,7 +1508,7 @@ pub struct ClassManager {
     ///
     /// WP2.4-F1 — wrapped in a `RwLock` so the hot per-thread invoke-cache
     /// populate path can acquire a handle through a `&ClassManager`
-    /// borrow (which is what `shared.class_manager.read()` provides) and
+    /// borrow (which is what `shared.classes.class_manager.read()` provides) and
     /// share the *same* `Arc<AtomicU32>` that `redefine_class` will
     /// later bump.  Without this, populate-time and redefine-time would
     /// hand out two unrelated counters and the cache would never see a
@@ -1424,6 +1558,14 @@ pub struct ClassManager {
     /// which matches the steady-state shape of this map (overwhelming
     /// majority of accesses are reads of already-INITIALIZED entries).
     init_states: parking_lot::RwLock<FxHashMap<ClassId, Arc<std::sync::atomic::AtomicU8>>>,
+}
+
+/// Metadata released when a user-defined class loader is unloaded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnloadedClass {
+    pub id: ClassId,
+    pub name: Arc<str>,
+    pub loader_id: ClassLoaderId,
 }
 
 /// Initialization-state values stored in [`ClassManager::init_states`].
@@ -1722,10 +1864,7 @@ impl ClassManager {
         // service-provider discovery (`ServiceLoader` via module `provides`,
         // e.g. ToolProvider.getSystemJavaCompiler) and module labelling match
         // the real JDK.
-        let register_modules = !matches!(
-            std::env::var("CRATONVM_BOOT_MODULE_REGISTRY").as_deref(),
-            Ok("0") | Ok("false") | Ok("no")
-        );
+        let register_modules = loader_flags().boot_module_registry;
         if register_modules {
             // `automatic = true` for the application class path: those jars are
             // on the class path (not a module path), so the real JDK puts them in
@@ -1786,7 +1925,7 @@ impl ClassManager {
     /// Parse a `module-info.class` byte array and register the contained
     /// module descriptor in `registry`.  Silently ignores parse failures.
     fn try_register_module_info(registry: &mut ModuleRegistry, bytes: &[u8], automatic: bool) {
-        let diag_mp = std::env::var("CRATONVM_DBG_MODPROV").is_ok();
+        let diag_mp = loader_flags().dbg_modprov;
         let mut class_file = match cratonvm_reader::read_class(bytes) {
             Ok(cf) => cf,
             Err(e) => {
@@ -2082,7 +2221,7 @@ impl ClassManager {
             {
                 match self.find_class_bytes_delegated(name) {
                     Ok((bytes, loader_id)) => {
-                        if let Err(e) = self.upgrade_synthetic_class(id, name, &bytes, loader_id) {
+                        if let Err(e) = self.upgrade_synthetic_class(id, name, bytes, loader_id) {
                             tracing::debug!(
                                 class = name,
                                 "ensure_synthetic_class: real-class upgrade failed: {e:?}"
@@ -2772,14 +2911,14 @@ impl ClassManager {
         if is_user_loader_answer && self.find_class_bytes_delegated(name).is_err() {
             return Some(candidate);
         }
-        if std::env::var("CRATONVM_DBG_DUPCLASS").is_ok() {
+        if loader_flags().dbg_dupclass {
             eprintln!(
                 "[DBG_DUPCLASS] rejecting existing UserDefined-loader candidate {:?} (loader={:?}) for {:?} -- delegation chain also has it, so a SEPARATE ClassId will be created under Application",
                 candidate,
                 self.class_store.get(candidate).map(|c| c.loader_id),
                 name,
             );
-            if std::env::var_os("CRATONVM_DBG_DUPCLASS_BT").is_some() {
+            if loader_flags().dbg_dupclass_bt {
                 let bt = std::backtrace::Backtrace::force_capture();
                 eprintln!("[DBG_DUPCLASS_BT] {name}\n{bt}");
             }
@@ -2788,7 +2927,7 @@ impl ClassManager {
     }
 
     pub fn load_class(&mut self, name: &str) -> Result<ClassId, VmError> {
-        if std::env::var_os("CRATONVM_DBG_LOADCLASS").is_some() && name.contains("GroupsMetadata") {
+        if loader_flags().dbg_loadclass && name.contains("GroupsMetadata") {
             let bt = std::backtrace::Backtrace::force_capture();
             eprintln!(
                 "[DBG_LOADCLASS] load_class({name}) already_loaded={:?}\n{bt}",
@@ -2826,7 +2965,7 @@ impl ClassManager {
             {
                 match self.find_class_bytes_delegated(name) {
                     Ok((bytes, loader_id)) => {
-                        match self.upgrade_synthetic_class(id, name, &bytes, loader_id) {
+                        match self.upgrade_synthetic_class(id, name, bytes, loader_id) {
                             Ok(()) => {
                                 tracing::debug!(
                                     class = name,
@@ -2865,7 +3004,12 @@ impl ClassManager {
         match self.find_class_bytes_delegated(name) {
             Ok((bytes, loader_id)) => {
                 // Parse and register with the loader that found it
-                self.define_class(name, &bytes, loader_id)
+                self.define_class_shared_with_options(
+                    name,
+                    bytes,
+                    loader_id,
+                    DefineClassOptions::default(),
+                )
             }
             Err(_) if is_jboss_logging_locale_lookup(name) => {
                 // S-trinity #3: JBoss Logging i18n probes locale-specific
@@ -2970,10 +3114,13 @@ impl ClassManager {
     }
 
     /// Find class bytes using parent delegation.
-    fn find_class_bytes_delegated(&self, name: &str) -> Result<(Vec<u8>, ClassLoaderId), VmError> {
+    fn find_class_bytes_delegated(
+        &self,
+        name: &str,
+    ) -> Result<(SharedBytes, ClassLoaderId), VmError> {
         // CDS archive check — fastest path
         if let Some(bytes) = self.cds_class_cache.get(name) {
-            return Ok((bytes.clone(), ClassLoaderId::Bootstrap));
+            return Ok((bytes.clone().into(), ClassLoaderId::Bootstrap));
         }
         // Bootstrap first
         if let Ok(bytes) = self.bootstrap.find_class_bytes(name) {
@@ -3021,7 +3168,21 @@ impl ClassManager {
         loader_id: ClassLoaderId,
         options: DefineClassOptions,
     ) -> Result<ClassId, VmError> {
-        if std::env::var("CRATONVM_DBG_DEFINE").is_ok()
+        self.define_class_shared_with_options(name, bytes.to_vec().into(), loader_id, options)
+    }
+
+    /// Define a class while retaining the class-path or archive backing that
+    /// supplied its bytes. Public byte-slice callers still enter through
+    /// `define_class_with_options`; class-path loads use this path to avoid a
+    /// second allocation and copy.
+    fn define_class_shared_with_options(
+        &mut self,
+        name: &str,
+        bytes: SharedBytes,
+        loader_id: ClassLoaderId,
+        options: DefineClassOptions,
+    ) -> Result<ClassId, VmError> {
+        if loader_flags().dbg_define
             && (name.contains("TestNGTestEngine") || name.contains("IsTestNGTestClass"))
         {
             eprintln!(
@@ -3031,10 +3192,10 @@ impl ClassManager {
                 bytes.len()
             );
         }
-        if std::env::var_os("CRATONVM_DBG_FBCGLIB").is_some()
+        if loader_flags().dbg_fbcglib
             && (name.contains("RepositoryConfiguration") || name.contains("RawFactoryMethod"))
         {
-            let haystack = String::from_utf8_lossy(bytes);
+            let haystack = String::from_utf8_lossy(&bytes);
             let has_factory_data = haystack.contains("CGLIB$FACTORY_DATA");
             eprintln!(
                 "[FBCGLIB-DBG] define_class name={name} override_name={:?} loader_id={:?} bytes_len={} has_CGLIB$FACTORY_DATA_utf8={has_factory_data}",
@@ -3043,7 +3204,7 @@ impl ClassManager {
                 bytes.len(),
             );
         }
-        if std::env::var_os("CRATONVM_DBG_OBSREG").is_some()
+        if loader_flags().dbg_obsreg
             && (name.contains("ObservationRegistry")
                 || name.contains("RestClientObservationAutoConfigurationWithoutMetricsTests")
                 || name.contains("TestObservationRegistry"))
@@ -3076,7 +3237,7 @@ impl ClassManager {
         }
 
         // Parse the class file
-        let mut class_file = cratonvm_reader::read_class(bytes).map_err(|e| {
+        let mut class_file = cratonvm_reader::read_class_shared(bytes.clone()).map_err(|e| {
             VmError::Linkage(LinkageError::ClassFormatError {
                 class_name: name.to_string(),
                 message: e.to_string(),
@@ -3222,7 +3383,7 @@ impl ClassManager {
             // confirms whether a same-name collision was actually detected
             // and rejected here (as opposed to real cglib silently
             // succeeding under a different name).
-            if std::env::var_os("CRATONVM_DBG_FBCGLIB").is_some() && dup.is_some() {
+            if loader_flags().dbg_fbcglib && dup.is_some() {
                 eprintln!(
                     "[FBCGLIB-DBG] duplicate-define rejected: name={stored_name_preview} loader_id={loader_id:?} existing={:?}",
                     dup
@@ -3779,12 +3940,21 @@ impl ClassManager {
         // matching the link-time verifier policy in vm_util.
         let defer_loader_sensitive_pass3 =
             loader_aware_resolution() && matches!(class.loader_id, ClassLoaderId::UserDefined(_));
-        if !options.skip_verification
-            && !defer_loader_sensitive_pass3
-            && !self.cds_class_cache.contains_key(name)
-            && !class.is_synthetic_stub
-            && class.state != ClassState::Verified
-        {
+        // TYPE MAPS (arch-2026-07-26/access-control-and-map-coverage): the
+        // deferral above is about the verifier's *load decision*, not about
+        // its type maps. Deferring the whole of Pass 3 also deferred the
+        // per-pc oop maps and the per-method `safe_for_fast_path` flag, and
+        // since every Spring / WildFly / H2 / Elasticsearch application class
+        // is defined by a user-defined loader, that meant no maps for the
+        // entire application workload — precisely the classes the maps exist
+        // to describe. `collect_class_type_maps` runs the same walk with the
+        // verdict discarded; see its doc comment for why the rows are sound
+        // even when the assignability verdicts are not.
+        let skip_all_verification = options.skip_verification
+            || self.cds_class_cache.contains_key(name)
+            || class.is_synthetic_stub
+            || class.state == ClassState::Verified;
+        if !skip_all_verification {
             let hierarchy = ClassStoreHierarchy {
                 class_store: &self.class_store,
                 loaded_classes: &self.loaded_classes,
@@ -3798,7 +3968,13 @@ impl ClassManager {
                 // loader's delegation order, not a global first-match.
                 requesting_loader: Some(class.loader_id),
             };
-            if let Err(verify_err) =
+            if defer_loader_sensitive_pass3 {
+                // Loader-sensitive class: harvest the maps, make no load
+                // decision. Publishing before registration is safe — the id is
+                // already minted, the store is the only other thing keyed by
+                // it, and nothing between here and `class_store.add` can fail.
+                crate::verifier::publish_deferred_class_type_maps(&class, &hierarchy);
+            } else if let Err(verify_err) =
                 crate::verifier::verify_class(&class, &self.class_store, &hierarchy)
             {
                 // Verifier rejected the bytecode. Drop the guard set
@@ -3806,6 +3982,17 @@ impl ClassManager {
                 self.loading_guard.remove(name);
                 return Err(VmError::Linkage(verify_err));
             }
+        } else {
+            // TYPE MAPS: record the *reason* there are no maps. Without this
+            // the side table answers `Unknown` for a `--noverify` /
+            // CDS / synthetic-stub / trusted-generated class, which a consumer
+            // cannot distinguish from "not verified yet" — and "not yet" is a
+            // state it might reasonably wait for. `Skipped` says: none are
+            // coming, scan conservatively and stay off the unchecked fast
+            // path. The marker never traps this id: `type_maps::install`
+            // upgrades an unverified marker to real maps on a later publish,
+            // and the redefine path replaces outright.
+            crate::type_maps::mark_class_verification_skipped(class.id);
         }
 
         debug!(
@@ -3856,7 +4043,7 @@ impl ClassManager {
         // (`class_bytes_cache_cap`, default 16 MiB) is enforced. Without
         // this, every classfile would stay resident forever — ~90 MB on
         // a medium Spring app.
-        self.insert_class_bytes(id, bytes.to_vec());
+        self.insert_class_bytes(id, bytes);
         // WP2.3: persist the per-class skip-verification flag in the side
         // table. The verifier consults `class_skip_bytecode_verification`
         // during link-time so trusted hidden / generated classes
@@ -3898,13 +4085,13 @@ impl ClassManager {
             fire_vtable_override_hook(super_id, slot);
         }
 
-        // T6.3.1 — Fire the JVMTI ClassLoad hook. The VM's JvmtiEventManager
-        // snapshots the attached-env list under its own lock; it never
-        // re-enters the class manager, so it is safe to call from inside
-        // `&mut self`. We still release the caller's class-manager write
-        // lock at the outer callsite before agent callbacks run for any
-        // slower path that needs it — here, the define_class path only
-        // mutates `self`, so dropping is not needed.
+        // T6.3.1 — Queue the JVMTI ClassLoad/ClassPrepare events (obsaudit
+        // D1, 2026-07-26: these no longer fire synchronously here). Actual
+        // delivery happens once the caller's L10 `class_manager` write guard
+        // is released — see the DEFERRED FIRING notes on the hook registry
+        // near `install_class_load_hook`, and `ClassManagerWriteGuard` in
+        // `vm/src/vm/realms/class_realm.rs`. A hook may now safely call back
+        // into `self` / `shared.classes` from its own thread.
         //
         // ClassPrepare is fired after linking/verification completes. For
         // classes that are loaded but not yet linked, the VM's linker path
@@ -3912,8 +4099,9 @@ impl ClassManager {
         // eagerly links eagerly-resolved classes, so we fire both here and
         // let the JVMTI layer de-duplicate if the state flag indicates
         // prepare has already been seen.
-        fire_class_load_hook(class_id_for_hook, &class_name_for_hook, 0);
-        fire_class_prepare_hook(class_id_for_hook, &class_name_for_hook, 0);
+        let hook_thread_id = current_thread_id();
+        fire_class_load_hook(class_id_for_hook, &class_name_for_hook, hook_thread_id);
+        fire_class_prepare_hook(class_id_for_hook, &class_name_for_hook, hook_thread_id);
 
         Ok(id)
     }
@@ -4248,6 +4436,69 @@ impl ClassManager {
     /// Get a mutable reference to a loaded class by its id.
     pub fn get_class_mut(&mut self, id: ClassId) -> Option<&mut Class> {
         self.class_store.get_mut(id)
+    }
+
+    /// Atomically detach every class defined by `loader_id` from the live
+    /// metadata graph.
+    ///
+    /// The underlying [`ClassStore`] leaves monotonic tombstones, so stale
+    /// ClassIds fail closed and can never alias a later definition. Callers
+    /// must additionally evict VM-owned ClassId caches (statics, mirrors,
+    /// vtables and executable code); the returned identities are the exact
+    /// invalidation set for that transaction.
+    pub fn unload_user_loader(&mut self, loader_id: ClassLoaderId) -> Vec<UnloadedClass> {
+        if !matches!(loader_id, ClassLoaderId::UserDefined(_)) {
+            return Vec::new();
+        }
+
+        let ids: FxHashSet<ClassId> = self
+            .class_store
+            .iter()
+            .filter(|class| class.loader_id == loader_id)
+            .map(|class| class.id)
+            .collect();
+        if ids.is_empty() {
+            self.user_loaders.remove(&loader_id);
+            return Vec::new();
+        }
+
+        // Remove both defining and initiating-name aliases that point into the
+        // dead loader's class set.
+        self.loaded_classes.retain(|_, id| !ids.contains(id));
+        self.user_loaders.remove(&loader_id);
+
+        self.vtable_descriptors.retain(|id, _| !ids.contains(id));
+        self.skip_bytecode_verification
+            .retain(|id| !ids.contains(id));
+        self.redefine_generations
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .retain(|id, _| !ids.contains(id));
+        self.init_states.write().retain(|id, _| !ids.contains(id));
+
+        for id in &ids {
+            if let Some(bytes) = self.class_bytes_cache.remove(id) {
+                self.class_bytes_cache_size =
+                    self.class_bytes_cache_size.saturating_sub(bytes.len());
+            }
+        }
+        self.class_bytes_cache_fifo.retain(|id| !ids.contains(id));
+
+        let mut unloaded = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(class) = self.class_store.remove(id) {
+                unloaded.push(UnloadedClass {
+                    id,
+                    name: class.name,
+                    loader_id,
+                });
+                // Symbolic and reflective resolution caches may hold the class
+                // as either key or resolved target.
+                fire_resolution_invalidate_hook(id.as_u32());
+            }
+        }
+        unloaded.sort_unstable_by_key(|class| class.id.as_u32());
+        unloaded
     }
 
     /// Find a raw classpath resource by name.
@@ -5194,6 +5445,35 @@ impl ClassManager {
         // Verification succeeded (or was legitimately skipped). The
         // snapshot vecs (if any) are dropped here; the new ones remain
         // installed.
+
+        // ---- Step 5c: re-publish this class's type maps ----
+        // The maps published when this class was DEFINED describe the OLD
+        // method bodies, at `Class::methods` indices this redefine may have
+        // reshuffled. `type_maps::publish_class_type_maps` is first-writer-
+        // wins, so the verify above (when it ran) could not overwrite them —
+        // the class's bytecode and its oop maps would silently diverge, and a
+        // stale oop map is a wrong oop map, i.e. heap corruption rather than a
+        // pessimisation. `refresh_class_type_maps` is the *replacing* install
+        // and is what keeps the two in lockstep.
+        //
+        // Unconditional on a successful redefine, including the paths that
+        // skipped verification (trusted generated bytecode, `--noverify`):
+        // there, replacing stale maps with an honest "walk did not complete"
+        // set is still strictly better than leaving the old class's rows
+        // visible.
+        {
+            let hierarchy = ClassStoreHierarchy {
+                class_store: &self.class_store,
+                loaded_classes: &self.loaded_classes,
+                in_flight: None,
+                in_flight_super_name: None,
+                requesting_loader: self.class_store.get(class_id).map(|c| c.loader_id),
+            };
+            if let Some(cls) = self.class_store.get(class_id) {
+                crate::verifier::refresh_class_type_maps(cls, &hierarchy);
+            }
+        }
+
         // Forget the borrow — the rest of this function is hooks +
         // bookkeeping that may re-enter the manager.
         let _ = existing_loader; // silence unused warning if no read below
@@ -5293,7 +5573,8 @@ impl ClassManager {
     /// size accounting and move the entry to the tail of the FIFO so
     /// it is the *last* candidate for eviction — agents that redefine
     /// hot classes keep them in cache.
-    pub fn insert_class_bytes(&mut self, class_id: ClassId, bytes: Vec<u8>) {
+    pub fn insert_class_bytes(&mut self, class_id: ClassId, bytes: impl Into<SharedBytes>) {
+        let bytes = bytes.into();
         let new_size = bytes.len();
         // If we already had an entry for this class, subtract its size
         // and remove it from the FIFO before re-appending.
@@ -5399,6 +5680,22 @@ impl ClassManager {
     ///
     /// Returns `None` if the class hasn't been loaded by any loader.
     ///
+    /// **Loader-blind — prefer [`Self::find_class_by_name_for_loader`].**
+    /// This method has no notion of *which* loader is asking, so when two
+    /// or more distinct user-defined loaders each define their own class
+    /// under the same name it cannot know which copy the caller means (see
+    /// the context.groovy note below — it now reports a miss rather than
+    /// guessing, but "miss when it could have answered correctly given the
+    /// requester" is itself the residual unsoundness). New call sites that
+    /// have a requesting/initiating loader in hand should call
+    /// `find_class_by_name_for_loader(name, requesting_loader)` instead,
+    /// which checks that loader's own namespace first and never guesses
+    /// across unrelated user-defined loaders. `#[deprecated]` below is
+    /// advisory only (no `deny(warnings)` anywhere in the workspace, so this
+    /// cannot break the centrally-run build) — it exists to surface the ~50
+    /// remaining external call sites for follow-up migration. See
+    /// `docs/internal/loader-identity.md` for the current per-file tally.
+    ///
     /// **Round 4 audit fix (HIGH):** the prior fallback scanned every
     /// entry in `loaded_classes` linearly for each key (O(n · keys)).
     /// With the (`ClassLoaderId`, `Arc<str>`) keying we already have,
@@ -5407,6 +5704,7 @@ impl ClassManager {
     /// O(entries · keys). On a Spring app with ~15k loaded classes that
     /// turns every miss from ~15k string compares into a handful of
     /// hash probes.
+    #[deprecated(note = "loader-blind; use find_class_by_name_for_loader")]
     pub fn find_class_by_name(&self, name: &str) -> Option<ClassId> {
         let slash = if name.contains('.') && !name.contains('/') {
             name.replace('.', "/")
@@ -5499,6 +5797,90 @@ impl ClassManager {
         None
     }
 
+    /// Loader-aware class lookup — JVMS §5.3/§5.4.3 delegation semantics
+    /// keyed on `(requesting_loader, name)` identity rather than on `name`
+    /// alone. Checks `requesting_loader`'s own namespace first (the classes
+    /// it has itself defined), then walks
+    /// [`BUILTIN_LOADER_DELEGATION_CHAIN`] (Bootstrap → Extension →
+    /// Application) up to the bootstrap loader.
+    ///
+    /// This is the sound replacement for [`Self::find_class_by_name`]:
+    /// unlike that method (and unlike [`Self::find_class_by_name_in_loader`],
+    /// whose fallback now forwards here — see its doc comment), this
+    /// function never scans `self.user_loaders` for an unrelated
+    /// user-defined loader's same-named class. Two isolating loaders that
+    /// each define their own copy of `X` must never collapse to whichever
+    /// one this function happens to see; if `requesting_loader` and the
+    /// built-in chain both miss, the answer is `None`, full stop.
+    ///
+    /// **Known limitation:** `ClassManager` does not track user-defined
+    /// loader *parentage* — a user loader's `getParent()` is a Java-level
+    /// field (`java.lang.ClassLoader.parent`) that this crate never
+    /// observes (see `loaders.rs`'s `BUILTIN_LOADER_DELEGATION_CHAIN` doc
+    /// comment: "user-defined loaders have their parent chains modelled on
+    /// the Java side"). So when `requesting_loader` is itself a
+    /// `ClassLoaderId::UserDefined` loader whose Java-level parent is
+    /// ANOTHER user-defined loader (rather than the built-in chain), this
+    /// function cannot walk that link — it degrades to "requesting loader's
+    /// own namespace, then the built-in chain," which is a strict subset of
+    /// full JVMS delegation for that case. Callers that need the true
+    /// parent chain for such a loader must drive its `loadClass` directly
+    /// at the bytecode/interpreter layer (the way
+    /// `native-builtins::lang_class::native_class_get_declared_classes`
+    /// falls through to `ClassLoader.loadClass` via
+    /// `native-builtins::classloader::defining_loader_for` when this kind
+    /// of lookup misses) rather than expecting this crate to resolve it.
+    /// See `docs/internal/loader-identity.md`.
+    pub fn find_class_by_name_for_loader(
+        &self,
+        name: &str,
+        requesting_loader: ClassLoaderId,
+    ) -> Option<ClassId> {
+        let slash = if name.contains('.') && !name.contains('/') {
+            name.replace('.', "/")
+        } else {
+            name.to_string()
+        };
+        let dot = slash.replace('/', ".");
+        let keys = if slash == dot {
+            vec![slash]
+        } else {
+            vec![slash, dot]
+        };
+
+        // Own namespace first: classes `requesting_loader` itself defined.
+        for key in &keys {
+            if let Some(id) = loaded_classes_probe(&self.loaded_classes, requesting_loader, key) {
+                if let Some(class) = self.get_class(id) {
+                    if class.hidden {
+                        continue;
+                    }
+                }
+                return Some(id);
+            }
+        }
+
+        // Then the built-in delegation chain up to Bootstrap. Skip
+        // `requesting_loader` itself if it's one of the three built-ins —
+        // already probed above.
+        for key in &keys {
+            for loader_id in BUILTIN_LOADER_DELEGATION_CHAIN {
+                if *loader_id == requesting_loader {
+                    continue;
+                }
+                if let Some(id) = loaded_classes_probe(&self.loaded_classes, *loader_id, key) {
+                    if let Some(class) = self.get_class(id) {
+                        if class.hidden {
+                            continue;
+                        }
+                    }
+                    return Some(id);
+                }
+            }
+        }
+        None
+    }
+
     /// Find a class by name within a specific loader's namespace, with delegation
     /// fallback to the standard loader chain (Bootstrap → Extension → Application).
     /// Exact-key lookup: the `ClassId` recorded under *exactly* `(loader_id,
@@ -5529,6 +5911,18 @@ impl ClassManager {
         })
     }
 
+    /// **Behavior change (loader-identity consolidation):** the parent-chain
+    /// fallback used to be the loader-blind `find_class_by_name`, which — on
+    /// a miss in the built-in chain — additionally scanned every OTHER
+    /// user-defined loader's namespace and returned an unambiguous same-named
+    /// match if it found exactly one. That was a guess: it could hand back a
+    /// completely unrelated user loader's class just because `loader_id`
+    /// itself and the built-ins didn't have it. The fallback now forwards to
+    /// [`Self::find_class_by_name_for_loader`], which stops at the built-in
+    /// chain and never guesses across unrelated user loaders. Practical
+    /// effect: callers only see a difference in the case that WAS unsound
+    /// (some other, unrelated user loader happened to have a same-named
+    /// class); the own-namespace and built-in-chain paths are unchanged.
     pub fn find_class_by_name_in_loader(
         &self,
         name: &str,
@@ -5543,8 +5937,8 @@ impl ClassManager {
         if let Some(id) = loaded_classes_probe(&self.loaded_classes, loader_id, name) {
             return Some(id);
         }
-        // Delegate to parent chain
-        self.find_class_by_name(name)
+        // Delegate to parent chain — see the doc comment above.
+        self.find_class_by_name_for_loader(name, loader_id)
     }
 
     /// Get the loader identity for a loaded class.
@@ -6038,12 +6432,12 @@ impl ClassManager {
         &mut self,
         id: ClassId,
         name: &str,
-        bytes: &[u8],
+        bytes: SharedBytes,
         loader_id: ClassLoaderId,
     ) -> Result<(), VmError> {
         use cratonvm_reader::attribute::Attribute;
 
-        let mut class_file = cratonvm_reader::read_class(bytes).map_err(|e| {
+        let mut class_file = cratonvm_reader::read_class_shared(bytes.clone()).map_err(|e| {
             VmError::ClassFile(ClassFileError::InvalidClassFile {
                 class_name: name.to_string(),
                 message: e.to_string(),
@@ -6287,7 +6681,7 @@ impl ClassManager {
         fire_resolution_invalidate_hook(id.as_u32());
 
         // Cache the class bytes (FIFO-bounded helper).
-        self.insert_class_bytes(id, bytes.to_vec());
+        self.insert_class_bytes(id, bytes);
 
         Ok(())
     }
@@ -6921,6 +7315,23 @@ fn jdk_interfaces(name: &str) -> &'static [&'static str] {
         "cratonvm/net/HttpBodyReplaySubscription" => &["java/util/concurrent/Flow$Subscription"],
         "java/util/ArrayList$Itr" => &["java/util/Iterator"],
         "java/util/ArrayList$ListItr" => &["java/util/ListIterator", "java/util/Iterator"],
+        // `ArrayList.subList()`'s backed-view object (native-collections'
+        // `ASL_CLASS`, allocated under this internal name rather than the
+        // real `java/util/ArrayList$SubList` since it has its own native
+        // field layout — see native-collections/src/lib.rs's "ArrayList
+        // subList backed view" section). With no entry here it fell to this
+        // match's `_ => &[]` default, so the returned view declared NO
+        // interfaces at all — not even `List`, let alone the `Collection`/
+        // `Iterable` it transitively implies. Any checkcast/instanceof
+        // against `List`/`Collection`/`Iterable` on a `subList()` result
+        // (e.g. AssertJ's `Iterable`-typed `satisfies`/`contains` overloads)
+        // failed with `ArrayListSubList cannot be cast to java.lang.Iterable`
+        // even though every real `List` is trivially an `Iterable`. Mirrors
+        // the real `java.util.ArrayList$SubList`, which extends
+        // `AbstractList` (itself `implements List`) and separately
+        // `implements RandomAccess`.
+        "cratonvm/internal/ArrayListSubList" => &["java/util/List", "java/util/RandomAccess"],
+        "java/util/Dictionary" => &[],
         "java/util/Dictionary" => &[],
         "java/util/ArrayDeque" => &[
             "java/util/Deque",
@@ -12618,7 +13029,9 @@ mod tests {
             .upgrade_synthetic_class(
                 class_id,
                 "Foo",
-                include_bytes!("../tests/fixtures/wp2_4b_redefine/Foo.v1.class"),
+                include_bytes!("../tests/fixtures/wp2_4b_redefine/Foo.v1.class")
+                    .to_vec()
+                    .into(),
                 ClassLoaderId::Bootstrap,
             )
             .expect("upgrade synthetic Foo stub to real fixture");
@@ -12645,6 +13058,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)] // deliberately exercises the loader-blind method
     fn class_manager_find_before_load_returns_none() {
         let mgr = ClassManager::new(&[], &[], &[]);
         assert!(mgr.find_class_by_name("java/lang/Object").is_none());
@@ -12785,7 +13199,7 @@ mod tests {
         for i in 0..50u32 {
             let class_id = ClassId::new(i);
             let bytes = vec![0xcafe_babeu32.to_be_bytes()[0]; i as usize + 4];
-            mgr.class_bytes_cache.insert(class_id, bytes);
+            mgr.class_bytes_cache.insert(class_id, bytes.into());
         }
         for i in 0..50u32 {
             let class_id = ClassId::new(i);
@@ -13470,10 +13884,37 @@ mod tests {
         fire_class_load_hook(42, "com/example/Foo", 1);
         fire_class_prepare_hook(42, "com/example/Foo", 1);
 
+        // obsaudit D1: firing is now deferred to drain_pending_class_hooks()
+        // (see the DEFERRED FIRING notes near install_class_load_hook) —
+        // queuing alone must not have dispatched the callbacks yet.
+        assert_eq!(LOAD_CALLS.load(O::SeqCst), before_load);
+        assert_eq!(PREPARE_CALLS.load(O::SeqCst), before_prepare);
+
+        drain_pending_class_hooks();
+
         assert_eq!(LOAD_CALLS.load(O::SeqCst), before_load + 1);
         assert_eq!(PREPARE_CALLS.load(O::SeqCst), before_prepare + 1);
         // Flag must be set once either hook is installed.
         assert!(CLASS_HOOKS_ACTIVE.load(Ordering::Acquire));
+
+        // A second drain with nothing queued must be a no-op, not a re-fire.
+        drain_pending_class_hooks();
+        assert_eq!(LOAD_CALLS.load(O::SeqCst), before_load + 1);
+        assert_eq!(PREPARE_CALLS.load(O::SeqCst), before_prepare + 1);
+    }
+
+    #[test]
+    fn jvmti_current_thread_id_defaults_to_zero_and_is_settable() {
+        // obsaudit D1: the "unknown/bootstrap" sentinel is 0 until this OS
+        // thread calls set_current_thread_id — exercised on a fresh thread
+        // so it can't observe another test's binding.
+        std::thread::spawn(|| {
+            assert_eq!(current_thread_id(), 0);
+            set_current_thread_id(7);
+            assert_eq!(current_thread_id(), 7);
+        })
+        .join()
+        .unwrap();
     }
 
     // ------------------------------------------------------------------
@@ -14116,4 +14557,16 @@ pub fn is_bootstrap_appended_class(internal: &str) -> bool {
     lock.read()
         .unwrap_or_else(|e| e.into_inner())
         .contains(internal)
+}
+
+impl ClassManager {
+    /// Rebuild the compact field layout of every loaded class.
+    ///
+    /// Called once at VM init when compressed oops are enabled, after the
+    /// bootstrap class set has been laid out with wide references but before
+    /// any instance of those classes exists. See
+    /// [`ClassStore::recompute_all_compact_layouts`].
+    pub fn recompute_all_compact_layouts(&self) -> usize {
+        self.class_store.recompute_all_compact_layouts()
+    }
 }

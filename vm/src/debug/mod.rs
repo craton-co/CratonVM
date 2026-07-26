@@ -710,7 +710,7 @@ pub fn run_jdwp_server(shared: &crate::vm::SharedVm, port: u16) {
         // Create the debug event channel and install in SharedVm
         let (tx, rx) = std::sync::mpsc::channel::<DebugEvent>();
         {
-            if let Ok(mut guard) = shared.debug_event_tx.lock() {
+            if let Ok(mut guard) = shared.debug.debug_event_tx.lock() {
                 *guard = Some(tx);
             }
         }
@@ -720,7 +720,7 @@ pub fn run_jdwp_server(shared: &crate::vm::SharedVm, port: u16) {
         // forward to the running VM.  The bridge is removed on disconnect.
         if let Some(shared_arc) = shared.self_arc.read().as_ref().and_then(|w| w.upgrade()) {
             let bridge: Arc<dyn DebuggerVmBridge> = Arc::new(SharedVmBridge::new(shared_arc));
-            shared.debug_state.lock().vm_bridge = Some(bridge);
+            shared.debug.debug_state.lock().vm_bridge = Some(bridge);
         } else {
             tracing::warn!(
                 "JDWP: self_arc unavailable — debugger-initiated invocations \
@@ -753,7 +753,7 @@ pub fn run_jdwp_server(shared: &crate::vm::SharedVm, port: u16) {
                     extra,
                 };
                 let pkt_id = {
-                    let mut ds = shared.debug_state.lock();
+                    let mut ds = shared.debug.debug_state.lock();
                     ds.next_id()
                 };
                 let mut pkt = events::compose_event_packet(evt.suspend_policy, &[event]);
@@ -784,16 +784,17 @@ pub fn run_jdwp_server(shared: &crate::vm::SharedVm, port: u16) {
                     ..
                 } => {
                     let result = {
-                        let mut ds = shared.debug_state.lock();
+                        let mut ds = shared.debug.debug_state.lock();
                         commands::dispatch(command_set, command, &data, &mut ds)
                     };
 
                     // Update breakpoints_active flag based on current event state
                     let has_bp = {
-                        let ds = shared.debug_state.lock();
+                        let ds = shared.debug.debug_state.lock();
                         ds.events.has_breakpoints() || ds.events.has_single_steps()
                     };
                     shared
+                        .debug
                         .breakpoints_active
                         .store(has_bp, std::sync::atomic::Ordering::Relaxed);
 
@@ -807,7 +808,7 @@ pub fn run_jdwp_server(shared: &crate::vm::SharedVm, port: u16) {
                     }
 
                     // Check if session was disposed
-                    let disposed = shared.debug_state.lock().disposed;
+                    let disposed = shared.debug.debug_state.lock().disposed;
                     if disposed {
                         break;
                     }
@@ -820,14 +821,14 @@ pub fn run_jdwp_server(shared: &crate::vm::SharedVm, port: u16) {
 
         // Tear down the event channel
         {
-            if let Ok(mut guard) = shared.debug_event_tx.lock() {
+            if let Ok(mut guard) = shared.debug.debug_event_tx.lock() {
                 *guard = None;
             }
         }
 
         // Clear all breakpoints/step requests and resume all threads
         {
-            let mut ds = shared.debug_state.lock();
+            let mut ds = shared.debug.debug_state.lock();
             ds.events.clear_all();
             ds.suspended_threads.clear();
             ds.suspended = false;
@@ -837,6 +838,7 @@ pub fn run_jdwp_server(shared: &crate::vm::SharedVm, port: u16) {
             ds.vm_bridge = None;
         }
         shared
+            .debug
             .breakpoints_active
             .store(false, std::sync::atomic::Ordering::Relaxed);
     }
@@ -857,13 +859,13 @@ pub fn build_location_extra(class_id: u64, method_id: u64, offset: u64) -> Vec<u
 pub fn send_thread_event(shared: &crate::vm::SharedVm, kind: events::EventKind, thread_id: u64) {
     // Check if debugger has a matching request
     let (req_id, suspend_policy) = {
-        let ds = shared.debug_state.lock();
+        let ds = shared.debug.debug_state.lock();
         match ds.events.check_thread_event(kind, thread_id) {
             Some(req) => (req.id, req.suspend_policy),
             None => return,
         }
     };
-    if let Ok(guard) = shared.debug_event_tx.lock() {
+    if let Ok(guard) = shared.debug.debug_event_tx.lock() {
         if let Some(ref tx) = *guard {
             let _ = tx.send(DebugEvent {
                 kind,
@@ -880,8 +882,8 @@ pub fn send_thread_event(shared: &crate::vm::SharedVm, kind: events::EventKind, 
 
 /// Populate DebugState with class metadata from the class manager.
 fn populate_class_metadata(shared: &crate::vm::SharedVm) {
-    let cm = shared.class_manager.read();
-    let mut ds = shared.debug_state.lock();
+    let cm = shared.classes.class_manager.read();
+    let mut ds = shared.debug.debug_state.lock();
 
     for class in cm.class_store.iter() {
         let class_id = class.id.as_u32() as u64;
@@ -932,8 +934,8 @@ fn populate_class_metadata(shared: &crate::vm::SharedVm) {
 
 /// Populate DebugState with thread metadata from the thread registry.
 fn populate_thread_metadata(shared: &crate::vm::SharedVm) {
-    let mut ds = shared.debug_state.lock();
-    let names = shared.thread_registry.all_thread_names();
+    let mut ds = shared.debug.debug_state.lock();
+    let names = shared.threads.thread_registry.all_thread_names();
     for (tid, name) in names {
         ds.thread_names.insert(tid.0 as u64, name);
     }
@@ -996,7 +998,7 @@ impl SharedVmBridge {
 
     /// Look up a class name by its wire class_id (= `Class::id.as_u32()`).
     fn class_name_for(&self, class_id: u64) -> Option<String> {
-        let cm = self.shared.class_manager.read();
+        let cm = self.shared.classes.class_manager.read();
         let cid = crate::classloading::ClassId::new(class_id as u32);
         cm.class_store.get(cid).map(|c| c.name.to_string())
     }
@@ -1007,7 +1009,7 @@ impl SharedVmBridge {
     /// descriptors (overloads).  When the caller provides arguments we
     /// disambiguate by argument count after the name lookup.
     fn method_sig_for(&self, class_id: u64, method_id: u64) -> Option<(String, String)> {
-        let ds = self.shared.debug_state.lock();
+        let ds = self.shared.debug.debug_state.lock();
         let methods = ds.class_methods.get(&class_id)?;
         let hit = methods.iter().find(|m| m.method_id.0 == method_id)?;
         Some((hit.name.clone(), hit.signature.clone()))
@@ -1141,7 +1143,7 @@ impl DebuggerVmBridge for SharedVmBridge {
         // the thread_names table — the actual invocation runs on an
         // ephemeral JvmThread per the documented simplification.
         {
-            let ds = self.shared.debug_state.lock();
+            let ds = self.shared.debug.debug_state.lock();
             if !ds.thread_names.contains_key(&thread_id) {
                 return Err(BridgeError::InvalidThread);
             }
@@ -1178,7 +1180,7 @@ impl DebuggerVmBridge for SharedVmBridge {
             return Err(BridgeError::InvalidObject);
         }
         {
-            let ds = self.shared.debug_state.lock();
+            let ds = self.shared.debug.debug_state.lock();
             if !ds.thread_names.contains_key(&thread_id) {
                 return Err(BridgeError::InvalidThread);
             }
@@ -1216,7 +1218,7 @@ impl DebuggerVmBridge for SharedVmBridge {
             return Err(BridgeError::Internal);
         }
         let element_kind_byte = {
-            let ds = self.shared.debug_state.lock();
+            let ds = self.shared.debug.debug_state.lock();
             ds.array_type_element_kind.get(&array_type_id).copied()
         };
         let element_type = match element_kind_byte {
@@ -1238,7 +1240,7 @@ impl DebuggerVmBridge for SharedVmBridge {
         // still succeeds — the debugger's subsequent `ArrayReference.Length`
         // call will see the correct length regardless.
         let class_id = {
-            let cm = self.shared.class_manager.read();
+            let cm = self.shared.classes.class_manager.read();
             let cid = crate::classloading::ClassId::new(array_type_id as u32);
             if cm.class_store.get(cid).is_some() {
                 cid
@@ -1249,6 +1251,7 @@ impl DebuggerVmBridge for SharedVmBridge {
 
         let array_ref = self
             .shared
+            .mem
             .heap
             .alloc_array(class_id, element_type, length as usize);
         let wire_id = array_ref.as_ptr() as u64;
@@ -1256,7 +1259,7 @@ impl DebuggerVmBridge for SharedVmBridge {
         // Register the allocated array in DebugState so subsequent
         // `ArrayReference.Length` / `ArrayReference.GetValues` can find it.
         {
-            let mut ds = self.shared.debug_state.lock();
+            let mut ds = self.shared.debug.debug_state.lock();
             ds.array_lengths.insert(wire_id, length as usize);
             ds.array_type_tags
                 .insert(wire_id, element_kind_byte.unwrap_or(b'L'));

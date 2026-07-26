@@ -222,7 +222,7 @@ pub(crate) fn set_pending_tm_trust_roots(root_ders: Vec<Vec<u8>>) {
             deduped.push(der);
         }
     }
-    if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+    if crate::nbflags().dbg_tls_auth_ok {
         eprintln!(
             "[dbg-tls-auth] set_pending_tm_trust_roots count={}",
             deduped.len()
@@ -266,7 +266,7 @@ pub(crate) fn set_pending_tm_revocation(revocation: Option<crate::x509_manager::
 
 fn take_pending_tm_trust_roots() -> Option<TlsTrustRoots> {
     let out = PENDING_TM_TRUST_ROOTS.with(|c| c.borrow_mut().take());
-    if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+    if crate::nbflags().dbg_tls_auth_ok {
         eprintln!(
             "[dbg-tls-auth] take_pending_tm_trust_roots -> {:?}",
             out.as_ref().map(|r| r.root_ders.len())
@@ -370,7 +370,7 @@ pub(crate) fn attach_trust_managers_to_ctx(
             }
         }
     }
-    if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+    if crate::nbflags().dbg_tls_auth_ok {
         eprintln!(
             "[dbg-tls-auth] attach_trust_managers_to_ctx key={} tms_array_present={} count={}",
             key,
@@ -438,7 +438,7 @@ pub(crate) fn attach_key_managers_to_ctx(
             }
         }
     }
-    if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+    if crate::nbflags().dbg_tls_auth_ok {
         eprintln!(
             "[dbg-tls-auth] attach_key_managers_to_ctx key={} kms_array_present={} count={}",
             key,
@@ -481,7 +481,7 @@ pub(crate) fn attach_pending_identity_to_ctx(
     let key = ctx_obj_key(ctx, ctx_obj);
     let pending = take_pending_km_identity();
     if let Some(ident) = resolved_km_identity.or(pending) {
-        if std::env::var_os("CRATONVM_DBG_TLS_AUTH").is_some() {
+        if crate::nbflags().dbg_tls_auth {
             eprintln!(
                 "[dbg-tls-auth] attach_pending_identity_to_ctx key={} STORING km identity key_pem_len={} cert_pem_len={}",
                 key,
@@ -490,14 +490,14 @@ pub(crate) fn attach_pending_identity_to_ctx(
             );
         }
         ctx_identity_table().lock().insert(key, ident);
-    } else if std::env::var_os("CRATONVM_DBG_TLS_AUTH").is_some() {
+    } else if crate::nbflags().dbg_tls_auth {
         eprintln!(
             "[dbg-tls-auth] attach_pending_identity_to_ctx key={} NO pending km identity to store",
             key
         );
     }
     if let Some(roots) = take_pending_tm_trust_roots() {
-        if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+        if crate::nbflags().dbg_tls_auth_ok {
             eprintln!(
                 "[dbg-tls-auth] attach_pending_identity_to_ctx key={} storing {} roots",
                 key,
@@ -505,7 +505,7 @@ pub(crate) fn attach_pending_identity_to_ctx(
             );
         }
         ctx_trust_roots_table().lock().insert(key, roots);
-    } else if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+    } else if crate::nbflags().dbg_tls_auth_ok {
         eprintln!(
             "[dbg-tls-auth] attach_pending_identity_to_ctx key={} NO pending roots to store",
             key
@@ -520,7 +520,7 @@ pub(crate) fn ctx_identity(
 ) -> Option<(String, String)> {
     let key = ctx_obj_key(ctx, ctx_obj);
     let trust_roots = ctx_trust_roots_table().lock().get(&key).cloned();
-    if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+    if crate::nbflags().dbg_tls_auth_ok {
         eprintln!(
             "[dbg-tls-auth] ctx_identity key={} trust_roots={:?}",
             key,
@@ -576,7 +576,7 @@ pub(crate) fn build_engine_client_config_with_identity(
     let trust_roots = active_client_trust_roots();
     let revocation = trust_roots.as_ref().and_then(|r| r.revocation.clone());
     let roots = root_store_for_trust_roots(trust_roots.as_ref());
-    if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+    if crate::nbflags().dbg_tls_auth_ok {
         eprintln!(
             "[dbg-tls-auth] build_engine_client_config_with_identity km_ctx_key={:?} client_identity_present={}",
             km_ctx_key,
@@ -597,7 +597,7 @@ pub(crate) fn build_engine_client_config_with_identity(
             .get(&key)
             .map(|v| !v.is_empty())
             .unwrap_or(false);
-        if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+        if crate::nbflags().dbg_tls_auth_ok {
             eprintln!(
                 "[dbg-tls-auth] build_engine_client_config_with_identity key={} has_kms={}",
                 key, has_kms
@@ -759,7 +759,7 @@ pub(crate) fn set_huc_default_client_identity(ident: Option<(String, String)>) {
     clear_huc_default_client_config();
     *huc_default_identity_slot().lock() = ident;
     let roots = selected_context_trust_roots();
-    if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+    if crate::nbflags().dbg_tls_auth_ok {
         eprintln!(
             "[dbg-tls-auth] set_huc_default_client_identity capturing roots={:?}",
             roots.as_ref().map(|r| r.root_ders.len())
@@ -829,7 +829,7 @@ pub(crate) fn huc_default_trust_managers_ctx_key() -> Option<u64> {
 pub(crate) fn capture_huc_key_managers_ctx_key(ctx: &mut dyn NativeContext, ctx_obj: ObjectRef) {
     let key = ctx_obj_key(ctx, ctx_obj);
     let has_kms = ctx_key_managers_table().lock().contains_key(&key);
-    if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+    if crate::nbflags().dbg_tls_auth_ok {
         eprintln!(
             "[dbg-tls-auth] capture_huc_key_managers_ctx_key key={} has_kms={}",
             key, has_kms
@@ -1013,7 +1013,7 @@ fn root_store_for_trust_roots(trust_roots: Option<&TlsTrustRoots>) -> RootCertSt
 fn active_client_trust_roots() -> Option<TlsTrustRoots> {
     let selected = take_selected_context_trust_roots();
     let result = selected.or_else(huc_default_trust_roots);
-    if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+    if crate::nbflags().dbg_tls_auth_ok {
         eprintln!(
             "[dbg-tls-auth] active_client_trust_roots -> {:?}",
             result.as_ref().map(|r| r.root_ders.len())
@@ -1113,7 +1113,7 @@ pub fn install_identity_from_der(key_pkcs8_der: &[u8], chain_der: &[Vec<u8>]) {
         cert_pem.push_str(&der_to_pem("CERTIFICATE", c));
     }
     let __sniffed = sniff_private_key_pem_header(key_pkcs8_der);
-    if std::env::var_os("CRATONVM_DBG_TLS_HS").is_some() {
+    if crate::nbflags().dbg_tls_hs {
         eprintln!(
             "[dbg-tls-hs] install_identity_from_der: key_der_len={} full_hex={} sniffed_header={}",
             key_pkcs8_der.len(),
@@ -2068,7 +2068,7 @@ impl JavaKeyManagerResolver {
         root_hint_subjects: &[&[u8]],
         sigschemes: &[SignatureScheme],
     ) -> Option<Arc<CertifiedKey>> {
-        let dbg = std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok();
+        let dbg = crate::nbflags().dbg_tls_auth_ok;
         let mut km_list = ctx_key_managers_table()
             .lock()
             .get(&self.km_ctx_key)?
@@ -2262,7 +2262,7 @@ impl ResolvesClientCert for JavaKeyManagerResolver {
         root_hint_subjects: &[&[u8]],
         sigschemes: &[SignatureScheme],
     ) -> Option<Arc<CertifiedKey>> {
-        let dbg = std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok();
+        let dbg = crate::nbflags().dbg_tls_auth_ok;
         if dbg {
             eprintln!(
                 "[dbg-tls-auth] JavaKeyManagerResolver::resolve CALLED km_ctx_key={} root_hint_subjects={}",
@@ -2289,7 +2289,7 @@ impl ResolvesClientCert for JavaKeyManagerResolver {
             .get(&self.km_ctx_key)
             .map(|v| !v.is_empty())
             .unwrap_or(false);
-        if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+        if crate::nbflags().dbg_tls_auth_ok {
             eprintln!(
                 "[dbg-tls-auth] JavaKeyManagerResolver::has_certs CALLED km_ctx_key={} -> {}",
                 self.km_ctx_key, out
@@ -2400,24 +2400,42 @@ pub(crate) fn any_cipher_mappable(ciphers: &[String]) -> bool {
 
 /// A `ClientCertVerifier` that accepts any structurally-valid, correctly
 /// SIGNED client certificate WITHOUT validating its chain against a trust
-/// anchor. Used exclusively when Tomcat's `trustManagerClassName` mechanism
-/// is configured: that feature's whole point is to delegate the trust
-/// decision to a Java `TrustManager` class INSTEAD OF a keystore-backed
-/// truststore, so there is no CA data here for `WebPkiClientVerifier` to
-/// build a `RootCertStore` from.
+/// anchor.
 ///
-/// Accepting a certificate here does NOT mean the connection is ultimately
-/// trusted — it only means the client proved possession of the leaf
-/// certificate's private key (`verify_tls12/13_signature` still do real
-/// cryptographic signature verification via the same webpki primitives
-/// `WebPkiClientVerifier` uses). The actual trust decision is made
-/// afterwards, synchronously, by `engine_run_trust_check` calling the real
-/// Java `TrustManager.checkClientTrusted` once the handshake completes —
-/// which aborts the connection (`SSLHandshakeException`) on rejection. This
-/// verifier must therefore ONLY be selected when a Java `TrustManager` is
-/// actually registered for the owning engine (see `engine_begin`'s
-/// `use_passthrough_client_verifier` check) — never as a general fallback for
-/// "no truststore configured", which would be a fail-open regression.
+/// Two callers select this:
+///
+/// 1. Tomcat's `trustManagerClassName` mechanism: that feature's whole point
+///    is to delegate the trust decision to a Java `TrustManager` class
+///    INSTEAD OF a keystore-backed truststore, so there is no CA data here
+///    for `WebPkiClientVerifier` to build a `RootCertStore` from. Trust is
+///    enforced afterwards, synchronously, by `engine_run_trust_check` calling
+///    the real Java `TrustManager.checkClientTrusted` once the handshake
+///    completes — which aborts the connection (`SSLHandshakeException`) on
+///    rejection.
+/// 2. Optional (`ClientAuth.WANT`/`setWantClientAuth(true)`) client auth with
+///    no trust source configured at all (no truststore, no custom
+///    `TrustManager`). Real JSSE does NOT fail the handshake here even when
+///    the presented certificate fails trust verification against its default
+///    (system cacerts) trust manager — confirmed empirically against a real
+///    JDK: the handshake completes, only the SERVER's own
+///    `getPeerPrincipal()`/`getPeerCertificates()` throw
+///    `SSLPeerUnverifiedException` afterward. rustls's `WebPkiClientVerifier`
+///    has no such soft-fail path (verification failure is always a fatal
+///    alert), so this verifier is the closest achievable approximation:
+///    accept the cert structurally (proves key possession via
+///    `verify_tls12/13_signature`, same webpki primitives
+///    `WebPkiClientVerifier` uses) without asserting CA trust. No Java
+///    `TrustManager` runs afterward in this case (none is registered), so
+///    unlike case 1 there is no later enforcement step — this only matters
+///    for callers that read `SSLSession.getPeerCertificates()` expecting an
+///    authoritative trust decision, which real JSSE would also leave
+///    unresolved here (it simply drops the unverified identity instead of
+///    exposing it, a difference this approximation does not fully capture).
+///
+/// Mandatory (`ClientAuth.NEED`/`setNeedClientAuth(true)`) client auth is
+/// UNCHANGED by case 2 above and still requires a real trust source — see
+/// `default_engine_server_config`'s own
+/// "setNeedClientAuth(true) requires javax.net.ssl.trustStore" error.
 #[derive(Debug)]
 struct PassthroughClientCertVerifier {
     mandatory: bool,
@@ -2646,7 +2664,7 @@ pub(crate) fn rustls_client_connect(
 /// `accept()` non-blockingly outside the lock so a `close()` call can always
 /// acquire the mutex immediately and is noticed within one poll interval.
 pub(crate) fn rustls_server_accept(listener_id: i32) -> Result<i32, String> {
-    let debug_hs = std::env::var_os("CRATONVM_DBG_TLS_HS").is_some();
+    let debug_hs = crate::nbflags().dbg_tls_hs;
     // Step 1: pop the config + a cloned tcp listener handle + the closed
     // flag, then accept *without* the mutex held so long handshakes (or a
     // long wait for a peer that never connects) don't stall every other TLS
@@ -2806,7 +2824,7 @@ pub(crate) fn rustls_server_handshake_over_stream(
     cert_pem: &str,
     key_pem: &str,
 ) -> Result<i32, String> {
-    let debug_srv = std::env::var_os("CRATONVM_DBG_TLS_SRV").is_some();
+    let debug_srv = crate::nbflags().dbg_tls_srv;
     if debug_srv {
         eprintln!("[dbg-tls-srv] wrap_existing_socket: got raw stream");
     }
@@ -3096,7 +3114,7 @@ pub(crate) fn stash_pending_layered_socket(
     extra_roots: Vec<Vec<u8>>,
     java_tm_key: Option<u64>,
 ) -> Result<i32, String> {
-    let debug_pls = std::env::var_os("CRATONVM_DBG_TLS_PLS").is_some();
+    let debug_pls = crate::nbflags().dbg_tls_pls;
     let stream = match crate::net_phase_e::take_raw_socket_stream_for_tls(ctx, wrapped) {
         Ok(tcp) => {
             if debug_pls {
@@ -3198,7 +3216,7 @@ pub(crate) fn drive_pending_layered_handshake(pending_id: i32) -> Result<i32, St
         .lock()
         .remove(&pending_id)
         .ok_or_else(|| "layered socket handshake state missing".to_string())?;
-    if std::env::var_os("CRATONVM_DBG_TLS_PLS").is_some() {
+    if crate::nbflags().dbg_tls_pls {
         eprintln!(
             "[dbg-tls-pls] drive: pending_id={} client_mode={} stream={} host={}",
             pending_id,
@@ -3271,10 +3289,21 @@ pub(crate) fn drive_pending_layered_handshake(pending_id: i32) -> Result<i32, St
 }
 
 pub(crate) fn rustls_stream_read(id: i32, buf: &mut [u8]) -> std::io::Result<usize> {
-    let debug_srv = std::env::var_os("CRATONVM_DBG_TLS_SRV").is_some();
+    let debug_srv = crate::nbflags().dbg_tls_srv;
     let mut reg = sreg().lock();
     if let Some(e) = reg.client_streams.get_mut(&id) {
-        return e.stream.read(buf);
+        // FIX (TestSsl.testSni[JSSE]): a plain `SSLSocket.getInputStream()
+        // .read()` on the client side used to propagate rustls's raw
+        // `UnexpectedEof` ("peer closed connection without sending TLS
+        // close_notify") straight through as an `IOException`. Tomcat's own
+        // server connector (also CratonVM/rustls) closes the raw socket
+        // after writing a `Connection: Close` response without a clean TLS
+        // shutdown — an unclean-but-benign close real JSSE clients
+        // routinely tolerate at the end of a fully-framed HTTP response.
+        // Reuse the same EOF-tolerant read already established for the
+        // native HTTP client bridge (`http_url_connection::
+        // read_eof_tolerant`) instead of duplicating the tolerance logic.
+        return crate::http_url_connection::read_eof_tolerant(&mut e.stream, buf);
     }
     if let Some(e) = reg.server_streams.get_mut(&id) {
         if debug_srv {
@@ -3306,7 +3335,7 @@ pub(crate) fn rustls_stream_read(id: i32, buf: &mut [u8]) -> std::io::Result<usi
 
 /// Write to either a client- or server-side rustls stream.
 pub(crate) fn rustls_stream_write(id: i32, data: &[u8]) -> std::io::Result<usize> {
-    let debug_srv = std::env::var_os("CRATONVM_DBG_TLS_SRV").is_some();
+    let debug_srv = crate::nbflags().dbg_tls_srv;
     let mut reg = sreg().lock();
     if let Some(e) = reg.client_streams.get_mut(&id) {
         return e.stream.write(data);
@@ -3850,7 +3879,9 @@ fn register_sslserversocket(r: &mut NativeMethodRegistry) {
         // left uninvestigated rather than risk a half-understood change to
         // this shared accept path).
 
-        let session = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSession", 3);
+        // 4-field synthetic session: proto, cipher, streamId, attrs (slot 3 —
+        // see SSLSESS_ATTRS_SLOT doc comment).
+        let session = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSession", 4);
         let p = ctx.create_string(&proto);
         let c = ctx.create_string(&cipher);
         ctx.set_field(session, 0, Value::Object(Some(p)));
@@ -4064,6 +4095,91 @@ fn register_https_url_connection(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(obj))))
         },
     );
+    // Walk from an arbitrary `SSLSocketFactory`-typed object down to the
+    // `SSLContext` it ultimately carries. The fast path is our own synthetic
+    // carrier (`alloc_concurrent_synthetic("javax/net/ssl/SSLSocketFactory",
+    // 1)`, field 0 = the SSLContext, as returned by `SSLContext.
+    // getSocketFactory()`), but real test/application code routinely wraps
+    // that in a REAL bytecode subclass that delegates to it — e.g. Tomcat's
+    // own `TesterSupport.ClientSSLSocketFactory(SSLSocketFactory delegate)`,
+    // used by `TesterSupport.configureClientSsl()` (every `TestCustomSsl`/
+    // `TestClientCert*`-style test). That subclass's field 0 is its own
+    // `delegate` field — itself another `SSLSocketFactory`, one hop short of
+    // the actual `SSLContext` — so blindly reading field 0 once returned the
+    // wrapper's delegate and treated IT as the SSLContext. Every
+    // `ctx_obj_key`-keyed lookup keyed off the real SSLContext (trust roots,
+    // key managers, identity) then silently missed for a completely
+    // unrelated object's identity, and the client fell back to the platform
+    // default trust store — rejecting the test's self-signed CA with
+    // `SSLHandshakeException: ... UnknownIssuer`.
+    //
+    // Match by `ClassId` (via a single `class_id_by_name` lookup), NOT by
+    // `class_name_of_id` on each candidate object: `alloc_concurrent_synthetic`
+    // itself documents that `class_name_of_id` can misreport an
+    // interface-like synthetic class (this carrier's declared type,
+    // `SSLSocketFactory`, is abstract) back as `java/lang/Object` — a
+    // name-string comparison at each node silently found nothing and this
+    // first attempt returned `None` every time, never actually resolving the
+    // wrapped SSLContext. `class_id_by_name` performed ONCE up front and
+    // compared by `ClassId` equality is immune to that per-object name
+    // misreport. Also explore EVERY reachable Object-typed field (bounded
+    // breadth/depth) rather than trying to first guess which one is
+    // "SSLSocketFactory-shaped" — that guess is exactly what needed the
+    // now-unreliable name check.
+    fn resolve_sslcontext_from_factory(
+        ctx: &mut dyn cratonvm_native_api::NativeContext,
+        factory: ObjectRef,
+    ) -> Option<ObjectRef> {
+        // `class_num_total_fields` is NOT trustworthy here: our own synthetic
+        // `SSLSocketFactory` carrier (`alloc_concurrent_synthetic(...,
+        // "javax/net/ssl/SSLSocketFactory", 1)`) reports 0 total fields for
+        // its ClassId even though it was allocated with (and, per
+        // `get_field`'s M4a contract, safely holds) exactly 1 real slot —
+        // confirmed via `CRATONVM_DBG_TLS_AUTH` tracing (`cid=ClassId(1046)
+        // nfields=0` for an object that DOES have the SSLContext at index
+        // 0). This is the identical "interface-like synthetic class"
+        // metadata gap `alloc_concurrent_synthetic` itself documents and
+        // works around at allocation time via `num_fields.max(real)` — this
+        // resolver hits the same gap on the READ side, where there is no
+        // equivalent fallback. `get_field` is required (M4a, this trait's
+        // own doc) to bounds-check and fail safe on an out-of-declared-range
+        // index, so scanning a small fixed range unconditionally is safe:
+        // true out-of-bounds reads just come back `Value::Object(None)` and
+        // are silently skipped, never a bad memory access.
+        const FIELD_SCAN_RANGE: usize = 8;
+        const MAX_DEPTH: usize = 6;
+        const MAX_VISITED: usize = 64;
+        let sslcontext_cid = ctx.class_id_by_name("javax/net/ssl/SSLContext");
+        let mut frontier = vec![factory];
+        let mut visited = 0usize;
+        for _ in 0..MAX_DEPTH {
+            let mut next_frontier = Vec::new();
+            for obj in frontier {
+                if visited >= MAX_VISITED {
+                    return None;
+                }
+                visited += 1;
+                let cid = ctx.class_id_of_object(obj);
+                if sslcontext_cid == Some(cid) {
+                    return Some(obj);
+                }
+                for i in 0..FIELD_SCAN_RANGE {
+                    if let Value::Object(Some(candidate)) = ctx.get_field(obj, i) {
+                        let sub_cid = ctx.class_id_of_object(candidate);
+                        if sslcontext_cid == Some(sub_cid) {
+                            return Some(candidate);
+                        }
+                        next_frontier.push(candidate);
+                    }
+                }
+            }
+            if next_frontier.is_empty() {
+                return None;
+            }
+            frontier = next_frontier;
+        }
+        None
+    }
     // Capture the client identity (cert+key) carried by the factory's
     // SSLContext so the native HttpsURLConnection client can present a client
     // certificate for mTLS. `setDefaultSSLSocketFactory` is static (factory =
@@ -4073,7 +4189,7 @@ fn register_https_url_connection(r: &mut NativeMethodRegistry) {
         factory: ObjectRef,
         connection: Option<ObjectRef>,
     ) {
-        if let Value::Object(Some(sslctx)) = ctx.get_field(factory, 0) {
+        if let Some(sslctx) = resolve_sslcontext_from_factory(ctx, factory) {
             if let Some(connection) = connection {
                 capture_huc_ssl_context_for_connection(ctx, connection, sslctx);
             } else {
@@ -5808,7 +5924,7 @@ fn enum_const(
     match ctx.invoke(cls, "valueOf", valueof_desc, &[Value::Object(Some(n))]) {
         Ok(Some(v)) => v,
         other => {
-            if std::env::var_os("CRATONVM_DBG_TLS_HS").is_some() {
+            if crate::nbflags().dbg_tls_hs {
                 eprintln!(
                     "[dbg-tls-hs] thread={:?} enum_const FAILED cls={} name={} result={:?}",
                     std::thread::current().id(),
@@ -5890,7 +6006,7 @@ fn alloc_engine_result(
     // comparison fail → the NIO handshake state machine spun → native SO.)
     let st = real_status_enum(ctx, status);
     let hss = real_handshake_status_enum(ctx, hs);
-    let __dbg_hs = std::env::var_os("CRATONVM_DBG_TLS_HS").is_some();
+    let __dbg_hs = crate::nbflags().dbg_tls_hs;
     if matches!(st, Value::Object(Some(_))) && matches!(hss, Value::Object(Some(_))) {
         match ctx.new_object_initialized(
             "javax/net/ssl/SSLEngineResult",
@@ -6392,7 +6508,7 @@ fn default_engine_server_config(
 /// configs (or defaults) and stash it on the engine.
 fn engine_begin(state: &mut EngineState) -> Result<(), String> {
     if state.conn.is_some() {
-        if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+        if crate::nbflags().dbg_tls_auth_ok {
             eprintln!(
                 "[dbg-tls-auth] engine_begin SHORT-CIRCUIT (conn already realized) need={} want={}",
                 state.need_client_auth, state.want_client_auth
@@ -6608,13 +6724,30 @@ fn engine_begin(state: &mut EngineState) -> Result<(), String> {
                                     .unwrap_or(false)
                             })
                             .unwrap_or(false);
-                    if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+                    let optional_client_cert = (state.want_client_auth || speculative_optional_auth)
+                        && !state.need_client_auth;
+                    // FIX (tomcatservletwebserverfactorytests-ssl-clientauth-peercert-residuals):
+                    // optional client auth (WANT) with no trust source at all
+                    // (no truststore, no custom TrustManager) used to fall
+                    // into the `else` branch below with `client_ca=None`,
+                    // where `build_server_config_single_cert_ex_ciphers`
+                    // treats a missing CA as a hard config-build error even
+                    // for the optional case -- real JSSE does not fail the
+                    // handshake in this scenario (see the doc comment on
+                    // `PassthroughClientCertVerifier`, case 2), so use the
+                    // same passthrough verifier already used for the
+                    // custom-trust-manager case. NEED (mandatory) mode is
+                    // untouched: `optional_client_cert` is false whenever
+                    // `state.need_client_auth` is true.
+                    let use_passthrough_verifier =
+                        has_custom_trust_managers || (client_ca.is_none() && optional_client_cert);
+                    if crate::nbflags().dbg_tls_auth_ok {
                         eprintln!(
-                            "[dbg-tls-auth] engine_begin request={} client_ca_none={} trust_ctx_key={:?} has_custom_trust_managers={}",
-                            request, client_ca.is_none(), state.trust_managers_ctx_key, has_custom_trust_managers
+                            "[dbg-tls-auth] engine_begin request={} client_ca_none={} trust_ctx_key={:?} has_custom_trust_managers={} use_passthrough_verifier={}",
+                            request, client_ca.is_none(), state.trust_managers_ctx_key, has_custom_trust_managers, use_passthrough_verifier
                         );
                     }
-                    let built = if has_custom_trust_managers {
+                    let built = if use_passthrough_verifier {
                         build_server_config_single_cert_passthrough_client_auth(
                             cert,
                             key,
@@ -6628,8 +6761,7 @@ fn engine_begin(state: &mut EngineState) -> Result<(), String> {
                             key,
                             &alpn_strs,
                             state.need_client_auth,
-                            (state.want_client_auth || speculative_optional_auth)
-                                && !state.need_client_auth,
+                            optional_client_cert,
                             client_ca.as_deref(),
                             &state.enabled_ciphers,
                         )
@@ -6637,7 +6769,7 @@ fn engine_begin(state: &mut EngineState) -> Result<(), String> {
                     built?
                 }
                 None => {
-                    if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+                    if crate::nbflags().dbg_tls_auth_ok {
                         eprintln!(
                             "[dbg-tls-auth] engine_begin(default_engine_server_config) need={} want={}",
                             state.need_client_auth, state.want_client_auth
@@ -6906,7 +7038,7 @@ fn engine_run_trust_check(
     } else {
         "checkClientTrusted"
     };
-    let dbg = std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok();
+    let dbg = crate::nbflags().dbg_tls_auth_ok;
     if dbg {
         eprintln!(
             "[dbg-tls-auth] engine_run_trust_check: {} trust manager(s), method={}, chain_len={}, auth_type={}",
@@ -7018,8 +7150,9 @@ fn build_synthetic_ssl_session(ctx: &mut dyn NativeContext, id: i32) -> ObjectRe
             String::new(),
         )
     });
-    // 7-field synthetic session: cipher, protocol, valid, peerHost, peerPort, creationTime, alpn
-    let ses = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSession", 7);
+    // 8-field synthetic session: cipher, protocol, valid, peerHost, peerPort,
+    // creationTime, alpn, attrs (slot 7 — see SSLSESS_ATTRS_SLOT doc comment).
+    let ses = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSession", 8);
     let cipher_s = ctx.create_string(&cipher);
     let proto_s = ctx.create_string(&proto);
     let alpn_s = ctx.create_string(&alpn);
@@ -7046,6 +7179,35 @@ fn build_synthetic_ssl_session(ctx: &mut dyn NativeContext, id: i32) -> ObjectRe
         session_peer_certs_table()
             .lock()
             .insert(gc_stable_objref_key(ctx, ses), peer_chain);
+    }
+    // Associate THIS side's own (local) cert chain so
+    // SSLSession.getLocalCertificates() can return it. Required by Jetty's
+    // SecureRequestCustomizer.getX509() (called from retrieveSni/checkSni on
+    // every HTTPS request): it calls getLocalCertificates() and, on an empty
+    // result, throws `HttpException.RuntimeException(400, "Invalid SNI")`
+    // unconditionally — a server ALWAYS presents a certificate, so an empty
+    // chain here failed every HTTPS request through a `SecureRequestCustomizer`
+    // (JettyServletWebServerFactoryTests/JettyReactiveWebServerFactoryTests).
+    let local_chain_pem = with_engine(id, |s| {
+        s.identity_override
+            .as_ref()
+            .map(|(cert, _)| cert.clone())
+            .or_else(|| {
+                (!s.is_client)
+                    .then(runtime_tls_identity)
+                    .flatten()
+                    .map(|rti| rti.cert_pem)
+            })
+    })
+    .flatten();
+    let local_chain: Vec<Vec<u8>> = local_chain_pem
+        .and_then(|pem| parse_cert_chain_pem(&pem).ok())
+        .map(|certs| certs.iter().map(|c| c.as_ref().to_vec()).collect())
+        .unwrap_or_default();
+    if !local_chain.is_empty() {
+        session_local_certs_table()
+            .lock()
+            .insert(gc_stable_objref_key(ctx, ses), local_chain);
     }
     ses
 }
@@ -7107,7 +7269,7 @@ fn register_engine_impl_natives(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let v = args.get(1).and_then(|x| x.as_int()).unwrap_or(0) != 0;
         let id = engine_id_or_alloc(ctx, this);
-        if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+        if crate::nbflags().dbg_tls_auth_ok {
             let conn_is_some = with_engine(id, |s| s.conn.is_some()).unwrap_or(false);
             eprintln!(
                 "[dbg-tls-auth] DIRECT setNeedClientAuth id={} v={} conn_already_realized={}",
@@ -7374,7 +7536,7 @@ fn register_engine_impl_natives(r: &mut NativeMethodRegistry) {
     r.register(cls_impl, "closeOutbound", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let id = engine_id_or_alloc(ctx, this);
-        if std::env::var("CRATONVM_DBG_TLS_HS").is_ok() {
+        if crate::nbflags().dbg_tls_hs_ok {
             eprintln!(
                 "[dbg-tls-hs] thread={:?} JAVA_CALLED closeOutbound() id={}",
                 std::thread::current().id(),
@@ -7623,7 +7785,7 @@ fn do_wrap(
     dst: ObjectRef,
 ) -> cratonvm_types::error::MethodCallResult {
     let id = engine_id_or_alloc(ctx, this);
-    let __dbg_hs = std::env::var("CRATONVM_DBG_TLS_HS").is_ok();
+    let __dbg_hs = crate::nbflags().dbg_tls_hs_ok;
     if __dbg_hs {
         eprintln!(
             "[dbg-tls-hs] thread={:?} do_wrap ENTER id={}",
@@ -7652,7 +7814,7 @@ fn do_wrap(
         if let Some(s) = g.get_mut(&id) {
             if s.conn.is_none() {
                 if let Err(e) = engine_begin(s) {
-                    if std::env::var("CRATONVM_DBG_TLS_HS").is_ok() {
+                    if crate::nbflags().dbg_tls_hs_ok {
                         eprintln!(
                             "[dbg-tls-hs] thread={:?} do_unwrap/do_wrap id={} RETURN(engine_begin ERROR) err={}",
                             std::thread::current().id(), id, e
@@ -7850,7 +8012,7 @@ fn do_unwrap(
     dsts: Vec<ObjectRef>,
 ) -> cratonvm_types::error::MethodCallResult {
     let id = engine_id_or_alloc(ctx, this);
-    let __dbg_hs = std::env::var("CRATONVM_DBG_TLS_HS").is_ok();
+    let __dbg_hs = crate::nbflags().dbg_tls_hs_ok;
     if __dbg_hs {
         eprintln!(
             "[dbg-tls-hs] thread={:?} do_unwrap ENTER id={}",
@@ -7877,7 +8039,7 @@ fn do_unwrap(
         if let Some(s) = g.get_mut(&id) {
             if s.conn.is_none() {
                 if let Err(e) = engine_begin(s) {
-                    if std::env::var("CRATONVM_DBG_TLS_HS").is_ok() {
+                    if crate::nbflags().dbg_tls_hs_ok {
                         eprintln!(
                             "[dbg-tls-hs] thread={:?} do_unwrap/do_wrap id={} RETURN(engine_begin ERROR) err={}",
                             std::thread::current().id(), id, e
@@ -8062,7 +8224,7 @@ fn do_unwrap(
                     break;
                 }
                 let __pnp_result = conn.process_new_packets();
-                if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+                if crate::nbflags().dbg_tls_auth_ok {
                     eprintln!(
                         "[dbg-tls-auth] do_unwrap id={} process_new_packets -> {} is_handshaking={} peer_certs_present={}",
                         id,
@@ -8353,7 +8515,7 @@ fn register_apply_parameters(r: &mut NativeMethodRegistry) {
                     .as_int()
                     .unwrap_or(0)
                     != 0;
-                if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+                if crate::nbflags().dbg_tls_auth_ok {
                     eprintln!(
                         "[dbg-tls-auth] setSSLParameters id={} need={} want={}",
                         id, need, want
@@ -8506,7 +8668,7 @@ pub(crate) fn set_engine_trust_ctx_key(
 ) {
     let key = ctx_obj_key(ctx, ctx_obj);
     let id = engine_id_or_alloc(ctx, engine_obj);
-    if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+    if crate::nbflags().dbg_tls_auth_ok {
         let has_entry = ctx_trust_managers_table().lock().contains_key(&key);
         eprintln!(
             "[dbg-tls-auth] set_engine_trust_ctx_key engine_id={} ctx_key={} table_has_entry={}",
@@ -8609,7 +8771,7 @@ fn default_ssl_context_slot() -> &'static Mutex<Option<ObjectRef>> {
 /// this SAME object. See `default_ssl_context_slot`'s doc for why identity,
 /// not a copy, is what makes this work.
 pub(crate) fn set_runtime_default_ssl_context(ctx_obj: ObjectRef) {
-    if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+    if crate::nbflags().dbg_tls_auth_ok {
         eprintln!(
             "[dbg-tls-auth] set_runtime_default_ssl_context ptr={:p}",
             ctx_obj.as_ptr()
@@ -8685,6 +8847,27 @@ pub fn register_sslengine_real(r: &mut NativeMethodRegistry) {
 fn session_peer_certs_table() -> &'static Mutex<HashMap<u64, Vec<Vec<u8>>>> {
     static T: OnceLock<Mutex<HashMap<u64, Vec<Vec<u8>>>>> = OnceLock::new();
     T.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Side-table associating an `SSLSession` object with ITS OWN (local) certificate
+/// chain (DER, leaf first) — the mirror-image of `session_peer_certs_table`,
+/// populated by `build_synthetic_ssl_session`. Backs `SSLSession.getLocalCertificates()`
+/// (`phases_late::register_p68_ssl`'s registration, which cannot reach a
+/// `t27_tls`-private table directly — see `local_certs_for_session`/
+/// `record_local_cert_chain` below for the crate-visible accessors).
+fn session_local_certs_table() -> &'static Mutex<HashMap<u64, Vec<Vec<u8>>>> {
+    static T: OnceLock<Mutex<HashMap<u64, Vec<Vec<u8>>>>> = OnceLock::new();
+    T.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Crate-visible accessor for `session_local_certs_table`, used by
+/// `phases_late::register_p68_ssl`'s `getLocalCertificates` registration.
+pub(crate) fn local_certs_for_session(ctx: &dyn NativeContext, session: ObjectRef) -> Vec<Vec<u8>> {
+    session_local_certs_table()
+        .lock()
+        .get(&gc_stable_objref_key(ctx, session))
+        .cloned()
+        .unwrap_or_default()
 }
 
 /// FIX (netty-https-client-trust residual): populate `session_peer_certs_table`
@@ -8850,6 +9033,161 @@ fn register_ssl_session_real(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Long(0)))
         }
     });
+
+    // getValue/putValue/removeValue/getValueNames — the JSSE session-attribute
+    // API. `SSLSession` is an interface with no default body for any of these,
+    // so an un-intercepted call throws AbstractMethodError. Jetty's
+    // `SecureRequestCustomizer.retrieveSni()` calls `getValue()`/`putValue()`
+    // on every SSL request to cache the resolved SNI host, so this previously
+    // failed every HTTPS request that reached `SecureRequestCustomizer`
+    // (`JettyServletWebServerFactoryTests`/`JettyReactiveWebServerFactoryTests`,
+    // both 500s with this exact AbstractMethodError). Backed by a real
+    // `java.util.HashMap` stored in the session's own LAST field (slot
+    // `num_fields - 1`, added to both the 4-field and 8-field shapes above)
+    // rather than a native side-table keyed by object address — normal GC
+    // root-scanning of the (live, reachable) session object keeps arbitrary
+    // attribute VALUES alive for free, avoiding the class of GC-unstable
+    // objref-key bug this file's other side tables have hit.
+    r.register(
+        cls,
+        "getValue",
+        "(Ljava/lang/String;)Ljava/lang/Object;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let name = args.get(1).copied().unwrap_or(Value::Object(None));
+            let slot = ctx.object_num_fields(this) - 1;
+            let map = match ctx.get_field(this, slot) {
+                Value::Object(Some(m)) => m,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            ctx.invoke(
+                "java/util/HashMap",
+                "get",
+                "(Ljava/lang/Object;)Ljava/lang/Object;",
+                &[Value::Object(Some(map)), name],
+            )
+        },
+    );
+    r.register(
+        cls,
+        "putValue",
+        "(Ljava/lang/String;Ljava/lang/Object;)V",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let name = args.get(1).copied().unwrap_or(Value::Object(None));
+            let value = args.get(2).copied().unwrap_or(Value::Object(None));
+            if matches!(name, Value::Object(None)) || matches!(value, Value::Object(None)) {
+                return Err(RuntimeError::NullPointerException {
+                    message: Some("name and value must not be null".into()),
+                }
+                .into());
+            }
+            let map = sslsess_attrs_map(ctx, this)?;
+            ctx.invoke(
+                "java/util/HashMap",
+                "put",
+                "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+                &[Value::Object(Some(map)), name, value],
+            )?;
+            Ok(None)
+        },
+    );
+    r.register(cls, "removeValue", "(Ljava/lang/String;)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let name = args.get(1).copied().unwrap_or(Value::Object(None));
+        let slot = ctx.object_num_fields(this) - 1;
+        let map = match ctx.get_field(this, slot) {
+            Value::Object(Some(m)) => m,
+            _ => return Ok(None),
+        };
+        ctx.invoke(
+            "java/util/HashMap",
+            "remove",
+            "(Ljava/lang/Object;)Ljava/lang/Object;",
+            &[Value::Object(Some(map)), name],
+        )?;
+        Ok(None)
+    });
+    r.register(cls, "getValueNames", "()[Ljava/lang/String;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let empty = |ctx: &mut dyn NativeContext| {
+            Ok(Some(Value::Object(Some(
+                ctx.new_ref_array(cratonvm_types::ClassId::new(0), 0),
+            ))))
+        };
+        let slot = ctx.object_num_fields(this) - 1;
+        let map = match ctx.get_field(this, slot) {
+            Value::Object(Some(m)) => m,
+            _ => return empty(ctx),
+        };
+        let key_set = match ctx.invoke(
+            "java/util/HashMap",
+            "keySet",
+            "()Ljava/util/Set;",
+            &[Value::Object(Some(map))],
+        )? {
+            Some(Value::Object(Some(s))) => s,
+            _ => return empty(ctx),
+        };
+        // `keySet()`'s runtime type is `HashMap$KeySet`, not `HashSet` — resolve
+        // `toArray`'s declaring class dynamically rather than guessing a name,
+        // since a wrong static class name here would use the wrong field/vtable
+        // layout for the dispatch.
+        let key_set_class = ctx.class_id_of_object(key_set);
+        let key_set_class_name = match ctx.class_name_of_id(key_set_class) {
+            Some(n) => n,
+            None => return empty(ctx),
+        };
+        let raw_arr = match ctx.invoke(
+            &key_set_class_name,
+            "toArray",
+            "()[Ljava/lang/Object;",
+            &[Value::Object(Some(key_set))],
+        )? {
+            Some(Value::Object(Some(arr))) => arr,
+            _ => return empty(ctx),
+        };
+        // `Collection.toArray()` reifies as `Object[]`, not `String[]` — real
+        // JDK's own `SSLSessionImpl.getValueNames()` has the same mismatch and
+        // copies into a freshly-typed array rather than returning it directly.
+        // Mirror that: allocate our own array (same `ClassId::new(0)` "generic
+        // String[]" convention already used elsewhere in this file, e.g.
+        // `getEnabledProtocols`) and copy each key across.
+        let len = ctx.array_length(raw_arr);
+        let out = ctx.new_ref_array(cratonvm_types::ClassId::new(0), len);
+        for i in 0..len {
+            ctx.set_array_element(out, i, ctx.get_array_element(raw_arr, i));
+        }
+        Ok(Some(Value::Object(Some(out))))
+    });
+}
+
+/// Lazily allocate (and cache in the session's own last field) the
+/// `java.util.HashMap` backing `SSLSession.putValue`/`getValue`/etc — see the
+/// doc comment on its registration in `register_ssl_session_real`.
+fn sslsess_attrs_map(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+) -> Result<ObjectRef, cratonvm_types::error::MethodCallFailed> {
+    let slot = ctx.object_num_fields(this) - 1;
+    if let Value::Object(Some(map)) = ctx.get_field(this, slot) {
+        return Ok(map);
+    }
+    let this_pin = ctx.pin_native_root(this);
+    let map = match ctx.new_object_initialized("java/util/HashMap", "()V", &[])? {
+        Some(Value::Object(Some(m))) => m,
+        _ => {
+            ctx.unpin_native_roots(this_pin);
+            return Err(RuntimeError::OutOfMemoryError {
+                message: "SSLSession: could not allocate attribute map".into(),
+            }
+            .into());
+        }
+    };
+    let this = ctx.read_native_pin(this_pin, this);
+    ctx.unpin_native_roots(this_pin);
+    ctx.set_field(this, slot, Value::Object(Some(map)));
+    Ok(map)
 }
 
 /// WP5.4 — register ALPN-related natives on SSLParameters. ALPN propagation

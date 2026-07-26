@@ -129,6 +129,17 @@ pub fn osr_backedge_enabled() -> bool {
 /// `CRATONVM_LOADER_AWARE_RESOLUTION` — loader-faithful `CONSTANT_Class`
 /// resolution (ProxyClassReuseTest / IsoProbe family).
 ///
+/// **Loader-identity consolidation:** this used to be one of THREE
+/// independent copies of the same env-var parse (this file, a
+/// `classloading::class_manager` copy, and a `native-builtins::classloader`
+/// copy) — they drifted out of lock-step at least once in production (see
+/// `docs/internal/loader-identity.md`). `cratonvm_classloading::
+/// loader_aware_resolution` is now the single source of truth; this
+/// function is kept (same name, same signature, own doc history below) so
+/// none of ITS callers have to change, but it simply forwards to the
+/// classloading crate's `OnceLock`-cached copy rather than maintaining a
+/// second cache of its own.
+///
 /// **Default: ON** (flipped from off during the `context.groovy` bug-cluster
 /// fix — see below). When on, an implicit class-constant reference (`ldc
 /// X.class`, `new X`, `checkcast`/`instanceof X`, `anewarray X`, and
@@ -200,18 +211,12 @@ pub fn osr_backedge_enabled() -> bool {
 /// off) rather than reverting the loader-aware resolution logic itself, which
 /// is independently correct.
 ///
-/// Empty or `"0"` ⇒ disabled; any other value ⇒ enabled. Read once and cached.
+/// Empty or `"0"` ⇒ disabled; any other value ⇒ enabled. Read once and
+/// cached (in `cratonvm_classloading`'s own `OnceLock` — see the
+/// consolidation note above; this function no longer keeps a second cache).
 #[inline]
 pub fn loader_aware_resolution() -> bool {
-    static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(|| match std::env::var("CRATONVM_LOADER_AWARE_RESOLUTION") {
-        // Explicitly set: preserve the original opt-out semantics (empty or
-        // "0" disables; anything else enables) so `CRATONVM_LOADER_AWARE_
-        // RESOLUTION=0` still forces the old (gate-off) behavior verbatim.
-        Ok(v) => !v.is_empty() && v != "0",
-        // Unset: new default is enabled (see doc comment above).
-        Err(_) => true,
-    })
+    cratonvm_classloading::loader_aware_resolution()
 }
 
 /// `CRATONVM_TIER_OSR_BACKEDGE` — wire-tiered-manager Step 6 — per-frame
@@ -221,7 +226,7 @@ pub fn loader_aware_resolution() -> bool {
 /// default inline-OSR path and the Step-5 background-OSR path (which is why it
 /// is a VM-side env knob, separate from the tiered manager's policy
 /// `osr_threshold`). Lowering it makes hot loops OSR sooner (useful for
-/// gauntlet tuning / quick repros); raising it defers OSR. Invalid/unset →
+/// gauntlet tuning / quick springboot); raising it defers OSR. Invalid/unset →
 /// useful profile/warmup). `None` when unset/invalid, so the caller keeps its
 /// own default (`OSR_THRESHOLD`); `0` clamps to `1`. Read once and cached.
 #[inline]
@@ -429,7 +434,7 @@ cached_is_set!(jit_main_inline, "CRATONVM_JIT_MAIN_INLINE");
 // wire-tiered-manager: OFF-THREAD codegen for the invocation tier-up trigger.
 // When on, the interpreter's invocation tier-up trigger ENQUEUES a
 // `CompilationTask` for the background compile thread (which runs the real
-// codegen via `try_jit_compile_callee` and publishes into `shared.jit_cache`)
+// codegen via `try_jit_compile_callee` and publishes into `shared.jit.jit_cache`)
 // and DOES NOT compile inline on the mutator — the mutator keeps interpreting
 // until the worker publishes, at which point the `jit_cache` fast-path flips the
 // call site to `Jit`. Step-5 OSR likewise compiles off-thread when on.
@@ -464,7 +469,7 @@ pub fn bg_compile() -> bool {
 // wire-tiered-manager Step 4 (PGO handoff C1 → C2): opt-in profile collection.
 // When set, `SharedVm::new` calls `jit::profile::enable_profiling(true)` once at
 // VM init, so the interpreter's existing branch / receiver / back-edge recording
-// sites populate `shared.profile_store` during the interpreted ("C1"/warmup)
+// sites populate `shared.jit.profile_store` during the interpreted ("C1"/warmup)
 // phase. The optimizing C2 compile then consumes that profile — the single-pass
 // backend already biases branch layout + pre-populates virtual-call MICs from it,
 // and (Step 4) the optimizing IR pipeline now reads branch bias too. Default-OFF:
@@ -666,12 +671,67 @@ cached_is_set!(dbg_bytecode_dump, "CRATONVM_DBG_BYTECODE_DUMP");
 /// already registered" duplicate-registration failure).
 cached_is_set!(dbg_dupcall_filter, "CRATONVM_DBG_DUPCALL_FILTER");
 
+/// `CRATONVM_INVOKE_VIRTUAL_ENTRY_TRACE` — AOT management-context trace
+/// (`aotContributedInitializerStartsManagementContext`), on the
+/// `invoke_on_class_shared_inner` lambda-dispatch path.
+///
+/// PERF (2026-07-25): the two call sites read this with an **uncached**
+/// `std::env::var_os` on *every* `invokevirtual` entry, and — because the env
+/// probe was the left operand of the `&&` — paid a `getenv` before the cheap
+/// `method_name ==` compare could short-circuit it. `getenv` takes the process
+/// environ lock and linearly scans environ, so this alone was ~10% of the
+/// CratonBench `hashmap` phase (10M virtual calls). Same class of bug as the
+/// `CRATONVM_DBG_BLOCKGC` note in `vm_exec.rs`. Keep this predicate as the
+/// left operand: a `OnceLock<bool>` read is cheaper than the string compare,
+/// so it short-circuits the common (unset) case in a single load.
+cached_is_set!(invoke_virtual_entry_trace, "CRATONVM_INVOKE_VIRTUAL_ENTRY_TRACE");
+
+// ── PERF 2026-07-25: the five `getenv` hogs found by an LD_PRELOAD tally ──
+//
+// An `LD_PRELOAD` shim counting `getenv()` by name over the CratonBench
+// `hashmap` phase (10M put/get) recorded **~130 million calls**, ≈13 per
+// benchmark iteration:
+//
+//     60,008,062  CRATONVM_DBG_LOADER_TRACE
+//     20,001,011  CRATONVM_DBG_MH_STACK
+//     20,001,011  CRATONVM_DBG_MH_ADAPTER
+//     20,001,005  CRATONVM_DBG_STACKLESS
+//     10,002,013  CRATONVM_DBG_H2TRACE
+//
+// All were uncached `std::env::var`/`var_os` probes sitting on the `new`
+// opcode and `try_stackless_invoke` paths, and most had the env probe as the
+// LEFT operand of an `&&` whose right operand is a cheap string compare — so
+// the `getenv` (which takes the process environ lock and linearly scans
+// environ) ran unconditionally and the cheap test could never short-circuit
+// it. Together they were ~11% of the phase's CPU. Caching is the fix; keep
+// these predicates as the left operand, since a `OnceLock<bool>` read is
+// cheaper than the string compares they guard.
+cached_is_set!(dbg_mh_stack, "CRATONVM_DBG_MH_STACK");
+cached_is_set!(dbg_mh_adapter, "CRATONVM_DBG_MH_ADAPTER");
+cached_is_set!(dbg_stackless, "CRATONVM_DBG_STACKLESS");
+cached_is_set!(dbg_h2trace, "CRATONVM_DBG_H2TRACE");
+
 // ── Flags read via `env::var(...).is_ok()` ──────────────────────────────
 
 /// `CRATONVM_NO_LOCAL_LIVENESS` — disable the per-bci local-variable
 /// liveness filter in the interpreter frame GC root scan (restores the
 /// scan-every-object-typed-slot behaviour; see `runtime::local_liveness`).
 cached_is_ok!(no_local_liveness, "CRATONVM_NO_LOCAL_LIVENESS");
+/// `CRATONVM_DBG_ARRLEN` — diagnostic for a non-array reaching
+/// `NativeContextImpl::array_length`. PERF (2026-07-25): was an uncached
+/// `std::env::var` (which allocates a `String` on a hit and takes the environ
+/// lock either way) evaluated on every `array_length` call whose receiver is
+/// not an array. Cached for the same reason as
+/// [`invoke_virtual_entry_trace`].
+cached_is_ok!(dbg_arrlen, "CRATONVM_DBG_ARRLEN");
+/// `CRATONVM_DBG_LOADER_TRACE` — MVStore `RootReference` loader-identity
+/// trace. The single worst `getenv` offender on the interpreter hot path
+/// (60M calls in one CratonBench `hashmap` run): ~33 uncached call sites,
+/// several on the `new` opcode path. See the tally note above
+/// [`dbg_mh_stack`]. Both `.is_ok()` and `.is_some()` spellings existed at
+/// the call sites; they are equivalent here (the flag is never set to
+/// non-UTF-8), so one predicate serves both.
+cached_is_ok!(dbg_loader_trace, "CRATONVM_DBG_LOADER_TRACE");
 cached_is_ok!(trace_sb_filter, "CRATONVM_TRACE_SB_FILTER");
 cached_is_ok!(nsee_trace, "CRATONVM_NSEE_TRACE");
 cached_is_ok!(iae_trace, "CRATONVM_IAE_TRACE");
@@ -894,6 +954,48 @@ impl RealSelector {
         false
     }
 }
+
+// ── Ad-hoc debug traces on interpreter hot paths ────────────────────────
+//
+// Each of these was an inline `std::env::var_os(...)` sitting on a path the
+// interpreter runs per invoke / per putfield / per `if_acmpne`. An
+// `LD_PRELOAD` `getenv` tally over `RrwlSingle` (300k uncontended
+// `ReentrantReadWriteLock`/`ReentrantLock` lock-unlock pairs, the reduced form
+// of H2 `TestFileSystem.testConcurrent`) counted **6.9 million** `getenv`
+// calls — about 23 per lock/unlock — with these six names accounting for
+// 6,900,696 of them:
+//
+// ```text
+// 4501107  CRATONVM_DBG_GSE                          (invoke-cache lookup, twice per lookup)
+// 1101202  CRATONVM_DBG_FIELD_WATCH                  (every putfield + every field retarget)
+//  599999  CRATONVM_DBG_WATCHREF
+//  398881  CRATONVM_DBG_ASSERTEQ                     (every JIT-ABI invoke)
+//  199000  CRATONVM_EXEC_FRAME_TRACE                 (every frame entry)
+//  100507  CRATONVM_ACTIVE_PROFILES_IDENTITY_TRACE   (every if_acmpne)
+// ```
+//
+// `perf record -F 999` attributed ~3.5% of the run to `getenv` and its
+// callers. This is the same defect class as the 2026-07-23 fix for
+// `callee_saved_gpr_local_homes_enabled()` in `vm/src/jit/skip_list.rs` — see
+// `docs/known-issues/h2/bug-h2-testfilesystem-testconcurrent-async-hang.md`,
+// which is where that one was found and where these were.
+//
+// NOTE: like every other helper in this module, these read the legacy
+// per-flag variable directly rather than through
+// `cratonvm_types::flags()`, so the grouped `CRATONVM_DBG=gse` spelling does
+// not reach them. That is pre-existing behaviour for all 30 helpers here, not
+// something this change introduced; the direct `CRATONVM_DBG_GSE=1` spelling
+// works exactly as before.
+
+cached_is_set!(dbg_gse, "CRATONVM_DBG_GSE");
+cached_is_set!(dbg_field_watch, "CRATONVM_DBG_FIELD_WATCH");
+cached_is_set!(dbg_watchref, "CRATONVM_DBG_WATCHREF");
+cached_is_set!(dbg_asserteq, "CRATONVM_DBG_ASSERTEQ");
+cached_is_set!(exec_frame_trace, "CRATONVM_EXEC_FRAME_TRACE");
+cached_is_set!(
+    active_profiles_identity_trace,
+    "CRATONVM_ACTIVE_PROFILES_IDENTITY_TRACE"
+);
 
 /// Once-initialized accessor for the `CRATONVM_REAL` / `CRATONVM_REAL_JCA`
 /// differential switch. Parses the env vars exactly once; every subsequent

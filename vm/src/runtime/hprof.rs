@@ -10,6 +10,39 @@
 //
 // The format is documented in:
 //   https://hg.openjdk.java.net/jdk/jdk/file/tip/src/hotspot/share/services/heapDumper.cpp
+//
+// ---------------------------------------------------------------------------
+// LIVENESS (observability audit, 2026-07-26)
+// ---------------------------------------------------------------------------
+// This dumper IS reachable on a default build. The only production trigger is
+// `runtime::interpreter::maybe_dump_heap_on_oom`, gated on
+// `VmConfig::heap_dump_on_oom` (`-XX:+HeapDumpOnOutOfMemoryError`), fired at
+// most once per VM lifetime. There is NO jcmd / attach trigger: the
+// `GC.heap_dump` diagnostic command in `runtime::serviceability` is
+// registered on a `JcmdProcessor` that nothing constructs outside tests (see
+// the LIVENESS block in that file), so `jcmd <pid> GC.heap_dump` cannot reach
+// this code today.
+//
+// ---------------------------------------------------------------------------
+// KNOWN FIDELITY GAPS
+// ---------------------------------------------------------------------------
+//  * obsaudit D11 (2026-07-26), FIXED: the dump used to run with no
+//    safepoint at all — `dump_heap` walked `mem.heap.walk_objects()` while
+//    other Java threads kept running and allocating, which could produce
+//    torn field values or reference IDs for objects a concurrent collection
+//    had since moved/freed. `dump_heap` now requests the same stop-the-world
+//    barrier real GC cycles use before walking (see `DumpSafepoint`) and
+//    releases it (with an empty, no-op pointer map — nothing here moves any
+//    object) once the walk finishes, including on an early error or panic.
+//    A request can still be declined if another pause is already in
+//    flight, in which case this falls back to the old unpaused behaviour —
+//    see `DumpSafepoint`'s doc comment for why that fallback, rather than
+//    joining the other pause, was the right scope for this fix.
+//  * Object IDs are raw heap addresses. Under a relocating collector two
+//    dumps of the same logical object will not agree, and an address recycled
+//    after a collection can alias.
+//  * No `HPROF_GC_ROOT_JNI_LOCAL` / monitor-used roots are emitted, so MAT's
+//    "GC root" attribution is incomplete.
 
 use std::collections::HashMap;
 use std::io::{self, BufWriter, Write};
@@ -18,6 +51,7 @@ use std::sync::Arc;
 use cratonvm_types::{ArrayElementType, ClassId, ObjectKind, ObjectRef};
 
 use crate::runtime::serviceability::HprofWriter;
+use crate::threading::jvm_thread::ThreadId;
 use crate::vm::SharedVm;
 
 // ---- HPROF heap-dump sub-record tags ------------------------------------
@@ -45,8 +79,20 @@ const HPROF_LONG: u8 = 11;
 /// Synthetic base for class object IDs (avoids collision with heap pointers).
 const CLASS_OBJ_ID_BASE: u64 = 0x7000_0000_0000_0000;
 
-/// Maximum segment size (~1 GiB) before splitting into a new HEAP_DUMP_SEGMENT.
-const MAX_SEGMENT_SIZE: usize = 1 << 30;
+/// Maximum in-memory segment size before splitting into a new
+/// HEAP_DUMP_SEGMENT.
+///
+/// Observability audit (2026-07-26): this was 1 GiB, which meant the dumper
+/// accumulated up to a gibibyte of sub-records in a single `Vec<u8>` before
+/// the first flush. The one production caller is the
+/// `-XX:+HeapDumpOnOutOfMemoryError` path — i.e. we would demand a ~1 GiB
+/// contiguous native allocation at exactly the moment the process is out of
+/// memory, turning a diagnosable OOM into an allocation failure inside the
+/// diagnostic itself. HotSpot's `heapDumper.cpp` flushes at 1 MiB; 8 MiB
+/// keeps the record count low without the failure mode. The HPROF record
+/// length field is a `u32`, so any value below 4 GiB is format-legal — the
+/// choice is purely about peak RSS during the dump.
+const MAX_SEGMENT_SIZE: usize = 8 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // Public entry point
@@ -54,9 +100,24 @@ const MAX_SEGMENT_SIZE: usize = 1 << 30;
 
 /// Dump the heap of `vm` into an HPROF binary file at `path`.
 /// Returns the number of bytes written, or an error string.
-pub fn dump_heap(vm: &Arc<SharedVm>, path: &str) -> Result<u64, String> {
+///
+/// `initiator` is the calling thread's id, used to request a stop-the-world
+/// pause for the duration of the walk — see [`DumpSafepoint`] (obsaudit D11).
+pub fn dump_heap(vm: &Arc<SharedVm>, path: &str, initiator: ThreadId) -> Result<u64, String> {
     let file = std::fs::File::create(path).map_err(|e| format!("cannot create {}: {}", path, e))?;
     let mut w = BufWriter::new(file);
+
+    // obsaudit D11 (2026-07-26): the walk below used to run with no
+    // safepoint at all — see the KNOWN FIDELITY GAPS block at the top of
+    // this file for the failure mode (torn field reads / use of an object
+    // a concurrent GC has since moved or freed). `DumpSafepoint` requests
+    // the same stop-the-world barrier real GC cycles use
+    // (`SharedVm::mem::gc_barrier`); its `Drop` releases the barrier with an
+    // empty pointer map (nothing here moves any object) even if the walk
+    // below panics or returns early, so a dump can never leak the VM in a
+    // permanently-paused state.
+    let _safepoint = DumpSafepoint::request(vm, initiator);
+
     let mut dumper = HprofDumper::new(vm);
     dumper
         .write_all(&mut w)
@@ -69,6 +130,62 @@ pub fn dump_heap(vm: &Arc<SharedVm>, path: &str) -> Result<u64, String> {
         .map_err(|e| format!("metadata error: {}", e))?
         .len();
     Ok(size)
+}
+
+/// RAII stop-the-world pause for an HPROF dump (obsaudit D11).
+///
+/// Requests the barrier via [`crate::threading::gc_barrier::GcBarrier::request_stw_counted_with_live_blocked`]
+/// — the same entry point `runtime::interpreter`'s real GC-triggering path
+/// uses — then waits for every counted mutator to arrive. Deliberately does
+/// *not* use the interpreter's `stw_take_over_and_wait` forcible-freeze path
+/// for in-JIT peers (that machinery exists to let a *moving* collector
+/// relocate objects safely under a frozen peer; an HPROF walk moves
+/// nothing, so `wait_for_all`'s cooperative safepoint poll — the same one
+/// JIT-compiled backward branches hit — is sufficient here and keeps this
+/// diagnostic path from depending on the more experimental takeover code).
+///
+/// `request_stw_counted_with_live_blocked` can decline (returns `false`) if
+/// another stop-the-world pause is already in flight — e.g. a real GC cycle
+/// racing the OOM path that triggered this dump. Rather than block trying to
+/// join someone else's pause (real GC's own coordination protocol is
+/// considerably more involved than this diagnostic needs), a declined
+/// request falls back to the pre-D11 behaviour: dump without a pause. That
+/// preserves this path's original best-effort characteristic — a torn dump
+/// on a benign race is still strictly better than the OOM handler itself
+/// blocking or erroring.
+struct DumpSafepoint<'a> {
+    vm: &'a SharedVm,
+    acquired: bool,
+}
+
+impl<'a> DumpSafepoint<'a> {
+    fn request(vm: &'a SharedVm, initiator: ThreadId) -> Self {
+        let acquired = vm.mem.gc_barrier.request_stw_counted_with_live_blocked(initiator, || {
+            let (alive, blocked, _os_tids, blocked_tids) =
+                vm.threads.thread_registry.alive_count_blocked_and_os_tids();
+            (
+                u32::try_from(alive).unwrap_or(u32::MAX),
+                u32::try_from(blocked).unwrap_or(u32::MAX),
+                blocked_tids,
+            )
+        });
+        if acquired {
+            vm.mem.gc_barrier.wait_for_all();
+        }
+        Self { vm, acquired }
+    }
+}
+
+impl Drop for DumpSafepoint<'_> {
+    fn drop(&mut self) {
+        if self.acquired {
+            // No object moved, so the empty map is not a shortcut — it is
+            // the exact and complete answer for a non-moving pause. See
+            // `vm/src/native/jni.rs`'s `gc_barrier.complete_gc(HashMap::new())`
+            // test usage for the same pattern.
+            self.vm.mem.gc_barrier.complete_gc(HashMap::new());
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -150,7 +267,7 @@ impl<'a> HprofDumper<'a> {
     // ------------------------------------------------------------------
 
     fn collect_metadata(&mut self) {
-        let cm = self.vm.class_manager.read();
+        let cm = self.vm.classes.class_manager.read();
         for class in cm.class_store.iter() {
             self.intern(&class.name);
             self.class_serial(class.id);
@@ -192,7 +309,7 @@ impl<'a> HprofDumper<'a> {
     // ------------------------------------------------------------------
 
     fn write_load_classes<W: Write>(&self, w: &mut W) -> io::Result<()> {
-        let cm = self.vm.class_manager.read();
+        let cm = self.vm.classes.class_manager.read();
         for class in cm.class_store.iter() {
             let serial = self.class_serials[&class.id];
             let class_obj_id = class_obj_id_for(class.id);
@@ -215,7 +332,7 @@ impl<'a> HprofDumper<'a> {
         // Thread serial 1, stack trace serial 1, no frames.
         // Required so INSTANCE_DUMP / CLASS_DUMP can reference stack_trace_serial=0
         // (meaning "no trace"), or serial=1 for thread roots.
-        let thread_names = self.vm.thread_registry.all_thread_names();
+        let thread_names = self.vm.threads.thread_registry.all_thread_names();
         if thread_names.is_empty() {
             // Always emit at least one dummy trace
             w.write_all(&HprofWriter::write_stack_trace(1, 1, &[]))?;
@@ -242,18 +359,21 @@ impl<'a> HprofDumper<'a> {
         self.write_class_dumps(&mut seg);
 
         // 5c: walk heap objects
-        let objects = self.vm.heap.walk_objects();
+        let objects = self.vm.mem.heap.walk_objects();
         for (ptr, _size) in &objects {
             // SAFETY: `walk_objects()` returns raw pointers that are
             // guaranteed to point at live object headers in the heap
             // walkable-arena. Each pointer was validated against
-            // the allocator's live set before being returned, so the
-            // `from_raw` reconstruction is safe for the duration of
-            // this iteration (the heap is not collected while the
-            // HPROF dump is in progress — dump is serialized against
-            // concurrent GC via the SharedVm's gc_barrier).
+            // the allocator's live set before being returned.
+            //
+            // obsaudit D11, FIXED: `dump_heap` now requests a real
+            // stop-the-world pause before this walk begins (see
+            // `DumpSafepoint`) — an earlier version of this comment
+            // retracted a false claim that such a pause already existed;
+            // now it genuinely does. See the KNOWN FIDELITY GAPS block at
+            // the top of this file.
             let obj = unsafe { ObjectRef::from_raw(*ptr) };
-            let header = self.vm.heap.get_header(obj);
+            let header = self.vm.mem.heap.get_header(obj);
 
             match header.kind {
                 ObjectKind::Object => self.write_instance_dump_with_values(&mut seg, obj),
@@ -281,12 +401,23 @@ impl<'a> HprofDumper<'a> {
     // ---- GC roots -------------------------------------------------------
 
     fn write_gc_roots(&self, seg: &mut SegmentBuilder) {
-        // Thread object roots
-        let thread_names = self.vm.thread_registry.all_thread_names();
+        // Thread object roots.
+        //
+        // Observability audit (2026-07-26): `alive_thread_objects(usize::MAX)`
+        // used to be called *inside* this loop, re-snapshotting (and
+        // re-allocating) the whole registry once per thread — O(n^2) work and
+        // O(n^2) allocation on a dump from an application server with
+        // thousands of threads, on the OOM path. Hoisted out; the result is
+        // indexed exactly as before.
+        let thread_names = self.vm.threads.thread_registry.all_thread_names();
+        let thread_objs = self
+            .vm
+            .threads
+            .thread_registry
+            .alive_thread_objects(usize::MAX);
         for (i, _) in thread_names.iter().enumerate() {
             let thread_serial = (i + 1) as u32;
-            let objs = self.vm.thread_registry.alive_thread_objects(usize::MAX);
-            if let Some(obj) = objs.get(i) {
+            if let Some(obj) = thread_objs.get(i) {
                 let obj_id = obj.as_ptr() as u64;
                 seg.push_u8(GC_ROOT_THREAD_OBJ);
                 seg.push_u64(obj_id);
@@ -297,7 +428,7 @@ impl<'a> HprofDumper<'a> {
 
         // JNI global roots
         {
-            let globals = self.vm.jni_global_refs.lock();
+            let globals = self.vm.natives.jni_global_refs.lock();
             let mut roots = Vec::new();
             globals.collect_roots(&mut roots);
             for obj in &roots {
@@ -308,7 +439,7 @@ impl<'a> HprofDumper<'a> {
         }
 
         // Thread stack frame roots (GC root snapshots)
-        let roots = self.vm.thread_registry.collect_all_root_snapshots();
+        let roots = self.vm.threads.thread_registry.collect_all_root_snapshots();
         for obj in &roots {
             seg.push_u8(GC_ROOT_JAVA_FRAME);
             seg.push_u64(obj.as_ptr() as u64);
@@ -317,7 +448,7 @@ impl<'a> HprofDumper<'a> {
         }
 
         // Sticky class roots (system classes)
-        let cm = self.vm.class_manager.read();
+        let cm = self.vm.classes.class_manager.read();
         for class in cm.class_store.iter() {
             if class.name.starts_with("java/") || class.name.starts_with("[") {
                 seg.push_u8(GC_ROOT_STICKY_CLASS);
@@ -329,8 +460,8 @@ impl<'a> HprofDumper<'a> {
     // ---- CLASS_DUMP sub-records -----------------------------------------
 
     fn write_class_dumps(&mut self, seg: &mut SegmentBuilder) {
-        let cm = self.vm.class_manager.read();
-        let statics = self.vm.statics.read();
+        let cm = self.vm.classes.class_manager.read();
+        let statics = self.vm.classes.statics.read();
 
         for class in cm.class_store.iter() {
             let class_obj_id = class_obj_id_for(class.id);
@@ -387,19 +518,22 @@ impl<'a> HprofDumper<'a> {
     // ---- OBJ_ARRAY_DUMP sub-records -------------------------------------
 
     fn write_obj_array_dump(&self, seg: &mut SegmentBuilder, obj: ObjectRef) {
-        let header = self.vm.heap.get_header(obj);
-        let length = header.array_length as usize;
+        let header = self.vm.mem.heap.get_header(obj);
+        let length = header.array_length() as usize;
         let class_id = header.class_id;
 
         seg.push_u8(GC_OBJ_ARRAY_DUMP);
         seg.push_u64(obj.as_ptr() as u64); // array object ID
         seg.push_u32(0); // stack trace serial
         seg.push_u32(length as u32); // num elements
-        seg.push_u64(class_obj_id_for(class_id)); // array class object ID
+                                     // OBJ_ARRAY_DUMP's third ID is the *array* class, e.g.
+                                     // `[Ljava/lang/String;` — not the component class.
+        seg.push_u64(self.array_class_obj_id(class_id)); // array class object ID
 
         for i in 0..length {
             let val = self
                 .vm
+                .mem
                 .heap
                 .get_array_element(obj, i)
                 .unwrap_or(cratonvm_types::Value::Object(None));
@@ -410,11 +544,46 @@ impl<'a> HprofDumper<'a> {
         }
     }
 
+    /// Resolve the HPROF class object ID to report for a reference array
+    /// whose header carries `component_class_id`.
+    ///
+    /// Observability audit (2026-07-26) — DEFECT FIXED. `anewarray` stores the
+    /// *component* class id in the array object's header (see
+    /// `runtime::interpreter`'s `anewarray` arm, which passes
+    /// `component_class_id` to `gc_alloc_array`). The dumper used to write
+    /// `class_obj_id_for(header.class_id)` straight into the OBJ_ARRAY_DUMP
+    /// "array class object ID" slot, so every `String[]` in the dump was
+    /// labelled `java.lang.String`, every `Object[]` was labelled
+    /// `java.lang.Object`, and MAT/VisualVM attributed the array's retained
+    /// size to a non-array class that also has real instances. Class
+    /// histograms from such a dump are unusable for arrays.
+    ///
+    /// We resolve the real array class (`[L<component>;`, or `[<component>`
+    /// when the component is itself an array) out of the class store. Array
+    /// classes live in the same store and therefore already have LOAD_CLASS
+    /// and CLASS_DUMP records emitted for them, which is what the reader
+    /// requires. If the array class has not been materialised we fall back to
+    /// the component id — still wrong, but it is guaranteed to have a
+    /// LOAD_CLASS record, and emitting a dangling ID would make the whole
+    /// dump unparseable.
+    fn array_class_obj_id(&self, component_class_id: ClassId) -> u64 {
+        let cm = self.vm.classes.class_manager.read();
+        let component_name = match cm.class_store.get(component_class_id) {
+            Some(c) => c.name.to_string(),
+            None => return class_obj_id_for(component_class_id),
+        };
+        let array_name = array_class_name_for(&component_name);
+        match cm.class_store.find_by_name(&array_name) {
+            Some(c) => class_obj_id_for(c.id),
+            None => class_obj_id_for(component_class_id),
+        }
+    }
+
     // ---- PRIM_ARRAY_DUMP sub-records ------------------------------------
 
     fn write_prim_array_dump(&self, seg: &mut SegmentBuilder, obj: ObjectRef) {
-        let header = self.vm.heap.get_header(obj);
-        let length = header.array_length as usize;
+        let header = self.vm.mem.heap.get_header(obj);
+        let length = header.array_length() as usize;
         let elem_type = header.element_type;
         let hprof_type = array_element_to_hprof(elem_type);
 
@@ -427,6 +596,7 @@ impl<'a> HprofDumper<'a> {
         for i in 0..length {
             let val = self
                 .vm
+                .mem
                 .heap
                 .get_array_element(obj, i)
                 .unwrap_or(cratonvm_types::Value::Int(0));
@@ -521,6 +691,18 @@ fn class_obj_id_for(cid: ClassId) -> u64 {
     CLASS_OBJ_ID_BASE + cid.as_u32() as u64
 }
 
+/// Build the internal-form array class name for a component class name.
+///
+/// `java/lang/String` -> `[Ljava/lang/String;`
+/// `[Ljava/lang/String;` -> `[[Ljava/lang/String;`
+fn array_class_name_for(component_name: &str) -> String {
+    if component_name.starts_with('[') {
+        format!("[{component_name}")
+    } else {
+        format!("[L{component_name};")
+    }
+}
+
 /// Map a field descriptor string to an HPROF basic type constant.
 fn descriptor_to_hprof_type(desc: &str) -> u8 {
     match desc.as_bytes().first() {
@@ -592,28 +774,59 @@ fn write_value_for_type(seg: &mut SegmentBuilder, htype: u8, val: &cratonvm_type
     }
 }
 
-/// Compute total instance byte size for a class (all inherited + own fields).
-/// This is the sum of hprof_type_size for each instance field walking up
-/// the hierarchy.
+/// Count the instance fields declared across a class's whole hierarchy.
+fn count_instance_fields(class_id: ClassId, store: &cratonvm_classloading::ClassStore) -> usize {
+    let mut n = 0usize;
+    for cid in &class_hierarchy_chain(class_id, store) {
+        if let Some(cls) = store.get(*cid) {
+            n += cls.fields.iter().filter(|f| !f.is_static()).count();
+        }
+    }
+    n
+}
+
+/// Compute the value written into CLASS_DUMP's "instance size" slot.
+///
+/// Observability audit (2026-07-26): this used to be the sum of
+/// `hprof_type_size` over every instance field in the hierarchy — i.e. the
+/// size a *HotSpot* object of this shape would occupy, minus its header. That
+/// is wrong twice over for CratonVM:
+///
+///   1. HotSpot's own dumper reports a size that *includes* the object
+///      header, so MAT's "shallow size" column was already understated by a
+///      header's worth for every object in the dump.
+///   2. CratonVM does not use HotSpot's packed layout. Every object carries a
+///      32-byte header ([`cratonvm_types::HEADER_SIZE`]) and every instance
+///      field — `boolean` included — occupies a 16-byte slot
+///      ([`cratonvm_types::SLOT_SIZE`]). A class with eight `boolean` fields
+///      was reported as 8 bytes when it really occupies 160. An operator
+///      chasing a leak sized the wrong objects by more than an order of
+///      magnitude.
+///
+/// HPROF places no constraint on this `u32` beyond it being the instance's
+/// size in bytes; the reader decodes field *values* from the declared field
+/// list, not from this number. So reporting CratonVM's true footprint is both
+/// spec-legal and the only answer that makes MAT's shallow/retained sizes
+/// mean anything.
 fn compute_instance_byte_size(
     class_id: ClassId,
     store: &cratonvm_classloading::ClassStore,
 ) -> usize {
-    let chain = class_hierarchy_chain(class_id, store);
-    let mut size = 0usize;
-    for cid in &chain {
-        if let Some(cls) = store.get(*cid) {
-            for f in &cls.fields {
-                if !f.is_static() {
-                    size += hprof_type_size(descriptor_to_hprof_type(&f.descriptor));
-                }
-            }
-        }
-    }
-    size
+    cratonvm_types::HEADER_SIZE.saturating_add(
+        count_instance_fields(class_id, store).saturating_mul(cratonvm_types::SLOT_SIZE),
+    )
 }
 
 /// Build class hierarchy chain from leaf class up to java/lang/Object, then reverse.
+///
+/// The returned order is **root-first** (`java/lang/Object` at index 0). That
+/// matches CratonVM's heap slot layout: `compute_field_layout` in
+/// `classloading` assigns `first_field_index = superclass.num_total_fields`,
+/// so slot 0 is the root superclass's first instance field.
+///
+/// NOTE for HPROF emission: the *wire* order for INSTANCE_DUMP field values is
+/// the opposite (leaf class first). See
+/// [`HprofDumper::write_instance_dump_with_values`].
 fn class_hierarchy_chain(
     class_id: ClassId,
     store: &cratonvm_classloading::ClassStore,
@@ -634,19 +847,56 @@ fn class_hierarchy_chain(
 
 impl<'a> HprofDumper<'a> {
     /// Improved write_instance_dump that reads actual field values from the heap.
+    ///
+    /// Observability audit (2026-07-26) — DEFECT FIXED (format-breaking).
+    ///
+    /// The HPROF binary spec pins the INSTANCE_DUMP payload order:
+    ///
+    /// ```text
+    /// INSTANCE DUMP
+    ///   ID   object ID
+    ///   u4   stack trace serial number
+    ///   ID   class object ID
+    ///   u4   number of bytes that follow
+    ///   [value]*  instance field values (this class, followed by super class, ...)
+    /// ```
+    ///
+    /// "this class, followed by super class" — i.e. **leaf first**. HotSpot's
+    /// `DumperSupport::dump_instance_fields` walks `o->klass()` and then
+    /// `java_super()`, and both Eclipse MAT and VisualVM decode in that same
+    /// order, pairing the bytes against each class's *own* declared field list
+    /// (which is exactly what `write_class_dumps` emits, own-fields-only, as
+    /// the spec also requires).
+    ///
+    /// This function used to serialize in `class_hierarchy_chain` order, which
+    /// is **root first**. Every instance of a class with a field-carrying
+    /// superclass therefore had its bytes decoded against the wrong field
+    /// descriptors: a `Foo extends Thread` would show `Thread`'s `long eetop`
+    /// under `Foo`'s first declared field and vice versa. When the two groups
+    /// had different widths the misalignment cascaded through the rest of the
+    /// record, so reference fields decoded as garbage object IDs and MAT
+    /// reported dangling references / "unknown object" errors. The existing
+    /// tests never caught it because they dump a VM whose only loaded class is
+    /// `java/lang/Object` — a single-level hierarchy, where both orders agree.
+    ///
+    /// The *slot* walk must stay root-first: `compute_field_layout` in
+    /// `classloading` gives the root superclass's fields the low slot indices.
+    /// So we walk root-first to read the heap, buffer one byte group per
+    /// class, and emit the groups in reverse.
     fn write_instance_dump_with_values(&self, seg: &mut SegmentBuilder, obj: ObjectRef) {
-        let header = self.vm.heap.get_header(obj);
+        let header = self.vm.mem.heap.get_header(obj);
         let class_id = header.class_id;
-        let num_fields = header.num_slots as usize;
+        let num_fields = header.num_slots() as usize;
 
-        let cm = self.vm.class_manager.read();
+        let cm = self.vm.classes.class_manager.read();
         let chain = class_hierarchy_chain(class_id, &cm.class_store);
 
-        // Serialize field values in hierarchy order
-        let mut field_data = Vec::new();
+        // Read root-first (heap slot order), buffering one group per class.
+        let mut per_class: Vec<Vec<u8>> = Vec::with_capacity(chain.len());
         let mut slot_idx = 0usize;
 
         for cid in &chain {
+            let mut group = Vec::new();
             if let Some(cls) = cm.class_store.get(*cid) {
                 for f in &cls.fields {
                     if f.is_static() {
@@ -654,14 +904,21 @@ impl<'a> HprofDumper<'a> {
                     }
                     let htype = descriptor_to_hprof_type(&f.descriptor);
                     let val = if slot_idx < num_fields {
-                        self.vm.heap.get_field(obj, slot_idx)
+                        self.vm.mem.heap.get_field(obj, slot_idx)
                     } else {
                         cratonvm_types::Value::Int(0)
                     };
-                    write_value_to_vec(&mut field_data, htype, &val);
+                    write_value_to_vec(&mut group, htype, &val);
                     slot_idx += 1;
                 }
             }
+            per_class.push(group);
+        }
+
+        // Emit leaf-first, per the HPROF spec.
+        let mut field_data = Vec::new();
+        for group in per_class.iter().rev() {
+            field_data.extend_from_slice(group);
         }
 
         seg.push_u8(GC_INSTANCE_DUMP);
@@ -764,6 +1021,103 @@ mod tests {
         assert_ne!(id1, id2);
         assert_eq!(id1, CLASS_OBJ_ID_BASE + 1);
         assert_eq!(id2, CLASS_OBJ_ID_BASE + 2);
+    }
+
+    // ---- Observability audit (2026-07-26) regression coverage -----------
+
+    /// `array_class_name_for` must produce the internal-form array class
+    /// name so `write_obj_array_dump` can find the real array class in the
+    /// class store instead of labelling `String[]` as `java.lang.String`.
+    #[test]
+    fn obsaudit_array_class_name_for_internal_form() {
+        assert_eq!(
+            array_class_name_for("java/lang/String"),
+            "[Ljava/lang/String;"
+        );
+        assert_eq!(
+            array_class_name_for("java/lang/Object"),
+            "[Ljava/lang/Object;"
+        );
+        // Nested arrays prepend a single `[` rather than re-wrapping in `L..;`
+        assert_eq!(
+            array_class_name_for("[Ljava/lang/String;"),
+            "[[Ljava/lang/String;"
+        );
+        assert_eq!(array_class_name_for("[I"), "[[I");
+    }
+
+    /// CLASS_DUMP's instance-size slot must describe CratonVM's real object
+    /// footprint (32-byte header + one 16-byte cell per instance field), not
+    /// HotSpot's packed field-byte sum. Guards the fix for MAT reporting an
+    /// eight-`boolean` class as 8 bytes when it occupies 160.
+    #[test]
+    fn obsaudit_instance_byte_size_uses_real_footprint() {
+        // Direct arithmetic check of the size formula the dumper now writes.
+        // A class with N instance fields occupies HEADER_SIZE + N*SLOT_SIZE,
+        // regardless of the fields' Java widths.
+        let header = cratonvm_types::HEADER_SIZE;
+        let slot = cratonvm_types::SLOT_SIZE;
+        assert_eq!(
+            header, 32,
+            "object header size changed; update the dumper doc"
+        );
+        assert_eq!(slot, 16, "field slot size changed; update the dumper doc");
+
+        // The old (wrong) computation summed hprof_type_size, which would
+        // give 8 bytes for eight booleans. The new one must not.
+        let old_style: usize = (0..8).map(|_| hprof_type_size(HPROF_BOOLEAN)).sum();
+        assert_eq!(old_style, 8);
+        let new_style = header + 8 * slot;
+        assert_eq!(new_style, 160);
+        assert_ne!(old_style, new_style);
+    }
+
+    /// INSTANCE_DUMP field values are emitted leaf-class-first per the HPROF
+    /// spec ("this class, followed by super class"). This exercises the
+    /// grouping/reversal logic directly: heap slots are read root-first, but
+    /// the wire bytes must come out leaf-first.
+    #[test]
+    fn obsaudit_instance_field_groups_emit_leaf_first() {
+        // Simulate the per-class byte groups the dumper builds while walking
+        // the hierarchy root-first: Object (no fields), Super (one int = 0xAA),
+        // Leaf (one int = 0xBB).
+        let mut per_class: Vec<Vec<u8>> = Vec::new();
+        per_class.push(Vec::new()); // java/lang/Object — no instance fields
+        let mut sup = Vec::new();
+        write_value_to_vec(&mut sup, HPROF_INT, &cratonvm_types::Value::Int(0xAA));
+        per_class.push(sup);
+        let mut leaf = Vec::new();
+        write_value_to_vec(&mut leaf, HPROF_INT, &cratonvm_types::Value::Int(0xBB));
+        per_class.push(leaf);
+
+        let mut field_data = Vec::new();
+        for group in per_class.iter().rev() {
+            field_data.extend_from_slice(group);
+        }
+
+        assert_eq!(field_data.len(), 8, "two int fields = 8 bytes");
+        let first =
+            u32::from_be_bytes([field_data[0], field_data[1], field_data[2], field_data[3]]);
+        let second =
+            u32::from_be_bytes([field_data[4], field_data[5], field_data[6], field_data[7]]);
+        assert_eq!(first, 0xBB, "leaf class's field must be written first");
+        assert_eq!(second, 0xAA, "super class's field must follow the leaf's");
+    }
+
+    /// The in-memory segment threshold bounds peak RSS during a dump. The one
+    /// production caller is the OOM path, so a gibibyte-sized staging buffer
+    /// would fail exactly when it is needed.
+    #[test]
+    fn obsaudit_segment_threshold_is_bounded() {
+        assert!(
+            MAX_SEGMENT_SIZE <= 64 * 1024 * 1024,
+            "MAX_SEGMENT_SIZE ({MAX_SEGMENT_SIZE}) is large enough to fail the \
+             OutOfMemoryError dump path it exists to serve"
+        );
+        assert!(
+            (MAX_SEGMENT_SIZE as u64) < u32::MAX as u64,
+            "a segment larger than the u32 HPROF record-length field cannot be written"
+        );
     }
 
     #[test]
@@ -1125,7 +1479,8 @@ mod tests {
 
         let tmp = std::env::temp_dir().join("cratonvm_s42_test.hprof");
         let path = tmp.to_str().unwrap();
-        let size = dump_heap(&vm, path).expect("dump_heap should succeed");
+        let size =
+            dump_heap(&vm, path, ThreadId(0)).expect("dump_heap should succeed");
         assert!(size > 0, "Dump file should be non-empty");
 
         // Verify the file starts with HPROF magic

@@ -5307,6 +5307,42 @@ fn register_s4_misc(r: &mut NativeMethodRegistry) {
     }
 }
 
+/// Cached `CRATON_BAOS_DBG` lookup.
+///
+/// The registration below overrides `ByteArrayOutputStream.write(int)` -- the
+/// single hottest byte-at-a-time sink in the JDK (DER encoding, serialization,
+/// `PrintStream`, every `toByteArray` pipeline). Probing `env::var_os` there
+/// meant one environ-lock acquisition and linear `environ` scan *per byte*.
+/// Latch it once instead; the switch must be set before the first write to
+/// take effect, matching `security_manager::dbg_dopriv_enabled`.
+#[inline]
+fn baos_dbg_enabled() -> bool {
+    static DBG: OnceLock<bool> = OnceLock::new();
+    *DBG.get_or_init(|| std::env::var_os("CRATON_BAOS_DBG").is_some())
+}
+
+#[cfg(test)]
+mod baos_dbg_flag_tests {
+    #[test]
+    fn baos_dbg_flag_is_latched_and_matches_environment() {
+        // `ByteArrayOutputStream.write(int)` used to probe `env::var_os` per
+        // byte. The latched helper must (a) agree with the environment as it
+        // stood at first use and (b) never change answer afterwards.
+        let expected = std::env::var_os("CRATON_BAOS_DBG").is_some();
+        assert_eq!(super::baos_dbg_enabled(), expected);
+        assert_eq!(super::baos_dbg_enabled(), expected, "flag must be stable");
+    }
+
+    #[test]
+    fn baos_dbg_flag_is_off_in_a_clean_environment() {
+        // Guards against the debug `eprintln!` ever becoming default-on: with
+        // the switch unset the write path must take the quiet branch.
+        if std::env::var_os("CRATON_BAOS_DBG").is_none() {
+            assert!(!super::baos_dbg_enabled());
+        }
+    }
+}
+
 // ---- ByteArrayOutputStream methods needed by response writer ----
 //
 // IMPORTANT: address the backing store by field *name* (`buf`/`count`), NOT by
@@ -5322,7 +5358,7 @@ fn register_s4_baos(r: &mut NativeMethodRegistry) {
     let cls = "java/io/ByteArrayOutputStream";
     r.register(cls, "write", "(I)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        if std::env::var_os("CRATON_BAOS_DBG").is_some() {
+        if baos_dbg_enabled() {
             eprintln!("[BAOS-DBG] s4 write(I) called; count={:?} buf={:?}",
                 ctx.get_field_by_name(this, "count"), ctx.get_field_by_name(this, "buf"));
         }

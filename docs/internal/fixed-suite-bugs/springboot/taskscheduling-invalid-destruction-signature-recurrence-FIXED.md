@@ -23,7 +23,7 @@ but context failed to start:
 
 ## Discrepancy with an existing RESOLVED doc
 
-[`docs/internal/fixed-suite-bugs/spring-disposablebeanadapter-invalid-destruction-signature-cluster-RESOLVED.md`](../spring-disposablebeanadapter-invalid-destruction-signature-cluster-RESOLVED.md)
+[`../spring/spring-disposablebeanadapter-invalid-destruction-signature-cluster-RESOLVED.md`](../spring/spring-disposablebeanadapter-invalid-destruction-signature-cluster-RESOLVED.md)
 covers the **identical error text and bean name shape** ("Invalid
 destruction signature", `AbstractAutowireCapableBeanFactory.doCreateBean`'s
 generic destroy-method-resolution catch handler), across a 34-class cluster

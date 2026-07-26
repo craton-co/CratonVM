@@ -504,6 +504,12 @@ impl DeoptimizationLog {
         }
     }
 
+    /// Release deoptimization history for methods owned by an unloaded class.
+    pub fn clear_class(&mut self, class_name: &str) {
+        let prefix = format!("{class_name}.");
+        self.history.retain(|method, _| !method.starts_with(&prefix));
+    }
+
     /// Recommend a deopt action based on current history and the triggering reason.
     ///
     /// The `reason` parameter influences the recommended action:
@@ -650,6 +656,16 @@ impl InvalidationManager {
             leaf_class_index: FxHashMap::default(),
             unique_method_index: FxHashMap::default(),
         }
+    }
+
+    /// Drop all hierarchy assumptions after class unloading. Unloading is rare
+    /// and invalidates both owners and dependants, so a conservative reset is
+    /// smaller and safer than retaining strings that may name dead metadata.
+    pub fn clear_all(&mut self) {
+        self.assumptions.clear();
+        self.class_dependencies.clear();
+        self.leaf_class_index.clear();
+        self.unique_method_index.clear();
     }
 
     /// Register an assumption made while compiling `method`.
@@ -1242,14 +1258,12 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-/// Read-once: is `CRATONVM_JIT_FREE_CODE` set (the A/B mode that actually
-/// frees evicted artifacts and their deopt-point boxes)? Mirrors the reads in
-/// `ExecutableBuffer::drop` / `CompiledMethod::drop` (jit/src/lib.rs); in the
-/// default retain-everything mode this is `false` and superseded artifacts'
-/// deopt boxes remain valid for the process lifetime.
+/// Legacy compatibility gate. Code reclamation is now ownership-safe in every
+/// configuration: an executing artifact owns its deopt metadata until return,
+/// so a superseded frame remains reconstructable and must not be forced into a
+/// side-effect-replaying whole-method fallback.
 fn jit_free_code_enabled() -> bool {
-    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var_os("CRATONVM_JIT_FREE_CODE").is_some())
+    false
 }
 
 /// Take (and clear) the frame most recently reconstructed by a deopt.
@@ -1748,6 +1762,211 @@ mod tests {
         // RegisterRef carries the full heap pointer as an Object (NOT a truncated
         // Int that would also drop it from the GC scan).
         assert_eq!(rf.locals[5], FrameValue::Object(0x0000_7F12_3456_7890));
+    }
+
+    // -- register-homed locals vs. a stale frame slot ----------------------
+    //
+    // These pin the invariant the register allocator's cross-call publication
+    // policy depends on: once a local is described by a REGISTER `FrameValue`,
+    // reconstruction never consults that local's canonical frame slot. The
+    // slot may therefore hold a stale copy — which is exactly what happens if
+    // a call site is allowed to skip publishing a primitive register-homed
+    // local. See `regalloc::SafepointPublishPlan` and
+    // `docs/internal/arch-2026-07-26/jit-regalloc-and-deopt.md`.
+
+    /// Every register-homed local reconstructs from `SavedRegisters`, and the
+    /// frame slot that would be its canonical home is filled with a *wrong*
+    /// value to prove it is never read.
+    #[test]
+    fn register_homed_locals_ignore_a_stale_canonical_frame_slot() {
+        // A fake native frame whose local slots hold DELIBERATELY STALE data:
+        // slot for local 0 @ rbp-8, local 1 @ rbp-16, local 2 @ rbp-24 — the
+        // `[rbp - (idx+1)*8]` layout the x64 emitter uses.
+        let stale: [u64; 4] = [
+            0xBAAD_F00D_BAAD_F00D, // rbp-32 (unused)
+            0xDEAD_DEAD_DEAD_DEAD, // rbp-24  <- local 2's canonical slot
+            0xBEEF_BEEF_BEEF_BEEF, // rbp-16  <- local 1's canonical slot
+            0xFACE_FACE_FACE_FACE, // rbp-8   <- local 0's canonical slot
+        ];
+        let rbp = (stale.as_ptr() as u64) + 32;
+
+        let mut regs = SavedRegisters::default();
+        regs.gpr[12] = 41; // local 0: a live int in R12
+        regs.gpr[13] = 0x0000_0001_0000_002A; // local 1: a live long in R13
+        regs.gpr[14] = 0x0000_7F00_1234_5678; // local 2: a live ref in R14
+
+        let fs = FrameState {
+            method_key: "T.fib:(I)I".to_string(),
+            bci: 10,
+            locals: vec![
+                FrameValue::Register(12),
+                FrameValue::RegisterLong(13),
+                FrameValue::RegisterRef(14),
+            ],
+            stack: Vec::new(),
+            monitors: Vec::new(),
+            caller: None,
+        };
+        let dp = DeoptimizationPoint {
+            native_offset: 0,
+            bci: 10,
+            reason: DeoptReason::UncommonTrap,
+            action: DeoptAction::Reinterpret,
+            speculation_id: 0,
+            frame_state: fs,
+        };
+        let rf = reconstruct_frame_from_machine_state(&dp, &regs, rbp);
+        assert_eq!(
+            rf.locals[0],
+            FrameValue::Int(41),
+            "a register-homed int must come from the GPR file, not the frame slot"
+        );
+        assert_eq!(
+            rf.locals[1],
+            FrameValue::Long(0x0000_0001_0000_002A),
+            "a register-homed long must keep all 64 bits from the GPR file"
+        );
+        assert_eq!(
+            rf.locals[2],
+            FrameValue::Object(0x0000_7F00_1234_5678),
+            "a register-homed ref must resolve as a GC-tracked Object from the GPR file"
+        );
+        // None of the stale words leaked through.
+        for v in &rf.locals {
+            match v {
+                FrameValue::Int(i) | FrameValue::Long(i) => {
+                    assert!(!stale.contains(&(*i as u64)), "stale slot leaked: {v:?}")
+                }
+                FrameValue::Object(o) => {
+                    assert!(!stale.contains(o), "stale slot leaked: {v:?}")
+                }
+                other => panic!("unexpected reconstruction {other:?}"),
+            }
+        }
+    }
+
+    /// The same value in the same GPR reconstructs to a *different* category
+    /// depending on the descriptor variant the snapshot emitter chose. This is
+    /// what makes `Register` vs `RegisterLong` vs `RegisterRef` load-bearing:
+    /// they select cat-1/cat-2 local placement and GC tracking on resume, not
+    /// just a numeric read.
+    #[test]
+    fn register_descriptor_variant_selects_the_resumed_value_category() {
+        let mut regs = SavedRegisters::default();
+        regs.gpr[15] = 0x0000_7F55_0000_0007;
+        let rbp = 0u64; // never dereferenced — no slot descriptors here
+        assert_eq!(
+            resolve_value(&FrameValue::Register(15), &regs, rbp),
+            FrameValue::Int(0x0000_7F55_0000_0007)
+        );
+        assert_eq!(
+            resolve_value(&FrameValue::RegisterLong(15), &regs, rbp),
+            FrameValue::Long(0x0000_7F55_0000_0007)
+        );
+        assert_eq!(
+            resolve_value(&FrameValue::RegisterRef(15), &regs, rbp),
+            FrameValue::Object(0x0000_7F55_0000_0007)
+        );
+    }
+
+    /// Inlined caller frames share the physical frame AND the register file, so
+    /// a register-homed local in an inlined *caller* must resolve from the same
+    /// `SavedRegisters` — an inliner that raises its budget (the concurrent
+    /// work on `jit/src/lib.rs`) deepens exactly this chain.
+    #[test]
+    fn inlined_caller_frames_resolve_register_locals_from_the_same_regfile() {
+        let mut regs = SavedRegisters::default();
+        regs.gpr[3] = 7; // RBX — callee-saved, so it survives the inlined call
+        regs.gpr[12] = 9;
+
+        let caller = FrameState {
+            method_key: "T.outer:()V".to_string(),
+            bci: 4,
+            locals: vec![FrameValue::Register(3)],
+            stack: Vec::new(),
+            monitors: Vec::new(),
+            caller: None,
+        };
+        let callee = FrameState {
+            method_key: "T.inner:()V".to_string(),
+            bci: 1,
+            locals: vec![FrameValue::Register(12)],
+            stack: Vec::new(),
+            monitors: Vec::new(),
+            caller: Some(Box::new(caller)),
+        };
+        let dp = DeoptimizationPoint {
+            native_offset: 0,
+            bci: 1,
+            reason: DeoptReason::SpeculationFailed,
+            action: DeoptAction::Reinterpret,
+            speculation_id: 0,
+            frame_state: callee,
+        };
+        let rf = reconstruct_frame_from_machine_state(&dp, &regs, 0);
+        assert_eq!(rf.locals[0], FrameValue::Int(9));
+        assert_eq!(rf.caller_frames.len(), 1);
+        assert_eq!(rf.caller_frames[0].method_key, "T.outer:()V");
+        assert_eq!(rf.caller_frames[0].locals[0], FrameValue::Int(7));
+    }
+
+    /// A monitor whose object is register-homed must also resolve from the
+    /// register file — otherwise a deopt inside a synchronized region rebuilds
+    /// the interpreter frame holding the *wrong* monitor and the unlock on
+    /// resume targets a different object.
+    #[test]
+    fn monitors_resolve_register_homed_objects() {
+        let mut regs = SavedRegisters::default();
+        regs.gpr[14] = 0x0000_7F99_0000_1000;
+        let fs = FrameState {
+            method_key: "T.sync:()V".to_string(),
+            bci: 2,
+            locals: Vec::new(),
+            stack: Vec::new(),
+            monitors: vec![MonitorInfo {
+                object: FrameValue::RegisterRef(14),
+                lock_depth: 1,
+            }],
+            caller: None,
+        };
+        let dp = DeoptimizationPoint {
+            native_offset: 0,
+            bci: 2,
+            reason: DeoptReason::UncommonTrap,
+            action: DeoptAction::Reinterpret,
+            speculation_id: 0,
+            frame_state: fs,
+        };
+        let rf = reconstruct_frame_from_machine_state(&dp, &regs, 0);
+        assert_eq!(rf.monitors.len(), 1);
+        assert_eq!(
+            rf.monitors[0].object,
+            FrameValue::Object(0x0000_7F99_0000_1000)
+        );
+        assert_eq!(rf.monitors[0].lock_depth, 1);
+    }
+
+    /// `SavedRegisters` is the ABI contract between the x64 deopt stub (which
+    /// spills 16 GPRs then 16 XMMs into a contiguous 256-byte region and passes
+    /// `&gpr[0]`) and this resolver. A layout change on either side silently
+    /// mis-resolves every register-homed value, so pin it here.
+    #[test]
+    fn saved_registers_layout_matches_the_stub_spill_region() {
+        assert_eq!(std::mem::size_of::<SavedRegisters>(), 256);
+        let sr = SavedRegisters::default();
+        let base = &sr as *const SavedRegisters as usize;
+        assert_eq!(
+            &sr.gpr[0] as *const u64 as usize, base,
+            "gpr[0] must be at the struct base — the stub passes &gpr[0] as the pointer"
+        );
+        assert_eq!(
+            &sr.xmm[0] as *const u64 as usize - base,
+            128,
+            "the XMM half must start 128 bytes in (16 GPRs x 8 bytes)"
+        );
+        // Highest indices addressable by a FrameValue register descriptor.
+        assert_eq!(sr.gpr.len(), 16);
+        assert_eq!(sr.xmm.len(), 16);
     }
 
     // -- DeoptReason -------------------------------------------------------

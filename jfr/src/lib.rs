@@ -16,6 +16,61 @@
 //!
 //! See [`ThreadEventRing`] for the local (non-registered) ring type, and
 //! [`ThreadRingRegistry`] for the multi-thread aggregator used by the dumper.
+//!
+//! ---------------------------------------------------------------------------
+//! # LIVENESS — observability audit, 2026-07-26
+//! ---------------------------------------------------------------------------
+//!
+//! **No production code path starts a recording, so JFR captures nothing on a
+//! default run.** The emit surface is genuinely wired — ~30 `emit_*` call
+//! sites across the interpreter, the JIT, `vm_exec`, `vm_util` and `vm_init`
+//! cover GC, class load, thread lifecycle, monitors, compilation,
+//! deoptimization, file I/O and virtual-thread pinning — and a
+//! `FlightRecorder` is constructed for every VM
+//! (`SharedVm::debug.flight_recorder`). What is missing is the trigger:
+//!
+//!  * There is **no `-XX:StartFlightRecording` command-line option**. Nothing
+//!    in `vm-cli` parses one.
+//!  * `FlightRecorder::new_recording` / `start_recording` have **zero callers
+//!    outside `#[cfg(test)]`**, so [`set_enabled`] is never flipped and
+//!    [`is_enabled`] is permanently `false`.
+//!  * The `JFR.start` / `JFR.stop` / `JFR.dump` jcmd verbs in
+//!    `vm/src/runtime/serviceability.rs` never touched the recorder (they
+//!    returned canned success strings; the audit replaced them with honest
+//!    failures), and in any case nothing constructs the `JcmdProcessor` that
+//!    hosts them, nor opens an attach socket.
+//!  * [`dump_to_file`] has no caller outside this crate.
+//!
+//! Because every `emit_*` checks [`is_enabled`] first, the standing cost is
+//! one relaxed atomic load per call site — the wiring is not a performance
+//! problem, it is simply unreachable. The two deliberate exceptions that
+//! bypass the gate (`emit_physical_memory_event` and
+//! `emit_initial_environment_variable_event`, both one-shot from `vm_init` on
+//! the main thread) push into that thread's bounded ring and stay there.
+//!
+//! To make JFR real, in dependency order: add the CLI option and/or bind the
+//! jcmd verbs to `SharedVm::debug.flight_recorder`; call `new_recording` +
+//! `start_recording`; and call `FlightRecorder::dump_recording` on stop. Note
+//! that the produced file is still **not JMC / `jfr print` loadable** — see
+//! the FORMAT-FIDELITY GAP block on `write_metadata_section` in
+//! [`dump`] — and that no event carries a real captured stack trace.
+//!
+//! ## Memory bounds (audited)
+//!
+//!  * Per-thread emit ring: [`DEFAULT_THREAD_RING_CAPACITY`] = 1024 entries,
+//!    fixed, oldest-dropped on overflow.
+//!  * Per-recording repository: `EventRepository::default()` = 100_000 events
+//!    with ring eviction. Bounded.
+//!  * Dead shards: [`ThreadRingRegistry`] reclaims retired+empty shards, but
+//!    only from inside `drain_all`. Since `drain_all` runs at dump time and no
+//!    dump ever happens, reclamation never runs in production today. This is
+//!    currently harmless *only* because the gate keeps ordinary threads from
+//!    registering a shard at all. It becomes a real per-thread leak the moment
+//!    a long-lived recording is started on a workload that churns threads —
+//!    fix reclamation (or drive a periodic drain) as part of wiring the
+//!    trigger, not after.
+//!  * `RecordingSettings::max_age` / `max_size` are **not enforced anywhere**;
+//!    see their declarations in [`recording`].
 
 pub mod builtin;
 pub mod dump;

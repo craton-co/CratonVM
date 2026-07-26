@@ -532,15 +532,62 @@ impl ModuleRegistry {
         }
 
         if self.graph_built {
-            self.readable
+            return self
+                .readable
                 .get(reader)
-                .is_some_and(|set| set.contains(provider))
-        } else {
-            // Fallback: direct requires only
-            self.modules
-                .get(reader)
-                .is_some_and(|desc| desc.requires.iter().any(|r| r.module_name == provider))
+                .is_some_and(|set| set.contains(provider));
         }
+
+        // ── Un-built fallback ────────────────────────────────────────────
+        //
+        // The cached closure is gone: either it was never computed, or
+        // `register` invalidated it (`graph_built = false; readable.clear()`)
+        // and nothing has rebuilt it yet. Two defects used to live here.
+        //
+        // 1. `requires static` edges were honoured. `build_readability_graph`
+        //    step 1 filters them out (`if !req.is_static`), because a
+        //    compile-time-only dependency is never readable at runtime. The
+        //    fallback therefore *granted* readability that the built graph
+        //    denies — the same query flipping answer purely on whether the
+        //    closure happened to be cached. (`add_reads_requires_static_not_
+        //    propagated` pinned the built-graph half of this only.)
+        //
+        // 2. Dynamic reads edges (`Module.addReads`, `--add-reads`,
+        //    `NativeContext::module_add_reads`) were ignored entirely.
+        //    `add_reads` patches `readable` only `if self.graph_built`,
+        //    parking the edge in `extra_reads` otherwise — and nothing here
+        //    consulted `extra_reads`. Repro: build the graph, `add_reads(A,
+        //    B)` (patched in, `reads(A, B) == true`), then load any
+        //    `module-info` class — `register` clears the closure and
+        //    `reads(A, B)` silently reverts to `false` until something calls
+        //    `build_readability_graph` again. `check_module_access` /
+        //    `check_deep_reflection_access` both gate on `reads`, so the
+        //    window turns a user's `--add-reads` into a spurious
+        //    `IllegalAccessError` / `InaccessibleObjectException`.
+        //
+        // Mirror `build_readability_graph`'s seeding (non-static direct
+        // requires) plus `add_reads`'s cached-graph patch (the edge itself and
+        // the `requires transitive` closure it implies).
+        if self.modules.get(reader).is_some_and(|desc| {
+            desc.requires
+                .iter()
+                .any(|r| !r.is_static && r.module_name == provider)
+        }) {
+            return true;
+        }
+        if let Some(extras) = self.extra_reads.get(reader) {
+            if extras.contains(provider) {
+                return true;
+            }
+            for e in extras {
+                let mut implied: FxHashSet<String> = FxHashSet::default();
+                self.collect_transitive_requires(e, &mut implied);
+                if implied.contains(provider) {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     // -----------------------------------------------------------------------
@@ -1420,6 +1467,116 @@ mod tests {
         reg.add_reads("modA", "modB");
         assert!(reg.reads("modA", "modB"));
         assert!(!reg.reads("modA", "modC")); // static dep not implied
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression: `reads()` with the readability closure invalidated
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn dynamic_reads_survive_graph_invalidation_by_register() {
+        // Repro for the un-built-fallback defect. `add_reads` patches the
+        // cached closure only while `graph_built` is true; `register`
+        // (every lazily-loaded `module-info.class` goes through it) sets
+        // `graph_built = false` and clears `readable`. The fallback used to
+        // consult `desc.requires` only, so the dynamic edge vanished until
+        // something happened to call `build_readability_graph` again.
+        //
+        // `check_module_access` and `check_deep_reflection_access` both gate
+        // on `reads`, so inside that window a user's `--add-reads` /
+        // `Module.addReads` turns into a spurious IllegalAccessError.
+        let mut reg = ModuleRegistry::new();
+        reg.register(sample_desc("modA"), vec![]);
+        reg.register(sample_desc("modB"), vec![]);
+        reg.build_readability_graph();
+
+        reg.add_reads("modA", "modB");
+        assert!(reg.reads("modA", "modB"), "patched into the built closure");
+
+        // A later module-info load invalidates the closure without rebuilding.
+        reg.register(sample_desc("modLate"), vec![]);
+        assert!(
+            reg.reads("modA", "modB"),
+            "dynamic addReads edge must survive closure invalidation"
+        );
+
+        // …and a rebuild must agree with the fallback.
+        reg.build_readability_graph();
+        assert!(reg.reads("modA", "modB"));
+    }
+
+    #[test]
+    fn dynamic_reads_imply_requires_transitive_before_rebuild() {
+        // Same window, but for the closure `add_reads` would have patched in:
+        // a reads edge to modB also implies everything modB `requires
+        // transitive`. The fallback must agree with the patched cache.
+        let mut desc_b = sample_desc("modB");
+        desc_b.requires.push(ModuleRequiresEntry {
+            module_name: "modC".to_string(),
+            is_transitive: true,
+            is_static: false,
+        });
+
+        let mut reg = ModuleRegistry::new();
+        reg.register(sample_desc("modA"), vec![]);
+        reg.register(desc_b, vec![]);
+        reg.register(sample_desc("modC"), vec![]);
+        reg.build_readability_graph();
+        reg.add_reads("modA", "modB");
+
+        reg.register(sample_desc("modLate"), vec![]); // invalidates
+        assert!(reg.reads("modA", "modB"));
+        assert!(
+            reg.reads("modA", "modC"),
+            "implied `requires transitive` closure must survive invalidation"
+        );
+    }
+
+    #[test]
+    fn requires_static_is_not_readable_with_or_without_the_closure() {
+        // `requires static` is compile-time only. `build_readability_graph`
+        // step 1 filters it (`if !req.is_static`), but the un-built fallback
+        // used to match on `module_name` alone — so the SAME query answered
+        // `true` before the closure was built and `false` after it.
+        let mut desc_a = sample_desc("modA");
+        desc_a.requires.push(ModuleRequiresEntry {
+            module_name: "modB".to_string(),
+            is_transitive: false,
+            is_static: true,
+        });
+
+        let mut reg = ModuleRegistry::new();
+        reg.register(desc_a, vec![]);
+        reg.register(sample_desc("modB"), vec![]);
+
+        // Closure not built yet — the fallback path.
+        assert!(
+            !reg.reads("modA", "modB"),
+            "`requires static` must not grant runtime readability"
+        );
+
+        reg.build_readability_graph();
+        assert!(!reg.reads("modA", "modB"), "and the built graph must agree");
+    }
+
+    #[test]
+    fn non_static_direct_requires_still_readable_without_the_closure() {
+        // Guard the other half of the same expression: the fallback must keep
+        // honouring ordinary (non-static) direct `requires`.
+        let mut desc_a = sample_desc("modA");
+        desc_a.requires.push(ModuleRequiresEntry {
+            module_name: "modB".to_string(),
+            is_transitive: false,
+            is_static: false,
+        });
+
+        let mut reg = ModuleRegistry::new();
+        reg.register(desc_a, vec![]);
+        reg.register(sample_desc("modB"), vec![]);
+
+        assert!(reg.reads("modA", "modB"));
+        reg.build_readability_graph();
+        assert!(reg.reads("modA", "modB"));
     }
 
     #[test]

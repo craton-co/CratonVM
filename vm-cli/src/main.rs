@@ -102,18 +102,33 @@ struct Args {
     #[arg(long = "Xshare", value_name = "MODE", default_value = "off")]
     xshare: String,
 
-    /// Force synthetic JDK mode (Rust stubs instead of real JDK bytecode).
+    /// Select the synthetic class library (~5,200 Rust stubs in
+    /// `native-builtins`) instead of real JDK bytecode.
     ///
-    /// As of task #53 the launcher defaults to real-JDK boot via JMOD
-    /// (`java.base.jmod` from `JAVA_HOME` / `CRATONVM_JAVA_HOME` / `java`
-    /// on `PATH`) whenever a JDK is detected on the host. Passing this
-    /// flag forces synthetic mode even when a JDK is present — useful
-    /// for hermetic test runs or when comparing synthetic vs. real-JDK
-    /// behaviour. When no JDK is detectable the launcher falls back to
-    /// synthetic automatically, so this flag is only an explicit
-    /// override.
-    #[arg(long = "synthetic-jdk")]
+    /// Mutually exclusive with `--real-jdk`. Requires a build with the
+    /// `synthetic-jdk` Cargo feature; without it the launcher errors out
+    /// rather than booting a VM with no class library (see
+    /// `cratonvm_vm::config::require_synthetic_jdk`).
+    ///
+    /// The launcher default is `--real-jdk`
+    /// (`cratonvm_vm::config::LAUNCHER_DEFAULT_JDK_MODE`), fixed at
+    /// compile time. It is NOT derived from whether a JDK happens to be
+    /// installed — see the determinism note on
+    /// `cratonvm_vm::config::JdkMode`.
+    #[arg(long = "synthetic-jdk", conflicts_with = "real_jdk")]
     synthetic_jdk: bool,
+
+    /// Select the real JDK class library: `java.base` and friends are
+    /// loaded from `$JAVA_HOME/jmods/*.jmod` or the `lib/modules` jimage,
+    /// with only the ~300 truly-native methods implemented in Rust.
+    ///
+    /// This is already the launcher default; the flag exists so the
+    /// choice can be stated explicitly (in scripts, CI lanes and bug
+    /// reproductions) and so the two modes are symmetric. If no usable
+    /// JDK is found the launcher fails with a message naming everything
+    /// it searched — it never silently substitutes the synthetic library.
+    #[arg(long = "real-jdk")]
+    real_jdk: bool,
 
     /// Enable Panama FFI native access (mirrors JDK `--enable-native-access`).
     ///
@@ -259,7 +274,7 @@ struct Args {
     /// `-XX:MaxDirectMemorySize=<size>` -> direct (off-heap NIO) buffer
     /// accounting cap. Mirrors real JDK: when absent, the cap defaults to
     /// `-Xmx` instead of a fixed value. See
-    /// docs/known-issues/h2-suite-bugs/bug-h2-largeblob-direct-memory-oom.md.
+    /// docs/known-issues/h2/bug-h2-largeblob-direct-memory-oom.md.
     #[arg(
         long = "XX:MaxDirectMemorySize",
         value_name = "SIZE",
@@ -1454,6 +1469,260 @@ fn extract_hotspot_flags(raw: Vec<String>) -> (Vec<String>, HotspotFlags) {
     (filtered, out)
 }
 
+// ---------------------------------------------------------------------------
+// JDK-mode selection and reporting
+//
+// CratonVM ships two complete, different standard-library implementations
+// (real JDK bytecode vs ~5,200 synthetic Rust stubs). Which one ran decides
+// which bug set applies, so:
+//
+//   * selection is explicit and deterministic — never inferred from what is
+//     installed on the host (see `cratonvm_vm::config::JdkMode`);
+//   * an unavailable mode is a hard launch error, never a silent downgrade;
+//   * the active mode is printed by `-version` / `-Xinternalversion` and in
+//     the launcher's fatal-error output, so every bug report carries it.
+// ---------------------------------------------------------------------------
+
+/// The mode this process actually booted in, published for the diagnostic
+/// paths in `main()` (which run after `run()` has returned an error and no
+/// longer have the `VmConfig`).
+static ACTIVE_JDK_MODE: std::sync::OnceLock<(cratonvm_vm::config::JdkMode, Option<String>)> =
+    std::sync::OnceLock::new();
+
+/// One-line "which class library is this" summary for diagnostics.
+fn active_jdk_mode_line() -> String {
+    match ACTIVE_JDK_MODE.get() {
+        Some((mode, Some(home))) => format!("jdk mode: {mode} (java.home={home})"),
+        Some((mode, None)) => format!("jdk mode: {mode}"),
+        None => "jdk mode: <not yet resolved — failure occurred during argument parsing>".into(),
+    }
+}
+
+/// Which flavour of version banner the user asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VersionQuery {
+    /// `-version` (stderr, exits) / `--version` (stdout, exits).
+    Version,
+    /// `-fullversion` / `--full-version`: single terse line.
+    Full,
+    /// `-Xinternalversion`: build + JDK-mode diagnostics.
+    Internal,
+    /// `-showversion` / `--show-version`: print, then run the program.
+    Show,
+}
+
+impl VersionQuery {
+    /// HotSpot writes the single-dash forms to stderr and the GNU-style
+    /// double-dash forms to stdout. Build tools that scrape `java -version`
+    /// depend on the stderr side of that.
+    fn to_stdout(self, token: &str) -> bool {
+        let _ = self;
+        token.starts_with("--")
+    }
+
+    fn exits(self) -> bool {
+        !matches!(self, VersionQuery::Show)
+    }
+}
+
+/// Scan the launcher section of argv (everything before the `--` that
+/// [`insert_program_args_separator`] parks after the program selector) for a
+/// version query. Returns the matched token as well so the caller can pick
+/// the right output stream.
+fn scan_version_query(argv: &[String]) -> Option<(VersionQuery, String)> {
+    for a in argv.iter().skip(1) {
+        if a == "--" {
+            return None;
+        }
+        let q = match a.as_str() {
+            "-version" | "--version" | "-v" | "-V" => VersionQuery::Version,
+            "-fullversion" | "--full-version" => VersionQuery::Full,
+            "-Xinternalversion" => VersionQuery::Internal,
+            "-showversion" | "--show-version" => VersionQuery::Show,
+            _ => continue,
+        };
+        return Some((q, a.clone()));
+    }
+    None
+}
+
+/// Remove the first occurrence of `token` from the launcher section of
+/// argv (everything before the `--` separator). Program arguments after
+/// `--` are never touched — a Java program is entitled to its own
+/// `-showversion`.
+fn remove_first_launcher_token(argv: &mut Vec<String>, token: &str) {
+    for i in 1..argv.len() {
+        if argv[i] == "--" {
+            return;
+        }
+        if argv[i] == token {
+            argv.remove(i);
+            return;
+        }
+    }
+}
+
+/// Resolve the requested JDK mode from raw argv, for the version banner.
+///
+/// The authoritative resolution happens after clap parsing
+/// ([`resolve_jdk_mode`]); this pre-parse scan exists only because the
+/// banner must be printable before clap runs (clap's own `--version`
+/// handling would otherwise exit first, printing a banner that says nothing
+/// about which standard library is in play).
+fn scan_requested_jdk_mode(argv: &[String]) -> cratonvm_vm::config::JdkMode {
+    let mut mode = cratonvm_vm::config::LAUNCHER_DEFAULT_JDK_MODE;
+    for a in argv.iter().skip(1) {
+        if a == "--" {
+            break;
+        }
+        match a.as_str() {
+            "--synthetic-jdk" => mode = cratonvm_vm::config::JdkMode::Synthetic,
+            "--real-jdk" => mode = cratonvm_vm::config::JdkMode::Real,
+            _ => {}
+        }
+    }
+    mode
+}
+
+/// Pick up an explicit `--java-home <PATH>` / `--java-home=<PATH>` from raw
+/// argv so the version banner reports the same JDK the run would use.
+fn scan_explicit_java_home(argv: &[String]) -> Option<String> {
+    let mut it = argv.iter().skip(1);
+    while let Some(a) = it.next() {
+        if a == "--" {
+            return None;
+        }
+        if let Some(rest) = a.strip_prefix("--java-home=") {
+            return Some(rest.to_string());
+        }
+        if a == "--java-home" {
+            return it.next().cloned();
+        }
+    }
+    None
+}
+
+/// Render the version banner, always naming the active class library.
+///
+/// This is the primary fix for "a bug report is uninterpretable without
+/// knowing which mode ran": `cratonvm -version` now states it, so the mode
+/// travels with every pasted terminal transcript.
+fn version_banner(
+    query: VersionQuery,
+    mode: cratonvm_vm::config::JdkMode,
+    explicit_java_home: Option<&str>,
+) -> String {
+    use cratonvm_vm::config as cfg;
+    let version = env!("CARGO_PKG_VERSION");
+
+    if query == VersionQuery::Full {
+        return format!("cratonvm full version \"{version}\" ({mode})\n");
+    }
+
+    let mut out = String::new();
+    out.push_str(&format!("cratonvm version \"{version}\"\n"));
+    out.push_str(&format!(
+        "CratonVM (build {version}, mixed mode, sharing)\n"
+    ));
+    out.push_str(&format!(
+        "JDK class library: {mode} — {}\n",
+        mode.describe()
+    ));
+
+    match mode {
+        cfg::JdkMode::Real => match cfg::require_real_jdk(explicit_java_home) {
+            Ok(home) => out.push_str(&format!("JDK class library root: {}\n", home.display())),
+            Err(_) => {
+                out.push_str(
+                    "JDK class library root: NONE FOUND — a program launch in this mode \
+                     will fail (run with --real-jdk for the full diagnostic, or pass \
+                     --synthetic-jdk to select the other library)\n",
+                );
+            }
+        },
+        cfg::JdkMode::Synthetic => {
+            if !cfg::SYNTHETIC_JDK_COMPILED_IN {
+                out.push_str(
+                    "JDK class library root: NOT COMPILED IN — this binary was built \
+                     without the `synthetic-jdk` Cargo feature, so a program launch in \
+                     this mode will fail\n",
+                );
+            }
+        }
+    }
+
+    if query == VersionQuery::Internal {
+        out.push('\n');
+        out.push_str(&format!("jdk.mode.active                = {mode}\n"));
+        out.push_str(&format!(
+            "jdk.mode.default.launcher       = {}\n",
+            cfg::LAUNCHER_DEFAULT_JDK_MODE
+        ));
+        out.push_str(&format!(
+            "jdk.mode.default.embedded       = {}\n",
+            cfg::EMBEDDED_DEFAULT_JDK_MODE
+        ));
+        out.push_str(
+            "jdk.mode.selection              = explicit flag or fixed default \
+             (never host-detected)\n",
+        );
+        out.push_str(&format!(
+            "jdk.mode.synthetic_compiled_in  = {}\n",
+            cfg::SYNTHETIC_JDK_COMPILED_IN
+        ));
+        out.push_str("jdk.search:\n");
+        out.push_str(&cfg::describe_jdk_search(explicit_java_home));
+        out.push('\n');
+    }
+    out
+}
+
+/// Authoritative JDK-mode resolution + availability validation.
+///
+/// Returns the selected mode and, in real-JDK mode, the validated
+/// `JAVA_HOME` root. An unavailable mode is an error — the launcher does
+/// **not** fall back to the other class library, because a run whose
+/// standard library was chosen by the host is neither reproducible nor
+/// reportable.
+fn resolve_jdk_mode(
+    synthetic_flag: bool,
+    real_flag: bool,
+    explicit_java_home: Option<&str>,
+) -> Result<(cratonvm_vm::config::JdkMode, Option<std::path::PathBuf>)> {
+    use cratonvm_vm::config as cfg;
+
+    // clap enforces this via `conflicts_with`; keep the check so a future
+    // argv-preprocessing change can't quietly make one flag win.
+    if synthetic_flag && real_flag {
+        bail!(
+            "--synthetic-jdk and --real-jdk are mutually exclusive: they select \
+             two different standard-library implementations. Pass exactly one \
+             (or neither, for the default {}).",
+            cfg::LAUNCHER_DEFAULT_JDK_MODE
+        );
+    }
+
+    let mode = if synthetic_flag {
+        cfg::JdkMode::Synthetic
+    } else if real_flag {
+        cfg::JdkMode::Real
+    } else {
+        cfg::LAUNCHER_DEFAULT_JDK_MODE
+    };
+
+    match mode {
+        cfg::JdkMode::Synthetic => {
+            cfg::require_synthetic_jdk().map_err(|e| anyhow::anyhow!("{e}"))?;
+            Ok((mode, None))
+        }
+        cfg::JdkMode::Real => {
+            let home =
+                cfg::require_real_jdk(explicit_java_home).map_err(|e| anyhow::anyhow!("{e}"))?;
+            Ok((mode, Some(home)))
+        }
+    }
+}
+
 fn resolve_watchdog_timeout(
     stack_dump_on_timeout: Option<u64>,
     default_watchdog_sec: Option<&str>,
@@ -1502,7 +1771,37 @@ fn run() -> Result<()> {
     // Runs first so the explicit `--` it parks is honoured by every
     // downstream stage.
     let raw_argv: Vec<String> = expand_argfiles(std::env::args().collect());
-    let argv: Vec<String> = insert_program_args_separator(raw_argv);
+    let mut argv: Vec<String> = insert_program_args_separator(raw_argv);
+
+    // Version banners are handled here, ahead of clap, for one reason: the
+    // banner must name the active JDK mode. clap's built-in `--version`
+    // prints and exits before any of our code runs, so it can only report
+    // the crate version — which says nothing about which of the two
+    // standard libraries the VM would boot. Since that is the single most
+    // important fact for interpreting a bug report, `-version`,
+    // `--version`, `-fullversion`, `-showversion` and `-Xinternalversion`
+    // all route through `version_banner` instead.
+    if let Some((query, token)) = scan_version_query(&argv) {
+        let mode = scan_requested_jdk_mode(&argv);
+        let java_home = scan_explicit_java_home(&argv);
+        let banner = version_banner(query, mode, java_home.as_deref());
+        // HotSpot writes the single-dash forms to stderr (build tools scrape
+        // `java -version` from there) and the double-dash forms to stdout.
+        if query.to_stdout(&token) {
+            print!("{banner}");
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+        } else {
+            eprint!("{banner}");
+            let _ = std::io::Write::flush(&mut std::io::stderr());
+        }
+        if query.exits() {
+            std::process::exit(0);
+        }
+        // `-showversion`: banner printed, now launch the program as normal.
+        // Drop the flag so clap doesn't see an unknown option.
+        remove_first_launcher_token(&mut argv, &token);
+    }
+
     // Extract -Dkey=value system properties before clap parsing
     let raw_args: Vec<String> = normalize_java_launcher_argv(argv);
     let (filtered_args, system_properties) = extract_system_properties(raw_args);
@@ -1839,12 +2138,15 @@ fn run() -> Result<()> {
         None
     };
 
-    // Task #53: the launcher prefers real-JDK boot (JMOD) when a JDK is
-    // detected on the host (JAVA_HOME / CRATONVM_JAVA_HOME / `java` on
-    // PATH); otherwise it falls back to the synthetic stubs. The library
-    // path (`VmConfig::default`) stays synthetic so embedded callers and
-    // the in-tree test suite are unaffected.
-    let mut config = VmConfig::with_host_jdk_default()
+    // The launcher's starting config. `for_launcher()` is deterministic:
+    // real-JDK mode (`LAUNCHER_DEFAULT_JDK_MODE`) regardless of what is
+    // installed on this machine. The actual mode — including validation and
+    // the `--synthetic-jdk` / `--real-jdk` override — is resolved below,
+    // after `--java-home` has been parsed. The library path
+    // (`VmConfig::default`) stays synthetic so embedded callers and the
+    // in-tree test suite are unaffected; that split is declared by
+    // `EMBEDDED_DEFAULT_JDK_MODE` in `vm/src/config.rs`.
+    let mut config = VmConfig::for_launcher()
         .with_classpath(classpath)
         .with_verbose_class_loading(args.verbose_class)
         .with_verbose_gc(args.verbose_gc)
@@ -1952,21 +2254,44 @@ fn run() -> Result<()> {
         }
     };
 
-    // Synthetic JDK override (task #53): the launcher already picked the
-    // host-driven default via `with_host_jdk_default()` above (real JDK
-    // when detected, synthetic otherwise). Three cases override that:
+    // ---------------------------------------------------------------
+    // JDK mode: explicit selection, then validation, then publication.
     //
-    //   * `--synthetic-jdk` flag → force synthetic (explicit opt-in)
-    //   * `--java-home` CLI arg → force real-JDK (user pointed at a JDK)
-    //   * `JAVA_HOME` already on `VmConfig` → force real-JDK
+    // Previously this was `use_synthetic_jdk = detect_real_jdk().is_none()`
+    // (in `with_host_jdk_default`) plus an ad-hoc "--java-home implies
+    // real" rule here. That made the *standard library* — and therefore
+    // the set of bugs a run could hit — a function of the host machine,
+    // with nothing in the VM's output recording which one was used.
     //
-    // The `--synthetic-jdk` flag wins over `--java-home` so users can
-    // explicitly compare synthetic vs. real-JDK behaviour against the
-    // same install.
-    if args.synthetic_jdk {
-        config.use_synthetic_jdk = true;
-    } else if args.java_home.is_some() || config.java_home.is_some() {
-        config.use_synthetic_jdk = false;
+    // Now: the mode comes from `--synthetic-jdk` / `--real-jdk` or the
+    // fixed launcher default; an unavailable mode aborts the launch with
+    // an actionable message; and the outcome is published for the
+    // `-version` banner and the fatal-error path. `--java-home` no longer
+    // *selects* real-JDK mode (it is already the default) — it only points
+    // the (already selected) real-JDK mode at a specific installation.
+    // ---------------------------------------------------------------
+    let (jdk_mode, resolved_java_home) = resolve_jdk_mode(
+        args.synthetic_jdk,
+        args.real_jdk,
+        config.java_home.as_deref(),
+    )?;
+    config = config.with_jdk_mode(jdk_mode);
+    // Pin the validated JDK root onto the config so boot-classpath
+    // discovery inside the VM resolves the same installation this launcher
+    // validated, instead of re-running the environment probe and possibly
+    // landing somewhere else.
+    if let Some(home) = resolved_java_home.as_ref() {
+        if config.java_home.is_none() {
+            config = config.with_java_home(home.to_string_lossy().into_owned());
+        }
+    }
+    let _ = ACTIVE_JDK_MODE.set((
+        jdk_mode,
+        resolved_java_home.map(|p| p.to_string_lossy().into_owned()),
+    ));
+    tracing::info!("{}", active_jdk_mode_line());
+    if args.verbose_class || args.verbose_gc {
+        eprintln!("[cratonvm] {}", active_jdk_mode_line());
     }
 
     // AOT configuration
@@ -2067,9 +2392,7 @@ fn run() -> Result<()> {
     if let Some(s) = &args.max_direct_memory {
         match parse_size(s) {
             Some(sz) if sz > 0 => config.max_direct_memory_size = Some(sz),
-            _ => eprintln!(
-                "Warning: ignoring -XX:MaxDirectMemorySize={s} (expected a byte size)"
-            ),
+            _ => eprintln!("Warning: ignoring -XX:MaxDirectMemorySize={s} (expected a byte size)"),
         }
     }
 
@@ -2196,10 +2519,16 @@ fn run() -> Result<()> {
     {
         let main_tlab = &vm.main_thread.tlab as *const _ as usize;
         let main_tid = vm.main_thread.thread_id;
-        vm.shared.thread_registry.set_tlab_addr(main_tid, main_tlab);
+        vm.shared
+            .threads
+            .thread_registry
+            .set_tlab_addr(main_tid, main_tlab);
         // xt-hardening (2026-07-03): publish main's OS thread id for the
         // takeover's counted-set excusal (workers publish at their start).
-        vm.shared.thread_registry.set_os_tid_current(main_tid);
+        vm.shared
+            .threads
+            .thread_registry
+            .set_os_tid_current(main_tid);
     }
 
     // T19.H1: optional watchdog that dumps interpreter frames and aborts when
@@ -2250,7 +2579,7 @@ fn run() -> Result<()> {
 
     if ring_recording_requested {
         cratonvm_native_api::native_ring::enable(true);
-        vm.shared.native_methods.flush_native_ring_names();
+        vm.shared.natives.native_methods.flush_native_ring_names();
         cratonvm_vm::dispatch_trace::enable();
     }
 
@@ -2268,7 +2597,7 @@ fn run() -> Result<()> {
         // frames; ring detail is reserved for runs that asked for it.
         if ring_recording_requested {
             cratonvm_native_api::native_ring::enable(true);
-            vm.shared.native_methods.flush_native_ring_names();
+            vm.shared.natives.native_methods.flush_native_ring_names();
             // T19.H1 — also enable the dispatch-trace ring. The native-call
             // ring records only opaque fn-pointers from two dispatch sites;
             // the dispatch trace records *named* class.method.desc for every
@@ -2470,9 +2799,10 @@ fn run() -> Result<()> {
                 // uninitialized reference slots).  The fallback path uses our
                 // synthetic System.in/out/err so stdout/stderr still work.
                 if let cratonvm_vm::error::MethodCallFailed::ExceptionThrown(exc_ref) = &e {
-                    let exc_class_id = vm.shared.heap.class_id_of(*exc_ref);
+                    let exc_class_id = vm.shared.mem.heap.class_id_of(*exc_ref);
                     let exc_class_name = vm
                         .shared
+                        .classes
                         .class_manager
                         .read()
                         .get_class(exc_class_id)
@@ -2490,7 +2820,7 @@ fn run() -> Result<()> {
                 // cached for a synthetic 1-slot object). Clear both caches so the next
                 // invocation re-resolves cleanly via the native-override registry.
                 vm.main_thread.invoke_cache.clear();
-                vm.shared.resolution_cache.write().clear();
+                vm.shared.classes.resolution_cache.write().clear();
                 // WP1.3: even though initPhase1 threw mid-flight, the
                 // early system-properties / stream installation ran
                 // before the failure — enough for callers gated on
@@ -2596,13 +2926,14 @@ fn run() -> Result<()> {
         .shared
         .load_class_concurrent("java/lang/String")
         .unwrap_or_else(|_| cratonvm_vm::ClassId::new(0));
-    let args_array = vm.shared.heap.alloc_array(
+    let args_array = vm.shared.mem.heap.alloc_array(
         string_array_class_id,
         cratonvm_vm::memory::heap::ArrayElementType::Reference,
         java_args.len(),
     );
     for (i, val) in java_args.into_iter().enumerate() {
         vm.shared
+            .mem
             .heap
             .set_array_element(args_array, i, val)
             .map_err(|idx| {
@@ -2736,7 +3067,7 @@ fn run() -> Result<()> {
         cratonvm_vm::jit::helpers::mic_prof::dump_now();
         eprintln!(
             "[MIC_PROF] gc_collections={} total_dispatches={}",
-            vm.shared.heap.collection_count(),
+            vm.shared.mem.heap.collection_count(),
             cratonvm_vm::dispatch_trace::total_dispatches()
         );
     }
@@ -2749,6 +3080,7 @@ fn run() -> Result<()> {
     if matches!(result, Ok(_)) {
         let swallowed = vm
             .shared
+            .debug
             .swallow_counter
             .load(std::sync::atomic::Ordering::Relaxed);
         if swallowed > 0 {
@@ -2768,7 +3100,7 @@ fn run() -> Result<()> {
     // can collect the table without `RUST_LOG`. No-op for the generational
     // collector and when no G1 collection ran.
     if args.verbose_gc || std::env::var_os("CRATONVM_GC_STATS").is_some() {
-        vm.shared.heap.print_gc_summary();
+        vm.shared.mem.heap.print_gc_summary();
     }
 
     // T19.K1 — wait for non-daemon threads before exiting.
@@ -2810,6 +3142,7 @@ fn run() -> Result<()> {
         // returned" forever.
         let pending = vm
             .shared
+            .threads
             .thread_registry
             .alive_non_daemon_thread_ids()
             .len();
@@ -2828,7 +3161,11 @@ fn run() -> Result<()> {
         // thread's roots and enter the full per-thread blocked-region protocol
         // for the whole wait, mirroring native socket/pipe waits.
         vm.begin_main_thread_blocking_region("vm-main:wait-non-daemon");
-        let joined = vm.shared.thread_registry.wait_for_non_daemon_threads(None);
+        let joined = vm
+            .shared
+            .threads
+            .thread_registry
+            .wait_for_non_daemon_threads(None);
         vm.end_main_thread_blocking_region();
         if joined > 0 {
             tracing::info!("cratonvm: joined {joined} non-daemon thread(s) after main() returned");
@@ -2879,7 +3216,7 @@ fn run() -> Result<()> {
             // exceptions are not silently truncated.
             const MAX_CAUSE_DEPTH: usize = 8;
             for depth in 0..MAX_CAUSE_DEPTH {
-                let cid = vm.shared.heap.class_id_of(cur);
+                let cid = vm.shared.mem.heap.class_id_of(cur);
                 // PERF: resolve the class name AND the Throwable field indices
                 // under a single read guard. These were two back-to-back
                 // `class_manager.read()` calls; both are pure reads with no
@@ -2891,7 +3228,7 @@ fn run() -> Result<()> {
                 // in lieu of Throwable.cause — see its `getCause()` override)
                 // so that `Caused by:` chains still walk through the wrapper.
                 let (cname, msg_idx, cause_idx, stack_idx, target_idx) = {
-                    let cm = vm.shared.class_manager.read();
+                    let cm = vm.shared.classes.class_manager.read();
                     let cname = cm
                         .get_class(cid)
                         .map(|c| c.name.to_string())
@@ -2931,9 +3268,10 @@ fn run() -> Result<()> {
                     (cname, msg_i, cause_i, stack_i, target_i)
                 };
                 let message = if let Some(i) = msg_idx {
-                    let v = vm.shared.heap.get_field(cur, i);
+                    let v = vm.shared.mem.heap.get_field(cur, i);
                     if let Value::Object(Some(s)) = v {
-                        cratonvm_vm::vm::read_java_string(&vm.shared.heap, s).unwrap_or_default()
+                        cratonvm_vm::vm::read_java_string(&vm.shared.mem.heap, s)
+                            .unwrap_or_default()
                     } else {
                         String::new()
                     }
@@ -2955,9 +3293,9 @@ fn run() -> Result<()> {
                 // Throwable fields above so we work regardless of layout.
                 let mut emitted_frames = false;
                 if let Some(si) = stack_idx {
-                    let stack_val = vm.shared.heap.get_field(cur, si);
+                    let stack_val = vm.shared.mem.heap.get_field(cur, si);
                     if let Value::Object(Some(arr)) = stack_val {
-                        let len = vm.shared.heap.array_length(arr);
+                        let len = vm.shared.mem.heap.array_length(arr);
                         if len > 0 {
                             emitted_frames = true;
                             // Resolve StackTraceElement field indices once
@@ -2965,17 +3303,19 @@ fn run() -> Result<()> {
                             let mut ste_idx: Option<(usize, usize, usize, usize)> = None;
                             for i in 0..len {
                                 let elem =
-                                    vm.shared.heap.get_array_element(arr, i).ok().and_then(|v| {
-                                        if let Value::Object(Some(o)) = v {
-                                            Some(o)
-                                        } else {
-                                            None
-                                        }
-                                    });
+                                    vm.shared.mem.heap.get_array_element(arr, i).ok().and_then(
+                                        |v| {
+                                            if let Value::Object(Some(o)) = v {
+                                                Some(o)
+                                            } else {
+                                                None
+                                            }
+                                        },
+                                    );
                                 let Some(elem_ref) = elem else { continue };
                                 if ste_idx.is_none() {
-                                    let ecid = vm.shared.heap.class_id_of(elem_ref);
-                                    let cm = vm.shared.class_manager.read();
+                                    let ecid = vm.shared.mem.heap.class_id_of(elem_ref);
+                                    let cm = vm.shared.classes.class_manager.read();
                                     let mut dc: Option<usize> = None;
                                     let mut mn: Option<usize> = None;
                                     let mut fn_: Option<usize> = None;
@@ -3019,9 +3359,12 @@ fn run() -> Result<()> {
                                     continue;
                                 };
                                 let read_str = |idx: usize| -> Option<String> {
-                                    match vm.shared.heap.get_field(elem_ref, idx) {
+                                    match vm.shared.mem.heap.get_field(elem_ref, idx) {
                                         Value::Object(Some(s)) => {
-                                            cratonvm_vm::vm::read_java_string(&vm.shared.heap, s)
+                                            cratonvm_vm::vm::read_java_string(
+                                                &vm.shared.mem.heap,
+                                                s,
+                                            )
                                         }
                                         _ => None,
                                     }
@@ -3031,7 +3374,7 @@ fn run() -> Result<()> {
                                 let method_name =
                                     read_str(mn).unwrap_or_else(|| "<unknown>".to_string());
                                 let file_name = read_str(fn_);
-                                let line_no = match vm.shared.heap.get_field(elem_ref, ln) {
+                                let line_no = match vm.shared.mem.heap.get_field(elem_ref, ln) {
                                     Value::Int(i) => i,
                                     _ => -1,
                                 };
@@ -3082,7 +3425,7 @@ fn run() -> Result<()> {
                 let mut next_cause = {
                     let mut next = None;
                     if let Some(i) = cause_idx {
-                        if let Value::Object(Some(c)) = vm.shared.heap.get_field(cur, i) {
+                        if let Value::Object(Some(c)) = vm.shared.mem.heap.get_field(cur, i) {
                             if c != cur {
                                 next = Some(c);
                             }
@@ -3090,7 +3433,7 @@ fn run() -> Result<()> {
                     }
                     if next.is_none() {
                         if let Some(i) = target_idx {
-                            if let Value::Object(Some(t)) = vm.shared.heap.get_field(cur, i) {
+                            if let Value::Object(Some(t)) = vm.shared.mem.heap.get_field(cur, i) {
                                 if t != cur {
                                     next = Some(t);
                                 }
@@ -3102,6 +3445,7 @@ fn run() -> Result<()> {
                 if next_cause.is_none() && cname == "java/lang/reflect/InvocationTargetException" {
                     let ite_decl = vm
                         .shared
+                        .classes
                         .class_manager
                         .read()
                         .get_loaded_class_id("java/lang/reflect/InvocationTargetException");
@@ -3158,7 +3502,7 @@ fn run() -> Result<()> {
                 if cname == "org/springframework/beans/PropertyBatchUpdateException" {
                     // Find the propertyAccessExceptions field by name.
                     let arr_idx = {
-                        let cm = vm.shared.class_manager.read();
+                        let cm = vm.shared.classes.class_manager.read();
                         let mut found: Option<usize> = None;
                         let mut walk = Some(cid);
                         while let Some(k) = walk {
@@ -3182,21 +3526,21 @@ fn run() -> Result<()> {
                         found
                     };
                     if let Some(ai) = arr_idx {
-                        match vm.shared.heap.get_field(cur, ai) {
+                        match vm.shared.mem.heap.get_field(cur, ai) {
                             Value::Object(Some(arr)) => {
-                                let n = vm.shared.heap.array_length(arr);
+                                let n = vm.shared.mem.heap.array_length(arr);
                                 lines.push(format!(
                                     "[cratonvm-cli] PropertyBatchUpdateException.propertyAccessExceptions length={n}"
                                 ));
                                 for i in 0..n {
-                                    let elem = vm.shared.heap.get_array_element(arr, i).ok();
+                                    let elem = vm.shared.mem.heap.get_array_element(arr, i).ok();
                                     if let Some(Value::Object(Some(eref))) = elem {
-                                        let ecid = vm.shared.heap.class_id_of(eref);
+                                        let ecid = vm.shared.mem.heap.class_id_of(eref);
                                         // PERF: one read guard for the sub-exception class
                                         // name and its field indices (back-to-back reads).
                                         // Read detailMessage and cause from this sub-exception
                                         let (ename, smsg, scause, spname) = {
-                                            let cm = vm.shared.class_manager.read();
+                                            let cm = vm.shared.classes.class_manager.read();
                                             let ename = cm
                                                 .get_class(ecid)
                                                 .map(|c| c.name.to_string())
@@ -3233,10 +3577,10 @@ fn run() -> Result<()> {
                                             }
                                             let read_s = |idx: Option<usize>| -> String {
                                                 idx.and_then(|i| {
-                                                    match vm.shared.heap.get_field(eref, i) {
+                                                    match vm.shared.mem.heap.get_field(eref, i) {
                                                         Value::Object(Some(s)) => {
                                                             cratonvm_vm::vm::read_java_string(
-                                                                &vm.shared.heap,
+                                                                &vm.shared.mem.heap,
                                                                 s,
                                                             )
                                                         }
@@ -3280,7 +3624,7 @@ fn run() -> Result<()> {
                                         // up to 6 deep just in case).
                                         let mut sub_cur = scause.and_then(|ci| {
                                             if let Value::Object(Some(c)) =
-                                                vm.shared.heap.get_field(eref, ci)
+                                                vm.shared.mem.heap.get_field(eref, ci)
                                             {
                                                 if c != eref {
                                                     Some(c)
@@ -3293,11 +3637,11 @@ fn run() -> Result<()> {
                                         });
                                         for _d in 0..6 {
                                             let Some(sc) = sub_cur else { break };
-                                            let sc_cid = vm.shared.heap.class_id_of(sc);
+                                            let sc_cid = vm.shared.mem.heap.class_id_of(sc);
                                             // PERF: one read guard for the sub-cause class
                                             // name and its field indices (back-to-back reads).
                                             let (sc_name, sc_msg, sc_cause_idx) = {
-                                                let cm = vm.shared.class_manager.read();
+                                                let cm = vm.shared.classes.class_manager.read();
                                                 let sc_name = cm
                                                     .get_class(sc_cid)
                                                     .map(|c| c.name.to_string())
@@ -3333,10 +3677,10 @@ fn run() -> Result<()> {
                                                 }
                                                 let m = mi
                                                     .and_then(|i| {
-                                                        match vm.shared.heap.get_field(sc, i) {
+                                                        match vm.shared.mem.heap.get_field(sc, i) {
                                                             Value::Object(Some(s)) => {
                                                                 cratonvm_vm::vm::read_java_string(
-                                                                    &vm.shared.heap,
+                                                                    &vm.shared.mem.heap,
                                                                     s,
                                                                 )
                                                             }
@@ -3374,7 +3718,7 @@ fn run() -> Result<()> {
                                             }
                                             sub_cur = sc_cause_idx.and_then(|ci| {
                                                 if let Value::Object(Some(c)) =
-                                                    vm.shared.heap.get_field(sc, ci)
+                                                    vm.shared.mem.heap.get_field(sc, ci)
                                                 {
                                                     if c != sc {
                                                         Some(c)
@@ -3501,6 +3845,35 @@ fn run() -> Result<()> {
 }
 
 fn main() {
+    // Expand the ten grouped configuration variables (`CRATONVM_JIT=-bce,unroll`
+    // and friends) into the per-knob keys the rest of the VM reads.
+    //
+    // This runs first, before the symbolize/SEGV hooks below, because those
+    // read `CRATONVM_SYMBOLIZE` and `CRATONVM_TEST_SEGV` — both of which are
+    // now tokens (`CRATONVM_DBG=symbolize=...`, `CRATONVM_TEST=segv`) and would
+    // otherwise be missed on this run. It is also the only point in the process
+    // guaranteed to be single-threaded, which is what makes writing back to
+    // `environ` sound: 431 read sites still call `std::env::var` directly and
+    // cannot see a resolved source. See `cratonvm_types::flag_groups`.
+    let (legacy_direct, unknown_tokens) = cratonvm_types::flag_groups::expand_process_env();
+    for t in &unknown_tokens {
+        eprintln!("[cratonvm] unknown configuration token: {t}");
+    }
+    // `CRATONVM_DBG=-deprecations` expands to `CRATONVM_QUIET_DEPRECATIONS=1`,
+    // which the call above has already written back, so this read sees it.
+    if !legacy_direct.is_empty() && std::env::var_os("CRATONVM_QUIET_DEPRECATIONS").is_none() {
+        // One line, not one per variable: a debugging session routinely exports
+        // a dozen of these and a dozen warnings would just train people to
+        // ignore them.
+        let shown: Vec<&str> = legacy_direct.iter().map(|(_, to)| to.as_str()).collect();
+        eprintln!(
+            "[cratonvm] {} per-flag variable(s) set directly; the supported \
+             spelling is now: {}",
+            legacy_direct.len(),
+            shown.join(" ")
+        );
+    }
+
     // Hardware-fault diagnostics. On Windows a SEGV/access violation is a
     // structured exception that bypasses the Rust panic hook below entirely;
     // without this, a native fault (e.g. the JIT-dispatch SEGV) kills the
@@ -3648,6 +4021,11 @@ fn main() {
         // Backtrace only when explicitly requested — matches the stock
         // Rust hook semantics so users opting out of backtrace still see
         // the panic message but no overhead.
+        // Stamp the crash with the standard library in play. Two complete
+        // class-library implementations ship in this binary and they fail
+        // differently; a panic report that doesn't say which one ran costs
+        // a round trip to triage.
+        let _ = writeln!(stderr, "[cratonvm] {}", active_jdk_mode_line());
         let bt = std::backtrace::Backtrace::capture();
         if bt.status() == std::backtrace::BacktraceStatus::Captured {
             let _ = writeln!(stderr, "stack backtrace:\n{bt}");
@@ -3721,6 +4099,12 @@ fn main() {
                 Err(e) => {
                     eprintln!("[cratonvm] main-vm run() returned Err: {e:#}");
                     eprintln!("[cratonvm] main-vm run() Err (debug): {e:?}");
+                    // Always stamp the failure with the standard library it
+                    // ran against. CratonVM has two of them with different
+                    // bug sets, so a stack trace or exception without the
+                    // mode is not actionable — this line is what makes a
+                    // pasted terminal transcript sufficient for triage.
+                    eprintln!("[cratonvm] {}", active_jdk_mode_line());
                     let _ = std::io::stderr().flush();
                     std::process::exit(1);
                 }
@@ -3895,6 +4279,192 @@ fn clamp_ergonomic_heap(basis: u64, cap: u64) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cratonvm_vm::config::{
+        JdkMode, EMBEDDED_DEFAULT_JDK_MODE, LAUNCHER_DEFAULT_JDK_MODE, SYNTHETIC_JDK_COMPILED_IN,
+    };
+
+    // -----------------------------------------------------------------------
+    // JDK-mode determinism (2026-07-26)
+    //
+    // The launcher used to pick its standard library by sniffing the host
+    // (`use_synthetic_jdk = detect_real_jdk().is_none()`). These tests pin
+    // the replacement contract: fixed default, symmetric explicit flags,
+    // no silent fallback, and a mode that is visible in `-version`.
+    // -----------------------------------------------------------------------
+
+    fn tokens(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn launcher_default_mode_is_real_jdk() {
+        assert_eq!(LAUNCHER_DEFAULT_JDK_MODE, JdkMode::Real);
+        assert_eq!(
+            scan_requested_jdk_mode(&tokens(&["cratonvm", "Main", "--"])),
+            JdkMode::Real
+        );
+        // ...and the embedding default deliberately differs.
+        assert_eq!(EMBEDDED_DEFAULT_JDK_MODE, JdkMode::Synthetic);
+    }
+
+    #[test]
+    fn explicit_mode_flags_are_symmetric() {
+        assert_eq!(
+            scan_requested_jdk_mode(&tokens(&["cratonvm", "--synthetic-jdk", "Main", "--"])),
+            JdkMode::Synthetic
+        );
+        assert_eq!(
+            scan_requested_jdk_mode(&tokens(&["cratonvm", "--real-jdk", "Main", "--"])),
+            JdkMode::Real
+        );
+    }
+
+    /// A program argument after `--` must never be mistaken for a launcher
+    /// mode flag.
+    #[test]
+    fn mode_flags_after_separator_are_program_args() {
+        assert_eq!(
+            scan_requested_jdk_mode(&tokens(&["cratonvm", "Main", "--", "--synthetic-jdk"])),
+            JdkMode::Real
+        );
+    }
+
+    #[test]
+    fn both_mode_flags_is_an_error_not_a_silent_winner() {
+        let err = resolve_jdk_mode(true, true, None).expect_err("both flags must be rejected");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("mutually exclusive"), "{msg}");
+    }
+
+    /// Selecting synthetic mode in a build without the `synthetic-jdk`
+    /// Cargo feature must abort the launch. Booting anyway would register
+    /// none of the ~5,200 stubs *and* skip boot-classpath discovery,
+    /// producing a VM with no class library at all.
+    #[test]
+    fn synthetic_mode_requires_the_cargo_feature() {
+        let result = resolve_jdk_mode(true, false, None);
+        assert_eq!(result.is_ok(), SYNTHETIC_JDK_COMPILED_IN);
+        if let Err(e) = result {
+            let msg = format!("{e:#}");
+            assert!(msg.contains("synthetic-jdk"), "{msg}");
+        }
+    }
+
+    /// Real-JDK mode with a bogus `--java-home` must fail loudly, naming
+    /// what was searched — never fall through to the synthetic library.
+    #[test]
+    fn real_mode_without_a_jdk_fails_loudly() {
+        let err = resolve_jdk_mode(false, false, Some("/definitely/not/a/jdk/anywhere"))
+            .expect_err("a nonexistent --java-home must not be tolerated");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("no usable JDK was found"), "{msg}");
+        assert!(msg.contains("jmods/java.base.jmod"), "{msg}");
+        assert!(msg.contains("lib/modules"), "{msg}");
+        // The message must offer the other mode explicitly rather than
+        // silently taking it.
+        assert!(msg.contains("--synthetic-jdk"), "{msg}");
+    }
+
+    // ── version banner ───────────────────────────────────────────────
+
+    #[test]
+    fn version_query_is_recognised_in_the_launcher_section() {
+        for (tok, expected) in [
+            ("-version", VersionQuery::Version),
+            ("--version", VersionQuery::Version),
+            ("-fullversion", VersionQuery::Full),
+            ("-Xinternalversion", VersionQuery::Internal),
+            ("-showversion", VersionQuery::Show),
+        ] {
+            let got = scan_version_query(&tokens(&["cratonvm", tok]));
+            assert_eq!(got.map(|(q, _)| q), Some(expected), "token {tok}");
+        }
+        // After the program selector these are program args.
+        assert!(scan_version_query(&tokens(&["cratonvm", "Main", "--", "-version"])).is_none());
+        assert!(scan_version_query(&tokens(&["cratonvm", "Main", "--"])).is_none());
+    }
+
+    /// The whole point of routing version output through our own banner:
+    /// it must name the active class library.
+    #[test]
+    fn version_banner_names_the_jdk_mode() {
+        let banner = version_banner(VersionQuery::Version, JdkMode::Synthetic, None);
+        assert!(banner.contains("cratonvm version"), "{banner}");
+        assert!(banner.contains("synthetic-jdk"), "{banner}");
+        let banner = version_banner(VersionQuery::Version, JdkMode::Real, None);
+        assert!(banner.contains("real-jdk"), "{banner}");
+    }
+
+    #[test]
+    fn internal_version_reports_both_defaults_and_the_search_path() {
+        let banner = version_banner(VersionQuery::Internal, JdkMode::Real, None);
+        for needle in [
+            "jdk.mode.active",
+            "jdk.mode.default.launcher",
+            "jdk.mode.default.embedded",
+            "jdk.mode.synthetic_compiled_in",
+            "never host-detected",
+            "JAVA_HOME",
+            "java on PATH",
+        ] {
+            assert!(banner.contains(needle), "missing {needle}:\n{banner}");
+        }
+    }
+
+    #[test]
+    fn version_stream_matches_hotspot_conventions() {
+        // `java -version` → stderr (build tools scrape it there);
+        // `java --version` → stdout.
+        assert!(!VersionQuery::Version.to_stdout("-version"));
+        assert!(VersionQuery::Version.to_stdout("--version"));
+        assert!(VersionQuery::Version.exits());
+        assert!(!VersionQuery::Show.exits());
+    }
+
+    #[test]
+    fn showversion_token_is_stripped_before_clap() {
+        let mut argv = tokens(&["cratonvm", "-showversion", "Main", "--", "-showversion"]);
+        remove_first_launcher_token(&mut argv, "-showversion");
+        // Only the launcher-section occurrence is removed; the program arg
+        // after `--` survives.
+        assert_eq!(argv, tokens(&["cratonvm", "Main", "--", "-showversion"]));
+    }
+
+    #[test]
+    fn explicit_java_home_is_visible_to_the_banner() {
+        assert_eq!(
+            scan_explicit_java_home(&tokens(&["cratonvm", "--java-home", "/opt/jdk", "Main", "--"])),
+            Some("/opt/jdk".to_string())
+        );
+        assert_eq!(
+            scan_explicit_java_home(&tokens(&["cratonvm", "--java-home=/opt/jdk", "Main", "--"])),
+            Some("/opt/jdk".to_string())
+        );
+        assert_eq!(
+            scan_explicit_java_home(&tokens(&["cratonvm", "Main", "--", "--java-home", "/x"])),
+            None
+        );
+    }
+
+    /// clap must reject the two mode flags together rather than letting one
+    /// silently win.
+    #[test]
+    fn clap_rejects_both_mode_flags() {
+        assert!(
+            Args::try_parse_from(tokens(&[
+                "cratonvm",
+                "--real-jdk",
+                "--synthetic-jdk",
+                "Main"
+            ]))
+            .is_err(),
+            "--real-jdk and --synthetic-jdk must conflict"
+        );
+        let parsed = Args::try_parse_from(tokens(&["cratonvm", "--real-jdk", "Main"]))
+            .expect("clap must accept --real-jdk");
+        assert!(parsed.real_jdk);
+        assert!(!parsed.synthetic_jdk);
+    }
 
     // -----------------------------------------------------------------------
     // Ergonomic default-heap clamp — pure math, exercised directly so the

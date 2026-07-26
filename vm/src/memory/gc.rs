@@ -15,6 +15,188 @@ pub use cratonvm_gc::gc::*;
 use crate::types::ObjectRef;
 #[cfg(test)]
 use crate::types::Value;
+use cratonvm_types::narrow_oop::{read_ref_slot, ref_element_size};
+
+/// Result of one VM metadata-unloading transaction.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ClassMetadataUnloadResult {
+    pub loaders_unloaded: usize,
+    pub classes_unloaded: usize,
+    pub jit_entries_retired: usize,
+}
+
+/// Complete the metadata half of class-loader unloading after GC has proved
+/// the defining loader objects unreachable.
+///
+/// ClassIds remain monotonic tombstones. Every VM-owned cache is either
+/// invalidated by exact ClassId or conservatively flushed when it lacks an
+/// ownership index.
+pub fn unload_dead_class_metadata(
+    shared: &crate::vm::SharedVm,
+    dead_class_hints: &[u32],
+) -> ClassMetadataUnloadResult {
+    use crate::classloading::{ClassId, ClassLoaderId};
+    use rustc_hash::FxHashSet;
+
+    if dead_class_hints.is_empty() {
+        return ClassMetadataUnloadResult::default();
+    }
+
+    let loaders: FxHashSet<ClassLoaderId> = {
+        let cm = shared.classes.class_manager.read();
+        dead_class_hints
+            .iter()
+            .filter_map(|id| cm.get_loader_id(ClassId::new(*id)))
+            .filter(|id| matches!(id, ClassLoaderId::UserDefined(_)))
+            .collect()
+    };
+    if loaders.is_empty() {
+        cratonvm_native_builtins::classloader::forget_unloaded_classes(dead_class_hints);
+        return ClassMetadataUnloadResult::default();
+    }
+
+    let unloaded = {
+        let mut cm = shared.classes.class_manager_write();
+        let mut classes = Vec::new();
+        for loader in &loaders {
+            classes.extend(cm.unload_user_loader(*loader));
+        }
+        classes
+    };
+    if unloaded.is_empty() {
+        cratonvm_native_builtins::classloader::forget_unloaded_classes(dead_class_hints);
+        return ClassMetadataUnloadResult::default();
+    }
+
+    let ids: FxHashSet<ClassId> = unloaded.iter().map(|class| class.id).collect();
+    let raw_ids: Vec<u32> = unloaded.iter().map(|class| class.id.as_u32()).collect();
+
+    shared
+        .classes
+        .statics
+        .write()
+        .retain(|id, _| !ids.contains(id));
+    shared
+        .classes
+        .class_locks
+        .write()
+        .retain(|id, _| !ids.contains(id));
+    shared
+        .classes
+        .field_descriptor_cache
+        .write()
+        .retain(|(id, _), _| !ids.contains(id));
+    shared
+        .classes
+        .class_init_waiters
+        .lock()
+        .retain(|id, _| !ids.contains(id));
+    shared
+        .classes
+        .lambda_proxies
+        .write()
+        .retain(|id, _| !ids.contains(id));
+    shared
+        .classes
+        .lambda_proxy_hosts
+        .write()
+        .retain(|proxy, host| !ids.contains(proxy) && !ids.contains(host));
+
+    let dead_mirrors: Vec<ObjectRef> = {
+        let mut mirrors = shared.classes.class_mirrors.write();
+        ids.iter().filter_map(|id| mirrors.remove(id)).collect()
+    };
+    shared
+        .classes
+        .class_mirrors_reverse
+        .write()
+        .retain(|_, id| !ids.contains(id));
+    cratonvm_native_builtins::classloader::forget_unloaded_class_mirrors(&dead_mirrors);
+
+    {
+        let mut cache = shared.classes.initiating_resolution_cache.write();
+        cache.retain(|loader, entries| {
+            if loaders.contains(loader) {
+                return false;
+            }
+            entries.retain(|_, id| !ids.contains(id));
+            !entries.is_empty()
+        });
+    }
+
+    // These caches are pure memoizers. A conservative clear is preferable to
+    // retaining a value that mentions an unloaded class through an indirect
+    // target not represented in its key.
+    //
+    // ARCH-2026-07-26 (request CR-LR-1 of
+    // `docs/internal/arch-2026-07-26/stackwalk-and-vtable.md`): this used to
+    // call `invalidate_all()`, which takes THREE write locks — but two of them
+    // guard `SharedResolutionState::global_methods` / `global_fields`, whose
+    // only writers (`cache_method` / `cache_field`) have no production callers,
+    // so those maps are always empty here. Re-verified on this tree: the sole
+    // external consumers of `shared_resolution` are this line and the
+    // interpreter's `promoted_*` paths. `invalidate_promoted()` clears exactly
+    // the live cache, and — more importantly — stops this call site implying
+    // that the other two maps are live.
+    shared.classes.shared_resolution.invalidate_promoted();
+    shared.classes.osc_cache.remove_classes(&ids);
+
+    let mut jit_entries_retired = 0;
+    {
+        // PERF (ARCH-2026-07-26, request CR-VT-1 of
+        // `docs/internal/arch-2026-07-26/stackwalk-and-vtable.md`).
+        // `unload_class` calls `invalidate_class`, which sweeps EVERY slot of
+        // EVERY vtable in the VM — so a per-class loop here costs
+        // O(unloaded x all_classes x slots_per_class) under the manager write
+        // lock: for a few hundred unloaded classes in a VM holding tens of
+        // thousands, hundreds of millions of slot visits at a moment when every
+        // dispatching thread is waiting on this lock. `unload_classes` does one
+        // sweep for the whole batch and is proven equivalent to the loop by
+        // `vtable::tests::unload_classes_matches_a_loop_of_unload_class`.
+        let dead: Vec<u64> = unloaded.iter().map(|c| c.id.as_u32() as u64).collect();
+        let mut vtables = shared.classes.vtable_manager.write();
+        vtables.unload_classes(&dead);
+    }
+    for class in &unloaded {
+        shared
+            .jit
+            .jit_alloc_class_cache
+            .invalidate(class.id.as_u32());
+        shared.jit.profile_store.invalidate_class(class.id.as_u32());
+        shared
+            .jit
+            .tiered_manager
+            .invalidate_class(class.name.as_ref());
+        shared.jit.deopt_log.lock().clear_class(class.name.as_ref());
+        jit_entries_retired += shared
+            .jit
+            .jit_cache
+            .invalidate_unloaded_class(class.id, class.name.as_ref());
+    }
+    shared.jit.invalidation_manager.lock().clear_all();
+    shared
+        .jit
+        .jit_skip_set
+        .write()
+        .retain(|(class_name, _, _)| {
+            !unloaded
+                .iter()
+                .any(|class| class.name.as_ref() == class_name.as_ref())
+        });
+
+    cratonvm_native_builtins::classloader::forget_unloaded_classes(&raw_ids);
+    shared
+        .debug
+        .diagnostic_counters
+        .classes_unloaded
+        .fetch_add(unloaded.len() as u64, std::sync::atomic::Ordering::Relaxed);
+
+    ClassMetadataUnloadResult {
+        loaders_unloaded: loaders.len(),
+        classes_unloaded: unloaded.len(),
+        jit_entries_retired,
+    }
+}
 
 /// Post-GC reconciliation of the class-mirror cache (companion to
 /// `roots.rs` step 6, which stops unconditionally rooting a user-defined
@@ -35,9 +217,9 @@ use crate::types::Value;
 /// `is_marked` is always true and nothing is pruned.
 pub fn reconcile_class_mirrors(shared: &crate::vm::SharedVm, is_marked: &dyn Fn(usize) -> bool) {
     let dbg = std::env::var_os("CRATONVM_DBG_MIRRORPIN").is_some();
-    let mut mirrors = shared.class_mirrors.write();
+    let mut mirrors = shared.classes.class_mirrors.write();
     if dbg {
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         for (&class_id, obj_ref) in mirrors.iter() {
             let name = cm
                 .get_class(class_id)
@@ -68,7 +250,7 @@ pub fn reconcile_class_mirrors(shared: &crate::vm::SharedVm, is_marked: &dyn Fn(
 /// `defining_loader_for` hash lookup that returns `None` (skipped) for every
 /// built-in-loader class — the overwhelmingly common case.
 pub fn rebuild_mirror_pins(shared: &crate::vm::SharedVm, pointer_map: &HashMap<usize, usize>) {
-    let class_mirrors = shared.class_mirrors.read();
+    let class_mirrors = shared.classes.class_mirrors.read();
     let mut entries: Vec<(usize, usize)> = Vec::new();
     for (&class_id, mirror_ref) in class_mirrors.iter() {
         if let Some(loader) =
@@ -159,6 +341,23 @@ pub(crate) fn gcpart_probe(addr: usize) -> Vec<(u64, Option<usize>, usize, bool)
     }
 }
 
+fn remap_handle_slots(
+    slots: &mut [Option<ObjectRef>],
+    pointer_map: &HashMap<usize, usize>,
+) -> usize {
+    let mut rewritten = 0;
+    for slot in slots.iter_mut().flatten() {
+        let old_addr = slot.as_ptr() as usize;
+        if let Some(&new_addr) = pointer_map.get(&old_addr) {
+            debug_assert!(new_addr != 0, "GC pointer map contains null address");
+            // SAFETY: relocation maps contain live, aligned object addresses.
+            *slot = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+            rewritten += 1;
+        }
+    }
+    rewritten
+}
+
 /// Scans thread frames (locals + operand stacks), static fields, class locks,
 /// and printed values, updating any ObjectRef whose old address appears in
 /// the pointer map.
@@ -178,14 +377,14 @@ pub fn update_all_roots(
     // Done BEFORE the empty-map early return so a non-relocating sweep also keeps
     // the cache rather than forcing a full rebuild. Opt-in/default-OFF + no-op
     // unless the rootsnap cache is enabled. See `remap_rs_cache_after_gc`.
-    crate::runtime::interpreter::remap_rs_cache_after_gc(thread, pointer_map, &shared.heap);
+    crate::runtime::interpreter::remap_rs_cache_after_gc(thread, pointer_map, &shared.mem.heap);
     // Long-smuggle mint registry: relocate registered handles through this
     // cycle's pointer map and drop entries whose referent died. BEFORE the
     // empty-map early return so non-relocating sweeps still sweep dead
     // entries (a reclaimed address must not stay registered — a future
     // primitive long colliding with the reused address would otherwise pass
     // the rewrite gate).
-    crate::memory::smuggled_longs::remap_and_sweep(pointer_map, &shared.heap);
+    crate::memory::smuggled_longs::remap_and_sweep(pointer_map, &shared.mem.heap);
     // Throwable backtraces are VM-wide, non-owning side data. Keep the stored
     // object handle in sync with a move and prune traces for collected
     // throwables before any early return for a non-relocating sweep.
@@ -193,7 +392,7 @@ pub fn update_all_roots(
     if std::env::var_os("CRATONVM_DBG_ALTRACE").is_some() {
         eprintln!(
             "[altrace GC] count={} moved={} tid={}",
-            shared.heap.collection_count(),
+            shared.mem.heap.collection_count(),
             pointer_map.len(),
             thread.thread_id.0
         );
@@ -201,7 +400,7 @@ pub fn update_all_roots(
     if pointer_map.is_empty() {
         return;
     }
-    gcpart_record(shared.heap.collection_count(), pointer_map);
+    gcpart_record(shared.mem.heap.collection_count(), pointer_map);
     crate::runtime::interpreter::remap_trace_push(
         shared,
         thread,
@@ -232,14 +431,16 @@ pub fn update_all_roots(
     // moves but main's frames are not remapped (the concurrent-spawn stale-`parent`
     // root cause). Read the mirror's CURRENT (pre-step-21) registry address.
     if std::env::var_os("CRATONVM_DBG_BUG03").is_some() {
-        let epoch = shared.heap.collection_count();
+        let epoch = shared.mem.heap.collection_count();
         let main_old = shared
+            .threads
             .thread_registry
             .java_thread_obj(crate::threading::jvm_thread::ThreadId(0))
             .map(|o| o.as_ptr() as usize)
             .unwrap_or(0);
         let moves = main_old != 0 && pointer_map.contains_key(&main_old);
         let blocked = shared
+            .threads
             .thread_registry
             .dump_blocked_states()
             .into_iter()
@@ -314,13 +515,15 @@ pub fn update_all_roots(
             .find_map(|(k, v)| (*v == w).then_some(*k));
         eprintln!(
             "[watch] GC#{} addr=0x{w:x} moved_to={fwd:x?} moved_from={back:x?}",
-            shared.heap.collection_count()
+            shared.mem.heap.collection_count()
         );
     }
     // 1. Thread frames — locals and operand stacks (SoA layout)
     for frame in &mut thread.frames {
-        frame.update_local_refs(pointer_map, &shared.heap);
-        frame.stack.update_object_refs(pointer_map, &shared.heap);
+        frame.update_local_refs(pointer_map, &shared.mem.heap);
+        frame
+            .stack
+            .update_object_refs(pointer_map, &shared.mem.heap);
         // Forward the synchronized-method monitor object too. A `synchronized`
         // method records the object it locked on entry in `monitor_on_exit` and
         // releases it on frame-pop. If a GC during the method body relocates
@@ -347,7 +550,7 @@ pub fn update_all_roots(
             for li in 0..fr.locals_len() {
                 if let crate::types::Value::Object(Some(o)) = fr.get_local(li as u16) {
                     let a = o.as_ptr() as usize;
-                    if let Some(new) = shared.heap.debug_forwarded_target(a) {
+                    if let Some(new) = shared.mem.heap.debug_forwarded_target(a) {
                         eprintln!(
                             "[blockgc] INITIATOR-STALE tid={} frame#{fi} {}.{} pc={} local[{li}] 0x{a:x}->0x{new:x} in_map={}",
                             thread.thread_id.0, fr.class_name(), fr.method_name(), fr.pc,
@@ -359,7 +562,7 @@ pub fn update_all_roots(
             for si in 0..fr.stack.len() {
                 if let crate::types::Value::Object(Some(o)) = fr.stack.peek_at(si) {
                     let a = o.as_ptr() as usize;
-                    if let Some(new) = shared.heap.debug_forwarded_target(a) {
+                    if let Some(new) = shared.mem.heap.debug_forwarded_target(a) {
                         eprintln!(
                             "[blockgc] INITIATOR-STALE tid={} frame#{fi} {}.{} pc={} stack[{si}] 0x{a:x}->0x{new:x} in_map={}",
                             thread.thread_id.0, fr.class_name(), fr.method_name(), fr.pc,
@@ -403,6 +606,11 @@ pub fn update_all_roots(
         }
     }
 
+    // Handle-scope slots (arch/handles) are roots too: without this remap a
+    // RootedHandle read after a moving collection would decode the pre-move
+    // address. Mirrors the native_pin_roots loop above.
+    remap_handle_slots(&mut thread.handle_slots, pointer_map);
+
     if let Some(ref mut obj_ref) = thread.native_pending_return {
         let old_addr = obj_ref.as_ptr() as usize;
         if let Some(&new_addr) = pointer_map.get(&old_addr) {
@@ -432,7 +640,7 @@ pub fn update_all_roots(
 
     // 2. Static fields
     {
-        let mut statics = shared.statics.write();
+        let mut statics = shared.classes.statics.write();
         for fields in statics.values_mut() {
             for val in fields.iter_mut() {
                 update_value_ref(val, pointer_map);
@@ -442,7 +650,7 @@ pub fn update_all_roots(
 
     // 3. Class lock objects
     {
-        let mut class_locks = shared.class_locks.write();
+        let mut class_locks = shared.classes.class_locks.write();
         for obj_ref in class_locks.values_mut() {
             let old_addr = obj_ref.as_ptr() as usize;
             if let Some(&new_addr) = pointer_map.get(&old_addr) {
@@ -462,7 +670,7 @@ pub fn update_all_roots(
 
     // 5. Interned string pool
     {
-        let mut string_pool = shared.string_pool.write();
+        let mut string_pool = shared.mem.string_pool.write();
         for obj_ref in string_pool.values_mut() {
             let old_addr = obj_ref.as_ptr() as usize;
             if let Some(&new_addr) = pointer_map.get(&old_addr) {
@@ -477,7 +685,7 @@ pub fn update_all_roots(
 
     // 6. Class mirror cache
     {
-        let mut class_mirrors = shared.class_mirrors.write();
+        let mut class_mirrors = shared.classes.class_mirrors.write();
         for obj_ref in class_mirrors.values_mut() {
             let old_addr = obj_ref.as_ptr() as usize;
             if let Some(&new_addr) = pointer_map.get(&old_addr) {
@@ -495,7 +703,7 @@ pub fn update_all_roots(
     //     `static final` slot is remapped via the `statics` block above using
     //     the same pointer-map entry, now that the VarHandle is traced/copied).
     {
-        let mut var_handle_roots = shared.var_handle_roots.write();
+        let mut var_handle_roots = shared.mem.var_handle_roots.write();
         for obj_ref in var_handle_roots.values_mut() {
             let old_addr = obj_ref.as_ptr() as usize;
             if let Some(&new_addr) = pointer_map.get(&old_addr) {
@@ -509,12 +717,12 @@ pub fn update_all_roots(
     //     ALIVE (memory/roots.rs step 8c), but the holder is a bare
     //     `SharedVm` field no other remap step covers — without this, the
     //     first relocating GC that moves the singleton leaves
-    //     `shared.singleton_oom` dangling, and a later true OOM throws a
+    //     `shared.mem.singleton_oom` dangling, and a later true OOM throws a
     //     reclaimed/zeroed object that surfaces as the unreadable
     //     `Exception in thread "main" unknown` (observed deterministically on
     //     the SteadyChurn recreation under sustained G1 churn).
     {
-        let mut oom = shared.singleton_oom.write();
+        let mut oom = shared.mem.singleton_oom.write();
         if let Some(ref mut obj_ref) = *oom {
             let old_addr = obj_ref.as_ptr() as usize;
             if let Some(&new_addr) = pointer_map.get(&old_addr) {
@@ -543,7 +751,7 @@ pub fn update_all_roots(
     //     means that store is mid-flight and its value is about to be
     //     overwritten anyway.
     {
-        if let Some(mut tg) = shared.main_thread_group.try_write() {
+        if let Some(mut tg) = shared.threads.main_thread_group.try_write() {
             if let Some(ref mut obj_ref) = *tg {
                 let old_addr = obj_ref.as_ptr() as usize;
                 if let Some(&new_addr) = pointer_map.get(&old_addr) {
@@ -606,7 +814,7 @@ pub fn update_all_roots(
 
     // 8. Primitive type Class mirrors
     {
-        let mut prim_mirrors = shared.primitive_mirrors.write();
+        let mut prim_mirrors = shared.classes.primitive_mirrors.write();
         for obj_ref in prim_mirrors.values_mut() {
             let old_addr = obj_ref.as_ptr() as usize;
             if let Some(&new_addr) = pointer_map.get(&old_addr) {
@@ -622,7 +830,7 @@ pub fn update_all_roots(
     // 8a. Canonical java.lang.Module mirrors (companion to root scan in
     //     roots.rs section 8a).
     {
-        let mut module_mirrors = shared.module_mirrors.write();
+        let mut module_mirrors = shared.classes.module_mirrors.write();
         for obj_ref in module_mirrors.values_mut() {
             let old_addr = obj_ref.as_ptr() as usize;
             if let Some(&new_addr) = pointer_map.get(&old_addr) {
@@ -634,7 +842,11 @@ pub fn update_all_roots(
 
     // 9. JNI global references — update stored ObjectRefs inside each Box<ObjectRef>.
     {
-        shared.jni_global_refs.lock().update_after_gc(pointer_map);
+        shared
+            .natives
+            .jni_global_refs
+            .lock()
+            .update_after_gc(pointer_map);
     }
 
     // 9a. Native upcall table — rewrite each live slot's callback `target` to its
@@ -642,7 +854,11 @@ pub fn update_all_roots(
     //     does not read a stale pointer after a moving collection (root scan in
     //     roots.rs section 9a).
     {
-        shared.upcall_table.lock().update_after_gc(pointer_map);
+        shared
+            .natives
+            .upcall_table
+            .lock()
+            .update_after_gc(pointer_map);
     }
 
     // 9b. NIO selector side-table — the `sun.nio.ch.SelectionKeyImpl` registry
@@ -705,14 +921,14 @@ pub fn update_all_roots(
 
     // 13. Resolution cache — CONSTANT_Dynamic values may hold ObjectRefs
     {
-        let mut cache = shared.resolution_cache.write();
+        let mut cache = shared.classes.resolution_cache.write();
         cache.update_condy_refs(pointer_map);
     }
 
     // 14. Class mirrors reverse map — rebuild keys from updated forward map
     {
-        let class_mirrors = shared.class_mirrors.read();
-        let mut reverse = shared.class_mirrors_reverse.write();
+        let class_mirrors = shared.classes.class_mirrors.read();
+        let mut reverse = shared.classes.class_mirrors_reverse.write();
         reverse.clear();
         for (&class_id, obj_ref) in class_mirrors.iter() {
             reverse.insert(*obj_ref, class_id);
@@ -742,6 +958,11 @@ pub fn update_all_roots(
     //     CallSite cache living in `native-builtins/src/lang_invoke.rs`.
     //     Same scan/update contract as the Integer.valueOf cache.
     cratonvm_native_builtins::lang_invoke::gc_update_lambda_callsite_cache_refs(pointer_map);
+
+    // 16a. Re-point the zero-capture lambda proxy singleton cache
+    //      (scanned in `roots.rs` step 16a). Same scan/update contract as
+    //      the Integer.valueOf cache.
+    crate::runtime::invokedynamic::gc_update_lambda_singleton_refs(shared.vm_identity, pointer_map);
 
     // 17. Overlay-backed collections (LinkedList / LinkedHashMap / TreeMap /
     //     TreeSet) keep their backing arrays + nodes in process-global Rust
@@ -851,6 +1072,7 @@ pub fn update_all_roots(
     //     place and composes this map into its pending wake-time frame
     //     fixup (applied in `check_post_block_gc`).
     shared
+        .threads
         .thread_registry
         .fold_pointer_map_into_blocked(pointer_map);
 
@@ -860,6 +1082,7 @@ pub fn update_all_roots(
     //     back into bytecode and `LockSupport.unpark(Thread)` lookups by
     //     the relocated address silently miss (lost wakeups).
     shared
+        .threads
         .thread_registry
         .update_thread_objs_after_gc(pointer_map);
 
@@ -894,8 +1117,8 @@ pub fn validate_object_sizes(shared: &crate::vm::SharedVm) {
     if std::env::var_os("CRATONVM_DBG_VALIDATE_NEW").is_none() {
         return;
     }
-    let heap = &shared.heap;
-    let cm = shared.class_manager.read();
+    let heap = &shared.mem.heap;
+    let cm = shared.classes.class_manager.read();
     // One-shot: dump the class_id -> (name, num_total_fields) table for the
     // low class_ids that show up in the JUnitCore-corruption walks (6, 12, 34,
     // 36, ...), so the corrupted object types can be identified by name.
@@ -925,8 +1148,8 @@ pub fn validate_object_sizes(shared: &crate::vm::SharedVm) {
             continue;
         }
         let cid = hdr.class_id;
-        let actual = hdr.num_slots as usize;
-        let arrlen = hdr.array_length;
+        let actual = hdr.num_slots() as usize;
+        let arrlen = hdr.array_length();
         match cm.get_class(cid) {
             Some(c) => {
                 if actual != c.num_total_fields || arrlen != 0 {
@@ -978,9 +1201,10 @@ pub fn verify_heap_object_fields(
     if std::env::var_os("CRATONVM_DBG_HEAP_STALE").is_none() {
         return;
     }
-    let heap = &shared.heap;
+    let heap = &shared.mem.heap;
     let class_name = |cid: cratonvm_types::ClassId| -> String {
         shared
+            .classes
             .class_manager
             .read()
             .get_class(cid)
@@ -1004,8 +1228,8 @@ pub fn verify_heap_object_fields(
         let h = unsafe { &*(addr as *const ObjectHeader) };
         if h.class_id.as_u32() == 0
             && h.identity_hash_code == 0
-            && h.num_slots == 0
-            && h.array_length == 0
+            && h.num_slots() == 0
+            && h.array_length() == 0
         {
             return Some("ZEROED(reclaimed)");
         }
@@ -1039,10 +1263,10 @@ pub fn verify_heap_object_fields(
             }
         } else if hdr.kind == ObjectKind::Array && hdr.element_type == ArrayElementType::Reference {
             // Reference array (Object[]): elements are 8-byte compact pointers.
-            let len = hdr.array_length as usize;
+            let len = hdr.array_length() as usize;
             for i in 0..len {
-                let s_ptr = unsafe { (ptr as *const u8).add(HEADER_SIZE + i * REF_ELEMENT_SIZE) };
-                let raw = unsafe { std::ptr::read(s_ptr as *const u64) } as usize;
+                let s_ptr = unsafe { (ptr as *const u8).add(HEADER_SIZE + i * ref_element_size()) };
+                let raw = unsafe { read_ref_slot(s_ptr) } as usize;
                 if let Some(reason) = classify(raw) {
                     eprintln!(
                         "[heap-stale] {} ARR {}[{}] -> 0x{:x}",
@@ -1181,8 +1405,8 @@ fn verify_no_stale_refs(
                     let h = unsafe { &*(addr as *const ObjectHeader) };
                     if h.class_id.as_u32() == 0
                         && h.identity_hash_code == 0
-                        && h.num_slots == 0
-                        && h.array_length == 0
+                        && h.num_slots() == 0
+                        && h.array_length() == 0
                     {
                         eprintln!(
                             "POST-GC ZERO-HEADER LOCAL: frame[{}] {}.{} local[{}] pc={} \
@@ -1237,8 +1461,8 @@ fn verify_no_stale_refs(
                     let h = unsafe { &*(addr as *const ObjectHeader) };
                     if h.class_id.as_u32() == 0
                         && h.identity_hash_code == 0
-                        && h.num_slots == 0
-                        && h.array_length == 0
+                        && h.num_slots() == 0
+                        && h.array_length() == 0
                     {
                         eprintln!(
                             "POST-GC ZERO-HEADER STACK: frame[{}] {}.{} stack[{}] pc={} \
@@ -1276,6 +1500,20 @@ mod tests {
     }
 
     #[test]
+    fn moving_gc_rewrites_live_handle_slots_in_place() {
+        // SAFETY: these aligned non-null addresses are never dereferenced.
+        let old = unsafe { ObjectRef::from_raw(0x1000usize as *mut u8) };
+        let unmoved = unsafe { ObjectRef::from_raw(0x3000usize as *mut u8) };
+        let mut slots = vec![Some(old), None, Some(unmoved)];
+        let pointer_map = HashMap::from([(0x1000usize, 0x2000usize)]);
+
+        assert_eq!(remap_handle_slots(&mut slots, &pointer_map), 1);
+        assert_eq!(slots[0].unwrap().as_ptr() as usize, 0x2000);
+        assert!(slots[1].is_none());
+        assert_eq!(slots[2].unwrap().as_ptr() as usize, 0x3000);
+    }
+
+    #[test]
     fn gc_basic_copy_single_object() {
         let heap = small_heap();
         let obj = heap.alloc_object(ClassId::new(1), 2);
@@ -1295,7 +1533,7 @@ mod tests {
         // Read fields from to-space
         let header = unsafe { &*(new_obj.as_ptr() as *const crate::memory::heap::ObjectHeader) };
         assert_eq!(header.class_id, ClassId::new(1));
-        assert_eq!(header.num_slots, 2);
+        assert_eq!(header.num_slots(), 2);
 
         // Read field values from to-space via raw pointers
         let field0_ptr = unsafe { new_obj.as_ptr().add(crate::memory::heap::HEADER_SIZE) };

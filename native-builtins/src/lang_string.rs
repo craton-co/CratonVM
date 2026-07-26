@@ -3,7 +3,7 @@
 
 //! String, StringBuilder, and StringBuffer native method implementations.
 
-use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_native_api::{NativeContext, NativeHandleScope, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult};
 use cratonvm_types::intern_arc;
 use cratonvm_types::Value;
@@ -912,26 +912,28 @@ pub(crate) fn native_string_init_abstract_string_builder(
     let latin1 = chars.iter().all(|&u| u <= 0xFF);
     let byte_len = if latin1 { chars.len() } else { chars.len() * 2 };
 
-    let this_pin = ctx.pin_native_root(this);
-    let value = ctx.new_array(ArrayElementType::Byte, byte_len);
-    let this = ctx.read_native_pin(this_pin, this);
-    ctx.unpin_native_roots(this_pin);
+    // `this` crosses an allocating call, so retain it only through the
+    // collector-updated slot. The scope closes automatically on every exit.
+    let mut scope = NativeHandleScope::new(ctx);
+    let this_h = scope.root(this);
+    let value = scope.new_array(ArrayElementType::Byte, byte_len);
+    let this = scope.get(&this_h);
 
     if latin1 {
         for (i, &u) in chars.iter().enumerate() {
-            ctx.set_array_element(value, i, Value::Int((u & 0xFF) as i32));
+            scope.set_array_element(value, i, Value::Int((u & 0xFF) as i32));
         }
     } else {
         for (i, &u) in chars.iter().enumerate() {
-            ctx.set_array_element(value, i * 2, Value::Int((u & 0xFF) as i32));
-            ctx.set_array_element(value, i * 2 + 1, Value::Int(((u >> 8) & 0xFF) as i32));
+            scope.set_array_element(value, i * 2, Value::Int((u & 0xFF) as i32));
+            scope.set_array_element(value, i * 2 + 1, Value::Int(((u >> 8) & 0xFF) as i32));
         }
     }
 
-    ctx.set_field(this, 0, Value::Object(Some(value)));
-    ctx.set_field(this, 1, Value::Int(if latin1 { 0 } else { 1 }));
-    ctx.set_field(this, 2, Value::Int(0));
-    ctx.set_field(this, 3, Value::Int(0));
+    scope.set_field(this, 0, Value::Object(Some(value)));
+    scope.set_field(this, 1, Value::Int(if latin1 { 0 } else { 1 }));
+    scope.set_field(this, 2, Value::Int(0));
+    scope.set_field(this, 3, Value::Int(0));
     Ok(None)
 }
 
@@ -1496,11 +1498,77 @@ pub(crate) fn sb_state(
 /// (matching the `class_num_total_fields` idiom used elsewhere to avoid
 /// hard-coding a layout — see the `Timestamp` nanos-field fix), so branch
 /// on it instead of assuming either shape.
+/// Helper: write the StringBuilder count in the layout-appropriate slot.
+///
+/// CratonVM's own synthetic StringBuilder/StringBuffer layout is 2 slots:
+/// `value: char[]` @0, `count: int` @1 (see `instance_fields(2)` in
+/// `classloading/src/class_manager.rs`) — this is the layout every object
+/// actually gets allocated with unless real `AbstractStringBuilder`
+/// bytecode itself constructs one (e.g. during Byte Buddy
+/// retransformation), which uses the real JDK 9+ 3-slot layout `value:
+/// byte[]` @0, `coder: byte` @1, `count: int` @2 instead.
+///
+/// A prior version of this helper unconditionally wrote slot 1 = 0 (as a
+/// LATIN1 `coder` placeholder) and mirrored `count` into slot 2, on the
+/// assumption every StringBuilder has the 3-slot real layout. Every
+/// StringBuilder actually allocated through CratonVM's own 2-slot
+/// synthetic path (i.e. essentially all of them) instead had its *real*
+/// count slot (slot 1) stomped to 0 on every append/insert/setLength call,
+/// and the slot-2 mirror silently dropped by the `gen_heap` OOB-write
+/// guard (num_slots=2 < index 2) — so `StringBuilder.length()` always
+/// read back 0 immediately after the write that was supposed to grow it.
+/// Java code with a growth loop keyed on `sb.length()` (e.g.
+/// `while (sb.length() < n) sb.append(c);`, seen during real
+/// `java.desktop`/`java.beans` clinit) never observed the length increase
+/// and spun forever, hammering the OOB guard on every iteration.
+///
+/// `object_num_fields` reports the object's *actual* allocated slot count
+/// (matching the `class_num_total_fields` idiom used elsewhere to avoid
+/// hard-coding a layout — see the `Timestamp` nanos-field fix), so branch
+/// on it instead of assuming either shape.
+///
+/// # The by-name mirror (2026-07-26)
+///
+/// The 3-slot branch's `@2` is the JDK 9 layout `value/coder/count`. JDK 25's
+/// `AbstractStringBuilder` declares FOUR instance fields —
+/// `value @0, coder @1, maybeLatin1 @2, count @3` — so on a real JDK 25 image
+/// slot 2 is `maybeLatin1` and the field genuinely named `count` was never
+/// written at all.
+///
+/// That stayed invisible while CratonVM's own natives were the only readers:
+/// they agree with each other on whichever slot this helper picked. It becomes
+/// visible the moment real `AbstractStringBuilder` bytecode runs against one of
+/// these objects — which is exactly what happens once Mockito's inline mock
+/// maker redefines `StringBuilder`/`AbstractStringBuilder` in place. From then
+/// on `length()` cedes to the woven advice (deliberately, so a MOCK's advice
+/// can run), and the advice's "not mocked" fallthrough is the original
+/// `getfield count:I`: it read the real, never-written `count` and returned
+/// **0** for a genuinely real builder. That is the "KNOWN REMAINING GAP" the
+/// 2026-07-23 MockitoBean session documented and left open.
+///
+/// It is not academic: `org.springframework.cglib.core.TypeUtils.map` does
+/// `type.substring(0, type.length() - sb.length() * 2)`, so a zero
+/// `sb.length()` left the trailing `[]` unstripped and
+/// `MethodInterceptorGenerator`'s `static final GET_DECLARED_METHODS` signature
+/// came out as the malformed `()[Ljava/lang/reflect/Method[];`. That field
+/// initialises once per class, so ONE Mockito mock anywhere in the process
+/// poisoned every cglib proxy generated afterwards, each dying in
+/// `CGLIB$STATICHOOK1` with `NoSuchMethodError: java.lang.Class
+/// .getDeclaredMethods` — what `AotIntegrationTests
+/// #endToEndTestsForBeanOverrides` aborted on.
+///
+/// So mirror the count into the field actually NAMED `count` as well. The
+/// index-based writes stay exactly as they were (every native in this file
+/// reads them back, and the unit-test `NativeContext` mock has no class model
+/// to resolve names against), and the extra by-name write is a no-op when no
+/// such field exists.
 fn sb_set_count(ctx: &mut dyn NativeContext, this: cratonvm_types::ObjectRef, count: i32) {
     if ctx.object_num_fields(this) >= 3 {
         // Real JDK 9+ layout: value@0, coder@1, count@2.
         ctx.set_field(this, 1, Value::Int(0));
         ctx.set_field(this, 2, Value::Int(count));
+        // …plus wherever THIS JDK actually puts `count` (JDK 25: slot 3).
+        ctx.set_field_by_name(this, "count", Value::Int(count));
     } else {
         // CratonVM synthetic layout: value(char[])@0, count@1.
         ctx.set_field(this, 1, Value::Int(count));
@@ -1533,13 +1601,10 @@ pub(crate) fn sb_ensure_capacity(
         count + additional,
     );
 
-    // Pin `this` before `ctx.new_array` — allocation can trigger a moving GC
-    // that relocates `this`, making the Rust-local copy stale.
-    let this_pin = ctx.pin_native_root(this);
-    let new_buf = ctx.new_array(ArrayElementType::Char, new_cap);
-    // Re-read `this` from the pin; GC updated it if the object moved.
-    let this = ctx.read_native_pin(this_pin, this);
-    ctx.unpin_native_roots(this_pin);
+    let mut scope = NativeHandleScope::new(ctx);
+    let this_handle = scope.root(this);
+    let new_buf = scope.new_array(ArrayElementType::Char, new_cap);
+    let this = scope.get(&this_handle);
 
     // Re-read old_buf via the GC-updated `this` (GC also updates object fields).
     // audit-round5 fix #6 (HIGH): use the `bulk_array_copy` intrinsic
@@ -1547,15 +1612,15 @@ pub(crate) fn sb_ensure_capacity(
     // per-element `get_array_element` / `set_array_element` loop. This
     // collapses 2N virtual trait dispatches into one bulk call on the
     // StringBuilder grow path.
-    if let Value::Object(Some(old_buf)) = ctx.get_field(this, 0) {
-        if ctx.object_is_array(old_buf)
-            && ctx.heap_element_type_of(old_buf) == cratonvm_types::ArrayElementType::Char
+    if let Value::Object(Some(old_buf)) = scope.get_field(this, 0) {
+        if scope.object_is_array(old_buf)
+            && scope.heap_element_type_of(old_buf) == cratonvm_types::ArrayElementType::Char
         {
-            let _ = ctx.bulk_array_copy(old_buf, 0, new_buf, 0, count);
+            let _ = scope.bulk_array_copy(old_buf, 0, new_buf, 0, count);
         }
     }
 
-    ctx.set_field(this, 0, Value::Object(Some(new_buf)));
+    scope.set_field(this, 0, Value::Object(Some(new_buf)));
     (this, new_buf)
 }
 
@@ -1617,14 +1682,12 @@ pub(crate) fn native_sb_init_default(
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
-    // Pin `this` before `ctx.new_array` — a moving GC during allocation would
-    // relocate `this`, leaving the Rust-local copy stale.
-    let this_pin = ctx.pin_native_root(this);
-    let buf = ctx.new_array(ArrayElementType::Char, 16);
-    let this = ctx.read_native_pin(this_pin, this);
-    ctx.unpin_native_roots(this_pin);
-    ctx.set_field(this, 0, Value::Object(Some(buf)));
-    sb_set_count(ctx, this, 0);
+    let mut scope = NativeHandleScope::new(ctx);
+    let this_h = scope.root(this);
+    let buf = scope.new_array(ArrayElementType::Char, 16);
+    let this = scope.get(&this_h);
+    scope.set_field(this, 0, Value::Object(Some(buf)));
+    sb_set_count(&mut *scope, this, 0);
     Ok(None)
 }
 
@@ -1643,15 +1706,15 @@ pub(crate) fn native_sb_init_string(
     };
     let chars: Vec<u16> = text.encode_utf16().collect();
     let cap = chars.len() + 16;
-    let this_pin = ctx.pin_native_root(this);
-    let buf = ctx.new_array(ArrayElementType::Char, cap);
-    let this = ctx.read_native_pin(this_pin, this);
-    ctx.unpin_native_roots(this_pin);
+    let mut scope = NativeHandleScope::new(ctx);
+    let this_h = scope.root(this);
+    let buf = scope.new_array(ArrayElementType::Char, cap);
+    let this = scope.get(&this_h);
     for (i, &ch) in chars.iter().enumerate() {
-        ctx.set_array_element(buf, i, Value::Int(ch as i32));
+        scope.set_array_element(buf, i, Value::Int(ch as i32));
     }
-    ctx.set_field(this, 0, Value::Object(Some(buf)));
-    sb_set_count(ctx, this, chars.len() as i32);
+    scope.set_field(this, 0, Value::Object(Some(buf)));
+    sb_set_count(&mut *scope, this, chars.len() as i32);
     Ok(None)
 }
 
@@ -1678,23 +1741,24 @@ pub(crate) fn native_sb_init_charsequence(
     };
     // Real JDK `AbstractStringBuilder(CharSequence)` calls `seq.length()`, so a
     // null sequence throws NPE; coerce any non-null CharSequence to its text.
-    // Pin `this` before any allocating call: `invoke_to_string` and `new_array`
-    // can both trigger a moving GC that relocates `this`.
-    let this_pin = ctx.pin_native_root(this);
+    // `this` crosses TWO allocating calls here —
+    // `invoke_to_string` (arbitrary Java `toString()`, can allocate/GC at
+    // will) and `new_array`; the handle slot remains current across both.
+    let mut scope = NativeHandleScope::new(ctx);
+    let this_h = scope.root(this);
     let text = match args.get(1) {
-        Some(Value::Object(Some(o))) => invoke_to_string(ctx, *o).unwrap_or_default(),
+        Some(Value::Object(Some(o))) => invoke_to_string(&mut *scope, *o).unwrap_or_default(),
         _ => String::new(),
     };
     let chars: Vec<u16> = text.encode_utf16().collect();
     let cap = chars.len() + 16;
-    let buf = ctx.new_array(ArrayElementType::Char, cap);
-    let this = ctx.read_native_pin(this_pin, this);
-    ctx.unpin_native_roots(this_pin);
+    let buf = scope.new_array(ArrayElementType::Char, cap);
+    let this = scope.get(&this_h);
     for (i, &ch) in chars.iter().enumerate() {
-        ctx.set_array_element(buf, i, Value::Int(ch as i32));
+        scope.set_array_element(buf, i, Value::Int(ch as i32));
     }
-    ctx.set_field(this, 0, Value::Object(Some(buf)));
-    sb_set_count(ctx, this, chars.len() as i32);
+    scope.set_field(this, 0, Value::Object(Some(buf)));
+    sb_set_count(&mut *scope, this, chars.len() as i32);
     Ok(None)
 }
 
@@ -1711,24 +1775,23 @@ pub(crate) fn native_sb_init_capacity(
         Some(Value::Int(v)) => std::cmp::max(*v, 0) as usize,
         _ => 16,
     };
-    let this_pin = ctx.pin_native_root(this);
+    let mut scope = NativeHandleScope::new(ctx);
+    let this_h = scope.root(this);
     // HotSpot throws a catchable OutOfMemoryError for an over-large value array
     // (e.g. `new StringBuilder(Integer.MAX_VALUE)`); mirror that instead of the
     // panicking allocator, which would abort the whole VM.
-    let buf = match ctx.try_new_array(ArrayElementType::Char, cap) {
+    let buf = match scope.try_new_array(ArrayElementType::Char, cap) {
         Some(b) => b,
         None => {
-            ctx.unpin_native_roots(this_pin);
             return Err(cratonvm_types::error::RuntimeError::OutOfMemoryError {
                 message: "Requested array size exceeds VM limit".to_string(),
             }
             .into());
         }
     };
-    let this = ctx.read_native_pin(this_pin, this);
-    ctx.unpin_native_roots(this_pin);
-    ctx.set_field(this, 0, Value::Object(Some(buf)));
-    sb_set_count(ctx, this, 0);
+    let this = scope.get(&this_h);
+    scope.set_field(this, 0, Value::Object(Some(buf)));
+    sb_set_count(&mut *scope, this, 0);
     Ok(None)
 }
 
@@ -1895,17 +1958,16 @@ pub(crate) fn native_sb_repeat_charsequence(
     if count == 0 {
         return Ok(Some(Value::Object(Some(this))));
     }
-    // Producer-#12 fix: re-entrant `invoke_to_string` can move `this`.
-    let this_pin = ctx.pin_native_root(this);
-    let text = invoke_to_string(ctx, cs).unwrap_or_default();
-    let this = ctx.read_native_pin(this_pin, this);
-    ctx.unpin_native_roots(this_pin);
+    let mut scope = NativeHandleScope::new(ctx);
+    let this_handle = scope.root(this);
+    let text = invoke_to_string(&mut *scope, cs).unwrap_or_default();
+    let this = scope.get(&this_handle);
     let units: Vec<u16> = text.encode_utf16().collect();
-    let mut chars = sb_read_chars(ctx, this);
+    let mut chars = sb_read_chars(&*scope, this);
     for _ in 0..count {
         chars.extend_from_slice(&units);
     }
-    let this = sb_write_chars(ctx, this, &chars);
+    let this = sb_write_chars(&mut *scope, this, &chars);
     Ok(Some(Value::Object(Some(this))))
 }
 
@@ -2188,15 +2250,15 @@ pub(crate) fn native_sb_append_object(
     // stale, poisoning every later link of the javac chain (the WildFly
     // [stale-recv] StringBuilder family). Pin + re-read, exactly like the
     // in-tree exemplar in the insert-CharSequence native.
-    let this_pin = ctx.pin_native_root(this);
+    let mut scope = NativeHandleScope::new(ctx);
+    let this_handle = scope.root(this);
     let text = match args.get(1) {
-        Some(Value::Object(Some(obj))) => invoke_to_string(ctx, *obj)?,
+        Some(Value::Object(Some(obj))) => invoke_to_string(&mut *scope, *obj)?,
         Some(Value::Object(None)) => "null".to_string(),
         _ => "null".to_string(),
     };
-    let this = ctx.read_native_pin(this_pin, this);
-    ctx.unpin_native_roots(this_pin);
-    let this = sb_append_str(ctx, this, &text);
+    let this = scope.get(&this_handle);
+    let this = sb_append_str(&mut *scope, this, &text);
     Ok(Some(Value::Object(Some(this))))
 }
 
@@ -2213,18 +2275,18 @@ pub(crate) fn native_sb_append_charsequence(
     };
     // Producer-#12 fix: same re-entrant `invoke_to_string` hazard as
     // `native_sb_append_object` just above — pin + re-read `this`.
-    let this_pin = ctx.pin_native_root(this);
+    let mut scope = NativeHandleScope::new(ctx);
+    let this_handle = scope.root(this);
     let text = match args.get(1) {
-        Some(Value::Object(Some(obj))) => match invoke_to_string(ctx, *obj) {
+        Some(Value::Object(Some(obj))) => match invoke_to_string(&mut *scope, *obj) {
             Ok(s) => s,
             Err(_) => String::new(),
         },
         Some(Value::Object(None)) => "null".to_string(),
         _ => "null".to_string(),
     };
-    let this = ctx.read_native_pin(this_pin, this);
-    ctx.unpin_native_roots(this_pin);
-    let this = sb_append_str(ctx, this, &text);
+    let this = scope.get(&this_handle);
+    let this = sb_append_str(&mut *scope, this, &text);
     Ok(Some(Value::Object(Some(this))))
 }
 
@@ -2268,13 +2330,13 @@ pub(crate) fn native_sb_append_charsequence_off_len(
     //  - Any CharSequence with a toString()Ljava/lang/String;: invoke_to_string.
     // Both paths already handle StringBuilder/StringBuffer/String/CharBuffer.
     // Producer-#12 fix: re-entrant `invoke_to_string` can move `this`.
-    let this_pin = ctx.pin_native_root(this);
-    let text = match invoke_to_string(ctx, cs_obj) {
+    let mut scope = NativeHandleScope::new(ctx);
+    let this_handle = scope.root(this);
+    let text = match invoke_to_string(&mut *scope, cs_obj) {
         Ok(s) => s,
         Err(_) => String::new(),
     };
-    let this = ctx.read_native_pin(this_pin, this);
-    ctx.unpin_native_roots(this_pin);
+    let this = scope.get(&this_handle);
     let chars: Vec<u16> = text.encode_utf16().collect();
 
     // Clamp [start, end] to the CharSequence's length; real JDK throws
@@ -2286,7 +2348,7 @@ pub(crate) fn native_sb_append_charsequence_off_len(
     let s = (start.max(0) as usize).min(len);
     let e = (end.max(0) as usize).min(len);
     let this = if e > s {
-        sb_append_chars(ctx, this, &chars[s..e])
+        sb_append_chars(&mut *scope, this, &chars[s..e])
     } else {
         this
     };
@@ -3491,26 +3553,27 @@ pub(crate) fn native_string_replace_charseq(
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    // Producer-#12 fix: the two re-entrant `invoke_to_string` calls can
-    // move `this`; re-read it through a pin before the read_string below
-    // (the funnel unpins on the early-return paths).
-    let this_pin = ctx.pin_native_root(this);
+    let mut scope = NativeHandleScope::new(ctx);
+    let this_handle = scope.root(this);
     let target = match args.get(1) {
-        Some(Value::Object(Some(o))) => invoke_to_string(ctx, *o).unwrap_or_default(),
+        Some(Value::Object(Some(o))) => {
+            invoke_to_string(&mut *scope, *o).unwrap_or_default()
+        }
         // null target → real JDK NPEs; defer to the (graceful) null result the
         // sibling regex natives use rather than crash. Real callers never pass null.
         _ => return Ok(Some(Value::Object(None))),
     };
     let replacement = match args.get(2) {
-        Some(Value::Object(Some(o))) => invoke_to_string(ctx, *o).unwrap_or_default(),
+        Some(Value::Object(Some(o))) => {
+            invoke_to_string(&mut *scope, *o).unwrap_or_default()
+        }
         _ => return Ok(Some(Value::Object(None))),
     };
-    let this = ctx.read_native_pin(this_pin, this);
-    ctx.unpin_native_roots(this_pin);
-    let s = ctx.read_string(this).unwrap_or_default();
+    let this = scope.get(&this_handle);
+    let s = scope.read_string(this).unwrap_or_default();
     let result = s.replace(&target, &replacement);
     Ok(Some(Value::Object(Some(
-        ctx.create_string_uninterned(&result),
+        scope.create_string_uninterned(&result),
     ))))
 }
 
@@ -3532,9 +3595,18 @@ pub(crate) fn native_string_to_lower_case(
         changed
     } else {
         let folded = lower.to_lowercase();
-        if folded == lower { false } else { lower = folded; true }
+        if folded == lower {
+            false
+        } else {
+            lower = folded;
+            true
+        }
     };
-    let result = if changed { ctx.create_ascii_case_string_cached(this, &lower, false) } else { this };
+    let result = if changed {
+        ctx.create_ascii_case_string_cached(this, &lower, false)
+    } else {
+        this
+    };
     Ok(Some(Value::Object(Some(result))))
 }
 
@@ -3556,9 +3628,18 @@ pub(crate) fn native_string_to_upper_case(
         changed
     } else {
         let folded = upper.to_uppercase();
-        if folded == upper { false } else { upper = folded; true }
+        if folded == upper {
+            false
+        } else {
+            upper = folded;
+            true
+        }
     };
-    let result = if changed { ctx.create_ascii_case_string_cached(this, &upper, true) } else { this };
+    let result = if changed {
+        ctx.create_ascii_case_string_cached(this, &upper, true)
+    } else {
+        this
+    };
     Ok(Some(Value::Object(Some(result))))
 }
 
@@ -4091,39 +4172,31 @@ pub(crate) fn native_string_join(ctx: &mut dyn NativeContext, args: &[Value]) ->
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(Some(ctx.create_string_uninterned(""))))),
     };
-    // `String.join` accepts any CharSequence, not only String.  Keep the
-    // array rooted while an element's virtual `toString()` can allocate, then
-    // root that element for the call itself: both references may move in a GC.
-    let arr_pin = ctx.pin_native_root(arr);
-    let parts_result: Result<Vec<String>, cratonvm_types::error::MethodCallFailed> = (|| {
-        let arr = ctx.read_native_pin(arr_pin, arr);
-        let len = ctx.array_length(arr);
-        let mut parts = Vec::with_capacity(len);
-        for i in 0..len {
-            let arr = ctx.read_native_pin(arr_pin, arr);
-            if let Value::Object(Some(elem)) = ctx.get_array_element(arr, i) {
-                let elem_pin = ctx.pin_native_root(elem);
-                let elem = ctx.read_native_pin(elem_pin, elem);
-                // Preserve the String fast path, but use real polymorphic
-                // dispatch for StringBuilder, custom CharSequences, and
-                // application classes such as Spring Boot's Regex.
-                let text_result = match ctx.read_string(elem) {
-                    Some(text) => Ok(text),
-                    None => invoke_to_string(ctx, elem),
-                };
-                ctx.unpin_native_roots(elem_pin);
-                parts.push(text_result?);
-            } else {
-                parts.push("null".to_string());
-            }
+    let mut scope = NativeHandleScope::new(ctx);
+    let arr_handle = scope.root(arr);
+    let len = scope.array_length(scope.get(&arr_handle));
+    let mut parts = Vec::with_capacity(len);
+    for i in 0..len {
+        let arr = scope.get(&arr_handle);
+        if let Value::Object(Some(elem)) = scope.get_array_element(arr, i) {
+            let mut element_scope = NativeHandleScope::new(&mut *scope);
+            let elem_handle = element_scope.root(elem);
+            let elem = element_scope.get(&elem_handle);
+            // Preserve the String fast path, but use real polymorphic
+            // dispatch for StringBuilder, custom CharSequences, and
+            // application classes such as Spring Boot's Regex.
+            let text = match element_scope.read_string(elem) {
+                Some(text) => text,
+                None => invoke_to_string(&mut *element_scope, elem)?,
+            };
+            parts.push(text);
+        } else {
+            parts.push("null".to_string());
         }
-        Ok(parts)
-    })();
-    ctx.unpin_native_roots(arr_pin);
-    let parts = parts_result?;
+    }
     let joined = parts.join(&delim);
     Ok(Some(Value::Object(Some(
-        ctx.create_string_uninterned(&joined),
+        scope.create_string_uninterned(&joined),
     ))))
 }
 
@@ -4143,30 +4216,30 @@ pub(crate) fn native_string_join_iterable(
         Some(Value::Object(Some(obj))) => obj,
         _ => return Ok(Some(Value::Object(Some(ctx.create_string_uninterned(""))))),
     };
-    let iterator_pin = ctx.pin_native_root(iterator);
+    let mut scope = NativeHandleScope::new(ctx);
+    let iterator_handle = scope.root(iterator);
     let mut parts = Vec::new();
     for _ in 0..1_000_000 {
-        let iterator = ctx.read_native_pin(iterator_pin, iterator);
-        let has_next = match ctx.invoke_virtual(iterator, "hasNext", "()Z", &[])? {
+        let iterator = scope.get(&iterator_handle);
+        let has_next = match scope.invoke_virtual(iterator, "hasNext", "()Z", &[])? {
             Some(Value::Int(v)) => v != 0,
             _ => false,
         };
         if !has_next {
             break;
         }
-        let iterator = ctx.read_native_pin(iterator_pin, iterator);
-        let elem = ctx.invoke_virtual(iterator, "next", "()Ljava/lang/Object;", &[])?;
+        let iterator = scope.get(&iterator_handle);
+        let elem = scope.invoke_virtual(iterator, "next", "()Ljava/lang/Object;", &[])?;
         let text = match elem {
-            Some(Value::Object(Some(obj))) => invoke_to_string(ctx, obj)?,
+            Some(Value::Object(Some(obj))) => invoke_to_string(&mut *scope, obj)?,
             Some(Value::Object(None)) | None => "null".to_string(),
             _ => "null".to_string(),
         };
         parts.push(text);
     }
-    ctx.unpin_native_roots(iterator_pin);
     let joined = parts.join(&delim);
     Ok(Some(Value::Object(Some(
-        ctx.create_string_uninterned(&joined),
+        scope.create_string_uninterned(&joined),
     ))))
 }
 
@@ -5111,19 +5184,23 @@ fn extract_temporal_fields(
                 let nano = invoke_i32(ctx, obj, "getNano");
                 Ok((year, month, day, hour, minute, second, nano))
             } else {
-                Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
-                    message: format!(
-                        "{} cannot be formatted as a date",
-                        ctx.class_name_of_id(cid).unwrap_or_default()
-                    ),
-                }
-                .into())
+                Err(
+                    cratonvm_types::error::RuntimeError::IllegalArgumentException {
+                        message: format!(
+                            "{} cannot be formatted as a date",
+                            ctx.class_name_of_id(cid).unwrap_or_default()
+                        ),
+                    }
+                    .into(),
+                )
             }
         }
-        _ => Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
-            message: "Illegal date/time conversion argument".to_string(),
-        }
-        .into()),
+        _ => Err(
+            cratonvm_types::error::RuntimeError::IllegalArgumentException {
+                message: "Illegal date/time conversion argument".to_string(),
+            }
+            .into(),
+        ),
     }
 }
 
@@ -5249,10 +5326,12 @@ fn format_temporal_field(
             DAYS_ABBR[dow], MONTHS_ABBR[month_idx], day, hour, minute, second, year
         ),
         _ => {
-            return Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
-                message: format!("Unknown date/time conversion '%t{}'", field),
-            }
-            .into());
+            return Err(
+                cratonvm_types::error::RuntimeError::IllegalArgumentException {
+                    message: format!("Unknown date/time conversion '%t{}'", field),
+                }
+                .into(),
+            );
         }
     };
 
@@ -5669,8 +5748,6 @@ pub(crate) fn native_string_is_blank(
 /// see `STREAM_FIELD_ELEMENTS`/`STREAM_FIELD_CLOSE_HANDLERS` in
 /// native-collections/src/lib.rs), matching every other IntStream factory.
 pub(crate) fn native_string_chars(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    use cratonvm_types::ClassId;
-
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
@@ -5689,7 +5766,13 @@ pub(crate) fn native_string_chars(ctx: &mut dyn NativeContext, args: &[Value]) -
     // also breaks `StringUtils.containsWhitespace` -> `"...".chars().anyMatch(...)`
     // -- via a 1-field allocation; reconciled to the 2-field layout here.)
     let stream = alloc_concurrent_synthetic(ctx, "java/util/stream/IntStream", 2);
-    let arr = ctx.new_ref_array(ClassId::new(0), char_values.len());
+    // Must be a primitive `int[]`, not a reference array: this stream's
+    // consumers (`IntStream.forEach`/`toArray`/etc.) read field 0 as an
+    // int-element array. A `new_ref_array` allocation stored `Value::Int`s
+    // into Object-shaped slots, which silently read back as 0 -- every
+    // `"...".chars()` consumer therefore saw a correctly-SIZED but all-zero
+    // stream (confirmed via a standalone `chars().toArray()` repro).
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Int, char_values.len());
     for (i, val) in char_values.iter().enumerate() {
         ctx.set_array_element(arr, i, *val);
     }

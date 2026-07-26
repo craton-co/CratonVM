@@ -40,6 +40,19 @@ jobs:
         shell: bash
         run: bash scripts/check-no-diag-prints.sh
 
+      # The CRATONVM_* surface reached 692 identifiers by growing roughly one
+      # per fixed bug with no retirement path. It is now ten grouped variables
+      # plus five scalars, and every knob is a token in
+      # `types/src/flag_groups.rs::INVENTORY`. This fails if a new
+      # `std::env::var("CRATONVM_...")` call site appears without one, or if the
+      # reference docs name a token that does not exist — the failure mode that
+      # left CRATONVM_PRECISE_JIT_MAPS documented-but-dead for months.
+      # Bash-only script, so gate to the Linux leg.
+      - name: Flag-surface guard
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: bash tools/flag-census/check-surface.sh
+
       - name: Clippy
         # `[workspace.lints]` in Cargo.toml already silences the noise lints
         # (dead_code, unused_*, rustdoc broken_intra_doc_links, clippy
@@ -78,6 +91,76 @@ jobs:
           if [ "${STUBS:-0}" -ne 0 ]; then
             echo "::warning::default build registered ${STUBS} synthetic-stub native(s)"
           fi
+
+  # `synthetic-jdk` feature gate. This feature is documented and supported (see
+  # the `[features]` table in vm/Cargo.toml and NEW-11 in docs/roadmap.md), but
+  # it is deliberately NOT in the default set — so every job above compiles the
+  # default build and *nothing* ever compiled the code behind this flag.
+  #
+  # That is exactly how it rotted. On 2026-07-25 `cargo build --features
+  # synthetic-jdk` was found to be broken on `dev`: two Thread-layout helpers
+  # had been nested inside `register_essential_natives` (22 x E0425 from
+  # `register_synthetic_overrides`), and behind that, 327 more errors' worth of
+  # API drift had accumulated in the `#[cfg(all(test, feature =
+  # "synthetic-jdk"))]` module in vm/src/vm.rs — 1,522 tests that no compiler
+  # had looked at. None of it produced a CI signal, because no job built this
+  # configuration.
+  #
+  # `--all-targets` is deliberate: the lib/bin scope alone would NOT have caught
+  # the test-module drift, which was the larger half of the breakage. Scoped to
+  # `-p cratonvm-vm -p cratonvm-native-builtins` (the only crates that declare a
+  # `synthetic-jdk` feature at all — `cratonvm-gc` and `cratonvm-jit` do not) so
+  # this stays a fast guard rather than a second full workspace matrix.
+  synthetic-jdk:
+    name: Feature gate (--features synthetic-jdk)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Lib + bin scope across the whole workspace: proves the feature-gated
+      # production code (native-builtins' synthetic overrides, and every crate
+      # that forwards the feature) still compiles.
+      - name: Check workspace (synthetic-jdk)
+        run: cargo check --workspace --features synthetic-jdk
+
+      # Test scope: proves the synthetic-jdk-only test modules still compile.
+      - name: Check tests (synthetic-jdk)
+        run: >
+          cargo check --all-targets --features synthetic-jdk
+          -p cratonvm-vm -p cratonvm-native-builtins
+
+      # `cratonvm-native-builtins` is the crate whose synthetic overrides the
+      # feature actually switches on: 3251 lib tests pass under the flag versus
+      # 3075 without it, so this step is where the 176 feature-only tests get
+      # exercised — and its failure set under the flag is exactly the same five
+      # pre-existing failures as the default build. Blocking, same as the
+      # default `cargo test --workspace`.
+      - name: Test native-builtins (synthetic-jdk)
+        run: cargo test -p cratonvm-native-builtins --lib --features synthetic-jdk
+
+      # ADVISORY for now, and it needs a timeout. `cratonvm-vm`'s inline test
+      # module is entirely synthetic-jdk-gated, and its 1,522 tests spent the
+      # whole unbuildable period drifting away from VM semantics as well as from
+      # the API. Once made to compile again (2026-07-25): 186 of them fail, and
+      # the harness does not exit after the last result — a lingering non-daemon
+      # VM thread keeps the process alive, which surfaces either as a hang or as
+      # a SIGSEGV on the shutdown path. Those are pre-existing defects that were
+      # merely invisible while the module was unbuildable, not a regression from
+      # fixing the build — but they must not red-flag every PR until triaged.
+      #
+      # The `cargo check --all-targets` step above is what is blocking today: it
+      # is what stops the module silently rotting out of compilability again.
+      # Drop `continue-on-error` and the timeout once the runtime failures and
+      # the non-exiting harness are worked through.
+      - name: Test vm (synthetic-jdk, advisory)
+        continue-on-error: true
+        timeout-minutes: 20
+        run: cargo test -p cratonvm-vm --lib --features synthetic-jdk
 
   # Build + publish the libcratonvm C-ABI embedding library (cdylib + staticlib)
   # and its public C headers as downloadable CI artifacts, per

@@ -1,572 +1,36 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2024-2026 Craton Software Company
 
-//! Lock ordering enforcement framework.
+//! Global lock acquisition order (L0-L10) — re-export.
 //!
-//! **This module is the canonical, in-source definition of CratonVM's global
-//! lock acquisition order.** There is no separate `docs/lock-order.md`; the
-//! [`LockLevel`] enum below (with its doc comments) *is* the authoritative
-//! hierarchy, and the wrappers in this module are its runtime enforcement. When
-//! a level is added, removed, or renumbered, update [`LockLevel`] and the
-//! mapping in [`tracking::level_from_u8`] together — they are the single source
-//! of truth, so there is no external document to keep in sync.
+//! The definitions live in [`cratonvm_types::lock_order`], one crate below
+//! both `vm` and `cratonvm-gc`. They used to live here, which meant
+//! `VmHeap`'s interior locks — L8 in the hierarchy, defined in the separate
+//! `cratonvm-gc` crate — had no way to name [`LockLevel`] without inverting
+//! the `vm -> gc` dependency edge. Moving the core down to `cratonvm-types`
+//! removes that obstacle: `gc` can now announce L8 with [`enter_level`], or
+//! wrap its interior locks in [`OrderedPlMutex`] / [`OrderedPlRwLock`]
+//! directly.
 //!
-//! ## The global lock acquisition order
+//! Nothing else changed. `crate::runtime::lock_order::X` still resolves for
+//! every `X` it resolved for before, the per-thread tracker is still a
+//! single `thread_local!` (it moved, it was not duplicated), and the
+//! hierarchy table, the enforcement rules and the
+//! `CRATONVM_LOCK_ORDER_CHECK` opt-in are unchanged — see
+//! [`cratonvm_types::lock_order`] for all of it.
 //!
-//! Locks are numbered L0 (lowest) through L10 (highest). The full hierarchy,
-//! highest-first (acquired-first), is:
+//! Current wiring in `SharedVm` (see `crate::vm::realms`):
 //!
-//! | Level | Name | Lock |
-//! |------:|------|------|
-//! | L10 | `class_manager`   | `SharedVm::class_manager` (RwLock) — acquired first |
-//! | L9  | `native_methods`  | `SharedVm::native_methods` (append-only Mutex) |
-//! | L8  | `heap`            | `SharedVm::heap` interior locks (in the `gc` crate) |
-//! | L7  | `ref_processor`   | `SharedVm::ref_processor` (Mutex) |
-//! | L6  | `monitors`        | per-object monitor registry (`MonitorTable`) |
-//! | L5  | `thread_registry` | `SharedVm::thread_registry` (Mutex) |
-//! | L4  | `flight_recorder` | `SharedVm::flight_recorder` (Mutex) |
-//! | L3  | `cleaner_actions` | `cleaner_thread.pending_actions` (Mutex) |
-//! | L2  | `native_memory`   | `SharedVm::native_memory` (Mutex) |
-//! | L1  | `jvm_thread`       | `JvmThread`-local state (owning thread only) |
-//! | L0  | `scratch`         | per-call scratch collections — released first |
-//!
-//! The integer discriminants of [`LockLevel`] match this table exactly.
-//!
-//! ## The rule
-//!
-//! The hierarchy is **descending**: a thread holding a lock at level N may
-//! *only* acquire a lock at a level **strictly less than N** (i.e. a lower
-//! number). Equivalently: lower number == acquired *later* and released
-//! *first*; higher number == acquired *earlier* and held longer.
-//!
-//! Example: a thread holding `class_manager` (L10) may then acquire `heap`
-//! (L8), then `monitors` (L6), then `thread_registry` (L5) — the levels
-//! descend monotonically. A thread holding `monitors` (L6) must **not** acquire
-//! `class_manager` (L10) or `heap` (L8); it has to release the monitor first.
-//!
-//! ## Enforcement strategy
-//!
-//! Each [`OrderedMutex`] / [`OrderedRwLock`] carries a [`LockLevel`]. When
-//! enforcement is active we maintain a per-thread bit-set of currently-held
-//! levels. On every acquire we assert that the attempted level is strictly
-//! less than the *minimum* currently-held level — the binding constraint for
-//! "descending".
-//!
-//! Enforcement is **always on in debug builds**. In release builds it is
-//! **off by default** (a single cached `AtomicU8` load gates the whole fast
-//! path, so the wrapper is effectively zero-cost) but can be **opted in at
-//! runtime** by setting the environment variable `CRATONVM_LOCK_ORDER_CHECK`
-//! to a truthy value (`1`, `true`, `yes`, or `on`, case-insensitive). This
-//! lets production builds turn on deadlock-ordering checks without a rebuild,
-//! e.g. when reproducing a suspected lock-order bug in the field. The env var
-//! is read once and cached; flipping it after the first lock acquisition has
-//! no effect. See [`tracking::enforced`].
-//!
-//! ## Usage
-//!
-//! Wiring is incremental, starting with the highest-level locks. As of the
-//! V11 hardening pass the **L6 `monitors` registry** is wired: both internal
-//! maps of [`crate::threading::monitor::MonitorTable`] (`monitors` and
-//! `cas_locks`) are [`OrderedMutex`] at [`LockLevel::Monitors`].
-//!
-//! ### Runtime enforcement status
-//!
-//! Authoritative, non-aspirational list of which locks are checked vs still
-//! raw:
-//! - **Wired (checked):** L6 `monitors` (both `MonitorTable` maps).
-//! - **Not wired (not observed by the checker):** L10 `class_manager` and
-//!   L8 `heap`, for the reasons below; the remaining levels are documented
-//!   here for ordering purposes but not yet wrapped.
-//!
-//! The two high-level locks above are **not** wired and the checker therefore
-//! does not observe them:
-//! - `class_manager` (L10) is a `parking_lot::RwLock` reached from ~19 modules
-//!   (including FFI/JNI surfaces this pass is not permitted to touch); swapping
-//!   its type would ripple guard-API changes through those files.
-//! - `heap` (L8) is defined in the separate `gc` crate (`gc/src/vm_heap.rs`),
-//!   which cannot depend on `vm::runtime::lock_order` without a circular crate
-//!   dependency.
+//! - `shared.classes.class_manager` — [`OrderedPlRwLock`] at
+//!   [`LockLevel::ClassManager`] (L10).
+//! - `shared.mem.ref_processor` — [`OrderedPlMutex`] at
+//!   [`LockLevel::RefProcessor`] (L7).
+//! - `shared.natives.native_methods` — L9 is reserved; the registry is
+//!   immutable after `SharedVm::new` and holds no lock.
+//! - `shared.mem.heap` — L8, now *unblocked* but not yet wrapped: doing so
+//!   would change locking behaviour and is left to a follow-up.
 
-use std::fmt;
-use std::sync::{LockResult, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
-
-// ---------------------------------------------------------------------------
-// LockLevel
-// ---------------------------------------------------------------------------
-
-/// Ordered lock levels.
-///
-/// These variants, and the table in this module's doc comment, *are* the
-/// canonical global lock acquisition order — the integer discriminants are the
-/// single source of truth. A thread holding a lock at level N may only acquire
-/// locks at level **strictly less than N** (descending order).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[repr(u8)]
-pub enum LockLevel {
-    /// L0 — per-call scratch (`Vec`s, `HashMap`s built inside a single call).
-    Scratch = 0,
-    /// L1 — `JvmThread`-local state (owning thread only; never contended).
-    JvmThread = 1,
-    /// L2 — `SharedVm::native_memory` (NativeMemoryTable Mutex).
-    NativeMemory = 2,
-    /// L3 — `SharedVm::cleaner_thread.pending_actions` (Mutex).
-    CleanerActions = 3,
-    /// L4 — `SharedVm::flight_recorder` (Mutex).
-    FlightRecorder = 4,
-    /// L5 — `SharedVm::thread_registry` (Mutex).
-    ThreadRegistry = 5,
-    /// L6 — `SharedVm::monitors` (per-object Monitors via `Arc<Monitor>`).
-    Monitors = 6,
-    /// L7 — `SharedVm::ref_processor` (Mutex).
-    RefProcessor = 7,
-    /// L8 — `SharedVm::heap` interior locks.
-    Heap = 8,
-    /// L9 — `SharedVm::native_methods` (append-only Mutex).
-    NativeMethods = 9,
-    /// L10 — `SharedVm::class_manager` (RwLock). Highest level / acquired first.
-    ClassManager = 10,
-}
-
-impl LockLevel {
-    /// One past the highest discriminant; size of the per-thread tracking
-    /// bit-array.
-    const COUNT: usize = 11;
-}
-
-impl fmt::Display for LockLevel {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Debug::fmt(self, f)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Error type
-// ---------------------------------------------------------------------------
-
-/// Error returned when a thread attempts to acquire a lock out of order.
-///
-/// `held` is the *binding* (minimum) currently-held level — the one the
-/// `attempted` level needed to be strictly less than.
-#[derive(Debug, Clone)]
-pub struct LockOrderViolation {
-    /// The level the thread attempted to acquire.
-    pub attempted: LockLevel,
-    /// The minimum-level lock the thread currently holds. The attempt was
-    /// rejected because `attempted >= held` (descending order requires
-    /// `attempted < held`).
-    pub held: LockLevel,
-}
-
-impl fmt::Display for LockOrderViolation {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "lock order violation: attempted to acquire {:?} (level {}) while holding {:?} (level {}); descending order requires attempted < held",
-            self.attempted, self.attempted as u8, self.held, self.held as u8
-        )
-    }
-}
-
-impl std::error::Error for LockOrderViolation {}
-
-// ---------------------------------------------------------------------------
-// Thread-local tracking
-// ---------------------------------------------------------------------------
-
-mod tracking {
-    use super::LockLevel;
-    use std::cell::Cell;
-    use std::sync::atomic::{AtomicU8, Ordering};
-
-    // Cached enforcement decision. 0 = undetermined, 1 = off, 2 = on. Reading
-    // it is a single relaxed atomic load on the lock fast path, so when
-    // enforcement is off the per-acquire cost is negligible.
-    static ENFORCE: AtomicU8 = AtomicU8::new(0);
-
-    /// Whether lock-order enforcement is active for this process.
-    ///
-    /// In debug builds this is always `true`. In release builds it defaults to
-    /// `false` but can be opted in at runtime by setting the environment
-    /// variable `CRATONVM_LOCK_ORDER_CHECK` to a truthy value (`1`, `true`,
-    /// `yes`, or `on`, case-insensitive). The decision is computed on the first
-    /// call and cached; later changes to the environment have no effect.
-    #[inline]
-    pub(super) fn enforced() -> bool {
-        match ENFORCE.load(Ordering::Relaxed) {
-            1 => false,
-            2 => true,
-            _ => {
-                let on = compute_enforced();
-                // Idempotent: every caller computes the same value, so a racing
-                // store is harmless. Use a plain store rather than CAS.
-                ENFORCE.store(if on { 2 } else { 1 }, Ordering::Relaxed);
-                on
-            }
-        }
-    }
-
-    fn compute_enforced() -> bool {
-        // Always enforce in debug builds; the env opt-in is for release.
-        if cfg!(debug_assertions) {
-            return true;
-        }
-        match std::env::var("CRATONVM_LOCK_ORDER_CHECK") {
-            Ok(v) => {
-                let v = v.trim();
-                v.eq_ignore_ascii_case("1")
-                    || v.eq_ignore_ascii_case("true")
-                    || v.eq_ignore_ascii_case("yes")
-                    || v.eq_ignore_ascii_case("on")
-            }
-            Err(_) => false,
-        }
-    }
-
-    // Bit-set of currently held lock levels for this thread.
-    // Index `i` corresponds to `LockLevel` with discriminant `i`.
-    thread_local! {
-        static HELD: Cell<[bool; LockLevel::COUNT]> = const { Cell::new([false; LockLevel::COUNT]) };
-    }
-
-    /// Returns the *lowest* currently-held level, if any. In descending
-    /// order, this is the binding constraint: the next lock acquired must be
-    /// at a level strictly less than this.
-    pub(super) fn lowest_held() -> Option<LockLevel> {
-        HELD.with(|cell| {
-            let arr = cell.get();
-            for i in 0..LockLevel::COUNT {
-                if arr[i] {
-                    return Some(level_from_u8(i as u8));
-                }
-            }
-            None
-        })
-    }
-
-    /// Mark a level as held by this thread.
-    pub(super) fn acquire(level: LockLevel) {
-        HELD.with(|cell| {
-            let mut arr = cell.get();
-            arr[level as u8 as usize] = true;
-            cell.set(arr);
-        });
-    }
-
-    /// Mark a level as released by this thread.
-    pub(super) fn release(level: LockLevel) {
-        HELD.with(|cell| {
-            let mut arr = cell.get();
-            arr[level as u8 as usize] = false;
-            cell.set(arr);
-        });
-    }
-
-    fn level_from_u8(v: u8) -> LockLevel {
-        match v {
-            0 => LockLevel::Scratch,
-            1 => LockLevel::JvmThread,
-            2 => LockLevel::NativeMemory,
-            3 => LockLevel::CleanerActions,
-            4 => LockLevel::FlightRecorder,
-            5 => LockLevel::ThreadRegistry,
-            6 => LockLevel::Monitors,
-            7 => LockLevel::RefProcessor,
-            8 => LockLevel::Heap,
-            9 => LockLevel::NativeMethods,
-            10 => LockLevel::ClassManager,
-            _ => unreachable!(),
-        }
-    }
-
-    /// Check the descending-order invariant for `level` against the locks
-    /// currently held by this thread, then record `level` as held.
-    ///
-    /// No-op (and skips touching the thread-local) when enforcement is off, so
-    /// the only cost on the disabled fast path is the cached [`enforced`] load.
-    ///
-    /// # Panics
-    ///
-    /// Panics with a [`super::LockOrderViolation`] message if `level` is not
-    /// strictly less than the minimum currently-held level.
-    #[inline]
-    pub(super) fn check_and_acquire(level: LockLevel) {
-        if !enforced() {
-            return;
-        }
-        if let Some(held) = lowest_held() {
-            assert!(
-                level < held,
-                "{}",
-                super::LockOrderViolation {
-                    attempted: level,
-                    held,
-                }
-            );
-        }
-        acquire(level);
-    }
-
-    /// Mirror of [`check_and_acquire`] for guard drop: releases `level` iff
-    /// enforcement is active. Must be paired with a `check_and_acquire(level)`
-    /// — `enforced()` is cached, so both observe the same decision.
-    #[inline]
-    pub(super) fn release_if_enforced(level: LockLevel) {
-        if enforced() {
-            release(level);
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// OrderedMutex<T>
-// ---------------------------------------------------------------------------
-
-/// A `Mutex<T>` wrapper that enforces lock-ordering discipline.
-///
-/// When enforcement is active, acquiring this lock asserts that the calling
-/// thread holds no lock at an equal or **lower** [`LockLevel`] (the
-/// descending-order rule documented at the top of this module). Enforcement is
-/// always on in debug builds and opt-in at runtime in release builds via
-/// `CRATONVM_LOCK_ORDER_CHECK`; when off, the only per-acquire cost is a single
-/// cached atomic load (see [`tracking::enforced`]).
-pub struct OrderedMutex<T> {
-    inner: Mutex<T>,
-    level: LockLevel,
-}
-
-// Manual impls because Mutex<T> is Send+Sync but we store a LockLevel too.
-unsafe impl<T: Send> Send for OrderedMutex<T> {}
-unsafe impl<T: Send> Sync for OrderedMutex<T> {}
-
-impl<T> OrderedMutex<T> {
-    /// Create a new ordered mutex at the given lock level.
-    pub fn new(value: T, level: LockLevel) -> Self {
-        Self {
-            inner: Mutex::new(value),
-            level,
-        }
-    }
-
-    /// Acquire the mutex, enforcing descending lock order when enforcement is
-    /// active (always in debug builds; in release when
-    /// `CRATONVM_LOCK_ORDER_CHECK` is set — see this module's docs).
-    ///
-    /// # Panics
-    ///
-    /// When enforcement is active, panics if the calling thread already holds a
-    /// lock at an equal or *lower* level (which would invert the documented
-    /// descending hierarchy and risk deadlock).
-    pub fn lock(&self) -> LockResult<OrderedMutexGuard<'_, T>> {
-        tracking::check_and_acquire(self.level);
-
-        match self.inner.lock() {
-            Ok(guard) => Ok(OrderedMutexGuard {
-                guard,
-                level: self.level,
-            }),
-            Err(poison) => {
-                // Even on poison we acquired the OS lock, so tracking is correct.
-                let guard = OrderedMutexGuard {
-                    guard: poison.into_inner(),
-                    level: self.level,
-                };
-                Err(std::sync::PoisonError::new(guard))
-            }
-        }
-    }
-
-    /// Returns the lock level of this mutex.
-    pub fn level(&self) -> LockLevel {
-        self.level
-    }
-}
-
-impl<T: fmt::Debug> fmt::Debug for OrderedMutex<T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("OrderedMutex")
-            .field("level", &self.level)
-            .field("inner", &self.inner)
-            .finish()
-    }
-}
-
-/// RAII guard for [`OrderedMutex`]. Releases the lock level on drop in debug
-/// builds.
-pub struct OrderedMutexGuard<'a, T> {
-    guard: MutexGuard<'a, T>,
-    level: LockLevel,
-}
-
-impl<T> std::ops::Deref for OrderedMutexGuard<'_, T> {
-    type Target = T;
-    fn deref(&self) -> &T {
-        &self.guard
-    }
-}
-
-impl<T> std::ops::DerefMut for OrderedMutexGuard<'_, T> {
-    fn deref_mut(&mut self) -> &mut T {
-        &mut self.guard
-    }
-}
-
-impl<T> Drop for OrderedMutexGuard<'_, T> {
-    fn drop(&mut self) {
-        tracking::release_if_enforced(self.level);
-    }
-}
-
-impl<T: fmt::Debug> fmt::Debug for OrderedMutexGuard<'_, T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Debug::fmt(&*self.guard, f)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// OrderedRwLock<T>
-// ---------------------------------------------------------------------------
-
-/// An `RwLock<T>` wrapper with the same descending lock-ordering enforcement
-/// as [`OrderedMutex`].
-pub struct OrderedRwLock<T> {
-    inner: RwLock<T>,
-    level: LockLevel,
-}
-
-unsafe impl<T: Send> Send for OrderedRwLock<T> {}
-unsafe impl<T: Send + Sync> Sync for OrderedRwLock<T> {}
-
-impl<T> OrderedRwLock<T> {
-    /// Create a new ordered read-write lock at the given level.
-    pub fn new(value: T, level: LockLevel) -> Self {
-        Self {
-            inner: RwLock::new(value),
-            level,
-        }
-    }
-
-    /// Acquire the lock for reading.
-    ///
-    /// # Panics
-    ///
-    /// When enforcement is active, panics on lock-order violation (see
-    /// [`OrderedMutex::lock`]).
-    pub fn read(&self) -> LockResult<OrderedRwLockReadGuard<'_, T>> {
-        tracking::check_and_acquire(self.level);
-
-        match self.inner.read() {
-            Ok(guard) => Ok(OrderedRwLockReadGuard {
-                guard,
-                level: self.level,
-            }),
-            Err(poison) => {
-                let guard = OrderedRwLockReadGuard {
-                    guard: poison.into_inner(),
-                    level: self.level,
-                };
-                Err(std::sync::PoisonError::new(guard))
-            }
-        }
-    }
-
-    /// Acquire the lock for writing.
-    ///
-    /// # Panics
-    ///
-    /// When enforcement is active, panics on lock-order violation (see
-    /// [`OrderedMutex::lock`]).
-    pub fn write(&self) -> LockResult<OrderedRwLockWriteGuard<'_, T>> {
-        tracking::check_and_acquire(self.level);
-
-        match self.inner.write() {
-            Ok(guard) => Ok(OrderedRwLockWriteGuard {
-                guard,
-                level: self.level,
-            }),
-            Err(poison) => {
-                let guard = OrderedRwLockWriteGuard {
-                    guard: poison.into_inner(),
-                    level: self.level,
-                };
-                Err(std::sync::PoisonError::new(guard))
-            }
-        }
-    }
-
-    /// Returns the lock level of this rwlock.
-    pub fn level(&self) -> LockLevel {
-        self.level
-    }
-}
-
-impl<T: fmt::Debug> fmt::Debug for OrderedRwLock<T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("OrderedRwLock")
-            .field("level", &self.level)
-            .field("inner", &self.inner)
-            .finish()
-    }
-}
-
-/// RAII read guard for [`OrderedRwLock`].
-pub struct OrderedRwLockReadGuard<'a, T> {
-    guard: RwLockReadGuard<'a, T>,
-    level: LockLevel,
-}
-
-impl<T> std::ops::Deref for OrderedRwLockReadGuard<'_, T> {
-    type Target = T;
-    fn deref(&self) -> &T {
-        &self.guard
-    }
-}
-
-impl<T> Drop for OrderedRwLockReadGuard<'_, T> {
-    fn drop(&mut self) {
-        tracking::release_if_enforced(self.level);
-    }
-}
-
-impl<T: fmt::Debug> fmt::Debug for OrderedRwLockReadGuard<'_, T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Debug::fmt(&*self.guard, f)
-    }
-}
-
-/// RAII write guard for [`OrderedRwLock`].
-pub struct OrderedRwLockWriteGuard<'a, T> {
-    guard: RwLockWriteGuard<'a, T>,
-    level: LockLevel,
-}
-
-impl<T> std::ops::Deref for OrderedRwLockWriteGuard<'_, T> {
-    type Target = T;
-    fn deref(&self) -> &T {
-        &self.guard
-    }
-}
-
-impl<T> std::ops::DerefMut for OrderedRwLockWriteGuard<'_, T> {
-    fn deref_mut(&mut self) -> &mut T {
-        &mut self.guard
-    }
-}
-
-impl<T> Drop for OrderedRwLockWriteGuard<'_, T> {
-    fn drop(&mut self) {
-        tracking::release_if_enforced(self.level);
-    }
-}
-
-impl<T: fmt::Debug> fmt::Debug for OrderedRwLockWriteGuard<'_, T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Debug::fmt(&*self.guard, f)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
+pub use cratonvm_types::lock_order::*;
 
 #[cfg(test)]
 mod tests {
@@ -1031,5 +495,234 @@ mod tests {
         // Nothing held now: a higher-level lock must be acquirable.
         let b = OrderedMutex::new((), LockLevel::ClassManager);
         let _gb = b.lock().unwrap();
+    }
+
+    // -- Drop-in parking_lot-backed wrappers (top-of-hierarchy wiring) ------
+    //
+    // `class_manager` (L10) and `ref_processor` (L7) are `OrderedPlRwLock` /
+    // `OrderedPlMutex` in `SharedVm`. The tests below pin the behaviour those
+    // fields now rely on: descending acquisition succeeds, every inversion is
+    // detected, and the parking_lot family shares one per-thread tracker with
+    // the std-backed family so a monitor (L6, `OrderedMutex`) held across a
+    // `class_manager` (L10, `OrderedPlRwLock`) acquisition is caught.
+
+    #[test]
+    fn pl_mutex_basic() {
+        let m = OrderedPlMutex::new(42, LockLevel::RefProcessor);
+        assert_eq!(m.level(), LockLevel::RefProcessor);
+        assert!(!m.is_locked());
+        {
+            let mut g = m.lock();
+            assert_eq!(*g, 42);
+            *g = 7;
+        }
+        {
+            let g = m.try_lock().expect("uncontended try_lock must succeed");
+            assert_eq!(*g, 7);
+        }
+        let mut m = m;
+        *m.get_mut() = 11;
+        assert_eq!(m.into_inner(), 11);
+    }
+
+    #[test]
+    fn pl_rwlock_basic() {
+        let rw = OrderedPlRwLock::new(String::from("hello"), LockLevel::ClassManager);
+        assert_eq!(rw.level(), LockLevel::ClassManager);
+        {
+            let r = rw.read();
+            assert_eq!(&*r, "hello");
+        }
+        {
+            let mut w = rw.write();
+            w.push_str(" world");
+        }
+        {
+            let r = rw.try_read().expect("uncontended try_read must succeed");
+            assert_eq!(&*r, "hello world");
+        }
+        {
+            let w = rw.try_write().expect("uncontended try_write must succeed");
+            assert_eq!(&**w, "hello world");
+        }
+        let mut rw = rw;
+        rw.get_mut().push('!');
+        assert_eq!(rw.into_inner(), "hello world!");
+    }
+
+    /// The four top levels of the documented hierarchy, acquired highest-first
+    /// exactly as the table in this module's doc comment prescribes:
+    /// `class_manager` (L10) -> `native_methods` (L9) -> `heap` (L8) ->
+    /// `ref_processor` (L7) -> `monitors` (L6). This mixes all three
+    /// enforcement mechanisms — `OrderedPlRwLock` (class_manager),
+    /// `OrderedPlMutex` (ref_processor), `LevelScope` (heap, which lives in the
+    /// `gc` crate and cannot be wrapped) and `OrderedMutex` (monitors) — to
+    /// prove they share one per-thread tracker.
+    #[test]
+    fn top_of_hierarchy_descending_order_ok() {
+        let class_manager = OrderedPlRwLock::new(10_u8, LockLevel::ClassManager);
+        let native_methods = OrderedPlMutex::new(9_u8, LockLevel::NativeMethods);
+        let ref_processor = OrderedPlMutex::new(7_u8, LockLevel::RefProcessor);
+        let monitors = OrderedMutex::new(6_u8, LockLevel::Monitors);
+
+        let cm = class_manager.write();
+        let nm = native_methods.lock();
+        let heap = enter_level(LockLevel::Heap);
+        let rp = ref_processor.lock();
+        let mon = monitors.lock().unwrap();
+
+        assert_eq!(*cm + *nm + *rp + *mon, 10 + 9 + 7 + 6);
+        assert_eq!(heap.level(), LockLevel::Heap);
+        // Guards drop in reverse (LIFO) order here: L6, L7, L8, L9, L10.
+    }
+
+    #[test]
+    fn pl_release_then_higher_ok() {
+        let rp = OrderedPlMutex::new((), LockLevel::RefProcessor);
+        let cm = OrderedPlRwLock::new((), LockLevel::ClassManager);
+        {
+            let _g = rp.lock();
+        }
+        // Nothing held: the higher level is acquirable again.
+        let _cm = cm.read();
+    }
+
+    /// `read_recursive` on a lock this thread already reads is the documented
+    /// reentrant case (`interpreter.rs::resolve_method_ref`) and must not trip.
+    #[test]
+    fn pl_read_recursive_reentrant_ok() {
+        let cm = OrderedPlRwLock::new(1_u8, LockLevel::ClassManager);
+        let outer = cm.read();
+        let inner = cm.read_recursive();
+        assert_eq!(*outer, *inner);
+        drop(inner);
+        // The outer guard still holds the level, so a same-level plain read is
+        // still (correctly) refused — see `pl_read_recursive_does_not_release`.
+        assert!(tracking::is_held(LockLevel::ClassManager));
+        drop(outer);
+        assert!(!tracking::is_held(LockLevel::ClassManager));
+    }
+
+    /// A reentrant read must not clear the outer acquisition's record when it
+    /// drops — otherwise the tracker would forget a still-held L10 lock.
+    #[test]
+    fn pl_read_recursive_does_not_release_outer() {
+        let cm = OrderedPlRwLock::new((), LockLevel::ClassManager);
+        let _outer = cm.read();
+        {
+            let _inner = cm.read_recursive();
+        }
+        assert!(
+            tracking::is_held(LockLevel::ClassManager),
+            "dropping the reentrant read guard must leave the outer record intact"
+        );
+    }
+
+    #[test]
+    fn level_scope_descending_ok() {
+        let _heap = enter_level(LockLevel::Heap);
+        let _monitors = enter_level(LockLevel::Monitors);
+        let _scratch = enter_level(LockLevel::Scratch);
+    }
+
+    #[test]
+    fn pl_debug_impls() {
+        let m = OrderedPlMutex::new(42_i32, LockLevel::RefProcessor);
+        let dbg = format!("{:?}", m);
+        assert!(dbg.contains("OrderedPlMutex"));
+        assert!(dbg.contains("RefProcessor"));
+        let g = m.lock();
+        assert!(format!("{:?}", g).contains("42"));
+        drop(g);
+
+        let rw = OrderedPlRwLock::new(7_i32, LockLevel::ClassManager);
+        let dbg = format!("{:?}", rw);
+        assert!(dbg.contains("OrderedPlRwLock"));
+        assert!(dbg.contains("ClassManager"));
+        assert!(format!("{:?}", rw.read()).contains('7'));
+        assert!(format!("{:?}", rw.write()).contains('7'));
+        assert!(format!("{:?}", enter_level(LockLevel::Scratch)).contains("Scratch"));
+    }
+
+    // ---- inversions that must be detected --------------------------------
+
+    /// The historically real defect: holding a monitor (L6, std-backed
+    /// `OrderedMutex`) and then reaching *up* for `class_manager` (L10,
+    /// parking_lot-backed). This is the class_manager/vtable ABBA shape, and it
+    /// only fires because both wrapper families share one per-thread tracker.
+    #[test]
+    #[should_panic(expected = "lock order violation")]
+    fn pl_monitor_then_class_manager_inverts_across_families() {
+        let monitors = OrderedMutex::new((), LockLevel::Monitors);
+        let class_manager = OrderedPlRwLock::new((), LockLevel::ClassManager);
+        let _m = monitors.lock().unwrap();
+        let _cm = class_manager.read(); // L10 under L6 => violation
+    }
+
+    /// `ref_processor` (L7) held while acquiring `class_manager` (L10) — the
+    /// inversion the GC reference-processing path must never take.
+    #[test]
+    #[should_panic(expected = "lock order violation")]
+    fn pl_ref_processor_then_class_manager_inverts() {
+        let ref_processor = OrderedPlMutex::new((), LockLevel::RefProcessor);
+        let class_manager = OrderedPlRwLock::new((), LockLevel::ClassManager);
+        let _rp = ref_processor.lock();
+        let _cm = class_manager.write(); // L10 under L7 => violation
+    }
+
+    #[test]
+    #[should_panic(expected = "lock order violation")]
+    fn pl_rwlock_same_level_panics() {
+        let a = OrderedPlRwLock::new((), LockLevel::ClassManager);
+        let b = OrderedPlRwLock::new((), LockLevel::ClassManager);
+        let _ga = a.read();
+        let _gb = b.write(); // same level (L10) on a *different* lock => violation
+    }
+
+    #[test]
+    #[should_panic(expected = "lock order violation")]
+    fn pl_mutex_ascending_panics() {
+        let low = OrderedPlMutex::new((), LockLevel::Monitors);
+        let high = OrderedPlMutex::new((), LockLevel::NativeMethods);
+        let _l = low.lock();
+        let _h = high.lock(); // L9 under L6 => violation
+    }
+
+    /// `read_recursive` is only exempt for a level this thread *already* holds.
+    /// Reaching up to L10 from a held L6 must still be rejected.
+    #[test]
+    #[should_panic(expected = "lock order violation")]
+    fn pl_read_recursive_under_lower_level_panics() {
+        let monitors = OrderedMutex::new((), LockLevel::Monitors);
+        let class_manager = OrderedPlRwLock::new((), LockLevel::ClassManager);
+        let _m = monitors.lock().unwrap();
+        let _cm = class_manager.read_recursive(); // L10 under L6 => violation
+    }
+
+    /// A `LevelScope` standing in for the `gc`-crate heap locks (L8) must be
+    /// observed by the tracker: taking `class_manager` (L10) under it inverts.
+    #[test]
+    #[should_panic(expected = "lock order violation")]
+    fn level_scope_then_higher_lock_panics() {
+        let _heap = enter_level(LockLevel::Heap);
+        let class_manager = OrderedPlRwLock::new((), LockLevel::ClassManager);
+        let _cm = class_manager.read(); // L10 under L8 => violation
+    }
+
+    #[test]
+    #[should_panic(expected = "lock order violation")]
+    fn level_scope_ascending_panics() {
+        let _monitors = enter_level(LockLevel::Monitors);
+        let _heap = enter_level(LockLevel::Heap); // L8 under L6 => violation
+    }
+
+    #[test]
+    fn enforcement_active_matches_debug_assertions() {
+        // The test runner is a debug build, so enforcement must be on and the
+        // public query must agree with the internal one.
+        assert_eq!(enforcement_active(), tracking::enforced());
+        if cfg!(debug_assertions) {
+            assert!(enforcement_active());
+        }
     }
 }

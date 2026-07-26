@@ -30,12 +30,41 @@ pub enum RecordingState {
     Closed,
 }
 
+/// Settings for a recording.
+///
+/// ---------------------------------------------------------------------------
+/// UNENFORCED FIELDS (observability audit, 2026-07-26)
+/// ---------------------------------------------------------------------------
+/// Only [`Self::enabled_events`] and [`Self::event_thresholds`] are read by
+/// any code — `Recording::record_event` and `Recording::passes_filter` consult
+/// them. The remaining five are **inert**: setting them changes nothing.
+///
+///  * `max_age`, `max_size` — no retention policy exists. A recording's
+///    memory bound comes solely from `EventRepository::default()`'s fixed
+///    100_000-event ring, which evicts oldest-first regardless of these
+///    values. An operator setting `max_size` to cap a recording's footprint
+///    gets the same 100_000 events either way, and one setting `max_age` to
+///    keep the last 60 seconds gets whatever 100_000 events happen to be
+///    newest. Both are honest-looking knobs that do nothing.
+///  * `disk` — there is no disk-backed repository; recordings are memory-only
+///    until an explicit `dump_recording` call.
+///  * `dump_on_exit` — nothing hooks VM shutdown to dump.
+///  * `duration` — nothing schedules an automatic stop.
+///
+/// These are left in place because they are the right shape for the eventual
+/// implementation, but they must not be surfaced to users (as a CLI option, a
+/// jcmd argument, or a `jdk.jfr` API) until they are enforced.
 pub struct RecordingSettings {
     pub name: String,
+    /// Inert — see the type-level note. No retention policy reads this.
     pub max_age: Option<Duration>,
+    /// Inert — see the type-level note. No retention policy reads this.
     pub max_size: Option<usize>,
+    /// Inert — see the type-level note. Recordings are memory-only.
     pub disk: bool,
+    /// Inert — see the type-level note. Nothing hooks VM shutdown.
     pub dump_on_exit: bool,
+    /// Inert — see the type-level note. Nothing schedules an automatic stop.
     pub duration: Option<Duration>,
     /// T10.9.B: FxHashSet — EventTypeId is internal JFR definition.
     pub enabled_events: FxHashSet<EventTypeId>,
@@ -669,6 +698,59 @@ mod tests {
         let mut s = RecordingSettings::new("aged");
         s.max_age = Some(Duration::from_secs(60));
         assert_eq!(s.max_age.unwrap(), Duration::from_secs(60));
+    }
+
+    /// Observability audit (2026-07-26) contract pin: `max_size` and `max_age`
+    /// are stored but never enforced. This test asserts the *current* (inert)
+    /// behaviour so that implementing retention makes it fail — at which point
+    /// the "UNENFORCED FIELDS" note on `RecordingSettings` must be updated in
+    /// the same change rather than silently going stale.
+    #[test]
+    fn obsaudit_max_size_and_max_age_are_not_enforced() {
+        let mut settings = RecordingSettings::new("capped");
+        settings.max_size = Some(2); // "keep at most 2 events"
+        settings.max_age = Some(Duration::from_nanos(1)); // "keep only the newest"
+
+        let mut rec = Recording::new(1, settings);
+        rec.start();
+        for i in 0..10u64 {
+            rec.record_event(EventInstance {
+                type_id: EventTypeId(1),
+                start_time: i * 1_000_000_000,
+                end_time: i * 1_000_000_000 + 1,
+                thread_id: 1,
+                fields: smallvec::SmallVec::new(),
+            });
+        }
+
+        assert_eq!(
+            rec.event_count(),
+            10,
+            "max_size/max_age are inert; the only bound is the repository ring"
+        );
+    }
+
+    /// The bound that *does* apply: `EventRepository::default()`'s fixed ring.
+    /// A recording cannot grow without limit even though `max_size` is inert.
+    #[test]
+    fn obsaudit_recording_memory_is_bounded_by_repository_ring() {
+        let mut repo = crate::repository::EventRepository::default();
+        let cap = 100_000usize;
+        for i in 0..(cap + 500) {
+            repo.push(EventInstance {
+                type_id: EventTypeId(1),
+                start_time: i as u64,
+                end_time: i as u64 + 1,
+                thread_id: 1,
+                fields: smallvec::SmallVec::new(),
+            });
+        }
+        assert_eq!(
+            repo.len(),
+            cap,
+            "the default repository ring must be bounded"
+        );
+        assert_eq!(repo.total_recorded(), (cap + 500) as u64);
     }
 
     #[test]

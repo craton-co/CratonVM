@@ -3204,7 +3204,7 @@ pub fn register_p63_method_handles_lookup(r: &mut NativeMethodRegistry) {
             // FULL power, matching HotSpot's caller-sensitive lookup():
             // PUBLIC|PRIVATE|PROTECTED|PACKAGE|MODULE|ORIGINAL = 0x5F.
             lk_write_allowed_modes(ctx, obj, 0x5F);
-            if std::env::var("CRATONVM_DBG_LOOKUP").is_ok() {
+            if crate::nbflags().dbg_lookup {
                 let cid = ctx.class_id_of_object(obj);
                 eprintln!(
                     "[DBG_LOOKUP] lookup(): total_fields={} byname_allowedModes={:?} slot1={:?} slot2={:?}",
@@ -3258,7 +3258,7 @@ pub fn register_p63_method_handles_lookup(r: &mut NativeMethodRegistry) {
     r.register(lk, "lookupModes", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let modes = lk_read_allowed_modes(ctx, this);
-        if std::env::var("CRATONVM_DBG_LOOKUP").is_ok() {
+        if crate::nbflags().dbg_lookup {
             eprintln!(
                 "[DBG_LOOKUP] lookupModes(): byname={:?} slot1={:?} slot2={:?} -> {:#x}",
                 ctx.get_field_by_name(this, "allowedModes"),
@@ -4945,7 +4945,7 @@ fn neutralize_missing_serialization_hook(
             if let Some(result) =
                 serialization_hook_neutral_result(&method_name, &method_descriptor, args)
             {
-                if std::env::var_os("CRATONVM_DBG_REFLECTION_FACTORY").is_some() {
+                if crate::nbflags().dbg_reflection_factory {
                     eprintln!(
                         "[rf-ser] neutral MethodHandle missing hook {}.{}{}",
                         class_name, method_name, method_descriptor
@@ -6090,7 +6090,7 @@ pub(crate) fn mh_dispatch(
     if ctx.class_name_of_id(ctx.class_id_of_object(mh)).as_deref()
         == Some("java/lang/foreign/DowncallHandle")
     {
-        if std::env::var_os("CRATONVM_DBG_MH_DISPATCH").is_some() {
+        if crate::nbflags().dbg_mh_dispatch {
             let arg_slots: Vec<Value> = extra_args
                 .iter()
                 .map(|value| match value {
@@ -6119,7 +6119,7 @@ pub(crate) fn mh_dispatch(
         _ => MH_KIND_VIRTUAL,
     };
     let bound = ctx.get_field(mh, MH_BOUND);
-    if std::env::var_os("CRATONVM_DBG_MH_DISPATCH").is_some() {
+    if crate::nbflags().dbg_mh_dispatch {
         let runtime_class = ctx
             .class_name_of_id(ctx.class_id_of_object(mh))
             .unwrap_or_else(|| "<unknown>".to_string());
@@ -6361,7 +6361,7 @@ pub(crate) fn mh_dispatch(
                 let val = extra_args.get(idx).copied().unwrap_or(Value::Object(None));
                 permuted_args.push(val);
             }
-            if std::env::var_os("CRATONVM_DBG_MH_DISPATCH").is_some() {
+            if crate::nbflags().dbg_mh_dispatch {
                 let target_desc = mh_read_desc(ctx, target_mh).unwrap_or_default();
                 eprintln!(
                     "[MH_PERMUTE] reorder={reorder_vals:?} extra_args_len={} target_desc={target_desc:?}",
@@ -6870,7 +6870,7 @@ pub(crate) fn mh_dispatch(
                             .map(|(i, arg)| read_pinned_mh_arg(ctx, adapted_handles[i], *arg))
                             .collect();
                         let receiver = ctx.read_native_pin(recv_pin, receiver);
-                        if std::env::var_os("CRATONVM_DBG_MH_DISPATCH").is_some() {
+                        if crate::nbflags().dbg_mh_dispatch {
                             let last_desc = match adapted.last() {
                                 Some(Value::Object(Some(o))) if ctx.object_is_array(*o) => {
                                     format!("array[len={}]", ctx.array_length(*o))

@@ -174,7 +174,7 @@ classes" table below.
 
 ## Discrepancy with a prior RESOLVED doc
 
-`docs/internal/fixed-suite-bugs/spring-disposablebeanadapter-invalid-destruction-signature-cluster-RESOLVED.md`
+`../spring/spring-disposablebeanadapter-invalid-destruction-signature-cluster-RESOLVED.md`
 (dated 2026-07-12) closed an earlier 34-class "Invalid destruction signature"
 cluster after a standalone probe against a single concrete `AutoCloseable`
 bean succeeded, and explicitly noted it never captured the actual inner

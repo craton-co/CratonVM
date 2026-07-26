@@ -522,7 +522,7 @@ fn get_or_create_bean_factory(ctx: &mut dyn NativeContext, receiver: ObjectRef) 
     // actually runs, vs. the bytecode constructor already having set the field.
     // Ruled OUT as Bug B's cause: all 159 calls observed in that investigation
     // showed fast_path=true, so the recovery path never even ran.
-    if std::env::var_os("CRATONVM_DBG_GOCBF").is_some() {
+    if crate::nbflags().dbg_gocbf {
         let rcid = ctx.class_id_of_object(receiver);
         let rname = ctx.class_name_of_id(rcid).unwrap_or_default();
         eprintln!(
@@ -1285,6 +1285,28 @@ pub fn register(registry: &mut NativeMethodRegistry) {
     // provider into a required bean. Preserve a method already owned by a
     // defining loader, but canonicalize an application/global Method through
     // the active TCCL before caching it in the bean definition.
+    //
+    // AOT-cluster fix (2026-07-24): this override wrote the incoming `Method`
+    // to a field named `resolvedFactoryMethod`, which doesn't exist on
+    // real `RootBeanDefinition` (the actual field is `factoryMethodToIntrospect`,
+    // confirmed against the current `spring-framework-recheck` checkout's
+    // source) -- so every write here was silently absorbed by
+    // `set_field_by_name`'s no-such-field path, `getResolvedFactoryMethod()`
+    // (which reads `factoryMethodToIntrospect`) always saw `null`, and real
+    // Spring's own `setResolvedFactoryMethod`'s side effect of calling
+    // `setUniqueFactoryMethodName(method.getName())` (setting BOTH
+    // `factoryMethodName` and `isFactoryMethodUnique = true`) was skipped
+    // entirely. `ConstructorResolver.resolveFactoryMethod` requires
+    // `isFactoryMethodUnique` to even consult `getResolvedFactoryMethod()` in
+    // the first place, so the net effect was a bean definition that behaved
+    // as if `setResolvedFactoryMethod` had never been called at all --
+    // surfaced as `ApplicationContextAotGeneratorTests
+    // .processAheadOfTimeWithExplicitResolvableType` (gh-30689, a bean
+    // definition built with `setResolvedFactoryMethod` + `setTargetType` and
+    // no `factoryMethodName` ever set explicitly) failing with
+    // `IllegalStateException: No constructor or factory method candidate
+    // found for ... factoryMethodName=null`. Fixed by writing the correct
+    // field and replicating `setUniqueFactoryMethodName`'s two side effects.
     registry.register(
         "org/springframework/beans/factory/support/RootBeanDefinition",
         "setResolvedFactoryMethod",
@@ -1320,7 +1342,17 @@ pub fn register(registry: &mut NativeMethodRegistry) {
             }
             let this_pin = ctx.pin_native_root(this);
             let this = ctx.read_native_pin(this_pin, this);
-            ctx.set_field_by_name(this, "resolvedFactoryMethod", Value::Object(method));
+            ctx.set_field_by_name(this, "factoryMethodToIntrospect", Value::Object(method));
+            if let Some(m) = method {
+                // Mirrors `setUniqueFactoryMethodName(method.getName())`,
+                // real `setResolvedFactoryMethod`'s side effect for a
+                // non-null method — see the doc comment above.
+                if let Some((_, name, _)) = crate::lang_class::method_class_name_desc(ctx, m) {
+                    let name_str = ctx.create_string(&name);
+                    ctx.set_field_by_name(this, "factoryMethodName", Value::Object(Some(name_str)));
+                    ctx.set_field_by_name(this, "isFactoryMethodUnique", Value::Int(1));
+                }
+            }
             ctx.unpin_native_roots(this_pin);
             Ok(None)
         },
@@ -2084,6 +2116,41 @@ fn ccpp_process_config_bean_definitions(
 
 /// Recursively walk a class' @Import tree and ensure every imported class
 /// has a RootBeanDefinition registered.  `seen` prevents cycles.
+/// Cached `CCPP_DBG` lookup.
+///
+/// `walk_imports_recursive` runs the `@Import` closure for every
+/// configuration class in the context, and this probe sits on the
+/// class-not-found branch that a large Spring Boot startup takes hundreds of
+/// times (every `@ConditionalOnClass`-guarded import of an absent
+/// optional dependency). `env::var` also allocates a `String` per call on top
+/// of taking the environ lock. Latch it once; the switch must be set before
+/// the first context refresh to take effect.
+#[inline]
+fn ccpp_dbg_enabled() -> bool {
+    static DBG: OnceLock<bool> = OnceLock::new();
+    *DBG.get_or_init(|| std::env::var_os("CCPP_DBG").is_some())
+}
+
+#[cfg(test)]
+mod ccpp_dbg_flag_tests {
+    #[test]
+    fn ccpp_dbg_flag_is_latched_and_matches_environment() {
+        // The `@Import` walker used to call `env::var` (which also allocates a
+        // `String`) on every missing-class branch. The latched helper must
+        // agree with the environment at first use and stay stable.
+        let expected = std::env::var_os("CCPP_DBG").is_some();
+        assert_eq!(super::ccpp_dbg_enabled(), expected);
+        assert_eq!(super::ccpp_dbg_enabled(), expected);
+    }
+
+    #[test]
+    fn ccpp_dbg_flag_is_off_in_a_clean_environment() {
+        if std::env::var_os("CCPP_DBG").is_none() {
+            assert!(!super::ccpp_dbg_enabled());
+        }
+    }
+}
+
 fn walk_imports_recursive(
     ctx: &mut dyn NativeContext,
     class_name: &str,
@@ -2146,7 +2213,7 @@ fn walk_imports_recursive(
         // Without this, registering a RootBeanDefinition for a missing class
         // throws CannotLoadBeanClassException later during bean preInstantiation.
         if ctx.class_id_by_name(&imp_class).is_none() && ctx.load_class(&imp_class).is_err() {
-            if std::env::var("CCPP_DBG").is_ok() {
+            if ccpp_dbg_enabled() {
                 eprintln!(
                     "[CCPP-DBG] walk_imports: skipping missing @Import target {}",
                     imp_class
@@ -2469,7 +2536,7 @@ fn try_build_method_injection(
 
     // Enumerate methods up the hierarchy; a method needs implementing if it is
     // abstract somewhere and never concrete.
-    let mut all: Vec<(String, String, bool)> = Vec::new();
+    let mut all: Vec<(String, String, bool, cratonvm_types::ClassId)> = Vec::new();
     let mut iface_work: Vec<cratonvm_types::ClassId> = Vec::new();
     let mut cursor = Some(super_cid);
     while let Some(cid) = cursor {
@@ -2481,6 +2548,7 @@ fn try_build_method_injection(
                 m.name.clone(),
                 m.descriptor.clone(),
                 m.access_flags & ACC_ABSTRACT != 0,
+                cid,
             ));
         }
         iface_work.extend(ctx.class_interfaces(cid));
@@ -2511,19 +2579,20 @@ fn try_build_method_injection(
                 m.name.clone(),
                 m.descriptor.clone(),
                 m.access_flags & ACC_ABSTRACT != 0,
+                icid,
             ));
         }
         iface_work.extend(ctx.class_interfaces(icid));
     }
     let mut concrete: HashSet<(String, String)> = HashSet::new();
-    for (n, d, is_abs) in &all {
+    for (n, d, is_abs, _cid) in &all {
         if !is_abs {
             concrete.insert((n.clone(), d.clone()));
         }
     }
     let mut seen: HashSet<(String, String)> = HashSet::new();
     let mut specs: Vec<crate::cglib_enhancer::LookupMethodSpec> = Vec::new();
-    for (n, d, is_abs) in &all {
+    for (n, d, is_abs, decl_cid) in &all {
         if !is_abs || concrete.contains(&(n.clone(), d.clone())) {
             continue;
         }
@@ -2549,12 +2618,15 @@ fn try_build_method_injection(
             Some(b) if ref_ret => (true, b),
             _ => (false, None),
         };
+        let declaring_internal =
+            ctx.class_name_of_id(*decl_cid).unwrap_or_else(|| super_internal.clone());
         specs.push(crate::cglib_enhancer::LookupMethodSpec {
             name: n.clone(),
             descriptor: d.clone(),
             return_internal,
             bean_name,
             is_lookup,
+            declaring_internal,
         });
     }
     if specs.is_empty() {
@@ -2928,7 +3000,7 @@ fn try_build_replace_override(
     for c in &candidates {
         *name_counts.entry(c.name.clone()).or_insert(0) += 1;
     }
-    let dbg_replovr = std::env::var_os("CRATONVM_DBG_REPLOVR").is_some();
+    let dbg_replovr = crate::nbflags().dbg_replovr;
     let mut specs: Vec<crate::cglib_enhancer::ReplaceMethodSpec> = Vec::new();
     for c in &candidates {
         let cfgs = &replacers[&c.name];
@@ -3445,7 +3517,7 @@ fn resolve_bean_class_field(ctx: &mut dyn NativeContext, recv: ObjectRef) -> Bea
     // `ensure_class_initialized` below (both can trigger class-init that
     // allocates/collects); pin it for the whole function.
     let recv_pin = ctx.pin_native_root(recv);
-    let dbg = std::env::var_os("CRATONVM_DBG_RESOLVE_SHIM").is_some();
+    let dbg = crate::nbflags().dbg_resolve_shim;
     // Primary: the `beanClass` Object field (a Class mirror or a String name).
     let name: Option<String> = match ctx.get_field_by_name(recv, "beanClass") {
         Value::Object(Some(o)) => {
@@ -3819,7 +3891,16 @@ fn m4_abstract_bean_factory_do_resolve_bean_class(
 /// method, so this wrapping has to happen here instead of in a real catch
 /// block — same rationale as `throw_cannot_load_bean_class_exception` right
 /// above it.
-fn wrap_as_bean_definition_store_exception(
+///
+/// `pub(crate)`: also reused by `cglib_enhancer::cce_enhance` to wrap the
+/// "No visible constructors" `IllegalArgumentException` it synthesizes for
+/// `@Configuration` classes with no non-private constructor — real CGLIB's
+/// `Enhancer.filterConstructors` throws that exception raw (not wrapped, per
+/// `AbstractClassGenerator`'s RuntimeException-passthrough catch), so the
+/// wrapping into `BeanDefinitionStoreException`
+/// (`SpringApplicationTests.sourcesMustBeAccessible`'s expected type) has to
+/// happen at our synthesis site too, same rationale as here.
+pub(crate) fn wrap_as_bean_definition_store_exception(
     ctx: &mut dyn NativeContext,
     resource_description: Option<&str>,
     bean_name: &str,

@@ -227,7 +227,7 @@ null` on a freshly-constructed, never-closed reader.
 branch `fix/formauth-streamdecoder-field-index-20260710`):** applied the same
 fix `stream_encoder.rs` already used for the analogous `StreamEncoder`
 corruption (see
-[`spring-web-flow-outputstreamwriter-close-corruption-FIXED.md`](../spring-web-flow-outputstreamwriter-close-corruption-FIXED.md)) —
+[`spring-web-flow-outputstreamwriter-close-corruption-FIXED.md`](../spring/spring-web-flow-outputstreamwriter-close-corruption-FIXED.md)) —
 resolve the one real field this shim legitimately owns (`in`) **by name**
 (`get_field_by_name`/`set_field_by_name`, which walk the real class's field
 metadata instead of trusting a hand-counted index) and move the side-table

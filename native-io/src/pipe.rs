@@ -367,13 +367,55 @@ fn arg_int(args: &[Value], idx: usize) -> i32 {
     }
 }
 
-/// Extract the underlying byte-array + offset/length from a Java
+/// Decoded view of a heap-backed `java.nio.ByteBuffer`.
+///
+/// `base` is the buffer's `offset` field — the index inside `arr` that the
+/// buffer's *own* index 0 maps to. It is 0 for `ByteBuffer.allocate(n)` and
+/// for `ByteBuffer.wrap(a)`/`wrap(a, off, len)` (those encode the window in
+/// `position`/`limit`), but NON-ZERO for every buffer produced by
+/// `slice()` — `HeapByteBuffer.slice()` builds
+/// `new HeapByteBuffer(hb, -1, 0, rem, rem, pos + offset)`, i.e. it resets
+/// `position` to 0 and folds the parent position into `offset`.
+struct HeapBufferView {
+    arr: ObjectRef,
+    /// `ByteBuffer.offset` — see the struct doc.
+    base: i32,
+    position: i32,
+    limit: i32,
+}
+
+impl HeapBufferView {
+    /// Absolute index into `arr` of the buffer's current `position`.
+    fn index(&self) -> usize {
+        self.base.saturating_add(self.position).max(0) as usize
+    }
+
+    /// `limit - position`, never negative.
+    fn remaining(&self) -> i32 {
+        self.limit.saturating_sub(self.position).max(0)
+    }
+}
+
+/// Extract the underlying byte-array + offset/position/limit from a Java
 /// `ByteBuffer`-shaped object.  Tolerates several layouts:
 ///   * Heap ByteBuffer: field "hb" or slot 5 holds a `byte[]`.
 ///   * Position is at field "position" or slot 0.
 ///   * Limit is at field "limit" or slot 1.
-/// Returns (array_ref, position, limit).  None if no recognizable layout.
-fn buffer_view(ctx: &dyn NativeContext, buf: ObjectRef) -> Option<(ObjectRef, i32, i32)> {
+///   * Offset is at field "offset" (real JDK only; absent/0 in the
+///     synthetic layout).
+///
+/// Returns None if no recognizable layout (in particular for a
+/// `DirectByteBuffer`, whose `hb` is null — those have no backing array and
+/// must be handled by the caller).
+///
+/// AUDIT 2026-07-26 (native-io-audit): this used to drop `offset` entirely
+/// and index `arr` by the raw `position`. Every sliced buffer therefore
+/// read/wrote the WRONG region of the backing array — silently, with no
+/// exception — which is the same failure shape as the historical
+/// `DirectByteBuffer.put` and ByteBuffer mark/reset aliasing defects.
+/// `socket_channel::buffer_access` already handled `offset` correctly; this
+/// module was the divergent copy.
+fn buffer_view(ctx: &dyn NativeContext, buf: ObjectRef) -> Option<HeapBufferView> {
     let arr = match ctx.get_field_by_name(buf, "hb") {
         Value::Object(Some(a)) => a,
         _ => match ctx.get_field(buf, 5) {
@@ -395,7 +437,18 @@ fn buffer_view(ctx: &dyn NativeContext, buf: ObjectRef) -> Option<(ObjectRef, i3
             _ => 0,
         },
     };
-    Some((arr, position, limit))
+    // `offset` only exists on the real-JDK `ByteBuffer`; the synthetic
+    // layout has no such field, so a non-Int / negative read means 0.
+    let base = match ctx.get_field_by_name(buf, "offset") {
+        Value::Int(v) if v >= 0 => v,
+        _ => 0,
+    };
+    Some(HeapBufferView {
+        arr,
+        base,
+        position,
+        limit,
+    })
 }
 
 fn buffer_set_position(ctx: &mut dyn NativeContext, buf: ObjectRef, new_pos: i32) {
@@ -475,19 +528,42 @@ fn sink_write_buffer(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     let Some(buf) = arg_obj(args, 1) else {
         return Err(io_error("SinkChannel.write: null buffer"));
     };
-    let Some((arr, position, limit)) = buffer_view(ctx, buf) else {
+    let Some(view) = buffer_view(ctx, buf) else {
         return Err(io_error(
             "SinkChannel.write: unrecognised ByteBuffer layout",
         ));
     };
-    if position >= limit {
+    let remaining = view.remaining();
+    if remaining <= 0 {
         return Ok(Some(Value::Int(0)));
     }
-    let to_write = (limit - position) as usize;
+    // Clamp to what actually exists behind `offset + position`; a bogus
+    // `limit` must not turn into an out-of-range array read.
+    let start = view.index();
+    let avail = ctx.array_length(view.arr).saturating_sub(start);
+    let to_write = (remaining as usize).min(avail);
+    if to_write == 0 {
+        return Ok(Some(Value::Int(0)));
+    }
     // AUDIT 2026-05-17: bulk read via NativeContext intrinsic.
     let mut bytes = vec![0u8; to_write];
-    ctx.read_byte_array_into(arr, position as usize, &mut bytes);
-    let n = write_pipe(end.raw, &bytes).map_err(|e| io_error(format!("write: {e}")))?;
+    ctx.read_byte_array_into(view.arr, start, &mut bytes);
+    let position = view.position;
+    // A sink write blocks once the kernel pipe buffer is full (the Windows
+    // `CreatePipe` default is only 4 KiB, and `WriteFile` with a NULL
+    // OVERLAPPED is synchronous). Publish this thread as GC-safe first, or a
+    // concurrent stop-the-world pause waits on a mutator parked in the
+    // kernel — the documented "STW blocking-region missing native I/O
+    // family" hang shape. `buf` is used after the region, so re-sync it.
+    let mut held = [Value::Object(Some(buf))];
+    ctx.begin_blocking_region();
+    let written = write_pipe(end.raw, &bytes);
+    ctx.end_blocking_region_refs(&mut held);
+    let buf = match held[0] {
+        Value::Object(Some(o)) => o,
+        _ => buf,
+    };
+    let n = written.map_err(|e| io_error(format!("write: {e}")))?;
     if n > 0 {
         buffer_set_position(ctx, buf, position + n as i32);
     }
@@ -517,26 +593,50 @@ fn source_read_buffer(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     let Some(buf) = arg_obj(args, 1) else {
         return Err(io_error("SourceChannel.read: null buffer"));
     };
-    let Some((arr, position, limit)) = buffer_view(ctx, buf) else {
+    let Some(view) = buffer_view(ctx, buf) else {
         return Err(io_error(
             "SourceChannel.read: unrecognised ByteBuffer layout",
         ));
     };
-    let space = (limit - position).max(0) as usize;
+    // Clamp the read to what is actually addressable behind
+    // `offset + position`, so a buffer whose `limit` overshoots its backing
+    // array cannot make us read more than we can store.
+    let start = view.index();
+    let avail = ctx.array_length(view.arr).saturating_sub(start);
+    let space = (view.remaining() as usize).min(avail);
     if space == 0 {
         return Ok(Some(Value::Int(0)));
     }
+    let position = view.position;
     let mut bytes = vec![0u8; space];
-    let n = read_pipe(end.raw, &mut bytes).map_err(|e| io_error(format!("read: {e}")))?;
+    // `read(2)` / `ReadFile` on an empty pipe blocks until the peer writes or
+    // closes. Without this bracket a thread parked here never reaches a
+    // safepoint, so a concurrent stop-the-world pause hangs the whole VM —
+    // the "STW blocking-region missing native I/O family" shape. `arr` and
+    // `buf` are both used after the region, so re-sync them through
+    // `end_blocking_region_refs`.
+    let mut held = [Value::Object(Some(view.arr)), Value::Object(Some(buf))];
+    ctx.begin_blocking_region();
+    let read = read_pipe(end.raw, &mut bytes);
+    ctx.end_blocking_region_refs(&mut held);
+    let arr = match held[0] {
+        Value::Object(Some(o)) => o,
+        _ => view.arr,
+    };
+    let buf = match held[1] {
+        Value::Object(Some(o)) => o,
+        _ => buf,
+    };
+    let n = read.map_err(|e| io_error(format!("read: {e}")))?;
     if n == 0 {
         // EOF — JDK signals -1.
         return Ok(Some(Value::Int(-1)));
     }
     // AUDIT 2026-05-17: bulk write via NativeContext intrinsic.
     let copy_len = (n as usize).min(bytes.len());
-    ctx.write_byte_array_from(arr, position as usize, &bytes[..copy_len]);
-    buffer_set_position(ctx, buf, position + n as i32);
-    Ok(Some(Value::Int(n as i32)))
+    ctx.write_byte_array_from(arr, start, &bytes[..copy_len]);
+    buffer_set_position(ctx, buf, position + copy_len as i32);
+    Ok(Some(Value::Int(copy_len as i32)))
 }
 
 /// `sun.nio.ch.SinkChannelImpl.write(byte[], int off, int len)` — direct
@@ -568,7 +668,14 @@ fn sink_write_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     let mut bytes = vec![0u8; len];
     // AUDIT 2026-05-17: bulk read via NativeContext intrinsic.
     ctx.read_byte_array_into(arr, off, &mut bytes);
-    let n = write_pipe(end.raw, &bytes).map_err(|e| io_error(format!("write: {e}")))?;
+    // Same GC-cooperation contract as `sink_write_buffer` — a full kernel
+    // pipe buffer parks this thread in `write(2)`/`WriteFile`. Nothing here
+    // uses a Java ref after the region, so the plain `end_blocking_region`
+    // is sufficient.
+    ctx.begin_blocking_region();
+    let written = write_pipe(end.raw, &bytes);
+    ctx.end_blocking_region();
+    let n = written.map_err(|e| io_error(format!("write: {e}")))?;
     Ok(Some(Value::Int(n as i32)))
 }
 
@@ -597,14 +704,24 @@ fn source_read_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         )));
     }
     let mut bytes = vec![0u8; len];
-    let n = read_pipe(end.raw, &mut bytes).map_err(|e| io_error(format!("read: {e}")))?;
+    // Blocking kernel read — same GC-cooperation contract as
+    // `source_read_buffer`. `arr` is written after the region, so re-sync it.
+    let mut held = [Value::Object(Some(arr))];
+    ctx.begin_blocking_region();
+    let read = read_pipe(end.raw, &mut bytes);
+    ctx.end_blocking_region_refs(&mut held);
+    let arr = match held[0] {
+        Value::Object(Some(o)) => o,
+        _ => arr,
+    };
+    let n = read.map_err(|e| io_error(format!("read: {e}")))?;
     if n == 0 {
         return Ok(Some(Value::Int(-1)));
     }
     // AUDIT 2026-05-17: bulk write via NativeContext intrinsic.
     let copy_len = (n as usize).min(bytes.len());
     ctx.write_byte_array_from(arr, off, &bytes[..copy_len]);
-    Ok(Some(Value::Int(n as i32)))
+    Ok(Some(Value::Int(copy_len as i32)))
 }
 
 fn channel_is_open(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -764,6 +881,197 @@ mod tests {
     fn wp37_pipe_table_unknown_id_returns_none() {
         assert!(pipe_end_get(i32::MAX - 1).is_none());
         assert!(!close_pipe_end(i32::MAX - 1));
+    }
+
+    // --- AUDIT 2026-07-26 (native-io-audit) regressions ---
+
+    use crate::test_support::MockNativeContext;
+
+    /// Build a real-JDK-shaped `HeapByteBuffer` over a fresh byte[] of
+    /// `cap` bytes, with the given `offset`/`position`/`limit`.
+    fn heap_buffer(
+        ctx: &mut MockNativeContext,
+        cap: usize,
+        offset: i32,
+        position: i32,
+        limit: i32,
+    ) -> (ObjectRef, ObjectRef) {
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, cap);
+        let bb = ctx.alloc_object(8);
+        ctx.set_field_by_name(bb, "hb", Value::Object(Some(arr)));
+        ctx.set_field_by_name(bb, "offset", Value::Int(offset));
+        ctx.set_field_by_name(bb, "position", Value::Int(position));
+        ctx.set_field_by_name(bb, "limit", Value::Int(limit));
+        (bb, arr)
+    }
+
+    /// `buffer_view` used to drop the ByteBuffer `offset` field entirely and
+    /// index the backing array by the raw `position`. Every buffer produced
+    /// by `slice()` carries a non-zero `offset` (HeapByteBuffer.slice() resets
+    /// position to 0 and folds the parent position into offset), so a pipe
+    /// read/write against a sliced buffer silently touched the WRONG region
+    /// of the backing array — no exception, wrong bytes.
+    #[test]
+    fn audit_buffer_view_honours_slice_offset() {
+        let mut ctx = MockNativeContext::new();
+        // A slice of a 16-byte array starting at index 6, 4 bytes long:
+        // offset=6, position=0, limit=4.
+        let (bb, _arr) = heap_buffer(&mut ctx, 16, 6, 0, 4);
+        let view = buffer_view(&ctx, bb).expect("heap layout recognised");
+        assert_eq!(view.base, 6, "offset must be read");
+        assert_eq!(view.index(), 6, "array index is offset + position");
+        assert_eq!(view.remaining(), 4);
+
+        // With a non-zero position too: offset=6, position=1 -> index 7.
+        ctx.set_field_by_name(bb, "position", Value::Int(1));
+        let view = buffer_view(&ctx, bb).expect("heap layout recognised");
+        assert_eq!(view.index(), 7);
+        assert_eq!(view.remaining(), 3);
+    }
+
+    /// A plain `ByteBuffer.allocate()` (offset absent / 0) must be unchanged
+    /// by the fix.
+    #[test]
+    fn audit_buffer_view_plain_allocate_unchanged() {
+        let mut ctx = MockNativeContext::new();
+        let (bb, _arr) = heap_buffer(&mut ctx, 8, 0, 2, 6);
+        let view = buffer_view(&ctx, bb).expect("heap layout recognised");
+        assert_eq!(view.base, 0);
+        assert_eq!(view.index(), 2);
+        assert_eq!(view.remaining(), 4);
+    }
+
+    /// The synthetic layout has no `offset` field at all; a missing (or
+    /// non-Int) read must be treated as 0, not as a bogus base.
+    #[test]
+    fn audit_buffer_view_missing_offset_field_is_zero() {
+        let mut ctx = MockNativeContext::new();
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 4);
+        let bb = ctx.alloc_object(8);
+        ctx.set_field_by_name(bb, "hb", Value::Object(Some(arr)));
+        ctx.set_field_by_name(bb, "position", Value::Int(1));
+        ctx.set_field_by_name(bb, "limit", Value::Int(3));
+        // No "offset" named field set -> get_field_by_name yields Object(None).
+        let view = buffer_view(&ctx, bb).expect("heap layout recognised");
+        assert_eq!(view.base, 0);
+        assert_eq!(view.index(), 1);
+    }
+
+    /// A sliced destination buffer must receive the pipe bytes at
+    /// `offset + position`, and the blocking read must be bracketed in a
+    /// GC-cooperative blocking region.
+    #[test]
+    fn audit_source_read_writes_at_slice_offset_and_brackets_gc() {
+        let (read_end, write_end) = create_anonymous_pipe().expect("pipe");
+        let read_id = register_pipe_end(read_end);
+        let payload = b"XYZ";
+        assert_eq!(
+            write_pipe(write_end.raw, payload).expect("write") as usize,
+            payload.len()
+        );
+        close_raw(write_end.raw);
+
+        let mut ctx = MockNativeContext::new();
+        let this = ctx.alloc_object(4);
+        ctx.set_field(this, PIPE_FIELD_ID, Value::Int(read_id));
+        // 16-byte array, slice starting at 6 with room for 3 bytes.
+        let (bb, arr) = heap_buffer(&mut ctx, 16, 6, 0, 3);
+
+        let before = ctx.blocking_region_counts();
+        let r = source_read_buffer(
+            &mut ctx,
+            &[Value::Object(Some(this)), Value::Object(Some(bb))],
+        );
+        assert!(matches!(r, Ok(Some(Value::Int(3)))), "read 3 bytes");
+
+        // Bytes must land at arr[6..9], NOT arr[0..3].
+        let mut got = vec![0u8; 16];
+        ctx.read_byte_array_into(arr, 0, &mut got);
+        assert_eq!(
+            &got[6..9],
+            &payload[..],
+            "pipe bytes must be written at offset + position"
+        );
+        assert_eq!(
+            &got[0..3],
+            &[0u8, 0, 0][..],
+            "nothing may be written at the raw position"
+        );
+        // position is buffer-relative, so it advances 0 -> 3.
+        assert_eq!(ctx.get_field_by_name(bb, "position"), Value::Int(3));
+
+        let after = ctx.blocking_region_counts();
+        assert_eq!(
+            (after.0 - before.0, after.1 - before.1),
+            (1, 1),
+            "the blocking kernel read must be bracketed exactly once"
+        );
+        close_pipe_end(read_id);
+    }
+
+    /// The sink write must read from `offset + position` too, and bracket the
+    /// (potentially blocking) kernel write.
+    #[test]
+    fn audit_sink_write_reads_from_slice_offset_and_brackets_gc() {
+        let (read_end, write_end) = create_anonymous_pipe().expect("pipe");
+        let write_id = register_pipe_end(write_end);
+
+        let mut ctx = MockNativeContext::new();
+        let this = ctx.alloc_object(4);
+        ctx.set_field(this, PIPE_FIELD_ID, Value::Int(write_id));
+        let (bb, arr) = heap_buffer(&mut ctx, 16, 6, 0, 3);
+        // Put a decoy at the raw position and the real payload at the slice.
+        ctx.write_byte_array_from(arr, 0, b"BAD");
+        ctx.write_byte_array_from(arr, 6, b"OK!");
+
+        let before = ctx.blocking_region_counts();
+        let r = sink_write_buffer(
+            &mut ctx,
+            &[Value::Object(Some(this)), Value::Object(Some(bb))],
+        );
+        assert!(matches!(r, Ok(Some(Value::Int(3)))));
+        let after = ctx.blocking_region_counts();
+        assert_eq!((after.0 - before.0, after.1 - before.1), (1, 1));
+
+        let mut got = [0u8; 3];
+        let n = read_pipe(read_end.raw, &mut got).expect("read back");
+        assert_eq!(n, 3);
+        assert_eq!(
+            &got[..],
+            &b"OK!"[..],
+            "the bytes on the wire must come from offset + position"
+        );
+        assert_eq!(ctx.get_field_by_name(bb, "position"), Value::Int(3));
+        close_pipe_end(write_id);
+        close_raw(read_end.raw);
+    }
+
+    /// A `limit` that overshoots the backing array must clamp rather than
+    /// read/write out of range.
+    #[test]
+    fn audit_buffer_view_clamps_limit_past_array_end() {
+        let (read_end, write_end) = create_anonymous_pipe().expect("pipe");
+        let read_id = register_pipe_end(read_end);
+        write_pipe(write_end.raw, b"abcdefgh").expect("write");
+        close_raw(write_end.raw);
+
+        let mut ctx = MockNativeContext::new();
+        let this = ctx.alloc_object(4);
+        ctx.set_field(this, PIPE_FIELD_ID, Value::Int(read_id));
+        // 4-byte array, offset 2 -> only 2 bytes addressable, but limit says 8.
+        let (bb, arr) = heap_buffer(&mut ctx, 4, 2, 0, 8);
+        let r = source_read_buffer(
+            &mut ctx,
+            &[Value::Object(Some(this)), Value::Object(Some(bb))],
+        );
+        assert!(
+            matches!(r, Ok(Some(Value::Int(n))) if n <= 2),
+            "must not claim more bytes than the array can hold, got {r:?}"
+        );
+        let mut got = vec![0u8; 4];
+        ctx.read_byte_array_into(arr, 0, &mut got);
+        assert_eq!(&got[2..4], &b"ab"[..]);
+        close_pipe_end(read_id);
     }
 
     #[test]

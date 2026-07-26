@@ -37,7 +37,7 @@ fn register_bench_class(
     use cratonvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
     use cratonvm_vm::classloading::Class;
 
-    let mut cm = shared.class_manager.write();
+    let mut cm = shared.classes.class_manager_write();
     let id = cm.class_store.next_id();
     let class_name: Arc<str> = Arc::from(name);
     cm.class_store.add(Class {
@@ -247,7 +247,7 @@ fn make_nbody_bytecode() -> Vec<u8> {
 ///
 /// Computes `2^d - 1` (the sum of all node values in a perfect binary
 /// tree of depth `d` where every node has value 1) by repeated
-/// doubling РІР‚вЂќ `result = 0; for i in 0..d { result = result*2 + 1; }`.
+/// doubling — `result = 0; for i in 0..d { result = result*2 + 1; }`.
 /// This avoids actual heap allocation but exercises arithmetic +
 /// branching at the same shape as the shootout original.
 ///
@@ -359,7 +359,7 @@ fn bench_startup_to_first_bytecode(c: &mut Criterion) {
     use cratonvm_reader::attribute::{Attribute, CodeAttribute};
     use cratonvm_reader::class_access_flags::MethodAccessFlags;
 
-    // iconst_1; ireturn РІР‚вЂќ simplest possible method
+    // iconst_1; ireturn — simplest possible method
     let code = vec![0x04, 0xAC];
 
     c.bench_function("startup_to_first_bytecode", |b| {
@@ -413,7 +413,7 @@ fn bench_object_allocation(c: &mut Criterion) {
                 // Fresh VM per iteration to avoid OOM across warmup/samples
                 let shared = Arc::new(SharedVm::new(VmConfig::default()));
                 for _ in 0..n {
-                    let obj = shared.heap.alloc_object(ClassId::new(1), 4);
+                    let obj = shared.mem.heap.alloc_object(ClassId::new(1), 4);
                     black_box(obj);
                 }
             });
@@ -429,15 +429,16 @@ fn bench_gc_cycle(c: &mut Criterion) {
             let shared = Arc::new(SharedVm::new(VmConfig::default()));
             let mut roots = Vec::new();
             for _ in 0..1000 {
-                let obj = shared.heap.alloc_object(ClassId::new(1), 2);
+                let obj = shared.mem.heap.alloc_object(ClassId::new(1), 2);
                 roots.push(obj);
             }
-            if shared.heap.needs_gc() {
+            if shared.mem.heap.needs_gc() {
                 // Single-threaded benchmark — no other mutator exists.
                 let stw = unsafe { cratonvm_gc::collector::StopTheWorldToken::new() };
                 let _ = shared
+                    .mem
                     .heap
-                    .collect_garbage(&stw, &mut roots, &shared.monitors);
+                    .collect_garbage(&stw, &mut roots, &shared.threads.monitors);
             }
             black_box(&roots);
         });
@@ -446,15 +447,17 @@ fn bench_gc_cycle(c: &mut Criterion) {
 
 fn bench_native_method_dispatch(c: &mut Criterion) {
     let mut shared_vm = SharedVm::new(VmConfig::default());
-    register_builtins(&mut shared_vm.native_methods);
+    register_builtins(&mut shared_vm.natives.native_methods);
     let shared = Arc::new(shared_vm);
 
     c.bench_function("native_dispatch_noop", |b| {
         let mut thread = JvmThread::new(ThreadId(0), "bench");
         b.iter(|| {
-            if let Some(cb) = shared
-                .native_methods
-                .find("java/lang/Object", "<init>", "()V")
+            if let Some(cb) =
+                shared
+                    .natives
+                    .native_methods
+                    .find("java/lang/Object", "<init>", "()V")
             {
                 let mut ctx = cratonvm_vm::vm::NativeContextImpl {
                     shared: &shared,
@@ -646,15 +649,15 @@ fn bench_shootout_binary_trees(c: &mut Criterion) {
 // =============================================================================
 // T1.1.41-45: SPECjvm2008 / DaCapo equivalent benchmarks
 //
-// Written from scratch in Rust РІР‚вЂќ no external JARs needed. Each bench
+// Written from scratch in Rust — no external JARs needed. Each bench
 // targets the same JVM subsystem as the corresponding SPECjvm workload:
 //
-// - specjvm_startup      РІвЂ вЂ™ already covered by bench_vm_startup +
+// - specjvm_startup      → already covered by bench_vm_startup +
 //                           bench_startup_to_first_bytecode
-// - specjvm_compiler      РІвЂ вЂ™ JIT compilation throughput
-// - specjvm_crypto        РІвЂ вЂ™ hash computation via native dispatch
-// - specjvm_scimark_sor   РІвЂ вЂ™ SOR (successive over-relaxation) numeric kernel
-// - dacapo_avrora_sim     РІвЂ вЂ™ embedded simulation: tight loop + branching
+// - specjvm_compiler      → JIT compilation throughput
+// - specjvm_crypto        → hash computation via native dispatch
+// - specjvm_scimark_sor   → SOR (successive over-relaxation) numeric kernel
+// - dacapo_avrora_sim     → embedded simulation: tight loop + branching
 // =============================================================================
 
 /// SPECjvm2008-compiler equivalent: measure JIT compilation throughput.
@@ -679,16 +682,18 @@ fn bench_specjvm_compiler(c: &mut Criterion) {
 /// measure the dispatch overhead that a real crypto workload would hit.
 fn bench_specjvm_crypto_dispatch(c: &mut Criterion) {
     let mut shared_vm = SharedVm::new(VmConfig::default());
-    register_builtins(&mut shared_vm.native_methods);
+    register_builtins(&mut shared_vm.natives.native_methods);
     let shared = Arc::new(shared_vm);
 
     c.bench_function("specjvm_crypto_dispatch_10k", |b| {
         let mut thread = JvmThread::new(ThreadId(0), "bench");
         b.iter(|| {
             for _ in 0..10_000 {
-                if let Some(cb) = shared
-                    .native_methods
-                    .find("java/lang/Object", "<init>", "()V")
+                if let Some(cb) =
+                    shared
+                        .natives
+                        .native_methods
+                        .find("java/lang/Object", "<init>", "()V")
                 {
                     let mut ctx = cratonvm_vm::vm::NativeContextImpl {
                         shared: &shared,
@@ -702,7 +707,7 @@ fn bench_specjvm_crypto_dispatch(c: &mut Criterion) {
 }
 
 /// SPECjvm2008-scimark SOR equivalent: successive over-relaxation on a
-/// grid. This is the classic numeric kernel from scimark2 РІР‚вЂќ a 2D
+/// grid. This is the classic numeric kernel from scimark2 — a 2D
 /// relaxation sweep. Built as raw bytecode so it runs through the
 /// real interpreter.
 ///
@@ -861,7 +866,7 @@ fn bench_specjvm_scimark_sor(c: &mut Criterion) {
     );
 
     let mut group = c.benchmark_group("specjvm_scimark_sor");
-    // grid_size=10, iters=5 РІвЂ вЂ™ light
+    // grid_size=10, iters=5 → light
     group.bench_function("10x5", |b| {
         b.iter(|| {
             let mut thread = JvmThread::new(ThreadId(0), "bench");
@@ -875,7 +880,7 @@ fn bench_specjvm_scimark_sor(c: &mut Criterion) {
             ));
         });
     });
-    // grid_size=20, iters=10 РІвЂ вЂ™ heavier
+    // grid_size=20, iters=10 → heavier
     group.bench_function("20x10", |b| {
         b.iter(|| {
             let mut thread = JvmThread::new(ThreadId(0), "bench");
@@ -895,7 +900,7 @@ fn bench_specjvm_scimark_sor(c: &mut Criterion) {
 /// DaCapo-avrora equivalent: tight embedded-simulation loop.
 /// Avrora simulates an AVR microcontroller instruction set. We
 /// approximate the workload shape: a tight decode-execute loop with
-/// branching on opcode categories РІР‚вЂќ exercising the interpreter's
+/// branching on opcode categories — exercising the interpreter's
 /// branch prediction and dispatch throughput at scale.
 ///
 /// Uses the same counting-loop bytecode pattern but with a much
@@ -1039,8 +1044,8 @@ fn bench_gc_write_barrier(c: &mut Criterion) {
     let shared = Arc::new(SharedVm::new(VmConfig::default()));
     // One holder object + one referent — the canonical "store ref into
     // field" shape the barrier triggers on.
-    let holder = shared.heap.alloc_object(ClassId::new(1), 4);
-    let referent = shared.heap.alloc_object(ClassId::new(1), 4);
+    let holder = shared.mem.heap.alloc_object(ClassId::new(1), 4);
+    let referent = shared.mem.heap.alloc_object(ClassId::new(1), 4);
 
     c.bench_function("gc_write_barrier_lower_bound_touch_loop", |b| {
         b.iter(|| {
@@ -1068,17 +1073,17 @@ fn bench_gc_write_barrier(c: &mut Criterion) {
 /// the monitor table at the same rate.
 fn bench_monitor_enter_exit(c: &mut Criterion) {
     let shared = Arc::new(SharedVm::new(VmConfig::default()));
-    let obj = shared.heap.alloc_object(ClassId::new(1), 4);
+    let obj = shared.mem.heap.alloc_object(ClassId::new(1), 4);
 
     c.bench_function("monitor_enter_exit_lower_bound_touch_loop", |b| {
         b.iter(|| {
             for _ in 0..1_000 {
-                // Drive the monitor table — `&shared.monitors` is the
+                // Drive the monitor table — `&shared.threads.monitors` is the
                 // same handle the interpreter consults on
                 // `monitorenter`. Without a public enter/exit hook this
                 // is a touch-only loop that establishes the baseline
                 // path-length the real bench will replace.
-                black_box(&shared.monitors);
+                black_box(&shared.threads.monitors);
                 black_box(&obj);
             }
         });
@@ -1108,7 +1113,7 @@ fn bench_exception_throw_catch(c: &mut Criterion) {
                 // iteration approximates that without needing the
                 // unwinder. Replace with a `throw + catch` invocation
                 // once the bytecode fixture lands.
-                let exc = shared.heap.alloc_object(ClassId::new(1), 4);
+                let exc = shared.mem.heap.alloc_object(ClassId::new(1), 4);
                 black_box(exc);
             }
         });

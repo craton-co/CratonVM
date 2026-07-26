@@ -68,6 +68,31 @@ const BOOTSTRAP: &str = "bootstrap";
 /// Apache Groovy's invokedynamic bootstrap class.
 const GROOVY_INDY_INTERFACE: &str = "org/codehaus/groovy/vmplugin/v8/IndyInterface";
 
+/// Cached read of a `CRATONVM_DBG_*` env var.
+///
+/// `std::env::var_os` is a `getenv` mutex + `OsString` allocation on Linux and a
+/// ~500 ns `GetEnvironmentVariableW` syscall plus a UTF-16 decode on Windows.
+/// Two of the three flags below sat on genuinely hot paths:
+/// `CRATONVM_DBG_INDY_GENERIC` is read on **every execution** of a generic
+/// (non-JDK-factory) `invokedynamic` — which is every Groovy / JRuby / Kotlin
+/// call site — and `CRATONVM_DBG_LAMBDA_DISPATCH` on every lambda bootstrap.
+/// Same process-lifetime caching policy as
+/// [`crate::runtime::env_cache`] and `runtime::exceptions`: setting the
+/// variable after the first read has no effect.
+macro_rules! cached_env_flag {
+    ($name:ident, $env:literal) => {
+        #[inline]
+        fn $name() -> bool {
+            static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *CACHE.get_or_init(|| std::env::var_os($env).is_some())
+        }
+    };
+}
+
+cached_env_flag!(dbg_indy_all, "CRATONVM_DBG_INDY_ALL");
+cached_env_flag!(dbg_indy_generic, "CRATONVM_DBG_INDY_GENERIC");
+cached_env_flag!(dbg_lambda_dispatch, "CRATONVM_DBG_LAMBDA_DISPATCH");
+
 /// Groovy call-site name for a coercion (`cast:(Object)Z`, `cast:(Object)I`, …).
 const GROOVY_CAST: &str = "cast";
 
@@ -118,7 +143,7 @@ pub fn execute_invokedynamic(
     // with every resolver queued behind the writers. The clone is cheap:
     // `ResolvedCallSite`'s strings are `Arc<str>` (refcount bumps).
     let cached_site = {
-        let cache = shared.resolution_cache.read();
+        let cache = shared.classes.resolution_cache.read();
         cache.get_call_site(current_class_id, cp_index).cloned()
     };
     if let Some(site) = cached_site {
@@ -129,7 +154,7 @@ pub fn execute_invokedynamic(
     // Extract all needed data under the class_manager read lock, then drop it.
     // This avoids deadlocking when create_java_string needs a write lock.
     let info = {
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let class = cm
             .get_class(current_class_id)
             .ok_or_else(|| VmError::Internal {
@@ -211,9 +236,9 @@ pub fn execute_invokedynamic(
         }
     }; // cm read lock dropped here
 
-    if std::env::var_os("CRATONVM_DBG_INDY_ALL").is_some() {
+    if dbg_indy_all() {
         let caller_name = {
-            let cm = shared.class_manager.read();
+            let cm = shared.classes.class_manager.read();
             cm.get_class(current_class_id)
                 .map(|c| c.name.to_string())
                 .unwrap_or_default()
@@ -235,11 +260,19 @@ pub fn execute_invokedynamic(
             target_descriptor: Arc::from(info.target_descriptor.clone()),
         };
         shared
+            .classes
             .resolution_cache
             .write()
             .put_call_site(current_class_id, cp_index, site);
 
-        execute_string_concat(shared, thread, frame_idx, &info)
+        execute_string_concat(
+            shared,
+            thread,
+            frame_idx,
+            &info.recipe,
+            info.constant_args.as_slice(),
+            &info.target_descriptor,
+        )
     } else if info.bsm_class == STRING_CONCAT_FACTORY && info.bsm_method == MAKE_CONCAT {
         // makeConcat has no recipe — all arguments are simply concatenated in order.
         // Synthesize a recipe of all \u{0001} placeholders so the existing concat
@@ -248,27 +281,31 @@ pub fn execute_invokedynamic(
         let synthetic_recipe: String = std::iter::repeat('\u{0001}')
             .take(arg_types.len())
             .collect();
-        let patched_info = IndyInfo {
-            bsm_class: info.bsm_class.clone(),
-            bsm_method: info.bsm_method.clone(),
-            target_name: info.target_name.clone(),
-            target_descriptor: info.target_descriptor.clone(),
-            recipe: synthetic_recipe.clone(),
-            constant_args: vec![],
-            bootstrap_arg_indices: info.bootstrap_arg_indices.clone(),
-        };
 
         let site = ResolvedCallSite::StringConcat {
-            recipe: Arc::from(synthetic_recipe),
+            recipe: Arc::from(synthetic_recipe.as_str()),
             constant_args: vec![],
-            target_descriptor: Arc::from(info.target_descriptor.clone()),
+            target_descriptor: Arc::from(info.target_descriptor.as_str()),
         };
         shared
+            .classes
             .resolution_cache
             .write()
             .put_call_site(current_class_id, cp_index, site);
 
-        execute_string_concat(shared, thread, frame_idx, &patched_info)
+        // A synthesized all-argument recipe is U+0001 repeated, so it holds no
+        // TAG_CONST (U+0002) placeholders and the constant list is empty. The
+        // whole-`IndyInfo` clone (`patched_info`) this branch used to build was
+        // only ever read for the three values passed below.
+        const NO_CONSTANTS: &[&str] = &[];
+        execute_string_concat(
+            shared,
+            thread,
+            frame_idx,
+            &synthetic_recipe,
+            NO_CONSTANTS,
+            &info.target_descriptor,
+        )
     } else if info.bsm_class == LAMBDA_METAFACTORY
         && (info.bsm_method == METAFACTORY || info.bsm_method == ALT_METAFACTORY)
     {
@@ -400,7 +437,7 @@ fn groovy_cast_to_boolean(
         Some(Value::Int(v)) => v,
         Some(Value::Object(Some(o))) => {
             // Defensive: a boxed Boolean — unbox via field 0.
-            match shared.heap.get_field(o, 0) {
+            match shared.mem.heap.get_field(o, 0) {
                 Value::Int(v) => v,
                 _ => 1,
             }
@@ -429,7 +466,7 @@ fn bootstrap_generic(
 ) -> Result<(), MethodCallFailed> {
     // --- Re-resolve the BSM (with descriptor) + static args under the lock. ---
     let (bsm_class, bsm_method, bsm_desc, static_args) = {
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let class = cm
             .get_class(current_class_id)
             .ok_or_else(|| VmError::Internal {
@@ -690,7 +727,7 @@ fn bootstrap_generic(
     }
 
     // --- Invoke the bootstrap method → CallSite. ---
-    let dbg = std::env::var_os("CRATONVM_DBG_INDY_GENERIC").is_some();
+    let dbg = dbg_indy_generic();
     if dbg {
         eprintln!(
             "[indy-generic] bootstrap {bsm_class}.{bsm_method} target={}{} bsm_args_len={}",
@@ -910,18 +947,14 @@ fn execute_cached_call_site(
             recipe,
             constant_args,
             target_descriptor,
-        } => {
-            let info = IndyInfo {
-                bsm_class: String::new(),
-                bsm_method: String::new(),
-                target_name: String::new(),
-                target_descriptor: target_descriptor.to_string(),
-                recipe: recipe.to_string(),
-                constant_args: constant_args.iter().map(|s| s.to_string()).collect(),
-                bootstrap_arg_indices: vec![],
-            };
-            execute_string_concat(shared, thread, frame_idx, &info)
-        }
+        } => execute_string_concat(
+            shared,
+            thread,
+            frame_idx,
+            recipe,
+            constant_args.as_slice(),
+            target_descriptor,
+        ),
         ResolvedCallSite::Lambda(lcs) => execute_cached_lambda(shared, thread, frame_idx, lcs),
         ResolvedCallSite::TypeSwitch { labels } => {
             execute_type_switch(shared, thread, frame_idx, labels)
@@ -966,7 +999,7 @@ fn bootstrap_lambda(
     // Parse bootstrap arguments from constant pool
     // We need to re-acquire the class manager lock briefly to resolve the BSM args
     let (sam_erased_desc, impl_handle, instantiated_desc, host_loader) = {
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let class = cm
             .get_class(current_class_id)
             .ok_or_else(|| VmError::Internal {
@@ -1019,11 +1052,12 @@ fn bootstrap_lambda(
     // checks (Spring AOT `ArgumentCodeGenerator.and()` → javapoet
     // `TypeName.equals` getClass() mismatch).
     let functional_interface_id = shared
+        .classes
         .class_manager
         .read()
         .get_loaded_class_id_for_requester(&functional_interface, host_loader);
 
-    if std::env::var_os("CRATONVM_DBG_LAMBDA_DISPATCH").is_some() {
+    if dbg_lambda_dispatch() {
         eprintln!(
             "[DBG_LAMBDA] bootstrap host={:?} loader={:?} iface={} resolved_id={:?}",
             current_class_id, host_loader, functional_interface, functional_interface_id
@@ -1046,7 +1080,7 @@ fn bootstrap_lambda(
 
     // Register the lambda proxy and cache the call site
     let registered = {
-        let mut proxies = shared.lambda_proxies.write();
+        let mut proxies = shared.classes.lambda_proxies.write();
         if proxies.len() < crate::vm::MAX_LAMBDA_PROXIES {
             proxies.insert(proxy_class_id, call_site.clone());
             true
@@ -1060,11 +1094,12 @@ fn bootstrap_lambda(
     // Bounded by the same cap as `lambda_proxies`. bug-06 fam5 #1.
     if registered {
         shared
+            .classes
             .lambda_proxy_hosts
             .write()
             .insert(proxy_class_id, current_class_id);
     }
-    shared.resolution_cache.write().put_call_site(
+    shared.classes.resolution_cache.write().put_call_site(
         current_class_id,
         cp_index,
         ResolvedCallSite::Lambda(call_site),
@@ -1090,6 +1125,63 @@ fn execute_cached_lambda(
     )
 }
 
+// Zero-capture lambda singleton cache — mirrors real HotSpot's
+// `InnerClassLambdaMetafactory` behaviour of caching a single `INSTANCE`
+// per spun lambda class when the lambda captures nothing. Some code
+// (Spring AOT's bean-override identity check across an original context
+// and its AOT-replayed context) depends on `==`/`.equals()` identity
+// holding for two separate invocations of the same non-capturing lambda
+// expression. `proxy_class_id` is a monotonically-increasing synthetic id
+// (`SharedVm::alloc_lambda_proxy_id`) that is never recycled, so unlike
+// the real (recyclable) `ClassId` space used for loaded classes, keying
+// this cache directly by `(vm_identity, proxy_class_id)` carries no
+// aliasing risk. GC-scanned/remapped the same way as the
+// `Integer.valueOf` cache in `native-builtins/src/lang_math.rs` (see
+// `gc_scan_lambda_singleton_roots` / `gc_update_lambda_singleton_refs`,
+// wired into `vm/src/memory/{roots.rs,gc.rs}`).
+static LAMBDA_SINGLETON_CACHE: std::sync::OnceLock<
+    parking_lot::Mutex<std::collections::HashMap<(usize, ClassId), ObjectRef>>,
+> = std::sync::OnceLock::new();
+
+fn lambda_singleton_cache(
+) -> &'static parking_lot::Mutex<std::collections::HashMap<(usize, ClassId), ObjectRef>> {
+    LAMBDA_SINGLETON_CACHE.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// GC root scan hook — called from `vm/src/memory/roots.rs`. Reports the
+/// cached zero-capture lambda singletons for the active VM so the GC keeps
+/// them live.
+pub fn gc_scan_lambda_singleton_roots(vm_identity: usize, out: &mut Vec<ObjectRef>) {
+    let cache = lambda_singleton_cache().lock();
+    for (&(vid, _), obj_ref) in cache.iter() {
+        if vid == vm_identity {
+            out.push(*obj_ref);
+        }
+    }
+}
+
+/// GC post-compaction hook — called from `vm/src/memory/gc.rs`. Remaps
+/// every cached singleton for the active VM through the GC's pointer map.
+pub fn gc_update_lambda_singleton_refs(
+    vm_identity: usize,
+    pointer_map: &std::collections::HashMap<usize, usize>,
+) {
+    if pointer_map.is_empty() {
+        return;
+    }
+    let mut cache = lambda_singleton_cache().lock();
+    for (&(vid, _), obj_ref) in cache.iter_mut() {
+        if vid != vm_identity {
+            continue;
+        }
+        let old_addr = obj_ref.as_ptr() as usize;
+        if let Some(&new_addr) = pointer_map.get(&old_addr) {
+            debug_assert!(new_addr != 0, "GC pointer map contains null address");
+            *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+        }
+    }
+}
+
 /// Pop captured values from the stack, allocate a lambda proxy object, push it.
 fn allocate_lambda_proxy(
     shared: &SharedVm,
@@ -1099,6 +1191,23 @@ fn allocate_lambda_proxy(
     capture_types: &[char],
 ) -> Result<(), MethodCallFailed> {
     let num_captures = capture_types.len();
+
+    // Fast path: a zero-capture call site whose singleton was already
+    // minted on a prior invocation just returns the cached instance —
+    // matches real HotSpot's cached-INSTANCE-field optimization for
+    // non-capturing lambdas (see LAMBDA_SINGLETON_CACHE above).
+    if num_captures == 0 {
+        if let Some(cached) = lambda_singleton_cache()
+            .lock()
+            .get(&(shared.vm_identity, proxy_class_id))
+            .copied()
+        {
+            thread.frames[frame_idx]
+                .stack
+                .push(Value::Object(Some(cached)))?;
+            return Ok(());
+        }
+    }
 
     // Pop captured values (pushed left-to-right, pop right-to-left)
     let mut captures: Vec<Value> = Vec::with_capacity(num_captures);
@@ -1135,12 +1244,17 @@ fn allocate_lambda_proxy(
 
     // Allocate a proxy object on the heap with fields for captured values.
     // Use try_alloc + GC retry to avoid aborting on young-gen exhaustion.
-    let proxy_ref = match shared.heap.try_alloc_object(proxy_class_id, num_captures) {
+    let proxy_ref = match shared
+        .mem
+        .heap
+        .try_alloc_object(proxy_class_id, num_captures)
+    {
         Some(obj) => obj,
         None => {
             thread.tlab.retire();
             super::interpreter::maybe_gc_forced_pub(shared, thread);
             match shared
+                .mem
                 .heap
                 .try_alloc_object(proxy_class_id, num_captures)
                 .ok_or_else(|| {
@@ -1171,7 +1285,15 @@ fn allocate_lambda_proxy(
     thread.native_pin_roots.truncate(pin_base);
 
     for (i, val) in captures.iter().enumerate() {
-        shared.heap.set_field(proxy_ref, i, *val);
+        shared.mem.heap.set_field(proxy_ref, i, *val);
+    }
+
+    // Zero-capture call sites mint their singleton exactly once; every
+    // later invocation hits the fast path above instead.
+    if num_captures == 0 {
+        lambda_singleton_cache()
+            .lock()
+            .insert((shared.vm_identity, proxy_class_id), proxy_ref);
     }
 
     // Push the proxy object onto the stack
@@ -1270,13 +1392,29 @@ pub fn resolve_method_handle_full(
 /// Execute StringConcatFactory.makeConcatWithConstants.
 ///
 /// Called after the class_manager read lock has been released.
-fn execute_string_concat(
+/// Execute a `StringConcatFactory` call site.
+///
+/// Takes the three pieces it actually needs as **borrowed** data rather than an
+/// `&IndyInfo`. That is not cosmetic: this is the hottest cached
+/// `invokedynamic` shape in the VM (every `"a" + b` in every logging call,
+/// `toString()`, and exception message), and the cached fast path used to
+/// rebuild a whole `IndyInfo` per execution — `recipe.to_string()` +
+/// `target_descriptor.to_string()` + a `Vec<String>` re-allocating **every**
+/// constant arg — purely to convert the cached `Arc<str>`s into the `String`s
+/// this signature demanded. That was `2 + N` heap allocations plus a `Vec` on
+/// every single string concatenation, all of it discarded microseconds later.
+/// Generic over `S: AsRef<str>` so the cached path can pass its
+/// `&[Arc<str>]` and the bootstrap path its `&[String]` with no conversion at
+/// all.
+fn execute_string_concat<S: AsRef<str>>(
     shared: &SharedVm,
     thread: &mut JvmThread,
     frame_idx: usize,
-    info: &IndyInfo,
+    recipe: &str,
+    constant_args: &[S],
+    target_descriptor: &str,
 ) -> Result<(), MethodCallFailed> {
-    let arg_types = parse_descriptor_args(&info.target_descriptor);
+    let arg_types = parse_descriptor_args(target_descriptor);
 
     // Pop arguments from the stack (pushed left-to-right, pop right-to-left).
     //
@@ -1351,7 +1489,7 @@ fn execute_string_concat(
     let mut arg_idx = 0;
     let mut const_idx = 0;
 
-    for ch in info.recipe.chars() {
+    for ch in recipe.chars() {
         if ch == '\u{0001}' {
             // Argument placeholder
             if arg_idx < arg_values.len() {
@@ -1378,8 +1516,8 @@ fn execute_string_concat(
             }
         } else if ch == '\u{0002}' {
             // Constant placeholder (from bootstrap_arguments[1..])
-            if let Some(s) = info.constant_args.get(const_idx) {
-                result.push_str(s);
+            if let Some(s) = constant_args.get(const_idx) {
+                result.push_str(s.as_ref());
             }
             const_idx += 1;
         } else {
@@ -1613,7 +1751,7 @@ fn value_to_string(
         Value::Object(None) => "null".to_string(),
         Value::Object(Some(obj_ref)) => {
             // Try to read as a Java String first
-            if let Some(s) = read_java_string(&shared.heap, *obj_ref) {
+            if let Some(s) = read_java_string(&shared.mem.heap, *obj_ref) {
                 return s;
             }
 
@@ -1621,13 +1759,15 @@ fn value_to_string(
             // Arrays must NOT take this path: num_slots is the array LENGTH,
             // so a length-1 array would masquerade as a wrapper and packed
             // primitive arrays would read a garbage Value slot.
-            let is_array = shared.heap.kind_of(*obj_ref) == crate::memory::heap::ObjectKind::Array;
-            let nf = shared.heap.get_header(*obj_ref).num_slots as usize;
+            let is_array =
+                shared.mem.heap.kind_of(*obj_ref) == crate::memory::heap::ObjectKind::Array;
+            let nf = shared.mem.heap.get_header(*obj_ref).num_slots() as usize;
             if nf == 1 && !is_array {
-                match shared.heap.get_field(*obj_ref, 0) {
+                match shared.mem.heap.get_field(*obj_ref, 0) {
                     Value::Int(v) => {
-                        let class_id = shared.heap.class_id_of(*obj_ref);
+                        let class_id = shared.mem.heap.class_id_of(*obj_ref);
                         let name = shared
+                            .classes
                             .class_manager
                             .read()
                             .get_class(class_id)
@@ -1680,11 +1820,12 @@ fn value_to_string(
                 // `"file:" + Paths.get(...)` repro that still printed
                 // `file:java.nio.file.Path@<hash>` until switched to
                 // `is_subclass_of`.)
-                let obj_class_id = shared.heap.class_id_of(*obj_ref);
+                let obj_class_id = shared.mem.heap.class_id_of(*obj_ref);
                 let is_path = ctx
                     .class_id_by_name("java/nio/file/Path")
                     .is_some_and(|path_cid| {
                         shared
+                            .classes
                             .class_manager
                             .read()
                             .is_subclass_of(obj_class_id, path_cid)
@@ -1712,8 +1853,9 @@ fn value_to_string(
                 crate::runtime::interpreter::array_descriptor_of(shared, *obj_ref)
                     .unwrap_or_else(|| "[Ljava/lang/Object;".to_string())
             } else {
-                let class_id = shared.heap.class_id_of(*obj_ref);
+                let class_id = shared.mem.heap.class_id_of(*obj_ref);
                 shared
+                    .classes
                     .class_manager
                     .read()
                     .get_class(class_id)
@@ -1721,7 +1863,7 @@ fn value_to_string(
                     .unwrap_or_else(|| "?".to_string())
             };
             let dotted = class_name.replace('/', ".");
-            let hash = shared.heap.identity_hash_code(*obj_ref);
+            let hash = shared.mem.heap.identity_hash_code(*obj_ref);
             format!("{dotted}@{hash:x}")
         }
         _ => "?".to_string(),
@@ -1763,7 +1905,7 @@ fn bootstrap_type_switch(
 
     // Phase 1: extract label names from constant pool (read lock only).
     let raw_labels: Vec<RawSwitchLabel> = {
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let class = cm
             .get_class(current_class_id)
             .ok_or_else(|| VmError::Internal {
@@ -1858,6 +2000,7 @@ fn bootstrap_type_switch(
         labels: labels.clone(),
     };
     shared
+        .classes
         .resolution_cache
         .write()
         .put_call_site(current_class_id, cp_index, site);
@@ -1901,9 +2044,10 @@ pub fn execute_type_switch(
         // here is what the generated bytecode expects.
         Value::Object(None) => -1,
         Value::Object(Some(obj_ref)) => {
-            let obj_class_id = shared.heap.class_id_of(obj_ref);
+            let obj_class_id = shared.mem.heap.class_id_of(obj_ref);
             // Read the object's class name once for boxed-type matching.
             let obj_class_name = shared
+                .classes
                 .class_manager
                 .read()
                 .get_class(obj_class_id)
@@ -1961,6 +2105,7 @@ fn type_switch_match(
                 // A Long does NOT match `case Integer i` — only exact type or
                 // supertype matches are valid.
                 shared
+                    .classes
                     .class_manager
                     .read()
                     .is_subclass_of(obj_class_id, *class_id)
@@ -1976,7 +2121,7 @@ fn type_switch_match(
             SwitchLabel::Double(expected) => unbox_double(shared, obj_ref, obj_class_name)
                 .is_some_and(|v| v.to_bits() == expected.to_bits()),
             SwitchLabel::Str(expected) => {
-                read_java_string(&shared.heap, obj_ref).as_deref() == Some(&**expected)
+                read_java_string(&shared.mem.heap, obj_ref).as_deref() == Some(&**expected)
             }
             SwitchLabel::PrimitiveClass(desc) => {
                 // JEP 507: primitive type pattern matches boxed wrapper types.
@@ -2022,19 +2167,19 @@ fn primitive_pattern_match(
         | "java/lang/Short"
         | "java/lang/Integer"
         | "java/lang/Character"
-        | "java/lang/Boolean" => match shared.heap.get_field(obj_ref, 0) {
+        | "java/lang/Boolean" => match shared.mem.heap.get_field(obj_ref, 0) {
             Value::Int(v) => NumericValue::Int(v),
             _ => return false,
         },
-        "java/lang/Long" => match shared.heap.get_field(obj_ref, 0) {
+        "java/lang/Long" => match shared.mem.heap.get_field(obj_ref, 0) {
             Value::Long(v) => NumericValue::Long(v),
             _ => return false,
         },
-        "java/lang/Float" => match shared.heap.get_field(obj_ref, 0) {
+        "java/lang/Float" => match shared.mem.heap.get_field(obj_ref, 0) {
             Value::Float(v) => NumericValue::Float(v),
             _ => return false,
         },
-        "java/lang/Double" => match shared.heap.get_field(obj_ref, 0) {
+        "java/lang/Double" => match shared.mem.heap.get_field(obj_ref, 0) {
             Value::Double(v) => NumericValue::Double(v),
             _ => return false,
         },
@@ -2153,7 +2298,7 @@ fn unbox_int(shared: &SharedVm, obj: ObjectRef, class_name: &str) -> Option<i32>
         | "java/lang/Byte"
         | "java/lang/Short"
         | "java/lang/Character"
-        | "java/lang/Boolean" => match shared.heap.get_field(obj, 0) {
+        | "java/lang/Boolean" => match shared.mem.heap.get_field(obj, 0) {
             Value::Int(v) => Some(v),
             _ => None,
         },
@@ -2163,7 +2308,7 @@ fn unbox_int(shared: &SharedVm, obj: ObjectRef, class_name: &str) -> Option<i32>
 
 fn unbox_long(shared: &SharedVm, obj: ObjectRef, class_name: &str) -> Option<i64> {
     if class_name == "java/lang/Long" {
-        match shared.heap.get_field(obj, 0) {
+        match shared.mem.heap.get_field(obj, 0) {
             Value::Long(v) => Some(v),
             _ => None,
         }
@@ -2174,7 +2319,7 @@ fn unbox_long(shared: &SharedVm, obj: ObjectRef, class_name: &str) -> Option<i64
 
 fn unbox_float(shared: &SharedVm, obj: ObjectRef, class_name: &str) -> Option<f32> {
     if class_name == "java/lang/Float" {
-        match shared.heap.get_field(obj, 0) {
+        match shared.mem.heap.get_field(obj, 0) {
             Value::Float(v) => Some(v),
             _ => None,
         }
@@ -2185,7 +2330,7 @@ fn unbox_float(shared: &SharedVm, obj: ObjectRef, class_name: &str) -> Option<f3
 
 fn unbox_double(shared: &SharedVm, obj: ObjectRef, class_name: &str) -> Option<f64> {
     if class_name == "java/lang/Double" {
-        match shared.heap.get_field(obj, 0) {
+        match shared.mem.heap.get_field(obj, 0) {
             Value::Double(v) => Some(v),
             _ => None,
         }
@@ -2230,7 +2375,7 @@ fn bootstrap_record_object_method(
 
     // Parse component names and field descriptors from bootstrap arguments.
     let (component_names, field_indices, field_descriptors) = {
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let class = cm
             .get_class(current_class_id)
             .ok_or_else(|| VmError::Internal {
@@ -2277,7 +2422,7 @@ fn bootstrap_record_object_method(
         // Determine the field indices for each component.
         let field_indices: Vec<usize> = if let Some(ref rec_name) = record_class_name {
             let rec_cid = shared.load_class_concurrent(rec_name)?;
-            let cm = shared.class_manager.read();
+            let cm = shared.classes.class_manager.read();
             if let Some(rec_class) = cm.get_class(rec_cid) {
                 let first_field = rec_class.first_field_index;
                 (0..component_names.len())
@@ -2301,6 +2446,7 @@ fn bootstrap_record_object_method(
         field_descriptors: field_descriptors.clone(),
     };
     shared
+        .classes
         .resolution_cache
         .write()
         .put_call_site(current_class_id, cp_index, site);
@@ -2363,8 +2509,8 @@ fn execute_record_object_method(
                 (Value::Object(Some(a)), Value::Object(Some(b))) if a == b => Ok(1),
                 (Value::Object(Some(a)), Value::Object(Some(b))) => {
                     // Must be same class
-                    let a_cid = shared.heap.class_id_of(*a);
-                    let b_cid = shared.heap.class_id_of(*b);
+                    let a_cid = shared.mem.heap.class_id_of(*a);
+                    let b_cid = shared.mem.heap.class_id_of(*b);
                     if a_cid != b_cid {
                         Ok(0)
                     } else {
@@ -2445,8 +2591,9 @@ fn execute_record_object_method(
             let this = thread.frames[frame_idx].stack.pop()?;
             let s = match this {
                 Value::Object(Some(obj)) => {
-                    let cid = shared.heap.class_id_of(obj);
+                    let cid = shared.mem.heap.class_id_of(obj);
                     let class_name = shared
+                        .classes
                         .class_manager
                         .read()
                         .get_class(cid)
@@ -2526,16 +2673,17 @@ fn values_equal_deep(
             if x == y {
                 return Ok(true);
             }
-            let x_cid = ctx.shared.heap.class_id_of(*x);
+            let x_cid = ctx.shared.mem.heap.class_id_of(*x);
             let x_name = ctx
                 .shared
+                .classes
                 .class_manager
                 .read()
                 .get_class(x_cid)
                 .map(|c| c.name.clone());
             if x_name.as_deref() == Some("java/lang/String") {
-                let xs = read_java_string(&ctx.shared.heap, *x);
-                let ys = read_java_string(&ctx.shared.heap, *y);
+                let xs = read_java_string(&ctx.shared.mem.heap, *x);
+                let ys = read_java_string(&ctx.shared.mem.heap, *y);
                 return Ok(xs == ys);
             }
             use cratonvm_native_api::NativeContext as _;
@@ -2558,9 +2706,10 @@ fn values_equal_deep(
 fn value_hash_deep(ctx: &mut NativeContextImpl<'_>, v: &Value) -> Result<i32, MethodCallFailed> {
     match v {
         Value::Object(Some(obj)) => {
-            let cid = ctx.shared.heap.class_id_of(*obj);
+            let cid = ctx.shared.mem.heap.class_id_of(*obj);
             let name = ctx
                 .shared
+                .classes
                 .class_manager
                 .read()
                 .get_class(cid)
@@ -2590,13 +2739,14 @@ fn value_to_string_deep(
     match v {
         Value::Object(Some(obj)) => {
             // String fast path — read the chars directly.
-            if let Some(s) = read_java_string(&ctx.shared.heap, *obj) {
+            if let Some(s) = read_java_string(&ctx.shared.mem.heap, *obj) {
                 return Ok(s);
             }
             use cratonvm_native_api::NativeContext as _;
             match ctx.invoke_virtual(*obj, "toString", "()Ljava/lang/String;", &[])? {
                 Some(Value::Object(Some(s))) => {
-                    Ok(read_java_string(&ctx.shared.heap, s).unwrap_or_else(|| "null".to_string()))
+                    Ok(read_java_string(&ctx.shared.mem.heap, s)
+                        .unwrap_or_else(|| "null".to_string()))
                 }
                 // toString returned null (legal) → JDK prints "null".
                 _ => Ok("null".to_string()),
@@ -2626,15 +2776,16 @@ fn values_equal(shared: &SharedVm, a: &Value, b: &Value) -> bool {
                 return true;
             }
             // For String objects, compare by content
-            let x_cid = shared.heap.class_id_of(*x);
+            let x_cid = shared.mem.heap.class_id_of(*x);
             let x_name = shared
+                .classes
                 .class_manager
                 .read()
                 .get_class(x_cid)
                 .map(|c| c.name.clone());
             if x_name.as_deref() == Some("java/lang/String") {
-                let xs = read_java_string(&shared.heap, *x);
-                let ys = read_java_string(&shared.heap, *y);
+                let xs = read_java_string(&shared.mem.heap, *x);
+                let ys = read_java_string(&shared.mem.heap, *y);
                 return xs == ys;
             }
             // For other objects, reference equality
@@ -2656,14 +2807,15 @@ fn value_hash(shared: &SharedVm, v: &Value) -> i32 {
         }
         Value::Object(Some(obj)) => {
             // For strings, hash the content
-            let cid = shared.heap.class_id_of(*obj);
+            let cid = shared.mem.heap.class_id_of(*obj);
             let name = shared
+                .classes
                 .class_manager
                 .read()
                 .get_class(cid)
                 .map(|c| c.name.clone());
             if name.as_deref() == Some("java/lang/String") {
-                if let Some(s) = read_java_string(&shared.heap, *obj) {
+                if let Some(s) = read_java_string(&shared.mem.heap, *obj) {
                     return s
                         .bytes()
                         .fold(0i32, |h, b| h.wrapping_mul(31).wrapping_add(b as i32));
@@ -2696,7 +2848,7 @@ fn format_field_value(shared: &SharedVm, v: &Value, descriptor: &str) -> String 
         Value::Float(f) => format!("{f}"),
         Value::Double(d) => format!("{d}"),
         Value::Object(Some(obj)) => {
-            if let Some(s) = read_java_string(&shared.heap, *obj) {
+            if let Some(s) = read_java_string(&shared.mem.heap, *obj) {
                 s
             } else {
                 format!("object@{:x}", obj.as_ptr() as usize)
@@ -2723,7 +2875,7 @@ fn bootstrap_enum_switch(
 
     // Resolve bootstrap arguments — all are string constants (enum constant names).
     let labels = {
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let class = cm
             .get_class(current_class_id)
             .ok_or_else(|| VmError::Internal {
@@ -2743,6 +2895,7 @@ fn bootstrap_enum_switch(
         labels: labels.clone(),
     };
     shared
+        .classes
         .resolution_cache
         .write()
         .put_call_site(current_class_id, cp_index, site);
@@ -2772,8 +2925,8 @@ pub fn execute_enum_switch(
         Value::Object(None) => -1,
         Value::Object(Some(obj_ref)) => {
             // Read the enum constant name from field 0 (Enum.<init> stores name there).
-            let name = match shared.heap.get_field(obj_ref, 0) {
-                Value::Object(Some(name_ref)) => read_java_string(&shared.heap, name_ref),
+            let name = match shared.mem.heap.get_field(obj_ref, 0) {
+                Value::Object(Some(name_ref)) => read_java_string(&shared.mem.heap, name_ref),
                 _ => None,
             };
 
@@ -2798,6 +2951,208 @@ pub fn execute_enum_switch(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // Cached debug-flag helpers
+    // -----------------------------------------------------------------------
+    //
+    // These replaced uncached `std::env::var_os` reads that sat on the
+    // per-execution generic-indy path. The risk of the swap is a typo in the
+    // variable name (the flag would then silently never fire, and a future
+    // debugging session would waste hours on a dead switch), or an inverted
+    // sense. Both are caught by comparing against the live environment.
+
+    #[test]
+    fn cached_indy_debug_flags_match_environment_and_are_stable() {
+        let pairs: [(fn() -> bool, &str); 3] = [
+            (dbg_indy_all, "CRATONVM_DBG_INDY_ALL"),
+            (dbg_indy_generic, "CRATONVM_DBG_INDY_GENERIC"),
+            (dbg_lambda_dispatch, "CRATONVM_DBG_LAMBDA_DISPATCH"),
+        ];
+        for (flag, name) in pairs {
+            let expected = std::env::var_os(name).is_some();
+            assert_eq!(
+                flag(),
+                expected,
+                "cached flag disagrees with env for {name}"
+            );
+            // Process-lifetime memo: repeat reads must be stable (and must not
+            // re-enter `var_os`).
+            assert_eq!(flag(), expected, "cached flag for {name} is not stable");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Call-site cache: population, reuse, and redefinition invalidation
+    // -----------------------------------------------------------------------
+    //
+    // Task-3 coverage for "is the bootstrap result cached per call site and
+    // correctly invalidated?". The observable contract lives entirely in
+    // `ResolutionCache`, which `execute_invokedynamic` consults on its fast
+    // path and populates from every JDK-factory bootstrap branch.
+
+    use crate::classloading::resolution::ResolutionCache;
+
+    fn concat_site(recipe: &str, constants: &[&str], descriptor: &str) -> ResolvedCallSite {
+        ResolvedCallSite::StringConcat {
+            recipe: Arc::from(recipe),
+            constant_args: constants.iter().map(|s| Arc::from(*s)).collect(),
+            target_descriptor: Arc::from(descriptor),
+        }
+    }
+
+    fn lambda_site(iface: &str, impl_owner: &str, impl_name: &str) -> ResolvedCallSite {
+        ResolvedCallSite::Lambda(LambdaCallSite {
+            functional_interface: Arc::from(iface),
+            functional_interface_id: None,
+            sam_method_name: Arc::from("apply"),
+            sam_descriptor: Arc::from("(Ljava/lang/Object;)Ljava/lang/Object;"),
+            impl_handle: MethodHandle {
+                kind: MethodHandleKind::InvokeStatic,
+                class_name: Arc::from(impl_owner),
+                member_name: Arc::from(impl_name),
+                descriptor: Arc::from("(Ljava/lang/Object;)Ljava/lang/Object;"),
+            },
+            instantiated_descriptor: Arc::from("(Ljava/lang/Object;)Ljava/lang/Object;"),
+            capture_types: vec![],
+            proxy_class_id: ClassId::new(9001),
+        })
+    }
+
+    #[test]
+    fn bootstrapped_call_site_is_reused_not_rebootstrapped() {
+        let mut cache = ResolutionCache::new();
+        let caller = ClassId::new(7);
+        assert!(
+            cache.get_call_site(caller, 42).is_none(),
+            "cold call site must miss so the bootstrap slow path runs"
+        );
+        cache.put_call_site(caller, 42, concat_site("\u{0001} items", &[], "(I)V"));
+        // Second and every later execution take the fast path. Nothing here
+        // memoizes a *negative* result, so a miss is always retried — the
+        // "cached `None` is permanent" failure mode does not apply to this
+        // cache (`get_call_site` returns `Option<&_>` from a plain map lookup;
+        // only successful bootstraps ever insert).
+        assert!(cache.get_call_site(caller, 42).is_some());
+        assert!(cache.get_call_site(caller, 42).is_some());
+        assert_eq!(cache.call_site_count(), 1);
+    }
+
+    #[test]
+    fn lambda_call_site_is_dropped_when_its_caller_is_redefined() {
+        let mut cache = ResolutionCache::new();
+        let caller = ClassId::new(11);
+        let other = ClassId::new(12);
+        cache.put_call_site(
+            caller,
+            3,
+            lambda_site("java/util/function/Function", "P", "f"),
+        );
+        cache.put_call_site(
+            other,
+            3,
+            lambda_site("java/util/function/Function", "P", "g"),
+        );
+
+        // Redefining an unrelated class must not disturb this call site: the
+        // lambda keeps dispatching to the same spun proxy.
+        cache.invalidate_class(ClassId::new(99));
+        assert!(cache.get_call_site(caller, 3).is_some());
+
+        // Redefining the class that *contains* the invokedynamic drops it, so
+        // the next execution re-runs LambdaMetafactory against the new constant
+        // pool. Same cp index in a redefined pool may denote a different call
+        // site entirely, which is exactly why key-match eviction is required.
+        cache.invalidate_class(caller);
+        assert!(cache.get_call_site(caller, 3).is_none());
+        // ... and only that class's entries go.
+        assert!(cache.get_call_site(other, 3).is_some());
+    }
+
+    #[test]
+    fn lambda_impl_handle_is_symbolic_so_impl_redefinition_needs_no_eviction() {
+        // `invalidate_class` evicts call sites by *key* class only. That is
+        // sound precisely because `LambdaCallSite::impl_handle` stores the
+        // implementation method symbolically (owner / name / descriptor) and is
+        // re-resolved on each dispatch — redefining the class that owns the
+        // lambda body is therefore picked up without touching this cache. If
+        // anyone ever pre-resolves the handle to a concrete method pointer,
+        // this test fails and flags that eviction must grow a callee-side prong
+        // (as `fields` / `methods` already have).
+        let ResolvedCallSite::Lambda(lcs) = lambda_site("java/util/function/Function", "Impl", "f")
+        else {
+            panic!("expected a lambda call site");
+        };
+        assert_eq!(&*lcs.impl_handle.class_name, "Impl");
+        assert_eq!(&*lcs.impl_handle.member_name, "f");
+        assert_eq!(
+            &*lcs.impl_handle.descriptor,
+            "(Ljava/lang/Object;)Ljava/lang/Object;"
+        );
+    }
+
+    #[test]
+    fn cached_string_concat_site_exposes_borrowable_recipe_and_constants() {
+        // `execute_string_concat` now borrows `&str` / `&[S: AsRef<str>]`
+        // straight out of the cached site instead of rebuilding an `IndyInfo`
+        // with `recipe.to_string()`, `target_descriptor.to_string()` and a
+        // freshly allocated `Vec<String>` of every constant on *every* `"a" + b`
+        // evaluation. This test pins the borrow shape: destructuring the cached
+        // site must yield data usable without conversion, and `Arc<str>` must
+        // satisfy the `AsRef<str>` bound.
+        fn takes_borrowed<S: AsRef<str>>(
+            recipe: &str,
+            constants: &[S],
+            descriptor: &str,
+        ) -> String {
+            let mut out = String::from(recipe);
+            for c in constants {
+                out.push_str(c.as_ref());
+            }
+            out.push_str(descriptor);
+            out
+        }
+
+        let site = concat_site("a\u{0002}b", &["X", "Y"], "(I)Ljava/lang/String;");
+        let ResolvedCallSite::StringConcat {
+            recipe,
+            constant_args,
+            target_descriptor,
+        } = &site
+        else {
+            panic!("expected a StringConcat call site");
+        };
+        assert_eq!(
+            takes_borrowed(recipe, constant_args.as_slice(), target_descriptor),
+            "a\u{0002}bXY(I)Ljava/lang/String;"
+        );
+        // The bootstrap path passes `&[String]`; both must compile against the
+        // same bound.
+        let owned: Vec<String> = vec!["X".to_string(), "Y".to_string()];
+        assert_eq!(
+            takes_borrowed("a\u{0002}b", owned.as_slice(), "(I)Ljava/lang/String;"),
+            "a\u{0002}bXY(I)Ljava/lang/String;"
+        );
+    }
+
+    #[test]
+    fn synthesized_make_concat_recipe_is_all_argument_placeholders() {
+        // The `makeConcat` (no-recipe) branch synthesizes one `\u{0001}` per
+        // declared argument and passes an empty constant list. Regression guard
+        // for the `patched_info` removal: the synthesized recipe must still have
+        // exactly one placeholder per descriptor argument and contain no
+        // `\u{0002}` constant placeholders (there are no constants to consume).
+        for desc in [
+            "()Ljava/lang/String;",
+            "(I)Ljava/lang/String;",
+            "(ILjava/lang/String;J)Ljava/lang/String;",
+        ] {
+            let n = parse_descriptor_args(desc).len();
+            let recipe: String = std::iter::repeat('\u{0001}').take(n).collect();
+            assert_eq!(recipe.chars().filter(|c| *c == '\u{0001}').count(), n);
+            assert!(!recipe.contains('\u{0002}'));
+        }
+    }
 
     #[test]
     fn parse_descriptor_args_empty() {
@@ -3009,8 +3364,8 @@ mod tests {
 
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let class_id = ClassId::new(0);
-        let obj = shared.heap.alloc_object(class_id, 1);
-        shared.heap.set_field(obj, 0, value);
+        let obj = shared.mem.heap.alloc_object(class_id, 1);
+        shared.mem.heap.set_field(obj, 0, value);
         primitive_pattern_match(&shared, obj, source_class, target_class)
     }
 

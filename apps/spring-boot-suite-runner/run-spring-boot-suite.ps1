@@ -288,14 +288,23 @@ function New-PathingJar {
   $signature = 'pathing-jar-manifest-url-v1' + "`n" + (($Entries | ForEach-Object { [System.IO.Path]::GetFullPath($_) }) -join "`n")
   $hash = (Get-Sha256Hex $signature).Substring(0, 16)
   $stem = ConvertTo-SafeFileStem $(if ($Module) { $Module } else { 'universal' })
-  $jarPath = Join-Path $pathingDir "$stem-$hash.jar"
+  # Spring Boot's ModifiedClassPathClassLoader expands the manifest class
+  # path only for IntelliJ-style `classpath.jar` files.  The runner needs
+  # that expansion for @ClassPathExclusions/@ClassPathOverrides: otherwise
+  # it sees this one wrapper JAR instead of the individual dependency JARs.
+  # Keep module/content isolation in directories so the wrapper name itself
+  # can retain the recognized IntelliJ convention.
+  $jarDir = Join-Path (Join-Path $pathingDir $stem) $hash
+  $jarPath = Join-Path $jarDir 'classpath.jar'
   if (Test-Path $jarPath) { return [System.IO.Path]::GetFullPath($jarPath) }
+  New-Item -ItemType Directory -Force -Path $jarDir | Out-Null
 
   Add-Type -AssemblyName System.IO.Compression | Out-Null
   Add-Type -AssemblyName System.IO.Compression.FileSystem | Out-Null
   $urls = @($Entries | ForEach-Object { ConvertTo-ManifestClasspathUrl $_ })
   $lines = New-Object System.Collections.Generic.List[string]
   $lines.Add('Manifest-Version: 1.0')
+  $lines.Add('Created-By: IntelliJ IDEA')
   $lines.Add('Main-Class: SbRunner')
   foreach ($line in (Split-ManifestLine ('Class-Path: ' + ($urls -join ' ')))) { $lines.Add($line) }
   $lines.Add('')
@@ -359,10 +368,18 @@ function Invoke-Gradlew {
   # discovering 0 classes / regenerating no classpaths despite exit 0).
   $prevEAP = $ErrorActionPreference
   $ErrorActionPreference = 'Continue'
+  # gradlew.bat relies on the CALLER's current directory being the Gradle
+  # project root (it does not `cd` into its own location) -- invoking it via
+  # `& $Gradlew` from an arbitrary caller cwd (e.g. the CratonVM repo root)
+  # fails with "Directory '<cwd>' does not contain a Gradle build" even
+  # though $Gradlew's own path is fully qualified. Push into its directory
+  # for the duration of the call.
+  Push-Location (Split-Path $Gradlew -Parent)
   try {
     & $Gradlew @GradleArgs 2>&1 | ForEach-Object { Write-Host $_ }
     return $LASTEXITCODE
   } finally {
+    Pop-Location
     $ErrorActionPreference = $prevEAP
   }
 }
@@ -617,6 +634,48 @@ function Get-EffectiveClassTimeoutSec {
     # (`Test run finished after 470134 ms`, 76/78 passed). Keep headroom
     # above that observed time instead of reporting a false HANG.
     'module/spring-boot-amqp|org.springframework.boot.amqp.autoconfigure.RabbitAutoConfigurationTests' = 900
+    # CORE39-CLUSTERA.1 (2026-07-23): originally reported as a HANG at the
+    # standard 300s shard timeout. A 900s standalone repro (single OS thread,
+    # JIT on) proved this is not a deadlock -- it completes on its own in
+    # 386.8s, PASS. The class exercises many individual `@Test` methods (each
+    # a fresh YAML-loader parse), and JUnit5's own extension-registry /
+    # interceptor-chain machinery multiplies CratonVM's per-call dispatch cost
+    # across all of them (see reference_junit5_execution_machinery_dispatch_overhead
+    # in project memory) -- CPU-bound, not stuck. Keep headroom above the
+    # observed time (extra margin for contention when run alongside other
+    # slow classes in the same -Parallel batch) instead of reporting a false
+    # HANG.
+    'core/spring-boot|org.springframework.boot.env.OriginTrackedYamlLoaderTests' = 1100
+    # CORE39-CLUSTERA.2 (2026-07-24): ConfigurationPropertySourcesTests was
+    # reported as a HANG at 300s. Extensive diagnosis (CPU-sampling across
+    # multiple stack dumps at 60s/400s/1100s -- pegged near 100% CPU
+    # throughout, never parked/blocked; a hand-scaled-down repro of its own
+    # perf-test shape -- N property sources x M keys x K
+    # `environment.getProperty()` iterations -- measured CONSTANT
+    # per-iteration cost, ~47ms/iter at 5 sources x 1000 keys, no quadratic
+    # growth across 20-iteration buckets, confirmed linear not superlinear
+    # scaling) all point to a real but DIFFUSE interpreter/dispatch
+    # throughput gap, not a deadlock -- consistent with the already-tracked
+    # reference_hashmap_native_call_dispatch_overhead /
+    # reference_junit5_execution_machinery_dispatch_overhead family in
+    # project memory. The class deliberately exercises an "uncached"
+    # O(sources x keys) baseline against ~100 property sources x 1000 keys x
+    # 1000 iterations (explicit `cached < uncached/2` perf assertions) --
+    # genuinely CPU-heavy by design, not merely slow-to-start. A standalone
+    # rerun completed (PASS) in 2645.0s; keep headroom above that observed
+    # time instead of reporting a false HANG.
+    #
+    # NOTE: `ConfigurationPropertiesBeanRegistrationAotProcessorTests` (the
+    # other class originally reported alongside this one) is DELIBERATELY
+    # NOT in this table -- unlike this class, it never completed even at a
+    # 7200s (2-hour) ceiling with ZERO of its 9 `@Test` methods reporting a
+    # result, and a CPU-sampled stack repeatedly lands at the identical
+    # bytecode offset in Hibernate Validator's
+    # `BeanMetaDataImpl.getClassLevelConstraintsAsDescriptors` across samples
+    # taken minutes and hours apart -- a real, still-unfixed hang, not a
+    # throughput gap. Do not paper over it with a timeout; see
+    # docs/known-issues/springboot/configurationpropertiesbeanregistrationaotprocessortests-hang.md.
+    'core/spring-boot|org.springframework.boot.context.properties.source.ConfigurationPropertySourcesTests' = 5400
   }
   $key = "$($ClassRow.module)|$($ClassRow.class)"
   if ($slowClasses.ContainsKey($key)) {

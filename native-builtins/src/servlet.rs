@@ -2306,8 +2306,25 @@ pub(crate) fn s2_tls_close(id: i32) -> std::io::Result<()> {
 }
 
 /// NEW-13: snapshot the captured peer certificate chain (DER bytes) for a
-/// given TLS stream id. Returns an empty Vec if no cert was presented.
+/// given TLS stream id, or -- for ids >= `RUSTLS_SOCK_ID_BASE` -- the rustls
+/// client stream table. Returns an empty Vec if no cert was presented.
+///
+/// FIX (tomcatservletwebserverfactorytests-ssl-clientauth-peercert-residuals):
+/// this was missing the same `RUSTLS_SOCK_ID_BASE` redirect `s2_tls_read`/
+/// `s2_tls_write`/`s2_tls_close` (just above) already have. A client TLS
+/// socket backed by the rustls path (`t27_tls`, e.g. one that went through
+/// the deferred `SSLSocketFactory.createSocket(Socket,...)` handshake) stores
+/// its stream id offset by `RUSTLS_SOCK_ID_BASE` -- looking that id up in
+/// `s2_registry()` (the native-tls-only table) always misses, so
+/// `SSLSession.getPeerCertificates()`/`getPeerPrincipal()` (both call this)
+/// silently saw an empty chain and reported a "peer not authenticated" error
+/// even though rustls had genuinely captured the peer certificate, and
+/// `t27_tls::rustls_client_peer_cert_chain_der` already exposed it correctly
+/// for a different call site (`record_client_peer_chain`'s caller).
 pub(crate) fn s2_tls_peer_cert_chain_der(id: i32) -> Option<Vec<Vec<u8>>> {
+    if id >= RUSTLS_SOCK_ID_BASE {
+        return crate::t27_tls::rustls_client_peer_cert_chain_der(id - RUSTLS_SOCK_ID_BASE);
+    }
     let reg = s2_registry().lock();
     reg.tls_streams
         .get(&id)
@@ -6182,7 +6199,7 @@ fn register_s2_selector(r: &mut NativeMethodRegistry) {
     let sel = "java/nio/channels/Selector";
 
     r.register(sel, "open", "()Ljava/nio/channels/Selector;", |ctx, _| {
-        if std::env::var_os("CRATONVM_DBG_SEL").is_some() {
+        if crate::nbflags().dbg_sel {
             eprintln!("[SEL] Selector.open()");
         }
         let s = alloc_concurrent_synthetic(ctx, "java/nio/channels/Selector", 3);
@@ -6197,7 +6214,7 @@ fn register_s2_selector(r: &mut NativeMethodRegistry) {
     // "wait forever" sentinel.)
     r.register(sel, "select", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        if std::env::var_os("CRATONVM_DBG_SEL").is_some() {
+        if crate::nbflags().dbg_sel {
             let open = ctx.get_field(this, S2SEL_OPEN).as_int().unwrap_or(-1);
             let nkeys = ctx.get_field(this, S2SEL_NKEYS).as_int().unwrap_or(-1);
             eprintln!("[SEL] select() open={open} nkeys={nkeys}");
@@ -6266,7 +6283,7 @@ fn register_s2_selector(r: &mut NativeMethodRegistry) {
     r.register(sel, "isOpen", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let v = ctx.get_field(this, S2SEL_OPEN);
-        if std::env::var_os("CRATONVM_DBG_SEL").is_some() {
+        if crate::nbflags().dbg_sel {
             eprintln!("[SEL] isOpen() = {:?}", v);
         }
         Ok(Some(v))

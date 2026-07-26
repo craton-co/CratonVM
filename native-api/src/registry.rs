@@ -10,6 +10,12 @@
 // migrated to rustc_hash::FxHashMap (T10.9.B). Import removed.
 use std::sync::{Arc, OnceLock};
 
+// Call-site memoization handles. `NativeMethodId` indexes this file's
+// `NativeSlot` table; `NativeMethodKey` is the precomputable digest. Both live
+// in `native_id.rs` so the memo cell (`NativeCallSite`) and its documentation
+// sit together, away from this file's 3,000-line `NativeContext` trait.
+use crate::native_id::{NativeMethodId, NativeMethodKey};
+
 /// NIO-SERVER-SOCKET (route 1): cached check of the `CRATONVM_REAL_NET_SOCKETS`
 /// env var. When set, the native registry drops all synthetic
 /// `java/net/Socket` / `java/net/ServerSocket` registrations so real JDK
@@ -50,7 +56,7 @@ fn real_forkjoinpool_enabled() -> bool {
     *FLAG.get_or_init(|| std::env::var_os("CRATONVM_REAL_FORKJOINPOOL").is_some())
 }
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::ClassId;
@@ -221,22 +227,53 @@ pub struct LambdaSerialMetadata {
 /// native methods we register is negligibly small (and `register`
 /// still carries a `debug_assert!` collision check as a backstop).
 #[inline]
-fn native_method_hash(class: &str, method: &str, descriptor: &str) -> (u64, u64) {
-    // FNV prime for the first pass.
-    const FNV_PRIME: u64 = 0x100000001b3;
-    // A distinct odd multiplier for the second pass — different bit
-    // pattern *and* different magnitude, so the second hash is not a
-    // re-seeded copy of the first.
-    const ALT_PRIME: u64 = 0x880355f21e6d1965;
+pub(crate) fn native_method_hash(class: &str, method: &str, descriptor: &str) -> (u64, u64) {
+    native_method_hash_from(native_class_hash(class), method, descriptor)
+}
+
+/// FNV prime for the first pass of the native-method digest.
+const FNV_PRIME: u64 = 0x100000001b3;
+/// A distinct odd multiplier for the second pass — different bit pattern
+/// *and* different magnitude, so the second hash is not a re-seeded copy of
+/// the first.
+const ALT_PRIME: u64 = 0x880355f21e6d1965;
+
+/// The **unfinalized** accumulator pair after hashing only the class-name
+/// component of a native-method triple.
+///
+/// This is the prefix state [`native_method_hash`] would hold halfway through,
+/// exposed so a lookup can (a) test whether the class registers ANY native at
+/// all before paying for the rest of the digest, and (b) finish the digest
+/// from here without re-walking the class name. Deliberately NOT passed
+/// through [`fmix64`]: it is a resumable state, not a key.
+///
+/// PERF (H2 `TestFileSystem.testConcurrent`, 2026-07-26). `slot_for_exact` is
+/// on the interpreter's every-invoke path via `invoke_or_native`, and it was
+/// the single largest entry in a live 30s/999Hz profile of that test —
+/// **8.75%** of CPU across its two real threads, plus a large share of the
+/// `__memcmp_evex_movbe` time spent name-verifying the digest hit. The digest
+/// is a byte-at-a-time walk of all three strings (~60-100 bytes, two
+/// accumulators), and the overwhelming majority of the calls come from
+/// application classes — `org/h2/mvstore/...`, `org/h2/store/...` — that
+/// register no natives whatsoever, so all of that work produced a miss. The
+/// class name alone is ~25 of those bytes and answers "miss" for every one of
+/// them.
+#[inline]
+fn native_class_hash(class: &str) -> (u64, u64) {
     let mut h1 = 0xcbf29ce484222325;
     let mut h2 = 0x9e3779b97f4a7c15;
-
     hash_component_pair(&mut h1, &mut h2, class, FNV_PRIME, ALT_PRIME);
+    (h1, h2)
+}
+
+/// Finish a native-method digest from a [`native_class_hash`] prefix state.
+#[inline]
+fn native_method_hash_from(class_state: (u64, u64), method: &str, descriptor: &str) -> (u64, u64) {
+    let (mut h1, mut h2) = class_state;
     hash_byte_pair(&mut h1, &mut h2, b'.', FNV_PRIME, ALT_PRIME);
     hash_component_pair(&mut h1, &mut h2, method, FNV_PRIME, ALT_PRIME);
     hash_byte_pair(&mut h1, &mut h2, b'.', FNV_PRIME, ALT_PRIME);
     hash_component_pair(&mut h1, &mut h2, descriptor, FNV_PRIME, ALT_PRIME);
-
     (fmix64(h1), fmix64(h2))
 }
 
@@ -322,6 +359,87 @@ pub enum GpuFutureResult {
     ScalarF32(f32),
     /// Scalar-return accumulator readback (`)D` descriptor).
     ScalarF64(f64),
+}
+
+/// Opaque reference to a GC-updated slot owned by a [`NativeHandleScope`].
+///
+/// The fallback is intentionally private. Lightweight mock contexts do not
+/// implement a moving heap and therefore use it when their default
+/// [`NativeContext::handle_get`] returns `None`; production VM contexts always
+/// read the current address through `slot`. Native implementations cannot
+/// extract either value, so they cannot accidentally keep using a pre-GC raw
+/// reference or reinterpret a slot index as a heap address.
+#[derive(Debug)]
+pub struct NativeHandle {
+    slot: u32,
+    fallback: ObjectRef,
+}
+
+/// Early-return- and panic-safe native root scope.
+///
+/// Construct this before retaining any object across an allocating or
+/// re-entrant VM call. Every object rooted through [`Self::root`] remains in
+/// the executing thread's collector-visible handle table until this guard is
+/// dropped. [`Drop`] closes the scope on every Rust exit path, eliminating the
+/// manually paired `handle_scope_push`/`handle_scope_pop` discipline.
+///
+/// `DerefMut<Target = dyn NativeContext>` lets existing native code call VM
+/// capabilities through the scope while the roots are active:
+///
+/// ```ignore
+/// let mut scope = NativeHandleScope::new(ctx);
+/// let receiver = scope.root(receiver);
+/// let array = scope.new_array(ArrayElementType::Char, len); // may collect
+/// let receiver = scope.get(&receiver); // always the current address
+/// scope.set_field(receiver, 0, Value::Object(Some(array)));
+/// // scope closes automatically, including on `?` or `return`.
+/// ```
+pub struct NativeHandleScope<'a> {
+    context: &'a mut dyn NativeContext,
+}
+
+impl<'a> NativeHandleScope<'a> {
+    /// Open a nested scope on `context`.
+    pub fn new(context: &'a mut dyn NativeContext) -> Self {
+        context.handle_scope_push();
+        Self { context }
+    }
+
+    /// Root `object` and return an opaque handle that can only be resolved
+    /// through this scope.
+    pub fn root(&mut self, object: ObjectRef) -> NativeHandle {
+        NativeHandle {
+            slot: self.context.handle_root(object),
+            fallback: object,
+        }
+    }
+
+    /// Resolve `handle` to its current post-GC address.
+    pub fn get(&self, handle: &NativeHandle) -> ObjectRef {
+        self.context
+            .handle_get(handle.slot)
+            .unwrap_or(handle.fallback)
+    }
+}
+
+impl<'a> std::ops::Deref for NativeHandleScope<'a> {
+    type Target = dyn NativeContext + 'a;
+
+    fn deref(&self) -> &Self::Target {
+        self.context
+    }
+}
+
+impl<'a> std::ops::DerefMut for NativeHandleScope<'a> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.context
+    }
+}
+
+impl Drop for NativeHandleScope<'_> {
+    fn drop(&mut self) {
+        self.context.handle_scope_pop();
+    }
 }
 
 /// Trait providing VM capabilities needed by native method implementations.
@@ -596,7 +714,7 @@ pub trait NativeContext {
     /// ```
     ///
     /// the lambda is materialised as a proxy object whose class is
-    /// recorded in `shared.lambda_proxies`. This method looks the
+    /// recorded in `shared.classes.lambda_proxies`. This method looks the
     /// proxy up and returns
     /// `Some((target_class, target_method, target_descriptor,
     ///        captured_values))` so the dispatcher can route through
@@ -712,6 +830,77 @@ pub trait NativeContext {
     /// Release all native pin roots from `base` (a handle returned by
     /// [`pin_native_root`]) onward. Default impl is a no-op.
     fn unpin_native_roots(&mut self, _base: usize) {}
+
+    // ---- rooted handle scope (arch/handles) ----
+    //
+    // `pin_native_root`/`read_native_pin`/`unpin_native_roots` above fix
+    // staleness but not the discipline: a native method still holds the
+    // SAME `ObjectRef` type before and after pinning, so reading the
+    // pre-pin local by mistake type-checks fine and silently reintroduces
+    // the bug. The handle-scope quartet below is `cratonvm_types::handle`'s
+    // rooted-handle design (`RootedHandle`/`HandleStorage`) adapted to this
+    // trait-object boundary: a handle is an opaque `u32` slot, not an
+    // `ObjectRef`, so there is no raw pointer left to accidentally read.
+    //
+    // **Discipline — READ BEFORE holding any `ObjectRef` across a call that
+    // can allocate:** any native code that holds a reference across
+    // `invoke`/`new_object_initialized`/`new_array`/anything that can run
+    // Java (and therefore can trigger a GC) MUST root it with
+    // [`handle_root`] first and read it back with [`handle_get`] afterward
+    // — never keep using the pre-call local. The usual shape:
+    //
+    // ```ignore
+    // let mut scope = NativeHandleScope::new(ctx);
+    // let this_h = scope.root(this);
+    // let arr = scope.new_array(ArrayElementType::Char, len); // may GC-move `this`
+    // let this = scope.get(&this_h);                          // current address
+    // ```
+    //
+    // `NativeHandleScope` closes itself on normal, early-return, and unwind
+    // paths. Scopes nest and each guard releases only its own handles. See
+    // `docs/feature-designs/native-handle-discipline.md` for the full
+    // design and `native_builtins::lang_string` for worked examples
+    // (`native_string_init_abstract_string_builder`,
+    // `native_sb_init_default`, `native_sb_init_string`,
+    // `native_sb_init_charsequence`, `native_sb_init_capacity`).
+    //
+    // Default impls below mirror the no-op/pass-through convention already
+    // used by `pin_native_root` & co. for mock/test contexts with no moving
+    // GC: pushing/popping a scope is a no-op, and `handle_root` delegates to
+    // the already-default-implemented `pin_native_root` (truncated to
+    // `u32`) as the closest existing stand-in. `handle_get`'s default
+    // returns `None` rather than trying to read back through that
+    // delegation — `pin_native_root`'s own default doesn't retain anything
+    // to read, so there is nothing genuine to hand back. The VM's
+    // `NativeContextImpl` overrides all four with a real per-thread slot
+    // table (`vm/src/vm/vm_exec.rs`, "handle scope support").
+
+    /// Push a new handle scope. Every [`handle_root`] call until the
+    /// matching [`handle_scope_pop`] is released together when that pop
+    /// runs. Default impl is a no-op.
+    fn handle_scope_push(&mut self) {}
+
+    /// Pop the current handle scope, releasing every handle rooted since the
+    /// matching [`handle_scope_push`]. Default impl is a no-op.
+    fn handle_scope_pop(&mut self) {}
+
+    /// Root `r` in the current handle scope and return its slot id. Reading
+    /// through the slot (via [`handle_get`]) always returns `r`'s current,
+    /// possibly-GC-forwarded address — a handle can never go stale while its
+    /// scope is open, unlike a raw `ObjectRef` copy.
+    ///
+    /// Default impl delegates to [`pin_native_root`] (see the block doc
+    /// above for why); real GC-safety comes from the VM's override.
+    fn handle_root(&mut self, r: ObjectRef) -> u32 {
+        self.pin_native_root(r) as u32
+    }
+
+    /// Read back the current reference for `slot` (from [`handle_root`]), or
+    /// `None` if `slot` is out of range or its scope already popped. Default
+    /// impl returns `None`.
+    fn handle_get(&self, _slot: u32) -> Option<ObjectRef> {
+        None
+    }
 
     /// Create a *persistent* global GC root for `obj`, returning an opaque handle.
     ///
@@ -1325,7 +1514,11 @@ pub trait NativeContext {
     /// Probe a per-thread cache for an ASCII case-conversion result. The
     /// cache alternates two immutable values so consecutive calls stay
     /// observably distinct.
-    fn get_ascii_case_string_cached(&mut self, _source: ObjectRef, _upper: bool) -> Option<ObjectRef> {
+    fn get_ascii_case_string_cached(
+        &mut self,
+        _source: ObjectRef,
+        _upper: bool,
+    ) -> Option<ObjectRef> {
         None
     }
 
@@ -1571,6 +1764,44 @@ pub trait NativeContext {
     /// `Field`/`Method`/`Constructor`'s own declaring class.
     fn class_id_by_name_near(&self, name: &str, _near: ClassId) -> Option<ClassId> {
         self.class_id_by_name(name)
+    }
+
+    /// Resolve `name` to a `ClassId`, LOADING it through
+    /// `referencing_class_id`'s own defining classloader if it isn't loaded
+    /// yet -- exactly as a bytecode instruction (`new`/`checkcast`/
+    /// `invokestatic`/...) referencing `name` FROM `referencing_class_id`
+    /// would (JVMS SS5.4.3 initiating-loader semantics).
+    ///
+    /// Unlike [`Self::class_id_by_name_near`]/[`Self::class_id_by_name`] --
+    /// pure lookups that only succeed once `name` has already been
+    /// resolved/indexed under that loader -- this drives the loader's own
+    /// `loadClass`/`defineClass` on a miss, so it also answers correctly the
+    /// very first time a class is needed under a given loader (the gap that
+    /// made two prior lookup-based fix attempts for the H2 `Parser`
+    /// loader-collapse bug regress on a fresh session -- see
+    /// docs/known-issues/h2/bug-h2-suite-residual-fail-triage.md's
+    /// eighth-pass section).
+    ///
+    /// Native overrides that construct or invoke-special a DIFFERENT class
+    /// than their own receiver's declaring class (an app/H2 native bridging
+    /// into the receiver's own package -- e.g. `SessionLocal.prepareLocal`'s
+    /// `new Parser(this)`) MUST use this instead of
+    /// `new_object_initialized`/`invoke_special` with a bare name: those
+    /// collapse to whichever loader defined `name` FIRST process-wide,
+    /// silently constructing/invoking the WRONG loader's copy of the class
+    /// whenever the receiver's own defining loader is a user-defined one
+    /// distinct from the first-loaded (usually Application) copy.
+    ///
+    /// The default implementation ignores `referencing_class_id` and falls
+    /// back to the name-only [`Self::ensure_class_initialized`] -- sufficient
+    /// for test mocks and any context with a single (global) loader
+    /// namespace; the real VM implementation honours per-loader identity.
+    fn class_id_by_name_via_referencing_class(
+        &mut self,
+        _referencing_class_id: ClassId,
+        name: &str,
+    ) -> Result<ClassId, cratonvm_types::error::MethodCallFailed> {
+        self.ensure_class_initialized(name)
     }
 
     /// For a synthetic lambda-proxy `ClassId` (created by `register_lambda_proxy`,
@@ -1971,6 +2202,26 @@ pub trait NativeContext {
     /// Must be paired with `vt_release_carrier`. No-op for platform threads.
     fn vt_acquire_carrier(&mut self) {}
 
+    /// Request a continuation-backed timed park. Returns `true` only for an
+    /// unpinned virtual thread whose interpreter frames can be frozen by the
+    /// VM. The native must then return `ContinuationYield` without blocking.
+    fn vt_park_for(&mut self, _duration: std::time::Duration) -> bool {
+        false
+    }
+
+    /// Register the current unpinned virtual thread as an asynchronous waiter
+    /// on a VM-local stable key. The native must recheck its condition after
+    /// registration and return `ContinuationYield` only while it remains false.
+    fn vt_wait_on_key(&mut self, _key: u64) -> bool {
+        false
+    }
+
+    /// Cancel a waiter registration made by [`Self::vt_wait_on_key`].
+    fn vt_cancel_wait_on_key(&mut self, _key: u64) {}
+
+    /// Wake and resubmit all virtual threads waiting on a stable key.
+    fn vt_wake_waiters(&mut self, _key: u64) {}
+
     /// Emit a `jdk.VirtualThreadPinned` JFR event for the current thread.
     /// Called when a pinned virtual thread is about to block its carrier.
     ///
@@ -2008,11 +2259,24 @@ pub trait NativeContext {
         256 * 1024 * 1024
     }
 
+    /// Initial heap size in bytes, as reported by the JMX `MemoryMXBean`'s
+    /// heap `MemoryUsage.getInit()`. The default (mock/test contexts) mirrors
+    /// `max_heap_bytes`'s historical placeholder; the VM overrides it to
+    /// return the configured `-Xms` (`VmConfig::initial_heap_size`).
+    fn initial_heap_bytes(&self) -> i64 {
+        16 * 1024 * 1024
+    }
+
     /// Returns the total number of bytes allocated on the heap.
     fn heap_allocated_bytes(&self) -> usize;
 
     /// Returns the number of classes currently loaded in the VM.
     fn loaded_class_count(&self) -> usize;
+
+    /// Cumulative classes reclaimed by class-loader unloading.
+    fn unloaded_class_count(&self) -> u64 {
+        0
+    }
 
     /// Returns the cumulative number of GC collections that have occurred.
     fn gc_collection_count(&self) -> u64;
@@ -2035,6 +2299,22 @@ pub trait NativeContext {
     /// The default impl is a no-op so out-of-tree `NativeContext`
     /// implementors (tests) need not change.
     fn begin_blocking_region(&mut self) {}
+
+    /// Same GC-safety contract as `begin_blocking_region`, for a region with
+    /// a bounded/known wait duration (`Thread.sleep`, a timed `Object.wait`,
+    /// `LockSupport.parkNanos`, …). `Thread.getState()` reports
+    /// `TIMED_WAITING` for a thread inside one of these vs. plain `WAITING`
+    /// for an unbounded `begin_blocking_region` — real JDK's
+    /// `Thread.State` makes exactly this distinction, and callers such as
+    /// Spring Boot's `SpringApplicationShutdownHookTests` assert on it via
+    /// `Awaitility.await().until(thread::getState, State.TIMED_WAITING::equals)`.
+    ///
+    /// The default impl just delegates to `begin_blocking_region` (reported
+    /// as plain `WAITING`) so out-of-tree `NativeContext` implementors need
+    /// not change; must still be paired with exactly one `end_blocking_region`.
+    fn begin_timed_blocking_region(&mut self) {
+        self.begin_blocking_region();
+    }
 
     /// T19.H1 — end a blocking region opened by `begin_blocking_region`.
     /// Re-syncs the thread with any GC that ran while it was blocked.
@@ -3408,6 +3688,30 @@ pub struct StackTraceEntry {
     /// self-frame and NPEs when `getDeclaringClass()` falls back to null.
     /// `None` only for synthetic entries with no backing interpreter frame.
     pub class_id: Option<ClassId>,
+    /// Index of this frame's method within its declaring class's
+    /// `Class::methods` list, when the capture path had a `ClassStore` borrow
+    /// and resolved it. `None` for synthetic entries and for the deliberately
+    /// lock-free cross-thread snapshot (`stackwalker::capture_frames_no_lines`,
+    /// which takes no `ClassStore` by design).
+    ///
+    /// ARCH-2026-07-26 (`cross-owner-closeout`, request CR-SW-1 of
+    /// `docs/internal/arch-2026-07-26/stackwalk-and-vtable.md`). This exists so
+    /// that *deferred* line-number resolution can be **exact**. `class_name` +
+    /// `method_name` + `byte_code_index` are not enough: a class may declare an
+    /// overload set under one name, the members have different
+    /// `LineNumberTable`s, and picking the wrong one prints a line from the
+    /// wrong method body. Carrying the index (rather than the descriptor) keeps
+    /// the entry `Arc`-free and makes both ends O(1).
+    ///
+    /// It is an *index*, never a borrow, and it is **never trusted on its own**:
+    /// `stackwalker::resolve_line_numbers_in_place` re-reads
+    /// `class.methods[idx]` from the live `ClassStore` and re-checks that its
+    /// name equals `method_name` before using it, so a class redefinition that
+    /// reorders or removes methods fails closed to "unknown line" rather than
+    /// resolving against the wrong body. `ClassId`s are monotonic and never
+    /// reused (`ClassStore::remove` leaves a tombstone), so a stale entry can
+    /// only ever miss, never alias a different class.
+    pub method_index: Option<u32>,
 }
 
 /// Callback signature for native method implementations.
@@ -3516,26 +3820,101 @@ impl NativeKind {
 /// 128-bit keyspace the birthday-collision probability for the ~3,000
 /// registrations we do at boot is on the order of 1e-32, so no runtime
 /// collision check is needed on the hot path.
+/// Width of the [`NativeMethodRegistry::generation`] band reserved for one
+/// registry. Far larger than the ~3,100 natives registered at boot, so
+/// `registry_epoch + slots.len()` never leaves its own band; ~4,096 registries
+/// can be constructed in a process before the `u32` counter wraps and bands
+/// could alias (a test binary building thousands of VMs would, at worst, see a
+/// stale memo re-validated against the wrong registry — hence the additional
+/// full-name verification on every resolve).
+const REGISTRY_EPOCH_STRIDE: u32 = 1 << 20;
+
+/// Hands each `NativeMethodRegistry` its own generation band. Starts at one
+/// stride so generation `0` is never a live value and stays usable as the
+/// "never resolved" sentinel in `NativeCallSite`.
+static NEXT_REGISTRY_EPOCH: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(REGISTRY_EPOCH_STRIDE);
+
+/// One entry of the registry's dense slot table — the single place a resolved
+/// native lives.
+///
+/// A [`NativeMethodId`](crate::NativeMethodId) is an index into
+/// `NativeMethodRegistry::slots`. Redeeming a handle is therefore a
+/// bounds-checked array load, with none of the three string hashes `find`
+/// pays. `reg_index` points back at the `registrations` entry that owns this
+/// slot; it is what makes the **full-name verification** on every digest hit
+/// possible (see `slot_index_for_key`), which is the property the deleted
+/// `class_manager::name_to_id` map lacked.
+#[derive(Copy, Clone)]
+struct NativeSlot {
+    callback: NativeCallback,
+    kind: NativeKind,
+    /// Index into `registrations` of the triple that currently owns this slot.
+    /// Re-registration of the same triple rewrites this in place, so the slot
+    /// index (and thus any handle already handed out) stays valid.
+    reg_index: u32,
+}
+
 pub struct NativeMethodRegistry {
-    methods: FxHashMap<(u64, u64), NativeCallback>,
-    /// Registration log used only by `alias_class` (a rare, slow-path
-    /// operation called a handful of times at boot to copy interface-
-    /// method registrations down to subinterface class names). We keep
-    /// the original triples here as `Box<str>` rather than `String` to
-    /// minimize per-entry overhead. This replaces the previous
-    /// `FxHashMap<u64, String>` reverse map which was inserted into on
-    /// every `register()` purely to enable collision detection.
+    /// Dense slot table. `slots[i]` is the resolved native for
+    /// `NativeMethodId(i)`. Append-only: entries are updated in place on
+    /// re-registration and never removed, which is what makes handles stable.
+    slots: Vec<NativeSlot>,
+    /// 128-bit `(class, method, descriptor)` digest -> slot index. A hit here
+    /// is a *candidate*, not an answer: `slot_index_for_key` re-checks the full
+    /// triple before returning the slot.
+    slot_by_key: FxHashMap<(u64, u64), u32>,
+    /// [`native_class_hash`] of every class name that has ever been passed to
+    /// [`register`](Self::register) — the negative-lookup prefilter for
+    /// [`slot_for_exact`](Self::slot_for_exact). See `native_class_hash` for
+    /// why this exists and what it is worth.
+    ///
+    /// Soundness is one-directional and cheap to keep: a class absent from
+    /// this set provably has no registration (the single production writer is
+    /// `register`, which inserts here in the same statement sequence that
+    /// pushes to `registrations`), so answering `None` for it is exact. A hash
+    /// collision can only add a FALSE POSITIVE, which falls through to the
+    /// full digest + name verification below and is therefore harmless.
+    /// Registrations are never removed, so the set never needs to shrink.
+    classes_with_natives: FxHashSet<(u64, u64)>,
+    /// Process-unique base for [`generation`](Self::generation).
+    ///
+    /// Without this, `generation()` would just be `slots.len()`, and two
+    /// *different* registries with the same number of registrations would
+    /// report the same generation — so a `NativeCallSite` that outlives one
+    /// registry (a `static` cell in a test binary that builds several `SharedVm`s,
+    /// say) could accept a memo taken against a different registry and redeem a
+    /// slot index that means something else. Banding each registry into its own
+    /// `REGISTRY_EPOCH_STRIDE`-wide range makes that a re-resolve instead of a
+    /// wrong answer.
+    registry_epoch: u32,
+    /// Append-only registration log: the original `(class, method, descriptor)`
+    /// triples, kept as `Box<str>` rather than `String` to minimize per-entry
+    /// overhead. This replaces the previous `FxHashMap<u64, String>` reverse map
+    /// which was inserted into on every `register()` purely to enable collision
+    /// detection.
+    ///
+    /// Two consumers:
+    ///
+    ///  1. `alias_class` (a rare, slow-path operation called a handful of times
+    ///     at boot to copy interface-method registrations down to subinterface
+    ///     class names).
+    ///  2. **Full-name verification on every digest hit.** Each `NativeSlot`
+    ///     carries the `reg_index` of the triple it was registered under, and
+    ///     `slot_index_for_key` compares all three strings before returning the slot.
+    ///     Without this, an FNV-1a collision would silently hand back the wrong
+    ///     callback — the exact defect the `class_manager::name_to_id` shadow map
+    ///     had (see `classloading/src/class_manager.rs`, `loaded_classes` field
+    ///     doc, "Round 4 audit fix (CRIT)") before it was deleted.
+    ///
+    /// Index-parallel with `categories`. Only *accepted* registrations are
+    /// pushed — every drop arm in `register()` returns before this point.
     registrations: Vec<(Box<str>, Box<str>, Box<str>)>,
     /// AUDIT 2026-05-17 (Fix 5): O(1) index keyed by the 128-bit hash
     /// of `(method_name, descriptor)` (class portion omitted). Used by
     /// `find_by_method_descriptor` to avoid the O(N) linear scan over
     /// `registrations`. Built incrementally on every `register()`.
     by_method_desc: FxHashMap<(u64, u64), NativeCallback>,
-    /// Category tag for each registration, keyed by the same 128-bit
-    /// `(class, method, descriptor)` hash as `methods`. Lets the dispatcher
-    /// and audit tooling ask `kind_of(...)` in O(1). Populated on every
-    /// `register()` from `current_category`.
-    category_by_key: FxHashMap<(u64, u64), NativeKind>,
     /// Category aligned with `registrations` (index-parallel), for
     /// `dump_registrations` / census output.
     categories: Vec<NativeKind>,
@@ -3622,16 +4001,21 @@ impl NativeMethodRegistry {
         // up front so `register()` does not repeatedly rehash/grow.
         const BOOT_REGISTRATION_HINT: usize = 4096;
         Self {
-            methods: FxHashMap::with_capacity_and_hasher(
+            slots: Vec::with_capacity(BOOT_REGISTRATION_HINT),
+            slot_by_key: FxHashMap::with_capacity_and_hasher(
                 BOOT_REGISTRATION_HINT,
                 Default::default(),
+            ),
+            classes_with_natives: FxHashSet::with_capacity_and_hasher(
+                BOOT_REGISTRATION_HINT,
+                Default::default(),
+            ),
+            registry_epoch: NEXT_REGISTRY_EPOCH.fetch_add(
+                REGISTRY_EPOCH_STRIDE,
+                std::sync::atomic::Ordering::Relaxed,
             ),
             registrations: Vec::with_capacity(BOOT_REGISTRATION_HINT),
             by_method_desc: FxHashMap::with_capacity_and_hasher(
-                BOOT_REGISTRATION_HINT,
-                Default::default(),
-            ),
-            category_by_key: FxHashMap::with_capacity_and_hasher(
                 BOOT_REGISTRATION_HINT,
                 Default::default(),
             ),
@@ -3705,8 +4089,8 @@ impl NativeMethodRegistry {
         method_name: &str,
         descriptor: &str,
     ) -> Option<NativeKind> {
-        let key = native_method_hash(class_name, method_name, descriptor);
-        self.category_by_key.get(&key).copied()
+        self.slot_for_exact(class_name, method_name, descriptor)
+            .map(|slot| slot.kind)
     }
 
     /// Snapshot of every registration as `(class, method, descriptor, kind)`,
@@ -3921,7 +4305,7 @@ impl NativeMethodRegistry {
         // PipedInputStream itself -- which declares neither -- producing a
         // NoSuchMethodError naming PipedInputStream for a completely
         // unrelated method. See
-        // docs/known-issues/h2-suite-bugs/bug-h2-nosuchmethoderror-cross-class-dispatch.md
+        // docs/known-issues/h2/bug-h2-nosuchmethoderror-cross-class-dispatch.md
         // (H2's TestLob/TestLobApi/TestSQLXML/TestUpdatableResultSet/
         // TestResultSet, which all use real connected Piped stream pairs).
         // Real JDK PipedInputStream/PipedOutputStream bytecode is
@@ -4180,24 +4564,29 @@ impl NativeMethodRegistry {
         // entry, the most common cause is legitimate re-registration of
         // the same triple (e.g. by `alias_class` running twice). A true
         // hash collision would only be flagged if it produced a
-        // pre-existing key for a triple we have NOT seen before — but
-        // distinguishing those two cases requires walking
-        // `registrations`, which is O(N). We skip that check here:
-        // unconditional registration is the documented behavior, and
-        // the 128-bit keyspace makes false hits practically impossible.
-        let prior = self.methods.insert(key, callback);
+        // pre-existing key for a triple we have NOT seen before.
+        //
         // Duplicate-registration / collision detection MUST use a stable
         // key — the `(class, name, descriptor)` triple — not `fn` pointer
         // equality. Rust `fn` pointer comparison is unreliable: the
         // compiler may merge identical functions or duplicate them across
-        // codegen units, so `prior == Some(callback)` produces no
+        // codegen units, so comparing the prior callback produces no
         // meaningful result (and triggers the
-        // `unpredictable_function_pointer_comparisons` lint). If `prior`
-        // is `Some`, this key was already occupied: it is a legitimate
-        // re-registration iff the very same triple appears in
-        // `registrations`; otherwise it is a true 128-bit hash collision.
+        // `unpredictable_function_pointer_comparisons` lint). If the key is
+        // already occupied it is a legitimate re-registration iff the very
+        // same triple appears in `registrations`; otherwise it is a true
+        // 128-bit hash collision.
+        //
+        // NOTE (memoization work, 2026-07-26): this remains a `debug_assert`
+        // — the *registration-time* check — but it is no longer the only line
+        // of defense. `slot_index_for_key` now re-verifies the full triple on every
+        // lookup, so in a release build a true collision degrades to "the
+        // loser's triple resolves to `None`" rather than "the loser's triple
+        // silently dispatches the winner's callback". See the `registrations`
+        // field doc for the `class_manager::name_to_id` precedent.
+        let prior_slot = self.slot_by_key.get(&key).copied();
         debug_assert!(
-            prior.is_none() || self.registrations.iter().any(
+            prior_slot.is_none() || self.registrations.iter().any(
                 |(c, m, d)| c.as_ref() == class_name
                     && m.as_ref() == method_name
                     && d.as_ref() == descriptor
@@ -4206,15 +4595,45 @@ impl NativeMethodRegistry {
         );
         // Index of this registration's triple in `registrations`, used below
         // to back the deferred native-ring name map without a second copy of
-        // the parts (see the `name_index` field doc).
+        // the parts (see the `name_index` field doc), and by every slot to
+        // name-verify a digest hit.
         let reg_index = self.registrations.len();
         self.registrations
             .push((class_name.into(), method_name.into(), descriptor.into()));
+        // Arm the negative-lookup prefilter. Kept adjacent to the
+        // `registrations` push — the one statement pair that must never drift
+        // apart, because a class in `registrations` but absent here would make
+        // `slot_for_exact` answer `None` for a native that IS registered.
+        self.classes_with_natives.insert(native_class_hash(class_name));
         // Tag this registration with the current category (see `with_category`).
-        // `insert` (not `or_insert`) so a deliberate re-registration under a new
-        // category — e.g. promoting a fixed stub to `Intrinsic` — takes effect.
-        self.category_by_key.insert(key, self.current_category);
+        // Re-registration under a new category — e.g. promoting a fixed stub to
+        // `Intrinsic` — takes effect, matching the previous `insert`-not-
+        // -`or_insert` semantics of the removed `category_by_key` map.
         self.categories.push(self.current_category);
+        // Publish into the dense slot table. Re-registration of a key we have
+        // already seen UPDATES THE EXISTING SLOT IN PLACE rather than appending
+        // a new one: that is what makes a `NativeMethodId` handed out earlier
+        // stay valid (and pick up the new callback, matching the documented
+        // last-registration-wins behavior of `register`).
+        let category = self.current_category;
+        match prior_slot {
+            Some(idx) => {
+                if let Some(slot) = self.slots.get_mut(idx as usize) {
+                    slot.callback = callback;
+                    slot.kind = category;
+                    slot.reg_index = reg_index as u32;
+                }
+            }
+            None => {
+                let idx = self.slots.len() as u32;
+                self.slots.push(NativeSlot {
+                    callback,
+                    kind: category,
+                    reg_index: reg_index as u32,
+                });
+                self.slot_by_key.insert(key, idx);
+            }
+        }
         // AUDIT 2026-05-17 (Fix 5): also populate the class-agnostic
         // (method, descriptor) index used by `find_by_method_descriptor`.
         // Reuse `native_method_hash` with an empty class string so the
@@ -4295,6 +4714,229 @@ impl NativeMethodRegistry {
         }
     }
 
+    /// Combined `find` + `kind_of`: computes the 128-bit
+    /// `(class, method, descriptor)` hash once and looks up both the
+    /// callback and its category from it, instead of the two independent
+    /// hashes (one full byte-walk each) `invoke_or_native`'s
+    /// synthetic-stub check used to pay on every native dispatch --
+    /// `find(...)` to get the callback, then immediately `kind_of(...)`
+    /// with the identical three strings to classify it. A gdb sampling
+    /// profile of a hung-looking H2 `TestFileSystem.testConcurrent` run
+    /// (two real threads, heavy native-call volume) caught both live
+    /// threads inside `hash_byte_pair`/`native_method_hash` disproportionately
+    /// often, which is this exact redundant second pass. Only covers the
+    /// fast exact-hash path (mirroring `find`'s own fast path); falls back
+    /// to the slow `find`+`kind_of` pair on a miss so descriptor-quirk
+    /// rewriting keeps working unchanged.
+    #[inline]
+    pub fn find_with_kind(
+        &self,
+        class_name: &str,
+        method_name: &str,
+        descriptor: &str,
+    ) -> Option<(NativeCallback, NativeKind)> {
+        if let Some(slot) = self.slot_for_exact(class_name, method_name, descriptor) {
+            return Some((slot.callback, slot.kind));
+        }
+        // Cold descriptor-quirk path. Semantics deliberately preserved from the
+        // pre-memoization implementation: the kind is looked up with the
+        // ORIGINAL (un-rewritten) descriptor, so it misses and falls back to
+        // `Bridge`. The slot now carries its true kind and we could report it
+        // exactly, but that would change which natives the real-JDK
+        // `SyntheticStub` drop applies to on quirky descriptors — a dispatch
+        // semantics change, out of scope for a perf change. Left as-is,
+        // deliberately.
+        //
+        // MERGE NOTE (dev @ 6495a191c): dev's concurrent edit here was a pure
+        // rustfmt reflow of the `methods` / `category_by_key` probe that this
+        // change deletes outright. Its formatting of the `kind_of` chain is
+        // carried over; the two-map probe itself is gone.
+        let cb = self.find_with_descriptor_quirks(class_name, method_name, descriptor)?;
+        let kind = self
+            .kind_of(class_name, method_name, descriptor)
+            .unwrap_or(NativeKind::Bridge);
+        Some((cb, kind))
+    }
+
+    /// Number of distinct native slots ever allocated. Changes **only** when a
+    /// registration introduces a triple the registry has not seen before;
+    /// re-registering an existing triple updates its slot in place and leaves
+    /// this unchanged.
+    ///
+    /// This is the invalidation signal for [`NativeCallSite`](crate::NativeCallSite):
+    /// a memo — including a memoized *negative* ("no native for this triple") —
+    /// is valid exactly as long as the generation it was taken at still holds.
+    /// It costs one `u32` load to check, and it is what makes call-site
+    /// memoization correct during boot and across the lazy `register_*` passes,
+    /// not merely "after the registry stops changing".
+    ///
+    /// The value is `registry_epoch + slots.len()`, not `slots.len()` alone, so
+    /// it also distinguishes *which* registry a memo was taken against — see the
+    /// [`registry_epoch`](Self) field doc. Never `0`, so a `NativeCallSite` can
+    /// keep using an all-zero word as its "never resolved" sentinel.
+    ///
+    /// The absolute value is an opaque token: compare it for equality, never
+    /// treat it as a count.
+    #[inline]
+    pub fn generation(&self) -> u32 {
+        self.registry_epoch.wrapping_add(self.slots.len() as u32)
+    }
+
+    /// Resolve a triple to a stable [`NativeMethodId`](crate::NativeMethodId)
+    /// that a call site can cache and redeem later with
+    /// [`callback_of`](Self::callback_of) — an array index instead of three
+    /// string hashes plus a map probe.
+    ///
+    /// Semantics are identical to [`find`](Self::find), descriptor-quirk
+    /// fallback included: `resolve_id(..).and_then(|id| reg.callback_of(id))`
+    /// always equals `find(..)`.
+    #[inline]
+    pub fn resolve_id(
+        &self,
+        class_name: &str,
+        method_name: &str,
+        descriptor: &str,
+    ) -> Option<NativeMethodId> {
+        let key = native_method_hash(class_name, method_name, descriptor);
+        if let Some(idx) = self.slot_index_for_key(key, class_name, method_name, descriptor) {
+            return Some(NativeMethodId::from_u32(idx));
+        }
+        self.resolve_id_with_descriptor_quirks(class_name, method_name, descriptor)
+    }
+
+    /// As [`resolve_id`](Self::resolve_id), but with the 128-bit digest already
+    /// computed (see [`NativeMethodKey`](crate::NativeMethodKey)) so constant
+    /// strings known at class-link time are not re-hashed on every lookup.
+    ///
+    /// The three strings are still required and still checked: the digest
+    /// narrows the search, the names decide the answer. Passing a `key` that
+    /// does not correspond to the strings simply misses — it can never return
+    /// some other class's native.
+    #[inline]
+    pub fn resolve_id_by_key(
+        &self,
+        key: NativeMethodKey,
+        class_name: &str,
+        method_name: &str,
+        descriptor: &str,
+    ) -> Option<NativeMethodId> {
+        if let Some(idx) =
+            self.slot_index_for_key(key.as_pair(), class_name, method_name, descriptor)
+        {
+            return Some(NativeMethodId::from_u32(idx));
+        }
+        self.resolve_id_with_descriptor_quirks(class_name, method_name, descriptor)
+    }
+
+    /// Redeem a handle: the callback for `id`, or `None` if the handle does not
+    /// belong to this registry. O(1), no hashing, no string comparison — this is
+    /// the whole point of the mechanism.
+    #[inline]
+    pub fn callback_of(&self, id: NativeMethodId) -> Option<NativeCallback> {
+        self.slots.get(id.index()).map(|slot| slot.callback)
+    }
+
+    /// The category the native behind `id` was registered under.
+    #[inline]
+    pub fn kind_of_id(&self, id: NativeMethodId) -> Option<NativeKind> {
+        self.slots.get(id.index()).map(|slot| slot.kind)
+    }
+
+    /// The `(class, method, descriptor)` triple that currently owns `id`.
+    /// Diagnostics (native-ring dumps, tracing), not a dispatch input.
+    #[inline]
+    pub fn triple_of(&self, id: NativeMethodId) -> Option<(&str, &str, &str)> {
+        let slot = self.slots.get(id.index())?;
+        let (c, m, d) = self.registrations.get(slot.reg_index as usize)?;
+        Some((c.as_ref(), m.as_ref(), d.as_ref()))
+    }
+
+    /// [`find`](Self::find) with a precomputed digest. See
+    /// [`resolve_id_by_key`](Self::resolve_id_by_key) for the verification
+    /// contract.
+    #[inline]
+    pub fn find_by_key(
+        &self,
+        key: NativeMethodKey,
+        class_name: &str,
+        method_name: &str,
+        descriptor: &str,
+    ) -> Option<NativeCallback> {
+        let id = self.resolve_id_by_key(key, class_name, method_name, descriptor)?;
+        self.callback_of(id)
+    }
+
+    /// [`find_with_kind`](Self::find_with_kind) with a precomputed digest.
+    ///
+    /// Unlike `find_with_kind` this reports the slot's true kind on the
+    /// descriptor-quirk path too; `find_with_kind`'s `Bridge` fallback there is
+    /// preserved only for the existing callers that depend on it.
+    #[inline]
+    pub fn find_with_kind_by_key(
+        &self,
+        key: NativeMethodKey,
+        class_name: &str,
+        method_name: &str,
+        descriptor: &str,
+    ) -> Option<(NativeCallback, NativeKind)> {
+        let id = self.resolve_id_by_key(key, class_name, method_name, descriptor)?;
+        let slot = self.slots.get(id.index())?;
+        Some((slot.callback, slot.kind))
+    }
+
+    /// Slot lookup by exact triple (no descriptor rewriting).
+    #[inline]
+    fn slot_for_exact(
+        &self,
+        class_name: &str,
+        method_name: &str,
+        descriptor: &str,
+    ) -> Option<&NativeSlot> {
+        // Prefilter on the class name alone before finishing the digest: see
+        // `native_class_hash`. Exact for a miss, may false-positive into the
+        // full path.
+        let class_state = native_class_hash(class_name);
+        if !self.classes_with_natives.contains(&class_state) {
+            return None;
+        }
+        let key = native_method_hash_from(class_state, method_name, descriptor);
+        let idx = self.slot_index_for_key(key, class_name, method_name, descriptor)?;
+        self.slots.get(idx as usize)
+    }
+
+    /// The one place a 128-bit digest is turned into a slot index — and the one
+    /// place the full name is verified.
+    ///
+    /// A digest hit is treated as a *candidate*: we fetch the triple the
+    /// candidate slot was registered under and compare all three strings. A
+    /// mismatch is reported as a **miss**, not as a callback.
+    ///
+    /// This is not defensive theater. `classloading/src/class_manager.rs` (the
+    /// `loaded_classes` field doc, "Round 4 audit fix (CRIT)") records a
+    /// shipped defect of exactly this shape: a `name_to_id: FxHashMap<u64,
+    /// ClassId>` keyed by a raw FNV-1a digest with no name verification, where
+    /// any collision returned the wrong `ClassId` and caused silent type
+    /// confusion downstream. Three `str` comparisons of already-hot cache lines
+    /// are cheaper than the byte-at-a-time hash that produced the key, so this
+    /// is bought at essentially no cost.
+    #[inline]
+    fn slot_index_for_key(
+        &self,
+        key: (u64, u64),
+        class_name: &str,
+        method_name: &str,
+        descriptor: &str,
+    ) -> Option<u32> {
+        let idx = *self.slot_by_key.get(&key)?;
+        let slot = self.slots.get(idx as usize)?;
+        let (c, m, d) = self.registrations.get(slot.reg_index as usize)?;
+        if c.as_ref() == class_name && m.as_ref() == method_name && d.as_ref() == descriptor {
+            Some(idx)
+        } else {
+            None
+        }
+    }
+
     /// Look up a native method implementation (zero allocation on the
     /// fast path; zero allocation on a miss with a clean descriptor).
     #[inline]
@@ -4304,9 +4946,8 @@ impl NativeMethodRegistry {
         method_name: &str,
         descriptor: &str,
     ) -> Option<NativeCallback> {
-        let key = native_method_hash(class_name, method_name, descriptor);
-        if let Some(cb) = self.methods.get(&key).copied() {
-            return Some(cb);
+        if let Some(slot) = self.slot_for_exact(class_name, method_name, descriptor) {
+            return Some(slot.callback);
         }
 
         // AUDIT 2026-05-17 (Fix 4): the compatibility-variants path was
@@ -4324,14 +4965,30 @@ impl NativeMethodRegistry {
     /// variants. Returns `None` if the descriptor is already clean
     /// (no whitespace, no NUL, no `\r\n`, and any `L…` return type
     /// already correctly terminated with `;`).
-    #[cold]
-    #[inline(never)]
+    #[inline]
     fn find_with_descriptor_quirks(
         &self,
         class_name: &str,
         method_name: &str,
         descriptor: &str,
     ) -> Option<NativeCallback> {
+        let id = self.resolve_id_with_descriptor_quirks(class_name, method_name, descriptor)?;
+        self.callback_of(id)
+    }
+
+    /// Handle-returning form of [`find_with_descriptor_quirks`]. The quirk
+    /// rewrite is the only part of resolution that is not a pure function of
+    /// the exact triple, so it has to produce a slot index too — otherwise a
+    /// call site that memoizes a `NativeMethodId` would silently lose the
+    /// compatibility rewrites that `find` performs.
+    #[cold]
+    #[inline(never)]
+    fn resolve_id_with_descriptor_quirks(
+        &self,
+        class_name: &str,
+        method_name: &str,
+        descriptor: &str,
+    ) -> Option<NativeMethodId> {
         // Cheap precheck: if the descriptor has none of the quirks the
         // rewrites target, there are no variants to try — bail before
         // touching the allocator.
@@ -4398,14 +5055,18 @@ impl NativeMethodRegistry {
             }
         }
 
-        for slot in variants
+        for candidate_desc in variants
             .iter()
             .take(n_variants)
             .filter_map(|s| s.as_deref())
         {
-            let k = native_method_hash(class_name, method_name, slot);
-            if let Some(cb) = self.methods.get(&k).copied() {
-                return Some(cb);
+            let k = native_method_hash(class_name, method_name, candidate_desc);
+            // Verify against the REWRITTEN descriptor — that is the triple the
+            // native was registered under, and the one the digest encodes.
+            if let Some(idx) =
+                self.slot_index_for_key(k, class_name, method_name, candidate_desc)
+            {
+                return Some(NativeMethodId::from_u32(idx));
             }
         }
         None
@@ -4435,17 +5096,21 @@ impl NativeMethodRegistry {
     pub fn alias_class(&mut self, from_class: &str, to_class: &str) {
         // Collect first to avoid mutating while iterating, and to drop
         // the immutable borrow on `self.registrations` before we call
-        // `self.register()` below.
-        let entries: Vec<(String, String, NativeCallback)> = self
+        // `self.register()` below. Two passes (rather than one closure that
+        // both walks `registrations` and probes the slot table) so the
+        // `registrations` borrow is provably released before the whole-`self`
+        // lookup — a rare boot-time path, so the extra `Vec` is free.
+        let matched: Vec<(String, String)> = self
             .registrations
             .iter()
-            .filter_map(|(class, method, descriptor)| {
-                if class.as_ref() != from_class {
-                    return None;
-                }
-                let key = native_method_hash(from_class, method, descriptor);
-                let callback = *self.methods.get(&key)?;
-                Some((method.to_string(), descriptor.to_string(), callback))
+            .filter(|(class, _, _)| class.as_ref() == from_class)
+            .map(|(_, method, descriptor)| (method.to_string(), descriptor.to_string()))
+            .collect();
+        let entries: Vec<(String, String, NativeCallback)> = matched
+            .into_iter()
+            .filter_map(|(method, descriptor)| {
+                let callback = self.slot_for_exact(from_class, &method, &descriptor)?.callback;
+                Some((method, descriptor, callback))
             })
             .collect();
         for (method_name, descriptor, callback) in entries {
@@ -4453,14 +5118,15 @@ impl NativeMethodRegistry {
         }
     }
 
-    /// The number of registered native methods.
+    /// The number of registered native methods (distinct triples — a
+    /// re-registration of the same triple does not increase this).
     pub fn len(&self) -> usize {
-        self.methods.len()
+        self.slots.len()
     }
 
     /// Returns true if no native methods are registered.
     pub fn is_empty(&self) -> bool {
-        self.methods.is_empty()
+        self.slots.is_empty()
     }
 
     /// Fallback search: find any registered native callback whose
@@ -4529,6 +5195,44 @@ impl NativeMethodRegistry {
     }
 }
 
+#[cfg(test)]
+impl NativeMethodRegistry {
+    /// TEST ONLY: manufacture a 128-bit digest collision.
+    ///
+    /// Points the digest of `victim` (a triple that is NOT registered) at the
+    /// slot owned by `owner` (a triple that IS registered) — exactly the state
+    /// a real FNV-1a collision would produce. Everything downstream of the map
+    /// probe is the production code path, so this exercises the full-name
+    /// verification in `slot_index_for_key` for real. Without that check,
+    /// `find(victim)` would return `owner`'s callback: the silent type
+    /// confusion the `class_manager::name_to_id` map used to cause.
+    ///
+    /// Finding a genuine 128-bit collision is computationally infeasible, which
+    /// is precisely why the check has to be tested by injection.
+    fn inject_digest_collision_for_test(
+        &mut self,
+        owner: (&str, &str, &str),
+        victim: (&str, &str, &str),
+    ) {
+        let owner_key = native_method_hash(owner.0, owner.1, owner.2);
+        let idx = *self
+            .slot_by_key
+            .get(&owner_key)
+            .expect("owner triple must already be registered");
+        let victim_key = native_method_hash(victim.0, victim.1, victim.2);
+        assert_ne!(
+            owner_key, victim_key,
+            "test setup: owner and victim must be distinct triples"
+        );
+        self.slot_by_key.insert(victim_key, idx);
+        // The victim triple is deliberately NOT registered, so its class is
+        // not in the prefilter — without this the injected collision would be
+        // filtered out before `slot_index_for_key` ever ran, and the test
+        // would pass for the wrong reason.
+        self.classes_with_natives.insert(native_class_hash(victim.0));
+    }
+}
+
 impl Default for NativeMethodRegistry {
     fn default() -> Self {
         Self::new()
@@ -4538,7 +5242,7 @@ impl Default for NativeMethodRegistry {
 impl std::fmt::Debug for NativeMethodRegistry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NativeMethodRegistry")
-            .field("count", &self.methods.len())
+            .field("count", &self.slots.len())
             .finish()
     }
 }
@@ -4546,6 +5250,7 @@ impl std::fmt::Debug for NativeMethodRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_mock::MockNativeContext;
 
     fn dummy_native(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
         Ok(None)
@@ -4553,6 +5258,46 @@ mod tests {
 
     fn dummy_native_2(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
         Ok(Some(Value::Int(42)))
+    }
+
+    #[test]
+    fn native_handle_scope_releases_nested_roots_on_all_rust_exit_paths() {
+        fn root_then_return(ctx: &mut dyn NativeContext, object: ObjectRef) {
+            let mut scope = NativeHandleScope::new(ctx);
+            let handle = scope.root(object);
+            assert_eq!(scope.get(&handle), object);
+        }
+
+        let mut ctx = MockNativeContext::new();
+        let first = ctx.fresh_object_ref();
+        root_then_return(&mut ctx, first);
+        assert_eq!(ctx.handle_slot_count(), 0);
+        assert_eq!(ctx.handle_scope_depth(), 0);
+
+        let outer_object = ctx.fresh_object_ref();
+        let inner_object = ctx.fresh_object_ref();
+        {
+            let mut outer = NativeHandleScope::new(&mut ctx);
+            let outer_handle = outer.root(outer_object);
+            {
+                let mut inner = NativeHandleScope::new(&mut *outer);
+                let inner_handle = inner.root(inner_object);
+                assert_eq!(inner.get(&inner_handle), inner_object);
+            }
+            assert_eq!(outer.get(&outer_handle), outer_object);
+        }
+        assert_eq!(ctx.handle_slot_count(), 0);
+        assert_eq!(ctx.handle_scope_depth(), 0);
+
+        let unwind_object = ctx.fresh_object_ref();
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut scope = NativeHandleScope::new(&mut ctx);
+            let _handle = scope.root(unwind_object);
+            panic!("exercise NativeHandleScope::drop during unwind");
+        }));
+        assert!(panicked.is_err());
+        assert_eq!(ctx.handle_slot_count(), 0);
+        assert_eq!(ctx.handle_scope_depth(), 0);
     }
 
     fn legacy_native_method_hash(class: &str, method: &str, descriptor: &str) -> (u64, u64) {
@@ -4708,6 +5453,82 @@ mod tests {
         registry.register("A", "b", "()V", dummy_native);
         let dbg = format!("{:?}", registry);
         assert!(dbg.contains("count: 1"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Negative-lookup class prefilter
+    // -----------------------------------------------------------------------
+
+    /// The one invariant the prefilter can get wrong in a way that MATTERS:
+    /// a class that has a surviving registration but is missing from the set
+    /// makes `slot_for_exact` answer `None` for a native that exists. Assert
+    /// it over the whole registration log rather than for one sample triple,
+    /// so a future `register` early-return added above the insert is caught.
+    #[test]
+    fn every_registered_class_is_in_the_prefilter() {
+        let mut registry = NativeMethodRegistry::new();
+        registry.register("java/lang/Object", "hashCode", "()I", dummy_native);
+        registry.register("java/lang/String", "length", "()I", dummy_native_2);
+        registry.with_category(NativeKind::Bridge, |r| {
+            r.register("sun/misc/Unsafe", "getInt", "(Ljava/lang/Object;J)I", dummy_native);
+        });
+        registry.alias_class("java/lang/String", "java/lang/CharSequence");
+
+        for (class, method, descriptor) in &registry.registrations {
+            assert!(
+                registry
+                    .classes_with_natives
+                    .contains(&native_class_hash(class)),
+                "{class} is in the registration log but not the prefilter, so \
+                 {class}.{method}{descriptor} would resolve to None"
+            );
+            assert!(
+                registry.find(class, method, descriptor).is_some(),
+                "{class}.{method}{descriptor} must still resolve through the prefilter"
+            );
+        }
+    }
+
+    /// A class with no registration at all must miss — that is the whole point
+    /// — and must miss for every method name, not just the ones tried above.
+    #[test]
+    fn unregistered_class_misses_without_finishing_the_digest() {
+        let mut registry = NativeMethodRegistry::new();
+        registry.register("java/lang/Object", "hashCode", "()I", dummy_native);
+        assert!(registry.find("org/h2/mvstore/MVMap", "get", "()V").is_none());
+        assert!(registry.kind_of("org/h2/mvstore/MVMap", "put", "()V").is_none());
+        assert!(registry
+            .find_with_kind("org/h2/mvstore/MVMap", "hashCode", "()I")
+            .is_none());
+        // …while a registered triple on a registered class still resolves.
+        assert!(registry.find("java/lang/Object", "hashCode", "()I").is_some());
+        // …and an unregistered METHOD on a registered class still misses,
+        // which is the prefilter's false-positive path falling through to the
+        // full digest + name verification.
+        assert!(registry.find("java/lang/Object", "toString", "()V").is_none());
+    }
+
+    /// The split hash must be bit-identical to the one-shot form it replaced:
+    /// `slot_by_key` entries written by `register` (one-shot) are probed by
+    /// `slot_for_exact` (split).
+    #[test]
+    fn split_hash_matches_the_one_shot_digest() {
+        for (c, m, d) in [
+            ("java/lang/Object", "hashCode", "()I"),
+            ("", "", ""),
+            ("a", "b", "c"),
+            (
+                "jdk/internal/misc/Unsafe",
+                "compareAndSetLong",
+                "(Ljava/lang/Object;JJJ)Z",
+            ),
+        ] {
+            assert_eq!(
+                native_method_hash(c, m, d),
+                native_method_hash_from(native_class_hash(c), m, d),
+                "split digest diverged for {c}.{m}{d}"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -5014,11 +5835,13 @@ mod tests {
             line_number: 42,
             byte_code_index: 17,
             class_id: None,
+            method_index: Some(3),
         };
         let cloned = entry.clone();
         assert_eq!(&*cloned.class_name, "java/lang/Object");
         assert_eq!(cloned.line_number, 42);
         assert_eq!(cloned.byte_code_index, 17);
+        assert_eq!(cloned.method_index, Some(3));
         let _ = format!("{:?}", entry);
     }
 
@@ -5031,9 +5854,273 @@ mod tests {
             line_number: -2, // native method
             byte_code_index: -1,
             class_id: None,
+            method_index: None,
         };
         assert_eq!(entry.line_number, -2);
         assert!(entry.source_file.is_none());
         assert_eq!(entry.byte_code_index, -1);
+        assert!(
+            entry.method_index.is_none(),
+            "a synthetic/native entry has no backing Class::methods slot"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Native-dispatch memoization: dense handles, digest verification
+    // -----------------------------------------------------------------------
+
+    /// Compare two callbacks by address. `fn`-pointer `==` is unreliable
+    /// (the compiler may merge or duplicate identical functions, hence the
+    /// `unpredictable_function_pointer_comparisons` lint), but `dummy_native`
+    /// and `dummy_native_2` have observably different bodies, so they cannot be
+    /// merged — and merging identical ones is exactly the equality we want.
+    fn cb_addr(cb: NativeCallback) -> usize {
+        cb as usize
+    }
+
+    #[test]
+    fn handle_lookup_agrees_with_name_lookup() {
+        let mut registry = NativeMethodRegistry::new();
+        let triples = [
+            ("java/lang/Object", "hashCode", "()I"),
+            ("java/lang/System", "arraycopy", "(Ljava/lang/Object;ILjava/lang/Object;II)V"),
+            ("java/lang/String", "length", "()I"),
+        ];
+        registry.register(triples[0].0, triples[0].1, triples[0].2, dummy_native);
+        registry.register(triples[1].0, triples[1].1, triples[1].2, dummy_native_2);
+        registry.register(triples[2].0, triples[2].1, triples[2].2, dummy_native);
+
+        for (class, method, descriptor) in triples {
+            let by_name = registry.find(class, method, descriptor).expect("registered");
+            let id = registry
+                .resolve_id(class, method, descriptor)
+                .expect("handle resolves");
+            let by_handle = registry.callback_of(id).expect("handle redeems");
+            assert_eq!(cb_addr(by_name), cb_addr(by_handle), "{class}.{method}");
+            assert_eq!(registry.triple_of(id), Some((class, method, descriptor)));
+            assert_eq!(
+                registry.kind_of_id(id),
+                registry.kind_of(class, method, descriptor)
+            );
+        }
+
+        // Misses agree too.
+        assert!(registry.find("java/lang/Object", "nope", "()V").is_none());
+        assert!(registry
+            .resolve_id("java/lang/Object", "nope", "()V")
+            .is_none());
+    }
+
+    #[test]
+    fn handle_survives_later_registrations() {
+        let mut registry = NativeMethodRegistry::new();
+        registry.register("a/A", "m", "()V", dummy_native);
+        let id = registry.resolve_id("a/A", "m", "()V").expect("registered");
+
+        // Registering hundreds of unrelated natives must not move the handle.
+        for i in 0..256 {
+            let class = format!("filler/C{i}");
+            registry.register(&class, "m", "()V", dummy_native_2);
+        }
+        assert_eq!(registry.resolve_id("a/A", "m", "()V"), Some(id));
+        assert_eq!(
+            cb_addr(registry.callback_of(id).expect("still redeems")),
+            cb_addr(dummy_native as NativeCallback)
+        );
+        assert_eq!(registry.triple_of(id), Some(("a/A", "m", "()V")));
+    }
+
+    #[test]
+    fn handle_is_stable_across_reregistration_and_picks_up_new_callback() {
+        let mut registry = NativeMethodRegistry::new();
+        registry.register("a/A", "m", "()V", dummy_native);
+        let id = registry.resolve_id("a/A", "m", "()V").expect("registered");
+        let generation_before = registry.generation();
+
+        // Re-registering the SAME triple must update the slot in place: the
+        // handle stays valid (an already-memoized call site keeps working) and
+        // now resolves to the new callback (last-registration-wins).
+        registry.register("a/A", "m", "()V", dummy_native_2);
+        assert_eq!(registry.resolve_id("a/A", "m", "()V"), Some(id));
+        assert_eq!(
+            registry.generation(),
+            generation_before,
+            "re-registering an existing triple must not allocate a new slot"
+        );
+        assert_eq!(
+            cb_addr(registry.callback_of(id).expect("redeems")),
+            cb_addr(dummy_native_2 as NativeCallback)
+        );
+        assert_eq!(registry.len(), 1);
+    }
+
+    #[test]
+    fn generation_advances_only_for_new_triples() {
+        let mut registry = NativeMethodRegistry::new();
+        // The absolute value is an opaque per-registry token; only the deltas
+        // are contractual.
+        let empty = registry.generation();
+        assert_ne!(empty, 0, "generation 0 is reserved as a cache sentinel");
+        registry.register("a/A", "m", "()V", dummy_native);
+        let after_first = registry.generation();
+        assert_ne!(after_first, empty);
+        // Re-registering an existing triple must NOT move the generation.
+        registry.register("a/A", "m", "()V", dummy_native_2);
+        assert_eq!(registry.generation(), after_first);
+        // A genuinely new triple must.
+        registry.register("a/A", "other", "()V", dummy_native);
+        assert_ne!(registry.generation(), after_first);
+    }
+
+    #[test]
+    fn distinct_registries_do_not_share_a_generation() {
+        // A `static NativeCallSite` in a test binary outlives any single VM.
+        // Two registries with the SAME number of registrations must still report
+        // different generations, or a memo taken against one would be accepted
+        // by the other and redeem a slot index that means something else.
+        let mut a = NativeMethodRegistry::new();
+        let mut b = NativeMethodRegistry::new();
+        assert_ne!(a.generation(), b.generation());
+        a.register("a/A", "m", "()V", dummy_native);
+        b.register("b/B", "m", "()V", dummy_native_2);
+        assert_eq!(a.len(), b.len());
+        assert_ne!(
+            a.generation(),
+            b.generation(),
+            "equal-size registries must not alias"
+        );
+    }
+
+    #[test]
+    fn digest_collision_is_reported_as_a_miss_not_a_wrong_callback() {
+        // Regression guard for the `class_manager::name_to_id` defect class: a
+        // digest-keyed map with no name verification returns the WRONG entry on
+        // a collision (silent type confusion). Inject a collision and prove the
+        // full-name check fires.
+        let mut registry = NativeMethodRegistry::new();
+        registry.register("owner/Owner", "run", "()V", dummy_native);
+        let owner_id = registry
+            .resolve_id("owner/Owner", "run", "()V")
+            .expect("owner registered");
+
+        let victim = ("victim/Victim", "run", "()V");
+        assert!(
+            registry.find(victim.0, victim.1, victim.2).is_none(),
+            "precondition: victim is not registered"
+        );
+        registry.inject_digest_collision_for_test(("owner/Owner", "run", "()V"), victim);
+
+        // The colliding triple must NOT resolve to the owner's callback.
+        assert!(
+            registry.find(victim.0, victim.1, victim.2).is_none(),
+            "full-name verification did not fire: a digest collision returned another native's callback"
+        );
+        assert!(registry.resolve_id(victim.0, victim.1, victim.2).is_none());
+        assert!(registry.kind_of(victim.0, victim.1, victim.2).is_none());
+        assert!(registry
+            .find_with_kind(victim.0, victim.1, victim.2)
+            .is_none());
+        assert!(registry
+            .find_by_key(
+                NativeMethodKey::new(victim.0, victim.1, victim.2),
+                victim.0,
+                victim.1,
+                victim.2
+            )
+            .is_none());
+
+        // ...and the legitimate owner is unaffected.
+        let owner_cb = registry
+            .find("owner/Owner", "run", "()V")
+            .expect("owner still resolves");
+        assert_eq!(cb_addr(owner_cb), cb_addr(dummy_native as NativeCallback));
+        assert_eq!(
+            registry.resolve_id("owner/Owner", "run", "()V"),
+            Some(owner_id)
+        );
+    }
+
+    #[test]
+    fn precomputed_key_matches_name_lookup() {
+        let mut registry = NativeMethodRegistry::new();
+        registry.register("java/lang/String", "length", "()I", dummy_native_2);
+
+        let key = NativeMethodKey::new("java/lang/String", "length", "()I");
+        let by_key = registry
+            .find_by_key(key, "java/lang/String", "length", "()I")
+            .expect("key lookup hits");
+        let by_name = registry
+            .find("java/lang/String", "length", "()I")
+            .expect("name lookup hits");
+        assert_eq!(cb_addr(by_key), cb_addr(by_name));
+        assert_eq!(
+            registry.resolve_id_by_key(key, "java/lang/String", "length", "()I"),
+            registry.resolve_id("java/lang/String", "length", "()I")
+        );
+        assert_eq!(
+            registry.find_with_kind_by_key(key, "java/lang/String", "length", "()I")
+                .map(|(cb, kind)| (cb_addr(cb), kind)),
+            registry
+                .find_with_kind("java/lang/String", "length", "()I")
+                .map(|(cb, kind)| (cb_addr(cb), kind))
+        );
+
+        // A key that does not describe the strings simply misses — it can never
+        // hand back some other class's native.
+        let wrong_key = NativeMethodKey::new("java/lang/Object", "hashCode", "()I");
+        assert!(registry
+            .find_by_key(wrong_key, "java/lang/String", "length", "()I")
+            .is_none());
+    }
+
+    #[test]
+    fn handles_resolve_through_the_descriptor_quirk_path() {
+        // A memoized handle must not silently lose `find`'s compatibility
+        // rewrites, or a call site that adopts handles would regress the
+        // malformed-descriptor cases the quirk path exists for.
+        let mut registry = NativeMethodRegistry::new();
+        registry.register("q/Q", "m", "()Ljava/lang/String;", dummy_native_2);
+
+        let quirky = "()Ljava/lang/String";  // missing trailing ';'
+        let by_name = registry.find("q/Q", "m", quirky).expect("quirk rewrite hits");
+        let id = registry
+            .resolve_id("q/Q", "m", quirky)
+            .expect("quirk rewrite yields a handle");
+        assert_eq!(
+            cb_addr(by_name),
+            cb_addr(registry.callback_of(id).expect("redeems"))
+        );
+        // The handle names the triple actually registered, not the quirky input.
+        assert_eq!(registry.triple_of(id), Some(("q/Q", "m", "()Ljava/lang/String;")));
+    }
+
+    #[test]
+    fn kind_travels_with_the_handle() {
+        let mut registry = NativeMethodRegistry::new();
+        registry.with_category(NativeKind::Intrinsic, |r| {
+            r.register("k/K", "fast", "()I", dummy_native);
+        });
+        registry.with_category(NativeKind::SyntheticStub, |r| {
+            r.register("k/K", "fake", "()I", dummy_native_2);
+        });
+        let fast = registry.resolve_id("k/K", "fast", "()I").expect("registered");
+        let fake = registry.resolve_id("k/K", "fake", "()I").expect("registered");
+        assert_eq!(registry.kind_of_id(fast), Some(NativeKind::Intrinsic));
+        assert_eq!(registry.kind_of_id(fake), Some(NativeKind::SyntheticStub));
+        assert_eq!(
+            registry
+                .find_with_kind("k/K", "fake", "()I")
+                .map(|(_, kind)| kind),
+            Some(NativeKind::SyntheticStub)
+        );
+    }
+
+    #[test]
+    fn foreign_handle_does_not_panic() {
+        let registry = NativeMethodRegistry::new();
+        let bogus = NativeMethodId::from_u32(9_999);
+        assert!(registry.callback_of(bogus).is_none());
+        assert!(registry.kind_of_id(bogus).is_none());
+        assert!(registry.triple_of(bogus).is_none());
     }
 }
