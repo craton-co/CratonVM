@@ -4200,15 +4200,47 @@ unsafe fn jit_typecheck_resolve(
     // in place, the cast succeeds and the array round-trips correctly.
     if vm.mem.heap.kind_of(*obj_ref) == cratonvm_types::ObjectKind::Array {
         if let Some(src_desc) = crate::runtime::interpreter::array_descriptor_of(vm, *obj_ref) {
-            let assignable = if lenient {
+            // AUTHORITATIVE for an array receiver — do NOT fall through on a
+            // negative answer.
+            //
+            // BUG-JIT-ARRAY-INSTANCEOF-20260726: this used to `return true`
+            // only on success and otherwise drop into the class-hierarchy path
+            // below, which compares `obj_class_id` against the target. For a
+            // reference array `obj_class_id` is the header's *component* class
+            // id (see the paragraph above), so `String[]` arrived at
+            // `obj_class_id == target_class_id` with both sides equal to
+            // `java/lang/String` and `instanceof` answered **true** for
+            // `String[] instanceof String`. Same for `Integer[] instanceof
+            // Integer`, and `is_subclass_of` extended it to interfaces, so
+            // `String[] instanceof CharSequence` was true as well. Every one of
+            // those is false in the interpreter, whose `Checkcast`/`InstanceOf`
+            // handlers dispatch on array-ness and never reach a hierarchy
+            // comparison — which is why this only reproduced JIT-on, and only
+            // after warm-up.
+            //
+            // H2's `ObjectDataType.getTypeId` is a 15-arm `instanceof` ladder
+            // over `Object`; once compiled it classified a `String[]` as
+            // `TYPE_STRING`, so `StringType`'s generic bridge ran `checkcast
+            // java/lang/String` on the array and `TestObjectDataType` died with
+            // `ClassCastException: java.lang.String cannot be cast to
+            // java.lang.String` (the message renders an array receiver by its
+            // component name — a separate cosmetic defect that made this look
+            // like a class-identity split for far longer than it should have).
+            //
+            // `array_is_assignable_to_impl` is complete for an array source: it
+            // handles `Object`/`Serializable`/`Cloneable`, rejects every
+            // non-array target, recurses on components, and implements the
+            // `lenient` native-`Object[]`→`T[]` carve-out itself. The
+            // hierarchy path below can only add the component-id collapse, so
+            // there is nothing to fall through FOR.
+            return if lenient {
                 crate::runtime::interpreter::array_is_assignable_to(vm, &src_desc, class_name)
             } else {
                 crate::runtime::interpreter::array_is_instance_of(vm, &src_desc, class_name)
             };
-            if assignable {
-                return true;
-            }
         }
+        // No descriptor (a synthetic/incomplete array header): keep the
+        // historical best-effort fall-through rather than hard-failing.
     }
 
     // Fast path: target already loaded. Most call sites hit this.
@@ -5963,14 +5995,47 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
             // `invoke_on_class_shared_no_retarget` so the virtual retarget never
             // fires. Native-override priority is preserved (same as
             // `invoke_or_native`).
-            let r = crate::vm::invoke_special_shared(
-                vm,
-                thread,
-                info.class_name,
-                info.method_name,
-                info.descriptor,
-                &values,
-            );
+            //
+            // BUG-JIT-INVOKESPECIAL-LOADER-20260726: resolve the CP class
+            // through the CALLER's loader before dispatching. `info.class_name`
+            // is constant-pool text; with two loaders defining the same binary
+            // name, `invoke_special_shared`'s own `load_class_concurrent` picks
+            // whichever copy the global map holds — see
+            // `JitInvokeInfo::declaring_class_id`. `resolve_class_loader_aware`
+            // is the same resolver the interpreter's invokespecial uses, and it
+            // short-circuits to the global answer whenever no user-defined
+            // loader has ever defined a class, so single-loader processes pay
+            // one relaxed atomic load.
+            let resolved_owner = if info.declaring_class_id != 0 {
+                crate::runtime::interpreter::resolve_class_loader_aware(
+                    vm,
+                    thread,
+                    ClassId::new(info.declaring_class_id),
+                    info.class_name,
+                )
+                .ok()
+            } else {
+                None
+            };
+            let r = match resolved_owner {
+                Some(owner) => crate::vm::invoke_special_shared_on_class(
+                    vm,
+                    thread,
+                    owner,
+                    info.class_name,
+                    info.method_name,
+                    info.descriptor,
+                    &values,
+                ),
+                None => crate::vm::invoke_special_shared(
+                    vm,
+                    thread,
+                    info.class_name,
+                    info.method_name,
+                    info.descriptor,
+                    &values,
+                ),
+            };
             match r {
                 Ok(v) => v,
                 Err(e) => {
@@ -6039,6 +6104,7 @@ static INTEGER_VALUE_OF_INFO: JitInvokeInfo = JitInvokeInfo {
     num_jit_args: 1,
     return_type: b'L',
     invoke_kind: 3,
+    declaring_class_id: 0,
 };
 
 /// Thin direct-call target for JIT `invokestatic Integer.valueOf(I)` sites
@@ -6211,6 +6277,7 @@ static INTEGER_INT_VALUE_INFO: JitInvokeInfo = JitInvokeInfo {
     num_jit_args: 1,
     return_type: b'I',
     invoke_kind: 0,
+    declaring_class_id: 0,
 };
 
 /// Thin direct-call target for JIT `invokevirtual Integer.intValue()` sites
@@ -6263,6 +6330,7 @@ static HASHMAP_PUT_DIRECT_INFO: JitInvokeInfo = JitInvokeInfo {
     num_jit_args: 3,
     return_type: b'L',
     invoke_kind: 0,
+    declaring_class_id: 0,
 };
 static HASHMAP_GET_DIRECT_INFO: JitInvokeInfo = JitInvokeInfo {
     class_name: "java/util/HashMap",
@@ -6271,6 +6339,7 @@ static HASHMAP_GET_DIRECT_INFO: JitInvokeInfo = JitInvokeInfo {
     num_jit_args: 2,
     return_type: b'L',
     invoke_kind: 0,
+    declaring_class_id: 0,
 };
 static CONCURRENT_HASHMAP_GET_DIRECT_INFO: JitInvokeInfo = JitInvokeInfo {
     class_name: "java/util/concurrent/ConcurrentMap",
@@ -6279,6 +6348,7 @@ static CONCURRENT_HASHMAP_GET_DIRECT_INFO: JitInvokeInfo = JitInvokeInfo {
     num_jit_args: 2,
     return_type: b'L',
     invoke_kind: 2,
+    declaring_class_id: 0,
 };
 
 static STRING_LATIN1_LOWER_DIRECT_INFO: JitInvokeInfo = JitInvokeInfo {
@@ -6288,6 +6358,7 @@ static STRING_LATIN1_LOWER_DIRECT_INFO: JitInvokeInfo = JitInvokeInfo {
     num_jit_args: 3,
     return_type: b'L',
     invoke_kind: 3,
+    declaring_class_id: 0,
 };
 
 thread_local! {
@@ -8375,6 +8446,7 @@ mod tests {
             num_jit_args: 1,
             return_type: b'I',
             invoke_kind: 0,
+            declaring_class_id: 0,
         };
 
         let target = unsafe { virtual_dispatch_target_for_receiver(&vm, receiver, &info) };
@@ -8399,6 +8471,7 @@ mod tests {
             num_jit_args: 1,
             return_type: b'I',
             invoke_kind: 0,
+            declaring_class_id: 0,
         };
 
         let target = unsafe { virtual_dispatch_target_for_receiver(&vm, receiver, &info) };

@@ -6158,6 +6158,7 @@ pub fn execute(
                                 num_jit_args,
                                 return_type,
                                 invoke_kind,
+                                declaring_class_id: class_id.as_u32(),
                             });
                             let info_ptr: *const _ = &*info;
                             owned_jit_invoke_infos.push(info);
@@ -6220,6 +6221,7 @@ pub fn execute(
                             num_jit_args: pcount + 1, // receiver + params
                             return_type: b'V',
                             invoke_kind: 1,
+                            declaring_class_id: class_id.as_u32(),
                         });
                         let info_ptr: *const _ = &*info;
                         owned_jit_invoke_infos.push(info);
@@ -33628,6 +33630,7 @@ fn compile_osr_artifact(
                         num_jit_args,
                         return_type,
                         invoke_kind,
+                        declaring_class_id: class_id.as_u32(),
                     });
                     let info_ptr: *const _ = &*info;
                     owned_jit_invoke_infos2.push(info);
@@ -33726,6 +33729,7 @@ fn compile_osr_artifact(
                     num_jit_args: param_count,
                     return_type,
                     invoke_kind: 3,
+                    declaring_class_id: class_id.as_u32(),
                 });
                 let info_ptr: *const _ = &*info;
                 owned_jit_invoke_infos2.push(info);
@@ -33768,6 +33772,7 @@ fn compile_osr_artifact(
                     num_jit_args: pcount + 1, // receiver + params
                     return_type: b'V',
                     invoke_kind: 1,
+                    declaring_class_id: class_id.as_u32(),
                 });
                 let info_ptr: *const _ = &*info;
                 owned_jit_invoke_infos2.push(info);
