@@ -295,3 +295,13 @@ timeout at 120s). Confirmed JIT-specific: identical lifted config with
 `--nojit` added is 76/76 clean in ~34s. **No action needed — both guards
 are current and correct, not stale. Do not attempt to lift without a real
 fix for the stale-pointer/zero-header receiver bug.**
+
+## JASPER-JDT.2 / JASPER-JDT.3 — CLAIMED 2026-07-26 02:54 UTC
+
+Branch `fix/jit-ban-sweep-20260725`. Eclipse JDT parser (JASPER-JDT.2,
+`org/eclipse/jdt/internal/compiler/parser/`) and AST/flow-analysis
+(JASPER-JDT.3, `org/eclipse/jdt/internal/compiler/ast/`) package bans,
+skip_list.rs ~L970-1022. Real Tomcat repros available on this host's
+fixture: `org.apache.jasper.compiler.TestCompiler` (JASPER-JDT.2) and
+`org.apache.catalina.authenticator.TestFormAuthenticatorA/B/C`
+(JASPER-JDT.3).
