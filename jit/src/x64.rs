@@ -2707,6 +2707,27 @@ const ALL_SPILL_GPRS: [u8; 14] = [
     RAX, RCX, RDX, RBX, RSI, RDI, R8, R9, R10, R11, R12, R13, R14, R15,
 ];
 
+/// Whether any local that could hold an object reference currently lives only in
+/// a register — the "must spill at this safepoint" question, factored out of
+/// [`Compiler::can_elide_self_call_register_spill`] so it is unit-testable
+/// without standing up a whole `Compiler`.
+///
+/// `plan` is `None` on compile paths that never build one (the legacy [`compile`]
+/// test wrapper, OSR artifact compilation). Those fall back to the pre-2026-07-26
+/// all-or-nothing answer: *any* register-homed local counts, which is strictly
+/// more conservative and keeps those paths byte-identical.
+///
+/// See the caller's doc comment for the five-part soundness argument.
+fn reference_local_in_register(
+    plan: Option<&super::regalloc::SafepointPublishPlan>,
+    local_assignments: &[Option<u8>],
+) -> bool {
+    match plan {
+        Some(plan) => !plan.no_reference_in_registers(),
+        None => local_assignments.iter().any(Option::is_some),
+    }
+}
+
 /// Register-only operand-stack-oop soundness — whether `flush_scratch_registers`
 /// (the standard pre-call / pre-backward-branch / pre-return flush) ALSO spills
 /// `StackSlot::CalleeSaved` operand-stack entries that hold an object reference
@@ -7572,6 +7593,22 @@ struct Compiler {
     /// Per-local register assignment from graph-coloring allocator.
     /// `local_assignments[i] = Some(reg)` means local i is in that register.
     local_assignments: Vec<Option<u8>>,
+    /// Which register-homed locals a GC-capable safepoint actually has to
+    /// publish to their canonical frame slots (see
+    /// [`super::regalloc::SafepointPublishPlan`]).
+    ///
+    /// `None` on paths that do not build it — the legacy [`compile`] test
+    /// wrapper, OSR artifact compilation, and (as a deliberate cost gate) any
+    /// method where no local received a register home, since there the plan
+    /// provably cannot change any consumer's answer. Every consumer must fall
+    /// back to the conservative "any register home at all" behaviour, which is
+    /// what the whole file did before 2026-07-26.
+    ///
+    /// Set by `compile_with_param_slots` immediately after `Compiler::new`
+    /// rather than being threaded through that already-18-argument constructor;
+    /// `local_assignments` is final once `new` returns and is never mutated
+    /// afterwards, so the plan cannot go stale.
+    safepoint_publish: Option<super::regalloc::SafepointPublishPlan>,
     /// Per-basic-block live-in local sets `(block_start_pc, live_in_bitset)`
     /// from the allocator — used to build per-OSR-entry-PC dead-local masks so
     /// the OSR trampoline skips loading locals dead at the entry (a dead local
@@ -8966,6 +9003,9 @@ impl Compiler {
             num_params,
             num_reg_locals,
             local_assignments,
+            // Built by `compile_with_param_slots` (it has `code`/`param_oop_mask`,
+            // which this constructor does not). `None` = conservative fallback.
+            safepoint_publish: None,
             osr_block_live_in,
             alloc_used_regs,
             xmm_assignments,
@@ -10154,12 +10194,67 @@ impl Compiler {
     /// visible in a canonical frame slot.
     /// The callee prologue canonicalizes its arguments before it can reach a GC
     /// safepoint; the caller still publishes its precise oop-map id.
+    ///
+    /// # The local test is reference-only (arch-2026-07-26 R1)
+    ///
+    /// This used to fail closed on `local_assignments.iter().any(Option::is_some)`
+    /// — *any* register-homed local at all. That made the register allocator
+    /// actively counter-productive on the workload the elision exists for: give
+    /// `int fib(int n)` a register home and both recursive call sites go from
+    /// `emit_safepoint_metadata_only` (2 instructions) to the full
+    /// `emit_pre_safepoint_spill` — a per-local publish plus the 14-store blind
+    /// full-GPR spill, twice per invocation.
+    ///
+    /// The test is now `no_reference_in_registers()`: the elision is refused
+    /// only when a register-homed local can actually hold an **object
+    /// reference**. Verified rather than assumed, on the merged tree:
+    ///
+    /// 1. **The GC scan is stack-only.** `OopMapEntry` carries
+    ///    `frame_slot_offsets` and nothing else — the `reg_oops` register bitmap
+    ///    is a TODO with no field, no producer and no consumer anywhere in the
+    ///    workspace. A primitive's frame slot is therefore never *read* as a
+    ///    root; and the conservative `[scanner_sp, entry_sp)` walk re-validates
+    ///    every qword through `heap.is_object_address`, so a slot left stale can
+    ///    only over-retain, never under-report.
+    /// 2. **The reference mask is method-wide and conservative.**
+    ///    `regalloc::find_reference_locals` linearly scans the whole method and
+    ///    ORs in every `aload`/`astore` (all encodings, including `wide`), so
+    ///    javac's cross-scope slot reuse only makes it *more* conservative — a
+    ///    slot used as a reference anywhere is a reference everywhere. Unioned
+    ///    with `param_oop_mask`, which covers the one case the scan cannot see:
+    ///    a reference parameter the method never loads.
+    /// 3. **Nothing reads a primitive's slot back.**
+    ///    `emit_post_safepoint_reload` walks `local_oop_masks[pc]` — oops only —
+    ///    so the store this elides has no paired load.
+    /// 4. **Deopt and precise exception frames read the register, not the slot.**
+    ///    `build_and_record_deopt_point` prefers `FrameValue::Register` /
+    ///    `RegisterLong` / `RegisterRef` over the slot descriptor for a
+    ///    register-homed local, and the frame-deopt stub fills
+    ///    `deopt::SavedRegisters` with the whole GPR file. Reconstruction never
+    ///    consults the unpublished slot.
+    /// 5. **Locals `>= 64` cannot be register-homed at all** (`color_graph` caps
+    ///    at 64 and hands out `None` above it), so a zero
+    ///    `register_homed_reference_locals` really does mean "no register-homed
+    ///    local can hold an oop" — there is no unrepresented tail.
+    ///
+    /// Consequently the R2 invariant ("the oop map's slots must be a subset of
+    /// what the call site keeps current") holds here *by construction*: when the
+    /// predicate passes, every oop local is frame-homed, so its canonical slot —
+    /// which is exactly what `emit_oop_map_for_safepoint` advertises — was
+    /// written at its `astore` and is authoritative. Register-homed *reference*
+    /// locals are unchanged: they still fail the predicate and are still spilled.
+    ///
+    /// When `safepoint_publish` is `None` (the legacy `compile` test wrapper and
+    /// the OSR artifact path, which do not build a plan) this falls back to the
+    /// old all-or-nothing test, so those paths are byte-identical.
     fn can_elide_self_call_register_spill(&self) -> bool {
+        let any_reference_local_in_a_register =
+            reference_local_in_register(self.safepoint_publish.as_ref(), &self.local_assignments);
         if full_self_call_spill_requested()
             || !self.precise_maps
             || self.shadow_enabled
             || moving_young_enabled()
-            || self.local_assignments.iter().any(Option::is_some)
+            || any_reference_local_in_a_register
             || self.stack.len() != self.stack_oop_marks.len()
             || !self.stack_oop_marks_exact
         {
@@ -28478,6 +28573,50 @@ pub fn compile_with_param_slots(
         precise_exception_frames,
     );
     KERNEL_REG_HOMES_ACTIVE.with(|c| c.set(false));
+    // Safepoint publication plan (arch-2026-07-26 R1). Built here rather than
+    // inside `Compiler::new` because it needs `code` and `param_oop_mask`,
+    // neither of which that constructor receives. `compiler.local_assignments`
+    // is final at this point — `Compiler::new` moved the (possibly
+    // kernel-masked, possibly all-`None` when GPR local homes are disabled)
+    // assignment vector into the struct and nothing mutates it afterwards — so
+    // the plan describes exactly the register homes this compile will emit.
+    //
+    // `param_oop_mask` is unioned in for the case `find_reference_locals`
+    // cannot see: a reference PARAMETER that the method never `aload`s. Without
+    // it such a local would look primitive and could be left unpublished while
+    // genuinely holding an oop.
+    //
+    // COST GATE. `plan_safepoint_publication` runs `live_locals_per_pc_with_
+    // coverage`, a second whole-method liveness pass on top of the one
+    // `allocate_registers` just did. R1 consumes only `no_reference_in_registers()`
+    // and never touches the liveness-narrowed `publish_at` vector, so paying for
+    // it on every compile would be a JIT-compile-time regression inside a change
+    // whose entire purpose is a speedup — and would confound measuring it.
+    //
+    // Skip it whenever no local has a register home at all: there the plan
+    // provably cannot change the answer (`register_homed_reference_locals` would
+    // be `0` ⇒ `no_reference_in_registers()` ⇒ `false`, which is exactly what
+    // the `None` fallback's `any(Option::is_some)` also yields), so leaving the
+    // plan absent is behaviour-identical at zero cost. The methods that DO have
+    // register homes are precisely the population R1 exists to speed up.
+    //
+    // FOLLOW-UP: R2 needs `publish_at`, so it will need the pass unconditionally.
+    // Before landing R2, `regalloc` should grow a `publish_always`-only
+    // constructor that skips the liveness walk, or thread `allocate_registers`'
+    // existing liveness result through instead of recomputing it.
+    if compiler.local_assignments.iter().any(Option::is_some) {
+        // Bound separately: `compiler.a = f(&compiler.b)` borrows and assigns
+        // the same struct in one statement, which is needlessly close to the edge.
+        let safepoint_publish = super::regalloc::plan_safepoint_publication(
+            code,
+            code_len,
+            max_locals,
+            num_params,
+            &compiler.local_assignments,
+            param_oop_mask,
+        );
+        compiler.safepoint_publish = Some(safepoint_publish);
+    }
     compiler.param_jvm_slots = param_jvm_slots.to_vec();
     compiler.param_slot_span = param_slot_span;
     compiler.method_key = method_key.to_string();
@@ -41124,6 +41263,163 @@ mod flag_and_header_contracts {
             IDENTITY_HASH_CODE_OFFSET,
             std::mem::offset_of!(cratonvm_types::ObjectHeader, identity_hash_code)
         );
+    }
+
+    // -- arch-2026-07-26 R1: reference-only self-call spill elision ---------
+
+    /// `int fib(int)` — the workload the elision exists for. No `aload`/`astore`
+    /// anywhere, so no local can hold a reference and the elision must fire
+    /// **even though** the allocator gave locals register homes. Before R1 the
+    /// predicate failed closed here, so giving `fib` a register home made both
+    /// recursive call sites *more* expensive than with allocation off.
+    #[test]
+    fn fib_shaped_kernel_has_no_reference_locals_in_registers() {
+        // 0: iload_0        1: iconst_2      2: if_icmpge 7
+        // 5: iload_0        6: ireturn
+        // 7: iload_0        8: iconst_1      9: isub
+        // 10: invokestatic  13: iload_0     14: iconst_2   15: isub
+        // 16: invokestatic  19: iadd        20: ireturn
+        let code: Vec<u8> = vec![
+            0x1a, 0x05, 0xa2, 0x00, 0x05, 0x1a, 0xac, 0x1a, 0x04, 0x64, 0xb8, 0x00, 0x01, 0x1a,
+            0x05, 0x64, 0xb8, 0x00, 0x01, 0x60, 0xac,
+        ];
+        let code_len = code.len();
+        // Both locals register-homed, as the allocator would do for a hot kernel.
+        let assignments = vec![Some(R12), Some(R13)];
+        let plan =
+            crate::regalloc::plan_safepoint_publication(&code, code_len, 2, 1, &assignments, 0);
+        assert_eq!(
+            plan.reference_locals, 0,
+            "an int-only kernel has no reference locals"
+        );
+        assert!(
+            plan.no_reference_in_registers(),
+            "no register-homed local can hold an oop here, so the self-call spill must be elidable"
+        );
+        assert!(
+            !reference_local_in_register(Some(&plan), &assignments),
+            "R1: the predicate must no longer fail closed merely because a local has a register"
+        );
+    }
+
+    /// The contrast case. A single `astore_1` taints local 1 method-wide; if
+    /// local 1 also has a register home the elision must be refused, because
+    /// that register really can hold a GC root the stack-only scan cannot see.
+    #[test]
+    fn register_homed_reference_local_still_forces_the_spill() {
+        // 0: aconst_null  1: astore_1  2: aload_1  3: areturn
+        let code: Vec<u8> = vec![0x01, 0x4c, 0x2b, 0xb0];
+        let code_len = code.len();
+        let assignments = vec![None, Some(R12)];
+        let plan =
+            crate::regalloc::plan_safepoint_publication(&code, code_len, 2, 0, &assignments, 0);
+        assert_eq!(
+            plan.reference_locals & 0b10,
+            0b10,
+            "astore_1 taints local 1"
+        );
+        assert!(!plan.no_reference_in_registers());
+        assert!(
+            reference_local_in_register(Some(&plan), &assignments),
+            "a register-homed reference local must keep forcing the full spill"
+        );
+
+        // Same method, but local 1 spilled to its frame slot: the oop is
+        // already frame-resident, so nothing needs publishing.
+        let spilled = vec![None, None];
+        let plan_spilled =
+            crate::regalloc::plan_safepoint_publication(&code, code_len, 2, 0, &spilled, 0);
+        assert!(plan_spilled.no_reference_in_registers());
+        assert!(!reference_local_in_register(Some(&plan_spilled), &spilled));
+    }
+
+    /// A reference PARAMETER the method never `aload`s is invisible to
+    /// `find_reference_locals`. `compile_with_param_slots` unions in
+    /// `param_oop_mask` for exactly this case; if it ever stops doing so, a
+    /// live oop could be left in an unpublished register.
+    #[test]
+    fn param_oop_mask_covers_a_never_loaded_reference_parameter() {
+        // `static int f(Object o) { return 1; }` — bytecode never touches local 0.
+        let code: Vec<u8> = vec![0x04, 0xac]; // iconst_1; ireturn
+        let code_len = code.len();
+        let assignments = vec![Some(R12)];
+        let without =
+            crate::regalloc::plan_safepoint_publication(&code, code_len, 1, 1, &assignments, 0);
+        assert!(
+            without.no_reference_in_registers(),
+            "the bytecode scan alone cannot see an unloaded reference parameter"
+        );
+        let with = crate::regalloc::plan_safepoint_publication(
+            &code,
+            code_len,
+            1,
+            1,
+            &assignments,
+            0b1, // param_oop_mask: local 0 is a reference parameter
+        );
+        assert!(
+            !with.no_reference_in_registers(),
+            "param_oop_mask must make the never-loaded reference parameter visible; \
+             compile_with_param_slots passes it for this reason"
+        );
+    }
+
+    /// Compile paths that build no plan must keep the old, strictly more
+    /// conservative behaviour.
+    #[test]
+    fn absent_plan_falls_back_to_the_conservative_all_or_nothing_test() {
+        assert!(
+            reference_local_in_register(None, &[None, Some(R12)]),
+            "without a plan, any register home must still force the spill"
+        );
+        assert!(
+            !reference_local_in_register(None, &[None, None]),
+            "without a plan and without register homes, the old predicate already elided"
+        );
+    }
+
+    /// `compile_with_param_slots` skips building the plan when no local has a
+    /// register home, to avoid a second whole-method liveness pass on every
+    /// compile. That shortcut is only legitimate if the plan and the `None`
+    /// fallback agree in exactly that case — including for a method that is
+    /// full of reference locals.
+    #[test]
+    fn cost_gate_skipping_the_plan_is_behaviour_identical_without_register_homes() {
+        // aconst_null; astore_1; aload_1; areturn — reference locals present.
+        let code: Vec<u8> = vec![0x01, 0x4c, 0x2b, 0xb0];
+        let no_homes = vec![None, None];
+        let plan =
+            crate::regalloc::plan_safepoint_publication(&code, code.len(), 2, 0, &no_homes, 0);
+        assert_eq!(
+            reference_local_in_register(Some(&plan), &no_homes),
+            reference_local_in_register(None, &no_homes),
+            "with no register homes the plan and the fallback must agree, or the \
+             cost gate in compile_with_param_slots silently changes behaviour"
+        );
+        assert!(!reference_local_in_register(None, &no_homes));
+    }
+
+    /// `plan_safepoint_publication`'s masks are `u64`, and the R1 argument
+    /// depends on there being no unrepresented tail above bit 63. That holds
+    /// only because `color_graph` refuses to colour locals `>= 64`.
+    #[test]
+    fn locals_past_the_bitset_never_receive_a_register_home() {
+        let code: Vec<u8> = vec![0x04, 0xac];
+        let mut assignments = vec![None; 80];
+        // A local at index 70 cannot legally be register-homed; assert the
+        // allocator's own contract rather than trusting the plan to mask it.
+        let alloc = crate::regalloc::allocate_registers(&code, code.len(), 80, 0, &[]);
+        assert!(
+            alloc.assignments.iter().skip(64).all(Option::is_none),
+            "color_graph caps at 64 locals; if that ever changes, \
+             SafepointPublishPlan's u64 masks silently stop covering the tail and \
+             can_elide_self_call_register_spill's soundness argument breaks"
+        );
+        // And the plan reports "no oop in registers" for an all-None assignment.
+        assignments[70] = None;
+        let plan =
+            crate::regalloc::plan_safepoint_publication(&code, code.len(), 80, 0, &assignments, 0);
+        assert!(plan.no_reference_in_registers());
     }
 
     /// Inventory tripwire for the 32→16-byte `ObjectHeader` shrink. If these

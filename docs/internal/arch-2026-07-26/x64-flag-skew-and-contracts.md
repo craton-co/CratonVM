@@ -1,8 +1,9 @@
 # `jit/src/x64.rs` — flag skew and codegen/runtime contracts
 
-*Session slug: `x64-flag-skew-and-contracts`. Written against `dev` @ `6495a191c`
-(2026-07-26). Scope of edits: `jit/src/x64.rs` only. Everything under §7 is a
-request to another owner and was **not** edited here.*
+*Session slug: `x64-flag-skew-and-contracts`. Written against `dev` @ `6495a191c`,
+then re-verified after merging `arch/wave1-integration-20260726` (2026-07-26).
+Scope of edits: `jit/src/x64.rs` only. Everything under §7 is a request to another
+owner and was **not** edited here.*
 
 Companion reading:
 
@@ -21,8 +22,11 @@ Companion reading:
 | Crate | Site | State on `6495a191c` before this change |
 | --- | --- | --- |
 | `gc` | `gc/src/gc_quiescence.rs::moving_young_enabled` | already centralized (`gc_flags().moving_young`) |
-| `jit` | `jit/src/x64.rs::moving_young_enabled` | crate-private `OnceLock` + `getenv` |
-| `vm` | `vm/src/jit/conservative_roots.rs::moving_young_enabled` | crate-private `OnceLock` + `getenv` |
+| `jit` | `jit/src/x64.rs::moving_young_enabled` | crate-private `OnceLock` + `getenv` — **fixed here** |
+| `vm` | `vm/src/jit/conservative_roots.rs::moving_young_enabled` | crate-private `OnceLock` + `getenv` — since fixed by `arch/wave1-integration-20260726` |
+
+With both landed, `CRATONVM_MOVING_YOUNG` now has exactly one parse site in the
+workspace. `CRATONVM_SHADOW_STACK` still has two in `vm` — see §7 R1.
 
 The same shape held for `CRATONVM_SHADOW_STACK` (`gc/src/gen_heap.rs:3684` already read
 `cratonvm_types::flags().jit.shadow_stack`; `jit` and `vm` still `getenv`'d).
@@ -466,21 +470,149 @@ constants, and the `<< 24` compact-flag shift became
 
 ---
 
+## 6A. Self-call spill elision — R1 landed, R2 specified
+
+Picked up mid-session from the orchestrator, following
+`docs/internal/arch-2026-07-26/jit-regalloc-and-deopt.md` (merged in via
+`arch/wave1-integration-20260726`).
+
+### 6A.1 What a GC-capable call cost, and why the allocator made it worse
+
+At a direct self-recursive call the emitter ran the full
+`emit_pre_safepoint_spill`: one store per register-homed local (*all* of them,
+reference or not), plus — on the default path — the blind 14-store full-GPR-file
+spill, plus the 2-instruction safepoint-id store. `safepoint_reg_spill_all` is
+implied by `precise_maps && !CRATONVM_NO_PRECISE_REG_SPILL`, which is the same
+fold §4 verifies is genuinely in place; the two findings corroborate each other.
+
+The bypass — `can_elide_self_call_register_spill` — existed for exactly this
+case but failed closed on `local_assignments.iter().any(Option::is_some)`. So
+giving `int fib(int n)` a register home *caused* ~17 extra stores per call site,
+twice per invocation: the register allocator made the recursion benchmark worse
+at the call boundary than with allocation off.
+
+### 6A.2 R1 — landed
+
+The local test is now reference-only, via
+`regalloc::SafepointPublishPlan::no_reference_in_registers()`. The decision was
+factored into a free function `reference_local_in_register(plan, assignments)`
+so it is unit-testable without standing up a `Compiler`. Every other
+precondition of the elision is untouched.
+
+**The GC-safety argument was verified on the merged tree, not assumed:**
+
+1. **The scan is stack-only.** `OopMapEntry` (`jit/src/lib.rs:708`) carries
+   `native_pc_offset`, `bytecode_pc`, `frame_slot_offsets`,
+   `moving_young_coverage_complete` — and nothing else. `reg_oops` appears in the
+   workspace only in two comments; there is no field, producer or consumer. A
+   primitive's frame slot is never read as a root, and the conservative
+   `[scanner_sp, entry_sp)` walk re-validates every qword through
+   `heap.is_object_address`, so a stale slot can only over-retain.
+2. **The reference mask is method-wide.** `regalloc::find_reference_locals`
+   (`regalloc.rs:1187`) linearly scans the whole method, ORing every
+   `aload`/`astore` in every encoding including `wide`. No scoping, no reset —
+   javac's cross-scope slot reuse can only make it more conservative.
+3. **Nothing reads a primitive's slot back.** `emit_post_safepoint_reload`
+   (`x64.rs:10718`) walks `local_oop_masks[pc]` — oops only. The elided store has
+   no paired load.
+4. **Deopt and precise exception frames read registers.**
+   `typed_local_frame_value` (`x64.rs:8399`) returns `Register` / `RegisterLong`
+   before ever considering `StackSlot`, the oop arm returns `RegisterRef`, and
+   the frame-deopt stub fills `deopt::SavedRegisters` with the whole GPR file.
+   The `precise_exception_frames` path (`x64.rs:17860`) goes through the same
+   `build_and_record_deopt_point`. Reconstruction never consults the unpublished
+   slot.
+5. **No unrepresented tail.** `color_graph` (`regalloc.rs:1010`) caps at
+   `num_locals.min(64)` and returns `None` above it, so a zero
+   `register_homed_reference_locals` genuinely means "no register-homed local can
+   hold an oop".
+
+**The R2 invariant holds trivially for R1.** When the predicate passes, every oop
+local is frame-homed, and a frame-homed oop's canonical slot was written at its
+`astore` — which is exactly what `emit_oop_map_for_safepoint` advertises. There
+is no gap to assert away.
+
+**Cost gate.** `plan_safepoint_publication` internally runs
+`live_locals_per_pc_with_coverage` — a *second* whole-method liveness pass on top
+of the one `allocate_registers` already did. R1 consumes only
+`no_reference_in_registers()` and never reads the liveness-narrowed `publish_at`
+vector, so paying for that pass on every compile would be a JIT-compile-time
+regression inside a change whose whole purpose is a speedup, and would confound
+measuring it. The plan is therefore built only when some local actually has a
+register home. That shortcut is exactly behaviour-preserving — with no register
+homes, `register_homed_reference_locals` is `0`, so the plan and the `None`
+fallback both answer "elide" — and it is pinned by
+`cost_gate_skipping_the_plan_is_behaviour_identical_without_register_homes`.
+
+Tests added: an int-only fib-shaped kernel with both locals register-homed
+(elision must fire), a register-homed reference local (must still spill) with its
+frame-homed counterpart, `param_oop_mask` covering a never-`aload`ed reference
+parameter, the absent-plan fallback, the 64-local cap contract, and the cost-gate
+equivalence.
+
+### 6A.3 R2 — NOT landed, and one finding that changes how it should land
+
+R2 was to gate `emit_pre_safepoint_spill`'s per-local publish loop
+(`x64.rs:9987-9992`) on the publish plan, generalising R1 to every call site. Not
+landed, for two reasons: the instruction was to measure R1 alone first, and this
+host cannot build. But the analysis produced a result worth acting on.
+
+The required invariant is that the oop map's advertised slots stay a subset of
+what the call site keeps current:
+
+```
+local_oop_masks[pc] & register_homed  ⊆  <the publish set used at pc>
+```
+
+**With `publish_always`, this holds by construction.** `compute_local_oop_masks`
+(`x64.rs:3268`) seeds `in_mask[0] = param_oop_mask` and sets a bit only where the
+slot was `astore`d on every reaching path. So
+`local_oop_masks[pc] ⊆ find_reference_locals | param_oop_mask`, which is exactly
+`SafepointPublishPlan::reference_locals`; intersecting both sides with
+`register_homed` gives `⊆ register_homed_reference_locals == publish_always`. No
+runtime assertion is needed — it is a static containment.
+
+**With `publish_at` (liveness-narrowed), it is NOT establishable by inspection,
+and should not be landed on a `debug_assert!` alone.** The two masks come from
+independently-constructed CFGs that handle exception edges *differently*:
+`compute_local_oop_masks` leaves handler-reachable PCs `unreached` and the caller
+falls back to the conservative sweep; `plan_safepoint_publication`'s liveness has
+no handler edges at all and instead depends on
+`lib.rs::local_handler_reads_unsafe_local` refusing to compile such methods. Those
+are two different unsound-by-default behaviours patched by two different
+mechanisms, and "they should agree" is not a proof.
+
+**Recommendation:** land R2 in two steps. First `publish_always` only — a real
+win (it drops the per-local publish for every primitive at every call site) with
+a static soundness argument and no new dependency on the RBC.6 admission gate.
+Only then consider `publish_at`, and only with the handler-edge question settled
+in `regalloc` rather than asserted in `x64`.
+
+---
+
 ## 7. Cross-owner requests (NOT edited here)
 
-### R1 — `vm/src/jit/conservative_roots.rs`: finish the three-way de-skew
+### R1 — `vm/src/jit/conservative_roots.rs`: finish the `CRATONVM_SHADOW_STACK` de-skew
 
-Owner: the `vm` sibling. Two crate-private `getenv`s remain and are now the **only**
-un-centralized readers of these gates:
+Owner: the `vm` sibling. **Partially resolved by
+`arch/wave1-integration-20260726`**, which landed after this audit began:
+`conservative_roots.rs:415` now reads `cratonvm_types::flags().gc.moving_young`, so
+`CRATONVM_MOVING_YOUNG` is centralized in all three crates and the three-way skew this
+session was convened for is fully closed. `conservative_roots.rs:2595` even cross-checks
+`cratonvm_jit::x64::moving_young_enabled() && cratonvm_types::flags().gc.moving_young` —
+a check that is now identity by construction, which is the point.
 
-- `vm/src/jit/conservative_roots.rs:377` — `moving_young_enabled()` should be
-  `cratonvm_types::flags().gc.moving_young`.
-- `vm/src/jit/conservative_roots.rs:358` and `:901` — `var_os("CRATONVM_SHADOW_STACK")`
-  should be `cratonvm_types::flags().jit.shadow_stack`.
+`CRATONVM_SHADOW_STACK` is still read by hand in two places and is the last remaining
+divergence surface:
 
-Behaviour-preserving (`parse::present` == `var_os(..).is_some()`). Rationale: with `gc`
-and `jit` both centralized, `vm` is the last place the gate can diverge, and it is the
-crate that owns the root scan — the half that must agree with codegen.
+- `vm/src/jit/conservative_roots.rs:358` — `var_os("CRATONVM_SHADOW_STACK").is_some()`
+- `vm/src/jit/conservative_roots.rs:957` — `var_os("CRATONVM_SHADOW_STACK").is_none()`
+
+Both should be `cratonvm_types::flags().jit.shadow_stack`. Behaviour-preserving
+(`parse::present` == `var_os(..).is_some()`). `gc/src/gen_heap.rs` and `jit/src/x64.rs`
+already read the centralized field, so `vm` is the only place this gate can still
+diverge — and it is the crate that owns the root scan, the half that must agree with
+codegen.
 
 ### R2 — `gc/src/tlab.rs` (+ `vm/src/jit/helpers.rs`): JIT allocations bypass pressure accounting
 
@@ -543,9 +675,16 @@ parse helper each needs. Two specific asks:
 ## 8. Verification status
 
 - Not built and not tested — this host runs nine concurrent agents and nine cargo builds
-  OOM it. `rustfmt --check` was run: `jit/src/x64.rs` has **15** pre-existing formatting
-  deviations before this session's edits and **the same 15** after (same sites, shifted by
-  the inserted lines). No new deviation was introduced.
+  OOM it. `rustfmt --check` was run after every edit: `jit/src/x64.rs` has **15**
+  pre-existing formatting deviations before this session's edits and **the same 15**
+  after (same sites, shifted by the inserted lines). No new deviation was introduced.
+- **R1 is unmeasured.** The instruction was to land R1 and measure it alone; the
+  measurement is outstanding and is the gate on R2. The expected effect is that both
+  recursive call sites in `int fib(int)` drop from `emit_pre_safepoint_spill`
+  (per-local publish + 14-store blind GPR spill + sp-id store) to
+  `emit_safepoint_metadata_only` (sp-id store only). Watch JIT-compile time as well as
+  run time: the cost gate should keep the added liveness pass off methods with no
+  register-homed locals, but that has not been observed either.
 - CRLF line endings verified preserved (`file` reports CRLF before and after every edit;
   `git diff --stat` shows a small localized diff, not a whole-file rewrite).
 - The `#[cfg(test)]` coverage added in `mod flag_and_header_contracts` is unrun. It is
