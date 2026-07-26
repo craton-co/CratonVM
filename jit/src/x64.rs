@@ -14793,6 +14793,31 @@ impl Compiler {
         self.patch_rel32_to_here(done);
     }
 
+    /// Zero-extended 8-bit field load for `String.coder`, with the same
+    /// compact/legacy dual handling as [`Self::emit_load_string_i32_field`].
+    ///
+    /// `coder` is declared `byte`. Under the compact natural-width layout it
+    /// occupies exactly ONE byte, followed by alignment padding up to the next
+    /// field -- padding whose contents nothing guarantees. A 32-bit load there
+    /// would fold that padding into the value, so it must be loaded at its
+    /// declared width. Under the legacy 16-byte tagged cell the byte at the
+    /// payload32 offset is the little-endian low byte of the same int and
+    /// `coder` is only ever 0 (LATIN1) or 1 (UTF16), so the narrow load is
+    /// correct for that representation too.
+    fn emit_load_string_u8_field(&mut self, dst: u8, base: u8, compact_offset: i32) {
+        self.emit_test_mem8_imm8(
+            base,
+            cratonvm_types::GC_FLAGS_OFFSET as i32,
+            cratonvm_types::GC_FLAG_COMPACT,
+        );
+        let legacy = self.emit_jcc_rel32_patch(0x84);
+        self.emit_movx_r64_mem_disp32(dst, base, compact_offset, 8, false);
+        let done = self.emit_jmp_rel32_patch();
+        self.patch_rel32_to_here(legacy);
+        self.emit_movx_r64_mem_disp32(dst, base, compact_offset + 8, 8, false);
+        self.patch_rel32_to_here(done);
+    }
+
     /// Emit a 32-bit register-to-register ALU op `dst op= src` for the
     /// STRING_SEARCH intrinsics. `opcode` is the primary opcode of the
     /// `r/m32, r32` form (0x01 ADD, 0x29 SUB, 0x39 CMP, 0x89 MOV, 0x31
@@ -25157,7 +25182,7 @@ impl Compiler {
                                 bail.push(self.emit_jcc_rel32_patch(0x84)); // JZ
 
                                 // R10D = coder (0 LATIN1 / 1 UTF16).
-                                self.emit_load_string_i32_field(
+                                self.emit_load_string_u8_field(
                                     R10,
                                     RAX,
                                     layout.coder_cell_offset + FIELD_CELL_PAYLOAD32_OFFSET as i32,
@@ -25421,7 +25446,7 @@ impl Compiler {
 
                             // coder mismatch → deopt.
                             // MOV ECX,[RAX+coder] ; CMP ECX,[RDX+coder]
-                            self.emit_load_string_i32_field(
+                            self.emit_load_string_u8_field(
                                 RCX,
                                 RAX,
                                 layout.coder_cell_offset + FIELD_CELL_PAYLOAD32_OFFSET as i32,
@@ -25431,7 +25456,7 @@ impl Compiler {
                             // same compact/legacy-aware helper (R11 is free
                             // here) instead of a raw CMP-with-memory-operand,
                             // then compare register-to-register.
-                            self.emit_load_string_i32_field(
+                            self.emit_load_string_u8_field(
                                 R11,
                                 RDX,
                                 layout.coder_cell_offset + FIELD_CELL_PAYLOAD32_OFFSET as i32,
@@ -25561,12 +25586,12 @@ impl Compiler {
                             self.buf.emit(&[0x4D, 0x85, 0xC9]); // TEST R9,R9
                             bail.push(self.emit_jcc_rel32_patch(0x84));
                             // R10 = this.coder, R11 = other.coder.
-                            self.emit_load_string_i32_field(
+                            self.emit_load_string_u8_field(
                                 R10,
                                 RAX,
                                 layout.coder_cell_offset + FIELD_CELL_PAYLOAD32_OFFSET as i32,
                             );
-                            self.emit_load_string_i32_field(
+                            self.emit_load_string_u8_field(
                                 R11,
                                 RDX,
                                 layout.coder_cell_offset + FIELD_CELL_PAYLOAD32_OFFSET as i32,
@@ -25687,7 +25712,7 @@ impl Compiler {
                             self.buf.emit(&[0x4D, 0x85, 0xC0]); // TEST R8,R8
                             bail.push(self.emit_jcc_rel32_patch(0x84));
                             // R10 = this.coder.
-                            self.emit_load_string_i32_field(
+                            self.emit_load_string_u8_field(
                                 R10,
                                 RAX,
                                 layout.coder_cell_offset + FIELD_CELL_PAYLOAD32_OFFSET as i32,
@@ -25792,12 +25817,12 @@ impl Compiler {
                             self.buf.emit(&[0x4D, 0x85, 0xC9]); // TEST R9,R9
                             bail.push(self.emit_jcc_rel32_patch(0x84));
                             // R10 = haystack coder, R11 = needle coder.
-                            self.emit_load_string_i32_field(
+                            self.emit_load_string_u8_field(
                                 R10,
                                 RAX,
                                 layout.coder_cell_offset + FIELD_CELL_PAYLOAD32_OFFSET as i32,
                             );
-                            self.emit_load_string_i32_field(
+                            self.emit_load_string_u8_field(
                                 R11,
                                 RDX,
                                 layout.coder_cell_offset + FIELD_CELL_PAYLOAD32_OFFSET as i32,

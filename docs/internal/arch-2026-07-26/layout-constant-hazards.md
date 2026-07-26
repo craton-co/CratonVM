@@ -119,7 +119,8 @@ pre-session numbers from `header-shrink.md` §6.6 are in parentheses):
 | `jit/src/ir_lower.rs:2035` (1992) | `MOVSS/MOVSD [RAX+RCX*n+HEADER_SIZE],XMM0` | **disp8** |
 | `jit/src/ir_lower.rs:2647` (2604) | `MOV R10D,[RAX+ARRAY_LENGTH_OFFSET]` bounds check | **disp8** |
 | `jit/src/lib.rs:3186` | `(HEADER_SIZE + body_off) as i32` — compact string field cell | disp32 |
-| `jit/src/lib.rs:3226` | `(HEADER_SIZE + idx * SLOT_SIZE) as i32` — legacy string field cell | disp32 |
+| `jit/src/lib.rs:3221` | `abs - FIELD_CELL_PAYLOAD32_OFFSET` — compact **primitive** field bias (added 2026-07-26) | disp32 |
+| `jit/src/lib.rs:3256` (3226) | `(HEADER_SIZE + idx * SLOT_SIZE) as i32` — legacy string field cell | disp32 |
 
 **All seven already read the shared constants, not literals** — no site needed
 converting. The hazards are the ones the inventory was supposed to surface and
@@ -168,12 +169,26 @@ layout constants this crate could plausibly emit:
 
 | | `HEADER_SIZE` | `ARRAY_LENGTH_OFFSET` | `SLOT_SIZE` | `REF_ELEMENT_SIZE` | `MARK_WORD_OFFSET` | `IDENTITY_HASH_CODE_OFFSET` | `FIELD_CELL_PAYLOAD32_OFFSET` | `FIELD_CELL_PAYLOAD64_OFFSET` |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `jit/src/lib.rs` | 3 | 1 | 2 | 1 | 0 | 0 | 0 | 2 |
+| `jit/src/lib.rs` | 3 | 1 | 2 | 1 | 0 | 0 | 1 | 2 |
 | `jit/src/ir_lower.rs` | 7 | 3 | 4 | 0 | 0 | 0 | 3 | 0 |
 
 The zero entries are as load-bearing as the rest: a constant that starts being
 used in a file where it never appeared before also trips the assertion and forces
 the new site into the inventory.
+
+**2026-07-26 — the tripwire earned its keep.** `FIELD_CELL_PAYLOAD32_OFFSET` moved
+from 0 to 1 in the `lib.rs` row when `StringFieldLayout::new`'s compact branch was
+fixed to bias a *primitive* field's offset the same way it already biased a
+*reference* one. The compact layout stores primitives at their natural width with
+no tag word (`classloading/src/class.rs`'s `CompactLayout` builder), so `abs` is
+already the payload address — but every `x64.rs` consumer adds its own
+`FIELD_CELL_PAYLOAD32_OFFSET`, which put the `String.coder` read on `String.hash`
+and the `String.hash` read on `hashIsZero` + padding. A JIT-compiled
+`String.hashCode()` therefore returned garbage, which corrupted every constant
+pool ASM/cglib generated (`org.springframework.asm.SymbolTable.hash` hashes a
+`String` straight into its dedup key). Same session, `String.coder` also moved
+from a 32-bit to an 8-bit load: at natural width it is one byte followed by
+alignment padding whose contents nothing zeroes.
 
 Two self-checks guard the guard:
 

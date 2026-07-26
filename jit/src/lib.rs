@@ -3188,7 +3188,37 @@ impl StringFieldLayout {
                         // Bare 8-byte pointer, no cell tag/payload32 prefix.
                         abs - cratonvm_types::FIELD_CELL_PAYLOAD64_OFFSET as i32
                     } else {
-                        abs
+                        // BUG-STRINGHASH-20260726: a compact-layout PRIMITIVE
+                        // field is just as bare as a reference one -- stored at
+                        // its natural width (FieldStorageKind::size_runtime),
+                        // naturally aligned, with no tag word in front of it
+                        // (see the CompactLayout builder in classloading/src/
+                        // class.rs and read_compact_field in types/src/
+                        // field_layout.rs). So `abs` is ALREADY the payload
+                        // address -- but every x64.rs call site adds its own
+                        // FIELD_CELL_PAYLOAD32_OFFSET (the legacy tagged-cell
+                        // payload bias) on top, so returning `abs` unbiased
+                        // made every primitive read land 4 bytes PAST the
+                        // field.
+                        //
+                        // For java/lang/String under JDK 25 (value:[B @0,
+                        // coder:B @8, hash:I @12, hashIsZero:Z @16) that put
+                        // the `coder` read on `hash` and the `hash` read on
+                        // `hashIsZero` + padding: a JIT-compiled
+                        // String.hashCode() returned whatever garbage sat
+                        // there, or -- when that read zero -- recomputed the
+                        // hash with `hash` misread as `coder`, shifting the
+                        // char count to zero and returning 0.
+                        //
+                        // org.springframework.asm.SymbolTable.hash folds
+                        // String.hashCode() straight into the constant-pool
+                        // dedup key, so once it tiered up every ASM/cglib
+                        // generated class came out with a duplicated constant
+                        // pool and a Code attribute whose name index was 0 --
+                        // "Blocker 2" of docs/known-issues/
+                        // CRATONVM-SPRING-GENUINE-BUGLIST.md
+                        // (AbstractMethodError: ... has no Code attribute).
+                        abs - cratonvm_types::FIELD_CELL_PAYLOAD32_OFFSET as i32
                     };
                 }
             }
@@ -13928,9 +13958,14 @@ mod layout_constant_inventory {
     /// `LAYOUT_CONSTANTS[i]` in that file.
     const INVENTORY: [(&str, [usize; 8]); 2] = [
         // lib.rs: the `use` list near the top, plus `StringFieldLayout::new`'s
-        // `cell()` closure — its compact-layout branch and its legacy
-        // header-plus-cell fallback, each biased by the payload64 offset.
-        ("lib.rs", [3, 1, 2, 1, 0, 0, 0, 2]),
+        // `cell()` closure — its compact-layout branch (biased by payload64
+        // for a reference field and by payload32 for a primitive one) and its
+        // legacy header-plus-cell fallback, biased by the payload64 offset.
+        // The payload32 use was added by BUG-STRINGHASH-20260726: the compact
+        // branch used to return a primitive field's offset UNBIASED, so every
+        // x64.rs `+ FIELD_CELL_PAYLOAD32_OFFSET` call site read 4 bytes past
+        // `String.coder` / `String.hash`.
+        ("lib.rs", [3, 1, 2, 1, 0, 0, 1, 2]),
         // ir_lower.rs: the `use` list, the three compile-time invariants
         // restated at the top of that file, two disp32 field-address
         // computations, two disp8 float array element accesses, and the disp8
