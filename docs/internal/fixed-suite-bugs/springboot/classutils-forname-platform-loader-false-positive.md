@@ -7,6 +7,53 @@ Cluster C (logging bootstrap) batch. Was blocking
 #doesNotRegisterHintsWhenLoggerContextIsNotAvailable` — that class is now
 4/4 passing.
 
+## 2026-07-26 update — the chain's last residual (Console/Mockito) is now also fixed
+
+The Instance-3 writeup in `exception-table-method-state-loss-cluster.md`
+noted `DefaultLogbackConfigurationTests` at 6/7 with the last failure
+described as "an unrelated Mockito/`java.io.Console` mocking limitation."
+That description was wrong: it was another fixable native gap in the same
+family as this doc's own bug. JDK 25 replaced `Console`'s `istty()Z`
+native with `private static native int ttyStatus()`, called once from
+`<clinit>`; CratonVM never registered it, so `<clinit>` threw
+`UnsatisfiedLinkError`, which Mockito's `InlineBytecodeGenerator` (it
+triggers class-init before mocking specifically to report a clean
+`MockitoException` instead of a confusing `NoClassDefFoundError`) surfaced
+as "Mockito cannot mock this class: class java.io.Console." Verified
+against real JDK 25 on the same host/classpath that real HotSpot passes
+this exact test 7/7 — ruling out a genuine Mockito/Console limitation.
+Fixed by registering `java/io/Console.ttyStatus()I` → `0`, mirroring the
+existing `istty()Z` → `false` convention for the same non-interactive
+embedding. `DefaultLogbackConfigurationTests` is now **7/7**.
+
+While verifying the full chain, also confirmed `JavaLoggingSystemTests`
+(Instance 1's target, claimed 12/12) currently shows **11/12** on this
+build — a real, pre-existing failure (`withFile`, empty `spring.log`)
+confirmed present in dev before this session's changes too (not a
+regression from the fix above). Root-caused to a *different*,
+unrelated bug: `apply_jul_config_entries` (`native-builtins/src/
+logmanager.rs`) instantiates every JUL `handlers=` class via a generic
+no-arg `new_object_initialized(cls, "()V", &[])`, but
+`java/util/logging/FileHandler`'s native override
+(`native-builtins/src/phases_late.rs`, `register_p61_logging`) only ever
+registered the `(String)` constructor plus `publish`/`flush`/`close`,
+all keyed off a synthetic 3-field convention (filename=0, level=1,
+closed=2) that does not correspond to the real `java.util.logging
+.Handler` superclass's actual field layout (`manager`, `filter`,
+`formatter`, `logLevel`, `errorManager`, `encoding`, in that declared
+order). A speculative no-arg-constructor native written the same way
+during this investigation successfully read the resolved `.pattern`
+property but still didn't fix the test — most likely because the
+missing real `Handler()` super-constructor path leaves `isLoggable()`'s
+inherited-field reads uninitialized (or, if CratonVM's native
+`ctx.set_field(this, N, ...)` indexes by real declared-field order,
+writing into the *real* `manager`/`filter`/`formatter` slots with
+wrong-typed values instead). That fix was reverted rather than shipped
+half-understood; this needs its own investigation into CratonVM's
+native/real field-index model for `Handler` subclasses, out of scope for
+this doc's ClassUtils/Console lineage. Tracking as a new, separate
+residual — not part of this doc's chain.
+
 ## Retraction — this was never a VM bug either
 
 `org/springframework/util/ClassUtils.forName` (the engine behind
