@@ -4724,10 +4724,25 @@ fn classvalue_cache(
 /// GC root scan hook for the `ClassValue` memoization cache — reports every
 /// cached computed value so the GC keeps it live across compaction. Wired
 /// into `roots.rs` alongside `lang_system::gc_scan_system_singleton_roots`.
-pub fn gc_scan_classvalue_cache_roots(out: &mut Vec<ObjectRef>) {
+///
+/// `metadata_pin_deferrable` is `roots.rs`'s
+/// `VmHeap::metadata_pin_deferrable` (SPB.1 residual fix), threaded in as a
+/// closure so this crate does not need a `cratonvm-gc` dependency. Skipping
+/// `out.push` for a still-young cached value here would be unsound: the
+/// Generational backend's `metadata_pin` consumer runs only inside the
+/// old-gen BFS, so a young value deferred to `metadata_pin` with no other
+/// GC root is silently reclaimed. See `gc/src/vm_heap.rs`'s doc for the full
+/// writeup and `docs/known-issues/spb1-springframework-util-investigation.md`
+/// for the observed corruption shape this pattern produced elsewhere.
+pub fn gc_scan_classvalue_cache_roots(
+    out: &mut Vec<ObjectRef>,
+    metadata_pin_deferrable: &dyn Fn(usize) -> bool,
+) {
     let cache = classvalue_cache().lock().unwrap_or_else(|e| e.into_inner());
     for entry in cache.values() {
-        if cratonvm_types::metadata_pin::metadata_weak_mode() {
+        if cratonvm_types::metadata_pin::metadata_weak_mode()
+            && metadata_pin_deferrable(entry.value.as_ptr() as usize)
+        {
             if let Some(loader) = entry
                 .owner_class_id
                 .and_then(cratonvm_types::loader_pin::loader_pin_addr)

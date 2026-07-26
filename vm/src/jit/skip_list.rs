@@ -1548,39 +1548,34 @@ fn should_skip_jit_internal(
             return Some(SkipReason::RustJvmTestFixture);
         }
 
-        // SPB.1 (Session 112) — provisional blanket ban for the Spring
-        // Framework `org/springframework/util/` package. `ClassUtils.
-        // <clinit>` runs `registerCommonClasses(...)` ~10 times for
-        // primitive / wrapper / collection / common-types groups, putting
-        // ~100 entries into a fresh HashMap. With JIT enabled the run
-        // segfaults right after the log4j-api StatusLogger warning; with
-        // `CRATONVM_DISABLE_JIT=1` the segfault disappears (a different
-        // downstream gap surfaces in PropertiesUtil.<clinit>). The frame
-        // trace shows the very last frame popping is
-        // `ClassUtils.registerCommonClasses` after a long sequence of
-        // `put -> putVal -> newNode -> Node.<init> -> afterNodeInsertion`
-        // cycles — the same allocate-then-putfield archetype documented
-        // in W2-CHM / RBC.1 / EXEC.1. The narrow HashMap entries above
-        // (`putVal`, `newNode`, `treeifyBin`, `hash`, `afterNode*`) cover
-        // the JDK side, but the Spring `ClassUtils.registerCommonClasses`
-        // method itself iterates the input array and calls
-        // `clazz.getName() -> Class.getName() -> String allocation` per
-        // element, which the JIT may compile after the second batch and
-        // miscompile the new String's value/coder slots. Spring's
-        // `ReflectionUtils`, `StringUtils`, etc. share the same
-        // allocate-heavy idioms.
-        //
-        // Like the BouncyCastle ban above, this is a coarse-grained
-        // safety net so SportMe boot can progress past `ClassUtils.
-        // <clinit>`. Lifted by
-        // `CRATONVM_JIT_ALLOW_PACKAGES=org/springframework/util/`. Track
-        // for a real fix once the underlying allocate-then-putfield
-        // miscompile is root-caused.
-        if class_name.starts_with("org/springframework/util/")
-            && !package_allowed("org/springframework/util/", allow_packages)
-        {
-            return Some(SkipReason::RustJvmTestFixture);
-        }
+        // SPB.1 (Session 112) — REMOVED 2026-07-26. This was a provisional
+        // blanket ban for `org/springframework/util/`, on the theory that
+        // `ClassUtils.<clinit>`'s `registerCommonClasses(...)` (~100
+        // `HashMap.put` calls into a fresh map) triggered a JIT
+        // allocate-then-putfield miscompile. Re-investigated 2026-07-26
+        // (`docs/known-issues/spb1-springframework-util-investigation.md`):
+        // three standalone repros against real `spring-core-7.0.7.jar`
+        // found no JIT-specific corruption, but a fourth (GC-pressure +
+        // `URLClassLoader` churn) reproduced real heap corruption with the
+        // ban ACTIVE too — ruling out "this ban prevents the regression".
+        // Root-caused as a GC-root-scanning gap, not a JIT bug: three
+        // `vm/src/memory/roots.rs` sections (static fields, class-lock
+        // objects, CONSTANT_Dynamic roots) and one `class_mirrors` section
+        // deferred a user-defined-loader class's still-YOUNG-generation
+        // object to the `metadata_pin` side-channel instead of rooting it
+        // directly; that channel is consulted only by the Generational
+        // backend's OLD-GEN mark BFS, so a young object with no other root
+        // (the overwhelmingly common case for a static field's value right
+        // after `<clinit>` assigns it) was silently reclaimed and its
+        // memory reused by the class's own next allocation. Fixed via
+        // `VmHeap::metadata_pin_deferrable` (`gc/src/vm_heap.rs`), which
+        // gates the defer on the object actually being in old gen.
+        // Verified: 50/50 clean runs of the doc's repro-3 with the ban kept
+        // and 47/47 clean with it lifted (`CRATONVM_JIT_ALLOW_PACKAGES=
+        // org/springframework/util/`), across 30-round `URLClassLoader`
+        // churn under concurrent GC pressure — no distinct JIT-specific
+        // symptom appears once lifted, so the ban is removed rather than
+        // just left liftable.
 
         // SPB.2 (Session 112 r8) — provisional blanket ban for
         // `org/springframework/core/`. SerializableTypeWrapper.forTypeProvider
