@@ -1008,14 +1008,24 @@ fn glob_segment_matches(pattern: &str, candidate: &str) -> bool {
     pi == pattern.len()
 }
 
-fn resource_name_matches_simple_glob(glob: &str, candidate: &str) -> bool {
-    let Some((prefix, pattern)) = simple_resource_glob(glob) else {
-        return false;
-    };
+/// Match one candidate against an **already-parsed** glob.
+///
+/// Split out of [`resource_name_matches_simple_glob`] so a caller that tests
+/// many candidates against one glob parses the glob once instead of once per
+/// candidate. See [`ClassPath::matching_resource_entry_names`].
+#[inline]
+fn resource_name_matches_parsed_glob(prefix: &str, pattern: &str, candidate: &str) -> bool {
     let Some(tail) = candidate.strip_prefix(prefix) else {
         return false;
     };
     !tail.is_empty() && !tail.contains('/') && glob_segment_matches(pattern, tail)
+}
+
+fn resource_name_matches_simple_glob(glob: &str, candidate: &str) -> bool {
+    let Some((prefix, pattern)) = simple_resource_glob(glob) else {
+        return false;
+    };
+    resource_name_matches_parsed_glob(prefix, pattern, candidate)
 }
 
 /// Parse a `<jar-path>!/<prefix>/` specification of the form produced by
@@ -1116,13 +1126,32 @@ impl ClassPath {
         matches
     }
 
+    /// Every entry name matching `glob`, sorted.
+    ///
+    /// PERF (2026-07-26 classpath-scan audit): the glob is parsed **once**.
+    /// This used to call `resource_name_matches_simple_glob` per candidate,
+    /// which re-ran `simple_resource_glob` — two `contains` scans, an `rfind`,
+    /// and an `is_safe_resource_name` prefix check that is itself six more
+    /// substring scans — for every name in the archive, on a loop-invariant
+    /// string. The caller is `find_all_resource_urls` on the glob path, which
+    /// visits *every* entry name of *every* archive on the classpath; the
+    /// hottest reachable caller is `ClassLoader.getDefinedPackage`
+    /// (`Class.getPackage()` → `"<pkg>/*.class"`), so this ran O(total entry
+    /// names across all jars) times per `getPackage()` call.
+    ///
+    /// An unparseable glob previously made the per-candidate predicate return
+    /// `false` for everything, yielding an empty vec; the early return here is
+    /// the same answer without the walk.
     fn matching_resource_entry_names<'a, I>(names: I, glob: &str) -> Vec<String>
     where
         I: IntoIterator<Item = &'a String>,
     {
+        let Some((prefix, pattern)) = simple_resource_glob(glob) else {
+            return Vec::new();
+        };
         let mut matches: Vec<String> = names
             .into_iter()
-            .filter(|name| resource_name_matches_simple_glob(glob, name))
+            .filter(|name| resource_name_matches_parsed_glob(prefix, pattern, name))
             .cloned()
             .collect();
         matches.sort();
@@ -2803,7 +2832,10 @@ impl ClassPath {
                 let mut resolved: Option<String> = None;
                 for &ver in present.range(9..=JVM_FEATURE_VERSION).rev() {
                     let versioned = format!("META-INF/versions/{ver}/{relative_path}");
-                    if Self::find_in_archive(archive, &versioned).is_some() {
+                    // Existence only — the bytes are re-read below once the
+                    // manifest has committed to the resolved name, so
+                    // inflating here would decompress the entry twice.
+                    if Self::archive_has_entry(archive, &versioned) {
                         resolved = Some(versioned);
                         break;
                     }
@@ -3792,7 +3824,10 @@ impl ClassPath {
                     }
                     let found = classes_cache.contains_key(name) || {
                         let jmod_name = format!("classes/{}", name);
-                        Self::find_in_archive(archive, &jmod_name).is_some()
+                        // URL emission only — never the bytes. Inflating the
+                        // entry here just to discard it made every
+                        // `getResource` hit on a JMOD pay a full deflate.
+                        Self::archive_has_entry(archive, &jmod_name)
                     };
                     if found {
                         let p = path.to_string_lossy().replace('\\', "/");
@@ -4189,6 +4224,19 @@ impl ClassPath {
         Some(path.to_string())
     }
 
+    /// Does `name` exist in the archive?
+    ///
+    /// PERF (2026-07-26 classpath-scan audit): the existence-only callers used
+    /// to spell this `find_in_archive(..).is_some()`, which **inflates the
+    /// whole entry** and throws the bytes away — a full deflate pass (and, in
+    /// debug builds, an extremely slow one) to answer a yes/no. `by_name`
+    /// seeks the central-directory record and builds the reader without
+    /// reading any compressed data, so dropping the reader immediately costs
+    /// only the seek. The mutex is held for the same short window either way.
+    fn archive_has_entry(archive: &Mutex<SharedArchive>, name: &str) -> bool {
+        archive.lock().by_name(name).is_ok()
+    }
+
     /// Helper: try to read a named entry from a mutex-guarded ZipArchive.
     fn find_in_archive(archive: &Mutex<SharedArchive>, name: &str) -> Option<Vec<u8>> {
         let mut guard = archive.lock();
@@ -4367,6 +4415,104 @@ mod tests {
             parse_jar_subdir_spec("/apps/test.war!/WEB-INF/classes/"),
             Some(("/apps/test.war".to_string(), "WEB-INF/classes/".to_string()))
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Glob parse-once refactor (2026-07-26 classpath-scan audit)
+    // -----------------------------------------------------------------------
+
+    /// Hoisting the glob parse out of the per-candidate filter must not change
+    /// which names match. Compare the batch API against the per-candidate
+    /// predicate it replaced, over globs that exercise `*`, `?`, directory
+    /// prefixes, the root, and the reject paths (no wildcard, wildcard in the
+    /// prefix, empty pattern, unsafe prefix).
+    #[test]
+    fn matching_resource_entry_names_agrees_with_per_candidate_predicate() {
+        let names: Vec<String> = [
+            "java/lang/Object.class",
+            "java/lang/String.class",
+            "java/lang/invoke/MethodHandle.class",
+            "java/util/List.class",
+            "Root.class",
+            "java/lang/notes.txt",
+            "java/lang/",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+
+        for glob in [
+            "java/lang/*.class",
+            "java/lang/*",
+            "java/lang/?bject.class",
+            "java/util/*.class",
+            "*.class",
+            "java/*/List.class",      // wildcard in the prefix → unparseable
+            "java/lang/Object.class", // no wildcard → unparseable
+            "java/lang/",             // empty pattern → unparseable
+            "/java/lang/*",           // unsafe prefix → unparseable
+        ] {
+            let batch = ClassPath::matching_resource_entry_names(names.iter(), glob);
+            let mut expected: Vec<String> = names
+                .iter()
+                .filter(|n| resource_name_matches_simple_glob(glob, n))
+                .cloned()
+                .collect();
+            expected.sort();
+            assert_eq!(batch, expected, "glob {glob:?} changed meaning");
+        }
+    }
+
+    /// The parsed and unparsed forms must be the same predicate.
+    #[test]
+    fn parsed_glob_predicate_matches_unparsed_form() {
+        let glob = "java/lang/*.class";
+        let (prefix, pattern) = simple_resource_glob(glob).expect("glob must parse");
+        for candidate in [
+            "java/lang/Object.class",
+            "java/lang/invoke/MethodHandle.class",
+            "java/util/List.class",
+            "java/lang/",
+            "",
+        ] {
+            assert_eq!(
+                resource_name_matches_parsed_glob(prefix, pattern, candidate),
+                resource_name_matches_simple_glob(glob, candidate),
+                "candidate {candidate:?} disagreed"
+            );
+        }
+    }
+
+    /// `archive_has_entry` must answer exactly what `find_in_archive` answers,
+    /// without paying for the inflate. Uses a Deflated entry so the two paths
+    /// genuinely differ in work done.
+    #[test]
+    fn archive_has_entry_agrees_with_find_in_archive() {
+        let dir = std::env::temp_dir().join("cratonvm_archive_has_entry");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let jar_path = dir.join("probe.jar");
+        {
+            let file = fs::File::create(&jar_path).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            zip.start_file("pkg/present.txt", options).unwrap();
+            zip.write_all(&b"payload".repeat(512)).unwrap();
+            zip.finish().unwrap();
+        }
+        let backing = read_archive_for_classpath(&jar_path).unwrap();
+        let archive: Mutex<SharedArchive> =
+            Mutex::new(ZipArchive::new(Cursor::new(backing)).unwrap());
+
+        for name in ["pkg/present.txt", "pkg/absent.txt", "", "pkg/"] {
+            assert_eq!(
+                ClassPath::archive_has_entry(&archive, name),
+                ClassPath::find_in_archive(&archive, name).is_some(),
+                "existence verdict for {name:?} diverged"
+            );
+        }
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -75,9 +75,68 @@
 //! bounded to the exact set of methods that the worklist verifier cannot
 //! model. Java 7+ classes that ship `StackMapTable` and no subroutines take
 //! the fast path through `bytecode_verifier::verify_bytecode` unchanged.
+//!
+//! ## Type maps and the `jsr`/`ret` decision (arch-2026-07-26)
+//!
+//! [`super::type_maps`] retains what verification proves: a per-pc reference
+//! layout of the local array and the operand stack, published per class into a
+//! process-wide side table so the GC root scan and the interpreter fast path
+//! can consume a *proof* instead of scanning conservatively. That recording
+//! rides inside `bytecode_verifier::verify_bytecode`, which this module
+//! **bypasses** for any class containing a subroutine-using method.
+//!
+//! Two things follow, and they are deliberately treated differently:
+//!
+//! 1. **Non-subroutine methods in a subroutine-bearing class were collateral
+//!    damage.** One legacy `try-finally` in one method routed the *whole class*
+//!    down [`verify_class_bytecode_inner`]'s per-method path, so every ordinary
+//!    method in it lost its maps even though [`verify_method_typestate`] /
+//!    [`verify_pre_java7_inference`] type-state-verify them exactly as
+//!    `bytecode_verifier` would. Those two functions now build the same
+//!    [`MethodTypeMapsBuilder`] and the class publishes a [`ClassTypeMaps`], so
+//!    the loss is bounded to the subroutine methods themselves.
+//!
+//! 2. **Subroutine-using methods stay deliberately unproven — this is a
+//!    decision, not an oversight.** They publish an *empty* map carrying
+//!    [`FastPathVeto::Subroutine`] (see [`subroutine_unproven_maps`]): zero
+//!    rows, so `oop_map_at` answers `None` at every pc (= "unproven, scan
+//!    conservatively") and `safe_for_fast_path` is denied, but
+//!    `fast_path_veto()` tells a consumer *why*, which distinguishes
+//!    "deliberately conservative" from "class was never verified".
+//!
+//! The reason we do not simply run the existing worklist
+//! ([`verify_pre_java7_inference`]) over subroutine methods and record its
+//! result is that **the maps it would produce are unsound in both
+//! directions**, which is strictly worse than no maps:
+//!
+//!   * **Missed roots.** JVMS §4.10.2.5 mandates per-call-site subroutine
+//!     inlining precisely because a subroutine typically does *not* touch most
+//!     of the caller's locals. A naive worklist merges all call sites at the
+//!     subroutine entry, so a local that holds a reference on the path from
+//!     `jsr` site A and an int on the path from `jsr` site B becomes
+//!     `ref ⊔ int = Top` throughout the subroutine body — recorded as *not a
+//!     reference*. Unlike an ordinary merge-to-`Top`, that slot is **not
+//!     dead**: after `ret` control returns to site A, where the slot is read as
+//!     a reference again. Failing to scan it is a missed root, i.e. heap
+//!     corruption. The "unusable ⇒ dead ⇒ safe not to scan" argument that makes
+//!     `Top` sound everywhere else does not hold across a `ret` edge.
+//!   * **Non-references scanned as references.** The worklist does not even
+//!     reach a fixpoint on these methods: the `astore` that saves the return
+//!     address fails on the collapsed `Top` and the walk aborts. Rows written
+//!     before the abort come from an unconverged state, so a slot can be
+//!     recorded as a reference on the strength of one predecessor while another
+//!     predecessor (not yet processed) supplies an int. Scanning an int as an
+//!     oop is an immediate crash, not a conservative over-approximation.
+//!
+//! Closing this properly requires the real §4.10.2.5 subroutine-inlining
+//! analysis (HotSpot does it in `GenerateOopMap`, not in its type checker) —
+//! the same ~1k LOC of work the load-policy above already defers. Until then
+//! the honest answer for these methods is `None`, and it is recorded as such.
+//! The blast radius is bounded by JVMS §4.9.1: `jsr`/`ret` are illegal at
+//! class-file major ≥ 51, so no class compiled for Java 7 (2011) or later can
+//! reach this path at all.
 
 use std::collections::{HashMap, HashSet};
-#[cfg(test)]
 use std::sync::Arc;
 use std::sync::OnceLock;
 
@@ -90,6 +149,7 @@ use cratonvm_reader::stack_map::StackMapTable;
 use cratonvm_reader::verified_code::verified_code;
 
 use super::class::{find_method_recursive, Class, ClassStore};
+use super::type_maps::{ClassTypeMaps, FastPathVeto, MethodTypeMaps, MethodTypeMapsBuilder};
 use super::verify_frame::VerificationFrame;
 use super::verify_insn::verify_instruction;
 use super::vtype::{param_types_from_descriptor, ClassHierarchy, VType};
@@ -246,11 +306,28 @@ fn verify_class_bytecode_inner(
     let legal_pre_java7_subroutines = class.version.major <= ClassFileVersion::JAVA_6.major;
     let accept_subroutines = allow_jsr || legal_pre_java7_subroutines;
 
+    // TYPE MAPS (arch-2026-07-26/classloading-verify-and-resolve): this path
+    // is the reason subroutine-bearing classes used to answer `Unknown` to
+    // every `type_maps_for` query — it never calls
+    // `bytecode_verifier::verify_bytecode`, which is where the recording
+    // lives. We now collect a per-method result here too, in `class.methods`
+    // order (abstract/native methods contribute `None` so positions stay
+    // aligned with `Class::methods`, which is what `ClassTypeMaps` indexes
+    // by), and publish once the whole class has verified.
+    //
+    // Unconditional on the default path: no cargo feature, no `CRATONVM_*`
+    // variable, no opt-in. The one class of methods that gets no rows is the
+    // subroutine-using ones, and that is an explicit, reasoned `None` — see
+    // the module docs and `subroutine_unproven_maps`.
+    let mut collected: Vec<(Arc<str>, Arc<str>, Option<MethodTypeMaps>)> =
+        Vec::with_capacity(class.methods.len());
+
     // At least one method in this class uses jsr/ret. Walk methods
     // individually so we can apply the structural-only fallback to the
     // subroutine-using ones while still type-state-verifying the rest.
     for method in class.methods.iter() {
         if method.is_abstract() || method.is_native() {
+            collected.push((method.name.clone(), method.descriptor.clone(), None));
             continue;
         }
         if method_uses_jsr_or_ret(method) {
@@ -278,17 +355,64 @@ fn verify_class_bytecode_inner(
                     ),
                 });
             }
+            // TYPE MAPS: an explicit "proven nothing, and here is why" entry
+            // rather than silence. Zero rows, so every `oop_map_at` answers
+            // `None` (scan conservatively); `fast_path_veto()` reports
+            // `Subroutine`. Fabricating an empty *bitmap* instead — i.e. rows
+            // that claim "no references live here" — would be a missed-root
+            // bug; see the module docs for why the worklist cannot be trusted
+            // on these methods.
+            collected.push((
+                method.name.clone(),
+                method.descriptor.clone(),
+                Some(subroutine_unproven_maps(method)),
+            ));
         } else {
             // Non-subroutine method: full type-state verification.
             // Performs the same algorithm as
             // `bytecode_verifier::verify_method` but in isolation per
             // method, so a real bug in this method cannot be masked by
             // a tolerated failure in a JSR-using method.
-            verify_method_typestate(class, method, hierarchy, strict)?;
+            //
+            // TYPE MAPS: this walk is a real, complete type-state proof, so it
+            // yields real maps — a legacy `finally` in a *sibling* method no
+            // longer costs this one its precise oop maps.
+            let maps = verify_method_typestate(class, method, hierarchy, strict)?;
+            collected.push((method.name.clone(), method.descriptor.clone(), maps));
         }
     }
 
+    // Publish only after every method verified: a class that fails
+    // verification is never loaded, so half-built maps must not be visible.
+    // `publish_class_type_maps` is a CAS install — if `verify_bytecode` also
+    // ran for this class the first writer wins and this is a no-op.
+    crate::type_maps::publish_class_type_maps(class.id, ClassTypeMaps::new(collected));
+
     Ok(())
+}
+
+/// The deliberate "unproven" entry for a `jsr`/`ret` method.
+///
+/// Zero rows, so [`MethodTypeMaps::oop_map_at`] answers `None` at *every* pc —
+/// which the type-map contract defines as "unproven, scan conservatively",
+/// never as "no references live here". The
+/// [`FastPathVeto::Subroutine`] tag is what makes the fallback diagnosable:
+/// a consumer that finds `type_maps_for(..)` → `Some(m)` with
+/// `m.fast_path_veto() == Some(FastPathVeto::Subroutine)` knows the conservative
+/// answer is a recorded decision, not an unverified class.
+///
+/// See the module docs for why running the worklist over these methods and
+/// recording *its* answer would be actively wrong rather than merely imprecise.
+fn subroutine_unproven_maps(method: &ClassFileMethod) -> MethodTypeMaps {
+    let (max_locals, max_stack) = match method.code() {
+        Some(code) => (code.max_locals, code.max_stack),
+        None => (0, 0),
+    };
+    let mut builder = MethodTypeMapsBuilder::new(max_locals, max_stack);
+    builder.mark_unsafe_for_fast_path(FastPathVeto::Subroutine);
+    // `finish(false)` would also veto with `IncompleteWalk`; the first veto
+    // wins, so `Subroutine` — the informative one — is what survives.
+    builder.finish(false)
 }
 
 /// Single-method type-state verification mirroring the algorithm used by
@@ -310,6 +434,10 @@ fn verify_class_bytecode_inner(
 /// Mirrors the invariants of `verify_method`. Imports the structural
 /// out-of-range check from `verify_method_structural_only` because the
 /// type-state path needs to reject malformed bytecode the same way.
+///
+/// TYPE MAPS: on success returns the [`MethodTypeMaps`] this walk proved.
+/// `None` means there was nothing to describe (no `Code` attribute, or an
+/// empty one), which consumers treat as "unproven".
 fn verify_method_typestate(
     class: &Class,
     method: &ClassFileMethod,
@@ -318,18 +446,18 @@ fn verify_method_typestate(
     // per-branch-target frame checking; `false` only for pre-verified trusted
     // bootstrap classes.
     strict: bool,
-) -> Result<(), LinkageError> {
+) -> Result<Option<MethodTypeMaps>, LinkageError> {
     // Structural sanity is a prerequisite for type-state verification:
     // we can't walk instructions if the bytecode itself is malformed.
     verify_method_structural_only(class, method)?;
 
     let code_attr = match method.code() {
         Some(c) => c,
-        None => return Ok(()),
+        None => return Ok(None),
     };
     let bytecode = &code_attr.code;
     if bytecode.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
 
     let cp = &class.constant_pool;
@@ -369,7 +497,11 @@ fn verify_method_typestate(
             // not `Clone`able, we instead replicate the inference
             // worklist here. The algorithm is the same that lives in
             // `bytecode_verifier::verify_by_inference`.
-            return verify_pre_java7_inference(class, method, hierarchy);
+            //
+            // TYPE MAPS: that path serializes its settled fixpoint, which is
+            // authoritative at every pc it covers (exception edges included),
+            // so it needs no extra care here.
+            return verify_pre_java7_inference(class, method, hierarchy).map(Some);
         }
         // No branches, no handlers — fall through to the linear walk
         // below.
@@ -460,9 +592,47 @@ fn verify_method_typestate(
     let mut new_site_classes: std::collections::HashMap<u16, std::sync::Arc<str>> =
         std::collections::HashMap::new();
 
+    // TYPE MAPS: ride the walk below. Rows are recorded at instruction starts
+    // with the type-state that holds immediately BEFORE the instruction
+    // executes — after any declared StackMapTable frame or exception-handler
+    // frame has been adopted, which is the state the interpreter and the GC
+    // root scan actually observe at that pc.
+    let mut type_maps = MethodTypeMapsBuilder::new(code_attr.max_locals, code_attr.max_stack);
+    // `bytecode.len() / 2` is a floor on instruction density (the shortest
+    // instruction is one byte, the average is ~2-3); `reserve` clamps it.
+    type_maps.reserve(bytecode.len() / 2 + 1);
+    // Cleared whenever the walk skips a region or reaches a pc whose
+    // type-state it cannot vouch for; denies `safe_for_fast_path`.
+    let mut walk_complete = true;
+
     let mut pc = 0usize;
     let mut current = initial;
     let mut verified = true;
+    // TYPE MAPS: is `current` the real entry state for *this* pc?
+    //
+    // `verified` alone is not enough, and the difference matters for
+    // soundness rather than precision. `verified` tracks only whether the
+    // PREVIOUS instruction fell through; it is never re-armed when a declared
+    // frame or a handler frame is adopted, and the unreachable-code guard
+    // below is conditioned on `requires_stack_map`. So there are two pcs at
+    // which `current` is a *stale* frame from an unrelated predecessor:
+    //
+    //   * pre-Java-7 classes that ship a `StackMapTable` (`requires_stack_map`
+    //     is false, so the guard never fires) walking dead code after a
+    //     `goto` / `return` / `athrow` that has no declared frame; and
+    //   * a handler pc that is ALSO reachable by fall-through — the handler
+    //     frame is installed only under `!verified`, so when control does fall
+    //     through, `current` describes the fall-through state while the
+    //     exception edge can enter the same pc with a different locals state
+    //     and `[throwable]` on the stack. The two are never merged.
+    //
+    // Type-checking against a stale frame is a pre-existing laxity of this
+    // walk. RECORDING one would be a different and much worse thing: a row
+    // that claims a slot holds a reference when the other edge supplies an
+    // int (an oop scan of a non-oop — an immediate crash), or claims it holds
+    // none when the other edge supplies a live reference (a missed root).
+    // So those pcs record nothing and the method loses `safe_for_fast_path`.
+    let mut authoritative = true;
     while pc < bytecode.len() {
         if let Some(declared) = declared_frames.get(&(pc as u16)) {
             if verified && !current.is_assignable_to(declared, hierarchy) {
@@ -478,6 +648,8 @@ fn verify_method_typestate(
             let mut adopted = declared.clone();
             adopted.pad_locals_to(code_attr.max_locals);
             current = adopted;
+            // A declared frame IS the authoritative merge-point state.
+            authoritative = true;
         }
 
         if let Some(catch_type) = handler_targets.get(&(pc as u16)) {
@@ -492,6 +664,13 @@ fn verify_method_typestate(
                         message: format!("exception handler stack overflow at offset {pc}"),
                     })?;
                 current = handler_frame;
+                authoritative = true;
+            } else if declared_frames.get(&(pc as u16)).is_none() {
+                // Handler entry that is also reachable by fall-through, with no
+                // declared frame to reconcile the two. `current` describes only
+                // the fall-through edge; the exception edge is unrepresented.
+                // Record nothing here rather than a half-true row.
+                authoritative = false;
             }
         }
 
@@ -515,6 +694,12 @@ fn verify_method_typestate(
                 });
             }
             // Lenient mode — skip unreachable code silently.
+            //
+            // TYPE MAPS: no row for a skipped pc (`oop_map_at` → `None` →
+            // scan conservatively), and the method loses `safe_for_fast_path`
+            // — the unchecked interpreter handlers need every executed
+            // instruction proven, not merely most of them.
+            walk_complete = false;
             let (_, next_pc) = match Instruction::decode(bytecode, pc) {
                 Ok(r) => r,
                 Err(_) => break,
@@ -523,12 +708,24 @@ fn verify_method_typestate(
             continue;
         }
 
+        // TYPE MAPS: capture the proven reference layout at this instruction
+        // start. See the `authoritative` declaration for why this is guarded.
+        if authoritative {
+            type_maps.record(pc as u32, &current);
+        } else {
+            walk_complete = false;
+        }
+
         let (insn, next_pc) =
             Instruction::decode(bytecode, pc).map_err(|e| LinkageError::VerifyError {
                 class_name: class_name.to_string(),
                 method_name: method.name.to_string(),
                 message: format!("failed to decode instruction at offset {pc}: {e}"),
             })?;
+
+        // TYPE MAPS: fold this instruction into the per-method fast-path
+        // safety proof (local-slot operand bounds, jsr/ret, stray `wide`).
+        type_maps.observe_instruction(&insn);
 
         // Record the class created by a `new` so a later `invokespecial
         // <init>` on the resulting `Uninitialized(pc)` can be owner-matched.
@@ -604,10 +801,14 @@ fn verify_method_typestate(
         if !result.falls_through && next_pc < bytecode.len() {
             verified = false;
         }
+        // TYPE MAPS: the next pc inherits an authoritative frame only when
+        // control actually flows into it from here. Otherwise it needs a
+        // declared frame or a handler frame to re-arm (see the loop head).
+        authoritative = authoritative && result.falls_through && next_pc < bytecode.len();
         pc = next_pc;
     }
 
-    Ok(())
+    Ok(Some(type_maps.finish(walk_complete)))
 }
 
 /// Pre-Java-7 worklist type inference for a single method.
@@ -615,14 +816,27 @@ fn verify_method_typestate(
 /// Mirrors `bytecode_verifier::verify_by_inference`. Used only for
 /// non-JSR pre-Java-7 methods (subroutine-using methods take the
 /// structural-only fallback before reaching here).
+///
+/// TYPE MAPS: when the worklist settles, `frame_at` *is* the answer — it maps
+/// every reachable instruction start to its fixpoint entry type-state,
+/// including exception-handler entries (they are merged in below, unlike the
+/// linear StackMapTable walk). The maps are serialized from that map, so this
+/// path performs no extra dataflow; it only writes down dataflow it already
+/// finished. Every pc the worklist did not reach is simply absent
+/// (`oop_map_at` → `None` → scan conservatively).
 fn verify_pre_java7_inference(
     class: &Class,
     method: &ClassFileMethod,
     hierarchy: &dyn ClassHierarchy,
-) -> Result<(), LinkageError> {
+) -> Result<MethodTypeMaps, LinkageError> {
     let code_attr = match method.code() {
         Some(c) => c,
-        None => return Ok(()),
+        None => {
+            // No body to describe. An empty builder yields zero rows, so every
+            // pc answers `None` — the same conservative answer, minus the
+            // special case in the caller.
+            return Ok(MethodTypeMapsBuilder::new(0, 0).finish(false));
+        }
     };
     let bytecode = &code_attr.code;
     let cp = &class.constant_pool;
@@ -812,7 +1026,35 @@ fn verify_pre_java7_inference(
         }
     }
 
-    Ok(())
+    // -----------------------------------------------------------------------
+    // TYPE MAPS: serialize the settled fixpoint.
+    // -----------------------------------------------------------------------
+    //
+    // `frame_at[pc]` is the merged type-state on ENTRY to the instruction at
+    // `pc` — exactly what the interpreter and the GC root scan observe when a
+    // frame's pc is `pc`. Rows must be emitted in ascending pc order because
+    // `MethodTypeMaps` indexes them with a binary search.
+    let mut type_maps = MethodTypeMapsBuilder::new(code_attr.max_locals, code_attr.max_stack);
+    type_maps.reserve(frame_at.len());
+    let mut ordered: Vec<usize> = frame_at.keys().copied().collect();
+    ordered.sort_unstable();
+
+    // Coverage is whatever the worklist reached. Anything it did not reach is
+    // absent from the map (`oop_map_at` → `None` → conservative), and a decode
+    // failure at a recorded pc denies `safe_for_fast_path`.
+    let mut walk_complete = true;
+    for pc in ordered {
+        let Some(frame) = frame_at.get(&pc) else {
+            continue;
+        };
+        type_maps.record(pc as u32, frame);
+        match Instruction::decode(bytecode, pc) {
+            Ok((insn, _)) => type_maps.observe_instruction(&insn),
+            Err(_) => walk_complete = false,
+        }
+    }
+
+    Ok(type_maps.finish(walk_complete))
 }
 
 /// Merge `incoming` into the frame at `target_pc` in the frame map.
@@ -2484,6 +2726,228 @@ mod tests {
             accepted_hatch.is_ok(),
             "with CRATONVM_ALLOW_JSR_RET the structurally-valid subroutine method \
              must be accepted (structural-only), got {accepted_hatch:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // TYPE MAPS on the subroutine path (arch-2026-07-26)
+    // -----------------------------------------------------------------------
+
+    /// Build a pre-Java-7 class carrying an explicit `ClassId` and an arbitrary
+    /// method list.
+    ///
+    /// The type-map store is a process-wide side table with first-writer-wins
+    /// install semantics, so every test that publishes must own a distinct
+    /// `ClassId` or it will read another test's maps under `cargo test`'s
+    /// parallel harness. The 90_00x range is reserved for these tests.
+    fn make_pre_java7_class_with_id(raw_id: u32, methods: Vec<ClassFileMethod>) -> Class {
+        let mut class = make_pre_java7_jsr_class("placeholder", "()V", 1, 1, vec![0xb1], vec![]);
+        class.id = ClassId::new(raw_id);
+        class.methods = methods;
+        class
+    }
+
+    /// A method with a `Code` attribute and no subroutine opcodes.
+    fn plain_method(name: &str, code: Vec<u8>, max_stack: u16, max_locals: u16) -> ClassFileMethod {
+        ClassFileMethod {
+            access_flags: MethodAccessFlags::PUBLIC,
+            name: Arc::from(name),
+            descriptor: Arc::from("()V"),
+            attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
+                max_stack,
+                max_locals,
+                code: cratonvm_reader::ByteView::from_vec(code),
+                exception_table: vec![],
+                attributes: vec![],
+            }))],
+        }
+    }
+
+    /// The double-`jsr` body used by the acceptance tests above.
+    fn double_jsr_method(name: &str) -> ClassFileMethod {
+        ClassFileMethod {
+            access_flags: MethodAccessFlags::PUBLIC,
+            name: Arc::from(name),
+            descriptor: Arc::from("()V"),
+            attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
+                max_stack: 1,
+                max_locals: 1,
+                code: cratonvm_reader::ByteView::from_vec(vec![
+                    0xa8, 0x00, 0x09, // 0: jsr +9
+                    0xa8, 0x00, 0x06, // 3: jsr +6
+                    0xb1, // 6: return
+                    0x00, 0x00, // 7..8: nop padding
+                    0x4b, // 9: astore_0
+                    0xa9, 0x00, // 10: ret 0
+                ]),
+                exception_table: vec![],
+                attributes: vec![],
+            }))],
+        }
+    }
+
+    /// REGRESSION: a single legacy `finally` used to cost the **whole class**
+    /// its type maps.
+    ///
+    /// `verify_class_bytecode_inner` routes a subroutine-bearing class down its
+    /// own per-method path, which never calls
+    /// `bytecode_verifier::verify_bytecode` — the only place that used to
+    /// publish. So `verification_status` answered `Unknown` and *every* method,
+    /// including the ordinary ones that were fully type-state verified, fell
+    /// back to conservative scanning. It must now publish.
+    #[test]
+    fn subroutine_bearing_class_publishes_maps_for_its_non_jsr_methods() {
+        let class = make_pre_java7_class_with_id(
+            90_001,
+            vec![
+                // aload_0; astore_0; return — no branches, no handlers, no jsr.
+                plain_method("plain", vec![0x2a, 0x4b, 0xb1], 1, 1),
+                double_jsr_method("legacyFinally"),
+            ],
+        );
+        let res = verify_class_bytecode_inner(&class, &PermissiveHierarchy, false);
+        assert!(
+            res.is_ok(),
+            "legal pre-Java-7 class must verify, got {res:?}"
+        );
+
+        assert_eq!(
+            crate::type_maps::verification_status(class.id),
+            crate::type_maps::VerificationStatus::Verified,
+            "a subroutine-bearing class must no longer answer Unknown"
+        );
+
+        let plain = crate::type_maps::type_maps_for(class.id, 0)
+            .expect("the non-jsr method must have maps");
+        // pc 0 is an instruction start with a proven layout.
+        let locals = plain.local_oops_at(0).expect("pc 0 must be described");
+        assert!(
+            locals.get(0),
+            "local 0 of an instance method is `this`, a reference"
+        );
+        assert_eq!(
+            plain.stack_depth_at(0),
+            Some(0),
+            "the operand stack is empty on entry"
+        );
+        // pc 1 is after `aload_0`: one reference on the stack.
+        assert_eq!(plain.stack_depth_at(1), Some(1));
+        assert!(
+            plain
+                .stack_oops_at(1)
+                .expect("pc 1 must be described")
+                .get(0),
+            "the value `aload_0` pushed is a reference"
+        );
+        assert!(
+            plain.safe_for_fast_path(),
+            "a straight-line method with in-range local operands is fast-path safe; \
+             veto was {:?}",
+            plain.fast_path_veto()
+        );
+    }
+
+    /// The subroutine method itself stays conservative — but *explicitly*.
+    ///
+    /// The contract is that `None` from `oop_map_at` means "unproven", never
+    /// "no references live here". A fabricated all-clear bitmap would be a
+    /// missed-root bug (JVMS §4.10.2.5 subroutine inlining exists precisely
+    /// because a naive merge collapses a caller's live reference to `Top` for
+    /// the duration of the subroutine, and that slot is read as a reference
+    /// again after `ret`). So the method publishes a *row-less* map whose veto
+    /// names the reason.
+    #[test]
+    fn jsr_method_map_is_explicitly_unproven_not_fabricated_empty() {
+        let class = make_pre_java7_class_with_id(
+            90_002,
+            vec![
+                double_jsr_method("legacyFinally"),
+                plain_method("plain", vec![0xb1], 1, 1),
+            ],
+        );
+        let res = verify_class_bytecode_inner(&class, &PermissiveHierarchy, false);
+        assert!(
+            res.is_ok(),
+            "legal pre-Java-7 class must verify, got {res:?}"
+        );
+
+        let jsr = crate::type_maps::type_maps_for(class.id, 0)
+            .expect("the jsr method must have an explicit entry, not silence");
+        assert_eq!(
+            jsr.entry_count(),
+            0,
+            "no row may be fabricated for a method whose type-state is unproven"
+        );
+        for pc in 0..12u32 {
+            assert!(
+                jsr.oop_map_at(pc).is_none(),
+                "pc {pc} must answer `None` (unproven → scan conservatively)"
+            );
+            assert!(jsr.local_oops_at(pc).is_none());
+            assert!(jsr.stack_oops_at(pc).is_none());
+        }
+        assert!(
+            !jsr.safe_for_fast_path(),
+            "a subroutine method must never take the unchecked interpreter path"
+        );
+        assert_eq!(
+            jsr.fast_path_veto(),
+            Some(FastPathVeto::Subroutine),
+            "the veto reason is what makes the conservative fallback diagnosable \
+             rather than indistinguishable from an unverified class"
+        );
+    }
+
+    /// Abstract and native methods must still occupy their position so
+    /// `ClassTypeMaps` indices line up with `Class::methods`.
+    #[test]
+    fn subroutine_class_type_map_indices_track_class_methods() {
+        let class = make_pre_java7_class_with_id(
+            90_003,
+            vec![
+                make_method("abs", "()V", MethodAccessFlags::ABSTRACT, false),
+                double_jsr_method("legacyFinally"),
+                make_method("nat", "()V", MethodAccessFlags::NATIVE, false),
+                plain_method("plain", vec![0x2a, 0x4b, 0xb1], 1, 1),
+            ],
+        );
+        let res = verify_class_bytecode_inner(&class, &PermissiveHierarchy, false);
+        assert!(res.is_ok(), "class must verify, got {res:?}");
+
+        let maps = crate::type_maps::class_type_maps(class.id).expect("maps must be published");
+        assert_eq!(maps.method_count(), 4, "one entry per Class::methods slot");
+        assert!(maps.method(0).is_none(), "abstract method has no body");
+        assert_eq!(
+            maps.method(1).and_then(|m| m.fast_path_veto()),
+            Some(FastPathVeto::Subroutine)
+        );
+        assert!(maps.method(2).is_none(), "native method has no body");
+        assert!(
+            maps.method(3).is_some_and(|m| m.entry_count() > 0),
+            "the plain method at index 3 must carry real rows"
+        );
+        // The by-name path must agree with the by-index path.
+        assert_eq!(
+            crate::type_maps::type_maps_for_named(class.id, "plain", "()V")
+                .map(|m| m.entry_count()),
+            maps.method(3).map(|m| m.entry_count())
+        );
+    }
+
+    /// A class that fails verification must publish nothing: a half-built map
+    /// for a class that never loads would be visible to the GC forever.
+    #[test]
+    fn failed_subroutine_class_publishes_no_maps() {
+        let mut class =
+            make_pre_java7_class_with_id(90_004, vec![double_jsr_method("legacyFinally")]);
+        // Major ≥ 51 makes the subroutine opcodes illegal (JVMS §4.9.1).
+        class.version = ClassFileVersion::JAVA_7;
+        let res = verify_class_bytecode_inner(&class, &PermissiveHierarchy, false);
+        assert!(res.is_err(), "subroutine at major 51 must be rejected");
+        assert_eq!(
+            crate::type_maps::verification_status(class.id),
+            crate::type_maps::VerificationStatus::Unknown,
+            "a class that failed verification must leave no maps behind"
         );
     }
 
