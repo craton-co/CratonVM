@@ -4025,54 +4025,98 @@ fn cce_enhance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult 
             ),
         );
     }
-    let (new_name, bytes) =
+    // The generated `$$SpringCGLIB$$<n>` suffix is numbered per
+    // `(super_loader_id, super_internal_name)` by
+    // `next_config_enhancer_counter`, so the FIRST enhancement of a given
+    // `@Configuration` class under a given loader is always `$$0` — which
+    // several tests hardcode. Define it into THAT loader, not unconditionally
+    // into the application loader (0): real cglib defines its subclass into the
+    // superclass's own loader, and a per-loader counter is only collision-free
+    // inside a per-loader namespace.
+    //
+    // Under `@CompileWithForkedClassLoader` the same `@Configuration` class is
+    // re-loaded by a fresh child loader for each test method, so the second,
+    // genuinely distinct `CglibConfiguration` correctly missed the cache,
+    // correctly drew `$$0` from its own fresh counter — and then collided with
+    // the FIRST loader's `$$0` in the application loader's single flat
+    // namespace (`IncompatibleClassChangeError: ... already defined by
+    // application loader`). The old code answered that collision by returning
+    // the ORIGINAL, UN-enhanced class, which surfaced downstream as
+    // `IllegalArgumentException: class ...CglibConfiguration is not an enhanced
+    // class` from `Enhancer.registerStaticCallbacks` during AOT replay, and as
+    // a `@Bean` body running twice ("Hello1" instead of "Hello0") when the
+    // un-enhanced config class was instantiated directly. Those are exactly the
+    // two long-standing `ApplicationContextAotGeneratorTests
+    // $ConfigurationClassCglibProxy` cross-test residuals: both pass in
+    // isolation (one loader, no collision) and failed 100% deterministically in
+    // the full 40-method class run.
+    let mut attempt = 0u32;
+    let (mut new_name, mut bytes) =
         build_enhancer_class(super_loader_id, &super_name, &bean_methods, &ctor_descriptors);
 
-    let opts = DefineClassFull {
-        override_name: Some(new_name.clone()),
-        skip_verification: true,
-        ..Default::default()
+    let (cid, new_name, bytes_arc) = loop {
+        let opts = DefineClassFull {
+            override_name: Some(new_name.clone()),
+            skip_verification: true,
+            ..Default::default()
+        };
+        let bytes_arc = std::sync::Arc::new(std::mem::take(&mut bytes));
+        match ctx.define_class_full(&new_name, &bytes_arc, super_loader_id, opts) {
+            Ok(cid) => break (cid, new_name, bytes_arc),
+            // Belt and braces for any remaining way the name can already be
+            // taken in the target namespace (a loader that delegates the name to
+            // a parent; a cache entry the class registry outlived; …): burn the
+            // counter and try the next suffix rather than hand back an
+            // un-enhanced class, which is always wrong. A differently numbered
+            // but genuinely enhanced class still satisfies every behavioural
+            // assertion — only assertions over generated *source text* care
+            // about the number, and the per-loader define above is what keeps
+            // those at `$$0`.
+            Err(msg) if attempt < 16 && msg.contains("already defined") => {
+                attempt += 1;
+                let (retry_name, retry_bytes) = build_enhancer_class(
+                    super_loader_id,
+                    &super_name,
+                    &bean_methods,
+                    &ctor_descriptors,
+                );
+                eprintln!(
+                    "[CCE] enhance: {new_name} already defined in loader {super_loader_id} — retrying as {retry_name}",
+                );
+                new_name = retry_name;
+                bytes = retry_bytes;
+            }
+            Err(msg) => {
+                eprintln!(
+                    "[CCE] enhance: define_class_full failed for {new_name}: {msg} — fallback to identity",
+                );
+                return Ok(Some(Value::Object(Some(cls_mirror))));
+            }
+        }
     };
 
-    let bytes_arc = std::sync::Arc::new(bytes);
-    match ctx.define_class_full(&new_name, &bytes_arc, 0, opts) {
-        Ok(cid) => {
-            config_enhancer_class_cache()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(cache_key, (cid, new_name.clone(), bytes_arc.clone()));
-            let mirror = ctx.get_class_mirror(cid);
-            eprintln!(
-                "[CCE] enhance: defined {new_name} (super={super_name}, marker={SPRING_MARKER_IFACE}, intercepted @Bean methods={})",
-                bean_methods.len(),
-            );
-            notify_generated_class_handler(ctx, receiver_loader_id, &new_name, &bytes_arc);
-            // See `build_fastclass_placeholder`'s doc comment: real cglib
-            // always emits two FastClass helper classes alongside the
-            // enhancer itself; our dispatch never needs them, but AOT's
-            // `isRegisteredCglibClass` test asserts their presence (bytes +
-            // reflection hint) regardless, and `notify_generated_class_handler`
-            // is a no-op outside AOT processing (no handler installed), so
-            // this is safe to call unconditionally.
-            for suffix in ["FastClass$$0", "FastClass$$1"] {
-                let fastclass_name = format!("{super_name}$$SpringCGLIB$${suffix}");
-                let fastclass_bytes = build_fastclass_placeholder(&fastclass_name);
-                notify_generated_class_handler(
-                    ctx,
-                    receiver_loader_id,
-                    &fastclass_name,
-                    &fastclass_bytes,
-                );
-            }
-            Ok(Some(Value::Object(Some(mirror))))
-        }
-        Err(msg) => {
-            eprintln!(
-                "[CCE] enhance: define_class_full failed for {new_name}: {msg} — fallback to identity",
-            );
-            Ok(Some(Value::Object(Some(cls_mirror))))
-        }
+    config_enhancer_class_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(cache_key, (cid, new_name.clone(), bytes_arc.clone()));
+    let mirror = ctx.get_class_mirror(cid);
+    eprintln!(
+        "[CCE] enhance: defined {new_name} (super={super_name}, loader={super_loader_id}, marker={SPRING_MARKER_IFACE}, intercepted @Bean methods={})",
+        bean_methods.len(),
+    );
+    notify_generated_class_handler(ctx, receiver_loader_id, &new_name, &bytes_arc);
+    // See `build_fastclass_placeholder`'s doc comment: real cglib always emits
+    // two FastClass helper classes alongside the enhancer itself; our dispatch
+    // never needs them, but AOT's `isRegisteredCglibClass` test asserts their
+    // presence (bytes + reflection hint) regardless, and
+    // `notify_generated_class_handler` is a no-op outside AOT processing (no
+    // handler installed), so this is safe to call unconditionally.
+    for suffix in ["FastClass$$0", "FastClass$$1"] {
+        let fastclass_name = format!("{super_name}$$SpringCGLIB$${suffix}");
+        let fastclass_bytes = build_fastclass_placeholder(&fastclass_name);
+        notify_generated_class_handler(ctx, receiver_loader_id, &fastclass_name, &fastclass_bytes);
     }
+    Ok(Some(Value::Object(Some(mirror))))
 }
 
 // ===========================================================================
