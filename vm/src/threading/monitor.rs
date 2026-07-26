@@ -1217,11 +1217,11 @@ impl MonitorTable {
     /// locking consults.
     fn index_repair_if_absent(&self, key: usize, monitor: &Arc<Monitor>) {
         let mut shard = self.monitor_shard(key).lock();
-        match shard.get(&key) {
-            Some(existing) if Arc::ptr_eq(existing, monitor) => {}
-            _ => {
-                shard.insert(key, Arc::clone(monitor));
-            }
+        // Resolve the read to a bool before mutating — holding the `get`
+        // borrow across the `insert` would not borrow-check.
+        let already_indexed = shard.get(&key).is_some_and(|e| Arc::ptr_eq(e, monitor));
+        if !already_indexed {
+            shard.insert(key, Arc::clone(monitor));
         }
     }
 
@@ -1529,9 +1529,7 @@ impl MonitorTable {
             let p = obj_ref.as_ptr() as *const u8;
             (
                 std::ptr::read(p as *const u32),
-                std::ptr::read(
-                    p.add(cratonvm_types::NUM_SLOTS_OFFSET) as *const u32
-                ),
+                std::ptr::read(p.add(cratonvm_types::NUM_SLOTS_OFFSET) as *const u32),
             )
         };
         let (reg_hit, reg_owner, reg_count) = {
@@ -1774,12 +1772,10 @@ impl MonitorTable {
             s if s == types::MARK_THIN_LOCKED => {
                 Some(ThreadId(u64::from(ObjectHeader::thin_lock_owner(mark))))
             }
-            s if s == types::MARK_INFLATED => {
-                monitor_from_mark(mark).and_then(|m| {
-                    let st = m.state.lock();
-                    st.owner
-                })
-            }
+            s if s == types::MARK_INFLATED => monitor_from_mark(mark).and_then(|m| {
+                let st = m.state.lock();
+                st.owner
+            }),
             _ => None,
         }
     }
@@ -1809,60 +1805,6 @@ impl MonitorTable {
         }
     }
 
-    /// Remap monitor keys after GC has moved objects.
-    ///
-    /// Takes a mapping from old pointer addresses to new pointer addresses.
-    /// Re-keys the internal HashMap so monitors remain associated with the
-    /// correct (now-relocated) objects.
-    ///
-    /// PERF (monitor-leak reclaim): historically every inflated `Monitor` and
-    /// every per-object `cas_lock` was inserted on first use and **never
-    /// removed**, so the registries grew monotonically for the VM lifetime —
-    /// each moving GC's remap then walked an ever-larger table even though most
-    /// keyed objects were long dead. This pass reclaims the entries that can be
-    /// dropped *without ever losing live lock state*, keeping the table bounded
-    /// and the remap cost proportional to the live (not historical) population.
-    ///
-    /// SAFETY of reclamation (why this never drops a live monitor):
-    ///
-    /// * `cas_locks` are **always** safe to prune when idle. A CAS lock has no
-    ///   back-reference from the object header (unlike an inflated monitor,
-    ///   whose address is published into the mark word), so removing it is
-    ///   invisible to the rest of the VM — `with_cas_lock` simply re-creates an
-    ///   equivalent fresh `Mutex` on the next access. We drop an entry only when
-    ///   `Arc::strong_count == 1`, i.e. the registry holds the *sole* reference
-    ///   and no thread is currently inside `with_cas_lock` holding a clone. An
-    ///   entry that is in use (`strong_count > 1`) is always retained/re-keyed.
-    ///
-    /// * Inflated `monitors` are **never reclaimed here** — only re-keyed.
-    ///
-    ///   ARCH-2026-07-26, and this is the load-bearing part: reclaiming on the
-    ///   "absent from `pointer_map` ⇒ dead" signal was already wrong, and is
-    ///   now unsafe. `pointer_map` lists only *moved* objects, so for a
-    ///   **partial** collector (G1 young/mixed, the generational minor GC) a
-    ///   live old-gen / non-CSet survivor is legitimately absent. Dropping its
-    ///   entry used to leave the survivor's `INFLATED` mark word pointing at a
-    ///   freed `Monitor`; the old code got away with never dereferencing that
-    ///   pointer only because every lookup went through this map (and instead
-    ///   re-inflated a SECOND monitor, orphaning every waiter on the first).
-    ///   Now that the mark word IS what locking dereferences, the same drop
-    ///   would be a use-after-free.
-    ///
-    ///   So the branch is gone, together with its `CRATONVM_RECLAIM_DEAD_MONITORS`
-    ///   opt-in — which was default-OFF and had therefore never run, so nothing
-    ///   is lost. Sound reclamation needs an EXACT dead set, which is exactly
-    ///   what [`cratonvm_gc::MonitorCleanup::prune_dead`] is given; that path is
-    ///   unconditional, on by default, and releases the mark-word reference too,
-    ///   so it genuinely frees.
-    ///
-    ///   CROSS-FILE FOLLOW-UP (flagged, not done here — out of edit scope): to
-    ///   reclaim dead monitors under the *moving* collectors as well, they need
-    ///   to supply an exact dead-address set (or call `prune_dead` alongside
-    ///   `remap_after_gc`). That means editing `gc/src/collector.rs` and the
-    ///   `remap_after_gc` call sites in `gc/src/heap.rs`, `gc/src/g1.rs` and
-    ///   `gc/src/gen_heap.rs` — left to the owner of those files. Until then a
-    ///   dead object's monitor is retained by the moving collectors, which is a
-    ///   bounded leak and strictly preferable to a dangling mark word.
     /// Release every inflated monitor still owned by `thread_id`. Called
     /// once from `ThreadRegistry::mark_dead` when a Java thread terminates.
     ///
@@ -1919,6 +1861,60 @@ impl MonitorTable {
         }
     }
 
+    /// Remap monitor keys after GC has moved objects.
+    ///
+    /// Takes a mapping from old pointer addresses to new pointer addresses.
+    /// Re-keys the internal HashMap so monitors remain associated with the
+    /// correct (now-relocated) objects.
+    ///
+    /// PERF (leak bounding): historically every inflated `Monitor` and every
+    /// per-object `cas_lock` was inserted on first use and **never removed**, so
+    /// the registries grew monotonically for the VM lifetime — each moving GC's
+    /// remap then walked an ever-larger table even though most keyed objects
+    /// were long dead. This pass drops the `cas_locks` entries that can be
+    /// dropped *without ever losing live lock state*. Inflated monitors are only
+    /// re-keyed here, never dropped — see below.
+    ///
+    /// SAFETY of reclamation (why this never drops a live monitor):
+    ///
+    /// * `cas_locks` are **always** safe to prune when idle. A CAS lock has no
+    ///   back-reference from the object header (unlike an inflated monitor,
+    ///   whose address is published into the mark word), so removing it is
+    ///   invisible to the rest of the VM — `with_cas_lock` simply re-creates an
+    ///   equivalent fresh `Mutex` on the next access. We drop an entry only when
+    ///   `Arc::strong_count == 1`, i.e. the registry holds the *sole* reference
+    ///   and no thread is currently inside `with_cas_lock` holding a clone. An
+    ///   entry that is in use (`strong_count > 1`) is always retained/re-keyed.
+    ///
+    /// * Inflated `monitors` are **never reclaimed here** — only re-keyed.
+    ///
+    ///   ARCH-2026-07-26, and this is the load-bearing part: reclaiming on the
+    ///   "absent from `pointer_map` ⇒ dead" signal was already wrong, and is
+    ///   now unsafe. `pointer_map` lists only *moved* objects, so for a
+    ///   **partial** collector (G1 young/mixed, the generational minor GC) a
+    ///   live old-gen / non-CSet survivor is legitimately absent. Dropping its
+    ///   entry used to leave the survivor's `INFLATED` mark word pointing at a
+    ///   freed `Monitor`; the old code got away with never dereferencing that
+    ///   pointer only because every lookup went through this map (and instead
+    ///   re-inflated a SECOND monitor, orphaning every waiter on the first).
+    ///   Now that the mark word IS what locking dereferences, the same drop
+    ///   would be a use-after-free.
+    ///
+    ///   So the branch is gone, together with its `CRATONVM_RECLAIM_DEAD_MONITORS`
+    ///   opt-in — which was default-OFF and had therefore never run, so nothing
+    ///   is lost. Sound reclamation needs an EXACT dead set, which is exactly
+    ///   what [`cratonvm_gc::MonitorCleanup::prune_dead`] is given; that path is
+    ///   unconditional, on by default, and releases the mark-word reference too,
+    ///   so it genuinely frees.
+    ///
+    ///   CROSS-FILE FOLLOW-UP (flagged, not done here — out of edit scope): to
+    ///   reclaim dead monitors under the *moving* collectors as well, they need
+    ///   to supply an exact dead-address set (or call `prune_dead` alongside
+    ///   `remap_after_gc`). That means editing `gc/src/collector.rs` and the
+    ///   `remap_after_gc` call sites in `gc/src/heap.rs`, `gc/src/g1.rs` and
+    ///   `gc/src/gen_heap.rs` — left to the owner of those files. Until then a
+    ///   dead object's monitor is retained by the moving collectors, which is a
+    ///   bounded leak and strictly preferable to a dangling mark word.
     pub fn remap_after_gc(&self, pointer_map: &std::collections::HashMap<usize, usize>) {
         if pointer_map.is_empty() {
             return;
@@ -2900,9 +2896,7 @@ mod tests {
             let _ = tx.send(());
         });
 
-        let finished = rx
-            .recv_timeout(std::time::Duration::from_secs(10))
-            .is_ok();
+        let finished = rx.recv_timeout(std::time::Duration::from_secs(10)).is_ok();
         // Release before asserting so the worker can finish (and `join` cannot
         // hang) even if the property regressed.
         drop(shard_guard);
@@ -3237,8 +3231,9 @@ mod tests {
         // whole point of hashing the address is that neighbouring objects get
         // independent shards.
         let base = 0x7f00_0000_0000usize;
-        let distinct: std::collections::HashSet<usize> =
-            (0..MONITOR_SHARDS).map(|i| shard_of(base + i * 32)).collect();
+        let distinct: std::collections::HashSet<usize> = (0..MONITOR_SHARDS)
+            .map(|i| shard_of(base + i * 32))
+            .collect();
         assert!(
             distinct.len() > MONITOR_SHARDS / 4,
             "shard hash clusters badly: {} distinct shards for {} consecutive \

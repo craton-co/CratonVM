@@ -244,6 +244,17 @@ pub struct ThreadRegistry {
     /// Level: L5 `thread_registry` (see `cratonvm_types::lock_order`). This
     /// lock is not yet wrapped in `OrderedPlRwLock`, so the checker does not
     /// observe it — the level is documentation, exactly as it was before.
+    ///
+    /// AUTO-TRAIT NOTE: this raises a bound. `Mutex<T>: Sync` needs only
+    /// `T: Send`, but `RwLock<T>: Sync` needs `T: Send + Sync`, so
+    /// [`ThreadEntry`] must now be `Sync` for `ThreadRegistry` to be `Sync` —
+    /// which `vm::vm::realms::ThreadRealm` requires, since it holds one by
+    /// value inside the shared VM. It is, but only because
+    /// `ObjectRef` carries an `unsafe impl Sync` (`types/src/value.rs`), which
+    /// the bare `java_thread_obj: Option<ObjectRef>` field relies on, and
+    /// because `std::thread::JoinHandle<T>` is unconditionally `Sync`. If
+    /// either ever changes, put those two fields behind their own locks rather
+    /// than reverting this one.
     threads: RwLock<FxHashMap<ThreadId, ThreadEntry>>,
     next_id: AtomicU64,
     /// Process-unique identity for this registry instance, used to key the
@@ -2795,10 +2806,7 @@ mod tests {
 
         let mut done = 0;
         while done < 8 {
-            if rx
-                .recv_timeout(std::time::Duration::from_secs(10))
-                .is_err()
-            {
+            if rx.recv_timeout(std::time::Duration::from_secs(10)).is_err() {
                 break;
             }
             done += 1;
@@ -2838,7 +2846,10 @@ mod tests {
         drop(held);
         let alive = worker.join().unwrap();
         assert!(blocked, "a writer must exclude readers");
-        assert!(alive, "the reader must still get the right answer afterwards");
+        assert!(
+            alive,
+            "the reader must still get the right answer afterwards"
+        );
     }
 
     /// The per-thread self-handle must return the *same* slot the registry
