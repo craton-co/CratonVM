@@ -160,6 +160,64 @@ in full and expand this table before testing.**
   other's `results.tsv` concurrently — always pass a per-shard-unique
   `--tag`.
 
+## WildFly boot smoke test (SPB.8/8b/8c family: jboss.modules, jboss.as, wildfly, jboss.msc, jboss.logging)
+
+Direct `standalone.sh` boot against `/data/data/wildfly-dist-keep/wildfly-32.0.1.Final`
+(fake JAVA_HOME wrapping the cratonvm binary as `bin/java`, `CRATONVM_JAVA_HOME=/home/victor/jdk25`
+for real-class support — see `docs/internal/fixed-suite-bugs/wildfly/wildfly-gc-barrier-boot-hang-and-harness-fixes.md`
+for why this shape is needed).
+
+- **Baseline (ban in place, default):** boots cleanly to `WFLYSRV0025: WildFly Full
+  32.0.1.Final ... started in 33227ms`, HTTP management interface up, deployment
+  scanner polling normally. Genuinely working server.
+- **Ban lifted (`CRATONVM_JIT_ALLOW_PACKAGES=org/jboss/modules/,org/jboss/as/,org/wildfly/,org/jboss/msc/,org/jboss/logging/`):**
+  boots ~39 threads deep into real config parsing, then **FATAL WFLYSRV0056** —
+  `NullPointerException: Cannot invoke "java.util.Set.iterator()" because
+  "this.validTypes" is null`, in the `standalone.xml` EE-subsystem
+  managed-executor-service parse path (`ModelTypeValidator.validateParameter` /
+  `LongRangeValidator`/`NillableOrExpressionParameterValidator` chain — note
+  CratonVM's own stack attribution across these is probably imprecise, matches
+  the known "JIT loses/mis-attributes an inlined callee's frame" pattern seen
+  elsewhere in this codebase, e.g. JASPER-JDT.3). **This is a real regression
+  from lifting the ban, not a stale safety net for this particular repro.**
+- **`--nojit` check in progress** (ban still lifted via env, but `--nojit` added)
+  to confirm this is JIT-specific before spending more time on it — result
+  pending as of this doc update.
+
+**CONFIRMED via `--nojit` differential (2026-07-26 ~01:10 UTC): this is
+JIT-specific, not an environment/harness artifact.** Ban lifted + `--nojit`
+added boots cleanly (`WFLYSRV0025 ... started in 24042ms`, matches baseline);
+only ban-lifted + JIT-on fails. **Verdict: KEEP `org/jboss/as/` (SPB.8b) —
+it is protecting against a currently-live miscompile, not a stale one.**
+Full writeup + repro: `docs/known-issues/wildfly/modeltypevalidator-validtypes-npe.md`
+(committed). This is the sweep's first concrete "new bug found" per the
+goal's own framing — a real, JIT-only `ModelTypeValidator`/`validTypes`
+null-field bug with a fast (~10-20s) deterministic repro, not yet root-caused
+to an exact codegen site. Good target for a dedicated follow-up session.
+
+NOT proof that the *other* ~20 bans in the SPB/CGL/PIC family are still
+needed — each needs its own check; this only confirms the family's root
+cause pattern is still real *somewhere*, so don't assume the whole family is
+safe to bulk-remove. The sibling bans in the same lift set this test used
+(`org/jboss/modules/`, `org/wildfly/`, `org/jboss/msc/`, `org/jboss/logging/`)
+are individually UNTESTED — this run never got far enough to exercise them
+since it crashed first in `org/jboss/as/`. Re-test those once the `org/jboss/as/`
+bug above is fixed (boot will get further and may expose or clear different
+bans downstream).
+
+Repro commands (host: victor@20.83.144.174):
+```bash
+mkdir -p /data/tmp/jitban-wf-javahome/bin
+cp <cratonvm-binary> /data/tmp/jitban-wf-javahome/bin/java
+chmod +x /data/tmp/jitban-wf-javahome/bin/java
+mkdir -p /data/tmp/<rundir> && cp -r /data/data/wildfly-dist-keep/wildfly-32.0.1.Final/standalone/configuration /data/tmp/<rundir>/
+JAVA_HOME=/data/tmp/jitban-wf-javahome CRATONVM_JAVA_HOME=/home/victor/jdk25 \
+  CRATONVM_JIT_ALLOW_PACKAGES='org/jboss/modules/,org/jboss/as/,org/wildfly/,org/jboss/msc/,org/jboss/logging/' \
+  timeout 90 bash /data/data/wildfly-dist-keep/wildfly-32.0.1.Final/bin/standalone.sh \
+  -Djboss.server.base.dir=/data/tmp/<rundir>
+```
+(standalone.sh isn't chmod +x in the dist — always invoke via `bash standalone.sh`.)
+
 ## Next steps
 
 1. Finish H2/ANTLR-runtime test (this session) — compare `TestFileSystem`
