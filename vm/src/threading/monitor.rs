@@ -8,13 +8,74 @@
 //! are **reentrant**: a thread that already owns a monitor can enter it again,
 //! incrementing an entry count.
 //!
-//! The monitor table is a global structure keyed by object identity (pointer
-//! address as `usize`). Monitors are created lazily on first use.
-//!
 //! When multiple OS threads contend for the same monitor, `parking_lot::Condvar`
 //! is used to block and wake threads. Two separate condvars are used:
 //! - `entry_condvar`: wakes threads blocked on `monitorenter`
 //! - `wait_condvar`: wakes threads blocked on `Object.wait()`
+//!
+//! # Where a monitor lives (the mark word IS the monitor table)
+//!
+//! CratonVM spawns one real OS thread per Java thread, so a process-wide lock
+//! on a synchronization fast path is a hard scalability ceiling, not a
+//! theoretical one. This module therefore follows HotSpot's shape:
+//!
+//! * **Uncontended / re-entrant** locking never leaves the object's own
+//!   `mark_word` (`try_thin_lock` / `try_thin_recursive_lock` /
+//!   `try_thin_unlock`) — one CAS, no allocation, no table.
+//! * **Inflated** locking is reached through the object's own mark word too:
+//!   `MARK_INFLATED` stores the `Monitor`'s address in its upper 62 bits, so
+//!   `monitorenter` / `monitorexit` / `wait` / `notify` on an inflated monitor
+//!   are a mark-word load followed by that monitor's *own* mutex. **No global
+//!   map probe, no global lock.**
+//! * [`MonitorTable`] is only a **sharded enumeration index**: it exists so
+//!   cold operations (thread-death monitor release, GC re-key / prune,
+//!   diagnostics) can walk the set of inflated monitors, which the mark words
+//!   alone cannot enumerate. It is never consulted on a hot path.
+//!
+//! ## Mark-word monitor ownership and lifetime (READ BEFORE EDITING)
+//!
+//! A `Monitor` reachable from a mark word must outlive every thread that can
+//! load that mark word; freeing one while a thread is parked on it is a
+//! use-after-free, not a perf bug. The rule that makes the raw pointer sound:
+//!
+//! 1. **The mark word owns a strong reference.** On the inflation CAS that
+//!    publishes `MARK_INFLATED`, the publisher leaks one `Arc<Monitor>` clone
+//!    into the mark word (see [`MonitorTable::publish_inflated`]) and records
+//!    that fact in [`Monitor::mark_ref`]. So an `INFLATED` mark word is, by
+//!    construction, accompanied by a live strong reference that nothing but
+//!    the reclaim path can drop.
+//! 2. **A reader can therefore always upgrade.** `&Monitor` borrowed from the
+//!    mark word ([`monitor_from_mark`]) and `Arc<Monitor>` cloned from it
+//!    ([`monitor_arc_from_mark`]) are both sound *because* of (1): the strong
+//!    count is >= 1 for as long as the mark word says `INFLATED`.
+//! 3. **The reference is released only for a provably dead object.** The two
+//!    release sites are `MonitorTable::prune_dead` (the collector passes an
+//!    EXACT set of just-swept addresses) and the reclaim branch of
+//!    `MonitorTable::remap_after_gc` (opt-in, and additionally requires the
+//!    monitor to be idle and referenced by nobody but the registry + mark
+//!    word). A thread can only load an object's mark word while holding a
+//!    live reference to that object, so a *dead* object's mark word has no
+//!    possible reader — the release cannot race a load.
+//! 4. **Release is never the last drop under a waiter.** Any thread parked in
+//!    `block_enter` / `wait` reached there through `Arc<Monitor>`, i.e. holds
+//!    its own strong reference for the whole park. Dropping the mark-word
+//!    reference (and the registry's) therefore cannot free the monitor out
+//!    from under it, and `Monitor::mark_ref` is cleared with a `swap` so a
+//!    double release is a no-op rather than a double free.
+//! 5. **Relocation is free.** A moving collector byte-copies the header, so
+//!    the monitor pointer travels with the object and stays valid (monitors
+//!    live in the Rust heap, never the Java heap). The GC never interprets
+//!    the mark word as an object reference — see the `mark_word` handling in
+//!    `gc/src/gc.rs`, `gc/src/g1.rs`, `gc/src/gen_heap.rs`, `gc/src/region.rs`,
+//!    all of which copy it verbatim. Re-keying the enumeration index in
+//!    `remap_after_gc` is a bookkeeping detail; correctness of locking no
+//!    longer depends on it.
+//!
+//! Consequence: the historical "mark word says INFLATED but the registry has
+//! no entry" invariant violation (the audit finding 1(b) tripwire, which used
+//! to re-inflate a *second* `Monitor` and orphan every waiter on the first) is
+//! structurally impossible now. The mark word is the single source of truth;
+//! a missing index entry is repaired from it.
 
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
@@ -242,59 +303,70 @@ pub fn try_thin_unlock(header: &ObjectHeader, thread_id: u32) -> Result<Option<u
     }
 }
 
-/// Inflate a thin lock (or a neutral mark) to a heap-allocated `Monitor`
-/// **without** CAS-protecting the publish. Visibility is restricted to the
-/// crate so that the only legitimate caller is `MonitorTable::inflate_locked`,
-/// which holds the registry mutex and performs its own `compare_exchange`
-/// against the observed mark word before/instead of calling this helper.
-///
-/// # Safety / correctness contract
-///
-/// This helper publishes the new mark word via an **unconditional**
-/// `store(Release)`. That is only sound when the caller has *already
-/// confirmed*, via CAS, that the mark word still holds the value it observed
-/// — otherwise this store will silently clobber a concurrent CAS (e.g. a
-/// thin-lock owner releasing back to NEUTRAL, or another thread's earlier
-/// inflation publishing a different `Arc<Monitor>`), corrupting the lock
-/// state machine. The bare helper is therefore named `_unchecked` and is
-/// not part of the public API; new call sites must instead use
-/// `MonitorTable::inflate_locked`, which routes inflation through the
-/// registry mutex and performs the CAS publish itself.
-///
-/// If `current_owner` is `Some((tid, recursion))`, the new monitor is
-/// pre-acquired by that thread with the given entry count, atomically
-/// transferring ownership from the thin-lock representation. This is used
-/// when the current owner inflates its own lock (to support deeper recursion)
-/// and also when a contending thread inflates a lock held by someone else.
-///
-/// Returns the leaked `Monitor` pointer. Callers are responsible for keeping
-/// the `Monitor` alive (e.g. by stashing an `Arc<Monitor>` in
-/// `MonitorTable::monitors`) so that the GC remap path can find it.
-#[inline]
-#[allow(dead_code)] // retained for future direct inflation paths; the in-tree
-                    // inflation goes through `MonitorTable::inflate_locked`,
-                    // which inlines the same logic under its registry mutex.
-pub(crate) fn inflate_unchecked(
-    header: &ObjectHeader,
-    monitor: Arc<Monitor>,
-    current_owner: Option<(u32, u8)>,
-) -> *mut Monitor {
-    if let Some((tid, recursion)) = current_owner {
-        monitor.enter_with_recursion(ThreadId(tid as u64), (recursion as u32) + 1);
+// ---------------------------------------------------------------------------
+// Mark-word → Monitor access (the hot inflated path; takes NO global lock)
+// ---------------------------------------------------------------------------
+
+/// Decode the `Monitor` address out of a mark-word snapshot, or `None` if the
+/// snapshot is not in `MARK_INFLATED` state (or carries a null pointer, which
+/// no legitimate publish can produce — `make_inflated` rejects it).
+#[inline(always)]
+fn monitor_ptr_from_mark(mark: u64) -> Option<*const Monitor> {
+    if ObjectHeader::mark_state(mark) != types::MARK_INFLATED {
+        return None;
     }
-    // Cast through *const to *mut — `Arc::as_ptr` only exposes the const
-    // form, but the mark word stores an opaque address tag, not a reference
-    // that gets dereferenced through this pointer.
-    let raw = Arc::as_ptr(&monitor) as *mut Monitor;
-    // SAFETY: Monitor is naturally 8-byte aligned (it contains a Mutex which
-    // has at least pointer alignment); the low 2 bits are therefore zero and
-    // safe to use as the state tag.
-    let new_mark = ObjectHeader::make_inflated(raw as usize);
-    // NOTE: unconditional store — see the function-level doc for the
-    // CAS-correctness contract. Direct callers outside
-    // `MonitorTable::inflate_locked` will violate the lock state machine.
-    header.mark_word.store(new_mark, Ordering::Release);
-    raw
+    let p = ObjectHeader::inflated_monitor(mark) as *const Monitor;
+    if p.is_null() {
+        None
+    } else {
+        Some(p)
+    }
+}
+
+/// Borrow the `Monitor` an `INFLATED` mark word points at.
+///
+/// This is *the* inflated fast path: a mark-word load plus a pointer deref,
+/// with no registry probe and therefore no global lock and no atomic refcount
+/// traffic. Use this whenever the borrow cannot outlive the caller's own
+/// reference to the object (i.e. everything except handing a monitor to a
+/// thread that is about to block on it — that needs [`monitor_arc_from_mark`]).
+///
+/// # Safety argument
+///
+/// See the module-level "Mark-word monitor ownership and lifetime" section:
+/// an `INFLATED` mark word owns one strong `Arc<Monitor>` reference, released
+/// only for an object the collector has proved dead — and a dead object has
+/// no possible mark-word reader. The returned lifetime is unconstrained, so
+/// callers must keep it within the scope in which they hold `obj_ref`.
+#[inline(always)]
+fn monitor_from_mark<'a>(mark: u64) -> Option<&'a Monitor> {
+    // SAFETY: as argued above, the pointee is kept alive by the strong
+    // reference the mark word itself owns.
+    monitor_ptr_from_mark(mark).map(|p| unsafe { &*p })
+}
+
+/// Clone an owned `Arc<Monitor>` out of an `INFLATED` mark word.
+///
+/// Needed when the monitor must outlive the caller's borrow of the object —
+/// notably the contended path, where the caller parks on the monitor after
+/// releasing everything else, and the thread-termination path, which keeps a
+/// stable handle across a moving GC.
+///
+/// # Safety argument
+///
+/// Same as [`monitor_from_mark`]: the mark word's own strong reference keeps
+/// the strong count >= 1 across the increment, so reconstituting an `Arc` from
+/// the raw pointer is sound.
+#[inline]
+fn monitor_arc_from_mark(mark: u64) -> Option<Arc<Monitor>> {
+    let p = monitor_ptr_from_mark(mark)?;
+    // SAFETY: `p` came from `Arc::as_ptr` on a still-live allocation (the
+    // mark word owns a strong reference). `increment_strong_count` +
+    // `from_raw` is the documented way to clone through a raw pointer.
+    unsafe {
+        Arc::increment_strong_count(p);
+        Some(Arc::from_raw(p))
+    }
 }
 
 /// Look up an `&ObjectHeader` from an `ObjectRef`. Mirrors the pattern used by
@@ -330,12 +402,30 @@ fn tid_to_u32(tid: ThreadId) -> Option<u32> {
 /// Each monitor tracks its owner thread and re-entry count. Two condvars
 /// separate the two kinds of blocking: monitor entry contention and
 /// `Object.wait()`/`notify()`.
+///
+/// `#[repr(align(8))]` is load-bearing, not cosmetic: the mark word packs the
+/// monitor's address into its upper 62 bits and tags the low 2 with the lock
+/// state, so a `Monitor` whose `Arc` payload were less than 4-byte aligned
+/// would corrupt the state field. `ObjectHeader::make_inflated` asserts this,
+/// and the alignment attribute makes the guarantee explicit rather than
+/// incidental to whatever `parking_lot` happens to contain.
+#[repr(align(8))]
 pub struct Monitor {
     state: Mutex<MonitorState>,
     /// Wakes threads blocked on `monitorenter` (waiting to acquire the lock).
     entry_condvar: Condvar,
     /// Wakes threads blocked on `Object.wait()`.
     wait_condvar: Condvar,
+    /// True once this monitor's address has been published into some object's
+    /// mark word, which from that moment **owns one strong `Arc` reference**
+    /// (see the module-level lifetime rules).
+    ///
+    /// Read by the two reclaim sites to know (a) how many strong references
+    /// are structural rather than "somebody is using this monitor", and (b)
+    /// whether they still owe a `drop` of the mark-word reference. Cleared
+    /// with a `swap`, so a monitor that is reached by both `prune_dead` and
+    /// `remap_after_gc` releases exactly once.
+    mark_ref: std::sync::atomic::AtomicBool,
 }
 
 /// The mutable state protected by a monitor's mutex.
