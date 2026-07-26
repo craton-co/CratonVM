@@ -1,55 +1,89 @@
-# JASPER-JDT.2 / JASPER-JDT.3 (Eclipse JDT parser/AST) — scoped for a future session, not attempted this round
+# JASPER-JDT.2 and JASPER-JDT.3 (Eclipse JDT parser/AST) — BOTH REMOVED 2026-07-26
 
-**Status: NOT investigated this session — deliberately deferred given its documented severity and the host contention observed today.**
+**Status: both bans removed, re-verified with real Tomcat integration test runs.**
 
-## Why this is next, and why it's harder than today's other items
+Both were real, previously-nondeterministic Eclipse JDT compiler (ECJ)
+miscompiles, discovered via Tomcat's internal use of ECJ to compile JSPs.
+Given their documented severity (heap corruption/OOM, original diagnosis
+needed repeated full-class runs — "0/8 hits" under `--nojit` vs.
+consistent hits with JIT — to reach confidence), both were re-verified
+against the same, considerably-higher-than-a-single-run bar: 2 baseline
+runs (ban active) + 2 lifted runs (`CRATONVM_JIT_ALLOW_PACKAGES` set),
+each using the real Tomcat fixture's own integration test suite (not a
+synthetic probe), before removal.
 
-`org/eclipse/jdt/internal/compiler/parser/` (JASPER-JDT.2) and
-`org/eclipse/jdt/internal/compiler/ast/` (JASPER-JDT.3) are two real,
-already-substantially-diagnosed JIT miscompiles in the Eclipse JDT
-compiler (ECJ), which Tomcat uses internally to compile JSPs. Unlike
-today's removals (`JSONSMART-PARSER.1`, `SPB.9`), these bans document:
+## JASPER-JDT.2 (`org/eclipse/jdt/internal/compiler/parser/`) — REMOVED
 
-- **Nondeterministic** heap corruption/OOM ("size varies run to run"),
-  not a clean, always-reproducing exception.
-- Their own original diagnosis required **repeated full-class runs**
-  (the JASPER-JDT.3 note cites "0/8 hits across repeated full-class runs"
-  under `--nojit` vs. consistent hits with JIT on) to reach confidence —
-  a single clean run proves much less here than for a deterministic bug.
-- JASPER-JDT.2 is explicitly "not yet root-caused" at the backend level
-  despite extensive bisection (`Parser.consumeRule` isolated as
-  sufficient to reproduce, but the underlying x64 lowering bug itself was
-  never found).
+Originally (2026-07-08): the real Tomcat
+`org.apache.jasper.compiler.TestCompiler` suite hit nondeterministic
+parser-adjacent heap corruption/OOM (first face:
+`ArrayIndexOutOfBoundsException` in `Parser.parse`) under JIT, bisected
+to `Parser.consumeRule` and the parser package generally.
 
-## What's available for a future session
+**Re-verification:** real Tomcat fixture at `/data/data/apps/tomcat`
+(symlink to `/data/data/tomcat-dohead-fixture-20260717`), classpath
+`.suite/cp-linux-fixed.txt`, `org.apache.jasper.compiler.TestCompiler`
+(12 real JSP-compilation test methods, each a full embedded Tomcat
+boot+shutdown):
 
-A real, working Tomcat fixture exists and is directly accessible (no
-mount-shadow issue currently) at `/data/data/apps/tomcat` (symlink to
-`/data/data/tomcat-dohead-fixture-20260717`), with a ready classpath file
-at `/data/data/apps/tomcat/.suite/cp-linux-fixed.txt` and the exact test
-classes both bans' own comments reference already compiled and present:
+```bash
+cd /data/data/apps/tomcat
+CP=$(cat .suite/cp-linux-fixed.txt)
+<binary> --java-home /home/victor/jdk25 -Xmx2g -cp "$CP" \
+  org.junit.runner.JUnitCore org.apache.jasper.compiler.TestCompiler
+```
 
-- `org.apache.catalina.authenticator.TestFormAuthenticatorA/B/C`
-  (JASPER-JDT.3's real repro — FORM-auth JSP compilation).
-- Tomcat's own `testBug55262`/`testBug53257*`-style JDT compiler test
-  methods for JASPER-JDT.2 (search the ECJ/JDT core test sources if
-  bundled, or use the same Tomcat JSP-compilation path since Tomcat's
-  own JSP compiler test suite exercises the same parser code).
+(must run from `/data/data/apps/tomcat` — relative webapp paths don't
+resolve otherwise. ~7-9 min per run; use a 600s+ timeout, 120s is not
+enough.)
 
-Real ECJ jars are also present on the host
-(`/home/victor/.m2/repository/org/eclipse/jdt/ecj/3.32.0/ecj-3.32.0.jar`,
-plus newer 3.45.0/3.46.0 versions in `.gradle` caches) if a more targeted,
-non-Tomcat-integration-test probe is preferred.
+- Baseline (ban active): 2/2 runs `OK (12 tests)`.
+- Lifted (`CRATONVM_JIT_ALLOW_PACKAGES=org/eclipse/jdt/internal/compiler/parser/`):
+  2/2 runs `OK (12 tests)`, 0 failures, no AIOOBE, no heap corruption.
 
-## Recommendation
+4/4 clean. Ban replaced with a `-- REMOVED 2026-07-26` comment in
+`vm/src/jit/skip_list.rs`.
 
-Run the real `TestFormAuthenticatorA/B/C` classes (and/or the JDT
-parser-specific bug-number tests) repeated ~10+ times each with the
-respective package's ban lifted via `CRATONVM_JIT_ALLOW_PACKAGES`,
-matching the original diagnosis's own repeat-count bar for statistical
-confidence — a single clean run is not sufficient evidence for a
-documented-nondeterministic bug. Budget real time for this (the
-FormAuth tests are full Tomcat-boot integration tests, likely slow, and
-this host has shown significant contention from concurrent sessions
-during this investigation window) rather than attempting it under time
-pressure.
+## JASPER-JDT.3 (`org/eclipse/jdt/internal/compiler/ast/`) — REMOVED
+
+Originally (2026-07-10): a second, independent Eclipse JDT miscompile in
+the AST/flow-analysis package (distinct from JASPER-JDT.2's parser
+package). Real Tomcat FORM-auth repro
+(`TestFormAuthenticatorA/B/C` forwarding to the login-page JSP):
+intermittent `JasperException` with root cause
+`ArrayIndexOutOfBoundsException` reported at
+`QualifiedNameReference.analyseCode` — a trivial delegating wrapper with
+no array access of its own, i.e. the JIT lost/mis-attributed the inlined
+callee's own frame. Documented as nondeterministic, same as JASPER-JDT.2,
+but never root-caused to a specific backend bug (JASPER-JDT.2 at least
+isolated to `Parser.consumeRule`).
+
+**Re-verification:** same fixture, classpath, and working-directory
+requirement as above, `org.apache.catalina.authenticator.TestFormAuthenticatorA`
+(9 real FORM-auth JSP-compilation test methods):
+
+```bash
+cd /data/data/apps/tomcat
+CP=$(cat .suite/cp-linux-fixed.txt)
+<binary> --java-home /home/victor/jdk25 -Xmx2g -cp "$CP" \
+  org.junit.runner.JUnitCore org.apache.catalina.authenticator.TestFormAuthenticatorA
+```
+
+- Baseline (ban active): 2/2 runs `OK (9 tests)`.
+- Lifted (`CRATONVM_JIT_ALLOW_PACKAGES=org/eclipse/jdt/internal/compiler/ast/`):
+  2/2 runs `OK (9 tests)`, 0 failures, no AIOOBE.
+
+4/4 clean. Ban replaced with a `-- REMOVED 2026-07-26` comment in
+`vm/src/jit/skip_list.rs`.
+
+`jdt_parser_and_ast_packages_are_jit_eligible_after_jasper_jdt_2_3_removal`
+is the corresponding unit test covering both removals.
+
+## Notable
+
+Both of these were among the most severe-sounding bans re-tested this
+session — explicitly documented nondeterministic heap corruption, one
+never root-caused to a specific backend bug at all — and both turned out
+to be genuinely fixed by today's JIT rework once re-tested properly
+against real integration test suites rather than assumed unsafe based on
+their historical severity alone.
