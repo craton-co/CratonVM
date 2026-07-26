@@ -415,3 +415,10 @@ Branch `fix/jit-ban-sweep-20260725`. `com/sun/org/apache/xerces/internal/`
 SchemaGrammar's SymbolHash corrupted under JIT during XSD schema
 validation, NPE in getGlobalTypeDecl. Fully standalone (javax.xml.validation
 + a simple XSD, no external deps) -- building a stress repro.
+
+**Result: SPRING-HAZELCAST-XERCES-JIT.1 REMOVED, stale 2026-07-26 11:59
+UTC.** Re-verified with a standalone javax.xml.validation stress probe
+(4 and 32 distinct XSD schemas, ~40k total Validator.validate() calls);
+confirmed SymbolHash.hash/.search/.get -- the exact class the original
+bug named -- actively JIT-compiled throughout via CRATONVM_DBG_JITC=1,
+no crash. Merged dev@9ba6ab5de.
