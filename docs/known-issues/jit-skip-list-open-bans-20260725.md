@@ -58,6 +58,48 @@ the whole skip list: a working, cheap (no-rebuild) bisection method already
 exists, the repro is 13 lines, and the payoff is collapsing 8 bans into
 (at best) 1 real fix instead of 8 separate whack-a-mole entries.
 
+## TYPES-ERASURE.1 consolidation hypothesis — REFUTED 2026-07-26 02:30 UTC
+
+Tested by temporarily gating all 6 other javac-family bans
+(`ClassReader.readClass`, `ClassFinder.complete`, `ClassFinder.fillIn`,
+`ClassReader.readInnerClasses`, `ClassReader.readAttrs`,
+`Symbol$ClassSymbol.complete`) behind a test-only env var
+(`CRATONVM_JIT_TESTONLY_UNBAN_SIX`, never committed) while leaving
+`Types.erasure`'s ban (TYPES-ERASURE.1) in place, then running a stress
+repro (`JavacLoopProbe2.java` — 100 iterations, each compiling a class with
+a `@Deprecated` member, a JSpecify `@Nullable` TYPE_USE-annotated generic
+method return + array return, and a generic method, matching the union of
+all 7 original bans' trigger shapes).
+
+**Result: still fails.** With all 6 lifted (only `Types.erasure` banned):
+continuous failures (16 ok / 45 fail by iteration 60) with a THIRD, distinct
+crash signature not previously catalogued:
+`NullPointerException: Cannot read field "kind" because "tree.sym" is null`
+from `com.sun.tools.javac.comp.Flow$CaptureAnalyzer.visitIdent`. Confirmed
+JIT-specific: the identical probe under `--nojit` is 30/30 clean (0
+failures).
+
+Bisecting which of the 6 is load-bearing (re-pin one via
+`CRATONVM_JIT_DENY=<Class.method>` while the other 5 stay lifted, no
+rebuild needed): `ClassReader.readClass` alone insufficient (still fails
+continuously). `ClassFinder.complete` alone: failures cluster ONLY in
+iterations 6-16 (11 failures) then completely stop for the remaining 83
+iterations — a partial improvement, but not clean, meaning `complete`
+contributes but at least one more of the remaining 5
+(`fillIn`/`readInnerClasses`/`readAttrs`/`ClassSymbol.complete`) or a
+genuinely new corruptor is also still needed. Did not finish narrowing
+further this session (time-boxed).
+
+**Conclusion: the consolidation hypothesis is false as a blanket claim.**
+`Types.erasure` is real and independently worth banning (see
+TYPES-ERASURE.1 above) but does NOT subsume the other 6 javac-family bans.
+All 6 must stay. Do not re-attempt this exact consolidation without new
+evidence; if picked up again, the `CRATONVM_JIT_TESTONLY_UNBAN_SIX`-style
+gate + `CRATONVM_JIT_DENY` bisection (both no-rebuild after the first gated
+build) is a fast way to keep narrowing which subset is load-bearing --
+`ClassFinder.complete` is the next lead, not yet fully isolated from the
+remaining 4.
+
 ## TOMCAT-DOHEAD-JUNIT-ITERATOR.1 — investigated, inconclusive
 
 2026-07-22 ban on `org/junit/runners/model/TestClass
@@ -166,7 +208,7 @@ still real correctness bugs worth closing):
 ## Recommended next session priority
 
 **Status (this session, branch `fix/jit-ban-sweep-20260725`):**
-- Item 1 — **STARTED 2026-07-26 02:14 UTC.**
+- Item 1 — **DONE, REFUTED 2026-07-26 02:30 UTC** (see consolidation-hypothesis section above).
 - Item 2 (SPB.1 bisection) — **SKIPPED, owned by the other concurrent
   session** (`fix/jit-ban-sweep2-20260726` / `wt-jitsweep2-20260726`, see
   `docs/internal/jit-ban-sweep-20260725.md` — already actively testing the
