@@ -36059,6 +36059,7 @@ mod tests {
             num_jit_args: 1, // just receiver
             return_type: b'I',
             invoke_kind: 0, // invokevirtual
+        declaring_class_id: 0,
         }));
         let invoke_info = vec![(1usize, info as *const JitInvokeInfo)]; // Cast: address arithmetic
 
@@ -36116,6 +36117,7 @@ mod tests {
             num_jit_args: 1,
             return_type: b'I',
             invoke_kind: 2, // invokeinterface
+        declaring_class_id: 0,
         }));
         let invoke_info = vec![(1usize, info as *const JitInvokeInfo)]; // Cast: address arithmetic
 
@@ -36173,6 +36175,7 @@ mod tests {
             num_jit_args: 1, // just receiver
             return_type: b'V',
             invoke_kind: 0,
+        declaring_class_id: 0,
         }));
         let invoke_info = vec![(1usize, info as *const JitInvokeInfo)]; // Cast: address arithmetic
 
@@ -36232,6 +36235,7 @@ mod tests {
             num_jit_args: 3, // receiver + 2 int args
             return_type: b'I',
             invoke_kind: 0,
+        declaring_class_id: 0,
         }));
         let invoke_info = vec![(3usize, info as *const JitInvokeInfo)]; // Cast: address arithmetic
 
@@ -38815,6 +38819,7 @@ mod tests {
             num_jit_args: 1,
             return_type: b'V',
             invoke_kind: 0xb7,
+        declaring_class_id: 0,
         }));
         let invoke_info = vec![(4usize, init_info as *const JitInvokeInfo)]; // Cast: address arithmetic
         let scalar_base = 4; // some offset
@@ -38932,6 +38937,7 @@ mod tests {
             num_jit_args: 1,
             return_type: b'V',
             invoke_kind: 0xb7,
+        declaring_class_id: 0,
         }));
         let invoke_info = vec![(4usize, init_info as *const JitInvokeInfo)];
         let plan =
@@ -39020,6 +39026,7 @@ mod tests {
             num_jit_args: 2,
             return_type: b'V',
             invoke_kind: 0xb7,
+        declaring_class_id: 0,
         }));
         let invoke_info = vec![(5usize, init_info as *const JitInvokeInfo)]; // Cast: address arithmetic
         let plan = plan_scalar_replacement(&code, 9, &non_escaping, &new_info, &invoke_info, 0);
@@ -41109,6 +41116,7 @@ mod tests {
             num_jit_args: 1, // receiver only
             return_type: b'I',
             invoke_kind: 0, // virtual
+        declaring_class_id: 0,
         });
         let info_ptr: *const JitInvokeInfo = &*info;
         let invoke_info = vec![(11usize, info_ptr)];

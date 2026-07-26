@@ -3402,6 +3402,31 @@ pub struct JitInvokeInfo {
     /// `CALL` to the method's own entry; such a call NEVER reaches the dispatch
     /// helper, so the helper need not handle 4.
     pub invoke_kind: u8,
+    /// `ObjectHeader` class id of the method this call site lives IN, or `0`
+    /// when the compiler could not supply one.
+    ///
+    /// The other three name fields are the raw constant-pool text, and a class
+    /// NAME is not a class identity: two loaders can each define
+    /// `org/h2/util/IntArray`. `jit_invoke_dispatch` resolves invokespecial
+    /// targets by name, which silently picks whichever copy the global
+    /// name->id map happens to hold — the caller's own loader is the only
+    /// thing that says which one the constant pool meant.
+    ///
+    /// BUG-JIT-INVOKESPECIAL-LOADER-20260726: H2's `TestUpgrade` loads
+    /// h2-1.2.120 in its own loader alongside the current H2 on the app
+    /// classpath. Old `IntArray.add` does `invokespecial checkCapacity()V` on
+    /// its own private method; once `add` was JIT-compiled, the dispatch
+    /// resolved `org/h2/util/IntArray` to the CURRENT copy, which has
+    /// `ensureCapacity(int)` and no `checkCapacity()` at all —
+    /// `NoSuchMethodError: org.h2.util.IntArray.checkCapacity()V`, from a
+    /// stack made entirely of 1.2.120 frames. The interpreter resolves the
+    /// same site through the caller's constant pool and gets it right, which
+    /// is why the failure was JIT-only.
+    ///
+    /// `0` means "no context, resolve as before" — every synthetic call site
+    /// (the `Integer.valueOf` / `HashMap.get` direct-dispatch statics) uses it,
+    /// and they name JDK classes that only ever have one definition.
+    pub declaring_class_id: u32,
 }
 
 /// Enumeration of every JIT call-site intrinsic.
@@ -7646,6 +7671,7 @@ fn try_compile_inner(
                             num_jit_args: num_args,
                             return_type: ret,
                             invoke_kind,
+                            declaring_class_id: cached.declaring_class_id.as_u32(),
                         });
                         let info_ptr = &*info as *const JitInvokeInfo as usize;
                         ir_call_infos.push(info);
@@ -8389,6 +8415,7 @@ fn try_compile_inner(
                                 num_jit_args: num_params,
                                 return_type: ret,
                                 invoke_kind,
+                                declaring_class_id: cached.declaring_class_id.as_u32(),
                             });
                             let info_ptr: *const JitInvokeInfo = &*info;
                             owned_invoke_infos.push(info);
@@ -8685,6 +8712,7 @@ fn try_compile_inner(
                 num_jit_args,
                 return_type: ret_type,
                 invoke_kind,
+                declaring_class_id: cached.declaring_class_id.as_u32(),
             });
             let info_ptr: *const JitInvokeInfo = &*info;
             owned_invoke_infos.push(info);
