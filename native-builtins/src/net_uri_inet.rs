@@ -1611,6 +1611,24 @@ mod new2_net_tests {
     }
 
     #[test]
+    fn resolve_real_hostname_is_cached_and_matches_uncached_probe() {
+        // `resolve_real_hostname` latches its result in a `OnceLock` because
+        // the third resolution step forks and execs `hostname`, and
+        // `InetAddress.getLocalHost()` / `NetworkInterface` enumeration call it
+        // on every invocation. Two things must hold: repeated calls are stable,
+        // and the cached value is exactly what the uncached probe produces.
+        let first = resolve_real_hostname();
+        let second = resolve_real_hostname();
+        assert_eq!(first, second, "cached hostname must be stable across calls");
+        assert_eq!(
+            first,
+            crate::resolve_real_hostname_uncached(),
+            "cache must not change the resolved value"
+        );
+        assert!(!first.is_empty(), "hostname must never be empty");
+    }
+
+    #[test]
     fn resolve_primary_ipv4_is_parseable() {
         let h = resolve_real_hostname();
         let ip = resolve_primary_ipv4(&h);
