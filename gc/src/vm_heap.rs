@@ -1236,8 +1236,10 @@ impl VmHeap {
     /// collector does not compact. `moving_young` defaults false, and
     /// `gen_heap` fail-closes to a non-moving mark-sweep whenever any thread
     /// holds a live JIT frame — the steady state at a 500-invocation JIT
-    /// threshold (`docs/known-issues/moving-young-gen-drops-jit-held-oops.md`,
-    /// OPEN). Under a non-moving, fragmenting heap "unused bytes" and "bytes an
+    /// threshold; compaction's correctness blocker closed 2026-07-26
+    /// (`docs/internal/fixed-suite-bugs/app-jvm-bugs/moving-young-gen-drops-jit-held-oops-FIXED.md`),
+    /// but moving-young remains opt-in on throughput grounds. Under a
+    /// non-moving, fragmenting heap "unused bytes" and "bytes an
     /// allocation can actually obtain" diverge without bound: a heap can be 60%
     /// unused and still fail a modest allocation because no single free run is
     /// large enough. A policy keyed on unused bytes then refuses to clear soft
@@ -1769,7 +1771,24 @@ impl VmHeap {
         }
         let fallbacks = crate::gc_quiescence::moving_young_coverage_fallback_count();
         if crate::gc_quiescence::moving_young_enabled() || fallbacks > 0 {
-            eprintln!("[GC] moving_young_coverage_fallbacks={fallbacks}");
+            // Both numbers, always. A correct answer while `cycles == 0` means
+            // the young generation never actually copied anything, which is the
+            // exact way the 2026-07-01 validation declared moving-young working
+            // while it was inert (see
+            // `docs/internal/arch-2026-07-26/moving-young-corruption-rootcause.md`
+            // section 6). The histogram then names what stopped it.
+            let cycles = crate::gc_quiescence::moving_young_cycle_count();
+            eprintln!("[GC] moving_young: cycles={cycles} coverage_fallbacks={fallbacks}");
+            let counts = crate::gc_quiescence::moving_young_fallback_reason_counts();
+            for (reason, n) in counts.iter().enumerate() {
+                if *n > 0 {
+                    eprintln!(
+                        "[GC] moving_young_fallback_reason: {}={}",
+                        crate::gc_quiescence::incomplete_reason::label(reason),
+                        n
+                    );
+                }
+            }
         }
     }
 

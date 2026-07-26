@@ -726,6 +726,17 @@ pub struct OopMapEntry {
     /// True only when the moving-young shadow-stack publication for this
     /// safepoint proved complete enough for relocation under live JIT frames.
     pub moving_young_coverage_complete: bool,
+    /// Exclusive `[rbp - off]` bound of the LIVE part of the frame at this
+    /// safepoint: the operand-spill cursor (`next_spill_offset`) at the moment
+    /// the safepoint was emitted. Slots at a larger offset are inside the
+    /// `max_stack`-sized spill reserve but above the live operand stack and
+    /// the staged invoke-argument buffer, so their contents are dead — the
+    /// spill cursor reclaims by moving, it does not clear.
+    ///
+    /// The moving-young frame verifier uses this to stop reporting stale
+    /// object pointers in reclaimed spill slots as un-rewritable roots.
+    /// `0` means "unknown" and makes the verifier scan the whole region.
+    pub live_frame_hi: i32,
 }
 
 impl OopMapEntry {
@@ -738,6 +749,7 @@ impl OopMapEntry {
             bytecode_pc: 0,
             frame_slot_offsets: Vec::new(),
             moving_young_coverage_complete: false,
+            live_frame_hi: 0,
         }
     }
 
@@ -1086,6 +1098,105 @@ pub fn lookup_jit_method_name(addr: usize) -> Option<String> {
         .map(|(_, _, name)| name.clone())
 }
 
+/// Where each storage class lives in a compiled frame, as positive
+/// `[rbp - off]` byte offsets. Every range is `lo..hi` (exclusive `hi`), and an
+/// empty range is `0..0`.
+///
+/// The GC needs this partition because the classes are NOT interchangeable
+/// under a relocating young generation:
+///
+///   * `java_locals`, `operand_spill`, `ref_hoist` and `scalar_fields` are
+///     genuine, independent oop storage — a reference there is the only copy,
+///     so the collector must be able to REWRITE it or must not move at all.
+///   * `arith_hoist` and `arith_scratch` hold `int`/`long` results of hoisted
+///     integer arithmetic. Never references.
+///   * `callee_saved`, `xmm_saved` and `reg_spill` are IMAGES of registers.
+///     `callee_saved`/`xmm_saved` hold the CALLER's values for the epilogue to
+///     restore; `reg_spill` is the write-only SB-CRASH-04 blind spill that
+///     exists to make register-resident values visible to a CONSERVATIVE scan.
+///     Nothing resumes from any of them in a way the owning frame's own
+///     published roots do not already cover.
+///
+/// See `docs/internal/fixed-suite-bugs/app-jvm-bugs/moving-young-gen-drops-jit-held-oops-FIXED.md`.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct FrameLayout {
+    /// Java locals: slot `i` at `[rbp - (i + 1) * 8]`.
+    pub java_locals_hi: i32,
+    /// LICM `aaload` hoist slots. Always reference-typed (`aaload` loads an
+    /// element of a reference array).
+    pub ref_hoist_lo: i32,
+    pub ref_hoist_hi: i32,
+    /// LICM integer-arithmetic hoist slots and their shared evaluation
+    /// scratch. Always primitive.
+    pub arith_lo: i32,
+    pub arith_hi: i32,
+    /// Scalar-replacement field slots (all fields of every eliminated object).
+    pub scalar_lo: i32,
+    pub scalar_hi: i32,
+    /// End of the whole reserved-locals region (locals + heap slot + hoists +
+    /// scalar fields + the reserved tail slots: sp-id, stack floor, cached
+    /// JIT thread, shadow bookkeeping).
+    pub locals_hi: i32,
+    /// Canonical operand-stack spill slots.
+    pub spill_lo: i32,
+    pub spill_hi: i32,
+    /// Prologue save area for the caller's callee-saved GPRs.
+    pub callee_saved_lo: i32,
+    pub callee_saved_hi: i32,
+    /// Prologue save area for the caller's callee-saved XMMs.
+    pub xmm_saved_lo: i32,
+    pub xmm_saved_hi: i32,
+    /// Per-safepoint blind GPR spill (`emit_pre_safepoint_spill`).
+    pub reg_spill_lo: i32,
+    pub reg_spill_hi: i32,
+    /// Total frame size (`SUB RSP, frame_size`); the band is `[rbp - size, rbp)`.
+    pub frame_size: i32,
+}
+
+impl FrameLayout {
+    /// Whether `off` names a slot that is only ever an IMAGE of a register.
+    #[inline]
+    pub fn is_register_image(&self, off: i32) -> bool {
+        (self.callee_saved_hi > self.callee_saved_lo
+            && off >= self.callee_saved_lo
+            && off < self.callee_saved_hi)
+            || (self.xmm_saved_hi > self.xmm_saved_lo
+                && off >= self.xmm_saved_lo
+                && off < self.xmm_saved_hi)
+            || (self.reg_spill_hi > self.reg_spill_lo
+                && off >= self.reg_spill_lo
+                && off < self.reg_spill_hi)
+    }
+
+    /// Name the region `off` falls in. Diagnostics only.
+    pub fn region_name(&self, off: i32) -> &'static str {
+        let hit = |lo: i32, hi: i32| hi > lo && off >= lo && off < hi;
+        if hit(self.ref_hoist_lo, self.ref_hoist_hi) {
+            "licm-ref-hoist"
+        } else if hit(self.arith_lo, self.arith_hi) {
+            "licm-arith"
+        } else if hit(self.scalar_lo, self.scalar_hi) {
+            "scalar-replaced-field"
+        } else if self.java_locals_hi > 0 && off < self.java_locals_hi {
+            "java-local"
+        } else if self.locals_hi > 0 && off < self.locals_hi {
+            "reserved-locals-tail"
+        } else if hit(self.spill_lo, self.spill_hi) {
+            "operand-spill"
+        } else if hit(self.callee_saved_lo, self.callee_saved_hi) {
+            "callee-saved-gpr-image"
+        } else if hit(self.xmm_saved_lo, self.xmm_saved_hi) {
+            "callee-saved-xmm-image"
+        } else if hit(self.reg_spill_lo, self.reg_spill_hi) {
+            "safepoint-gpr-spill-image"
+        } else if self.reg_spill_hi > 0 && off >= self.reg_spill_hi {
+            "outgoing-args-or-deopt-regs"
+        } else {
+            "unclassified"
+        }
+    }
+}
+
 /// A compiled native-code method.
 pub struct CompiledMethod {
     /// The executable buffer holding the machine code.
@@ -1162,6 +1273,15 @@ pub struct CompiledMethod {
     /// OSR metadata: XMM callee-saved save-area offset (mirrors the prologue's
     /// `xmm_saved_base`). Paired with `osr_callee_saved_xmms`.
     pub osr_xmm_saved_base: i32,
+    /// Where each storage class lives in this method's frame. See
+    /// [`FrameLayout`]; consumed by the moving-young frame verifier.
+    pub frame_layout: FrameLayout,
+    /// `Class.method` label, for diagnostics that have only a frame to go on.
+    pub method_label: String,
+    /// Frame offset of the shadow-stack per-push saved-base slot (the third
+    /// reserved tail slot). Exposed alongside `shadow_savetop_slot_off` so a
+    /// frame walker can recognise all three shadow bookkeeping slots.
+    pub shadow_savebase_slot_off: i32,
     /// OSR metadata: offset of VM context pointer in frame.
     pub osr_heap_local_offset: i32,
     /// OSR metadata: frame offset of the inline-TLAB cached `JvmThread*` slot.
@@ -1441,6 +1561,9 @@ impl CompiledMethod {
             osr_callee_saved_regs: None,
             osr_callee_saved_xmms: None,
             osr_xmm_saved_base: 0,
+            frame_layout: FrameLayout::default(),
+            method_label: String::new(),
+            shadow_savebase_slot_off: 0,
             osr_heap_local_offset: 0,
             jit_thread_slot_off: 0,
             stack_floor_slot_off: 0,
@@ -1503,6 +1626,9 @@ impl CompiledMethod {
             osr_callee_saved_regs: None,
             osr_callee_saved_xmms: None,
             osr_xmm_saved_base: 0,
+            frame_layout: FrameLayout::default(),
+            method_label: String::new(),
+            shadow_savebase_slot_off: 0,
             osr_heap_local_offset: 0,
             jit_thread_slot_off: 0,
             stack_floor_slot_off: 0,

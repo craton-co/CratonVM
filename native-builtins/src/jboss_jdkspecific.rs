@@ -953,11 +953,32 @@ pub fn register_jboss_jdkspecific(registry: &mut NativeMethodRegistry) {
     // a `HashSet` (the packages set) which produced
     // "NoSuchMethodError: java/util/HashSet.loadClass(Module, String)Class"
     // when downstream code tried to invoke `loadClass` on the result.
+    //
+    // Amended 2026-07-26: answer from the Module's own `loader` field when it
+    // is populated, and only fall back to null when it is not. The blanket
+    // null made `Module.getClassLoader()` return null even for the UNNAMED
+    // module -- where HotSpot returns the defining (application) loader -- so
+    // real `Package.getPackageInfo()` resolved `<pkg>.package-info` against
+    // the BOOTSTRAP loader and never saw a classpath package-info, hiding
+    // every package-level annotation from any `Package` not built by
+    // `Class.getPackage()`'s eager path. `lang_class::canonical_unnamed_module`
+    // now wires `loader` on the unnamed-module mirror; the synthetic PLATFORM
+    // modules `build_module` above produces still leave it unset and so still
+    // get the spec-correct null this override was written for.
     registry.register(
         m,
         "getClassLoader",
         "()Ljava/lang/ClassLoader;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            if let Value::Object(Some(loader)) = ctx.get_field_by_name(this, "loader") {
+                return Ok(Some(Value::Object(Some(loader))));
+            }
+            Ok(Some(Value::Object(None)))
+        },
     );
 
     // ── Round 63: WildFly `WildFlySecurityManager` <clinit> NPE ────────────

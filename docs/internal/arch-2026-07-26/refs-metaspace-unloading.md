@@ -204,7 +204,9 @@ Getting that number right is *harder* here than on HotSpot, for the reason the
 brief flags. The default collector does not compact: `moving_young` defaults
 false and `gen_heap` fail-closes to a non-moving mark-sweep whenever any thread
 holds a live JIT frame — the steady state at a 500-invocation JIT threshold
-(`docs/known-issues/moving-young-gen-drops-jit-held-oops.md`, OPEN). Under a
+(compaction's correctness blocker closed 2026-07-26,
+`docs/internal/fixed-suite-bugs/app-jvm-bugs/moving-young-gen-drops-jit-held-oops-FIXED.md`,
+but moving-young remains opt-in on throughput grounds). Under a
 non-moving fragmenting heap, "unused bytes" and "bytes an allocation can actually
 obtain" diverge without bound. A policy keyed on unused bytes refuses to clear
 soft references precisely while allocation is failing.
