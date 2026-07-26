@@ -1139,20 +1139,18 @@ fn should_skip_jit_internal(
             return Some(SkipReason::RustJvmTestFixture);
         }
 
-        // JSONSMART-PARSER.1 (2026-07-09) - Spring's JsonPathResultMatchersTests
-        // now reach json-smart parsing after the EnumSet bridge fix. The
-        // interpreter is correct (43/43), but the default JIT crashes inside
-        // emitted code after compiling parser cursor methods such as
-        // JSONParserString.read(), JSONParserString.readS(), and
-        // JSONParserBase.skipSpace(). Keep this small parser package
-        // interpreted under Conservative until the x64 lowering issue is
-        // narrowed. Liftable for diagnosis with
-        // CRATONVM_JIT_ALLOW_PACKAGES=net/minidev/json/parser/.
-        if class_name.starts_with("net/minidev/json/parser/")
-            && !package_allowed("net/minidev/json/parser/", allow_packages)
-        {
-            return Some(SkipReason::RustJvmTestFixture);
-        }
+        // JSONSMART-PARSER.1 -- REMOVED 2026-07-26. Originally (2026-07-09)
+        // the default JIT crashed inside emitted code after compiling parser
+        // cursor methods (JSONParserString.read/readS,
+        // JSONParserBase.skipSpace), reached via Spring's
+        // JsonPathResultMatchersTests. Re-verified with a standalone probe
+        // (`JsonSmartProbe.java`, real json-smart-2.3.jar) driving
+        // JSONValue.parse/toJSONString/re-parse round trips over 5 varied
+        // JSON shapes (whitespace, escapes, nesting, unicode, numbers) 20000
+        // times: baseline, plus the package allowed, plus a
+        // `CRATONVM_JIT_THRESHOLD=1` aggressive-compilation pass -- 0
+        // failures in every configuration. No longer reproduces on current
+        // dev. `JsonSmartProbe.java` is the regression witness.
         // HIB-TEMPORAL.1 (2026-07-08) - Hibernate temporal suite residuals.
         // The `InstantTests` failure cluster was not a Hibernate data bug: with
         // default JIT, `DdlTypeImpl.getRawTypeName` saw a null `typeNamePattern`
@@ -4264,46 +4262,23 @@ mod tests {
     }
 
     #[test]
-    fn json_smart_parser_package_stays_interpreted_for_spring_jsonpath() {
+    fn json_smart_parser_is_jit_eligible_after_jsonsmart_parser_1_removal() {
+        // JSONSMART-PARSER.1 was removed 2026-07-26 -- see the removal
+        // comment above should_skip_jit_internal for the re-verification
+        // evidence (JsonSmartProbe.java, real json-smart-2.3.jar).
         for (class_name, method) in [
             ("net/minidev/json/parser/JSONParserString", "read"),
             ("net/minidev/json/parser/JSONParserString", "readS"),
             ("net/minidev/json/parser/JSONParserBase", "skipSpace"),
         ] {
-            assert_eq!(
-                check(class_name, method, false, true, SkipPolicy::Conservative),
-                Some(SkipReason::RustJvmTestFixture),
-                "{class_name}.{method} must stay interpreted under the conservative policy"
-            );
-            assert_eq!(
-                check(class_name, method, false, true, SkipPolicy::Aggressive),
-                None,
-                "aggressive policy must lift the json-smart parser guard"
-            );
-            assert_eq!(
-                check_with(
-                    class_name,
-                    method,
-                    false,
-                    true,
-                    SkipPolicy::Conservative,
-                    &["net/minidev/json/parser/"],
-                ),
-                None,
-                "CRATONVM_JIT_ALLOW_PACKAGES=net/minidev/json/parser/ must lift the guard"
-            );
+            for policy in [SkipPolicy::Conservative, SkipPolicy::Aggressive] {
+                assert_eq!(
+                    check(class_name, method, false, true, policy),
+                    None,
+                    "{class_name}.{method} must be JIT-eligible now that JSONSMART-PARSER.1 is removed"
+                );
+            }
         }
-        assert_eq!(
-            check(
-                "net/minidev/json/writer/JsonReaderI",
-                "read",
-                false,
-                true,
-                SkipPolicy::Conservative,
-            ),
-            None,
-            "the json-smart guard is intentionally limited to the parser package"
-        );
     }
 
     #[test]
