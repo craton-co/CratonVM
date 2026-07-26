@@ -579,7 +579,14 @@ impl JvmtiCapabilities {
             can_get_source_file_name: true,
             can_get_line_numbers: true,
             can_get_source_debug_extension: true,
-            can_access_local_variables: true,
+            // obsaudit D2 (2026-07-26): `get_local_*`/`set_local_*` read and
+            // write a side table, never a real interpreter/JIT frame — see
+            // the GAP note above `set_local_variable_table` below.
+            // `GetPotentialCapabilities` must not claim this works; a
+            // well-behaved caller checks potential capabilities before
+            // `AddCapabilities`, and `add_capabilities` below now enforces
+            // it regardless.
+            can_access_local_variables: false,
             can_maintain_original_method_order: true,
             can_generate_single_step_events: true,
             can_generate_exception_events: true,
@@ -2239,38 +2246,43 @@ impl JvmtiEnv {
     // --- Local Variables ---
     //
     // -----------------------------------------------------------------------
-    // GAP (observability audit, 2026-07-26): `GetLocalVariable*` DOES NOT READ
-    // REAL FRAMES.
+    // obsaudit D2 (2026-07-26): `GetLocalVariable*` DOES NOT READ REAL FRAMES
+    // — PARTIALLY FIXED (capability negotiation is now honest; the
+    // underlying data source is still a side table, by design).
     // -----------------------------------------------------------------------
     // `get_local_int` / `_long` / `_float` / `_double` / `_object` read the
-    // `local_variables` side table. That table is written by exactly one set
-    // of functions: `set_local_variable_table` and `set_local_*` on this same
-    // `JvmtiEnv`. Outside `#[cfg(test)]`, nothing calls any of them — not the
-    // interpreter, not the JIT deopt path, not the stack walker.
+    // `local_variables` side table, written by `set_local_variable_table` /
+    // `set_local_*` on this same `JvmtiEnv`. Outside `#[cfg(test)]`, nothing
+    // calls any of them — not the interpreter, not the JIT deopt path, not
+    // the stack walker. Wiring this to real frames is NOT just a matter of
+    // plumbing a frame reference in: JVMTI's API is typed per slot —
+    // `GetLocalInt` on a slot that holds a reference must return
+    // `JVMTI_ERROR_TYPE_MISMATCH`, not a reinterpreted pointer — so the
+    // reader needs a per-slot *kind* (int/long/float/double/ref). The
+    // verifier type maps in `classloading/src/type_maps.rs` are
+    // **oop-vs-not only**: they can say "slot 3 holds a reference", which is
+    // what the GC needs, but cannot distinguish an `int` slot from a `float`
+    // slot or identify the second half of a `long`. Implementing
+    // `GetLocalVariable*` faithfully therefore needs either the class
+    // file's `LocalVariableTable` attribute (optional, absent from most
+    // release builds) or a widened slot-kind map — both larger, separate
+    // undertakings than this pass. That part of the gap remains open.
     //
-    // So on a live VM every `get_local_*` returns `JvmtiError::NoMoreFrames`
-    // (no side-table entry for `(thread, depth)`), and `can_access_local_variables`
-    // is nevertheless advertised as `true` in `JvmtiCapabilities::all()`. A
-    // debugger negotiating capabilities is told local-variable inspection
-    // works and then finds every frame empty. That failure mode reads as "the
-    // VM lost my frames", which is a much worse diagnosis than "unsupported".
+    // What IS fixed: `can_access_local_variables` used to be advertised as
+    // `true` in `potentially_available()` while granting it via
+    // `add_capabilities` and then finding every frame empty via the side
+    // table — the exact "VM lost my frames" failure mode described by the
+    // original audit. `potentially_available()` now reports `false`, and
+    // `add_capabilities` rejects a request for it with `NotAvailable`. A
+    // caller that checks potential capabilities before requesting (the
+    // JVMTI-spec-correct client behaviour) will not be misled.
     //
-    // Wiring this to real frames is NOT just a matter of plumbing a frame
-    // reference in. JVMTI's API is typed per slot — `GetLocalInt` on a slot
-    // that holds a reference must return `JVMTI_ERROR_TYPE_MISMATCH`, not a
-    // reinterpreted pointer — so the reader needs a per-slot *kind*
-    // (int/long/float/double/ref). The verifier type maps added in
-    // `classloading/src/type_maps.rs` are **oop-vs-not only**: they can say
-    // "slot 3 holds a reference", which is what the GC needs, but they cannot
-    // distinguish an `int` slot from a `float` slot or identify the second
-    // half of a `long`. Implementing `GetLocalVariable*` faithfully therefore
-    // needs either the class file's `LocalVariableTable` attribute (which is
-    // optional, and absent from most release builds) or a widened slot-kind
-    // map. Until one of those exists, returning an error is the honest
-    // behaviour and this note is the contract.
-    //
-    // The `set_local_*` half is genuinely useful as an embedder/test surface
-    // and is left as-is.
+    // The capability check was removed from all ten `get_local_*`/
+    // `set_local_*` methods below (it can never be satisfied through the
+    // real API anymore) so the side table remains usable exactly as before
+    // as an embedder/test surface — it was never real JVMTI local-variable
+    // access, and gating it behind a capability that can no longer be
+    // granted would have made it unusable even for that purpose.
 
     /// Set local variable values for a given thread and frame depth.
     pub fn set_local_variable_table(
@@ -2289,7 +2301,6 @@ impl JvmtiEnv {
 
     /// GetLocalVariableInt
     pub fn get_local_int(&self, thread: ThreadId, depth: u32, slot: u32) -> JvmtiResult<i32> {
-        self.require_capability(|c| c.can_access_local_variables)?;
         let locals = self
             .local_variables
             .read()
@@ -2306,7 +2317,6 @@ impl JvmtiEnv {
 
     /// GetLocalVariableLong
     pub fn get_local_long(&self, thread: ThreadId, depth: u32, slot: u32) -> JvmtiResult<i64> {
-        self.require_capability(|c| c.can_access_local_variables)?;
         let locals = self
             .local_variables
             .read()
@@ -2323,7 +2333,6 @@ impl JvmtiEnv {
 
     /// GetLocalVariableFloat
     pub fn get_local_float(&self, thread: ThreadId, depth: u32, slot: u32) -> JvmtiResult<f32> {
-        self.require_capability(|c| c.can_access_local_variables)?;
         let locals = self
             .local_variables
             .read()
@@ -2340,7 +2349,6 @@ impl JvmtiEnv {
 
     /// GetLocalVariableDouble
     pub fn get_local_double(&self, thread: ThreadId, depth: u32, slot: u32) -> JvmtiResult<f64> {
-        self.require_capability(|c| c.can_access_local_variables)?;
         let locals = self
             .local_variables
             .read()
@@ -2362,7 +2370,6 @@ impl JvmtiEnv {
         depth: u32,
         slot: u32,
     ) -> JvmtiResult<Option<u64>> {
-        self.require_capability(|c| c.can_access_local_variables)?;
         let locals = self
             .local_variables
             .read()
@@ -2385,7 +2392,6 @@ impl JvmtiEnv {
         slot: u32,
         value: i32,
     ) -> JvmtiResult<()> {
-        self.require_capability(|c| c.can_access_local_variables)?;
         let mut locals = self
             .local_variables
             .write()
@@ -2403,7 +2409,6 @@ impl JvmtiEnv {
         slot: u32,
         value: i64,
     ) -> JvmtiResult<()> {
-        self.require_capability(|c| c.can_access_local_variables)?;
         let mut locals = self
             .local_variables
             .write()
@@ -2421,7 +2426,6 @@ impl JvmtiEnv {
         slot: u32,
         value: f32,
     ) -> JvmtiResult<()> {
-        self.require_capability(|c| c.can_access_local_variables)?;
         let mut locals = self
             .local_variables
             .write()
@@ -2439,7 +2443,6 @@ impl JvmtiEnv {
         slot: u32,
         value: f64,
     ) -> JvmtiResult<()> {
-        self.require_capability(|c| c.can_access_local_variables)?;
         let mut locals = self
             .local_variables
             .write()
@@ -2457,7 +2460,6 @@ impl JvmtiEnv {
         slot: u32,
         value: Option<u64>,
     ) -> JvmtiResult<()> {
-        self.require_capability(|c| c.can_access_local_variables)?;
         let mut locals = self
             .local_variables
             .write()
@@ -2606,7 +2608,18 @@ impl JvmtiEnv {
     // --- Capabilities ---
 
     /// AddCapabilities: request additional capabilities.
+    ///
+    /// obsaudit D2 (2026-07-26): rejects `can_access_local_variables`
+    /// explicitly — `potentially_available()` already reports it `false`;
+    /// this is the enforcement half, so a caller cannot be granted a
+    /// capability this env has already declared it cannot honor. No other
+    /// field is checked against `potentially_available()` here: every other
+    /// capability in that function is `true` today, so a generic per-field
+    /// loop would be a no-op everywhere except this one case.
     pub fn add_capabilities(&self, requested: &JvmtiCapabilities) -> JvmtiResult<()> {
+        if requested.can_access_local_variables {
+            return Err(JvmtiError::NotAvailable);
+        }
         let mut caps = self
             .capabilities
             .write()
@@ -3340,18 +3353,19 @@ mod tests {
 
     /// `GetLocalVariable*` reads a side table that no production code writes.
     /// This test pins the current, documented behaviour: on a fresh env there
-    /// are no frames to read, even though `can_access_local_variables` is
-    /// advertised. If someone wires locals to real interpreter frames, this
-    /// test SHOULD fail — and the gap note above the local-variable section
-    /// must be removed in the same change.
+    /// are no frames to read. If someone wires locals to real interpreter
+    /// frames, this test SHOULD fail — and the gap note above the
+    /// local-variable section must be updated in the same change.
+    ///
+    /// obsaudit D2 (2026-07-26): the capability gate was removed from these
+    /// methods (see the gap note) since `can_access_local_variables` can no
+    /// longer be granted through `add_capabilities` — see
+    /// `obsaudit_local_variable_capability_is_honestly_unavailable` for that
+    /// half. This test now exercises the side table directly, with no
+    /// capability negotiation step.
     #[test]
     fn obsaudit_get_local_reads_side_table_not_real_frames() {
         let env = make_test_env();
-        env.add_capabilities(&JvmtiCapabilities {
-            can_access_local_variables: true,
-            ..Default::default()
-        })
-        .unwrap();
 
         // No `set_local_*` call has happened, and nothing else populates the
         // table, so there is no frame at any depth for any thread.
@@ -3365,6 +3379,33 @@ mod tests {
         // Typed access is enforced against the side table's own tag, which is
         // the one JVMTI-conformant behaviour that survives here.
         assert_eq!(env.get_local_long(1, 0, 0), Err(JvmtiError::TypeMismatch));
+    }
+
+    /// obsaudit D2: a caller that checks `GetPotentialCapabilities` before
+    /// `AddCapabilities` (the JVMTI-spec-correct order) must be told
+    /// up front that local-variable access is unavailable, and a caller
+    /// that requests it anyway must be refused — not granted and then left
+    /// to discover empty frames on its own.
+    #[test]
+    fn obsaudit_local_variable_capability_is_honestly_unavailable() {
+        assert!(!JvmtiCapabilities::potentially_available().can_access_local_variables);
+
+        let env = make_test_env();
+        let result = env.add_capabilities(&JvmtiCapabilities {
+            can_access_local_variables: true,
+            ..Default::default()
+        });
+        assert_eq!(result, Err(JvmtiError::NotAvailable));
+        assert!(!env.get_capabilities().unwrap().can_access_local_variables);
+
+        // Requesting other, genuinely-available capabilities alongside it
+        // must still work — the rejection is specific to this one field.
+        env.add_capabilities(&JvmtiCapabilities {
+            can_suspend: true,
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(env.get_capabilities().unwrap().can_suspend);
     }
 
     fn make_thread_info(name: &str) -> ThreadInfo {
@@ -3636,12 +3677,9 @@ mod tests {
 
     #[test]
     fn test_local_variables() {
+        // obsaudit D2: no capability negotiation needed — see the gap note
+        // above `set_local_variable_table`.
         let env = make_test_env();
-        env.add_capabilities(&JvmtiCapabilities {
-            can_access_local_variables: true,
-            ..Default::default()
-        })
-        .unwrap();
 
         let mut vars = HashMap::new();
         vars.insert(0, LocalValue::Int(42));
@@ -3665,12 +3703,9 @@ mod tests {
 
     #[test]
     fn test_local_variable_set() {
+        // obsaudit D2: no capability negotiation needed — see the gap note
+        // above `set_local_variable_table`.
         let env = make_test_env();
-        env.add_capabilities(&JvmtiCapabilities {
-            can_access_local_variables: true,
-            ..Default::default()
-        })
-        .unwrap();
 
         env.set_local_int(1, 0, 0, 99).unwrap();
         assert_eq!(env.get_local_int(1, 0, 0).unwrap(), 99);
@@ -3689,16 +3724,19 @@ mod tests {
     }
 
     #[test]
-    fn test_local_variables_require_capability() {
-        let env = make_test_env(); // no capabilities
-        assert_eq!(
-            env.get_local_int(1, 0, 0),
-            Err(JvmtiError::MustPossessCapability)
-        );
-        assert_eq!(
-            env.set_local_int(1, 0, 0, 1),
-            Err(JvmtiError::MustPossessCapability)
-        );
+    fn test_local_variables_no_longer_require_capability() {
+        // obsaudit D2 (2026-07-26): renamed from
+        // test_local_variables_require_capability, which pinned the
+        // opposite behaviour. can_access_local_variables can no longer be
+        // granted (see obsaudit_local_variable_capability_is_honestly_
+        // unavailable), so gating these methods behind it would make the
+        // side-table embedder/test surface permanently unusable. The gate
+        // was removed instead — these methods now work with no capability
+        // negotiation step, same as `set_local_variable_table` already did.
+        let env = make_test_env(); // no capabilities granted
+        assert_eq!(env.get_local_int(1, 0, 0), Err(JvmtiError::NoMoreFrames));
+        assert_eq!(env.set_local_int(1, 0, 0, 1), Ok(()));
+        assert_eq!(env.get_local_int(1, 0, 0), Ok(1));
     }
 
     #[test]
@@ -3951,7 +3989,9 @@ mod tests {
         let all = JvmtiCapabilities::potentially_available();
         assert!(all.can_redefine_classes);
         assert!(all.can_retransform_classes);
-        assert!(all.can_access_local_variables);
+        // obsaudit D2: NOT potentially available — see
+        // obsaudit_local_variable_capability_is_honestly_unavailable.
+        assert!(!all.can_access_local_variables);
         assert!(all.can_suspend);
         assert!(all.can_generate_breakpoint_events);
     }

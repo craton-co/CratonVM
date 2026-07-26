@@ -79,31 +79,46 @@ workers / foreign JNI attach) rather than a hardcoded 0. See
 `jvmti_fire_hooks_dispatch_when_installed` (updated for deferred firing),
 `jvmti_current_thread_id_defaults_to_zero_and_is_settable`.
 
-### D2 — `GetLocalVariable*` reads a side table, not real frames
+### D2 — `GetLocalVariable*` reads a side table, not real frames — **PARTIALLY FIXED (capability negotiation now honest)**
 
 *Confirmed.* `JvmtiEnv::local_variables` is a
 `HashMap<(ThreadId, u32), HashMap<u32, LocalValue>>` written only by
 `set_local_variable_table` / `set_local_*` on the same `JvmtiEnv`. Nothing in
 the interpreter, the JIT deopt path, or the stack walker writes to it. On a
-live VM every `get_local_*` returns `JVMTI_ERROR_NO_MORE_FRAMES` — while
-`JvmtiCapabilities::all()` advertises `can_access_local_variables: true`.
+live VM every `get_local_*` returned `JVMTI_ERROR_NO_MORE_FRAMES` — while
+`JvmtiCapabilities::potentially_available()` advertised
+`can_access_local_variables: true`.
 
-**Failure scenario:** a debugger negotiates the capability, is told local
-inspection works, and then finds every frame empty. That reads as "the VM lost
-my frames", a far worse diagnosis than "unsupported".
-
-Per the wave's cross-reference: implementing this faithfully needs a per-slot
-*kind* (int/long/float/double/ref), because `GetLocalInt` on a reference slot
-must return `TYPE_MISMATCH` rather than a reinterpreted pointer. The new
-verifier type maps in `classloading/src/type_maps.rs` are **oop-vs-not only** —
-they answer the GC's question ("is slot 3 a reference?") but cannot separate an
-`int` slot from a `float` slot, nor identify the upper half of a `long`. So the
-type maps are *not* sufficient to wire this up. The remaining options are the
+Implementing this faithfully needs a per-slot *kind* (int/long/float/double/
+ref), because `GetLocalInt` on a reference slot must return `TYPE_MISMATCH`
+rather than a reinterpreted pointer. The verifier type maps in
+`classloading/src/type_maps.rs` are **oop-vs-not only** — they answer the
+GC's question ("is slot 3 a reference?") but cannot separate an `int` slot
+from a `float` slot, nor identify the upper half of a `long`. So the type
+maps are *not* sufficient to wire this up. The remaining options are the
 optional `LocalVariableTable` class-file attribute (absent from most release
-builds) or a widened slot-kind map.
+builds) or a widened slot-kind map — both larger, separate undertakings. That
+part is **still open** and was out of scope for this pass.
 
-Documented in-file; contract pinned by
-`obsaudit_get_local_reads_side_table_not_real_frames`.
+**What was fixed (2026-07-26):** the failure scenario this defect actually
+warned about — "a debugger negotiates the capability, is told local
+inspection works, and then finds every frame empty" — is closed.
+`JvmtiCapabilities::potentially_available()` now reports
+`can_access_local_variables: false`, and `add_capabilities` rejects a request
+for it with `NotAvailable` rather than silently granting it. A caller that
+checks potential capabilities before requesting (the JVMTI-spec-correct
+order) is told up front, not left to discover empty frames on its own. The
+capability check was removed from the ten `get_local_*`/`set_local_*`
+methods (it could otherwise never be satisfied again), so the side table
+keeps working exactly as before as the embedder/test surface it always was —
+it was never real JVMTI local-variable access, and gating it behind a
+now-permanently-unavailable capability would have made even that unusable.
+
+Documented in-file; the original contract pin
+(`obsaudit_get_local_reads_side_table_not_real_frames`) still pins the
+"side table, not real frames" behavior (now without a capability
+negotiation step). New: `obsaudit_local_variable_capability_is_honestly_
+unavailable` pins the capability-honesty half.
 
 ### D3 — `jcmd JFR.start` / `JFR.stop` / `JFR.dump` reported success without touching the recorder — **FIXED**
 
@@ -360,7 +375,7 @@ warning against "wiring up jcmd" by simply constructing a `JcmdProcessor` —
 | `vm/src/runtime/hprof.rs` | D6, D7, D8, D9, D10, D11 fixed; module LIVENESS block; 4 tests (original pass) |
 | `vm/src/runtime/serviceability.rs` | D3, D4 fixed; D15 + module LIVENESS block; 3 tests (replacing 4 that asserted the fabricated output) |
 | `vm/src/runtime/instrument.rs` | D5 fixed (`class_file_this_class` validator); 4 tests |
-| `vm/src/runtime/jvmti.rs` | D1 fixed (deferred hook firing + real thread id); D13 fixed (dead `AgentRegistry` removed, -8 tests); D14 bridged (`install_real_agent_env_bridge`, 9 event kinds); D2 documented; LIVENESS block updated throughout |
+| `vm/src/runtime/jvmti.rs` | D1 fixed (deferred hook firing + real thread id); D2 partially fixed (honest capability negotiation; frame access itself still open); D13 fixed (dead `AgentRegistry` removed, -8 tests); D14 bridged (`install_real_agent_env_bridge`, 9 event kinds); LIVENESS block updated throughout |
 | `classloading/src/class_manager.rs` | D1: deferred-queue hook firing, `set_current_thread_id`/`current_thread_id`, `drain_pending_class_hooks`; 2 new tests |
 | `vm/src/vm/realms/class_realm.rs` | D1: `ClassManagerWriteGuard` + `class_manager_write()`, now the sole L10 write-lock accessor workspace-wide |
 | `vm/src/vm/vm_init.rs`, `vm/src/vm/vm_exec.rs`, `vm/src/native/jni.rs` | D1: bind real thread id at the 3 thread-registration sites; D14: install the bridge in `Vm::new`; removed a redundant/incorrect ad hoc `ClassLoad` notify in `vm_init.rs` |
