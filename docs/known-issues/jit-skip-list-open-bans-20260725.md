@@ -207,5 +207,21 @@ still real correctness bugs worth closing):
    2026-07-25 TLAB-header finding, or whether it's stale like the JUnit
    iterator ban may be.
 3. ANTLR.1 narrowing (7 specific methods already named in the comment).
+   **CLAIMED by `fix/jit-ban-sweep2-20260726` / `wt-jitsweep2-20260726`,
+   2026-07-26 ~02:30 UTC.** Note before starting: the "narrowing" is
+   actually already done at the code level — `is_antlr_prediction_context_miscompile`
+   (skip_list.rs ~L3199, the exact 7 methods this item names) is already an
+   *unconditional* guard, active regardless of policy/`CRATONVM_JIT_ALLOW_PACKAGES`
+   (see ANTLR-COLDPATH.1's comment, ~L744: "stays interpreted even when
+   `CRATONVM_JIT_ALLOW_PACKAGES=groovyjarjarantlr4/` lifts the surrounding
+   package"). So the *correctness* reason (reason 1 in ANTLR.1's own
+   comment) is already independently covered. The real remaining question
+   is whether the *throughput* reason (reason 2: "~8x slower cold parse
+   under JIT") still holds post today's perf-focused JIT rework
+   (compressed oops / bytecode quickening / IR call lowering) — if not,
+   the broader `groovyjarjarantlr4/` blanket ban (Conservative-only) could
+   be lifted while the narrow 7-method guard stays as the correctness
+   safety net. Plan: find/build a Groovy parse benchmark, compare cold-parse
+   wall-clock lifted vs. baseline.
 4. Work down the "Medium" list — each is single-suite, well-scoped, lower
    risk of interacting with concurrent work elsewhere.
