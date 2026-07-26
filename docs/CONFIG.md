@@ -230,6 +230,12 @@ All are **off by default** (the default posture is JDK-faithful single-tenant).
 > `CRATONVM_TRACE_*`, and `CRATONVM_*_DBG` variable is an **internal
 > developer/debug switch** (tracing, GC stress, JIT bisection, etc.). They are
 > not a supported configuration surface, may change or disappear without
-> notice, and are intentionally not enumerated here. Discover them with
-> `grep -rhoE "CRATONVM_[A-Z0-9_]+" --include=*.rs vm/ gc/ jit/ native-*` if you
-> are working on the VM internals.
+> notice, and are intentionally not enumerated here.
+>
+> They *are* enumerated — with call sites, cache status, and a
+> debug / semantics-changing / test-only / dead classification — in
+> [`docs/internal/flag-census.md`](internal/flag-census.md). Regenerate it
+> with `python3 tools/flag-census/render.py`. Read it before adding a new
+> flag: roughly a fifth of the `CRATONVM_*` identifiers in the tree are dead,
+> and several flags still documented in runbooks are no-ops because a later
+> default flip replaced them with an inverted `NO_*` spelling.

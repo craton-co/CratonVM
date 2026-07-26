@@ -11,7 +11,7 @@ found" below).
 
 ## Original report
 
-See git history for the original report (`docs/known-issues/keycloak/pom-xml-declaration-char-corruption-breaks-quarkus-maven-bootstrap.md`,
+See git history for the original report (`../../known-issues/keycloak/pom-xml-declaration-char-corruption-breaks-quarkus-maven-bootstrap.md`,
 authored 2026-07-13 12:46, commit 057257d2b): 130 `tests/base` classes failed to resolve
 `keycloak-test-framework-remote-providers`/`keycloak-tests-custom-providers` at server-bootstrap time, with the
 `.err.log` for every one showing `XmlPullParserException: only whitespace content allowed before start tag and

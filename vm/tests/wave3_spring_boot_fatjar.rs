@@ -61,6 +61,7 @@ fn spring_boot_natives_are_registered() {
     // mode so the URL.toURI -> File round-trip can normalise on Windows.
     assert!(
         shared
+            .natives
             .native_methods
             .find("java/io/File", "<init>", "(Ljava/lang/String;)V")
             .is_some(),
@@ -69,6 +70,7 @@ fn spring_boot_natives_are_registered() {
     );
     assert!(
         shared
+            .natives
             .native_methods
             .find("java/io/File", "exists", "()Z")
             .is_some(),
@@ -79,6 +81,7 @@ fn spring_boot_natives_are_registered() {
     // can open the fat-jar via the Rust zip crate.
     assert!(
         shared
+            .natives
             .native_methods
             .find("java/util/jar/JarFile", "<init>", "(Ljava/io/File;)V")
             .is_some(),
@@ -87,6 +90,7 @@ fn spring_boot_natives_are_registered() {
     );
     assert!(
         shared
+            .natives
             .native_methods
             .find(
                 "java/util/jar/JarFile",
@@ -102,6 +106,7 @@ fn spring_boot_natives_are_registered() {
     // walks this entry point first when launching a fat-jar.
     assert!(
         shared
+            .natives
             .native_methods
             .find(
                 "java/lang/Class",

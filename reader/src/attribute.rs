@@ -45,7 +45,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use crate::buffer::ClassFileBuffer;
-use crate::byte_view::ByteView;
+use crate::byte_view::{ByteView, SharedBytes};
 use crate::class_reader_error::ClassReaderError;
 use crate::constant_pool::ConstantPool;
 
@@ -555,7 +555,7 @@ pub enum LazyAttribute {
         /// `Arc<str>` from the constant pool's string pool.
         name: Arc<str>,
         /// The shared backing buffer (typically the whole class file).
-        source: Arc<[u8]>,
+        source: SharedBytes,
         /// Byte range within `source` containing the attribute body.
         range: Range<usize>,
     },
@@ -569,7 +569,12 @@ impl LazyAttribute {
     /// This is the zero-copy constructor: callers that already hold the
     /// class file as an `Arc<[u8]>` clone the Arc (refcount bump, no
     /// memcpy) and hand it in alongside the body's `start..end` range.
-    pub fn new_raw_in(name: Arc<str>, source: Arc<[u8]>, range: Range<usize>) -> Self {
+    pub fn new_raw_in(
+        name: Arc<str>,
+        source: impl Into<SharedBytes>,
+        range: Range<usize>,
+    ) -> Self {
+        let source = source.into();
         debug_assert!(
             range.end <= source.len(),
             "LazyAttribute::new_raw_in: range {:?} exceeds source len {}",
@@ -598,7 +603,7 @@ impl LazyAttribute {
     ///
     /// [`new_raw_in`]: LazyAttribute::new_raw_in
     pub fn new_raw(name: Arc<str>, bytes: Vec<u8>) -> Self {
-        let source: Arc<[u8]> = bytes.into();
+        let source = SharedBytes::from(bytes);
         let len = source.len();
         Self::new_raw_in(name, source, 0..len)
     }
@@ -644,7 +649,7 @@ impl LazyAttribute {
         } = self
         {
             let name = name.clone();
-            let source = Arc::clone(source);
+            let source = source.clone();
             let range = range.clone();
             // Round 7 audit fix (MED #7): route through the `Arc<str>`
             // entrypoint so the body dispatch can use `Arc::ptr_eq`
@@ -873,7 +878,7 @@ pub fn decode_attribute(
     // Wrap the owned bytes once in a fresh `Arc<[u8]>` so the body
     // decoders that need slices for `Arc<[u8]>` payloads can share the
     // allocation rather than each performing their own `.to_vec()`.
-    let source: Arc<[u8]> = Arc::from(bytes);
+    let source = SharedBytes::from(bytes);
     // Round 7 audit fix (MED #7): the body decoder dispatches on the
     // attribute name via `Arc::ptr_eq` against canonical interned
     // forms. The eager API takes `&str` for back-compat, so intern it
@@ -896,7 +901,7 @@ pub fn decode_attribute(
 /// see `docs/round5-reader.md` CRIT-1.)
 pub fn decode_attribute_with_source(
     name: &str,
-    source: &Arc<[u8]>,
+    source: &SharedBytes,
     range: Range<usize>,
     cp: &ConstantPool,
 ) -> Result<Attribute, ClassReaderError> {
@@ -914,7 +919,7 @@ pub fn decode_attribute_with_source(
 /// because the caller already holds the constant-pool-interned arc.
 pub fn decode_attribute_with_source_arc(
     name: &Arc<str>,
-    source: &Arc<[u8]>,
+    source: &SharedBytes,
     range: Range<usize>,
     cp: &ConstantPool,
 ) -> Result<Attribute, ClassReaderError> {
@@ -999,7 +1004,7 @@ fn decode_attribute_body(
     length: usize,
     buf: &mut ClassFileBuffer<'_>,
     cp: &ConstantPool,
-    source: &Arc<[u8]>,
+    source: &SharedBytes,
     body_offset: usize,
     depth: usize,
 ) -> Result<Attribute, ClassReaderError> {
@@ -1209,7 +1214,7 @@ fn decode_attribute_body(
             // `try_new` so an OOB range surfaces as `InvalidClassData`
             // rather than panicking (round-11 off-by-`buf.position()`
             // regression).
-            let entries = ByteView::try_new(Arc::clone(source), start..start + length)?;
+            let entries = ByteView::try_new(source.clone(), start..start + length)?;
             Attribute::StackMapTable { entries }
         }
         "BootstrapMethods" => {
@@ -1500,7 +1505,7 @@ fn decode_attribute_body(
             let _ = buf.read_bytes(length)?;
             // Defense-in-depth: see `StackMapTable` arm — runtime-
             // derived offset/length must not panic on OOB.
-            let data = ByteView::try_new(Arc::clone(source), start..start + length)?;
+            let data = ByteView::try_new(source.clone(), start..start + length)?;
             // Round 7 audit fix (MED #7): `name` is already an
             // interned `Arc<str>` (the caller passed in the canonical
             // pool-interned arc); just refcount-bump instead of
@@ -1530,7 +1535,7 @@ fn decode_attribute_body(
 fn decode_attributes_vec(
     buf: &mut ClassFileBuffer<'_>,
     cp: &ConstantPool,
-    source: &Arc<[u8]>,
+    source: &SharedBytes,
     outermost_body_offset: usize,
     depth: usize,
 ) -> Result<Vec<Attribute>, ClassReaderError> {
@@ -1617,7 +1622,7 @@ fn decode_attributes_vec(
 fn decode_code_body(
     buf: &mut ClassFileBuffer<'_>,
     cp: &ConstantPool,
-    source: &Arc<[u8]>,
+    source: &SharedBytes,
     body_offset: usize,
     depth: usize,
 ) -> Result<Attribute, ClassReaderError> {
@@ -1648,7 +1653,7 @@ fn decode_code_body(
     // code_length` range goes through `try_new` so a malformed Code
     // body produces `InvalidClassData` instead of aborting the process
     // (the round-11 panic shipped from this very call site).
-    let code = ByteView::try_new(Arc::clone(source), code_start..code_start + code_length)?;
+    let code = ByteView::try_new(source.clone(), code_start..code_start + code_length)?;
 
     // Round 7 audit fix (MED #6 / round-4 #4): bulk slice parse of the
     // ExceptionTable — replaces four per-`u16` `read_u16()` calls per
@@ -3189,7 +3194,7 @@ mod tests {
         // hands `body_offset = range.start` to decode_attribute_body.
         // We exercise it through `decode_attribute_with_source` which is
         // the canonical entry used by the class reader.
-        let source: Arc<[u8]> = Arc::from(body.as_slice());
+        let source = SharedBytes::from(body.as_slice());
         let attr = decode_attribute_with_source("Code", &source, 0..source.len(), &cp)
             .expect("Code with nested StackMapTable must decode");
 
@@ -3251,7 +3256,7 @@ mod tests {
         source_bytes.extend_from_slice(&code_body);
         source_bytes.extend_from_slice(&trailing);
 
-        let source: Arc<[u8]> = Arc::from(source_bytes.as_slice());
+        let source = SharedBytes::from(source_bytes.as_slice());
         let range = preamble.len()..preamble.len() + code_body.len();
         let attr = decode_attribute_with_source("Code", &source, range, &cp)
             .expect("Code with nested StackMapTable must decode");
@@ -3298,7 +3303,7 @@ mod tests {
         // — pick an `Unknown` body shape: total body bytes = 6, fully
         // consumed by the verbatim payload.
         let source_bytes = vec![0x00u8, 0x11, 0x22, 0x33];
-        let source: Arc<[u8]> = Arc::from(source_bytes.as_slice());
+        let source = SharedBytes::from(source_bytes.as_slice());
         // range.end deliberately exceeds source.len() (8 > 4). The
         // buffer slice will be `&source[range]` which actually clamps
         // — no, std panics on OOB slice — so use ptr arithmetic via
@@ -3334,7 +3339,7 @@ mod tests {
         // The Err value that the migrated `?` operator forwards is the
         // same one `ByteView::try_new` itself produces. Confirm the
         // direct constructor surfaces InvalidClassData (never panics).
-        let oob = ByteView::try_new(Arc::clone(&source), 0..100);
+        let oob = ByteView::try_new(source.clone(), 0..100);
         assert!(matches!(
             oob,
             Err(ClassReaderError::InvalidClassData { .. })
@@ -3351,7 +3356,7 @@ mod tests {
         bogus_code.extend_from_slice(&1u16.to_be_bytes()); // max_locals
         bogus_code.extend_from_slice(&9999u32.to_be_bytes()); // code_length
         bogus_code.extend_from_slice(&[0x2A, 0xB1]); // only 2 code bytes present
-        let bogus_source: Arc<[u8]> = Arc::from(bogus_code.as_slice());
+        let bogus_source = SharedBytes::from(bogus_code.as_slice());
         let res = decode_attribute_with_source("Code", &bogus_source, 0..bogus_source.len(), &cp);
         assert!(
             res.is_err(),
@@ -3410,7 +3415,7 @@ mod tests {
             body = code_body(Some(body));
         }
 
-        let source: Arc<[u8]> = Arc::from(body.as_slice());
+        let source = SharedBytes::from(body.as_slice());
         let res = decode_attribute_with_source("Code", &source, 0..source.len(), &cp);
         assert!(
             matches!(res, Err(ClassReaderError::InvalidClassData { .. })),
@@ -3458,7 +3463,7 @@ mod tests {
             body = record_body(Some(body));
         }
 
-        let source: Arc<[u8]> = Arc::from(body.as_slice());
+        let source = SharedBytes::from(body.as_slice());
         let res = decode_attribute_with_source("Record", &source, 0..source.len(), &cp);
         assert!(
             matches!(res, Err(ClassReaderError::InvalidClassData { .. })),

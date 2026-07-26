@@ -512,7 +512,7 @@ pub fn try_dispatch(
     // (`execute_invokestatic` calls `ensure_class_initialized_shared`
     // before reaching this hook), so the class is guaranteed in the
     // manager.
-    let cm = shared.class_manager.read();
+    let cm = shared.classes.class_manager.read();
     let class_id = match cm.get_loaded_class_id(class_name) {
         Some(id) => id,
         None => return Ok(DispatchOutcome::FallThrough),
@@ -689,8 +689,8 @@ fn largest_primitive_array_len(
     let mut max_len = 0usize;
     for arg in args {
         if let cratonvm_types::Value::Object(Some(r)) = arg {
-            if shared.heap.array_element_type(*r).is_some() {
-                let len = shared.heap.array_length(*r);
+            if shared.mem.heap.array_element_type(*r).is_some() {
+                let len = shared.mem.heap.array_length(*r);
                 if len > max_len {
                     max_len = len;
                 }
@@ -2274,7 +2274,7 @@ pub fn dispatch_method_from_native_on_stream(
                 format!("submitMethod: load class failed for {class_name}: {e:?}"),
             );
         }
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let class_id = match cm.get_loaded_class_id(class_name) {
             Some(id) => id,
             None => {
@@ -2463,7 +2463,7 @@ pub fn dispatch_method_from_native_on_stream(
     //    the FinalizeState keeps the GC paused for the rest of
     //    the submission's life.
     let gc_guard = GcCriticalGuard::acquire();
-    let token = shared.heap.enter_gpu_critical();
+    let token = shared.mem.heap.enter_gpu_critical();
 
     // 7. Marshal Java args into KernelArgs + remember writebacks.
     //    `max_array_len` tracks the largest array length we marshal —
@@ -2530,14 +2530,14 @@ pub fn dispatch_method_from_native_on_stream(
         // 7b. Resolve each field name → slot on the receiver's
         //     concrete class, read the field, marshal it as a
         //     primitive-array kernel arg.
-        let receiver_class_id = shared.heap.class_id_of(receiver);
+        let receiver_class_id = shared.mem.heap.class_id_of(receiver);
         for (i, field_name) in this_field_names.iter().enumerate() {
             // Walk the class hierarchy starting at the receiver's
             // concrete class — the field may be declared on the
             // declared class (which equals receiver_class_id when the
             // receiver is exactly that class) or on a superclass.
             let slot: usize = {
-                let cm = shared.class_manager.read();
+                let cm = shared.classes.class_manager.read();
                 let mut current = Some(receiver_class_id);
                 let mut found: Option<usize> = None;
                 while let Some(cid) = current {
@@ -2562,7 +2562,7 @@ pub fn dispatch_method_from_native_on_stream(
                     }
                 }
             };
-            let field_val = shared.heap.get_field(receiver, slot);
+            let field_val = shared.mem.heap.get_field(receiver, slot);
             let field_obj = match field_val {
                 Value::Object(Some(o)) => o,
                 Value::Object(None) => {
@@ -2585,7 +2585,7 @@ pub fn dispatch_method_from_native_on_stream(
                     );
                 }
             };
-            let Some(etype) = shared.heap.array_element_type(field_obj) else {
+            let Some(etype) = shared.mem.heap.array_element_type(field_obj) else {
                 drop(token);
                 return record_failed_submission(
                     Some(stream.clone()),
@@ -2602,7 +2602,7 @@ pub fn dispatch_method_from_native_on_stream(
             // conservative and treat each as kernel-written, which
             // preserves the pre-Phase-10 #2 behaviour (always D→H
             // copy back) for this less-common code path.
-            let pthis_len = shared.heap.array_length(field_obj);
+            let pthis_len = shared.mem.heap.array_length(field_obj);
             match marshal_array_arg(shared, ctx, field_obj, etype, true, &token) {
                 Ok((args_after, wb_opt, bytes)) => {
                     kernel_args = args_after(kernel_args);
@@ -2635,7 +2635,7 @@ pub fn dispatch_method_from_native_on_stream(
             Value::Double(v) => kernel_args = kernel_args.push_f64(f64::from_bits(v.to_bits())),
             Value::Object(Some(obj_ref)) => {
                 // First: is it a primitive array?
-                if let Some(element_type) = shared.heap.array_element_type(*obj_ref) {
+                if let Some(element_type) = shared.mem.heap.array_element_type(*obj_ref) {
                     // Phase 10 #2 — `i` is the index inside
                     // `java_args_to_marshal`, which lines up 1:1 with
                     // the analyzer's `param_kinds[i]` for static
@@ -2645,7 +2645,7 @@ pub fn dispatch_method_from_native_on_stream(
                     // into this param, so we can safely skip the
                     // post-launch D→H copy.
                     let is_written = (writes_param_mask >> i) & 1 == 1;
-                    let arr_len = shared.heap.array_length(*obj_ref);
+                    let arr_len = shared.mem.heap.array_length(*obj_ref);
                     match marshal_array_arg(shared, ctx, *obj_ref, element_type, is_written, &token)
                     {
                         Ok((args_after, wb_opt, bytes)) => {
@@ -3711,22 +3711,22 @@ impl MarshalWriteback {
             // Download the kernel-written buffer straight into the JVM heap
             // arena (no staging Vec + write-back) when the array is contiguous.
             Self::I32 { obj, buf, .. } => {
-                gpu_marshal::download_obj_i32(buf.as_ref(), *obj, &shared.heap, token)
+                gpu_marshal::download_obj_i32(buf.as_ref(), *obj, &shared.mem.heap, token)
                     .map_err(|e| format!("download i32: {e}"))?;
                 Ok(None)
             }
             Self::I64 { obj, buf, .. } => {
-                gpu_marshal::download_obj_i64(buf.as_ref(), *obj, &shared.heap, token)
+                gpu_marshal::download_obj_i64(buf.as_ref(), *obj, &shared.mem.heap, token)
                     .map_err(|e| format!("download i64: {e}"))?;
                 Ok(None)
             }
             Self::F32 { obj, buf, .. } => {
-                gpu_marshal::download_obj_f32(buf.as_ref(), *obj, &shared.heap, token)
+                gpu_marshal::download_obj_f32(buf.as_ref(), *obj, &shared.mem.heap, token)
                     .map_err(|e| format!("download f32: {e}"))?;
                 Ok(None)
             }
             Self::F64 { obj, buf, .. } => {
-                gpu_marshal::download_obj_f64(buf.as_ref(), *obj, &shared.heap, token)
+                gpu_marshal::download_obj_f64(buf.as_ref(), *obj, &shared.mem.heap, token)
                     .map_err(|e| format!("download f64: {e}"))?;
                 Ok(None)
             }
@@ -3850,15 +3850,15 @@ fn try_gpu_array_snapshot(
     shared: &crate::vm::SharedVm,
     obj_ref: cratonvm_types::ObjectRef,
 ) -> Option<(cratonvm_types::ArrayElementType, usize, Vec<u8>, u64)> {
-    let cid = shared.heap.class_id_of(obj_ref);
-    let cm = shared.class_manager.read();
+    let cid = shared.mem.heap.class_id_of(obj_ref);
+    let cm = shared.classes.class_manager.read();
     let cls_name = cm.get_class(cid).map(|c| c.name.to_string())?;
     drop(cm);
     if cls_name != "craton/gpu/GpuArray" {
         return None;
     }
     // field 0 holds the long `handle`.
-    let handle = match shared.heap.get_field(obj_ref, 0) {
+    let handle = match shared.mem.heap.get_field(obj_ref, 0) {
         cratonvm_types::Value::Long(h) => h as u64,
         _ => return None,
     };
@@ -3991,11 +3991,11 @@ fn try_unbox_primitive(
     shared: &crate::vm::SharedVm,
     obj_ref: cratonvm_types::ObjectRef,
 ) -> Option<cratonvm_types::Value> {
-    let cid = shared.heap.class_id_of(obj_ref);
-    let cm = shared.class_manager.read();
+    let cid = shared.mem.heap.class_id_of(obj_ref);
+    let cm = shared.classes.class_manager.read();
     let cls_name = cm.get_class(cid).map(|c| c.name.to_string())?;
     drop(cm);
-    let inner = shared.heap.get_field(obj_ref, 0);
+    let inner = shared.mem.heap.get_field(obj_ref, 0);
     match cls_name.as_str() {
         "java/lang/Integer"
         | "java/lang/Byte"
@@ -4079,7 +4079,7 @@ fn marshal_array_arg(
     // length forces a fresh upload (an array can't change length
     // on the JVM heap without becoming a different ObjectRef, but
     // we treat length as part of the validity envelope defensively).
-    let len = shared.heap.array_length(obj_ref);
+    let len = shared.mem.heap.array_length(obj_ref);
 
     // Macro to keep the four arms readable. Each arm:
     //   (a) consult input_cache via the type's getter — on hit, skip
@@ -4112,7 +4112,7 @@ fn marshal_array_arg(
                     // (b) Miss — upload, reading the JVM heap arena directly
                     //     (no staging Vec) when the array is contiguous, then
                     //     install into the input cache.
-                    let buf = $upload_obj(ctx, obj_ref, &shared.heap, token)
+                    let buf = $upload_obj(ctx, obj_ref, &shared.mem.heap, token)
                         .map_err(|e| format!("upload {} (len={len}): {e}", $tag))?;
                     let arc = Arc::new(buf);
                     $cache_put(obj_ref, len, arc.clone());

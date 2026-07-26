@@ -35,5 +35,5 @@ test compiles and runs that probe automatically.
   `NotificationEmitterSupport.addNotificationListener` failure. It then
   reached a separate `KeycloakSession.realms()` provider-null failure, tracked
   independently in
-  `docs/internal/keycloak/keycloak-session-realms-null-after-jmx-FIXED.md`
+  `../../../known-issues/keycloak/keycloak-session-realms-null-after-jmx-FIXED.md`
   (a probe-classpath false positive).

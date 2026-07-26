@@ -21,6 +21,7 @@ use cratonvm_reader::constant_pool::ConstantPool;
 use cratonvm_reader::instruction::Instruction;
 use cratonvm_reader::method::ClassFileMethod;
 use cratonvm_reader::stack_map::StackMapTable;
+use cratonvm_reader::verified_code::verified_code;
 
 use super::class::Class;
 use super::verify_frame::VerificationFrame;
@@ -149,6 +150,16 @@ fn verify_method(
     if bytecode.is_empty() {
         return Ok(());
     }
+
+    // Establish the canonical decode and CFG contract before type-state
+    // verification. The JIT consumes the same bounded-cache entry, so verifier
+    // and compiler cannot disagree about instruction widths or branch
+    // boundaries.
+    let _verified = verified_code(bytecode).map_err(|e| LinkageError::VerifyError {
+        class_name: class_name.to_string(),
+        method_name: method.name.to_string(),
+        message: format!("failed to build verified code: {e}"),
+    })?;
 
     // Find the StackMapTable attribute within the Code attribute
     let stack_map_table = find_stack_map_table(&code_attr.attributes);

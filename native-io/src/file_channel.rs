@@ -475,7 +475,7 @@ fn native_fcimpl_open(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     // racing the JVM-level FileLockTable bookkeeping and MVStore's own
     // chunk metadata -- see H2 TestLob's OverlappingFileLockException /
     // "Chunk N not found"
-    // (docs/known-issues/h2-suite-bugs/bug-h2-testlob-mvstore-chunk-not-found-and-file-lock.md).
+    // (docs/known-issues/h2/bug-h2-testlob-mvstore-chunk-not-found-and-file-lock.md).
     // Register the real Cleaner action so the fd genuinely closes,
     // mirroring the real constructor exactly. `CleanerFactory.cleaner()`
     // is already relied on elsewhere for FileInputStream/FileOutputStream

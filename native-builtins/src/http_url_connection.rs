@@ -1179,7 +1179,16 @@ fn read_io_err(prefix: &str, e: std::io::Error) -> String {
 /// rustls surfaces as `UnexpectedEof` ("peer closed connection without sending
 /// TLS close_notify"). For an HTTP client that is a normal end-of-stream, so map
 /// it to `Ok(0)` (EOF) rather than a hard error.
-fn read_eof_tolerant<S: Read>(stream: &mut S, buf: &mut [u8]) -> std::io::Result<usize> {
+///
+/// `pub(crate)` — also reused by `t27_tls::rustls_stream_read`'s CLIENT-side
+/// path (a plain `javax.net.ssl.SSLSocket.getInputStream().read()`, not just
+/// this file's own HTTP client bridge, hits the identical "server did
+/// Connection: Close without a TLS close_notify" pattern — see
+/// `TestSsl.testSni`). Deliberately NOT applied to the server-side read path
+/// in that same function: a client that goes silent mid-REQUEST is a more
+/// security-relevant truncation than a server closing after a fully-framed
+/// response, so server reads keep surfacing the hard error.
+pub(crate) fn read_eof_tolerant<S: Read>(stream: &mut S, buf: &mut [u8]) -> std::io::Result<usize> {
     loop {
         match stream.read(buf) {
             Ok(n) => return Ok(n),
@@ -1508,7 +1517,7 @@ fn huc_upcall_create_socket_if_custom_factory(
 // Plain-HTTP keep-alive connection pool
 // ---------------------------------------------------------------------------
 //
-// docs/known-issues/h2-suite-bugs/bug-h2-httpurlconnection-no-keepalive-pooling.md
+// docs/known-issues/h2/bug-h2-httpurlconnection-no-keepalive-pooling.md
 // — real JDK's `sun.net.www.http.HttpClient` pools/reuses a TCP connection to
 // the same `(host, port)` across separate `HttpURLConnection` instances once
 // a response is fully drained; `perform` previously always opened a brand
@@ -2017,7 +2026,7 @@ fn perform(
 /// which also covers a genuinely brand-new connection the peer tears down
 /// mid-request). Confirmed against real JDK 21 and 25 with a minimal
 /// standalone repro mirroring H2 `WebServer`'s self-shutdown-on-logout
-/// pattern (`docs/known-issues/h2-suite-bugs/
+/// pattern (`docs/known-issues/h2/
 /// bug-h2-testweb-logout-connectexception-mismatch.md`): the server reads
 /// the `logout.do` request in full, then — synchronously, on that same
 /// request-handling thread — closes its own just-accepted socket as part of
@@ -2082,7 +2091,7 @@ fn perform_with_retry(
 // `TcpStream`. That's not just a performance gap: some servers key
 // connection-scoped state off the TCP connection itself (H2's `WebServer`
 // per-`WebThread` session-locale persistence is one confirmed case — see
-// `docs/known-issues/h2-suite-bugs/bug-h2-httpurlconnection-no-keepalive-pooling.md`
+// `docs/known-issues/h2/bug-h2-httpurlconnection-no-keepalive-pooling.md`
 // for the full root-cause writeup with a `tcpdump`-confirmed repro).
 //
 // Deliberately scoped conservative for this first implementation:
@@ -2348,7 +2357,7 @@ fn perform_pooled(
 /// which also covers a genuinely brand-new connection the peer tears down
 /// mid-request). Confirmed against real JDK 21 and 25 with a minimal
 /// standalone repro mirroring H2 `WebServer`'s self-shutdown-on-logout
-/// pattern (`docs/known-issues/h2-suite-bugs/
+/// pattern (`docs/known-issues/h2/
 /// bug-h2-testweb-logout-connectexception-mismatch.md`): the server reads
 /// the `logout.do` request in full, then — synchronously, on that same
 /// request-handling thread — closes its own just-accepted socket as part of

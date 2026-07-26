@@ -244,7 +244,7 @@ pub(crate) fn native_get_caller_class(
         .map(|e| e.class_name.as_ref())
         .filter(|n| !is_internal(n))
         .collect();
-    if std::env::var("CRATONVM_DBG_CALLER").is_ok() {
+    if crate::nbflags().dbg_caller {
         eprintln!(
             "[DBG_CALLER] getCallerClass trace ({} frames):",
             trace.len()

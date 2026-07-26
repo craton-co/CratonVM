@@ -50,7 +50,7 @@ Keycloak directly, since it benefits every JVM.
 
 Verified:
 - `JWTAuthorizationGrantTest` via the suite runner: before fix, part of the 1200s-timeout HANG set; after fix, completes in 119.3s (was hitting the full 1200s timeout). "Already scanned" line count dropped from 19,902/20,685 total to 4,847/5,690 total — consistent with normal DAG re-visit logging (each dependency can still be "skipped" once per parent) rather than the prior cascading re-traversal.
-- The class now fails fast for a distinct, already-documented, already-confirmed-not-a-CratonVM-bug reason: [`keycloak-test-framework-remote-providers` Maven artifact resolution NPE](../keycloak-tests-base-remote-providers-artifact-resolution-NOT-A-BUG.md) (confirmed 2026-07-07 to reproduce identically on real HotSpot) — not a repeat of the spin-loop hang.
+- The class now fails fast for a distinct, already-documented, already-confirmed-not-a-CratonVM-bug reason: [`keycloak-test-framework-remote-providers` Maven artifact resolution NPE](keycloak/keycloak-tests-base-remote-providers-artifact-resolution-NOT-A-BUG.md) (confirmed 2026-07-07 to reproduce identically on real HotSpot) — not a repeat of the spin-loop hang.
 
 ## Also noted in passing (not fixed, low priority)
 

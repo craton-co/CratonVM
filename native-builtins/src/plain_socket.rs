@@ -104,7 +104,7 @@ fn connectex(addr: SocketAddr, error: std::io::Error) -> MethodCallFailed {
 /// PlainSocketImpl surface vs the NioSocketImpl→sun/nio/ch/Net path.
 macro_rules! dbgplain {
     ($($arg:tt)*) => {
-        if std::env::var_os("CRATONVM_DBG_NET").is_some() {
+        if crate::vmflags().io.dbg_net {
             eprintln!("[PLAIN] {}", format!($($arg)*));
         }
     };

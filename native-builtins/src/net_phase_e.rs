@@ -113,7 +113,7 @@ fn cached_nested_jar(outer: &str, inner_entry: &str) -> std::io::Result<Arc<Vec<
 #[inline]
 fn spring_dbg_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("CRATONVM_SPRING_DBG").is_some())
+    *ENABLED.get_or_init(|| crate::nbflags().spring_dbg)
 }
 
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
@@ -188,7 +188,7 @@ pub(crate) struct SockSide {
     // invokes methods on a String receiver instead of a SocketImpl,
     // producing a NoSuchMethodError that names String for a method that
     // plainly does not exist on it (e.g. create(Z)V). See
-    // docs/known-issues/h2-suite-bugs/bug-h2-nosuchmethoderror-cross-class-dispatch.md.
+    // docs/known-issues/h2/bug-h2-nosuchmethoderror-cross-class-dispatch.md.
     pub host: String,
     pub port: i32,
     pub local_port: i32,
@@ -1827,7 +1827,7 @@ fn hash_str_ignore_case(h: i32, s: Option<&str>) -> i32 {
 /// every other character (INCLUDING `+`, which URI leaves literal — unlike
 /// `application/x-www-form-urlencoded`) is copied verbatim. A malformed `%`
 /// escape (missing/non-hex digits) is copied through unchanged.
-fn uri_percent_decode(input: &str) -> String {
+pub(crate) fn uri_percent_decode(input: &str) -> String {
     if !input.contains('%') {
         return input.to_string();
     }
@@ -2902,9 +2902,7 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
             if let Some((pos, reason)) = crate::uri_scheme_name_fail_index(&s) {
                 return Err(iae(format!("{reason} at index {pos}: {s}")));
             }
-            let strict_uri_chars = std::env::var("CRATONVM_URI_STRICT_CHARS")
-                .map(|v| v != "0")
-                .unwrap_or(true);
+            let strict_uri_chars = crate::nbflags().uri_strict_chars;
             let illegal = if strict_uri_chars {
                 crate::uri_first_illegal_index(&s)
             } else {
@@ -2973,7 +2971,7 @@ fn re1_socket_read_stream(
             .ok_or_else(|| ioex("Socket stream not found"))?
             .clone()
     };
-    let dbg = std::env::var_os("CRATONVM_DBG_SOCK").is_some();
+    let dbg = crate::nbflags().dbg_sock;
     if dbg {
         eprintln!("[dbg-sock] read: sid={stream_id} want={ln} (blocking on recv...)");
     }
@@ -3011,7 +3009,7 @@ fn re1_socket_read_stream(
     })?;
     if dbg {
         eprintln!("[dbg-sock] read: sid={stream_id} got={n}");
-        if std::env::var_os("CRATONVM_DBG_SOCK_BYTES").is_some() && n != 0 {
+        if crate::nbflags().dbg_sock_bytes && n != 0 {
             eprintln!(
                 "[dbg-sock-bytes] read: sid={stream_id} data={}",
                 socket_dbg_bytes(&tmp[..n])
@@ -3093,12 +3091,12 @@ fn re1_socket_write_stream(
         }
         return Err(ioex(format!("Socket write failed: {e}")));
     }
-    if std::env::var_os("CRATONVM_DBG_SOCK").is_some() {
+    if crate::nbflags().dbg_sock {
         eprintln!(
             "[dbg-sock] write: sid={stream_id} sent={} bytes",
             data.len()
         );
-        if std::env::var_os("CRATONVM_DBG_SOCK_BYTES").is_some() {
+        if crate::nbflags().dbg_sock_bytes {
             eprintln!(
                 "[dbg-sock-bytes] write: sid={stream_id} data={}",
                 socket_dbg_bytes(&data)
@@ -3298,7 +3296,7 @@ fn re1_socket_adaptor_inet(
 fn register_re1_socket(r: &mut NativeMethodRegistry) {
     // NIO-SERVER-SOCKET (route 1): skip the synthetic java.net.Socket surface so
     // real bytecode drives sun/nio/ch/Net. See register_phase53_socket_stubs.
-    if std::env::var_os("CRATONVM_REAL_NET_SOCKETS").is_some() {
+    if crate::vmflags().io.real_net_sockets {
         return;
     }
     let sock = "java/net/Socket";
@@ -3891,7 +3889,7 @@ fn re2_accept_into(
     let peer_port = peer.port() as i32;
     let peer_ip = peer.ip().to_string();
     let local_port = stream.local_addr().map(|a| a.port() as i32).unwrap_or(0);
-    if std::env::var_os("CRATONVM_DBG_SOCK").is_some() {
+    if crate::nbflags().dbg_sock {
         eprintln!(
             "[dbg-sock] accept: peer={peer_ip}:{peer_port} local_port={local_port} nonblocking_reset"
         );
@@ -4033,7 +4031,7 @@ fn register_re2_server_socket(r: &mut NativeMethodRegistry) {
     // NIO-SERVER-SOCKET (route 1): skip the synthetic java.net.ServerSocket
     // surface so real bytecode drives sun/nio/ch/Net. See
     // register_phase53_socket_stubs.
-    if std::env::var_os("CRATONVM_REAL_NET_SOCKETS").is_some() {
+    if crate::vmflags().io.real_net_sockets {
         return;
     }
     // Install the plain-`ServerSocket` bind hook for native-io's winning
@@ -5018,7 +5016,7 @@ fn http_decode_chunked(mut data: &[u8]) -> std::io::Result<Vec<u8>> {
 }
 
 fn re5_dbg() -> bool {
-    std::env::var_os("CRATONVM_DBG_RE5").is_some()
+    crate::nbflags().dbg_re5
 }
 
 fn http_timeout_remaining(deadline: Instant) -> std::io::Result<Duration> {
@@ -7192,7 +7190,7 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
         "isFileURL",
         "(Ljava/net/URL;)Z",
         |ctx, args| {
-            if std::env::var_os("CRATONVM_DBG_SBLOAD").is_some() {
+            if crate::nbflags().dbg_sbload {
                 eprintln!("[DBG_SBLOAD] ResourceUtils.isFileURL native override");
             }
             let url = match args.get(0) {
@@ -7212,7 +7210,7 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
         "isJarURL",
         "(Ljava/net/URL;)Z",
         |ctx, args| {
-            if std::env::var_os("CRATONVM_DBG_SBLOAD").is_some() {
+            if crate::nbflags().dbg_sbload {
                 eprintln!("[DBG_SBLOAD] ResourceUtils.isJarURL native override");
             }
             let url = match args.get(0) {
@@ -7229,14 +7227,100 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
     );
 
     // S111r25 — Banner lookup is best-effort; unresolved classpath URLs can
-    // trip `new UrlResource(null)` on some fallback paths. Returning null
-    // from both banner resolvers keeps boot moving (Spring then uses no
-    // custom banner or the default fallback).
+    // trip `new UrlResource(null)` on some fallback paths. The original fix
+    // here unconditionally returned null from both banner resolvers to keep
+    // boot moving — but that also permanently disabled a WORKING custom
+    // `banner.txt`/`banner.gif` lookup, since `getTextBanner`'s real bytecode
+    // (`resourceLoader.getResource(location)`) never even ran anymore
+    // (SpringApplicationTests.customBanner/customBannerWithProperties/
+    // failureInANativeImageWritesFailureToSystemOut always printed the
+    // DEFAULT SpringBootBanner instead of the test's `@WithResource
+    // banner.txt`). Reimplement the real logic instead — `getBanner()`'s
+    // `Environment.getProperty` / `ResourceLoader.getResource` /
+    // `Resource.exists()` / `Resource.getURL()` calls, `ResourceBanner`
+    // construction — but keep the S111r25 defensive intent by swallowing
+    // ANY failure along the way (not just the real method's checked
+    // `IOException`) and falling back to null, same as before.
     r.register(
         "org/springframework/boot/SpringApplicationBannerPrinter",
         "getTextBanner",
         "(Lorg/springframework/core/env/Environment;)Lorg/springframework/boot/Banner;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        |ctx, args| {
+            if crate::nbflags().dbg_sbload {
+                eprintln!(
+                    "[DBG_SBLOAD] SpringApplicationBannerPrinter.getTextBanner native override"
+                );
+            }
+            let this = match obj_arg(args, 0) {
+                Ok(o) => o,
+                Err(_) => return Ok(Some(Value::Object(None))),
+            };
+            let environment = match args.get(1) {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let resource_loader = match ctx.get_field_by_name(this, "resourceLoader") {
+                Value::Object(Some(o)) => o,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let prop_name = ctx.create_string("spring.banner.location");
+            let default_loc = ctx.create_string("banner.txt");
+            let location = match ctx.invoke_virtual(
+                environment,
+                "getProperty",
+                "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
+                &[
+                    Value::Object(Some(prop_name)),
+                    Value::Object(Some(default_loc)),
+                ],
+            ) {
+                Ok(Some(Value::Object(Some(s)))) => s,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let resource = match ctx.invoke_virtual(
+                resource_loader,
+                "getResource",
+                "(Ljava/lang/String;)Lorg/springframework/core/io/Resource;",
+                &[Value::Object(Some(location))],
+            ) {
+                Ok(Some(Value::Object(Some(r)))) => r,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let exists = matches!(
+                ctx.invoke_virtual(resource, "exists", "()Z", &[]),
+                Ok(Some(Value::Int(n))) if n != 0
+            );
+            if !exists {
+                return Ok(Some(Value::Object(None)));
+            }
+            let is_liquibase = match ctx.invoke_virtual(resource, "getURL", "()Ljava/net/URL;", &[])
+            {
+                Ok(Some(Value::Object(Some(url)))) => match ctx.invoke_virtual(
+                    url,
+                    "toExternalForm",
+                    "()Ljava/lang/String;",
+                    &[],
+                ) {
+                    Ok(Some(Value::Object(Some(s)))) => ctx
+                        .read_string(s)
+                        .map(|s| s.contains("liquibase-core"))
+                        .unwrap_or(false),
+                    _ => false,
+                },
+                _ => false,
+            };
+            if is_liquibase {
+                return Ok(Some(Value::Object(None)));
+            }
+            match ctx.new_object_initialized(
+                "org/springframework/boot/ResourceBanner",
+                "(Lorg/springframework/core/io/Resource;)V",
+                &[Value::Object(Some(resource))],
+            ) {
+                Ok(v) => Ok(v),
+                Err(_) => Ok(Some(Value::Object(None))),
+            }
+        },
     );
     r.register(
         "org/springframework/boot/SpringApplicationBannerPrinter",
@@ -9403,7 +9487,7 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
         "getInstance",
         "(Ljava/lang/String;)Ljavax/net/ssl/SSLContext;",
         |ctx, args| {
-            if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+            if crate::nbflags().dbg_tls_auth_ok {
                 eprintln!("[dbg-tls-auth] re6 SSLContext.getInstance");
             }
             let proto_val = args.first().copied().unwrap_or(Value::Object(None));
@@ -9452,10 +9536,19 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
             if let Some(ctx_obj) = crate::t27_tls::get_runtime_default_ssl_context() {
                 return Ok(Some(Value::Object(Some(ctx_obj))));
             }
+            // No explicit setDefault() call yet: mirror the JDK's lazy-init
+            // contract (SSLContext.getDefault() javadoc — the default is
+            // "created if not yet created") by allocating ONE context and
+            // caching it in the same slot setDefault() writes to, so a
+            // second getDefault() call returns this SAME object instead of
+            // a fresh one each time (e.g. OtlpMetricsExportAutoConfigurationTests
+            // .whenNoSslBundleDefaultHttpSenderHasDefaultSslContext asserts
+            // `httpClient.sslContext()).isSameAs(SSLContext.getDefault())`).
             let obj = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLContext", 2);
             let name = ctx.create_string("TLS");
             ctx.set_field(obj, 0, Value::Object(Some(name)));
             ctx.set_field(obj, 1, Value::Int(1));
+            crate::t27_tls::set_runtime_default_ssl_context(obj);
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -9482,7 +9575,7 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
         "([Ljavax/net/ssl/KeyManager;[Ljavax/net/ssl/TrustManager;Ljava/security/SecureRandom;)V",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+            if crate::nbflags().dbg_tls_auth_ok {
                 eprintln!("[dbg-tls-auth] re6 SSLContext.init key={}", ctx.identity_hash_code(this));
             }
             ctx.set_field(this, 1, Value::Int(1));
@@ -9541,7 +9634,7 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
         "()Ljavax/net/ssl/SSLSocketFactory;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+            if crate::nbflags().dbg_tls_auth_ok {
                 eprintln!("[dbg-tls-auth] re6 SSLContext.getSocketFactory key={}", ctx.identity_hash_code(this));
             }
             let f = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSocketFactory", 1);
@@ -9854,7 +9947,7 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
             });
             let sock = ctx.read_native_pin(pin_base, sock);
             ctx.unpin_native_roots(pin_base);
-            if std::env::var_os("CRATONVM_DBG_TLS_SOCK").is_some() {
+            if crate::nbflags().dbg_tls_sock {
                 eprintln!(
                     "[dbg-tls-sock] thread={:?} net_phase_e createSocket(String,int) built sock={:?} stream_id={}",
                     std::thread::current().id(),
@@ -10690,15 +10783,8 @@ fn request_queue() -> &'static Mutex<HashMap<i32, Vec<PendingRequest>>> {
 /// issues while still bounding worst-case allocation. A value of 0 or an
 /// unparseable value falls back to the default.
 fn http_max_request_body() -> usize {
-    static MAX: OnceLock<usize> = OnceLock::new();
-    *MAX.get_or_init(|| {
-        const DEFAULT: usize = 8 * 1024 * 1024; // 8 MiB
-        std::env::var("CRATONVM_HTTP_MAX_BODY")
-            .ok()
-            .and_then(|s| s.trim().parse::<usize>().ok())
-            .filter(|&n| n > 0)
-            .unwrap_or(DEFAULT)
-    })
+    const DEFAULT: usize = 8 * 1024 * 1024; // 8 MiB
+    crate::nbflags().http_max_body.unwrap_or(DEFAULT)
 }
 
 /// VULN-FIX [nb-net-phase-e]: best-effort write of a fixed minimal HTTP response
@@ -11368,7 +11454,7 @@ fn re10_spawn_dispatcher(
     ctx: &mut dyn NativeContext,
     server_id: i32,
 ) -> Result<(), cratonvm_types::error::MethodCallFailed> {
-    let dbg = std::env::var_os("CRATONVM_DBG_HTTPSRV").is_some();
+    let dbg = crate::nbflags().dbg_httpsrv;
     for idx in 0..HS_DISPATCHER_POOL {
         let runner = alloc_concurrent_synthetic(ctx, HS_LOOP_CLASS, 1);
         ctx.set_field(runner, 0, Value::Int(server_id));
@@ -11423,7 +11509,7 @@ fn re10_spawn_dispatcher(
 fn re10_serve_loop_run(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let server_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
-    let dbg = std::env::var_os("CRATONVM_DBG_HTTPSRV").is_some();
+    let dbg = crate::nbflags().dbg_httpsrv;
     if dbg {
         eprintln!("[HTTPSRV] serve_loop ENTER server={server_id}");
     }

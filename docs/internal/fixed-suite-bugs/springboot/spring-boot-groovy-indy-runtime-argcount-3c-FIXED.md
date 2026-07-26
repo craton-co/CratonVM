@@ -11,7 +11,7 @@ metadata:
 **Status:** ✅ FIXED on branch `fix/springrepos-indy-3c`
 (commit `5d36c432`, `native-builtins/src/lang_invoke.rs`). Two coupled defects.
 Parent cascade: [[springrepos-extension-hang-jit-throughput-and-deep-recursion]].
-Standalone repros: `docs/internal/repros/springrepos-indy-3c/`.
+Standalone repros: `../repros/springrepos-indy-3c/`.
 
 ## 3c — `guardWithTest` dropped the receiver from the adapter `type()`
 

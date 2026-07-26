@@ -34,6 +34,7 @@
 //!
 //! All public surface is registered via `register_async_socket_real`.
 
+use crate::io_flags;
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ClassId, ObjectRef, Value};
@@ -169,8 +170,7 @@ fn aio_shutdown_fd_table_stream(ctx: &mut dyn NativeContext, fd: u32) {
 /// as interleaved trace lines with a shared fd tag. Follows the precedent
 /// of `CRATONVM_DBG_SC_READ` / `CRATONVM_DBG_SC_CLOSE` in `socket_channel.rs`.
 fn dbg_aio_enabled() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("CRATONVM_DBG_AIO").is_some())
+    io_flags().dbg_aio
 }
 macro_rules! dbg_aio {
     ($($arg:tt)*) => {
@@ -2128,14 +2128,20 @@ fn aio_assc_local_address(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         return ctx.new_object_initialized(
             "java/net/InetSocketAddress",
             "(Ljava/net/InetAddress;I)V",
-            &[Value::Object(Some(inet_addr)), Value::Int(addr.port() as i32)],
+            &[
+                Value::Object(Some(inet_addr)),
+                Value::Int(addr.port() as i32),
+            ],
         );
     }
     let host_str = ctx.create_string(&addr.ip().to_string());
     ctx.new_object_initialized(
         "java/net/InetSocketAddress",
         "(Ljava/lang/String;I)V",
-        &[Value::Object(Some(host_str)), Value::Int(addr.port() as i32)],
+        &[
+            Value::Object(Some(host_str)),
+            Value::Int(addr.port() as i32),
+        ],
     )
 }
 

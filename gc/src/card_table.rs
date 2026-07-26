@@ -44,7 +44,7 @@
 //! property is preserved while the cross-table theft is eliminated.
 
 use parking_lot::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 
 /// Number of bytes covered by a single card.
@@ -227,8 +227,12 @@ thread_local! {
 /// Authoritative card-bitmap state. Locked exclusively by the collector
 /// during GC; never touched by the mutator fast path.
 struct CardCells {
-    /// One byte per card (CARD_CLEAN or CARD_DIRTY).
-    cards: Vec<u8>,
+    /// One stable atomic byte per card (CARD_CLEAN or CARD_DIRTY).
+    ///
+    /// The x64 JIT may perform a release byte-store directly into this backing
+    /// array after a reference store. The vector is never resized, so
+    /// [`CardTable::jit_cards_addr`] remains valid for the table's lifetime.
+    cards: Vec<AtomicU8>,
     /// Tracking list of card indices that have been dirtied since the last scan.
     dirty_cards: Vec<usize>,
 }
@@ -278,7 +282,9 @@ impl CardTable {
             base_addr,
             region_size,
             cells: Mutex::new(CardCells {
-                cards: vec![CARD_CLEAN; num_cards],
+                cards: (0..num_cards)
+                    .map(|_| AtomicU8::new(CARD_CLEAN))
+                    .collect(),
                 dirty_cards: Vec::new(),
             }),
             pending_offsets: Mutex::new(Vec::new()),
@@ -303,8 +309,16 @@ impl CardTable {
         }
         let index = (addr - self.base_addr) / CARD_SIZE;
         let mut cells = self.cells.lock();
-        if index < cells.cards.len() && cells.cards[index] != CARD_DIRTY {
-            cells.cards[index] = CARD_DIRTY;
+        if index < cells.cards.len()
+            && cells.cards[index]
+                .compare_exchange(
+                    CARD_CLEAN,
+                    CARD_DIRTY,
+                    Ordering::Release,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
+        {
             cells.dirty_cards.push(index);
         }
     }
@@ -329,8 +343,16 @@ impl CardTable {
                 continue;
             }
             let index = (addr - self.base_addr) / CARD_SIZE;
-            if index < cells.cards.len() && cells.cards[index] != CARD_DIRTY {
-                cells.cards[index] = CARD_DIRTY;
+            if index < cells.cards.len()
+                && cells.cards[index]
+                    .compare_exchange(
+                        CARD_CLEAN,
+                        CARD_DIRTY,
+                        Ordering::Release,
+                        Ordering::Relaxed,
+                    )
+                    .is_ok()
+            {
                 cells.dirty_cards.push(index);
             }
         }
@@ -338,7 +360,11 @@ impl CardTable {
 
     /// Check if a specific card is dirty.
     pub fn is_dirty(&self, card_index: usize) -> bool {
-        self.cells.lock().cards.get(card_index).copied() == Some(CARD_DIRTY)
+        self.cells
+            .lock()
+            .cards
+            .get(card_index)
+            .is_some_and(|card| card.load(Ordering::Acquire) == CARD_DIRTY)
     }
 
     /// Clear all cards (set to CARD_CLEAN). Also drops any pending
@@ -347,7 +373,9 @@ impl CardTable {
     /// represent stale work from before the clear.
     pub fn clear_all(&self) {
         let mut cells = self.cells.lock();
-        cells.cards.fill(CARD_CLEAN);
+        for card in &cells.cards {
+            card.store(CARD_CLEAN, Ordering::Release);
+        }
         cells.dirty_cards.clear();
         drop(cells);
         self.pending_offsets.lock().clear();
@@ -365,7 +393,7 @@ impl CardTable {
             .cards
             .iter()
             .enumerate()
-            .filter(|(_, &card)| card == CARD_DIRTY)
+            .filter(|(_, card)| card.load(Ordering::Acquire) == CARD_DIRTY)
             .map(|(i, _)| i)
             .collect()
     }
@@ -373,8 +401,11 @@ impl CardTable {
     /// Return the tracked list of dirty card indices and clear the tracking list
     /// AND reset those cards' bitmap bytes to `CARD_CLEAN`.
     ///
-    /// This is O(dirty cards) rather than O(total cards), making it much faster
-    /// when only a small fraction of cards are dirty.
+    /// Buffered Rust barriers populate `dirty_cards`; direct JIT card stores
+    /// deliberately do not. We therefore merge the tracked list with one
+    /// acquire scan of the atomic bitmap. This keeps the JIT mutator path to a
+    /// single release byte-store while preserving the exact card set at the
+    /// stop-the-world consumer boundary.
     ///
     /// B-K / bt18 fix (2026-06-14): the byte reset is load-bearing for the
     /// NON-MOVING young sweep, which (unlike the moving Cheney path) NEVER calls
@@ -392,12 +423,14 @@ impl CardTable {
     /// bitmap anyway, so the early per-card clear is redundant, never harmful.
     pub fn take_dirty_cards(&self) -> Vec<usize> {
         let mut cells = self.cells.lock();
-        let taken = std::mem::take(&mut cells.dirty_cards);
-        for &index in &taken {
-            if index < cells.cards.len() {
-                cells.cards[index] = CARD_CLEAN;
+        let mut taken = std::mem::take(&mut cells.dirty_cards);
+        for (index, card) in cells.cards.iter().enumerate() {
+            if card.swap(CARD_CLEAN, Ordering::AcqRel) == CARD_DIRTY {
+                taken.push(index);
             }
         }
+        taken.sort_unstable();
+        taken.dedup();
         taken
     }
 
@@ -445,6 +478,15 @@ impl CardTable {
     /// The size of the covered region.
     pub fn region_size(&self) -> usize {
         self.region_size
+    }
+
+    /// Stable address of the first atomic card byte for JIT post barriers.
+    ///
+    /// The returned storage is valid until this `CardTable` is dropped and is
+    /// never resized. A generated release byte-store of `CARD_DIRTY` is paired
+    /// with the acquire scan in [`Self::take_dirty_cards`].
+    pub fn jit_cards_addr(&self) -> usize {
+        self.cells.lock().cards.as_ptr() as usize
     }
 
     // -----------------------------------------------------------------
@@ -641,8 +683,16 @@ impl CardTable {
                 continue;
             }
             let index = (addr - self.base_addr) / CARD_SIZE;
-            if index < cells.cards.len() && cells.cards[index] != CARD_DIRTY {
-                cells.cards[index] = CARD_DIRTY;
+            if index < cells.cards.len()
+                && cells.cards[index]
+                    .compare_exchange(
+                        CARD_CLEAN,
+                        CARD_DIRTY,
+                        Ordering::Release,
+                        Ordering::Relaxed,
+                    )
+                    .is_ok()
+            {
                 cells.dirty_cards.push(index);
                 newly_dirtied += 1;
             }
@@ -673,7 +723,11 @@ impl CardTable {
 impl std::fmt::Debug for CardTable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let cells = self.cells.lock();
-        let dirty_count = cells.cards.iter().filter(|&&c| c == CARD_DIRTY).count();
+        let dirty_count = cells
+            .cards
+            .iter()
+            .filter(|card| card.load(Ordering::Acquire) == CARD_DIRTY)
+            .count();
         f.debug_struct("CardTable")
             .field("num_cards", &cells.cards.len())
             .field("dirty_cards", &dirty_count)
@@ -690,6 +744,16 @@ impl std::fmt::Debug for CardTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn direct_jit_atomic_mark_is_visible_to_stw_consumer() {
+        let ct = CardTable::new(0x1000, CARD_SIZE * 4);
+        let cards = ct.jit_cards_addr() as *const AtomicU8;
+        // Model the generated x64 release byte-store for card 2.
+        unsafe { &*cards.add(2) }.store(CARD_DIRTY, Ordering::Release);
+        assert_eq!(ct.take_dirty_cards(), vec![2]);
+        assert!(!ct.is_dirty(2));
+    }
 
     #[test]
     fn new_card_table_all_clean() {

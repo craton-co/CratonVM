@@ -1749,7 +1749,7 @@ fn validate_cert_chain(
         _ => 0,
     };
     let trust = crate::x509_manager::trust_manager_state_by_id(tm_id);
-    if std::env::var("CRATONVM_DBG_TLS_AUTH").is_ok() {
+    if crate::nbflags().dbg_tls_auth_ok {
         eprintln!(
             "[dbg-tls-auth] validate_cert_chain tm_id={} anchor_ders={} anchors_groups={} keystore_id={} chain_len={}",
             tm_id,

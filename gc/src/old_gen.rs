@@ -30,10 +30,12 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
+use crate::gc_flags;
 use crate::heap::{
     array_data_size, ArrayElementType, ObjectHeader, ObjectKind, GC_FLAG_MARKED, HEADER_SIZE,
     REF_ELEMENT_SIZE, SLOT_SIZE,
 };
+use cratonvm_types::narrow_oop::{read_ref_slot, ref_element_size, ref_field_size};
 use cratonvm_types::{ObjectRef, Value};
 
 /// Cached `CRATONVM_DBG_SEEDHUNT` gate (bc math-ec `0x4`). When on,
@@ -43,9 +45,7 @@ use cratonvm_types::{ObjectRef, Value};
 /// compaction. See docs/bc-math-ec-gc-0x4-handoff.md §6.1.
 #[inline]
 fn seedhunt_enabled() -> bool {
-    use std::sync::OnceLock;
-    static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| std::env::var_os("CRATONVM_DBG_SEEDHUNT").is_some())
+    gc_flags().dbg_seedhunt
 }
 
 /// A contiguous free block in the old generation.
@@ -385,6 +385,16 @@ impl OldGen {
         ptr >= base && ptr < end
     }
 
+    /// Backing-storage extent as plain integers: `[lo, hi)`.
+    ///
+    /// `OldGen` is not `Sync` (it owns the storage), so a parallel young-sweep
+    /// worker cannot hold a `&OldGen` just to run `contains`. This exposes the
+    /// same range test as two `usize`s the workers can copy.
+    pub fn extent(&self) -> (usize, usize) {
+        let base = self.data.as_ptr() as usize;
+        (base, base + self.data.len())
+    }
+
     /// Get the base pointer of the backing storage.
     pub fn base_ptr(&self) -> *const u8 {
         self.data.as_ptr()
@@ -540,7 +550,7 @@ impl OldGen {
             }
             let raw_size = if header.kind == ObjectKind::Array {
                 HEADER_SIZE
-                    + array_data_size(header.array_length as usize, header.element_type)
+                    + array_data_size(header.array_length() as usize, header.element_type)
                         .expect("array_data_size overflow in old_gen scan")
             } else {
                 // Compact reference-field layout: a promoted compact object's body
@@ -587,7 +597,7 @@ impl OldGen {
             }
             let raw_size = if header.kind == ObjectKind::Array {
                 HEADER_SIZE
-                    + array_data_size(header.array_length as usize, header.element_type)
+                    + array_data_size(header.array_length() as usize, header.element_type)
                         .expect("array_data_size overflow in old_gen scan")
             } else {
                 // Compact reference-field layout: honour the per-object
@@ -778,8 +788,8 @@ impl OldGen {
             (
                 h.kind,
                 h.element_type,
-                h.array_length,
-                h.num_slots,
+                h.array_length(),
+                h.num_slots(),
                 crate::heap::compact_oop_scan(h),
             )
         };
@@ -787,8 +797,8 @@ impl OldGen {
         if kind == ObjectKind::Array {
             if element_type == ArrayElementType::Reference {
                 for i in 0..array_length as usize {
-                    let slot = unsafe { obj_ptr.add(HEADER_SIZE + i * REF_ELEMENT_SIZE) };
-                    let raw: u64 = unsafe { std::ptr::read(slot as *const u64) };
+                    let slot = unsafe { obj_ptr.add(HEADER_SIZE + i * ref_element_size()) };
+                    let raw: u64 = unsafe { read_ref_slot(slot) };
                     if raw != 0 {
                         let ref_ptr = raw as usize;
                         if ref_ptr >= data_start && ref_ptr < data_end {
@@ -801,11 +811,11 @@ impl OldGen {
             // Compact object: 8-byte reference slots at the oop-map offsets.
             for &off in &layout.ref_offsets {
                 let off = off as usize;
-                if off + crate::heap::REF_FIELD_SIZE > body {
+                if off + ref_field_size() > body {
                     break;
                 }
                 let slot = unsafe { obj_ptr.add(HEADER_SIZE + off) };
-                let raw: u64 = unsafe { std::ptr::read(slot as *const u64) };
+                let raw: u64 = unsafe { read_ref_slot(slot) };
                 if raw != 0 {
                     let ref_ptr = raw as usize;
                     if ref_ptr >= data_start && ref_ptr < data_end {
@@ -1027,8 +1037,9 @@ mod tests {
 
         assert_eq!(second as usize - first as usize, 48);
         // OldGen reserves at least one header for any request, so the second
-        // 8-byte request occupies 40 bytes after the 48-byte compact extent.
-        assert_eq!(og.used(), 88);
+        // 8-byte request occupies one 32-byte production header after the
+        // 48-byte aligned extent.
+        assert_eq!(og.used(), 80);
     }
 
     #[test]
@@ -1117,14 +1128,14 @@ mod tests {
         let p1 = og.alloc(obj_size1, 8).unwrap();
         unsafe {
             let header = &mut *(p1 as *mut ObjectHeader);
-            header.num_slots = 2;
+            header.set_num_slots(2);
         }
 
         let obj_size2 = HEADER_SIZE + SLOT_SIZE; // 1 field
         let p2 = og.alloc(obj_size2, 8).unwrap();
         unsafe {
             let header = &mut *(p2 as *mut ObjectHeader);
-            header.num_slots = 1;
+            header.set_num_slots(1);
         }
 
         let objects = og.walk_objects();
@@ -1154,7 +1165,7 @@ mod tests {
         let filler_size = HEADER_SIZE + 4 * SLOT_SIZE;
         let filler = og.alloc(filler_size, 8).unwrap();
         unsafe {
-            (*(filler as *mut ObjectHeader)).num_slots = 4;
+            (*(filler as *mut ObjectHeader)).set_num_slots(4);
             // left UNMARKED -> dead -> reclaimed.
         }
 
@@ -1167,14 +1178,14 @@ mod tests {
         unsafe {
             // A is live, references B in field 0.
             let a_hdr = &mut *(a as *mut ObjectHeader);
-            a_hdr.num_slots = 1;
+            a_hdr.set_num_slots(1);
             a_hdr.gc_flags |= GC_FLAG_MARKED;
             let a_field0 = a.add(HEADER_SIZE) as *mut Value;
             std::ptr::write(a_field0, Value::Object(Some(ObjectRef::from_raw(b))));
 
             // B is left UNMARKED (would be floating garbage without the guard).
             let b_hdr = &mut *(b as *mut ObjectHeader);
-            b_hdr.num_slots = 1;
+            b_hdr.set_num_slots(1);
             b_hdr.identity_hash_code = B_TAG;
         }
 
@@ -1231,7 +1242,7 @@ mod tests {
         let a = og.alloc(a_size, 8).unwrap();
         unsafe {
             let a_hdr = &mut *(a as *mut ObjectHeader);
-            a_hdr.num_slots = 1;
+            a_hdr.set_num_slots(1);
             a_hdr.gc_flags |= GC_FLAG_MARKED;
         }
 
@@ -1241,7 +1252,7 @@ mod tests {
         let b = og.alloc(b_size, 8).unwrap();
         unsafe {
             let b_hdr = &mut *(b as *mut ObjectHeader);
-            b_hdr.num_slots = 1;
+            b_hdr.set_num_slots(1);
             b_hdr.gc_flags |= GC_FLAG_MARKED;
         }
 

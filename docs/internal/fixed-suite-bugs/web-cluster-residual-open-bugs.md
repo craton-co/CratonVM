@@ -1,145 +1,128 @@
-# web/test.web cluster — residual bugs (2026-07-06)
+# web/test.web cluster — residual OPEN bugs (2026-07-04)
 
 Found via a full Spring suite sweep of `test.web`, `web.client`, `web.context`,
 `web.method`, `web.reactive.function`, `web.reactive.resource`,
-`web.reactive.result`, `web.servlet`, `web.util` (653 classes, jit-real mode).
-This supersedes an earlier version of this doc that was lost when the Azure
-build host's ephemeral disk was wiped mid-session before it could be pushed.
-**All 3 items from the original OPEN list have since been fixed or confirmed
-not-reproducing** — see the FIXED section below. No items remain open from
-this sweep as of 2026-07-06.
+`web.reactive.result`, `web.servlet`, `web.util` (653 classes, jit-real mode)
+against `dev` @ 36d3102bf (which already includes the 7 fixes landed in this
+same sweep — see the "web cluster" memory entry / commit messages on
+`fix/jetty-iter-azure`, `fix/whatwg-azure`, `fix/cert-code-azure`,
+`fix/method-azure` for the FIXED half of this cluster).
 
-## Real CratonVM bugs — all resolved (moved to FIXED section below)
+None of the items below were fixed in this pass — either lower priority than
+the confirmed fixes, needs more investigation time, or (for the dependency
+gaps) out of CratonVM's scope entirely. Filed here so a future session doesn't
+have to re-discover them from a fresh suite run.
 
-(Originally 3 open items here: gzip/zlib byte-count mismatch, Jython
-Py.<clinit> circular dependency, and XlsViewTests POI ClassCastException.
-All 3 are now resolved — see items 15-16 and the XlsViewTests note in the
-FIXED section.)
+## Real CratonVM bugs (candidates for a future fix session)
+
+- **`UriComponentsTests::toUriWithIpv6HostAlreadyEncoded[2]` (WHAT_WG)** —
+  deterministic (not flaky): IPv6 host hex digits get lowercased even when
+  `UriComponentsBuilder...build(true)` ("already encoded") should pass the
+  host through verbatim. See `WhatWgUrlParser.java` IPv6 serialization. Found
+  right after the (separately fixed) non-deterministic AIOOBE in the same
+  parser — check whether HotSpot itself passes this test on the current
+  spring-framework source before assuming it's CratonVM's fault.
+- **`java.util.LinkedHashSet.comparator()` → `NoSuchMethodError`** — hit by
+  `RequestMappingInfoHandlerMappingTests::getHandlerRequestMethodNotAllowed`.
+  Looks like the same native-collections "empty/synthetic collection
+  mis-stamped" bug family as the (fixed) `Collections$EmptyIterator`/
+  `Collections$SingletonMap` cases — LinkedHashSet dispatch is picking up a
+  method it shouldn't have / lacks one it needs.
+- **`java.util.Collections$SingletonMap.iterator()` → `NoSuchMethodError`** —
+  hit by `ViewResolutionIntegrationTests::groovyMarkup` (GroovyMarkupConfigurer
+  bean creation). Same family as above; the fixed `1ae3066c5` covered
+  `emptyListIterator`/`newSetFromMap` stamps but not this one.
+- **`JAXBContextImpl.createValidator` → `VerifyError: concrete class must
+  implement abstract method`** — hits ~10 tests across `test.web` and
+  `web.servlet` (all the Xpath/XmlContent matcher/assertion tests). Possibly
+  the SAME family as the (fixed) `Certificate.getEncoded()`/`X509Certificate`
+  native-registration gap (register_p68_security_cert-style — check whether
+  JAXB's classes have an analogous real-JDK-mode registration gap), or a
+  genuine classfile-verifier bug misjudging abstract-method coverage.
+- **`java.util.stream.IntStream.iterator()` → `AbstractMethodError: has no
+  Code attribute`** — hit by `XlsViewTests::xlsxStreamingView`. Same "no Code
+  attribute" bug family as the two above — three-plus instances now, strong
+  candidate for a shared root cause worth hunting generically rather than
+  patching one class at a time.
+- **`AcceptHeaderLocaleResolverTests`** (5/5 methods) — `NoSuchElementException:
+  List is empty`. Accept-Language header locale resolution;  not yet
+  triaged this session.
+- **`CookieLocaleResolverTests::resolveLocaleContextWithInvalidTimeZone{,OnErrorDispatch}`**
+  — plain `AssertionError`, not yet triaged.
+- **`InvocableHandlerMethodKotlinTests`** (`web.reactive.result`) — Kotlin
+  default-parameter-value handling: `defaultValues()`/`defaultValuesOverridden()`
+  throw `IllegalStateException: argument type mismatch` instead of using the
+  default; `suspendingDefaultValueOverridden()` returns the default instead of
+  the overridden value. Smells like a real Kotlin-interop/reflection bug in
+  how CratonVM resolves default-value masks for suspend/coroutine methods.
+- **`web.servlet.resource.ResourceHttpRequestHandlerIntegrationTests`** (4
+  parameterized cases) and **`ResourceHttpRequestHandlerTests::partialContentByteRangeWithEncodedResource(GzippedFiles)`**
+  — plain `AssertionError`s around path-pattern/gzip-encoded resource serving,
+  not yet triaged.
+- **`web.servlet.view.DefaultFragmentsRenderingTests::render`** —
+  `ExceptionInInitializerError: null`, not yet triaged.
+- **`web.servlet.mvc.method.annotation.FragmentRenderingStreamTests`** (both
+  methods) — `IllegalStateException: Failed to send [...ResponseBodyEmitter
+  DataWithMediaType...]`, streaming/emitter write failure, not yet triaged.
+- **`web.servlet.view.document.XlsViewTests::xlsxView`** — Apache POI
+  `PartAlreadyExistsException` on `/xl/styles.xml` — could be a real bug in
+  how CratonVM's zip/stream natives interact with POI's OOXML package writer
+  (duplicate part write), not yet triaged.
 
 ## Not CratonVM bugs — environment/test-classpath gaps (skip)
 
 - **FreeMarker** (`org/springframework/*/view/freemarker/FreeMarkerConfigurer`
-  `NoClassDefFoundError`) — FreeMarker isn't on this suite run's test
-  classpath. Environment/build-config gap, not a VM bug.
-- **`org/springframework/oxm/jaxb/Jaxb2Marshaller`** `NoClassDefFoundError` —
-  spring-oxm module not on classpath for these tests. Same category.
+  `NoClassDefFoundError`, ~15 occurrences across `web.servlet.config`/
+  `web.servlet.view`/`web.reactive.result`) — FreeMarker isn't on this suite
+  run's test classpath. Environment/build-config gap, not a VM bug.
+- **`org/springframework/oxm/jaxb/Jaxb2Marshaller`** `NoClassDefFoundError`
+  (`test.web.servlet.samples.*.ViewResolutionTests`) — spring-oxm module not
+  on classpath for these tests. Same category.
 - **`sun/nio/ch/{IOUtil.fdLimit, EPollSelectorImpl, NativeThread}`** — the
   long-documented Linux-only native gap (see
-  `azure-host-jdk21-linux-only-native-gaps` memory — blocks HttpClient5/Netty
-  "Reactor Netty" test variants specifically on the Linux probe host; not a
-  real bug, don't chase).
+  `azure-host-jdk21-linux-only-native-gaps` — blocks HttpClient5/Netty
+  "Reactor Netty" test variants specifically on this Linux probe host; not a
+  real bug, don't chase). Affects a large fraction of the `[3] Reactor Netty`
+  / some `[2] Jetty Core` / `[4] Tomcat` parameterizations across
+  `web.reactive.*` — expect these to keep failing here regardless of any
+  CratonVM fix, and re-check on Windows/a real JDK≥19 host if it matters.
 - **`os error 11` ("Resource temporarily unavailable") on RestClient/WebClient
-  localhost connections** — observed under heavy host contention (many
-  concurrent sessions sharing the Azure probe box); did not reproduce as a
-  consistent CratonVM defect distinct from host load.
+  localhost connections** — observed under heavy host contention (60+
+  concurrent sessions sharing this Azure probe box); did not reproduce this
+  as a consistent CratonVM defect distinct from host load. Re-test on a quiet
+  box before concluding it's a real client-retry bug.
 - **`Cp1047` charset `SkipException`** (`DefaultResponseCreatorTests`) — the
   test itself skips when the JVM doesn't support this charset; not a failure.
-- **`UriComponentsBuilderTests::fromOpaqueUri()`** — a `java.net.URI`
-  opaque-fragment test that doesn't use `WhatWgUrlParser` at all; pre-existing,
-  unrelated to any fix in this cluster.
-- **A Windows-specific `BeanDefinitionStoreException: I/O failure during
-  classpath scanning`** observed on `GlobalCorsConfigIntegrationTests` when
-  verifying on a Windows host — not reproduced as related to any fix here
-  (none of the 12 fixes below touch classpath scanning); looks like a
-  Windows path/file-locking artifact. Worth a second look if it recurs.
 
-## FIXED this cluster (for cross-reference — see commit messages on `dev`)
+## Fixed this session (for cross-reference — see commit messages on `dev` for full detail)
 
 1. `Collections.emptyListIterator()` mis-stamped as `EmptyIterator` (no
-   `hasPrevious`) instead of `EmptyListIterator` — crashed Jetty main-thread.
-2. `StringBuilder`/`StringBuffer`/`AbstractStringBuilder` missing
-   `codePointAt`/`codePointBefore`/`codePointCount`/`appendCodePoint`
-   natives — corrupted `WhatWgUrlParser`'s state machine (non-deterministic
-   AIOOBE/AssertionError).
+   `hasPrevious`) instead of `EmptyListIterator` — crashed Jetty main-thread
+   with `NoSuchMethodError`. (Reapplied `1ae3066c5`'s fix; this specific
+   worktree had forked before that commit landed on `dev`.)
+2. `StringBuilder`/`StringBuffer`/`AbstractStringBuilder` had no native
+   registration for `codePointAt`/`codePointBefore`/`codePointCount`/
+   `appendCodePoint` — fell through to real-JDK bytecode assuming a
+   compact-string layout CratonVM doesn't use, corrupting
+   `WhatWgUrlParser`'s state machine (non-deterministic AIOOBE/AssertionError).
 3. `register_p68_security_cert` (Certificate/X509Certificate natives) was
-   gated behind the `synthetic-jdk` feature and never called in real-JDK
-   builds — `Certificate.getEncoded()` → `AbstractMethodError` on any cert
-   access (e.g. OkHttpClient's `TrustManagerFactory` init).
+   only reachable behind the `synthetic-jdk` feature gate and never called in
+   real-JDK-mode builds — `Certificate.getEncoded()` had no natives and no
+   bytecode, `AbstractMethodError` on any cert access (e.g. OkHttpClient's
+   `TrustManagerFactory` init, hit regardless of whether the test itself uses
+   HTTPS).
 4. `System.setProperty`/`clearProperty` didn't update the `Properties`
    side-table backing an already-cached `System.getProperties()` singleton —
-   broke SpEL `#{systemProperties.x}` for properties set post-`refresh()`.
-5. TYPE_USE annotations on generic type args (`@Valid` on `List<@Valid X>`)
-   parsed but discarded before reaching `AnnotatedParameterizedType
-   .getAnnotatedActualTypeArguments()` — broke container-element `@Valid`
-   cascading validation.
-6. `Class.getPackage()` allocated a fresh `Package` per call instead of
-   interning by name — broke `Package.equals()`.
-7. Reflective `Method.invoke(null-arg, primitive-param)` threw a cause-less
-   `IllegalArgumentException` instead of chaining a `NullPointerException`
-   cause.
-8. `java.net.URI.equals()`/`hashCode()` compared by exact raw-string equality
-   instead of RFC 3986 §3.2.2 case-insensitive scheme/host comparison — also
-   fixed the WHAT_WG IPv6-host-casing residual from an earlier pass of this
-   doc (`UriComponentsTests::toUriWithIpv6HostAlreadyEncoded`), since that was
-   actually a `URI.equals()` bug, not a `WhatWgUrlParser` bug.
-9. `file:` URL connection handling didn't percent-decode the path before
-   filesystem access — broke resource lookups with encoded characters
-   (`ResourceHttpRequestHandlerIntegrationTests`, `%20` in filenames).
-10. `Arrays$ArrayList`'s backing-array slot index differs between synthetic
-    and real-JDK mode (real mode has `AbstractList.modCount` pushing it to
-    slot 1) — `collect_collection_elements()` silently treated non-empty
-    `Arrays.asList(...)`-backed collections as empty (broke
-    `MockHttpServletRequest.setPreferredLocales`, hence
-    `AcceptHeaderLocaleResolverTests`).
-11. `Collections.unmodifiableSet()`'s synthetic stamp unconditionally
-    declared `SortedSet`/`NavigableSet` — mis-triggered `AssertJ`'s
-    `comparator()` probe on a plain `LinkedHashSet` wrapper
-    (`RequestMappingInfoHandlerMappingTests`).
-12. `synthetic_implements`'s name-based `instanceof Collection` fallback
-    matched on the substring "Collection" inside "Collections$SingletonMap"
-    itself — broke Groovy's `DefaultTypeTransformation.asCollection`
-    (`ViewResolutionIntegrationTests::groovyMarkup`).
-13. `kotlin.collections.ArrayAsCollection`'s `(values, isVarargs)` layout was
-    misread by the generic "ArrayList-shaped" heuristic (boolean `isVarargs`
-    treated as `size`) — truncated any `ArrayList(mutableListOf(...))` to one
-    element (`InvocableHandlerMethodKotlinTests`).
-14. `IntStream`/`LongStream`/`DoubleStream.iterator()` had no native
-    registration — dispatched to the abstract `BaseStream.iterator()`
-    interface declaration → `AbstractMethodError` (`XlsViewTests::xlsxStreamingView`).
-15. `java.util.logging.Logger.log(Level, String, Object[])` (and the
-    single-`Object` overload) had no native override — CratonVM's synthetic
-    `Logger` objects bypass the real constructor, leaving instance field
-    `loggerBundle` uninitialized, so the unshimmed call fell through to real
-    JDK bytecode (`Logger.doLog` → `getEffectiveLoggerBundle()`) and NPE'd
-    reading the never-initialized field. Jython 2.7.4's `PySystemState`
-    bootstrap (`PrePy.maybeWrite` → `writeConsoleWarning`) calls exactly this
-    overload on every `PythonInterpreter`/JSR-223 `jython` engine bootstrap,
-    breaking `DefaultFragmentsRenderingTests` and `FragmentRenderingStreamTests`.
-    (Not the class-initialization-ordering race originally hypothesized —
-    confirmed via direct repro against the actual Jython jar.)
-16. `flate2`'s default `rust_backend` (`miniz_oxide`) DEFLATE encoder,
-    while spec-correct, isn't byte-identical to real zlib's output —
-    `ResourceHttpRequestHandlerTests::partialContentByteRangeWithEncodedResource`
-    expected a 66-byte gzip stream (matching real zlib) but got 69 bytes.
-    Fixed by switching the workspace's `flate2` feature to `zlib-rs` (a pure-
-    Rust, no-system-dependency zlib reimplementation, bit-for-bit compatible
-    with real zlib) — verified with a side-by-side baseline-vs-fixed build
-    comparison to confirm zero regressions.
-
-`JAXBContextImpl.createValidator` `VerifyError` (from the original bug list)
-did not reproduce on a clean build — the check that would produce it
-(`verify_inherited_abstract_methods_implemented` in `classloading/src/verifier.rs`)
-is already disabled on `dev`, precisely because of this JAXB scenario. No fix
-needed. `CookieLocaleResolverTests`'s invalid-timezone tests also did not
-reproduce — already fixed by unrelated prior `TimeZone` native work.
-
-`XlsViewTests::xlsxView`'s `ClassCastException: StringEnumValue cannot be
-cast to STCellType$Enum` (traced to `SchemaTypeImpl.ensureStringEnumInfo()`'s
-reflective `Class.getField("table").get(null)` read on the XmlBeans-generated
-`STCellType$Enum`) also did **not** reproduce on a fresh `dev` build
-(HEAD `1fcd2feb`, 2026-07-06). Verified via a dedicated
-`fix/xls-poi-local` worktree: built a clean baseline binary and ran
-`XlsViewTests` alone (3/3 pass, including `xlsxView`) and again as part of the
-full `org.springframework.web.servlet.view.*` package (28 classes) — `OK 3 3
-0 0 0` both times, with the other pre-existing failures in that sweep
-(FreeMarker, Jython/JRuby, Groovy, `MarshallingViewTests`,
-`DefaultFragmentsRenderingTests`, `ScriptTemplateViewTests` timeout)
-reproducing exactly as documented elsewhere in this file, confirming the
-binary/harness behaved normally rather than silently skipping the test.
-Bisecting the intervening commits wasn't done, but the `ensure_class_initialized`
-call added ahead of every static `Field.get`/`Field.set` in `native-builtins/
-src/lang_class.rs` (`ensure_static_field_declaring_class_initialized`, landed
-in `50119adb` — already an ancestor of both this run and the run that found
-the bug OPEN) plus later reflection/classloading hardening merged into `dev`
-since (e.g. `489b0f88`, the `codex/web-residual-all-20260705-001` merge)
-apparently fixed this as a side effect. No code change was needed or made.
+   broke SpEL `#{systemProperties.x}` resolution for properties set after
+   `ApplicationContext.refresh()`.
+5. TYPE_USE annotations on generic type arguments (e.g. `@Valid` on
+   `List<@Valid Person>`) were parsed but discarded before reaching
+   `AnnotatedParameterizedType.getAnnotatedActualTypeArguments()` — broke
+   Spring's container-element `@Valid` cascading validation detection.
+6. `Class.getPackage()` allocated a fresh `Package` object per call instead
+   of interning by name — broke `Package.equals()` (which, like HotSpot, has
+   no override and relies on identity/interning) wherever Spring compares
+   packages by equality.
+7. Reflective `Method.invoke` with a null argument against a primitive
+   parameter threw a cause-less `IllegalArgumentException`; HotSpot chains a
+   `NullPointerException` cause that Spring's error-message logic depends on.

@@ -97,7 +97,7 @@ against real HotSpot (expect 1 there, CratonVM apparently reports 2).
 
 ## Discrepancy against `spring-disposablebeanadapter-invalid-destruction-signature-cluster-RESOLVED.md`
 
-`docs/internal/fixed-suite-bugs/spring-disposablebeanadapter-invalid-destruction-signature-cluster-RESOLVED.md`
+`../spring/spring-disposablebeanadapter-invalid-destruction-signature-cluster-RESOLVED.md`
 (dated 2026-07-12) closed a **34-class** cluster with this exact same outer
 message (`"Invalid destruction signature"`) — including
 `EmbeddedDataSourceConfiguration` by name in its own "affected modules"

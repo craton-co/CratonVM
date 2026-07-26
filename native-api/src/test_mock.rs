@@ -117,6 +117,10 @@ pub struct MockNativeContext {
     /// default-impl callers that route through `invoke_virtual` for
     /// dispatch. `None` means "return `Ok(None)` (Java `void`)".
     invoke_virtual_result: UnsafeCell<Option<MethodCallResult>>,
+    /// Collector-visible slots used to exercise `NativeHandleScope`.
+    handle_slots: UnsafeCell<Vec<Option<ObjectRef>>>,
+    /// Nested scope bases, matching the production `JvmThread` layout.
+    handle_scope_bases: UnsafeCell<Vec<usize>>,
 }
 
 impl Default for MockNativeContext {
@@ -137,6 +141,8 @@ impl MockNativeContext {
             next_hash: AtomicI32::new(1),
             next_ptr: AtomicUsize::new(8),
             invoke_virtual_result: UnsafeCell::new(None),
+            handle_slots: UnsafeCell::new(Vec::new()),
+            handle_scope_bases: UnsafeCell::new(Vec::new()),
         }
     }
 
@@ -157,6 +163,18 @@ impl MockNativeContext {
     pub fn set_invoke_virtual_result(&self, result: MethodCallResult) {
         // SAFETY: single-threaded test code.
         unsafe { *self.invoke_virtual_result.get() = Some(result) };
+    }
+
+    /// Number of currently rooted handle slots.
+    pub fn handle_slot_count(&self) -> usize {
+        // SAFETY: single-threaded test code.
+        unsafe { (&*self.handle_slots.get()).len() }
+    }
+
+    /// Number of currently open handle scopes.
+    pub fn handle_scope_depth(&self) -> usize {
+        // SAFETY: single-threaded test code.
+        unsafe { (&*self.handle_scope_bases.get()).len() }
     }
 
     fn fields_mut(&self) -> &mut HashMap<FieldKey, Value> {
@@ -201,6 +219,39 @@ impl NativeContext for MockNativeContext {
     }
     fn invoke(&mut self, _c: &str, _m: &str, _d: &str, _a: &[Value]) -> MethodCallResult {
         Ok(None)
+    }
+
+    fn handle_scope_push(&mut self) {
+        // SAFETY: single-threaded test code.
+        let slots = unsafe { &*self.handle_slots.get() };
+        // SAFETY: single-threaded test code.
+        unsafe { &mut *self.handle_scope_bases.get() }.push(slots.len());
+    }
+
+    fn handle_scope_pop(&mut self) {
+        // SAFETY: single-threaded test code.
+        let bases = unsafe { &mut *self.handle_scope_bases.get() };
+        let Some(base) = bases.pop() else {
+            return;
+        };
+        // SAFETY: single-threaded test code.
+        unsafe { &mut *self.handle_slots.get() }.truncate(base);
+    }
+
+    fn handle_root(&mut self, object: ObjectRef) -> u32 {
+        // SAFETY: single-threaded test code.
+        let slots = unsafe { &mut *self.handle_slots.get() };
+        let slot = slots.len();
+        slots.push(Some(object));
+        u32::try_from(slot).expect("mock native handle table exceeded u32")
+    }
+
+    fn handle_get(&self, slot: u32) -> Option<ObjectRef> {
+        // SAFETY: single-threaded test code.
+        unsafe { &*self.handle_slots.get() }
+            .get(slot as usize)
+            .copied()
+            .flatten()
     }
 
     // --------------------------------------------------------------

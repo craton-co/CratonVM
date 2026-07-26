@@ -1244,6 +1244,19 @@ fn h2_prune_nested_unnest_range(ctx: &mut dyn NativeContext, expression: ObjectR
 /// `SearchRow`. Reading that row directly avoids reinterpreting
 /// `TableFilter.getValue(Column)` for every nested-range candidate. All other
 /// resolver shapes retain H2's virtual dispatch as the fallback.
+fn h2trace_enabled() -> bool {
+    // PERF (2026-07-25): was an uncached `var_os` per call — an LD_PRELOAD
+    // tally over CratonBench `hashmap` counted 10M probes of this flag alone.
+    // The local `OnceLock` that fixed it is now redundant: the value is latched
+    // once in `cratonvm_types::flags()`, so this is a plain field load.
+    crate::nbflags().dbg_h2trace
+}
+
+fn h2trace_seq() -> u32 {
+    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 fn h2_expression_column_get_value(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let expression = h2_object_arg(args, 0, "ExpressionColumn.getValue receiver is null")?;
     let resolver = h2_object_field(ctx, expression, "columnResolver").ok_or_else(|| {
@@ -1259,14 +1272,74 @@ fn h2_expression_column_get_value(ctx: &mut dyn NativeContext, args: &[Value]) -
     let table_filter_class = ctx.class_id_by_name("org/h2/table/TableFilter");
     if table_filter_class.is_some_and(|class_id| ctx.class_id_of_object(resolver) == class_id) {
         let column_id = h2_int_field(ctx, column, "columnId");
-        if let Some(row) = h2_object_field(ctx, resolver, "current")
-            .or_else(|| h2_object_field(ctx, resolver, "currentSearchRow"))
-        {
+        // `current` (TableFilter.next()'s lazily-fetched FULL row, populated
+        // by the real getValue(Column) bytecode below on first need -- see
+        // that method's own `current = cursor.get()` line) always holds
+        // every column once it exists, so reading it directly is always
+        // safe. `currentSearchRow` (set unconditionally on every
+        // TableFilter.next()) is NOT always a full row: for a cursor driven
+        // by a SECONDARY index over only a PREFIX of a composite key (an
+        // index range scan, not an exact point lookup), it is the index's
+        // own lightweight key row -- containing only the INDEXED columns.
+        // Reading a non-indexed column straight off that partial row
+        // returns a bare Java null (not H2's own ValueNull.INSTANCE SQL-NULL
+        // sentinel) instead of triggering the genuine `Table.getValue`'s
+        // lazy `cursor.get()` full-row fetch that reads it correctly --
+        // corrupting the query result with a raw null instead of the real
+        // value. Take the fast path off `currentSearchRow` only when the
+        // read actually comes back with a value; a null result falls
+        // through to the real (slow, but correct) virtual dispatch below,
+        // which also has the side effect of caching the fetched full row
+        // into `current` for any later columns read from this same row.
+        if let Some(row) = h2_object_field(ctx, resolver, "current") {
             return ctx.invoke_virtual(
                 row,
                 "getValue",
                 "(I)Lorg/h2/value/Value;",
                 &[Value::Int(column_id)],
+            );
+        }
+        if let Some(row) = h2_object_field(ctx, resolver, "currentSearchRow") {
+            if h2trace_enabled() {
+                let row_cid = ctx.class_id_of_object(row);
+                let row_cls = ctx.class_name_of_id(row_cid).unwrap_or_default();
+                eprintln!(
+                    "[h2trace seq={}] EC.getValue FALLTHROUGH-ENTER column_id={} row_class={}",
+                    h2trace_seq(), column_id, row_cls,
+                );
+            }
+            // GC-safety: the probe call below re-enters Java and may move
+            // `resolver`/`column` (both read again afterward -- `resolver`
+            // by the fallback dispatch below, `column` as its argument).
+            // Pin both across it and re-read the forwarded references
+            // before any further use, same pattern as every other
+            // re-entrant call in this file.
+            let resolver_pin = ctx.pin_native_root(resolver);
+            let column_pin = ctx.pin_native_root(column);
+            let probe = ctx.invoke_virtual(
+                row,
+                "getValue",
+                "(I)Lorg/h2/value/Value;",
+                &[Value::Int(column_id)],
+            );
+            let resolver = ctx.read_native_pin(resolver_pin, resolver);
+            let column = ctx.read_native_pin(column_pin, column);
+            ctx.unpin_native_roots(resolver_pin);
+            let probe = probe?;
+            if h2trace_enabled() {
+                eprintln!(
+                    "[h2trace seq={}] EC.getValue FALLTHROUGH probe_hit={}",
+                    h2trace_seq(), probe.is_some(),
+                );
+            }
+            if let Some(Value::Object(Some(value))) = probe {
+                return Ok(Some(Value::Object(Some(value))));
+            }
+            return ctx.invoke_virtual(
+                resolver,
+                "getValue",
+                "(Lorg/h2/table/Column;)Lorg/h2/value/Value;",
+                &[Value::Object(Some(column))],
             );
         }
     }
@@ -1870,6 +1943,16 @@ fn h2_session_prepare_local_no_cache(
             .get(..6)
             .is_some_and(|prefix| prefix.eq_ignore_ascii_case("select"))
     });
+    if h2trace_enabled() {
+        let sql_text = ctx.read_string(sql).unwrap_or_default();
+        let prefix: String = sql_text.chars().take(60).collect();
+        let session_class_id = ctx.class_id_of_object(this);
+        let loader_id = ctx.loader_id_of_class(session_class_id);
+        eprintln!(
+            "[h2trace seq={}] Session.prepareLocal is_select={} loader_id={} sql={:?}",
+            h2trace_seq(), is_select, loader_id, prefix,
+        );
+    }
     if is_select {
         // The bytecode path re-enters Java and may move either argument.
         // Root and refresh both before handing them to the original method.
@@ -1887,22 +1970,87 @@ fn h2_session_prepare_local_no_cache(
         return result;
     }
 
-    let parser = match ctx.new_object_initialized(
-        "org/h2/command/Parser",
-        "(Lorg/h2/engine/SessionLocal;)V",
-        &[Value::Object(Some(this))],
-    )? {
-        Some(Value::Object(Some(o))) => o,
-        _ => return Ok(Some(Value::Object(None))),
-    };
-    let command = ctx.invoke_virtual(
-        parser,
-        "prepareCommand",
-        "(Ljava/lang/String;)Lorg/h2/command/Command;",
-        &[Value::Object(Some(sql))],
-    )?;
-    ctx.set_field_by_name(this, "derivedTableIndexCache", Value::Object(None));
-    Ok(command)
+    let this_pin = ctx.pin_native_root(this);
+    let sql_pin = ctx.pin_native_root(sql);
+    let result = (|| {
+        let this = ctx.read_native_pin(this_pin, this);
+        // Loader-precise construction (JVMS SS5.3): resolving "org/h2/command/
+        // Parser" by name alone collapses to whichever loader defined it
+        // FIRST process-wide (see `new_object_initialized`'s own doc
+        // comment) -- fatal for `Upgrade.loadH2`'s per-call anonymous
+        // ClassLoader, which defines its own, distinct copy of `Parser`, and
+        // whose sessions reach this native. Gated behind an actual
+        // UserDefined-loader check (`loader_id_of_class` returns 0/1/2 for
+        // Bootstrap/Extension/Application, 3+ for UserDefined): this is the
+        // SQL statement-preparation entry point for EVERY session in the
+        // whole process, and unconditionally driving
+        // `class_id_by_name_via_referencing_class` (which re-enters the
+        // interpreter's loader-initiated-resolution machinery) on every
+        // ordinary, single-loader Application call was measured to corrupt
+        // unrelated later state (a regression caught by `TestLinkedTable`
+        // during verification of this fix -- exact mechanism not pinned
+        // down, but the ordinary single-loader path has no need for
+        // loader-aware resolution at all, so simply not taking it there is
+        // both the minimal-risk and the correct fix). Only sessions
+        // genuinely loaded by a non-Application loader (`Upgrade.loadH2`'s
+        // old-driver copies) pay for the loader-aware path.
+        let session_class_id = ctx.class_id_of_object(this);
+        let loader_id = ctx.loader_id_of_class(session_class_id);
+        let parser_class_id = if loader_id >= 3 {
+            let resolved = ctx.class_id_by_name_via_referencing_class(
+                session_class_id,
+                "org/h2/command/Parser",
+            )?;
+            if h2trace_enabled() {
+                let resolved_loader = ctx.loader_id_of_class(resolved);
+                eprintln!(
+                    "[h2trace seq={}] Session.prepareLocal LOADER-AWARE-PATH session_loader={} parser_class_id={:?} parser_loader={}",
+                    h2trace_seq(), loader_id, resolved, resolved_loader,
+                );
+            }
+            Some(resolved)
+        } else {
+            if h2trace_enabled() {
+                eprintln!(
+                    "[h2trace seq={}] Session.prepareLocal PLAIN-PATH session_loader={}",
+                    h2trace_seq(), loader_id,
+                );
+            }
+            None
+        };
+        let this = ctx.read_native_pin(this_pin, this);
+        let sql = ctx.read_native_pin(sql_pin, sql);
+        let parser = match if let Some(parser_class_id) = parser_class_id {
+            ctx.new_object_initialized_with_class_id(
+                parser_class_id,
+                "(Lorg/h2/engine/SessionLocal;)V",
+                &[Value::Object(Some(this))],
+            )?
+        } else {
+            ctx.new_object_initialized(
+                "org/h2/command/Parser",
+                "(Lorg/h2/engine/SessionLocal;)V",
+                &[Value::Object(Some(this))],
+            )?
+        } {
+            Some(Value::Object(Some(o))) => o,
+            _ => return Ok(Some(Value::Object(None))),
+        };
+        let parser_pin = ctx.pin_native_root(parser);
+        let sql = ctx.read_native_pin(sql_pin, sql);
+        let parser = ctx.read_native_pin(parser_pin, parser);
+        let command = ctx.invoke_virtual(
+            parser,
+            "prepareCommand",
+            "(Ljava/lang/String;)Lorg/h2/command/Command;",
+            &[Value::Object(Some(sql))],
+        )?;
+        let this = ctx.read_native_pin(this_pin, this);
+        ctx.set_field_by_name(this, "derivedTableIndexCache", Value::Object(None));
+        Ok(command)
+    })();
+    ctx.unpin_native_roots(this_pin);
+    result
 }
 
 fn h2_constraint_check_existing_data(
@@ -2170,6 +2318,11 @@ fn h2_parser_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
+    if std::env::var_os("CRATONVM_DBG_H2PARSERREAD").is_some() {
+        let cid = ctx.class_id_of_object(this);
+        let cname = ctx.class_name_of_id(cid).unwrap_or_default();
+        eprintln!("[H2PARSERREAD] this class_id={cid:?} class_name={cname}");
+    }
     let old_index = match ctx.get_field_by_name(this, "tokenIndex") {
         Value::Int(i) => i,
         _ => -1,

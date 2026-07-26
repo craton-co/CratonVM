@@ -561,7 +561,7 @@ fn defl_do_compress(
     let st = match tbl.get_mut(&addr) {
         Some(s) => s,
         None => {
-            if std::env::var_os("CRATONVM_DBG_DEFLATE").is_some() {
+            if crate::nbflags().dbg_deflate {
                 eprintln!(
                     "[DBG-DEFLATER] {which} addr={addr:#x} NOT FOUND in deflater_table (silent 0/0 return)"
                 );
@@ -615,7 +615,7 @@ fn defl_deflate_bytes_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         None => Vec::new(),
     };
     let mut output_buf = vec![0u8; out_len];
-    if std::env::var_os("CRATONVM_DBG_DEFLATE").is_some() {
+    if crate::nbflags().dbg_deflate {
         eprintln!(
             "[DBG-DEFLATER] deflateBytesBytes addr={addr:#x} in_len={in_len} out_len={out_len} flush_code={flush_code} params={params}"
         );
@@ -670,7 +670,7 @@ fn defl_deflate_bytes_buffer(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         None => Vec::new(),
     };
     let mut output_buf = vec![0u8; out_len];
-    if std::env::var_os("CRATONVM_DBG_DEFLATE").is_some() {
+    if crate::nbflags().dbg_deflate {
         eprintln!(
             "[DBG-DEFLATER] deflateBytesBuffer addr={addr:#x} in_len={in_len} out_len={out_len} flush_code={flush_code} params={params}"
         );
@@ -724,7 +724,7 @@ fn defl_deflate_buffer_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         .into());
     }
     let mut output_buf = vec![0u8; out_len];
-    if std::env::var_os("CRATONVM_DBG_DEFLATE").is_some() {
+    if crate::nbflags().dbg_deflate {
         eprintln!(
             "[DBG-DEFLATER] deflateBufferBytes addr={addr:#x} in_len={in_len} out_len={out_len} flush_code={flush_code} params={params}"
         );
@@ -776,7 +776,7 @@ fn defl_deflate_buffer_buffer(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         .into());
     }
     let mut output_buf = vec![0u8; out_len];
-    if std::env::var_os("CRATONVM_DBG_DEFLATE").is_some() {
+    if crate::nbflags().dbg_deflate {
         eprintln!(
             "[DBG-DEFLATER] deflateBufferBuffer addr={addr:#x} in_len={in_len} out_len={out_len} flush_code={flush_code} params={params}"
         );

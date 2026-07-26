@@ -1,123 +1,118 @@
 # CratonVM
 
-### The Java Virtual Machine, reimagined in Rust.
+### Java on the GPU. No annotations. No rewrites. Just faster.
 
-**A modern JVM with a custom x86-64 JIT, memory-safe by construction, and built
-for the GPU era: zero C/C++ legacy, one self-contained native binary.**
+**CratonVM is the Java Virtual Machine that runs your existing Java code on
+the GPU — and beats the fastest Java GPU framework doing it. Built entirely
+in Rust: one self-contained binary, memory-safe from the first line.**
 
-*Version 0.3.0 - Java SE 8-25 language coverage - Brought to you by Craton
-Software Company*
-
----
-
-## Why CratonVM
-
-For twenty-five years, the Java runtime has rested on millions of lines of C
-and C++. CratonVM starts over on a foundation of **Rust**. The result is a Java
-Virtual Machine that is fast-moving, lean, and safe by design, with the ambition
-to run modern Java workloads on modern hardware, including the GPU.
-
-CratonVM is **cutting-edge, research-grade software**: early, fast-moving, and
-unafraid to rethink the runtime from first principles.
-
-- **Memory-safe by construction.** Built end-to-end in Rust, CratonVM inherits
-  Rust's ownership and bounds-checking guarantees. Entire categories of classic
-  VM vulnerabilities are designed out at the language level.
-- **No C/C++ legacy.** Not a fork, not a wrapper, not a binding layer. A
-  ground-up runtime with a clean, auditable codebase.
-- **One self-contained binary.** No JDK install, no `JAVA_HOME`, no `rt.jar`.
-  CratonVM ships its own implementations of the Java standard library and runs
-  as a single native executable.
-- **GPU-accelerated compute (emerging).** An opt-in pipeline lowers Java
-  bytecode toward the GPU via NVIDIA CUDA.
-- **Broad Java language coverage.** Targets Java SE 8 through 25: lambdas and
-  streams, records and sealed classes, pattern matching, virtual threads, scoped
-  values, and more.
-- **Performance work in progress.** Current measurements show OSR-enabled
-  Arithmetic, Sieve, and Matrix within roughly 1.3x-1.6x of JDK 25 C2, while
-  recursive Fibonacci and allocation-heavy Binary Trees remain major gaps.
+*Version 0.3.0 · Java SE 8–25 · by Craton Software Company*
 
 ---
 
-## Key Capabilities
+## Your Java. On the GPU. Automatically.
 
-- **Custom x86-64 JIT compiler** - compiles hot methods to native machine code,
-  with loop-invariant code motion, bounds-check elimination, AVX2 SIMD
-  vectorization, on-stack replacement, and graph-coloring register allocation.
-  AArch64 support is in progress.
-- **Memory-safe Rust runtime** - the VM, interpreter, GC, and JIT are written in
-  safe-by-default Rust.
-- **Generational garbage collection** - young/old generations with write
-  barriers and a card table, plus additional collector backends.
-- **True multi-threading** - monitors, locks, and barriers, with
-  `java.util.concurrent` support.
-- **Rich standard library** - thousands of native method implementations across
-  `java.lang`, `java.util`, `java.io`, `java.time`, `java.util.stream`,
-  `java.util.concurrent`, and more.
-- **Lambdas and `invokedynamic`** - modern functional Java runs out of the box.
-- **GPU offload (opt-in, emerging)** - bytecode-to-GPU lowering via NVIDIA
-  CUDA, off by default so the standard build stays a lean CPU-only JVM.
-- **Security-minded by design** - built-in bytecode verification and a
-  memory-safe core.
+Every other path to GPU acceleration in Java asks you to rewrite your code:
+special annotations, task graphs, new APIs, new build steps. CratonVM asks
+for nothing. Point it at your compiled classes and eligible computations move
+to the GPU transparently — the same `.class` files, the same `main()`, the
+same results, bit for bit.
 
----
+And it isn't just easier. **It's faster.** On division-dominated compute —
+the workloads where CPUs have no vectorized answer — CratonVM's GPU
+pipeline outruns [TornadoVM](https://github.com/beehive-lab/TornadoVM), the
+leading Java GPU framework:
 
-## Performance Snapshot
+| Compute kernel (16.7M elements) | CPU (HotSpot C2) | TornadoVM GPU | **CratonVM GPU** |
+|---------------------------------|------------------|----------------|-------------------|
+| Integer division chain          | 1,910 ms         | 28 ms          | **9 ms — 3.1x faster than TornadoVM, 212x faster than CPU** |
+| Double-precision division chain | 1,508 ms         | 129 ms         | **91 ms — 1.4x faster than TornadoVM, 16.6x faster than CPU** |
 
-Single-run snapshot measured 2026-07-02 on Windows 11, JDK 25.0.1 LTS, and
-CratonVM code `b80c50b5`.
+Three things make that second row special:
 
-| Benchmark            | JDK 25 C2    | CratonVM default | Default ratio | CratonVM OSR, threshold=1 | OSR ratio |
-|----------------------|--------------|------------------|---------------|---------------------------|-----------|
-| Arithmetic (300M)    | 991 ms       | 73,820 ms        | 74.5x         | 1,534 ms                  | 1.55x     |
-| Fibonacci(42)        | 2,071 ms     | 28,969 ms        | 14.0x         | 28,525 ms                 | 13.8x     |
-| Sieve (100K x 500)   | 358 ms       | 31,665 ms        | 88.4x         | 466 ms                    | 1.30x     |
-| Matrix 500x500       | 336 ms       | 39,078 ms        | 116.3x        | 452 ms                    | 1.35x     |
-| **QuickBench total** | **3,756 ms** | **173,532 ms**   | **46.2x**     | **30,977 ms**             | **8.25x** |
+1. **No code changes.** TornadoVM needed `@Parallel` annotations and its
+   TaskGraph API to get its number. CratonVM ran plain Java.
+2. **Bit-exact results.** CratonVM's GPU division matches HotSpot's answer
+   to the last bit, IEEE-754 exact. TornadoVM's doesn't.
+3. **It handles what others can't.** On a reduction kernel TornadoVM's own
+   backend throws `unimplemented`, CratonVM just runs it.
 
-This historical table predates the 2026-07-04 OSR default flip. The OSR column
-sets `CRATONVM_JIT_OSR=1 CRATONVM_JIT_THRESHOLD=1`; current `dev` enables OSR
-by default, with `CRATONVM_JIT_OSR=0` as the opt-out.
-
-Backed by a layered Rust/Java test strategy and HotSpot-differential tooling.
+Where the CPU is genuinely better — multiply-heavy kernels that AVX2
+vectorizes beautifully — CratonVM leaves the work on the CPU. Transparent
+means honest: the right processor for each job.
 
 ---
 
-## Who It's For
+## A JVM rebuilt for this decade
 
-- **Systems and language researchers** exploring what a memory-safe,
-  from-scratch JVM can do.
-- **Performance engineers** who want a transparent, hackable JIT instead of an
-  opaque black box.
-- **GPU and HPC explorers** curious about pushing JVM compute onto the GPU via
-  CUDA.
-- **Security-conscious teams** evaluating a runtime engineered to eliminate
-  whole classes of native-code vulnerabilities by construction.
-- **Rust and JVM enthusiasts** who want to see the two worlds meet.
+For twenty-five years the Java runtime has rested on millions of lines of
+C and C++. CratonVM starts over in **Rust**:
 
-CratonVM is experimental and not yet production-ready; it is a fast-moving
-platform for the curious and the ambitious.
+- **Memory-safe by construction.** The interpreter, the JIT compiler, and
+  the garbage collector inherit Rust's ownership and bounds guarantees.
+  Whole categories of classic VM vulnerabilities are designed out before
+  the first line of your code runs.
+- **One self-contained binary.** No JDK install, no `JAVA_HOME`, no
+  `rt.jar`. Download, run. When a JDK *is* present, CratonVM can boot from
+  its real class library for maximum fidelity.
+- **A real optimizing JIT.** Tiered compilation, on-stack replacement,
+  bounds-check elimination, AVX2 vectorization — compiling your hot code to
+  native x86-64, then getting out of the way.
+- **Modern Java, covered.** Lambdas and streams, records and sealed
+  classes, pattern matching, virtual threads, scoped values — Java 8
+  through Java 25.
 
 ---
 
-## Get Started
+## Runs what you actually build
 
-Run your first class in seconds:
+This isn't a toy that runs Fibonacci. CratonVM boots the frameworks your
+applications are made of, and passes their test suites:
+
+- **Spring & Spring Boot** — the world's most-used Java application stack
+- **Tomcat** — servlets, NIO, WebSockets, HTTP/2
+- **Hibernate** — the standard for Java persistence
+- **H2** — a full embedded SQL database
+
+**Next up: the reactive stack.** Netty, Quarkus, and Hibernate Reactive are
+on the roadmap, together with real database connectivity — bringing
+cloud-native, event-driven Java to CratonVM.
+
+---
+
+## Who it's for
+
+- **Teams with GPU-hungry Java compute** — simulation, pricing, scoring,
+  signal processing — who want acceleration without a rewrite.
+- **Performance engineers** who want a transparent, hackable runtime
+  instead of an opaque black box.
+- **Security-conscious organizations** evaluating a runtime that eliminates
+  native-memory vulnerability classes by construction.
+- **Researchers and enthusiasts** who want to see what a from-scratch,
+  memory-safe JVM can do.
+
+CratonVM is fast-moving, research-grade software — early, ambitious, and
+improving measurably every week. Every published benchmark ships with
+matching checksums and reproducible methodology.
+
+---
+
+## Get started in sixty seconds
 
 ```bash
-cargo run --release -p cratonvm-cli -- --classpath . HelloWorld
+cargo build --release -p cratonvm-cli
+./target/release/cratonvm -cp . HelloWorld
 ```
 
-- **README** - features, command-line reference, and the full capability matrix:
-  [`README.md`](../README.md)
-- **Install guide** - binary installation and getting started:
-  [`docs/INSTALL.md`](INSTALL.md)
-- **GPU offload** - the opt-in CUDA acceleration reference:
-  [`docs/gpu/README.md`](gpu/README.md)
+- **Developer guide & capability matrix:** [`README.md`](../README.md)
+- **Benchmarks & methodology:** [`BENCHMARK.md`](../BENCHMARK.md)
+- **GPU offload reference:** [`docs/gpu/README.md`](gpu/README.md)
+- **Install guide:** [`docs/INSTALL.md`](INSTALL.md)
 
-**CratonVM: modern Java, memory-safe, GPU-ready. Built in Rust by Craton
+**CratonVM: your Java, on every processor you own. Built in Rust by Craton
 Software Company.**
 
 *Java and OpenJDK are trademarks of Oracle and/or its affiliates. NVIDIA and
-CUDA are trademarks of NVIDIA Corporation. These references are used for
-compatibility identification only.*
+CUDA are trademarks of NVIDIA Corporation. TornadoVM is a project of the
+Beehive Lab, University of Manchester. These references are used for
+compatibility and comparison identification only.*

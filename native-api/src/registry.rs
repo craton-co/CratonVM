@@ -330,6 +330,87 @@ pub enum GpuFutureResult {
     ScalarF64(f64),
 }
 
+/// Opaque reference to a GC-updated slot owned by a [`NativeHandleScope`].
+///
+/// The fallback is intentionally private. Lightweight mock contexts do not
+/// implement a moving heap and therefore use it when their default
+/// [`NativeContext::handle_get`] returns `None`; production VM contexts always
+/// read the current address through `slot`. Native implementations cannot
+/// extract either value, so they cannot accidentally keep using a pre-GC raw
+/// reference or reinterpret a slot index as a heap address.
+#[derive(Debug)]
+pub struct NativeHandle {
+    slot: u32,
+    fallback: ObjectRef,
+}
+
+/// Early-return- and panic-safe native root scope.
+///
+/// Construct this before retaining any object across an allocating or
+/// re-entrant VM call. Every object rooted through [`Self::root`] remains in
+/// the executing thread's collector-visible handle table until this guard is
+/// dropped. [`Drop`] closes the scope on every Rust exit path, eliminating the
+/// manually paired `handle_scope_push`/`handle_scope_pop` discipline.
+///
+/// `DerefMut<Target = dyn NativeContext>` lets existing native code call VM
+/// capabilities through the scope while the roots are active:
+///
+/// ```ignore
+/// let mut scope = NativeHandleScope::new(ctx);
+/// let receiver = scope.root(receiver);
+/// let array = scope.new_array(ArrayElementType::Char, len); // may collect
+/// let receiver = scope.get(&receiver); // always the current address
+/// scope.set_field(receiver, 0, Value::Object(Some(array)));
+/// // scope closes automatically, including on `?` or `return`.
+/// ```
+pub struct NativeHandleScope<'a> {
+    context: &'a mut dyn NativeContext,
+}
+
+impl<'a> NativeHandleScope<'a> {
+    /// Open a nested scope on `context`.
+    pub fn new(context: &'a mut dyn NativeContext) -> Self {
+        context.handle_scope_push();
+        Self { context }
+    }
+
+    /// Root `object` and return an opaque handle that can only be resolved
+    /// through this scope.
+    pub fn root(&mut self, object: ObjectRef) -> NativeHandle {
+        NativeHandle {
+            slot: self.context.handle_root(object),
+            fallback: object,
+        }
+    }
+
+    /// Resolve `handle` to its current post-GC address.
+    pub fn get(&self, handle: &NativeHandle) -> ObjectRef {
+        self.context
+            .handle_get(handle.slot)
+            .unwrap_or(handle.fallback)
+    }
+}
+
+impl<'a> std::ops::Deref for NativeHandleScope<'a> {
+    type Target = dyn NativeContext + 'a;
+
+    fn deref(&self) -> &Self::Target {
+        self.context
+    }
+}
+
+impl<'a> std::ops::DerefMut for NativeHandleScope<'a> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.context
+    }
+}
+
+impl Drop for NativeHandleScope<'_> {
+    fn drop(&mut self) {
+        self.context.handle_scope_pop();
+    }
+}
+
 /// Trait providing VM capabilities needed by native method implementations.
 ///
 /// The `Vm` struct implements this trait. Using a trait here avoids circular
@@ -602,7 +683,7 @@ pub trait NativeContext {
     /// ```
     ///
     /// the lambda is materialised as a proxy object whose class is
-    /// recorded in `shared.lambda_proxies`. This method looks the
+    /// recorded in `shared.classes.lambda_proxies`. This method looks the
     /// proxy up and returns
     /// `Some((target_class, target_method, target_descriptor,
     ///        captured_values))` so the dispatcher can route through
@@ -718,6 +799,77 @@ pub trait NativeContext {
     /// Release all native pin roots from `base` (a handle returned by
     /// [`pin_native_root`]) onward. Default impl is a no-op.
     fn unpin_native_roots(&mut self, _base: usize) {}
+
+    // ---- rooted handle scope (arch/handles) ----
+    //
+    // `pin_native_root`/`read_native_pin`/`unpin_native_roots` above fix
+    // staleness but not the discipline: a native method still holds the
+    // SAME `ObjectRef` type before and after pinning, so reading the
+    // pre-pin local by mistake type-checks fine and silently reintroduces
+    // the bug. The handle-scope quartet below is `cratonvm_types::handle`'s
+    // rooted-handle design (`RootedHandle`/`HandleStorage`) adapted to this
+    // trait-object boundary: a handle is an opaque `u32` slot, not an
+    // `ObjectRef`, so there is no raw pointer left to accidentally read.
+    //
+    // **Discipline — READ BEFORE holding any `ObjectRef` across a call that
+    // can allocate:** any native code that holds a reference across
+    // `invoke`/`new_object_initialized`/`new_array`/anything that can run
+    // Java (and therefore can trigger a GC) MUST root it with
+    // [`handle_root`] first and read it back with [`handle_get`] afterward
+    // — never keep using the pre-call local. The usual shape:
+    //
+    // ```ignore
+    // let mut scope = NativeHandleScope::new(ctx);
+    // let this_h = scope.root(this);
+    // let arr = scope.new_array(ArrayElementType::Char, len); // may GC-move `this`
+    // let this = scope.get(&this_h);                          // current address
+    // ```
+    //
+    // `NativeHandleScope` closes itself on normal, early-return, and unwind
+    // paths. Scopes nest and each guard releases only its own handles. See
+    // `docs/feature-designs/native-handle-discipline.md` for the full
+    // design and `native_builtins::lang_string` for worked examples
+    // (`native_string_init_abstract_string_builder`,
+    // `native_sb_init_default`, `native_sb_init_string`,
+    // `native_sb_init_charsequence`, `native_sb_init_capacity`).
+    //
+    // Default impls below mirror the no-op/pass-through convention already
+    // used by `pin_native_root` & co. for mock/test contexts with no moving
+    // GC: pushing/popping a scope is a no-op, and `handle_root` delegates to
+    // the already-default-implemented `pin_native_root` (truncated to
+    // `u32`) as the closest existing stand-in. `handle_get`'s default
+    // returns `None` rather than trying to read back through that
+    // delegation — `pin_native_root`'s own default doesn't retain anything
+    // to read, so there is nothing genuine to hand back. The VM's
+    // `NativeContextImpl` overrides all four with a real per-thread slot
+    // table (`vm/src/vm/vm_exec.rs`, "handle scope support").
+
+    /// Push a new handle scope. Every [`handle_root`] call until the
+    /// matching [`handle_scope_pop`] is released together when that pop
+    /// runs. Default impl is a no-op.
+    fn handle_scope_push(&mut self) {}
+
+    /// Pop the current handle scope, releasing every handle rooted since the
+    /// matching [`handle_scope_push`]. Default impl is a no-op.
+    fn handle_scope_pop(&mut self) {}
+
+    /// Root `r` in the current handle scope and return its slot id. Reading
+    /// through the slot (via [`handle_get`]) always returns `r`'s current,
+    /// possibly-GC-forwarded address — a handle can never go stale while its
+    /// scope is open, unlike a raw `ObjectRef` copy.
+    ///
+    /// Default impl delegates to [`pin_native_root`] (see the block doc
+    /// above for why); real GC-safety comes from the VM's override.
+    fn handle_root(&mut self, r: ObjectRef) -> u32 {
+        self.pin_native_root(r) as u32
+    }
+
+    /// Read back the current reference for `slot` (from [`handle_root`]), or
+    /// `None` if `slot` is out of range or its scope already popped. Default
+    /// impl returns `None`.
+    fn handle_get(&self, _slot: u32) -> Option<ObjectRef> {
+        None
+    }
 
     /// Create a *persistent* global GC root for `obj`, returning an opaque handle.
     ///
@@ -1331,7 +1483,11 @@ pub trait NativeContext {
     /// Probe a per-thread cache for an ASCII case-conversion result. The
     /// cache alternates two immutable values so consecutive calls stay
     /// observably distinct.
-    fn get_ascii_case_string_cached(&mut self, _source: ObjectRef, _upper: bool) -> Option<ObjectRef> {
+    fn get_ascii_case_string_cached(
+        &mut self,
+        _source: ObjectRef,
+        _upper: bool,
+    ) -> Option<ObjectRef> {
         None
     }
 
@@ -1577,6 +1733,44 @@ pub trait NativeContext {
     /// `Field`/`Method`/`Constructor`'s own declaring class.
     fn class_id_by_name_near(&self, name: &str, _near: ClassId) -> Option<ClassId> {
         self.class_id_by_name(name)
+    }
+
+    /// Resolve `name` to a `ClassId`, LOADING it through
+    /// `referencing_class_id`'s own defining classloader if it isn't loaded
+    /// yet -- exactly as a bytecode instruction (`new`/`checkcast`/
+    /// `invokestatic`/...) referencing `name` FROM `referencing_class_id`
+    /// would (JVMS SS5.4.3 initiating-loader semantics).
+    ///
+    /// Unlike [`Self::class_id_by_name_near`]/[`Self::class_id_by_name`] --
+    /// pure lookups that only succeed once `name` has already been
+    /// resolved/indexed under that loader -- this drives the loader's own
+    /// `loadClass`/`defineClass` on a miss, so it also answers correctly the
+    /// very first time a class is needed under a given loader (the gap that
+    /// made two prior lookup-based fix attempts for the H2 `Parser`
+    /// loader-collapse bug regress on a fresh session -- see
+    /// docs/known-issues/h2/bug-h2-suite-residual-fail-triage.md's
+    /// eighth-pass section).
+    ///
+    /// Native overrides that construct or invoke-special a DIFFERENT class
+    /// than their own receiver's declaring class (an app/H2 native bridging
+    /// into the receiver's own package -- e.g. `SessionLocal.prepareLocal`'s
+    /// `new Parser(this)`) MUST use this instead of
+    /// `new_object_initialized`/`invoke_special` with a bare name: those
+    /// collapse to whichever loader defined `name` FIRST process-wide,
+    /// silently constructing/invoking the WRONG loader's copy of the class
+    /// whenever the receiver's own defining loader is a user-defined one
+    /// distinct from the first-loaded (usually Application) copy.
+    ///
+    /// The default implementation ignores `referencing_class_id` and falls
+    /// back to the name-only [`Self::ensure_class_initialized`] -- sufficient
+    /// for test mocks and any context with a single (global) loader
+    /// namespace; the real VM implementation honours per-loader identity.
+    fn class_id_by_name_via_referencing_class(
+        &mut self,
+        _referencing_class_id: ClassId,
+        name: &str,
+    ) -> Result<ClassId, cratonvm_types::error::MethodCallFailed> {
+        self.ensure_class_initialized(name)
     }
 
     /// For a synthetic lambda-proxy `ClassId` (created by `register_lambda_proxy`,
@@ -1977,6 +2171,26 @@ pub trait NativeContext {
     /// Must be paired with `vt_release_carrier`. No-op for platform threads.
     fn vt_acquire_carrier(&mut self) {}
 
+    /// Request a continuation-backed timed park. Returns `true` only for an
+    /// unpinned virtual thread whose interpreter frames can be frozen by the
+    /// VM. The native must then return `ContinuationYield` without blocking.
+    fn vt_park_for(&mut self, _duration: std::time::Duration) -> bool {
+        false
+    }
+
+    /// Register the current unpinned virtual thread as an asynchronous waiter
+    /// on a VM-local stable key. The native must recheck its condition after
+    /// registration and return `ContinuationYield` only while it remains false.
+    fn vt_wait_on_key(&mut self, _key: u64) -> bool {
+        false
+    }
+
+    /// Cancel a waiter registration made by [`Self::vt_wait_on_key`].
+    fn vt_cancel_wait_on_key(&mut self, _key: u64) {}
+
+    /// Wake and resubmit all virtual threads waiting on a stable key.
+    fn vt_wake_waiters(&mut self, _key: u64) {}
+
     /// Emit a `jdk.VirtualThreadPinned` JFR event for the current thread.
     /// Called when a pinned virtual thread is about to block its carrier.
     ///
@@ -2014,11 +2228,24 @@ pub trait NativeContext {
         256 * 1024 * 1024
     }
 
+    /// Initial heap size in bytes, as reported by the JMX `MemoryMXBean`'s
+    /// heap `MemoryUsage.getInit()`. The default (mock/test contexts) mirrors
+    /// `max_heap_bytes`'s historical placeholder; the VM overrides it to
+    /// return the configured `-Xms` (`VmConfig::initial_heap_size`).
+    fn initial_heap_bytes(&self) -> i64 {
+        16 * 1024 * 1024
+    }
+
     /// Returns the total number of bytes allocated on the heap.
     fn heap_allocated_bytes(&self) -> usize;
 
     /// Returns the number of classes currently loaded in the VM.
     fn loaded_class_count(&self) -> usize;
+
+    /// Cumulative classes reclaimed by class-loader unloading.
+    fn unloaded_class_count(&self) -> u64 {
+        0
+    }
 
     /// Returns the cumulative number of GC collections that have occurred.
     fn gc_collection_count(&self) -> u64;
@@ -2041,6 +2268,22 @@ pub trait NativeContext {
     /// The default impl is a no-op so out-of-tree `NativeContext`
     /// implementors (tests) need not change.
     fn begin_blocking_region(&mut self) {}
+
+    /// Same GC-safety contract as `begin_blocking_region`, for a region with
+    /// a bounded/known wait duration (`Thread.sleep`, a timed `Object.wait`,
+    /// `LockSupport.parkNanos`, …). `Thread.getState()` reports
+    /// `TIMED_WAITING` for a thread inside one of these vs. plain `WAITING`
+    /// for an unbounded `begin_blocking_region` — real JDK's
+    /// `Thread.State` makes exactly this distinction, and callers such as
+    /// Spring Boot's `SpringApplicationShutdownHookTests` assert on it via
+    /// `Awaitility.await().until(thread::getState, State.TIMED_WAITING::equals)`.
+    ///
+    /// The default impl just delegates to `begin_blocking_region` (reported
+    /// as plain `WAITING`) so out-of-tree `NativeContext` implementors need
+    /// not change; must still be paired with exactly one `end_blocking_region`.
+    fn begin_timed_blocking_region(&mut self) {
+        self.begin_blocking_region();
+    }
 
     /// T19.H1 — end a blocking region opened by `begin_blocking_region`.
     /// Re-syncs the thread with any GC that ran while it was blocked.
@@ -3990,7 +4233,7 @@ impl NativeMethodRegistry {
         // PipedInputStream itself -- which declares neither -- producing a
         // NoSuchMethodError naming PipedInputStream for a completely
         // unrelated method. See
-        // docs/known-issues/h2-suite-bugs/bug-h2-nosuchmethoderror-cross-class-dispatch.md
+        // docs/known-issues/h2/bug-h2-nosuchmethoderror-cross-class-dispatch.md
         // (H2's TestLob/TestLobApi/TestSQLXML/TestUpdatableResultSet/
         // TestResultSet, which all use real connected Piped stream pairs).
         // Real JDK PipedInputStream/PipedOutputStream bytecode is
@@ -4426,8 +4669,15 @@ impl NativeMethodRegistry {
         // `SyntheticStub` drop applies to on quirky descriptors — a dispatch
         // semantics change, out of scope for a perf change. Left as-is,
         // deliberately.
+        //
+        // MERGE NOTE (dev @ 6495a191c): dev's concurrent edit here was a pure
+        // rustfmt reflow of the `methods` / `category_by_key` probe that this
+        // change deletes outright. Its formatting of the `kind_of` chain is
+        // carried over; the two-map probe itself is gone.
         let cb = self.find_with_descriptor_quirks(class_name, method_name, descriptor)?;
-        let kind = self.kind_of(class_name, method_name, descriptor).unwrap_or(NativeKind::Bridge);
+        let kind = self
+            .kind_of(class_name, method_name, descriptor)
+            .unwrap_or(NativeKind::Bridge);
         Some((cb, kind))
     }
 
@@ -4911,6 +5161,7 @@ impl std::fmt::Debug for NativeMethodRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_mock::MockNativeContext;
 
     fn dummy_native(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
         Ok(None)
@@ -4918,6 +5169,46 @@ mod tests {
 
     fn dummy_native_2(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
         Ok(Some(Value::Int(42)))
+    }
+
+    #[test]
+    fn native_handle_scope_releases_nested_roots_on_all_rust_exit_paths() {
+        fn root_then_return(ctx: &mut dyn NativeContext, object: ObjectRef) {
+            let mut scope = NativeHandleScope::new(ctx);
+            let handle = scope.root(object);
+            assert_eq!(scope.get(&handle), object);
+        }
+
+        let mut ctx = MockNativeContext::new();
+        let first = ctx.fresh_object_ref();
+        root_then_return(&mut ctx, first);
+        assert_eq!(ctx.handle_slot_count(), 0);
+        assert_eq!(ctx.handle_scope_depth(), 0);
+
+        let outer_object = ctx.fresh_object_ref();
+        let inner_object = ctx.fresh_object_ref();
+        {
+            let mut outer = NativeHandleScope::new(&mut ctx);
+            let outer_handle = outer.root(outer_object);
+            {
+                let mut inner = NativeHandleScope::new(&mut *outer);
+                let inner_handle = inner.root(inner_object);
+                assert_eq!(inner.get(&inner_handle), inner_object);
+            }
+            assert_eq!(outer.get(&outer_handle), outer_object);
+        }
+        assert_eq!(ctx.handle_slot_count(), 0);
+        assert_eq!(ctx.handle_scope_depth(), 0);
+
+        let unwind_object = ctx.fresh_object_ref();
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut scope = NativeHandleScope::new(&mut ctx);
+            let _handle = scope.root(unwind_object);
+            panic!("exercise NativeHandleScope::drop during unwind");
+        }));
+        assert!(panicked.is_err());
+        assert_eq!(ctx.handle_slot_count(), 0);
+        assert_eq!(ctx.handle_scope_depth(), 0);
     }
 
     fn legacy_native_method_hash(class: &str, method: &str, descriptor: &str) -> (u64, u64) {

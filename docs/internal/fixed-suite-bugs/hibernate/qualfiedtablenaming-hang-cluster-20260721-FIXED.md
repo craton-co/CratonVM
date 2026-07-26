@@ -87,7 +87,7 @@ present and unmodified. This is a **known, already-implicitly-accepted
 tradeoff of that fix** (forced-interpreter execution of a divide-heavy,
 132-execution parameterized class) colliding with the suite runner's
 one-size-fits-all 300s per-class timeout, which nothing has reconciled yet.
-`docs/known-issues/hibernate/README.md`'s own prior entry for this class
+`README.md`'s own prior entry for this class
 ("the 132-test class passes under both normal JIT and `--nojit`") was
 written from earlier sessions' longer-timeout / solo harnesses — it was
 never re-validated against this repo's *default* 300s harness timeout, which
@@ -155,7 +155,7 @@ live capture is possible if it recurs.
 
 ## Housekeeping
 
-`docs/known-issues/hibernate/README.md`'s existing line for
+`README.md`'s existing line for
 `hib-misc-residuals-20260716-FIXED.md` ("the 132-test class passes under
 both normal JIT and `--nojit`") remains accurate for the *correctness*
 claim (no AIOOBE) but is now cross-referenced from this doc for the

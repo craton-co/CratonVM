@@ -177,6 +177,34 @@ pub enum SkipReason {
     /// lowering is understood.
     ClassReaderReadInnerClasses,
 
+    /// Javac's `ClassReader.readAttrs` -- the shared per-member/per-class
+    /// attribute-dispatch loop (`readClassAttrs`/`readMemberAttrs` both
+    /// delegate straight into it: read an attribute count via `nextChar()`,
+    /// then loop that many times reading a name-index `nextChar()` + a
+    /// length `nextInt()` and either dispatching to a specific
+    /// `AttributeReader` or skipping `bp += attrLen`) -- is a SEVENTH
+    /// distinct JIT residual in the same repeated-in-process-javac-
+    /// compilation family as `ClassReaderReadClass`/`ClassFinderComplete`/
+    /// `ClassFinderFillIn`/`ClassReaderReadInnerClasses` above, same
+    /// "moderately complex counted loop over the shared `bp` cursor" shape.
+    /// Symptom: real javac's `bad class file... bad signature: "ourceFile"`
+    /// (a corrupted read of the `SourceFile` attribute's own name — the
+    /// leading `"S"` lost, i.e. the shared constant-pool-index/length cursor
+    /// desynchronized by a couple of bytes) surfacing while compiling
+    /// AOT-generated sources against `spring-core`/`spring-beans`/JDK
+    /// `.class` files pulled onto the classpath — found via
+    /// `ApplicationContextAotGeneratorTests$ConfigurationClassCglibProxy
+    /// .processAheadOfTimeWhenHasCglibProxyUseProxy`, which reproduces this
+    /// deterministically with default (Conservative) JIT settings despite
+    /// `readClass`/`readInnerClasses` already being interpreted. Confirmed
+    /// JIT-only (`--nojit`: pass) and isolated with `CRATONVM_JIT_DENY=
+    /// com/sun/tools/javac/jvm/ClassReader` (whole class: pass) then
+    /// narrowed with `CRATONVM_JIT_BISECT_SKIP=com/sun/tools/javac/jvm/
+    /// ClassReader.readAttrs` (this exact method alone: pass). Keep this
+    /// attribute-dispatch loop interpreted until its own JIT lowering is
+    /// understood.
+    ClassReaderReadAttrs,
+
     /// Javac's `Symbol$ClassSymbol.complete` underflows the interpreter operand
     /// stack after tiered compilation while H2 compiles a generated alias.
     /// Keep this symbol-completion method interpreted until its invokespecial
@@ -224,6 +252,11 @@ pub enum SkipReason {
     /// raw entry point (ES-PERF-20260719 testSlicesDense: 6928 deopt events
     /// for `makeInt` alone in a single test run).
     StreamMatchOpsUncommonTrap,
+    /// Javac's `Types.erasure` corrupts symbol/type completion state once
+    /// tier-compiled during repeated in-process compilation, surfacing later
+    /// as a null `Type` read in `Lower.boxIfNeeded`. Keep this hot
+    /// type-erasure method interpreted until its JIT lowering is understood.
+    TypesErasure,
 }
 
 /// T1.1.f — classification of `<init>` / `<clinit>` complexity.
@@ -576,6 +609,10 @@ fn should_skip_jit_internal(
         return Some(SkipReason::ClassReaderReadInnerClasses);
     }
 
+    if class_name == "com/sun/tools/javac/jvm/ClassReader" && method_name == "readAttrs" {
+        return Some(SkipReason::ClassReaderReadAttrs);
+    }
+
     // HIB-STOREDPROC-JIT.1 (2026-07-23): H2's `CREATE ALIAS ... AS $$` invokes
     // the real in-process javac compiler.  After this exact method tiers up,
     // `Symbol$ClassSymbol.complete()` deterministically reaches an
@@ -589,6 +626,44 @@ fn should_skip_jit_internal(
         return Some(SkipReason::ClassSymbolComplete);
 
     }
+
+    // TYPES-ERASURE.1 (2026-07-25): an EIGHTH distinct JIT residual in the
+    // same repeated-in-process-javac-compilation family as
+    // SPRING-TESTCOMPILER.1-4 / HIB-STOREDPROC-JIT.1 above, and likely the
+    // common root several of those entries were only symptoms of.
+    // Standalone, Spring-free repro (no test framework, no annotation
+    // processing): `ToolProvider.getSystemJavaCompiler().getTask(...).call()`
+    // looped in one process, each iteration compiling a fresh trivial
+    // `@Deprecated class TrivialN { public int x() { return N; } }` --
+    // deterministically starts throwing `java.lang.NullPointerException:
+    // Cannot invoke "com.sun.tools.javac.code.Type.hasTag(...)" because
+    // "type" is null` from real javac's own `Lower.boxIfNeeded` (reached via
+    // `Lower.visitReturn`) at iteration 8 and every iteration after, with
+    // none of the existing SPRING-TESTCOMPILER/HIB-STOREDPROC-JIT bans (all
+    // already interpreted) preventing it. Bisected with `CRATONVM_JIT_DENY`:
+    // the whole `com/sun/tools/javac/` package fixes it (confirming it is
+    // still this same javac-JIT family), narrowed to
+    // `com/sun/tools/javac/code/` alone (fixed), then to `Types` alone
+    // (fixed) after `Symbol` alone proved insufficient. Splitting the
+    // Types-family candidate set in half and then bisecting the remaining
+    // half individually (`memberType` alone: insufficient; `boxedClass` +
+    // `unboxedType` together: insufficient) isolated the single necessary
+    // method: `CRATONVM_JIT_BISECT_SKIP=com/sun/tools/javac/code/
+    // Types.erasure` alone is sufficient (40/40 OK, was 7/40). `erasure` is
+    // called constantly during symbol/type completion (including from the
+    // already-interpreted `ClassReader`/`ClassFinder`/
+    // `Symbol$ClassSymbol.complete` methods above), so this single
+    // miscompile plausibly explains most or all of SPRING-TESTCOMPILER.1-4's
+    // and HIB-STOREDPROC-JIT.1's symptoms too -- but that consolidation
+    // claim is NOT yet verified (would need a full regression pass with
+    // those seven bans removed and only this one in place) and is left as a
+    // follow-up; for now this is added as its own targeted,
+    // independently-verified ban. Keep `erasure` interpreted until the x64
+    // lowering bug is found.
+    if class_name == "com/sun/tools/javac/code/Types" && method_name == "erasure" {
+        return Some(SkipReason::TypesErasure);
+    }
+
 
     // SPRING-TESTCOMPILER.4 (2026-07-21): see `JavaPoetCodeBlockBuilderAdd`
     // doc comment above. Spring shades/relocates `com.palantir.javapoet` to
@@ -720,34 +795,27 @@ fn should_skip_jit_internal(
         return Some(SkipReason::RustJvmTestFixture);
     }
 
-    // PROXY-JITCALL.1 — generated `$ProxyN` dynamic-proxy classes (any
-    // package — `define_or_get_proxy_class` places a package-private
-    // interface's proxy in the interface's OWN package, so this can't be a
-    // package-prefix check) SIGSEGV/hang when JIT-compiled together with
-    // methods on the OTHER side of the `Proxy$Dispatch.invokeProxy` call —
-    // e.g. Spring's `org/springframework/core/annotation/*` meta-annotation
+    // PROXY-JITCALL.1 — REMOVED 2026-07-26. Historically, generated
+    // `$ProxyN` dynamic-proxy classes SIGSEGV'd/hung when JIT-compiled
+    // together with methods on the OTHER side of the
+    // `Proxy$Dispatch.invokeProxy` call (e.g. Spring's meta-annotation
     // introspection calling `annotationType()`/`hashCode()`/`equals()`
     // repeatedly on many distinct `$ProxyN` receiver classes under
-    // `CRATONVM_REAL_ANNOTATIONS=1`. Confirmed via bisection
-    // (`CRATONVM_JIT_BISECT_ONLY`): `jdk/proxy` alone is clean, the Spring
-    // annotation package alone is clean, but JIT-compiling BOTH sides
-    // together SIGSEGVs (rc=139, read near address 0x1/0x18 — a garbage
-    // register value used as a pointer) or hangs — a JIT→JIT call-boundary
+    // `CRATONVM_REAL_ANNOTATIONS=1`) -- a JIT-JIT call-boundary
     // register-preservation bug in the same family as
-    // `docs/internal/jit-regalloc-callee-saved-clobber-family.md`, but NOT
-    // covered by that family's `is_known_miscompile` targeted list (which is
-    // gated behind `callee_saved_gpr_local_homes_enabled()`, default OFF as
-    // of the 2026-07-04 fix — so this residual case has no existing safety
-    // net). Checked unconditionally (not gated by policy or the GPR-homes
-    // flag) because the generated proxy method bodies are a handful of
-    // bytecodes (marshal args, box, call, unbox, return) — the JIT gains
-    // essentially nothing compiling them, so banning them outright is safe.
-    // `getInterfaces`/superclass access on a NON-generated class named
-    // e.g. `$ProxyHelper` by a user is not affected — the check requires the
-    // exact `$Proxy<digits>` simple-name shape `emit_proxy_classfile` emits.
-    if is_generated_proxy_class(class_name) {
-        return Some(SkipReason::RustJvmTestFixture);
-    }
+    // `docs/internal/fixed-suite-bugs/jit-regalloc-callee-saved-clobber-family.md`,
+    // but not covered by that family's `is_known_miscompile` targeted list
+    // (gated behind `callee_saved_gpr_local_homes_enabled()`, default OFF
+    // since the 2026-07-04 fix) since this check was unconditional.
+    // Re-verified 2026-07-26 with `bench/ProxyJitCallProbe.java` (real
+    // annotation-proxy instances -- 8 distinct `$ProxyN` classes via
+    // 8 distinct annotation types, `CRATONVM_REAL_ANNOTATIONS=1`,
+    // `annotationType()`/`hashCode()`/`equals()`/`toString()` called
+    // 300k times, `CRATONVM_JIT_THRESHOLD=1` to force maximal JIT
+    // engagement on both sides of the call boundary): no crash, no hang,
+    // correct output. No longer reproduces on current dev -- fixed as a
+    // side effect of general JIT/dispatch correctness work since this ban
+    // was added. `bench/ProxyJitCallProbe.java` is the regression witness.
 
     // SPR-AOT-TESTNG-MAPS.1 (2026-07-08) — TestNG's Maps helper is a set
     // of tiny allocation factories. JIT-compiling Maps.newConcurrentMap()
@@ -1078,8 +1146,10 @@ fn should_skip_jit_internal(
         // every neighbouring RDN comparison/normalisation method remains JIT
         // eligible. Keep this small accessor interpreted under the conservative
         // policy until the JIT's array-backed SortedSet return path is
-        // root-caused. It remains explicitly liftable for diagnosis with
-        // CRATONVM_JIT_ALLOW_PACKAGES=com/unboundid/ldap/sdk/.
+        // root-caused. NOTE: since TOMCAT-JNDIREALM-JIT.2 below widened the
+        // ban to all of com/unboundid/, lifting for diagnosis needs the full
+        // CRATONVM_JIT_ALLOW_PACKAGES=com/unboundid/ prefix; the narrower
+        // com/unboundid/ldap/sdk/ entry only clears this guard, not JIT.2's.
         if class_name == "com/unboundid/ldap/sdk/RDN"
             && method_name == "getNameValuePairs"
             && !package_allowed("com/unboundid/ldap/sdk/", allow_packages)
@@ -1115,6 +1185,45 @@ fn should_skip_jit_internal(
             } else {
                 SkipReason::RustJvmTestFixture
             });
+        }
+
+        // TOMCAT-KEYEDLOCK-COMPUTE.1 (2026-07-26) -- an undiscovered JIT
+        // miscompile in `KeyedReentrantReadWriteLock$LockImpl.lambda$lock$0`
+        // (the ternary-with-allocation `BiFunction` passed to
+        // `Map.compute`: `(k, v) -> v == null ? new CountedLock() : v`).
+        // Real Tomcat repro: `TestCompiler`/`TestFormAuthenticatorA` under
+        // JIT throw `NullPointerException: Cannot read field "count"` from
+        // `KeyedReentrantReadWriteLock$LockImpl.lock` -- i.e.
+        // `locksMap.compute(key, ...)` itself returns null even though the
+        // BiFunction can never return null. Minimal 25-line standalone
+        // repro (`ComputeInitProbe.java`: a `ConcurrentHashMap<String,
+        // Counted>` where `Counted` has one `AtomicInteger` field, called
+        // via `map.compute(key, (k, v) -> v == null ? new Counted() : v)`
+        // in a loop) reproduces deterministically at iteration 0 -- no
+        // warmup needed. Confirmed JIT-only: identical repro under
+        // `--nojit` is 500000/500000 clean. Bisected with
+        // `CRATONVM_JIT_DENY`/`CRATONVM_JIT_BISECT_SKIP` (no rebuild): the
+        // caller (`main`) and the constructed class's own `<init>` are each
+        // individually NOT the culprit (forcing either alone to interpret
+        // does not fix it); forcing just the lambda body
+        // (`ComputeInitProbe.lambda$main$0`) to interpret fixes it
+        // completely. The bug is therefore in how the JIT compiles a
+        // lambda body shaped like `v == null ? new X() : v` (branch,
+        // allocate-and-construct on one arm, pass through an existing
+        // reference on the other, merge, return) -- plausibly the same
+        // callee-saved-clobber archetype as
+        // `docs/internal/fixed-suite-bugs/jit-regalloc-callee-saved-clobber-family.md`,
+        // but this exact shape (a lambda, not a named user method) was not
+        // covered by that family's fix or its targeted list. Verified fix:
+        // `TestFormAuthenticatorA` no longer hits this NPE with this lambda
+        // pinned (a second, independent JIT bug in
+        // `org/apache/catalina/webresources/` remains open for that test,
+        // tracked separately). Keep this one lambda interpreted until the
+        // ternary-with-allocation lowering bug is found generically.
+        if class_name == "org/apache/tomcat/util/concurrent/KeyedReentrantReadWriteLock$LockImpl"
+            && method_name == "lambda$lock$0"
+        {
+            return Some(SkipReason::RustJvmTestFixture);
         }
 
         // ALV5th (2026-07-10) -- ConcurrentLinkedQueue is the same
@@ -1979,8 +2088,11 @@ fn is_unconditional_hash_miscompile_cluster(class_name: &str, method_name: &str)
 // policy until the package can be safely re-bisected. The July 2026 vector and
 // DiskBBQ hang residuals are covered by this same containment: the affected
 // test classes and their Elasticsearch vector-codec bodies sit under
-// `org/elasticsearch/`, while Lucene bytecode has its own fail-closed package
-// skip below.
+// `org/elasticsearch/`. Lucene bytecode is no longer skip-listed: the
+// LUCENE-POSTINGS.1 blanket `org/apache/lucene/` ban was retired by
+// `117d2d906` ("admit Lucene after synchronized-method gate") once the
+// interpreter started gating ACC_SYNCHRONIZED methods out of JIT/OSR itself,
+// which closed the IndexWriter monitor repro that had kept the ban alive.
 fn is_elasticsearch_suite_jit_fragile_cluster(class_name: &str, _method_name: &str) -> bool {
     class_name.starts_with("org/elasticsearch/")
 }
@@ -2981,7 +3093,7 @@ fn is_known_miscompile(class_name: &str, method_name: &str) -> bool {
 /// `ExclusiveNode` and immediately `casHead`s it in — an allocate-then-CAS
 /// hazard structurally identical to the allocate-then-putfield family, but
 /// running only once per lock instance (its first-ever contended acquire),
-/// which is exactly why light-contention repros (a handful of threads,
+/// which is exactly why light-contention springboot (a handful of threads,
 /// brief hold times) never trigger it while heavy-contention ones
 /// (many threads, deep contention) reliably do — matching the observed gap
 /// between an initial 4-thread stress repro (passed) and the real
@@ -3004,7 +3116,7 @@ fn is_known_miscompile_aqs_family(class_name: &str, method_name: &str) -> bool {
         // seconds under real CPU load -- the same "AbstractQueuedLongSynchronizer.
         // acquire" family hang this list already documents lower down, just
         // one level deeper (the CAS primitive `acquire` itself calls, not
-        // `acquire`). See docs/known-issues/h2-suite-bugs/
+        // `acquire`). See docs/known-issues/h2/
         // bug-h2-testfilesystem-testconcurrent-async-hang.md.
         ("java/util/concurrent/locks/AbstractQueuedSynchronizer", "compareAndSetState")
             | ("java/util/concurrent/locks/AbstractQueuedSynchronizer", "getState")
@@ -3175,22 +3287,6 @@ fn is_antlr_prediction_context_miscompile(class_name: &str, method_name: &str) -
             "equals"
         )
     )
-}
-
-/// True for a dynamically generated `$ProxyN` class's exact simple-name
-/// shape (`emit_proxy_classfile` / `build_proxy_spec_for` in
-/// `native-builtins/src/lib.rs`), regardless of package — `$Proxy` followed
-/// by one or more ASCII digits and nothing else. Deliberately narrow (exact
-/// shape, not a substring/prefix check) so it can never match ordinary user
-/// code that happens to declare a class starting with `$Proxy` (HotSpot
-/// reserves this exact pattern for its own generated proxies too, so real
-/// code doing this is already vanishingly rare).
-fn is_generated_proxy_class(class_name: &str) -> bool {
-    let simple_name = class_name.rsplit('/').next().unwrap_or(class_name);
-    match simple_name.strip_prefix("$Proxy") {
-        Some(rest) if !rest.is_empty() => rest.bytes().all(|b| b.is_ascii_digit()),
-        _ => false,
-    }
 }
 
 fn callee_saved_gpr_local_homes_enabled() -> bool {
@@ -3542,8 +3638,10 @@ mod tests {
                 true,
                 SkipPolicy::Conservative,
             ),
-            None,
-            "the Tomcat LDAP guard must stay exact to RDN.getNameValuePairs"
+            Some(SkipReason::RustJvmTestFixture),
+            "TOMCAT-JNDIREALM-JIT.2 keeps ALL of com/unboundid/ interpreted \
+             (cross-package String-receiver corruption), not just \
+             RDN.getNameValuePairs"
         );
     }
 
@@ -3556,9 +3654,25 @@ mod tests {
                 false,
                 true,
                 SkipPolicy::Conservative,
+                &["com/unboundid/"],
+            ),
+            None,
+            "CRATONVM_JIT_ALLOW_PACKAGES=com/unboundid/ must lift the \
+             TOMCAT-JNDIREALM-JIT.2 package ban for bisection"
+        );
+        assert_eq!(
+            check_with(
+                "com/unboundid/ldap/sdk/RDN",
+                "getNameValuePairs",
+                false,
+                true,
+                SkipPolicy::Conservative,
                 &["com/unboundid/ldap/sdk/"],
             ),
-            None
+            Some(SkipReason::RustJvmTestFixture),
+            "a narrower allow entry must NOT lift the JIT.2 ban: the \
+             corruption is a cross-package compiled interaction, so partial \
+             lifts of individually-clean slices would mask the repro"
         );
         assert_eq!(
             check(
@@ -4095,8 +4209,10 @@ mod tests {
                 true,
                 SkipPolicy::Conservative,
             ),
-            Some(SkipReason::RustJvmTestFixture),
-            "Lucene vector leaves must stay interpreted by the separate Lucene package ban"
+            None,
+            "Lucene is JIT-admitted at the skip-list level since 117d2d906 \
+             retired the LUCENE-POSTINGS.1 package ban (ACC_SYNCHRONIZED \
+             methods are gated in the interpreter, not here)"
         );
     }
 
@@ -4848,6 +4964,55 @@ mod tests {
                 "JavacTool.getTask must remain excluded under every policy",
             );
         }
+    }
+
+    #[test]
+    fn types_erasure_is_unconditionally_interpreted() {
+        for policy in [SkipPolicy::Conservative, SkipPolicy::Aggressive] {
+            assert_eq!(
+                check(
+                    "com/sun/tools/javac/code/Types",
+                    "erasure",
+                    false,
+                    true,
+                    policy,
+                ),
+                Some(SkipReason::TypesErasure),
+                "Types.erasure must remain excluded under every policy",
+            );
+        }
+    }
+
+    #[test]
+    fn generated_proxy_class_is_jit_eligible_after_proxy_jitcall_1_removal() {
+        for policy in [SkipPolicy::Conservative, SkipPolicy::Aggressive] {
+            assert_eq!(
+                check("com/example/$Proxy0", "invoke", false, true, policy),
+                None,
+                "$ProxyN classes must be JIT-eligible now that PROXY-JITCALL.1 is removed",
+            );
+            assert_eq!(
+                check("com/example/$Proxy42", "hashCode", false, true, policy),
+                None,
+                "$ProxyN classes must be JIT-eligible now that PROXY-JITCALL.1 is removed",
+            );
+        }
+    }
+
+    #[test]
+    fn tomcat_keyedlock_compute_lambda_stays_skipped_under_conservative() {
+        assert_eq!(
+            check(
+                "org/apache/tomcat/util/concurrent/KeyedReentrantReadWriteLock$LockImpl",
+                "lambda$lock$0",
+                false,
+                true,
+                SkipPolicy::Conservative,
+            ),
+            Some(SkipReason::RustJvmTestFixture),
+            "KeyedReentrantReadWriteLock$LockImpl.lambda$lock$0 must stay skipped \
+             under Conservative",
+        );
     }
 
     #[test]

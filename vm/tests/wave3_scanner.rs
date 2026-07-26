@@ -46,6 +46,7 @@ fn system_init_phase1_is_registered_as_native() {
     let shared = shared();
     assert!(
         shared
+            .natives
             .native_methods
             .find("java/lang/System", "initPhase1", "()V")
             .is_some(),
