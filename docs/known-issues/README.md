@@ -148,9 +148,26 @@ given enough time). Two new open docs:
 (Mockito `MockMethodAdvice` fails to load specifically inside
 `@ForkedClassPath`'s reentrant nested-JUnit-Launcher execution — root cause
 narrowed, not fixed) and
-[`springboot/tomcatservletwebserverfactorytests-ssl-clientauth-peercert-residuals.md`](springboot/tomcatservletwebserverfactorytests-ssl-clientauth-peercert-residuals.md)
+`springboot/tomcatservletwebserverfactorytests-ssl-clientauth-peercert-residuals.md`
 (SSL client-certificate mutual-auth handshake/peer-certificate gaps, distinct
 from the already-documented CBC/DHE/TLS1.1 rustls limitations).
+
+> Closure update (2026-07-26): the SSL client-auth/peer-certificate doc above
+> is fixed -- two root causes, both confirmed and corrected: (1)
+> `s2_tls_peer_cert_chain_der` was missing the rustls-stream redirect its
+> sibling `s2_tls_read`/`write`/`close` already had, so a client session's
+> peer chain silently read as empty; (2) optional (`ClientAuth.WANT`) client
+> auth with no trust source configured hard-failed the handshake, where real
+> JSSE (confirmed via a standalone probe) lets it proceed. Verified 129/132
+> PASS on `TomcatServletWebServerFactoryTests` (all 4 of the doc's own
+> affected methods now pass; the 3 remaining failures are unrelated re-run
+> artifacts / the doc's own already-flagged `sslWithHttp11Nio2Protocol`
+> flakiness). Moved to
+> [`../internal/fixed-suite-bugs/springboot/tomcatservletwebserverfactorytests-ssl-clientauth-peercert-residuals-FIXED.md`](../internal/fixed-suite-bugs/springboot/tomcatservletwebserverfactorytests-ssl-clientauth-peercert-residuals-FIXED.md).
+> A separate, pre-existing, unrelated intermittent hang (an "STW cross-thread
+> JIT takeover" stall, reproduced on both the pre-fix and post-fix binary) was
+> found while verifying and filed as its own new doc,
+> [`springboot/tomcatservletwebserverfactorytests-stw-takeover-hang.md`](springboot/tomcatservletwebserverfactorytests-stw-takeover-hang.md).
 
 ## 2026-07-23 Tomcat 9-class HANG-classification doc — FIXED, moved to internal
 
