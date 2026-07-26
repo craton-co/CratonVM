@@ -66,6 +66,18 @@ use cratonvm_types::{
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::{HashMap, HashSet};
 
+/// Byte offset of `ObjectHeader::identity_hash_code`.
+///
+/// `types` exports a named constant for every other header field but not this
+/// one, and the inline TLAB emitter needs it to zero the hash slot explicitly
+/// (the lazy-mint contract). Derived from the struct via `offset_of!` rather
+/// than written as a literal `8`, so the planned 32→16-byte `ObjectHeader`
+/// shrink (fold `forwarding_ptr` + `identity_hash_code` into the mark word)
+/// cannot silently leave this emission pointing at the wrong dword. See
+/// `docs/internal/arch-2026-07-26/x64-flag-skew-and-contracts.md` §5.
+const IDENTITY_HASH_CODE_OFFSET: usize =
+    std::mem::offset_of!(cratonvm_types::ObjectHeader, identity_hash_code);
+
 // ---------------------------------------------------------------------------
 // Switch-instruction validation helpers (HIGH security, task #8)
 // ---------------------------------------------------------------------------
@@ -2433,7 +2445,14 @@ pub fn shadow_stack_maps_enabled() -> bool {
     // gen requires a COMPLETE, rewritable precise root map (see
     // `moving_young_enabled` and `collect_live_oop_homes`), so turning it on also
     // turns on the push/reload emission.
-    *G.get_or_init(|| std::env::var_os("CRATONVM_SHADOW_STACK").is_some() || moving_young_enabled())
+    // `CRATONVM_SHADOW_STACK` is read here, in `gc` and in `vm`, which is why
+    // it lives in the shared `cratonvm_types::flags()` config rather than a
+    // crate-private `getenv` cache: the emission side (this file) and the
+    // root-scan side (`vm::jit::conservative_roots`, `gc::gen_heap`) MUST agree,
+    // or the collector walks a shadow stack the codegen never pushed to.
+    // `parse::present` == the former `var_os(..).is_some()`, so this is
+    // behaviour-preserving.
+    *G.get_or_init(|| cratonvm_types::flags().jit.shadow_stack || moving_young_enabled())
 }
 
 /// Whether the **default moving / compacting young generation**
@@ -2451,11 +2470,21 @@ pub fn shadow_stack_maps_enabled() -> bool {
 /// it can be validated against the bt18 = 68332206 invariant before any flip.
 ///
 /// See `docs/feature-designs/default-moving-young-gen.md`.
+///
+/// **Single source of truth.** This used to `getenv` `CRATONVM_MOVING_YOUNG`
+/// into a crate-private `OnceLock`, which meant the SAME gate was parsed
+/// independently in three crates (`jit::x64`, `gc::gc_quiescence`,
+/// `vm::jit::conservative_roots`). Codegen and the collector could therefore
+/// disagree about whether the feature was on — and the two halves of this
+/// feature are only sound *together*: the JIT must publish the complete
+/// rewritable root map and the collector must run the moving cycle. It now
+/// reads the centralized [`cratonvm_types::flags`] field, which is parsed from
+/// the same variable with the same `is_some()` presence semantics, so this is
+/// behaviour-preserving today and lets the default be flipped in one place
+/// later. Do NOT re-introduce a local `getenv` here.
 #[inline]
 pub fn moving_young_enabled() -> bool {
-    use std::sync::OnceLock;
-    static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| std::env::var_os("CRATONVM_MOVING_YOUNG").is_some())
+    cratonvm_types::flags().gc.moving_young
 }
 
 fn shadow2_diag_enabled(method_label: &str) -> bool {
@@ -15194,11 +15223,15 @@ impl Compiler {
         // invariant is at the *allocator* — write the four header bytes
         // (and the four array_length bytes) explicitly. Two extra dwords
         // per `new` is negligible vs. the safety guarantee.
-        self.emit_mov_dword_mem_disp32_imm32(R11, 4, 0);
-        // offset 8: identity_hash_code = 0 (lazy-mint contract). Written
-        // explicitly, not left to refill zeroing — see the default-on note
-        // below.
-        self.emit_mov_dword_mem_disp32_imm32(R11, 8, 0);
+        // `OBJECT_KIND_OFFSET` (4) names the dword that packs
+        // kind/element_type/gc_age/gc_flags; `IDENTITY_HASH_CODE_OFFSET` (8)
+        // names the identity-hash dword. Both were bare literals until the
+        // 2026-07-26 header-offset audit — see
+        // `docs/internal/arch-2026-07-26/x64-flag-skew-and-contracts.md` §5.
+        self.emit_mov_dword_mem_disp32_imm32(R11, cratonvm_types::OBJECT_KIND_OFFSET as i32, 0);
+        // identity_hash_code = 0 (lazy-mint contract). Written explicitly, not
+        // left to refill zeroing — see the default-on note below.
+        self.emit_mov_dword_mem_disp32_imm32(R11, IDENTITY_HASH_CODE_OFFSET as i32, 0);
         // offset 12: the full 32-bit field count for Object kind.
         let shape = num_fields as u32;
         self.emit_mov_dword_mem_disp32_imm32(
@@ -15213,10 +15246,15 @@ impl Compiler {
                     "[compact-inline] new class_id={class_id_raw} body={body} total={total_size}"
                 );
             }
+            // `GC_FLAGS_OFFSET` (7) is byte 3 of the dword at
+            // `OBJECT_KIND_OFFSET` (4), hence the `<< 24`. The shift is only
+            // correct while `GC_FLAGS_OFFSET - OBJECT_KIND_OFFSET == 3`;
+            // `header_offset_contract_gc_flags_is_byte3_of_kind_dword` pins it.
             self.emit_mov_dword_mem_disp32_imm32(
                 R11,
-                4,
-                (cratonvm_types::GC_FLAG_COMPACT as i32) << 24,
+                cratonvm_types::OBJECT_KIND_OFFSET as i32,
+                (cratonvm_types::GC_FLAG_COMPACT as i32)
+                    << (8 * (cratonvm_types::GC_FLAGS_OFFSET - cratonvm_types::OBJECT_KIND_OFFSET)),
             );
         }
         // default-on hardening (bt18-inline-tlab-regression-20260724): the
@@ -40951,5 +40989,167 @@ mod tests {
             !try_compile_int_body(&code, code_len),
             "branch into the middle of an instruction must bail, not compile"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Flag-skew and header-offset contracts
+// ---------------------------------------------------------------------------
+//
+// Companion doc: `docs/internal/arch-2026-07-26/x64-flag-skew-and-contracts.md`.
+//
+// These tests defend two properties that no build error would catch:
+//
+//   1. Codegen and the collector must derive the SAME answer for a shared
+//      feature gate. Before 2026-07-26 `CRATONVM_MOVING_YOUNG` was `getenv`'d
+//      independently in three crates; a divergence there is heap corruption,
+//      not a wrong answer, because the JIT half (publish a complete rewritable
+//      root map) and the GC half (run the moving cycle) are only sound
+//      together.
+//   2. The x86-64 array/field emitters bake object-header offsets into
+//      instruction displacements. The planned 32→16-byte `ObjectHeader` shrink
+//      must touch every one of them; the inventory counts below are the
+//      tripwire that says "the doc's site list is stale".
+#[cfg(test)]
+mod flag_and_header_contracts {
+    use super::*;
+
+    /// The whole point of the 2026-07-26 de-skew: this function must be a
+    /// projection of the centralized config, not an independent parse.
+    #[test]
+    fn moving_young_enabled_is_the_centralized_flag() {
+        assert_eq!(
+            moving_young_enabled(),
+            cratonvm_types::flags().gc.moving_young,
+            "jit::x64::moving_young_enabled must project cratonvm_types::flags().gc.moving_young \
+             — an independent getenv here lets codegen and the collector disagree about whether \
+             the moving young gen is on"
+        );
+    }
+
+    /// `CRATONVM_SHADOW_STACK` is likewise read by `jit`, `gc` and `vm`; the
+    /// emission side and the root-scan side must agree or the collector walks
+    /// a shadow stack the codegen never pushed to. Moving-young implies it.
+    #[test]
+    fn shadow_stack_maps_enabled_is_central_flag_or_moving_young() {
+        assert_eq!(
+            shadow_stack_maps_enabled(),
+            cratonvm_types::flags().jit.shadow_stack || moving_young_enabled(),
+            "shadow-stack codegen must be gated on the shared flag (plus the moving-young \
+             implication), not on a crate-private getenv"
+        );
+    }
+
+    /// Source-scan regression guard. Needles are assembled at runtime so this
+    /// test's own text does not match them.
+    #[test]
+    fn no_crate_private_getenv_for_centralized_gates() {
+        let src = include_str!("x64.rs");
+        for var in ["CRATONVM_MOVING_YOUNG", "CRATONVM_SHADOW_STACK"] {
+            for read in ["::var_os(\"", "::var(\""] {
+                let needle = format!("env{read}{var}\"");
+                assert!(
+                    !src.contains(&needle),
+                    "x64.rs re-introduced a crate-private read of {var}. It is centralized in \
+                     types/src/flags.rs and is also read by gc and vm; parsing it here again \
+                     recreates the three-way gate skew this file was fixed for."
+                );
+            }
+        }
+    }
+
+    /// The `<= 127` assertion in `types/src/heap_types.rs` exists because the
+    /// emitters below encode `HEADER_SIZE` as a **signed** disp8. Restate the
+    /// signedness explicitly: the upstream assert would still pass at 128..=255
+    /// if it were ever relaxed to `u8` reasoning, and 128 encodes as -128.
+    #[test]
+    fn header_size_fits_signed_disp8_and_is_qword_aligned() {
+        assert!(
+            i8::try_from(HEADER_SIZE).is_ok(),
+            "HEADER_SIZE={HEADER_SIZE} does not fit a SIGNED disp8; the array emitters would \
+             address backwards from the object base. Switch those sites to disp32 first."
+        );
+        assert_eq!(
+            HEADER_SIZE % 8,
+            0,
+            "object bodies are addressed as qword-indexed cells; HEADER_SIZE must stay \
+             8-aligned"
+        );
+        assert!(
+            i8::try_from(ARRAY_LENGTH_OFFSET).is_ok(),
+            "the array-length loads use a disp8 too"
+        );
+    }
+
+    /// `emit_inline_tlab_new` writes `GC_FLAG_COMPACT` by storing a whole dword
+    /// at `OBJECT_KIND_OFFSET` with the flag byte shifted into place. That
+    /// shift is only correct while `gc_flags` is byte 3 of that dword.
+    #[test]
+    fn header_offset_contract_gc_flags_is_byte3_of_kind_dword() {
+        assert_eq!(
+            cratonvm_types::GC_FLAGS_OFFSET - cratonvm_types::OBJECT_KIND_OFFSET,
+            3,
+            "the inline-TLAB compact-flag store shifts GC_FLAG_COMPACT by \
+             8*(GC_FLAGS_OFFSET - OBJECT_KIND_OFFSET); if gc_flags moves out of the top byte of \
+             that dword the store lands on kind/element_type/gc_age instead"
+        );
+        assert!(
+            cratonvm_types::GC_FLAGS_OFFSET > cratonvm_types::OBJECT_KIND_OFFSET
+                && cratonvm_types::GC_FLAGS_OFFSET - cratonvm_types::OBJECT_KIND_OFFSET < 4,
+            "gc_flags must live inside the dword the emitter overwrites, or the single dword \
+             store silently drops the compact bit"
+        );
+    }
+
+    /// The zeroing stores in `emit_inline_tlab_new` must cover exactly the
+    /// header words that are not written with a real value, and every one of
+    /// them must sit inside the header.
+    #[test]
+    fn inline_tlab_header_writes_stay_inside_the_header() {
+        for (name, off, width) in [
+            ("class_id", 0usize, 4usize),
+            ("kind/elem/age/flags", cratonvm_types::OBJECT_KIND_OFFSET, 4),
+            ("identity_hash_code", IDENTITY_HASH_CODE_OFFSET, 4),
+            ("shape", cratonvm_types::NUM_SLOTS_OFFSET, 4),
+            ("forwarding_ptr", cratonvm_types::FORWARDING_PTR_OFFSET, 8),
+            ("mark_word", cratonvm_types::MARK_WORD_OFFSET, 8),
+        ] {
+            assert!(
+                off + width <= HEADER_SIZE,
+                "inline-TLAB emitter writes {name} at +{off} ({width}B), past HEADER_SIZE \
+                 ({HEADER_SIZE}) — that store would land in the object body"
+            );
+        }
+        assert_eq!(
+            IDENTITY_HASH_CODE_OFFSET,
+            std::mem::offset_of!(cratonvm_types::ObjectHeader, identity_hash_code)
+        );
+    }
+
+    /// Inventory tripwire for the 32→16-byte `ObjectHeader` shrink. If these
+    /// counts change, the site list in
+    /// `docs/internal/arch-2026-07-26/x64-flag-skew-and-contracts.md` §5 is
+    /// stale and the shrink has an unaudited emission site.
+    #[test]
+    fn header_offset_emission_site_inventory_matches_the_doc() {
+        let src = include_str!("x64.rs");
+        // Needles assembled at runtime so this test's own text is not counted.
+        let cases: [(&str, &str, usize); 4] = [
+            ("HEADER_SIZE", " as u8", 31),
+            ("HEADER_SIZE", " as i32", 11),
+            ("ARRAY_LENGTH_OFFSET", " as u8", 16),
+            ("ARRAY_LENGTH_OFFSET", " as i32", 5),
+        ];
+        for (base, suffix, expected) in cases {
+            let needle = format!("{base}{suffix}");
+            let found = src.matches(needle.as_str()).count();
+            assert_eq!(
+                found, expected,
+                "{needle} appears {found}x in x64.rs, doc records {expected}x. Update \
+                 docs/internal/arch-2026-07-26/x64-flag-skew-and-contracts.md §5 (the \
+                 header-offset site list) in the same change — it is the map the \
+                 ObjectHeader 32→16 shrink navigates by."
+            );
+        }
     }
 }
