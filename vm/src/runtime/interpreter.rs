@@ -8182,7 +8182,11 @@ fn execute_frame_from_index(
         // reads only, no push, no `&mut` reborrow of the stack in between.
         let is_jdk_class = unsafe { (*hot_fp).is_jdk_class };
         let use_fast_path = !is_jdk_class && !shared.config.skip_verification;
-        let padded_code_len = unsafe { (*hot_fp).code.len() };
+        // Explicit `&` on the place expression: calling `.len()` directly on
+        // `(*hot_fp).code` autorefs through the raw pointer, which the
+        // `dangerous_implicit_autorefs` lint denies. The borrow is confined to
+        // this statement, so it cannot alias a later `&mut Frame`.
+        let padded_code_len = unsafe { (&(*hot_fp).code).len() };
         debug_assert!(
             padded_code_len >= 2,
             "bytecode must be padded with at least 2 trailing bytes"
@@ -42668,9 +42672,12 @@ mod wave1_adoption_tests {
         unsafe {
             assert_eq!((*fp).pc, frames[frame_idx].pc);
             assert_eq!((*fp).is_jdk_class, frames[frame_idx].is_jdk_class);
-            assert_eq!((*fp).code.len(), frames[frame_idx].code.len());
+            // Explicit `&` — see the note at the `padded_code_len` read: an
+            // implicit autoref through a raw pointer is denied by
+            // `dangerous_implicit_autorefs`.
+            assert_eq!((&(*fp).code).len(), frames[frame_idx].code.len());
             assert!(std::ptr::eq(
-                (*fp).code.as_ptr(),
+                (&(*fp).code).as_ptr(),
                 frames[frame_idx].code.as_ptr()
             ));
         }
@@ -42869,10 +42876,25 @@ mod tests {
 
     #[test]
     fn tomcat_scanner_uses_only_audited_native_bridges() {
-        assert!(!force_native_over_real_jdk_bytecode(
+        // `Response.toAbsolute` IS an audited bridge, as of `6a87072ca`
+        // ("fix(tomcat): close silent hang residual cluster", 2026-07-22),
+        // which added the explicit rule above and exempted `Response` from the
+        // blanket `org/apache/*` opt-out so it could fire. This test landed at
+        // `995ff48c7` (2026-07-16) and asserted the opposite; it was not
+        // updated when the bridge was added, so it has been failing on `dev`
+        // ever since. The audit intent is preserved — the bridge is still
+        // pinned here, just with the polarity the shipping rule actually has.
+        assert!(force_native_over_real_jdk_bytecode(
             "org/apache/catalina/connector/Response",
             "toAbsolute",
             "(Ljava/lang/String;)Ljava/lang/String;",
+        ));
+        // A sibling method on the same class must NOT be bridged: the rule is
+        // one specific method, not the whole class.
+        assert!(!force_native_over_real_jdk_bytecode(
+            "org/apache/catalina/connector/Response",
+            "sendRedirect",
+            "(Ljava/lang/String;)V",
         ));
         assert!(force_native_over_real_jdk_bytecode(
             "java/io/DataInputStream",
