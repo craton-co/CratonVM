@@ -278,3 +278,20 @@ SPB.1 and ANTLR.1 are now both owned by the other session
 Testable via Tomcat's 76-case `TestJNDIRealmIntegration` matrix on this
 host's Tomcat fixture (`/data/data/apps/tomcat`). Starting with the
 narrow RDN.getNameValuePairs guard first.
+
+**Result: DONE, ban stays (re-confirmed real) — 2026-07-26 02:43 UTC.**
+Ran Tomcat's real 76-case `TestJNDIRealmIntegration` suite against this
+host's fixture (`org.junit.runner.JUnitCore`, real UnboundID in-memory
+LDAP server, no mocks): baseline (ban in place) 76/76 pass in ~35s. With
+`CRATONVM_JIT_ALLOW_PACKAGES=com/unboundid/` (lifts both the narrow
+RDN.getNameValuePairs guard and the broader JIT.2 whole-package guard at
+once, since both gate on the same prefix): reproduces the documented
+corruption exactly — `Stale pointer detected in invokevirtual receiver
+(ptr=..., all-zero header) — falling back to CP class java/lang/String`,
+followed by `ClassCastException(java.lang.Object cannot be cast to
+java.lang.String)` during LDAP DN/RDN matching, and the run eventually
+hangs (STW cross-thread JIT takeover waiting on cooperative mutators,
+timeout at 120s). Confirmed JIT-specific: identical lifted config with
+`--nojit` added is 76/76 clean in ~34s. **No action needed — both guards
+are current and correct, not stale. Do not attempt to lift without a real
+fix for the stale-pointer/zero-header receiver bug.**
