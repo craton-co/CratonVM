@@ -70,7 +70,7 @@
 //! abandoned, because as written they would have rejected *correct* programs.
 //! Two provable false denials were identified and have now been fixed here:
 //!
-//! * **1a вЂ” hidden classes could never be nestmates.** [`confirmed_nest_host`]
+//! * **1a — hidden classes could never be nestmates.** [`confirmed_nest_host`]
 //!   demanded that the claimed host list the member in its `NestMembers`.
 //!   `NestMembers` is a class-file attribute, and a hidden class is minted at
 //!   run time under a mangled name, so the confirmation was unsatisfiable by
@@ -80,8 +80,8 @@
 //!   set by the defining `Lookup`, not read from attacker bytes). Pinned by
 //!   `hidden_class_is_nestmate_of_its_lambda_host` and three controls.
 //!
-//! * **1b вЂ” [`receiver_ok_for_protected`] was stricter than the spec.** It
-//!   implemented only `T <: D` of the four JVMS В§5.4.4 / HotSpot
+//! * **1b — [`receiver_ok_for_protected`] was stricter than the spec.** It
+//!   implemented only `T <: D` of the four JVMS §5.4.4 / HotSpot
 //!   `verify_field_access` disjuncts (`T == C`, `T == D`, `D <: T`, `T <: D`),
 //!   so the ordinary javac-emitted `this.inheritedProtectedField`
 //!   (`getfield p/C.f` from `q/S`) was denied. All four are now implemented,
@@ -114,7 +114,7 @@ pub fn check_class_access(accessor: &Class, target: &Class) -> Result<(), Linkag
         return Ok(());
     }
 
-    // Package-private: same runtime package required (loader-aware, JVMS В§5.3)
+    // Package-private: same runtime package required (loader-aware, JVMS §5.3)
     if same_runtime_package(accessor, target) {
         return Ok(());
     }
@@ -136,15 +136,15 @@ pub fn check_class_access(accessor: &Class, target: &Class) -> Result<(), Linkag
 /// Check whether `accessor` can access a field in `declaring` class with given flags.
 ///
 /// Per JVM spec 5.4.4:
-/// - `PUBLIC` в†’ accessible from anywhere
-/// - `PRIVATE` в†’ accessible only from declaring class
-/// - `PROTECTED` в†’ accessible from same package OR subclasses (with the
+/// - `PUBLIC` → accessible from anywhere
+/// - `PRIVATE` → accessible only from declaring class
+/// - `PROTECTED` → accessible from same package OR subclasses (with the
 ///   additional receiver-subtype requirement below for cross-package access)
-/// - Package-private (no access modifier) в†’ accessible from same package only
+/// - Package-private (no access modifier) → accessible from same package only
 ///
 /// `receiver` is the *static type* of the object/expression through which the
 /// member is being accessed (`None` for a static field, or when the caller does
-/// not track it). It is only consulted for the JVMS В§5.4.4 cross-package
+/// not track it). It is only consulted for the JVMS §5.4.4 cross-package
 /// protected receiver-subtype check (see [`receiver_ok_for_protected`]).
 #[inline]
 pub fn check_field_access(
@@ -178,10 +178,10 @@ pub fn check_field_access(
             return Ok(());
         }
         // Cross-package protected access: the accessor C must be a subclass of
-        // the class D declaring the member (JVMS В§5.4.4).
+        // the class D declaring the member (JVMS §5.4.4).
         if accessor.is_subclass_of(declaring.id, store) {
             // ...AND the access must be *through a receiver* whose static type
-            // T satisfies one of the four JVMS В§5.4.4 disjuncts (see
+            // T satisfies one of the four JVMS §5.4.4 disjuncts (see
             // `receiver_ok_for_protected`). A protected member of a superclass
             // in another package is NOT reachable through an unrelated
             // sibling-type receiver. When the caller does not supply a receiver
@@ -257,10 +257,10 @@ pub fn check_method_access(
             return Ok(());
         }
         // Cross-package protected access: the accessor C must be a subclass of
-        // the class D declaring the member (JVMS В§5.4.4).
+        // the class D declaring the member (JVMS §5.4.4).
         if accessor.is_subclass_of(declaring.id, store) {
             // ...AND the access must be *through a receiver* whose static type
-            // T satisfies one of the four JVMS В§5.4.4 disjuncts. See
+            // T satisfies one of the four JVMS §5.4.4 disjuncts. See
             // `receiver_ok_for_protected` and `check_field_access` for the
             // rationale; `None` receiver (static invocation / untracked) skips
             // the receiver clause.
@@ -296,7 +296,7 @@ pub fn check_method_access(
     })
 }
 
-/// Enforce the JVMS В§5.4.4 *receiver-subtype* clause for cross-package
+/// Enforce the JVMS §5.4.4 *receiver-subtype* clause for cross-package
 /// `protected` access.
 ///
 /// When code in class `C` (the `accessor`) accesses a `protected` member that
@@ -304,9 +304,9 @@ pub fn check_method_access(
 /// access is only permitted if `C` is a subclass of `D` **and** the access is
 /// performed through a reference whose static type is `C` or a subclass of `C`.
 ///
-/// The classic example (JLS В§6.6.2): given `package p; public class C` and a
+/// The classic example (JLS §6.6.2): given `package p; public class C` and a
 /// subclass `package q; class S extends C` with a `protected` member `m`
-/// inherited from `C` вЂ” actually declared in `p` вЂ” code in `S` may use
+/// inherited from `C` — actually declared in `p` — code in `S` may use
 /// `this.m` or `((S) other).m`, but may NOT reach `m` through a bare `C`
 /// receiver (`someC.m`) because `C` is in a different package. This stops a
 /// subclass from using its inherited access to reach a *sibling's* protected
@@ -315,18 +315,18 @@ pub fn check_method_access(
 /// `receiver` is the static type of the expression the member is accessed
 /// through. `None` means there is no receiver subject to this clause (a static
 /// member, or a caller that does not model the receiver type); in that case the
-/// clause is vacuously satisfied вЂ” the preceding subclass check already gated
+/// clause is vacuously satisfied — the preceding subclass check already gated
 /// access. When a receiver *is* supplied, it must satisfy one of the four
 /// disjuncts below.
 ///
 /// # The four disjuncts (FALSE-DENIAL FIX, arch-2026-07-26, defect 1b)
 ///
-/// Naming follows JVMS В§5.4.4 (**not** the parameter names): `C` is the class
+/// Naming follows JVMS §5.4.4 (**not** the parameter names): `C` is the class
 /// that *declares* the member (`declaring`), `D` is the class attempting the
 /// access (`accessor`), and `T` is the class named by the symbolic reference,
 /// i.e. the static type of the receiver.
 ///
-/// JVMS В§5.4.4 requires `T` to be "either a subclass of `D`, a superclass of
+/// JVMS §5.4.4 requires `T` to be "either a subclass of `D`, a superclass of
 /// `D`, or `D` itself". HotSpot's `Reflection::verify_field_access` implements
 /// that as four disjuncts (`current_class` = `D`, `resolved_class` = `T`,
 /// `field_class` = `C`):
@@ -342,7 +342,7 @@ pub fn check_method_access(
 /// single most common shape javac emits: `this.protectedInheritedField` from a
 /// subclass in another package. Given `package p; public class C { protected
 /// int f; }` and `package q; class S extends C`, javac compiles `this.f`
-/// inside `S` to `getfield p/C.f` вЂ” so `T = p/C`, `D = q/S`, `C = p/C`.
+/// inside `S` to `getfield p/C.f` — so `T = p/C`, `D = q/S`, `C = p/C`.
 /// `T <: D` is false (`p/C` is a *super*class of `q/S`), so a spec-legal,
 /// javac-generated access was rejected. `T == C` and `D <: T` both cover it.
 ///
@@ -359,18 +359,18 @@ fn receiver_ok_for_protected(
     store: &ClassStore,
 ) -> bool {
     match receiver {
-        // No tracked receiver (static access, or untracked) в†’ clause N/A.
+        // No tracked receiver (static access, or untracked) → clause N/A.
         None => true,
         Some(t) => {
-            // T == D  вЂ” access through the accessor's own type.
+            // T == D  — access through the accessor's own type.
             t.id == accessor.id
-                // T == C  вЂ” the symbolic reference names the declaring class,
+                // T == C  — the symbolic reference names the declaring class,
                 // which is what javac emits for `this.inheritedProtected`.
                 || t.id == declaring.id
-                // D <: T  вЂ” receiver typed as some supertype of the accessor
+                // D <: T  — receiver typed as some supertype of the accessor
                 // that is still at or below the declaring class.
                 || accessor.is_subclass_of(t.id, store)
-                // T <: D  вЂ” receiver typed as the accessor or a subclass.
+                // T <: D  — receiver typed as the accessor or a subclass.
                 || t.is_subclass_of(accessor.id, store)
         }
     }
@@ -382,7 +382,7 @@ fn receiver_ok_for_protected(
 /// - The class named by the `NestHost` attribute, if present.
 /// - Otherwise, the class itself (it is its own nest host).
 ///
-/// Per JVMS В§5.4.4, nest membership must be confirmed *bidirectionally*:
+/// Per JVMS §5.4.4, nest membership must be confirmed *bidirectionally*:
 /// a self-declared `NestHost` attribute is not sufficient. The claimed host
 /// class must actually be loadable and must list the claiming class in its
 /// `NestMembers` attribute. Without this confirmation a hostile class file
@@ -413,7 +413,7 @@ pub fn are_nestmates(a: &Class, b: &Class, store: &ClassStore) -> bool {
 ///
 /// If `class` declares a `NestHost` attribute, the named host must be
 /// loadable and must list `class` in its own `NestMembers` attribute for
-/// the claim to be honored (JVMS В§5.4.4). When the claim cannot be
+/// the claim to be honored (JVMS §5.4.4). When the claim cannot be
 /// confirmed, `class` is its own nest host.
 ///
 /// # Hidden classes are exempt from the bidirectional confirmation
@@ -476,8 +476,8 @@ fn confirmed_nest_host<'a>(class: &'a Class, store: &ClassStore) -> &'a str {
 
 /// Check if two classes are in the same *runtime* package.
 ///
-/// Per JVMS В§5.3, a runtime package is identified by the tuple
-/// `(defining class loader, package name)` вЂ” NOT by the package-name
+/// Per JVMS §5.3, a runtime package is identified by the tuple
+/// `(defining class loader, package name)` — NOT by the package-name
 /// string alone. Two classes named `java/lang/Xxx` are only in the same
 /// runtime package if they were *defined by the same class loader*.
 ///
@@ -492,10 +492,10 @@ fn confirmed_nest_host<'a>(class: &'a Class, store: &ClassStore) -> &'a str {
 ///
 /// The package name itself is still the prefix of the fully-qualified
 /// internal name. For example:
-/// - `"java/lang/Object"` в†’ package `"java/lang"`
-/// - `"java/lang/String"` в†’ package `"java/lang"` (same name)
-/// - `"java/util/List"` в†’ package `"java/util"` (different name)
-/// - `"Foo"` в†’ default package `""` (no `/`)
+/// - `"java/lang/Object"` → package `"java/lang"`
+/// - `"java/lang/String"` → package `"java/lang"` (same name)
+/// - `"java/util/List"` → package `"java/util"` (different name)
+/// - `"Foo"` → default package `""` (no `/`)
 #[inline]
 pub fn same_runtime_package(a: &Class, b: &Class) -> bool {
     // Runtime package identity = (defining loader, package name).
@@ -531,9 +531,9 @@ fn package_of(class_name: &str) -> &str {
 /// This is called **in addition** to the standard JVM 5.4.4 checks above.
 /// It only fires when both classes belong to distinct *named* modules.
 ///
-/// Rules (simplified from JVMS В§5.4.4 with JPMS overlay):
-/// 1. Same module в†’ allowed.
-/// 2. Either module is the unnamed module в†’ allowed (classpath compat).
+/// Rules (simplified from JVMS §5.4.4 with JPMS overlay):
+/// 1. Same module → allowed.
+/// 2. Either module is the unnamed module → allowed (classpath compat).
 /// 3. `accessor_module` must *read* `target_module`.
 /// 4. `target_module` must *export* the target package to `accessor_module`.
 ///
@@ -544,7 +544,7 @@ pub fn check_module_access(
     target: &Class,
     registry: &ModuleRegistry,
 ) -> Result<(), LinkageError> {
-    // No modules registered в†’ classpath-only mode, skip enforcement.
+    // No modules registered → classpath-only mode, skip enforcement.
     if registry.is_empty() {
         return Ok(());
     }
@@ -552,7 +552,7 @@ pub fn check_module_access(
     let accessor_mod = accessor.module_name.as_deref().unwrap_or(UNNAMED_MODULE);
     let target_mod = target.module_name.as_deref().unwrap_or(UNNAMED_MODULE);
 
-    // Same module or unnamed module involved в†’ always allowed.
+    // Same module or unnamed module involved → always allowed.
     if accessor_mod == target_mod || accessor_mod == UNNAMED_MODULE || target_mod == UNNAMED_MODULE
     {
         return Ok(());
@@ -603,7 +603,7 @@ pub fn check_class_access_with_modules(
 /// Module-aware variant of [`check_field_access`].
 ///
 /// `receiver` is the static type of the access receiver; see
-/// [`check_field_access`] for the JVMS В§5.4.4 cross-package protected rule.
+/// [`check_field_access`] for the JVMS §5.4.4 cross-package protected rule.
 pub fn check_field_access_with_modules(
     accessor: &Class,
     declaring: &Class,
@@ -619,7 +619,7 @@ pub fn check_field_access_with_modules(
 /// Module-aware variant of [`check_method_access`].
 ///
 /// `receiver` is the static type of the access receiver; see
-/// [`check_method_access`] for the JVMS В§5.4.4 cross-package protected rule.
+/// [`check_method_access`] for the JVMS §5.4.4 cross-package protected rule.
 pub fn check_method_access_with_modules(
     accessor: &Class,
     declaring: &Class,
@@ -636,7 +636,7 @@ pub fn check_method_access_with_modules(
 /// ClassId, using a ClassManager reference (which holds both the class store
 /// and the module registry).
 ///
-/// Returns Ok(()) silently if either class is not found (defensive вЂ” the
+/// Returns Ok(()) silently if either class is not found (defensive — the
 /// missing class will be caught later by a more specific error path).
 ///
 /// AUDIT (2026-07-26): the two early `Ok(())` returns below are **fail-open**.
@@ -723,7 +723,7 @@ mod tests {
         id
     }
 
-    // --- The four JVMS В§5.4.4 protected disjuncts (defect 1b) ---
+    // --- The four JVMS §5.4.4 protected disjuncts (defect 1b) ---
 
     /// Build the cross-package `protected` fixture used by the four-disjunct
     /// tests.
@@ -750,7 +750,7 @@ mod tests {
     /// Disjunct `T == C`: the receiver's static type is the **declaring**
     /// class. This is what javac emits for `this.inheritedProtectedField` in a
     /// cross-package subclass: `getfield p/C.f` from inside `q/D`, so
-    /// `T = p/C`. FAILS BEFORE THE FIX вЂ” the old single-clause implementation
+    /// `T = p/C`. FAILS BEFORE THE FIX — the old single-clause implementation
     /// asked only `T <: D`, and `p/C` is a *super*class of `q/D`.
     #[test]
     fn protected_disjunct_t_equals_declaring_class() {
@@ -868,8 +868,8 @@ mod tests {
     }
 
     /// CONTROL: widening to four disjuncts must not neuter the clause. A
-    /// *sibling* receiver вЂ” `p/Other extends p/C`, unrelated to `q/D` in both
-    /// directions вЂ” satisfies none of the four and is still denied. This is
+    /// *sibling* receiver — `p/Other extends p/C`, unrelated to `q/D` in both
+    /// directions — satisfies none of the four and is still denied. This is
     /// the case the clause exists for: it stops a subclass from using its
     /// inherited access to reach a sibling's protected state.
     #[test]
@@ -1020,7 +1020,7 @@ mod tests {
         assert!(!same_package_name("Foo", "com/example/Bar"));
     }
 
-    // --- same_runtime_package (loader-aware, JVMS В§5.3) ---
+    // --- same_runtime_package (loader-aware, JVMS §5.3) ---
 
     /// Build a class with an explicit defining loader for the
     /// loader-aware runtime-package tests.
@@ -1259,7 +1259,7 @@ mod tests {
         let child = store.get(child_id).unwrap();
         let parent = store.get(parent_id).unwrap();
         // Cross-package protected access through a receiver of the accessor's
-        // own type (`child`) is permitted (JVMS В§5.4.4 receiver-subtype clause
+        // own type (`child`) is permitted (JVMS §5.4.4 receiver-subtype clause
         // satisfied). `None` (untracked receiver) is likewise permitted.
         assert!(check_field_access(
             child,
@@ -1415,7 +1415,7 @@ mod tests {
 
         let child = store.get(child_id).unwrap();
         let parent = store.get(parent_id).unwrap();
-        // Receiver of the accessor's own type satisfies the В§5.4.4 clause;
+        // Receiver of the accessor's own type satisfies the §5.4.4 clause;
         // `None` (untracked) is also permitted.
         assert!(check_method_access(
             child,
@@ -1430,9 +1430,9 @@ mod tests {
         );
     }
 
-    // --- JVMS В§5.4.4 cross-package protected receiver-subtype clause ---
+    // --- JVMS §5.4.4 cross-package protected receiver-subtype clause ---
 
-    /// Builds the classic В§5.4.4 / JLS В§6.6.2 shape:
+    /// Builds the classic §5.4.4 / JLS §6.6.2 shape:
     /// `p/Base` (declares the protected member) and two subclasses in a
     /// *different* package `q`: `q/Sub` (the accessor C) and `q/Sibling`
     /// (an unrelated subtype of Base that is NOT a subtype of Sub).
@@ -1469,7 +1469,7 @@ mod tests {
 
     #[test]
     fn protected_cross_pkg_receiver_self_type_ok() {
-        // Receiver static type == accessor C в†’ allowed.
+        // Receiver static type == accessor C → allowed.
         let (store, base, sub, _sibling, _grand) = build_protected_hierarchy();
         let base_c = store.get(base).unwrap();
         let sub_c = store.get(sub).unwrap();
@@ -1493,7 +1493,7 @@ mod tests {
 
     #[test]
     fn protected_cross_pkg_receiver_subtype_of_c_ok() {
-        // Receiver static type is a subclass of accessor C в†’ allowed.
+        // Receiver static type is a subclass of accessor C → allowed.
         let (store, base, sub, _sibling, grand) = build_protected_hierarchy();
         let base_c = store.get(base).unwrap();
         let sub_c = store.get(sub).unwrap();
@@ -1511,7 +1511,7 @@ mod tests {
     #[test]
     fn protected_cross_pkg_receiver_sibling_denied() {
         // Receiver static type is a sibling (subtype of D=Base, but NOT of
-        // C=Sub) в†’ DENIED per В§5.4.4 receiver-subtype clause. This is the
+        // C=Sub) → DENIED per §5.4.4 receiver-subtype clause. This is the
         // bug being fixed: previously the subclass check alone admitted it.
         let (store, base, sub, sibling, _grand) = build_protected_hierarchy();
         let base_c = store.get(base).unwrap();
@@ -1536,26 +1536,53 @@ mod tests {
     }
 
     #[test]
-    fn protected_cross_pkg_receiver_declaring_type_denied() {
-        // Receiver static type is D=Base itself (a supertype of C) в†’ DENIED:
-        // a subclass may not reach the protected member of its other-package
-        // superclass through a bare superclass-typed receiver.
+    fn protected_cross_pkg_receiver_declaring_type_permitted_by_5_4_4() {
+        // Receiver static type T is the declaring class C itself (`p/Base`),
+        // accessed from D=`q/Sub` in another package. §5.4.4 PERMITS this.
+        //
+        // It is tempting to read the protected rule as "a subclass may not
+        // reach its other-package superclass's protected member through a bare
+        // superclass-typed receiver" and deny it. That conflates two different
+        // checks:
+        //
+        //   * §5.4.4 (this function, resolution time) constrains T, the class
+        //     named in the *symbolic reference* — "T is either a subclass of D,
+        //     a superclass of D, or D itself". Reaching this branch already
+        //     established D <: C, so T == C makes T a superclass of D and the
+        //     clause is satisfied. Denying it would reject javac's ordinary
+        //     `this.inheritedProtectedField`, which compiles to `getfield C.f`.
+        //
+        //   * §4.10.1.8 (the type checker, verification time) constrains the
+        //     actual *operand-stack* type, which must be assignable to D. That
+        //     is the check that stops a superclass-typed value from reaching a
+        //     protected member, and it is strictly stronger. It is NOT
+        //     implemented here and cannot be — this function never sees the
+        //     stack. See `docs/internal/arch-2026-07-26/`.
+        //
+        // HotSpot draws the same line: `Reflection::verify_field_access` lists
+        // `field_class == resolved_class` as an explicit disjunct, while
+        // `ClassVerifier::verify_field_instructions` separately requires the
+        // stack type to be assignable to the current class.
         let (store, base, sub, _sibling, _grand) = build_protected_hierarchy();
         let base_c = store.get(base).unwrap();
         let sub_c = store.get(sub).unwrap();
-        assert!(check_field_access(
-            sub_c,
-            base_c,
-            FieldAccessFlags::PROTECTED,
-            &store,
-            Some(base_c)
-        )
-        .is_err());
+        assert!(
+            check_field_access(
+                sub_c,
+                base_c,
+                FieldAccessFlags::PROTECTED,
+                &store,
+                Some(base_c)
+            )
+            .is_ok(),
+            "T == C is a §5.4.4 disjunct (T is a superclass of D); the strict \
+             receiver rule is §4.10.1.8's and operates on the operand stack"
+        );
     }
 
     #[test]
     fn protected_cross_pkg_untracked_receiver_allowed() {
-        // No receiver tracked (None) в†’ receiver clause N/A; the subclass
+        // No receiver tracked (None) → receiver clause N/A; the subclass
         // check governs. Preserves behavior for callers that don't model the
         // receiver type and for static members.
         let (store, base, sub, _sibling, _grand) = build_protected_hierarchy();
@@ -1569,7 +1596,7 @@ mod tests {
     #[test]
     fn protected_same_pkg_ignores_receiver() {
         // Same-package protected access is granted regardless of receiver
-        // type (the В§5.4.4 receiver clause only applies cross-package).
+        // type (the §5.4.4 receiver clause only applies cross-package).
         let mut store = ClassStore::new();
         let base = make_class(
             &mut store,
@@ -1677,7 +1704,7 @@ mod tests {
     fn nestmates_both_inner_classes() {
         let mut store = ClassStore::new();
         // The nest host must exist and must list both members for the
-        // bidirectional confirmation (JVMS В§5.4.4) to succeed.
+        // bidirectional confirmation (JVMS §5.4.4) to succeed.
         let _outer_id = make_nest_class(
             &mut store,
             "com/foo/Outer",
@@ -1774,7 +1801,7 @@ mod tests {
         let b_id = make_nest_class(&mut store, "com/foo/Outer$B", Some("com/foo/Outer"), &[]);
         let a = store.get(a_id).unwrap();
         let b = store.get(b_id).unwrap();
-        // Host unresolvable в†’ claim unconfirmed в†’ not nestmates.
+        // Host unresolvable → claim unconfirmed → not nestmates.
         assert!(!are_nestmates(a, b, &store));
     }
 
@@ -1797,14 +1824,14 @@ mod tests {
     /// `invokestatic com/foo/Host.lambda$run$0`, which is `private static`.
     /// Because the host's `NestMembers` is a compile-time attribute it can
     /// never list the runtime-generated hidden class, so the bidirectional
-    /// confirmation was unsatisfiable and this access вЂ” present in essentially
-    /// every modern Java program вЂ” would have thrown `IllegalAccessError` the
+    /// confirmation was unsatisfiable and this access — present in essentially
+    /// every modern Java program — would have thrown `IllegalAccessError` the
     /// moment `check_method_access` was wired into the interpreter.
     #[test]
     fn hidden_class_is_nestmate_of_its_lambda_host() {
         let mut store = ClassStore::new();
         // A top-level class with a lambda has NO NestMembers attribute at all
-        // (there are no compile-time nest members to list) вЂ” which is exactly
+        // (there are no compile-time nest members to list) — which is exactly
         // why the confirmation could never succeed.
         let host_id = make_nest_class(&mut store, "com/foo/Host", None, &[]);
         let hidden_id = make_hidden_nest_class(&mut store, "com/foo/Host/0x2a", "com/foo/Host");
@@ -1869,7 +1896,7 @@ mod tests {
     /// CONTROL: the exemption is keyed on `Class::hidden`, nothing else. An
     /// ordinary class file that claims `NestHost com/foo/Host` while the host
     /// does not list it is still an unconfirmed (spoofed) claim and is still
-    /// denied вЂ” the identical shape to the test above minus the hidden flag.
+    /// denied — the identical shape to the test above minus the hidden flag.
     #[test]
     fn non_hidden_class_with_same_shape_is_still_denied() {
         let mut store = ClassStore::new();
