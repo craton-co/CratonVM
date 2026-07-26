@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run the three bug-19 primitive repros under CratonVM across the doc's config
+# Run the three bug-19 primitive springboot under CratonVM across the doc's config
 # matrix. Each run has an external 30s timeout; rc=124 = hang.
 set -u
 VM="/c/craton/CratonVM/target/release/cratonvm.exe"

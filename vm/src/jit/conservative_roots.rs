@@ -548,6 +548,7 @@ pub(crate) fn push_entry_full(entry: JitFrameChainEntry) -> usize {
         n
     });
     GLOBAL_JIT_DEPTH.fetch_add(1, Ordering::Release);
+    cratonvm_jit::jit_execution_enter();
     // Mirror into the GC-side quiescence flag so the GC can defer
     // compaction whenever any thread is inside a JIT call. NEW-12's
     // precise root walk removes false positives from the root set,
@@ -589,6 +590,7 @@ pub fn pop_jit_entry() -> Option<usize> {
     if let Some(entry) = popped {
         GLOBAL_JIT_DEPTH.fetch_sub(1, Ordering::Release);
         cratonvm_gc::gc_quiescence::leave();
+        cratonvm_jit::jit_execution_leave();
         Some(entry.entry_sp)
     } else {
         None
@@ -640,6 +642,7 @@ pub fn prune_returned_jit_entries(scanner_sp: usize) -> usize {
     for _ in 0..pruned {
         GLOBAL_JIT_DEPTH.fetch_sub(1, Ordering::Release);
         cratonvm_gc::gc_quiescence::leave();
+        cratonvm_jit::jit_execution_leave();
     }
     if pruned > 0 {
         tracing::debug!(
@@ -665,6 +668,7 @@ pub fn prune_returned_jit_entries(scanner_sp: usize) -> usize {
 pub struct JitEntryGuard {
     /// Depth at the moment of construction; used as a sanity check on drop.
     depth_at_push: usize,
+    active_class_id: Option<u32>,
 }
 
 impl JitEntryGuard {
@@ -680,7 +684,10 @@ impl JitEntryGuard {
     pub fn enter() -> Self {
         let sp = current_stack_pointer();
         let depth_at_push = push_jit_entry_at(sp);
-        Self { depth_at_push }
+        Self {
+            depth_at_push,
+            active_class_id: None,
+        }
     }
 
     /// NEW-12: push a JIT entry that carries precise-frame metadata.
@@ -715,7 +722,10 @@ impl JitEntryGuard {
             }),
         };
         let depth_at_push = push_entry_full(entry);
-        Self { depth_at_push }
+        Self {
+            depth_at_push,
+            active_class_id: cratonvm_types::jit_activation::enter(cm.entry_ptr() as usize),
+        }
     }
 }
 
@@ -738,6 +748,9 @@ impl Drop for JitEntryGuard {
             "JitEntryGuard::drop: chain underflow (was depth {})",
             self.depth_at_push
         );
+        if let Some(class_id) = self.active_class_id.take() {
+            cratonvm_types::jit_activation::exit(class_id);
+        }
     }
 }
 

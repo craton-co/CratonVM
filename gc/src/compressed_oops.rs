@@ -18,19 +18,23 @@
 //!
 //! # Wiring status
 //!
-//! This module is **implemented but not yet wired into the live heap**. The
-//! encode/decode/`encode_klass`/`decode_klass` surface is complete, tested, and
-//! correct, but the VM currently stores all object/class references as full
-//! 64-bit pointers — nothing in the running heap calls these encoders yet. The
-//! code is therefore *unwired*, not dead or broken: it is a self-contained,
-//! ready-to-wire feature.
+//! This module is wired into the live heap behind the **opt-in**
+//! `-XX:+UseCompressedOops` / `CRATONVM_COMPRESSED_OOPS=1` gate, which is
+//! **off by default**. See [`enable_for_live_heap`] for the geometry the VM
+//! fixes at init, and `cratonvm_types::narrow_oop` for the mechanism the hot
+//! paths use (that module owns the base/shift pair because the compact field
+//! accessors live below this crate in the dependency graph).
 //!
-//! Wiring compressed oops into the live heap is a sizeable feature (narrow-oop
-//! field layout, JIT load/store barriers, GC root re-encoding, klass-pointer
-//! compression in object headers) and is tracked as a separate follow-up. Until
-//! that lands, keep the encodability guard in [`CompressedOops::encode`] correct
-//! so that callers wired in later cannot silently truncate a non-encodable
-//! address into a wrong narrow oop.
+//! What is narrowed when the gate is on: **reference instance fields** and
+//! **reference array elements**, from 8 bytes to 4. The class pointer in the
+//! object header is deliberately NOT narrowed — `ObjectHeader::class_id` is
+//! already a `u32`, so `encode_klass`/`decode_klass` remain unwired and would
+//! buy nothing here.
+//!
+//! Known gap: the JIT's inline compact-field fast paths are *disabled* while
+//! compressed oops are active (they bake an 8-byte reference load/store);
+//! `getfield`/`putfield` fall back to the always-correct helpers. That costs
+//! throughput and is the main reason the gate stays off by default.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -741,5 +745,122 @@ mod tests {
         let nk = NarrowKlass::from_raw(0xBEEF);
         assert_eq!(nk.raw(), 0xBEEF);
         assert!(!nk.is_null());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Live-heap wiring
+// ---------------------------------------------------------------------------
+
+use std::sync::atomic::Ordering as AtomicOrdering;
+use std::sync::OnceLock;
+
+/// Virtual-address headroom reserved **below** the lowest live heap region when
+/// the narrow-oop base is chosen.
+///
+/// The heap's backing stores are ordinary large allocations (`Vec<u8>`), so
+/// their addresses come from the system allocator's `mmap` region rather than
+/// from one reservation the VM controls. Linux hands successive large mappings
+/// out *downwards*, so a young-gen arena that is grown after init typically
+/// lands BELOW everything that existed at init. Anchoring the base a long way
+/// under the initial low-water mark keeps those later mappings encodable
+/// instead of turning heap growth into a hard failure.
+///
+/// 8 GiB of the 32 GiB shift-3 window is spent on this; the remaining 24 GiB is
+/// far more than any heap this VM is used with.
+pub const NARROW_OOP_HEADROOM: u64 = 8 * 1024 * 1024 * 1024;
+
+static ACTIVE: OnceLock<CompressedOops> = OnceLock::new();
+
+/// The configuration fixed at VM init, or `None` when compressed oops are off.
+pub fn active() -> Option<&'static CompressedOops> {
+    ACTIVE.get()
+}
+
+/// Fix the compressed-oop geometry from the live heap's published regions and
+/// switch narrow oops on process-wide.
+///
+/// **Mode: `HeapBased`, shift 3.** The base is
+/// `lowest_region_base - NARROW_OOP_HEADROOM`, page-aligned down; a narrow oop
+/// is `(addr - base) >> 3` and encoding `0` is reserved for null (the base sits
+/// far below any object, so no live object can encode to zero). Shift 3 is
+/// sound because every object starts on the 8-byte object grid, and it buys a
+/// 32 GiB window — a shift of 0 would cap the encodable range at 4 GiB measured
+/// from a base 8 GiB below the heap, i.e. nothing would be encodable at all.
+///
+/// Must be called **exactly once**, at VM init: after the heap's backing stores
+/// exist (so their addresses are known) and before the first object is
+/// allocated or the first class layout is registered (so no object is ever read
+/// back under a different width than it was written).
+///
+/// Returns the `(base, shift)` it fixed, or an error describing why the heap
+/// geometry is unusable — in which case narrow oops stay OFF and the VM runs
+/// with full 64-bit references exactly as before.
+pub fn enable_for_live_heap() -> Result<(u64, u8), String> {
+    let mut lo = u64::MAX;
+    let mut hi = 0u64;
+    for i in 0..3 {
+        let base =
+            crate::gen_heap::JIT_REGION_BOUNDS.words[i * 2].load(AtomicOrdering::Acquire) as u64;
+        let end = crate::gen_heap::JIT_REGION_BOUNDS.words[i * 2 + 1].load(AtomicOrdering::Acquire)
+            as u64;
+        if base == 0 || end <= base {
+            continue;
+        }
+        if base % 8 != 0 {
+            return Err(format!(
+                "heap region {i} base {base:#x} is not 8-byte aligned; shift-3 \
+                 narrow oops would be misaligned"
+            ));
+        }
+        lo = lo.min(base);
+        hi = hi.max(end);
+    }
+    if lo == u64::MAX {
+        return Err("no live heap regions published (non-generational backend?)".to_string());
+    }
+    if lo <= NARROW_OOP_HEADROOM {
+        return Err(format!(
+            "lowest heap region {lo:#x} sits below the {NARROW_OOP_HEADROOM:#x} base headroom"
+        ));
+    }
+    let base = (lo - NARROW_OOP_HEADROOM) & !0xfff;
+    let shift: u8 = 3;
+    let limit = base + ((u32::MAX as u64) << shift);
+    if hi >= limit {
+        return Err(format!(
+            "heap spans {lo:#x}..{hi:#x}, which does not fit the narrow-oop window \
+             {base:#x}..{limit:#x}"
+        ));
+    }
+    if !cratonvm_types::narrow_oop::enable(base, shift as usize) {
+        return Err("cratonvm_types::narrow_oop::enable rejected the geometry".to_string());
+    }
+    let _ = ACTIVE.set(CompressedOops::new(
+        base,
+        CompressedOops::MAX_HEAP_FOR_COMPRESSED,
+    ));
+    Ok((base, shift))
+}
+
+/// Panic if `[base, end)` has drifted outside the encodable window.
+///
+/// Called whenever the heap republishes its region bounds (young-gen growth
+/// reallocates the arena, which can move it anywhere the allocator likes). A
+/// region outside the window means references into it cannot be encoded, which
+/// would be silent heap corruption — fail loudly at the moment it happens
+/// instead.
+#[inline]
+pub fn assert_region_encodable(base: usize, end: usize) {
+    if !cratonvm_types::narrow_oop::narrow_oops_enabled() || base == 0 || end <= base {
+        return;
+    }
+    let lo = cratonvm_types::narrow_oop::narrow_base();
+    let hi = cratonvm_types::narrow_oop::narrow_limit();
+    if (base as u64) <= lo || (end as u64) > hi {
+        panic!(
+            "compressed oops: heap region {base:#x}..{end:#x} moved outside the \
+             narrow-oop window {lo:#x}..{hi:#x} — references into it cannot be encoded"
+        );
     }
 }

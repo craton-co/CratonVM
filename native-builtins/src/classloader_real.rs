@@ -62,7 +62,7 @@ fn register_url_array(ctx: &mut dyn NativeContext, this: ObjectRef, urls: Value)
     // callers like Tomcat's `StandardJarScanner`. Runs before classpath
     // registration so it happens even when no path is extractable.
     crate::classloader::record_ucl_urls(ctx, this, urls);
-    let dbg = std::env::var_os("CRATONVM_DBG_UCLREG").is_some();
+    let dbg = crate::nbflags().dbg_uclreg;
     let arr = match urls {
         Value::Object(Some(a)) => a,
         _ => {
@@ -253,7 +253,7 @@ fn init_urlclassloader_fields(ctx: &mut dyn NativeContext, this: ObjectRef) {
     // constructor appears to have initialized it. Tomcat's
     // WebappLoader.buildClassPath then immediately dereferences that field.
     let this_pin = ctx.pin_native_root(this);
-    let diag = std::env::var_os("CRATONVM_DBG_URLCL").is_some();
+    let diag = crate::nbflags().dbg_urlcl;
     // `closeables` — WeakHashMap. `getResourceAsStream` synchronizes on it.
     // Only populate when currently null so a real `<init>` that already ran
     // (e.g. the name-carrying constructor whose bytecode we don't override)
@@ -1021,8 +1021,8 @@ fn cl_real_load_class_base(
 ) -> cratonvm_types::error::MethodCallResult {
     let class_name = ctx.read_string(class_name_obj).unwrap_or_default();
     let internal = class_name.replace('.', "/");
-    let __obsreg_dbg = std::env::var_os("CRATONVM_DBG_OBSREG").is_some()
-        && internal.contains("ObservationRegistry");
+    let __obsreg_dbg =
+        crate::vmflags().loader.dbg_obsreg && internal.contains("ObservationRegistry");
     if __obsreg_dbg {
         let this_cls = ctx.class_name_of_id(ctx.class_id_of_object(this));
         let parent_field = ctx.get_field_by_name(this, "parent");
@@ -1151,10 +1151,12 @@ fn cl_real_load_class_base(
             .is_some_and(|name| name == "jdk/internal/loader/ClassLoaders$PlatformClassLoader")
     });
     let overrides_find_class = crate::classloader::receiver_overrides_find_class(ctx, this);
+    let bootstrap_appended = cratonvm_classloading::is_bootstrap_appended_class(&internal);
     let defer_to_find_class = overrides_find_class
         && (parent_is_null || parent_is_platform)
         && crate::classloader::cl_bootstrap_scoped()
-        && !crate::classloader::is_bootstrap_class_name(&internal);
+        && !crate::classloader::is_bootstrap_class_name(&internal)
+        && !bootstrap_appended;
     // JVMS 5.3-faithful scoping of the flat-store fallback (real-JDK-mode
     // counterpart of the same fix in classloader.rs's synthetic-mode base
     // delegation — this file has its OWN parallel loadClass implementation,
@@ -1171,7 +1173,7 @@ fn cl_real_load_class_base(
     // only override-less chains change.
     let scoped_user_chain = crate::classloader::cl_bootstrap_scoped()
         && !crate::classloader::is_bootstrap_class_name(&internal)
-        && !cratonvm_classloading::is_bootstrap_appended_class(&internal)
+        && !bootstrap_appended
         && !crate::classloader::builtin_loader_reachable(ctx, this);
 
     // A URLClassLoader parented only by bootstrap/platform is intentionally
@@ -1182,7 +1184,7 @@ fn cl_real_load_class_base(
     // recorded URLs, then make the miss authoritative.
     if crate::classloader::url_classloader_isolated_from_app(ctx, this)
         && !crate::classloader::is_bootstrap_class_name(&internal)
-        && !cratonvm_classloading::is_bootstrap_appended_class(&internal)
+        && !bootstrap_appended
     {
         if let Some(result) = crate::classloader::ucl_try_define_local_class(ctx, this, &internal) {
             return result;
@@ -1276,8 +1278,10 @@ fn cl_real_load_class_base(
     // URLClassLoader searches its recorded URLs after parent delegation. The
     // helper is a no-op for loaders without recorded URLs, and subclasses do
     // not always expose their inherited URLClassLoader identity here.
-    if let Some(result) = crate::classloader::ucl_try_define_local_class(ctx, this, &internal) {
-        return result;
+    if !bootstrap_appended {
+        if let Some(result) = crate::classloader::ucl_try_define_local_class(ctx, this, &internal) {
+            return result;
+        }
     }
 
     // 2. Custom-classloader extension point: if the receiver overrides

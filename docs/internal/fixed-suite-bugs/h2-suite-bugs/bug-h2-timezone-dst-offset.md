@@ -4,7 +4,7 @@
 **FIXED** (2026-07-22) — see
 `bug-h2-timezone-zonerules-offset-miscalculation-FIXED.md` in this same
 directory for the full root-cause/fix writeup (this doc was rediscovered
-independently as `docs/known-issues/h2-suite-bugs/bug-h2-timezone-zonerules-offset-miscalculation.md`
+independently as `../../../known-issues/h2/bug-h2-timezone-zonerules-offset-miscalculation.md`
 before either doc's relationship to the other was noticed; both cover the
 exact same bug — this doc's three symptoms below, `TestDateStorage`'s
 8-hour DST-gap shift and `TestValue`'s 1-hour delta included, all verified

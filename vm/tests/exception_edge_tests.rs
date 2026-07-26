@@ -38,9 +38,10 @@ fn printed_ints(vm: &Vm) -> Vec<i32> {
 fn describe_result(vm: &Vm, result: &MethodCallResult) -> String {
     match result {
         Err(MethodCallFailed::ExceptionThrown(exc)) => {
-            let class_id = vm.shared.heap.class_id_of(*exc);
+            let class_id = vm.shared.mem.heap.class_id_of(*exc);
             let class_name = vm
                 .shared
+                .classes
                 .class_manager
                 .read()
                 .get_class(class_id)
@@ -331,6 +332,7 @@ fn test_refs_equal_same_object() {
     let vm = test_vm();
     let obj = vm
         .shared
+        .mem
         .heap
         .alloc_object(cratonvm_vm::classloading::ClassId::new(0), 0);
     let a = Value::Object(Some(obj));
@@ -344,10 +346,12 @@ fn test_refs_equal_different_objects() {
     let vm = test_vm();
     let obj1 = vm
         .shared
+        .mem
         .heap
         .alloc_object(cratonvm_vm::classloading::ClassId::new(0), 0);
     let obj2 = vm
         .shared
+        .mem
         .heap
         .alloc_object(cratonvm_vm::classloading::ClassId::new(0), 0);
     let a = Value::Object(Some(obj1));
@@ -372,6 +376,7 @@ fn test_refs_equal_null_vs_nonnull() {
     let vm = test_vm();
     let obj = vm
         .shared
+        .mem
         .heap
         .alloc_object(cratonvm_vm::classloading::ClassId::new(0), 0);
     let a = Value::Object(None);

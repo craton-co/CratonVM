@@ -10,7 +10,7 @@ performance issue — see
 [`testmonotonicity-quantile-cdf-dispatch-performance.md`](../../known-issues/elasticsearch-suite/testmonotonicity-quantile-cdf-dispatch-performance.md).
 
 Found while retiring
-[`ES-CRASH-20260709-libs-tdigest-org-elasticsearch-tdigest-sortingdigesttests-0249530511-FIXED.md`](../ES-CRASH-20260709-libs-tdigest-org-elasticsearch-tdigest-sortingdigesttests-0249530511-FIXED.md)
+[`ES-CRASH-20260709-libs-tdigest-org-elasticsearch-tdigest-sortingdigesttests-0249530511-FIXED.md`](ES-CRASH-20260709-libs-tdigest-org-elasticsearch-tdigest-sortingdigesttests-0249530511-FIXED.md)
 — that doc's `System$1.findNative` crash is fixed and confirmed gone; this
 doc tracked two separate, newly-exposed bugs the crash was previously
 masking (the process never got far enough to hit them before). Both are now

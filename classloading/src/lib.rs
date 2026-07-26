@@ -16,6 +16,17 @@
 //! - [`bytecode_verifier`] — bytecode type-checking verification (Pass 3)
 //! - [`vtype`] — verification type lattice for Pass 3
 
+/// The class-loading slice of the process-wide typed configuration.
+///
+/// Every `CRATONVM_*` flag this crate reads is a field on
+/// [`cratonvm_types::LoaderFlags`], parsed once at first use. See
+/// `docs/internal/flag-census.md` for the inventory and
+/// `cratonvm_types::flags` for the latching rules.
+#[inline]
+pub(crate) fn loader_flags() -> &'static cratonvm_types::LoaderFlags {
+    &cratonvm_types::flags().loader
+}
+
 pub mod access_control;
 pub mod annotations;
 pub mod builtin_loaders;
@@ -53,6 +64,12 @@ pub use class_manager::{
     is_builtin_classloader_name,
     jdk_superclass_lookup,
     jit_supersede_epoch,
+    // Loader-identity consolidation: the single-source-of-truth
+    // `CRATONVM_LOADER_AWARE_RESOLUTION` gate. `vm::runtime::env_cache` and
+    // `native-builtins::classloader` both delegate to this instead of
+    // keeping their own `OnceLock`-cached env-var copy — see
+    // `docs/internal/loader-identity.md`.
+    loader_aware_resolution,
     register_builtin_classloaders,
     static_common_superclass_lookup,
     ClassFileLoadHook,
@@ -62,6 +79,7 @@ pub use class_manager::{
     JvmtiClassHook,
     RedefineOptions,
     ResolutionInvalidateHook,
+    UnloadedClass,
     VtableInstallHook,
     VtableMethodSnapshot,
     VtableOverrideHook,

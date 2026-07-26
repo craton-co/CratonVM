@@ -62,10 +62,10 @@ fn alloc_synthetic_throwable(
     // ClassId.  We only need the object to have ≥1 field so `get_field(this, 0)`
     // returns sensibly.  ClassId::new(0) is the conventional sentinel for
     // "synthetic, not yet linked to a real class id".
-    let obj = shared.heap.alloc_object(ClassId::new(0), 2);
+    let obj = shared.mem.heap.alloc_object(ClassId::new(0), 2);
     if let Some(m) = message {
         let s = create_java_string(shared, m);
-        shared.heap.set_field(obj, 0, Value::Object(Some(s)));
+        shared.mem.heap.set_field(obj, 0, Value::Object(Some(s)));
     }
     obj
 }
@@ -94,7 +94,7 @@ fn throwable_get_message_roundtrips() {
     let Some(Value::Object(Some(s))) = val else {
         panic!("expected non-null String return, got {val:?}");
     };
-    let read_back = cratonvm_vm::vm::read_java_string(&shared.heap, s)
+    let read_back = cratonvm_vm::vm::read_java_string(&shared.mem.heap, s)
         .expect("getMessage return must be a readable String");
     assert_eq!(read_back, "boom");
 }
@@ -130,7 +130,7 @@ fn no_class_def_found_error_get_message_registered() {
     let Some(Value::Object(Some(s))) = val else {
         panic!("expected non-null String return, got {val:?}");
     };
-    let read_back = cratonvm_vm::vm::read_java_string(&shared.heap, s)
+    let read_back = cratonvm_vm::vm::read_java_string(&shared.mem.heap, s)
         .expect("getMessage return must be a readable String");
     assert_eq!(read_back, "missing module: cratonvm.fixture");
 }
@@ -150,8 +150,8 @@ fn print_stack_trace_to_stream_does_not_npe() {
     // Allocate a synthetic PrintStream-shaped object (1 field for fd tag).
     // The native ignores the stream arg and writes to record_printed_line,
     // so the fd tag value is irrelevant for this test.
-    let ps = shared.heap.alloc_object(ClassId::new(0), 1);
-    shared.heap.set_field(ps, 0, Value::Int(2)); // fd=2 (stderr)
+    let ps = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+    shared.mem.heap.set_field(ps, 0, Value::Int(2)); // fd=2 (stderr)
 
     let registry = build_registry();
     let cb = registry

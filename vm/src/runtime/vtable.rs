@@ -717,6 +717,14 @@ impl VtableManager {
             }
         }
     }
+
+    /// Release the dispatch tables owned by an unloaded class after first
+    /// invalidating inherited copies of entries it declared.
+    pub fn unload_class(&mut self, class_id: u64) {
+        self.invalidate_class(class_id);
+        self.tables.remove(&class_id);
+        self.itables.remove(&class_id);
+    }
 }
 
 impl Default for VtableManager {
@@ -820,6 +828,9 @@ pub fn vtable_install_adapter(
                             is_static: snap.is_static,
                             force_native_cache: std::sync::OnceLock::new(),
                             native_callback_cache: std::sync::OnceLock::new(),
+                            invoc_key: std::sync::OnceLock::new(),
+                            jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
+                            quickened: std::sync::OnceLock::new(),
                         });
                         (Some(cached), false)
                     }
@@ -1529,6 +1540,9 @@ mod tests {
             is_static: false,
             force_native_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
+            invoc_key: std::sync::OnceLock::new(),
+            jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
+            quickened: std::sync::OnceLock::new(),
         })
     }
 

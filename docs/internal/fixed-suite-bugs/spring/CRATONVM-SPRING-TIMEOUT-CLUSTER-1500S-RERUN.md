@@ -438,7 +438,7 @@ need anywhere near a stack-overflowing depth. The real signature: **of the
 the 5 that call `spy(new DefaultListableBeanFactory())` + `inOrder(...)`
 verification.** This is a Mockito `spy()` bug, confirmed to reproduce with
 **zero Spring context involved at all** — see
-[`docs/internal/repros/mockito-spy-hierarchy-recursion/`](../internal/repros/mockito-spy-hierarchy-recursion/)
+[`../repros/mockito-spy-hierarchy-recursion/`](../internal/repros/mockito-spy-hierarchy-recursion/)
 for the full repro kit and decompiled root-cause chain (`javap -p -c`
 against the real mockito-core 5.23.0 / byte-buddy 1.18.3 jars, not guessed
 from memory). Minimal repro (`SpyDLBFProbe.java` in that directory): create

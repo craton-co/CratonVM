@@ -454,7 +454,7 @@ fn impl_slot(ctx: &dyn NativeContext, impl_obj: ObjectRef) -> Option<usize> {
 }
 
 fn atomic_updater_diag_enabled() -> bool {
-    std::env::var_os("CRATONVM_DBG_ATOMIC_UPDATER").is_some()
+    crate::nbflags().dbg_atomic_updater
 }
 
 fn object_class_name(ctx: &dyn NativeContext, obj: ObjectRef) -> String {

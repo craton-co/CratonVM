@@ -122,7 +122,7 @@ f6aa11c9..007e620a with the probe is the mechanical path.
 - `reference_randctx_weakhashmap_jit_suspect` — RandomizedContext
   `WeakHashMap<Thread,...>` entry loss, "JIT-only, --nojit ok": same shape
   (weak-keyed table entry loss under JIT-active GC mode).
-- archived [`elasticsearch-engine-merge-policy-hangs.md`](../internal/fixed-suite-bugs/elasticsearch-engine-merge-policy-hangs.md)'s 2026-07-05 note — "GC:
+- archived [`elasticsearch-suite/elasticsearch-engine-merge-policy-hangs.md`](../internal/fixed-suite-bugs/elasticsearch-engine-merge-policy-hangs.md)'s 2026-07-05 note — "GC:
   inconsistent header - kind=Object but array_length=512; inline-alloc forgot
   kind=Array" + `mark_young: rejecting object ... implausible extent`.
 - The blocked-thread / young-sweep all-zero-header family

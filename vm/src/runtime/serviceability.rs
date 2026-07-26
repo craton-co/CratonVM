@@ -6,6 +6,7 @@
 //! Provides attach API, diagnostic command processing, thread dump generation,
 //! heap analysis, and HPROF stub writing for JVM serviceability tooling.
 
+use cratonvm_types::narrow_oop::{read_ref_slot_unaligned, ref_element_size};
 use std::fmt;
 use std::sync::Arc;
 use std::time::Instant;
@@ -1384,7 +1385,8 @@ impl HprofWriter {
     ) {
         use cratonvm_gc::heap::HEADER_SIZE;
         use cratonvm_gc::heap::SLOT_SIZE;
-        use cratonvm_gc::{class_layout, is_compact_object, ObjectHeader};
+        use cratonvm_gc::{is_compact_object, ObjectHeader};
+        use cratonvm_types::class_layout_for_fields;
         use cratonvm_types::FIELD_CELL_PAYLOAD64_OFFSET;
 
         buf.push(Self::GC_INSTANCE_DUMP);
@@ -1422,12 +1424,12 @@ impl HprofWriter {
         // Internal layout:
         // - Legacy object: fields are at HEADER_SIZE + field_index * SLOT_SIZE, each
         //   slot is 16 bytes containing a Value enum.
-        // - Compact object: reference fields are 8-byte pointers; primitive fields are
-        //   still 16-byte Value cells at compact-packed offsets from the class layout.
+        // - Compact object: fields use their natural widths at offsets from the
+        //   immutable layout version selected by this object's field count.
         let mut field_index: usize = 0;
         let header = unsafe { &*(obj.data_ptr as *const ObjectHeader) };
         let compact_layout = if is_compact_object(header) {
-            class_layout(header.class_id.as_u32())
+            class_layout_for_fields(header.class_id.as_u32(), header.num_slots())
         } else {
             None
         };
@@ -1543,11 +1545,11 @@ impl HprofWriter {
 
         // Read each element as an 8-byte reference
         for i in 0..obj.array_length as usize {
-            let elem_offset = HEADER_SIZE + i * REF_ELEMENT_SIZE;
-            let val = if elem_offset + 8 <= obj.total_size {
+            let elem_offset = HEADER_SIZE + i * ref_element_size();
+            let val = if elem_offset + ref_element_size() <= obj.total_size {
                 unsafe {
                     let ptr = obj.data_ptr.add(elem_offset);
-                    std::ptr::read_unaligned(ptr as *const u64)
+                    read_ref_slot_unaligned(ptr)
                 }
             } else {
                 0u64
@@ -3229,7 +3231,7 @@ mod tests {
         };
         // Simulate an Object[2] array
         let array_length: u32 = 2;
-        let data_size = array_length as usize * REF_ELEMENT_SIZE;
+        let data_size = array_length as usize * ref_element_size();
         let total_size = HEADER_SIZE + ((data_size + 7) & !7);
         let mut mem = vec![0u8; total_size];
 
@@ -3247,7 +3249,7 @@ mod tests {
 
         // Write element references: [0xCAFE, 0xBEEF]
         for (i, val) in [0xCAFEu64, 0xBEEF].iter().enumerate() {
-            let offset = HEADER_SIZE + i * REF_ELEMENT_SIZE;
+            let offset = HEADER_SIZE + i * ref_element_size();
             unsafe {
                 std::ptr::write_unaligned(mem.as_mut_ptr().add(offset) as *mut u64, *val);
             }
@@ -3620,7 +3622,7 @@ mod tests {
     fn test_hprof_instance_dump_reads_compact_ref_field_value() {
         use cratonvm_gc::heap::{ArrayElementType, ObjectHeader, ObjectKind, HEADER_SIZE};
         use cratonvm_gc::register_class_layout;
-        use cratonvm_types::{CompactLayout, GC_FLAG_COMPACT};
+        use cratonvm_types::{CompactLayout, FieldStorageKind, GC_FLAG_COMPACT};
         use std::sync::Arc;
 
         const CLASS_ID: u32 = 61_001;
@@ -3630,6 +3632,7 @@ mod tests {
             Arc::new(CompactLayout {
                 field_offsets: vec![0],
                 is_ref: vec![true],
+                field_kinds: vec![FieldStorageKind::Reference],
                 ref_offsets: vec![0],
                 body_size: 8,
             }),
@@ -3661,8 +3664,7 @@ mod tests {
             0,
             1,
         );
-        header.array_length = 8;
-        header.gc_flags = GC_FLAG_COMPACT;
+        header.set_compact_shape(1, 8);
         unsafe {
             std::ptr::write(mem.as_mut_ptr() as *mut ObjectHeader, header);
             std::ptr::write_unaligned(mem.as_mut_ptr().add(HEADER_SIZE) as *mut u64, expected_ref);

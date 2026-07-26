@@ -104,12 +104,14 @@ pub fn record(holder: ObjectRef, field_idx: usize, expected: usize, class_id: u3
 #[inline]
 fn slot_addr(holder: ObjectRef, idx: u32) -> usize {
     use cratonvm_gc::heap::SLOT_SIZE;
-    use cratonvm_gc::{class_layout, is_compact_object};
-    use cratonvm_types::ObjectHeader;
+    use cratonvm_gc::is_compact_object;
+    use cratonvm_types::{class_layout_for_fields, ObjectHeader};
 
     let header = unsafe { &*(holder.as_ptr() as *const ObjectHeader) };
     if is_compact_object(header) {
-        if let Some(layout) = class_layout(header.class_id.as_u32()) {
+        if let Some(layout) =
+            class_layout_for_fields(header.class_id.as_u32(), header.num_slots())
+        {
             if let Some(offset) = layout.field_offset(idx as usize) {
                 return header_base(holder) + offset as usize;
             }
@@ -155,7 +157,10 @@ pub fn detect() -> Vec<(usize, u32, usize, usize)> {
         let slot_ptr = slot_addr(holder, idx);
         let header = unsafe { &*(holder.as_ptr() as *const cratonvm_types::ObjectHeader) };
         let is_compact_slot = cratonvm_gc::is_compact_object(header)
-            && cratonvm_gc::class_layout(header.class_id.as_u32())
+            && cratonvm_types::class_layout_for_fields(
+                header.class_id.as_u32(),
+                header.num_slots(),
+            )
                 .and_then(|layout| layout.field_is_ref(idx as usize))
                 .unwrap_or(false);
 

@@ -504,6 +504,12 @@ impl DeoptimizationLog {
         }
     }
 
+    /// Release deoptimization history for methods owned by an unloaded class.
+    pub fn clear_class(&mut self, class_name: &str) {
+        let prefix = format!("{class_name}.");
+        self.history.retain(|method, _| !method.starts_with(&prefix));
+    }
+
     /// Recommend a deopt action based on current history and the triggering reason.
     ///
     /// The `reason` parameter influences the recommended action:
@@ -650,6 +656,16 @@ impl InvalidationManager {
             leaf_class_index: FxHashMap::default(),
             unique_method_index: FxHashMap::default(),
         }
+    }
+
+    /// Drop all hierarchy assumptions after class unloading. Unloading is rare
+    /// and invalidates both owners and dependants, so a conservative reset is
+    /// smaller and safer than retaining strings that may name dead metadata.
+    pub fn clear_all(&mut self) {
+        self.assumptions.clear();
+        self.class_dependencies.clear();
+        self.leaf_class_index.clear();
+        self.unique_method_index.clear();
     }
 
     /// Register an assumption made while compiling `method`.
@@ -1242,14 +1258,12 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-/// Read-once: is `CRATONVM_JIT_FREE_CODE` set (the A/B mode that actually
-/// frees evicted artifacts and their deopt-point boxes)? Mirrors the reads in
-/// `ExecutableBuffer::drop` / `CompiledMethod::drop` (jit/src/lib.rs); in the
-/// default retain-everything mode this is `false` and superseded artifacts'
-/// deopt boxes remain valid for the process lifetime.
+/// Legacy compatibility gate. Code reclamation is now ownership-safe in every
+/// configuration: an executing artifact owns its deopt metadata until return,
+/// so a superseded frame remains reconstructable and must not be forced into a
+/// side-effect-replaying whole-method fallback.
 fn jit_free_code_enabled() -> bool {
-    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var_os("CRATONVM_JIT_FREE_CODE").is_some())
+    false
 }
 
 /// Take (and clear) the frame most recently reconstructed by a deopt.

@@ -1264,7 +1264,7 @@ fn alloc_stream_connection_for_tcp(
         .map_err(|e| mcf_io(format!("AcceptingChannel.accept: clone stream failed: {e}")))?;
     let source_id = register_source_channel(ConduitTransport::Tcp(source_stream));
     let sink_id = register_sink_channel(ConduitTransport::Tcp(stream));
-    if std::env::var_os("CRATONVM_DBG_XNIO_TCP").is_some() {
+    if crate::nbflags().dbg_xnio_tcp {
         eprintln!("[cratonvm:xnio-tcp] accepted_stream source_id={source_id} sink_id={sink_id}");
     }
 
@@ -1382,7 +1382,7 @@ fn native_accept_pump_run(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         match listener.accept() {
             Ok((stream, peer)) => {
                 let _ = stream.set_nonblocking(true);
-                if std::env::var_os("CRATONVM_DBG_XNIO_TCP").is_some() {
+                if crate::nbflags().dbg_xnio_tcp {
                     eprintln!(
                         "[cratonvm:xnio-tcp] accept_pump listener_id={listener_id} peer={peer}"
                     );
@@ -1404,7 +1404,7 @@ fn native_accept_pump_run(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
                 channel = accept_pump_blocked_sleep(ctx, channel, Duration::from_millis(10));
             }
             Err(e) => {
-                if std::env::var_os("CRATONVM_DBG_XNIO_TCP").is_some() {
+                if crate::nbflags().dbg_xnio_tcp {
                     eprintln!(
                         "[cratonvm:xnio-tcp] accept_pump listener_id={listener_id} error={e}"
                     );
@@ -1797,7 +1797,7 @@ fn native_iot_open_tcp_stream_connection(
 
     let source_id = register_source_channel(ConduitTransport::Tcp(source_stream));
     let sink_id = register_sink_channel(ConduitTransport::Tcp(stream));
-    if std::env::var_os("CRATONVM_DBG_XNIO_TCP").is_some() {
+    if crate::nbflags().dbg_xnio_tcp {
         eprintln!(
             "[cratonvm:xnio-tcp] open_tcp_stream host={host} port={port} source_id={source_id} sink_id={sink_id}"
         );
