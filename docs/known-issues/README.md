@@ -1,9 +1,80 @@
 ﻿# Known issues вЂ” index & bug map
 
+## 2026-07-26 H2 — both H2 JIT/perf docs retired; three residuals carried forward
+
+The `Schema  not found` reconnect corruption and the `TestFileSystem`
+per-invoke costs are fixed and their docs are archived under
+`../internal/fixed-suite-bugs/h2-suite-bugs/`. What is still open — three
+classes that stop passing when the `org/h2/` JIT ban is lifted, one
+`TestFileSystem` performance wall, and one cosmetic `ClassCastException`
+message defect — is in
+[`h2/h2-jitban-residuals-20260726.md`](h2/h2-jitban-residuals-20260726.md).
+Two general x64 JIT defects were fixed on the way there and are worth knowing
+about outside H2: an array reported itself an instance of its component type
+(`String[] instanceof String` was true), and JIT invokespecial resolved its
+target by name, ignoring the caller's class loader.
+
 This folder collects CratonVM-only defects found while running upstream Java
 suites. The docs had grown to describe the **same underlying bug from several
 angles**; this index is the consolidated map. Read it first.
 
+## 2026-07-26 SPB.1 (`org/springframework/util/`) ban REMOVED — the "allocate-then-putfield" crash was a GC-root-scanning gap, not a JIT bug — FIXED, moved to internal
+
+FIXED (moved to
+[`../internal/fixed-suite-bugs/spb1-springframework-util-investigation-FIXED.md`](../internal/fixed-suite-bugs/spb1-springframework-util-investigation-FIXED.md)):
+a follow-up repro (concurrent GC pressure + a fresh `URLClassLoader`-loaded
+`ClassUtils.<clinit>`) reproduced real heap corruption with the SPB.1 ban
+ACTIVE too, ruling out "the ban prevents the regression" and reopening the
+whole ban's justification. Root cause: `vm/src/memory/roots.rs` had four
+root-scan sections (static fields, class-lock objects, CONSTANT_Dynamic
+roots, class mirrors) that deferred a user-defined-loader class's
+still-YOUNG-generation object to the `metadata_pin` side-channel instead of
+rooting it directly. That channel is consulted only by the Generational
+backend's old-gen-only mark BFS, so a value with no other root — the common
+case for a static field's value right after `<clinit>` assigns it — was
+silently reclaimed, and its memory reused moments later by the class's own
+next allocation: reading back as a live, valid, but unrelated object
+(`ReentrantLock$NonfairSync`, `ConcurrentReferenceHashMap$Reference`, a raw
+class-name string). Fixed via `VmHeap::metadata_pin_deferrable`
+(`gc/src/vm_heap.rs`), gating the defer on the object actually being in old
+gen; the identical defect was also found and fixed in
+`native-builtins/src/phases_late.rs`'s `ClassValue` cache. G1/ZGC were
+unaffected — their `metadata_pin` consumers already walk every live region
+uniformly. Verified: 50/50 clean repro-3 runs with the ban kept, 47/47 clean
+with it lifted post-fix (vs. failing ~40-60% of the time pre-fix even with
+the ban active) — no distinct JIT-specific symptom survives, so the ban is
+removed from `vm/src/jit/skip_list.rs` rather than left liftable.
+
+## 2026-07-26 G1 backend could OOM-abort on a heap full of garbage — natives that allocate internally never triggered a safepoint — FIXED, doc RETIRED
+
+`docs/known-issues/bug-g1-native-alloc-no-safepoint-oom.md` →
+[`docs/internal/fixed-suite-bugs/g1-native-alloc-no-safepoint-oom-FIXED.md`](../internal/fixed-suite-bugs/g1-native-alloc-no-safepoint-oom-FIXED.md).
+
+`maybe_gc()` is polled only from the five bytecode allocation instructions,
+so a hot loop that allocates exclusively from *inside* native methods (the
+`Integer` box `AsynchronousFileChannel.read` builds on the Rust side) ran for
+millions of iterations with zero safepoint checks. G1's infallible
+`GarbageCollector::alloc_object` cannot report failure, so it consumed all
+1024 regions and `abort()`ed a heap that was ~99.9% garbage. `--nojit`
+reproduced it because that flag is what flips the default collector to G1;
+`-XX:+UseG1GC` reproduced it with the JIT on.
+
+Fixed WITHOUT the interpreter-wide safepoint additions the original doc
+scoped. `safe_native_call_impl` already runs an orchestrated boundary GC at
+the one point where every native argument is pinned and remapped, gated on
+`VmHeap::young_spill_pressure()` — which returned a hardcoded `false` for G1.
+G1 now latches that signal (`G1Collector::native_alloc_pressure`) when a new
+Eden region is claimed with the Free pool already under the `needs_gc`
+threshold, plus a TLAB emergency reserve so speculative bulk refills stop
+before the per-object allocator is cornered. No interpreter dispatch path
+changed; under the default Generational collector nothing changed at all.
+
+Verified: the doc's repro ran 5400 s with zero aborts (was SIGABRT in 1-10 s);
+867 `gc` + 2426 `vm` unit tests green (2 pre-existing failures reproduce with
+the change stashed); the fast regression suite identical across four configs
+(default, `--nojit`, `-XX:+UseG1GC`, and baseline); and the full 218-class H2
+suite in `nojit-real` mode at 147→148 PASS with every one of the seven
+status changes individually accounted for (details in the retired doc).
 ## 2026-07-26 Moving young gen dropped JIT-held oops — FIXED, moved to internal
 
 FIXED (moved to
@@ -45,10 +116,11 @@ that run's jar-fix are now closed, and neither was what it looked like.
   returned `value.length >> (hash & 31)` once a string's hash cache was
   populated. kotlin-reflect's `FqNameUnsafe.isRoot()` is `fqName.length() == 0`,
   so hashed package names started reporting themselves as the root package.
-  29/30 classes now pass; the 30th has an unrelated AssertJ residual. See
-  [`spring-kotlin-reflect-illegalstateexception-root-20260726.md`](spring-kotlin-reflect-illegalstateexception-root-20260726.md).
+  All 30 classes now pass, including the 30th's unrelated AssertJ
+  `Representation`-null NPE residual (fixed `fdc852f55`). Doc moved to
+  [`../internal/fixed-suite-bugs/spring-kotlin-reflect-illegalstateexception-root-FIXED.md`](../internal/fixed-suite-bugs/spring-kotlin-reflect-illegalstateexception-root-FIXED.md).
   The same JIT defect (found independently from H2) is
-  [`h2/h2-jitban-schema-not-found-on-reconnect.md`](h2/h2-jitban-schema-not-found-on-reconnect.md).
+  [`h2/h2-jitban-schema-not-found-on-reconnect-FIXED.md`](../internal/fixed-suite-bugs/h2-suite-bugs/h2-jitban-schema-not-found-on-reconnect-FIXED.md).
 
 Method note worth keeping: `KRun` only prints a failure's stack trace when
 `KRUN_STACK=1` is set. The Kotlin cluster was filed as "zero-frame stack trace,
@@ -76,9 +148,26 @@ given enough time). Two new open docs:
 (Mockito `MockMethodAdvice` fails to load specifically inside
 `@ForkedClassPath`'s reentrant nested-JUnit-Launcher execution — root cause
 narrowed, not fixed) and
-[`springboot/tomcatservletwebserverfactorytests-ssl-clientauth-peercert-residuals.md`](springboot/tomcatservletwebserverfactorytests-ssl-clientauth-peercert-residuals.md)
+`springboot/tomcatservletwebserverfactorytests-ssl-clientauth-peercert-residuals.md`
 (SSL client-certificate mutual-auth handshake/peer-certificate gaps, distinct
 from the already-documented CBC/DHE/TLS1.1 rustls limitations).
+
+> Closure update (2026-07-26): the SSL client-auth/peer-certificate doc above
+> is fixed -- two root causes, both confirmed and corrected: (1)
+> `s2_tls_peer_cert_chain_der` was missing the rustls-stream redirect its
+> sibling `s2_tls_read`/`write`/`close` already had, so a client session's
+> peer chain silently read as empty; (2) optional (`ClientAuth.WANT`) client
+> auth with no trust source configured hard-failed the handshake, where real
+> JSSE (confirmed via a standalone probe) lets it proceed. Verified 129/132
+> PASS on `TomcatServletWebServerFactoryTests` (all 4 of the doc's own
+> affected methods now pass; the 3 remaining failures are unrelated re-run
+> artifacts / the doc's own already-flagged `sslWithHttp11Nio2Protocol`
+> flakiness). Moved to
+> [`../internal/fixed-suite-bugs/springboot/tomcatservletwebserverfactorytests-ssl-clientauth-peercert-residuals-FIXED.md`](../internal/fixed-suite-bugs/springboot/tomcatservletwebserverfactorytests-ssl-clientauth-peercert-residuals-FIXED.md).
+> A separate, pre-existing, unrelated intermittent hang (an "STW cross-thread
+> JIT takeover" stall, reproduced on both the pre-fix and post-fix binary) was
+> found while verifying and filed as its own new doc,
+> [`springboot/tomcatservletwebserverfactorytests-stw-takeover-hang.md`](springboot/tomcatservletwebserverfactorytests-stw-takeover-hang.md).
 
 ## 2026-07-23 Tomcat 9-class HANG-classification doc — FIXED, moved to internal
 

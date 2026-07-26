@@ -112,9 +112,22 @@ rather than assuming closed or re-investigating from scratch.
 > an effectively empty classpath, since `ClassPath::new` never expanded a
 > plain jar's own manifest `Class-Path:` attribute. **FIXED** — see
 > [`../../internal/fixed-suite-bugs/springboot/springboot-security-modifiedclasspathextension-pathing-jar-classpath-manifest-FIXED.md`](../../internal/fixed-suite-bugs/springboot/springboot-security-modifiedclasspathextension-pathing-jar-classpath-manifest-FIXED.md).
-> `PathRequestTests` now passes outright; the other 3 narrow to two distinct,
-> newly-exposed residuals: [`onbeancondition-mergedannotations-intermittent-identity-mismatch.md`](onbeancondition-mergedannotations-intermittent-identity-mismatch.md)
-> and [`securityfilterautoconfig-capturedoutput-password-not-observed.md`](securityfilterautoconfig-capturedoutput-password-not-observed.md).
+> `PathRequestTests` now passes outright; the other 3 narrowed to two distinct
+> residuals: [`onbeancondition-mergedannotations-intermittent-identity-mismatch.md`](onbeancondition-mergedannotations-intermittent-identity-mismatch.md)
+> (still OPEN) and `securityfilterautoconfig-capturedoutput-password-not-observed.md`
+> (was here, now **FIXED** — see below).
+
+> Closure update (2026-07-26): `SecurityFilterAutoConfigurationEarlyInitializationTests`
+> (the `securityfilterautoconfig-capturedoutput-password-not-observed.md` residual
+> above) is fixed — verified 5/5 PASS against current `dev`, resolved as a side
+> effect of unrelated classloader/reflection drift between 2026-07-23 and
+> 2026-07-26, not independently root-caused. Moved to
+> [`../../internal/fixed-suite-bugs/springboot/securityfilterautoconfig-capturedoutput-password-not-observed-FIXED.md`](../../internal/fixed-suite-bugs/springboot/securityfilterautoconfig-capturedoutput-password-not-observed-FIXED.md).
+> The sibling `onbeancondition-mergedannotations-intermittent-identity-mismatch.md`
+> residual remains OPEN (independently spot-checked the same session:
+> `ManagementWebSecurityAutoConfigurationTests` 3/3 clean; the reactive variant
+> shows a separate, likely-unrelated intermittent timeout — see the FIXED doc
+> above for details).
 
 > Investigation (2026-07-24): `module/spring-boot-micrometer-tracing-opentelemetry`'s
 > 2-class residual from this rerun (`OpenTelemetryBaggagePropagationIntegrationTests`,

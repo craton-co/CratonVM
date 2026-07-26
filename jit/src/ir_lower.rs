@@ -3314,6 +3314,7 @@ mod tests {
             num_jit_args: 2, // receiver + one int
             return_type: b'I',
             invoke_kind: 0, // virtual
+        declaring_class_id: 0,
         }));
         let info_ptr = info as *const JitInvokeInfo as usize;
 

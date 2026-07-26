@@ -961,35 +961,50 @@ impl VmHeap {
         }
     }
 
-    /// Native-wrapper young-exhaustion signal, consumed at the
+    /// Native-wrapper allocation-pressure signal, consumed at the
     /// `safe_native_call` boundary to run the GC the wrappers themselves
-    /// cannot (see `GenHeap::young_spill_pressure`). Collectors without the
-    /// generational young→old spill-then-abort shape report `false`.
+    /// cannot.
+    ///
+    /// Each collector latches this from the point where it notices the
+    /// mutator is outrunning it *inside* a native callback — where no
+    /// collection can be initiated, because the callback's locals are not all
+    /// rooted yet. Generational: a young→old spill
+    /// (`GenHeap::young_spill_pressure`). G1: a new Eden region claimed with
+    /// the Free pool already under the `needs_gc` threshold
+    /// (`G1Collector::native_alloc_pressure`) — without it, a workload that
+    /// allocates only from inside natives never reaches ANY safepoint and G1's
+    /// infallible allocator aborts the process on a heap full of garbage (see
+    /// `docs/internal/fixed-suite-bugs/g1-native-alloc-no-safepoint-oom-FIXED.md`).
     #[inline]
     pub fn young_spill_pressure(&self) -> bool {
         match self {
             VmHeap::Generational(h) => h.young_spill_pressure(),
-            VmHeap::G1(_) => false,
+            VmHeap::G1(h) => h.native_alloc_pressure(),
             #[cfg(feature = "zgc")]
             VmHeap::Zgc(_) => false,
         }
     }
 
-    /// Clear the native-wrapper young-exhaustion signal (no-op on
-    /// non-generational collectors).
+    /// Clear the native-wrapper allocation-pressure signal.
     #[inline]
     pub fn clear_young_spill_pressure(&self) {
-        if let VmHeap::Generational(h) = self {
-            h.clear_young_spill_pressure();
+        match self {
+            VmHeap::Generational(h) => h.clear_young_spill_pressure(),
+            VmHeap::G1(h) => h.clear_native_alloc_pressure(),
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(_) => {}
         }
     }
 
-    /// Record a native-wrapper young-exhaustion spill (no-op on
-    /// non-generational collectors) — see `GenHeap::note_young_spill_pressure`.
+    /// Record a native-wrapper allocation-pressure event — see
+    /// [`Self::young_spill_pressure`].
     #[inline]
     pub fn note_young_spill_pressure(&self) {
-        if let VmHeap::Generational(h) = self {
-            h.note_young_spill_pressure();
+        match self {
+            VmHeap::Generational(h) => h.note_young_spill_pressure(),
+            VmHeap::G1(h) => h.note_native_alloc_pressure(),
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(_) => {}
         }
     }
 
@@ -1848,6 +1863,40 @@ impl VmHeap {
             VmHeap::G1(_) => false,
             #[cfg(feature = "zgc")]
             VmHeap::Zgc(_) => false,
+        }
+    }
+
+    /// True when `addr` is safe to defer to the loader-scoped
+    /// `metadata_pin` side-channel instead of pushing it as an unconditional
+    /// GC root (see `vm::memory::roots`'s static-field, class-lock and
+    /// CONSTANT_Dynamic root sections, all gated on `conditional_metadata`).
+    ///
+    /// Generational: ONLY old-gen addresses. `metadata_pin` is consulted
+    /// exclusively by `old_gen_gc`'s BFS (`gen_heap.rs`), which never scans
+    /// the young generation, and `sweep_young_non_moving` / the moving young
+    /// copy closure seed strictly from the direct root set — neither
+    /// consults `metadata_pin`. A YOUNG address deferred here has no path to
+    /// ever be marked: if it has no other reachability (the common case for
+    /// a static field's value immediately after `<clinit>` assigns it, or a
+    /// class-lock/condy object with no other reference), it is silently
+    /// reclaimed and its memory reused by the very next allocation —
+    /// producing a live object that reads back as a DIFFERENT, unrelated
+    /// type. See `docs/known-issues/spb1-springframework-util-investigation.md`'s
+    /// repro-3 follow-up for the observed corruption shape (a `ClassUtils`
+    /// static field, loaded via a user-defined `ClassLoader`, read back as
+    /// an unrelated live object from later in the same `<clinit>`).
+    ///
+    /// G1 / ZGC: always `true` — both backends' `metadata_pin` consumers
+    /// (`g1.rs`, `zgc.rs`) walk every live region uniformly during the same
+    /// full-mark pass that activates `conditional_metadata`, so deferring a
+    /// young-resident object is sound; this matches their existing,
+    /// unconditional behavior and is unchanged here.
+    pub fn metadata_pin_deferrable(&self, addr: usize) -> bool {
+        match self {
+            VmHeap::Generational(h) => h.is_old_gen_addr(addr),
+            VmHeap::G1(_) => true,
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(_) => true,
         }
     }
 

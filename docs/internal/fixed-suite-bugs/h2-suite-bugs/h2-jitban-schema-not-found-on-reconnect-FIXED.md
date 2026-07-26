@@ -1,3 +1,13 @@
+> **RETIRED 2026-07-26 — archived, non-normative.** The `Schema  not found`
+> corruption this doc was opened for is fixed and extinct (0 of 218 classes).
+> `HIB-LONGTAIL.1` itself is still in place; what remains of it is three
+> classes, tracked in
+> [`docs/known-issues/h2/h2-jitban-residuals-20260726.md`](../../../known-issues/h2/h2-jitban-residuals-20260726.md).
+> The 9-vs-10 discrepancy in the body below is corrected there: **ten** classes
+> regressed, and the "9" was the net PASS delta (158 → 149), because
+> `TestMvccMultiThreaded2` improved in the same run. Six of the ten are now
+> closed. Do not cite this doc as current behaviour.
+
 # H2 JIT-ban lift (`org/h2/`, HIB-LONGTAIL.1): the systemic "Schema  not found" corruption is FIXED; the ban stays for 9 enumerated classes
 
 **Status:** the corruption this doc was opened for is **FIXED** (2026-07-26,

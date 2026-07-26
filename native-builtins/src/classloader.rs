@@ -6009,6 +6009,17 @@ pub(crate) fn ucl_try_define_local_class(
     loader: ObjectRef,
     internal_name: &str,
 ) -> Option<MethodCallResult> {
+    if std::env::var("CRATONVM_DBG_UCLTRACE").is_ok() {
+        let loader_cid = ctx.class_id_of_object(loader);
+        let loader_class = ctx.class_name_of_id(loader_cid).unwrap_or_default();
+        let paths = loader_constructor_url_paths(ctx, loader);
+        eprintln!(
+            "[UCLTRACE] name={internal_name} loader_ptr={:?} loader_class={loader_class} n_paths={} paths={:?}",
+            loader.as_ptr(),
+            paths.len(),
+            paths,
+        );
+    }
     if let Some(mirror) = find_loaded_class_for_loader(ctx, loader, internal_name) {
         return Some(Ok(Some(Value::Object(Some(mirror)))));
     }

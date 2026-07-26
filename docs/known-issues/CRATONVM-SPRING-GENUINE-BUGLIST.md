@@ -3052,10 +3052,10 @@ disagreed, the normalisation was skipped, and the lookup went in as lowercase
 `"sa"`.
 
 This is the same defect a concurrent session root-caused from H2
-(BUG-STRING-CODER-COMPACT-20260726, `docs/known-issues/h2/h2-jitban-schema-not-found-on-reconnect.md`)
+(BUG-STRING-CODER-COMPACT-20260726, `docs/internal/fixed-suite-bugs/h2-suite-bugs/h2-jitban-schema-not-found-on-reconnect-FIXED.md`)
 and the same defect behind the 30-class Kotlin
 `IllegalStateException: root` cluster
-([`spring-kotlin-reflect-illegalstateexception-root-20260726.md`](spring-kotlin-reflect-illegalstateexception-root-20260726.md)).
+([`../internal/fixed-suite-bugs/spring-kotlin-reflect-illegalstateexception-root-FIXED.md`](../internal/fixed-suite-bugs/spring-kotlin-reflect-illegalstateexception-root-FIXED.md)).
 Fixed on `dev` in `jit/src/lib.rs` / `jit/src/x64.rs`; this branch dropped its
 own duplicate implementation in favour of it.
 
@@ -3503,6 +3503,36 @@ context's own fork-loaded Spring -- which is precisely why
 | `MockitoSpyBeanByNameLookupForConstructorParametersIntegrationTests` | 0/5 | **5/5** | 5/5 |
 | `MockitoBeansByNameIntegrationTests` | 0/1 | **1/1** | 1/1 |
 
+And all three together in a single AOT end-to-end run, which is the closest
+thing to the real harness that finishes in a usable time:
+`found=13 succ=13 fail=0` in **34s** -- i.e. exactly the 13 failures this
+cluster had left, all green.
+
+### The full 175-class run did NOT complete -- and that is not this fix
+
+`endToEndTestsForBeanOverrides` itself was left running for over an hour without
+reaching its summary (the first attempt heap-thrashed at `--Xmx 4g`: 4.0GB RSS
+with `main-vm` pegged; restarted at `--Xmx 8g` it climbed steadily to 5.7GB,
+still with no summary at 66 minutes, and was stopped). The pre-fix run of the
+same method took ~15 minutes. **Do not read that as a regression from this
+change** -- four A/B measurements, pre-fix binary vs post-fix binary on
+identical inputs, say otherwise:
+
+| workload (identical behaviour on both binaries) | pre-fix | post-fix |
+|---|---|---|
+| 1 neutral class | 17.3s | 18.9s |
+| 2 neutral classes | 21.97s | 21.92s |
+| 4 Mockito classes untouched by this fix | 23.12s | 23.91s |
+| 6 non-Mockito classes | 30.5s | — |
+
+Per-class cost is unchanged, and Mockito classes are not inherently slow either.
+Whatever makes the 175-class run blow up lives in the AOT compile+replay phase
+at full-suite scale and predates this session; the only contribution from this
+fix is that 13 tests which used to abort instantly at parameter resolution now
+genuinely build their contexts and create their mocks. `gdb` cannot be attached
+on this host (`ptrace_scope`), and the phase is silent, so it was not narrowed
+further -- **flagged as its own item, not as a blocker for the fix above.**
+
 Non-AOT mode is unchanged (those three plus `MockitoBeanByTypeLookup*`: 7/7,
 5/5, 1/1, 5/5, 6/6). `cargo test -p cratonvm-vm --lib --release` 2405 passed /
 18 failed, all `runtime::lock_order`, same as baseline; `cargo test -p
@@ -3510,3 +3540,91 @@ cratonvm-native-builtins --lib` matches a stashed-baseline run in the same
 worktree (the extra `lang_system::checkexec_security_tests` failure is flaky
 independently of this change -- a repeated baseline run gives 2, 2, then 1
 failures).
+
+## 2026-07-26 (later) Blocker 2 is now UNREACHABLE: `AotIntegrationTests` hangs first, in Mockito advice on `AbstractStringBuilder.length()`
+
+An attempt to fix Blocker 2 could not reach it. On `dev` `8819b8e4b`,
+`AotIntegrationTests` no longer gets as far as the CGLIB `NoSuchMethodError` --
+it **hangs** during AOT generation. A build from a few hours earlier (dev
+around `a6f69c388`) ran the same test to completion and produced the
+`NoSuchMethodError`, so this is a behaviour change on `dev` within that window,
+not an artifact of the investigation: the hang reproduces on a **pristine**
+`origin/dev` build with no instrumentation.
+
+### The hang
+
+`--stack-dump-on-timeout 900` on the pristine build, main thread, innermost
+frames (full dump: 172 frames):
+
+```
+AotIntegrationTests.endToEndTestsForBeanOverrides -> runEndToEndTests
+  -> TestCompiler.compile -> JavacTaskImpl.call -> JavaCompiler.parseFiles
+  -> JavacParser.nextToken -> Scanner.nextToken -> JavaTokenizer.readToken
+  -> JavaTokenizer.scanOperator
+  -> java/lang/StringBuilder.length
+  -> java/lang/AbstractStringBuilder.length
+  -> org/mockito/internal/creation/bytebuddy/MockMethodAdvice.isMocked
+  -> MockMethodAdvice.getSingletonMockInterceptor
+  -> org/mockito/internal/util/concurrent/DetachedThreadLocal.get
+  -> org/mockito/internal/util/concurrent/WeakConcurrentMap.get
+  -> WeakConcurrentMap$LatentKey.hashCode
+```
+
+Mockito's inline mock-maker advice is installed on
+`java.lang.AbstractStringBuilder.length()` and has not been removed, so EVERY
+`StringBuilder.length()` call in the process now routes through a Mockito
+`WeakConcurrentMap` lookup. javac's tokenizer calls it per token, which is why
+this surfaces as an apparently dead hang rather than a slowdown: the AOT test
+compiles the generated sources with the in-process javac.
+
+This is the same family as
+[[mockito-inline-redefine-leaks-to-unrelated-real-instances]] and the
+`MockitoBean` / `AbstractStringBuilder.length` issue recorded as fixed on
+2026-07-23 ([[mockitobean-length-abstractstringbuilder-fixed-20260723]]) -- a
+recurrence or an adjacent leak, and it needs fixing before Blocker 2 is
+reachable again.
+
+### What was established about Blocker 2 itself
+
+All from the last run that DID reach it. These narrow it considerably and
+should not be re-derived:
+
+1. **The generated class's constant pool is CORRECT.** Dumped the actual bytes
+   with `cglib.debugLocation` and ran `javap -v`:
+   `#191 = Utf8 ()[Ljava/lang/reflect/Method;` and
+   `#193 = Methodref java/lang/Class.getDeclaredMethods:()[Ljava/lang/reflect/Method;`.
+   So the malformed `()[Ljava/lang/reflect/Method[];` in the error is produced
+   by CratonVM after parsing, not present in the input.
+2. **That exact dumped class file loads and initializes fine on CratonVM** when
+   placed on the classpath and `Class.forName`'d (`declaredMethods=49`,
+   identical to HotSpot). So neither the bytes nor the class-file parser is at
+   fault.
+3. **Every runtime `defineClass` route is fine** for an equivalent hand-built
+   class whose `<clinit>` calls `Class.getDeclaredMethods()`:
+   `MethodHandles.Lookup.defineClass`, a user `ClassLoader.defineClass`, and one
+   with the platform loader as parent all work -- including a variant that also
+   forces a `CONSTANT_Class` for `[Ljava/lang/reflect/Method;` via
+   checkcast/anewarray/ldc in the same class.
+4. **The exact failing Spring path works standalone.** Driving
+   `ProxyFactory.setProxyTargetClass(true).getProxy()` (i.e.
+   `ObjenesisCglibAopProxy.createProxyClass`) on the real
+   `...LazyResolutionProxyIntegrationTests$Two` and `$One` produces a working
+   proxy with 49 declared methods, same as HotSpot.
+5. **CratonVM's own native CGLIB enhancer is not involved**: the `[CCE] enhance:
+   defined` log lines cover only `$Config$$SpringCGLIB$$0` classes; the failing
+   `$Two$$SpringCGLIB$$0` is never among them.
+6. The `NoSuchMethodError` does **not** come from `vm_exec.rs`'s dispatch site --
+   `CRATONVM_DBG_NSME=1` produced 10808 `[NSME_DBG] native-probe` lines and not
+   one of them mentions `getDeclaredMethods` or contains `[]`. Some other
+   construction site is responsible; find it before instrumenting further.
+
+So the defect is **context-dependent**, not a property of the bytes, the
+parser, the define route, or the proxy path in isolation. The next step is
+unchanged: fix the Mockito advice leak so the test runs again, then catch the
+malformed descriptor at its construction site. A cheap probe that works: a
+`descriptor.contains("[]")` guard plus `std::backtrace::Backtrace::force_capture()`
+at each `LinkageError::NoSuchMethodError` construction -- but put it ONLY on
+those cold paths. Putting it at `interpreter::execute`'s entry (a substring scan
+on the hottest path in the VM) slows the run enough to look like a hang, and
+`RUST_BACKTRACE=full` does the same by making every internal error capture a
+backtrace.

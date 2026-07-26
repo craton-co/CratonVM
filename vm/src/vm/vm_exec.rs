@@ -12309,6 +12309,49 @@ pub fn invoke_special_shared(
     descriptor: &str,
     args: &[Value],
 ) -> MethodCallResult {
+    invoke_special_shared_impl(shared, thread, None, class_name, method_name, descriptor, args)
+}
+
+/// [`invoke_special_shared`] with the owning class ALREADY resolved.
+///
+/// The name-resolving form calls `load_class_concurrent(class_name)`, which
+/// consults the global binary-name map and therefore cannot tell two loaders'
+/// definitions of the same name apart. A caller that knows the resolution
+/// (because it resolved through the referencing class's own loader) passes it
+/// here instead. `class_name` is still required — the native-override probe
+/// and the diagnostics are name-keyed.
+///
+/// See `JitInvokeInfo::declaring_class_id` for the H2 `TestUpgrade` failure
+/// that motivated this split.
+pub fn invoke_special_shared_on_class(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    class_id: ClassId,
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+    args: &[Value],
+) -> MethodCallResult {
+    invoke_special_shared_impl(
+        shared,
+        thread,
+        Some(class_id),
+        class_name,
+        method_name,
+        descriptor,
+        args,
+    )
+}
+
+fn invoke_special_shared_impl(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    pre_resolved: Option<ClassId>,
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+    args: &[Value],
+) -> MethodCallResult {
     // Native override always wins -- same priority order as invoke_or_native.
     // EXCEPT for SyntheticStub-tagged natives on real-protected classes with
     // loaded bytecode: invokespecial is how constructors and super-calls
@@ -12345,13 +12388,18 @@ pub fn invoke_special_shared(
         }
     }
 
-    // Resolve and initialize the class.
-    let class_id = match shared.load_class_concurrent(class_name) {
-        Ok(cid) => cid,
-        Err(e) => {
-            thread.native_pin_roots.truncate(pin_base);
-            return Err(e.into());
-        }
+    // Resolve and initialize the class. A caller that already resolved it
+    // through the referencing class's loader passes the answer in; only the
+    // name-keyed entry point falls back to the global map.
+    let class_id = match pre_resolved {
+        Some(cid) => cid,
+        None => match shared.load_class_concurrent(class_name) {
+            Ok(cid) => cid,
+            Err(e) => {
+                thread.native_pin_roots.truncate(pin_base);
+                return Err(e.into());
+            }
+        },
     };
     if let Err(e) = super::ensure_class_initialized_shared(shared, thread, class_id) {
         thread.native_pin_roots.truncate(pin_base);
@@ -18136,7 +18184,35 @@ fn invoke_on_class_shared_inner(
                         // native's memoized `computeValue` dispatch must win).
                         || (class_name == "java/lang/ClassValue"
                             && method_name == "get"
-                            && descriptor == "(Ljava/lang/Class;)Ljava/lang/Object;");
+                            && descriptor == "(Ljava/lang/Class;)Ljava/lang/Object;")
+                        // java.util.logging.FileHandler's registered natives
+                        // (native-builtins/src/phases_late.rs,
+                        // register_p61_logging) store their filename/closed
+                        // bookkeeping in an identity-hash side table
+                        // (jul_file_handler_state_table, logging_shims.rs)
+                        // rather than real instance field slots -- see
+                        // docs/known-issues/springboot/filehandler-noarg-ctor-handler-field-layout-gap.md.
+                        // Without this override, real FileHandler bytecode
+                        // (loaded from java.base) is concrete/non-abstract,
+                        // so the default rule above ran its REAL
+                        // <init>()V / <init>(String)V -- which try to
+                        // actually open/lock a real log file via NIO and
+                        // throw NoSuchFileException when the parent
+                        // directory for the lock file isn't set up the way
+                        // real JUL's openFiles() expects -- instead of our
+                        // native override, so apply_jul_config_entries's
+                        // new_object_initialized call (logmanager.rs)
+                        // failed with that exception and the handler was
+                        // silently treated as "uninstantiable, skip it".
+                        || (class_name == "java/util/logging/FileHandler"
+                            && matches!(
+                                (method_name, descriptor),
+                                ("<init>", "()V")
+                                    | ("<init>", "(Ljava/lang/String;)V")
+                                    | ("publish", "(Ljava/util/logging/LogRecord;)V")
+                                    | ("flush", "()V")
+                                    | ("close", "()V")
+                            ));
                     if check_override
                         && shared
                             .natives
