@@ -134,8 +134,12 @@ fn t1_hprof_dump_writes_a_real_file() {
 
     // Build a real Vm so self_arc is set, then call dump_heap directly.
     let vm = cratonvm_vm::vm::Vm::new(cfg);
-    let bytes = cratonvm_vm::runtime::hprof::dump_heap(&vm.shared, path.to_str().unwrap())
-        .expect("HPROF dump must succeed on a fresh VM");
+    let bytes = cratonvm_vm::runtime::hprof::dump_heap(
+        &vm.shared,
+        path.to_str().unwrap(),
+        ThreadId(0), // main thread, registered by Vm::new
+    )
+    .expect("HPROF dump must succeed on a fresh VM");
     assert!(bytes > 0, "dump_heap should write a non-zero file");
 
     let raw = std::fs::read(&path).unwrap();

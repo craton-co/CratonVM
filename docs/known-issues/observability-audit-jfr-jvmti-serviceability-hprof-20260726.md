@@ -238,16 +238,30 @@ Fixed: 8 MiB (HotSpot flushes at 1 MiB). New test
 re-snapshotting and re-allocating the whole registry once per thread. O(n²)
 work and allocation on an app-server dump, on the OOM path. Hoisted.
 
-### D11 — HPROF dumps are not taken at a safepoint — **DOCUMENTED, not fixed**
+### D11 — HPROF dumps are not taken at a safepoint — **FIXED**
 
 `write_heap_segments` carried a comment claiming "the heap is not collected
 while the HPROF dump is in progress — dump is serialized against concurrent GC
-via the SharedVm's gc_barrier". **Neither `dump_heap` nor
-`maybe_dump_heap_on_oom` requests a safepoint or touches any GC barrier.** The
-false claim has been removed and replaced with an accurate note. Tolerable on
-the OOM path (the VM is about to die), but must be fixed before any on-demand
-trigger is wired. Related: object IDs are raw heap addresses, so under a
-relocating collector two dumps disagree and a recycled address can alias.
+via the SharedVm's gc_barrier". Neither `dump_heap` nor
+`maybe_dump_heap_on_oom` requested a safepoint or touched any GC barrier.
+
+Fixed (2026-07-26): `dump_heap` (`vm/src/runtime/hprof.rs`) now takes the
+calling thread's id and requests the same stop-the-world barrier real GC
+cycles use (`GcBarrier::request_stw_counted_with_live_blocked`) before
+walking the heap, via a `DumpSafepoint` RAII guard whose `Drop` releases the
+barrier — with an empty, no-op pointer map, since nothing here relocates any
+object — even on an early error or panic. Deliberately does *not* use the
+interpreter's `stw_take_over_and_wait` forcible-freeze path for in-JIT peers
+(that machinery exists so a *moving* collector can relocate objects safely
+under a frozen peer; a non-moving HPROF walk doesn't need it, and skipping it
+keeps this diagnostic path off the more experimental takeover code). If the
+barrier is already held by a concurrent real GC, the request is declined and
+the dump falls back to the pre-fix unpaused behaviour rather than trying to
+join the other pause — a torn dump on that rare race is still better than the
+OOM handler itself blocking. `maybe_dump_heap_on_oom` and its four call sites
+in `runtime/interpreter.rs` now thread the calling thread through. Related,
+still open: object IDs are raw heap addresses, so under a relocating
+collector two dumps disagree and a recycled address can alias.
 
 ### D12 — JFR is unreachable; `RecordingSettings` has five inert fields — **DOCUMENTED**
 
@@ -343,7 +357,7 @@ warning against "wiring up jcmd" by simply constructing a `JcmdProcessor` —
 
 | File | Change |
 |---|---|
-| `vm/src/runtime/hprof.rs` | D6, D7, D8, D9, D10 fixed; D11 documented; module LIVENESS block; 4 tests |
+| `vm/src/runtime/hprof.rs` | D6, D7, D8, D9, D10, D11 fixed; module LIVENESS block; 4 tests (original pass) |
 | `vm/src/runtime/serviceability.rs` | D3, D4 fixed; D15 + module LIVENESS block; 3 tests (replacing 4 that asserted the fabricated output) |
 | `vm/src/runtime/instrument.rs` | D5 fixed (`class_file_this_class` validator); 4 tests |
 | `vm/src/runtime/jvmti.rs` | D1 fixed (deferred hook firing + real thread id); D13 fixed (dead `AgentRegistry` removed, -8 tests); D14 bridged (`install_real_agent_env_bridge`, 9 event kinds); D2 documented; LIVENESS block updated throughout |

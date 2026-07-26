@@ -3024,7 +3024,7 @@ pub(crate) fn alloc_object_shared(
     // death-spiral (a sliver freed each cycle would otherwise let allocation
     // limp on, GC-thrashing). The catch site / drain surfaces the singleton.
     if gc_overhead_limit_exceeded(shared) {
-        maybe_dump_heap_on_oom(shared);
+        maybe_dump_heap_on_oom(shared, thread);
         return Err(MethodCallFailed::InternalError(VmError::Runtime(
             RuntimeError::OutOfMemoryError {
                 message: format!("Java heap space (alloc_object with {} fields)", num_fields),
@@ -3055,7 +3055,7 @@ pub(crate) fn alloc_object_shared(
         })
         .ok_or_else(|| {
             // T1.7.7 — write an HPROF dump on OOM if `-XX:+HeapDumpOnOutOfMemoryError`.
-            maybe_dump_heap_on_oom(shared);
+            maybe_dump_heap_on_oom(shared, thread);
             MethodCallFailed::InternalError(VmError::Runtime(RuntimeError::OutOfMemoryError {
                 message: format!("Java heap space (alloc_object with {} fields)", num_fields),
             }))
@@ -3070,7 +3070,7 @@ pub(crate) fn alloc_object_shared(
 /// The dump runs at most once per VM lifetime (gated by an atomic
 /// flag on the shared VM) so a tight allocation loop doesn't write
 /// thousands of dumps.
-fn maybe_dump_heap_on_oom(shared: &SharedVm) {
+fn maybe_dump_heap_on_oom(shared: &SharedVm, thread: &JvmThread) {
     use std::sync::atomic::Ordering;
     if !shared.config.heap_dump_on_oom {
         return;
@@ -3089,7 +3089,9 @@ fn maybe_dump_heap_on_oom(shared: &SharedVm) {
         .clone()
         .unwrap_or_else(|| format!("./java_pid{}.hprof", std::process::id()));
     let arc = shared.get_arc();
-    match crate::runtime::hprof::dump_heap(&arc, &path) {
+    // obsaudit D11: pass this thread's id so dump_heap can request a real
+    // stop-the-world pause for the walk instead of racing live mutators.
+    match crate::runtime::hprof::dump_heap(&arc, &path, thread.thread_id) {
         Ok(bytes) => tracing::error!(
             "wrote {} byte HPROF heap dump to {} on OutOfMemoryError",
             bytes,
@@ -3120,7 +3122,7 @@ fn gc_alloc_array(
     // GC-overhead limit (see alloc_object_shared): bail to OOM if the heap is
     // GC-thrashing rather than spinning on slivers.
     if gc_overhead_limit_exceeded(shared) {
-        maybe_dump_heap_on_oom(shared);
+        maybe_dump_heap_on_oom(shared, thread);
         return Err(MethodCallFailed::InternalError(VmError::Runtime(
             RuntimeError::OutOfMemoryError {
                 message: format!("Java heap space (alloc_array length {})", length),
@@ -3143,7 +3145,7 @@ fn gc_alloc_array(
         .heap
         .try_alloc_array(class_id, element_type, length)
         .ok_or_else(|| {
-            maybe_dump_heap_on_oom(shared);
+            maybe_dump_heap_on_oom(shared, thread);
             MethodCallFailed::InternalError(VmError::Runtime(RuntimeError::OutOfMemoryError {
                 message: format!("Java heap space (alloc_array length {})", length),
             }))
