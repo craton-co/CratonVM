@@ -63,9 +63,9 @@ pub use narrow_oop::{
 pub use value::{
     decode_value, decode_value_checked, encode_value, is_object_tag,
     jlong_bits_as_aligned_object_ptr, plausible_heap_pointer, read_value_atomic,
-    read_value_checked, read_value_checked_atomic, write_value_atomic, ObjectRef, Value,
-    VALUE_MAX_DISCRIMINANT, VTAG_DOUBLE, VTAG_FLOAT, VTAG_INT, VTAG_LONG, VTAG_NULL, VTAG_OBJECT,
-    VTAG_RETADDR, VTAG_UNINIT,
+    read_value_checked, read_value_checked_atomic, write_value_atomic, ObjectRef, RawSlot,
+    SlotType, Value, VALUE_MAX_DISCRIMINANT, VTAG_DOUBLE, VTAG_FLOAT, VTAG_INT, VTAG_LONG,
+    VTAG_NULL, VTAG_OBJECT, VTAG_RETADDR, VTAG_UNINIT,
 };
 
 #[cfg(test)]
