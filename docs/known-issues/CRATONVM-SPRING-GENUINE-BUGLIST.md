@@ -3354,13 +3354,25 @@ course no such method is registered. The mangled form is exactly what
 `format!("[L{};", name)` produces when handed the *Java-language* array name
 `java/lang/reflect/Method[]` instead of a descriptor-form name -- i.e. an
 array-name-to-descriptor conversion that assumed its input was not already an
-array. There are four such `[L{};` builders (`native-builtins/src/lang_class.rs`
-`native_class_array_type`, `native-collections/src/lib.rs`,
-`native-builtins/src/generics.rs`, `vm/src/runtime/interpreter.rs`); each guards
-with `starts_with('[')`, so the producer is whichever path can see the bracketed
-Java name. Start by dumping the descriptor at the resolution site
+array.
+
+There are **nine** `format!("[L{};", ...)` builders repo-wide, and all nine were
+checked: `native-builtins/src/lang_class.rs` (2 sites, incl.
+`native_class_array_type`), `native-builtins/src/lib.rs`,
+`native-builtins/src/generics.rs`, `native-collections/src/lib.rs`,
+`vm/src/runtime/interpreter.rs`, `vm/src/runtime/hprof.rs`,
+`classloading/src/verify_insn.rs` (`anewarray`) and `classloading/src/vtype.rs`
+(`merge_arrays`). **Every one of them is correctly guarded** -- either by an
+explicit `starts_with('[')` test or by being fed an already-`L…;`-stripped class
+name -- so none of them is the producer, and re-auditing them is a dead end.
+Whatever builds this descriptor is somewhere else; do not start from that list.
+
+Start instead by dumping the descriptor at the resolution site
 (`vm/src/vm/vm_exec.rs`'s `NoSuchMethodError` warn) for a class defined through
-`ReflectUtils.defineClass`, and compare it with the raw CP UTF8 entry.
+`ReflectUtils.defineClass`, and compare it byte-for-byte with the raw CP UTF8
+entry in the generated class bytes. That answers the one question that decides
+the whole investigation: is the constant pool being parsed wrong, or is the
+descriptor being re-synthesised somewhere between parse and dispatch?
 
 **Ruled out this session** (all verified equal to HotSpot on current `dev`):
 
