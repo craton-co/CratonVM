@@ -1969,11 +1969,25 @@ fn should_skip_jit_internal(
         {
             return Some(SkipReason::RustJvmTestFixture);
         }
-        if class_name.starts_with("org/springframework/beans/factory/support/")
-            && !package_allowed("org/springframework/beans/factory/support/", allow_packages)
-        {
-            return Some(SkipReason::RustJvmTestFixture);
-        }
+        // org/springframework/beans/factory/support/ -- REMOVED 2026-07-26,
+        // the ONLY one of SPB.9b's three sub-bans lifted so far (the other
+        // two, org/springframework/boot/loader/ and
+        // org/springframework/web/reactive/ + org/springframework/boot/web/reactive/
+        // above, remain banned -- they need the full insurance-backend
+        // JarLauncher/WebFlux-boot scaffold to test faithfully, which is
+        // confirmed absent from this host; this sub-package alone is
+        // independently testable via plain DefaultListableBeanFactory
+        // usage). Re-verified with a standalone probe
+        // (`BeanFactorySupportProbe.java`, real spring-beans-7.0.7.jar +
+        // spring-core-7.0.7.jar + commons-logging-1.2.jar) registering 60
+        // real RootBeanDefinition instances per iteration (matching the
+        // ban's own "~50+ beans" scale) via a real
+        // `DefaultListableBeanFactory`, 500 iterations: baseline,
+        // package-allowed, and a `CRATONVM_JIT_THRESHOLD=1`
+        // aggressive-compilation pass -- 0 failures, correct bean counts
+        // and field reads every call in every configuration. No longer
+        // reproduces on current dev. `BeanFactorySupportProbe.java` is the
+        // regression witness for this one sub-package only.
 
         // SPB.9c (Session 114) — companion blanket bans for the Spring
         // component-scan critical path. With SPB.9 and SPB.9b in place,
@@ -4220,6 +4234,57 @@ mod tests {
                 "{class_name}.matches must be JIT-eligible now that ES-HAMCREST.1 is removed"
             );
         }
+    }
+
+    #[test]
+    fn beans_factory_support_is_jit_eligible_after_spb9b_partial_removal() {
+        // Only the org/springframework/beans/factory/support/ sub-ban of
+        // SPB.9b was removed 2026-07-26 -- see the removal comment above
+        // should_skip_jit_internal for the re-verification evidence
+        // (BeanFactorySupportProbe.java, real spring-beans-7.0.7.jar). The
+        // other two SPB.9b sub-bans (org/springframework/boot/loader/,
+        // org/springframework/web/reactive/ + org/springframework/boot/web/reactive/)
+        // remain active -- they need the full insurance-backend app
+        // (confirmed absent from this host) to test faithfully.
+        for policy in [SkipPolicy::Conservative, SkipPolicy::Aggressive] {
+            assert_eq!(
+                check(
+                    "org/springframework/beans/factory/support/DefaultListableBeanFactory",
+                    "registerBeanDefinition",
+                    false,
+                    true,
+                    policy,
+                ),
+                None,
+                "org/springframework/beans/factory/support/ must be JIT-eligible now that its SPB.9b sub-ban is removed"
+            );
+        }
+        // The sibling org/springframework/beans/factory/ ban (a separate,
+        // still-active rule that explicitly carves out .../support/ from
+        // its own scope) must still catch non-support factory classes.
+        assert_eq!(
+            check(
+                "org/springframework/beans/factory/config/BeanDefinitionHolder",
+                "getBeanName",
+                false,
+                true,
+                SkipPolicy::Conservative,
+            ),
+            Some(SkipReason::RustJvmTestFixture),
+            "the sibling org/springframework/beans/factory/ ban (excluding support/) must remain active for non-support classes"
+        );
+        // The other two still-active SPB.9b sub-bans must remain banned.
+        assert_eq!(
+            check(
+                "org/springframework/boot/loader/JarLauncher",
+                "launch",
+                false,
+                true,
+                SkipPolicy::Conservative,
+            ),
+            Some(SkipReason::RustJvmTestFixture),
+            "org/springframework/boot/loader/ must remain banned -- not covered by this partial removal"
+        );
     }
 
     #[test]
