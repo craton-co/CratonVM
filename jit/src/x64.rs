@@ -14760,7 +14760,13 @@ impl Compiler {
     /// Dispatches per-object via the `GC_FLAG_COMPACT` header-bit (byte
     /// offset 21), exactly mirroring the getfield 0xb4 inline path. No
     /// scratch register needed.
-    fn emit_load_string_value_ptr(&mut self, dst: u8, base: u8, compact_offset: i32) {
+    fn emit_load_string_value_ptr(
+        &mut self,
+        dst: u8,
+        base: u8,
+        compact_offset: i32,
+        legacy_offset: i32,
+    ) {
         self.emit_test_mem8_imm8(
             base,
             cratonvm_types::GC_FLAGS_OFFSET as i32,
@@ -14770,7 +14776,7 @@ impl Compiler {
         self.emit_mov_r64_mem_disp32(dst, base, compact_offset);
         let done = self.emit_jmp_rel32_patch();
         self.patch_rel32_to_here(legacy);
-        self.emit_mov_r64_mem_disp32(dst, base, compact_offset + 8);
+        self.emit_mov_r64_mem_disp32(dst, base, legacy_offset);
         self.patch_rel32_to_here(done);
     }
 
@@ -14779,7 +14785,13 @@ impl Compiler {
     /// [`Self::emit_load_string_value_ptr`] (see its doc comment). `coder`
     /// and `hash` are always non-negative in practice, so sign- vs
     /// zero-extension is behaviourally identical here.
-    fn emit_load_string_i32_field(&mut self, dst: u8, base: u8, compact_offset: i32) {
+    fn emit_load_string_i32_field(
+        &mut self,
+        dst: u8,
+        base: u8,
+        compact_offset: i32,
+        legacy_offset: i32,
+    ) {
         self.emit_test_mem8_imm8(
             base,
             cratonvm_types::GC_FLAGS_OFFSET as i32,
@@ -14789,7 +14801,7 @@ impl Compiler {
         self.emit_movsxd_r64_mem_disp32(dst, base, compact_offset);
         let done = self.emit_jmp_rel32_patch();
         self.patch_rel32_to_here(legacy);
-        self.emit_movsxd_r64_mem_disp32(dst, base, compact_offset + 8);
+        self.emit_movsxd_r64_mem_disp32(dst, base, legacy_offset);
         self.patch_rel32_to_here(done);
     }
 
@@ -25151,7 +25163,8 @@ impl Compiler {
                                 self.emit_load_string_value_ptr(
                                     RCX,
                                     RAX,
-                                    layout.value_cell_offset + FIELD_CELL_PAYLOAD64_OFFSET as i32,
+                                    layout.value_compact_offset,
+                                    layout.value_legacy_offset,
                                 );
                                 self.emit_test_r64_r64(RCX);
                                 bail.push(self.emit_jcc_rel32_patch(0x84)); // JZ
@@ -25160,7 +25173,8 @@ impl Compiler {
                                 self.emit_load_string_i32_field(
                                     R10,
                                     RAX,
-                                    layout.coder_cell_offset + FIELD_CELL_PAYLOAD32_OFFSET as i32,
+                                    layout.coder_compact_offset,
+                                    layout.coder_legacy_offset,
                                 );
 
                                 if kind == 3 {
@@ -25175,8 +25189,8 @@ impl Compiler {
                                     self.emit_load_string_i32_field(
                                         RAX,
                                         RAX,
-                                        layout.hash_cell_offset
-                                            + FIELD_CELL_PAYLOAD32_OFFSET as i32,
+                                        layout.hash_compact_offset,
+                                        layout.hash_legacy_offset,
                                     );
                                     // TEST EAX,EAX ; JNZ cached_done
                                     self.buf.emit(&[0x85, 0xC0]);
@@ -25200,8 +25214,8 @@ impl Compiler {
                                     self.emit_load_string_value_ptr(
                                         RDX,
                                         RDX,
-                                        layout.value_cell_offset
-                                            + FIELD_CELL_PAYLOAD64_OFFSET as i32,
+                                        layout.value_compact_offset,
+                                        layout.value_legacy_offset,
                                     );
                                     // h = 0 (EAX) ; i = 0 (R8D).
                                     self.emit_xor_reg_self(RAX);
@@ -25406,12 +25420,14 @@ impl Compiler {
                             self.emit_load_string_value_ptr(
                                 R8,
                                 RAX,
-                                layout.value_cell_offset + FIELD_CELL_PAYLOAD64_OFFSET as i32,
+                                layout.value_compact_offset,
+                                layout.value_legacy_offset,
                             );
                             self.emit_load_string_value_ptr(
                                 R9,
                                 RDX,
-                                layout.value_cell_offset + FIELD_CELL_PAYLOAD64_OFFSET as i32,
+                                layout.value_compact_offset,
+                                layout.value_legacy_offset,
                             );
                             // Null value array on either side → deopt.
                             self.buf.emit(&[0x4D, 0x85, 0xC0]); // TEST R8,R8
@@ -25424,7 +25440,8 @@ impl Compiler {
                             self.emit_load_string_i32_field(
                                 RCX,
                                 RAX,
-                                layout.coder_cell_offset + FIELD_CELL_PAYLOAD32_OFFSET as i32,
+                                layout.coder_compact_offset,
+                                layout.coder_legacy_offset,
                             );
                             // other.coder may come from a legacy-laid-out `other`
                             // independently of `this` -- load it through the
@@ -25434,7 +25451,8 @@ impl Compiler {
                             self.emit_load_string_i32_field(
                                 R11,
                                 RDX,
-                                layout.coder_cell_offset + FIELD_CELL_PAYLOAD32_OFFSET as i32,
+                                layout.coder_compact_offset,
+                                layout.coder_legacy_offset,
                             );
                             self.emit_alu_r32_r32(0x39, RCX, R11); // CMP ECX,R11D
                             bail.push(self.emit_jcc_rel32_patch(0x85)); // JNE
@@ -25549,14 +25567,16 @@ impl Compiler {
                             self.emit_load_string_value_ptr(
                                 R8,
                                 RAX,
-                                layout.value_cell_offset + FIELD_CELL_PAYLOAD64_OFFSET as i32,
+                                layout.value_compact_offset,
+                                layout.value_legacy_offset,
                             );
                             self.buf.emit(&[0x4D, 0x85, 0xC0]); // TEST R8,R8
                             bail.push(self.emit_jcc_rel32_patch(0x84));
                             self.emit_load_string_value_ptr(
                                 R9,
                                 RDX,
-                                layout.value_cell_offset + FIELD_CELL_PAYLOAD64_OFFSET as i32,
+                                layout.value_compact_offset,
+                                layout.value_legacy_offset,
                             );
                             self.buf.emit(&[0x4D, 0x85, 0xC9]); // TEST R9,R9
                             bail.push(self.emit_jcc_rel32_patch(0x84));
@@ -25564,12 +25584,14 @@ impl Compiler {
                             self.emit_load_string_i32_field(
                                 R10,
                                 RAX,
-                                layout.coder_cell_offset + FIELD_CELL_PAYLOAD32_OFFSET as i32,
+                                layout.coder_compact_offset,
+                                layout.coder_legacy_offset,
                             );
                             self.emit_load_string_i32_field(
                                 R11,
                                 RDX,
-                                layout.coder_cell_offset + FIELD_CELL_PAYLOAD32_OFFSET as i32,
+                                layout.coder_compact_offset,
+                                layout.coder_legacy_offset,
                             );
 
                             // --- past every deopt edge: save the callee-
@@ -25682,7 +25704,8 @@ impl Compiler {
                             self.emit_load_string_value_ptr(
                                 R8,
                                 RAX,
-                                layout.value_cell_offset + FIELD_CELL_PAYLOAD64_OFFSET as i32,
+                                layout.value_compact_offset,
+                                layout.value_legacy_offset,
                             );
                             self.buf.emit(&[0x4D, 0x85, 0xC0]); // TEST R8,R8
                             bail.push(self.emit_jcc_rel32_patch(0x84));
@@ -25690,7 +25713,8 @@ impl Compiler {
                             self.emit_load_string_i32_field(
                                 R10,
                                 RAX,
-                                layout.coder_cell_offset + FIELD_CELL_PAYLOAD32_OFFSET as i32,
+                                layout.coder_compact_offset,
+                                layout.coder_legacy_offset,
                             );
                             // R9D = needle = ch & 0xFFFF.
                             self.load_slot_to_reg(R9, ch_slot);
@@ -25780,14 +25804,16 @@ impl Compiler {
                             self.emit_load_string_value_ptr(
                                 R8,
                                 RAX,
-                                layout.value_cell_offset + FIELD_CELL_PAYLOAD64_OFFSET as i32,
+                                layout.value_compact_offset,
+                                layout.value_legacy_offset,
                             );
                             self.buf.emit(&[0x4D, 0x85, 0xC0]); // TEST R8,R8
                             bail.push(self.emit_jcc_rel32_patch(0x84));
                             self.emit_load_string_value_ptr(
                                 R9,
                                 RDX,
-                                layout.value_cell_offset + FIELD_CELL_PAYLOAD64_OFFSET as i32,
+                                layout.value_compact_offset,
+                                layout.value_legacy_offset,
                             );
                             self.buf.emit(&[0x4D, 0x85, 0xC9]); // TEST R9,R9
                             bail.push(self.emit_jcc_rel32_patch(0x84));
@@ -25795,12 +25821,14 @@ impl Compiler {
                             self.emit_load_string_i32_field(
                                 R10,
                                 RAX,
-                                layout.coder_cell_offset + FIELD_CELL_PAYLOAD32_OFFSET as i32,
+                                layout.coder_compact_offset,
+                                layout.coder_legacy_offset,
                             );
                             self.emit_load_string_i32_field(
                                 R11,
                                 RDX,
-                                layout.coder_cell_offset + FIELD_CELL_PAYLOAD32_OFFSET as i32,
+                                layout.coder_compact_offset,
+                                layout.coder_legacy_offset,
                             );
 
                             // PUSH RBX,RSI,RDI,R12,R13,R14,R15.

@@ -3075,11 +3075,51 @@ pub enum JitLdcConstant {
 ///
 /// # How an intrinsic obtains a field offset
 ///
-/// Each `*_field_index` is the abstract field slot index. The matching
-/// `*_cell_offset` is the **byte offset of that field's 16-byte `Value`
-/// cell from the object base**, precomputed as
-/// `HEADER_SIZE + field_index * SLOT_SIZE`. To load the field's payload,
-/// add the in-cell payload offset from `cratonvm_types`:
+/// Each `*_field_index` is the abstract field slot index. For every field the
+/// layout carries TWO ready-to-use **absolute** byte offsets from the object
+/// base -- one per physical object shape -- and the codegen picks between them
+/// at run time on the receiver's `GC_FLAG_COMPACT` header bit:
+///
+/// ```text
+/// TEST byte [recv + GC_FLAGS_OFFSET], GC_FLAG_COMPACT
+/// JZ   legacy
+///   MOV rax, [recv + layout.value_compact_offset]   ; compact object
+/// legacy:
+///   MOV rax, [recv + layout.value_legacy_offset]    ; 16-byte-cell object
+/// ```
+///
+/// * `*_legacy_offset` = `HEADER_SIZE + field_index * SLOT_SIZE + payload`
+///   (`payload` = `FIELD_CELL_PAYLOAD64_OFFSET` for the `value` reference,
+///   `FIELD_CELL_PAYLOAD32_OFFSET` for the `coder` / `hash` ints).
+/// * `*_compact_offset` = `HEADER_SIZE + <body offset from the registered
+///   CompactLayout>`, which already IS the payload address: a compact
+///   reference field is a bare pointer and a compact primitive field is
+///   stored at its natural width, so neither carries a cell tag prefix and
+///   nothing may be added on top.
+///
+/// # BUG-STRING-CODER-AS-HASH-20260726
+///
+/// These used to be ONE offset per field (`*_cell_offset`), with the codegen
+/// deriving the compact address as `cell + payload` and the legacy address as
+/// `cell + payload + 8`. That only holds when a field's compact body offset
+/// equals `field_index * SLOT_SIZE` -- true for `value` (index 0, body offset
+/// 0) and, by coincidence, for `coder`'s legacy address, but NOT for `coder`'s
+/// compact address. On the real JDK 25 String (`value:[B` @0, `coder:B` @8,
+/// `hash:I` @12) the compact `coder` read landed on `hash`, so `length()`
+/// computed `value.length >> (hash & 31)`. That returned the right answer only
+/// while `hash` was still 0 -- i.e. until something called `hashCode()` on
+/// that String, after which `length()`, `isEmpty()`, `charAt()`, `equals()`,
+/// `compareTo()` and `indexOf()` all silently decoded the string at the wrong
+/// width. Observed as `"sa".equalsIgnoreCase("SA") == false` (HSQLDB rejecting
+/// its own `SA` user with `invalid authorization specification`, breaking
+/// every Spring `test.context.testng` transactional test after the first one
+/// in a JVM) and as kotlin-reflect's `FqNameUnsafe.isRoot()` reporting a
+/// non-empty package name as the root package (`IllegalStateException: root`
+/// across 30 Spring Kotlin test classes). `hash`'s own LEGACY offset was wrong
+/// the same way. The two shapes' offsets are not derivable from one another --
+/// keep them independent.
+///
+/// The obsolete single-offset scheme's derivation, for reference:
 ///
 /// ```text
 /// // `hash` is an int  → 4-byte payload at FIELD_CELL_PAYLOAD32_OFFSET:
@@ -3107,22 +3147,29 @@ pub enum JitLdcConstant {
 pub struct StringFieldLayout {
     /// Abstract field slot index of `String.value` (the backing array ref).
     pub value_field_index: usize,
-    /// Byte offset of `value`'s 16-byte `Value` cell from the object base
-    /// (`HEADER_SIZE + value_field_index * SLOT_SIZE`).
-    pub value_cell_offset: i32,
+    /// Absolute byte offset of `value`'s bare pointer in a COMPACT object.
+    pub value_compact_offset: i32,
+    /// Absolute byte offset of `value`'s pointer payload in a LEGACY
+    /// (uniform 16-byte `Value` cell) object.
+    pub value_legacy_offset: i32,
     /// Abstract field slot index of `String.hash` (the cached `int` hash).
     pub hash_field_index: usize,
-    /// Byte offset of `hash`'s `Value` cell from the object base.
-    pub hash_cell_offset: i32,
+    /// Absolute byte offset of `hash` in a COMPACT object.
+    pub hash_compact_offset: i32,
+    /// Absolute byte offset of `hash`'s int payload in a LEGACY object.
+    pub hash_legacy_offset: i32,
     /// Whether this String layout has a `coder` field (`true` for the
     /// compact `byte[]` layout, `false` for the legacy `char[]` layout).
     pub has_coder: bool,
     /// Abstract field slot index of `String.coder`. Meaningful only when
     /// [`has_coder`](Self::has_coder) is `true`.
     pub coder_field_index: usize,
-    /// Byte offset of `coder`'s `Value` cell from the object base.
+    /// Absolute byte offset of `coder` in a COMPACT object. Meaningful only
+    /// when [`has_coder`](Self::has_coder) is `true`.
+    pub coder_compact_offset: i32,
+    /// Absolute byte offset of `coder`'s int payload in a LEGACY object.
     /// Meaningful only when [`has_coder`](Self::has_coder) is `true`.
-    pub coder_cell_offset: i32,
+    pub coder_legacy_offset: i32,
     /// `ObjectHeader` class id of `java/lang/String` (the value stored at
     /// object offset 0). Used as the receiver class-id guard for the
     /// `java/lang/CharSequence` accessor intrinsics (`charAt`/`length`/
@@ -3134,106 +3181,56 @@ pub struct StringFieldLayout {
 }
 
 impl StringFieldLayout {
-    /// Build a layout from raw field indices, precomputing the cell offsets.
-    /// `coder_field_index` is ignored (and the offset zeroed) when
-    /// `has_coder` is `false`. `string_class_id` is the `java/lang/String`
+    /// Build a layout from raw field indices, precomputing BOTH the compact
+    /// and the legacy absolute payload offset of every field (see the
+    /// struct-level "How an intrinsic obtains a field offset" section, and
+    /// BUG-STRING-CODER-AS-HASH-20260726 for why one shared offset is not
+    /// enough). `coder_field_index` is ignored (and both coder offsets zeroed)
+    /// when it is `None`. `string_class_id` is the `java/lang/String`
     /// `ObjectHeader` class id used as the CharSequence receiver guard.
-    ///
-    /// # BUG-ES-TASKINFO-20260710 — compact-ref-field offsets were wrong
-    ///
-    /// Under `CRATONVM_COMPACT_REF_FIELDS` (default ON), a *reference*
-    /// instance field is stored as a bare 8-byte pointer instead of the
-    /// uniform 16-byte `Value` cell (see `cratonvm_types::field_layout`).
-    /// `String.value` (a `byte[]` ref, always field index 0) is exactly such
-    /// a field, so it only occupies 8 bytes of body space — but the old
-    /// `cell(idx) = HEADER_SIZE + idx * SLOT_SIZE` formula assumed every
-    /// field, including `value`, takes a full 16-byte `SLOT_SIZE`. That
-    /// overcounts `value`'s footprint by 8 bytes, so it computed every
-    /// following field's offset (`coder`, `hash`) 8 bytes too high.
-    ///
-    /// Concretely: the inlined `indexOf`/`charAt`/`length`/`hashCode`/
-    /// `equals`/`compareTo` intrinsics in `x64.rs` would read `value`'s own
-    /// trailing bytes as if they were `coder`'s cell, and — for `indexOf` —
-    /// dereference what should have been `coder`'s tag+payload32 word (a
-    /// small int, e.g. `1i64 << 32` for a UTF16-coded string) as if it were
-    /// an 8-byte pointer, producing a wild-pointer SIGSEGV. The bogus
-    /// pointer was fully deterministic (not a data race): it fell straight
-    /// out of the fixed mis-offset applied to every compact-ref-field
-    /// `java/lang/String` instance, reproducing byte-for-byte across runs.
-    ///
-    /// The fix consults the registered per-class `CompactLayout` (built at
-    /// class-define time; see `cratonvm_types::class_layout`) for the real
-    /// per-field byte offset whenever compact ref fields are enabled and a
-    /// layout is available for `string_class_id`, instead of assuming
-    /// uniform `SLOT_SIZE` spacing. A *reference* field has no tag/payload32
-    /// prefix — every call site in `x64.rs` reads the pointer via
-    /// `cell_offset + FIELD_CELL_PAYLOAD64_OFFSET`, so the resolved absolute
-    /// offset is biased by `-FIELD_CELL_PAYLOAD64_OFFSET` before being
-    /// stored, so that arithmetic still lands on the bare pointer. Falls
-    /// back to the legacy uniform formula when compact ref fields are off,
-    /// or (defensively) if no layout is registered yet for `string_class_id`.
     pub fn new(
         value_field_index: usize,
         coder_field_index: Option<usize>,
         hash_field_index: usize,
         string_class_id: u32,
     ) -> Self {
-        let cell = |idx: usize| -> i32 {
+        // LEGACY shape: every field is a uniform 16-byte `Value` cell whose
+        // payload sits at a fixed offset inside the cell.
+        let legacy = |idx: usize, payload: usize| -> i32 {
+            (cratonvm_types::HEADER_SIZE + idx * cratonvm_types::SLOT_SIZE + payload) as i32
+        };
+        // COMPACT shape: the registered per-class `CompactLayout` (built at
+        // class-define time; see `cratonvm_types::class_layout`) gives the
+        // field's real body offset, which already IS its payload address.
+        //
+        // Fallback (compact ref fields globally off, or no `CompactLayout`
+        // registered yet for `string_class_id` -- e.g. the forged class ids in
+        // jit/tests/intrinsic_string_*.rs): use the legacy offset. No object of
+        // such a class can carry `GC_FLAG_COMPACT`, so the compact branch of
+        // the emitted code is unreachable for it.
+        let compact = |idx: usize, payload: usize| -> i32 {
             if cratonvm_types::compact_ref_fields_enabled() {
-                if let Some((body_off, is_ref)) =
+                if let Some((body_off, _is_ref)) =
                     cratonvm_types::compact_field_slot(string_class_id, idx)
                 {
-                    let abs = (cratonvm_types::HEADER_SIZE + body_off) as i32;
-                    return if is_ref {
-                        // Bare 8-byte pointer, no cell tag/payload32 prefix.
-                        abs - cratonvm_types::FIELD_CELL_PAYLOAD64_OFFSET as i32
-                    } else {
-                        abs
-                    };
+                    return (cratonvm_types::HEADER_SIZE + body_off) as i32;
                 }
             }
-            // FALLBACK (compact ref fields globally off, or no CompactLayout
-            // registered yet for string_class_id -- e.g. a class that never
-            // reached ClassStore::add, as every test in
-            // intrinsic_string_access.rs/intrinsic_string_search.rs
-            // deliberately forges via a fake `string_class_id`).
-            //
-            // Every x64.rs call site reconstructs the true address by adding
-            // ITS OWN payload offset to this function's return value
-            // (`FIELD_CELL_PAYLOAD64_OFFSET` for `value`, `_32_OFFSET` for
-            // `coder`/`hash`), and emit_load_string_value_ptr /
-            // emit_load_string_i32_field's own "legacy" branch adds a
-            // FURTHER `+FIELD_CELL_PAYLOAD64_OFFSET` (8) on top of that. So
-            // this fallback must return `legacy_cell_start -
-            // FIELD_CELL_PAYLOAD64_OFFSET` for EVERY field, ref or
-            // primitive alike -- not the bare legacy cell-start unbiased --
-            // so the caller's add + the emitter's own +8 net out to the true
-            // legacy payload address. (The registered branch above only
-            // needs the bias for `is_ref` because its `abs` already IS a
-            // bare-pointer/payload address for non-ref fields; the fallback
-            // formula below is a plain cell-start for every field, so it
-            // always needs the bias.)
-            //
-            // BUG-STRINGINTRINSIC-20260711: this used to return the bare,
-            // unbiased `HEADER_SIZE + idx*SLOT_SIZE`, which put every
-            // fallback field's reconstructed address 8 bytes past its real
-            // payload. For `value` (a byte[] ref) that misread the NEXT
-            // field's (`coder`'s) cell as the array pointer -- combining
-            // `Value::Int`'s zero tag with `coder`'s own int payload into a
-            // bogus 64-bit value (e.g. `0x1_00000000` for coder=1),
-            // non-null and plausible-looking, later dereferenced for the
-            // array-length bounds check. SIGSEGV.
-            (cratonvm_types::HEADER_SIZE + idx * cratonvm_types::SLOT_SIZE) as i32
-                - cratonvm_types::FIELD_CELL_PAYLOAD64_OFFSET as i32
+            legacy(idx, payload)
         };
+        let ref_payload = cratonvm_types::FIELD_CELL_PAYLOAD64_OFFSET;
+        let int_payload = cratonvm_types::FIELD_CELL_PAYLOAD32_OFFSET;
         StringFieldLayout {
             value_field_index,
-            value_cell_offset: cell(value_field_index),
+            value_compact_offset: compact(value_field_index, ref_payload),
+            value_legacy_offset: legacy(value_field_index, ref_payload),
             hash_field_index,
-            hash_cell_offset: cell(hash_field_index),
+            hash_compact_offset: compact(hash_field_index, int_payload),
+            hash_legacy_offset: legacy(hash_field_index, int_payload),
             has_coder: coder_field_index.is_some(),
             coder_field_index: coder_field_index.unwrap_or(0),
-            coder_cell_offset: coder_field_index.map_or(0, cell),
+            coder_compact_offset: coder_field_index.map_or(0, |i| compact(i, int_payload)),
+            coder_legacy_offset: coder_field_index.map_or(0, |i| legacy(i, int_payload)),
             string_class_id,
         }
     }
@@ -13928,9 +13925,13 @@ mod layout_constant_inventory {
     /// `LAYOUT_CONSTANTS[i]` in that file.
     const INVENTORY: [(&str, [usize; 8]); 2] = [
         // lib.rs: the `use` list near the top, plus `StringFieldLayout::new`'s
-        // `cell()` closure — its compact-layout branch and its legacy
-        // header-plus-cell fallback, each biased by the payload64 offset.
-        ("lib.rs", [3, 1, 2, 1, 0, 0, 0, 2]),
+        // two closures — `compact()` (header + registered CompactLayout body
+        // offset) and `legacy()` (header + cell index + in-cell payload) — and
+        // the two payload constants bound once each as `ref_payload` /
+        // `int_payload`. The payload64 count dropped 2 -> 1 and payload32 rose
+        // 0 -> 1 when the single-offset `cell()` closure was split into the
+        // two per-shape closures (BUG-STRING-CODER-AS-HASH-20260726).
+        ("lib.rs", [3, 1, 2, 1, 0, 0, 1, 1]),
         // ir_lower.rs: the `use` list, the three compile-time invariants
         // restated at the top of that file, two disp32 field-address
         // computations, two disp8 float array element accesses, and the disp8
