@@ -117,20 +117,19 @@ Hibernate-Validator hang described here no longer reproduces on current
 test method completes in ~13s under `--nojit`, matching this doc's own
 repro recipe exactly. Very likely fixed as a side effect of unrelated work
 landed on `dev` after the 2026-07-24 investigation; no specific fixing
-commit was identified. **However the class still fails under CratonVM's
-default JIT-on mode**, due to two newly-discovered, unrelated JIT
-correctness bugs in Spring's AOT codegen path: (1) `javax.lang.model
-.SourceVersion.isIdentifier` gets miscompiled once JIT-inlined/compiled via
-`SourceVersion.isName`'s own call (fully isolated, dependency-free 20-line
-repro, `CRATONVM_JIT_DENY=isIdentifier` workaround available), and (2)
+commit was identified. At the time of this investigation the class still
+failed under CratonVM's default JIT-on mode, due to two newly-discovered,
+unrelated JIT correctness bugs in Spring's AOT codegen path: (1) `javax
+.lang.model.SourceVersion.isIdentifier` getting miscompiled once JIT-
+inlined/compiled via `SourceVersion.isName`'s own call, and (2)
 AOT-generated `void`-returning methods (built via javapoet's default
-`TypeName.VOID`, e.g. `registerBeanDefinitions`) lose their return type
-token under JIT, producing a javac parse error (not yet minimally
-isolated). Both are JIT-only (never reproduce under `--nojit`). Full
-diagnostic trail, minimal repros, and bisection notes:
-`configurationpropertiesbeanregistrationaotprocessortests-hang.md`. Still
-left OUT of the suite-runner timeout table — it's a real (fast, ~2s)
-failure under JIT now, not a hang, but still not passing.
+`TypeName.VOID`, e.g. `registerBeanDefinitions`) losing their return type
+token under JIT, producing a javac parse error. **Both are now fixed as of
+2026-07-26** (an unrelated JIT branch-join-merge fix, commit `13055f75c`,
+turned out to resolve both — see the full diagnostic trail, minimal
+repros, bisection notes, and closure writeup:
+`docs/internal/fixed-suite-bugs/springboot/configurationpropertiesbeanregistrationaotprocessortests-hang-FIXED.md`).
+The class now passes under JIT-on, real repro, all 9 test methods.
 
 ## Cluster B — diagnostics, process metadata, and byte/URL utilities
 
