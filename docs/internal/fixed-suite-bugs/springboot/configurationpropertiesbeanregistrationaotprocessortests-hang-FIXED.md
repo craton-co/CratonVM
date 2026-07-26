@@ -1,10 +1,15 @@
-# `ConfigurationPropertiesBeanRegistrationAotProcessorTests` — original hang RESOLVED, class still blocked by 2 unrelated JIT bugs (OPEN)
+# `ConfigurationPropertiesBeanRegistrationAotProcessorTests` — ALL THREE issues RESOLVED (see closure note)
 
 Class: `org.springframework.boot.context.properties.ConfigurationPropertiesBeanRegistrationAotProcessorTests`
 (`core/spring-boot`). Originally found investigating Spring Boot core39
 residual Cluster A (`spring-boot-core39-residual-clusters-20260723.md`),
 2026-07-24. Re-investigated 2026-07-25/26 (worktree
 `wt-cpbrap-hang-20260725`, branch `fix/cpbrap-hang-20260725`, Azure host).
+Closed 2026-07-26 (worktree `wt-cpbrap-fix2-20260726`, branch
+`fix/cpbrap-jitbugs-20260726`, Azure host) — see "Closure" section at the
+bottom; this doc has moved to `docs/internal/fixed-suite-bugs/` as part of
+that closure, per the known-issues-vs-internal convention (known-issues
+holds only unfixed bugs; a doc moves out once fully resolved).
 
 ## Status: original Hibernate-Validator hang no longer reproduces — CONFIRMED FIXED
 
@@ -19,12 +24,10 @@ history around that window). No specific commit was identified as *the*
 fix — this is inferred from the hang no longer occurring, not from reading
 a diff.
 
-**However, the class still does not pass under CratonVM's default (JIT-on)
-configuration**, due to two unrelated, newly-discovered JIT correctness
-bugs described below. Since the suite runner's default mode is JIT-on, this
-class remains a real failure — just a different one than originally
-documented. Left in `known-issues/` per the doc convention (only moves to
-`docs/internal/` once the class actually passes).
+**However, at the time this section was written, the class still did not
+pass under CratonVM's default (JIT-on) configuration**, due to two
+unrelated, newly-discovered JIT correctness bugs described below. See the
+"Closure" section at the bottom — both are now also fixed.
 
 ## How this was verified (no Gradle/Spring Boot checkout needed)
 
@@ -93,7 +96,7 @@ TMPDIR=/data/tmp ./cratonvm --java-home <jdk25> -cp "$CP" \
 #    (see Bug 1 below) — fails in ~2s, not a multi-hour hang.
 ```
 
-## Bug 1 (OPEN): AOT-generated `void`-returning methods lose their return type under JIT
+## Bug 1 (FIXED 2026-07-26 — see Closure section): AOT-generated `void`-returning methods lose their return type under JIT
 
 The generated `..._TestTarget__BeanFactoryRegistrations.java` source (built
 by `BeanRegistrationsAotContribution` via `org.springframework.javapoet`'s
@@ -119,7 +122,7 @@ codegen path (not just raw javapoet) to trigger. Confirmed **JIT-only**
 **not** fix this one — the two bugs are independent, both currently gate
 this same test method from passing under JIT.
 
-## Bug 2 (OPEN, minimally isolated): `javax.lang.model.SourceVersion.isIdentifier` JIT miscompilation
+## Bug 2 (FIXED 2026-07-26 — see Closure section): `javax.lang.model.SourceVersion.isIdentifier` JIT miscompilation
 
 **Fully isolated, dependency-free, 20-line repro** (no javapoet/Spring
 needed at all):
@@ -190,6 +193,12 @@ Bisection so far:
   tested, so if they're related it's indirect (e.g. a different call-site
   eligibility heuristic upstream of those flags, not the lowering itself).
 
+  **2026-07-26 closure update: this specific "only compiles via isName,
+  never via a direct call" tiering asymmetry no longer holds either** —
+  see Closure section. `CRATONVM_DBG_JITC` on current `dev` shows
+  `isIdentifier` tiering up through the normal background C1→C2 path like
+  any other hot method, regardless of caller.
+
 ## What's needed to close this
 
 **Bug 1** needs a minimal repro first (the standalone javapoet loop test
@@ -214,6 +223,8 @@ are at risk. `CRATONVM_JIT_DENY=isIdentifier` is a viable *workaround* for
 Bug 2 specifically (not a fix) if this class needs to pass under JIT before
 a real fix lands; no equivalent workaround was found for Bug 1.
 
+**2026-07-26 closure update: this whole section is moot** — see Closure.
+
 ## Reproduction of the (RESOLVED) original doc content, for the record
 
 ```powershell
@@ -228,6 +239,96 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File apps\spring-boot-suite-r
 This no longer hangs (confirmed via the from-scratch reproduction above,
 not by re-running this exact PowerShell command — `apps/spring-boot` was
 not available on either machine this session). If re-verifying against the
-full suite runner, note the runner's default is JIT-**on**, which will now
-hit Bug 1/Bug 2 above instead of completing — pass `-Jit off` to see the
-original hang's absence directly, matching this doc's original repro.
+full suite runner, note the runner's default is JIT-**on** — as of this
+doc's closure (below), that no longer matters: the class passes JIT-on too.
+
+## Closure (2026-07-26): both remaining bugs turned out to already be fixed on `dev`
+
+Re-investigated in worktree `wt-cpbrap-fix2-20260726`
+(branch `fix/cpbrap-jitbugs-20260726`, from `origin/dev` at `3f080ad48`,
+Azure host), with the goal of actually fixing Bug 1 and Bug 2 above. The
+prior session's full repro environment had survived on the host at
+`/data/data/cpbrap-repro/` (sparse Spring Boot checkout, assembled
+classpath, `ExtDriver`/`ForkedDriver`, and — critically — the exact
+`cratonvm` binary built when this doc was written, preserved at
+`/data/data/cpbrap-repro/cratonvm-cpbrap-20260725`), so no re-assembly was
+needed.
+
+**Both bugs no longer reproduce on current `dev`.** Building a fresh
+`cratonvm` from `origin/dev` tip and re-running:
+
+- `SourceVersionProbe` (Bug 2's exact 20-line repro, 20,000 iterations of
+  `SourceVersion.isName("Object")`): **0 bad results**, both at the
+  default `CRATONVM_TIER_C1_THRESHOLD=500` and at `=10` with 200,000
+  iterations. `CRATONVM_DBG_JITC` confirms `isIdentifier` still tiers up
+  through the normal background C1→C2 path (contradicting this doc's
+  earlier claim that it only ever compiled via the eager direct-call-as-
+  callee path — that claim no longer holds on current `dev` either,
+  suggesting the underlying tiering behavior shifted along with the fix).
+- All 5 `@CompileWithForkedClassLoader` test methods
+  (`aotContributedInitializerBindsValueObject`,
+  `...WithSpecificConstructor`, `...BindsJavaBean`,
+  `...BindsScannedValueObject`, `...BindsScannedJavaBean` — one more than
+  this doc originally counted) plus the 4 plain `@Test` methods on the
+  class: **all 9 pass**, default JIT-on, real Spring Boot 7.0.7 bytecode,
+  multiple repeated runs for determinism. No `CompilationException`, no
+  hang.
+
+Re-running the **same** repros against the preserved 2026-07-25 binary
+(`cratonvm-cpbrap-20260725`) confirms both bugs are genuinely present
+there (Bug 2: `BAD` starting at iteration ~505-512, ~97% of iterations bad
+thereafter; Bug 1: the exact `CompilationException` /
+"invalid method declaration; return type required" from the doc) — so
+this is a real fix on `dev`, not an environment or repro difference.
+
+**Root cause, identified via bisection:** both bugs were fixed by the
+*same* commit, `13055f75c` ("fix(jit): String compact-layout field offsets
+and the branch-join reload mirror"), landed on `dev` 2026-07-26 13:46 UTC
+— found independently, investigating an unrelated H2/`org/hibernate`
+JIT-ban lift (see that commit's own log for the H2 angle). Built the
+worktree at `13055f75c~1` (its immediate parent) in a separate throwaway
+worktree (`wt-cpbrap-bisect-20260726`) and reran both repros: **both bugs
+reproduce at `13055f75c~1`** (Bug 2: `BAD` from iteration ~505; Bug 1: same
+`CompilationException`), confirming `13055f75c` is the exact fixing
+commit for both, not just "some fix somewhere in the range."
+
+The commit's second fix, **BUG-JOIN-MIRROR**, is the relevant half: the
+x64 backend's reload-elision mirror (tracking which register already
+holds a given stack/local value, to skip redundant reloads) was cleared
+at the top of a branch-TARGET pc, but the merge-point
+`canonicalize_stack()` runs *after* that clear and emits fall-through-only
+code before `pc_to_native[pc]` — so a mirror entry recorded during that
+fall-through window leaked across the join, and code reached via the
+branch edge read a stale register. The commit's own example was a ternary
+(`s == null ? defaultValue : s`) returning the wrong arm's stale value.
+This is a generic branch-merge-point bug, not specific to H2, Spring, or
+either bug documented here — it explains both:
+
+- **Bug 2**: `isIdentifier`'s loop (`for (int i = ...; i < id.length(); i
+  += ...) { cp = id.codePointAt(i); if (!Character.isJavaIdentifierPart(cp))
+  return false; }`) has exactly the shape BUG-JOIN-MIRROR corrupts — a
+  loop back-edge merging with the loop-entry path, with an early-return
+  branch inside. A stale register value read at the merge point plausibly
+  explains the always-wrong-after-first-hit behavior once the method was
+  JIT-compiled.
+- **Bug 1**: the generated source's missing `void ` token is exactly the
+  kind of corruption a stale/wrong register produces when it feeds into
+  the `StringBuilder`/string-concat machinery inside javapoet's
+  `MethodSpec.emit()` (a conditional — "if there's an explicit return
+  type, emit it" — around a ternary-shaped branch join), which is why the
+  doc's own earlier attempt to isolate Bug 1 with a hand-rolled 200k-loop
+  javapoet-only probe never reproduced it: that probe likely never hit the
+  same branch-join shape the real `BeanRegistrationsAotContribution`
+  codegen path does.
+
+Neither of these attributions was re-verified by reading `13055f75c`'s
+diff line-by-line against a hand-reduced minimal repro of either bug
+specifically (the bisection + repro re-run above is what's actually
+verified) — flagged here as inference, matching this doc's own established
+convention from the original hang's closure.
+
+**Disposition:** doc moved to `docs/internal/fixed-suite-bugs/` (top status
+is now fully closed, no remaining OPEN sub-part). No code changes were
+needed in this session — the fix already existed on `dev`; this session's
+contribution is the verification, bisection, and root-cause attribution
+above.

@@ -3540,3 +3540,91 @@ cratonvm-native-builtins --lib` matches a stashed-baseline run in the same
 worktree (the extra `lang_system::checkexec_security_tests` failure is flaky
 independently of this change -- a repeated baseline run gives 2, 2, then 1
 failures).
+
+## 2026-07-26 (later) Blocker 2 is now UNREACHABLE: `AotIntegrationTests` hangs first, in Mockito advice on `AbstractStringBuilder.length()`
+
+An attempt to fix Blocker 2 could not reach it. On `dev` `8819b8e4b`,
+`AotIntegrationTests` no longer gets as far as the CGLIB `NoSuchMethodError` --
+it **hangs** during AOT generation. A build from a few hours earlier (dev
+around `a6f69c388`) ran the same test to completion and produced the
+`NoSuchMethodError`, so this is a behaviour change on `dev` within that window,
+not an artifact of the investigation: the hang reproduces on a **pristine**
+`origin/dev` build with no instrumentation.
+
+### The hang
+
+`--stack-dump-on-timeout 900` on the pristine build, main thread, innermost
+frames (full dump: 172 frames):
+
+```
+AotIntegrationTests.endToEndTestsForBeanOverrides -> runEndToEndTests
+  -> TestCompiler.compile -> JavacTaskImpl.call -> JavaCompiler.parseFiles
+  -> JavacParser.nextToken -> Scanner.nextToken -> JavaTokenizer.readToken
+  -> JavaTokenizer.scanOperator
+  -> java/lang/StringBuilder.length
+  -> java/lang/AbstractStringBuilder.length
+  -> org/mockito/internal/creation/bytebuddy/MockMethodAdvice.isMocked
+  -> MockMethodAdvice.getSingletonMockInterceptor
+  -> org/mockito/internal/util/concurrent/DetachedThreadLocal.get
+  -> org/mockito/internal/util/concurrent/WeakConcurrentMap.get
+  -> WeakConcurrentMap$LatentKey.hashCode
+```
+
+Mockito's inline mock-maker advice is installed on
+`java.lang.AbstractStringBuilder.length()` and has not been removed, so EVERY
+`StringBuilder.length()` call in the process now routes through a Mockito
+`WeakConcurrentMap` lookup. javac's tokenizer calls it per token, which is why
+this surfaces as an apparently dead hang rather than a slowdown: the AOT test
+compiles the generated sources with the in-process javac.
+
+This is the same family as
+[[mockito-inline-redefine-leaks-to-unrelated-real-instances]] and the
+`MockitoBean` / `AbstractStringBuilder.length` issue recorded as fixed on
+2026-07-23 ([[mockitobean-length-abstractstringbuilder-fixed-20260723]]) -- a
+recurrence or an adjacent leak, and it needs fixing before Blocker 2 is
+reachable again.
+
+### What was established about Blocker 2 itself
+
+All from the last run that DID reach it. These narrow it considerably and
+should not be re-derived:
+
+1. **The generated class's constant pool is CORRECT.** Dumped the actual bytes
+   with `cglib.debugLocation` and ran `javap -v`:
+   `#191 = Utf8 ()[Ljava/lang/reflect/Method;` and
+   `#193 = Methodref java/lang/Class.getDeclaredMethods:()[Ljava/lang/reflect/Method;`.
+   So the malformed `()[Ljava/lang/reflect/Method[];` in the error is produced
+   by CratonVM after parsing, not present in the input.
+2. **That exact dumped class file loads and initializes fine on CratonVM** when
+   placed on the classpath and `Class.forName`'d (`declaredMethods=49`,
+   identical to HotSpot). So neither the bytes nor the class-file parser is at
+   fault.
+3. **Every runtime `defineClass` route is fine** for an equivalent hand-built
+   class whose `<clinit>` calls `Class.getDeclaredMethods()`:
+   `MethodHandles.Lookup.defineClass`, a user `ClassLoader.defineClass`, and one
+   with the platform loader as parent all work -- including a variant that also
+   forces a `CONSTANT_Class` for `[Ljava/lang/reflect/Method;` via
+   checkcast/anewarray/ldc in the same class.
+4. **The exact failing Spring path works standalone.** Driving
+   `ProxyFactory.setProxyTargetClass(true).getProxy()` (i.e.
+   `ObjenesisCglibAopProxy.createProxyClass`) on the real
+   `...LazyResolutionProxyIntegrationTests$Two` and `$One` produces a working
+   proxy with 49 declared methods, same as HotSpot.
+5. **CratonVM's own native CGLIB enhancer is not involved**: the `[CCE] enhance:
+   defined` log lines cover only `$Config$$SpringCGLIB$$0` classes; the failing
+   `$Two$$SpringCGLIB$$0` is never among them.
+6. The `NoSuchMethodError` does **not** come from `vm_exec.rs`'s dispatch site --
+   `CRATONVM_DBG_NSME=1` produced 10808 `[NSME_DBG] native-probe` lines and not
+   one of them mentions `getDeclaredMethods` or contains `[]`. Some other
+   construction site is responsible; find it before instrumenting further.
+
+So the defect is **context-dependent**, not a property of the bytes, the
+parser, the define route, or the proxy path in isolation. The next step is
+unchanged: fix the Mockito advice leak so the test runs again, then catch the
+malformed descriptor at its construction site. A cheap probe that works: a
+`descriptor.contains("[]")` guard plus `std::backtrace::Backtrace::force_capture()`
+at each `LinkageError::NoSuchMethodError` construction -- but put it ONLY on
+those cold paths. Putting it at `interpreter::execute`'s entry (a substring scan
+on the hottest path in the VM) slows the run enough to look like a hang, and
+`RUST_BACKTRACE=full` does the same by making every internal error capture a
+backtrace.
