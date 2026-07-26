@@ -10,7 +10,7 @@
 //! - Method bytecode and exception table
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::Arc;
 
 use cratonvm_reader::attribute::ExceptionTableEntry;
 
@@ -75,6 +75,18 @@ pub fn padded_bytecode(code: &[u8]) -> Arc<[u8]> {
 // replace the entry, so `Arc` sharing semantics are identical to the
 // non-memoized path (old frames keep the old Arc alive; the liveness cache's
 // `Weak` + `ptr_eq` guard sees a different pointer and recomputes).
+//
+// THE OTHER CODE-POINTER-KEYED CACHE
+// ----------------------------------
+// `reader/src/quickened.rs::intern` also keys on `(code.as_ptr(), code.len())`
+// (reached via `interpreter.rs::quickened_for_frame`). That one is *content
+// only* — `QuickenedCode::build` is a pure pre-decode of `Instruction::decode`
+// over the bytes, with no constant-pool dependence — and its `Some` entries pin
+// a strong `Arc<[u8]>`, so a recycled address cannot yield a wrong hit.
+// Method-identity keying is safe for it and in fact helps: two frames of the
+// same method now share one code allocation, so the quickened stream is reused
+// instead of rebuilt and re-interned under a fresh address. `local_liveness` is
+// the constraint, not this.
 
 /// `(class_id, hash(method_name ++ descriptor))`.
 type PaddedCodeKey = (u32, u64);
@@ -89,9 +101,10 @@ const PADDED_CODE_CACHE_CAP: usize = 16384;
 /// would dominate the cache's footprint.
 const PADDED_CODE_CACHE_MAX_LEN: usize = 32 * 1024;
 
-fn padded_code_cache() -> &'static Mutex<HashMap<PaddedCodeKey, Arc<[u8]>>> {
-    static CACHE: OnceLock<Mutex<HashMap<PaddedCodeKey, Arc<[u8]>>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+fn padded_code_cache() -> &'static std::sync::Mutex<HashMap<PaddedCodeKey, Arc<[u8]>>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<PaddedCodeKey, Arc<[u8]>>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }
 
 /// FNV-1a over `bytes`, seeded with `seed` so several fields can be chained.
@@ -3438,7 +3451,9 @@ mod tests {
             assert_eq!(
                 frames.reloc_epoch(),
                 epoch_after_reserve,
-                "push #{i} relocated despite reserve_stable({DEPTH})"
+                "push #{} relocated despite reserve_stable({})",
+                i,
+                DEPTH
             );
         }
 
@@ -3515,18 +3530,15 @@ mod tests {
             frames.push(test_frame("fill", 1));
         }
         assert_eq!(frames.reloc_epoch(), 0);
-        let before = &frames[0] as *const Frame;
 
-        // The next push must grow, which must bump the epoch.
+        // The next push must grow, which must bump the epoch. (Addresses taken
+        // before this point are stale by construction — that is precisely what
+        // the epoch bump reports — so we assert the epoch and never dereference
+        // a pre-growth pointer.)
         frames.push(test_frame("overflow", 1));
         assert_eq!(frames.reloc_epoch(), 1, "growth must bump reloc_epoch");
         // Capacity at least doubled, so a long run of pushes is stable again.
         assert!(frames.stable_headroom() >= FRAME_STACK_INITIAL_STABLE_CAP - 1);
-
-        // (The old address is stale by construction — that is exactly what the
-        // epoch bump reports. We only assert the epoch, never dereference
-        // `before`.)
-        let _ = before;
 
         // truncate/clear keep the (now larger) stable capacity and move nothing.
         let cap = frames.stable_headroom() + frames.len();

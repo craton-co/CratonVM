@@ -4,6 +4,11 @@ Wave: `arch-2026-07-26`. Slug: `frame-arena`.
 Files owned: `vm/src/runtime/frame.rs`, `vm/src/runtime/value_stack.rs`,
 `vm/src/threading/jvm_thread.rs`.
 
+**Basis: `dev` = `6495a191c34fcf701c7c168517e6a13f462fc3dc`** (merged clean, no
+conflicts). Every line number below was re-verified against that tree. `dev`
+moves under concurrent sessions in this repo — if the citations do not match,
+re-grep rather than trusting them.
+
 ---
 
 ## 1. What landed
@@ -25,10 +30,15 @@ Every existing `.frames` call site in the repo compiles unchanged (§3).
 `JvmThread::frames` was `Vec<Frame>`. `Vec::push` reallocates on capacity
 exhaustion and **memcpy's every live frame**, so no `&mut Frame` and no
 `*mut Frame` could survive a call. The interpreter therefore re-indexed
-`thread.frames[frame_idx]` on every access — 622 sites in
-`runtime/interpreter.rs`, six of them inside the single dispatch site at
-`interpreter.rs:10364-10395` that executes one bytecode. Each is a bounds check
-plus an `imul` by `size_of::<Frame>()` (not a power of two) plus a pointer chase.
+`thread.frames[frame_idx]` on every access — **622** sites in
+`runtime/interpreter.rs` (652 counting all `thread.frames[…]` forms), **eight**
+of them inside the single dispatch site at `interpreter.rs:10364-10400` that
+executes one bytecode. Each is a bounds check plus an `imul` by
+`size_of::<Frame>()` (not a power of two) plus a pointer chase.
+
+(The count is eight, not six, on the current `dev`: the quickening work added
+`thread.frames[frame_idx].code.as_ptr()` and `quickened_for_frame(&thread.frames
+[frame_idx])` at the top of the dispatch block. The 622 figure is unchanged.)
 
 `vm/src/runtime/frame.rs` now defines `FrameStack`, a thin wrapper over
 `Vec<Frame>` that turns capacity management into an explicit, observable part
@@ -64,22 +74,36 @@ WildFly/Elasticsearch-scale thread counts cannot absorb. 256 covers essentially
 every real Java stack; deeper stacks pay at most ~5 doublings over the whole
 life of the thread, each announced via `reloc_epoch`.
 
-Growth cannot be removed entirely: `interpreter.rs:4857-4861` documents that a
-`Method.invoke` re-entry pushes frames on a path *not* bounded by
-`max_stack_depth`, so a hard capacity would be a new panic surface. The epoch is
-the honest answer instead.
+Growth cannot be removed entirely: the "S-bytebuddy r1" comment at
+`interpreter.rs:4979` documents that a `Method.invoke` re-entry pushes frames on
+a path *not* bounded by `max_stack_depth`, so a hard capacity would be a new
+panic surface. The epoch is the honest answer instead.
 
 ---
 
 ## 3. Drop-in compatibility (the hard constraint)
 
-`interpreter.rs` was off-limits, and it holds 691 `thread.frames[…]` index
+`interpreter.rs` was off-limits, and it holds 652 `thread.frames[…]` index
 sites plus `.iter()`, `.push`, `.pop`, `.last()`, `.last_mut()`, `.get_mut()`,
 `.truncate()`, `.len()`, `.is_empty()`. The rest of the VM adds
 `for f in &thread.frames`, `for f in &mut thread.frames`, and — the awkward
 one — `&self.thread.frames` passed where `&[Frame]` is expected
-(`vm_exec.rs:1985`, `:2285`, `:7029` → `stackwalker::capture_full_trace` /
+(`vm_exec.rs:2193`, `:2493`, `:7538` → `stackwalker::capture_full_trace` /
 `capture_frames_no_lines`, both `fn(… , frames: &[Frame])`).
+
+The repo-wide method surface on the merged tree, re-derived after the
++3,919-line interpreter drift, is exactly:
+
+```
+702 [   80 .len   77 .iter   22 .push   15 .last   5 .last_mut
+  4 .pop   4 .is_empty   2 .get_mut   2 .get   1 .truncate   1 .insert
+  1 .clear
+```
+
+(`.clone` and one `.insert` in that tally belong to unrelated `frames` fields —
+`debug/ids.rs`'s `HashMap`, `native-builtins/src/xml_stax.rs`'s namespace
+scopes, `vm_init.rs`'s `trace.frames` — not `JvmThread::frames`.) No method
+outside the provided surface appears.
 
 That last requirement is why `FrameStack` is a **contiguous** wrapper and not a
 chunked arena: a chunked arena cannot implement `Deref<Target = [Frame]>`, and
@@ -104,7 +128,10 @@ Provided surface:
 
 Audited for slice-only / `Vec`-only uses that would break: no `mem::take`,
 `mem::replace`, `mem::swap`, `as_ptr`, `drain`, `retain`, `swap_remove`,
-`split_off`, `sort*`, `clone` on `JvmThread::frames` anywhere in the repo. The
+`split_off`, `sort*`, `extend`, `append`, `resize`, `reserve`, `capacity`,
+`to_vec`, `clone` on `JvmThread::frames` anywhere in the repo (the two
+`mem::take` hits are `VirtualThread::frozen_frames`, a different field; the new
+`vm/src/vm/realms/` tree does not touch `.frames` at all). The
 `Vec<Frame>` signatures in `threading/virtual_threads.rs` (`freeze_frames` /
 `thaw_frames` / `park_with_frames`) have no callers that pass
 `JvmThread::frames`, so they are untouched; `From<Vec<Frame>>` /
@@ -191,10 +218,11 @@ It is fed by `JvmThread::recycle_frame`, from the branch that used to simply
 this is a strict improvement over the previous behaviour and never competes with
 the thread-owned pools.
 
-That last point is deliberate. `interpreter.rs:6970-6975` records a prior
-attempt ("P4 reverted") that routed the uncached path through the *thread* pools
-and hung the BouncyCastle suites (rc 0 → 124). Nothing here touches those pools'
-dynamics: the cached invoke path's pool behaviour is bit-for-bit unchanged.
+That last point is deliberate. `interpreter.rs:7197` records a prior attempt
+("NOTE (P4 reverted)") that routed the uncached path through the *thread* pools
+and hung the BouncyCastle suites (bc-asn1/crypto/crypto-prng, rc 0 → 124).
+Nothing here touches those pools' dynamics: the cached invoke path's pool
+behaviour is bit-for-bit unchanged.
 
 `init_locals_pooled` is now a one-line wrapper over `init_locals_from_parts`, so
 the pooled and unpooled arms cannot drift; the redundant `init_locals` was
@@ -203,7 +231,7 @@ removed.
 ### 5.2 `padded_bytecode` per-frame copy
 
 `padded_bytecode` copies the whole method body into a fresh `Arc<[u8]>` on every
-call. `Frame::new` did that per frame; so does `interpreter.rs:6981` on the
+call. `Frame::new` did that per frame; so does `interpreter.rs:7208` on the
 uncached invoke path.
 
 **Content-addressed interning would be unsound here** and was rejected:
@@ -214,6 +242,19 @@ from `analyze(code, exception_table)` — which depends on the method's
 byte-identical `Code` and different handler ranges; merging their Arcs would
 serve method B's liveness from method A's handler edges, under-approximating the
 live-locals mask and dropping a GC root.
+
+There is now a *second* consumer of `Frame::code` pointer identity, landed on
+`dev` after this wave's brief was written: `reader/src/quickened.rs::intern`
+keys the quickened instruction stream on `(code.as_ptr(), code.len())`
+(`interpreter.rs:7872 quickened_for_frame`, dispatch site `:10364-10366`). That
+one is content-only — `QuickenedCode::build` is a pure pre-decode of
+`Instruction::decode` over the bytes, with no constant-pool dependence — and its
+`Some` entries pin a strong `Arc<[u8]>`, so address recycling cannot produce a
+wrong hit. Method-identity keying is therefore safe for it too, and is in fact
+**complementary**: two frames of the same method now share one code allocation,
+so the quickened table hits where it previously rebuilt and re-interned under a
+fresh address. (Content-addressed interning would also have been safe for
+*this* table — it is `local_liveness` that rules it out.)
 
 So the memo is keyed on **method identity**:
 
@@ -290,27 +331,35 @@ let frame: &mut Frame = unsafe { &mut *fp };
 
 Suggested landing order, smallest blast radius first:
 
-1. `interpreter.rs:10364-10395` only — one `let frame = …` hoisted across the
-   six re-indexes in the single dispatch site. Measure.
+1. `interpreter.rs:10364-10400` only — one `let frame = …` hoisted across the
+   eight re-indexes in the single dispatch site (`code.as_ptr()`,
+   `quickened_for_frame`, the two in `Instruction::decode`, the three in its
+   error-message closure, and the `pc` write-back). Measure.
 2. The straight-line opcode arms that already do
-   `let frame = &mut thread.frames[frame_idx];` (e.g. `interpreter.rs:7813`) —
-   pure win, no aliasing change.
-3. The invoke path, using `reserve_stable(1)` + epoch assert.
+   `let frame = &mut thread.frames[frame_idx];` (e.g. `interpreter.rs:8153`,
+   `:12384`) — pure win, no aliasing change.
+3. The invoke path around `interpreter.rs:7176-7213`, using `reserve_stable(1)`
+   + epoch assert.
 
 Do **not** hoist across `capture_stack_trace`, GC root scans
-(`scan_frame_roots`), exception unwinding, or JVMTI callbacks — they all take
-`&thread.frames` or iterate it, which violates rule 1.
+(`scan_frame_roots`, `interpreter.rs:3347/3365/3831`), exception unwinding, or
+JVMTI callbacks — they all take `&thread.frames` or iterate it, which violates
+rule 1.
 
 ### 6.2 One-line bytecode fix on the uncached invoke path
 
-`interpreter.rs:6981` currently reads:
+`interpreter.rs:7208` — inside the `Frame::new_from_arcs(...)` call that starts
+at `:7202`, in `pub fn execute` (`:4956`) — currently reads:
 
 ```rust
 crate::runtime::frame::padded_bytecode(&code_attr.code),
 ```
 
-`class_id`, `method_name` and `method_descriptor` are all in scope at that call
-(they are passed to `Frame::new_from_arcs` on the adjacent lines). Replace with:
+`class_id: ClassId`, `method_name: &str` and `method_descriptor: &str` are all
+`execute`'s own parameters and are in scope at that line (verified on
+`6495a191c`). They are only *borrowed* by the adjacent
+`Arc::from(method_name)` / `Arc::from(method_descriptor)` arguments, so
+evaluation order is not a problem. Replace with:
 
 ```rust
 crate::runtime::frame::padded_bytecode_for_method(
@@ -326,9 +375,9 @@ entry. Semantics are identical: same bytes, same `>= 2` trailing zero bytes,
 same `Arc<[u8]>`, and distinct methods still get distinct Arcs (which is what
 `local_liveness.rs` requires — see §5.2).
 
-The other `padded_bytecode` call sites (`jit/helpers.rs:1724`,
-`interpreter.rs:5707/22787/31212/34226/35106/35679/36316/40272`) run once per
-method *resolution*, not per frame, and should stay as they are.
+The other `padded_bytecode` call sites (`jit/helpers.rs`, and
+`interpreter.rs:5854/23591/31228/31288/32238/35300/36186/36762/41510`) run once
+per method *resolution*, not per frame, and should stay as they are.
 
 ### 6.3 Optional: pooling the uncached invoke path further
 
@@ -388,3 +437,34 @@ lives in `classloading/`, not here.
 * **Sizing `FRAME_STACK_INITIAL_STABLE_CAP`** is a guess (256). If a profile
   shows relocations happening in steady state on a real workload, raise it or
   derive it from `config.max_stack_depth` with a per-thread cap.
+* **Quickening interaction, worth measuring.** `Frame::new` now shares one code
+  allocation across frames of the same method, which should raise the hit rate
+  of `reader/src/quickened.rs::intern` on `Owned` frames. Adopting §6.2 extends
+  that to the uncached invoke path, where it matters most. Nobody has measured
+  it; the mechanism is sound either way.
+
+---
+
+## 9. Merge / basis note
+
+This branch was originally cut from `e4e4053bb` (= `origin/main`, 2026-07-23),
+not from `dev`. It was merged onto `dev` = `6495a191c34fcf701c7c168517e6a13f462fc3dc`
+(clean, no conflicts) and every survey and citation above was **re-derived on
+the merged tree**, not on the original base. Specifically re-verified after the
+merge:
+
+* the repo-wide `.frames` method surface (§3) — unchanged set, so the
+  `FrameStack` API is still a complete drop-in across the +3,919 lines of
+  `interpreter.rs` drift;
+* the 622 `thread.frames[frame_idx]` count (identical) and the dispatch-site
+  re-index count (6 → 8, because of quickening);
+* the uncached invoke path moving `6981 → 7208`, and that `class_id`,
+  `method_name: &str`, `method_descriptor: &str` are all still in scope there;
+* `local_liveness.rs:96` (unchanged) and the newly-landed
+  `reader/src/quickened.rs::intern` — the second code-pointer-keyed cache, which
+  did not exist when the brief was written and which this design had to be
+  re-checked against (§5.2);
+* `dev`'s own edits to the two owned files (`frame.rs`: the
+  `class_disables_interp_fast_path` doc rewrite plus the new
+  `Frame::cached_method()`; `jvm_thread.rs`: the `handle_slots` /
+  `handle_scope_bases` fields) — neither conflicts with anything here.
