@@ -347,6 +347,13 @@ impl Aarch64Emitter {
     ///
     /// The flag is sticky: once set it stays set, so a single check after all
     /// emission/patching is sufficient.
+    ///
+    /// The production reader is `aarch64_backend::emit_machine_code`, which
+    /// checks it after the branch/literal patch loops and returns `None`
+    /// (bail to the interpreter) when set. That check was missing until
+    /// 2026-07-26 — this flag existed, was documented as the release-build
+    /// protection, and had no caller outside these tests, so a release
+    /// `aarch64` build emitted truncated branches as executable code.
     #[inline]
     pub fn overflowed(&self) -> bool {
         self.overflow
