@@ -713,3 +713,262 @@ fn charseq_char_at_null_receiver_deopts() {
     assert_eq!(r, i64::MIN, "null CharSequence receiver must deopt");
     assert_one_deopt_after(before, "null-receiver CharSequence.charAt");
 }
+
+
+// --- COMPACT-laid-out receivers (BUG-STRING-CODER-COMPACT-20260726) --------
+//
+// Every test above forges a LEGACY instance (uniform 16-byte `Value` cells,
+// `GC_FLAG_COMPACT` clear) behind a fake `string_class_id` that has no
+// registered `CompactLayout`, so they only ever exercise the emitters' legacy
+// arm. The compact arm is what production actually runs, and it was reading
+// `coder` and `hash` four bytes past their real addresses: `coder` landed on
+// `hash` and `hash` landed on `hashIsZero`.
+//
+// `coder` is 0 (LATIN1) for nearly every string and `hash` is 0 until someone
+// asks for it, so the misread was invisible until a receiver's lazy hash cache
+// was populated — at which point `length()` computed
+// `value.length >> (hash & 31)`. H2's interned `"PUBLIC"` schema name (a
+// `HashMap` key, so hashed) has `hashCode() == -1924094359`, low five bits 9:
+// `6 >> 9 == 0`. H2 persisted `CREATE SEQUENCE ""."SEQ1"` and could not reopen
+// the database — see
+// `docs/known-issues/h2/h2-jitban-schema-not-found-on-reconnect.md`.
+
+/// Dense-registry-safe class id for the compact tests. `register_class_layout`
+/// indexes a dense `Vec` by class id, so this must stay small — unlike
+/// [`STRING_CLASS_ID`], which is never registered.
+const COMPACT_STRING_CLASS_ID: u32 = 7;
+
+/// Register the real JDK25 `java/lang/String` compact layout for
+/// [`COMPACT_STRING_CLASS_ID`]: `value:[B` at 0, `coder:B` at 8, `hash:I` at
+/// 12, `hashIsZero:Z` at 16, 24-byte body — each field at its natural Java
+/// width with no tag prefix. Idempotent; safe under the test harness's
+/// parallel threads.
+fn compact_string_class_id() -> u32 {
+    use cratonvm_types::{register_class_layout, CompactLayout, FieldStorageKind};
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        register_class_layout(
+            COMPACT_STRING_CLASS_ID,
+            std::sync::Arc::new(CompactLayout {
+                field_offsets: vec![0, 8, 12, 16],
+                is_ref: vec![true, false, false, false],
+                field_kinds: vec![
+                    FieldStorageKind::Reference,
+                    FieldStorageKind::Byte,
+                    FieldStorageKind::Int,
+                    FieldStorageKind::Boolean,
+                ],
+                ref_offsets: vec![0],
+                body_size: 24,
+            }),
+        );
+    });
+    COMPACT_STRING_CLASS_ID
+}
+
+fn compact_string_layout() -> StringFieldLayout {
+    StringFieldLayout::new(0, Some(1), 2, compact_string_class_id())
+}
+
+/// Build a COMPACT `java/lang/String` instance: `GC_FLAG_COMPACT` set,
+/// `num_slots == 4`, body packed exactly as `compact_string_class_id`'s
+/// layout describes. `hash_is_zero` is the JDK's `hashIsZero` flag — the field
+/// the buggy `hashCode()` read as if it were the cached hash.
+fn make_compact_string(value_ptr: i64, coder: u8, hash: i32, hash_is_zero: bool) -> FakeObj {
+    let mut obj = FakeObj::with_bytes(HEADER_SIZE + 24);
+    let base = obj.base();
+    unsafe {
+        std::ptr::copy_nonoverlapping(COMPACT_STRING_CLASS_ID.to_le_bytes().as_ptr(), base, 4);
+        *base.add(cratonvm_types::OBJECT_KIND_OFFSET) = ObjectKind::Object as u8;
+        *base.add(cratonvm_types::GC_FLAGS_OFFSET) = cratonvm_types::GC_FLAG_COMPACT;
+        std::ptr::copy_nonoverlapping(
+            4u32.to_le_bytes().as_ptr(),
+            base.add(cratonvm_types::NUM_SLOTS_OFFSET),
+            4,
+        );
+        let body = base.add(HEADER_SIZE);
+        std::ptr::copy_nonoverlapping(value_ptr.to_le_bytes().as_ptr(), body, 8);
+        *body.add(8) = coder;
+        std::ptr::copy_nonoverlapping(hash.to_le_bytes().as_ptr(), body.add(12), 4);
+        *body.add(16) = hash_is_zero as u8;
+    }
+    obj
+}
+
+/// `compile_unary`, but against [`compact_string_layout`] and with the
+/// receiver-class-id guard pointed at [`COMPACT_STRING_CLASS_ID`].
+fn compile_unary_compact(name: &str, descriptor: &str) -> Option<impl Fn(i64) -> i64> {
+    let layout = compact_string_layout();
+    let entry =
+        try_resolve_string_intrinsic("java/lang/String", name, descriptor, Some(layout))?.0;
+    let code: Vec<u8> = vec![0x2a, 0xb6, 0x00, 0x01, 0xac, 0, 0];
+    let compiled = compile(
+        &code,
+        code.len(),
+        1,
+        1,
+        false,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        vec![(
+            1,
+            JitDirectCall {
+                entry,
+                needs_context: false,
+                num_params: 0,
+                return_type: b'I',
+                guard_class_id: 0,
+            },
+        )],
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        HashMap::new(),
+        HashMap::new(),
+        &helpers(),
+        HashSet::new(),
+        HashMap::new(),
+        Some(layout),
+    )?;
+    Some(move |this: i64| unsafe { compiled.try_call(&[this]).expect("test JIT call") })
+}
+
+#[test]
+fn compact_string_layout_offsets_are_exact_payload_addresses() {
+    let l = compact_string_layout();
+    // COMPACT: `HEADER_SIZE + body_offset`, nothing added.
+    assert_eq!(l.value_compact_offset, HEADER_SIZE as i32, "value compact");
+    assert_eq!(l.coder_compact_offset, (HEADER_SIZE + 8) as i32, "coder compact");
+    assert_eq!(l.hash_compact_offset, (HEADER_SIZE + 12) as i32, "hash compact");
+    assert!(l.coder_compact_is_byte, "coder is a natural-width byte");
+    // LEGACY: uniform 16-byte cells, payload inside each.
+    assert_eq!(l.value_legacy_offset, (HEADER_SIZE + 8) as i32, "value legacy");
+    assert_eq!(
+        l.coder_legacy_offset,
+        (HEADER_SIZE + SLOT_SIZE + 4) as i32,
+        "coder legacy"
+    );
+    assert_eq!(
+        l.hash_legacy_offset,
+        (HEADER_SIZE + 2 * SLOT_SIZE + 4) as i32,
+        "hash legacy"
+    );
+    // The old scheme derived legacy from compact by a fixed +8, which is only
+    // right for field indices 0 and 1 — `hash` (index 2) came out 12 bytes low.
+    assert_ne!(l.hash_legacy_offset, l.hash_compact_offset + 8);
+}
+
+#[test]
+fn compact_string_length_ignores_cached_hash() {
+    let f = compile_unary_compact("length", "()I").expect("length must register");
+    // -1924094359 is "PUBLIC".hashCode(); its low five bits are 9, so a
+    // `value.length >> hash` misread answers 0 for any string shorter than 512.
+    for (s, hash) in [
+        ("PUBLIC", -1_924_094_359i32),
+        ("hello", 99_162_322),
+        ("x", 120),
+        ("", 0),
+    ] {
+        let (bytes, coder) = encode(s);
+        let arr = make_byte_array(&bytes);
+        let strobj = make_compact_string(arr.ptr(), coder as u8, hash, hash == 0);
+        assert_eq!(f(strobj.ptr()) as i32, ref_length(s), "length({s:?})");
+    }
+    // UTF-16 receiver: `coder == 1` must be read from `coder`, not from `hash`.
+    let s = "A\u{4e2d}Z";
+    let (bytes, coder) = encode(s);
+    assert_eq!(coder, 1);
+    let arr = make_byte_array(&bytes);
+    let strobj = make_compact_string(arr.ptr(), coder as u8, -1_924_094_359, false);
+    assert_eq!(f(strobj.ptr()) as i32, 3, "UTF-16 length under a cached hash");
+}
+
+#[test]
+fn compact_string_is_empty_ignores_cached_hash() {
+    let f = compile_unary_compact("isEmpty", "()Z").expect("isEmpty must register");
+    let (bytes, coder) = encode("PUBLIC");
+    let arr = make_byte_array(&bytes);
+    let strobj = make_compact_string(arr.ptr(), coder as u8, -1_924_094_359, false);
+    assert_eq!(f(strobj.ptr()), 0, "a 6-char string is not empty");
+}
+
+#[test]
+fn compact_string_hash_code_reads_hash_not_hash_is_zero() {
+    let f = compile_unary_compact("hashCode", "()I").expect("hashCode must register");
+    // Populated cache → returned verbatim.
+    let (bytes, coder) = encode("PUBLIC");
+    let arr = make_byte_array(&bytes);
+    let strobj = make_compact_string(arr.ptr(), coder as u8, ref_hash("PUBLIC"), false);
+    assert_eq!(f(strobj.ptr()) as i32, ref_hash("PUBLIC"), "cached hash");
+    // Empty cache with `hashIsZero == true` — the buggy read returned that
+    // flag (1) instead of recomputing 0.
+    let empty = make_byte_array(&[]);
+    let strobj = make_compact_string(empty.ptr(), 0, 0, true);
+    assert_eq!(f(strobj.ptr()) as i32, 0, "\"\".hashCode()");
+    // Cold cache on a non-empty string → recompute.
+    let (bytes, coder) = encode("hello");
+    let arr = make_byte_array(&bytes);
+    let strobj = make_compact_string(arr.ptr(), coder as u8, 0, false);
+    assert_eq!(f(strobj.ptr()) as i32, ref_hash("hello"), "recomputed hash");
+}
+
+#[test]
+fn compact_string_char_at_decodes_through_its_own_coder() {
+    let layout = compact_string_layout();
+    let entry = try_resolve_string_intrinsic("java/lang/String", "charAt", "(I)C", Some(layout))
+        .expect("charAt must register")
+        .0;
+    // aload_0, iload_1, invokevirtual, ireturn
+    let code: Vec<u8> = vec![0x2a, 0x1b, 0xb6, 0x00, 0x02, 0xac, 0, 0];
+    let compiled = compile(
+        &code,
+        code.len(),
+        2,
+        2,
+        false,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        vec![(
+            2,
+            JitDirectCall {
+                entry,
+                needs_context: false,
+                num_params: 1,
+                return_type: b'I',
+                guard_class_id: 0,
+            },
+        )],
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        HashMap::new(),
+        HashMap::new(),
+        &helpers(),
+        HashSet::new(),
+        HashMap::new(),
+        Some(layout),
+    )
+    .expect("charAt wrapper must compile");
+    let f = |this: i64, i: i64| unsafe { compiled.try_call(&[this, i]).expect("test JIT call") };
+    for s in ["PUBLIC", "A\u{4e2d}Z"] {
+        let (bytes, coder) = encode(s);
+        let arr = make_byte_array(&bytes);
+        // Non-zero cached hash: the coder read must not pick it up.
+        let strobj = make_compact_string(arr.ptr(), coder as u8, ref_hash(s), false);
+        for i in 0..s.encode_utf16().count() {
+            assert_eq!(f(strobj.ptr(), i as i64) as i32, ref_char_at(s, i), "charAt({s:?},{i})");
+        }
+    }
+}
