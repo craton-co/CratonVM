@@ -3079,5 +3079,249 @@ The `testng`-jar-stripping workaround recorded under Blocker 1 is obsolete and
 should not be used; it silently removes the engine those classes exist to test.
 
 **Blocker 2** (`Class.getDeclaredMethods()` `NoSuchMethodError` inside a
-dynamically-`defineClass`'d CGLIB class's `<clinit>`) is untouched by this
-session and remains open.
+dynamically-`defineClass`'d CGLIB class's `<clinit>`) was untouched by this
+session -- it is closed by "AOT follow-up 10" immediately below, which found it
+was never a resolution failure at all: the generated class file itself was
+corrupt, because `String.hashCode()` was JIT-miscompiled.
+
+## 2026-07-26 AOT follow-up 10 -- Blocker 2 FIXED, the CGLIB cross-test residual FIXED (40/40), a third blocker behind them FIXED; `endToEndTestsForBeanOverrides` runs all 175 tests again (13 failures, one family, fully characterised)
+
+Worktree `/data/data/wt-testngresid-20260726` (branch `fix/aot-cluster-20260726`,
+from `origin/dev` `95e4d9929`, with the concurrent session's Blocker-1 fix
+`34201b21e` merged in). Azure host `20.83.144.174`, real JDK 25. No subagents,
+per this task's standing instruction.
+
+**Scoreboard**
+
+| | before | after |
+|---|---|---|
+| `ApplicationContextAotGeneratorTests` | 38/40 | **40/40** |
+| `AotIntegrationTests#endToEndTestsForBeanOverrides` | aborts on test class #1 (`failOnError=true`) | **runs all 175, 13 failures** |
+| `test.context.testng.*` | 8x LOADERR | all discover and run (Blocker 1, concurrent session) |
+
+Three genuine VM bugs fixed. Every one had been mis-hypothesised in this doc
+before, and every one was found by reducing the failure to a standalone probe
+rather than by reasoning about the Spring stack. The probes live in
+`/data/data/aot20260726/src/` on the host.
+
+### Fix 1: Blocker 2 -- `String.hashCode()` returns garbage from JIT-compiled code
+
+**This doc's own hypothesis for Blocker 2 was wrong.** It read the
+`NoSuchMethodError: java.lang.Class.getDeclaredMethods()` as "a method-RESOLUTION
+failure specific to a dynamically-`defineClass`'d class's own constant pool". It
+is nothing of the kind: the generated *class file itself* was corrupt, and the
+corruption came from a JIT miscompilation of `String.hashCode()`.
+
+Reduced to a 0.3s Spring-free probe (`CglibProbe.java`: one `Enhancer.create()`
+on a two-method class). With JIT it died with `AbstractMethodError:
+...$$FastClassByCGLIB$$...<init>(Ljava/lang/Class;)V has no Code attribute`;
+with `--nojit` it passed. Dumping both runs' generated classes
+(`-Dcglib.debugLocation=...`, which works on CratonVM) showed the JIT run's
+class files were 60% LARGER than the interpreter's (12297/6124/4031 bytes vs
+7321/5830/2585 -- the interpreter's sizes match HotSpot's exactly), with a
+**duplicated constant pool** (three separate `Utf8 java/lang/Object` entries)
+and, on one class, a `Code` attribute whose `attribute_name_index` was **0**
+(`javap` renders it as `: length = 0x12 (unknown attribute)`).
+
+`CRATONVM_JIT_DENY` / `CRATONVM_JIT_BISECT_SKIP` narrowed it, with no rebuild, to
+exactly one method: `org.springframework.asm.SymbolTable.hash` -- six tiny
+private static overloads that all reduce to `0x7FFFFFFF & (tag +
+value.hashCode())`. A pure-Java probe of that shape then showed the defect with
+no ASM involved at all: from ~1k iterations on (i.e. once the method tiers up),
+`String.hashCode()` returned 0 or garbage, and `String.length()` intermittently
+did too.
+
+**Root cause** (`jit/src/lib.rs`, `StringFieldLayout::new`): the compact-layout
+branch biased a *reference* field's offset by `-FIELD_CELL_PAYLOAD64_OFFSET` --
+so the x64 call sites' own `+ FIELD_CELL_PAYLOAD64_OFFSET` lands on the bare
+pointer -- but returned a *primitive* field's offset unbiased. Compact-layout
+primitives are just as bare: natural width, naturally aligned, no tag word (see
+`classloading/src/class.rs`'s `CompactLayout` builder and
+`types/src/field_layout.rs::read_compact_field`). Every `x64.rs` consumer adds
+its own `+ FIELD_CELL_PAYLOAD32_OFFSET`, so each read landed 4 bytes past the
+field. For JDK 25's `java/lang/String` (`value:[B @0`, `coder:B @8`,
+`hash:I @12`, `hashIsZero:Z @16`) that put the `coder` read on `hash` and the
+`hash` read on `hashIsZero` + padding. `hashCode()` returned whatever garbage
+sat there or, when that read zero, recomputed the hash with `hash` misread as
+`coder` -- shifting the char count right by `hash & 31` and returning 0.
+
+Why the blast radius stayed narrow enough to go unnoticed: the intrinsic only
+fires on a **statically-String-typed** receiver. `HashMap`, `Objects.hash`,
+`Arrays.hashCode` and friends all call `invokevirtual java/lang/Object.hashCode`
+and were unaffected. `SymbolTable.hash` is not so lucky -- it folds
+`String.hashCode()` straight into the constant-pool dedup key, so once it tiered
+up, dedup stopped working and (via `MethodWriter.putMethodInfo`'s
+`addConstantUtf8(Constants.CODE)`) the `Code` attribute name index came out 0.
+Every ASM- or cglib-generated class in the process was born corrupt.
+
+Fixed by biasing primitives by `-FIELD_CELL_PAYLOAD32_OFFSET` in the same
+branch. `String.coder` additionally now loads at its declared **8-bit** width:
+at natural width it is one byte followed by alignment padding that nothing
+zeroes, so the old 32-bit load folded that padding into the value (the legacy
+16-byte tagged cell stores the same value little-endian and `coder` is only ever
+0 or 1, so the narrow load is correct for both representations).
+
+The `layout_constant_inventory` tripwire in `jit/src/lib.rs` -- added by the
+2026-07-26 header-shrink audit precisely to catch a layout constant appearing in
+a file where it never appeared before -- fired on the new
+`FIELD_CELL_PAYLOAD32_OFFSET` use and forced the inventory and both
+`docs/internal/arch-2026-07-26` files to be updated in the same change. It
+worked exactly as designed.
+
+Verified: `CglibProbe` passes, and the classes it generates are now
+**byte-identical between JIT and `--nojit`** (and the same sizes HotSpot emits).
+
+**Merge note.** A concurrent session reached the same root cause from the other
+end -- lifting the `org/h2` JIT ban -- and landed a strictly more thorough fix
+first (`13055f75c`, `234a45b98`): it gives `StringFieldLayout` a SEPARATE
+compact and legacy offset per field instead of one offset plus a derived `+8`,
+which also repairs the legacy 16-byte-cell path (where the fixed `+8` was only
+correct for field indices 0 and 1, so `hash` resolved 12 bytes low). Their
+version is what is on `dev`; this session's narrower bias fix was dropped at
+merge time in favour of it. The diagnosis, the probes and the conclusion below
+are unchanged -- two independent investigations converging on the same
+`String.hashCode()`-returns-garbage defect from opposite directions is the
+strongest confirmation either of them could have had.
+
+### Fix 2: the CGLIB cross-test residual -- a generated-name collision, not a cache-key problem
+
+Follow-ups 8 and 9 both chased `config_enhancer_class_cache`'s key shape and
+both concluded, correctly, that the key was fine and the double-MISS was "the
+anomaly". The double-MISS was never the bug -- it is the *correct* answer for
+two genuinely different `CglibConfiguration` classes loaded by two different
+`@CompileWithForkedClassLoader` loaders. The bug is what happens next, and it
+was visible all along in the unconditional `[CCE]` stderr line nobody had
+grepped:
+
+```
+[CCE] enhance: define_class_full failed for ...CglibConfiguration$$SpringCGLIB$$0:
+      IncompatibleClassChangeError { message: "... already defined by application
+      loader" } — fallback to identity
+```
+
+`cce_enhance` numbers the generated `$$SpringCGLIB$$<n>` suffix per
+`(super_loader_id, super_internal_name)` -- so the second loader's copy
+correctly drew `$$0` from its own fresh counter -- but then called
+`define_class_full(..., loader_id = 0, ...)`, hardcoded to the application
+loader. A per-loader counter is only collision-free inside a per-loader
+namespace, so the second `$$0` collided with the first and the code answered the
+collision by **returning the original, un-enhanced class**. That is exactly the
+two documented symptoms: `processAheadOfTimeUsesCglibClassForFactoryMethod`'s
+`IllegalArgumentException: class ...CglibConfiguration is not an enhanced class`
+(thrown by `Enhancer.registerStaticCallbacks` at AOT replay, on a class that
+never got a `CGLIB$SET_STATIC_CALLBACKS`) and
+`processAheadOfTimeWhenHasCglibProxyUseProxy`'s "Hello1" (the `@Bean` body
+running twice, because the un-enhanced config class was instantiated directly).
+It also explains the isolation asymmetry perfectly: one loader, no collision,
+both pass.
+
+Fixed by defining the enhancer subclass into `super_loader_id` -- the
+superclass's own loader, which is where real cglib puts it -- so each loader's
+first enhancement keeps the `$$0` name the tests hardcode in generated *source
+text*. A bounded retry (burn the counter, regenerate) covers any remaining way
+the name could still be taken, since handing back an un-enhanced class is never
+the right answer.
+
+**`ApplicationContextAotGeneratorTests` 38/40 -> 40/40**, with every
+`[CCE] enhance: defined` line in the run landing on `$$SpringCGLIB$$0` and no
+`already defined`/identity fallback anywhere.
+
+### Fix 3: a real `StringBuilder.length()` returns 0 after any Mockito mock
+
+With Blockers 1 and 2 gone, `endToEndTestsForBeanOverrides` reached real AOT
+processing and aborted (`failOnError=true`) on the first `@MockitoSpyBean` class
+with the *same* `NoSuchMethodError` symptom as Blocker 2 -- but for a different
+reason, visible in the descriptor:
+
+```
+NoSuchMethodError method="java/lang/Class.getDeclaredMethods()[Ljava/lang/reflect/Method[];"
+```
+
+Note the malformed `[Ljava/lang/reflect/Method[];`. That is precisely what
+`org.springframework.cglib.core.TypeUtils.map` emits when
+`type.substring(0, type.length() - sb.length() * 2)` fails to strip the trailing
+`[]` -- i.e. when `sb.length()` returns 0 for a `StringBuilder` that just had
+one `[` appended. Because `MethodInterceptorGenerator`'s `GET_DECLARED_METHODS`
+signature is a `static final` computed once, a single Mockito mock anywhere in
+the process poisons **every** cglib proxy generated afterwards in that loader.
+
+This is the **KNOWN REMAINING GAP** the 2026-07-23 MockitoBean session
+documented and left open, reproduced here in three seconds
+(`RealAfterMockLengthProbe.java`: mock a `StringBuilder`, then use a real one).
+Root cause, though, is not what that session assumed. `sb_set_count`'s
+3-or-more-slot branch writes the JDK 9 layout `value/coder/count` with `count`
+at slot 2. **JDK 25's `AbstractStringBuilder` declares FOUR instance fields --
+`value @0, coder @1, maybeLatin1 @2, count @3`** -- so slot 2 is `maybeLatin1`
+and the field genuinely named `count` was never written at all. That is
+invisible while CratonVM's natives are the only readers (they agree with each
+other on the wrong slot), and fatal the moment real `AbstractStringBuilder`
+bytecode runs against one of these objects -- which is what Mockito's in-place
+redefinition of `StringBuilder`/`AbstractStringBuilder` causes, since `length()`
+then cedes to the woven advice whose "not mocked" fallthrough is the original
+`getfield count:I`.
+
+Fixed additively: keep the index-based writes (every native in `lang_string.rs`
+reads them back, and the unit-test `NativeContext` mock has no class model to
+resolve names against -- it answers `Int(0)` for any name it does not know,
+which is indistinguishable from a real zero count) and mirror the value into
+`count` by name as well.
+
+Two approaches were tried and rejected first, both worth recording:
+- Resolving `count` by name on the READ side too -- breaks 12 `lang_string`
+  unit tests for the mock-context reason above.
+- Fixing it at the dispatch layer: force the registered native for a "real
+  carrier" the way the `java/net/HttpURLConnection` exemption does, keyed on a
+  null field 0. **Does not work here** -- CratonVM allocates a Mockito-mocked
+  `StringBuilder` through the same synthetic path as a real one, so a mock's
+  backing buffer is non-null too; the exemption fired for mocks as well and
+  broke `verify(mock).length()` and `when(mock.length())`. Anyone reaching for
+  the HttpURLConnection trick on another class should check this first.
+
+### `endToEndTestsForBeanOverrides`: 175 tests, 13 failures, all one family
+
+The run now completes (`ms=910642` under a load average of ~28; budget
+generously). All 13 failures are Family A -- `@MockitoBean`/`@MockitoSpyBean`
+**by-name** lookup for **constructor parameters** -- in exactly three classes:
+
+| class | failures |
+|---|---|
+| `...mockito.constructor.MockitoBeanByNameLookupForConstructorParametersIntegrationTests` | 7 |
+| `...mockito.constructor.MockitoSpyBeanByNameLookupForConstructorParametersIntegrationTests` | 5 |
+| `...mockito.typelevel.MockitoBeansByNameIntegrationTests` | 1 |
+
+All shaped like:
+
+```
+ParameterResolutionException: Failed to resolve parameter [... ExampleService service2]
+in constructor [...]: No qualifying bean of type '...ExampleService' available:
+expected single matching bean but found 4: s1,s2,s3,s4
+```
+
+**New and important**: all three classes pass **100% in normal (non-AOT) mode**
+on this same binary (7/7, 5/5, 1/1). So this is not the field-vs-constructor
+override bug follow-up 7 fixed -- it is specific to what AOT *replay* does with
+a by-name override, i.e. the AOT-generated bean definitions do not carry the
+name-based replacement, leaving all the original candidates in play for
+by-type constructor autowiring. That is a far tighter starting point than the
+"17 failures, two families, unisolated" this doc has carried since follow-up 7.
+
+**Family B appears to be gone.** The `AssertionFailedError: expected: null but
+was: ""` shape that motivated follow-ups 9b/9c does not occur anywhere in this
+run (zero `AssertionFailedError`s of any kind). The most likely explanation is
+Fix 1: a `String.hashCode()` that returns 0 for arbitrary strings will corrupt
+any map keyed by String, and the AOT generator is full of them. Not proven --
+recorded as an observation, to be reconfirmed on the next run.
+
+### Still open in the AOT cluster
+
+1. The 13 Family-A failures above (AOT-replay-only, three named classes).
+2. `TestContextAotGeneratorIntegrationTests`' `Arrays.stream`/
+   `Spliterators.spliterator` hang (follow-up 9c) -- not revisited this session;
+   note that follow-up 9c's own runs predate Fix 1, and a corrupted
+   `String.hashCode()` is a plausible contributor to a hang in
+   `AccessControl.lowest`'s map-heavy call chain, so **re-measure before
+   re-investigating**.
+3. `cglib_enhancer::fb_ref_bytecode_tests::fb_ref_splice_shifts_exception_table_by_exactly_8_bytes`
+   -- still failing, still pre-existing on `origin/dev` (confirmed again this
+   session by running the same test against this file's pre-change contents),
+   still just stale hardcoded byte-length constants.
