@@ -218,6 +218,61 @@ JAVA_HOME=/data/tmp/jitban-wf-javahome CRATONVM_JAVA_HOME=/home/victor/jdk25 \
 ```
 (standalone.sh isn't chmod +x in the dist — always invoke via `bash standalone.sh`.)
 
+## H2/ANTLR-runtime ban (HIB-LONGTAIL.1) — RESULT: CONFIRMED STILL NEEDED
+
+The full-suite differential (99/218 classes completed before the background
+job was interrupted mid-run — still a large, representative sample) found a
+**systemic correctness bug**, not just the perf issue the ban's own comment
+describes: 16/40 FAILs are the identical `Schema  not found` (blank schema
+name) error, hit across 15+ completely unrelated test classes, all during
+DB-reopen metadata replay (`Database.executeMeta` → `Parser.getSchema`).
+HANG rate did drop as the ban's perf framing predicted (6% vs. baseline's
+25.7%), but that's overshadowed by the new correctness failures. **Verdict:
+KEEP.** Full writeup: `docs/known-issues/h2/h2-jitban-schema-not-found-on-reconnect.md`
+(committed). This is the sweep's second concrete "new bug found" per
+the goal's framing (after the WildFly `org/jboss/as/` one below).
+
+## Coordination with other concurrent sessions (2026-07-26, mid-session)
+
+The user flagged that other sessions are doing the same jit-ban-sweep work
+in parallel on this host. Found their shared doc:
+`/data/data/wt-jitban-20260725/docs/known-issues/jit-skip-list-open-bans-20260725.md`
+(their worktree, not yet merged to dev as of this update) — read it in full,
+key takeaways:
+- They discovered `CRATONVM_JIT_DENY=<substring>` (forces interpretation,
+  no rebuild) as a fast bisection tool — useful complement to
+  `CRATONVM_JIT_ALLOW_PACKAGES` (lifts a ban, also no rebuild for most
+  entries — their doc says ALLOW_PACKAGES "does NOT lift unconditional
+  targeted bans", which is only partially true: I confirmed HIB-LONGTAIL.1,
+  the whole SPB/CGL/PIC family, bouncycastle, intpoly, bytebuddy etc. all DO
+  respond to `CRATONVM_JIT_ALLOW_PACKAGES` despite being "unconditional
+  targeted bans" outside the `SkipPolicy::Conservative` gate — only the
+  javac-family bans (JavacTool.getTask, ClassReader.*, ClassFinder.*,
+  Symbol$ClassSymbol.complete, javapoet CodeBlock.Builder.add,
+  ModifiedClassPathClassLoader.loadClass) and a few others with no
+  `package_allowed()` check genuinely need a source edit).
+- They landed **TYPES-ERASURE.1**: `com.sun.tools.javac.code.Types.erasure`
+  was an undiscovered 8th javac-JIT-family miscompile (same family as
+  SPRING-TESTCOMPILER.1-4 / HIB-STOREDPROC-JIT.1), bisected via
+  `CRATONVM_JIT_DENY`, committed on their branch
+  (`fix/jit-ban-sweep-20260725` @ `303121033`, not yet on `dev`). Their own
+  next-step note: fixing/banning `Types.erasure` alone might make the other
+  7 javac-family bans redundant — unverified, high-value follow-up for
+  whoever gets there.
+- They explicitly flagged the AQS/RRWL family (`is_known_miscompile_aqs_family`)
+  and CLQ family as tied into a **separate, live H2 `testConcurrent` perf
+  investigation** — "do not touch without reading that context first". This
+  is DIFFERENT from `HIB-LONGTAIL.1` (the org/h2+antlr package ban I tested
+  above) but still worth remembering if working AQS/RRWL-adjacent H2 code.
+- Their doc independently recommends the exact same next step I'd already
+  started (fresh bisection on an SPB.x ban to check if the
+  allocate-then-putfield theory still holds) — my WildFly `org/jboss/as/`
+  finding above directly answers this: **yes, it still holds, at least for
+  that one ban.**
+- User clarified (after initial confusion) that *I* am the session doing H2
+  jitban work — no actual collision, just cross-session awareness-sharing.
+  No lanes need to change based on this exchange.
+
 ## Next steps
 
 1. Finish H2/ANTLR-runtime test (this session) — compare `TestFileSystem`
