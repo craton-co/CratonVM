@@ -8,13 +8,80 @@
 //! are **reentrant**: a thread that already owns a monitor can enter it again,
 //! incrementing an entry count.
 //!
-//! The monitor table is a global structure keyed by object identity (pointer
-//! address as `usize`). Monitors are created lazily on first use.
-//!
 //! When multiple OS threads contend for the same monitor, `parking_lot::Condvar`
 //! is used to block and wake threads. Two separate condvars are used:
 //! - `entry_condvar`: wakes threads blocked on `monitorenter`
 //! - `wait_condvar`: wakes threads blocked on `Object.wait()`
+//!
+//! # Where a monitor lives (the mark word IS the monitor table)
+//!
+//! CratonVM spawns one real OS thread per Java thread, so a process-wide lock
+//! on a synchronization fast path is a hard scalability ceiling, not a
+//! theoretical one. This module therefore follows HotSpot's shape:
+//!
+//! * **Uncontended / re-entrant** locking never leaves the object's own
+//!   `mark_word` (`try_thin_lock` / `try_thin_recursive_lock` /
+//!   `try_thin_unlock`) — one CAS, no allocation, no table.
+//! * **Inflated** locking is reached through the object's own mark word too:
+//!   `MARK_INFLATED` stores the `Monitor`'s address in its upper 62 bits, so
+//!   `monitorenter` / `monitorexit` / `wait` / `notify` on an inflated monitor
+//!   are a mark-word load followed by that monitor's *own* mutex. **No global
+//!   map probe, no global lock.**
+//! * [`MonitorTable`] is only a **sharded enumeration index**: it exists so
+//!   cold operations (thread-death monitor release, GC re-key / prune,
+//!   diagnostics) can walk the set of inflated monitors, which the mark words
+//!   alone cannot enumerate. It is never consulted on a hot path.
+//!
+//! ## Mark-word monitor ownership and lifetime (READ BEFORE EDITING)
+//!
+//! A `Monitor` reachable from a mark word must outlive every thread that can
+//! load that mark word; freeing one while a thread is parked on it is a
+//! use-after-free, not a perf bug. The rule that makes the raw pointer sound:
+//!
+//! 1. **The mark word owns a strong reference.** On the inflation CAS that
+//!    publishes `MARK_INFLATED`, the publisher leaks one `Arc<Monitor>` clone
+//!    into the mark word (see [`MonitorTable::publish_inflated`]) and records
+//!    that fact in [`Monitor::mark_ref`]. So an `INFLATED` mark word is, by
+//!    construction, accompanied by a live strong reference that nothing but
+//!    the reclaim path can drop.
+//! 2. **A reader can therefore always upgrade.** `&Monitor` borrowed from the
+//!    mark word ([`monitor_from_mark`]) and `Arc<Monitor>` cloned from it
+//!    ([`monitor_arc_from_mark`]) are both sound *because* of (1): the strong
+//!    count is >= 1 for as long as the mark word says `INFLATED`.
+//! 3. **The reference is released only for a provably dead object.** There is
+//!    exactly ONE release site: `MonitorTable::prune_dead`, which the collector
+//!    calls with an **exact** set of just-swept addresses. A thread can only
+//!    load an object's mark word while holding a live reference to that
+//!    object, so a swept object's mark word has no possible reader — the
+//!    release cannot race a load.
+//!
+//!    `remap_after_gc` deliberately does **not** release. Its "absent from the
+//!    forwarding map" signal means *dead* only for a whole-heap collector; for
+//!    a partial one (G1 young/mixed, generational minor GC) an absent key is
+//!    routinely a live in-place survivor whose mark word still names the
+//!    monitor. Releasing there would be a use-after-free. The old opt-in that
+//!    did so (`CRATONVM_RECLAIM_DEAD_MONITORS`) was default-off, had therefore
+//!    never run, and is gone.
+//! 4. **Release is never the last drop under a waiter.** Any thread parked in
+//!    `block_enter` / `wait` reached there through `Arc<Monitor>`, i.e. holds
+//!    its own strong reference for the whole park. Dropping the mark-word
+//!    reference (and the registry's) therefore cannot free the monitor out
+//!    from under it, and `Monitor::mark_ref` is cleared with a `swap` so a
+//!    double release is a no-op rather than a double free.
+//! 5. **Relocation is free.** A moving collector byte-copies the header, so
+//!    the monitor pointer travels with the object and stays valid (monitors
+//!    live in the Rust heap, never the Java heap). The GC never interprets
+//!    the mark word as an object reference — see the `mark_word` handling in
+//!    `gc/src/gc.rs`, `gc/src/g1.rs`, `gc/src/gen_heap.rs`, `gc/src/region.rs`,
+//!    all of which copy it verbatim. Re-keying the enumeration index in
+//!    `remap_after_gc` is a bookkeeping detail; correctness of locking no
+//!    longer depends on it.
+//!
+//! Consequence: the historical "mark word says INFLATED but the registry has
+//! no entry" invariant violation (the audit finding 1(b) tripwire, which used
+//! to re-inflate a *second* `Monitor` and orphan every waiter on the first) is
+//! structurally impossible now. The mark word is the single source of truth;
+//! a missing index entry is repaired from it.
 
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
@@ -28,7 +95,16 @@ use crate::error::{MethodCallFailed, RuntimeError, VmError};
 // SECURITY FIX (V11): wire the L6 `monitors` registry through the lock-order
 // enforcement framework so the documented hierarchy is actually checked at
 // runtime in debug builds.
-use crate::runtime::lock_order::{LockLevel, OrderedMutex};
+//
+// ARCH-2026-07-26: the registry is now SHARDED, and every shard sits at the
+// same L6 `Monitors` level. The descending rule forbids acquiring two locks at
+// the same level, so no code path may ever hold two shard guards at once —
+// every multi-shard walk below locks exactly one shard at a time. The wrapper
+// family moved from the std-backed `OrderedMutex` to the `parking_lot`-backed
+// `OrderedPlMutex` (same level, same enforcement) because these maps are never
+// held across a panic, so poison plumbing bought nothing but `.expect()` noise
+// at every call site.
+use crate::runtime::lock_order::{LockLevel, OrderedPlMutex};
 use crate::threading::jvm_thread::ThreadId;
 use crate::types::ObjectRef;
 
@@ -78,22 +154,24 @@ pub fn mon_enter_dump_enabled() -> bool {
     *FLAG.get_or_init(|| std::env::var("CRATONVM_DBG_MONENTER").is_ok())
 }
 
-/// PERF (monitor-leak reclaim): opt-in gate for reclaiming inflated-monitor
-/// registry entries whose object is dead. See `MonitorTable::remap_after_gc`
-/// for the full safety rationale — in short, "absent from the GC forwarding
-/// map" is a reliable *dead* signal **only for a whole-heap collection**; for
-/// partial collectors (G1 young/mixed, generational minor GC) an absent key may
-/// be a live in-place survivor, so dropping it would desync the registry from
-/// the surviving object's `INFLATED` mark word. Until the GC can pass a
-/// dead-address set (flagged cross-file follow-up), monitor reclamation is
-/// **default OFF** so the registry behaviour stays byte-identical. CAS-lock
-/// reclamation is unconditional (safe for all collectors) and does NOT consult
-/// this flag. Read once and cached so the per-GC check is a single relaxed load.
-#[inline]
-fn reclaim_dead_monitors_enabled() -> bool {
-    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var_os("CRATONVM_RECLAIM_DEAD_MONITORS").is_some())
-}
+// REMOVED (ARCH-2026-07-26): `reclaim_dead_monitors_enabled()` /
+// `CRATONVM_RECLAIM_DEAD_MONITORS`.
+//
+// That flag gated reclaiming inflated-monitor entries in `remap_after_gc` on
+// the "absent from the GC forwarding map ⇒ dead" signal. That signal is only
+// valid for a *whole-heap* collector; under a partial collector (G1
+// young/mixed, the generational minor GC) an absent key is frequently a live
+// in-place survivor. So the branch could drop the registry's `Arc` for a LIVE
+// object — and now that the mark word is what locking dereferences, doing so
+// would be a use-after-free rather than the old (already wrong) "registry
+// miss, re-inflate a second monitor and orphan the waiters".
+//
+// The flag was default-OFF and therefore had never run, so removing it loses
+// no behaviour. Sound monitor reclamation needs an EXACT dead set, which is
+// precisely what `MonitorCleanup::prune_dead` receives — that path is
+// unconditional, on by default, and now releases the mark-word reference too,
+// so it genuinely frees. Extending an exact dead set to the moving collectors
+// is the flagged cross-file follow-up recorded on `remap_after_gc`.
 
 /// KC16-watchdog: callback installed by the VM that emits the current
 /// thread's frame chain from a wait-site context. Set by `SharedVm`
@@ -141,10 +219,13 @@ fn emit_wait_site_frames(thread_id: ThreadId) {
 // The inflation path is the only one that allocates a `Monitor`. It must
 // publish the mark word via `compare_exchange` against the observed
 // pre-inflation mark, *not* an unconditional store, to avoid clobbering a
-// concurrent CAS (e.g. another thread releasing a thin lock back to
-// NEUTRAL). `MonitorTable::inflate_locked` enforces this; the bare
-// `inflate_unchecked` helper (kept for diagnostics / future reuse) is
-// `pub(crate)` and documented as unsafe in that respect.
+// concurrent CAS (e.g. another thread releasing a thin lock back to NEUTRAL).
+// `MonitorTable::publish_inflated` is the single place that does it, and it
+// also welds the CAS to the strong-reference transfer that keeps the published
+// `Monitor` alive (see the module-level lifetime rules). There is deliberately
+// no unchecked variant: an unconditional store here corrupts the lock state
+// machine, and a publish without the reference transfer creates a dangling
+// mark word.
 
 /// Attempt thin-lock acquisition via a single CAS on the mark word.
 ///
@@ -242,59 +323,92 @@ pub fn try_thin_unlock(header: &ObjectHeader, thread_id: u32) -> Result<Option<u
     }
 }
 
-/// Inflate a thin lock (or a neutral mark) to a heap-allocated `Monitor`
-/// **without** CAS-protecting the publish. Visibility is restricted to the
-/// crate so that the only legitimate caller is `MonitorTable::inflate_locked`,
-/// which holds the registry mutex and performs its own `compare_exchange`
-/// against the observed mark word before/instead of calling this helper.
-///
-/// # Safety / correctness contract
-///
-/// This helper publishes the new mark word via an **unconditional**
-/// `store(Release)`. That is only sound when the caller has *already
-/// confirmed*, via CAS, that the mark word still holds the value it observed
-/// — otherwise this store will silently clobber a concurrent CAS (e.g. a
-/// thin-lock owner releasing back to NEUTRAL, or another thread's earlier
-/// inflation publishing a different `Arc<Monitor>`), corrupting the lock
-/// state machine. The bare helper is therefore named `_unchecked` and is
-/// not part of the public API; new call sites must instead use
-/// `MonitorTable::inflate_locked`, which routes inflation through the
-/// registry mutex and performs the CAS publish itself.
-///
-/// If `current_owner` is `Some((tid, recursion))`, the new monitor is
-/// pre-acquired by that thread with the given entry count, atomically
-/// transferring ownership from the thin-lock representation. This is used
-/// when the current owner inflates its own lock (to support deeper recursion)
-/// and also when a contending thread inflates a lock held by someone else.
-///
-/// Returns the leaked `Monitor` pointer. Callers are responsible for keeping
-/// the `Monitor` alive (e.g. by stashing an `Arc<Monitor>` in
-/// `MonitorTable::monitors`) so that the GC remap path can find it.
-#[inline]
-#[allow(dead_code)] // retained for future direct inflation paths; the in-tree
-                    // inflation goes through `MonitorTable::inflate_locked`,
-                    // which inlines the same logic under its registry mutex.
-pub(crate) fn inflate_unchecked(
-    header: &ObjectHeader,
-    monitor: Arc<Monitor>,
-    current_owner: Option<(u32, u8)>,
-) -> *mut Monitor {
-    if let Some((tid, recursion)) = current_owner {
-        monitor.enter_with_recursion(ThreadId(tid as u64), (recursion as u32) + 1);
+// ---------------------------------------------------------------------------
+// Mark-word → Monitor access (the hot inflated path; takes NO global lock)
+// ---------------------------------------------------------------------------
+
+/// Decode the `Monitor` address out of a mark-word snapshot, or `None` if the
+/// snapshot is not in `MARK_INFLATED` state (or carries a null pointer, which
+/// no legitimate publish can produce — `make_inflated` rejects it).
+#[inline(always)]
+fn monitor_ptr_from_mark(mark: u64) -> Option<*const Monitor> {
+    if ObjectHeader::mark_state(mark) != types::MARK_INFLATED {
+        return None;
     }
-    // Cast through *const to *mut — `Arc::as_ptr` only exposes the const
-    // form, but the mark word stores an opaque address tag, not a reference
-    // that gets dereferenced through this pointer.
-    let raw = Arc::as_ptr(&monitor) as *mut Monitor;
-    // SAFETY: Monitor is naturally 8-byte aligned (it contains a Mutex which
-    // has at least pointer alignment); the low 2 bits are therefore zero and
-    // safe to use as the state tag.
-    let new_mark = ObjectHeader::make_inflated(raw as usize);
-    // NOTE: unconditional store — see the function-level doc for the
-    // CAS-correctness contract. Direct callers outside
-    // `MonitorTable::inflate_locked` will violate the lock state machine.
-    header.mark_word.store(new_mark, Ordering::Release);
-    raw
+    let p = ObjectHeader::inflated_monitor(mark) as *const Monitor;
+    if p.is_null() {
+        None
+    } else {
+        Some(p)
+    }
+}
+
+/// Borrow the `Monitor` an `INFLATED` mark word points at.
+///
+/// This is *the* inflated fast path: a mark-word load plus a pointer deref,
+/// with no registry probe and therefore no global lock and no atomic refcount
+/// traffic. Use this whenever the borrow cannot outlive the caller's own
+/// reference to the object (i.e. everything except handing a monitor to a
+/// thread that is about to block on it — that needs [`monitor_arc_from_mark`]).
+///
+/// # Safety argument
+///
+/// See the module-level "Mark-word monitor ownership and lifetime" section:
+/// an `INFLATED` mark word owns one strong `Arc<Monitor>` reference, released
+/// only for an object the collector has proved dead — and a dead object has
+/// no possible mark-word reader. The returned lifetime is unconstrained, so
+/// callers must keep it within the scope in which they hold `obj_ref`.
+#[inline(always)]
+fn monitor_from_mark<'a>(mark: u64) -> Option<&'a Monitor> {
+    // SAFETY: as argued above, the pointee is kept alive by the strong
+    // reference the mark word itself owns.
+    monitor_ptr_from_mark(mark).map(|p| unsafe { &*p })
+}
+
+/// Clone an owned `Arc<Monitor>` out of an `INFLATED` mark word.
+///
+/// Needed when the monitor must outlive the caller's borrow of the object —
+/// notably the contended path, where the caller parks on the monitor after
+/// releasing everything else, and the thread-termination path, which keeps a
+/// stable handle across a moving GC.
+///
+/// # Safety argument
+///
+/// Same as [`monitor_from_mark`]: the mark word's own strong reference keeps
+/// the strong count >= 1 across the increment, so reconstituting an `Arc` from
+/// the raw pointer is sound.
+#[inline]
+fn monitor_arc_from_mark(mark: u64) -> Option<Arc<Monitor>> {
+    let p = monitor_ptr_from_mark(mark)?;
+    // SAFETY: `p` came from `Arc::as_ptr` on a still-live allocation (the
+    // mark word owns a strong reference). `increment_strong_count` +
+    // `from_raw` is the documented way to clone through a raw pointer.
+    unsafe {
+        Arc::increment_strong_count(p);
+        Some(Arc::from_raw(p))
+    }
+}
+
+/// A monitor reached either straight from a mark word (the normal case, free)
+/// or from the address-keyed index (the `ThreadId > u32::MAX` legacy monitors,
+/// which have no mark-word home).
+///
+/// Exists so the shared code below can be written once without forcing an
+/// `Arc` clone on the path that does not need one.
+enum MonitorHandle<'a> {
+    Borrowed(&'a Monitor),
+    Owned(Arc<Monitor>),
+}
+
+impl std::ops::Deref for MonitorHandle<'_> {
+    type Target = Monitor;
+    #[inline]
+    fn deref(&self) -> &Monitor {
+        match self {
+            MonitorHandle::Borrowed(m) => m,
+            MonitorHandle::Owned(m) => m,
+        }
+    }
 }
 
 /// Look up an `&ObjectHeader` from an `ObjectRef`. Mirrors the pattern used by
@@ -330,12 +444,30 @@ fn tid_to_u32(tid: ThreadId) -> Option<u32> {
 /// Each monitor tracks its owner thread and re-entry count. Two condvars
 /// separate the two kinds of blocking: monitor entry contention and
 /// `Object.wait()`/`notify()`.
+///
+/// `#[repr(align(8))]` is load-bearing, not cosmetic: the mark word packs the
+/// monitor's address into its upper 62 bits and tags the low 2 with the lock
+/// state, so a `Monitor` whose `Arc` payload were less than 4-byte aligned
+/// would corrupt the state field. `ObjectHeader::make_inflated` asserts this,
+/// and the alignment attribute makes the guarantee explicit rather than
+/// incidental to whatever `parking_lot` happens to contain.
+#[repr(align(8))]
 pub struct Monitor {
     state: Mutex<MonitorState>,
     /// Wakes threads blocked on `monitorenter` (waiting to acquire the lock).
     entry_condvar: Condvar,
     /// Wakes threads blocked on `Object.wait()`.
     wait_condvar: Condvar,
+    /// True once this monitor's address has been published into some object's
+    /// mark word, which from that moment **owns one strong `Arc` reference**
+    /// (see the module-level lifetime rules).
+    ///
+    /// Read by the two reclaim sites to know (a) how many strong references
+    /// are structural rather than "somebody is using this monitor", and (b)
+    /// whether they still owe a `drop` of the mark-word reference. Cleared
+    /// with a `swap`, so a monitor that is reached by both `prune_dead` and
+    /// `remap_after_gc` releases exactly once.
+    mark_ref: std::sync::atomic::AtomicBool,
 }
 
 /// The mutable state protected by a monitor's mutex.
@@ -381,13 +513,50 @@ impl Monitor {
             }),
             entry_condvar: Condvar::new(),
             wait_condvar: Condvar::new(),
+            mark_ref: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// How many strong references to this monitor are *structural* rather than
+    /// "somebody is actively using it": always 1 for the enumeration index
+    /// entry, plus 1 more once the mark word owns a reference.
+    ///
+    /// The reclaim predicate compares `Arc::strong_count` against this to
+    /// decide whether any thread is currently parked on / owns the monitor
+    /// through a clone of its own.
+    #[allow(dead_code)]
+    #[inline]
+    fn structural_refs(&self) -> usize {
+        1 + usize::from(self.mark_ref.load(Ordering::Acquire))
+    }
+
+    /// Release the strong reference an object's `MARK_INFLATED` mark word owns
+    /// on `monitor`, if it still owns one.
+    ///
+    /// # Safety
+    ///
+    /// The caller must have proved that the object whose mark word points at
+    /// `monitor` is **dead** — no thread can load that mark word again. See the
+    /// module-level lifetime rules; the two legitimate callers are
+    /// [`MonitorTable::prune_dead`] (exact swept-address set) and the reclaim
+    /// branch of [`MonitorTable::remap_after_gc`].
+    ///
+    /// This is *not* the last drop under a waiter: any thread parked on the
+    /// monitor holds its own `Arc` clone. The `swap` makes a second call a
+    /// no-op, so overlapping reclaim paths cannot double-free.
+    unsafe fn release_mark_ref(monitor: &Arc<Monitor>) {
+        if monitor.mark_ref.swap(false, Ordering::AcqRel) {
+            // SAFETY: pairs with the `mem::forget` in
+            // `MonitorTable::publish_inflated`, which leaked exactly one
+            // strong reference through this same pointer.
+            drop(unsafe { Arc::from_raw(Arc::as_ptr(monitor)) });
         }
     }
 
     /// Pre-acquire this monitor for `thread_id` at the given entry count.
     ///
-    /// Used exclusively by the inflation handoff (`inflate_unchecked` /
-    /// `MonitorTable::inflate_locked`) to atomically transfer ownership
+    /// Used exclusively by the inflation handoff
+    /// (`MonitorTable::inflate_locked`) to atomically transfer ownership
     /// from the thin-lock representation to a freshly created `Monitor`.
     /// The monitor must be brand new (no other thread can observe it yet
     /// because the mark word still points at the thin state), so this is
@@ -421,20 +590,24 @@ impl Monitor {
         self.state.lock().owner
     }
 
-    /// PERF (monitor-leak reclaim): returns true iff this monitor is fully
-    /// idle — unowned and with a zero entry count. A monitor that is held,
-    /// re-entered, or in the middle of a `wait()` (which temporarily clears
-    /// `owner` but keeps a non-zero `saved_count` *only on the stack*, and is
-    /// represented to the registry by a live extra `Arc` clone held by the
-    /// blocked thread — see the `strong_count` guard at the reclaim site)
-    /// reports `false`. Used by `remap_after_gc` to decide whether a
-    /// dead-object monitor entry can be dropped without losing lock state.
+    /// Returns true iff this monitor is fully idle — unowned and with a zero
+    /// entry count. A monitor that is held, re-entered, or in the middle of a
+    /// `wait()` (which temporarily clears `owner` but keeps a non-zero
+    /// `saved_count` *only on the stack*, and is represented to the index by
+    /// a live extra `Arc` clone held by the blocked thread) reports `false`.
     ///
-    /// Note: idleness alone does NOT prove the object is dead — the reclaim
-    /// site additionally requires (a) the object is absent from the GC's live
-    /// forwarding map for a whole-heap collection and (b) `Arc::strong_count`
-    /// proves the registry holds the only reference (no thread is parked in
-    /// `block_enter`/`wait` on a clone). All three together are required.
+    /// This is one half of the *reclaim predicate*:
+    /// `Arc::strong_count(m) == m.structural_refs() && m.is_idle()` — "nobody
+    /// owns it, nobody is parked on it, and nothing but its structural holders
+    /// references it".
+    ///
+    /// It is **not** used by [`MonitorTable::prune_dead`], the only reclaim
+    /// site today: an exact swept-address set already proves the object is
+    /// unreachable, which is strictly stronger. It is retained (and pinned by
+    /// tests) because the flagged follow-up — plumbing an exact dead set
+    /// through the moving collectors — needs exactly this predicate, and
+    /// because idleness alone must never be mistaken for a licence to free.
+    #[allow(dead_code)]
     #[inline]
     fn is_idle(&self) -> bool {
         let state = self.state.lock();
@@ -818,143 +991,204 @@ pub(crate) enum MonitorError {
 }
 
 // ---------------------------------------------------------------------------
-// MonitorTable — global table of monitors keyed by object identity
+// MonitorTable — sharded enumeration index for inflated monitors
 // ---------------------------------------------------------------------------
 
-/// Global table of JVM monitors, keyed by object pointer address.
+/// Number of shards in each of the two registries. Enumeration walks all of
+/// them, so this trades a longer cold walk for a shorter inflation critical
+/// section; 64 keeps the walk trivial (64 uncontended lock/unlock pairs) while
+/// making inflation collisions rare even at high thread counts.
+const MONITOR_SHARD_BITS: u32 = 6;
+const MONITOR_SHARDS: usize = 1 << MONITOR_SHARD_BITS;
+
+/// Map an object address to its registry shard.
 ///
-/// Each Java object can be used as a monitor. With the thin-lock fast path
-/// the *uncontended* and *re-entrant single-thread* cases NEVER allocate a
-/// `Monitor` — the lock state lives entirely in the object's `mark_word`.
-/// A heavyweight `Monitor` is only created when contention forces inflation
-/// (or when `Object.wait`/`notify` is used, which thin locks do not support).
+/// Object addresses are at least 8-byte aligned and frequently allocated in
+/// near-consecutive runs, so the low bits alone cluster badly; multiply by the
+/// 64-bit golden ratio and take the *high* bits (fibonacci hashing) to spread
+/// consecutive allocations across shards.
+#[inline(always)]
+fn shard_of(key: usize) -> usize {
+    (((key as u64) >> 3).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - MONITOR_SHARD_BITS)) as usize
+}
+
+/// Sharded index of inflated JVM monitors, keyed by object pointer address.
 ///
-/// The `monitors` map is therefore a *fallback registry* for inflated
-/// monitors:
-///   * it keeps each `Arc<Monitor>` alive after inflation (the mark word
-///     only stores a raw pointer);
-///   * it provides the lookup needed by `remap_after_gc` so monitors follow
-///     their object across compaction.
+/// **This is not on any hot path and is not how a monitor is found.** Locking
+/// an object reaches its monitor through the object's own `mark_word` (see the
+/// module-level docs): thin-locked and neutral objects never allocate a
+/// `Monitor` at all, and an `INFLATED` mark word carries the monitor's address
+/// directly. `enter` / `exit` / `wait` / `notify` / `holds` therefore take
+/// **no lock in this table**.
 ///
-/// The fast path (`try_thin_lock`, `try_thin_recursive_lock`,
-/// `try_thin_unlock`) NEVER touches this map.
+/// What the table is still for — all of it cold, all of it enumeration:
+///   * releasing every monitor a just-died thread still owned
+///     ([`Self::release_monitors_held_by`]);
+///   * re-keying / pruning across a collection ([`Self::remap_after_gc`],
+///     [`Self::prune_dead`]);
+///   * the per-object CAS locks used to emulate non-atomic compare-and-swap
+///     ([`Self::with_cas_lock`]), which have no mark-word home;
+///   * the legacy path for `ThreadId`s that exceed `u32::MAX` and so cannot be
+///     represented in a thin lock;
+///   * diagnostics (`Debug`, `CRATONVM_DBG_MONEXIT` forensics).
+///
+/// Because the mark word is authoritative, a missing index entry is a
+/// *bookkeeping* miss, never a correctness failure: the entry is silently
+/// re-derived from the mark word. The historical "INFLATED mark but no
+/// registry entry" panic path is gone with it.
 pub struct MonitorTable {
-    /// Inflated-monitor registry — keys are object pointer addresses.
-    /// Populated lazily on inflation; consulted by GC remap only.
-    /// T10.9.B: FxHashMap — keys are object pointer addresses (internal).
+    /// Inflated-monitor index — keys are object pointer addresses, sharded by
+    /// [`shard_of`]. Populated on inflation; read only by enumeration.
     ///
-    // SECURITY FIX (V11): this registry lock is the `monitors` lock at
-    // hierarchy level L6 (`docs/lock-order.md`). It is wrapped in
-    // `OrderedMutex` at `LockLevel::Monitors` so that, in debug builds, any
-    // attempt to acquire a *lower*-or-equal-level lock first and then this
-    // registry trips the descending-order debug assertion. All accesses are
-    // confined to this file (the field is private), so the wrapper change has
-    // no blast radius outside `monitor.rs`.
-    monitors: OrderedMutex<FxHashMap<usize, Arc<Monitor>>>,
-    /// Per-object CAS locks for compareAndSwap operations.
-    /// Provides mutual exclusion for non-atomic CAS emulation on Value slots.
-    /// T10.9.B: FxHashMap — object pointer addresses (internal).
-    ///
-    // SECURITY FIX (V11): the CAS-lock *registry* (the outer map) is also part
-    // of the L6 `monitors` subsystem; wrap it at `LockLevel::Monitors` too. The
-    // inner per-object `Arc<Mutex<()>>` stays a plain `parking_lot::Mutex`: it
-    // is an L6-internal sub-lock with no global ordering constraints and is
-    // never held while acquiring another tracked lock.
-    cas_locks: OrderedMutex<FxHashMap<usize, Arc<Mutex<()>>>>,
+    // SECURITY FIX (V11) / ARCH-2026-07-26: every shard is the `monitors` lock
+    // at hierarchy level L6 (see `cratonvm_types::lock_order`). Because all
+    // shards share one level and the hierarchy forbids equal-level nesting, no
+    // code path may hold two shard guards simultaneously. Every multi-shard
+    // walk in this file (`release_monitors_held_by_except`, `remap_after_gc`,
+    // `prune_dead`, `indexed_monitor_count`) locks exactly one shard at a
+    // time — in debug builds the lock-order checker turns a violation of that
+    // rule into an immediate panic rather than a latent deadlock.
+    monitors: Box<[OrderedPlMutex<FxHashMap<usize, Arc<Monitor>>>]>,
+    /// Per-object CAS locks for compareAndSwap operations, sharded the same
+    /// way. Provides mutual exclusion for non-atomic CAS emulation on Value
+    /// slots. The inner per-object `Arc<Mutex<()>>` stays a plain
+    /// `parking_lot::Mutex`: it is an L6-internal sub-lock with no global
+    /// ordering constraints and is never held while acquiring another tracked
+    /// lock.
+    cas_locks: Box<[OrderedPlMutex<FxHashMap<usize, Arc<Mutex<()>>>>]>,
 }
 
 impl MonitorTable {
     /// Create an empty monitor table.
     pub fn new() -> Self {
         Self {
-            // SECURITY FIX (V11): both registries live at L6 (`monitors`).
-            monitors: OrderedMutex::new(FxHashMap::default(), LockLevel::Monitors),
-            cas_locks: OrderedMutex::new(FxHashMap::default(), LockLevel::Monitors),
+            // Every shard of both registries lives at L6 (`monitors`).
+            monitors: (0..MONITOR_SHARDS)
+                .map(|_| OrderedPlMutex::new(FxHashMap::default(), LockLevel::Monitors))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            cas_locks: (0..MONITOR_SHARDS)
+                .map(|_| OrderedPlMutex::new(FxHashMap::default(), LockLevel::Monitors))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
         }
     }
 
-    /// Look up the inflated `Monitor` for `obj_ref`, returning `None` if the
-    /// object has never been inflated.
-    fn lookup_inflated(&self, obj_ref: ObjectRef) -> Option<Arc<Monitor>> {
-        let key = obj_ref.as_ptr() as usize;
-        // SECURITY FIX (V11): OrderedMutex::lock() returns a LockResult; the
-        // registry is never poisoned (no panic is held across it), so unwrap.
-        let monitors = self.monitors.lock().expect("monitors registry poisoned");
-        monitors.get(&key).cloned()
+    /// The monitor-index shard that owns `key`.
+    #[inline]
+    fn monitor_shard(&self, key: usize) -> &OrderedPlMutex<FxHashMap<usize, Arc<Monitor>>> {
+        &self.monitors[shard_of(key)]
     }
 
-    /// Force inflation of the lock for `obj_ref`. If the object already has
-    /// an inflated monitor (either via a prior CAS-published mark word or via
-    /// our fallback registry), that one is returned. Otherwise a new
-    /// `Monitor` is allocated, pre-acquired with the *currently observed*
-    /// thin-lock owner (if any), registered, and published into the mark
-    /// word.
+    /// Record `monitor` in the enumeration index under `key`, replacing any
+    /// stale entry. Cold — called once per inflation (and on index repair).
+    fn index_insert(&self, key: usize, monitor: &Arc<Monitor>) {
+        self.monitor_shard(key).lock().insert(key, monitor.clone());
+    }
+
+    /// Look up the inflated `Monitor` for `obj_ref` **in the index**.
     ///
-    /// Re-snapshots the mark word under the registry mutex so that the
-    /// pre-acquire reflects reality at publish time (avoiding stale
-    /// `current_owner` data from a CAS-loser caller).
+    /// Prefer the mark word ([`monitor_from_mark`] / [`monitor_arc_from_mark`])
+    /// wherever the object is in hand: this takes an L6 shard lock and exists
+    /// only for the address-keyed paths that have no mark word to consult
+    /// (the `> u32::MAX` thread-id legacy path and diagnostics).
+    fn lookup_indexed(&self, obj_ref: ObjectRef) -> Option<Arc<Monitor>> {
+        let key = obj_ref.as_ptr() as usize;
+        self.monitor_shard(key).lock().get(&key).cloned()
+    }
+
+    /// Publish `monitor` into `header`'s mark word, transferring one strong
+    /// reference to the mark word on success.
     ///
-    /// Returns `Err(IllegalStateException)` only on the pathological case
-    /// where the mark word reads `INFLATED` but the registry has no entry
-    /// for the object. Under correct concurrent operation this is
-    /// impossible — every INFLATED publish in this module CAS-flips the
-    /// mark word **and** inserts into `self.monitors` under the same
-    /// registry mutex (see C8 / C9). The Err variant therefore signals
-    /// memory corruption or a non-conforming inflation path; previously
-    /// this case silently leaked the original `Arc<Monitor>` and broke
-    /// per-object identity (a thread that already held the old monitor
-    /// would re-enter a fresh unowned monitor → eventual IMSE on exit).
+    /// Returns `true` if the CAS from `expected` to `INFLATED(monitor)` won.
+    /// On failure nothing is published and no reference is leaked, so the
+    /// caller may simply drop its freshly built monitor and retry.
+    ///
+    /// This is the ONLY place that establishes the module's central invariant
+    /// — "an `INFLATED` mark word owns a strong reference to the monitor it
+    /// names" — so the increment and the CAS must stay welded together here.
+    fn publish_inflated(header: &ObjectHeader, expected: u64, monitor: &Arc<Monitor>) -> bool {
+        // Take the reference the mark word will own *before* publishing, so
+        // the count is already correct the instant another thread can observe
+        // the pointer.
+        let mark_owned = Arc::clone(monitor);
+        let new_mark = ObjectHeader::make_inflated(Arc::as_ptr(monitor) as usize);
+        if header
+            .mark_word
+            .compare_exchange(expected, new_mark, Ordering::Release, Ordering::Relaxed)
+            .is_ok()
+        {
+            monitor.mark_ref.store(true, Ordering::Release);
+            // Transfer ownership of `mark_owned` to the mark word. Balanced by
+            // `Monitor::release_mark_ref` at the reclaim site (`prune_dead`).
+            std::mem::forget(mark_owned);
+            true
+        } else {
+            drop(mark_owned);
+            false
+        }
+    }
+
+    /// Force inflation of the lock for `obj_ref` and return the heavyweight
+    /// `Monitor`.
+    ///
+    /// If the object is already `INFLATED`, the monitor is read straight out
+    /// of the mark word — no allocation, no publish, and the index is repaired
+    /// if it happens to be missing the entry. Otherwise a new `Monitor` is
+    /// allocated, pre-acquired with the *currently observed* thin-lock owner
+    /// (if any), published into the mark word by CAS, and indexed.
+    ///
+    /// Unlike the previous implementation this cannot fail: the mark word is
+    /// the source of truth, so there is no "inflated but unfindable" state to
+    /// report. The `Result` is retained because every caller already threads
+    /// it and several of them (`wait`/`notify`/`notifyAll`) are on paths that
+    /// legitimately return `MethodCallFailed` for other reasons.
+    ///
+    /// Note the CAS-retry loop takes **no lock at all** in the common case;
+    /// the L6 shard lock is touched once, after the publish wins, purely to
+    /// record the new monitor for later enumeration.
     fn inflate_locked(
         &self,
         obj_ref: ObjectRef,
         header: &ObjectHeader,
     ) -> Result<Arc<Monitor>, MethodCallFailed> {
         let key = obj_ref.as_ptr() as usize;
-        // SECURITY FIX (V11): OrderedMutex::lock() returns a LockResult.
-        let mut monitors = self.monitors.lock().expect("monitors registry poisoned");
         loop {
             let cur = header.mark_word.load(Ordering::Acquire);
             match ObjectHeader::mark_state(cur) {
                 s if s == types::MARK_INFLATED => {
-                    if let Some(m) = monitors.get(&key).cloned() {
-                        return Ok(m);
-                    }
-                    // Inflated mark but no registry entry — pathological.
-                    // We hold `self.monitors.lock()` and every legitimate
-                    // INFLATED publish in this module inserts under that
-                    // same mutex, so this branch is unreachable under
-                    // correct concurrent operation. Refuse to recover by
-                    // synthesising a fresh monitor: doing so would leak
-                    // the prior `Arc<Monitor>` *and* break per-object
-                    // identity (any thread that already held the old
-                    // monitor would re-enter a fresh unowned monitor and
-                    // later raise IMSE on exit). Surface the invariant
-                    // violation as a runtime error so the caller decides
-                    // whether to abort or unwind.
-                    return Err(MethodCallFailed::InternalError(VmError::Runtime(
-                        RuntimeError::IllegalStateException {
-                            message: format!(
-                                "monitor mark inflated but registry entry missing \
-                                 (data race or memory corruption) at obj={key:#x}"
-                            ),
-                        },
-                    )));
+                    // Already inflated: the mark word names the one true
+                    // monitor for this object. Repairing a missing index entry
+                    // here is what makes the index non-authoritative — and is
+                    // why a second `Monitor` can no longer be synthesised for
+                    // an object that already has one (the old audit finding
+                    // 1(b) shape, which orphaned every waiter on the first).
+                    let Some(m) = monitor_arc_from_mark(cur) else {
+                        // `make_inflated` rejects null, so an INFLATED mark
+                        // with a null pointer is memory corruption, not a
+                        // race. Surface it rather than dereferencing it.
+                        return Err(MethodCallFailed::InternalError(VmError::Runtime(
+                            RuntimeError::IllegalStateException {
+                                message: format!(
+                                    "monitor mark word is INFLATED with a null monitor \
+                                     pointer (memory corruption) at obj={key:#x}"
+                                ),
+                            },
+                        )));
+                    };
+                    self.index_repair_if_absent(key, &m);
+                    return Ok(m);
                 }
                 s if s == types::MARK_THIN_LOCKED => {
                     let owner = ObjectHeader::thin_lock_owner(cur);
                     let recursion = ObjectHeader::thin_lock_recursion(cur);
                     let monitor = Arc::new(Monitor::new());
                     monitor.enter_with_recursion(ThreadId(owner as u64), (recursion as u32) + 1);
-                    let new_mark = ObjectHeader::make_inflated(Arc::as_ptr(&monitor) as usize);
                     // Publish atomically — if the CAS loses, the original
                     // owner mutated the word (either recursive bump or
                     // release). Drop the local monitor and retry.
-                    if header
-                        .mark_word
-                        .compare_exchange(cur, new_mark, Ordering::Release, Ordering::Relaxed)
-                        .is_ok()
-                    {
-                        monitors.insert(key, monitor.clone());
+                    if Self::publish_inflated(header, cur, &monitor) {
+                        self.index_insert(key, &monitor);
                         return Ok(monitor);
                     }
                     // CAS lost; loop to re-snapshot. The pre-acquired Monitor
@@ -964,18 +1198,30 @@ impl MonitorTable {
                     // NEUTRAL (or reserved). Create an unowned monitor and
                     // publish it; the caller will `enter` it normally.
                     let monitor = Arc::new(Monitor::new());
-                    let new_mark = ObjectHeader::make_inflated(Arc::as_ptr(&monitor) as usize);
-                    if header
-                        .mark_word
-                        .compare_exchange(cur, new_mark, Ordering::Release, Ordering::Relaxed)
-                        .is_ok()
-                    {
-                        monitors.insert(key, monitor.clone());
+                    if Self::publish_inflated(header, cur, &monitor) {
+                        self.index_insert(key, &monitor);
                         return Ok(monitor);
                     }
                     // CAS lost — retry.
                 }
             }
+        }
+    }
+
+    /// Re-add `monitor` to the enumeration index if the index lost track of it
+    /// (e.g. it was pruned as dead while the object was in fact a live in-place
+    /// survivor of a partial collection, or a shard was drained mid-remap).
+    ///
+    /// Idempotent and cheap; keeps `release_monitors_held_by` able to see every
+    /// live inflated monitor even though the mark word, not the index, is what
+    /// locking consults.
+    fn index_repair_if_absent(&self, key: usize, monitor: &Arc<Monitor>) {
+        let mut shard = self.monitor_shard(key).lock();
+        // Resolve the read to a bool before mutating — holding the `get`
+        // borrow across the `insert` would not borrow-check.
+        let already_indexed = shard.get(&key).is_some_and(|e| Arc::ptr_eq(e, monitor));
+        if !already_indexed {
+            shard.insert(key, Arc::clone(monitor));
         }
     }
 
@@ -1003,7 +1249,11 @@ impl MonitorTable {
     /// Slow paths (inflate to a real `Monitor`):
     /// * THIN_LOCKED(other) → inflate transferring ownership, then try-enter.
     /// * THIN_LOCKED(self) at recursion = 255 → inflate, then try-enter.
-    /// * INFLATED         → dispatch to `Monitor::try_enter`.
+    /// * INFLATED         → dispatch to `Monitor::try_enter` **via the mark
+    ///   word**: a pointer load and that monitor's own mutex. No table lock.
+    ///
+    /// Every arm above is per-object. The only path that touches a shared L6
+    /// lock is inflation itself (one shard insert, once per object, ever).
     ///
     /// `None` ⇒ acquired. `Some(m)` ⇒ contended; caller must
     /// `m.block_enter(thread_id)` (the monitor may have been released in
@@ -1043,13 +1293,13 @@ impl MonitorTable {
                         return None;
                     }
                     // Lost the race again → inflate to avoid livelock.
-                    // `inflate_locked` only Errs on the impossible "mark
-                    // INFLATED but registry empty" invariant violation; panic
-                    // here surfaces the corruption rather than the previous
-                    // silent-leak recovery (see C8).
+                    // `inflate_locked` now only Errs on an INFLATED mark word
+                    // carrying a null monitor pointer, which `make_inflated`
+                    // cannot produce — i.e. memory corruption. Panic surfaces
+                    // it instead of dereferencing null.
                     let m = self
                         .inflate_locked(obj_ref, header)
-                        .expect("monitor inflation invariant: registry/mark-word desync");
+                        .expect("monitor inflation invariant: corrupt INFLATED mark word");
                     if m.try_enter(thread_id) {
                         return None;
                     }
@@ -1074,7 +1324,7 @@ impl MonitorTable {
                                     // succeeds) to record the current
                                     // attempted acquisition.
                                     let m = self.inflate_locked(obj_ref, header).expect(
-                                        "monitor inflation invariant: registry/mark-word desync",
+                                        "monitor inflation invariant: corrupt INFLATED mark word",
                                     );
                                     if m.try_enter(thread_id) {
                                         return None;
@@ -1094,7 +1344,7 @@ impl MonitorTable {
                         // released; otherwise the caller blocks GC-marked.
                         let m = self
                             .inflate_locked(obj_ref, header)
-                            .expect("monitor inflation invariant: registry/mark-word desync");
+                            .expect("monitor inflation invariant: corrupt INFLATED mark word");
                         if m.try_enter(thread_id) {
                             return None;
                         }
@@ -1102,58 +1352,40 @@ impl MonitorTable {
                     }
                 }
                 s if s == types::MARK_INFLATED => {
-                    // ── Slow path: already inflated → dispatch directly. ─
-                    if let Some(m) = self.lookup_inflated(obj_ref) {
+                    // ── Inflated: dispatch through the object's own mark
+                    // word. THIS IS THE PATH THAT USED TO TAKE A PROCESS-WIDE
+                    // LOCK. It is now a pointer load plus this monitor's own
+                    // mutex, so two threads locking two different inflated
+                    // objects never touch a shared cache line here.
+                    //
+                    // The uncontended case borrows (`monitor_from_mark`) and
+                    // never touches the refcount at all; only the contended
+                    // case pays an `Arc` clone, because the caller is about to
+                    // park on the monitor and must own a reference across the
+                    // park (see the module lifetime rules, point 4).
+                    let Some(m) = monitor_from_mark(cur) else {
+                        // Null pointer under an INFLATED tag is corruption,
+                        // not a race — `make_inflated` rejects null. Fall into
+                        // `inflate_locked`, which reports it as an error.
+                        let m = self
+                            .inflate_locked(obj_ref, header)
+                            .expect("monitor inflation invariant: corrupt INFLATED mark word");
                         if m.try_enter(thread_id) {
                             return None;
                         }
                         return Some(m);
-                    }
-                    // Registry miss (should not happen): re-inflate. The
-                    // window between the inflating thread's mark-word CAS
-                    // and its registry insert is closed by the registry
-                    // mutex inside `inflate_locked`, so this branch only
-                    // fires on a true invariant violation — see C8.
-                    //
-                    // GC-audit finding 1(b) tripwire (2026-07-10): this
-                    // branch is the prime suspect for the MTChurn
-                    // lost-wakeup pile-up. If a pause's monitor-registry
-                    // remap races a thread the STW quota hole let run
-                    // mid-collection, that thread can miss here and
-                    // RE-INFLATE a SECOND Monitor for the same Java object
-                    // — every waiter parked on the first is orphaned (the
-                    // gdb-captured 5-waiters-none-woken picture). Loud,
-                    // rate-limited, and counted so an MTChurn round can
-                    // confirm or kill the hypothesis cheaply.
-                    {
-                        static REINFLATE_MISSES: std::sync::atomic::AtomicUsize =
-                            std::sync::atomic::AtomicUsize::new(0);
-                        let n = REINFLATE_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        if n < 8 {
-                            tracing::warn!(
-                                obj = obj_ref.as_ptr() as usize,
-                                occurrence = n + 1,
-                                "monitor registry miss with INFLATED mark word — \
-                                 re-inflating a second Monitor for this object \
-                                 (audit finding 1(b) tripwire: waiters on the \
-                                 original monitor are now orphaned)"
-                            );
-                        }
-                    }
-                    let m = self
-                        .inflate_locked(obj_ref, header)
-                        .expect("monitor inflation invariant: registry/mark-word desync");
+                    };
                     if m.try_enter(thread_id) {
                         return None;
                     }
-                    return Some(m);
+                    return monitor_arc_from_mark(cur);
                 }
                 _ => {
                     // Reserved state 0b11 — should never occur. Fall back to
                     // inflation as the safest recovery.
                     let m = self
                         .inflate_locked(obj_ref, header)
-                        .expect("monitor inflation invariant: registry/mark-word desync");
+                        .expect("monitor inflation invariant: corrupt INFLATED mark word");
                     if m.try_enter(thread_id) {
                         return None;
                     }
@@ -1182,12 +1414,17 @@ impl MonitorTable {
     }
 
     /// Get or create a monitor without touching the mark word — used only
-    /// for the legacy fallback when a `ThreadId` exceeds `u32::MAX`.
+    /// for the legacy fallback when a `ThreadId` exceeds `u32::MAX` and so
+    /// cannot be represented in the thin lock's 32-bit owner field.
+    ///
+    /// These monitors are the one kind that is *not* reachable from a mark
+    /// word, so the index is genuinely authoritative for them and their
+    /// `Monitor::mark_ref` stays `false` (see [`Monitor::structural_refs`]).
+    /// The address-keyed shard lookup is the only correct home for them.
     fn inflate_for_legacy(&self, obj_ref: ObjectRef) -> Arc<Monitor> {
         let key = obj_ref.as_ptr() as usize;
-        // SECURITY FIX (V11): OrderedMutex::lock() returns a LockResult.
-        let mut monitors = self.monitors.lock().expect("monitors registry poisoned");
-        monitors
+        self.monitor_shard(key)
+            .lock()
             .entry(key)
             .or_insert_with(|| Arc::new(Monitor::new()))
             .clone()
@@ -1200,7 +1437,8 @@ impl MonitorTable {
     /// * THIN_LOCKED(self) at recursion=0 → CAS back to NEUTRAL.
     ///
     /// Slow path:
-    /// * INFLATED → dispatch to `Monitor::exit`.
+    /// * INFLATED → dispatch to `Monitor::exit` **via the mark word**; no
+    ///   table lock, no allocation, no refcount traffic.
     ///
     /// Returns `Err(MethodCallFailed)` with `IllegalMonitorStateException` if
     /// the calling thread does not own the monitor.
@@ -1232,7 +1470,15 @@ impl MonitorTable {
         }
 
         // ── Slow path: inflated monitor dispatch. ──────────────────────────
-        let monitor = self.lookup_inflated(obj_ref);
+        //
+        // Read the monitor out of the object's own mark word. Falls back to
+        // the index only for the legacy (`ThreadId > u32::MAX`) monitors,
+        // which have no mark-word representation at all.
+        let mark = header.mark_word.load(Ordering::Acquire);
+        let monitor: Option<MonitorHandle<'_>> = match monitor_from_mark(mark) {
+            Some(m) => Some(MonitorHandle::Borrowed(m)),
+            None => self.lookup_indexed(obj_ref).map(MonitorHandle::Owned),
+        };
         match monitor {
             Some(m) => m.exit(thread_id).map_err(|MonitorError::NotOwner| {
                 self.dbg_monexit_forensics(
@@ -1250,13 +1496,9 @@ impl MonitorTable {
                 ))
             }),
             None => {
-                // No monitor exists for this object — thread never entered it
-                self.dbg_monexit_forensics(
-                    obj_ref,
-                    thread_id,
-                    header.mark_word.load(Ordering::Acquire),
-                    "registry-miss",
-                );
+                // Neither the mark word nor the index names a monitor for this
+                // object, so the thread never entered it.
+                self.dbg_monexit_forensics(obj_ref, thread_id, mark, "no-monitor");
                 Err(MethodCallFailed::InternalError(VmError::Runtime(
                     RuntimeError::IllegalMonitorStateException {
                         message: format!(
@@ -1287,14 +1529,12 @@ impl MonitorTable {
             let p = obj_ref.as_ptr() as *const u8;
             (
                 std::ptr::read(p as *const u32),
-                std::ptr::read(
-                    p.add(cratonvm_types::NUM_SLOTS_OFFSET) as *const u32
-                ),
+                std::ptr::read(p.add(cratonvm_types::NUM_SLOTS_OFFSET) as *const u32),
             )
         };
         let (reg_hit, reg_owner, reg_count) = {
-            let monitors = self.monitors.lock().expect("monitors registry poisoned");
-            match monitors.get(&key) {
+            let shard = self.monitor_shard(key).lock();
+            match shard.get(&key) {
                 Some(m) => {
                     let st = m.state.lock();
                     (true, st.owner, st.entry_count)
@@ -1302,8 +1542,17 @@ impl MonitorTable {
                 None => (false, None, 0),
             }
         };
+        // The mark word is authoritative now, so print what IT says alongside
+        // the index's opinion — a disagreement is the interesting signal.
+        let (mark_owner, mark_count) = match monitor_from_mark(mark) {
+            Some(m) => {
+                let st = m.state.lock();
+                (Some(st.owner), st.entry_count)
+            }
+            None => (None, 0),
+        };
         eprintln!(
-            "[MONEXIT-IMSE] arm={arm} tid={} obj={key:#x} mark={mark:#x} state={} thin_owner={} thin_rec={} class_id={class_id} num_slots={num_slots} registry_hit={reg_hit} reg_owner={reg_owner:?} reg_entry_count={reg_count}",
+            "[MONEXIT-IMSE] arm={arm} tid={} obj={key:#x} mark={mark:#x} state={} thin_owner={} thin_rec={} class_id={class_id} num_slots={num_slots} index_hit={reg_hit} index_owner={reg_owner:?} index_entry_count={reg_count} mark_owner={mark_owner:?} mark_entry_count={mark_count}",
             tid.0,
             match state {
                 s if s == types::MARK_NEUTRAL => "NEUTRAL",
@@ -1327,14 +1576,13 @@ impl MonitorTable {
     /// monitor that the JFR consumer is interested in — the JFR-enabled gate
     /// means we're already on the cold path.
     pub fn set_jfr_enter_recorded(&self, obj_ref: ObjectRef, thread_id: ThreadId) {
-        // The only failure mode `ensure_inflated` can surface is the
-        // pathological "mark INFLATED but registry empty" invariant
-        // violation from `inflate_locked` (C8). This API is `()`-returning
-        // (the JFR consumer has no error channel here), so we panic to
-        // surface the corruption rather than silently leak as before.
+        // `ensure_inflated` can now only fail on an INFLATED mark word holding
+        // a null monitor pointer, which `make_inflated` cannot produce — i.e.
+        // memory corruption. This API is `()`-returning (the JFR consumer has
+        // no error channel here), so panic to surface it.
         let monitor = self
             .ensure_inflated(obj_ref, thread_id)
-            .expect("monitor inflation invariant: registry/mark-word desync");
+            .expect("monitor inflation invariant: corrupt INFLATED mark word");
         monitor.set_jfr_enter_recorded(thread_id);
     }
 
@@ -1344,9 +1592,12 @@ impl MonitorTable {
     /// which case the enter event could not have been recorded — the flag
     /// lives on the heavyweight `Monitor`, never on the thin lock).
     pub fn jfr_enter_recorded(&self, obj_ref: ObjectRef) -> bool {
-        match self.lookup_inflated(obj_ref) {
+        let mark = header_of(obj_ref).mark_word.load(Ordering::Acquire);
+        match monitor_from_mark(mark) {
             Some(m) => m.jfr_enter_recorded(),
-            None => false,
+            None => self
+                .lookup_indexed(obj_ref)
+                .is_some_and(|m| m.jfr_enter_recorded()),
         }
     }
 
@@ -1355,11 +1606,16 @@ impl MonitorTable {
     /// transferred atomically.
     ///
     /// Used by `wait`/`notify`/`notifyAll`, which require a heavyweight
-    /// monitor (thin locks have no condvars). Propagates the
-    /// `Err(IllegalStateException)` that `inflate_locked` raises on the
-    /// pathological "INFLATED mark but missing registry entry" case (see
-    /// C8) so callers can surface it as a normal runtime error rather
-    /// than a silent leak.
+    /// monitor (thin locks have no condvars).
+    ///
+    /// The already-inflated case — by far the common one for a `wait`/`notify`
+    /// loop — is served entirely from the mark word: **no L6 lock, no map
+    /// probe**. Only a first-time inflation reaches `inflate_locked`.
+    ///
+    /// Errs only if the mark word reads INFLATED while carrying a null monitor
+    /// pointer, which `ObjectHeader::make_inflated` refuses to construct; that
+    /// is memory corruption, surfaced as a runtime error rather than a null
+    /// dereference.
     fn ensure_inflated(
         &self,
         obj_ref: ObjectRef,
@@ -1367,13 +1623,12 @@ impl MonitorTable {
     ) -> Result<Arc<Monitor>, MethodCallFailed> {
         let header = header_of(obj_ref);
         let cur = header.mark_word.load(Ordering::Acquire);
-        if ObjectHeader::mark_state(cur) == types::MARK_INFLATED {
-            if let Some(m) = self.lookup_inflated(obj_ref) {
-                return Ok(m);
-            }
+        if let Some(m) = monitor_arc_from_mark(cur) {
+            return Ok(m);
         }
-        // `inflate_locked` re-snapshots the mark word under its registry
-        // mutex so the pre-acquire (if any) reflects the current owner.
+        // Not inflated (or the legacy no-mark-word case). `inflate_locked`
+        // re-snapshots the mark word so its pre-acquire reflects the current
+        // thin-lock owner.
         self.inflate_locked(obj_ref, header)
     }
 
@@ -1463,16 +1718,8 @@ impl MonitorTable {
                 }
             }
             s if s == types::MARK_INFLATED => {
-                let key = obj_ref.as_ptr() as usize;
-                let monitor = {
-                    // SECURITY FIX (V11): OrderedMutex::lock() -> LockResult.
-                    let monitors = self.monitors.lock().expect("monitors registry poisoned");
-                    monitors.get(&key).cloned()
-                };
-                match monitor {
-                    Some(m) => m.is_held_by(thread_id),
-                    None => false,
-                }
+                // Straight from the mark word — no table lock.
+                monitor_from_mark(mark).is_some_and(|m| m.is_held_by(thread_id))
             }
             _ => false,
         }
@@ -1483,14 +1730,20 @@ impl MonitorTable {
     /// Provides mutual exclusion for non-atomic compare-and-swap emulation.
     /// Each object gets its own lock (lazily created), so CAS operations on
     /// different objects do not contend.
+    ///
+    /// Unlike monitors, CAS locks have no mark-word home, so the lookup is
+    /// necessarily address-keyed — but it is sharded, so two CAS operations on
+    /// objects in different shards no longer serialize on one process-wide
+    /// mutex. The shard guard is dropped before the per-object lock is taken
+    /// (both are L6-adjacent; the inner `Mutex<()>` is untracked and must never
+    /// be held while re-entering the shard).
     pub fn with_cas_lock<F, R>(&self, obj_ref: ObjectRef, f: F) -> R
     where
         F: FnOnce() -> R,
     {
         let key = obj_ref.as_ptr() as usize;
         let lock = {
-            // SECURITY FIX (V11): OrderedMutex::lock() -> LockResult.
-            let mut cas = self.cas_locks.lock().expect("cas_locks registry poisoned");
+            let mut cas = self.cas_locks[shard_of(key)].lock();
             cas.entry(key)
                 .or_insert_with(|| Arc::new(Mutex::new(())))
                 .clone()
@@ -1519,18 +1772,10 @@ impl MonitorTable {
             s if s == types::MARK_THIN_LOCKED => {
                 Some(ThreadId(u64::from(ObjectHeader::thin_lock_owner(mark))))
             }
-            s if s == types::MARK_INFLATED => {
-                let key = obj_ref.as_ptr() as usize;
-                let monitor = {
-                    // SECURITY FIX (V11): OrderedMutex::lock() -> LockResult.
-                    let monitors = self.monitors.lock().expect("monitors registry poisoned");
-                    monitors.get(&key).cloned()
-                };
-                monitor.and_then(|m| {
-                    let st = m.state.lock();
-                    st.owner
-                })
-            }
+            s if s == types::MARK_INFLATED => monitor_from_mark(mark).and_then(|m| {
+                let st = m.state.lock();
+                st.owner
+            }),
             _ => None,
         }
     }
@@ -1554,73 +1799,12 @@ impl MonitorTable {
                 u32::from(ObjectHeader::thin_lock_recursion(mark)) + 1
             }
             s if s == types::MARK_INFLATED => {
-                let key = obj_ref.as_ptr() as usize;
-                let monitor = {
-                    // SECURITY FIX (V11): OrderedMutex::lock() -> LockResult.
-                    let monitors = self.monitors.lock().expect("monitors registry poisoned");
-                    monitors.get(&key).cloned()
-                };
-                monitor.map_or(0, |m| m.state.lock().entry_count)
+                monitor_from_mark(mark).map_or(0, |m| m.state.lock().entry_count)
             }
             _ => 0,
         }
     }
 
-    /// Remap monitor keys after GC has moved objects.
-    ///
-    /// Takes a mapping from old pointer addresses to new pointer addresses.
-    /// Re-keys the internal HashMap so monitors remain associated with the
-    /// correct (now-relocated) objects.
-    ///
-    /// PERF (monitor-leak reclaim): historically every inflated `Monitor` and
-    /// every per-object `cas_lock` was inserted on first use and **never
-    /// removed**, so the registries grew monotonically for the VM lifetime —
-    /// each moving GC's remap then walked an ever-larger table even though most
-    /// keyed objects were long dead. This pass reclaims the entries that can be
-    /// dropped *without ever losing live lock state*, keeping the table bounded
-    /// and the remap cost proportional to the live (not historical) population.
-    ///
-    /// SAFETY of reclamation (why this never drops a live monitor):
-    ///
-    /// * `cas_locks` are **always** safe to prune when idle. A CAS lock has no
-    ///   back-reference from the object header (unlike an inflated monitor,
-    ///   whose address is published into the mark word), so removing it is
-    ///   invisible to the rest of the VM — `with_cas_lock` simply re-creates an
-    ///   equivalent fresh `Mutex` on the next access. We drop an entry only when
-    ///   `Arc::strong_count == 1`, i.e. the registry holds the *sole* reference
-    ///   and no thread is currently inside `with_cas_lock` holding a clone. An
-    ///   entry that is in use (`strong_count > 1`) is always retained/re-keyed.
-    ///
-    /// * Inflated `monitors` are reclaimed only when **all** of the following
-    ///   hold, which together prove the monitor is dead *and* unreferenced:
-    ///     1. the object's old address is **absent** from `pointer_map`;
-    ///     2. `Arc::strong_count == 1` — the registry holds the only reference,
-    ///        so no thread is parked in `block_enter`/`wait` on a clone;
-    ///     3. the monitor `is_idle()` — unowned with a zero entry count.
-    ///   Condition (1) is a reliable *dead* signal **only for a whole-heap
-    ///   collection** (the semi-space copying collector forwards *every* live
-    ///   object into `pointer_map`, so absence ⇔ dead). For **partial**
-    ///   collectors (G1 young/mixed, the generational minor GC) `pointer_map`
-    ///   lists only *moved* objects; a live old-gen / non-CSet survivor stays in
-    ///   place and is legitimately absent. Dropping such an entry would be a
-    ///   correctness bug — the survivor's mark word still reads `INFLATED`, so
-    ///   the next `enter`/`lookup_inflated` would miss the registry and trip the
-    ///   hardened "INFLATED mark but registry entry missing" panic (the same
-    ///   class of premature-reclaim bug documented for BUG-V and the WildFly
-    ///   weak-`ClassLoader` referent). Because this method cannot tell which
-    ///   collector invoked it, monitor reclamation is **gated behind the opt-in
-    ///   `CRATONVM_RECLAIM_DEAD_MONITORS` flag** and the default build re-keys
-    ///   monitors exactly as before (byte-identical behaviour). The conditions
-    ///   (2)+(3) are belt-and-braces: even under the flag, a held/contended/
-    ///   waiting monitor is *never* removed.
-    ///
-    ///   CROSS-FILE FOLLOW-UP (flagged, not done here — out of edit scope): to
-    ///   reclaim dead monitors safely under *partial* collectors too, the GC
-    ///   would need to pass a dead-address set (or a "whole-heap collection"
-    ///   bool) through `cratonvm_gc::collector::MonitorCleanup::remap_after_gc`.
-    ///   That requires editing `gc/src/collector.rs`, the four `remap_after_gc`
-    ///   call sites (`gc/src/heap.rs`, `gc/src/g1.rs`, `gc/src/gen_heap.rs`),
-    ///   and the impl in this file — left to the owner of those files.
     /// Release every inflated monitor still owned by `thread_id`. Called
     /// once from `ThreadRegistry::mark_dead` when a Java thread terminates.
     ///
@@ -1661,78 +1845,127 @@ impl MonitorTable {
         thread_id: ThreadId,
         except: Option<&Arc<Monitor>>,
     ) {
-        let monitors = self.monitors.lock().expect("monitors registry poisoned");
-        for monitor in monitors.values() {
-            if let Some(exc) = except {
-                if Arc::ptr_eq(monitor, exc) {
-                    continue;
+        // Cold: runs once per thread death. Walk one shard at a time — two L6
+        // guards must never be live simultaneously (equal-level nesting is a
+        // lock-order violation).
+        for shard in self.monitors.iter() {
+            let guard = shard.lock();
+            for monitor in guard.values() {
+                if let Some(exc) = except {
+                    if Arc::ptr_eq(monitor, exc) {
+                        continue;
+                    }
                 }
+                monitor.force_release_if_owned_by(thread_id);
             }
-            monitor.force_release_if_owned_by(thread_id);
         }
     }
 
+    /// Remap monitor keys after GC has moved objects.
+    ///
+    /// Takes a mapping from old pointer addresses to new pointer addresses.
+    /// Re-keys the internal HashMap so monitors remain associated with the
+    /// correct (now-relocated) objects.
+    ///
+    /// PERF (leak bounding): historically every inflated `Monitor` and every
+    /// per-object `cas_lock` was inserted on first use and **never removed**, so
+    /// the registries grew monotonically for the VM lifetime — each moving GC's
+    /// remap then walked an ever-larger table even though most keyed objects
+    /// were long dead. This pass drops the `cas_locks` entries that can be
+    /// dropped *without ever losing live lock state*. Inflated monitors are only
+    /// re-keyed here, never dropped — see below.
+    ///
+    /// SAFETY of reclamation (why this never drops a live monitor):
+    ///
+    /// * `cas_locks` are **always** safe to prune when idle. A CAS lock has no
+    ///   back-reference from the object header (unlike an inflated monitor,
+    ///   whose address is published into the mark word), so removing it is
+    ///   invisible to the rest of the VM — `with_cas_lock` simply re-creates an
+    ///   equivalent fresh `Mutex` on the next access. We drop an entry only when
+    ///   `Arc::strong_count == 1`, i.e. the registry holds the *sole* reference
+    ///   and no thread is currently inside `with_cas_lock` holding a clone. An
+    ///   entry that is in use (`strong_count > 1`) is always retained/re-keyed.
+    ///
+    /// * Inflated `monitors` are **never reclaimed here** — only re-keyed.
+    ///
+    ///   ARCH-2026-07-26, and this is the load-bearing part: reclaiming on the
+    ///   "absent from `pointer_map` ⇒ dead" signal was already wrong, and is
+    ///   now unsafe. `pointer_map` lists only *moved* objects, so for a
+    ///   **partial** collector (G1 young/mixed, the generational minor GC) a
+    ///   live old-gen / non-CSet survivor is legitimately absent. Dropping its
+    ///   entry used to leave the survivor's `INFLATED` mark word pointing at a
+    ///   freed `Monitor`; the old code got away with never dereferencing that
+    ///   pointer only because every lookup went through this map (and instead
+    ///   re-inflated a SECOND monitor, orphaning every waiter on the first).
+    ///   Now that the mark word IS what locking dereferences, the same drop
+    ///   would be a use-after-free.
+    ///
+    ///   So the branch is gone, together with its `CRATONVM_RECLAIM_DEAD_MONITORS`
+    ///   opt-in — which was default-OFF and had therefore never run, so nothing
+    ///   is lost. Sound reclamation needs an EXACT dead set, which is exactly
+    ///   what [`cratonvm_gc::MonitorCleanup::prune_dead`] is given; that path is
+    ///   unconditional, on by default, and releases the mark-word reference too,
+    ///   so it genuinely frees.
+    ///
+    ///   CROSS-FILE FOLLOW-UP (flagged, not done here — out of edit scope): to
+    ///   reclaim dead monitors under the *moving* collectors as well, they need
+    ///   to supply an exact dead-address set (or call `prune_dead` alongside
+    ///   `remap_after_gc`). That means editing `gc/src/collector.rs` and the
+    ///   `remap_after_gc` call sites in `gc/src/heap.rs`, `gc/src/g1.rs` and
+    ///   `gc/src/gen_heap.rs` — left to the owner of those files. Until then a
+    ///   dead object's monitor is retained by the moving collectors, which is a
+    ///   bounded leak and strictly preferable to a dangling mark word.
     pub fn remap_after_gc(&self, pointer_map: &std::collections::HashMap<usize, usize>) {
         if pointer_map.is_empty() {
             return;
         }
-        // PERF: read the monitor-reclaim opt-in once and cache it — the per-GC
-        // check then costs a single relaxed load. Default OFF keeps the
-        // monitor-registry behaviour byte-identical to before (see the safety
-        // note above: absence-from-`pointer_map` is only a reliable dead signal
-        // for a whole-heap collector).
-        let reclaim_monitors = reclaim_dead_monitors_enabled();
-
-        // SECURITY FIX (V11): both `monitors` and `cas_locks` are wrapped at
-        // the SAME hierarchy level (L6). The lock-order checker forbids holding
-        // one and then acquiring the other (equal level => not strictly
-        // descending). Scope each guard so only one L6 registry lock is held at
-        // a time; the two maps are independent so this is purely additive
-        // safety with no behavioural change.
+        // SHARDING + LOCK ORDER: every shard of both registries is L6, and the
+        // hierarchy forbids equal-level nesting, so we may never hold two shard
+        // guards at once. Re-keying can also move an entry to a DIFFERENT shard
+        // (the key changes), which rules out a simple in-place per-shard
+        // drain/refill. Both walks below therefore run in two phases:
+        //   phase 1 — lock one shard, drain it, release, classify;
+        //   phase 2 — lock the destination shard for each surviving entry and
+        //             insert.
+        // Safe to do non-atomically because `remap_after_gc` is only ever
+        // called by the collector under stop-the-world (see
+        // `cratonvm_gc::collector::StopTheWorldToken`), so no mutator can
+        // observe the intermediate state. Even if one did, the mark word — not
+        // this index — is what locking consults, so the worst case is a
+        // transiently missing index entry, which `index_repair_if_absent`
+        // restores.
         {
-            let mut monitors = self.monitors.lock().expect("monitors registry poisoned");
-            // PERF: pre-size the rebuilt map to the live count so the
-            // re-insertion loop never rehashes mid-walk. With reclamation off
-            // the live count equals the drained count; with it on it is a tight
-            // upper bound. `drain()` empties the map in place and lets us
-            // `insert` back into the same (now-empty) allocation.
-            let entries: Vec<(usize, Arc<Monitor>)> = monitors.drain().collect();
-            for (old_key, mut monitor) in entries {
-                match pointer_map.get(&old_key).copied() {
-                    Some(new_key) => {
-                        // Object survived AND moved — must re-key (a stale key
-                        // would desync the registry from the copied mark word,
-                        // see BUG-V). Always retained.
-                        monitors.insert(new_key, monitor);
-                    }
-                    None => {
-                        // Absent from the forwarding map. Under a whole-heap
-                        // collection this means the object is dead; under a
-                        // partial collection it may be a live in-place
-                        // survivor. Reclaim ONLY when explicitly enabled AND
-                        // the monitor is provably idle and uniquely referenced
-                        // (no waiter/owner). Otherwise re-key in place (old_key
-                        // unchanged) exactly as the original code did.
-                        let reclaimable = reclaim_monitors
-                            // `get_mut` succeeds iff this is the unique strong
-                            // reference (no other `Arc<Monitor>` clone is held
-                            // by a blocked/owning thread). Equivalent to
-                            // `strong_count == 1 && weak_count == 0` but checked
-                            // without a separate atomic load.
-                            && Arc::get_mut(&mut monitor).is_some()
-                            && monitor.is_idle();
-                        if !reclaimable {
-                            // Keep the entry under its (unchanged) address.
-                            monitors.insert(old_key, monitor);
+            let mut survivors: Vec<(usize, Arc<Monitor>)> = Vec::new();
+            for shard in self.monitors.iter() {
+                let entries: Vec<(usize, Arc<Monitor>)> = shard.lock().drain().collect();
+                for (old_key, monitor) in entries {
+                    match pointer_map.get(&old_key).copied() {
+                        Some(new_key) => {
+                            // Object survived AND moved — re-key so enumeration
+                            // stays addressable. (Locking already followed the
+                            // object automatically: the mark word was copied
+                            // with the header.)
+                            survivors.push((new_key, monitor));
                         }
-                        // else: drop `monitor` here — the registry's sole
-                        // `Arc` is released, freeing the heavyweight Monitor.
+                        None => {
+                            // Absent from the forwarding map. That is NOT proof
+                            // of death under a partial collector — a live
+                            // in-place survivor is legitimately absent — and its
+                            // mark word still names this monitor. Retain it
+                            // under its (unchanged) address. See the safety note
+                            // on this method for why reclaiming here would now
+                            // be a use-after-free rather than merely wasteful.
+                            survivors.push((old_key, monitor));
+                        }
                     }
                 }
             }
+            for (key, monitor) in survivors {
+                self.monitor_shard(key).lock().insert(key, monitor);
+            }
         }
 
-        // Also remap CAS locks (separate L6 critical section).
+        // Also remap CAS locks — same two-phase, one-shard-at-a-time shape.
         //
         // PERF: CAS locks carry no object-header back-reference, so an idle one
         // is always safe to drop and is transparently re-created by the next
@@ -1742,28 +1975,34 @@ impl MonitorTable {
         // collectors. A surviving-and-moved lock is re-keyed; an in-use lock
         // (`strong_count > 1`, i.e. a thread is inside `with_cas_lock`) is kept.
         {
-            let mut cas = self.cas_locks.lock().expect("cas_locks registry poisoned");
-            let cas_entries: Vec<(usize, Arc<Mutex<()>>)> = cas.drain().collect();
-            for (old_key, mut lock) in cas_entries {
-                match pointer_map.get(&old_key).copied() {
-                    Some(new_key) => {
-                        // Object moved — re-key so a future CAS on the same
-                        // (relocated) object reuses the same lock.
-                        cas.insert(new_key, lock);
-                    }
-                    None => {
-                        // Absent. For cas_locks this is *always* safe to treat
-                        // as reclaimable when unreferenced, even under a partial
-                        // collector: dropping a live-but-idle object's cas_lock
-                        // only forces a cheap lazy re-create on the next CAS, it
-                        // never desyncs any header state. Keep it only if a
-                        // thread is currently using it.
-                        if Arc::get_mut(&mut lock).is_none() {
-                            cas.insert(old_key, lock);
+            let mut survivors: Vec<(usize, Arc<Mutex<()>>)> = Vec::new();
+            for shard in self.cas_locks.iter() {
+                let entries: Vec<(usize, Arc<Mutex<()>>)> = shard.lock().drain().collect();
+                for (old_key, mut lock) in entries {
+                    match pointer_map.get(&old_key).copied() {
+                        Some(new_key) => {
+                            // Object moved — re-key so a future CAS on the same
+                            // (relocated) object reuses the same lock.
+                            survivors.push((new_key, lock));
                         }
-                        // else: drop the sole `Arc` — reclaimed.
+                        None => {
+                            // Absent. For cas_locks this is *always* safe to
+                            // treat as reclaimable when unreferenced, even under
+                            // a partial collector: dropping a live-but-idle
+                            // object's cas_lock only forces a cheap lazy
+                            // re-create on the next CAS, it never desyncs any
+                            // header state. Keep it only if a thread is
+                            // currently using it.
+                            if Arc::get_mut(&mut lock).is_none() {
+                                survivors.push((old_key, lock));
+                            }
+                            // else: drop the sole `Arc` — reclaimed.
+                        }
                     }
                 }
+            }
+            for (key, lock) in survivors {
+                self.cas_locks[shard_of(key)].lock().insert(key, lock);
             }
         }
     }
@@ -1783,39 +2022,59 @@ impl cratonvm_gc::MonitorCleanup for MonitorTable {
     /// Whole-heap dead-address prune (ZGC backend — see the trait doc).
     /// `dead` is EXACT (every element's object was just swept), so removal
     /// is unconditional: a thread still blocked on a dead object's monitor
-    /// holds its own `Arc<Monitor>` clone (dropping the registry entry
-    /// cannot free it under that thread), and no future locker can exist
-    /// for a dead object — while a NEW object reusing the address MUST get
-    /// a fresh monitor, not the dead object's.
+    /// holds its own `Arc<Monitor>` clone (dropping the index entry and the
+    /// mark-word reference cannot free it under that thread), and no future
+    /// locker can exist for a dead object — while a NEW object reusing the
+    /// address MUST get a fresh monitor, not the dead object's.
+    ///
+    /// ARCH-2026-07-26: this now also releases the mark-word-owned strong
+    /// reference. That is exactly the case the exactness of `dead` licenses —
+    /// the object's memory is already freed, so nothing can load its mark word
+    /// again — and it is what turns this from "drop one of two references"
+    /// (a leak) into a real reclaim.
     fn prune_dead(&self, dead: &[usize]) {
         if dead.is_empty() {
             return;
         }
         {
-            let mut monitors = self.monitors.lock().expect("monitors registry poisoned");
+            // Group by shard so each shard is locked once; never two at a time.
             for d in dead {
-                monitors.remove(d);
+                let removed = self.monitor_shard(*d).lock().remove(d);
+                if let Some(monitor) = removed {
+                    // SAFETY: `dead` is documented EXACT — this address was a
+                    // live allocation base before this collection and its
+                    // memory is now freed, so no thread can read its mark word.
+                    // Any thread still parked on the monitor holds its own
+                    // `Arc` clone, so this is not the last drop.
+                    unsafe { Monitor::release_mark_ref(&monitor) };
+                }
             }
         }
         {
-            let mut cas = self.cas_locks.lock().expect("cas_locks registry poisoned");
             for d in dead {
-                cas.remove(d);
+                self.cas_locks[shard_of(*d)].lock().remove(d);
             }
         }
     }
 }
 
+impl MonitorTable {
+    /// Number of inflated monitors currently in the enumeration index, summed
+    /// across shards (one shard locked at a time — never two).
+    ///
+    /// Diagnostic only. It is a lower bound on "monitors that exist": a monitor
+    /// whose index entry was pruned while its object was in fact alive is still
+    /// perfectly usable through its mark word, and is re-indexed on next use.
+    pub fn indexed_monitor_count(&self) -> usize {
+        self.monitors.iter().map(|s| s.lock().len()).sum()
+    }
+}
+
 impl std::fmt::Debug for MonitorTable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // SECURITY FIX (V11): OrderedMutex::lock() -> LockResult.
-        let count = self
-            .monitors
-            .lock()
-            .expect("monitors registry poisoned")
-            .len();
         f.debug_struct("MonitorTable")
-            .field("active_monitors", &count)
+            .field("active_monitors", &self.indexed_monitor_count())
+            .field("shards", &MONITOR_SHARDS)
             .finish()
     }
 }
@@ -2092,10 +2351,15 @@ mod tests {
         );
     }
 
-    /// PERF safety: with monitor reclamation at its DEFAULT (off), an inflated
-    /// monitor whose object is absent from a *partial*-collection forwarding map
-    /// (a live in-place survivor) is RETAINED and still usable. This guards
-    /// against the premature-reclaim / registry-desync class of bug (BUG-V).
+    /// An inflated monitor whose object is absent from a *partial*-collection
+    /// forwarding map (i.e. a live in-place survivor) is RETAINED and still
+    /// usable.
+    ///
+    /// This is now an unconditional guarantee rather than a default-off one:
+    /// `remap_after_gc` no longer reclaims monitors at all, because absence
+    /// from `pointer_map` is not proof of death and the survivor's mark word
+    /// still points at the monitor (dropping it would be a use-after-free, not
+    /// just the BUG-V registry desync it used to be).
     #[test]
     fn inflated_monitor_absent_from_map_is_retained_by_default() {
         let table = MonitorTable::new();
@@ -2384,14 +2648,10 @@ mod tests {
         ObjectHeader::mark_state(mark) == types::MARK_INFLATED
     }
 
-    /// Returns the active monitor count in the table's fallback registry.
+    /// Returns the active monitor count in the table's enumeration index
+    /// (summed across shards).
     fn monitor_registry_len(table: &MonitorTable) -> usize {
-        // SECURITY FIX (V11): registry is now an OrderedMutex (LockResult).
-        table
-            .monitors
-            .lock()
-            .expect("monitors registry poisoned")
-            .len()
+        table.indexed_monitor_count()
     }
 
     #[test]
@@ -2575,5 +2835,411 @@ mod tests {
         m.block_enter(tid_b);
         assert_eq!(m.current_owner(), Some(tid_b));
         assert!(m.exit(tid_b).is_ok());
+    }
+
+    // ── ARCH-2026-07-26: mark-word-reachable monitors ─────────────────────
+    //
+    // The properties these guard are the ones that turn a global-lock probe
+    // into a per-object pointer chase without introducing a use-after-free.
+
+    /// Leak a heap so `ObjectRef`s stay valid for the whole test (same reason
+    /// as `test_object`, but shared by several objects).
+    fn leaked_heap() -> &'static Heap {
+        Box::leak(Box::new(Heap::new()))
+    }
+
+    /// Drive `obj` all the way to `MARK_INFLATED` and leave it unowned.
+    fn force_inflated(table: &MonitorTable, obj: ObjectRef, tid: ThreadId) {
+        table.enter(obj, tid);
+        // `wait` requires a heavyweight monitor, so it inflates. A 1ms timeout
+        // keeps it fast; the monitor is re-acquired on return.
+        table.wait(obj, tid, Some(1), None).unwrap();
+        table.exit(obj, tid).unwrap();
+        assert!(is_inflated(obj), "setup must leave the object INFLATED");
+    }
+
+    /// THE headline property: once inflated, `enter` / `exit` / `holds` /
+    /// `current_owner` / `entry_count` reach the monitor through the object's
+    /// own mark word and never probe the shared index.
+    ///
+    /// Proven directly rather than by inspection: the test holds the L6 shard
+    /// guard that owns this object's key for the whole window, and a second
+    /// thread must still complete a full lock/unlock cycle. If any of those
+    /// operations still went through the table, the worker would block and the
+    /// `recv_timeout` would expire.
+    ///
+    /// Exactly one shard guard is held, so this does not violate the
+    /// equal-level nesting rule the L6 hierarchy enforces.
+    #[test]
+    fn inflated_lock_unlock_never_touches_the_shared_index() {
+        let table = Arc::new(MonitorTable::new());
+        let obj = leaked_heap().alloc_object(ClassId::new(0), 0);
+        force_inflated(&table, obj, ThreadId(1));
+
+        let key = obj.as_ptr() as usize;
+        let shard_guard = table.monitor_shard(key).lock();
+
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let worker_table = table.clone();
+        let h = std::thread::spawn(move || {
+            let tid = ThreadId(2);
+            worker_table.enter(obj, tid);
+            assert!(worker_table.holds(obj, tid));
+            assert_eq!(worker_table.current_owner(obj), Some(tid));
+            assert_eq!(worker_table.entry_count(obj), 1);
+            // Re-entrant acquire on an inflated monitor.
+            worker_table.enter(obj, tid);
+            assert_eq!(worker_table.entry_count(obj), 2);
+            worker_table.exit(obj, tid).unwrap();
+            worker_table.exit(obj, tid).unwrap();
+            assert!(!worker_table.holds(obj, tid));
+            let _ = tx.send(());
+        });
+
+        let finished = rx.recv_timeout(std::time::Duration::from_secs(10)).is_ok();
+        // Release before asserting so the worker can finish (and `join` cannot
+        // hang) even if the property regressed.
+        drop(shard_guard);
+        h.join().unwrap();
+        assert!(
+            finished,
+            "inflated monitorenter/monitorexit blocked on the monitor index — \
+             the inflated fast path must go through the mark word only"
+        );
+    }
+
+    /// The uncontended fast path allocates nothing and indexes nothing, even
+    /// across many lock/unlock cycles: the whole state machine stays in the
+    /// object's mark word.
+    #[test]
+    fn uncontended_fast_path_never_allocates_or_indexes() {
+        let table = MonitorTable::new();
+        let obj = test_object();
+        let tid = ThreadId(9);
+
+        for _ in 0..1000 {
+            table.enter(obj, tid);
+            assert!(is_thin_locked(obj));
+            table.exit(obj, tid).unwrap();
+        }
+        assert_eq!(
+            monitor_registry_len(&table),
+            0,
+            "uncontended locking must never create an index entry"
+        );
+        assert!(!is_inflated(obj));
+    }
+
+    /// Recursive entry by the owning thread works past the thin lock's 256-deep
+    /// ceiling: the overflow inflates, carrying the accumulated count over, and
+    /// the matching exits unwind it exactly.
+    #[test]
+    fn recursive_entry_survives_thin_lock_overflow_into_inflation() {
+        let table = MonitorTable::new();
+        let obj = test_object();
+        let tid = ThreadId(3);
+
+        // 256 acquisitions fit in the thin lock (recursion 0..=255).
+        for _ in 0..256 {
+            table.enter(obj, tid);
+        }
+        assert!(is_thin_locked(obj), "256 nested acquires must stay thin");
+        assert_eq!(table.entry_count(obj), 256);
+
+        // The 257th overflows the recursion field and forces inflation.
+        table.enter(obj, tid);
+        assert!(is_inflated(obj), "recursion overflow must inflate");
+        assert_eq!(
+            table.entry_count(obj),
+            257,
+            "inflation must carry the accumulated recursion count over"
+        );
+        assert_eq!(table.current_owner(obj), Some(tid));
+
+        for _ in 0..257 {
+            table.exit(obj, tid).unwrap();
+        }
+        assert_eq!(table.current_owner(obj), None);
+        // One exit too many is an IMSE, not a wrap.
+        assert!(table.exit(obj, tid).is_err());
+    }
+
+    /// Contended handoff on an already-inflated monitor: the second thread
+    /// blocks in `block_enter` until the first releases, then acquires.
+    #[test]
+    fn contended_handoff_between_two_threads_on_an_inflated_monitor() {
+        let table = Arc::new(MonitorTable::new());
+        let obj = leaked_heap().alloc_object(ClassId::new(0), 0);
+        force_inflated(&table, obj, ThreadId(1));
+
+        let holder_has_it = Arc::new(std::sync::Barrier::new(2));
+        let contender_observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let t1 = table.clone();
+        let b1 = holder_has_it.clone();
+        let h1 = std::thread::spawn(move || {
+            t1.enter(obj, ThreadId(1));
+            b1.wait();
+            // Hold long enough that thread 2 is definitely parked on entry.
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            t1.exit(obj, ThreadId(1)).unwrap();
+        });
+
+        let t2 = table.clone();
+        let b2 = holder_has_it.clone();
+        let observed = contender_observed.clone();
+        let h2 = std::thread::spawn(move || {
+            b2.wait();
+            // Thread 1 owns it: `enter_or_contend` must report contention
+            // rather than silently succeeding.
+            let contended = t2.enter_or_contend(obj, ThreadId(2));
+            if let Some(m) = contended {
+                observed.store(true, std::sync::atomic::Ordering::Release);
+                m.block_enter(ThreadId(2));
+            }
+            assert!(t2.holds(obj, ThreadId(2)));
+            t2.exit(obj, ThreadId(2)).unwrap();
+        });
+
+        h1.join().unwrap();
+        h2.join().unwrap();
+        assert!(
+            contender_observed.load(std::sync::atomic::Ordering::Acquire),
+            "the second thread must have seen the monitor as contended"
+        );
+        assert_eq!(table.current_owner(obj), None);
+        assert_eq!(table.entry_count(obj), 0);
+        // Contention on an already-inflated monitor must not create a SECOND
+        // monitor for the same object (the old registry-miss failure shape).
+        assert_eq!(monitor_registry_len(&table), 1);
+    }
+
+    /// `wait`/`notify` round-trip across two threads, driven entirely through
+    /// the mark word (the object is already inflated before either thread
+    /// starts, so no inflation happens on either side).
+    #[test]
+    fn wait_notify_round_trip_on_a_mark_word_reachable_monitor() {
+        let table = Arc::new(MonitorTable::new());
+        let obj = leaked_heap().alloc_object(ClassId::new(0), 0);
+        force_inflated(&table, obj, ThreadId(1));
+        let monitor_before = header_of(obj).mark_word.load(Ordering::Acquire);
+
+        let delivered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let woke = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let t1 = table.clone();
+        let d1 = delivered.clone();
+        let w1 = woke.clone();
+        let consumer = std::thread::spawn(move || {
+            let tid = ThreadId(1);
+            t1.enter(obj, tid);
+            while !d1.load(std::sync::atomic::Ordering::Acquire) {
+                t1.wait(obj, tid, Some(1000), None).unwrap();
+            }
+            w1.store(true, std::sync::atomic::Ordering::Release);
+            t1.exit(obj, tid).unwrap();
+        });
+
+        let t2 = table.clone();
+        let d2 = delivered.clone();
+        let producer = std::thread::spawn(move || {
+            let tid = ThreadId(2);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            t2.enter(obj, tid);
+            d2.store(true, std::sync::atomic::Ordering::Release);
+            t2.notify_all(obj, tid).unwrap();
+            t2.exit(obj, tid).unwrap();
+        });
+
+        consumer.join().unwrap();
+        producer.join().unwrap();
+        assert!(woke.load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(
+            header_of(obj).mark_word.load(Ordering::Acquire),
+            monitor_before,
+            "wait/notify must reuse the monitor the mark word already named, \
+             never publish a new one"
+        );
+        assert_eq!(table.current_owner(obj), None);
+    }
+
+    /// Publishing `MARK_INFLATED` transfers exactly one strong reference to the
+    /// mark word, and releasing it is idempotent — a second release must not
+    /// decrement again (that would be a double free once the real holders drop).
+    #[test]
+    fn mark_word_owns_one_strong_ref_and_release_is_idempotent() {
+        let table = MonitorTable::new();
+        let obj = test_object();
+        let tid = ThreadId(1);
+
+        let (m, contended) = table.enter_inflated_or_contend(obj, tid).expect("inflate");
+        assert!(!contended);
+        assert!(
+            m.mark_ref.load(Ordering::Acquire),
+            "publishing INFLATED must record that the mark word owns a ref"
+        );
+        // index entry + mark word + the handle we are holding.
+        assert_eq!(Arc::strong_count(&m), 3);
+        assert_eq!(m.structural_refs(), 2);
+
+        // SAFETY: test-local object; nothing else can read its mark word.
+        unsafe { Monitor::release_mark_ref(&m) };
+        assert!(!m.mark_ref.load(Ordering::Acquire));
+        assert_eq!(Arc::strong_count(&m), 2);
+        assert_eq!(m.structural_refs(), 1);
+
+        // Second release: no-op, NOT a second decrement.
+        unsafe { Monitor::release_mark_ref(&m) };
+        assert_eq!(
+            Arc::strong_count(&m),
+            2,
+            "release_mark_ref must be idempotent — a double decrement here is \
+             a double free once the remaining holders drop"
+        );
+
+        // The monitor is still perfectly usable through the surviving handle.
+        assert!(m.is_held_by(tid));
+        assert!(m.exit(tid).is_ok());
+    }
+
+    /// Reclamation must never race a waiter. A thread parked in `Object.wait()`
+    /// holds its own `Arc<Monitor>` for the whole park, which pushes the strong
+    /// count above `structural_refs()` — the exact predicate the reclaim path
+    /// uses to decide a monitor is unreferenced. So while anyone is parked, the
+    /// monitor is not reclaimable, and even if it were, the release would not
+    /// be the last drop.
+    #[test]
+    fn a_parked_waiter_keeps_its_monitor_unreclaimable_and_alive() {
+        let table = Arc::new(MonitorTable::new());
+        let obj = leaked_heap().alloc_object(ClassId::new(0), 0);
+        let interrupt = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let t = table.clone();
+        let flag = interrupt.clone();
+        let waiter = std::thread::spawn(move || {
+            let tid = ThreadId(2);
+            t.enter(obj, tid);
+            // Untimed wait with an interrupt flag: parks until we set it.
+            t.wait(obj, tid, None, Some(&*flag)).unwrap();
+            t.exit(obj, tid).unwrap();
+        });
+
+        // Spin until the waiter has inflated the monitor AND released it into
+        // the wait (owner goes back to None while it is parked).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if is_inflated(obj) && table.current_owner(obj).is_none() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "waiter never reached Object.wait()"
+            );
+            std::thread::yield_now();
+        }
+
+        let mark = header_of(obj).mark_word.load(Ordering::Acquire);
+        let m = monitor_arc_from_mark(mark).expect("INFLATED mark must name a monitor");
+        // index + mark word = structural; plus the parked waiter, plus `m`.
+        assert!(
+            Arc::strong_count(&m) > m.structural_refs() + 1,
+            "a thread parked in wait() must hold its own strong reference \
+             (strong={}, structural={})",
+            Arc::strong_count(&m),
+            m.structural_refs()
+        );
+        // The reclaim predicate shared by `remap_after_gc` and the idle check
+        // must therefore refuse this monitor.
+        assert!(
+            !(Arc::strong_count(&m) == m.structural_refs() && m.is_idle()),
+            "a monitor with a parked waiter must never look reclaimable"
+        );
+
+        drop(m);
+        interrupt.store(true, std::sync::atomic::Ordering::Release);
+        waiter.join().unwrap();
+
+        // After the waiter is gone the monitor is idle and referenced only by
+        // its structural holders — now it WOULD be reclaimable.
+        let m = monitor_arc_from_mark(header_of(obj).mark_word.load(Ordering::Acquire)).unwrap();
+        assert!(m.is_idle());
+        assert_eq!(Arc::strong_count(&m), m.structural_refs() + 1);
+    }
+
+    /// A monitor whose index entry is lost (pruned as dead while its object was
+    /// actually a live in-place survivor of a partial collection) must remain
+    /// fully usable through the mark word, and must be re-indexed rather than
+    /// replaced by a second `Monitor`.
+    ///
+    /// This is the regression guard for the old "INFLATED mark but registry
+    /// entry missing" failure: it used to re-inflate a SECOND monitor, orphaning
+    /// every waiter parked on the first.
+    #[test]
+    fn a_lost_index_entry_is_repaired_not_re_inflated() {
+        let table = MonitorTable::new();
+        let obj = test_object();
+        let tid = ThreadId(1);
+        force_inflated(&table, obj, ThreadId(1));
+
+        let mark_before = header_of(obj).mark_word.load(Ordering::Acquire);
+        let original = monitor_arc_from_mark(mark_before).unwrap();
+        assert_eq!(monitor_registry_len(&table), 1);
+
+        // Simulate the lost entry.
+        let key = obj.as_ptr() as usize;
+        table.monitor_shard(key).lock().remove(&key);
+        assert_eq!(monitor_registry_len(&table), 0);
+
+        // Locking still works — the mark word is authoritative.
+        table.enter(obj, tid);
+        assert!(table.holds(obj, tid));
+        assert_eq!(
+            header_of(obj).mark_word.load(Ordering::Acquire),
+            mark_before,
+            "a missing index entry must NOT cause a second inflation"
+        );
+        table.exit(obj, tid).unwrap();
+
+        // `inflate_locked` — the path a racing inflation attempt takes when the
+        // mark word turned INFLATED under it — repairs the index and returns
+        // the SAME monitor, never a replacement.
+        let m = table
+            .inflate_locked(obj, header_of(obj))
+            .expect("already-inflated object must resolve from its mark word");
+        assert!(
+            Arc::ptr_eq(&m, &original),
+            "index repair must return the object's existing monitor, \
+             not a freshly synthesised one"
+        );
+        assert_eq!(monitor_registry_len(&table), 1, "index must be repaired");
+
+        // And enumeration (thread-death monitor release) sees it again.
+        table.enter(obj, tid);
+        table.release_monitors_held_by(tid);
+        assert_eq!(table.current_owner(obj), None);
+    }
+
+    /// Monitors for different objects land in different shards often enough
+    /// that the index is not a single serialization point, and `shard_of` stays
+    /// inside bounds for every input it can be handed.
+    #[test]
+    fn shard_selection_is_in_bounds_and_spreads_consecutive_addresses() {
+        for raw in [0usize, 8, 16, 0x1000, usize::MAX & !7] {
+            assert!(shard_of(raw) < MONITOR_SHARDS);
+        }
+        // Consecutive 8-byte-aligned allocations must not all collide: the
+        // whole point of hashing the address is that neighbouring objects get
+        // independent shards.
+        let base = 0x7f00_0000_0000usize;
+        let distinct: std::collections::HashSet<usize> = (0..MONITOR_SHARDS)
+            .map(|i| shard_of(base + i * 32))
+            .collect();
+        assert!(
+            distinct.len() > MONITOR_SHARDS / 4,
+            "shard hash clusters badly: {} distinct shards for {} consecutive \
+             allocations",
+            distinct.len(),
+            MONITOR_SHARDS
+        );
     }
 }

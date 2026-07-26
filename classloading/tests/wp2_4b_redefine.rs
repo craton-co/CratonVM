@@ -149,7 +149,9 @@ fn redefine_round_trip_replaces_method_body_and_bumps_generation() {
         .class_bytes_cache
         .get(&cid)
         .expect("class_bytes_cache must hold latest bytes");
-    assert_eq!(cached, &v2);
+    // `class_bytes_cache` stores `SharedBytes`, which has no
+    // `PartialEq<Vec<u8>>`; compare through its `Deref<Target = [u8]>`.
+    assert_eq!(&cached[..], &v2[..]);
 
     // Vtable layout unchanged: still 1 virtual slot for foo()I.
     let entries = cm.vtable_descriptors_of(cid).expect("vtable present");

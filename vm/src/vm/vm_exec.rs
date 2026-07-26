@@ -2006,14 +2006,36 @@ fn resume_virtual_continuation(shared: std::sync::Arc<SharedVm>, vt_id: u64) {
         return;
     };
     let tid = thread.thread_id;
-    thread
-        .gc_block_state
-        .in_blocked_region
-        .store(false, std::sync::atomic::Ordering::Release);
-    thread
-        .gc_block_state
-        .java_state
-        .store(0, std::sync::atomic::Ordering::Release);
+    // CRASH DIAGNOSTICS (`startup-and-diagnostics.md` §6.3): publish this
+    // continuation's frame trace into the CARRIER's thread-local cell for the
+    // duration of the mount, so a fault while it is running renders *its* Java
+    // stack instead of the primordial thread's. Deliberately here and not at
+    // `install_runtime` (which runs on the spawning thread, not the carrier):
+    // a carrier hosts many continuations over its life, and the report has to
+    // name the one that was actually mounted. The guard restores the previous
+    // occupant on every exit path — normal return, `ContinuationYield` unmount,
+    // the missing-`java_thread_obj` bail — so the cell never outlives a mount.
+    //
+    // This is the crash class the primordial-only publication misses by
+    // construction: virtual-thread resume heap corruption faults on a carrier.
+    let _crash_frames = super::vm_util::PublishedFrameTrace::publish(
+        &thread.name,
+        tid.0,
+        thread.frame_trace.clone(),
+    );
+    // Publish this mount's identity BEFORE leaving the blocked region.
+    //
+    // `check_post_block_gc` below turns this thread back into a COUNTED
+    // mutator (`GcBarrier::leave_blocked_region_flagged`). From that instant a
+    // new stop-the-world can be requested that *expects* us, and the takeover
+    // / cross-thread scan paths identify us through the registry:
+    // `set_os_tid_current` feeds the counted-set excusal and
+    // `frozen_peer_thread_addrs`, which maps OS tids back to
+    // `jvm_thread_addr`. A parked continuation is remounted on whichever
+    // carrier picked it up, so `os_tid` genuinely differs from the previous
+    // mount — becoming counted while it still names the *old* carrier would
+    // point a takeover at the wrong OS thread. Hence: publish first, drain
+    // second.
     shared.threads.thread_registry.set_os_tid_current(tid);
     shared
         .threads
@@ -2023,6 +2045,72 @@ fn resume_virtual_continuation(shared: std::sync::Arc<SharedVm>, vt_id: u64) {
         .threads
         .thread_registry
         .set_tlab_addr(tid, &thread.tlab as *const cratonvm_gc::Tlab as usize);
+    // REMOUNT FIXUP (2026-07-26, `docs/internal/arch-2026-07-26/vt-resume-gc-fixup.md`).
+    //
+    // This used to be a bare
+    //     gc_block_state.in_blocked_region.store(false, Release)
+    // placed *above* the publishes, and it never drained the blocked-region
+    // fixup. That is a heap corruptor, not a tidiness issue:
+    //
+    //  * `suspend_runtime`'s caller runs `deposit_root_snapshot()`, which
+    //    RAISES `in_blocked_region`. So for the whole parked duration this
+    //    thread is excluded from every STW census.
+    //  * Every moving collection that runs meanwhile calls
+    //    `ThreadRegistry::fold_pointer_map_into_blocked`, which remaps only the
+    //    `root_snapshot` and *accumulates* the moves into
+    //    `gc_block_state.fixup` (chained orig->cur) and `slot_origins`. It
+    //    deliberately does NOT touch the parked thread's frames — the fold
+    //    reaches us at all only because the registry entry shares our
+    //    `Arc<GcBlockState>` / `root_snapshot` (see the `set_gc_block_state`
+    //    call in `spawn_thread`'s `is_virtual` arm).
+    //  * The ONLY code that drains and applies that accumulation to frame
+    //    locals, operand stacks, `monitor_on_exit`, the thread mirror, JNI
+    //    locals and the `slot_origins` write-back is
+    //    `check_post_block_gc_refs`. `safepoint_check` does not — its own
+    //    comment names "nothing ever applies its accumulated blocked-fixup" as
+    //    the violation it *detects*.
+    //
+    // So a virtual thread parked across a young copying cycle resumed on
+    // vacated addresses. It is reachable on the DEFAULT build: virtual threads
+    // never enter JIT (`interpreter.rs` forces `env_disable_jit` for
+    // `ThreadKind::Virtual`), so a virtual-thread workload publishes no
+    // conservative JIT roots, `has_conservative_roots` is false,
+    // `divert_non_moving` is false (`gc/src/gen_heap.rs`) and the moving Cheney
+    // young cycle runs — in exactly the workload where continuations park.
+    //
+    // `check_post_block_gc` also replaces the raw `store(false)` with
+    // `leave_blocked_region_flagged`, which clears the flag under the same
+    // barrier-lock hold that confirmed no pause is active, closing the
+    // excluded-but-running-mutator window the raw store left open.
+    //
+    // Drain exactly once: `check_post_block_gc_refs` `mem::take`s both `fixup`
+    // and `slot_origins`, and once the flag is down no further fold can target
+    // us, so a second call is a no-op.
+    if resumed {
+        // Only the resume path can have accumulated a fixup — `resumed` is
+        // `vt.execution_started`, so `false` means this box came straight from
+        // `install_runtime` with a virgin `GcBlockState` (flag down, fixup
+        // empty). Calling the drain there would be worse than useless: the
+        // first-mount arm below runs its own `arrive_and_wait_excluded`
+        // handshake, and `leave_blocked_region_flagged` would classify an
+        // unexcluded thread as participating and arrive a SECOND time for the
+        // same pause, inflating `arrived` and releasing `wait_for_all` while a
+        // counted mutator still runs.
+        NativeContextImpl {
+            shared: &shared,
+            thread: &mut thread,
+        }
+        .check_post_block_gc();
+    } else {
+        thread
+            .gc_block_state
+            .in_blocked_region
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+    thread
+        .gc_block_state
+        .java_state
+        .store(0, std::sync::atomic::Ordering::Release);
 
     let result = if resumed {
         if shared
@@ -6986,11 +7074,14 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                     .java_thread_obj(tid)
                     .unwrap_or(thread_obj_for_spawn),
             );
-            if is_virtual {
-                jvm_thread.kind = crate::threading::ThreadKind::Virtual;
-                // Acquire a carrier permit before executing (blocks if all carriers busy).
-                shared_arc.threads.virtual_scheduler.acquire();
-            }
+            // NOTE: `is_virtual` is impossible inside this closure — the
+            // `is_virtual` arm above returns before `std::thread::Builder`
+            // is ever reached, so a virtual thread never gets an OS carrier
+            // of its own. The `jvm_thread.kind = Virtual` assignment and the
+            // `virtual_scheduler.acquire()` that used to live here were both
+            // dead; the acquire additionally blocked on a permit pool
+            // disjoint from the real carriers (see the removal note in
+            // `vm/src/threading/virtual_scheduler.rs`).
             // Share root snapshot with registry for GC cross-thread access
             shared_arc
                 .threads.thread_registry
@@ -7000,6 +7091,21 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             shared_arc
                 .threads.thread_registry
                 .set_frame_trace(tid, jvm_thread.frame_trace.clone());
+            // CRASH DIAGNOSTICS (`startup-and-diagnostics.md` §6.3): the same
+            // handle, additionally published into THIS OS thread's local cell.
+            // The registry copy serves cross-thread readers (getStackTrace,
+            // dumpThreads); this one serves the crash handler, which runs on
+            // the faulting thread and until now could only render the
+            // primordial thread's frames — so a SIGSEGV or a panic on a worker
+            // arrived with no Java context at all, which is precisely the shape
+            // of the STW-takeover deadlock reports. TLS rather than a shared
+            // registry keeps the read lock-free; the guard un-publishes when
+            // this worker's closure returns.
+            let _crash_frames = super::vm_util::PublishedFrameTrace::publish(
+                &name,
+                tid.0,
+                jvm_thread.frame_trace.clone(),
+            );
             // Share the optional VM-side breadcrumb for STW diagnostics.
             shared_arc
                 .threads.thread_registry
@@ -7132,7 +7238,6 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                     boxed,
                     std::time::Duration::from_nanos(*wake_after_nanos),
                 );
-                shared_arc.threads.virtual_scheduler.release();
                 return;
             }
             if dbg_ts {
@@ -7246,10 +7351,9 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                     eprintln!("Thread {} terminated with error: {:?}", tid, e);
                 }
             }
-            if is_virtual {
-                // Release carrier permit on thread exit.
-                shared_arc.threads.virtual_scheduler.release();
-            }
+            // (No carrier-permit release on exit: unreachable here — see the
+            // note at the top of this closure — and the permit pool it
+            // targeted owned no carrier.)
             // Record JFR thread end event
             {
                 let now_ns = std::time::SystemTime::now()
@@ -7540,18 +7644,39 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 &self.thread.frames,
             );
         }
-        // Another thread: return its last-published (line-less) frame snapshot —
-        // for a parked thread this is the blocking call site. Resolve line
-        // numbers from the BCI now that we hold the ClassStore (so a dump still
-        // gets source lines without paying for them at every deposit).
+        // Another thread: return its last-published frame snapshot — for a
+        // parked thread this is the blocking call site.
         let tid = resolve_thread_id_from_thread_obj(self.shared, thread_obj);
         let Some(tid) = tid else {
             return Vec::new();
         };
-        // Line-less snapshot (class.method + BCI). The published entry doesn't
-        // carry the ClassId/descriptor needed to resolve source lines, but
-        // class.method is sufficient to pinpoint where a parked thread is stuck.
-        self.shared.threads.thread_registry.frame_trace_of(tid)
+        // CR-CLO-1 (`docs/internal/arch-2026-07-26/cross-owner-closeout.md` §6).
+        //
+        // Two stale comments used to sit here. The first claimed line numbers
+        // were resolved "now that we hold the ClassStore" — and then called the
+        // UNRESOLVED `frame_trace_of`, every entry of which carries
+        // `line_number == -1` (the deposit path is `capture_frames_no_lines`,
+        // which is lock-free by design and must stay that way). The second
+        // claimed the published entry "doesn't carry the ClassId/descriptor
+        // needed to resolve source lines"; it has carried `class_id` for some
+        // time, and the eager path now also carries `method_index`. Net effect
+        // of believing them: every cross-thread thread dump printed line -1.
+        //
+        // `frame_trace_of_resolved` is `frame_trace_of` followed by
+        // `stackwalker::resolve_line_numbers_in_place`, run AFTER the registry
+        // lock is dropped (holding L5 across a `ClassStore` walk would invert
+        // the usual order) and against the returned copy, so the published
+        // snapshot stays exactly as deposited for the next reader. The resolver
+        // is fail-closed: it fills an unknown with the line an eager capture
+        // would have produced or leaves -1, never writes a wrong line, and
+        // never touches an entry that already has one — including the -2 native
+        // sentinel. The `class_manager.read()` is the same borrow the
+        // current-thread arm above already takes.
+        let cm = self.shared.classes.class_manager.read();
+        self.shared
+            .threads
+            .thread_registry
+            .frame_trace_of_resolved(tid, &cm.class_store)
     }
 
     fn thread_jmx_snapshot(
@@ -7903,17 +8028,29 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         }
     }
 
-    fn vt_release_carrier(&mut self) {
-        if matches!(self.thread.kind, crate::threading::ThreadKind::Virtual) {
-            self.shared.threads.virtual_scheduler.release();
-        }
-    }
-
-    fn vt_acquire_carrier(&mut self) {
-        if matches!(self.thread.kind, crate::threading::ThreadKind::Virtual) {
-            self.shared.threads.virtual_scheduler.acquire();
-        }
-    }
+    // `vt_release_carrier` / `vt_acquire_carrier` are deliberately NOT
+    // overridden — the `NativeContext` defaults (no-ops, see
+    // `native-api/src/registry.rs`) are the honest implementation.
+    //
+    // They used to release/acquire a `virtual_scheduler` permit. Two reasons
+    // that was wrong, both verified 2026-07-26:
+    //
+    //  1. Every caller is unreachable. All six call sites
+    //     (`native-builtins/src/lang_system.rs`, the three `Thread.sleep`
+    //     natives) are shaped as
+    //         let release = is_virtual && !pinned;              // pin_count == 0
+    //         if release && ctx.vt_park_for(d) { return ContinuationYield }
+    //         if release { ctx.vt_release_carrier(); }
+    //     and `vt_park_for` returns exactly `is_virtual && pin_count == 0` —
+    //     the same predicate as `release`, with nothing in between that can
+    //     change it. So whenever `release` holds the guarded return always
+    //     fires first and the two carrier calls are dead code.
+    //  2. The permit pool is disjoint from the carriers. Releasing freed no
+    //     carrier, and the paired `acquire()` could block a real carrier OS
+    //     thread on a permit nobody was going to return.
+    //
+    // Overriding them with no-ops explicitly (rather than deleting the
+    // overrides) would be equivalent; the defaults already say it.
 
     fn vt_park_for(&mut self, _duration: std::time::Duration) -> bool {
         matches!(self.thread.kind, crate::threading::ThreadKind::Virtual)
@@ -8645,12 +8782,23 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // Deposit root snapshot before blocking so GC can scan this thread
         self.deposit_root_snapshot();
 
-        // NEW-15.4: virtual-thread aware park.
-        // Non-pinned VTs release their carrier permit so another VT can run.
-        // Pinned VTs emit `jdk.VirtualThreadPinned` and keep the carrier.
+        // NEW-15.4: virtual-thread aware park — pinned VTs emit
+        // `jdk.VirtualThreadPinned`.
+        //
+        // A non-pinned VT used to `virtual_scheduler.release()` here and
+        // `.acquire()` after the park. That was removed 2026-07-26: the permit
+        // pool was disjoint from the real carriers, so the release freed no
+        // carrier (this OS thread stays blocked in `park_interruptible`
+        // either way — see §7.2 of
+        // `docs/internal/arch-2026-07-26/virtual-threads.md`), while the
+        // post-park `acquire()` was a live hang risk. Nothing else in the tree
+        // acquires from that pool, so with more concurrently-parked virtual
+        // threads than `carrier_count`, the surplus acquirers blocked on a
+        // permit no one would return — a carrier wedged waiting on a
+        // bookkeeping counter. Removing it loses no backpressure, because
+        // there was none to lose.
         let is_virtual = matches!(self.thread.kind, crate::threading::ThreadKind::Virtual);
         let pin_count = self.thread.pin_count;
-        let release = is_virtual && pin_count == 0;
         if is_virtual && pin_count > 0 {
             let reason = if self.thread.pin_reason.is_empty() {
                 "Pinned (park)"
@@ -8671,9 +8819,6 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 self.thread.thread_id.0,
                 now_ns,
             );
-        }
-        if release {
-            self.shared.threads.virtual_scheduler.release();
         }
 
         let park_start = std::time::Instant::now();
@@ -8713,9 +8858,6 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         }
         let park_dur = park_start.elapsed();
 
-        if release {
-            self.shared.threads.virtual_scheduler.acquire();
-        }
         // Check if GC happened while we were blocked
         self.check_post_block_gc();
         // AQS-PARK-PIN: drop the extra `parkBlocker` root now that we're done
@@ -19681,6 +19823,234 @@ mod tests {
         Arc::new(SharedVm::new(VmConfig::default()))
     }
 
+    /// Wire a thread into the registry exactly the way `spawn_thread`'s
+    /// `is_virtual` arm does: sharing the `root_snapshot` and
+    /// `Arc<GcBlockState>` is the ONLY reason
+    /// `ThreadRegistry::fold_pointer_map_into_blocked` can reach a parked
+    /// continuation at all.
+    fn register_like_virtual_mount(shared: &Arc<SharedVm>, thread: &JvmThread, tid: ThreadId) {
+        let reg = &shared.threads.thread_registry;
+        reg.register(tid, "vt-resume-gc-fixup-test", None);
+        reg.set_root_snapshot(tid, thread.root_snapshot.clone());
+        reg.set_gc_block_state(tid, thread.gc_block_state.clone());
+    }
+
+    fn parked_frame(obj: ObjectRef) -> crate::runtime::frame::Frame {
+        // `aload_0; return` — LOCAL[0] is live at pc 0, so the snapshot's
+        // local-liveness filter keeps it; LOCAL[1] is dead and is therefore
+        // covered only by the exact `slot_origins` write-back.
+        let mut frame = crate::runtime::frame::Frame::new(
+            ClassId::new(0),
+            "T".to_string(),
+            "parked".to_string(),
+            "()V".to_string(),
+            None,
+            vec![0x2a, 0xb1],
+            vec![],
+            8,
+            4,
+            &[],
+        );
+        frame.set_local(0, Value::Object(Some(obj)));
+        frame.set_local(1, Value::Object(Some(obj)));
+        frame.stack.push(Value::Object(Some(obj))).unwrap();
+        // Pushed into the snapshot unconditionally by `deposit_root_snapshot`,
+        // so this is what deterministically seeds the `fixup` chain — and it
+        // is healed ONLY by that chain, never by `slot_origins`.
+        frame.monitor_on_exit = Some(obj);
+        frame
+    }
+
+    fn slot_addr(v: Value) -> usize {
+        match v {
+            Value::Object(Some(o)) => o.as_ptr() as usize,
+            other => panic!("expected an object slot, got {other:?}"),
+        }
+    }
+
+    /// A virtual thread parked across a MOVING collection must resume with
+    /// remapped frame slots.
+    ///
+    /// Before the 2026-07-26 fix, `resume_virtual_continuation` cleared
+    /// `in_blocked_region` with a raw `store(false)` and never called
+    /// `check_post_block_gc()`, so everything the fold accumulated below was
+    /// silently dropped and the continuation resumed on vacated addresses.
+    #[test]
+    fn parked_continuation_resumes_with_remapped_frame_slots() {
+        let shared = test_shared();
+        let tid = ThreadId(0x7601);
+        let mut thread = JvmThread::new(tid, "vt-resume-gc-fixup-test");
+        register_like_virtual_mount(&shared, &thread, tid);
+
+        // `parked` is the address the frames hold; `moved_to` is where a
+        // copying young cycle relocated the object while we slept.
+        let parked = shared.mem.heap.alloc_object(ClassId::new(0), 0);
+        let moved_to = shared.mem.heap.alloc_object(ClassId::new(0), 0);
+        let old = parked.as_ptr() as usize;
+        let new = moved_to.as_ptr() as usize;
+        assert_ne!(old, new);
+
+        thread.frames.push(parked_frame(parked));
+
+        // --- park. This is what `suspend_runtime`'s caller does, and it
+        // RAISES `in_blocked_region` — which is exactly what excludes the
+        // thread from every subsequent stop-the-world census.
+        NativeContextImpl {
+            shared: &shared,
+            thread: &mut thread,
+        }
+        .deposit_root_snapshot();
+        assert!(
+            thread
+                .gc_block_state
+                .in_blocked_region
+                .load(std::sync::atomic::Ordering::Acquire),
+            "the park-side deposit must raise in_blocked_region"
+        );
+
+        // --- a moving collection runs while the continuation is parked.
+        let mut pointer_map = std::collections::HashMap::new();
+        pointer_map.insert(old, new);
+        shared
+            .threads
+            .thread_registry
+            .fold_pointer_map_into_blocked(&pointer_map);
+
+        // The accumulation/drain asymmetry, asserted directly: the fold
+        // remapped the snapshot and recorded the move, but deliberately did
+        // NOT touch the frames.
+        assert_eq!(
+            slot_addr(thread.frames[0].get_local(0)),
+            old,
+            "fold_pointer_map_into_blocked must not touch frames — that is the \
+             whole reason a drain on remount is required"
+        );
+        assert!(
+            thread.gc_block_state.fixup.lock().contains_key(&old),
+            "the move must be accumulated in the fixup chain"
+        );
+        assert!(
+            thread
+                .gc_block_state
+                .slot_origins
+                .lock()
+                .iter()
+                .any(|so| so.orig == old && so.cur == new),
+            "the exact per-slot tracker must have been advanced"
+        );
+
+        // --- remount. This is the call `resume_virtual_continuation` was
+        // missing.
+        NativeContextImpl {
+            shared: &shared,
+            thread: &mut thread,
+        }
+        .check_post_block_gc();
+
+        assert!(
+            !thread
+                .gc_block_state
+                .in_blocked_region
+                .load(std::sync::atomic::Ordering::Acquire),
+            "the wake must leave the blocked region"
+        );
+        assert_eq!(
+            slot_addr(thread.frames[0].get_local(0)),
+            new,
+            "live local must be forwarded"
+        );
+        assert_eq!(
+            slot_addr(thread.frames[0].get_local(1)),
+            new,
+            "dead local must be forwarded too (slot_origins write-back)"
+        );
+        assert_eq!(
+            slot_addr(thread.frames[0].stack.peek_at(0)),
+            new,
+            "operand stack slot must be forwarded"
+        );
+        assert_eq!(
+            thread.frames[0].monitor_on_exit.unwrap().as_ptr() as usize,
+            new,
+            "monitor_on_exit must be forwarded, or the implicit monitorexit \
+             releases a vacated address"
+        );
+    }
+
+    /// The drain runs exactly once: `check_post_block_gc_refs` `mem::take`s
+    /// both `fixup` and `slot_origins`, and once the flag is down no further
+    /// fold can target this thread — so a repeated wake is inert rather than
+    /// double-applying a chain onto already-forwarded slots.
+    #[test]
+    fn blocked_region_drain_is_idempotent() {
+        let shared = test_shared();
+        let tid = ThreadId(0x7602);
+        let mut thread = JvmThread::new(tid, "vt-resume-gc-fixup-test");
+        register_like_virtual_mount(&shared, &thread, tid);
+
+        let parked = shared.mem.heap.alloc_object(ClassId::new(0), 0);
+        let moved_to = shared.mem.heap.alloc_object(ClassId::new(0), 0);
+        let old = parked.as_ptr() as usize;
+        let new = moved_to.as_ptr() as usize;
+
+        thread.frames.push(parked_frame(parked));
+        NativeContextImpl {
+            shared: &shared,
+            thread: &mut thread,
+        }
+        .deposit_root_snapshot();
+
+        let mut pointer_map = std::collections::HashMap::new();
+        pointer_map.insert(old, new);
+        shared
+            .threads
+            .thread_registry
+            .fold_pointer_map_into_blocked(&pointer_map);
+
+        NativeContextImpl {
+            shared: &shared,
+            thread: &mut thread,
+        }
+        .check_post_block_gc();
+
+        assert!(
+            thread.gc_block_state.fixup.lock().is_empty(),
+            "the fixup chain must be drained, not merely read"
+        );
+        assert!(
+            thread.gc_block_state.slot_origins.lock().is_empty(),
+            "the slot tracker must be drained, not merely read"
+        );
+
+        // A second wake — e.g. a remount racing an unpark — must be a no-op.
+        NativeContextImpl {
+            shared: &shared,
+            thread: &mut thread,
+        }
+        .check_post_block_gc();
+
+        assert_eq!(
+            slot_addr(thread.frames[0].get_local(0)),
+            new,
+            "a second drain must not re-apply anything"
+        );
+        assert_eq!(
+            slot_addr(thread.frames[0].get_local(1)),
+            new,
+            "a second drain must not re-apply anything"
+        );
+        assert_eq!(
+            slot_addr(thread.frames[0].stack.peek_at(0)),
+            new,
+            "a second drain must not re-apply anything"
+        );
+        assert_eq!(
+            thread.frames[0].monitor_on_exit.unwrap().as_ptr() as usize,
+            new,
+            "a second drain must not re-apply anything"
+        );
+    }
+
     #[test]
     fn downcall_handle_uses_method_handle_signature_polymorphic_dispatch() {
         assert!(is_method_handle_signature_polymorphic_receiver(
@@ -21195,5 +21565,179 @@ mod tests {
             Value::Long(1),
             "successful CAS must persist with the declared `J` tag"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // CR-CLO-1 — `thread_stack_trace`'s cross-thread arm
+    // (`docs/internal/arch-2026-07-26/vm-exec-closeout.md` §1)
+    // -----------------------------------------------------------------------
+
+    fn line_less_entry(class_id: ClassId, method: &str, bci: i32) -> StackTraceEntry {
+        StackTraceEntry {
+            class_name: Arc::from("probe/Target"),
+            method_name: Arc::from(method),
+            source_file: Some(Arc::from("Target.java")),
+            // Exactly what the lock-free deposit path publishes.
+            line_number: -1,
+            byte_code_index: bci,
+            class_id: Some(class_id),
+            method_index: None,
+        }
+    }
+
+    /// The bug CR-CLO-1 names: the arm's comment claimed lines were resolved,
+    /// the call was the unresolved reader, and every dumped frame read `-1`.
+    /// Pin both halves — the raw reader still yields `-1` (that is its
+    /// documented contract, and the lock-free depositor depends on it), and the
+    /// reader the arm now uses fills the line in.
+    #[test]
+    fn a_cross_thread_dump_now_carries_source_lines() {
+        use crate::runtime::stackwalker::test_support::{named_method, store_with};
+        use cratonvm_reader::attribute::LineNumberEntry;
+
+        let (store, cid) = store_with(vec![named_method(
+            "run",
+            "()V",
+            vec![LineNumberEntry {
+                start_pc: 0,
+                line_number: 91,
+            }],
+        )]);
+        let shared = test_shared();
+        let tid = ThreadId(0xC101);
+        shared
+            .threads
+            .thread_registry
+            .register(tid, "cr-clo-1-worker", None);
+        let published = Arc::new(parking_lot::Mutex::new(vec![line_less_entry(
+            cid, "run", 0,
+        )]));
+        shared
+            .threads
+            .thread_registry
+            .set_frame_trace(tid, published.clone());
+
+        let raw = shared.threads.thread_registry.frame_trace_of(tid);
+        assert_eq!(
+            raw[0].line_number, -1,
+            "the deposit path is line-less by design; if this ever changes, the \
+             cross-thread arm's premise changes with it"
+        );
+
+        let resolved = shared
+            .threads
+            .thread_registry
+            .frame_trace_of_resolved(tid, &store);
+        assert_eq!(
+            resolved[0].line_number, 91,
+            "this is the call `thread_stack_trace`'s cross-thread arm makes"
+        );
+    }
+
+    /// The published snapshot belongs to the *thread being dumped*, not to the
+    /// dumper. Resolving must not write through to it, or one dump would
+    /// mutate what a concurrent dump (or the crash handler) sees.
+    #[test]
+    fn resolving_a_dump_leaves_the_published_snapshot_untouched() {
+        use crate::runtime::stackwalker::test_support::{named_method, store_with};
+        use cratonvm_reader::attribute::LineNumberEntry;
+
+        let (store, cid) = store_with(vec![named_method(
+            "run",
+            "()V",
+            vec![LineNumberEntry {
+                start_pc: 0,
+                line_number: 91,
+            }],
+        )]);
+        let shared = test_shared();
+        let tid = ThreadId(0xC102);
+        shared
+            .threads
+            .thread_registry
+            .register(tid, "cr-clo-1-worker", None);
+        let published = Arc::new(parking_lot::Mutex::new(vec![line_less_entry(
+            cid, "run", 0,
+        )]));
+        shared
+            .threads
+            .thread_registry
+            .set_frame_trace(tid, published.clone());
+
+        let first = shared
+            .threads
+            .thread_registry
+            .frame_trace_of_resolved(tid, &store);
+        assert_eq!(first[0].line_number, 91);
+        assert_eq!(
+            published.lock()[0].line_number,
+            -1,
+            "resolution must run on the returned copy, not the deposited one"
+        );
+        let second = shared
+            .threads
+            .thread_registry
+            .frame_trace_of_resolved(tid, &store);
+        assert_eq!(second[0].line_number, 91, "and it must be repeatable");
+    }
+
+    /// Fail-closed, end to end: an unknown class (the `ClassStore` the dumper
+    /// holds is not the one the frame was captured against — e.g. the class was
+    /// unloaded) drops the *line*, never the frame. A thread dump that loses
+    /// the call site is worse than one that loses the line.
+    #[test]
+    fn a_dump_of_a_thread_whose_class_is_gone_keeps_the_frame() {
+        use crate::runtime::stackwalker::test_support::{named_method, store_with};
+
+        use cratonvm_reader::attribute::LineNumberEntry;
+
+        let (mut store, cid) = store_with(vec![named_method(
+            "run",
+            "()V",
+            vec![LineNumberEntry {
+                start_pc: 0,
+                line_number: 91,
+            }],
+        )]);
+        let shared = test_shared();
+        let tid = ThreadId(0xC103);
+        shared
+            .threads
+            .thread_registry
+            .register(tid, "cr-clo-1-worker", None);
+        shared.threads.thread_registry.set_frame_trace(
+            tid,
+            Arc::new(parking_lot::Mutex::new(vec![line_less_entry(
+                cid, "run", 0,
+            )])),
+        );
+        // The class the frame was captured against is unloaded between the
+        // deposit and the dump — `ClassId`s are never reused, so this can only
+        // ever fail closed.
+        let _ = store.remove(cid);
+
+        let resolved = shared
+            .threads
+            .thread_registry
+            .frame_trace_of_resolved(tid, &store);
+        assert_eq!(resolved.len(), 1, "the frame itself must survive");
+        assert_eq!(resolved[0].line_number, -1);
+        assert_eq!(&*resolved[0].method_name, "run");
+    }
+
+    /// A thread that never registered (or has already been reaped) must yield
+    /// an empty dump, not a panic — `thread_stack_trace` is reachable from
+    /// `ThreadMXBean.dumpAllThreads` while threads are exiting.
+    #[test]
+    fn a_dump_of_an_unknown_thread_is_empty_not_a_panic() {
+        use crate::runtime::stackwalker::test_support::{named_method, store_with};
+
+        let (store, _cid) = store_with(vec![named_method("run", "()V", Vec::new())]);
+        let shared = test_shared();
+        assert!(shared
+            .threads
+            .thread_registry
+            .frame_trace_of_resolved(ThreadId(0xDEAD), &store)
+            .is_empty());
     }
 }

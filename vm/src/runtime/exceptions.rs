@@ -14,17 +14,51 @@ use crate::types::{ObjectRef, Value};
 use crate::vm::{invoke_on_class_shared, try_create_java_string, SharedVm};
 use std::sync::OnceLock;
 
-/// Cached read of the `CRATONVM_IAE_TRACE` env var. Env-var lookups are
-/// surprisingly expensive (mutex + string alloc on some platforms); the
-/// exception-throw hot path is sensitive to per-throw overhead, so we read
-/// once at first use and cache the boolean. Process-lifetime cache: setting
-/// the var after the first exception is thrown will have no effect.
-static IAE_TRACE: OnceLock<bool> = OnceLock::new();
+/// Cached read of a `CRATONVM_DBG_*` / `CRATONVM_*_TRACE` env var. Env-var
+/// lookups are surprisingly expensive (a `getenv` mutex + `OsString` alloc on
+/// Linux, a ~500 ns `GetEnvironmentVariableW` syscall + UTF-16 decode on
+/// Windows); the exception-throw path is sensitive to per-throw overhead, so we
+/// read once at first use and cache the boolean.
+///
+/// Process-lifetime cache: setting the var after the first exception is thrown
+/// has no effect. Identical policy to [`crate::runtime::env_cache`], which
+/// documents this module's original `iae_trace_enabled` as the pattern's
+/// origin; these helpers stay local because the flags below are only read from
+/// this file.
+///
+/// Why this matters: every one of these was previously an **uncached**
+/// `std::env::var_os` on the `throw_runtime_error` / `convert_class_not_found`
+/// / `throw_linkage_error` entry paths. `throw_runtime_error` alone paid three
+/// of them on *every* VM-raised throw (NPE, CCE, AIOOBE, ISE, IOException, …)
+/// — i.e. ~1.5 µs of pure syscall on Windows before a single useful
+/// instruction ran. Framework code (Spring, Hibernate, the JUnit/Surefire
+/// harnesses) throws as control flow, so this was a first-order cost.
+macro_rules! cached_env_flag {
+    ($name:ident, $env:literal) => {
+        #[inline]
+        fn $name() -> bool {
+            static CACHE: OnceLock<bool> = OnceLock::new();
+            *CACHE.get_or_init(|| std::env::var_os($env).is_some())
+        }
+    };
+}
 
+/// `CRATONVM_IAE_TRACE` — the original cached flag (kept with `env::var`
+/// semantics it has always had; `var` vs `var_os` only differ for non-UTF-8
+/// values, which we never set).
 #[inline]
 fn iae_trace_enabled() -> bool {
+    static IAE_TRACE: OnceLock<bool> = OnceLock::new();
     *IAE_TRACE.get_or_init(|| std::env::var("CRATONVM_IAE_TRACE").is_ok())
 }
+
+cached_env_flag!(dbg_npe_none, "CRATONVM_DBG_NPE_NONE");
+cached_env_flag!(dbg_aioobe, "CRATONVM_DBG_AIOOBE");
+cached_env_flag!(dbg_bufunder, "CRATONVM_DBG_BUFUNDER");
+cached_env_flag!(dbg_npe_trace, "CRATONVM_DBG_NPE_TRACE");
+cached_env_flag!(dbg_wf_npe, "CRATONVM_DBG_WF_NPE");
+cached_env_flag!(dbg_ncdfe, "CRATONVM_DBG_NCDFE");
+cached_env_flag!(dbg_verify_error, "CRATONVM_DBG_VERIFY_ERROR");
 
 // ===========================================================================
 // JEP 358 — Helpful NullPointerException messages
@@ -896,6 +930,92 @@ fn set_detail_message_by_name(shared: &SharedVm, obj: ObjectRef, string_ref: Obj
     }
 }
 
+/// Resolve the absolute heap field index of the first non-static field named
+/// `name` found walking `obj`'s class hierarchy (most-derived first), using the
+/// same `first_field_index` + declaration-order counting scheme as
+/// [`set_detail_message_by_name`] / [`set_cause_by_name`].
+///
+/// Read-only companion to those setters: it takes the `class_manager` read lock
+/// for the duration of the walk and releases it before returning, so callers
+/// never hold it across a heap access.
+fn instance_field_index_by_name(shared: &SharedVm, obj: ObjectRef, name: &str) -> Option<usize> {
+    let class_id = shared.mem.heap.class_id_of(obj);
+    let cm = shared.classes.class_manager.read();
+    let mut walk = Some(class_id);
+    while let Some(cid) = walk {
+        let cls = cm.get_class(cid)?;
+        let mut inst = 0usize;
+        for f in &cls.fields {
+            if f.is_static() {
+                continue;
+            }
+            if &*f.name == name {
+                return Some(cls.first_field_index + inst);
+            }
+            inst += 1;
+        }
+        walk = cls.superclass;
+    }
+    None
+}
+
+/// Whether the throwable's stack trace was already captured by its constructor
+/// **at exactly the current frame depth** — in which case re-running
+/// `fillInStackTrace` would recompute and re-store a byte-identical trace.
+///
+/// `capture_throwable_trace` (native-builtins `lang_misc.rs`, the shared body of
+/// every `native_exc_init_*` constructor shadow *and* of
+/// `Throwable.fillInStackTrace`) writes two markers on the throwable:
+///
+/// * `backtrace = this` — the non-null marker real-JDK `getOurStackTrace()`
+///   requires before it will materialise any frames, and
+/// * `depth = trace.len()` — and the captured trace is the *whole* Java stack
+///   (`capture_full_trace` maps every entry of `thread.frames`), so
+///   `depth == thread.frames.len()` **as it stood at capture time**.
+///
+/// So `backtrace == this && depth == frames.len()` proves the constructor's
+/// capture was taken with this thread's frame stack in exactly the state
+/// `fillInStackTrace` would see now — same frames, same `last_instr_pc` per
+/// frame, therefore the same `StackTraceEntry` vector.
+///
+/// The check deliberately fails **closed**: a bytecode (non-shadowed) `<init>`
+/// runs inside a pushed Java frame, so its capture records `depth ==
+/// frames.len() + k` for the `k` constructor frames — the comparison then
+/// mismatches and the explicit `fillInStackTrace` below still runs, replacing
+/// the constructor-frame-contaminated trace with the clean one. Likewise a
+/// missing / unwritten `depth` or `backtrace` field (opaque `_fN` bootstrap
+/// layouts, `depth == 0`) returns `false`. Fidelity is never traded for the
+/// saved walk: we skip only when the two traces are provably identical.
+fn trace_already_captured_at_current_depth(
+    shared: &SharedVm,
+    thread: &JvmThread,
+    obj: ObjectRef,
+) -> bool {
+    let frames = thread.frames.len();
+    if frames == 0 {
+        // Nothing to capture either way; leave the legacy path untouched so the
+        // trace store still gets its (empty) entry exactly as before.
+        return false;
+    }
+    // `backtrace` must be the self-reference marker `capture_throwable_trace`
+    // parks there. Anything else (null, unset — which reads back as `Int(0)`,
+    // not `Object(None)` — or a real JDK backtrace object) means our capture
+    // did not run.
+    let Some(bt_idx) = instance_field_index_by_name(shared, obj, "backtrace") else {
+        return false;
+    };
+    if shared.mem.heap.get_field(obj, bt_idx) != Value::Object(Some(obj)) {
+        return false;
+    }
+    let Some(depth_idx) = instance_field_index_by_name(shared, obj, "depth") else {
+        return false;
+    };
+    matches!(
+        shared.mem.heap.get_field(obj, depth_idx),
+        Value::Int(d) if d > 0 && d as usize == frames
+    )
+}
+
 /// Resolve `Throwable.cause` (or any inherited Throwable field by that
 /// name) and write `cause_ref` to it. Same by-name hierarchy walk as
 /// `set_detail_message_by_name` just above, reused so a cause can be
@@ -1128,18 +1248,42 @@ pub fn create_exception_object_for_class(
         }
     }
 
-    // 4. Call fillInStackTrace
-    // This is done automatically by the Throwable constructor in most JDK versions,
-    // but we call it explicitly just in case.
+    // 4. Call fillInStackTrace — but only if the constructor did not already
+    //    capture an identical trace.
+    //
+    // Historically this ran unconditionally ("just in case" the constructor
+    // didn't do it). That made every VM-raised throw capture the stack **twice**:
+    // the `native_exc_init_*` constructor shadows registered for ~50 exception
+    // subclasses all funnel through `capture_throwable_trace`, and so does
+    // `Throwable.fillInStackTrace`. Each capture is *not* cheap — per Java frame
+    // it resolves the method in the `ClassStore` and linearly scans its
+    // `LineNumberTable` (`stackwalker::entry_from_frame`), then the result is
+    // allocated into a `Vec<StackTraceEntry>`, **cloned** a second time
+    // (`NativeContextImpl::capture_throwable_stack_trace`), and inserted into the
+    // VM-wide `throwable_stacks` map under a `RwLock::write`. At a Spring/JUnit
+    // stack depth of 50-150 frames that is two O(depth) walks, four vector
+    // allocations and two global write-lock acquisitions per throw, where one of
+    // each suffices — and the second capture's result was byte-identical to the
+    // first, so it was pure waste that also *replaced* a correct entry with an
+    // equal one.
+    //
+    // `trace_already_captured_at_current_depth` only reports `true` when the
+    // constructor's capture provably matches what this call would produce (see
+    // its doc for the `backtrace`/`depth` proof, and for why every uncertain
+    // case — bytecode `<init>`, opaque field layouts, absent markers — falls
+    // through to the explicit call). Fidelity is preserved exactly; only the
+    // duplicate is removed.
     let obj_ref = thread.native_pin_roots[pin_base];
-    let _ = invoke_on_class_shared(
-        shared,
-        thread,
-        class_id,
-        "fillInStackTrace",
-        "(I)Ljava/lang/Throwable;",
-        &[Value::Object(Some(obj_ref)), Value::Int(0)],
-    );
+    if !trace_already_captured_at_current_depth(shared, thread, obj_ref) {
+        let _ = invoke_on_class_shared(
+            shared,
+            thread,
+            class_id,
+            "fillInStackTrace",
+            "(I)Ljava/lang/Throwable;",
+            &[Value::Object(Some(obj_ref)), Value::Int(0)],
+        );
+    }
 
     let obj_ref = thread.native_pin_roots[pin_base];
     thread.native_pin_roots.truncate(pin_base);
@@ -1175,7 +1319,7 @@ pub fn throw_runtime_error(
     // thrown from Rust (as opposed to constructed by Java bytecode via
     // `new NullPointerException()`), so the exact Rust throw site is known
     // instead of inferred from bytecode-level probes.
-    if std::env::var_os("CRATONVM_DBG_NPE_NONE").is_some() {
+    if dbg_npe_none() {
         if let RuntimeError::NullPointerException { message: None } = &error {
             eprintln!(
                 "[npe-none] message-less NPE thrown — Java stack ({} frames, deepest first):",
@@ -1196,7 +1340,7 @@ pub fn throw_runtime_error(
             );
         }
     }
-    if std::env::var_os("CRATONVM_DBG_AIOOBE").is_some() {
+    if dbg_aioobe() {
         if let RuntimeError::ArrayIndexOutOfBoundsException { index } = &error {
             eprintln!(
                 "[AIOOBE-THROW] index={index} — full live Java thread stack ({} frames, deepest first):",
@@ -1226,9 +1370,7 @@ pub fn throw_runtime_error(
     // `CRATONVM_DBG_ATHROW` only ever shows the later Java-level rethrow
     // (e.g. Lucene's `IOUtils.rethrowAlways`) — this dump names the true
     // origin frame instead.
-    if std::env::var_os("CRATONVM_DBG_BUFUNDER").is_some()
-        && matches!(&error, RuntimeError::BufferUnderflowException)
-    {
+    if dbg_bufunder() && matches!(&error, RuntimeError::BufferUnderflowException) {
         eprintln!(
             "[BUFUNDER-THROW] — full live Java thread stack ({} frames, deepest first):",
             thread.frames.len()
@@ -1326,7 +1468,7 @@ pub fn throw_runtime_error(
                 }
             }
             // C29 / SUREFIRE NPE traces — opt-in via CRATONVM_DBG_NPE_TRACE.
-            if std::env::var_os("CRATONVM_DBG_NPE_TRACE").is_some() {
+            if dbg_npe_trace() {
                 if let RuntimeError::NullPointerException { message: Some(m) } = &error {
                     if m.contains("isInterface") {
                         for (i, f) in thread.frames.iter().enumerate().rev().take(20) {
@@ -1365,7 +1507,7 @@ pub fn throw_runtime_error(
             // bytecode op produces the bare-NPE that bubbles up as the
             // ExceptionInInitializerError that crashes WildFly boot. Opt-in
             // via CRATONVM_DBG_WF_NPE to avoid stderr spam during boot.
-            if std::env::var_os("CRATONVM_DBG_WF_NPE").is_some() {
+            if dbg_wf_npe() {
                 let in_log4j_init = thread.frames.iter().any(|f| {
                     let cn = shared
                         .classes
@@ -1772,7 +1914,7 @@ pub fn throw_linkage_error(
     error: LinkageError,
 ) -> MethodCallFailed {
     let (class_name, detail) = linkage_throwable(&error);
-    if std::env::var_os("CRATONVM_DBG_VERIFY_ERROR").is_some() {
+    if dbg_verify_error() {
         if let LinkageError::VerifyError {
             class_name,
             method_name,
@@ -1804,7 +1946,7 @@ pub fn convert_class_not_found(
     class_name: &str,
     err: MethodCallFailed,
 ) -> MethodCallFailed {
-    if std::env::var_os("CRATONVM_DBG_NCDFE").is_some() {
+    if dbg_ncdfe() {
         eprintln!("[NCDFE] class={} err={:?}", class_name, err);
         let cm = shared.classes.class_manager.read();
         for (i, f) in thread.frames.iter().enumerate().rev().take(20) {
@@ -1865,6 +2007,156 @@ mod tests {
 
     fn test_vm() -> Vm {
         Vm::new(VmConfig::default())
+    }
+
+    // -----------------------------------------------------------------------
+    // Cached debug-flag helpers (throw hot path)
+    // -----------------------------------------------------------------------
+
+    /// `throw_runtime_error` used to pay three uncached `std::env::var_os`
+    /// lookups on *every* VM-raised throw, plus one each in
+    /// `convert_class_not_found` and `throw_linkage_error`. They are now
+    /// process-lifetime memoized. The failure mode a memo introduces is a typo'd
+    /// or inverted variable name — the switch would silently never fire and the
+    /// next person debugging an NPE origin would chase a dead flag. Comparing
+    /// each helper against the live environment catches exactly that.
+    #[test]
+    fn cached_throw_path_debug_flags_match_environment_and_are_stable() {
+        let pairs: [(fn() -> bool, &str); 7] = [
+            (dbg_npe_none, "CRATONVM_DBG_NPE_NONE"),
+            (dbg_aioobe, "CRATONVM_DBG_AIOOBE"),
+            (dbg_bufunder, "CRATONVM_DBG_BUFUNDER"),
+            (dbg_npe_trace, "CRATONVM_DBG_NPE_TRACE"),
+            (dbg_wf_npe, "CRATONVM_DBG_WF_NPE"),
+            (dbg_ncdfe, "CRATONVM_DBG_NCDFE"),
+            (dbg_verify_error, "CRATONVM_DBG_VERIFY_ERROR"),
+        ];
+        for (flag, name) in pairs {
+            let expected = std::env::var_os(name).is_some();
+            assert_eq!(
+                flag(),
+                expected,
+                "cached flag disagrees with env for {name}"
+            );
+            assert_eq!(flag(), expected, "cached flag for {name} is not stable");
+        }
+        assert_eq!(
+            iae_trace_enabled(),
+            std::env::var("CRATONVM_IAE_TRACE").is_ok()
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Stack-trace capture: no duplicate walk, no lost fidelity
+    // -----------------------------------------------------------------------
+
+    /// The skip guard must fail **closed** when the thread has no Java frames.
+    /// A freshly built VM's main thread is in exactly that state, and it is the
+    /// state every bootstrap-era throwable is constructed in — so the explicit
+    /// `fillInStackTrace` still runs there and the legacy behaviour is bit-for-bit
+    /// preserved.
+    #[test]
+    fn duplicate_trace_guard_is_closed_with_no_frames() {
+        let mut vm = test_vm();
+        let Ok(obj) = create_exception_object(
+            &vm.shared,
+            &mut vm.main_thread,
+            "java/lang/IllegalStateException",
+            Some("probe"),
+        ) else {
+            // Stripped VM (no JDK on the test classpath): nothing to probe with.
+            return;
+        };
+        // Any heap object works as the probe: with zero frames the guard must
+        // short-circuit to `false` before it ever looks at a field.
+        if vm.main_thread.frames.is_empty() {
+            assert!(
+                !trace_already_captured_at_current_depth(&vm.shared, &vm.main_thread, obj),
+                "guard must not skip fillInStackTrace when there are no frames"
+            );
+        }
+    }
+
+    /// The core fidelity invariant behind dropping the redundant
+    /// `fillInStackTrace` call: whenever the constructor's capture actually ran
+    /// (proved by the `backtrace = this` self-marker that
+    /// `capture_throwable_trace` parks there), a trace **must** be registered in
+    /// the VM-wide store keyed by the throwable's identity hash.
+    ///
+    /// If that implication ever breaks, `create_exception_object` could skip the
+    /// explicit `fillInStackTrace` and leave the throwable with an empty
+    /// `getStackTrace()` — the precise regression this change must never cause.
+    #[test]
+    fn constructor_capture_marker_implies_a_registered_trace() {
+        let mut vm = test_vm();
+        let Ok(obj) = create_exception_object(
+            &vm.shared,
+            &mut vm.main_thread,
+            "java/lang/IllegalStateException",
+            Some("boom"),
+        ) else {
+            // Stripped VM (no JDK on the test classpath): nothing to assert.
+            return;
+        };
+        let Some(bt_idx) = instance_field_index_by_name(&vm.shared, obj, "backtrace") else {
+            return;
+        };
+        if vm.shared.mem.heap.get_field(obj, bt_idx) != Value::Object(Some(obj)) {
+            // Our capture never ran for this class in this configuration.
+            return;
+        }
+        let hash = vm.shared.mem.heap.identity_hash_code(obj);
+        assert!(
+            vm.shared.throwable_stack_trace(hash).is_some(),
+            "backtrace self-marker is set but no trace was registered"
+        );
+    }
+
+    /// Nested / rethrown shape: building a second throwable while the first is
+    /// still live must not evict or overwrite the first one's trace. The store
+    /// is keyed by identity hash, so both entries have to coexist — otherwise a
+    /// `catch (E e) { throw new F(e); }` chain would print the wrong frames for
+    /// the cause.
+    #[test]
+    fn nested_throwables_keep_independent_traces() {
+        let mut vm = test_vm();
+        let Ok(inner) = create_exception_object(
+            &vm.shared,
+            &mut vm.main_thread,
+            "java/lang/IllegalStateException",
+            Some("inner"),
+        ) else {
+            return;
+        };
+        let inner_hash = vm.shared.mem.heap.identity_hash_code(inner);
+        let Some(inner_trace) = vm.shared.throwable_stack_trace(inner_hash) else {
+            return;
+        };
+
+        // Pin `inner` so building the outer throwable cannot collect or move it
+        // out from under the identity hash we just read.
+        vm.main_thread.native_pin_roots.push(inner);
+        let outer = create_exception_object(
+            &vm.shared,
+            &mut vm.main_thread,
+            "java/lang/IllegalArgumentException",
+            Some("outer"),
+        );
+        let inner = vm.main_thread.native_pin_roots.pop().expect("pinned inner");
+
+        let Ok(outer) = outer else { return };
+        let outer_hash = vm.shared.mem.heap.identity_hash_code(outer);
+        let inner_hash = vm.shared.mem.heap.identity_hash_code(inner);
+
+        assert!(
+            vm.shared.throwable_stack_trace(outer_hash).is_some(),
+            "outer throwable lost its trace"
+        );
+        assert_eq!(
+            vm.shared.throwable_stack_trace(inner_hash).map(|t| t.len()),
+            Some(inner_trace.len()),
+            "constructing the outer throwable clobbered the inner one's trace"
+        );
     }
 
     // -----------------------------------------------------------------------

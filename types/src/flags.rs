@@ -449,6 +449,45 @@ pub enum BlockedAccessMode {
     Panic,
 }
 
+/// Compiled-in default for the moving (compacting) young generation.
+///
+/// # This is the flip
+///
+/// `ARCHITECTURE.md` advertises a "generational semi-space collector (Cheney
+/// moving young gen)". Making that true is a **one-constant change here** —
+/// once, and only once, the codegen side reads [`GcFlags::moving_young`]
+/// instead of parsing `CRATONVM_MOVING_YOUNG` itself.
+///
+/// ## The remaining blocker (exact)
+///
+/// `jit/src/x64.rs::moving_young_enabled()` is
+/// `*G.get_or_init(|| std::env::var_os("CRATONVM_MOVING_YOUNG").is_some())`.
+/// It decides whether the JIT emits the shadow-stack push/reload sequences at
+/// all, whether `collect_live_oop_homes` publishes the *complete* home set,
+/// and whether `OopMapEntry::moving_young_coverage_complete` can ever be true.
+/// Nothing outside that file can cause a rewritable root map to be emitted, so
+/// a collector that relocates while it is `false` relocates objects whose only
+/// home is a JIT register that nothing will ever rewrite.
+///
+/// Its body must become:
+///
+/// ```ignore
+/// pub fn moving_young_enabled() -> bool {
+///     cratonvm_types::flags().gc.moving_young
+/// }
+/// ```
+///
+/// (`cratonvm-jit` already depends on `cratonvm-types`.) After that, flipping
+/// this constant to `true` flips codegen, root gathering and the collector
+/// together, and no skew between them is representable.
+///
+/// Until then this stays `false`, because the three layers agree today only
+/// because all three parse the same variable the same way — and flipping any
+/// subset is heap corruption, not a risk of it.
+///
+/// See `docs/internal/arch-2026-07-26/moving-young-precise-roots.md`.
+pub const DEFAULT_MOVING_YOUNG: bool = false;
+
 /// Flags read by `cratonvm-gc` (and, for the shared ones, by `jit` and `vm`).
 ///
 /// Unless a field says otherwise it was built with [`parse::present`], i.e. it
@@ -456,13 +495,36 @@ pub enum BlockedAccessMode {
 #[derive(Debug, Clone, Default)]
 pub struct GcFlags {
     // ── Semantics-changing ────────────────────────────────────────────────
-    /// `CRATONVM_MOVING_YOUNG` — enable the moving young generation.
+    /// The moving (compacting, Cheney) young generation.
+    ///
+    /// Shaped as an **opt-OUT** (`CRATONVM_NO_MOVING_YOUNG`) over
+    /// [`DEFAULT_MOVING_YOUNG`]; `CRATONVM_MOVING_YOUNG` is retained as a
+    /// backwards-compatible opt-IN that becomes a no-op once the default
+    /// flips. Not [`parse::present`] — see [`GcFlags::from_source`].
+    ///
+    /// `DEFAULT_MOVING_YOUNG` is currently `false`, and the one remaining
+    /// reason is recorded in
+    /// `docs/internal/arch-2026-07-26/moving-young-precise-roots.md`:
+    /// `jit/src/x64.rs::moving_young_enabled` still reads
+    /// `CRATONVM_MOVING_YOUNG` from the environment directly instead of from
+    /// this field, so flipping the constant here would make the COLLECTOR
+    /// relocate while the CODEGEN emits no rewritable root map.
+    ///
+    /// The former companion flag `CRATONVM_ALLOW_MOVING_YOUNG` is **gone**. It
+    /// was a second opt-in that had to be set *in addition* to this one before
+    /// `gen_heap` would run a moving cycle under a live JIT frame — i.e. in
+    /// the only situation the feature exists for — which is why the feature
+    /// was repeatedly "implemented" and repeatedly still a gap. A flag whose
+    /// sole job is to permit correct behaviour is not a safety mechanism; the
+    /// per-cycle coverage proof is.
     pub moving_young: bool,
-    /// `CRATONVM_ALLOW_MOVING_YOUNG` — permit moving young collection in
-    /// contexts that otherwise force non-moving.
-    pub allow_moving_young: bool,
-    /// `CRATONVM_MOVING_YOUNG_FALLBACKS` — take the moving-young fallback
-    /// paths instead of failing.
+    /// `CRATONVM_MOVING_YOUNG_FALLBACKS` — **verbosity only.**
+    ///
+    /// Coverage-fallback reporting is now unconditional and at `warn` level
+    /// (`gc::gc_quiescence::record_moving_young_coverage_fallback`), because a
+    /// silent slide back to the non-moving sweep is exactly how the young
+    /// generation stopped being a copying collector unnoticed. This flag now
+    /// only asks for *every* occurrence instead of the rate-limited subset.
     pub moving_young_fallbacks: bool,
     /// `CRATONVM_NO_GC_PROMOTION_GUARD` — opt **out** of the promotion-OOM
     /// guard. Consumers want `!no_gc_promotion_guard`.
@@ -616,8 +678,18 @@ impl GcFlags {
     fn from_source(src: &dyn FlagSource) -> Self {
         use parse::*;
         Self {
-            moving_young: present(src, "CRATONVM_MOVING_YOUNG"),
-            allow_moving_young: present(src, "CRATONVM_ALLOW_MOVING_YOUNG"),
+            // Opt-OUT over the compiled-in default, with the historical
+            // opt-in still honoured. Deliberately NOT `present`: this is the
+            // one gate that decides whether the young generation compacts,
+            // and it must be flippable by changing `DEFAULT_MOVING_YOUNG`
+            // alone. See that constant for the remaining blocker.
+            moving_young: if present(src, "CRATONVM_NO_MOVING_YOUNG") {
+                false
+            } else if present(src, "CRATONVM_MOVING_YOUNG") {
+                true
+            } else {
+                DEFAULT_MOVING_YOUNG
+            },
             moving_young_fallbacks: present(src, "CRATONVM_MOVING_YOUNG_FALLBACKS"),
             no_gc_promotion_guard: present(src, "CRATONVM_NO_GC_PROMOTION_GUARD"),
             promotion_oom_guard_broad: present(src, "CRATONVM_PROMOTION_OOM_GUARD_BROAD"),
@@ -1654,7 +1726,12 @@ mod tests {
     fn empty_source_matches_all_documented_defaults() {
         let f = VmFlags::from_source(&MapSource::empty());
         // Every opt-in flag is off…
-        assert!(!f.gc.moving_young);
+        // `moving_young` is no longer an opt-in — it tracks
+        // `DEFAULT_MOVING_YOUNG`, which is the single constant that flips the
+        // young generation to a copying collector. Assert against the constant,
+        // not against `false`, so the flip does not have to edit this test (and
+        // so this test cannot silently become the thing that blocks it).
+        assert_eq!(f.gc.moving_young, DEFAULT_MOVING_YOUNG);
         assert!(!f.gc.card_table_only);
         assert!(!f.gc.dbg_a2);
         assert!(!f.jit.shadow_stack);
@@ -1706,11 +1783,34 @@ mod tests {
     fn presence_parser_treats_zero_as_set() {
         // This is the surprising-but-existing majority semantics: `X=0` is ON
         // for every `var_os(..).is_some()` site. Locked down so the migration
-        // cannot quietly "fix" it.
+        // cannot quietly "fix" it. `moving_young` keeps this semantics for its
+        // compatibility opt-in — `jit/src/x64.rs` still parses the same
+        // variable with `var_os(..).is_some()`, and the two MUST agree.
         let f = VmFlags::from_source(&src(&[("CRATONVM_MOVING_YOUNG", "0")]));
         assert!(f.gc.moving_young);
         let f = VmFlags::from_source(&src(&[("CRATONVM_MOVING_YOUNG", "")]));
         assert!(f.gc.moving_young);
+    }
+
+    /// The moving-young gate is an opt-OUT over [`DEFAULT_MOVING_YOUNG`], not
+    /// an opt-in, and the opt-out wins over the compatibility opt-in.
+    ///
+    /// There is deliberately no second flag to also satisfy: the removed
+    /// `CRATONVM_ALLOW_MOVING_YOUNG` had to be set *in addition* to
+    /// `CRATONVM_MOVING_YOUNG` before `gen_heap` would run a moving cycle under
+    /// a live JIT frame, so the documented way to enable the feature could
+    /// never actually enable it in the case it exists for.
+    #[test]
+    fn moving_young_is_an_opt_out_with_a_compatibility_opt_in() {
+        assert!(!VmFlags::from_source(&src(&[("CRATONVM_NO_MOVING_YOUNG", "1")])).gc.moving_young);
+        // Opt-out beats opt-in — "turn it off" must always be honoured.
+        let both = VmFlags::from_source(&src(&[
+            ("CRATONVM_MOVING_YOUNG", "1"),
+            ("CRATONVM_NO_MOVING_YOUNG", "1"),
+        ]));
+        assert!(!both.gc.moving_young);
+        // And the opt-in alone is sufficient: nothing else has to be set.
+        assert!(VmFlags::from_source(&src(&[("CRATONVM_MOVING_YOUNG", "1")])).gc.moving_young);
     }
 
     #[test]

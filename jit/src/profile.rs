@@ -196,6 +196,26 @@ impl LoopTripProfile {
 
 /// Collected profile data for a single method.
 /// T10.9.B: FxHashMap — bytecode-PC keys, hot path per-branch during warmup.
+///
+/// ## Coverage — read this before basing an inlining decision on it
+///
+/// The four maps below are populated by *different* interpreter hooks with
+/// *different* coverage, and only while [`is_profiling_enabled`] is true (the
+/// process default is **false**; the tiered manager flips it on).
+///
+/// | Map | Recorded at | Covers |
+/// |---|---|---|
+/// | `branches` | every conditional-branch opcode | all branches |
+/// | `loops` | every back-edge | all loops |
+/// | `receivers` | the receiver-resolution path of `invokevirtual`/`invokeinterface` | **virtual + interface call sites only** |
+/// | `call_sites` | [`Self::record_call_site`] | whatever the interpreter calls it from |
+///
+/// In particular there is no per-call-site counter for `invokestatic` /
+/// `invokespecial` unless `call_sites` is fed: `receivers` is the only
+/// per-bci execution evidence the store has historically carried, and a
+/// monomorphic static call has no receiver to record. Use
+/// [`Self::call_site_count`], which unifies the two sources and states which
+/// one answered.
 #[derive(Default)]
 pub struct MethodProfile {
     /// Branch counts keyed by bytecode PC.
@@ -204,6 +224,14 @@ pub struct MethodProfile {
     pub receivers: FxHashMap<usize, ReceiverCounts>,
     /// Loop trip profiles keyed by back-edge bytecode PC.
     pub loops: FxHashMap<usize, LoopTripProfile>,
+    /// Execution count of the invoke instruction at each bytecode PC.
+    ///
+    /// Kind-agnostic: unlike [`Self::receivers`] this counts `invokestatic`
+    /// and `invokespecial` too, which is what an inliner needs to tell a hot
+    /// call site from a cold one inside the *same* method (per-method
+    /// invocation counts cannot — a call in a rarely-taken branch of a hot
+    /// method looks identical to one on the hot path).
+    pub call_sites: FxHashMap<usize, u32>,
 }
 
 impl MethodProfile {
@@ -240,6 +268,99 @@ impl MethodProfile {
             .entry(backedge_pc)
             .or_default()
             .record_trip_complete(trip);
+    }
+
+    /// Record one execution of the invoke instruction at `pc`.
+    ///
+    /// Kind-agnostic — call it for `invokestatic`/`invokespecial`/`invokevirtual`/
+    /// `invokeinterface`/`invokedynamic` alike. Saturating, like every other
+    /// counter here.
+    #[inline]
+    pub fn record_call_site(&mut self, pc: usize) {
+        let e = self.call_sites.entry(pc).or_insert(0);
+        *e = e.saturating_add(1);
+    }
+}
+
+/// Where a [`MethodProfile::call_site_count`] answer came from. An inliner
+/// that treats "no evidence" as "cold" would refuse to inline every static
+/// call in the VM, so the absence of data is reported distinctly from a
+/// genuine zero.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CallSiteEvidence {
+    /// A direct per-call-site execution counter ([`MethodProfile::call_sites`]).
+    Direct(u32),
+    /// Derived by summing the receiver-type observations at this bci. Exact
+    /// for `invokevirtual`/`invokeinterface`, unavailable for every other
+    /// invoke kind.
+    Receivers(u32),
+    /// Nothing was recorded at this bci — either the site is genuinely never
+    /// executed, or profiling was off, or no hook covers its invoke kind.
+    /// **Not** the same as a count of zero.
+    None,
+}
+
+impl CallSiteEvidence {
+    /// The observed count, or `0` when there is no evidence. Only use this
+    /// where "unknown" and "cold" are genuinely interchangeable.
+    pub fn count_or_zero(self) -> u32 {
+        match self {
+            CallSiteEvidence::Direct(n) | CallSiteEvidence::Receivers(n) => n,
+            CallSiteEvidence::None => 0,
+        }
+    }
+
+    /// Whether any hook actually observed this call site.
+    pub fn is_observed(self) -> bool {
+        !matches!(self, CallSiteEvidence::None)
+    }
+}
+
+impl MethodProfile {
+    /// Execution evidence for the invoke instruction at `pc`.
+    ///
+    /// Prefers the direct counter and falls back to summing the receiver
+    /// observations, which are already recorded today for virtual/interface
+    /// sites. See [`CallSiteEvidence`] for why "no data" is distinguished from
+    /// "zero".
+    pub fn call_site_count(&self, pc: usize) -> CallSiteEvidence {
+        if let Some(&n) = self.call_sites.get(&pc) {
+            return CallSiteEvidence::Direct(n);
+        }
+        match self.receivers.get(&pc) {
+            Some(counts) => CallSiteEvidence::Receivers(
+                counts.values().copied().fold(0u32, u32::saturating_add),
+            ),
+            None => CallSiteEvidence::None,
+        }
+    }
+
+    /// Every call site with observed evidence of at least `min_count`
+    /// executions, hottest first (ties broken by ascending bci so the order is
+    /// deterministic across runs — an inliner that ranks candidates must not
+    /// produce a different artifact from the same profile).
+    pub fn hot_call_sites(&self, min_count: u32) -> Vec<(usize, u32)> {
+        let mut pcs: Vec<usize> = self
+            .call_sites
+            .keys()
+            .copied()
+            .chain(self.receivers.keys().copied())
+            .collect();
+        pcs.sort_unstable();
+        pcs.dedup();
+        let mut out: Vec<(usize, u32)> = pcs
+            .into_iter()
+            .filter_map(|pc| {
+                let n = self.call_site_count(pc).count_or_zero();
+                if n >= min_count {
+                    Some((pc, n))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        out.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        out
     }
 }
 
@@ -784,6 +905,36 @@ impl ProfileStore {
         slot.lock().record_receiver(pc, receiver_class_id);
     }
 
+    /// Borrowed-key counterpart of [`record_call_site`](Self::record_call_site).
+    ///
+    /// Intended to be called from the interpreter's invoke dispatch for EVERY
+    /// invoke kind — see [`MethodProfile::call_sites`] for why per-method
+    /// invocation counts cannot substitute.
+    #[inline]
+    pub fn record_call_site_borrowed(
+        &self,
+        class_id: u32,
+        method_name: &Arc<str>,
+        descriptor: &Arc<str>,
+        pc: usize,
+    ) {
+        if !is_profiling_enabled() {
+            return;
+        }
+        let slot = self.get_or_insert_borrowed(class_id, method_name, descriptor);
+        slot.lock().record_call_site(pc);
+    }
+
+    /// Record one execution of the invoke instruction at `pc`.
+    #[inline]
+    pub fn record_call_site(&self, key: &MethodKey, pc: usize) {
+        if !is_profiling_enabled() {
+            return;
+        }
+        let slot = self.get_or_insert(key);
+        slot.lock().record_call_site(pc);
+    }
+
     /// Record a branch observation.  Called from the interpreter hot-loop.
     ///
     /// Returns immediately when profiling is disabled (the global default),
@@ -847,6 +998,7 @@ impl ProfileStore {
             branches: p.branches.clone(),
             receivers: p.receivers.clone(),
             loops: p.loops.clone(),
+            call_sites: p.call_sites.clone(),
         })
     }
 
@@ -884,6 +1036,7 @@ impl ProfileStore {
                         branches: p.branches.clone(),
                         receivers: p.receivers.clone(),
                         loops: p.loops.clone(),
+                        call_sites: p.call_sites.clone(),
                     },
                 )
             })
@@ -925,10 +1078,26 @@ mod tests {
     /// parallel test that depends on the disabled-default doesn't observe
     /// `true` mid-run.
     fn with_profiling_enabled<R>(f: impl FnOnce() -> R) -> R {
-        static GATE: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
         let _g = GATE.lock();
         let prev = is_profiling_enabled();
         enable_profiling(true);
+        let r = f();
+        enable_profiling(prev);
+        r
+    }
+
+    /// Serialises every gate transition in this module. Hoisted out of
+    /// `with_profiling_enabled` so the disabled-side helper below shares it —
+    /// two helpers with private statics would not exclude each other, and a
+    /// parallel test would then observe the wrong gate state.
+    static GATE: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+    /// Inverse of [`with_profiling_enabled`], for tests that assert a recorder
+    /// is a no-op while the global gate is off (its process default).
+    fn with_profiling_disabled<R>(f: impl FnOnce() -> R) -> R {
+        let _g = GATE.lock();
+        let prev = is_profiling_enabled();
+        enable_profiling(false);
         let r = f();
         enable_profiling(prev);
         r
@@ -1376,6 +1545,110 @@ mod tests {
             assert!(
                 profile.branches.contains_key(&(42usize * 4)),
                 "FxHashMap lookup should find the inserted PC"
+            );
+        });
+    }
+
+    // -----------------------------------------------------------------------
+    // Per-call-site evidence
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn call_site_evidence_distinguishes_absent_from_zero() {
+        let p = MethodProfile::default();
+        assert_eq!(p.call_site_count(7), CallSiteEvidence::None);
+        assert!(!p.call_site_count(7).is_observed());
+        assert_eq!(p.call_site_count(7).count_or_zero(), 0);
+    }
+
+    #[test]
+    fn call_site_evidence_prefers_the_direct_counter() {
+        let mut p = MethodProfile::default();
+        // A virtual site with receiver observations only.
+        p.record_receiver(4, 100);
+        p.record_receiver(4, 100);
+        p.record_receiver(4, 200);
+        assert_eq!(p.call_site_count(4), CallSiteEvidence::Receivers(3));
+        // Once the direct counter exists it wins (it is kind-agnostic and
+        // counts executions the receiver hook may not see).
+        p.record_call_site(4);
+        assert_eq!(p.call_site_count(4), CallSiteEvidence::Direct(1));
+    }
+
+    #[test]
+    fn call_site_counter_covers_static_calls_receivers_cannot() {
+        let mut p = MethodProfile::default();
+        for _ in 0..5 {
+            p.record_call_site(12); // an invokestatic — no receiver to record
+        }
+        assert_eq!(p.call_site_count(12), CallSiteEvidence::Direct(5));
+        assert!(
+            p.receivers.is_empty(),
+            "a static call site contributes no receiver evidence"
+        );
+    }
+
+    #[test]
+    fn hot_call_sites_is_ordered_and_deterministic() {
+        let mut p = MethodProfile::default();
+        for _ in 0..10 {
+            p.record_call_site(30);
+        }
+        for _ in 0..10 {
+            p.record_call_site(8); // ties with pc 30 — lower bci must win
+        }
+        for _ in 0..50 {
+            p.record_call_site(20);
+        }
+        p.record_call_site(99); // below the threshold
+        p.record_receiver(40, 7); // receiver-derived, also below threshold
+        assert_eq!(p.hot_call_sites(10), vec![(20, 50), (8, 10), (30, 10)]);
+        assert_eq!(p.hot_call_sites(1).len(), 5);
+        // Same profile, same order — an inliner ranking candidates must not
+        // produce a different artifact from run to run.
+        assert_eq!(p.hot_call_sites(10), p.hot_call_sites(10));
+    }
+
+    #[test]
+    fn call_site_counts_saturate_rather_than_wrap() {
+        let mut p = MethodProfile::default();
+        p.call_sites.insert(3, u32::MAX);
+        p.record_call_site(3);
+        assert_eq!(p.call_site_count(3), CallSiteEvidence::Direct(u32::MAX));
+    }
+
+    #[test]
+    fn store_records_and_snapshots_call_sites() {
+        with_profiling_enabled(|| {
+            let store = ProfileStore::new();
+            let key = make_key(11);
+            store.record_call_site(&key, 16);
+            store.record_call_site(&key, 16);
+            store.record_call_site(&key, 24);
+            let p = store.get_profile(&key).expect("profile recorded");
+            assert_eq!(p.call_site_count(16), CallSiteEvidence::Direct(2));
+            assert_eq!(p.call_site_count(24), CallSiteEvidence::Direct(1));
+            // The bulk snapshot must carry the new map too — AOT training and
+            // the tiered manager both read it that way.
+            let snap = store.snapshot_all();
+            let (_, sp) = snap
+                .into_iter()
+                .find(|(k, _)| k.class_id == key.class_id)
+                .expect("method present in snapshot_all");
+            assert_eq!(sp.call_site_count(16), CallSiteEvidence::Direct(2));
+        });
+    }
+
+    #[test]
+    fn call_site_recording_respects_the_global_profiling_gate() {
+        // Profiling defaults to OFF; the recorder must be a single atomic load.
+        with_profiling_disabled(|| {
+            let store = ProfileStore::new();
+            let key = make_key(77);
+            store.record_call_site(&key, 4);
+            assert!(
+                store.get_profile(&key).is_none(),
+                "nothing may be recorded while profiling is disabled"
             );
         });
     }

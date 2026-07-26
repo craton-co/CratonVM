@@ -24,6 +24,7 @@ use cratonvm_reader::stack_map::StackMapTable;
 use cratonvm_reader::verified_code::verified_code;
 
 use super::class::Class;
+use super::type_maps::{ClassTypeMaps, MethodTypeMaps, MethodTypeMapsBuilder};
 use super::verify_frame::VerificationFrame;
 use super::verify_insn::verify_instruction;
 use super::vtype::{ClassHierarchy, VType};
@@ -113,13 +114,32 @@ fn verify_bytecode_inner(
     hierarchy: &dyn ClassHierarchy,
     strict_verification: bool,
 ) -> Result<(), LinkageError> {
+    // TYPE MAPS (arch-2026-07-26/verifier-type-maps): verification retains
+    // what it proves. The walk below already computes the exact verification
+    // type of every local slot and every operand-stack slot at every pc; the
+    // per-method builder captures that as compact oop bitmaps as it goes —
+    // it is the SAME walk, not a second pass — and the results are published
+    // into the process-wide side table keyed by `(ClassId, method_index)`.
+    //
+    // This is unconditional on the default build path: no cargo feature, no
+    // `CRATONVM_*` env var, no opt-in. `skip_verification` (the `--noverify`
+    // escape hatch) prevents this function from running at all, in which case
+    // `type_maps::verification_status` answers `Unknown`/`Skipped` and every
+    // consumer is required to fall back to conservative behaviour.
+    let mut collected: Vec<(Arc<str>, Arc<str>, Option<MethodTypeMaps>)> =
+        Vec::with_capacity(class.methods.len());
+
     for method in &class.methods {
-        // Skip abstract and native methods — they have no Code attribute
+        // Skip abstract and native methods — they have no Code attribute.
+        // They still occupy an index in `Class::methods`, so a `None` entry
+        // is pushed to keep `method_index` aligned with the class's method
+        // list (consumers index by that position).
         if method.is_abstract() || method.is_native() {
+            collected.push((method.name.clone(), method.descriptor.clone(), None));
             continue;
         }
 
-        verify_method(
+        let maps = verify_method(
             &class.name,
             method,
             &class.constant_pool,
@@ -127,12 +147,23 @@ fn verify_bytecode_inner(
             hierarchy,
             strict_verification,
         )?;
+        collected.push((method.name.clone(), method.descriptor.clone(), maps));
     }
+
+    // Publish only once every method verified: a class that fails
+    // verification is never loaded, so half-built maps must not be visible.
+    crate::type_maps::publish_class_type_maps(class.id, ClassTypeMaps::new(collected));
 
     Ok(())
 }
 
 /// Verify a single method's bytecode.
+///
+/// On success returns the [`MethodTypeMaps`] the verification walk produced —
+/// the exact reference layout of every local slot and every operand-stack slot
+/// at every instruction start, plus the per-method `safe_for_fast_path` proof.
+/// `None` means the method has nothing to describe (no `Code` attribute, or an
+/// empty one), which consumers must treat as "unproven".
 fn verify_method(
     class_name: &str,
     method: &ClassFileMethod,
@@ -140,26 +171,33 @@ fn verify_method(
     version: &ClassFileVersion,
     hierarchy: &dyn ClassHierarchy,
     strict_verification: bool,
-) -> Result<(), LinkageError> {
+) -> Result<Option<MethodTypeMaps>, LinkageError> {
     let code_attr = match method.code() {
         Some(code) => code,
-        None => return Ok(()), // No code to verify (shouldn't happen if abstract/native filtered)
+        None => return Ok(None), // No code to verify (shouldn't happen if abstract/native filtered)
     };
 
     let bytecode = &code_attr.code;
     if bytecode.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
 
     // Establish the canonical decode and CFG contract before type-state
     // verification. The JIT consumes the same bounded-cache entry, so verifier
     // and compiler cannot disagree about instruction widths or branch
     // boundaries.
-    let _verified = verified_code(bytecode).map_err(|e| LinkageError::VerifyError {
+    let verified = verified_code(bytecode).map_err(|e| LinkageError::VerifyError {
         class_name: class_name.to_string(),
         method_name: method.name.to_string(),
         message: format!("failed to build verified code: {e}"),
     })?;
+    // TYPE MAPS lean on two guarantees this canonical decode establishes, so
+    // they are asserted here rather than re-derived downstream:
+    //   1. `code.len() <= 65535`, so every recorded pc fits a `u16` (the
+    //      `PcTable::U32` widening is defence in depth, not a live path).
+    //   2. every branch target is an instruction boundary, so no row in the
+    //      pc table can describe a mid-instruction offset.
+    let insn_count = verified.instructions().len();
 
     // Find the StackMapTable attribute within the Code attribute
     let stack_map_table = find_stack_map_table(&code_attr.attributes);
@@ -203,7 +241,10 @@ fn verify_method(
         let has_branches = bytecode_has_branches(bytecode);
         let has_handlers = !code_attr.exception_table.is_empty();
         if has_branches || has_handlers {
-            return verify_by_inference(class_name, method, code_attr, cp, hierarchy);
+            // Pre-Java-7 inference path (JVMS §4.10.2). It builds its own type
+            // maps from the settled worklist fixpoint — see
+            // `verify_by_inference`.
+            return verify_by_inference(class_name, method, code_attr, cp, hierarchy).map(Some);
         }
         // No branches and no handlers — fall through to linear walk
     }
@@ -263,6 +304,19 @@ fn verify_method(
         handler_targets.insert(entry.handler_pc, catch_type);
     }
 
+    // TYPE MAPS: ride the walk below. `record` is called once per instruction
+    // start with the type-state that holds immediately BEFORE that
+    // instruction executes — after any declared StackMapTable frame or
+    // exception-handler frame has been adopted, so the recorded state is the
+    // one the interpreter/GC would actually observe at that pc.
+    let mut type_maps = MethodTypeMapsBuilder::new(code_attr.max_locals, code_attr.max_stack);
+    // Exact, not estimated: `verified_code` already counted the instructions.
+    type_maps.reserve(insn_count);
+    // Cleared whenever the walk skips or truncates a region, which denies
+    // `safe_for_fast_path` (the unchecked interpreter handlers need every
+    // executed instruction proven, not merely most of them).
+    let mut walk_complete = true;
+
     // Walk the bytecode
     let mut pc = 0usize;
     let mut current_frame = initial_frame;
@@ -272,6 +326,41 @@ fn verify_method(
     // the first instruction has no previous, so it's unconditionally
     // reachable.
     let mut verified = true;
+    // TYPE MAPS SOUNDNESS: is `current_frame` the real entry state for *this*
+    // pc?
+    //
+    // `verified` alone does not answer that, and the difference is soundness
+    // rather than precision. `verified` tracks only whether the PREVIOUS
+    // instruction fell through; it is never re-armed when a declared frame or
+    // a handler frame is adopted, and the unreachable-code guard below is
+    // conditioned on `requires_stack_map`. So there are exactly two pcs at
+    // which `current_frame` is a *stale* frame belonging to an unrelated
+    // predecessor:
+    //
+    //   * a **pre-Java-7 class that ships a `StackMapTable`**
+    //     (`requires_stack_map` is false, so the dead-code guard below never
+    //     fires) walking dead code after a `goto` / `return` / `athrow` that
+    //     carries no declared frame; and
+    //   * a **handler pc that is ALSO reachable by fall-through** — the
+    //     handler frame is installed only under `!verified`, so when control
+    //     does fall through, `current_frame` describes the fall-through state
+    //     while the exception edge enters the same pc with a different locals
+    //     state and `[throwable]` on the operand stack. The linear walk never
+    //     merges the two.
+    //
+    // Type-*checking* against a stale frame is a pre-existing laxity of this
+    // walk (it can only accept too much, and strict mode closes the first
+    // case). RECORDING one is a different and much worse thing: a row that
+    // claims a slot holds a reference where the other edge supplies an int is
+    // an oop scan of a non-oop — immediate heap corruption — and a row that
+    // claims none where the other edge supplies a live reference is a missed
+    // root. Both are silent.
+    //
+    // So those pcs record nothing (`oop_map_at` → `None` → "unproven, scan
+    // conservatively") and the method loses `safe_for_fast_path`. This
+    // mirrors the guard in `verifier::verify_method_typestate`, which is the
+    // same walk for classes routed through the JSR-aware dispatcher.
+    let mut authoritative = true;
 
     while pc < bytecode.len() {
         // Check if this PC is a declared frame target
@@ -292,6 +381,10 @@ fn verify_method(
             let mut adopted = declared.clone();
             adopted.pad_locals_to(code_attr.max_locals);
             current_frame = adopted;
+            // TYPE MAPS: a declared StackMapTable frame IS the authoritative
+            // merge-point state for this pc — every edge into it was (or, at
+            // the branch sites below, will be) checked against it.
+            authoritative = true;
         }
 
         // Check if this PC is an exception handler entry
@@ -308,6 +401,16 @@ fn verify_method(
                         message: format!("exception handler stack overflow at offset {pc}"),
                     })?;
                 current_frame = handler_frame;
+                // The handler frame we just built IS this pc's entry state.
+                authoritative = true;
+            } else if !declared_frames.contains_key(&(pc as u16)) {
+                // TYPE MAPS: handler entry that is ALSO reachable by
+                // fall-through, with no declared frame to reconcile the two
+                // edges. `current_frame` describes only the fall-through edge;
+                // the exception edge (`[throwable]` on a cleared stack) is
+                // unrepresented and is never merged in. Record nothing here
+                // rather than a half-true row.
+                authoritative = false;
             }
         }
 
@@ -347,12 +450,32 @@ fn verify_method(
                 });
             }
             // Lenient: skip to the next declared frame or handler.
+            //
+            // TYPE MAPS: no row is emitted for a skipped region, so
+            // `oop_map_at` answers `None` there (= "unproven", scan
+            // conservatively). The method also loses `safe_for_fast_path`:
+            // the unreachability call is the verifier's, and the unchecked
+            // interpreter handlers must not run on bytecode whose operands
+            // were never checked.
+            walk_complete = false;
             let (_, next_pc) = match Instruction::decode(bytecode, pc) {
                 Ok(r) => r,
                 Err(_) => break, // malformed — stop walking
             };
             pc = next_pc;
             continue;
+        }
+
+        // TYPE MAPS: capture the proven reference layout at this instruction
+        // start. This is the entire point of the change — the walk already
+        // holds `current_frame`; without this line it is discarded. The guard
+        // is load-bearing: see the `authoritative` declaration above for the
+        // two pcs at which `current_frame` is a stale frame from an unrelated
+        // predecessor, where a recorded row would be a wrong oop map.
+        if authoritative {
+            type_maps.record(pc as u32, &current_frame);
+        } else {
+            walk_complete = false;
         }
 
         // Decode the instruction
@@ -366,6 +489,10 @@ fn verify_method(
                 });
             }
         };
+
+        // TYPE MAPS: fold this instruction into the per-method fast-path
+        // safety proof (local-slot operand bounds, jsr/ret, stray `wide`).
+        type_maps.observe_instruction(&insn);
 
         // Verify the instruction's type effects
         let result = verify_instruction(
@@ -472,6 +599,13 @@ fn verify_method(
 
         verified = result.falls_through;
 
+        // TYPE MAPS: the next pc inherits an authoritative frame only when
+        // control actually flows into it from here. Once control stops falling
+        // through, `current_frame` belongs to this instruction and not to
+        // whatever pc the walk visits next; only a declared frame or a handler
+        // frame (adopted at the top of the loop) can re-arm it.
+        authoritative = authoritative && result.falls_through && next_pc < bytecode.len();
+
         if !result.falls_through && next_pc < bytecode.len() {
             // Control does not fall through — the next instruction is only reachable
             // via a branch target or exception handler. Reset verification state.
@@ -482,7 +616,7 @@ fn verify_method(
         pc = next_pc;
     }
 
-    Ok(())
+    Ok(Some(type_maps.finish(walk_complete)))
 }
 
 /// Quick scan of bytecode to detect if it contains any branch instructions.
@@ -592,13 +726,20 @@ fn build_declared_frames(
 /// forward through each instruction, and merge at branch targets / exception
 /// handler entries.  The algorithm terminates when the worklist is empty
 /// and all reachable offsets have consistent type states.
+///
+/// TYPE MAPS: when the worklist settles, `frame_at` *is* the answer — it maps
+/// every reachable instruction start to its fixpoint entry type-state. The
+/// maps are serialized from that map, not recomputed: this path performs no
+/// extra dataflow, it only writes down the dataflow it already finished. (The
+/// StackMapTable path records inline instead, because its linear walk visits
+/// each pc exactly once and never revisits a merge.)
 fn verify_by_inference(
     class_name: &str,
     method: &ClassFileMethod,
     code_attr: &cratonvm_reader::attribute::CodeAttribute,
     cp: &ConstantPool,
     hierarchy: &dyn ClassHierarchy,
-) -> Result<(), LinkageError> {
+) -> Result<MethodTypeMaps, LinkageError> {
     let bytecode = &code_attr.code;
     let initial_frame = VerificationFrame::initial_frame(
         class_name,
@@ -778,7 +919,37 @@ fn verify_by_inference(
         }
     }
 
-    Ok(())
+    // -----------------------------------------------------------------------
+    // TYPE MAPS: serialize the settled fixpoint.
+    // -----------------------------------------------------------------------
+    //
+    // `frame_at[pc]` is the merged type-state on ENTRY to the instruction at
+    // `pc` — exactly the state the interpreter/GC observes when the frame's pc
+    // is `pc`. Rows must be emitted in ascending pc order because
+    // `MethodTypeMaps` indexes them with a binary search.
+    let mut type_maps = MethodTypeMapsBuilder::new(code_attr.max_locals, code_attr.max_stack);
+    type_maps.reserve(frame_at.len());
+    let mut ordered: Vec<usize> = frame_at.keys().copied().collect();
+    ordered.sort_unstable();
+
+    // A pre-Java-7 method that reached this path has branches or handlers and
+    // no StackMapTable, so its coverage is whatever the worklist reached.
+    // Anything the worklist did not reach is simply absent from the map
+    // (`oop_map_at` → `None` → conservative), and a decode failure at a
+    // recorded pc denies `safe_for_fast_path`.
+    let mut walk_complete = true;
+    for pc in ordered {
+        let Some(frame) = frame_at.get(&pc) else {
+            continue;
+        };
+        type_maps.record(pc as u32, frame);
+        match Instruction::decode(bytecode, pc) {
+            Ok((insn, _)) => type_maps.observe_instruction(&insn),
+            Err(_) => walk_complete = false,
+        }
+    }
+
+    Ok(type_maps.finish(walk_complete))
 }
 
 /// Merge `incoming` frame into the frame at `target_pc` in the map.
@@ -2321,5 +2492,233 @@ mod tests {
             verify_bytecode(&trusted, &MockHierarchy).is_ok(),
             "trusted bootstrap variant must stay lenient"
         );
+    }
+
+    // =======================================================================
+    // TYPE MAP SOUNDNESS — the `authoritative` guard on `record`
+    //
+    // A wrong oop map is heap corruption, not a pessimisation: a set bit
+    // where the other edge supplies an int makes the GC scan a non-oop, and
+    // a clear bit where the other edge supplies a live reference is a missed
+    // root. Both tests below fail before the guard was added (the row exists
+    // and describes the wrong edge) and pass after (no row → `None` →
+    // "unproven, scan conservatively").
+    // =======================================================================
+
+    /// Same as [`make_class_with_stackmap`] but with an explicit class id (the
+    /// type-map store is a process-wide, first-writer-wins side table keyed by
+    /// `ClassId`, so every test that inspects it needs its own id) and an
+    /// exception table.
+    fn make_map_probe_class(
+        id: u32,
+        version: ClassFileVersion,
+        max_stack: u16,
+        max_locals: u16,
+        code: Vec<u8>,
+        stack_map_bytes: Vec<u8>,
+        exception_table: Vec<cratonvm_reader::attribute::ExceptionTableEntry>,
+    ) -> Class {
+        let mut class = make_class(vec![ClassFileMethod {
+            access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
+            name: Arc::from("m"),
+            descriptor: Arc::from("()V"),
+            attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
+                max_stack,
+                max_locals,
+                code: cratonvm_reader::ByteView::from_vec(code),
+                exception_table,
+                attributes: vec![Attribute::StackMapTable {
+                    entries: cratonvm_reader::ByteView::from_vec(stack_map_bytes),
+                }],
+            }))],
+        }]);
+        class.version = version;
+        class.id = ClassId::new(id);
+        class
+    }
+
+    /// An empty `StackMapTable` attribute (`number_of_entries = 0`). Its only
+    /// job is to be *present*, so `verify_method` takes the linear
+    /// StackMapTable walk instead of the pre-Java-7 inference worklist.
+    fn empty_stack_map() -> Vec<u8> {
+        vec![0x00, 0x00]
+    }
+
+    /// STALE-FRAME PC #1: dead code in a **pre-Java-7 class that nonetheless
+    /// ships a StackMapTable**.
+    ///
+    /// `requires_stack_map` is false at major 50, so the unreachable-code
+    /// guard never fires and the walk keeps going straight into the dead
+    /// region carrying the frame from before the `return`. Recording there
+    /// publishes an oop map for a pc whose real entry state is "unreachable",
+    /// derived from an unrelated predecessor.
+    ///
+    /// ```text
+    ///   0: aconst_null   stack=[null]
+    ///   1: astore_0      stack=[]      locals=[null]
+    ///   2: return        <- does not fall through
+    ///   3: iconst_0      <- DEAD: no declared frame, no handler
+    ///   4: pop
+    ///   5: return
+    /// ```
+    #[test]
+    fn dead_code_in_pre_java7_class_with_stackmap_records_no_row() {
+        let class = make_map_probe_class(
+            81_001,
+            ClassFileVersion::JAVA_6,
+            1,
+            1,
+            vec![0x01, 0x4b, 0xb1, 0x03, 0x57, 0xb1],
+            empty_stack_map(),
+            vec![],
+        );
+        assert!(
+            verify_bytecode(&class, &MockHierarchy).is_ok(),
+            "the class must still verify — this is a map-soundness fix, not a rejection"
+        );
+        let maps = crate::type_maps::type_maps_for(class.id, 0).expect("maps must be published");
+
+        // The reachable prefix is still fully described.
+        for pc in [0u32, 1, 2] {
+            assert!(
+                maps.oop_map_at(pc).is_some(),
+                "pc {pc} is reachable and must keep its row"
+            );
+        }
+        // The dead region must contribute nothing.
+        for pc in [3u32, 4, 5] {
+            assert!(
+                maps.oop_map_at(pc).is_none(),
+                "pc {pc} is dead code walked with a stale frame; a row there \
+                 would be a fabricated oop map"
+            );
+        }
+        assert!(
+            !maps.safe_for_fast_path(),
+            "an incompletely described method must not take the unchecked path"
+        );
+        assert_eq!(
+            maps.fast_path_veto(),
+            Some(crate::type_maps::FastPathVeto::IncompleteWalk)
+        );
+    }
+
+    /// STALE-FRAME PC #2: a handler pc that is **also reachable by
+    /// fall-through**, with no declared frame to reconcile the two edges.
+    ///
+    /// ```text
+    ///   0: iconst_0    stack=[int]
+    ///   1: nop         <- protected range [1, 2)
+    ///   2: pop         <- handler_pc; fall-through stack=[int],
+    ///                     exception   stack=[Throwable]
+    ///   3: return
+    /// ```
+    ///
+    /// The two edges disagree about whether operand-stack slot 0 holds a
+    /// reference. The linear walk installs the handler frame only under
+    /// `!verified`, so it records the *fall-through* answer ("slot 0 is not an
+    /// oop") — which, on an exception entry, is a live `Throwable` the GC
+    /// would never scan. Missed root.
+    #[test]
+    fn handler_pc_reachable_by_fallthrough_records_no_row() {
+        let class = make_map_probe_class(
+            81_002,
+            ClassFileVersion::JAVA_8,
+            1,
+            0,
+            vec![0x03, 0x00, 0x57, 0xb1],
+            empty_stack_map(),
+            vec![cratonvm_reader::attribute::ExceptionTableEntry {
+                start_pc: 1,
+                end_pc: 2,
+                handler_pc: 2,
+                catch_type: 0, // catch-all → java/lang/Throwable
+            }],
+        );
+        assert!(
+            verify_bytecode(&class, &MockHierarchy).is_ok(),
+            "the class must still verify"
+        );
+        let maps = crate::type_maps::type_maps_for(class.id, 0).expect("maps must be published");
+
+        assert!(maps.oop_map_at(0).is_some(), "pc 0 has one entry edge");
+        assert!(maps.oop_map_at(1).is_some(), "pc 1 has one entry edge");
+        assert!(
+            maps.oop_map_at(2).is_none(),
+            "pc 2 has two unmerged entry edges that disagree about whether \
+             stack slot 0 is an oop; recording either one is a wrong map"
+        );
+        assert!(
+            !maps.safe_for_fast_path(),
+            "the method loses the unchecked fast path along with the row"
+        );
+    }
+
+    /// CONTROL: the guard must not cost an ordinary method its maps. A method
+    /// whose handler pc is reachable ONLY by the exception edge keeps a row at
+    /// every pc and stays fast-path safe.
+    #[test]
+    fn handler_pc_reachable_only_by_exception_keeps_its_rows() {
+        //   0: iconst_0
+        //   1: pop        <- protected range [1, 2)
+        //   2: return     <- does not fall through
+        //   3: pop        <- handler_pc, reachable ONLY via the exception edge
+        //   4: return
+        let class = make_map_probe_class(
+            81_003,
+            ClassFileVersion::JAVA_6,
+            1,
+            0,
+            vec![0x03, 0x57, 0xb1, 0x57, 0xb1],
+            empty_stack_map(),
+            vec![cratonvm_reader::attribute::ExceptionTableEntry {
+                start_pc: 1,
+                end_pc: 2,
+                handler_pc: 3,
+                catch_type: 0,
+            }],
+        );
+        assert!(verify_bytecode(&class, &MockHierarchy).is_ok());
+        let maps = crate::type_maps::type_maps_for(class.id, 0).expect("maps must be published");
+        for pc in 0..5u32 {
+            assert!(
+                maps.oop_map_at(pc).is_some(),
+                "pc {pc} has exactly one entry edge and must keep its row"
+            );
+        }
+        // The handler's entry state must describe the caught Throwable as an
+        // oop on the operand stack — that is the whole point of the maps.
+        let handler_stack = maps.stack_oops_at(3).expect("handler pc has a row");
+        assert!(
+            handler_stack.get(0),
+            "the caught Throwable at the handler pc must be marked as a reference"
+        );
+        assert!(maps.safe_for_fast_path());
+    }
+
+    /// CONTROL: a straight-line method with no branches and no handlers is
+    /// authoritative at every pc; the guard is invisible to it.
+    #[test]
+    fn straight_line_method_keeps_every_row() {
+        let class = make_map_probe_class(
+            81_004,
+            ClassFileVersion::JAVA_8,
+            1,
+            1,
+            vec![0x01, 0x4b, 0xb1], // aconst_null; astore_0; return
+            empty_stack_map(),
+            vec![],
+        );
+        assert!(verify_bytecode(&class, &MockHierarchy).is_ok());
+        let maps = crate::type_maps::type_maps_for(class.id, 0).expect("maps must be published");
+        for pc in 0..3u32 {
+            assert!(maps.oop_map_at(pc).is_some());
+        }
+        assert!(
+            maps.safe_for_fast_path(),
+            "the guard must not cost an ordinary method its fast path"
+        );
+        // Local 0 holds a reference from pc 2 onward.
+        assert!(maps.local_oops_at(2).expect("row at pc 2").get(0));
     }
 }

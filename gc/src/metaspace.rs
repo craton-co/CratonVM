@@ -5,6 +5,43 @@
 //!
 //! Models HotSpot's Metaspace: chunk-based allocation with per-classloader
 //! accounting, compressed class space, and GC integration.
+//!
+//! # THIS IS A MODEL, NOT THE VM'S METASPACE
+//!
+//! Audit note, 2026-07-26 (`arch-2026-07-26/refs-metaspace-unloading`).
+//!
+//! Nothing in the workspace constructs a [`Metaspace`], a
+//! [`MetaspaceRegistry`] or a [`CompressedClassSpace`]: a repo-wide search for
+//! `Metaspace`/`metaspace::` outside this file matches only JFR event
+//! descriptors, `-XX:` flag parsing that is accepted-and-ignored, unified-log
+//! tag names, and the serviceability text report. So no class metadata is
+//! actually allocated through this module, and its numbers are never the ones
+//! a Java program observes.
+//!
+//! What the VM really reports as "metaspace" is an approximation computed in
+//! `vm/src/vm/vm_init.rs` (search for "Metaspace approximation"): live class
+//! count multiplied by an estimated per-class overhead. `native-builtins/src/jmx.rs`
+//! documents the same thing from the `MemoryMXBean` side — CratonVM has no
+//! per-pool non-heap accounting, so `-XX:MaxMetaspaceSize` does not bound
+//! anything.
+//!
+//! Consequences worth being explicit about, because "metaspace is modelled"
+//! reads as "metaspace is bounded" and it is not:
+//!
+//! * **Metaspace is unbounded in practice.** Class metadata lives in ordinary
+//!   Rust allocations owned by `classloading::ClassStore` and friends. It
+//!   shrinks when `vm/src/memory/gc.rs::unload_dead_class_metadata` runs (which
+//!   it does — see `class_unloading.rs`'s module doc for that chain), but there
+//!   is no cap and no `OutOfMemoryError: Metaspace`. A proxy-heavy workload
+//!   (CGLIB / ByteBuddy, i.e. the Spring and Hibernate suites) is bounded only
+//!   by loader unloading keeping up.
+//! * The chunk allocator below hands out `(chunk_id, offset)` pairs, not
+//!   pointers. It reserves no memory and cannot be made to.
+//!
+//! The model is kept because it is the natural home for real accounting and its
+//! chunking/GC policy is already tested; see
+//! `docs/internal/arch-2026-07-26/refs-metaspace-unloading.md` for the wiring
+//! sketch and its prerequisites.
 
 use std::collections::HashMap;
 
@@ -663,10 +700,41 @@ impl MetaspaceRegistry {
         }
     }
 
+    /// Flag a loader dead without dropping its accounting row.
+    ///
+    /// The row is retained deliberately so [`Self::dead_loaders`] and
+    /// [`Self::get_all_stats`] can report it once — but it MUST be released
+    /// afterwards. Use [`Self::mark_dead`] + [`Self::prune_dead`], or
+    /// [`Self::remove_loader`] when no reporting pass is needed.
     pub fn mark_dead(&mut self, loader_id: u64) {
         if let Some(loader) = self.loaders.get_mut(&loader_id) {
             loader.is_alive = false;
         }
+    }
+
+    /// Drop a loader's accounting row outright. Returns the removed row.
+    ///
+    /// BOUNDED-METADATA FIX (2026-07-26): before this existed, `mark_dead` was
+    /// the ONLY unload-side operation and it merely flipped `is_alive`. Since
+    /// `register_loader` is the only other writer, `loaders` was append-only:
+    /// every loader ever created kept a `ClassLoaderMetaspace` row (with an
+    /// owned `loader_name: String`) for the process lifetime. That is the exact
+    /// shape of leak `docs/internal/class-loader-unloading-and-bounded-metadata.md`
+    /// forbids ("either unload invalidation or hard bounds"), and it is invisible
+    /// — the row is small, so it fails only after hours under a proxy-generating
+    /// workload.
+    pub fn remove_loader(&mut self, loader_id: u64) -> Option<ClassLoaderMetaspace> {
+        self.loaders.remove(&loader_id)
+    }
+
+    /// Release every row already flagged dead. Returns how many were released.
+    ///
+    /// Call this at the end of each unload transaction, after any pass that
+    /// wants to observe the dead set.
+    pub fn prune_dead(&mut self) -> usize {
+        let before = self.loaders.len();
+        self.loaders.retain(|_, l| l.is_alive);
+        before - self.loaders.len()
     }
 
     pub fn get_loader_stats(&self, loader_id: u64) -> Option<&ClassLoaderMetaspace> {
@@ -1457,6 +1525,98 @@ mod tests {
                          // Loader 2's chunk survived; further allocation bumps it correctly.
         let a = ms.allocate(64, 2).unwrap();
         assert_eq!(a.offset, 64);
+        assert_eq!(ms.chunks.len(), 1);
+        assert_eq!(ms.chunks[0].owner_loader_id, 2);
+    }
+
+    // ======================================================================
+    // BOUNDED-METADATA FIX (2026-07-26): unload must RELEASE registry rows.
+    // `mark_dead` alone left one `ClassLoaderMetaspace` (owned `String`
+    // included) per loader ever created, for the process lifetime.
+    // ======================================================================
+
+    #[test]
+    fn registry_prune_dead_releases_rows() {
+        let mut reg = MetaspaceRegistry::new();
+        reg.register_loader(1, "A".into());
+        reg.register_loader(2, "B".into());
+        reg.register_loader(3, "C".into());
+        reg.mark_dead(1);
+        reg.mark_dead(3);
+        // Reporting pass still sees them...
+        assert_eq!(reg.dead_loaders(), 2);
+        assert_eq!(reg.total_loaders(), 3);
+        // ...then they are released.
+        assert_eq!(reg.prune_dead(), 2);
+        assert_eq!(reg.total_loaders(), 1);
+        assert_eq!(reg.dead_loaders(), 0);
+        assert!(reg.get_loader_stats(2).is_some());
+        assert!(reg.get_loader_stats(1).is_none());
+        assert!(reg.get_loader_stats(3).is_none());
+    }
+
+    #[test]
+    fn registry_remove_loader_returns_row() {
+        let mut reg = MetaspaceRegistry::new();
+        reg.register_loader(7, "Plugin".into());
+        reg.record_allocation(7, 512);
+        reg.record_class_loaded(7);
+        let removed = reg
+            .remove_loader(7)
+            .expect("metaspace: expected a row for loader 7");
+        assert_eq!(removed.loader_name, "Plugin");
+        assert_eq!(removed.allocated_bytes, 512);
+        assert_eq!(removed.class_count, 1);
+        assert_eq!(reg.total_loaders(), 0);
+        assert!(reg.remove_loader(7).is_none());
+    }
+
+    // The registry must reach a steady state under repeated define/unload
+    // cycles, not grow one row per cycle.
+    #[test]
+    fn registry_bounded_across_repeated_unload_cycles() {
+        let mut reg = MetaspaceRegistry::new();
+        reg.register_loader(0, "bootstrap".into());
+        for cycle in 0..128u64 {
+            let id = 1000 + cycle;
+            reg.register_loader(id, "ProxyLoader".into());
+            reg.record_allocation(id, 4096);
+            reg.record_class_loaded(id);
+            reg.mark_dead(id);
+            assert_eq!(reg.prune_dead(), 1, "cycle {cycle}");
+        }
+        assert_eq!(
+            reg.total_loaders(),
+            1,
+            "registry grew across unload cycles — the unbounded-metadata leak is back"
+        );
+        assert_eq!(reg.dead_loaders(), 0);
+    }
+
+    // Freeing a loader's chunks and then running a metaspace GC must return
+    // the capacity, so `Metaspace` itself shrinks on unload.
+    #[test]
+    fn metaspace_capacity_shrinks_on_loader_unload() {
+        let mut cfg = MetaspaceConfig::default();
+        cfg.small_chunk_size = 256;
+        let mut ms = Metaspace::new(cfg).unwrap();
+        ms.allocate(64, 1).unwrap();
+        ms.allocate(64, 2).unwrap();
+        let capacity_before = ms.total_capacity;
+        assert!(capacity_before > 0);
+
+        let freed = ms.free_loader_metaspace(1);
+        assert_eq!(freed.chunks_freed, 1);
+        assert_eq!(freed.loader_id, 1);
+        // Freeing alone only flags the chunk; capacity is returned by the GC.
+        assert_eq!(ms.total_capacity, capacity_before);
+
+        let gc = ms.trigger_gc();
+        assert!(gc.bytes_reclaimed > 0);
+        assert!(
+            ms.total_capacity < capacity_before,
+            "metaspace capacity must shrink once an unloaded loader's chunks are collected"
+        );
         assert_eq!(ms.chunks.len(), 1);
         assert_eq!(ms.chunks[0].owner_loader_id, 2);
     }

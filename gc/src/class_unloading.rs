@@ -8,6 +8,41 @@
 //! descriptors) is reclaimed and any JIT-compiled code is invalidated.
 //!
 //! System/bootstrap loaders are never unloaded.
+//!
+//! # THIS MODULE IS NOT THE PRODUCTION CLASS UNLOADER
+//!
+//! Audit note, 2026-07-26 (`arch-2026-07-26/refs-metaspace-unloading`).
+//! [`ClassUnloader`] and [`ClassLoaderHierarchy`] have **no caller anywhere in
+//! the workspace** — a repo-wide search for `ClassUnloader`,
+//! `ClassLoaderHierarchy` and `class_unloading::` matches only this file and
+//! the `pub mod class_unloading;` line in `gc/src/lib.rs`. Nothing ever calls
+//! `register_loader` / `register_class` / `register_jit_code`, so every table
+//! below is permanently empty in a running VM.
+//!
+//! The real unload transaction lives outside the `gc` crate and does not touch
+//! this type:
+//!
+//! * driver: `vm/src/runtime/interpreter.rs` — `process_references_after_gc`
+//!   (post-GC path) and `g1_remark_process_references` (G1 final remark), both
+//!   under STW;
+//! * loader reachability: `native-builtins/src/classloader.rs` —
+//!   `gc_reconcile_defining_loaders`, returning dead class-id hints;
+//! * the transaction itself: `vm/src/memory/gc.rs` —
+//!   `unload_dead_class_metadata`, which prunes statics, class locks, field
+//!   descriptors, lambda proxies, mirrors, vtables, JIT profiles/tier
+//!   state/deopt log/code cache and the initiating-resolution cache, then
+//!   `classloading/src/class_manager.rs` — `unload_user_loader`.
+//!
+//! See `docs/internal/class-loader-unloading-and-bounded-metadata.md` for the
+//! invariants that transaction upholds, and
+//! `docs/internal/arch-2026-07-26/refs-metaspace-unloading.md` for why this
+//! scaffolding is being kept (correct, tested, and the natural home should the
+//! GC ever need to own loader bookkeeping) rather than deleted.
+//!
+//! **Do not wire this in without re-reading that doc.** Two of the tables here
+//! previously had no bound at all and would have violated the "unload
+//! invalidation or hard bound" rule the moment they saw traffic; both are fixed
+//! below and pinned by tests.
 
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -63,6 +98,16 @@ pub struct ClassUnloadingResult {
     pub unloaded_class_names: Vec<String>,
     /// Names of unloaded loaders.
     pub unloaded_loader_names: Vec<String>,
+    /// Heap addresses of the unloaded loaders.
+    ///
+    /// BOUNDED-METADATA FIX (2026-07-26): [`ClassLoaderHierarchy`] is a
+    /// separate, unlinked type whose `parents` map is only ever pruned through
+    /// the manual [`ClassLoaderHierarchy::remove`] / [`ClassLoaderHierarchy::remove_all`].
+    /// Without the unloaded addresses in the result, a caller holding both
+    /// types had no way to keep the hierarchy in step, so `parents` grew
+    /// without bound. `unloaded_loader_names` is not usable for this — loader
+    /// names are not unique.
+    pub unloaded_loader_addrs: Vec<usize>,
 }
 
 /// A JIT code cache entry associated with a compiled method.
@@ -276,10 +321,27 @@ impl ClassUnloader {
             .collect();
         let unloaded_class_ids: std::collections::HashSet<u32> =
             unloaded_pairs.iter().map(|&(_, id)| id).collect();
+        // BOUNDED-METADATA FIX (2026-07-26): this loop used to only flip
+        // `entry.valid = false` and leave the `CodeCacheEntry` — including its
+        // owned `method_name: String` — in `code_cache` forever. `code_cache`
+        // is otherwise append-only (`register_jit_code` only ever pushes), so
+        // the vector grew without bound across unload cycles: exactly the
+        // "long-running app with dynamic proxies dies after hours" failure
+        // mode, and a direct violation of the "unload invalidation or hard
+        // bound" rule in
+        // `docs/internal/class-loader-unloading-and-bounded-metadata.md`.
+        //
+        // Retiring an entry is now a REMOVAL, not a flag flip. The `valid`
+        // field is kept because a caller may hold an entry snapshot, but no
+        // retired entry survives the transaction that retired it. This also
+        // keeps the O(code_cache) scan here — and the O(loaders * classes) scan
+        // in `register_jit_code` — proportional to *live* compiled methods
+        // rather than to every method ever compiled.
         let mut jit_invalidated = 0;
-        for entry in &mut inner.code_cache {
+        inner.code_cache.retain_mut(|entry| {
             if !entry.valid {
-                continue;
+                // Already retired by an earlier path; drop it now.
+                return false;
             }
             let should_invalidate = match entry.loader_addr {
                 // Owning loader known: only invalidate the exact pair, so a
@@ -292,8 +354,11 @@ impl ClassUnloader {
             if should_invalidate {
                 entry.valid = false;
                 jit_invalidated += 1;
+                false // drop: the owning class is gone
+            } else {
+                true
             }
-        }
+        });
 
         // Phase 4 -- reclaim metadata.
         let mut metadata_reclaimed = 0;
@@ -302,7 +367,13 @@ impl ClassUnloader {
                 metadata_reclaimed += loader.metadata_bytes;
             }
         }
-        inner.total_metadata_bytes -= metadata_reclaimed;
+        // `saturating_sub`: a plain `-=` here underflows (and panics in debug)
+        // if the accounting ever drifts — e.g. a class registered against an
+        // unknown loader bumps neither total, but a later re-registration
+        // could. Accounting drift must not take down the collector.
+        inner.total_metadata_bytes = inner
+            .total_metadata_bytes
+            .saturating_sub(metadata_reclaimed);
 
         // Build result.
         let unloaded_class_names: Vec<String> = classes.iter().map(|c| c.name.clone()).collect();
@@ -312,6 +383,12 @@ impl ClassUnloader {
             .filter(|l| unreachable.contains(&l.loader_addr))
             .map(|l| l.name.clone())
             .collect();
+        let unloaded_loader_addrs: Vec<usize> = inner
+            .loaders
+            .iter()
+            .map(|l| l.loader_addr)
+            .filter(|a| unreachable.contains(a))
+            .collect();
         let loaders_unloaded = unreachable.len();
         let classes_unloaded = classes.len();
 
@@ -320,8 +397,9 @@ impl ClassUnloader {
             .loaders
             .retain(|l| !unreachable.contains(&l.loader_addr));
 
-        // Update totals.
-        inner.total_classes -= classes_unloaded;
+        // Update totals. `saturating_sub` for the same reason as
+        // `total_metadata_bytes` above.
+        inner.total_classes = inner.total_classes.saturating_sub(classes_unloaded);
 
         // Update stats.
         inner.stats.total_unload_cycles += 1;
@@ -337,6 +415,7 @@ impl ClassUnloader {
             jit_entries_invalidated: jit_invalidated,
             unloaded_class_names,
             unloaded_loader_names,
+            unloaded_loader_addrs,
         }
     }
 
@@ -508,6 +587,37 @@ impl ClassLoaderHierarchy {
     /// Remove a loader from the hierarchy.
     pub fn remove(&mut self, loader_addr: usize) {
         self.parents.remove(&loader_addr);
+    }
+
+    /// Remove every loader in `loader_addrs` from the hierarchy.
+    ///
+    /// BOUNDED-METADATA FIX (2026-07-26): pair this with
+    /// [`ClassUnloadingResult::unloaded_loader_addrs`] after every
+    /// [`ClassUnloader::unload_classes`]. `parents` is otherwise append-only
+    /// (`register` is the only writer besides `update_after_gc`, which
+    /// re-inserts what it drained), so a caller that unloads loaders without
+    /// pruning here leaks one map entry per loader for the process lifetime —
+    /// and every leaked entry also lengthens the `is_ancestor` iteration bound.
+    ///
+    /// Note this deliberately does NOT re-parent orphaned children: a child of
+    /// an unloaded loader is itself unreachable (a loader strongly references
+    /// its parent, never the reverse), so it is unloaded in the same
+    /// transaction and appears in the same address list.
+    pub fn remove_all(&mut self, loader_addrs: &[usize]) {
+        for addr in loader_addrs {
+            self.parents.remove(addr);
+        }
+    }
+
+    /// Number of registered loaders. Exposed so callers (and tests) can assert
+    /// the map actually shrinks on unload.
+    pub fn len(&self) -> usize {
+        self.parents.len()
+    }
+
+    /// Whether the hierarchy is empty.
+    pub fn is_empty(&self) -> bool {
+        self.parents.is_empty()
     }
 
     /// Update addresses after GC.
@@ -682,8 +792,12 @@ mod tests {
         u.register_jit_code(50, "init", 1024);
         let result = u.unload_classes(&|_| false);
         assert_eq!(result.jit_entries_invalidated, 2);
-        // Code cache entries are still present but invalid.
-        assert!(u.code_cache_snapshot().iter().all(|e| !e.valid));
+        // BOUNDED-METADATA FIX (2026-07-26): retired entries are REMOVED, not
+        // just flagged. Previously they stayed in `code_cache` forever.
+        assert!(
+            u.code_cache_snapshot().is_empty(),
+            "retired code-cache entries must be released, not merely flagged"
+        );
     }
 
     #[test]
@@ -748,19 +862,21 @@ mod tests {
         // shared class_id.
         assert_eq!(result.jit_entries_invalidated, 1);
         let cache = u.code_cache_snapshot();
-        let dead = cache
-            .iter()
-            .find(|e| e.loader_addr == Some(0xA00))
-            .expect("class_unloading: expected code cache entry for dead loader 0xA00");
+        // BOUNDED-METADATA FIX (2026-07-26): the dead loader's entry is
+        // released outright rather than left behind with `valid == false`.
+        assert!(
+            !cache.iter().any(|e| e.loader_addr == Some(0xA00)),
+            "dead loader's JIT code must be invalidated AND released"
+        );
         let live = cache
             .iter()
             .find(|e| e.loader_addr == Some(0xB00))
             .expect("class_unloading: expected code cache entry for live loader 0xB00");
-        assert!(!dead.valid, "dead loader's JIT code must be invalidated");
         assert!(
             live.valid,
             "live loader's JIT code must survive (reused class_id)"
         );
+        assert_eq!(cache.len(), 1, "exactly the live entry remains");
     }
 
     #[test]
@@ -1189,5 +1305,116 @@ mod tests {
 
         let h = ClassLoaderHierarchy::default();
         assert!(h.all_loaders().is_empty());
+    }
+
+    // ======================================================================
+    // BOUNDED-METADATA FIX (2026-07-26): "unload releases everything".
+    //
+    // These pin the invariant stated in
+    // `docs/internal/class-loader-unloading-and-bounded-metadata.md`: every
+    // process-lifetime cache must have unload invalidation or a hard bound.
+    // Two tables here previously had neither.
+    // ======================================================================
+
+    // Repeated define-heat-drop cycles — the shape of the checked-in
+    // `class_loader_unload` probe, and of any app using CGLIB/ByteBuddy
+    // proxies — must not grow ANY table. Before the fix `code_cache` grew by
+    // one `CodeCacheEntry` (with an owned `String`) per compiled method per
+    // cycle, forever.
+    #[test]
+    fn repeated_unload_cycles_leave_no_residue() {
+        let u = ClassUnloader::new();
+        let mut hierarchy = ClassLoaderHierarchy::new();
+        u.register_loader(0x10, "bootstrap", true);
+        u.register_class(0x10, make_class("java/lang/Object", 1, 1024));
+
+        for cycle in 0..64usize {
+            let addr = 0x1000 + cycle * 0x100;
+            u.register_loader(addr, "ProxyLoader", false);
+            hierarchy.register(addr, Some(0x10));
+            u.register_class(
+                addr,
+                make_class("proxy/Generated", 1000 + cycle as u32, 512),
+            );
+            u.register_jit_code(1000 + cycle as u32, "invoke", 2048);
+            u.register_jit_code(1000 + cycle as u32, "<init>", 512);
+
+            // Only the bootstrap loader stays reachable.
+            let result = u.unload_classes(&|a| a == 0x10);
+            assert_eq!(result.loaders_unloaded, 1, "cycle {cycle}");
+            assert_eq!(result.jit_entries_invalidated, 2, "cycle {cycle}");
+            hierarchy.remove_all(&result.unloaded_loader_addrs);
+        }
+
+        // Steady state: only the bootstrap loader and its one class remain.
+        assert_eq!(u.loader_count(), 1);
+        assert_eq!(u.total_classes(), 1);
+        assert_eq!(u.total_metadata_bytes(), 1024);
+        assert!(
+            u.code_cache_snapshot().is_empty(),
+            "code_cache grew across unload cycles — the unbounded-metadata leak is back"
+        );
+        assert!(
+            hierarchy.is_empty(),
+            "hierarchy grew across unload cycles: {} entries left",
+            hierarchy.len()
+        );
+    }
+
+    // The unloaded addresses must be reported, or a caller holding a
+    // `ClassLoaderHierarchy` cannot keep it in step (loader NAMES are not
+    // unique, so `unloaded_loader_names` is not a substitute).
+    #[test]
+    fn unload_result_reports_loader_addresses() {
+        let u = ClassUnloader::new();
+        u.register_loader(0xA00, "Plugin", false);
+        u.register_loader(0xB00, "Plugin", false); // same name, different loader
+        u.register_class(0xA00, make_class("a/C", 1, 64));
+        u.register_class(0xB00, make_class("b/C", 2, 64));
+
+        let result = u.unload_classes(&|a| a == 0xB00);
+        assert_eq!(result.unloaded_loader_addrs, vec![0xA00]);
+        assert_eq!(result.unloaded_loader_names, vec!["Plugin".to_string()]);
+    }
+
+    // Retiring one loader's code must leave the surviving loader's entry
+    // untouched, and a second cycle with nothing new to unload must neither
+    // resurrect nor re-count anything.
+    #[test]
+    fn retired_entries_do_not_linger_or_recount() {
+        let u = ClassUnloader::new();
+        u.register_loader(0xA00, "Dead", false);
+        u.register_class(0xA00, make_class("d/C", 1, 64));
+        u.register_jit_code(1, "m", 128);
+        u.register_loader(0xB00, "Live", false);
+        u.register_class(0xB00, make_class("l/C", 2, 64));
+        u.register_jit_code(2, "m", 128);
+
+        let first = u.unload_classes(&|a| a == 0xB00);
+        assert_eq!(first.jit_entries_invalidated, 1);
+        assert_eq!(u.code_cache_snapshot().len(), 1);
+
+        // A second cycle with nothing new to unload must not resurrect or
+        // re-count anything.
+        let second = u.unload_classes(&|a| a == 0xB00);
+        assert_eq!(second.jit_entries_invalidated, 0);
+        assert_eq!(u.code_cache_snapshot().len(), 1);
+        assert!(u.code_cache_snapshot()[0].valid);
+    }
+
+    // Accounting must not underflow when a class is registered against an
+    // unknown loader (the registration is dropped, so the totals never rose).
+    #[test]
+    fn accounting_does_not_underflow_on_unknown_loader() {
+        let u = ClassUnloader::new();
+        u.register_class(0xDEAD, make_class("ghost/C", 1, 4096)); // no such loader
+        assert_eq!(u.total_classes(), 0);
+        assert_eq!(u.total_metadata_bytes(), 0);
+        u.register_loader(0xA00, "L", false);
+        u.register_class(0xA00, make_class("a/C", 2, 64));
+        let result = u.unload_classes(&|_| false);
+        assert_eq!(result.classes_unloaded, 1);
+        assert_eq!(u.total_classes(), 0);
+        assert_eq!(u.total_metadata_bytes(), 0);
     }
 }

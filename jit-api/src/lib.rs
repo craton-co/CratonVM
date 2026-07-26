@@ -37,6 +37,73 @@ use cratonvm_types::ClassId;
 /// impl snapshots its current value, which is semantically right: the field is
 /// a *memo*, and copying a memo forward is always sound (at worst the clone
 /// re-probes once).
+///
+/// # Adding a field to this struct is a four-crate change
+///
+/// There are **38 struct literals** of this type, in
+/// `vm/src/runtime/interpreter.rs`, `vm/src/runtime/vtable.rs`,
+/// `vm/src/jit/helpers.rs`, `vm/src/runtime/lockfree_resolve.rs`,
+/// `vm/src/vm.rs`, `classloading/src/resolution.rs`, `jit/src/lib.rs`,
+/// `jit/tests/ir_vs_singlepass.rs` and this file — spanning
+/// `cratonvm-jit-api`, `cratonvm-jit`, `cratonvm-classloading` and
+/// `cratonvm-vm`. Only five have a `..expr` functional-update tail (the
+/// `..make_cached_method()` literals in this file's `mod tests`), and those are
+/// the ones to watch: they keep compiling silently while every other literal
+/// errors. A `Default` impl does not help — a struct literal must name every
+/// field unless it ends in `..expr`.
+///
+/// Changing an existing field's **type** is far cheaper: all 38 literals spell
+/// the four `OnceLock` fields as `std::sync::OnceLock::new()`, which re-infers,
+/// so an `OnceLock<T>` → `OnceLock<U>` change touches only this file and the
+/// handful of named readers. That is why [`Self::native_callback_cache`] still
+/// carries its old name while holding a `NativeCallSite`.
+///
+/// # CR-CLO-2 — the `method_index` field this struct still wants
+///
+/// **Not landed.** Specified here because the pass that needed it
+/// (`frame-index-and-crash-trace`, 2026-07-26) owned this file but none of the
+/// eight *production* sites that would populate the field, so landing it would
+/// have left the workspace non-compiling for eight concurrent agents while
+/// still producing `None` everywhere.
+///
+/// *What.* `pub method_index: Option<u32>` — this method's slot in its
+/// declaring class's `Class::methods` list. The value belongs here rather than
+/// on `Frame` because this entry is built once per call site and `Arc`-shared
+/// across every call through it, so the slot is resolved **once per method**
+/// instead of once per frame push.
+///
+/// *Why.* `stackwalker::capture_frames_no_lines` — the thread-dump depositor
+/// that runs at every blocking/safepoint deposit and therefore must not take a
+/// `ClassStore` borrow — publishes `StackTraceEntry::method_index: None`, so
+/// deferred resolution (`stackwalker::resolve_line_numbers_in_place`) falls
+/// back to the unambiguous-name rule and leaves every **overloaded** frame with
+/// no line number at all. A `u32` copied out of the frame costs no borrow, no
+/// lock and no allocation.
+///
+/// *How to land it.* Add the field, then populate it at the six sites that
+/// already hold a live `ClassStore` borrow plus the resolved `&ClassFileMethod`
+/// and declaring `ClassId` — `vm/src/runtime/interpreter.rs` in
+/// `try_invoke_cached_lambda_impl`, `populate_invoke_cache`,
+/// `try_jit_upgrade_with_gate`, `try_jit_compile_callee_slow`,
+/// `populate_virtual_invoke_cache`, and `vm/src/jit/helpers.rs` in
+/// `try_resume_trapped_callee`. `vm/src/runtime/vtable.rs`'s
+/// `vtable_install_adapter` has no store but does have
+/// `VtableSlotDescriptor::method_index` already resolved at link time, so it
+/// can pass it straight through. The one production site with neither is the
+/// first-call tier-up deopt-resume path in `interpreter.rs::execute`, which
+/// drops its `class_manager` guard before building the entry; `None` there is
+/// correct and costs only that one path the fallback rule.
+///
+/// Then `Frame::new_pooled_cached` (`vm/src/runtime/frame.rs`) seeds
+/// `Frame::method_index` from `cached.method_index` — one line, already
+/// commented in place — and `capture_frames_no_lines` swaps its `None` for
+/// `f.method_index()`.
+///
+/// *What it must NOT be used for.* It does not make deferring the `Throwable`
+/// capture path safe. Index verification is by *name*, so a redefinition that
+/// reorders an overload set across the capture/read window is the one case
+/// verification cannot catch, and eager capture has no such window. See
+/// `docs/internal/arch-2026-07-26/cross-owner-closeout.md` §6.
 pub struct CachedBytecodeMethod {
     pub declaring_class_id: ClassId,
     pub class_name: Arc<str>,
@@ -68,22 +135,59 @@ pub struct CachedBytecodeMethod {
     /// after this entry is populated, so it is still re-evaluated on every
     /// hit (cheap: a single generation-counter read plus a short allowlist).
     pub force_native_cache: std::sync::OnceLock<bool>,
+    /// Per-call-site native-dispatch memo. **Read it through
+    /// [`Self::native_call_site`], never directly.**
+    ///
     /// Perf follow-up (2026-07-19, TestResponsePerformance interpreter-
-    /// throughput residual): memoizes the resolved `NativeCallback` (or
-    /// `None`) for this callsite, mirroring `force_native_cache` above.
-    /// `intercept_force_registered_native_cached` previously called
+    /// throughput residual): `intercept_force_registered_native_cached` called
     /// `NativeMethodRegistry::find` (a hash-keyed lookup over all three of
     /// class/method/descriptor) on every single cached-invoke hit whose
     /// force-native decision was `true` -- confirmed via `perf` to be the
-    /// #2 hottest symbol (~7% of samples) on this same benchmark, second
-    /// only to the interpreter's own frame-dispatch loop. Native-method
-    /// registration is immutable after VM boot (no redefinition path
-    /// touches the registry), so the same (class, method, descriptor)
-    /// triple always resolves to the same callback for the life of the
-    /// process -- caching it here is sound by the same argument already
-    /// used for `force_native_cache`. See docs/known-issues/tomcat-08-07/
-    /// silent-hang-no-signature-cluster.md.
-    pub native_callback_cache: std::sync::OnceLock<Option<cratonvm_native_api::NativeCallback>>,
+    /// #2 hottest symbol (~7% of samples) on that benchmark, second only to
+    /// the interpreter's own frame-dispatch loop. See
+    /// docs/known-issues/tomcat-08-07/silent-hang-no-signature-cluster.md.
+    ///
+    /// # Why this holds a `NativeCallSite` and not an `Option<NativeCallback>`
+    ///
+    /// It used to be `OnceLock<Option<NativeCallback>>`, whose soundness
+    /// argument was "native registration is immutable after VM boot". That is
+    /// true of the steady state but **not of boot itself**, and not of
+    /// `alias_class` or of the lazy `register_*` passes that run after the
+    /// first bytecode executes. A `None` memoized before those run stayed
+    /// wrong forever: a native that *is* registered, and that dispatches fine
+    /// through `find`, was invisible at this call site for the life of the
+    /// process. `cratonvm_native_api::NativeCallSite` keys its memo on the
+    /// registry generation instead, so a stale negative self-heals at the cost
+    /// of one `u32` compare -- the same argument
+    /// [`Self::jit_probe_generation`] below already relies on. See
+    /// `docs/internal/arch-2026-07-26/native-dispatch-memoization.md` §3
+    /// Steps 0 and 2 (sites A1-A3).
+    ///
+    /// # ONE CELL, ONE TRIPLE
+    ///
+    /// A `NativeCallSite` memo is `(generation << 32) | slot`, validated
+    /// against the generation *alone* -- the triple is deliberately not
+    /// re-checked on a warm hit, because re-hashing three strings is the exact
+    /// cost the cell exists to remove. A cell reached with two different
+    /// triples silently serves the second whatever the first memoized. This
+    /// cell therefore answers for **this entry's own
+    /// `(class_name, method_name, method_descriptor)` and nothing else**. A
+    /// call site that needs a *different* triple (e.g. the
+    /// `java/lang/ClassLoader` re-target inside
+    /// `intercept_force_registered_native_cached`) must use its own cell or
+    /// plain `find`. Pinned by
+    /// `sharing_one_memo_cell_across_two_triples_silently_mis_answers` in
+    /// `vm/src/runtime/interpreter.rs`.
+    ///
+    /// # Field name
+    ///
+    /// Still `native_callback_cache` only because ~20 struct literals live in
+    /// crates the wave that changed this could not write to, and the literals
+    /// all read `std::sync::OnceLock::new()`, which type-infers unchanged. The
+    /// rename to `native_call_site` is a pure mechanical follow-up; see the
+    /// cross-owner request in
+    /// `docs/internal/arch-2026-07-26/interpreter-completion.md`.
+    pub native_callback_cache: std::sync::OnceLock<cratonvm_native_api::NativeCallSite>,
     /// T2.5 — memoized JIT invocation-counter key for this method, i.e. the
     /// packed `(declaring_class_id << 32) | hash(method_name ++ descriptor)`
     /// u64 that the interpreter uses to index
@@ -160,6 +264,12 @@ impl Clone for CachedBytecodeMethod {
             is_synchronized: self.is_synchronized,
             is_static: self.is_static,
             force_native_cache: self.force_native_cache.clone(),
+            // `NativeCallSite: Clone` snapshots the memo word. Carrying it
+            // forward is sound for the same reason `jit_probe_generation`'s
+            // snapshot is: the memo is generation-keyed, so a clone that
+            // inherits a stale word re-resolves on its first read after the
+            // registry moves. The clone answers for the same triple, because
+            // the triple fields are `Arc`-shared with it.
             native_callback_cache: self.native_callback_cache.clone(),
             invoc_key: self.invoc_key.clone(),
             jit_probe_generation: std::sync::atomic::AtomicU64::new(
@@ -176,6 +286,33 @@ impl Clone for CachedBytecodeMethod {
 }
 
 impl CachedBytecodeMethod {
+    /// This entry's native-dispatch memo cell — see
+    /// [`Self::native_callback_cache`] for the full contract.
+    ///
+    /// The returned cell is a drop-in for
+    /// `shared.natives.native_methods.find(class, method, desc)`:
+    ///
+    /// ```ignore
+    /// let cb = cached.native_call_site().callback(
+    ///     &shared.natives.native_methods,
+    ///     cached.class_name.as_ref(),
+    ///     cached.method_name.as_ref(),
+    ///     cached.method_descriptor.as_ref(),
+    /// );
+    /// ```
+    ///
+    /// It must only ever be handed this entry's own triple — the memo is per
+    /// call site, not per triple, and is not re-validated against the strings
+    /// on a warm hit. The `OnceLock` wrapper exists purely so that the ~20
+    /// `CachedBytecodeMethod` struct literals that spell this field
+    /// `std::sync::OnceLock::new()` keep compiling; it costs one already-hot
+    /// acquire load ahead of the memo's relaxed load.
+    #[inline]
+    pub fn native_call_site(&self) -> &cratonvm_native_api::NativeCallSite {
+        self.native_callback_cache
+            .get_or_init(cratonvm_native_api::NativeCallSite::new)
+    }
+
     /// The memoized JIT invocation-counter key for this method — see
     /// [`Self::invoc_key`]. Computed on first use, then read straight out of the
     /// `OnceLock`.
@@ -883,6 +1020,177 @@ mod tests {
             jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
             quickened: std::sync::OnceLock::new(),
         }
+    }
+
+    fn noop_native(
+        _ctx: &mut dyn cratonvm_native_api::NativeContext,
+        _args: &[cratonvm_types::Value],
+    ) -> cratonvm_types::error::MethodCallResult {
+        Ok(None)
+    }
+
+    /// Step 0 of `docs/internal/arch-2026-07-26/native-dispatch-memoization.md`
+    /// §3: the per-entry native-dispatch memo must be substitutable for
+    /// `registry.find(class, method, descriptor)` — on a miss, on a hit, and
+    /// warm.
+    #[test]
+    fn native_call_site_is_substitutable_for_find() {
+        let cached = make_cached_method();
+        let mut registry = cratonvm_native_api::NativeMethodRegistry::new();
+
+        // Miss agrees with `find`.
+        assert!(registry
+            .find(
+                &cached.class_name,
+                &cached.method_name,
+                &cached.method_descriptor
+            )
+            .is_none());
+        assert!(cached
+            .native_call_site()
+            .callback(
+                &registry,
+                &cached.class_name,
+                &cached.method_name,
+                &cached.method_descriptor,
+            )
+            .is_none());
+
+        registry.register(
+            &cached.class_name,
+            &cached.method_name,
+            &cached.method_descriptor,
+            noop_native,
+        );
+
+        let via_find = registry
+            .find(
+                &cached.class_name,
+                &cached.method_name,
+                &cached.method_descriptor,
+            )
+            .expect("registered native must be findable");
+        let via_cell = cached
+            .native_call_site()
+            .callback(
+                &registry,
+                &cached.class_name,
+                &cached.method_name,
+                &cached.method_descriptor,
+            )
+            .expect("the cell must resolve what `find` resolves");
+        assert_eq!(via_find as usize, via_cell as usize);
+
+        // Warm read agrees with itself.
+        let warm = cached
+            .native_call_site()
+            .callback(
+                &registry,
+                &cached.class_name,
+                &cached.method_name,
+                &cached.method_descriptor,
+            )
+            .expect("warm read");
+        assert_eq!(warm as usize, via_find as usize);
+    }
+
+    /// THE LATENT BUG THIS FIELD CHANGE FIXES. The old
+    /// `OnceLock<Option<NativeCallback>>` memoized a *negative* permanently, so
+    /// a native registered by `alias_class` or a lazy `register_*` pass — both
+    /// of which run after the first bytecode executes — was invisible at this
+    /// call site for the rest of the process, while `find` kept resolving it.
+    /// The generation-keyed cell must self-heal.
+    #[test]
+    fn native_call_site_heals_a_negative_after_late_registration() {
+        let cached = make_cached_method();
+        let mut registry = cratonvm_native_api::NativeMethodRegistry::new();
+
+        // Warm the cell with a negative, twice, so a `OnceLock`-shaped memo
+        // would definitely be sealed.
+        for _ in 0..2 {
+            assert!(cached
+                .native_call_site()
+                .callback(
+                    &registry,
+                    &cached.class_name,
+                    &cached.method_name,
+                    &cached.method_descriptor,
+                )
+                .is_none());
+        }
+
+        registry.register(
+            &cached.class_name,
+            &cached.method_name,
+            &cached.method_descriptor,
+            noop_native,
+        );
+
+        assert!(
+            cached
+                .native_call_site()
+                .callback(
+                    &registry,
+                    &cached.class_name,
+                    &cached.method_name,
+                    &cached.method_descriptor,
+                )
+                .is_some(),
+            "a native registered after the call site first ran must become \
+             visible once the registry generation moves"
+        );
+    }
+
+    /// The cell is reached through `&self`, so the same `Arc`-shared entry that
+    /// several call sites hold must hand back one stable cell — and `Clone`
+    /// must carry a usable (not corrupt) memo forward, per the hand-written
+    /// `Clone` impl's comment.
+    #[test]
+    fn native_call_site_is_stable_per_entry_and_survives_clone() {
+        let cached = make_cached_method();
+        let mut registry = cratonvm_native_api::NativeMethodRegistry::new();
+        registry.register(
+            &cached.class_name,
+            &cached.method_name,
+            &cached.method_descriptor,
+            noop_native,
+        );
+
+        let first = cached.native_call_site() as *const _;
+        let second = cached.native_call_site() as *const _;
+        assert_eq!(
+            first, second,
+            "`native_call_site()` must return the one cell this entry owns"
+        );
+
+        let warm = cached
+            .native_call_site()
+            .callback(
+                &registry,
+                &cached.class_name,
+                &cached.method_name,
+                &cached.method_descriptor,
+            )
+            .expect("warm");
+
+        let cloned = cached.clone();
+        // The clone shares the triple (`Arc`), so the inherited memo answers
+        // for the same triple and must agree.
+        let via_clone = cloned
+            .native_call_site()
+            .callback(
+                &registry,
+                &cloned.class_name,
+                &cloned.method_name,
+                &cloned.method_descriptor,
+            )
+            .expect("clone must resolve the same native");
+        assert_eq!(via_clone as usize, warm as usize);
+        // ...but it is a distinct cell, so mutating one cannot corrupt the other.
+        assert_ne!(
+            cached.native_call_site() as *const _,
+            cloned.native_call_site() as *const _
+        );
     }
 
     /// T2.2 — the memo primitive, tested against literal generation values so

@@ -614,6 +614,49 @@ fn build_cfg(code: &[u8], code_len: usize) -> Vec<BasicBlock> {
                 block_starts[next] = true;
             }
         }
+        // Mark the instruction FOLLOWING any unconditional control transfer as
+        // a block start.
+        //
+        // `goto`/`goto_w` and the two switches already reach this via the
+        // `branch_target` / switch arms above; the missing family was
+        // `ireturn..return` (0xac-0xb1) and `athrow` (0xbf), which have no
+        // branch target and so never marked their successor PC. Second pass
+        // below SKIPS any PC that is not a block start once the first block
+        // exists:
+        //
+        //     if !block_starts[pc] && !blocks.is_empty() { pc += bc_len(..); continue; }
+        //
+        // so a region that begins right after a `return`/`athrow` and is not
+        // otherwise a branch target belonged to NO basic block at all. Its
+        // local loads/stores were invisible to `compute_gen_kill`,
+        // `build_interference` and `live_locals_per_pc` — which is exactly the
+        // CM-FASTMATH failure shape (invisible uses ⇒ two simultaneously-live
+        // locals coalesced onto one register), just reached through the CFG
+        // instead of through a bad instruction length.
+        //
+        // The reachable instance of that region is an **exception handler**
+        // whose protected block ends in `return`/`athrow` (javac's ordinary
+        // shape when the `try` body returns). Handlers are entered by the
+        // runtime's exception router, never by a fall-through or branch, so
+        // nothing else marks them. Today a handler that reads a non-parameter
+        // local also fails the RBC.6 admission gate in
+        // `jit/src/lib.rs::local_handler_reads_unsafe_local`, so the method is
+        // refused before it can be miscompiled — this fix removes the reliance
+        // on that coincidence and is a prerequisite for relaxing it (see
+        // `docs/internal/arch-2026-07-26/jit-regalloc-and-deopt.md`).
+        //
+        // Direction of the change is monotone-safe: more block starts ⇒ more
+        // blocks ⇒ strictly MORE code covered by gen/kill and interference.
+        // Extra interference edges can only make the coloring more
+        // conservative (a local spills to its frame slot, which is always
+        // correct), never less. Instruction stepping is unchanged — the skip
+        // loop already walked the region with the same `bc_len`.
+        if is_unconditional(code[pc]) {
+            let next = pc + len;
+            if next < code_len {
+                block_starts[next] = true;
+            }
+        }
         pc += len;
     }
 
@@ -1190,6 +1233,171 @@ pub(crate) fn find_reference_locals(code: &[u8], code_len: usize, num_locals: us
     ref_mask
 }
 
+// ---------------------------------------------------------------------------
+// Safepoint publication planning (cross-call register residency)
+// ---------------------------------------------------------------------------
+
+/// Which register-homed locals a GC-capable call site actually has to copy back
+/// into their canonical frame slots.
+///
+/// ## Why this exists
+///
+/// Every local this allocator colours receives a **callee-saved** register
+/// ([`super::x64::LOCAL_REGS`] = `R12..R15, RBX` on System V, plus `RSI/RDI` on
+/// Windows; [`ARM64_LOCAL_GPRS`] = `X19..X28`). Callee-saved means the value
+/// survives a call *by ABI* — the callee's own prologue saves and its epilogue
+/// restores it. So "keeping a hot value in a register across a call" is not a
+/// missing capability here; it is the default, and it has been since the
+/// graph-colouring allocator landed.
+///
+/// What still costs a store on every call is **publication**: the x64 emitter's
+/// pre-safepoint sequence copies *every* register-homed local to
+/// `[rbp - (idx+1)*8]` before *every* GC-capable call, because the GC's oop maps
+/// and the conservative frame walk read stack memory only — there is no
+/// register-level pointer map (`OopMapEntry` carries `frame_slot_offsets`, and
+/// the long-standing `reg_oops` bitmap TODO is still unimplemented). A local
+/// that can never hold an object reference contributes nothing to that scan, so
+/// its store is pure overhead — paid on the hottest possible instruction of a
+/// recursion-bound workload.
+///
+/// This plan separates the two populations so a call site can publish the oops
+/// and leave the primitives in their registers.
+///
+/// ## Soundness
+///
+/// * **GC.** A local excluded from [`Self::publish_always`] is one that no
+///   `astore`/`aload` in the whole method ever touches (`find_reference_locals`
+///   taints a slot for the entire method on a single reference access, so
+///   javac's cross-scope slot reuse cannot defeat it), unioned with the
+///   caller-supplied reference-parameter mask. Such a slot can only ever hold a
+///   primitive, so leaving it in a callee-saved register across a call cannot
+///   create an invisible GC root. This is the same argument the pure-kernel
+///   register-home path already relies on, applied per-local instead of
+///   per-method.
+/// * **Deopt.** The x64 snapshot builder already prefers a register descriptor
+///   over a slot descriptor for a register-homed local
+///   (`FrameValue::Register` / `RegisterLong` / `RegisterRef`), and the
+///   frame-deopt stub spills the whole GPR file into
+///   [`crate::deopt::SavedRegisters`], so reconstruction reads the *register*,
+///   not the frame slot. An unpublished slot is therefore never observed.
+/// * **Value.** The register is authoritative between accesses; the frame slot
+///   is a copy. Skipping the copy cannot change a computed value.
+pub struct SafepointPublishPlan {
+    /// Locals that may hold an object reference anywhere in the method
+    /// (`find_reference_locals` ∪ caller-supplied reference parameters).
+    /// Bit `i` ⇒ local `i`. Locals `>= 64` are not represented and must be
+    /// treated as references by the caller.
+    pub reference_locals: u64,
+    /// `reference_locals` restricted to locals that actually received a
+    /// register home. This is the **only** population whose register residency
+    /// can hide a GC root; when it is zero, no register-homed local can hold an
+    /// oop and a call site may skip local publication entirely.
+    pub register_homed_reference_locals: u64,
+    /// Bci-independent publish set — always sound, no liveness precondition.
+    /// Equal to `register_homed_reference_locals`.
+    pub publish_always: u64,
+    /// Per-bci publish set, additionally narrowed by liveness: a reference
+    /// local whose last read is already behind us is not a live root and need
+    /// not be published.
+    ///
+    /// **Precondition.** Liveness here is computed from the ordinary bytecode
+    /// CFG, which has no edges into exception handlers (the handler table is
+    /// not threaded into this module). Under today's admission rules that is
+    /// safe — `jit/src/lib.rs::local_handler_reads_unsafe_local` refuses to
+    /// compile any method whose handler reads a non-parameter local — but a
+    /// consumer that narrows by liveness inherits that dependency. Use
+    /// [`Self::publish_always`] if you do not want it. Indexed by bci; entries
+    /// past the end are absent, and a caller must fall back to
+    /// `publish_always`.
+    pub publish_at: Vec<u64>,
+}
+
+impl SafepointPublishPlan {
+    /// Publish set at `bci`, falling back to the bci-independent set when the
+    /// liveness table has no entry (unreached PC, out-of-range bci).
+    pub fn publish_at_bci(&self, bci: usize) -> u64 {
+        match self.publish_at.get(bci) {
+            Some(&m) => m,
+            None => self.publish_always,
+        }
+    }
+
+    /// True when no register-homed local can ever hold an object reference, so
+    /// a call site may omit local publication (and the conservative full-GPR
+    /// spill, as far as *locals* are concerned) altogether.
+    ///
+    /// This is the exact predicate the x64 backend's
+    /// `can_elide_self_call_register_spill` should test instead of
+    /// `local_assignments.iter().any(Option::is_some)`; see the cross-owner
+    /// request in `docs/internal/arch-2026-07-26/jit-regalloc-and-deopt.md`.
+    pub fn no_reference_in_registers(&self) -> bool {
+        self.register_homed_reference_locals == 0
+    }
+}
+
+/// Build a [`SafepointPublishPlan`] for a compiled method.
+///
+/// `assignments` is [`RegAllocResult::assignments`] (GPR homes). XMM homes are
+/// deliberately ignored: a float/double local is never a reference, so it never
+/// participates in publication.
+///
+/// `extra_reference_locals` lets the caller union in reference *parameters*
+/// (the x64 backend's `param_oop_mask`). Passing `0` is safe for any method
+/// whose reference parameters are read at least once, since a single `aload`
+/// taints the slot — but callers that already have a descriptor-derived mask
+/// should pass it rather than rely on that.
+///
+/// Locals with index `>= 64` are outside the `u64` bitset used throughout this
+/// module; they never receive a register home in the first place
+/// ([`color_graph`] caps at 64), so they cannot appear in any of the returned
+/// masks and their canonical frame slot is always authoritative.
+pub fn plan_safepoint_publication(
+    code: &[u8],
+    code_len: usize,
+    num_locals: usize,
+    num_params: usize,
+    assignments: &[Option<u8>],
+    extra_reference_locals: u64,
+) -> SafepointPublishPlan {
+    let reference_locals =
+        find_reference_locals(code, code_len, num_locals) | extra_reference_locals;
+
+    let mut register_homed = 0u64;
+    for (i, a) in assignments.iter().enumerate().take(64) {
+        if a.is_some() {
+            register_homed |= 1u64 << i;
+        }
+    }
+    let register_homed_reference_locals = reference_locals & register_homed;
+
+    // Liveness-narrowed per-bci sets.
+    //
+    // A pc that no basic block covers reads back as "nothing live" from the
+    // liveness table, which is the DEFAULT value, not a computed answer.
+    // Trusting it would publish nothing at a safepoint in unreached-but-
+    // executed code (an exception handler the CFG cannot see) and drop a live
+    // oop. Uncovered PCs therefore fall back to the bci-independent set.
+    let (live_at, covered) = live_locals_per_pc_with_coverage(code, code_len, num_params);
+    let publish_at: Vec<u64> = live_at
+        .iter()
+        .zip(covered.iter())
+        .map(|(&live, &is_covered)| {
+            if is_covered {
+                live & register_homed_reference_locals
+            } else {
+                register_homed_reference_locals
+            }
+        })
+        .collect();
+
+    SafepointPublishPlan {
+        reference_locals,
+        register_homed_reference_locals,
+        publish_always: register_homed_reference_locals,
+        publish_at,
+    }
+}
+
 /// Run register allocation for a method (x86-64).
 pub fn allocate_registers(
     code: &[u8],
@@ -1235,6 +1443,23 @@ pub fn allocate_registers(
 /// `i < 64`); a caller must treat locals `>= 64` as conservatively live (as
 /// they already do for `block_live_in`).
 pub fn live_locals_per_pc(code: &[u8], code_len: usize, num_params: usize) -> Vec<u64> {
+    live_locals_per_pc_with_coverage(code, code_len, num_params).0
+}
+
+/// [`live_locals_per_pc`] plus the parallel *coverage* bitmap: `covered[pc]` is
+/// `true` exactly when `pc` is an instruction start inside some basic block, so
+/// `live_at[pc]` is a computed answer rather than the `0` default.
+///
+/// The distinction matters for any consumer that treats "nothing live" as
+/// permission to drop state: an *uncovered* pc (code no CFG path reaches —
+/// genuinely dead bytecode, or the interior of a mis-decoded region) also reads
+/// as `0`, and acting on that would silently discard live values. Every such
+/// consumer must fall back to its conservative answer instead.
+fn live_locals_per_pc_with_coverage(
+    code: &[u8],
+    code_len: usize,
+    num_params: usize,
+) -> (Vec<u64>, Vec<bool>) {
     let mut blocks = build_cfg(code, code_len);
     for block in &mut blocks {
         compute_gen_kill(code, block);
@@ -1242,6 +1467,7 @@ pub fn live_locals_per_pc(code: &[u8], code_len: usize, num_params: usize) -> Ve
     solve_liveness(&mut blocks, num_params);
 
     let mut live_at = vec![0u64; code_len + 1];
+    let mut covered = vec![false; code_len + 1];
     for block in &blocks {
         let mut pcs = Vec::new();
         {
@@ -1269,9 +1495,10 @@ pub fn live_locals_per_pc(code: &[u8], code_len: usize, num_params: usize) -> Ve
                 }
             }
             live_at[pc] = live;
+            covered[pc] = true;
         }
     }
-    live_at
+    (live_at, covered)
 }
 
 /// Run register allocation for a method (ARM64).
@@ -2241,5 +2468,332 @@ mod tests {
             0,
             "local 2 live at the iload_2 that reads it"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // CFG coverage after an unconditional terminator (handler-shaped region)
+    // -----------------------------------------------------------------------
+
+    /// The shape this fixes: a protected region that ends in `ireturn`,
+    /// followed by an exception handler that is not a branch target. Before
+    /// the fix, `build_cfg`'s second pass skipped every PC from the handler's
+    /// `astore` to the end of the method (nothing marked them as block
+    /// starts), so the handler's local accesses were invisible to liveness and
+    /// interference.
+    const HANDLER_AFTER_RETURN: [u8; 9] = [
+        0x1a, // 0: iload_0
+        0xac, // 1: ireturn                  <- protected region ends here
+        0x4c, // 2: astore_1  (handler entry: store the pending exception)
+        0x12, 0x01, // 3: ldc #1
+        0x4d, // 5: astore_2
+        0x2c, // 6: aload_2
+        0x2b, // 7: aload_1
+        0xbf, // 8: athrow
+    ];
+
+    #[test]
+    fn cfg_covers_code_after_an_unconditional_terminator() {
+        let code = HANDLER_AFTER_RETURN;
+        let live = live_locals_per_pc(&code, code.len(), 1);
+        // The handler reads locals 1 and 2 at pc7/pc6. If the region were
+        // uncovered, every entry here would be the `0` default.
+        assert_ne!(
+            live[7] & (1 << 1),
+            0,
+            "local 1 must be live at the aload_1 inside the handler"
+        );
+        assert_ne!(
+            live[6] & (1 << 2),
+            0,
+            "local 2 must be live at the aload_2 inside the handler"
+        );
+    }
+
+    #[test]
+    fn interference_sees_locals_defined_after_a_return() {
+        let code = HANDLER_AFTER_RETURN;
+        let mut blocks = build_cfg(&code, code.len());
+        for b in &mut blocks {
+            compute_gen_kill(&code, b);
+        }
+        solve_liveness(&mut blocks, 1);
+        let interference = build_interference(&code, &blocks, 3);
+        // Locals 1 and 2 are simultaneously live at the `aload_2; aload_1`
+        // pair, so they MUST interfere — otherwise the colourer is free to
+        // give them the same register and the athrow rethrows the wrong ref.
+        assert_ne!(
+            interference[1] & (1 << 2),
+            0,
+            "locals 1 and 2 are simultaneously live in the handler and must interfere"
+        );
+        assert_ne!(
+            interference[2] & (1 << 1),
+            0,
+            "interference must be symmetric"
+        );
+    }
+
+    #[test]
+    fn find_reference_locals_sees_handler_locals_after_a_return() {
+        // `find_reference_locals` walks raw bytecode, not the CFG, so it was
+        // never affected — pin that, because the publish plan's soundness
+        // rests on it covering handler code the CFG previously missed.
+        let code = HANDLER_AFTER_RETURN;
+        let refs = find_reference_locals(&code, code.len(), 3);
+        assert_ne!(refs & (1 << 1), 0, "local 1 is astore_1/aload_1'd");
+        assert_ne!(refs & (1 << 2), 0, "local 2 is astore_2/aload_2'd");
+        assert_eq!(refs & 1, 0, "local 0 is only ever iload'ed");
+    }
+
+    // -----------------------------------------------------------------------
+    // Safepoint publication planning
+    // -----------------------------------------------------------------------
+
+    /// `int fib(int n) { return n < 2 ? n : fib(n-1) + fib(n-2); }`-shaped
+    /// body: one int local, two `invokestatic`s. Nothing here can hold an oop,
+    /// so a GC-capable call site has nothing to publish.
+    #[test]
+    fn publish_plan_is_empty_for_an_int_only_recursive_kernel() {
+        let code: Vec<u8> = vec![
+            0x1a, // 0: iload_0
+            0x05, // 1: iconst_2
+            0xa2, 0x00, 0x05, // 2: if_icmpge +5 -> 7
+            0x1a, // 5: iload_0
+            0xac, // 6: ireturn
+            0x1a, // 7: iload_0
+            0x04, // 8: iconst_1
+            0x64, // 9: isub
+            0xb8, 0x00, 0x01, // 10: invokestatic #1
+            0x1a, // 13: iload_0
+            0x05, // 14: iconst_2
+            0x64, // 15: isub
+            0xb8, 0x00, 0x01, // 16: invokestatic #1
+            0x60, // 19: iadd
+            0xac, // 20: ireturn
+        ];
+        let code_len = code.len();
+        // Pretend the colourer gave local 0 a register home.
+        let assignments = vec![Some(12u8)];
+        let plan = plan_safepoint_publication(&code, code_len, 1, 1, &assignments, 0);
+
+        assert_eq!(plan.reference_locals, 0, "no aload/astore anywhere");
+        assert_eq!(plan.register_homed_reference_locals, 0);
+        assert_eq!(plan.publish_always, 0);
+        assert!(
+            plan.no_reference_in_registers(),
+            "an int-only kernel must be allowed to skip local publication"
+        );
+        // At both call sites there is nothing to publish.
+        assert_eq!(plan.publish_at_bci(10), 0);
+        assert_eq!(plan.publish_at_bci(16), 0);
+    }
+
+    #[test]
+    fn publish_plan_keeps_register_homed_reference_locals() {
+        let code: Vec<u8> = vec![
+            0x2a, // 0: aload_0   (local 0 is a reference)
+            0x4c, // 1: astore_1  (local 1 is a reference)
+            0x1c, // 2: iload_2   (local 2 is an int)
+            0xb8, 0x00, 0x01, // 3: invokestatic #1
+            0x2b, // 6: aload_1   (keeps local 1 live across the call)
+            0xb0, // 7: areturn
+        ];
+        let code_len = code.len();
+        // Locals 0 and 1 are refs, local 2 is an int; all three get registers.
+        let assignments = vec![Some(12u8), Some(13u8), Some(14u8)];
+        let plan = plan_safepoint_publication(&code, code_len, 3, 1, &assignments, 0);
+
+        assert_eq!(plan.reference_locals, 0b011);
+        assert_eq!(plan.register_homed_reference_locals, 0b011);
+        assert!(
+            !plan.no_reference_in_registers(),
+            "a register-homed reference local must force publication"
+        );
+        // Local 1 is read after the call, so it must be published at the call.
+        assert_ne!(
+            plan.publish_at_bci(3) & (1 << 1),
+            0,
+            "a reference local live across the call must be published"
+        );
+        // Local 2 is an int — never published regardless of liveness.
+        assert_eq!(
+            plan.publish_at_bci(3) & (1 << 2),
+            0,
+            "a primitive local is never a GC root and must not be published"
+        );
+    }
+
+    #[test]
+    fn publish_plan_narrows_by_liveness_but_never_below_a_dead_reference() {
+        let code: Vec<u8> = vec![
+            0x2a, // 0: aload_0
+            0x4c, // 1: astore_1
+            0x2b, // 2: aload_1     <- local 1's LAST read
+            0x57, // 3: pop
+            0xb8, 0x00, 0x01, // 4: invokestatic #1  (local 1 is dead here)
+            0xb1, // 7: return
+        ];
+        let code_len = code.len();
+        let assignments = vec![Some(12u8), Some(13u8)];
+        let plan = plan_safepoint_publication(&code, code_len, 2, 1, &assignments, 0);
+        assert_ne!(plan.register_homed_reference_locals & (1 << 1), 0);
+        assert_eq!(
+            plan.publish_at_bci(4) & (1 << 1),
+            0,
+            "a reference local whose last read is behind the call is not a live root"
+        );
+        // The bci-independent set is unaffected by liveness — a consumer that
+        // does not want the exception-handler-CFG precondition uses this.
+        assert_ne!(plan.publish_always & (1 << 1), 0);
+    }
+
+    /// Uncovered PCs (no basic block reaches them) read `0` from the liveness
+    /// table by default, which must NOT be mistaken for "nothing live".
+    #[test]
+    fn publish_plan_falls_back_to_conservative_set_on_uncovered_pcs() {
+        let code: Vec<u8> = vec![
+            0x2a, // 0: aload_0
+            0x4c, // 1: astore_1
+            0xb1, // 2: return
+        ];
+        let code_len = code.len();
+        let assignments = vec![Some(12u8), Some(13u8)];
+        let plan = plan_safepoint_publication(&code, code_len, 2, 1, &assignments, 0);
+        // pc past the end of the code is definitionally uncovered.
+        assert_eq!(
+            plan.publish_at_bci(code_len + 32),
+            plan.publish_always,
+            "an out-of-range bci must fall back to the conservative set"
+        );
+    }
+
+    #[test]
+    fn publish_plan_ignores_locals_without_a_register_home() {
+        let code: Vec<u8> = vec![
+            0x2a, // 0: aload_0
+            0x4c, // 1: astore_1
+            0xb8, 0x00, 0x01, // 2: invokestatic #1
+            0x2b, // 5: aload_1
+            0xb0, // 6: areturn
+        ];
+        let code_len = code.len();
+        // Local 1 spilled (no register home) — its canonical frame slot is
+        // already authoritative, so it is not part of the publish set.
+        let assignments = vec![Some(12u8), None];
+        let plan = plan_safepoint_publication(&code, code_len, 2, 1, &assignments, 0);
+        assert_ne!(plan.reference_locals & (1 << 1), 0);
+        assert_eq!(
+            plan.register_homed_reference_locals & (1 << 1),
+            0,
+            "a frame-homed reference local needs no publication"
+        );
+    }
+
+    #[test]
+    fn publish_plan_unions_the_caller_supplied_reference_parameter_mask() {
+        // `void f(Object unused)` whose parameter is never read: no `aload`
+        // taints slot 0, so only the caller's descriptor-derived mask knows.
+        let code: Vec<u8> = vec![0xb1]; // return
+        let assignments = vec![Some(12u8)];
+        let plan = plan_safepoint_publication(&code, code.len(), 1, 1, &assignments, 0b1);
+        assert_ne!(plan.reference_locals & 1, 0);
+        assert_ne!(plan.register_homed_reference_locals & 1, 0);
+        assert!(!plan.no_reference_in_registers());
+    }
+
+    // -----------------------------------------------------------------------
+    // Save-area sizing — the historical spill-overflow defect
+    // -----------------------------------------------------------------------
+    //
+    // The x64 prologue sizes its callee-saved save area as
+    // `used_callee_saved.len() * 8` and writes register `used_callee_saved[i]`
+    // at `callee_saved_base + i*8`; the per-safepoint spill region is sized
+    // from the SAME vector. If `used_callee_saved` ever reported fewer
+    // registers than `assignments` actually uses, the prologue would under-
+    // reserve and the safepoint spill would write past its region into the
+    // caller's saved registers — the documented `Token.duplicate` corruption.
+    // Pin the contract from this side.
+
+    fn assert_save_area_contract(result: &RegAllocResult, pool: &[u8]) {
+        let mut seen: Vec<u8> = result.assignments.iter().flatten().copied().collect();
+        seen.sort_unstable();
+        seen.dedup();
+        let mut reported = result.used_callee_saved.clone();
+        reported.sort_unstable();
+        assert_eq!(
+            seen, reported,
+            "used_callee_saved must be exactly the deduped set of assigned registers"
+        );
+        for r in &result.used_callee_saved {
+            assert!(
+                pool.contains(r),
+                "assigned register {r} is outside the allocation pool {pool:?}"
+            );
+        }
+        let mut dedup = result.used_callee_saved.clone();
+        dedup.dedup();
+        assert_eq!(
+            dedup.len(),
+            result.used_callee_saved.len(),
+            "used_callee_saved must not contain duplicates — each entry owns one 8-byte save slot"
+        );
+        assert!(
+            result.used_callee_saved.len() <= pool.len(),
+            "save area can never need more slots than the pool has registers"
+        );
+    }
+
+    #[test]
+    fn save_area_contract_holds_for_a_register_pressured_method() {
+        // 12 distinct, simultaneously-live locals against a 5/7-register pool:
+        // forces spilling, which is exactly when the reported save-area set
+        // and the actual assignments are most likely to drift apart.
+        let mut code: Vec<u8> = Vec::new();
+        for slot in 0..12u8 {
+            code.push(0x15); // iload <slot>
+            code.push(slot);
+        }
+        for slot in (0..12u8).rev() {
+            code.push(0x36); // istore <slot>
+            code.push(slot);
+        }
+        code.push(0xb1); // return
+        let code_len = code.len();
+        let result = allocate_registers_with(
+            &code,
+            code_len,
+            12,
+            12,
+            &[],
+            &ARM64_LOCAL_GPRS,
+            &ARM64_LOCAL_FPS,
+        );
+        assert_save_area_contract(&result, &ARM64_LOCAL_GPRS);
+    }
+
+    #[test]
+    fn save_area_contract_holds_for_the_handler_shaped_method() {
+        let code = HANDLER_AFTER_RETURN;
+        let result = allocate_registers_with(
+            &code,
+            code.len(),
+            3,
+            1,
+            &[],
+            &ARM64_LOCAL_GPRS,
+            &ARM64_LOCAL_FPS,
+        );
+        assert_save_area_contract(&result, &ARM64_LOCAL_GPRS);
+    }
+
+    #[test]
+    fn save_area_contract_holds_when_every_local_spills() {
+        // Zero available registers → every local must spill and the save area
+        // must be empty (a non-empty one would reserve slots the prologue
+        // never writes and shift every later frame region).
+        let code: Vec<u8> = vec![0x1a, 0x1b, 0x60, 0x3c, 0xb1];
+        let result = allocate_registers_with(&code, code.len(), 2, 2, &[], &[], &[]);
+        assert!(result.assignments.iter().all(Option::is_none));
+        assert!(result.used_callee_saved.is_empty());
     }
 }

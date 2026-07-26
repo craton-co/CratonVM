@@ -1224,6 +1224,80 @@ impl VmHeap {
         }
     }
 
+    /// Free-heap estimate in **megabytes** for the `SoftReference` LRU policy,
+    /// deliberately keyed on *allocatable* rather than merely *unused* bytes.
+    ///
+    /// HotSpot's `LRUMaxHeapPolicy` clears a soft reference when it has been
+    /// idle longer than `SoftRefLRUPolicyMSPerMB * free_heap_MB`, so this number
+    /// is the entire pressure dimension of the policy: return a large value and
+    /// nothing is ever cleared, return zero and everything is.
+    ///
+    /// **Why not simply `heap_capacity() - live_bytes_estimate()`.** The default
+    /// collector does not compact. `moving_young` defaults false, and
+    /// `gen_heap` fail-closes to a non-moving mark-sweep whenever any thread
+    /// holds a live JIT frame — the steady state at a 500-invocation JIT
+    /// threshold (`docs/known-issues/moving-young-gen-drops-jit-held-oops.md`,
+    /// OPEN). Under a non-moving, fragmenting heap "unused bytes" and "bytes an
+    /// allocation can actually obtain" diverge without bound: a heap can be 60%
+    /// unused and still fail a modest allocation because no single free run is
+    /// large enough. A policy keyed on unused bytes then refuses to clear soft
+    /// references precisely while allocation is failing — the worst possible
+    /// time — and `OutOfMemoryError` is thrown with a heap full of reclaimable
+    /// soft-reachable objects.
+    ///
+    /// So this reports the free space of the generation that must satisfy the
+    /// next allocation (young/eden), not the whole-heap figure, and floors the
+    /// result at the old generation's headroom only insofar as young space is
+    /// backed by it. It is intentionally *pessimistic*: under-reporting free
+    /// space makes the policy clear soft references sooner, which costs cache
+    /// hit rate; over-reporting makes it clear them never, which costs the
+    /// process. Prefer the recoverable failure.
+    ///
+    /// # HANDOFF — this accessor has no caller yet (cross-owner)
+    ///
+    /// The two production reference-processing sites both pass a hardcoded
+    /// `64`, in a file this module's owner may not edit:
+    ///
+    /// * `vm/src/runtime/interpreter.rs`, in `process_references_after_gc`:
+    ///   `let result = ref_proc.process_references(&is_marked, 64, 0);`
+    /// * `vm/src/runtime/interpreter.rs`, in `g1_remark_process_references`:
+    ///   `let result = ref_proc.process_references(is_marked, 64, 0);`
+    ///
+    /// Both should become `shared.mem.heap.soft_ref_policy_free_mb()` in place
+    /// of the `64`. (The `0` third argument no longer matters: `gc::reference`
+    /// now substitutes the mutator clock it observes through
+    /// `touch_soft_reference` when the caller passes `0`. See the
+    /// `last_observed_clock_ms` field doc there.) Until that lands, the soft-ref
+    /// policy runs on a constant 64 MB of assumed headroom and therefore does
+    /// not respond to memory pressure at all. Tracked in
+    /// `docs/internal/arch-2026-07-26/refs-metaspace-unloading.md`.
+    pub fn soft_ref_policy_free_mb(&self) -> usize {
+        const MB: usize = 1024 * 1024;
+        let (young_used, young_cap) = self.young_gen_stats();
+        let (old_used, old_cap) = self.old_gen_stats();
+
+        // Whole-heap headroom, as an upper bound.
+        let total_free = (young_cap + old_cap).saturating_sub(young_used + old_used);
+
+        // Allocation-relevant headroom. An allocation lands in young/eden; when
+        // that space is exhausted a collection runs and the survivors must fit
+        // in the old generation. Both must have room, so the binding constraint
+        // is the smaller of the two.
+        let young_free = young_cap.saturating_sub(young_used);
+        let old_free = old_cap.saturating_sub(old_used);
+        let allocatable = if young_cap == 0 {
+            // Backends that report no separate young space (ZGC's real heap
+            // reports `(0, 0)`): the old-gen pair carries the whole heap.
+            old_free
+        } else {
+            young_free.min(old_free)
+        };
+
+        // Never report more than the whole-heap headroom, and round DOWN: a
+        // sub-megabyte remainder must read as 0 MB (maximum pressure), not 1.
+        allocatable.min(total_free) / MB
+    }
+
     // =====================================================================
     // GenerationalHeap-specific methods (no-ops for G1)
     // =====================================================================
@@ -2226,6 +2300,64 @@ mod concurrent_mark_controller_tests {
             heap.get_array_element(large, n - 1).unwrap().as_int(),
             Some(0x1234_5678),
             "flat write to the humongous tail must round-trip",
+        );
+    }
+
+    // ======================================================================
+    // soft_ref_policy_free_mb — the pressure input to the SoftReference LRU.
+    // See the accessor's doc comment for why it is keyed on allocatable
+    // rather than merely unused bytes, and for the cross-owner handoff.
+    // ======================================================================
+
+    #[test]
+    fn soft_ref_policy_free_mb_is_bounded_by_whole_heap_headroom() {
+        let heap = VmHeap::new(GcBackend::Generational, 32 * 1024 * 1024);
+        let (young_used, young_cap) = heap.young_gen_stats();
+        let (old_used, old_cap) = heap.old_gen_stats();
+        let total_free_mb =
+            (young_cap + old_cap).saturating_sub(young_used + old_used) / (1024 * 1024);
+
+        let reported = heap.soft_ref_policy_free_mb();
+        assert!(
+            reported <= total_free_mb,
+            "reported {reported} MB exceeds whole-heap headroom {total_free_mb} MB"
+        );
+        // It must also never exceed the young generation's own headroom, which
+        // is what an allocation actually has to fit into.
+        let young_free_mb = young_cap.saturating_sub(young_used) / (1024 * 1024);
+        if young_cap != 0 {
+            assert!(
+                reported <= young_free_mb,
+                "reported {reported} MB exceeds young headroom {young_free_mb} MB"
+            );
+        }
+    }
+
+    #[test]
+    fn soft_ref_policy_free_mb_rounds_down_to_max_pressure() {
+        // A heap far smaller than 1 MiB of usable headroom must report 0 MB
+        // (maximum pressure), never a rounded-up 1 MB that would keep the LRU
+        // threshold non-zero.
+        let heap = VmHeap::new(GcBackend::Generational, 512 * 1024);
+        assert_eq!(
+            heap.soft_ref_policy_free_mb(),
+            0,
+            "sub-megabyte headroom must read as zero free MB"
+        );
+    }
+
+    #[test]
+    fn soft_ref_policy_free_mb_shrinks_as_the_heap_fills() {
+        let heap = VmHeap::new(GcBackend::Generational, 64 * 1024 * 1024);
+        let before = heap.soft_ref_policy_free_mb();
+        // Allocate a few hundred KB of objects; the figure must not grow.
+        for _ in 0..2000 {
+            let _ = heap.try_alloc_object(cratonvm_types::ClassId::new(0), 8);
+        }
+        let after = heap.soft_ref_policy_free_mb();
+        assert!(
+            after <= before,
+            "free-MB estimate rose from {before} to {after} while allocating"
         );
     }
 }

@@ -16,8 +16,9 @@ cratonvm [OPTIONS] --jar <FILE.jar> [ARGS...]
 | `--classpath <PATH>` / `-c <PATH>` / `--cp <PATH>` | Directories and JARs to search for `.class` files. Separator: `;` (Windows) or `:` (Unix). | `.` (current directory) |
 | `--jar <FILE>` | Execute a JAR. Main class is read from `META-INF/MANIFEST.MF`. `-cp` is ignored when this is set. | — |
 | `--Xbootclasspath <PATH>` | Override bootstrap classpath. | Auto-detected from `--java-home` |
-| `--java-home <PATH>` | JDK installation for boot/ext classpath discovery and JMOD loading. | `JAVA_HOME` env var |
-| `--synthetic-jdk` | Force synthetic (Rust-implemented) stdlib instead of loading real JDK classes from JMODs. Explicit opt-in to synthetic mode — only needed when overriding the detected default. | Auto: real JDK when `java.base.jmod` (or `lib/modules`) is found via `JAVA_HOME`/`CRATONVM_JAVA_HOME`/`java` on `PATH`; otherwise synthetic. See `detect_real_jdk` in `vm/src/config.rs`. |
+| `--java-home <PATH>` | JDK installation for boot/ext classpath discovery and JMOD loading. Does **not** select a mode — it only points the (already selected) real-JDK mode at a specific installation. | `CRATONVM_JAVA_HOME`, then `JAVA_HOME`, then `java` on `PATH` |
+| `--real-jdk` | Load the real JDK class files from `jmods/` or `lib/modules` (~300 native methods in Rust). Already the default; pass it to be explicit. Fails loudly if no usable JDK is found. | **on** (`LAUNCHER_DEFAULT_JDK_MODE`) |
+| `--synthetic-jdk` | Use the synthetic Rust standard library (~5,200 native stubs, no JDK needed) instead. Mutually exclusive with `--real-jdk`. Requires a build with the `synthetic-jdk` Cargo feature — otherwise the launch fails rather than starting a VM with no class library at all. | off |
 
 ## Heap and GC
 
@@ -135,7 +136,7 @@ and can be overridden by editing the `Default for VmConfig` impl:
 | `gc_algorithm` | `Generational` | Other choices in `GcAlgorithm` enum |
 | `use_compressed_oops` | false | `-XX:+UseCompressedOops` |
 | `use_compact_headers` | false | `-XX:+UseCompactObjectHeaders` |
-| `use_synthetic_jdk` | true (library) / host-detected (launcher) | Library default (`VmConfig::default()`) keeps this `true` for hermetic tests. The `cratonvm` launcher calls `VmConfig::with_host_jdk_default()` which flips this to `false` whenever `detect_real_jdk()` finds `java.base.jmod` (or `lib/modules`) on the host. `--synthetic-jdk` forces synthetic. |
+| `use_synthetic_jdk` | true (library) / **false — real-JDK, always** (launcher) | **Never host-detected.** Library/embedding default (`VmConfig::default()`, `EMBEDDED_DEFAULT_JDK_MODE`) stays `true` so the in-tree suite is hermetic. The `cratonvm` launcher and the C embedding API use `VmConfig::for_launcher()` (`LAUNCHER_DEFAULT_JDK_MODE`), which is **real-JDK unconditionally**. Select the other mode with `--real-jdk` / `--synthetic-jdk` (mutually exclusive). If the selected mode is unavailable — no usable JDK for `--real-jdk`, or a build without the `synthetic-jdk` Cargo feature for `--synthetic-jdk` — the launch is a **hard error** naming everything searched; there is no silent fallback to the other class library. See [`docs/internal/arch-2026-07-26/jdk-mode-determinism.md`](internal/arch-2026-07-26/jdk-mode-determinism.md). |
 | `use_container_support` | true | Cgroup limits honoured by default |
 | `xverify_mode` | `Remote` | See `XverifyMode` enum |
 | `cds_mode` | `Off` | |
@@ -146,7 +147,7 @@ and can be overridden by editing the `Default for VmConfig` impl:
 
 | Variable | Description |
 |----------|-------------|
-| `JAVA_HOME` | Default for `--java-home`. When the directory contains `jmods/java.base.jmod` (or `lib/modules`), the launcher boots from the real JDK; otherwise it falls back to synthetic stubs. |
+| `JAVA_HOME` | Default for `--java-home`. Real-JDK mode requires the directory to contain `jmods/java.base.jmod` **or** `lib/modules`; a JDK 8-style `lib/rt.jar`-only tree is rejected. If nothing usable is found the launch **fails** with the full search list — it does *not* fall back to synthetic stubs. |
 | `CRATONVM_JAVA_HOME` | Overrides `JAVA_HOME` for the boot probe — set this when `JAVA_HOME` points at a cratonvm shim tree (Maven, Gradle) but the boot modules should come from a real JDK. |
 | `RUST_MIN_STACK` | Minimum thread stack size. Set to `8388608` (8 MB) for deep-recursion tests. |
 | `RUST_LOG` | Tracing log level (`trace`, `debug`, `info`, `warn`, `error`). Defaults to `WARN`. |

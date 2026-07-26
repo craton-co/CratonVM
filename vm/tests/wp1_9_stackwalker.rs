@@ -38,9 +38,15 @@ fn stack_trace_entry_carries_bci_and_line_number() {
         line_number: 42,
         byte_code_index: 17,
         class_id: None,
+        // ARCH-2026-07-26: `method_index` is the frame's slot in
+        // `Class::methods`, carried so deferred line resolution can pick the
+        // exact member of an overload set. `None` here — this entry is
+        // synthesized, not captured from a live frame.
+        method_index: None,
     };
     assert_eq!(e.line_number, 42);
     assert_eq!(e.byte_code_index, 17);
+    assert_eq!(e.method_index, None);
     assert_eq!(&*e.class_name, "example/Foo");
     assert_eq!(e.source_file.as_deref(), Some("Foo.java"));
 }

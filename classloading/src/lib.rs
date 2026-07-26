@@ -40,6 +40,7 @@ pub mod loaders;
 pub mod module;
 pub mod proxy_gen;
 pub mod resolution;
+pub mod type_maps;
 pub mod verifier;
 pub mod verify_frame;
 pub mod verify_insn;
@@ -98,6 +99,19 @@ pub use class_path::{ClassPath, ManifestInfo};
 // with `ResolutionCache::invalidate_class` from the JVMTI
 // `RedefineClasses` path.
 pub use resolution::{LinkResolver, ResolvedMember};
+// Verification-derived per-method oop maps (see `type_maps`). Produced by the
+// same walk that verifies, on the default build path — no feature gate, no
+// env var. Re-exported here because the eventual consumers (GC root scan,
+// interpreter fast path, JIT) live outside this crate.
+// (`store_heap_bytes` / `store_class_count` are deliberately NOT re-exported
+// at the crate root — their names are too generic there; reach them as
+// `type_maps::store_heap_bytes`.)
+pub use type_maps::{
+    class_type_maps, mark_class_verification_skipped, publish_class_type_maps,
+    replace_class_type_maps, type_maps_for, type_maps_for_named, verification_status,
+    ClassTypeMaps, CompactBitmapArray, FastPathVeto, FrameOopMap, LocalOopBits, MethodTypeMaps,
+    MethodTypeMapsBuilder, OopBits, SetBitIter, StackOopBits, VerificationStatus,
+};
 // Round 5 audit fix (LOW #11) / Round 7 carry-over: pre-flattened
 // built-in loader delegation chain. Used by VM-side callers that
 // want to walk parent-delegation without chasing trait-object

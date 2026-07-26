@@ -394,6 +394,25 @@ thread_local! {
     /// OUTERMOST Java call: `0` means the thread is idle (between calls, parked
     /// in the host event loop) and is modelled as GC-blocked.
     static FOREIGN_CALL_DEPTH: Cell<u32> = const { Cell::new(0) };
+    /// CR-VXC-3 (`docs/internal/arch-2026-07-26/vm-exec-closeout.md` §5.3): the
+    /// crash handler's publication guard for a foreign-attached thread.
+    ///
+    /// `crash_handler::java_stack_lines` renders whatever the *faulting* OS
+    /// thread published into `vm_util`'s thread-local cell, falling back to the
+    /// primordial trace. A JNI-attached host thread that faults while running
+    /// Java is exactly the case with no fallback worth printing — the
+    /// primordial thread's frames say nothing about it.
+    ///
+    /// The guard is parked here rather than bound in `attach_foreign_thread`
+    /// because it must live for the whole **attachment**, not for the
+    /// registration call: a `let _guard = …` in that function would un-publish
+    /// the moment it returned, i.e. before the thread ran a single bytecode.
+    /// `detach_foreign_thread` takes it back out, which restores whatever the
+    /// cell held before the attach (the guard is save-and-restore, so a
+    /// detach/re-attach cycle on the same OS thread is correct too).
+    static FOREIGN_CRASH_FRAMES: std::cell::RefCell<
+        Option<crate::vm::PublishedFrameTrace>,
+    > = std::cell::RefCell::new(None);
 }
 
 /// True if the calling OS thread is currently foreign-attached (owns a
@@ -460,6 +479,26 @@ pub fn attach_foreign_thread(
         .threads
         .thread_registry
         .set_frame_trace(tid, jt.frame_trace.clone());
+    // CR-VXC-3: the registry copy above serves cross-thread readers (thread
+    // dumps); this one serves the crash handler, which runs *on* the faulting
+    // thread and therefore reads a lock-free thread-local instead. Parked in
+    // TLS so it outlives this call — see `FOREIGN_CRASH_FRAMES`. Cleared in
+    // `detach_foreign_thread`.
+    {
+        // Drop any stale guard left by an earlier attachment on this OS thread
+        // BEFORE publishing the new one. The guard is save-and-restore, so
+        // dropping it *after* the new publication would restore the pre-attach
+        // cell over the trace we just installed.
+        let stale =
+            FOREIGN_CRASH_FRAMES.with(|c| c.try_borrow_mut().ok().and_then(|mut slot| slot.take()));
+        drop(stale);
+        let guard = crate::vm::PublishedFrameTrace::publish(&name, tid.0, jt.frame_trace.clone());
+        FOREIGN_CRASH_FRAMES.with(|c| {
+            if let Ok(mut slot) = c.try_borrow_mut() {
+                *slot = Some(guard);
+            }
+        });
+    }
     shared
         .threads
         .thread_registry
@@ -527,6 +566,14 @@ pub fn detach_foreign_thread(shared: &SharedVm) -> bool {
     // release anything it still holds so no future locker waits forever
     // (see `MonitorTable::release_monitors_held_by`).
     shared.threads.monitors.release_monitors_held_by(tid);
+    // CR-VXC-3: un-publish the crash handler's view of this thread BEFORE the
+    // `JvmThread` box is dropped. The guard only holds an `Arc` to the frame
+    // trace, so no dangling reference is possible either way, but leaving it in
+    // place would make a later fault on this (now plain host) OS thread render
+    // the stack of a Java thread that no longer exists.
+    let crash_guard =
+        FOREIGN_CRASH_FRAMES.with(|c| c.try_borrow_mut().ok().and_then(|mut slot| slot.take()));
+    drop(crash_guard);
     drop(jt);
     FOREIGN_CALL_DEPTH.with(|c| c.set(0));
     true

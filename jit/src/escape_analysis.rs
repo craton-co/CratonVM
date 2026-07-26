@@ -17,6 +17,46 @@
 //! The analysis builds a *connection graph* that tracks how object
 //! references flow through the IR, then propagates escape states to a
 //! fixed point.
+//!
+//! # Which escape analysis is this?
+//!
+//! There are **two** in the JIT and they share a function name. Do not confuse
+//! them:
+//!
+//! * **This module** operates on the sea-of-nodes IR ([`Graph`], [`Op`]) and is
+//!   reached only from the tier-2 IR pipeline in `jit/src/lib.rs`
+//!   (`escape_analysis_from_ir` builds the graph; `analyze_escapes(&ea_graph)`
+//!   runs it). Its results drive IR-level scalar replacement and lock elision.
+//! * **The single-pass x64 backend has its own**, private, *bytecode-level*
+//!   `analyze_escapes(code, code_len, &invokespecial_shapes)` in
+//!   `jit/src/x64.rs`. That is the one that runs for the overwhelming majority
+//!   of compiled methods, and it is where the known varargs-constructor
+//!   receiver-null defect (BUG-05) lives — the shape map keyed by
+//!   `InvokeSpecialShape { arg_slots, is_trivial_void_init }` is that
+//!   analysis's, not this one's. Fixing this module does not fix that one.
+//!
+//! # What is actually consumed
+//!
+//! [`EscapeAnalysisResult`] has four outputs; `jit/src/lib.rs` reads only two:
+//!
+//! | Field | Consumer | Status |
+//! |---|---|---|
+//! | `scalar_replaceable` | IR scalar replacement | live |
+//! | `elide_locks` | IR lock elision | live |
+//! | `stack_allocatable` | — | **computed, never read** |
+//! | `escape_states` / `stats` | tests + diagnostics | informational |
+//!
+//! `stack_allocatable` collects every `ArgEscape` allocation, but no caller
+//! looks at it: **stack allocation is not implemented**. The field is not a
+//! disabled feature behind a flag — there is no code to enable. Treat a
+//! non-empty `stack_allocatable` as a measurement, not an optimisation.
+//!
+//! # Soundness direction
+//!
+//! The lattice joins upward (`NoEscape < ArgEscape < GlobalEscape`), so every
+//! partial result *under*-estimates escape, and both live consumers act on
+//! `== NoEscape`. Anything that can terminate the fixed point early therefore
+//! has to fail closed — see [`escalate_all_to_global`].
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -467,11 +507,30 @@ fn is_ref_producer(graph: &Graph, node: NodeId) -> bool {
 
 // ── Phase 2: Propagate escape states ────────────────────────────────────
 
+/// Iteration bound on the escape fixed point. Reaching it means the lattice
+/// did NOT converge; see [`escalate_all_to_global`] for why that must fail
+/// closed rather than be silently accepted.
+const MAX_ESCAPE_ITERATIONS: usize = 100;
+
+/// Force every node in `graph` to [`EscapeState::GlobalEscape`].
+///
+/// The fail-closed answer: `GlobalEscape` is the top of the lattice, so no
+/// consumer can act on it (`find_scalar_replacements` and `find_lock_elisions`
+/// both require `== NoEscape`). Every node id in `0..graph.nodes.len()` is
+/// written explicitly, because [`ConnectionGraph::get_escape`] reports an
+/// *absent* node as `NoEscape` — leaving the map untouched would keep exactly
+/// the nodes that were never reached looking optimisable.
+fn escalate_all_to_global(cg: &mut ConnectionGraph, graph: &Graph) {
+    for id in 0..graph.nodes.len() {
+        cg.set_escape(id, EscapeState::GlobalEscape);
+    }
+}
+
 /// Fixed-point propagation of escape states through the connection graph.
 fn propagate_escape_states(cg: &mut ConnectionGraph, graph: &Graph) {
     let mut changed = true;
     let mut iteration = 0;
-    const MAX_ITERATIONS: usize = 100;
+    const MAX_ITERATIONS: usize = MAX_ESCAPE_ITERATIONS;
 
     while changed && iteration < MAX_ITERATIONS {
         changed = false;
@@ -620,6 +679,27 @@ fn propagate_escape_states(cg: &mut ConnectionGraph, graph: &Graph) {
                 }
             }
         }
+    }
+
+    // Non-convergence must FAIL CLOSED.
+    //
+    // This lattice only ever joins UPWARD (`NoEscape < ArgEscape <
+    // GlobalEscape`; `set_escape` itself joins), so every intermediate state
+    // is an UNDER-estimate of escape. Stopping at the iteration cap therefore
+    // leaves states too LOW, and both consumers — `find_scalar_replacements`
+    // and `find_lock_elisions` — act on `== NoEscape`. An unconverged run
+    // would hand them objects that actually escape: scalar replacement then
+    // deletes stores another party can observe, and lock elision drops a
+    // monitor another thread contends on. Both are silent wrong-answer bugs,
+    // not crashes.
+    //
+    // `changed` is still true exactly when the `while` exited on the iteration
+    // bound rather than on a fixed point. In that case escalate EVERY node to
+    // `GlobalEscape`, which disables every downstream optimisation for this
+    // method and leaves the ordinary heap-allocating, fully-locked code.
+    // Slower, always correct.
+    if changed {
+        escalate_all_to_global(cg, graph);
     }
 }
 
@@ -2275,6 +2355,132 @@ mod tests {
                 .iter()
                 .all(|sr| sr.alloc_node != inner),
             "a value published into an escaping object's field is not SR-eligible"
+        );
+    }
+
+    // -- non-convergence must fail closed ---------------------------------
+
+    /// `escalate_all_to_global` has to cover nodes that were never entered in
+    /// the escape map at all: `get_escape` reports an absent node as
+    /// `NoEscape`, so leaving the map alone would keep exactly the unreached
+    /// nodes looking optimisable.
+    #[test]
+    fn escalation_covers_nodes_with_no_map_entry() {
+        let mut g = Graph::new();
+        let a = g.add_node(
+            Op::New {
+                class_id: 1,
+                num_fields: 1,
+            },
+            vec![],
+        );
+        let b = g.add_node(Op::Const(7), vec![]);
+        let mut cg = ConnectionGraph::new();
+        // Deliberately populate nothing: every node reads back as NoEscape.
+        assert_eq!(cg.get_escape(a), EscapeState::NoEscape);
+        assert_eq!(cg.get_escape(b), EscapeState::NoEscape);
+
+        escalate_all_to_global(&mut cg, &g);
+
+        for id in 0..g.nodes.len() {
+            assert_eq!(
+                cg.get_escape(id),
+                EscapeState::GlobalEscape,
+                "node {id} must be escalated"
+            );
+        }
+    }
+
+    /// After escalation neither live consumer may offer a candidate — that is
+    /// the whole point of failing closed.
+    #[test]
+    fn escalation_disables_scalar_replacement_and_lock_elision() {
+        let mut g = Graph::new();
+        let obj = g.add_node(
+            Op::New {
+                class_id: 3,
+                num_fields: 1,
+            },
+            vec![],
+        );
+        let c = g.add_node(Op::Const(1), vec![]);
+        let _st = g.add_node(Op::Store(0), vec![obj, c]);
+        let _me = g.add_node(Op::MonitorEnter, vec![obj]);
+        let _mx = g.add_node(Op::MonitorExit, vec![obj]);
+
+        // Baseline: this shape IS optimisable when the fixed point converges.
+        let converged = analyze_escapes(&g);
+        assert!(
+            !converged.scalar_replaceable.is_empty() || !converged.elide_locks.is_empty(),
+            "fixture must be optimisable before escalation, else the test proves nothing"
+        );
+
+        // Now the failed-fixed-point answer.
+        let mut cg = build_connection_graph(&g);
+        escalate_all_to_global(&mut cg, &g);
+        assert!(
+            find_scalar_replacements(&cg, &g).is_empty(),
+            "no allocation may be scalar-replaced after escalation"
+        );
+        assert!(
+            find_lock_elisions(&cg, &g).is_empty(),
+            "no monitor may be elided after escalation"
+        );
+    }
+
+    /// The escalation must NOT fire on an ordinary graph — a fixed point that
+    /// converges keeps its precise answer.
+    #[test]
+    fn converging_graph_is_not_escalated() {
+        let mut g = Graph::new();
+        let obj = g.add_node(
+            Op::New {
+                class_id: 4,
+                num_fields: 1,
+            },
+            vec![],
+        );
+        let c = g.add_node(Op::Const(42), vec![]);
+        let _st = g.add_node(Op::Store(0), vec![obj, c]);
+        let result = analyze_escapes(&g);
+        assert_eq!(
+            result.escape_states.get(&obj).copied(),
+            Some(EscapeState::NoEscape),
+            "a purely local allocation must stay NoEscape"
+        );
+        assert!(!result.scalar_replaceable.is_empty());
+    }
+
+    /// Documented, deliberately unwired output: `stack_allocatable` is
+    /// computed but no caller reads it. Pin the shape so a future consumer
+    /// knows what it is getting (ArgEscape allocations only — never NoEscape,
+    /// which goes to `scalar_replaceable`, and never GlobalEscape).
+    #[test]
+    fn stack_allocatable_holds_only_arg_escaping_allocations() {
+        let mut g = Graph::new();
+        let obj = g.add_node(
+            Op::New {
+                class_id: 5,
+                num_fields: 0,
+            },
+            vec![],
+        );
+        // Passing the object to a call is ArgEscape, not GlobalEscape.
+        let _call = g.add_node(Op::Call, vec![obj]);
+        let result = analyze_escapes(&g);
+        for &id in &result.stack_allocatable {
+            assert_eq!(
+                result.escape_states.get(&id).copied(),
+                Some(EscapeState::ArgEscape),
+                "stack_allocatable must contain exactly the ArgEscape allocations"
+            );
+        }
+        assert!(
+            result
+                .scalar_replaceable
+                .iter()
+                .all(|sr| sr.alloc_node != obj),
+            "an ArgEscape allocation is not scalar-replaceable"
         );
     }
 }
