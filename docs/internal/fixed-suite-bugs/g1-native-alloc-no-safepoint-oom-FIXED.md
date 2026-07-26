@@ -218,7 +218,7 @@ before.
   there for the generational latch.
 * The residual "`TestFileSystem` exceeds the 300 s watchdog" behaviour is a
   DIFFERENT, still-open issue with its own doc:
-  `docs/known-issues/h2/bug-h2-testfilesystem-testconcurrent-async-hang.md`
+  `docs/internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-testfilesystem-testconcurrent-async-hang-FIXED.md`
   ("Open: remaining performance gap"). It is a flat, distributed performance
   ceiling, not this OOM.
 * This workload allocates ~800 MB of Java-heap garbage per GC interval

@@ -1,5 +1,19 @@
 ﻿# Known issues вЂ” index & bug map
 
+## 2026-07-26 H2 — both H2 JIT/perf docs retired; three residuals carried forward
+
+The `Schema  not found` reconnect corruption and the `TestFileSystem`
+per-invoke costs are fixed and their docs are archived under
+`../internal/fixed-suite-bugs/h2-suite-bugs/`. What is still open — three
+classes that stop passing when the `org/h2/` JIT ban is lifted, one
+`TestFileSystem` performance wall, and one cosmetic `ClassCastException`
+message defect — is in
+[`h2/h2-jitban-residuals-20260726.md`](h2/h2-jitban-residuals-20260726.md).
+Two general x64 JIT defects were fixed on the way there and are worth knowing
+about outside H2: an array reported itself an instance of its component type
+(`String[] instanceof String` was true), and JIT invokespecial resolved its
+target by name, ignoring the caller's class loader.
+
 This folder collects CratonVM-only defects found while running upstream Java
 suites. The docs had grown to describe the **same underlying bug from several
 angles**; this index is the consolidated map. Read it first.
@@ -78,7 +92,7 @@ that run's jar-fix are now closed, and neither was what it looked like.
   29/30 classes now pass; the 30th has an unrelated AssertJ residual. See
   [`spring-kotlin-reflect-illegalstateexception-root-20260726.md`](spring-kotlin-reflect-illegalstateexception-root-20260726.md).
   The same JIT defect (found independently from H2) is
-  [`h2/h2-jitban-schema-not-found-on-reconnect.md`](h2/h2-jitban-schema-not-found-on-reconnect.md).
+  [`h2/h2-jitban-schema-not-found-on-reconnect-FIXED.md`](../internal/fixed-suite-bugs/h2-suite-bugs/h2-jitban-schema-not-found-on-reconnect-FIXED.md).
 
 Method note worth keeping: `KRun` only prints a failure's stack trace when
 `KRUN_STACK=1` is set. The Kotlin cluster was filed as "zero-frame stack trace,

@@ -182,7 +182,7 @@ narrowing WHY, and confirmed neither is a new or independently-fixable bug:
   `T19_H6_CAS_DIAG cas_long` diagnostic and `STW cross-thread JIT takeover ...
   pending=8 taken=0` signature already investigated and characterized as
   "severe slowness, not a deadlock" in
-  [`../../../known-issues/h2/bug-h2-testfilesystem-testconcurrent-async-hang.md`](../../../known-issues/h2/bug-h2-testfilesystem-testconcurrent-async-hang.md)
+  [`../../../internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-testfilesystem-testconcurrent-async-hang-FIXED.md`](../../../internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-testfilesystem-testconcurrent-async-hang-FIXED.md)
   (that doc explicitly documents `cas_long FAIL` as expected/benign
   `AbstractQueuedLongSynchronizer` CAS-retry noise, not a bug, and profiled the
   real cost to interpreted `ReentrantReadWriteLock`/AQS dispatch overhead
