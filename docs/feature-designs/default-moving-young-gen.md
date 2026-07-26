@@ -11,14 +11,22 @@ stack while the safepoint still certified complete coverage. bt18 is now
 `68332206` on every run with the JIT on, across 1–25 real moving cycles
 (`gc_quiescence::moving_young_cycle_count()`), with zero coverage fallbacks.
 
-**Do not flip `types::flags::DEFAULT_MOVING_YOUNG` on the strength of that.**
-On bt18 at `-Xmx8g`, `CRATONVM_MOVING_YOUNG=1` measured ~19 s against ~6–8 s
-for the default sweep — two separable costs: the per-method codegen overhead
-moving-young forces (shadow push/reload + full-GPR safepoint spill, visible as
-~7–8 s even on runs that executed zero moving cycles) and the Cheney copy of a
-very large live set. bt18 is the worst case for a copying collector, so this
-does not settle the design — but the flip needs its own throughput case, on a
-workload mix, with both counters printed.
+**Throughput, measured properly (2026-07-26).** bt18 at `-Xmx8g`, six
+interleaved rounds, minimum: default **1363 ms**, `CRATONVM_MOVING_YOUNG=1`
+**2905 ms** — **2.1×**. It was 5.0× until the pre-cycle from-space walk stopped
+building an `FxHashSet` of every object start (49% of the whole process) and
+started using an exact bitmap; see
+`docs/internal/moving-young-throughput-20260726.md`.
+Of the remaining 1.5 s, roughly 370 ms is codegen moving-young forces, 300 ms
+the shadow push/reload, and 870 ms one Cheney copy.
+
+**The flip still needs its own case, but no longer on throughput grounds
+alone.** bt18 is the worst case for a copying collector — a very large live set
+maximises copying cost against sweeping — and it is also the workload where the
+default build dies with `OutOfMemoryError: young gen exhausted` at `-Xmx512m`
+while the compacting collector completes in 3.0 s. What is missing is a
+workload MIX, with `moving_young_cycle_count()` and the fallback counter
+printed for each.
 
 Also still open before a flip: `refresh_moving_young_coverage_for_collection`
 treats any cycle with a peer thread in JIT as unproven, so moving-young engages
