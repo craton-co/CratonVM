@@ -147,8 +147,11 @@ still real correctness bugs worth closing):
 - ES-HAMCREST.1, ES-JIT-DEOPT-GC.1, ES fragile cluster
   (`is_elasticsearch_suite_jit_fragile_cluster`)
 - JSONSMART-PARSER.1, JASPER-JDT.2/.3, WILDFLY-CONTROLLER-JIT.1
-- TOMCAT-JNDIREALM-RDN.1, TOMCAT-JNDIREALM-JIT.2, PROXY-JITCALL.1,
-  SPR-AOT-TESTNG-MAPS.1
+- TOMCAT-JNDIREALM-RDN.1, TOMCAT-JNDIREALM-JIT.2 — **CLAIMED by
+  `fix/jit-ban-sweep2-20260726` / `wt-jitsweep2-20260726`, 2026-07-26
+  ~02:35 UTC** (pivoted here from the blocked ANTLR.1 item above; real
+  Tomcat Linux fixture + named repro test available on this host).
+  PROXY-JITCALL.1, SPR-AOT-TESTNG-MAPS.1
 - REACTOR-ADDCAP.1, REACTOR-FLUXCREATE.1, JETTY-WSIO.1, NETTY.1 — all
   Reactor/Jetty/Netty websocket demand-accounting bugs, share a "JIT
   long/CAS lowering bug" hypothesis across three separate entries; another
@@ -223,5 +226,22 @@ still real correctness bugs worth closing):
    be lifted while the narrow 7-method guard stays as the correctness
    safety net. Plan: find/build a Groovy parse benchmark, compare cold-parse
    wall-clock lifted vs. baseline.
+
+   **BLOCKED 2026-07-26 ~02:35 UTC — no fixture on this host.** Exhaustively
+   searched every jar on the Azure host (`find / -iname '*.jar' | xargs
+   unzip -l | grep groovyjarjarantlr4/...`, zero matches) — the shaded
+   `groovyjarjarantlr4` package this ban targets isn't present anywhere,
+   including in `groovy-3.0.21.jar`/`groovy-3.0.8.jar`/`groovy-4.0.22.jar`
+   (checked directly, no `antlr` entries at all in any of them — modern
+   Groovy apparently ships this in a separate module not yet resolved on
+   this host). Didn't want to speculatively fetch unknown additional
+   dependencies to chase down which exact artifact has it. **Pivoting to
+   TOMCAT-JNDIREALM-RDN.1/JIT.2 (`com/unboundid/`) instead** — real,
+   working Tomcat Linux fixture already confirmed on this host (see
+   `[[tomcat-linux-suite-fixture-location]]` memory /
+   `docs/internal/jit-ban-sweep-20260725.md`), and the ban comment names
+   an exact real repro (`TestJNDIRealmIntegration`, 76-case matrix).
+   Leaving this ANTLR.1 item open/unclaimed for whoever has a Groovy
+   fixture available, or is willing to fetch the right module.
 4. Work down the "Medium" list — each is single-suite, well-scoped, lower
    risk of interacting with concurrent work elsewhere.
