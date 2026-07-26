@@ -165,6 +165,14 @@ still real correctness bugs worth closing):
 
 ## Recommended next session priority
 
+**Status (this session, branch `fix/jit-ban-sweep-20260725`):**
+- Item 1 — **STARTED 2026-07-26 02:14 UTC.**
+- Item 2 (SPB.1 bisection) — **SKIPPED, owned by the other concurrent
+  session** (`fix/jit-ban-sweep2-20260726` / `wt-jitsweep2-20260726`, see
+  `docs/internal/jit-ban-sweep-20260725.md` — already actively testing the
+  SPB/CGL/PIC/WildFly family). Do not duplicate.
+- PROXY-JITCALL.1 — REMOVED (see above, merged dev@07427a14e).
+
 1. Verify (or refute) the TYPES-ERASURE.1 consolidation hypothesis — highest
    expected value, cheapest to test (no-rebuild env-var bisection already
    proven to work on this exact cluster).
