@@ -7315,6 +7315,23 @@ fn jdk_interfaces(name: &str) -> &'static [&'static str] {
         "cratonvm/net/HttpBodyReplaySubscription" => &["java/util/concurrent/Flow$Subscription"],
         "java/util/ArrayList$Itr" => &["java/util/Iterator"],
         "java/util/ArrayList$ListItr" => &["java/util/ListIterator", "java/util/Iterator"],
+        // `ArrayList.subList()`'s backed-view object (native-collections'
+        // `ASL_CLASS`, allocated under this internal name rather than the
+        // real `java/util/ArrayList$SubList` since it has its own native
+        // field layout — see native-collections/src/lib.rs's "ArrayList
+        // subList backed view" section). With no entry here it fell to this
+        // match's `_ => &[]` default, so the returned view declared NO
+        // interfaces at all — not even `List`, let alone the `Collection`/
+        // `Iterable` it transitively implies. Any checkcast/instanceof
+        // against `List`/`Collection`/`Iterable` on a `subList()` result
+        // (e.g. AssertJ's `Iterable`-typed `satisfies`/`contains` overloads)
+        // failed with `ArrayListSubList cannot be cast to java.lang.Iterable`
+        // even though every real `List` is trivially an `Iterable`. Mirrors
+        // the real `java.util.ArrayList$SubList`, which extends
+        // `AbstractList` (itself `implements List`) and separately
+        // `implements RandomAccess`.
+        "cratonvm/internal/ArrayListSubList" => &["java/util/List", "java/util/RandomAccess"],
+        "java/util/Dictionary" => &[],
         "java/util/Dictionary" => &[],
         "java/util/ArrayDeque" => &[
             "java/util/Deque",
