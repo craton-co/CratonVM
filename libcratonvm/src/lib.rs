@@ -2519,7 +2519,10 @@ mod tests {
         })
     }
 
-    fn args_with(opts: &mut [JavaVMOption], ignore_unrecognized: JInt) -> JavaVMInitArgs {
+    // `JavaVMInitArgs::ignoreUnrecognized` is a JNI `jboolean` (`u8`), not a
+    // `jint`; all three call sites pass an untyped literal, so taking `u8`
+    // here is exact rather than a lossy conversion at the struct literal.
+    fn args_with(opts: &mut [JavaVMOption], ignore_unrecognized: u8) -> JavaVMInitArgs {
         JavaVMInitArgs {
             version: JNI_VERSION,
             n_options: opts.len() as JInt,
