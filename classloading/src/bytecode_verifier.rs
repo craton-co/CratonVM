@@ -23,6 +23,7 @@ use cratonvm_reader::method::ClassFileMethod;
 use cratonvm_reader::stack_map::StackMapTable;
 
 use super::class::Class;
+use super::type_maps::{ClassTypeMaps, MethodTypeMaps, MethodTypeMapsBuilder};
 use super::verify_frame::VerificationFrame;
 use super::verify_insn::verify_instruction;
 use super::vtype::{ClassHierarchy, VType};
@@ -112,13 +113,32 @@ fn verify_bytecode_inner(
     hierarchy: &dyn ClassHierarchy,
     strict_verification: bool,
 ) -> Result<(), LinkageError> {
+    // TYPE MAPS (arch-2026-07-26/verifier-type-maps): verification retains
+    // what it proves. The walk below already computes the exact verification
+    // type of every local slot and every operand-stack slot at every pc; the
+    // per-method builder captures that as compact oop bitmaps as it goes —
+    // it is the SAME walk, not a second pass — and the results are published
+    // into the process-wide side table keyed by `(ClassId, method_index)`.
+    //
+    // This is unconditional on the default build path: no cargo feature, no
+    // `CRATONVM_*` env var, no opt-in. `skip_verification` (the `--noverify`
+    // escape hatch) prevents this function from running at all, in which case
+    // `type_maps::verification_status` answers `Unknown`/`Skipped` and every
+    // consumer is required to fall back to conservative behaviour.
+    let mut collected: Vec<(Arc<str>, Arc<str>, Option<MethodTypeMaps>)> =
+        Vec::with_capacity(class.methods.len());
+
     for method in &class.methods {
-        // Skip abstract and native methods — they have no Code attribute
+        // Skip abstract and native methods — they have no Code attribute.
+        // They still occupy an index in `Class::methods`, so a `None` entry
+        // is pushed to keep `method_index` aligned with the class's method
+        // list (consumers index by that position).
         if method.is_abstract() || method.is_native() {
+            collected.push((method.name.clone(), method.descriptor.clone(), None));
             continue;
         }
 
-        verify_method(
+        let maps = verify_method(
             &class.name,
             method,
             &class.constant_pool,
@@ -126,12 +146,23 @@ fn verify_bytecode_inner(
             hierarchy,
             strict_verification,
         )?;
+        collected.push((method.name.clone(), method.descriptor.clone(), maps));
     }
+
+    // Publish only once every method verified: a class that fails
+    // verification is never loaded, so half-built maps must not be visible.
+    crate::type_maps::publish_class_type_maps(class.id, ClassTypeMaps::new(collected));
 
     Ok(())
 }
 
 /// Verify a single method's bytecode.
+///
+/// On success returns the [`MethodTypeMaps`] the verification walk produced —
+/// the exact reference layout of every local slot and every operand-stack slot
+/// at every instruction start, plus the per-method `safe_for_fast_path` proof.
+/// `None` means the method has nothing to describe (no `Code` attribute, or an
+/// empty one), which consumers must treat as "unproven".
 fn verify_method(
     class_name: &str,
     method: &ClassFileMethod,
@@ -139,15 +170,15 @@ fn verify_method(
     version: &ClassFileVersion,
     hierarchy: &dyn ClassHierarchy,
     strict_verification: bool,
-) -> Result<(), LinkageError> {
+) -> Result<Option<MethodTypeMaps>, LinkageError> {
     let code_attr = match method.code() {
         Some(code) => code,
-        None => return Ok(()), // No code to verify (shouldn't happen if abstract/native filtered)
+        None => return Ok(None), // No code to verify (shouldn't happen if abstract/native filtered)
     };
 
     let bytecode = &code_attr.code;
     if bytecode.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
 
     // Find the StackMapTable attribute within the Code attribute
@@ -192,7 +223,10 @@ fn verify_method(
         let has_branches = bytecode_has_branches(bytecode);
         let has_handlers = !code_attr.exception_table.is_empty();
         if has_branches || has_handlers {
-            return verify_by_inference(class_name, method, code_attr, cp, hierarchy);
+            // Pre-Java-7 inference path (JVMS §4.10.2). It builds its own type
+            // maps from the settled worklist fixpoint — see
+            // `verify_by_inference`.
+            return verify_by_inference(class_name, method, code_attr, cp, hierarchy).map(Some);
         }
         // No branches and no handlers — fall through to linear walk
     }
@@ -251,6 +285,19 @@ fn verify_method(
         };
         handler_targets.insert(entry.handler_pc, catch_type);
     }
+
+    // TYPE MAPS: ride the walk below. `record` is called once per instruction
+    // start with the type-state that holds immediately BEFORE that
+    // instruction executes — after any declared StackMapTable frame or
+    // exception-handler frame has been adopted, so the recorded state is the
+    // one the interpreter/GC would actually observe at that pc.
+    let mut type_maps = MethodTypeMapsBuilder::new(code_attr.max_locals, code_attr.max_stack);
+    // Instruction density: real bytecode averages ~2 bytes/instruction.
+    type_maps.reserve(bytecode.len() / 2 + 1);
+    // Cleared whenever the walk skips or truncates a region, which denies
+    // `safe_for_fast_path` (the unchecked interpreter handlers need every
+    // executed instruction proven, not merely most of them).
+    let mut walk_complete = true;
 
     // Walk the bytecode
     let mut pc = 0usize;
@@ -336,6 +383,14 @@ fn verify_method(
                 });
             }
             // Lenient: skip to the next declared frame or handler.
+            //
+            // TYPE MAPS: no row is emitted for a skipped region, so
+            // `oop_map_at` answers `None` there (= "unproven", scan
+            // conservatively). The method also loses `safe_for_fast_path`:
+            // the unreachability call is the verifier's, and the unchecked
+            // interpreter handlers must not run on bytecode whose operands
+            // were never checked.
+            walk_complete = false;
             let (_, next_pc) = match Instruction::decode(bytecode, pc) {
                 Ok(r) => r,
                 Err(_) => break, // malformed — stop walking
@@ -343,6 +398,11 @@ fn verify_method(
             pc = next_pc;
             continue;
         }
+
+        // TYPE MAPS: capture the proven reference layout at this instruction
+        // start. This is the entire point of the change — the walk already
+        // holds `current_frame`; without this line it is discarded.
+        type_maps.record(pc as u32, &current_frame);
 
         // Decode the instruction
         let (insn, next_pc) = match Instruction::decode(bytecode, pc) {
@@ -355,6 +415,10 @@ fn verify_method(
                 });
             }
         };
+
+        // TYPE MAPS: fold this instruction into the per-method fast-path
+        // safety proof (local-slot operand bounds, jsr/ret, stray `wide`).
+        type_maps.observe_instruction(&insn);
 
         // Verify the instruction's type effects
         let result = verify_instruction(
@@ -471,7 +535,7 @@ fn verify_method(
         pc = next_pc;
     }
 
-    Ok(())
+    Ok(Some(type_maps.finish(walk_complete)))
 }
 
 /// Quick scan of bytecode to detect if it contains any branch instructions.
@@ -581,13 +645,20 @@ fn build_declared_frames(
 /// forward through each instruction, and merge at branch targets / exception
 /// handler entries.  The algorithm terminates when the worklist is empty
 /// and all reachable offsets have consistent type states.
+///
+/// TYPE MAPS: when the worklist settles, `frame_at` *is* the answer — it maps
+/// every reachable instruction start to its fixpoint entry type-state. The
+/// maps are serialized from that map, not recomputed: this path performs no
+/// extra dataflow, it only writes down the dataflow it already finished. (The
+/// StackMapTable path records inline instead, because its linear walk visits
+/// each pc exactly once and never revisits a merge.)
 fn verify_by_inference(
     class_name: &str,
     method: &ClassFileMethod,
     code_attr: &cratonvm_reader::attribute::CodeAttribute,
     cp: &ConstantPool,
     hierarchy: &dyn ClassHierarchy,
-) -> Result<(), LinkageError> {
+) -> Result<MethodTypeMaps, LinkageError> {
     let bytecode = &code_attr.code;
     let initial_frame = VerificationFrame::initial_frame(
         class_name,
@@ -767,7 +838,37 @@ fn verify_by_inference(
         }
     }
 
-    Ok(())
+    // -----------------------------------------------------------------------
+    // TYPE MAPS: serialize the settled fixpoint.
+    // -----------------------------------------------------------------------
+    //
+    // `frame_at[pc]` is the merged type-state on ENTRY to the instruction at
+    // `pc` — exactly the state the interpreter/GC observes when the frame's pc
+    // is `pc`. Rows must be emitted in ascending pc order because
+    // `MethodTypeMaps` indexes them with a binary search.
+    let mut type_maps = MethodTypeMapsBuilder::new(code_attr.max_locals, code_attr.max_stack);
+    type_maps.reserve(frame_at.len());
+    let mut ordered: Vec<usize> = frame_at.keys().copied().collect();
+    ordered.sort_unstable();
+
+    // A pre-Java-7 method that reached this path has branches or handlers and
+    // no StackMapTable, so its coverage is whatever the worklist reached.
+    // Anything the worklist did not reach is simply absent from the map
+    // (`oop_map_at` → `None` → conservative), and a decode failure at a
+    // recorded pc denies `safe_for_fast_path`.
+    let mut walk_complete = true;
+    for pc in ordered {
+        let Some(frame) = frame_at.get(&pc) else {
+            continue;
+        };
+        type_maps.record(pc as u32, frame);
+        match Instruction::decode(bytecode, pc) {
+            Ok((insn, _)) => type_maps.observe_instruction(&insn),
+            Err(_) => walk_complete = false,
+        }
+    }
+
+    Ok(type_maps.finish(walk_complete))
 }
 
 /// Merge `incoming` frame into the frame at `target_pc` in the map.
