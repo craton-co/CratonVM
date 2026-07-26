@@ -1320,12 +1320,54 @@ impl ThreadRegistry {
 
     /// Read a copy of `thread_id`'s last-published frame trace (call stack),
     /// innermost frame first. Empty if the thread is unknown or never deposited.
+    ///
+    /// **Every entry has `line_number == -1`.** The depositor
+    /// (`stackwalker::capture_frames_no_lines`, called from every blocking
+    /// deposit point) is deliberately lock-free and takes no `ClassStore`
+    /// borrow, so it cannot resolve lines. Prefer
+    /// [`frame_trace_of_resolved`](Self::frame_trace_of_resolved) at any call
+    /// site that has a `ClassStore` in hand — a thread dump then gains source
+    /// lines it does not have today, at zero cost to the deposit path.
     pub fn frame_trace_of(&self, thread_id: ThreadId) -> Vec<cratonvm_native_api::StackTraceEntry> {
         self.threads
             .read()
             .get(&thread_id)
             .map(|e| e.frame_trace.lock().clone())
             .unwrap_or_default()
+    }
+
+    /// [`frame_trace_of`](Self::frame_trace_of) with source line numbers filled
+    /// in from `class_store`.
+    ///
+    /// ARCH-2026-07-26 (`cross-owner-closeout`, request CR-SW-2 of
+    /// `docs/internal/arch-2026-07-26/stackwalk-and-vtable.md`). The published
+    /// snapshot is line-less because the *depositor* must stay lock-free; the
+    /// *reader* usually does hold a `ClassStore` (cross-thread
+    /// `Thread.getStackTrace()`, `dumpThreads()`, the JMX thread dump), so it
+    /// can pay for the resolution once, only when a dump is actually taken.
+    ///
+    /// Strictly additive: `stackwalker::resolve_line_numbers_in_place` is
+    /// fail-closed — it yields the line an eager capture would have produced or
+    /// leaves `-1` — so this can only replace unknowns with correct lines. It
+    /// never produces a wrong line, and it never touches an entry that already
+    /// has one (including the `-2` native sentinel).
+    ///
+    /// Resolution is exact for frames carrying `StackTraceEntry::method_index`;
+    /// the deposit path cannot compute one (it has no `ClassStore`), so those
+    /// frames fall back to the unambiguous-name rule and overloaded frames stay
+    /// at `-1`. That is still strictly more than the all-`-1` snapshot.
+    ///
+    /// The registry lock is released before the resolution runs: the walk over
+    /// the returned `Vec` touches no registry state, and holding L5 across a
+    /// `ClassStore` walk would invert the usual acquisition order.
+    pub fn frame_trace_of_resolved(
+        &self,
+        thread_id: ThreadId,
+        class_store: &crate::classloading::ClassStore,
+    ) -> Vec<cratonvm_native_api::StackTraceEntry> {
+        let mut trace = self.frame_trace_of(thread_id);
+        crate::runtime::stackwalker::resolve_line_numbers_in_place(class_store, &mut trace);
+        trace
     }
 
     /// xt-hardening follow-up (2026-07-03): OS tids of alive threads
@@ -2129,6 +2171,151 @@ mod tests {
     fn unknown_thread_not_alive() {
         let registry = ThreadRegistry::new();
         assert!(!registry.is_alive(ThreadId(99)));
+    }
+
+    // -----------------------------------------------------------------------
+    // ARCH-2026-07-26 `cross-owner-closeout` (CR-SW-2): thread dumps get line
+    // numbers. The depositor publishes a line-less snapshot (it must stay
+    // lock-free), so the reader resolves — but only fail-closed.
+    // -----------------------------------------------------------------------
+
+    use crate::runtime::stackwalker::test_support::{named_method, store_with};
+    use crate::runtime::stackwalker::{LINE_NUMBER_NATIVE, LINE_NUMBER_UNKNOWN};
+    use cratonvm_native_api::StackTraceEntry;
+    use cratonvm_reader::attribute::LineNumberEntry;
+
+    fn deposited_entry(
+        class_id: crate::classloading::ClassId,
+        method: &str,
+        bci: i32,
+    ) -> StackTraceEntry {
+        // Exactly the shape `stackwalker::capture_frames_no_lines` deposits.
+        StackTraceEntry {
+            class_name: Arc::from("probe/Target"),
+            method_name: Arc::from(method),
+            source_file: Some(Arc::from("Target.java")),
+            line_number: LINE_NUMBER_UNKNOWN,
+            byte_code_index: bci,
+            class_id: Some(class_id),
+            method_index: None,
+        }
+    }
+
+    fn registry_with_trace(trace: Vec<StackTraceEntry>) -> (ThreadRegistry, ThreadId) {
+        let registry = ThreadRegistry::new();
+        let tid = ThreadId(1);
+        registry.register(tid, "worker-1", None);
+        registry.set_frame_trace(tid, Arc::new(Mutex::new(trace)));
+        (registry, tid)
+    }
+
+    #[test]
+    fn frame_trace_of_is_line_less_and_resolved_reader_fills_it_in() {
+        let (store, cid) = store_with(vec![named_method(
+            "compute",
+            "()I",
+            vec![
+                LineNumberEntry {
+                    start_pc: 0,
+                    line_number: 40,
+                },
+                LineNumberEntry {
+                    start_pc: 4,
+                    line_number: 41,
+                },
+            ],
+        )]);
+        let (registry, tid) = registry_with_trace(vec![
+            deposited_entry(cid, "compute", 0),
+            deposited_entry(cid, "compute", 6),
+        ]);
+
+        // What every consumer sees today.
+        let raw = registry.frame_trace_of(tid);
+        assert_eq!(raw.len(), 2);
+        assert!(raw.iter().all(|e| e.line_number == LINE_NUMBER_UNKNOWN));
+
+        // What a reader holding a ClassStore can see instead.
+        let resolved = registry.frame_trace_of_resolved(tid, &store);
+        assert_eq!(resolved.len(), 2);
+        assert_eq!(resolved[0].line_number, 40);
+        assert_eq!(resolved[1].line_number, 41);
+
+        // Resolution is non-destructive: the published snapshot is untouched,
+        // so a second reader still starts from the deposited state.
+        assert!(registry
+            .frame_trace_of(tid)
+            .iter()
+            .all(|e| e.line_number == LINE_NUMBER_UNKNOWN));
+    }
+
+    #[test]
+    fn resolved_reader_leaves_overloaded_and_native_frames_alone() {
+        let (store, cid) = store_with(vec![
+            named_method(
+                "run",
+                "(I)V",
+                vec![LineNumberEntry {
+                    start_pc: 0,
+                    line_number: 11,
+                }],
+            ),
+            named_method(
+                "run",
+                "(J)V",
+                vec![LineNumberEntry {
+                    start_pc: 0,
+                    line_number: 22,
+                }],
+            ),
+        ]);
+        let mut native = deposited_entry(cid, "run", -1);
+        native.line_number = LINE_NUMBER_NATIVE;
+        let (registry, tid) = registry_with_trace(vec![deposited_entry(cid, "run", 0), native]);
+
+        let resolved = registry.frame_trace_of_resolved(tid, &store);
+        assert_eq!(
+            resolved[0].line_number, LINE_NUMBER_UNKNOWN,
+            "a deposited frame has no method_index, so an overload set must \
+             stay unknown rather than print a line from the wrong body"
+        );
+        assert_eq!(resolved[1].line_number, LINE_NUMBER_NATIVE);
+        // Frame identity is never lost, which is the property a dump needs.
+        assert_eq!(&*resolved[0].class_name, "probe/Target");
+        assert_eq!(&*resolved[0].method_name, "run");
+    }
+
+    #[test]
+    fn resolved_reader_on_an_unknown_thread_is_empty_not_a_panic() {
+        let (store, _cid) = store_with(vec![named_method("compute", "()I", Vec::new())]);
+        let registry = ThreadRegistry::new();
+        assert!(registry
+            .frame_trace_of_resolved(ThreadId(99), &store)
+            .is_empty());
+    }
+
+    #[test]
+    fn resolved_reader_after_class_unload_keeps_the_frame_and_drops_only_the_line() {
+        let (mut store, cid) = store_with(vec![named_method(
+            "compute",
+            "()I",
+            vec![LineNumberEntry {
+                start_pc: 0,
+                line_number: 40,
+            }],
+        )]);
+        let (registry, tid) = registry_with_trace(vec![deposited_entry(cid, "compute", 0)]);
+        assert_eq!(
+            registry.frame_trace_of_resolved(tid, &store)[0].line_number,
+            40
+        );
+
+        // ClassIds are monotonic and never reused, so a stale id can only miss.
+        let _ = store.remove(cid);
+        let after = registry.frame_trace_of_resolved(tid, &store);
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].line_number, LINE_NUMBER_UNKNOWN);
+        assert_eq!(&*after[0].method_name, "compute");
     }
 
     #[test]
