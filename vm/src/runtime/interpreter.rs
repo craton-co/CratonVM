@@ -7205,7 +7205,20 @@ pub fn execute(
         std::sync::Arc::from(method_name),
         std::sync::Arc::from(method_descriptor),
         source_file.map(|s| std::sync::Arc::from(s.as_str())),
-        crate::runtime::frame::padded_bytecode(&code_attr.code),
+        // Interned per *method identity* (see `frame-arena.md` §5.2), not
+        // content-addressed: `local_liveness.rs` keys a per-method liveness
+        // table on `Arc::as_ptr(code)` and derives it from the method's
+        // exception table, so two byte-identical methods with different
+        // handler ranges must keep distinct Arcs. This ends a full
+        // method-body memcpy plus an allocation per uncached method entry,
+        // and lets `quickened.rs::intern` hit across frames of the same
+        // method instead of rebuilding under a fresh address.
+        crate::runtime::frame::padded_bytecode_for_method(
+            class_id,
+            method_name,
+            method_descriptor,
+            &code_attr.code,
+        ),
         std::sync::Arc::from(code_attr.exception_table.into_boxed_slice()),
         code_attr.max_stack,
         code_attr.max_locals,
@@ -7937,10 +7950,11 @@ fn execute_frame_from_index(
     // another method as un-quickened -- a pessimisation, never a miscompare.
     let mut quick: Option<Arc<cratonvm_reader::QuickenedCode>> = None;
     let mut quick_code_ptr: *const u8 = std::ptr::null();
-    // Expected stream index of the next instruction (straight-line execution
-    // resolves a pc in one compare; anything else binary-searches the pc
-    // table). Purely a hint -- never trusted without a pc equality check.
-    let mut quick_hint: usize = 0;
+    // (The former `quick_hint` local is gone: `QuickenedCode` now resolves any
+    // pc in O(1) via an instruction-start bitmap plus per-block popcount, so
+    // the fall-through hint only bought one popcount on the fall-through path
+    // at the cost of a compare on every branch, back-edge, handler entry and
+    // switch target. `resolve()` is the hint-free form.)
     loop {
         // Route callee-thrown Java exceptions before the safepoint poll below.
         // `pending_java_exception` is only a Rust local between the callee's
@@ -8104,14 +8118,41 @@ fn execute_frame_from_index(
             }
         }
 
-        let saved_pc = thread.frames[frame_idx].pc;
-        thread.frames[frame_idx].last_instr_pc = saved_pc;
+        // ── Frame-pointer hoist, preamble (frame-arena.md §6.1) ──────────
+        // `FrameStack` gives frames stable addresses, so one address
+        // computation can serve the whole per-bytecode preamble instead of
+        // six bounds-checked `imul`-by-`size_of::<Frame>()` re-indexes. The
+        // region this covers runs from here to the `code_ptr`/`b2` reads just
+        // below and contains no push, no pop and no `&mut` reborrow of
+        // `thread.frames`; `hot_fp` is dead by the time the fast-path match
+        // takes its real `&mut thread.frames[frame_idx]` borrow (which is
+        // deliberately left as a borrow-checked reference, so the arms' `let
+        // _ = frame;` discipline before calling back into `thread` keeps its
+        // compile-time enforcement). Null iff `frame_idx >= len()`, which
+        // routes through `VmError` where indexing would have panicked.
+        let hot_fp: *mut Frame = thread.frames.frame_ptr(frame_idx);
+        if hot_fp.is_null() {
+            return Err(MethodCallFailed::InternalError(VmError::Internal {
+                message: format!(
+                    "frame index {frame_idx} out of range (depth {})",
+                    thread.frames.len()
+                ),
+            }));
+        }
+        // SAFETY: `hot_fp` is non-null and in bounds (checked above); see the
+        // hoist note for the aliasing argument covering every deref below.
+        let saved_pc = unsafe { (*hot_fp).pc };
+        unsafe { (*hot_fp).last_instr_pc = saved_pc };
 
         // T17.Δ.3 — JVMTI single-step dispatch hook, gated by the hoisted
         // `single_step_active` so the no-agent case (universal) does zero atomics
         // and never materializes the frame borrow here. `fire_jvmti_single_step`
         // re-checks the listener + per-thread step flag when a listener is active.
         if single_step_active {
+            // Deliberately still re-indexed: this call takes `&JvmThread`,
+            // which exposes the whole frame stack, so hoist rule 1 forbids
+            // routing it through `hot_fp`. Cold and listener-gated — it costs
+            // nothing in the universal no-agent case.
             fire_jvmti_single_step(thread, &thread.frames[frame_idx], saved_pc);
         }
 
@@ -8137,15 +8178,18 @@ fn execute_frame_from_index(
         // per-class `skip_verification` generated classes that this cheap
         // global flag does not cover). `skip_verification` is a single bool
         // load — no per-instruction RwLock acquire.
-        let use_fast_path =
-            !thread.frames[frame_idx].is_jdk_class && !shared.config.skip_verification;
+        // SAFETY (every `hot_fp` deref below): see the hoist note above —
+        // reads only, no push, no `&mut` reborrow of the stack in between.
+        let is_jdk_class = unsafe { (*hot_fp).is_jdk_class };
+        let use_fast_path = !is_jdk_class && !shared.config.skip_verification;
+        let padded_code_len = unsafe { (*hot_fp).code.len() };
         debug_assert!(
-            thread.frames[frame_idx].code.len() >= 2,
+            padded_code_len >= 2,
             "bytecode must be padded with at least 2 trailing bytes"
         );
-        let code_len = thread.frames[frame_idx].code.len().wrapping_sub(2); // original unpadded length
+        let code_len = padded_code_len.wrapping_sub(2); // original unpadded length
         if use_fast_path && saved_pc < code_len {
-            let code_ptr = thread.frames[frame_idx].code.as_ptr();
+            let code_ptr = unsafe { (*hot_fp).code.as_ptr() };
             // SAFETY: code_ptr points to the method's bytecode array; saved_pc is bounds-checked against code_len above, and the bytecode is padded with 2 trailing bytes.
             let opcode = unsafe { *code_ptr.add(saved_pc) };
             let b1 = unsafe { *code_ptr.add(saved_pc + 1) };
@@ -10354,40 +10398,85 @@ fn execute_frame_from_index(
         // --- Slow path: pre-decoded (quickened) lookup, else full decode ---
         //
         // The quickened stream is a pure memoization of `Instruction::decode`
-        // keyed by bytecode pc: `index_of_pc` only ever returns an index whose
-        // recorded pc equals `saved_pc`, and `next_pc` replays exactly what
+        // keyed by bytecode pc: `resolve` only ever hands back the record whose
+        // recorded pc equals `saved_pc`, together with exactly the `next_pc`
         // `decode` returned there. Every pc-keyed consumer downstream
         // (exception table, stack maps, line numbers, JVMTI single-step,
         // JIT/OSR entry) therefore sees identical values. Any pc the stream
         // does not know -- dead bytes, a desynchronised landing pad -- falls
         // through to the original decode below.
-        let code_ptr_now = thread.frames[frame_idx].code.as_ptr();
-        if code_ptr_now != quick_code_ptr {
-            quick = quickened_for_frame(&thread.frames[frame_idx]);
-            quick_code_ptr = code_ptr_now;
-            quick_hint = 0;
+        // ── Frame-pointer hoist (frame-arena.md §6.1) ────────────────────
+        // `JvmThread::frames` is a `FrameStack`, which guarantees that a
+        // frame's address never changes unless the backing buffer grows, and
+        // that growth happens only inside `reserve_stable`/`push` and always
+        // bumps `reloc_epoch()`. That makes it sound to hold one raw frame
+        // pointer across the whole dispatch region instead of re-indexing.
+        //
+        // The region this pointer covers runs from the derivation below to
+        // the `execute_instruction` call, and contains **no push, no pop, and
+        // no access to `thread.frames` other than through `fp`**. The four
+        // aliasing rules therefore hold:
+        //   1. No overlapping reference. Every frame access in the region
+        //      goes through `fp`; in particular `quickened_for_frame` takes a
+        //      single `&Frame`, which we derive from `fp` itself, and nothing
+        //      here takes the `&[Frame]` slice view (no `capture_full_trace`,
+        //      no root scan, no unwinding — those all live outside).
+        //   2. No `&mut` reborrow of the stack, so `fp`'s provenance stays
+        //      live; `thread` is next touched by `execute_instruction`, by
+        //      which point `fp` is dead.
+        //   3. No relocation, hence no epoch change — asserted in debug.
+        //   4. Frame still live: the null check below *is* the
+        //      `frame_idx < thread.frames.len()` test, and it routes a
+        //      violation through `VmError` where indexing would have panicked.
+        //
+        // This collapses 13 bounds-checked, `imul`-by-`size_of::<Frame>()`
+        // re-indexes per executed bytecode down to one address computation.
+        #[cfg(debug_assertions)]
+        let reloc_epoch_at_hoist = thread.frames.reloc_epoch();
+        let fp: *mut Frame = thread.frames.frame_ptr(frame_idx);
+        if fp.is_null() {
+            return Err(MethodCallFailed::InternalError(VmError::Internal {
+                message: format!(
+                    "frame index {frame_idx} out of range (depth {}) at pc={saved_pc}",
+                    thread.frames.len()
+                ),
+            }));
         }
-        let quick_hit = quick
-            .as_deref()
-            .and_then(|q| q.index_of_pc(saved_pc, quick_hint).map(|i| (q, i)));
+        // SAFETY: `fp` is non-null and in bounds (checked above), and rules
+        // 1-3 above hold for every dereference in this region.
+        let code_ptr_now = unsafe { (*fp).code.as_ptr() };
+        if code_ptr_now != quick_code_ptr {
+            // SAFETY: as above. `quickened_for_frame` only reads the frame.
+            quick = quickened_for_frame(unsafe { &*fp });
+            quick_code_ptr = code_ptr_now;
+        }
+        // One O(1) call yielding both the pre-decoded instruction and the
+        // `next_pc` that `Instruction::decode` reported there, replacing
+        // `index_of_pc` + `op` + `next_pc` and their three bounds checks.
+        let quick_hit: Option<(&Instruction, usize)> =
+            quick.as_deref().and_then(|q| q.resolve(saved_pc));
         // Only populated on the fallback path; keeps the freshly decoded
         // instruction alive for as long as `instruction` borrows it.
         let mut fallback_decoded: Option<Instruction> = None;
         if quick_hit.is_none() {
-            let (decoded, next_pc) =
-                Instruction::decode(&thread.frames[frame_idx].code, thread.frames[frame_idx].pc)
-                    .map_err(|e| {
-                        MethodCallFailed::InternalError(VmError::Internal {
-                            message: format!(
-                                "decode error at pc={} in {}.{}: {}",
-                                thread.frames[frame_idx].pc,
-                                thread.frames[frame_idx].method_name(),
-                                thread.frames[frame_idx].method_descriptor(),
-                                e
-                            ),
-                        })
-                    })?;
-            thread.frames[frame_idx].pc = next_pc;
+            // SAFETY: hoist rules 1-4 above. All accesses here are reads of
+            // the frame plus the single `pc` write-back; the `&[u8]` borrow of
+            // `code` ends when `decode` returns, before that write.
+            let decoded_at_pc = unsafe {
+                Instruction::decode(&(*fp).code, (*fp).pc).map_err(|e| {
+                    MethodCallFailed::InternalError(VmError::Internal {
+                        message: format!(
+                            "decode error at pc={} in {}.{}: {}",
+                            (*fp).pc,
+                            (*fp).method_name(),
+                            (*fp).method_descriptor(),
+                            e
+                        ),
+                    })
+                })
+            };
+            let (decoded, next_pc) = decoded_at_pc?;
+            unsafe { (*fp).pc = next_pc };
             fallback_decoded = Some(decoded);
         }
         // Panic-free selection (B3 / NEW-7 zero-panic gate): the `(None, None)`
@@ -10395,10 +10484,10 @@ fn execute_frame_from_index(
         // `fallback_decoded` when there is no quickened hit -- but it is routed
         // through `VmError` rather than an `unreachable!`.
         let instruction: &Instruction = match (quick_hit, fallback_decoded.as_ref()) {
-            (Some((q, idx)), _) => {
-                thread.frames[frame_idx].pc = q.next_pc(idx);
-                quick_hint = idx + 1;
-                q.op(idx)
+            (Some((quickened, next_pc)), _) => {
+                // SAFETY: hoist rules 1-4 above.
+                unsafe { (*fp).pc = next_pc };
+                quickened
             }
             (None, Some(decoded)) => decoded,
             (None, None) => {
@@ -10411,7 +10500,8 @@ fn execute_frame_from_index(
         trace!(
             pc = saved_pc,
             instruction = ?instruction,
-            stack_depth = thread.frames[frame_idx].stack.len(),
+            // SAFETY: hoist rules 1-4 above.
+            stack_depth = unsafe { (*fp).stack.len() },
             "execute"
         );
 
@@ -10420,21 +10510,30 @@ fn execute_frame_from_index(
         // release builds compile update_diag_ctx to an empty function.
         #[cfg(debug_assertions)]
         {
-            let opcode_byte = thread.frames[frame_idx]
-                .code
-                .get(saved_pc)
-                .copied()
-                .unwrap_or(0);
-            let class_name = thread.frames[frame_idx].class_name();
-            let method_name = thread.frames[frame_idx].method_name();
+            // SAFETY: hoist rules 1-4 above; all three accesses are reads.
+            let frame: &Frame = unsafe { &*fp };
+            let opcode_byte = frame.code.get(saved_pc).copied().unwrap_or(0);
             crate::runtime::value_stack::update_diag_ctx(
-                class_name,
-                method_name,
+                frame.class_name(),
+                frame.method_name(),
                 saved_pc,
                 opcode_byte,
             );
         }
 
+        // Last use of `fp`: `execute_instruction` takes `&mut thread` and may
+        // push frames, so the hoisted pointer must not outlive this point.
+        #[cfg(debug_assertions)]
+        {
+            // Hoist rule 3: nothing in the region above may relocate frames.
+            // A bump here would mean `fp` had gone stale mid-region.
+            assert_eq!(
+                reloc_epoch_at_hoist,
+                thread.frames.reloc_epoch(),
+                "frame relocation inside the dispatch region would invalidate \
+                 the hoisted frame pointer"
+            );
+        }
         let exec_result = execute_instruction(shared, thread, frame_idx, instruction, saved_pc);
 
         // DIAG (gated `CRATONVM_DBG_UNDERFLOW=1`): pinpoint an operand-stack
@@ -29615,7 +29714,22 @@ fn intercept_force_registered_native(
             }
         )
     {
-        let callback = shared.natives.native_methods.find(
+        // Fully-constant triple: memoized in a file-local cell rather than
+        // re-hashing three literals on every call (native-dispatch-memoization
+        // §3 Step 1, B1). The memo is keyed on the registry generation, so a
+        // native registered later is still picked up and a negative result
+        // self-heals — unlike a `OnceLock`.
+        //
+        // ONE STATIC, ONE TRIPLE. The generation is the *only* key: the triple
+        // is not re-verified on a warm hit (re-hashing it is the cost this
+        // exists to remove), so a cell reached with a second triple can redeem
+        // the first's memoized negative and silently report "no native" for a
+        // registered one. This cell is reached from exactly one call, with
+        // three string literals.
+        static NCS_CLASS_GET_CLASSLOADER: cratonvm_native_api::NativeCallSite =
+            cratonvm_native_api::NativeCallSite::new();
+        let callback = NCS_CLASS_GET_CLASSLOADER.callback(
+            &shared.natives.native_methods,
             "java/lang/Class",
             "getClassLoader",
             "()Ljava/lang/ClassLoader;",
@@ -30186,7 +30300,14 @@ fn intercept_classloader_set_default_assertion_status(
     if method_name != "setDefaultAssertionStatus" || method_descriptor != "(Z)V" {
         return None;
     }
-    let cb = shared.natives.native_methods.find(
+    // Fully-constant triple — memoized (native-dispatch-memoization §3, B2).
+    // ONE STATIC, ONE TRIPLE: reached from exactly this one call, with three
+    // literals. See `NCS_CLASS_GET_CLASSLOADER` for why sharing a cell across
+    // triples silently mis-answers.
+    static NCS_CL_SET_DEFAULT_ASSERTION_STATUS: cratonvm_native_api::NativeCallSite =
+        cratonvm_native_api::NativeCallSite::new();
+    let cb = NCS_CL_SET_DEFAULT_ASSERTION_STATUS.callback(
+        &shared.natives.native_methods,
         "java/lang/ClassLoader",
         "setDefaultAssertionStatus",
         "(Z)V",
@@ -30212,10 +30333,26 @@ fn surefire_lazy_launcher_discover_native(
     if method_name != "discover" || descriptor != DESC_DISCOVER {
         return None;
     }
-    let cb = shared
-        .natives
-        .native_methods
-        .find(LAZY, "discover", DESC_DISCOVER)?;
+    // Fully-constant triple (`LAZY` / `DESC_DISCOVER` are the `const`s above),
+    // memoized per native-dispatch-memoization §3 Step 1, B3.
+    //
+    // ONE STATIC, ONE TRIPLE. A `NativeCallSite` memo is keyed on the registry
+    // generation alone — the triple is deliberately not re-checked on a warm
+    // hit, since re-hashing it is the exact cost the cell exists to remove.
+    // So a cell that ever sees a second triple can redeem the first triple's
+    // memoized negative for the second and silently answer `None` for a
+    // native that is in fact registered. This cell is reached from exactly
+    // this one call, with these constants. The identical triple in
+    // `native_override_for_cached_reflect_invoke` gets its *own* cell rather
+    // than sharing this one.
+    static NCS_LAZY_LAUNCHER_DISCOVER: cratonvm_native_api::NativeCallSite =
+        cratonvm_native_api::NativeCallSite::new();
+    let cb = NCS_LAZY_LAUNCHER_DISCOVER.callback(
+        &shared.natives.native_methods,
+        LAZY,
+        "discover",
+        DESC_DISCOVER,
+    )?;
     let cid = shared.mem.heap.class_id_of(recv_obj);
     let cm = shared.classes.class_manager.read();
     let ok = cm
@@ -30355,6 +30492,16 @@ fn try_stackless_invoke(
 ) -> Result<CachedCallResult, MethodCallFailed> {
     use crate::runtime::frame::padded_bytecode;
     use crate::vm::{coerce_value_for_return, native_return_pushed_to_stack, safe_native_call};
+
+    // Memo for the constant `DowncallHandle.type()` triple resolved in the
+    // receiver-class-gated arm below (native-dispatch-memoization §3, B4).
+    // ONE STATIC, ONE TRIPLE: the single `.callback` below passes three
+    // literals, and no other arm of this function touches this cell. In
+    // particular the `.or_else` chain's lookups — whose class name is rewritten
+    // from `[`-prefixed receivers and therefore varies at runtime — are NOT
+    // memoizable by this mechanism and are deliberately left re-resolving.
+    static NCS_DOWNCALL_HANDLE_TYPE: cratonvm_native_api::NativeCallSite =
+        cratonvm_native_api::NativeCallSite::new();
 
     // T15: Array types (`[LFoo;`, `[I`, etc.) inherit their method
     // dispatch from `java.lang.Object` (JVMS §4.4.1).  Treat any invoke
@@ -30498,7 +30645,11 @@ fn try_stackless_invoke(
                 .map(|class| class.name.as_ref() == "java/lang/foreign/DowncallHandle")
                 .unwrap_or(false);
             if is_downcall {
-                shared.natives.native_methods.find(
+                // Fully-constant triple (native-dispatch-memoization §3, B4).
+                // Only ever reached with this one triple, so the per-call-site
+                // memo cannot be asked to serve a different one.
+                NCS_DOWNCALL_HANDLE_TYPE.callback(
+                    &shared.natives.native_methods,
                     "java/lang/foreign/DowncallHandle",
                     "type",
                     "()Ljava/lang/invoke/MethodType;",
@@ -39413,12 +39564,30 @@ fn native_override_for_cached_reflect_invoke(
     method_name: &str,
     descriptor: &str,
 ) -> Option<cratonvm_native_api::NativeCallback> {
+    // Every arm is a fully-constant triple, so each gets its OWN memo cell
+    // (native-dispatch-memoization §3 Step 1, B5/B6/B7).
+    //
+    // ONE STATIC, ONE TRIPLE — a `NativeCallSite` is keyed on the registry
+    // generation alone and does not re-verify the triple on a warm hit, so a
+    // cell reached with two different triples can hand the second one the
+    // first one's memoized negative and silently report "no native" for a
+    // registered one. Each arm below is a distinct triple and therefore a
+    // distinct cell; the third does NOT reuse
+    // `surefire_lazy_launcher_discover_native`'s cell even though the triple
+    // is identical, so no cell is reachable from more than one call.
+    static NCS_METHOD_INVOKE: cratonvm_native_api::NativeCallSite =
+        cratonvm_native_api::NativeCallSite::new();
+    static NCS_CONSTRUCTOR_NEW_INSTANCE: cratonvm_native_api::NativeCallSite =
+        cratonvm_native_api::NativeCallSite::new();
+    static NCS_REFLECT_LAZY_LAUNCHER_DISCOVER: cratonvm_native_api::NativeCallSite =
+        cratonvm_native_api::NativeCallSite::new();
     match (class_name, method_name, descriptor) {
         (
             "java/lang/reflect/Method",
             "invoke",
             "(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;",
-        ) => shared.natives.native_methods.find(
+        ) => NCS_METHOD_INVOKE.callback(
+            &shared.natives.native_methods,
             "java/lang/reflect/Method",
             "invoke",
             "(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;",
@@ -39427,7 +39596,8 @@ fn native_override_for_cached_reflect_invoke(
             "java/lang/reflect/Constructor",
             "newInstance",
             "([Ljava/lang/Object;)Ljava/lang/Object;",
-        ) => shared.natives.native_methods.find(
+        ) => NCS_CONSTRUCTOR_NEW_INSTANCE.callback(
+            &shared.natives.native_methods,
             "java/lang/reflect/Constructor",
             "newInstance",
             "([Ljava/lang/Object;)Ljava/lang/Object;",
@@ -39436,7 +39606,8 @@ fn native_override_for_cached_reflect_invoke(
             "org/apache/maven/surefire/junitplatform/LazyLauncher",
             "discover",
             "(Lorg/junit/platform/launcher/LauncherDiscoveryRequest;)Lorg/junit/platform/launcher/TestPlan;",
-        ) => shared.natives.native_methods.find(
+        ) => NCS_REFLECT_LAZY_LAUNCHER_DISCOVER.callback(
+            &shared.natives.native_methods,
             "org/apache/maven/surefire/junitplatform/LazyLauncher",
             "discover",
             "(Lorg/junit/platform/launcher/LauncherDiscoveryRequest;)Lorg/junit/platform/launcher/TestPlan;",
@@ -42386,6 +42557,288 @@ fn dump_imse_holdcount_state(shared: &SharedVm, thread: &JvmThread, exc: ObjectR
             "[imse]   readHolds={:p}: NO ThreadLocalMap entry in current thread's table (len={len}) — the entry is GONE",
             read_holds.as_ptr(),
         );
+    }
+}
+
+#[cfg(test)]
+mod wave1_adoption_tests {
+    //! Coverage for the `arch-2026-07-26` adoption edits in this file:
+    //! O(1) quickened dispatch (`quickened-dispatch-o1.md`), the frame-pointer
+    //! hoists (`frame-arena.md` §6.1) and the constant-triple native memo cells
+    //! (`native-dispatch-memoization.md` §3 Step 1).
+
+    use super::*;
+    use crate::runtime::frame::FrameStack;
+    use std::sync::Arc as StdArc;
+
+    /// A tiny, fully decodable method body: `iconst_0; istore_0; iload_0;
+    /// ifeq +3 (back-edge target); return`, padded with the two trailing zero
+    /// bytes every `Frame` code array carries.
+    fn sample_code() -> StdArc<[u8]> {
+        StdArc::from(
+            [
+                0x03u8, // iconst_0        @0
+                0x3b,   // istore_0        @1
+                0x1a,   // iload_0         @2
+                0x99, 0x00, 0x03, // ifeq +3   @3
+                0xb1, // return          @6
+                0x00, 0x00, // padding
+            ]
+            .as_slice(),
+        )
+    }
+
+    /// The dispatch loop swapped `index_of_pc(pc, hint)` + `op(idx)` +
+    /// `next_pc(idx)` for the single `resolve(pc)`. Pin that the replacement is
+    /// exactly equivalent at every pc — including the misses that must still
+    /// fall through to `Instruction::decode`, and regardless of what the
+    /// now-deleted `quick_hint` would have been.
+    #[test]
+    fn resolve_matches_the_index_of_pc_triple_it_replaced() {
+        let code = sample_code();
+        let quick =
+            cratonvm_reader::quickened::intern(&code).expect("a fully decodable body must quicken");
+
+        for pc in 0..code.len() + 4 {
+            let expected = quick
+                .index_of_pc_direct(pc)
+                .map(|idx| (quick.op(idx), quick.next_pc(idx)));
+            let actual = quick.resolve(pc);
+
+            match (expected, actual) {
+                (None, None) => {}
+                (Some((eop, enext)), Some((aop, anext))) => {
+                    assert!(
+                        std::ptr::eq(eop, aop),
+                        "resolve({pc}) must hand back the same interned record"
+                    );
+                    assert_eq!(enext, anext, "resolve({pc}) next_pc diverged");
+                }
+                (e, a) => panic!(
+                    "resolve({pc}) disagreed: {:?} vs {:?}",
+                    e.is_some(),
+                    a.is_some()
+                ),
+            }
+
+            // The deleted hint was never load-bearing: every hint value, valid
+            // or nonsensical, must agree with the hint-free form.
+            for hint in [0usize, 1, 2, 5, usize::MAX] {
+                assert_eq!(
+                    quick.index_of_pc(pc, hint),
+                    quick.index_of_pc_direct(pc),
+                    "hint {hint} changed the answer at pc {pc}"
+                );
+            }
+        }
+    }
+
+    fn sample_frame() -> Frame {
+        Frame::new(
+            ClassId::new(1),
+            "com/example/Sample".to_string(),
+            "run".to_string(),
+            "()V".to_string(),
+            None,
+            sample_code()[..7].to_vec(),
+            Vec::new(),
+            2,
+            2,
+            &[],
+        )
+    }
+
+    /// The preamble and dispatch hoists read `pc`, `last_instr_pc`,
+    /// `is_jdk_class` and `code` through a raw `*mut Frame` instead of
+    /// re-indexing. Pin the two properties that makes sound: the pointer
+    /// addresses the same frame indexing would, and a region that performs no
+    /// push cannot relocate it (`reloc_epoch` unchanged).
+    #[test]
+    fn hoisted_frame_pointer_addresses_the_same_frame_as_indexing() {
+        let mut frames = FrameStack::new();
+        frames.push(sample_frame());
+        frames.push(sample_frame());
+        let frame_idx = frames.len() - 1;
+
+        let epoch_before = frames.reloc_epoch();
+        let fp = frames.frame_ptr(frame_idx);
+        assert!(!fp.is_null(), "an in-range index must not yield null");
+
+        // Everything the hoisted region reads must match indexing.
+        unsafe {
+            assert_eq!((*fp).pc, frames[frame_idx].pc);
+            assert_eq!((*fp).is_jdk_class, frames[frame_idx].is_jdk_class);
+            assert_eq!((*fp).code.len(), frames[frame_idx].code.len());
+            assert!(std::ptr::eq(
+                (*fp).code.as_ptr(),
+                frames[frame_idx].code.as_ptr()
+            ));
+        }
+
+        // A write through the pointer is observable through the index, and the
+        // no-push region did not relocate anything.
+        let fp = frames.frame_ptr(frame_idx);
+        unsafe {
+            (*fp).pc = 6;
+            (*fp).last_instr_pc = 3;
+        }
+        assert_eq!(frames[frame_idx].pc, 6);
+        assert_eq!(frames[frame_idx].last_instr_pc, 3);
+        assert_eq!(
+            epoch_before,
+            frames.reloc_epoch(),
+            "a region with no push must not bump the relocation epoch"
+        );
+
+        // Rule 4: out of range is null, which is what routes to `VmError`
+        // instead of the panic the old `thread.frames[frame_idx]` would raise.
+        assert!(frames.frame_ptr(frames.len()).is_null());
+    }
+
+    /// `Frame::new` now interns padded bytecode per method identity. The
+    /// uncached invoke path in `execute` adopted the same call. Pin both halves
+    /// of the contract `local_liveness.rs` depends on: same method shares one
+    /// allocation, distinct methods never do.
+    #[test]
+    fn frames_of_one_method_share_bytecode_but_distinct_methods_do_not() {
+        let a = sample_frame();
+        let b = sample_frame();
+        assert!(
+            std::ptr::eq(a.code.as_ptr(), b.code.as_ptr()),
+            "two frames of the same method must share one padded code allocation"
+        );
+
+        let other = Frame::new(
+            ClassId::new(1),
+            "com/example/Sample".to_string(),
+            "runOther".to_string(),
+            "()V".to_string(),
+            None,
+            sample_code()[..7].to_vec(),
+            Vec::new(),
+            2,
+            2,
+            &[],
+        );
+        assert!(
+            !std::ptr::eq(a.code.as_ptr(), other.code.as_ptr()),
+            "byte-identical bodies of DIFFERENT methods must keep distinct Arcs — \
+             local_liveness.rs keys its handler-edge-dependent table on this pointer"
+        );
+    }
+
+    fn noop_native(
+        _ctx: &mut dyn cratonvm_native_api::NativeContext,
+        _args: &[Value],
+    ) -> MethodCallResult {
+        Ok(None)
+    }
+
+    /// Every constant-triple site converted in this file (B1-B7) replaced
+    /// `registry.find(c, m, d)` with `CELL.callback(&registry, c, m, d)`. Pin
+    /// that substitution — on a hit, on a miss, and across the late
+    /// registration that the old `OnceLock`-shaped memo could not survive.
+    #[test]
+    fn constant_triple_memo_cell_is_substitutable_for_find() {
+        let cell = cratonvm_native_api::NativeCallSite::new();
+        let mut registry = cratonvm_native_api::NativeMethodRegistry::new();
+
+        // Miss before registration must agree, and must not be memoized as a
+        // permanent negative.
+        assert!(registry
+            .find(
+                "java/lang/Class",
+                "getClassLoader",
+                "()Ljava/lang/ClassLoader;"
+            )
+            .is_none());
+        assert!(cell
+            .callback(
+                &registry,
+                "java/lang/Class",
+                "getClassLoader",
+                "()Ljava/lang/ClassLoader;",
+            )
+            .is_none());
+
+        registry.register(
+            "java/lang/Class",
+            "getClassLoader",
+            "()Ljava/lang/ClassLoader;",
+            noop_native,
+        );
+
+        let via_find = registry
+            .find(
+                "java/lang/Class",
+                "getClassLoader",
+                "()Ljava/lang/ClassLoader;",
+            )
+            .expect("registered native must be findable");
+        let via_cell = cell
+            .callback(
+                &registry,
+                "java/lang/Class",
+                "getClassLoader",
+                "()Ljava/lang/ClassLoader;",
+            )
+            .expect("the memo cell must self-heal past the earlier negative");
+        assert_eq!(
+            via_find as usize, via_cell as usize,
+            "the memo cell must resolve the same callback `find` does"
+        );
+
+        // Warm path: a second read agrees with itself and with `find`.
+        let warm = cell
+            .callback(
+                &registry,
+                "java/lang/Class",
+                "getClassLoader",
+                "()Ljava/lang/ClassLoader;",
+            )
+            .expect("warm read");
+        assert_eq!(warm as usize, via_find as usize);
+    }
+
+    /// ONE STATIC, ONE TRIPLE — the invariant every `NCS_*` cell in this file
+    /// relies on, pinned here so the failure mode is visible next to the call
+    /// sites rather than only in `native-api`.
+    ///
+    /// A `NativeCallSite` memo is `(generation << 32) | slot` and is validated
+    /// against the registry generation *only*: the triple is deliberately not
+    /// re-checked on a warm hit, because re-hashing three strings is the exact
+    /// cost the cell exists to remove. So a cell reached with two different
+    /// triples will hand the second one whatever the first memoized — and when
+    /// the first was a miss, that is a silent `None` for a native that is
+    /// registered and dispatches fine through `find`. No panic, no log.
+    #[test]
+    fn sharing_one_memo_cell_across_two_triples_silently_mis_answers() {
+        let mut registry = cratonvm_native_api::NativeMethodRegistry::new();
+        registry.register("java/lang/Sample", "b", "()V", noop_native);
+
+        // A cell that first sees triple A (unregistered) memoizes a negative
+        // for this generation, then wrongly serves it to triple B.
+        let shared_cell = cratonvm_native_api::NativeCallSite::new();
+        assert!(shared_cell
+            .callback(&registry, "java/lang/Sample", "a", "()V")
+            .is_none());
+        let leaked = shared_cell.callback(&registry, "java/lang/Sample", "b", "()V");
+        assert!(
+            leaked.is_none(),
+            "this asserts the FOOTGUN, not desired behaviour: a shared cell \
+             redeems triple A's negative for triple B"
+        );
+
+        // `find` proves the native really is registered and resolvable — the
+        // shared cell was simply wrong.
+        assert!(registry.find("java/lang/Sample", "b", "()V").is_some());
+
+        // One cell per triple is correct. Every `NCS_*` static in this file is
+        // reached from exactly one call site with a literal/const triple.
+        let cell_b = cratonvm_native_api::NativeCallSite::new();
+        assert!(cell_b
+            .callback(&registry, "java/lang/Sample", "b", "()V")
+            .is_some());
     }
 }
 
