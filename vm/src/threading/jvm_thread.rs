@@ -25,7 +25,7 @@ use std::sync::{Arc, OnceLock};
 use parking_lot::{Condvar as PLCondvar, Mutex as PLMutex};
 
 use crate::classloading::resolution::InvokeCache;
-use crate::runtime::frame::Frame;
+use crate::runtime::frame::{Frame, FrameStack};
 use crate::runtime::fx_collections::FxHashMap;
 use crate::types::{ObjectRef, Value};
 use cratonvm_types::ClassId;
@@ -333,7 +333,18 @@ pub struct JvmThread {
     /// Live execution frames. The last element is the currently executing frame.
     /// Frames are pushed on method entry and popped on method return.
     /// Stack traces are derived from frames on demand (in capture_stack_trace).
-    pub frames: Vec<Frame>,
+    ///
+    /// [`FrameStack`] is a drop-in for the `Vec<Frame>` this used to be — same
+    /// methods, same `Index`, same iteration, and it still coerces to
+    /// `&[Frame]` — but it additionally guarantees that a frame's **address**
+    /// does not change while it is on the stack, except across an explicit,
+    /// observable relocation (`FrameStack::reloc_epoch`). Reserving with
+    /// `FrameStack::reserve_stable(n)` rules relocation out for the next `n`
+    /// pushes, which is what lets the interpreter hoist a single
+    /// `*mut Frame` across the dispatch loop instead of re-indexing
+    /// `thread.frames[frame_idx]` on every access. See the `FrameStack` docs
+    /// for the aliasing rules that come with the raw-pointer API.
+    pub frames: FrameStack,
 
     /// Pool of reusable locals (values, tags) pairs (avoids allocation on recursive calls).
     pub locals_pool: SoaPool,
@@ -594,7 +605,7 @@ impl JvmThread {
         Self {
             thread_id,
             name: name.to_string(),
-            frames: Vec::new(),
+            frames: FrameStack::new(),
             locals_pool: Vec::new(),
             stacks_pool: Vec::new(),
             printed: Vec::new(),
@@ -630,11 +641,29 @@ impl JvmThread {
     }
 
     /// Return a popped frame's Vec allocations to the pool for reuse.
+    ///
+    /// Overflow (thread-owned pool already at `MAX_POOL_SIZE`) is offered to
+    /// the per-OS-thread SoA pool in `runtime::frame`, which backs the
+    /// *non-pooled* constructors `Frame::new` / `Frame::new_from_arcs` — the
+    /// latter being the hot uncached invoke path, which previously allocated
+    /// and zero-filled four `Vec`s per frame. Buffers that pool declines
+    /// (cap reached, or oversized) are dropped exactly as before, so this is
+    /// never worse than the old behaviour.
+    ///
+    /// The thread-owned `locals_pool` / `stacks_pool` keep first claim, so the
+    /// cached invoke path's pool dynamics are unchanged.
     pub fn recycle_frame(&mut self, frame: Frame) {
         if self.locals_pool.len() < MAX_POOL_SIZE {
             frame.recycle(&mut self.locals_pool, &mut self.stacks_pool);
+            return;
         }
-        // If pool is full, frame's Vecs are simply dropped
+        let (local_vals, local_tags, stack_vals, stack_tags) = frame.take_pool_parts();
+        crate::runtime::frame::offer_frame_parts_to_tls_pool(
+            local_vals,
+            local_tags,
+            stack_vals,
+            stack_tags,
+        );
     }
 
     /// T10.7 — recycle a frame, spilling any overflow into the VM-wide

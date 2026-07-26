@@ -10,7 +10,7 @@
 //! - Method bytecode and exception table
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use cratonvm_reader::attribute::ExceptionTableEntry;
 
@@ -25,12 +25,127 @@ use crate::types::{
 /// Create a bytecode Arc with 2 trailing zero bytes for safe speculative reads.
 /// This allows the hot loop to unconditionally read `code[pc+1]` and `code[pc+2]`
 /// without bounds checks, since the padding guarantees valid memory.
+///
+/// # Prefer [`padded_bytecode_for_method`] on per-invocation paths
+///
+/// This function copies the whole method body into a fresh allocation on
+/// *every* call. Call sites that run once per method *resolution* (building a
+/// [`CachedBytecodeMethod`], a JIT record, …) are fine. Call sites that run
+/// once per *frame construction* — notably the uncached invoke path in
+/// `interpreter.rs` — pay an allocation + full memcpy per method entry and
+/// should use [`padded_bytecode_for_method`], which memoizes the padded Arc
+/// under the method's own identity.
 pub fn padded_bytecode(code: &[u8]) -> Arc<[u8]> {
     let mut padded = Vec::with_capacity(code.len() + 2);
     padded.extend_from_slice(code);
     padded.push(0);
     padded.push(0);
     Arc::from(padded.into_boxed_slice())
+}
+
+// ---------------------------------------------------------------------------
+// Per-method padded-bytecode memo
+// ---------------------------------------------------------------------------
+//
+// WHY KEYED BY METHOD IDENTITY AND NOT BY CONTENT
+// -----------------------------------------------
+// The obvious implementation of "intern the padded bytecode" is a
+// content-addressed table: hash the bytes, return a shared Arc for equal
+// bodies. That is UNSOUND here, because the *pointer identity* of
+// `Frame::code` is already used elsewhere in the VM as a proxy for method
+// identity:
+//
+//   `runtime/local_liveness.rs` caches a per-method `LivenessTable` under the
+//   key `(Arc::as_ptr(code), code.len())`, validated with `Arc::ptr_eq`. The
+//   table is computed by `analyze(code, exception_table)` — it depends on the
+//   method's **exception table**, which is NOT part of the hashed bytes.
+//
+// Two distinct methods can have byte-identical `Code` but different exception
+// table ranges (generated / obfuscated / hand-written classfiles). A
+// content-addressed interner would hand them the same Arc, the liveness cache
+// would answer the second method from the first method's handler edges, and an
+// under-approximated live-locals mask drops a GC root — the silent
+// heap-corruption class of bug. So we key on *method identity* instead:
+// distinct methods never share an Arc, and identical bodies are deliberately
+// NOT merged.
+//
+// The content check on a hit is still required: class redefinition /
+// retransformation rewrites the body under an unchanged
+// `(class_id, name, descriptor)`. On a content mismatch we mint a fresh Arc and
+// replace the entry, so `Arc` sharing semantics are identical to the
+// non-memoized path (old frames keep the old Arc alive; the liveness cache's
+// `Weak` + `ptr_eq` guard sees a different pointer and recomputes).
+
+/// `(class_id, hash(method_name ++ descriptor))`.
+type PaddedCodeKey = (u32, u64);
+
+/// Entry cap for the padded-bytecode memo. On overflow the whole table is
+/// dropped (entries are cheap to recompute) — mirrors the bounded-cache policy
+/// in `local_liveness.rs`. Keeps runaway class generators (ByteBuddy / CGLIB)
+/// from retaining every synthetic method body forever.
+const PADDED_CODE_CACHE_CAP: usize = 16384;
+
+/// Bodies larger than this are not memoized: they are rare, and retaining them
+/// would dominate the cache's footprint.
+const PADDED_CODE_CACHE_MAX_LEN: usize = 32 * 1024;
+
+fn padded_code_cache() -> &'static Mutex<HashMap<PaddedCodeKey, Arc<[u8]>>> {
+    static CACHE: OnceLock<Mutex<HashMap<PaddedCodeKey, Arc<[u8]>>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// FNV-1a over `bytes`, seeded with `seed` so several fields can be chained.
+#[inline]
+fn fnv1a64(seed: u64, bytes: &[u8]) -> u64 {
+    let mut h = seed;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x1000_0000_01b3);
+    }
+    h
+}
+
+/// Padded bytecode for one *method*, memoized under that method's identity.
+///
+/// Semantically identical to [`padded_bytecode`] — same bytes, same `>= 2`
+/// trailing zero bytes, same `Arc<[u8]>` type — but repeat calls for the same
+/// method return the *same* Arc instead of a fresh allocation + full memcpy.
+///
+/// Distinct methods never share an Arc (see the module comment above): the key
+/// is `(class_id, method_name, descriptor)`, and a hit is additionally verified
+/// against the actual bytes so a redefined method mints a fresh Arc.
+pub fn padded_bytecode_for_method(
+    class_id: ClassId,
+    method_name: &str,
+    method_descriptor: &str,
+    code: &[u8],
+) -> Arc<[u8]> {
+    if code.len() > PADDED_CODE_CACHE_MAX_LEN {
+        return padded_bytecode(code);
+    }
+    let h = fnv1a64(
+        fnv1a64(0xcbf2_9ce4_8422_2325, method_name.as_bytes()),
+        method_descriptor.as_bytes(),
+    );
+    let key: PaddedCodeKey = (class_id.as_u32(), h);
+    let mut cache = match padded_code_cache().lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if let Some(hit) = cache.get(&key) {
+        // Verify the body actually matches: guards both a `(class_id, hash)`
+        // collision between two methods of the same class and a redefinition
+        // that rewrote the body under an unchanged identity.
+        if hit.len() == code.len() + 2 && hit[..code.len()] == *code {
+            return Arc::clone(hit);
+        }
+    }
+    if cache.len() >= PADDED_CODE_CACHE_CAP {
+        cache.clear();
+    }
+    let fresh = padded_bytecode(code);
+    cache.insert(key, Arc::clone(&fresh));
+    fresh
 }
 
 /// JVM slots required to hold `args` as the initial local variable array
@@ -328,15 +443,6 @@ fn lost_tag_local_candidates(cv: CompactValue) -> [u64; 3] {
     ]
 }
 
-fn init_locals(max_locals: u16, args: &[Value]) -> (Vec<CompactValue>, Vec<u8>, u16) {
-    let eff = effective_max_locals(max_locals, args);
-    let n = eff as usize;
-    let mut locals = vec![CompactValue::uninitialized(); n];
-    let mut kinds = vec![LKIND_OTHER; n];
-    copy_args_to_locals(&mut locals, &mut kinds, args);
-    (locals, kinds, eff)
-}
-
 /// Pool-backed local-Vec initialisation.
 ///
 /// The pool stores `(Vec<u64>, Vec<u8>)` tuples — the `u64` half is the
@@ -351,9 +457,27 @@ fn init_locals_pooled(
     args: &[Value],
     pool: &mut Vec<(Vec<u64>, Vec<u8>)>,
 ) -> (Vec<CompactValue>, Vec<u8>, u16) {
+    init_locals_from_parts(max_locals, args, pool.pop())
+}
+
+/// The body of [`init_locals_pooled`], taking the recycled `(vals, tags)` pair
+/// directly instead of popping it from a pool. Lets the non-pooled
+/// constructors source their buffers from the per-OS-thread pool
+/// ([`tls_pop_locals`]) without materialising a throw-away pool `Vec`.
+///
+/// `parts == None` is exactly the old allocating path: `unwrap_or_default()`
+/// yields empty Vecs which are then resized to `n`, so the pooled and unpooled
+/// arms cannot drift apart. `copy_args_to_locals` fills the argument slots and
+/// every other slot is `CompactValue::uninitialized()` / `LKIND_OTHER`, so no
+/// recycled content can survive into the new frame.
+fn init_locals_from_parts(
+    max_locals: u16,
+    args: &[Value],
+    parts: Option<(Vec<u64>, Vec<u8>)>,
+) -> (Vec<CompactValue>, Vec<u8>, u16) {
     let eff = effective_max_locals(max_locals, args);
     let n = eff as usize;
-    let (vals, mut kinds) = pool.pop().unwrap_or_default();
+    let (vals, mut kinds) = parts.unwrap_or_default();
     // SAFETY: CompactValue is repr(transparent) over u64 — transmute is a
     // no-op layout-wise. The `Vec<u8>` half (formerly the discarded local-tag
     // Vec) is reused as the parallel `local_kinds` buffer; clear + resize
@@ -365,6 +489,139 @@ fn init_locals_pooled(
     kinds.resize(n, LKIND_OTHER);
     copy_args_to_locals(&mut locals, &mut kinds, args);
     (locals, kinds, eff)
+}
+
+// ---------------------------------------------------------------------------
+// Per-OS-thread SoA buffer pool for the *non-pooled* Frame constructors
+// ---------------------------------------------------------------------------
+//
+// `Frame::new_pooled` / `Frame::new_pooled_cached` take the owning
+// `JvmThread`'s `locals_pool` / `stacks_pool` by `&mut`, so they never
+// allocate. `Frame::new` and `Frame::new_from_arcs` have no access to the
+// thread (they are called from paths that only hold the frame's inputs), so
+// until now each one ran `vec![…; n]` twice for the locals pair and
+// `ValueStack::new` — which itself zero-fills TWO more Vecs of `max_stack`.
+// Four allocations plus four zero-fills per frame, and `Frame::new_from_arcs`
+// is the hot *uncached* invoke path in `interpreter.rs`.
+//
+// This pool closes that hole without touching the thread-owned pools, so the
+// dynamics of the cached invoke path are bit-for-bit unchanged. (That matters:
+// a previous attempt — noted in `interpreter.rs` as "P4 reverted" — routed the
+// uncached path through the *thread* pools and hung the BouncyCastle suites.
+// Nothing here competes with those pools for buffers.)
+//
+// It is fed by `JvmThread::recycle_frame` from the branch that used to simply
+// DROP a popped frame's Vecs once `locals_pool` was already at `MAX_POOL_SIZE`,
+// so it is a strict improvement: buffers that were previously freed are now
+// reused, and when the pool is empty both constructors fall back to exactly the
+// allocating path they used before.
+
+/// Per-OS-thread reusable `(values, tags)` buffers, split by role so a locals
+/// buffer sized for `max_locals` is not handed to an operand stack sized for
+/// `max_stack` (and vice versa) — either would work, but keeping them apart
+/// preserves the size distribution and avoids repeated grow/shrink churn.
+struct FrameSoaTls {
+    locals: Vec<(Vec<u64>, Vec<u8>)>,
+    stacks: Vec<(Vec<u64>, Vec<u8>)>,
+}
+
+/// Max buffers retained per role per OS thread.
+const TLS_SOA_POOL_CAP: usize = 32;
+
+/// Buffers with more slots than this are not retained — a single pathological
+/// `max_stack` / `max_locals` method must not pin a large allocation for the
+/// lifetime of the thread.
+const TLS_SOA_MAX_RETAINED_SLOTS: usize = 4096;
+
+thread_local! {
+    static FRAME_SOA_TLS: std::cell::RefCell<FrameSoaTls> = const {
+        std::cell::RefCell::new(FrameSoaTls {
+            locals: Vec::new(),
+            stacks: Vec::new(),
+        })
+    };
+}
+
+/// Take a recycled locals buffer pair, or `None` when the pool is empty (or the
+/// thread-local is already destroyed, during thread teardown).
+#[inline]
+fn tls_pop_locals() -> Option<(Vec<u64>, Vec<u8>)> {
+    FRAME_SOA_TLS
+        .try_with(|p| p.borrow_mut().locals.pop())
+        .ok()
+        .flatten()
+}
+
+/// Take a recycled operand-stack buffer pair, or `None`.
+#[inline]
+fn tls_pop_stack() -> Option<(Vec<u64>, Vec<u8>)> {
+    FRAME_SOA_TLS
+        .try_with(|p| p.borrow_mut().stacks.pop())
+        .ok()
+        .flatten()
+}
+
+/// Offer a popped frame's four buffers to this OS thread's pool.
+///
+/// Called by `JvmThread::recycle_frame` when the thread-owned pool is full —
+/// i.e. exactly where the buffers used to be dropped. Buffers that exceed
+/// [`TLS_SOA_MAX_RETAINED_SLOTS`] or that would push a role past
+/// [`TLS_SOA_POOL_CAP`] are dropped as before.
+pub fn offer_frame_parts_to_tls_pool(
+    local_vals: Vec<u64>,
+    local_tags: Vec<u8>,
+    stack_vals: Vec<u64>,
+    stack_tags: Vec<u8>,
+) {
+    let _ = FRAME_SOA_TLS.try_with(|p| {
+        let mut p = p.borrow_mut();
+        if p.locals.len() < TLS_SOA_POOL_CAP
+            && local_vals.capacity() <= TLS_SOA_MAX_RETAINED_SLOTS
+            && local_tags.capacity() <= TLS_SOA_MAX_RETAINED_SLOTS
+        {
+            p.locals.push((local_vals, local_tags));
+        }
+        if p.stacks.len() < TLS_SOA_POOL_CAP
+            && stack_vals.capacity() <= TLS_SOA_MAX_RETAINED_SLOTS
+            && stack_tags.capacity() <= TLS_SOA_MAX_RETAINED_SLOTS
+        {
+            p.stacks.push((stack_vals, stack_tags));
+        }
+    });
+}
+
+/// Build an operand stack of `max_size` slots, reusing a pooled buffer pair
+/// when one is available. Falls back to `ValueStack::new` (which allocates and
+/// zero-fills) only when the pool is empty.
+#[inline]
+fn value_stack_from_tls_pool(max_size: usize) -> ValueStack {
+    match tls_pop_stack() {
+        Some((vals, tags)) => ValueStack::from_pooled(vals, tags, max_size),
+        None => ValueStack::new(max_size),
+    }
+}
+
+/// Test/diagnostic helper: current per-role depth of this thread's SoA pool.
+#[doc(hidden)]
+pub fn tls_soa_pool_depths() -> (usize, usize) {
+    FRAME_SOA_TLS
+        .try_with(|p| {
+            let p = p.borrow();
+            (p.locals.len(), p.stacks.len())
+        })
+        .unwrap_or((0, 0))
+}
+
+/// Test helper: drop every pooled buffer on this OS thread so a test starts
+/// from a known state. `libtest` may run several tests on one thread
+/// (`--test-threads=1`), so tests must not assume an empty pool.
+#[cfg(test)]
+fn tls_soa_pool_clear() {
+    let _ = FRAME_SOA_TLS.try_with(|p| {
+        let mut p = p.borrow_mut();
+        p.locals.clear();
+        p.stacks.clear();
+    });
 }
 
 fn copy_args_to_locals(locals: &mut [CompactValue], kinds: &mut [u8], args: &[Value]) {
@@ -612,16 +869,18 @@ impl Frame {
         max_locals: u16,
         args: &[Value],
     ) -> Self {
-        let (locals, local_kinds, eff_max_locals) = init_locals(max_locals, args);
+        let (locals, local_kinds, eff_max_locals) =
+            init_locals_from_parts(max_locals, args, tls_pop_locals());
         let is_jdk = class_disables_interp_fast_path(&*class_name);
+        let code = padded_bytecode_for_method(class_id, &method_name, &method_descriptor, &code);
         Self {
             class_id,
             pc: 0,
             last_instr_pc: 0,
             locals,
             local_kinds,
-            stack: ValueStack::new((max_stack as usize).max(16) + 8),
-            code: padded_bytecode(&code),
+            stack: value_stack_from_tls_pool((max_stack as usize).max(16) + 8),
+            code,
             max_stack,
             max_locals: eff_max_locals,
             inner: FrameInner::Owned {
@@ -684,7 +943,8 @@ impl Frame {
              bytes (use `padded_bytecode()` on raw classfile bytes). len={}",
             code.len(),
         );
-        let (locals, local_kinds, eff_max_locals) = init_locals(max_locals, args);
+        let (locals, local_kinds, eff_max_locals) =
+            init_locals_from_parts(max_locals, args, tls_pop_locals());
         let is_jdk = class_disables_interp_fast_path(&*class_name);
         Self {
             class_id,
@@ -692,7 +952,7 @@ impl Frame {
             last_instr_pc: 0,
             locals,
             local_kinds,
-            stack: ValueStack::new((max_stack as usize).max(16) + 8),
+            stack: value_stack_from_tls_pool((max_stack as usize).max(16) + 8),
             code,
             max_stack,
             max_locals: eff_max_locals,
@@ -1687,6 +1947,399 @@ impl Frame {
         self.stack
             .dbg_locate_addr(addr)
             .map(|s| format!("operand-{s}"))
+    }
+}
+
+// ===========================================================================
+// FrameStack — the Java call stack with STABLE frame addresses
+// ===========================================================================
+
+/// Frames reserved the first time a thread pushes anything.
+///
+/// Sized so that essentially every real Java stack fits without a single
+/// relocation, while costing a bounded amount for a thread that only ever runs
+/// a shallow stack (`256 * size_of::<Frame>()`, a few tens of KiB) — and
+/// nothing at all for a thread that never executes bytecode, since
+/// [`FrameStack::new`] does not allocate.
+pub const FRAME_STACK_INITIAL_STABLE_CAP: usize = 256;
+
+/// The Java call stack of one thread: `Vec<Frame>` semantics, plus an explicit
+/// **address-stability contract**.
+///
+/// # Why this type exists
+///
+/// The backing store used to be a plain `Vec<Frame>`. Because `Vec::push`
+/// reallocates when it runs out of capacity — moving *every* live frame — no
+/// `&mut Frame` (nor any raw `*mut Frame`) could be held across a call. The
+/// interpreter therefore had to re-index `thread.frames[frame_idx]` on every
+/// single access: 622 occurrences in `runtime/interpreter.rs`, six of them in
+/// the one dispatch site that executes a single bytecode. Each is a bounds
+/// check plus an `imul` by `size_of::<Frame>()` (which is not a power of two)
+/// plus a pointer chase.
+///
+/// `FrameStack` makes it possible to hoist that: capacity is reserved in
+/// advance and growth is an explicit, observable event.
+///
+/// # Address-stability contract
+///
+/// * A frame's address never changes while it is on the stack **unless** the
+///   backing buffer grows.
+/// * A growth is the *only* thing that moves frames, it happens only inside
+///   [`FrameStack::reserve_stable`] (which [`FrameStack::push`] calls), and it
+///   always increments [`FrameStack::reloc_epoch`].
+/// * `reserve_stable(n)` guarantees the next `n` pushes cannot grow, hence
+///   cannot move anything. [`FrameStack::stable_headroom`] reports how many
+///   pushes are currently guaranteed relocation-free.
+/// * Popping never moves a frame; neither does [`FrameStack::truncate`].
+///
+/// So the pattern the interpreter should adopt is:
+///
+/// ```ignore
+/// thread.frames.reserve_stable(1);      // next push cannot relocate
+/// let epoch = thread.frames.reloc_epoch();
+/// let f: *mut Frame = thread.frames.frame_ptr(frame_idx);
+/// // … push a callee frame, run it, pop it …
+/// debug_assert_eq!(epoch, thread.frames.reloc_epoch());
+/// let f: &mut Frame = unsafe { &mut *f };   // still valid
+/// ```
+///
+/// # Aliasing rules for the raw-pointer API
+///
+/// Address stability is *not* the same as aliasing permission. While a
+/// `*mut Frame` obtained from [`FrameStack::frame_ptr`] is in use:
+///
+/// 1. No `&Frame` / `&mut Frame` to the *same* frame may be live — that
+///    includes `thread.frames[idx]`, `.last()`, `.iter()`, and the `&[Frame]`
+///    view produced by `Deref` (so no `capture_full_trace(&thread.frames)`
+///    while a frame reference is held). Other frames are unaffected.
+/// 2. The pointer must be re-derived (`frame_ptr`) after any `&mut` reborrow
+///    of the `FrameStack` itself, for strict provenance. The *address* is
+///    unchanged, so the re-derivation is one load plus one add and still
+///    removes the bounds check and the `imul`; caching it across a whole
+///    dispatch iteration is the win.
+/// 3. `reloc_epoch()` must be unchanged since the pointer was taken.
+/// 4. The frame must not have been popped (`idx < len()`).
+///
+/// # Drop-in surface
+///
+/// Every method the rest of the VM already calls on `thread.frames` is
+/// provided inherently (`len`, `is_empty`, `iter`, `iter_mut`, `push`, `pop`,
+/// `last`, `last_mut`, `get`, `get_mut`, `truncate`, `clear`, `insert`), plus
+/// `Index`/`IndexMut` over any slice index, `Deref`/`DerefMut` to `[Frame]`
+/// (so `&thread.frames` still coerces to `&[Frame]` for
+/// `stackwalker::capture_full_trace`), and `IntoIterator` for `&`/`&mut`
+/// (so `for f in &thread.frames` keeps working).
+pub struct FrameStack {
+    /// Backing storage. Never reallocated except through `grow_for`, which
+    /// bumps `reloc_epoch`.
+    buf: Vec<Frame>,
+    /// Incremented every time the backing buffer is reallocated with live
+    /// frames in it — i.e. every time frame addresses change. Wrapping is
+    /// harmless: consumers only ever compare for equality across a short
+    /// window, and a wrap needs 2^32 relocations.
+    reloc_epoch: u32,
+}
+
+impl FrameStack {
+    /// An empty stack that has not allocated. Matches the old
+    /// `frames: Vec::new()` cost for threads that never run bytecode.
+    pub const fn new() -> Self {
+        Self {
+            buf: Vec::new(),
+            reloc_epoch: 0,
+        }
+    }
+
+    // ── Address-stability API (the point of this type) ──────────────────
+
+    /// Relocation generation. Any cached `*mut Frame` is invalidated when this
+    /// changes; nothing else invalidates it except popping the frame.
+    #[inline(always)]
+    pub fn reloc_epoch(&self) -> u32 {
+        self.reloc_epoch
+    }
+
+    /// How many more frames can be pushed with **no** frame moving.
+    #[inline(always)]
+    pub fn stable_headroom(&self) -> usize {
+        self.buf.capacity() - self.buf.len()
+    }
+
+    /// Guarantee that the next `additional` pushes will not move any frame.
+    ///
+    /// If a growth is required it happens *now* (bumping
+    /// [`Self::reloc_epoch`]) rather than in the middle of a push, which is
+    /// what lets a caller take a frame pointer *after* this call and keep it
+    /// across the pushes.
+    #[inline(always)]
+    pub fn reserve_stable(&mut self, additional: usize) {
+        if self.buf.len().saturating_add(additional) > self.buf.capacity() {
+            self.grow_for(additional);
+        }
+    }
+
+    /// Grow the backing buffer. Cold: after the initial reservation this runs
+    /// at most a handful of times over a thread's entire life (the capacity
+    /// doubles), and never at all for a stack that stays under
+    /// [`FRAME_STACK_INITIAL_STABLE_CAP`].
+    #[cold]
+    #[inline(never)]
+    fn grow_for(&mut self, additional: usize) {
+        let len = self.buf.len();
+        let cap = self.buf.capacity();
+        let needed = len.saturating_add(additional);
+        let target = if cap == 0 {
+            // No frames exist yet, so nothing can move: no epoch bump.
+            needed.max(FRAME_STACK_INITIAL_STABLE_CAP)
+        } else {
+            // Live frames are about to be memcpy'd to a new allocation.
+            self.reloc_epoch = self.reloc_epoch.wrapping_add(1);
+            needed.max(cap.saturating_mul(2))
+        };
+        self.buf.reserve_exact(target - len);
+    }
+
+    /// Raw pointer to frame `idx`.
+    ///
+    /// Returns a null pointer for an out-of-range `idx` rather than panicking,
+    /// so a caller can check once instead of paying a bounds check per use.
+    ///
+    /// # Safety of the *returned pointer*
+    ///
+    /// Dereferencing it is `unsafe` and subject to the aliasing rules in the
+    /// type-level docs. The pointer itself is always safe to obtain.
+    #[inline(always)]
+    pub fn frame_ptr(&mut self, idx: usize) -> *mut Frame {
+        if idx < self.buf.len() {
+            // SAFETY: idx is in bounds, so the offset is inside the allocation.
+            unsafe { self.buf.as_mut_ptr().add(idx) }
+        } else {
+            std::ptr::null_mut()
+        }
+    }
+
+    /// Raw pointer to the top frame, or null when the stack is empty.
+    #[inline(always)]
+    pub fn current_ptr(&mut self) -> *mut Frame {
+        let len = self.buf.len();
+        if len == 0 {
+            std::ptr::null_mut()
+        } else {
+            // SAFETY: len > 0, so len - 1 is in bounds.
+            unsafe { self.buf.as_mut_ptr().add(len - 1) }
+        }
+    }
+
+    /// Base pointer of the backing buffer. Only valid up to `len()`.
+    #[inline(always)]
+    pub fn as_mut_ptr(&mut self) -> *mut Frame {
+        self.buf.as_mut_ptr()
+    }
+
+    /// Safe `&mut` to the currently executing (top) frame.
+    ///
+    /// This is the *safe* half of the hoisting API: it borrows the stack, so
+    /// it cannot be held across a push — use [`Self::current_ptr`] plus
+    /// [`Self::reserve_stable`] for that.
+    #[inline(always)]
+    pub fn current_mut(&mut self) -> Option<&mut Frame> {
+        self.buf.last_mut()
+    }
+
+    // ── Drop-in `Vec<Frame>` surface ────────────────────────────────────
+
+    #[inline(always)]
+    pub fn len(&self) -> usize {
+        self.buf.len()
+    }
+
+    #[inline(always)]
+    pub fn is_empty(&self) -> bool {
+        self.buf.is_empty()
+    }
+
+    #[inline(always)]
+    pub fn iter(&self) -> std::slice::Iter<'_, Frame> {
+        self.buf.iter()
+    }
+
+    #[inline(always)]
+    pub fn iter_mut(&mut self) -> std::slice::IterMut<'_, Frame> {
+        self.buf.iter_mut()
+    }
+
+    #[inline(always)]
+    pub fn first(&self) -> Option<&Frame> {
+        self.buf.first()
+    }
+
+    #[inline(always)]
+    pub fn last(&self) -> Option<&Frame> {
+        self.buf.last()
+    }
+
+    #[inline(always)]
+    pub fn last_mut(&mut self) -> Option<&mut Frame> {
+        self.buf.last_mut()
+    }
+
+    #[inline(always)]
+    pub fn get(&self, idx: usize) -> Option<&Frame> {
+        self.buf.get(idx)
+    }
+
+    #[inline(always)]
+    pub fn get_mut(&mut self, idx: usize) -> Option<&mut Frame> {
+        self.buf.get_mut(idx)
+    }
+
+    #[inline(always)]
+    pub fn as_slice(&self) -> &[Frame] {
+        &self.buf
+    }
+
+    #[inline(always)]
+    pub fn as_mut_slice(&mut self) -> &mut [Frame] {
+        &mut self.buf
+    }
+
+    /// Push a frame. Existing frames keep their addresses unless this call has
+    /// to grow the buffer — see [`Self::reserve_stable`] to rule that out.
+    #[inline(always)]
+    pub fn push(&mut self, frame: Frame) {
+        self.reserve_stable(1);
+        self.buf.push(frame);
+    }
+
+    /// Pop the top frame. Never moves any remaining frame.
+    #[inline(always)]
+    pub fn pop(&mut self) -> Option<Frame> {
+        self.buf.pop()
+    }
+
+    /// Drop everything above depth `len`. Never moves any surviving frame.
+    #[inline(always)]
+    pub fn truncate(&mut self, len: usize) {
+        self.buf.truncate(len);
+    }
+
+    /// Drop every frame. Retains the (stable) capacity.
+    #[inline(always)]
+    pub fn clear(&mut self) {
+        self.buf.clear();
+    }
+
+    /// Insert at `idx`, shifting the frames above it.
+    ///
+    /// NOTE: this is the one operation that moves frames *without* a
+    /// relocation-epoch bump, because the buffer itself does not move — the
+    /// contents shift. It exists only for `Vec` parity; the Java call stack is
+    /// strictly LIFO and nothing in the VM currently uses it. Any future
+    /// caller must invalidate its own frame pointers.
+    #[inline]
+    pub fn insert(&mut self, idx: usize, frame: Frame) {
+        self.reserve_stable(1);
+        self.buf.insert(idx, frame);
+    }
+}
+
+impl Default for FrameStack {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Debug for FrameStack {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FrameStack")
+            .field("depth", &self.buf.len())
+            .field("stable_capacity", &self.buf.capacity())
+            .field("reloc_epoch", &self.reloc_epoch)
+            .finish()
+    }
+}
+
+impl std::ops::Deref for FrameStack {
+    type Target = [Frame];
+    #[inline(always)]
+    fn deref(&self) -> &[Frame] {
+        &self.buf
+    }
+}
+
+impl std::ops::DerefMut for FrameStack {
+    #[inline(always)]
+    fn deref_mut(&mut self) -> &mut [Frame] {
+        &mut self.buf
+    }
+}
+
+impl<I: std::slice::SliceIndex<[Frame]>> std::ops::Index<I> for FrameStack {
+    type Output = I::Output;
+    #[inline(always)]
+    fn index(&self, index: I) -> &Self::Output {
+        std::ops::Index::index(&*self.buf, index)
+    }
+}
+
+impl<I: std::slice::SliceIndex<[Frame]>> std::ops::IndexMut<I> for FrameStack {
+    #[inline(always)]
+    fn index_mut(&mut self, index: I) -> &mut Self::Output {
+        std::ops::IndexMut::index_mut(&mut *self.buf, index)
+    }
+}
+
+impl<'a> IntoIterator for &'a FrameStack {
+    type Item = &'a Frame;
+    type IntoIter = std::slice::Iter<'a, Frame>;
+    #[inline(always)]
+    fn into_iter(self) -> Self::IntoIter {
+        self.buf.iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a mut FrameStack {
+    type Item = &'a mut Frame;
+    type IntoIter = std::slice::IterMut<'a, Frame>;
+    #[inline(always)]
+    fn into_iter(self) -> Self::IntoIter {
+        self.buf.iter_mut()
+    }
+}
+
+impl IntoIterator for FrameStack {
+    type Item = Frame;
+    type IntoIter = std::vec::IntoIter<Frame>;
+    #[inline(always)]
+    fn into_iter(self) -> Self::IntoIter {
+        self.buf.into_iter()
+    }
+}
+
+impl FromIterator<Frame> for FrameStack {
+    fn from_iter<T: IntoIterator<Item = Frame>>(iter: T) -> Self {
+        Self {
+            buf: iter.into_iter().collect(),
+            reloc_epoch: 0,
+        }
+    }
+}
+
+impl From<Vec<Frame>> for FrameStack {
+    #[inline]
+    fn from(buf: Vec<Frame>) -> Self {
+        Self {
+            buf,
+            reloc_epoch: 0,
+        }
+    }
+}
+
+impl From<FrameStack> for Vec<Frame> {
+    #[inline]
+    fn from(fs: FrameStack) -> Vec<Frame> {
+        fs.buf
     }
 }
 
@@ -2694,5 +3347,398 @@ mod tests {
 
         assert_eq!(frame.backward_count, 0);
         assert_eq!(frame.osr_attempt_counts, vec![(4, 2)]);
+    }
+
+    // ===================================================================
+    // FrameStack — address stability
+    // ===================================================================
+
+    fn test_frame(name: &str, max_locals: u16) -> Frame {
+        Frame::new(
+            ClassId::new(0),
+            "Test".to_string(),
+            name.to_string(),
+            "()V".to_string(),
+            None,
+            vec![0xb1],
+            vec![],
+            2,
+            max_locals,
+            &[],
+        )
+    }
+
+    /// The core guarantee: after `reserve_stable(n)`, `n` pushes move nothing.
+    /// This is what lets the interpreter hoist a `*mut Frame` across the
+    /// dispatch loop instead of re-indexing `thread.frames[frame_idx]`.
+    #[test]
+    fn frame_addresses_are_stable_across_a_reserved_deep_push_sequence() {
+        const DEPTH: usize = 4096;
+        let mut frames = FrameStack::new();
+        frames.reserve_stable(DEPTH);
+        let epoch_after_reserve = frames.reloc_epoch();
+        assert!(frames.stable_headroom() >= DEPTH);
+
+        let mut addrs = Vec::with_capacity(DEPTH);
+        for i in 0..DEPTH {
+            frames.push(test_frame("deep", 1));
+            addrs.push(&frames[i] as *const Frame);
+            // Nothing already on the stack may have moved.
+            assert_eq!(
+                frames.reloc_epoch(),
+                epoch_after_reserve,
+                "push #{i} relocated despite reserve_stable({DEPTH})"
+            );
+        }
+
+        for (i, &expected) in addrs.iter().enumerate() {
+            assert_eq!(
+                &frames[i] as *const Frame,
+                expected,
+                "frame {i} moved during a reserved push sequence"
+            );
+        }
+
+        // Popping never moves a survivor either.
+        for _ in 0..DEPTH / 2 {
+            frames.pop();
+        }
+        for (i, &expected) in addrs.iter().enumerate().take(DEPTH / 2) {
+            assert_eq!(
+                &frames[i] as *const Frame,
+                expected,
+                "frame {i} moved during pops"
+            );
+        }
+    }
+
+    /// The raw-pointer API must observe the same address as the safe one, and
+    /// stay valid across pushes *and* pops of frames above it.
+    #[test]
+    fn frame_ptr_stays_valid_across_pushes_and_pops() {
+        let mut frames = FrameStack::new();
+        frames.reserve_stable(64);
+        frames.push(test_frame("bottom", 3));
+
+        let epoch = frames.reloc_epoch();
+        let bottom = frames.frame_ptr(0);
+        assert!(!bottom.is_null());
+        assert_eq!(bottom as *const Frame, &frames[0] as *const Frame);
+        assert_eq!(frames.current_ptr(), bottom, "depth 1: top == bottom");
+
+        // SAFETY: index 0 is live, epoch unchanged, no other reference to it.
+        unsafe { (*bottom).pc = 0x1234 };
+
+        for _ in 0..48 {
+            frames.push(test_frame("callee", 1));
+        }
+        assert_eq!(frames.reloc_epoch(), epoch, "reserved pushes must not grow");
+        while frames.len() > 1 {
+            frames.pop();
+        }
+
+        assert_eq!(frames.frame_ptr(0), bottom, "bottom frame moved");
+        // SAFETY: same conditions as above.
+        assert_eq!(unsafe { (*bottom).pc }, 0x1234, "bottom frame was clobbered");
+
+        // Out of range yields null rather than panicking.
+        assert!(frames.frame_ptr(1).is_null());
+        frames.pop();
+        assert!(frames.current_ptr().is_null());
+    }
+
+    /// Growth is the ONLY thing that moves frames, and it is always announced
+    /// via `reloc_epoch`.
+    #[test]
+    fn growth_is_the_only_relocation_and_always_bumps_the_epoch() {
+        let mut frames = FrameStack::new();
+        assert_eq!(frames.reloc_epoch(), 0);
+
+        // First push allocates, but there is nothing to move → no bump.
+        frames.push(test_frame("first", 1));
+        assert_eq!(frames.reloc_epoch(), 0, "initial reservation moved nothing");
+        assert!(frames.stable_headroom() >= FRAME_STACK_INITIAL_STABLE_CAP - 1);
+
+        // Fill exactly to capacity: still no relocation.
+        while frames.stable_headroom() > 0 {
+            frames.push(test_frame("fill", 1));
+        }
+        assert_eq!(frames.reloc_epoch(), 0);
+        let before = &frames[0] as *const Frame;
+
+        // The next push must grow, which must bump the epoch.
+        frames.push(test_frame("overflow", 1));
+        assert_eq!(frames.reloc_epoch(), 1, "growth must bump reloc_epoch");
+        // Capacity at least doubled, so a long run of pushes is stable again.
+        assert!(frames.stable_headroom() >= FRAME_STACK_INITIAL_STABLE_CAP - 1);
+
+        // (The old address is stale by construction — that is exactly what the
+        // epoch bump reports. We only assert the epoch, never dereference
+        // `before`.)
+        let _ = before;
+
+        // truncate/clear keep the (now larger) stable capacity and move nothing.
+        let cap = frames.stable_headroom() + frames.len();
+        frames.truncate(10);
+        assert_eq!(frames.reloc_epoch(), 1);
+        assert_eq!(frames.stable_headroom() + frames.len(), cap);
+        frames.clear();
+        assert!(frames.is_empty());
+        assert_eq!(frames.stable_headroom(), cap);
+    }
+
+    /// The drop-in surface the rest of the VM depends on (`Deref` to
+    /// `&[Frame]` for `stackwalker::capture_full_trace`, iteration by
+    /// reference, `Index`, `last`/`get`).
+    #[test]
+    fn frame_stack_is_a_drop_in_for_vec_frame() {
+        let mut frames = FrameStack::new();
+        for i in 0..4 {
+            frames.push(test_frame(&format!("m{i}"), 1));
+        }
+
+        // Deref to a slice — what `capture_full_trace(&thread.frames)` needs.
+        fn takes_slice(f: &[Frame]) -> usize {
+            f.len()
+        }
+        assert_eq!(takes_slice(&frames), 4);
+        assert_eq!(frames[..2].len(), 2);
+
+        // Iteration in both directions, by shared and mutable reference.
+        assert_eq!(frames.iter().count(), 4);
+        assert_eq!(
+            frames.iter().enumerate().rev().take(2).count(),
+            2,
+            "iter() must be DoubleEnded + ExactSize"
+        );
+        assert!(frames.iter().any(|f| f.method_name() == "m3"));
+        for f in &frames {
+            assert_eq!(f.class_name(), "Test");
+        }
+        for f in &mut frames {
+            f.pc = 7;
+        }
+        assert!(frames.iter().all(|f| f.pc == 7));
+
+        assert_eq!(frames.last().map(|f| f.method_name()), Some("m3"));
+        frames.last_mut().expect("non-empty").pc = 9;
+        assert_eq!(frames[3].pc, 9);
+        assert!(frames.get(9).is_none());
+        assert_eq!(frames.get_mut(0).map(|f| f.pc), Some(7));
+        assert_eq!(
+            frames.pop().map(|f| f.method_name().to_string()),
+            Some("m3".to_string())
+        );
+        assert_eq!(frames.len(), 3);
+    }
+
+    // ===================================================================
+    // Per-OS-thread SoA pool
+    // ===================================================================
+
+    /// A recycled buffer pair must be picked up by the non-pooled constructors
+    /// and must produce a frame indistinguishable from a freshly allocated one
+    /// — in particular with no stale locals and no stale kind marks.
+    #[test]
+    fn tls_soa_pool_is_reused_and_leaves_no_stale_state() {
+        tls_soa_pool_clear();
+        assert_eq!(tls_soa_pool_depths(), (0, 0));
+
+        // Dirty a frame, then offer its buffers to the pool.
+        let mut dirty = test_frame("dirty", 4);
+        dirty.set_local(0, Value::Long(-1));
+        dirty.set_local(2, Value::Double(2.5));
+        dirty.stack.push(Value::Long(i64::MIN)).expect("push");
+        let (lv, lt, sv, st) = dirty.take_pool_parts();
+        offer_frame_parts_to_tls_pool(lv, lt, sv, st);
+        assert_eq!(
+            tls_soa_pool_depths(),
+            (1, 1),
+            "recycled buffers were not pooled"
+        );
+
+        // The next non-pooled construction must drain the pool …
+        let reused = test_frame("reused", 4);
+        assert_eq!(
+            tls_soa_pool_depths(),
+            (0, 0),
+            "pooled buffers were not reused by Frame::new"
+        );
+
+        // … and must look exactly like a fresh frame.
+        assert_eq!(reused.stack.len(), 0, "recycled operand stack not empty");
+        for i in 0u16..4 {
+            assert_eq!(
+                reused.get_local(i),
+                Value::Uninitialized,
+                "recycled local {i} kept stale content"
+            );
+        }
+        tls_soa_pool_clear();
+    }
+
+    /// A pooled frame must be byte-for-byte equivalent to an unpooled one —
+    /// same locals, same argument copy-in, same operand-stack capacity.
+    #[test]
+    fn pooled_and_unpooled_frames_are_equivalent() {
+        let args = [Value::Int(11), Value::Long(-7), Value::Object(None)];
+
+        tls_soa_pool_clear();
+        let fresh = Frame::new(
+            ClassId::new(5),
+            "Eq".to_string(),
+            "m".to_string(),
+            "(IJLjava/lang/Object;)V".to_string(),
+            None,
+            vec![0xb1],
+            vec![],
+            3,
+            6,
+            &args,
+        );
+
+        // Prime the pool with a dirty buffer pair, then build the same frame.
+        let mut dirty = test_frame("dirty", 6);
+        dirty.set_local(0, Value::Long(i64::MIN));
+        dirty.set_local(1, Value::Double(-1.0));
+        let (lv, lt, sv, st) = dirty.take_pool_parts();
+        offer_frame_parts_to_tls_pool(lv, lt, sv, st);
+        let pooled = Frame::new(
+            ClassId::new(5),
+            "Eq".to_string(),
+            "m".to_string(),
+            "(IJLjava/lang/Object;)V".to_string(),
+            None,
+            vec![0xb1],
+            vec![],
+            3,
+            6,
+            &args,
+        );
+
+        assert_eq!(pooled.max_locals, fresh.max_locals);
+        for i in 0u16..fresh.max_locals {
+            assert_eq!(
+                pooled.get_local(i),
+                fresh.get_local(i),
+                "pooled local {i} differs from the unpooled frame"
+            );
+        }
+        assert_eq!(pooled.stack.len(), fresh.stack.len());
+        tls_soa_pool_clear();
+    }
+
+    /// Oversized buffers must not be pinned for the lifetime of the thread.
+    #[test]
+    fn tls_soa_pool_declines_oversized_buffers() {
+        tls_soa_pool_clear();
+        let huge = vec![0u64; TLS_SOA_MAX_RETAINED_SLOTS + 1];
+        offer_frame_parts_to_tls_pool(huge, Vec::new(), Vec::new(), Vec::new());
+        assert_eq!(
+            tls_soa_pool_depths(),
+            (0, 1),
+            "oversized locals buffer must be dropped; the small stack half is \
+             still poolable"
+        );
+        tls_soa_pool_clear();
+    }
+
+    /// The pool must saturate rather than grow without bound.
+    #[test]
+    fn tls_soa_pool_is_capped() {
+        tls_soa_pool_clear();
+        for _ in 0..(TLS_SOA_POOL_CAP * 2) {
+            offer_frame_parts_to_tls_pool(Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        }
+        assert_eq!(
+            tls_soa_pool_depths(),
+            (TLS_SOA_POOL_CAP, TLS_SOA_POOL_CAP),
+            "TLS SoA pool exceeded its cap"
+        );
+        tls_soa_pool_clear();
+    }
+
+    // ===================================================================
+    // Per-method padded-bytecode memo
+    // ===================================================================
+
+    #[test]
+    fn padded_bytecode_memo_returns_the_same_arc_for_the_same_method() {
+        let code = vec![0x1a, 0x04, 0x60, 0xac];
+        let a = padded_bytecode_for_method(ClassId::new(4242), "memoA", "()I", &code);
+        let b = padded_bytecode_for_method(ClassId::new(4242), "memoA", "()I", &code);
+        assert!(Arc::ptr_eq(&a, &b), "identical method must reuse the Arc");
+        assert_eq!(&a[..code.len()], &code[..]);
+        assert_eq!(a.len(), code.len() + 2);
+        assert_eq!(a[code.len()], 0);
+        assert_eq!(a[code.len() + 1], 0);
+    }
+
+    /// Distinct methods must NEVER share an Arc even when their bodies are
+    /// byte-identical — `local_liveness.rs` keys its per-method table on
+    /// `Arc::as_ptr(code)` and computes it from the method's exception table,
+    /// which is not part of the bytes.
+    #[test]
+    fn padded_bytecode_memo_never_merges_distinct_methods() {
+        let code = vec![0xb1];
+        let a = padded_bytecode_for_method(ClassId::new(7), "same", "()V", &code);
+        let other_name = padded_bytecode_for_method(ClassId::new(7), "different", "()V", &code);
+        let other_desc = padded_bytecode_for_method(ClassId::new(7), "same", "(I)V", &code);
+        let other_class = padded_bytecode_for_method(ClassId::new(8), "same", "()V", &code);
+        assert!(!Arc::ptr_eq(&a, &other_name));
+        assert!(!Arc::ptr_eq(&a, &other_desc));
+        assert!(!Arc::ptr_eq(&a, &other_class));
+    }
+
+    /// Redefinition rewrites the body under an unchanged identity; the memo
+    /// must notice and mint a fresh Arc rather than serve the old bytes.
+    #[test]
+    fn padded_bytecode_memo_detects_a_redefined_body() {
+        let v1 = vec![0xb1];
+        let v2 = vec![0x04, 0xac];
+        let a = padded_bytecode_for_method(ClassId::new(99), "redef", "()V", &v1);
+        let b = padded_bytecode_for_method(ClassId::new(99), "redef", "()V", &v2);
+        assert!(!Arc::ptr_eq(&a, &b));
+        assert_eq!(&b[..v2.len()], &v2[..]);
+        // The old Arc is untouched — existing frames keep executing old code.
+        assert_eq!(&a[..v1.len()], &v1[..]);
+    }
+
+    /// `Frame::new` goes through the memo, so two frames for the same method
+    /// share one bytecode allocation instead of copying the body per frame.
+    #[test]
+    fn frame_new_shares_bytecode_across_frames_of_the_same_method() {
+        let f1 = Frame::new(
+            ClassId::new(31337),
+            "Shared".to_string(),
+            "body".to_string(),
+            "()V".to_string(),
+            None,
+            vec![0x03, 0xac],
+            vec![],
+            1,
+            1,
+            &[],
+        );
+        let f2 = Frame::new(
+            ClassId::new(31337),
+            "Shared".to_string(),
+            "body".to_string(),
+            "()V".to_string(),
+            None,
+            vec![0x03, 0xac],
+            vec![],
+            1,
+            1,
+            &[],
+        );
+        assert!(
+            Arc::ptr_eq(&f1.code, &f2.code),
+            "per-frame bytecode copy was not eliminated"
+        );
+        // Padding contract still holds (the hot loop reads code[pc+1..2]).
+        assert!(f1.code.len() >= 2);
+        assert_eq!(f1.code[f1.code.len() - 1], 0);
+        assert_eq!(f1.code[f1.code.len() - 2], 0);
     }
 }
