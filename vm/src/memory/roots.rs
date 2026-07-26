@@ -498,16 +498,32 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     // coverage, we deliberately re-enable the conservative scan and tell the
     // collector to use the non-moving sweep for this cycle. On any non-moving
     // path this scan remains the authoritative JIT root set.
+    // arch-2026-07-26 (`moving-young-precise-roots`): `moving_young_enabled()`
+    // is a delegation to the CODEGEN-side gate, and reading it here also
+    // republishes that decision to the GC crate (which cannot call into the JIT
+    // crate). Because `collect_roots` is on the path of every collection, the
+    // collector can never decide to relocate against a gate the codegen
+    // disagrees with. See `conservative_roots::moving_young_enabled`.
     let moving_young = crate::jit::conservative_roots::moving_young_enabled();
+    crate::jit::conservative_roots::publish_moving_young_gate();
     let moving_young_osr_fallback =
         moving_young && crate::jit::conservative_roots::moving_young_osr_shadow_fallback_needed();
     if moving_young_osr_fallback {
         cratonvm_gc::gc_quiescence::set_force_non_moving_jit_roots();
-        cratonvm_gc::gc_quiescence::mark_moving_young_coverage_incomplete();
+        cratonvm_gc::gc_quiescence::mark_moving_young_coverage_incomplete_because(
+            cratonvm_gc::gc_quiescence::incomplete_reason::OSR_SHADOW,
+        );
     }
+    // COLLECTION-authoritative refresh, not the per-thread one: this call site
+    // is the one that decides whether the collector may relocate, so it must
+    // also account for JIT frames owned by OTHER threads (whose registers and
+    // frame slots this collection cannot rewrite). See
+    // `refresh_moving_young_coverage_for_collection`. The per-thread variant
+    // remains correct — and remains used — at each mutator's root-snapshot
+    // deposit, where per-thread scope is exactly the right question.
     let moving_young_precise_only = moving_young
         && !moving_young_osr_fallback
-        && crate::jit::conservative_roots::refresh_moving_young_coverage_for_current_thread()
+        && crate::jit::conservative_roots::refresh_moving_young_coverage_for_collection()
         && !cratonvm_gc::gc_quiescence::moving_young_coverage_incomplete();
     if !moving_young_precise_only {
         crate::jit::conservative_roots::scan_active_jit_frames(&shared.heap, &mut roots);
