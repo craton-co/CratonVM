@@ -937,6 +937,24 @@ fn should_skip_jit_internal(
     // AssertJ checks repeatedly compile patterns, and interpreting
     // Pattern.compile turned that finite check into a watchdog timeout while
     // its JIT path was stable — moot now that java.util is JIT-eligible again.)
+    //
+    // 2026-07-26 re-test. The perf framing above is stale (the Hibernate
+    // longtail it cites was root-caused to the executor bridge on 2026-07-15),
+    // and so is the correctness reason the 2026-07-25 sweep replaced it with: a
+    // systemic `Schema  not found` metadata corruption that turned out to be
+    // two general x64 defects, both since fixed (`13055f75c`) — the compact
+    // `String.coder`/`hash` offsets and a reload-elision mirror leaking across
+    // a control-flow join. That cluster is extinct (0 of 218 classes).
+    //
+    // The ban nevertheless STAYS, on fresh evidence: a same-binary 218-class
+    // A/B is PASS 158 with it and PASS 149 without, and the 9 regressions are
+    // enumerated with per-class signatures in
+    // `docs/known-issues/h2/h2-jitban-schema-not-found-on-reconnect.md`. Two of
+    // them name their mechanism outright (`TestObjectDataType`:
+    // `String cannot be cast to String`; `TestUpgrade`: `NoSuchMethodError` on
+    // an existing `IntArray.checkCapacity()V`) and are the place to start.
+    // The `org/antlr/v4/runtime/` half remains untested in isolation — the H2
+    // suite never exercises it.
     if (class_name.starts_with("org/h2/") && !package_allowed("org/h2/", allow_packages))
         || (class_name.starts_with("org/antlr/v4/runtime/")
             && !package_allowed("org/antlr/v4/runtime/", allow_packages))
