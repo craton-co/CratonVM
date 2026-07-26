@@ -8,17 +8,17 @@
 //! an `invokestatic` resolved to an `Arrays.*` intrinsic, then runs the
 //! generated machine code against the JDK-specified reference behaviour.
 //!
-//! Array memory model (`cratonvm_types`): a 40-byte object header with the
+//! Array memory model (`cratonvm_types`): a 32-byte object header with the
 //! i32 element count at offset 12, element data packed at natural width from
-//! offset 40. The tests fabricate that layout in a raw, 8-byte-aligned
-//! `Vec<u8>` — the intrinsics touch only offset 12 (length) and offset 40+
+//! offset 32. The tests fabricate that layout in a raw, 8-byte-aligned
+//! `Vec<u8>` — the intrinsics touch only offset 12 (length) and offset 32+
 //! (data), never the GC mark word, so a real heap allocation is unnecessary.
 
 use cratonvm_jit::x64::{compile, is_jit_compatible};
 use cratonvm_jit_api::JitRuntimeHelpers;
 use std::collections::{HashMap, HashSet};
 
-const HEADER_SIZE: usize = 40;
+const HEADER_SIZE: usize = 32;
 const ARRAY_LENGTH_OFFSET: usize = 12;
 
 /// Runtime helpers for the intrinsic tests. The fill/equals intrinsics emit
@@ -41,7 +41,10 @@ fn arrays_helpers() -> JitRuntimeHelpers {
     // crashing so the call yields the deopt sentinel.
     unsafe extern "C" fn noop_npe_with_action() {}
     let s = stub as *const () as usize;
-    JitRuntimeHelpers {
+    JitRuntimeHelpers { safepoint_flag_addr: 0, safepoint_slow_path: 0,
+        jit_card_table_addr: 0,
+        jit_card_old_base: 0,
+        jit_card_old_end: 0,
         newarray: s,
         new_object: s,
         anewarray_object: s,
@@ -97,8 +100,8 @@ fn arrays_helpers() -> JitRuntimeHelpers {
 }
 
 /// A fabricated primitive array: an 8-byte-aligned buffer laid out exactly
-/// like a `cratonvm` array object (40-byte header, length at +12, data
-/// at +40). Kept alive by holding the backing `Vec`.
+/// like a `cratonvm` array object (32-byte header, length at +12, data
+/// at +32). Kept alive by holding the backing `Vec`.
 struct FakeArray {
     buf: Vec<u8>,
 }

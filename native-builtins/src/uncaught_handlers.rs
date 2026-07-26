@@ -134,7 +134,7 @@ pub fn register_uncaught_handler_natives(r: &mut NativeMethodRegistry) {
         "setUncaughtExceptionHandler",
         "(Ljava/lang/Thread$UncaughtExceptionHandler;)V",
         |ctx, args| {
-            if std::env::var_os("CRATONVM_UEH_DEBUG").is_some() {
+            if crate::nbflags().ueh_debug {
                 eprintln!(
                     "[UEH] setUncaughtExceptionHandler invoked, args.len={}",
                     args.len()

@@ -819,7 +819,7 @@ mod tests {
         // + fixed_offset_rules are the pure, ctx-free half of the fix that
         // `get_zone_rules` delegates to once the tzdb catalog lookup misses);
         // the full ctx-driven path is covered by the Java-level repro in
-        // docs/known-issues/h2-suite-bugs/bug-h2-suite-residual-fail-triage.md.
+        // docs/known-issues/h2/bug-h2-suite-residual-fail-triage.md.
         let rules = parse_fixed_gmt_offset_seconds("GMT+01:00")
             .map(fixed_offset_rules)
             .expect("GMT+01:00 must resolve to a fixed-offset rule set");

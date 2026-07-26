@@ -881,6 +881,24 @@ impl TieredCompilationManager {
         }
     }
 
+    /// Remove queued and historical tiering state for an unloaded class.
+    pub fn invalidate_class(&self, class_name: &str) {
+        self.core
+            .methods
+            .lock()
+            .retain(|key, _| key.class_name != class_name);
+        let mut queue = self.core.queue.lock();
+        queue
+            .high
+            .retain(|task| task.method_key.class_name != class_name);
+        queue
+            .normal
+            .retain(|task| task.method_key.class_name != class_name);
+        queue
+            .low
+            .retain(|task| task.method_key.class_name != class_name);
+    }
+
     /// Create a new manager with the default policy.
     pub fn with_default_policy() -> Self {
         Self::new(CompilationPolicy::default())

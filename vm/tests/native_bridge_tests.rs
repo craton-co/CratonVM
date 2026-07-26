@@ -195,7 +195,7 @@ mod print_long_compact_tag_regression {
     fn run_print(method: &str, arg: Value) -> Vec<String> {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
-        let dummy_ps = shared.heap.alloc_object(ClassId::new(0), 0);
+        let dummy_ps = shared.mem.heap.alloc_object(ClassId::new(0), 0);
         let mut registry = NativeMethodRegistry::new();
         cratonvm_native_builtins::register_essential_natives(&mut registry);
         let callback = registry

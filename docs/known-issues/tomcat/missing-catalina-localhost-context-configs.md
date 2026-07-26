@@ -56,7 +56,7 @@ context rather than a bare directory under `webapps/`. Without these, the
 `manager`/`host-manager` webapps either fail their `StandardContext` startup
 outright, or requests that depend on context-scoped mapping/routing 404.
 The earlier fixture fix in
-`docs/internal/fixed-suite-bugs/tomcat/16-full-suite-6shard-rerun-20260721.md`
+`../../internal/fixed-suite-bugs/tomcat/16-full-suite-6shard-rerun-20260721.md`
 only copied the top-level `conf/*.xml` files (`server.xml`, `web.xml`, etc.),
 not this per-`Host` subdirectory.
 

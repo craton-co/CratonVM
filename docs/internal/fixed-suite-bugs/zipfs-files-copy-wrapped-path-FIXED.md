@@ -1,7 +1,7 @@
 # zipfs `Files.copy()` extraction (Quarkus `ZipUtils.unzip`) — two stacked path-layout bugs — FIXED (2026-07-15)
 
 Status: FIXED, merged to `dev` (`90cc7e73`, `882395cd`). Closes item 3 of
-`docs/known-issues/keycloak/welcomepagetest-stream-spliterator-zipcopy-residuals-20260715.md`
+`../../known-issues/keycloak/welcomepagetest-stream-spliterator-zipcopy-residuals-20260715.md`
 ("`Files.copy()` from a non-default `FileSystemProvider` path fails — REPRODUCED, NOT ROOT-CAUSED").
 
 ## Summary

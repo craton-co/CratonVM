@@ -184,7 +184,7 @@ pub fn caller_blocks_jit_by_name(
         return false;
     }
     let method_index = {
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         let Some(class) = cm.get_class(class_id) else {
             return false;
         };
@@ -215,7 +215,7 @@ fn compute(shared: &SharedVm, class_id: ClassId, method_index: u16) -> bool {
         return false;
     }
 
-    let cm = shared.class_manager.read();
+    let cm = shared.classes.class_manager.read();
     let Some(class) = cm.get_class(class_id) else {
         return false;
     };

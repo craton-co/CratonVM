@@ -1,0 +1,1760 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
+//! `java.util` collection natives: sequenced collections, NavigableMap/Set, AbstractMap, WeakHashMap, EnumMap/EnumSet, checked wrappers.
+//!
+//! Pure code move out of `phases_late.rs` (no logic, signature or ordering
+//! changes). Every registration call site is untouched and the per-phase
+//! dispatchers stay in the parent module, so the native registration SEQUENCE
+//! is byte-identical to before the split.
+
+use super::*;
+
+// ---------------------------------------------------------------------------
+// Collection extras: IdentityHashMap, Collections.unmodifiableX, etc.
+// ---------------------------------------------------------------------------
+pub(crate) fn register_phase55_collection_extras(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
+    // --- IdentityHashMap (same 3-field layout as HashMap) ---
+    let ihm = "java/util/IdentityHashMap";
+    r.register(ihm, "<init>", "()V", native_al_init_default_for_map);
+    r.register(ihm, "<init>", "(I)V", native_al_init_default_for_map);
+    r.register(ihm, "size", "()I", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        Ok(Some(ctx.get_field(this, 1)))
+    });
+    r.register(ihm, "isEmpty", "()Z", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let sz = ctx.get_field(this, 1).as_int().unwrap_or(0);
+        Ok(Some(Value::Int(if sz == 0 { 1 } else { 0 })))
+    });
+
+    // --- Collections extras (unmodifiable/synchronized already in collections.rs) ---
+    let coll = "java/util/Collections";
+    r.register(
+        coll,
+        "synchronizedList",
+        "(Ljava/util/List;)Ljava/util/List;",
+        crate::native_synchronized_list,
+    );
+    r.register(
+        coll,
+        "synchronizedSet",
+        "(Ljava/util/Set;)Ljava/util/Set;",
+        crate::native_synchronized_set,
+    );
+    r.register(
+        coll,
+        "synchronizedMap",
+        "(Ljava/util/Map;)Ljava/util/Map;",
+        crate::native_synchronized_map,
+    );
+    r.register(
+        coll,
+        "synchronizedCollection",
+        "(Ljava/util/Collection;)Ljava/util/Collection;",
+        crate::native_synchronized_collection,
+    );
+    r.register(
+        coll,
+        "checkedList",
+        "(Ljava/util/List;Ljava/lang/Class;)Ljava/util/List;",
+        |_ctx, args| Ok(Some(args[0])),
+    );
+    r.register(
+        coll,
+        "checkedSet",
+        "(Ljava/util/Set;Ljava/lang/Class;)Ljava/util/Set;",
+        |_ctx, args| Ok(Some(args[0])),
+    );
+    r.register(
+        coll,
+        "checkedMap",
+        "(Ljava/util/Map;Ljava/lang/Class;Ljava/lang/Class;)Ljava/util/Map;",
+        |_ctx, args| Ok(Some(args[0])),
+    );
+    r.register(
+        coll,
+        "singleton",
+        "(Ljava/lang/Object;)Ljava/util/Set;",
+        |ctx, args| {
+            let elem = args[0];
+            // Pin across the set/array allocs below — a moving young GC there
+            // would relocate them (native stale-local family).
+            let elem_pin = pinned_object_value(ctx, elem);
+            let set = alloc_concurrent_synthetic(ctx, "java/util/HashSet", 3);
+            let set_pin = ctx.pin_native_root(set);
+            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 16);
+            let set = ctx.read_native_pin(set_pin, set);
+            let elem = read_pinned_object_value(ctx, elem_pin, elem);
+            ctx.set_field(set, 0, Value::Object(Some(arr)));
+            ctx.set_field(set, 1, Value::Int(0));
+            ctx.set_field(set, 2, Value::Int(16));
+            // Just store element — we'll use the standard HashSet native_set_add internally
+            // But we can't call it directly here. Just allocate and put manually:
+            ctx.set_array_element(arr, 0, elem);
+            ctx.set_field(set, 1, Value::Int(1));
+            ctx.unpin_native_roots(elem_pin.map(|(h, _)| h).unwrap_or(set_pin));
+            Ok(Some(Value::Object(Some(set))))
+        },
+    );
+    r.register(
+        coll,
+        "singletonList",
+        "(Ljava/lang/Object;)Ljava/util/List;",
+        |ctx, args| {
+            let elem = args[0];
+            // Pin across the list/array allocs below — a moving young GC there
+            // would relocate them (native stale-local family).
+            let elem_pin = pinned_object_value(ctx, elem);
+            let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+            let list_pin = ctx.pin_native_root(list);
+            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
+            let list = ctx.read_native_pin(list_pin, list);
+            let elem = read_pinned_object_value(ctx, elem_pin, elem);
+            ctx.set_array_element(arr, 0, elem);
+            ctx.set_field(list, 0, Value::Object(Some(arr)));
+            ctx.set_field(list, 1, Value::Int(1));
+            ctx.unpin_native_roots(elem_pin.map(|(h, _)| h).unwrap_or(list_pin));
+            Ok(Some(Value::Object(Some(list))))
+        },
+    );
+    r.register(
+        coll,
+        "singletonMap",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/util/Map;",
+        |ctx, args| {
+            let key = args[0];
+            let val = args[1];
+            // Pin across the map/array/node allocs below — a moving young GC
+            // there would relocate them (native stale-local family).
+            let key_pin = pinned_object_value(ctx, key);
+            let val_pin = pinned_object_value(ctx, val);
+            let map = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
+            let map_pin = ctx.pin_native_root(map);
+            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 16);
+            let arr_pin = ctx.pin_native_root(arr);
+            let map = ctx.read_native_pin(map_pin, map);
+            ctx.set_field(map, 0, Value::Object(Some(arr)));
+            ctx.set_field(map, 1, Value::Int(0));
+            ctx.set_field(map, 2, Value::Int(16));
+            // Simple: put at bucket 0
+            let node = alloc_concurrent_synthetic(ctx, "java/util/HashMap$Node", 4);
+            let key = read_pinned_object_value(ctx, key_pin, key);
+            let val = read_pinned_object_value(ctx, val_pin, val);
+            let map = ctx.read_native_pin(map_pin, map);
+            let arr = ctx.read_native_pin(arr_pin, arr);
+            ctx.set_field(node, 0, key);
+            ctx.set_field(node, 1, val);
+            ctx.set_field(node, 2, Value::Int(0)); // hash
+            ctx.set_field(node, 3, Value::Object(None)); // next
+            ctx.set_array_element(arr, 0, Value::Object(Some(node)));
+            ctx.set_field(map, 1, Value::Int(1));
+            let first_pin = key_pin
+                .map(|(h, _)| h)
+                .or(val_pin.map(|(h, _)| h))
+                .unwrap_or(map_pin);
+            ctx.unpin_native_roots(first_pin);
+            Ok(Some(Value::Object(Some(map))))
+        },
+    );
+    r.register(
+        coll,
+        "nCopies",
+        "(ILjava/lang/Object;)Ljava/util/List;",
+        |ctx, args| {
+            let n = args[0].as_int().unwrap_or(0) as usize;
+            let elem = args[1];
+            // Pin across the list/array allocs below — a moving young GC there
+            // would relocate them (native stale-local family).
+            let elem_pin = pinned_object_value(ctx, elem);
+            let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+            let list_pin = ctx.pin_native_root(list);
+            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, n);
+            let list = ctx.read_native_pin(list_pin, list);
+            let elem = read_pinned_object_value(ctx, elem_pin, elem);
+            for i in 0..n {
+                ctx.set_array_element(arr, i, elem);
+            }
+            ctx.set_field(list, 0, Value::Object(Some(arr)));
+            ctx.set_field(list, 1, Value::Int(n as i32));
+            ctx.unpin_native_roots(elem_pin.map(|(h, _)| h).unwrap_or(list_pin));
+            Ok(Some(Value::Object(Some(list))))
+        },
+    );
+    r.register(
+        coll,
+        "frequency",
+        "(Ljava/util/Collection;Ljava/lang/Object;)I",
+        |ctx, args| {
+            // Collection is typically an ArrayList with backing array at field 0, size at field 1
+            let col = obj_arg(args, 1)?;
+            let target = args.get(2).copied().unwrap_or(Value::Object(None));
+            let arr_val = ctx.get_field(col, 0);
+            let size = match ctx.get_field(col, 1) {
+                Value::Int(n) => n as usize,
+                _ => 0,
+            };
+            let mut count = 0i32;
+            if let Value::Object(Some(arr)) = arr_val {
+                let len = ctx.array_length(arr).min(size);
+                for i in 0..len {
+                    let elem = ctx.get_array_element(arr, i);
+                    if values_equal(&elem, &target) {
+                        count += 1;
+                    }
+                }
+            }
+            Ok(Some(Value::Int(count)))
+        },
+    );
+    // NOTE: `Collections.disjoint` is deliberately NOT registered as a native.
+    // It used to be stubbed here to always return `1` ("assume disjoint"), which
+    // silently produced wrong answers (e.g. keycloak DisclosureRedListTest:
+    // `Collections.disjoint(redList, {"vct"})` returned true even though both
+    // sets share "vct", so the red-list guard never threw). The real
+    // `java.util.Collections.disjoint` is a small pure-Java method (iterate one
+    // collection, `contains` on the other, with the Set-size optimisation) and
+    // runs correctly on CratonVM, so we let the real bytecode handle it.
+    r.set_category(__prev_cat);
+}
+
+/// Helper to init a map-like object with 3 fields (buckets, size, capacity)
+pub(crate) fn native_al_init_default_for_map(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let cap = 16;
+    // Pin across the array alloc below — a moving young GC there would
+    // relocate `this` (native stale-local family).
+    let this_pin = ctx.pin_native_root(this);
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, cap);
+    let this = ctx.read_native_pin(this_pin, this);
+    ctx.set_field(this, 0, Value::Object(Some(arr)));
+    ctx.set_field(this, 1, Value::Int(0));
+    ctx.set_field(this, 2, Value::Int(cap as i32));
+    ctx.unpin_native_roots(this_pin);
+    Ok(Some(Value::Object(None)))
+}
+
+// =============================================================================
+// AbstractMap expansion — base class methods for Map implementations
+// =============================================================================
+
+pub(crate) fn register_p60_abstract_map(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
+    let am = "java/util/AbstractMap";
+    r.register(am, "isEmpty", "()Z", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let size = match ctx.get_field(this, 1) {
+            Value::Int(v) => v,
+            _ => 0,
+        };
+        Ok(Some(Value::Int(if size == 0 { 1 } else { 0 })))
+    });
+    r.register(am, "containsKey", "(Ljava/lang/Object;)Z", |_ctx, _args| {
+        Ok(Some(Value::Int(0)))
+    });
+    r.register(
+        am,
+        "containsValue",
+        "(Ljava/lang/Object;)Z",
+        |_ctx, _args| Ok(Some(Value::Int(0))),
+    );
+    r.register(am, "toString", "()Ljava/lang/String;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let size = match ctx.get_field(this, 1) {
+            Value::Int(v) => v,
+            _ => 0,
+        };
+        let s = ctx.create_string(&format!("{{size={size}}}"));
+        Ok(Some(Value::Object(Some(s))))
+    });
+    r.register(am, "hashCode", "()I", |_ctx, args| {
+        let this = obj_arg(args, 0)?;
+        Ok(Some(Value::Int(this.as_ptr() as i32)))
+    });
+    r.register(am, "equals", "(Ljava/lang/Object;)Z", |_ctx, args| {
+        let this = obj_arg(args, 0)?;
+        if let Some(Value::Object(Some(other))) = args.get(1) {
+            Ok(Some(Value::Int(if this == *other { 1 } else { 0 })))
+        } else {
+            Ok(Some(Value::Int(0)))
+        }
+    });
+    r.set_category(__prev_cat);
+}
+
+// =============================================================================
+// NavigableMap/NavigableSet completion — floorEntry, ceilingEntry, etc.
+// =============================================================================
+
+pub(crate) fn register_p62_navigable_expansion(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
+    let tm = "java/util/TreeMap";
+    r.register(
+        tm,
+        "floorKey",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+        p62_tm_floor_key,
+    );
+    r.register(
+        tm,
+        "ceilingKey",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+        p62_tm_ceiling_key,
+    );
+    r.register(
+        tm,
+        "lowerKey",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+        p62_tm_lower_key,
+    );
+    r.register(
+        tm,
+        "higherKey",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+        p62_tm_higher_key,
+    );
+    r.register(
+        tm,
+        "floorEntry",
+        "(Ljava/lang/Object;)Ljava/util/Map$Entry;",
+        p62_tm_floor_entry,
+    );
+    r.register(
+        tm,
+        "ceilingEntry",
+        "(Ljava/lang/Object;)Ljava/util/Map$Entry;",
+        p62_tm_ceiling_entry,
+    );
+    r.register(
+        tm,
+        "lowerEntry",
+        "(Ljava/lang/Object;)Ljava/util/Map$Entry;",
+        p62_tm_lower_entry,
+    );
+    r.register(
+        tm,
+        "higherEntry",
+        "(Ljava/lang/Object;)Ljava/util/Map$Entry;",
+        p62_tm_higher_entry,
+    );
+
+    let nm = "java/util/NavigableMap";
+    r.register(
+        nm,
+        "floorKey",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+        p62_tm_floor_key,
+    );
+    r.register(
+        nm,
+        "ceilingKey",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+        p62_tm_ceiling_key,
+    );
+    r.register(
+        nm,
+        "lowerKey",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+        p62_tm_lower_key,
+    );
+    r.register(
+        nm,
+        "higherKey",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+        p62_tm_higher_key,
+    );
+    r.register(
+        nm,
+        "floorEntry",
+        "(Ljava/lang/Object;)Ljava/util/Map$Entry;",
+        p62_tm_floor_entry,
+    );
+    r.register(
+        nm,
+        "ceilingEntry",
+        "(Ljava/lang/Object;)Ljava/util/Map$Entry;",
+        p62_tm_ceiling_entry,
+    );
+    r.register(
+        nm,
+        "lowerEntry",
+        "(Ljava/lang/Object;)Ljava/util/Map$Entry;",
+        p62_tm_lower_entry,
+    );
+    r.register(
+        nm,
+        "higherEntry",
+        "(Ljava/lang/Object;)Ljava/util/Map$Entry;",
+        p62_tm_higher_entry,
+    );
+
+    let ts = "java/util/TreeSet";
+    r.register(
+        ts,
+        "floor",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+        p62_ts_floor,
+    );
+    r.register(
+        ts,
+        "ceiling",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+        p62_ts_ceiling,
+    );
+    r.register(
+        ts,
+        "lower",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+        p62_ts_lower,
+    );
+    r.register(
+        ts,
+        "higher",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+        p62_ts_higher,
+    );
+
+    let ns = "java/util/NavigableSet";
+    r.register(
+        ns,
+        "floor",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+        p62_ts_floor,
+    );
+    r.register(
+        ns,
+        "ceiling",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+        p62_ts_ceiling,
+    );
+    r.register(
+        ns,
+        "lower",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+        p62_ts_lower,
+    );
+    r.register(
+        ns,
+        "higher",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+        p62_ts_higher,
+    );
+    r.set_category(__prev_cat);
+}
+
+// TreeMap navigable helpers — operate on sorted interleaved array [k0,v0,k1,v1,...]
+pub(crate) fn p62_tm_floor_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    let size = match ctx.get_field(this, 1) {
+        Value::Int(v) => v as usize,
+        _ => 0,
+    };
+    if size == 0 {
+        return Ok(Some(Value::Object(None)));
+    }
+    let data = match ctx.get_field(this, 0) {
+        Value::Object(Some(a)) => a,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let mut result = Value::Object(None);
+    for i in 0..size {
+        let k = ctx.get_array_element(data, i * 2);
+        if natural_compare_values(k, key) <= 0 {
+            result = k;
+        } else {
+            break;
+        }
+    }
+    Ok(Some(result))
+}
+
+pub(crate) fn p62_tm_ceiling_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    let size = match ctx.get_field(this, 1) {
+        Value::Int(v) => v as usize,
+        _ => 0,
+    };
+    if size == 0 {
+        return Ok(Some(Value::Object(None)));
+    }
+    let data = match ctx.get_field(this, 0) {
+        Value::Object(Some(a)) => a,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    for i in 0..size {
+        let k = ctx.get_array_element(data, i * 2);
+        if natural_compare_values(k, key) >= 0 {
+            return Ok(Some(k));
+        }
+    }
+    Ok(Some(Value::Object(None)))
+}
+
+pub(crate) fn p62_tm_lower_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    let size = match ctx.get_field(this, 1) {
+        Value::Int(v) => v as usize,
+        _ => 0,
+    };
+    if size == 0 {
+        return Ok(Some(Value::Object(None)));
+    }
+    let data = match ctx.get_field(this, 0) {
+        Value::Object(Some(a)) => a,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let mut result = Value::Object(None);
+    for i in 0..size {
+        let k = ctx.get_array_element(data, i * 2);
+        if natural_compare_values(k, key) < 0 {
+            result = k;
+        } else {
+            break;
+        }
+    }
+    Ok(Some(result))
+}
+
+pub(crate) fn p62_tm_higher_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    let size = match ctx.get_field(this, 1) {
+        Value::Int(v) => v as usize,
+        _ => 0,
+    };
+    if size == 0 {
+        return Ok(Some(Value::Object(None)));
+    }
+    let data = match ctx.get_field(this, 0) {
+        Value::Object(Some(a)) => a,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    for i in 0..size {
+        let k = ctx.get_array_element(data, i * 2);
+        if natural_compare_values(k, key) > 0 {
+            return Ok(Some(k));
+        }
+    }
+    Ok(Some(Value::Object(None)))
+}
+
+// The relative-`*Entry` variants for the p62 TreeMap layout (field0 = sorted
+// key/value array with key at i*2 + value at i*2+1, field1 = size). These
+// mirror the p62 `*Key` scans exactly but return a `Map.Entry` for the
+// resolved slot — needed so that whichever TreeMap impl registers last (this
+// linear-scan one or native-collections' array/fast-mode one) has a layout-
+// consistent `*Entry` alongside its `*Key`.
+
+/// Build a `Map.Entry` for the p62 slot at logical index `idx` (None → null).
+pub(crate) fn p62_tm_entry_at(
+    ctx: &mut dyn NativeContext,
+    data: ObjectRef,
+    idx: Option<usize>,
+) -> Value {
+    match idx {
+        Some(i) => {
+            let k = ctx.get_array_element(data, i * 2);
+            let v = ctx.get_array_element(data, i * 2 + 1);
+            Value::Object(Some(p64_make_entry(ctx, k, v)))
+        }
+        None => Value::Object(None),
+    }
+}
+
+pub(crate) fn p62_tm_floor_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    let size = match ctx.get_field(this, 1) {
+        Value::Int(v) => v as usize,
+        _ => 0,
+    };
+    let data = match ctx.get_field(this, 0) {
+        Value::Object(Some(a)) if size != 0 => a,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let mut found: Option<usize> = None;
+    for i in 0..size {
+        let k = ctx.get_array_element(data, i * 2);
+        if natural_compare_values(k, key) <= 0 {
+            found = Some(i);
+        } else {
+            break;
+        }
+    }
+    Ok(Some(p62_tm_entry_at(ctx, data, found)))
+}
+
+pub(crate) fn p62_tm_ceiling_entry(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    let size = match ctx.get_field(this, 1) {
+        Value::Int(v) => v as usize,
+        _ => 0,
+    };
+    let data = match ctx.get_field(this, 0) {
+        Value::Object(Some(a)) if size != 0 => a,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    for i in 0..size {
+        let k = ctx.get_array_element(data, i * 2);
+        if natural_compare_values(k, key) >= 0 {
+            return Ok(Some(p62_tm_entry_at(ctx, data, Some(i))));
+        }
+    }
+    Ok(Some(Value::Object(None)))
+}
+
+pub(crate) fn p62_tm_lower_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    let size = match ctx.get_field(this, 1) {
+        Value::Int(v) => v as usize,
+        _ => 0,
+    };
+    let data = match ctx.get_field(this, 0) {
+        Value::Object(Some(a)) if size != 0 => a,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let mut found: Option<usize> = None;
+    for i in 0..size {
+        let k = ctx.get_array_element(data, i * 2);
+        if natural_compare_values(k, key) < 0 {
+            found = Some(i);
+        } else {
+            break;
+        }
+    }
+    Ok(Some(p62_tm_entry_at(ctx, data, found)))
+}
+
+pub(crate) fn p62_tm_higher_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    let size = match ctx.get_field(this, 1) {
+        Value::Int(v) => v as usize,
+        _ => 0,
+    };
+    let data = match ctx.get_field(this, 0) {
+        Value::Object(Some(a)) if size != 0 => a,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    for i in 0..size {
+        let k = ctx.get_array_element(data, i * 2);
+        if natural_compare_values(k, key) > 0 {
+            return Ok(Some(p62_tm_entry_at(ctx, data, Some(i))));
+        }
+    }
+    Ok(Some(Value::Object(None)))
+}
+
+// TreeSet navigable helpers — operate on sorted element array
+pub(crate) fn p62_ts_floor(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    let size = match ctx.get_field(this, 1) {
+        Value::Int(v) => v as usize,
+        _ => 0,
+    };
+    if size == 0 {
+        return Ok(Some(Value::Object(None)));
+    }
+    let data = match ctx.get_field(this, 0) {
+        Value::Object(Some(a)) => a,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let mut result = Value::Object(None);
+    for i in 0..size {
+        let elem = ctx.get_array_element(data, i);
+        if natural_compare_values(elem, key) <= 0 {
+            result = elem;
+        } else {
+            break;
+        }
+    }
+    Ok(Some(result))
+}
+
+pub(crate) fn p62_ts_ceiling(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    let size = match ctx.get_field(this, 1) {
+        Value::Int(v) => v as usize,
+        _ => 0,
+    };
+    if size == 0 {
+        return Ok(Some(Value::Object(None)));
+    }
+    let data = match ctx.get_field(this, 0) {
+        Value::Object(Some(a)) => a,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    for i in 0..size {
+        let elem = ctx.get_array_element(data, i);
+        if natural_compare_values(elem, key) >= 0 {
+            return Ok(Some(elem));
+        }
+    }
+    Ok(Some(Value::Object(None)))
+}
+
+pub(crate) fn p62_ts_lower(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    let size = match ctx.get_field(this, 1) {
+        Value::Int(v) => v as usize,
+        _ => 0,
+    };
+    if size == 0 {
+        return Ok(Some(Value::Object(None)));
+    }
+    let data = match ctx.get_field(this, 0) {
+        Value::Object(Some(a)) => a,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let mut result = Value::Object(None);
+    for i in 0..size {
+        let elem = ctx.get_array_element(data, i);
+        if natural_compare_values(elem, key) < 0 {
+            result = elem;
+        } else {
+            break;
+        }
+    }
+    Ok(Some(result))
+}
+
+pub(crate) fn p62_ts_higher(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let key = args.get(1).copied().unwrap_or(Value::Object(None));
+    let size = match ctx.get_field(this, 1) {
+        Value::Int(v) => v as usize,
+        _ => 0,
+    };
+    if size == 0 {
+        return Ok(Some(Value::Object(None)));
+    }
+    let data = match ctx.get_field(this, 0) {
+        Value::Object(Some(a)) => a,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    for i in 0..size {
+        let elem = ctx.get_array_element(data, i);
+        if natural_compare_values(elem, key) > 0 {
+            return Ok(Some(elem));
+        }
+    }
+    Ok(Some(Value::Object(None)))
+}
+
+pub(crate) fn natural_compare_values(a: Value, b: Value) -> i32 {
+    match (a, b) {
+        (Value::Int(x), Value::Int(y)) => x.cmp(&y) as i32,
+        (Value::Long(x), Value::Long(y)) => x.cmp(&y) as i32,
+        (Value::Float(x), Value::Float(y)) => {
+            x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal) as i32
+        }
+        (Value::Double(x), Value::Double(y)) => {
+            x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal) as i32
+        }
+        _ => 0,
+    }
+}
+
+// =============================================================================
+// AbstractMap.SimpleEntry / SimpleImmutableEntry = 2-field (key=0, value=1)
+// =============================================================================
+
+pub(crate) fn register_p62_abstract_map_entries(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
+    let se = "java/util/AbstractMap$SimpleEntry";
+    r.register(
+        se,
+        "<init>",
+        "(Ljava/lang/Object;Ljava/lang/Object;)V",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            ctx.set_field(this, 0, args.get(1).copied().unwrap_or(Value::Object(None)));
+            ctx.set_field(this, 1, args.get(2).copied().unwrap_or(Value::Object(None)));
+            Ok(None)
+        },
+    );
+    r.register(se, "getKey", "()Ljava/lang/Object;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        Ok(Some(ctx.get_field(this, 0)))
+    });
+    r.register(se, "getValue", "()Ljava/lang/Object;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        Ok(Some(ctx.get_field(this, 1)))
+    });
+    r.register(
+        se,
+        "setValue",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let old = ctx.get_field(this, 1);
+            ctx.set_field(this, 1, args.get(1).copied().unwrap_or(Value::Object(None)));
+            Ok(Some(old))
+        },
+    );
+    r.register(se, "toString", "()Ljava/lang/String;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let s = ctx.create_string(&format!("entry@{:x}", this.as_ptr() as usize));
+        Ok(Some(Value::Object(Some(s))))
+    });
+
+    // SimpleImmutableEntry (same layout, setValue throws)
+    let sie = "java/util/AbstractMap$SimpleImmutableEntry";
+    r.register(
+        sie,
+        "<init>",
+        "(Ljava/lang/Object;Ljava/lang/Object;)V",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            ctx.set_field(this, 0, args.get(1).copied().unwrap_or(Value::Object(None)));
+            ctx.set_field(this, 1, args.get(2).copied().unwrap_or(Value::Object(None)));
+            Ok(None)
+        },
+    );
+    r.register(sie, "getKey", "()Ljava/lang/Object;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        Ok(Some(ctx.get_field(this, 0)))
+    });
+    r.register(sie, "getValue", "()Ljava/lang/Object;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        Ok(Some(ctx.get_field(this, 1)))
+    });
+    r.register(
+        sie,
+        "setValue",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+        |_ctx, _args| {
+            Err(RuntimeError::UnsupportedOperationException {
+                message: "immutable entry".into(),
+            }
+            .into())
+        },
+    );
+    r.register(sie, "toString", "()Ljava/lang/String;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let s = ctx.create_string(&format!("entry@{:x}", this.as_ptr() as usize));
+        Ok(Some(Value::Object(Some(s))))
+    });
+    r.set_category(__prev_cat);
+}
+
+// =============================================================================
+// WeakHashMap = 3-field (same as HashMap: buckets=0, size=1, capacity=2)
+// Delegates to HashMap natives for all core operations
+// =============================================================================
+
+pub(crate) fn register_p63_weak_hash_map(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    // Same synthetic fallback as the early registration: a real JDK
+    // WeakHashMap must use its bytecode-backed layout.
+    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
+    let whm = "java/util/WeakHashMap";
+    r.register(whm, "<init>", "()V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let cap = 16usize;
+        let buckets = ctx.new_array(cratonvm_types::ArrayElementType::Reference, cap);
+        ctx.set_field(this, 0, Value::Object(Some(buckets)));
+        ctx.set_field(this, 1, Value::Int(0));
+        ctx.set_field(this, 2, Value::Int(cap as i32));
+        Ok(None)
+    });
+    r.register(whm, "<init>", "(I)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let cap = match args.get(1) {
+            Some(Value::Int(v)) => (*v).max(1) as usize,
+            _ => 16,
+        };
+        let buckets = ctx.new_array(cratonvm_types::ArrayElementType::Reference, cap);
+        ctx.set_field(this, 0, Value::Object(Some(buckets)));
+        ctx.set_field(this, 1, Value::Int(0));
+        ctx.set_field(this, 2, Value::Int(cap as i32));
+        Ok(None)
+    });
+    r.register(whm, "size", "()I", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        Ok(Some(ctx.get_field(this, 1)))
+    });
+    r.register(whm, "isEmpty", "()Z", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let size = match ctx.get_field(this, 1) {
+            Value::Int(v) => v,
+            _ => 0,
+        };
+        Ok(Some(Value::Int(if size == 0 { 1 } else { 0 })))
+    });
+    r.register(
+        whm,
+        "get",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+        cratonvm_native_collections::native_map_get_pub,
+    );
+    r.register(
+        whm,
+        "containsKey",
+        "(Ljava/lang/Object;)Z",
+        cratonvm_native_collections::native_map_contains_key_pub,
+    );
+    r.register(whm, "clear", "()V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        ctx.set_field(this, 0, Value::Object(None));
+        ctx.set_field(this, 1, Value::Int(0));
+        Ok(None)
+    });
+    r.register(whm, "keySet", "()Ljava/util/Set;", |ctx, _args| {
+        // Return empty HashSet stub
+        let set = alloc_concurrent_synthetic(ctx, "java/util/HashSet", 3);
+        ctx.set_field(set, 0, Value::Object(None));
+        ctx.set_field(set, 1, Value::Int(0));
+        ctx.set_field(set, 2, Value::Int(16));
+        Ok(Some(Value::Object(Some(set))))
+    });
+    r.register(whm, "values", "()Ljava/util/Collection;", |ctx, _args| {
+        let al = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+        ctx.set_field(al, 0, Value::Object(None));
+        ctx.set_field(al, 1, Value::Int(0));
+        Ok(Some(Value::Object(Some(al))))
+    });
+    r.set_category(__prev_cat);
+}
+
+// =============================================================================
+// Enumeration — empty stub + Collections.emptyEnumeration, Collections.enumeration
+// =============================================================================
+
+pub(crate) fn register_p63_enumeration(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
+    // Empty enumeration
+    let ee = "java/util/Collections$EmptyEnumeration";
+    r.register(ee, "hasMoreElements", "()Z", |_ctx, _args| {
+        Ok(Some(Value::Int(0)))
+    });
+    r.register(ee, "nextElement", "()Ljava/lang/Object;", |_ctx, _args| {
+        Err(RuntimeError::IllegalStateException {
+            message: "NoSuchElementException".into(),
+        }
+        .into())
+    });
+
+    let cols = "java/util/Collections";
+    r.register(
+        cols,
+        "emptyEnumeration",
+        "()Ljava/util/Enumeration;",
+        |ctx, _args| {
+            let e = alloc_concurrent_synthetic(ctx, "java/util/Collections$EmptyEnumeration", 0);
+            Ok(Some(Value::Object(Some(e))))
+        },
+    );
+    // synthetic-stub removed: defers to real JDK bytecode
+    // removed — VERIFY real bytecode covers it
+    // Collections.enumeration(Collection) was a divergent fake: it ignored its
+    // Collection argument and returned an EMPTY enumeration regardless of input.
+    // Real java/util/Collections.enumeration is plain bytecode that wraps the
+    // collection's iterator (hasMoreElements/nextElement delegate to it), and
+    // CratonVM already models Collection/Iterator, so the real bytecode runs.
+
+    // Enumeration interface
+    //
+    // NEW-14: the previous stub hardcoded `hasMoreElements` to false and
+    // `nextElement` to throw. Our synthetic Enumeration is a 2-field
+    // struct (`array: Object[]`, `pos: int`) populated by
+    // `NetworkInterface.getNetworkInterfaces`, `DriverManager.getDrivers`,
+    // and the other enumerators in native-builtins. The real impl
+    // simply walks the array until `pos >= array.length`.
+    let en = "java/util/Enumeration";
+    r.register(en, "hasMoreElements", "()Z", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let pos = ctx.get_field(this, 1).as_int().unwrap_or(0) as usize;
+        let len = match ctx.get_field(this, 0) {
+            Value::Object(Some(arr)) => ctx.array_length(arr),
+            _ => 0,
+        };
+        Ok(Some(Value::Int(if pos < len { 1 } else { 0 })))
+    });
+    r.register(en, "nextElement", "()Ljava/lang/Object;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let pos = ctx.get_field(this, 1).as_int().unwrap_or(0) as usize;
+        let arr = match ctx.get_field(this, 0) {
+            Value::Object(Some(a)) => a,
+            _ => {
+                return Err(RuntimeError::NoSuchElementException {
+                    message: "empty Enumeration".into(),
+                }
+                .into());
+            }
+        };
+        let len = ctx.array_length(arr);
+        if pos >= len {
+            return Err(RuntimeError::NoSuchElementException {
+                message: "Enumeration exhausted".into(),
+            }
+            .into());
+        }
+        let elem = ctx.get_array_element(arr, pos);
+        ctx.set_field(this, 1, Value::Int((pos + 1) as i32));
+        Ok(Some(elem))
+    });
+    r.register(en, "asIterator", "()Ljava/util/Iterator;", |ctx, _args| {
+        let itr = alloc_concurrent_synthetic(ctx, "java/util/Collections$EmptyItr", 2);
+        ctx.set_field(itr, 0, Value::Object(None));
+        ctx.set_field(itr, 1, Value::Int(0));
+        Ok(Some(Value::Object(Some(itr))))
+    });
+    r.set_category(__prev_cat);
+}
+
+// =============================================================================
+// SequencedCollection / SequencedSet / SequencedMap — Java 21 interfaces
+// Register default methods for ArrayList, LinkedList, ArrayDeque, TreeSet,
+// LinkedHashMap, TreeMap etc.
+// =============================================================================
+
+pub(crate) fn register_p64_sequenced_collections(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
+    // SequencedCollection interface
+    let sc = "java/util/SequencedCollection";
+    r.register(
+        sc,
+        "getFirst",
+        "()Ljava/lang/Object;",
+        native_p64_seq_get_first,
+    );
+    r.register(
+        sc,
+        "getLast",
+        "()Ljava/lang/Object;",
+        native_p64_seq_get_last,
+    );
+    r.register(
+        sc,
+        "reversed",
+        "()Ljava/util/SequencedCollection;",
+        native_p64_seq_reversed,
+    );
+    r.register(sc, "addFirst", "(Ljava/lang/Object;)V", |ctx, args| {
+        // Default impl: add to start of the underlying list/deque
+        let this = obj_arg(args, 0)?;
+        let elem = args.get(1).copied().unwrap_or(Value::Object(None));
+        // Try add(int, Object) with index 0 for List-like collections
+        let _ = ctx.invoke_virtual(
+            this,
+            "add",
+            "(ILjava/lang/Object;)V",
+            &[Value::Int(0), elem],
+        );
+        Ok(None)
+    });
+    r.register(sc, "addLast", "(Ljava/lang/Object;)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let elem = args.get(1).copied().unwrap_or(Value::Object(None));
+        // Try add(Object) which appends
+        let _ = ctx.invoke_virtual(this, "add", "(Ljava/lang/Object;)Z", &[elem]);
+        Ok(None)
+    });
+    r.register(
+        sc,
+        "removeFirst",
+        "()Ljava/lang/Object;",
+        native_p64_seq_get_first,
+    );
+    r.register(
+        sc,
+        "removeLast",
+        "()Ljava/lang/Object;",
+        native_p64_seq_get_last,
+    );
+
+    // Register getFirst/getLast + reversed for ArrayList
+    let al = "java/util/ArrayList";
+    r.register(
+        al,
+        "getFirst",
+        "()Ljava/lang/Object;",
+        native_p64_al_get_first,
+    );
+    r.register(
+        al,
+        "getLast",
+        "()Ljava/lang/Object;",
+        native_p64_al_get_last,
+    );
+    r.register(al, "reversed", "()Ljava/util/List;", native_p64_al_reversed);
+
+    // Register getFirst/getLast + reversed for LinkedList
+    let ll = "java/util/LinkedList";
+    r.register(
+        ll,
+        "getFirst",
+        "()Ljava/lang/Object;",
+        native_p64_ll_get_first,
+    );
+    r.register(
+        ll,
+        "getLast",
+        "()Ljava/lang/Object;",
+        native_p64_ll_get_last,
+    );
+    r.register(ll, "reversed", "()Ljava/util/List;", native_p64_ll_reversed);
+
+    // SequencedSet interface
+    let ss = "java/util/SequencedSet";
+    r.register(
+        ss,
+        "getFirst",
+        "()Ljava/lang/Object;",
+        native_p64_seq_get_first,
+    );
+    r.register(
+        ss,
+        "getLast",
+        "()Ljava/lang/Object;",
+        native_p64_seq_get_last,
+    );
+    r.register(
+        ss,
+        "reversed",
+        "()Ljava/util/SequencedSet;",
+        native_p64_seq_reversed,
+    );
+
+    // SequencedMap interface
+    let sm = "java/util/SequencedMap";
+    r.register(
+        sm,
+        "firstEntry",
+        "()Ljava/util/Map$Entry;",
+        native_p64_sm_first_entry,
+    );
+    r.register(
+        sm,
+        "lastEntry",
+        "()Ljava/util/Map$Entry;",
+        native_p64_sm_last_entry,
+    );
+    r.register(
+        sm,
+        "pollFirstEntry",
+        "()Ljava/util/Map$Entry;",
+        native_p64_sm_first_entry,
+    );
+    r.register(
+        sm,
+        "pollLastEntry",
+        "()Ljava/util/Map$Entry;",
+        native_p64_sm_last_entry,
+    );
+    r.register(
+        sm,
+        "reversed",
+        "()Ljava/util/SequencedMap;",
+        |_ctx, args| {
+            // Return self for now — full reversed map view is complex
+            Ok(Some(args.first().copied().unwrap_or(Value::Object(None))))
+        },
+    );
+    r.register(
+        sm,
+        "sequencedKeySet",
+        "()Ljava/util/SequencedSet;",
+        native_p64_sm_seq_key_set,
+    );
+    r.register(
+        sm,
+        "sequencedValues",
+        "()Ljava/util/SequencedCollection;",
+        native_p64_sm_seq_values,
+    );
+    r.register(
+        sm,
+        "sequencedEntrySet",
+        "()Ljava/util/SequencedSet;",
+        native_p64_sm_seq_entry_set,
+    );
+    r.register(
+        sm,
+        "putFirst",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+        |_ctx, _args| Ok(Some(Value::Object(None))),
+    );
+    r.register(
+        sm,
+        "putLast",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+        |_ctx, _args| Ok(Some(Value::Object(None))),
+    );
+
+    // LinkedHashMap-specific SequencedMap methods
+    let lhm = "java/util/LinkedHashMap";
+    r.register(
+        lhm,
+        "firstEntry",
+        "()Ljava/util/Map$Entry;",
+        native_p64_lhm_first_entry,
+    );
+    r.register(
+        lhm,
+        "lastEntry",
+        "()Ljava/util/Map$Entry;",
+        native_p64_lhm_last_entry,
+    );
+    r.register(
+        lhm,
+        "sequencedKeySet",
+        "()Ljava/util/SequencedSet;",
+        native_p64_lhm_seq_key_set,
+    );
+    r.register(
+        lhm,
+        "sequencedValues",
+        "()Ljava/util/SequencedCollection;",
+        native_p64_lhm_seq_values,
+    );
+    r.register(
+        lhm,
+        "sequencedEntrySet",
+        "()Ljava/util/SequencedSet;",
+        native_p64_lhm_seq_entry_set,
+    );
+    r.register(
+        lhm,
+        "reversed",
+        "()Ljava/util/SequencedMap;",
+        native_p64_lhm_reversed,
+    );
+    r.set_category(__prev_cat);
+}
+
+pub(crate) fn native_p64_seq_get_first(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    // Fallback: for unknown types return null
+    Ok(Some(Value::Object(None)))
+}
+
+pub(crate) fn native_p64_seq_get_last(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    Ok(Some(Value::Object(None)))
+}
+
+pub(crate) fn native_p64_seq_reversed(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    // Fallback: return self for unknown types
+    Ok(Some(args.first().copied().unwrap_or(Value::Object(None))))
+}
+
+// --- ArrayList reversed() → new ArrayList with elements in reverse order ---
+pub(crate) fn native_p64_al_reversed(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let size = match ctx.get_field(this, 1) {
+        Value::Int(v) => v as usize,
+        _ => 0,
+    };
+    let arr = match ctx.get_field(this, 0) {
+        Value::Object(Some(a)) => a,
+        _ => {
+            let new_al = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+            let new_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
+            ctx.set_field(new_al, 0, Value::Object(Some(new_arr)));
+            ctx.set_field(new_al, 1, Value::Int(0));
+            return Ok(Some(Value::Object(Some(new_al))));
+        }
+    };
+    let new_al = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+    let new_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, size);
+    for i in 0..size {
+        let elem = ctx.get_array_element(arr, size - 1 - i);
+        ctx.set_array_element(new_arr, i, elem);
+    }
+    ctx.set_field(new_al, 0, Value::Object(Some(new_arr)));
+    ctx.set_field(new_al, 1, Value::Int(size as i32));
+    Ok(Some(Value::Object(Some(new_al))))
+}
+
+// --- LinkedList reversed() → new ArrayList with elements in reverse order ---
+pub(crate) fn native_p64_ll_reversed(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let size = match ctx.get_field(this, 2) {
+        Value::Int(v) => v as usize,
+        _ => 0,
+    };
+    // Collect elements by walking tail → head (using prev pointers: node field 0)
+    let mut elements = Vec::with_capacity(size);
+    let mut cur = ctx.get_field(this, 1); // tail
+    while let Value::Object(Some(node)) = cur {
+        elements.push(ctx.get_field(node, 2)); // element
+        cur = ctx.get_field(node, 0); // prev
+    }
+    // Build new ArrayList with reversed elements
+    let new_al = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+    let new_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, elements.len());
+    for (i, elem) in elements.iter().enumerate() {
+        ctx.set_array_element(new_arr, i, *elem);
+    }
+    ctx.set_field(new_al, 0, Value::Object(Some(new_arr)));
+    ctx.set_field(new_al, 1, Value::Int(elements.len() as i32));
+    Ok(Some(Value::Object(Some(new_al))))
+}
+
+pub(crate) fn native_p64_al_get_first(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let size = match ctx.get_field(this, 1) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    if size == 0 {
+        return Err(RuntimeError::IllegalStateException {
+            message: "NoSuchElementException".into(),
+        }
+        .into());
+    }
+    let arr = match ctx.get_field(this, 0) {
+        Value::Object(Some(a)) => a,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    Ok(Some(ctx.get_array_element(arr, 0)))
+}
+
+pub(crate) fn native_p64_al_get_last(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let size = match ctx.get_field(this, 1) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    if size == 0 {
+        return Err(RuntimeError::IllegalStateException {
+            message: "NoSuchElementException".into(),
+        }
+        .into());
+    }
+    let arr = match ctx.get_field(this, 0) {
+        Value::Object(Some(a)) => a,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    Ok(Some(ctx.get_array_element(arr, (size - 1) as usize)))
+}
+
+pub(crate) fn native_p64_ll_get_first(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let size = match ctx.get_field(this, 2) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    if size == 0 {
+        return Err(RuntimeError::IllegalStateException {
+            message: "NoSuchElementException".into(),
+        }
+        .into());
+    }
+    match ctx.get_field(this, 0) {
+        Value::Object(Some(head)) => Ok(Some(ctx.get_field(head, 2))),
+        _ => Ok(Some(Value::Object(None))),
+    }
+}
+
+pub(crate) fn native_p64_ll_get_last(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let size = match ctx.get_field(this, 2) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    if size == 0 {
+        return Err(RuntimeError::IllegalStateException {
+            message: "NoSuchElementException".into(),
+        }
+        .into());
+    }
+    match ctx.get_field(this, 1) {
+        Value::Object(Some(tail)) => Ok(Some(ctx.get_field(tail, 2))),
+        _ => Ok(Some(Value::Object(None))),
+    }
+}
+
+// --- SequencedMap helpers ---
+
+// Helper: create Map$Entry from key + value
+pub(crate) fn p64_make_entry(ctx: &mut dyn NativeContext, key: Value, value: Value) -> ObjectRef {
+    // Pin across the entry alloc below — a moving young GC there would
+    // relocate the key/value (native stale-local family).
+    let key_pin = pinned_object_value(ctx, key);
+    let value_pin = pinned_object_value(ctx, value);
+    let entry = alloc_concurrent_synthetic(ctx, "java/util/HashMap$Entry", 2);
+    let key = read_pinned_object_value(ctx, key_pin, key);
+    let value = read_pinned_object_value(ctx, value_pin, value);
+    ctx.set_field(entry, 0, key);
+    ctx.set_field(entry, 1, value);
+    if let Some((h, _)) = key_pin.or(value_pin) {
+        ctx.unpin_native_roots(h);
+    }
+    entry
+}
+
+// SequencedMap interface fallbacks (return null for non-LinkedHashMap)
+pub(crate) fn native_p64_sm_first_entry(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    Ok(Some(Value::Object(None)))
+}
+
+pub(crate) fn native_p64_sm_last_entry(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    Ok(Some(Value::Object(None)))
+}
+
+pub(crate) fn native_p64_sm_seq_key_set(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    Ok(Some(Value::Object(None)))
+}
+
+pub(crate) fn native_p64_sm_seq_values(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    Ok(Some(Value::Object(None)))
+}
+
+pub(crate) fn native_p64_sm_seq_entry_set(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    Ok(Some(Value::Object(None)))
+}
+
+// --- LinkedHashMap SequencedMap methods ---
+// LHM layout: buckets=0, size=1, capacity=2, head=3, tail=4
+// LHM node: key=0, value=1, hash=2, next=3, before=4, after=5
+
+pub(crate) fn native_p64_lhm_first_entry(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    match ctx.get_field(this, 3) {
+        // head
+        Value::Object(Some(head)) => {
+            let key = ctx.get_field(head, 0);
+            let val = ctx.get_field(head, 1);
+            let entry = p64_make_entry(ctx, key, val);
+            Ok(Some(Value::Object(Some(entry))))
+        }
+        _ => Ok(Some(Value::Object(None))),
+    }
+}
+
+pub(crate) fn native_p64_lhm_last_entry(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    match ctx.get_field(this, 4) {
+        // tail
+        Value::Object(Some(tail)) => {
+            let key = ctx.get_field(tail, 0);
+            let val = ctx.get_field(tail, 1);
+            let entry = p64_make_entry(ctx, key, val);
+            Ok(Some(Value::Object(Some(entry))))
+        }
+        _ => Ok(Some(Value::Object(None))),
+    }
+}
+
+pub(crate) fn native_p64_lhm_seq_key_set(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    // Walk insertion order: head → ... → tail via field 5 (after)
+    let mut keys = Vec::new();
+    let mut cur = ctx.get_field(this, 3); // head
+    while let Value::Object(Some(node)) = cur {
+        keys.push(ctx.get_field(node, 0)); // key
+        cur = ctx.get_field(node, 5); // after
+    }
+    // Return as ArrayList (simplification — real Java returns a Set view)
+    let al = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, keys.len());
+    for (i, k) in keys.iter().enumerate() {
+        ctx.set_array_element(arr, i, *k);
+    }
+    ctx.set_field(al, 0, Value::Object(Some(arr)));
+    ctx.set_field(al, 1, Value::Int(keys.len() as i32));
+    Ok(Some(Value::Object(Some(al))))
+}
+
+pub(crate) fn native_p64_lhm_seq_values(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let mut vals = Vec::new();
+    let mut cur = ctx.get_field(this, 3);
+    while let Value::Object(Some(node)) = cur {
+        vals.push(ctx.get_field(node, 1)); // value
+        cur = ctx.get_field(node, 5);
+    }
+    let al = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, vals.len());
+    for (i, v) in vals.iter().enumerate() {
+        ctx.set_array_element(arr, i, *v);
+    }
+    ctx.set_field(al, 0, Value::Object(Some(arr)));
+    ctx.set_field(al, 1, Value::Int(vals.len() as i32));
+    Ok(Some(Value::Object(Some(al))))
+}
+
+pub(crate) fn native_p64_lhm_seq_entry_set(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let mut entries = Vec::new();
+    let mut cur = ctx.get_field(this, 3);
+    while let Value::Object(Some(node)) = cur {
+        let key = ctx.get_field(node, 0);
+        let val = ctx.get_field(node, 1);
+        entries.push(p64_make_entry(ctx, key, val));
+        cur = ctx.get_field(node, 5);
+    }
+    let al = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, entries.len());
+    for (i, e) in entries.iter().enumerate() {
+        ctx.set_array_element(arr, i, Value::Object(Some(*e)));
+    }
+    ctx.set_field(al, 0, Value::Object(Some(arr)));
+    ctx.set_field(al, 1, Value::Int(entries.len() as i32));
+    Ok(Some(Value::Object(Some(al))))
+}
+
+pub(crate) fn native_p64_lhm_reversed(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    // Collect entries in reverse insertion order (tail → head via before=4)
+    let mut entries = Vec::new();
+    let mut cur = ctx.get_field(this, 4); // tail
+    while let Value::Object(Some(node)) = cur {
+        let key = ctx.get_field(node, 0);
+        let val = ctx.get_field(node, 1);
+        entries.push((key, val));
+        cur = ctx.get_field(node, 4); // before
+    }
+    // Build new LinkedHashMap with reversed insertion order
+    // Use native put to insert each entry
+    let new_lhm = alloc_concurrent_synthetic(ctx, "java/util/LinkedHashMap", 5);
+    let init_cap = 16i32;
+    let buckets = ctx.new_array(
+        cratonvm_types::ArrayElementType::Reference,
+        init_cap as usize,
+    );
+    ctx.set_field(new_lhm, 0, Value::Object(Some(buckets)));
+    ctx.set_field(new_lhm, 1, Value::Int(0));
+    ctx.set_field(new_lhm, 2, Value::Int(init_cap));
+    ctx.set_field(new_lhm, 3, Value::Object(None)); // head
+    ctx.set_field(new_lhm, 4, Value::Object(None)); // tail
+                                                    // Insert each entry via invoke_virtual
+    for (key, val) in &entries {
+        let _ = ctx.invoke_virtual(
+            new_lhm,
+            "put",
+            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            &[Value::Object(Some(new_lhm)), *key, *val],
+        );
+    }
+    Ok(Some(Value::Object(Some(new_lhm))))
+}
+
+// =============================================================================
+// Collections checked wrappers — delegate to underlying collection
+// =============================================================================
+
+pub(crate) fn register_p65_checked_collections(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
+    let cols = "java/util/Collections";
+    // checkedList — return the list itself (simplified, no runtime type checking)
+    r.register(
+        cols,
+        "checkedList",
+        "(Ljava/util/List;Ljava/lang/Class;)Ljava/util/List;",
+        |_ctx, args| Ok(Some(args.first().copied().unwrap_or(Value::Object(None)))),
+    );
+    r.register(
+        cols,
+        "checkedSet",
+        "(Ljava/util/Set;Ljava/lang/Class;)Ljava/util/Set;",
+        |_ctx, args| Ok(Some(args.first().copied().unwrap_or(Value::Object(None)))),
+    );
+    r.register(
+        cols,
+        "checkedMap",
+        "(Ljava/util/Map;Ljava/lang/Class;Ljava/lang/Class;)Ljava/util/Map;",
+        |_ctx, args| Ok(Some(args.first().copied().unwrap_or(Value::Object(None)))),
+    );
+    r.register(
+        cols,
+        "checkedCollection",
+        "(Ljava/util/Collection;Ljava/lang/Class;)Ljava/util/Collection;",
+        |_ctx, args| Ok(Some(args.first().copied().unwrap_or(Value::Object(None)))),
+    );
+    r.register(
+        cols,
+        "checkedSortedSet",
+        "(Ljava/util/SortedSet;Ljava/lang/Class;)Ljava/util/SortedSet;",
+        |_ctx, args| Ok(Some(args.first().copied().unwrap_or(Value::Object(None)))),
+    );
+    r.register(
+        cols,
+        "checkedSortedMap",
+        "(Ljava/util/SortedMap;Ljava/lang/Class;Ljava/lang/Class;)Ljava/util/SortedMap;",
+        |_ctx, args| Ok(Some(args.first().copied().unwrap_or(Value::Object(None)))),
+    );
+    r.register(
+        cols,
+        "checkedNavigableSet",
+        "(Ljava/util/NavigableSet;Ljava/lang/Class;)Ljava/util/NavigableSet;",
+        |_ctx, args| Ok(Some(args.first().copied().unwrap_or(Value::Object(None)))),
+    );
+    r.register(
+        cols,
+        "checkedNavigableMap",
+        "(Ljava/util/NavigableMap;Ljava/lang/Class;Ljava/lang/Class;)Ljava/util/NavigableMap;",
+        |_ctx, args| Ok(Some(args.first().copied().unwrap_or(Value::Object(None)))),
+    );
+    // unmodifiableSequencedCollection — Java 21
+    r.register(
+        cols,
+        "unmodifiableSequencedCollection",
+        "(Ljava/util/SequencedCollection;)Ljava/util/SequencedCollection;",
+        |_ctx, args| Ok(Some(args.first().copied().unwrap_or(Value::Object(None)))),
+    );
+    r.register(
+        cols,
+        "unmodifiableSequencedSet",
+        "(Ljava/util/SequencedSet;)Ljava/util/SequencedSet;",
+        |_ctx, args| Ok(Some(args.first().copied().unwrap_or(Value::Object(None)))),
+    );
+    r.register(
+        cols,
+        "unmodifiableSequencedMap",
+        "(Ljava/util/SequencedMap;)Ljava/util/SequencedMap;",
+        |_ctx, args| Ok(Some(args.first().copied().unwrap_or(Value::Object(None)))),
+    );
+    r.set_category(__prev_cat);
+}
+
+// =============================================================================
+// Misc: java.util.EnumMap, java.util.EnumSet, java.lang.Iterable additions
+// =============================================================================
+
+pub(crate) fn register_p70_misc(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
+    // EnumMap and EnumSet core methods already registered in earlier phases — only add NEW methods here
+
+    // EnumSet: complementOf and range (not in earlier phases)
+    let es = "java/util/EnumSet";
+    r.register(
+        es,
+        "complementOf",
+        "(Ljava/util/EnumSet;)Ljava/util/EnumSet;",
+        |ctx, _args| {
+            // Use same layout as existing EnumSet: field 0 = ArrayList backing, field 1 = type
+            let set = alloc_concurrent_synthetic(ctx, "java/util/EnumSet", 2);
+            // Pin across the array/backing allocs below — a moving young GC
+            // there would relocate them (native stale-local family).
+            let set_pin = ctx.pin_native_root(set);
+            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
+            let arr_pin = ctx.pin_native_root(arr);
+            let backing = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+            let set = ctx.read_native_pin(set_pin, set);
+            let arr = ctx.read_native_pin(arr_pin, arr);
+            ctx.set_field(backing, 0, Value::Object(Some(arr)));
+            ctx.set_field(backing, 1, Value::Int(0));
+            ctx.set_field(set, 0, Value::Object(Some(backing)));
+            ctx.set_field(set, 1, Value::Object(None));
+            ctx.unpin_native_roots(set_pin);
+            Ok(Some(Value::Object(Some(set))))
+        },
+    );
+    r.register(
+        es,
+        "range",
+        "(Ljava/lang/Enum;Ljava/lang/Enum;)Ljava/util/EnumSet;",
+        crate::phases_early::native_es_range,
+    );
+
+    // java.io.Serializable — marker interface (no methods, but sometimes referenced)
+    r.register(
+        "java/io/Serializable",
+        "serialVersionUID",
+        "J",
+        |_ctx, _args| Ok(Some(Value::Long(0))),
+    );
+
+    // java.lang.Comparable — compareTo for String already exists; add for wrappers
+    r.register(
+        "java/lang/Comparable",
+        "compareTo",
+        "(Ljava/lang/Object;)I",
+        |_ctx, _args| Ok(Some(Value::Int(0))),
+    );
+
+    // java.lang.AutoCloseable
+    r.register("java/lang/AutoCloseable", "close", "()V", |_ctx, _args| {
+        // AutoCloseable is a marker interface — close() is implemented by concrete classes
+        // (FileInputStream, Socket, etc.). This default registration is a fallback for
+        // callers that hold a raw AutoCloseable reference; the real implementation runs
+        // via virtual dispatch on the concrete subclass.
+        Ok(None)
+    });
+    r.set_category(__prev_cat);
+}

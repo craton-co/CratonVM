@@ -63,26 +63,26 @@ fn test_println_multi_line_no_npe() {
     // corrupt the real stream graph, so `ensure_system_streams` deliberately
     // skips the fd-tag write in that case (mirrors
     // `vm_init.rs::ensure_system_streams_creates_objects`).
-    let out_header = shared.heap.get_header(out_ref);
+    let out_header = shared.mem.heap.get_header(out_ref);
     let slot0_is_ref = cratonvm_gc::class_layout(out_header.class_id.as_u32())
         .and_then(|layout| layout.field_is_ref(0))
         .unwrap_or(false);
     if slot0_is_ref {
         assert!(
-            !matches!(shared.heap.get_field(out_ref, 0), Value::Int(1)),
+            !matches!(shared.mem.heap.get_field(out_ref, 0), Value::Int(1)),
             "real PrintStream.out (a reference field) must not hold a boxed fd tag"
         );
         assert!(
-            !matches!(shared.heap.get_field(err_ref, 0), Value::Int(2)),
+            !matches!(shared.mem.heap.get_field(err_ref, 0), Value::Int(2)),
             "real PrintStream.out (a reference field) must not hold a boxed fd tag"
         );
     } else {
         assert!(
-            matches!(shared.heap.get_field(out_ref, 0), Value::Int(1)),
+            matches!(shared.mem.heap.get_field(out_ref, 0), Value::Int(1)),
             "out fd tag must be readable at slot 0"
         );
         assert!(
-            matches!(shared.heap.get_field(err_ref, 0), Value::Int(2)),
+            matches!(shared.mem.heap.get_field(err_ref, 0), Value::Int(2)),
             "err fd tag must be readable at slot 0"
         );
     }
@@ -102,11 +102,11 @@ fn test_println_multi_line_no_npe() {
         let s = create_java_string(&shared, text);
         if !slot0_is_ref {
             assert!(
-                matches!(shared.heap.get_field(*stream, 0), Value::Int(1 | 2)),
+                matches!(shared.mem.heap.get_field(*stream, 0), Value::Int(1 | 2)),
                 "fd tag must remain a valid Int(1|2) after allocation round {text}"
             );
         }
-        let read_back = cratonvm_vm::vm::read_java_string(&shared.heap, s).unwrap_or_default();
+        let read_back = cratonvm_vm::vm::read_java_string(&shared.mem.heap, s).unwrap_or_default();
         assert_eq!(
             read_back, *text,
             "create_java_string round-trip must survive between println calls"
@@ -137,13 +137,13 @@ fn test_system_streams_slot_count_matches_class() {
     // under the default config (real JDK + compact-ref-fields), slot 0 is
     // the real `FilterOutputStream.out` reference field and stays null, not
     // a boxed fd-tag Int.
-    let out_header = shared.heap.get_header(out_ref);
+    let out_header = shared.mem.heap.get_header(out_ref);
     let slot0_is_ref = cratonvm_gc::class_layout(out_header.class_id.as_u32())
         .and_then(|layout| layout.field_is_ref(0))
         .unwrap_or(false);
 
-    let out_fd = shared.heap.get_field(out_ref, 0);
-    let err_fd = shared.heap.get_field(err_ref, 0);
+    let out_fd = shared.mem.heap.get_field(out_ref, 0);
+    let err_fd = shared.mem.heap.get_field(err_ref, 0);
     if slot0_is_ref {
         assert_ne!(out_fd, Value::Int(1));
         assert_ne!(err_fd, Value::Int(2));

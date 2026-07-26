@@ -64,7 +64,7 @@ macro_rules! require_classes {
 /// `ModuleTarget` into it, and ensure `TckModule` stays in the unnamed
 /// module. Optional `extra_opens` simulates `--add-opens` flags.
 fn setup_modules(vm: &mut Vm, extra_opens: &[(&str, &str, &str)]) {
-    let mut cm = vm.shared.class_manager.write();
+    let mut cm = vm.shared.classes.class_manager.write();
 
     // Load both test classes.
     cm.load_class("cratonvm/ModuleTarget")
@@ -127,7 +127,7 @@ fn setup_modules(vm: &mut Vm, extra_opens: &[(&str, &str, &str)]) {
 /// (possibly) re-homed. Returns `UNNAMED_MODULE` ("") when the class has
 /// no module membership, which is the semantics the registry check uses.
 fn module_name_of(vm: &Vm, class_name: &str) -> String {
-    let cm = vm.shared.class_manager.read();
+    let cm = vm.shared.classes.class_manager.read();
     let cid = cm
         .find_class_by_name(class_name)
         .expect("class must be loaded");
@@ -155,7 +155,7 @@ fn new19_direct_deny_cross_module_without_opens() {
         "ModuleTarget must be re-homed into test.named"
     );
 
-    let cm = vm.shared.class_manager.read();
+    let cm = vm.shared.classes.class_manager.read();
     let result =
         cm.module_registry
             .check_deep_reflection_access(&accessor_mod, &target_mod, "cratonvm");
@@ -176,7 +176,7 @@ fn new19_direct_allow_cross_module_with_add_opens_unqualified() {
     let accessor_mod = module_name_of(&vm, "cratonvm/TckModule");
     let target_mod = module_name_of(&vm, "cratonvm/ModuleTarget");
 
-    let cm = vm.shared.class_manager.read();
+    let cm = vm.shared.classes.class_manager.read();
     let result =
         cm.module_registry
             .check_deep_reflection_access(&accessor_mod, &target_mod, "cratonvm");
@@ -194,7 +194,7 @@ fn new19_direct_allow_same_module() {
 
     // TckModule → TckModule (same module: UNNAMED → UNNAMED).
     let m = module_name_of(&vm, "cratonvm/TckModule");
-    let cm = vm.shared.class_manager.read();
+    let cm = vm.shared.classes.class_manager.read();
     assert!(cm
         .module_registry
         .check_deep_reflection_access(&m, &m, "cratonvm")
@@ -210,7 +210,7 @@ fn new19_direct_allow_named_accessor_with_qualified_opens() {
     // be denied because our accessor is unnamed, not "other.mod".
     setup_modules(&mut vm, &[("test.named", "cratonvm", "other.mod")]);
 
-    let cm = vm.shared.class_manager.read();
+    let cm = vm.shared.classes.class_manager.read();
     // Unnamed accessor → still denied (opens is qualified to other.mod).
     assert!(
         cm.module_registry
@@ -235,10 +235,10 @@ fn new19_direct_classpath_only_mode_allows_everything() {
     // never break existing users.
     let vm = test_vm();
     {
-        let mut cm = vm.shared.class_manager.write();
+        let mut cm = vm.shared.classes.class_manager.write();
         cm.load_class("cratonvm/ModuleTarget").expect("must load");
     }
-    let cm = vm.shared.class_manager.read();
+    let cm = vm.shared.classes.class_manager.read();
     assert!(cm.module_registry.is_empty());
     // Any cross-module query is vacuously allowed in this mode — the
     // trait wrapper returns Ok(()).

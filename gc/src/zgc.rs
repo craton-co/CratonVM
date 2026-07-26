@@ -1737,11 +1737,11 @@ impl ZgcRealHeap {
     fn alloc_size(header: &ObjectHeader) -> usize {
         match header.kind {
             ObjectKind::Object | ObjectKind::HumongousFiller => {
-                HEADER_SIZE + header.num_slots as usize * SLOT_SIZE
+                HEADER_SIZE + cratonvm_types::object_body_size(header)
             }
             ObjectKind::Array => {
                 let data =
-                    array_data_size(header.array_length as usize, header.element_type).unwrap_or(0);
+                    array_data_size(header.array_length() as usize, header.element_type).unwrap_or(0);
                 HEADER_SIZE + data
             }
         }
@@ -1768,22 +1768,49 @@ impl ZgcRealHeap {
         let header = self.header_mut(base);
         match header.kind {
             ObjectKind::Object => {
-                let n = header.num_slots as usize;
-                for i in 0..n {
-                    if skip_index == Some(i) {
-                        continue;
-                    }
-                    // SAFETY: i < num_slots so the slot is within the object.
-                    let slot = unsafe { base.add(HEADER_SIZE + i * SLOT_SIZE) };
-                    let val = unsafe { std::ptr::read(slot as *const Value) };
-                    if let Value::Object(Some(r)) = val {
-                        work.push(r.as_ptr() as usize);
+                if cratonvm_types::is_compact_object(header) {
+                    // Borrowing accessor: this walk only reads `field_offsets` /
+                    // `is_ref` and drops the handle, so it need not pay the
+                    // `Arc` clone/drop that `class_layout_for_fields` implies.
+                    let _ = cratonvm_types::with_class_layout(
+                        header.class_id.as_u32(),
+                        header.num_slots(),
+                        |layout| {
+                            for (index, (&offset, &is_ref)) in layout
+                                .field_offsets
+                                .iter()
+                                .zip(layout.is_ref.iter())
+                                .enumerate()
+                            {
+                                if !is_ref || skip_index == Some(index) {
+                                    continue;
+                                }
+                                let slot = unsafe { base.add(HEADER_SIZE + offset as usize) };
+                                let raw = unsafe { std::ptr::read(slot as *const u64) };
+                                if raw != 0 {
+                                    work.push(raw as usize);
+                                }
+                            }
+                        },
+                    );
+                } else {
+                    let n = header.num_slots() as usize;
+                    for i in 0..n {
+                        if skip_index == Some(i) {
+                            continue;
+                        }
+                        // SAFETY: i < num_slots so the slot is within the object.
+                        let slot = unsafe { base.add(HEADER_SIZE + i * SLOT_SIZE) };
+                        let val = unsafe { std::ptr::read(slot as *const Value) };
+                        if let Value::Object(Some(r)) = val {
+                            work.push(r.as_ptr() as usize);
+                        }
                     }
                 }
             }
             ObjectKind::Array => {
                 if header.element_type == ArrayElementType::Reference {
-                    let len = header.array_length as usize;
+                    let len = header.array_length() as usize;
                     // SAFETY: data area begins at base + HEADER_SIZE; each ref
                     // element is REF_ELEMENT_SIZE and `i < len`.
                     let data = unsafe { base.add(HEADER_SIZE) };
@@ -1806,7 +1833,7 @@ impl ZgcRealHeap {
     /// the header is suspect or the index is out of range. Mirrors the guards
     /// in `g1::get_field` / `gen_heap`.
     fn check_field_index(&self, header: &ObjectHeader, index: usize) -> Option<usize> {
-        let num_slots = header.num_slots as usize;
+        let num_slots = header.num_slots() as usize;
         if num_slots > (1 << 24) {
             tracing::debug!(target: "zgc", index, num_slots, "zgc real: suspect header");
             return None;
@@ -1910,9 +1937,13 @@ impl Default for ZgcRealHeap {
 
 impl GarbageCollector for ZgcRealHeap {
     fn alloc_object(&self, class_id: ClassId, num_fields: usize) -> ObjectRef {
-        let fields_size = num_fields
-            .checked_mul(SLOT_SIZE)
-            .expect("object field size overflow");
+        let compact_body =
+            cratonvm_types::compact_object_body_size(class_id.as_u32(), num_fields);
+        let fields_size = compact_body.unwrap_or_else(|| {
+            num_fields
+                .checked_mul(SLOT_SIZE)
+                .expect("object field size overflow")
+        });
         let total = HEADER_SIZE
             .checked_add(fields_size)
             .expect("object total size overflow");
@@ -1920,7 +1951,7 @@ impl GarbageCollector for ZgcRealHeap {
             eprintln!("FATAL: ZGC(real): out of heap space for object ({total} bytes)");
             std::process::abort();
         });
-        let header = ObjectHeader::new(
+        let mut header = ObjectHeader::new(
             class_id,
             ObjectKind::Object,
             ArrayElementType::Reference,
@@ -1928,6 +1959,9 @@ impl GarbageCollector for ZgcRealHeap {
             0,
             u32::try_from(num_fields).expect("field count exceeds u32::MAX"),
         );
+        if let Some(body) = compact_body {
+            header.set_compact_shape(num_fields as u32, body);
+        }
         // SAFETY: `ptr` is a fresh zeroed allocation of `total >= HEADER_SIZE`.
         unsafe {
             std::ptr::write(ptr as *mut ObjectHeader, header);
@@ -1998,6 +2032,14 @@ impl GarbageCollector for ZgcRealHeap {
         if self.check_field_index(header, index).is_none() {
             return Value::Object(None);
         }
+        if let Some((offset, storage)) =
+            cratonvm_types::compact_object_field_storage(header, index)
+        {
+            let ptr = unsafe { obj.as_ptr().add(HEADER_SIZE + offset) };
+            return unsafe {
+                cratonvm_types::read_compact_field(ptr, storage, Ordering::Relaxed)
+            };
+        }
         // SAFETY: index validated < num_slots, so the slot is within bounds.
         unsafe {
             let ptr = obj.as_ptr().add(HEADER_SIZE + index * SLOT_SIZE);
@@ -2008,6 +2050,20 @@ impl GarbageCollector for ZgcRealHeap {
     fn set_field(&self, obj: ObjectRef, index: usize, value: Value) {
         let header = self.header(obj);
         if self.check_field_index(header, index).is_none() {
+            return;
+        }
+        if let Some((offset, storage)) =
+            cratonvm_types::compact_object_field_storage(header, index)
+        {
+            let ptr = unsafe { obj.as_ptr().add(HEADER_SIZE + offset) };
+            unsafe {
+                cratonvm_types::write_compact_field(
+                    ptr,
+                    storage,
+                    value,
+                    Ordering::Relaxed,
+                )
+            };
             return;
         }
         // SAFETY: index validated < num_slots, so the slot is within bounds.
@@ -2035,7 +2091,7 @@ impl GarbageCollector for ZgcRealHeap {
     fn array_length(&self, obj: ObjectRef) -> usize {
         let header = self.header(obj);
         debug_assert_eq!(header.kind, ObjectKind::Array, "not an array");
-        header.array_length as usize
+        header.array_length() as usize
     }
 
     fn get_array_element(&self, obj: ObjectRef, index: usize) -> Result<Value, i32> {
@@ -2043,7 +2099,7 @@ impl GarbageCollector for ZgcRealHeap {
         if header.kind != ObjectKind::Array {
             return Err(index as i32);
         }
-        if index >= header.array_length as usize {
+        if index >= header.array_length() as usize {
             return Err(index as i32);
         }
         // SAFETY: bounds check passed; data area starts at base + HEADER_SIZE.
@@ -2059,7 +2115,7 @@ impl GarbageCollector for ZgcRealHeap {
         if header.kind != ObjectKind::Array {
             return Err(index as i32);
         }
-        if index >= header.array_length as usize {
+        if index >= header.array_length() as usize {
             return Err(index as i32);
         }
         let element_type = header.element_type;
@@ -2161,8 +2217,18 @@ impl GarbageCollector for ZgcRealHeap {
             if header.gc_flags & GC_FLAG_MARKED != 0 {
                 continue; // already visited
             }
+            let class_id = header.class_id.as_u32();
             header.gc_flags |= GC_FLAG_MARKED;
             self.enumerate_references(addr as *mut u8, &mut work, skip_for(addr));
+            if let Some(loader) = cratonvm_types::loader_pin::loader_pin_addr(class_id) {
+                work.push(loader);
+            }
+            if let Some(mirrors) = cratonvm_types::mirror_pin::mirrors_for_loader(addr) {
+                work.extend(mirrors);
+            }
+            if let Some(metadata) = cratonvm_types::metadata_pin::roots_for_loader(addr) {
+                work.extend(metadata);
+            }
         }
         if wild_skipped > 0 {
             tracing::warn!(
@@ -2197,8 +2263,24 @@ impl GarbageCollector for ZgcRealHeap {
                     if h.gc_flags & GC_FLAG_MARKED != 0 {
                         continue;
                     }
+                    let class_id = h.class_id.as_u32();
                     h.gc_flags |= GC_FLAG_MARKED;
                     self.enumerate_references(a as *mut u8, &mut work, skip_for(a));
+                    if let Some(loader) =
+                        cratonvm_types::loader_pin::loader_pin_addr(class_id)
+                    {
+                        work.push(loader);
+                    }
+                    if let Some(mirrors) =
+                        cratonvm_types::mirror_pin::mirrors_for_loader(a)
+                    {
+                        work.extend(mirrors);
+                    }
+                    if let Some(metadata) =
+                        cratonvm_types::metadata_pin::roots_for_loader(a)
+                    {
+                        work.extend(metadata);
+                    }
                 }
             }
             if !resurrected.is_empty() {

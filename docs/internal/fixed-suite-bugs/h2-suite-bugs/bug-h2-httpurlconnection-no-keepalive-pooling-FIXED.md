@@ -146,7 +146,7 @@ have the bnf }`), so `session.getBnf()` returns `null` forever for that
 session, and `WebApp.autoCompleteList()` returns `"autoCompleteList.jsp"`
 without ever populating the `autoCompleteList` session var the JSP
 template interpolates — hence the empty body. Filed as its own known issue:
-`docs/known-issues/h2-suite-bugs/bug-h2-bnf-ruleelement-link-null-npe-autocomplete.md`.
+`../../../known-issues/h2/bug-h2-bnf-ruleelement-link-null-npe-autocomplete.md`.
 
 ## Verification
 - `cargo test -p cratonvm-native-builtins http_url_connection` — 39 tests
@@ -199,7 +199,7 @@ pass) before pushing.
 
 ## Related
 - `docs/internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-testweb-logout-connectexception-mismatch-FIXED.md` — the fix that originally exposed this.
-- `docs/known-issues/h2-suite-bugs/bug-h2-bnf-ruleelement-link-null-npe-autocomplete.md` — the separate, pre-existing bug this fix newly exposed reachability to.
+- `../../../known-issues/h2/bug-h2-bnf-ruleelement-link-null-npe-autocomplete.md` — the separate, pre-existing bug this fix newly exposed reachability to.
 - `native-builtins/src/http_url_connection.rs` — `perform()`, `pool_take`/`pool_put`/`pool_clear`/`try_pooled_request`/`is_poolable_response`.
 
 ## Implementation attempt (reverted, 2026-07-22, earlier same day)

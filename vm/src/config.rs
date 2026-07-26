@@ -194,7 +194,7 @@ pub struct VmConfig {
     /// explicitly; real JDK then defaults the cap to `-Xmx` (`max_heap_size`),
     /// and `vm_init` resolves it the same way when wiring up
     /// `native_io::direct_buffer`'s accounting. See
-    /// docs/known-issues/h2-suite-bugs/bug-h2-largeblob-direct-memory-oom.md —
+    /// docs/known-issues/h2/bug-h2-largeblob-direct-memory-oom.md —
     /// previously this cap was a hardcoded 256 MiB regardless of `-Xmx`,
     /// which OOM'd direct-buffer-heavy workloads (H2 MVStore chunk writes)
     /// that HotSpot handles fine at the same `-Xmx`.

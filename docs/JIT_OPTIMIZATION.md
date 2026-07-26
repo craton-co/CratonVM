@@ -318,8 +318,9 @@ today.*
 
 A Java Virtual Machine written entirely in Rust:
 
-- **~323,000+ lines** of Rust code (project-wide; the JIT alone is now
-  ~105,400 lines across `jit/src`, `jit/tests`, and `vm/src/jit` — see above)
+- **~1,290,000 lines** of Rust code (project-wide, across the 20 workspace
+  member crates, measured 2026-07-25; the JIT alone is now ~116,600 lines
+  across `jit/src`, `jit/tests`, and `vm/src/jit` — see above)
 - Large Rust/Java test corpus with clippy and formatting tracked as release gates
 - **~3,100+ native method** registrations (java.lang, java.util, java.io, java.time, ...)
 - Full interpreter with 140+ fast-path bytecodes
@@ -831,8 +832,8 @@ String access/search, Arrays, CRC32).
 
 | Metric | Value |
 |--------|-------|
-| Total Rust LoC | **~323,000+** |
-| JIT LoC (jit crate + vm/src/jit) | **~105,400** (`jit/src` 81,903 + `jit/tests` 8,307 + `vm/src/jit` 15,197) |
+| Total Rust LoC | **~1,290,000** (20 workspace members, measured 2026-07-25) |
+| JIT LoC (jit crate + vm/src/jit) | **~116,600** (`jit/src` 88,720 + `jit/tests` 8,447 + `vm/src/jit` 19,448) |
 | JIT backends | x86-64 (single-pass + IR-optimizing), AArch64 |
 | JIT bytecodes | ~130 core opcodes + ~40 call-site intrinsics |
 | JIT unit/integration tests | ~hundreds in `x64.rs` + differential/IR-vs-singlepass/intrinsic suites in `jit/tests/` |

@@ -93,6 +93,17 @@ pub struct ResolvedMethod {
     pub method_descriptor: Arc<str>,
     /// Cached parameter count (number of JVM stack slots consumed, excluding `this`).
     pub num_params: u16,
+    /// Exact native callback resolved for the symbolic owner, if one exists.
+    ///
+    /// This is method-resolution metadata rather than a VM-global string-keyed
+    /// cache: a constant-pool method reference hashes the native registry once,
+    /// then every call site sharing that resolved reference reuses the target.
+    /// Resolution-cache invalidation on class redefinition/unloading drops the
+    /// callback with the rest of the method metadata.
+    pub native_target: Option<cratonvm_native_api::NativeCallback>,
+    /// Category paired with [`Self::native_target`], cached from the same
+    /// registry probe so synthetic-stub selection never re-hashes the triple.
+    pub native_kind: Option<cratonvm_native_api::NativeKind>,
 }
 
 // ---------------------------------------------------------------------------
@@ -454,6 +465,20 @@ impl ResolutionCache {
         for val in self.condy.values() {
             if let Value::Object(Some(obj_ref)) = val {
                 roots.push(*obj_ref);
+            }
+        }
+    }
+
+    /// Visit condy roots together with the referring class that owns the
+    /// constant-pool cache entry. Loader unloading uses this to make the root
+    /// conditional on defining-loader liveness.
+    pub fn for_each_condy_root(
+        &self,
+        mut visit: impl FnMut(ClassId, cratonvm_types::ObjectRef),
+    ) {
+        for (&(class_id, _), value) in &self.condy {
+            if let Value::Object(Some(object)) = value {
+                visit(class_id, *object);
             }
         }
     }
@@ -1497,6 +1522,13 @@ mod tests {
 
     #[test]
     fn cache_method_put_and_get() {
+        fn cached_native(
+            _ctx: &mut dyn cratonvm_native_api::NativeContext,
+            _args: &[cratonvm_types::Value],
+        ) -> cratonvm_types::error::MethodCallResult {
+            Ok(None)
+        }
+
         let mut cache = ResolutionCache::new();
         let key_class = ClassId::new(0);
         let cp_index = 10;
@@ -1512,12 +1544,22 @@ mod tests {
                 method_name: Arc::from("toString"),
                 method_descriptor: Arc::from("()Ljava/lang/String;"),
                 num_params: 0,
+                native_target: Some(cached_native),
+                native_kind: Some(cratonvm_native_api::NativeKind::Bridge),
             },
         );
 
         let resolved = cache.get_method(key_class, cp_index).unwrap();
         assert_eq!(resolved.declaring_class_id, ClassId::new(3));
         assert_eq!(&*resolved.method_name, "toString");
+        assert_eq!(
+            resolved.native_target.map(|target| target as usize),
+            Some(cached_native as usize)
+        );
+        assert_eq!(
+            resolved.native_kind,
+            Some(cratonvm_native_api::NativeKind::Bridge)
+        );
         assert_eq!(cache.method_count(), 1);
     }
 
@@ -1629,6 +1671,9 @@ mod tests {
                 is_static: false,
                 force_native_cache: std::sync::OnceLock::new(),
                 native_callback_cache: std::sync::OnceLock::new(),
+                invoc_key: std::sync::OnceLock::new(),
+                jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
+                quickened: std::sync::OnceLock::new(),
             })
         };
 
@@ -1699,6 +1744,9 @@ mod tests {
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
+            invoc_key: std::sync::OnceLock::new(),
+            jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
+            quickened: std::sync::OnceLock::new(),
         });
         let entry = CachedInvokeTarget::Bytecode {
             cached,
@@ -1734,6 +1782,9 @@ mod tests {
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
+            invoc_key: std::sync::OnceLock::new(),
+            jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
+            quickened: std::sync::OnceLock::new(),
         });
         cache.put(
             caller,
