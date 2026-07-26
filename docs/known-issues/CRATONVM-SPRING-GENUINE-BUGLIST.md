@@ -3081,3 +3081,52 @@ should not be used; it silently removes the engine those classes exist to test.
 **Blocker 2** (`Class.getDeclaredMethods()` `NoSuchMethodError` inside a
 dynamically-`defineClass`'d CGLIB class's `<clinit>`) is untouched by this
 session and remains open.
+
+## 2026-07-26 Blocker 2 still open -- but the `NoSuchMethodError` names a MALFORMED descriptor
+
+Re-confirmed on current `dev` (worktree `/data/data/wt-testngnpe-20260726`,
+real JDK 25, `--Xmx 4g`; Blocker 1's testng-jar-stripping workaround is no
+longer needed now that Blocker 1 is fixed). `AotIntegrationTests` still fails
+`endToEndTestsForBeanOverrides` at the same place:
+
+```
+TestContextAotException: Failed to generate AOT artifacts for test classes
+  [...MockitoSpyBeanAndCircularDependenciesWithLazyResolutionProxyIntegrationTests]
+Caused by: NoSuchMethodError: java.lang.Class.getDeclaredMethods()[Ljava/lang/reflect/Method[];
+  at ...$Two$$SpringCGLIB$$0.CGLIB$STATICHOOK1(<generated>)
+  at ...$Two$$SpringCGLIB$$0.<clinit>(<generated>)
+  at org.springframework.cglib.core.ReflectUtils.defineClass(ReflectUtils.java:581)
+```
+
+**New and actionable: look at the descriptor.** It is
+`()[Ljava/lang/reflect/Method[];` -- note the `[]` INSIDE the `L...;`. The real
+descriptor in cglib's generated constant pool is `()[Ljava/lang/reflect/Method;`.
+So this is not "method resolution fails for a dynamically-defined class"; the
+descriptor CratonVM resolves for that call site is textually wrong, and of
+course no such method is registered. The mangled form is exactly what
+`format!("[L{};", name)` produces when handed the *Java-language* array name
+`java/lang/reflect/Method[]` instead of a descriptor-form name -- i.e. an
+array-name-to-descriptor conversion that assumed its input was not already an
+array. There are four such `[L{};` builders (`native-builtins/src/lang_class.rs`
+`native_class_array_type`, `native-collections/src/lib.rs`,
+`native-builtins/src/generics.rs`, `vm/src/runtime/interpreter.rs`); each guards
+with `starts_with('[')`, so the producer is whichever path can see the bracketed
+Java name. Start by dumping the descriptor at the resolution site
+(`vm/src/vm/vm_exec.rs`'s `NoSuchMethodError` warn) for a class defined through
+`ReflectUtils.defineClass`, and compare it with the raw CP UTF8 entry.
+
+**Ruled out this session** (all verified equal to HotSpot on current `dev`):
+
+- Ordinary real-cglib proxy generation is fine. `Enhancer.create()` on a plain
+  class produces a working proxy, `CGLIB$STATICHOOK1` runs, and
+  `proxyClass.getDeclaredMethods()` returns the same 24 methods HotSpot does.
+  So it is NOT "any real-bytecode cglib proxy generation" as the original
+  Blocker 2 note supposed.
+- `Class.getDeclaredMethods` itself resolves fine everywhere else
+  (`Class.class.getDeclaredMethods().length == 167`, same as HotSpot).
+- Array class naming is correct in isolation: `Method[].class.getName()`,
+  `getClass().getName()`, `arrayType().getName()` and `descriptorString()` all
+  match HotSpot exactly, so the bracketed name is being produced somewhere
+  narrower than the general array-mirror path.
+- `MockitoSpyBeanAndCircularDependenciesWithLazyResolutionProxyIntegrationTests`
+  passes 1/1 when run directly; only the AOT-generation path fails.
