@@ -29719,6 +29719,13 @@ fn intercept_force_registered_native(
         // §3 Step 1, B1). The memo is keyed on the registry generation, so a
         // native registered later is still picked up and a negative result
         // self-heals — unlike a `OnceLock`.
+        //
+        // ONE STATIC, ONE TRIPLE. The generation is the *only* key: the triple
+        // is not re-verified on a warm hit (re-hashing it is the cost this
+        // exists to remove), so a cell reached with a second triple can redeem
+        // the first's memoized negative and silently report "no native" for a
+        // registered one. This cell is reached from exactly one call, with
+        // three string literals.
         static NCS_CLASS_GET_CLASSLOADER: cratonvm_native_api::NativeCallSite =
             cratonvm_native_api::NativeCallSite::new();
         let callback = NCS_CLASS_GET_CLASSLOADER.callback(
@@ -30294,6 +30301,9 @@ fn intercept_classloader_set_default_assertion_status(
         return None;
     }
     // Fully-constant triple — memoized (native-dispatch-memoization §3, B2).
+    // ONE STATIC, ONE TRIPLE: reached from exactly this one call, with three
+    // literals. See `NCS_CLASS_GET_CLASSLOADER` for why sharing a cell across
+    // triples silently mis-answers.
     static NCS_CL_SET_DEFAULT_ASSERTION_STATUS: cratonvm_native_api::NativeCallSite =
         cratonvm_native_api::NativeCallSite::new();
     let cb = NCS_CL_SET_DEFAULT_ASSERTION_STATUS.callback(
@@ -30304,15 +30314,6 @@ fn intercept_classloader_set_default_assertion_status(
     )?;
     Some(crate::vm::safe_native_call(shared, thread, cb, args).map(|_| CachedCallResult::Handled))
 }
-
-/// Shared memo for the (fully constant) `LazyLauncher.discover` triple.
-/// Module-level rather than function-local because two call sites look up the
-/// identical triple — `surefire_lazy_launcher_discover_native` below and the
-/// third arm of `native_override_for_cached_reflect_invoke`
-/// (native-dispatch-memoization §3 Step 1, B3 + B7, which that doc explicitly
-/// asks to share one cell).
-static NCS_LAZY_LAUNCHER_DISCOVER: cratonvm_native_api::NativeCallSite =
-    cratonvm_native_api::NativeCallSite::new();
 
 /// Surefire `LazyLauncher` implements `Launcher`. Some dispatch paths key the
 /// lookup by the constant-pool interface (`org/junit/platform/launcher/Launcher`)
@@ -30332,6 +30333,20 @@ fn surefire_lazy_launcher_discover_native(
     if method_name != "discover" || descriptor != DESC_DISCOVER {
         return None;
     }
+    // Fully-constant triple (`LAZY` / `DESC_DISCOVER` are the `const`s above),
+    // memoized per native-dispatch-memoization §3 Step 1, B3.
+    //
+    // ONE STATIC, ONE TRIPLE. A `NativeCallSite` memo is keyed on the registry
+    // generation alone — the triple is deliberately not re-checked on a warm
+    // hit, since re-hashing it is the exact cost the cell exists to remove.
+    // So a cell that ever sees a second triple can redeem the first triple's
+    // memoized negative for the second and silently answer `None` for a
+    // native that is in fact registered. This cell is reached from exactly
+    // this one call, with these constants. The identical triple in
+    // `native_override_for_cached_reflect_invoke` gets its *own* cell rather
+    // than sharing this one.
+    static NCS_LAZY_LAUNCHER_DISCOVER: cratonvm_native_api::NativeCallSite =
+        cratonvm_native_api::NativeCallSite::new();
     let cb = NCS_LAZY_LAUNCHER_DISCOVER.callback(
         &shared.natives.native_methods,
         LAZY,
@@ -30480,6 +30495,11 @@ fn try_stackless_invoke(
 
     // Memo for the constant `DowncallHandle.type()` triple resolved in the
     // receiver-class-gated arm below (native-dispatch-memoization §3, B4).
+    // ONE STATIC, ONE TRIPLE: the single `.callback` below passes three
+    // literals, and no other arm of this function touches this cell. In
+    // particular the `.or_else` chain's lookups — whose class name is rewritten
+    // from `[`-prefixed receivers and therefore varies at runtime — are NOT
+    // memoizable by this mechanism and are deliberately left re-resolving.
     static NCS_DOWNCALL_HANDLE_TYPE: cratonvm_native_api::NativeCallSite =
         cratonvm_native_api::NativeCallSite::new();
 
@@ -39544,13 +39564,22 @@ fn native_override_for_cached_reflect_invoke(
     method_name: &str,
     descriptor: &str,
 ) -> Option<cratonvm_native_api::NativeCallback> {
-    // Every arm is a fully-constant triple, so each gets its own memo cell
-    // (native-dispatch-memoization §3 Step 1, B5/B6/B7). The `discover` arm
-    // shares `NCS_LAZY_LAUNCHER_DISCOVER` with
-    // `surefire_lazy_launcher_discover_native`, which looks up the same triple.
+    // Every arm is a fully-constant triple, so each gets its OWN memo cell
+    // (native-dispatch-memoization §3 Step 1, B5/B6/B7).
+    //
+    // ONE STATIC, ONE TRIPLE — a `NativeCallSite` is keyed on the registry
+    // generation alone and does not re-verify the triple on a warm hit, so a
+    // cell reached with two different triples can hand the second one the
+    // first one's memoized negative and silently report "no native" for a
+    // registered one. Each arm below is a distinct triple and therefore a
+    // distinct cell; the third does NOT reuse
+    // `surefire_lazy_launcher_discover_native`'s cell even though the triple
+    // is identical, so no cell is reachable from more than one call.
     static NCS_METHOD_INVOKE: cratonvm_native_api::NativeCallSite =
         cratonvm_native_api::NativeCallSite::new();
     static NCS_CONSTRUCTOR_NEW_INSTANCE: cratonvm_native_api::NativeCallSite =
+        cratonvm_native_api::NativeCallSite::new();
+    static NCS_REFLECT_LAZY_LAUNCHER_DISCOVER: cratonvm_native_api::NativeCallSite =
         cratonvm_native_api::NativeCallSite::new();
     match (class_name, method_name, descriptor) {
         (
@@ -39577,7 +39606,7 @@ fn native_override_for_cached_reflect_invoke(
             "org/apache/maven/surefire/junitplatform/LazyLauncher",
             "discover",
             "(Lorg/junit/platform/launcher/LauncherDiscoveryRequest;)Lorg/junit/platform/launcher/TestPlan;",
-        ) => NCS_LAZY_LAUNCHER_DISCOVER.callback(
+        ) => NCS_REFLECT_LAZY_LAUNCHER_DISCOVER.callback(
             &shared.natives.native_methods,
             "org/apache/maven/surefire/junitplatform/LazyLauncher",
             "discover",
@@ -42769,6 +42798,47 @@ mod wave1_adoption_tests {
             )
             .expect("warm read");
         assert_eq!(warm as usize, via_find as usize);
+    }
+
+    /// ONE STATIC, ONE TRIPLE — the invariant every `NCS_*` cell in this file
+    /// relies on, pinned here so the failure mode is visible next to the call
+    /// sites rather than only in `native-api`.
+    ///
+    /// A `NativeCallSite` memo is `(generation << 32) | slot` and is validated
+    /// against the registry generation *only*: the triple is deliberately not
+    /// re-checked on a warm hit, because re-hashing three strings is the exact
+    /// cost the cell exists to remove. So a cell reached with two different
+    /// triples will hand the second one whatever the first memoized — and when
+    /// the first was a miss, that is a silent `None` for a native that is
+    /// registered and dispatches fine through `find`. No panic, no log.
+    #[test]
+    fn sharing_one_memo_cell_across_two_triples_silently_mis_answers() {
+        let mut registry = cratonvm_native_api::NativeMethodRegistry::new();
+        registry.register("java/lang/Sample", "b", "()V", noop_native);
+
+        // A cell that first sees triple A (unregistered) memoizes a negative
+        // for this generation, then wrongly serves it to triple B.
+        let shared_cell = cratonvm_native_api::NativeCallSite::new();
+        assert!(shared_cell
+            .callback(&registry, "java/lang/Sample", "a", "()V")
+            .is_none());
+        let leaked = shared_cell.callback(&registry, "java/lang/Sample", "b", "()V");
+        assert!(
+            leaked.is_none(),
+            "this asserts the FOOTGUN, not desired behaviour: a shared cell \
+             redeems triple A's negative for triple B"
+        );
+
+        // `find` proves the native really is registered and resolvable — the
+        // shared cell was simply wrong.
+        assert!(registry.find("java/lang/Sample", "b", "()V").is_some());
+
+        // One cell per triple is correct. Every `NCS_*` static in this file is
+        // reached from exactly one call site with a literal/const triple.
+        let cell_b = cratonvm_native_api::NativeCallSite::new();
+        assert!(cell_b
+            .callback(&registry, "java/lang/Sample", "b", "()V")
+            .is_some());
     }
 }
 
