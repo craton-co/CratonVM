@@ -267,3 +267,14 @@ still real correctness bugs worth closing):
    wall-clock lifted vs. baseline.
 4. Work down the "Medium" list — each is single-suite, well-scoped, lower
    risk of interacting with concurrent work elsewhere.
+
+## TOMCAT-JNDIREALM-RDN.1 / JIT.2 — CLAIMED 2026-07-26 02:38 UTC
+
+Picked from the Medium list, branch `fix/jit-ban-sweep-20260725`, since
+SPB.1 and ANTLR.1 are now both owned by the other session
+(`fix/jit-ban-sweep2-20260726`). UnboundID in-memory LDAP path
+(`com/unboundid/ldap/sdk/RDN.getNameValuePairs` narrow guard +
+`com/unboundid/` whole-package guard, skip_list.rs ~L1138-1177).
+Testable via Tomcat's 76-case `TestJNDIRealmIntegration` matrix on this
+host's Tomcat fixture (`/data/data/apps/tomcat`). Starting with the
+narrow RDN.getNameValuePairs guard first.
