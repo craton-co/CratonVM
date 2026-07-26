@@ -52,7 +52,7 @@
 //!   checked against the declaration order of `SharedVm` every time someone
 //!   reads it;
 //! * a *cross-realm* acquisition is now syntactically visible at the call
-//!   site — `shared.classes.class_manager.write()` inside a
+//!   site — `shared.classes.class_manager_write()` inside a
 //!   `shared.threads.monitors` critical section reads as two different
 //!   subsystems, where previously both were indistinguishable
 //!   `shared.<field>` accesses;

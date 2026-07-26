@@ -3459,7 +3459,7 @@ impl<'a> NativeContextImpl<'a> {
             cls.name.to_string()
         };
         {
-            let mut cm = self.shared.classes.class_manager.write();
+            let mut cm = self.shared.classes.class_manager_write();
             let options = RedefineOptions {
                 preserve_original_bytes: preserve_original,
                 ..RedefineOptions::default()
@@ -8130,6 +8130,11 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             .threads
             .thread_registry
             .register_with_daemon(tid, name, None, daemon);
+        // obsaudit D1: this runs on the newly-spawned OS thread itself (see
+        // the raw `join_handle_ptr` claim below), so binding the JVMTI
+        // thread-attribution TLS here correctly attributes every class this
+        // `Thread.start()` worker loads to its own `jthread`.
+        cratonvm_classloading::set_current_thread_id(tid.0);
         // Claim the raw pointer for exactly-once consumption BEFORE
         // reconstructing the Box: if this exact pointer were ever passed twice
         // (a duplicated handle), the second `Box::from_raw` would double-free
@@ -10378,7 +10383,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     }
 
     fn set_class_hidden(&mut self, class_id: ClassId) {
-        let mut cm = self.shared.classes.class_manager.write();
+        let mut cm = self.shared.classes.class_manager_write();
         if let Some(class) = cm.get_class_mut(class_id) {
             class.hidden = true;
         }
@@ -10396,7 +10401,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // inherit the lookup class's nest host and nest members. We copy
         // the relevant fields onto the target so that member access
         // checks see the hidden class as a legitimate nestmate.
-        let mut cm = self.shared.classes.class_manager.write();
+        let mut cm = self.shared.classes.class_manager_write();
         // Grab the nest info from the source class first (release the
         // immutable borrow before we take a mutable one).
         let (nest_host, nest_members) = match cm.get_class(source_class) {
@@ -10575,7 +10580,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
 
     fn define_class_from_bytes(&mut self, name: &str, bytes: &[u8]) -> Option<ClassId> {
         use cratonvm_types::ClassLoaderId;
-        let mut cm = self.shared.classes.class_manager.write();
+        let mut cm = self.shared.classes.class_manager_write();
         match cm.define_class(name, bytes, ClassLoaderId::Application) {
             Ok(cid) => {
                 // Release the ClassManager write lock before calling
@@ -10613,7 +10618,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     ) -> Result<ClassId, String> {
         use cratonvm_classloading::DefineClassOptions;
         use cratonvm_types::ClassLoaderId;
-        let mut cm = self.shared.classes.class_manager.write();
+        let mut cm = self.shared.classes.class_manager_write();
         let options = DefineClassOptions {
             override_name: Some(stored_name.to_string()),
             hidden: true,
@@ -10649,7 +10654,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         loader_id: u32,
     ) -> Option<ClassId> {
         use cratonvm_types::ClassLoaderId;
-        let mut cm = self.shared.classes.class_manager.write();
+        let mut cm = self.shared.classes.class_manager_write();
         match cm.define_class(name, bytes, ClassLoaderId::UserDefined(loader_id)) {
             Ok(cid) => {
                 drop(cm);
@@ -10726,7 +10731,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         };
 
         let cid = {
-            let mut cm = self.shared.classes.class_manager.write();
+            let mut cm = self.shared.classes.class_manager_write();
             cm.define_class_with_options(name, bytes, cl_id, define_opts)
                 .map_err(|e| format!("{e:?}"))?
         };
@@ -21348,7 +21353,7 @@ mod tests {
         let shared = test_shared();
         // Register a synthetic stub so field_at_index resolves.
         let cid = {
-            let mut cm = shared.classes.class_manager.write();
+            let mut cm = shared.classes.class_manager_write();
             cm.ensure_synthetic_class("cratonvm/test/SyntheticStubProbe", 2)
         };
         // Sanity: that class is a stub.
@@ -21395,7 +21400,7 @@ mod tests {
             .collect();
         let num_fields = fields.len();
 
-        let mut cm = shared.classes.class_manager.write();
+        let mut cm = shared.classes.class_manager_write();
         let id = cm.class_store.next_id();
         cm.class_store.add(Class {
             id,
@@ -21443,7 +21448,7 @@ mod tests {
             &["Ljava/lang/Runnable;"],
         );
         {
-            let mut cm = shared.classes.class_manager.write();
+            let mut cm = shared.classes.class_manager_write();
             let cls = cm
                 .get_class_mut(thread_cid)
                 .expect("test thread layout class registered");
