@@ -474,12 +474,47 @@ impl Tlab {
         self.cursor = self.end;
     }
 
+    /// Bytes handed out of this TLAB since it was installed, **including the
+    /// allocations the JIT's inline bump made without ever entering this
+    /// file**.
+    ///
+    /// `cursor - start` is the only measure that sees those: the compiled
+    /// fast path in `jit/src/x64.rs::emit_inline_tlab_new` reads `cursor` and
+    /// `end` at their fixed offsets, bumps the cursor and commits it — it
+    /// never touches [`TlabPressureTracker`]. Returns 0 for an empty
+    /// (retired / never refilled) TLAB.
+    pub fn consumed_bytes(&self) -> usize {
+        if self.start.is_null() || self.cursor.is_null() {
+            return 0;
+        }
+        (self.cursor as usize).saturating_sub(self.start as usize)
+    }
+
     /// T5.5.1 — Recommended byte size for the next refill. Delegates to
     /// the per-thread [`TlabPressureTracker`] which applies the
-    /// grow/shrink heuristic. Call this after retiring the current TLAB
-    /// and before requesting a fresh buffer from the arena.
+    /// grow/shrink heuristic. Call this **before** retiring the current TLAB
+    /// (the sizer reads the live cursor) and before requesting a fresh buffer
+    /// from the arena.
+    ///
+    /// JIT BLINDNESS (perf/gc-allocation-fastpath, 2026-07-26). The tracker's
+    /// `alloc_count` only counts allocations that went through
+    /// [`Tlab::alloc_initialized`]. A thread running compiled code allocates
+    /// through the JIT's inline bump instead, so its `alloc_count` is ~0 for
+    /// the whole TLAB lifetime — and the raw heuristic reads "fewer than
+    /// [`SLOW_REFILL_ALLOC_COUNT`] allocations" as *idle*. The result was a
+    /// one-way ratchet: any JIT thread whose TLAB took longer than
+    /// [`FAST_REFILL_THRESHOLD_MS`] to fill halved its next request, again
+    /// and again, down to [`MIN_TLAB_SIZE`] — and could never climb back,
+    /// because the shrink condition stayed permanently true no matter how
+    /// furiously the thread was allocating. An 8 KiB TLAB refills 32x more
+    /// often than the 256 KiB baseline, and every refill is a young-arena
+    /// lock, a `write_bytes` of the whole chunk, a tail-filler write and two
+    /// `Instant::now()` calls. Passing the observed consumption in lets the
+    /// tracker distinguish "nobody allocated" from "the JIT allocated and did
+    /// not tell you".
     pub fn next_refill_size(&mut self) -> usize {
-        self.pressure.next_refill_size()
+        let consumed = self.consumed_bytes();
+        self.pressure.next_refill_size_with_consumed(consumed)
     }
 
     /// T5.5.1 — Notify the tracker that a new TLAB of `size` bytes has
@@ -664,17 +699,47 @@ impl TlabPressureTracker {
     /// The returned value is guaranteed to satisfy
     /// `MIN_TLAB_SIZE <= size <= MAX_TLAB_SIZE`.
     pub fn next_refill_size(&self) -> usize {
+        // No external consumption measure — the tracker's own byte tally is
+        // the whole truth for a caller that does not own a live `Tlab`.
+        self.next_refill_size_with_consumed(0)
+    }
+
+    /// [`Self::next_refill_size`], told how many bytes the TLAB *actually*
+    /// handed out.
+    ///
+    /// `consumed_bytes` comes from [`Tlab::consumed_bytes`] (the live
+    /// `cursor - start` span) and is the only signal that sees the JIT's
+    /// inline bump — see the note on [`Tlab::next_refill_size`] for the
+    /// one-way shrink ratchet this closes. The tracker's own tally is still
+    /// used when it is the larger of the two, so nothing about the
+    /// interpreter path's behaviour changes.
+    pub fn next_refill_size_with_consumed(&self, consumed_bytes: usize) -> usize {
         let elapsed_ms = self.refill_started_at.elapsed().as_millis();
         let alloc_count = self.alloc_count as usize;
         let large_allocs = self.large_alloc_count as usize;
         let current = self.last_refill_size;
 
-        // Grow when: fast fill OR few-but-large allocations dominated.
-        let grow = elapsed_ms < FAST_REFILL_THRESHOLD_MS
-            || (alloc_count < FAST_REFILL_ALLOC_COUNT && large_allocs > 0);
+        // Did the thread actually drain this TLAB? `alloc_count` cannot
+        // answer that for compiled code, but the byte high-water mark can.
+        // 75% is deliberately below 100%: the last object that did not fit is
+        // what ends a TLAB's life, so a fully-drained TLAB still reports a
+        // short tail, and a partially-filled one that was retired early
+        // (refill for an oversized object) should not read as pressure.
+        let bytes = (self.allocations_since_last_refill as usize).max(consumed_bytes);
+        let well_used = current > 0 && bytes.saturating_mul(4) >= current.saturating_mul(3);
 
-        // Shrink when: very slow fill OR the TLAB was barely touched.
-        let shrink = elapsed_ms > SLOW_REFILL_THRESHOLD_MS || alloc_count < SLOW_REFILL_ALLOC_COUNT;
+        // Grow when: fast fill OR few-but-large allocations dominated OR the
+        // TLAB was genuinely drained within a sane window (the JIT-visible
+        // arm — `alloc_count` is blind to compiled allocation).
+        let grow = elapsed_ms < FAST_REFILL_THRESHOLD_MS
+            || (alloc_count < FAST_REFILL_ALLOC_COUNT && large_allocs > 0)
+            || (well_used && elapsed_ms < SLOW_REFILL_THRESHOLD_MS);
+
+        // Shrink when: very slow fill OR the TLAB was barely touched. "Barely
+        // touched" now requires the BYTE evidence to agree — a drained TLAB
+        // is never idle, however few allocations this tracker saw.
+        let shrink = elapsed_ms > SLOW_REFILL_THRESHOLD_MS
+            || (alloc_count < SLOW_REFILL_ALLOC_COUNT && !well_used);
 
         let next = if grow && !shrink {
             current.saturating_mul(2).min(MAX_TLAB_SIZE)
@@ -1126,6 +1191,123 @@ mod tests {
             tlab.install_tail_filler(TLAB_FILLER_CLASS_ID);
         }
         assert!(tlab.is_empty());
+    }
+
+    // ---------------------------------------------------------------
+    // JIT-blind sizing (perf/gc-allocation-fastpath, 2026-07-26)
+    // ---------------------------------------------------------------
+
+    /// `consumed_bytes` is the ONLY signal that sees the JIT's inline bump,
+    /// so it must track the raw cursor span — including a bump this file
+    /// never performed. Simulate the compiled fast path exactly: read the
+    /// cursor, add the object size, store it back.
+    #[test]
+    fn consumed_bytes_sees_a_raw_cursor_bump() {
+        let mut buf = vec![0u8; 4096];
+        let mut tlab = unsafe { Tlab::new(buf.as_mut_ptr(), 4096) };
+        assert_eq!(tlab.consumed_bytes(), 0);
+
+        tlab.alloc(64, 8).unwrap();
+        assert_eq!(tlab.consumed_bytes(), 64);
+
+        // The JIT's `emit_inline_tlab_new`: bump `cursor` in place, touching
+        // nothing else on the struct.
+        let bumped = unsafe { tlab.cursor.add(128) };
+        tlab.cursor = bumped;
+        assert_eq!(tlab.consumed_bytes(), 64 + 128);
+        // The tracker itself saw only the one Rust-side allocation.
+        assert_eq!(tlab.pressure_tracker().alloc_count, 1);
+
+        // An empty TLAB contributes nothing (no null-pointer arithmetic).
+        let empty = Tlab::empty();
+        assert_eq!(empty.consumed_bytes(), 0);
+    }
+
+    /// The regression this fix exists for: a thread allocating entirely
+    /// through compiled code reports `alloc_count == 0`, which the raw
+    /// heuristic read as "idle" and halved the TLAB for — every refill,
+    /// forever, down to the floor and never back up. With the consumption
+    /// signal the drained TLAB is recognised as pressure instead.
+    #[test]
+    fn jit_drained_tlab_does_not_ratchet_down() {
+        let size = 256 * 1024;
+        let mut t = TlabPressureTracker::new();
+        t.begin_refill(size);
+        // Slow enough that the sub-millisecond "fast fill" arm cannot rescue
+        // it — this is the case that used to shrink.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+
+        // Without the consumption signal: read as idle, halved.
+        assert_eq!(t.next_refill_size_with_consumed(0), size / 2);
+        // With it: the TLAB was drained, so it is not idle.
+        assert!(
+            t.next_refill_size_with_consumed(size) >= size,
+            "a drained TLAB must never shrink"
+        );
+    }
+
+    /// The ratchet was one-way — once at the floor, the shrink condition
+    /// stayed true regardless of allocation rate, so the thread was stuck
+    /// with 8 KiB TLABs for the rest of the process. Walking the sizer the
+    /// way the refill path does must climb back out.
+    #[test]
+    fn jit_drained_tlab_climbs_back_from_the_floor() {
+        let mut t = TlabPressureTracker::new();
+        let mut size = MIN_TLAB_SIZE;
+        t.begin_refill(size);
+        for _ in 0..16 {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            // Whole TLAB consumed by compiled code: zero tracked allocations.
+            let next = t.next_refill_size_with_consumed(size);
+            assert!(next >= size, "sizer went backwards: {next} < {size}");
+            if next == size {
+                break;
+            }
+            size = next;
+            t.begin_refill(size);
+            if size >= DEFAULT_TLAB_SIZE {
+                break;
+            }
+        }
+        assert!(
+            size >= DEFAULT_TLAB_SIZE,
+            "JIT-drained thread stuck at {size} bytes"
+        );
+    }
+
+    /// A TLAB that was barely touched must still shrink — the consumption
+    /// signal must not blanket-disable the idle path (one sleeping thread per
+    /// core holding a 1 MiB chunk is what the shrink arm exists to prevent).
+    #[test]
+    fn barely_used_tlab_still_shrinks_with_consumption_signal() {
+        let mut t = TlabPressureTracker::new();
+        t.begin_refill(MAX_TLAB_SIZE);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        // 4 KiB out of 1 MiB consumed — nowhere near drained.
+        let next = t.next_refill_size_with_consumed(4096);
+        assert!(
+            next < MAX_TLAB_SIZE,
+            "an idle thread must give its TLAB back, got {next}"
+        );
+        assert!(next >= MIN_TLAB_SIZE);
+    }
+
+    /// The whole-TLAB path: `Tlab::next_refill_size` must feed its own live
+    /// cursor span in, so callers get the fix without threading anything.
+    #[test]
+    fn tlab_next_refill_size_feeds_its_own_consumption() {
+        let bytes = 64 * 1024;
+        let mut buf = vec![0u8; bytes];
+        let mut tlab = unsafe { Tlab::new(buf.as_mut_ptr(), bytes) };
+        tlab.begin_refill(bytes);
+        // Drain it the way compiled code does: raw cursor bump only.
+        tlab.cursor = unsafe { tlab.start.add(bytes) };
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        assert_eq!(tlab.consumed_bytes(), bytes);
+        assert!(
+            tlab.next_refill_size() >= bytes,
+            "a JIT-drained TLAB must not shrink through the Tlab wrapper"
+        );
     }
 
     #[test]
