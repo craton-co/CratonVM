@@ -3326,10 +3326,21 @@ recorded as an observation, to be reconfirmed on the next run.
    session by running the same test against this file's pre-change contents),
    still just stale hardcoded byte-length constants.
 
-dynamically-`defineClass`'d CGLIB class's `<clinit>`) is untouched by this
-session and remains open.
+## 2026-07-26 Blocker 2 -- the MALFORMED-descriptor investigation (question ANSWERED below)
 
-## 2026-07-26 Blocker 2 still open -- but the `NoSuchMethodError` names a MALFORMED descriptor
+> **Answered by "AOT follow-up 10", Fix 3, further down this file.** This
+> section's central question -- *"is the constant pool being parsed wrong, or is
+> the descriptor being re-synthesised somewhere between parse and dispatch?"* --
+> has a third answer that it did not consider, and that is the right one:
+> **neither**. CratonVM parses and dispatches the descriptor it was given; the
+> malformed `()[Ljava/lang/reflect/Method[];` is baked into the generated class
+> file by cglib's own *Java* code. `org.springframework.cglib.core.TypeUtils.map`
+> builds it with `type.substring(0, type.length() - sb.length() * 2)`, and
+> `sb.length()` returned 0 because CratonVM's `sb_set_count` wrote `count` into
+> JDK 25's `maybeLatin1` slot. Everything this section rules out is correctly
+> ruled out -- including, usefully, all nine `format!("[L{};", ...)` builders --
+> and the conclusion "do not start from that list" was exactly right. Kept in
+> full for that reason.
 
 Re-confirmed on current `dev` (worktree `/data/data/wt-testngnpe-20260726`,
 real JDK 25, `--Xmx 4g`; Blocker 1's testng-jar-stripping workaround is no
@@ -3389,3 +3400,113 @@ descriptor being re-synthesised somewhere between parse and dispatch?
   narrower than the general array-mirror path.
 - `MockitoSpyBeanAndCircularDependenciesWithLazyResolutionProxyIntegrationTests`
   passes 1/1 when run directly; only the AOT-generation path fails.
+
+## 2026-07-26 AOT follow-up 11 -- "Family A" root-caused and FIXED: `BeanOverrideUtils` was being asked about the wrong classloader's `@BeanOverride`
+
+Same worktree/branch as follow-up 10. The 13 failures that follow-up 10 left --
+`@MockitoBean`/`@MockitoSpyBean` **by-name** lookup for **constructor
+parameters**, AOT-replay only -- are one bug, and it is a one-line class
+resolution defect.
+
+### The enabling step: a 23-second end-to-end harness
+
+`endToEndTestsForBeanOverrides` takes ~15 minutes and processes 175 classes, so
+nothing about it is debuggable. Two small probes replace it
+(`/data/data/aot20260726/src/`, and reusable for ANY future AOT-replay bug):
+
+- **`AotE2EProbe`** is `AotIntegrationTests.runEndToEndTests` cut down to the
+  classes named on the command line: `TestContextAotGenerator
+  .processAheadOfTime` -> `TestCompiler` compiles the generated sources ->
+  re-run the same classes under `spring.aot.enabled=true`.
+- **`ForkedProbeMain`** (in package `org.springframework.core.test.tools`, since
+  `CompileWithForkedClassLoaderClassLoader` is package-private) runs
+  `AotE2EProbe` inside that forked loader, which is what
+  `@CompileWithForkedClassLoader` does for the real test method. **This part is
+  not optional**: `TestCompiler` defines the generated `__TestContext001
+  _BeanDefinitions` classes into the forked loader, and they touch
+  package-private members of the test class, so without it the probe dies with
+  `IllegalAccessError` on HotSpot too.
+
+Two gotchas worth reusing: pass the `@Nested` classes explicitly (the real
+harness gets them from `TestClassScanner`, and without them the nested tests
+fail with "Failed to load AOT ApplicationContextInitializer"), and build the
+`Launcher` with an explicit Jupiter-only `LauncherConfig` -- ServiceLoader-based
+engine discovery runs under the forked TCCL and splits the Suite/TestNG engines'
+package-private helpers across the two loaders.
+
+The result: 23 seconds per class, and the failure reproduces exactly.
+
+### Root cause
+
+`native_spring_extension_resolve_parameter` faithfully mirrors real Spring's
+`SpringExtension.resolveParameter`, including its by-name shortcut:
+
+```java
+BeanOverrideHandler handler = BeanOverrideUtils.resolveHandlerForParameter(parameter, testClass);
+if (handler != null && handler.getBeanName() != null) {
+    return applicationContext.getBean(handler.getBeanName());
+}
+```
+
+but it reached `BeanOverrideUtils` through a plain, **loader-blind**
+`ctx.invoke_special` by name, which prefers the Application-loader copy. The
+SpringExtension statics a few lines above already anchor around exactly this
+hazard (`spring_extension_invoke_special_anchored_on_test_class`); this call was
+missed.
+
+It matters more here than anywhere else in that native, because
+`resolveHandlerForParameter` does its own annotation scan --
+`MergedAnnotations.from(parameter).stream(BeanOverride.class)` -- and that
+`BeanOverride.class` literal resolves against whichever copy of
+`BeanOverrideUtils` is running. The Application-loader copy therefore asks *"is
+this parameter annotated with the APPLICATION loader's `@BeanOverride`?"* about a
+parameter belonging to a fork-loaded class, whose `@MockitoBean` is
+meta-annotated with the FORK's `@BeanOverride`. The answer is no, for every
+parameter, so the shortcut silently never fired.
+
+Everything then fell through to `ParameterResolutionDelegate.resolveDependency`,
+and the surviving symptom depends entirely on luck:
+
+| parameter | override name | rescued by | outcome |
+|---|---|---|---|
+| `@MockitoBean ExampleService s0A` | (none) | parameter name == bean name | passes |
+| `@MockitoBean @Qualifier("s0C") ... service0C` | (none) | the `@Qualifier` | passes |
+| `@MockitoBean(name = "s0B") ... service0B` | `s0B` | nothing | **fails** |
+| `@MockitoBean("nonExistingBean") ... nonExisting` | `nonExistingBean` | nothing | would fail |
+
+-- which is why every failure names `service0B` (JUnit stops at the first
+unresolvable parameter, index 1) and reports `expected single matching bean but
+found 4: s0A,s0B,s0C,nonExistingBean`: every sibling override bean shares the
+declared type. It is also why this is AOT-only: with no fork loader there are
+no two copies to disagree across.
+
+**Confirmed before writing any fix, on HotSpot, with no CratonVM involvement**
+(`BoUtilsProbe`): calling the Application-loader copy of
+`resolveHandlerForParameter` on a fork-loaded parameter returns `null` for EVERY
+parameter, while the fork's own copy returns the handlers (`service0B` ->
+beanName `s0B`, `nonExisting` -> `nonExistingBean`, and `null` for the two that
+are meant to resolve by parameter name / qualifier -- matching the table above
+exactly).
+
+### The fix
+
+Route that one call through the existing
+`spring_extension_invoke_special_anchored_on_test_class` helper. Only this call
+needs it: `ParameterResolutionDelegate.resolveDependency` merely forwards to the
+bean factory, and the qualifier matching that follows runs inside the AOT
+context's own fork-loaded Spring -- which is precisely why
+`qualifierIsUsedToResolveByName` kept passing while the shortcut was dead.
+
+| class, AOT replay | before | after | HotSpot |
+|---|---|---|---|
+| `MockitoBeanByNameLookupForConstructorParametersIntegrationTests` | 0/7 | **7/7** | 7/7 |
+| `MockitoSpyBeanByNameLookupForConstructorParametersIntegrationTests` | 0/5 | **5/5** | 5/5 |
+| `MockitoBeansByNameIntegrationTests` | 0/1 | **1/1** | 1/1 |
+
+Non-AOT mode is unchanged (those three plus `MockitoBeanByTypeLookup*`: 7/7,
+5/5, 1/1, 5/5, 6/6). `cargo test -p cratonvm-vm --lib --release` 2405 passed /
+18 failed, all `runtime::lock_order`, same as baseline; `cargo test -p
+cratonvm-native-builtins --lib` matches a stashed-baseline run in the same
+worktree (the extra `lang_system::checkexec_security_tests` failure is flaky
+independently of this change -- a repeated baseline run gives 2, 2, then 1
+failures).

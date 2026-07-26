@@ -244,11 +244,15 @@ the JIT enabled produces the right answer and runs real moving cycles as of
 2026-07-26 — the heap corruption that blocked it was five codegen sites pushing
 an untagged object reference onto the JIT's simulated operand stack
 ([`docs/internal/fixed-suite-bugs/app-jvm-bugs/moving-young-gen-drops-jit-held-oops-FIXED.md`](docs/internal/fixed-suite-bugs/app-jvm-bugs/moving-young-gen-drops-jit-held-oops-FIXED.md)).
-What blocks the flip now is throughput: on Binary-Trees-18 the moving path
-measured roughly 3× the default sweep, partly from the Cheney copy of a large
-live set and partly from the per-method codegen overhead moving-young forces
-(shadow push/reload plus the full-GPR safepoint spill). Remaining precise-root
-work is tracked in
+What blocks the flip now is throughput, and by less than it was: on
+Binary-Trees-18 the moving path measures **2.1×** the default sweep (six
+interleaved rounds, min 2905 ms vs 1363 ms), down from 5.0× before the
+pre-cycle object-start walk stopped building a hash set of every object in
+from-space
+([`docs/internal/moving-young-throughput-20260726.md`](docs/internal/moving-young-throughput-20260726.md)).
+bt18 is the worst case for a copying collector, and it is also the workload
+where the default build cannot run at `-Xmx512m` at all while the compacting
+collector completes. Remaining precise-root work is tracked in
 [`docs/internal/arch-2026-07-26/moving-young-precise-roots.md`](docs/internal/arch-2026-07-26/moving-young-precise-roots.md).
 
 **Object layout:**

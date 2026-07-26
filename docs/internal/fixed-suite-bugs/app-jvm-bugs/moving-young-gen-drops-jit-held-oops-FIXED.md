@@ -165,16 +165,27 @@ New regression tests:
 
 ## Residuals (open, tracked separately)
 
-1. **Throughput.** A correct moving young gen is *slower* than the default on
-   bt18, and by more than the original doc measured: at `-Xmx8g` on a busy
-   16-core host, `MOVING_YOUNG=1` ran ~19 s against ~6–8 s for the default.
-   Two separable costs — the codegen overhead moving-young forces on every
-   compiled method (shadow push/reload plus the full-GPR safepoint spill;
-   ~7–8 s even on runs that executed **zero** moving cycles) and the Cheney
-   copy itself. bt18 is the worst case for a copying collector (a very large
-   live set), so this measurement alone does not settle the design question —
-   but it does mean **`DEFAULT_MOVING_YOUNG` must not be flipped on the
-   strength of this fix**. See
+1. **Throughput — investigated 2026-07-26, largely FIXED.** See
+   `docs/internal/moving-young-throughput-20260726.md`.
+   Most of the gap was not the copying collector: the pre-cycle from-space walk
+   built an `FxHashSet<usize>` of *every* object start, live and dead, so
+   `HashMap::insert` + `reserve_rehash` were **49% of the whole process**.
+   Replacing it with an exact bit-per-8-bytes bitmap took bt18 `-Xmx8g` from
+   5.0× the default sweep to **2.1×**, and `-Xmx512m` from 7692 ms to 3049 ms
+   — a heap at which the default build cannot run bt18 at all
+   (`OutOfMemoryError: young gen exhausted`) while the compacting collector
+   completes.
+
+   The numbers in the first version of this section (~19 s vs ~6–8 s) were
+   taken with the configurations run in sequence on a heavily loaded host and
+   were contention-inflated; the interleaved minima are 1363 ms default vs
+   6833 ms moving-young pre-fix. The attribution to "the full-GPR safepoint
+   spill" was also wrong — that spill is default-ON via `precise_maps`. What
+   moving-young actually adds is the shadow push/reload and the loss of
+   self-call spill elision. Full decomposition in the linked doc.
+
+   `DEFAULT_MOVING_YOUNG` still should not be flipped on one benchmark, but
+   throughput is no longer a disqualification. See
    `docs/feature-designs/default-moving-young-gen.md`.
 
 2. **Over-strict cross-thread proof.** `refresh_moving_young_coverage_for_collection`
