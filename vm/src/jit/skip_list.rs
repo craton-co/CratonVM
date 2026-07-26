@@ -957,17 +957,30 @@ fn should_skip_jit_internal(
     // configuration. No longer reproduces on current dev.
     // AttributesImplGrowthProbe.java is the regression witness.
 
-    // HIB-LONGTAIL.3 (2026-07-15): when Hibernate bytecode is explicitly
-    // promoted for bisection, the optimized constructor path can return a
-    // GenerationTargetToScript whose ScriptTargetOutput field was never
-    // initialized. Schema creation then fails in accept(String). Preserve the
-    // constructor's interpreter semantics; its small body is cold and this
-    // does not suppress the rest of Hibernate's JIT eligibility.
-    if class_name == "org/hibernate/tool/schema/internal/exec/GenerationTargetToScript"
-        && method_name == "<init>"
-    {
-        return Some(SkipReason::RustJvmTestFixture);
-    }
+    // HIB-LONGTAIL.3 -- REMOVED 2026-07-26 (shadowing analysis, not a
+    // real-app probe). A constructor that initializes a field via
+    // putfield -- as this ban's own description says
+    // GenerationTargetToScript.<init> does, to set its ScriptTargetOutput
+    // field -- is unconditionally classified InitComplexity::Complex by
+    // classify_init_complexity (any putfield/putstatic/monitorenter/
+    // monitorexit/invokedynamic disqualifies Trivial). Every
+    // should_skip_jit_with_init call site computes that classification
+    // from the actual method's own bytecode and only sets
+    // skip_init_check=true when Trivial; when false, the generic
+    // `if !skip_init_check { if method_name == "<init>" { return
+    // Some(Constructor) } }` gate above already unconditionally bans this
+    // exact constructor before this specific entry could ever be
+    // reached. Same shadowing pattern as W2-CHM's Integer/Long <init>
+    // entries (see that comment: constructors are banned by the generic
+    // <init> gate anyway, so the entries are redundant but document the
+    // archetype) and as SPRINGBOOT-WITHOUT-JACKSON.2's removal earlier
+    // this session. Verified by reading classify_init_complexity and
+    // every should_skip_jit_with_init call site (vm/src/runtime/
+    // interpreter.rs, offload_jit_gate.rs) rather than a standalone
+    // probe -- no hibernate-tools jar was available on this host to
+    // build a real repro, but none is needed: this removal changes no
+    // observable behavior, the constructor stays interpreted via the
+    // structural non-trivial-constructor gate regardless.
     // T1.1.g — the historical blanket bans for `java/util/*` and
     // `cratonvm/*` were narrowed to targeted per-method exclusions.
     // Those targeted exclusions guarded the callee-saved-GPR local-home
@@ -1650,66 +1663,52 @@ fn should_skip_jit_internal(
             return Some(SkipReason::RustJvmTestFixture);
         }
 
-        // ANTLR.1 (2026-06-23) — blanket ban for the shaded ANTLR v4 runtime
-        // that Groovy's parser (`org.apache.groovy.parser.antlr4`) and any
-        // ANTLR-based grammar (HQL, SpEL, …) execute. Two independent reasons,
-        // both verified on the SpringRepositoriesExtensionTests / Groovy parse:
-        //
-        // 1. CORRECTNESS — JIT-compiling the ANTLR ATN simulation MISCOMPILES.
-        //    A method in `…/runtime/atn/` produces a null `PredictionContext`
-        //    that flows into interpreted `ATNConfigSet.optimizeConfigs` ->
-        //    `ATN.getCachedContext` -> NPE, surfacing as Groovy
-        //    `MultipleCompilationErrorsException: General error during parsing:
-        //    NullPointerException` (the script fails to compile). `--nojit`
-        //    parses the SAME script cleanly. Bisection via
-        //    `CRATONVM_JIT_BISECT_SKIP` proved it and NARROWED the culprit from
-        //    the ~105 compiled `groovyjarjarantlr4/*` methods down to a 7-method
-        //    `PredictionContext` equality/hash cluster — de-JIT'ing just these 7
-        //    makes the parse succeed:
-        //      PredictionContext.{calculateHashCode, hashCode},
-        //      PredictionContext$IdentityEqualityComparator.hashCode,
-        //      SingletonPredictionContext.{equals, isEmpty, size},
-        //      ObjectEqualityComparator.equals.
-        //    (A wrong hash/equals corrupts ATN config-context dedup, leaving a
-        //    config with a null `PredictionContext` that later NPEs.) The exact
-        //    single method / codegen archetype is the open follow-up; the
-        //    package ban is the sound, evidence-backed stop-gap (a surgical
-        //    per-method ban of those 7 is the future minimal fix once the
-        //    codegen bug is root-caused — see docs/known-issues).
-        // 2. THROUGHPUT — JIT-compiling ANTLR is also a large REGRESSION here:
-        //    the first cold parse runs ~8x SLOWER with JIT than `--nojit`
-        //    (a trivial warmup class alone takes ~95 s under JIT). The ATN
-        //    simulation is a one-shot, branch-heavy interpreter loop, not a
-        //    benchmarked hot path — exactly the BouncyCastle / ByteBuddy /
-        //    Spring archetype banned above. Same root family as the
-        //    Hibernate HQL reproducer in
-        //    `springrepos-extension-hang-jit-throughput-and-deep-recursion.md`.
-        //
-        // Lifted by `CRATONVM_JIT_ALLOW_PACKAGES=groovyjarjarantlr4/` for
-        // cold-path validation, but the PredictionContext equality/hash
-        // cluster above stays interpreted.
-        if class_name.starts_with("groovyjarjarantlr4/")
-            && !package_allowed("groovyjarjarantlr4/", allow_packages)
-        {
-            return Some(SkipReason::RustJvmTestFixture);
-        }
+        // ANTLR.1 -- REMOVED 2026-07-26. Reason 1 (correctness -- the
+        // PredictionContext equality/hash miscompile) was already
+        // independently, unconditionally covered by
+        // is_antlr_prediction_context_miscompile (see ANTLR-COLDPATH.1
+        // below), which stays interpreted regardless of this broader
+        // package ban or CRATONVM_JIT_ALLOW_PACKAGES. Reason 2 (throughput
+        // -- ~8x slower cold parse under JIT) was re-tested post the
+        // 2026-07-26 JIT rework with a real groovy-3.0.21.jar
+        // (GroovyAntlrThroughputProbe.java, found this session at
+        // /data/tmp/groovysrc + /data/tmp/groovy-antlr4-probe on this
+        // host -- an earlier session's claim that "the shaded package
+        // doesn't exist anywhere on this host" was simply wrong, it was
+        // never searched for outside .gradle/.m2): 15 cold
+        // GroovyShell.evaluate() calls, fresh script + fresh class per
+        // iteration. Baseline (ban active): avg 840.6ms/iter (steady-state
+        // ~390-480ms after the first classloading-heavy call). Lifted
+        // (groovyjarjarantlr4/ JIT-compiled, narrow PredictionContext guard
+        // still active): avg 866.1ms/iter, steady-state ~370-460ms --
+        // statistically indistinguishable from baseline, not an 8x
+        // regression. The throughput justification no longer holds; 0
+        // parse failures in either config. GroovyAntlrThroughputProbe.java
+        // is the regression witness.
 
-        // HIB-ANTLR.1 (2026-07-15) -- Hibernate uses the ordinary ANTLR4
-        // runtime rather than Groovy's shaded copy. After a full HQL parse,
-        // JIT-compiled ATN simulation could leave an ATNState with a null
-        // `transitions` array; the next parse then failed in
-        // ParserATNSimulator.computeTargetState. A fresh process passed the
-        // same query, isolating the defect to state corrupted by the compiled
-        // parser path rather than Hibernate's grammar or query metadata.
-        //
-        // This is the unshaded counterpart of ANTLR.1 above. Keep it
-        // liftable for JIT bisection, but default to the sound interpreter
-        // path until the compiled ATN-state mutation is root-caused.
-        if class_name.starts_with("org/antlr/v4/runtime/")
-            && !package_allowed("org/antlr/v4/runtime/", allow_packages)
-        {
-            return Some(SkipReason::RustJvmTestFixture);
-        }
+        // HIB-ANTLR.1 -- REMOVED 2026-07-26. Re-verified with the real
+        // Hibernate ORM 8.0 test harness (hibernate-orm-harness on this
+        // host, hibernate-core testClasses/testRuntimeClasspath + a real
+        // H2 in-memory DB via the JUnit5 Platform CratonRunner driver):
+        // org.hibernate.orm.test.hql.ASTParserLoadingTest (106 methods,
+        // heavy real HQL-via-ANTLR parsing), .hql.HQLInsertAndUpdateTest
+        // (5 methods), and .type.temporal.InstantTests (204 methods) all
+        // ran clean (0 failures, identical to baseline) with
+        // org/antlr/v4/runtime/ JIT-allowed and org/hibernate/ still
+        // banned -- this bans own specific claim (ATNState.transitions
+        // corrupted between two separate HQL parses) does not reproduce.
+        // IMPORTANT: org/antlr/v4/runtime/ is ALSO, separately, covered by
+        // HIB-LONGTAIL.1 above (same prefix, already confirmed still
+        // needed via a real 218-class H2 suite run finding a
+        // "Schema not found" DB-reconnect corruption -- a different,
+        // reconnect-specific trigger this HQL-parsing test batch does not
+        // exercise). This removal is therefore redundant/shadowed, not an
+        // independent unban: default (Conservative) behavior for
+        // org/antlr/v4/runtime/ classes is UNCHANGED -- they stay
+        // interpreted via HIB-LONGTAIL.1 regardless. Same pattern as
+        // SPRINGBOOT-WITHOUT-JACKSON.2s removal earlier this session. The
+        // real, positive, non-shadowed finding here is narrower: this
+        // bans own specific correctness claim no longer reproduces.
 
         // SPB.6 (Session 113 r1) — provisional blanket ban for the
         // Netflix Eureka discovery client. `com/netflix/discovery/
@@ -4331,38 +4330,38 @@ mod tests {
     }
 
     #[test]
-    fn antlr_coldpath_blanket_ban_holds_by_default() {
-        assert_eq!(
-            check(
-                "groovyjarjarantlr4/v4/runtime/atn/ParserATNSimulator",
-                "closure_",
-                false,
-                true,
-                SkipPolicy::Conservative,
-            ),
-            Some(SkipReason::RustJvmTestFixture),
-            "ANTLR cold-path methods stay interpreted by default"
-        );
+    fn antlr_coldpath_non_bad_atn_methods_are_jit_eligible_after_antlr_1_removal() {
+        // ANTLR.1 (the groovyjarjarantlr4/ blanket ban) was removed
+        // 2026-07-26 -- see the removal comment above should_skip_jit_internal
+        // for the re-verification evidence (real groovy-3.0.21.jar, cold-parse
+        // throughput no longer regressed post the 2026-07-26 JIT rework).
+        // ParserATNSimulator.closure_ is not one of the 7 PredictionContext
+        // methods is_antlr_prediction_context_miscompile still covers, so it
+        // is JIT-eligible under both default and explicit-allow now.
+        for policy in [SkipPolicy::Conservative, SkipPolicy::Aggressive] {
+            assert_eq!(
+                check(
+                    "groovyjarjarantlr4/v4/runtime/atn/ParserATNSimulator",
+                    "closure_",
+                    false,
+                    true,
+                    policy,
+                ),
+                None,
+                "ANTLR cold-path non-PredictionContext methods must be JIT-eligible now that ANTLR.1 is removed"
+            );
+        }
     }
 
     #[test]
-    fn antlr_coldpath_validation_lifts_non_bad_atn_methods() {
-        assert_eq!(
-            check_with(
-                "groovyjarjarantlr4/v4/runtime/atn/ParserATNSimulator",
-                "closure_",
-                false,
-                true,
-                SkipPolicy::Conservative,
-                &["groovyjarjarantlr4/"],
-            ),
-            None,
-            "CRATONVM_JIT_ALLOW_PACKAGES=groovyjarjarantlr4/ is the cold-path validation lift"
-        );
-    }
-
-    #[test]
-    fn hibernate_unshaded_antlr_runtime_stays_interpreted_by_default() {
+    fn hibernate_unshaded_antlr_runtime_stays_interpreted_via_hib_longtail_1() {
+        // HIB-ANTLR.1's own specific check was removed 2026-07-26 (see the
+        // removal comment above should_skip_jit_internal), but
+        // org/antlr/v4/runtime/ classes stay interpreted under Conservative
+        // regardless -- HIB-LONGTAIL.1 (a separate, still-active,
+        // already-confirmed-needed ban covering the same prefix) already
+        // catches them. This test now documents THAT shadowing relationship
+        // rather than HIB-ANTLR.1's own removed check.
         assert_eq!(
             check(
                 "org/antlr/v4/runtime/atn/ParserATNSimulator",
@@ -4372,7 +4371,7 @@ mod tests {
                 SkipPolicy::Conservative,
             ),
             Some(SkipReason::RustJvmTestFixture),
-            "Hibernate's unshaded ANTLR runtime must not corrupt ATN state under JIT"
+            "org/antlr/v4/runtime/ must still be interpreted under Conservative via HIB-LONGTAIL.1"
         );
         assert_eq!(
             check_with(
@@ -4384,7 +4383,7 @@ mod tests {
                 &["org/antlr/v4/runtime/"],
             ),
             None,
-            "the unshaded ANTLR guard must remain available for JIT bisection"
+            "CRATONVM_JIT_ALLOW_PACKAGES=org/antlr/v4/runtime/ lifts HIB-LONGTAIL.1 (same prefix) too"
         );
     }
 
