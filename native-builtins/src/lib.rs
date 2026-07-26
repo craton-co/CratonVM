@@ -8710,6 +8710,29 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         Ok(Some(Value::Int(0)))
     });
 
+    // JDK 25 residual (docs/known-issues/springboot/classutils-forname-platform-loader-false-positive.md):
+    // JDK 25's `java.io.Console` no longer has `istty()Z` at all -- it was
+    // replaced by `private static native int ttyStatus()`, called once from
+    // `<clinit>` and stashed in a static `ttyStatus` field that
+    // `isStdinTty()`/`isStdoutTty()`/`isStderrTty()` later mask against
+    // `TTY_STDIN_MASK`/`TTY_STDOUT_MASK`/`TTY_STDERR_MASK`. Without this
+    // native, `<clinit>` throws `UnsatisfiedLinkError`, which normally gets
+    // swallowed as an ExceptionInInitializerError the first time anything
+    // touches `Console` -- but Mockito's `InlineBytecodeGenerator` calls
+    // `Class.forName` on the target class before mocking it precisely so it
+    // can surface a clean `MockitoException` instead of a confusing NCDFE,
+    // and that surfaces the swallowed link error as
+    // "Mockito cannot mock this class: class java.io.Console", misdiagnosed
+    // in the known-issue doc above as an unfixable Mockito/Console
+    // limitation. Returning 0 (no bit set) mirrors `istty()`'s `false`: every
+    // stream reports non-tty, matching HotSpot's behavior for CratonVM's
+    // always-non-interactive embedding, and lets `DefaultLogbackConfigurationTests
+    // .consoleLogCharsetShouldUseConsoleCharsetIfConsoleAvailable` (which mocks
+    // `Console` directly, forcing real `<clinit>` to run) initialize cleanly.
+    registry.register("java/io/Console", "ttyStatus", "()I", |_ctx, _args| {
+        Ok(Some(Value::Int(0)))
+    });
+
     // nontty-console: companion to `Console.istty()` for the modern
     // (JDK 22+) console path. In JDK 25 the only two natives across the
     // entire `System.console()` chain are:
