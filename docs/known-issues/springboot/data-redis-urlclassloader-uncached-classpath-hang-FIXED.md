@@ -228,6 +228,43 @@ at the failure point, or whether the class gets loaded (and its static
 two runs actually observed by the instrumentation. Confirm this before
 re-opening the "non-canonical mirror" hypothesis.
 
+#### RESOLVED 2026-07-26 (continuation session)
+
+Root cause was exactly the "not yet checked" gap above: `DialectOverride`'s
+nest host **and** its ~30 nested annotation-override members were being
+resolved through `native_class_get_nest_members`'s (and the sibling
+`native_class_get_permitted_subclasses`'s) **loader-blind global lookup
+FIRST**, falling back to the correct per-loader `ClassLoader.loadClass()`
+call only on a miss. Since `org.hibernate.annotations.DialectOverride` and
+its member classes were already loaded under the *first* (non-isolated)
+run of the test class before `ModifiedClassPathExtension`'s nested
+`Launcher` re-ran the whole class under its own `ModifiedClassPathClassLoader`,
+the blind lookup silently found and returned the **first** run's copies —
+even when called from a nest host resolved under the **second**,
+isolated loader. `DialectOverridesAnnotationHelper.OVERRIDE_MAP`'s
+static initializer (running under the isolated loader, per the isolated
+run's own class instance) ended up keyed by the **first** run's `Class`
+objects, while `getOverrideAnnotation(SQLInsert.class)`'s lookup key came
+from the isolated run's own `SQLInsert.class` literal — two
+reference-unequal `Class` objects for "the same" class name, guaranteed
+`HashMap` miss, matching the observed `does not have an override form`
+failure exactly.
+
+Fixed in `native-builtins/src/lang_class.rs` by adding
+`resolve_nestmate_via_defining_loader` and using it in both
+`native_class_get_nest_members` and `native_class_get_permitted_subclasses`:
+the class's own defining loader's `loadClass()` is now tried **first**
+(cheap even when already loaded, since `ClassLoader.loadClass` itself
+checks `findLoadedClass` before delegating/defining), falling back to the
+global lookup only when no Java-level loader object is available
+(bootstrap-loaded classes). This can only ever return a *more* correct
+answer than the old ordering — never a worse failure.
+
+**Verified: `DataJpaRepositoriesAutoConfigurationTests` now passes 9/9**
+(Azure Linux host, worktree `/data/data/wt-redis-issues-20260726`, branch
+`fix/redis-residuals-20260726`, binary `cratonvm-redis-issues-20260726`,
+forked from `origin/dev` @ `887cd01fa`). No further action needed here.
+
 ### Residual: `WebSocketMessagingAutoConfigurationTests` — real, reproducible corruption bug found, root cause NOT located
 
 **Triaged 2026-07-26**, same worktree/binary as above. Root cause of the
@@ -302,6 +339,106 @@ the iteration-2 boundary, rather than more `eprintln!` sweeps, is probably
 the more efficient next move given how much of the natural
 Rust-native-code-level surface area is already ruled out.
 
+#### Continuation 2026-07-26: original corruption bug gone, THREE different residuals found instead
+
+Re-verified on `origin/dev` @ `887cd01fa` (worktree
+`/data/data/wt-redis-issues-20260726`, branch `fix/redis-residuals-20260726`,
+binary `cratonvm-redis-issues-20260726`): the `NoUniqueBeanDefinitionException`/
+`Parameter.getName()` corruption bug described above **no longer
+reproduces** — `subProtocolWebSocketHandler`'s by-parameter-name tie-break
+now works correctly across all 13 `@Test` methods in one process. Like the
+`DataRedisAutoConfigurationTests` perf residual above, this was apparently
+closed by unrelated `dev` work landed since 2026-07-26 (the same
+`getNestMembers0`/nest-sibling-resolution fix documented above may well be
+implicated, since Spring's `MethodParameter`/annotation-attribute
+resolution also walks nest-mate metadata in places — not confirmed, but
+plausible given the fix's blast radius).
+
+With that mask gone, the class now reliably fails **2 of 13** tests (not 3
+— see the `ArrayListSubList` fix below, landed this session, which closed
+the third):
+
+1. **FIXED this session — `cratonvm/internal/ArrayListSubList` (the
+   `ArrayList.subList()` backed-view object added by the original fix
+   above, see `native-collections/src/lib.rs`'s "ArrayList subList backed
+   view" section) declared ZERO interfaces**, not even `List`, because its
+   internal class name has no entry in `classloading/src/class_manager.rs`'s
+   `jdk_interfaces()` match (which drives every synthetic stub's declared
+   interface list) — it silently fell to that match's `_ => &[]` default.
+   Any checkcast/instanceof against `List`/`Collection`/`Iterable` on a
+   `subList()` result then failed with `ArrayListSubList cannot be cast to
+   java.lang.Iterable`, reproducing in
+   `webSocketMessageBrokerConfigurerOrdering` via AssertJ's
+   `Iterable`-typed `satisfies`/`contains` overloads (`configurers.subList(3,
+   5)`). Fixed by adding `"cratonvm/internal/ArrayListSubList" =>
+   &["java/util/List", "java/util/RandomAccess"]` to `jdk_interfaces()`,
+   mirroring the real `java.util.ArrayList$SubList` (`extends AbstractList
+   implements RandomAccess`; `List`/`Collection`/`Iterable` come for free
+   via `is_subclass_of`'s existing interface-of-interface recursion, which
+   already walks a resolved interface's own super-interfaces). Verified:
+   `webSocketMessageBrokerConfigurerOrdering` now passes; 3 repeated runs
+   all showed the same 2 remaining failures below, never this one again.
+
+2. **Root-caused, NOT fixed — `shouldUseJackson2WhenPreferred` fails with
+   `IllegalArgumentException: argument type mismatch` constructing
+   `WebSocketMessagingAutoConfiguration$Jackson2WebSocketMessageConverterConfiguration(ObjectMapper)`.**
+   `CRATONVM_DBG_COERCE=1` tracing
+   (`native-builtins/src/lang_class.rs`'s `coerce_arg_strict`) shows the
+   constructor's declared `ObjectMapper` parameter resolves to a DIFFERENT
+   `ClassId`/loader than the actual bean argument:
+   `expected=com/fasterxml/jackson/databind/ObjectMapper (cid=5007,
+   loader=4) arg_class=...ObjectMapper (cid=1521, loader=2)`. Loader 4 is
+   `org/springframework/boot/testsupport/classpath/ModifiedClassPathClassLoader`
+   (confirmed via a temporary `CRATONVM_DBG_UCLTRACE=1` trace added to
+   `ucl_try_define_local_class` in `native-builtins/src/classloader.rs`,
+   kept as a permanent env-gated debug aid — see that function). Two OTHER
+   methods in this same class (`shouldUseJackson2WhenJacksonIsMissing`,
+   `jackson2ConfigurationShouldBackOffWhenThereIsNoObjectMapperBean`) carry
+   `@ClassPathExclusions("jackson-*-3*")`, which per JUnit5's
+   `ModifiedClassPathExtension` mechanism (see
+   `modifiedclasspath-aether-network-hang-cluster.md`) reruns the *entire*
+   containing class under a fresh `ModifiedClassPathClassLoader` — and the
+   trace confirms `WebSocketMessagingAutoConfigurationTests` itself (and a
+   fresh `ObjectMapper`) really do get reloaded under that loader at some
+   point in the process. `shouldUseJackson2WhenPreferred` carries no such
+   annotation and should be entirely unaffected, resolving everything
+   through the plain default loader (2) throughout — the fact that its
+   `Jackson2WebSocketMessageConverterConfiguration`'s *declaring class*
+   resolves through loader 4 while its `registerBean(ObjectMapper.class)`
+   argument resolves through loader 2 (a **literal `.class` token in the
+   test's own bytecode**, which should be as loader-stable as it gets)
+   strongly suggests a **leaked `Thread.currentThread()` context
+   classloader**: JUnit5's nested `Launcher` for the two excluded-classpath
+   methods sets the TCCL to the isolated loader for its run and — on a
+   real, working JVM — restores the original TCCL afterward; if that
+   restore doesn't happen (or doesn't happen correctly) on CratonVM, a
+   *later*-executing `shouldUseJackson2WhenPreferred` (JUnit does not
+   guarantee method execution order without `@TestMethodOrder`) would
+   observe a stale, isolated-loader TCCL for any resolution that consults
+   it (e.g. `AutoConfigurationImportSelector`'s `ClassUtils.forName(name,
+   beanFactory.getBeanClassLoader())`, which defaults to the ambient TCCL)
+   while its own `ldc`-driven class literals stay loader-2-stable
+   regardless. **Not confirmed** — this requires tracing exactly when/where
+   `setContextClassLoader` is called and restored across the whole
+   13-method run, which is a job for an actual native debugger attach
+   (matching this doc's own earlier recommendation) rather than further
+   `eprintln!` sweeps.
+3. **Likely the same root cause, not separately investigated —
+   `basicMessagingWithJsonResponse` fails with `AssertionError: Response
+   was not received within 30 seconds`** (a STOMP round-trip that silently
+   never completes, rather than a startup exception) — consistent with the
+   Jackson2 message converter configuration failing to apply correctly
+   under the same loader confusion, so the JSON payload is never converted/
+   delivered, rather than the context refresh itself throwing.
+
+**Reproduction**: run the whole `WebSocketMessagingAutoConfigurationTests`
+class (SbRunner or the suite runner) against the
+`module/spring-boot-websocket` Gradle test classpath — reproduces
+deterministically (3/3 repeated runs, exact same 2 failing methods) once
+the `ArrayListSubList` fix above is applied. `CRATONVM_DBG_COERCE=1` +
+`CRATONVM_DBG_UCLTRACE=1` together give the class-identity evidence above
+without needing new instrumentation.
+
 ## Worktree / branch
 
 Original fix: `C:\craton\CratonVM-data-redis-fix-20260723`, branch
@@ -312,3 +449,8 @@ Original fix: `C:\craton\CratonVM-data-redis-fix-20260723`, branch
 `/data/data/wt-redis-residuals-20260725`, branch
 `fix/redis-residuals-20260725`, binary
 `cratonvm-redis-residuals-20260725`.
+
+2026-07-26 continuation (Azure Linux host):
+`/data/data/wt-redis-issues-20260726`, branch
+`fix/redis-residuals-20260726`, binary
+`cratonvm-redis-issues-20260726`, forked from `origin/dev` @ `887cd01fa`.

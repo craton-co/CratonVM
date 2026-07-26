@@ -18184,7 +18184,35 @@ fn invoke_on_class_shared_inner(
                         // native's memoized `computeValue` dispatch must win).
                         || (class_name == "java/lang/ClassValue"
                             && method_name == "get"
-                            && descriptor == "(Ljava/lang/Class;)Ljava/lang/Object;");
+                            && descriptor == "(Ljava/lang/Class;)Ljava/lang/Object;")
+                        // java.util.logging.FileHandler's registered natives
+                        // (native-builtins/src/phases_late.rs,
+                        // register_p61_logging) store their filename/closed
+                        // bookkeeping in an identity-hash side table
+                        // (jul_file_handler_state_table, logging_shims.rs)
+                        // rather than real instance field slots -- see
+                        // docs/known-issues/springboot/filehandler-noarg-ctor-handler-field-layout-gap.md.
+                        // Without this override, real FileHandler bytecode
+                        // (loaded from java.base) is concrete/non-abstract,
+                        // so the default rule above ran its REAL
+                        // <init>()V / <init>(String)V -- which try to
+                        // actually open/lock a real log file via NIO and
+                        // throw NoSuchFileException when the parent
+                        // directory for the lock file isn't set up the way
+                        // real JUL's openFiles() expects -- instead of our
+                        // native override, so apply_jul_config_entries's
+                        // new_object_initialized call (logmanager.rs)
+                        // failed with that exception and the handler was
+                        // silently treated as "uninstantiable, skip it".
+                        || (class_name == "java/util/logging/FileHandler"
+                            && matches!(
+                                (method_name, descriptor),
+                                ("<init>", "()V")
+                                    | ("<init>", "(Ljava/lang/String;)V")
+                                    | ("publish", "(Ljava/util/logging/LogRecord;)V")
+                                    | ("flush", "()V")
+                                    | ("close", "()V")
+                            ));
                     if check_override
                         && shared
                             .natives

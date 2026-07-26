@@ -18,6 +18,33 @@ This folder collects CratonVM-only defects found while running upstream Java
 suites. The docs had grown to describe the **same underlying bug from several
 angles**; this index is the consolidated map. Read it first.
 
+## 2026-07-26 SPB.1 (`org/springframework/util/`) ban REMOVED — the "allocate-then-putfield" crash was a GC-root-scanning gap, not a JIT bug — FIXED, moved to internal
+
+FIXED (moved to
+[`../internal/fixed-suite-bugs/spb1-springframework-util-investigation-FIXED.md`](../internal/fixed-suite-bugs/spb1-springframework-util-investigation-FIXED.md)):
+a follow-up repro (concurrent GC pressure + a fresh `URLClassLoader`-loaded
+`ClassUtils.<clinit>`) reproduced real heap corruption with the SPB.1 ban
+ACTIVE too, ruling out "the ban prevents the regression" and reopening the
+whole ban's justification. Root cause: `vm/src/memory/roots.rs` had four
+root-scan sections (static fields, class-lock objects, CONSTANT_Dynamic
+roots, class mirrors) that deferred a user-defined-loader class's
+still-YOUNG-generation object to the `metadata_pin` side-channel instead of
+rooting it directly. That channel is consulted only by the Generational
+backend's old-gen-only mark BFS, so a value with no other root — the common
+case for a static field's value right after `<clinit>` assigns it — was
+silently reclaimed, and its memory reused moments later by the class's own
+next allocation: reading back as a live, valid, but unrelated object
+(`ReentrantLock$NonfairSync`, `ConcurrentReferenceHashMap$Reference`, a raw
+class-name string). Fixed via `VmHeap::metadata_pin_deferrable`
+(`gc/src/vm_heap.rs`), gating the defer on the object actually being in old
+gen; the identical defect was also found and fixed in
+`native-builtins/src/phases_late.rs`'s `ClassValue` cache. G1/ZGC were
+unaffected — their `metadata_pin` consumers already walk every live region
+uniformly. Verified: 50/50 clean repro-3 runs with the ban kept, 47/47 clean
+with it lifted post-fix (vs. failing ~40-60% of the time pre-fix even with
+the ban active) — no distinct JIT-specific symptom survives, so the ban is
+removed from `vm/src/jit/skip_list.rs` rather than left liftable.
+
 ## 2026-07-26 G1 backend could OOM-abort on a heap full of garbage — natives that allocate internally never triggered a safepoint — FIXED, doc RETIRED
 
 `docs/known-issues/bug-g1-native-alloc-no-safepoint-oom.md` →

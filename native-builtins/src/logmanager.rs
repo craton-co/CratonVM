@@ -898,7 +898,7 @@ fn native_read_configuration_with_stream(
     apply_jul_config_entries(ctx, &entries)
 }
 
-fn parsed_log_properties() -> &'static Mutex<HashMap<String, String>> {
+pub(crate) fn parsed_log_properties() -> &'static Mutex<HashMap<String, String>> {
     static T: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
     T.get_or_init(|| Mutex::new(HashMap::new()))
 }

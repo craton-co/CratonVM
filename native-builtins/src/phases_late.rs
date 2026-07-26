@@ -2747,13 +2747,139 @@ pub(crate) fn register_p61_logging(r: &mut NativeMethodRegistry) {
         Ok(None)
     });
 
-    // --- FileHandler = 3-field (filename=0, level=1, closed=2) ---
+    // --- FileHandler: see `register_p61_file_handler` below, also called
+    // directly from real-JDK mode's init path (vm_init.rs) since this
+    // whole function is synthetic-JDK-mode-only.
+    register_p61_file_handler(r);
+
+    // --- LogManager = 1-field (properties=0 HashMap-like) ---
+    let lm = "java/util/logging/LogManager";
+    r.register(
+        lm,
+        "getLogManager",
+        "()Ljava/util/logging/LogManager;",
+        |ctx, _args| {
+            let mgr = alloc_concurrent_synthetic(ctx, "java/util/logging/LogManager", 1);
+            ctx.set_field(mgr, 0, Value::Object(None));
+            Ok(Some(Value::Object(Some(mgr))))
+        },
+    );
+    r.register(lm, "reset", "()V", |ctx, args| {
+        // Reset clears the LogManager's properties field.
+        let this = obj_arg(args, 0)?;
+        if ctx.object_num_fields(this) > 0 {
+            ctx.set_field(this, 0, Value::Object(None));
+        }
+        Ok(None)
+    });
+    r.register(
+        lm,
+        "getProperty",
+        "(Ljava/lang/String;)Ljava/lang/String;",
+        |_ctx, _args| Ok(Some(Value::Object(None))),
+    );
+    r.register(
+        lm,
+        "addLogger",
+        "(Ljava/util/logging/Logger;)Z",
+        |_ctx, _args| Ok(Some(Value::Int(1))),
+    );
+    r.register(
+        lm,
+        "getLoggerNames",
+        "()Ljava/util/Enumeration;",
+        |ctx, _args| {
+            // Return empty enumeration stub
+            let e = alloc_concurrent_synthetic(
+                ctx,
+                "java/util/logging/LogManager$LoggerEnumeration",
+                1,
+            );
+            ctx.set_field(e, 0, Value::Int(0));
+            Ok(Some(Value::Object(Some(e))))
+        },
+    );
+    r.set_category(__prev_cat);
+}
+
+
+// =============================================================================
+// java.lang.ClassLoader — resource loading, findResource, loadClass
+// =============================================================================
+
+/// `java.util.logging.FileHandler`'s natives: identity-hash side table
+/// (filename, closed) -- see `jul_file_handler_state_table` in
+/// `logging_shims.rs`. NOT raw field slots: `FileHandler` is a real
+/// `java.base` class, so `ctx.set_field(this, N, ...)` indexes the real
+/// declared-field array (inherited `Handler.manager`/`filter`/`formatter`/
+/// `logLevel`/`errorManager`/`encoding`, then `StreamHandler`'s/
+/// `FileHandler`'s own real fields) -- a raw slot 0/1/2 convention here
+/// silently corrupts `Handler.manager`/`filter`/`formatter` instead of
+/// storing our own bookkeeping. See
+/// docs/known-issues/springboot/filehandler-noarg-ctor-handler-field-layout-gap.md.
+///
+/// Split out into its own `pub` function (rather than staying inline in
+/// `register_p61_logging`) because `register_p61_logging` is called only
+/// from `register_phase61_natives` -> `register_synthetic_overrides`,
+/// which is `#[cfg(feature = "synthetic-jdk")]`-gated and NEVER runs in
+/// real-JDK mode (the `--java-home` suite-runner default). Spring Boot's
+/// `logging-file.properties` (`handlers=java.util.logging.FileHandler,
+/// ...`) only ever exercises real-JDK mode, so without a SEPARATE
+/// real-mode call site this whole native surface was dead code for the
+/// one caller that actually needs it: `apply_jul_config_entries`'s
+/// `new_object_initialized("java/util/logging/FileHandler", "()V", &[])`
+/// fell through to the REAL `FileHandler()` bytecode instead, which
+/// tries to actually open/lock a real log file via NIO and throws
+/// `NoSuchFileException` (real JUL's `openFiles()` expects a lock-file
+/// directory layout CratonVM doesn't provide). `vm_init.rs` calls this
+/// directly, alongside `register_essential_natives`, in both of its
+/// real-JDK-mode arms -- see `force_native_over_real_jdk_bytecode`
+/// (`interpreter.rs`) and the `check_override` entry (`vm_exec.rs`) for
+/// the matching "prefer this native over real bytecode" gates, without
+/// which registering the native alone is not sufficient (real, concrete
+/// bytecode wins by default).
+pub fn register_p61_file_handler(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
+    // --- FileHandler: identity-hash side table (filename, closed) -- see
+    // `jul_file_handler_state_table` in `logging_shims.rs`. NOT raw field
+    // slots: `FileHandler` is a real `java.base` class, so
+    // `ctx.set_field(this, N, ...)` indexes the real declared-field array
+    // (inherited `Handler.manager`/`filter`/`formatter`/`logLevel`/
+    // `errorManager`/`encoding`, then `StreamHandler`'s/`FileHandler`'s own
+    // real fields) -- a raw slot 0/1/2 convention here silently corrupts
+    // `Handler.manager`/`filter`/`formatter` instead of storing our own
+    // bookkeeping. See
+    // docs/known-issues/springboot/filehandler-noarg-ctor-handler-field-layout-gap.md.
     let fh = "java/util/logging/FileHandler";
+    // Real `java.util.logging.FileHandler()` is entirely config-driven (no
+    // args): Spring Boot's `logging-file.properties` lists it in `handlers=`
+    // and relies on this constructor alone -- `apply_jul_config_entries`
+    // (`logmanager.rs`) instantiates every configured handler class via a
+    // generic no-arg `new_object_initialized(cls, "()V", &[])`. Without this
+    // registration, that call fell through to `Ok(None)`/`Err(...)` (no
+    // native, and the real bytecode ctor's `LogManager.getProperty` calls
+    // return null against our stub), so `FileHandler` was silently treated
+    // as "uninstantiable -- skip it" and `spring.log` was never created.
+    r.register(fh, "<init>", "()V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let pattern = crate::logmanager::parsed_log_properties()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get("java.util.logging.FileHandler.pattern")
+            .cloned();
+        crate::jul_file_handler_set_filename(ctx, this, pattern);
+        crate::jul_file_handler_set_closed(ctx, this, false);
+        Ok(None)
+    });
     r.register(fh, "<init>", "(Ljava/lang/String;)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        ctx.set_field(this, 0, args.get(1).copied().unwrap_or(Value::Object(None)));
-        ctx.set_field(this, 1, Value::Object(None)); // level
-        ctx.set_field(this, 2, Value::Int(0)); // open
+        let filename = match args.get(1).copied() {
+            Some(Value::Object(Some(s))) => ctx.read_string(s),
+            _ => None,
+        };
+        crate::jul_file_handler_set_filename(ctx, this, filename);
+        crate::jul_file_handler_set_closed(ctx, this, false);
         Ok(None)
     });
     r.register(
@@ -2762,16 +2888,16 @@ pub(crate) fn register_p61_logging(r: &mut NativeMethodRegistry) {
         "(Ljava/util/logging/LogRecord;)V",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            // Check if closed
-            let closed = ctx.get_field(this, 2).as_int().unwrap_or(0);
-            if closed != 0 {
+            if crate::jul_file_handler_is_closed(ctx, this) {
                 return Ok(None);
             }
 
             // Get filename
-            let filename = match ctx.get_field(this, 0) {
-                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-                _ => return Ok(None),
+            let filename = match crate::jul_file_handler_filename(ctx, this) {
+                Some(f) => f,
+                None => {
+                    return Ok(None);
+                }
             };
 
             // Extract level and message
@@ -2828,64 +2954,11 @@ pub(crate) fn register_p61_logging(r: &mut NativeMethodRegistry) {
     });
     r.register(fh, "close", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        ctx.set_field(this, 2, Value::Int(1));
+        crate::jul_file_handler_set_closed(ctx, this, true);
         Ok(None)
     });
-
-    // --- LogManager = 1-field (properties=0 HashMap-like) ---
-    let lm = "java/util/logging/LogManager";
-    r.register(
-        lm,
-        "getLogManager",
-        "()Ljava/util/logging/LogManager;",
-        |ctx, _args| {
-            let mgr = alloc_concurrent_synthetic(ctx, "java/util/logging/LogManager", 1);
-            ctx.set_field(mgr, 0, Value::Object(None));
-            Ok(Some(Value::Object(Some(mgr))))
-        },
-    );
-    r.register(lm, "reset", "()V", |ctx, args| {
-        // Reset clears the LogManager's properties field.
-        let this = obj_arg(args, 0)?;
-        if ctx.object_num_fields(this) > 0 {
-            ctx.set_field(this, 0, Value::Object(None));
-        }
-        Ok(None)
-    });
-    r.register(
-        lm,
-        "getProperty",
-        "(Ljava/lang/String;)Ljava/lang/String;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
-    );
-    r.register(
-        lm,
-        "addLogger",
-        "(Ljava/util/logging/Logger;)Z",
-        |_ctx, _args| Ok(Some(Value::Int(1))),
-    );
-    r.register(
-        lm,
-        "getLoggerNames",
-        "()Ljava/util/Enumeration;",
-        |ctx, _args| {
-            // Return empty enumeration stub
-            let e = alloc_concurrent_synthetic(
-                ctx,
-                "java/util/logging/LogManager$LoggerEnumeration",
-                1,
-            );
-            ctx.set_field(e, 0, Value::Int(0));
-            Ok(Some(Value::Object(Some(e))))
-        },
-    );
     r.set_category(__prev_cat);
 }
-
-
-// =============================================================================
-// java.lang.ClassLoader — resource loading, findResource, loadClass
-// =============================================================================
 
 pub(crate) fn register_p61_classloader(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
@@ -4724,10 +4797,25 @@ fn classvalue_cache(
 /// GC root scan hook for the `ClassValue` memoization cache — reports every
 /// cached computed value so the GC keeps it live across compaction. Wired
 /// into `roots.rs` alongside `lang_system::gc_scan_system_singleton_roots`.
-pub fn gc_scan_classvalue_cache_roots(out: &mut Vec<ObjectRef>) {
+///
+/// `metadata_pin_deferrable` is `roots.rs`'s
+/// `VmHeap::metadata_pin_deferrable` (SPB.1 residual fix), threaded in as a
+/// closure so this crate does not need a `cratonvm-gc` dependency. Skipping
+/// `out.push` for a still-young cached value here would be unsound: the
+/// Generational backend's `metadata_pin` consumer runs only inside the
+/// old-gen BFS, so a young value deferred to `metadata_pin` with no other
+/// GC root is silently reclaimed. See `gc/src/vm_heap.rs`'s doc for the full
+/// writeup and `docs/known-issues/spb1-springframework-util-investigation.md`
+/// for the observed corruption shape this pattern produced elsewhere.
+pub fn gc_scan_classvalue_cache_roots(
+    out: &mut Vec<ObjectRef>,
+    metadata_pin_deferrable: &dyn Fn(usize) -> bool,
+) {
     let cache = classvalue_cache().lock().unwrap_or_else(|e| e.into_inner());
     for entry in cache.values() {
-        if cratonvm_types::metadata_pin::metadata_weak_mode() {
+        if cratonvm_types::metadata_pin::metadata_weak_mode()
+            && metadata_pin_deferrable(entry.value.as_ptr() as usize)
+        {
             if let Some(loader) = entry
                 .owner_class_id
                 .and_then(cratonvm_types::loader_pin::loader_pin_addr)
