@@ -5,6 +5,69 @@
 //!
 //! Checks whether a class, field, or method is accessible from a given context.
 //! Returns `IllegalAccessError` when access is denied.
+//!
+//! # STATUS (audited 2026-07-26) - member access is NOT enforced at runtime
+//!
+//! The question this audit set out to answer was "does a resolution cache skip
+//! the access check?". The answer is no, and for an uncomfortable reason:
+//! **on the bytecode resolution path there is no member access check to skip.**
+//!
+//! What the caching does right, so it is not re-litigated later: every live
+//! resolution cache is keyed on the *referencing* class, not just the resolved
+//! member --
+//!
+//! * `resolution::ResolutionKey` = `(ClassId, u16)`, i.e. (referring class, cp
+//!   index);
+//! * `resolution::InvokeCacheKey` = `(caller class, cp index, is_special)`,
+//!   plus the receiver class for the polymorphic tier;
+//! * `lockfree_resolve::PromotedInvokeKey` adds the receiver class to the same
+//!   caller-keyed tuple.
+//!
+//! JVMS 5.4.4 resolution is defined per (referencing class, symbolic
+//! reference), so a cache hit is by construction the *same* accessor that the
+//! check was performed for, and re-running it would be redundant. The bug
+//! shape to watch for -- a globally-keyed resolved member reused from a
+//! *different* referencing class without re-checking -- is not present. The one
+//! globally-keyed member cache, [`super::resolution::LinkResolver`], stores no
+//! access verdict and serves only JNI `GetMethodID`/`GetFieldID`, where the
+//! spec does not mandate the check. (`lockfree_resolve`'s
+//! `SharedResolutionState::global_methods`/`global_fields` DO use an
+//! accessor-free key; they have no production callers today, and that key shape
+//! must not be adopted for anything carrying an access verdict.)
+//!
+//! The actual gap is upstream of caching:
+//!
+//! | function | production call sites |
+//! |---|---|
+//! | [`check_class_access`] | `vm/src/runtime/interpreter.rs` -- `new` only |
+//! | [`check_module_access_by_id`] | field + method resolution (JPMS only) |
+//! | [`check_field_access`] | **none** |
+//! | [`check_method_access`] | **none** |
+//! | [`check_class_access_with_modules`] | **none** |
+//! | [`check_field_access_with_modules`] | **none** |
+//! | [`check_method_access_with_modules`] | **none** |
+//! | [`are_nestmates`] | none (reachable only via the two dead member checks) |
+//!
+//! Consequence: at `getfield` / `putfield` / `getstatic` / `putstatic` /
+//! `invoke*`, a hand-written class file that names another class's `private`
+//! or package-private member resolves and executes. The verifier does not
+//! compensate -- `IllegalAccessError` is constructed nowhere outside this
+//! module. Class-level access is enforced only for `new`, not for `checkcast`,
+//! `instanceof`, `ldc`, `anewarray`, or the owner class of a field/method ref.
+//! Reflection is a separate subsystem with its own (correctly wired) check in
+//! `native-builtins/src/lang_class.rs`.
+//!
+//! Wiring this up requires edits in `vm/src/runtime/interpreter.rs`, which this
+//! module's owner does not own; the exact insertion points are recorded under
+//! "cross-owner requests" in
+//! `docs/internal/arch-2026-07-26/classloading-verify-and-resolve.md`.
+//!
+//! One trap for whoever does the wiring: the cross-package protected
+//! receiver-subtype clause is implemented ([`receiver_ok_for_protected`]), but
+//! passing `receiver: None` satisfies it **vacuously**. Plumbing the static
+//! receiver type through `getfield`/`invokevirtual` is part of the job, not an
+//! optional refinement -- see
+//! `protected_receiver_none_is_vacuous_not_a_check`.
 
 use cratonvm_reader::class_access_flags::{FieldAccessFlags, MethodAccessFlags};
 #[cfg(test)]
@@ -459,6 +522,17 @@ pub fn check_method_access_with_modules(
 ///
 /// Returns Ok(()) silently if either class is not found (defensive вЂ” the
 /// missing class will be caught later by a more specific error path).
+///
+/// AUDIT (2026-07-26): the two early `Ok(())` returns below are **fail-open**.
+/// The empty-registry one is correct (classpath-only mode has no modules, so
+/// there is no boundary to cross). The lookup-failure one is a silent allow:
+/// if either `ClassId` is absent from the store the JPMS check is skipped
+/// rather than raised. Both classes are normally resident by the time
+/// resolution reaches here, so this is not currently reachable in a way that
+/// grants access it should not -- but it is a fail-open default, and it is
+/// recorded here rather than left implicit. Changing it to fail-closed
+/// requires a boot-path validation this session could not run; see the
+/// arch doc.
 pub fn check_module_access_by_id(
     accessor_id: super::class::ClassId,
     target_id: super::class::ClassId,
@@ -531,6 +605,61 @@ mod tests {
             init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
         });
         id
+    }
+
+    // --- The protected receiver-subtype trap (audit 2026-07-26) ---
+
+    /// PINS A TRAP, does not assert desired behaviour.
+    ///
+    /// The JVMS 5.4.4 cross-package protected rule has two clauses: the
+    /// accessor must be a subclass of the declaring class, AND the receiver's
+    /// static type must be the accessor or a subclass of it. The second clause
+    /// is implemented, but `receiver: None` satisfies it **vacuously** -- so a
+    /// caller that has not plumbed the static receiver type through gets clause
+    /// 1 only, and cross-package protected access that JVMS forbids is allowed.
+    ///
+    /// Today nothing calls `check_field_access` at all (see the module STATUS
+    /// section), so this is latent rather than live. It becomes live the moment
+    /// someone wires the check up at `getfield`/`invokevirtual` and passes
+    /// `None` because the receiver type is inconvenient to thread through. This
+    /// test exists so that reviewer sees the divergence spelled out.
+    #[test]
+    fn protected_receiver_none_is_vacuous_not_a_check() {
+        let mut store = ClassStore::new();
+        // p/Declaring  <- q/Accessor (subclass, different package)
+        //                 p/Sibling  (unrelated to Accessor)
+        let declaring = make_class(&mut store, "p/Declaring", None, ClassAccessFlags::PUBLIC);
+        let accessor = make_class(
+            &mut store,
+            "q/Accessor",
+            Some(declaring),
+            ClassAccessFlags::PUBLIC,
+        );
+        let sibling = make_class(
+            &mut store,
+            "p/Sibling",
+            Some(declaring),
+            ClassAccessFlags::PUBLIC,
+        );
+
+        let acc = store.get(accessor).unwrap();
+        let dec = store.get(declaring).unwrap();
+        let sib = store.get(sibling).unwrap();
+
+        // With the receiver supplied, clause 2 does its job: `p/Sibling` is not
+        // a subtype of `q/Accessor`, so cross-package protected access through
+        // it is denied.
+        assert!(
+            check_field_access(acc, dec, FieldAccessFlags::PROTECTED, &store, Some(sib)).is_err(),
+            "clause 2 must reject a sibling receiver"
+        );
+
+        // With `None`, the SAME access is allowed. This is the trap.
+        assert!(
+            check_field_access(acc, dec, FieldAccessFlags::PROTECTED, &store, None).is_ok(),
+            "an omitted receiver satisfies clause 2 vacuously - a wirer that \
+             passes None gets clause 1 only"
+        );
     }
 
     // --- package_of ---
