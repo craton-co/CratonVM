@@ -1,0 +1,667 @@
+# CratonVM — complete `CRATONVM_*` token reference
+
+*Generated from `types/src/flag_groups.rs::INVENTORY`. Regenerate with
+`tools/flag-census/render-tokens.sh`; `types/tests/flag_surface.rs` fails the
+build if this table and the code disagree about which variables exist.*
+
+Every knob in the VM is a token in one of **ten** environment variables. This
+file lists all of them. [`docs/CONFIG.md`](CONFIG.md) documents the handful you
+would set when *running* an application; the rest are here because a complete
+list is what stops the surface from growing back.
+
+## Syntax
+
+```sh
+CRATONVM_<GROUP>=token,token=value,-token
+```
+
+| Form | Meaning |
+| --- | --- |
+| `token` or `+token` | switch it **on** |
+| `-token` | switch it **off** |
+| `token=value` | switch it on with a value (sizes, counts, paths) |
+| `all` | every token in that group |
+
+Tokens are comma-separated and whitespace around them is ignored. A token the
+group does not define prints one line on stderr and is otherwise ignored — a
+typo is loud, which it was not before.
+
+## The five scalars
+
+These keep their own name: they are a path, a location or a master switch, not
+a knob with an on/off sense.
+
+| Variable | Meaning |
+| --- | --- |
+| `CRATONVM_JAVA_HOME` | JDK to boot from; overrides `JAVA_HOME` for the boot probe. |
+| `CRATONVM_BIN` | Path to the `cratonvm` binary, for harnesses that re-exec it. |
+| `CRATONVM_MAVEN_REPO_LOCAL` | Local Maven repository root. |
+| `CRATONVM_ENABLE_ASSERTIONS` | Evaluate Java `assert` statements (the `-ea` analog). |
+| `CRATONVM_DISABLE_JIT` | Interpreter-only execution. Also set by `--nojit`. |
+
+## Legacy names
+
+The **Expands to** column is not documentation of a second surface — it is the
+compatibility rule. Setting `CRATONVM_DBG_GC_STRESS=65536` directly still works
+because that variable is exactly what `CRATONVM_DBG=gc-stress=65536` writes. The
+launcher prints one line naming the grouped spelling when it sees one.
+
+Where a row lists two variables (`A / B`), those were two spellings of one
+switch before this table existed — `A` was the opt-in and `B` the opt-out, or
+`A` was the real implementation and `B` the synthetic shim. They are now one
+token: the plain form selects `A`, the `-` form selects `B`.
+
+A grouped variable **wins** over a legacy one, so `-token` can mask a stale
+export inherited from a parent shell.
+
+## `CRATONVM_DBG`
+
+342 tokens.
+
+| Token | Expands to |
+| --- | --- |
+| `a2` | `CRATONVM_DBG_A2` |
+| `access` | `CRATONVM_DBG_ACCESS` |
+| `active-profiles-identity-trace` | `CRATONVM_ACTIVE_PROFILES_IDENTITY_TRACE` |
+| `aio` | `CRATONVM_DBG_AIO` |
+| `aioobe` | `CRATONVM_DBG_AIOOBE` |
+| `aioobe2` | `CRATONVM_DBG_AIOOBE2` |
+| `aioobe3` | `CRATONVM_DBG_AIOOBE3` |
+| `altrace` | `CRATONVM_DBG_ALTRACE` |
+| `ann-proxy-dispatch-trace` | `CRATONVM_ANN_PROXY_DISPATCH_TRACE` |
+| `ann-trace` | `CRATONVM_ANN_TRACE` |
+| `annproxy-wrap` | `CRATONVM_DBG_ANNPROXY_WRAP` |
+| `anonalloc` | `CRATONVM_DBG_ANONALLOC` |
+| `aqs-trace` | `CRATONVM_DBG_AQS_TRACE` |
+| `args` | `CRATONVM_DBG_ARGS` |
+| `arraycopy` | `CRATONVM_DBG_ARRAYCOPY` |
+| `arrlen` | `CRATONVM_DBG_ARRLEN` |
+| `arrstore` | `CRATONVM_DBG_ARRSTORE` |
+| `asserteq` | `CRATONVM_DBG_ASSERTEQ` |
+| `assertj-arr` | `CRATONVM_DBG_ASSERTJ_ARR` |
+| `athrow` | `CRATONVM_DBG_ATHROW` |
+| `atomic-updater` | `CRATONVM_DBG_ATOMIC_UPDATER` |
+| `badrecv` | `CRATONVM_DBG_BADRECV` |
+| `badref` | `CRATONVM_DBG_BADREF` |
+| `bb` | `CRATONVM_DBG_BB` |
+| `bblp` | `CRATONVM_DBG_BBLP` |
+| `bd-debug` | `CRATONVM_BD_DEBUG` |
+| `blocked-access` | `CRATONVM_DBG_BLOCKED_ACCESS` |
+| `blockgc` | `CRATONVM_DBG_BLOCKGC` |
+| `bufunder` | `CRATONVM_DBG_BUFUNDER` |
+| `bug03` | `CRATONVM_DBG_BUG03` |
+| `bytecode-dump` | `CRATONVM_DBG_BYTECODE_DUMP` |
+| `caller` | `CRATONVM_DBG_CALLER` |
+| `capval` | `CRATONVM_DBG_CAPVAL` |
+| `catalina` | `CRATONVM_DBG_CATALINA` |
+| `cause` | `CRATONVM_DBG_CAUSE` |
+| `cce` | `CRATONVM_DBG_CCE` |
+| `cce-bt` | `CRATONVM_DBG_CCE_BT` |
+| `ccecache` | `CRATONVM_DBG_CCECACHE` |
+| `ccsprobe` | `CRATONVM_DBG_CCSPROBE` |
+| `cellcorrupt` | `CRATONVM_DBG_CELLCORRUPT` |
+| `charset` | `CRATONVM_DBG_CHARSET` |
+| `classpath` | `CRATONVM_DBG_CLASSPATH` |
+| `cleaners` | `CRATONVM_DBG_NO_CLEANERS` |
+| `clone` | `CRATONVM_DBG_CLONE` |
+| `coerce` | `CRATONVM_DBG_COERCE` |
+| `compact-inline` | `CRATONVM_DBG_COMPACT_INLINE` |
+| `compact-legacy` | `CRATONVM_DBG_COMPACT_LEGACY` |
+| `compactvalue` | `CRATONVM_DBG_COMPACTVALUE` |
+| `component-type` | `CRATONVM_DBG_COMPONENT_TYPE` |
+| `corrupt-frames` | `CRATONVM_DBG_CORRUPT_FRAMES` |
+| `ctor-fix` | `CRATONVM_DBG_CTOR_FIX` |
+| `debug-sfi` | `CRATONVM_DEBUG_SFI` |
+| `debug-stack-tag` | `CRATONVM_DEBUG_STACK_TAG` |
+| `debug-stackwalk` | `CRATONVM_DEBUG_STACKWALK` |
+| `define` | `CRATONVM_DBG_DEFINE` |
+| `deflate` | `CRATONVM_DBG_DEFLATE` |
+| `deopt` | `CRATONVM_DBG_DEOPT` |
+| `deopt-eager` | `CRATONVM_DEOPT_EAGER` |
+| `deopt-eager-bci` | `CRATONVM_DEOPT_EAGER_BCI` |
+| `deopt-verify` | `CRATONVM_DEOPT_VERIFY` |
+| `deprecations` | `CRATONVM_QUIET_DEPRECATIONS` |
+| `desctrace` | `CRATONVM_DBG_DESCTRACE` |
+| `diag-hib32` | `CRATONVM_DIAG_HIB32` |
+| `diag-jar-list` | `CRATONVM_DIAG_JAR_LIST` |
+| `diag-jboss-services` | `CRATONVM_DIAG_JBOSS_SERVICES` |
+| `diag-jca` | `CRATONVM_DIAG_JCA` |
+| `diag-method-invoke-null` | `CRATONVM_DIAG_METHOD_INVOKE_NULL` |
+| `diag-properties` | `CRATONVM_DIAG_PROPERTIES` |
+| `diag-serviceloader` | `CRATONVM_DIAG_SERVICELOADER` |
+| `dopriv` | `CRATONVM_DBG_DOPRIV` |
+| `dropped-stubs` | `CRATONVM_DBG_DROPPED_STUBS` |
+| `dump-jit` | `CRATONVM_DBG_DUMP_JIT` |
+| `dupcall-filter` | `CRATONVM_DBG_DUPCALL_FILTER` |
+| `dupclass` | `CRATONVM_DBG_DUPCLASS` |
+| `dupclass-bt` | `CRATONVM_DBG_DUPCLASS_BT` |
+| `dupx-methods` | `CRATONVM_DBG_DUPX_METHODS` |
+| `ecwatch` | `CRATONVM_DBG_ECWATCH` |
+| `ecwatch-native` | `CRATONVM_DBG_ECWATCH_NATIVE` |
+| `enable-native-ring` | `CRATONVM_ENABLE_NATIVE_RING` |
+| `eqe` | `CRATONVM_DBG_EQE` |
+| `exec` | `CRATONVM_DBG_EXEC` |
+| `exec-frame-trace` | `CRATONVM_EXEC_FRAME_TRACE` |
+| `exit` | `CRATONVM_DBG_EXIT` |
+| `fbcglib` | `CRATONVM_DBG_FBCGLIB` |
+| `fbref` | `CRATONVM_DBG_FBREF` |
+| `field-get` | `CRATONVM_DBG_FIELD_GET` |
+| `field-watch` | `CRATONVM_DBG_FIELD_WATCH` |
+| `fieldaddr` | `CRATONVM_DBG_FIELDADDR` |
+| `force-moving` | `CRATONVM_DBG_FORCE_MOVING` |
+| `forname-trace` | `CRATONVM_FORNAME_TRACE` |
+| `frame-trace` | `CRATONVM_FRAME_TRACE` |
+| `fsp` | `CRATONVM_DBG_FSP` |
+| `fullstack-scan` | `CRATONVM_DBG_FULLSTACK_SCAN` |
+| `fwdguard` | `CRATONVM_DBG_FWDGUARD` |
+| `g1-dbg-headers` | `CRATONVM_G1_DBG_HEADERS` |
+| `g1-dbg-pins` | `CRATONVM_G1_DBG_PINS` |
+| `g1-dbg-reach` | `CRATONVM_G1_DBG_REACH` |
+| `g1-dbg-rootcensus` | `CRATONVM_G1_DBG_ROOTCENSUS` |
+| `g1-dbg-zero` | `CRATONVM_G1_DBG_ZERO` |
+| `g1diag` | `CRATONVM_DBG_G1DIAG` |
+| `gc-array-guard-bt` | `CRATONVM_GC_ARRAY_GUARD_BT` |
+| `gc-overhead` | `CRATONVM_DBG_GC_OVERHEAD` |
+| `gc-stats` | `CRATONVM_GC_STATS` |
+| `gc-stress` | `CRATONVM_DBG_GC_STRESS` |
+| `gc-verify-stale` | `CRATONVM_GC_VERIFY_STALE` |
+| `gcpart` | `CRATONVM_DBG_GCPART` |
+| `gcpause` | `CRATONVM_DBG_GCPAUSE` |
+| `gcphase` | `CRATONVM_DBG_GCPHASE` |
+| `gcwrite` | `CRATONVM_DBG_GCWRITE` |
+| `getresources` | `CRATONVM_DBG_GETRESOURCES` |
+| `gocbf` | `CRATONVM_DBG_GOCBF` |
+| `gpu-trace-bytes` | `CRATONVM_GPU_TRACE_BYTES` |
+| `gse` | `CRATONVM_DBG_GSE` |
+| `h2parserread` | `CRATONVM_DBG_H2PARSERREAD` |
+| `h2trace` | `CRATONVM_DBG_H2TRACE` |
+| `hang-sample` | `CRATONVM_DBG_HANG_SAMPLE` |
+| `hangwalk` | `CRATONVM_DBG_HANGWALK` |
+| `heap-stale` | `CRATONVM_DBG_HEAP_STALE` |
+| `heap-trace` | `CRATONVM_DBG_HEAP_TRACE` |
+| `heapcopy` | `CRATONVM_DBG_HEAPCOPY` |
+| `heartbeat` | `CRATONVM_DBG_HEARTBEAT` |
+| `hm-trace` | `CRATONVM_HM_TRACE` |
+| `hmput` | `CRATONVM_DBG_HMPUT` |
+| `hotpath-counts` | `CRATONVM_DBG_HOTPATH_COUNTS` |
+| `hs-itr-dbg` | `CRATONVM_HS_ITR_DBG` |
+| `httpsrv` | `CRATONVM_DBG_HTTPSRV` |
+| `iae-trace` | `CRATONVM_IAE_TRACE` |
+| `iae-trace2` | `CRATONVM_IAE_TRACE2` |
+| `imse` | `CRATONVM_DBG_IMSE` |
+| `indy-all` | `CRATONVM_DBG_INDY_ALL` |
+| `indy-generic` | `CRATONVM_DBG_INDY_GENERIC` |
+| `inline-fr` | `CRATONVM_DBG_INLINE_FR` |
+| `intrinsic-stats` | `CRATONVM_INTRINSIC_STATS` |
+| `invoke-coerce` | `CRATONVM_DBG_INVOKE_COERCE` |
+| `invoke-virtual-entry-trace` | `CRATONVM_INVOKE_VIRTUAL_ENTRY_TRACE` |
+| `invokestatic-loader-trace` | `CRATONVM_INVOKESTATIC_LOADER_TRACE` |
+| `invokestats` | `CRATONVM_DBG_INVOKESTATS` |
+| `invspecial` | `CRATONVM_DBG_INVSPECIAL` |
+| `ir-call` | `CRATONVM_DBG_IR_CALL` |
+| `ir-long` | `CRATONVM_DBG_IR_LONG` |
+| `irslot` | `CRATONVM_DBG_IRSLOT` |
+| `isinstance` | `CRATONVM_DBG_ISINSTANCE` |
+| `jar` | `CRATONVM_DBG_JAR` |
+| `jetty` | `CRATONVM_DBG_JETTY` |
+| `jetty2` | `CRATONVM_DBG_JETTY2` |
+| `jit-alloc` | `CRATONVM_DBG_JIT_ALLOC` |
+| `jit-bisect-only` | `CRATONVM_JIT_BISECT_ONLY` |
+| `jit-bisect-skip` | `CRATONVM_JIT_BISECT_SKIP` |
+| `jit-code` | `CRATONVM_DBG_JIT_CODE` |
+| `jit-disasm` | `CRATONVM_DBG_JIT_DISASM` |
+| `jit-dispatch` | `CRATONVM_DBG_JIT_DISPATCH` |
+| `jit-entry` | `CRATONVM_DBG_JIT_ENTRY` |
+| `jit-gen` | `CRATONVM_DBG_JIT_GEN` |
+| `jit-ldc` | `CRATONVM_DBG_JIT_LDC` |
+| `jit-method-stats` | `CRATONVM_DBG_JIT_METHOD_STATS` |
+| `jit-mic` | `CRATONVM_DBG_JIT_MIC` |
+| `jit-names` | `CRATONVM_DBG_JIT_NAMES` |
+| `jit-putfield` | `CRATONVM_DBG_JIT_PUTFIELD` |
+| `jit-safepoints` | `CRATONVM_DBG_JIT_SAFEPOINTS` |
+| `jitc` | `CRATONVM_DBG_JITC` |
+| `jlm` | `CRATONVM_DBG_JLM` |
+| `kcbool` | `CRATONVM_DBG_KCBOOL` |
+| `lambda` | `CRATONVM_DBG_LAMBDA` |
+| `lambda-dispatch` | `CRATONVM_DBG_LAMBDA_DISPATCH` |
+| `lambda-generic` | `CRATONVM_DBG_LAMBDA_GENERIC` |
+| `layout` | `CRATONVM_DBG_LAYOUT` |
+| `ldc-classref-trace` | `CRATONVM_LDC_CLASSREF_TRACE` |
+| `letsgo` | `CRATONVM_DBG_LETSGO` |
+| `lhm-evict` | `CRATONVM_DBG_LHM_EVICT` |
+| `licm` | `CRATONVM_DBG_LICM` |
+| `linker` | `CRATONVM_DBG_LINKER` |
+| `loadclass` | `CRATONVM_DBG_LOADCLASS` |
+| `loader-trace` | `CRATONVM_DBG_LOADER_TRACE` |
+| `logprov` | `CRATONVM_DBG_LOGPROV` |
+| `longroot` | `CRATONVM_DBG_LONGROOT` |
+| `lookup` | `CRATONVM_DBG_LOOKUP` |
+| `mcl` | `CRATONVM_DBG_MCL` |
+| `memwatch` | `CRATONVM_DBG_MEMWATCH` |
+| `method-invoke-box` | `CRATONVM_DBG_METHOD_INVOKE_BOX` |
+| `mh-adapter` | `CRATONVM_DBG_MH_ADAPTER` |
+| `mh-dispatch` | `CRATONVM_DBG_MH_DISPATCH` |
+| `mh-stack` | `CRATONVM_DBG_MH_STACK` |
+| `mic-prof` | `CRATONVM_DBG_MIC_PROF` |
+| `minvoke` | `CRATONVM_DBG_MINVOKE` |
+| `mirrorpin` | `CRATONVM_DBG_MIRRORPIN` |
+| `modprov` | `CRATONVM_DBG_MODPROV` |
+| `modstatic` | `CRATONVM_DBG_MODSTATIC` |
+| `monenter` | `CRATONVM_DBG_MONENTER` |
+| `monexit` | `CRATONVM_DBG_MONEXIT` |
+| `moving-young-coverage-dbg` | `CRATONVM_MOVING_YOUNG_COVERAGE_DBG` |
+| `moving-young-fallbacks` | `CRATONVM_MOVING_YOUNG_FALLBACKS` |
+| `moving-young-verify` | `CRATONVM_MOVING_YOUNG_VERIFY` |
+| `msc` | `CRATONVM_DBG_MSC` |
+| `mtroots` | `CRATONVM_DBG_MTROOTS` |
+| `ncdfe` | `CRATONVM_DBG_NCDFE` |
+| `needs-exact-trace` | `CRATONVM_NEEDS_EXACT_TRACE` |
+| `net` | `CRATONVM_DBG_NET` |
+| `netty-queue` | `CRATONVM_DBG_NETTY_QUEUE` |
+| `nextint` | `CRATONVM_DBG_NEXTINT` |
+| `nio-bind` | `CRATONVM_DBG_NIO_BIND` |
+| `nocode` | `CRATONVM_DBG_NOCODE` |
+| `nonmoving-reclaim` | `CRATONVM_DBG_NO_NONMOVING_RECLAIM` |
+| `npe-invoke` | `CRATONVM_DBG_NPE_INVOKE` |
+| `npe-none` | `CRATONVM_DBG_NPE_NONE` |
+| `npe-stack` | `CRATONVM_DBG_NPE_STACK` |
+| `npe-trace` | `CRATONVM_DBG_NPE_TRACE` |
+| `nsee-trace` | `CRATONVM_NSEE_TRACE` |
+| `nsme` | `CRATONVM_DBG_NSME` |
+| `null-native` | `CRATONVM_DBG_NULL_NATIVE` |
+| `nullthis` | `CRATONVM_DBG_NULLTHIS` |
+| `obj-equals` | `CRATONVM_DBG_OBJ_EQUALS` |
+| `objects` | `CRATONVM_DBG_OBJECTS` |
+| `obsreg` | `CRATONVM_DBG_OBSREG` |
+| `oobfield` | `CRATONVM_DBG_OOBFIELD` |
+| `oop-span-probe` | `CRATONVM_OOP_SPAN_PROBE` |
+| `osr` | `CRATONVM_DBG_OSR` |
+| `osr-exit-after` | `CRATONVM_OSR_EXIT_AFTER` |
+| `osr-exit-test` | `CRATONVM_OSR_EXIT_TEST` |
+| `osr-meta` | `CRATONVM_DBG_OSR_META` |
+| `overlay` | `CRATONVM_DBG_OVERLAY` |
+| `overlay-all` | `CRATONVM_DBG_OVERLAY_ALL` |
+| `parklat` | `CRATONVM_DBG_PARKLAT` |
+| `pb` | `CRATONVM_DBG_PB` |
+| `pbe` | `CRATONVM_DBG_PBE` |
+| `pbstart` | `CRATONVM_DBG_PBSTART` |
+| `picocli-style` | `CRATONVM_DBG_PICOCLI_STYLE` |
+| `popint` | `CRATONVM_DBG_POPINT` |
+| `precise` | `CRATONVM_DBG_PRECISE` |
+| `proxy` | `CRATONVM_DBG_PROXY` |
+| `prune` | `CRATONVM_DBG_NO_PRUNE` |
+| `quarkus-staticinit` | `CRATONVM_DBG_QUARKUS_STATICINIT` |
+| `quicken-stats` | `CRATONVM_QUICKEN_STATS` |
+| `raf-getfd` | `CRATONVM_DBG_RAF_GETFD` |
+| `raf-init` | `CRATONVM_DBG_RAF_INIT` |
+| `rbc6` | `CRATONVM_DBG_RBC6` |
+| `re5` | `CRATONVM_DBG_RE5` |
+| `refersto` | `CRATONVM_DBG_REFERSTO` |
+| `reflection-factory` | `CRATONVM_DBG_REFLECTION_FACTORY` |
+| `refproc` | `CRATONVM_DBG_NO_REFPROC` |
+| `refproc-remark` | `CRATONVM_DBG_REFPROC_REMARK` |
+| `remap-trace` | `CRATONVM_DBG_REMAP_TRACE` |
+| `replovr` | `CRATONVM_DBG_REPLOVR` |
+| `resolve-shim` | `CRATONVM_DBG_RESOLVE_SHIM` |
+| `resource-timing` | `CRATONVM_DBG_RESOURCE_TIMING` |
+| `resume-pc` | `CRATONVM_DBG_RESUME_PC` |
+| `retransform` | `CRATONVM_DBG_RETRANSFORM` |
+| `rootsnap` | `CRATONVM_DBG_ROOTSNAP` |
+| `rset-audit` | `CRATONVM_DBG_RSET_AUDIT` |
+| `rset-audit-young-scan` | `CRATONVM_DBG_RSET_AUDIT_YOUNG_SCAN` |
+| `rvas` | `CRATONVM_DBG_RVAS` |
+| `s111-dbg` | `CRATONVM_S111_DBG` |
+| `sbload` | `CRATONVM_DBG_SBLOAD` |
+| `sc-close` | `CRATONVM_DBG_SC_CLOSE` |
+| `sc-read` | `CRATONVM_DBG_SC_READ` |
+| `sc-write` | `CRATONVM_DBG_SC_WRITE` |
+| `scalar-deopt` | `CRATONVM_DBG_SCALAR_DEOPT` |
+| `scalar-new` | `CRATONVM_DBG_SCALAR_NEW` |
+| `seed-all-old` | `CRATONVM_DBG_SEED_ALL_OLD` |
+| `seedhunt` | `CRATONVM_DBG_SEEDHUNT` |
+| `sel` | `CRATONVM_DBG_SEL` |
+| `selector` | `CRATONVM_DBG_SELECTOR` |
+| `sfi-null-trace` | `CRATONVM_SFI_NULL_TRACE` |
+| `shadow` | `CRATONVM_DBG_SHADOW` |
+| `shadow-depth` | `CRATONVM_DBG_SHADOW_DEPTH` |
+| `shadow-reload` | `CRATONVM_DBG_SHADOW_RELOAD` |
+| `shadow-sentinel` | `CRATONVM_SHADOW_SENTINEL` |
+| `shadow-watch` | `CRATONVM_SHADOW_WATCH` |
+| `shadow2` | `CRATONVM_DBG_SHADOW2` |
+| `shadow2-filter` | `CRATONVM_DBG_SHADOW2_FILTER` |
+| `sleep-trace` | `CRATONVM_DBG_SLEEP_TRACE` |
+| `sock` | `CRATONVM_DBG_SOCK` |
+| `sock-bytes` | `CRATONVM_DBG_SOCK_BYTES` |
+| `soe` | `CRATONVM_DBG_SOE` |
+| `soft-exit` | `CRATONVM_SOFT_EXIT` |
+| `sp-stats` | `CRATONVM_SP_STATS` |
+| `sp-trace` | `CRATONVM_SP_TRACE` |
+| `sp-verify` | `CRATONVM_SP_VERIFY` |
+| `spid` | `CRATONVM_DBG_SPID` |
+| `spring-dbg` | `CRATONVM_SPRING_DBG` |
+| `stackless` | `CRATONVM_DBG_STACKLESS` |
+| `stale-objref` | `CRATONVM_DBG_STALE_OBJREF` |
+| `stale-objref-cycles` | `CRATONVM_DBG_STALE_OBJREF_CYCLES` |
+| `stale-recv` | `CRATONVM_DBG_STALE_RECV` |
+| `stalelong` | `CRATONVM_DBG_STALELONG` |
+| `straystack` | `CRATONVM_DBG_STRAYSTACK` |
+| `streamsupp` | `CRATONVM_DBG_STREAMSUPP` |
+| `sttrace` | `CRATONVM_DBG_STTRACE` |
+| `stw-census` | `CRATONVM_DBG_STW_CENSUS` |
+| `stw-expected-ids` | `CRATONVM_DBG_STW_EXPECTED_IDS` |
+| `stw-native-ring` | `CRATONVM_DBG_STW_NATIVE_RING` |
+| `surefire-ipc-dbg` | `CRATONVM_SUREFIRE_IPC_DBG` |
+| `sweep-census` | `CRATONVM_DBG_SWEEP_CENSUS` |
+| `sweep-edges` | `CRATONVM_DBG_SWEEP_EDGES` |
+| `sweep-zero` | `CRATONVM_DBG_SWEEP_ZERO` |
+| `symbolize` | `CRATONVM_SYMBOLIZE` |
+| `symbolize-dbg` | `CRATONVM_SYMBOLIZE_DBG` |
+| `threadreg-perf` | `CRATONVM_DBG_THREADREG_PERF` |
+| `threadstart` | `CRATONVM_DBG_THREADSTART` |
+| `tier-enqueue` | `CRATONVM_DBG_TIER_ENQUEUE` |
+| `tlabmiss` | `CRATONVM_DBG_TLABMISS` |
+| `tls-auth` | `CRATONVM_DBG_TLS_AUTH` |
+| `tls-hs` | `CRATONVM_DBG_TLS_HS` |
+| `tls-pls` | `CRATONVM_DBG_TLS_PLS` |
+| `tls-sock` | `CRATONVM_DBG_TLS_SOCK` |
+| `tls-srv` | `CRATONVM_DBG_TLS_SRV` |
+| `toarray` | `CRATONVM_DBG_TOARRAY` |
+| `tohex` | `CRATONVM_DBG_TOHEX` |
+| `trace-arrays-hashcode` | `CRATONVM_TRACE_ARRAYS_HASHCODE` |
+| `trace-classvalue` | `CRATONVM_TRACE_CLASSVALUE` |
+| `trace-pti-args` | `CRATONVM_TRACE_PTI_ARGS` |
+| `trace-sb-filter` | `CRATONVM_TRACE_SB_FILTER` |
+| `trace-unimplemented` | `CRATONVM_TRACE_UNIMPLEMENTED` |
+| `track-native` | `CRATONVM_TRACK_NATIVE` |
+| `uclreg` | `CRATONVM_DBG_UCLREG` |
+| `uclres` | `CRATONVM_DBG_UCLRES` |
+| `ueh-debug` | `CRATONVM_UEH_DEBUG` |
+| `uncaught` | `CRATONVM_DBG_UNCAUGHT` |
+| `underflow` | `CRATONVM_DBG_UNDERFLOW` |
+| `unpark-miss` | `CRATONVM_DBG_UNPARK_MISS` |
+| `unpin-ring` | `CRATONVM_DBG_UNPIN_RING` |
+| `unroll` | `CRATONVM_DBG_UNROLL` |
+| `urlcl` | `CRATONVM_DBG_URLCL` |
+| `ute` | `CRATONVM_DBG_UTE` |
+| `validate-new` | `CRATONVM_DBG_VALIDATE_NEW` |
+| `vdisp` | `CRATONVM_DBG_VDISP` |
+| `verify-error` | `CRATONVM_DBG_VERIFY_ERROR` |
+| `verify-inline-frame-record` | `CRATONVM_DBG_VERIFY_INLINE_FRAME_RECORD` |
+| `verify-oop-maps` | `CRATONVM_DBG_VERIFY_OOP_MAPS` |
+| `visitfile` | `CRATONVM_DBG_VISITFILE` |
+| `vm-state` | `CRATONVM_DBG_VM_STATE` |
+| `watch-cause-self` | `CRATONVM_DBG_WATCH_CAUSE_SELF` |
+| `watch-cell` | `CRATONVM_DBG_WATCH_CELL` |
+| `watchaddr` | `CRATONVM_DBG_WATCHADDR` |
+| `watchref` | `CRATONVM_DBG_WATCHREF` |
+| `weakref` | `CRATONVM_DBG_WEAKREF` |
+| `wf` | `CRATONVM_DBG_WF` |
+| `wf-npe` | `CRATONVM_DBG_WF_NPE` |
+| `xnio-tcp` | `CRATONVM_DBG_XNIO_TCP` |
+| `xt-jit-root-scan` | `CRATONVM_DBG_XT_JIT_ROOT_SCAN` |
+| `youngscan` | `CRATONVM_DBG_YOUNGSCAN` |
+| `youngstate` | `CRATONVM_DBG_YOUNGSTATE` |
+| `zero-ranges` | `CRATONVM_DBG_ZERO_RANGES` |
+
+## `CRATONVM_JIT`
+
+96 tokens.
+
+| Token | Expands to |
+| --- | --- |
+| `aaload-licm` | `CRATONVM_DISABLE_AALOAD_LICM` |
+| `alloc-class-cache` | `CRATONVM_NO_JIT_ALLOC_CLASS_CACHE` |
+| `allow-packages` | `CRATONVM_JIT_ALLOW_PACKAGES` |
+| `arith-licm` | `CRATONVM_DISABLE_ARITH_LICM` |
+| `bce` | `CRATONVM_JIT_NO_BCE` |
+| `bg-compile` | `CRATONVM_BG_COMPILE` |
+| `c2-first-call` | `CRATONVM_JIT_C2_FIRST_CALL` |
+| `c2-supersede` | `CRATONVM_C2_SUPERSEDE` |
+| `callee-oop-flush` | `CRATONVM_JIT_NO_CALLEE_OOP_FLUSH` |
+| `code-cache-max-mb` | `CRATONVM_JIT_CODE_CACHE_MAX_MB` |
+| `conservative-locals` | `CRATONVM_NO_CONSERVATIVE_LOCALS` |
+| `ctor-direct-call` | `CRATONVM_NO_CTOR_DIRECT_CALL` |
+| `deny` | `CRATONVM_JIT_DENY` |
+| `deopt-real` | `CRATONVM_DEOPT_REAL` |
+| `direct-callee-calls` | `CRATONVM_JIT_DIRECT_CALLEE_CALLS` |
+| `dispatch-cache-direct-entry` | `CRATONVM_JIT_DISPATCH_CACHE_DIRECT_ENTRY` |
+| `dispatch-cache-virtual-direct-entry` | `CRATONVM_JIT_DISPATCH_CACHE_VIRTUAL_DIRECT_ENTRY` |
+| `dup-x1` | `CRATONVM_JIT_NO_DUP_X1` |
+| `dup-x2` | `CRATONVM_JIT_NO_DUP_X2` |
+| `dupx` | `CRATONVM_JIT_NO_DUPX` |
+| `dupx-eager-canon` | `CRATONVM_JIT_DUPX_EAGER_CANON` |
+| `enable-callee-saved-gpr-locals` | `CRATONVM_JIT_ENABLE_CALLEE_SAVED_GPR_LOCALS` |
+| `enable-inline-new` | `CRATONVM_JIT_ENABLE_INLINE_NEW` |
+| `full-self-call-spill` | `CRATONVM_JIT_FULL_SELF_CALL_SPILL` |
+| `getfield-helper` | `CRATONVM_JIT_GETFIELD_HELPER` |
+| `helpful-npe-opcodes` | `CRATONVM_HELPFUL_NPE_OPCODES` |
+| `inclusive-bce` | `CRATONVM_JIT_INCLUSIVE_BCE` |
+| `inline-allow-static` | `CRATONVM_INLINE_ALLOW_STATIC` |
+| `inline-getfield` | `CRATONVM_JIT_INLINE_GETFIELD` |
+| `inline-new` | `CRATONVM_JIT_DISABLE_INLINE_NEW` |
+| `inline-putfield` | `CRATONVM_NO_JIT_INLINE_PUTFIELD` |
+| `inline-self-guard` | `CRATONVM_JIT_INLINE_SELF_GUARD` |
+| `inline-tlab-new` | `CRATONVM_NO_JIT_INLINE_TLAB_NEW` |
+| `intrinsics` | `CRATONVM_DISABLE_INTRINSICS` |
+| `ir-branchy` | `CRATONVM_NO_IR_BRANCHY` |
+| `ir-call` | `CRATONVM_JIT_IR_CALL` |
+| `ir-call-special` | `CRATONVM_JIT_IR_CALL_SPECIAL` |
+| `ir-call-virtual` | `CRATONVM_JIT_IR_CALL_VIRTUAL` |
+| `ir-deopt-resume` | `CRATONVM_IR_DEOPT_RESUME` |
+| `ir-direct-call` | `CRATONVM_JIT_IR_DIRECT_CALL` |
+| `ir-fp` | `CRATONVM_JIT_IR_FP` |
+| `ir-long` | `CRATONVM_JIT_IR_LONG` |
+| `ir-selfrec-direct` | `CRATONVM_JIT_IR_SELFREC_DIRECT` |
+| `kernel-reg-locals` | `CRATONVM_JIT_KERNEL_REG_LOCALS` |
+| `kernel-reg-osr` | `CRATONVM_JIT_KERNEL_REG_OSR` |
+| `licm` | `CRATONVM_JIT_LICM` |
+| `local-liveness` | `CRATONVM_NO_LOCAL_LIVENESS` |
+| `long-intrinsics` | `CRATONVM_JIT_NO_LONG_INTRINSICS` |
+| `longroot-strict` | `CRATONVM_LONGROOT_STRICT` |
+| `main-inline` | `CRATONVM_JIT_MAIN_INLINE` |
+| `native-ec-multiply` | `CRATONVM_NATIVE_EC_MULTIPLY` |
+| `native-matcher-find` | `CRATONVM_NATIVE_MATCHER_FIND` |
+| `native-pbe-keyfactory` | `CRATONVM_NATIVE_PBE_KEYFACTORY` |
+| `native-string-regex` | `CRATONVM_NATIVE_STRING_REGEX` |
+| `old-sweep-jit` | `CRATONVM_OLD_SWEEP_JIT` |
+| `osr` | `CRATONVM_JIT_OSR` |
+| `osr-newarray` | `CRATONVM_OSR_NEWARRAY` |
+| `precise-coverage-pin` | `CRATONVM_PRECISE_COVERAGE_PIN` |
+| `precise-inline-frame-record` | `CRATONVM_NO_PRECISE_INLINE_FRAME_RECORD` |
+| `precise-jit-maps` | `CRATONVM_NO_PRECISE_JIT_MAPS` |
+| `precise-reg-spill` | `CRATONVM_NO_PRECISE_REG_SPILL` |
+| `range-scan-legacy` | `CRATONVM_JIT_RANGE_SCAN_LEGACY` |
+| `reassoc` | `CRATONVM_JIT_REASSOC` |
+| `rootsnap-cache` | `CRATONVM_ROOTSNAP_CACHE` |
+| `rootsnap-cache-survive-gc` | `CRATONVM_ROOTSNAP_CACHE_SURVIVE_GC` |
+| `safepoint-polls` | `CRATONVM_JIT_SAFEPOINT_POLLS` |
+| `safepoint-reg-spill` | `CRATONVM_JIT_SAFEPOINT_REG_SPILL` |
+| `scalar-deopt` | `CRATONVM_SCALAR_DEOPT` |
+| `scalar-new` | `CRATONVM_JIT_SCALAR_NEW` |
+| `scalar-replacement` | `CRATONVM_DISABLE_SCALAR_REPLACEMENT` |
+| `scan-cache` | `CRATONVM_NO_JIT_SCAN_CACHE` |
+| `self-cache-inherit` | `CRATONVM_JIT_NO_SELF_CACHE_INHERIT` |
+| `shadow-nopush` | `CRATONVM_SHADOW_NOPUSH` |
+| `shadow-noreload` | `CRATONVM_SHADOW_NORELOAD` |
+| `shadow-pin` | `CRATONVM_SHADOW_PIN` |
+| `shadow-raw-reload` | `CRATONVM_SHADOW_RAW_RELOAD` |
+| `shadow-savebase` | `CRATONVM_SHADOW_NO_SAVEBASE` |
+| `shadow-stack` | `CRATONVM_SHADOW_STACK` |
+| `slot-mirror` | `CRATONVM_JIT_NO_SLOT_MIRROR` |
+| `sp-coalesce` | `CRATONVM_SP_NO_COALESCE` |
+| `spec-bce` | `CRATONVM_JIT_NO_SPEC_BCE` |
+| `stack-bang` | `CRATONVM_JIT_STACK_BANG / CRATONVM_JIT_NO_STACK_BANG` |
+| `strict-jit-roots` | `CRATONVM_STRICT_JIT_ROOTS` |
+| `threshold` | `CRATONVM_JIT_THRESHOLD` |
+| `tier-c1-threshold` | `CRATONVM_TIER_C1_THRESHOLD` |
+| `tier-c2-min-invocations` | `CRATONVM_TIER_C2_MIN_INVOCATIONS` |
+| `tier-c2-threshold` | `CRATONVM_TIER_C2_THRESHOLD` |
+| `tier-osr-backedge` | `CRATONVM_TIER_OSR_BACKEDGE` |
+| `tier-osr-threshold` | `CRATONVM_TIER_OSR_THRESHOLD` |
+| `tier-pgo` | `CRATONVM_TIER_PGO` |
+| `tiered` | `CRATONVM_TIER_ENABLED` |
+| `unban-junitcore` | `CRATONVM_JIT_UNBAN_JUNITCORE` |
+| `unroll` | `CRATONVM_JIT_UNROLL / CRATONVM_DISABLE_UNROLL` |
+| `virtual-tierup` | `CRATONVM_JIT_VIRTUAL_TIERUP` |
+| `xt-helper-window-scan` | `CRATONVM_XT_HELPER_WINDOW_SCAN` |
+| `xt-jit-root-scan` | `CRATONVM_XT_JIT_ROOT_SCAN` |
+
+## `CRATONVM_GC`
+
+22 tokens.
+
+| Token | Expands to |
+| --- | --- |
+| `card-table-only` | `CRATONVM_CARD_TABLE_ONLY` |
+| `compact-ref-fields` | `CRATONVM_COMPACT_REF_FIELDS` |
+| `compressed-oops` | `CRATONVM_COMPRESSED_OOPS` |
+| `default-heap-ergonomics` | `CRATONVM_DEFAULT_HEAP_ERGONOMICS` |
+| `default-heap-max-mb` | `CRATONVM_DEFAULT_HEAP_MAX_MB` |
+| `g1-evac-retry` | `CRATONVM_G1_NO_EVAC_RETRY` |
+| `g1-parallel-evac` | `CRATONVM_G1_PARALLEL_EVAC` |
+| `g1-workers` | `CRATONVM_G1_WORKERS` |
+| `gpu-zerocopy` | `CRATONVM_GPU_NO_ZEROCOPY` |
+| `max-inflated-bytes` | `CRATONVM_MAX_INFLATED_BYTES` |
+| `moving-young` | `CRATONVM_MOVING_YOUNG / CRATONVM_NO_MOVING_YOUNG` |
+| `overhead-limit` | `CRATONVM_GC_OVERHEAD_LIMIT` |
+| `par-min-bytes` | `CRATONVM_GC_PAR_MIN_BYTES` |
+| `par-threads` | `CRATONVM_GC_PAR_THREADS` |
+| `promotion-guard` | `CRATONVM_NO_GC_PROMOTION_GUARD` |
+| `promotion-oom-guard-broad` | `CRATONVM_PROMOTION_OOM_GUARD_BROAD` |
+| `selective-promote` | `CRATONVM_NO_SELECTIVE_PROMOTE` |
+| `stress` | `CRATONVM_GC_STRESS` |
+| `sweep-anchor-stride` | `CRATONVM_GC_SWEEP_ANCHOR_STRIDE` |
+| `tlab-gc-trigger` | `CRATONVM_TLAB_GC_TRIGGER` |
+| `weakref-clear` | `CRATONVM_WEAKREF_CLEAR` |
+| `youngscan-stride` | `CRATONVM_YOUNGSCAN_STRIDE` |
+
+## `CRATONVM_REAL`
+
+25 tokens.
+
+| Token | Expands to |
+| --- | --- |
+| `agroal` | `CRATONVM_REAL_AGROAL / CRATONVM_SYNTHETIC_AGROAL` |
+| `annotations` | `CRATONVM_REAL_ANNOTATIONS / CRATONVM_SYNTHETIC_ANNOTATIONS` |
+| `aqs` | `CRATONVM_REAL_AQS / CRATONVM_SYNTHETIC_AQS` |
+| `buffered-writer` | `CRATONVM_SYNTHETIC_BUFFERED_WRITER` |
+| `dsa` | `CRATONVM_SYNTHETIC_DSA` |
+| `ec` | `CRATONVM_SYNTHETIC_EC` |
+| `eqe` | `CRATONVM_SYNTHETIC_EQE` |
+| `filewriter` | `CRATONVM_SYNTHETIC_FILEWRITER` |
+| `forkjoinpool` | `CRATONVM_REAL_FORKJOINPOOL` |
+| `jca` | `CRATONVM_REAL_JCA` |
+| `msc-real-start` | `CRATONVM_MSC_REAL_START` |
+| `net-sockets` | `CRATONVM_REAL_NET_SOCKETS` |
+| `pqc` | `CRATONVM_SYNTHETIC_PQC` |
+| `proxy` | `CRATONVM_REAL_PROXY` |
+| `proxy-strict` | `CRATONVM_REAL_PROXY_STRICT` |
+| `proxy-super` | `CRATONVM_REAL_PROXY_SUPER` |
+| `quarkus-arc` | `CRATONVM_SYNTHETIC_QUARKUS_ARC` |
+| `quarkus-start` | `CRATONVM_REAL_QUARKUS_START` |
+| `raf` | `CRATONVM_SYNTHETIC_RAF` |
+| `rsa` | `CRATONVM_SYNTHETIC_RSA` |
+| `stax-factory` | `CRATONVM_REAL_STAX_FACTORY` |
+| `stubs` | `CRATONVM_NO_STUBS` |
+| `use-wildfly-reflect-shim` | `CRATONVM_USE_WILDFLY_REFLECT_SHIM` |
+| `use-wildfly-synth-bytecode` | `CRATONVM_USE_WILDFLY_SYNTH_BYTECODE` |
+| `vertx` | `CRATONVM_REAL_VERTX / CRATONVM_SYNTHETIC_VERTX` |
+
+## `CRATONVM_LOADER`
+
+10 tokens.
+
+| Token | Expands to |
+| --- | --- |
+| `allow-jsr-ret` | `CRATONVM_ALLOW_JSR_RET` |
+| `aware-resolution` | `CRATONVM_LOADER_AWARE_RESOLUTION` |
+| `boot-module-registry` | `CRATONVM_BOOT_MODULE_REGISTRY` |
+| `cl-bootstrap-scoped` | `CRATONVM_CL_BOOTSTRAP_SCOPED` |
+| `fwd-resolve-strict` | `CRATONVM_FWD_RESOLVE_STRICT` |
+| `jar-mmap` | `CRATONVM_DISABLE_JAR_MMAP` |
+| `lenient-clinit` | `CRATONVM_LENIENT_CLINIT` |
+| `longrewrite-loose` | `CRATONVM_LONGREWRITE_LOOSE` |
+| `resolve-cache-cap` | `CRATONVM_RESOLVE_CACHE_CAP` |
+| `unload` | `CRATONVM_LOADER_UNLOAD` |
+
+## `CRATONVM_IO`
+
+9 tokens.
+
+| Token | Expands to |
+| --- | --- |
+| `canon-openfile` | `CRATONVM_CANON_OPENFILE` |
+| `http-max-body` | `CRATONVM_HTTP_MAX_BODY` |
+| `netty-queue-bridge` | `CRATONVM_NETTY_QUEUE_BRIDGE` |
+| `resolve-outbound-host` | `CRATONVM_RESOLVE_OUTBOUND_HOST` |
+| `select-max-block-ms` | `CRATONVM_SELECT_MAX_BLOCK_MS` |
+| `selector-connect-probe` | `CRATONVM_NO_SELECTOR_CONNECT_PROBE` |
+| `socket-capture` | `CRATONVM_SOCKET_CAPTURE` |
+| `uri-strict-chars` | `CRATONVM_URI_STRICT_CHARS` |
+| `zip-max-entry-bytes` | `CRATONVM_ZIP_MAX_ENTRY_BYTES` |
+
+## `CRATONVM_THREADS`
+
+13 tokens.
+
+| Token | Expands to |
+| --- | --- |
+| `assert-single-os-thread` | `CRATONVM_ASSERT_SINGLE_OS_THREAD` |
+| `async-handoff-sleep-floor-ms` | `CRATONVM_ASYNC_HANDOFF_SLEEP_FLOOR_MS` |
+| `async-submit-grace-ms` | `CRATONVM_ASYNC_SUBMIT_GRACE_MS` |
+| `async-worker-sleep-floor-ms` | `CRATONVM_ASYNC_WORKER_SLEEP_FLOOR_MS` |
+| `await-shortcircuit` | `CRATONVM_AWAIT_NO_SHORTCIRCUIT` |
+| `default-watchdog` | `CRATONVM_DISABLE_DEFAULT_WATCHDOG` |
+| `default-watchdog-sec` | `CRATONVM_DEFAULT_WATCHDOG_SEC` |
+| `eqe-sync-execute` | `CRATONVM_EQE_SYNC_EXECUTE` |
+| `exec-depth-ceiling` | `CRATONVM_EXEC_DEPTH_CEILING` |
+| `inherit-thread-ccl` | `CRATONVM_INHERIT_THREAD_CCL` |
+| `inherit-tl-workaround` | `CRATONVM_INHERIT_TL_WORKAROUND` |
+| `lock-order-check` | `CRATONVM_LOCK_ORDER_CHECK` |
+| `thread-start-grace-ms` | `CRATONVM_THREAD_START_GRACE_MS` |
+
+## `CRATONVM_SECURITY`
+
+7 tokens.
+
+| Token | Expands to |
+| --- | --- |
+| `aot-hmac-key` | `CRATONVM_AOT_HMAC_KEY` |
+| `block-private-nets` | `CRATONVM_BLOCK_PRIVATE_NETS` |
+| `confine-io` | `CRATONVM_CONFINE_IO` |
+| `harden-manifest-classpath` | `CRATONVM_HARDEN_MANIFEST_CLASSPATH` |
+| `require-policy` | `CRATONVM_REQUIRE_POLICY` |
+| `trust-pem` | `CRATONVM_TRUST_PEM` |
+| `untrusted-code` | `CRATONVM_UNTRUSTED_CODE` |
+
+## `CRATONVM_COMPAT`
+
+8 tokens.
+
+| Token | Expands to |
+| --- | --- |
+| `eager-streams` | `CRATONVM_EAGER_STREAMS` |
+| `foreign-attach` | `CRATONVM_FOREIGN_ATTACH` |
+| `jboss-boot-log-file` | `CRATONVM_JBOSS_BOOT_LOG_FILE` |
+| `jboss-brute-force-jars` | `CRATONVM_JBOSS_BRUTE_FORCE_JARS` |
+| `jboss-logger-base-emit` | `CRATONVM_JBOSS_LOGGER_BASE_EMIT` |
+| `jboss-mp-root` | `CRATONVM_JBOSS_MP_ROOT` |
+| `lazy-streams` | `CRATONVM_LAZY_STREAMS` |
+| `strict-swallows` | `CRATONVM_STRICT_SWALLOWS` |
+
+## `CRATONVM_TEST`
+
+9 tokens.
+
+| Token | Expands to |
+| --- | --- |
+| `force-win-build` | `CRATONVM_FORCE_WIN_BUILD` |
+| `jdk` | `CRATONVM_TEST_JDK` |
+| `segv` | `CRATONVM_TEST_SEGV` |
+| `soak-iters` | `CRATONVM_SOAK_ITERS` |
+| `soak-k` | `CRATONVM_SOAK_K` |
+| `soak-method` | `CRATONVM_SOAK_METHOD` |
+| `soak-timeout-secs` | `CRATONVM_SOAK_TIMEOUT_SECS` |
+| `soak-xmx` | `CRATONVM_SOAK_XMX` |
+| `var` | `CRATONVM_TEST_VAR` |
+

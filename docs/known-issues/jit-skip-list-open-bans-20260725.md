@@ -422,3 +422,33 @@ UTC.** Re-verified with a standalone javax.xml.validation stress probe
 confirmed SymbolHash.hash/.search/.get -- the exact class the original
 bug named -- actively JIT-compiled throughout via CRATONVM_DBG_JITC=1,
 no crash. Merged dev@9ba6ab5de.
+
+
+## Session update 2026-07-26 (continuation, `fix/jit-ban-remaining-20260726`)
+
+Worked the remaining unclaimed candidates from the "Not investigated this
+session" list above. Full writeup: `docs/internal/jit-ban-remaining-sweep-20260726.md`.
+
+- **REMOVED (7, real-jar/real-checkout-verified, baseline/lifted/aggressive-threshold all clean):**
+  SPR-AOT-TESTNG-MAPS.1, REACTOR-ADDCAP.1, REACTOR-FLUXCREATE.1, JETTY-WSIO.1,
+  SPRINGBOOT-WITHOUT-JACKSON.2 (redundant/shadowed by the separate
+  `org/springframework/boot/` blanket ban under Conservative — safe no-op for
+  default behavior, see the doc for the nuance), ES-HAMCREST.1, SnakeYAML
+  emitter (ES-JIT-DEOPT-GC.1).
+- **KEPT, confirmed still live:** JAXB (`org/glassfish/jaxb/`) — real
+  corruption reproduced once a newly-found, unrelated `java.io.Writer`
+  bug (below) was worked around.
+- **KEPT, no fixture to test:** ES fragile cluster / whole `org/elasticsearch/`
+  prefix — no Elasticsearch checkout survives on this host; see
+  `docs/known-issues/es-fragile-cluster-no-fixture-20260726.md`.
+- **Already moot, no action:** BC-ASN1.1 and FELIX.1 both live inside
+  `is_known_miscompile`, gated behind `callee_saved_gpr_local_homes_enabled()`
+  (defaults `false`) — dead in any default run already. NETTY.1's only
+  matching entry was the historical `Arrays.fill` bug, already lifted
+  2026-06-11 (predates this session).
+- **NEW BUG FOUND:** `java.io.Writer.write(char[])` silently drops output
+  under JIT once hot — a general VM defect, not app-specific, unrelated to
+  the JAXB ban it was found under. Not yet root-caused/fixed. See
+  `docs/known-issues/java-io-writer-write-char-array-jit-miscompile-20260726.md`.
+
+Reproducers committed under `docs/known-issues/repros/jitban-remaining-20260726/`.

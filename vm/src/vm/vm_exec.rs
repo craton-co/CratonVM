@@ -7711,7 +7711,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
 
     fn current_thread_object(&mut self) -> ObjectRef {
         if let Some(obj) = self.thread.java_thread_obj {
-            if std::env::var_os("CRATONVM_DBG_WATCHREF").is_some() {
+            if crate::runtime::env_cache::dbg_watchref() {
                 debug_log_thread_mirror_identity(self.shared, self.thread.thread_id.0, obj);
             }
             return obj;

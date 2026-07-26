@@ -144,6 +144,94 @@ impl YoungMarkBits {
     }
 }
 
+/// Exact "is this address an object start in young from-space?" membership,
+/// as one bit per 8 bytes of `[base, base + span)`.
+///
+/// The moving (Cheney) collector needs this predicate to reject aligned
+/// interior words arriving from conservative roots before it forwards through
+/// them. It used to be an `FxHashSet<usize>` populated by the pre-collection
+/// from-space walk — one insert per object, live or dead. That made a moving
+/// collection cost O(objects allocated) rather than O(objects surviving):
+/// on bt18 at `-Xmx8g`, `HashMap::insert` plus `reserve_rehash` were 49% of
+/// the entire process and one moving cycle cost ~6.1 s, against a 1.4 s
+/// whole-program run on the default non-moving collector.
+///
+/// A bitmap is an exact substitute because every object start is 8-byte
+/// aligned: `gen_object_total_size` rounds each footprint up to 8, the walk
+/// begins at the (page-aligned) arena base, and the free-block / TLAB-tail
+/// skips it honours are allocation-granular. [`Self::insert`] reports an
+/// unaligned start rather than aliasing a neighbour's bit, and the caller
+/// treats that as a walk that did not complete.
+///
+/// Single-threaded by construction — the walk and the forwarding that reads it
+/// both run inside the collection's stop-the-world region — so unlike
+/// [`YoungMarkBits`] the accessors are plain loads and stores.
+pub(crate) struct ObjectStartBits {
+    words: Vec<u64>,
+    base: usize,
+    span: usize,
+    len: usize,
+}
+
+impl ObjectStartBits {
+    /// Cover `[base, base + span)`. `vec![0u64; n]` allocates zeroed, so a
+    /// multi-megabyte bitmap costs a zero-page mapping, not a memset.
+    pub(crate) fn new(base: usize, span: usize) -> Self {
+        let nwords = span.div_ceil(8).div_ceil(64);
+        Self {
+            words: vec![0u64; nwords],
+            base,
+            span,
+            len: 0,
+        }
+    }
+
+    #[inline]
+    fn locate(&self, addr: usize) -> Option<(usize, u64)> {
+        let off = addr.checked_sub(self.base)?;
+        if off >= self.span || off & 7 != 0 {
+            return None;
+        }
+        let bit = off >> 3;
+        Some((bit >> 6, 1u64 << (bit & 63)))
+    }
+
+    /// Record an object start. Returns `false` when `addr` is outside the
+    /// covered span or is not 8-byte aligned — either means the bitmap cannot
+    /// represent this walk exactly, and the caller must not run a moving cycle
+    /// against it.
+    #[inline]
+    pub(crate) fn insert(&mut self, addr: usize) -> bool {
+        match self.locate(addr) {
+            None => false,
+            Some((w, mask)) => {
+                let word = &mut self.words[w];
+                if *word & mask == 0 {
+                    *word |= mask;
+                    self.len += 1;
+                }
+                true
+            }
+        }
+    }
+
+    /// Membership. An address outside the span, or not 8-byte aligned, is not
+    /// an object start — the same answer the `FxHashSet` gave.
+    #[inline]
+    pub(crate) fn contains(&self, addr: usize) -> bool {
+        match self.locate(addr) {
+            None => false,
+            Some((w, mask)) => self.words[w] & mask != 0,
+        }
+    }
+
+    /// Number of recorded starts. Diagnostics only.
+    #[inline]
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
+}
+
 impl Drop for YoungMarkBits {
     fn drop(&mut self) {
         if self.nwords == 0 {
@@ -348,6 +436,56 @@ pub(crate) unsafe fn zero_spans_parallel(base: usize, spans: &[(usize, usize)], 
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn object_start_bits_match_a_hash_set_exactly() {
+        const BASE: usize = 0x1_0000;
+        const SPAN: usize = 4096;
+        let mut bits = ObjectStartBits::new(BASE, SPAN);
+        let mut set = std::collections::HashSet::new();
+        for k in [0usize, 1, 2, 7, 63, 64, 65, 511] {
+            let addr = BASE + k * 8;
+            assert!(bits.insert(addr), "{addr:#x} is in-span and aligned");
+            set.insert(addr);
+        }
+        // Every 8-byte slot in the span must agree with the reference set.
+        for k in 0..(SPAN / 8) {
+            let addr = BASE + k * 8;
+            assert_eq!(
+                bits.contains(addr),
+                set.contains(&addr),
+                "membership disagrees at {addr:#x}"
+            );
+        }
+        assert_eq!(bits.len(), set.len());
+    }
+
+    #[test]
+    fn object_start_bits_reject_out_of_span_and_unaligned() {
+        const BASE: usize = 0x1_0000;
+        let mut bits = ObjectStartBits::new(BASE, 4096);
+        // Below the base, at the end of the span, and past it.
+        assert!(!bits.insert(BASE - 8));
+        assert!(!bits.insert(BASE + 4096));
+        assert!(!bits.contains(BASE - 8));
+        assert!(!bits.contains(BASE + 4096));
+        // An 8-byte-misaligned start would alias its neighbour's bit, so it is
+        // refused rather than recorded: the caller diverts to the non-moving
+        // sweep. Recording it would make `contains(BASE + 8)` true.
+        assert!(!bits.insert(BASE + 12));
+        assert!(!bits.contains(BASE + 12));
+        assert!(!bits.contains(BASE + 8));
+        assert_eq!(bits.len(), 0);
+    }
+
+    #[test]
+    fn object_start_bits_handle_an_empty_span() {
+        let mut bits = ObjectStartBits::new(0x1_0000, 0);
+        assert!(!bits.insert(0x1_0000));
+        assert!(!bits.contains(0x1_0000));
+        assert_eq!(bits.len(), 0);
+    }
+
     use super::*;
     use std::sync::atomic::AtomicUsize;
 

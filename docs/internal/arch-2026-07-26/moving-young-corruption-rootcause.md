@@ -5,7 +5,24 @@ Basis: `arch/wave1-integration-20260726` merged at `928ad62a9`
 (first merge in this session was `c5d9d2de2`; re-merged on the orchestrator's
 instruction to pick up the `jit/src/x64.rs` flag-skew closure).
 Continues `docs/internal/arch-2026-07-26/moving-young-precise-roots.md`.
-Open blocker: `docs/known-issues/moving-young-gen-drops-jit-held-oops.md`.
+
+> **SUPERSEDED IN PART, 2026-07-26.** The known-issue is CLOSED — see
+> `docs/internal/fixed-suite-bugs/app-jvm-bugs/moving-young-gen-drops-jit-held-oops-FIXED.md`.
+> The measured producer was an **untagged operand-stack oop**: five codegen
+> sites pushed an object reference without setting `stack_oop_marks`, so it was
+> published nowhere while the safepoint still certified coverage (that check
+> only inspects MARKED entries). Section 3's "precise-only under-coverage"
+> verdict is right in shape — the coverage bit was not trustworthy — but wrong
+> in mechanism for bt18: `BinTreesClassic.bottomUpTree` scalar-replaces nothing
+> and hoists nothing (`FrameLayout { scalar_lo: 0, scalar_hi: 0,
+> ref_hoist_lo: 0, ref_hoist_hi: 0 }`). The cross-owner request in §7.1 was
+> nonetheless actioned for the scalar-replacement `getfield` path.
+>
+> The frame-band verifier this session added was load-bearing for the
+> diagnosis — it is what proved the coverage bit was lying — but as written it
+> reported a phantom miss on **every** collection (register images and
+> reclaimed operand-spill slots), so moving-young ran zero cycles. It is now
+> precise; see the FIXED doc.
 
 ---
 

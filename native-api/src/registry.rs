@@ -56,7 +56,7 @@ fn real_forkjoinpool_enabled() -> bool {
     *FLAG.get_or_init(|| std::env::var_os("CRATONVM_REAL_FORKJOINPOOL").is_some())
 }
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::ClassId;
@@ -228,21 +228,52 @@ pub struct LambdaSerialMetadata {
 /// still carries a `debug_assert!` collision check as a backstop).
 #[inline]
 pub(crate) fn native_method_hash(class: &str, method: &str, descriptor: &str) -> (u64, u64) {
-    // FNV prime for the first pass.
-    const FNV_PRIME: u64 = 0x100000001b3;
-    // A distinct odd multiplier for the second pass — different bit
-    // pattern *and* different magnitude, so the second hash is not a
-    // re-seeded copy of the first.
-    const ALT_PRIME: u64 = 0x880355f21e6d1965;
+    native_method_hash_from(native_class_hash(class), method, descriptor)
+}
+
+/// FNV prime for the first pass of the native-method digest.
+const FNV_PRIME: u64 = 0x100000001b3;
+/// A distinct odd multiplier for the second pass — different bit pattern
+/// *and* different magnitude, so the second hash is not a re-seeded copy of
+/// the first.
+const ALT_PRIME: u64 = 0x880355f21e6d1965;
+
+/// The **unfinalized** accumulator pair after hashing only the class-name
+/// component of a native-method triple.
+///
+/// This is the prefix state [`native_method_hash`] would hold halfway through,
+/// exposed so a lookup can (a) test whether the class registers ANY native at
+/// all before paying for the rest of the digest, and (b) finish the digest
+/// from here without re-walking the class name. Deliberately NOT passed
+/// through [`fmix64`]: it is a resumable state, not a key.
+///
+/// PERF (H2 `TestFileSystem.testConcurrent`, 2026-07-26). `slot_for_exact` is
+/// on the interpreter's every-invoke path via `invoke_or_native`, and it was
+/// the single largest entry in a live 30s/999Hz profile of that test —
+/// **8.75%** of CPU across its two real threads, plus a large share of the
+/// `__memcmp_evex_movbe` time spent name-verifying the digest hit. The digest
+/// is a byte-at-a-time walk of all three strings (~60-100 bytes, two
+/// accumulators), and the overwhelming majority of the calls come from
+/// application classes — `org/h2/mvstore/...`, `org/h2/store/...` — that
+/// register no natives whatsoever, so all of that work produced a miss. The
+/// class name alone is ~25 of those bytes and answers "miss" for every one of
+/// them.
+#[inline]
+fn native_class_hash(class: &str) -> (u64, u64) {
     let mut h1 = 0xcbf29ce484222325;
     let mut h2 = 0x9e3779b97f4a7c15;
-
     hash_component_pair(&mut h1, &mut h2, class, FNV_PRIME, ALT_PRIME);
+    (h1, h2)
+}
+
+/// Finish a native-method digest from a [`native_class_hash`] prefix state.
+#[inline]
+fn native_method_hash_from(class_state: (u64, u64), method: &str, descriptor: &str) -> (u64, u64) {
+    let (mut h1, mut h2) = class_state;
     hash_byte_pair(&mut h1, &mut h2, b'.', FNV_PRIME, ALT_PRIME);
     hash_component_pair(&mut h1, &mut h2, method, FNV_PRIME, ALT_PRIME);
     hash_byte_pair(&mut h1, &mut h2, b'.', FNV_PRIME, ALT_PRIME);
     hash_component_pair(&mut h1, &mut h2, descriptor, FNV_PRIME, ALT_PRIME);
-
     (fmix64(h1), fmix64(h2))
 }
 
@@ -3833,6 +3864,19 @@ pub struct NativeMethodRegistry {
     /// is a *candidate*, not an answer: `slot_index_for_key` re-checks the full
     /// triple before returning the slot.
     slot_by_key: FxHashMap<(u64, u64), u32>,
+    /// [`native_class_hash`] of every class name that has ever been passed to
+    /// [`register`](Self::register) — the negative-lookup prefilter for
+    /// [`slot_for_exact`](Self::slot_for_exact). See `native_class_hash` for
+    /// why this exists and what it is worth.
+    ///
+    /// Soundness is one-directional and cheap to keep: a class absent from
+    /// this set provably has no registration (the single production writer is
+    /// `register`, which inserts here in the same statement sequence that
+    /// pushes to `registrations`), so answering `None` for it is exact. A hash
+    /// collision can only add a FALSE POSITIVE, which falls through to the
+    /// full digest + name verification below and is therefore harmless.
+    /// Registrations are never removed, so the set never needs to shrink.
+    classes_with_natives: FxHashSet<(u64, u64)>,
     /// Process-unique base for [`generation`](Self::generation).
     ///
     /// Without this, `generation()` would just be `slots.len()`, and two
@@ -3959,6 +4003,10 @@ impl NativeMethodRegistry {
         Self {
             slots: Vec::with_capacity(BOOT_REGISTRATION_HINT),
             slot_by_key: FxHashMap::with_capacity_and_hasher(
+                BOOT_REGISTRATION_HINT,
+                Default::default(),
+            ),
+            classes_with_natives: FxHashSet::with_capacity_and_hasher(
                 BOOT_REGISTRATION_HINT,
                 Default::default(),
             ),
@@ -4552,6 +4600,11 @@ impl NativeMethodRegistry {
         let reg_index = self.registrations.len();
         self.registrations
             .push((class_name.into(), method_name.into(), descriptor.into()));
+        // Arm the negative-lookup prefilter. Kept adjacent to the
+        // `registrations` push — the one statement pair that must never drift
+        // apart, because a class in `registrations` but absent here would make
+        // `slot_for_exact` answer `None` for a native that IS registered.
+        self.classes_with_natives.insert(native_class_hash(class_name));
         // Tag this registration with the current category (see `with_category`).
         // Re-registration under a new category — e.g. promoting a fixed stub to
         // `Intrinsic` — takes effect, matching the previous `insert`-not-
@@ -4839,7 +4892,14 @@ impl NativeMethodRegistry {
         method_name: &str,
         descriptor: &str,
     ) -> Option<&NativeSlot> {
-        let key = native_method_hash(class_name, method_name, descriptor);
+        // Prefilter on the class name alone before finishing the digest: see
+        // `native_class_hash`. Exact for a miss, may false-positive into the
+        // full path.
+        let class_state = native_class_hash(class_name);
+        if !self.classes_with_natives.contains(&class_state) {
+            return None;
+        }
+        let key = native_method_hash_from(class_state, method_name, descriptor);
         let idx = self.slot_index_for_key(key, class_name, method_name, descriptor)?;
         self.slots.get(idx as usize)
     }
@@ -5165,6 +5225,11 @@ impl NativeMethodRegistry {
             "test setup: owner and victim must be distinct triples"
         );
         self.slot_by_key.insert(victim_key, idx);
+        // The victim triple is deliberately NOT registered, so its class is
+        // not in the prefilter — without this the injected collision would be
+        // filtered out before `slot_index_for_key` ever ran, and the test
+        // would pass for the wrong reason.
+        self.classes_with_natives.insert(native_class_hash(victim.0));
     }
 }
 
@@ -5388,6 +5453,82 @@ mod tests {
         registry.register("A", "b", "()V", dummy_native);
         let dbg = format!("{:?}", registry);
         assert!(dbg.contains("count: 1"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Negative-lookup class prefilter
+    // -----------------------------------------------------------------------
+
+    /// The one invariant the prefilter can get wrong in a way that MATTERS:
+    /// a class that has a surviving registration but is missing from the set
+    /// makes `slot_for_exact` answer `None` for a native that exists. Assert
+    /// it over the whole registration log rather than for one sample triple,
+    /// so a future `register` early-return added above the insert is caught.
+    #[test]
+    fn every_registered_class_is_in_the_prefilter() {
+        let mut registry = NativeMethodRegistry::new();
+        registry.register("java/lang/Object", "hashCode", "()I", dummy_native);
+        registry.register("java/lang/String", "length", "()I", dummy_native_2);
+        registry.with_category(NativeKind::Bridge, |r| {
+            r.register("sun/misc/Unsafe", "getInt", "(Ljava/lang/Object;J)I", dummy_native);
+        });
+        registry.alias_class("java/lang/String", "java/lang/CharSequence");
+
+        for (class, method, descriptor) in &registry.registrations {
+            assert!(
+                registry
+                    .classes_with_natives
+                    .contains(&native_class_hash(class)),
+                "{class} is in the registration log but not the prefilter, so \
+                 {class}.{method}{descriptor} would resolve to None"
+            );
+            assert!(
+                registry.find(class, method, descriptor).is_some(),
+                "{class}.{method}{descriptor} must still resolve through the prefilter"
+            );
+        }
+    }
+
+    /// A class with no registration at all must miss — that is the whole point
+    /// — and must miss for every method name, not just the ones tried above.
+    #[test]
+    fn unregistered_class_misses_without_finishing_the_digest() {
+        let mut registry = NativeMethodRegistry::new();
+        registry.register("java/lang/Object", "hashCode", "()I", dummy_native);
+        assert!(registry.find("org/h2/mvstore/MVMap", "get", "()V").is_none());
+        assert!(registry.kind_of("org/h2/mvstore/MVMap", "put", "()V").is_none());
+        assert!(registry
+            .find_with_kind("org/h2/mvstore/MVMap", "hashCode", "()I")
+            .is_none());
+        // …while a registered triple on a registered class still resolves.
+        assert!(registry.find("java/lang/Object", "hashCode", "()I").is_some());
+        // …and an unregistered METHOD on a registered class still misses,
+        // which is the prefilter's false-positive path falling through to the
+        // full digest + name verification.
+        assert!(registry.find("java/lang/Object", "toString", "()V").is_none());
+    }
+
+    /// The split hash must be bit-identical to the one-shot form it replaced:
+    /// `slot_by_key` entries written by `register` (one-shot) are probed by
+    /// `slot_for_exact` (split).
+    #[test]
+    fn split_hash_matches_the_one_shot_digest() {
+        for (c, m, d) in [
+            ("java/lang/Object", "hashCode", "()I"),
+            ("", "", ""),
+            ("a", "b", "c"),
+            (
+                "jdk/internal/misc/Unsafe",
+                "compareAndSetLong",
+                "(Ljava/lang/Object;JJJ)Z",
+            ),
+        ] {
+            assert_eq!(
+                native_method_hash(c, m, d),
+                native_method_hash_from(native_class_hash(c), m, d),
+                "split digest diverged for {c}.{m}{d}"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------

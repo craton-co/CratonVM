@@ -3534,10 +3534,45 @@ fn native_spring_extension_resolve_parameter(
         other => return Ok(other),
     };
 
-    if let Ok(Some(Value::Object(Some(handler)))) = ctx.invoke_special(
+    // Anchor this on the TEST CLASS's own loader, exactly like the
+    // SpringExtension statics above -- a plain `ctx.invoke_special` by name is
+    // loader-blind and prefers the Application-loader copy.
+    //
+    // That matters here more than anywhere else in this native, because
+    // `resolveHandlerForParameter` does its own annotation scan:
+    // `MergedAnnotations.from(parameter).stream(BeanOverride.class)`. The
+    // `BeanOverride.class` literal is resolved against the copy of
+    // `BeanOverrideUtils` that is executing, so the Application-loader copy
+    // asks "is this parameter annotated with the APPLICATION loader's
+    // @BeanOverride?" about a parameter belonging to a class the AOT
+    // `CompileWithForkedClassLoader`/`TestCompiler` fork loaded -- whose
+    // @MockitoBean is meta-annotated with the FORK's @BeanOverride. The
+    // answer is no, for every parameter, so the whole by-name shortcut
+    // silently never fired during AOT replay and every @BeanOverride
+    // constructor parameter fell through to `ParameterResolutionDelegate
+    // .resolveDependency`. Parameters whose override name happens to equal
+    // the parameter name (`@MockitoBean ExampleService s0A`) or that carry an
+    // explicit `@Qualifier` still resolved by accident; the rest threw
+    // `NoUniqueBeanDefinitionException` ("expected single matching bean but
+    // found 4: s0A,s0B,s0C,nonExistingBean"), since every sibling override
+    // bean shares the declared type. That is "Family A" of
+    // `AotIntegrationTests#endToEndTestsForBeanOverrides` -- 13 failures
+    // across `MockitoBeanByNameLookupForConstructorParametersIntegrationTests`,
+    // `MockitoSpyBeanByNameLookupForConstructorParametersIntegrationTests` and
+    // `MockitoBeansByNameIntegrationTests`, all of which pass in non-AOT mode
+    // because there is no fork loader there for the two copies to disagree
+    // across.
+    //
+    // Confirmed on HotSpot with no CratonVM involvement: calling the
+    // Application-loader copy of `resolveHandlerForParameter` on a
+    // fork-loaded parameter returns null for EVERY parameter, while the fork's
+    // own copy returns the handlers (`service0B` -> beanName `s0B`).
+    if let Ok(Some(Value::Object(Some(handler)))) = spring_extension_invoke_special_anchored_on_test_class(
+        ctx,
         "org/springframework/test/context/bean/override/BeanOverrideUtils",
         "resolveHandlerForParameter",
         "(Ljava/lang/reflect/Parameter;Ljava/lang/Class;)Lorg/springframework/test/context/bean/override/BeanOverrideHandler;",
+        test_class,
         &[
             Value::Object(Some(parameter)),
             Value::Object(Some(test_class)),
@@ -11638,6 +11673,17 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
                 } else {
                     None
                 };
+
+            // Unnamed module (everything on the application classpath): route
+            // through the shared builder so this mirror is identical to the one
+            // `ClassLoader.getUnnamedModule()` and the `java.lang.Package`
+            // builders hand out, AND carries a non-null `loader` field so real
+            // `Module.getClassLoader()` bytecode answers the AppClassLoader like
+            // HotSpot instead of null. See `lang_class::canonical_unnamed_module`.
+            if module_name.is_none() {
+                let m = crate::lang_class::canonical_unnamed_module(ctx);
+                return Ok(Some(Value::Object(Some(m))));
+            }
 
             // Canonical-cache hit: hand back the existing Module mirror so
             // identity comparisons across classes in the same module succeed.

@@ -6,9 +6,11 @@ was read-only. Base: `dev` @ `6495a191c`.
 Context that shaped the work: the default collector does **not** compact
 (`moving_young` defaults off and `gen_heap` fail-closes to a non-moving
 mark-sweep whenever a live JIT frame exists — the steady state at a
-500-invocation JIT threshold, and `docs/known-issues/moving-young-gen-drops-jit-held-oops.md`
-is still OPEN). So the *free-list* allocator is the production allocator, not a
-degraded fallback, and the fast path has to be good in a fragmenting world.
+500-invocation JIT threshold). Compaction's correctness blocker was closed on
+2026-07-26 (`docs/internal/fixed-suite-bugs/app-jvm-bugs/moving-young-gen-drops-jit-held-oops-FIXED.md`),
+but moving-young stays opt-in on throughput grounds — so the *free-list*
+allocator is still the production allocator, not a degraded fallback, and the
+fast path has to be good in a fragmenting world.
 
 ---
 

@@ -40,6 +40,19 @@ jobs:
         shell: bash
         run: bash scripts/check-no-diag-prints.sh
 
+      # The CRATONVM_* surface reached 692 identifiers by growing roughly one
+      # per fixed bug with no retirement path. It is now ten grouped variables
+      # plus five scalars, and every knob is a token in
+      # `types/src/flag_groups.rs::INVENTORY`. This fails if a new
+      # `std::env::var("CRATONVM_...")` call site appears without one, or if the
+      # reference docs name a token that does not exist — the failure mode that
+      # left CRATONVM_PRECISE_JIT_MAPS documented-but-dead for months.
+      # Bash-only script, so gate to the Linux leg.
+      - name: Flag-surface guard
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: bash tools/flag-census/check-surface.sh
+
       - name: Clippy
         # `[workspace.lints]` in Cargo.toml already silences the noise lints
         # (dead_code, unused_*, rustdoc broken_intra_doc_links, clippy
