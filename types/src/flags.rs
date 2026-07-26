@@ -1500,7 +1500,11 @@ impl NativeFlags {
             bd_debug: present(src, "CRATONVM_BD_DEBUG"),
             canon_openfile: present(src, "CRATONVM_CANON_OPENFILE"),
             cl_bootstrap_scoped: on_unless_zero(src, "CRATONVM_CL_BOOTSTRAP_SCOPED"),
-            dbg: present(src, "CRATONVM_DBG"),
+            // Was the bare `CRATONVM_DBG`. That name is now the debug *group*
+            // variable (`CRATONVM_DBG=topic,topic`), so this one call site —
+            // `quarkus_staticinit.rs` — gets an ordinary topic of its own:
+            // `CRATONVM_DBG=quarkus-staticinit`.
+            dbg: present(src, "CRATONVM_DBG_QUARKUS_STATICINIT"),
             dbg_annproxy_wrap: present(src, "CRATONVM_DBG_ANNPROXY_WRAP"),
             dbg_aqs_trace: present(src, "CRATONVM_DBG_AQS_TRACE"),
             dbg_arraycopy: exactly_one(src, "CRATONVM_DBG_ARRAYCOPY"),
@@ -1683,8 +1687,14 @@ impl VmFlags {
     ///
     /// Snapshots `environ` once via [`MapSource::from_process_env`] instead of
     /// calling `getenv` per field; the values are identical.
+    ///
+    /// The snapshot is passed through [`crate::flag_groups::resolve`] first, so
+    /// the ten grouped variables (`CRATONVM_JIT=-bce,unroll` and friends) reach
+    /// every field below. Legacy per-flag names are what the grouped tokens
+    /// expand *to*, so setting one directly still works unchanged.
     pub fn from_env() -> Self {
-        Self::from_source(&MapSource::from_process_env())
+        let raw = MapSource::from_process_env();
+        Self::from_source(&crate::flag_groups::resolve(&raw))
     }
 }
 

@@ -2972,6 +2972,118 @@ longer holds -- this session found zero Groovy involvement, ruled out JIT
 miscompilation, and identified a specific (if not yet fully pinpointed)
 real-JDK-class construction site as the actual hang.
 
+## 2026-07-26 TestNG-engine discovery NPE (Blocker 1) -- FIXED, and the whole `test.context.testng.*` package now matches HotSpot
+
+Two separate defects were keeping this package down. Both are fixed; all 11
+classes under `org.springframework.test.context.testng` now run and their
+results match HotSpot exactly (verified real JDK 25, jit-real, `KRun`, Azure
+host `20.83.144.174`, worktree `/data/data/wt-testngnpe-20260726`).
+
+### Blast radius, before the fix
+
+A fresh full-suite run (dev `346c74b71`, 8-way sharded) found that **all 8**
+classes under `org.springframework.test.context.testng` that go through the
+plain `LauncherFactory.create()` auto-discovery path hit the identical
+`LOADERR`:
+
+```
+LOADERR org.springframework.test.context.testng.AnnotationConfigTestNGSpringContextTests :: org.junit.platform.commons.JUnitException: TestEngine with ID 'testng' failed to discover tests
+```
+
+-- i.e. this was never specific to `AotIntegrationTests`' single classpath
+scan; it made every one of those classes unrunnable as `found=0` rather than
+whatever their real pass/fail split would be. Two adjacent classes with
+`testng` in the name did NOT hit it (`TestNGConcurrencyTests` and
+`FailingBeforeAndAfterMethodsTestNGTests`), which was the clue that the trigger
+is a specific `Package` object shape rather than anything about TestNG itself.
+
+### Defect 1 (the LOADERR): `java.lang.Package` with a null `module`
+
+Fixed in `34201b21e`. Real `Package.getPackageInfo()` (JDK 25,
+`Package.java:417`) calls `module().getClassLoader()` with **no null check**,
+so any `Package` CratonVM synthesises without a `module` NPEs the instant
+something asks it for an annotation.
+
+TestNG's `IgnoreListener.ignoreTestAtClass` calls `clazz.getPackage()` and then
+walks the package chain upward via the deprecated static
+`Package.getPackage(String)` -> `ClassLoader.getPackage` -> `getDefinedPackage`.
+`Class.getPackage()`'s override did set `module`; the `ClassLoader`-side
+builders (`i2_alloc_synthetic_package`, feeding `getDefinedPackage` /
+`definePackage(Class)` / `getNamedPackage`) never did. The first parent package
+TestNG asked about therefore came back module-less and `getAnnotation` NPE'd
+inside the engine's discovery, which JUnit surfaces as
+`TestEngine with ID 'testng' failed to discover tests`.
+
+The fix makes every synthesised `Package` carry a non-null `module` (and a
+non-null `versionInfo`, which `getSpecificationTitle`/`isSealed`/
+`getImplementationVersion` also deref unguarded), routes `Class.getModule()`,
+`ClassLoader.getUnnamedModule()` and the Package builders through one canonical
+unnamed-module mirror so JDK identity comparisons on `Module` hold, and wires
+that mirror's `loader` field so `Module.getClassLoader()` answers the
+AppClassLoader like HotSpot instead of null. It also collapses a duplicate
+`Package.equals` registration whose class check was dead code (the registry is
+last-registration-wins).
+
+### Defect 2 (revealed once discovery worked): the String `coder`/`hash` JIT miscompile
+
+With discovery fixed, 10 of the 11 classes passed immediately.
+`ConcreteTransactionalTestNGSpringContextTests` still failed -- but only on the
+**second and later runs in the same JVM**, with
+`CannotGetJdbcConnectionException` <- `SQLInvalidAuthorizationSpecException:
+invalid authorization specification - not found: sa`, i.e. HSQLDB rejecting its
+own built-in `SA` user.
+
+`--nojit` passed. `CRATONVM_JIT_DENY` bisected it to `java/lang/String`, then to
+`equalsIgnoreCase`, then to the `StringLength` intrinsic inside it. HSQLDB's
+`Database.connect` does:
+
+```java
+if (username.equalsIgnoreCase("SA")) { username = "SA"; }
+User user = userManager.getUser(username, password);   // userList is keyed on "SA"
+```
+
+`equalsIgnoreCase` compares `anotherString.length() == length()` before doing
+any character work. The JIT's `length()` intrinsic was reading `String.coder`
+from `String.hash`'s slot on compact objects, so it evaluated
+`value.length >> (hash & 31)` -- correct only while `hash` was still 0. Run 1
+populated the interned literal `"SA"`'s hash cache; from run 2 on, `"SA"`
+reported length 0 while the un-hashed `username` reported 2, the lengths
+disagreed, the normalisation was skipped, and the lookup went in as lowercase
+`"sa"`.
+
+This is the same defect a concurrent session root-caused from H2
+(BUG-STRING-CODER-COMPACT-20260726, `docs/known-issues/h2/h2-jitban-schema-not-found-on-reconnect.md`)
+and the same defect behind the 30-class Kotlin
+`IllegalStateException: root` cluster
+([`spring-kotlin-reflect-illegalstateexception-root-20260726.md`](spring-kotlin-reflect-illegalstateexception-root-20260726.md)).
+Fixed on `dev` in `jit/src/lib.rs` / `jit/src/x64.rs`; this branch dropped its
+own duplicate implementation in favour of it.
+
+### Result
+
+| class | CratonVM | HotSpot |
+|---|---|---|
+| `AnnotationConfigTestNGSpringContextTests` | OK 1/1 | OK 1/1 |
+| `AnnotationConfigTransactionalTestNGSpringContextTests` | OK 2/2 | OK 2/2 |
+| `ConcreteTransactionalTestNGSpringContextTests` | OK 8/8 | OK 8/8 |
+| `DirtiesContextTransactionalTestNGSpringContextTests` | OK 3/3 | OK 3/3 |
+| `TimedTransactionalTestNGSpringContextTests` | OK 1/1 | OK 1/1 |
+| `web.TestNGSpringContextWebTests` | OK 2/2 | OK 2/2 |
+| `web.ServletTestExecutionListenerTestNGIntegrationTests` | OK 2/2 | OK 2/2 |
+| `event.TestNGApplicationEventsIntegrationTests` | OK 2/2 | OK 2/2 |
+| `event.TestNGApplicationEventsAsyncIntegrationTests` | OK 2/2 | OK 2/2 |
+| `TestNGConcurrencyTests` | OK 1/1 | OK 1/1 |
+| `FailingBeforeAndAfterMethodsTestNGTests` | OK 9/9 | OK 9/9 |
+
+The `testng`-jar-stripping workaround recorded under Blocker 1 is obsolete and
+should not be used; it silently removes the engine those classes exist to test.
+
+**Blocker 2** (`Class.getDeclaredMethods()` `NoSuchMethodError` inside a
+dynamically-`defineClass`'d CGLIB class's `<clinit>`) was untouched by this
+session -- it is closed by "AOT follow-up 10" immediately below, which found it
+was never a resolution failure at all: the generated class file itself was
+corrupt, because `String.hashCode()` was JIT-miscompiled.
+
 ## 2026-07-26 AOT follow-up 10 -- Blocker 2 FIXED, the CGLIB cross-test residual FIXED (40/40), a third blocker behind them FIXED; `endToEndTestsForBeanOverrides` runs all 175 tests again (13 failures, one family, fully characterised)
 
 Worktree `/data/data/wt-testngresid-20260726` (branch `fix/aot-cluster-20260726`,
@@ -3058,6 +3170,18 @@ worked exactly as designed.
 
 Verified: `CglibProbe` passes, and the classes it generates are now
 **byte-identical between JIT and `--nojit`** (and the same sizes HotSpot emits).
+
+**Merge note.** A concurrent session reached the same root cause from the other
+end -- lifting the `org/h2` JIT ban -- and landed a strictly more thorough fix
+first (`13055f75c`, `234a45b98`): it gives `StringFieldLayout` a SEPARATE
+compact and legacy offset per field instead of one offset plus a derived `+8`,
+which also repairs the legacy 16-byte-cell path (where the fixed `+8` was only
+correct for field indices 0 and 1, so `hash` resolved 12 bytes low). Their
+version is what is on `dev`; this session's narrower bias fix was dropped at
+merge time in favour of it. The diagnosis, the probes and the conclusion below
+are unchanged -- two independent investigations converging on the same
+`String.hashCode()`-returns-garbage defect from opposite directions is the
+strongest confirmation either of them could have had.
 
 ### Fix 2: the CGLIB cross-test residual -- a generated-name collision, not a cache-key problem
 

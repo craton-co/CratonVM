@@ -726,6 +726,17 @@ pub struct OopMapEntry {
     /// True only when the moving-young shadow-stack publication for this
     /// safepoint proved complete enough for relocation under live JIT frames.
     pub moving_young_coverage_complete: bool,
+    /// Exclusive `[rbp - off]` bound of the LIVE part of the frame at this
+    /// safepoint: the operand-spill cursor (`next_spill_offset`) at the moment
+    /// the safepoint was emitted. Slots at a larger offset are inside the
+    /// `max_stack`-sized spill reserve but above the live operand stack and
+    /// the staged invoke-argument buffer, so their contents are dead — the
+    /// spill cursor reclaims by moving, it does not clear.
+    ///
+    /// The moving-young frame verifier uses this to stop reporting stale
+    /// object pointers in reclaimed spill slots as un-rewritable roots.
+    /// `0` means "unknown" and makes the verifier scan the whole region.
+    pub live_frame_hi: i32,
 }
 
 impl OopMapEntry {
@@ -738,6 +749,7 @@ impl OopMapEntry {
             bytecode_pc: 0,
             frame_slot_offsets: Vec::new(),
             moving_young_coverage_complete: false,
+            live_frame_hi: 0,
         }
     }
 
@@ -1086,6 +1098,105 @@ pub fn lookup_jit_method_name(addr: usize) -> Option<String> {
         .map(|(_, _, name)| name.clone())
 }
 
+/// Where each storage class lives in a compiled frame, as positive
+/// `[rbp - off]` byte offsets. Every range is `lo..hi` (exclusive `hi`), and an
+/// empty range is `0..0`.
+///
+/// The GC needs this partition because the classes are NOT interchangeable
+/// under a relocating young generation:
+///
+///   * `java_locals`, `operand_spill`, `ref_hoist` and `scalar_fields` are
+///     genuine, independent oop storage — a reference there is the only copy,
+///     so the collector must be able to REWRITE it or must not move at all.
+///   * `arith_hoist` and `arith_scratch` hold `int`/`long` results of hoisted
+///     integer arithmetic. Never references.
+///   * `callee_saved`, `xmm_saved` and `reg_spill` are IMAGES of registers.
+///     `callee_saved`/`xmm_saved` hold the CALLER's values for the epilogue to
+///     restore; `reg_spill` is the write-only SB-CRASH-04 blind spill that
+///     exists to make register-resident values visible to a CONSERVATIVE scan.
+///     Nothing resumes from any of them in a way the owning frame's own
+///     published roots do not already cover.
+///
+/// See `docs/known-issues/moving-young-gen-drops-jit-held-oops.md`.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct FrameLayout {
+    /// Java locals: slot `i` at `[rbp - (i + 1) * 8]`.
+    pub java_locals_hi: i32,
+    /// LICM `aaload` hoist slots. Always reference-typed (`aaload` loads an
+    /// element of a reference array).
+    pub ref_hoist_lo: i32,
+    pub ref_hoist_hi: i32,
+    /// LICM integer-arithmetic hoist slots and their shared evaluation
+    /// scratch. Always primitive.
+    pub arith_lo: i32,
+    pub arith_hi: i32,
+    /// Scalar-replacement field slots (all fields of every eliminated object).
+    pub scalar_lo: i32,
+    pub scalar_hi: i32,
+    /// End of the whole reserved-locals region (locals + heap slot + hoists +
+    /// scalar fields + the reserved tail slots: sp-id, stack floor, cached
+    /// JIT thread, shadow bookkeeping).
+    pub locals_hi: i32,
+    /// Canonical operand-stack spill slots.
+    pub spill_lo: i32,
+    pub spill_hi: i32,
+    /// Prologue save area for the caller's callee-saved GPRs.
+    pub callee_saved_lo: i32,
+    pub callee_saved_hi: i32,
+    /// Prologue save area for the caller's callee-saved XMMs.
+    pub xmm_saved_lo: i32,
+    pub xmm_saved_hi: i32,
+    /// Per-safepoint blind GPR spill (`emit_pre_safepoint_spill`).
+    pub reg_spill_lo: i32,
+    pub reg_spill_hi: i32,
+    /// Total frame size (`SUB RSP, frame_size`); the band is `[rbp - size, rbp)`.
+    pub frame_size: i32,
+}
+
+impl FrameLayout {
+    /// Whether `off` names a slot that is only ever an IMAGE of a register.
+    #[inline]
+    pub fn is_register_image(&self, off: i32) -> bool {
+        (self.callee_saved_hi > self.callee_saved_lo
+            && off >= self.callee_saved_lo
+            && off < self.callee_saved_hi)
+            || (self.xmm_saved_hi > self.xmm_saved_lo
+                && off >= self.xmm_saved_lo
+                && off < self.xmm_saved_hi)
+            || (self.reg_spill_hi > self.reg_spill_lo
+                && off >= self.reg_spill_lo
+                && off < self.reg_spill_hi)
+    }
+
+    /// Name the region `off` falls in. Diagnostics only.
+    pub fn region_name(&self, off: i32) -> &'static str {
+        let hit = |lo: i32, hi: i32| hi > lo && off >= lo && off < hi;
+        if hit(self.ref_hoist_lo, self.ref_hoist_hi) {
+            "licm-ref-hoist"
+        } else if hit(self.arith_lo, self.arith_hi) {
+            "licm-arith"
+        } else if hit(self.scalar_lo, self.scalar_hi) {
+            "scalar-replaced-field"
+        } else if self.java_locals_hi > 0 && off < self.java_locals_hi {
+            "java-local"
+        } else if self.locals_hi > 0 && off < self.locals_hi {
+            "reserved-locals-tail"
+        } else if hit(self.spill_lo, self.spill_hi) {
+            "operand-spill"
+        } else if hit(self.callee_saved_lo, self.callee_saved_hi) {
+            "callee-saved-gpr-image"
+        } else if hit(self.xmm_saved_lo, self.xmm_saved_hi) {
+            "callee-saved-xmm-image"
+        } else if hit(self.reg_spill_lo, self.reg_spill_hi) {
+            "safepoint-gpr-spill-image"
+        } else if self.reg_spill_hi > 0 && off >= self.reg_spill_hi {
+            "outgoing-args-or-deopt-regs"
+        } else {
+            "unclassified"
+        }
+    }
+}
+
 /// A compiled native-code method.
 pub struct CompiledMethod {
     /// The executable buffer holding the machine code.
@@ -1162,6 +1273,15 @@ pub struct CompiledMethod {
     /// OSR metadata: XMM callee-saved save-area offset (mirrors the prologue's
     /// `xmm_saved_base`). Paired with `osr_callee_saved_xmms`.
     pub osr_xmm_saved_base: i32,
+    /// Where each storage class lives in this method's frame. See
+    /// [`FrameLayout`]; consumed by the moving-young frame verifier.
+    pub frame_layout: FrameLayout,
+    /// `Class.method` label, for diagnostics that have only a frame to go on.
+    pub method_label: String,
+    /// Frame offset of the shadow-stack per-push saved-base slot (the third
+    /// reserved tail slot). Exposed alongside `shadow_savetop_slot_off` so a
+    /// frame walker can recognise all three shadow bookkeeping slots.
+    pub shadow_savebase_slot_off: i32,
     /// OSR metadata: offset of VM context pointer in frame.
     pub osr_heap_local_offset: i32,
     /// OSR metadata: frame offset of the inline-TLAB cached `JvmThread*` slot.
@@ -1441,6 +1561,9 @@ impl CompiledMethod {
             osr_callee_saved_regs: None,
             osr_callee_saved_xmms: None,
             osr_xmm_saved_base: 0,
+            frame_layout: FrameLayout::default(),
+            method_label: String::new(),
+            shadow_savebase_slot_off: 0,
             osr_heap_local_offset: 0,
             jit_thread_slot_off: 0,
             stack_floor_slot_off: 0,
@@ -1503,6 +1626,9 @@ impl CompiledMethod {
             osr_callee_saved_regs: None,
             osr_callee_saved_xmms: None,
             osr_xmm_saved_base: 0,
+            frame_layout: FrameLayout::default(),
+            method_label: String::new(),
+            shadow_savebase_slot_off: 0,
             osr_heap_local_offset: 0,
             jit_thread_slot_off: 0,
             stack_floor_slot_off: 0,
@@ -3075,29 +3201,28 @@ pub enum JitLdcConstant {
 ///
 /// # How an intrinsic obtains a field offset
 ///
-/// Each `*_field_index` is the abstract field slot index. The matching
-/// `*_cell_offset` is the **byte offset of that field's 16-byte `Value`
-/// cell from the object base**, precomputed as
-/// `HEADER_SIZE + field_index * SLOT_SIZE`. To load the field's payload,
-/// add the in-cell payload offset from `cratonvm_types`:
+/// Each `*_field_index` is the abstract field slot index. Every field then
+/// carries TWO ready-to-use byte offsets from the object base — one per
+/// instance layout, each already the exact payload address, so codegen adds
+/// nothing to them:
 ///
 /// ```text
-/// // `hash` is an int  → 4-byte payload at FIELD_CELL_PAYLOAD32_OFFSET:
-/// MOVSXD rax, [receiver + layout.hash_cell_offset  + FIELD_CELL_PAYLOAD32_OFFSET]
-/// // `coder` is a byte → also a 4-byte Value::Int payload:
-/// MOVSXD rax, [receiver + layout.coder_cell_offset + FIELD_CELL_PAYLOAD32_OFFSET]
-/// // `value` is a ref  → 8-byte payload at FIELD_CELL_PAYLOAD64_OFFSET:
-/// MOV    rax, [receiver + layout.value_cell_offset + FIELD_CELL_PAYLOAD64_OFFSET]
+/// TEST BYTE [receiver + GC_FLAGS_OFFSET], GC_FLAG_COMPACT ; JZ legacy
+/// MOV    rax, [receiver + layout.value_compact_offset]  ; compact: bare ptr
+/// MOVZX  eax, BYTE [receiver + layout.coder_compact_offset] ; natural width
+/// legacy:
+/// MOV    rax, [receiver + layout.value_legacy_offset]   ; cell payload
+/// MOVSXD rax, [receiver + layout.coder_legacy_offset]
 /// ```
 ///
-/// This is the same cell-offset math the inline `getfield` codegen uses;
-/// see `x64.rs` opcode `0xb4`.
+/// This mirrors the per-object compact/legacy dispatch the inline `getfield`
+/// codegen uses; see `x64.rs` opcode `0xb4`.
 ///
 /// # `coder` may be absent
 ///
 /// The legacy synthetic `{value:[C, hash:I}` String layout has no `coder`
 /// field (the backing array is `char[]`, always UTF-16). `has_coder` is
-/// `false` in that case and `coder_field_index`/`coder_cell_offset` are
+/// `false` in that case and `coder_field_index`/`coder_*_offset` are
 /// meaningless — an intrinsic that needs `coder` MUST check `has_coder`
 /// first and bail to native dispatch when it is `false`. The compact
 /// JDK-9+ `{value:[B, coder:B, hash:I, hashIsZero:Z}` layout sets it
@@ -3107,22 +3232,36 @@ pub enum JitLdcConstant {
 pub struct StringFieldLayout {
     /// Abstract field slot index of `String.value` (the backing array ref).
     pub value_field_index: usize,
-    /// Byte offset of `value`'s 16-byte `Value` cell from the object base
-    /// (`HEADER_SIZE + value_field_index * SLOT_SIZE`).
-    pub value_cell_offset: i32,
+    /// Byte offset of `value`'s bare 8-byte pointer in a COMPACT instance.
+    pub value_compact_offset: i32,
+    /// Byte offset of `value`'s 8-byte pointer payload in a LEGACY instance
+    /// (`HEADER_SIZE + value_field_index * SLOT_SIZE + FIELD_CELL_PAYLOAD64_OFFSET`).
+    pub value_legacy_offset: i32,
     /// Abstract field slot index of `String.hash` (the cached `int` hash).
     pub hash_field_index: usize,
-    /// Byte offset of `hash`'s `Value` cell from the object base.
-    pub hash_cell_offset: i32,
+    /// Byte offset of `hash`'s 4-byte payload in a COMPACT instance.
+    pub hash_compact_offset: i32,
+    /// Byte offset of `hash`'s 4-byte payload in a LEGACY instance.
+    pub hash_legacy_offset: i32,
     /// Whether this String layout has a `coder` field (`true` for the
     /// compact `byte[]` layout, `false` for the legacy `char[]` layout).
     pub has_coder: bool,
     /// Abstract field slot index of `String.coder`. Meaningful only when
     /// [`has_coder`](Self::has_coder) is `true`.
     pub coder_field_index: usize,
-    /// Byte offset of `coder`'s `Value` cell from the object base.
+    /// Byte offset of `coder`'s payload in a COMPACT instance. Meaningful
+    /// only when [`has_coder`](Self::has_coder) is `true`.
+    pub coder_compact_offset: i32,
+    /// Byte offset of `coder`'s 4-byte payload in a LEGACY instance.
     /// Meaningful only when [`has_coder`](Self::has_coder) is `true`.
-    pub coder_cell_offset: i32,
+    pub coder_legacy_offset: i32,
+    /// Whether `coder`'s COMPACT payload is a single byte. The registered
+    /// `CompactLayout` stores every field at its natural Java width, so a
+    /// `byte coder` occupies exactly one byte there and must be loaded with
+    /// a byte-sized move: the three bytes that follow it belong to the
+    /// class's padding, not to `coder`. `false` selects the 4-byte load,
+    /// which is what the no-registered-layout fallback below needs.
+    pub coder_compact_is_byte: bool,
     /// `ObjectHeader` class id of `java/lang/String` (the value stored at
     /// object offset 0). Used as the receiver class-id guard for the
     /// `java/lang/CharSequence` accessor intrinsics (`charAt`/`length`/
@@ -3134,136 +3273,116 @@ pub struct StringFieldLayout {
 }
 
 impl StringFieldLayout {
-    /// Build a layout from raw field indices, precomputing the cell offsets.
-    /// `coder_field_index` is ignored (and the offset zeroed) when
-    /// `has_coder` is `false`. `string_class_id` is the `java/lang/String`
-    /// `ObjectHeader` class id used as the CharSequence receiver guard.
+    /// Build a layout from raw field indices, precomputing, for each of
+    /// `value`/`coder`/`hash`, the two byte offsets the codegen needs: the
+    /// exact payload address under the COMPACT instance layout and the exact
+    /// payload address under the LEGACY one. `coder_field_index` is ignored
+    /// (and its offsets zeroed) when `has_coder` is `false`.
+    /// `string_class_id` is the `java/lang/String` `ObjectHeader` class id
+    /// used as the CharSequence receiver guard.
     ///
-    /// # BUG-ES-TASKINFO-20260710 — compact-ref-field offsets were wrong
+    /// # Why two offsets per field
     ///
-    /// Under `CRATONVM_COMPACT_REF_FIELDS` (default ON), a *reference*
-    /// instance field is stored as a bare 8-byte pointer instead of the
-    /// uniform 16-byte `Value` cell (see `cratonvm_types::field_layout`).
-    /// `String.value` (a `byte[]` ref, always field index 0) is exactly such
-    /// a field, so it only occupies 8 bytes of body space — but the old
-    /// `cell(idx) = HEADER_SIZE + idx * SLOT_SIZE` formula assumed every
-    /// field, including `value`, takes a full 16-byte `SLOT_SIZE`. That
-    /// overcounts `value`'s footprint by 8 bytes, so it computed every
-    /// following field's offset (`coder`, `hash`) 8 bytes too high.
+    /// A class with a registered `CompactLayout` may still have
+    /// LEGACY-laid-out instances (an allocation whose field count did not
+    /// match the registered layout), so every String intrinsic dispatches
+    /// per-object on the `GC_FLAG_COMPACT` header bit — exactly like the
+    /// inline `getfield` path in `x64.rs`. The two layouts place a field at
+    /// unrelated addresses:
     ///
-    /// Concretely: the inlined `indexOf`/`charAt`/`length`/`hashCode`/
-    /// `equals`/`compareTo` intrinsics in `x64.rs` would read `value`'s own
-    /// trailing bytes as if they were `coder`'s cell, and — for `indexOf` —
-    /// dereference what should have been `coder`'s tag+payload32 word (a
-    /// small int, e.g. `1i64 << 32` for a UTF16-coded string) as if it were
-    /// an 8-byte pointer, producing a wild-pointer SIGSEGV. The bogus
-    /// pointer was fully deterministic (not a data race): it fell straight
-    /// out of the fixed mis-offset applied to every compact-ref-field
-    /// `java/lang/String` instance, reproducing byte-for-byte across runs.
+    /// * COMPACT — `CompactLayout` packs each field at its natural Java
+    ///   width with no tag word, so `HEADER_SIZE + body_offset` already IS
+    ///   the payload address. Nothing may be added to it.
+    /// * LEGACY — every field is a uniform 16-byte `Value` cell at
+    ///   `HEADER_SIZE + field_index * SLOT_SIZE`, whose payload sits at
+    ///   `FIELD_CELL_PAYLOAD64_OFFSET` (references, 8 bytes) or
+    ///   `FIELD_CELL_PAYLOAD32_OFFSET` (int-category, 4 bytes) inside it.
     ///
-    /// The fix consults the registered per-class `CompactLayout` (built at
-    /// class-define time; see `cratonvm_types::class_layout`) for the real
-    /// per-field byte offset whenever compact ref fields are enabled and a
-    /// layout is available for `string_class_id`, instead of assuming
-    /// uniform `SLOT_SIZE` spacing. A *reference* field has no tag/payload32
-    /// prefix — every call site in `x64.rs` reads the pointer via
-    /// `cell_offset + FIELD_CELL_PAYLOAD64_OFFSET`, so the resolved absolute
-    /// offset is biased by `-FIELD_CELL_PAYLOAD64_OFFSET` before being
-    /// stored, so that arithmetic still lands on the bare pointer. Falls
-    /// back to the legacy uniform formula when compact ref fields are off,
-    /// or (defensively) if no layout is registered yet for `string_class_id`.
+    /// # BUG-STRING-CODER-COMPACT-20260726 — the compact offsets were +4
+    ///
+    /// This used to expose a single `*_cell_offset` per field that every
+    /// `x64.rs` call site turned into an address by adding its own
+    /// `FIELD_CELL_PAYLOAD32/64_OFFSET`, and the emitters derived the legacy
+    /// address from the compact one by adding a further fixed
+    /// `SLOT_SIZE - REF_FIELD_SIZE` (8). Both derivations were wrong:
+    ///
+    /// * for the COMPACT arm the extra `+4` on the int-category fields
+    ///   pushed `coder`'s read onto `hash` and `hash`'s read onto
+    ///   `hashIsZero` (real-JDK `String` packs `value@0, coder@8, hash@12,
+    ///   hashIsZero@16`). `coder` normally reads 0 either way — LATIN1 — so
+    ///   this was invisible until a String's `hash` cache was populated:
+    ///   `length()` then evaluated `value.length >> (hash & 31)`, which
+    ///   returns 0 for most hashes. H2 hit it on the interned `"PUBLIC"`
+    ///   schema name (used as a `HashMap` key, so its hash was cached), and
+    ///   wrote `CREATE SEQUENCE ""."SEQ1"` into its persisted metadata —
+    ///   after which reopening the database failed with `Schema  not found`
+    ///   (`docs/known-issues/h2/h2-jitban-schema-not-found-on-reconnect.md`).
+    ///   `hashCode()` had the mirror defect: it read `hashIsZero` as the
+    ///   cached hash, so `"".hashCode()` returned 1.
+    /// * for the LEGACY arm the fixed `+8` happens to be right for field
+    ///   indices 0 and 1 (`value`, `coder`) and wrong for every later field:
+    ///   `hash` (index 2) resolved to `HEADER + 0x18` instead of its real
+    ///   cell payload at `HEADER + 2 * SLOT_SIZE + 4`.
+    ///
+    /// Both arms are now computed from first principles, independently.
     pub fn new(
         value_field_index: usize,
         coder_field_index: Option<usize>,
         hash_field_index: usize,
         string_class_id: u32,
     ) -> Self {
-        let cell = |idx: usize| -> i32 {
+        // LEGACY: uniform 16-byte `Value` cell, payload inside it.
+        let legacy = |idx: usize, is_ref: bool| -> i32 {
+            let cell = (cratonvm_types::HEADER_SIZE + idx * cratonvm_types::SLOT_SIZE) as i32;
+            cell + if is_ref {
+                cratonvm_types::FIELD_CELL_PAYLOAD64_OFFSET as i32
+            } else {
+                cratonvm_types::FIELD_CELL_PAYLOAD32_OFFSET as i32
+            }
+        };
+        // COMPACT: the registered `CompactLayout` body offset IS the payload
+        // address. Returns `(address, is_byte_wide)`.
+        //
+        // FALLBACK (compact ref fields globally off, or no `CompactLayout`
+        // registered yet for `string_class_id` — e.g. a class that never
+        // reached `ClassStore::add`, as every test in
+        // `intrinsic_string_access.rs`/`intrinsic_string_search.rs`
+        // deliberately forges via a fake `string_class_id`): reuse the legacy
+        // address. Neither condition can produce an instance carrying
+        // `GC_FLAG_COMPACT` (see `compact_object_body_size`, the single
+        // predicate every collector's allocation path uses), so the compact
+        // arm is unreachable, and pointing it at the legacy address keeps it
+        // harmless rather than wild if that invariant ever slips.
+        let compact = |idx: usize, is_ref: bool| -> (i32, bool) {
             if cratonvm_types::compact_ref_fields_enabled() {
-                if let Some((body_off, is_ref)) =
-                    cratonvm_types::compact_field_slot(string_class_id, idx)
+                if let Some((body_off, storage)) =
+                    cratonvm_types::compact_field_storage(string_class_id, idx)
                 {
-                    let abs = (cratonvm_types::HEADER_SIZE + body_off) as i32;
-                    return if is_ref {
-                        // Bare 8-byte pointer, no cell tag/payload32 prefix.
-                        abs - cratonvm_types::FIELD_CELL_PAYLOAD64_OFFSET as i32
-                    } else {
-                        // BUG-STRINGHASH-20260726: a compact-layout PRIMITIVE
-                        // field is just as bare as a reference one -- stored at
-                        // its natural width (FieldStorageKind::size_runtime),
-                        // naturally aligned, with no tag word in front of it
-                        // (see the CompactLayout builder in classloading/src/
-                        // class.rs and read_compact_field in types/src/
-                        // field_layout.rs). So `abs` is ALREADY the payload
-                        // address -- but every x64.rs call site adds its own
-                        // FIELD_CELL_PAYLOAD32_OFFSET (the legacy tagged-cell
-                        // payload bias) on top, so returning `abs` unbiased
-                        // made every primitive read land 4 bytes PAST the
-                        // field.
-                        //
-                        // For java/lang/String under JDK 25 (value:[B @0,
-                        // coder:B @8, hash:I @12, hashIsZero:Z @16) that put
-                        // the `coder` read on `hash` and the `hash` read on
-                        // `hashIsZero` + padding: a JIT-compiled
-                        // String.hashCode() returned whatever garbage sat
-                        // there, or -- when that read zero -- recomputed the
-                        // hash with `hash` misread as `coder`, shifting the
-                        // char count to zero and returning 0.
-                        //
-                        // org.springframework.asm.SymbolTable.hash folds
-                        // String.hashCode() straight into the constant-pool
-                        // dedup key, so once it tiered up every ASM/cglib
-                        // generated class came out with a duplicated constant
-                        // pool and a Code attribute whose name index was 0 --
-                        // "Blocker 2" of docs/known-issues/
-                        // CRATONVM-SPRING-GENUINE-BUGLIST.md
-                        // (AbstractMethodError: ... has no Code attribute).
-                        abs - cratonvm_types::FIELD_CELL_PAYLOAD32_OFFSET as i32
-                    };
+                    return (
+                        (cratonvm_types::HEADER_SIZE + body_off) as i32,
+                        storage.size_runtime() == 1,
+                    );
                 }
             }
-            // FALLBACK (compact ref fields globally off, or no CompactLayout
-            // registered yet for string_class_id -- e.g. a class that never
-            // reached ClassStore::add, as every test in
-            // intrinsic_string_access.rs/intrinsic_string_search.rs
-            // deliberately forges via a fake `string_class_id`).
-            //
-            // Every x64.rs call site reconstructs the true address by adding
-            // ITS OWN payload offset to this function's return value
-            // (`FIELD_CELL_PAYLOAD64_OFFSET` for `value`, `_32_OFFSET` for
-            // `coder`/`hash`), and emit_load_string_value_ptr /
-            // emit_load_string_i32_field's own "legacy" branch adds a
-            // FURTHER `+FIELD_CELL_PAYLOAD64_OFFSET` (8) on top of that. So
-            // this fallback must return `legacy_cell_start -
-            // FIELD_CELL_PAYLOAD64_OFFSET` for EVERY field, ref or
-            // primitive alike -- not the bare legacy cell-start unbiased --
-            // so the caller's add + the emitter's own +8 net out to the true
-            // legacy payload address. (The registered branch above only
-            // needs the bias for `is_ref` because its `abs` already IS a
-            // bare-pointer/payload address for non-ref fields; the fallback
-            // formula below is a plain cell-start for every field, so it
-            // always needs the bias.)
-            //
-            // BUG-STRINGINTRINSIC-20260711: this used to return the bare,
-            // unbiased `HEADER_SIZE + idx*SLOT_SIZE`, which put every
-            // fallback field's reconstructed address 8 bytes past its real
-            // payload. For `value` (a byte[] ref) that misread the NEXT
-            // field's (`coder`'s) cell as the array pointer -- combining
-            // `Value::Int`'s zero tag with `coder`'s own int payload into a
-            // bogus 64-bit value (e.g. `0x1_00000000` for coder=1),
-            // non-null and plausible-looking, later dereferenced for the
-            // array-length bounds check. SIGSEGV.
-            (cratonvm_types::HEADER_SIZE + idx * cratonvm_types::SLOT_SIZE) as i32
-                - cratonvm_types::FIELD_CELL_PAYLOAD64_OFFSET as i32
+            (legacy(idx, is_ref), false)
         };
+
+        let (value_compact_offset, _) = compact(value_field_index, true);
+        let (hash_compact_offset, _) = compact(hash_field_index, false);
+        let (coder_compact_offset, coder_compact_is_byte) =
+            coder_field_index.map_or((0, false), |idx| compact(idx, false));
         StringFieldLayout {
             value_field_index,
-            value_cell_offset: cell(value_field_index),
+            value_compact_offset,
+            value_legacy_offset: legacy(value_field_index, true),
             hash_field_index,
-            hash_cell_offset: cell(hash_field_index),
+            hash_compact_offset,
+            hash_legacy_offset: legacy(hash_field_index, false),
             has_coder: coder_field_index.is_some(),
             coder_field_index: coder_field_index.unwrap_or(0),
-            coder_cell_offset: coder_field_index.map_or(0, cell),
+            coder_compact_offset,
+            coder_legacy_offset: coder_field_index.map_or(0, |idx| legacy(idx, false)),
+            coder_compact_is_byte,
             string_class_id,
         }
     }
@@ -13958,14 +14077,15 @@ mod layout_constant_inventory {
     /// `LAYOUT_CONSTANTS[i]` in that file.
     const INVENTORY: [(&str, [usize; 8]); 2] = [
         // lib.rs: the `use` list near the top, plus `StringFieldLayout::new`'s
-        // `cell()` closure — its compact-layout branch (biased by payload64
-        // for a reference field and by payload32 for a primitive one) and its
-        // legacy header-plus-cell fallback, biased by the payload64 offset.
-        // The payload32 use was added by BUG-STRINGHASH-20260726: the compact
-        // branch used to return a primitive field's offset UNBIASED, so every
-        // x64.rs `+ FIELD_CELL_PAYLOAD32_OFFSET` call site read 4 bytes past
-        // `String.coder` / `String.hash`.
-        ("lib.rs", [3, 1, 2, 1, 0, 0, 1, 2]),
+        // two offset closures — `legacy()` (header-plus-cell, then the ref or
+        // int-category payload offset inside that cell: one use of each) and
+        // `compact()` (header-plus-body-offset, no payload bias at all, since
+        // a `CompactLayout` offset already IS the payload address). Before
+        // BUG-STRING-CODER-COMPACT-20260726 this read `[…, 0, 2]`: the single
+        // `cell()` closure it replaced biased BOTH branches by payload64 and
+        // never mentioned payload32, which is precisely how the compact arm
+        // ended up 4 bytes past `coder` and `hash`.
+        ("lib.rs", [3, 1, 2, 1, 0, 0, 1, 1]),
         // ir_lower.rs: the `use` list, the three compile-time invariants
         // restated at the top of that file, two disp32 field-address
         // computations, two disp8 float array element accesses, and the disp8

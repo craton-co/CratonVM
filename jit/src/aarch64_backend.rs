@@ -1009,6 +1009,7 @@ impl Arm64Backend {
             bytecode_pc: 0,
             frame_slot_offsets: slots,
             moving_young_coverage_complete: false,
+            live_frame_hi: 0,
         });
     }
 
