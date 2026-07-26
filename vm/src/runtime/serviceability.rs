@@ -5,6 +5,42 @@
 //!
 //! Provides attach API, diagnostic command processing, thread dump generation,
 //! heap analysis, and HPROF stub writing for JVM serviceability tooling.
+//!
+//! ---------------------------------------------------------------------------
+//! # LIVENESS — READ THIS BEFORE WIRING ANYTHING TO IT
+//! ---------------------------------------------------------------------------
+//!
+//! **On a default build, none of the attach/jcmd surface in this module is
+//! reachable from outside the process.** Established by the observability
+//! audit of 2026-07-26:
+//!
+//!  * [`AttachListener`] has no constructor call anywhere outside this file.
+//!    Its `socket_path` field is a plain `String` and `start_listening` only
+//!    flips a `bool` — **no socket, named pipe, or `.attach_pid<N>` file is
+//!    ever created**. `jcmd <pid> ...` / `jstack <pid>` / `jmap <pid>` from
+//!    another process therefore cannot connect to a CratonVM at all.
+//!  * [`JcmdProcessor`] is constructed only in `#[cfg(test)]` code
+//!    (`vm/src/vm/vm_init.rs`, past the `#[cfg(test)]` at line ~5734, and
+//!    this file's own tests). Nothing in the VM bootstrap builds one.
+//!  * [`hsdb_start_listener`] / [`HsdbListener`] have no callers outside this
+//!    file's tests.
+//!
+//! Consequences, in order of how badly they would mislead an operator:
+//!
+//!  1. The *only* live consumers of this module are [`HprofWriter`] (used by
+//!     `runtime::hprof`, which IS reachable via
+//!     `-XX:+HeapDumpOnOutOfMemoryError`) and the [`VmDiagnosticState`] impl
+//!     on `SharedVm`, which exists but has no production caller.
+//!  2. `register_default_commands` (the no-VM-state variant used by
+//!     `JcmdProcessor::new` / `::default`) returns **fabricated** output for
+//!     several commands. See the audit note on `Compiler.queue`.
+//!  3. `JFR.start` / `JFR.stop` / `JFR.dump` never touch the flight recorder.
+//!     See the audit notes at their registration sites.
+//!
+//! Do not "wire up jcmd" by simply constructing a `JcmdProcessor` at
+//! bootstrap: `register_default_commands` would then start reporting invented
+//! data to operators. Fix the individual commands first, or register only
+//! `register_live_commands`.
 
 use cratonvm_types::narrow_oop::{read_ref_slot_unaligned, ref_element_size};
 use std::fmt;
@@ -445,81 +481,126 @@ impl JcmdProcessor {
         ));
 
         // 13. Compiler.queue
+        //
+        // Observability audit (2026-07-26) — DEFECT FIXED. This handler used
+        // to return a hard-coded, entirely **fabricated** queue listing:
+        //
+        //     C1 compile queue: 3 methods
+        //       1: java.lang.String.hashCode()I (tier 1)
+        //       2: java.util.HashMap.get(...)... (tier 1)
+        //       3: java.lang.Math.max(II)I (tier 1)
+        //     C2 compile queue: 1 method
+        //       1: com.example.Main.hotLoop()V (tier 4)
+        //
+        // Those method names were invented — `com.example.Main.hotLoop` does
+        // not exist in any real workload. Nothing consulted the JIT's
+        // compilation queue. An operator diagnosing a compile-storm would
+        // have read that output as ground truth and drawn conclusions from
+        // fiction. Invented diagnostic data is strictly worse than an honest
+        // "unsupported", so the command now reports that it is unimplemented.
+        //
+        // To implement for real: extend `VmDiagnosticState` with a
+        // `compiler_queue()` method backed by the JIT compile queue and
+        // register the command from `register_live_commands` instead (that
+        // variant has the `Arc<dyn VmDiagnosticState>` this one lacks).
         listener.register_command(DiagnosticCommand::new(
             "Compiler.queue",
-            "Print compilation queue",
+            "Print compilation queue (not implemented)",
             CommandImpact::Low,
             CommandPermission::ReadOnly,
             vec![],
             Box::new(|_args| {
-                let queue = vec![
-                    "C1 compile queue: 3 methods",
-                    "  1: java.lang.String.hashCode()I (tier 1)",
-                    "  2: java.util.HashMap.get(Ljava/lang/Object;)Ljava/lang/Object; (tier 1)",
-                    "  3: java.lang.Math.max(II)I (tier 1)",
-                    "C2 compile queue: 1 method",
-                    "  1: com.example.Main.hotLoop()V (tier 4)",
-                ];
-                CommandResult::ok(queue.join("\n"), 0)
+                CommandResult::err(
+                    "Compiler.queue is not implemented: this JcmdProcessor has no \
+                     VM state binding and CratonVM does not yet expose the JIT \
+                     compile queue to serviceability."
+                        .to_string(),
+                    0,
+                )
             }),
         ));
 
-        // 14. JFR.start
-        listener.register_command(DiagnosticCommand::new(
-            "JFR.start",
-            "Start a flight recording",
-            CommandImpact::Medium,
-            CommandPermission::ManagementAction,
-            vec![CommandArgument {
-                name: "name".to_string(),
-                description: "Recording name".to_string(),
-                arg_type: ArgType::String,
-                required: false,
-                default_value: Some("recording1".to_string()),
-            }],
-            Box::new(|args| {
-                let name = args.first().map(|s| s.as_str()).unwrap_or("recording1");
-                CommandResult::ok(format!("Flight recording started: {}", name), 0)
-            }),
-        ));
-
-        // 15. JFR.stop
-        listener.register_command(DiagnosticCommand::new(
-            "JFR.stop",
-            "Stop a flight recording",
-            CommandImpact::Medium,
-            CommandPermission::ManagementAction,
-            vec![CommandArgument {
-                name: "name".to_string(),
-                description: "Recording name".to_string(),
-                arg_type: ArgType::String,
-                required: false,
-                default_value: Some("recording1".to_string()),
-            }],
-            Box::new(|args| {
-                let name = args.first().map(|s| s.as_str()).unwrap_or("recording1");
-                CommandResult::ok(format!("Flight recording stopped: {}", name), 0)
-            }),
-        ));
-
-        // 16. JFR.dump
-        listener.register_command(DiagnosticCommand::new(
-            "JFR.dump",
-            "Dump flight recording to file",
-            CommandImpact::Medium,
-            CommandPermission::ManagementAction,
-            vec![CommandArgument {
-                name: "filename".to_string(),
-                description: "Output file path".to_string(),
-                arg_type: ArgType::FilePath,
-                required: false,
-                default_value: Some("recording.jfr".to_string()),
-            }],
-            Box::new(|args| {
-                let path = args.first().map(|s| s.as_str()).unwrap_or("recording.jfr");
-                CommandResult::ok(format!("Flight recording dumped to {}", path), 0)
-            }),
-        ));
+        // 14-16. JFR.start / JFR.stop / JFR.dump
+        //
+        // Observability audit (2026-07-26) — DEFECT FIXED. All three handlers
+        // used to return `CommandResult::ok("Flight recording started: {name}")`
+        // (and the stop/dump equivalents) **without touching the flight
+        // recorder at all**. They did not call `FlightRecorder::new_recording`,
+        // `start_recording`, `stop_recording`, or `cratonvm_jfr::dump_to_file`;
+        // `JFR.dump` reported a file path it never created.
+        //
+        // The failure scenario is the worst kind: an operator runs
+        // `jcmd <pid> JFR.start`, is told the recording started, reproduces a
+        // production incident, runs `JFR.dump`, is told the file was written —
+        // and finds nothing. Meanwhile the incident window is gone.
+        //
+        // (In practice nothing could even reach these handlers — see the
+        // LIVENESS block at the top of this module — but they were the most
+        // load-bearing-looking lie in the file, and the previous tests
+        // asserted the fake success strings, which would have kept the lie
+        // alive through any future wiring.)
+        //
+        // Implementing these for real needs, in order:
+        //   1. an `Arc<SharedVm>` (or a `VmDiagnosticState` extension) on the
+        //      processor so the handler can reach `debug.flight_recorder`;
+        //   2. `new_recording` + `start_recording` on start, `stop_recording`
+        //      on stop — both of which flip the process-global
+        //      `cratonvm_jfr::set_enabled` flag that every `emit_*` checks;
+        //   3. `FlightRecorder::dump_recording` on dump, which drains the
+        //      per-thread rings and writes the chunk.
+        // Note that even then the produced `.jfr` is not JMC-loadable — see
+        // the FORMAT-FIDELITY GAP block in `jfr/src/dump.rs`.
+        for (name, help, arg_name, arg_help, arg_type, arg_default) in [
+            (
+                "JFR.start",
+                "Start a flight recording (not implemented)",
+                "name",
+                "Recording name",
+                ArgType::String,
+                "recording1",
+            ),
+            (
+                "JFR.stop",
+                "Stop a flight recording (not implemented)",
+                "name",
+                "Recording name",
+                ArgType::String,
+                "recording1",
+            ),
+            (
+                "JFR.dump",
+                "Dump flight recording to file (not implemented)",
+                "filename",
+                "Output file path",
+                ArgType::FilePath,
+                "recording.jfr",
+            ),
+        ] {
+            listener.register_command(DiagnosticCommand::new(
+                name,
+                help,
+                CommandImpact::Medium,
+                CommandPermission::ManagementAction,
+                vec![CommandArgument {
+                    name: arg_name.to_string(),
+                    description: arg_help.to_string(),
+                    arg_type,
+                    required: false,
+                    default_value: Some(arg_default.to_string()),
+                }],
+                Box::new(move |_args| {
+                    CommandResult::err(
+                        format!(
+                            "{name} is not implemented: this JcmdProcessor has no binding \
+                             to the VM's FlightRecorder, so no recording is started, \
+                             stopped, or written. Reporting success here would lose an \
+                             operator's incident window."
+                        ),
+                        0,
+                    )
+                }),
+            ));
+        }
     }
 
     fn register_live_commands(listener: &mut AttachListener, vm_state: Arc<dyn VmDiagnosticState>) {
@@ -2459,43 +2540,81 @@ mod tests {
             .contains("Thread dump written to /tmp/threads.txt"));
     }
 
+    /// Observability audit (2026-07-26): `Compiler.queue` must NOT invent a
+    /// compilation queue. It previously returned a hard-coded listing naming
+    /// `com.example.Main.hotLoop()V` — fiction an operator would have read as
+    /// ground truth. Until the JIT queue is exposed to serviceability, the
+    /// command must fail honestly.
     #[test]
-    fn test_jcmd_compiler_queue() {
+    fn obsaudit_jcmd_compiler_queue_does_not_fabricate() {
         let jcmd = JcmdProcessor::new();
         let result = jcmd.process_command("Compiler.queue");
-        assert!(result.success);
-        assert!(result.output.contains("C1 compile queue"));
-        assert!(result.output.contains("C2 compile queue"));
+        assert!(
+            !result.success,
+            "Compiler.queue must not report success while unimplemented"
+        );
+        assert!(
+            !result.output.contains("com.example.Main"),
+            "fabricated compile-queue entries must never reappear"
+        );
+        assert!(
+            !result.output.contains("C1 compile queue"),
+            "fabricated compile-queue entries must never reappear"
+        );
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("not implemented"));
     }
 
+    /// Observability audit (2026-07-26): the JFR jcmd verbs must not claim
+    /// success while never touching the FlightRecorder. A false "recording
+    /// started" costs the operator the incident window they were capturing.
     #[test]
-    fn test_jcmd_jfr_start() {
+    fn obsaudit_jcmd_jfr_verbs_do_not_claim_false_success() {
         let jcmd = JcmdProcessor::new();
-        let result = jcmd.process_command("JFR.start myrecording");
-        assert!(result.success);
-        assert!(result
-            .output
-            .contains("Flight recording started: myrecording"));
+        for (cmd, forbidden) in [
+            ("JFR.start myrecording", "Flight recording started"),
+            ("JFR.stop myrecording", "Flight recording stopped"),
+            ("JFR.dump /tmp/rec.jfr", "Flight recording dumped"),
+        ] {
+            let result = jcmd.process_command(cmd);
+            assert!(
+                !result.success,
+                "`{cmd}` must not report success: nothing wires it to the FlightRecorder"
+            );
+            assert!(
+                !result.output.contains(forbidden),
+                "`{cmd}` must not emit the old fake-success string `{forbidden}`"
+            );
+            assert!(
+                result
+                    .error
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("not implemented"),
+                "`{cmd}` must say plainly that it is unimplemented"
+            );
+        }
     }
 
+    /// The attach surface has no production wiring: `AttachListener` never
+    /// creates a socket and `JcmdProcessor` is only constructed in tests. This
+    /// test pins the first half — if someone gives `start_listening` real
+    /// socket behaviour they must also revisit the LIVENESS block at the top
+    /// of this module and the fabricated-data audit notes it points at.
     #[test]
-    fn test_jcmd_jfr_stop() {
-        let jcmd = JcmdProcessor::new();
-        let result = jcmd.process_command("JFR.stop myrecording");
-        assert!(result.success);
-        assert!(result
-            .output
-            .contains("Flight recording stopped: myrecording"));
-    }
-
-    #[test]
-    fn test_jcmd_jfr_dump() {
-        let jcmd = JcmdProcessor::new();
-        let result = jcmd.process_command("JFR.dump /tmp/rec.jfr");
-        assert!(result.success);
-        assert!(result
-            .output
-            .contains("Flight recording dumped to /tmp/rec.jfr"));
+    fn obsaudit_attach_listener_creates_no_socket() {
+        let path = "cratonvm-obsaudit-attach-socket-that-must-not-exist";
+        let mut l = AttachListener::new(path);
+        l.start_listening();
+        assert!(l.is_listening, "the flag is all `start_listening` sets");
+        assert!(
+            !std::path::Path::new(path).exists(),
+            "AttachListener still creates no real socket; if that changed, the \
+             module-level LIVENESS block is now stale"
+        );
     }
 
     #[test]
