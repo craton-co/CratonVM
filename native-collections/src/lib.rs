@@ -510,6 +510,45 @@ mod dense_int_entries_tests {
 #[derive(Default)]
 struct HmIntFastState {
     entries: DenseIntEntries,
+    /// Runtime class of every key currently stored in `entries`; `None` only
+    /// before the overlay's first insert.
+    ///
+    /// CORRECTNESS (cross-wrapper key aliasing). `unbox_wrapper` collapses
+    /// `Integer`, `Short`, `Byte`, `Character` AND `Boolean` onto the same
+    /// `Value::Int`, so keying this overlay on that `i32` alone made
+    /// `Integer.valueOf(65)` and `Character.valueOf('A')` — or `Boolean.TRUE`
+    /// and `Integer.valueOf(1)` — the SAME overlay entry. Real `HashMap` keeps
+    /// them apart: every JDK wrapper's `equals` starts with an `instanceof` of
+    /// its own type, so wrappers of different classes are never equal. The
+    /// symptom was a silent wrong answer, not a crash:
+    ///
+    /// ```java
+    /// Map<Object, String> m = new HashMap<>();
+    /// m.put(Integer.valueOf(65), "int");
+    /// m.put(Character.valueOf('A'), "char");
+    /// m.size();                        // JDK 2, overlay 1
+    /// m.get(Integer.valueOf(65));      // JDK "int", overlay "char"
+    /// ```
+    ///
+    /// Recording the wrapper class of the first key an overlay ever saw and
+    /// refusing any later key of a different class restores the contract: the
+    /// mismatching key falls through to `materialize_hm_int_fast` plus the
+    /// ordinary node path, which compares through `map_keys_equal` (itself
+    /// class-guarded — see there). The check costs one `class_id_of_object`,
+    /// a heap-header read with no `class_manager` lock and no `String`
+    /// allocation, so the Integer-keyed path this overlay exists for is
+    /// unaffected.
+    key_class: Option<ClassId>,
+}
+
+/// True when `key_class` may be stored in / looked up against `state`.
+/// A `None` (fresh) overlay accepts any wrapper class and adopts it.
+#[inline]
+fn hm_int_fast_key_class_ok(state: &HmIntFastState, key_class: ClassId) -> bool {
+    match state.key_class {
+        Some(existing) => existing == key_class,
+        None => true,
+    }
 }
 
 fn hm_int_fast_table() -> &'static Mutex<FxHashMap<usize, HmIntFastState>> {
@@ -519,21 +558,44 @@ fn hm_int_fast_table() -> &'static Mutex<FxHashMap<usize, HmIntFastState>> {
 }
 
 thread_local! {
-    static HM_INT_FAST_LAST_KEY: std::cell::Cell<Option<(usize, usize)>> =
+    /// Single-entry memo for [`hm_int_fast_obj_key`]:
+    /// `(raw pointer, identity hash, overlay key)`.
+    static HM_INT_FAST_LAST_KEY: std::cell::Cell<Option<(usize, i32, usize)>> =
         const { std::cell::Cell::new(None) };
 }
 
 #[inline]
 fn hm_int_fast_obj_key(ctx: &dyn NativeContext, this: ObjectRef) -> usize {
     let ptr = this.as_ptr() as usize;
-    if let Some((_, key)) = HM_INT_FAST_LAST_KEY
+    // GC-SOUNDNESS: the memo used to be validated by raw pointer ALONE. A raw
+    // address is not a stable object identity under a moving/compacting
+    // collector: once a map dies and its address is handed to a fresh
+    // allocation, the pointer test still passed and this returned the DEAD
+    // map's overlay key. The new map would then read and write its entries
+    // under the wrong key — invisible to any other thread (whose own memo is
+    // cold and resolves the correct key through `widened_obj_key`), and
+    // invisible to `gc_prune_dead_collection_overlays`, which walks the key
+    // registry and would drop those entries as belonging to a dead object.
+    //
+    // Identity hashes are minted from a counter at allocation
+    // (`VmHeap::next_identity_hash`), never derived from the address, so the
+    // recycling object always presents a different hash — validating it closes
+    // the hole. `native_map_init` still purges a same-address predecessor's
+    // overlay entry (see there); that stays a pointer-only match on purpose,
+    // since its job is precisely to evict the previous tenant.
+    //
+    // Cost: `identity_hash_code` is a header word read. The memo still earns
+    // its keep — the path it skips (`widened_obj_key`) takes a sharded global
+    // mutex and scans the hash's slot vector.
+    let hash = ctx.identity_hash_code(this);
+    if let Some((_, _, key)) = HM_INT_FAST_LAST_KEY
         .with(|cache| cache.get())
-        .filter(|(cached_ptr, _)| *cached_ptr == ptr)
+        .filter(|(cached_ptr, cached_hash, _)| *cached_ptr == ptr && *cached_hash == hash)
     {
         return key;
     }
     let key = widened_obj_key(ctx, this);
-    HM_INT_FAST_LAST_KEY.with(|cache| cache.set(Some((ptr, key))));
+    HM_INT_FAST_LAST_KEY.with(|cache| cache.set(Some((ptr, hash, key))));
     key
 }
 
@@ -561,11 +623,21 @@ fn try_hm_int_fast_put(
         _ => return None,
     };
     let object_key = hm_int_fast_obj_key(ctx, this);
+    // See `HmIntFastState::key_class`: a key whose wrapper class differs from
+    // the one the overlay already holds is a DIFFERENT `HashMap` key in the
+    // JDK, so it must not reuse the overlay's `i32` slot. Returning `None`
+    // sends the caller down the materialize + node path, which distinguishes
+    // the two through `map_keys_equal`.
+    let key_class = ctx.class_id_of_object(key_ref);
     {
         let mut table = hm_int_fast_table()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         if let Some(state) = table.get_mut(&object_key) {
+            if !hm_int_fast_key_class_ok(state, key_class) {
+                return None;
+            }
+            state.key_class = Some(key_class);
             let old = state
                 .entries
                 .insert(int_key, (key_ref, value))
@@ -583,6 +655,10 @@ fn try_hm_int_fast_put(
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let state = table.entry(object_key).or_default();
+        if !hm_int_fast_key_class_ok(state, key_class) {
+            return None;
+        }
+        state.key_class = Some(key_class);
         let old = state
             .entries
             .insert(int_key, (key_ref, value))
@@ -606,10 +682,17 @@ fn try_hm_int_fast_get(
         _ => return None,
     };
     let object_key = hm_int_fast_obj_key(ctx, this);
+    let key_class = ctx.class_id_of_object(key_ref);
     let table = hm_int_fast_table()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let state = table.get(&object_key)?;
+    // Wrapper-class mismatch (see `HmIntFastState::key_class`): this is not a
+    // key this overlay can answer for. Fall through to the node path rather
+    // than reporting the numerically-equal entry of a different wrapper type.
+    if !hm_int_fast_key_class_ok(state, key_class) {
+        return None;
+    }
     Some(Ok(Some(
         state
             .entries
@@ -1547,6 +1630,28 @@ fn normalize_for_compare(ctx: &dyn NativeContext, v: &Value) -> Value {
 /// Check if two Values refer to the same object (by identity) or are equal
 /// strings/wrapper values. Used by ArrayList.contains/indexOf and HashMap key lookup.
 fn values_equal(ctx: &dyn NativeContext, a: &Value, b: &Value) -> bool {
+    // Two BOXED wrappers of different runtime classes are never `equals` in
+    // Java (each wrapper's `equals` opens with an `instanceof` of its own
+    // type), but `normalize_for_compare` below erases the class and leaves
+    // only the primitive — so `list.contains(Long.valueOf(1L))` reported true
+    // for a list holding `Integer.valueOf(1)`, and `map.containsValue('A')`
+    // reported true for a map holding `Integer.valueOf(65)`. Mirrors the guard
+    // in `map_keys_equal`; see there for the full rationale.
+    //
+    // Scoped to the object/object case on purpose: when one side is a RAW
+    // `Value::Int`/`Value::Long` there is no Java wrapper class to compare and
+    // the cross-type numeric arms below stay in force, since that comparison
+    // is about how the VM represented the value, not about two Java objects.
+    // The ClassId inequality test short-circuits the two `unbox_wrapper` calls
+    // in the overwhelmingly common same-class case.
+    if let (Value::Object(Some(oa)), Value::Object(Some(ob))) = (a, b) {
+        if ctx.class_id_of_object(*oa) != ctx.class_id_of_object(*ob)
+            && unbox_wrapper(ctx, *oa).is_some()
+            && unbox_wrapper(ctx, *ob).is_some()
+        {
+            return false;
+        }
+    }
     // Normalize: unbox wrapper objects to primitives for comparison
     let na = normalize_for_compare(ctx, a);
     let nb = normalize_for_compare(ctx, b);
@@ -1572,8 +1677,18 @@ fn values_equal(ctx: &dyn NativeContext, a: &Value, b: &Value) -> bool {
         (Value::Object(None), Value::Object(None)) => true,
         (Value::Int(a), Value::Int(b)) => a == b,
         (Value::Long(a), Value::Long(b)) => a == b,
-        (Value::Float(a), Value::Float(b)) => a == b,
-        (Value::Double(a), Value::Double(b)) => a == b,
+        // `Float.equals`/`Double.equals` compare bit patterns, not `==`:
+        // NaN equals itself and +0.0 != -0.0. Every caller of `values_equal`
+        // implements a Java `equals`-semantics operation (`List.contains`,
+        // `List.indexOf`, `List.remove(Object)`, `Map.containsValue`), so the
+        // bit semantics is the correct one for all of them. With `==`,
+        // `list.contains(Double.NaN)` was false for a list that held NaN.
+        (Value::Float(a), Value::Float(b)) => {
+            (a.is_nan() && b.is_nan()) || a.to_bits() == b.to_bits()
+        }
+        (Value::Double(a), Value::Double(b)) => {
+            (a.is_nan() && b.is_nan()) || a.to_bits() == b.to_bits()
+        }
         // Cross-type numeric: Int vs Long
         (Value::Int(a), Value::Long(b)) => (*a as i64) == *b,
         (Value::Long(a), Value::Int(b)) => *a == (*b as i64),
@@ -4405,11 +4520,52 @@ fn map_keys_equal(
     // `class_manager` RwLock read + allocating class-name lookup per call
     // just to fail for every Integer/Long/etc. key).
     if let (Some(pa), Some(pb)) = (unbox_wrapper(ctx, a), unbox_wrapper(ctx, b)) {
+        // JDK contract: every wrapper's `equals(Object)` opens with an
+        // `instanceof` of its OWN type, so two wrappers of DIFFERENT classes
+        // are never equal. Without this guard the unboxed comparison below
+        // conflated key types that real `HashMap` keeps apart, because
+        // `unbox_wrapper` maps Integer/Short/Byte/Character/Boolean onto the
+        // same `Value::Int` and the Int-vs-Long arms cross-compare explicitly:
+        //
+        //   Map<Object,String> m = new HashMap<>();
+        //   m.put(Integer.valueOf(1), "int");
+        //   m.put(Long.valueOf(1L),   "long");   // JDK: 2 entries
+        //
+        // `Integer.hashCode()==1` and `Long.hashCode()==1`, so both keys land
+        // in the same bucket; the chain walk then found the Integer node
+        // "equal" and OVERWROTE it -> size()==1 and get(1) == "long". Same for
+        // Integer.valueOf(65) vs Character.valueOf('A') (both hash 65) and
+        // Boolean.TRUE vs Integer.valueOf(1) (Boolean unboxes to Int(1)).
+        //
+        // Deliberately compared by ClassId, not by class name: it is a
+        // heap-header read, with no `class_manager` lock and no `String`
+        // allocation, on the hottest comparison in the map natives. The
+        // same-class Int-vs-Long arms are KEPT: within one wrapper class they
+        // only paper over a representational difference in how the VM stored
+        // the value field, never over two genuinely distinct Java keys.
+        if ctx.class_id_of_object(a) != ctx.class_id_of_object(b) {
+            return Ok(false);
+        }
         return Ok(match (pa, pb) {
             (Value::Int(x), Value::Int(y)) => x == y,
             (Value::Long(x), Value::Long(y)) => x == y,
-            (Value::Float(x), Value::Float(y)) => x == y,
-            (Value::Double(x), Value::Double(y)) => x == y,
+            // `Float.equals`/`Double.equals` compare floatToIntBits /
+            // doubleToLongBits, NOT `==`. Two consequences that plain `==` got
+            // backwards, both silent-wrong-answer:
+            //   * NaN equals itself, so `m.put(Double.NaN, v)` followed by
+            //     `m.get(Double.NaN)` MUST find the entry; with `==` the key
+            //     could never be looked up again (get/remove/containsKey all
+            //     returned "absent" for a key the map demonstrably held).
+            //   * +0.0 does NOT equal -0.0, so they are two distinct keys;
+            //     with `==` the second put silently overwrote the first.
+            // `is_nan() || to_bits()` reproduces floatToIntBits exactly,
+            // including its canonicalisation of every NaN payload.
+            (Value::Float(x), Value::Float(y)) => {
+                (x.is_nan() && y.is_nan()) || x.to_bits() == y.to_bits()
+            }
+            (Value::Double(x), Value::Double(y)) => {
+                (x.is_nan() && y.is_nan()) || x.to_bits() == y.to_bits()
+            }
             (Value::Int(x), Value::Long(y)) => (x as i64) == y,
             (Value::Long(x), Value::Int(y)) => x == (y as i64),
             _ => false,
@@ -5287,9 +5443,9 @@ pub fn native_map_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         return Ok(None);
     }
     let ptr = this.as_ptr() as usize;
-    if let Some((_, stale_key)) = HM_INT_FAST_LAST_KEY
+    if let Some((_, _, stale_key)) = HM_INT_FAST_LAST_KEY
         .with(|cache| cache.get())
-        .filter(|(cached_ptr, _)| *cached_ptr == ptr)
+        .filter(|(cached_ptr, _, _)| *cached_ptr == ptr)
     {
         hm_int_fast_table()
             .lock()
@@ -6398,12 +6554,19 @@ fn native_map_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         if let Value::Object(Some(key_ref)) = key_val {
             if let Some(Value::Int(int_key)) = unbox_wrapper(ctx, key_ref) {
                 let object_key = hm_int_fast_obj_key(ctx, this);
+                let key_class = ctx.class_id_of_object(key_ref);
                 let mut table = hm_int_fast_table()
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
                 if let Some(state) = table.get_mut(&object_key) {
-                    let old = state.entries.remove(&int_key).map(|(_, value)| value);
-                    return Ok(Some(old.unwrap_or(Value::Object(None))));
+                    // Wrapper-class mismatch: `remove(Character.valueOf('A'))`
+                    // must NOT delete the `Integer.valueOf(65)` entry (see
+                    // `HmIntFastState::key_class`). Drop out of the overlay and
+                    // let the node path decide.
+                    if hm_int_fast_key_class_ok(state, key_class) {
+                        let old = state.entries.remove(&int_key).map(|(_, value)| value);
+                        return Ok(Some(old.unwrap_or(Value::Object(None))));
+                    }
                 }
             }
         }
@@ -6609,13 +6772,19 @@ fn native_map_contains_key(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     if let Value::Object(Some(key_ref)) = key_val {
         if let Some(Value::Int(int_key)) = unbox_wrapper(ctx, key_ref) {
             let object_key = hm_int_fast_obj_key(ctx, this);
+            let key_class = ctx.class_id_of_object(key_ref);
             let table = hm_int_fast_table()
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             if let Some(state) = table.get(&object_key) {
-                return Ok(Some(
-                    Value::Int(state.entries.contains_key(&int_key) as i32),
-                ));
+                // Wrapper-class mismatch: `containsKey(Character.valueOf('A'))`
+                // is false for a map holding `Integer.valueOf(65)` (see
+                // `HmIntFastState::key_class`). Fall through to the node path.
+                if hm_int_fast_key_class_ok(state, key_class) {
+                    return Ok(Some(
+                        Value::Int(state.entries.contains_key(&int_key) as i32),
+                    ));
+                }
             }
         }
     }
@@ -47791,6 +47960,213 @@ mod tests {
 
             assert_eq!(unbox_wrapper(&ctx, boxed), Some(Value::Long(42)));
             assert_eq!(element_hash_code(&mut ctx, &Value::Object(Some(boxed))), 42);
+        }
+
+        // ------------------------------------------------------------------
+        // Cross-wrapper key aliasing (silent wrong answer).
+        //
+        // `unbox_wrapper` maps Integer / Short / Byte / Character / Boolean
+        // onto the same `Value::Int`, and the wrapper-comparison arms also
+        // cross-compare Int against Long. Both the exact-HashMap integer
+        // overlay and the ordinary bucket-node path keyed off that, so keys
+        // real `HashMap` keeps apart collapsed onto one entry. Every assertion
+        // below fails against the pre-fix code.
+        // ------------------------------------------------------------------
+
+        /// Allocate a JDK wrapper instance of `class_name` holding `value`.
+        fn boxed_wrapper(
+            ctx: &mut MockCtx,
+            cid: ClassId,
+            class_name: &str,
+            value: Value,
+        ) -> ObjectRef {
+            ctx.define_class(cid, class_name);
+            let obj = ctx.alloc_object(cid, 1);
+            ctx.set_field(obj, 0, value);
+            obj
+        }
+
+        #[test]
+        fn wrapper_keys_of_different_classes_are_never_map_equal() {
+            let mut ctx = MockCtx::new(1);
+            let int_cid = ClassId::new(2001);
+            let i65 = boxed_wrapper(&mut ctx, int_cid, "java/lang/Integer", Value::Int(65));
+            let i65_other = boxed_wrapper(&mut ctx, int_cid, "java/lang/Integer", Value::Int(65));
+            let i1 = boxed_wrapper(&mut ctx, int_cid, "java/lang/Integer", Value::Int(1));
+            let c65 = boxed_wrapper(
+                &mut ctx,
+                ClassId::new(2002),
+                "java/lang/Character",
+                Value::Int(65),
+            );
+            let true_box = boxed_wrapper(
+                &mut ctx,
+                ClassId::new(2003),
+                "java/lang/Boolean",
+                Value::Int(1),
+            );
+            let l1 = boxed_wrapper(
+                &mut ctx,
+                ClassId::new(2004),
+                "java/lang/Long",
+                Value::Long(1),
+            );
+
+            // Unchanged: same wrapper class, same value, distinct objects.
+            assert!(
+                map_keys_equal(&mut ctx, i65, i65_other).unwrap(),
+                "two distinct Integer(65) boxes are the same HashMap key"
+            );
+
+            // All four returned `true` before the fix, silently collapsing two
+            // distinct JDK keys (which share a bucket, since their hashCodes
+            // agree) into one entry on `put`.
+            assert!(
+                !map_keys_equal(&mut ctx, i65, c65).unwrap(),
+                "Integer.valueOf(65) vs Character.valueOf('A')"
+            );
+            assert!(
+                !map_keys_equal(&mut ctx, i1, true_box).unwrap(),
+                "Integer.valueOf(1) vs Boolean.TRUE"
+            );
+            assert!(
+                !map_keys_equal(&mut ctx, i1, l1).unwrap(),
+                "Integer.valueOf(1) vs Long.valueOf(1L)"
+            );
+            assert!(
+                !map_keys_equal(&mut ctx, l1, i1).unwrap(),
+                "Long.valueOf(1L) vs Integer.valueOf(1) (symmetry)"
+            );
+        }
+
+        #[test]
+        fn double_wrapper_keys_use_jdk_bit_equality() {
+            let mut ctx = MockCtx::new(1);
+            let dbl = ClassId::new(2010);
+            let nan_a = boxed_wrapper(&mut ctx, dbl, "java/lang/Double", Value::Double(f64::NAN));
+            let nan_b = boxed_wrapper(&mut ctx, dbl, "java/lang/Double", Value::Double(f64::NAN));
+            let pos_zero = boxed_wrapper(&mut ctx, dbl, "java/lang/Double", Value::Double(0.0));
+            let neg_zero = boxed_wrapper(&mut ctx, dbl, "java/lang/Double", Value::Double(-0.0));
+
+            // `Double.valueOf(NaN).equals(Double.valueOf(NaN))` is TRUE in Java
+            // (doubleToLongBits). Was `false` under the old `x == y`, so a NaN
+            // key could be stored by `put` and never found again by
+            // `get`/`remove`/`containsKey`.
+            assert!(
+                map_keys_equal(&mut ctx, nan_a, nan_b).unwrap(),
+                "a NaN key must find itself"
+            );
+            // `Double.valueOf(0.0).equals(Double.valueOf(-0.0))` is FALSE in
+            // Java. Was `true`, so `put(-0.0, ...)` overwrote the `0.0` entry.
+            assert!(
+                !map_keys_equal(&mut ctx, pos_zero, neg_zero).unwrap(),
+                "+0.0 and -0.0 are distinct HashMap keys"
+            );
+        }
+
+        #[test]
+        fn values_equal_rejects_cross_wrapper_boxes() {
+            let mut ctx = MockCtx::new(1);
+            let i1 = boxed_wrapper(
+                &mut ctx,
+                ClassId::new(2020),
+                "java/lang/Integer",
+                Value::Int(1),
+            );
+            let l1 = boxed_wrapper(
+                &mut ctx,
+                ClassId::new(2021),
+                "java/lang/Long",
+                Value::Long(1),
+            );
+
+            // `List.of(Integer.valueOf(1)).contains(Long.valueOf(1L))` is false;
+            // so is `map.containsValue(...)` across wrapper types.
+            assert!(
+                !values_equal(&ctx, &Value::Object(Some(i1)), &Value::Object(Some(l1))),
+                "boxed Integer(1) and boxed Long(1L) are not equal"
+            );
+            // Raw VM-level primitives keep the cross-type numeric comparison —
+            // no Java wrapper class is involved there.
+            assert!(values_equal(&ctx, &Value::Int(1), &Value::Long(1)));
+            // Java `equals` bit semantics for floating point.
+            assert!(values_equal(
+                &ctx,
+                &Value::Double(f64::NAN),
+                &Value::Double(f64::NAN)
+            ));
+            assert!(!values_equal(
+                &ctx,
+                &Value::Double(0.0),
+                &Value::Double(-0.0)
+            ));
+        }
+
+        #[test]
+        fn int_overlay_refuses_a_foreign_wrapper_class() {
+            // The overlay side-tables are process-global and keyed by identity
+            // hash, which this mock derives from the raw pointer — every
+            // `MockCtx` otherwise starts allocating at the same address. Give
+            // each overlay-touching test its own pointer range.
+            static PTR_SPREAD: std::sync::atomic::AtomicUsize =
+                std::sync::atomic::AtomicUsize::new(0);
+            let pad = PTR_SPREAD.fetch_add(256, std::sync::atomic::Ordering::Relaxed);
+            let mut ctx = MockCtx::new(1);
+            let filler = ClassId::new(2030);
+            ctx.define_class(filler, "java/lang/Object");
+            for _ in 0..pad {
+                let _ = ctx.alloc_object(filler, 0);
+            }
+
+            let map_cid = ClassId::new(2031);
+            ctx.define_class(map_cid, "java/util/HashMap");
+            let map = ctx.alloc_object(map_cid, 3);
+
+            let i65 = boxed_wrapper(
+                &mut ctx,
+                ClassId::new(2032),
+                "java/lang/Integer",
+                Value::Int(65),
+            );
+            let c65 = boxed_wrapper(
+                &mut ctx,
+                ClassId::new(2033),
+                "java/lang/Character",
+                Value::Int(65),
+            );
+
+            // First put seeds the overlay and adopts Integer as its key class.
+            assert!(
+                try_hm_int_fast_put(&mut ctx, map, Value::Object(Some(i65)), Value::Int(1))
+                    .is_some(),
+                "fresh exact HashMap with an Integer key takes the overlay"
+            );
+            // A Character key unboxes to the same `Value::Int(65)`. Before the
+            // fix it landed on the SAME overlay slot and overwrote the Integer
+            // entry (map.size() stayed 1, get(65) returned the Character's
+            // value); now the overlay declines and the caller materializes into
+            // real nodes, where `map_keys_equal` keeps the two keys apart.
+            assert!(
+                try_hm_int_fast_put(&mut ctx, map, Value::Object(Some(c65)), Value::Int(2))
+                    .is_none(),
+                "a Character key must not reuse the Integer overlay slot"
+            );
+            let got = try_hm_int_fast_get(&ctx, map, Value::Object(Some(i65)));
+            assert!(
+                matches!(got, Some(Ok(Some(Value::Int(1))))),
+                "Integer entry survives the rejected Character put: {got:?}"
+            );
+            assert!(
+                try_hm_int_fast_get(&ctx, map, Value::Object(Some(c65))).is_none(),
+                "a Character lookup must fall through to the node path"
+            );
+            assert_eq!(hm_int_fast_len(&ctx, map), Some(1));
+
+            // Leave the process-global overlay as we found it.
+            hm_int_fast_table()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&hm_int_fast_obj_key(&ctx, map));
         }
 
         /// Helper: initialise a fresh LBQ instance with the given capacity.
