@@ -92,10 +92,22 @@ actually is:
 | `native-io` | 50,000 | `types` | 9,500 |
 | `classloading` | 50,000 | remaining 6 | < 6,000 each |
 
-Several individual files are far larger than is comfortable — `vm/src/vm.rs`
-(~68,000 lines), `vm/src/runtime/interpreter.rs` (~45,000), and
-`jit/src/x64.rs` (~39,000). Two `native-builtins` files were worse and were
-split on 2026-07-25: `lib.rs` went ~90,000 → ~39,000 across 13 per-domain
+Several individual files are far larger than is comfortable. The two largest
+*production* files are `vm/src/runtime/interpreter.rs` (~46,800 lines) and
+`jit/src/x64.rs` (~41,000).
+
+`vm/src/vm.rs` appears to dwarf both at 74,043 lines, but that number is
+misleading and this is **not** the file to start reading. Everything from
+line 62 onward is a single `#[cfg(all(test, feature = "synthetic-jdk"))]
+mod tests` — a test module the default build does not even compile, because
+`synthetic-jdk` is deliberately not a default Cargo feature (`vm/Cargo.toml`).
+The orchestrator itself is the ~61-line module header above it, which declares
+and re-exports `vm/src/vm/`: `vm_exec.rs` (~21,200 lines), `vm_init.rs`
+(~11,900), `vm_util.rs` (~4,300), `vm_object.rs` (~2,100), and `realms/`.
+Those are the files to open.
+
+Two `native-builtins` files were worse and were split on 2026-07-25:
+`lib.rs` went ~90,000 → ~39,000 across 13 per-domain
 modules (`util_concurrent_ext`, `antlr_intrinsics`, `regex_matcher`,
 `math_bignum`, …), and `phases_late.rs` went ~77,000 → ~8,000 across 18
 modules under `native-builtins/src/phases_late/` (`nio_file`, `bouncycastle`,
@@ -144,10 +156,19 @@ The bytecode execution engine.
      property of the bytecode. The intended fix (recorded in that function's
      own TODO) is a per-method `unsafe_for_fast_path` flag computed at
      verification time.
-  2. JDK and Spring bytecode runs on the slow path, which re-decodes every
-     instruction on **every execution** — and `Instruction`'s `Tableswitch` /
-     `Lookupswitch` variants own `Vec`s, so each execution of a switch
-     allocates. A one-time link-time quickening pass is the tracked fix.
+  2. JDK and Spring bytecode runs on the slow path. The re-decode-on-every-
+     execution cost that used to imply **has been fixed** — do not re-propose
+     it. A one-time quickening pass pre-decodes a method's instruction stream
+     into a `QuickenedCode` (`reader/src/quickened.rs`), and the slow path
+     picks it up through `quickened_for_frame`
+     (`vm/src/runtime/interpreter.rs:7872`), falling back to
+     `Instruction::decode` only for frames with no quickened stream.
+
+     The *remaining* cost is the pc→index lookup, not decoding.
+     `QuickenedCode::index_of_pc` (`reader/src/quickened.rs:186`) resolves
+     straight-line execution in a single compare against a `hint`, but every
+     taken branch misses the hint and falls back to a binary search over the
+     pc table. That is the residual to attack.
 - **`frame.rs`** — Stack frame: local variables + operand stack, stored
   in SoA (Structure-of-Arrays) layout for cache efficiency.
 - **`call_stack.rs`** — Per-thread call stack of frames.
@@ -172,7 +193,7 @@ Implements JVMS Ch. 5: loading, linking, and initialization. Extracted into the
 
 ### Memory (`gc/` crate)
 
-Garbage collectors, extracted into the `cratonvm-gc` crate. The default is the generational semi-space collector (Cheney moving young gen + non-moving sweep). A region-based G1 collector is also present and opt-in selectable via `-XX:+UseG1GC` (experimental; Generational remains the default safety net during G1 maturation — see `docs/feature-designs/concurrent-gc-maturation.md`). ZGC is experimental and feature-gated (`--features zgc`, off by default): a metadata-only simulation plus a real STW mark-sweep heap (`ZgcRealHeap`) that is built but not yet wired into the backend dispatch (`GcBackend`), so neither is a selectable production collector.
+Garbage collectors, extracted into the `cratonvm-gc` crate. The default is the generational collector — but see **"The default does not compact"** below before assuming the Cheney moving young gen is what runs; it is off by default and, on a JIT-warm workload, effectively unreachable. A region-based G1 collector is also present and opt-in selectable via `-XX:+UseG1GC` (experimental; Generational remains the default safety net during G1 maturation — see `docs/feature-designs/concurrent-gc-maturation.md`). ZGC is experimental and feature-gated (`--features zgc`, off by default): a metadata-only simulation plus a real STW mark-sweep heap (`ZgcRealHeap`) that is built but not yet wired into the backend dispatch (`GcBackend`), so neither is a selectable production collector.
 
 - **`heap.rs`** — Object/array layout and allocation (semi-space).
 - **`gen_heap.rs`** — Generational heap: young gen (copying) + old gen.
@@ -182,6 +203,33 @@ Garbage collectors, extracted into the `cratonvm-gc` crate. The default is the g
 - **`arena.rs`** — Bump-pointer memory arena.
 - **`roots.rs`** — Root scanning and pointer remapping.
 - **`old_gen.rs`** — Old generation management.
+
+**The default does not compact.** Two independent gates keep the moving
+(Cheney) young-gen path from running on the default configuration:
+
+1. `moving_young` is an **opt-in** flag that defaults to **false** —
+   `moving_young: present(src, "CRATONVM_MOVING_YOUNG")` at
+   `types/src/flags.rs:619`, pinned by the
+   `empty_source_matches_all_documented_defaults` test at `:1657`. Unless
+   `CRATONVM_MOVING_YOUNG` is set in the environment, the moving cycle is
+   never even requested.
+2. Even when it *is* set, `gc/src/gen_heap.rs:3770` computes
+   `fail_closed_non_moving = gc_quiescence::is_active() && !gc_flags().allow_moving_young`,
+   and `is_active()` (`gc/src/gc_quiescence.rs:187`) is true whenever **any**
+   thread is inside a JIT call. `allow_moving_young` is `present()`-gated and
+   also defaults to false. With `CRATONVM_JIT_THRESHOLD` at 500 (see the JIT
+   section), a long-running workload spends most of its allocation time under
+   a live JIT frame, so cycles keep diverting. The collector says so in its own
+   trace: `"… — compaction deferred."` (`gen_heap.rs:3798`).
+
+So what a default `cargo build` actually gives you is a **generational
+non-moving mark-sweep with selective promotion**, not a semi-space copying
+young gen: no young-gen compaction, and fragmentation reclaimed only by
+sweeping the free list. That is a different complexity class from the one
+"Cheney moving young gen" advertises, and it is the behaviour to reason about
+when reading allocation-path or GC-pause code. The precise-root work needed
+before the moving path can be safe by default is tracked in
+[`docs/internal/arch-2026-07-26/moving-young-precise-roots.md`](docs/internal/arch-2026-07-26/moving-young-precise-roots.md).
 
 **Object layout:**
 ```
@@ -210,11 +258,16 @@ them in the same way would take the header to 16 bytes.
 Arrays use compact element sizes (1/2/4/8 bytes per element depending on type;
 `element_byte_size`), with reference elements at `REF_ELEMENT_SIZE` = 8 B.
 
-**Compressed oops** (`gc/src/compressed_oops.rs`) are implemented and tested but
-**not wired into the live heap** — `use_compressed_oops` defaults to `false`
-(`vm/src/config.rs`). The encode/decode surface is ready; narrow-oop field
-layout, JIT load/store barriers, GC root re-encoding, and klass-pointer
-compression are the remaining work.
+**Compressed oops** (`gc/src/compressed_oops.rs`) *are* wired into the live
+heap now — `enable_for_live_heap` is called from `vm/src/vm/vm_init.rs:874` —
+but behind an **opt-in** `-XX:+UseCompressedOops` / `CRATONVM_COMPRESSED_OOPS=1`
+gate, and `use_compressed_oops` defaults to `false` (`vm/src/config.rs:426`), so
+the default path does not use it. When the gate is on, reference instance fields
+and reference array elements narrow from 8 bytes to 4; the klass pointer is
+deliberately not narrowed (`ObjectHeader::class_id` is already a `u32`). The
+reason the gate stays off is a throughput regression, not incompleteness: the
+JIT's inline compact-field fast paths are disabled while compressed oops are
+active, so `getfield`/`putfield` fall back to the always-correct helpers.
 
 ### JIT Compiler (`jit/` crate)
 
@@ -280,10 +333,13 @@ domain-specific crates. The `NativeContext` trait lives in `native-api/`.
 - **`native-collections/`** — java.util.* native methods.
 - **`native-io/`** — java.io/nio native methods.
 
-Instead of loading `rt.jar`, CratonVM provides native Rust implementations
-of JDK classes. The `NativeContext` trait (in `native-api/`) provides a
-VM-agnostic interface for native methods to access the heap, class manager,
-and thread state.
+These stubs are the **synthetic** standard library — the fallback mode, not the
+default one (see Key Design Decision 1). In the default real-JDK mode the same
+crates register a much smaller essential-native surface underneath real
+`java.base` bytecode, so a method you find implemented here may not be the one
+executing. The `NativeContext` trait (in `native-api/`) provides a VM-agnostic
+interface for native methods to access the heap, class manager, and thread
+state in both modes.
 
 ### Threading (`vm/src/threading/`)
 
@@ -346,9 +402,45 @@ pointer.
 
 ## Key Design Decisions
 
-1. **No JDK dependency.** All standard library classes are implemented as
-   native methods in Rust. This means no `JAVA_HOME`, no `rt.jar`, and
-   no dependency on any JDK installation at runtime.
+1. **Two standard libraries, and the default one is the real JDK's.** This
+   decision has been reversed since it was first written, and the old wording
+   ("no `JAVA_HOME`, no `rt.jar`, no dependency on any JDK installation at
+   runtime") no longer describes the default build. CratonVM carries **two
+   complete implementations of the Java standard library**:
+
+   * **Real-JDK mode (the default).** Class bytecode is loaded from a detected
+     JDK — `$JAVA_HOME/jmods/java.base.jmod` or the `lib/modules` jimage, via
+     the jimage reader — and Rust supplies only the essential native surface
+     underneath it. `vm/Cargo.toml` states this outright: `synthetic-jdk` is
+     deliberately **not** in `default = [...]`, and its comment reads "The
+     default build boots against real JDK bytecode loaded from
+     `$JAVA_HOME/lib/modules`".
+   * **Synthetic mode.** The Rust stub library (the 3,100+ registrations
+     described under *Native Methods* below) stands in for `java.*`, so the VM
+     can run with no JDK on the machine. This is what makes the "runs
+     standalone" claim true — but it is the fallback, not the default. Note
+     also that its *full* surface is itself feature-gated: ~120
+     `#[cfg(feature = "synthetic-jdk")]` sites across the native crates are
+     compiled out of a default build, so `--synthetic-jdk` on a default binary
+     and a `--features synthetic-jdk` build are not the same standard library.
+
+   **How the mode is chosen matters.** The launcher path picks by *sniffing the
+   host*: `VmConfig::with_host_jdk_default` does
+   `cfg.use_synthetic_jdk = detect_real_jdk().is_none();`
+   (`vm/src/config.rs:503`). The same binary therefore boots a different
+   standard library on a developer laptop with a JDK installed than on a bare
+   container — which is exactly the kind of implicit, environment-dependent
+   behaviour that makes bug reports hard to reproduce. (Library callers via
+   `VmConfig::new` / `VmConfig::default` always start synthetic; `--java-home`
+   forces real-JDK boot; `--synthetic-jdk` forces synthetic and wins.) Making
+   the mode an explicit, stated choice rather than an autodetection is tracked
+   work — when reading this section, check `config.rs` for which it currently
+   is.
+
+   Practical consequence for anyone diagnosing a failure: **establish which
+   library the run used before anything else.** A missing real-JDK native and a
+   synthetic-stub gap produce indistinguishable stack traces, and a fix applied
+   to the wrong one changes nothing on the path that actually failed.
 
 2. **Two-layer exception model.** `MethodCallFailed::ExceptionThrown` wraps
    Java-catchable exceptions; `MethodCallFailed::InternalError` wraps VM
@@ -381,14 +473,65 @@ pointer.
    `types/src/value.rs`) should be read with that in mind.
 
 7. **Configuration is env-var-driven, and the surface is large.** There are
-   ~560 distinct `CRATONVM_*` identifiers across the workspace. Most are debug
-   or diagnostic gates, but a meaningful subset changes semantics
+   **593** distinct `CRATONVM_*` identifiers across the workspace crates and
+   ~695 bare `std::env::var` / `var_os` call sites (counted 2026-07-26).
+   `types/src/flags.rs` centralises 248 of those identifiers behind 9 reads and
+   `vm/src/runtime/env_cache.rs` another 39; the rest are scattered. Most are
+   debug or diagnostic gates, but a meaningful subset changes semantics
    (`CRATONVM_COMPACT_REF_FIELDS`, `CRATONVM_REAL_NET_SOCKETS`,
    `CRATONVM_REAL_FORKJOINPOOL`, `CRATONVM_JIT_GETFIELD_HELPER`,
    `CRATONVM_BG_COMPILE`, …). Most are cached in a `OnceLock` on first read, but
    not all — check before adding one to a hot path, and prefer extending
    `VmConfig` / `runtime::env_cache` over introducing a new bare
    `std::env::var` call.
+
+## How to tell whether a feature actually runs
+
+This repository has a chronic and well-evidenced failure mode: a capability
+lands behind a `CRATONVM_*` environment variable, the variable defaults to
+**off**, the work is recorded as "implemented", and the code never executes on
+the default path. The docs then describe a VM that nobody is running. Several
+of the corrections in the 2026-07-26 truth pass were instances of this; the
+pass itself is recorded in
+[`docs/internal/arch-2026-07-26/docs-truth-pass.md`](docs/internal/arch-2026-07-26/docs-truth-pass.md).
+
+**Confirmed instances** (all verifiable in the tree today):
+
+| Capability | Where the default lives | Status |
+|------------|-------------------------|--------|
+| `moving_young` | `types/src/flags.rs:619` | Opt-in, defaults false — the "default" GC does not compact. |
+| `allow_moving_young` | `types/src/flags.rs:620` | Opt-in, defaults false — second gate on the same path (`gc/src/gen_heap.rs:3770`). |
+| `use_compressed_oops` | `vm/src/config.rs:426` | Opt-in, defaults false. Fully wired (`vm/src/vm/vm_init.rs:874`) but never enabled on the default path — and the doc claimed for a while that it was *not* wired, which is the same failure mode in the opposite direction. |
+| `safepoint_reg_spill` | `jit/src/x64.rs:2650` | **Was** the canonical case: several call sites' own comments claimed a register spill as their protection, but that spill "only ran when the SEPARATE `CRATONVM_JIT_SAFEPOINT_REG_SPILL` env var was ALSO set — off by default, so the documented protection never actually happened." Now folded into default-on `precise_maps` and inverted to opt-**out** (`CRATONVM_NO_PRECISE_REG_SPILL`). This is the shape the fix should take. |
+| `precise_maps` register-spill half | `jit/src/x64.rs:2646-2662` | Same item; `precise_maps` was default-on since 2026-07-07 while its register-spill branch was not. A flag being on does not mean all of its branches are. |
+
+**Checklist — apply this before recording anything as "implemented":**
+
+1. **Find the default.** Look the flag up in `types/src/flags.rs` (or
+   `vm/src/runtime/env_cache.rs` / `vm/src/config.rs`). `present(src, "…")`
+   means *presence is truth* — the flag is **off** unless the variable exists.
+   Do not infer the default from the call site.
+2. **Check that the default path takes the new branch.** Read the condition
+   that guards it with the flag at its default value substituted in. If the
+   branch is unreachable that way, the capability does not ship.
+3. **Check for a second gate.** `moving_young` needed `allow_moving_young`
+   too; `precise_maps` needed `safepoint_reg_spill` too. One flag being on is
+   not evidence that a code path runs.
+4. **Check whether the old path was deleted or merely bypassed.** If the
+   previous implementation is still present and still reachable, the new one is
+   an alternative, not a replacement — and the old one is what most runs use.
+5. **State the default in the sentence.** Not "X is implemented" but "X is
+   implemented and is **on/off** by default (`FLAG_NAME`, `path/to/file.rs:NNN`)".
+   A doc sentence that does not name the default is not a claim that can be
+   checked.
+
+**Convention for new work:** a new capability should ship **opt-out**, never
+opt-in. Land it on by default with a named escape hatch for bisection
+(`CRATONVM_NO_<FEATURE>`), the way `precise_reg_spill_disabled` was rewritten.
+An opt-in flag is acceptable only as a temporary bring-up state, and it must be
+recorded as *not shipped* until it is inverted. Correspondingly, **any doc
+sentence describing a capability must name its default explicitly** — that is
+the single cheapest defence against this whole class of drift.
 
 ## Data Flow
 
