@@ -91,53 +91,414 @@ fn active_depth_get() -> usize {
 pub static ENTER_COUNT: AtomicUsize = AtomicUsize::new(0);
 pub static LEAVE_COUNT: AtomicUsize = AtomicUsize::new(0);
 
-/// Whether the **default moving / compacting young generation**
-/// (`CRATONVM_MOVING_YOUNG`) is enabled. Cached on first read.
+// ---------------------------------------------------------------------------
+// Moving / compacting young generation — the ONE gate
+// ---------------------------------------------------------------------------
+//
+// WHY THIS IS A PUBLISHED VALUE AND NOT JUST `gc_flags().moving_young`
+// (arch-2026-07-26 `moving-young-precise-roots`):
+//
+// The moving-young switch is consumed by three layers that cannot see each
+// other, and only ONE of them can physically make relocation safe:
+//
+//   * `cratonvm_jit::x64::moving_young_enabled()` — CODEGEN. Decides whether
+//     the shadow-stack push/reload sequences (the rewritable precise root map)
+//     are emitted at all, and whether `OopMapEntry::moving_young_coverage_
+//     complete` can ever be true. It still parses `CRATONVM_MOVING_YOUNG` from
+//     the environment ITSELF rather than reading `flags().gc.moving_young`.
+//   * `cratonvm_vm::jit::conservative_roots::moving_young_enabled()` — ROOT
+//     GATHERING. Decides whether the conservative JIT-frame scan is suppressed.
+//   * this function — COLLECTOR. Decides whether `gen_heap` relocates.
+//
+// Any skew where the COLLECTOR says "moving" while the CODEGEN says "no shadow
+// map" relocates objects whose only home is a JIT register/frame slot that
+// nothing will ever rewrite. That is not a risk of corruption, it is
+// corruption. Because the codegen still reads the raw variable, a default flip
+// in `cratonvm_types::flags` alone WOULD produce exactly that skew.
+//
+// Model: the codegen side is authoritative, and the VM PUBLISHES its answer
+// here via [`publish_moving_young_enabled`] — `collect_roots` is on the path of
+// every collection, so the collector can never decide to relocate against a
+// gate the codegen disagrees with. Before the first publish (a `cratonvm-gc`
+// process with no JIT at all: unit tests, embedders) this falls back to
+// `gc_flags().moving_young`, where there are no JIT frames and moving is
+// unconditionally safe.
+//
+// The interlock is deliberately kept even after the codegen migrates to
+// `flags()`: it is what makes the skew unrepresentable rather than merely
+// unlikely, and it costs one relaxed load per collection.
+
+const MOVING_YOUNG_UNPUBLISHED: u8 = 0;
+const MOVING_YOUNG_OFF: u8 = 1;
+const MOVING_YOUNG_ON: u8 = 2;
+
+#[cfg(not(test))]
+static MOVING_YOUNG_STATE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(MOVING_YOUNG_UNPUBLISHED);
+
+// Per-test isolation, mirroring `TEST_JIT_ACTIVE_DEPTH` above: the gc unit
+// tests run in parallel threads of one process, so a process-global gate would
+// make "publish on, collect, publish off" tests race each other.
+#[cfg(test)]
+thread_local! {
+    static MOVING_YOUNG_STATE: std::cell::Cell<u8> =
+        const { std::cell::Cell::new(MOVING_YOUNG_UNPUBLISHED) };
+}
+
+#[cfg(not(test))]
+#[inline]
+fn moving_young_state_get() -> u8 {
+    MOVING_YOUNG_STATE.load(Ordering::Acquire)
+}
+
+#[cfg(not(test))]
+#[inline]
+fn moving_young_state_set(v: u8) {
+    MOVING_YOUNG_STATE.store(v, Ordering::Release);
+}
+
+#[cfg(test)]
+#[inline]
+fn moving_young_state_get() -> u8 {
+    MOVING_YOUNG_STATE.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+#[inline]
+fn moving_young_state_set(v: u8) {
+    MOVING_YOUNG_STATE.with(|c| c.set(v));
+}
+
+/// Publish the authoritative (codegen-side) moving-young decision.
+///
+/// Called by the VM's root gatherer, which is on the path of every collection.
+/// Idempotent; a *changed* value is a bug (the codegen gate is a `OnceLock`)
+/// and is reported loudly rather than silently accepted.
+pub fn publish_moving_young_enabled(on: bool) {
+    let next = if on { MOVING_YOUNG_ON } else { MOVING_YOUNG_OFF };
+    let prev = moving_young_state_get();
+    if prev != MOVING_YOUNG_UNPUBLISHED && prev != next {
+        tracing::warn!(
+            "[moving-young] gate skew: collector previously observed on={}, codegen reports \
+             on={} — the collector now follows the codegen. This must never happen; it means \
+             a relocation decision was taken against a stale gate.",
+            prev == MOVING_YOUNG_ON,
+            on,
+        );
+    }
+    moving_young_state_set(next);
+}
+
+/// Whether the **moving / compacting young generation** is in effect.
 ///
 /// When on, `gen_heap::collect_garbage_inner` runs the moving (Cheney) young
 /// collection even while JIT frames are live (`is_active()`), instead of
-/// diverting to the non-moving sweep. Safe only because the JIT publishes a
+/// diverting to the non-moving sweep. Sound only because the JIT publishes a
 /// COMPLETE rewritable precise root map via the shadow stack and the
 /// conservative frame scan is suppressed (see the vm crate's
 /// `conservative_roots::moving_young_enabled` and
-/// `docs/feature-designs/default-moving-young-gen.md`). Off by default; gated for
-/// validation against the bt18 = 68332206 invariant.
+/// `docs/internal/arch-2026-07-26/moving-young-precise-roots.md`).
+///
+/// Reads what the VM published from the codegen gate; before the first publish
+/// it falls back to `gc_flags().moving_young`. Never an independent policy
+/// decision — see the module comment above.
 #[inline]
 pub fn moving_young_enabled() -> bool {
-    gc_flags().moving_young
+    match moving_young_state_get() {
+        MOVING_YOUNG_ON => true,
+        MOVING_YOUNG_OFF => false,
+        _ => gc_flags().moving_young,
+    }
 }
 
+// The per-cycle coverage verdict is process-global in production: it is
+// written by whichever thread proves an obligation unprovable (including the
+// STW initiator scanning FROZEN peers) and read by the collector, which may be
+// a different thread. Under `cfg(test)` it is thread-local for the same reason
+// `TEST_JIT_ACTIVE_DEPTH` is: gc unit tests run in parallel threads of one
+// process, and a global verdict would let one test's deliberate "incomplete"
+// divert another test's deliberate "complete" collection.
+#[cfg(not(test))]
 static MOVING_YOUNG_COVERAGE_INCOMPLETE: AtomicBool = AtomicBool::new(false);
+#[cfg(not(test))]
+static MOVING_YOUNG_INCOMPLETE_REASON: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+thread_local! {
+    static MOVING_YOUNG_COVERAGE_INCOMPLETE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    static MOVING_YOUNG_INCOMPLETE_REASON: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(not(test))]
+#[inline]
+fn coverage_incomplete_get() -> bool {
+    MOVING_YOUNG_COVERAGE_INCOMPLETE.load(Ordering::Acquire)
+}
+
+#[cfg(not(test))]
+#[inline]
+fn coverage_incomplete_set(v: bool) {
+    MOVING_YOUNG_COVERAGE_INCOMPLETE.store(v, Ordering::Release);
+}
+
+#[cfg(not(test))]
+#[inline]
+fn incomplete_reason_get() -> usize {
+    MOVING_YOUNG_INCOMPLETE_REASON.load(Ordering::Acquire)
+}
+
+#[cfg(not(test))]
+#[inline]
+fn incomplete_reason_set_if_unset(reason: usize) {
+    let _ = MOVING_YOUNG_INCOMPLETE_REASON.compare_exchange(
+        incomplete_reason::NONE,
+        reason,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    );
+}
+
+#[cfg(not(test))]
+#[inline]
+fn incomplete_reason_clear() {
+    MOVING_YOUNG_INCOMPLETE_REASON.store(incomplete_reason::NONE, Ordering::Release);
+}
+
+#[cfg(test)]
+#[inline]
+fn coverage_incomplete_get() -> bool {
+    MOVING_YOUNG_COVERAGE_INCOMPLETE.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+#[inline]
+fn coverage_incomplete_set(v: bool) {
+    MOVING_YOUNG_COVERAGE_INCOMPLETE.with(|c| c.set(v));
+}
+
+#[cfg(test)]
+#[inline]
+fn incomplete_reason_get() -> usize {
+    MOVING_YOUNG_INCOMPLETE_REASON.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+#[inline]
+fn incomplete_reason_set_if_unset(reason: usize) {
+    MOVING_YOUNG_INCOMPLETE_REASON.with(|c| {
+        if c.get() == incomplete_reason::NONE {
+            c.set(reason);
+        }
+    });
+}
+
+#[cfg(test)]
+#[inline]
+fn incomplete_reason_clear() {
+    MOVING_YOUNG_INCOMPLETE_REASON.with(|c| c.set(incomplete_reason::NONE));
+}
+
+// Diagnostic counters. Thread-local under `cfg(test)` for the same reason as
+// the verdict above: a unit test that asserts "this proven cycle recorded no
+// fallback" must not be raced by a parallel test that deliberately provokes one.
+#[cfg(not(test))]
 static MOVING_YOUNG_COVERAGE_FALLBACKS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(not(test))]
+static MOVING_YOUNG_CYCLES: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+thread_local! {
+    static MOVING_YOUNG_COVERAGE_FALLBACKS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+    static MOVING_YOUNG_CYCLES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(not(test))]
+#[inline]
+fn bump_fallbacks() -> usize {
+    MOVING_YOUNG_COVERAGE_FALLBACKS.fetch_add(1, Ordering::Relaxed) + 1
+}
+
+#[cfg(not(test))]
+#[inline]
+fn read_fallbacks() -> usize {
+    MOVING_YOUNG_COVERAGE_FALLBACKS.load(Ordering::Relaxed)
+}
+
+#[cfg(not(test))]
+#[inline]
+fn bump_moving_cycles() -> usize {
+    MOVING_YOUNG_CYCLES.fetch_add(1, Ordering::Relaxed) + 1
+}
+
+#[cfg(not(test))]
+#[inline]
+fn read_moving_cycles() -> usize {
+    MOVING_YOUNG_CYCLES.load(Ordering::Relaxed)
+}
+
+#[cfg(test)]
+#[inline]
+fn bump_fallbacks() -> usize {
+    MOVING_YOUNG_COVERAGE_FALLBACKS.with(|c| {
+        let n = c.get() + 1;
+        c.set(n);
+        n
+    })
+}
+
+#[cfg(test)]
+#[inline]
+fn read_fallbacks() -> usize {
+    MOVING_YOUNG_COVERAGE_FALLBACKS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+#[inline]
+fn bump_moving_cycles() -> usize {
+    MOVING_YOUNG_CYCLES.with(|c| {
+        let n = c.get() + 1;
+        c.set(n);
+        n
+    })
+}
+
+#[cfg(test)]
+#[inline]
+fn read_moving_cycles() -> usize {
+    MOVING_YOUNG_CYCLES.with(std::cell::Cell::get)
+}
+
+/// Why a moving-young cycle could not prove complete rewritable JIT coverage.
+///
+/// Carried as a plain code (no allocation, no lock) so it can be set from the
+/// STW root-scan hot path and read back by the collector for the warn-level
+/// fallback diagnostic. The numbering is stable; append new variants.
+pub mod incomplete_reason {
+    /// No incompleteness recorded this cycle.
+    pub const NONE: usize = 0;
+    /// A registered JIT entry carried no precise oop-map metadata at all.
+    pub const NO_PRECISE_MAP: usize = 1;
+    /// A live JIT frame did not publish its exact RBP, so no map can be located.
+    pub const MISSING_EXACT_RBP: usize = 2;
+    /// The active safepoint's oop map is not `moving_young_coverage_complete`.
+    pub const ACTIVE_FRAME_MAP: usize = 3;
+    /// A parent (RBP-chain) frame's map is not complete.
+    pub const PARENT_FRAME_MAP: usize = 4;
+    /// A JIT frame is on the native stack without a `JitEntryGuard` (A5).
+    pub const UNREGISTERED_JIT_FRAME: usize = 5;
+    /// An active OSR artifact cannot prove rewritable shadow coverage.
+    pub const OSR_SHADOW: usize = 6;
+    /// Another thread holds live JIT frames whose coverage this thread's scan
+    /// cannot verify and whose registers/stack are not rewritable.
+    pub const CROSS_THREAD_JIT_PEER: usize = 7;
+    /// A peer thread was OS-suspended in JIT code and scanned conservatively.
+    pub const XT_TAKEOVER: usize = 8;
+    /// A blocked peer's JIT helper window was scanned conservatively.
+    pub const XT_HELPER_WINDOW: usize = 9;
+
+    /// Human-readable label for a reason code (for the fallback diagnostic).
+    pub fn label(code: usize) -> &'static str {
+        match code {
+            NONE => "none",
+            NO_PRECISE_MAP => "jit-entry-without-precise-map",
+            MISSING_EXACT_RBP => "missing-exact-rbp",
+            ACTIVE_FRAME_MAP => "active-safepoint-map-incomplete",
+            PARENT_FRAME_MAP => "parent-frame-map-incomplete",
+            UNREGISTERED_JIT_FRAME => "unregistered-jit-frame-on-stack",
+            OSR_SHADOW => "osr-shadow-coverage-unproven",
+            CROSS_THREAD_JIT_PEER => "cross-thread-jit-peer",
+            XT_TAKEOVER => "xt-takeover-conservative-scan",
+            XT_HELPER_WINDOW => "xt-helper-window-conservative-scan",
+            _ => "unknown",
+        }
+    }
+}
 
 /// Start a new VM young-GC root-publication cycle. The VM calls this before
 /// mutators publish the snapshots that the collector will use for the cycle.
 pub fn begin_moving_young_coverage_cycle() {
-    MOVING_YOUNG_COVERAGE_INCOMPLETE.store(false, Ordering::Release);
+    coverage_incomplete_set(false);
+    incomplete_reason_clear();
 }
 
 /// Record that at least one live JIT frame in this collection lacks a complete
 /// moving-young coverage proof. The collector must use the non-moving sweep.
 pub fn mark_moving_young_coverage_incomplete() {
-    MOVING_YOUNG_COVERAGE_INCOMPLETE.store(true, Ordering::Release);
+    coverage_incomplete_set(true);
+}
+
+/// Same as [`mark_moving_young_coverage_incomplete`], but also records WHY, so
+/// the warn-level fallback diagnostic names the specific unproven obligation
+/// instead of just "incomplete". First reason of a cycle wins (it is the one
+/// that actually forced the decision; later ones are consequences).
+pub fn mark_moving_young_coverage_incomplete_because(reason: usize) {
+    incomplete_reason_set_if_unset(reason);
+    coverage_incomplete_set(true);
+}
+
+/// The first recorded reason this cycle's moving-young coverage was incomplete
+/// (see [`incomplete_reason`]).
+#[inline]
+pub fn moving_young_incomplete_reason() -> usize {
+    incomplete_reason_get()
 }
 
 /// Whether the current collection has observed an incomplete moving-young JIT
 /// frame/safepoint coverage proof.
 #[inline]
 pub fn moving_young_coverage_incomplete() -> bool {
-    MOVING_YOUNG_COVERAGE_INCOMPLETE.load(Ordering::Acquire)
+    coverage_incomplete_get()
 }
 
 /// Bump the diagnostic fallback counter and return the post-increment value.
+///
+/// **Emits at `warn` level, ON BY DEFAULT.** A silent regression to the
+/// non-moving sweep is precisely how the moving young generation stayed
+/// switched off while the architecture docs advertised it (see
+/// `docs/internal/arch-2026-07-26/moving-young-precise-roots.md`): the only
+/// signal was a `tracing::debug!` line reading "compaction deferred" and a
+/// counter behind `CRATONVM_MOVING_YOUNG_FALLBACKS`, which nobody set.
+/// Rate-limited (every occurrence up to 8, then powers of two) so a genuinely
+/// non-provable workload cannot flood the log, but the FIRST one is always
+/// visible; `gc_flags().moving_young_fallbacks` now asks for *all* of them
+/// rather than being what makes any of them appear.
 pub fn record_moving_young_coverage_fallback() -> usize {
-    MOVING_YOUNG_COVERAGE_FALLBACKS.fetch_add(1, Ordering::Relaxed) + 1
+    let n = bump_fallbacks();
+    if n <= 8 || n.is_power_of_two() || gc_flags().moving_young_fallbacks {
+        tracing::warn!(
+            "[moving-young] fallback #{n}: reason={} — a live JIT frame could not prove a \
+             complete rewritable root map, so this young collection runs the NON-MOVING \
+             sweep (no compaction, free-list allocation). Persistent fallbacks mean the \
+             young generation is not actually a copying collector.",
+            incomplete_reason::label(moving_young_incomplete_reason()),
+        );
+    }
+    n
 }
 
 /// Number of moving-young cycles diverted to the non-moving sweep because at
 /// least one live JIT frame did not have complete coverage.
 pub fn moving_young_coverage_fallback_count() -> usize {
-    MOVING_YOUNG_COVERAGE_FALLBACKS.load(Ordering::Relaxed)
+    read_fallbacks()
+}
+
+/// Record that a young collection actually ran the MOVING (Cheney) cycle while
+/// a JIT frame was live.
+///
+/// The counterpart to [`record_moving_young_coverage_fallback`]: together they
+/// make "is the young generation actually copying?" answerable at runtime
+/// instead of by reading the collector source.
+pub fn record_moving_young_cycle() -> usize {
+    bump_moving_cycles()
+}
+
+/// Number of young collections that ran the moving (Cheney) cycle under a live
+/// JIT frame.
+pub fn moving_young_cycle_count() -> usize {
+    read_moving_cycles()
 }
 
 /// Increment the global JIT-active counter. Called from the VM crate's
@@ -636,6 +997,65 @@ mod tests {
         let _ = enter();
         assert!(is_active());
         let _ = leave();
+    }
+
+    /// The collector must follow the value the codegen side publishes, not its
+    /// own read of `gc_flags()`. This interlock is what makes a default flip on
+    /// the codegen side safe — and what makes a flip of
+    /// `cratonvm_types::flags::DEFAULT_MOVING_YOUNG` *alone* harmless rather
+    /// than corrupting, while `jit/src/x64.rs` still parses the raw variable.
+    #[test]
+    fn published_gate_wins_over_the_flags_default() {
+        // Fresh test thread: unpublished, so the flags value applies.
+        assert_eq!(moving_young_enabled(), gc_flags().moving_young);
+        publish_moving_young_enabled(true);
+        assert!(
+            moving_young_enabled(),
+            "the collector must honour a codegen-published moving-young decision",
+        );
+        publish_moving_young_enabled(false);
+        assert!(
+            !moving_young_enabled(),
+            "and it must honour a codegen-published REFUSAL even if the typed \
+             config says moving-young is on — the codegen is the side that has \
+             to emit the rewritable root map",
+        );
+    }
+
+    #[test]
+    fn coverage_cycle_resets_verdict_and_reason() {
+        begin_moving_young_coverage_cycle();
+        assert!(!moving_young_coverage_incomplete());
+        assert_eq!(moving_young_incomplete_reason(), incomplete_reason::NONE);
+
+        mark_moving_young_coverage_incomplete_because(incomplete_reason::UNREGISTERED_JIT_FRAME);
+        assert!(moving_young_coverage_incomplete());
+        assert_eq!(
+            moving_young_incomplete_reason(),
+            incomplete_reason::UNREGISTERED_JIT_FRAME
+        );
+
+        // First reason of a cycle wins — later ones are consequences of it.
+        mark_moving_young_coverage_incomplete_because(incomplete_reason::XT_TAKEOVER);
+        assert_eq!(
+            moving_young_incomplete_reason(),
+            incomplete_reason::UNREGISTERED_JIT_FRAME
+        );
+
+        begin_moving_young_coverage_cycle();
+        assert!(!moving_young_coverage_incomplete());
+        assert_eq!(moving_young_incomplete_reason(), incomplete_reason::NONE);
+    }
+
+    #[test]
+    fn every_incomplete_reason_has_a_label() {
+        for code in incomplete_reason::NONE..=incomplete_reason::XT_HELPER_WINDOW {
+            assert_ne!(
+                incomplete_reason::label(code),
+                "unknown",
+                "reason code {code} needs a label for the warn-level fallback diagnostic",
+            );
+        }
     }
 
     #[test]
