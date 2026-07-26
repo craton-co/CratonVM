@@ -96,6 +96,290 @@ pub fn savebase_watch_caught() -> bool {
     SAVEBASE_WATCH_CAUGHT.load(Ordering::Relaxed)
 }
 
+// ── VM diagnostic snapshot ─────────────────────────────────────────────────
+//
+// A crash report that does not say *which* standard library, *which*
+// collector, and *whether* a JIT frame was live is not triageable. All three
+// facts are cheap to publish once at VM construction (or read live from
+// lock-free counters at report time) and each of them has already cost this
+// project multi-session debugging when it was missing:
+//
+//   * **JDK mode.** CratonVM ships two complete, materially different Java
+//     class libraries (~5,200 Rust stubs vs ~300 natives over real JDK
+//     bytecode). They have different semantics and different bugs. Until
+//     `docs/internal/arch-2026-07-26/jdk-mode-determinism.md` the mode was
+//     host-detected and printed nowhere; the launcher now prints it, but the
+//     hardware-fault path below does NOT go through the launcher's panic hook,
+//     so without this snapshot a SIGSEGV/access-violation report still carries
+//     no mode. (`jdk-mode-determinism.md` §6.1.)
+//   * **GC mode.** The default generational collector silently degrades its
+//     young generation to a NON-MOVING sweep whenever a live JIT frame cannot
+//     prove a complete rewritable root map. A heap-corruption report that does
+//     not say whether the last cycles compacted is nearly undiagnosable, and
+//     the degrade was invisible for a long time (see
+//     `docs/internal/arch-2026-07-26/moving-young-precise-roots.md`).
+//   * **JIT state.** Whether the faulting thread was inside compiled code,
+//     and whether an unregistered JIT frame was on the stack, separates a
+//     codegen bug from an interpreter/GC bug on the first read.
+//
+// Publication is one-shot and lock-free; every reader is either a `OnceLock`
+// load or a relaxed atomic load, so nothing here can deadlock a crash path
+// against a lock the faulting thread already held.
+
+/// [`ACTIVE_JDK_MODE_CODE`] sentinel: `publish_jdk_mode` has not run.
+pub const JDK_MODE_CODE_UNKNOWN: u8 = 0;
+/// [`ACTIVE_JDK_MODE_CODE`] sentinel: real JDK class files.
+pub const JDK_MODE_CODE_REAL: u8 = 1;
+/// [`ACTIVE_JDK_MODE_CODE`] sentinel: synthetic Rust class library.
+pub const JDK_MODE_CODE_SYNTHETIC: u8 = 2;
+
+/// Async-signal-safe encoding of the active JDK mode.
+///
+/// The Unix signal handler may not touch `OnceLock`, `String`, or the
+/// allocator (see the module doc), so the mode is *also* kept as a plain
+/// `AtomicU8` that the handler can turn into one of three `&'static [u8]`
+/// literals with no allocation and no locking.
+static ACTIVE_JDK_MODE_CODE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(JDK_MODE_CODE_UNKNOWN);
+
+/// The rich form of the active JDK mode, for the two allocating report paths
+/// (the Rust panic hook and the Windows vectored exception handler, both of
+/// which run in ordinary thread context).
+static ACTIVE_JDK_MODE: std::sync::OnceLock<(crate::config::JdkMode, Option<String>)> =
+    std::sync::OnceLock::new();
+
+/// The collector selected by `VmConfig::gc_algorithm`, as a stable identifier.
+static ACTIVE_GC_ALGORITHM: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+
+/// The primordial thread's published Java frame trace.
+///
+/// Shared (`Arc`) with `JvmThread::frame_trace`, which the interpreter
+/// republishes at every blocking/safepoint deposit point. Read with
+/// `try_lock` only: a crash may well have happened *while* the faulting
+/// thread held this mutex, and blocking there would turn a diagnosable crash
+/// into a hang.
+#[allow(clippy::type_complexity)]
+static PRIMORDIAL_FRAME_TRACE: std::sync::OnceLock<
+    std::sync::Arc<parking_lot::Mutex<Vec<cratonvm_native_api::StackTraceEntry>>>,
+> = std::sync::OnceLock::new();
+
+/// Publish the class library this process actually booted with.
+///
+/// Called once from `vm_init` (which owns the `VmConfig`). Idempotent — the
+/// first call wins, so a test fixture that builds several `SharedVm`s does not
+/// flip the reported mode underneath a later crash.
+pub fn publish_jdk_mode(mode: crate::config::JdkMode, java_home: Option<&str>) {
+    let code = match mode {
+        crate::config::JdkMode::Real => JDK_MODE_CODE_REAL,
+        crate::config::JdkMode::Synthetic => JDK_MODE_CODE_SYNTHETIC,
+    };
+    // First-write-wins on BOTH cells, or they can disagree: `OnceLock::set`
+    // already ignores a second publish, so an unconditional `store` here would
+    // let the signal-safe byte form report the *second* VM's mode while
+    // `jdk_mode_line()` reports the first one's. A crash report that
+    // contradicts itself about the class library is worse than one that omits
+    // it.
+    let _ = ACTIVE_JDK_MODE_CODE.compare_exchange(
+        JDK_MODE_CODE_UNKNOWN,
+        code,
+        Ordering::Relaxed,
+        Ordering::Relaxed,
+    );
+    let _ = ACTIVE_JDK_MODE.set((mode, java_home.map(str::to_owned)));
+}
+
+/// The published JDK mode, if `publish_jdk_mode` has run.
+pub fn active_jdk_mode() -> Option<crate::config::JdkMode> {
+    ACTIVE_JDK_MODE.get().map(|(m, _)| *m)
+}
+
+/// One-line "which class library is this" summary, mirroring the launcher's
+/// `active_jdk_mode_line()` in `vm-cli/src/main.rs`.
+pub fn jdk_mode_line() -> String {
+    match ACTIVE_JDK_MODE.get() {
+        Some((mode, Some(home))) => format!("jdk mode: {mode} (java.home={home})"),
+        Some((mode, None)) => format!("jdk mode: {mode}"),
+        None => "jdk mode: <not published — crashed before VM construction>".to_string(),
+    }
+}
+
+/// Async-signal-safe rendering of the JDK mode.
+///
+/// Returns a `&'static [u8]` chosen by a single relaxed atomic load — no
+/// allocation, no locking, no formatting machinery — so the Unix signal
+/// handler may call it. Keep it that way.
+pub fn jdk_mode_bytes() -> &'static [u8] {
+    match ACTIVE_JDK_MODE_CODE.load(Ordering::Relaxed) {
+        JDK_MODE_CODE_REAL => b"real-jdk",
+        JDK_MODE_CODE_SYNTHETIC => b"synthetic-jdk",
+        _ => b"<unpublished>",
+    }
+}
+
+/// Publish the selected collector. Called once from `vm_init`.
+pub fn publish_gc_algorithm(name: &'static str) {
+    let _ = ACTIVE_GC_ALGORITHM.set(name);
+}
+
+/// Publish the primordial thread's frame-trace handle. Called once from
+/// `Vm::new`, alongside the equivalent `ThreadRegistry::set_frame_trace`.
+pub fn publish_primordial_frame_trace(
+    trace: std::sync::Arc<parking_lot::Mutex<Vec<cratonvm_native_api::StackTraceEntry>>>,
+) {
+    let _ = PRIMORDIAL_FRAME_TRACE.set(trace);
+}
+
+/// Collector identity plus the *actual* moving/non-moving verdict of the
+/// young generation.
+///
+/// `moving_young_enabled()` is the configured policy; the two counters are
+/// what really happened. A report showing `policy=moving` with a nonzero
+/// fallback count means the young generation was NOT a copying collector for
+/// those cycles — which is exactly the state a heap-corruption or
+/// stale-`ObjectRef` bug needs to be read against.
+pub fn gc_state_lines() -> Vec<String> {
+    use cratonvm_gc::gc_quiescence as q;
+
+    let collector = ACTIVE_GC_ALGORITHM
+        .get()
+        .copied()
+        .unwrap_or("<unpublished>");
+    let moving_cycles = q::moving_young_cycle_count();
+    let fallbacks = q::moving_young_coverage_fallback_count();
+    let policy = if q::moving_young_enabled() {
+        "moving (Cheney young copy)"
+    } else {
+        "non-moving (STW mark-sweep young)"
+    };
+
+    let mut lines = vec![
+        format!("gc collector: {collector}"),
+        format!("gc young-gen policy: {policy}"),
+        format!(
+            "gc young-gen actual: {moving_cycles} moving cycle(s), \
+             {fallbacks} cycle(s) diverted to the NON-MOVING sweep"
+        ),
+    ];
+    if fallbacks > 0 || q::moving_young_coverage_incomplete() {
+        lines.push(format!(
+            "gc young-gen last incomplete-coverage reason: {}",
+            q::incomplete_reason::label(q::moving_young_incomplete_reason())
+        ));
+    }
+    // Both flags below are thread-local and cleared at the start of every
+    // root-gathering pass, so what they report is *this* (faulting) thread's
+    // verdict for the most recent pass — which is the one that matters when
+    // the fault is a stale/relocated reference.
+    if q::force_non_moving_jit_roots() {
+        lines.push(
+            "gc young-gen: force-non-moving-jit-roots is ARMED on the faulting thread \
+             (a live JIT frame pinned the last cycle to the non-moving sweep)"
+                .to_string(),
+        );
+    }
+    if q::unregistered_jit_frame_on_stack() {
+        lines.push(
+            "gc young-gen: the faulting thread had an UNREGISTERED JIT frame on its \
+             native stack in the last root-gathering pass (no precise root map for it)"
+                .to_string(),
+        );
+    }
+    lines
+}
+
+/// JIT state at the moment of the crash.
+///
+/// `fault_pc` is the faulting instruction pointer when the caller has one (the
+/// hardware-fault path); the panic path passes `None`.
+///
+/// The quiescence depth is a *process-wide* counter of guarded JIT entries
+/// (`JitEntryGuard`), not a per-thread one — the label says so, because
+/// "depth=3" would otherwise read as three compiled frames under the faulting
+/// thread.
+pub fn jit_state_lines(fault_pc: Option<usize>) -> Vec<String> {
+    use cratonvm_gc::gc_quiescence as q;
+
+    let depth = q::depth();
+    let mut lines = vec![
+        format!(
+            "jit: guarded compiled frames live process-wide: {} (quiescence depth={depth})",
+            if q::is_active() { "YES" } else { "no" }
+        ),
+        format!(
+            "jit: {} compiled code range(s), cache generation {}",
+            cratonvm_jit::jit_code_range_count(),
+            cratonvm_jit::jit_code_ranges_generation()
+        ),
+    ];
+    if let Some(pc) = fault_pc {
+        match cratonvm_jit::lookup_jit_method_name(pc) {
+            Some(name) => lines.push(format!("jit: faulting pc is inside compiled method {name}")),
+            None if !cratonvm_jit::jit_names_enabled() => lines.push(
+                "jit: faulting pc not attributed to a compiled method \
+                 (JIT method names are off; re-run with CRATONVM_DBG_JIT_NAMES=1)"
+                    .to_string(),
+            ),
+            None => {
+                lines.push("jit: faulting pc is not inside any compiled code range".to_string())
+            }
+        }
+    }
+    lines
+}
+
+/// The primordial thread's last published Java frames.
+///
+/// This is a *deposit-point* snapshot, not a live walk: the interpreter
+/// republishes it whenever the thread blocks or reaches a safepoint deposit,
+/// so for a thread stuck in a native/blocking call it is exact, and for a
+/// thread crashing in the middle of a hot bytecode loop it is the last known
+/// good position. The report says so rather than implying it is live.
+///
+/// Never blocks: `try_lock` failure is reported, not waited on.
+pub fn java_stack_lines(max_frames: usize) -> Vec<String> {
+    let Some(trace) = PRIMORDIAL_FRAME_TRACE.get() else {
+        return vec![
+            "Java frames: <not published — crashed before the primordial thread was registered>"
+                .to_string(),
+        ];
+    };
+    let Some(frames) = trace.try_lock() else {
+        return vec![
+            "Java frames: <frame-trace mutex was held at crash time; not waiting on it>"
+                .to_string(),
+        ];
+    };
+    if frames.is_empty() {
+        return vec!["Java frames (primordial thread): <none published yet>".to_string()];
+    }
+    let mut lines = vec![format!(
+        "Java frames (primordial thread, {} frame(s), published at the last \
+         blocking/safepoint deposit — may lag the faulting instruction):",
+        frames.len()
+    )];
+    for entry in frames.iter().take(max_frames) {
+        let source = entry.source_file.as_deref().unwrap_or("<unknown>");
+        lines.push(format!(
+            "  at {}.{}({}:{})",
+            entry.class_name, entry.method_name, source, entry.line_number
+        ));
+    }
+    if frames.len() > max_frames {
+        lines.push(format!("  ... ({} more)", frames.len() - max_frames));
+    }
+    lines
+}
+
+/// The full VM-state block every crash path emits: JDK mode, GC mode, JIT
+/// state, and the primordial thread's Java frames.
+pub fn vm_diagnostic_lines(fault_pc: Option<usize>) -> Vec<String> {
+    let mut lines = vec![jdk_mode_line()];
+    lines.extend(gc_state_lines());
+    lines.extend(jit_state_lines(fault_pc));
+    lines.extend(java_stack_lines(64));
+    lines
+}
+
 // ── CrashInfo ──────────────────────────────────────────────────────────────
 
 /// Captures the essential facts about a crash / fatal signal.
@@ -181,9 +465,22 @@ impl<'a> CrashReport<'a> {
         let mut buf = String::with_capacity(4096);
         self.write_header(&mut buf);
         self.write_thread_section(&mut buf);
+        self.write_vm_section(&mut buf);
         self.write_process_section(&mut buf);
         self.write_system_section(&mut buf);
         buf
+    }
+
+    /// Which class library, which collector, and whether the JIT was live —
+    /// the three facts that decide how the rest of the report is read.
+    /// See the `VM diagnostic snapshot` section above for why each is here.
+    fn write_vm_section(&self, buf: &mut String) {
+        let _ = writeln!(buf, "---------------  V M  S T A T E  ---------------");
+        let _ = writeln!(buf);
+        for line in vm_diagnostic_lines(None) {
+            let _ = writeln!(buf, "{}", line);
+        }
+        let _ = writeln!(buf);
     }
 
     fn write_header(&self, buf: &mut String) {
@@ -214,6 +511,10 @@ impl<'a> CrashReport<'a> {
         }
         let _ = writeln!(buf, "#");
         let _ = writeln!(buf, "# JRE version: CratonVM 25.0");
+        // The class library goes in the HEADER, not just the VM section: it is
+        // the first thing a triager needs and the first thing a truncated
+        // report loses. See `jdk-mode-determinism.md`.
+        let _ = writeln!(buf, "# {}", jdk_mode_line());
 
         // Rust compiler version (baked in at build time).
         let _ = writeln!(buf, "# Rust version: {}", rust_version());
@@ -776,6 +1077,17 @@ mod windows_fault {
         }
         if let Some(name) = cratonvm_jit::lookup_jit_method_name(fault_addr) {
             let _ = writeln!(report, "#  faulting JIT method: {}", name);
+        }
+        // jdk-mode-determinism.md §6.1: this VEH is the ONE crash path that
+        // bypasses the launcher's panic hook, so without these lines a
+        // hardware-fault report names neither the class library, nor the
+        // collector, nor whether the JIT was live — and none of those can be
+        // reconstructed after the fact. Every reader here is a `OnceLock` load,
+        // a relaxed atomic load, or a `try_lock`, so nothing below can block on
+        // a lock the faulting thread was already holding.
+        let _ = writeln!(report, "#");
+        for line in super::vm_diagnostic_lines(Some(fault_addr)) {
+            let _ = writeln!(report, "#  {}", line);
         }
         let _ = writeln!(report, "#");
         let _ = writeln!(report, "Native frames (most recent call first) [raw]:");
@@ -1480,6 +1792,12 @@ fn install_signal_handlers() {
     const TID_LBL: &[u8] = b", tid=";
     const NL_REPORT: &[u8] = b"\n#  Error report saved to: ";
     const FOOTER: &[u8] = b"\n#\n";
+    // The class library is the single most load-bearing fact in a CratonVM
+    // bug report (two complete, differently-buggy standard libraries — see the
+    // `VM diagnostic snapshot` section). `jdk_mode_bytes()` is a relaxed
+    // atomic load returning a `&'static [u8]`, which keeps this path
+    // async-signal-safe: no allocation, no lock, no formatting.
+    const JDK_MODE_LBL: &[u8] = b"\n#  jdk mode: ";
     const FILE_PREFIX: &[u8] = b"hs_err_pid";
     const FILE_SUFFIX: &[u8] = b".log";
 
@@ -1548,6 +1866,8 @@ fn install_signal_handlers() {
         async_signal_safe::write_all(async_signal_safe::STDERR_FD, &pid_buf[..pid_len]);
         async_signal_safe::write_all(async_signal_safe::STDERR_FD, TID_LBL);
         async_signal_safe::write_all(async_signal_safe::STDERR_FD, &tid_buf[..tid_len]);
+        async_signal_safe::write_all(async_signal_safe::STDERR_FD, JDK_MODE_LBL);
+        async_signal_safe::write_all(async_signal_safe::STDERR_FD, jdk_mode_bytes());
         async_signal_safe::write_all(async_signal_safe::STDERR_FD, NL_REPORT);
         // Write filename without the trailing NUL.
         async_signal_safe::write_all(async_signal_safe::STDERR_FD, &filename[..fpos]);
@@ -1568,6 +1888,8 @@ fn install_signal_handlers() {
             async_signal_safe::write_all(fd, &pid_buf[..pid_len]);
             async_signal_safe::write_all(fd, b"\n# tid=");
             async_signal_safe::write_all(fd, &tid_buf[..tid_len]);
+            async_signal_safe::write_all(fd, b"\n# jdk mode: ");
+            async_signal_safe::write_all(fd, jdk_mode_bytes());
             async_signal_safe::write_all(
                 fd,
                 b"\n# (truncated: full report requires allocator, unsafe in \
@@ -1949,11 +2271,22 @@ fn get_memory_info_windows() -> String {
     }
 }
 
-/// Return a summary of the VM state (version, uptime hint).
+/// Return a summary of the VM state (version + the published class library).
+///
+/// We still hold no reference to the live `Vm` — crash handlers must be
+/// self-contained and must not take VM locks — but the two facts that used to
+/// be reported as "unavailable" (which class library, which collector) are
+/// published lock-free at VM construction, so there is no reason to omit them.
+/// The detailed per-collector counters live in the `V M  S T A T E` section.
 pub fn get_vm_state() -> String {
-    // We do not have a static reference to the VM here (crash handlers
-    // must be self-contained), so report what we can.
-    format!("CratonVM 25.0 (crash state — detailed VM info unavailable)")
+    format!(
+        "CratonVM 25.0 ({}, gc={})",
+        String::from_utf8_lossy(jdk_mode_bytes()),
+        ACTIVE_GC_ALGORITHM
+            .get()
+            .copied()
+            .unwrap_or("<unpublished>"),
+    )
 }
 
 /// Get heap information if available.
@@ -2243,5 +2576,139 @@ mod tests {
         // -1 is never a valid fd; `write` returns EBADF, which is not EINTR,
         // so the loop must give up immediately.
         write_all(-1, b"this should not hang");
+    }
+
+    // ── VM diagnostic snapshot ─────────────────────────────────────────────
+    //
+    // The publication cells are process-global `OnceLock`s / atomics, so these
+    // tests are written to be order-independent: they assert invariants that
+    // hold whether or not some earlier test in the same binary already
+    // published a mode. `publish_and_report_are_consistent` does the one
+    // publish and then pins every consumer against it.
+
+    #[test]
+    fn jdk_mode_bytes_is_one_of_three_static_literals() {
+        // Must never allocate and never panic, at any publication state — the
+        // Unix signal handler calls it.
+        let b = jdk_mode_bytes();
+        assert!(
+            b == b"real-jdk" || b == b"synthetic-jdk" || b == b"<unpublished>",
+            "unexpected jdk_mode_bytes(): {:?}",
+            String::from_utf8_lossy(b)
+        );
+    }
+
+    #[test]
+    fn jdk_mode_line_never_silently_omits_the_mode() {
+        // Either it names a mode, or it says out loud that it could not — the
+        // one thing it must never do is render an empty/ambiguous string, which
+        // is what the pre-change hardware-fault report effectively did.
+        let line = jdk_mode_line();
+        assert!(line.starts_with("jdk mode: "), "got {line:?}");
+        assert!(line.len() > "jdk mode: ".len(), "got {line:?}");
+    }
+
+    #[test]
+    fn publish_and_report_are_consistent() {
+        // First-write-wins, so whichever test/VM published first owns the
+        // value; publishing again must not change it and must not make the
+        // byte form disagree with the rich form.
+        publish_jdk_mode(crate::config::JdkMode::Synthetic, Some("/nonexistent/jdk"));
+        publish_jdk_mode(crate::config::JdkMode::Real, None);
+
+        let mode = active_jdk_mode().expect("a mode is published by now");
+        let expected: &[u8] = match mode {
+            crate::config::JdkMode::Real => b"real-jdk",
+            crate::config::JdkMode::Synthetic => b"synthetic-jdk",
+        };
+        assert_eq!(
+            jdk_mode_bytes(),
+            expected,
+            "signal-safe byte form disagrees with the OnceLock form"
+        );
+        assert!(
+            jdk_mode_line().contains(mode.as_str()),
+            "jdk_mode_line() must name the published mode"
+        );
+    }
+
+    #[test]
+    fn gc_state_lines_report_collector_and_the_moving_verdict() {
+        let lines = gc_state_lines();
+        let joined = lines.join("\n");
+        assert!(joined.contains("gc collector:"), "{joined}");
+        // The policy/actual split is the whole point: a report that only said
+        // "generational" would not distinguish a compacting young generation
+        // from one permanently diverted to the non-moving sweep.
+        assert!(joined.contains("gc young-gen policy:"), "{joined}");
+        assert!(joined.contains("gc young-gen actual:"), "{joined}");
+        assert!(
+            joined.contains("moving cycle(s)") && joined.contains("NON-MOVING sweep"),
+            "the actual line must carry both counters: {joined}"
+        );
+    }
+
+    #[test]
+    fn jit_state_lines_attribute_a_faulting_pc() {
+        // No `fault_pc`: the pc-attribution line must be absent rather than
+        // fabricated.
+        let without = jit_state_lines(None).join("\n");
+        assert!(without.contains("guarded compiled frames live process-wide:"));
+        assert!(!without.contains("faulting pc"), "{without}");
+
+        // With a pc that is certainly not in any compiled code range, the
+        // report must say so explicitly (or explain that names are off) rather
+        // than staying silent.
+        let with = jit_state_lines(Some(1)).join("\n");
+        assert!(with.contains("faulting pc"), "{with}");
+    }
+
+    #[test]
+    fn java_stack_lines_never_block_and_always_explain_themselves() {
+        // Unpublished, empty, or contended — every branch must produce a line
+        // that says which case it is. A crash report with a silently missing
+        // Java stack is indistinguishable from one with no Java frames.
+        let lines = java_stack_lines(8);
+        assert!(!lines.is_empty());
+        assert!(lines[0].starts_with("Java frames"), "got {:?}", lines[0]);
+    }
+
+    #[test]
+    fn crash_report_carries_the_vm_state_section() {
+        let info = sample_crash_info();
+        let report = generate_crash_report(&info);
+        assert!(report.contains("V M  S T A T E"), "{report}");
+        assert!(report.contains("jdk mode: "), "{report}");
+        assert!(report.contains("gc collector: "), "{report}");
+        assert!(report.contains("jit: "), "{report}");
+        assert!(report.contains("Java frames"), "{report}");
+    }
+
+    #[test]
+    fn crash_report_header_names_the_class_library() {
+        // Truncated reports lose the tail first, so the mode is duplicated into
+        // the header. Guard the duplication so a future refactor cannot quietly
+        // drop it back to the VM section only.
+        let info = sample_crash_info();
+        let report = generate_crash_report(&info);
+        let header_end = report
+            .find("---------------  T H R E A D")
+            .expect("thread section marker");
+        assert!(
+            report[..header_end].contains("jdk mode: "),
+            "header must name the class library: {}",
+            &report[..header_end]
+        );
+    }
+
+    #[test]
+    fn vm_state_summary_reports_mode_and_collector() {
+        let s = get_vm_state();
+        assert!(s.starts_with("CratonVM 25.0 ("), "{s}");
+        assert!(s.contains("gc="), "{s}");
+        assert!(
+            !s.contains("detailed VM info unavailable"),
+            "the mode and collector are published lock-free; they are available: {s}"
+        );
     }
 }
