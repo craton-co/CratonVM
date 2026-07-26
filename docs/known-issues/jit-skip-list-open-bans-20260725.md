@@ -407,3 +407,11 @@ staleness trap mid-investigation -- verifying a skip_list.rs change via
 `cargo test` alone does NOT rebuild the separate `cratonvm` executable.
 Always `cargo build --release` + check the binary's mtime before trusting
 a still crashes/now passes result against a real repro.
+
+## SPRING-HAZELCAST-XERCES-JIT.1 — CLAIMED 2026-07-26 11:26 UTC
+
+Branch `fix/jit-ban-sweep-20260725`. `com/sun/org/apache/xerces/internal/`
+(JDK-internal bundled Xerces) banned, skip_list.rs ~L1140-1152.
+SchemaGrammar's SymbolHash corrupted under JIT during XSD schema
+validation, NPE in getGlobalTypeDecl. Fully standalone (javax.xml.validation
++ a simple XSD, no external deps) -- building a stress repro.
