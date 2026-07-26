@@ -1256,6 +1256,37 @@ pub struct G1Collector {
     /// clean collection so healthy workloads keep the larger eden.
     needs_gc_free_percent: AtomicUsize,
 
+    /// Native-allocation pressure latch — G1's half of the "the allocation
+    /// wrappers cannot collect, so the next `safe_native_call` boundary does
+    /// it for them" protocol. The generational half is
+    /// [`crate::gen_heap::GenerationalHeap::young_spill_pressure`]; the shared
+    /// consumer is `vm_exec::safe_native_call_impl`, the one point on the
+    /// native-dispatch path where every Java argument is pinned in
+    /// `native_pin_roots` and remapped afterwards, so an orchestrated moving
+    /// collection is safe there.
+    ///
+    /// Latched whenever a NEW region is claimed for Eden (from
+    /// [`Self::alloc_in_region`] or [`Self::refill_tlab`]) and the remaining
+    /// Free pool has fallen below the `needs_gc` threshold; cleared by the
+    /// consumer and at the end of every collection.
+    ///
+    /// Why this exists: the interpreter's `maybe_gc()` — the only thing that
+    /// ever asks G1 to collect during normal execution — is polled from the
+    /// bytecode allocation instructions (`new`/`newarray`/`anewarray`/
+    /// `multianewarray`) alone. A hot loop whose body allocates only from
+    /// INSIDE native methods (no allocation bytecode of its own — e.g.
+    /// `AsynchronousFileChannel.read`, whose `Integer` box is allocated on the
+    /// Rust side by `afc_box_integer`) therefore runs for millions of
+    /// iterations with ZERO safepoint checks. Eden grows to 100% of the heap
+    /// and the infallible [`GarbageCollector::alloc_object`] entry point —
+    /// which has no way to report failure and so cannot retry after a GC —
+    /// aborts the process with "out of heap space" while the heap is almost
+    /// entirely garbage. The generational collector hides the same gap behind
+    /// its young→old spill fallback (`gen_heap::alloc_object`); G1 has no
+    /// equivalent, so it aborted outright. See
+    /// `docs/internal/fixed-suite-bugs/g1-native-alloc-no-safepoint-oom-FIXED.md`.
+    native_alloc_pressure: AtomicBool,
+
     /// Per-region `(reuse_epoch, cursor, region_type)` snapshot captured at
     /// concurrent-mark start (`start_concurrent_mark`, under the `regions`
     /// lock). The TAMS equivalent: `cleanup` treats every byte allocated
@@ -1542,6 +1573,7 @@ impl G1Collector {
             current_eden: AtomicUsize::new(usize::MAX), // no eden yet
             next_hash_code: AtomicI32::new(1),
             needs_gc_free_percent: AtomicUsize::new(25),
+            native_alloc_pressure: AtomicBool::new(false),
             mark_start_snapshot: Mutex::new(Vec::new()),
             gc_state: Arc::new(ConcurrentGcState::new()),
             satb_queue: Arc::new(SatbQueue::new()),
@@ -1626,6 +1658,60 @@ impl G1Collector {
     // Allocation
     // -----------------------------------------------------------------------
 
+    /// Count the Free regions left and latch [`Self::native_alloc_pressure`]
+    /// when the pool has dropped below the `needs_gc` threshold.
+    ///
+    /// Called ONLY when a new region is consumed — once per `region_size`
+    /// bytes of allocation, never per object — so the O(num_regions) count is
+    /// amortized away. `regions` must already be locked by the caller.
+    fn note_region_consumed_locked(&self, regions: &[G1Region]) {
+        let free = regions
+            .iter()
+            .filter(|r| r.region_type == RegionType::Free)
+            .count();
+        let pct = self.needs_gc_free_percent.load(Ordering::Relaxed).max(1);
+        if free * 100 < regions.len() * pct {
+            self.native_alloc_pressure.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Native-allocation pressure signal — see the field doc. Consumed at the
+    /// `safe_native_call` boundary via `VmHeap::young_spill_pressure`.
+    #[inline]
+    pub fn native_alloc_pressure(&self) -> bool {
+        self.native_alloc_pressure.load(Ordering::Relaxed)
+    }
+
+    /// Clear the native-allocation pressure latch.
+    #[inline]
+    pub fn clear_native_alloc_pressure(&self) {
+        self.native_alloc_pressure.store(false, Ordering::Relaxed);
+    }
+
+    /// Latch the native-allocation pressure signal from outside the collector
+    /// (the `VmHeap::note_young_spill_pressure` funnel used by allocation
+    /// wrappers that spilled and cannot collect themselves).
+    #[inline]
+    pub fn note_native_alloc_pressure(&self) {
+        self.native_alloc_pressure.store(true, Ordering::Relaxed);
+    }
+
+    /// Free regions held back from *speculative bulk* TLAB refills once the
+    /// pool runs low, so the last of the heap serves real object allocations
+    /// (which cannot be deferred) instead of TLAB tails that may never be
+    /// used. Defense-in-depth for the native-alloc safepoint gap: it widens
+    /// the window in which the `safe_native_call` boundary GC can still fire
+    /// before the infallible allocator is cornered. `refill_tlab` returning
+    /// `None` is an already-handled path (the caller falls back to per-object
+    /// allocation), so this can never wedge allocation.
+    fn tlab_reserve_regions(&self, total_regions: usize) -> usize {
+        // Capped at an eighth of the heap so a very small heap (the unit
+        // tests' 2-region collectors, an embedded `-Xmx4m`) is never starved
+        // of TLABs by its own reserve — at 8 regions or fewer the cap decides,
+        // and below 8 regions the reserve is zero (previous behaviour).
+        (total_regions / 64).max(2).min(total_regions / 8)
+    }
+
     /// Bump-allocate `size` bytes in the current Eden region.
     /// Returns `(pointer, region_index)` or `None` on failure.
     pub fn alloc_in_region(&self, size: usize) -> Option<(*mut u8, usize)> {
@@ -1634,7 +1720,13 @@ impl G1Collector {
 
         // Humongous check
         if size > region_size / 2 {
-            return self.alloc_humongous_locked(&mut regions, size);
+            let result = self.alloc_humongous_locked(&mut regions, size);
+            if result.is_some() {
+                // A humongous span consumes several regions at once — always
+                // the largest single bite out of the Free pool.
+                self.note_region_consumed_locked(&regions);
+            }
+            return result;
         }
 
         // Try current Eden region
@@ -1650,6 +1742,7 @@ impl G1Collector {
             regions[idx].region_type = RegionType::Eden;
             self.current_eden.store(idx, Ordering::Relaxed);
             if let Some(result) = regions[idx].bump_alloc(size, 8) {
+                self.note_region_consumed_locked(&regions);
                 return Some((result.0, idx));
             }
         }
@@ -6443,7 +6536,25 @@ impl G1Collector {
             }
         }
 
-        // Find a new free region for Eden and carve TLAB from it
+        // Find a new free region for Eden and carve TLAB from it.
+        //
+        // Emergency reserve: a TLAB refill is a *speculative bulk* claim (the
+        // thread may retire the chunk with most of it unused), so once the
+        // Free pool is down to the reserve, stop serving refills and leave
+        // those regions to the per-object allocator — which, unlike this one,
+        // has callers that cannot be told "no" (`GarbageCollector::
+        // alloc_object` aborts the process). See `tlab_reserve_regions`.
+        let free_count = regions
+            .iter()
+            .filter(|r| r.region_type == RegionType::Free)
+            .count();
+        if free_count <= self.tlab_reserve_regions(regions.len()) {
+            // Latch the pressure signal on the way out: the workload is
+            // allocating hard enough to exhaust the pool and something must
+            // ask for a collection.
+            self.native_alloc_pressure.store(true, Ordering::Relaxed);
+            return None;
+        }
         if let Some(idx) = find_free_region(&regions) {
             regions[idx].region_type = RegionType::Eden;
             self.current_eden.store(idx, Ordering::Relaxed);
@@ -6451,6 +6562,7 @@ impl G1Collector {
             if remaining >= 256 {
                 let actual = requested_size.min(remaining);
                 if let Some((ptr, _off)) = regions[idx].bump_alloc(actual, 8) {
+                    self.note_region_consumed_locked(&regions);
                     return Some((ptr, actual));
                 }
             }
@@ -7057,7 +7169,12 @@ impl GarbageCollector for G1Collector {
                 );
             }
             eprintln!(
-                "FATAL: G1: out of heap space for object allocation ({} bytes)",
+                "FATAL: G1: out of heap space for object allocation ({} bytes) \
+                 -- every region consumed with no collection able to run. This \
+                 entry point cannot report failure (see `native_alloc_pressure`), \
+                 so the pressure latch is supposed to have forced a collection at \
+                 the preceding `safe_native_call` boundary; re-run with \
+                 CRATONVM_DBG_G1DIAG=1 to see the region census per collection.",
                 total_size
             );
             std::process::abort();
@@ -7092,7 +7209,9 @@ impl GarbageCollector for G1Collector {
         let total_size = HEADER_SIZE + data_size;
         let (ptr, _region) = self.alloc_in_region(total_size).unwrap_or_else(|| {
             eprintln!(
-                "FATAL: G1: out of heap space for array allocation ({} bytes)",
+                "FATAL: G1: out of heap space for array allocation ({} bytes) \
+                 -- see the object-allocation abort above for the invariant \
+                 this encodes (`native_alloc_pressure`).",
                 total_size
             );
             std::process::abort();
@@ -7643,6 +7762,12 @@ impl GarbageCollector for G1Collector {
         if pause_ms > 0 {
             self.update_ihop(pause_ms);
         }
+
+        // 4. The Free pool has just been rebuilt, so any outstanding
+        //    native-allocation pressure request has been served. Clear the
+        //    latch; the next region claim re-latches it if the workload is
+        //    still outrunning the collector (see `native_alloc_pressure`).
+        self.native_alloc_pressure.store(false, Ordering::Relaxed);
 
         result
     }
@@ -10014,6 +10139,139 @@ mod tests {
             "a resurrected finalizable's region must survive this cycle's cleanup"
         );
         assert!(regions[d_region].live_bytes > 0);
+    }
+
+    // -- Native-allocation pressure latch --
+    // (docs/internal/fixed-suite-bugs/g1-native-alloc-no-safepoint-oom-FIXED.md)
+
+    /// Fill the first `count` regions so they read as fully-consumed Eden,
+    /// leaving `num_regions - count` Free. Mirrors what a running mutator
+    /// would have done, without allocating megabytes in a unit test.
+    fn consume_regions(gc: &G1Collector, count: usize) {
+        let full = gc.config.region_size;
+        let mut regions = gc.regions.lock();
+        for r in regions.iter_mut().take(count) {
+            r.region_type = RegionType::Eden;
+            r.cursor = full;
+        }
+    }
+
+    fn free_region_count(gc: &G1Collector) -> usize {
+        gc.regions
+            .lock()
+            .iter()
+            .filter(|r| r.region_type == RegionType::Free)
+            .count()
+    }
+
+    /// The latch must stay clear while the Free pool is comfortable and arm
+    /// the moment a newly-claimed Eden region takes it under the `needs_gc`
+    /// threshold — the signal `safe_native_call` consumes to run the
+    /// collection a native allocation wrapper cannot run itself.
+    #[test]
+    fn native_alloc_pressure_arms_only_once_the_free_pool_falls_below_the_gc_threshold() {
+        let gc = make_collector(); // 8 regions x 1 MiB, threshold 25% => 2
+        assert!(
+            !gc.native_alloc_pressure(),
+            "a fresh collector must not report native-alloc pressure"
+        );
+
+        // 3 consumed, 5 Free. Allocating claims a 4th => 4 Free = 50%, well
+        // above the 25% bar: the latch must stay clear.
+        consume_regions(&gc, 3);
+        let _ = GarbageCollector::alloc_object(&gc, ClassId::new(1), 1);
+        assert_eq!(free_region_count(&gc), 4);
+        assert!(
+            !gc.native_alloc_pressure(),
+            "the latch must not arm while the Free pool is still above the \
+             needs_gc threshold (a comfortable heap must not pay for a GC at \
+             every native call)"
+        );
+
+        // Consume everything but one Free region, current Eden included, so
+        // the next allocation is forced to claim a fresh region.
+        consume_regions(&gc, 7);
+        let _ = GarbageCollector::alloc_object(&gc, ClassId::new(1), 1);
+        assert!(
+            gc.native_alloc_pressure(),
+            "claiming an Eden region that takes the Free pool under the \
+             needs_gc threshold must arm the latch"
+        );
+    }
+
+    /// The consumer clears the latch; a still-starved heap must re-arm it on
+    /// the very next region claim, and a collection (which rebuilds the Free
+    /// pool) must clear it.
+    #[test]
+    fn native_alloc_pressure_rearms_after_clear_and_is_cleared_by_a_collection() {
+        let gc = make_collector();
+        consume_regions(&gc, 7);
+        let _ = GarbageCollector::alloc_object(&gc, ClassId::new(1), 1);
+        assert!(gc.native_alloc_pressure());
+
+        gc.clear_native_alloc_pressure();
+        assert!(!gc.native_alloc_pressure());
+
+        // Still starved: the next claim must re-arm rather than stay quiet
+        // until the abort.
+        consume_regions(&gc, 8);
+        {
+            // Free one region back so a claim is possible at all.
+            let mut regions = gc.regions.lock();
+            regions[7].region_type = RegionType::Free;
+            regions[7].cursor = 0;
+        }
+        gc.current_eden.store(usize::MAX, Ordering::Relaxed);
+        let _ = GarbageCollector::alloc_object(&gc, ClassId::new(1), 1);
+        assert!(
+            gc.native_alloc_pressure(),
+            "a post-clear region claim under the threshold must re-arm"
+        );
+
+        // A collection rebuilds the Free pool, so the outstanding request has
+        // been served: the latch must not survive it (else every native call
+        // after the first pressure event would force a collection).
+        let mut roots: Vec<ObjectRef> = Vec::new();
+        let _ = GarbageCollector::collect_garbage(&gc, &stw(), &mut roots, &NoopMonitors);
+        assert!(
+            !gc.native_alloc_pressure(),
+            "a completed collection must clear the pressure latch"
+        );
+    }
+
+    /// Emergency reserve: once the Free pool is down to the reserve, the
+    /// speculative bulk TLAB refill must step aside (and arm the latch) while
+    /// real object allocation — whose caller cannot be told "no" — still
+    /// succeeds out of the held-back regions.
+    #[test]
+    fn tlab_refill_holds_back_an_emergency_reserve_for_real_allocations() {
+        let gc = make_collector();
+        // 8 regions: the eighth-of-the-heap cap decides, so the reserve is 1.
+        assert_eq!(gc.tlab_reserve_regions(8), 1);
+        // A heap too small to hold a reserve keeps the previous behaviour.
+        assert_eq!(gc.tlab_reserve_regions(2), 0);
+        // A realistic 1 GiB heap holds back 16 of its 1024 regions.
+        assert_eq!(gc.tlab_reserve_regions(1024), 16);
+
+        consume_regions(&gc, 7); // 1 Free == the reserve
+        assert!(
+            gc.refill_tlab(4096).is_none(),
+            "a TLAB refill must not consume the last reserve regions"
+        );
+        assert!(
+            gc.native_alloc_pressure(),
+            "refusing a refill for lack of regions must arm the pressure latch"
+        );
+
+        gc.clear_native_alloc_pressure();
+        assert!(
+            gc.try_alloc_object(ClassId::new(1), 1).is_some(),
+            "the reserve must still serve a real object allocation"
+        );
+        assert!(
+            gc.native_alloc_pressure(),
+            "consuming a reserve region must arm the pressure latch"
+        );
     }
 
     // -- Needs GC --

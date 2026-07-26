@@ -2802,7 +2802,7 @@ mod tests {
         use cratonvm_reader::class_file_version::ClassFileVersion;
         use cratonvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
 
-        let mut cm = shared.classes.class_manager.write();
+        let mut cm = shared.classes.class_manager_write();
         let id = cm.class_store.next_id();
         let num_fields = fields.iter().filter(|f| !f.is_static()).count();
         cm.class_store.add(Class {
@@ -2854,7 +2854,7 @@ mod tests {
         use cratonvm_reader::class_file_version::ClassFileVersion;
         use cratonvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
 
-        let mut cm = shared.classes.class_manager.write();
+        let mut cm = shared.classes.class_manager_write();
         let id = cm.class_store.next_id();
         let num_fields = fields.iter().filter(|f| !f.is_static()).count();
         let class_name = name.to_string();
@@ -46504,7 +46504,7 @@ mod tests {
 
         // Load String to get a known ClassId
         {
-            let mut cm = shared.classes.class_manager.write();
+            let mut cm = shared.classes.class_manager_write();
             let _ = cm.load_class("java/lang/String");
         }
         let string_id = {
@@ -46530,7 +46530,7 @@ mod tests {
 
             // Add the JAR to the VM classpath dynamically
             {
-                let mut cm = shared.classes.class_manager.write();
+                let mut cm = shared.classes.class_manager_write();
                 cm.extend_application_classpath(&[tmp.to_string_lossy().into_owned()]);
             }
 
@@ -53337,7 +53337,7 @@ mod tests {
 
         // Register a class with record components in the class manager
         let class_id = {
-            let mut cm = shared.classes.class_manager.write();
+            let mut cm = shared.classes.class_manager_write();
             let id = cm.class_store.next_id();
             cm.class_store.add(Class {
                 id,
@@ -53419,7 +53419,7 @@ mod tests {
 
         // Register two different record classes with same field count
         let (cid1, cid2) = {
-            let mut cm = shared.classes.class_manager.write();
+            let mut cm = shared.classes.class_manager_write();
             let id1 = cm.class_store.next_id();
             cm.class_store.add(Class {
                 id: id1,
@@ -53570,7 +53570,7 @@ mod tests {
         let mut thread = crate::threading::JvmThread::new(crate::threading::ThreadId(0), "test");
 
         let (rec_id, sealed_id, plain_id) = {
-            let mut cm = shared.classes.class_manager.write();
+            let mut cm = shared.classes.class_manager_write();
             let rid = cm.class_store.next_id();
             cm.class_store.add(Class {
                 id: rid,
@@ -56161,7 +56161,7 @@ mod tests {
         let config = VmConfig::default();
         let shared = Arc::new(SharedVm::new(config));
         {
-            let mut cm = shared.classes.class_manager.write();
+            let mut cm = shared.classes.class_manager_write();
             // Loading String causes its interfaces (including CharSequence) to be loaded too.
             cm.load_class("java/lang/String").unwrap();
         }
@@ -56228,7 +56228,7 @@ mod tests {
             "org/renaissance/jdk/streams/MnemonicsCoderWithStream",
         ];
         for class_name in &classes {
-            let result = shared.classes.class_manager.write().load_class(class_name);
+            let result = shared.classes.class_manager_write().load_class(class_name);
             assert!(
                 result.is_ok(),
                 "Loading {class_name} should succeed: {result:?}"
@@ -56255,7 +56255,7 @@ mod tests {
         //   actual = ObjectRef("String")  →  is_subclass("String", "CharSequence") must be true
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         {
-            let mut cm = shared.classes.class_manager.write();
+            let mut cm = shared.classes.class_manager_write();
             cm.load_class("java/lang/String").unwrap();
         }
         let cm = shared.classes.class_manager.read();
@@ -62694,7 +62694,7 @@ mod tests {
 
         let class_id;
         {
-            let mut cm = shared.classes.class_manager.write();
+            let mut cm = shared.classes.class_manager_write();
             class_id = cm.class_store.next_id();
             cm.class_store.add(Class {
                 id: class_id,
@@ -62777,7 +62777,7 @@ mod tests {
 
         let class_id;
         {
-            let mut cm = shared.classes.class_manager.write();
+            let mut cm = shared.classes.class_manager_write();
             class_id = cm.class_store.next_id();
             cm.class_store.add(Class {
                 id: class_id,
@@ -62912,7 +62912,7 @@ mod tests {
             use cratonvm_reader::class_access_flags::ClassAccessFlags;
             use cratonvm_reader::class_file_version::ClassFileVersion;
 
-            let mut cm = shared.classes.class_manager.write();
+            let mut cm = shared.classes.class_manager_write();
             class_id = cm.class_store.next_id();
             cm.class_store.add(Class {
                 id: class_id,

@@ -64,7 +64,7 @@ macro_rules! require_classes {
 /// `ModuleTarget` into it, and ensure `TckModule` stays in the unnamed
 /// module. Optional `extra_opens` simulates `--add-opens` flags.
 fn setup_modules(vm: &mut Vm, extra_opens: &[(&str, &str, &str)]) {
-    let mut cm = vm.shared.classes.class_manager.write();
+    let mut cm = vm.shared.classes.class_manager_write();
 
     // Load both test classes.
     cm.load_class("cratonvm/ModuleTarget")
@@ -235,7 +235,7 @@ fn new19_direct_classpath_only_mode_allows_everything() {
     // never break existing users.
     let vm = test_vm();
     {
-        let mut cm = vm.shared.classes.class_manager.write();
+        let mut cm = vm.shared.classes.class_manager_write();
         cm.load_class("cratonvm/ModuleTarget").expect("must load");
     }
     let cm = vm.shared.classes.class_manager.read();

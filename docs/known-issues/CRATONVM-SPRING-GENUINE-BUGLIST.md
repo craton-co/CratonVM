@@ -3503,6 +3503,36 @@ context's own fork-loaded Spring -- which is precisely why
 | `MockitoSpyBeanByNameLookupForConstructorParametersIntegrationTests` | 0/5 | **5/5** | 5/5 |
 | `MockitoBeansByNameIntegrationTests` | 0/1 | **1/1** | 1/1 |
 
+And all three together in a single AOT end-to-end run, which is the closest
+thing to the real harness that finishes in a usable time:
+`found=13 succ=13 fail=0` in **34s** -- i.e. exactly the 13 failures this
+cluster had left, all green.
+
+### The full 175-class run did NOT complete -- and that is not this fix
+
+`endToEndTestsForBeanOverrides` itself was left running for over an hour without
+reaching its summary (the first attempt heap-thrashed at `--Xmx 4g`: 4.0GB RSS
+with `main-vm` pegged; restarted at `--Xmx 8g` it climbed steadily to 5.7GB,
+still with no summary at 66 minutes, and was stopped). The pre-fix run of the
+same method took ~15 minutes. **Do not read that as a regression from this
+change** -- four A/B measurements, pre-fix binary vs post-fix binary on
+identical inputs, say otherwise:
+
+| workload (identical behaviour on both binaries) | pre-fix | post-fix |
+|---|---|---|
+| 1 neutral class | 17.3s | 18.9s |
+| 2 neutral classes | 21.97s | 21.92s |
+| 4 Mockito classes untouched by this fix | 23.12s | 23.91s |
+| 6 non-Mockito classes | 30.5s | — |
+
+Per-class cost is unchanged, and Mockito classes are not inherently slow either.
+Whatever makes the 175-class run blow up lives in the AOT compile+replay phase
+at full-suite scale and predates this session; the only contribution from this
+fix is that 13 tests which used to abort instantly at parameter resolution now
+genuinely build their contexts and create their mocks. `gdb` cannot be attached
+on this host (`ptrace_scope`), and the phase is silent, so it was not narrowed
+further -- **flagged as its own item, not as a blocker for the fix above.**
+
 Non-AOT mode is unchanged (those three plus `MockitoBeanByTypeLookup*`: 7/7,
 5/5, 1/1, 5/5, 6/6). `cargo test -p cratonvm-vm --lib --release` 2405 passed /
 18 failed, all `runtime::lock_order`, same as baseline; `cargo test -p

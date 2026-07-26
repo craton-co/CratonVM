@@ -9,7 +9,9 @@
 
 use crate::classloading::resolution::{LambdaCallSite, LinkResolver, ResolutionCache};
 use crate::classloading::{ClassId, ClassManager};
-use crate::runtime::lock_order::{LockLevel, OrderedPlMutex, OrderedPlRwLock};
+use crate::runtime::lock_order::{
+    LockLevel, OrderedPlMutex, OrderedPlRwLock, OrderedPlRwLockWriteGuard,
+};
 use crate::types::{ObjectRef, Value};
 use crate::vm::vm_init::ANON_CLASS_CACHE_LEN;
 use parking_lot::RwLock;
@@ -219,4 +221,65 @@ pub struct ClassRealm {
     /// See `crate::runtime::serialization::oscache` for the cache
     /// implementation and rationale.
     pub osc_cache: crate::runtime::serialization::OscCache,
+}
+
+impl ClassRealm {
+    /// Acquire the L10 `class_manager` write lock through a guard that
+    /// drains any JVMTI ClassLoad/ClassPrepare events queued during the
+    /// critical section once the underlying lock is released.
+    ///
+    /// obsaudit D1 (2026-07-26): this is now the *only* sanctioned way to
+    /// take this write lock — `cratonvm_classloading::fire_class_load_hook`/
+    /// `fire_class_prepare_hook` no longer invoke an installed JVMTI hook
+    /// synchronously; they queue the event on a thread-local and rely on
+    /// this guard's `Drop` to fire it after the lock is gone. Acquiring the
+    /// write lock any other way (e.g. reaching into `.class_manager_write()`
+    /// directly) would silently strand queued events until the next time
+    /// this method happens to run on the same OS thread — every former
+    /// direct-`.write()` call site in the workspace was mechanically
+    /// switched to this method for exactly that reason. See the DEFERRED
+    /// FIRING notes in `classloading/src/class_manager.rs` near
+    /// `install_class_load_hook`.
+    pub fn class_manager_write(&self) -> ClassManagerWriteGuard<'_> {
+        ClassManagerWriteGuard {
+            guard: Some(self.class_manager.write()),
+        }
+    }
+}
+
+/// RAII write guard for [`ClassRealm::class_manager`] that fires queued
+/// JVMTI class-lifecycle events after releasing the lock. See
+/// [`ClassRealm::class_manager_write`].
+pub struct ClassManagerWriteGuard<'a> {
+    // `Option` so `Drop` can explicitly drop the inner guard (releasing the
+    // lock) before draining hooks, rather than relying on field-drop order
+    // (which Rust does guarantee top-to-bottom for a single-field struct,
+    // but the `Option` makes the ordering an explicit, checkable step
+    // instead of an implicit language rule future edits could disturb).
+    guard: Option<OrderedPlRwLockWriteGuard<'a, ClassManager>>,
+}
+
+impl std::ops::Deref for ClassManagerWriteGuard<'_> {
+    type Target = ClassManager;
+    fn deref(&self) -> &ClassManager {
+        self.guard.as_ref().expect("guard taken before drop")
+    }
+}
+
+impl std::ops::DerefMut for ClassManagerWriteGuard<'_> {
+    fn deref_mut(&mut self) -> &mut ClassManager {
+        self.guard.as_mut().expect("guard taken before drop")
+    }
+}
+
+impl Drop for ClassManagerWriteGuard<'_> {
+    fn drop(&mut self) {
+        // Release the class-manager write lock first...
+        self.guard = None;
+        // ...then fire whatever ClassLoad/ClassPrepare events this critical
+        // section queued. A hook invoked from here may freely take a fresh
+        // `class_manager_write()`/`.read()` itself: the lock this guard held
+        // is already gone by this point.
+        cratonvm_classloading::drain_pending_class_hooks();
+    }
 }

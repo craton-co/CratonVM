@@ -115,7 +115,7 @@ fn shared_vm_ref_processor_then_class_manager_is_detected() {
     let shared = fresh_shared_vm();
     expect_violation("ref_processor (L7) -> class_manager (L10)", || {
         let _rp = shared.mem.ref_processor.lock();
-        let _cm = shared.classes.class_manager.write();
+        let _cm = shared.classes.class_manager_write();
     });
 }
 
