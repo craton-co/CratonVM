@@ -331,6 +331,46 @@ pub struct Frame {
     /// Cold-path metadata (method name, descriptor, exception table, etc.).
     inner: FrameInner,
 
+    /// CR-CLO-2 — this method's slot in its declaring class's `Class::methods`
+    /// list, when the pusher knew it. `None` means "not known", which is always
+    /// a correct answer: every consumer falls back to today's behaviour.
+    ///
+    /// # Why it exists
+    ///
+    /// `stackwalker::capture_frames_no_lines` is the thread-dump depositor. It
+    /// runs on the blocking thread at every safepoint/blocking point and
+    /// therefore must not take a `ClassStore` borrow, so the
+    /// `StackTraceEntry::method_index` it publishes is `None` and deferred
+    /// resolution (`resolve_line_numbers_in_place`) falls back to the
+    /// unambiguous-name rule. That rule fails closed on an overload set —
+    /// overloads share a name and have different `LineNumberTable`s — so
+    /// overloaded frames in a cross-thread dump report no line at all. A `u32`
+    /// copied out of the frame needs no borrow and no allocation, which is the
+    /// whole point.
+    ///
+    /// # It is an index, never a borrow, and never trusted alone
+    ///
+    /// `resolve_line_numbers_in_place` re-reads `class.methods[idx]` from the
+    /// live `ClassStore` and re-checks that its `name` equals the recorded
+    /// method name before using it. That check catches a *wrong name*; it does
+    /// **not** catch another member of the same overload set, which is exactly
+    /// the population this field exists to disambiguate. So a stale index is
+    /// worse than no index, and the two places that can strand one —
+    /// [`Frame::reset_for_tail_call`] and [`Frame::from_frozen_frame`] — clear
+    /// it explicitly rather than by omission.
+    ///
+    /// # Placement
+    ///
+    /// On `Frame` rather than inside `FrameInner`, deliberately: it then covers
+    /// `Owned` and `Cached` frames uniformly with one field, one accessor and
+    /// one reset rule, instead of a per-variant setter that would silently
+    /// no-op on the `Cached` half (whose metadata `Arc` is shared across every
+    /// frame of that method and must not carry per-push state). The enum is
+    /// sized by its `Owned` variant either way, so nothing is saved by hiding
+    /// the field in there. See the doc for the `CachedBytecodeMethod`-side
+    /// follow-up that makes the cached path resolve once per *method*.
+    method_index: Option<u32>,
+
     /// CRIT-PERF (audit 2026-05-17): per-loop OSR attempt counter with
     /// exponential backoff.
     ///
@@ -941,6 +981,9 @@ impl Frame {
                 source_file: source_file.map(|s| Arc::from(s.as_str())),
                 exception_table: Arc::from(exception_table.into_boxed_slice()),
             },
+            // The caller passes loose parts, not a resolved method; use
+            // `set_method_index` where the slot is known.
+            method_index: None,
             backward_count: 0,
             osr_attempt_counts: Vec::new(),
             monitor_on_exit: None,
@@ -1014,6 +1057,8 @@ impl Frame {
                 source_file,
                 exception_table,
             },
+            // Same as `Frame::new`: loose Arcs, no resolved method slot.
+            method_index: None,
             backward_count: 0,
             osr_attempt_counts: Vec::new(),
             monitor_on_exit: None,
@@ -1065,6 +1110,8 @@ impl Frame {
                 source_file,
                 exception_table,
             },
+            // Same as `Frame::new`: loose Arcs, no resolved method slot.
+            method_index: None,
             backward_count: 0,
             osr_attempt_counts: Vec::new(),
             monitor_on_exit: None,
@@ -1106,6 +1153,13 @@ impl Frame {
             max_stack,
             max_locals: eff_max_locals,
             inner: FrameInner::Cached(cached),
+            // CR-CLO-2 cached half: `CachedBytecodeMethod` does not yet carry a
+            // method slot (see the field doc — its 38 struct literals live in
+            // four crates and none has a `..` tail, so the field cannot be
+            // added from here without breaking the workspace). When it lands
+            // this becomes `cached.method_index`, resolved once per method
+            // instead of once per push, and this is the only line that changes.
+            method_index: None,
             backward_count: 0,
             osr_attempt_counts: Vec::new(),
             monitor_on_exit: None,
@@ -1149,6 +1203,17 @@ impl Frame {
             source_file,
             exception_table,
         };
+        // CR-CLO-2 — MUST be cleared alongside `class_id` and `inner`. A tail
+        // call replaces the method executing in this frame while reusing the
+        // allocation, so an index left over from the *caller* would be read
+        // back as the callee's slot. `resolve_line_numbers_in_place` guards a
+        // stale index only by re-checking the method's NAME, which is precisely
+        // the check that cannot separate two members of one overload set — and
+        // an overload set is the only population this index exists to
+        // disambiguate. A stale index is therefore strictly worse than none:
+        // it can print a line from the wrong method body, which the fallback
+        // never does. `None` restores the fail-closed unambiguous-name rule.
+        self.method_index = None;
         // Reset locals
         let n = eff_max_locals as usize;
         self.locals.clear();
@@ -1323,6 +1388,38 @@ impl Frame {
             FrameInner::Owned { source_file, .. } => source_file.clone(),
             FrameInner::Cached(cm) => cm.source_file.clone(),
         }
+    }
+
+    /// CR-CLO-2 — this frame's slot in its declaring class's `Class::methods`,
+    /// when the pusher knew it. See the `Frame::method_index` field doc.
+    ///
+    /// A plain `u32` copy: no `ClassStore` borrow, no lock, no allocation.
+    /// That is the whole reason the field exists — it is what lets the
+    /// deliberately lock-free thread-dump depositor
+    /// (`stackwalker::capture_frames_no_lines`) publish
+    /// `method_index: f.method_index()` instead of `None`, which in turn lets
+    /// deferred resolution put an exact line on an *overloaded* frame rather
+    /// than failing closed to `UNKNOWN`.
+    ///
+    /// `None` is always a correct answer and simply keeps today's behaviour.
+    #[inline]
+    pub fn method_index(&self) -> Option<u32> {
+        self.method_index
+    }
+
+    /// Record this frame's slot in its declaring class's `Class::methods`.
+    ///
+    /// Called by a pusher that already holds the `ClassStore` borrow and the
+    /// resolved `ClassFileMethod` — i.e. that has the index in hand for free.
+    /// It must be **this** frame's own method: the index is re-verified against
+    /// the live class by name only, and a name check cannot separate two
+    /// members of one overload set (see the field doc).
+    ///
+    /// Passing `None` is always safe and restores the unambiguous-name
+    /// fallback; a pusher that is unsure should pass `None` rather than guess.
+    #[inline]
+    pub fn set_method_index(&mut self, method_index: Option<u32>) {
+        self.method_index = method_index;
     }
 
     // ── Local variable access ───────────────────────────────────────────
@@ -1678,6 +1775,18 @@ impl Frame {
                 source_file: frozen.source_file.map(|s| Arc::from(s.as_str())),
                 exception_table,
             },
+            // CR-CLO-2 — explicit, not incidental. `FrozenFrame` carries no
+            // method slot (it round-trips names and a descriptor, and lives in
+            // `threading/virtual_threads.rs`), so a thawed frame has no
+            // trustworthy index. Spelling `None` here rather than relying on
+            // the field's absence from `FrozenFrame` means that if the frozen
+            // shape ever gains an index, this site has to make a deliberate
+            // decision about re-verifying it against the class as it exists on
+            // the *resuming* side — a continuation can be thawed long after a
+            // redefinition reordered the overload set it was captured from,
+            // and the name re-check in `resolve_line_numbers_in_place` cannot
+            // catch that reordering.
+            method_index: None,
             backward_count: 0,
             osr_attempt_counts: Vec::new(),
             monitor_on_exit: None,
@@ -2433,6 +2542,192 @@ mod tests {
         // Use the CompactValue accessor with context (Long-by-instruction).
         assert_eq!(frame.get_local_compact(1).as_long(), Some(100));
         // Slot 2 is the second half of the long → Uninitialized
+    }
+
+    // ── CR-CLO-2 — `Frame::method_index` ────────────────────────────────
+    //
+    // The index makes deferred stack-trace line resolution EXACT across an
+    // overload set. Its whole failure mode is staleness: `resolve_line_numbers_
+    // in_place` guards an index by re-checking the method's NAME, and a name
+    // check cannot separate two overloads — which is the one population the
+    // index exists for. So the two places that reuse a `Frame` allocation
+    // under a new method get dedicated tests.
+
+    fn probe_frame(class_id: ClassId, method: &str, descriptor: &str) -> Frame {
+        Frame::new(
+            class_id,
+            "probe/Target".to_string(),
+            method.to_string(),
+            descriptor.to_string(),
+            Some("Target.java".to_string()),
+            vec![0xb1],
+            vec![],
+            1,
+            1,
+            &[],
+        )
+    }
+
+    #[test]
+    fn a_frames_method_index_starts_absent_and_round_trips_through_the_setter() {
+        // `None` is the correct default everywhere: it restores exactly
+        // today's unambiguous-name behaviour, so a pusher that does not know
+        // the slot never has to guess.
+        let mut f = probe_frame(ClassId::new(0), "m", "(I)V");
+        assert_eq!(f.method_index(), None);
+        f.set_method_index(Some(7));
+        assert_eq!(f.method_index(), Some(7));
+        f.set_method_index(None);
+        assert_eq!(f.method_index(), None);
+    }
+
+    #[test]
+    fn a_tail_call_clears_the_method_index_rather_than_stranding_it() {
+        // Tail-call elimination reuses the frame allocation under a DIFFERENT
+        // method. An index left behind would be read back as the callee's
+        // slot; if it happened to point at another overload of the callee's
+        // name it would pass the name re-check and print a line from the wrong
+        // method body — the one failure the fallback rule can never produce.
+        let mut f = probe_frame(ClassId::new(0), "m", "(I)V");
+        f.set_method_index(Some(3));
+        assert_eq!(f.method_index(), Some(3));
+
+        f.reset_for_tail_call(
+            ClassId::new(1),
+            padded_bytecode(&[0xb1]),
+            2,
+            2,
+            &[],
+            Arc::from("probe/Other"),
+            Arc::from("m"), // same NAME on purpose: the name check cannot help
+            Arc::from("(J)V"),
+            Some(Arc::from("Other.java")),
+            Arc::from(Vec::<ExceptionTableEntry>::new().into_boxed_slice()),
+        );
+
+        assert_eq!(
+            f.method_index(),
+            None,
+            "a tail call must clear the index along with class_id and inner"
+        );
+        assert_eq!(f.method_name(), "m");
+        assert_eq!(f.class_id, ClassId::new(1));
+    }
+
+    #[test]
+    fn a_thawed_continuation_frame_carries_no_method_index() {
+        // `FrozenFrame` round-trips names and a descriptor, never a slot, and a
+        // continuation can be resumed long after a redefinition reordered the
+        // overload set it was captured from. Thaw must therefore start from
+        // "unknown", not from whatever the pre-freeze frame happened to hold.
+        let mut f = probe_frame(ClassId::new(0), "m", "(I)V");
+        f.set_method_index(Some(5));
+        let frozen = f.to_frozen_frame();
+        let thawed = Frame::from_frozen_frame(frozen);
+        assert_eq!(thawed.method_index(), None);
+        assert_eq!(thawed.method_name(), "m");
+    }
+
+    #[test]
+    fn a_cached_frame_reports_no_index_until_the_shared_entry_carries_one() {
+        // Pins the documented state of the cached half: `CachedBytecodeMethod`
+        // has no `method_index` field (its 38 struct literals live in four
+        // crates and none has a `..` tail), so a frame pushed through the
+        // cached-invoke path answers `None` and falls back to the name rule.
+        // When that field lands, `new_pooled_cached` seeds this from the Arc
+        // and this assertion flips to `Some(..)`.
+        let cached = Arc::new(CachedBytecodeMethod {
+            declaring_class_id: ClassId::new(0),
+            class_name: Arc::from("probe/Target"),
+            method_name: Arc::from("m"),
+            method_descriptor: Arc::from("(I)V"),
+            source_file: Some(Arc::from("Target.java")),
+            code: padded_bytecode(&[0xb1]),
+            exception_table: Arc::from(Vec::<ExceptionTableEntry>::new().into_boxed_slice()),
+            max_stack: 1,
+            max_locals: 1,
+            num_params: 0,
+            is_synchronized: false,
+            is_static: true,
+            force_native_cache: std::sync::OnceLock::new(),
+            native_callback_cache: std::sync::OnceLock::new(),
+            invoc_key: std::sync::OnceLock::new(),
+            jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
+            quickened: std::sync::OnceLock::new(),
+        });
+        let mut locals_pool = Vec::new();
+        let mut stacks_pool = Vec::new();
+        let mut f = Frame::new_pooled_cached(cached, &[], &mut locals_pool, &mut stacks_pool);
+        assert_eq!(f.method_index(), None);
+        // The per-frame field is still writable for a cached frame — the
+        // uniform placement on `Frame` is what buys that.
+        f.set_method_index(Some(1));
+        assert_eq!(f.method_index(), Some(1));
+    }
+
+    /// The payoff, end to end: an overload set resolves to an EXACT line when
+    /// the frame carries its index, and fails closed to `UNKNOWN` without it.
+    ///
+    /// This is written against the entry shape
+    /// `stackwalker::capture_frames_no_lines` produces once its `method_index:
+    /// None` becomes `method_index: f.method_index()` (one line, in a file this
+    /// pass does not own). Everything the change depends on is pinned here.
+    #[test]
+    fn an_overload_set_resolves_exactly_only_when_the_frame_carries_its_index() {
+        use crate::runtime::stackwalker::{resolve_line_numbers_in_place, LINE_NUMBER_UNKNOWN};
+        use cratonvm_reader::attribute::LineNumberEntry;
+
+        // Two overloads of `m`: same name, different LineNumberTables. The
+        // unambiguous-name rule cannot choose between them by construction.
+        let (store, class_id) = crate::runtime::stackwalker::test_support::store_with(vec![
+            crate::runtime::stackwalker::test_support::named_method(
+                "m",
+                "(I)V",
+                vec![LineNumberEntry {
+                    start_pc: 0,
+                    line_number: 11,
+                }],
+            ),
+            crate::runtime::stackwalker::test_support::named_method(
+                "m",
+                "(J)V",
+                vec![LineNumberEntry {
+                    start_pc: 0,
+                    line_number: 22,
+                }],
+            ),
+        ]);
+
+        let entry_for = |f: &Frame| cratonvm_native_api::StackTraceEntry {
+            class_name: f.class_name_arc(),
+            method_name: f.method_name_arc(),
+            source_file: f.source_file_arc(),
+            line_number: LINE_NUMBER_UNKNOWN,
+            byte_code_index: f.last_instr_pc.min(i32::MAX as usize) as i32,
+            class_id: Some(f.class_id),
+            method_index: f.method_index(),
+        };
+
+        // Without an index: declines, and specifically does NOT guess.
+        let plain = probe_frame(class_id, "m", "(J)V");
+        let mut entries = vec![entry_for(&plain)];
+        assert_eq!(resolve_line_numbers_in_place(&store, &mut entries), 0);
+        assert_eq!(entries[0].line_number, LINE_NUMBER_UNKNOWN);
+
+        // With the index: exact, and it picks the SECOND overload — the one a
+        // name-only rule could never have reached.
+        let mut indexed = probe_frame(class_id, "m", "(J)V");
+        indexed.set_method_index(Some(1));
+        let mut entries = vec![entry_for(&indexed)];
+        assert_eq!(resolve_line_numbers_in_place(&store, &mut entries), 1);
+        assert_eq!(entries[0].line_number, 22);
+
+        // And the first overload resolves to its own line, not the other's.
+        let mut first = probe_frame(class_id, "m", "(I)V");
+        first.set_method_index(Some(0));
+        let mut entries = vec![entry_for(&first)];
+        assert_eq!(resolve_line_numbers_in_place(&store, &mut entries), 1);
+        assert_eq!(entries[0].line_number, 11);
     }
 
     /// If `Code.max_locals` is smaller than the invocation argument slots,

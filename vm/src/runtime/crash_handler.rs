@@ -327,7 +327,8 @@ pub fn jit_state_lines(fault_pc: Option<usize>) -> Vec<String> {
     lines
 }
 
-/// The primordial thread's last published Java frames.
+/// The faulting thread's last published Java frames, falling back to the
+/// primordial thread's.
 ///
 /// This is a *deposit-point* snapshot, not a live walk: the interpreter
 /// republishes it whenever the thread blocks or reaches a safepoint deposit,
@@ -335,8 +336,29 @@ pub fn jit_state_lines(fault_pc: Option<usize>) -> Vec<String> {
 /// thread crashing in the middle of a hot bytecode loop it is the last known
 /// good position. The report says so rather than implying it is live.
 ///
-/// Never blocks: `try_lock` failure is reported, not waited on.
+/// CR-VXC-1 (`docs/internal/arch-2026-07-26/vm-exec-closeout.md` §5.1): the
+/// body below reads one process-wide `OnceLock` published from `Vm::new`, so a
+/// fault on a spawned worker or on a virtual-thread carrier used to render the
+/// *primordial* thread's frames — never the faulting thread's. The two crash
+/// classes that most need a Java stack (virtual-thread resume heap corruption,
+/// STW-takeover deadlock) both fault on workers. `faulting_thread_java_stack_lines`
+/// reads a per-OS-thread cell published by an RAII guard at platform-worker
+/// spawn, at virtual-thread mount, and at JNI attach; it returns `None` on any
+/// thread that has nothing published (the primordial thread included), so this
+/// is strictly additive and strictly a fallback.
+///
+/// Never blocks and never panics, on either path: the faulting-thread reader is
+/// `try_with` + `try_borrow` + `try_lock` throughout, and `try_lock` failure
+/// here is reported, not waited on.
+///
+/// Both paths **allocate**, so this belongs only to the two allocating report
+/// paths (the Rust panic hook via `CrashReport::render`, and the Windows
+/// vectored exception handler). It must not be called from the Unix
+/// async-signal-safe handler.
 pub fn java_stack_lines(max_frames: usize) -> Vec<String> {
+    if let Some(lines) = crate::vm::faulting_thread_java_stack_lines(max_frames) {
+        return lines;
+    }
     let Some(trace) = PRIMORDIAL_FRAME_TRACE.get() else {
         return vec![
             "Java frames: <not published — crashed before the primordial thread was registered>"
@@ -2671,6 +2693,108 @@ mod tests {
         let lines = java_stack_lines(8);
         assert!(!lines.is_empty());
         assert!(lines[0].starts_with("Java frames"), "got {:?}", lines[0]);
+    }
+
+    /// CR-VXC-1. Each of these runs inside its own spawned thread: the
+    /// publication cell is thread-local and cargo's harness reuses threads, so
+    /// publishing on the harness thread would leak into unrelated tests.
+    fn published_trace(class: &str, method: &str, line: i32) -> crate::vm::PublishedTraceHandle {
+        std::sync::Arc::new(parking_lot::Mutex::new(vec![
+            cratonvm_native_api::StackTraceEntry {
+                class_name: class.into(),
+                method_name: method.into(),
+                source_file: Some("Probe.java".into()),
+                line_number: line,
+                byte_code_index: 0,
+                class_id: None,
+                method_index: None,
+            },
+        ]))
+    }
+
+    #[test]
+    fn a_worker_thread_crash_now_renders_that_workers_java_frames() {
+        // The whole point of CR-VXC-1: before it, a fault anywhere but the
+        // primordial thread rendered the primordial thread's frames (or the
+        // "not published" placeholder) and the reader had no way to tell.
+        let lines = std::thread::spawn(|| {
+            let _guard = crate::vm::PublishedFrameTrace::publish(
+                "worker-7",
+                7,
+                published_trace("com/example/Worker", "run", 42),
+            );
+            java_stack_lines(8)
+        })
+        .join()
+        .expect("worker thread");
+
+        let joined = lines.join("\n");
+        assert!(joined.contains("worker-7"), "{joined}");
+        assert!(joined.contains("tid 7"), "{joined}");
+        assert!(joined.contains("com/example/Worker.run"), "{joined}");
+        assert!(joined.contains("Probe.java:42"), "{joined}");
+        assert!(
+            !joined.contains("primordial"),
+            "the faulting thread's frames must not be labelled primordial: {joined}"
+        );
+    }
+
+    #[test]
+    fn an_unpublished_thread_still_falls_back_to_the_primordial_path() {
+        // Strictly additive: the helper returns `None` wherever nothing is
+        // published (the primordial thread included), so today's behaviour is
+        // preserved everywhere it was the right behaviour.
+        let lines = std::thread::spawn(|| java_stack_lines(8))
+            .join()
+            .expect("worker thread");
+        assert!(!lines.is_empty());
+        assert!(lines[0].starts_with("Java frames"), "got {:?}", lines[0]);
+        assert!(
+            !lines[0].contains("faulting thread"),
+            "unpublished thread must not claim a faulting-thread trace: {:?}",
+            lines[0]
+        );
+    }
+
+    #[test]
+    fn the_full_vm_state_section_carries_the_faulting_threads_frames() {
+        // `vm_diagnostic_lines` is what both allocating report paths call
+        // (`CrashReport::render` and the Windows VEH), so the wiring has to be
+        // visible from there and not only from `java_stack_lines` directly.
+        let lines = std::thread::spawn(|| {
+            let _guard = crate::vm::PublishedFrameTrace::publish(
+                "carrier-3",
+                3,
+                published_trace("com/example/Mounted", "loop", 9),
+            );
+            vm_diagnostic_lines(None)
+        })
+        .join()
+        .expect("carrier thread");
+
+        let joined = lines.join("\n");
+        assert!(joined.contains("jdk mode: "), "{joined}");
+        assert!(joined.contains("carrier-3"), "{joined}");
+        assert!(joined.contains("com/example/Mounted.loop"), "{joined}");
+    }
+
+    #[test]
+    fn a_held_frame_trace_mutex_is_reported_rather_than_waited_on() {
+        // The actual crash-time situation: the faulting thread died in the
+        // middle of republishing its own trace. A crash handler that blocks
+        // here turns a diagnosable crash into a hang.
+        let lines = std::thread::spawn(|| {
+            let trace = published_trace("com/example/Wedged", "spin", 1);
+            let _guard = crate::vm::PublishedFrameTrace::publish("wedged", 11, trace.clone());
+            let _held = trace.lock();
+            java_stack_lines(8)
+        })
+        .join()
+        .expect("wedged thread");
+
+        let joined = lines.join("\n");
+        assert!(joined.contains("not waiting on it"), "{joined}");
+        assert!(joined.contains("wedged"), "{joined}");
     }
 
     #[test]
