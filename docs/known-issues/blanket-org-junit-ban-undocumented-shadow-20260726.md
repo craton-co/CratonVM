@@ -153,3 +153,75 @@ Raw logs (not committed, too large/verbose): `/data/tmp/hib-baseline-run.log`,
 `/data/tmp/hib-allowjunit-run.log` on the Azure build host. Test list:
 `/data/tmp/hib-org-junit-test-sample.txt` (regenerate via the seeded
 `gen_hib_test_list.py` script for full reproducibility if needed).
+
+## Update 2026-07-26 (later same day): three more undocumented siblings found, same origin commit, same clean result
+
+While investigating this ban, found it is NOT alone: three neighboring
+blanket bans share the exact same shape — no rationale comment, gated
+Conservative-only, and (confirmed via `git log -S'<pattern>' --
+vm/src/jit/skip_list.rs` run separately for each) all four patterns
+trace to the SAME single commit, `60ef90d4b`:
+
+```rust
+if class_name.starts_with("com/carrotsearch/randomizedtesting/") && !package_allowed(...) { ... }
+if class_name.starts_with("org/apache/logging/log4j/") && !package_allowed(...) { ... }
+if class_name.starts_with("org/junit/") && !package_allowed("org/junit/", allow_packages) { ... }
+if class_name.starts_with("junit/") && !package_allowed("junit/", allow_packages) { ... }
+```
+
+Given the commit's own subject ("Fix Elasticsearch postings FFM checksum
+bridges") and that `randomizedtesting`/`log4j`/`junit` are all central to
+Elasticsearch's own test framework, this is almost certainly one
+incidental defensive group added together to keep ES's test harness
+fully interpreted during that historical investigation — never
+individually justified or revisited since.
+
+**Re-ran the same 80-class Hibernate sample with all four lifted
+together** (`CRATONVM_JIT_ALLOW_PACKAGES='org/junit/,junit/,org/apache/logging/log4j/,com/carrotsearch/randomizedtesting/'`):
+`diff` against baseline is again byte-for-byte empty across all 80
+classes. Same conclusion as the `org/junit/`-alone test: positive but
+not sufficient evidence to remove, since a Hibernate-only sample can't
+rule out the group's likely actual origin (Elasticsearch-specific).
+
+**Updated recommendation:** the most direct next step is testing against
+the real Elasticsearch fixture at
+`/data/data/es-fixture-ivfknn-slicesdense-closure-20260717/` (2555
+compiled test classes) with the same env var — this directly tests the
+"these bans exist because of ES" hypothesis rather than a
+Hibernate-based proxy for it.
+
+## Update 2026-07-26 (final note on the ES-specific test attempt): inconclusive due to host contention, stopped
+
+Two attempts to run the 4-ban-lifted config against the real 18-class ES
+sample (baseline: `Tests run: 389, Failures: 93`, completed successfully)
+failed to reach completion:
+
+- First attempt: killed by a 600s timeout partway through (5/18 classes
+  done).
+- Second attempt (25-minute/1500s budget): progressed only ~1 minute of
+  test execution per ~20 minutes of wall-clock wait, indicating severe
+  host contention from other concurrent sessions on this shared Azure
+  build host (this host has had multiple sessions running heavy
+  Rust/JVM workloads throughout this whole investigation) rather than a
+  hang, crash, or regression specific to the bans under test. Stopped
+  manually after it became clear it would not complete in a reasonable
+  window.
+
+**No conclusion can be drawn from either ES attempt** — this is a
+resource/scheduling limitation of the shared host at this specific time,
+not evidence about the bans themselves.
+
+**Final status: NOT removed.** The only decisive evidence remains the
+Hibernate ORM sample (80/80 real classes, byte-for-byte identical results
+with all 4 bans lifted, both individually and together). This is
+positive and real, but per this doc's own standing caution, a
+Hibernate-only sample cannot rule out an ES-specific original trigger
+given the group's likely origin (commit 60ef90d4b, "Fix Elasticsearch
+postings FFM checksum bridges"). The 4 bans stay in place.
+
+**Recommendation for a future session:** retry the ES-specific comparison
+when the host is less contended, or use a smaller/faster ES class subset
+(3-5 fast unit-style classes rather than this 18-class mixed sample,
+which includes several slow, heavily-parameterized classes like
+`TextFieldMapperTests` and `FloatFieldBlockLoaderTests`) to get a
+decisive answer within a shorter, more reliable window.
