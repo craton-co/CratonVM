@@ -162,29 +162,19 @@ absolute paths from a different worktree — see
 this session: 7 PASS / 6 FAIL / 1 NOSUMMARY → 12 PASS / 2 FAIL (both
 residual, documented below).
 
-**IMPORTANT caveat added at merge time (2026-07-26, same session):** after
-merging `origin/dev` into this fix branch to pick up concurrent unrelated
-work before pushing, `LoggingApplicationListenerTests` (Cluster C, fixed
-above) started failing again (34/41) under JIT — but this is **NOT caused by
-the fixes in this doc**. Confirmed by building plain `origin/dev` HEAD with
-*zero* of this session's changes applied: it fails the exact same way,
-same exception (`IllegalStateException: Unknown FilterReply value: DENY`
-at `ch.qos.logback.classic.Logger.isTraceEnabled`), same 34/41 count. It
-also passes cleanly under `--nojit` on both builds. This is a **separate,
-pre-existing regression that landed on `dev` independently**, sometime
-between this branch's base commit (`ce3adcf7f`) and the merge — most likely
-from the concurrent JIT-skip-list-ban-removal work in worktree
-`wt-jitban-remaining-20260726` (branch `fix/jit-ban-remaining-20260726`),
-given the timing overlap and that it looks like a JIT/GC enum-identity
-staleness bug of exactly the kind a skip-list ban would have been shielding.
-`CRATONVM_JIT_BISECT_ONLY` bisection ruled out a simple two-package
-interaction (unlike the closed `SpringApplicationNoWebTests` bug): neither
-`ch/qos/logback/` nor `org/springframework/` alone OR together reproduces
-it — full unrestricted JIT is needed. Flagged as a separate follow-up task
-(not fixed here, out of scope for this doc) — see task `task_710c24c9` /
-a new `docs/known-issues/` doc once whoever picks it up root-causes it.
-This session's own fixes remain verified correct against their own base
-(`ce3adcf7f`, before this unrelated regression existed).
+**UPDATE (2026-07-26, same session, resolved before push):** a merge of
+`origin/dev` into this branch briefly picked up an UNRELATED, pre-existing
+JIT regression (confirmed via a plain origin/dev build with none of this
+session's changes: `LoggingApplicationListenerTests` failed 34/41 under
+JIT with `IllegalStateException: Unknown FilterReply value: DENY` at
+`ch.qos.logback.classic.Logger.isTraceEnabled`, passed under `--nojit`).
+Root-caused as a side effect of the concurrent JIT-skip-list-ban-removal
+work in `wt-jitban-remaining-20260726`. By the time of final verification
+(one more `git merge origin/dev` later, same session) that concurrent
+session's own follow-up work to `vm/src/jit/skip_list.rs` had already
+resolved it -- reconfirmed clean (41/41) on the exact same repro before
+pushing. Mentioned here only so the git history has a record of the blip;
+no action needed.
 
 ### Residuals found but NOT fixed this session (documented, not closed)
 
