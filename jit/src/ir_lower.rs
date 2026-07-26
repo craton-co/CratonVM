@@ -215,6 +215,30 @@ struct Lowerer<'a> {
     /// is off) ⇒ every `Op::Call` keeps the historical helper dispatch,
     /// byte-for-byte.
     direct_calls: &'a HashMap<usize, (usize, bool)>,
+    /// IR inline-cache lowering (jit-inlining-and-ir-calls): virtual /
+    /// interface call sites this compile serves from a monomorphic + polymorphic
+    /// inline cache instead of the generic `jit_invoke_dispatch` helper. Keyed
+    /// by the invoke's bytecode pc, exactly like [`Self::direct_calls`]; the
+    /// value is `(mic_slot_addr, pic_slot_addr)`.
+    ///
+    /// This is the virtual/interface counterpart of `direct_calls`, and it is
+    /// what removes the last reason the IR pipeline declined call-heavy
+    /// methods: a statically bound call could already be bound directly, but an
+    /// `invokevirtual` still paid a full helper round trip WITH a dynamic
+    /// target lookup, which the single-pass backend has never done (it emits a
+    /// MIC/PIC cascade — `x64.rs`). Empty ⇒ every virtual `Op::Call` keeps the
+    /// historical helper dispatch, byte-for-byte.
+    ///
+    /// SAFETY: both addresses point at `Box`es owned by the compiling
+    /// `try_compile_inner` frame and moved into the returned
+    /// `CompiledMethod::_jit_mic_slots` / `_jit_pic_slots`, so the imm64s baked
+    /// into the emitted guards cannot outlive their storage.
+    ic_slots: &'a HashMap<usize, (usize, usize)>,
+    /// Address of the `jit_invoke_virtual_mic` runtime helper — the
+    /// inline-cache miss path, which resolves the receiver AND populates both
+    /// caches. 6 args: `(vm_ptr, info_ptr, args_ptr, num_args, mic, pic)`.
+    /// 0 ⇒ no IC site may be planned (the planner checks the same field).
+    invoke_virtual_mic: usize,
     /// wire-tiered-manager Step 4 (PGO handoff C1 → C2): per-bytecode-PC branch
     /// bias, keyed by the conditional-branch instruction's bytecode PC (the same
     /// key the IR builder stamps on each `Op::If` via `Node::bytecode_pc`). Value
@@ -242,6 +266,7 @@ impl<'a> Lowerer<'a> {
         branch_hints: &'a HashMap<usize, bool>,
         sr_map: Option<&'a ScalarReplacementMap>,
         direct_calls: &'a HashMap<usize, (usize, bool)>,
+        ic_slots: &'a HashMap<usize, (usize, usize)>,
     ) -> Self {
         // Gap B: scan for `Op::Call` to size the call-related frame regions.
         // `needs_context` ⇒ the method takes the VM ptr as a hidden first arg
@@ -280,18 +305,37 @@ impl<'a> Lowerer<'a> {
         let frame_size = (total + 15) & !15;
 
         // The context slot is the first slot after the locals; spills start
-        // after it. `arg[0]` of the staging region sits at offset
-        // `frame_size - shadow` (the byte just above the shadow space); for a
-        // no-call method `args_stage_size == 0` so the cap stays `frame_size -
-        // shadow`, unchanged from before this slice.
+        // after it.
+        //
+        // BUG FIX (jit-inlining-and-ir-calls): `arg[0]` of the staging region
+        // used to sit at `frame_size - shadow`, i.e. at address `RSP + 32` —
+        // which is exactly where the Win64 ABI places a callee's FIFTH stack
+        // argument, and `RSP + 40` (staged `arg[1]`) the sixth. That was
+        // latent while every helper the IR lowerer called took at most four
+        // arguments, so no stack argument was ever written. The inline-cache
+        // miss path calls `jit_invoke_virtual_mic`, which takes SIX
+        // (`vm, info, args_ptr, num_args, mic, pic`), and would have written
+        // `mic`/`pic` straight over staged `arg[0]`/`arg[1]` — the receiver
+        // and first argument of the very call being dispatched.
+        //
+        // The 16-byte `stack_arg_reserve` was already budgeted into
+        // `frame_size` for exactly this purpose (see the layout comment above,
+        // which describes the reserve as sitting between the staging region and
+        // the shadow space); it simply was not being SKIPPED when placing the
+        // staging region. Skip it now, so the documented layout and the actual
+        // one agree: `[RSP, RSP+32)` shadow, `[RSP+32, RSP+48)` stack args 5-6,
+        // staging from `RSP + 48` up, spills above that. Every consumer reads
+        // `args_stage_top_off` symmetrically (`store_rax` to place, then
+        // `lea_reg_from_frame` to pass `args_ptr`), so relocating the region is
+        // transparent to the generic dispatch path.
         let context_slot_off = if needs_context {
             (num_locals as i32 + 1) * 8
         } else {
             0
         };
         let first_spill = (num_locals as i32 + 1 + if needs_context { 1 } else { 0 }) * 8;
-        let args_stage_top_off = frame_size - shadow;
-        let spill_cap_off = frame_size - shadow - args_stage_size;
+        let args_stage_top_off = frame_size - shadow - stack_arg_reserve;
+        let spill_cap_off = frame_size - shadow - stack_arg_reserve - args_stage_size;
 
         Lowerer {
             graph,
@@ -324,6 +368,8 @@ impl<'a> Lowerer<'a> {
             call_exc_patches: Vec::new(),
             self_call_patches: Vec::new(),
             direct_calls,
+            ic_slots,
+            invoke_virtual_mic: helpers.invoke_virtual_mic,
             branch_hints,
             sr_map,
         }
@@ -1036,6 +1082,277 @@ impl<'a> Lowerer<'a> {
         self.emit_call_return_check(slot, ty);
     }
 
+    // ── Inline caches (jit-inlining-and-ir-calls) ────────────────────
+
+    /// Emit `Jcc rel32` with a placeholder displacement; returns the native
+    /// offset of the 4-byte operand. `cc` is the second opcode byte:
+    /// `0x84` = JE/JZ, `0x85` = JNE/JNZ.
+    fn emit_jcc_rel32(&mut self, cc: u8) -> usize {
+        self.buf.emit(&[0x0F, cc]);
+        let patch = self.buf.pos();
+        self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
+        patch
+    }
+
+    /// Emit `JMP rel32` with a placeholder displacement; returns the operand
+    /// offset.
+    fn emit_jmp_rel32(&mut self) -> usize {
+        self.buf.emit_byte(0xE9);
+        let patch = self.buf.pos();
+        self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
+        patch
+    }
+
+    /// Resolve a rel32 branch operand so it targets the CURRENT buffer
+    /// position.
+    ///
+    /// Never panics. Once `ExecutableBuffer` has overflowed it drops writes and
+    /// stops advancing `len`, so recorded patch offsets no longer address their
+    /// placeholder bytes and `try_patch_i32` legitimately fails (setting the
+    /// sticky flag itself). `lower_inner` discards the whole artifact in that
+    /// case, so swallowing the error is correct — an `expect` here would turn a
+    /// recoverable "fall back to single-pass" into a compile-thread panic.
+    fn patch_rel32_to_here(&mut self, patch: usize) {
+        let here = self.buf.pos();
+        let rel = here as i32 - (patch as i32 + 4);
+        let _ = self.buf.try_patch_i32(patch, rel);
+    }
+
+    /// Marshal a call's arguments into the compiled-callee entry ABI
+    /// ([`ENTRY_ABI_REGS`]) with the hidden VM context pointer in `abi[0]`.
+    ///
+    /// Shared by every inline-cache hit path. Both the MIC and the PIC gate on
+    /// their cached `needs_context` byte before reaching here, so the context
+    /// pointer is always the right ABI shape for the cached target.
+    fn emit_ic_abi_marshal(&mut self, inputs: &[NodeId], num_args: usize) {
+        self.load_reg_from_frame(ENTRY_ABI_REGS[0], self.context_slot_off);
+        for i in 0..num_args {
+            let arg = inputs[2 + i];
+            self.load_reg_from_frame(ENTRY_ABI_REGS[1 + i], self.slot_of(arg));
+        }
+    }
+
+    /// `CMP EAX, dword [R10 + disp]` — an inline-cache class-id guard.
+    fn emit_cmp_eax_r10_disp(&mut self, disp: u8) {
+        if disp == 0 {
+            // REX.B + 3B /r + ModRM(mod=00, reg=RAX, rm=R10)
+            self.buf.emit(&[0x41, 0x3B, 0x02]);
+        } else {
+            // REX.B + 3B /r + ModRM(mod=01, reg=RAX, rm=R10) + disp8
+            self.buf.emit(&[0x41, 0x3B, 0x42, disp]);
+        }
+    }
+
+    /// `CMP BYTE [R10 + disp], 0` — the cached-`needs_context` gate. A cached
+    /// target that does NOT take the VM pointer cannot be reached with this ABI
+    /// marshalling, so such an entry falls through to the helper.
+    fn emit_cmp_byte_r10_disp_zero(&mut self, disp: u8) {
+        // REX.B + 80 /7 + ModRM(mod=01, /7, rm=R10) + disp8 + imm8
+        self.buf.emit(&[0x41, 0x80, 0x7A, disp, 0x00]);
+    }
+
+    /// `MOV R11, qword [R10 + disp] ; CALL R11` — the cached-entry indirect
+    /// call.
+    ///
+    /// SECURITY INVARIANT (inherited verbatim from `x64.rs`'s inline caches):
+    /// nothing may be emitted between these two instructions. R10 is a general
+    /// scratch register; keeping the call target addressed through it across
+    /// any other emitted instruction would let an R10 clobber redirect native
+    /// control flow. Loading into R11 (caller-saved, not an argument register
+    /// on either ABI, clobbered by the call anyway) immediately before the
+    /// `CALL` closes the window to a single fixed pair.
+    fn emit_call_cached_entry(&mut self, disp: u8) {
+        if disp == 0 {
+            self.buf.emit(&[0x4D, 0x8B, 0x1A]); // MOV R11, [R10]
+        } else {
+            self.buf.emit(&[0x4D, 0x8B, 0x5A, disp]); // MOV R11, [R10+disp8]
+        }
+        self.buf.emit(&[0x41, 0xFF, 0xD3]); // CALL R11
+    }
+
+    /// IR inline-cache lowering — serve a virtual / interface `Op::Call` from a
+    /// monomorphic (`JitMICSlot`) guard, then a 3-way polymorphic
+    /// (`JitPICSlot`) cascade, then the resolving `jit_invoke_virtual_mic`
+    /// helper. This is the IR analogue of the single-pass backend's MIC/PIC
+    /// codegen in `x64.rs`.
+    ///
+    /// # Why this matters
+    ///
+    /// `emit_direct_cross_call` removed the per-call helper tax for the
+    /// STATICALLY BOUND kinds, but left `invokevirtual` / `invokeinterface`
+    /// paying a full `jit_invoke_dispatch` round trip *plus* a dynamic
+    /// vtable/itable lookup on every single call — something the single-pass
+    /// backend has never done. That asymmetry is why virtual-call lowering was
+    /// gated opt-IN (`CRATONVM_JIT_IR_CALL_VIRTUAL`) and why
+    /// `c2_upgrade_would_engage` refused any method containing a virtual call:
+    /// admitting them made the "optimizing" body slower than the C1 body it
+    /// replaced. With this, an IR virtual site costs a load, a compare and an
+    /// indirect call on the monomorphic path — the same as single-pass.
+    ///
+    /// # Shape
+    ///
+    /// ```text
+    ///   MOV  RAX, [rbp - recv_slot]                  ; receiver = arg0
+    ///   TEST RAX, RAX ; JZ .slow                     ; null → helper raises NPE
+    ///   MOV  EAX, dword [RAX]                        ; class_id (ObjectHeader+0)
+    ///   ; ── monomorphic ──
+    ///   MOV  R10, imm64 mic
+    ///   CMP  EAX, [R10 + CACHED_CLASS_ID_OFFSET]     ; JNE .pic
+    ///   CMP  BYTE [R10 + CACHED_NEEDS_CONTEXT], 0    ; JE  .pic
+    ///   <marshal entry ABI> ; MOV R11,[R10+8] ; CALL R11 ; JMP .done
+    ///   ; ── polymorphic, 3-way ──
+    /// .pic:
+    ///   MOV  R10, imm64 pic
+    ///   for i in 0..3:
+    ///     CMP EAX, [R10+CLASS_ID_OFFSETS[i]]  ; JNE .pic_{i+1} (last: .slow)
+    ///     CMP BYTE [R10+NEEDS_CONTEXT[i]], 0  ; JE  .slow
+    ///     <marshal> ; MOV R11,[R10+ENTRY_PTR_OFFSETS[i]] ; CALL R11 ; JMP .done
+    ///   ; ── megamorphic / cold ──
+    /// .slow:
+    ///   <marshal args into the frame staging region>
+    ///   jit_invoke_virtual_mic(vm, info, args_ptr, num_args, mic, pic)
+    /// .done:
+    ///   <emit_call_return_check>                     ; shared sentinel + spill
+    /// ```
+    ///
+    /// EAX carries the receiver class id from the single header load through
+    /// the whole cascade: no guard writes RAX, and the ABI marshalling only
+    /// touches [`ENTRY_ABI_REGS`] (which excludes RAX, R10 and R11 on both
+    /// platforms), so both the class id and the slot base survive to their uses.
+    ///
+    /// Cold sites cost nothing: an unpopulated slot holds `class_id == 0`,
+    /// which no real receiver matches (class id 0 is `java/lang/Object`, never
+    /// an `invokevirtual` dispatch target here), so every guard falls straight
+    /// through to the helper — which then populates the caches, after which
+    /// later invocations take the inline path with no recompile. Exactly the
+    /// eager-allocation strategy `lib.rs` already uses for single-pass (HIGH-7).
+    ///
+    /// All forward branches use rel32. The single-pass inline caches have had
+    /// two separate CRIT bugs from rel8 displacement overflow (CRIT-3, and the
+    /// inter-slot `jne`); a few extra bytes per site is the right trade.
+    ///
+    /// Every branch is patched before this function returns, so no per-site
+    /// patch state escapes into the shared stub-patching phase.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_inline_cache_call(
+        &mut self,
+        inputs: &[NodeId],
+        slot: i32,
+        num_args: usize,
+        mic: usize,
+        pic: usize,
+        info_ptr: usize,
+        ty: IrType,
+    ) {
+        use crate::{JitMICSlot, JitPICSlot, JIT_PIC_ENTRIES};
+
+        debug_assert!(
+            num_args >= 1,
+            "a virtual/interface site always marshals a receiver as arg0"
+        );
+        // This is the ONLY helper the IR lowerer calls with more than four
+        // arguments, so it is the only place the Win64 stack-argument area
+        // `[RSP+32, RSP+48)` is ever written. Pin that the arg-staging region
+        // starts above it — if the two ever overlap again, `mic`/`pic` land on
+        // the receiver and first argument of the call being dispatched. See the
+        // frame-layout fix in `Lowerer::new`.
+        #[cfg(target_os = "windows")]
+        debug_assert!(
+            self.args_stage_top_off <= self.frame_size - 48,
+            "ir_lower: arg-staging region at rbp-{} overlaps the Win64 stack-argument \
+             area for the 6-argument jit_invoke_virtual_mic call (frame_size {})",
+            self.args_stage_top_off,
+            self.frame_size,
+        );
+        let mut done_patches: Vec<usize> = Vec::new();
+        let mut slow_patches: Vec<usize> = Vec::new();
+
+        // Receiver = arg0. Load it and its class id ONCE for the whole cascade.
+        self.load_to_rax(self.slot_of(inputs[2]));
+        self.buf.emit(&[0x48, 0x85, 0xC0]); // TEST RAX, RAX
+        slow_patches.push(self.emit_jcc_rel32(0x84)); // JZ .slow
+        self.buf.emit(&[0x8B, 0x00]); // MOV EAX, dword [RAX]
+
+        // ── Monomorphic inline cache ────────────────────────────────
+        self.emit_mov_reg_imm64(R10, mic as u64);
+        self.emit_cmp_eax_r10_disp(JitMICSlot::CACHED_CLASS_ID_OFFSET as u8);
+        let mic_miss = self.emit_jcc_rel32(0x85); // JNE .pic
+        self.emit_cmp_byte_r10_disp_zero(JitMICSlot::CACHED_NEEDS_CONTEXT_OFFSET as u8);
+        let mic_noctx = self.emit_jcc_rel32(0x84); // JE .pic
+        self.emit_ic_abi_marshal(inputs, num_args);
+        self.emit_call_cached_entry(JitMICSlot::CACHED_ENTRY_PTR_OFFSET as u8);
+        done_patches.push(self.emit_jmp_rel32());
+
+        // ── Polymorphic 3-way cascade ───────────────────────────────
+        // .pic:
+        self.patch_rel32_to_here(mic_miss);
+        self.patch_rel32_to_here(mic_noctx);
+        self.emit_mov_reg_imm64(R10, pic as u64);
+        let mut next_entry: Option<usize> = None;
+        for i in 0..JIT_PIC_ENTRIES {
+            if let Some(p) = next_entry.take() {
+                self.patch_rel32_to_here(p);
+            }
+            self.emit_cmp_eax_r10_disp(JitPICSlot::CLASS_ID_OFFSETS[i] as u8);
+            let miss = self.emit_jcc_rel32(0x85); // JNE → next entry / .slow
+            if i + 1 == JIT_PIC_ENTRIES {
+                slow_patches.push(miss);
+            } else {
+                next_entry = Some(miss);
+            }
+            self.emit_cmp_byte_r10_disp_zero(JitPICSlot::NEEDS_CONTEXT_OFFSETS[i] as u8);
+            slow_patches.push(self.emit_jcc_rel32(0x84)); // JE .slow
+            self.emit_ic_abi_marshal(inputs, num_args);
+            self.emit_call_cached_entry(JitPICSlot::ENTRY_PTR_OFFSETS[i] as u8);
+            done_patches.push(self.emit_jmp_rel32());
+        }
+        debug_assert!(next_entry.is_none());
+
+        // ── Slow path: the resolving + cache-populating helper ──────
+        // .slow:
+        for p in slow_patches {
+            self.patch_rel32_to_here(p);
+        }
+        // Args 1..4 use the same ABI as `jit_invoke_dispatch`, so the staging
+        // marshalling is identical to the generic path below.
+        for i in 0..num_args {
+            let arg = inputs[2 + i];
+            self.load_to_rax(self.slot_of(arg));
+            self.store_rax(self.args_stage_top_off - (i as i32) * 8);
+        }
+        self.load_reg_from_frame(CALL_ARG_REGS[0], self.context_slot_off); // vm_ptr
+        self.emit_mov_reg_imm64(CALL_ARG_REGS[1], info_ptr as u64); // info_ptr
+        self.lea_reg_from_frame(CALL_ARG_REGS[2], self.args_stage_top_off); // args_ptr
+        self.emit_mov_reg_imm64(CALL_ARG_REGS[3], num_args as u64); // num_args
+                                                                    // Args 5 and 6 (mic, pic). Win64 passes them in the caller's stack
+                                                                    // argument area at [RSP+32]/[RSP+40] — the 16-byte reserve
+                                                                    // `Lowerer::new` budgets immediately above the 32-byte shadow space,
+                                                                    // sized for exactly this worst-case 6-argument helper (see the
+                                                                    // `jit_invoke_virtual_mic` note there). SysV passes them in R8/R9.
+        #[cfg(target_os = "windows")]
+        {
+            self.emit_mov_reg_imm64(RAX, mic as u64);
+            self.buf.emit(&[0x48, 0x89, 0x44, 0x24, 0x20]); // MOV [RSP+32], RAX
+            self.emit_mov_reg_imm64(RAX, pic as u64);
+            self.buf.emit(&[0x48, 0x89, 0x44, 0x24, 0x28]); // MOV [RSP+40], RAX
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            self.emit_mov_reg_imm64(8, mic as u64); // R8
+            self.emit_mov_reg_imm64(9, pic as u64); // R9
+        }
+        self.emit_mov_reg_imm64(RAX, self.invoke_virtual_mic as u64);
+        self.buf.emit(&[0xFF, 0xD0]); // CALL RAX
+
+        // .done:
+        for p in done_patches {
+            self.patch_rel32_to_here(p);
+        }
+        // Shared with the dispatch and direct-call paths: the compiled-entry
+        // protocol is the same `i64::MIN` sentinel either way.
+        self.emit_call_return_check(slot, ty);
+    }
+
     /// Post-call exception sentinel + result spill, shared by the
     /// `jit_invoke_dispatch` path and the direct cross-method call path.
     ///
@@ -1727,6 +2044,38 @@ impl<'a> Lowerer<'a> {
                             num_args,
                             entry,
                             callee_needs_ctx,
+                            node.ty,
+                        );
+                        return;
+                    }
+                }
+                // IR inline-cache lowering (jit-inlining-and-ir-calls): a
+                // virtual / interface site with allocated MIC + PIC slots gets
+                // the same monomorphic-then-polymorphic cascade the single-pass
+                // backend emits, falling back to `jit_invoke_virtual_mic` (which
+                // populates both caches) rather than the blind
+                // `jit_invoke_dispatch`. Same register-file precondition as the
+                // direct path — the hit path marshals into the callee entry ABI
+                // with the hidden context pointer in `abi[0]`, and there is no
+                // stack-argument path — so an over-wide site falls through to
+                // the unchanged helper dispatch below. `lower_data_node` has no
+                // post-`match` code, so an early `return` fully handles the node.
+                if let Some(&(mic, pic)) =
+                    node.bytecode_pc.and_then(|pc| self.ic_slots.get(&pc))
+                {
+                    if mic != 0
+                        && pic != 0
+                        && self.invoke_virtual_mic != 0
+                        && num_args >= 1
+                        && num_args + 1 <= ENTRY_ABI_REGS.len()
+                    {
+                        self.emit_inline_cache_call(
+                            &node.inputs,
+                            slot,
+                            num_args,
+                            mic,
+                            pic,
+                            *info_ptr,
                             node.ty,
                         );
                         return;
@@ -2599,8 +2948,9 @@ pub fn lower(
     // allocation until first insert.
     let empty: HashMap<usize, bool> = HashMap::new();
     let no_direct: HashMap<usize, (usize, bool)> = HashMap::new();
+    let no_ic: HashMap<usize, (usize, usize)> = HashMap::new();
     lower_inner(
-        graph, schedule, num_params, num_locals, helpers, &empty, None, &no_direct,
+        graph, schedule, num_params, num_locals, helpers, &empty, None, &no_direct, &no_ic,
     )
 }
 
@@ -2618,6 +2968,7 @@ pub fn lower_with_branch_hints(
     branch_hints: &HashMap<usize, bool>,
 ) -> Option<CompiledMethod> {
     let no_direct: HashMap<usize, (usize, bool)> = HashMap::new();
+    let no_ic: HashMap<usize, (usize, usize)> = HashMap::new();
     lower_inner(
         graph,
         schedule,
@@ -2627,6 +2978,7 @@ pub fn lower_with_branch_hints(
         branch_hints,
         None,
         &no_direct,
+        &no_ic,
     )
 }
 
@@ -2646,14 +2998,17 @@ pub fn lower_with_scalar_deopt(
 ) -> Option<CompiledMethod> {
     let empty: HashMap<usize, bool> = HashMap::new();
     let no_direct: HashMap<usize, (usize, bool)> = HashMap::new();
+    let no_ic: HashMap<usize, (usize, usize)> = HashMap::new();
     lower_inner(
-        graph, schedule, num_params, num_locals, helpers, &empty, sr_map, &no_direct,
+        graph, schedule, num_params, num_locals, helpers, &empty, sr_map, &no_direct, &no_ic,
     )
 }
 
-/// Shared lowering body: both profile-guided branch hints and the optional
-/// guard-surviving scalar-replacement map flow in here. `pub(crate)` so the
-/// production compile path (`lib.rs`) can supply BOTH at once.
+/// Shared lowering body: profile-guided branch hints, the optional
+/// guard-surviving scalar-replacement map, and the two per-call-site lowering
+/// tables all flow in here. `pub(crate)` so the production compile path
+/// (`lib.rs`) can supply all of them at once.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn lower_inner(
     graph: &Graph,
     schedule: &Schedule,
@@ -2666,8 +3021,30 @@ pub(crate) fn lower_inner(
     // every statically-bound call site whose callee was eagerly compiled. Empty
     // ⇒ every `Op::Call` keeps the historical `jit_invoke_dispatch` lowering.
     direct_calls: &HashMap<usize, (usize, bool)>,
+    // IR inline-cache lowering: `pc → (mic_slot_addr, pic_slot_addr)` for every
+    // virtual / interface site served from an inline cache. Empty ⇒ every such
+    // site keeps the historical helper dispatch.
+    ic_slots: &HashMap<usize, (usize, usize)>,
 ) -> Option<CompiledMethod> {
-    let estimated_size = graph.nodes.len() * 32 + 256;
+    // Buffer sizing. The historical estimate (`nodes * 32 + 256`) predates call
+    // lowering: an arithmetic node emits well under 32 bytes, but a single
+    // MIC + 3-way-PIC inline-cache site emits ~250 and a direct call ~60. With
+    // `ir_compatible`'s invoke budget raised to `ir::IR_MAX_INVOKES`,
+    // under-estimating here would silently TRUNCATE the body —
+    // `ExecutableBuffer::emit` sets a sticky `overflowed` flag and skips the
+    // write rather than panicking — so budget every call node explicitly, with
+    // the same saturating arithmetic the single-pass sizing uses.
+    let call_nodes = graph
+        .nodes
+        .iter()
+        .filter(|n| matches!(n.op, Op::Call { .. }))
+        .count();
+    let estimated_size = graph
+        .nodes
+        .len()
+        .saturating_mul(32)
+        .saturating_add(call_nodes.saturating_mul(320))
+        .saturating_add(1024);
     let buf = ExecutableBuffer::new(estimated_size.max(4096))?;
 
     let mut lowerer = Lowerer::new(
@@ -2681,6 +3058,7 @@ pub(crate) fn lower_inner(
         branch_hints,
         sr_map,
         direct_calls,
+        ic_slots,
     );
 
     // Gap B: a `needs_context` method (one containing an `Op::Call`) receives the
@@ -2741,6 +3119,18 @@ pub(crate) fn lower_inner(
     let needs_context = lowerer.needs_context;
 
     let buf = lowerer.buf;
+    // Soundness bail (jit-inlining-and-ir-calls). `ExecutableBuffer::emit` is
+    // non-panicking: on capacity exhaustion it sets a sticky `overflowed` flag
+    // and DROPS the write, so an under-estimated buffer yields a silently
+    // truncated body — execution runs off the end of the emitted code. The
+    // single-pass backend has always checked this; the IR lowerer never did,
+    // which was harmless only while its per-node emission was tiny and bounded.
+    // Inline caches (~250 bytes/site) plus the widened invoke budget make the
+    // estimate materially harder, so check it here and let the caller fall back
+    // to single-pass, exactly like the unallocated-slot latch above.
+    if buf.overflowed() {
+        return None;
+    }
     let _code_size = buf.pos();
 
     let mut cm = CompiledMethod::new(buf);
@@ -2843,6 +3233,260 @@ mod tests {
     /// True iff `needle` appears as a contiguous subsequence of `hay`.
     fn contains_seq(hay: &[u8], needle: &[u8]) -> bool {
         needle.len() <= hay.len() && hay.windows(needle.len()).any(|w| w == needle)
+    }
+
+    /// Count non-overlapping occurrences of `needle` in `hay`.
+    fn count_seq(hay: &[u8], needle: &[u8]) -> usize {
+        if needle.is_empty() || needle.len() > hay.len() {
+            return 0;
+        }
+        hay.windows(needle.len()).filter(|w| *w == needle).count()
+    }
+
+    // ── IR inline caches (jit-inlining-and-ir-calls) ────────────────────
+
+    /// Build → lower a `static int f(Obj o, int n) { return o.g(n); }` shaped
+    /// body whose single `invokevirtual` is planned as an inline-cache site.
+    ///
+    /// `ic` is the `pc → (mic, pic)` map handed to `lower_inner`; passing an
+    /// empty map exercises the unchanged generic-dispatch path, which is what
+    /// makes the "absent plan is byte-identical" assertion below meaningful.
+    ///
+    /// The returned code is never EXECUTED — the baked helper/slot addresses
+    /// are test sentinels, not real functions. These tests assert on the
+    /// emitted instruction stream, which is the part this change owns; the
+    /// end-to-end execution coverage for IR call lowering lives in
+    /// `jit/tests/ir_vs_singlepass.rs` (see the doc for the cases to add
+    /// there — that file is outside this change's ownership).
+    fn lower_virtual_call_with_ic(ic: &HashMap<usize, (usize, usize)>) -> Vec<u8> {
+        // aload_0; iload_1; invokevirtual #2; ireturn
+        let code = [0x2a, 0x1b, 0xb6, 0x00, 0x02, 0xac, 0x00, 0x00];
+        // A live `JitInvokeInfo` for the site. Leaked deliberately: `Op::Call`
+        // bakes its address, and the lowerer dereferences it to read
+        // `invoke_kind`.
+        let info: &'static JitInvokeInfo = Box::leak(Box::new(JitInvokeInfo {
+            class_name: "pkg/Obj",
+            method_name: "g",
+            descriptor: "(I)I",
+            num_jit_args: 2, // receiver + one int
+            return_type: b'I',
+            invoke_kind: 0, // virtual
+        }));
+        let info_ptr = info as *const JitInvokeInfo as usize;
+
+        let mut builder = IrBuilder::new(2, 2);
+        builder.set_param_types(&[IrType::Ref, IrType::Int]);
+        let mut invoke_info = HashMap::new();
+        invoke_info.insert(2usize, (info_ptr, 2usize, b'I'));
+        builder.set_invoke_info(invoke_info);
+        let graph = builder.build(&code, 6).expect("IR build of virtual call");
+        let schedule = ir_schedule::schedule(&graph);
+
+        let mut helpers = no_helpers();
+        // Distinct non-zero sentinels so each path is identifiable in the
+        // emitted imm64s.
+        helpers.invoke_dispatch = 0x1111_2222_3333_4440;
+        helpers.invoke_virtual_mic = 0x1111_2222_3333_4441;
+        helpers.dispatch_threw = 0x1111_2222_3333_4442;
+
+        let empty_hints: HashMap<usize, bool> = HashMap::new();
+        let no_direct: HashMap<usize, (usize, bool)> = HashMap::new();
+        lower_inner(
+            &graph,
+            &schedule,
+            2,
+            2,
+            &helpers,
+            &empty_hints,
+            None,
+            &no_direct,
+            ic,
+        )
+        .expect("virtual-call method must lower")
+        .code_bytes()
+        .to_vec()
+    }
+
+    /// A planned inline-cache site must emit the full three-tier cascade:
+    /// the receiver null check, ONE class-id load, the monomorphic guard, three
+    /// polymorphic guards, four `CALL R11` cached-entry calls, and the
+    /// `jit_invoke_virtual_mic` miss path — NOT the blind `jit_invoke_dispatch`
+    /// helper the pre-2026-07-26 lowerer used for every virtual call.
+    #[test]
+    fn ic_site_emits_mic_pic_cascade_not_blind_dispatch() {
+        const MIC: usize = 0x7fff_0000_0000_1000;
+        const PIC: usize = 0x7fff_0000_0000_2000;
+        let mut ic = HashMap::new();
+        ic.insert(2usize, (MIC, PIC));
+        let code = lower_virtual_call_with_ic(&ic);
+
+        // Receiver null check + the single class-id load feeding every guard.
+        assert!(
+            contains_seq(&code, &[0x48, 0x85, 0xC0]),
+            "TEST RAX,RAX receiver null check must be emitted"
+        );
+        assert_eq!(
+            count_seq(&code, &[0x8B, 0x00]),
+            1,
+            "the receiver class id must be loaded exactly ONCE for the whole cascade"
+        );
+        // Both slot base pointers are baked as imm64 (`MOV R10, imm64` = 49 BA).
+        assert!(
+            contains_seq(&code, &[0x49, 0xBA]) && contains_seq(&code, &MIC.to_le_bytes()),
+            "the MIC slot address must be baked into the guard"
+        );
+        assert!(
+            contains_seq(&code, &PIC.to_le_bytes()),
+            "the PIC slot address must be baked into the cascade"
+        );
+        // One MIC entry + three PIC entries = four `CALL R11` cached-entry calls.
+        assert_eq!(
+            count_seq(&code, &[0x41, 0xFF, 0xD3]),
+            1 + crate::JIT_PIC_ENTRIES,
+            "one cached-entry CALL R11 per inline-cache entry (MIC + 3-way PIC)"
+        );
+        // The miss path resolves AND populates via `jit_invoke_virtual_mic`.
+        assert!(
+            contains_seq(&code, &0x1111_2222_3333_4441u64.to_le_bytes()),
+            "the inline-cache miss path must call jit_invoke_virtual_mic"
+        );
+        assert!(
+            !contains_seq(&code, &0x1111_2222_3333_4440u64.to_le_bytes()),
+            "a planned IC site must NOT also emit the blind jit_invoke_dispatch helper"
+        );
+    }
+
+    /// The guards must read the MIC/PIC fields at the offsets the shared slot
+    /// types publish, not at hand-copied literals — this is what keeps the IR
+    /// cascade layout-compatible with the single-pass one and with the runtime
+    /// helper that populates both.
+    #[test]
+    fn ic_guards_use_published_slot_offsets() {
+        use crate::{JitMICSlot, JitPICSlot};
+        const MIC: usize = 0x7fff_0000_0000_1000;
+        const PIC: usize = 0x7fff_0000_0000_2000;
+        let mut ic = HashMap::new();
+        ic.insert(2usize, (MIC, PIC));
+        let code = lower_virtual_call_with_ic(&ic);
+
+        // MIC: class id at offset 0 → `CMP EAX,[R10]` = 41 3B 02;
+        // needs_context at 16 → `CMP BYTE [R10+16],0` = 41 80 7A 10 00;
+        // entry ptr at 8 → `MOV R11,[R10+8]` = 4D 8B 5A 08.
+        assert_eq!(JitMICSlot::CACHED_CLASS_ID_OFFSET, 0);
+        assert!(contains_seq(&code, &[0x41, 0x3B, 0x02]));
+        assert!(contains_seq(
+            &code,
+            &[
+                0x41,
+                0x80,
+                0x7A,
+                JitMICSlot::CACHED_NEEDS_CONTEXT_OFFSET as u8,
+                0x00
+            ]
+        ));
+        assert!(contains_seq(
+            &code,
+            &[0x4D, 0x8B, 0x5A, JitMICSlot::CACHED_ENTRY_PTR_OFFSET as u8]
+        ));
+
+        // PIC: one guard + one needs-context gate + one entry load per entry.
+        for i in 0..crate::JIT_PIC_ENTRIES {
+            let cid = JitPICSlot::CLASS_ID_OFFSETS[i] as u8;
+            if cid == 0 {
+                assert!(contains_seq(&code, &[0x41, 0x3B, 0x02]));
+            } else {
+                assert!(
+                    contains_seq(&code, &[0x41, 0x3B, 0x42, cid]),
+                    "PIC entry {i} class-id guard at offset {cid} must be emitted"
+                );
+            }
+            assert!(
+                contains_seq(
+                    &code,
+                    &[0x41, 0x80, 0x7A, JitPICSlot::NEEDS_CONTEXT_OFFSETS[i] as u8, 0x00]
+                ),
+                "PIC entry {i} needs-context gate must be emitted"
+            );
+            assert!(
+                contains_seq(
+                    &code,
+                    &[0x4D, 0x8B, 0x5A, JitPICSlot::ENTRY_PTR_OFFSETS[i] as u8]
+                ),
+                "PIC entry {i} cached-entry load must be emitted"
+            );
+        }
+    }
+
+    /// No plan ⇒ the historical generic-dispatch lowering, unchanged. This is
+    /// the guarantee that every un-planned call site in every method is
+    /// byte-identical to the pre-2026-07-26 backend.
+    #[test]
+    fn absent_ic_plan_keeps_generic_dispatch() {
+        let empty: HashMap<usize, (usize, usize)> = HashMap::new();
+        let code = lower_virtual_call_with_ic(&empty);
+        assert!(
+            contains_seq(&code, &0x1111_2222_3333_4440u64.to_le_bytes()),
+            "an unplanned virtual site must still route through jit_invoke_dispatch"
+        );
+        assert!(
+            !contains_seq(&code, &0x1111_2222_3333_4441u64.to_le_bytes()),
+            "an unplanned site must NOT reach the inline-cache miss helper"
+        );
+        assert_eq!(
+            count_seq(&code, &[0x41, 0xFF, 0xD3]),
+            0,
+            "an unplanned site must emit no cached-entry CALL R11"
+        );
+    }
+
+    /// Every branch the inline-cache cascade emits is patched before the
+    /// emitter returns, so no `rel32` operand is left as its `00 00 00 00`
+    /// placeholder. A stale placeholder would jump to the instruction
+    /// immediately after itself — a silent fall-through into the next cache
+    /// entry's body rather than to `.pic` / `.slow` / `.done`.
+    ///
+    /// (`patch_rel32_to_here` swallows patch errors by design, because they are
+    /// only reachable on an overflowed buffer that `lower_inner` discards — so
+    /// this test is what proves the non-overflow path really does patch.)
+    #[test]
+    fn ic_cascade_leaves_no_unpatched_branch() {
+        const MIC: usize = 0x7fff_0000_0000_1000;
+        const PIC: usize = 0x7fff_0000_0000_2000;
+        let mut ic = HashMap::new();
+        ic.insert(2usize, (MIC, PIC));
+        let code = lower_virtual_call_with_ic(&ic);
+
+        // Scan for a Jcc rel32 / JMP rel32 whose displacement is still zero.
+        for w in 0..code.len().saturating_sub(6) {
+            let is_jcc = code[w] == 0x0F && (code[w + 1] == 0x84 || code[w + 1] == 0x85);
+            if is_jcc && code[w + 2..w + 6] == [0, 0, 0, 0] {
+                panic!("unpatched Jcc rel32 placeholder at native offset {w}");
+            }
+        }
+        for w in 0..code.len().saturating_sub(5) {
+            if code[w] == 0xE9 && code[w + 1..w + 5] == [0, 0, 0, 0] {
+                panic!("unpatched JMP rel32 placeholder at native offset {w}");
+            }
+        }
+    }
+
+    /// A site whose receiver + arguments + hidden VM context pointer overflow
+    /// the entry ABI register file must fall back to the helper rather than
+    /// emit a call with garbage in an unwritten register. On Win64 the file is
+    /// 4 registers wide, so a 4-argument virtual site (receiver + 3) already
+    /// needs 5 and must decline; SysV has 6, so the same shape fits there and
+    /// the assertion is platform-specific by construction.
+    #[test]
+    fn ic_declines_when_args_overflow_the_abi_register_file() {
+        // The lowerer's own guard is `num_args + 1 <= ENTRY_ABI_REGS.len()`;
+        // pin the constant rather than re-deriving it, so a future ABI change
+        // has to visit this test.
+        #[cfg(target_os = "windows")]
+        assert_eq!(ENTRY_ABI_REGS.len(), 4);
+        #[cfg(not(target_os = "windows"))]
+        assert_eq!(ENTRY_ABI_REGS.len(), 6);
+        // The shared planner bound must agree with the lowerer's.
+        assert_eq!(crate::ir_entry_abi_reg_count(), ENTRY_ABI_REGS.len());
     }
 
     // ── wire-tiered-manager Step 4: PGO branch-bias in the IR (C2) path ──
