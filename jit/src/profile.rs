@@ -13,7 +13,7 @@
 /// - Receiver type counts pre-populate Monomorphic Inline Cache (MIC) slots so the
 ///   common-case virtual dispatch is a direct call from the very first JIT execution.
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 
 use rustc_hash::FxHashMap;
@@ -265,6 +265,70 @@ impl MethodProfile {
 /// runs per-shard.
 const PROFILE_SHARDS: usize = 16;
 
+/// Number of shards for the per-method invocation-counter map. Power of two so
+/// the shard mapping is a single mask.
+///
+/// Fanned out wider than [`PROFILE_SHARDS`] because this map is hotter by
+/// construction: [`ProfileStore::increment_invocation`] runs on **every**
+/// interpreted invocation of a not-yet-compiled method (the cached-invoke
+/// `Bytecode` arm in `vm/src/runtime/interpreter.rs` calls it before the
+/// warmup-threshold test), whereas the profile shards are only touched when
+/// `PROFILING_ENABLED`. The steady-state path is a shared read-lock plus one
+/// relaxed `fetch_add`; the only exclusive acquisition left is the first
+/// invocation of a given method, and a wide fan-out keeps that from
+/// serialising unrelated methods.
+const INVOCATION_SHARDS: usize = 64;
+
+/// One shard of the invocation-counter map.
+///
+/// The counter cell is an [`AtomicU32`] rather than a plain `u32` so the
+/// common "counter already exists" path needs only a *shared* read-lock: the
+/// increment itself is an atomic RMW on the cell, not a mutation of the map.
+/// Before this split the whole map sat behind one process-global
+/// `parking_lot::Mutex`, so every Java method call in the VM serialised on a
+/// single lock (plus a hash probe) purely to bump a counter.
+struct InvocationShard {
+    counts: parking_lot::RwLock<FxHashMap<u64, AtomicU32>>,
+}
+
+impl InvocationShard {
+    fn new() -> Self {
+        Self {
+            counts: parking_lot::RwLock::new(FxHashMap::default()),
+        }
+    }
+}
+
+/// Shard index for a packed invocation key.
+///
+/// The packed key is `(class_id << 32) | method_name_descriptor_hash`, so the
+/// low 32 bits are the well-distributed part; the high bits would cluster
+/// every method of one class into one shard.
+#[inline]
+fn invocation_shard_for(packed_key: u64) -> usize {
+    (packed_key as u32 as usize) & (INVOCATION_SHARDS - 1)
+}
+
+/// Increment an invocation counter cell, preserving the exact
+/// `u32::saturating_add(1)` semantics of the pre-sharding implementation.
+///
+/// The common case is a single relaxed `fetch_add`. `fetch_add` wraps rather
+/// than saturates, so the (astronomically rare — 2^32 invocations of a method
+/// whose compilation never succeeded) overflow case restores the saturated
+/// value. Concurrent incrementers all converge, because every one of them that
+/// observes the overflow stores `u32::MAX`.
+#[inline]
+fn saturating_inc(cell: &AtomicU32) -> u32 {
+    let prev = cell.fetch_add(1, Ordering::Relaxed);
+    match prev.checked_add(1) {
+        Some(next) => next,
+        None => {
+            cell.store(u32::MAX, Ordering::Relaxed);
+            u32::MAX
+        }
+    }
+}
+
 /// One shard of the per-method profile store. Each shard owns its own
 /// `methods` rwlock + `name_index` rwlock, identical in structure to
 /// the pre-sharding monolithic store.
@@ -346,7 +410,16 @@ pub struct ProfileStore {
     shards: [ProfileShard; PROFILE_SHARDS],
     /// Per-method invocation counters for JIT warmup gating.
     /// Keyed by `(class_id << 32 | method_hash)` packed into a `u64` for fast lookup.
-    invocation_counts: parking_lot::Mutex<FxHashMap<u64, u32>>,
+    ///
+    /// Sharded across [`INVOCATION_SHARDS`] independent rwlocks with
+    /// [`AtomicU32`] cells. This was a single process-global
+    /// `parking_lot::Mutex<FxHashMap<u64, u32>>`, which every Java method call
+    /// in the VM had to acquire exclusively just to bump a counter — a hard
+    /// scalability ceiling on multi-threaded throughput and a measurable
+    /// single-thread cost. The steady-state path is now a shared read-lock and
+    /// one relaxed `fetch_add`; only a method's *first* invocation takes a
+    /// write-lock, and then only on its own shard.
+    invocation_counts: [InvocationShard; INVOCATION_SHARDS],
     /// PERF (round-5 vm #7): auxiliary index keyed by a 64-bit fingerprint
     /// of `(class_id, method_name, descriptor)`. See `ProfileShard::name_index`
     /// for the per-shard storage — this struct field is intentionally absent
@@ -383,9 +456,28 @@ impl ProfileStore {
     pub fn new() -> Self {
         Self {
             shards: std::array::from_fn(|_| ProfileShard::new()),
-            invocation_counts: parking_lot::Mutex::new(FxHashMap::default()),
+            invocation_counts: std::array::from_fn(|_| InvocationShard::new()),
             name_index_collisions: std::sync::atomic::AtomicU64::new(0),
             name_index_benign_races: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Reclaim every profile and warmup counter owned by an unloaded class.
+    pub fn invalidate_class(&self, class_id: u32) {
+        // Sharded by the *low* 32 bits (see `invocation_shard_for`), so a
+        // class's methods are spread across every shard — all of them must be
+        // swept. Cold path (class unloading), so the full walk is fine.
+        for shard in &self.invocation_counts {
+            shard
+                .counts
+                .write()
+                .retain(|packed, _| (*packed >> 32) as u32 != class_id);
+        }
+        for shard in &self.shards {
+            let mut methods = shard.methods.write();
+            methods.retain(|key, _| key.class_id != class_id);
+            let mut index = shard.name_index.write();
+            index.retain(|_, (key, _)| key.class_id != class_id);
         }
     }
 
@@ -416,10 +508,27 @@ impl ProfileStore {
     /// behind a warmup threshold instead of compiling on the second invocation.
     #[inline]
     pub fn increment_invocation(&self, packed_key: u64) -> u32 {
-        let mut counts = self.invocation_counts.lock();
-        let entry = counts.entry(packed_key).or_insert(0);
-        *entry = entry.saturating_add(1);
-        *entry
+        let shard = &self.invocation_counts[invocation_shard_for(packed_key)];
+        // Fast path (every call after a method's first): shared read-lock, one
+        // relaxed atomic RMW on the cell. Unrelated threads and unrelated
+        // methods never block each other here.
+        {
+            let read = shard.counts.read();
+            if let Some(cell) = read.get(&packed_key) {
+                return saturating_inc(cell);
+            }
+        }
+        // Slow path: this method's first invocation. Escalate to a write-lock
+        // and double-check — another thread may have inserted between our
+        // dropping the read-lock and acquiring the write-lock.
+        let mut write = shard.counts.write();
+        match write.get(&packed_key) {
+            Some(cell) => saturating_inc(cell),
+            None => {
+                write.insert(packed_key, AtomicU32::new(1));
+                1
+            }
+        }
     }
 
     /// Fetch (or insert) the per-method profile slot.  Returns a cheap `Arc`
@@ -783,8 +892,20 @@ impl ProfileStore {
 
     /// Snapshot all invocation counts: returns (packed_key, count) pairs.
     pub fn snapshot_invocation_counts(&self) -> Vec<(u64, u32)> {
-        let counts = self.invocation_counts.lock();
-        counts.iter().map(|(&k, &v)| (k, v)).collect()
+        // Not a single atomic snapshot across shards — it never was: the
+        // pre-sharding version held one lock, but callers (diagnostics /
+        // tiered-manager reporting) already tolerated counters advancing
+        // concurrently. Per-shard consistency is preserved.
+        let mut out = Vec::new();
+        for shard in &self.invocation_counts {
+            let counts = shard.counts.read();
+            out.extend(
+                counts
+                    .iter()
+                    .map(|(&k, cell)| (k, cell.load(Ordering::Relaxed))),
+            );
+        }
+        out
     }
 }
 
@@ -982,6 +1103,117 @@ mod tests {
         assert_eq!(counts.len(), 2);
         let abcd = counts.iter().find(|(k, _)| *k == 0x0001_0000_ABCD);
         assert_eq!(abcd.unwrap().1, 2);
+    }
+
+    // --- Sharded invocation counters (global-Mutex removal) ----------------
+
+    /// Every increment must be observed exactly once under concurrency. The
+    /// old implementation held one process-global `Mutex` for this; the
+    /// sharded version relies on a per-shard read-lock plus an atomic RMW, so
+    /// a lost update here would mean methods warm up slower than their real
+    /// call count (or never reach the JIT threshold).
+    #[test]
+    fn invocation_counter_concurrent_increments_are_exact() {
+        const THREADS: usize = 8;
+        const PER_THREAD: u32 = 2_000;
+        let store = Arc::new(ProfileStore::new());
+        // Two keys that differ ONLY in the high (class_id) half: they must
+        // share a shard, since `invocation_shard_for` masks the low 32 bits.
+        // This is the case most likely to expose a lost update.
+        let key_a = 0x0000_0001_DEAD_BEEFu64;
+        let key_b = 0x0000_0002_DEAD_BEEFu64;
+        assert_eq!(
+            invocation_shard_for(key_a),
+            invocation_shard_for(key_b),
+            "keys differing only in the class_id half must collide on one shard"
+        );
+
+        let mut handles = Vec::new();
+        for t in 0..THREADS {
+            let store = Arc::clone(&store);
+            let key = if t % 2 == 0 { key_a } else { key_b };
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..PER_THREAD {
+                    store.increment_invocation(key);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("increment worker should not panic");
+        }
+
+        let counts = store.snapshot_invocation_counts();
+        let expected = PER_THREAD * (THREADS as u32 / 2);
+        for key in [key_a, key_b] {
+            let got = counts
+                .iter()
+                .find(|(k, _)| *k == key)
+                .expect("key should be present")
+                .1;
+            assert_eq!(got, expected, "lost update on key {key:#x}");
+        }
+    }
+
+    /// The counter returned by `increment_invocation` is what the interpreter
+    /// compares against the warmup threshold, so it must be the *new* value
+    /// and must advance by exactly one per call.
+    #[test]
+    fn invocation_counter_returns_monotonic_new_value() {
+        let store = ProfileStore::new();
+        for expected in 1..=64u32 {
+            assert_eq!(store.increment_invocation(0xFEED_FACE), expected);
+        }
+    }
+
+    /// Saturating semantics are preserved from the pre-sharding
+    /// `u32::saturating_add(1)` implementation: the counter pins at `u32::MAX`
+    /// instead of wrapping to 0 (which would restart JIT warmup).
+    #[test]
+    fn invocation_counter_saturates_instead_of_wrapping() {
+        let store = ProfileStore::new();
+        let key = 0x0BAD_C0DEu64;
+        // Seed the cell directly at MAX-1 rather than calling increment 4
+        // billion times.
+        {
+            let shard = &store.invocation_counts[invocation_shard_for(key)];
+            shard
+                .counts
+                .write()
+                .insert(key, AtomicU32::new(u32::MAX - 1));
+        }
+        assert_eq!(store.increment_invocation(key), u32::MAX);
+        // Further increments stay pinned, and never wrap through 0.
+        for _ in 0..4 {
+            assert_eq!(store.increment_invocation(key), u32::MAX);
+        }
+    }
+
+    /// `invalidate_class` must sweep *every* shard: because the shard index
+    /// comes from the low 32 bits, one class's methods are spread across all
+    /// of them. A single-shard sweep would leak counters for an unloaded
+    /// class and let a recycled `class_id` inherit stale warmup state.
+    #[test]
+    fn invalidate_class_sweeps_all_shards() {
+        let store = ProfileStore::new();
+        // 256 methods of class 7 — with 64 shards this reliably populates
+        // many distinct shards.
+        for m in 0..256u64 {
+            store.increment_invocation((7u64 << 32) | m);
+        }
+        // A second class that must survive the sweep.
+        for m in 0..256u64 {
+            store.increment_invocation((9u64 << 32) | m);
+        }
+        assert_eq!(store.snapshot_invocation_counts().len(), 512);
+
+        store.invalidate_class(7);
+
+        let remaining = store.snapshot_invocation_counts();
+        assert_eq!(remaining.len(), 256, "class 7 counters should all be gone");
+        assert!(
+            remaining.iter().all(|(k, _)| (*k >> 32) as u32 == 9),
+            "only class 9 counters should remain"
+        );
     }
 
     #[test]

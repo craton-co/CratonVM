@@ -738,8 +738,8 @@ impl HeaderView {
             class_id: h.class_id,
             is_array: h.kind == crate::heap::ObjectKind::Array,
             element_type: h.element_type as u8,
-            array_length: h.array_length,
-            num_slots: h.num_slots,
+            array_length: h.array_length(),
+            num_slots: h.num_slots(),
             identity_hash_code: h.identity_hash_code,
             gc_age: h.gc_age,
             gc_flags: h.gc_flags,
@@ -1916,8 +1916,8 @@ mod tests {
     #[test]
     fn s54_compact_header_8_vs_legacy_32() {
         assert_eq!(CompactHeader::SIZE, 8);
-        assert_eq!(crate::heap::HEADER_SIZE, 40);
-        assert_eq!(crate::heap::HEADER_SIZE - CompactHeader::SIZE, 32);
+        assert_eq!(crate::heap::HEADER_SIZE, 32);
+        assert_eq!(crate::heap::HEADER_SIZE - CompactHeader::SIZE, 24);
     }
 
     #[test]

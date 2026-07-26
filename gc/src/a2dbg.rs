@@ -11,14 +11,14 @@
 //! allocator that wrote a wrong/partial header vs a `gen_object_total_size`
 //! walker bug. Default-inert (zero cost when the env gate is unset).
 
+use crate::gc_flags;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 /// Cached `CRATONVM_DBG_A2` gate. When unset, `record` is a cheap early return.
 #[inline]
 pub fn enabled() -> bool {
-    static E: OnceLock<bool> = OnceLock::new();
-    *E.get_or_init(|| std::env::var_os("CRATONVM_DBG_A2").is_some())
+    gc_flags().dbg_a2
 }
 
 /// One recorded allocation.

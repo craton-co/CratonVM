@@ -69,6 +69,16 @@ pub fn set_loader_pin(class_id: u32, loader_addr: usize) {
     NON_EMPTY.store(true, Ordering::Relaxed);
 }
 
+/// Remove the instance-to-loader edge for a class whose defining loader and
+/// metadata have completed unloading.
+pub fn remove_loader_pin(class_id: u32) {
+    let mut pins = store().write();
+    pins.remove(&class_id);
+    if pins.is_empty() {
+        NON_EMPTY.store(false, Ordering::Relaxed);
+    }
+}
+
 /// The defining-loader heap address for `class_id`, if it was defined by a user
 /// loader. Returns `None` for built-in/app/bootstrap classes. Hot path: a single
 /// relaxed atomic load short-circuits when the registry is empty.

@@ -25,7 +25,8 @@
 //!   defers compaction (it may still mark, but it does not relocate any
 //!   object — see `gen_heap::collect_garbage_inner`).
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use crate::gc_flags;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 #[cfg(not(test))]
 static JIT_ACTIVE_DEPTH: AtomicUsize = AtomicUsize::new(0);
@@ -94,44 +95,38 @@ pub static LEAVE_COUNT: AtomicUsize = AtomicUsize::new(0);
 // Moving / compacting young generation — the ONE gate
 // ---------------------------------------------------------------------------
 //
-// HISTORY / WHY THIS IS A PUBLISHED VALUE RATHER THAN AN ENV READ
+// WHY THIS IS A PUBLISHED VALUE AND NOT JUST `gc_flags().moving_young`
 // (arch-2026-07-26 `moving-young-precise-roots`):
 //
-// The moving-young switch used to be read INDEPENDENTLY, from the same env
-// var, in three crates that cannot see each other:
+// The moving-young switch is consumed by three layers that cannot see each
+// other, and only ONE of them can physically make relocation safe:
 //
-//   * `cratonvm_jit::x64::moving_young_enabled()`  — CODEGEN. Decides whether
+//   * `cratonvm_jit::x64::moving_young_enabled()` — CODEGEN. Decides whether
 //     the shadow-stack push/reload sequences (the rewritable precise root map)
 //     are emitted at all, and whether `OopMapEntry::moving_young_coverage_
-//     complete` can ever be true.
+//     complete` can ever be true. It still parses `CRATONVM_MOVING_YOUNG` from
+//     the environment ITSELF rather than reading `flags().gc.moving_young`.
 //   * `cratonvm_vm::jit::conservative_roots::moving_young_enabled()` — ROOT
 //     GATHERING. Decides whether the conservative JIT-frame scan is suppressed.
 //   * this function — COLLECTOR. Decides whether `gen_heap` relocates.
 //
-// Three independent copies of one safety-critical predicate is a latent
-// heap-corruption bug: any skew where the COLLECTOR says "moving" while the
-// CODEGEN says "no shadow map" relocates objects whose only home is a JIT
-// register/frame slot that nothing will ever rewrite. It also made the default
-// impossible to flip safely — flipping any subset is unsound.
+// Any skew where the COLLECTOR says "moving" while the CODEGEN says "no shadow
+// map" relocates objects whose only home is a JIT register/frame slot that
+// nothing will ever rewrite. That is not a risk of corruption, it is
+// corruption. Because the codegen still reads the raw variable, a default flip
+// in `cratonvm_types::flags` alone WOULD produce exactly that skew.
 //
-// Model now: the codegen side is the single source of truth (it is the side
-// that must physically emit the map), and the VM PUBLISHES that decision here
-// via [`publish_moving_young_enabled`] before every collection. Until it is
-// published this reads [`DEFAULT_MOVING_YOUNG`] / the env seed, which is the
-// FAIL-SAFE (non-moving) value. Consequently flipping the default is now a
-// ONE-CONSTANT change on the codegen side; nothing here needs to change with
-// it, and no skew is representable.
-
-/// Fail-safe default for the moving young generation when nothing has been
-/// published and no env override is present.
-///
-/// **This is not the authoritative switch** — see the module comment above.
-/// The authoritative value is the codegen-side gate
-/// (`cratonvm_jit::x64::moving_young_enabled`), republished here by the VM.
-/// This constant only decides what a `cratonvm-gc`-only process (unit tests,
-/// embedders that never build a JIT) does, and it must stay `false` while a
-/// live JIT frame can exist without a proven rewritable root map.
-const DEFAULT_MOVING_YOUNG: bool = false;
+// Model: the codegen side is authoritative, and the VM PUBLISHES its answer
+// here via [`publish_moving_young_enabled`] — `collect_roots` is on the path of
+// every collection, so the collector can never decide to relocate against a
+// gate the codegen disagrees with. Before the first publish (a `cratonvm-gc`
+// process with no JIT at all: unit tests, embedders) this falls back to
+// `gc_flags().moving_young`, where there are no JIT frames and moving is
+// unconditionally safe.
+//
+// The interlock is deliberately kept even after the codegen migrates to
+// `flags()`: it is what makes the skew unrepresentable rather than merely
+// unlikely, and it costs one relaxed load per collection.
 
 const MOVING_YOUNG_UNPUBLISHED: u8 = 0;
 const MOVING_YOUNG_OFF: u8 = 1;
@@ -174,27 +169,9 @@ fn moving_young_state_set(v: u8) {
     MOVING_YOUNG_STATE.with(|c| c.set(v));
 }
 
-/// The fail-safe seed used until the VM publishes the codegen-side decision.
-///
-/// `CRATONVM_NO_MOVING_YOUNG` is the **opt-OUT**; `CRATONVM_MOVING_YOUNG` is
-/// retained only as a backwards-compatible opt-IN for the historical
-/// validation recipes (it becomes a no-op once [`DEFAULT_MOVING_YOUNG`] flips).
-/// Both must be interpreted IDENTICALLY by the codegen-side gate, or the two
-/// can disagree in the window before the first publish.
-fn moving_young_env_seed() -> bool {
-    if std::env::var_os("CRATONVM_NO_MOVING_YOUNG").is_some() {
-        return false;
-    }
-    if std::env::var_os("CRATONVM_MOVING_YOUNG").is_some() {
-        return true;
-    }
-    DEFAULT_MOVING_YOUNG
-}
-
 /// Publish the authoritative (codegen-side) moving-young decision.
 ///
-/// Called by the VM's root gatherer, which is on the path of every collection,
-/// so the collector can never read a value the codegen does not agree with.
+/// Called by the VM's root gatherer, which is on the path of every collection.
 /// Idempotent; a *changed* value is a bug (the codegen gate is a `OnceLock`)
 /// and is reported loudly rather than silently accepted.
 pub fn publish_moving_young_enabled(on: bool) {
@@ -202,9 +179,9 @@ pub fn publish_moving_young_enabled(on: bool) {
     let prev = moving_young_state_get();
     if prev != MOVING_YOUNG_UNPUBLISHED && prev != next {
         tracing::warn!(
-            "[moving-young] gate skew: previously observed {}, codegen reports {} — \
-             the collector now follows the codegen. This must never happen; it means \
-             a moving decision was taken against a stale gate.",
+            "[moving-young] gate skew: collector previously observed on={}, codegen reports \
+             on={} — the collector now follows the codegen. This must never happen; it means \
+             a relocation decision was taken against a stale gate.",
             prev == MOVING_YOUNG_ON,
             on,
         );
@@ -222,23 +199,15 @@ pub fn publish_moving_young_enabled(on: bool) {
 /// `conservative_roots::moving_young_enabled` and
 /// `docs/internal/arch-2026-07-26/moving-young-precise-roots.md`).
 ///
-/// Reads the value the VM published from the codegen-side gate; before the
-/// first publish it falls back to the fail-safe seed. Never an independent
-/// policy decision — see the module comment above.
+/// Reads what the VM published from the codegen gate; before the first publish
+/// it falls back to `gc_flags().moving_young`. Never an independent policy
+/// decision — see the module comment above.
 #[inline]
 pub fn moving_young_enabled() -> bool {
     match moving_young_state_get() {
         MOVING_YOUNG_ON => true,
         MOVING_YOUNG_OFF => false,
-        _ => {
-            let seeded = moving_young_env_seed();
-            moving_young_state_set(if seeded {
-                MOVING_YOUNG_ON
-            } else {
-                MOVING_YOUNG_OFF
-            });
-            seeded
-        }
+        _ => gc_flags().moving_young,
     }
 }
 
@@ -250,8 +219,7 @@ pub fn moving_young_enabled() -> bool {
 // process, and a global verdict would let one test's deliberate "incomplete"
 // divert another test's deliberate "complete" collection.
 #[cfg(not(test))]
-static MOVING_YOUNG_COVERAGE_INCOMPLETE: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static MOVING_YOUNG_COVERAGE_INCOMPLETE: AtomicBool = AtomicBool::new(false);
 #[cfg(not(test))]
 static MOVING_YOUNG_INCOMPLETE_REASON: AtomicUsize = AtomicUsize::new(0);
 
@@ -417,7 +385,7 @@ pub mod incomplete_reason {
     pub const MISSING_EXACT_RBP: usize = 2;
     /// The active safepoint's oop map is not `moving_young_coverage_complete`.
     pub const ACTIVE_FRAME_MAP: usize = 3;
-    /// A parent (inlined-caller / RBP-chain) frame's map is not complete.
+    /// A parent (RBP-chain) frame's map is not complete.
     pub const PARENT_FRAME_MAP: usize = 4;
     /// A JIT frame is on the native stack without a `JitEntryGuard` (A5).
     pub const UNREGISTERED_JIT_FRAME: usize = 5;
@@ -489,22 +457,23 @@ pub fn moving_young_coverage_incomplete() -> bool {
 ///
 /// **Emits at `warn` level, ON BY DEFAULT.** A silent regression to the
 /// non-moving sweep is precisely how the moving young generation stayed
-/// switched off for months while the architecture docs advertised it (see
+/// switched off while the architecture docs advertised it (see
 /// `docs/internal/arch-2026-07-26/moving-young-precise-roots.md`): the only
-/// signal was a `tracing::debug!` line saying "compaction deferred" and an
-/// env-gated counter nobody set. Rate-limited (every occurrence up to 8, then
-/// powers of two) so a genuinely non-provable workload cannot flood the log,
-/// but the FIRST one is always visible.
+/// signal was a `tracing::debug!` line reading "compaction deferred" and a
+/// counter behind `CRATONVM_MOVING_YOUNG_FALLBACKS`, which nobody set.
+/// Rate-limited (every occurrence up to 8, then powers of two) so a genuinely
+/// non-provable workload cannot flood the log, but the FIRST one is always
+/// visible; `gc_flags().moving_young_fallbacks` now asks for *all* of them
+/// rather than being what makes any of them appear.
 pub fn record_moving_young_coverage_fallback() -> usize {
     let n = bump_fallbacks();
-    if n <= 8 || n.is_power_of_two() {
-        let reason = moving_young_incomplete_reason();
+    if n <= 8 || n.is_power_of_two() || gc_flags().moving_young_fallbacks {
         tracing::warn!(
             "[moving-young] fallback #{n}: reason={} — a live JIT frame could not prove a \
              complete rewritable root map, so this young collection runs the NON-MOVING \
              sweep (no compaction, free-list allocation). Persistent fallbacks mean the \
              young generation is not actually a copying collector.",
-            incomplete_reason::label(reason),
+            incomplete_reason::label(moving_young_incomplete_reason()),
         );
     }
     n
@@ -516,7 +485,8 @@ pub fn moving_young_coverage_fallback_count() -> usize {
     read_fallbacks()
 }
 
-/// Record that a young collection actually ran the MOVING (Cheney) cycle.
+/// Record that a young collection actually ran the MOVING (Cheney) cycle while
+/// a JIT frame was live.
 ///
 /// The counterpart to [`record_moving_young_coverage_fallback`]: together they
 /// make "is the young generation actually copying?" answerable at runtime
@@ -525,7 +495,8 @@ pub fn record_moving_young_cycle() -> usize {
     bump_moving_cycles()
 }
 
-/// Number of young collections that ran the moving (Cheney) cycle.
+/// Number of young collections that ran the moving (Cheney) cycle under a live
+/// JIT frame.
 pub fn moving_young_cycle_count() -> usize {
     read_moving_cycles()
 }
@@ -683,6 +654,35 @@ pub fn force_non_moving_jit_roots() -> bool {
 
 thread_local! {
     static MAJOR_GC_REQUESTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static CLASS_UNLOAD_MARKING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run one root-gather operation for a collector's non-moving class-unloading
+/// mark. Ordinary moving/evacuating pauses keep loader metadata strongly
+/// rooted; only an initial/final full-mark snapshot may publish conditional
+/// loader-owned edges.
+pub fn with_class_unload_marking<T>(f: impl FnOnce() -> T) -> T {
+    struct Reset(bool);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            CLASS_UNLOAD_MARKING.with(|flag| flag.set(self.0));
+        }
+    }
+
+    let previous = CLASS_UNLOAD_MARKING.with(|flag| {
+        let previous = flag.get();
+        flag.set(true);
+        previous
+    });
+    let _reset = Reset(previous);
+    f()
+}
+
+/// Whether this thread is gathering roots for a full non-moving mark whose
+/// side-edge closure understands loader-owned metadata.
+#[inline]
+pub fn class_unload_marking() -> bool {
+    CLASS_UNLOAD_MARKING.with(std::cell::Cell::get)
 }
 
 /// Request that the next collection on this thread run a full (major) cycle
@@ -957,6 +957,24 @@ pub fn is_watched_referent(addr: usize) -> bool {
     WATCHED_REFERENTS.with(|s| s.borrow().contains(&addr))
 }
 
+/// Snapshot of the watched-referent set, or `None` when it is empty.
+///
+/// The set lives in a `thread_local!` owned by the collecting thread, so a
+/// parallel sweep worker cannot consult it directly (it would see its own,
+/// always-empty, copy). The collector snapshots it once before spawning
+/// workers; the set is sized by the VM's reference processor, not by the
+/// young generation, so the clone is cheap and usually skipped entirely.
+pub fn watched_referents_snapshot() -> Option<std::collections::HashSet<usize>> {
+    WATCHED_REFERENTS.with(|s| {
+        let s = s.borrow();
+        if s.is_empty() {
+            None
+        } else {
+            Some(s.clone())
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -981,27 +999,27 @@ mod tests {
         let _ = leave();
     }
 
-    /// The collector must follow the value the codegen side publishes, not an
-    /// independent env read of its own. This is the invariant that makes a
-    /// one-constant default flip on the codegen side safe.
+    /// The collector must follow the value the codegen side publishes, not its
+    /// own read of `gc_flags()`. This interlock is what makes a default flip on
+    /// the codegen side safe — and what makes a flip of
+    /// `cratonvm_types::flags::DEFAULT_MOVING_YOUNG` *alone* harmless rather
+    /// than corrupting, while `jit/src/x64.rs` still parses the raw variable.
     #[test]
-    fn published_moving_young_gate_wins_over_the_local_seed() {
-        // Fresh test thread: unpublished, so the fail-safe seed applies.
-        // (Skipped when the harness itself was run with the compatibility
-        // opt-in, which legitimately seeds the other way.)
-        if std::env::var_os("CRATONVM_MOVING_YOUNG").is_none() {
-            assert!(
-                !moving_young_enabled(),
-                "unpublished gate must read as the fail-safe (non-moving) value",
-            );
-        }
+    fn published_gate_wins_over_the_flags_default() {
+        // Fresh test thread: unpublished, so the flags value applies.
+        assert_eq!(moving_young_enabled(), gc_flags().moving_young);
         publish_moving_young_enabled(true);
         assert!(
             moving_young_enabled(),
             "the collector must honour a codegen-published moving-young decision",
         );
         publish_moving_young_enabled(false);
-        assert!(!moving_young_enabled());
+        assert!(
+            !moving_young_enabled(),
+            "and it must honour a codegen-published REFUSAL even if the typed \
+             config says moving-young is on — the codegen is the side that has \
+             to emit the rewritable root map",
+        );
     }
 
     #[test]

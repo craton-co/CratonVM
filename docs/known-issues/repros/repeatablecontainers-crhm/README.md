@@ -23,7 +23,7 @@ Exits 1 if any mismatch or `ClassCastException` was observed.
 Note: the key-generation loop (many distinct dynamically-defined `Class`
 objects) was previously ALSO subject to an unrelated JIT/OSR loop-duplication
 bug — see `docs/internal/jit-osr-loop-duplicate-execution-silent-corruption-FIXED.md`
-and its repro under `docs/internal/repros/jit-osr-loop-duplicate-execution/`.
+and its repro under `../../../internal/fixed-suite-bugs/repros/jit-osr-loop-duplicate-execution/`.
 That bug is now FIXED on `dev`; `keys.size()` should equal `numKeys` again
 regardless of JIT/OSR state. If it does not on the tree you're using, you are
 likely on a pre-fix checkout.

@@ -78,7 +78,7 @@ guard already used a few lines above for the native-shadow decision
 ## Verification
 
 - Minimal standalone repro
-  (`docs/known-issues/springboot/repros/mockito-nested-selfcall-stub-bypass-RealProbe.java`,
+  (`../../../known-issues/repros/springboot/mockito-nested-selfcall-stub-bypass-RealProbe.java`,
   no JUnit/Spring context needed): now correctly prints the stubbed value and
   records the invocation via `Mockito.verify(...).get(key)`.
 - `OtlpMetricsPropertiesConfigAdapterTests`: 30/30 PASS (up from 29/30).

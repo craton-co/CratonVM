@@ -3,8 +3,8 @@
 # GC-root acceptance lane — docs/feature-designs/precise-jit-maps-default.md
 # Step 4 ("App-gauntlet GC-root acceptance sweep").
 #
-# Runs the GC-root-coverage-under-JIT family (the A1-A4 repros + the
-# gc-stress-bintrees-main-args repros) and the GC microbenchmarks with precise
+# Runs the GC-root-coverage-under-JIT family (the A1-A4 springboot + the
+# gc-stress-bintrees-main-args springboot) and the GC microbenchmarks with precise
 # JIT stack maps ON (the dev default), diffs CratonVM against HotSpot, and
 # records a baseline TSV + human summary. Each item carries an EXPECTED status,
 # so the lane doubles as a regression gate: it exits non-zero if any item

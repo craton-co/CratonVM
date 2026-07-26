@@ -5,7 +5,7 @@
 **Note — recurrence of a doc previously closed as RESOLVED.** This is the
 same outer symptom (`BeanCreationException: ... Invalid destruction
 signature`) as
-[`../../internal/fixed-suite-bugs/spring-disposablebeanadapter-invalid-destruction-signature-cluster-RESOLVED.md`](../spring-disposablebeanadapter-invalid-destruction-signature-cluster-RESOLVED.md),
+[`../../internal/fixed-suite-bugs/spring-disposablebeanadapter-invalid-destruction-signature-cluster-RESOLVED.md`](../spring/spring-disposablebeanadapter-invalid-destruction-signature-cluster-RESOLVED.md),
 closed 2026-07-12 with "the hypothesised reflection failure is not present
 on current `dev`" based on a standalone probe of `DisposableBeanAdapter`
 around **a plain bean with a single, non-overridden `AutoCloseable.close()`

@@ -313,3 +313,53 @@ the two missing paths from a clean Tomcat source checkout, e.g.
 the `/tmp/vcloader_sandbox`-style private overlay workaround from section 1
 to get a final pass/fail on the original 404-vs-200 assertion without
 touching the shared fixture.
+
+## 2026-07-24 FINAL CLOSURE — fixture repaired, test now runs end-to-end, matches HotSpot exactly
+
+The blocking fixture gap (section 1) was repaired as part of the separate
+`../../../known-issues/tomcat/unbuilt-virtual-webapp-submodule.md` fixture-completion
+work (2026-07-23): `test/webapp-virtual-webapp/target/classes/rsrc/resourceX.properties`
+(placeholder) and `test/webapp-virtual-library/target/WEB-INF/classes/` (empty
+dir) were created directly on the shared Azure host fixture — no Maven build
+needed (there's no `pom.xml`, contradicting this doc's section 1 theory that
+these were git-tracked Maven output).
+
+With the fixture gap closed, reran both `TestVirtualContext` methods
+end-to-end against a `dev`-tip-plus branch build (2026-07-24,
+`fix/tcfixregr-resume-20260723`, includes the `File.getCanonicalPath()`
+symlink-resolution fix from the same session —
+`native-builtins/src/phases_late.rs`'s `resolve_existing_ancestor_then_literal_tail`):
+
+- `testAdditionalWebInfClassesPaths` — **PASSES** (329s wall time; slow but
+  correct, see below).
+- `testVirtualClassLoader` — **still `expected:<200> but was:<404>`, but now
+  identically on BOTH CratonVM and HotSpot** (confirmed via a direct HotSpot
+  rerun of the same class against the same fixture, same run). This is the
+  key change from every earlier entry in this doc: the original CratonVM-only
+  divergence (`404` vs HotSpot's `200`, and later a CratonVM-only `500` per
+  `../../../known-issues/tomcat/regressions-revealed-by-fixture-completion-20260723.md`)
+  is gone. Both VMs now fail this one assertion identically, for whatever
+  reason HotSpot itself doesn't reach `200` here (not investigated — out of
+  scope once it's confirmed to not be a CratonVM regression). **This is no
+  longer a CratonVM defect** — closing per this repo's known-issues triage
+  rule (a shared-failure residual with no CratonVM-specific divergence isn't
+  a VM bug to track here).
+
+`testAdditionalWebInfClassesPaths`'s 329s wall time (vs HotSpot's ~2s for the
+whole class) is NOT a new/distinct bug either — it's the same cross-suite,
+already-tracked, deliberately-deferred interpreter/dispatch throughput
+ceiling documented in
+[`04-embedded-server-throughput-wall-OPEN.md`](04-embedded-server-throughput-wall-OPEN.md)
+(annotation/BCEL constant-pool scanning of the container classpath's large
+jars, e.g. `bouncycastle-provider` at 6112 classes, `bnd` at 5919) — confirmed
+by a live trace showing the interpreter genuinely and repeatedly executing
+`ContextConfig.processAnnotationsJar` → BCEL `ConstantPool`/`ConstantUtf8`
+parsing, not stuck in a loop. A generous per-class harness timeout (the
+existing suite runner's `TIMEOUT_SEC`) is the correct accommodation, not a
+code fix, until that broader throughput gap gets its own dedicated session.
+
+**Net: this doc's original defect (the classloader/`URLClassLoader`
+resource-resolution bug, `cb016825`) has been fixed, verified, and closed for
+over two weeks; the fixture gap that blocked final verification is now also
+closed; the residual `testVirtualClassLoader` 404 is confirmed NOT
+CratonVM-specific. Nothing actionable remains in this doc — fully closing.**

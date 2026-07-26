@@ -655,8 +655,8 @@ fn register_application_lifecycle(registry: &mut NativeMethodRegistry) {
     // deploy bytecode already runs for `<clinit>` — see Gaps 4–7 — so `doStart` is the
     // same kind of bytecode). Opt-in while the RUNTIME_INIT path is validated; pairs with
     // CRATONVM_REAL_AGROAL / CRATONVM_REAL_VERTX / CRATONVM_REAL_NET_SOCKETS.
-    if std::env::var_os("CRATONVM_REAL_QUARKUS_START").is_some() {
-        if std::env::var_os("CRATONVM_DBG").is_some() {
+    if crate::nbflags().real_quarkus_start {
+        if crate::nbflags().dbg {
             eprintln!(
                 "[cratonvm] CRATONVM_REAL_QUARKUS_START: NOT registering Application.start/stop/awaitShutdown no-ops — real Quarkus lifecycle (doStart RUNTIME_INIT) will run"
             );

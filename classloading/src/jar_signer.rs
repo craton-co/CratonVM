@@ -124,6 +124,7 @@
 #![allow(dead_code)] // SHA-1 paths only fire on legacy JARs not exercised
                      // by every test target in the workspace.
 
+use crate::loader_flags;
 use tracing::warn;
 
 // ---------------------------------------------------------------------------
@@ -1936,8 +1937,8 @@ impl TrustStore {
         }
 
         // 2. CratonVM-native PEM bundle (no password).
-        if let Ok(p) = std::env::var("CRATONVM_TRUST_PEM") {
-            ts.try_load_path(&p, "CRATONVM_TRUST_PEM", "");
+        if let Some(p) = crate::loader_flags().trust_pem.as_deref() {
+            ts.try_load_path(p, "CRATONVM_TRUST_PEM", "");
         }
 
         // 3. System root store — integration seam.  `rustls-native-certs`

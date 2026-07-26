@@ -37,6 +37,6 @@ retired rather than attributed to an unproven file-I/O defect.
 ## Related residuals
 
 The downstream Maven/Sisu symptom previously noted in
-`docs/known-issues/keycloak/welcomepagetest-stream-spliterator-zipcopy-residuals-20260715.md` is resolved by
+`../../known-issues/keycloak/welcomepagetest-stream-spliterator-zipcopy-residuals-20260715.md` is resolved by
 this reclassification. That note's remaining Stream/Spliterator issue is separate and remains outside this
 closure.

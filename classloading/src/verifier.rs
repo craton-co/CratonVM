@@ -87,11 +87,13 @@ use cratonvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
 use cratonvm_reader::instruction::Instruction;
 use cratonvm_reader::method::ClassFileMethod;
 use cratonvm_reader::stack_map::StackMapTable;
+use cratonvm_reader::verified_code::verified_code;
 
 use super::class::{find_method_recursive, Class, ClassStore};
 use super::verify_frame::VerificationFrame;
 use super::verify_insn::verify_instruction;
 use super::vtype::{param_types_from_descriptor, ClassHierarchy, VType};
+use crate::loader_flags;
 use cratonvm_types::error::LinkageError;
 
 /// Verify a class: structural (Pass 2) + bytecode (Pass 3).
@@ -164,11 +166,7 @@ static ALLOW_JSR_RET: OnceLock<bool> = OnceLock::new();
 /// value. Computed once and cached for the process lifetime. See
 /// [`ALLOW_JSR_RET`].
 fn allow_jsr_ret() -> bool {
-    *ALLOW_JSR_RET.get_or_init(|| {
-        std::env::var("CRATONVM_ALLOW_JSR_RET")
-            .map(|v| v != "0" && !v.is_empty())
-            .unwrap_or(false)
-    })
+    loader_flags().allow_jsr_ret
 }
 
 pub fn verify_class_bytecode(
@@ -970,35 +968,29 @@ fn verify_method_structural_only(
         });
     }
 
-    let mut decoded = Vec::new();
-    let mut instruction_starts = HashSet::new();
-    let mut instruction_by_pc = HashMap::new();
-    let mut pc = 0usize;
-    while pc < code_len {
-        let (insn, next_pc) =
-            Instruction::decode(bytecode, pc).map_err(|e| LinkageError::VerifyError {
-                class_name: class.name.to_string(),
-                method_name: method.name.to_string(),
-                message: format!("failed to decode instruction at offset {pc}: {e}"),
-            })?;
-
-        // Enumerate branch targets that this instruction can reach and
-        // confirm each one lies inside the code array. We do NOT do
-        // type-state verification here — we only check that the program
-        // counter never falls off the edge of the method.
-        if next_pc <= pc {
-            // Pathological: decoder claimed zero/negative advance.
-            return Err(LinkageError::VerifyError {
-                class_name: class.name.to_string(),
-                method_name: method.name.to_string(),
-                message: format!("instruction at offset {pc} did not advance program counter"),
-            });
-        }
-        instruction_starts.insert(pc);
-        instruction_by_pc.insert(pc, decoded.len());
-        decoded.push(StructuralInstruction { pc, next_pc, insn });
-        pc = next_pc;
-    }
+    // Decode and validate all branch boundaries through the same canonical
+    // pre-IR consumed by the JIT. This primes the bounded process cache, so a
+    // later compilation reuses this exact instruction/CFG analysis.
+    let verified = verified_code(bytecode).map_err(|e| LinkageError::VerifyError {
+        class_name: class.name.to_string(),
+        method_name: method.name.to_string(),
+        message: format!("failed to build verified code: {e}"),
+    })?;
+    let decoded: Vec<_> = verified
+        .instructions()
+        .iter()
+        .map(|decoded| StructuralInstruction {
+            pc: decoded.pc as usize,
+            next_pc: decoded.next_pc as usize,
+            insn: decoded.instruction.clone(),
+        })
+        .collect();
+    let instruction_starts: HashSet<_> = decoded.iter().map(|instruction| instruction.pc).collect();
+    let instruction_by_pc: HashMap<_, _> = decoded
+        .iter()
+        .enumerate()
+        .map(|(index, instruction)| (instruction.pc, index))
+        .collect();
 
     // Validate exception handler ranges (JVMS §4.9.1).
     let mut branch_targets_by_pc: HashMap<usize, Vec<usize>> = HashMap::new();
@@ -1255,7 +1247,7 @@ fn structural_successors(
                 successors.push(decoded_insn.next_pc);
             }
         }
-        Instruction::Tableswitch { .. } | Instruction::Lookupswitch { .. } => {
+        Instruction::Tableswitch(_) | Instruction::Lookupswitch(_) => {
             successors.extend_from_slice(branch_targets);
         }
         Instruction::Ret(_)
@@ -1312,20 +1304,18 @@ fn instruction_branch_targets(insn: &Instruction, pc: usize) -> Result<Vec<i64>,
         | Instruction::Goto(o)
         | Instruction::Jsr(o) => Ok(vec![target(*o as i64)?]),
         Instruction::GotoW(o) | Instruction::JsrW(o) => Ok(vec![target(*o as i64)?]),
-        Instruction::Tableswitch {
-            default, offsets, ..
-        } => {
-            let mut v = Vec::with_capacity(offsets.len() + 1);
-            v.push(target(*default as i64)?);
-            for off in offsets {
+        Instruction::Tableswitch(ts) => {
+            let mut v = Vec::with_capacity(ts.offsets.len() + 1);
+            v.push(target(ts.default as i64)?);
+            for off in &ts.offsets {
                 v.push(target(*off as i64)?);
             }
             Ok(v)
         }
-        Instruction::Lookupswitch { default, pairs } => {
-            let mut v = Vec::with_capacity(pairs.len() + 1);
-            v.push(target(*default as i64)?);
-            for (_, off) in pairs {
+        Instruction::Lookupswitch(ls) => {
+            let mut v = Vec::with_capacity(ls.pairs.len() + 1);
+            v.push(target(ls.default as i64)?);
+            for (_, off) in &ls.pairs {
                 v.push(target(*off as i64)?);
             }
             Ok(v)

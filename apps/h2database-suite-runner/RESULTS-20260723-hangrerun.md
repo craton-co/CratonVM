@@ -74,7 +74,7 @@ merely-slow) is not statistically solid, but directionally suggests the
 Full investigation of all 19 `FAIL` classes from RESULTS-20260723.md, cross-
 referenced against the HotSpot JDK25 baseline (the authoritative oracle —
 `out/full-hotspot-all-20260721-185428/results.tsv`) and the ~15 other
-concurrent `wt-h2-*` worktrees + `docs/known-issues/h2-suite-bugs/` /
+concurrent `wt-h2-*` worktrees + `../../docs/known-issues/h2/` /
 `docs/internal/` on this host, to avoid re-deriving already-tracked work.
 
 ### A. NEW untracked genuine CratonVM bugs
@@ -91,9 +91,9 @@ concurrent `wt-h2-*` worktrees + `docs/known-issues/h2-suite-bugs/` /
 | Class | Where tracked |
 |---|---|
 | `TestFileSystem` | `docs/internal/h2-suite-bugs/bug-h2-files-setposixfilepermissions-FIXED.md` — flags read-only `FileChannel.open` not enforcing write-protection as an open follow-up |
-| `TestWeb` | `docs/known-issues/h2-suite-bugs/bug-h2-dataoutputstream-writechars-data-loss.md` (OPEN, HIGH) — `DataOutputStream.writeChars` no-op corrupts H2's TCP wire protocol; this `assertContains` failure is a residual in that family, distinct from the already-fixed `h2-testweb-logout-connectexception` |
+| `TestWeb` | `../../docs/known-issues/h2/bug-h2-dataoutputstream-writechars-data-loss.md` (OPEN, HIGH) — `DataOutputStream.writeChars` no-op corrupts H2's TCP wire protocol; this `assertContains` failure is a residual in that family, distinct from the already-fixed `h2-testweb-logout-connectexception` |
 | `TestUpgrade` | Branch `fix/h2-testupgrade-rootreference-20260722` (`wt-h2-testupgrade-20260722`) — actively under investigation; `RootReference.hasChangesSince` cross-version dispatch |
-| `TestTransaction` | `docs/known-issues/h2-suite-bugs/bug-h2-suite-residual-fail-triage.md` — `MERGE USING` exactly-half-rows, not yet root-caused |
+| `TestTransaction` | `../../docs/known-issues/h2/bug-h2-suite-residual-fail-triage.md` — `MERGE USING` exactly-half-rows, not yet root-caused |
 | `TestBnf` | Same residual-fail-triage doc — `testProcedures`, not yet investigated |
 | `TestFileLock` | Same residual-fail-triage doc — wrong lock error code, timing/advisory-lock hypothesis |
 

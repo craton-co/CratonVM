@@ -156,7 +156,7 @@ const CHANNEL_LISTENER_HANDLE_EVENT_DESC: &str = "(Ljava/nio/channels/Channel;)V
 const READ_NOTIFY_RETRY_DELAYS_MS: [u64; 1] = [0];
 const READ_NOTIFY_POST_LISTENER_RETRY_DELAYS_MS: [u64; 1] = [0];
 fn xnio_tcp_dbg_enabled() -> bool {
-    std::env::var_os("CRATONVM_DBG_XNIO_TCP").is_some()
+    crate::nbflags().dbg_xnio_tcp
 }
 
 macro_rules! xnio_tcp_dbg {

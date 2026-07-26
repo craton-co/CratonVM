@@ -32,6 +32,7 @@ use crate::heap::{
 use crate::mark_bitmap::MarkBitmap;
 use crate::old_gen::OldGen;
 use crate::satb::SatbQueue;
+use cratonvm_types::narrow_oop::{read_ref_slot, ref_element_size, ref_field_size};
 use cratonvm_types::Value;
 
 // ---------------------------------------------------------------------------
@@ -766,8 +767,8 @@ impl ConcurrentMarker {
                 snapshot.kind_tag,
                 snapshot.element_tag,
                 snapshot.class_id,
-                snapshot.array_length,
-                snapshot.num_slots,
+                snapshot.array_length(),
+                snapshot.num_slots(),
                 snapshot.gc_flags,
             );
             return false;
@@ -785,8 +786,8 @@ impl ConcurrentMarker {
                 snapshot.kind_tag,
                 snapshot.element_tag,
                 snapshot.class_id,
-                snapshot.array_length,
-                snapshot.num_slots,
+                snapshot.array_length(),
+                snapshot.num_slots(),
                 snapshot.gc_flags,
             );
             return false;
@@ -796,11 +797,11 @@ impl ConcurrentMarker {
         if header.kind == ObjectKind::Array {
             if header.element_type == ArrayElementType::Reference {
                 // Reference array: compact 8-byte pointer per element.
-                for i in 0..header.array_length as usize {
+                for i in 0..header.array_length() as usize {
                     // SAFETY: i < array_length, offset is within the allocated array object.
-                    let slot_ptr = unsafe { obj_ptr.add(HEADER_SIZE + i * REF_ELEMENT_SIZE) };
+                    let slot_ptr = unsafe { obj_ptr.add(HEADER_SIZE + i * ref_element_size()) };
                     // SAFETY: slot_ptr points to a valid 8-byte reference element in the array.
-                    let raw: u64 = unsafe { std::ptr::read(slot_ptr as *const u64) };
+                    let raw: u64 = unsafe { read_ref_slot(slot_ptr) };
                     if raw != 0 {
                         let ref_ptr = raw as usize as *mut u8;
                         if markable_old_object(ref_ptr, object_starts)
@@ -819,12 +820,12 @@ impl ConcurrentMarker {
             // needed even though this runs concurrently with mutators.
             for &off in &layout.ref_offsets {
                 let off = off as usize;
-                if off + crate::heap::REF_FIELD_SIZE > body {
+                if off + ref_field_size() > body {
                     break;
                 }
                 // SAFETY: `off` is within the object's body (capped above).
                 let slot_ptr = unsafe { obj_ptr.add(HEADER_SIZE + off) };
-                let raw: u64 = unsafe { std::ptr::read(slot_ptr as *const u64) };
+                let raw: u64 = unsafe { read_ref_slot(slot_ptr) };
                 if raw != 0 {
                     let ref_ptr = raw as usize as *mut u8;
                     if markable_old_object(ref_ptr, object_starts)
@@ -871,7 +872,7 @@ impl ConcurrentMarker {
             // `ObjectRef` only as a stripe-lock key (its address is hashed),
             // never to mutate the object.
             let obj_ref = unsafe { cratonvm_types::ObjectRef::from_raw(obj_ptr) };
-            for slot_idx in 0..header.num_slots as usize {
+            for slot_idx in 0..header.num_slots() as usize {
                 // Serialize the 16-byte read against striped mutator writes so
                 // we never observe a torn (tag, payload) pair. Held only for
                 // the duration of this single slot read.
@@ -924,7 +925,7 @@ pub(crate) fn concurrent_mark_object_size(header: *const ObjectHeader) -> Option
     match snapshot.kind_tag {
         tag if tag == ObjectKind::Array as u8 => {
             let element_type = array_element_type_from_tag(snapshot.element_tag)?;
-            let data_size = array_data_size(snapshot.array_length as usize, element_type).ok()?;
+            let data_size = array_data_size(snapshot.array_length() as usize, element_type).ok()?;
             HEADER_SIZE.checked_add(data_size)
         }
         tag if tag == ObjectKind::Object as u8 => {
@@ -933,12 +934,12 @@ pub(crate) fn concurrent_mark_object_size(header: *const ObjectHeader) -> Option
                 return None;
             }
             if snapshot.gc_flags & GC_FLAG_COMPACT != 0 {
-                return HEADER_SIZE.checked_add(snapshot.array_length as usize);
+                return HEADER_SIZE.checked_add(snapshot.compact_body_size()?);
             }
-            if snapshot.array_length != 0 || snapshot.num_slots > (1 << 24) {
+            if snapshot.num_slots() > (1 << 24) {
                 return None;
             }
-            let fields_size = (snapshot.num_slots as usize).checked_mul(SLOT_SIZE)?;
+            let fields_size = (snapshot.num_slots() as usize).checked_mul(SLOT_SIZE)?;
             HEADER_SIZE.checked_add(fields_size)
         }
         _ => None,
@@ -961,8 +962,7 @@ struct ConcurrentMarkHeaderSnapshot {
     class_id: u32,
     kind_tag: u8,
     element_tag: u8,
-    array_length: u32,
-    num_slots: u32,
+    shape: u32,
     gc_flags: u8,
 }
 
@@ -979,11 +979,33 @@ impl ConcurrentMarkHeaderSnapshot {
                 element_tag: std::ptr::addr_of!((*header).element_type)
                     .cast::<u8>()
                     .read_unaligned(),
-                array_length: std::ptr::addr_of!((*header).array_length).read_unaligned(),
-                num_slots: std::ptr::addr_of!((*header).num_slots).read_unaligned(),
+                shape: std::ptr::addr_of!((*header).shape).read_unaligned(),
                 gc_flags: std::ptr::addr_of!((*header).gc_flags).read_unaligned(),
             }
         }
+    }
+
+    #[inline]
+    fn array_length(&self) -> u32 {
+        if self.kind_tag == ObjectKind::Array as u8 {
+            self.shape
+        } else {
+            0
+        }
+    }
+
+    #[inline]
+    fn num_slots(&self) -> u32 {
+        self.shape
+    }
+
+    #[inline]
+    fn compact_body_size(&self) -> Option<usize> {
+        // Borrowing accessor: reads one `u32` and drops the handle, so there is
+        // no reason to pay an `Arc` clone/drop for it.
+        cratonvm_types::with_class_layout(self.class_id, self.num_slots(), |layout| {
+            layout.body_size as usize
+        })
     }
 }
 
@@ -1032,7 +1054,7 @@ mod tests {
             header.class_id = ClassId::new(1);
             header.kind = ObjectKind::Object;
             header.element_type = ArrayElementType::Byte;
-            header.num_slots = num_slots;
+            header.set_num_slots(num_slots);
             header.gc_age = 0;
             header.gc_flags = 0x01; // GC_FLAG_OLD_GEN
         }
@@ -1054,7 +1076,7 @@ mod tests {
             Some(HEADER_SIZE + 2 * SLOT_SIZE)
         );
 
-        header.array_length = 258;
+        header.shape = (1 << 24) + 1;
         assert_eq!(concurrent_mark_object_size(&header), None);
     }
 
@@ -1091,7 +1113,7 @@ mod tests {
             let h = &mut *(ptr_a as *mut ObjectHeader);
             h.class_id = ClassId::new(1);
             h.kind = ObjectKind::Object;
-            h.num_slots = 2;
+            h.set_num_slots(2);
             h.gc_flags = 0x01;
         }
 
@@ -1102,7 +1124,7 @@ mod tests {
             let h = &mut *(ptr_b as *mut ObjectHeader);
             h.class_id = ClassId::new(2);
             h.kind = ObjectKind::Object;
-            h.num_slots = 1;
+            h.set_num_slots(1);
             h.gc_flags = 0x01;
         }
 
@@ -1134,7 +1156,7 @@ mod tests {
             let h = &mut *(live_ptr as *mut ObjectHeader);
             h.class_id = ClassId::new(1);
             h.kind = ObjectKind::Object;
-            h.num_slots = 1;
+            h.set_num_slots(1);
             h.gc_flags = 0x01;
         }
 
@@ -1143,7 +1165,7 @@ mod tests {
             let h = &mut *(dead_ptr as *mut ObjectHeader);
             h.class_id = ClassId::new(2);
             h.kind = ObjectKind::Object;
-            h.num_slots = 1;
+            h.set_num_slots(1);
             h.gc_flags = 0x01;
         }
 
@@ -1167,7 +1189,7 @@ mod tests {
             let h = &mut *(ptr_a as *mut ObjectHeader);
             h.class_id = ClassId::new(1);
             h.kind = ObjectKind::Object;
-            h.num_slots = 1;
+            h.set_num_slots(1);
             h.gc_flags = 0x01;
         }
 
@@ -1177,7 +1199,7 @@ mod tests {
             let h = &mut *(ptr_b as *mut ObjectHeader);
             h.class_id = ClassId::new(2);
             h.kind = ObjectKind::Object;
-            h.num_slots = 1;
+            h.set_num_slots(1);
             h.gc_flags = 0x01;
         }
 
@@ -1235,7 +1257,7 @@ mod tests {
             let h = &mut *(ptr_a as *mut ObjectHeader);
             h.class_id = ClassId::new(1);
             h.kind = ObjectKind::Object;
-            h.num_slots = 1;
+            h.set_num_slots(1);
             h.gc_flags = 0x01;
         }
 
@@ -1245,7 +1267,7 @@ mod tests {
             let h = &mut *(ptr_b as *mut ObjectHeader);
             h.class_id = ClassId::new(2);
             h.kind = ObjectKind::Object;
-            h.num_slots = 1;
+            h.set_num_slots(1);
             h.gc_flags = 0x01;
         }
 
@@ -1313,7 +1335,7 @@ mod tests {
                     let h = &mut *(p as *mut ObjectHeader);
                     h.class_id = ClassId::new(i + 1);
                     h.kind = ObjectKind::Object;
-                    h.num_slots = 1;
+                    h.set_num_slots(1);
                     h.gc_flags = 0x01;
                 }
                 p
@@ -1511,7 +1533,7 @@ mod tests {
                 let h = &mut *(p as *mut ObjectHeader);
                 h.class_id = ClassId::new(i as u32 + 1);
                 h.kind = ObjectKind::Object;
-                h.num_slots = 1;
+                h.set_num_slots(1);
                 h.gc_flags = 0x01;
             }
             ptrs.push(p);
@@ -1551,7 +1573,7 @@ mod tests {
                 let h = &mut *(p as *mut ObjectHeader);
                 h.class_id = ClassId::new(id);
                 h.kind = ObjectKind::Object;
-                h.num_slots = 1;
+                h.set_num_slots(1);
                 h.gc_flags = 0x01;
             }
         }
@@ -1618,7 +1640,7 @@ mod tests {
                 let h = &mut *(p as *mut ObjectHeader);
                 h.class_id = ClassId::new(i + 1);
                 h.kind = ObjectKind::Object;
-                h.num_slots = 1;
+                h.set_num_slots(1);
                 h.gc_flags = 0x01;
             }
         }
@@ -1656,7 +1678,7 @@ mod tests {
             let h = &mut *(ptr_a as *mut ObjectHeader);
             h.class_id = ClassId::new(1);
             h.kind = ObjectKind::Object;
-            h.num_slots = 1;
+            h.set_num_slots(1);
             h.gc_flags = 0x01;
         }
         // Object B — the only legitimate target A's slot can point to.
@@ -1665,7 +1687,7 @@ mod tests {
             let h = &mut *(ptr_b as *mut ObjectHeader);
             h.class_id = ClassId::new(2);
             h.kind = ObjectKind::Object;
-            h.num_slots = 1;
+            h.set_num_slots(1);
             h.gc_flags = 0x01;
         }
 
@@ -1735,7 +1757,7 @@ mod tests {
             let h = &mut *(live as *mut ObjectHeader);
             h.class_id = ClassId::new(7);
             h.kind = ObjectKind::Object;
-            h.num_slots = 1;
+            h.set_num_slots(1);
             h.gc_flags = 0x01;
         }
 

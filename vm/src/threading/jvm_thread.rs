@@ -414,6 +414,31 @@ pub struct JvmThread {
     /// `native_alloc_pool`. `None` when the pool is empty.
     pub native_alloc_pool_layout: Option<(ClassId, usize)>,
 
+    // ---- handle scope support (arch/handles) ----
+    //
+    // Slot storage backing `NativeContext::handle_root`/`handle_get` (see
+    // `native_api::registry` and `cratonvm_types::handle`) — the GC-safe
+    // sibling of `native_pin_roots` just above. A handle reads through its
+    // slot on every access instead of caching an `ObjectRef` copy, so it
+    // cannot go stale across an allocating call the way a raw pinned-and-
+    // re-read local still can if a caller forgets the re-read step.
+    //
+    /// One entry per live handle slot. A `None` hole is a released
+    /// (`handle_scope_pop`-truncated-past or otherwise unrooted) slot; root
+    /// scanning (`memory::roots::collect_roots`) only visits `Some` entries.
+    /// Entries are appended by `handle_root` and released in bulk by
+    /// `handle_scope_pop` truncating back to a recorded base — never
+    /// reused mid-scope — mirroring `native_pin_roots`' own append/truncate
+    /// discipline.
+    pub handle_slots: Vec<Option<ObjectRef>>,
+    /// Stack of `handle_slots` lengths recorded by each `handle_scope_push`,
+    /// popped (and used to truncate `handle_slots`) by the matching
+    /// `handle_scope_pop`. Tracking the base on the thread itself (rather
+    /// than making every caller thread a base index through, as
+    /// `pin_native_root`'s callers must) is what lets handle scopes nest
+    /// across native call frames with a single push/pop pair each.
+    pub handle_scope_bases: Vec<usize>,
+
     /// Object result from the last `safe_native_call`: either an object return
     /// value before the interpreter pushes it onto the operand stack, or a
     /// native-thrown Java exception before the interpreter routes it through a
@@ -612,6 +637,8 @@ impl JvmThread {
             native_pin_roots: Vec::new(),
             native_alloc_pool: Vec::new(),
             native_alloc_pool_layout: None,
+            handle_slots: Vec::new(),
+            handle_scope_bases: Vec::new(),
             native_pending_return: None,
             jit_hashmap_string_node_cache: Vec::new(),
             string_case_cache: Vec::new(),

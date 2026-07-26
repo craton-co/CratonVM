@@ -569,7 +569,7 @@ fn bootstrap(vm: &mut Vm) {
             .is_err()
         {
             vm.main_thread.invoke_cache.clear();
-            vm.shared.resolution_cache.write().clear();
+            vm.shared.classes.resolution_cache.write().clear();
         }
         vm.shared.set_init_level(2);
     }
@@ -930,7 +930,7 @@ impl CratonValue {
 // before it is ever turned back into an `ObjectRef`.
 //
 // The table is layered on top of the VM's existing `JniGlobalRefs`
-// (`shared.jni_global_refs`), which is the only channel that (a) keeps the
+// (`shared.natives.jni_global_refs`), which is the only channel that (a) keeps the
 // referenced object alive as a GC root and (b) has its stored `ObjectRef`s
 // rewritten by the moving collector via `update_after_gc`. We never retain a
 // raw object address in this table; dedup compares against the current address
@@ -997,7 +997,7 @@ fn register_handle(shared: &SharedVm, o: Option<ObjectRef>) -> CratonRef {
         Err(_) => return 0,
     };
     let table = tables.entry(vm_key(shared)).or_default();
-    let mut grefs = shared.jni_global_refs.lock();
+    let mut grefs = shared.natives.jni_global_refs.lock();
     // Dedup by resolving each global ref to its current post-GC address. This
     // keeps the table correct when a moving collector rewrites the global refs.
     for (&tok, entry) in &mut table.by_token {
@@ -1030,7 +1030,7 @@ fn resolve_handle(shared: &SharedVm, h: CratonRef) -> Option<ObjectRef> {
     let gref = tables.get(&vm_key(shared))?.by_token.get(&h)?.gref;
     // `JniGlobalRefs::resolve` validates the gref is still live and returns the
     // current (post-GC) address.
-    shared.jni_global_refs.lock().resolve(gref)
+    shared.natives.jni_global_refs.lock().resolve(gref)
 }
 
 fn release_handle(shared: &SharedVm, h: CratonRef) -> bool {
@@ -1055,7 +1055,7 @@ fn release_handle(shared: &SharedVm, h: CratonRef) -> bool {
         .by_token
         .remove(&h)
         .expect("entry was present while releasing handle");
-    shared.jni_global_refs.lock().remove(entry.gref)
+    shared.natives.jni_global_refs.lock().remove(entry.gref)
 }
 
 fn decode_craton_args(api: &str, shared: &SharedVm, args: &[CratonValue]) -> Option<Vec<Value>> {
@@ -1087,7 +1087,7 @@ fn decode_craton_value(api: &str, shared: &SharedVm, value: CratonValue) -> Opti
 fn drop_handle_table(shared: &SharedVm) {
     if let Ok(mut tables) = handle_tables().lock() {
         if let Some(table) = tables.remove(&vm_key(shared)) {
-            let mut grefs = shared.jni_global_refs.lock();
+            let mut grefs = shared.natives.jni_global_refs.lock();
             for entry in table.by_token.into_values() {
                 grefs.remove(entry.gref);
             }
@@ -1569,7 +1569,7 @@ pub extern "C" fn cratonvm_string_utf8(vm: *mut CratonVm, str: CratonRef) -> *mu
                 };
                 // Reuse the VM's String reader (`vm::read_java_string`), the same
                 // primitive the JNIEnv `GetStringUTFChars` slot uses.
-                match cratonvm_vm::vm::read_java_string(&h.vm.shared.heap, oref) {
+                match cratonvm_vm::vm::read_java_string(&h.vm.shared.mem.heap, oref) {
                     Some(s) => {
                         // Strip interior NULs so `CString::new` cannot fail; the
                         // buffer is caller-owned (freed via cratonvm_free_string).
@@ -1726,7 +1726,7 @@ pub extern "C" fn cratonvm_invoke_virtual(
                 // most-derived class is exactly virtual dispatch (the same
                 // pattern `Vm::run_pending_finalizers` uses to virtual-dispatch
                 // `finalize()` on an object's concrete class).
-                let class_id = h.vm.shared.heap.class_id_of(recv);
+                let class_id = h.vm.shared.mem.heap.class_id_of(recv);
                 let class_name = match h.vm.class_name(class_id) {
                     Some(n) => n,
                     None => {
@@ -1792,7 +1792,7 @@ pub extern "C" fn cratonvm_object_class(
                         return JNI_ERR;
                     }
                 };
-                let class_id = h.vm.shared.heap.class_id_of(oref);
+                let class_id = h.vm.shared.mem.heap.class_id_of(oref);
                 if !out_class.is_null() {
                     // SAFETY: `out_class` checked non-null; writable per contract.
                     *out_class = class_id.as_u32() as CratonClass;
@@ -1871,9 +1871,10 @@ pub extern "C" fn cratonvm_field_count(vm: *mut CratonVm, obj: CratonRef) -> JIn
                         return -1;
                     }
                 };
-                let class_id = h.vm.shared.heap.class_id_of(oref);
+                let class_id = h.vm.shared.mem.heap.class_id_of(oref);
                 let n =
                     h.vm.shared
+                        .classes
                         .class_manager
                         .read()
                         .get_class(class_id)
@@ -1923,9 +1924,10 @@ pub extern "C" fn cratonvm_get_field(
                         return CratonValue::error();
                     }
                 };
-                let class_id = h.vm.shared.heap.class_id_of(oref);
+                let class_id = h.vm.shared.mem.heap.class_id_of(oref);
                 let nfields =
                     h.vm.shared
+                        .classes
                         .class_manager
                         .read()
                         .get_class(class_id)
@@ -1938,7 +1940,7 @@ pub extern "C" fn cratonvm_get_field(
                     return CratonValue::error();
                 }
                 // Bounds-checked above; `heap.get_field` reads the slot value.
-                let v = h.vm.shared.heap.get_field(oref, index as usize);
+                let v = h.vm.shared.mem.heap.get_field(oref, index as usize);
                 CratonValue::from_value(&h.vm.shared, v)
             })
         }
@@ -2119,7 +2121,7 @@ pub extern "C" fn cratonvm_get_field_by_name(
                     Some(s) => s,
                     None => return CratonValue::error(),
                 };
-                let class_id = h.vm.shared.heap.class_id_of(oref);
+                let class_id = h.vm.shared.mem.heap.class_id_of(oref);
                 match h.vm.instance_field_index(class_id, field_name) {
                     Some(idx) => {
                         CratonValue::from_value(&h.vm.shared, h.vm.get_instance_field(oref, idx))
@@ -2171,7 +2173,7 @@ pub extern "C" fn cratonvm_set_field(
                         return JNI_ERR;
                     }
                 };
-                let class_id = h.vm.shared.heap.class_id_of(oref);
+                let class_id = h.vm.shared.mem.heap.class_id_of(oref);
                 let nfields = h.vm.instance_field_count(class_id);
                 if index < 0 || (index as usize) >= nfields {
                     set_last_error(format!(
@@ -2228,7 +2230,7 @@ pub extern "C" fn cratonvm_set_field_by_name(
                     Some(s) => s,
                     None => return JNI_ERR,
                 };
-                let class_id = h.vm.shared.heap.class_id_of(oref);
+                let class_id = h.vm.shared.mem.heap.class_id_of(oref);
                 match h.vm.instance_field_index(class_id, field_name) {
                     Some(idx) => {
                         let value = match decode_craton_value(
@@ -2492,7 +2494,11 @@ mod tests {
         let first = register_handle(&shared, Some(old));
         let mut pointer_map = std::collections::HashMap::new();
         pointer_map.insert(old.as_ptr() as usize, moved.as_ptr() as usize);
-        shared.jni_global_refs.lock().update_after_gc(&pointer_map);
+        shared
+            .natives
+            .jni_global_refs
+            .lock()
+            .update_after_gc(&pointer_map);
 
         let after_move = register_handle(&shared, Some(moved));
         assert_eq!(
@@ -3213,10 +3219,12 @@ mod tests {
         // cycle counter (to prove a collection actually fired under the churn).
         let baseline = cratonvm_vm::native::jni::process_vm()
             .expect("process_vm published")
+            .threads
             .thread_registry
             .alive_count();
         let gc_before = cratonvm_vm::native::jni::process_vm()
             .expect("process_vm published")
+            .mem
             .heap
             .collection_count();
 
@@ -3356,14 +3364,14 @@ mod tests {
                 if let Some(vm) = cratonvm_vm::native::jni::process_vm() {
                     eprintln!(
                         "[soak/watchdog] alive={} stw_requested={} blocked={} pending(expected-arrived)={}",
-                        vm.thread_registry.alive_count(),
-                        vm.gc_barrier
+                        vm.threads.thread_registry.alive_count(),
+                        vm.mem.gc_barrier
                             .stw_requested
                             .load(std::sync::atomic::Ordering::Acquire),
-                        vm.gc_barrier.blocked_count(),
-                        vm.gc_barrier.pending_count(),
+                        vm.mem.gc_barrier.blocked_count(),
+                        vm.mem.gc_barrier.pending_count(),
                     );
-                    for (tid, blocked, snap) in vm.thread_registry.dump_blocked_states() {
+                    for (tid, blocked, snap) in vm.threads.thread_registry.dump_blocked_states() {
                         eprintln!(
                             "[soak/watchdog]   tid={tid} blocked={blocked} snapshot_len={snap}"
                         );
@@ -3401,6 +3409,7 @@ mod tests {
         // matched by a detach that deregistered its thread.
         let after = cratonvm_vm::native::jni::process_vm()
             .expect("process_vm still live")
+            .threads
             .thread_registry
             .alive_count();
         assert_eq!(
@@ -3413,6 +3422,7 @@ mod tests {
         // the caller forced a large heap / few iterations for bisection.)
         let gc_after = cratonvm_vm::native::jni::process_vm()
             .expect("process_vm still live")
+            .mem
             .heap
             .collection_count();
         if iters >= 64 {

@@ -320,7 +320,7 @@ fn invoke_one_premain(
     // helper classes loadable, which is the practical effect that
     // Mockito / Jacoco rely on.
     {
-        let mut cm = shared.class_manager.write();
+        let mut cm = shared.classes.class_manager.write();
         let mut paths: Vec<String> = agent
             .boot_class_path
             .iter()
@@ -392,8 +392,8 @@ fn invoke_one_premain(
         Ok(_) => Ok(()),
         Err(MethodCallFailed::ExceptionThrown(exc_ref)) => {
             let exc_class_name = {
-                let cm = shared.class_manager.read();
-                let cid = shared.heap.class_id_of(exc_ref);
+                let cm = shared.classes.class_manager.read();
+                let cid = shared.mem.heap.class_id_of(exc_ref);
                 cm.get_class(cid)
                     .map(|c| c.name.to_string())
                     .unwrap_or_else(|| format!("class#{cid}"))
@@ -431,12 +431,12 @@ fn build_instrumentation_mirror(
 
     // Pull num_total_fields so we allocate the right object size.
     let num_fields = {
-        let cm = shared.class_manager.read();
+        let cm = shared.classes.class_manager.read();
         cm.get_class(class_id)
             .map(|c| c.num_total_fields)
             .unwrap_or(0)
     };
-    let inst_obj = shared.heap.alloc_object(class_id, num_fields);
+    let inst_obj = shared.mem.heap.alloc_object(class_id, num_fields);
 
     // The real-JDK constructor enters VM-private instrumentation setup.  The
     // mirror is instead backed by CratonVM's Instrumentation operations, so it
@@ -452,7 +452,7 @@ fn build_instrumentation_mirror(
 /// given name and descriptor. Used to pick the two-arg-vs-one-arg
 /// `premain` overload.
 fn method_present(shared: &SharedVm, class_internal: &str, name: &str, descriptor: &str) -> bool {
-    let cm = shared.class_manager.read();
+    let cm = shared.classes.class_manager.read();
     let cid = match cm.get_loaded_class_id(class_internal) {
         Some(id) => id,
         None => return false,

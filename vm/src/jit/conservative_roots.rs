@@ -369,49 +369,65 @@ pub fn shadow_stack_enabled() -> bool {
 /// (Cheney) young collection even while JIT frames are live instead of diverting
 /// to the non-moving sweep.
 ///
-/// # This is a DELEGATION, not a policy decision (arch-2026-07-26)
+/// # This is an INTERLOCK, not an independent policy decision (arch-2026-07-26)
 ///
-/// This used to be an independent `std::env::var_os("CRATONVM_MOVING_YOUNG")`
-/// read — the second of **three** copies of the same predicate, alongside
+/// This used to be its own `std::env::var_os("CRATONVM_MOVING_YOUNG")` read —
+/// the second of **three** copies of the same predicate, alongside
 /// `cratonvm_jit::x64::moving_young_enabled` (codegen) and
 /// `cratonvm_gc::gc_quiescence::moving_young_enabled` (collector). Three
-/// independent reads of one safety-critical switch means the default cannot be
+/// independent reads of one safety-critical switch mean the default cannot be
 /// flipped safely: flipping the collector without the codegen relocates objects
 /// whose only home is a JIT register that no shadow push ever recorded, and
 /// flipping the root gatherer without the codegen suppresses the conservative
-/// backstop while nothing precise replaced it.
+/// backstop with nothing precise replacing it.
 ///
-/// The **codegen** side is now the single source of truth — it is the side that
-/// must physically emit the shadow push/reload and the per-safepoint coverage
-/// bit, so it is the only side that can be wrong in a way nothing else can
-/// compensate for. This function returns that decision verbatim and, on the way
-/// through, publishes it to the GC crate (which cannot call into the JIT crate:
-/// `cratonvm-gc` has no `cratonvm-jit` dependency, only a dev-dependency).
-/// Flipping the default is therefore now a ONE-CONSTANT change in
-/// `jit/src/x64.rs`; no skew between the three layers is representable.
+/// The effective gate is the **conjunction** of two questions that are answered
+/// in different crates:
+///
+///   * *Can* we move? — `cratonvm_jit::x64::moving_young_enabled()`. Only the
+///     codegen can physically emit the shadow push/reload and the
+///     per-safepoint `moving_young_coverage_complete` bit. If it says no,
+///     nothing anywhere else can make relocation safe.
+///   * *Should* we move? — `cratonvm_types::flags().gc.moving_young`, the typed
+///     config (opt-OUT `CRATONVM_NO_MOVING_YOUNG` over
+///     `flags::DEFAULT_MOVING_YOUNG`).
+///
+/// AND-ing them is fail-safe in both directions and closes a live gap: today
+/// `x64` still parses `CRATONVM_MOVING_YOUNG` itself, so without the AND a user
+/// setting `CRATONVM_NO_MOVING_YOUNG` alongside a stale `CRATONVM_MOVING_YOUNG`
+/// would be silently ignored on the codegen side.
+///
+/// The result is then published to the GC crate, which cannot call into the JIT
+/// crate (`cratonvm-gc` has no `cratonvm-jit` dependency, only a
+/// dev-dependency). So the collector always relocates against the same answer
+/// the codegen compiled for, and no skew between the three layers is
+/// representable. Flipping the default becomes a one-constant change in
+/// `cratonvm_types::flags::DEFAULT_MOVING_YOUNG` once `x64` reads that field
+/// instead of the raw variable — see that constant's docs for the exact patch.
 #[inline]
 pub fn moving_young_enabled() -> bool {
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        // The authoritative gate. `x64::moving_young_enabled` is itself a
-        // `OnceLock`, so this is a single resolution for the process.
-        let on = cratonvm_jit::x64::moving_young_enabled();
-        // Hand the collector the same answer. The GC reads it on the path of
-        // every collection; until this publish it uses its own fail-safe
-        // (non-moving) seed, so the window before the first JIT-aware root
-        // gather can only be conservative, never unsound.
+        // `x64::moving_young_enabled` is itself a `OnceLock`, and `flags()`
+        // latches on first use, so this resolves once for the process.
+        let on = cratonvm_jit::x64::moving_young_enabled()
+            && cratonvm_types::flags().gc.moving_young;
+        // Hand the collector the same answer. Before this publish the GC uses
+        // `gc_flags().moving_young` on its own, which is only reachable in a
+        // process with no JIT at all — where there are no JIT frames and moving
+        // is unconditionally safe.
         cratonvm_gc::gc_quiescence::publish_moving_young_enabled(on);
         on
     })
 }
 
-/// Re-publish the codegen-side moving-young decision to the GC crate.
+/// Re-publish the moving-young decision to the GC crate.
 ///
-/// Cheap (one relaxed-ish store behind an already-resolved `OnceLock`) and
-/// called from the root gatherer so the collector's view is refreshed on the
-/// path of every collection, even if the first `moving_young_enabled()` call
-/// happened on a different thread than the one that will collect.
+/// Cheap (one store behind an already-resolved `OnceLock`) and called from the
+/// root gatherer so the collector's view is refreshed on the path of every
+/// collection, even if the first `moving_young_enabled()` call happened on a
+/// different thread than the one that will collect.
 #[inline]
 pub fn publish_moving_young_gate() {
     let _ = moving_young_enabled();
@@ -588,6 +604,7 @@ pub(crate) fn push_entry_full(entry: JitFrameChainEntry) -> usize {
         n
     });
     GLOBAL_JIT_DEPTH.fetch_add(1, Ordering::Release);
+    cratonvm_jit::jit_execution_enter();
     // Mirror into the GC-side quiescence flag so the GC can defer
     // compaction whenever any thread is inside a JIT call. NEW-12's
     // precise root walk removes false positives from the root set,
@@ -629,6 +646,7 @@ pub fn pop_jit_entry() -> Option<usize> {
     if let Some(entry) = popped {
         GLOBAL_JIT_DEPTH.fetch_sub(1, Ordering::Release);
         cratonvm_gc::gc_quiescence::leave();
+        cratonvm_jit::jit_execution_leave();
         Some(entry.entry_sp)
     } else {
         None
@@ -680,6 +698,7 @@ pub fn prune_returned_jit_entries(scanner_sp: usize) -> usize {
     for _ in 0..pruned {
         GLOBAL_JIT_DEPTH.fetch_sub(1, Ordering::Release);
         cratonvm_gc::gc_quiescence::leave();
+        cratonvm_jit::jit_execution_leave();
     }
     if pruned > 0 {
         tracing::debug!(
@@ -705,6 +724,7 @@ pub fn prune_returned_jit_entries(scanner_sp: usize) -> usize {
 pub struct JitEntryGuard {
     /// Depth at the moment of construction; used as a sanity check on drop.
     depth_at_push: usize,
+    active_class_id: Option<u32>,
 }
 
 impl JitEntryGuard {
@@ -720,7 +740,10 @@ impl JitEntryGuard {
     pub fn enter() -> Self {
         let sp = current_stack_pointer();
         let depth_at_push = push_jit_entry_at(sp);
-        Self { depth_at_push }
+        Self {
+            depth_at_push,
+            active_class_id: None,
+        }
     }
 
     /// NEW-12: push a JIT entry that carries precise-frame metadata.
@@ -755,7 +778,10 @@ impl JitEntryGuard {
             }),
         };
         let depth_at_push = push_entry_full(entry);
-        Self { depth_at_push }
+        Self {
+            depth_at_push,
+            active_class_id: cratonvm_types::jit_activation::enter(cm.entry_ptr() as usize),
+        }
     }
 }
 
@@ -778,6 +804,9 @@ impl Drop for JitEntryGuard {
             "JitEntryGuard::drop: chain underflow (was depth {})",
             self.depth_at_push
         );
+        if let Some(class_id) = self.active_class_id.take() {
+            cratonvm_types::jit_activation::exit(class_id);
+        }
     }
 }
 
@@ -2554,39 +2583,57 @@ mod tests {
         assert_eq!(current_thread_jit_depth(), local_before);
     }
 
-    /// The moving-young gate must be ONE decision, not three agreeing ones.
+    /// The moving-young gate must be ONE decision that all three layers see,
+    /// not three independently-parsed ones that happen to agree.
     ///
-    /// The codegen side owns it (it emits the shadow push/reload and the
-    /// per-safepoint coverage bit); the root gatherer and the collector must
-    /// follow. If this ever fails, a default flip on either of the other two
-    /// layers has re-introduced the skew that makes moving-young unsound.
+    /// Effective gate = codegen *can* AND config *wants*; the collector then
+    /// gets that answer published to it. If this ever fails, a default flip on
+    /// one layer has re-introduced the skew that makes moving-young unsound.
     #[test]
     fn moving_young_gate_is_a_single_decision_across_all_three_layers() {
-        let codegen = cratonvm_jit::x64::moving_young_enabled();
+        let expected =
+            cratonvm_jit::x64::moving_young_enabled() && cratonvm_types::flags().gc.moving_young;
         assert_eq!(
             moving_young_enabled(),
-            codegen,
-            "the root gatherer must delegate to the codegen gate, never decide \
-             independently — suppressing the conservative backstop while the \
-             codegen emitted no precise map is silent heap corruption",
+            expected,
+            "the root gatherer must never decide independently — suppressing the \
+             conservative backstop while the codegen emitted no precise map is \
+             silent heap corruption",
         );
         // Reading the gate publishes it; the collector must now agree too.
         publish_moving_young_gate();
         assert_eq!(
             cratonvm_gc::gc_quiescence::moving_young_enabled(),
-            codegen,
+            expected,
             "the collector must relocate only when the codegen actually emitted \
-             a rewritable root map",
+             a rewritable root map AND the config asked for compaction",
         );
     }
 
-    /// With moving-young off (the state this gate is in until the codegen-side
-    /// constant flips), the collection-authoritative refresh is a no-op that
-    /// reports "proven" — the coverage machinery must not impose cost or
-    /// verdicts on the legacy path.
+    /// The codegen gate is a veto the config cannot override.
+    ///
+    /// `jit/src/x64.rs` still parses `CRATONVM_MOVING_YOUNG` itself rather than
+    /// reading `flags().gc.moving_young`, so a config-side default flip alone
+    /// must NOT be able to switch the collector on. Guards the exact mistake
+    /// that would turn a one-line flip into heap corruption.
+    #[test]
+    fn codegen_gate_vetoes_moving_young_regardless_of_config() {
+        if !cratonvm_jit::x64::moving_young_enabled() {
+            assert!(
+                !moving_young_enabled(),
+                "no shadow push/reload was ever emitted, so nothing may relocate \
+                 behind a JIT frame no matter what the typed config says",
+            );
+        }
+    }
+
+    /// With moving-young off (the state this gate is in until
+    /// `flags::DEFAULT_MOVING_YOUNG` flips and the codegen reads it), the
+    /// collection-authoritative refresh is a no-op that reports "proven" — the
+    /// coverage machinery must not impose cost or verdicts on the legacy path.
     #[test]
     fn collection_coverage_refresh_is_inert_when_moving_young_is_off() {
-        if cratonvm_jit::x64::moving_young_enabled() {
+        if moving_young_enabled() {
             return; // validating a moving-young build; nothing to assert here
         }
         assert!(refresh_moving_young_coverage_for_collection());

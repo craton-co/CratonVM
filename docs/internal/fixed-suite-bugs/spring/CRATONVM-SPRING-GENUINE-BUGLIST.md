@@ -3327,7 +3327,7 @@ rule `uri_scheme_name_fail_index` already enforced for exceptions). The class is
     passed / 16 failed, and the failing set is EXACTLY the pre-existing, already-documented
     9 debug-build-only `lock_order` + 7 parallel-race `jit::skip_list` tests (see Round-3's
     "16 then 17 failures" note above) — zero new failures. The `binarytrees` checksum oracle
-    (`docs/internal/repros/gc-stress-bintrees-main-args/binarytrees.java`, the heaviest
+    (`../repros/gc-stress-bintrees-main-args/binarytrees.java`, the heaviest
     allocation/GC-stress repro in the tree) was run at all three documented depths with
     `CRATONVM_DBG_VERIFY_TRUSTED_ROOTS=1`: bt14 (checksum `3222190`), bt16 (`14985902`), bt18
     (`68332206`, `-Xmx8g`) — all three matched the documented golden checksums exactly, and ZERO

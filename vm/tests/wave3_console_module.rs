@@ -18,7 +18,7 @@
 //! Acceptance:
 //!
 //! 1. The triple `(java/lang/Module, canUse, (Ljava/lang/Class;)Z)` is
-//!    present in `shared.native_methods` after VM construction.
+//!    present in `shared.natives.native_methods` after VM construction.
 //! 2. Subprocess: `apps/console_probe/ConsoleProbe.java` (`System.console()`
 //!    on a non-TTY) prints `console=null` + `OK` and exits 0 under
 //!    `CRATONVM_STRICT_SWALLOWS=1`. Any regression that lets the
@@ -43,6 +43,7 @@ fn module_canuse_class_is_registered() {
     let shared = shared();
     assert!(
         shared
+            .natives
             .native_methods
             .find("java/lang/Module", "canUse", "(Ljava/lang/Class;)Z")
             .is_some(),

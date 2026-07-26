@@ -41,6 +41,7 @@
 //! through to the checked path instead, but that checked path's own
 //! validation was not audited as part of this change).
 
+use crate::gc_flags;
 use std::sync::OnceLock;
 
 /// Address of the most recent stale `ObjectRef` the canary panicked on, for
@@ -56,8 +57,7 @@ pub static LAST_STALE_ADDR: std::sync::atomic::AtomicUsize = std::sync::atomic::
 /// every other `CRATONVM_DBG_*` flag — see `vm/src/runtime/env_cache.rs`).
 #[inline]
 pub fn enabled() -> bool {
-    static E: OnceLock<bool> = OnceLock::new();
-    *E.get_or_init(|| std::env::var_os("CRATONVM_DBG_STALE_OBJREF").is_some())
+    gc_flags().dbg_stale_objref
 }
 
 /// Number of minor-GC cycles each just-evacuated young from-space arena is
@@ -72,12 +72,5 @@ pub fn enabled() -> bool {
 /// the wrong-object read still happened). Costs `N x young-semispace` bytes
 /// while the flag is set; ignored entirely when it is not.
 pub fn quarantine_cycles() -> usize {
-    static N: OnceLock<usize> = OnceLock::new();
-    *N.get_or_init(|| {
-        std::env::var("CRATONVM_DBG_STALE_OBJREF_CYCLES")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .filter(|&n| n >= 1)
-            .unwrap_or(1)
-    })
+    crate::gc_flags().dbg_stale_objref_cycles
 }
