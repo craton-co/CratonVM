@@ -108,6 +108,34 @@ pub(crate) fn register_reference_natives(registry: &mut NativeMethodRegistry) {
         native_brave_weak_key_equals,
     );
 
+    // Same underlying defect as the Brave bridge above (see its comment): a
+    // shared/polymorphic `Object.equals()` call site inside
+    // `ConcurrentHashMap`'s internals can resolve to the wrong override for a
+    // rarely-exercised receiver class, silently falling back to identity
+    // comparison. Mockito's `mockito-core`'s own `WeakConcurrentMap` vendors
+    // the exact same WeakKey/LatentKey asymmetric-equals design as Brave's
+    // (both libraries independently converged on the same pattern for a
+    // GC-aware identity map), and hits the identical dispatch failure: a
+    // freshly created mock's entry is unfindable via
+    // `WeakConcurrentMap.get()` after `put()` genuinely stored it, because
+    // `LatentKey.equals(WeakKey)` (or the reverse) never actually reaches
+    // Mockito's own bytecode. Confirmed via `Mockito.verify(mock)` throwing
+    // `NotAMockException` for a mock created and used successfully moments
+    // earlier (`docs/known-issues/springboot/tomcatservletwebserverservletcontextlistenertests-mockito-forkedclasspath-mockmethodadvice.md`).
+    // Bridge both directions explicitly, mirroring Mockito's own semantics.
+    registry.register(
+        "org/mockito/internal/util/concurrent/WeakConcurrentMap$WeakKey",
+        "equals",
+        "(Ljava/lang/Object;)Z",
+        native_mockito_weak_key_equals,
+    );
+    registry.register(
+        "org/mockito/internal/util/concurrent/WeakConcurrentMap$LatentKey",
+        "equals",
+        "(Ljava/lang/Object;)Z",
+        native_mockito_latent_key_equals,
+    );
+
     // SoftReference constructors
     registry.register(
         "java/lang/ref/SoftReference",
@@ -207,6 +235,61 @@ fn native_brave_weak_key_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     let referent = ctx.get_field(*this, REF_FIELD_REFERENT);
     Ok(Some(Value::Int(
         matches!(referent, Value::Object(Some(value)) if value == *other) as i32,
+    )))
+}
+
+/// `WeakConcurrentMap$WeakKey.equals(Object)` — mirrors Mockito's own
+/// bytecode: `other instanceof LatentKey ? ((LatentKey) other).key ==
+/// this.get() : ((WeakKey) other).get() == this.get()`. See the registration
+/// site's comment for why the real bytecode is unreliable here.
+fn native_mockito_weak_key_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let Some(Value::Object(Some(this))) = args.first() else {
+        return Ok(Some(Value::Int(0)));
+    };
+    let Some(Value::Object(Some(other))) = args.get(1) else {
+        return Ok(Some(Value::Int(0)));
+    };
+    let this_referent = ctx.get_field_by_name(*this, "referent");
+    let is_latent = ctx.class_name_of_id(ctx.class_id_of_object(*other)).as_deref()
+        == Some("org/mockito/internal/util/concurrent/WeakConcurrentMap$LatentKey");
+    let other_key = if is_latent {
+        ctx.get_field_by_name(*other, "key")
+    } else {
+        ctx.get_field_by_name(*other, "referent")
+    };
+    Ok(Some(Value::Int(
+        (matches!((this_referent, other_key),
+            (Value::Object(a), Value::Object(b)) if a == b))
+            as i32,
+    )))
+}
+
+/// `WeakConcurrentMap$LatentKey.equals(Object)` — mirrors Mockito's own
+/// bytecode: `other instanceof LatentKey ? other.key == this.key :
+/// ((WeakKey) other).get() == this.key`.
+fn native_mockito_latent_key_equals(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let Some(Value::Object(Some(this))) = args.first() else {
+        return Ok(Some(Value::Int(0)));
+    };
+    let Some(Value::Object(Some(other))) = args.get(1) else {
+        return Ok(Some(Value::Int(0)));
+    };
+    let this_key = ctx.get_field_by_name(*this, "key");
+    let other_key = if ctx.class_name_of_id(ctx.class_id_of_object(*other))
+        .as_deref()
+        == Some("org/mockito/internal/util/concurrent/WeakConcurrentMap$LatentKey")
+    {
+        ctx.get_field_by_name(*other, "key")
+    } else {
+        ctx.get_field_by_name(*other, "referent")
+    };
+    Ok(Some(Value::Int(
+        (matches!((this_key, other_key),
+            (Value::Object(a), Value::Object(b)) if a == b))
+            as i32,
     )))
 }
 

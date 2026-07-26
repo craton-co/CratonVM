@@ -3835,7 +3835,7 @@ pub(crate) fn native_unsafe_allocate_memory_realloc(
 
 mod unsafe_arena {
     use parking_lot::{Mutex, RwLock};
-    use std::collections::{HashMap, HashSet};
+    use std::collections::{BTreeMap, HashSet};
 
     /// R1 (silent-corruption fix): reserved high tag bit OR-ed into every
     /// arena handle. Real OS pointers on every platform CratonVM targets live
@@ -3863,14 +3863,14 @@ mod unsafe_arena {
     }
 
     pub(super) struct ArenaStore {
-        inner: RwLock<HashMap<i64, Arena>>,
+        inner: RwLock<BTreeMap<i64, Arena>>,
         next_addr: Mutex<i64>,
     }
 
     impl ArenaStore {
         fn new() -> Self {
             Self {
-                inner: RwLock::new(HashMap::new()),
+                inner: RwLock::new(BTreeMap::new()),
                 next_addr: Mutex::new(ARENA_BASE),
             }
         }
@@ -3957,23 +3957,29 @@ mod unsafe_arena {
 
         // audit-2026-05-16: find the arena whose `[base, base+size)`
         // contains `addr`. The previous impl looked up `addr` as the
-        // HashMap key directly, which only succeeded at offset 0.
-        fn locate(inner: &HashMap<i64, Arena>, addr: i64) -> Option<(i64, usize)> {
-            if let Some(arena) = inner.get(&addr) {
-                if !arena.bytes.is_empty() {
-                    return Some((addr, 0));
-                }
+        // HashMap key directly, which only succeeded at offset 0, so a
+        // fallback full scan over every live arena was added to cover
+        // non-zero offsets.
+        //
+        // PERF FIX (2026-07-25, H2 TestFileSystem.testConcurrent profiling):
+        // that O(n)-in-live-arena-count scan was the single dominant cost
+        // (~24% of total CPU, `perf record -F 999`, 38854 samples) of a
+        // real-disk-I/O workload doing many small Unsafe reads/writes
+        // through direct ByteBuffers backed by this arena store — every
+        // non-zero-offset byte/short/int/long access re-scanned every live
+        // arena. `next_addr` in `allocate()` only ever increases, so live
+        // arenas are always disjoint, non-overlapping `[base, base+len)`
+        // ranges keyed by their (ordered) base address — exactly what a
+        // `BTreeMap` range query answers in O(log n): the arena containing
+        // `addr`, if any, is the one with the largest base <= addr.
+        fn locate(inner: &BTreeMap<i64, Arena>, addr: i64) -> Option<(i64, usize)> {
+            let (&base, arena) = inner.range(..=addr).next_back()?;
+            let offset = (addr - base) as u64;
+            if offset < arena.bytes.len() as u64 {
+                Some((base, offset as usize))
+            } else {
+                None
             }
-            for (&base, arena) in inner.iter() {
-                if addr < base {
-                    continue;
-                }
-                let offset = (addr - base) as u64;
-                if offset < arena.bytes.len() as u64 {
-                    return Some((base, offset as usize));
-                }
-            }
-            None
         }
 
         fn read<const N: usize>(&self, addr: i64) -> Option<[u8; N]> {

@@ -57,7 +57,7 @@ on this shared box it is often the only trustworthy one.
   memory-heavy rows more — so ratios, not absolute times, are the durable
   content across host re-provisionings.
 
-### Current table (measured 2026-07-18, Binary Trees re-validated 2026-07-24)
+### Current table (2026-07-18; HashMap and String/Regex re-measured 2026-07-25, Binary Trees re-validated 2026-07-24)
 
 | Benchmark                         | JDK 25 C2 | CratonVM  | Ratio |
 |-----------------------------------|-----------|-----------|-------|
@@ -65,12 +65,49 @@ on this shared box it is often the only trustworthy one.
 | Fibonacci(44)                     | 1,719 ms  | 4,790 ms  | 2.79x |
 | Sieve (100K × 20,000)             | 2,851 ms  | 6,508 ms  | 2.28x |
 | Matrix 1280×1280                  | 2,349 ms  | 6,875 ms  | 2.93x |
-| HashMap (10M put/get, isolated)   | 1,471 ms  | 5,488 ms  | 3.73x |
-| String/Regex (100K, isolated)     | 54 ms     | 193 ms    | 3.57x |
+| HashMap (10M put/get, isolated)   | 1,039 ms  | 22,077 ms | **21.2x** |
+| String/Regex (100K, isolated)     | 55 ms     | 423 ms    | **7.7x** |
 | Binary Trees (depth 18, isolated) | 176 ms    | 1,468 ms  | 8.34x |
 
 Row notes:
 
+- **HashMap and String/Regex regressed, and it is CratonVM's regression, not
+  the host's.** Re-measured 2026-07-25 with `bench/HashMapOnly.java` and
+  `bench/StringRegexOnly.java` as alternating fresh-process pairs on one pinned
+  core, `-Xmx8g` both sides, every checksum exact (`1549999915000000`,
+  `5000050000`). HashMap 3.73x → **21.2x**, String/Regex 3.57x → **7.7x**.
+  What makes this a CratonVM regression rather than a slower box: on the *same
+  runs* HotSpot reproduced its own recorded numbers — String/Regex **55 vs 54
+  ms** — or beat them — HashMap **1,039 vs 1,471 ms**. CratonVM is 2.2x
+  (String/Regex) to 4.0x (HashMap) off its own 07-18 figures. Scale dependence,
+  same session: HashMap at n=1M is 47 ms vs 2,005 ms (**42.7x**), so the gap is
+  not GC-scaling at the 10M live set — it is worse at the small size.
+  Cross-reference the OPEN items below: this is *not* host load (the same gap
+  reproduces on a quiet host with <1% run-to-run spread) and *not* anything
+  landed since the perf-gate baselines were anchored on 07-24 (the anchor
+  commit `e57f0bc7d` measures identically to current `dev`).
+  The other five rows have no fresh paired HotSpot run and are left at their
+  07-18 values rather than half-updated.
+- **The regression is CONFIRMED and bounded to `a36b9d121..e57f0bc7d`.**
+  `a36b9d121` (07-18, the commit that recorded the 5,488 / 193 ms figures) was
+  rebuilt fat-LTO and run three-way against HotSpot and current `dev`,
+  alternating on one pinned core. The 07-18 binary still reproduces its own
+  recorded numbers; `dev` does not:
+
+  | | HotSpot | cratonvm@07-18 | cratonvm@dev | dev vs 07-18 |
+  |---|---|---|---|---|
+  | HashMap 10M | 1,415 ms | 2,827 ms | 25,063 ms | **8.9x slower** |
+  | HashMap 1M | 54 ms | 434 ms | 3,084 ms | **7.1x slower** |
+  | String/Regex 100K | 66 ms | 181 ms | 484 ms | **2.7x slower** |
+
+  String/Regex at 07-18 measures 181 ms against its recorded 193 ms — the old
+  binary is healthy. (This run sat at load ~10, so absolutes are inflated for
+  every arm; the three arms were interleaved, so the *ratios* hold. That the
+  07-18 arm still lands near its recorded value under that load only
+  strengthens the read.) The range is 137 first-parent commits (983 including
+  merged branches), so ~8 bisect steps. **Bisect on HashMap 1M** — it shows the
+  regression at 7.1x, runs in seconds rather than 25 s, and needs no quiet host
+  at that effect size.
 - **Fibonacci** is recursion-bound; the recursive self-call already
   compiles to a guarded direct call, and the remaining gap is register
   allocation and recursion inlining, which the current backends do not do.
