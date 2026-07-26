@@ -118,3 +118,62 @@ KC26-PIC.1/KC26-RX.1 and RBC.1's crypto-adjacent tests together; (4) fetch
 one of the missing Spring Boot fixture apps to unblock the remaining SPB.x
 package-level family in bulk (matches prior sessions' own top
 recommendation, never completed due to host provisioning).
+
+## Update 2026-07-26 (same day, continuation after the prior "blocked, no fixture" claims were challenged)
+
+The user pointed out that fixture apps for this sweep DO exist on the
+Azure host and told this session to search harder. That search found real
+fixtures for three of the four families previously marked "blocked, no
+fixture," all of which were simply named after the specific investigation
+they were built for rather than the technology itself, so the earlier
+`find -iname '*groovy*'` / `'*hibernate*'` / `'*elasticsearch*'` /
+`'*keycloak*'` sweeps missed them:
+
+- **ANTLR.1** (`groovyjarjarantlr4/`) — found `groovy-3.0.21.jar` (844
+  shaded-antlr4 classes) already cached in `.gradle`, plus a prior
+  session's own probe directory at `/data/tmp/groovy-antlr4-probe/` and
+  build logs at `/data/tmp/groovy-antlr4-build*.log` — evidence a fixture
+  existed all along. **REMOVED** — real cold-parse throughput retest
+  shows the ~8x regression this ban's only remaining justification relied
+  on no longer holds.
+- **HIB-ANTLR.1** / **HIB-TEMPORAL.1** (`org/antlr/v4/runtime/` /
+  `org/hibernate/`) — found a full real Hibernate ORM 8.0 test harness at
+  `apps/hibernate-orm-harness/` (compiled `hibernate-core` test classes +
+  full runtime classpath + a JUnit5 Platform Launcher driver). HIB-ANTLR.1
+  **REMOVED** (own claim doesn't reproduce, though shadowed by
+  HIB-LONGTAIL.1 regardless). HIB-TEMPORAL.1 **CONFIRMED STILL NEEDED** —
+  and MORE severe than documented: lifting it causes a full
+  `StrategySelectionException` Hibernate bootstrap failure, not just a
+  narrow DDL-descriptor NPE.
+- **ES fragile cluster** (`org/elasticsearch/`) — found a full real
+  Elasticsearch 9.6.0-SNAPSHOT checkout at
+  `/data/data/es-fixture-ivfknn-slicesdense-closure-20260717/` (2555
+  compiled test classes, `test/framework` module, `libvec.so` already
+  built). **CONFIRMED STILL NEEDED** — an 18-class spread sample found a
+  real regression (`FloatFieldBlockLoaderTests`: 38→41 failures under
+  JIT); the true failure surface across the full suite is likely larger,
+  not yet fully characterized.
+- **KC26-PIC.1 / KC26-RX.1** (Keycloak) — found a full real Keycloak
+  26.6.1 Maven repo + bootable quarkus-dist server at
+  `/home/victor/.m2/repository/org/keycloak/`. Still blocked, but for a
+  **different, more specific reason** than "no fixture": booting the real
+  server fails immediately in `Version.<clinit>` with a
+  `getResourceAsStream("/keycloak-version.properties")` classloading gap
+  — a real, separate (non-JIT) bug, not yet root-caused. See
+  `docs/known-issues/keycloak-boot-blocked-version-null-20260726.md`.
+
+**Lesson for future searches:** when a prior "no fixture on this host"
+claim needs re-checking, search by the TECHNOLOGY'S content/purpose
+(shaded package names, `craton-testcp.txt`, compiled `*Tests.class`
+files) across the whole filesystem, not just by the app's own expected
+directory name — investigation-specific naming conventions
+(`es-fixture-ivfknn-*`, `hibernate-orm-harness`) hide otherwise-complete,
+reusable fixtures from a narrow name-based search.
+
+**Still genuinely blocked, no fixture found even after this deeper
+search:** the SPB.x package-level family's named fixture apps
+(SportMe-master, ms-course-youtube, insurance-backend, eureka-server,
+msyt-admin, cglib_probe) — searched at full filesystem depth with no
+matches. These remain a real, structural gap (no equivalent generic
+open-source app was substituted, to avoid overclaiming coverage of a
+specific historical bug's exact trigger shape).
