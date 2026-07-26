@@ -174,16 +174,29 @@ still real correctness bugs worth closing):
 - PROXY-JITCALL.1 — REMOVED (see above, merged dev@07427a14e).
 
 **Status (`fix/jit-ban-sweep2-20260726` / `wt-jitsweep2-20260726`):**
-- Item 2 (SPB.1 bisection, `org/springframework/util/`) — **STARTED
-  2026-07-26 02:20 UTC.** Confirming this session's own two prior findings
-  before starting: `org/jboss/as/` (SPB.8b sibling) and `org/h2/`
-  (HIB-LONGTAIL.1) are BOTH confirmed still-needed with live JIT-only
-  correctness bugs found (see `docs/internal/jit-ban-sweep-20260725.md`,
-  `docs/known-issues/wildfly/modeltypevalidator-validtypes-npe.md`,
-  `docs/known-issues/h2/h2-jitban-schema-not-found-on-reconnect.md`) — so
-  the "allocate-then-putfield theory is stale" hypothesis is already
-  weakened going into this test; expecting SPB.1 to also still be needed,
-  but testing for real rather than assuming.
+- Item 2 (SPB.1 bisection, `org/springframework/util/`) — **DONE (started
+  2026-07-26 02:20 UTC, concluded 02:24 UTC): INCONCLUSIVE, ban KEPT.**
+  Three standalone repros against a real `spring-core-7.0.7.jar` (no
+  fixture app available on host): two clean-load variants (with/without
+  HashMap-machinery warmup) passed identically in both baseline and lifted
+  configs; a third, more aggressive GC-pressure + classloader-churn variant
+  crashed **both** configs (differently — baseline hit
+  `gen_heap::read_slot: corrupt Value cell` heap corruption landing in
+  `ClassUtils.registerCommonClasses` with an NPE, matching the *original*
+  bug's crash site but under the config that should be protected from it;
+  lifted hit a `ClassCastException` reading back a corrupted field). Since
+  baseline (ban active) also crashed, this can't be cleanly attributed to
+  lifting *this* ban — likely either a separate GC-root/classloader-churn
+  bug my repro's own design exercises, or a timing-sensitive race. Full
+  writeup + all 3 repros: `docs/known-issues/spb1-springframework-util-investigation.md`,
+  `docs/known-issues/repros/spb1-classutils/`. **Verdict: KEEP the ban** (no
+  positive evidence to remove); the repro-3 crash is flagged as a separate,
+  possibly-serious open issue for whoever wants to chase it, independent of
+  SPB.1. Confirms this session's now-established pattern: `org/jboss/as/`
+  and `org/h2/` were BOTH confirmed still-needed via real-app testing;
+  synthetic repros for this ban family have proven unreliable/hard to
+  construct faithfully — prefer a real app/suite over a hand-rolled probe
+  when one is available for any future items in this family.
 
 1. Verify (or refute) the TYPES-ERASURE.1 consolidation hypothesis — highest
    expected value, cheapest to test (no-rebuild env-var bisection already
