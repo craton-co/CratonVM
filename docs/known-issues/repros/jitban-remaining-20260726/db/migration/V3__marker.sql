@@ -1,0 +1,1 @@
+CREATE TABLE marker (id INT PRIMARY KEY);

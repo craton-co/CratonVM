@@ -213,22 +213,42 @@ Garbage collectors, extracted into the `cratonvm-gc` crate. The default is the g
    `empty_source_matches_all_documented_defaults` test at `:1657`. Unless
    `CRATONVM_MOVING_YOUNG` is set in the environment, the moving cycle is
    never even requested.
-2. Even when it *is* set, `gc/src/gen_heap.rs:3770` computes
-   `fail_closed_non_moving = gc_quiescence::is_active() && !gc_flags().allow_moving_young`,
-   and `is_active()` (`gc/src/gc_quiescence.rs:187`) is true whenever **any**
-   thread is inside a JIT call. `allow_moving_young` is `present()`-gated and
-   also defaults to false. With `CRATONVM_JIT_THRESHOLD` at 500 (see the JIT
-   section), a long-running workload spends most of its allocation time under
-   a live JIT frame, so cycles keep diverting. The collector says so in its own
-   trace: `"… — compaction deferred."` (`gen_heap.rs:3798`).
+2. Even when it *is* set, every cycle must carry a **per-cycle coverage
+   proof** before it may relocate: `collect_garbage_inner` diverts to the
+   non-moving sweep on `divert_for_incomplete_moving_coverage`, which
+   `vm/src/memory/roots.rs` computes from
+   `conservative_roots::refresh_moving_young_coverage_for_collection()` — every
+   live compiled frame's active safepoint must certify
+   `moving_young_coverage_complete`, no unregistered JIT frame may be on the
+   native stack, no peer thread may be in JIT, and a frame-band verifier must
+   find no young-resident word the shadow stack did not publish. Each diversion
+   is counted and logged at `warn` with the specific unproven obligation
+   (`gc_quiescence::incomplete_reason`), and `--verbose:gc` / `CRATONVM_GC_STATS`
+   print `moving_young: cycles=N coverage_fallbacks=M` plus a per-reason
+   histogram.
+
+   (An earlier `fail_closed_non_moving = is_active() && !allow_moving_young`
+   term made this unconditional — it meant `CRATONVM_MOVING_YOUNG=1` alone could
+   never run a moving cycle under a live JIT frame, the only case the feature
+   exists for. That term and the `CRATONVM_ALLOW_MOVING_YOUNG` flag are gone.)
 
 So what a default `cargo build` actually gives you is a **generational
 non-moving mark-sweep with selective promotion**, not a semi-space copying
 young gen: no young-gen compaction, and fragmentation reclaimed only by
 sweeping the free list. That is a different complexity class from the one
 "Cheney moving young gen" advertises, and it is the behaviour to reason about
-when reading allocation-path or GC-pause code. The precise-root work needed
-before the moving path can be safe by default is tracked in
+when reading allocation-path or GC-pause code.
+
+Correctness is no longer what blocks the flip. `CRATONVM_MOVING_YOUNG=1` with
+the JIT enabled produces the right answer and runs real moving cycles as of
+2026-07-26 — the heap corruption that blocked it was five codegen sites pushing
+an untagged object reference onto the JIT's simulated operand stack
+([`docs/internal/fixed-suite-bugs/app-jvm-bugs/moving-young-gen-drops-jit-held-oops-FIXED.md`](docs/internal/fixed-suite-bugs/app-jvm-bugs/moving-young-gen-drops-jit-held-oops-FIXED.md)).
+What blocks the flip now is throughput: on Binary-Trees-18 the moving path
+measured roughly 3× the default sweep, partly from the Cheney copy of a large
+live set and partly from the per-method codegen overhead moving-young forces
+(shadow push/reload plus the full-GPR safepoint spill). Remaining precise-root
+work is tracked in
 [`docs/internal/arch-2026-07-26/moving-young-precise-roots.md`](docs/internal/arch-2026-07-26/moving-young-precise-roots.md).
 
 **Object layout:**

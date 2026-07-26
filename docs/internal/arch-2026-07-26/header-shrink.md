@@ -341,7 +341,9 @@ audit the shrink was planned from:
 - `ir_lower.rs:1887`, `:1923` — `HEADER_SIZE as i32` (disp32)
 - `ir_lower.rs:2604` — `ARRAY_LENGTH_OFFSET as u8` (disp8, `MOV R10D,[RAX+12]`)
 
-Plus `jit/src/lib.rs:3186`, `:3226` — `(cratonvm_types::HEADER_SIZE + …) as i32`.
+Plus `jit/src/lib.rs:3210`, `:3236` (was `:3186`, `:3226` — the two closures were
+rewritten by BUG-STRING-CODER-COMPACT-20260726) —
+`(cratonvm_types::HEADER_SIZE + …) as i32`.
 
 All are value-safe at `HEADER_SIZE = 24` (24 fits signed disp8, `ARRAY_LENGTH_OFFSET`
 does not move), so **§6.6 needs no edit for the 24-byte target** — but it must be in the
