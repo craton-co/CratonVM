@@ -4,6 +4,37 @@ This folder collects CratonVM-only defects found while running upstream Java
 suites. The docs had grown to describe the **same underlying bug from several
 angles**; this index is the consolidated map. Read it first.
 
+## 2026-07-26 G1 backend could OOM-abort on a heap full of garbage — natives that allocate internally never triggered a safepoint — FIXED, doc RETIRED
+
+`docs/known-issues/bug-g1-native-alloc-no-safepoint-oom.md` →
+[`docs/internal/fixed-suite-bugs/g1-native-alloc-no-safepoint-oom-FIXED.md`](../internal/fixed-suite-bugs/g1-native-alloc-no-safepoint-oom-FIXED.md).
+
+`maybe_gc()` is polled only from the five bytecode allocation instructions,
+so a hot loop that allocates exclusively from *inside* native methods (the
+`Integer` box `AsynchronousFileChannel.read` builds on the Rust side) ran for
+millions of iterations with zero safepoint checks. G1's infallible
+`GarbageCollector::alloc_object` cannot report failure, so it consumed all
+1024 regions and `abort()`ed a heap that was ~99.9% garbage. `--nojit`
+reproduced it because that flag is what flips the default collector to G1;
+`-XX:+UseG1GC` reproduced it with the JIT on.
+
+Fixed WITHOUT the interpreter-wide safepoint additions the original doc
+scoped. `safe_native_call_impl` already runs an orchestrated boundary GC at
+the one point where every native argument is pinned and remapped, gated on
+`VmHeap::young_spill_pressure()` — which returned a hardcoded `false` for G1.
+G1 now latches that signal (`G1Collector::native_alloc_pressure`) when a new
+Eden region is claimed with the Free pool already under the `needs_gc`
+threshold, plus a TLAB emergency reserve so speculative bulk refills stop
+before the per-object allocator is cornered. No interpreter dispatch path
+changed; under the default Generational collector nothing changed at all.
+
+Verified: the doc's repro ran 5400 s with zero aborts (was SIGABRT in 1-10 s);
+867 `gc` + 2426 `vm` unit tests green (2 pre-existing failures reproduce with
+the change stashed); the fast regression suite identical across four configs
+(default, `--nojit`, `-XX:+UseG1GC`, and baseline); and the full 218-class H2
+suite in `nojit-real` mode at 147→148 PASS with every one of the seven
+status changes individually accounted for (details in the retired doc).
+
 ## 2026-07-23 `module/spring-boot-tomcat` 5-class residual sweep — 3 real bugs fixed, 2 open
 
 Fixed and verified (see the two commits on `worktree-sb-tomcat-5class-fix-20260723`):

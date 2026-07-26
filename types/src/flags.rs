@@ -658,7 +658,8 @@ pub struct GcFlags {
     /// old/pinned) before and after every `collect_garbage()` call, and a
     /// fuller breakdown (incl. humongous) right before the "out of heap
     /// space" abort. Diagnostic aid for tracing G1 region-pool exhaustion;
-    /// see docs/known-issues/bug-g1-native-alloc-no-safepoint-oom.md.
+    /// see docs/internal/fixed-suite-bugs/
+    /// g1-native-alloc-no-safepoint-oom-FIXED.md.
     pub g1_dbg_diag: bool,
     /// `CRATONVM_G1_DBG_PINS`
     pub g1_dbg_pins: bool,

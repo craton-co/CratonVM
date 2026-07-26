@@ -119,8 +119,13 @@ a **different** shape than the original doc's gdb snapshot:
   re-investigated.
 - A **separate control-run finding**: `--nojit --Xmx 1g` (and even `--Xmx
   4g`) does **not** cleanly pass either — it OOMs (`FATAL: G1: out of heap
-  space`) within ~10s. This is now root-caused — see
-  [`bug-g1-native-alloc-no-safepoint-oom.md`](../bug-g1-native-alloc-no-safepoint-oom.md).
+  space`) within ~10s. This was root-caused 2026-07-25 and **FIXED
+  2026-07-26** — see
+  [`g1-native-alloc-no-safepoint-oom-FIXED.md`](../../internal/fixed-suite-bugs/g1-native-alloc-no-safepoint-oom-FIXED.md).
+  `--nojit` no longer OOMs; it now runs into the same performance ceiling
+  this doc covers instead (a 5400s `--nojit --Xmx 1g` run made no further
+  visible progress once `testConcurrent` started, with a healthy GC cadence
+  throughout and zero heap-exhaustion aborts).
 
 ## Session 2026-07-25: dominant cost found and fixed (merged `dev` `74b709d8e`)
 
@@ -260,10 +265,20 @@ here precisely rather than rushing it.
    this test's tight two-thread read/write interleaving on the same file —
    still not directly investigated (did not show up as a distinct hotspot
    in the 2026-07-25 profile, but wasn't isolated either).
-4. ~~Root-cause the `--nojit`/G1 OOM~~ — done 2026-07-25, see
-   [`bug-g1-native-alloc-no-safepoint-oom.md`](../bug-g1-native-alloc-no-safepoint-oom.md).
-   Not fixed (needs interpreter-wide safepoint-checkpoint additions with a
-   full regression pass); the doc has a precise, scoped fix plan.
+4. ~~Root-cause the `--nojit`/G1 OOM~~ — root-caused 2026-07-25, **FIXED
+   2026-07-26**, doc retired to
+   [`g1-native-alloc-no-safepoint-oom-FIXED.md`](../../internal/fixed-suite-bugs/g1-native-alloc-no-safepoint-oom-FIXED.md).
+   The fix did NOT need the interpreter-wide safepoint-checkpoint additions
+   that doc originally scoped: G1 was given its half of the existing
+   `young_spill_pressure` → `safe_native_call` boundary-GC protocol the
+   generational heap already used, so no interpreter dispatch path changed.
+   **Relevant to this doc's own performance investigation:** with GC actually
+   running under `--nojit`, `CRATONVM_DBG_G1DIAG=1` shows this workload
+   producing ~800 MB of Java-heap garbage per collection interval while
+   copying only ~1 MB of live data — essentially all of it the `Integer` box
+   plus completed-future wrapper `native_afc_read` allocates on every
+   `AsynchronousFileChannel.read`. Cutting that per-call allocation is a
+   concrete, measurable lead for item 5 below.
 5. New: implement the interpreted-dispatch cache described above if the
    ~10-13% combined native-registry/method-resolution cost is worth
    pursuing further — likely the next-largest opportunity now that the
