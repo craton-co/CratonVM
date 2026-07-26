@@ -1,14 +1,105 @@
 # FIXED — `Properties.keySet()`/`entrySet()`/`values()` returned disconnected snapshots, not live `Map` views
 
-**Status: FIXED 2026-07-24, second attempt (first attempt reverted — see
-below for what changed).** General `java.util.Properties` bridge gap
-(`native-builtins/src/properties_sidetable.rs`), discovered via the Spring
-Boot core Cluster C (logging bootstrap) batch. Was blocking
-`org.springframework.boot.logging.log4j2.Log4j2LoggingSystemPropertiesTests
+**Status: FIXED. `keySet()` fixed 2026-07-24 (second attempt; first attempt
+reverted — see below). `values()` closed 2026-07-26 (see "Third fix: live
+`values()` view" below) — `entrySet()` was already a live view by the time
+`values()` was investigated, no separate fix needed for it.** General
+`java.util.Properties` bridge gap (`native-builtins/src/
+properties_sidetable.rs`), discovered via the Spring Boot core Cluster C
+(logging bootstrap) batch. Was blocking `org.springframework.boot.logging.
+log4j2.Log4j2LoggingSystemPropertiesTests
 #appliesLog4j2RollingPolicyPropertiesWithDefaults` (now fully passing) and
 contributing to several `LoggingApplicationListenerTests` failures (its
-`@AfterEach` uses the exact idiom below; went from 22 to 17 failures out
-of 41 once this landed — the rest are unrelated to this specific gap).
+`@AfterEach` uses the exact idiom below; went from 22 to 17(->16, see below)
+failures out of 41 once the `keySet()` fix landed — the rest are unrelated
+to this specific gap, confirmed by direct inspection, see "Residual sweep"
+below).
+
+## Third fix (2026-07-26): live `values()` view
+
+`entrySet()` (`native_properties_entry_set`) was already a genuine live view
+by this point (a static entry-set view backed by the source `Properties`,
+via `make_static_entry_set` — `entry.setValue(v)` / `iterator().remove()`
+write through). `keySet()` was fixed above. But `values()`
+(`native_properties_values`) still built a plain, disconnected `ArrayList`
+snapshot (`build_value_list`) — the exact same defect class this doc
+originally described for all three views, just not yet closed for this one.
+Confirmed directly:
+```java
+Properties p = new Properties();
+p.setProperty("x", "1"); p.setProperty("y", "2");
+p.values().remove("2");
+p.getProperty("y"); // expected null, got "2" before this fix
+```
+
+Fixed by tagging the `ArrayList` `values()` returns with the source
+`Properties` object in its trailing (beyond-logical-size) capacity slot —
+the exact same convention `native_map_values` (regular `HashMap`/
+`Hashtable`) already uses, via a new shared helper,
+`cratonvm_native_collections::make_live_values_list`. This reuses the
+ALREADY-hardened generic `values_view_source` / `resync_values_view` /
+`propagate_list_removal` machinery that `native_al_remove_obj`/
+`native_al_clear`/the list iterator's `.remove()` already consult for
+`java/util/ArrayList` — no new override on `ArrayList` itself (which would
+carry the same "global override on a near-universal class" blast-radius risk
+the `keySet()` retry above had to specifically avoid by scoping to
+`LinkedHashSet`). `native_properties_values` could not reuse
+`native_map_values` wholesale, because Properties data lives in a
+process-wide Rust-side table (`properties_sidetable.rs`'s `table()`), not in
+the real `Properties.map` CHM field `map_collect_values` reads for ordinary
+maps — so it collects the same (side-table + CHM-exclusive) value set
+`build_value_list`/`chm_extra_entries` already assembled, mirroring the
+GC-pinning pattern already proven in `native_properties_entry_set`, then
+hands that to `make_live_values_list` just for the live-view tagging.
+`build_value_list` (now unused) was removed.
+
+Verified (Azure Linux host, real JDK 25, release build):
+`values().remove(v)`, `values().iterator().remove()`, and `values().clear()`
+all write through to the source `Properties` now; a plain (non-Properties)
+`ArrayList.remove()`/`.retainAll()` and a regular `HashMap.values().remove()`
+are unaffected (the trailing-slot marker never matches an ordinary,
+non-tagged list). `Log4j2LoggingSystemPropertiesTests` 3/3,
+`JakartaApiValidationExceptionFailureAnalyzerTests` (the `keySet()` fix's
+regression control) 2/2 — no regression.
+
+**Known, pre-existing, OUT OF SCOPE limitation found while verifying this:**
+`values().retainAll(...)` does NOT propagate to the source map for ANY
+`Map.values()` view — not just `Properties`'. `native_al_retain_all` (the
+shared `java/util/ArrayList.retainAll` native) never consults
+`values_view_source` at all, unlike `native_al_remove_obj`/`native_al_clear`.
+Confirmed with a plain `java.util.HashMap`: `new HashMap<>(Map.of("a","1",
+"b","2")).values().retainAll(List.of("1"))` leaves `b` in the map. This is a
+generic `ArrayList`/map-values-view gap, unrelated to the `Properties`
+side-table bridge this doc tracks, so it is left unfixed here — flagged for
+separate follow-up.
+
+## Residual sweep (2026-07-26): confirmed the remaining `LoggingApplicationListenerTests` failures are unrelated
+
+Re-ran the full Cluster C list on current `dev` + the `values()` fix above:
+`LoggingApplicationListenerTests` 25/41 (16 failing, down from 17 — an
+unrelated dev-drift improvement), `JavaLoggingSystemTests` 11/12,
+`Log4J2LoggingSystemTests` 58/61, `SpringBootPropertySourceTests` 2/2,
+`SpringProfileArbiterTests` 7/7, `DefaultLogbackConfigurationTests` 7/7,
+`LogbackConfigurationAotContributionTests` 9/11. Inspected every failure's
+assertion directly (not just the test name):
+
+- All 16 `LoggingApplicationListenerTests` failures are `CapturedOutput`
+  console-content leaking BETWEEN test methods (e.g. `parseLevelsNone`
+  asserting output "not to contain" a previous test's `testaterror` log
+  line, or `parseLevels` asserting output "to contain" `testatdebug` and
+  getting `""`) — an `OutputCaptureExtension`/logging-appender state-reset
+  gap, not a `System`-properties leak. Confirmed unrelated to this doc's
+  bridge gap.
+- `JavaLoggingSystemTests#withFile` — file-logging output assertion
+  ("Expecting actual not to be empty"), unrelated.
+- `Log4J2LoggingSystemTests`'s 3 failures — MDC correlation-ID padding
+  format mismatch in the console/file pattern layout, unrelated.
+- `LogbackConfigurationAotContributionTests`'s 2 failures — AOT reflection
+  hint collection picking up extra `com.example.Alpha`/`com.example.Bravo`
+  classes it shouldn't, unrelated.
+
+None of these touch `Properties`/`System` properties view semantics — this
+doc's own "the rest are unrelated to this specific gap" conclusion holds.
 
 ## Second attempt: scope the override to `LinkedHashSet`, not `HashSet`
 

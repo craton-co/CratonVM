@@ -7460,6 +7460,43 @@ fn native_map_values(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     Ok(Some(Value::Object(Some(list))))
 }
 
+/// Build a live-view `java.util.ArrayList` from an already-collected `values`
+/// slice, tagging it with `source` in the trailing capacity slot exactly like
+/// [`native_map_values`] does -- so it participates in the same already-hardened
+/// `values_view_source`/`resync_values_view`/`propagate_list_removal` machinery
+/// used by `native_al_remove_obj`/`native_al_clear`/iterator `.remove()`
+/// (`values().remove(v)`, `.iterator().remove()`, and `.clear()` write through
+/// to `source` via its virtual `remove`/`clear`).
+///
+/// Exposed for callers (e.g. `java.util.Properties`'s side-table-backed
+/// `values()`) whose data does not live in a native bucket table, so
+/// `map_collect_values` cannot be reused directly -- the caller collects the
+/// correct value list itself and hands it here just to get live-view wiring.
+pub fn make_live_values_list(
+    ctx: &mut dyn NativeContext,
+    source: ObjectRef,
+    values: &[Value],
+) -> ObjectRef {
+    let source_pin = ctx.pin_native_root(source);
+    let (_, val_handles) = pin_value_slice(ctx, values);
+    let __al_n_fields = al_slots(ctx).2;
+    let list = alloc_synthetic(ctx, "java/util/ArrayList", __al_n_fields);
+    let list_pin = ctx.pin_native_root(list);
+    let cap = std::cmp::max(values.len(), AL_DEFAULT_CAPACITY) + 1;
+    let buf = alloc_ref_array(ctx, cap);
+    for (i, val) in values.iter().enumerate() {
+        let val = read_pinned_elem(ctx, val_handles[i], *val);
+        ctx.set_array_element(buf, i, val);
+    }
+    let source = ctx.read_native_pin(source_pin, source);
+    ctx.set_array_element(buf, cap - 1, Value::Object(Some(source)));
+    let list = ctx.read_native_pin(list_pin, list);
+    al_set_data(ctx, list, buf);
+    al_set_size(ctx, list, values.len() as i32);
+    ctx.unpin_native_roots(source_pin);
+    list
+}
+
 fn native_map_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let mut this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
