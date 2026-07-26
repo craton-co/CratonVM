@@ -206,7 +206,23 @@ still real correctness bugs worth closing):
   (`xerces_schema_jit_deny_prefix`), SnakeYAML emitter
 - ES-HAMCREST.1, ES-JIT-DEOPT-GC.1, ES fragile cluster
   (`is_elasticsearch_suite_jit_fragile_cluster`)
-- JSONSMART-PARSER.1, JASPER-JDT.2/.3, WILDFLY-CONTROLLER-JIT.1
+- JSONSMART-PARSER.1 — **CLAIMED by `fix/jit-ban-sweep2-20260726` /
+  `wt-jitsweep2-20260726`, 2026-07-26 ~03:05 UTC.** `json-smart-2.6.0.jar`
+  available in gradle caches, self-contained (no Spring context needed) —
+  building a standalone `JSONParser`/`JSONValue.parse` stress repro.
+  JASPER-JDT.2/.3 (owned by other session, see below).
+  WILDFLY-CONTROLLER-JIT.1 (`org/jboss/as/controller/`) — **already
+  transitively confirmed still-needed**: it's a strict subset of the
+  broader `org/jboss/as/` prefix this session already lifted for the
+  `org/jboss/as/` WildFly-boot test (`docs/known-issues/wildfly/modeltypevalidator-validtypes-npe.md`)
+  — `package_allowed()` lifts any ban whose prefix starts with an allowed
+  entry, so lifting `org/jboss/as/` also lifted `org/jboss/as/controller/`
+  in that same run. The crash found (`ModelTypeValidator.validTypes` null)
+  is literally inside `org.jboss.as.controller.*`, the same symptom class
+  (a field null after construction under JIT) as this ban's own
+  `AbstractOperationContext.<init>`/`controllerOperations` null report —
+  very likely the same underlying bug family, possibly the same bug. No
+  separate test needed; KEEP.
 - TOMCAT-JNDIREALM-RDN.1, TOMCAT-JNDIREALM-JIT.2 — **CLAIMED by
   `fix/jit-ban-sweep2-20260726` / `wt-jitsweep2-20260726`, 2026-07-26
   ~02:35 UTC** (pivoted here from the blocked ANTLR.1 item above; real
@@ -363,3 +379,11 @@ level) -- likely a similar family to the KEYEDLOCK-COMPUTE.1 fix just
 landed (String read shortly after construction/mutation reading a stale
 value) but not yet isolated to one method. Flagging for a future session
 rather than continuing further given time already spent this session.
+
+## HIB-BIGINTEGER-AIOOBE.1 — CLAIMED 2026-07-26 10:24 UTC
+
+Branch `fix/jit-ban-sweep-20260725`. Whole `java/math/MutableBigInteger`
+class banned unconditionally, skip_list.rs ~L768-785
+(`BigInteger.smallToString` AIOOBE "Index 2 out of bounds for length
+2"). Explicitly noted as never having a deterministic reproducer.
+Standalone (java.math only) -- building a stress repro to try to get one.
