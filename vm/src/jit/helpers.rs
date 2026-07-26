@@ -5963,14 +5963,47 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
             // `invoke_on_class_shared_no_retarget` so the virtual retarget never
             // fires. Native-override priority is preserved (same as
             // `invoke_or_native`).
-            let r = crate::vm::invoke_special_shared(
-                vm,
-                thread,
-                info.class_name,
-                info.method_name,
-                info.descriptor,
-                &values,
-            );
+            //
+            // BUG-JIT-INVOKESPECIAL-LOADER-20260726: resolve the CP class
+            // through the CALLER's loader before dispatching. `info.class_name`
+            // is constant-pool text; with two loaders defining the same binary
+            // name, `invoke_special_shared`'s own `load_class_concurrent` picks
+            // whichever copy the global map holds — see
+            // `JitInvokeInfo::declaring_class_id`. `resolve_class_loader_aware`
+            // is the same resolver the interpreter's invokespecial uses, and it
+            // short-circuits to the global answer whenever no user-defined
+            // loader has ever defined a class, so single-loader processes pay
+            // one relaxed atomic load.
+            let resolved_owner = if info.declaring_class_id != 0 {
+                crate::runtime::interpreter::resolve_class_loader_aware(
+                    vm,
+                    thread,
+                    ClassId::new(info.declaring_class_id),
+                    info.class_name,
+                )
+                .ok()
+            } else {
+                None
+            };
+            let r = match resolved_owner {
+                Some(owner) => crate::vm::invoke_special_shared_on_class(
+                    vm,
+                    thread,
+                    owner,
+                    info.class_name,
+                    info.method_name,
+                    info.descriptor,
+                    &values,
+                ),
+                None => crate::vm::invoke_special_shared(
+                    vm,
+                    thread,
+                    info.class_name,
+                    info.method_name,
+                    info.descriptor,
+                    &values,
+                ),
+            };
             match r {
                 Ok(v) => v,
                 Err(e) => {
@@ -6039,6 +6072,7 @@ static INTEGER_VALUE_OF_INFO: JitInvokeInfo = JitInvokeInfo {
     num_jit_args: 1,
     return_type: b'L',
     invoke_kind: 3,
+    declaring_class_id: 0,
 };
 
 /// Thin direct-call target for JIT `invokestatic Integer.valueOf(I)` sites
@@ -6211,6 +6245,7 @@ static INTEGER_INT_VALUE_INFO: JitInvokeInfo = JitInvokeInfo {
     num_jit_args: 1,
     return_type: b'I',
     invoke_kind: 0,
+    declaring_class_id: 0,
 };
 
 /// Thin direct-call target for JIT `invokevirtual Integer.intValue()` sites
@@ -6263,6 +6298,7 @@ static HASHMAP_PUT_DIRECT_INFO: JitInvokeInfo = JitInvokeInfo {
     num_jit_args: 3,
     return_type: b'L',
     invoke_kind: 0,
+    declaring_class_id: 0,
 };
 static HASHMAP_GET_DIRECT_INFO: JitInvokeInfo = JitInvokeInfo {
     class_name: "java/util/HashMap",
@@ -6271,6 +6307,7 @@ static HASHMAP_GET_DIRECT_INFO: JitInvokeInfo = JitInvokeInfo {
     num_jit_args: 2,
     return_type: b'L',
     invoke_kind: 0,
+    declaring_class_id: 0,
 };
 static CONCURRENT_HASHMAP_GET_DIRECT_INFO: JitInvokeInfo = JitInvokeInfo {
     class_name: "java/util/concurrent/ConcurrentMap",
@@ -6279,6 +6316,7 @@ static CONCURRENT_HASHMAP_GET_DIRECT_INFO: JitInvokeInfo = JitInvokeInfo {
     num_jit_args: 2,
     return_type: b'L',
     invoke_kind: 2,
+    declaring_class_id: 0,
 };
 
 static STRING_LATIN1_LOWER_DIRECT_INFO: JitInvokeInfo = JitInvokeInfo {
@@ -6288,6 +6326,7 @@ static STRING_LATIN1_LOWER_DIRECT_INFO: JitInvokeInfo = JitInvokeInfo {
     num_jit_args: 3,
     return_type: b'L',
     invoke_kind: 3,
+    declaring_class_id: 0,
 };
 
 thread_local! {
@@ -8375,6 +8414,7 @@ mod tests {
             num_jit_args: 1,
             return_type: b'I',
             invoke_kind: 0,
+            declaring_class_id: 0,
         };
 
         let target = unsafe { virtual_dispatch_target_for_receiver(&vm, receiver, &info) };
@@ -8399,6 +8439,7 @@ mod tests {
             num_jit_args: 1,
             return_type: b'I',
             invoke_kind: 0,
+            declaring_class_id: 0,
         };
 
         let target = unsafe { virtual_dispatch_target_for_receiver(&vm, receiver, &info) };
