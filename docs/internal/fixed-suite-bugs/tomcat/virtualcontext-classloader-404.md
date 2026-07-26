@@ -317,7 +317,7 @@ touching the shared fixture.
 ## 2026-07-24 FINAL CLOSURE — fixture repaired, test now runs end-to-end, matches HotSpot exactly
 
 The blocking fixture gap (section 1) was repaired as part of the separate
-`../../../known-issues/tomcat/unbuilt-virtual-webapp-submodule.md` fixture-completion
+`../../tomcat/unbuilt-virtual-webapp-submodule.md` fixture-completion
 work (2026-07-23): `test/webapp-virtual-webapp/target/classes/rsrc/resourceX.properties`
 (placeholder) and `test/webapp-virtual-library/target/WEB-INF/classes/` (empty
 dir) were created directly on the shared Azure host fixture — no Maven build
@@ -337,7 +337,7 @@ symlink-resolution fix from the same session —
   rerun of the same class against the same fixture, same run). This is the
   key change from every earlier entry in this doc: the original CratonVM-only
   divergence (`404` vs HotSpot's `200`, and later a CratonVM-only `500` per
-  `../../../known-issues/tomcat/regressions-revealed-by-fixture-completion-20260723.md`)
+  `../../tomcat/regressions-revealed-by-fixture-completion-20260723.md`)
   is gone. Both VMs now fail this one assertion identically, for whatever
   reason HotSpot itself doesn't reach `200` here (not investigated — out of
   scope once it's confirmed to not be a CratonVM regression). **This is no

@@ -806,6 +806,12 @@ fn should_skip_jit_internal(
     // guard, since both now share one fail-closed disposition until the
     // x64 lowering bug is found.
     if class_name == "java/math/BigInteger" {
+        // CROSS-REFERENCE (2026-07-26): the removed SUNEC-INTPOLY ban
+        // (see the -- REMOVED comment near sun/security/util/math/intpoly/
+        // below) depends on THIS ban staying active -- its own root cause
+        // needs BigInteger JIT-compiled too. Do not lift this ban without
+        // re-testing SUNEC-INTPOLY's P-384/P-521 EC keygen+sign+verify
+        // scenario (EcIntPolyProbe.java) alongside it.
         return Some(SkipReason::BigIntegerArithmetic);
     }
 
@@ -916,6 +922,24 @@ fn should_skip_jit_internal(
     // AssertJ checks repeatedly compile patterns, and interpreting
     // Pattern.compile turned that finite check into a watchdog timeout while
     // its JIT path was stable — moot now that java.util is JIT-eligible again.)
+    //
+    // 2026-07-26 re-test. The perf framing above is stale (the Hibernate
+    // longtail it cites was root-caused to the executor bridge on 2026-07-15),
+    // and so is the correctness reason the 2026-07-25 sweep replaced it with: a
+    // systemic `Schema  not found` metadata corruption that turned out to be
+    // two general x64 defects, both since fixed (`13055f75c`) — the compact
+    // `String.coder`/`hash` offsets and a reload-elision mirror leaking across
+    // a control-flow join. That cluster is extinct (0 of 218 classes).
+    //
+    // The ban nevertheless STAYS, on fresh evidence: a same-binary 218-class
+    // A/B is PASS 158 with it and PASS 149 without, and the 9 regressions are
+    // enumerated with per-class signatures in
+    // `docs/known-issues/h2/h2-jitban-schema-not-found-on-reconnect.md`. Two of
+    // them name their mechanism outright (`TestObjectDataType`:
+    // `String cannot be cast to String`; `TestUpgrade`: `NoSuchMethodError` on
+    // an existing `IntArray.checkCapacity()V`) and are the place to start.
+    // The `org/antlr/v4/runtime/` half remains untested in isolation — the H2
+    // suite never exercises it.
     if (class_name.starts_with("org/h2/") && !package_allowed("org/h2/", allow_packages))
         || (class_name.starts_with("org/antlr/v4/runtime/")
             && !package_allowed("org/antlr/v4/runtime/", allow_packages))
@@ -923,25 +947,40 @@ fn should_skip_jit_internal(
         return Some(SkipReason::RustJvmTestFixture);
     }
 
-    // HIB-LONGTAIL.2 (2026-07-15): compiled AttributesImpl.ensureCapacity
-    // passes a corrupted int count to anewarray during Hibernate's qualified
-    // table bootstrap (observed Object[1677721600]). The interpreter executes
-    // the method correctly; keep just this small growth helper interpreted.
-    if class_name == "org/xml/sax/helpers/AttributesImpl" && method_name == "ensureCapacity" {
-        return Some(SkipReason::RustJvmTestFixture);
-    }
+    // HIB-LONGTAIL.2 -- REMOVED 2026-07-26. Re-verified with a standalone
+    // probe (AttributesImplGrowthProbe.java, pure JDK org.xml.sax.helpers,
+    // no external jar needed) driving addAttribute/removeAttribute across
+    // 20000 independent AttributesImpl instances at varied sizes (forcing
+    // many ensureCapacity growth calls per instance) -- baseline + package
+    // explicitly allowed + a 5000-instance CRATONVM_JIT_THRESHOLD=1
+    // aggressive-compilation pass: 0 length/value mismatches in every
+    // configuration. No longer reproduces on current dev.
+    // AttributesImplGrowthProbe.java is the regression witness.
 
-    // HIB-LONGTAIL.3 (2026-07-15): when Hibernate bytecode is explicitly
-    // promoted for bisection, the optimized constructor path can return a
-    // GenerationTargetToScript whose ScriptTargetOutput field was never
-    // initialized. Schema creation then fails in accept(String). Preserve the
-    // constructor's interpreter semantics; its small body is cold and this
-    // does not suppress the rest of Hibernate's JIT eligibility.
-    if class_name == "org/hibernate/tool/schema/internal/exec/GenerationTargetToScript"
-        && method_name == "<init>"
-    {
-        return Some(SkipReason::RustJvmTestFixture);
-    }
+    // HIB-LONGTAIL.3 -- REMOVED 2026-07-26 (shadowing analysis, not a
+    // real-app probe). A constructor that initializes a field via
+    // putfield -- as this ban's own description says
+    // GenerationTargetToScript.<init> does, to set its ScriptTargetOutput
+    // field -- is unconditionally classified InitComplexity::Complex by
+    // classify_init_complexity (any putfield/putstatic/monitorenter/
+    // monitorexit/invokedynamic disqualifies Trivial). Every
+    // should_skip_jit_with_init call site computes that classification
+    // from the actual method's own bytecode and only sets
+    // skip_init_check=true when Trivial; when false, the generic
+    // `if !skip_init_check { if method_name == "<init>" { return
+    // Some(Constructor) } }` gate above already unconditionally bans this
+    // exact constructor before this specific entry could ever be
+    // reached. Same shadowing pattern as W2-CHM's Integer/Long <init>
+    // entries (see that comment: constructors are banned by the generic
+    // <init> gate anyway, so the entries are redundant but document the
+    // archetype) and as SPRINGBOOT-WITHOUT-JACKSON.2's removal earlier
+    // this session. Verified by reading classify_init_complexity and
+    // every should_skip_jit_with_init call site (vm/src/runtime/
+    // interpreter.rs, offload_jit_gate.rs) rather than a standalone
+    // probe -- no hibernate-tools jar was available on this host to
+    // build a real repro, but none is needed: this removal changes no
+    // observable behavior, the constructor stays interpreted via the
+    // structural non-trivial-constructor gate regardless.
     // T1.1.g — the historical blanket bans for `java/util/*` and
     // `cratonvm/*` were narrowed to targeted per-method exclusions.
     // Those targeted exclusions guarded the callee-saved-GPR local-home
@@ -955,15 +994,11 @@ fn should_skip_jit_internal(
     // GPR local-home allocator is explicitly enabled. The aggressive policy
     // (set via `jit_aggressive_compilation` or `CRATONVM_JIT_ALLOW_PACKAGES`)
     // still lifts the targeted list so developers can surface new miscompiles.
-    // DBG bypass: force-compile JUnitCore.main despite the JUNIT.1 stopgap ban,
-    // so its emitted code can be dumped/diagnosed. Default-off; the ban holds in
-    // normal runs.
-    if class_name == "org/junit/runner/JUnitCore"
-        && method_name == "main"
-        && std::env::var_os("CRATONVM_JIT_UNBAN_JUNITCORE").is_some()
-    {
-        return None;
-    }
+    // JUNIT.1 -- REMOVED 2026-07-26 (see the removal comment further below,
+    // near the old is_known_miscompile entry, for the re-verification
+    // evidence). The CRATONVM_JIT_UNBAN_JUNITCORE DBG bypass that used to
+    // live here is no longer needed since JUnitCore.main is JIT-eligible
+    // unconditionally now.
 
     if policy == SkipPolicy::Conservative {
         if is_unconditional_hash_miscompile_cluster(class_name, method_name)
@@ -1408,28 +1443,34 @@ fn should_skip_jit_internal(
             return Some(SkipReason::RustJvmTestFixture);
         }
 
-        // SUNEC-INTPOLY (2026-06-14) — blanket JIT ban for SunEC's field
-        // arithmetic (`sun/security/util/math/intpoly/`). For P-384 / P-521 a
-        // repeated keygen+sign+verify mix progressively corrupts the curve's
-        // field-element limb arrays (`long[]`), zeroing chunks of the cached
-        // generator point, so `ECOperations.multiply` then fails "point NOT ON
-        // CURVE" (keycloak DefaultCryptoJWKTest publicEs256P384/P521,
-        // BCECDSACryptoProviderTest secp384/521, SdJwtVP AltCurves). It is the
-        // JIT-only face of the documented cross-package JIT→JIT arg-marshalling
-        // miscompile (a primitive value lands in a reference/array slot — cf.
-        // docs/bc-math-ec-jit-miscompile-investigation.md): `CRATONVM_DISABLE_JIT=1`
-        // makes it 0/40, and bisection shows it needs BOTH `intpoly` AND
-        // `java/math` (BigInteger) JIT-compiled together — `intpoly` is the
-        // compiled caller, so banning it from the JIT (callee→interpreter) breaks
-        // the bad JIT→JIT call. P-256 is unaffected (smaller field) but is banned
-        // too for safety; EC field math is correctness-critical crypto, never a
-        // benchmarked hot path, so interpreter-only is the right trade. Lifted by
-        // `CRATONVM_JIT_ALLOW_PACKAGES=sun/security/util/math/intpoly/`.
-        if class_name.starts_with("sun/security/util/math/intpoly/")
-            && !package_allowed("sun/security/util/math/intpoly/", allow_packages)
-        {
-            return Some(SkipReason::RustJvmTestFixture);
-        }
+        // SUNEC-INTPOLY -- REMOVED 2026-07-26, BUT SEE THE WARNING BELOW.
+        // Re-verified with a standalone probe (EcIntPolyProbe.java, pure
+        // JDK java.security -- KeyPairGenerator/Signature "EC", no
+        // external jar) driving a real repeated keygen+sign+verify mix on
+        // P-384 and P-521 (the exact curves and operation shape the
+        // original bug report named): 60 baseline + 60 package-explicitly-
+        // allowed P-384 runs, 60 more P-521 runs -- 0 signature/verification
+        // failures in any configuration.
+        //
+        // *** IMPORTANT, DO NOT REMOVE THIS WARNING WITHOUT RE-TESTING ***
+        // This ban's own original root-cause analysis says the underlying
+        // JIT→JIT arg-marshalling miscompile needs BOTH `intpoly` AND
+        // `java/math/BigInteger` JIT-compiled TOGETHER to trigger --
+        // `BigInteger`/`MutableBigInteger` are separately, unconditionally
+        // banned elsewhere in this file (HIB-BIGINTEGER-AIOOBE.1/.2, no
+        // `package_allowed` escape hatch at all -- see the `class_name ==
+        // "java/math/BigInteger"` / "java/math/MutableBigInteger"` checks
+        // above), so the callee side of that JIT→JIT interaction currently
+        // can never happen regardless of this ban. This removal is
+        // therefore "safe under the current, still-active BigInteger ban"
+        // -- NOT an independent fix of the JIT→JIT arg-marshalling bug
+        // itself. If HIB-BIGINTEGER-AIOOBE.1/.2 is EVER lifted in a future
+        // session, this exact SUNEC-INTPOLY scenario (P-384/P-521 EC
+        // keygen+sign+verify) MUST be re-tested together with BigInteger
+        // JIT-compiled before assuming EC crypto is still safe -- do not
+        // treat the two bans as independent. EcIntPolyProbe.java is the
+        // regression witness for the currently-tested (BigInteger-still-
+        // banned) configuration only.
 
         // HIB-BYTEBUDDY (2026-06-13) — provisional blanket ban for ByteBuddy's
         // runtime class-build chain (`net/bytebuddy/`). The narrow HIB-PROXY ban
@@ -1622,66 +1663,52 @@ fn should_skip_jit_internal(
             return Some(SkipReason::RustJvmTestFixture);
         }
 
-        // ANTLR.1 (2026-06-23) — blanket ban for the shaded ANTLR v4 runtime
-        // that Groovy's parser (`org.apache.groovy.parser.antlr4`) and any
-        // ANTLR-based grammar (HQL, SpEL, …) execute. Two independent reasons,
-        // both verified on the SpringRepositoriesExtensionTests / Groovy parse:
-        //
-        // 1. CORRECTNESS — JIT-compiling the ANTLR ATN simulation MISCOMPILES.
-        //    A method in `…/runtime/atn/` produces a null `PredictionContext`
-        //    that flows into interpreted `ATNConfigSet.optimizeConfigs` ->
-        //    `ATN.getCachedContext` -> NPE, surfacing as Groovy
-        //    `MultipleCompilationErrorsException: General error during parsing:
-        //    NullPointerException` (the script fails to compile). `--nojit`
-        //    parses the SAME script cleanly. Bisection via
-        //    `CRATONVM_JIT_BISECT_SKIP` proved it and NARROWED the culprit from
-        //    the ~105 compiled `groovyjarjarantlr4/*` methods down to a 7-method
-        //    `PredictionContext` equality/hash cluster — de-JIT'ing just these 7
-        //    makes the parse succeed:
-        //      PredictionContext.{calculateHashCode, hashCode},
-        //      PredictionContext$IdentityEqualityComparator.hashCode,
-        //      SingletonPredictionContext.{equals, isEmpty, size},
-        //      ObjectEqualityComparator.equals.
-        //    (A wrong hash/equals corrupts ATN config-context dedup, leaving a
-        //    config with a null `PredictionContext` that later NPEs.) The exact
-        //    single method / codegen archetype is the open follow-up; the
-        //    package ban is the sound, evidence-backed stop-gap (a surgical
-        //    per-method ban of those 7 is the future minimal fix once the
-        //    codegen bug is root-caused — see docs/known-issues).
-        // 2. THROUGHPUT — JIT-compiling ANTLR is also a large REGRESSION here:
-        //    the first cold parse runs ~8x SLOWER with JIT than `--nojit`
-        //    (a trivial warmup class alone takes ~95 s under JIT). The ATN
-        //    simulation is a one-shot, branch-heavy interpreter loop, not a
-        //    benchmarked hot path — exactly the BouncyCastle / ByteBuddy /
-        //    Spring archetype banned above. Same root family as the
-        //    Hibernate HQL reproducer in
-        //    `springrepos-extension-hang-jit-throughput-and-deep-recursion.md`.
-        //
-        // Lifted by `CRATONVM_JIT_ALLOW_PACKAGES=groovyjarjarantlr4/` for
-        // cold-path validation, but the PredictionContext equality/hash
-        // cluster above stays interpreted.
-        if class_name.starts_with("groovyjarjarantlr4/")
-            && !package_allowed("groovyjarjarantlr4/", allow_packages)
-        {
-            return Some(SkipReason::RustJvmTestFixture);
-        }
+        // ANTLR.1 -- REMOVED 2026-07-26. Reason 1 (correctness -- the
+        // PredictionContext equality/hash miscompile) was already
+        // independently, unconditionally covered by
+        // is_antlr_prediction_context_miscompile (see ANTLR-COLDPATH.1
+        // below), which stays interpreted regardless of this broader
+        // package ban or CRATONVM_JIT_ALLOW_PACKAGES. Reason 2 (throughput
+        // -- ~8x slower cold parse under JIT) was re-tested post the
+        // 2026-07-26 JIT rework with a real groovy-3.0.21.jar
+        // (GroovyAntlrThroughputProbe.java, found this session at
+        // /data/tmp/groovysrc + /data/tmp/groovy-antlr4-probe on this
+        // host -- an earlier session's claim that "the shaded package
+        // doesn't exist anywhere on this host" was simply wrong, it was
+        // never searched for outside .gradle/.m2): 15 cold
+        // GroovyShell.evaluate() calls, fresh script + fresh class per
+        // iteration. Baseline (ban active): avg 840.6ms/iter (steady-state
+        // ~390-480ms after the first classloading-heavy call). Lifted
+        // (groovyjarjarantlr4/ JIT-compiled, narrow PredictionContext guard
+        // still active): avg 866.1ms/iter, steady-state ~370-460ms --
+        // statistically indistinguishable from baseline, not an 8x
+        // regression. The throughput justification no longer holds; 0
+        // parse failures in either config. GroovyAntlrThroughputProbe.java
+        // is the regression witness.
 
-        // HIB-ANTLR.1 (2026-07-15) -- Hibernate uses the ordinary ANTLR4
-        // runtime rather than Groovy's shaded copy. After a full HQL parse,
-        // JIT-compiled ATN simulation could leave an ATNState with a null
-        // `transitions` array; the next parse then failed in
-        // ParserATNSimulator.computeTargetState. A fresh process passed the
-        // same query, isolating the defect to state corrupted by the compiled
-        // parser path rather than Hibernate's grammar or query metadata.
-        //
-        // This is the unshaded counterpart of ANTLR.1 above. Keep it
-        // liftable for JIT bisection, but default to the sound interpreter
-        // path until the compiled ATN-state mutation is root-caused.
-        if class_name.starts_with("org/antlr/v4/runtime/")
-            && !package_allowed("org/antlr/v4/runtime/", allow_packages)
-        {
-            return Some(SkipReason::RustJvmTestFixture);
-        }
+        // HIB-ANTLR.1 -- REMOVED 2026-07-26. Re-verified with the real
+        // Hibernate ORM 8.0 test harness (hibernate-orm-harness on this
+        // host, hibernate-core testClasses/testRuntimeClasspath + a real
+        // H2 in-memory DB via the JUnit5 Platform CratonRunner driver):
+        // org.hibernate.orm.test.hql.ASTParserLoadingTest (106 methods,
+        // heavy real HQL-via-ANTLR parsing), .hql.HQLInsertAndUpdateTest
+        // (5 methods), and .type.temporal.InstantTests (204 methods) all
+        // ran clean (0 failures, identical to baseline) with
+        // org/antlr/v4/runtime/ JIT-allowed and org/hibernate/ still
+        // banned -- this bans own specific claim (ATNState.transitions
+        // corrupted between two separate HQL parses) does not reproduce.
+        // IMPORTANT: org/antlr/v4/runtime/ is ALSO, separately, covered by
+        // HIB-LONGTAIL.1 above (same prefix, already confirmed still
+        // needed via a real 218-class H2 suite run finding a
+        // "Schema not found" DB-reconnect corruption -- a different,
+        // reconnect-specific trigger this HQL-parsing test batch does not
+        // exercise). This removal is therefore redundant/shadowed, not an
+        // independent unban: default (Conservative) behavior for
+        // org/antlr/v4/runtime/ classes is UNCHANGED -- they stay
+        // interpreted via HIB-LONGTAIL.1 regardless. Same pattern as
+        // SPRINGBOOT-WITHOUT-JACKSON.2s removal earlier this session. The
+        // real, positive, non-shadowed finding here is narrower: this
+        // bans own specific correctness claim no longer reproduces.
 
         // SPB.6 (Session 113 r1) — provisional blanket ban for the
         // Netflix Eureka discovery client. `com/netflix/discovery/
@@ -2268,31 +2295,18 @@ fn is_known_miscompile(class_name: &str, method_name: &str) -> bool {
         // native-bridged and never compiles) — all OSR-compile, terminate,
         // and match HotSpot's checksum. Ban removed; FillProbe is the
         // regression witness.
-        // JUNIT.1 (current session) — STOPGAP. JIT-compiling
-        // `org/junit/runner/JUnitCore.main` under real-JCA produces severe
-        // young-gen heap corruption: out-of-bounds heap writes overwrite live
-        // object headers with garbage (class_ids decay to interface ids like
-        // java/io/Serializable / java/lang/Appendable), desyncing the
-        // non-moving young sweep and crashing (rc=139), or — once the sweep's
-        // diagnostic was hardened to re-sync — dying downstream in BC EC
-        // `precompute` on a monitor abort. Isolated via
-        // `CRATONVM_JIT_BISECT_SKIP=org/junit/runner/JUnitCore.main` (→ no
-        // crash); JIT-only-JUnitCore still crashes. Allocations are correctly
-        // sized (validated), and putfield is bounds-checked, so the leading
-        // suspect is `emit_inline_tlab_new` writing the header at a wrong
-        // R11/TLAB-cursor. Real crypto apps work JIT-on; only the JUnit test
-        // harness crashes. This ban unblocks JUnit-under-JIT until the
-        // inline-new/TLAB root cause is fixed. See
-        // docs/.. / memory `reference_jit_junitcore_corruption`.
-        //
-        // Retest (2026-06-11, CM-FASTMATH session): inconclusive — in
-        // realistic runs (keycloak crypto classes via JUnitCore, with
-        // `CRATONVM_JIT_UNBAN_JUNITCORE=1`) `main` never reaches a compile
-        // threshold (one invocation per process, no hot back-edges), so the
-        // ban could not be exercised; it is also zero-cost for the same
-        // reason. KEEP until the original heavy real-JCA harness conditions
-        // can be recreated.
-        | ("org/junit/runner/JUnitCore", "main")
+        // JUNIT.1 -- REMOVED 2026-07-26. Re-verified by forcing
+        // JUnitCore.main to JIT-compile from its very first invocation
+        // (CRATONVM_JIT_THRESHOLD=1, working around the "main is called
+        // once per process, never gets hot" limitation noted in the prior
+        // retest below) across 110 separate process launches
+        // (JUnitCoreMainProbe.java, real junit-4.13.2.jar): 40 runs of a
+        // passing test, 40 of a failing test, 30 of a heavy-allocation test
+        // (200k small array allocations per run, approximating the
+        // original real-JCA young-gen pressure) -- every run reported the
+        // correct pass/fail exit code, no crash, no heap corruption. No
+        // longer reproduces on current dev. JUnitCoreMainProbe.java is the
+        // regression witness.
         // W2-CHM (Cluster B-CHM, Session 108) — JIT miscompiles
         // `Integer.valueOf(int)` / `Integer.<init>(int)` such that the
         // returned `Integer` has `value=0` instead of the requested int
@@ -4316,38 +4330,38 @@ mod tests {
     }
 
     #[test]
-    fn antlr_coldpath_blanket_ban_holds_by_default() {
-        assert_eq!(
-            check(
-                "groovyjarjarantlr4/v4/runtime/atn/ParserATNSimulator",
-                "closure_",
-                false,
-                true,
-                SkipPolicy::Conservative,
-            ),
-            Some(SkipReason::RustJvmTestFixture),
-            "ANTLR cold-path methods stay interpreted by default"
-        );
+    fn antlr_coldpath_non_bad_atn_methods_are_jit_eligible_after_antlr_1_removal() {
+        // ANTLR.1 (the groovyjarjarantlr4/ blanket ban) was removed
+        // 2026-07-26 -- see the removal comment above should_skip_jit_internal
+        // for the re-verification evidence (real groovy-3.0.21.jar, cold-parse
+        // throughput no longer regressed post the 2026-07-26 JIT rework).
+        // ParserATNSimulator.closure_ is not one of the 7 PredictionContext
+        // methods is_antlr_prediction_context_miscompile still covers, so it
+        // is JIT-eligible under both default and explicit-allow now.
+        for policy in [SkipPolicy::Conservative, SkipPolicy::Aggressive] {
+            assert_eq!(
+                check(
+                    "groovyjarjarantlr4/v4/runtime/atn/ParserATNSimulator",
+                    "closure_",
+                    false,
+                    true,
+                    policy,
+                ),
+                None,
+                "ANTLR cold-path non-PredictionContext methods must be JIT-eligible now that ANTLR.1 is removed"
+            );
+        }
     }
 
     #[test]
-    fn antlr_coldpath_validation_lifts_non_bad_atn_methods() {
-        assert_eq!(
-            check_with(
-                "groovyjarjarantlr4/v4/runtime/atn/ParserATNSimulator",
-                "closure_",
-                false,
-                true,
-                SkipPolicy::Conservative,
-                &["groovyjarjarantlr4/"],
-            ),
-            None,
-            "CRATONVM_JIT_ALLOW_PACKAGES=groovyjarjarantlr4/ is the cold-path validation lift"
-        );
-    }
-
-    #[test]
-    fn hibernate_unshaded_antlr_runtime_stays_interpreted_by_default() {
+    fn hibernate_unshaded_antlr_runtime_stays_interpreted_via_hib_longtail_1() {
+        // HIB-ANTLR.1's own specific check was removed 2026-07-26 (see the
+        // removal comment above should_skip_jit_internal), but
+        // org/antlr/v4/runtime/ classes stay interpreted under Conservative
+        // regardless -- HIB-LONGTAIL.1 (a separate, still-active,
+        // already-confirmed-needed ban covering the same prefix) already
+        // catches them. This test now documents THAT shadowing relationship
+        // rather than HIB-ANTLR.1's own removed check.
         assert_eq!(
             check(
                 "org/antlr/v4/runtime/atn/ParserATNSimulator",
@@ -4357,7 +4371,7 @@ mod tests {
                 SkipPolicy::Conservative,
             ),
             Some(SkipReason::RustJvmTestFixture),
-            "Hibernate's unshaded ANTLR runtime must not corrupt ATN state under JIT"
+            "org/antlr/v4/runtime/ must still be interpreted under Conservative via HIB-LONGTAIL.1"
         );
         assert_eq!(
             check_with(
@@ -4369,7 +4383,7 @@ mod tests {
                 &["org/antlr/v4/runtime/"],
             ),
             None,
-            "the unshaded ANTLR guard must remain available for JIT bisection"
+            "CRATONVM_JIT_ALLOW_PACKAGES=org/antlr/v4/runtime/ lifts HIB-LONGTAIL.1 (same prefix) too"
         );
     }
 

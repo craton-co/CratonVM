@@ -218,7 +218,25 @@ JAVA_HOME=/data/tmp/jitban-wf-javahome CRATONVM_JAVA_HOME=/home/victor/jdk25 \
 ```
 (standalone.sh isn't chmod +x in the dist — always invoke via `bash standalone.sh`.)
 
-## H2/ANTLR-runtime ban (HIB-LONGTAIL.1) — RESULT: CONFIRMED STILL NEEDED
+## H2/ANTLR-runtime ban (HIB-LONGTAIL.1) — STILL NEEDED, but the reason below is now WRONG
+
+> **2026-07-26 update.** The `Schema  not found` cluster described in this
+> section was root-caused and fixed (`13055f75c`): the inlined `java/lang/String`
+> JIT intrinsics read `coder` and `hash` 4 bytes past their real addresses in a
+> COMPACT instance, so `length()` computed `value.length >> (hash & 31)` for any
+> receiver whose lazy hash cache was populated. H2's interned `"PUBLIC"` schema
+> name is such a receiver, so it persisted `CREATE SEQUENCE ""."SEQ1"` into its
+> own metadata and could never reopen the database. A second x64 defect behind
+> it (a reload-elision mirror leaking across a control-flow join) made
+> `ConnectionInfo.getProperty(key, default)` return null. **Both are general
+> x64-backend bugs, not H2 bugs**, and the cluster is now extinct: 0 occurrences
+> across a full 218-class lifted run. The ban still stays — a same-binary
+> 218-class A/B gives PASS 158 (ban in place) vs 149 (lifted), with 9 enumerated
+> regressions — but for those 9 classes, not for the systemic corruption below.
+> See `docs/known-issues/h2/h2-jitban-schema-not-found-on-reconnect.md`, which
+> has been rewritten with the A/B table and the residual list.
+
+### Original 2026-07-25 finding (superseded, kept for the record)
 
 The full-suite differential (99/218 classes completed before the background
 job was interrupted mid-run — still a large, representative sample) found a

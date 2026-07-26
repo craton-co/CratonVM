@@ -1261,6 +1261,36 @@ pub(crate) fn native_class_get_resource_as_stream(
         Some(n) => n,
         None => return Ok(Some(Value::Object(None))),
     };
+    // T24 delegation fix: a class defined through a genuine user-defined
+    // (non-builtin, non-URLClassLoader-fixed-up) ClassLoader -- e.g. a
+    // from-scratch loader overriding only findResource, like Quarkus's
+    // RunnerClassLoader -- must have its resource lookups go through that
+    // loader's real (possibly overridden) getResourceAsStream, not just
+    // CratonVM's static -cp scan below. Without this, any resource whose
+    // backing jar isn't on the process's own -cp (but IS indexed by the
+    // custom loader itself) silently resolves to null. Mirrors the
+    // identical delegation `cl_get_resource_as_stream` already performs
+    // when ClassLoader.getResourceAsStream is called directly.
+    if let Ok(Some(Value::Object(Some(loader)))) =
+        native_class_get_class_loader(ctx, &[Value::Object(Some(this))])
+    {
+        let loader_class_id = ctx.class_id_of_object(loader);
+        let loader_class_name = ctx.class_name_of_id(loader_class_id).unwrap_or_default();
+        if crate::classloader::object_extends(ctx, loader, "java/net/URLClassLoader")
+            || !crate::classloader::is_builtin_loader_class(&loader_class_name)
+        {
+            let pin = ctx.pin_native_root(loader);
+            let name_arg = Value::Object(Some(ctx.create_string(&resource_name)));
+            let loader = ctx.read_native_pin(pin, loader);
+            ctx.unpin_native_roots(pin);
+            return ctx.invoke_virtual(
+                loader,
+                "getResourceAsStream",
+                "(Ljava/lang/String;)Ljava/io/InputStream;",
+                &[name_arg],
+            );
+        }
+    }
     // A package-directory resource has a URL but no byte content to read.
     // In particular, `SomeClass.class.getResourceAsStream("")` resolves to
     // `SomeClass`'s package directory and HotSpot returns a non-null stream.
@@ -1322,6 +1352,31 @@ pub(crate) fn native_class_get_resource(
         Some(n) => n,
         None => return Ok(Some(Value::Object(None))),
     };
+
+    // T24 delegation fix: see the identical block in
+    // native_class_get_resource_as_stream for the full rationale -- a
+    // genuine user-defined (non-builtin) ClassLoader must have its own
+    // getResource override consulted, not just the static -cp scan below.
+    if let Ok(Some(Value::Object(Some(loader)))) =
+        native_class_get_class_loader(ctx, &[Value::Object(Some(this))])
+    {
+        let loader_class_id = ctx.class_id_of_object(loader);
+        let loader_class_name = ctx.class_name_of_id(loader_class_id).unwrap_or_default();
+        if crate::classloader::object_extends(ctx, loader, "java/net/URLClassLoader")
+            || !crate::classloader::is_builtin_loader_class(&loader_class_name)
+        {
+            let pin = ctx.pin_native_root(loader);
+            let name_arg = Value::Object(Some(ctx.create_string(&resource_name)));
+            let loader = ctx.read_native_pin(pin, loader);
+            ctx.unpin_native_roots(pin);
+            return ctx.invoke_virtual(
+                loader,
+                "getResource",
+                "(Ljava/lang/String;)Ljava/net/URL;",
+                &[name_arg],
+            );
+        }
+    }
 
     // Prefer the structured URL (jar:file:/... or jrt:/... or file:/...) so
     // getResource returns a URL whose `toURI()`/`new File(...)` round-trip
