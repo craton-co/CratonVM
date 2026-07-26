@@ -370,3 +370,84 @@ fn differential_double_chain_matches_host() {
         "JIT diverges from host for double chain: expected {expected}, got {actual}",
     );
 }
+
+
+// --- BUG-JOIN-MIRROR-20260726 ---------------------------------------------
+//
+// The x64 single-pass backend elides a `MOV reg,[rbp-off]` reload when the
+// immediately preceding instruction stored that very slot from that very
+// register (the `slot_mirror`). At a branch target the mirror is cleared at
+// the TOP of the PC's handling — but the merge-point `canonicalize_stack()`
+// runs AFTER that clear, and the code it emits sits BEFORE `pc_to_native[pc]`,
+// i.e. on the fall-through edge only. The mirror it recorded therefore leaked
+// across the join, and the reload it suppressed left the joined value in a
+// register only one of the two edges had written.
+//
+// `return s == null ? defaultValue : s` is the minimal shape: the
+// fall-through arm canonicalizes `s` out of its callee-saved home via RAX
+// (`MOV RAX,R12 ; MOV [rbp-off],RAX`) while the `goto` arm stores
+// `defaultValue` straight from its own home (`MOV [rbp-off],R13`, no RAX).
+// The `areturn`'s elided reload then returned the fall-through arm's RAX on
+// BOTH edges — so the null case returned the null instead of the default.
+// H2's `ConnectionInfo.getProperty(key, "rw")` answered null for every
+// database open.
+
+/// `static Object pick(Object s, Object defaultValue) {
+///      return s == null ? defaultValue : s; }`
+///
+/// ```text
+/// 0: aload_0                 2a
+/// 1: ifnonnull 8             c7 00 07
+/// 4: aload_1                 2b
+/// 5: goto 9                  a7 00 04
+/// 8: aload_0                 2a
+/// 9: areturn                 b0
+/// ```
+fn ternary_pick() -> Vec<u8> {
+    vec![0x2a, 0xc7, 0x00, 0x07, 0x2b, 0xa7, 0x00, 0x04, 0x2a, 0xb0, 0, 0]
+}
+
+#[test]
+fn ternary_return_uses_the_value_from_the_taken_edge() {
+    let code = ternary_pick();
+    let compiled = compile(
+        &code,
+        code.len(),
+        2, // num_params: (s, defaultValue)
+        2, // max_locals
+        false,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        HashMap::new(),
+        HashMap::new(),
+        &dummy_helpers(),
+        HashSet::new(),
+        HashMap::new(),
+        None,
+    )
+    .expect("ternary pick must compile");
+    // Two plausible non-null "object pointers" — the JIT only moves them.
+    const S: i64 = 0x1234_5678;
+    const DEF: i64 = 0x7EDC_BA98;
+    // Warm both edges, alternating, exactly as a real caller would.
+    for i in 0..8 {
+        let taken_null = i % 2 == 0;
+        let got = unsafe {
+            compiled
+                .try_call(&[if taken_null { 0 } else { S }, DEF])
+                .expect("test JIT call")
+        };
+        let want = if taken_null { DEF } else { S };
+        assert_eq!(got, want, "iteration {i}: null-edge={taken_null}");
+    }
+}

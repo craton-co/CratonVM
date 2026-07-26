@@ -15,7 +15,12 @@ ROOT="$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel 2>/dev
 HERE="$ROOT/regression-suite"
 CV="${CV:-$ROOT/target/release/cratonvm.exe}"
 JDK="${JDK:-${JAVA_HOME:-C:/Program Files/Java/jdk-25}}"
+# The suite is usually run from Git Bash on Windows, but the Linux build host
+# is where the JIT fixes are validated first — fall back to the extension-less
+# names (and the extension-less CratonVM binary) when the .exe form is absent.
 JAVAC="$JDK/bin/javac.exe"; HS="$JDK/bin/java.exe"
+[ -x "$JAVAC" ] || { JAVAC="$JDK/bin/javac"; HS="$JDK/bin/java"; }
+[ -x "$CV" ] || { case "$CV" in *.exe) [ -x "${CV%.exe}" ] && CV="${CV%.exe}" ;; esac; }
 BUILD="$HERE/build"
 TIMEOUT="${TIMEOUT:-120}"
 
@@ -25,7 +30,7 @@ TIMEOUT="${TIMEOUT:-120}"
 # CratonVM gap (cross-thread JIT-frame root scanning at a STW GC pause — see
 # README "Known gaps"), so it flakes. Run it explicitly once that gap is closed:
 #   ONLY="RConcurrent" bash regression-suite/run.sh
-CLASSES="${ONLY:-RCollections RStrings RNumbers RSerial RCrypto RExceptions RReflect ROptionalClassForName RPrivateLambdaOwner RLambdaDefaultOverload RJitGc}"
+CLASSES="${ONLY:-RCollections RStrings RNumbers RSerial RCrypto RExceptions RReflect ROptionalClassForName RPrivateLambdaOwner RLambdaDefaultOverload RJitGc RJitStringLayout}"
 
 [ -x "$CV" ] || { echo "ERROR: CratonVM binary not found: $CV (build with build-cpu.bat)"; exit 3; }
 [ -x "$JAVAC" ] || { echo "ERROR: javac not found: $JAVAC (set JDK=...)"; exit 3; }
