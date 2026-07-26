@@ -273,6 +273,29 @@ key takeaways:
   jitban work — no actual collision, just cross-session awareness-sharing.
   No lanes need to change based on this exchange.
 
+## SPB.1 (`org/springframework/util/`) — priority item 2 from the shared
+## coordination doc — RESULT: INCONCLUSIVE, ban KEPT
+
+Full writeup: `docs/known-issues/spb1-springframework-util-investigation.md`,
+repros in `docs/known-issues/repros/spb1-classutils/`. Short version: two
+clean synthetic repros (single `ClassUtils.<clinit>` trigger, with/without
+HashMap-machinery warmup) passed identically in both configs; a third,
+GC-pressure + classloader-churn repro crashed BOTH baseline and lifted
+(differently) — since baseline (ban active) also crashed, this can't be
+cleanly attributed to lifting the ban, so no positive evidence to remove
+it. The repro-3 crash itself is flagged as a separate, possibly-serious
+open issue (GC-root/classloader-churn heap corruption) independent of
+SPB.1, for anyone who wants to chase it separately.
+
+**Running tally across this session's SPB/CGL/PIC-family tests:**
+`org/jboss/as/` (real WildFly boot) and `org/h2/` (real 218-class H2 suite)
+both confirmed still-needed via real-app testing; `org/springframework/util/`
+(synthetic repros only, no fixture app available) came back inconclusive.
+Lesson for future items in this family: prefer a real app/suite when one's
+available — synthetic repros for this specific bug class have been hard to
+construct faithfully so far (2/2 clean synthetic tests, 1/1 real-app tests
+found real bugs).
+
 ## Next steps
 
 1. Finish H2/ANTLR-runtime test (this session) — compare `TestFileSystem`

@@ -215,6 +215,31 @@ still real correctness bugs worth closing):
   SPB/CGL/PIC/WildFly family). Do not duplicate.
 - PROXY-JITCALL.1 — REMOVED (see above, merged dev@07427a14e).
 
+**Status (`fix/jit-ban-sweep2-20260726` / `wt-jitsweep2-20260726`):**
+- Item 2 (SPB.1 bisection, `org/springframework/util/`) — **DONE (started
+  2026-07-26 02:20 UTC, concluded 02:24 UTC): INCONCLUSIVE, ban KEPT.**
+  Three standalone repros against a real `spring-core-7.0.7.jar` (no
+  fixture app available on host): two clean-load variants (with/without
+  HashMap-machinery warmup) passed identically in both baseline and lifted
+  configs; a third, more aggressive GC-pressure + classloader-churn variant
+  crashed **both** configs (differently — baseline hit
+  `gen_heap::read_slot: corrupt Value cell` heap corruption landing in
+  `ClassUtils.registerCommonClasses` with an NPE, matching the *original*
+  bug's crash site but under the config that should be protected from it;
+  lifted hit a `ClassCastException` reading back a corrupted field). Since
+  baseline (ban active) also crashed, this can't be cleanly attributed to
+  lifting *this* ban — likely either a separate GC-root/classloader-churn
+  bug my repro's own design exercises, or a timing-sensitive race. Full
+  writeup + all 3 repros: `docs/known-issues/spb1-springframework-util-investigation.md`,
+  `docs/known-issues/repros/spb1-classutils/`. **Verdict: KEEP the ban** (no
+  positive evidence to remove); the repro-3 crash is flagged as a separate,
+  possibly-serious open issue for whoever wants to chase it, independent of
+  SPB.1. Confirms this session's now-established pattern: `org/jboss/as/`
+  and `org/h2/` were BOTH confirmed still-needed via real-app testing;
+  synthetic repros for this ban family have proven unreliable/hard to
+  construct faithfully — prefer a real app/suite over a hand-rolled probe
+  when one is available for any future items in this family.
+
 1. Verify (or refute) the TYPES-ERASURE.1 consolidation hypothesis — highest
    expected value, cheapest to test (no-rebuild env-var bisection already
    proven to work on this exact cluster).
@@ -224,5 +249,21 @@ still real correctness bugs worth closing):
    2026-07-25 TLAB-header finding, or whether it's stale like the JUnit
    iterator ban may be.
 3. ANTLR.1 narrowing (7 specific methods already named in the comment).
+   **CLAIMED by `fix/jit-ban-sweep2-20260726` / `wt-jitsweep2-20260726`,
+   2026-07-26 ~02:30 UTC.** Note before starting: the "narrowing" is
+   actually already done at the code level — `is_antlr_prediction_context_miscompile`
+   (skip_list.rs ~L3199, the exact 7 methods this item names) is already an
+   *unconditional* guard, active regardless of policy/`CRATONVM_JIT_ALLOW_PACKAGES`
+   (see ANTLR-COLDPATH.1's comment, ~L744: "stays interpreted even when
+   `CRATONVM_JIT_ALLOW_PACKAGES=groovyjarjarantlr4/` lifts the surrounding
+   package"). So the *correctness* reason (reason 1 in ANTLR.1's own
+   comment) is already independently covered. The real remaining question
+   is whether the *throughput* reason (reason 2: "~8x slower cold parse
+   under JIT") still holds post today's perf-focused JIT rework
+   (compressed oops / bytecode quickening / IR call lowering) — if not,
+   the broader `groovyjarjarantlr4/` blanket ban (Conservative-only) could
+   be lifted while the narrow 7-method guard stays as the correctness
+   safety net. Plan: find/build a Groovy parse benchmark, compare cold-parse
+   wall-clock lifted vs. baseline.
 4. Work down the "Medium" list — each is single-suite, well-scoped, lower
    risk of interacting with concurrent work elsewhere.
