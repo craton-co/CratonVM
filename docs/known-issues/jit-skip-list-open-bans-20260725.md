@@ -206,10 +206,23 @@ still real correctness bugs worth closing):
   (`xerces_schema_jit_deny_prefix`), SnakeYAML emitter
 - ES-HAMCREST.1, ES-JIT-DEOPT-GC.1, ES fragile cluster
   (`is_elasticsearch_suite_jit_fragile_cluster`)
-- JSONSMART-PARSER.1 — **CLAIMED by `fix/jit-ban-sweep2-20260726` /
-  `wt-jitsweep2-20260726`, 2026-07-26 ~03:05 UTC.** `json-smart-2.6.0.jar`
-  available in gradle caches, self-contained (no Spring context needed) —
-  building a standalone `JSONParser`/`JSONValue.parse` stress repro.
+- JSONSMART-PARSER.1 — **DONE 2026-07-26 03:12 UTC: CONFIRMED still needed,
+  ban KEPT.** Standalone stress repro (`docs/known-issues/repros/jsonsmart/JsonSmartProbe.java`,
+  10 varied JSON docs × 300k iterations, round-trip parse/serialize/re-parse
+  check) against `json-smart-2.6.0.jar`. Baseline (ban in place): 0 errors
+  in whatever it completed within a 200s budget (interpreted parsing is
+  slow, never finished one 30k-iter checkpoint). Lifted
+  (`CRATONVM_JIT_ALLOW_PACKAGES=net/minidev/json/parser/`): **~20% error
+  rate** (239,605/1,200,010 ops), corruption starting within the first ~5
+  iterations and producing a DIFFERENT exception message for the identical
+  input document across consecutive iterations (`"tab" at position 6` →
+  `"tab":"a\tb at position 12` → `character (a) at position 5`, all for the
+  same doc) — a live-state-dependent miscompile signature, not a
+  deterministic parser bug. Full writeup:
+  `docs/known-issues/jsonsmart-parser-still-needed.md`. Fourth-for-four
+  real-app/faithful-repro confirmation this session that this ban family
+  (`org/jboss/as/`, `org/h2/`, `com/unboundid/`, now this) is still fully
+  live — nothing in it has been found safe to remove yet.
   JASPER-JDT.2/.3 (owned by other session, see below).
   WILDFLY-CONTROLLER-JIT.1 (`org/jboss/as/controller/`) — **already
   transitively confirmed still-needed**: it's a strict subset of the
