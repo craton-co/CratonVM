@@ -233,7 +233,7 @@ JAVA_HOME=/data/tmp/jitban-wf-javahome CRATONVM_JAVA_HOME=/home/victor/jdk25 \
 > across a full 218-class lifted run. The ban still stays — a same-binary
 > 218-class A/B gives PASS 158 (ban in place) vs 149 (lifted), with 9 enumerated
 > regressions — but for those 9 classes, not for the systemic corruption below.
-> See `docs/known-issues/h2/h2-jitban-schema-not-found-on-reconnect.md`, which
+> See `docs/internal/fixed-suite-bugs/h2-suite-bugs/h2-jitban-schema-not-found-on-reconnect-FIXED.md`, which
 > has been rewritten with the A/B table and the residual list.
 
 ### Original 2026-07-25 finding (superseded, kept for the record)
@@ -246,7 +246,7 @@ name) error, hit across 15+ completely unrelated test classes, all during
 DB-reopen metadata replay (`Database.executeMeta` → `Parser.getSchema`).
 HANG rate did drop as the ban's perf framing predicted (6% vs. baseline's
 25.7%), but that's overshadowed by the new correctness failures. **Verdict:
-KEEP.** Full writeup: `docs/known-issues/h2/h2-jitban-schema-not-found-on-reconnect.md`
+KEEP.** Full writeup: `docs/internal/fixed-suite-bugs/h2-suite-bugs/h2-jitban-schema-not-found-on-reconnect-FIXED.md`
 (committed). This is the sweep's second concrete "new bug found" per
 the goal's framing (after the WildFly `org/jboss/as/` one below).
 

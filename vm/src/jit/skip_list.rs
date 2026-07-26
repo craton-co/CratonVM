@@ -944,15 +944,29 @@ fn should_skip_jit_internal(
     // `String.coder`/`hash` offsets and a reload-elision mirror leaking across
     // a control-flow join. That cluster is extinct (0 of 218 classes).
     //
-    // The ban nevertheless STAYS, on fresh evidence: a same-binary 218-class
-    // A/B is PASS 158 with it and PASS 149 without, and the 9 regressions are
-    // enumerated with per-class signatures in
-    // `docs/known-issues/h2/h2-jitban-schema-not-found-on-reconnect.md`. Two of
-    // them name their mechanism outright (`TestObjectDataType`:
-    // `String cannot be cast to String`; `TestUpgrade`: `NoSuchMethodError` on
-    // an existing `IntArray.checkCapacity()V`) and are the place to start.
-    // The `org/antlr/v4/runtime/` half remains untested in isolation — the H2
-    // suite never exercises it.
+    // The ban nevertheless STAYS, on fresh evidence. A same-binary 218-class
+    // A/B was PASS 158 with it and PASS 149 without; ten classes regressed
+    // (the -9 is net — `TestMvccMultiThreaded2` improved in the same run).
+    // Six of the ten have since been closed, including both that named their
+    // mechanism outright, and both turned out to be general x64 defects rather
+    // than anything H2-specific: an array reporting itself an instance of its
+    // component type (`373e780b7`, hit by `TestObjectDataType`) and
+    // invokespecial resolving its target by name instead of through the
+    // caller's loader (`f16acca12`, hit by `TestUpgrade`).
+    //
+    // What actually holds this ban now is THREE classes — `TestStreamStore`
+    // (an intermittent `Interruptible.interrupt` NPE that also reproduces with
+    // the ban in place, so it may not belong here at all), `TestFreeSpace` and
+    // `TestNestedJoins` (both clean 300s timeouts, nothing known). A fourth,
+    // `TestCompatibility`, now fails with the ban in place too and is no
+    // longer evidence for anything. Per-class detail, repro commands and the
+    // next steps: `docs/known-issues/h2/h2-jitban-residuals-20260726.md`.
+    //
+    // The `org/antlr/v4/runtime/` half is NOT held by any of that — the H2
+    // suite never exercises ANTLR. A concurrent session isolated it against
+    // Hibernate ORM's own HQL suite (which does, heavily) and came back clean;
+    // see `docs/known-issues/hib-antlr-1-removed-shadowed-20260726.md`. That
+    // half is the better-evidenced candidate for narrowing this rule.
     if (class_name.starts_with("org/h2/") && !package_allowed("org/h2/", allow_packages))
         || (class_name.starts_with("org/antlr/v4/runtime/")
             && !package_allowed("org/antlr/v4/runtime/", allow_packages))

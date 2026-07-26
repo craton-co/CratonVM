@@ -185,7 +185,7 @@ added its own payload offset on top, so for a COMPACT instance (whose
 `hash` were each read 4 bytes high: `coder` landed on `hash`, `hash` landed on
 `hashIsZero`. `String.length()` therefore computed
 `value.length >> (hash & 31)` for any receiver whose lazy hash cache had been
-populated. See `docs/known-issues/h2/h2-jitban-schema-not-found-on-reconnect.md`.
+populated. See `docs/internal/fixed-suite-bugs/h2-suite-bugs/h2-jitban-schema-not-found-on-reconnect-FIXED.md`.
 The row is now `… 1 | 1`: `legacy()` uses each payload constant exactly once
 (ref vs int-category) and `compact()` uses neither.
 
