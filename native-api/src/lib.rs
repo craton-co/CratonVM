@@ -11,6 +11,7 @@ pub mod fd_table;
 pub mod ffi;
 pub mod init_level;
 pub mod intrinsic;
+pub mod native_id;
 pub mod native_ring;
 pub mod plain_server_socket_bind;
 pub mod plain_server_socket_close;
@@ -28,6 +29,13 @@ pub mod socket_input_stream_read;
 pub mod test_mock;
 
 pub use intrinsic::InterpIntrinsic;
+/// Native-dispatch call-site memoization: resolve once, then index.
+///
+/// `NativeMethodRegistry::find` hashes all three of class/method/descriptor on
+/// every call. `NativeCallSite` turns the steady-state cost into an atomic load
+/// plus an array index; `NativeMethodKey` removes the hash from the sites that
+/// still have to resolve by name. See `native_id` for the full rationale.
+pub use native_id::{NativeCallSite, NativeMethodId, NativeMethodKey};
 pub use registry::{
     dispatch_baos_event, install_baos_event_hook, AnnotationData, AnnotationElementValue,
     BaosEvent, BaosEventHook, DefineClassFull, FieldMetadata, LambdaSerialMetadata, MethodMetadata,
