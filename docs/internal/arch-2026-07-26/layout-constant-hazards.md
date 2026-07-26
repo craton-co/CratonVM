@@ -61,25 +61,6 @@ time `x64.rs` is opened. It is not this session's file.
 
 ---
 
-## 1b. 2026-07-26 correction — the two shapes need two offsets
-
-`StringFieldLayout` used to carry ONE offset per field and let `x64.rs` derive
-both physical addresses from it (`cell + payload` for a compact object,
-`cell + payload + 8` for a legacy 16-byte-cell object). That derivation is only
-valid when a field's compact body offset equals `field_index * SLOT_SIZE`. It
-does for `value` (index 0, body offset 0); it does not for `coder`, whose
-compact read consequently landed on `hash` (JDK 25 String: `value:[B` @0,
-`coder:B` @8, `hash:I` @12 — the read went to @12). `length()` therefore
-computed `value.length >> (hash & 31)` and was correct only while `hash` was
-still 0, i.e. until anything called `hashCode()` on that String. `hash`'s own
-legacy address was wrong the same way.
-
-The struct now carries `<field>_compact_offset` and `<field>_legacy_offset` —
-both absolute payload addresses — and `emit_load_string_value_ptr` /
-`emit_load_string_i32_field` take both and select on `GC_FLAG_COMPACT` with no
-arithmetic of their own. When the header shrinks, BOTH columns move and both
-must be re-derived; neither is computable from the other.
-
 ## 2. The stranded constants — `types/src/lib.rs` (closed)
 
 `mod heap_types` is **private** with an explicit re-export list. `MARK_FORWARDED`,
@@ -137,8 +118,8 @@ pre-session numbers from `header-shrink.md` §6.6 are in parentheses):
 | `jit/src/ir_lower.rs:2014` (1971) | `MOVSS/MOVSD XMM0,[RAX+RCX*n+HEADER_SIZE]` | **disp8** |
 | `jit/src/ir_lower.rs:2035` (1992) | `MOVSS/MOVSD [RAX+RCX*n+HEADER_SIZE],XMM0` | **disp8** |
 | `jit/src/ir_lower.rs:2647` (2604) | `MOV R10D,[RAX+ARRAY_LENGTH_OFFSET]` bounds check | **disp8** |
-| `jit/src/lib.rs` `StringFieldLayout::new::compact` | `(HEADER_SIZE + body_off) as i32` — compact string field payload address | disp32 |
-| `jit/src/lib.rs` `StringFieldLayout::new::legacy` | `(HEADER_SIZE + idx * SLOT_SIZE + payload) as i32` — legacy string field payload address | disp32 |
+| `jit/src/lib.rs:3236` (3186) | `(HEADER_SIZE + body_off) as i32` — compact string field **payload** address | disp32 |
+| `jit/src/lib.rs:3210` (3226) | `(HEADER_SIZE + idx * SLOT_SIZE) as i32` — legacy string field cell | disp32 |
 
 **All seven already read the shared constants, not literals** — no site needed
 converting. The hazards are the ones the inventory was supposed to surface and
@@ -193,6 +174,20 @@ layout constants this crate could plausibly emit:
 The zero entries are as load-bearing as the rest: a constant that starts being
 used in a file where it never appeared before also trips the assertion and forces
 the new site into the inventory.
+
+**2026-07-26 update — the inventory earned its keep, in reverse.** The
+`jit/src/lib.rs` row read `… 0 | 2` because `StringFieldLayout::new` had a
+single `cell()` closure that biased *both* the compact and the legacy branch by
+`FIELD_CELL_PAYLOAD64_OFFSET` and never mentioned `FIELD_CELL_PAYLOAD32_OFFSET`
+— which is exactly the shape of the bug it was hiding. Every `x64.rs` call site
+added its own payload offset on top, so for a COMPACT instance (whose
+`CompactLayout` offset is already the payload address, no tag word) `coder` and
+`hash` were each read 4 bytes high: `coder` landed on `hash`, `hash` landed on
+`hashIsZero`. `String.length()` therefore computed
+`value.length >> (hash & 31)` for any receiver whose lazy hash cache had been
+populated. See `docs/known-issues/h2/h2-jitban-schema-not-found-on-reconnect.md`.
+The row is now `… 1 | 1`: `legacy()` uses each payload constant exactly once
+(ref vs int-category) and `compact()` uses neither.
 
 Two self-checks guard the guard:
 

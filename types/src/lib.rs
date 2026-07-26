@@ -13,6 +13,7 @@ pub mod compact_value;
 pub mod error;
 pub mod field_layout;
 pub mod field_watch;
+pub mod flag_groups;
 pub mod flags;
 pub mod float_format;
 pub mod handle;

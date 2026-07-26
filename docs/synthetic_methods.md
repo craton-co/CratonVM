@@ -76,7 +76,7 @@ the JDK's own `.class` files call down into them via `native` declarations.
 
 #### Crypto hardware bridge
 Source: `sunec_point.rs`, `sunec_intpoly.rs`, `zip_crc32c.rs`, `biginteger_intrinsics.rs`
-- SunEC P-256 point arithmetic (active when `route_ec_to_real()` is true; disabled by `CRATONVM_SYNTHETIC_EC=1`)
+- SunEC P-256 point arithmetic (active when `route_ec_to_real()` is true; disabled by `CRATONVM_REAL=-ec`)
 - BigInteger arithmetic: add, subtract, multiply, divide, modPow, gcd, shift, toString
 - CRC32C hardware acceleration
 
@@ -97,14 +97,14 @@ that redirect to real JDK bytecode:
 
 | Subsystem | Default state | Override flag |
 |---|---|---|
-| RustCrypto EC | ON (RustCrypto) | `CRATONVM_SYNTHETIC_EC=1` → revert to legacy stub |
-| RustCrypto PQC | ON (RustCrypto) | `CRATONVM_SYNTHETIC_PQC=1` → revert to legacy stub |
-| RustCrypto RSA | ON (RustCrypto) | `CRATONVM_SYNTHETIC_RSA=1` → revert to legacy stub |
-| Synthetic ForkJoinPool | ON (synthetic) | `CRATONVM_REAL_FORKJOINPOOL` → use real JDK |
-| Synthetic ReentrantLock / AQS | ON (synthetic) | `CRATONVM_REAL_AQS` → use real JDK |
-| Synthetic socket layer | ON (synthetic) | `CRATONVM_REAL_NET_SOCKETS` → use real JDK |
-| Synthetic RandomAccessFile | ON (synthetic) | `CRATONVM_REAL_RAF=1` → use real JDK |
-| Synthetic annotation dispatch | OFF by default | `CRATONVM_SYNTHETIC_ANNOTATIONS=1` or `CRATONVM_REAL_ANNOTATIONS=0` → use legacy synthetic annotation objects |
+| RustCrypto EC | ON (RustCrypto) | `CRATONVM_REAL=-ec` → revert to legacy stub |
+| RustCrypto PQC | ON (RustCrypto) | `CRATONVM_REAL=-pqc` → revert to legacy stub |
+| RustCrypto RSA | ON (RustCrypto) | `CRATONVM_REAL=-rsa` → revert to legacy stub |
+| Synthetic ForkJoinPool | ON (synthetic) | `CRATONVM_REAL=forkjoinpool` → use real JDK |
+| Synthetic ReentrantLock / AQS | ON (synthetic) | `CRATONVM_REAL=aqs` → use real JDK |
+| Synthetic socket layer | ON (synthetic) | `CRATONVM_REAL=net-sockets` → use real JDK |
+| Synthetic RandomAccessFile | ON (synthetic) | `CRATONVM_REAL=raf` → use real JDK |
+| Synthetic annotation dispatch | OFF by default | `CRATONVM_REAL=-annotations` → use legacy synthetic annotation objects |
 
 ---
 
@@ -208,18 +208,26 @@ Implemented via `RealSelector` in `vm/src/runtime/env_cache.rs`.  These allow
 differential testing even in the default build — set a flag to run real JDK bytecode
 for one subsystem while everything else stays on synthetic paths.
 
+Every per-subsystem override is now a token in `CRATONVM_REAL`; the plain form
+selects the real implementation and `-token` selects the synthetic shim. See
+[`docs/flag-tokens.md`](flag-tokens.md#cratonvm_real) for the full list.
+
 | Flag | Direction | Subsystem |
 |---|---|---|
 | `CRATONVM_REAL=all` | → real | All synthetic stubs bypassed |
+| `CRATONVM_REAL=-stubs` | → real | Drop every `SyntheticStub` native at registration |
 | `CRATONVM_REAL=jca` | → real | `java/security/`, `javax/crypto/`, `sun/security/` |
 | `CRATONVM_REAL=<classname>` | → real | Exact class (comma-separated list) |
-| `CRATONVM_REAL_JCA` | → real | Legacy alias for `CRATONVM_REAL=jca` |
-| `CRATONVM_REAL_FORKJOINPOOL` | → real | ForkJoinPool + work-stealing |
-| `CRATONVM_REAL_NET_SOCKETS` | → real | `sun/nio/ch/Net`, socket layer |
-| `CRATONVM_REAL_AQS` | → real | AbstractQueuedSynchronizer → ReentrantLock etc. |
-| `CRATONVM_REAL_RAF=1` | → real | RandomAccessFile |
-| `CRATONVM_REAL_ANNOTATIONS=0` | → synthetic | Annotation dispatch opt-out |
-| `CRATONVM_ECLIPSE_REAL=1` | → real | Eclipse JDT-specific natives |
+| `CRATONVM_REAL=forkjoinpool` | → real | ForkJoinPool + work-stealing |
+| `CRATONVM_REAL=net-sockets` | → real | `sun/nio/ch/Net`, socket layer |
+| `CRATONVM_REAL=aqs` / `-aqs` | → real / synthetic | AbstractQueuedSynchronizer → ReentrantLock etc. |
+| `CRATONVM_REAL=raf` / `-raf` | → real / synthetic | RandomAccessFile |
+| `CRATONVM_REAL=-annotations` | → synthetic | Annotation dispatch opt-out |
+
+> `CRATONVM_ECLIPSE_REAL` used to be listed here. It has **no read site** —
+> nothing in the VM has ever consulted it, and neither have the other 33
+> per-application `CRATONVM_<APP>_REAL` variables that `scripts/real-run-all.sh`
+> exported. Use `CRATONVM_REAL=-stubs`, which is what that script now does.
 
 ---
 
@@ -228,10 +236,10 @@ for one subsystem while everything else stays on synthetic paths.
 | Flag | Default | Effect |
 |---|---|---|
 | *(unset)* | RustCrypto | EC, PQC, RSA all via RustCrypto |
-| `CRATONVM_SYNTHETIC_EC=1` | off | Revert to legacy synthetic EC stubs |
-| `CRATONVM_SYNTHETIC_PQC=1` | off | Revert to legacy synthetic PQC stubs |
-| `CRATONVM_SYNTHETIC_RSA=1` | off | Revert to legacy bare-interface RSA stubs |
-| `CRATONVM_NATIVE_EC_MULTIPLY` | off | Force-enable P-256 native multiply |
+| `CRATONVM_REAL=-ec` | off | Revert to legacy synthetic EC stubs |
+| `CRATONVM_REAL=-pqc` | off | Revert to legacy synthetic PQC stubs |
+| `CRATONVM_REAL=-rsa` | off | Revert to legacy bare-interface RSA stubs |
+| `CRATONVM_JIT=native-ec-multiply` | off | Force-enable P-256 native multiply |
 
 ---
 
@@ -239,12 +247,14 @@ for one subsystem while everything else stays on synthetic paths.
 
 | Flag | Default | Effect |
 |---|---|---|
-| `CRATONVM_USE_WILDFLY_MAIN_SHIM=1` | off | Re-enable legacy WildFly main shim |
-| `CRATONVM_USE_WILDFLY_SYNTH_BYTECODE=1` | off | Re-enable WildFly synthetic bytecode patches |
-| `CRATONVM_USE_WILDFLY_REFLECT_SHIM=1` | off | Re-enable WildFly reflection shim |
-| `CRATONVM_MSC_REAL_START` | off | Use real MSC `service.start` (vs synthetic pump) |
-| `CRATONVM_SKIP_JBOSS_PLUMBING=1` | off | Skip JBoss modules plumbing registration |
-| `CRATONVM_WILDFLY_SHORTCIRCUIT=1` | off | Emergency no-op fallback for WildFly dispatch |
+| `CRATONVM_REAL=use-wildfly-synth-bytecode` | off | Re-enable WildFly synthetic bytecode patches |
+| `CRATONVM_REAL=use-wildfly-reflect-shim` | off | Re-enable WildFly reflection shim |
+| `CRATONVM_REAL=msc-real-start` | **on** | Use real MSC `service.start` (vs synthetic pump); `-msc-real-start` for the pump |
+
+> `CRATONVM_USE_WILDFLY_MAIN_SHIM`, `CRATONVM_SKIP_JBOSS_PLUMBING` and
+> `CRATONVM_WILDFLY_SHORTCIRCUIT` used to be listed here with a documented
+> effect. All three have **no read site** — setting them has never done
+> anything. They are removed rather than re-spelled.
 
 ---
 
@@ -350,50 +360,57 @@ Root snapshots: `CRATONVM_DBG_ROOTSNAP`, `CRATONVM_ROOTSNAP_CACHE`,
 
 ---
 
-## Part 4 — Consolidation Problems
+## Part 4 — Consolidation (resolved)
 
-Three specific inconsistencies are worth resolving.
+This part used to propose three fixes. All three are implemented; the surface
+is now ten grouped variables plus five scalars, defined once in
+[`types/src/flag_groups.rs`](../types/src/flag_groups.rs) and listed in
+[`docs/flag-tokens.md`](flag-tokens.md).
 
-### Problem A: Per-subsystem `CRATONVM_REAL_*` flags are redundant with `CRATONVM_REAL`
+### Problem A: per-subsystem `CRATONVM_REAL_*` flags were redundant with `CRATONVM_REAL` — **fixed**
 
-`CRATONVM_REAL` already supports `=jca`, `=all`, or exact class names and is handled
-centrally by `RealSelector` in `vm/src/runtime/env_cache.rs`.  However, eight
-per-subsystem flags bypass it and gate at the registration call site in `lib.rs`:
+`CRATONVM_REAL` already supported `all`, `jca` and exact class names via
+`RealSelector` in `vm/src/runtime/env_cache.rs`, but eight per-subsystem flags
+bypassed it and gated at the registration call site in `lib.rs`. Each is now a
+token in the same variable: `CRATONVM_REAL=forkjoinpool,net-sockets,aqs,raf`.
+`RealSelector::parse` still reads `all` / `jca` / class names off the raw value,
+so nothing about that path changed.
 
-```
-CRATONVM_REAL_JCA           (already a documented legacy alias in env_cache.rs)
-CRATONVM_REAL_FORKJOINPOOL
-CRATONVM_REAL_NET_SOCKETS
-CRATONVM_REAL_AQS
-CRATONVM_REAL_RAF
-CRATONVM_REAL_ANNOTATIONS
-CRATONVM_ECLIPSE_REAL
-```
+One of the eight, `CRATONVM_ECLIPSE_REAL`, turned out to have no read site at
+all — along with 33 sibling `CRATONVM_<APP>_REAL` variables that
+`scripts/real-run-all.sh` exported. That script now uses `CRATONVM_REAL=-stubs`.
 
-**Proposed fix**: add group tokens (`fjp`, `net`, `aqs`, `raf`, `annotations`, `eclipse`)
-to `RealSelector::parse` and deprecate the individual flags.  `CRATONVM_REAL_JCA` is
-already on this path.
+### Problem B: inverted naming convention for crypto — **fixed**
 
-### Problem B: Inverted naming convention for crypto
+`CRATONVM_SYNTHETIC_EC=1` meant "use the legacy fake" while `CRATONVM_REAL_JCA`
+meant "use real JDK": two opposite conventions in one matrix.
 
-`CRATONVM_SYNTHETIC_EC=1` means "use the legacy fake" (less real), while
-`CRATONVM_REAL_JCA` means "use real JDK" (more real).  The conventions are opposite,
-which makes the matrix of crypto flags confusing.
+The fix was not a rename. Each subsystem is now **one token stated positively**,
+with the direction carried by a `-` prefix rather than by the name:
+`CRATONVM_REAL=ec` for real, `CRATONVM_REAL=-ec` for the synthetic shim. The
+four subsystems that had *both* a `REAL_` and a `SYNTHETIC_` variable — AQS,
+ANNOTATIONS, AGROAL, VERTX — collapse into one token each, and
+`types/src/flag_groups.rs` records both legacy names so existing runbooks keep
+working. `every_token_is_unique` asserts the merge stays merged.
 
-**Proposed fix**: rename `CRATONVM_SYNTHETIC_{EC,PQC,RSA}` to
-`CRATONVM_REAL_{EC,PQC,RSA}` (absent = RustCrypto default; set = prefer real JDK),
-consistent with the rest of the REAL family.  Keep the old names as no-op aliases for
-one release cycle.
+### Problem C: WildFly mode flags scattered across six files — **fixed**
 
-### Problem C: WildFly mode flags are scattered across six files with no central registry
+The six variables had no shared parsing and no shared documentation. They are
+now tokens in `CRATONVM_REAL` and `CRATONVM_COMPAT`, parsed once at startup into
+`cratonvm_types::flags::VmFlags`.
 
-`CRATONVM_USE_WILDFLY_MAIN_SHIM`, `CRATONVM_USE_WILDFLY_SYNTH_BYTECODE`,
-`CRATONVM_USE_WILDFLY_REFLECT_SHIM`, `CRATONVM_WILDFLY_SHORTCIRCUIT`,
-`CRATONVM_SKIP_JBOSS_PLUMBING`, `CRATONVM_MSC_REAL_START` each live in a different
-source file with no shared parsing or documentation.
+Three of the six — `CRATONVM_USE_WILDFLY_MAIN_SHIM`,
+`CRATONVM_SKIP_JBOSS_PLUMBING`, `CRATONVM_WILDFLY_SHORTCIRCUIT` — had no read
+site. They were documented here with a stated effect and did nothing. Removed.
 
-**Proposed fix**: a single `CRATONVM_WILDFLY=<token-list>` following the same
-comma-token model as `CRATONVM_REAL`, parsed once at startup into a cached struct.
+### What stops it growing back
+
+`tools/flag-census/check-surface.sh` runs in CI and fails if a
+`std::env::var("CRATONVM_…")` call site appears without a token, or if these
+docs name a token that does not exist. The second half is the one that matters
+here: a documented flag that reads nothing is how `CRATONVM_PRECISE_JIT_MAPS`
+stayed in the docs for months while the code read the inverse
+`CRATONVM_NO_PRECISE_JIT_MAPS`.
 
 ---
 
@@ -404,8 +421,12 @@ comma-token model as `CRATONVM_REAL`, parsed once at startup into a cached struc
 | Interpreter intrinsic table entries | ~35 |
 | Essential natives (real-JDK mode) | ~150 |
 | Framework / app extras source files | ~100 |
-| `CRATONVM_DBG_*` diagnostic flags | ~80 |
-| Other control / mode flags | ~120 |
-| **Total `CRATONVM_*` env vars** | **~200** |
 | Compile-time feature flags | 11 |
-| Per-subsystem REAL flags (consolidation candidates) | 8 |
+| **`CRATONVM_*` environment variables you can set** | **15** |
+| …ten grouped ones, carrying this many tokens between them | 550 |
+| …plus five scalars (`JAVA_HOME`, `BIN`, `MAVEN_REPO_LOCAL`, `ENABLE_ASSERTIONS`, `DISABLE_JIT`) | 5 |
+| Per-application `CRATONVM_<APP>_REAL` variables, all dead, all removed | 34 |
+
+The 15 is the number to hold. It was 692 identifiers before the consolidation —
+559 with a read site, 133 that nothing had ever read. `types/tests/flag_surface.rs`
+and `tools/flag-census/check-surface.sh` pin it.

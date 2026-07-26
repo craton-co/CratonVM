@@ -3845,6 +3845,35 @@ fn run() -> Result<()> {
 }
 
 fn main() {
+    // Expand the ten grouped configuration variables (`CRATONVM_JIT=-bce,unroll`
+    // and friends) into the per-knob keys the rest of the VM reads.
+    //
+    // This runs first, before the symbolize/SEGV hooks below, because those
+    // read `CRATONVM_SYMBOLIZE` and `CRATONVM_TEST_SEGV` — both of which are
+    // now tokens (`CRATONVM_DBG=symbolize=...`, `CRATONVM_TEST=segv`) and would
+    // otherwise be missed on this run. It is also the only point in the process
+    // guaranteed to be single-threaded, which is what makes writing back to
+    // `environ` sound: 431 read sites still call `std::env::var` directly and
+    // cannot see a resolved source. See `cratonvm_types::flag_groups`.
+    let (legacy_direct, unknown_tokens) = cratonvm_types::flag_groups::expand_process_env();
+    for t in &unknown_tokens {
+        eprintln!("[cratonvm] unknown configuration token: {t}");
+    }
+    // `CRATONVM_DBG=-deprecations` expands to `CRATONVM_QUIET_DEPRECATIONS=1`,
+    // which the call above has already written back, so this read sees it.
+    if !legacy_direct.is_empty() && std::env::var_os("CRATONVM_QUIET_DEPRECATIONS").is_none() {
+        // One line, not one per variable: a debugging session routinely exports
+        // a dozen of these and a dozen warnings would just train people to
+        // ignore them.
+        let shown: Vec<&str> = legacy_direct.iter().map(|(_, to)| to.as_str()).collect();
+        eprintln!(
+            "[cratonvm] {} per-flag variable(s) set directly; the supported \
+             spelling is now: {}",
+            legacy_direct.len(),
+            shown.join(" ")
+        );
+    }
+
     // Hardware-fault diagnostics. On Windows a SEGV/access violation is a
     // structured exception that bypasses the Rust panic hook below entirely;
     // without this, a native fault (e.g. the JIT-dispatch SEGV) kills the
