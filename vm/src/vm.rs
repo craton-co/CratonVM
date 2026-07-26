@@ -72753,14 +72753,25 @@ public class SkippedTest {
         assert_eq!(cache.len(), 1);
     }
 
+    /// Inlining moved from a single flat cap to HotSpot's three-tier model
+    /// (trivial / cold / hot). The value this test has always pinned — 35, the
+    /// most bytecode we will inline from a callee with no profile evidence that
+    /// it is hot — is now `MAX_INLINE_SIZE_COLD`. `MAX_INLINE_BYTECODE_SIZE`
+    /// became the *hot* tier (HotSpot's `FreqInlineSize` = 325), so pinning it
+    /// at 35 would now assert the opposite of the original intent.
     #[test]
     fn s31_max_inline_bytecode_size_constant() {
-        assert_eq!(cratonvm_jit::MAX_INLINE_BYTECODE_SIZE, 35);
+        assert_eq!(cratonvm_jit::MAX_INLINE_SIZE_COLD, 35);
+        assert_eq!(cratonvm_jit::MAX_INLINE_BYTECODE_SIZE, 325);
+        // A cold callee must never be allowed to inline more than a hot one.
+        assert!(cratonvm_jit::MAX_INLINE_SIZE_COLD <= cratonvm_jit::MAX_INLINE_BYTECODE_SIZE);
     }
 
     #[test]
     fn s31_max_inline_budget_constant() {
-        assert_eq!(cratonvm_jit::MAX_INLINE_BUDGET, 250);
+        assert_eq!(cratonvm_jit::MAX_INLINE_BUDGET, 750);
+        assert_eq!(cratonvm_jit::MAX_INLINE_BUDGET_HOT, 2000);
+        assert!(cratonvm_jit::MAX_INLINE_BUDGET <= cratonvm_jit::MAX_INLINE_BUDGET_HOT);
     }
 
     #[test]

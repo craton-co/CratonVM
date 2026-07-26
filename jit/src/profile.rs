@@ -324,7 +324,7 @@ impl MethodProfile {
     /// sites. See [`CallSiteEvidence`] for why "no data" is distinguished from
     /// "zero".
     pub fn call_site_count(&self, pc: usize) -> CallSiteEvidence {
-        if let Some(&n) = self.call_sites.get(pc) {
+        if let Some(&n) = self.call_sites.get(&pc) {
             return CallSiteEvidence::Direct(n);
         }
         match self.receivers.get(&pc) {

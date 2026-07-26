@@ -505,7 +505,21 @@ mod tests {
         // ...and re-resolving against the second registry gives the second
         // registry's (correct) answer, not the first's slot.
         assert!(site.callback(&second, "a/A", "m", "()V").is_none());
-        assert!(site.callback(&second, "z/Z", "other", "()V").is_some());
+
+        // A `NativeCallSite` memoizes ONE call site, so the memo is keyed on the
+        // registry generation alone — the triple is invariant by construction at
+        // a real site and is deliberately not re-checked on a warm hit. Probing
+        // a *different* triple therefore needs its own site: the line above just
+        // memoized "not found" for `second`'s generation, and reusing `site`
+        // here would redeem that negative rather than resolve `z/Z.other`.
+        //
+        // This is a live footgun for the interpreter adoption plan, which puts
+        // `static NativeCallSite` cells at the constant-triple call sites: each
+        // such site must have its own static, never a shared one.
+        let other_site = NativeCallSite::new();
+        assert!(other_site.callback(&second, "z/Z", "other", "()V").is_some());
+        // And that second site is likewise not warm for the first registry.
+        assert!(!other_site.is_warm(&first));
     }
 
     #[test]
