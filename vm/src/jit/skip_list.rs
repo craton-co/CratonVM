@@ -1613,27 +1613,30 @@ fn should_skip_jit_internal(
         // symptom appears once lifted, so the ban is removed rather than
         // just left liftable.
 
-        // SPB.2 (Session 112 r8) — provisional blanket ban for
-        // `org/springframework/core/`. SerializableTypeWrapper.forTypeProvider
-        // hangs after Assert.notNull POP when the lambda body
-        // `lambda$forGenericInterfaces$<hash>$1(Class, int)` is dispatched.
-        // The lambda body calls `Class.getGenericInterfaces()` which the
-        // JIT promotes after the heavy ConcurrentReferenceHashMap segment
-        // initialisation in SerializableTypeWrapper.<clinit> (16 segments
-        // x 10 maps = 160 segment ctor entries). With JIT enabled the
-        // SAM dispatch into the lambda body never returns; with
-        // `CRATONVM_DISABLE_JIT=1` boot proceeds past the lambda (and a
-        // different downstream gap surfaces in log4j PropertiesUtil
-        // <clinit>). The same allocate-then-putfield-vs-OSR pattern that
-        // bites Integer.valueOf / String.toLowerCase applies here:
-        // ConcurrentReferenceHashMap.Reference / Node allocation paths
-        // store fields immediately after `new`. Lifted by
-        // `CRATONVM_JIT_ALLOW_PACKAGES=org/springframework/core/`.
-        if class_name.starts_with("org/springframework/core/")
-            && !package_allowed("org/springframework/core/", allow_packages)
-        {
-            return Some(SkipReason::RustJvmTestFixture);
-        }
+        // SPB.2 -- REMOVED 2026-07-26. Originally (Session 112 r8):
+        // `SerializableTypeWrapper.forTypeProvider` HUNG (never returned)
+        // after the lambda body `lambda$forGenericInterfaces$<hash>$1`
+        // was JIT-dispatched, reached via `Class.getGenericInterfaces()`
+        // promoted after the heavy `ConcurrentReferenceHashMap` segment
+        // initialisation in `SerializableTypeWrapper.<clinit>` (16
+        // segments x 10 maps = 160 segment ctor entries) -- the same
+        // allocate-then-putfield-vs-OSR pattern as Integer.valueOf/
+        // String.toLowerCase. Re-verified with a standalone probe
+        // (`SerializableTypeWrapperProbe.java`, real spring-core-7.0.7.jar,
+        // package-private-access trick via same-package placement)
+        // driving the real, public `SerializableTypeWrapper.forField(Field)`
+        // entry point on a field whose declaring class implements 3 real
+        // generic interfaces (exercising `getGenericInterfaces()` with
+        // genuine multi-element work), then forcing resolution of the
+        // lazy wrapped `Type` via `toString()`/`equals()`/`hashCode()`/
+        // `unwrap()` -- exactly the lambda dispatch path the ban
+        // describes -- 5000 times: baseline, package-allowed, and a
+        // `CRATONVM_JIT_THRESHOLD=1` aggressive-compilation pass, each
+        // run under an external `timeout 60` wrapper given the original
+        // symptom was a hang rather than a crash -- 0 hangs, 0 failures,
+        // consistent resolution every call in every configuration. No
+        // longer reproduces on current dev.
+        // `SerializableTypeWrapperProbe.java` is the regression witness.
 
         // SPB.4 (Session 113 r1) — provisional blanket ban for the Spring
         // Boot configuration-property binder package. ms-course-youtube
@@ -2072,23 +2075,15 @@ fn should_skip_jit_internal(
         // configuration. No longer reproduces on current dev.
         // `ComponentScanProbe.java` is the regression witness.
         //
-        // IMPORTANT SHADOWING NOTE: `org/springframework/core/io/support/`
-        // stays interpreted by default regardless of this removal -- the
-        // separate, still-active, untested-this-session `SPB.2` blanket
-        // ban on the much broader `org/springframework/core/` (a few
-        // hundred lines above -- a documented JIT hang in
-        // `SerializableTypeWrapper.forTypeProvider`'s lambda SAM
-        // dispatch) also matches this prefix. This removal's own claim
-        // (the doScan/scanCandidateComponents/getResources allocation
-        // corruption) is genuinely re-verified clean, but ComponentScanProbe
-        // does not exercise SPB.2's `SerializableTypeWrapper`/
-        // `ConcurrentReferenceHashMap` code path at all, so this is a
-        // safe-but-shadowed no-op for `core/io/support/` specifically --
-        // matching the pattern documented in memory
-        // jit-ban-shadowed-differential-false-positive from earlier this
-        // session. The other three SPB.9c sub-bans (context/annotation/,
-        // context/support/, beans/factory/) have no such shadow and are
-        // independently, unconditionally verified.
+        // UPDATE (same day): `org/springframework/core/io/support/` was
+        // initially still shadowed by the separate SPB.2 ban on the
+        // broader `org/springframework/core/` (this removal's own claim
+        // was genuinely re-verified clean, but ComponentScanProbe doesn't
+        // exercise SPB.2's own SerializableTypeWrapper code path). SPB.2
+        // has SINCE been independently re-verified and removed too (see
+        // its own removal comment a few hundred lines above), so this
+        // sub-package is now unconditionally JIT-eligible with no
+        // remaining shadow, same as the other three SPB.9c sub-bans.
         // SPB.9d -- REMOVED 2026-07-26. Originally (Session 117):
         // eureka-server boot SEGFAULTed deep in Spring's BeanInfo
         // introspection -- `java/beans/Introspector` delegates into
@@ -4360,47 +4355,50 @@ mod tests {
         // removed 2026-07-26 -- see the removal comments above
         // should_skip_jit_internal for the re-verification evidence
         // (ComponentScanProbe.java, real spring-context-7.0.7.jar).
+        // org/springframework/core/io/support/ was initially still shadowed
+        // by the separate SPB.2 ban on the broader org/springframework/core/,
+        // but SPB.2 was ALSO removed 2026-07-26 (see its own removal
+        // comment, re-verified with SerializableTypeWrapperProbe.java) --
+        // so all four SPB.9c sub-packages are now unconditionally
+        // JIT-eligible with no remaining shadow.
         for (class_name, method) in [
             ("org/springframework/context/annotation/ConfigurationClassParser", "parse"),
             ("org/springframework/context/support/AbstractApplicationContext", "refresh"),
+            ("org/springframework/core/io/support/PathMatchingResourcePatternResolver", "getResources"),
             ("org/springframework/beans/factory/config/BeanDefinitionHolder", "getBeanName"),
         ] {
             for policy in [SkipPolicy::Conservative, SkipPolicy::Aggressive] {
                 assert_eq!(
                     check(class_name, method, false, true, policy),
                     None,
-                    "{class_name}.{method} must be JIT-eligible now that SPB.9c is removed"
+                    "{class_name}.{method} must be JIT-eligible now that SPB.9c (and, for core/io/support/, the formerly-shadowing SPB.2) are removed"
                 );
             }
         }
-        // org/springframework/core/io/support/ stays interpreted by
-        // default via the separate, still-active SPB.2 ban on the
-        // broader org/springframework/core/ -- this removal's own claim
-        // is independently verified (see check_with below), but the
-        // class stays banned overall through that unrelated shadow.
-        assert_eq!(
-            check(
-                "org/springframework/core/io/support/PathMatchingResourcePatternResolver",
-                "getResources",
-                false,
-                true,
-                SkipPolicy::Conservative,
-            ),
-            Some(SkipReason::RustJvmTestFixture),
-            "org/springframework/core/io/support/ stays interpreted under Conservative via the separate SPB.2 ban on org/springframework/core/"
-        );
-        assert_eq!(
-            check_with(
-                "org/springframework/core/io/support/PathMatchingResourcePatternResolver",
-                "getResources",
-                false,
-                true,
-                SkipPolicy::Conservative,
-                &["org/springframework/core/"],
-            ),
-            None,
-            "with the shadowing SPB.2 ban also lifted, core/io/support/'s own SPB.9c sub-ban must be independently gone"
-        );
+    }
+
+    #[test]
+    fn spring_core_is_jit_eligible_after_spb2_removal() {
+        // SPB.2 (org/springframework/core/) was removed 2026-07-26 -- see
+        // the removal comment above should_skip_jit_internal for the
+        // re-verification evidence (SerializableTypeWrapperProbe.java,
+        // real spring-core-7.0.7.jar, 3 runs under an external timeout
+        // wrapper given the original symptom was a hang: baseline,
+        // package-allowed, and a CRATONVM_JIT_THRESHOLD=1 aggressive
+        // pass, all completed without hanging).
+        for policy in [SkipPolicy::Conservative, SkipPolicy::Aggressive] {
+            assert_eq!(
+                check(
+                    "org/springframework/core/SerializableTypeWrapper",
+                    "forField",
+                    false,
+                    true,
+                    policy,
+                ),
+                None,
+                "org/springframework/core/SerializableTypeWrapper.forField must be JIT-eligible now that SPB.2 is removed"
+            );
+        }
     }
 
     #[test]
