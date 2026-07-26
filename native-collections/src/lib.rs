@@ -7460,6 +7460,43 @@ fn native_map_values(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     Ok(Some(Value::Object(Some(list))))
 }
 
+/// Build a live-view `java.util.ArrayList` from an already-collected `values`
+/// slice, tagging it with `source` in the trailing capacity slot exactly like
+/// [`native_map_values`] does -- so it participates in the same already-hardened
+/// `values_view_source`/`resync_values_view`/`propagate_list_removal` machinery
+/// used by `native_al_remove_obj`/`native_al_clear`/iterator `.remove()`
+/// (`values().remove(v)`, `.iterator().remove()`, and `.clear()` write through
+/// to `source` via its virtual `remove`/`clear`).
+///
+/// Exposed for callers (e.g. `java.util.Properties`'s side-table-backed
+/// `values()`) whose data does not live in a native bucket table, so
+/// `map_collect_values` cannot be reused directly -- the caller collects the
+/// correct value list itself and hands it here just to get live-view wiring.
+pub fn make_live_values_list(
+    ctx: &mut dyn NativeContext,
+    source: ObjectRef,
+    values: &[Value],
+) -> ObjectRef {
+    let source_pin = ctx.pin_native_root(source);
+    let (_, val_handles) = pin_value_slice(ctx, values);
+    let __al_n_fields = al_slots(ctx).2;
+    let list = alloc_synthetic(ctx, "java/util/ArrayList", __al_n_fields);
+    let list_pin = ctx.pin_native_root(list);
+    let cap = std::cmp::max(values.len(), AL_DEFAULT_CAPACITY) + 1;
+    let buf = alloc_ref_array(ctx, cap);
+    for (i, val) in values.iter().enumerate() {
+        let val = read_pinned_elem(ctx, val_handles[i], *val);
+        ctx.set_array_element(buf, i, val);
+    }
+    let source = ctx.read_native_pin(source_pin, source);
+    ctx.set_array_element(buf, cap - 1, Value::Object(Some(source)));
+    let list = ctx.read_native_pin(list_pin, list);
+    al_set_data(ctx, list, buf);
+    al_set_size(ctx, list, values.len() as i32);
+    ctx.unpin_native_roots(source_pin);
+    list
+}
+
 fn native_map_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let mut this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
@@ -29992,6 +30029,13 @@ fn native_al_retain_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Int(0))),
     };
+    // Live `values()` view: a modifying retainAll must also drop the removed
+    // elements' entries from the source map. Unlike native_al_remove_obj /
+    // native_al_clear, this native previously never consulted
+    // values_view_source at all -- a generic gap (affects retainAll() on
+    // ANY Map's values() view, not just Properties') found 2026-07-26 while
+    // auditing Properties.values() liveness. See properties-keyset-view-not-live.md.
+    let view_src = values_view_source(ctx, this);
     let coll_elems = collect_collection_elements(ctx, coll);
     let (data, size) = al_state(ctx, this);
     let buf = match data {
@@ -30002,13 +30046,16 @@ fn native_al_retain_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     // backing array (capacity == size) is handled correctly.
     //
     // Family-1 fix (cce0079): pinned walk + kept INDICES — see
-    // `native_al_remove_all` for the full rationale.
+    // `native_al_remove_all` for the full rationale. `removed_idx` mirrors
+    // `kept_idx` for the view-source propagation below.
     let this_pin = ctx.pin_native_root(this);
     let buf_pin = ctx.pin_native_root(buf);
+    let vh = view_src.map(|v| ctx.pin_native_root(v));
     let (_, ce_handles) = pin_value_slice(ctx, &coll_elems);
     let mut this = this;
     let mut buf = buf;
     let mut kept_idx: Vec<usize> = Vec::with_capacity(size as usize);
+    let mut removed_idx: Vec<usize> = Vec::new();
     let mut modified = false;
     for read_idx in 0..(size as usize) {
         let elem0 = ctx.get_array_element(buf, read_idx);
@@ -30033,10 +30080,22 @@ fn native_al_retain_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
             kept_idx.push(read_idx);
         } else {
             modified = true;
+            removed_idx.push(read_idx);
         }
     }
     this = ctx.read_native_pin(this_pin, this);
     buf = ctx.read_native_pin(buf_pin, buf);
+    let view_src = match (view_src, vh) {
+        (Some(v), Some(h)) => Some(ctx.read_native_pin(h, v)),
+        _ => None,
+    };
+    // Snapshot the removed elements' current values before compaction
+    // overwrites their slots below (the compaction itself is a local array
+    // shift, not GC-capable, but the propagation loop after it is).
+    let removed_vals: Vec<Value> = removed_idx
+        .iter()
+        .map(|&i| ctx.get_array_element(buf, i))
+        .collect();
     ctx.unpin_native_roots(this_pin);
     if modified {
         for (k, &idx) in kept_idx.iter().enumerate() {
@@ -30055,6 +30114,17 @@ fn native_al_retain_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
             ctx.set_array_element(buf, i, Value::Object(None));
         }
         al_set_size(ctx, this, kept_idx.len() as i32);
+        if let Some(source) = view_src {
+            let source_pin = ctx.pin_native_root(source);
+            let (_, removed_handles) = pin_value_slice(ctx, &removed_vals);
+            let mut source = source;
+            for (i, &orig) in removed_vals.iter().enumerate() {
+                let v = read_pinned_elem(ctx, removed_handles[i], orig);
+                source = ctx.read_native_pin(source_pin, source);
+                propagate_list_removal(ctx, source, v)?;
+            }
+            ctx.unpin_native_roots(source_pin);
+        }
     }
     Ok(Some(Value::Int(if modified { 1 } else { 0 })))
 }

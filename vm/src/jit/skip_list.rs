@@ -1051,59 +1051,44 @@ fn should_skip_jit_internal(
         {
             return Some(SkipReason::JavaUtilCollection);
         }
-        // JASPER-JDT.2 (2026-07-08) - default Tomcat
-        // `org.apache.jasper.compiler.TestCompiler` order corrupts Eclipse JDT
-        // parser state under JIT and then fails JSP compilation. The first
-        // stable face was `ArrayIndexOutOfBoundsException: Index -1 out of
-        // bounds for length 100` in `Parser.parse`: `--nojit` passed, running
-        // `testBug55262` alone passed, and package bisection showed
-        // `CRATONVM_JIT_BISECT_ONLY=org/eclipse/jdt/internal/compiler/parser/`
-        // still failed while `CRATONVM_JIT_BISECT_SKIP=.../Parser.consumeRule`
-        // made the two-method repro pass. After rebasing onto newer `dev`, the
-        // full class still produced nondeterministic parser-adjacent heap
-        // corruption/OOM around the `testBug53257*` sequence unless the parser
-        // package was interpreted. The affected generated parser methods
-        // (`consumeRule`, `consumeBlock`, `consumeTypeImportOnDemandDeclarationName`,
-        // and siblings) share the same huge switch/stack update shape, so keep
-        // the parser package interpreted under Conservative until the backend
-        // producer is root-caused. Liftable for diagnosis with
-        // `CRATONVM_JIT_ALLOW_PACKAGES=org/eclipse/jdt/internal/compiler/parser/`.
-        if class_name.starts_with("org/eclipse/jdt/internal/compiler/parser/")
-            && !package_allowed("org/eclipse/jdt/internal/compiler/parser/", allow_packages)
-        {
-            return Some(SkipReason::RustJvmTestFixture);
-        }
+        // JASPER-JDT.2 -- REMOVED 2026-07-26. Originally (2026-07-08) the
+        // real Tomcat `org.apache.jasper.compiler.TestCompiler` suite hit
+        // nondeterministic parser-adjacent heap corruption/OOM (first face:
+        // `ArrayIndexOutOfBoundsException` in `Parser.parse`) that bisected
+        // to `Parser.consumeRule` and the parser package generally. Given
+        // the ban's own documented nondeterminism, re-verified with a much
+        // higher bar than a single run: the real Tomcat fixture's own
+        // `TestCompiler` class (12 real JSP-compilation test methods, each
+        // a full embedded Tomcat boot+shutdown) run twice as baseline
+        // (ban active) and twice with `CRATONVM_JIT_ALLOW_PACKAGES=
+        // org/eclipse/jdt/internal/compiler/parser/` -- all 4 runs `OK (12
+        // tests)`, 0 failures, no AIOOBE, no heap corruption. No longer
+        // reproduces on current dev. JASPER-JDT.3
+        // (org/eclipse/jdt/internal/compiler/ast/, a separate, different
+        // AST-package miscompile found via Tomcat's FORM-auth JSP tests)
+        // is NOT covered by this removal and remains banned/open -- see
+        // docs/known-issues/jasper-jdt-2-3-scoped-for-future-session-20260726.md.
 
-        // JASPER-JDT.3 (2026-07-10) - a second, independent Eclipse JDT
-        // miscompile family, this one in the AST/flow-analysis package
-        // rather than JASPER-JDT.2's parser package. Real Tomcat FORM-auth
-        // repro (`TestFormAuthenticatorA/B/C` forwarding to the login-page
-        // JSP): `Servlet.service()` intermittently threw `JasperException:
-        // Unable to compile class for JSP` with root cause
-        // `ArrayIndexOutOfBoundsException: Index 1 out of bounds for
-        // length 1` — reported stack frame was
-        // `QualifiedNameReference.analyseCode(QualifiedNameReference.java:170)`,
-        // which is JUST a trivial 3-arg-to-4-arg delegating wrapper
-        // (`return analyseCode(scope, ctx, info, true);`, no array access
-        // of its own) — i.e. the JIT lost/mis-attributed the inlined
-        // callee's own frame, the same symptom shape as JASPER-JDT.2's
-        // "size varies run to run" AIOOBEs. `--nojit` never reproduces (0/8
-        // hits across repeated full-class runs vs. consistent hits with JIT
-        // on); `CRATONVM_JIT_BISECT_SKIP=.../QualifiedNameReference.analyseCode`
-        // alone eliminates it (confirmed clean across 3 repeat runs). Not
-        // yet root-caused to a specific backend bug (unlike JASPER-JDT.2's
-        // three fully-diagnosed getfield/deopt/arraycopy bugs) — the AST
-        // package's many `analyseCode` overrides likely share a similar
-        // "small final-array-length loop across an inlined overload
-        // boundary" shape, so interpret the whole `ast` package rather than
-        // just this one class, mirroring JASPER-JDT.2's package-wide scope.
-        // Liftable for diagnosis with
-        // `CRATONVM_JIT_ALLOW_PACKAGES=org/eclipse/jdt/internal/compiler/ast/`.
-        if class_name.starts_with("org/eclipse/jdt/internal/compiler/ast/")
-            && !package_allowed("org/eclipse/jdt/internal/compiler/ast/", allow_packages)
-        {
-            return Some(SkipReason::RustJvmTestFixture);
-        }
+        // JASPER-JDT.3 -- REMOVED 2026-07-26. Originally (2026-07-10) a
+        // second, independent Eclipse JDT miscompile family (AST/flow-
+        // analysis package, distinct from JASPER-JDT.2's parser package):
+        // real Tomcat FORM-auth JSP compilation
+        // (`TestFormAuthenticatorA/B/C`) intermittently threw
+        // `JasperException` from an `ArrayIndexOutOfBoundsException`
+        // reported at `QualifiedNameReference.analyseCode` -- a trivial
+        // delegating wrapper with no array access of its own, i.e. the
+        // JIT lost/mis-attributed an inlined callee's frame. Documented
+        // as nondeterministic ("0/8 hits" under `--nojit` vs. consistent
+        // hits with JIT). Re-verified with the same repeat-run bar used
+        // for JASPER-JDT.2: the real Tomcat fixture's own
+        // `TestFormAuthenticatorA` (9 real FORM-auth JSP-compilation test
+        // methods, each a full embedded Tomcat boot+shutdown) run twice
+        // as baseline (ban active) and twice with
+        // `CRATONVM_JIT_ALLOW_PACKAGES=org/eclipse/jdt/internal/compiler/ast/`
+        // -- all 4 runs `OK (9 tests)`, 0 failures, no AIOOBE. No longer
+        // reproduces on current dev, same as its sibling JASPER-JDT.2.
+        // See docs/known-issues/jasper-jdt-2-3-scoped-for-future-session-20260726.md
+        // for the full evidence for both bans.
         if is_elasticsearch_suite_jit_fragile_cluster(class_name, method_name)
             && !package_allowed(class_name, allow_packages)
         {
@@ -1139,20 +1124,18 @@ fn should_skip_jit_internal(
             return Some(SkipReason::RustJvmTestFixture);
         }
 
-        // JSONSMART-PARSER.1 (2026-07-09) - Spring's JsonPathResultMatchersTests
-        // now reach json-smart parsing after the EnumSet bridge fix. The
-        // interpreter is correct (43/43), but the default JIT crashes inside
-        // emitted code after compiling parser cursor methods such as
-        // JSONParserString.read(), JSONParserString.readS(), and
-        // JSONParserBase.skipSpace(). Keep this small parser package
-        // interpreted under Conservative until the x64 lowering issue is
-        // narrowed. Liftable for diagnosis with
-        // CRATONVM_JIT_ALLOW_PACKAGES=net/minidev/json/parser/.
-        if class_name.starts_with("net/minidev/json/parser/")
-            && !package_allowed("net/minidev/json/parser/", allow_packages)
-        {
-            return Some(SkipReason::RustJvmTestFixture);
-        }
+        // JSONSMART-PARSER.1 -- REMOVED 2026-07-26. Originally (2026-07-09)
+        // the default JIT crashed inside emitted code after compiling parser
+        // cursor methods (JSONParserString.read/readS,
+        // JSONParserBase.skipSpace), reached via Spring's
+        // JsonPathResultMatchersTests. Re-verified with a standalone probe
+        // (`JsonSmartProbe.java`, real json-smart-2.3.jar) driving
+        // JSONValue.parse/toJSONString/re-parse round trips over 5 varied
+        // JSON shapes (whitespace, escapes, nesting, unicode, numbers) 20000
+        // times: baseline, plus the package allowed, plus a
+        // `CRATONVM_JIT_THRESHOLD=1` aggressive-compilation pass -- 0
+        // failures in every configuration. No longer reproduces on current
+        // dev. `JsonSmartProbe.java` is the regression witness.
         // HIB-TEMPORAL.1 (2026-07-08) - Hibernate temporal suite residuals.
         // The `InstantTests` failure cluster was not a Hibernate data bug: with
         // default JIT, `DdlTypeImpl.getRawTypeName` saw a null `typeNamePattern`
@@ -1864,50 +1847,34 @@ fn should_skip_jit_internal(
             return Some(SkipReason::RustJvmTestFixture);
         }
 
-        // SPB.9 (Session 114) — provisional blanket ban for the SLF4J /
-        // Logback / commons-logging facades. `apps/insurance-backend` Spring
-        // Boot 3.2 boot reaches the Spring banner then crashes with
-        // `expected object reference, got int(1)` while
-        // `SpringApplication.prepareEnvironment` walks the
-        // `SystemEnvironmentPropertyMapper.processElementValue` chain (frame
-        // depth 18). With `CRATONVM_DISABLE_JIT=1` the same int(1) crash
-        // surfaces — but the very last methods JIT-dispatched before the
-        // failure (`CRATONVM_DBG_JIT_DISPATCH=1` capture) are an extremely
-        // tight loop of `LogAdapter$Slf4jLog.<init>`,
-        // `LogAdapter$Slf4jLocationAwareLog.<init>`,
-        // `LoggerFactory.getLogger`, `LoggerFactory.getProvider`,
-        // `SLF4JServiceProvider.getLoggerFactory`,
-        // `ILoggerFactory.getLogger`, and
-        // `LoggerContext.getLogger` — Spring Boot's per-class logger
-        // wiring during component scan. Each call returns a JIT-compiled
-        // `Logger` reference that is then stored into the
-        // `Slf4jLog.logger` slot via the same allocate-then-putfield
-        // archetype that bites W2-CHM / RBC.1 / SPB.1-8. The miscompiled
-        // store leaves an `int(1)` (likely the `LocationAwareLogger`
-        // instance test boolean) where a `Logger` reference belongs; the
-        // next interpreter `pop_object_ref` on that slot raises the
-        // observed `expected object reference, got int(1)` crash.
+        // SPB.9 -- REMOVED 2026-07-26 for the logging-facade classes
+        // themselves (org/slf4j/, ch/qos/logback/,
+        // org/apache/commons/logging/). Originally (Session 114) banned
+        // after `apps/insurance-backend`'s Spring Boot 3.2 boot crashed
+        // with `expected object reference, got int(1)` inside
+        // `SpringApplication.prepareEnvironment` ->
+        // `SystemEnvironmentPropertyMapper.processElementValue`, with the
+        // last JIT-dispatched methods before the crash being a tight
+        // LoggerFactory/Slf4jLog init loop -- a correlation, not a proven
+        // miscompile inside the logging classes themselves. Re-verified
+        // with a standalone probe (`SlfLoggingProbe.java`, real
+        // jcl-over-slf4j + slf4j-api + logback-classic/core jars) driving
+        // `LogFactory.getLog(Class)` for 10 distinct per-class loggers
+        // (simulating component-scan per-class logger wiring) 20000
+        // times, each followed by a real `log.info(...)` call that would
+        // fail on a corrupted reference: baseline, package-allowed, and a
+        // `CRATONVM_JIT_THRESHOLD=1` aggressive pass -- 0 failures in
+        // every configuration. The logging facade classes' own JIT
+        // compilation is genuinely safe.
         //
-        // The three logging facades are tightly coupled at boot:
-        // `org/slf4j/` (the API), `ch/qos/logback/` (Spring Boot 3.2's
-        // default backend), and `org/apache/commons/logging/` (the
-        // bridge Spring uses internally). Banning all three together
-        // covers the full per-class logger wiring path. Lifted by
-        // `CRATONVM_JIT_ALLOW_PACKAGES=org/slf4j/,ch/qos/logback/,
-        // org/apache/commons/logging/`.
-        if class_name.starts_with("org/slf4j/") && !package_allowed("org/slf4j/", allow_packages) {
-            return Some(SkipReason::RustJvmTestFixture);
-        }
-        if class_name.starts_with("ch/qos/logback/")
-            && !package_allowed("ch/qos/logback/", allow_packages)
-        {
-            return Some(SkipReason::RustJvmTestFixture);
-        }
-        if class_name.starts_with("org/apache/commons/logging/")
-            && !package_allowed("org/apache/commons/logging/", allow_packages)
-        {
-            return Some(SkipReason::RustJvmTestFixture);
-        }
+        // IMPORTANT: this does NOT independently confirm the original
+        // `insurance-backend` crash is fixed -- its actual trigger site
+        // (`SystemEnvironmentPropertyMapper.processElementValue`, in
+        // `org/springframework/boot/context/properties/bind/`) is a
+        // SEPARATE, still-active, already-documented ban (see the
+        // `org/springframework/boot/context/properties/bind/` guard
+        // above) that this removal does not touch. `SlfLoggingProbe.java`
+        // is the regression witness for the logging-facade claim only.
 
         // CGL.1 (Session 117 — agent O4, 2026-05-16) — provisional blanket ban
         // for CGLIB (`net/sf/cglib/`). `apps/cglib_probe` is a minimal repro
@@ -2047,38 +2014,28 @@ fn should_skip_jit_internal(
         {
             return Some(SkipReason::RustJvmTestFixture);
         }
-        // SPB.9d (Session 117) — eureka-server boot SEGFAULTs deep in
-        // Spring's BeanInfo/ExtendedBeanInfo introspection. Spring
-        // introspects every bean class via `java/beans/Introspector`,
-        // which delegates into `com/sun/beans/introspect/MethodInfo`
-        // and `ClassInfo` and sorts methods/properties via
-        // comparators. Frame trace + CRATONVM_DBG_JIT_DISPATCH=1 show
-        // the very last hot JIT-compiled callees on the crash path are
-        // `MethodInfo$MethodOrder.compare`, `String.compareTo`,
-        // `Method.getName`, `Arrays.hashCode`, `Method.toString`,
-        // and `StringJoiner.<init>` — i.e. a JIT-compiled comparator
-        // chain driven by `java/util/Arrays.sort`. With JIT disabled
-        // the run terminates cleanly with the parallel agent's
-        // `Attribute 'type' not found` (rc=1, no segfault); with JIT
-        // enabled the comparator returns inconsistent ordering,
-        // corrupting transient sort state and SEGFAULTing in a
-        // downstream `Method.toString` -> `StringJoiner` allocation.
-        // Same allocate-then-putfield archetype as NEW-1.3 / SPB.1.
-        //
-        // Blanket-ban the JDK BeanInfo introspection package and the
-        // `java/beans/` reflection-driven sort callers. Liftable via
-        // `CRATONVM_JIT_ALLOW_PACKAGES=com/sun/beans/,java/beans/`
-        // when the underlying allocate-then-putfield miscompile is
-        // root-caused.
-        if class_name.starts_with("com/sun/beans/")
-            && !package_allowed("com/sun/beans/", allow_packages)
-        {
-            return Some(SkipReason::RustJvmTestFixture);
-        }
-        if class_name.starts_with("java/beans/") && !package_allowed("java/beans/", allow_packages)
-        {
-            return Some(SkipReason::RustJvmTestFixture);
-        }
+        // SPB.9d -- REMOVED 2026-07-26. Originally (Session 117):
+        // eureka-server boot SEGFAULTed deep in Spring's BeanInfo
+        // introspection -- `java/beans/Introspector` delegates into
+        // `com/sun/beans/introspect/MethodInfo`/`ClassInfo`, sorting
+        // methods/properties via a comparator chain
+        // (`MethodInfo$MethodOrder.compare` -> `String.compareTo` ->
+        // `Method.getName`/`toString` -> `StringJoiner.<init>`) driven by
+        // `java/util/Arrays.sort`; under JIT the comparator returned
+        // inconsistent ordering, corrupting transient sort state and
+        // SEGFAULTing in the downstream StringJoiner allocation -- the
+        // same allocate-then-putfield archetype as NEW-1.3/SPB.1.
+        // Re-verified with a standalone, pure-JDK probe (no external jar
+        // needed -- `BeanIntrospectorProbe.java`) driving
+        // `Introspector.getBeanInfo(Class)` (cache flushed every call to
+        // force a real re-sort each time) over a 13-method/10-property
+        // bean 20000 times, including exercising the exact
+        // `MethodDescriptor.toString()` downstream path the crash trace
+        // named: baseline, package-allowed, and a
+        // `CRATONVM_JIT_THRESHOLD=1` aggressive-compilation pass -- 0
+        // failures, 0 crashes, correct property/method counts every call
+        // in every configuration. No longer reproduces on current dev.
+        // `BeanIntrospectorProbe.java` is the regression witness.
         if class_name.starts_with("org/springframework/beans/factory/")
             && !class_name.starts_with("org/springframework/beans/factory/support/")
             && !package_allowed("org/springframework/beans/factory/", allow_packages)
@@ -4056,40 +4013,42 @@ mod tests {
     }
 
     #[test]
-    fn jdt_parser_package_skips_under_conservative() {
-        assert_eq!(
-            check(
-                "org/eclipse/jdt/internal/compiler/parser/Parser",
-                "consumeRule",
-                false,
-                true,
-                SkipPolicy::Conservative,
-            ),
-            Some(SkipReason::RustJvmTestFixture),
-            "JDT Parser.consumeRule must stay interpreted for the Jasper parser residual"
-        );
-        assert_eq!(
-            check(
-                "org/eclipse/jdt/internal/compiler/parser/Parser",
-                "consumeTypeImportOnDemandDeclarationName",
-                false,
-                true,
-                SkipPolicy::Conservative,
-            ),
-            Some(SkipReason::RustJvmTestFixture),
-            "the Jasper residual guard covers the JDT parser package, not only consumeRule"
-        );
-        assert_eq!(
-            check(
-                "org/eclipse/jdt/internal/compiler/lookup/Scope",
-                "getType",
-                false,
-                true,
-                SkipPolicy::Conservative,
-            ),
-            None,
-            "the Jasper residual guard is intentionally limited to the parser package"
-        );
+    fn jdt_parser_and_ast_packages_are_jit_eligible_after_jasper_jdt_2_3_removal() {
+        // Both JASPER-JDT.2 (org/eclipse/jdt/internal/compiler/parser/) and
+        // JASPER-JDT.3 (org/eclipse/jdt/internal/compiler/ast/) were
+        // removed 2026-07-26 -- see the removal comments above
+        // should_skip_jit_internal for the re-verification evidence (each:
+        // 2 baseline + 2 lifted runs of a real Tomcat integration test
+        // suite -- TestCompiler for JASPER-JDT.2, TestFormAuthenticatorA
+        // for JASPER-JDT.3 -- all runs clean).
+        for method in ["consumeRule", "consumeTypeImportOnDemandDeclarationName"] {
+            for policy in [SkipPolicy::Conservative, SkipPolicy::Aggressive] {
+                assert_eq!(
+                    check(
+                        "org/eclipse/jdt/internal/compiler/parser/Parser",
+                        method,
+                        false,
+                        true,
+                        policy,
+                    ),
+                    None,
+                    "org/eclipse/jdt/internal/compiler/parser/Parser.{method} must be JIT-eligible now that JASPER-JDT.2 is removed"
+                );
+            }
+        }
+        for policy in [SkipPolicy::Conservative, SkipPolicy::Aggressive] {
+            assert_eq!(
+                check(
+                    "org/eclipse/jdt/internal/compiler/ast/QualifiedNameReference",
+                    "analyseCode",
+                    false,
+                    true,
+                    policy,
+                ),
+                None,
+                "org/eclipse/jdt/internal/compiler/ast/QualifiedNameReference.analyseCode must be JIT-eligible now that JASPER-JDT.3 is removed"
+            );
+        }
     }
 
     #[test]
@@ -4264,46 +4223,75 @@ mod tests {
     }
 
     #[test]
-    fn json_smart_parser_package_stays_interpreted_for_spring_jsonpath() {
+    fn beans_introspector_is_jit_eligible_after_spb9d_removal() {
+        // SPB.9d was removed 2026-07-26 for the blanket com/sun/beans/ and
+        // java/beans/ package ban -- see the removal comment above
+        // should_skip_jit_internal for the re-verification evidence
+        // (BeanIntrospectorProbe.java, pure JDK, no external jar). Note a
+        // SEPARATE, older duplicate SPB.9d entry inside
+        // is_known_miscompile() (targeting
+        // com/sun/beans/introspect/MethodInfo$MethodOrder.compare,
+        // org/springframework/beans/ExtendedBeanInfo$PropertyDescriptorComparator.compare,
+        // java/util/StringJoiner.<init>) is untouched by this removal --
+        // that function is already dead code by default (gated behind
+        // callee_saved_gpr_local_homes_enabled(), which defaults false),
+        // so it does not affect this test either way.
+        for (class_name, method) in [
+            ("java/beans/Introspector", "getBeanInfo"),
+            ("com/sun/beans/introspect/MethodInfo", "getMethods"),
+        ] {
+            for policy in [SkipPolicy::Conservative, SkipPolicy::Aggressive] {
+                assert_eq!(
+                    check(class_name, method, false, true, policy),
+                    None,
+                    "{class_name}.{method} must be JIT-eligible now that SPB.9d is removed"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn slf4j_logback_commons_logging_are_jit_eligible_after_spb9_removal() {
+        // SPB.9 was removed 2026-07-26 for these three logging-facade
+        // packages themselves -- see the removal comment above
+        // should_skip_jit_internal for the re-verification evidence
+        // (SlfLoggingProbe.java, real jcl-over-slf4j/slf4j-api/logback
+        // jars) and the important caveat that the original crash's real
+        // trigger site (org/springframework/boot/context/properties/bind/)
+        // is a separate, still-active ban this removal does not touch.
+        for (class_name, method) in [
+            ("org/slf4j/LoggerFactory", "getLogger"),
+            ("ch/qos/logback/classic/Logger", "info"),
+            ("org/apache/commons/logging/LogFactory", "getLog"),
+        ] {
+            for policy in [SkipPolicy::Conservative, SkipPolicy::Aggressive] {
+                assert_eq!(
+                    check(class_name, method, false, true, policy),
+                    None,
+                    "{class_name}.{method} must be JIT-eligible now that SPB.9 is removed"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn json_smart_parser_is_jit_eligible_after_jsonsmart_parser_1_removal() {
+        // JSONSMART-PARSER.1 was removed 2026-07-26 -- see the removal
+        // comment above should_skip_jit_internal for the re-verification
+        // evidence (JsonSmartProbe.java, real json-smart-2.3.jar).
         for (class_name, method) in [
             ("net/minidev/json/parser/JSONParserString", "read"),
             ("net/minidev/json/parser/JSONParserString", "readS"),
             ("net/minidev/json/parser/JSONParserBase", "skipSpace"),
         ] {
-            assert_eq!(
-                check(class_name, method, false, true, SkipPolicy::Conservative),
-                Some(SkipReason::RustJvmTestFixture),
-                "{class_name}.{method} must stay interpreted under the conservative policy"
-            );
-            assert_eq!(
-                check(class_name, method, false, true, SkipPolicy::Aggressive),
-                None,
-                "aggressive policy must lift the json-smart parser guard"
-            );
-            assert_eq!(
-                check_with(
-                    class_name,
-                    method,
-                    false,
-                    true,
-                    SkipPolicy::Conservative,
-                    &["net/minidev/json/parser/"],
-                ),
-                None,
-                "CRATONVM_JIT_ALLOW_PACKAGES=net/minidev/json/parser/ must lift the guard"
-            );
+            for policy in [SkipPolicy::Conservative, SkipPolicy::Aggressive] {
+                assert_eq!(
+                    check(class_name, method, false, true, policy),
+                    None,
+                    "{class_name}.{method} must be JIT-eligible now that JSONSMART-PARSER.1 is removed"
+                );
+            }
         }
-        assert_eq!(
-            check(
-                "net/minidev/json/writer/JsonReaderI",
-                "read",
-                false,
-                true,
-                SkipPolicy::Conservative,
-            ),
-            None,
-            "the json-smart guard is intentionally limited to the parser package"
-        );
     }
 
     #[test]

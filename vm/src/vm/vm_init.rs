@@ -1099,6 +1099,19 @@ impl SharedVm {
                 // like LinkedBlockingQueue which use ReentrantLock for synchronization
                 cratonvm_native_builtins::register_concurrent_natives(&mut native_methods);
                 cratonvm_native_builtins::register_stamped_lock_natives(&mut native_methods);
+                // java.util.logging.FileHandler's natives are registered
+                // (as part of register_p61_logging) only under
+                // register_synthetic_overrides, which is
+                // #[cfg(feature = "synthetic-jdk")]-gated and never runs in
+                // real-JDK mode -- so Spring Boot's logging-file.properties
+                // (handlers=java.util.logging.FileHandler,...), which only
+                // ever exercises real-JDK mode, silently fell through to the
+                // real FileHandler() bytecode instead (which throws
+                // NoSuchFileException trying to actually lock a real log
+                // file). Register just the FileHandler natives directly here.
+                // See docs/known-issues/springboot/filehandler-noarg-ctor-handler-field-layout-gap.md.
+                cratonvm_native_builtins::phases_late::register_p61_file_handler(&mut native_methods);
+
                 // LinkedBlockingQueue.drainTo(Collection, int) - needed by SLF4J/Spring
                 // Override with native implementation to avoid ReentrantLock field layout mismatch
                 // between synthetic natives and real JDK classes
@@ -1513,6 +1526,19 @@ impl SharedVm {
             // drainTo natives (SLF4J replayEvents, Spring thread pools).
             cratonvm_native_builtins::register_concurrent_natives(&mut native_methods);
             cratonvm_native_builtins::register_stamped_lock_natives(&mut native_methods);
+            // java.util.logging.FileHandler's natives are registered
+            // (as part of register_p61_logging) only under
+            // register_synthetic_overrides, which is
+            // #[cfg(feature = "synthetic-jdk")]-gated and never runs in
+            // real-JDK mode -- so Spring Boot's logging-file.properties
+            // (handlers=java.util.logging.FileHandler,...), which only
+            // ever exercises real-JDK mode, silently fell through to the
+            // real FileHandler() bytecode instead (which throws
+            // NoSuchFileException trying to actually lock a real log
+            // file). Register just the FileHandler natives directly here.
+            // See docs/known-issues/springboot/filehandler-noarg-ctor-handler-field-layout-gap.md.
+            cratonvm_native_builtins::phases_late::register_p61_file_handler(&mut native_methods);
+
             fn real_jdk_lbq_drain_to_bounded(
                 ctx: &mut dyn cratonvm_native_api::NativeContext,
                 args: &[cratonvm_types::Value],
