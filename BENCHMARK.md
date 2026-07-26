@@ -85,10 +85,29 @@ Row notes:
   Cross-reference the OPEN items below: this is *not* host load (the same gap
   reproduces on a quiet host with <1% run-to-run spread) and *not* anything
   landed since the perf-gate baselines were anchored on 07-24 (the anchor
-  commit `e57f0bc7d` measures identically to current `dev`). The regression
-  therefore predates 07-24; bisecting `a36b9d121..e57f0bc7d` is the open work.
+  commit `e57f0bc7d` measures identically to current `dev`).
   The other five rows have no fresh paired HotSpot run and are left at their
   07-18 values rather than half-updated.
+- **The regression is CONFIRMED and bounded to `a36b9d121..e57f0bc7d`.**
+  `a36b9d121` (07-18, the commit that recorded the 5,488 / 193 ms figures) was
+  rebuilt fat-LTO and run three-way against HotSpot and current `dev`,
+  alternating on one pinned core. The 07-18 binary still reproduces its own
+  recorded numbers; `dev` does not:
+
+  | | HotSpot | cratonvm@07-18 | cratonvm@dev | dev vs 07-18 |
+  |---|---|---|---|---|
+  | HashMap 10M | 1,415 ms | 2,827 ms | 25,063 ms | **8.9x slower** |
+  | HashMap 1M | 54 ms | 434 ms | 3,084 ms | **7.1x slower** |
+  | String/Regex 100K | 66 ms | 181 ms | 484 ms | **2.7x slower** |
+
+  String/Regex at 07-18 measures 181 ms against its recorded 193 ms — the old
+  binary is healthy. (This run sat at load ~10, so absolutes are inflated for
+  every arm; the three arms were interleaved, so the *ratios* hold. That the
+  07-18 arm still lands near its recorded value under that load only
+  strengthens the read.) The range is 137 first-parent commits (983 including
+  merged branches), so ~8 bisect steps. **Bisect on HashMap 1M** — it shows the
+  regression at 7.1x, runs in seconds rather than 25 s, and needs no quiet host
+  at that effect size.
 - **Fibonacci** is recursion-bound; the recursive self-call already
   compiles to a guarded direct call, and the remaining gap is register
   allocation and recursion inlining, which the current backends do not do.

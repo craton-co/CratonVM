@@ -62,12 +62,14 @@ fresh-process runs — full methodology in [BENCHMARK.md](BENCHMARK.md)):
 > they have no fresh paired HotSpot number yet, so they are left alone rather
 > than half-updated.
 >
-> Root-causing is open and tracked in [BENCHMARK.md](BENCHMARK.md). What is
-> already established: it is not host load (the same gap appears on a quiet
-> host with <1% run-to-run spread), and it is not anything that landed since
-> the perf-gate baselines were anchored on 07-24 (the anchor commit measures
-> identically to current `dev`). That places the regression **before** 07-24,
-> which is where the bisect now points.
+> **Confirmed and bounded**: rebuilding `a36b9d121` (07-18, the commit that
+> recorded the old figures) and running it three-way against HotSpot and
+> current `dev` shows the 07-18 binary still reproduces its own numbers
+> (String/Regex 181 ms vs a recorded 193) while `dev` is **8.9x** slower on
+> HashMap 10M and **2.7x** on String/Regex. It is not host load and not
+> anything since the 07-24 perf-gate anchoring, so the regression sits in
+> `a36b9d121..e57f0bc7d` — 137 first-parent commits, ~8 bisect steps.
+> Root-causing is tracked in [BENCHMARK.md](BENCHMARK.md).
 
 GPU offload, vs HotSpot C2 and [TornadoVM](https://github.com/beehive-lab/TornadoVM)
 4.0.1 (RTX 2060, N = 2²⁴, warm, full H2D+kernel+D2H round-trip, checksums
