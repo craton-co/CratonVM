@@ -3052,7 +3052,7 @@ disagreed, the normalisation was skipped, and the lookup went in as lowercase
 `"sa"`.
 
 This is the same defect a concurrent session root-caused from H2
-(BUG-STRING-CODER-COMPACT-20260726, `docs/known-issues/h2/h2-jitban-schema-not-found-on-reconnect.md`)
+(BUG-STRING-CODER-COMPACT-20260726, `docs/internal/fixed-suite-bugs/h2-suite-bugs/h2-jitban-schema-not-found-on-reconnect-FIXED.md`)
 and the same defect behind the 30-class Kotlin
 `IllegalStateException: root` cluster
 ([`spring-kotlin-reflect-illegalstateexception-root-20260726.md`](spring-kotlin-reflect-illegalstateexception-root-20260726.md)).
