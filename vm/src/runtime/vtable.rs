@@ -3,9 +3,40 @@
 
 //! Virtual method dispatch tables (vtables) and interface method tables (itables).
 //!
-//! Accelerates `invokevirtual` and `invokeinterface` bytecodes by replacing
-//! HashMap lookups with direct array indexing. Each class gets a vtable that
-//! inherits from its parent and overrides/appends entries for its own methods.
+//! Each class gets a vtable that inherits from its parent and
+//! overrides/appends entries for its own methods.
+//!
+//! ## What this actually costs today (audited 2026-07-26, `stackwalk-and-vtable`)
+//!
+//! The historical module doc claimed this module "replaces HashMap lookups
+//! with direct array indexing". That is **half true and worth stating
+//! precisely**, because callers have repeatedly assumed the O(1) half:
+//!
+//! * `Vtable::get(slot)` *is* direct array indexing — O(1), no hashing.
+//! * But no production caller has a slot number. The interpreter's only
+//!   consumer (`interpreter.rs`, the "fast path 0" `vtable_fast` helper)
+//!   calls [`Vtable::lookup_slot`]`(name, descriptor)`, which is an
+//!   `FxHashMap` probe (two `FxHasher` streams over the name and the
+//!   descriptor) followed by a verifying `&str` comparison of both. There is
+//!   no per-call-site slot cache, so **every** dispatch that reaches this
+//!   module re-derives the slot from strings. See the cross-owner request in
+//!   `docs/internal/arch-2026-07-26/stackwalk-and-vtable.md` for the
+//!   quickened-CP slot cache that would make it genuinely O(1).
+//! * The lookup also runs under a read guard on the process-wide
+//!   `RwLock<VtableManager>`, and the interpreter re-opens
+//!   `class_manager.read()` around it for the redefine guard.
+//!
+//! ## Interface dispatch
+//!
+//! [`Itable`] is **not on any production path**. `VtableManager::create_itable`,
+//! `get_itable` and `resolve_interface` have no callers outside this file's own
+//! tests; `invokeinterface` resolves through the receiver's *vtable* by
+//! `(name, descriptor)` exactly like `invokevirtual`, because the receiver's
+//! vtable already contains its interface implementations. The `CRIT` note on
+//! `Itable::lookup` saying "`invokeinterface` is on every interface dispatch"
+//! describes an intent, not the wiring. The type is kept (it is correct, and
+//! wiring it is the natural next step) but must not be read as a description
+//! of current behaviour.
 
 use std::collections::HashMap;
 use std::hash::Hasher;
@@ -28,6 +59,53 @@ fn fast_lookup_key(name: &str, descriptor: &str) -> u64 {
     // Rotate one half so `(a, b)` and `(b, a)` don't collide on the
     // (admittedly rare) case where name == descriptor reversed.
     h1.finish() ^ h2.finish().rotate_left(17)
+}
+
+/// Candidate slots sharing one [`fast_lookup_key`] bucket.
+///
+/// PERF (2026-07-26 arch pass). The bucket used to be a `Vec<usize>`, i.e. a
+/// **heap allocation per distinct method signature per class**. `install_vtable`
+/// builds one bucket for every slot of every class it links, so a Spring-shaped
+/// application with tens of thousands of classes averaging dozens of methods
+/// paid a `Vec` header + allocation for each — and `Vtable::from_parent` /
+/// `create_vtable` then deep-cloned every one of them again per subclass.
+///
+/// FxHash collisions between two `(name, descriptor)` pairs are vanishingly
+/// rare, so `One` covers essentially every bucket and allocates nothing;
+/// `Many` preserves the exact collision behaviour (all candidates are probed
+/// and verified) for the rare case.
+#[derive(Clone, Debug, PartialEq)]
+enum SlotBucket {
+    One(u32),
+    Many(Vec<u32>),
+}
+
+impl SlotBucket {
+    #[inline]
+    fn push(&mut self, slot: u32) {
+        match self {
+            SlotBucket::One(first) => {
+                if *first != slot {
+                    *self = SlotBucket::Many(vec![*first, slot]);
+                }
+            }
+            SlotBucket::Many(v) => {
+                if !v.contains(&slot) {
+                    v.push(slot);
+                }
+            }
+        }
+    }
+
+    #[inline]
+    fn iter(&self) -> impl Iterator<Item = u32> + '_ {
+        // `std::slice::from_ref` keeps both arms one type without allocating.
+        let slice: &[u32] = match self {
+            SlotBucket::One(s) => std::slice::from_ref(s),
+            SlotBucket::Many(v) => v.as_slice(),
+        };
+        slice.iter().copied()
+    }
 }
 
 /// A method slot in the vtable.
@@ -126,20 +204,24 @@ pub struct Vtable {
     class_id: u64,
     /// Entries indexed by slot number.
     entries: Vec<Option<VtableEntry>>,
-    /// Quick lookup: method (name, descriptor) -> slot index.
-    ///
-    /// HIGH-6 — keyed by `(Arc<str>, Arc<str>)` so insertion at link
-    /// time reuses the interned method-name handles instead of
-    /// allocating fresh `String`s. This map is the authoritative
-    /// fallback when the `fast_lookup` u64-hash map collides; routine
-    /// `lookup_slot(&str, &str)` calls never touch it.
-    name_to_slot: FxHashMap<(Arc<str>, Arc<str>), usize>,
     /// HIGH-6 — zero-allocation fast path for `lookup_slot(&str, &str)`.
-    /// Keyed by `fast_lookup_key(name, descriptor)`. Stores a `Vec<usize>`
-    /// to handle the (vanishingly rare) FxHash collisions without
-    /// allocating on probe; on hit, the caller verifies that each
-    /// candidate entry's stored `(name, descriptor)` matches the args.
-    fast_lookup: FxHashMap<u64, Vec<usize>>,
+    /// Keyed by `fast_lookup_key(name, descriptor)`; the bucket handles the
+    /// (vanishingly rare) FxHash collisions without allocating on probe. On
+    /// hit, the caller verifies that each candidate entry's stored
+    /// `(name, descriptor)` matches the args.
+    ///
+    /// This is the **only** signature index. A second
+    /// `name_to_slot: FxHashMap<(Arc<str>, Arc<str>), usize>` used to be built
+    /// alongside it — by `install_vtable`, for every slot of every class the
+    /// class loader links — and was documented as "the authoritative fallback
+    /// when the `fast_lookup` u64-hash map collides". It was not: `lookup_slot`
+    /// never consulted it (it resolves collisions by verifying each candidate
+    /// in the bucket), and its only reader was the test-only `add_method`.
+    /// Every production class link therefore paid a full second hash map —
+    /// hashing both strings again and bumping two `Arc` refcounts per method —
+    /// for a map nothing read. Removed 2026-07-26; `add_method` now asks
+    /// `lookup_slot`, which returns the identical answer.
+    fast_lookup: FxHashMap<u64, SlotBucket>,
 }
 
 impl Vtable {
@@ -148,7 +230,6 @@ impl Vtable {
         Vtable {
             class_id,
             entries: Vec::new(),
-            name_to_slot: FxHashMap::default(),
             fast_lookup: FxHashMap::default(),
         }
     }
@@ -158,7 +239,6 @@ impl Vtable {
         Vtable {
             class_id,
             entries: parent.entries.clone(),
-            name_to_slot: parent.name_to_slot.clone(),
             fast_lookup: parent.fast_lookup.clone(),
         }
     }
@@ -173,15 +253,14 @@ impl Vtable {
         declaring_class_id: u64,
         method_index: u32,
     ) -> usize {
-        // Materialise Arc<str> handles once for both the entry payload
-        // and the index key — two refcount bumps total instead of two
-        // String allocs per insert.
         let name_arc: Arc<str> = Arc::<str>::from(name);
         let desc_arc: Arc<str> = Arc::<str>::from(descriptor);
-        let key = (Arc::clone(&name_arc), Arc::clone(&desc_arc));
 
-        // If this method signature already has a slot, override it.
-        if let Some(&slot) = self.name_to_slot.get(&key) {
+        // If this method signature already has a slot, override it. This used
+        // to probe a separate `name_to_slot` map; `lookup_slot` gives the
+        // identical answer (it verifies name+descriptor byte-for-byte on every
+        // candidate) from the one index this vtable now keeps.
+        if let Some(slot) = self.lookup_slot(name, descriptor) {
             self.entries[slot] = Some(VtableEntry {
                 declaring_class_id,
                 method_index,
@@ -205,12 +284,11 @@ impl Vtable {
             resolved_method: None,
             is_native: false,
         }));
-        self.name_to_slot.insert(key, slot);
         // HIGH-6 — keep the u64 fast-lookup map in sync.
         self.fast_lookup
             .entry(fast_lookup_key(name, descriptor))
-            .or_insert_with(Vec::new)
-            .push(slot);
+            .and_modify(|b| b.push(slot as u32))
+            .or_insert(SlotBucket::One(slot as u32));
         slot
     }
 
@@ -239,7 +317,8 @@ impl Vtable {
     pub fn lookup_slot(&self, name: &str, descriptor: &str) -> Option<usize> {
         let key = fast_lookup_key(name, descriptor);
         let candidates = self.fast_lookup.get(&key)?;
-        for &slot in candidates {
+        for slot in candidates.iter() {
+            let slot = slot as usize;
             // HIGH-6 — verify each candidate; on bucket collision we
             // continue rather than short-circuit. A `None` or
             // out-of-range slot here would indicate index/entries
@@ -427,12 +506,7 @@ impl VtableManager {
                     .get(&pid)
                     .map(|p| p.entries.clone())
                     .unwrap_or_default();
-                let parent_name_to_slot: FxHashMap<(Arc<str>, Arc<str>), usize> = self
-                    .tables
-                    .get(&pid)
-                    .map(|p| p.name_to_slot.clone())
-                    .unwrap_or_default();
-                let parent_fast_lookup: FxHashMap<u64, Vec<usize>> = self
+                let parent_fast_lookup: FxHashMap<u64, SlotBucket> = self
                     .tables
                     .get(&pid)
                     .map(|p| p.fast_lookup.clone())
@@ -440,7 +514,6 @@ impl VtableManager {
                 Vtable {
                     class_id,
                     entries: parent_entries,
-                    name_to_slot: parent_name_to_slot,
                     fast_lookup: parent_fast_lookup,
                 }
             }
@@ -543,28 +616,25 @@ impl VtableManager {
     /// intentionally empty (e.g. reserved for an abstract method that
     /// hasn't been overridden yet). The vec is moved — no clone.
     pub fn install_vtable(&mut self, class_id: u64, entries: Vec<Option<VtableEntry>>) {
-        // Rebuild the name_to_slot index from the entries so downstream
-        // callers that use `lookup_slot` still work. HIGH-6 — the
-        // entries already own `Arc<str>` for the name and descriptor,
-        // so the keys are O(1) refcount clones rather than fresh allocs.
-        let mut name_to_slot: FxHashMap<(Arc<str>, Arc<str>), usize> =
-            FxHashMap::with_capacity_and_hasher(entries.len(), Default::default());
-        let mut fast_lookup: FxHashMap<u64, Vec<usize>> =
+        // Rebuild the signature index from the entries so `lookup_slot`
+        // works. One map, one bucket per signature, no allocation per bucket
+        // in the (overwhelmingly common) collision-free case — see the
+        // `fast_lookup` field doc for the second map this used to build and
+        // why it was removed.
+        let mut fast_lookup: FxHashMap<u64, SlotBucket> =
             FxHashMap::with_capacity_and_hasher(entries.len(), Default::default());
         for (slot, entry) in entries.iter().enumerate() {
             if let Some(e) = entry {
                 let key = fast_lookup_key(&e.method_name, &e.descriptor);
-                fast_lookup.entry(key).or_insert_with(Vec::new).push(slot);
-                name_to_slot.insert(
-                    (Arc::clone(&e.method_name), Arc::clone(&e.descriptor)),
-                    slot,
-                );
+                fast_lookup
+                    .entry(key)
+                    .and_modify(|b| b.push(slot as u32))
+                    .or_insert(SlotBucket::One(slot as u32));
             }
         }
         let vtable = Vtable {
             class_id,
             entries,
-            name_to_slot,
             fast_lookup,
         };
         self.tables.insert(class_id, vtable);
@@ -656,6 +726,32 @@ impl VtableManager {
     /// vtable entry (via `LeafClass(super_class_id)` assumptions) must
     /// observe `resolve_virtual_slot` returning `None` for that slot
     /// until they are recompiled.
+    ///
+    /// ## Known cost: this is a permanent, never-retried negative
+    ///
+    /// Audited 2026-07-26 (`stackwalk-and-vtable`). `resolved = false` is a
+    /// one-way door: nothing in this module ever sets it back to `true` except
+    /// a wholesale `install_vtable` / `add_method` / `override_method` for that
+    /// same class, which only happens when *that* class is (re)linked. So the
+    /// first subclass to override `Foo.bar()` disables the interpreter's
+    /// vtable fast path for `(Foo, bar)` **for the life of the process** — and
+    /// since essentially every class overrides `toString`/`equals`/`hashCode`,
+    /// those slots are disabled on their declaring classes almost immediately
+    /// after boot.
+    ///
+    /// It is not a correctness bug: the interpreter looks the vtable up by the
+    /// *receiver object's own* class id, so `Foo`'s entry is only ever
+    /// consulted for a receiver that really is a `Foo`, for which `Foo.bar` is
+    /// the correct target. The invalidation is a CHA/`LeafClass`-assumption
+    /// signal that costs the interpreter its fast path — and the JIT, which is
+    /// the assumption's intended consumer, does not read `VtableManager` at
+    /// all (no `jit/**` reference to any of these APIs exists today).
+    ///
+    /// Deliberately **not** changed in this pass: separating "CHA assumption
+    /// broken" from "entry undispatchable" changes dispatch-tier semantics,
+    /// and this pass cannot build or run the suites. Written up as a scoped
+    /// proposal in
+    /// `docs/internal/arch-2026-07-26/stackwalk-and-vtable.md`.
     pub fn invalidate_for_override(&mut self, super_class_id: u64, slot: usize) {
         if let Some(vtable) = self.tables.get_mut(&super_class_id) {
             vtable.invalidate_slot(slot);
@@ -720,10 +816,41 @@ impl VtableManager {
 
     /// Release the dispatch tables owned by an unloaded class after first
     /// invalidating inherited copies of entries it declared.
+    ///
+    /// **Prefer [`VtableManager::unload_classes`] when unloading a batch.**
+    /// `invalidate_class` sweeps every slot of every vtable in the VM, so
+    /// calling this in a loop over a loader's classes is
+    /// `O(unloaded × all_classes × slots_per_class)` — for a class-loader
+    /// unload of a few hundred classes in a VM holding tens of thousands, that
+    /// is hundreds of millions of slot visits under the manager write lock.
     pub fn unload_class(&mut self, class_id: u64) {
         self.invalidate_class(class_id);
         self.tables.remove(&class_id);
         self.itables.remove(&class_id);
+    }
+
+    /// Batch counterpart to [`VtableManager::unload_class`]: one sweep over all
+    /// vtables for the whole set, instead of one sweep per class.
+    ///
+    /// Semantics are identical to calling `unload_class` for each id — every
+    /// inherited copy of an entry declared by any of `class_ids` is
+    /// invalidated, then the unloaded classes' own tables are dropped.
+    pub fn unload_classes(&mut self, class_ids: &[u64]) {
+        if class_ids.is_empty() {
+            return;
+        }
+        let dead: std::collections::HashSet<u64> = class_ids.iter().copied().collect();
+        for vtable in self.tables.values_mut() {
+            for entry in vtable.entries.iter_mut().flatten() {
+                if dead.contains(&entry.declaring_class_id) {
+                    entry.resolved = false;
+                }
+            }
+        }
+        for id in &dead {
+            self.tables.remove(id);
+            self.itables.remove(id);
+        }
     }
 }
 
@@ -973,6 +1100,125 @@ mod tests {
         assert_eq!(it.lookup(100, "run", "()V"), Some(3));
         assert_eq!(it.lookup(100, "run", "(I)V"), None);
         assert_eq!(it.lookup(999, "run", "()V"), None);
+    }
+
+    // -- 2026-07-26 arch pass: single-index + inline bucket ---------------
+
+    fn probe_entry(name: &str, descriptor: &str, declaring: u64, idx: u32) -> VtableEntry {
+        VtableEntry {
+            declaring_class_id: declaring,
+            method_index: idx,
+            method_name: Arc::from(name),
+            descriptor: Arc::from(descriptor),
+            resolved: true,
+            resolved_method: None,
+            is_native: false,
+        }
+    }
+
+    #[test]
+    fn slot_bucket_promotes_to_many_only_on_collision() {
+        let mut b = SlotBucket::One(3);
+        assert_eq!(b.iter().collect::<Vec<_>>(), vec![3]);
+        b.push(3); // idempotent — must not allocate a Vec
+        assert_eq!(b, SlotBucket::One(3));
+        b.push(9);
+        assert_eq!(b, SlotBucket::Many(vec![3, 9]));
+        b.push(9);
+        assert_eq!(b, SlotBucket::Many(vec![3, 9]));
+        assert_eq!(b.iter().collect::<Vec<_>>(), vec![3, 9]);
+    }
+
+    #[test]
+    fn add_method_override_still_reuses_the_slot_without_name_to_slot() {
+        // The `name_to_slot` map that used to answer this question is gone;
+        // `lookup_slot` must give the identical answer.
+        let mut vt = Vtable::new(1);
+        assert_eq!(vt.add_method("m", "(I)V", 1, 0), 0);
+        assert_eq!(vt.add_method("m", "(J)V", 1, 1), 1); // overload: new slot
+        assert_eq!(vt.add_method("m", "(I)V", 2, 7), 0); // same sig: override
+        assert_eq!(vt.len(), 2);
+        let e = vt.get(0).unwrap();
+        assert_eq!(e.declaring_class_id, 2);
+        assert_eq!(e.method_index, 7);
+        assert_eq!(vt.lookup_slot("m", "(I)V"), Some(0));
+        assert_eq!(vt.lookup_slot("m", "(J)V"), Some(1));
+    }
+
+    #[test]
+    fn install_vtable_indexes_every_slot_and_lookups_verify_exactly() {
+        let mut mgr = VtableManager::new();
+        mgr.install_vtable(
+            7,
+            vec![
+                Some(probe_entry("run", "()V", 7, 0)),
+                None, // an intentionally empty slot must not break the index
+                Some(probe_entry("run", "(I)V", 7, 1)),
+                Some(probe_entry("stop", "()V", 7, 2)),
+            ],
+        );
+        let vt = mgr.get_vtable(7).unwrap();
+        assert_eq!(vt.lookup_slot("run", "()V"), Some(0));
+        assert_eq!(vt.lookup_slot("run", "(I)V"), Some(2));
+        assert_eq!(vt.lookup_slot("stop", "()V"), Some(3));
+        assert_eq!(vt.lookup_slot("stop", "(I)V"), None);
+        assert_eq!(vt.lookup_slot("nope", "()V"), None);
+    }
+
+    #[test]
+    fn from_parent_inherits_the_signature_index() {
+        let mut parent = Vtable::new(1);
+        parent.add_method("a", "()V", 1, 0);
+        parent.add_method("b", "()V", 1, 1);
+        let mut child = Vtable::from_parent(2, &parent);
+        assert_eq!(child.lookup_slot("b", "()V"), Some(1));
+        // Overriding through the inherited index must land on the same slot.
+        assert_eq!(child.add_method("b", "()V", 2, 42), 1);
+        assert_eq!(child.get(1).unwrap().declaring_class_id, 2);
+        // The parent's own table is untouched.
+        assert_eq!(parent.get(1).unwrap().declaring_class_id, 1);
+    }
+
+    #[test]
+    fn unload_classes_matches_a_loop_of_unload_class() {
+        let build = || {
+            let mut mgr = VtableManager::new();
+            // Class 1 declares `a`; classes 2 and 3 inherit that entry.
+            for cid in [1u64, 2, 3] {
+                mgr.install_vtable(
+                    cid,
+                    vec![
+                        Some(probe_entry("a", "()V", 1, 0)),
+                        Some(probe_entry("b", "()V", cid, 1)),
+                    ],
+                );
+            }
+            mgr
+        };
+
+        let mut looped = build();
+        looped.unload_class(1);
+        let mut batched = build();
+        batched.unload_classes(&[1]);
+
+        assert!(looped.get_vtable(1).is_none());
+        assert!(batched.get_vtable(1).is_none());
+        for cid in [2u64, 3] {
+            // The inherited `a` entry (declared by the unloaded class 1) is
+            // invalidated in both; the class's own `b` stays resolved.
+            assert!(looped.vtable_entry_ref(cid, 0).is_none());
+            assert!(batched.vtable_entry_ref(cid, 0).is_none());
+            assert!(looped.vtable_entry_ref(cid, 1).is_some());
+            assert!(batched.vtable_entry_ref(cid, 1).is_some());
+        }
+    }
+
+    #[test]
+    fn unload_classes_is_a_noop_on_an_empty_batch() {
+        let mut mgr = VtableManager::new();
+        mgr.install_vtable(1, vec![Some(probe_entry("a", "()V", 1, 0))]);
+        mgr.unload_classes(&[]);
+        assert!(mgr.vtable_entry_ref(1, 0).is_some());
     }
 
     #[test]
