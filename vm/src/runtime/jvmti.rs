@@ -11,16 +11,31 @@
 //! # LIVENESS AND SCOPE — established by the observability audit, 2026-07-26
 //! ---------------------------------------------------------------------------
 //!
-//! **There are two JVMTI implementations in this tree and they are not
-//! connected to each other.** Know which one you are looking at:
+//! **There are two JVMTI implementations in this tree.** Know which one you
+//! are looking at:
 //!
 //! | | `vm/src/runtime/jvmti.rs` (this file) | `vm/src/jvmti/` |
 //! |---|---|---|
 //! | Event delivery | `JvmtiEventManager` + `fire_*` free functions | `EventManager` + `EventCallbacks` |
 //! | Callback type | in-process Rust `Box<dyn Fn>` | in-process Rust `Box<dyn Fn>` |
-//! | Reached by native agents | **no** | yes — `agent.rs` does a real `libloading` `dlopen` + `Agent_OnLoad` |
-//! | Wired to the interpreter | **yes** — see below | only `notify_class_load` / `notify_thread_end` |
+//! | Reached by native agents | **no** — see the bridge below | yes — `agent.rs` does a real `libloading` `dlopen` + `Agent_OnLoad` |
+//! | Wired to the interpreter | **yes** — see below | only via the bridge (D14) |
 //! | Gated on a cargo feature | no | `experimental-debug` (on by default) |
+//!
+//! **obsaudit D14 (2026-07-26): a one-way bridge now forwards 9 event kinds
+//! from this file to the real, native-agent-facing env** — see
+//! `install_real_agent_env_bridge` near the bottom of this file for exactly
+//! which ones and why not all of them. This is a bridge, not a merge: the two
+//! `JvmtiEventManager`/`EventManager` types, their event enums, and their two
+//! `JvmtiCapabilities` structs remain separate. A real agent now receives
+//! VMInit, VMDeath, ThreadStart, ThreadEnd, ClassLoad, ClassPrepare,
+//! GarbageCollectionStart/Finish, and ObjectFree; it still receives nothing
+//! for method-level tracing (MethodEntry/Exit, SingleStep, Breakpoint,
+//! FramePop, FieldAccess/Modification) or monitor contention events, and
+//! `vm/src/jvmti/capabilities.rs`'s `JvmtiCapabilities::potential()` was
+//! corrected to advertise `false` for exactly those, so `AddCapabilities`
+//! honestly reports what an agent will and won't see. Full unification
+//! remains a separate, larger task.
 //!
 //! What IS live in this file on a default build:
 //!
@@ -34,21 +49,21 @@
 //!    `fire_field_modification_if_watched` from the interpreter.
 //!  * Every one of those call sites is guarded by an `any_*_listener_active()`
 //!    atomic check, so with no listener registered the cost is a relaxed load.
+//!  * `install_real_agent_env_bridge` runs unconditionally from `Vm::new`
+//!    (the real boot path), so the 9 bridged event kinds above reach a real
+//!    attached agent without it registering anything on this file's manager.
 //!
-//! What is NOT live: **nothing registers a listener on the global manager
-//! outside `#[cfg(test)]`.** A native agent loaded via `-agentpath:` goes to
-//! `vm/src/jvmti/`, whose `EventManager` is a *different object* — so an
-//! attached agent receives none of the interpreter-sourced events plumbed
-//! here. In practice this file is an in-tree/embedder API today, not the
-//! agent-facing one. Do not describe it to users as "JVMTI works".
+//! In-tree/embedder listeners (Rust closures registered directly on this
+//! file's `JvmtiEventManager`, e.g. in tests) still work exactly as before
+//! and are unaffected by the bridge — they are a separate delivery path from
+//! `snapshot_envs()`/`self.callbacks`, not routed through `vm/src/jvmti/` at
+//! all.
 //!
 //! ## Known correctness gaps (each documented at its definition)
 //!
 //!  * `AgentRegistry::load_agents` does not load anything — see its doc.
 //!  * `get_local_*` / `set_local_*` operate on a side table, not on real
 //!    interpreter frames — see [`JvmtiEnv::get_local_int`].
-//!  * `ClassLoad`/`ClassPrepare` are fired from inside the class-manager
-//!    write guard and always report thread 0 — see [`fire_class_load`].
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -1194,6 +1209,10 @@ impl JvmtiEventManager {
     // --- Event firing methods ---
 
     pub fn fire_vm_init(&self) {
+        // obsaudit D14 bridge — see the notes above `install_real_agent_env_bridge`.
+        if let Some(shared) = real_agent_shared() {
+            crate::jvmti::notify_vm_init(&shared.debug.jvmti_env.lock(), 0);
+        }
         if !self.is_event_enabled(JvmtiEventKind::VmInit, None) {
             return;
         }
@@ -1206,6 +1225,10 @@ impl JvmtiEventManager {
     }
 
     pub fn fire_vm_death(&self) {
+        // obsaudit D14 bridge — see the notes above `install_real_agent_env_bridge`.
+        if let Some(shared) = real_agent_shared() {
+            crate::jvmti::notify_vm_death(&shared.debug.jvmti_env.lock());
+        }
         if !self.is_event_enabled(JvmtiEventKind::VmDeath, None) {
             return;
         }
@@ -1218,6 +1241,11 @@ impl JvmtiEventManager {
     }
 
     pub fn fire_thread_start(&self, thread: ThreadId) {
+        // obsaudit D14 bridge — see the notes above `install_real_agent_env_bridge`.
+        if let Some(shared) = real_agent_shared() {
+            let name = resolve_thread_name_for_bridge(&shared, thread);
+            crate::jvmti::notify_thread_start(&shared.debug.jvmti_env.lock(), thread, &name);
+        }
         if !self.is_event_enabled(JvmtiEventKind::ThreadStart, Some(thread)) {
             return;
         }
@@ -1230,6 +1258,15 @@ impl JvmtiEventManager {
     }
 
     pub fn fire_thread_end(&self, thread: ThreadId) {
+        // obsaudit D14 bridge — see the notes above `install_real_agent_env_bridge`.
+        // Note: `vm/src/vm/vm_exec.rs` already has its own hand-written
+        // `notify_thread_end` call site for the real env; this bridge makes
+        // that call redundant whenever this method is *also* invoked for the
+        // same thread exit, but harmless — ThreadEnd carries no per-call
+        // state an agent couldn't tolerate seeing twice as cheaply as never.
+        if let Some(shared) = real_agent_shared() {
+            crate::jvmti::notify_thread_end(&shared.debug.jvmti_env.lock(), thread);
+        }
         if !self.is_event_enabled(JvmtiEventKind::ThreadEnd, Some(thread)) {
             return;
         }
@@ -1276,6 +1313,16 @@ impl JvmtiEventManager {
     /// not unwind through interpreter/classloader frames it has no business
     /// touching.
     pub fn fire_class_load(&self, thread: ThreadId, class_id: ClassId) {
+        // obsaudit D14 bridge — see the notes above `install_real_agent_env_bridge`.
+        // Replaces the old hand-written call site in `vm/src/vm/vm_init.rs`
+        // (a narrower helper that only covered one dynamic-load path), which
+        // was removed so ClassLoad reaches the real env exactly once, from
+        // every class-definition path, not just that one.
+        if let Some(shared) = real_agent_shared() {
+            if let Some(name) = resolve_class_name_for_bridge(&shared, class_id) {
+                crate::jvmti::notify_class_load(&shared.debug.jvmti_env.lock(), class_id, &name);
+            }
+        }
         if !self.is_event_enabled(JvmtiEventKind::ClassLoad, Some(thread)) {
             return;
         }
@@ -1300,6 +1347,12 @@ impl JvmtiEventManager {
     /// Fire ClassPrepare. Same timing and re-entrancy contract as
     /// [`Self::fire_class_load`] — see its doc comment.
     pub fn fire_class_prepare(&self, thread: ThreadId, class_id: ClassId) {
+        // obsaudit D14 bridge — see the notes above `install_real_agent_env_bridge`.
+        if let Some(shared) = real_agent_shared() {
+            if let Some(name) = resolve_class_name_for_bridge(&shared, class_id) {
+                crate::jvmti::notify_class_prepare(&shared.debug.jvmti_env.lock(), class_id, &name);
+            }
+        }
         if !self.is_event_enabled(JvmtiEventKind::ClassPrepare, Some(thread)) {
             return;
         }
@@ -1509,6 +1562,10 @@ impl JvmtiEventManager {
     }
 
     pub fn fire_gc_start(&self) {
+        // obsaudit D14 bridge — see the notes above `install_real_agent_env_bridge`.
+        if let Some(shared) = real_agent_shared() {
+            crate::jvmti::notify_gc_start(&shared.debug.jvmti_env.lock());
+        }
         if !self.is_event_enabled(JvmtiEventKind::GarbageCollectionStart, None) {
             return;
         }
@@ -1521,6 +1578,10 @@ impl JvmtiEventManager {
     }
 
     pub fn fire_gc_finish(&self) {
+        // obsaudit D14 bridge — see the notes above `install_real_agent_env_bridge`.
+        if let Some(shared) = real_agent_shared() {
+            crate::jvmti::notify_gc_finish(&shared.debug.jvmti_env.lock());
+        }
         if !self.is_event_enabled(JvmtiEventKind::GarbageCollectionFinish, None) {
             return;
         }
@@ -1675,6 +1736,14 @@ impl JvmtiEventManager {
     /// "no tag" and should not normally reach this path; callers (the GC's
     /// tag-sweep step) are expected to filter those out.
     pub fn fire_object_free(&self, tag: i64) {
+        // obsaudit D14 bridge — see the notes above `install_real_agent_env_bridge`.
+        // Deliberately ahead of the `has_any_listener` fast-path below: that
+        // flag tracks only this (synthetic) manager's own listeners, so a
+        // real native agent with `can_tag_objects` and nothing registered
+        // here would otherwise never see its own ObjectFree events.
+        if let Some(shared) = real_agent_shared() {
+            crate::jvmti::notify_object_free(&shared.debug.jvmti_env.lock(), tag);
+        }
         if !self.has_any_listener() {
             return;
         }
@@ -2874,6 +2943,99 @@ pub fn any_listener_active() -> bool {
     }
 }
 
+// ---------------------------------------------------------------------------
+// obsaudit D14 (2026-07-26) — bridge to the real, native-agent-facing JVMTI
+// env (`vm/src/jvmti/`, `shared.debug.jvmti_env`)
+// ---------------------------------------------------------------------------
+//
+// This file's `JvmtiEventManager` and `vm/src/jvmti/`'s `EventManager` are
+// separate objects (see the LIVENESS block at the top of this file) — a
+// native agent loaded via `-agentpath:` (real `dlopen`, `vm/src/jvmti/agent.rs`)
+// only ever sees the latter. Before this bridge, of the ~26 event kinds this
+// file's `fire_*` methods drive from the interpreter/GC/classloading, the
+// real env received exactly two (`ClassLoad`, `ThreadEnd`), each via its own
+// hand-written call site elsewhere in `vm/` — not through this manager at
+// all. The bridge below forwards the 9 event kinds that (a) have a
+// `notify_*` counterpart in `vm/src/jvmti/mod.rs` and (b) are not a
+// per-bytecode/per-invocation hot path, so a real agent attached today
+// actually receives VMInit, VMDeath, ThreadStart, ThreadEnd, ClassLoad,
+// ClassPrepare, GarbageCollectionStart/Finish, and ObjectFree.
+//
+// Deliberately NOT bridged: MethodEntry/MethodExit/SingleStep/Breakpoint/
+// FramePop/FieldAccess/FieldModification (per-bytecode or per-invocation —
+// would add a `Mutex<JvmtiEnv>` lock to the interpreter's hottest paths for
+// every VM, whether or not a native agent is attached to them) and
+// MonitorWait/MonitorContendedEnter (per contended lock — same hot-path
+// concern; also `vm/src/jvmti/mod.rs` has no `notify_monitor_waited` /
+// `notify_monitor_contended_entered`, so `can_generate_monitor_events`
+// could only ever be half-honest here). `JvmtiCapabilities::potential()`
+// in `vm/src/jvmti/capabilities.rs` was corrected to advertise `false` for
+// every capability whose events are not bridged, so a real agent's
+// `AddCapabilities` negotiation reflects what it will actually receive
+// instead of silently promising events that never arrive — the same
+// failure shape D2 (`GetLocalVariable*`) documents for a different
+// capability. Full unification of the two implementations (shared event
+// enum, shared capability set, one `JvmtiEnv`) remains a separate, larger
+// task — this bridge closes the "silently receives nothing" gap without
+// attempting that rewrite.
+
+static REAL_AGENT_ENV_BRIDGE: OnceLock<Weak<crate::vm::SharedVm>> = OnceLock::new();
+
+/// Install the bridge to the real, native-agent-facing JVMTI env. Idempotent
+/// — only the first install wins. Called once from `SharedVm::new`, right
+/// where [`install_global_manager`] itself is installed.
+pub fn install_real_agent_env_bridge(shared: &Arc<crate::vm::SharedVm>) {
+    let _ = REAL_AGENT_ENV_BRIDGE.set(Arc::downgrade(shared));
+}
+
+/// The live `SharedVm` behind the bridge, if installed and not yet torn
+/// down. Every bridged `fire_*` method calls this first and skips its
+/// bridging logic entirely on `None` (no bridge installed — e.g. a unit
+/// test that builds a bare `JvmtiEventManager` without a `SharedVm`, or a
+/// `SharedVm` in the middle of being dropped) — same cost as any other
+/// "no listener" fast path in this file: one `OnceLock::get`, one
+/// `Weak::upgrade`.
+fn real_agent_shared() -> Option<Arc<crate::vm::SharedVm>> {
+    REAL_AGENT_ENV_BRIDGE.get()?.upgrade()
+}
+
+/// Resolve a loaded class's name for `vm/src/jvmti/mod.rs`'s
+/// `notify_class_load` / `notify_class_prepare`, which (unlike this file's
+/// `fire_class_load` / `fire_class_prepare`) take the name directly rather
+/// than expecting the listener to look it up.
+///
+/// Safe to call from inside a bridged `fire_*` method even though it takes
+/// the L10 `class_manager` read lock: as of obsaudit D1 (2026-07-26),
+/// `fire_class_load`/`fire_class_prepare` only run after the write guard
+/// that produced them has already been released, so a fresh `.read()` here
+/// cannot self-deadlock.
+fn resolve_class_name_for_bridge(
+    shared: &crate::vm::SharedVm,
+    class_id: ClassId,
+) -> Option<String> {
+    let cid = crate::classloading::ClassId::new(class_id as u32);
+    shared
+        .classes
+        .class_manager
+        .read()
+        .class_store
+        .get(cid)
+        .map(|c| c.name.to_string())
+}
+
+/// Resolve a thread's name for `vm/src/jvmti/mod.rs`'s `notify_thread_start`
+/// (unlike this file's `fire_thread_start`, it takes the name directly).
+/// Falls back to a synthetic name rather than skipping the event: an agent
+/// still needs to see the thread came into existence even if the registry
+/// entry raced with this lookup.
+fn resolve_thread_name_for_bridge(shared: &crate::vm::SharedVm, thread: ThreadId) -> String {
+    shared
+        .threads
+        .thread_registry
+        .thread_name(crate::threading::jvm_thread::ThreadId(thread))
+        .unwrap_or_else(|| format!("Thread-{thread}"))
+}
+
 /// Fire VMInit at the global level. No-op if no manager is installed.
 pub fn fire_vm_init() {
     if let Some(m) = GLOBAL_MANAGER.get() {
@@ -2891,34 +3053,14 @@ pub fn fire_vm_death() {
 /// Fire ClassLoad at the global level. Called from the class manager
 /// after a new class has been registered.
 ///
-/// ---------------------------------------------------------------------------
-/// TWO CALLER-SIDE HAZARDS (observability audit, 2026-07-26)
-/// ---------------------------------------------------------------------------
-///
-/// 1. **Fired while the class-manager write guard is held.** The producer is
-///    `cratonvm_classloading::class_manager::define_class_shared_with_options`,
-///    which calls `fire_class_load_hook` / `fire_class_prepare_hook` from
-///    inside its `&mut self` region — i.e. the L10 `ClassManager` write lock is
-///    held for the whole callback. That file's own comment claims "it never
-///    re-enters the class manager, so it is safe to call from inside
-///    `&mut self`", which holds only because every listener today is an
-///    in-tree Rust function pointer that does nothing but bump a counter.
-///
-///    A real JVMTI agent's `ClassLoad` handler routinely calls back into the
-///    VM — `GetClassSignature`, `GetLoadedClasses`, `GetClassMethods`,
-///    `RetransformClasses` — and every one of those needs to read the class
-///    manager. Because the guard is an exclusive write lock held by the same
-///    thread, that is a **self-deadlock**, not lock contention: the thread
-///    blocks forever on a lock it already owns, taking the class-loading path
-///    for the whole VM down with it. This must be fixed (snapshot what the
-///    event needs, drop the guard, then fire) before any native agent is
-///    allowed to receive `ClassLoad`/`ClassPrepare`.
-///
-/// 2. **`thread` is always 0.** Both hook call sites pass a literal `0` for
-///    the thread id rather than the loading thread. JVMTI's `ClassLoad`
-///    signature carries a `jthread` and agents key on it (e.g. to skip classes
-///    loaded by their own instrumentation thread and avoid recursion). Every
-///    event delivered here reports the same, wrong, thread.
+/// obsaudit D1 (2026-07-26), fixed: this used to be reached while the L10
+/// `class_manager` write guard was still held (a real agent's `ClassLoad`
+/// handler calling `GetClassSignature`/`GetLoadedClasses`/`RetransformClasses`
+/// would self-deadlock) and always reported thread 0. Both are fixed — see
+/// the DEFERRED FIRING notes near `install_class_load_hook` in
+/// `classloading/src/class_manager.rs` and the doc comment on
+/// `JvmtiEventManager::fire_class_load`. Also now bridged to the real,
+/// native-agent-facing env — see `install_real_agent_env_bridge` (D14).
 pub fn fire_class_load(thread: ThreadId, class_id: ClassId) {
     if let Some(m) = GLOBAL_MANAGER.get() {
         m.fire_class_load(thread, class_id);
@@ -2926,10 +3068,7 @@ pub fn fire_class_load(thread: ThreadId, class_id: ClassId) {
 }
 
 /// Fire ClassPrepare at the global level. Called from the class manager
-/// after the class has been linked / prepared.
-///
-/// Shares both hazards documented on [`fire_class_load`]: fired under the
-/// class-manager write guard, with a hardcoded thread id of 0.
+/// after the class has been linked / prepared. See [`fire_class_load`].
 pub fn fire_class_prepare(thread: ThreadId, class_id: ClassId) {
     if let Some(m) = GLOBAL_MANAGER.get() {
         m.fire_class_prepare(thread, class_id);

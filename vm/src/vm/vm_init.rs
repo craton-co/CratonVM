@@ -3649,19 +3649,17 @@ impl SharedVm {
             }
         }
 
-        // Fire JVMTI ClassLoad event on successful load
+        // obsaudit D14 (2026-07-26): the hand-written real-env ClassLoad
+        // notification that used to live here was removed. It fired on
+        // every successful `Ok(class_id)` unconditionally — including a
+        // cache hit against an already-loaded class, which is not a new
+        // ClassLoad and should not re-fire one. ClassLoad now reaches the
+        // real env exactly once per class, from
+        // `JvmtiEventManager::fire_class_load`'s bridge (see
+        // `install_real_agent_env_bridge` in `runtime/jvmti.rs`), which is
+        // driven by `ClassManager::define_class_shared_with_options` and so
+        // only runs when the class is actually newly defined.
         if let Ok(class_id) = &result {
-            #[cfg(feature = "experimental-debug")]
-            {
-                let env = self.debug.jvmti_env.lock();
-                if env
-                    .event_manager
-                    .is_enabled(crate::jvmti::JvmtiEvent::ClassLoad)
-                {
-                    crate::jvmti::notify_class_load(&env, class_id.as_u32() as u64, name);
-                }
-            }
-
             // T5.4.4 — class hierarchy change invalidation.
             //
             // When a new class is loaded, any JIT-compiled method
@@ -4906,6 +4904,13 @@ impl Vm {
         // fixtures that build multiple Vms in-process) are silently
         // ignored, which matches the global vtable hook pattern.
         set_global_shared_vm_for_hooks(Arc::downgrade(&shared));
+
+        // obsaudit D14 (2026-07-26): bridge `runtime::jvmti::JvmtiEventManager`
+        // (interpreter/GC/classloading-sourced events) to the real,
+        // native-agent-facing `shared.debug.jvmti_env` — see the notes above
+        // `install_real_agent_env_bridge` in `runtime/jvmti.rs`. Same `Weak`,
+        // idempotent, last-writer-wins shape as the two hooks just above.
+        crate::runtime::jvmti::install_real_agent_env_bridge(&shared);
 
         // KC16-watchdog: install the wait-site frame dumper so a thread
         // parked in `Object.wait()` (e.g. AsyncFutureTask.await) can emit
