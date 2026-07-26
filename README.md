@@ -47,29 +47,6 @@ fresh-process runs — full methodology in [BENCHMARK.md](BENCHMARK.md)):
 | String/Regex (100K)               | 55 ms     | 423 ms    | 7.7x  | **07-25** |
 | Binary Trees (depth 18)           | 176 ms    | 1,468 ms  | 8.34x | 07-18 |
 
-> **⚠ The two 07-25 rows are re-measurements and they regressed** — HashMap
-> 3.73x → **21.2x**, String/Regex 3.57x → **7.7x**. Both were re-run on
-> 2026-07-25 as alternating fresh-process pairs on one pinned core, all
-> checksums exact.
->
-> The regression is **CratonVM's, not the host's**: on the same runs HotSpot
-> reproduced its own recorded numbers (String/Regex 55 vs 54 ms) or beat them
-> (HashMap 1,039 vs 1,471 ms), so the machine is not slower. CratonVM is 2.2x
-> (String/Regex) to 4.0x (HashMap) off its 07-18 figures.
->
-> The other five rows are **not** re-measured here and remain 07-18 figures;
-> CratonVM-side re-runs suggest sieve and Binary Trees have also drifted, but
-> they have no fresh paired HotSpot number yet, so they are left alone rather
-> than half-updated.
->
-> **Confirmed and bounded**: rebuilding `a36b9d121` (07-18, the commit that
-> recorded the old figures) and running it three-way against HotSpot and
-> current `dev` shows the 07-18 binary still reproduces its own numbers
-> (String/Regex 181 ms vs a recorded 193) while `dev` is **8.9x** slower on
-> HashMap 10M and **2.7x** on String/Regex. It is not host load and not
-> anything since the 07-24 perf-gate anchoring, so the regression sits in
-> `a36b9d121..e57f0bc7d` — 137 first-parent commits, ~8 bisect steps.
-> Root-causing is tracked in [BENCHMARK.md](BENCHMARK.md).
 
 GPU offload, vs HotSpot C2 and [TornadoVM](https://github.com/beehive-lab/TornadoVM)
 4.0.1 (RTX 2060, N = 2²⁴, warm, full H2D+kernel+D2H round-trip, checksums
