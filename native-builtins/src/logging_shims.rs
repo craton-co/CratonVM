@@ -490,6 +490,75 @@ pub(crate) fn jul_logger_filter_set(
     }
 }
 
+/// GC-safe side table for `java.util.logging.FileHandler`'s own bookkeeping
+/// (a resolved output filename plus a closed flag), keyed by
+/// `identity_hash_code` -- same pattern as `jul_logger_handlers_table`/
+/// `jul_logger_filters_table` above.
+///
+/// `FileHandler`'s `<init>`/`publish`/`flush`/`close` are fully
+/// native-overridden (this module never falls through to real bytecode for
+/// them), so this state doesn't need to live in any particular instance
+/// field slot -- and MUST NOT, for the same reason documented on
+/// `jul_logger_handlers_table`: `FileHandler` is loaded from the real
+/// `java.base` module, so `new_object_initialized`/`ctx.set_field(this, N,
+/// ...)` allocates and indexes the REAL declared-field array (`Handler`'s
+/// inherited `manager`/`filter`/`formatter`/`logLevel`/`errorManager`/
+/// `encoding`, then `StreamHandler`'s and `FileHandler`'s own real fields).
+/// A prior fix attempt wrote the resolved filename to raw slot 0 (aliasing
+/// `Handler.manager`) and a closed flag to slot 2 -- see
+/// docs/known-issues/springboot/filehandler-noarg-ctor-handler-field-layout-gap.md
+/// for the full diagnosis. Keying by identity hash sidesteps field layout
+/// entirely, exactly like the `Logger` handler-list/filter tables above,
+/// and leaves `Handler`'s real `logLevel`/`filter`/`formatter` fields (which
+/// `Handler.setLevel`/`getLevel`/`isLoggable`/`setFormatter`/`getFormatter`
+/// in `reflect_annotations.rs` access by NAME, not slot) untouched and
+/// correct regardless of how a `FileHandler` was constructed.
+fn jul_file_handler_state_table() -> &'static std::sync::Mutex<std::collections::HashMap<i32, (Option<String>, bool)>>
+{
+    static T: OnceLock<std::sync::Mutex<std::collections::HashMap<i32, (Option<String>, bool)>>> =
+        OnceLock::new();
+    T.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+pub(crate) fn jul_file_handler_filename(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<String> {
+    let key = ctx.identity_hash_code(this);
+    jul_file_handler_state_table()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&key)
+        .and_then(|(filename, _)| filename.clone())
+}
+
+pub(crate) fn jul_file_handler_set_filename(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    filename: Option<String>,
+) {
+    let key = ctx.identity_hash_code(this);
+    let mut table = jul_file_handler_state_table()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    table.entry(key).or_insert((None, false)).0 = filename;
+}
+
+pub(crate) fn jul_file_handler_is_closed(ctx: &mut dyn NativeContext, this: ObjectRef) -> bool {
+    let key = ctx.identity_hash_code(this);
+    jul_file_handler_state_table()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&key)
+        .map(|(_, closed)| *closed)
+        .unwrap_or(false)
+}
+
+pub(crate) fn jul_file_handler_set_closed(ctx: &mut dyn NativeContext, this: ObjectRef, closed: bool) {
+    let key = ctx.identity_hash_code(this);
+    let mut table = jul_file_handler_state_table()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    table.entry(key).or_insert((None, false)).1 = closed;
+}
+
 pub(crate) fn emit_framework_log(ctx: &mut dyn NativeContext, text: &str) {
     ctx.record_printed_line(text.to_string());
     // `NativeContext::get_system_stream` is the process's canonical fd-backed
