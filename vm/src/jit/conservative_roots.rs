@@ -1107,6 +1107,269 @@ fn moving_young_frame_coverage_complete(rbp: usize, cm: &cratonvm_jit::CompiledM
     found
 }
 
+// ---------------------------------------------------------------------------
+// Moving-young coverage VERIFICATION (arch-2026-07-26
+// `moving-young-corruption-rootcause`)
+// ---------------------------------------------------------------------------
+//
+// `OopMapEntry::moving_young_coverage_complete` is the codegen's ASSERTION that
+// the shadow push at a safepoint published every live oop of that frame. The
+// assertion is computed by `x64::moving_young_safepoint_coverage_complete` from
+// the abstract interpreter's model of the frame: `self.stack` (the operand
+// stack) plus `local_oop_masks` (the Java locals). `collect_live_oop_homes`
+// publishes exactly that same set.
+//
+// A compiled frame holds oops in storage the abstract model does not describe:
+//
+//   * SCALAR-REPLACED OBJECT FIELDS. Escape analysis explodes an object into
+//     raw frame slots at `[rbp - (field_base_offset + k*8)]`
+//     (`x64.rs` `ScalarReplacedObject`, used by the `new` / `getfield` /
+//     `putfield` arms). A reference-typed field of such an object is a genuine
+//     heap pointer that is neither a Java local nor an operand-stack entry.
+//   * LICM HOIST SLOTS. `hoist_info` hoists a loop-invariant `aaload` into
+//     `hoist_offsets[idx]`; for a reference array that slot holds an object
+//     reference for the whole loop, again outside the local/operand model.
+//   * THE FULL-GPR SAFEPOINT SPILL AREA (`reg_spill_base`, the SB-CRASH-04
+//     spill). It exists precisely to make register-resident values visible to a
+//     CONSERVATIVE scan; the shadow push does not enumerate it.
+//
+// On the non-moving path all three are covered, because the conservative frame
+// scan reads every word of the frame. Under moving-young `memory/roots.rs`
+// SUPPRESSES that scan when the coverage proof passes — so those oops are
+// neither marked nor rewritten, and a Cheney copy strands or reclaims them.
+// That is a silent, GC-timing-dependent under-count with the exact shape the
+// known-issue records for bt18.
+//
+// This verifier removes the need to trust the assertion. It walks each live
+// compiled frame's OWN spill band — `[rbp - osr_frame_size, rbp)`, the same
+// bounded band `scan_compiled_frame_bands` uses, so intervening interpreter and
+// Rust frames are excluded — and checks every word that lands in a published
+// YOUNG semispace against the thread's published shadow window `[base, top)`.
+// A word that is young-resident and unpublished is, by definition, a reference
+// this collection could relocate and could not rewrite.
+//
+// Direction of error: the band scan is CONSERVATIVE, so it can flag a non-oop
+// `i64` that happens to look young-resident. The cost of a false positive is
+// one non-moving collection (counted, labelled, logged); the cost of a false
+// negative would be heap corruption. Fail-closed everywhere: an unbounded band,
+// a missing frame size, or an unresolvable shadow window all report "not
+// verified".
+
+/// Locate this thread's published shadow window `[base, top)` from a live
+/// compiled frame.
+///
+/// The frame caches its `*mut JvmThread` in `[rbp - cm.shadow_thread_slot_off]`
+/// (written by the prologue, or by the OSR trampoline for an OSR entry), and
+/// the `ShadowStack` sits at `thread + cm.shadow_off_in_thread` with the
+/// `#[repr(C)]` layout asserted in `cratonvm_gc::shadow_stack`.
+///
+/// `None` means "cannot resolve" — including the legitimate null-thread case
+/// (`maybe_nop_out_shadow_fetch` NOPs the prologue fetch for a method that
+/// never emitted a push, leaving the slot null). The caller treats `None` as an
+/// EMPTY published set rather than as an error: a method that published nothing
+/// is fine exactly as long as its band contains no young words, which is what
+/// the band scan then goes on to check.
+fn shadow_window_from_frame(
+    rbp: usize,
+    cm: &cratonvm_jit::CompiledMethod,
+) -> Option<(usize, usize)> {
+    let thr_off = cm.shadow_thread_slot_off;
+    if thr_off <= 0 || cm.shadow_off_in_thread <= 0 || rbp < thr_off as usize {
+        return None;
+    }
+    let slot = rbp - thr_off as usize;
+    if slot & 0x7 != 0 {
+        return None;
+    }
+    // SAFETY: `slot` is an aligned address inside this thread's own live
+    // compiled frame, bounded by the same frame-size check the caller applied
+    // before calling here.
+    let thread_ptr = unsafe { (slot as *const usize).read() };
+    if thread_ptr == 0 || thread_ptr & 0x7 != 0 {
+        return None;
+    }
+    let ss = thread_ptr.checked_add(cm.shadow_off_in_thread as usize)?;
+    if ss & 0x7 != 0 {
+        return None;
+    }
+    // SAFETY: `ss` addresses the `ShadowStack` embedded in the `JvmThread` this
+    // frame cached at entry; the thread outlives its own compiled frames.
+    let top = unsafe {
+        ((ss + cratonvm_gc::shadow_stack::ShadowStack::TOP_OFFSET) as *const usize).read()
+    };
+    let base = unsafe {
+        ((ss + cratonvm_gc::shadow_stack::ShadowStack::BASE_OFFSET) as *const usize).read()
+    };
+    if base == 0 || top < base || (top - base) % 8 != 0 {
+        return None;
+    }
+    Some((base, top))
+}
+
+/// Collect the values currently published on the shadow window `[base, top)`.
+fn published_shadow_values(window: Option<(usize, usize)>) -> std::collections::HashSet<usize> {
+    let mut out = std::collections::HashSet::new();
+    let Some((base, top)) = window else {
+        return out;
+    };
+    // A pathological `top` cannot widen this beyond the backing buffer, which
+    // `ShadowStack::set_top` clamps; bound it anyway so a torn read cannot walk
+    // off the allocation.
+    const MAX_SLOTS: usize = cratonvm_gc::shadow_stack::DEFAULT_SHADOW_SLOTS;
+    let slots = ((top - base) / 8).min(MAX_SLOTS);
+    for i in 0..slots {
+        // SAFETY: aligned slot inside the thread's own shadow-stack buffer.
+        let v = unsafe { ((base + i * 8) as *const usize).read() };
+        out.insert(v);
+    }
+    out
+}
+
+/// Verify that every young-resident word in this thread's live compiled frame
+/// bands was published on the shadow stack.
+///
+/// Returns `true` when at least one word was **not** published (or when the
+/// bands could not be bounded), i.e. when moving-young must NOT relocate this
+/// cycle. See the module block above for why the codegen's own
+/// `moving_young_coverage_complete` bit is not sufficient.
+///
+/// `reason_out` receives the specific `incomplete_reason` code on a `true`
+/// result so the fallback histogram can distinguish "an oop was missed" from
+/// "the frame could not be inspected at all".
+pub fn moving_young_unpublished_frame_oop_present(reason_out: &mut usize) -> bool {
+    if !moving_young_enabled() {
+        return false;
+    }
+    let scanner_sp = current_stack_pointer();
+    let mut unverified = false;
+    let mut unpublished = false;
+    JIT_ENTRY_CHAIN.with(|c| {
+        {
+            let mut chain = c.borrow_mut();
+            flush_top_rbp_cache_to_chain(chain.as_mut_slice());
+        }
+        let chain = c.borrow();
+        for entry in chain.iter() {
+            let Some(info) = entry.precise else {
+                // A conservative (map-less) entry is already reported by the
+                // NO_PRECISE_MAP obligation; nothing to verify here.
+                continue;
+            };
+            let entry_sp = entry.entry_sp;
+            let mut rbp = info.exact_rbp;
+            if rbp == 0 || rbp & 0x7 != 0 || rbp < scanner_sp || rbp >= entry_sp {
+                // MISSING_EXACT_RBP already covers rbp == 0; an out-of-range
+                // value means the band cannot be located at all.
+                unverified = true;
+                continue;
+            }
+            // SAFETY: same contract as `scan_compiled_frame_bands` — the chain
+            // entry's CompiledMethod is Arc-owned by the JIT cache while any of
+            // its frames is live.
+            let mut cm: &cratonvm_jit::CompiledMethod = unsafe { &*info.compiled_method };
+            let published = published_shadow_values(shadow_window_from_frame(rbp, cm));
+            let mut frames = 0usize;
+            while frames < 4096 {
+                frames += 1;
+                let frame_size = cm.osr_frame_size;
+                if frame_size <= 0 {
+                    unverified = true;
+                    break;
+                }
+                let frame_size = frame_size as usize;
+                const MAX_COMPILED_FRAME_BYTES: usize = 1024 * 1024;
+                if frame_size > MAX_COMPILED_FRAME_BYTES || frame_size > rbp {
+                    unverified = true;
+                    break;
+                }
+                if band_has_unpublished_young_word(rbp - frame_size, rbp, &published) {
+                    unpublished = true;
+                    break;
+                }
+                // `[rbp]` = saved caller RBP, `[rbp + 8]` = return PC into it.
+                // SAFETY: `rbp` was validated to lie in this thread's live JIT
+                // stack interval.
+                let parent_rbp = unsafe { (rbp as *const usize).read() };
+                let ret_addr = unsafe { ((rbp + 8) as *const usize).read() };
+                let Some(parent_cm_ptr) = cratonvm_jit::lookup_jit_code_range(ret_addr) else {
+                    // A non-JIT parent ends the walk cleanly: it owns no
+                    // compiled spill band.
+                    break;
+                };
+                if parent_rbp <= rbp
+                    || parent_rbp & 0x7 != 0
+                    || parent_rbp >= entry_sp
+                    || parent_rbp < scanner_sp
+                {
+                    unverified = true;
+                    break;
+                }
+                // SAFETY: code ranges retain their CompiledMethod metadata for
+                // the lifetime of an active frame.
+                cm = unsafe { &*(parent_cm_ptr as *const cratonvm_jit::CompiledMethod) };
+                rbp = parent_rbp;
+            }
+            if unpublished {
+                break;
+            }
+        }
+    });
+    if unpublished {
+        *reason_out = cratonvm_gc::gc_quiescence::incomplete_reason::UNPUBLISHED_FRAME_OOP;
+        return true;
+    }
+    if unverified {
+        *reason_out = cratonvm_gc::gc_quiescence::incomplete_reason::UNBOUNDED_FRAME_BAND;
+        return true;
+    }
+    false
+}
+
+/// Scan one compiled frame's spill band `[lo, hi)` for a word that lands in a
+/// published young semispace and is absent from `published`.
+fn band_has_unpublished_young_word(
+    lo: usize,
+    hi: usize,
+    published: &std::collections::HashSet<usize>,
+) -> bool {
+    band_has_unpublished_word_with(
+        lo,
+        hi,
+        published,
+        cratonvm_gc::gen_heap::addr_in_published_young_regions,
+    )
+}
+
+/// Predicate-injected core of [`band_has_unpublished_young_word`], so the scan
+/// itself is unit-testable without mutating the process-global published
+/// region-bounds table (which parallel tests share).
+fn band_has_unpublished_word_with(
+    lo: usize,
+    hi: usize,
+    published: &std::collections::HashSet<usize>,
+    is_relocatable: impl Fn(usize) -> bool,
+) -> bool {
+    if hi <= lo {
+        return false;
+    }
+    let mut addr = (lo + 7) & !7usize;
+    // Same guard as `scan_one_frame`: a stale bound must never walk into
+    // unmapped pages. A compiled frame is orders of magnitude smaller than
+    // this, so the clamp is unreachable in practice.
+    const MAX_SCAN_BYTES: usize = 1024 * 1024;
+    let hi = hi.min(addr.saturating_add(MAX_SCAN_BYTES));
+    while addr + 8 <= hi {
+        // SAFETY: aligned read inside the calling thread's own live compiled
+        // frame, bounded by the frame size recorded at compile time.
+        let w = unsafe { (addr as *const usize).read() };
+        if is_relocatable(w) && !published.contains(&w) {
+            return true;
+        }
+        addr += 8;
+    }
+    false
+}
+
 /// Refresh the current thread's moving-young coverage status for the active
 /// JIT frames it owns. Returns `true` when every live frame reachable from this
 /// thread has a complete active-safepoint proof; on `false`, the GC-side
@@ -1280,6 +1543,35 @@ pub fn refresh_moving_young_coverage_for_current_thread() -> bool {
             cratonvm_gc::gc_quiescence::mark_moving_young_coverage_incomplete_because(
                 cratonvm_gc::gc_quiescence::incomplete_reason::UNREGISTERED_JIT_FRAME,
             );
+            complete = false;
+        }
+    }
+
+    // COVERAGE VERIFICATION, not coverage assertion (arch-2026-07-26
+    // `moving-young-corruption-rootcause`). Everything above trusts
+    // `OopMapEntry::moving_young_coverage_complete`, a codegen bit computed
+    // from the abstract interpreter's local/operand model. That model does not
+    // describe scalar-replacement field slots, LICM hoist slots, or the
+    // full-GPR safepoint spill area — all of which can hold live oops that the
+    // shadow push never publishes and that `roots.rs` no longer scans
+    // conservatively once the proof "passes". Check the frames' actual bytes
+    // instead of taking the bit's word for it.
+    //
+    // Deliberately placed HERE rather than at the `roots.rs` call site: this
+    // function is also what `vm_exec::deposit_root_snapshot` and
+    // `interpreter::update_root_snapshot` call before suppressing their own
+    // conservative scans, so a parked or safepointed thread gets the same
+    // verification without those (differently-owned) files changing.
+    {
+        let mut reason = cratonvm_gc::gc_quiescence::incomplete_reason::NONE;
+        if moving_young_unpublished_frame_oop_present(&mut reason) {
+            if dbg {
+                eprintln!(
+                    "[moving-young-coverage] incomplete: {}",
+                    cratonvm_gc::gc_quiescence::incomplete_reason::label(reason),
+                );
+            }
+            cratonvm_gc::gc_quiescence::mark_moving_young_coverage_incomplete_because(reason);
             complete = false;
         }
     }
@@ -2670,6 +2962,194 @@ mod tests {
         cm.shadow_thread_slot_off = 8;
         cm.shadow_savetop_slot_off = 16;
         cm.shadow_off_in_thread = 24;
+    }
+
+    // -----------------------------------------------------------------
+    // Moving-young coverage VERIFICATION (arch-2026-07-26
+    // `moving-young-corruption-rootcause`)
+    // -----------------------------------------------------------------
+
+    /// THE regression test for this item.
+    ///
+    /// A live compiled frame must never be able to hold a relocatable
+    /// reference that is neither published on the shadow stack (rewritable)
+    /// nor covered by the conservative scan (which moving-young suppresses).
+    /// The codegen's `moving_young_coverage_complete` bit cannot answer this:
+    /// it is computed from the abstract interpreter's locals + operand stack
+    /// only, while the frame also carries scalar-replacement field slots, LICM
+    /// hoist slots and the blind full-GPR safepoint spill area. The band scan
+    /// is what closes that gap, so it must FAIL when such a word is present.
+    #[test]
+    fn frame_band_scan_rejects_a_relocatable_word_the_shadow_stack_never_published() {
+        // A synthetic compiled-frame spill band. `hoisted` stands for any of
+        // the three storage classes outside the local/operand model.
+        let published_oop = 0xdead_0000usize;
+        let hoisted_oop = 0xbeef_0000usize;
+        let band: Vec<usize> = vec![7, published_oop, 0x1234_5678, hoisted_oop, 0];
+        let lo = band.as_ptr() as usize;
+        let hi = lo + band.len() * 8;
+
+        let relocatable = move |w: usize| w == published_oop || w == hoisted_oop;
+
+        let mut published = std::collections::HashSet::new();
+        published.insert(published_oop);
+        assert!(
+            band_has_unpublished_word_with(lo, hi, &published, &relocatable),
+            "a young-resident word absent from the shadow window is un-rewritable: \
+             the cycle MUST NOT relocate",
+        );
+
+        published.insert(hoisted_oop);
+        assert!(
+            !band_has_unpublished_word_with(lo, hi, &published, &relocatable),
+            "once every relocatable word in the band is on the shadow stack, the \
+             frame really is fully covered and the moving cycle may proceed",
+        );
+    }
+
+    /// The scan must not divert on a frame full of primitives — otherwise
+    /// moving-young could never engage at all and the fix would be a disguised
+    /// default-off landing.
+    #[test]
+    fn frame_band_scan_ignores_words_outside_the_young_regions() {
+        let band: Vec<usize> = vec![0, 1, u64::MAX as usize, 42, 0x7fff_ffff];
+        let lo = band.as_ptr() as usize;
+        let hi = lo + band.len() * 8;
+        let published = std::collections::HashSet::new();
+        assert!(!band_has_unpublished_word_with(lo, hi, &published, |_| {
+            false
+        }));
+    }
+
+    #[test]
+    fn frame_band_scan_handles_an_empty_or_inverted_band() {
+        let published = std::collections::HashSet::new();
+        assert!(!band_has_unpublished_word_with(
+            0x2000,
+            0x1000,
+            &published,
+            |_| true
+        ));
+        assert!(!band_has_unpublished_word_with(
+            0x1000,
+            0x1000,
+            &published,
+            |_| true
+        ));
+    }
+
+    /// A synthetic `JvmThread`-shaped buffer whose `ShadowStack` sits at
+    /// `shadow_off_in_thread`, plus a frame that caches a pointer to it in
+    /// `[rbp - shadow_thread_slot_off]` — exactly the two indirections the
+    /// verifier uses to recover a thread's published window from a frame.
+    #[allow(dead_code)] // the three buffers exist to keep the addresses alive
+    struct FakeShadowThread {
+        _thread: Box<[usize]>,
+        _slots: Box<[usize]>,
+        _frame: Box<[usize]>,
+        rbp: usize,
+        cm: cratonvm_jit::CompiledMethod,
+    }
+
+    fn fake_shadow_thread(values: &[usize], thread_is_null: bool) -> FakeShadowThread {
+        const SHADOW_OFF_IN_THREAD: usize = 24;
+        const THREAD_SLOT_OFF: usize = 8;
+
+        let mut slots: Box<[usize]> = vec![0usize; values.len().max(1)].into_boxed_slice();
+        slots[..values.len()].copy_from_slice(values);
+        let base = slots.as_ptr() as usize;
+        let top = base + values.len() * 8;
+
+        // thread[0..] with a ShadowStack {top, end, base} at byte offset 24.
+        let mut thread: Box<[usize]> = vec![0usize; 8].into_boxed_slice();
+        let ss = SHADOW_OFF_IN_THREAD / 8;
+        thread[ss] = top; // TOP_OFFSET  = 0
+        thread[ss + 1] = top; // END_OFFSET  = 8
+        thread[ss + 2] = base; // BASE_OFFSET = 16
+
+        // frame[..] with the cached thread pointer at [rbp - 8].
+        let mut frame: Box<[usize]> = vec![0usize; 4].into_boxed_slice();
+        frame[0] = if thread_is_null {
+            0
+        } else {
+            thread.as_ptr() as usize
+        };
+        let rbp = frame.as_ptr() as usize + THREAD_SLOT_OFF;
+
+        let mut cm = dummy_compiled_method();
+        cm.shadow_thread_slot_off = THREAD_SLOT_OFF as i32;
+        cm.shadow_off_in_thread = SHADOW_OFF_IN_THREAD as i32;
+
+        FakeShadowThread {
+            _thread: thread,
+            _slots: slots,
+            _frame: frame,
+            rbp,
+            cm,
+        }
+    }
+
+    #[test]
+    fn shadow_window_is_recovered_from_a_live_compiled_frame() {
+        let f = fake_shadow_thread(&[0x1111, 0x2222, 0x3333], false);
+        let window = shadow_window_from_frame(f.rbp, &f.cm).expect("window must resolve");
+        let published = published_shadow_values(Some(window));
+        assert_eq!(published.len(), 3);
+        for v in [0x1111usize, 0x2222, 0x3333] {
+            assert!(
+                published.contains(&v),
+                "value {v:#x} must count as published"
+            );
+        }
+    }
+
+    /// `maybe_nop_out_shadow_fetch` (jit/src/x64.rs) overwrites the prologue's
+    /// `get_current_thread` sequence with a JMP-over whenever a method emitted
+    /// no shadow push, leaving `[rbp - shadow_thread_slot_off]` NULL. At
+    /// runtime every push and reload in that method is then skipped by their
+    /// null guards — while its oop maps still carry
+    /// `moving_young_coverage_complete = true`. So a null thread slot means
+    /// "this frame published NOTHING", and the verifier must treat it as an
+    /// empty set rather than as "nothing to check": any relocatable word in
+    /// such a frame's band is then correctly un-rewritable.
+    #[test]
+    fn nulled_thread_slot_publishes_nothing_rather_than_proving_everything() {
+        let f = fake_shadow_thread(&[0x1111, 0x2222], true);
+        assert!(
+            shadow_window_from_frame(f.rbp, &f.cm).is_none(),
+            "a NOP'd-out prologue fetch leaves the cached thread pointer null",
+        );
+        let published = published_shadow_values(None);
+        assert!(published.is_empty());
+
+        let band: Vec<usize> = vec![0x1111];
+        let lo = band.as_ptr() as usize;
+        assert!(
+            band_has_unpublished_word_with(lo, lo + 8, &published, |w| w == 0x1111),
+            "a frame that published nothing cannot prove coverage of a live oop",
+        );
+    }
+
+    #[test]
+    fn shadow_window_is_unresolvable_without_the_layout_offsets() {
+        let mut f = fake_shadow_thread(&[0x1111], false);
+        f.cm.shadow_thread_slot_off = 0;
+        assert!(shadow_window_from_frame(f.rbp, &f.cm).is_none());
+        f.cm.shadow_thread_slot_off = 8;
+        f.cm.shadow_off_in_thread = 0;
+        assert!(shadow_window_from_frame(f.rbp, &f.cm).is_none());
+    }
+
+    /// The verifier must impose no verdict (and no cost) while moving-young is
+    /// off — the legacy path's conservative scan already covers these frames.
+    #[test]
+    fn frame_oop_verifier_is_inert_when_moving_young_is_off() {
+        if moving_young_enabled() {
+            return; // validating a moving-young build
+        }
+        let mut reason = cratonvm_gc::gc_quiescence::incomplete_reason::NONE;
+        assert!(!moving_young_unpublished_frame_oop_present(&mut reason));
+        assert_eq!(reason, cratonvm_gc::gc_quiescence::incomplete_reason::NONE);
     }
 
     #[test]

@@ -398,6 +398,18 @@ pub mod incomplete_reason {
     pub const XT_TAKEOVER: usize = 8;
     /// A blocked peer's JIT helper window was scanned conservatively.
     pub const XT_HELPER_WINDOW: usize = 9;
+    /// A live compiled frame's own spill band holds a young-heap address that
+    /// the shadow stack never published, so nothing can rewrite that slot after
+    /// a relocation (arch-2026-07-26 `moving-young-corruption-rootcause`).
+    pub const UNPUBLISHED_FRAME_OOP: usize = 10;
+    /// A live compiled frame's spill band could not be bounded (no exact RBP or
+    /// no recorded frame size), so "every oop is published" is unverifiable.
+    pub const UNBOUNDED_FRAME_BAND: usize = 11;
+
+    /// One past the highest defined reason code. Sizes the per-reason counter
+    /// array; a new variant must bump it (asserted by
+    /// `every_incomplete_reason_has_a_label`).
+    pub const COUNT: usize = 12;
 
     /// Human-readable label for a reason code (for the fallback diagnostic).
     pub fn label(code: usize) -> &'static str {
@@ -412,9 +424,85 @@ pub mod incomplete_reason {
             CROSS_THREAD_JIT_PEER => "cross-thread-jit-peer",
             XT_TAKEOVER => "xt-takeover-conservative-scan",
             XT_HELPER_WINDOW => "xt-helper-window-conservative-scan",
+            UNPUBLISHED_FRAME_OOP => "compiled-frame-oop-not-published",
+            UNBOUNDED_FRAME_BAND => "compiled-frame-band-unbounded",
             _ => "unknown",
         }
     }
+}
+
+// Per-reason fallback histogram.
+//
+// `moving_young_coverage_fallback_count()` answers "did moving-young give up?"
+// but not "on which obligation?", and the FIRST reason of a cycle is the only
+// one recorded per cycle — so a single scalar cannot tell an operator whether
+// one obligation is blocking every cycle or ten are blocking one each. That
+// distinction is the whole content of the follow-up work, so it is counted.
+//
+// Process-global in production, thread-local under `cfg(test)`, for the same
+// reason as every other counter in this module.
+#[cfg(not(test))]
+static MOVING_YOUNG_REASON_COUNTS: [AtomicUsize; incomplete_reason::COUNT] = [
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+];
+
+#[cfg(test)]
+thread_local! {
+    static MOVING_YOUNG_REASON_COUNTS: std::cell::RefCell<[usize; incomplete_reason::COUNT]> =
+        const { std::cell::RefCell::new([0; incomplete_reason::COUNT]) };
+}
+
+#[cfg(not(test))]
+#[inline]
+fn bump_reason_count(reason: usize) {
+    if let Some(slot) = MOVING_YOUNG_REASON_COUNTS.get(reason) {
+        slot.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[cfg(not(test))]
+fn read_reason_counts() -> [usize; incomplete_reason::COUNT] {
+    let mut out = [0usize; incomplete_reason::COUNT];
+    for (i, slot) in MOVING_YOUNG_REASON_COUNTS.iter().enumerate() {
+        out[i] = slot.load(Ordering::Relaxed);
+    }
+    out
+}
+
+#[cfg(test)]
+#[inline]
+fn bump_reason_count(reason: usize) {
+    MOVING_YOUNG_REASON_COUNTS.with(|c| {
+        if let Some(slot) = c.borrow_mut().get_mut(reason) {
+            *slot += 1;
+        }
+    });
+}
+
+#[cfg(test)]
+fn read_reason_counts() -> [usize; incomplete_reason::COUNT] {
+    MOVING_YOUNG_REASON_COUNTS.with(|c| *c.borrow())
+}
+
+/// Histogram of the reasons moving-young cycles fell back to the non-moving
+/// sweep, indexed by [`incomplete_reason`] code.
+///
+/// Paired with [`moving_young_cycle_count`] this is the whole runtime answer to
+/// "is the young generation a copying collector, and if not, what is stopping
+/// it?" — see `docs/internal/arch-2026-07-26/moving-young-corruption-rootcause.md`.
+pub fn moving_young_fallback_reason_counts() -> [usize; incomplete_reason::COUNT] {
+    read_reason_counts()
 }
 
 /// Start a new VM young-GC root-publication cycle. The VM calls this before
@@ -467,6 +555,10 @@ pub fn moving_young_coverage_incomplete() -> bool {
 /// rather than being what makes any of them appear.
 pub fn record_moving_young_coverage_fallback() -> usize {
     let n = bump_fallbacks();
+    // Attribute this cycle to the obligation that actually forced it, so the
+    // histogram answers "which proof is blocking moving-young?" even when the
+    // rate limiter has suppressed the log line.
+    bump_reason_count(moving_young_incomplete_reason());
     if n <= 8 || n.is_power_of_two() || gc_flags().moving_young_fallbacks {
         tracing::warn!(
             "[moving-young] fallback #{n}: reason={} — a live JIT frame could not prove a \
@@ -1049,13 +1141,54 @@ mod tests {
 
     #[test]
     fn every_incomplete_reason_has_a_label() {
-        for code in incomplete_reason::NONE..=incomplete_reason::XT_HELPER_WINDOW {
+        for code in incomplete_reason::NONE..incomplete_reason::COUNT {
             assert_ne!(
                 incomplete_reason::label(code),
                 "unknown",
-                "reason code {code} needs a label for the warn-level fallback diagnostic",
+                "reason code {code} needs a label for the warn-level fallback diagnostic — \
+                 and `incomplete_reason::COUNT` must match the highest defined code + 1, \
+                 because it sizes the per-reason fallback histogram",
             );
         }
+        assert_eq!(
+            incomplete_reason::label(incomplete_reason::COUNT),
+            "unknown",
+            "COUNT must be one PAST the last defined reason",
+        );
+    }
+
+    /// A repeat of the 2026-07-01 "validated" run — which declared moving-young
+    /// working after executing ZERO moving cycles — must be impossible to
+    /// reproduce silently. The pair (cycle count, per-reason fallback
+    /// histogram) is what makes that so, and the histogram must attribute the
+    /// fallback to the obligation that actually forced it.
+    #[test]
+    fn fallback_histogram_attributes_the_blocking_obligation() {
+        let before = moving_young_fallback_reason_counts();
+        assert_eq!(moving_young_cycle_count(), 0, "fresh test thread");
+
+        begin_moving_young_coverage_cycle();
+        mark_moving_young_coverage_incomplete_because(incomplete_reason::UNPUBLISHED_FRAME_OOP);
+        // A later, consequential reason must NOT steal the attribution.
+        mark_moving_young_coverage_incomplete_because(incomplete_reason::CROSS_THREAD_JIT_PEER);
+        record_moving_young_coverage_fallback();
+
+        let after = moving_young_fallback_reason_counts();
+        assert_eq!(
+            after[incomplete_reason::UNPUBLISHED_FRAME_OOP],
+            before[incomplete_reason::UNPUBLISHED_FRAME_OOP] + 1,
+        );
+        assert_eq!(
+            after[incomplete_reason::CROSS_THREAD_JIT_PEER],
+            before[incomplete_reason::CROSS_THREAD_JIT_PEER],
+            "only the FIRST reason of a cycle is the one that forced the decision",
+        );
+        assert_eq!(
+            moving_young_cycle_count(),
+            0,
+            "a fallback is the OPPOSITE of a moving cycle; the two counters must \
+             never both be bumped for one collection",
+        );
     }
 
     #[test]

@@ -559,6 +559,37 @@ pub fn jit_region_bounds_addr() -> usize {
     &JIT_REGION_BOUNDS as *const _ as usize
 }
 
+/// Does `addr` fall inside either published YOUNG semispace `[base, end)`?
+///
+/// A *containment* test, deliberately not an object-header validation: it is
+/// the cheap, lock-free, `&VmHeap`-free predicate the moving-young coverage
+/// verifier needs (`conservative_roots::moving_young_unpublished_frame_oop_present`),
+/// which runs on the current thread's own JIT frame bands and must be callable
+/// from `refresh_moving_young_coverage_for_current_thread` — a function with no
+/// heap handle, reached from three different deposit sites.
+///
+/// Only the young generation matters there: a moving young cycle relocates
+/// young objects only, so an old-gen or off-heap word in a compiled frame slot
+/// is never left stale by it. Being a superset of "is a young object address"
+/// is the safe direction — an interior/stale/coincidental word merely costs one
+/// diverted (non-moving) collection, never a wrong relocation.
+///
+/// Returns `false` before the first publish and after the heap's `Drop` re-zeroes
+/// the table (see [`JitRegionBoundsTable`]); both are states in which the
+/// generational young semispaces do not exist, so nothing can be young.
+#[inline]
+pub fn addr_in_published_young_regions(addr: usize) -> bool {
+    // words = [yf_base, yf_end, yt_base, yt_end, og_base, og_end]
+    for i in 0..2 {
+        let base = JIT_REGION_BOUNDS.words[i * 2].load(Ordering::Acquire);
+        let end = JIT_REGION_BOUNDS.words[i * 2 + 1].load(Ordering::Acquire);
+        if base != 0 && addr >= base && addr < end {
+            return true;
+        }
+    }
+    false
+}
+
 impl Drop for GenerationalHeap {
     fn drop(&mut self) {
         // The guarded inline getfield's safety argument is "anything inside the
