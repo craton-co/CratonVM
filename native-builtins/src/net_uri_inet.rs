@@ -82,7 +82,29 @@ pub(crate) fn native_urlconnection_set_content_handler_factory(
 /// CratonVM's JNDI DNS client reaches the same real, responsive server
 /// HotSpot does. Falls back to an empty string (prior behavior) if
 /// `ipconfig` is unavailable or unparsable — never fatal.
+///
+/// Cached: the result is latched on first use, for the same reason
+/// [`crate::resolve_real_hostname`] is. On Windows this **forks and execs
+/// `ipconfig /all`** and parses its full output; the two natives that call it
+/// (`ResolverConfigurationImpl.init0` and `.loadDNSconfig0`,
+/// `lib.rs`) sit under the real JDK's `ResolverConfiguration.get()` refresh
+/// path, so a long-running program re-paid that process spawn every time the
+/// JDK decided its resolver config was stale. The host's DNS configuration is
+/// not something a JVM re-reads meaningfully mid-run — HotSpot's own
+/// `loadDNSconfig0` reads it through `GetNetworkParams` once per refresh
+/// precisely because the value is stable — so one probe per VM is the right
+/// granularity. [`os_dns_nameservers_string_uncached`] keeps the parsing
+/// logic directly testable without the latch.
 pub(crate) fn os_dns_nameservers_string() -> String {
+    static CACHED: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    CACHED
+        .get_or_init(os_dns_nameservers_string_uncached)
+        .clone()
+}
+
+/// The uncached probe behind [`os_dns_nameservers_string`]. Split out so the
+/// `ipconfig /all` parsing stays testable without the `OnceLock` latch.
+pub(crate) fn os_dns_nameservers_string_uncached() -> String {
     #[cfg(target_os = "windows")]
     {
         let output = match std::process::Command::new("ipconfig").arg("/all").output() {
@@ -1960,4 +1982,50 @@ mod new2_net_tests {
     // the message round-trip requires the JDK exception chain. The
     // native registration itself is unit-tested by virtue of compiling
     // and the broader VM test suite covering throw/catch paths.
+
+    // ---------------- DNS-config probe caching ----------------
+
+    /// `os_dns_nameservers_string` forks `ipconfig /all` on Windows. The
+    /// natives behind `sun/net/dns/ResolverConfigurationImpl.init0` and
+    /// `.loadDNSconfig0` call it under the JDK's resolver-config refresh
+    /// path, so an unlatched probe re-paid a process spawn every refresh.
+    /// The cache must be stable and must not change the answer.
+    #[test]
+    fn os_dns_nameservers_is_cached_and_matches_uncached_probe() {
+        let first = os_dns_nameservers_string();
+        let second = os_dns_nameservers_string();
+        assert_eq!(
+            first, second,
+            "the DNS-nameserver probe must be latched, not re-run per call"
+        );
+        assert_eq!(
+            first,
+            os_dns_nameservers_string_uncached(),
+            "latching must not change the resolved nameserver list"
+        );
+    }
+
+    /// The parse contract the callers depend on: a space-separated list of
+    /// bare IP literals, and — critically — never a `null`-ish value, because
+    /// the real JDK's `loadConfig()` feeds it straight into
+    /// `stringToList(os_nameservers)` which calls `String.split` with no null
+    /// guard (see the fn doc). An empty string is the correct "no servers"
+    /// answer; anything else must parse as an `IpAddr`.
+    #[test]
+    fn os_dns_nameservers_yields_bare_ip_literals_or_empty() {
+        let servers = os_dns_nameservers_string();
+        for token in servers.split(' ').filter(|t| !t.is_empty()) {
+            assert!(
+                token.parse::<std::net::IpAddr>().is_ok(),
+                "`{token}` is not an IP literal; ResolverConfigurationImpl \
+                 splits this string on whitespace and hands the pieces to the \
+                 DNS client verbatim"
+            );
+            assert!(
+                !token.contains('%'),
+                "`{token}` still carries an IPv6 zone id, which our UDP layer \
+                 cannot route"
+            );
+        }
+    }
 }
