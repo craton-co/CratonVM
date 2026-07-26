@@ -17839,12 +17839,17 @@ fn array_is_assignable_to_impl(
     // old on-demand loading behavior for a genuine miss without forcing the
     // warm path through an exclusive lock.
     let resolve_component = |name: &str| {
-        shared
-            .classes
-            .class_manager
-            .read()
-            .find_class_by_name(name)
-            .or_else(|| shared.load_class_concurrent(name).ok())
+        // Do NOT chain `.read()....or_else(|| ...load_class_concurrent...)` in
+        // one expression: the `RwLockReadGuard` temporary from `.read()` is not
+        // dropped until the end of the *statement*, which -- in a single
+        // expression -- includes the `or_else` closure's own execution. On a
+        // genuine miss, `load_class_concurrent` takes `class_manager.write()`
+        // on the SAME thread that still (per that temporary-lifetime rule)
+        // holds its own read guard, self-deadlocking against a non-reentrant
+        // `parking_lot::RwLock`. Bind the read result to a `let` first so the
+        // guard drops before any write-lock attempt.
+        let found = shared.classes.class_manager.read().find_class_by_name(name);
+        found.or_else(|| shared.load_class_concurrent(name).ok())
     };
     let src_id = match resolve_component(&src_comp) {
         Some(id) => id,
