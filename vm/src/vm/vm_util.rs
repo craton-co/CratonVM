@@ -3572,6 +3572,136 @@ fn post_clinit_fixup(shared: &SharedVm, class_id: ClassId, class_name: &str) {
 }
 
 // ---------------------------------------------------------------------------
+// Per-OS-thread frame-trace publication for the crash handler
+// ---------------------------------------------------------------------------
+
+/// The shape `JvmThread::frame_trace` has: the interpreter republishes into it
+/// at every blocking / safepoint deposit point, and the `ThreadRegistry` holds
+/// the same `Arc` so cross-thread dumps can read it.
+pub type PublishedTraceHandle =
+    std::sync::Arc<parking_lot::Mutex<Vec<cratonvm_native_api::StackTraceEntry>>>;
+
+std::thread_local! {
+    /// The frame trace of whatever Java thread is *currently running on this OS
+    /// thread*, for the crash handler to render.
+    ///
+    /// `crash_handler` already keeps a process-wide
+    /// `PRIMORDIAL_FRAME_TRACE` `OnceLock`, published from `Vm::new`. That
+    /// covers the common case and nothing else: a fault on a spawned worker, or
+    /// on a carrier running a virtual-thread continuation, produced a report
+    /// with the *primordial* thread's frames or none at all — and the two crash
+    /// classes that most need a Java stack (virtual-thread resume heap
+    /// corruption, STW-takeover deadlock) both fault on workers. See
+    /// `docs/internal/arch-2026-07-26/startup-and-diagnostics.md` §6.3.
+    ///
+    /// Thread-local rather than a shared registry, deliberately: the crash
+    /// handler runs *on the faulting thread* (Rust panic hook, Windows vectored
+    /// exception handler), so a TLS read needs no lock at all and cannot be the
+    /// thing that turns a diagnosable crash into a hang. The only lock involved
+    /// is the trace's own mutex, and that is `try_lock`-only.
+    ///
+    /// Holds `(thread name, ThreadId, handle)`; the identity is carried because
+    /// a carrier OS thread hosts many virtual threads over its life and the
+    /// report must say *which* one was mounted.
+    static CURRENT_THREAD_FRAME_TRACE: std::cell::RefCell<
+        Option<(String, u64, PublishedTraceHandle)>,
+    > = std::cell::RefCell::new(None);
+}
+
+/// RAII publication of the running Java thread's frame trace into this OS
+/// thread's TLS cell.
+///
+/// Save-and-restore rather than set-and-clear: a virtual-thread carrier mounts
+/// one continuation after another (and, in principle, could publish around a
+/// nested run), so `Drop` must put back whatever was there before rather than
+/// blanking the cell. Every early return out of a mount — the
+/// `ContinuationYield` unmount, the uncaught-exception path, the
+/// `java_thread_obj`-missing bail — is covered for free, which is the reason
+/// this is a guard and not a pair of calls.
+#[must_use = "dropping the guard immediately un-publishes the frame trace"]
+pub struct PublishedFrameTrace {
+    previous: Option<(String, u64, PublishedTraceHandle)>,
+}
+
+impl PublishedFrameTrace {
+    /// Publish `trace` as this OS thread's Java stack for the duration of the
+    /// returned guard. Never panics: if the TLS cell is unavailable (thread
+    /// teardown) or already borrowed, publication is silently skipped and the
+    /// crash handler falls back to the primordial trace.
+    pub fn publish(thread_name: &str, thread_id: u64, trace: PublishedTraceHandle) -> Self {
+        let previous = CURRENT_THREAD_FRAME_TRACE
+            .try_with(|cell| {
+                cell.try_borrow_mut()
+                    .ok()
+                    .and_then(|mut slot| slot.replace((thread_name.to_string(), thread_id, trace)))
+            })
+            .ok()
+            .flatten();
+        Self { previous }
+    }
+}
+
+impl Drop for PublishedFrameTrace {
+    fn drop(&mut self) {
+        let previous = self.previous.take();
+        let _ = CURRENT_THREAD_FRAME_TRACE.try_with(|cell| {
+            if let Ok(mut slot) = cell.try_borrow_mut() {
+                *slot = previous;
+            }
+        });
+    }
+}
+
+/// The Java frames of the thread currently mounted on *this* OS thread,
+/// rendered for a crash report. `None` when nothing is published here — the
+/// caller should then fall back to `crash_handler`'s primordial trace.
+///
+/// Never blocks and never panics: `try_with` + `try_borrow` + `try_lock`
+/// throughout. A crash may well have happened while this very thread held the
+/// frame-trace mutex, and waiting on it would hang the report.
+///
+/// Like the primordial renderer this is a *deposit-point* snapshot, not a live
+/// walk, and the text says so rather than implying otherwise.
+pub fn faulting_thread_java_stack_lines(max_frames: usize) -> Option<Vec<String>> {
+    CURRENT_THREAD_FRAME_TRACE
+        .try_with(|cell| {
+            let slot = cell.try_borrow().ok()?;
+            let (name, tid, trace) = slot.as_ref()?;
+            let Some(frames) = trace.try_lock() else {
+                return Some(vec![format!(
+                    "Java frames (faulting thread {name:?}, tid {tid}): \
+                     <frame-trace mutex was held at crash time; not waiting on it>"
+                )]);
+            };
+            if frames.is_empty() {
+                return Some(vec![format!(
+                    "Java frames (faulting thread {name:?}, tid {tid}): <none published yet>"
+                )]);
+            }
+            let mut lines = vec![format!(
+                "Java frames (faulting thread {:?}, tid {}, {} frame(s), published at the \
+                 last blocking/safepoint deposit — may lag the faulting instruction):",
+                name,
+                tid,
+                frames.len()
+            )];
+            for entry in frames.iter().take(max_frames) {
+                let source = entry.source_file.as_deref().unwrap_or("<unknown>");
+                lines.push(format!(
+                    "  at {}.{}({}:{})",
+                    entry.class_name, entry.method_name, source, entry.line_number
+                ));
+            }
+            if frames.len() > max_frames {
+                lines.push(format!("  ... ({} more)", frames.len() - max_frames));
+            }
+            Some(lines)
+        })
+        .ok()
+        .flatten()
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -4305,5 +4435,175 @@ mod tests {
                 "{cls} has no recovery path and must NOT be swallowed",
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Per-OS-thread frame-trace publication (startup-and-diagnostics.md §6.3)
+    //
+    // Every test below runs the publication inside its OWN spawned thread. The
+    // cell is thread-local, so doing otherwise would let cargo's test harness
+    // (which reuses threads) leak one test's publication into the next.
+    // -----------------------------------------------------------------------
+
+    fn entry(class: &str, method: &str, line: i32) -> cratonvm_native_api::StackTraceEntry {
+        cratonvm_native_api::StackTraceEntry {
+            class_name: class.into(),
+            method_name: method.into(),
+            source_file: Some("Probe.java".into()),
+            line_number: line,
+            byte_code_index: 0,
+            class_id: None,
+            method_index: None,
+        }
+    }
+
+    fn handle(entries: Vec<cratonvm_native_api::StackTraceEntry>) -> PublishedTraceHandle {
+        Arc::new(parking_lot::Mutex::new(entries))
+    }
+
+    #[test]
+    fn an_unpublished_os_thread_reports_nothing_so_the_primordial_path_still_runs() {
+        std::thread::spawn(|| {
+            assert!(faulting_thread_java_stack_lines(64).is_none());
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn a_published_worker_renders_its_own_frames_with_its_own_identity() {
+        std::thread::spawn(|| {
+            let _guard = PublishedFrameTrace::publish(
+                "pool-1-thread-3",
+                77,
+                handle(vec![entry("com/example/Svc", "run", 42)]),
+            );
+            let lines = faulting_thread_java_stack_lines(64).expect("published");
+            assert!(
+                lines[0].contains("pool-1-thread-3") && lines[0].contains("77"),
+                "header must name the faulting thread, got {:?}",
+                lines[0]
+            );
+            assert_eq!(lines[1], "  at com/example/Svc.run(Probe.java:42)");
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn dropping_the_guard_unpublishes_so_a_carrier_never_reports_a_stale_mount() {
+        std::thread::spawn(|| {
+            {
+                let _guard =
+                    PublishedFrameTrace::publish("vt-1", 1, handle(vec![entry("A", "a", 1)]));
+                assert!(faulting_thread_java_stack_lines(8).is_some());
+            }
+            assert!(
+                faulting_thread_java_stack_lines(8).is_none(),
+                "an unmounted carrier must not still advertise the continuation's stack"
+            );
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn a_carrier_mounting_one_continuation_after_another_reports_the_current_one() {
+        std::thread::spawn(|| {
+            for (name, tid) in [("vt-1", 1u64), ("vt-2", 2), ("vt-3", 3)] {
+                let _guard = PublishedFrameTrace::publish(
+                    name,
+                    tid,
+                    handle(vec![entry("Task", name, tid as i32)]),
+                );
+                let lines = faulting_thread_java_stack_lines(8).expect("mounted");
+                assert!(lines[0].contains(name), "got {:?}", lines[0]);
+                assert!(lines[1].contains(&format!("Task.{name}")));
+            }
+            assert!(faulting_thread_java_stack_lines(8).is_none());
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn a_nested_publication_restores_the_outer_one_rather_than_blanking_the_cell() {
+        std::thread::spawn(|| {
+            let _outer =
+                PublishedFrameTrace::publish("outer", 10, handle(vec![entry("O", "o", 1)]));
+            {
+                let _inner =
+                    PublishedFrameTrace::publish("inner", 11, handle(vec![entry("I", "i", 2)]));
+                assert!(faulting_thread_java_stack_lines(8).unwrap()[0].contains("inner"));
+            }
+            let lines = faulting_thread_java_stack_lines(8).expect("outer must come back");
+            assert!(lines[0].contains("outer"), "got {:?}", lines[0]);
+            assert_eq!(lines[1], "  at O.o(Probe.java:1)");
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn a_held_frame_trace_mutex_is_reported_not_waited_on() {
+        std::thread::spawn(|| {
+            let trace = handle(vec![entry("A", "a", 1)]);
+            let _guard = PublishedFrameTrace::publish("worker", 5, trace.clone());
+            // Exactly the crash-time situation: the faulting thread was inside
+            // a frame-trace republication when it died. Blocking here would
+            // turn a diagnosable crash into a hang.
+            let _held = trace.lock();
+            let lines = faulting_thread_java_stack_lines(8).expect("published");
+            assert_eq!(lines.len(), 1);
+            assert!(lines[0].contains("not waiting on it"), "got {:?}", lines[0]);
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn an_empty_trace_says_so_rather_than_rendering_a_bare_header() {
+        std::thread::spawn(|| {
+            let _guard = PublishedFrameTrace::publish("worker", 5, handle(Vec::new()));
+            let lines = faulting_thread_java_stack_lines(8).expect("published");
+            assert_eq!(lines.len(), 1);
+            assert!(
+                lines[0].contains("<none published yet>"),
+                "got {:?}",
+                lines[0]
+            );
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn a_deep_stack_is_truncated_with_a_count_of_what_was_dropped() {
+        std::thread::spawn(|| {
+            let frames: Vec<_> = (0..10).map(|i| entry("C", "m", i)).collect();
+            let _guard = PublishedFrameTrace::publish("worker", 5, handle(frames));
+            let lines = faulting_thread_java_stack_lines(4).expect("published");
+            // header + 4 frames + the "... (6 more)" line
+            assert_eq!(lines.len(), 6);
+            assert!(lines[5].contains("6 more"), "got {:?}", lines[5]);
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn publication_is_per_os_thread_and_never_bleeds_across_workers() {
+        let a = std::thread::spawn(|| {
+            let _guard = PublishedFrameTrace::publish("A", 1, handle(vec![entry("A", "a", 1)]));
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            faulting_thread_java_stack_lines(8).expect("A")[0].clone()
+        });
+        let b = std::thread::spawn(|| {
+            let _guard = PublishedFrameTrace::publish("B", 2, handle(vec![entry("B", "b", 2)]));
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            faulting_thread_java_stack_lines(8).expect("B")[0].clone()
+        });
+        assert!(a.join().unwrap().contains("\"A\""));
+        assert!(b.join().unwrap().contains("\"B\""));
     }
 }

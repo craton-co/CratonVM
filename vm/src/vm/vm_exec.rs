@@ -2006,6 +2006,23 @@ fn resume_virtual_continuation(shared: std::sync::Arc<SharedVm>, vt_id: u64) {
         return;
     };
     let tid = thread.thread_id;
+    // CRASH DIAGNOSTICS (`startup-and-diagnostics.md` §6.3): publish this
+    // continuation's frame trace into the CARRIER's thread-local cell for the
+    // duration of the mount, so a fault while it is running renders *its* Java
+    // stack instead of the primordial thread's. Deliberately here and not at
+    // `install_runtime` (which runs on the spawning thread, not the carrier):
+    // a carrier hosts many continuations over its life, and the report has to
+    // name the one that was actually mounted. The guard restores the previous
+    // occupant on every exit path — normal return, `ContinuationYield` unmount,
+    // the missing-`java_thread_obj` bail — so the cell never outlives a mount.
+    //
+    // This is the crash class the primordial-only publication misses by
+    // construction: virtual-thread resume heap corruption faults on a carrier.
+    let _crash_frames = super::vm_util::PublishedFrameTrace::publish(
+        &thread.name,
+        tid.0,
+        thread.frame_trace.clone(),
+    );
     // Publish this mount's identity BEFORE leaving the blocked region.
     //
     // `check_post_block_gc` below turns this thread back into a COUNTED
@@ -7074,6 +7091,21 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             shared_arc
                 .threads.thread_registry
                 .set_frame_trace(tid, jvm_thread.frame_trace.clone());
+            // CRASH DIAGNOSTICS (`startup-and-diagnostics.md` §6.3): the same
+            // handle, additionally published into THIS OS thread's local cell.
+            // The registry copy serves cross-thread readers (getStackTrace,
+            // dumpThreads); this one serves the crash handler, which runs on
+            // the faulting thread and until now could only render the
+            // primordial thread's frames — so a SIGSEGV or a panic on a worker
+            // arrived with no Java context at all, which is precisely the shape
+            // of the STW-takeover deadlock reports. TLS rather than a shared
+            // registry keeps the read lock-free; the guard un-publishes when
+            // this worker's closure returns.
+            let _crash_frames = super::vm_util::PublishedFrameTrace::publish(
+                &name,
+                tid.0,
+                jvm_thread.frame_trace.clone(),
+            );
             // Share the optional VM-side breadcrumb for STW diagnostics.
             shared_arc
                 .threads.thread_registry
@@ -7612,18 +7644,39 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 &self.thread.frames,
             );
         }
-        // Another thread: return its last-published (line-less) frame snapshot —
-        // for a parked thread this is the blocking call site. Resolve line
-        // numbers from the BCI now that we hold the ClassStore (so a dump still
-        // gets source lines without paying for them at every deposit).
+        // Another thread: return its last-published frame snapshot — for a
+        // parked thread this is the blocking call site.
         let tid = resolve_thread_id_from_thread_obj(self.shared, thread_obj);
         let Some(tid) = tid else {
             return Vec::new();
         };
-        // Line-less snapshot (class.method + BCI). The published entry doesn't
-        // carry the ClassId/descriptor needed to resolve source lines, but
-        // class.method is sufficient to pinpoint where a parked thread is stuck.
-        self.shared.threads.thread_registry.frame_trace_of(tid)
+        // CR-CLO-1 (`docs/internal/arch-2026-07-26/cross-owner-closeout.md` §6).
+        //
+        // Two stale comments used to sit here. The first claimed line numbers
+        // were resolved "now that we hold the ClassStore" — and then called the
+        // UNRESOLVED `frame_trace_of`, every entry of which carries
+        // `line_number == -1` (the deposit path is `capture_frames_no_lines`,
+        // which is lock-free by design and must stay that way). The second
+        // claimed the published entry "doesn't carry the ClassId/descriptor
+        // needed to resolve source lines"; it has carried `class_id` for some
+        // time, and the eager path now also carries `method_index`. Net effect
+        // of believing them: every cross-thread thread dump printed line -1.
+        //
+        // `frame_trace_of_resolved` is `frame_trace_of` followed by
+        // `stackwalker::resolve_line_numbers_in_place`, run AFTER the registry
+        // lock is dropped (holding L5 across a `ClassStore` walk would invert
+        // the usual order) and against the returned copy, so the published
+        // snapshot stays exactly as deposited for the next reader. The resolver
+        // is fail-closed: it fills an unknown with the line an eager capture
+        // would have produced or leaves -1, never writes a wrong line, and
+        // never touches an entry that already has one — including the -2 native
+        // sentinel. The `class_manager.read()` is the same borrow the
+        // current-thread arm above already takes.
+        let cm = self.shared.classes.class_manager.read();
+        self.shared
+            .threads
+            .thread_registry
+            .frame_trace_of_resolved(tid, &cm.class_store)
     }
 
     fn thread_jmx_snapshot(
@@ -21512,5 +21565,179 @@ mod tests {
             Value::Long(1),
             "successful CAS must persist with the declared `J` tag"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // CR-CLO-1 — `thread_stack_trace`'s cross-thread arm
+    // (`docs/internal/arch-2026-07-26/vm-exec-closeout.md` §1)
+    // -----------------------------------------------------------------------
+
+    fn line_less_entry(class_id: ClassId, method: &str, bci: i32) -> StackTraceEntry {
+        StackTraceEntry {
+            class_name: Arc::from("probe/Target"),
+            method_name: Arc::from(method),
+            source_file: Some(Arc::from("Target.java")),
+            // Exactly what the lock-free deposit path publishes.
+            line_number: -1,
+            byte_code_index: bci,
+            class_id: Some(class_id),
+            method_index: None,
+        }
+    }
+
+    /// The bug CR-CLO-1 names: the arm's comment claimed lines were resolved,
+    /// the call was the unresolved reader, and every dumped frame read `-1`.
+    /// Pin both halves — the raw reader still yields `-1` (that is its
+    /// documented contract, and the lock-free depositor depends on it), and the
+    /// reader the arm now uses fills the line in.
+    #[test]
+    fn a_cross_thread_dump_now_carries_source_lines() {
+        use crate::runtime::stackwalker::test_support::{named_method, store_with};
+        use cratonvm_reader::attribute::LineNumberEntry;
+
+        let (store, cid) = store_with(vec![named_method(
+            "run",
+            "()V",
+            vec![LineNumberEntry {
+                start_pc: 0,
+                line_number: 91,
+            }],
+        )]);
+        let shared = test_shared();
+        let tid = ThreadId(0xC101);
+        shared
+            .threads
+            .thread_registry
+            .register(tid, "cr-clo-1-worker", None);
+        let published = Arc::new(parking_lot::Mutex::new(vec![line_less_entry(
+            cid, "run", 0,
+        )]));
+        shared
+            .threads
+            .thread_registry
+            .set_frame_trace(tid, published.clone());
+
+        let raw = shared.threads.thread_registry.frame_trace_of(tid);
+        assert_eq!(
+            raw[0].line_number, -1,
+            "the deposit path is line-less by design; if this ever changes, the \
+             cross-thread arm's premise changes with it"
+        );
+
+        let resolved = shared
+            .threads
+            .thread_registry
+            .frame_trace_of_resolved(tid, &store);
+        assert_eq!(
+            resolved[0].line_number, 91,
+            "this is the call `thread_stack_trace`'s cross-thread arm makes"
+        );
+    }
+
+    /// The published snapshot belongs to the *thread being dumped*, not to the
+    /// dumper. Resolving must not write through to it, or one dump would
+    /// mutate what a concurrent dump (or the crash handler) sees.
+    #[test]
+    fn resolving_a_dump_leaves_the_published_snapshot_untouched() {
+        use crate::runtime::stackwalker::test_support::{named_method, store_with};
+        use cratonvm_reader::attribute::LineNumberEntry;
+
+        let (store, cid) = store_with(vec![named_method(
+            "run",
+            "()V",
+            vec![LineNumberEntry {
+                start_pc: 0,
+                line_number: 91,
+            }],
+        )]);
+        let shared = test_shared();
+        let tid = ThreadId(0xC102);
+        shared
+            .threads
+            .thread_registry
+            .register(tid, "cr-clo-1-worker", None);
+        let published = Arc::new(parking_lot::Mutex::new(vec![line_less_entry(
+            cid, "run", 0,
+        )]));
+        shared
+            .threads
+            .thread_registry
+            .set_frame_trace(tid, published.clone());
+
+        let first = shared
+            .threads
+            .thread_registry
+            .frame_trace_of_resolved(tid, &store);
+        assert_eq!(first[0].line_number, 91);
+        assert_eq!(
+            published.lock()[0].line_number,
+            -1,
+            "resolution must run on the returned copy, not the deposited one"
+        );
+        let second = shared
+            .threads
+            .thread_registry
+            .frame_trace_of_resolved(tid, &store);
+        assert_eq!(second[0].line_number, 91, "and it must be repeatable");
+    }
+
+    /// Fail-closed, end to end: an unknown class (the `ClassStore` the dumper
+    /// holds is not the one the frame was captured against — e.g. the class was
+    /// unloaded) drops the *line*, never the frame. A thread dump that loses
+    /// the call site is worse than one that loses the line.
+    #[test]
+    fn a_dump_of_a_thread_whose_class_is_gone_keeps_the_frame() {
+        use crate::runtime::stackwalker::test_support::{named_method, store_with};
+
+        use cratonvm_reader::attribute::LineNumberEntry;
+
+        let (mut store, cid) = store_with(vec![named_method(
+            "run",
+            "()V",
+            vec![LineNumberEntry {
+                start_pc: 0,
+                line_number: 91,
+            }],
+        )]);
+        let shared = test_shared();
+        let tid = ThreadId(0xC103);
+        shared
+            .threads
+            .thread_registry
+            .register(tid, "cr-clo-1-worker", None);
+        shared.threads.thread_registry.set_frame_trace(
+            tid,
+            Arc::new(parking_lot::Mutex::new(vec![line_less_entry(
+                cid, "run", 0,
+            )])),
+        );
+        // The class the frame was captured against is unloaded between the
+        // deposit and the dump — `ClassId`s are never reused, so this can only
+        // ever fail closed.
+        let _ = store.remove(cid);
+
+        let resolved = shared
+            .threads
+            .thread_registry
+            .frame_trace_of_resolved(tid, &store);
+        assert_eq!(resolved.len(), 1, "the frame itself must survive");
+        assert_eq!(resolved[0].line_number, -1);
+        assert_eq!(&*resolved[0].method_name, "run");
+    }
+
+    /// A thread that never registered (or has already been reaped) must yield
+    /// an empty dump, not a panic — `thread_stack_trace` is reachable from
+    /// `ThreadMXBean.dumpAllThreads` while threads are exiting.
+    #[test]
+    fn a_dump_of_an_unknown_thread_is_empty_not_a_panic() {
+        use crate::runtime::stackwalker::test_support::{named_method, store_with};
+
+        let (store, _cid) = store_with(vec![named_method("run", "()V", Vec::new())]);
+        let shared = test_shared();
+        assert!(shared
+            .threads
+            .thread_registry
+            .frame_trace_of_resolved(ThreadId(0xDEAD), &store)
+            .is_empty());
     }
 }
