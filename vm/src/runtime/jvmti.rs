@@ -1184,6 +1184,19 @@ impl JvmtiEventManager {
         None
     }
 
+    /// Fire ClassLoad.
+    ///
+    /// Panic-safe, and load-bearing here in a way it is not for most events:
+    /// this is reached from `ClassManager::define_class_shared_with_options`
+    /// (see the re-entrancy notes above `install_class_load_hook` in
+    /// `classloading/src/class_manager.rs`) while the caller still holds the
+    /// L10 `ClassRealm::class_manager` **write** guard. That guard is a
+    /// `parking_lot::RwLock`, which does not poison — so an agent callback
+    /// that panicked would unwind straight through it and release it
+    /// silently, publishing a half-built `ClassManager` (the class is in the
+    /// store with its vtable installed, but the define path never finished)
+    /// to every later reader with no indication anything went wrong.
+    /// Containing the panic here keeps the unwind out of the guard entirely.
     pub fn fire_class_load(&self, thread: ThreadId, class_id: ClassId) {
         if !self.is_event_enabled(JvmtiEventKind::ClassLoad, Some(thread)) {
             return;
@@ -1191,11 +1204,16 @@ impl JvmtiEventManager {
         self.record_event(JvmtiEventKind::ClassLoad);
         if let Ok(cbs) = self.callbacks.read() {
             if let Some(ref cb) = cbs.class_load {
-                cb(thread, class_id);
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    cb(thread, class_id)
+                }));
             }
         }
     }
 
+    /// Fire ClassPrepare. Panic-safe for the same reason as
+    /// [`Self::fire_class_load`] — it fires from the same place, under the
+    /// same held class-manager write guard.
     pub fn fire_class_prepare(&self, thread: ThreadId, class_id: ClassId) {
         if !self.is_event_enabled(JvmtiEventKind::ClassPrepare, Some(thread)) {
             return;
@@ -1203,7 +1221,9 @@ impl JvmtiEventManager {
         self.record_event(JvmtiEventKind::ClassPrepare);
         if let Ok(cbs) = self.callbacks.read() {
             if let Some(ref cb) = cbs.class_prepare {
-                cb(thread, class_id);
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    cb(thread, class_id)
+                }));
             }
         }
     }
@@ -4679,6 +4699,64 @@ mod tests {
         fire_method_entry(tid, 999); // agent panics
         fire_method_entry(tid, mid + 1); // must still deliver
         assert_eq!(ok_count.load(Ordering::SeqCst), 3);
+    }
+
+    /// A panicking ClassLoad / ClassPrepare callback must not propagate out
+    /// of the fire_* path.
+    ///
+    /// This matters more than for the other events: both fire from
+    /// `ClassManager::define_class_shared_with_options` while the caller
+    /// holds the L10 `class_manager` **write** guard. `parking_lot::RwLock`
+    /// does not poison, so an escaping unwind would release that guard
+    /// silently and publish a half-built `ClassManager`. See the re-entrancy
+    /// notes above `install_class_load_hook` in
+    /// `classloading/src/class_manager.rs`.
+    #[test]
+    fn class_load_prepare_agent_panic_is_contained() {
+        let _lock = global_test_lock();
+        let mgr = ensure_global_manager();
+        reset_global_manager_for_tests();
+
+        let tid: ThreadId = 21;
+        let poison: ClassId = 999;
+        mgr.set_event_notification_mode(EventMode::Enable, JvmtiEventKind::ClassLoad, Some(tid))
+            .unwrap();
+        mgr.set_event_notification_mode(EventMode::Enable, JvmtiEventKind::ClassPrepare, Some(tid))
+            .unwrap();
+
+        let calls = Arc::new(AtomicU32::new(0));
+        let (cl, cp) = (calls.clone(), calls.clone());
+        mgr.set_event_callbacks(EventCallbacks {
+            class_load: Some(Box::new(move |_t, c| {
+                cl.fetch_add(1, Ordering::SeqCst);
+                if c == poison {
+                    panic!("agent panic in ClassLoad");
+                }
+            })),
+            class_prepare: Some(Box::new(move |_t, c| {
+                cp.fetch_add(1, Ordering::SeqCst);
+                if c == poison {
+                    panic!("agent panic in ClassPrepare");
+                }
+            })),
+            ..Default::default()
+        })
+        .unwrap();
+
+        // Each of these would unwind into the caller before the fix. Reaching
+        // the assertion below at all is the property under test.
+        fire_class_load(tid, 1);
+        fire_class_load(tid, poison);
+        fire_class_load(tid, 2);
+        fire_class_prepare(tid, 1);
+        fire_class_prepare(tid, poison);
+        fire_class_prepare(tid, 2);
+
+        // 3 ClassLoad + 3 ClassPrepare: dispatch survives the panic and keeps
+        // delivering, rather than the callback being torn down or skipped.
+        assert_eq!(calls.load(Ordering::SeqCst), 6);
+        assert_eq!(mgr.event_count(JvmtiEventKind::ClassLoad), 3);
+        assert_eq!(mgr.event_count(JvmtiEventKind::ClassPrepare), 3);
     }
 
     /// T17.Δ.4 — registering a watchpoint idempotently sets access and
