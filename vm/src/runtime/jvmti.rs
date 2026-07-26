@@ -823,6 +823,40 @@ impl fmt::Debug for EventCallbacks {
 /// it dispatches to every attached env's callback table in turn, matching the
 /// JVMTI spec semantics where multiple agents may subscribe to the same event.
 ///
+/// **That contract is currently only partially implemented.** 11 of the 30
+/// `fire_*` methods run the `snapshot_envs()` loop; the rest dispatch only to
+/// this manager's own `callbacks` table, so an attached env silently receives
+/// nothing for them. There is no diagnostic when this happens. Still missing
+/// the loop, as of 2026-07-26:
+///
+/// ```text
+/// vm_init          vm_death          thread_start      thread_end
+/// class_file_load_hook               exception         exception_catch
+/// breakpoint       gc_start          gc_finish         monitor_contended_enter
+/// monitor_contended_entered          monitor_wait      monitor_waited
+/// compiled_method_load               compiled_method_unload
+/// dynamic_code_generated
+/// ```
+///
+/// `class_load` / `class_prepare` were in that list and now dispatch per-env;
+/// the others were left alone rather than swept, because two of them need a
+/// semantic decision first, not a copied loop: `class_file_load_hook` returns
+/// replacement bytes (with N agents, whose transform wins — first, last, or
+/// chained?), and `breakpoint` / `exception` are the events where double
+/// delivery to an agent that registered on both tables would be most visible.
+///
+/// Note also that the per-env loops do *not* consult the env's own enable
+/// state — `is_event_enabled` is checked once against this manager, then every
+/// attached env's callback is invoked. An env that never enabled the event
+/// still gets it. That is the established behaviour of every existing loop, so
+/// the two added here match it deliberately rather than inventing a second
+/// semantics; it is worth revisiting if per-env enablement ever matters.
+///
+/// Scope check before relying on any of this: `register_env` has no callers
+/// outside tests, and agents loaded via `-agentpath:` reach a *different*
+/// manager entirely (`vm/src/jvmti/`, see the D14 note at the top of this
+/// file). Per-env delivery here is therefore test-only reachable today.
+///
 /// A per-manager [`AtomicBool`] is used as the no-agent fast path: when no
 /// environment has enabled any event and no callback is registered, the flag
 /// is false and fire_ methods exit in a single atomic load. This keeps the
@@ -1247,9 +1281,17 @@ impl JvmtiEventManager {
         self.record_event(JvmtiEventKind::ClassLoad);
         if let Ok(cbs) = self.callbacks.read() {
             if let Some(ref cb) = cbs.class_load {
-                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    cb(thread, class_id)
-                }));
+                let _ =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cb(thread, class_id)));
+            }
+        }
+        for env in self.snapshot_envs() {
+            if let Ok(cbs) = env.event_manager.callbacks.read() {
+                if let Some(ref cb) = cbs.class_load {
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        cb(thread, class_id)
+                    }));
+                }
             }
         }
     }
@@ -1264,9 +1306,17 @@ impl JvmtiEventManager {
         self.record_event(JvmtiEventKind::ClassPrepare);
         if let Ok(cbs) = self.callbacks.read() {
             if let Some(ref cb) = cbs.class_prepare {
-                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    cb(thread, class_id)
-                }));
+                let _ =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cb(thread, class_id)));
+            }
+        }
+        for env in self.snapshot_envs() {
+            if let Ok(cbs) = env.event_manager.callbacks.read() {
+                if let Some(ref cb) = cbs.class_prepare {
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        cb(thread, class_id)
+                    }));
+                }
             }
         }
     }
@@ -4376,6 +4426,51 @@ mod tests {
         em.unregister_env(&env).unwrap();
         em.fire_object_free(789);
         assert_eq!(*agent_tags.lock().unwrap(), vec![123, 456]);
+    }
+
+    /// ClassLoad / ClassPrepare must reach attached envs, not just the
+    /// manager's own callback table.
+    ///
+    /// Both events used to dispatch only to `self.callbacks`, so an agent
+    /// holding its own `JvmtiEnv` silently received neither — no error, no
+    /// diagnostic, just nothing. That contradicted the delivery contract
+    /// documented on `JvmtiEventManager`. This pins the fix; see the same doc
+    /// comment for the events that still lack per-env delivery.
+    #[test]
+    fn test_env_receives_class_load_and_prepare() {
+        let em = JvmtiEventManager::new();
+        let tid: ThreadId = 3;
+        em.set_event_notification_mode(EventMode::Enable, JvmtiEventKind::ClassLoad, Some(tid))
+            .unwrap();
+        em.set_event_notification_mode(EventMode::Enable, JvmtiEventKind::ClassPrepare, Some(tid))
+            .unwrap();
+
+        let env = Arc::new(JvmtiEnv::new());
+        let loaded = Arc::new(Mutex::new(Vec::<ClassId>::new()));
+        let prepared = Arc::new(Mutex::new(Vec::<ClassId>::new()));
+        let (l, p) = (loaded.clone(), prepared.clone());
+        env.event_manager
+            .set_event_callbacks(EventCallbacks {
+                class_load: Some(Box::new(move |_t, c| l.lock().unwrap().push(c))),
+                class_prepare: Some(Box::new(move |_t, c| p.lock().unwrap().push(c))),
+                ..Default::default()
+            })
+            .unwrap();
+
+        em.register_env(&env).unwrap();
+        em.fire_class_load(tid, 11);
+        em.fire_class_load(tid, 22);
+        em.fire_class_prepare(tid, 11);
+
+        assert_eq!(*loaded.lock().unwrap(), vec![11, 22]);
+        assert_eq!(*prepared.lock().unwrap(), vec![11]);
+
+        // Unregistering must stop delivery, same as every other per-env event.
+        em.unregister_env(&env).unwrap();
+        em.fire_class_load(tid, 33);
+        em.fire_class_prepare(tid, 33);
+        assert_eq!(*loaded.lock().unwrap(), vec![11, 22]);
+        assert_eq!(*prepared.lock().unwrap(), vec![11]);
     }
 
     #[test]
