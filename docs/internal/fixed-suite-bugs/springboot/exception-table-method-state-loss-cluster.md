@@ -64,7 +64,21 @@ from when `LoggerContext` was synthetically allocated and NPE'd on
 `monitorenter` — a premise that stopped holding once `LoggerContext`
 construction moved to real bytecode, but nobody removed the now-stale
 stub. `DefaultLogbackConfigurationTests` went from 4/7 to 6/7 (the last
-failure is an unrelated Mockito/`java.io.Console` mocking limitation).
+failure was ~~an unrelated Mockito/`java.io.Console` mocking
+limitation~~ — **retraction, 2026-07-26: this was also a fixable native
+gap, not a real limitation.** `Console`'s `<clinit>` (JDK 25) calls a
+`private static native int ttyStatus()` that CratonVM never registered,
+so `<clinit>` threw `UnsatisfiedLinkError`; Mockito's
+`InlineBytecodeGenerator` triggers class-init before mocking specifically
+so it can report a clean `MockitoException` instead of an `NCDFE`, and
+that's what surfaced: "Mockito cannot mock this class: class
+java.io.Console". Verified against real JDK 25 on the same host/classpath
+that real HotSpot passes this test — confirming it was never a genuine
+Mockito/Console limitation. Fixed by registering `java/io/Console
+.ttyStatus()I` → `0` (mirrors the pre-JDK-25 `istty()Z` → `false`
+convention already used for the same class). `DefaultLogbackConfigurationTests`
+is now 7/7. See `classutils-forname-platform-loader-false-positive.md`'s
+2026-07-26 update.
 
 ## What would have ruled all three out immediately
 
