@@ -392,11 +392,3 @@ level) -- likely a similar family to the KEYEDLOCK-COMPUTE.1 fix just
 landed (String read shortly after construction/mutation reading a stale
 value) but not yet isolated to one method. Flagging for a future session
 rather than continuing further given time already spent this session.
-
-## HIB-BIGINTEGER-AIOOBE.1 — CLAIMED 2026-07-26 10:24 UTC
-
-Branch `fix/jit-ban-sweep-20260725`. Whole `java/math/MutableBigInteger`
-class banned unconditionally, skip_list.rs ~L768-785
-(`BigInteger.smallToString` AIOOBE "Index 2 out of bounds for length
-2"). Explicitly noted as never having a deterministic reproducer.
-Standalone (java.math only) -- building a stress repro to try to get one.
