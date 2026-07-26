@@ -65,7 +65,7 @@ use crate::registry::{NativeCallback, NativeKind, NativeMethodRegistry};
 /// which is a bounds-checked array index — no hashing, no string walk.
 ///
 /// Handles are only meaningful against the registry that issued them. In a
-/// running VM there is exactly one (`shared.native_methods`), built during boot
+/// running VM there is exactly one (`shared.natives.native_methods`), built during boot
 /// and never replaced; tests that build their own `NativeMethodRegistry` must
 /// not mix handles between instances. Redeeming a foreign handle is *safe* (it
 /// either bounds-checks to `None` or returns some other registered native), but
@@ -229,7 +229,7 @@ impl NativeCallSite {
 
     /// The resolved callback for this call site, or `None` if no native is
     /// registered for the triple. This is the drop-in replacement for
-    /// `shared.native_methods.find(class, method, desc)`.
+    /// `shared.natives.native_methods.find(class, method, desc)`.
     #[inline]
     pub fn callback(
         &self,
