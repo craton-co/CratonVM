@@ -5,6 +5,32 @@
 **Files changed:** `vm/src/config.rs`, `vm-cli/src/main.rs`
 **Status:** landed (default-on, no feature gate, no env gate)
 
+**Basis:** `dev` @ **`6495a191c`**. Every line number, measurement and
+follow-up citation below was (re-)derived against that commit. `dev` is
+advanced concurrently by other sessions here, so citations drift — the
+*greppable strings* are given alongside the line numbers so they can be
+re-found.
+
+> The work was first written against `e4e4053bb` (= `origin/main`,
+> 2026-07-23) and then merged forward onto `6495a191c`. The merge was clean:
+> `dev`'s 115-line drift in `vm-cli/src/main.rs` is entirely the `SharedVm`
+> realm extraction (`vm.shared.heap` → `vm.shared.mem.heap`,
+> `class_manager` → `classes.class_manager`, `thread_registry` →
+> `threads.thread_registry`, `native_methods` → `natives.native_methods`,
+> `swallow_counter` → `debug.swallow_counter`) inside `run()`'s
+> exception-reporting section, plus two cosmetic changes — no overlap with
+> the argv preprocessing, the pre-clap `-version` handling, the clap wiring,
+> or the config-construction site this change touches. `dev`'s 2-line drift
+> in `vm/src/config.rs` is a doc-path rename only
+> (`docs/known-issues/h2-suite-bugs/…` → `docs/known-issues/h2/…`).
+>
+> **Checked for duplicate work:** `dev` added `types/src/flags.rs` (2,137
+> lines), a centralised typed config for the `CRATONVM_*` **environment**
+> variables. It contains no JDK-mode selection and no CLI-flag handling, so
+> there is no overlap with this change and nothing here duplicates it. (It
+> does contain ~15 per-class `CRATONVM_SYNTHETIC_*` toggles — a *different*,
+> finer-grained synthetic-vs-real surface that reinforces §7; see §7.3.)
+
 ---
 
 ## 1. Summary
@@ -72,14 +98,25 @@ instead of contradicting it on JDK-less machines. (A separate agent owns
 ### 2.3 The compounding defect: the "fallback" fell back to *nothing*
 
 This is the part that makes the old behaviour worse than merely
-non-deterministic, and it was verified in this session:
+non-deterministic. **Re-verified on `dev` @ `6495a191c`** — all three legs
+hold, with the line numbers re-derived (they moved substantially: the realm
+extraction shifted `vm_init.rs` by ~440 lines):
 
 * The ~5,200 stubs are registered inside `#[cfg(feature = "synthetic-jdk")]`
-  in `vm/src/vm/vm_init.rs:1382`.
+  — **`vm/src/vm/vm_init.rs:937`**, guarding
+  `if config.use_synthetic_jdk { register_builtins(&mut native_methods); … }`
+  at `:941`. The `#[cfg(not(feature = "synthetic-jdk"))]` real-JDK-only arm
+  is at `:1423`.
+  *(main line numbers were `:1382` / `:1386` / `:1868`.)*
 * `synthetic-jdk` is **not** a default feature of `cratonvm-vm` or
-  `cratonvm-cli` (`vm/Cargo.toml:43`, `vm-cli/Cargo.toml:92`).
-* Synthetic mode *also* suppresses boot-classpath discovery
-  (`vm_init.rs:1037`: `if config.boot_classpath.is_empty() && !config.use_synthetic_jdk`).
+  `cratonvm-cli`:
+  `vm/Cargo.toml:37` (`default = ["awt", "experimental-tls", …]` — no
+  `synthetic-jdk`) with the feature itself at `:43`;
+  `vm-cli/Cargo.toml:79` (`default = ["mimalloc"]`) with the feature at `:92`.
+* Synthetic mode *also* suppresses boot-classpath discovery —
+  **`vm/src/vm/vm_init.rs:539`**:
+  `let boot_cp = if config.boot_classpath.is_empty() && !config.use_synthetic_jdk {`.
+  *(main line number was `:1037`.)*
 
 So in a stock `cargo build -p cratonvm-cli` binary, on a machine with no JDK,
 the old autodetection produced `use_synthetic_jdk = true`, which registered
@@ -266,7 +303,11 @@ product decision reserved for the human — see the memo in §7.
 
 Each is source-compatible today; nothing below blocks the build.
 
-1. **`vm/src/runtime/crash_handler.rs`** — the hardware-fault (VEH) report is
+*(All five source citations below re-checked against `dev` @ `6495a191c`;
+line numbers are current.)*
+
+1. **`vm/src/runtime/crash_handler.rs`** (`install_hardware_fault_handler` at
+   `:1159`) — the hardware-fault (VEH) report is
    the one crash path that does not go through the launcher's panic hook, so it
    currently prints a faulting PC and backtrace with no indication of which
    class library was loaded. One line in the report banner:
@@ -313,16 +354,32 @@ explicit, is `native-builtins`' synthetic class library worth its cost?
 
 ### 7.1 The numbers
 
-Measured in this worktree (2026-07-26):
+Re-measured on `dev` @ `6495a191c` (2026-07-26). An earlier count in this
+document was taken on `origin/main` (`e4e4053bb`) and read 561,755 LoC /
+249 files / 43.8 %; the numbers below supersede it.
 
 | metric | value | how |
 |---|---|---|
-| `native-builtins` crate | **561,755 LoC across 249 `.rs` files** | `find native-builtins -name '*.rs' \| xargs cat \| wc -l` |
-| …of which `native-builtins/src` | 513,455 LoC across 136 files | same, `src` only |
-| workspace total (excl. two stray root-level `native-builtins-lib.{dev,merge}.rs` snapshots totalling 169,232 lines) | 1,283,368 LoC | `find . -name '*.rs' -not -path './target/*'` |
-| **`native-builtins` share of the workspace** | **43.8 %** | 561,755 / 1,283,368 |
+| `native-builtins` crate | **569,510 LoC across 280 `.rs` files** | `find native-builtins -name '*.rs' -not -path '*/target/*' -exec cat {} + \| wc -l` |
+| workspace total | **1,307,949 LoC across 793 `.rs` files** | `find . -name '*.rs' -not -path './target/*' -not -path './.git/*' -exec cat {} + \| wc -l` |
+| **`native-builtins` share of the workspace** | **43.5 %** | 569,510 / 1,307,949 |
 | release binary | ~30 MB (as reported in the finding; no release artifact exists in this worktree to re-measure) | `ls -l target/release/cratonvm` |
 | build time attributable to `native-builtins` | **not measured** — this session is forbidden from building | `cargo build --release -p cratonvm-cli --timings`, then read the `cratonvm-native-builtins` bar |
+
+Notes on the re-measurement:
+
+* The orchestrator independently measured 569,235 LoC / 280 files on `dev`.
+  The file count agrees exactly; the 275-line delta is a counting-convention
+  difference (final-newline / exclusion-glob handling) and does not move the
+  ratio. Either figure supports the same conclusion.
+* `main` carried two stray root-level snapshots
+  (`native-builtins-lib.{dev,merge}.rs`, 169,232 lines of duplicated
+  `native-builtins` source) that had to be excluded to get an honest
+  workspace total. **`dev` has removed them**, so the `dev` figures need no
+  such caveat — the 43.5 % is a clean ratio over real source.
+* Both the crate and the workspace grew across the main→dev gap
+  (+7,755 and +24,581 lines respectively), so the ratio is essentially flat:
+  `native-builtins` is not shrinking relative to the rest of the tree.
 
 Two facts sharpen the picture:
 
@@ -331,7 +388,7 @@ Two facts sharpen the picture:
   compiled and linked, because the real-JDK arm calls into it for the ~300
   essential natives plus a set of permanent bridges (`register_concurrent_natives`,
   `register_stamped_lock_natives`, the JMX/`Function$Identity` clusters, the
-  SLF4J binder stubs). So the 44 % is paid on every default build and shipped
+  SLF4J binder stubs). So the 43.5 % is paid on every default build and shipped
   in every default binary, while most of it is unreachable at runtime.
 * The crate is therefore **not** cleanly separable today: "delete
   `native-builtins`" is not the available move. The available moves are about
@@ -350,12 +407,26 @@ Two facts sharpen the picture:
   synthetic lane has already been unbuildable at least once
   (`synthetic-jdk-feature-was-unbuildable-and-untested`). A lane that can rot
   invisibly is worse than no lane.
-* **44 % of the codebase for a non-default mode** is a permanent tax on
-  compile time, binary size, review surface, refactoring cost, and every
-  workspace-wide grep a human does.
+* **43.5 % of the codebase for a non-default mode** (569,510 of 1,307,949
+  lines on `dev` @ `6495a191c`) is a permanent tax on compile time, binary
+  size, review surface, refactoring cost, and every workspace-wide grep a
+  human does. The ratio held flat across the last main→dev gap, so it is not
+  self-correcting.
 * **The design decision it implemented is already reversed.** "No JDK
   dependency" is not what ships. Keeping the implementation of an abandoned
   decision is how `ARCHITECTURE.md` got to be wrong.
+* **The divergence has already leaked into a second, finer-grained escape
+  hatch.** `dev`'s new `types/src/flags.rs` catalogues ~15 per-class
+  `CRATONVM_SYNTHETIC_*` environment toggles (`SYNTHETIC_FILEWRITER`,
+  `SYNTHETIC_RAF`, `SYNTHETIC_AQS`, `SYNTHETIC_ANNOTATIONS`,
+  `SYNTHETIC_RSA`/`DSA`/`EC`/`PQC`, `SYNTHETIC_AGROAL`, `SYNTHETIC_VERTX`, …),
+  several documented as "opt back into the synthetic (known lossy)
+  implementation". Those exist because individual synthetic classes are
+  *worse* than the real ones but something still depends on their behaviour.
+  That is the whole-mode problem in miniature, replicated per class — and it
+  is a live surface, not a historical one. (Note the polarity is already
+  correct there: the consumers want `!synthetic_*_forced`, i.e. real wins by
+  default. Same direction this change takes the whole-mode switch.)
 
 ### 7.3 The case for keeping it
 
@@ -396,7 +467,7 @@ Concretely, in priority order:
    `Function$Identity`, SLF4J binder, the LBQ `drainTo` bridge). Move exactly
    those into a `native-essentials` crate that the default build depends on,
    and leave the rest behind `synthetic-jdk`. This is the only step that
-   actually recovers build time and binary size, and it makes the 44 % figure
+   actually recovers build time and binary size, and it makes the 43.5 % figure
    *mean* something: after the split, whatever remains under the feature is
    provably dead weight in the default build.
 3. **Run the census before deleting anything.** The tooling already exists:
@@ -406,8 +477,9 @@ Concretely, in priority order:
    Tomcat suites in real-JDK mode. Any `SyntheticStub` that is still reached in
    real-JDK mode is a permanent bridge and must move to `native-essentials`
    (this is precisely the mistake the `d8092acb` regression made and had to
-   revert — see the comment at `vm_init.rs:1879`). Everything not reached is a
-   deletion candidate.
+   revert — see the `dev d8092acb` comments at `vm_init.rs:1005`, `:1435` and
+   `:6383` on `dev` @ `6495a191c`; they were at `:1879` on `main`). Everything
+   not reached is a deletion candidate.
 4. **Do not delete the corpus wholesale.** After steps 2–3 the cost of keeping
    the remainder is a feature-gated crate that the default build neither
    compiles into the shipped registration path nor ships bugs from — which is a
