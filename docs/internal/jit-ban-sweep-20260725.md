@@ -296,6 +296,43 @@ available — synthetic repros for this specific bug class have been hard to
 construct faithfully so far (2/2 clean synthetic tests, 1/1 real-app tests
 found real bugs).
 
+## ANTLR.1 blocked, pivoted to TOMCAT-JNDIREALM — then discovered a
+## same-time collision with the other session
+
+Priority item 3 (ANTLR.1, `groovyjarjarantlr4/`) is blocked: exhaustively
+searched every jar on this host, the shaded package doesn't exist anywhere
+(checked groovy-3.0.21/3.0.8/4.0.22 directly, zero `antlr` entries — modern
+Groovy apparently ships it in a separate, unresolved module). Didn't want
+to speculatively fetch dependencies to chase it down. Left unclaimed in the
+shared doc for whoever has a Groovy fixture.
+
+Pivoted to `com/unboundid/` (TOMCAT-JNDIREALM-RDN.1/JIT.2) — real Tomcat
+Linux fixture on this host, ban comment names an exact repro
+(`TestJNDIRealmIntegration`, 76 cases). Ran it: baseline 76/76 pass, ban
+lifted → **SIGSEGV**, stale-pointer/all-zero-header receiver corruption
+during LDAP DN/RDN matching, exactly matching the documented bug. Clean,
+decisive confirmation — **KEEP**.
+
+**Then found the other session (`fix/jit-ban-sweep-20260725`) had
+independently claimed and tested the exact same ban at essentially the same
+timestamp (02:38-02:43 UTC), reaching the identical conclusion with slightly
+more detail (they also ran the `--nojit` differential, confirming JIT-
+specificity, and noted it hangs rather than just crashing at the 120s
+mark).** Their writeup is the more complete one — see
+`docs/known-issues/jit-skip-list-open-bans-20260725.md`'s
+"TOMCAT-JNDIREALM-RDN.1 / JIT.2" section. Removed my own redundant doc file
+rather than commit a duplicate. Independent cross-confirmation isn't
+harmful, but it is wasted effort — **lesson: re-fetch the shared doc's
+claim markers immediately before starting each new item, not just after
+finishing the previous one**, since both sessions are now moving fast
+enough that claims can land within minutes of each other.
+
+Running tally: **4 real-app-confirmed still-needed bans this session**
+(`org/jboss/as/`, `org/h2/`, `com/unboundid/` ×2 sessions independently),
+1 inconclusive synthetic-only test (`org/springframework/util/`), 1 blocked
+for lack of fixture (`groovyjarjarantlr4/`). Nothing in this family has
+been confirmed safely removable yet by either session.
+
 ## Next steps
 
 1. Finish H2/ANTLR-runtime test (this session) — compare `TestFileSystem`

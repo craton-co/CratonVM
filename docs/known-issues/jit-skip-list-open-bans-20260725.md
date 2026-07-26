@@ -30,6 +30,24 @@ is how every cluster below with a "bisected to X" note was actually found.
 It costs zero rebuild time and should be the first move on any of the
 still-OPEN items.
 
+**Shortcut found 2026-07-26 ~02:58 UTC (`fix/jit-ban-sweep2-20260726`):
+skip the whole `is_known_miscompile` match-arm cluster.** Every entry
+inside that function's `matches!(...)` block (HashMap.put/get/resize,
+`Calendar.isFieldSet` (BC-ASN1.1), the ByteBuddy/reflection/JUC entries
+catalogued in `jit-regalloc-callee-saved-clobber-family.md`, etc.) is only
+even *checked* when `callee_saved_gpr_local_homes_enabled()` returns true
+(skip_list.rs ~L1176: `if callee_saved_gpr_local_homes_enabled() &&
+is_known_miscompile(...)`), and that function
+(skip_list.rs ~L3253) defaults to **false** on x86_64 unless a developer
+explicitly sets `CRATONVM_JIT_ENABLE_CALLEE_SAVED_GPR_LOCALS=1` for
+diagnosis. **None of these entries are active in any normal run** (none of
+this session's test commands set that var) — they're already effectively
+"removed" from production's perspective, just kept as a diagnostic legacy
+table. Don't spend real-app-testing effort re-verifying any ban that lives
+inside `is_known_miscompile`'s `matches!` block specifically for this
+reason (BC-ASN1.1 is one example — there may be others in that block worth
+a quick grep before picking a next target).
+
 ## This session's concrete finding: TYPES-ERASURE.1 (NEW, landed)
 
 `com.sun.tools.javac.code.Types.erasure` was an **undiscovered** JIT
@@ -189,8 +207,11 @@ still real correctness bugs worth closing):
 - ES-HAMCREST.1, ES-JIT-DEOPT-GC.1, ES fragile cluster
   (`is_elasticsearch_suite_jit_fragile_cluster`)
 - JSONSMART-PARSER.1, JASPER-JDT.2/.3, WILDFLY-CONTROLLER-JIT.1
-- TOMCAT-JNDIREALM-RDN.1, TOMCAT-JNDIREALM-JIT.2, PROXY-JITCALL.1,
-  SPR-AOT-TESTNG-MAPS.1
+- TOMCAT-JNDIREALM-RDN.1, TOMCAT-JNDIREALM-JIT.2 — **CLAIMED by
+  `fix/jit-ban-sweep2-20260726` / `wt-jitsweep2-20260726`, 2026-07-26
+  ~02:35 UTC** (pivoted here from the blocked ANTLR.1 item above; real
+  Tomcat Linux fixture + named repro test available on this host).
+  PROXY-JITCALL.1, SPR-AOT-TESTNG-MAPS.1
 - REACTOR-ADDCAP.1, REACTOR-FLUXCREATE.1, JETTY-WSIO.1, NETTY.1 — all
   Reactor/Jetty/Netty websocket demand-accounting bugs, share a "JIT
   long/CAS lowering bug" hypothesis across three separate entries; another
@@ -265,6 +286,23 @@ still real correctness bugs worth closing):
    be lifted while the narrow 7-method guard stays as the correctness
    safety net. Plan: find/build a Groovy parse benchmark, compare cold-parse
    wall-clock lifted vs. baseline.
+
+   **BLOCKED 2026-07-26 ~02:35 UTC — no fixture on this host.** Exhaustively
+   searched every jar on the Azure host (`find / -iname '*.jar' | xargs
+   unzip -l | grep groovyjarjarantlr4/...`, zero matches) — the shaded
+   `groovyjarjarantlr4` package this ban targets isn't present anywhere,
+   including in `groovy-3.0.21.jar`/`groovy-3.0.8.jar`/`groovy-4.0.22.jar`
+   (checked directly, no `antlr` entries at all in any of them — modern
+   Groovy apparently ships this in a separate module not yet resolved on
+   this host). Didn't want to speculatively fetch unknown additional
+   dependencies to chase down which exact artifact has it. **Pivoting to
+   TOMCAT-JNDIREALM-RDN.1/JIT.2 (`com/unboundid/`) instead** — real,
+   working Tomcat Linux fixture already confirmed on this host (see
+   `[[tomcat-linux-suite-fixture-location]]` memory /
+   `docs/internal/jit-ban-sweep-20260725.md`), and the ban comment names
+   an exact real repro (`TestJNDIRealmIntegration`, 76-case matrix).
+   Leaving this ANTLR.1 item open/unclaimed for whoever has a Groovy
+   fixture available, or is willing to fetch the right module.
 4. Work down the "Medium" list — each is single-suite, well-scoped, lower
    risk of interacting with concurrent work elsewhere.
 
