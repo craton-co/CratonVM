@@ -1037,6 +1037,59 @@ fn should_skip_jit_internal(
     // unconditionally now" was an overclaim -- it is only JIT-eligible when
     // the blanket ban is ALSO explicitly lifted, which was not tested.
 
+    // SPB.9-COMMONS-LOGGING (2026-07-26, same day as the SPB.9 blanket
+    // slf4j/logback/commons-logging removal above): re-banned
+    // `org/apache/commons/logging/` specifically, UNCONDITIONALLY (not
+    // inside the Conservative-only heuristic block below, unlike most
+    // provisional bans in this file) because this guards a REAL, live-fire
+    // Spring Boot regression with concrete reproduction evidence, not a
+    // suspected/provisional concern.
+    //
+    // `org.springframework.boot.context.logging.LoggingApplicationListenerTests`
+    // went from 16 to 34 failures (of 41) once the blanket SPB.9 removal
+    // landed, with a NEW signature never seen before:
+    // `java.lang.IllegalStateException: Unknown FilterReply value: DENY`
+    // thrown from `ch.qos.logback.classic.Logger.isTraceEnabled` during
+    // `LoggingApplicationListener.initialize` ->
+    // `LogbackLoggingSystemProperties.apply`/`applyRollingPolicy` ->
+    // `PropertySourcesPropertyResolver.getProperty`. `FilterReply` is a
+    // Logback enum (DENY/NEUTRAL/ACCEPT) -- a JIT-caused heap-corruption
+    // signature, the same archetype documented throughout this file (a
+    // miscompiled store elsewhere clobbers an unrelated live object).
+    // Confirmed the regression was JIT-caused (not merely a coincidental
+    // dev-drift correlation) by disabling JIT entirely on the exact
+    // regressed binary (`CRATONVM_DISABLE_JIT=1`): failures dropped back to
+    // 16/41. Bisected the three SPB.9 packages by selectively re-banning
+    // subsets of them in an isolated worktree with incremental rebuilds:
+    // logback-only re-banned -> still 34/41; logback+slf4j re-banned (only
+    // commons-logging left JIT-eligible) -> still 34/41; commons-logging-only
+    // re-banned (logback+slf4j left JIT-eligible) -> back to 16/41, matching
+    // the clean baseline exactly. This isolates the miscompile to
+    // `org/apache/commons/logging/` specifically -- `org/slf4j/` and
+    // `ch/qos/logback/` are genuinely safe to leave JIT-eligible (see the
+    // SPB.9 removal comment above), matching what `SlfLoggingProbe.java`
+    // actually exercised: real Commons Logging was NOT on that probe's
+    // classpath, it used `jcl-over-slf4j`, an API-compatible but
+    // BYTECODE-DIFFERENT implementation of `org/apache/commons/logging/`,
+    // so the probe never actually JIT-compiled the real Commons Logging
+    // 1.3.x classes Spring Boot's real test classpath uses. The one
+    // JIT-dispatched Commons-Logging method observed in a
+    // `CRATONVM_DBG=jit-dispatch` trace of the failing run was
+    // `org/apache/commons/logging/impl/Slf4jLogFactory.access$000()
+    // Lorg/slf4j/Marker;` (Commons Logging 1.3.6's built-in SLF4J adapter's
+    // synthetic private-static-field accessor for its `MARKER` field),
+    // called extremely frequently during per-class logger wiring --
+    // plausible trigger for the miscompile, though the exact JIT lowering
+    // bug for this bytecode shape was not further pinned down (root cause
+    // is "some `org/apache/commons/logging/` method", not yet narrowed to a
+    // single method/bytecode pattern). Not lifted by
+    // `CRATONVM_JIT_ALLOW_PACKAGES` on purpose -- a confirmed corruption bug
+    // should not have a casual opt-out; a developer who genuinely needs to
+    // bisect further can still comment this guard out locally.
+    if class_name.starts_with("org/apache/commons/logging/") {
+        return Some(SkipReason::RustJvmTestFixture);
+    }
+
     if policy == SkipPolicy::Conservative {
         if is_unconditional_hash_miscompile_cluster(class_name, method_name)
             && !package_allowed(class_name, allow_packages)
@@ -1847,34 +1900,35 @@ fn should_skip_jit_internal(
             return Some(SkipReason::RustJvmTestFixture);
         }
 
-        // SPB.9 -- REMOVED 2026-07-26 for the logging-facade classes
-        // themselves (org/slf4j/, ch/qos/logback/,
-        // org/apache/commons/logging/). Originally (Session 114) banned
-        // after `apps/insurance-backend`'s Spring Boot 3.2 boot crashed
-        // with `expected object reference, got int(1)` inside
-        // `SpringApplication.prepareEnvironment` ->
-        // `SystemEnvironmentPropertyMapper.processElementValue`, with the
-        // last JIT-dispatched methods before the crash being a tight
-        // LoggerFactory/Slf4jLog init loop -- a correlation, not a proven
-        // miscompile inside the logging classes themselves. Re-verified
-        // with a standalone probe (`SlfLoggingProbe.java`, real
-        // jcl-over-slf4j + slf4j-api + logback-classic/core jars) driving
-        // `LogFactory.getLog(Class)` for 10 distinct per-class loggers
-        // (simulating component-scan per-class logger wiring) 20000
-        // times, each followed by a real `log.info(...)` call that would
-        // fail on a corrupted reference: baseline, package-allowed, and a
-        // `CRATONVM_JIT_THRESHOLD=1` aggressive pass -- 0 failures in
-        // every configuration. The logging facade classes' own JIT
-        // compilation is genuinely safe.
+        // SPB.9 -- `org/slf4j/` and `ch/qos/logback/` REMOVED 2026-07-26.
+        // Originally (Session 114) banned as a blanket trio (with
+        // `org/apache/commons/logging/`) after `apps/insurance-backend`'s
+        // Spring Boot 3.2 boot crashed with `expected object reference, got
+        // int(1)` inside `SpringApplication.prepareEnvironment` ->
+        // `SystemEnvironmentPropertyMapper.processElementValue` -- a
+        // correlation (tight LoggerFactory/Slf4jLog init loop just before
+        // the crash), not a proven miscompile inside the logging classes
+        // themselves. Re-verified with a standalone probe
+        // (`SlfLoggingProbe.java`, real jcl-over-slf4j + slf4j-api +
+        // logback-classic/core jars): 0 failures across baseline,
+        // package-allowed, and aggressive-compilation passes. These two
+        // packages ARE genuinely safe -- see the UNCONDITIONAL
+        // `org/apache/commons/logging/` re-ban further up this function
+        // (near the other severity-based unconditional entries, e.g.
+        // `TYPES-ERASURE.1`) for why that THIRD package from the original
+        // trio needed to come back after a same-day real regression
+        // (`LoggingApplicationListenerTests` `FilterReply` corruption) that
+        // this narrower probe did not exercise (it used `jcl-over-slf4j`,
+        // API-compatible but bytecode-different from the real Commons
+        // Logging 1.3.x jar Spring Boot's real test classpath uses).
         //
-        // IMPORTANT: this does NOT independently confirm the original
-        // `insurance-backend` crash is fixed -- its actual trigger site
-        // (`SystemEnvironmentPropertyMapper.processElementValue`, in
+        // IMPORTANT: this removal does NOT independently confirm the
+        // original `insurance-backend` crash is fixed -- its actual trigger
+        // site (`SystemEnvironmentPropertyMapper.processElementValue`, in
         // `org/springframework/boot/context/properties/bind/`) is a
         // SEPARATE, still-active, already-documented ban (see the
         // `org/springframework/boot/context/properties/bind/` guard
-        // above) that this removal does not touch. `SlfLoggingProbe.java`
-        // is the regression witness for the logging-facade claim only.
+        // above) that this removal does not touch.
 
         // CGL.1 (Session 117 — agent O4, 2026-05-16) — provisional blanket ban
         // for CGLIB (`net/sf/cglib/`). `apps/cglib_probe` is a minimal repro
@@ -4316,24 +4370,45 @@ mod tests {
     }
 
     #[test]
-    fn slf4j_logback_commons_logging_are_jit_eligible_after_spb9_removal() {
-        // SPB.9 was removed 2026-07-26 for these three logging-facade
-        // packages themselves -- see the removal comment above
-        // should_skip_jit_internal for the re-verification evidence
-        // (SlfLoggingProbe.java, real jcl-over-slf4j/slf4j-api/logback
-        // jars) and the important caveat that the original crash's real
-        // trigger site (org/springframework/boot/context/properties/bind/)
-        // is a separate, still-active ban this removal does not touch.
+    fn slf4j_logback_are_jit_eligible_after_spb9_narrowing() {
+        // SPB.9 was removed 2026-07-26 for `org/slf4j/` and
+        // `ch/qos/logback/` -- see the removal/re-ban comment above
+        // should_skip_jit_internal for the re-verification evidence and
+        // the bisection that isolated the later real regression to
+        // `org/apache/commons/logging/` specifically (that package is
+        // re-banned below, see commons_logging_is_jit_banned_after_spb9_narrowing).
         for (class_name, method) in [
             ("org/slf4j/LoggerFactory", "getLogger"),
             ("ch/qos/logback/classic/Logger", "info"),
-            ("org/apache/commons/logging/LogFactory", "getLog"),
         ] {
             for policy in [SkipPolicy::Conservative, SkipPolicy::Aggressive] {
                 assert_eq!(
                     check(class_name, method, false, true, policy),
                     None,
-                    "{class_name}.{method} must be JIT-eligible now that SPB.9 is removed"
+                    "{class_name}.{method} must be JIT-eligible (SPB.9 removal for this package still stands)"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn commons_logging_is_jit_banned_after_spb9_narrowing() {
+        // Re-banned 2026-07-26, same day as the SPB.9 blanket removal, after
+        // a real Spring Boot suite regression (LoggingApplicationListenerTests
+        // 16/41 -> 34/41 failing, new "Unknown FilterReply value: DENY"
+        // Logback signature) was bisected to `org/apache/commons/logging/`
+        // specifically -- see the ban comment above should_skip_jit_internal.
+        // `org/slf4j/` and `ch/qos/logback/` remain JIT-eligible (see
+        // slf4j_logback_are_jit_eligible_after_spb9_narrowing).
+        for (class_name, method) in [
+            ("org/apache/commons/logging/LogFactory", "getLog"),
+            ("org/apache/commons/logging/impl/Slf4jLogFactory", "getInstance"),
+        ] {
+            for policy in [SkipPolicy::Conservative, SkipPolicy::Aggressive] {
+                assert_eq!(
+                    check(class_name, method, false, true, policy),
+                    Some(SkipReason::RustJvmTestFixture),
+                    "{class_name}.{method} must be JIT-skipped (SPB.9 re-ban for this package specifically)"
                 );
             }
         }
