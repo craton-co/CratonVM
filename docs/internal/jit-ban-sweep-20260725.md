@@ -103,6 +103,121 @@ junit-platform-console-picocli.
 **Not yet catalogued individually — next session(s) should read L920-2001
 in full and expand this table before testing.**
 
+## Session log — 2026-07-26 (first working session)
+
+- Discovered `/data/data/wt-jitban-20260725` (branch `fix/jit-ban-sweep-20260725`,
+  pre-existing from an earlier session) was **actively being edited by another
+  concurrent session right now** — caught an uncommitted `if false &&` guard
+  on the exact `TestClass.collectAnnotatedMethodValues` line the user told me
+  to avoid. **Moved to a fresh, exclusively-owned worktree**:
+  `/data/data/wt-jitsweep2-20260726`, branch `fix/jit-ban-sweep2-20260726`,
+  branched from `origin/dev` @ `4493d9265`. Use this one going forward, not
+  the `-2025` one.
+- Built baseline binary (no code changes yet, just to test via
+  `CRATONVM_JIT_ALLOW_PACKAGES`): `/data/tmp/jitban-bins/cratonvm-jitban-baseline-20260726`.
+- **`git blame`/`-S` check on the springframework/jboss/slf4j/cglib/hsqldb
+  blanket-ban block (L920-2001): every single entry (SPB.1 through SPB.9d,
+  CGL.1, PIC.1 — ~25 distinct package bans) cites the identical
+  "allocate-then-putfield" / callee-saved-GPR-clobber signature as its root
+  cause, and traces back to commits from ~2026-05-05 (Session 111-118) —
+  i.e. ALL predate the 2026-07-04 general fix** (`docs/internal/fixed-suite-bugs/jit-regalloc-callee-saved-clobber-family.md`,
+  default-off callee-saved GPR local homes) that was specifically supposed to
+  fix this exact symptom family. None of these ~25 bans appear to have been
+  revisited since. **This is the single highest-value lead in the whole
+  sweep** — if confirmed, it's a ~25-entry removal in one coherent batch, not
+  25 separate investigations. BUT: unverified so far — the original crash
+  fixture apps (SportMe, ms-course-youtube/admin-service, insurance-backend,
+  eureka-server, msyt-admin, cglib_probe) are **not present on this host**,
+  so verification needs either (a) a full app-suite run that exercises these
+  packages (Spring Boot suite, WildFly boot — `/data/data/wildfly-dist-keep/wildfly-32.0.1.Final`
+  is available) or (b) a hand-written minimal repro per package. Next
+  session: try WildFly boot first (covers `org/jboss/modules,as/`,
+  `org/wildfly/`, `org/jboss/msc/`, `org/jboss/logging/` — 5 of the ~25 in
+  one shot) since WildFly-boot-under-CratonVM is well-precedented on this
+  host (see `docs/internal/fixed-suite-bugs/wildfly/*`). Needs
+  `CRATONVM_JAVA_HOME` set alongside any JAVA_HOME shim per
+  `wildfly-jboss-modules-inputstreamreader-clinit-race.md`.
+- **H2/ANTLR-runtime ban (HIB-LONGTAIL.1) — IN PROGRESS.** Single-class
+  differential (`TestFileSystem`, lifted vs. baseline) was inconclusive: both
+  hit the 400s timeout at the identical point (stuck after the RRWL CAS diag
+  warnings, no further progress) — this class is independently known to be
+  right at the perf ceiling regardless of this ban (see
+  `[[h2-testfilesystem-testconcurrent-three-fixes-perf-gap-open]]`), and the
+  host was extremely loaded (~70+ concurrent cargo/rustc processes from other
+  sessions) making single-class wall-clock comparisons unreliable today.
+  **Switched to a full-suite differential instead**: 4-way sharded
+  `run-h2-suite.sh run --category all --shard i/4 --tag h2ban-lifted-si`
+  with `CRATONVM_JIT_ALLOW_PACKAGES=org/h2/,org/antlr/v4/runtime/`, output in
+  `/data/tmp/jitban-h2-full/h2ban-lifted-s{1,2,3,4}-*/`. Compare final
+  PASS/HANG/FAIL counts against the existing baseline in
+  `apps/h2database-suite-runner/RESULTS-20260724.md`: **PASS 143 (65.6%) /
+  HANG 56 (25.7%) / FAIL 19 (8.7%)** (with the ban in place, same host,
+  similar contention level). Launched ~00:58 UTC 2026-07-26; **still running
+  as of this doc update — check `/data/tmp/jitban-h2-full/*/summary.txt` for
+  completion, or `results.tsv` line counts for progress.** First shard
+  collision gotcha: giving all 4 shards the same `--tag` makes them share one
+  output directory name (stamp-only, no shard index) and clobber each
+  other's `results.tsv` concurrently — always pass a per-shard-unique
+  `--tag`.
+
+## WildFly boot smoke test (SPB.8/8b/8c family: jboss.modules, jboss.as, wildfly, jboss.msc, jboss.logging)
+
+Direct `standalone.sh` boot against `/data/data/wildfly-dist-keep/wildfly-32.0.1.Final`
+(fake JAVA_HOME wrapping the cratonvm binary as `bin/java`, `CRATONVM_JAVA_HOME=/home/victor/jdk25`
+for real-class support — see `docs/internal/fixed-suite-bugs/wildfly/wildfly-gc-barrier-boot-hang-and-harness-fixes.md`
+for why this shape is needed).
+
+- **Baseline (ban in place, default):** boots cleanly to `WFLYSRV0025: WildFly Full
+  32.0.1.Final ... started in 33227ms`, HTTP management interface up, deployment
+  scanner polling normally. Genuinely working server.
+- **Ban lifted (`CRATONVM_JIT_ALLOW_PACKAGES=org/jboss/modules/,org/jboss/as/,org/wildfly/,org/jboss/msc/,org/jboss/logging/`):**
+  boots ~39 threads deep into real config parsing, then **FATAL WFLYSRV0056** —
+  `NullPointerException: Cannot invoke "java.util.Set.iterator()" because
+  "this.validTypes" is null`, in the `standalone.xml` EE-subsystem
+  managed-executor-service parse path (`ModelTypeValidator.validateParameter` /
+  `LongRangeValidator`/`NillableOrExpressionParameterValidator` chain — note
+  CratonVM's own stack attribution across these is probably imprecise, matches
+  the known "JIT loses/mis-attributes an inlined callee's frame" pattern seen
+  elsewhere in this codebase, e.g. JASPER-JDT.3). **This is a real regression
+  from lifting the ban, not a stale safety net for this particular repro.**
+- **`--nojit` check in progress** (ban still lifted via env, but `--nojit` added)
+  to confirm this is JIT-specific before spending more time on it — result
+  pending as of this doc update.
+
+**CONFIRMED via `--nojit` differential (2026-07-26 ~01:10 UTC): this is
+JIT-specific, not an environment/harness artifact.** Ban lifted + `--nojit`
+added boots cleanly (`WFLYSRV0025 ... started in 24042ms`, matches baseline);
+only ban-lifted + JIT-on fails. **Verdict: KEEP `org/jboss/as/` (SPB.8b) —
+it is protecting against a currently-live miscompile, not a stale one.**
+Full writeup + repro: `docs/known-issues/wildfly/modeltypevalidator-validtypes-npe.md`
+(committed). This is the sweep's first concrete "new bug found" per the
+goal's own framing — a real, JIT-only `ModelTypeValidator`/`validTypes`
+null-field bug with a fast (~10-20s) deterministic repro, not yet root-caused
+to an exact codegen site. Good target for a dedicated follow-up session.
+
+NOT proof that the *other* ~20 bans in the SPB/CGL/PIC family are still
+needed — each needs its own check; this only confirms the family's root
+cause pattern is still real *somewhere*, so don't assume the whole family is
+safe to bulk-remove. The sibling bans in the same lift set this test used
+(`org/jboss/modules/`, `org/wildfly/`, `org/jboss/msc/`, `org/jboss/logging/`)
+are individually UNTESTED — this run never got far enough to exercise them
+since it crashed first in `org/jboss/as/`. Re-test those once the `org/jboss/as/`
+bug above is fixed (boot will get further and may expose or clear different
+bans downstream).
+
+Repro commands (host: victor@20.83.144.174):
+```bash
+mkdir -p /data/tmp/jitban-wf-javahome/bin
+cp <cratonvm-binary> /data/tmp/jitban-wf-javahome/bin/java
+chmod +x /data/tmp/jitban-wf-javahome/bin/java
+mkdir -p /data/tmp/<rundir> && cp -r /data/data/wildfly-dist-keep/wildfly-32.0.1.Final/standalone/configuration /data/tmp/<rundir>/
+JAVA_HOME=/data/tmp/jitban-wf-javahome CRATONVM_JAVA_HOME=/home/victor/jdk25 \
+  CRATONVM_JIT_ALLOW_PACKAGES='org/jboss/modules/,org/jboss/as/,org/wildfly/,org/jboss/msc/,org/jboss/logging/' \
+  timeout 90 bash /data/data/wildfly-dist-keep/wildfly-32.0.1.Final/bin/standalone.sh \
+  -Djboss.server.base.dir=/data/tmp/<rundir>
+```
+(standalone.sh isn't chmod +x in the dist — always invoke via `bash standalone.sh`.)
+
 ## Next steps
 
 1. Finish H2/ANTLR-runtime test (this session) — compare `TestFileSystem`

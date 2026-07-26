@@ -110,25 +110,27 @@ seconds); `OriginTrackedYamlLoaderTests` takes several minutes;
 `ConfigurationPropertySourcesTests` can take on the order of 45 minutes —
 expected, not a regression, given the CPU-bound findings above.
 
-**`ConfigurationPropertiesBeanRegistrationAotProcessorTests` remains OPEN.**
-Unlike the other four, it is a genuine, confirmed hang: it never completed
-even with a 7200s (2-hour) ceiling, with *zero* of its 9 `@Test` methods
-reporting a result in that window, and repeated CPU-sampled stack dumps
-taken minutes AND hours apart land at the identical bytecode offset inside
-Hibernate Validator's `BeanMetaDataImpl.getClassLevelConstraintsAsDescriptors`.
-Deep investigation (a minimal standalone Hibernate Validator repro completes
-in ~320ms, ruling out a generic Hibernate Validator bug; rebuilding with the
-`String.chars()` fix made no difference; empty-array `Arrays.stream()` edge
-cases were ruled out) narrowed but did not pin the exact root cause — it is
-very likely specific to the interaction between Hibernate Validator's
-per-class metadata caching and this class's repeated
-`@CompileWithForkedClassLoader` fresh-classloader + in-process-`javac`
-compilation cycles. Full diagnostic trail:
-`configurationpropertiesbeanregistrationaotprocessortests-hang.md`.
-Left OUT of the suite-runner timeout table deliberately — do not paper over
-a real hang with a large timeout; it needs either a native debugger
-(unavailable in this environment) or a much longer targeted bisection
-session to close.
+**`ConfigurationPropertiesBeanRegistrationAotProcessorTests` — original hang
+RESOLVED 2026-07-26, class still OPEN (2 unrelated JIT bugs).** The
+Hibernate-Validator hang described here no longer reproduces on current
+`dev` — a faithful from-scratch reproduction of the real (forked-classloader)
+test method completes in ~13s under `--nojit`, matching this doc's own
+repro recipe exactly. Very likely fixed as a side effect of unrelated work
+landed on `dev` after the 2026-07-24 investigation; no specific fixing
+commit was identified. **However the class still fails under CratonVM's
+default JIT-on mode**, due to two newly-discovered, unrelated JIT
+correctness bugs in Spring's AOT codegen path: (1) `javax.lang.model
+.SourceVersion.isIdentifier` gets miscompiled once JIT-inlined/compiled via
+`SourceVersion.isName`'s own call (fully isolated, dependency-free 20-line
+repro, `CRATONVM_JIT_DENY=isIdentifier` workaround available), and (2)
+AOT-generated `void`-returning methods (built via javapoet's default
+`TypeName.VOID`, e.g. `registerBeanDefinitions`) lose their return type
+token under JIT, producing a javac parse error (not yet minimally
+isolated). Both are JIT-only (never reproduce under `--nojit`). Full
+diagnostic trail, minimal repros, and bisection notes:
+`configurationpropertiesbeanregistrationaotprocessortests-hang.md`. Still
+left OUT of the suite-runner timeout table — it's a real (fast, ~2s)
+failure under JIT now, not a hang, but still not passing.
 
 ## Cluster B — diagnostics, process metadata, and byte/URL utilities
 
