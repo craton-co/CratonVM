@@ -7580,6 +7580,12 @@ struct Compiler {
     stack: Vec<StackSlot>,
     /// Next available frame offset (negative, below locals area).
     next_spill_offset: i32,
+    /// Operand-spill cursor captured by the most recent
+    /// `emit_pre_safepoint_spill`, consumed by the matching
+    /// `emit_oop_map_for_safepoint` as `OopMapEntry::live_frame_hi`. `0` when
+    /// no spill was emitted for this safepoint, which the GC reads as
+    /// "unknown" and handles by scanning the whole frame.
+    pending_live_frame_hi: i32,
     /// Base spill offset (first slot after locals).
     base_spill_offset: i32,
     /// Exclusive end of the operand-stack spill area.
@@ -8997,6 +9003,7 @@ impl Compiler {
             buf,
             stack: Vec::with_capacity(max_stack),
             next_spill_offset: base_spill,
+            pending_live_frame_hi: 0,
             base_spill_offset: base_spill,
             spill_limit_offset: spill_limit,
             num_locals,
@@ -10017,6 +10024,77 @@ impl Compiler {
     /// stack has `stack_oop_marks`) and (b) `OopMapEntry::reg_oops`
     /// bitmap consumed by the GC scanner walking saved-register slots
     /// in the JIT prologue.
+    /// Publish this frame's storage-class partition for the GC
+    /// (`CompiledMethod::frame_layout`). Derived from the same values the
+    /// prologue and the slot emitters use, so it cannot drift from the code
+    /// that is actually generated. All offsets are positive `[rbp - off]`.
+    fn frame_layout(&self) -> crate::FrameLayout {
+        let span = |offs: &[i32]| -> (i32, i32) {
+            match (offs.iter().min(), offs.iter().max()) {
+                (Some(&lo), Some(&hi)) => (lo, hi + 8),
+                _ => (0, 0),
+            }
+        };
+        let (ref_hoist_lo, ref_hoist_hi) = span(&self.hoist_offsets);
+        // The arith hoist slots and the shared arith scratch are contiguous and
+        // sit directly after the ref-hoist slots; the scratch's depth is not
+        // retained, so bound the region by the next region that IS known (the
+        // scalar-replacement fields, else the end of the reserved locals).
+        let (arith_lo, arith_hi) = if self.arith_hoist_offsets.is_empty() {
+            if self.arith_scratch_base > 0 {
+                (self.arith_scratch_base, self.arith_scratch_base)
+            } else {
+                (0, 0)
+            }
+        } else {
+            let (lo, _) = span(&self.arith_hoist_offsets);
+            (lo, self.arith_scratch_base.max(lo))
+        };
+        let mut scalar_lo = 0i32;
+        let mut scalar_hi = 0i32;
+        for obj in self.scalar_replaced.values() {
+            let lo = obj.field_base_offset;
+            // Cast: field count is bounded by 16 (see `plan_scalar_replacement`).
+            let hi = lo + (obj.num_fields as i32) * (SLOT_SIZE as i32);
+            if scalar_hi == 0 || lo < scalar_lo {
+                scalar_lo = lo;
+            }
+            if hi > scalar_hi {
+                scalar_hi = hi;
+            }
+        }
+        let reg_spill_slots = if self.reg_spill_base == 0 || !self.safepoint_reg_spill {
+            0
+        } else if self.safepoint_reg_spill_all {
+            ALL_SPILL_GPRS.len() as i32 // Cast: fixed 14-entry table
+        } else {
+            self.alloc_used_regs.len() as i32 // Cast: register count fits i32
+        };
+        // Cast: register counts, all far below i32::MAX.
+        let callee_saved_hi = self.callee_saved_base + self.alloc_used_regs.len() as i32 * 8;
+        let xmm_saved_hi = self.xmm_saved_base + self.alloc_used_xmms.len() as i32 * 8;
+        crate::FrameLayout {
+            // Cast: local counts are bounded by the classfile format.
+            java_locals_hi: (self.num_locals as i32 + 1) * 8,
+            ref_hoist_lo,
+            ref_hoist_hi,
+            arith_lo,
+            arith_hi,
+            scalar_lo,
+            scalar_hi,
+            locals_hi: self.base_spill_offset,
+            spill_lo: self.base_spill_offset,
+            spill_hi: self.spill_limit_offset,
+            callee_saved_lo: self.callee_saved_base,
+            callee_saved_hi,
+            xmm_saved_lo: self.xmm_saved_base,
+            xmm_saved_hi,
+            reg_spill_lo: self.reg_spill_base,
+            reg_spill_hi: self.reg_spill_base + reg_spill_slots * 8,
+            frame_size: self.frame_size,
+        }
+    }
+
     fn emit_pre_safepoint_spill(&mut self) {
         if self.failed {
             return;
@@ -10024,6 +10102,13 @@ impl Compiler {
         if moving_young_enabled() {
             self.flush_scratch_registers();
         }
+        // Capture the live-frame bound for the map this safepoint will record.
+        // Taken here rather than in `emit_oop_map_for_safepoint` because that
+        // runs AFTER the call, by which point `emit_stack_arg_cleanup` may have
+        // moved the cursor. Includes the staged invoke-argument buffer, which
+        // sits above the operand stack in the same spill reserve and is live
+        // for the duration of the call.
+        self.pending_live_frame_hi = self.next_spill_offset;
         for idx in 0..self.local_assignments.len() {
             if let Some(reg) = self.local_assignments[idx] {
                 let off = self.local_offset(idx);
@@ -10722,6 +10807,11 @@ impl Compiler {
         // If marks is somehow longer than stack (pop desync), truncate.
         self.stack_oop_marks.truncate(self.stack.len());
 
+        // Consume the bound captured by the paired `emit_pre_safepoint_spill`.
+        // Taking it (rather than copying) means a map emitted without a paired
+        // spill records `0` = "unknown" and the GC scans conservatively, which
+        // is the fail-closed direction.
+        let live_frame_hi = std::mem::take(&mut self.pending_live_frame_hi);
         let native_pc = self.buf.pos() as u32; // Cast: x86-64 immediate encoding
         let mut slots: Vec<i16> = Vec::new();
         let n = self.stack.len();
@@ -10783,6 +10873,7 @@ impl Compiler {
                 bytecode_pc: self.cur_bc_pc as u32, // Cast: bytecode PC fits u32
                 frame_slot_offsets: slots,
                 moving_young_coverage_complete: self.pending_shadow_coverage_complete,
+                live_frame_hi,
             });
             self.pending_shadow_coverage_complete = false;
         }
@@ -16559,11 +16650,23 @@ impl Compiler {
 
                 // ireturn, lreturn, areturn, freturn, dreturn
                 0xac | 0xad | 0xb0 | 0xae | 0xaf => {
+                    // `areturn` returns an object reference, and the popped
+                    // entry's own mark says the same thing. The pop/push pair
+                    // below moves the value to a new slot, and `push_from_rax`
+                    // always marks its push `false` — so without carrying the
+                    // mark across, inlining a reference-returning callee erases
+                    // the oop tag of its result. Under moving-young that entry
+                    // is then neither published nor rewritable.
+                    let ret_is_oop =
+                        op == 0xb0 || self.stack_oop_marks.last().copied().unwrap_or(false);
                     // Pop callee's return value → push onto caller stack
                     self.pop_to_rax();
                     // Reclaim callee locals
                     self.next_spill_offset = save_spill;
                     self.push_from_rax();
+                    if ret_is_oop {
+                        self.mark_top_as_oop();
+                    }
                     // Jump past the rest of the inlined code
                     self.buf.emit_byte(0xE9);
                     let patch_off = self.buf.pos();
@@ -16613,6 +16716,13 @@ impl Compiler {
                         // downstream. Mirrors the invoke-site guard below.
                         self.emit_post_invoke_exception_check(type_tag);
                         self.push_from_rax();
+                        // Mirrors the top-level `getfield` arms and the inlined
+                        // `getstatic` arm just below: a reference field's value
+                        // is a live oop and must be tagged, or it is invisible
+                        // to both the precise oop map and the shadow stack.
+                        if type_tag == b'L' || type_tag == b'[' {
+                            self.mark_top_as_oop();
+                        }
                     } else {
                         // Cannot resolve field — bail out
                         self.next_spill_offset = callee_local_base;
@@ -22193,7 +22303,7 @@ impl Compiler {
                     if let Some(&new_pc) = self.scalar_field_ops.get(&pc) {
                         // Scalar-replaced getfield: load directly from frame slot
                         // MED-4 / Fix 3 — O(1) pc-indexed lookup.
-                        let (_, field_index, _) = self
+                        let (_, field_index, type_tag) = self
                             .field_info_idx
                             .get(&pc)
                             .map(|&i| self.field_info[i])
@@ -22204,6 +22314,14 @@ impl Compiler {
                             sr_obj.field_base_offset + (field_index as i32) * (SLOT_SIZE as i32); // Cast: x86-64 immediate encoding
                         self.emit_load_local(RAX, field_off);
                         self.push_from_rax();
+                        // A REFERENCE field of a scalar-replaced object is an
+                        // ordinary live oop once loaded — the object being
+                        // exploded into frame slots changes where the field
+                        // lives, not what its value is. Same obligation as every
+                        // other `getfield` arm.
+                        if type_tag == b'L' || type_tag == b'[' {
+                            self.mark_top_as_oop();
+                        }
                         pc += 3;
                     } else if let Some(&(c_off, c_is_ref)) =
                         self.compact_field_off.get(&pc).filter(|_| {
@@ -25014,6 +25132,35 @@ impl Compiler {
                             .copied();
                         if self_ret_ty != Some(b'V') {
                             self.push_from_rax();
+                            // The callee IS this method, so its return type is
+                            // the method's own. A reference result MUST be
+                            // tagged: `collect_live_oop_homes` publishes only
+                            // marked operand entries, so an untagged reference
+                            // left on the operand stack across a later
+                            // GC-capable call is invisible to the shadow stack
+                            // — while `moving_young_safepoint_coverage_complete`
+                            // still certifies the frame, because it only checks
+                            // that MARKED entries have frame/register homes.
+                            //
+                            // That combination is the measured heap corruption
+                            // in `docs/known-issues/
+                            // moving-young-gen-drops-jit-held-oops.md`:
+                            // `BinTreesClassic.bottomUpTree` keeps the result of
+                            // its first recursive call — an entire subtree — on
+                            // the operand stack across its second, and a moving
+                            // young cycle neither marked nor rewrote it.
+                            match self_ret_ty {
+                                Some(b'L') | Some(b'[') => self.mark_top_as_oop(),
+                                // No descriptor (the legacy `compile` test
+                                // wrapper passes an empty `method_key`): we
+                                // cannot tell whether this is a reference, so
+                                // the mark vector is no longer exact and this
+                                // frame must not certify moving-young coverage.
+                                // Fail-closed costs a non-moving cycle; guessing
+                                // costs the heap.
+                                None => self.stack_oop_marks_exact = false,
+                                _ => {}
+                            }
                         }
                     }
                     pc += 3;
@@ -26362,6 +26509,16 @@ impl Compiler {
                                     self.push_from_rax_as_xmm0();
                                 } else {
                                     self.push_from_rax();
+                                }
+                                // Same obligation as the direct INVOKESTATIC arm
+                                // (which has always tagged it) and the dispatch
+                                // arm below: a reference return is a live oop and
+                                // must not keep `push_from_rax`'s default `false`
+                                // mark. Missing here, the reference is published
+                                // to neither the precise oop map nor the shadow
+                                // stack — see the self-recursive site above.
+                                if matches!(ret_type, b'L' | b'[') {
+                                    self.mark_top_as_oop();
                                 }
                             }
                         } // end `if !intrinsic_handled` (plain direct call)
@@ -29058,6 +29215,10 @@ pub fn compile_with_param_slots(
         // side.
         || !compiler.static_field_info.is_empty()
         || !compiler.new_info.is_empty();
+    // Snapshot the frame partition and the label BEFORE `compiler.buf` is moved
+    // into the artifact (which partially moves `compiler`).
+    let frame_layout = compiler.frame_layout();
+    let method_label = compiler.method_label.clone();
     let mut cm = if needs_heap {
         CompiledMethod::new_with_context(compiler.buf)
     } else {
@@ -29224,6 +29385,9 @@ pub fn compile_with_param_slots(
     cm.osr_callee_saved_regs = Some(compiler.alloc_used_regs.clone());
     cm.osr_callee_saved_xmms = Some(compiler.alloc_used_xmms.clone());
     cm.osr_xmm_saved_base = compiler.xmm_saved_base;
+    cm.method_label = method_label;
+    cm.shadow_savebase_slot_off = compiler.shadow_savebase_slot_off;
+    cm.frame_layout = frame_layout;
     cm.osr_heap_local_offset = compiler.heap_local_offset;
     cm.jit_thread_slot_off = compiler.jit_thread_slot_off;
     cm.stack_floor_slot_off = compiler.stack_floor_slot_off;
@@ -29824,6 +29988,110 @@ mod tests {
             jit_card_old_base: 0,
             jit_card_old_end: 0,
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression: docs/known-issues/moving-young-gen-drops-jit-held-oops.md
+    // -----------------------------------------------------------------------
+    //
+    // `BinTreesClassic.bottomUpTree` holds the result of its FIRST recursive
+    // call on the operand stack across its SECOND — an entire subtree. The
+    // direct self-recursive `invokestatic` arm pushed that result without
+    // tagging it as a reference, so `collect_live_oop_homes` never published
+    // it, `emit_oop_map_for_safepoint` never recorded its slot, and
+    // `moving_young_safepoint_coverage_complete` certified the frame anyway
+    // (it only checks that MARKED entries have frame/register homes). Under
+    // `CRATONVM_MOVING_YOUNG` the conservative frame scan is suppressed on a
+    // certified frame, so the subtree was neither marked nor rewritten and
+    // bt18 returned a wrong, run-varying checksum.
+
+    /// Compile `static <ret> f(int)` whose body is two direct self-recursive
+    /// calls with the first result live across the second, and return the oop
+    /// map recorded at the second call (bytecode pc 5).
+    fn self_recursive_second_call_map(method_key: &str) -> Option<crate::OopMapEntry> {
+        //  0: iload_0
+        //  1: invokestatic f      -> r1 pushed
+        //  4: iload_0
+        //  5: invokestatic f      -> SAFEPOINT, r1 live on the operand stack
+        //  8: pop
+        //  9: areturn
+        let code = [0x1a, 0xb8, 0x00, 0x00, 0x1a, 0xb8, 0x00, 0x00, 0x57, 0xb0];
+        let helpers = test_helpers();
+        let compiled = compile_with_param_slots(
+            &code,
+            code.len(),
+            1,
+            1,
+            false,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            HashMap::new(),
+            HashMap::new(),
+            &helpers,
+            std::collections::HashSet::new(),
+            HashMap::new(),
+            None,
+            &[0],
+            1,
+            0,
+            Vec::new(),
+            method_key,
+            Vec::new(),
+        )?;
+        compiled
+            .oop_maps
+            .iter()
+            .find(|m| m.bytecode_pc == 5)
+            .cloned()
+    }
+
+    #[test]
+    fn self_recursive_reference_return_is_published_as_an_oop() {
+        let map = self_recursive_second_call_map("T.f:(I)Ljava/lang/Object;")
+            .expect("the second self-call is a GC-capable safepoint and records a map");
+        assert!(
+            !map.frame_slot_offsets.is_empty(),
+            "the first call's result is a live reference on the operand stack across \
+             the second call; leaving it untagged is the measured bt18 moving-young \
+             heap corruption (docs/known-issues/moving-young-gen-drops-jit-held-oops.md)",
+        );
+    }
+
+    #[test]
+    fn self_recursive_primitive_return_is_not_published_as_an_oop() {
+        let map = self_recursive_second_call_map("T.f:(I)I")
+            .expect("the second self-call is a GC-capable safepoint and records a map");
+        assert!(
+            map.frame_slot_offsets.is_empty(),
+            "an int result must NOT be tagged: publishing a primitive as a movable \
+             root would have the collector relocate whatever its bit pattern names",
+        );
+    }
+
+    #[test]
+    fn self_recursive_return_without_a_descriptor_fails_closed() {
+        // The legacy `compile()` wrapper passes an empty `method_key`, so the
+        // return type is unknown. Guessing either way is unsafe, so the frame
+        // stops certifying moving-young coverage instead and the collector
+        // takes the non-moving sweep for that cycle.
+        let map = self_recursive_second_call_map("")
+            .expect("the second self-call is a GC-capable safepoint and records a map");
+        assert!(
+            !map.moving_young_coverage_complete,
+            "an unknown self-call return type must mark the safepoint's coverage \
+             INCOMPLETE, not silently assume the pushed value is a primitive",
+        );
     }
 
     #[test]

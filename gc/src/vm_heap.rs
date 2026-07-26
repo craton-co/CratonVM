@@ -1769,7 +1769,24 @@ impl VmHeap {
         }
         let fallbacks = crate::gc_quiescence::moving_young_coverage_fallback_count();
         if crate::gc_quiescence::moving_young_enabled() || fallbacks > 0 {
-            eprintln!("[GC] moving_young_coverage_fallbacks={fallbacks}");
+            // Both numbers, always. A correct answer while `cycles == 0` means
+            // the young generation never actually copied anything, which is the
+            // exact way the 2026-07-01 validation declared moving-young working
+            // while it was inert (see
+            // `docs/internal/arch-2026-07-26/moving-young-corruption-rootcause.md`
+            // section 6). The histogram then names what stopped it.
+            let cycles = crate::gc_quiescence::moving_young_cycle_count();
+            eprintln!("[GC] moving_young: cycles={cycles} coverage_fallbacks={fallbacks}");
+            let counts = crate::gc_quiescence::moving_young_fallback_reason_counts();
+            for (reason, n) in counts.iter().enumerate() {
+                if *n > 0 {
+                    eprintln!(
+                        "[GC] moving_young_fallback_reason: {}={}",
+                        crate::gc_quiescence::incomplete_reason::label(reason),
+                        n
+                    );
+                }
+            }
         }
     }
 
