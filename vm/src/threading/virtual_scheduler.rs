@@ -1,24 +1,54 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2024-2026 Craton Software Company
 
-//! Virtual thread scheduler (JEP 444, Java 21).
+//! VESTIGIAL — this module has **no live callers** and bounds nothing.
+//! Do not wire it up. Scheduled for deletion; see
+//! `docs/internal/arch-2026-07-26/vt-resume-gc-fixup.md` §3.
 //!
-//! Implements a simplified virtual thread model: virtual threads are still
-//! backed by OS threads, but their concurrency is bounded by a carrier-thread
-//! semaphore. When a virtual thread blocks (sleep, park, wait, contended lock),
-//! it releases its carrier permit so another virtual thread can run.
+//! It was an early sketch of JEP 444: a counting semaphore meant to bound how
+//! many virtual threads run at once. The bound was never real. The permits
+//! here are **disjoint from the actual carrier pool**, which lives in
+//! [`crate::threading::VirtualThreadManager`] / `ForkJoinScheduler`
+//! (`virtual_threads.rs`) and owns the real carrier OS threads. Nothing in
+//! this module can start, stop, park, or free a carrier: `release()`
+//! increments a counter, and the carrier OS thread it was named after keeps
+//! running (or keeps blocking) regardless.
 //!
-//! The carrier count defaults to the number of available hardware threads.
+//! Every call site was removed on 2026-07-26 (`vm/src/vm/vm_exec.rs`). Three
+//! were already unreachable — they sat inside the platform-spawn closure,
+//! past the `is_virtual` early return. Two more (`vt_release_carrier` /
+//! `vt_acquire_carrier`) were reached only from `Thread.sleep` natives whose
+//! guard `release && vt_park_for(..)` evaluates the *same* predicate twice, so
+//! the `ContinuationYield` return always won. The last pair, in
+//! `NativeContextImpl::park`, was the only reachable one and was a hang risk:
+//! nothing else acquired from this pool, so once more virtual threads had
+//! parked concurrently than `carrier_count`, the post-park `acquire()` blocked
+//! a real carrier OS thread on a permit no one would return.
+//!
+//! That is the danger this module poses and why it should go rather than be
+//! "fixed": it reads as backpressure, so a reader concludes the carrier pool
+//! is bounded and that virtual-thread starvation is already handled. It is
+//! not. The genuine bound, and the genuine starvation compensation, are the
+//! watchdog in `virtual_threads.rs`.
+//!
+//! What still keeps the type alive is purely structural, in files outside this
+//! change's ownership — see the cross-owner request in the doc above:
+//! `threading/mod.rs` (`pub mod` / `pub use`), `vm/realms/thread_realm.rs`
+//! (the `virtual_scheduler` field), `vm/vm_init.rs` (`new_default()`), and two
+//! tests in `vm/src/vm.rs`. The implementation below is therefore left
+//! behaviourally intact so those keep compiling and passing.
 
 use std::sync::Arc;
 
 use parking_lot::{Condvar, Mutex};
 
-/// Manages carrier-thread permits for virtual threads.
+/// A counting semaphore that once claimed to bound virtual-thread
+/// concurrency. **Nothing calls it** — see the module header. Retained only
+/// so the (non-owned) construction site and tests keep compiling.
 ///
-/// Virtual threads must acquire a permit before executing and release it
-/// when blocking. This bounds the number of concurrently running virtual
-/// threads to `carrier_count`, matching the JDK's ForkJoinPool behavior.
+/// The counter is self-consistent; it simply has no relationship to any
+/// carrier. Treat `carrier_count` as "the number this was constructed with",
+/// not as a live property of the VM.
 pub struct VirtualThreadScheduler {
     state: Mutex<SchedulerState>,
     condvar: Condvar,
@@ -144,13 +174,13 @@ mod tests {
         // and fully restore the pool to capacity. (An earlier version of this
         // test asserted `1` here, expecting the second release to be treated
         // as a "double release" — but with 2 real acquires outstanding, both
-        // releases genuinely pair with one, so both must count. Real callers
-        // pair acquire/release per blocking event (see
-        // `vt_acquire_carrier`/`vt_release_carrier` in `vm_exec.rs`), so two
-        // *different* virtual threads legitimately releasing back-to-back
-        // with no acquire in between is an expected pattern, not a bug —
-        // discounting the second release here would silently drop a real
-        // permit and starve the scheduler over time.)
+        // releases genuinely pair with one, so both must count.
+        //
+        // The original rationale continued "…real callers pair
+        // acquire/release per blocking event (see `vt_acquire_carrier` /
+        // `vt_release_carrier` in `vm_exec.rs`)". Those callers are gone as of
+        // 2026-07-26 and there are no real callers at all now; what is left
+        // below is a semantics test of the counter itself.)
         sched.release();
         sched.release();
         assert_eq!(
