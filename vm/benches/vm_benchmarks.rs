@@ -247,7 +247,7 @@ fn make_nbody_bytecode() -> Vec<u8> {
 ///
 /// Computes `2^d - 1` (the sum of all node values in a perfect binary
 /// tree of depth `d` where every node has value 1) by repeated
-/// doubling РІР‚вЂќ `result = 0; for i in 0..d { result = result*2 + 1; }`.
+/// doubling — `result = 0; for i in 0..d { result = result*2 + 1; }`.
 /// This avoids actual heap allocation but exercises arithmetic +
 /// branching at the same shape as the shootout original.
 ///
@@ -359,7 +359,7 @@ fn bench_startup_to_first_bytecode(c: &mut Criterion) {
     use cratonvm_reader::attribute::{Attribute, CodeAttribute};
     use cratonvm_reader::class_access_flags::MethodAccessFlags;
 
-    // iconst_1; ireturn РІР‚вЂќ simplest possible method
+    // iconst_1; ireturn — simplest possible method
     let code = vec![0x04, 0xAC];
 
     c.bench_function("startup_to_first_bytecode", |b| {
@@ -649,15 +649,15 @@ fn bench_shootout_binary_trees(c: &mut Criterion) {
 // =============================================================================
 // T1.1.41-45: SPECjvm2008 / DaCapo equivalent benchmarks
 //
-// Written from scratch in Rust РІР‚вЂќ no external JARs needed. Each bench
+// Written from scratch in Rust — no external JARs needed. Each bench
 // targets the same JVM subsystem as the corresponding SPECjvm workload:
 //
-// - specjvm_startup      РІвЂ вЂ™ already covered by bench_vm_startup +
+// - specjvm_startup      → already covered by bench_vm_startup +
 //                           bench_startup_to_first_bytecode
-// - specjvm_compiler      РІвЂ вЂ™ JIT compilation throughput
-// - specjvm_crypto        РІвЂ вЂ™ hash computation via native dispatch
-// - specjvm_scimark_sor   РІвЂ вЂ™ SOR (successive over-relaxation) numeric kernel
-// - dacapo_avrora_sim     РІвЂ вЂ™ embedded simulation: tight loop + branching
+// - specjvm_compiler      → JIT compilation throughput
+// - specjvm_crypto        → hash computation via native dispatch
+// - specjvm_scimark_sor   → SOR (successive over-relaxation) numeric kernel
+// - dacapo_avrora_sim     → embedded simulation: tight loop + branching
 // =============================================================================
 
 /// SPECjvm2008-compiler equivalent: measure JIT compilation throughput.
@@ -707,7 +707,7 @@ fn bench_specjvm_crypto_dispatch(c: &mut Criterion) {
 }
 
 /// SPECjvm2008-scimark SOR equivalent: successive over-relaxation on a
-/// grid. This is the classic numeric kernel from scimark2 РІР‚вЂќ a 2D
+/// grid. This is the classic numeric kernel from scimark2 — a 2D
 /// relaxation sweep. Built as raw bytecode so it runs through the
 /// real interpreter.
 ///
@@ -866,7 +866,7 @@ fn bench_specjvm_scimark_sor(c: &mut Criterion) {
     );
 
     let mut group = c.benchmark_group("specjvm_scimark_sor");
-    // grid_size=10, iters=5 РІвЂ вЂ™ light
+    // grid_size=10, iters=5 → light
     group.bench_function("10x5", |b| {
         b.iter(|| {
             let mut thread = JvmThread::new(ThreadId(0), "bench");
@@ -880,7 +880,7 @@ fn bench_specjvm_scimark_sor(c: &mut Criterion) {
             ));
         });
     });
-    // grid_size=20, iters=10 РІвЂ вЂ™ heavier
+    // grid_size=20, iters=10 → heavier
     group.bench_function("20x10", |b| {
         b.iter(|| {
             let mut thread = JvmThread::new(ThreadId(0), "bench");
@@ -900,7 +900,7 @@ fn bench_specjvm_scimark_sor(c: &mut Criterion) {
 /// DaCapo-avrora equivalent: tight embedded-simulation loop.
 /// Avrora simulates an AVR microcontroller instruction set. We
 /// approximate the workload shape: a tight decode-execute loop with
-/// branching on opcode categories РІР‚вЂќ exercising the interpreter's
+/// branching on opcode categories — exercising the interpreter's
 /// branch prediction and dispatch throughput at scale.
 ///
 /// Uses the same counting-loop bytecode pattern but with a much
