@@ -374,7 +374,7 @@ pub(crate) fn native_random_next_int_bound(
         // only catches the downstream rethrow, not this origin. Used to locate
         // the empty-collection / zero-count divergence in Elasticsearch /
         // Lucene test-framework `@BeforeClass` setup (RandomPicks.randomFrom).
-        if std::env::var("CRATONVM_DBG_NEXTINT").is_ok() {
+        if crate::nbflags().dbg_nextint {
             eprintln!("NEXTINT-BAD bound={bound} caller-chain (inner→outer):");
             let frames = ctx.capture_stack_trace(0);
             for f in frames.iter().rev().take(20) {

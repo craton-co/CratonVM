@@ -28,6 +28,7 @@ use std::sync::Arc;
 use crate::collector::{GarbageCollector, MonitorCleanup};
 use crate::concurrent_mark::{ConcurrentGcPhase, ConcurrentGcState};
 use crate::gc::{GcResult, GcStats};
+use crate::gc_flags;
 use crate::heap::{
     array_data_size, array_element_type_from_tag, object_kind_from_tag, ArrayElementType,
     ObjectHeader, ObjectKind, ARRAY_ELEMENT_TYPE_OFFSET, HEADER_SIZE, OBJECT_KIND_OFFSET,
@@ -61,6 +62,61 @@ fn value_from_bytes(bytes: &[u8; SLOT_SIZE]) -> Value {
 fn value_to_bytes(value: Value, bytes: &mut [u8; SLOT_SIZE]) {
     // SAFETY: the byte buffer is large enough for one `Value`.
     unsafe { value_to_unaligned_ptr(value, bytes.as_mut_ptr()) };
+}
+
+/// Enumerate reference fields of a non-humongous object under either body
+/// layout. `slot` points at the writable on-heap representation; `compact`
+/// selects an 8-byte raw pointer versus a legacy 16-byte `Value` cell.
+fn for_each_flat_object_reference(
+    obj_ptr: *const u8,
+    header: &ObjectHeader,
+    first_index: usize,
+    mut visit: impl FnMut(*mut u8, usize, bool),
+) {
+    if cratonvm_types::is_compact_object(header) {
+        // Borrowing accessor: only `field_offsets` / `is_ref` are read here.
+        // `visit` is caller-supplied and may re-enter the layout cache (G1's
+        // evacuation visitor sizes the referent); that is supported — the
+        // accessor holds a shared borrow, so nested lookups still hit.
+        let _ = cratonvm_types::with_class_layout(
+            header.class_id.as_u32(),
+            header.num_slots(),
+            |layout| {
+                for (index, (&offset, &is_ref)) in layout
+                    .field_offsets
+                    .iter()
+                    .zip(layout.is_ref.iter())
+                    .enumerate()
+                {
+                    if !is_ref || index < first_index {
+                        continue;
+                    }
+                    let slot = unsafe { obj_ptr.add(HEADER_SIZE + offset as usize) } as *mut u8;
+                    let raw = unsafe { std::ptr::read(slot as *const u64) } as usize;
+                    if raw != 0 {
+                        visit(slot, raw, true);
+                    }
+                }
+            },
+        );
+    } else {
+        for index in first_index..header.num_slots() as usize {
+            let slot = unsafe { obj_ptr.add(HEADER_SIZE + index * SLOT_SIZE) } as *mut u8;
+            let value = unsafe { cratonvm_types::read_value_atomic(slot as *const Value) };
+            if let Value::Object(Some(reference)) = value {
+                visit(slot, reference.as_ptr() as usize, false);
+            }
+        }
+    }
+}
+
+fn write_flat_object_reference(slot: *mut u8, raw: usize, compact: bool) {
+    if compact {
+        unsafe { std::ptr::write(slot as *mut u64, raw as u64) };
+    } else {
+        let value = Value::Object(Some(unsafe { ObjectRef::from_raw(raw as *mut u8) }));
+        unsafe { cratonvm_types::write_value_atomic(slot as *mut Value, value) };
+    }
 }
 
 #[inline]
@@ -163,13 +219,7 @@ fn array_element_to_bytes(element_type: ArrayElementType, value: Value, raw: &mu
 /// freshness signal that removes the `pointer_map.contains_key` evacuation
 /// TOCTOU at the ref-scan sites.
 fn parallel_evac_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("CRATONVM_G1_PARALLEL_EVAC")
-            .ok()
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
-    })
+    gc_flags().g1_parallel_evac
 }
 
 // ===========================================================================
@@ -514,7 +564,7 @@ impl<'a> SharedEvac<'a> {
     ) {
         let (kind, etype, alen, nslots) = {
             let h = &*(obj_ptr as *const ObjectHeader);
-            (h.kind, h.element_type, h.array_length, h.num_slots)
+            (h.kind, h.element_type, h.array_length(), h.num_slots())
         };
         if kind == ObjectKind::Array {
             if etype == ArrayElementType::Reference {
@@ -626,8 +676,8 @@ impl<'a> SharedEvac<'a> {
                 (
                     header.kind,
                     header.element_type,
-                    header.array_length,
-                    header.num_slots,
+                    header.array_length(),
+                    header.num_slots(),
                     is_filler,
                     sz,
                 )
@@ -1762,7 +1812,7 @@ impl G1Collector {
                     regions[cset_idx].region_type = RegionType::Survivor;
                 }
             } else {
-                if std::env::var_os("CRATONVM_G1_DBG_REACH").is_some() {
+                if gc_flags().g1_dbg_reach {
                     eprintln!(
                         "[g1][FREED] evac region={cset_idx} type={:?} cursor={:#x}",
                         regions[cset_idx].region_type, regions[cset_idx].cursor
@@ -1820,7 +1870,7 @@ impl G1Collector {
         // Diagnostic kill-switch (bisection aid): CRATONVM_G1_NO_EVAC_RETRY=1
         // restores the single-pass behaviour (and with it, the kept-region
         // death spiral under to-space exhaustion).
-        if std::env::var_os("CRATONVM_G1_NO_EVAC_RETRY").is_some() {
+        if gc_flags().g1_no_evac_retry {
             return first;
         }
 
@@ -1858,7 +1908,7 @@ impl G1Collector {
         let mut passes = 1usize;
         while !seeds.is_empty() && passes < MAX_EVAC_RETRY_PASSES {
             let drain = self.drain_kept_self_forwards(&seeds, roots, monitors);
-            if std::env::var_os("CRATONVM_G1_DBG_REACH").is_some() {
+            if gc_flags().g1_dbg_reach {
                 eprintln!(
                     "[g1][RETRY] drain pass={} seeds={} copied={} freed={} forwards={}",
                     passes + 1,
@@ -1942,7 +1992,7 @@ impl G1Collector {
         };
         if header.kind == ObjectKind::Array {
             if header.element_type == ArrayElementType::Reference {
-                for i in 0..header.array_length as usize {
+                for i in 0..header.array_length() as usize {
                     // SAFETY: i < array_length — inside the allocation.
                     let raw =
                         unsafe { std::ptr::read(obj_ptr.add(HEADER_SIZE + i * 8) as *const u64) };
@@ -1950,15 +2000,7 @@ impl G1Collector {
                 }
             }
         } else {
-            for slot_idx in 0..header.num_slots as usize {
-                // SAFETY: slot_idx < num_slots — inside the allocation. STW:
-                // no concurrent mutator stores, plain reads are fine.
-                let slot_ptr = unsafe { obj_ptr.add(HEADER_SIZE + slot_idx * SLOT_SIZE) };
-                let value = unsafe { cratonvm_types::read_value_atomic(slot_ptr as *const Value) };
-                if let Value::Object(Some(r)) = value {
-                    record(r.as_ptr() as usize);
-                }
-            }
+            for_each_flat_object_reference(obj_ptr, header, 0, |_, raw, _| record(raw));
         }
     }
 
@@ -2157,7 +2199,7 @@ impl G1Collector {
         // from the CSet, exactly like JNI-pinned regions. Empty unless a thread
         // is in JIT (the common case for a JIT-triggered young GC).
         let jit_pinned_regions = self.jit_pinned_region_set();
-        if std::env::var_os("CRATONVM_G1_DBG_PINS").is_some() {
+        if gc_flags().g1_dbg_pins {
             eprintln!(
                 "[g1][PINS] young pause: jit_active={} pin_addrs={} pin_regions={:?}",
                 crate::gc_quiescence::is_active(),
@@ -2279,7 +2321,7 @@ impl G1Collector {
             .iter()
             .flat_map(|(_, srcs)| srcs.iter().copied())
             .collect();
-        let dbg_phases = std::env::var_os("CRATONVM_G1_DBG_REACH").is_some();
+        let dbg_phases = gc_flags().g1_dbg_reach;
         let p1_forwards = pointer_map.len();
         unique_sources.extend(jit_pinned_regions.iter().copied());
         if dbg_phases {
@@ -2835,10 +2877,8 @@ impl G1Collector {
         // Diagnostic override: `CRATONVM_G1_WORKERS=N` forces the worker count
         // (e.g. =1 to drain the parallel path serially and isolate concurrency
         // races from logic divergences). Falls back to the config otherwise.
-        if let Some(v) = std::env::var_os("CRATONVM_G1_WORKERS") {
-            if let Some(n) = v.to_str().and_then(|s| s.trim().parse::<usize>().ok()) {
-                return n.max(1);
-            }
+        if let Some(n) = gc_flags().g1_workers {
+            return n;
         }
         let cfg = self.config.gc_worker_threads.max(1);
         let avail = std::thread::available_parallelism()
@@ -3583,8 +3623,8 @@ impl G1Collector {
                 old_ptr,
                 obj_size,
                 header.kind as u8,
-                header.num_slots,
-                header.array_length,
+                header.num_slots(),
+                header.array_length(),
             );
             return None;
         }
@@ -3703,7 +3743,7 @@ impl G1Collector {
     ) {
         if header.kind == ObjectKind::Array {
             if header.element_type == ArrayElementType::Reference {
-                for i in 0..header.array_length as usize {
+                for i in 0..header.array_length() as usize {
                     let slot_ptr = unsafe { obj_ptr.add(HEADER_SIZE + i * 8) };
                     let raw: u64 = unsafe { std::ptr::read(slot_ptr as *const u64) };
                     if raw != 0 {
@@ -3751,47 +3791,34 @@ impl G1Collector {
                 }
             }
         } else {
-            for slot_idx in 0..header.num_slots as usize {
-                let slot_ptr = unsafe { obj_ptr.add(HEADER_SIZE + slot_idx * SLOT_SIZE) };
-                let value = unsafe { std::ptr::read(slot_ptr as *const Value) };
-                if let Value::Object(Some(ref_obj)) = value {
-                    let ref_ptr = ref_obj.as_ptr();
-                    if let Some(region_idx) = self.region_for_ptr(regions, ref_ptr) {
-                        if cset.contains(&region_idx) {
-                            // Round-5 fix (CRIT, O(N²)): only push the
-                            // forwarded target onto the worklist when this
-                            // call site actually evacuated it. Step 9: the
-                            // freshness comes from the evacuation outcome
-                            // (`fresh`), not a separate `contains_key`
-                            // pre-check (a TOCTOU under parallel evacuation).
-                            if let Some((new_ptr, fresh)) = self.evacuate_object(
-                                regions,
-                                ref_ptr,
-                                pointer_map,
-                                objects_copied,
-                                bytes_copied,
-                                cset,
-                            ) {
-                                let new_value =
-                                    Value::Object(Some(unsafe { ObjectRef::from_raw(new_ptr) }));
-                                unsafe {
-                                    std::ptr::write(slot_ptr as *mut Value, new_value);
-                                }
-                                if fresh {
-                                    work_list.push(new_ptr);
-                                }
-                            }
-                        } else if let Some(&new_addr) = pointer_map.get(&(ref_ptr as usize)) {
-                            let new_value = Value::Object(Some(unsafe {
-                                ObjectRef::from_raw(new_addr as *mut u8)
-                            }));
-                            unsafe {
-                                std::ptr::write(slot_ptr as *mut Value, new_value);
+            for_each_flat_object_reference(obj_ptr, header, 0, |slot_ptr, raw, compact| {
+                let ref_ptr = raw as *mut u8;
+                if let Some(region_idx) = self.region_for_ptr(regions, ref_ptr) {
+                    if cset.contains(&region_idx) {
+                        // Round-5 fix (CRIT, O(N²)): only push the
+                        // forwarded target onto the worklist when this
+                        // call site actually evacuated it. Step 9: the
+                        // freshness comes from the evacuation outcome
+                        // (`fresh`), not a separate `contains_key`
+                        // pre-check (a TOCTOU under parallel evacuation).
+                        if let Some((new_ptr, fresh)) = self.evacuate_object(
+                            regions,
+                            ref_ptr,
+                            pointer_map,
+                            objects_copied,
+                            bytes_copied,
+                            cset,
+                        ) {
+                            write_flat_object_reference(slot_ptr, new_ptr as usize, compact);
+                            if fresh {
+                                work_list.push(new_ptr);
                             }
                         }
+                    } else if let Some(&new_addr) = pointer_map.get(&raw) {
+                        write_flat_object_reference(slot_ptr, new_addr, compact);
                     }
                 }
-            }
+            });
         }
     }
 
@@ -3852,7 +3879,7 @@ impl G1Collector {
             }
             let obj_size = object_total_size(header);
             if obj_size < HEADER_SIZE || offset + obj_size > cursor {
-                if std::env::var_os("CRATONVM_G1_DBG_REACH").is_some() {
+                if gc_flags().g1_dbg_reach {
                     eprintln!(
                         "[g1][WALKBRK] source-scan region={source_idx} off={offset:#x} \
                          cursor={cursor:#x} obj_size={obj_size:#x}"
@@ -3868,7 +3895,7 @@ impl G1Collector {
             // scan_and_evacuate_refs helper).
             if header.kind == ObjectKind::Array {
                 if header.element_type == ArrayElementType::Reference {
-                    for i in 0..header.array_length as usize {
+                    for i in 0..header.array_length() as usize {
                         let slot_ptr = unsafe { obj_ptr.add(HEADER_SIZE + i * 8) };
                         let raw: u64 = unsafe { std::ptr::read(slot_ptr as *const u64) };
                         if raw == 0 {
@@ -3899,34 +3926,25 @@ impl G1Collector {
                     }
                 }
             } else {
-                for slot_idx in 0..header.num_slots as usize {
-                    let slot_ptr = unsafe { obj_ptr.add(HEADER_SIZE + slot_idx * SLOT_SIZE) };
-                    let value = unsafe { std::ptr::read(slot_ptr as *const Value) };
-                    if let Value::Object(Some(ref_obj)) = value {
-                        let ref_ptr = ref_obj.as_ptr();
-                        if let Some(ridx) = self.region_for_ptr(regions, ref_ptr) {
-                            if cset.contains(&ridx) {
-                                // Step 9: `fresh` ignored (see the Array branch).
-                                if let Some((new_ptr, _fresh)) = self.evacuate_object(
-                                    regions,
-                                    ref_ptr,
-                                    pointer_map,
-                                    objects_copied,
-                                    bytes_copied,
-                                    cset,
-                                ) {
-                                    let new_value = Value::Object(Some(unsafe {
-                                        ObjectRef::from_raw(new_ptr)
-                                    }));
-                                    unsafe {
-                                        std::ptr::write(slot_ptr as *mut Value, new_value);
-                                    }
-                                    work_list.push(new_ptr);
-                                }
+                for_each_flat_object_reference(obj_ptr, header, 0, |slot_ptr, raw, compact| {
+                    let ref_ptr = raw as *mut u8;
+                    if let Some(ridx) = self.region_for_ptr(regions, ref_ptr) {
+                        if cset.contains(&ridx) {
+                            // Step 9: `fresh` ignored (see the Array branch).
+                            if let Some((new_ptr, _fresh)) = self.evacuate_object(
+                                regions,
+                                ref_ptr,
+                                pointer_map,
+                                objects_copied,
+                                bytes_copied,
+                                cset,
+                            ) {
+                                write_flat_object_reference(slot_ptr, new_ptr as usize, compact);
+                                work_list.push(new_ptr);
                             }
                         }
                     }
-                }
+                });
             }
 
             offset += obj_size;
@@ -4004,7 +4022,7 @@ impl G1Collector {
                 let obj_size = object_total_size(header);
 
                 if obj_size < HEADER_SIZE || offset + obj_size > cursor {
-                    if std::env::var_os("CRATONVM_G1_DBG_REACH").is_some() {
+                    if gc_flags().g1_dbg_reach {
                         eprintln!(
                             "[g1][WALKBRK] phase4 region={i} off={offset:#x} \
                              cursor={cursor:#x} obj_size={obj_size:#x}"
@@ -4055,7 +4073,7 @@ impl G1Collector {
         let data_start = unsafe { obj_ptr.add(HEADER_SIZE) };
         if header.kind == ObjectKind::Array {
             if header.element_type == ArrayElementType::Reference {
-                for k in 0..header.array_length as usize {
+                for k in 0..header.array_length() as usize {
                     let raw: u64 = unsafe { std::ptr::read(data_start.add(k * 8) as *const u64) };
                     if raw == 0 {
                         continue;
@@ -4068,16 +4086,13 @@ impl G1Collector {
                 }
             }
         } else {
-            for s in 0..header.num_slots as usize {
-                let v = unsafe { std::ptr::read(data_start.add(s * SLOT_SIZE) as *const Value) };
-                if let Value::Object(Some(r)) = v {
-                    if let Some(j) = self.lookup_region_for_addr(r.as_ptr() as usize) {
-                        if j != holder && is_collectable_region_type(regions[j].region_type) {
-                            out.push((j, holder));
-                        }
+            for_each_flat_object_reference(obj_ptr, header, 0, |_, raw, _| {
+                if let Some(j) = self.lookup_region_for_addr(raw) {
+                    if j != holder && is_collectable_region_type(regions[j].region_type) {
+                        out.push((j, holder));
                     }
                 }
-            }
+            });
         }
     }
 
@@ -4166,7 +4181,7 @@ impl G1Collector {
                 let data_start = unsafe { obj_ptr.add(HEADER_SIZE) };
                 if header.kind == ObjectKind::Array {
                     if header.element_type == ArrayElementType::Reference {
-                        for k in 0..header.array_length as usize {
+                        for k in 0..header.array_length() as usize {
                             let slot_ptr = unsafe { data_start.add(k * 8) };
                             let raw: u64 = unsafe { std::ptr::read(slot_ptr as *const u64) };
                             if is_dangling(raw as usize) {
@@ -4175,16 +4190,11 @@ impl G1Collector {
                         }
                     }
                 } else {
-                    for slot_idx in 0..header.num_slots as usize {
-                        let slot_ptr = unsafe { data_start.add(slot_idx * SLOT_SIZE) };
-                        let value = unsafe { std::ptr::read(slot_ptr as *const Value) };
-                        if let Value::Object(Some(ref_obj)) = value {
-                            let ref_addr = ref_obj.as_ptr() as usize;
-                            if is_dangling(ref_addr) {
-                                self.report_dangling_cset_ref(i, obj_ptr as usize, ref_addr);
-                            }
+                    for_each_flat_object_reference(obj_ptr, header, 0, |_, raw, _| {
+                        if is_dangling(raw) {
+                            self.report_dangling_cset_ref(i, obj_ptr as usize, raw);
                         }
-                    }
+                    });
                 }
 
                 offset += obj_size;
@@ -4246,7 +4256,7 @@ impl G1Collector {
         pointer_map: &HashMap<usize, usize>,
         roots: &[ObjectRef],
     ) {
-        if std::env::var_os("CRATONVM_G1_DBG_HEADERS").is_none() {
+        if !gc_flags().g1_dbg_headers {
             return;
         }
         // (0) OVERLAP DETECTOR: two distinct from-space objects forwarded to the
@@ -4361,7 +4371,7 @@ impl G1Collector {
                 let data = unsafe { obj_ptr.add(HEADER_SIZE) };
                 if header.kind == ObjectKind::Array {
                     if header.element_type == ArrayElementType::Reference {
-                        for k in 0..header.array_length as usize {
+                        for k in 0..header.array_length() as usize {
                             let raw =
                                 unsafe { std::ptr::read(data.add(k * 8) as *const u64) } as usize;
                             if raw != 0 {
@@ -4370,12 +4380,9 @@ impl G1Collector {
                         }
                     }
                 } else {
-                    for s in 0..header.num_slots as usize {
-                        let v = unsafe { std::ptr::read(data.add(s * SLOT_SIZE) as *const Value) };
-                        if let Value::Object(Some(o)) = v {
-                            check(obj_ptr as usize, "field", o.as_ptr() as usize);
-                        }
-                    }
+                    for_each_flat_object_reference(obj_ptr, header, 0, |_, raw, _| {
+                        check(obj_ptr as usize, "field", raw);
+                    });
                 }
                 offset += obj_size;
             }
@@ -4401,7 +4408,7 @@ impl G1Collector {
         cset_set: &std::collections::HashSet<usize>,
         roots: &[ObjectRef],
     ) {
-        if std::env::var_os("CRATONVM_G1_DBG_ZERO").is_none() {
+        if !gc_flags().g1_dbg_zero {
             return;
         }
         let mut hits = 0usize;
@@ -4411,9 +4418,9 @@ impl G1Collector {
             }
             let h = unsafe { &*(addr as *const ObjectHeader) };
             h.class_id.as_u32() == 0
-                && h.num_slots == 0
+                && h.num_slots() == 0
                 && (h.kind as u8) == 0
-                && h.array_length == 0
+                && h.array_length() == 0
         };
         let mut report = |holder: usize, hreg: Option<usize>, where_: &str, target: usize| {
             if is_zeroed(target) {
@@ -4464,19 +4471,16 @@ impl G1Collector {
                 let data = unsafe { obj_ptr.add(HEADER_SIZE) };
                 if header.kind == ObjectKind::Array {
                     if header.element_type == ArrayElementType::Reference {
-                        for k in 0..header.array_length as usize {
+                        for k in 0..header.array_length() as usize {
                             let raw =
                                 unsafe { std::ptr::read(data.add(k * 8) as *const u64) } as usize;
                             report(obj_ptr as usize, Some(ridx), "array-elem", raw);
                         }
                     }
                 } else {
-                    for s in 0..header.num_slots as usize {
-                        let v = unsafe { std::ptr::read(data.add(s * SLOT_SIZE) as *const Value) };
-                        if let Value::Object(Some(o)) = v {
-                            report(obj_ptr as usize, Some(ridx), "field", o.as_ptr() as usize);
-                        }
-                    }
+                    for_each_flat_object_reference(obj_ptr, header, 0, |_, raw, _| {
+                        report(obj_ptr as usize, Some(ridx), "field", raw);
+                    });
                 }
                 off += sz;
             }
@@ -4501,7 +4505,7 @@ impl G1Collector {
         roots: &[ObjectRef],
         label: &str,
     ) {
-        if std::env::var_os("CRATONVM_G1_DBG_REACH").is_none() {
+        if !gc_flags().g1_dbg_reach {
             return;
         }
         static PAUSE_NO: AtomicUsize = AtomicUsize::new(0);
@@ -4513,9 +4517,9 @@ impl G1Collector {
             // requiring it zero here keeps a live bare `new Object()` (which
             // legitimately has class_id 0 / no slots) from false-positiving.
             h.class_id.as_u32() == 0
-                && h.num_slots == 0
+                && h.num_slots() == 0
                 && (h.kind as u8) == 0
-                && h.array_length == 0
+                && h.array_length() == 0
                 && h.identity_hash_code == 0
         };
 
@@ -4541,8 +4545,8 @@ impl G1Collector {
                         (
                             hh.class_id.as_u32(),
                             hh.kind as u8,
-                            hh.num_slots,
-                            hh.array_length,
+                            hh.num_slots(),
+                            hh.array_length(),
                         )
                     } else {
                         (0, 0, 0, 0)
@@ -4586,27 +4590,15 @@ impl G1Collector {
             if header.kind == ObjectKind::Array {
                 if header.element_type == ArrayElementType::Reference {
                     let data = unsafe { (addr as *const u8).add(HEADER_SIZE) };
-                    for k in 0..header.array_length as usize {
+                    for k in 0..header.array_length() as usize {
                         let raw = unsafe { std::ptr::read(data.add(k * 8) as *const u64) } as usize;
                         check_push(raw, addr, "array-elem", k, &mut stack, &mut seen, &mut bad);
                     }
                 }
             } else {
-                let data = unsafe { (addr as *const u8).add(HEADER_SIZE) };
-                for s in 0..header.num_slots as usize {
-                    let v = unsafe { std::ptr::read(data.add(s * SLOT_SIZE) as *const Value) };
-                    if let Value::Object(Some(o)) = v {
-                        check_push(
-                            o.as_ptr() as usize,
-                            addr,
-                            "field",
-                            s,
-                            &mut stack,
-                            &mut seen,
-                            &mut bad,
-                        );
-                    }
-                }
+                for_each_flat_object_reference(addr as *mut u8, header, 0, |_, raw, _| {
+                    check_push(raw, addr, "field", 0, &mut stack, &mut seen, &mut bad);
+                });
             }
         }
         if bad > 0 {
@@ -4621,7 +4613,7 @@ impl G1Collector {
         // reach counts, to identify a stale root anchoring a large dead
         // subgraph (e.g. a historical list node retaining everything appended
         // after it through `next` chains).
-        if std::env::var_os("CRATONVM_G1_DBG_ROOTCENSUS").is_some() {
+        if gc_flags().g1_dbg_rootcensus {
             for (ri, r) in roots.iter().enumerate() {
                 let addr = r.as_ptr() as usize;
                 if addr == 0 || self.lookup_region_for_addr(addr).is_none() {
@@ -4635,7 +4627,7 @@ impl G1Collector {
                     let data = unsafe { (a as *const u8).add(HEADER_SIZE) };
                     if h.kind == ObjectKind::Array {
                         if h.element_type == ArrayElementType::Reference {
-                            for k in 0..h.array_length as usize {
+                            for k in 0..h.array_length() as usize {
                                 let raw = unsafe { std::ptr::read(data.add(k * 8) as *const u64) }
                                     as usize;
                                 if raw != 0
@@ -4647,7 +4639,7 @@ impl G1Collector {
                             }
                         }
                     } else {
-                        for s in 0..h.num_slots as usize {
+                        for s in 0..h.num_slots() as usize {
                             let v =
                                 unsafe { std::ptr::read(data.add(s * SLOT_SIZE) as *const Value) };
                             if let Value::Object(Some(o)) = v {
@@ -4664,7 +4656,7 @@ impl G1Collector {
                     // Diagnostic slot peek: for SteadyChurn-shaped objects,
                     // slot 1 is the `seq` int — identifies WHICH node/payload
                     // anchors the subgraph (ancient seq ⟹ stale root).
-                    let slot1 = if h.num_slots >= 2 {
+                    let slot1 = if h.num_slots() >= 2 {
                         let v = unsafe {
                             std::ptr::read(
                                 (addr as *const u8).add(HEADER_SIZE + SLOT_SIZE) as *const Value
@@ -4679,7 +4671,7 @@ impl G1Collector {
                          slots={} reach={} slot1={slot1}",
                         h.class_id.as_u32(),
                         h.kind as u8,
-                        h.num_slots,
+                        h.num_slots(),
                         rseen.len()
                     );
                 }
@@ -5243,7 +5235,7 @@ impl G1Collector {
         if header.kind == ObjectKind::Array {
             if header.element_type == ArrayElementType::Reference {
                 // Reference array: 8-byte compact slot per element.
-                for i in 0..header.array_length as usize {
+                for i in 0..header.array_length() as usize {
                     let raw: u64 = read_ref(i * 8);
                     if raw == 0 {
                         continue;
@@ -5282,50 +5274,116 @@ impl G1Collector {
                     0
                 }
             };
-            // Object: 16-byte Value slot per field.
-            for slot_idx in first_slot..header.num_slots as usize {
-                let payload_off = slot_idx * SLOT_SIZE;
-                let value = if let Some((start, total_payload)) = humongous_start {
-                    // Region-aware 16-byte read for humongous objects.
-                    let mut buf = [0u8; SLOT_SIZE];
-                    if !self.humongous_copy(
-                        regions,
-                        start,
-                        total_payload,
-                        payload_off,
-                        buf.as_mut_ptr(),
-                        SLOT_SIZE,
-                        false,
-                    ) {
-                        continue;
-                    }
-                    value_from_bytes(&buf)
-                } else {
-                    // SAFETY: slot_idx < num_slots, within the allocated object.
-                    let slot_ptr = unsafe { obj_ptr.add(HEADER_SIZE + payload_off) };
-                    // Concurrent-mark torn-read fix: this scan runs concurrently
-                    // with JIT-compiled field stores, which write the 16-byte
-                    // slot directly (bypassing the regions-lock-serialized
-                    // `set_field`). Read the slot as two atomic words so the
-                    // access is well-defined and cannot splice a garbage pointer.
-                    // SAFETY: slot_ptr is a properly aligned live Value slot.
-                    unsafe { cratonvm_types::read_value_atomic(slot_ptr as *const Value) }
-                };
-                if let Value::Object(Some(ref_obj)) = value {
-                    let ref_ptr = ref_obj.as_ptr();
-                    if let Some(idx) = region_for(ref_ptr) {
-                        if !regions[idx].mark_bitmap.is_marked(ref_ptr as usize) {
-                            // Round-9 gc HIGH-5: graceful overflow — drop
-                            // the push and record the event so remark
-                            // can run a conservative full re-walk.
-                            if worklist.len() >= MARK_WORKLIST_CAP {
-                                self.mark_worklist_overflowed.store(true, Ordering::Relaxed);
-                            } else {
-                                worklist.push(ref_ptr as usize);
+            if cratonvm_types::is_compact_object(header) {
+                // Borrowing accessor: the mark walk only reads `field_offsets` /
+                // `is_ref`, so it need not pay an `Arc` clone/drop per marked
+                // object.
+                let _ = cratonvm_types::with_class_layout(
+                    header.class_id.as_u32(),
+                    header.num_slots(),
+                    |layout| {
+                        for (slot_idx, (&payload_off, &is_ref)) in layout
+                            .field_offsets
+                            .iter()
+                            .zip(layout.is_ref.iter())
+                            .enumerate()
+                        {
+                            if !is_ref || slot_idx < first_slot {
+                                continue;
+                            }
+                            let raw = read_ref(payload_off as usize);
+                            if raw == 0 {
+                                continue;
+                            }
+                            let ref_ptr = raw as usize as *mut u8;
+                            if let Some(idx) = region_for(ref_ptr) {
+                                if !regions[idx].mark_bitmap.is_marked(ref_ptr as usize) {
+                                    if worklist.len() >= MARK_WORKLIST_CAP {
+                                        self.mark_worklist_overflowed
+                                            .store(true, Ordering::Relaxed);
+                                    } else {
+                                        worklist.push(ref_ptr as usize);
+                                    }
+                                }
+                            }
+                        }
+                    },
+                );
+            } else {
+                // Legacy object: 16-byte Value slot per field.
+                for slot_idx in first_slot..header.num_slots() as usize {
+                    let payload_off = slot_idx * SLOT_SIZE;
+                    let value = if let Some((start, total_payload)) = humongous_start {
+                        let mut buf = [0u8; SLOT_SIZE];
+                        if !self.humongous_copy(
+                            regions,
+                            start,
+                            total_payload,
+                            payload_off,
+                            buf.as_mut_ptr(),
+                            SLOT_SIZE,
+                            false,
+                        ) {
+                            continue;
+                        }
+                        value_from_bytes(&buf)
+                    } else {
+                        let slot_ptr = unsafe { obj_ptr.add(HEADER_SIZE + payload_off) };
+                        unsafe { cratonvm_types::read_value_atomic(slot_ptr as *const Value) }
+                    };
+                    if let Value::Object(Some(ref_obj)) = value {
+                        let ref_ptr = ref_obj.as_ptr();
+                        if let Some(idx) = region_for(ref_ptr) {
+                            if !regions[idx].mark_bitmap.is_marked(ref_ptr as usize) {
+                                // Round-9 gc HIGH-5: graceful overflow — drop
+                                // the push and record the event so remark
+                                // can run a conservative full re-walk.
+                                if worklist.len() >= MARK_WORKLIST_CAP {
+                                    self.mark_worklist_overflowed.store(true, Ordering::Relaxed);
+                                } else {
+                                    worklist.push(ref_ptr as usize);
+                                }
                             }
                         }
                     }
                 }
+            }
+        }
+
+        // Class-loader-data side edges. CratonVM stores these relationships in
+        // VM side tables rather than traceable Java fields:
+        //
+        //   live instance -> defining loader
+        //   live defining loader -> class mirrors and metadata oops
+        //
+        // Root gathering publishes the mirror/metadata tables only for G1's
+        // initial/final full-mark snapshots, never for an evacuating young
+        // pause. The concurrent marker can therefore follow them exactly like
+        // ordinary object references without making the loader itself a root.
+        let mut enqueue = |addr: usize| {
+            let ptr = addr as *mut u8;
+            if let Some(idx) = region_for(ptr) {
+                if !regions[idx].mark_bitmap.is_marked(addr) {
+                    if worklist.len() >= MARK_WORKLIST_CAP {
+                        self.mark_worklist_overflowed.store(true, Ordering::Relaxed);
+                    } else {
+                        worklist.push(addr);
+                    }
+                }
+            }
+        };
+        if let Some(loader) = cratonvm_types::loader_pin::loader_pin_addr(header.class_id.as_u32())
+        {
+            enqueue(loader);
+        }
+        if let Some(mirrors) = cratonvm_types::mirror_pin::mirrors_for_loader(obj_ptr as usize) {
+            for mirror in mirrors {
+                enqueue(mirror);
+            }
+        }
+        if let Some(metadata) = cratonvm_types::metadata_pin::roots_for_loader(obj_ptr as usize) {
+            for object in metadata {
+                enqueue(object);
             }
         }
     }
@@ -5585,7 +5643,7 @@ impl G1Collector {
                 && region.region_type == RegionType::Old
                 && !region.pinned
             {
-                if std::env::var_os("CRATONVM_G1_DBG_REACH").is_some() {
+                if gc_flags().g1_dbg_reach {
                     eprintln!(
                         "[g1][FREED] cleanup region={region_idx} cursor={:#x}",
                         region.cursor
@@ -5913,7 +5971,7 @@ impl G1Collector {
             stats.objects_copied,
             stats.bytes_copied,
             stats.bytes_freed,
-            if std::env::var_os("CRATONVM_G1_DBG_REACH").is_some() {
+            if gc_flags().g1_dbg_reach {
                 // try_lock: the collection paths call this while still holding
                 // the regions guard (diagnostic-only; skip the counts then).
                 if let Some(regions) = self.regions.try_lock() {
@@ -6693,10 +6751,10 @@ impl G1Collector {
         // the JVM `Integer.MAX_VALUE` ceiling (matches `array_length()`).
         const MAX_PLAUSIBLE_SLOTS: u32 = 1 << 24;
         let is_array = kind == ObjectKind::Array;
-        if !is_array && header.num_slots > MAX_PLAUSIBLE_SLOTS {
+        if !is_array && header.num_slots() > MAX_PLAUSIBLE_SLOTS {
             return None;
         }
-        if is_array && header.array_length > i32::MAX as u32 {
+        if is_array && header.array_length() > i32::MAX as u32 {
             return None;
         }
         Some(unsafe { ObjectRef::from_raw(raw as *mut u8) })
@@ -6853,8 +6911,37 @@ impl G1Collector {
 
 impl GarbageCollector for G1Collector {
     fn alloc_object(&self, class_id: ClassId, num_fields: usize) -> ObjectRef {
-        let total_size = HEADER_SIZE + num_fields * SLOT_SIZE;
+        let compact_body = cratonvm_types::compact_object_body_size(class_id.as_u32(), num_fields);
+        let body_size = compact_body.unwrap_or(num_fields * SLOT_SIZE);
+        let total_size = HEADER_SIZE + body_size;
         let (ptr, _region) = self.alloc_in_region(total_size).unwrap_or_else(|| {
+            if gc_flags().g1_dbg_diag {
+                let regions = self.regions.lock();
+                let mut free = 0usize;
+                let mut eden = 0usize;
+                let mut survivor = 0usize;
+                let mut old = 0usize;
+                let mut hstart = 0usize;
+                let mut hcont = 0usize;
+                for r in regions.iter() {
+                    match r.region_type {
+                        RegionType::Free => free += 1,
+                        RegionType::Eden => eden += 1,
+                        RegionType::Survivor => survivor += 1,
+                        RegionType::Old => old += 1,
+                        RegionType::HumongousStart => hstart += 1,
+                        RegionType::HumongousContinuation => hcont += 1,
+                    }
+                }
+                eprintln!(
+                    "DBG-G1DIAG: heap_size={} region_size={} num_regions={} free={} eden={} survivor={} old={} hstart={} hcont={} collection_count={}",
+                    self.config.heap_size,
+                    self.config.region_size,
+                    regions.len(),
+                    free, eden, survivor, old, hstart, hcont,
+                    self.collection_count.load(Ordering::Relaxed)
+                );
+            }
             eprintln!(
                 "FATAL: G1: out of heap space for object allocation ({} bytes)",
                 total_size
@@ -6862,7 +6949,7 @@ impl GarbageCollector for G1Collector {
             std::process::abort();
         });
 
-        let header = ObjectHeader::new(
+        let mut header = ObjectHeader::new(
             class_id,
             ObjectKind::Object,
             ArrayElementType::Reference,
@@ -6870,6 +6957,9 @@ impl GarbageCollector for G1Collector {
             0,
             u32::try_from(num_fields).expect("field count exceeds u32::MAX"),
         );
+        if let Some(body) = compact_body {
+            header.set_compact_shape(num_fields as u32, body);
+        }
 
         unsafe {
             std::ptr::write(ptr as *mut ObjectHeader, header);
@@ -6945,7 +7035,7 @@ impl GarbageCollector for G1Collector {
         // header or an out-of-layout index must NOT dereference arbitrary
         // memory — return a benign null read instead, matching gen_heap.
         let header = self.get_header(obj);
-        let num_slots = header.num_slots as usize;
+        let num_slots = header.num_slots() as usize;
         if num_slots > (1 << 24) {
             tracing::debug!(
                 target: "cratonvm::gc::guard",
@@ -6969,8 +7059,11 @@ impl GarbageCollector for G1Collector {
             return Value::Object(None);
         }
 
-        let total_size = HEADER_SIZE + num_slots * SLOT_SIZE;
-        let payload_off = index * SLOT_SIZE;
+        let compact = cratonvm_types::compact_object_field_storage(header, index);
+        let (payload_off, payload_size) = compact
+            .map(|(offset, storage)| (offset, storage.size_runtime() as usize))
+            .unwrap_or((index * SLOT_SIZE, SLOT_SIZE));
+        let total_size = object_total_size(header);
 
         // C2 (round-12 gc): humongous objects are region-fragmented; translate
         // the flat payload offset to the owning continuation region's buffer so
@@ -6978,17 +7071,29 @@ impl GarbageCollector for G1Collector {
         {
             let regions = self.regions.lock();
             if let Some((start, total_payload)) = self.humongous_span(&regions, obj, total_size) {
-                let mut tmp = [0u8; SLOT_SIZE];
+                let mut tmp = [0u64; 2];
                 if self.humongous_copy(
                     &regions,
                     start,
                     total_payload,
                     payload_off,
-                    tmp.as_mut_ptr(),
-                    SLOT_SIZE,
+                    tmp.as_mut_ptr().cast(),
+                    payload_size,
                     false,
                 ) {
-                    return value_from_bytes(&tmp);
+                    return if let Some((_, storage)) = compact {
+                        unsafe {
+                            cratonvm_types::read_compact_field(
+                                tmp.as_ptr().cast(),
+                                storage,
+                                Ordering::Relaxed,
+                            )
+                        }
+                    } else {
+                        let bytes =
+                            unsafe { &*(tmp.as_ptr().cast::<u8>() as *const [u8; SLOT_SIZE]) };
+                        value_from_bytes(bytes)
+                    };
                 }
                 return Value::Object(None);
             }
@@ -7004,7 +7109,11 @@ impl GarbageCollector for G1Collector {
         // #3 and commit 4e6b560f (the GC-marker-vs-JIT-store counterpart fix,
         // which covered g1::scan_object_refs but not this mutator-side path).
         let ptr = unsafe { obj.as_ptr().add(HEADER_SIZE + payload_off) };
-        unsafe { cratonvm_types::read_value_atomic(ptr as *const Value) }
+        if let Some((_, storage)) = compact {
+            unsafe { cratonvm_types::read_compact_field(ptr, storage, Ordering::Relaxed) }
+        } else {
+            unsafe { cratonvm_types::read_value_atomic(ptr as *const Value) }
+        }
     }
 
     fn set_field(&self, obj: ObjectRef, index: usize, value: Value) {
@@ -7012,7 +7121,7 @@ impl GarbageCollector for G1Collector {
         // out-of-layout writes rather than corrupting the neighboring object,
         // mirroring `GenerationalHeap::set_field`.
         let header = self.get_header(obj);
-        let num_slots = header.num_slots as usize;
+        let num_slots = header.num_slots() as usize;
         if num_slots > (1 << 24) {
             tracing::debug!(
                 target: "cratonvm::gc::guard",
@@ -7061,23 +7170,39 @@ impl GarbageCollector for G1Collector {
             }
         }
 
-        let total_size = HEADER_SIZE + num_slots * SLOT_SIZE;
-        let payload_off = index * SLOT_SIZE;
+        let compact = cratonvm_types::compact_object_field_storage(header, index);
+        let (payload_off, payload_size) = compact
+            .map(|(offset, storage)| (offset, storage.size_runtime() as usize))
+            .unwrap_or((index * SLOT_SIZE, SLOT_SIZE));
+        let total_size = object_total_size(header);
 
         // C2 (round-12 gc): route humongous stores through the region-aware
         // translation so the write can never escape the object's memory.
         let stored = {
             let regions = self.regions.lock();
             if let Some((start, total_payload)) = self.humongous_span(&regions, obj, total_size) {
-                let mut tmp = [0u8; SLOT_SIZE];
-                value_to_bytes(value, &mut tmp);
+                let mut tmp = [0u64; 2];
+                if let Some((_, storage)) = compact {
+                    unsafe {
+                        cratonvm_types::write_compact_field(
+                            tmp.as_mut_ptr().cast(),
+                            storage,
+                            value,
+                            Ordering::Relaxed,
+                        )
+                    };
+                } else {
+                    let bytes =
+                        unsafe { &mut *(tmp.as_mut_ptr().cast::<u8>() as *mut [u8; SLOT_SIZE]) };
+                    value_to_bytes(value, bytes);
+                }
                 self.humongous_copy(
                     &regions,
                     start,
                     total_payload,
                     payload_off,
-                    tmp.as_mut_ptr(),
-                    SLOT_SIZE,
+                    tmp.as_mut_ptr().cast(),
+                    payload_size,
                     true,
                 )
             } else {
@@ -7088,8 +7213,14 @@ impl GarbageCollector for G1Collector {
                 // `ptr::write::<Value>` -- see the matching note on
                 // `get_field`'s read side above.
                 let ptr = unsafe { obj.as_ptr().add(HEADER_SIZE + payload_off) };
-                unsafe {
-                    cratonvm_types::write_value_atomic(ptr as *mut Value, value);
+                if let Some((_, storage)) = compact {
+                    unsafe {
+                        cratonvm_types::write_compact_field(ptr, storage, value, Ordering::Relaxed)
+                    };
+                } else {
+                    unsafe {
+                        cratonvm_types::write_value_atomic(ptr as *mut Value, value);
+                    }
                 }
                 true
             }
@@ -7147,12 +7278,12 @@ impl GarbageCollector for G1Collector {
     }
 
     fn array_length(&self, obj: ObjectRef) -> usize {
-        self.get_header(obj).array_length as usize
+        self.get_header(obj).array_length() as usize
     }
 
     fn get_array_element(&self, obj: ObjectRef, index: usize) -> Result<Value, i32> {
         let header = self.get_header(obj);
-        let len = header.array_length as usize;
+        let len = header.array_length() as usize;
         if index >= len {
             return Err(index as i32);
         }
@@ -7197,7 +7328,7 @@ impl GarbageCollector for G1Collector {
 
     fn set_array_element(&self, obj: ObjectRef, index: usize, value: Value) -> Result<(), i32> {
         let header = self.get_header(obj);
-        let len = header.array_length as usize;
+        let len = header.array_length() as usize;
         if index >= len {
             return Err(index as i32);
         }
@@ -7292,6 +7423,28 @@ impl GarbageCollector for G1Collector {
         //    compares against `config.max_gc_pause_ms` — feeding a byte
         //    count (typically 10^4-10^8) caused the adaptive IHOP threshold
         //    to floor on essentially every collection.
+        if gc_flags().g1_dbg_diag {
+            let regions = self.regions.lock();
+            let mut free = 0usize;
+            let mut eden = 0usize;
+            let mut survivor = 0usize;
+            let mut old = 0usize;
+            for r in regions.iter() {
+                match r.region_type {
+                    RegionType::Free => free += 1,
+                    RegionType::Eden => eden += 1,
+                    RegionType::Survivor => survivor += 1,
+                    RegionType::Old => old += 1,
+                    _ => {}
+                }
+            }
+            let pinned = regions.iter().filter(|r| r.pinned).count();
+            eprintln!(
+                "DBG-G1DIAG-PRE: collection #{} regions={} free={} eden={} survivor={} old={} pinned={}",
+                self.collection_count.load(Ordering::Relaxed),
+                regions.len(), free, eden, survivor, old, pinned
+            );
+        }
         let pause_start = std::time::Instant::now();
         let result = if self.needs_mixed_gc() {
             self.mixed_collection(roots, monitors)
@@ -7300,6 +7453,12 @@ impl GarbageCollector for G1Collector {
         };
         let result = self.retry_after_evacuation_failure(result, roots, monitors);
         let pause_ms = pause_start.elapsed().as_millis() as u64;
+        if gc_flags().g1_dbg_diag {
+            eprintln!(
+                "DBG-G1DIAG-POST: objects_copied={} bytes_copied={} bytes_freed={}",
+                result.stats.objects_copied, result.stats.bytes_copied, result.stats.bytes_freed
+            );
+        }
 
         // 2. IHOP / concurrent-mark triggering is driven by the VM layer
         //    (`interpreter::maybe_concurrent_gc` -> `g1_concurrent_mark_cycle`),
@@ -7465,7 +7624,7 @@ fn find_contiguous_free(regions: &[G1Region], count: usize) -> Option<usize> {
 /// converts a hard process abort into a recoverable / fail-safe path.
 fn object_total_size(header: &ObjectHeader) -> usize {
     if header.kind == ObjectKind::Array {
-        match array_data_size(header.array_length as usize, header.element_type) {
+        match array_data_size(header.array_length() as usize, header.element_type) {
             Ok(data) => HEADER_SIZE + data,
             Err(_) => {
                 // Implausible array header — treat as corrupt. Return 0 so the
@@ -7474,7 +7633,7 @@ fn object_total_size(header: &ObjectHeader) -> usize {
                 tracing::warn!(
                     "g1: implausible array_length {} (element_type={:?}) in object header — \
                      treating as corrupt; caller will skip/stop the walk",
-                    header.array_length,
+                    header.array_length(),
                     header.element_type,
                 );
                 0
@@ -7662,7 +7821,7 @@ fn update_object_refs(
 
     if header.kind == ObjectKind::Array {
         if header.element_type == ArrayElementType::Reference {
-            for i in 0..header.array_length as usize {
+            for i in 0..header.array_length() as usize {
                 let slot_ptr = unsafe { data_start.add(i * 8) };
                 let raw: u64 = unsafe { std::ptr::read(slot_ptr as *const u64) };
                 if raw != 0 {
@@ -7675,20 +7834,11 @@ fn update_object_refs(
             }
         }
     } else {
-        for slot_idx in 0..header.num_slots as usize {
-            let slot_ptr = unsafe { data_start.add(slot_idx * SLOT_SIZE) };
-            let value = unsafe { std::ptr::read(slot_ptr as *const Value) };
-            if let Value::Object(Some(ref_obj)) = value {
-                let ref_addr = ref_obj.as_ptr() as usize;
-                if let Some(&new_addr) = pointer_map.get(&ref_addr) {
-                    let new_value =
-                        Value::Object(Some(unsafe { ObjectRef::from_raw(new_addr as *mut u8) }));
-                    unsafe {
-                        std::ptr::write(slot_ptr as *mut Value, new_value);
-                    }
-                }
+        for_each_flat_object_reference(obj_ptr, header, 0, |slot, raw, compact| {
+            if let Some(&new_addr) = pointer_map.get(&raw) {
+                write_flat_object_reference(slot, new_addr, compact);
             }
-        }
+        });
     }
 }
 
@@ -8039,7 +8189,7 @@ mod tests {
         let header = gc.get_header(obj);
         assert_eq!(header.class_id, ClassId::new(1));
         assert_eq!(header.kind, ObjectKind::Object);
-        assert_eq!(header.num_slots, 2);
+        assert_eq!(header.num_slots(), 2);
         assert_eq!(gc.count_regions(RegionType::Eden), 1);
     }
 
@@ -9880,7 +10030,7 @@ mod tests {
         assert!(obj.is_some());
         let obj = obj.unwrap();
         assert_eq!(gc.class_id_of(obj), ClassId::new(1));
-        assert_eq!(gc.get_header(obj).num_slots, 3);
+        assert_eq!(gc.get_header(obj).num_slots(), 3);
     }
 
     #[test]
@@ -10041,7 +10191,7 @@ mod tests {
         let obj = gc.try_alloc_object(ClassId::new(1), num_fields);
         assert!(obj.is_some());
         let obj = obj.unwrap();
-        assert_eq!(gc.get_header(obj).num_slots, num_fields as u32);
+        assert_eq!(gc.get_header(obj).num_slots(), num_fields as u32);
 
         // Verify the region is marked humongous
         let humongous_count = gc.count_regions(RegionType::HumongousStart);
@@ -11415,7 +11565,7 @@ mod tests {
         let gc = G1Collector::new(cfg);
         // Fill ~1.1 MB across the 2 regions with a held chain → both regions
         // become Eden (CSet), leaving 0 Free regions for evacuation to-space.
-        let n = 20000usize;
+        let n = 24000usize;
         let head = gc.alloc_object(ClassId::new(1), 1);
         let mut cur = head;
         for _ in 1..n {

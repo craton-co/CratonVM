@@ -588,7 +588,7 @@ pub(crate) fn resolve_module(root: &Path, name: &str) -> Result<ResolvedModule, 
     for coord in &mx.artifacts {
         match resolve_artifact_path(coord) {
             Some(path) => resource_roots.push(path),
-            None if std::env::var_os("CRATONVM_DBG_WF").is_some() => {
+            None if crate::nbflags().dbg_wf => {
                 eprintln!("[jboss-module] artifact {coord:?} did not resolve in local Maven repo");
             }
             None => {}
@@ -1188,13 +1188,13 @@ pub(crate) fn native_loader_load_module(
             ctx.unpin_native_roots(this_pin);
             return synthesize_platform_module(ctx, this_now, &name);
         }
-        if std::env::var_os("CRATONVM_DBG_WF").is_some() {
+        if crate::nbflags().dbg_wf {
             eprintln!("[jboss-module] loadModule({name}) no roots; receiver_has_finders={receiver_has_finders}");
         }
         return Err(throw_module_not_found(ctx, &name));
     }
 
-    let dbg_wf = std::env::var_os("CRATONVM_DBG_WF").is_some();
+    let dbg_wf = crate::nbflags().dbg_wf;
     if dbg_wf {
         eprintln!(
             "[jboss-module] loadModule({name}) receiver_has_finders={receiver_has_finders} roots={}",
@@ -1367,8 +1367,7 @@ pub(crate) fn native_loader_load_module(
         // resolution path covers the common case; re-enable this walk via
         // the env var only if a specific app regresses with a
         // `NoSuchMethodException` on its bootstrap entry class.
-        let brute_force_enabled =
-            std::env::var("CRATONVM_JBOSS_BRUTE_FORCE_JARS").as_deref() == Ok("1");
+        let brute_force_enabled = crate::nbflags().jboss_brute_force_jars;
         let brute_jars = if brute_force_enabled {
             brute_force_collect_layered_jars(&roots, &name)
         } else {
@@ -1443,8 +1442,7 @@ pub(crate) fn native_loader_load_module(
         // behavior is to run the real bytecode for every entry candidate
         // that loaded via `ensure_class_initialized` above, and to fail
         // loudly (rather than fake-out) for any that didn't.
-        let allow_synth_bytecode =
-            std::env::var("CRATONVM_USE_WILDFLY_SYNTH_BYTECODE").as_deref() == Ok("1");
+        let allow_synth_bytecode = crate::nbflags().use_wildfly_synth_bytecode;
         if !allow_synth_bytecode {
             // Skip the entire synthesis pass. Suppress dead-code warning
             // on the synthesis helper since it is now only called from
@@ -1984,7 +1982,7 @@ fn is_brute_force_trigger(name: &str) -> bool {
 /// Returns absolute paths of jar files (the caller passes them through
 /// `register_resource_roots` which dedupes against already-registered jars).
 fn brute_force_collect_layered_jars(roots: &[PathBuf], module_name: &str) -> Vec<PathBuf> {
-    let dbg_wf = std::env::var_os("CRATONVM_DBG_WF").is_some();
+    let dbg_wf = crate::nbflags().dbg_wf;
     let mut jars: Vec<PathBuf> = Vec::new();
     for root in roots {
         let key = format!("{}|{}", root.to_string_lossy(), module_name);
@@ -2245,12 +2243,13 @@ fn alloc_initialized_array_list(
 }
 
 fn jboss_services_diag_enabled() -> bool {
-    matches!(
-        std::env::var("CRATONVM_DIAG_JBOSS_SERVICES")
-            .or_else(|_| std::env::var("CRATONVM_DIAG_SERVICELOADER"))
-            .as_deref(),
-        Ok("1") | Ok("true") | Ok("yes")
-    )
+    // `CRATONVM_DIAG_JBOSS_SERVICES` wins whenever it is set to anything at
+    // all; the `CRATONVM_DIAG_SERVICELOADER` fallback fires only when it is
+    // unset, exactly as the original `var(..).or_else(|_| var(..))` chain did.
+    match crate::nbflags().diag_jboss_services.as_deref() {
+        Some(v) => matches!(v, "1" | "true" | "yes"),
+        None => crate::nbflags().diag_serviceloader,
+    }
 }
 
 fn module_find_services_load_class(
@@ -2593,7 +2592,7 @@ pub(crate) fn native_module_classloader_load_class(
     };
     let class_name = ctx.read_string(name_obj).unwrap_or_default();
     let internal = class_name.replace('.', "/");
-    let dbg = std::env::var_os("CRATONVM_DBG_MCL").is_some();
+    let dbg = crate::nbflags().dbg_mcl;
     if dbg {
         eprintln!("[mcl.loadClass] entry name={class_name:?}");
     }

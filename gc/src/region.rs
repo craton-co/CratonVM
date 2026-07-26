@@ -660,13 +660,10 @@ impl RegionHeap {
                             (*dst_hdr).class_id = (*src_hdr).class_id;
                             (*dst_hdr).kind = (*src_hdr).kind;
                             (*dst_hdr).element_type = (*src_hdr).element_type;
-                            (*dst_hdr)._padding = (*src_hdr)._padding;
                             (*dst_hdr).identity_hash_code = (*src_hdr).identity_hash_code;
-                            (*dst_hdr).array_length = (*src_hdr).array_length;
-                            (*dst_hdr).num_slots = (*src_hdr).num_slots;
+                            (*dst_hdr).shape = (*src_hdr).shape;
                             (*dst_hdr).gc_age = (*src_hdr).gc_age;
                             (*dst_hdr).gc_flags = (*src_hdr).gc_flags;
-                            (*dst_hdr)._gc_reserved = (*src_hdr)._gc_reserved;
                             // `forwarding_ptr` published as a single naturally-aligned
                             // pointer-sized store — no torn read possible.
                             (*dst_hdr).forwarding_ptr = (*src_hdr).forwarding_ptr;
@@ -880,7 +877,7 @@ impl RegionHeap {
 /// converts a hard process abort into a recoverable / fail-safe path.
 fn object_total_size(header: &ObjectHeader) -> usize {
     if header.kind == ObjectKind::Array {
-        match array_data_size(header.array_length as usize, header.element_type) {
+        match array_data_size(header.array_length() as usize, header.element_type) {
             Ok(data) => HEADER_SIZE + data,
             Err(_) => {
                 // Implausible array header — treat as corrupt. Return 0 so the
@@ -889,7 +886,7 @@ fn object_total_size(header: &ObjectHeader) -> usize {
                 tracing::warn!(
                     "region: implausible array_length {} (element_type={:?}) in object header — \
                      treating as corrupt; caller will skip/stop the walk",
-                    header.array_length,
+                    header.array_length(),
                     header.element_type,
                 );
                 0
@@ -930,7 +927,7 @@ fn scan_object_refs(obj_addr: usize, header: &ObjectHeader) -> Vec<usize> {
 
     if header.kind == ObjectKind::Array {
         if header.element_type == ArrayElementType::Reference {
-            let len = header.array_length as usize;
+            let len = header.array_length() as usize;
             for i in 0..len {
                 let slot_addr = data_start + i * 8;
                 let ptr = unsafe { *(slot_addr as *const usize) };
@@ -940,7 +937,7 @@ fn scan_object_refs(obj_addr: usize, header: &ObjectHeader) -> Vec<usize> {
             }
         }
     } else {
-        let num_slots = header.num_slots as usize;
+        let num_slots = header.num_slots() as usize;
         for i in 0..num_slots {
             let slot_addr = data_start + i * SLOT_SIZE;
             // Check if slot looks like a heap pointer (non-zero, aligned)
@@ -966,7 +963,7 @@ fn update_object_refs(obj_addr: usize, header: &ObjectHeader, forwarding: &HashM
 
     if header.kind == ObjectKind::Array {
         if header.element_type == ArrayElementType::Reference {
-            let len = header.array_length as usize;
+            let len = header.array_length() as usize;
             for i in 0..len {
                 let slot_addr = data_start + i * 8;
                 let ptr = unsafe { *(slot_addr as *const usize) };
@@ -978,7 +975,7 @@ fn update_object_refs(obj_addr: usize, header: &ObjectHeader, forwarding: &HashM
             }
         }
     } else {
-        let num_slots = header.num_slots as usize;
+        let num_slots = header.num_slots() as usize;
         for i in 0..num_slots {
             let slot_addr = data_start + i * SLOT_SIZE;
             let raw = unsafe { *(slot_addr as *const usize) };
@@ -1191,7 +1188,7 @@ mod tests {
         // Write header
         unsafe {
             let header = &mut *(ptr as *mut ObjectHeader);
-            header.num_slots = 2;
+            header.set_num_slots(2);
             header.kind = ObjectKind::Object;
         }
 

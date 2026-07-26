@@ -88,6 +88,7 @@ const RCX: u8 = 1;
 const RDX: u8 = 2;
 #[allow(dead_code)]
 const R10: u8 = 10;
+const R11: u8 = 11;
 
 // XMM scratch registers for the FP value tier (inc 30). Analogous to RAX/RCX:
 // XMM0 holds the first operand / result, XMM1 the second operand / a mask.
@@ -103,6 +104,18 @@ const XMM1: u8 = 1;
 const CALL_ARG_REGS: [u8; 4] = [1, 2, 8, 9]; // RCX, RDX, R8, R9
 #[cfg(not(target_os = "windows"))]
 const CALL_ARG_REGS: [u8; 4] = [7, 6, 2, 1]; // RDI, RSI, RDX, RCX
+
+// Platform C-ABI integer argument registers for a JIT *method entry* — the ABI
+// a compiled artifact's own prologue reads its incoming arguments from:
+// `abi[0]` = the hidden VM context pointer when the callee `needs_context`,
+// then one register per Java argument (receiver first for a non-static
+// callee). This is the FULL integer argument register file, unlike
+// `CALL_ARG_REGS` (capped at 4 because the dispatch helper only ever takes 4).
+// Mirrors x64.rs `ARG_REGS` and the inline list in `emit_self_recursive_call`.
+#[cfg(target_os = "windows")]
+const ENTRY_ABI_REGS: &[u8] = &[1, 2, 8, 9]; // RCX, RDX, R8, R9
+#[cfg(not(target_os = "windows"))]
+const ENTRY_ABI_REGS: &[u8] = &[7, 6, 2, 1, 8, 9]; // RDI, RSI, RDX, RCX, R8, R9
 
 // ── Lowering state ───────────────────────────────────────────────────
 
@@ -168,6 +181,10 @@ struct Lowerer<'a> {
     /// instance-field reads route through it so receivers are validated against
     /// the live heap before any object-header dereference.
     getfield: usize,
+    /// Cooperative GC poll flag and no-argument slow path. IR values are
+    /// canonicalized in frame slots, so the slow-path call needs no spill.
+    safepoint_flag_addr: usize,
+    safepoint_slow_path: usize,
     /// True iff the graph contains an `Op::Call` — then the method takes the VM
     /// context pointer as a hidden first argument (`try_call_with_context`), and
     /// the prologue stores it to `context_slot_off` + shifts the Java params.
@@ -188,6 +205,16 @@ struct Lowerer<'a> {
     /// self-recursive `CALL` (invoke_kind 4), patched at finalize to target the
     /// method's own entry (code offset 0). See `lower_self_call` / Op::Call.
     self_call_patches: Vec<usize>,
+    /// IR direct-call lowering: statically-bound call sites this compile may
+    /// lower as a raw `CALL` into an already-compiled callee's entry instead of
+    /// routing through the generic `jit_invoke_dispatch` helper. Keyed by the
+    /// invoke's bytecode pc (the same key the IR builder stamps on the
+    /// `Op::Call` node via `Node::bytecode_pc`); the value is
+    /// `(callee_entry, callee_needs_context)` as returned by the caller's
+    /// `callee_compiler`. Empty (the default, and whenever the direct-call gate
+    /// is off) ⇒ every `Op::Call` keeps the historical helper dispatch,
+    /// byte-for-byte.
+    direct_calls: &'a HashMap<usize, (usize, bool)>,
     /// wire-tiered-manager Step 4 (PGO handoff C1 → C2): per-bytecode-PC branch
     /// bias, keyed by the conditional-branch instruction's bytecode PC (the same
     /// key the IR builder stamps on each `Op::If` via `Node::bytecode_pc`). Value
@@ -214,6 +241,7 @@ impl<'a> Lowerer<'a> {
         helpers: &JitRuntimeHelpers,
         branch_hints: &'a HashMap<usize, bool>,
         sr_map: Option<&'a ScalarReplacementMap>,
+        direct_calls: &'a HashMap<usize, (usize, bool)>,
     ) -> Self {
         // Gap B: scan for `Op::Call` to size the call-related frame regions.
         // `needs_context` ⇒ the method takes the VM ptr as a hidden first arg
@@ -287,12 +315,15 @@ impl<'a> Lowerer<'a> {
             frem: helpers.jit_frem,
             drem: helpers.jit_drem,
             getfield: helpers.getfield,
+            safepoint_flag_addr: helpers.safepoint_flag_addr,
+            safepoint_slow_path: helpers.safepoint_slow_path,
             needs_context,
             context_slot_off,
             args_stage_top_off,
             spill_cap_off,
             call_exc_patches: Vec::new(),
             self_call_patches: Vec::new(),
+            direct_calls,
             branch_hints,
             sr_map,
         }
@@ -489,6 +520,29 @@ impl<'a> Lowerer<'a> {
             }
             self.store_abi_reg(abi_regs[abi_idx], ((i as i32) + 1) * 8); // local_offset(i)
         }
+    }
+
+    /// Emit the default-on cooperative poll used at method entries and loop
+    /// back-edges. The lowerer keeps all live values in frame slots, so the
+    /// no-argument slow path may be called directly.
+    fn emit_safepoint_poll(&mut self) {
+        let enabled = std::env::var_os("CRATONVM_JIT_SAFEPOINT_POLLS")
+            .and_then(|v| v.into_string().ok())
+            .is_none_or(|v| v != "0");
+        if !enabled || self.safepoint_flag_addr == 0 || self.safepoint_slow_path == 0 {
+            return;
+        }
+        self.emit_mov_reg_imm64(R11, self.safepoint_flag_addr as u64);
+        self.buf.emit(&[0x41, 0xF6, 0x03, 0xFF]); // TEST byte ptr [R11], 0xff
+        self.buf.emit(&[0x0F, 0x84]); // JZ .clear
+        let clear_patch = self.buf.pos();
+        self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
+        self.emit_mov_reg_imm64(RAX, self.safepoint_slow_path as u64);
+        self.buf.emit(&[0xFF, 0xD0]); // CALL RAX
+        let rel = self.buf.pos() as i32 - (clear_patch as i32 + 4);
+        self.buf
+            .try_patch_i32(clear_patch, rel)
+            .expect("IR safepoint poll patch in-bounds");
     }
 
     /// MOV [RBP - offset], reg  (REX.W [+ REX.R for an extended reg]).
@@ -809,6 +863,9 @@ impl<'a> Lowerer<'a> {
             // successor physically next).
             let succ = self.schedule.blocks[block_idx].successors.first().copied();
             if let Some(succ_block) = succ {
+                if succ_block <= block_idx {
+                    self.emit_safepoint_poll();
+                }
                 self.emit_phi_copies(block_idx, succ_block);
                 self.buf.emit_byte(0xE9); // JMP succ_block
                 let patch_pos = self.buf.pos();
@@ -908,6 +965,125 @@ impl<'a> Lowerer<'a> {
             .try_patch_i32(keep_patch, rel)
             .expect("ir_lower self-call sentinel keep patch in-bounds");
         // Spill the return value.
+        self.store_rax(slot);
+    }
+
+    /// IR direct-call lowering — emit a statically-bound `Op::Call` as a raw
+    /// `CALL` into the callee's already-compiled entry, instead of the generic
+    /// `jit_invoke_dispatch` round trip.
+    ///
+    /// This is the IR analogue of the single-pass backend's direct-call path
+    /// (`x64.rs`, `direct_calls` / `emit_call_absolute`): the eligibility loop in
+    /// `lib.rs` eagerly compiles a resolved `invokestatic` / non-`<init>`
+    /// `invokespecial` callee via `callee_compiler` and records
+    /// `(pc → (entry, callee_needs_context))`. Both call kinds are STATICALLY
+    /// bound, so no receiver type check is needed — exactly why single-pass may
+    /// bind them directly too.
+    ///
+    /// # Why this matters
+    ///
+    /// `jit_invoke_dispatch` costs a full helper round trip per call
+    /// (`note_jit_boundary`, an SATB flush, a `lookup_jit_code_range` scan, a
+    /// re-entrant `JitEntryGuard` push/pop, and re-marshalling the staged args
+    /// into `Value`s). That per-call tax is the whole reason the IR pipeline
+    /// capped `invoke_ops` at 5 — an "optimizing" recompile of a call-heavy
+    /// method was a NET REGRESSION versus the single-pass body, which has had
+    /// direct calls all along. Lowering the statically-bound cases directly
+    /// removes the tax, so the cap can be raised.
+    ///
+    /// # ABI
+    ///
+    /// The callee is an `extern "C"` compiled artifact whose prologue reads its
+    /// incoming arguments from [`ENTRY_ABI_REGS`]: `abi[0]` = the hidden VM
+    /// context pointer when the callee `needs_context`, then one register per
+    /// Java argument. Every argument is marshalled as a raw 64-bit slot value
+    /// (the VM's compact all-GPR JIT ABI — an FP argument travels as its
+    /// `to_bits()` pattern in an INTEGER register, and an FP result comes back in
+    /// RAX), which is exactly how each argument is already stored in its frame
+    /// slot. Every source is memory, so loading straight into the ABI registers
+    /// cannot inter-clobber; `RAX` (the indirect-call target scratch) is not an
+    /// argument register on either ABI. The caller must have verified that
+    /// `num_args + needs_context <= ENTRY_ABI_REGS.len()`, since there is no
+    /// stack-argument path here.
+    ///
+    /// SAFETY: `entry` is a code address produced by this JIT for the resolved
+    /// callee; `lib.rs` records it in `CompiledMethod::_direct_callee_entries`,
+    /// which both keeps the callee's buffer alive (`_direct_callee_roots`) and
+    /// puts this method into the callee's invalidation closure, so the baked
+    /// address can never outlive the code it points at.
+    fn emit_direct_cross_call(
+        &mut self,
+        inputs: &[NodeId],
+        slot: i32,
+        num_args: usize,
+        entry: usize,
+        callee_needs_ctx: bool,
+        ty: IrType,
+    ) {
+        let base = if callee_needs_ctx {
+            self.load_reg_from_frame(ENTRY_ABI_REGS[0], self.context_slot_off);
+            1
+        } else {
+            0
+        };
+        for i in 0..num_args {
+            let arg = inputs[2 + i];
+            self.load_reg_from_frame(ENTRY_ABI_REGS[base + i], self.slot_of(arg));
+        }
+        // MOV RAX, entry ; CALL RAX.
+        self.emit_mov_reg_imm64(RAX, entry as u64);
+        self.buf.emit(&[0xFF, 0xD0]);
+        self.emit_call_return_check(slot, ty);
+    }
+
+    /// Post-call exception sentinel + result spill, shared by the
+    /// `jit_invoke_dispatch` path and the direct cross-method call path.
+    ///
+    /// A callee that threw (or deopted) returns the `i64::MIN` sentinel. For an
+    /// int / reference / void result that is unambiguous (no legitimate value is
+    /// `i64::MIN`), so a plain `CMP RAX, i64::MIN ; JE bail` suffices. For a
+    /// `J`/`D`/`F` result a legitimate `Long.MIN_VALUE` is bit-identical to the
+    /// sentinel, so on the (rare) `RAX == i64::MIN` branch we peek the
+    /// out-of-band signal via `jit_dispatch_threw`: bail only when a genuine
+    /// exception/deopt is pending, else keep the real value. The result is then
+    /// spilled to `slot` (harmless for a void call: the slot is allocated but
+    /// never read).
+    fn emit_call_return_check(&mut self, slot: i32, ty: IrType) {
+        self.emit_mov_reg_imm64(R10, i64::MIN as u64);
+        self.buf.emit(&[0x4C, 0x39, 0xD0]); // CMP RAX, R10
+        if matches!(ty, IrType::Long | IrType::Double | IrType::Float) {
+            // JNE .keep — common path: not the sentinel, keep real RAX.
+            self.buf.emit(&[0x0F, 0x85]);
+            let keep_patch = self.buf.pos();
+            self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
+            // Cold: RAX == i64::MIN. Peek whether a real exception/deopt
+            // is pending — MOV RAX, dispatch_threw ; CALL RAX (RAX = 0/1).
+            self.emit_mov_reg_imm64(RAX, self.dispatch_threw as u64);
+            self.buf.emit(&[0xFF, 0xD0]);
+            // TEST RAX, RAX — ZF=1 iff no signal pending (legit value).
+            self.buf.emit(&[0x48, 0x85, 0xC0]);
+            // Restore the sentinel/value into RAX before branching: the
+            // shared bail stub returns RAX unchanged (so it must be
+            // `i64::MIN`), and the keep path needs the genuine
+            // `Long.MIN_VALUE`. `MOV` does not disturb ZF.
+            self.emit_mov_reg_imm64(RAX, i64::MIN as u64);
+            // JNE bail_stub — ZF==0 ⇒ exception/deopt ⇒ propagate sentinel.
+            self.buf.emit(&[0x0F, 0x85]);
+            let patch = self.buf.pos();
+            self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
+            self.call_exc_patches.push(patch);
+            // .keep: patch the JNE above to land here.
+            let keep_off = self.buf.pos();
+            let rel = keep_off as i32 - (keep_patch as i32 + 4);
+            self.buf
+                .try_patch_i32(keep_patch, rel)
+                .expect("ir_lower call-sentinel keep patch in-bounds");
+        } else {
+            self.buf.emit(&[0x0F, 0x84]); // JE rel32 (patched to the stub)
+            let patch = self.buf.pos();
+            self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
+            self.call_exc_patches.push(patch);
+        }
         self.store_rax(slot);
     }
 
@@ -1531,6 +1707,31 @@ impl<'a> Lowerer<'a> {
                     self.emit_self_recursive_call(&node.inputs, slot, num_args);
                     return;
                 }
+                // IR direct-call lowering: a statically-bound site whose callee
+                // was eagerly compiled becomes a raw `CALL` into that callee's
+                // entry — no `jit_invoke_dispatch` round trip. See
+                // `emit_direct_cross_call`. There is no stack-argument path, so a
+                // site whose args do not fit the entry ABI register file falls
+                // through to the (unchanged) helper dispatch below rather than
+                // being dropped. `lower_data_node` has no post-`match` code, so
+                // an early `return` here fully handles the node.
+                if let Some(&(entry, callee_needs_ctx)) =
+                    node.bytecode_pc.and_then(|pc| self.direct_calls.get(&pc))
+                {
+                    if entry != 0
+                        && num_args + usize::from(callee_needs_ctx) <= ENTRY_ABI_REGS.len()
+                    {
+                        self.emit_direct_cross_call(
+                            &node.inputs,
+                            slot,
+                            num_args,
+                            entry,
+                            callee_needs_ctx,
+                            node.ty,
+                        );
+                        return;
+                    }
+                }
                 // 1. Marshal each Java arg into the staging region.
                 for i in 0..num_args {
                     let arg = node.inputs[2 + i];
@@ -1545,55 +1746,9 @@ impl<'a> Lowerer<'a> {
                                                                             // 3. MOV RAX, invoke_dispatch ; CALL RAX.
                 self.emit_mov_reg_imm64(RAX, self.invoke_dispatch as u64);
                 self.buf.emit(&[0xFF, 0xD0]);
-                // 4. Exception sentinel. The dispatch helper returns `i64::MIN`
-                //    when the callee threw/deopted. For an int/ref/void return
-                //    that is unambiguous (no legitimate result is `i64::MIN`), so
-                //    a plain `CMP RAX, i64::MIN; JE bail` suffices. For a `J`/`D`
-                //    (long/double) return a legitimate `Long.MIN_VALUE` result is
-                //    bit-identical to the sentinel, so on the (rare)
-                //    `RAX == i64::MIN` branch we peek the out-of-band signal via
-                //    `jit_dispatch_threw`: bail only when a genuine exception/
-                //    deopt is pending, else keep the real value. (Only `J` is
-                //    currently reachable — `static_call_shape` still rejects
-                //    `D`/`F` returns until the XMM value tier.)
-                self.emit_mov_reg_imm64(R10, i64::MIN as u64);
-                self.buf.emit(&[0x4C, 0x39, 0xD0]); // CMP RAX, R10
-                if matches!(node.ty, IrType::Long | IrType::Double | IrType::Float) {
-                    // JNE .keep — common path: not the sentinel, keep real RAX.
-                    self.buf.emit(&[0x0F, 0x85]);
-                    let keep_patch = self.buf.pos();
-                    self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
-                    // Cold: RAX == i64::MIN. Peek whether a real exception/deopt
-                    // is pending — MOV RAX, dispatch_threw ; CALL RAX (RAX = 0/1).
-                    self.emit_mov_reg_imm64(RAX, self.dispatch_threw as u64);
-                    self.buf.emit(&[0xFF, 0xD0]);
-                    // TEST RAX, RAX — ZF=1 iff no signal pending (legit value).
-                    self.buf.emit(&[0x48, 0x85, 0xC0]);
-                    // Restore the sentinel/value into RAX before branching: the
-                    // shared bail stub returns RAX unchanged (so it must be
-                    // `i64::MIN`), and the keep path needs the genuine
-                    // `Long.MIN_VALUE`. `MOV` does not disturb ZF.
-                    self.emit_mov_reg_imm64(RAX, i64::MIN as u64);
-                    // JNE bail_stub — ZF==0 ⇒ exception/deopt ⇒ propagate sentinel.
-                    self.buf.emit(&[0x0F, 0x85]);
-                    let patch = self.buf.pos();
-                    self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
-                    self.call_exc_patches.push(patch);
-                    // .keep: patch the JNE above to land here.
-                    let keep_off = self.buf.pos();
-                    let rel = keep_off as i32 - (keep_patch as i32 + 4);
-                    self.buf
-                        .try_patch_i32(keep_patch, rel)
-                        .expect("ir_lower call-sentinel keep patch in-bounds");
-                } else {
-                    self.buf.emit(&[0x0F, 0x84]); // JE rel32 (patched to the stub)
-                    let patch = self.buf.pos();
-                    self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
-                    self.call_exc_patches.push(patch);
-                }
-                // 5. Spill the return value (harmless for a void call: the slot
-                //    is allocated but never read).
-                self.store_rax(slot);
+                // 4. Exception sentinel + result spill — shared with the direct
+                //    cross-method call path; see `emit_call_return_check`.
+                self.emit_call_return_check(slot, node.ty);
             }
             // ── FP value tier (inc 30) ───────────────────────────────────
             // A float/double constant is just its IEEE bit pattern written to
@@ -1698,6 +1853,13 @@ impl<'a> Lowerer<'a> {
     }
 
     fn lower_terminator(&mut self, term: NodeId, block_idx: usize) {
+        if self.schedule.blocks[block_idx]
+            .successors
+            .iter()
+            .any(|&succ| succ <= block_idx)
+        {
+            self.emit_safepoint_poll();
+        }
         let node = &self.graph.nodes[term as usize];
         match &node.op {
             Op::Return => {
@@ -2436,8 +2598,9 @@ pub fn lower(
     // the historical byte-for-byte layout. An empty `HashMap` performs no
     // allocation until first insert.
     let empty: HashMap<usize, bool> = HashMap::new();
+    let no_direct: HashMap<usize, (usize, bool)> = HashMap::new();
     lower_inner(
-        graph, schedule, num_params, num_locals, helpers, &empty, None,
+        graph, schedule, num_params, num_locals, helpers, &empty, None, &no_direct,
     )
 }
 
@@ -2454,6 +2617,7 @@ pub fn lower_with_branch_hints(
     helpers: &JitRuntimeHelpers,
     branch_hints: &HashMap<usize, bool>,
 ) -> Option<CompiledMethod> {
+    let no_direct: HashMap<usize, (usize, bool)> = HashMap::new();
     lower_inner(
         graph,
         schedule,
@@ -2462,6 +2626,7 @@ pub fn lower_with_branch_hints(
         helpers,
         branch_hints,
         None,
+        &no_direct,
     )
 }
 
@@ -2480,8 +2645,9 @@ pub fn lower_with_scalar_deopt(
     sr_map: Option<&ScalarReplacementMap>,
 ) -> Option<CompiledMethod> {
     let empty: HashMap<usize, bool> = HashMap::new();
+    let no_direct: HashMap<usize, (usize, bool)> = HashMap::new();
     lower_inner(
-        graph, schedule, num_params, num_locals, helpers, &empty, sr_map,
+        graph, schedule, num_params, num_locals, helpers, &empty, sr_map, &no_direct,
     )
 }
 
@@ -2496,6 +2662,10 @@ pub(crate) fn lower_inner(
     helpers: &JitRuntimeHelpers,
     branch_hints: &HashMap<usize, bool>,
     sr_map: Option<&ScalarReplacementMap>,
+    // IR direct-call lowering: `pc → (callee_entry, callee_needs_context)` for
+    // every statically-bound call site whose callee was eagerly compiled. Empty
+    // ⇒ every `Op::Call` keeps the historical `jit_invoke_dispatch` lowering.
+    direct_calls: &HashMap<usize, (usize, bool)>,
 ) -> Option<CompiledMethod> {
     let estimated_size = graph.nodes.len() * 32 + 256;
     let buf = ExecutableBuffer::new(estimated_size.max(4096))?;
@@ -2510,6 +2680,7 @@ pub(crate) fn lower_inner(
         helpers,
         branch_hints,
         sr_map,
+        direct_calls,
     );
 
     // Gap B: a `needs_context` method (one containing an `Op::Call`) receives the
@@ -2533,6 +2704,7 @@ pub(crate) fn lower_inner(
     lowerer.prealloc_phi_slots();
 
     lowerer.emit_prologue();
+    lowerer.emit_safepoint_poll();
 
     // Emit blocks in order
     for block_idx in 0..schedule.blocks.len() {
@@ -2612,6 +2784,32 @@ mod tests {
     /// all-integer (usize) fields, so an all-zero bit pattern is a valid value.
     fn no_helpers() -> JitRuntimeHelpers {
         unsafe { std::mem::zeroed() }
+    }
+
+    #[test]
+    fn cooperative_poll_runs_in_a_pure_ir_method() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static FLAG: u8 = 1;
+        static HITS: AtomicUsize = AtomicUsize::new(0);
+        extern "C" fn slow_poll() {
+            HITS.fetch_add(1, Ordering::SeqCst);
+        }
+
+        let code = [0x04, 0xac]; // iconst_1; ireturn
+        let builder = IrBuilder::new(0, 0);
+        let graph = builder.build(&code, code.len()).expect("IR build");
+        let schedule = ir_schedule::schedule(&graph);
+        let mut helpers = no_helpers();
+        helpers.safepoint_flag_addr = &FLAG as *const u8 as usize;
+        helpers.safepoint_slow_path = slow_poll as *const () as usize;
+        HITS.store(0, Ordering::SeqCst);
+        let compiled =
+            lower(&graph, &schedule, 0, 0, &helpers).expect("pure IR method should lower");
+
+        // SAFETY: the generated function has no arguments and returns int 1.
+        assert_eq!(unsafe { compiled.try_call(&[]) }, Ok(1));
+        assert_eq!(HITS.load(Ordering::SeqCst), 1);
     }
 
     fn compile_via_ir(

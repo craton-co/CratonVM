@@ -1377,7 +1377,9 @@ impl MonitorTable {
             let p = obj_ref.as_ptr() as *const u8;
             (
                 std::ptr::read(p as *const u32),
-                std::ptr::read(p.add(16) as *const u32),
+                std::ptr::read(
+                    p.add(cratonvm_types::NUM_SLOTS_OFFSET) as *const u32
+                ),
             )
         };
         let (reg_hit, reg_owner, reg_count) = {

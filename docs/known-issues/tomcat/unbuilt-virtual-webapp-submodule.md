@@ -42,7 +42,7 @@ java.lang.IllegalArgumentException: Unable to create WebResourceSet from [/data/
 ## Root cause
 
 `target/classes` is a Maven build-output convention (not an Ant one — the
-rest of the Tomcat build uses Ant/`output/`). `test/webapp-virtual-webapp/`
+rest of the Tomcat build uses Ant/`../../../output`). `test/webapp-virtual-webapp/`
 is a small standalone Maven submodule Tomcat's test suite uses purely as a
 "pre-built classes directory to point a virtual WebResourceSet at" fixture;
 it was never `mvn compile`d in this checkout.

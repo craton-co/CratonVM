@@ -1150,6 +1150,19 @@ impl VmHeap {
         }
     }
 
+    /// Return stable generational card-table metadata for JIT inline barriers.
+    ///
+    /// G1 and ZGC require collector-specific remembered-set/barrier protocols,
+    /// so they return `None` and generated code retains the helper call.
+    pub fn jit_card_table_info(&self) -> Option<(usize, usize, usize)> {
+        match self {
+            VmHeap::Generational(heap) => Some(heap.jit_card_table_info()),
+            VmHeap::G1(_) => None,
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(_) => None,
+        }
+    }
+
     /// Return the total number of GC collections performed so far.
     ///
     /// For the generational heap, this is the sum of minor + major cycle
@@ -1688,7 +1701,7 @@ impl VmHeap {
 
     /// Get the number of fields (slots) in an object.
     pub fn num_fields(&self, obj: ObjectRef) -> usize {
-        dispatch!(self, get_header(obj)).num_slots as usize
+        dispatch!(self, get_header(obj)).num_slots() as usize
     }
 
     /// Carve out a TLAB from the young generation (generational) or Eden region (G1).

@@ -71,10 +71,7 @@ const MALFORMED_UNICODE_MESSAGE: &str = "Malformed \\uxxxx encoding.";
 
 #[inline]
 fn props_stderr_diag() -> bool {
-    matches!(
-        std::env::var("CRATONVM_DIAG_PROPERTIES").as_deref(),
-        Ok("1") | Ok("true") | Ok("yes")
-    )
+    crate::nbflags().diag_properties
 }
 
 fn throw_malformed_unicode_escape(ctx: &mut dyn NativeContext) -> MethodCallFailed {
@@ -175,7 +172,7 @@ fn key_for(ctx: &dyn NativeContext, obj: ObjectRef) -> usize {
 // 10_000 distinct `Properties` objects had EVER been registered in this
 // process's lifetime, every subsequent brand-new object silently lost all
 // `put`/`getProperty` calls forever (no exception, no eviction). See
-// docs/known-issues/h2-suite-bugs/bug-h2-properties-sidetable-global-cap-silent-drop.md.
+// docs/known-issues/h2/bug-h2-properties-sidetable-global-cap-silent-drop.md.
 // H2's `TestAnalyzeTableTx` (10_000 connections in a loop, each constructing
 // a JDBC-properties object) crosses that watermark and starts reading back
 // empty username/password, which H2 correctly reports as "Wrong user name or
@@ -687,7 +684,7 @@ fn split_key_value(line: &str) -> (String, String) {
     (line.to_string(), String::new())
 }
 
-/// Decode Java `.properties` escapes (`\n`, `\t`, `\r`, `\\`, `\"`,
+/// Decode Java `.properties` escapes (`\n`, `\t`, `\r`, `\f`, `\\`, `\"`,
 /// `\'`, `\<space>`, `\:`, `\=`, `\uXXXX`).  Unknown escapes degrade
 /// to literal characters.
 ///
@@ -726,6 +723,7 @@ fn unescape_inner(s: &str, strict_unicode: bool) -> Result<String, ()> {
             Some('n') => out.push('\n'),
             Some('t') => out.push('\t'),
             Some('r') => out.push('\r'),
+            Some('f') => out.push('\u{000c}'),
             Some('\\') => out.push('\\'),
             Some('"') => out.push('"'),
             Some('\'') => out.push('\''),
@@ -2169,7 +2167,164 @@ fn build_key_set(ctx: &mut dyn NativeContext, this: ObjectRef) -> ObjectRef {
         .into_iter()
         .map(|(k, _v)| k)
         .collect();
-    build_string_collection(ctx, "java/util/HashSet", keys)
+    // `java/util/LinkedHashSet`, not the far more common `java/util/HashSet`:
+    // this snapshot needs `retainAll`/`remove` to propagate back to the
+    // source `Properties` (see `tag_properties_keyset_source` below, for the
+    // common `props.keySet().retainAll(baseline)` test-cleanup idiom), which
+    // requires a native override on the snapshot's exact class. Scoping that
+    // override to `LinkedHashSet` instead of `HashSet` keeps the blast radius
+    // to "objects this function creates" — every other `new HashSet<>()` in
+    // the entire process (a MUCH more common class) is completely
+    // unaffected. `LinkedHashSet extends HashSet`, so `instanceof HashSet`
+    // and the `Set` contract are unchanged for callers.
+    build_string_collection(ctx, "java/util/LinkedHashSet", keys)
+}
+
+/// Side table linking a `Properties.keySet()` snapshot `Set` (by identity
+/// hash) back to the source `Properties` object it was built from. Read by
+/// the `LinkedHashSet.retainAll`/`remove` overrides below so mutating the
+/// snapshot also mutates the real, side-table-backed source — otherwise
+/// `properties.keySet().retainAll(...)`/`.remove(...)` silently no-ops on
+/// the disconnected snapshot alone (`build_key_set` above is a snapshot,
+/// not a live view).
+fn properties_keyset_source_table() -> &'static Mutex<FxHashMap<i32, usize>> {
+    static T: OnceLock<Mutex<FxHashMap<i32, usize>>> = OnceLock::new();
+    T.get_or_init(|| Mutex::new(FxHashMap::default()))
+}
+
+fn tag_properties_keyset_source(ctx: &mut dyn NativeContext, set: ObjectRef, source: ObjectRef) {
+    let set_pin = ctx.pin_native_root(set);
+    let handle = ctx.add_global_root(source);
+    let set = ctx.read_native_pin(set_pin, set);
+    let key = ctx.identity_hash_code(set);
+    let mut table = properties_keyset_source_table().lock();
+    // Retention cap: each entry roots one snapshot `Set` (and the source
+    // `Properties`, usually already permanently alive) forever. Bound the
+    // leak rather than grow unboundedly — mirrors the sibling cap in
+    // `logmanager.rs`'s `log_record_messages`.
+    if table.len() > 4096 {
+        if let Some(&oldest) = table.keys().next() {
+            if let Some(h) = table.remove(&oldest) {
+                ctx.remove_global_root(h);
+            }
+        }
+    }
+    table.insert(key, handle);
+    ctx.unpin_native_roots(set_pin);
+}
+
+fn properties_keyset_source(ctx: &mut dyn NativeContext, set: ObjectRef) -> Option<ObjectRef> {
+    let key = ctx.identity_hash_code(set);
+    let handle = *properties_keyset_source_table().lock().get(&key)?;
+    ctx.resolve_global_root(handle)
+}
+
+/// Native `LinkedHashSet.retainAll(Collection)Z`, gated on
+/// `properties_keyset_source`. For an ordinary `LinkedHashSet` (anything
+/// not built by `build_key_set`) this is a plain pass-through to real
+/// bytecode (`invoke_virtual_bytecode_only`, which skips re-entering this
+/// same native — its `args` contract is PARAMS ONLY, receiver excluded,
+/// hence `&args[1..]` below). For a `Properties.keySet()` snapshot, first
+/// remove every currently side-table-tracked key NOT present in the
+/// retain collection from the SOURCE `Properties` (whose own `remove` is a
+/// real, working mutation), then let real bytecode finish the snapshot's
+/// own (already-correct) in-memory `retainAll`.
+fn native_linkedhashset_retain_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let Some(Value::Object(Some(this))) = args.first().copied() else {
+        return Ok(Some(Value::Int(0)));
+    };
+    let Some(Value::Object(Some(retain_coll))) = args.get(1).copied() else {
+        return ctx.invoke_virtual_bytecode_only(
+            this,
+            "retainAll",
+            "(Ljava/util/Collection;)Z",
+            &args[1..],
+        );
+    };
+    let Some(source) = properties_keyset_source(ctx, this) else {
+        return ctx.invoke_virtual_bytecode_only(
+            this,
+            "retainAll",
+            "(Ljava/util/Collection;)Z",
+            &args[1..],
+        );
+    };
+    let keys = side_key_set(ctx, source);
+    let this_pin = ctx.pin_native_root(this);
+    let source_pin = ctx.pin_native_root(source);
+    let retain_pin = ctx.pin_native_root(retain_coll);
+    for key in keys {
+        let key_obj = ctx.create_string(&key);
+        let retain_coll = ctx.read_native_pin(retain_pin, retain_coll);
+        let contained = matches!(
+            ctx.invoke_virtual(
+                retain_coll,
+                "contains",
+                "(Ljava/lang/Object;)Z",
+                &[Value::Object(Some(key_obj))]
+            ),
+            Ok(Some(Value::Int(1)))
+        );
+        if !contained {
+            let source = ctx.read_native_pin(source_pin, source);
+            let key_obj = ctx.create_string(&key);
+            let _ = ctx.invoke_virtual(
+                source,
+                "remove",
+                "(Ljava/lang/Object;)Ljava/lang/Object;",
+                &[Value::Object(Some(key_obj))],
+            );
+        }
+    }
+    let this = ctx.read_native_pin(this_pin, this);
+    let retain_coll = ctx.read_native_pin(retain_pin, retain_coll);
+    ctx.unpin_native_roots(this_pin);
+    ctx.unpin_native_roots(source_pin);
+    ctx.unpin_native_roots(retain_pin);
+    ctx.invoke_virtual_bytecode_only(
+        this,
+        "retainAll",
+        "(Ljava/util/Collection;)Z",
+        &[Value::Object(Some(retain_coll))],
+    )
+}
+
+/// Native `LinkedHashSet.remove(Object)Z` — same
+/// disconnected-snapshot-vs-source-`Properties` gate as
+/// `native_linkedhashset_retain_all`, for the single-key removal case
+/// (`properties.keySet().remove(key)`).
+fn native_linkedhashset_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let Some(Value::Object(Some(this))) = args.first().copied() else {
+        return Ok(Some(Value::Int(0)));
+    };
+    let Some(source) = properties_keyset_source(ctx, this) else {
+        return ctx.invoke_virtual_bytecode_only(this, "remove", "(Ljava/lang/Object;)Z", &args[1..]);
+    };
+    if let Some(Value::Object(Some(elem))) = args.get(1).copied() {
+        let this_pin = ctx.pin_native_root(this);
+        let source_pin = ctx.pin_native_root(source);
+        let elem_pin = ctx.pin_native_root(elem);
+        let elem = ctx.read_native_pin(elem_pin, elem);
+        let source = ctx.read_native_pin(source_pin, source);
+        let _ = ctx.invoke_virtual(
+            source,
+            "remove",
+            "(Ljava/lang/Object;)Ljava/lang/Object;",
+            &[Value::Object(Some(elem))],
+        );
+        let this = ctx.read_native_pin(this_pin, this);
+        let elem = ctx.read_native_pin(elem_pin, elem);
+        ctx.unpin_native_roots(this_pin);
+        ctx.unpin_native_roots(source_pin);
+        ctx.unpin_native_roots(elem_pin);
+        return ctx.invoke_virtual_bytecode_only(
+            this,
+            "remove",
+            "(Ljava/lang/Object;)Z",
+            &[Value::Object(Some(elem))],
+        );
+    }
+    ctx.invoke_virtual_bytecode_only(this, "remove", "(Ljava/lang/Object;)Z", &args[1..])
 }
 
 /// Build a real `ArrayList<String>` populated with the side-table values for
@@ -2305,6 +2460,10 @@ fn native_properties_key_set(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         ctx.unpin_native_roots(pin);
     }
     set = ctx.read_native_pin(set_pin, set);
+    // Tag the snapshot so `LinkedHashSet.retainAll`/`remove` can propagate
+    // mutations back to `this` (the source `Properties`) — see
+    // `tag_properties_keyset_source`'s doc comment.
+    tag_properties_keyset_source(ctx, set, this);
     ctx.unpin_native_roots(set_pin);
     Ok(Some(Value::Object(Some(set))))
 }
@@ -3220,6 +3379,27 @@ pub fn register_properties_sidetable(registry: &mut NativeMethodRegistry) {
         "keySet",
         "()Ljava/util/Set;",
         native_properties_key_set,
+    );
+    // `Properties.keySet()` returns a disconnected snapshot
+    // (`native_properties_key_set`/`build_key_set`, now a `LinkedHashSet`
+    // specifically), not a real live view — mutating it otherwise silently
+    // never touched the source `Properties`. Gated on
+    // `properties_keyset_source`: an ordinary `LinkedHashSet` (anything not
+    // built by `build_key_set`) passes straight through to real bytecode
+    // via `invoke_virtual_bytecode_only`. Scoped to `LinkedHashSet` rather
+    // than the far more common `HashSet` specifically to keep this
+    // override's blast radius to objects this module itself creates.
+    registry.register(
+        "java/util/LinkedHashSet",
+        "retainAll",
+        "(Ljava/util/Collection;)Z",
+        native_linkedhashset_retain_all,
+    );
+    registry.register(
+        "java/util/LinkedHashSet",
+        "remove",
+        "(Ljava/lang/Object;)Z",
+        native_linkedhashset_remove,
     );
     registry.register(
         "java/util/Properties",

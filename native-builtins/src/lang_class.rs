@@ -37,7 +37,7 @@ static DBG_BB: OnceLock<bool> = OnceLock::new();
 
 #[inline]
 pub(crate) fn dbg_bb_enabled() -> bool {
-    *DBG_BB.get_or_init(|| std::env::var("CRATONVM_DBG_BB").is_ok())
+    *DBG_BB.get_or_init(|| crate::nbflags().dbg_bb)
 }
 
 // ---------------------------------------------------------------------------
@@ -1394,7 +1394,7 @@ fn i18n_logger_locale_suffix(name: &str) -> bool {
 /// `CRATONVM_S111_DBG=1` to re-enable.
 fn s111_dbg_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var("CRATONVM_S111_DBG").is_ok())
+    *ENABLED.get_or_init(|| crate::nbflags().s111_dbg)
 }
 
 macro_rules! s111_dbg {
@@ -1599,7 +1599,7 @@ fn wf7_synthesise_entry_class_if_missing(
     // would then be invoked as the entry-point вЂ” short-circuiting any
     // real boot. The guard above ("if class already loaded, return None")
     // limits scope, but the gate-off is the safer default.
-    if std::env::var("CRATONVM_USE_WILDFLY_SYNTH_BYTECODE").as_deref() != Ok("1") {
+    if !crate::nbflags().use_wildfly_synth_bytecode {
         let _ = internal_name;
         return None;
     }
@@ -1800,7 +1800,7 @@ pub(crate) fn native_class_for_name(
     // The initialize flag belongs to the explicit-null-loader overload too.
     // Loading a bootstrap class with initialize=false must not run clinit.
     let bootstrap_initialize = matches!(args.get(1), Some(v) if v.as_int().unwrap_or(0) != 0);
-    if std::env::var_os("CRATONVM_FORNAME_TRACE").is_some() {
+    if crate::nbflags().forname_trace {
         eprintln!(
             "[FORNAME-TRACE] name={} args.len()={} args={:?} effective_loader_is_some={}",
             dotted_name,
@@ -1953,6 +1953,21 @@ pub(crate) fn native_class_for_name(
                     "[S111-DBG] loadClass({}) succeeded via invoke_virtual",
                     dotted_name
                 );
+                if s111_dbg_enabled()
+                    && (dotted_name.contains("ConditionalOnMissingBean")
+                        || dotted_name.contains("DataSourceAutoConfiguration$PooledDataSourceConfiguration"))
+                {
+                    if let Value::Object(Some(mirror_ref)) = mirror {
+                        let cid = ctx.class_id_from_mirror(mirror_ref);
+                        let defining_loader = cid.and_then(|id| {
+                            crate::classloader::defining_loader_for(id.as_u32())
+                        });
+                        eprintln!(
+                            "[S111-DBG] loadClass({}) mirror={:?} cid={:?} defining_loader={:?}",
+                            dotted_name, mirror_ref, cid, defining_loader
+                        );
+                    }
+                }
                 // Root-cause-2 fix (WildFly parallel-extension-add CCE family,
                 // docs/known-issues/wildfly-remoting-classcastexception-
                 // parallel-extension-add.md): `mirror` -- the `Class` object
@@ -2027,8 +2042,7 @@ pub(crate) fn native_class_for_name(
                         }
                     }
                 }
-                if std::env::var("CRATONVM_IAE_TRACE").is_ok() && dbg_is_entity_name(&internal_name)
-                {
+                if crate::nbflags().iae_trace_ok && dbg_is_entity_name(&internal_name) {
                     if let Value::Object(Some(mr)) = mirror {
                         if let Some(cid) = ctx.class_id_from_mirror(mr) {
                             let enh = dbg_class_enhanced(ctx, cid);
@@ -2201,7 +2215,7 @@ pub(crate) fn native_class_for_name(
                     .into(),
                 );
             }
-            if std::env::var("CRATONVM_IAE_TRACE").is_ok() && dbg_is_entity_name(&internal_name) {
+            if crate::nbflags().iae_trace_ok && dbg_is_entity_name(&internal_name) {
                 let enh = dbg_class_enhanced(ctx, class_id);
                 eprintln!(
                     "FORNAME-RET name={dotted_name} cid={} enhanced={enh} (global-fallback)",
@@ -2492,7 +2506,7 @@ pub(crate) fn native_class_is_instance(
     {
         return Ok(Some(Value::Int(1)));
     }
-    if std::env::var_os("CRATONVM_DBG_ISINSTANCE").is_some() {
+    if crate::nbflags().dbg_isinstance {
         let ifaces = ctx.class_interfaces(target_class_id);
         let iface_names: Vec<String> = ifaces
             .iter()
@@ -2777,7 +2791,7 @@ pub(crate) fn native_class_is_assignable_from(
         // underlying type-system gap.
         let this_name = mirror_class_name(ctx, this).unwrap_or_default();
         let other_name = mirror_class_name(ctx, other).unwrap_or_default();
-        if std::env::var_os("CRATONVM_DBG_OBSREG").is_some()
+        if crate::vmflags().loader.dbg_obsreg
             && (this_name.contains("ObservationRegistry")
                 || other_name.contains("ObservationRegistry"))
         {
@@ -3387,7 +3401,24 @@ pub(crate) fn descriptor_to_class_mirror(
             }
             match ctx.load_class(class_name) {
                 Ok(Some(Value::Object(Some(mirror)))) => mirror,
-                _ => synthetic_class_mirror(ctx, class_name),
+                _ => {
+                    // `load_class`'s return shape didn't match the expected
+                    // Class-object-in-hand variant, but the class may still
+                    // have been registered as a side effect of the attempt
+                    // (e.g. a loader that registers first, surfaces its
+                    // result differently on some paths). Re-check the
+                    // canonical registry before minting an uncached
+                    // `synthetic_class_mirror` — that mirror is a fresh,
+                    // never-registered `ObjectRef` each call, which would
+                    // break identity-based comparisons (`HashMap<Class<?>,
+                    // V>`, `==`) against the SAME class resolved through
+                    // any other path (`ldc`, `Class.forName`, `getClass()`).
+                    if let Some(class_id) = ctx.class_id_by_name(class_name) {
+                        ctx.get_class_mirror(class_id)
+                    } else {
+                        synthetic_class_mirror(ctx, class_name)
+                    }
+                }
             }
         }
         s if s.starts_with('[') => {
@@ -3843,7 +3874,7 @@ pub(crate) fn coerce_arg_strict(
                             if !ctx.is_interface_class(expected_cid) {
                                 let arg_cid = ctx.class_id_of_object(obj);
                                 if !ctx.is_subclass(arg_cid, expected_cid) {
-                                    if std::env::var_os("CRATONVM_DBG_COERCE").is_some() {
+                                    if crate::nbflags().dbg_coerce {
                                         let arg_name =
                                             ctx.class_name_of_id(arg_cid).unwrap_or_default();
                                         let near_name = near
@@ -4674,7 +4705,7 @@ fn reject_array_field_receiver(
 }
 
 fn dbg_field_get_enabled() -> bool {
-    std::env::var("CRATONVM_DBG_FIELD_GET").is_ok()
+    crate::nbflags().dbg_field_get
 }
 
 fn dbg_field_get(
@@ -5439,7 +5470,7 @@ fn capture_field_descriptor(type_char: char) -> String {
 /// Synthesize the captured-variable fields (`arg$1`, `arg$2`, ...) that
 /// real HotSpot's `LambdaMetafactory`-spun proxy classes carry, for a
 /// CratonVM lambda-proxy `class_id`. Lambda proxies are never registered in
-/// `class_manager` (they live in `shared.lambda_proxies` instead — see
+/// `class_manager` (they live in `shared.classes.lambda_proxies` instead — see
 /// `docs/internal/comparable-classcast-lambda-proxy-unknown-class-RESOLVED.md`
 /// for the same root cause in a sibling `Comparable` check), so
 /// `NativeContext::declared_fields` can't see them and reflective access to
@@ -5562,7 +5593,7 @@ pub(crate) fn native_class_get_declared_field(
         }
     };
     let target_name = ctx.read_string(name_obj).unwrap_or_default();
-    if std::env::var_os("CRATONVM_DBG_FBCGLIB").is_some() && target_name.starts_with("CGLIB$") {
+    if crate::vmflags().loader.dbg_fbcglib && target_name.starts_with("CGLIB$") {
         eprintln!("[FBCGLIB-DBG] Class.getDeclaredField({target_name})");
     }
 
@@ -6535,7 +6566,7 @@ pub(crate) fn native_method_invoke(
             // degraded Method object so the producer can be identified
             // (observed: Gradle DefaultServiceRegistry configure-method
             // dispatch receiving a Method whose clazz slot reads null).
-            if std::env::var_os("CRATONVM_DBG_MINVOKE").is_some() {
+            if crate::nbflags().dbg_minvoke {
                 let name = match method_name_value(ctx, this) {
                     Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
                     _ => "<no name>".to_string(),
@@ -6798,7 +6829,7 @@ pub(crate) fn native_method_invoke(
                     // CRATONVM_DBG_INVOKE_COERCE=1 вЂ” dump the method, formal
                     // descriptors, actual arg runtime types, and innermost Java
                     // caller frames on a coercion mismatch. Env-gated.
-                    if std::env::var("CRATONVM_DBG_INVOKE_COERCE").as_deref() == Ok("1") {
+                    if crate::nbflags().dbg_invoke_coerce {
                         let arg_types: Vec<String> = raw_args
                             .iter()
                             .map(|v| match v {
@@ -6880,7 +6911,7 @@ pub(crate) fn native_method_invoke(
             .unwrap_or(false);
     let use_virtual_dispatch = !is_static && !is_private && !is_init && !crosses_package;
 
-    let iae_trace = std::env::var_os("CRATONVM_IAE_TRACE").is_some();
+    let iae_trace = crate::nbflags().iae_trace;
     if iae_trace {
         eprintln!("[Method.invoke] about to invoke: class={} method={} desc={} is_static={} use_virtual={}",
                   class_name, method_name, descriptor, is_static, use_virtual_dispatch);
@@ -6899,7 +6930,7 @@ pub(crate) fn native_method_invoke(
             }
         };
         let virtual_args: &[Value] = &invoke_args[1..];
-        if std::env::var_os("CRATONVM_BD_DEBUG").is_some() {
+        if crate::nbflags().bd_debug {
             eprintln!(
                 "[Method.invoke] virtual class={} method={} desc={} recv={:p}",
                 class_name,
@@ -6964,7 +6995,7 @@ pub(crate) fn native_method_invoke(
         }
     };
 
-    if std::env::var_os("CRATONVM_DIAG_METHOD_INVOKE_NULL").is_some() {
+    if crate::nbflags().diag_method_invoke_null {
         let void_ret = ret_desc == "V" || ret_desc.is_empty();
         if !void_ret {
             match &result {
@@ -7695,7 +7726,7 @@ pub(crate) fn native_class_get_declared_methods(
         };
 
         let methods = declared_methods_with_synthetic(ctx, class_id);
-        if std::env::var_os("CRATONVM_DBG_OBSREG").is_some() {
+        if crate::vmflags().loader.dbg_obsreg {
             let __cname = ctx.class_name_of_id(class_id).unwrap_or_default();
             if __cname.contains("SecurityFilterAutoConfigurationEarlyInitializationTests")
                 || __cname.contains("PathRequestTests")
@@ -8064,7 +8095,7 @@ fn wf_shim_synth_main_method(
     // intercepting reflective lookup even when the real bytecode had
     // already been loaded. Re-enable via `CRATONVM_USE_WILDFLY_REFLECT_SHIM=1`
     // for boot-test (exit-rc-only) diagnostics.
-    if std::env::var("CRATONVM_USE_WILDFLY_REFLECT_SHIM").as_deref() != Ok("1") {
+    if !crate::nbflags().use_wildfly_reflect_shim {
         let _ = (this, name, param_types_arr);
         return None;
     }
@@ -8771,7 +8802,7 @@ pub(crate) fn native_constructor_new_instance(
         }
         .into());
     }
-    if std::env::var("CRATONVM_IAE_TRACE").is_ok() && dbg_is_entity_name(&class_name) {
+    if crate::nbflags().iae_trace_ok && dbg_is_entity_name(&class_name) {
         let (cidv, enh) = match declaring_cid {
             Some(cid) => (cid.as_u32() as i64, dbg_class_enhanced(ctx, cid)),
             None => (-1, false),
@@ -9350,7 +9381,7 @@ pub(crate) fn native_class_get_field(
         }
     };
 
-    if std::env::var_os("CRATONVM_DBG_FBCGLIB").is_some() && target_name.starts_with("CGLIB$") {
+    if crate::vmflags().loader.dbg_fbcglib && target_name.starts_with("CGLIB$") {
         let cname = ctx.class_name_of_id(class_id);
         eprintln!(
             "[FBCGLIB-DBG] Class.getField({target_name}) on class_id={class_id:?} name={cname:?}"
@@ -10211,7 +10242,7 @@ fn cached_annotation_proxy_for_key(
     // deferred `TypeNotPresentException` for filtered types. `None` for built-in
     // loaders keeps the global resolution.
     let container_loader = crate::classloader::defining_loader_for(holder_class_id.as_u32());
-    if std::env::var("CRATONVM_IAE_TRACE").is_ok() {
+    if crate::nbflags().iae_trace_ok {
         let holder = ctx.class_name_of_id(holder_class_id).unwrap_or_default();
         eprintln!(
             "ANN-HOLDER cid={} holder={holder} ann={} container_loader={}",
@@ -10224,7 +10255,7 @@ fn cached_annotation_proxy_for_key(
             }
         );
     }
-    let proxy = create_annotation_proxy(ctx, ann, container_loader);
+    let proxy = create_annotation_proxy(ctx, ann, Some(holder_class_id), container_loader);
     let mut guard = annotation_proxy_cache()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -10357,16 +10388,7 @@ pub fn gc_update_annotation_proxy_refs(pointer_map: &HashMap<usize, usize>) {
 /// `CRATONVM_SYNTHETIC_ANNOTATIONS=1` or `CRATONVM_REAL_ANNOTATIONS=0` to retain
 /// the old bare-`AnnotationProxy` representation for debugging.
 fn real_annotations_enabled() -> bool {
-    static E: OnceLock<bool> = OnceLock::new();
-    *E.get_or_init(|| {
-        if std::env::var_os("CRATONVM_SYNTHETIC_ANNOTATIONS").is_some() {
-            return false;
-        }
-        !matches!(
-            std::env::var("CRATONVM_REAL_ANNOTATIONS").ok().as_deref(),
-            Some("0") | Some("false") | Some("FALSE") | Some("off") | Some("OFF")
-        )
-    })
+    !crate::nbflags().synthetic_annotations && crate::nbflags().real_annotations
 }
 
 /// Wrap a synthetic `AnnotationProxy` data object (`handler`) in a real
@@ -10405,7 +10427,7 @@ fn wrap_annotation_in_real_proxy(
         // even when the proxy STRICT mode is on.
         _ => return None,
     };
-    if std::env::var_os("CRATONVM_DBG_ANNPROXY_WRAP").is_some() {
+    if crate::nbflags().dbg_annproxy_wrap {
         let ann_name = ctx.class_name_of_id(ann_cid).unwrap_or_default();
         eprintln!(
             "[DBG_WRAP] ann_cid={} ann_name={ann_name} loader_namespace={loader_namespace} proxy_cid={}",
@@ -10990,6 +11012,7 @@ fn resolve_annotation_class_via_loader(
 fn create_annotation_proxy(
     ctx: &mut dyn NativeContext,
     ann: &cratonvm_native_api::AnnotationData,
+    container_class_id: Option<ClassId>,
     container_loader: Option<ObjectRef>,
 ) -> ObjectRef {
     let mut proxy = alloc_concurrent_synthetic(
@@ -11034,7 +11057,17 @@ fn create_annotation_proxy(
                 Err(_) => None,
             }
         });
-        let cid_mirror = via_loader.or_else(|| {
+        // App-loader classes do not have an ObjectRef recorded in
+        // `defining_loader_for`, but they still carry a loader id in the class
+        // manager. Prefer that namespace before the flat global index: once an
+        // isolated Spring test has loaded a child copy of `OnBeanCondition`, a
+        // global lookup can otherwise make an annotation on an app-loader
+        // configuration class instantiate the child condition class.
+        let via_container_scope = container_class_id.and_then(|holder| {
+            ctx.class_id_by_name_near(class_name, holder)
+                .map(|cid| (cid, ctx.get_class_mirror(cid)))
+        });
+        let cid_mirror = via_loader.or(via_container_scope).or_else(|| {
             let cid = ctx.class_id_by_name(class_name).or_else(|| {
                 // load_class returns the mirror; we only need the ClassId, so just
                 // trigger the load and re-query by name.
@@ -11048,11 +11081,11 @@ fn create_annotation_proxy(
             child_roots.push(mirror);
             proxy = ctx.read_native_pin(proxy_pin, proxy);
             ctx.set_field(proxy, ANN_PROXY_TYPE_MIRROR, Value::Object(Some(mirror)));
-        } else if std::env::var("CRATONVM_IAE_TRACE").is_ok() {
+        } else if crate::nbflags().iae_trace_ok {
             eprintln!("ANN-PROXY-NULL-MIRROR: annotation={} type_descriptor={} class_name={class_name} вЂ” type mirror NOT set (class load failed)",
                 ann.type_descriptor, ann.type_descriptor);
         }
-    } else if std::env::var("CRATONVM_IAE_TRACE").is_ok() {
+    } else if crate::nbflags().iae_trace_ok {
         eprintln!("ANN-PROXY-NULL-MIRROR: type_descriptor={} вЂ” annotation_desc_to_class_name returned None",
             ann.type_descriptor);
     }
@@ -11142,8 +11175,14 @@ fn create_annotation_proxy(
         names_arr = ctx.read_native_pin(names_pin, names_arr);
         ctx.set_array_element(names_arr, i, Value::Object(Some(name_str)));
         let java_val =
-            annotation_element_to_java_typed(ctx, val, ret_desc.as_deref(), container_loader);
-        if std::env::var("CRATONVM_IAE_TRACE2").is_ok() {
+            annotation_element_to_java_typed(
+                ctx,
+                val,
+                ret_desc.as_deref(),
+                container_class_id,
+                container_loader,
+            );
+        if crate::nbflags().iae_trace2 {
             let desc = match &java_val {
                 Value::Object(Some(o)) => {
                     let cid = ctx.class_id_of_object(*o);
@@ -11218,7 +11257,7 @@ pub(crate) fn annotation_element_to_java(
     ctx: &mut dyn NativeContext,
     val: &cratonvm_native_api::AnnotationElementValue,
 ) -> Value {
-    annotation_element_to_java_typed(ctx, val, None, None)
+    annotation_element_to_java_typed(ctx, val, None, None, None)
 }
 
 /// Preserve the declared array shape when the class-file annotation reader
@@ -11272,6 +11311,7 @@ pub(crate) fn annotation_element_to_java_typed(
     ctx: &mut dyn NativeContext,
     val: &cratonvm_native_api::AnnotationElementValue,
     return_type_desc: Option<&str>,
+    container_class_id: Option<ClassId>,
     container_loader: Option<ObjectRef>,
 ) -> Value {
     use cratonvm_native_api::AnnotationElementValue;
@@ -11356,7 +11396,7 @@ pub(crate) fn annotation_element_to_java_typed(
             // `container_loader` is present, resolve the enum type through it
             // first via `loadClass`, so the SAME loader's copy backs both the
             // default value and the bytecode's own reference to the constant.
-            let iae_trace = std::env::var("CRATONVM_IAE_TRACE").is_ok();
+            let iae_trace = crate::nbflags().iae_trace_ok;
             let via_loader = container_loader.and_then(|loader| {
                 match resolve_annotation_class_via_loader(ctx, loader, class_name) {
                     Ok(mirror) => ctx.class_id_from_mirror(mirror),
@@ -11419,7 +11459,7 @@ pub(crate) fn annotation_element_to_java_typed(
             // (common for annotation defaults that reference sibling classes
             // like picocli's NoOpModelTransformer), load it on demand. A null
             // return here causes downstream NullPointerExceptions (C29).
-            let iae_trace_cls = std::env::var("CRATONVM_IAE_TRACE").is_ok();
+            let iae_trace_cls = crate::nbflags().iae_trace_ok;
             if let Some(class_name) = annotation_desc_to_class_name(desc) {
                 // Classloader-isolation: when the declaring class was loaded by a
                 // user-defined loader, resolve the Class member THROUGH that loader
@@ -11460,7 +11500,9 @@ pub(crate) fn annotation_element_to_java_typed(
                         }
                     }
                 }
-                if let Some(cid) = ctx.class_id_by_name(class_name) {
+                let scoped = container_class_id
+                    .and_then(|holder| ctx.class_id_by_name_near(class_name, holder));
+                if let Some(cid) = scoped.or_else(|| ctx.class_id_by_name(class_name)) {
                     let mirror = ctx.get_class_mirror(cid);
                     if iae_trace_cls {
                         eprintln!("ANN-CLASS desc={desc} class={class_name} already-loaded ok");
@@ -11525,7 +11567,7 @@ pub(crate) fn annotation_element_to_java_typed(
             Value::Object(Some(descriptor_to_class_mirror(ctx, desc)))
         }
         AnnotationElementValue::Annotation(nested) => {
-            let proxy = create_annotation_proxy(ctx, nested, container_loader);
+            let proxy = create_annotation_proxy(ctx, nested, container_class_id, container_loader);
             normalize_single_annotation_array(ctx, Value::Object(Some(proxy)), return_type_desc)
         }
         AnnotationElementValue::Array(elems) => {
@@ -11753,6 +11795,7 @@ pub(crate) fn annotation_element_to_java_typed(
                     ctx,
                     elem,
                     elem_desc.as_deref(),
+                    container_class_id,
                     container_loader,
                 );
                 arr = ctx.read_native_pin(arr_pin, arr);
@@ -11920,7 +11963,7 @@ fn build_annotation_array_for(
         declaring_class_id.and_then(|cid| crate::classloader::defining_loader_for(cid.as_u32()));
     // GC-safe: `create_annotation_proxy` allocates (see `build_mirror_array`).
     build_mirror_array_comp(ctx, comp, resolvable.len(), |ctx, i| {
-        create_annotation_proxy(ctx, resolvable[i], container_loader)
+        create_annotation_proxy(ctx, resolvable[i], declaring_class_id, container_loader)
     })
 }
 
@@ -11989,7 +12032,7 @@ pub(crate) fn native_class_get_declared_annotations(
         }
     };
     let annotations = ctx.class_annotations(class_id);
-    if std::env::var("CRATONVM_ANN_TRACE").is_ok() {
+    if crate::nbflags().ann_trace {
         let cn = ctx.class_name_of_id(class_id).unwrap_or_default();
         if cn.contains("SpringBootApplication")
             || cn.contains("EnableAutoConfiguration")
@@ -12376,7 +12419,7 @@ fn class_annotations_by_type_impl(
     // GC-safe: `create_annotation_proxy` allocates (see `build_mirror_array`).
     let container_loader = crate::classloader::defining_loader_for(class_id.as_u32());
     let arr = build_mirror_array(ctx, matching.len(), |ctx, i| {
-        create_annotation_proxy(ctx, &matching[i], container_loader)
+        create_annotation_proxy(ctx, &matching[i], Some(class_id), container_loader)
     });
     Ok(Some(Value::Object(Some(arr))))
 }
@@ -12452,7 +12495,7 @@ pub(crate) fn native_method_get_annotations_by_type(
     // GC-safe: `create_annotation_proxy` allocates (see `build_mirror_array`).
     let container_loader = crate::classloader::defining_loader_for(class_id.as_u32());
     let arr = build_mirror_array(ctx, matching.len(), |ctx, i| {
-        create_annotation_proxy(ctx, &matching[i], container_loader)
+        create_annotation_proxy(ctx, &matching[i], Some(class_id), container_loader)
     });
     Ok(Some(Value::Object(Some(arr))))
 }
@@ -12615,7 +12658,7 @@ pub(crate) fn native_field_get_annotation(
     let container_loader = crate::classloader::defining_loader_for(class_id.as_u32());
     for ann in &annotations {
         if ann.type_descriptor == target_desc {
-            let proxy = create_annotation_proxy(ctx, ann, container_loader);
+            let proxy = create_annotation_proxy(ctx, ann, Some(class_id), container_loader);
             return Ok(Some(Value::Object(Some(proxy))));
         }
     }
@@ -12642,7 +12685,7 @@ pub(crate) fn native_method_get_annotations(
         }
     };
     let annotations = ctx.method_annotations(class_id, &method_name, &method_desc);
-    if std::env::var("CRATONVM_ANN_TRACE").is_ok() {
+    if crate::nbflags().ann_trace {
         let cn = ctx.class_name_of_id(class_id).unwrap_or_default();
         if cn.contains("SpringBootApplication")
             || cn.contains("EnableAutoConfiguration")
@@ -12728,7 +12771,7 @@ pub(crate) fn native_method_get_annotation(
     };
     let target_desc = format!("L{};", ann_class_name);
     let annotations = ctx.method_annotations(class_id, &method_name, &method_desc);
-    if std::env::var("CRATONVM_ANN_TRACE").is_ok() {
+    if crate::nbflags().ann_trace {
         let cn = ctx.class_name_of_id(class_id).unwrap_or_default();
         if cn.contains("SpringBootApplication")
             || cn.ends_with("/Import")
@@ -13206,9 +13249,7 @@ pub(crate) fn native_class_get_generic_interfaces(
             return Ok(Some(Value::Object(Some(arr))));
         }
     };
-    if std::env::var("CRATONVM_DBG_LAMBDA_GENERIC").is_ok()
-        && this_name.contains("ApplicationContextInitializer")
-    {
+    if crate::nbflags().dbg_lambda_generic && this_name.contains("ApplicationContextInitializer") {
         eprintln!(
             "[LAMBDA-GENERIC] getGenericInterfaces ENTRY this_name={this_name} class_id={class_id:?}"
         );
@@ -13255,7 +13296,7 @@ pub(crate) fn native_class_get_generic_interfaces(
                 }
                 arr = ctx.read_native_pin(arr_pin, arr);
                 ctx.unpin_native_roots(class_mirror_pin);
-                if std::env::var("CRATONVM_DBG_LAMBDA_GENERIC").is_ok()
+                if crate::nbflags().dbg_lambda_generic
                     && this_name.contains("ApplicationContextInitializer")
                 {
                     eprintln!(
@@ -13290,7 +13331,7 @@ pub(crate) fn native_class_get_generic_interfaces(
             // require one and throw on a bare raw `Class`. Falls back to the
             // long-standing raw-mirror behavior for non-generic SAM interfaces
             // or whenever the type variable(s) can't be matched.
-            let dbg_lg = std::env::var("CRATONVM_DBG_LAMBDA_GENERIC").is_ok();
+            let dbg_lg = crate::nbflags().dbg_lambda_generic;
             if let Some((sam_name, sam_desc, inst_desc)) =
                 ctx.lambda_call_site_descriptors(class_id)
             {
@@ -13879,7 +13920,7 @@ pub(crate) fn native_class_get_component_type(
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => {
-            if std::env::var("CRATONVM_DBG_COMPONENT_TYPE").is_ok() {
+            if crate::nbflags().dbg_component_type {
                 eprintln!("[CT-DBG] getComponentType receiver=null");
             }
             return Ok(Some(Value::Object(None)));
@@ -15458,7 +15499,7 @@ pub(crate) fn native_class_as_subclass(
         let name = mirror_class_name(ctx, this)
             .unwrap_or_default()
             .replace('/', ".");
-        if std::env::var_os("CRATONVM_DBG_CCE_BT").is_some() {
+        if crate::nbflags().dbg_cce_bt {
             let this_cid_map = ctx.class_id_from_mirror(this);
             let this_field0 = ctx.get_field(this, 0);
             let this_field1 = ctx.get_field(this, 1);
@@ -15910,7 +15951,13 @@ pub(crate) fn native_class_get_declared_classes(
         // downstream that reads their annotations/enum constants (e.g. a
         // `@Conditional` enum attribute compared by `==` against a value
         // resolved through the forked loader elsewhere).
-        let inner_id = match ctx.class_id_by_name_near(inner_class, class_id) {
+        let loader_id = ctx.loader_id_of_class(class_id);
+        let exact_inner = if loader_id >= 3 {
+            ctx.class_id_defined_by_loader_exact(inner_class, loader_id as u32)
+        } else {
+            None
+        };
+        let inner_id = match exact_inner {
             Some(id) => Some(id),
             None => {
                 // Not already loaded under the outer class's own loader.
@@ -15927,27 +15974,53 @@ pub(crate) fn native_class_get_declared_classes(
                 // `forkedLoader.loadClass("...NestedConfig")` directly)
                 // falls straight to the global lookup and silently returns
                 // the FIRST same-named class some other loader registered.
-                let driven = crate::classloader::defining_loader_for(class_id.as_u32()).and_then(
-                    |loader_obj| {
-                        let dotted = inner_class.replace('/', ".");
-                        let name_obj = ctx.create_string(&dotted);
-                        match ctx.invoke_virtual(
-                            loader_obj,
-                            "loadClass",
-                            "(Ljava/lang/String;)Ljava/lang/Class;",
-                            &[Value::Object(Some(name_obj))],
-                        ) {
-                            Ok(Some(Value::Object(Some(mirror)))) => mirror_class_id(ctx, mirror),
-                            _ => None,
-                        }
-                    },
-                );
+                //
+                // `defining_loader_for` is narrowly populated (only the ~4
+                // explicit `register_defining_loader` call sites write it),
+                // so a class defined via the ordinary isolated-`URLClassLoader`
+                // native path (`ucl_try_define_local_class`) can have a
+                // perfectly good `UserDefined` namespace id in `class_manager`
+                // (readable via `loader_id_of_class`) while still missing
+                // from that side table. Fall back to the namespace-id-keyed
+                // reverse lookup (`loader_object_for_namespace_id`, backed by
+                // the SAME object-keyed store `loader_namespace_id` itself
+                // writes) before giving up on driving the loader directly —
+                // this is exactly the scenario a JUnit5 `@Nested` class run
+                // under Spring Boot's `ModifiedClassPathClassLoader` fork
+                // hits: `getDeclaredClasses()` is called on a freshly
+                // isolated outer `Class` whose defining loader was never
+                // separately registered.
+                let loader_obj = crate::classloader::defining_loader_for(class_id.as_u32())
+                    .or_else(|| {
+                        let ns_id = ctx.loader_id_of_class(class_id);
+                        (ns_id >= 3)
+                            .then(|| crate::classloader::loader_object_for_namespace_id(ns_id as u32))
+                            .flatten()
+                    });
+                let driven = loader_obj.and_then(|loader_obj| {
+                    let dotted = inner_class.replace('/', ".");
+                    let name_obj = ctx.create_string(&dotted);
+                    match ctx.invoke_virtual(
+                        loader_obj,
+                        "loadClass",
+                        "(Ljava/lang/String;)Ljava/lang/Class;",
+                        &[Value::Object(Some(name_obj))],
+                    ) {
+                        Ok(Some(Value::Object(Some(mirror)))) => mirror_class_id(ctx, mirror),
+                        _ => None,
+                    }
+                });
                 match driven {
                     Some(id) => Some(id),
-                    None => match ctx.load_class(inner_class) {
-                        Ok(_) => ctx.class_id_by_name_near(inner_class, class_id),
-                        Err(_) => None,
-                    },
+                    None => ctx.class_id_by_name_near(inner_class, class_id).or_else(|| {
+                        ctx.load_class(inner_class)
+                            .ok()
+                            .flatten()
+                            .and_then(|value| match value {
+                                Value::Object(Some(mirror)) => mirror_class_id(ctx, mirror),
+                                _ => None,
+                            })
+                    }),
                 }
             }
         };
@@ -16007,9 +16080,15 @@ pub(crate) fn native_class_get_nest_host(
 
 /// `java/lang/Class.getNestMembers0()[Ljava/lang/Class;`
 ///
-/// Returns the nest members of this class. If this class has a NestMembers
-/// attribute (i.e., it is a nest host), returns those classes plus itself.
-/// Otherwise returns an array containing just itself.
+/// Returns the nest members of this class. Per JVMS/javadoc, only the nest
+/// *host* class file carries the `NestMembers` attribute — a nest *member*
+/// only carries a `NestHost` attribute pointing back to it. So a class that
+/// is itself a member (not the host) must resolve to its host first and
+/// query the host's `NestMembers` list; querying the member's own class_id
+/// directly always looks empty and silently degenerates to the "singleton
+/// nest" fallback below, even for classes that do belong to a larger nest.
+/// The returned array always includes `this` (JDK contract), plus the host
+/// and every other resolved member.
 pub(crate) fn native_class_get_nest_members(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -16024,18 +16103,82 @@ pub(crate) fn native_class_get_nest_members(
         }
     };
 
-    let members = ctx.nest_member_names(class_id);
+    // Lazily resolved on cache miss, same pattern as
+    // `native_class_get_permitted_subclasses`: nest members are commonly
+    // annotation-only or otherwise-untouched nested types that nothing
+    // else has caused to load yet, so a passive `class_id_by_name`
+    // registry lookup silently drops any member not already loaded —
+    // `this` class's own defining loader is authoritative for resolving
+    // its nestmates (compiled together, always visible to that loader).
+    let mut loader_obj: Option<ObjectRef> = None;
+    let mut loader_resolved = false;
+
+    let host_class_id = match ctx.nest_host_name(class_id) {
+        Some(host_name) => ctx
+            .class_id_by_name(&host_name)
+            .or_else(|| {
+                if !loader_resolved {
+                    loader_resolved = true;
+                    loader_obj = match native_class_get_class_loader(ctx, args) {
+                        Ok(Some(Value::Object(Some(l)))) => Some(l),
+                        _ => None,
+                    };
+                }
+                let loader = loader_obj?;
+                let dotted = host_name.replace('/', ".");
+                let name_obj = ctx.create_string(&dotted);
+                match ctx.invoke_virtual(
+                    loader,
+                    "loadClass",
+                    "(Ljava/lang/String;)Ljava/lang/Class;",
+                    &[Value::Object(Some(name_obj))],
+                ) {
+                    Ok(Some(Value::Object(Some(mirror_obj)))) => {
+                        ctx.class_id_from_mirror(mirror_obj)
+                    }
+                    _ => None,
+                }
+            })
+            .unwrap_or(class_id),
+        None => class_id,
+    };
+
+    let members = ctx.nest_member_names(host_class_id);
     if members.is_empty() {
         // Not a nest host вЂ” return [self]
         let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
         ctx.set_array_element(arr, 0, Value::Object(Some(this)));
         Ok(Some(Value::Object(Some(arr))))
     } else {
-        // Nest host вЂ” return [self] + resolved members
-        let mut mirrors: Vec<ObjectRef> = vec![ctx.get_class_mirror(class_id)];
+        // Nest host вЂ” return [host] + resolved members
+        let host_mirror = ctx.get_class_mirror(host_class_id);
+        let mut mirrors: Vec<ObjectRef> = vec![host_mirror];
         for member_name in &members {
-            if let Some(member_id) = ctx.class_id_by_name(member_name) {
-                if member_id != class_id {
+            let resolved = ctx.class_id_by_name(member_name).or_else(|| {
+                if !loader_resolved {
+                    loader_resolved = true;
+                    loader_obj = match native_class_get_class_loader(ctx, args) {
+                        Ok(Some(Value::Object(Some(l)))) => Some(l),
+                        _ => None,
+                    };
+                }
+                let loader = loader_obj?;
+                let dotted = member_name.replace('/', ".");
+                let name_obj = ctx.create_string(&dotted);
+                match ctx.invoke_virtual(
+                    loader,
+                    "loadClass",
+                    "(Ljava/lang/String;)Ljava/lang/Class;",
+                    &[Value::Object(Some(name_obj))],
+                ) {
+                    Ok(Some(Value::Object(Some(mirror_obj)))) => {
+                        ctx.class_id_from_mirror(mirror_obj)
+                    }
+                    _ => None,
+                }
+            });
+            if let Some(member_id) = resolved {
+                if member_id != host_class_id {
                     mirrors.push(ctx.get_class_mirror(member_id));
                 }
             }
@@ -18483,6 +18626,66 @@ mod tests {
         assert_eq!(ctx.array_length(arr), 1);
         let first = ctx.get_array_element(arr, 0);
         assert_eq!(first, Value::Object(Some(mirror)));
+    }
+
+    /// Regression: calling getNestMembers0 on a NEST MEMBER (not the host)
+    /// must resolve to the host first and return the host's full
+    /// NestMembers list, not silently degenerate to [self]. Per JVMS, only
+    /// the host class file carries the NestMembers attribute; members only
+    /// carry a NestHost back-pointer.
+    #[test]
+    fn class_get_nest_members_resolves_through_host_when_called_on_member() {
+        let mut ctx = mock_ctx();
+        let host_id = ctx.ensure_class_initialized("com/example/Outer").unwrap();
+        let member_id = ctx
+            .ensure_class_initialized("com/example/Outer$Inner")
+            .unwrap();
+        let sibling_id = ctx
+            .ensure_class_initialized("com/example/Outer$Sibling")
+            .unwrap();
+        ctx.set_nest_host_override(member_id, "com/example/Outer");
+        ctx.set_nest_members_override(
+            host_id,
+            vec![
+                "com/example/Outer$Inner".to_string(),
+                "com/example/Outer$Sibling".to_string(),
+            ],
+        );
+        let member_mirror =
+            make_class_mirror(&mut ctx, member_id.as_u32(), "com/example/Outer$Inner");
+
+        // Calling on the MEMBER's own mirror, not the host's.
+        let r = native_class_get_nest_members(&mut ctx, &[Value::Object(Some(member_mirror))]);
+        let arr = match r.unwrap() {
+            Some(Value::Object(Some(a))) => a,
+            other => panic!("expected array, got {other:?}"),
+        };
+        // Must include the host plus both members (3 total), not just [self].
+        // The mock's `get_class_mirror` mints a fresh ObjectRef per call (no
+        // canonicalization), so compare by the class_id stored in field 0
+        // rather than by object identity.
+        assert_eq!(ctx.array_length(arr), 3);
+        let ids: Vec<i32> = (0..3)
+            .map(|i| match ctx.get_array_element(arr, i) {
+                Value::Object(Some(o)) => match ctx.get_field(o, 0) {
+                    Value::Int(id) => id,
+                    other => panic!("expected Int class_id field, got {other:?}"),
+                },
+                other => panic!("expected non-null Object element, got {other:?}"),
+            })
+            .collect();
+        assert!(
+            ids.contains(&(host_id.as_u32() as i32)),
+            "missing host in result: {ids:?}"
+        );
+        assert!(
+            ids.contains(&(member_id.as_u32() as i32)),
+            "missing calling member (self) in result: {ids:?}"
+        );
+        assert!(
+            ids.contains(&(sibling_id.as_u32() as i32)),
+            "missing sibling in result: {ids:?}"
+        );
     }
 
     // -----------------------------------------------------------------------

@@ -13,7 +13,7 @@
 //!
 //! 1. The hot triple
 //!    `(java/lang/String, contains, (Ljava/lang/CharSequence;)Z)`
-//!    is present in `shared.native_methods` after VM construction.
+//!    is present in `shared.natives.native_methods` after VM construction.
 //! 2. The same is true for the offset overload of `startsWith`.
 //! 3. The registered native produces the spec-correct result for the
 //!    typical hits/misses + the empty-needle edge case.
@@ -37,6 +37,7 @@ fn string_contains_charsequence_is_registered() {
     let shared = shared();
     assert!(
         shared
+            .natives
             .native_methods
             .find(
                 "java/lang/String",
@@ -56,6 +57,7 @@ fn string_starts_with_offset_is_registered() {
     let shared = shared();
     assert!(
         shared
+            .natives
             .native_methods
             .find("java/lang/String", "startsWith", "(Ljava/lang/String;I)Z")
             .is_some(),
@@ -73,6 +75,7 @@ fn string_contains_true_via_dispatch() {
 
     let cb = vm
         .shared
+        .natives
         .native_methods
         .find(
             "java/lang/String",
@@ -104,6 +107,7 @@ fn string_contains_false_via_dispatch() {
 
     let cb = vm
         .shared
+        .natives
         .native_methods
         .find(
             "java/lang/String",
@@ -136,6 +140,7 @@ fn string_contains_empty_needle_is_true() {
 
     let cb = vm
         .shared
+        .natives
         .native_methods
         .find(
             "java/lang/String",
@@ -167,6 +172,7 @@ fn string_starts_with_offset_via_dispatch() {
 
     let cb = vm
         .shared
+        .natives
         .native_methods
         .find("java/lang/String", "startsWith", "(Ljava/lang/String;I)Z")
         .expect("startsWith(String, int) must be registered");

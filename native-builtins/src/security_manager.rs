@@ -39,7 +39,7 @@ static DBG_DOPRIV: OnceLock<bool> = OnceLock::new();
 
 #[inline]
 fn dbg_dopriv_enabled() -> bool {
-    *DBG_DOPRIV.get_or_init(|| std::env::var_os("CRATONVM_DBG_DOPRIV").is_some())
+    *DBG_DOPRIV.get_or_init(|| crate::nbflags().dbg_dopriv)
 }
 
 // SECURITY FIX (V10): strict opt-in for the certification profile.
@@ -58,7 +58,7 @@ static REQUIRE_POLICY: OnceLock<bool> = OnceLock::new();
 
 #[inline]
 fn require_policy_enabled() -> bool {
-    *REQUIRE_POLICY.get_or_init(|| std::env::var_os("CRATONVM_REQUIRE_POLICY").is_some())
+    *REQUIRE_POLICY.get_or_init(|| crate::nbflags().require_policy)
 }
 
 // ---------------------------------------------------------------------------

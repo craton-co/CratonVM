@@ -65,7 +65,7 @@ correctness (see the perf-hang report).
 
 ## Open bugs (reports in this directory)
 - **`bug-h2-charset-cp500-unsupported.md`** — FIXED 2026-07-22, see
-  [`../fixed-suite-bugs/bug-h2-charset-cp500-unsupported-FIXED.md`](../bug-h2-charset-cp500-unsupported-FIXED.md)
+  [`../fixed-suite-bugs/bug-h2-charset-cp500-unsupported-FIXED.md`](bug-h2-charset-cp500-unsupported-FIXED.md)
   — `Charset.forName("cp500")` now resolves (curated IBM500 codec added);
   `TestCharsetCollator`/`TestSetCollation.testCp500Collator` both pass.
 - **`bug-h2-netutils-missing-pbe-algparams.md`** — missing

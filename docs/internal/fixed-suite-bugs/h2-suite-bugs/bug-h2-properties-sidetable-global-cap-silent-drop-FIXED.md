@@ -3,7 +3,7 @@
 ## Status
 **FIXED** — 2026-07-22, `dev` (see commit referenced in the merge that landed
 this doc move). Originally opened 2026-07-21 as
-`docs/known-issues/h2-suite-bugs/bug-h2-properties-sidetable-global-cap-silent-drop.md`.
+`../../../known-issues/h2/bug-h2-properties-sidetable-global-cap-silent-drop.md`.
 
 *(This file was inadvertently dropped — not renamed, just lost — by the
 `docs/internal refactor` commit (`0bf07ab25`) that moved
@@ -95,7 +95,7 @@ root cause:
   just not this one.
 
 This was re-filed as a new, separate issue,
-`docs/known-issues/h2-suite-bugs/bug-h2-connectionpool-datasource-wrong-password-not-cap.md`
+`../../../known-issues/h2/bug-h2-connectionpool-datasource-wrong-password-not-cap.md`
 — **since also confirmed FIXED** (2026-07-22, as a side effect of other
 unrelated changes on `dev`, not a targeted fix): see
 `docs/internal/fixed-suite-bugs/h2-suite-bugs/bug-h2-connectionpool-datasource-wrong-password-not-cap-FIXED.md`.
