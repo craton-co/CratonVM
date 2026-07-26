@@ -66,6 +66,7 @@ use std::collections::HashMap;
 use std::sync::{Once, OnceLock, PoisonError, RwLock};
 
 use cratonvm_native_api::{NativeCallback, NativeContext, NativeMethodRegistry};
+use cratonvm_types::narrow_oop::ref_element_size;
 use cratonvm_types::{
     error::{MethodCallFailed, MethodCallResult, VmError},
     ArrayElementType, ClassId, ObjectKind, ObjectRef, Value,
@@ -288,7 +289,7 @@ pub fn approximate_object_size(
     let body = match kind {
         ObjectKind::Object => (num_slots * SLOT_SIZE) as i64,
         ObjectKind::Array => match element_type {
-            ArrayElementType::Reference => (length * REF_ELEMENT_SIZE) as i64,
+            ArrayElementType::Reference => (length * ref_element_size()) as i64,
             other => {
                 let raw = length.saturating_mul(element_byte_size(other));
                 // 8-byte align like the heap does.
@@ -1818,38 +1819,31 @@ mod tests {
 
     #[test]
     fn approximate_object_size_object() {
-        // FIX: HEADER_SIZE grew 32 -> 40 (mark_word added for thin-locks; see
-        // cratonvm_types::heap_types::HEADER_SIZE). Expectation was stale.
-        // Header (40) + 5 slots * 16 = 40 + 80 = 120.
+        // The compact header folds locking state into its metadata words:
+        // header (32) + 5 legacy Value slots * 16 = 112.
         let sz = approximate_object_size(ObjectKind::Object, ArrayElementType::Reference, 0, 5);
-        assert_eq!(sz, 120);
+        assert_eq!(sz, 112);
     }
 
     #[test]
     fn approximate_object_size_byte_array() {
-        // FIX: HEADER_SIZE grew 32 -> 40 (mark_word added for thin-locks; see
-        // cratonvm_types::heap_types::HEADER_SIZE). Expectation was stale.
-        // Header (40) + 10 bytes aligned-up-to-8 = 40 + 16 = 56.
+        // Header (32) + 10 bytes aligned up to 8 = 48.
         let sz = approximate_object_size(ObjectKind::Array, ArrayElementType::Byte, 10, 0);
-        assert_eq!(sz, 56);
+        assert_eq!(sz, 48);
     }
 
     #[test]
     fn approximate_object_size_long_array() {
-        // FIX: HEADER_SIZE grew 32 -> 40 (mark_word added for thin-locks; see
-        // cratonvm_types::heap_types::HEADER_SIZE). Expectation was stale.
-        // Header (40) + 4 * 8 = 40 + 32 = 72.
+        // Header (32) + 4 * 8 = 64.
         let sz = approximate_object_size(ObjectKind::Array, ArrayElementType::Long, 4, 0);
-        assert_eq!(sz, 72);
+        assert_eq!(sz, 64);
     }
 
     #[test]
     fn approximate_object_size_ref_array() {
-        // FIX: HEADER_SIZE grew 32 -> 40 (mark_word added for thin-locks; see
-        // cratonvm_types::heap_types::HEADER_SIZE). Expectation was stale.
-        // Header (40) + 3 refs * 8 = 40 + 24 = 64.
+        // Header (32) + 3 refs * 8 = 56.
         let sz = approximate_object_size(ObjectKind::Array, ArrayElementType::Reference, 3, 0);
-        assert_eq!(sz, 64);
+        assert_eq!(sz, 56);
     }
 
     #[test]

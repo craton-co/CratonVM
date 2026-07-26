@@ -108,10 +108,21 @@ pub fn scan_osc_cache_roots(roots: &mut Vec<ObjectRef>) {
         // (see `OscMap` lifetime note above). We re-lock through its own
         // `RwLock`, so no aliasing with the owner's guards.
         let map = unsafe { &*ptr };
-        for desc in map.read().values() {
+        for (&class_id, desc) in map.read().iter() {
             // `ObjectRef` is non-null by construction; the guard is
             // belt-and-suspenders against a future nullable value type.
             if !desc.as_ptr().is_null() {
+                if cratonvm_types::metadata_pin::metadata_weak_mode() {
+                    if let Some(loader) =
+                        cratonvm_types::loader_pin::loader_pin_addr(class_id.as_u32())
+                    {
+                        cratonvm_types::metadata_pin::add_metadata_pin(
+                            loader,
+                            desc.as_ptr() as usize,
+                        );
+                        continue;
+                    }
+                }
                 roots.push(*desc);
             }
         }
@@ -253,6 +264,51 @@ impl OscCache {
     /// Whether the cache is empty.
     pub fn is_empty(&self) -> bool {
         self.inner.read().is_empty()
+    }
+
+    /// Scan this VM's descriptor cache directly from its owning `SharedVm`.
+    ///
+    /// The process-global callback remains as a compatibility backstop, but a
+    /// VM-owned cache must not depend on lazy raw-pointer registration for
+    /// correctness or unloading. Direct ownership also lets loader metadata
+    /// remain a conditional edge during a full class-unloading mark.
+    pub fn scan_roots(&self, roots: &mut Vec<ObjectRef>) {
+        for (&class_id, desc) in self.inner.read().iter() {
+            if cratonvm_types::metadata_pin::metadata_weak_mode() {
+                if let Some(loader) =
+                    cratonvm_types::loader_pin::loader_pin_addr(class_id.as_u32())
+                {
+                    cratonvm_types::metadata_pin::add_metadata_pin(
+                        loader,
+                        desc.as_ptr() as usize,
+                    );
+                    continue;
+                }
+            }
+            roots.push(*desc);
+        }
+    }
+
+    /// Rewrite cached descriptors after a moving collection.
+    pub fn remap_roots(&self, pointer_map: &HashMap<usize, usize>) {
+        if pointer_map.is_empty() {
+            return;
+        }
+        for desc in self.inner.write().values_mut() {
+            if let Some(&new) = pointer_map.get(&(desc.as_ptr() as usize)) {
+                // SAFETY: collector forwarding maps contain live aligned
+                // object starts.
+                *desc = unsafe { ObjectRef::from_raw(new as *mut u8) };
+            }
+        }
+    }
+
+    /// Release descriptor mirrors owned by unloaded classes.
+    pub fn remove_classes(&self, class_ids: &rustc_hash::FxHashSet<ClassId>) -> usize {
+        let mut map = self.inner.write();
+        let before = map.len();
+        map.retain(|id, _| !class_ids.contains(id));
+        before - map.len()
     }
 
     /// Drop every cached descriptor. Test-only; production code should

@@ -41,6 +41,7 @@ pub enum MethodCallFailed {
     /// A Java exception was thrown (can be caught by exception handlers).
     /// The `ObjectRef` points to the `Throwable` object on the heap.
     ExceptionThrown(ObjectRef),
+
 }
 
 impl fmt::Display for MethodCallFailed {
@@ -107,6 +108,13 @@ pub enum VmError {
     /// Internal VM error (bug in the implementation).
     #[error("internal error: {message}")]
     Internal { message: String },
+
+    /// Non-failure scheduler control transfer used to unmount an unpinned
+    /// virtual thread. It is wrapped in `MethodCallFailed::InternalError`
+    /// solely to travel through native/interpreter return types and is
+    /// intercepted before any Java exception boundary.
+    #[error("virtual-thread continuation yielded for {wake_after_nanos}ns")]
+    ContinuationYield { wake_after_nanos: u64 },
 }
 
 /// Errors related to class file loading and parsing.

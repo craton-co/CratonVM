@@ -145,7 +145,7 @@ CratonVM one.
 
 ## Not the previously-fixed HIB-CV-27 bug — and not simple host-load noise either
 
-**Not HIB-CV-27.** `docs/internal/hib-linux-fail-bucket-triage-20260703.md`
+**Not HIB-CV-27.** `hib-linux-fail-bucket-triage-20260703.md`
 documents these exact 4 classes previously failing with a hard *compile
 error* (`package org.h2.tools does not exist`), root-caused to
 `java.io.File.<clinit>` never populating `file.separator`/`path.separator`
@@ -171,7 +171,7 @@ now root-caused, which the prior docs did not do.
 **Not simple host-load noise, either — though the shared host doesn't help.**
 Two prior docs
 (`docs/internal/fixed-suite-bugs/hib-generic-timeout-hang-longtail-resolved-20260715.md`,
-`docs/internal/hib-linux-fail-bucket-triage-20260703.md`) explicitly flag
+`hib-linux-fail-bucket-triage-20260703.md`) explicitly flag
 `sql.storedproc.{ResultMappingTest,StoredProcedureTest}` as having shown
 inconsistent PASS/FAIL/HANG/CRASH results across reruns on this same
 heavily-shared, multi-tenant host, and conclude (without finding a root

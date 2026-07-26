@@ -832,7 +832,7 @@ happened to be non-zero.
 
 ### This matches an already-documented, currently-OPEN bug family — not a new one
 
-`docs/internal/fixed-suite-bugs/dohead-jit-heap-corruption-register-invisibility-FIXED.md`
+`dohead-jit-heap-corruption-register-invisibility-FIXED.md`
 (filed for `TestHttpServletDoHead*`, root-caused via `CRATONVM_DBG_A2`) documents
 the exact mechanism this looks like: JIT-compiled code can keep a live object
 reference in a register/stack-slot across a GC-capable safepoint (there, a
@@ -1396,7 +1396,7 @@ that cluster. Don't count it among this family's confirmed occurrences.
 
 **Updated confirmed-occurrence list for the register-invisible-JIT-root
 family** (tomcat-08-07 investigation): DoHead
-(`docs/internal/fixed-suite-bugs/dohead-jit-heap-corruption-register-invisibility-FIXED.md`),
+(`dohead-jit-heap-corruption-register-invisibility-FIXED.md`),
 `TestSwallowAbortedUploads`/`AbortedPOSTClient` (this doc, above), and
 `TestAccessLogValve` (this section). The Hibernate global-temp-table cluster
 is explicitly **not** part of this list per the correction above.

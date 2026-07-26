@@ -743,11 +743,7 @@ fn alloc_synthetic(
 ///
 /// `"0"` ⇒ off (escape hatch); unset or any other value ⇒ on.
 fn real_stax_factory_gate() -> bool {
-    static GATE: OnceLock<bool> = OnceLock::new();
-    *GATE.get_or_init(|| match std::env::var("CRATONVM_REAL_STAX_FACTORY") {
-        Ok(v) => v != "0",
-        Err(_) => true,
-    })
+    crate::nbflags().real_stax_factory
 }
 
 /// Extract a non-null `ObjectRef` from an `invoke` result, swallowing errors /

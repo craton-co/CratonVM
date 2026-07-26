@@ -253,6 +253,18 @@ fn native_unsafe_park_with_blocker(
     } else {
         Some(std::time::Duration::from_nanos(nanos as u64))
     };
+    if ctx.is_current_virtual()
+        && ctx.vt_pin_count() == 0
+        && ctx.vt_park_for(timeout.unwrap_or(std::time::Duration::ZERO))
+    {
+        return Err(cratonvm_types::error::MethodCallFailed::InternalError(
+            cratonvm_types::error::VmError::ContinuationYield {
+                wake_after_nanos: timeout
+                    .map(|duration| duration.as_nanos().min(u64::MAX as u128) as u64)
+                    .unwrap_or(0),
+            },
+        ));
+    }
     // AQS-PARK-PIN: pin the blocker across the block so it can't be lost to
     // the JIT register-invisibility gap regardless of which JDK park overload
     // is live (see the matching fix in `NativeContextImpl::park`,

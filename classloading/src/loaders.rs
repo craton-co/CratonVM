@@ -18,6 +18,7 @@
 
 use crate::class::ClassLoaderId;
 use crate::class_path::ClassPath;
+use cratonvm_reader::SharedBytes;
 use cratonvm_types::error::ClassFileError;
 
 /// Round 5 audit fix (LOW #11) / Round 7 carry-over: the built-in
@@ -68,7 +69,7 @@ pub trait ClassFinder: std::fmt::Debug {
     ///
     /// Returns `Ok(bytes)` if found, `Err(ClassNotFound)` if not in this
     /// loader's search space.
-    fn find_class_bytes(&self, class_name: &str) -> Result<Vec<u8>, ClassFileError>;
+    fn find_class_bytes(&self, class_name: &str) -> Result<SharedBytes, ClassFileError>;
 
     /// Human-readable name for logging.
     fn name(&self) -> &str;
@@ -109,7 +110,7 @@ impl ClassFinder for BootstrapClassFinder {
     fn loader_id(&self) -> ClassLoaderId {
         ClassLoaderId::Bootstrap
     }
-    fn find_class_bytes(&self, class_name: &str) -> Result<Vec<u8>, ClassFileError> {
+    fn find_class_bytes(&self, class_name: &str) -> Result<SharedBytes, ClassFileError> {
         self.class_path.find_class(class_name)
     }
     fn name(&self) -> &str {
@@ -144,7 +145,7 @@ impl ClassFinder for ExtensionClassFinder {
     fn loader_id(&self) -> ClassLoaderId {
         ClassLoaderId::Extension
     }
-    fn find_class_bytes(&self, class_name: &str) -> Result<Vec<u8>, ClassFileError> {
+    fn find_class_bytes(&self, class_name: &str) -> Result<SharedBytes, ClassFileError> {
         self.class_path.find_class(class_name)
     }
     fn name(&self) -> &str {
@@ -183,7 +184,7 @@ impl ClassFinder for ApplicationClassFinder {
     fn loader_id(&self) -> ClassLoaderId {
         ClassLoaderId::Application
     }
-    fn find_class_bytes(&self, class_name: &str) -> Result<Vec<u8>, ClassFileError> {
+    fn find_class_bytes(&self, class_name: &str) -> Result<SharedBytes, ClassFileError> {
         self.class_path.find_class(class_name)
     }
     fn name(&self) -> &str {

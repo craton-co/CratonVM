@@ -142,6 +142,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "arc-swap"
+version = "1.9.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c049c0be4daef0b145cb3555416b3b8ef5b7888a38aea1a3a155801fe7b0810b"
+dependencies = [
+ "rustversion",
+]
+
+[[package]]
 name = "argon2"
 version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -462,6 +471,7 @@ dependencies = [
  "ecdsa",
  "elliptic-curve",
  "hashbrown 0.14.5",
+ "memmap2",
  "p12",
  "p256",
  "p384",
@@ -552,6 +562,7 @@ dependencies = [
 name = "cratonvm-jit"
 version = "0.3.0"
 dependencies = [
+ "arc-swap",
  "cratonvm-gc",
  "cratonvm-jit-api",
  "cratonvm-reader",

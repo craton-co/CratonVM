@@ -89,3 +89,39 @@ to-do list — when one is fixed, re-enable the corresponding check:
   cross-thread JIT-frame root scanning at a stop-the-world GC pause (there is a
   `fix/multithread-jit-roots-stw` branch for this). Excluded from the default
   set; run it once the gap is closed with `ONLY="RConcurrent"`.
+
+## Performance gate (CratonBench) — mandatory
+
+`perf/run-cratonbench-gate.sh` is the **mandatory perf-regression gate** for
+any change that touches `vm/`, `jit/`, `jit-api/`, `gc/`, `classloading/`, or
+the `native-*` crates. It runs every phase of `bench/CratonBench.java`
+(arithmetic, fib, sieve, matrix, hashmap, stringregex, bintrees) as an
+isolated fresh process — pinned CPU, `-Xmx8g`, median of 5 reps, no discarded
+samples — and enforces:
+
+1. **Exact checksums on every run.** A checksum mismatch is a correctness
+   regression and fails the gate outright.
+2. **No phase median may exceed its baseline by more than 5%**
+   (`perf/cratonbench-baseline-azure-epyc.tsv`). `anchored` baselines carry a
+   linked evidence doc (e.g.
+   `docs/internal/performance/binarytrees-half-gap-20260718.md` for
+   bintrees = 1,468 ms) and may only be re-anchored by a new evidence doc;
+   `provisional` baselines may be re-anchored with a normal PR justification
+   (use `--calibrate` on a quiet host).
+3. **Never measure under load.** The script refuses (exit 3) when the 1-min
+   load average exceeds `--max-load` (default 2.0). A refused run is not a
+   pass — rerun on a quiet host.
+
+```bash
+# On the Azure EPYC bench host, quiet window:
+bash regression-suite/perf/run-cratonbench-gate.sh -Exe /abs/path/to/cratonvm
+```
+
+The gate is Linux-bench-host-specific by design (taskset pinning, the
+baseline file is per-host). For a new bench host, generate
+`perf/cratonbench-baseline-<host>.tsv` with `--calibrate` and pass it via
+`--baseline`.
+
+> Note (2026-07-24): the bintrees anchor deliberately FAILS on current `dev` —
+> an open ~4x bt18 regression (post-`cf3a44e2a`) is being bisected. That is
+> the gate doing its job; do not re-anchor the baseline to absorb it.

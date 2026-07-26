@@ -673,6 +673,12 @@ pub(crate) struct MockNativeContext {
     /// `set_nest_host_override(child_id, "OuterClass")` to simulate a
     /// lookup class that is itself a nestmate of an outer.
     pub(crate) nest_host_override: UnsafeCell<HashMap<u32, String>>,
+    /// getNestMembers0 regression: per-class `nest_members` override,
+    /// returned by the `nest_member_names` trait method. Empty by default
+    /// (no class carries a `NestMembers` attribute); tests populate this
+    /// via `set_nest_members_override(host_id, vec!["Member1", "Member2"])`
+    /// to simulate a nest host's `NestMembers` attribute contents.
+    pub(crate) nest_members_override: UnsafeCell<HashMap<u32, Vec<String>>>,
     /// WP8.11.5: snapshot of the most recent `define_class_full` call's
     /// `DefineClassFull` options. Set by the override below;
     /// `last_define_full_opts()` reads it. Used by NESTMATE-propagation
@@ -780,6 +786,7 @@ impl MockNativeContext {
             native_thread_java_objs: UnsafeCell::new(HashMap::new()),
             registered_classpath: UnsafeCell::new(Vec::new()),
             nest_host_override: UnsafeCell::new(HashMap::new()),
+            nest_members_override: UnsafeCell::new(HashMap::new()),
             last_define_full_opts: UnsafeCell::new(None),
             last_define_full_loader: UnsafeCell::new(None),
             loader_id_override: UnsafeCell::new(HashMap::new()),
@@ -899,6 +906,17 @@ impl MockNativeContext {
         // SAFETY: single-threaded test code.
         unsafe {
             (*self.nest_host_override.get()).insert(child_id.as_u32(), host.to_string());
+        }
+    }
+
+    /// getNestMembers0 regression: declare that `host_id` has a
+    /// `NestMembers` attribute listing `members`.
+    /// Subsequent calls to `nest_member_names(host_id)` return `members`.
+    #[allow(dead_code)]
+    pub(crate) fn set_nest_members_override(&self, host_id: ClassId, members: Vec<String>) {
+        // SAFETY: single-threaded test code.
+        unsafe {
+            (*self.nest_members_override.get()).insert(host_id.as_u32(), members);
         }
     }
 
@@ -2219,6 +2237,19 @@ impl NativeContext for MockNativeContext {
             (*self.nest_host_override.get())
                 .get(&class_id.as_u32())
                 .cloned()
+        }
+    }
+
+    /// getNestMembers0 regression: read the per-class nest-members override
+    /// populated by `set_nest_members_override`. Empty by default (no
+    /// `NestMembers` attribute).
+    fn nest_member_names(&self, class_id: ClassId) -> Vec<String> {
+        // SAFETY: single-threaded test code.
+        unsafe {
+            (*self.nest_members_override.get())
+                .get(&class_id.as_u32())
+                .cloned()
+                .unwrap_or_default()
         }
     }
 

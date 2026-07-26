@@ -4,8 +4,8 @@
 //! Virtual-thread probe regression test.
 //!
 //! Pins the runtime behavior of `Thread.ofVirtual().start(...)` end-to-end
-//! through the `cratonvm.exe` CLI binary against the probes in
-//! `apps/vthread_probe/`:
+//! through the `cratonvm.exe` CLI binary against the checked-in probes in
+//! `vm/tests/resources/vthread_probe/`:
 //!
 //!   * `Counter.java`     — 1 virtual thread incrementing an `AtomicInteger`,
 //!                          must print `After: n=1`. (Matches the user-supplied
@@ -38,9 +38,8 @@ use std::time::Duration;
 fn probe_dir() -> PathBuf {
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
     manifest
-        .parent()
-        .unwrap()
-        .join("apps")
+        .join("tests")
+        .join("resources")
         .join("vthread_probe")
 }
 

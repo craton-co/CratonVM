@@ -25,6 +25,7 @@
 //!   defers compaction (it may still mark, but it does not relocate any
 //!   object — see `gen_heap::collect_garbage_inner`).
 
+use crate::gc_flags;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 #[cfg(not(test))]
@@ -103,9 +104,7 @@ pub static LEAVE_COUNT: AtomicUsize = AtomicUsize::new(0);
 /// validation against the bt18 = 68332206 invariant.
 #[inline]
 pub fn moving_young_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("CRATONVM_MOVING_YOUNG").is_some())
+    gc_flags().moving_young
 }
 
 static MOVING_YOUNG_COVERAGE_INCOMPLETE: AtomicBool = AtomicBool::new(false);
@@ -294,6 +293,35 @@ pub fn force_non_moving_jit_roots() -> bool {
 
 thread_local! {
     static MAJOR_GC_REQUESTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static CLASS_UNLOAD_MARKING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run one root-gather operation for a collector's non-moving class-unloading
+/// mark. Ordinary moving/evacuating pauses keep loader metadata strongly
+/// rooted; only an initial/final full-mark snapshot may publish conditional
+/// loader-owned edges.
+pub fn with_class_unload_marking<T>(f: impl FnOnce() -> T) -> T {
+    struct Reset(bool);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            CLASS_UNLOAD_MARKING.with(|flag| flag.set(self.0));
+        }
+    }
+
+    let previous = CLASS_UNLOAD_MARKING.with(|flag| {
+        let previous = flag.get();
+        flag.set(true);
+        previous
+    });
+    let _reset = Reset(previous);
+    f()
+}
+
+/// Whether this thread is gathering roots for a full non-moving mark whose
+/// side-edge closure understands loader-owned metadata.
+#[inline]
+pub fn class_unload_marking() -> bool {
+    CLASS_UNLOAD_MARKING.with(std::cell::Cell::get)
 }
 
 /// Request that the next collection on this thread run a full (major) cycle
@@ -566,6 +594,24 @@ pub fn set_watched_referents(addrs: &[usize]) {
 /// Consulted by the non-moving young sweep for each kept-in-place survivor.
 pub fn is_watched_referent(addr: usize) -> bool {
     WATCHED_REFERENTS.with(|s| s.borrow().contains(&addr))
+}
+
+/// Snapshot of the watched-referent set, or `None` when it is empty.
+///
+/// The set lives in a `thread_local!` owned by the collecting thread, so a
+/// parallel sweep worker cannot consult it directly (it would see its own,
+/// always-empty, copy). The collector snapshots it once before spawning
+/// workers; the set is sized by the VM's reference processor, not by the
+/// young generation, so the clone is cheap and usually skipped entirely.
+pub fn watched_referents_snapshot() -> Option<std::collections::HashSet<usize>> {
+    WATCHED_REFERENTS.with(|s| {
+        let s = s.borrow();
+        if s.is_empty() {
+            None
+        } else {
+            Some(s.clone())
+        }
+    })
 }
 
 #[cfg(test)]

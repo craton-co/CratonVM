@@ -34,7 +34,7 @@ fn test_vm() -> Vm {
 }
 
 fn read_test_java_string(vm: &Vm, obj: ObjectRef) -> Option<String> {
-    let heap = &vm.shared.heap;
+    let heap = &vm.shared.mem.heap;
     let value_array = match heap.get_field(obj, 0) {
         Value::Object(Some(arr)) => arr,
         _ => return None,
@@ -76,10 +76,10 @@ fn read_test_java_string(vm: &Vm, obj: ObjectRef) -> Option<String> {
 }
 
 fn throwable_detail_message(vm: &Vm, exc: ObjectRef) -> Option<String> {
-    let class_id = vm.shared.heap.class_id_of(exc);
+    let class_id = vm.shared.mem.heap.class_id_of(exc);
     let msg_ref = vm
         .instance_field_index(class_id, "detailMessage")
-        .and_then(|idx| match vm.shared.heap.get_field(exc, idx) {
+        .and_then(|idx| match vm.shared.mem.heap.get_field(exc, idx) {
             Value::Object(Some(msg)) => Some(msg),
             _ => None,
         })?;
@@ -89,9 +89,10 @@ fn throwable_detail_message(vm: &Vm, exc: ObjectRef) -> Option<String> {
 fn describe_result(vm: &Vm, result: &MethodCallResult) -> String {
     match result {
         Err(MethodCallFailed::ExceptionThrown(exc)) => {
-            let class_id = vm.shared.heap.class_id_of(*exc);
+            let class_id = vm.shared.mem.heap.class_id_of(*exc);
             let class_name = vm
                 .shared
+                .classes
                 .class_manager
                 .read()
                 .get_class(class_id)
@@ -246,17 +247,18 @@ fn io_input_stream_hierarchy() {
 fn io_superclass_chain_file_input_stream() {
     let vm = test_vm();
     let shared = vm.shared.clone();
-    let cm = shared.class_manager.read();
+    let cm = shared.classes.class_manager.read();
 
     // Load FileInputStream
     drop(cm);
     let fis_id = shared
+        .classes
         .class_manager
         .write()
         .load_class("java/io/FileInputStream")
         .expect("should load FileInputStream");
 
-    let cm = shared.class_manager.read();
+    let cm = shared.classes.class_manager.read();
     let fis = cm.get_class(fis_id).expect("FIS class");
     assert_eq!(&*fis.name, "java/io/FileInputStream");
 
@@ -275,12 +277,13 @@ fn io_superclass_chain_print_stream() {
     let shared = vm.shared.clone();
 
     let ps_id = shared
+        .classes
         .class_manager
         .write()
         .load_class("java/io/PrintStream")
         .expect("should load PrintStream");
 
-    let cm = shared.class_manager.read();
+    let cm = shared.classes.class_manager.read();
     let ps = cm.get_class(ps_id).expect("PS class");
     let super_id = ps.superclass.expect("PS should have superclass");
     let super_cls = cm.get_class(super_id).expect("superclass");
@@ -296,12 +299,13 @@ fn io_superclass_chain_byte_buffer() {
     let shared = vm.shared.clone();
 
     let bb_id = shared
+        .classes
         .class_manager
         .write()
         .load_class("java/nio/ByteBuffer")
         .expect("should load ByteBuffer");
 
-    let cm = shared.class_manager.read();
+    let cm = shared.classes.class_manager.read();
     let bb = cm.get_class(bb_id).expect("BB class");
     let super_id = bb.superclass.expect("BB should have superclass");
     let super_cls = cm.get_class(super_id).expect("superclass");
@@ -317,12 +321,13 @@ fn io_superclass_chain_buffered_reader() {
     let shared = vm.shared.clone();
 
     let br_id = shared
+        .classes
         .class_manager
         .write()
         .load_class("java/io/BufferedReader")
         .expect("should load BufferedReader");
 
-    let cm = shared.class_manager.read();
+    let cm = shared.classes.class_manager.read();
     let br = cm.get_class(br_id).expect("BR class");
     let super_id = br.superclass.expect("BR should have superclass");
     let super_cls = cm.get_class(super_id).expect("superclass");
@@ -342,17 +347,19 @@ fn io_field_count_file_streams() {
     let shared = vm.shared.clone();
 
     let fis_id = shared
+        .classes
         .class_manager
         .write()
         .load_class("java/io/FileInputStream")
         .expect("load FIS");
     let fos_id = shared
+        .classes
         .class_manager
         .write()
         .load_class("java/io/FileOutputStream")
         .expect("load FOS");
 
-    let cm = shared.class_manager.read();
+    let cm = shared.classes.class_manager.read();
     let fis = cm.get_class(fis_id).expect("FIS");
     let fos = cm.get_class(fos_id).expect("FOS");
 
@@ -375,12 +382,13 @@ fn io_field_count_byte_buffer() {
     let shared = vm.shared.clone();
 
     let bb_id = shared
+        .classes
         .class_manager
         .write()
         .load_class("java/nio/ByteBuffer")
         .expect("load ByteBuffer");
 
-    let cm = shared.class_manager.read();
+    let cm = shared.classes.class_manager.read();
     let bb = cm.get_class(bb_id).expect("BB");
 
     // ByteBuffer should have 5 own fields + 4 from Buffer parent = 9 total
@@ -401,12 +409,13 @@ fn io_input_stream_implements_closeable() {
     let shared = vm.shared.clone();
 
     let is_id = shared
+        .classes
         .class_manager
         .write()
         .load_class("java/io/InputStream")
         .expect("load InputStream");
 
-    let cm = shared.class_manager.read();
+    let cm = shared.classes.class_manager.read();
     let is_cls = cm.get_class(is_id).expect("IS");
 
     // Class.name is Arc<str> post T10.9.C; convert to String at the test

@@ -3495,7 +3495,7 @@ fn native_jdk_reflection_factory_get(
 }
 
 fn reflection_factory_debug_enabled() -> bool {
-    std::env::var_os("CRATONVM_DBG_REFLECTION_FACTORY").is_some()
+    crate::nbflags().dbg_reflection_factory
 }
 
 fn reflection_factory_class_arg(

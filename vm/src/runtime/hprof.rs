@@ -150,7 +150,7 @@ impl<'a> HprofDumper<'a> {
     // ------------------------------------------------------------------
 
     fn collect_metadata(&mut self) {
-        let cm = self.vm.class_manager.read();
+        let cm = self.vm.classes.class_manager.read();
         for class in cm.class_store.iter() {
             self.intern(&class.name);
             self.class_serial(class.id);
@@ -192,7 +192,7 @@ impl<'a> HprofDumper<'a> {
     // ------------------------------------------------------------------
 
     fn write_load_classes<W: Write>(&self, w: &mut W) -> io::Result<()> {
-        let cm = self.vm.class_manager.read();
+        let cm = self.vm.classes.class_manager.read();
         for class in cm.class_store.iter() {
             let serial = self.class_serials[&class.id];
             let class_obj_id = class_obj_id_for(class.id);
@@ -215,7 +215,7 @@ impl<'a> HprofDumper<'a> {
         // Thread serial 1, stack trace serial 1, no frames.
         // Required so INSTANCE_DUMP / CLASS_DUMP can reference stack_trace_serial=0
         // (meaning "no trace"), or serial=1 for thread roots.
-        let thread_names = self.vm.thread_registry.all_thread_names();
+        let thread_names = self.vm.threads.thread_registry.all_thread_names();
         if thread_names.is_empty() {
             // Always emit at least one dummy trace
             w.write_all(&HprofWriter::write_stack_trace(1, 1, &[]))?;
@@ -242,7 +242,7 @@ impl<'a> HprofDumper<'a> {
         self.write_class_dumps(&mut seg);
 
         // 5c: walk heap objects
-        let objects = self.vm.heap.walk_objects();
+        let objects = self.vm.mem.heap.walk_objects();
         for (ptr, _size) in &objects {
             // SAFETY: `walk_objects()` returns raw pointers that are
             // guaranteed to point at live object headers in the heap
@@ -253,7 +253,7 @@ impl<'a> HprofDumper<'a> {
             // HPROF dump is in progress — dump is serialized against
             // concurrent GC via the SharedVm's gc_barrier).
             let obj = unsafe { ObjectRef::from_raw(*ptr) };
-            let header = self.vm.heap.get_header(obj);
+            let header = self.vm.mem.heap.get_header(obj);
 
             match header.kind {
                 ObjectKind::Object => self.write_instance_dump_with_values(&mut seg, obj),
@@ -282,10 +282,14 @@ impl<'a> HprofDumper<'a> {
 
     fn write_gc_roots(&self, seg: &mut SegmentBuilder) {
         // Thread object roots
-        let thread_names = self.vm.thread_registry.all_thread_names();
+        let thread_names = self.vm.threads.thread_registry.all_thread_names();
         for (i, _) in thread_names.iter().enumerate() {
             let thread_serial = (i + 1) as u32;
-            let objs = self.vm.thread_registry.alive_thread_objects(usize::MAX);
+            let objs = self
+                .vm
+                .threads
+                .thread_registry
+                .alive_thread_objects(usize::MAX);
             if let Some(obj) = objs.get(i) {
                 let obj_id = obj.as_ptr() as u64;
                 seg.push_u8(GC_ROOT_THREAD_OBJ);
@@ -297,7 +301,7 @@ impl<'a> HprofDumper<'a> {
 
         // JNI global roots
         {
-            let globals = self.vm.jni_global_refs.lock();
+            let globals = self.vm.natives.jni_global_refs.lock();
             let mut roots = Vec::new();
             globals.collect_roots(&mut roots);
             for obj in &roots {
@@ -308,7 +312,7 @@ impl<'a> HprofDumper<'a> {
         }
 
         // Thread stack frame roots (GC root snapshots)
-        let roots = self.vm.thread_registry.collect_all_root_snapshots();
+        let roots = self.vm.threads.thread_registry.collect_all_root_snapshots();
         for obj in &roots {
             seg.push_u8(GC_ROOT_JAVA_FRAME);
             seg.push_u64(obj.as_ptr() as u64);
@@ -317,7 +321,7 @@ impl<'a> HprofDumper<'a> {
         }
 
         // Sticky class roots (system classes)
-        let cm = self.vm.class_manager.read();
+        let cm = self.vm.classes.class_manager.read();
         for class in cm.class_store.iter() {
             if class.name.starts_with("java/") || class.name.starts_with("[") {
                 seg.push_u8(GC_ROOT_STICKY_CLASS);
@@ -329,8 +333,8 @@ impl<'a> HprofDumper<'a> {
     // ---- CLASS_DUMP sub-records -----------------------------------------
 
     fn write_class_dumps(&mut self, seg: &mut SegmentBuilder) {
-        let cm = self.vm.class_manager.read();
-        let statics = self.vm.statics.read();
+        let cm = self.vm.classes.class_manager.read();
+        let statics = self.vm.classes.statics.read();
 
         for class in cm.class_store.iter() {
             let class_obj_id = class_obj_id_for(class.id);
@@ -387,8 +391,8 @@ impl<'a> HprofDumper<'a> {
     // ---- OBJ_ARRAY_DUMP sub-records -------------------------------------
 
     fn write_obj_array_dump(&self, seg: &mut SegmentBuilder, obj: ObjectRef) {
-        let header = self.vm.heap.get_header(obj);
-        let length = header.array_length as usize;
+        let header = self.vm.mem.heap.get_header(obj);
+        let length = header.array_length() as usize;
         let class_id = header.class_id;
 
         seg.push_u8(GC_OBJ_ARRAY_DUMP);
@@ -400,6 +404,7 @@ impl<'a> HprofDumper<'a> {
         for i in 0..length {
             let val = self
                 .vm
+                .mem
                 .heap
                 .get_array_element(obj, i)
                 .unwrap_or(cratonvm_types::Value::Object(None));
@@ -413,8 +418,8 @@ impl<'a> HprofDumper<'a> {
     // ---- PRIM_ARRAY_DUMP sub-records ------------------------------------
 
     fn write_prim_array_dump(&self, seg: &mut SegmentBuilder, obj: ObjectRef) {
-        let header = self.vm.heap.get_header(obj);
-        let length = header.array_length as usize;
+        let header = self.vm.mem.heap.get_header(obj);
+        let length = header.array_length() as usize;
         let elem_type = header.element_type;
         let hprof_type = array_element_to_hprof(elem_type);
 
@@ -427,6 +432,7 @@ impl<'a> HprofDumper<'a> {
         for i in 0..length {
             let val = self
                 .vm
+                .mem
                 .heap
                 .get_array_element(obj, i)
                 .unwrap_or(cratonvm_types::Value::Int(0));
@@ -635,11 +641,11 @@ fn class_hierarchy_chain(
 impl<'a> HprofDumper<'a> {
     /// Improved write_instance_dump that reads actual field values from the heap.
     fn write_instance_dump_with_values(&self, seg: &mut SegmentBuilder, obj: ObjectRef) {
-        let header = self.vm.heap.get_header(obj);
+        let header = self.vm.mem.heap.get_header(obj);
         let class_id = header.class_id;
-        let num_fields = header.num_slots as usize;
+        let num_fields = header.num_slots() as usize;
 
-        let cm = self.vm.class_manager.read();
+        let cm = self.vm.classes.class_manager.read();
         let chain = class_hierarchy_chain(class_id, &cm.class_store);
 
         // Serialize field values in hierarchy order
@@ -654,7 +660,7 @@ impl<'a> HprofDumper<'a> {
                     }
                     let htype = descriptor_to_hprof_type(&f.descriptor);
                     let val = if slot_idx < num_fields {
-                        self.vm.heap.get_field(obj, slot_idx)
+                        self.vm.mem.heap.get_field(obj, slot_idx)
                     } else {
                         cratonvm_types::Value::Int(0)
                     };

@@ -570,8 +570,9 @@ impl ExecutableBuffer {
     }
 }
 
-/// Total bytes of JIT code retained (never freed) for the process lifetime.
-/// See [`ExecutableBuffer`]'s `Drop` for why code is retained rather than freed.
+/// Legacy diagnostic retained for API compatibility. Executable mappings are
+/// now reclaimed with their last owning `Arc<CompiledMethod>`, so this remains
+/// zero in the ownership-tracked implementation.
 pub static RETAINED_JIT_CODE_BYTES: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
@@ -579,28 +580,18 @@ pub static RETAINED_JIT_CODE_BYTES: std::sync::atomic::AtomicUsize =
 // JIT code-cache cap (bounded growth)
 // ---------------------------------------------------------------------------
 //
-// Compiled code is intentionally RETAINED for the process lifetime (see
-// `ExecutableBuffer`'s `Drop`): baked-in direct `CALL rel32` targets and cached
-// MIC/PIC entry pointers have no back-reference mechanism, so reclamation would
-// dangle them. That makes the code cache monotonically growing — a long-running
-// workload that compiles many methods (or repeatedly re-compiles via OSR /
-// deopt churn) keeps mapping new executable regions with no upper bound.
-//
-// Since safe reclamation isn't feasible here, we apply a CAP-AND-STOP policy:
-// once the retained code (committed via `ExecutableBuffer::new`) reaches the
-// cap, `try_compile` refuses further compilation and the affected methods stay
-// in the interpreter. This bounds executable-memory growth at the cost of some
-// lost throughput past the cap; correctness is unaffected because the
-// interpreter can always run any method.
+// The cache owns executable bodies through `Arc<CompiledMethod>`. Baked direct
+// calls, MIC/PIC entries, external dispatch caches, and lock-free readers all
+// retain matching strong owners. Invalidation clears dynamic targets and
+// transitively withdraws direct callers; the last owner unregisters and unmaps
+// the body. The cap is therefore a live-occupancy pressure valve rather than a
+// permanent cap-and-stop threshold.
 
 /// Bytes of JIT code currently committed (mapped) by live `ExecutableBuffer`s.
 ///
-/// Bumped in [`ExecutableBuffer::new`] and decremented only when a region is
-/// actually returned to the OS (the `CRATONVM_JIT_FREE_CODE=1` path). Because
-/// code is normally retained for the process lifetime, this rises monotonically
-/// in the default configuration and is the quantity the code-cache cap bounds.
-/// Distinct from [`RETAINED_JIT_CODE_BYTES`], which only counts buffers whose
-/// owner was dropped (cache eviction) but whose memory was leaked.
+/// Bumped in [`ExecutableBuffer::new`] and decremented when the last owner drops
+/// and returns the region to the OS. This is the live quantity bounded by the
+/// code-cache cap.
 pub static COMMITTED_JIT_CODE_BYTES: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
@@ -677,43 +668,11 @@ impl Drop for ExecutableBuffer {
         if self.ptr.is_null() {
             return;
         }
-        // JIT code is RETAINED for the process lifetime — it is never returned
-        // to the OS here.
-        //
-        // Why: a compiled method's code can be the target of *baked-in direct
-        // `CALL rel32` instructions* (and cached MIC/PIC entry pointers) emitted
-        // into OTHER compiled methods (see `direct_calls` / `try_jit_compile_callee`
-        // in the interpreter). When a method is deoptimised or evicted, its
-        // `CompiledMethod` is dropped from the JIT cache (e.g.
-        // `DeoptimizationController::deoptimize` → `jit_cache.remove`), which
-        // would run this `Drop` and `VirtualFree`/`munmap` the code. But there is
-        // currently NO back-reference mechanism to find and patch the inbound
-        // direct calls, so they would dangle and the next call through one of
-        // them faults (execute) at the now-unmapped 64KB-aligned buffer base.
-        // That was the real-bytecode RAF avrora SEGV (commit()→advance dispatch;
-        // see docs/real-raf-segv-root-cause.md, Part 3).
-        //
-        // Freeing is therefore unsafe until the JIT tracks inbound call sites and
-        // patches/invalidates them at a safepoint before reclamation (a code-cache
-        // sweeper — the proper long-term fix). Until then we keep the region
-        // mapped AND registered so any dangling direct call still lands on valid,
-        // semantically-correct-at-compile-time code instead of crashing.
-        //
-        // `CRATONVM_JIT_FREE_CODE=1` restores the old free-on-drop behaviour for
-        // A/B testing / measuring retained-code growth — do NOT set it in
-        // production; it reintroduces the use-after-free.
-        if std::env::var_os("CRATONVM_JIT_FREE_CODE").is_some() {
-            if let Ok(mut regions) = jit_code_regions().lock() {
-                regions.deregister(self.ptr);
-            }
-            // This region is being returned to the OS, so it no longer counts
-            // against the code-cache cap.
-            COMMITTED_JIT_CODE_BYTES.fetch_sub(self.capacity, std::sync::atomic::Ordering::Relaxed);
-            platform::free_executable(self.ptr, self.capacity);
-            return;
+        if let Ok(mut regions) = jit_code_regions().lock() {
+            regions.deregister(self.ptr);
         }
-        RETAINED_JIT_CODE_BYTES.fetch_add(self.capacity, std::sync::atomic::Ordering::Relaxed);
-        // Intentionally leak: keep the mapping live and the region registered.
+        COMMITTED_JIT_CODE_BYTES.fetch_sub(self.capacity, std::sync::atomic::Ordering::Relaxed);
+        platform::free_executable(self.ptr, self.capacity);
     }
 }
 
@@ -796,17 +755,37 @@ impl OopMapEntry {
 // Arc-stable `CompiledMethod` pointer. The GC root walker uses it to resolve
 // which method a return address belongs to while walking the JIT RBP chain, so
 // it can remap EVERY active JIT frame (not just the innermost). Populated at
-// `JitCache::put`; normal eviction retires the `Arc<CompiledMethod>` instead of
-// dropping/unregistering it because stale direct calls and active return
-// addresses can still reach retained code. The explicit `CRATONVM_JIT_FREE_CODE`
-// diagnostic mode restores unregister+drop behavior for A/B testing only.
+// `JitCache::put`. Range snapshots are immutable and lock-free; the matching
+// `CompiledMethod` stays alive through cache, direct-call, inline-cache, and
+// active-reader ownership. Its final Drop unregisters the range before unmap.
 
-/// One registered code range: `(entry, end, cm_ptr)`.
-static JIT_CODE_RANGES: std::sync::OnceLock<std::sync::Mutex<Vec<(usize, usize, usize)>>> =
+type JitCodeRange = (usize, usize, usize);
+
+/// Copy-on-write code-range registry.
+///
+/// Readers take an atomically reference-counted immutable snapshot and never
+/// acquire the writer mutex. Registration/invalidation are rare compared with
+/// stack classification, so publishing a newly sorted snapshot keeps the hot
+/// lookup path both lock-free and O(log n).
+struct JitCodeRangeRegistry {
+    snapshot: arc_swap::ArcSwap<Vec<JitCodeRange>>,
+    writer: std::sync::Mutex<()>,
+}
+
+impl JitCodeRangeRegistry {
+    fn new() -> Self {
+        Self {
+            snapshot: arc_swap::ArcSwap::from_pointee(Vec::new()),
+            writer: std::sync::Mutex::new(()),
+        }
+    }
+}
+
+static JIT_CODE_RANGES: std::sync::OnceLock<JitCodeRangeRegistry> =
     std::sync::OnceLock::new();
 
-fn jit_code_ranges() -> &'static std::sync::Mutex<Vec<(usize, usize, usize)>> {
-    JIT_CODE_RANGES.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+fn jit_code_ranges() -> &'static JitCodeRangeRegistry {
+    JIT_CODE_RANGES.get_or_init(JitCodeRangeRegistry::new)
 }
 
 /// PERF (2026-07-15, RequestMappingMessageConversionIntegrationTests bootstrap
@@ -846,8 +825,12 @@ pub fn register_jit_code_range(entry: usize, len: usize, cm_ptr: usize) {
     if entry == 0 || len == 0 || cm_ptr == 0 {
         return;
     }
-    if let Ok(mut v) = jit_code_ranges().lock() {
-        v.push((entry, entry + len, cm_ptr));
+    let registry = jit_code_ranges();
+    if let Ok(_writer) = registry.writer.lock() {
+        let mut next = (**registry.snapshot.load()).clone();
+        next.push((entry, entry.saturating_add(len), cm_ptr));
+        next.sort_unstable_by_key(|&(start, _, _)| start);
+        registry.snapshot.store(std::sync::Arc::new(next));
         // Release: any cached snapshot taken with Acquire after this point must
         // see the push above (ordinary Mutex unlock already provides this, but
         // the counter itself is read outside the lock by cache-check callers).
@@ -862,15 +845,18 @@ pub fn unregister_jit_code_range(entry: usize) {
     if entry == 0 {
         return;
     }
-    if let Ok(mut v) = jit_code_ranges().lock() {
-        v.retain(|&(e, _, _)| e != entry);
+    let registry = jit_code_ranges();
+    if let Ok(_writer) = registry.writer.lock() {
+        let mut next = (**registry.snapshot.load()).clone();
+        next.retain(|&(e, _, _)| e != entry);
+        registry.snapshot.store(std::sync::Arc::new(next));
         JIT_CODE_RANGES_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
     }
 }
 
 /// Number of registered code ranges (Stage 5 diagnostic).
 pub fn jit_code_range_count() -> usize {
-    jit_code_ranges().lock().map(|v| v.len()).unwrap_or(0)
+    jit_code_ranges().snapshot.load().len()
 }
 
 /// BUG-03 — whether the cross-thread STW JIT root scan is enabled (env
@@ -905,25 +891,27 @@ pub fn xt_jit_root_scan_enabled() -> bool {
 /// deadlock the collector. The collector instead takes this snapshot ONCE
 /// (no thread suspended yet), then classifies every frozen peer against the
 /// returned copy with a lock-free range check. The set of ranges only grows
-/// during compilation and normally remains registered after eviction because
-/// retained code may still be reached by stale direct calls. A momentarily-stale
+/// during compilation and is withdrawn only after the last code owner drops.
+/// A momentarily-stale
 /// snapshot can only mis-classify a brand-new range as "not JIT" (handled
 /// conservatively by the snapshot-based mitigation), never the reverse.
 pub fn jit_code_ranges_snapshot() -> Vec<(usize, usize)> {
     jit_code_ranges()
-        .lock()
-        .map(|v| v.iter().map(|&(e, end, _)| (e, end)).collect())
-        .unwrap_or_default()
+        .snapshot
+        .load()
+        .iter()
+        .map(|&(e, end, _)| (e, end))
+        .collect()
 }
 
 /// Resolve the `CompiledMethod` pointer whose code range contains `addr`, or
-/// `None`. Linear scan (method counts are modest; only hit at GC time on the
-/// gated precise path). Stage 5.
+/// `None`. The immutable range table is sorted at publication, so this performs
+/// a lock-free binary search. Stage 5.
 pub fn lookup_jit_code_range(addr: usize) -> Option<usize> {
-    let v = jit_code_ranges().lock().ok()?;
-    v.iter()
-        .find(|&&(e, end, _)| addr >= e && addr < end)
-        .map(|&(_, _, cm)| cm)
+    let ranges = jit_code_ranges().snapshot.load();
+    let candidate = ranges.partition_point(|&(entry, _, _)| entry <= addr);
+    let &(entry, end, cm) = ranges.get(candidate.checked_sub(1)?)?;
+    (addr >= entry && addr < end).then_some(cm)
 }
 
 /// Copy the registered code ranges into `buf` as `(start, end)` pairs sorted by
@@ -939,10 +927,8 @@ pub fn lookup_jit_code_range(addr: usize) -> Option<usize> {
 /// `register_jit_code_range`.
 pub fn snapshot_code_ranges_into(buf: &mut Vec<(usize, usize)>) {
     buf.clear();
-    if let Ok(v) = jit_code_ranges().lock() {
-        buf.extend(v.iter().map(|&(e, end, _)| (e, end)));
-    }
-    buf.sort_unstable();
+    let ranges = jit_code_ranges().snapshot.load();
+    buf.extend(ranges.iter().map(|&(e, end, _)| (e, end)));
 }
 
 /// DBG (spring-bug-11): code-range → method-name table for naming a JIT frame in
@@ -1129,6 +1115,13 @@ pub struct CompiledMethod {
     /// helper has populated a slot, subsequent dispatches take the
     /// inline fast path.
     pub _jit_pic_slots: Vec<Box<JitPICSlot>>,
+    /// Native entries of compiled callees referenced by baked direct calls.
+    /// Filled by the compile driver before publication.
+    pub _direct_callee_entries: Vec<usize>,
+    /// Strong ownership matching `_direct_callee_entries`. A loaded caller can
+    /// therefore never outlive executable code reached by one of its baked
+    /// calls, even after the callee is invalidated and removed from the cache.
+    _direct_callee_roots: Vec<Arc<CompiledMethod>>,
     /// OSR metadata: bytecode PC → native offset mapping.
     pub osr_pc_to_native: Option<Vec<i32>>,
     /// OSR metadata: number of locals in the compiled frame.
@@ -1354,55 +1347,23 @@ unsafe impl Sync for CompiledMethod {}
 
 impl Drop for CompiledMethod {
     fn drop(&mut self) {
-        // The emitted machine code is RETAINED for the process lifetime (see
-        // `ExecutableBuffer::drop`) because other compiled methods bake direct
-        // `CALL rel32` / IC-slot pointers into it with no back-reference to patch
-        // on reclamation. That code ALSO holds RAW pointers into THIS method's
-        // interned strings, `JitInvokeInfo`s, and MIC/PIC slots. Freeing those
-        // boxes here while the code lives on makes the next MIC/PIC dispatch read
-        // a freed `JitInvokeInfo` — a garbage class/method name (embedded NUL
-        // bytes) that corrupts dispatch and panics when logged (avrora real-RAF
-        // `Thread-N` `core::fmt` slice panic on `MainClock.<garbage>`; see
-        // docs/real-raf-segv-root-cause.md). So leak this metadata too, keeping
-        // it alive exactly as long as the code that references it. This completes
-        // the code-retention fix — the two MUST go together.
-        //
-        // `CRATONVM_JIT_FREE_CODE=1` restores full freeing (code + metadata +
-        // OSR-trampoline purge) for A/B testing — it reintroduces the UAF.
-        if std::env::var_os("CRATONVM_JIT_FREE_CODE").is_none() {
-            std::mem::forget(std::mem::take(&mut self._jit_strings));
-            std::mem::forget(std::mem::take(&mut self._jit_invoke_infos));
-            std::mem::forget(std::mem::take(&mut self._jit_mic_slots));
-            std::mem::forget(std::mem::take(&mut self._jit_pic_slots));
-            // Deopt-point boxes are referenced by baked imm64 pointers in the
-            // (retained) guard/trampoline code; leak them too.
-            std::mem::forget(std::mem::take(&mut self._deopt_point_boxes));
-            return;
+        let entry = self.entry as usize;
+        cratonvm_types::jit_activation::unregister_executable_owner(entry);
+        unregister_jit_code_range(entry);
+        if let Some(owners) = JIT_ENTRY_OWNERS.get() {
+            let mut owners = owners.lock();
+            if owners
+                .get(&entry)
+                .is_some_and(|owner| owner.strong_count() == 0)
+            {
+                owners.remove(&entry);
+            }
         }
-        // deopt-osr Step 9 follow-up (a): retain the deopt-point boxes EVEN in
-        // free-mode, decoupling box lifetime from code lifetime. The boxes are
-        // baked by raw imm64 pointer into frame-deopt stubs; under
-        // `CRATONVM_JIT_FREE_CODE=1` the code is unmapped here, but a frame still
-        // executing this evicted artifact (or a concurrent invalidation) can
-        // reach `x64_deopt_entry`, which dereferences the box. Freeing the box
-        // would dangle that pointer. The boxes are tiny (one per deopt point), so
-        // leaking them is a negligible cost that removes the box use-after-free
-        // even in the A/B free-mode; the in-stub `DeoptEpochGuard` (also leaked,
-        // a raw pointer never owned here) lets the entry skip the deref entirely
-        // for a superseded artifact. The residual free-mode hazards (dangling
-        // direct CALLs into, and execution of, the now-unmapped code) are
-        // pre-existing and out of scope — see the module note above.
-        std::mem::forget(std::mem::take(&mut self._deopt_point_boxes));
-        // FREE mode: purge any cached OSR trampolines that point into this
-        // method's code range. After Drop, `self._buffer` releases its
-        // executable mapping, so any stale `target_addr` in the global cache
-        // would be a use-after-free hazard if a future compile reused the same
-        // address. `target_addr` for an OSR entry is `self.entry +
-        // native_offset`, where `native_offset < self._buffer.pos()`; pruning by
-        // half-open range `[entry, entry + pos)` covers every such address.
+
+        // Purge cached OSR trampolines before the body mapping is returned.
         #[cfg(target_arch = "x86_64")]
         {
-            let start = self.entry as usize;
+            let start = entry;
             let end = start.saturating_add(self._buffer.pos());
             let mut cache = osr_trampoline_cache().lock();
             cache.retain(|&target, _| !(target >= start && target < end));
@@ -1467,6 +1428,8 @@ impl CompiledMethod {
             _jit_invoke_infos: Vec::new(),
             _jit_mic_slots: Vec::new(),
             _jit_pic_slots: Vec::new(),
+            _direct_callee_entries: Vec::new(),
+            _direct_callee_roots: Vec::new(),
             osr_pc_to_native: None,
             osr_num_locals: 0,
             osr_num_reg_locals: 0,
@@ -1527,6 +1490,8 @@ impl CompiledMethod {
             _jit_invoke_infos: Vec::new(),
             _jit_mic_slots: Vec::new(),
             _jit_pic_slots: Vec::new(),
+            _direct_callee_entries: Vec::new(),
+            _direct_callee_roots: Vec::new(),
             osr_pc_to_native: None,
             osr_num_locals: 0,
             osr_num_reg_locals: 0,
@@ -2485,184 +2450,18 @@ unsafe fn osr_trampoline(
 // Method inlining
 // ---------------------------------------------------------------------------
 
-/// Maximum callee bytecode size (excluding padding) eligible for inlining at
-/// **any** call site — the admission gate, not the policy.
-///
-/// # 2026-07-26 re-shape (jit-inlining-and-ir-calls)
-///
-/// This was `35`, applied as a flat cap to every callee. That number is
-/// HotSpot's `MaxInlineSize`, which HotSpot applies **only to cold callees**;
-/// for a callee reached from a hot call site HotSpot uses `FreqInlineSize`,
-/// which is `325` — nearly 10x larger. CratonVM had the cold constant and no
-/// hot tier at all, so a 40-byte accessor called a million times in a loop was
-/// treated exactly like a 40-byte method called twice.
-///
-/// The three-tier HotSpot shape now lives here:
-///
-/// | tier | cap | HotSpot name | when |
-/// |---|---|---|---|
-/// | trivial | [`MAX_TRIVIAL_INLINE_SIZE`] = 6 | `MaxTrivialSize` | always — a getter is never worth a call |
-/// | cold | [`MAX_INLINE_SIZE_COLD`] = 35 | `MaxInlineSize` | no profile evidence the site is hot |
-/// | hot | `MAX_INLINE_BYTECODE_SIZE` = 325 | `FreqInlineSize` | the site is in a hot loop or has a hot receiver profile |
-///
-/// **This constant is the value the VM-side inline resolver
-/// (`vm/src/runtime/interpreter.rs::resolve_inline_site`) gates on**, and it
-/// must stay the largest of the three: the resolver is a pure admission
-/// filter that hands candidates to the planner in `try_compile_inner`, which
-/// then applies the per-site tier via [`inline_size_cap_for_site`]. Lowering
-/// this constant back to 35 would make the hot tier unreachable.
-///
-/// See also: `docs/internal/arch-2026-07-26/jit-inlining-and-ir-calls.md`.
-pub const MAX_INLINE_BYTECODE_SIZE: usize = 325;
+/// Maximum callee bytecode size (excluding padding) eligible for inlining.
+pub const MAX_INLINE_BYTECODE_SIZE: usize = 35;
 
-/// Callee-size cap for a call site with **no evidence of hotness** —
-/// HotSpot's `MaxInlineSize`. This is the value the flat pre-2026-07-26 cap
-/// used, so a cold site's inlining decisions are unchanged by the re-shape.
-pub const MAX_INLINE_SIZE_COLD: usize = 35;
+/// Total inlined bytecode budget per compiled method.
+pub const MAX_INLINE_BUDGET: usize = 250;
 
-/// Callee-size cap below which inlining is **always** profitable regardless of
-/// site hotness — HotSpot's `MaxTrivialSize`. A method this small is smaller
-/// than the call sequence that would invoke it.
-pub const MAX_TRIVIAL_INLINE_SIZE: usize = 6;
-
-/// Total inlined bytecode budget per compiled method, for a caller with no
-/// hot-loop / hot-site evidence.
+/// Maximum estimated native-code expansion accepted for one inline site.
 ///
-/// Raised from 250. The budget is not a free parameter: the single-pass
-/// backend sizes both its code buffer and its frame from it
-/// (`x64::compile` reserves `callee_code_len * 64` buffer bytes and
-/// `callee_max_locals + callee_code_len` spill slots **per inlined site**), so
-/// the ceiling here directly bounds committed executable memory (~64 bytes of
-/// buffer per budgeted bytecode) and JIT frame size (~8 bytes per budgeted
-/// bytecode). 750 keeps both comfortably bounded — ~48 KiB of buffer estimate
-/// and ~6 KiB of frame in the worst case — while being 3x the old ceiling.
-pub const MAX_INLINE_BUDGET: usize = 750;
-
-/// Total inlined bytecode budget for a **hot** caller — one the profile shows
-/// executing a hot loop, which is where inlining actually pays.
-///
-/// Worst case ~128 KiB of buffer estimate and ~16 KiB of frame; see
-/// [`MAX_INLINE_BUDGET`] for where those numbers come from.
-pub const MAX_INLINE_BUDGET_HOT: usize = 2000;
-
-/// Back-edge execution count at which a loop is considered hot for inlining
-/// purposes. Matches the order of magnitude
-/// `LoopTripProfile::suggests_unroll_factor` already uses for "not hot enough"
-/// (100 back-edges), so the two profile consumers agree on what "hot" means.
-pub const INLINE_HOT_LOOP_BACKEDGES: u64 = 100;
-
-/// Observation count at which a *call site* (rather than a loop) is considered
-/// hot, from its receiver-type profile. `MethodProfile::receivers` records one
-/// observation per executed `invokevirtual`/`invokeinterface`, so the summed
-/// count is a direct execution count for that site.
-pub const INLINE_HOT_SITE_OBSERVATIONS: u32 = 500;
-
-/// Bytecode pc ranges `[header, back_edge]` of every loop the profile shows to
-/// be hot, derived from `MethodProfile::loops` (keyed by back-edge pc) plus the
-/// bytecode itself (to recover each back-edge's branch target, i.e. the loop
-/// header).
-///
-/// `LoopTripProfile` records only the back-edge pc, so the header is recovered
-/// by decoding the branch instruction at that pc: a 3-byte `goto` (0xa7) or
-/// conditional (0x99..=0xa6) carries a signed 16-bit relative offset, and a
-/// 5-byte `goto_w` (0xc8) a signed 32-bit one. A back-edge is a branch whose
-/// target is at or before its own pc.
-fn hot_loop_ranges(
-    code: &[u8],
-    code_len: usize,
-    profile: Option<&profile::MethodProfile>,
-) -> Vec<(usize, usize)> {
-    let Some(prof) = profile else {
-        return Vec::new();
-    };
-    let mut ranges = Vec::new();
-    for (&back_pc, trips) in &prof.loops {
-        if trips.backedge_count < INLINE_HOT_LOOP_BACKEDGES {
-            continue;
-        }
-        if back_pc >= code_len {
-            continue;
-        }
-        let op = code[back_pc];
-        let target = match op {
-            // 3-byte relative branches: goto, if<cond>, if_icmp<cond>, if_acmp<cond>.
-            0x99..=0xa8 => {
-                if back_pc + 2 >= code_len {
-                    continue;
-                }
-                let off = i16::from_be_bytes([code[back_pc + 1], code[back_pc + 2]]) as isize;
-                back_pc as isize + off
-            }
-            // goto_w — 5 bytes, 32-bit offset.
-            0xc8 => {
-                if back_pc + 4 >= code_len {
-                    continue;
-                }
-                let off = i32::from_be_bytes([
-                    code[back_pc + 1],
-                    code[back_pc + 2],
-                    code[back_pc + 3],
-                    code[back_pc + 4],
-                ]) as isize;
-                back_pc as isize + off
-            }
-            _ => continue,
-        };
-        if target < 0 || target as usize > back_pc {
-            // Not a backward branch — the profile keyed something else here.
-            continue;
-        }
-        ranges.push((target as usize, back_pc));
-    }
-    ranges
-}
-
-/// Whether a call site at `pc` is HOT, and therefore eligible for the
-/// [`MAX_INLINE_BYTECODE_SIZE`] (`FreqInlineSize`) allowance rather than the
-/// [`MAX_INLINE_SIZE_COLD`] (`MaxInlineSize`) one.
-///
-/// Two independent pieces of real profile evidence, either of which suffices:
-///
-///  1. the site lies inside a loop whose back-edge count clears
-///     [`INLINE_HOT_LOOP_BACKEDGES`] (`MethodProfile::loops`); or
-///  2. the site's own receiver-type profile records at least
-///     [`INLINE_HOT_SITE_OBSERVATIONS`] executions (`MethodProfile::receivers`,
-///     which the interpreter populates per executed virtual/interface invoke).
-///
-/// With no profile at all every site is cold, so an unprofiled compile keeps
-/// exactly the pre-2026-07-26 35-byte behaviour.
-fn call_site_is_hot(
-    pc: usize,
-    hot_loops: &[(usize, usize)],
-    profile: Option<&profile::MethodProfile>,
-) -> bool {
-    if hot_loops
-        .iter()
-        .any(|&(header, back)| pc >= header && pc <= back)
-    {
-        return true;
-    }
-    profile
-        .and_then(|p| p.receivers.get(&pc))
-        .map(|counts| {
-            counts.values().copied().map(u64::from).sum::<u64>()
-                >= u64::from(INLINE_HOT_SITE_OBSERVATIONS)
-        })
-        .unwrap_or(false)
-}
-
-/// Per-site callee-size cap: the HotSpot three-tier shape.
-///
-/// Returns the largest callee bytecode length that may be inlined at this
-/// site. `MAX_TRIVIAL_INLINE_SIZE` is implicit — it is below both other tiers,
-/// so a trivial callee passes whichever cap applies.
-pub fn inline_size_cap_for_site(is_hot: bool) -> usize {
-    if is_hot {
-        MAX_INLINE_BYTECODE_SIZE
-    } else {
-        MAX_INLINE_SIZE_COLD
-    }
-}
+/// Bytecode length alone under-prices field accesses and helper-dependent
+/// bodies. Keeping a second, backend-oriented ceiling prevents one nominally
+/// small leaf from consuming disproportionate instruction-cache space.
+pub const MAX_INLINE_EXPANSION_COST: usize = 64;
 
 /// C1→C2 supersede eligibility: would an `optimize=true` recompile of this
 /// method actually take the optimizing IR pipeline AND be expected to produce
@@ -2670,31 +2469,47 @@ pub fn inline_size_cap_for_site(is_hot: bool) -> usize {
 ///
 /// Mirrors the IR gate in `try_compile_inner` (`ir_compatible` + the
 /// category-2/FP admission clauses) with one deliberate extra restriction:
-/// only ALLOCATION-FREE methods qualify.
+/// only ALLOCATION-FREE methods qualify, and a call-bearing method qualifies
+/// only when the IR can lower its calls as well as the single-pass backend
+/// does. Pure compute (int/long/FP arithmetic over locals, arrays and fields —
+/// sieve/matrix/reduction loop shapes) is where the IR backend reliably wins.
 ///
-/// # 2026-07-26 (jit-inlining-and-ir-calls): the CALL exclusion is gone
+/// # Why calls used to be excluded outright, and what changed
 ///
-/// This predicate used to additionally refuse any method containing an
-/// invoke. The stated reason — "the IR path lowers every invoke through the
-/// generic `invoke_dispatch` helper (no inline caches, no direct calls, no
-/// direct self-recursive CALL), so an optimizing recompile can be a net
-/// REGRESSION over the single-pass body" — was accurate when written and is
-/// now false on all three counts: `ir_lower` emits a direct self-recursive
-/// `CALL` (`invoke_kind` 4), direct calls to statically-bound compiled
-/// entries, and a MIC + 3-way-PIC inline cache for virtual/interface sites.
-/// An IR call site is now at worst equal to its single-pass counterpart, so
-/// call-bearing methods — i.e. ordinary application code, which was the entire
-/// population this predicate excluded — become C2 upgrade candidates.
+/// This predicate used to reject ANY method containing an invoke, because the
+/// IR path lowered every invoke through the generic `invoke_dispatch` helper —
+/// no direct calls, no inline caches — so an "optimizing" recompile of a
+/// call-bearing method could be a net REGRESSION over the single-pass body,
+/// which has always had direct calls and constructor inlining. That was the
+/// binding constraint on the whole IR pipeline: the tiered manager compiles a
+/// hot call-bearing method at C1 (`optimize == false`, which skips the IR
+/// pipeline entirely) and then declined to promote it here, so raising
+/// `ir_compatible`'s invoke cap alone changed nothing under tiered routing.
 ///
-/// The ALLOCATION exclusion **stays**, and deliberately so. The IR still has
-/// no allocation lowering: an `Op::New` that survives escape analysis bails
-/// the whole method to single-pass (`has_live_new`), precisely so the
-/// single-pass inline TLAB bump-pointer fast path keeps serving every real
-/// allocation. Promoting an allocation-bearing method to C2 would at best
-/// waste a compile and at worst trade the inline TLAB bump for a helper call —
-/// which is exactly one of the two independent causes of the July 2026
-/// Binary Trees 4x regression documented in BENCHMARK.md. Do not lift this
-/// clause without first giving the IR an inline-TLAB allocation path.
+/// `ir_lower::emit_direct_cross_call` removed that per-call tax for the
+/// STATICALLY BOUND invoke kinds, so those are now admitted:
+///
+///  * `invokestatic` (0xb8) and `invokespecial` (0xb7) have exactly one
+///    possible target, so the IR binds them with the same raw `CALL` the
+///    single-pass backend emits — subject to `ir_direct_calls_enabled()`,
+///    without which the IR would be back to paying the helper per call and the
+///    original rejection is still the right answer.
+///  * `invokevirtual` (0xb6) / `invokeinterface` (0xb9) stay excluded: the IR
+///    has no monomorphic inline cache, so a virtual site still pays the full
+///    helper round trip with a dynamic target lookup. (They are also
+///    default-OFF for IR lowering entirely — `CRATONVM_JIT_IR_CALL_VIRTUAL` —
+///    so such a method's invokes would bail the IR builder anyway.)
+///
+/// ALLOCATION-bearing methods remain excluded, unchanged: the IR's allocation
+/// lowering differs from the single-pass inline-TLAB bump, and the IR call
+/// eligibility loop requires `new_ops.is_empty()` anyway, so an
+/// allocation-bearing method's invokes would bail the builder.
+///
+/// This predicate deliberately stays a cheap, scan-only approximation (it
+/// cannot resolve a constant pool), so it can admit a method the IR later
+/// bails on — e.g. a constructor whose `invokespecial` is an `<init>` super
+/// call. That costs a wasted optimizing compile whose result is discarded in
+/// favour of the single-pass body; it is never a correctness risk.
 pub fn c2_upgrade_would_engage(
     code: &[u8],
     code_len: usize,
@@ -2705,10 +2520,20 @@ pub fn c2_upgrade_would_engage(
     let Some(scan) = x64::jit_scan(code, code_len, descriptor) else {
         return false;
     };
-    // Allocation exclusion — see the doc comment. `indy` is excluded by
-    // `ir_compatible` too; kept here so the reason is local.
     if !scan.new_ops.is_empty() || !scan.anewarray_ops.is_empty() || !scan.indy_ops.is_empty() {
         return false;
+    }
+    if !scan.invoke_ops.is_empty() {
+        if !ir_direct_calls_enabled() {
+            return false;
+        }
+        if scan
+            .invoke_ops
+            .iter()
+            .any(|(_, _, opcode)| *opcode != 0xb8 && *opcode != 0xb7)
+        {
+            return false;
+        }
     }
     if !ir::ir_compatible(&scan) {
         return false;
@@ -2797,6 +2622,68 @@ pub struct InlineSite {
     /// emitter pops the receiver the preceding `aload_0` pushed and emits
     /// NOTHING for these PCs; any 0xb7 NOT in this list still bails.
     pub elided_invoke_pcs: Vec<usize>,
+}
+
+/// Estimate the native-code expansion charged to the compilation's inline
+/// budget. The estimate deliberately stays cheap and deterministic: planning
+/// happens before backend emission and must not resolve or compile anything
+/// speculatively.
+pub fn inline_site_expansion_cost(site: &InlineSite) -> Option<usize> {
+    if site.callee_code_len == 0 || site.callee_code_len > MAX_INLINE_BYTECODE_SIZE {
+        return None;
+    }
+
+    let field_cost = site.field_info.len().saturating_mul(6);
+    let static_field_cost = site.static_field_info.len().saturating_mul(8);
+    let context_cost = usize::from(site.needs_heap).saturating_mul(4);
+    let cost = site
+        .callee_code_len
+        .saturating_add(field_cost)
+        .saturating_add(static_field_cost)
+        .saturating_add(context_cost);
+    (cost <= MAX_INLINE_EXPANSION_COST).then_some(cost)
+}
+
+#[cfg(test)]
+mod inline_selection_tests {
+    use super::*;
+
+    fn site(code_len: usize, fields: usize, static_fields: usize, needs_heap: bool) -> InlineSite {
+        InlineSite {
+            callee_code: vec![0; code_len.saturating_add(2)],
+            callee_code_len: code_len,
+            callee_max_locals: 1,
+            callee_num_args: 0,
+            callee_is_static: true,
+            return_type: b'V',
+            field_info: (0..fields).map(|pc| (pc, 0, b'I')).collect(),
+            compact_field_info: Vec::new(),
+            static_field_info: (0..static_fields)
+                .map(|pc| (pc, 1, 0, b'I', false))
+                .collect(),
+            ldc_info: Vec::new(),
+            ldc2w_info: Vec::new(),
+            needs_heap,
+            class_name: "InlineCost".to_string(),
+            method_name: "leaf".to_string(),
+            descriptor: "()V".to_string(),
+            elided_invoke_pcs: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn inline_selection_prices_backend_expansion() {
+        assert_eq!(inline_site_expansion_cost(&site(10, 2, 1, true)), Some(34));
+    }
+
+    #[test]
+    fn inline_selection_rejects_oversized_or_expensive_leaf() {
+        assert_eq!(
+            inline_site_expansion_cost(&site(MAX_INLINE_BYTECODE_SIZE + 1, 0, 0, false)),
+            None
+        );
+        assert_eq!(inline_site_expansion_cost(&site(35, 5, 0, true)), None);
+    }
 }
 
 /// A constant-pool value that the JIT can materialize safely.
@@ -3846,6 +3733,9 @@ pub struct JitMICSlot {
     /// expose to JIT codegen. `Arc<str>` so the per-hit clone in the
     /// dispatch helper is a refcount bump, not a `String` heap copy.
     pub cached_class_name: parking_lot::Mutex<Option<std::sync::Arc<str>>>,
+    /// Keeps a compiled cache target alive while generated code can load its
+    /// raw entry pointer. Native targets have no owner and leave this empty.
+    compiled_owner: parking_lot::Mutex<Option<Arc<CompiledMethod>>>,
 }
 
 impl JitMICSlot {
@@ -3879,6 +3769,7 @@ impl JitMICSlot {
             hits: std::sync::atomic::AtomicU64::new(0),
             misses: std::sync::atomic::AtomicU64::new(0),
             cached_class_name: parking_lot::Mutex::new(None),
+            compiled_owner: parking_lot::Mutex::new(None),
         }
     }
 
@@ -3949,6 +3840,7 @@ impl JitMICSlot {
         // Publish entry_ptr BEFORE class_id so the inline cache reader (which
         // checks class_id first, then loads entry_ptr) never observes a class
         // id paired with stale target metadata.
+        *self.compiled_owner.lock() = resolve_jit_entry_owner(entry_ptr as usize);
         self.cached_entry_ptr.store(entry_ptr, Ordering::Release);
         *self.cached_class_name.lock() = Some(std::sync::Arc::from(class_name));
         self.cached_needs_context
@@ -3963,8 +3855,18 @@ impl JitMICSlot {
     pub fn clear_compiled_entry(&self) {
         self.cached_entry_ptr
             .store(0, std::sync::atomic::Ordering::Release);
+        defer_jit_owner(self.compiled_owner.lock().take());
         self.cached_needs_context
             .store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn invalidate_target(&self, targets: &std::collections::HashSet<usize>) {
+        let entry = self
+            .cached_entry_ptr
+            .load(std::sync::atomic::Ordering::Acquire) as usize;
+        if entry != 0 && targets.contains(&entry) {
+            self.clear_compiled_entry();
+        }
     }
 
     /// Record a cache hit.
@@ -4103,6 +4005,9 @@ pub struct JitPICSlot {
     /// Moved to the tail: `parking_lot::Mutex<Option<String>>` has an
     /// unstable layout we must not expose to JIT codegen.
     pub class_names: [parking_lot::Mutex<Option<String>>; JIT_PIC_ENTRIES],
+    /// Strong owners for compiled `entry_ptrs`; tail-only so hot offsets stay
+    /// stable. Native targets leave the corresponding element empty.
+    compiled_owners: [parking_lot::Mutex<Option<Arc<CompiledMethod>>>; JIT_PIC_ENTRIES],
 }
 
 /// Miss count on a `JitMICSlot` at which the adaptive recompiler
@@ -4163,6 +4068,11 @@ impl JitPICSlot {
                 parking_lot::Mutex::new(None),
                 parking_lot::Mutex::new(None),
             ],
+            compiled_owners: [
+                parking_lot::Mutex::new(None),
+                parking_lot::Mutex::new(None),
+                parking_lot::Mutex::new(None),
+            ],
         }
     }
 
@@ -4186,6 +4096,7 @@ impl JitPICSlot {
         // per-hit clones in the dispatch helper) — convert on this rare
         // promotion path.
         let class_name = mic.cached_class_name.lock().as_deref().map(String::from);
+        *self.compiled_owners[0].lock() = mic.compiled_owner.lock().clone();
         // BUG-24: publish entry_ptr / needs_context / name BEFORE the class_id,
         // exactly as `write_entry` does. The inline PIC cascade
         // (`jit/src/x64.rs`) reads `class_ids[i]` first and, on a match, loads
@@ -4263,6 +4174,7 @@ impl JitPICSlot {
         // Clear first so readers don't see the old ptr paired with
         // the new class_id during the atomic update window.
         self.class_ids[victim].store(0, std::sync::atomic::Ordering::Release);
+        defer_jit_owner(self.compiled_owners[victim].lock().take());
         self.write_entry(victim, class_id, class_name, entry_ptr, needs_ctx);
     }
 
@@ -4278,6 +4190,7 @@ impl JitPICSlot {
         entry_ptr: u64,
         needs_ctx: bool,
     ) {
+        *self.compiled_owners[i].lock() = resolve_jit_entry_owner(entry_ptr as usize);
         self.entry_ptrs[i].store(entry_ptr, std::sync::atomic::Ordering::Release);
         self.needs_context[i].store(needs_ctx, std::sync::atomic::Ordering::Relaxed);
         *self.class_names[i].lock() = Some(class_name.to_string());
@@ -4299,6 +4212,19 @@ impl JitPICSlot {
             self.needs_context[i].store(false, std::sync::atomic::Ordering::Relaxed);
             self.hits[i].store(0, std::sync::atomic::Ordering::Relaxed);
             *self.class_names[i].lock() = None;
+            defer_jit_owner(self.compiled_owners[i].lock().take());
+        }
+    }
+
+    fn invalidate_targets(&self, targets: &std::collections::HashSet<usize>) {
+        for i in 0..JIT_PIC_ENTRIES {
+            let entry = self.entry_ptrs[i].load(std::sync::atomic::Ordering::Acquire) as usize;
+            if entry != 0 && targets.contains(&entry) {
+                self.class_ids[i].store(0, std::sync::atomic::Ordering::Release);
+                self.entry_ptrs[i].store(0, std::sync::atomic::Ordering::Release);
+                self.needs_context[i].store(false, std::sync::atomic::Ordering::Relaxed);
+                defer_jit_owner(self.compiled_owners[i].lock().take());
+            }
         }
     }
 
@@ -4434,7 +4360,7 @@ struct JitKey {
     // `ClassLoader(null)` re-loading an old H2 jar's own
     // `org.h2.mvstore.RootReference` alongside the identically-named class
     // already on the application classpath — see
-    // `docs/known-issues/h2-suite-bugs/bug-h2-suite-residual-fail-triage.md`'s
+    // `docs/known-issues/h2/bug-h2-suite-residual-fail-triage.md`'s
     // `TestUpgrade` residual) are DISTINCT classes with unrelated bytecode,
     // but the interpreter's own dispatch (`resolve_method_ref` /
     // `execute_invoke_kind` / `try_stackless_invoke`) already correctly
@@ -4580,48 +4506,183 @@ fn compute_jit_key_hash(
 /// cache (`osr_trampoline_cache`), relocation patches, and the
 /// JIT-code-region tracker (`jit_code_regions`) — all touching
 /// concurrency invariants that need their own test battery.
+impl CompiledMethod {
+    fn invalidate_cached_targets(&self, targets: &std::collections::HashSet<usize>) {
+        for slot in &self._jit_mic_slots {
+            slot.invalidate_target(targets);
+        }
+        for slot in &self._jit_pic_slots {
+            slot.invalidate_targets(targets);
+        }
+    }
+
+    fn clear_cached_targets(&self) {
+        for slot in &self._jit_mic_slots {
+            slot.clear_compiled_entry();
+        }
+        for slot in &self._jit_pic_slots {
+            slot.clear_entries();
+        }
+    }
+}
+
+type JitCacheMap = FxHashMap<u64, (JitKey, Arc<CompiledMethod>)>;
+const JIT_CACHE_SHARDS: usize = 64;
+
+struct JitCacheShard {
+    methods: arc_swap::ArcSwap<JitCacheMap>,
+    osr_methods: arc_swap::ArcSwap<JitCacheMap>,
+}
+
+impl JitCacheShard {
+    fn new() -> Self {
+        Self {
+            methods: arc_swap::ArcSwap::from_pointee(FxHashMap::default()),
+            osr_methods: arc_swap::ArcSwap::from_pointee(FxHashMap::default()),
+        }
+    }
+}
+
+/// Lock-free-read, copy-on-write sharded compiled-method cache.
+///
+/// A lookup touches one immutable shard snapshot and clones only the returned
+/// `Arc<CompiledMethod>`. Mutations are serialized because publication and
+/// dependency invalidation are rare and must be atomic as a group; only the
+/// affected shard map is copied for an ordinary tier-up publication.
 pub struct JitCache {
-    methods: FxHashMap<u64, (JitKey, Arc<CompiledMethod>)>,
-    /// OSR bodies are keyed separately from method-entry bodies. An OSR
-    /// artifact and a later C1/C2 publication for the same Java method must
-    /// coexist: replacing the OSR body otherwise leaves the hot back-edge
-    /// permanently interpreting while it waits for an OSR-only cache entry.
-    osr_methods: FxHashMap<u64, (JitKey, Arc<CompiledMethod>)>,
-    /// Evicted compiled methods whose code ranges remain executable and
-    /// registered for precise GC frame walks.
-    ///
-    /// Code is normally retained for process lifetime (see
-    /// `ExecutableBuffer::drop`), and direct-call sites / MIC slots are not yet
-    /// patched at invalidation time. Keeping the `Arc` alive preserves the
-    /// `CompiledMethod` pointer stored in `JIT_CODE_RANGES`.
-    retired_methods: Vec<Arc<CompiledMethod>>,
-    string_arena: Vec<Pin<Box<str>>>,
-    invoke_info_arena: Vec<Pin<Box<JitInvokeInfo>>>,
+    shards: Box<[JitCacheShard]>,
+    mutation: parking_lot::Mutex<()>,
+    string_arena: parking_lot::Mutex<Vec<Pin<Box<str>>>>,
+    invoke_info_arena: parking_lot::Mutex<Vec<Pin<Box<JitInvokeInfo>>>>,
+}
+
+static JIT_ENTRY_OWNERS: std::sync::OnceLock<
+    parking_lot::Mutex<FxHashMap<usize, std::sync::Weak<CompiledMethod>>>,
+> = std::sync::OnceLock::new();
+static JIT_CACHE_GENERATION: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+static ACTIVE_JIT_EXECUTIONS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static DEFERRED_JIT_OWNERS: std::sync::OnceLock<
+    parking_lot::Mutex<Vec<Arc<CompiledMethod>>>,
+> = std::sync::OnceLock::new();
+
+fn jit_entry_owners(
+) -> &'static parking_lot::Mutex<FxHashMap<usize, std::sync::Weak<CompiledMethod>>> {
+    JIT_ENTRY_OWNERS.get_or_init(|| parking_lot::Mutex::new(FxHashMap::default()))
+}
+
+fn resolve_jit_entry_owner(entry: usize) -> Option<Arc<CompiledMethod>> {
+    jit_entry_owners().lock().get(&entry)?.upgrade()
+}
+
+fn deferred_jit_owners() -> &'static parking_lot::Mutex<Vec<Arc<CompiledMethod>>> {
+    DEFERRED_JIT_OWNERS.get_or_init(|| parking_lot::Mutex::new(Vec::new()))
+}
+
+fn drain_deferred_jit_owners_if_quiescent() {
+    if ACTIVE_JIT_EXECUTIONS.load(std::sync::atomic::Ordering::Acquire) != 0 {
+        return;
+    }
+    let retired = std::mem::take(&mut *deferred_jit_owners().lock());
+    drop(retired);
+}
+
+fn defer_jit_owner(owner: Option<Arc<CompiledMethod>>) {
+    let Some(owner) = owner else {
+        return;
+    };
+    if ACTIVE_JIT_EXECUTIONS.load(std::sync::atomic::Ordering::Acquire) == 0 {
+        drop(owner);
+        return;
+    }
+    deferred_jit_owners().lock().push(owner);
+    // Close the race where the final execution leaves between the first load
+    // and queue publication.
+    drain_deferred_jit_owners_if_quiescent();
+}
+
+/// Enter/leave the process-wide executable-code quiescence epoch. VM JIT entry
+/// guards call these at the same boundaries as their precise frame chain.
+pub fn jit_execution_enter() {
+    ACTIVE_JIT_EXECUTIONS.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+}
+
+pub fn jit_execution_leave() {
+    let previous = ACTIVE_JIT_EXECUTIONS.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    debug_assert!(previous > 0, "unbalanced JIT execution leave");
+    if previous == 1 {
+        drain_deferred_jit_owners_if_quiescent();
+    }
+}
+
+/// Pin a raw compiled entry while an external dispatch cache can publish it.
+pub fn pin_jit_entry(entry: usize) -> Option<Arc<CompiledMethod>> {
+    resolve_jit_entry_owner(entry)
+}
+
+/// Monotonic publication/invalidation generation for external entry caches.
+///
+/// Advanced by EVERY mutation of a [`JitCache`] — `put`, `put_osr`, any
+/// `invalidate_*`, and `clear_all` — including a first-time insertion of a key
+/// that was not previously present.
+///
+/// That last case matters: until T2.2 the two `put` paths bumped only when they
+/// *replaced* an existing entry, which was sufficient for the original consumer
+/// (`vm/src/jit/helpers.rs`'s thread-local raw-entry dispatch caches, a purely
+/// *positive* cache that a brand-new key cannot invalidate). The interpreter's
+/// invoke-cache epoch check is a *negative* cache — "this method has no compiled
+/// body" — and a first-time publication is precisely what falsifies it, so the
+/// bump has to be unconditional. Under-bumping there would leave an interpreted
+/// call site pinned to the interpreter forever after a background compile
+/// published its body.
+pub fn jit_cache_generation() -> u64 {
+    JIT_CACHE_GENERATION.load(std::sync::atomic::Ordering::Acquire)
 }
 
 impl JitCache {
     pub fn new() -> Self {
+        let shards = (0..JIT_CACHE_SHARDS)
+            .map(|_| JitCacheShard::new())
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
         Self {
-            methods: FxHashMap::default(),
-            osr_methods: FxHashMap::default(),
-            retired_methods: Vec::new(),
-            string_arena: Vec::new(),
-            invoke_info_arena: Vec::new(),
+            shards,
+            mutation: parking_lot::Mutex::new(()),
+            string_arena: parking_lot::Mutex::new(Vec::new()),
+            invoke_info_arena: parking_lot::Mutex::new(Vec::new()),
         }
     }
 
-    pub fn intern_string(&mut self, s: String) -> (*const u8, usize) {
+    /// Compatibility accessors for callers written against the historical
+    /// outer `RwLock<JitCache>`. They deliberately do not acquire a lock.
+    #[inline]
+    pub fn read(&self) -> &Self {
+        self
+    }
+
+    #[inline]
+    pub fn write(&self) -> &Self {
+        self
+    }
+
+    #[inline]
+    fn shard_index(hash: u64) -> usize {
+        (hash as usize) & (JIT_CACHE_SHARDS - 1)
+    }
+
+    pub fn intern_string(&self, s: String) -> (*const u8, usize) {
         let boxed: Pin<Box<str>> = Pin::new(s.into_boxed_str());
         let ptr = boxed.as_ptr();
         let len = boxed.len();
-        self.string_arena.push(boxed);
+        self.string_arena.lock().push(boxed);
         (ptr, len)
     }
 
-    pub fn intern_invoke_info(&mut self, info: JitInvokeInfo) -> *const JitInvokeInfo {
+    pub fn intern_invoke_info(&self, info: JitInvokeInfo) -> *const JitInvokeInfo {
         let boxed = Pin::new(Box::new(info));
         let ptr: *const JitInvokeInfo = &*boxed;
-        self.invoke_info_arena.push(boxed);
+        self.invoke_info_arena.lock().push(boxed);
         ptr
     }
 
@@ -4648,7 +4709,8 @@ impl JitCache {
         declaring_class_id: cratonvm_types::ClassId,
     ) -> Option<Arc<CompiledMethod>> {
         let h = compute_jit_key_hash(class_name, method_name, descriptor, declaring_class_id);
-        let (key, method) = self.methods.get(&h)?;
+        let methods = self.shards[Self::shard_index(h)].methods.load();
+        let (key, method) = methods.get(&h)?;
         if &*key.class_name == class_name
             && &*key.method_name == method_name
             && &*key.descriptor == descriptor
@@ -4669,7 +4731,8 @@ impl JitCache {
         declaring_class_id: cratonvm_types::ClassId,
     ) -> Option<Arc<CompiledMethod>> {
         let h = compute_jit_key_hash(class_name, method_name, descriptor, declaring_class_id);
-        let (key, method) = self.osr_methods.get(&h)?;
+        let methods = self.shards[Self::shard_index(h)].osr_methods.load();
+        let (key, method) = methods.get(&h)?;
         if &*key.class_name == class_name
             && &*key.method_name == method_name
             && &*key.descriptor == descriptor
@@ -4681,27 +4744,23 @@ impl JitCache {
         }
     }
 
-    fn retire_evicted_method(&mut self, cm: Arc<CompiledMethod>) {
-        if std::env::var_os("CRATONVM_JIT_FREE_CODE").is_some() {
-            unregister_jit_code_range(cm.entry_ptr() as usize);
-            return;
-        }
-
-        // Keep the method object alive for the same lifetime as its retained
-        // executable buffer. The code-range registry stores this Arc's inner
-        // pointer and GC may dereference it while walking stale direct-call or
-        // still-active JIT frames after the cache entry becomes non-entrant.
-        self.retired_methods.push(cm);
+    fn prepare_for_publication(compiled: &mut CompiledMethod) {
+        compiled._direct_callee_roots = compiled
+            ._direct_callee_entries
+            .iter()
+            .filter_map(|&entry| resolve_jit_entry_owner(entry))
+            .collect();
     }
 
     pub fn put(
-        &mut self,
+        &self,
         class_name: Arc<str>,
         method_name: Arc<str>,
         descriptor: Arc<str>,
         declaring_class_id: cratonvm_types::ClassId,
-        compiled: CompiledMethod,
+        mut compiled: CompiledMethod,
     ) {
+        let _mutation = self.mutation.lock();
         let h = compute_jit_key_hash(&class_name, &method_name, &descriptor, declaring_class_id);
         let key = JitKey {
             class_name,
@@ -4709,10 +4768,12 @@ impl JitCache {
             descriptor,
             declaring_class_id,
         };
-        if let Some((_old_key, old_cm)) = self.methods.remove(&h) {
-            self.retire_evicted_method(old_cm);
-        }
+        Self::prepare_for_publication(&mut compiled);
         let arc = Arc::new(compiled);
+        cratonvm_types::jit_activation::register_executable_owner(
+            arc.entry_ptr() as usize,
+            declaring_class_id.as_u32(),
+        );
         // Stage 5 — register this method's code range for the GC RBP-chain
         // walker. Enabled when the precise gate is on (the registry is consulted
         // by `remap_active_jit_frames`) OR when the BUG-03 cross-thread STW JIT
@@ -4736,18 +4797,31 @@ impl JitCache {
                 format!("{}.{}{}", key.class_name, key.method_name, key.descriptor),
             );
         }
-        self.methods.insert(h, (key, arc));
+        jit_entry_owners()
+            .lock()
+            .insert(arc.entry_ptr() as usize, Arc::downgrade(&arc));
+        let shard = &self.shards[Self::shard_index(h)];
+        let mut next = (**shard.methods.load()).clone();
+        next.insert(h, (key, arc));
+        shard.methods.store(Arc::new(next));
+        // T2.2 — bump on EVERY publication, not just replacements. A first-time
+        // insertion is exactly the event the interpreter's negative
+        // "no compiled body for this method" memo
+        // (`CachedBytecodeMethod::jit_probe_generation`) must observe. See
+        // `jit_cache_generation`.
+        JIT_CACHE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
     }
 
     /// Publish an OSR body without superseding the method-entry body.
     pub fn put_osr(
-        &mut self,
+        &self,
         class_name: Arc<str>,
         method_name: Arc<str>,
         descriptor: Arc<str>,
         declaring_class_id: cratonvm_types::ClassId,
-        compiled: CompiledMethod,
+        mut compiled: CompiledMethod,
     ) {
+        let _mutation = self.mutation.lock();
         debug_assert!(compiled.compiled_via_osr);
         let h = compute_jit_key_hash(&class_name, &method_name, &descriptor, declaring_class_id);
         let key = JitKey {
@@ -4756,10 +4830,12 @@ impl JitCache {
             descriptor,
             declaring_class_id,
         };
-        if let Some((_old_key, old_cm)) = self.osr_methods.remove(&h) {
-            self.retire_evicted_method(old_cm);
-        }
+        Self::prepare_for_publication(&mut compiled);
         let arc = Arc::new(compiled);
+        cratonvm_types::jit_activation::register_executable_owner(
+            arc.entry_ptr() as usize,
+            declaring_class_id.as_u32(),
+        );
         if crate::x64::precise_jit_maps_enabled() || xt_jit_root_scan_enabled() {
             register_jit_code_range(
                 arc.entry_ptr() as usize,
@@ -4777,15 +4853,26 @@ impl JitCache {
                 ),
             );
         }
-        self.osr_methods.insert(h, (key, arc));
+        jit_entry_owners()
+            .lock()
+            .insert(arc.entry_ptr() as usize, Arc::downgrade(&arc));
+        let shard = &self.shards[Self::shard_index(h)];
+        let mut next = (**shard.osr_methods.load()).clone();
+        next.insert(h, (key, arc));
+        shard.osr_methods.store(Arc::new(next));
+        // T2.2 — unconditional, for the same reason as `put` above.
+        JIT_CACHE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
     }
 
     pub fn len(&self) -> usize {
-        self.methods.len() + self.osr_methods.len()
+        self.shards
+            .iter()
+            .map(|shard| shard.methods.load().len() + shard.osr_methods.load().len())
+            .sum()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.methods.is_empty() && self.osr_methods.is_empty()
+        self.len() == 0
     }
 
     /// Remove a compiled method from the cache (for invalidation).
@@ -4794,38 +4881,18 @@ impl JitCache {
     /// (rare) hash collision can't cause an unrelated cached entry to
     /// be evicted.
     pub fn remove(
-        &mut self,
+        &self,
         class_name: &str,
         method_name: &str,
         descriptor: &str,
         declaring_class_id: cratonvm_types::ClassId,
     ) {
-        let h = compute_jit_key_hash(class_name, method_name, descriptor, declaring_class_id);
-        if let Some((key, cm)) = self.methods.get(&h) {
-            if &*key.class_name == class_name
+        self.invalidate_matching(|key, _| {
+            &*key.class_name == class_name
                 && &*key.method_name == method_name
                 && &*key.descriptor == descriptor
                 && key.declaring_class_id == declaring_class_id
-            {
-                // Keep this method's GC code-range registration live after
-                // eviction; retained code may still appear in active frames or
-                // stale direct-call targets.
-                let cm = cm.clone();
-                self.methods.remove(&h);
-                self.retire_evicted_method(cm);
-            }
-        }
-        if let Some((key, cm)) = self.osr_methods.get(&h) {
-            if &*key.class_name == class_name
-                && &*key.method_name == method_name
-                && &*key.descriptor == descriptor
-                && key.declaring_class_id == declaring_class_id
-            {
-                let cm = cm.clone();
-                self.osr_methods.remove(&h);
-                self.retire_evicted_method(cm);
-            }
-        }
+        });
     }
 
     /// T5.4.4 — Class hierarchy change invalidation.
@@ -4837,95 +4904,142 @@ impl JitCache {
     /// the virtual method) is no longer valid.
     ///
     /// Returns the number of evicted entries.
-    pub fn invalidate_for_class_change(&mut self, changed_class: &str) -> usize {
-        let hashes_to_remove: Vec<u64> = self
-            .methods
-            .iter()
-            .filter(|(_, (_key, cm))| {
-                cm.inlined_methods
-                    .iter()
-                    .any(|(cls, _, _)| cls == changed_class)
-            })
-            .map(|(h, _)| *h)
-            .collect();
-        let osr_hashes_to_remove: Vec<u64> = self
-            .osr_methods
-            .iter()
-            .filter(|(_, (_key, cm))| {
-                cm.inlined_methods
-                    .iter()
-                    .any(|(cls, _, _)| cls == changed_class)
-            })
-            .map(|(h, _)| *h)
-            .collect();
-        let count = hashes_to_remove.len() + osr_hashes_to_remove.len();
-        for h in hashes_to_remove {
-            if let Some((_key, cm)) = self.methods.remove(&h) {
-                self.retire_evicted_method(cm);
-            }
-        }
-        for h in osr_hashes_to_remove {
-            if let Some((_key, cm)) = self.osr_methods.remove(&h) {
-                self.retire_evicted_method(cm);
-            }
-        }
-        count
+    pub fn invalidate_for_class_change(&self, changed_class: &str) -> usize {
+        self.invalidate_matching(|_, cm| {
+            cm.inlined_methods
+                .iter()
+                .any(|(cls, _, _)| cls == changed_class)
+        })
     }
 
     /// Invalidate all compiled methods that inlined code from `class_name`.
     /// Returns the number of methods evicted.
-    pub fn invalidate_for_class(&mut self, class_name: &str) -> usize {
-        let hashes_to_remove: Vec<u64> = self
-            .methods
-            .iter()
-            .filter(|(_, (_key, compiled))| {
-                compiled
+    pub fn invalidate_for_class(&self, class_name: &str) -> usize {
+        self.invalidate_matching(|_, compiled| {
+            compiled
+                .inlined_methods
+                .iter()
+                .any(|(cn, _, _)| cn == class_name)
+        })
+    }
+
+    /// Retire every body owned by an unloaded class and every caller that
+    /// inlined one of its methods. Retired executable allocations are reclaimed
+    /// by the epoch/quiescence path once no active frame can still execute them.
+    pub fn invalidate_unloaded_class(
+        &self,
+        class_id: cratonvm_types::ClassId,
+        class_name: &str,
+    ) -> usize {
+        self.invalidate_matching(|key, compiled| {
+            key.declaring_class_id == class_id
+                || compiled
                     .inlined_methods
                     .iter()
                     .any(|(cn, _, _)| cn == class_name)
-            })
-            .map(|(h, _)| *h)
-            .collect();
-        let osr_hashes_to_remove: Vec<u64> = self
-            .osr_methods
-            .iter()
-            .filter(|(_, (_key, compiled))| {
-                compiled
-                    .inlined_methods
-                    .iter()
-                    .any(|(cn, _, _)| cn == class_name)
-            })
-            .map(|(h, _)| *h)
-            .collect();
-        let count = hashes_to_remove.len() + osr_hashes_to_remove.len();
-        for h in hashes_to_remove {
-            if let Some((_key, cm)) = self.methods.remove(&h) {
-                self.retire_evicted_method(cm);
+        })
+    }
+
+    fn invalidate_matching(
+        &self,
+        predicate: impl Fn(&JitKey, &CompiledMethod) -> bool,
+    ) -> usize {
+        let _mutation = self.mutation.lock();
+        let mut remove_entries = std::collections::HashSet::new();
+        for shard in self.shards.iter() {
+            for (_hash, (key, cm)) in shard.methods.load().iter() {
+                if predicate(key, cm) {
+                    remove_entries.insert(cm.entry_ptr() as usize);
+                }
+            }
+            for (_hash, (key, cm)) in shard.osr_methods.load().iter() {
+                if predicate(key, cm) {
+                    remove_entries.insert(cm.entry_ptr() as usize);
+                }
             }
         }
-        for h in osr_hashes_to_remove {
-            if let Some((_key, cm)) = self.osr_methods.remove(&h) {
-                self.retire_evicted_method(cm);
+
+        // A raw direct caller of an invalidated body is invalid too. Compute
+        // the transitive reverse closure before publishing any new snapshot.
+        loop {
+            let before = remove_entries.len();
+            for shard in self.shards.iter() {
+                for map in [shard.methods.load(), shard.osr_methods.load()] {
+                    for (_hash, (_key, cm)) in map.iter() {
+                        if cm
+                            ._direct_callee_entries
+                            .iter()
+                            .any(|entry| remove_entries.contains(entry))
+                        {
+                            remove_entries.insert(cm.entry_ptr() as usize);
+                        }
+                    }
+                }
+            }
+            if remove_entries.len() == before {
+                break;
             }
         }
-        count
+
+        // Retarget dynamic inline caches before withdrawing ownership from the
+        // cache. Readers that already hold an old caller snapshot either miss
+        // after this release publication or keep the callee alive through the
+        // slot's strong owner until that snapshot is dropped.
+        for shard in self.shards.iter() {
+            for map in [shard.methods.load(), shard.osr_methods.load()] {
+                for (_hash, (_key, cm)) in map.iter() {
+                    cm.invalidate_cached_targets(&remove_entries);
+                }
+            }
+        }
+
+        let mut removed = 0;
+        for shard in self.shards.iter() {
+            let current = shard.methods.load();
+            let mut next = (**current).clone();
+            let old_len = next.len();
+            next.retain(|_, (_, cm)| !remove_entries.contains(&(cm.entry_ptr() as usize)));
+            removed += old_len - next.len();
+            if next.len() != old_len {
+                shard.methods.store(Arc::new(next));
+            }
+
+            let current = shard.osr_methods.load();
+            let mut next = (**current).clone();
+            let old_len = next.len();
+            next.retain(|_, (_, cm)| !remove_entries.contains(&(cm.entry_ptr() as usize)));
+            removed += old_len - next.len();
+            if next.len() != old_len {
+                shard.osr_methods.store(Arc::new(next));
+            }
+        }
+        if removed != 0 {
+            JIT_CACHE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
+        }
+        removed
     }
 
     /// Invalidate every compiled method in the cache.
     ///
     /// JVMTI redefine can invalidate caller-side direct calls and inline caches,
     /// not just methods declared by the redefined class. A full flush is rare
-    /// but conservative; normal mode retires evicted methods so retained code
-    /// ranges still have valid GC metadata.
-    pub fn clear_all(&mut self) -> usize {
-        let count = self.methods.len() + self.osr_methods.len();
-        let methods = std::mem::take(&mut self.methods);
-        for (_h, (_key, cm)) in methods {
-            self.retire_evicted_method(cm);
+    /// but conservative; ownership pins any body still referenced by an
+    /// already-loaded reader while new snapshots become empty atomically.
+    pub fn clear_all(&self) -> usize {
+        let _mutation = self.mutation.lock();
+        let mut count = 0;
+        for shard in self.shards.iter() {
+            for map in [shard.methods.load(), shard.osr_methods.load()] {
+                for (_hash, (_key, cm)) in map.iter() {
+                    cm.clear_cached_targets();
+                }
+            }
+            count += shard.methods.load().len() + shard.osr_methods.load().len();
+            shard.methods.store(Arc::new(FxHashMap::default()));
+            shard.osr_methods.store(Arc::new(FxHashMap::default()));
         }
-        let osr_methods = std::mem::take(&mut self.osr_methods);
-        for (_h, (_key, cm)) in osr_methods {
-            self.retire_evicted_method(cm);
+        if count != 0 {
+            JIT_CACHE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
         }
         count
     }
@@ -4942,8 +5056,11 @@ impl std::fmt::Debug for JitCache {
         write!(
             f,
             "JitCache({} methods, {} osr methods)",
-            self.methods.len(),
-            self.osr_methods.len()
+            self.shards.iter().map(|s| s.methods.load().len()).sum::<usize>(),
+            self.shards
+                .iter()
+                .map(|s| s.osr_methods.load().len())
+                .sum::<usize>()
         )
     }
 }
@@ -5684,6 +5801,27 @@ pub fn jit_direct_call_requires_dispatch(
 /// this is checked at JIT-compile time, never on the runtime hot path within
 /// this crate, so re-reading the env var has no measurable cost — and caching
 /// would make the flag racy against whichever test/thread compiles first.
+/// IR direct-call lowering — may the optimizing IR pipeline bind a resolved,
+/// statically-bound `invokestatic` / non-`<init>` `invokespecial` straight to its
+/// callee's compiled entry (a raw `CALL`), the way the single-pass backend
+/// already does?
+///
+/// Subordinate to [`direct_jit_callee_calls_enabled`]: the IR path emits exactly
+/// the same raw JIT-to-JIT edge the single-pass backend emits, so it must respect
+/// the same master switch. `CRATONVM_JIT_IR_DIRECT_CALL=0` is an additional
+/// IR-only opt-out for bisecting a regression to this lowering specifically
+/// (which restores the historical `jit_invoke_dispatch` route for every IR call
+/// site) without also disabling single-pass direct calls.
+pub fn ir_direct_calls_enabled() -> bool {
+    if !direct_jit_callee_calls_enabled() {
+        return false;
+    }
+    match std::env::var("CRATONVM_JIT_IR_DIRECT_CALL") {
+        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+        Err(_) => true,
+    }
+}
+
 pub fn direct_jit_callee_calls_enabled() -> bool {
     match std::env::var("CRATONVM_JIT_DIRECT_CALLEE_CALLS") {
         Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
@@ -5982,14 +6120,8 @@ pub fn try_compile_with_invokespecial_resolver(
         return None;
     }
 
-    // Code-cache cap (bounded growth). Compiled code is retained for the
-    // process lifetime with no safe reclamation path (see the cap notes near
-    // `COMMITTED_JIT_CODE_BYTES`), so once the retained code reaches the
-    // configured cap we refuse further compilation and let the method run in
-    // the interpreter. This is checked here — before any scan/IR/lowering — so
-    // a saturated cache spends no work on methods it won't emit. Not bail-
-    // listed: the refusal is capacity-driven, not a permanent backend bail, so
-    // if headroom later reappears (a region is freed) the method may compile.
+    // Live code-cache cap. Reclaimed bodies restore headroom, so this is a
+    // transient admission check rather than a permanent compile stop.
     if jit_code_cache_at_capacity() {
         JIT_CODE_CACHE_CAP_REFUSALS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return None;
@@ -6646,23 +6778,13 @@ fn try_compile_inner(
         // `CompiledMethod` below so the baked `info_ptr`s outlive the code.
         let mut ir_call_infos: Vec<Box<JitInvokeInfo>> = Vec::new();
         let mut ir_call_strings: Vec<Box<str>> = Vec::new();
-        // jit-inlining-and-ir-calls: per-call-site lowering plan handed to
-        // `ir_lower`. Every site defaults to the historical dispatch helper;
-        // the loop below upgrades the ones it can prove better.
-        let mut ir_call_plan = ir_lower::IrCallPlan::default();
-        let mut ir_mic_slots: Vec<Box<JitMICSlot>> = Vec::new();
-        let mut ir_pic_slots: Vec<Box<JitPICSlot>> = Vec::new();
-        // The virtual/interface gate was default-OFF at the VM call sites for
-        // one reason only: the IR lowered `invokevirtual`/`invokeinterface`
-        // through the generic `jit_invoke_dispatch` helper with NO inline
-        // cache, so admitting them made call-heavy methods slower than the
-        // single-pass body they replaced. `ir_lower` now emits the same
-        // MIC + 3-way-PIC cascade the single-pass backend does, so that reason
-        // is gone and the capability becomes opt-OUT
-        // (`CRATONVM_JIT_IR_CALL_VIRTUAL=0`) rather than opt-in. The caller's
-        // parameter still forces the gate on; it can no longer force it off.
-        // See the doc for the matching `env_cache.rs` cleanup.
-        let ir_emit_virtual_calls = ir_emit_virtual_calls || ir_virtual_calls_enabled();
+        // IR direct-call lowering: `pc → (callee_entry, callee_needs_context)`
+        // for each statically-bound site the IR lowerer may bind directly, plus
+        // the flat entry list recorded on the finished `CompiledMethod` (see
+        // `_direct_callee_entries` — keep-alive + invalidation closure).
+        let mut ir_direct_calls: std::collections::HashMap<usize, (usize, bool)> =
+            std::collections::HashMap::new();
+        let mut ir_direct_callee_entries: Vec<usize> = Vec::new();
         if (ir_emit_calls || ir_emit_special_calls || ir_emit_virtual_calls)
             && !scan.invoke_ops.is_empty()
         {
@@ -6671,10 +6793,6 @@ fn try_compile_inner(
                 if call_eligible {
                     let mut info_map = std::collections::HashMap::new();
                     let mut all_emittable = true;
-                    // Direct cross-method calls share the single-pass gate, so
-                    // the IR path inherits exactly its safety posture — no new
-                    // raw JIT→JIT transition shape is introduced.
-                    let ir_direct_calls_ok = direct_jit_callee_calls_enabled();
                     // Follow-up to the fib44 fix: when
                     // `CRATONVM_JIT_IR_SELFREC_DIRECT` is on, an eligible
                     // self-recursive static call is emitted as a DIRECT self-call
@@ -6683,6 +6801,10 @@ fn try_compile_inner(
                     // Default-on when the native-stack guard helper is wired;
                     // the env flag remains an opt-out for diagnosis.
                     let selfrec_direct = selfrec_direct_enabled();
+                    // IR direct-call lowering (this slice) - see
+                    // `ir_direct_calls_enabled` and `ir_lower`'s
+                    // `emit_direct_cross_call`.
+                    let ir_direct = ir_direct_calls_enabled();
                     for &(pc, cp_idx, opcode) in &scan.invoke_ops {
                         // Admit `invokestatic` (under `ir_emit_calls`), resolved
                         // non-`<init>` `invokespecial` (inc 24, under
@@ -6787,13 +6909,67 @@ fn try_compile_inner(
                         } else {
                             3
                         };
-                        // Kept for the per-site lowering plan below, which needs
-                        // the resolved target AFTER the strings are moved into
-                        // the leaked-box vector. Three short-lived allocations
-                        // per call site at compile time.
-                        let cn_for_plan = cn.clone();
-                        let mn_for_plan = mn.clone();
-                        let desc_for_plan = desc.clone();
+                        // IR direct-call lowering. `invokestatic` and a
+                        // non-`<init>` `invokespecial` are STATICALLY bound, so
+                        // the resolved callee is the only possible target and no
+                        // receiver type check is needed — exactly the property
+                        // that lets the single-pass backend bind them directly
+                        // (`x64.rs` `direct_calls`). Mirror its guards here:
+                        //
+                        //  * `note_jit_recursive_compile_cycle` — a call that
+                        //    closes an in-flight compile cycle (A-B-A) keeps the
+                        //    dispatch route, whose depth guard is the only stack
+                        //    protection such an edge has.
+                        //  * `jit_direct_call_requires_dispatch` — the deny-list
+                        //    of edges known to need the helper's rooting/return
+                        //    protocol (and every recorded cycle member).
+                        //  * self-recursion is handled by the dedicated
+                        //    `invoke_kind == 4` path above, not here.
+                        //  * JVMS §6.5 — for `invokespecial` the direct target is
+                        //    the *selection-start* class, not the plain CP class,
+                        //    so apply `cp_invokespecial_owner_resolver` first
+                        //    (single-pass does the same before its
+                        //    `callee_compiler` call). Without this a super call
+                        //    could be bound to the wrong method body.
+                        let mut direct_target: Option<(usize, bool)> = None;
+                        if ir_direct && (is_static || is_special) && !is_self_recursive {
+                            let special_owner: Option<String> = if is_special {
+                                cp_invokespecial_owner_resolver.and_then(|r| r(cp_idx))
+                            } else {
+                                None
+                            };
+                            let direct_class: &str =
+                                special_owner.as_deref().unwrap_or(cn.as_str());
+                            let closes_cycle =
+                                note_jit_recursive_compile_cycle(direct_class, &mn, &desc);
+                            if !closes_cycle
+                                && !jit_direct_call_requires_dispatch(direct_class, &mn, &desc)
+                            {
+                                if let Some(compiler) = callee_compiler.as_ref() {
+                                    if let Some((entry, callee_needs_ctx)) =
+                                        compiler(direct_class, &mn, &desc)
+                                    {
+                                        // Re-check: compiling the callee may have
+                                        // discovered a cycle through this edge.
+                                        if entry != 0
+                                            && !jit_direct_call_requires_dispatch(
+                                                direct_class,
+                                                &mn,
+                                                &desc,
+                                            )
+                                        {
+                                            direct_target = Some((entry, callee_needs_ctx));
+                                        } else {
+                                            mark_current_jit_compile_method_recursive_cycle();
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if let Some((entry, callee_needs_ctx)) = direct_target {
+                            ir_direct_calls.insert(pc, (entry, callee_needs_ctx));
+                            ir_direct_callee_entries.push(entry);
+                        }
                         let class_box: Box<str> = cn.into_boxed_str();
                         let method_box: Box<str> = mn.into_boxed_str();
                         let desc_box: Box<str> = desc.into_boxed_str();
@@ -6814,165 +6990,32 @@ fn try_compile_inner(
                         let info_ptr = &*info as *const JitInvokeInfo as usize;
                         ir_call_infos.push(info);
                         info_map.insert(pc, (info_ptr, num_args, ret));
-
-                        // ── Per-site lowering plan (jit-inlining-and-ir-calls) ──
-                        //
-                        // Everything below only ever UPGRADES a site away from
-                        // the generic dispatch helper; an unclassified site
-                        // lowers exactly as it did before this change.
-                        //
-                        // Hard precondition for both upgrades: the call's
-                        // arguments plus the hidden VM context pointer must fit
-                        // the platform's integer argument registers, because
-                        // `emit_direct_call` / `emit_inline_cache_call` marshal
-                        // in registers only (4 on Win64, 6 on SysV). A wider
-                        // site keeps the helper, which marshals through the
-                        // in-frame staging region.
-                        let args_fit = ir_lower::IrCallPlan::args_fit_in_registers(num_args);
-                        if invoke_kind == 4 {
-                            // Already a direct self-call; `ir_lower` keys that
-                            // off `invoke_kind` and never consults the plan.
-                        } else if (is_static || is_special) && args_fit && ir_direct_calls_ok {
-                            // DIRECT CALL — statically bound target whose
-                            // compiled entry we can resolve now. Mirrors the
-                            // single-pass `direct_calls` table, including its
-                            // exclusion of recursive-cycle targets: a direct
-                            // call into ANOTHER method's artifact is a hazard
-                            // the self-call stack guard does not cover, so those
-                            // keep the dispatch route.
-                            //
-                            // `note_jit_recursive_compile_cycle` is called for
-                            // its SIDE EFFECT as well as its answer — it is the
-                            // mechanism that detects a mutual-recursion compile
-                            // cycle. Skipping it (and relying on
-                            // `jit_direct_call_requires_dispatch` alone) would
-                            // let a mutually recursive pair compile each other
-                            // without bound. Same call, same order, same
-                            // interpretation as the single-pass loop below.
-                            let closes_cycle = note_jit_recursive_compile_cycle(
-                                &cn_for_plan,
-                                &mn_for_plan,
-                                &desc_for_plan,
-                            );
-                            let cycle_target = closes_cycle
-                                || jit_direct_call_requires_dispatch(
-                                    &cn_for_plan,
-                                    &mn_for_plan,
-                                    &desc_for_plan,
-                                );
-                            if !is_self_recursive && !cycle_target {
-                                if let Some(compiler) = callee_compiler.as_ref() {
-                                    if let Some((entry, callee_needs_ctx)) =
-                                        compiler(&cn_for_plan, &mn_for_plan, &desc_for_plan)
-                                    {
-                                        // `args_fit` already budgeted the hidden
-                                        // context pointer (`num_args + 1 <=
-                                        // abi_len`), so a callee that does NOT
-                                        // take it needs strictly fewer
-                                        // registers — no re-check required.
-                                        ir_call_plan.sites.insert(
-                                            pc,
-                                            ir_lower::IrCallTarget::Direct {
-                                                entry,
-                                                needs_context: callee_needs_ctx,
-                                            },
-                                        );
-                                    }
-                                }
-                            }
-                        } else if (is_virtual || is_interface)
-                            && args_fit
-                            && helpers.invoke_virtual_mic != 0
-                        {
-                            // INLINE CACHE — the IR analogue of the single-pass
-                            // MIC/PIC pair, allocated with exactly the same
-                            // eager strategy (HIGH-7): one MIC + one PIC per
-                            // virtual/interface site, PIC seeded from the MIC so
-                            // a profile-driven dominant receiver is not lost.
-                            // Slots start empty; the inline guards fall straight
-                            // through to `jit_invoke_virtual_mic`, which
-                            // populates them, after which later invocations take
-                            // the inline path with no recompile.
-                            let mic = Box::new(JitMICSlot::new());
-                            if let Some(prof) = profile {
-                                if let Some(receiver_counts) = prof.receivers.get(&pc) {
-                                    if let Some(dom) =
-                                        profile::dominant_receiver(receiver_counts, 80)
-                                    {
-                                        mic.prepopulate(dom);
-                                    }
-                                }
-                            }
-                            let pic = Box::new(JitPICSlot::new());
-                            pic.seed_from_mic(&mic);
-                            let mic_addr = &*mic as *const JitMICSlot as usize;
-                            let pic_addr = &*pic as *const JitPICSlot as usize;
-                            ir_mic_slots.push(mic);
-                            ir_pic_slots.push(pic);
-                            ir_call_plan.sites.insert(
-                                pc,
-                                ir_lower::IrCallTarget::InlineCache {
-                                    mic: mic_addr,
-                                    pic: pic_addr,
-                                },
-                            );
-                        }
                     }
                     if all_emittable && !info_map.is_empty() {
                         if std::env::var_os("CRATONVM_DBG_IR_CALL").is_some() {
                             eprintln!(
-                                "[cratonvm-ircall] {}.{}{}: emitting {} invoke(static/special/virtual/interface) Op::Call(s)",
+                                "[cratonvm-ircall] {}.{}{}: emitting {} invoke(static/special/virtual/interface) Op::Call(s), {} bound as DIRECT calls",
                                 cached.class_name,
                                 cached.method_name,
                                 cached.method_descriptor,
                                 info_map.len(),
+                                ir_direct_calls.len(),
                             );
                         }
                         builder.set_invoke_info(info_map);
                     } else {
                         // A non-emittable invoke is present → leave `invoke_info`
                         // unset (the builder bails on every invoke → single-pass)
-                        // and drop the now-unreferenced boxes/strings. The
-                        // lowering plan and its MIC/PIC slots go with them: the
-                        // plan's baked imm64s are addresses INTO those boxes, so
-                        // they must never outlive the vectors that own them.
+                        // and drop the now-unreferenced boxes/strings.
                         ir_call_infos.clear();
                         ir_call_strings.clear();
-                        ir_call_plan.sites.clear();
-                        ir_mic_slots.clear();
-                        ir_pic_slots.clear();
+                        ir_direct_calls.clear();
+                        ir_direct_callee_entries.clear();
                     }
                 }
             }
         }
         let built = builder.build(code, code_len);
-        // jit-inlining-and-ir-calls, tier-4 compile-time guard. `ir_compatible`'s
-        // bytecode budget rose from 200 to HotSpot's 8000-byte HugeMethodLimit,
-        // which is the right *admission* rule but a poor proxy for compile cost:
-        // `ir_optimize`'s GVN, the escape-analysis connection graph and the
-        // scheduler are all super-linear in NODE count, and an 8000-byte
-        // straight-line arithmetic method builds a far larger graph than an
-        // 8000-byte call-heavy one. Check the built graph — the one input that
-        // reflects actual complexity — before any optimization runs, so an
-        // over-large method costs exactly one linear build and then takes the
-        // single-pass backend. Without this, raising the size cap would move
-        // compile-time blowup from "impossible" to "unbounded" at tier 4.
-        let built = match built {
-            Some(g) if g.nodes.len() > ir::IR_MAX_GRAPH_NODES => {
-                if std::env::var_os("CRATONVM_DBG_IR_CALL").is_some() {
-                    eprintln!(
-                        "[cratonvm-ircall] {}.{}{}: IR graph {} nodes > IR_MAX_GRAPH_NODES {} — single-pass",
-                        cached.class_name,
-                        cached.method_name,
-                        cached.method_descriptor,
-                        g.nodes.len(),
-                        ir::IR_MAX_GRAPH_NODES,
-                    );
-                }
-                None
-            }
-            other => other,
-        };
         // Soak diagnostic (CRATONVM_DBG_SCALAR_NEW): an allocation-bearing method
         // that bailed the IR builder went single-pass, so `new` scalar
         // replacement could not fire on it — the signal that the IR builder is
@@ -7105,17 +7148,10 @@ fn try_compile_inner(
                                 .collect()
                         })
                         .unwrap_or_default();
-                    // Supply the profiled branch hints (Step 4), the
-                    // guard-surviving scalar-replacement map (Front 3.2) and the
-                    // per-call-site lowering plan (jit-inlining-and-ir-calls) to
-                    // the shared lowering body. `sr_map` is `None` unless
-                    // `CRATONVM_SCALAR_DEOPT` + `CRATONVM_DEOPT_REAL` are set;
-                    // an empty plan reproduces the generic-dispatch lowering.
-                    let ir_call_plan_ref = if ir_call_plan.sites.is_empty() {
-                        None
-                    } else {
-                        Some(&ir_call_plan)
-                    };
+                    // Supply BOTH the profiled branch hints (Step 4) and the
+                    // guard-surviving scalar-replacement map (Front 3.2) to the
+                    // shared lowering body. `sr_map` is `None` unless
+                    // `CRATONVM_SCALAR_DEOPT` + `CRATONVM_DEOPT_REAL` are set.
                     if let Some(mut compiled) = ir_lower::lower_inner(
                         &graph,
                         &schedule,
@@ -7124,7 +7160,7 @@ fn try_compile_inner(
                         helpers,
                         &ir_branch_hints,
                         sr_map.as_ref(),
-                        ir_call_plan_ref,
+                        &ir_direct_calls,
                     ) {
                         // Gap B: attach the leaked `JitInvokeInfo` boxes/strings
                         // so the `info_ptr`s baked into each `Op::Call` stay valid
@@ -7138,16 +7174,19 @@ fn try_compile_inner(
                             compiled._jit_strings = ir_call_strings;
                             compiled.has_dispatch = true;
                         }
-                        // jit-inlining-and-ir-calls: transfer ownership of the
-                        // inline-cache slots to the compiled method. The MIC/PIC
-                        // addresses are baked into the emitted guards as imm64,
-                        // so the boxes MUST outlive the code — exactly the
-                        // contract `_jit_mic_slots` / `_jit_pic_slots` exists
-                        // for on the single-pass path. Both are empty when no
-                        // virtual/interface site was planned.
-                        if !ir_mic_slots.is_empty() {
-                            compiled._jit_mic_slots = ir_mic_slots;
-                            compiled._jit_pic_slots = ir_pic_slots;
+                        // IR direct-call lowering: record every raw JIT-to-JIT
+                        // callee entry baked into this body. `_direct_callee_roots`
+                        // (computed at publication) keeps the callee's executable
+                        // buffer alive, and the cache's invalidation pass walks
+                        // `_direct_callee_entries` to evict a caller whose callee
+                        // was invalidated — without this the baked address could
+                        // outlive the code it targets. Same contract the
+                        // single-pass backend's `direct_callee_entries` has.
+                        if !ir_direct_callee_entries.is_empty() {
+                            ir_direct_callee_entries.sort_unstable();
+                            ir_direct_callee_entries.dedup();
+                            compiled._direct_callee_entries =
+                                std::mem::take(&mut ir_direct_callee_entries);
                         }
                         // Backend-routing introspection (tests only): this body was
                         // produced by the optimizing IR pipeline. A method that
@@ -7350,6 +7389,7 @@ fn try_compile_inner(
     let mut invoke_info: Vec<(usize, *const JitInvokeInfo)> = Vec::new();
     let mut owned_invoke_infos: Vec<Box<JitInvokeInfo>> = Vec::new();
     let mut direct_calls: Vec<(usize, JitDirectCall)> = Vec::new();
+    let mut direct_callee_entries: Vec<usize> = Vec::new();
     let mut mic_slots: Vec<(usize, *const JitMICSlot)> = Vec::new();
     let mut owned_mic_slots: Vec<Box<JitMICSlot>> = Vec::new();
     // HIGH-7 — Eager PIC allocation strategy.
@@ -7374,20 +7414,7 @@ fn try_compile_inner(
     let mut pic_slots: Vec<(usize, *const JitPICSlot)> = Vec::new();
     let mut owned_pic_slots: Vec<Box<JitPICSlot>> = Vec::new();
     let mut inline_sites: HashMap<usize, InlineSite> = HashMap::new();
-    // jit-inlining-and-ir-calls: HotSpot-shaped inlining budget. `hot_loops`
-    // is derived once from the profile + bytecode; a caller that executes any
-    // hot loop gets the larger whole-method budget, and each individual site
-    // inside one gets the `FreqInlineSize` (325) rather than `MaxInlineSize`
-    // (35) callee cap. With no profile the lists are empty, every site is cold,
-    // and both the per-site cap and the whole-method budget collapse to the
-    // pre-2026-07-26 values — an unprofiled compile inlines identically.
-    let inline_hot_loops = hot_loop_ranges(code, code_len, profile);
-    let caller_is_hot = !inline_hot_loops.is_empty();
-    let mut inline_budget_remaining: usize = if caller_is_hot {
-        MAX_INLINE_BUDGET_HOT
-    } else {
-        MAX_INLINE_BUDGET
-    };
+    let mut inline_budget_remaining: usize = MAX_INLINE_BUDGET;
     let mut inlined_methods: Vec<(String, String, String)> = Vec::new();
     // `java/lang/String` field layout, resolved ONCE for the whole
     // compilation. `try_resolve_string_intrinsic` (in the invoke loop
@@ -7471,29 +7498,11 @@ fn try_compile_inner(
                 if inline_budget_remaining > 0 {
                     if let Some(resolver_fn) = inline_resolver.as_ref() {
                         if let Some(site) = resolver_fn(&class_name, &method_name, &descriptor) {
-                            // Real budget accounting, in two independent
-                            // dimensions (jit-inlining-and-ir-calls):
-                            //  * PER SITE — the HotSpot three-tier callee cap.
-                            //    A trivial callee (<= MaxTrivialSize) always
-                            //    passes; otherwise a hot site gets
-                            //    FreqInlineSize and a cold one MaxInlineSize.
-                            //    Without this the raised admission constant
-                            //    (`MAX_INLINE_BYTECODE_SIZE`, now 325, which is
-                            //    what the VM-side resolver filters on) would
-                            //    splice 300-byte cold callees everywhere.
-                            //  * PER METHOD — the running `inline_budget_remaining`,
-                            //    which is what actually bounds code-size
-                            //    explosion: the single-pass backend reserves
-                            //    ~64 buffer bytes and ~1 frame slot per
-                            //    inlined bytecode, both linear in this total.
-                            let site_hot =
-                                call_site_is_hot(pc, &inline_hot_loops, profile);
-                            let size_cap = inline_size_cap_for_site(site_hot);
-                            let within_size = site.callee_code_len <= MAX_TRIVIAL_INLINE_SIZE
-                                || site.callee_code_len <= size_cap;
-                            if within_size && site.callee_code_len <= inline_budget_remaining {
+                            if let Some(expansion_cost) = inline_site_expansion_cost(&site)
+                                .filter(|cost| *cost <= inline_budget_remaining)
+                            {
                                 inline_budget_remaining =
-                                    inline_budget_remaining.saturating_sub(site.callee_code_len);
+                                    inline_budget_remaining.saturating_sub(expansion_cost);
                                 if site.needs_heap {
                                     needs_heap = true;
                                 }
@@ -7580,6 +7589,7 @@ fn try_compile_inner(
                                 if callee_needs_ctx {
                                     needs_heap = true;
                                 }
+                                direct_callee_entries.push(entry);
                                 direct_calls.push((
                                     pc,
                                     JitDirectCall {
@@ -8154,6 +8164,9 @@ fn try_compile_inner(
     // alive for the lifetime of the compiled code.
     compiled._jit_mic_slots.extend(owned_mic_slots);
     compiled._jit_pic_slots.extend(owned_pic_slots);
+    direct_callee_entries.sort_unstable();
+    direct_callee_entries.dedup();
+    compiled._direct_callee_entries = direct_callee_entries;
     compiled.inlined_methods = inlined_methods;
 
     if let Ok(want) = std::env::var("CRATONVM_DBG_JIT_CODE") {
@@ -8756,21 +8769,6 @@ thread_local! {
     /// ⇒ fall back to the env var. Production never sets this.
     static SELFREC_DIRECT_TEST_OVERRIDE: std::cell::Cell<Option<bool>> =
         const { std::cell::Cell::new(None) };
-
-    /// Per-thread override for [`ir_virtual_calls_enabled`], for tests that must
-    /// exercise the "virtual calls declined" routing without mutating a
-    /// process-global env var (which would race parallel test threads). `None`
-    /// ⇒ fall back to the env var (i.e. enabled). Production never sets this.
-    static IR_VIRTUAL_CALLS_TEST_OVERRIDE: std::cell::Cell<Option<bool>> =
-        const { std::cell::Cell::new(None) };
-}
-
-/// Test hook: force IR virtual/interface call lowering on (`Some(true)`) / off
-/// (`Some(false)`) for the CURRENT thread, or restore env behaviour (`None`).
-/// Thread-local so parallel tests don't race. Not part of the stable API.
-#[doc(hidden)]
-pub fn __set_ir_virtual_calls_override(v: Option<bool>) {
-    IR_VIRTUAL_CALLS_TEST_OVERRIDE.with(|c| c.set(v));
 }
 
 /// Test hook: force the self-recursive direct-call path on (`Some(true)`) / off
@@ -8790,39 +8788,6 @@ fn selfrec_direct_enabled() -> bool {
         return v;
     }
     match std::env::var("CRATONVM_JIT_IR_SELFREC_DIRECT") {
-        Ok(v) => !matches!(
-            v.trim().to_ascii_lowercase().as_str(),
-            "0" | "false" | "off"
-        ),
-        Err(_) => true,
-    }
-}
-
-/// Whether the IR pipeline may lower `invokevirtual` / `invokeinterface`
-/// (jit-inlining-and-ir-calls).
-///
-/// This capability existed before, but was gated **opt-IN** at the VM call
-/// sites (`CRATONVM_JIT_IR_CALL_VIRTUAL` had to be *set* to enable it) for a
-/// single, now-obsolete reason: the IR lowered every virtual call through the
-/// generic `jit_invoke_dispatch` helper with no inline cache, so admitting
-/// virtual calls made call-heavy methods SLOWER than the single-pass body they
-/// replaced. `ir_lower` now emits the MIC + 3-way-PIC cascade, so the
-/// regression risk that justified opt-in is gone and the flag inverts to a
-/// diagnostic opt-OUT, matching every other IR capability gate
-/// (`CRATONVM_JIT_IR_CALL`, `…_CALL_SPECIAL`, `…_LONG`, `…_FP`,
-/// `…_SELFREC_DIRECT`), all of which are `map_or(true, |v| v != "0")`.
-///
-/// FOLLOW-UP (not in this change's file scope): `vm/src/runtime/env_cache.rs`
-/// still computes its own copy of this flag as `var_os(...).is_some()`
-/// (opt-in). That copy is now redundant — `try_compile_inner` ORs the caller's
-/// parameter with this function, so the capability is on either way — but it
-/// should be inverted to `map_or(true, |v| v != "0")` for consistency, and
-/// then this local gate can be deleted. See the design doc.
-fn ir_virtual_calls_enabled() -> bool {
-    if let Some(v) = IR_VIRTUAL_CALLS_TEST_OVERRIDE.with(|c| c.get()) {
-        return v;
-    }
-    match std::env::var("CRATONVM_JIT_IR_CALL_VIRTUAL") {
         Ok(v) => !matches!(
             v.trim().to_ascii_lowercase().as_str(),
             "0" | "false" | "off"
@@ -9254,6 +9219,9 @@ mod tests {
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
+            invoc_key: std::sync::OnceLock::new(),
+            jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
+            quickened: std::sync::OnceLock::new(),
         };
         let resolver = |idx: u16| -> Option<(String, String, String)> {
             (idx == 1).then(|| ("pkg/Rec".to_string(), "f".to_string(), "(I)I".to_string()))
@@ -9474,6 +9442,9 @@ mod tests {
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
+            invoc_key: std::sync::OnceLock::new(),
+            jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
+            quickened: std::sync::OnceLock::new(),
         };
         // SAFETY: every `JitRuntimeHelpers` field is a `usize` and the struct is
         // `#[repr(C)]`, so an all-zero bit pattern is valid (no niches/padding).
@@ -9549,6 +9520,9 @@ mod tests {
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
+            invoc_key: std::sync::OnceLock::new(),
+            jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
+            quickened: std::sync::OnceLock::new(),
         };
         // SAFETY: see `step3_optimize_toggle_…`; an all-zero `JitRuntimeHelpers`
         // is valid and never called (the inline getfield emits no helper call,
@@ -10008,6 +9982,9 @@ mod tests {
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
+            invoc_key: std::sync::OnceLock::new(),
+            jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
+            quickened: std::sync::OnceLock::new(),
         };
         let helpers: JitRuntimeHelpers = unsafe { std::mem::zeroed() };
         let new_resolver = |cp: u16| -> Option<(u32, usize, bool, bool)> {
@@ -10143,6 +10120,9 @@ mod tests {
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
+            invoc_key: std::sync::OnceLock::new(),
+            jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
+            quickened: std::sync::OnceLock::new(),
         };
         // SAFETY: all-zero `JitRuntimeHelpers` is valid; this test only COMPILES
         // (never executes the body), so the baked `invoke_dispatch` is not called.
@@ -10256,6 +10236,9 @@ mod tests {
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
+            invoc_key: std::sync::OnceLock::new(),
+            jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
+            quickened: std::sync::OnceLock::new(),
         };
         // SAFETY: all-zero `JitRuntimeHelpers` is valid; this test only COMPILES
         // (never executes the body), so the baked `invoke_dispatch` is not called.
@@ -10373,6 +10356,9 @@ mod tests {
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
+            invoc_key: std::sync::OnceLock::new(),
+            jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
+            quickened: std::sync::OnceLock::new(),
         };
         // SAFETY: all-zero `JitRuntimeHelpers` is valid; this test only COMPILES
         // (never executes), and a pure long-arithmetic method calls no helper.
@@ -10432,6 +10418,9 @@ mod tests {
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
+            invoc_key: std::sync::OnceLock::new(),
+            jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
+            quickened: std::sync::OnceLock::new(),
         };
         // SAFETY: all-zero `JitRuntimeHelpers` is valid; this test only COMPILES
         // (never executes), and a pure FP-arithmetic method calls no helper.
@@ -10465,18 +10454,10 @@ mod tests {
         );
     }
 
-    /// inc 26 (Gap B) + jit-inlining-and-ir-calls: a resolved `invokevirtual`
-    /// routes through the IR pipeline.
-    ///
-    /// The polarity of this test INVERTED on 2026-07-26. It used to assert
-    /// "…ONLY when `ir_emit_virtual_calls` is on", because the IR lowered
-    /// virtual calls through the generic dispatch helper with no inline cache
-    /// and admitting them was a throughput regression. `ir_lower` now emits the
-    /// MIC + 3-way-PIC cascade, so the capability became opt-OUT: the caller's
-    /// parameter can still force it ON, but only the diagnostic
-    /// `CRATONVM_JIT_IR_CALL_VIRTUAL=0` (here, its thread-local test override)
-    /// can turn it off.
-    ///
+    /// inc 26 (Gap B): a resolved `invokevirtual` routes through the IR pipeline
+    /// ONLY when `ir_emit_virtual_calls` is on — independent of the invokestatic
+    /// (`ir_emit_calls`) and invokespecial (`ir_emit_special_calls`) gates. The
+    /// flags are crossed to prove the VIRTUAL flag alone admits invokevirtual.
     /// Guards against a vacuous validation: single-pass ALSO dispatches
     /// invokevirtual, so result-equality alone would not prove the IR path ran.
     #[test]
@@ -10502,6 +10483,9 @@ mod tests {
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
+            invoc_key: std::sync::OnceLock::new(),
+            jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
+            quickened: std::sync::OnceLock::new(),
         };
         // SAFETY: all-zero `JitRuntimeHelpers` is valid; this test only COMPILES
         // (never executes the body), so the baked `invoke_dispatch` is not called.
@@ -10555,46 +10539,9 @@ mod tests {
             "an Op::Call method must be needs_context"
         );
 
-        // Default (parameter false, no override): virtual calls are now
-        // opt-OUT, so the IR pipeline must STILL take this method. This is the
-        // assertion that inverted — it is the whole point of the change.
-        IR_LOWER_COMPILES.with(|c| c.set(0));
-        let by_default = try_compile(
-            &cached,
-            None,
-            None,
-            None,
-            Some(&invoke_resolver),
-            None,
-            None,
-            None,
-            None,
-            None,
-            &helpers,
-            None,
-            None,
-            None,
-            None,
-            true,  // optimize
-            false, // ir_emit_calls OFF
-            false, // ir_emit_special_calls OFF
-            false, // ir_emit_long
-            false, // ir_emit_virtual_calls: caller does NOT force it
-            false, // ir_emit_fp OFF
-            None,
-        );
-        assert!(by_default.is_some());
-        assert_eq!(
-            IR_LOWER_COMPILES.with(|c| c.get()),
-            1,
-            "invokevirtual must take the IR pipeline BY DEFAULT now that ir_lower \
-             emits MIC/PIC inline caches — the capability is opt-out, not opt-in"
-        );
-
-        // Explicit opt-out (`CRATONVM_JIT_IR_CALL_VIRTUAL=0`, modelled by the
-        // thread-local override) → the builder bails on the invokevirtual →
-        // single-pass. Proves the escape hatch still works.
-        __set_ir_virtual_calls_override(Some(false));
+        // ir_emit_virtual_calls = false (calls + special ON) → the builder bails on
+        // the invokevirtual → single-pass. Proves the static/special gates do NOT
+        // admit invokevirtual.
         IR_LOWER_COMPILES.with(|c| c.set(0));
         let _without = try_compile(
             &cached,
@@ -10620,11 +10567,10 @@ mod tests {
             false, // ir_emit_fp OFF
             None,  // cp_invokedynamic_descriptor_resolver: no indy in these test methods
         );
-        let took_ir = IR_LOWER_COMPILES.with(|c| c.get());
-        __set_ir_virtual_calls_override(None);
         assert_eq!(
-            took_ir, 0,
-            "with CRATONVM_JIT_IR_CALL_VIRTUAL=0, invokevirtual must NOT take the IR pipeline"
+            IR_LOWER_COMPILES.with(|c| c.get()),
+            0,
+            "without ir_emit_virtual_calls, invokevirtual must NOT take the IR pipeline"
         );
     }
 
@@ -11502,8 +11448,8 @@ mod tests {
     }
 
     #[test]
-    fn test_jit_cache_put_replacement_retires_old_code_range() {
-        let mut cache = JitCache::new();
+    fn test_jit_cache_put_replacement_reclaims_after_last_reader() {
+        let cache = JitCache::new();
         let class: Arc<str> = Arc::from("ReplaceClass");
         let method: Arc<str> = Arc::from("replaceMethod");
         let desc: Arc<str> = Arc::from("()V");
@@ -11535,22 +11481,23 @@ mod tests {
             CompiledMethod::new(new_buf),
         );
 
-        if std::env::var_os("CRATONVM_JIT_FREE_CODE").is_none() {
-            assert_eq!(cache.retired_methods.len(), 1);
-            assert!(
-                lookup_jit_code_range(old_entry).is_some(),
-                "retained code must keep its GC metadata range after replacement"
-            );
-        }
-        unregister_jit_code_range(old_entry);
+        assert!(
+            lookup_jit_code_range(old_entry).is_some(),
+            "an outstanding lock-free reader must own the replaced artifact"
+        );
+        drop(old);
+        assert!(
+            lookup_jit_code_range(old_entry).is_none(),
+            "the replaced artifact must unregister after its last Arc is released"
+        );
         if let Some(new_cm) = cache.get(&class, &method, &desc, cid) {
             unregister_jit_code_range(new_cm.entry_ptr() as usize);
         }
     }
 
     #[test]
-    fn test_jit_cache_remove_retires_code_range() {
-        let mut cache = JitCache::new();
+    fn test_jit_cache_remove_reclaims_code_range() {
+        let cache = JitCache::new();
         let class: Arc<str> = Arc::from("RemoveClass");
         let method: Arc<str> = Arc::from("removeMethod");
         let desc: Arc<str> = Arc::from("()V");
@@ -11575,19 +11522,420 @@ mod tests {
         cache.remove(&class, &method, &desc, cid);
 
         assert!(cache.get(&class, &method, &desc, cid).is_none());
-        if std::env::var_os("CRATONVM_JIT_FREE_CODE").is_none() {
-            assert_eq!(cache.retired_methods.len(), 1);
-            assert!(
-                lookup_jit_code_range(entry).is_some(),
-                "retained code must keep a valid CompiledMethod mapping"
-            );
+        assert!(
+            lookup_jit_code_range(entry).is_none(),
+            "removed code must unregister when no caller or reader owns it"
+        );
+    }
+
+    #[test]
+    fn test_replaced_callee_is_owned_by_baked_direct_caller() {
+        let cache = JitCache::new();
+        let cid = cratonvm_types::ClassId::new(7);
+        let callee_class: Arc<str> = Arc::from("OwnedCallee");
+        let callee_method: Arc<str> = Arc::from("target");
+        let desc: Arc<str> = Arc::from("()V");
+
+        let mut callee_buf = ExecutableBuffer::new(64).expect("alloc callee");
+        callee_buf.emit(&[0xC3]);
+        cache.put(
+            callee_class.clone(),
+            callee_method.clone(),
+            desc.clone(),
+            cid,
+            CompiledMethod::new(callee_buf),
+        );
+        let old_entry = cache
+            .get(&callee_class, &callee_method, &desc, cid)
+            .expect("callee")
+            .entry_ptr() as usize;
+
+        let mut caller_buf = ExecutableBuffer::new(64).expect("alloc caller");
+        caller_buf.emit(&[0xC3]);
+        let mut caller = CompiledMethod::new(caller_buf);
+        caller._direct_callee_entries.push(old_entry);
+        let caller_class: Arc<str> = Arc::from("OwningCaller");
+        let caller_method: Arc<str> = Arc::from("call");
+        cache.put(
+            caller_class.clone(),
+            caller_method.clone(),
+            desc.clone(),
+            cid,
+            caller,
+        );
+
+        let mut replacement_buf = ExecutableBuffer::new(64).expect("alloc replacement");
+        replacement_buf.emit(&[0xC3]);
+        cache.put(
+            callee_class.clone(),
+            callee_method.clone(),
+            desc.clone(),
+            cid,
+            CompiledMethod::new(replacement_buf),
+        );
+        assert!(
+            lookup_jit_code_range(old_entry).is_some(),
+            "the caller's baked edge must pin its superseded callee"
+        );
+
+        cache.remove(&caller_class, &caller_method, &desc, cid);
+        assert!(
+            lookup_jit_code_range(old_entry).is_none(),
+            "dropping the final direct caller must reclaim the old body"
+        );
+    }
+
+    #[test]
+    fn test_inline_cache_reclamation_waits_for_jit_quiescence() {
+        let cache = JitCache::new();
+        let class: Arc<str> = Arc::from("DeferredTarget");
+        let method: Arc<str> = Arc::from("run");
+        let desc: Arc<str> = Arc::from("()V");
+        let cid = cratonvm_types::ClassId::new(19);
+        let mut buf = ExecutableBuffer::new(64).expect("alloc deferred target");
+        buf.emit(&[0xC3]);
+        cache.put(
+            class.clone(),
+            method.clone(),
+            desc.clone(),
+            cid,
+            CompiledMethod::new(buf),
+        );
+        let entry = cache
+            .get(&class, &method, &desc, cid)
+            .expect("target")
+            .entry_ptr() as usize;
+        let slot = JitMICSlot::new();
+        slot.update(cid.as_u32(), &class, entry as u64, false);
+
+        jit_execution_enter();
+        slot.clear_compiled_entry();
+        cache.remove(&class, &method, &desc, cid);
+        assert!(
+            lookup_jit_code_range(entry).is_some(),
+            "a raw cache reader may still be between load and call"
+        );
+        jit_execution_leave();
+        assert!(
+            lookup_jit_code_range(entry).is_none(),
+            "the final quiescent transition must drain deferred code owners"
+        );
+    }
+
+    #[test]
+    fn test_sharded_cache_supports_concurrent_lock_free_reads_and_publication() {
+        let cache = Arc::new(JitCache::new());
+        let mut workers = Vec::new();
+        for worker in 0..4u32 {
+            let cache = cache.clone();
+            workers.push(std::thread::spawn(move || {
+                for method_index in 0..32u32 {
+                    let class: Arc<str> = Arc::from(format!("Concurrent{worker}"));
+                    let method: Arc<str> = Arc::from(format!("m{method_index}"));
+                    let desc: Arc<str> = Arc::from("()V");
+                    let cid = cratonvm_types::ClassId::new(worker * 32 + method_index + 1);
+                    let mut buf = ExecutableBuffer::new(16).expect("alloc concurrent body");
+                    buf.emit(&[0xC3]);
+                    cache.put(
+                        class.clone(),
+                        method.clone(),
+                        desc.clone(),
+                        cid,
+                        CompiledMethod::new(buf),
+                    );
+                    assert!(cache.get(&class, &method, &desc, cid).is_some());
+                }
+            }));
         }
-        unregister_jit_code_range(entry);
+        for worker in workers {
+            worker.join().expect("cache worker");
+        }
+        assert_eq!(cache.len(), 128);
+        assert_eq!(cache.clear_all(), 128);
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn test_code_range_snapshot_stays_searchable_during_publication() {
+        let base = 0x7f00_0000_0000usize;
+        for i in 0..128usize {
+            register_jit_code_range(base + i * 0x1000, 0x100, i + 1);
+        }
+        let readers = (0..4)
+            .map(|_| {
+                std::thread::spawn(move || {
+                    for _ in 0..1_000 {
+                        for i in 0..128usize {
+                            assert_eq!(
+                                lookup_jit_code_range(base + i * 0x1000 + 0x40),
+                                Some(i + 1)
+                            );
+                        }
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        for reader in readers {
+            reader.join().expect("range reader");
+        }
+        for i in 0..128usize {
+            unregister_jit_code_range(base + i * 0x1000);
+        }
+    }
+
+    /// `clear_all` must evict every entry and drop every published body —
+    /// `CompiledMethod::drop` is what returns the executable mapping AND
+    /// withdraws that body's `JIT_CODE_RANGES` registration.
+    ///
+    /// The post-conditions below are deliberately phrased against state this
+    /// test OWNS rather than against the process-global range table. This lib
+    /// test binary runs its tests on a thread pool and `JIT_CODE_RANGES` is
+    /// process-global, so the old `lookup_jit_code_range(entry).is_none()`
+    /// assertion was order-dependent: `clear_all` unmaps our code pages, a
+    /// concurrently-running test then gets one of those very addresses back
+    /// from `ExecutableBuffer::new` and registers ITS range over it, and the
+    /// lookup correctly reports `Some(<that other test's body>)`. Holding a
+    /// `Weak` to each body keeps its `Arc` allocation (not the body) alive, so
+    /// `own_*` can never be recycled underneath the comparison and
+    /// `strong_count() == 0` proves *our* `Drop` ran.
+    // T2.2 epoch invalidation for the interpreter's Bytecode invoke cache
+    //
+    // These tests guard the contract the interpreter's cached-invoke `Bytecode`
+    // arms now rely on: instead of calling `JitCache::get` (three string hashes
+    // + three string compares) on every interpreted call just to notice that a
+    // background compile published a body, they memoize
+    // `jit_cache_generation()` in `CachedBytecodeMethod::jit_probe_generation`
+    // and only re-probe when the live generation differs.
+    //
+    // Every assertion below is written to be robust under a parallel `cargo
+    // test`: the generation is a process-global, so other tests can advance it
+    // concurrently. That can only push two sampled values FURTHER apart, so
+    // "must differ" assertions are race-free; no test here asserts that the
+    // generation stayed equal across a window in which another test could run.
+
+    fn probe_test_method(
+        class: &str,
+        method: &str,
+        desc: &str,
+        cid: cratonvm_types::ClassId,
+    ) -> CachedBytecodeMethod {
+        CachedBytecodeMethod {
+            declaring_class_id: cid,
+            class_name: Arc::from(class),
+            method_name: Arc::from(method),
+            method_descriptor: Arc::from(desc),
+            source_file: None,
+            code: Arc::from([0xb1u8].as_slice()),
+            exception_table: Arc::from(Vec::new().as_slice()),
+            max_stack: 0,
+            max_locals: 0,
+            num_params: 0,
+            is_synchronized: false,
+            is_static: true,
+            force_native_cache: std::sync::OnceLock::new(),
+            native_callback_cache: std::sync::OnceLock::new(),
+            invoc_key: std::sync::OnceLock::new(),
+            jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
+            quickened: std::sync::OnceLock::new(),
+        }
+    }
+
+    fn probe_ret_body() -> CompiledMethod {
+        let mut buf = ExecutableBuffer::new(16).expect("alloc failed");
+        buf.emit(&[0xC3]); // RET
+        CompiledMethod::new(buf)
+    }
+
+    /// THE staleness test. Replays the interpreter's exact epoch protocol
+    /// end-to-end and proves that a **first-time** publication (not a
+    /// replacement) forces the memoized call site back onto the slow path,
+    /// where it picks up the newly published body.
+    ///
+    /// This is the case that used to be broken: `JitCache::put` advanced the
+    /// generation only when it *replaced* an existing entry, so a call site that
+    /// had already memoized "no compiled body for this method" would have stayed
+    /// pinned to the interpreter forever after the background worker published
+    /// its first body.
+    #[test]
+    fn jit_probe_epoch_forces_reprobe_after_first_publication() {
+        let cache = JitCache::new();
+        let cid = cratonvm_types::ClassId::new(4101);
+        let class: Arc<str> = Arc::from("ProbeEpochA");
+        let method: Arc<str> = Arc::from("hot");
+        let desc: Arc<str> = Arc::from("()V");
+        let cached = probe_test_method(&class, &method, &desc, cid);
+
+        // 1. Cold: the call site probes, misses, and memoizes the miss --
+        //    exactly what the `Bytecode` arm does on its first interpreted call.
+        let gen_at_probe = jit_cache_generation();
+        assert!(
+            cache.get(&class, &method, &desc, cid).is_none(),
+            "nothing published yet"
+        );
+        cached.record_jit_probe_miss(gen_at_probe);
+        assert!(
+            cached.jit_probe_is_current(gen_at_probe),
+            "the memo must suppress a re-probe while the generation is unchanged"
+        );
+
+        // 2. A background compile publishes this method's FIRST body.
+        cache.put(
+            class.clone(),
+            method.clone(),
+            desc.clone(),
+            cid,
+            probe_ret_body(),
+        );
+
+        // 3. The memo must now report stale, so the interpreter re-probes...
+        let gen_after_publish = jit_cache_generation();
+        assert!(
+            !cached.jit_probe_is_current(gen_after_publish),
+            "a first-time publication MUST advance the JIT cache generation, or an \
+             interpreted call site that already memoized a probe miss would never \
+             notice the new body"
+        );
+        // ...and the re-probe finds the freshly published body.
+        assert!(
+            cache.get(&class, &method, &desc, cid).is_some(),
+            "the re-probe must pick up the published body"
+        );
+    }
+
+    /// An OSR publication lands in a separate map (`osr_methods`) but reaches the
+    /// same `Bytecode` call sites, so it must advance the generation too. Same
+    /// first-publication (non-replacement) shape as above.
+    #[test]
+    fn jit_probe_epoch_forces_reprobe_after_first_osr_publication() {
+        let cache = JitCache::new();
+        let cid = cratonvm_types::ClassId::new(4102);
+        let class: Arc<str> = Arc::from("ProbeEpochB");
+        let method: Arc<str> = Arc::from("loopy");
+        let desc: Arc<str> = Arc::from("(I)I");
+        let cached = probe_test_method(&class, &method, &desc, cid);
+
+        let gen_at_probe = jit_cache_generation();
+        cached.record_jit_probe_miss(gen_at_probe);
+
+        let mut osr = probe_ret_body();
+        osr.compiled_via_osr = true;
+        cache.put_osr(class.clone(), method.clone(), desc.clone(), cid, osr);
+
+        assert!(
+            !cached.jit_probe_is_current(jit_cache_generation()),
+            "put_osr must advance the generation on a first publication"
+        );
+        assert!(cache.get_osr(&class, &method, &desc, cid).is_some());
+    }
+
+    /// A C1->C2 supersede republishes under an existing key. That path already
+    /// bumped (it is a replacement), but it is part of the audited contract, so
+    /// pin it: a call site that had flipped to `Jit` and then been downgraded
+    /// back to `Bytecode` must still re-probe and find the C2 body.
+    #[test]
+    fn jit_probe_epoch_forces_reprobe_after_supersede_republication() {
+        let cache = JitCache::new();
+        let cid = cratonvm_types::ClassId::new(4103);
+        let class: Arc<str> = Arc::from("ProbeEpochC");
+        let method: Arc<str> = Arc::from("tiered");
+        let desc: Arc<str> = Arc::from("()J");
+        cache.put(
+            class.clone(),
+            method.clone(),
+            desc.clone(),
+            cid,
+            probe_ret_body(),
+        );
+        let c1_entry = cache
+            .get(&class, &method, &desc, cid)
+            .expect("C1 body")
+            .entry_ptr() as usize;
+
+        let cached = probe_test_method(&class, &method, &desc, cid);
+        let gen_at_probe = jit_cache_generation();
+        cached.record_jit_probe_miss(gen_at_probe);
+
+        // C2 replaces the C1 entry under the same key.
+        cache.put(
+            class.clone(),
+            method.clone(),
+            desc.clone(),
+            cid,
+            probe_ret_body(),
+        );
+
+        assert!(
+            !cached.jit_probe_is_current(jit_cache_generation()),
+            "a superseding republication must advance the generation"
+        );
+        let c2_entry = cache
+            .get(&class, &method, &desc, cid)
+            .expect("C2 body")
+            .entry_ptr() as usize;
+        assert_ne!(c1_entry, c2_entry, "C2 must have replaced the C1 artifact");
+    }
+
+    /// Invalidation/eviction must advance the generation as well. It is not a
+    /// staleness hazard for the negative memo (a removal cannot make "there is
+    /// no body" wrong), but the interpreter's `Jit` entries are re-derived
+    /// through this same probe, so pin the behaviour rather than leave it to
+    /// chance.
+    #[test]
+    fn jit_probe_epoch_advances_on_invalidation() {
+        let cache = JitCache::new();
+        let cid = cratonvm_types::ClassId::new(4104);
+        let class: Arc<str> = Arc::from("ProbeEpochD");
+        let method: Arc<str> = Arc::from("gone");
+        let desc: Arc<str> = Arc::from("()V");
+        cache.put(
+            class.clone(),
+            method.clone(),
+            desc.clone(),
+            cid,
+            probe_ret_body(),
+        );
+        assert!(cache.get(&class, &method, &desc, cid).is_some());
+
+        let cached = probe_test_method(&class, &method, &desc, cid);
+        let gen_before_remove = jit_cache_generation();
+        cached.record_jit_probe_miss(gen_before_remove);
+
+        cache.remove(&class, &method, &desc, cid);
+        assert!(cache.get(&class, &method, &desc, cid).is_none());
+        assert!(
+            !cached.jit_probe_is_current(jit_cache_generation()),
+            "an eviction must advance the generation"
+        );
+    }
+
+    /// The memoized invocation-counter key must stay bit-identical to the two
+    /// open-coded 31-multiplier loops it replaced in the interpreter -- the key
+    /// indexes `ProfileStore`'s per-method warmup counters, so a different value
+    /// would silently reset every method's tier-up progress.
+    #[test]
+    fn memoized_invoc_key_matches_the_open_coded_hash() {
+        let cid = cratonvm_types::ClassId::new(7);
+        let cached = probe_test_method("pkg/Hash", "someMethod", "(Ljava/lang/String;I)Z", cid);
+        let expected = {
+            let mut h = 0u32;
+            for &b in cached.method_name.as_bytes() {
+                h = h.wrapping_mul(31).wrapping_add(b as u32);
+            }
+            for &b in cached.method_descriptor.as_bytes() {
+                h = h.wrapping_mul(31).wrapping_add(b as u32);
+            }
+            ((cid.as_u32() as u64) << 32) | (h as u64)
+        };
+        assert_eq!(cached.invoc_key(), expected);
+        // Memoized: stable across calls.
+        assert_eq!(cached.invoc_key(), expected);
+        // And it survives a clone (the manual `Clone` impl).
+        assert_eq!(cached.clone().invoc_key(), expected);
     }
 
     #[test]
     fn test_jit_cache_clear_all_evicts_entries() {
-        let mut cache = JitCache::new();
+        let cache = JitCache::new();
         let class_a: Arc<str> = Arc::from("TestClassA");
         let method_a: Arc<str> = Arc::from("testA");
         let desc_a: Arc<str> = Arc::from("()V");
@@ -11617,25 +11965,124 @@ mod tests {
             CompiledMethod::new(buf_b),
         );
 
-        let entry_a = cache
+        let cm_a = cache
             .get(&class_a, &method_a, &desc_a, cid_a)
-            .expect("compiled A")
-            .entry_ptr() as usize;
-        let entry_b = cache
+            .expect("compiled A");
+        let cm_b = cache
             .get(&class_b, &method_b, &desc_b, cid_b)
-            .expect("compiled B")
-            .entry_ptr() as usize;
+            .expect("compiled B");
+        let entry_a = cm_a.entry_ptr() as usize;
+        let entry_b = cm_b.entry_ptr() as usize;
+        // The `cm_ptr` each body registered in `JIT_CODE_RANGES` (see
+        // `JitCache::put`), used below to tell our own registration apart from a
+        // recycled-address one belonging to another test.
+        let own_a = Arc::as_ptr(&cm_a) as usize;
+        let own_b = Arc::as_ptr(&cm_b) as usize;
+        let weak_a = Arc::downgrade(&cm_a);
+        let weak_b = Arc::downgrade(&cm_b);
+        drop(cm_a);
+        drop(cm_b);
 
         assert_eq!(cache.len(), 2);
         assert_eq!(cache.clear_all(), 2);
         assert!(cache.is_empty());
         assert!(cache.get(&class_a, &method_a, &desc_a, cid_a).is_none());
         assert!(cache.get(&class_b, &method_b, &desc_b, cid_b).is_none());
-        if std::env::var_os("CRATONVM_JIT_FREE_CODE").is_none() {
-            assert_eq!(cache.retired_methods.len(), 2);
+
+        // The cache held the last strong reference, so eviction must have run
+        // `CompiledMethod::drop` — which unmaps the code and unregisters the
+        // range — for both bodies.
+        assert_eq!(
+            weak_a.strong_count(),
+            0,
+            "clear_all must release the last owner of body A"
+        );
+        assert_eq!(
+            weak_b.strong_count(),
+            0,
+            "clear_all must release the last owner of body B"
+        );
+        // And no code range still binds our entry addresses to OUR bodies. A
+        // `Some(other)` here just means a concurrently-running test has already
+        // been handed the freed page back; that is not this cache's business.
+        assert_ne!(
+            lookup_jit_code_range(entry_a),
+            Some(own_a),
+            "clear_all must withdraw body A's own code-range registration"
+        );
+        assert_ne!(
+            lookup_jit_code_range(entry_b),
+            Some(own_b),
+            "clear_all must withdraw body B's own code-range registration"
+        );
+    }
+
+    /// `clear_all` must return every unreferenced executable mapping, and with
+    /// it the `COMMITTED_JIT_CODE_BYTES` those mappings account for.
+    ///
+    /// `COMMITTED_JIT_CODE_BYTES` is process-global and this lib test binary
+    /// runs its tests on a thread pool, so absolute before/after totals are NOT
+    /// a stable observable: every other test that allocates or drops an
+    /// `ExecutableBuffer` moves the same counter. The old
+    /// `populated >= before + 8 * 4096` / `reclaimed <= populated - 8 * 4096`
+    /// pair therefore failed whenever concurrent frees (resp. allocations)
+    /// happened to outpace this test's own bookkeeping between the two loads.
+    ///
+    /// What this test owns instead:
+    ///  * the counter is an exact ledger — `ExecutableBuffer::new` adds
+    ///    `capacity` and its `Drop` subtracts the same `capacity` — so at any
+    ///    instant it equals the summed capacity of all *live* buffers. That
+    ///    makes `>= our own live bytes` a sound lower bound no matter what
+    ///    other threads are doing.
+    ///  * `Drop` is the *only* site that decrements the counter and releases
+    ///    the mapping, so proving `clear_all` dropped the last owner of each
+    ///    body proves exactly `committed_by_test` bytes went back.
+    #[test]
+    fn test_clear_all_releases_committed_executable_bytes() {
+        const BODY_BYTES: usize = 4096;
+        const BODIES: u32 = 8;
+
+        let cache = JitCache::new();
+        let mut bodies = Vec::with_capacity(BODIES as usize);
+        for i in 0..BODIES {
+            let mut buf = ExecutableBuffer::new(BODY_BYTES).expect("alloc cache body");
+            buf.emit(&[0xC3]);
+            let class: Arc<str> = Arc::from("ReclaimBytes");
+            let method: Arc<str> = Arc::from(format!("m{i}"));
+            let desc: Arc<str> = Arc::from("()V");
+            let cid = cratonvm_types::ClassId::new(i + 1);
+            cache.put(
+                class.clone(),
+                method.clone(),
+                desc.clone(),
+                cid,
+                CompiledMethod::new(buf),
+            );
+            let cm = cache.get(&class, &method, &desc, cid).expect("published");
+            bodies.push(Arc::downgrade(&cm));
         }
-        unregister_jit_code_range(entry_a);
-        unregister_jit_code_range(entry_b);
+        let committed_by_test = BODIES as usize * BODY_BYTES;
+
+        // Our eight mappings are live, so the global ledger must be at least
+        // that large — every other contribution to it is a live buffer too.
+        let populated = COMMITTED_JIT_CODE_BYTES.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            populated >= committed_by_test,
+            "committed ledger {populated} is below this test's own live mappings \
+             ({committed_by_test} bytes)"
+        );
+
+        assert_eq!(cache.clear_all(), BODIES as usize);
+
+        // Every body lost its last owner, so `CompiledMethod::drop` ran for all
+        // eight — unmapping the code and returning `committed_by_test` bytes.
+        for (i, weak) in bodies.iter().enumerate() {
+            assert_eq!(
+                weak.strong_count(),
+                0,
+                "clear_all must return body m{i}'s executable mapping"
+            );
+        }
     }
 
     #[test]
@@ -11821,6 +12268,9 @@ mod tests {
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
+            invoc_key: std::sync::OnceLock::new(),
+            jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
+            quickened: std::sync::OnceLock::new(),
         };
         let b_cached = CachedBytecodeMethod {
             declaring_class_id: cratonvm_types::ClassId::new(2),
@@ -11837,6 +12287,9 @@ mod tests {
             is_static: true,
             force_native_cache: std::sync::OnceLock::new(),
             native_callback_cache: std::sync::OnceLock::new(),
+            invoc_key: std::sync::OnceLock::new(),
+            jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
+            quickened: std::sync::OnceLock::new(),
         };
         // SAFETY: every helper address is an integer slot. This test only
         // inspects emitted metadata and never executes the generated code.
@@ -12766,8 +13219,6 @@ mod tests {
 
     #[test]
     fn code_cache_committed_counter_tracks_buffer_allocation() {
-        // Allocating a buffer bumps the committed counter by its capacity; the
-        // cap is enforced against exactly this quantity.
         let before = COMMITTED_JIT_CODE_BYTES.load(std::sync::atomic::Ordering::Relaxed);
         let buf = ExecutableBuffer::new(4096).expect("alloc failed");
         let after = COMMITTED_JIT_CODE_BYTES.load(std::sync::atomic::Ordering::Relaxed);
@@ -12775,9 +13226,9 @@ mod tests {
             after >= before + 4096,
             "committed counter must rise by at least the requested capacity"
         );
-        // Default-config Drop leaks the region (no decrement), so the counter
-        // does not fall back here — that's the intended monotonic behaviour the
-        // cap bounds.
+        // Drop now returns the executable mapping. Exact post-drop accounting
+        // is covered by the reclamation tests because this suite runs other
+        // buffer-allocation tests concurrently.
         drop(buf);
     }
 

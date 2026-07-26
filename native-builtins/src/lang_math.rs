@@ -2895,7 +2895,7 @@ pub(crate) fn native_integer_to_hex_string(
         _ => 0,
     };
     // DEBUG-NETTYHANG: log every call
-    if std::env::var_os("CRATONVM_DBG_TOHEX").is_some() {
+    if crate::nbflags().dbg_tohex {
         static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if n < 600 || n % 1000 == 0 {

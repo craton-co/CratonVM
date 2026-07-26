@@ -340,7 +340,7 @@ methods (`scanQName`, `scanContent`, `skipSpaces`, `normalizeNewlines`,
 `checkEntityLimit`; see `force_native_over_real_jdk_bytecode` /
 `is_xerces_xml_parser_native_override` in `vm/src/runtime/interpreter.rs`)
 in
-`docs/internal/fixed-suite-bugs/keycloak-model-liquibase-xerces-xml-parse-nojit-timeout-FIXED.md`.
+`../keycloak/keycloak-model-liquibase-xerces-xml-parse-nojit-timeout-FIXED.md`.
 `load` is notably **absent** from that force-native gate's method list.
 
 Unlike the Liquibase/Keycloak case (one large XSD/changelog file, dominated

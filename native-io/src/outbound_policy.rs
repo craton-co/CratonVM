@@ -29,6 +29,7 @@
 //! native-io crate already pays an `OnceLock` per registry, and a
 //! `fn`-pointer keeps the hot path branch-predictor-friendly.
 
+use crate::io_flags;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -246,24 +247,8 @@ fn resolve_and_classify_host(host: &str) -> Option<PolicyDecision> {
 /// `block_private_nets_enabled`. Off by default so the standard policy keeps
 /// its no-DNS, low-latency, TOCTOU-free posture (resolution-aware blocking
 /// at the literal-IP layer in `policy_connect` is the always-on path).
-static RESOLVE_OUTBOUND_HOST: AtomicU64 = AtomicU64::new(0);
-
 fn resolve_outbound_host_enabled() -> bool {
-    match RESOLVE_OUTBOUND_HOST.load(Ordering::Relaxed) {
-        2 => true,
-        1 => false,
-        _ => {
-            let on = match std::env::var("CRATONVM_RESOLVE_OUTBOUND_HOST") {
-                Ok(v) => {
-                    let v = v.trim().to_ascii_lowercase();
-                    !(v.is_empty() || v == "0" || v == "false" || v == "off" || v == "no")
-                }
-                Err(_) => false,
-            };
-            RESOLVE_OUTBOUND_HOST.store(if on { 2 } else { 1 }, Ordering::Relaxed);
-            on
-        }
-    }
+    crate::io_flags().resolve_outbound_host
 }
 
 /// Cached `CRATONVM_BLOCK_PRIVATE_NETS` flag. Read once on first connect so
@@ -272,24 +257,8 @@ fn resolve_outbound_host_enabled() -> bool {
 /// `false` / `off` / `no` (case-insensitive) disables. Tri-state encoding in
 /// the atomic: 0 = not yet computed, 1 = disabled, 2 = enabled — so the
 /// "absent" default (disabled) is never mistaken for "uncomputed".
-static BLOCK_PRIVATE_NETS: AtomicU64 = AtomicU64::new(0);
-
 fn block_private_nets_enabled() -> bool {
-    match BLOCK_PRIVATE_NETS.load(Ordering::Relaxed) {
-        2 => true,
-        1 => false,
-        _ => {
-            let on = match std::env::var("CRATONVM_BLOCK_PRIVATE_NETS") {
-                Ok(v) => {
-                    let v = v.trim().to_ascii_lowercase();
-                    !(v.is_empty() || v == "0" || v == "false" || v == "off" || v == "no")
-                }
-                Err(_) => false,
-            };
-            BLOCK_PRIVATE_NETS.store(if on { 2 } else { 1 }, Ordering::Relaxed);
-            on
-        }
-    }
+    crate::io_flags().block_private_nets
 }
 
 /// Returns true for loopback and RFC1918 private IPv4/IPv6 addresses.
