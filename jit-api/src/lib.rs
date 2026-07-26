@@ -37,6 +37,73 @@ use cratonvm_types::ClassId;
 /// impl snapshots its current value, which is semantically right: the field is
 /// a *memo*, and copying a memo forward is always sound (at worst the clone
 /// re-probes once).
+///
+/// # Adding a field to this struct is a four-crate change
+///
+/// There are **38 struct literals** of this type, in
+/// `vm/src/runtime/interpreter.rs`, `vm/src/runtime/vtable.rs`,
+/// `vm/src/jit/helpers.rs`, `vm/src/runtime/lockfree_resolve.rs`,
+/// `vm/src/vm.rs`, `classloading/src/resolution.rs`, `jit/src/lib.rs`,
+/// `jit/tests/ir_vs_singlepass.rs` and this file — spanning
+/// `cratonvm-jit-api`, `cratonvm-jit`, `cratonvm-classloading` and
+/// `cratonvm-vm`. Only five have a `..expr` functional-update tail (the
+/// `..make_cached_method()` literals in this file's `mod tests`), and those are
+/// the ones to watch: they keep compiling silently while every other literal
+/// errors. A `Default` impl does not help — a struct literal must name every
+/// field unless it ends in `..expr`.
+///
+/// Changing an existing field's **type** is far cheaper: all 38 literals spell
+/// the four `OnceLock` fields as `std::sync::OnceLock::new()`, which re-infers,
+/// so an `OnceLock<T>` → `OnceLock<U>` change touches only this file and the
+/// handful of named readers. That is why [`Self::native_callback_cache`] still
+/// carries its old name while holding a `NativeCallSite`.
+///
+/// # CR-CLO-2 — the `method_index` field this struct still wants
+///
+/// **Not landed.** Specified here because the pass that needed it
+/// (`frame-index-and-crash-trace`, 2026-07-26) owned this file but none of the
+/// eight *production* sites that would populate the field, so landing it would
+/// have left the workspace non-compiling for eight concurrent agents while
+/// still producing `None` everywhere.
+///
+/// *What.* `pub method_index: Option<u32>` — this method's slot in its
+/// declaring class's `Class::methods` list. The value belongs here rather than
+/// on `Frame` because this entry is built once per call site and `Arc`-shared
+/// across every call through it, so the slot is resolved **once per method**
+/// instead of once per frame push.
+///
+/// *Why.* `stackwalker::capture_frames_no_lines` — the thread-dump depositor
+/// that runs at every blocking/safepoint deposit and therefore must not take a
+/// `ClassStore` borrow — publishes `StackTraceEntry::method_index: None`, so
+/// deferred resolution (`stackwalker::resolve_line_numbers_in_place`) falls
+/// back to the unambiguous-name rule and leaves every **overloaded** frame with
+/// no line number at all. A `u32` copied out of the frame costs no borrow, no
+/// lock and no allocation.
+///
+/// *How to land it.* Add the field, then populate it at the six sites that
+/// already hold a live `ClassStore` borrow plus the resolved `&ClassFileMethod`
+/// and declaring `ClassId` — `vm/src/runtime/interpreter.rs` in
+/// `try_invoke_cached_lambda_impl`, `populate_invoke_cache`,
+/// `try_jit_upgrade_with_gate`, `try_jit_compile_callee_slow`,
+/// `populate_virtual_invoke_cache`, and `vm/src/jit/helpers.rs` in
+/// `try_resume_trapped_callee`. `vm/src/runtime/vtable.rs`'s
+/// `vtable_install_adapter` has no store but does have
+/// `VtableSlotDescriptor::method_index` already resolved at link time, so it
+/// can pass it straight through. The one production site with neither is the
+/// first-call tier-up deopt-resume path in `interpreter.rs::execute`, which
+/// drops its `class_manager` guard before building the entry; `None` there is
+/// correct and costs only that one path the fallback rule.
+///
+/// Then `Frame::new_pooled_cached` (`vm/src/runtime/frame.rs`) seeds
+/// `Frame::method_index` from `cached.method_index` — one line, already
+/// commented in place — and `capture_frames_no_lines` swaps its `None` for
+/// `f.method_index()`.
+///
+/// *What it must NOT be used for.* It does not make deferring the `Throwable`
+/// capture path safe. Index verification is by *name*, so a redefinition that
+/// reorders an overload set across the capture/read window is the one case
+/// verification cannot catch, and eager capture has no such window. See
+/// `docs/internal/arch-2026-07-26/cross-owner-closeout.md` §6.
 pub struct CachedBytecodeMethod {
     pub declaring_class_id: ClassId,
     pub class_name: Arc<str>,
