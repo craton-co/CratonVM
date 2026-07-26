@@ -29991,7 +29991,8 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Regression: docs/known-issues/moving-young-gen-drops-jit-held-oops.md
+    // Regression: docs/internal/fixed-suite-bugs/app-jvm-bugs/
+    //             moving-young-gen-drops-jit-held-oops-FIXED.md
     // -----------------------------------------------------------------------
     //
     // `BinTreesClassic.bottomUpTree` holds the result of its FIRST recursive
@@ -30064,7 +30065,7 @@ mod tests {
             !map.frame_slot_offsets.is_empty(),
             "the first call's result is a live reference on the operand stack across \
              the second call; leaving it untagged is the measured bt18 moving-young \
-             heap corruption (docs/known-issues/moving-young-gen-drops-jit-held-oops.md)",
+             heap corruption (docs/internal/fixed-suite-bugs/app-jvm-bugs/             moving-young-gen-drops-jit-held-oops-FIXED.md)",
         );
     }
 

@@ -1117,7 +1117,7 @@ pub fn lookup_jit_method_name(addr: usize) -> Option<String> {
 ///     Nothing resumes from any of them in a way the owning frame's own
 ///     published roots do not already cover.
 ///
-/// See `docs/known-issues/moving-young-gen-drops-jit-held-oops.md`.
+/// See `docs/internal/fixed-suite-bugs/app-jvm-bugs/moving-young-gen-drops-jit-held-oops-FIXED.md`.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct FrameLayout {
     /// Java locals: slot `i` at `[rbp - (i + 1) * 8]`.
