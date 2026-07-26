@@ -252,6 +252,11 @@ pub enum SkipReason {
     /// raw entry point (ES-PERF-20260719 testSlicesDense: 6928 deopt events
     /// for `makeInt` alone in a single test run).
     StreamMatchOpsUncommonTrap,
+    /// Javac's `Types.erasure` corrupts symbol/type completion state once
+    /// tier-compiled during repeated in-process compilation, surfacing later
+    /// as a null `Type` read in `Lower.boxIfNeeded`. Keep this hot
+    /// type-erasure method interpreted until its JIT lowering is understood.
+    TypesErasure,
 }
 
 /// T1.1.f — classification of `<init>` / `<clinit>` complexity.
@@ -621,6 +626,44 @@ fn should_skip_jit_internal(
         return Some(SkipReason::ClassSymbolComplete);
 
     }
+
+    // TYPES-ERASURE.1 (2026-07-25): an EIGHTH distinct JIT residual in the
+    // same repeated-in-process-javac-compilation family as
+    // SPRING-TESTCOMPILER.1-4 / HIB-STOREDPROC-JIT.1 above, and likely the
+    // common root several of those entries were only symptoms of.
+    // Standalone, Spring-free repro (no test framework, no annotation
+    // processing): `ToolProvider.getSystemJavaCompiler().getTask(...).call()`
+    // looped in one process, each iteration compiling a fresh trivial
+    // `@Deprecated class TrivialN { public int x() { return N; } }` --
+    // deterministically starts throwing `java.lang.NullPointerException:
+    // Cannot invoke "com.sun.tools.javac.code.Type.hasTag(...)" because
+    // "type" is null` from real javac's own `Lower.boxIfNeeded` (reached via
+    // `Lower.visitReturn`) at iteration 8 and every iteration after, with
+    // none of the existing SPRING-TESTCOMPILER/HIB-STOREDPROC-JIT bans (all
+    // already interpreted) preventing it. Bisected with `CRATONVM_JIT_DENY`:
+    // the whole `com/sun/tools/javac/` package fixes it (confirming it is
+    // still this same javac-JIT family), narrowed to
+    // `com/sun/tools/javac/code/` alone (fixed), then to `Types` alone
+    // (fixed) after `Symbol` alone proved insufficient. Splitting the
+    // Types-family candidate set in half and then bisecting the remaining
+    // half individually (`memberType` alone: insufficient; `boxedClass` +
+    // `unboxedType` together: insufficient) isolated the single necessary
+    // method: `CRATONVM_JIT_BISECT_SKIP=com/sun/tools/javac/code/
+    // Types.erasure` alone is sufficient (40/40 OK, was 7/40). `erasure` is
+    // called constantly during symbol/type completion (including from the
+    // already-interpreted `ClassReader`/`ClassFinder`/
+    // `Symbol$ClassSymbol.complete` methods above), so this single
+    // miscompile plausibly explains most or all of SPRING-TESTCOMPILER.1-4's
+    // and HIB-STOREDPROC-JIT.1's symptoms too -- but that consolidation
+    // claim is NOT yet verified (would need a full regression pass with
+    // those seven bans removed and only this one in place) and is left as a
+    // follow-up; for now this is added as its own targeted,
+    // independently-verified ban. Keep `erasure` interpreted until the x64
+    // lowering bug is found.
+    if class_name == "com/sun/tools/javac/code/Types" && method_name == "erasure" {
+        return Some(SkipReason::TypesErasure);
+    }
+
 
     // SPRING-TESTCOMPILER.4 (2026-07-21): see `JavaPoetCodeBlockBuilderAdd`
     // doc comment above. Spring shades/relocates `com.palantir.javapoet` to
@@ -4903,6 +4946,23 @@ mod tests {
                 ),
                 Some(SkipReason::JavacToolContext),
                 "JavacTool.getTask must remain excluded under every policy",
+            );
+        }
+    }
+
+    #[test]
+    fn types_erasure_is_unconditionally_interpreted() {
+        for policy in [SkipPolicy::Conservative, SkipPolicy::Aggressive] {
+            assert_eq!(
+                check(
+                    "com/sun/tools/javac/code/Types",
+                    "erasure",
+                    false,
+                    true,
+                    policy,
+                ),
+                Some(SkipReason::TypesErasure),
+                "Types.erasure must remain excluded under every policy",
             );
         }
     }
