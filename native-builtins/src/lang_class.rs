@@ -3401,7 +3401,24 @@ pub(crate) fn descriptor_to_class_mirror(
             }
             match ctx.load_class(class_name) {
                 Ok(Some(Value::Object(Some(mirror)))) => mirror,
-                _ => synthetic_class_mirror(ctx, class_name),
+                _ => {
+                    // `load_class`'s return shape didn't match the expected
+                    // Class-object-in-hand variant, but the class may still
+                    // have been registered as a side effect of the attempt
+                    // (e.g. a loader that registers first, surfaces its
+                    // result differently on some paths). Re-check the
+                    // canonical registry before minting an uncached
+                    // `synthetic_class_mirror` — that mirror is a fresh,
+                    // never-registered `ObjectRef` each call, which would
+                    // break identity-based comparisons (`HashMap<Class<?>,
+                    // V>`, `==`) against the SAME class resolved through
+                    // any other path (`ldc`, `Class.forName`, `getClass()`).
+                    if let Some(class_id) = ctx.class_id_by_name(class_name) {
+                        ctx.get_class_mirror(class_id)
+                    } else {
+                        synthetic_class_mirror(ctx, class_name)
+                    }
+                }
             }
         }
         s if s.starts_with('[') => {
@@ -16063,9 +16080,15 @@ pub(crate) fn native_class_get_nest_host(
 
 /// `java/lang/Class.getNestMembers0()[Ljava/lang/Class;`
 ///
-/// Returns the nest members of this class. If this class has a NestMembers
-/// attribute (i.e., it is a nest host), returns those classes plus itself.
-/// Otherwise returns an array containing just itself.
+/// Returns the nest members of this class. Per JVMS/javadoc, only the nest
+/// *host* class file carries the `NestMembers` attribute — a nest *member*
+/// only carries a `NestHost` attribute pointing back to it. So a class that
+/// is itself a member (not the host) must resolve to its host first and
+/// query the host's `NestMembers` list; querying the member's own class_id
+/// directly always looks empty and silently degenerates to the "singleton
+/// nest" fallback below, even for classes that do belong to a larger nest.
+/// The returned array always includes `this` (JDK contract), plus the host
+/// and every other resolved member.
 pub(crate) fn native_class_get_nest_members(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -16080,18 +16103,82 @@ pub(crate) fn native_class_get_nest_members(
         }
     };
 
-    let members = ctx.nest_member_names(class_id);
+    // Lazily resolved on cache miss, same pattern as
+    // `native_class_get_permitted_subclasses`: nest members are commonly
+    // annotation-only or otherwise-untouched nested types that nothing
+    // else has caused to load yet, so a passive `class_id_by_name`
+    // registry lookup silently drops any member not already loaded —
+    // `this` class's own defining loader is authoritative for resolving
+    // its nestmates (compiled together, always visible to that loader).
+    let mut loader_obj: Option<ObjectRef> = None;
+    let mut loader_resolved = false;
+
+    let host_class_id = match ctx.nest_host_name(class_id) {
+        Some(host_name) => ctx
+            .class_id_by_name(&host_name)
+            .or_else(|| {
+                if !loader_resolved {
+                    loader_resolved = true;
+                    loader_obj = match native_class_get_class_loader(ctx, args) {
+                        Ok(Some(Value::Object(Some(l)))) => Some(l),
+                        _ => None,
+                    };
+                }
+                let loader = loader_obj?;
+                let dotted = host_name.replace('/', ".");
+                let name_obj = ctx.create_string(&dotted);
+                match ctx.invoke_virtual(
+                    loader,
+                    "loadClass",
+                    "(Ljava/lang/String;)Ljava/lang/Class;",
+                    &[Value::Object(Some(name_obj))],
+                ) {
+                    Ok(Some(Value::Object(Some(mirror_obj)))) => {
+                        ctx.class_id_from_mirror(mirror_obj)
+                    }
+                    _ => None,
+                }
+            })
+            .unwrap_or(class_id),
+        None => class_id,
+    };
+
+    let members = ctx.nest_member_names(host_class_id);
     if members.is_empty() {
         // Not a nest host вЂ” return [self]
         let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
         ctx.set_array_element(arr, 0, Value::Object(Some(this)));
         Ok(Some(Value::Object(Some(arr))))
     } else {
-        // Nest host вЂ” return [self] + resolved members
-        let mut mirrors: Vec<ObjectRef> = vec![ctx.get_class_mirror(class_id)];
+        // Nest host вЂ” return [host] + resolved members
+        let host_mirror = ctx.get_class_mirror(host_class_id);
+        let mut mirrors: Vec<ObjectRef> = vec![host_mirror];
         for member_name in &members {
-            if let Some(member_id) = ctx.class_id_by_name(member_name) {
-                if member_id != class_id {
+            let resolved = ctx.class_id_by_name(member_name).or_else(|| {
+                if !loader_resolved {
+                    loader_resolved = true;
+                    loader_obj = match native_class_get_class_loader(ctx, args) {
+                        Ok(Some(Value::Object(Some(l)))) => Some(l),
+                        _ => None,
+                    };
+                }
+                let loader = loader_obj?;
+                let dotted = member_name.replace('/', ".");
+                let name_obj = ctx.create_string(&dotted);
+                match ctx.invoke_virtual(
+                    loader,
+                    "loadClass",
+                    "(Ljava/lang/String;)Ljava/lang/Class;",
+                    &[Value::Object(Some(name_obj))],
+                ) {
+                    Ok(Some(Value::Object(Some(mirror_obj)))) => {
+                        ctx.class_id_from_mirror(mirror_obj)
+                    }
+                    _ => None,
+                }
+            });
+            if let Some(member_id) = resolved {
+                if member_id != host_class_id {
                     mirrors.push(ctx.get_class_mirror(member_id));
                 }
             }
@@ -18539,6 +18626,66 @@ mod tests {
         assert_eq!(ctx.array_length(arr), 1);
         let first = ctx.get_array_element(arr, 0);
         assert_eq!(first, Value::Object(Some(mirror)));
+    }
+
+    /// Regression: calling getNestMembers0 on a NEST MEMBER (not the host)
+    /// must resolve to the host first and return the host's full
+    /// NestMembers list, not silently degenerate to [self]. Per JVMS, only
+    /// the host class file carries the NestMembers attribute; members only
+    /// carry a NestHost back-pointer.
+    #[test]
+    fn class_get_nest_members_resolves_through_host_when_called_on_member() {
+        let mut ctx = mock_ctx();
+        let host_id = ctx.ensure_class_initialized("com/example/Outer").unwrap();
+        let member_id = ctx
+            .ensure_class_initialized("com/example/Outer$Inner")
+            .unwrap();
+        let sibling_id = ctx
+            .ensure_class_initialized("com/example/Outer$Sibling")
+            .unwrap();
+        ctx.set_nest_host_override(member_id, "com/example/Outer");
+        ctx.set_nest_members_override(
+            host_id,
+            vec![
+                "com/example/Outer$Inner".to_string(),
+                "com/example/Outer$Sibling".to_string(),
+            ],
+        );
+        let member_mirror =
+            make_class_mirror(&mut ctx, member_id.as_u32(), "com/example/Outer$Inner");
+
+        // Calling on the MEMBER's own mirror, not the host's.
+        let r = native_class_get_nest_members(&mut ctx, &[Value::Object(Some(member_mirror))]);
+        let arr = match r.unwrap() {
+            Some(Value::Object(Some(a))) => a,
+            other => panic!("expected array, got {other:?}"),
+        };
+        // Must include the host plus both members (3 total), not just [self].
+        // The mock's `get_class_mirror` mints a fresh ObjectRef per call (no
+        // canonicalization), so compare by the class_id stored in field 0
+        // rather than by object identity.
+        assert_eq!(ctx.array_length(arr), 3);
+        let ids: Vec<i32> = (0..3)
+            .map(|i| match ctx.get_array_element(arr, i) {
+                Value::Object(Some(o)) => match ctx.get_field(o, 0) {
+                    Value::Int(id) => id,
+                    other => panic!("expected Int class_id field, got {other:?}"),
+                },
+                other => panic!("expected non-null Object element, got {other:?}"),
+            })
+            .collect();
+        assert!(
+            ids.contains(&(host_id.as_u32() as i32)),
+            "missing host in result: {ids:?}"
+        );
+        assert!(
+            ids.contains(&(member_id.as_u32() as i32)),
+            "missing calling member (self) in result: {ids:?}"
+        );
+        assert!(
+            ids.contains(&(sibling_id.as_u32() as i32)),
+            "missing sibling in result: {ids:?}"
+        );
     }
 
     // -----------------------------------------------------------------------
