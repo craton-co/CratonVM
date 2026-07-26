@@ -20,8 +20,8 @@ established first, per subsystem, before any code change.**
 | **JFR emit surface** (`jfr/src/builtin.rs`, ~30 VM call sites) | Compiled in and called — but every `emit_*` returns early on `is_enabled()`, which is **permanently false** | **No** | n/a |
 | **JFR recording lifecycle** (`new_recording` / `start_recording`) | **No** — zero callers outside `#[cfg(test)]`; no `-XX:StartFlightRecording`; no working jcmd verb | No | n/a |
 | **JFR file writer** (`dump_to_file`) | **No** — no caller outside the `jfr` crate | n/a | Format is a documented **bespoke** encoding, not stock JFR: not loadable by JMC / `jfr print` |
-| **JVMTI event delivery** (`runtime/jvmti.rs`) | Yes — global manager installed from `SharedVm::new`; `fire_*` driven by interpreter / classloading / GC hooks | Fires, but **nothing registers a listener outside tests** | Partially — see D1, D2 |
-| **JVMTI native agents** (`-agentpath:`) | Yes, via `vm/src/jvmti/agent.rs` (real `dlopen` + `Agent_OnLoad`), feature `experimental-debug` (default-on) | Yes | Agents reach a **different** `EventManager` and receive **none** of the interpreter-sourced events plumbed in `runtime/jvmti.rs` |
+| **JVMTI event delivery** (`runtime/jvmti.rs`) | Yes — global manager installed from `SharedVm::new`; `fire_*` driven by interpreter / classloading / GC hooks | Fires; in-tree/test listeners always worked, and a real native agent now receives 9 of ~26 event kinds via the D14 bridge | Yes — see D1, D2, D14 |
+| **JVMTI native agents** (`-agentpath:`) | Yes, via `vm/src/jvmti/agent.rs` (real `dlopen` + `Agent_OnLoad`), feature `experimental-debug` (default-on) | Yes | Agents reach a **different** `EventManager`, now bridged (D14) for VMInit/VMDeath/ThreadStart/ThreadEnd/ClassLoad/ClassPrepare/GC-start-finish/ObjectFree; `JvmtiCapabilities::potential()` was corrected to advertise `false` for the event kinds that remain unbridged, so `AddCapabilities` no longer over-promises |
 | **JVMTI `GetLocalVariable*`** | Yes (capability advertised) | **No** — reads an agent-written side table, never real frames | n/a — see D2 |
 | **jcmd / attach surface** (`runtime/serviceability.rs`) | **No** — `AttachListener` opens no socket; `JcmdProcessor` constructed only in tests | No | Several handlers returned **fabricated** data — see D3, D4 |
 | **`java.lang.instrument`** (`runtime/instrument.rs`) | **Yes** — natives registered in both the synthetic and real-JDK paths; self-attach (`ByteBuddyAgent.install()`) supported | Yes | Yes, after D5 |
@@ -33,14 +33,19 @@ established first, per subsystem, before any code change.**
   live and correct. It is the one operators actually exercise (Mockito inline
   mock maker, JaCoCo, ByteBuddy self-attach).
 * **HPROF** — live, and now correct after the fixes below. It was not before.
-* Everything else is inert. JFR captures nothing; jcmd/attach is unreachable
-  from another process; JVMTI events fire into a manager nobody listens to.
+* **JVMTI** — the interpreter/GC/classloading-sourced event manager
+  (`runtime/jvmti.rs`) is correct for in-tree/test listeners (D1, D2 fixed);
+  a real native agent (`vm/src/jvmti/`) now receives 9 of ~26 event kinds via
+  a bridge (D14) with an honest, correspondingly-narrowed capability set —
+  full unification of the two implementations remains open.
+* JFR captures nothing (D12, open); jcmd/attach is unreachable from another
+  process (D15, open).
 
 ---
 
 ## 2. Defects
 
-### D1 — `ClassLoad`/`ClassPrepare` fire under the class-manager write guard; a native agent would self-deadlock
+### D1 — `ClassLoad`/`ClassPrepare` fire under the class-manager write guard; a native agent would self-deadlock — **FIXED**
 
 *Confirmed.* `classloading/src/class_manager.rs` calls `fire_class_load_hook` /
 `fire_class_prepare_hook` from inside `define_class_shared_with_options`'s
@@ -59,8 +64,20 @@ every `ClassLoad`/`ClassPrepare` event reports the wrong `jthread`. Agents key
 on that field to skip classes loaded by their own instrumentation thread and
 avoid unbounded recursion.
 
-Documented at `fire_class_load` in `vm/src/runtime/jvmti.rs`. **Not fixed** —
-the producer is in `classloading/`, owned by another agent. See §4.
+Fixed (2026-07-26): `fire_class_load_hook`/`fire_class_prepare_hook`
+(`classloading/src/class_manager.rs`) now queue the event on a thread-local
+instead of invoking the installed hook synchronously; the queue drains only
+after the L10 write guard is released, via a new `ClassRealm::class_manager_write()`
+accessor (`vm/src/vm/realms/class_realm.rs`) that is now the *sole* way to
+take that lock in the workspace — every prior `.class_manager.write()` call
+site was mechanically switched to it, so no site can bypass the drain. A
+listener may now safely call back into the class manager. Thread id is real
+(bound once per Java thread at registration via
+`cratonvm_classloading::set_current_thread_id`, main thread / `Thread.start`
+workers / foreign JNI attach) rather than a hardcoded 0. See
+`vm/src/runtime/jvmti.rs`'s `fire_class_load` doc comment. New tests:
+`jvmti_fire_hooks_dispatch_when_installed` (updated for deferred firing),
+`jvmti_current_thread_id_defaults_to_zero_and_is_settable`.
 
 ### D2 — `GetLocalVariable*` reads a side table, not real frames
 
@@ -256,28 +273,60 @@ a shard at all; it becomes a real per-thread leak the moment a long-lived
 recording starts on a thread-churning workload. Fix reclamation as part of
 wiring the trigger, not after.
 
-### D13 — `runtime::jvmti::AgentRegistry::load_agents` loads nothing — **DOCUMENTED**
+### D13 — `runtime::jvmti::AgentRegistry::load_agents` loads nothing — **FIXED (removed)**
 
-No `dlopen`, no `Agent_OnLoad` symbol lookup. Every registered agent is
+No `dlopen`, no `Agent_OnLoad` symbol lookup. Every registered agent was
 unconditionally marked `loaded = true` and counted a success — including
-`-agentpath:/does/not/exist.so`. Only previously-registered Rust closures run.
+`-agentpath:/does/not/exist.so`. Only previously-registered Rust closures ran.
 
-This is *not* the registry the VM bootstrap uses: `SharedVm::new` →
+This was *not* the registry the VM bootstrap uses: `SharedVm::new` →
 `load_startup_jvmti_agents` drives `vm/src/jvmti/agent.rs`, which does real
-`libloading` loading. But the two are trivially confusable — same type name,
-same method names, adjacent modules. Documented with an explicit "do not route
-`-agentpath:` here". Pinned by
-`obsaudit_load_agents_does_not_actually_load_native_libraries`.
+`libloading` loading. A repo-wide search confirmed `runtime::jvmti::AgentRegistry`
+(and its `JvmtiEnv::agent_registry` field) had **zero callers outside its own
+unit tests** — not wired to any bootstrap path, not part of the documented
+embedding API. Rather than fix its behaviour in place (which would still
+leave a same-named, same-method-shaped type sitting adjacent to the real one),
+it was deleted outright: `AgentEntry`, `AgentRegistry`, `split_agent_arg`, the
+`JvmtiEnv::agent_registry` field, and their 8 unit tests (including the
+contract-pin `obsaudit_load_agents_does_not_actually_load_native_libraries`,
+which pinned the bug's *existence* and is moot once the buggy code is gone).
+Use `vm::jvmti::AgentRegistry` for anything agent-loading related.
 
-### D14 — two parallel JVMTI implementations — **DOCUMENTED**
+### D14 — two parallel JVMTI implementations — **PARTIALLY FIXED (bridged)**
 
 `vm/src/runtime/jvmti.rs` (4 710 lines) and `vm/src/jvmti/` (2 243 lines) are
-both live and **not connected**. The former owns interpreter/GC/classloading
+both live and were **not connected**. The former owns interpreter/GC/classloading
 event plumbing; the latter owns real native-agent loading and the
 `create_jvmti_env` used at bootstrap. An agent attached via `-agentpath:`
-therefore receives none of the events the interpreter fires. A comparison table
-is now at the top of `runtime/jvmti.rs`; consolidating them is a separate,
-larger task.
+received none of the events the interpreter fires — before this fix, only
+`ClassLoad` and `ThreadEnd` reached it at all, each via its own ad hoc,
+inconsistent call site elsewhere in `vm/` (one of which, in
+`vm/src/vm/vm_init.rs`, incorrectly re-fired `ClassLoad` on every cache-hit
+`load_class` call, not just new definitions).
+
+Fixed (2026-07-26): `install_real_agent_env_bridge` (`vm/src/runtime/jvmti.rs`),
+installed once from `Vm::new` as a `Weak<SharedVm>` (same idiom as
+`set_process_vm` / `set_global_shared_vm_for_hooks`), forwards 9 event kinds —
+VMInit, VMDeath, ThreadStart, ThreadEnd, ClassLoad, ClassPrepare,
+GarbageCollectionStart/Finish, ObjectFree — from `JvmtiEventManager`'s `fire_*`
+methods to the real env's `notify_*` functions, ahead of (not gated by) this
+file's own listener-enabled check. Deliberately **not** bridged: MethodEntry/
+MethodExit/SingleStep/Breakpoint/FramePop/FieldAccess/FieldModification
+(per-bytecode/per-invocation hot paths — bridging would add a `Mutex<JvmtiEnv>`
+lock to the interpreter's hottest paths for every VM, agent attached or not)
+and MonitorWait/MonitorContendedEnter (per-contended-lock hot path; also
+`vm/src/jvmti/mod.rs` has no `notify_monitor_waited`/
+`notify_monitor_contended_entered`, so `can_generate_monitor_events` could
+only ever be half-honest). `vm/src/jvmti/capabilities.rs`'s
+`JvmtiCapabilities::potential()` was corrected to advertise `false` for
+exactly the capabilities whose events are not bridged, so `AddCapabilities`
+now reflects what an agent will actually receive instead of silently granting
+capabilities that deliver nothing.
+
+This is a bridge, not a merge — the two event enums, callback types, and
+capability structs remain separate types. **Full unification (shared event
+enum, shared capability set, one `JvmtiEnv`) remains open, as originally
+scoped**; see the cross-owner request below, updated to reflect the bridge.
 
 ### D15 — the attach surface opens no socket — **DOCUMENTED**
 
@@ -297,29 +346,29 @@ warning against "wiring up jcmd" by simply constructing a `JcmdProcessor` —
 | `vm/src/runtime/hprof.rs` | D6, D7, D8, D9, D10 fixed; D11 documented; module LIVENESS block; 4 tests |
 | `vm/src/runtime/serviceability.rs` | D3, D4 fixed; D15 + module LIVENESS block; 3 tests (replacing 4 that asserted the fabricated output) |
 | `vm/src/runtime/instrument.rs` | D5 fixed (`class_file_this_class` validator); 4 tests |
-| `vm/src/runtime/jvmti.rs` | D1, D2, D13, D14 documented in-file; 2 contract-pin tests |
+| `vm/src/runtime/jvmti.rs` | D1 fixed (deferred hook firing + real thread id); D13 fixed (dead `AgentRegistry` removed, -8 tests); D14 bridged (`install_real_agent_env_bridge`, 9 event kinds); D2 documented; LIVENESS block updated throughout |
+| `classloading/src/class_manager.rs` | D1: deferred-queue hook firing, `set_current_thread_id`/`current_thread_id`, `drain_pending_class_hooks`; 2 new tests |
+| `vm/src/vm/realms/class_realm.rs` | D1: `ClassManagerWriteGuard` + `class_manager_write()`, now the sole L10 write-lock accessor workspace-wide |
+| `vm/src/vm/vm_init.rs`, `vm/src/vm/vm_exec.rs`, `vm/src/native/jni.rs` | D1: bind real thread id at the 3 thread-registration sites; D14: install the bridge in `Vm::new`; removed a redundant/incorrect ad hoc `ClassLoad` notify in `vm_init.rs` |
+| `vm/src/jvmti/capabilities.rs` | D14: `potential()` no longer advertises capabilities for unbridged event kinds; 2 new tests |
+| `vm/src/jvmti/mod.rs` | D14: `test_full_workflow` updated (no longer requests a now-`false` capability) |
 | `jfr/src/lib.rs` | D12 LIVENESS + memory-bounds block |
 | `jfr/src/recording.rs` | D12 inert-field docs; 2 tests |
 
-Not built or tested — concurrent builds OOM the audit host. All changed files
-pass `rustfmt --edition 2021 --check`; CRLF line endings preserved.
+D1, D13, D14 rows above: built and tested on the Azure host
+(`fix/observability-audit-20260726`) — `cratonvm-classloading` full suite,
+`cratonvm-vm` `jvmti` test subset (117 passed after D13's removal), and
+`vm/tests/lock_order_smoke` / `vm/tests/new19_module_access` all green. The
+original D3–D12 rows above were not built or tested (concurrent builds OOM'd
+the audit host at the time) — still true for that original work; not
+re-verified in this pass.
 
 ---
 
 ## 4. Cross-owner requests
 
-**To the owner of `classloading/src/class_manager.rs` (D1):**
-
-1. `define_class_shared_with_options` fires `fire_class_load_hook` /
-   `fire_class_prepare_hook` (around line 3945) while the `ClassManager` write
-   guard is held. Please snapshot whatever the event needs (class id, name),
-   drop the guard, then fire. As written, any native JVMTI agent whose
-   `ClassLoad` handler calls back into the VM self-deadlocks. The in-file
-   comment asserting the callback "never re-enters the class manager" describes
-   today's in-tree listeners only and should be corrected either way.
-2. Both hook call sites pass a hardcoded `0` for `thread_id`. Please pass the
-   loading thread's id; agents key on `jthread` to avoid instrumenting their
-   own instrumentation.
+**D1 — resolved, no action needed.** See the D1 section above for what
+changed (`classloading/src/class_manager.rs`, `vm/src/vm/realms/class_realm.rs`).
 
 **To the owner of `classloading/src/type_maps.rs` (D2):**
 
@@ -329,9 +378,16 @@ not just oop-vs-not. Today they answer only the GC's question. No action
 requested now — recorded so the requirement is visible if the maps are extended
 for another reason.
 
-**To the owner of `vm/src/jvmti/` (D14):**
+**To the owner of `vm/src/jvmti/` (D14) — partially resolved.**
 
-`vm/src/jvmti/mod.rs`'s `EventManager` and `runtime/jvmti.rs`'s
-`JvmtiEventManager` are disjoint. Agents loaded through `agent.rs` see none of
-the interpreter/GC/classloading events. Either bridge the two managers or
-declare one of them the sole implementation.
+A one-way bridge (`install_real_agent_env_bridge` in `runtime/jvmti.rs`) now
+forwards 9 event kinds to `vm/src/jvmti/`'s `EventManager`; see the D14
+section above for exactly which and why not the rest. Still open, for
+whoever picks this up next: full unification (one event enum, one capability
+struct, one `JvmtiEnv`) so the remaining method-level tracing and monitor
+events don't need a second bespoke bridge each. `vm/src/jvmti/mod.rs` also
+has three `notify_*` functions with zero production callers even after this
+fix (`notify_breakpoint`, `notify_method_entry`, `notify_exception`, and
+others in the same file) — worth checking whether they should be wired too
+before extending the bridge to cover them, since a wired-but-unfired
+`notify_*` is exactly the kind of gap this whole audit exists to catch.

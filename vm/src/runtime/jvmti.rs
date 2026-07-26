@@ -61,7 +61,6 @@
 //!
 //! ## Known correctness gaps (each documented at its definition)
 //!
-//!  * `AgentRegistry::load_agents` does not load anything — see its doc.
 //!  * `get_local_*` / `set_local_*` operate on a side table, not on real
 //!    interpreter frames — see [`JvmtiEnv::get_local_int`].
 
@@ -1886,222 +1885,22 @@ impl Default for JvmtiEventManager {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Agent Loading Support
-// ---------------------------------------------------------------------------
-
-/// A registered agent (native or Java).
-#[derive(Debug, Clone)]
-pub struct AgentEntry {
-    pub name: String,
-    pub path: String,
-    pub options: String,
-    pub is_java_agent: bool,
-    pub loaded: bool,
-}
-
-/// Registry of JVMTI agents loaded via command-line options.
-pub struct AgentRegistry {
-    agents: Vec<AgentEntry>,
-    /// Callbacks invoked during Agent_OnLoad (indexed by agent name).
-    on_load_callbacks: HashMap<String, Box<dyn Fn(&str) -> i32 + Send + Sync>>,
-    /// Callbacks invoked during Agent_OnUnload (indexed by agent name).
-    on_unload_callbacks: HashMap<String, Box<dyn Fn() + Send + Sync>>,
-}
-
-impl fmt::Debug for AgentRegistry {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("AgentRegistry")
-            .field("agents", &self.agents)
-            .field("on_load_count", &self.on_load_callbacks.len())
-            .field("on_unload_count", &self.on_unload_callbacks.len())
-            .finish()
-    }
-}
-
-impl AgentRegistry {
-    pub fn new() -> Self {
-        Self {
-            agents: Vec::new(),
-            on_load_callbacks: HashMap::new(),
-            on_unload_callbacks: HashMap::new(),
-        }
-    }
-
-    /// Parse a command-line agent option and register the agent.
-    ///
-    /// Supported formats:
-    /// - `-agentlib:name[=options]`
-    /// - `-agentpath:path[=options]`
-    /// - `-javaagent:jarpath[=options]`
-    pub fn parse_agent_option(&mut self, arg: &str) -> JvmtiResult<()> {
-        if let Some(rest) = arg.strip_prefix("-agentlib:") {
-            let (name, options) = split_agent_arg(rest);
-            // For agentlib, the path is platform-dependent library lookup
-            let path = format!("lib{}.so", name); // simplified; real impl uses platform search
-            self.agents.push(AgentEntry {
-                name: name.to_string(),
-                path,
-                options: options.to_string(),
-                is_java_agent: false,
-                loaded: false,
-            });
-            Ok(())
-        } else if let Some(rest) = arg.strip_prefix("-agentpath:") {
-            let (path, options) = split_agent_arg(rest);
-            let name = std::path::Path::new(path)
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or(path)
-                .to_string();
-            self.agents.push(AgentEntry {
-                name,
-                path: path.to_string(),
-                options: options.to_string(),
-                is_java_agent: false,
-                loaded: false,
-            });
-            Ok(())
-        } else if let Some(rest) = arg.strip_prefix("-javaagent:") {
-            let (jar_path, options) = split_agent_arg(rest);
-            let name = std::path::Path::new(jar_path)
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or(jar_path)
-                .to_string();
-            self.agents.push(AgentEntry {
-                name,
-                path: jar_path.to_string(),
-                options: options.to_string(),
-                is_java_agent: true,
-                loaded: false,
-            });
-            Ok(())
-        } else {
-            Err(JvmtiError::IllegalArgument)
-        }
-    }
-
-    /// Register an Agent_OnLoad callback for testing or embedded agents.
-    pub fn register_on_load<F>(&mut self, name: &str, callback: F)
-    where
-        F: Fn(&str) -> i32 + Send + Sync + 'static,
-    {
-        self.on_load_callbacks
-            .insert(name.to_string(), Box::new(callback));
-    }
-
-    /// Register an Agent_OnUnload callback.
-    pub fn register_on_unload<F>(&mut self, name: &str, callback: F)
-    where
-        F: Fn() + Send + Sync + 'static,
-    {
-        self.on_unload_callbacks
-            .insert(name.to_string(), Box::new(callback));
-    }
-
-    /// Load all registered agents by invoking their Agent_OnLoad callbacks.
-    /// Returns the number of successfully loaded agents.
-    ///
-    /// ---------------------------------------------------------------------
-    /// WARNING (observability audit, 2026-07-26): THIS DOES NOT LOAD NATIVE
-    /// AGENTS.
-    /// ---------------------------------------------------------------------
-    /// There is no `dlopen`/`LoadLibrary` here and no `Agent_OnLoad` symbol
-    /// lookup. Every registered agent is unconditionally marked
-    /// `loaded = true` and counted as a success — including an
-    /// `-agentpath:/does/not/exist.so`. The only callbacks invoked are Rust
-    /// closures previously handed to [`AgentRegistry::register_on_load`],
-    /// which is an in-process/test facility.
-    ///
-    /// Failure scenario: an operator passes `-agentpath:` for a profiler, the
-    /// VM reports the agent loaded, and the profiler is simply never present.
-    /// Nothing distinguishes that from a profiler that attached and found
-    /// nothing to record.
-    ///
-    /// Real native-agent loading lives in `vm/src/jvmti/agent.rs`
-    /// (`AgentRegistry::load_agent` there), which does use `libloading` and
-    /// does resolve `Agent_OnLoad` / `Agent_OnAttach` / `Agent_OnUnload`. That
-    /// is the registry `SharedVm::new` actually drives via
-    /// `load_startup_jvmti_agents`. This type is a *different*, in-tree
-    /// registry that no bootstrap path uses; treat it as an embedder hook, and
-    /// do not route `-agentpath:` here.
-    pub fn load_agents(&mut self) -> JvmtiResult<usize> {
-        let mut loaded_count = 0usize;
-        for agent in &mut self.agents {
-            if agent.loaded {
-                continue;
-            }
-            // For native agents with registered callbacks, invoke them.
-            // For agents without callbacks (real dlopen case), mark them as loaded
-            // since actual native library loading requires OS-level dlopen which
-            // is handled at the VM bootstrap level.
-            agent.loaded = true;
-            loaded_count += 1;
-        }
-        // Now invoke on_load callbacks for agents that have them registered
-        let agent_snapshot: Vec<(String, String)> = self
-            .agents
-            .iter()
-            .map(|a| (a.name.clone(), a.options.clone()))
-            .collect();
-        for (name, options) in &agent_snapshot {
-            if let Some(cb) = self.on_load_callbacks.get(name.as_str()) {
-                let result = cb(options);
-                if result != 0 {
-                    // Non-zero return means agent load failed; mark it unloaded
-                    if let Some(agent) = self.agents.iter_mut().find(|a| a.name == *name) {
-                        agent.loaded = false;
-                        loaded_count = loaded_count.saturating_sub(1);
-                    }
-                }
-            }
-        }
-        Ok(loaded_count)
-    }
-
-    /// Unload all loaded agents by invoking their Agent_OnUnload callbacks.
-    pub fn unload_agents(&mut self) {
-        let names: Vec<String> = self
-            .agents
-            .iter()
-            .filter(|a| a.loaded)
-            .map(|a| a.name.clone())
-            .collect();
-        for name in &names {
-            if let Some(cb) = self.on_unload_callbacks.get(name.as_str()) {
-                cb();
-            }
-        }
-        for agent in &mut self.agents {
-            agent.loaded = false;
-        }
-    }
-
-    /// Get all registered agents.
-    pub fn agents(&self) -> &[AgentEntry] {
-        &self.agents
-    }
-
-    /// Get loaded agent count.
-    pub fn loaded_count(&self) -> usize {
-        self.agents.iter().filter(|a| a.loaded).count()
-    }
-}
-
-impl Default for AgentRegistry {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Split an agent argument at the first `=` sign into (name_or_path, options).
-fn split_agent_arg(s: &str) -> (&str, &str) {
-    match s.find('=') {
-        Some(idx) => (&s[..idx], &s[idx + 1..]),
-        None => (s, ""),
-    }
-}
+// obsaudit D13 (2026-07-26), fixed by removal: this file used to define its
+// own `AgentRegistry`/`AgentEntry`/`split_agent_arg` "agent loading" type.
+// It never actually loaded a native library (no `dlopen`, no `Agent_OnLoad`
+// symbol lookup — every registered agent was unconditionally marked
+// `loaded = true`), it was not the registry any bootstrap path used (that is
+// `vm/src/jvmti/agent.rs`'s `AgentRegistry`, a *different* type with a real
+// `libloading` implementation, driven by `SharedVm::new` via
+// `load_startup_jvmti_agents`), and — per a repo-wide search — nothing
+// outside its own unit tests ever constructed it. Two same-named,
+// adjacent-module types with identical method names (`load_agents`,
+// `agents()`, `loaded_count()`) is exactly the confusion the observability
+// audit flagged: keeping a fake one around "for embedders" when no embedder
+// anywhere in this tree used it just left the trap armed for the next
+// person who greps for `AgentRegistry` and finds this one first. Removed
+// rather than fixed in place; use `vm::jvmti::AgentRegistry` for anything
+// agent-loading related.
 
 // ---------------------------------------------------------------------------
 // JVMTI Environment — the main function table
@@ -2114,8 +1913,6 @@ pub struct JvmtiEnv {
     capabilities: RwLock<JvmtiCapabilities>,
     /// Event management.
     pub event_manager: Arc<JvmtiEventManager>,
-    /// Agent registry.
-    pub agent_registry: Mutex<AgentRegistry>,
     /// Thread registry: maps thread IDs to their info.
     threads: RwLock<HashMap<ThreadId, ThreadInfo>>,
     /// Suspended threads set.
@@ -2152,7 +1949,6 @@ impl JvmtiEnv {
         Self {
             capabilities: RwLock::new(JvmtiCapabilities::default()),
             event_manager: Arc::new(JvmtiEventManager::new()),
-            agent_registry: Mutex::new(AgentRegistry::new()),
             threads: RwLock::new(HashMap::new()),
             suspended_threads: RwLock::new(HashSet::new()),
             stack_traces: RwLock::new(HashMap::new()),
@@ -3571,28 +3367,6 @@ mod tests {
         assert_eq!(env.get_local_long(1, 0, 0), Err(JvmtiError::TypeMismatch));
     }
 
-    /// `AgentRegistry::load_agents` reports success for a library that does
-    /// not exist, because it never dlopens anything. Pinning this keeps the
-    /// "not a real agent loader" warning on `load_agents` honest — if the
-    /// function ever gains real loading, this test fails and the doc must be
-    /// rewritten alongside it.
-    #[test]
-    fn obsaudit_load_agents_does_not_actually_load_native_libraries() {
-        let mut reg = AgentRegistry::new();
-        reg.parse_agent_option("-agentpath:/nonexistent/definitely-not-here.so=opts")
-            .unwrap();
-        let loaded = reg.load_agents().unwrap();
-        assert_eq!(
-            loaded, 1,
-            "current behaviour: a missing agent library still counts as loaded"
-        );
-        assert_eq!(reg.loaded_count(), 1);
-        assert!(
-            !std::path::Path::new("/nonexistent/definitely-not-here.so").exists(),
-            "the library really does not exist — the success above is fictitious"
-        );
-    }
-
     fn make_thread_info(name: &str) -> ThreadInfo {
         ThreadInfo {
             name: name.to_string(),
@@ -4151,98 +3925,6 @@ mod tests {
     }
 
     #[test]
-    fn test_agent_parse_agentlib() {
-        let mut registry = AgentRegistry::new();
-        registry
-            .parse_agent_option("-agentlib:jdwp=transport=dt_socket,server=y")
-            .unwrap();
-
-        assert_eq!(registry.agents().len(), 1);
-        let agent = &registry.agents()[0];
-        assert_eq!(agent.name, "jdwp");
-        assert_eq!(agent.options, "transport=dt_socket,server=y");
-        assert!(!agent.is_java_agent);
-    }
-
-    #[test]
-    fn test_agent_parse_agentpath() {
-        let mut registry = AgentRegistry::new();
-        registry
-            .parse_agent_option("-agentpath:/opt/lib/myagent.so=debug")
-            .unwrap();
-
-        let agent = &registry.agents()[0];
-        assert_eq!(agent.path, "/opt/lib/myagent.so");
-        assert_eq!(agent.options, "debug");
-        assert!(!agent.is_java_agent);
-    }
-
-    #[test]
-    fn test_agent_parse_javaagent() {
-        let mut registry = AgentRegistry::new();
-        registry
-            .parse_agent_option("-javaagent:agent.jar=premain_opt")
-            .unwrap();
-
-        let agent = &registry.agents()[0];
-        assert_eq!(agent.path, "agent.jar");
-        assert_eq!(agent.options, "premain_opt");
-        assert!(agent.is_java_agent);
-    }
-
-    #[test]
-    fn test_agent_parse_invalid() {
-        let mut registry = AgentRegistry::new();
-        assert_eq!(
-            registry.parse_agent_option("-Xms512m"),
-            Err(JvmtiError::IllegalArgument)
-        );
-        assert_eq!(
-            registry.parse_agent_option("garbage"),
-            Err(JvmtiError::IllegalArgument)
-        );
-    }
-
-    #[test]
-    fn test_agent_load_unload() {
-        let mut registry = AgentRegistry::new();
-        registry.parse_agent_option("-agentlib:test").unwrap();
-
-        let load_count = Arc::new(AtomicU32::new(0));
-        let unload_count = Arc::new(AtomicU32::new(0));
-        let lc = load_count.clone();
-        let uc = unload_count.clone();
-
-        registry.register_on_load("test", move |_opts| {
-            lc.fetch_add(1, Ordering::SeqCst);
-            0 // success
-        });
-        registry.register_on_unload("test", move || {
-            uc.fetch_add(1, Ordering::SeqCst);
-        });
-
-        let loaded = registry.load_agents().unwrap();
-        assert_eq!(loaded, 1);
-        assert_eq!(load_count.load(Ordering::SeqCst), 1);
-        assert_eq!(registry.loaded_count(), 1);
-
-        registry.unload_agents();
-        assert_eq!(unload_count.load(Ordering::SeqCst), 1);
-        assert_eq!(registry.loaded_count(), 0);
-    }
-
-    #[test]
-    fn test_agent_load_failure() {
-        let mut registry = AgentRegistry::new();
-        registry.parse_agent_option("-agentlib:badagent").unwrap();
-        registry.register_on_load("badagent", |_opts| -1); // non-zero = failure
-
-        let loaded = registry.load_agents().unwrap();
-        assert_eq!(loaded, 0);
-        assert_eq!(registry.loaded_count(), 0);
-    }
-
-    #[test]
     fn test_force_gc_with_trigger() {
         let env = make_test_env();
         let triggered = Arc::new(AtomicU32::new(0));
@@ -4322,15 +4004,6 @@ mod tests {
         let debug = format!("{:?}", env);
         assert!(debug.contains("JvmtiEnv"));
         assert!(debug.contains("version"));
-    }
-
-    #[test]
-    fn test_agent_parse_no_options() {
-        let mut registry = AgentRegistry::new();
-        registry.parse_agent_option("-agentlib:simple").unwrap();
-        let agent = &registry.agents()[0];
-        assert_eq!(agent.name, "simple");
-        assert_eq!(agent.options, "");
     }
 
     #[test]
