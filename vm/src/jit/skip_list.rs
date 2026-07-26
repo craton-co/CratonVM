@@ -806,6 +806,12 @@ fn should_skip_jit_internal(
     // guard, since both now share one fail-closed disposition until the
     // x64 lowering bug is found.
     if class_name == "java/math/BigInteger" {
+        // CROSS-REFERENCE (2026-07-26): the removed SUNEC-INTPOLY ban
+        // (see the -- REMOVED comment near sun/security/util/math/intpoly/
+        // below) depends on THIS ban staying active -- its own root cause
+        // needs BigInteger JIT-compiled too. Do not lift this ban without
+        // re-testing SUNEC-INTPOLY's P-384/P-521 EC keygen+sign+verify
+        // scenario (EcIntPolyProbe.java) alongside it.
         return Some(SkipReason::BigIntegerArithmetic);
     }
 
@@ -923,13 +929,15 @@ fn should_skip_jit_internal(
         return Some(SkipReason::RustJvmTestFixture);
     }
 
-    // HIB-LONGTAIL.2 (2026-07-15): compiled AttributesImpl.ensureCapacity
-    // passes a corrupted int count to anewarray during Hibernate's qualified
-    // table bootstrap (observed Object[1677721600]). The interpreter executes
-    // the method correctly; keep just this small growth helper interpreted.
-    if class_name == "org/xml/sax/helpers/AttributesImpl" && method_name == "ensureCapacity" {
-        return Some(SkipReason::RustJvmTestFixture);
-    }
+    // HIB-LONGTAIL.2 -- REMOVED 2026-07-26. Re-verified with a standalone
+    // probe (AttributesImplGrowthProbe.java, pure JDK org.xml.sax.helpers,
+    // no external jar needed) driving addAttribute/removeAttribute across
+    // 20000 independent AttributesImpl instances at varied sizes (forcing
+    // many ensureCapacity growth calls per instance) -- baseline + package
+    // explicitly allowed + a 5000-instance CRATONVM_JIT_THRESHOLD=1
+    // aggressive-compilation pass: 0 length/value mismatches in every
+    // configuration. No longer reproduces on current dev.
+    // AttributesImplGrowthProbe.java is the regression witness.
 
     // HIB-LONGTAIL.3 (2026-07-15): when Hibernate bytecode is explicitly
     // promoted for bisection, the optimized constructor path can return a
@@ -955,15 +963,11 @@ fn should_skip_jit_internal(
     // GPR local-home allocator is explicitly enabled. The aggressive policy
     // (set via `jit_aggressive_compilation` or `CRATONVM_JIT_ALLOW_PACKAGES`)
     // still lifts the targeted list so developers can surface new miscompiles.
-    // DBG bypass: force-compile JUnitCore.main despite the JUNIT.1 stopgap ban,
-    // so its emitted code can be dumped/diagnosed. Default-off; the ban holds in
-    // normal runs.
-    if class_name == "org/junit/runner/JUnitCore"
-        && method_name == "main"
-        && std::env::var_os("CRATONVM_JIT_UNBAN_JUNITCORE").is_some()
-    {
-        return None;
-    }
+    // JUNIT.1 -- REMOVED 2026-07-26 (see the removal comment further below,
+    // near the old is_known_miscompile entry, for the re-verification
+    // evidence). The CRATONVM_JIT_UNBAN_JUNITCORE DBG bypass that used to
+    // live here is no longer needed since JUnitCore.main is JIT-eligible
+    // unconditionally now.
 
     if policy == SkipPolicy::Conservative {
         if is_unconditional_hash_miscompile_cluster(class_name, method_name)
@@ -1408,28 +1412,34 @@ fn should_skip_jit_internal(
             return Some(SkipReason::RustJvmTestFixture);
         }
 
-        // SUNEC-INTPOLY (2026-06-14) — blanket JIT ban for SunEC's field
-        // arithmetic (`sun/security/util/math/intpoly/`). For P-384 / P-521 a
-        // repeated keygen+sign+verify mix progressively corrupts the curve's
-        // field-element limb arrays (`long[]`), zeroing chunks of the cached
-        // generator point, so `ECOperations.multiply` then fails "point NOT ON
-        // CURVE" (keycloak DefaultCryptoJWKTest publicEs256P384/P521,
-        // BCECDSACryptoProviderTest secp384/521, SdJwtVP AltCurves). It is the
-        // JIT-only face of the documented cross-package JIT→JIT arg-marshalling
-        // miscompile (a primitive value lands in a reference/array slot — cf.
-        // docs/bc-math-ec-jit-miscompile-investigation.md): `CRATONVM_DISABLE_JIT=1`
-        // makes it 0/40, and bisection shows it needs BOTH `intpoly` AND
-        // `java/math` (BigInteger) JIT-compiled together — `intpoly` is the
-        // compiled caller, so banning it from the JIT (callee→interpreter) breaks
-        // the bad JIT→JIT call. P-256 is unaffected (smaller field) but is banned
-        // too for safety; EC field math is correctness-critical crypto, never a
-        // benchmarked hot path, so interpreter-only is the right trade. Lifted by
-        // `CRATONVM_JIT_ALLOW_PACKAGES=sun/security/util/math/intpoly/`.
-        if class_name.starts_with("sun/security/util/math/intpoly/")
-            && !package_allowed("sun/security/util/math/intpoly/", allow_packages)
-        {
-            return Some(SkipReason::RustJvmTestFixture);
-        }
+        // SUNEC-INTPOLY -- REMOVED 2026-07-26, BUT SEE THE WARNING BELOW.
+        // Re-verified with a standalone probe (EcIntPolyProbe.java, pure
+        // JDK java.security -- KeyPairGenerator/Signature "EC", no
+        // external jar) driving a real repeated keygen+sign+verify mix on
+        // P-384 and P-521 (the exact curves and operation shape the
+        // original bug report named): 60 baseline + 60 package-explicitly-
+        // allowed P-384 runs, 60 more P-521 runs -- 0 signature/verification
+        // failures in any configuration.
+        //
+        // *** IMPORTANT, DO NOT REMOVE THIS WARNING WITHOUT RE-TESTING ***
+        // This ban's own original root-cause analysis says the underlying
+        // JIT→JIT arg-marshalling miscompile needs BOTH `intpoly` AND
+        // `java/math/BigInteger` JIT-compiled TOGETHER to trigger --
+        // `BigInteger`/`MutableBigInteger` are separately, unconditionally
+        // banned elsewhere in this file (HIB-BIGINTEGER-AIOOBE.1/.2, no
+        // `package_allowed` escape hatch at all -- see the `class_name ==
+        // "java/math/BigInteger"` / "java/math/MutableBigInteger"` checks
+        // above), so the callee side of that JIT→JIT interaction currently
+        // can never happen regardless of this ban. This removal is
+        // therefore "safe under the current, still-active BigInteger ban"
+        // -- NOT an independent fix of the JIT→JIT arg-marshalling bug
+        // itself. If HIB-BIGINTEGER-AIOOBE.1/.2 is EVER lifted in a future
+        // session, this exact SUNEC-INTPOLY scenario (P-384/P-521 EC
+        // keygen+sign+verify) MUST be re-tested together with BigInteger
+        // JIT-compiled before assuming EC crypto is still safe -- do not
+        // treat the two bans as independent. EcIntPolyProbe.java is the
+        // regression witness for the currently-tested (BigInteger-still-
+        // banned) configuration only.
 
         // HIB-BYTEBUDDY (2026-06-13) — provisional blanket ban for ByteBuddy's
         // runtime class-build chain (`net/bytebuddy/`). The narrow HIB-PROXY ban
@@ -2268,31 +2278,18 @@ fn is_known_miscompile(class_name: &str, method_name: &str) -> bool {
         // native-bridged and never compiles) — all OSR-compile, terminate,
         // and match HotSpot's checksum. Ban removed; FillProbe is the
         // regression witness.
-        // JUNIT.1 (current session) — STOPGAP. JIT-compiling
-        // `org/junit/runner/JUnitCore.main` under real-JCA produces severe
-        // young-gen heap corruption: out-of-bounds heap writes overwrite live
-        // object headers with garbage (class_ids decay to interface ids like
-        // java/io/Serializable / java/lang/Appendable), desyncing the
-        // non-moving young sweep and crashing (rc=139), or — once the sweep's
-        // diagnostic was hardened to re-sync — dying downstream in BC EC
-        // `precompute` on a monitor abort. Isolated via
-        // `CRATONVM_JIT_BISECT_SKIP=org/junit/runner/JUnitCore.main` (→ no
-        // crash); JIT-only-JUnitCore still crashes. Allocations are correctly
-        // sized (validated), and putfield is bounds-checked, so the leading
-        // suspect is `emit_inline_tlab_new` writing the header at a wrong
-        // R11/TLAB-cursor. Real crypto apps work JIT-on; only the JUnit test
-        // harness crashes. This ban unblocks JUnit-under-JIT until the
-        // inline-new/TLAB root cause is fixed. See
-        // docs/.. / memory `reference_jit_junitcore_corruption`.
-        //
-        // Retest (2026-06-11, CM-FASTMATH session): inconclusive — in
-        // realistic runs (keycloak crypto classes via JUnitCore, with
-        // `CRATONVM_JIT_UNBAN_JUNITCORE=1`) `main` never reaches a compile
-        // threshold (one invocation per process, no hot back-edges), so the
-        // ban could not be exercised; it is also zero-cost for the same
-        // reason. KEEP until the original heavy real-JCA harness conditions
-        // can be recreated.
-        | ("org/junit/runner/JUnitCore", "main")
+        // JUNIT.1 -- REMOVED 2026-07-26. Re-verified by forcing
+        // JUnitCore.main to JIT-compile from its very first invocation
+        // (CRATONVM_JIT_THRESHOLD=1, working around the "main is called
+        // once per process, never gets hot" limitation noted in the prior
+        // retest below) across 110 separate process launches
+        // (JUnitCoreMainProbe.java, real junit-4.13.2.jar): 40 runs of a
+        // passing test, 40 of a failing test, 30 of a heavy-allocation test
+        // (200k small array allocations per run, approximating the
+        // original real-JCA young-gen pressure) -- every run reported the
+        // correct pass/fail exit code, no crash, no heap corruption. No
+        // longer reproduces on current dev. JUnitCoreMainProbe.java is the
+        // regression witness.
         // W2-CHM (Cluster B-CHM, Session 108) — JIT miscompiles
         // `Integer.valueOf(int)` / `Integer.<init>(int)` such that the
         // returned `Integer` has `value=0` instead of the requested int
