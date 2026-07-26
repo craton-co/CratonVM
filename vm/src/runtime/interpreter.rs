@@ -18086,7 +18086,7 @@ pub(crate) fn aastore_element_assignable(
             .find_class_by_name(comp_name)
     })
     .unwrap_or_else(
-        || match shared.classes.class_manager.write().load_class(comp_name) {
+        || match shared.classes.class_manager_write().load_class(comp_name) {
             Ok(id) => id,
             Err(_) => ClassId::new(0),
         },

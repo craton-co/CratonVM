@@ -3633,7 +3633,7 @@ impl SharedVm {
         }
 
         // Actually load the class (this takes the global write lock briefly)
-        let mut cm_guard = self.classes.class_manager.write();
+        let mut cm_guard = self.classes.class_manager_write();
         let result = cm_guard.load_class(name);
         drop(cm_guard);
 
@@ -4403,7 +4403,7 @@ impl SharedVm {
         // present (pure synthetic-jdk mode) the load fails harmlessly
         // and we fall back to the 1-field synthetic stub below.
         let _ = self.load_class_concurrent("java/io/PrintStream");
-        let ps_class_id = self.classes.class_manager.write().ensure_synthetic_class(
+        let ps_class_id = self.classes.class_manager_write().ensure_synthetic_class(
             "java/io/PrintStream",
             1, // 1 field: fd_id — used only when the real class isn't loaded
         );
@@ -4732,13 +4732,17 @@ impl SharedVm {
         self.classes.class_manager.read()
     }
 
-    /// Acquire `class_manager` (L10) for write. See
-    /// [`Self::class_manager_read_ranked`] for why this is a plain alias.
+    /// Acquire `class_manager` (L10) for write, through the hook-draining
+    /// guard (obsaudit D1) — see
+    /// [`crate::vm::realms::class_realm::ClassRealm::class_manager_write`].
+    /// No longer a bare alias: unlike the read side, this must route
+    /// through the draining wrapper like every other write-lock site, or
+    /// JVMTI ClassLoad/ClassPrepare events queued under it would never fire.
     #[inline]
     pub fn class_manager_write_ranked(
         &self,
-    ) -> crate::runtime::lock_order::OrderedPlRwLockWriteGuard<'_, ClassManager> {
-        self.classes.class_manager.write()
+    ) -> crate::vm::realms::class_realm::ClassManagerWriteGuard<'_> {
+        self.classes.class_manager_write()
     }
 
     /// Acquire `ref_processor` (L7).
@@ -4932,6 +4936,11 @@ impl Vm {
             .threads
             .thread_registry
             .register(ThreadId(0), "main", None);
+        // obsaudit D1: bind this OS thread's JVMTI thread-attribution TLS so
+        // ClassLoad/ClassPrepare events fired while bootstrapping on the
+        // main thread report the real `jthread` instead of the "unknown"
+        // sentinel. See `cratonvm_classloading::set_current_thread_id`.
+        cratonvm_classloading::set_current_thread_id(0);
         // Share the interrupted flag so cross-thread interrupt works on the main thread
         shared
             .threads
@@ -11862,7 +11871,7 @@ mod tests {
 
         // Load a class so there's class info available
         {
-            let mut cm = shared.classes.class_manager.write();
+            let mut cm = shared.classes.class_manager_write();
             let _ = cm.load_class("java/lang/Object");
         }
 

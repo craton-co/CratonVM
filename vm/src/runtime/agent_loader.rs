@@ -320,7 +320,7 @@ fn invoke_one_premain(
     // helper classes loadable, which is the practical effect that
     // Mockito / Jacoco rely on.
     {
-        let mut cm = shared.classes.class_manager.write();
+        let mut cm = shared.classes.class_manager_write();
         let mut paths: Vec<String> = agent
             .boot_class_path
             .iter()

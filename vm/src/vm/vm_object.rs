@@ -273,7 +273,7 @@ fn java_string_allocation_layout(shared: &SharedVm) -> (ClassId, usize) {
         None => {
             // Slow path: first resolution (or read-probe miss). Take the write
             // lock to load the class and compute + cache the field count.
-            let mut cm = shared.classes.class_manager.write();
+            let mut cm = shared.classes.class_manager_write();
             let id = cm.load_class("java/lang/String").unwrap_or(ClassId::new(0));
             let count = if cached != 0 {
                 cached
@@ -883,7 +883,7 @@ pub fn get_or_create_class_mirror(shared: &SharedVm, class_id: ClassId) -> Objec
         .cached_class_mirror_num_fields
         .load(std::sync::atomic::Ordering::Relaxed);
     let (class_class_id, mirror_field_count) = {
-        let mut cm = shared.classes.class_manager.write();
+        let mut cm = shared.classes.class_manager_write();
         let id = cm.load_class("java/lang/Class").unwrap_or(ClassId::new(0));
         let count = if cached != 0 {
             cached
@@ -1074,7 +1074,7 @@ pub fn get_or_create_primitive_mirror(shared: &SharedVm, prim_name: &str) -> Obj
         .cached_class_mirror_num_fields
         .load(std::sync::atomic::Ordering::Relaxed);
     let (class_class_id, mirror_field_count) = {
-        let mut cm = shared.classes.class_manager.write();
+        let mut cm = shared.classes.class_manager_write();
         let id = cm.load_class("java/lang/Class").unwrap_or(ClassId::new(0));
         let count = if cached != 0 {
             cached
