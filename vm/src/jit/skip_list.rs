@@ -857,20 +857,33 @@ fn should_skip_jit_internal(
     // every configuration. No longer reproduces on current dev.
     // `TestNgMapsProbe.java` is the regression witness.
 
-    // TOMCAT-DOHEAD-JUNIT-ITERATOR.1 (2026-07-22) — the DoHead
-    // invalid-write matrix deterministically proves that compiling this
-    // reflective JUnit helper corrupts its enhanced-for iterator local:
-    // `collectAnnotatedMethodValues` later observes `i$` as null, then the
-    // runner leaks failures until it reaches `OutOfMemoryError`. The exact
-    // class passes under `CRATONVM_DISABLE_JIT=1`; all neighboring DoHead
-    // cases pass once this leaf remains interpreted. Keep this one cold test
-    // harness method fail-closed under every policy while preserving JIT
-    // coverage for the rest of JUnit and Tomcat.
-    if class_name == "org/junit/runners/model/TestClass"
-        && method_name == "collectAnnotatedMethodValues"
-    {
-        return Some(SkipReason::RustJvmTestFixture);
-    }
+    // TOMCAT-DOHEAD-JUNIT-ITERATOR.1 -- REMOVED 2026-07-26. Originally
+    // (2026-07-22) an invalid-write matrix deterministically proved that
+    // compiling org/junit/runners/model/TestClass.collectAnnotatedMethodValues
+    // corrupted its enhanced-for iterator local (`i$` observed null),
+    // leaking failures until OutOfMemoryError. Re-verified with a
+    // standalone probe (`TomcatDoheadJunitIteratorProbe.java`, real
+    // junit-4.13.2.jar) calling the exact banned method
+    // (`getAnnotatedMethodValues(target, Rule.class, TestRule.class)`,
+    // which internally invokes collectAnnotatedMethodValues's enhanced-for
+    // loop over 5 real `@Rule`-annotated methods per call) 20000-40000
+    // times: baseline, plus a `CRATONVM_JIT_THRESHOLD=1`/`CRATONVM_JIT=
+    // threshold` forced-aggressive-compilation pass -- 0 failures, 0 null
+    // results, correct count (5) every call in every configuration. No
+    // longer reproduces on current dev. `TomcatDoheadJunitIteratorProbe.java`
+    // is the regression witness.
+    //
+    // IMPORTANT: this class stays interpreted by DEFAULT regardless of this
+    // removal -- the separate, still-active blanket "org/junit/" ban a few
+    // hundred lines below (`class_name.starts_with("org/junit/") &&
+    // !package_allowed(...)`) also matches
+    // org/junit/runners/model/TestClass and catches it first. Unlike most
+    // shadowed removals this session, this one WAS independently
+    // re-verified against the real, unshadowed condition: every probe run
+    // above also used `CRATONVM_JIT_ALLOW_PACKAGES=org/junit/` (lifting the
+    // blanket ban too) to confirm collectAnnotatedMethodValues itself is
+    // genuinely safe once actually JIT-compiled, not merely a safe no-op
+    // removal riding on the blanket ban's continued coverage.
 
     // REACTOR-ADDCAP.1 / REACTOR-FLUXCREATE.1 -- REMOVED 2026-07-26.
     // Re-verified with a standalone probe (`ReactorAddCapProbe.java`, real
@@ -931,15 +944,29 @@ fn should_skip_jit_internal(
     // `String.coder`/`hash` offsets and a reload-elision mirror leaking across
     // a control-flow join. That cluster is extinct (0 of 218 classes).
     //
-    // The ban nevertheless STAYS, on fresh evidence: a same-binary 218-class
-    // A/B is PASS 158 with it and PASS 149 without, and the 9 regressions are
-    // enumerated with per-class signatures in
-    // `docs/known-issues/h2/h2-jitban-schema-not-found-on-reconnect.md`. Two of
-    // them name their mechanism outright (`TestObjectDataType`:
-    // `String cannot be cast to String`; `TestUpgrade`: `NoSuchMethodError` on
-    // an existing `IntArray.checkCapacity()V`) and are the place to start.
-    // The `org/antlr/v4/runtime/` half remains untested in isolation — the H2
-    // suite never exercises it.
+    // The ban nevertheless STAYS, on fresh evidence. A same-binary 218-class
+    // A/B was PASS 158 with it and PASS 149 without; ten classes regressed
+    // (the -9 is net — `TestMvccMultiThreaded2` improved in the same run).
+    // Six of the ten have since been closed, including both that named their
+    // mechanism outright, and both turned out to be general x64 defects rather
+    // than anything H2-specific: an array reporting itself an instance of its
+    // component type (`373e780b7`, hit by `TestObjectDataType`) and
+    // invokespecial resolving its target by name instead of through the
+    // caller's loader (`f16acca12`, hit by `TestUpgrade`).
+    //
+    // What actually holds this ban now is THREE classes — `TestStreamStore`
+    // (an intermittent `Interruptible.interrupt` NPE that also reproduces with
+    // the ban in place, so it may not belong here at all), `TestFreeSpace` and
+    // `TestNestedJoins` (both clean 300s timeouts, nothing known). A fourth,
+    // `TestCompatibility`, now fails with the ban in place too and is no
+    // longer evidence for anything. Per-class detail, repro commands and the
+    // next steps: `docs/known-issues/h2/h2-jitban-residuals-20260726.md`.
+    //
+    // The `org/antlr/v4/runtime/` half is NOT held by any of that — the H2
+    // suite never exercises ANTLR. A concurrent session isolated it against
+    // Hibernate ORM's own HQL suite (which does, heavily) and came back clean;
+    // see `docs/known-issues/hib-antlr-1-removed-shadowed-20260726.md`. That
+    // half is the better-evidenced candidate for narrowing this rule.
     if (class_name.starts_with("org/h2/") && !package_allowed("org/h2/", allow_packages))
         || (class_name.starts_with("org/antlr/v4/runtime/")
             && !package_allowed("org/antlr/v4/runtime/", allow_packages))
@@ -997,8 +1024,18 @@ fn should_skip_jit_internal(
     // JUNIT.1 -- REMOVED 2026-07-26 (see the removal comment further below,
     // near the old is_known_miscompile entry, for the re-verification
     // evidence). The CRATONVM_JIT_UNBAN_JUNITCORE DBG bypass that used to
-    // live here is no longer needed since JUnitCore.main is JIT-eligible
-    // unconditionally now.
+    // live here is no longer needed for JUNIT.1's OWN narrow check.
+    // CORRECTION (2026-07-26, same day): this removal is a shadowed no-op,
+    // like SPRINGBOOT-WITHOUT-JACKSON.2 and HIB-ANTLR.1 -- JUnitCore.main
+    // is NOT actually JIT-eligible by default, because the separate,
+    // still-active blanket "org/junit/" ban below also matches
+    // org/junit/runner/JUnitCore and was never lifted during JUNIT.1's own
+    // retest (JUnitCoreMainProbe.java's 110 runs used only
+    // CRATONVM_JIT_THRESHOLD=1, not CRATONVM_JIT_ALLOW_PACKAGES=org/junit/).
+    // The original claim below ("no longer reproduces on current dev") is
+    // still accurate for JUNIT.1's own specific miscompile, but "JIT-eligible
+    // unconditionally now" was an overclaim -- it is only JIT-eligible when
+    // the blanket ban is ALSO explicitly lifted, which was not tested.
 
     if policy == SkipPolicy::Conservative {
         if is_unconditional_hash_miscompile_cluster(class_name, method_name)
@@ -1511,39 +1548,34 @@ fn should_skip_jit_internal(
             return Some(SkipReason::RustJvmTestFixture);
         }
 
-        // SPB.1 (Session 112) — provisional blanket ban for the Spring
-        // Framework `org/springframework/util/` package. `ClassUtils.
-        // <clinit>` runs `registerCommonClasses(...)` ~10 times for
-        // primitive / wrapper / collection / common-types groups, putting
-        // ~100 entries into a fresh HashMap. With JIT enabled the run
-        // segfaults right after the log4j-api StatusLogger warning; with
-        // `CRATONVM_DISABLE_JIT=1` the segfault disappears (a different
-        // downstream gap surfaces in PropertiesUtil.<clinit>). The frame
-        // trace shows the very last frame popping is
-        // `ClassUtils.registerCommonClasses` after a long sequence of
-        // `put -> putVal -> newNode -> Node.<init> -> afterNodeInsertion`
-        // cycles — the same allocate-then-putfield archetype documented
-        // in W2-CHM / RBC.1 / EXEC.1. The narrow HashMap entries above
-        // (`putVal`, `newNode`, `treeifyBin`, `hash`, `afterNode*`) cover
-        // the JDK side, but the Spring `ClassUtils.registerCommonClasses`
-        // method itself iterates the input array and calls
-        // `clazz.getName() -> Class.getName() -> String allocation` per
-        // element, which the JIT may compile after the second batch and
-        // miscompile the new String's value/coder slots. Spring's
-        // `ReflectionUtils`, `StringUtils`, etc. share the same
-        // allocate-heavy idioms.
-        //
-        // Like the BouncyCastle ban above, this is a coarse-grained
-        // safety net so SportMe boot can progress past `ClassUtils.
-        // <clinit>`. Lifted by
-        // `CRATONVM_JIT_ALLOW_PACKAGES=org/springframework/util/`. Track
-        // for a real fix once the underlying allocate-then-putfield
-        // miscompile is root-caused.
-        if class_name.starts_with("org/springframework/util/")
-            && !package_allowed("org/springframework/util/", allow_packages)
-        {
-            return Some(SkipReason::RustJvmTestFixture);
-        }
+        // SPB.1 (Session 112) — REMOVED 2026-07-26. This was a provisional
+        // blanket ban for `org/springframework/util/`, on the theory that
+        // `ClassUtils.<clinit>`'s `registerCommonClasses(...)` (~100
+        // `HashMap.put` calls into a fresh map) triggered a JIT
+        // allocate-then-putfield miscompile. Re-investigated 2026-07-26
+        // (`docs/known-issues/spb1-springframework-util-investigation.md`):
+        // three standalone repros against real `spring-core-7.0.7.jar`
+        // found no JIT-specific corruption, but a fourth (GC-pressure +
+        // `URLClassLoader` churn) reproduced real heap corruption with the
+        // ban ACTIVE too — ruling out "this ban prevents the regression".
+        // Root-caused as a GC-root-scanning gap, not a JIT bug: three
+        // `vm/src/memory/roots.rs` sections (static fields, class-lock
+        // objects, CONSTANT_Dynamic roots) and one `class_mirrors` section
+        // deferred a user-defined-loader class's still-YOUNG-generation
+        // object to the `metadata_pin` side-channel instead of rooting it
+        // directly; that channel is consulted only by the Generational
+        // backend's OLD-GEN mark BFS, so a young object with no other root
+        // (the overwhelmingly common case for a static field's value right
+        // after `<clinit>` assigns it) was silently reclaimed and its
+        // memory reused by the class's own next allocation. Fixed via
+        // `VmHeap::metadata_pin_deferrable` (`gc/src/vm_heap.rs`), which
+        // gates the defer on the object actually being in old gen.
+        // Verified: 50/50 clean runs of the doc's repro-3 with the ban kept
+        // and 47/47 clean with it lifted (`CRATONVM_JIT_ALLOW_PACKAGES=
+        // org/springframework/util/`), across 30-round `URLClassLoader`
+        // churn under concurrent GC pressure — no distinct JIT-specific
+        // symptom appears once lifted, so the ban is removed rather than
+        // just left liftable.
 
         // SPB.2 (Session 112 r8) — provisional blanket ban for
         // `org/springframework/core/`. SerializableTypeWrapper.forTypeProvider
@@ -4921,20 +4953,54 @@ mod tests {
     }
 
     #[test]
-    fn tomcat_dohead_junit_iterator_helper_is_unconditionally_interpreted() {
-        for policy in [SkipPolicy::Conservative, SkipPolicy::Aggressive] {
-            assert_eq!(
-                check(
-                    "org/junit/runners/model/TestClass",
-                    "collectAnnotatedMethodValues",
-                    false,
-                    true,
-                    policy,
-                ),
-                Some(SkipReason::RustJvmTestFixture),
-                "the proven DoHead JUnit iterator miscompile must stay excluded",
-            );
-        }
+    fn tomcat_dohead_junit_iterator_is_jit_eligible_after_removal() {
+        // TOMCAT-DOHEAD-JUNIT-ITERATOR.1's own specific check was removed
+        // 2026-07-26 (see the removal comment above should_skip_jit_internal),
+        // but org/junit/ classes stay interpreted under Conservative by
+        // default regardless -- the separate, still-active, unrelated
+        // blanket "org/junit/" ban a few hundred lines below (itself gated
+        // inside `if policy == SkipPolicy::Conservative`, like all its
+        // neighboring blanket bans -- Aggressive bypasses this whole
+        // section unconditionally, same shape as the existing
+        // spring_boot_modified_classpath_loader_is_jit_eligible_after_removal
+        // test just above) also matches org/junit/runners/model/TestClass.
+        // Unlike most shadowed removals this session, this one WAS
+        // independently re-verified against the real, unshadowed condition
+        // (see check_with below, and the removal comment for the probe
+        // evidence gathered with the blanket ban explicitly lifted too).
+        let class_name = "org/junit/runners/model/TestClass";
+        let method_name = "collectAnnotatedMethodValues";
+
+        // Aggressive: the whole Conservative-only blanket-ban section is
+        // skipped, so DoHead's removal is directly observable with no
+        // allow-list needed.
+        assert_eq!(
+            check(class_name, method_name, false, true, SkipPolicy::Aggressive),
+            None,
+            "TOMCAT-DOHEAD-JUNIT-ITERATOR.1 was removed 2026-07-26 -- must be JIT-eligible under Aggressive (no blanket org/junit/ ban applies there)",
+        );
+
+        // Conservative: the blanket org/junit/ ban still applies by default...
+        assert_eq!(
+            check(class_name, method_name, false, true, SkipPolicy::Conservative),
+            Some(SkipReason::RustJvmTestFixture),
+            "org/junit/ stays interpreted under Conservative by default via the separate blanket org/junit/ ban, independent of TOMCAT-DOHEAD-JUNIT-ITERATOR.1's own removal",
+        );
+        // ...but with that blanket ban explicitly lifted, DoHead's own
+        // specific check must be gone -- this is the real test of its
+        // removal under Conservative.
+        assert_eq!(
+            check_with(
+                class_name,
+                method_name,
+                false,
+                true,
+                SkipPolicy::Conservative,
+                &["org/junit/"],
+            ),
+            None,
+            "TOMCAT-DOHEAD-JUNIT-ITERATOR.1 was removed 2026-07-26 -- re-verified clean with the blanket org/junit/ ban lifted too, must no longer be independently skipped",
+        );
     }
 
     #[test]

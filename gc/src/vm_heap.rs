@@ -1866,6 +1866,40 @@ impl VmHeap {
         }
     }
 
+    /// True when `addr` is safe to defer to the loader-scoped
+    /// `metadata_pin` side-channel instead of pushing it as an unconditional
+    /// GC root (see `vm::memory::roots`'s static-field, class-lock and
+    /// CONSTANT_Dynamic root sections, all gated on `conditional_metadata`).
+    ///
+    /// Generational: ONLY old-gen addresses. `metadata_pin` is consulted
+    /// exclusively by `old_gen_gc`'s BFS (`gen_heap.rs`), which never scans
+    /// the young generation, and `sweep_young_non_moving` / the moving young
+    /// copy closure seed strictly from the direct root set — neither
+    /// consults `metadata_pin`. A YOUNG address deferred here has no path to
+    /// ever be marked: if it has no other reachability (the common case for
+    /// a static field's value immediately after `<clinit>` assigns it, or a
+    /// class-lock/condy object with no other reference), it is silently
+    /// reclaimed and its memory reused by the very next allocation —
+    /// producing a live object that reads back as a DIFFERENT, unrelated
+    /// type. See `docs/known-issues/spb1-springframework-util-investigation.md`'s
+    /// repro-3 follow-up for the observed corruption shape (a `ClassUtils`
+    /// static field, loaded via a user-defined `ClassLoader`, read back as
+    /// an unrelated live object from later in the same `<clinit>`).
+    ///
+    /// G1 / ZGC: always `true` — both backends' `metadata_pin` consumers
+    /// (`g1.rs`, `zgc.rs`) walk every live region uniformly during the same
+    /// full-mark pass that activates `conditional_metadata`, so deferring a
+    /// young-resident object is sound; this matches their existing,
+    /// unconditional behavior and is unchanged here.
+    pub fn metadata_pin_deferrable(&self, addr: usize) -> bool {
+        match self {
+            VmHeap::Generational(h) => h.is_old_gen_addr(addr),
+            VmHeap::G1(_) => true,
+            #[cfg(feature = "zgc")]
+            VmHeap::Zgc(_) => true,
+        }
+    }
+
     /// Backend-generic post-GC staleness verdict for a PRE-collection
     /// address: `true` iff the object at `addr` did NOT survive the
     /// collection whose `pointer_map` is supplied — i.e. writing through

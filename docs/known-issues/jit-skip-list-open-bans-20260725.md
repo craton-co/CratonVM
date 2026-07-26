@@ -165,21 +165,30 @@ real; don't trust a single noisy run either way.
 
 High-value (wide blast radius or already well-isolated in comments):
 
-- **SPB.1/.2/.4/.4b/.4c/.5/.6/.7/.8/.8b/.8c/.9/.9b/.9c/.9d, RBC.1, CGL.1,
-  PIC.1, W2-CHM, EXEC.1** — ~20 Spring-Boot-era blanket package bans, all
-  explicitly cross-referenced in their own comments as "the same
-  allocate-then-putfield archetype" (a hypothesized JIT bug: a freshly
-  allocated object's field stores, written immediately after `new`, get
-  corrupted/miscompiled, esp. across a GC-triggering call). **Caution:**
-  a fresh, unrelated 2026-07-25 finding
+- **SPB.2/.4/.4b/.4c/.5/.6/.7/.8/.8b/.8c/.9/.9b/.9c/.9d, RBC.1, CGL.1,
+  PIC.1, W2-CHM, EXEC.1** — ~19 remaining Spring-Boot-era blanket package
+  bans (SPB.1 itself, `org/springframework/util/`, was REMOVED 2026-07-26 —
+  see the "UPDATE" note above and
+  `docs/internal/fixed-suite-bugs/spb1-springframework-util-investigation-FIXED.md`;
+  its "allocate-then-putfield" crash turned out to be a GC-root-scanning gap,
+  not a JIT miscompile), all explicitly cross-referenced in their own
+  comments as "the same allocate-then-putfield archetype" (a hypothesized JIT
+  bug: a freshly allocated object's field stores, written immediately after
+  `new`, get corrupted/miscompiled, esp. across a GC-triggering call).
+  **Caution:** a fresh, unrelated 2026-07-25 finding
   ([[jit-inline-tlab-header-before-cursor-commit]] memory /
   `gc/src/gen_heap.rs`) confirms the *allocator's own header writes* are
   correct and linearized properly — so if this bug is still real, it is in
   the JIT's `putfield` codegen or register allocation *after* `new`
-  returns, not in the allocator. Worth a fresh bisection pass (same
-  `CRATONVM_JIT_DENY` technique) on ONE of these (e.g. SPB.1,
-  `org/springframework/util/`, has a documented Spring Boot repro) before
-  assuming the theory is even still correct — it may also be stale, like
+  returns, not in the allocator. **SPB.1's own resolution suggests checking
+  the same GC-root gap first** (a still-young object owned by a
+  user-defined-loader class, deferred to `metadata_pin` instead of being
+  rooted directly — see `gc/src/vm_heap.rs::metadata_pin_deferrable`) before
+  assuming a JIT miscompile for any of these remaining bans; several are
+  themselves user-defined-loader-adjacent (CGL.1/cglib, PIC.1 likely a
+  proxy/picocli generator). Worth a fresh bisection pass (same
+  `CRATONVM_JIT_DENY` technique) on one of these before assuming the JIT
+  theory is even still correct for them — it may also be stale, like
   TOMCAT-DOHEAD-JUNIT-ITERATOR.1 turned out to possibly be.
 - **ANTLR.1 / ANTLR-COLDPATH.1 / HIB-ANTLR.1** — shaded ANTLR v4 runtime,
   used by Groovy/Hibernate/Keycloak; comment already narrows suspicion to
@@ -280,24 +289,40 @@ still real correctness bugs worth closing):
   baseline (ban active) also crashed, this can't be cleanly attributed to
   lifting *this* ban — likely either a separate GC-root/classloader-churn
   bug my repro's own design exercises, or a timing-sensitive race. Full
-  writeup + all 3 repros: `docs/known-issues/spb1-springframework-util-investigation.md`,
-  `docs/known-issues/repros/spb1-classutils/`. **Verdict: KEEP the ban** (no
-  positive evidence to remove); the repro-3 crash is flagged as a separate,
-  possibly-serious open issue for whoever wants to chase it, independent of
-  SPB.1. Confirms this session's now-established pattern: `org/jboss/as/`
+  writeup + all 3 repros (at the time): `docs/known-issues/repros/spb1-classutils/`.
+  Confirms this session's now-established pattern: `org/jboss/as/`
   and `org/h2/` were BOTH confirmed still-needed via real-app testing;
   synthetic repros for this ban family have proven unreliable/hard to
   construct faithfully — prefer a real app/suite over a hand-rolled probe
   when one is available for any future items in this family.
 
+  **UPDATE 2026-07-26 (later session): the repro-3 crash was chased down —
+  ban REMOVED.** It was never a JIT bug: `vm/src/memory/roots.rs` had a
+  GC-root-scanning gap (four sections deferred a still-young-generation
+  object owned by a user-defined-loader class to the `metadata_pin`
+  side-channel, which the Generational backend's old-gen-only mark BFS
+  never covers for young objects — so a static field's value with no other
+  root was silently reclaimed and its memory reused moments later by the
+  class's own next allocation). Fixed via `VmHeap::metadata_pin_deferrable`
+  (`gc/src/vm_heap.rs`) gating the defer on old-gen containment; same defect
+  found and fixed in `native-builtins/src/phases_late.rs`'s `ClassValue`
+  cache. Verified 50/50 clean with the ban kept and 47/47 clean with it
+  lifted — no distinct JIT-specific symptom survives the fix, so
+  `org/springframework/util/`'s blanket ban is removed rather than left
+  liftable. Full writeup:
+  `docs/internal/fixed-suite-bugs/spb1-springframework-util-investigation-FIXED.md`.
+
 1. Verify (or refute) the TYPES-ERASURE.1 consolidation hypothesis — highest
    expected value, cheapest to test (no-rebuild env-var bisection already
    proven to work on this exact cluster).
-2. Fresh `CRATONVM_JIT_DENY` bisection on ONE SPB.x ban (suggest SPB.1,
-   `org/springframework/util/`, has the clearest documented repro) to
-   check whether the "allocate-then-putfield" theory still holds post the
+2. Fresh `CRATONVM_JIT_DENY` bisection on ONE remaining SPB.x ban (SPB.1
+   itself is DONE — removed 2026-07-26, see above — pick another, e.g.
+   SPB.2 `org/springframework/core/`) to check whether the
+   "allocate-then-putfield" theory still holds post the
    2026-07-25 TLAB-header finding, or whether it's stale like the JUnit
-   iterator ban may be.
+   iterator ban (and now SPB.1) turned out to be. Check the GC-root-scanning
+   gap (`gc/src/vm_heap.rs::metadata_pin_deferrable`) first if the target
+   package's classes are ever loaded via a user-defined `ClassLoader`.
 3. ANTLR.1 narrowing (7 specific methods already named in the comment).
    **CLAIMED by `fix/jit-ban-sweep2-20260726` / `wt-jitsweep2-20260726`,
    2026-07-26 ~02:30 UTC.** Note before starting: the "narrowing" is
