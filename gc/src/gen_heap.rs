@@ -111,19 +111,29 @@ const fn young_gc_trigger_bytes(
     }
 }
 
+/// Will the NEXT ordinary young collection certainly take the non-moving
+/// sweep? Only used to size the collection trigger (the moving cycle needs
+/// Cheney copy headroom; the non-moving sweep does not).
+///
+/// arch-2026-07-26 (`moving-young-precise-roots`): the former
+/// `allow_moving_young` parameter — fed by `CRATONVM_ALLOW_MOVING_YOUNG`, a
+/// *second* opt-in that had to be set IN ADDITION to the moving-young gate —
+/// is gone, along with the flag itself. Its practical effect was that
+/// `CRATONVM_MOVING_YOUNG=1` alone never ran a moving cycle under a live JIT
+/// frame, which is the only case the feature exists for. A live JIT frame now
+/// forces the non-moving sweep exactly when moving-young is not in effect;
+/// when it IS in effect, the per-cycle coverage proof decides, not a flag.
 #[inline]
 const fn next_young_gc_is_guaranteed_non_moving(
     jit_active: bool,
     unregistered_jit_frame: bool,
     jit_allocation_frame: bool,
     moving_young_requested: bool,
-    allow_moving_young: bool,
     force_moving: bool,
 ) -> bool {
     !force_moving
-        && ((jit_active && !allow_moving_young)
-            || ((jit_active || unregistered_jit_frame || jit_allocation_frame)
-                && !moving_young_requested))
+        && (jit_active || unregistered_jit_frame || jit_allocation_frame)
+        && !moving_young_requested
 }
 
 /// "Humongous" object threshold as a percentage of the young semi-space
@@ -3320,7 +3330,6 @@ impl GenerationalHeap {
             crate::gc_quiescence::unregistered_jit_frame_on_stack(),
             jit_allocation_frame,
             crate::gc_quiescence::moving_young_enabled(),
-            gc_flags().allow_moving_young,
             gc_flags().dbg_force_moving,
         );
         let threshold = young_gc_trigger_bytes(
@@ -3751,30 +3760,63 @@ impl GenerationalHeap {
         // `CRATONVM_PROMOTION_OOM_GUARD_BROAD=1`.
         let honor_promotion_oom_risk =
             promotion_oom_risk && (has_conservative_roots || gc_flags().promotion_oom_guard_broad);
-        // Default moving young gen (`CRATONVM_MOVING_YOUNG`): the JIT publishes a
-        // COMPLETE rewritable precise root map (shadow stack) for every live frame
-        // and the conservative scan is suppressed (see roots.rs), so a live JIT
+        // Moving young gen — the collector-side half of the decision.
+        //
+        // When moving-young is in effect the JIT publishes a COMPLETE
+        // rewritable precise root map (shadow stack) for every live frame and
+        // the conservative scan is suppressed (see roots.rs), so a live JIT
         // frame no longer forces the non-moving sweep — run the moving (Cheney)
-        // cycle instead. The `honor_promotion_oom_risk` guard is STILL respected as
-        // a safety fallback: when both generations are ~full the moving path can
-        // `process::abort()` on a promotion failure, so we divert to the
-        // (abort-free) non-moving sweep for that cycle regardless of the flag. The
-        // suppressed conservative scan means that fallback sweep also relies on the
-        // complete shadow map for marking — consistent, since the shadow map is the
-        // sole precise JIT root set under this flag. If the VM detected an
-        // incomplete JIT coverage proof during root gathering, this cycle treats
-        // moving-young as unavailable and uses the conservative/non-moving
-        // fallback instead.
+        // cycle instead.
+        //
+        // arch-2026-07-26 (`moving-young-precise-roots`): this block used to
+        // contain a SECOND, independent opt-in gate:
+        //
+        //     let fail_closed_non_moving =
+        //         is_active() && !gc_flags().allow_moving_young;
+        //
+        // ORed unconditionally into `divert_non_moving`. Because
+        // `gc_quiescence::is_active()` is true whenever ANY thread holds a live
+        // JIT frame — i.e. in every steady-state workload once the
+        // 500-invocation JIT threshold trips — that term made the young
+        // generation stop being a copying collector the moment the JIT engaged.
+        // Worse, it did NOT consult `moving_young_requested`, so
+        // `CRATONVM_MOVING_YOUNG=1` on its own could never run a moving cycle
+        // under a live JIT frame, which is the ONLY case the feature exists
+        // for; `CRATONVM_ALLOW_MOVING_YOUNG` had to be set as well. Both the
+        // term and the flag are DELETED, not defaulted: a flag whose sole job
+        // is to permit correct behaviour is not a safety mechanism.
+        //
+        // What remains is exactly two diversions, and both are real:
+        //
+        //   1. `has_conservative_roots && !moving_young` — when moving-young is
+        //      NOT in effect, a live JIT frame's roots are discovered
+        //      conservatively (a stack word that merely looks like a pointer
+        //      may be an `i64`), so they can be marked but never rewritten and
+        //      the collector must not relocate. The original NEW-1.5 rule.
+        //   2. `honor_promotion_oom_risk` — the genuine safety fallback: with
+        //      BOTH generations ~full the moving path can `process::abort()` on
+        //      a promotion failure, so that cycle takes the abort-free sweep.
+        //
+        // Everything else that used to divert is now a per-cycle COVERAGE PROOF
+        // published by the VM's root gatherer, and its failure is reported at
+        // `warn` level by default rather than counted behind a flag.
         let moving_young_requested = crate::gc_quiescence::moving_young_enabled();
-        let fail_closed_non_moving =
-            crate::gc_quiescence::is_active() && !gc_flags().allow_moving_young;
         let force_non_moving_jit_roots = crate::gc_quiescence::force_non_moving_jit_roots();
-        let coverage_incomplete = crate::gc_quiescence::moving_young_coverage_incomplete();
+        // An unregistered JIT frame (A5 — a compiled frame live WITHOUT a
+        // `JitEntryGuard`, e.g. the compiled entry-point `main` while a
+        // clinit/interpreted callee runs) is not reachable from the JIT entry
+        // chain, so it publishes no shadow homes and no per-safepoint map: its
+        // oops are conservatively marked but un-rewritable. That is an
+        // incomplete coverage proof under moving-young exactly as much as it is
+        // a conservative-root condition on the legacy path. Fold it in here so
+        // the moving branch can never relocate behind such a frame even if a
+        // future root-scan caller forgets to mark the cycle.
+        let coverage_incomplete = crate::gc_quiescence::moving_young_coverage_incomplete()
+            || crate::gc_quiescence::unregistered_jit_frame_on_stack();
         let divert_for_incomplete_moving_coverage =
             moving_young_requested && (force_non_moving_jit_roots || coverage_incomplete);
         let moving_young = moving_young_requested && !divert_for_incomplete_moving_coverage;
-        let divert_non_moving = fail_closed_non_moving
-            || (has_conservative_roots && !moving_young_requested)
+        let divert_non_moving = (has_conservative_roots && !moving_young)
             || honor_promotion_oom_risk
             || divert_for_incomplete_moving_coverage
             || explicit_full_gc;
@@ -3785,12 +3827,10 @@ impl GenerationalHeap {
         }
         if divert_non_moving && (!force_moving || divert_for_incomplete_moving_coverage) {
             if divert_for_incomplete_moving_coverage {
-                let n = crate::gc_quiescence::record_moving_young_coverage_fallback();
-                if gc_flags().moving_young_fallbacks {
-                    eprintln!(
-                        "[moving-young] coverage fallback #{n}: incomplete live JIT safepoint map; running non-moving young sweep"
-                    );
-                }
+                // Warn-level and ON BY DEFAULT (see the function's doc): a
+                // silent slide back to the non-moving sweep is the failure mode
+                // this whole item exists to make impossible.
+                crate::gc_quiescence::record_moving_young_coverage_fallback();
             }
             tracing::debug!(
                 "running non-moving young-gen mark-sweep (jit_active={}, \
@@ -3804,6 +3844,14 @@ impl GenerationalHeap {
                 force_non_moving_jit_roots,
             );
             return self.run_non_moving_young_cycle(roots, finalizer_addrs, monitors);
+        }
+        if moving_young && has_conservative_roots {
+            // A moving (Cheney) young collection running WHILE a JIT frame is
+            // live — what the architecture advertises, and what only happens
+            // once every live frame proved a rewritable root map. Counted so
+            // "is the young generation actually copying?" is answerable at
+            // runtime (paired with the coverage-fallback counter).
+            crate::gc_quiescence::record_moving_young_cycle();
         }
 
         let mut young_from = self.young_from.lock();
@@ -11501,25 +11549,33 @@ mod tests {
             "non-moving young should defer the O(heap) sweep until 90% occupancy",
         );
         let ordinary_cycle =
-            next_young_gc_is_guaranteed_non_moving(false, false, false, false, false, false);
+            next_young_gc_is_guaranteed_non_moving(false, false, false, false, false);
         assert!(
             !ordinary_cycle,
             "JIT-quiescent collection is moving by default"
         );
         assert!(
-            next_young_gc_is_guaranteed_non_moving(true, false, false, false, false, false),
-            "live JIT frames require the default non-moving collector",
+            next_young_gc_is_guaranteed_non_moving(true, false, false, false, false),
+            "live JIT frames without moving-young require the non-moving collector",
         );
         assert!(
-            next_young_gc_is_guaranteed_non_moving(false, false, true, false, false, false),
+            next_young_gc_is_guaranteed_non_moving(false, false, true, false, false),
             "a JIT allocation helper has a compiled frame for root scanning",
         );
+        // arch-2026-07-26: moving-young alone is now sufficient. There is no
+        // second `CRATONVM_ALLOW_MOVING_YOUNG` opt-in to also satisfy — the
+        // per-cycle coverage proof, not a flag, decides at collection time.
         assert!(
-            !next_young_gc_is_guaranteed_non_moving(true, false, true, true, true, false),
-            "explicitly allowed moving-young must preserve copy headroom",
+            !next_young_gc_is_guaranteed_non_moving(true, false, true, true, false),
+            "moving-young must preserve Cheney copy headroom without a second opt-in",
         );
         assert!(
-            !next_young_gc_is_guaranteed_non_moving(true, false, true, false, false, true),
+            !next_young_gc_is_guaranteed_non_moving(true, true, true, true, false),
+            "moving-young sizes for the copy even with an unregistered frame flagged \
+             (that cycle may fall back, but the trigger must not assume it will)",
+        );
+        assert!(
+            !next_young_gc_is_guaranteed_non_moving(true, false, true, false, true),
             "the diagnostic forced-moving path must preserve copy headroom",
         );
     }
@@ -11875,13 +11931,26 @@ mod tests {
         }
     }
 
-    /// Non-moving young-gen sweep (the JIT-frames-active path).
+    /// Non-moving young-gen sweep — the JIT-frames-active path **when
+    /// moving-young is not in effect**.
     ///
-    /// With `gc_quiescence` active the collector must run a non-moving
-    /// mark-sweep: survivors keep their exact addresses, dead objects
-    /// are reclaimed into the free list, and a subsequent allocation
-    /// reuses a reclaimed hole. This is the fix for the
-    /// "GC skipped: JIT frames are active → OOM" blocker.
+    /// The original NEW-1.5 contract, unchanged: with no rewritable root map a
+    /// live JIT frame's roots are conservative, so the collector must not
+    /// relocate. Survivors keep their exact addresses, dead objects are
+    /// reclaimed into the free list, and a subsequent allocation reuses a
+    /// reclaimed hole. This is the fix for the "GC skipped: JIT frames are
+    /// active → OOM" blocker.
+    ///
+    /// arch-2026-07-26 (`moving-young-precise-roots`) narrowed the
+    /// precondition. This used to be what happened for a live JIT frame
+    /// *unconditionally*: `is_active()` was ORed into the divert decision
+    /// behind a second opt-in (`CRATONVM_ALLOW_MOVING_YOUNG`) that nobody set,
+    /// so it fired even when moving-young had been explicitly requested. It is
+    /// now conditional on moving-young being off, which is the state this
+    /// test's (unpublished ⇒ `gc_flags()`) gate supplies. The complementary
+    /// direction — live JIT frame, moving-young on, coverage proven, collector
+    /// actually copies — is
+    /// `moving_young_copies_with_live_jit_frame_and_proven_coverage` below.
     #[test]
     fn non_moving_sweep_when_jit_active() {
         let heap = small_gen_heap();
@@ -11899,8 +11968,10 @@ mod tests {
         let b_ptr = obj_b.as_ptr();
         let dead_ptr = dead.as_ptr();
 
-        // Simulate "a JIT frame is active" so the collector takes the
+        // Simulate "a JIT frame is active". With moving-young NOT in effect
+        // (this test thread never publishes it) the collector must take the
         // non-moving path. The guard is paired with a `leave()` below.
+        crate::gc_quiescence::publish_moving_young_enabled(false);
         crate::gc_quiescence::enter();
         assert!(crate::gc_quiescence::is_active());
 
@@ -12046,16 +12117,87 @@ mod tests {
         );
     }
 
-    /// A5 fix regression: the `unregistered_jit_frame_on_stack` flag must force
-    /// the same NON-MOVING sweep as `is_active()`. The VM root scan sets it when
-    /// it finds a guard-less JIT frame on the native stack (the compiled
-    /// entry-point `main`); without the non-moving path the moving collector
-    /// would relocate that frame's conservatively-marked roots and leave its raw
-    /// stack slots stale (the bintrees `main`-compiled corruption). Here the flag
-    /// is set directly (no JIT-quiescence `enter()`), and the collector must keep
-    /// survivors in place exactly as in `non_moving_sweep_when_jit_active`.
+    /// A5 fix regression, **strengthened for moving-young**: the
+    /// `unregistered_jit_frame_on_stack` flag must force the NON-MOVING sweep
+    /// regardless of whether moving-young is in effect.
+    ///
+    /// The VM root scan sets it when it finds a guard-less JIT frame on the
+    /// native stack (the compiled entry-point `main` while a clinit /
+    /// interpreted callee runs). Such a frame is not reachable from the JIT
+    /// entry chain, so it publishes no shadow homes and no per-safepoint oop
+    /// map: its oops can be conservatively MARKED but never rewritten. Moving
+    /// behind it relocates them and leaves the raw register/spill slots stale —
+    /// the bintrees `main`-compiled corruption.
+    ///
+    /// arch-2026-07-26 (`moving-young-precise-roots`): before this change the
+    /// flag only participated via `has_conservative_roots`, which the
+    /// moving-young branch bypassed. It is now also an explicit
+    /// coverage-incompleteness condition, so the assertion runs TWICE — once
+    /// with moving-young off (the historical contract) and once with it
+    /// published on (the new obligation).
     #[test]
     fn non_moving_sweep_when_unregistered_jit_frame_on_stack() {
+        for moving_young in [false, true] {
+            let heap = small_gen_heap();
+            let monitors = NoOpMonitors;
+
+            let obj_a = heap.alloc_object(ClassId::new(1), 1);
+            let obj_b = heap.alloc_object(ClassId::new(2), 1);
+            heap.set_field(obj_a, 0, Value::Object(Some(obj_b)));
+            heap.set_field(obj_b, 0, Value::Int(4242));
+            let a_ptr = obj_a.as_ptr();
+            let b_ptr = obj_b.as_ptr();
+
+            crate::gc_quiescence::publish_moving_young_enabled(moving_young);
+            crate::gc_quiescence::begin_moving_young_coverage_cycle();
+            crate::gc_quiescence::clear_force_non_moving_jit_roots();
+
+            // No JIT quiescence — only the unregistered-frame flag is set,
+            // exactly as `conservative_roots::scan_active_jit_frames` does on
+            // detection.
+            assert!(!crate::gc_quiescence::is_active());
+            crate::gc_quiescence::set_unregistered_jit_frame_on_stack();
+            assert!(crate::gc_quiescence::unregistered_jit_frame_on_stack());
+
+            let mut roots = vec![obj_a];
+            let result = heap.collect_garbage(&stw(), &mut roots, &monitors);
+
+            crate::gc_quiescence::clear_unregistered_jit_frame_on_stack();
+            crate::gc_quiescence::publish_moving_young_enabled(false);
+
+            // Non-moving: nothing copied, empty pointer map, addresses
+            // UNCHANGED.
+            assert_eq!(
+                result.stats.objects_copied, 0,
+                "unregistered-JIT-frame flag must select the non-moving sweep \
+                 (moving_young={moving_young})"
+            );
+            assert!(result.pointer_map.is_empty());
+            assert_eq!(roots[0].as_ptr(), a_ptr, "survivor must not move");
+            assert_eq!(obj_a.as_ptr(), a_ptr);
+            match heap.get_field(obj_a, 0) {
+                Value::Object(Some(b)) => {
+                    assert_eq!(b.as_ptr(), b_ptr, "B must not move");
+                    assert_eq!(heap.get_field(b, 0).as_int(), Some(4242));
+                }
+                other => panic!("A's field should still reference B, got {other:?}"),
+            }
+        }
+    }
+
+    /// The contract this whole item exists to establish: with a LIVE JIT frame,
+    /// healthy generations and a proven complete rewritable root map, the young
+    /// collector must actually **copy**.
+    ///
+    /// The direct inverse of `non_moving_sweep_when_jit_active`. Under the old
+    /// code it was unreachable at any single env-var setting: `is_active()` was
+    /// ORed into the divert decision behind `CRATONVM_ALLOW_MOVING_YOUNG`, so
+    /// even with moving-young explicitly requested the collector answered
+    /// "compaction deferred" and ran the free-list sweep. If this test ever
+    /// starts failing with `objects_copied == 0`, the young generation has
+    /// silently stopped being a copying collector again.
+    #[test]
+    fn moving_young_copies_with_live_jit_frame_and_proven_coverage() {
         let heap = small_gen_heap();
         let monitors = NoOpMonitors;
 
@@ -12064,34 +12206,130 @@ mod tests {
         heap.set_field(obj_a, 0, Value::Object(Some(obj_b)));
         heap.set_field(obj_b, 0, Value::Int(4242));
         let a_ptr = obj_a.as_ptr();
-        let b_ptr = obj_b.as_ptr();
 
-        // No JIT quiescence — only the unregistered-frame flag is set, exactly
-        // as `conservative_roots::scan_active_jit_frames` does on detection.
-        assert!(!crate::gc_quiescence::is_active());
-        crate::gc_quiescence::set_unregistered_jit_frame_on_stack();
-        assert!(crate::gc_quiescence::unregistered_jit_frame_on_stack());
+        // The codegen publishes "moving-young is in effect" (in production via
+        // `conservative_roots::moving_young_enabled` → `x64`). Then a clean
+        // coverage cycle: nothing unproven, no unregistered frame, no forced
+        // conservative roots.
+        crate::gc_quiescence::publish_moving_young_enabled(true);
+        crate::gc_quiescence::begin_moving_young_coverage_cycle();
+        crate::gc_quiescence::clear_force_non_moving_jit_roots();
+        crate::gc_quiescence::clear_unregistered_jit_frame_on_stack();
+
+        let fallbacks_before = crate::gc_quiescence::moving_young_coverage_fallback_count();
+        let cycles_before = crate::gc_quiescence::moving_young_cycle_count();
+
+        crate::gc_quiescence::enter();
+        assert!(crate::gc_quiescence::is_active());
 
         let mut roots = vec![obj_a];
         let result = heap.collect_garbage(&stw(), &mut roots, &monitors);
 
-        crate::gc_quiescence::clear_unregistered_jit_frame_on_stack();
+        crate::gc_quiescence::leave();
+        crate::gc_quiescence::publish_moving_young_enabled(false);
 
-        // Non-moving: nothing copied, empty pointer map, addresses UNCHANGED.
         assert_eq!(
-            result.stats.objects_copied, 0,
-            "unregistered-JIT-frame flag must select the non-moving sweep"
+            result.stats.objects_copied, 2,
+            "moving-young with a proven root map must run the Cheney copy even \
+             though a JIT frame is live — this is the whole point of the feature",
         );
-        assert!(result.pointer_map.is_empty());
-        assert_eq!(roots[0].as_ptr(), a_ptr, "survivor must not move");
-        assert_eq!(obj_a.as_ptr(), a_ptr);
-        match heap.get_field(obj_a, 0) {
+        assert_ne!(
+            roots[0].as_ptr(),
+            a_ptr,
+            "a copying collection must relocate the survivor and rewrite the root",
+        );
+        assert_eq!(
+            crate::gc_quiescence::moving_young_coverage_fallback_count(),
+            fallbacks_before,
+            "a proven cycle must not record a coverage fallback",
+        );
+        assert_eq!(
+            crate::gc_quiescence::moving_young_cycle_count(),
+            cycles_before + 1,
+            "the moving-under-live-JIT cycle must be counted, so \"is the young \
+             generation actually copying?\" stays answerable at runtime",
+        );
+
+        // The relocated graph is intact through the rewritten root.
+        match heap.get_field(roots[0], 0) {
             Value::Object(Some(b)) => {
-                assert_eq!(b.as_ptr(), b_ptr, "B must not move");
                 assert_eq!(heap.get_field(b, 0).as_int(), Some(4242));
             }
             other => panic!("A's field should still reference B, got {other:?}"),
         }
+    }
+
+    /// The mandatory safety net: moving-young in effect, JIT frame live, but a
+    /// live frame could not prove its rewritable map. That cycle MUST fall back
+    /// to the non-moving sweep and MUST record the fallback (which warns by
+    /// default), so a regression to permanent non-moving mode is visible.
+    #[test]
+    fn moving_young_falls_back_and_counts_when_coverage_is_unproven() {
+        let heap = small_gen_heap();
+        let monitors = NoOpMonitors;
+
+        let obj_a = heap.alloc_object(ClassId::new(1), 1);
+        let obj_b = heap.alloc_object(ClassId::new(2), 1);
+        heap.set_field(obj_a, 0, Value::Object(Some(obj_b)));
+        heap.set_field(obj_b, 0, Value::Int(4242));
+        let a_ptr = obj_a.as_ptr();
+
+        crate::gc_quiescence::publish_moving_young_enabled(true);
+        crate::gc_quiescence::begin_moving_young_coverage_cycle();
+        crate::gc_quiescence::clear_force_non_moving_jit_roots();
+        crate::gc_quiescence::clear_unregistered_jit_frame_on_stack();
+        crate::gc_quiescence::mark_moving_young_coverage_incomplete_because(
+            crate::gc_quiescence::incomplete_reason::CROSS_THREAD_JIT_PEER,
+        );
+
+        let fallbacks_before = crate::gc_quiescence::moving_young_coverage_fallback_count();
+
+        crate::gc_quiescence::enter();
+        let mut roots = vec![obj_a];
+        let result = heap.collect_garbage(&stw(), &mut roots, &monitors);
+        crate::gc_quiescence::leave();
+
+        crate::gc_quiescence::begin_moving_young_coverage_cycle();
+        crate::gc_quiescence::publish_moving_young_enabled(false);
+
+        assert_eq!(
+            result.stats.objects_copied, 0,
+            "an unproven coverage cycle must never relocate",
+        );
+        assert_eq!(roots[0].as_ptr(), a_ptr, "survivor must not move");
+        assert!(
+            crate::gc_quiescence::moving_young_coverage_fallback_count() > fallbacks_before,
+            "the fallback must be counted so a silent slide back to non-moving \
+             mode is impossible",
+        );
+    }
+
+    /// `force_non_moving_jit_roots` (set by the root gatherer's OSR guard) is
+    /// the other half of the fallback and must divert on its own.
+    #[test]
+    fn moving_young_falls_back_on_forced_non_moving_jit_roots() {
+        let heap = small_gen_heap();
+        let monitors = NoOpMonitors;
+
+        let obj_a = heap.alloc_object(ClassId::new(1), 1);
+        heap.set_field(obj_a, 0, Value::Int(7));
+        let a_ptr = obj_a.as_ptr();
+
+        crate::gc_quiescence::publish_moving_young_enabled(true);
+        crate::gc_quiescence::begin_moving_young_coverage_cycle();
+        crate::gc_quiescence::clear_unregistered_jit_frame_on_stack();
+        crate::gc_quiescence::set_force_non_moving_jit_roots();
+
+        crate::gc_quiescence::enter();
+        let mut roots = vec![obj_a];
+        let result = heap.collect_garbage(&stw(), &mut roots, &monitors);
+        crate::gc_quiescence::leave();
+
+        crate::gc_quiescence::clear_force_non_moving_jit_roots();
+        crate::gc_quiescence::publish_moving_young_enabled(false);
+
+        assert_eq!(result.stats.objects_copied, 0);
+        assert_eq!(roots[0].as_ptr(), a_ptr, "survivor must not move");
     }
 
     #[test]

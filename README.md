@@ -21,7 +21,10 @@ install, no `rt.jar`, one self-contained binary.
   **no annotations and no API changes**, and beat TornadoVM on
   division-dominated kernels (see below).
 - **Generational GC** — young/old generations, card table, selective
-  promotion; opt-in region-based G1 (`-XX:+UseG1GC`).
+  promotion. The default young collection is a **non-moving sweep**; the
+  moving/compacting young gen is opt-in (`CRATONVM_MOVING_YOUNG`, off by
+  default — see [ARCHITECTURE.md](ARCHITECTURE.md#memory-gc-crate)). Opt-in
+  region-based G1 (`-XX:+UseG1GC`).
 - **Real frameworks run** — Spring, Spring Boot, Tomcat, Hibernate, and H2
   boot and pass large test suites.
 - **Memory-safe by construction** — the interpreter, GC, and JIT are Rust;

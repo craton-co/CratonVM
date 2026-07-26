@@ -359,8 +359,7 @@ pub fn shadow_stack_enabled() -> bool {
     })
 }
 
-/// Whether the **default moving / compacting young generation**
-/// (`CRATONVM_MOVING_YOUNG`) is enabled. Cached on first read.
+/// Whether the **moving / compacting young generation** is in effect.
 ///
 /// When on: (1) the JIT publishes a *complete* rewritable precise root map at
 /// each safepoint (see `cratonvm_jit::x64::moving_young_enabled`), (2) the
@@ -368,13 +367,70 @@ pub fn shadow_stack_enabled() -> bool {
 /// needs no conservative backstop, and mixing a conservatively-marked slot with a
 /// precisely-relocated object would corrupt), and (3) `gen_heap` runs the moving
 /// (Cheney) young collection even while JIT frames are live instead of diverting
-/// to the non-moving sweep. Off by default; gated for validation against the
-/// bt18 = 68332206 invariant. See `docs/feature-designs/default-moving-young-gen.md`.
+/// to the non-moving sweep.
+///
+/// # This is an INTERLOCK, not an independent policy decision (arch-2026-07-26)
+///
+/// This used to be its own `std::env::var_os("CRATONVM_MOVING_YOUNG")` read —
+/// the second of **three** copies of the same predicate, alongside
+/// `cratonvm_jit::x64::moving_young_enabled` (codegen) and
+/// `cratonvm_gc::gc_quiescence::moving_young_enabled` (collector). Three
+/// independent reads of one safety-critical switch mean the default cannot be
+/// flipped safely: flipping the collector without the codegen relocates objects
+/// whose only home is a JIT register that no shadow push ever recorded, and
+/// flipping the root gatherer without the codegen suppresses the conservative
+/// backstop with nothing precise replacing it.
+///
+/// The effective gate is the **conjunction** of two questions that are answered
+/// in different crates:
+///
+///   * *Can* we move? — `cratonvm_jit::x64::moving_young_enabled()`. Only the
+///     codegen can physically emit the shadow push/reload and the
+///     per-safepoint `moving_young_coverage_complete` bit. If it says no,
+///     nothing anywhere else can make relocation safe.
+///   * *Should* we move? — `cratonvm_types::flags().gc.moving_young`, the typed
+///     config (opt-OUT `CRATONVM_NO_MOVING_YOUNG` over
+///     `flags::DEFAULT_MOVING_YOUNG`).
+///
+/// AND-ing them is fail-safe in both directions and closes a live gap: today
+/// `x64` still parses `CRATONVM_MOVING_YOUNG` itself, so without the AND a user
+/// setting `CRATONVM_NO_MOVING_YOUNG` alongside a stale `CRATONVM_MOVING_YOUNG`
+/// would be silently ignored on the codegen side.
+///
+/// The result is then published to the GC crate, which cannot call into the JIT
+/// crate (`cratonvm-gc` has no `cratonvm-jit` dependency, only a
+/// dev-dependency). So the collector always relocates against the same answer
+/// the codegen compiled for, and no skew between the three layers is
+/// representable. Flipping the default becomes a one-constant change in
+/// `cratonvm_types::flags::DEFAULT_MOVING_YOUNG` once `x64` reads that field
+/// instead of the raw variable — see that constant's docs for the exact patch.
 #[inline]
 pub fn moving_young_enabled() -> bool {
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("CRATONVM_MOVING_YOUNG").is_some())
+    *ENABLED.get_or_init(|| {
+        // `x64::moving_young_enabled` is itself a `OnceLock`, and `flags()`
+        // latches on first use, so this resolves once for the process.
+        let on = cratonvm_jit::x64::moving_young_enabled()
+            && cratonvm_types::flags().gc.moving_young;
+        // Hand the collector the same answer. Before this publish the GC uses
+        // `gc_flags().moving_young` on its own, which is only reachable in a
+        // process with no JIT at all — where there are no JIT frames and moving
+        // is unconditionally safe.
+        cratonvm_gc::gc_quiescence::publish_moving_young_enabled(on);
+        on
+    })
+}
+
+/// Re-publish the moving-young decision to the GC crate.
+///
+/// Cheap (one store behind an already-resolved `OnceLock`) and called from the
+/// root gatherer so the collector's view is refreshed on the path of every
+/// collection, even if the first `moving_young_enabled()` call happened on a
+/// different thread than the one that will collect.
+#[inline]
+pub fn publish_moving_young_gate() {
+    let _ = moving_young_enabled();
 }
 
 /// Returns true when moving-young must fall back to the conservative
@@ -1091,6 +1147,9 @@ pub fn refresh_moving_young_coverage_for_current_thread() -> bool {
                 if dbg {
                     eprintln!("[moving-young-coverage] incomplete: JIT entry has no precise map");
                 }
+                cratonvm_gc::gc_quiescence::mark_moving_young_coverage_incomplete_because(
+                    cratonvm_gc::gc_quiescence::incomplete_reason::NO_PRECISE_MAP,
+                );
                 complete = false;
                 continue;
             };
@@ -1110,6 +1169,9 @@ pub fn refresh_moving_young_coverage_for_current_thread() -> bool {
                         cm.sp_id_slot_off,
                     );
                 }
+                cratonvm_gc::gc_quiescence::mark_moving_young_coverage_incomplete_because(
+                    cratonvm_gc::gc_quiescence::incomplete_reason::MISSING_EXACT_RBP,
+                );
                 complete = false;
                 continue;
             }
@@ -1120,6 +1182,9 @@ pub fn refresh_moving_young_coverage_for_current_thread() -> bool {
                         exact_rbp
                     );
                 }
+                cratonvm_gc::gc_quiescence::mark_moving_young_coverage_incomplete_because(
+                    cratonvm_gc::gc_quiescence::incomplete_reason::ACTIVE_FRAME_MAP,
+                );
                 complete = false;
             }
 
@@ -1150,6 +1215,9 @@ pub fn refresh_moving_young_coverage_for_current_thread() -> bool {
                             parent_rbp
                         );
                     }
+                    cratonvm_gc::gc_quiescence::mark_moving_young_coverage_incomplete_because(
+                        cratonvm_gc::gc_quiescence::incomplete_reason::PARENT_FRAME_MAP,
+                    );
                     complete = false;
                 }
                 if parent_rbp <= child_rbp {
@@ -1160,14 +1228,43 @@ pub fn refresh_moving_young_coverage_for_current_thread() -> bool {
         }
     });
 
+    // A5 — unregistered JIT frame on the native stack.
+    //
+    // arch-2026-07-26 (`moving-young-precise-roots`): this probe used to be
+    // SKIPPED entirely under moving-young, on the argument that "in precise
+    // moving-young mode every actual compiled transition is registered by
+    // JitEntryGuard and checked above". That argument is an assertion, not a
+    // proof, and it was load-bearing for heap safety in exactly the direction
+    // where being wrong is fatal:
+    //
+    //   * A JIT frame that is live WITHOUT a `JitEntryGuard` is not in the
+    //     chain, so the loop above never examines it. It publishes no shadow
+    //     homes and no per-safepoint oop map, so nothing can rewrite its
+    //     register/spill slots.
+    //   * With the probe skipped, `complete` stayed `true`, `roots.rs` took the
+    //     precise-only branch (suppressing the conservative backstop that would
+    //     at least have MARKED the frame's oops), and `gen_heap` ran the moving
+    //     cycle — relocating objects out from under raw slots nobody rewrites.
+    //     That is the canonical `main`-compiled bintrees corruption, re-armed.
+    //   * The condition is known to be reachable: the whole A5 fix exists
+    //     because it was observed (`Vm::invoke` → compiled app `main`, live
+    //     while a clinit / interpreted callee triggers a GC).
+    //
+    // The probe therefore runs under moving-young as well, and a hit is treated
+    // as an incomplete coverage proof (divert to the non-moving sweep) AND as
+    // the A5 conservative-root condition, exactly as on the legacy path.
+    //
+    // The original skip was motivated by UTILITY, not soundness: the probe is a
+    // raw-word scan, not a frame walk, so cached function pointers and JIT
+    // helper arguments that happen to point inside generated code read as
+    // return PCs and fabricate a frame. Over-detection costs moving cycles; it
+    // never costs correctness. Reducing that false-positive rate (so
+    // moving-young engages more often) is a real follow-up and is specified in
+    // the design doc — it belongs in `native_stack_has_jit_frame` /
+    // return-address validation, or in registering the entry-point transition,
+    // NOT in suppressing the check.
     #[cfg(any(target_os = "windows", target_os = "linux"))]
-    // In precise moving-young mode every actual compiled transition is
-    // registered by JitEntryGuard and checked above.  A raw native-stack scan
-    // is not a frame walk: cached function pointers and JIT helper arguments
-    // are ordinary stack data that frequently point *inside* generated code.
-    // Treating them as return PCs fabricated an unregistered frame on nearly
-    // every root snapshot and permanently disabled precise reclamation.
-    if !moving_young_enabled() && cratonvm_jit::jit_code_range_count() > 0 {
+    if cratonvm_jit::jit_code_range_count() > 0 {
         let cover_hi = JIT_ENTRY_CHAIN
             .with(|c| c.borrow().iter().map(|e| e.entry_sp).max())
             .unwrap_or(scanner_sp);
@@ -1180,12 +1277,75 @@ pub fn refresh_moving_young_coverage_for_current_thread() -> bool {
                 );
             }
             cratonvm_gc::gc_quiescence::set_unregistered_jit_frame_on_stack();
+            cratonvm_gc::gc_quiescence::mark_moving_young_coverage_incomplete_because(
+                cratonvm_gc::gc_quiescence::incomplete_reason::UNREGISTERED_JIT_FRAME,
+            );
             complete = false;
         }
     }
 
     if !complete {
         cratonvm_gc::gc_quiescence::mark_moving_young_coverage_incomplete();
+    }
+    complete
+}
+
+/// Pure predicate behind [`other_thread_in_jit`], split out so it is testable
+/// without racing the process-global depth counter.
+#[inline]
+const fn peer_jit_frames_present(global_depth: usize, local_depth: usize) -> bool {
+    global_depth > local_depth
+}
+
+/// Whether some OTHER thread holds live JIT frames that this thread's scan
+/// cannot account for.
+///
+/// `GLOBAL_JIT_DEPTH` counts every registered JIT entry process-wide;
+/// `current_thread_jit_depth()` counts this thread's. A positive difference
+/// means at least one peer is inside compiled code right now.
+#[inline]
+pub fn other_thread_in_jit() -> bool {
+    peer_jit_frames_present(
+        GLOBAL_JIT_DEPTH.load(Ordering::Acquire),
+        current_thread_jit_depth(),
+    )
+}
+
+/// Collection-authoritative moving-young coverage refresh.
+///
+/// [`refresh_moving_young_coverage_for_current_thread`] proves (or disproves)
+/// the obligation for the frames THIS thread owns. It is called both by each
+/// mutator's root-snapshot deposit — where per-thread scope is exactly right —
+/// and by the collection's own root gather, where it is **not sufficient**:
+/// a collection must account for every live JIT frame in the process, not just
+/// the initiator's.
+///
+/// The cross-thread obligations are discharged elsewhere for the two cases that
+/// have machinery: a cooperatively-parked peer publishes its shadow values into
+/// its `root_snapshot` and remaps its own shadow stack on resume, and an
+/// OS-frozen / helper-window peer is scanned conservatively and marks the cycle
+/// incomplete. Neither mechanism, however, gives the *initiator* a positive
+/// proof at the moment it decides whether to relocate — a peer whose deposit is
+/// stale, or which entered JIT after its last deposit, is simply not
+/// represented. Since a peer's JIT registers and frame slots are not rewritable
+/// by this collection, "cannot prove" must mean "do not move".
+///
+/// So: when any peer is in JIT, this cycle is treated as unproven. That is
+/// deliberately conservative — it means moving-young engages only on cycles
+/// where the initiator is the sole thread in compiled code — and it is the
+/// honest state of the proof until a cross-thread coverage handshake exists
+/// (specified in `docs/internal/arch-2026-07-26/moving-young-precise-roots.md`).
+/// Over-diverting costs compaction; under-diverting costs the heap.
+pub fn refresh_moving_young_coverage_for_collection() -> bool {
+    if !moving_young_enabled() {
+        return true;
+    }
+    let mut complete = refresh_moving_young_coverage_for_current_thread();
+    if other_thread_in_jit() {
+        cratonvm_gc::gc_quiescence::mark_moving_young_coverage_incomplete_because(
+            cratonvm_gc::gc_quiescence::incomplete_reason::CROSS_THREAD_JIT_PEER,
+        );
+        complete = false;
     }
     complete
 }
@@ -1442,12 +1602,15 @@ pub fn scan_active_jit_frames(heap: &VmHeap, out: &mut Vec<ObjectRef>) {
     #[cfg(any(target_os = "windows", target_os = "linux"))]
     {
         let code_ranges = cratonvm_jit::jit_code_range_count();
-        // See the matching precise-moving exemption in
-        // `refresh_moving_young_coverage_for_current_thread`: the raw-word
-        // probe is useful only for the conservative fallback and cannot
-        // distinguish a return address from an interior code pointer stored
-        // as data.
-        if !moving_young_enabled() && code_ranges > 0 {
+        // arch-2026-07-26 (`moving-young-precise-roots`): this used to carry a
+        // `!moving_young_enabled()` exemption matching the one in
+        // `refresh_moving_young_coverage_for_current_thread`. Both are gone.
+        // This function only runs at all when the precise-only path was NOT
+        // taken (see `roots.rs`), i.e. when something already needs the
+        // conservative backstop — and in that situation an unregistered frame's
+        // oops MUST be marked, or the non-moving sweep reclaims them. Skipping
+        // the probe here made the fallback path itself lossy under moving-young.
+        if code_ranges > 0 {
             let cover_hi = JIT_ENTRY_CHAIN
                 .with(|c| c.borrow().iter().map(|e| e.entry_sp).max())
                 .unwrap_or(scanner_sp);
@@ -1515,6 +1678,11 @@ pub fn scan_active_jit_frames(heap: &VmHeap, out: &mut Vec<ObjectRef>) {
                         // once something is actually found.
                         scan_one_frame(search_lo, high, heap, out);
                         cratonvm_gc::gc_quiescence::set_unregistered_jit_frame_on_stack();
+                        // The frame's oops are now MARKED but still not
+                        // rewritable, so the cycle cannot be a moving one.
+                        cratonvm_gc::gc_quiescence::mark_moving_young_coverage_incomplete_because(
+                            cratonvm_gc::gc_quiescence::incomplete_reason::UNREGISTERED_JIT_FRAME,
+                        );
                     } else {
                         UNREG_JIT_VERIFIED_LO.with(|v| v.set((search_lo, code_ranges)));
                     }
@@ -2413,6 +2581,81 @@ mod tests {
         assert!(any_thread_in_jit());
         drop(_g);
         assert_eq!(current_thread_jit_depth(), local_before);
+    }
+
+    /// The moving-young gate must be ONE decision that all three layers see,
+    /// not three independently-parsed ones that happen to agree.
+    ///
+    /// Effective gate = codegen *can* AND config *wants*; the collector then
+    /// gets that answer published to it. If this ever fails, a default flip on
+    /// one layer has re-introduced the skew that makes moving-young unsound.
+    #[test]
+    fn moving_young_gate_is_a_single_decision_across_all_three_layers() {
+        let expected =
+            cratonvm_jit::x64::moving_young_enabled() && cratonvm_types::flags().gc.moving_young;
+        assert_eq!(
+            moving_young_enabled(),
+            expected,
+            "the root gatherer must never decide independently — suppressing the \
+             conservative backstop while the codegen emitted no precise map is \
+             silent heap corruption",
+        );
+        // Reading the gate publishes it; the collector must now agree too.
+        publish_moving_young_gate();
+        assert_eq!(
+            cratonvm_gc::gc_quiescence::moving_young_enabled(),
+            expected,
+            "the collector must relocate only when the codegen actually emitted \
+             a rewritable root map AND the config asked for compaction",
+        );
+    }
+
+    /// The codegen gate is a veto the config cannot override.
+    ///
+    /// `jit/src/x64.rs` still parses `CRATONVM_MOVING_YOUNG` itself rather than
+    /// reading `flags().gc.moving_young`, so a config-side default flip alone
+    /// must NOT be able to switch the collector on. Guards the exact mistake
+    /// that would turn a one-line flip into heap corruption.
+    #[test]
+    fn codegen_gate_vetoes_moving_young_regardless_of_config() {
+        if !cratonvm_jit::x64::moving_young_enabled() {
+            assert!(
+                !moving_young_enabled(),
+                "no shadow push/reload was ever emitted, so nothing may relocate \
+                 behind a JIT frame no matter what the typed config says",
+            );
+        }
+    }
+
+    /// With moving-young off (the state this gate is in until
+    /// `flags::DEFAULT_MOVING_YOUNG` flips and the codegen reads it), the
+    /// collection-authoritative refresh is a no-op that reports "proven" — the
+    /// coverage machinery must not impose cost or verdicts on the legacy path.
+    #[test]
+    fn collection_coverage_refresh_is_inert_when_moving_young_is_off() {
+        if moving_young_enabled() {
+            return; // validating a moving-young build; nothing to assert here
+        }
+        assert!(refresh_moving_young_coverage_for_collection());
+        assert!(refresh_moving_young_coverage_for_current_thread());
+    }
+
+    /// `other_thread_in_jit()` is the cross-thread proof obligation's trigger.
+    /// The initiator's OWN frames are proven by its own scan and must never
+    /// trip it; only depth the local chain cannot account for may.
+    #[test]
+    fn peer_detection_ignores_this_threads_own_jit_frames() {
+        assert!(!peer_jit_frames_present(0, 0), "quiescent process");
+        assert!(
+            !peer_jit_frames_present(3, 3),
+            "all live JIT frames belong to this thread — its own scan proves them",
+        );
+        assert!(
+            peer_jit_frames_present(4, 3),
+            "depth this thread's chain cannot account for means a peer is in JIT, \
+             and a peer's registers/frame slots are not rewritable by this cycle",
+        );
+        assert!(peer_jit_frames_present(1, 0), "a peer while we are quiescent");
     }
 
     fn dummy_compiled_method() -> cratonvm_jit::CompiledMethod {
