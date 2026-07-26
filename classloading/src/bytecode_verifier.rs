@@ -186,11 +186,18 @@ fn verify_method(
     // verification. The JIT consumes the same bounded-cache entry, so verifier
     // and compiler cannot disagree about instruction widths or branch
     // boundaries.
-    let _verified = verified_code(bytecode).map_err(|e| LinkageError::VerifyError {
+    let verified = verified_code(bytecode).map_err(|e| LinkageError::VerifyError {
         class_name: class_name.to_string(),
         method_name: method.name.to_string(),
         message: format!("failed to build verified code: {e}"),
     })?;
+    // TYPE MAPS lean on two guarantees this canonical decode establishes, so
+    // they are asserted here rather than re-derived downstream:
+    //   1. `code.len() <= 65535`, so every recorded pc fits a `u16` (the
+    //      `PcTable::U32` widening is defence in depth, not a live path).
+    //   2. every branch target is an instruction boundary, so no row in the
+    //      pc table can describe a mid-instruction offset.
+    let insn_count = verified.instructions().len();
 
     // Find the StackMapTable attribute within the Code attribute
     let stack_map_table = find_stack_map_table(&code_attr.attributes);
@@ -303,8 +310,8 @@ fn verify_method(
     // exception-handler frame has been adopted, so the recorded state is the
     // one the interpreter/GC would actually observe at that pc.
     let mut type_maps = MethodTypeMapsBuilder::new(code_attr.max_locals, code_attr.max_stack);
-    // Instruction density: real bytecode averages ~2 bytes/instruction.
-    type_maps.reserve(bytecode.len() / 2 + 1);
+    // Exact, not estimated: `verified_code` already counted the instructions.
+    type_maps.reserve(insn_count);
     // Cleared whenever the walk skips or truncates a region, which denies
     // `safe_for_fast_path` (the unchecked interpreter handlers need every
     // executed instruction proven, not merely most of them).
