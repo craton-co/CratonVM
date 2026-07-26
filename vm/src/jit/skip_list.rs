@@ -2014,38 +2014,28 @@ fn should_skip_jit_internal(
         {
             return Some(SkipReason::RustJvmTestFixture);
         }
-        // SPB.9d (Session 117) — eureka-server boot SEGFAULTs deep in
-        // Spring's BeanInfo/ExtendedBeanInfo introspection. Spring
-        // introspects every bean class via `java/beans/Introspector`,
-        // which delegates into `com/sun/beans/introspect/MethodInfo`
-        // and `ClassInfo` and sorts methods/properties via
-        // comparators. Frame trace + CRATONVM_DBG_JIT_DISPATCH=1 show
-        // the very last hot JIT-compiled callees on the crash path are
-        // `MethodInfo$MethodOrder.compare`, `String.compareTo`,
-        // `Method.getName`, `Arrays.hashCode`, `Method.toString`,
-        // and `StringJoiner.<init>` — i.e. a JIT-compiled comparator
-        // chain driven by `java/util/Arrays.sort`. With JIT disabled
-        // the run terminates cleanly with the parallel agent's
-        // `Attribute 'type' not found` (rc=1, no segfault); with JIT
-        // enabled the comparator returns inconsistent ordering,
-        // corrupting transient sort state and SEGFAULTing in a
-        // downstream `Method.toString` -> `StringJoiner` allocation.
-        // Same allocate-then-putfield archetype as NEW-1.3 / SPB.1.
-        //
-        // Blanket-ban the JDK BeanInfo introspection package and the
-        // `java/beans/` reflection-driven sort callers. Liftable via
-        // `CRATONVM_JIT_ALLOW_PACKAGES=com/sun/beans/,java/beans/`
-        // when the underlying allocate-then-putfield miscompile is
-        // root-caused.
-        if class_name.starts_with("com/sun/beans/")
-            && !package_allowed("com/sun/beans/", allow_packages)
-        {
-            return Some(SkipReason::RustJvmTestFixture);
-        }
-        if class_name.starts_with("java/beans/") && !package_allowed("java/beans/", allow_packages)
-        {
-            return Some(SkipReason::RustJvmTestFixture);
-        }
+        // SPB.9d -- REMOVED 2026-07-26. Originally (Session 117):
+        // eureka-server boot SEGFAULTed deep in Spring's BeanInfo
+        // introspection -- `java/beans/Introspector` delegates into
+        // `com/sun/beans/introspect/MethodInfo`/`ClassInfo`, sorting
+        // methods/properties via a comparator chain
+        // (`MethodInfo$MethodOrder.compare` -> `String.compareTo` ->
+        // `Method.getName`/`toString` -> `StringJoiner.<init>`) driven by
+        // `java/util/Arrays.sort`; under JIT the comparator returned
+        // inconsistent ordering, corrupting transient sort state and
+        // SEGFAULTing in the downstream StringJoiner allocation -- the
+        // same allocate-then-putfield archetype as NEW-1.3/SPB.1.
+        // Re-verified with a standalone, pure-JDK probe (no external jar
+        // needed -- `BeanIntrospectorProbe.java`) driving
+        // `Introspector.getBeanInfo(Class)` (cache flushed every call to
+        // force a real re-sort each time) over a 13-method/10-property
+        // bean 20000 times, including exercising the exact
+        // `MethodDescriptor.toString()` downstream path the crash trace
+        // named: baseline, package-allowed, and a
+        // `CRATONVM_JIT_THRESHOLD=1` aggressive-compilation pass -- 0
+        // failures, 0 crashes, correct property/method counts every call
+        // in every configuration. No longer reproduces on current dev.
+        // `BeanIntrospectorProbe.java` is the regression witness.
         if class_name.starts_with("org/springframework/beans/factory/")
             && !class_name.starts_with("org/springframework/beans/factory/support/")
             && !package_allowed("org/springframework/beans/factory/", allow_packages)
@@ -4229,6 +4219,34 @@ mod tests {
                 None,
                 "{class_name}.matches must be JIT-eligible now that ES-HAMCREST.1 is removed"
             );
+        }
+    }
+
+    #[test]
+    fn beans_introspector_is_jit_eligible_after_spb9d_removal() {
+        // SPB.9d was removed 2026-07-26 for the blanket com/sun/beans/ and
+        // java/beans/ package ban -- see the removal comment above
+        // should_skip_jit_internal for the re-verification evidence
+        // (BeanIntrospectorProbe.java, pure JDK, no external jar). Note a
+        // SEPARATE, older duplicate SPB.9d entry inside
+        // is_known_miscompile() (targeting
+        // com/sun/beans/introspect/MethodInfo$MethodOrder.compare,
+        // org/springframework/beans/ExtendedBeanInfo$PropertyDescriptorComparator.compare,
+        // java/util/StringJoiner.<init>) is untouched by this removal --
+        // that function is already dead code by default (gated behind
+        // callee_saved_gpr_local_homes_enabled(), which defaults false),
+        // so it does not affect this test either way.
+        for (class_name, method) in [
+            ("java/beans/Introspector", "getBeanInfo"),
+            ("com/sun/beans/introspect/MethodInfo", "getMethods"),
+        ] {
+            for policy in [SkipPolicy::Conservative, SkipPolicy::Aggressive] {
+                assert_eq!(
+                    check(class_name, method, false, true, policy),
+                    None,
+                    "{class_name}.{method} must be JIT-eligible now that SPB.9d is removed"
+                );
+            }
         }
     }
 
