@@ -398,19 +398,36 @@ enum ClassPathEntry {
         signer_cache: OnceLock<JarSignerInfo>,
     },
     /// A JDK 9+ JMOD file (ZIP with 4-byte `JM\x01\x00` prefix).
-    /// All entries under `classes/` are pre-extracted into an in-memory cache
-    /// at load time so that subsequent lookups are O(1) HashMap gets without
-    /// any ZIP decompression.  This is critical for debug-mode performance
-    /// where deflate is extremely slow without compiler optimisations.
+    ///
+    /// PERF (2026-07-26 boot-classpath-lazy): this variant used to carry a
+    /// `classes_cache: HashMap<String, SharedBytes>` holding the **inflated
+    /// bytes of every `classes/` entry**, built eagerly by `load_jmod`. On a
+    /// stock JDK 25 `discover_boot_classpath` puts all 70 `.jmod` files on the
+    /// boot classpath, so that cost 27,962 full deflate passes and ~136 MB of
+    /// resident inflated bytes *before the first Java class loaded* — measured
+    /// at 15-21 s even with optimised native zlib, and far worse in a debug
+    /// build. See `docs/internal/arch-2026-07-26/boot-classpath-lazy.md`.
+    ///
+    /// The eager cache existed to stop existence probes paying a deflate each
+    /// (`find_in_archive(..).is_some()` inflated the entry just to answer a
+    /// yes/no). That is now solved the way the JAR path already solves it: a
+    /// decompression-free name index built from the central directory
+    /// (compare `JarFile::entry_index` / `build_archive_entry_index`), with
+    /// bytes inflated only for entries actually requested. Existence checks
+    /// are a hash-set probe; a real hit is one deflate of one entry.
     JmodFile {
         path: PathBuf,
-        /// Pre-extracted class entries: relative path (e.g. `java/lang/Object.class`)
-        /// mapped to decompressed bytes.  Built once during `load_jmod`.
-        classes_cache: HashMap<String, SharedBytes>,
+        /// Names of every entry under `classes/`, with the `classes/` prefix
+        /// stripped (e.g. `java/lang/Object.class`). Built once during
+        /// `load_jmod` from the central directory — no entry is inflated to
+        /// populate it. Membership here means "this JMOD can serve that
+        /// name"; the bytes come from [`ClassPath::jmod_class_bytes`].
+        class_entry_index: FxHashSet<String>,
         /// The full set of entry names in the JMOD (including non-class entries)
         /// kept for `list_jmod_classes` and resource lookups.
         all_entry_names: Vec<String>,
-        /// Lazily-opened archive for non-class resource lookups (rare path).
+        /// The archive, used for every byte-serving lookup (classes via
+        /// [`ClassPath::jmod_class_bytes`], other entries directly).
         archive: Mutex<SharedArchive>,
         backing: ArchiveBacking,
     },
@@ -730,6 +747,14 @@ const JVM_FEATURE_VERSION: u32 = MULTI_RELEASE_MAX_VERSION;
 /// above any legitimate single class file or resource and matches the
 /// upper bound JDK 21+'s `ZipInputStream` uses internally.
 pub(crate) const MAX_UNCOMPRESSED_ENTRY_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Directory prefix under which a JMOD stores its class files and the
+/// resources that ship inside the module (`classes/java/lang/Object.class`,
+/// `classes/META-INF/services/...`). A JMOD's other top-level directories
+/// (`lib/`, `bin/`, `conf/`, `include/`, `legal/`, `man/`) are build-time
+/// artefacts that the runtime reads from `$JAVA_HOME`, not from the module,
+/// which is why only this subtree is indexed for class lookup.
+const JMOD_CLASSES_PREFIX: &str = "classes/";
 
 /// Clamp a ZIP entry's declared `size()` to [`MAX_UNCOMPRESSED_ENTRY_BYTES`]
 /// for `Vec::with_capacity`. Returns the clamped capacity as `usize`.
@@ -2333,13 +2358,18 @@ impl ClassPath {
                 }
                 ClassPathEntry::JmodFile {
                     path,
-                    classes_cache,
+                    class_entry_index,
+                    archive,
+                    backing,
                     ..
                 } => {
-                    // Look up in the pre-extracted classes cache — O(1), no decompression
-                    if let Some(data) = classes_cache.get(&relative_path) {
+                    // O(1) name probe against the central-directory index;
+                    // only a hit pays a deflate, and only for this one entry.
+                    if let Some(data) =
+                        Self::jmod_class_bytes(archive, backing, class_entry_index, &relative_path)
+                    {
                         debug!("Found class {class_name} in JMOD {}", path.display());
-                        return Ok(data.clone());
+                        return Ok(data);
                     }
                 }
                 ClassPathEntry::JImageFile {
@@ -2476,10 +2506,11 @@ impl ClassPath {
                 }
                 ClassPathEntry::JmodFile {
                     path,
-                    classes_cache,
+                    class_entry_index,
                     ..
                 } => {
-                    if classes_cache.contains_key(&relative_path) {
+                    // Existence only — never inflate for a code-source query.
+                    if class_entry_index.contains(&relative_path) {
                         return Some(path.to_string_lossy().into_owned());
                     }
                 }
@@ -3175,8 +3206,9 @@ impl ClassPath {
                 }
                 ClassPathEntry::JmodFile {
                     path,
-                    classes_cache,
+                    class_entry_index,
                     archive,
+                    backing,
                     ..
                 } => {
                     if !archive_safe {
@@ -3184,11 +3216,16 @@ impl ClassPath {
                     }
                     if simple_resource_glob(name).is_some() {
                         let candidates =
-                            Self::matching_resource_entry_names(classes_cache.keys(), name);
+                            Self::matching_resource_entry_names(class_entry_index.iter(), name);
                         if let Some(candidate) = candidates.first() {
-                            if let Some(data) = classes_cache.get(candidate) {
+                            if let Some(data) = Self::jmod_class_bytes(
+                                archive,
+                                backing,
+                                class_entry_index,
+                                candidate,
+                            ) {
                                 debug!(
-                                    "Found resource glob {name} in JMOD {} as {candidate} (cached)",
+                                    "Found resource glob {name} in JMOD {} as {candidate}",
                                     path.display()
                                 );
                                 return Some(data.to_vec());
@@ -3196,13 +3233,16 @@ impl ClassPath {
                         }
                         continue;
                     }
-                    // Try the pre-extracted classes cache first (covers .class + resources under classes/)
-                    if let Some(data) = classes_cache.get(name) {
-                        debug!("Found resource {name} in JMOD {} (cached)", path.display());
+                    // The `classes/` subtree covers both .class files and the
+                    // resources that ship inside the module.
+                    if let Some(data) =
+                        Self::jmod_class_bytes(archive, backing, class_entry_index, name)
+                    {
+                        debug!("Found resource {name} in JMOD {}", path.display());
                         return Some(data.to_vec());
                     }
                     // Fall back to archive for non-class entries
-                    let jmod_name = format!("classes/{}", name);
+                    let jmod_name = format!("{JMOD_CLASSES_PREFIX}{name}");
                     if let Some(data) = Self::find_in_archive(archive, &jmod_name) {
                         debug!("Found resource {name} in JMOD {}", path.display());
                         return Some(data);
@@ -3444,8 +3484,9 @@ impl ClassPath {
                     }
                 }
                 ClassPathEntry::JmodFile {
-                    classes_cache,
+                    class_entry_index,
                     archive,
+                    backing,
                     ..
                 } => {
                     if !archive_safe {
@@ -3453,18 +3494,25 @@ impl ClassPath {
                     }
                     if simple_resource_glob(name).is_some() {
                         for candidate in
-                            Self::matching_resource_entry_names(classes_cache.keys(), name)
+                            Self::matching_resource_entry_names(class_entry_index.iter(), name)
                         {
-                            if let Some(b) = classes_cache.get(&candidate) {
+                            if let Some(b) = Self::jmod_class_bytes(
+                                archive,
+                                backing,
+                                class_entry_index,
+                                &candidate,
+                            ) {
                                 out.push(b.to_vec());
                             }
                         }
                         continue;
                     }
-                    if let Some(b) = classes_cache.get(name) {
+                    if let Some(b) =
+                        Self::jmod_class_bytes(archive, backing, class_entry_index, name)
+                    {
                         out.push(b.to_vec());
                     } else {
-                        let jmod_name = format!("classes/{}", name);
+                        let jmod_name = format!("{JMOD_CLASSES_PREFIX}{name}");
                         if let Some(b) = Self::find_in_archive(archive, &jmod_name) {
                             out.push(b);
                         }
@@ -3805,7 +3853,7 @@ impl ClassPath {
                 }
                 ClassPathEntry::JmodFile {
                     path,
-                    classes_cache,
+                    class_entry_index,
                     archive,
                     ..
                 } => {
@@ -3816,14 +3864,14 @@ impl ClassPath {
                         let p = path.to_string_lossy().replace('\\', "/");
                         let p = p.trim_start_matches('/');
                         for candidate in
-                            Self::matching_resource_entry_names(classes_cache.keys(), name)
+                            Self::matching_resource_entry_names(class_entry_index.iter(), name)
                         {
                             urls.push(format!("jar:file:/{p}!/{candidate}"));
                         }
                         continue;
                     }
-                    let found = classes_cache.contains_key(name) || {
-                        let jmod_name = format!("classes/{}", name);
+                    let found = class_entry_index.contains(name) || {
+                        let jmod_name = format!("{JMOD_CLASSES_PREFIX}{name}");
                         // URL emission only — never the bytes. Inflating the
                         // entry here just to discard it made every
                         // `getResource` hit on a JMOD pay a full deflate.
@@ -3959,10 +4007,17 @@ impl ClassPath {
                 }
                 ClassPathEntry::JmodFile {
                     path,
-                    classes_cache,
+                    class_entry_index,
+                    archive,
+                    backing,
                     ..
                 } => {
-                    if let Some(data) = classes_cache.get("module-info.class") {
+                    if let Some(data) = Self::jmod_class_bytes(
+                        archive,
+                        backing,
+                        class_entry_index,
+                        "module-info.class",
+                    ) {
                         debug!("Found module-info.class in JMOD {}", path.display());
                         results.push(data.to_vec());
                     }
@@ -4067,14 +4122,16 @@ impl ClassPath {
         self.entries
             .iter()
             .map(|e| match e {
-                ClassPathEntry::JmodFile { classes_cache, .. } => classes_cache.len(),
+                ClassPathEntry::JmodFile {
+                    class_entry_index, ..
+                } => class_entry_index.len(),
                 _ => 0,
             })
             .sum()
     }
 
     /// Return the number of classes known to the jimage entries on this
-    /// classpath. Unlike `jmod_class_count`, this is O(1) per entry since
+    /// classpath. Like `jmod_class_count`, this is O(1) per entry since
     /// the class-to-module index was built at load time.
     pub fn jimage_class_count(&self) -> usize {
         self.entries
@@ -4296,6 +4353,34 @@ impl ClassPath {
             .map(SharedBytes::from)
     }
 
+    /// Serve one `classes/` entry out of a JMOD, inflating it on demand.
+    ///
+    /// `relative` is the name with the `classes/` prefix already stripped
+    /// (e.g. `java/lang/Object.class`). The index probe comes first so a
+    /// miss costs a hash lookup and no ZIP work at all — that is the
+    /// property the old eager `classes_cache` was bought with 136 MB of
+    /// inflated bytes, and it is exactly what `JarFile::entry_index` buys
+    /// the JAR path for free.
+    ///
+    /// Returns `None` when the name is not in this JMOD, when the entry
+    /// exceeds [`MAX_UNCOMPRESSED_ENTRY_BYTES`], or when the entry is
+    /// corrupt — the same three cases in which the eager cache simply had
+    /// no key, so every caller's fall-through behaviour is unchanged.
+    fn jmod_class_bytes(
+        archive: &Mutex<SharedArchive>,
+        backing: &ArchiveBacking,
+        class_entry_index: &FxHashSet<String>,
+        relative: &str,
+    ) -> Option<SharedBytes> {
+        if !class_entry_index.contains(relative) {
+            return None;
+        }
+        let mut name = String::with_capacity(JMOD_CLASSES_PREFIX.len() + relative.len());
+        name.push_str(JMOD_CLASSES_PREFIX);
+        name.push_str(relative);
+        Self::find_shared_in_archive(archive, backing, &name)
+    }
+
     /// JMOD file header prefix: `JM` (0x4A 0x4D).
     const JMOD_MAGIC_PREFIX: [u8; 2] = [0x4A, 0x4D];
 
@@ -4312,10 +4397,25 @@ impl ClassPath {
     ///
     /// Class files inside are stored under `classes/` (e.g. `classes/java/lang/Object.class`).
     ///
-    /// All entries under `classes/` are pre-extracted into an in-memory HashMap
-    /// so that `find_class` is a simple HashMap lookup with no decompression.
-    /// This is critical for debug-mode performance where deflate is extremely
-    /// slow (~30s for 200 classes vs <2s with pre-extraction).
+    /// Every entry name is read from the central directory into
+    /// `class_entry_index`; **no entry is inflated here**. Class bytes are
+    /// produced on demand by [`Self::jmod_class_bytes`].
+    ///
+    /// PERF (2026-07-26 boot-classpath-lazy): this used to pre-extract every
+    /// `classes/` entry into a `HashMap<String, SharedBytes>`. That made
+    /// existence probes free but paid for it up front — on a stock JDK 25 the
+    /// 70 JMODs `discover_boot_classpath` puts on the boot classpath meant
+    /// 27,962 deflate passes and ~136 MB resident before the first Java class
+    /// loaded. The name index gives the same free existence probe (that was
+    /// the actual point of the cache: the old `find_in_archive(..).is_some()`
+    /// callers inflated an entry to answer a yes/no, which is where the
+    /// "~30 s for 200 classes" debug-build figure came from) at ~1 % of the
+    /// memory and none of the up-front CPU. It mirrors `build_archive_entry_index`
+    /// on the JAR path.
+    ///
+    /// Repeat requests for the same class do not re-inflate in practice:
+    /// `ClassManager::class_bytes_cache` already memoizes class bytes behind a
+    /// 16 MiB FIFO cap, which is the right place for that bound to live.
     fn load_jmod(path: &Path) -> Result<ClassPathEntry, String> {
         // JMOD files are ordinary classpath archives here; read them through
         // the same owned, mutation-detecting helper as JARs.
@@ -4360,8 +4460,11 @@ impl ClassPath {
 
         let total_entries = archive.len();
 
-        // Pre-extract all class entries into an in-memory cache.
-        let mut classes_cache = HashMap::new();
+        // Index every entry name from the central directory. `by_index_raw`
+        // builds the entry reader without touching compressed data, so this
+        // loop reads no payload bytes at all.
+        let mut class_entry_index =
+            FxHashSet::with_capacity_and_hasher(total_entries, Default::default());
         let mut all_entry_names = Vec::with_capacity(total_entries);
 
         for i in 0..total_entries {
@@ -4369,36 +4472,27 @@ impl ClassPath {
                 Ok(entry) => entry.name().to_string(),
                 Err(_) => continue,
             };
-            all_entry_names.push(name.clone());
 
-            if let Some(relative) = name.strip_prefix("classes/") {
+            if let Some(relative) = name.strip_prefix(JMOD_CLASSES_PREFIX) {
                 if !relative.is_empty() && !relative.ends_with('/') {
-                    if let Some(buf) =
-                        Self::find_shared_in_archive_locked(&mut archive, &zip_data, &name)
-                    {
-                        classes_cache.insert(relative.to_string(), buf);
-                    }
+                    class_entry_index.insert(relative.to_string());
                 }
             }
+            all_entry_names.push(name);
         }
 
         debug!(
-            "Loaded JMOD {} ({} entries, {} classes pre-cached)",
+            "Loaded JMOD {} ({} entries, {} classes indexed, none inflated)",
             path.display(),
             total_entries,
-            classes_cache.len()
+            class_entry_index.len()
         );
-
-        // Re-open the archive for rare non-class resource lookups
-        let cursor2 = Cursor::new(zip_data.clone());
-        let archive2 = ZipArchive::new(cursor2)
-            .map_err(|e| format!("failed to re-parse ZIP inside JMOD: {e}"))?;
 
         Ok(ClassPathEntry::JmodFile {
             path: path.to_path_buf(),
-            classes_cache,
+            class_entry_index,
             all_entry_names,
-            archive: Mutex::new(archive2),
+            archive: Mutex::new(archive),
             backing: zip_data,
         })
     }
@@ -5397,35 +5491,35 @@ mod tests {
             entry.err()
         );
 
-        // Verify it's a JmodFile variant with a populated classes_cache
+        // Verify it's a JmodFile variant with a populated class_entry_index
         match entry.unwrap() {
             ClassPathEntry::JmodFile {
-                classes_cache,
+                class_entry_index,
                 all_entry_names,
                 ..
             } => {
                 assert!(
-                    classes_cache.len() > 100,
+                    class_entry_index.len() > 100,
                     "java.base should have >100 classes, got {}",
-                    classes_cache.len()
+                    class_entry_index.len()
                 );
                 assert!(
-                    all_entry_names.len() > classes_cache.len(),
+                    all_entry_names.len() > class_entry_index.len(),
                     "all_entry_names should include non-class entries too"
                 );
                 // Should contain java.lang.Object
                 assert!(
-                    classes_cache.contains_key("java/lang/Object.class"),
+                    class_entry_index.contains("java/lang/Object.class"),
                     "java.base should contain java/lang/Object.class"
                 );
                 // Should contain java.lang.String
                 assert!(
-                    classes_cache.contains_key("java/lang/String.class"),
+                    class_entry_index.contains("java/lang/String.class"),
                     "java.base should contain java/lang/String.class"
                 );
                 eprintln!(
                     "java.base.jmod: {} classes, {} total entries",
-                    classes_cache.len(),
+                    class_entry_index.len(),
                     all_entry_names.len()
                 );
             }
@@ -6646,5 +6740,339 @@ Implementation-Version: 999.999\n";
             "default policy must keep escaping entries: {cp:?}"
         );
         assert!(cp[0].replace('\\', "/").contains("../../shared/b.jar"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Lazy JMOD class serving (2026-07-26 boot-classpath-lazy)
+    //
+    // `load_jmod` used to inflate every `classes/` entry at load time. It now
+    // indexes names only and inflates per lookup. These tests pin the three
+    // things that change could plausibly break: the bytes, the fall-through to
+    // other classpath entries, and the behaviour on a damaged archive.
+    // -----------------------------------------------------------------------
+
+    /// The 4-byte JMOD header that precedes the embedded ZIP.
+    const TEST_JMOD_HEADER: [u8; 4] = [0x4A, 0x4D, 0x01, 0x00];
+
+    /// Build a JMOD image in memory: `JM\x01\x00` followed by a ZIP holding
+    /// `entries` verbatim (names are used exactly as given, so callers
+    /// control whether an entry lands under `classes/`).
+    ///
+    /// Entries are **Deflated**, not Stored, so the lazy path is exercised
+    /// against genuinely compressed data — a Stored entry would be served by
+    /// the zero-copy `ArchiveSlice` branch and would never prove that
+    /// on-demand inflation produces the right bytes.
+    fn build_test_jmod_bytes(entries: &[(&str, Vec<u8>)]) -> Vec<u8> {
+        let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        for (name, bytes) in entries {
+            zip.start_file(*name, options).unwrap();
+            zip.write_all(bytes).unwrap();
+        }
+        let zip_bytes = zip.finish().unwrap().into_inner();
+
+        let mut out = Vec::with_capacity(TEST_JMOD_HEADER.len() + zip_bytes.len());
+        out.extend_from_slice(&TEST_JMOD_HEADER);
+        out.extend_from_slice(&zip_bytes);
+        out
+    }
+
+    fn jmod_temp_path(tag: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("cratonvm_lazy_jmod_{}_{}", std::process::id(), tag));
+        let _ = fs::create_dir_all(&dir);
+        dir.join(format!("{tag}.jmod"))
+    }
+
+    /// A class body big enough that its deflate stream spans many bytes, so
+    /// the corruption test below has payload to damage. Deterministic so a
+    /// failure is reproducible.
+    fn synthetic_class_bytes(seed: u8, len: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(len);
+        out.extend_from_slice(&[0xCA, 0xFE, 0xBA, 0xBE]);
+        let mut x = seed as u32 | 1;
+        while out.len() < len {
+            // xorshift — pseudo-random so the entry does not compress to
+            // nothing, but fully reproducible.
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            out.push((x & 0xFF) as u8);
+        }
+        out
+    }
+
+    /// Equivalence with the eager implementation this replaced: for every
+    /// `classes/` entry, `find_class` must return exactly the bytes that
+    /// pre-extracting the whole archive would have cached.
+    ///
+    /// The reference side is computed here by replicating the old eager loop
+    /// against the same archive, so this compares the two strategies rather
+    /// than comparing the new one against a hand-written expectation.
+    #[test]
+    fn jmod_lazy_lookup_matches_eager_extraction_byte_for_byte() {
+        let entries: Vec<(&str, Vec<u8>)> = vec![
+            (
+                "classes/java/lang/Object.class",
+                synthetic_class_bytes(1, 3000),
+            ),
+            (
+                "classes/java/lang/String.class",
+                synthetic_class_bytes(2, 5000),
+            ),
+            (
+                "classes/java/util/List.class",
+                synthetic_class_bytes(3, 700),
+            ),
+            ("classes/module-info.class", synthetic_class_bytes(4, 400)),
+            (
+                "classes/META-INF/services/example.Service",
+                b"example.ServiceImpl\n".to_vec(),
+            ),
+            // Not under `classes/` — a JMOD's build-time payload. Must not be
+            // indexed as a class and must not be counted.
+            ("legal/java.base/LICENSE", b"license text".to_vec()),
+            ("lib/libjava.so", vec![0u8; 64]),
+        ];
+        let path = jmod_temp_path("equivalence");
+        fs::write(&path, build_test_jmod_bytes(&entries)).unwrap();
+
+        // --- reference: what the old eager pre-extraction would have cached
+        let raw = fs::read(&path).unwrap();
+        let mut reference: HashMap<String, Vec<u8>> = HashMap::new();
+        {
+            let mut archive = ZipArchive::new(Cursor::new(raw[4..].to_vec())).unwrap();
+            for i in 0..archive.len() {
+                let name = archive.by_index_raw(i).unwrap().name().to_string();
+                if let Some(relative) = name.strip_prefix("classes/") {
+                    if relative.is_empty() || relative.ends_with('/') {
+                        continue;
+                    }
+                    let mut entry = archive.by_name(&name).unwrap();
+                    let mut buf = Vec::new();
+                    entry.read_to_end(&mut buf).unwrap();
+                    reference.insert(relative.to_string(), buf);
+                }
+            }
+        }
+        assert_eq!(reference.len(), 5, "five entries live under classes/");
+
+        let cp = ClassPath::new(&[path.to_string_lossy().into_owned()]);
+
+        // The index must agree with the eager cache on membership...
+        assert_eq!(
+            cp.jmod_class_count(),
+            reference.len(),
+            "index must cover exactly the classes/ subtree"
+        );
+
+        // ...and on bytes, for every class the eager cache would have held.
+        for name in ["java/lang/Object", "java/lang/String", "java/util/List"] {
+            let got = cp.find_class(name).expect("class must resolve");
+            let want = reference
+                .get(&format!("{name}.class"))
+                .expect("reference entry");
+            assert_eq!(
+                got.as_ref(),
+                want.as_slice(),
+                "lazy bytes for {name} must equal eagerly-extracted bytes"
+            );
+        }
+
+        // Non-class resources under `classes/` come back too.
+        assert_eq!(
+            cp.find_resource("META-INF/services/example.Service"),
+            Some(b"example.ServiceImpl\n".to_vec())
+        );
+
+        // A second lookup returns the same bytes — inflating on demand must
+        // be idempotent, not stateful.
+        let first = cp.find_class("java/lang/String").unwrap();
+        let second = cp.find_class("java/lang/String").unwrap();
+        assert_eq!(first.as_ref(), second.as_ref());
+
+        // Entries outside `classes/` are not classes.
+        assert!(cp.find_class("legal/java.base/LICENSE").is_err());
+        assert!(cp.find_class("java/lang/Missing").is_err());
+
+        // The code source still points at the JMOD, and answering that
+        // question never needs the bytes.
+        assert_eq!(
+            cp.find_class_source_path("java/lang/Object"),
+            Some(path.to_string_lossy().into_owned())
+        );
+        assert_eq!(cp.find_class_source_path("java/lang/Missing"), None);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    /// A JMOD and a jimage on the same classpath: a class only the JMOD has
+    /// must still resolve. This is the case that makes the "just prefer
+    /// `lib/modules`" alternative unsafe, and it is what the fall-through in
+    /// `find_class` exists for.
+    #[test]
+    fn class_only_in_jmod_resolves_when_jimage_is_also_on_the_path() {
+        let jimage_data =
+            cratonvm_reader::jimage::test_builder::build_simple(&sample_jimage_resources());
+        let jimage_path = jimage_temp_path("jmod_fallthrough");
+        fs::write(&jimage_path, &jimage_data).unwrap();
+
+        let jmod_only = synthetic_class_bytes(9, 2048);
+        let jmod_path = jmod_temp_path("fallthrough");
+        fs::write(
+            &jmod_path,
+            build_test_jmod_bytes(&[("classes/com/example/OnlyInJmod.class", jmod_only.clone())]),
+        )
+        .unwrap();
+
+        // jimage first, JMOD second — the ordering a `lib/modules`-preferring
+        // boot classpath would produce.
+        let mut cp = ClassPath::new(&[]);
+        cp.add_jimage(&jimage_path).expect("add_jimage");
+        cp.add_path(&jmod_path.to_string_lossy());
+        assert_eq!(cp.entry_count(), 2, "both entries must be on the classpath");
+
+        // The jimage-only class resolves through the jimage reader...
+        assert_eq!(
+            cp.find_class("java/lang/String").unwrap().as_ref(),
+            b"\xCA\xFE\xBA\xBE_jimage_string".as_ref()
+        );
+        // ...and the JMOD-only class resolves through the lazy JMOD path,
+        // after the jimage arm has declined it.
+        assert_eq!(
+            cp.find_class("com/example/OnlyInJmod").unwrap().as_ref(),
+            jmod_only.as_slice()
+        );
+
+        let _ = fs::remove_file(&jimage_path);
+        let _ = fs::remove_file(&jmod_path);
+    }
+
+    /// Malformed and truncated JMODs must produce errors, never panics.
+    /// `load_jmod` is reached from `ClassPath::new` on any host-supplied
+    /// `JAVA_HOME`, so a damaged install must degrade to "class not found".
+    #[test]
+    fn malformed_jmod_errors_instead_of_panicking() {
+        let good = build_test_jmod_bytes(&[(
+            "classes/java/lang/Object.class",
+            synthetic_class_bytes(7, 4096),
+        )]);
+
+        let cases: Vec<(&str, Vec<u8>)> = vec![
+            ("empty", Vec::new()),
+            ("shorter_than_header", vec![0x4A, 0x4D, 0x01]),
+            ("bad_magic", {
+                let mut v = good.clone();
+                v[0] = 0x50;
+                v[1] = 0x4B;
+                v
+            }),
+            ("future_major_version", {
+                let mut v = good.clone();
+                v[2] = 0x02;
+                v
+            }),
+            ("header_only", TEST_JMOD_HEADER.to_vec()),
+            ("garbage_after_header", {
+                let mut v = TEST_JMOD_HEADER.to_vec();
+                v.extend_from_slice(&[0xFFu8; 512]);
+                v
+            }),
+            // Valid header, ZIP truncated mid-way: the central directory is
+            // gone, so the archive cannot be opened at all.
+            ("truncated_zip", good[..good.len() / 2].to_vec()),
+        ];
+
+        for (tag, bytes) in cases {
+            let path = jmod_temp_path(tag);
+            fs::write(&path, &bytes).unwrap();
+
+            // Direct: `load_jmod` reports an error string.
+            assert!(
+                ClassPath::load_jmod(&path).is_err(),
+                "load_jmod({tag}) must return Err, not succeed or panic"
+            );
+
+            // Through the public entry point: the damaged file is skipped and
+            // lookups fail cleanly.
+            let cp = ClassPath::new(&[path.to_string_lossy().into_owned()]);
+            assert!(
+                cp.find_class("java/lang/Object").is_err(),
+                "find_class on damaged JMOD ({tag}) must return Err"
+            );
+
+            let _ = fs::remove_file(&path);
+        }
+    }
+
+    /// Corruption that the *eager* loader would have absorbed at load time
+    /// (the entry simply never entered the cache) now surfaces at lookup
+    /// time. It must surface as `ClassNotFound`, not as a panic and not as
+    /// silently truncated class bytes.
+    ///
+    /// The archive itself stays well-formed — only the last entry's
+    /// compressed payload is damaged — so `load_jmod` succeeds and the name
+    /// is in the index, which is precisely the new lazy-path-only case.
+    #[test]
+    fn jmod_with_corrupt_entry_payload_reports_class_not_found() {
+        let mut bytes = build_test_jmod_bytes(&[(
+            "classes/java/lang/Object.class",
+            synthetic_class_bytes(11, 65536),
+        )]);
+
+        // Locate the central directory via the end-of-central-directory
+        // record (no ZIP comment is written, so it is the final 22 bytes).
+        let eocd = bytes.len() - 22;
+        assert_eq!(
+            &bytes[eocd..eocd + 4],
+            &[0x50, 0x4B, 0x05, 0x06],
+            "expected EOCD signature at end of synthesized JMOD"
+        );
+        let cd_offset = u32::from_le_bytes([
+            bytes[eocd + 16],
+            bytes[eocd + 17],
+            bytes[eocd + 18],
+            bytes[eocd + 19],
+        ]) as usize
+            + TEST_JMOD_HEADER.len(); // offsets are relative to the ZIP, not the JMOD
+
+        // Damage 256 bytes of the compressed stream, ending just before the
+        // central directory. Well clear of the local file header.
+        let end = cd_offset;
+        let start = end - 256;
+        for b in &mut bytes[start..end] {
+            *b ^= 0xFF;
+        }
+
+        let path = jmod_temp_path("corrupt_payload");
+        fs::write(&path, &bytes).unwrap();
+
+        // The archive still parses: the index is built from the central
+        // directory, which we did not touch.
+        let entry = ClassPath::load_jmod(&path).expect("central directory is intact");
+        match &entry {
+            ClassPathEntry::JmodFile {
+                class_entry_index, ..
+            } => assert!(
+                class_entry_index.contains("java/lang/Object.class"),
+                "the damaged entry is still indexed"
+            ),
+            other => panic!("expected JmodFile, got {other:?}"),
+        }
+
+        // But serving it fails cleanly rather than panicking or returning
+        // a partially-inflated class file.
+        let cp = ClassPath::new(&[path.to_string_lossy().into_owned()]);
+        match cp.find_class("java/lang/Object") {
+            Err(ClassFileError::ClassNotFound { .. }) => {}
+            Err(other) => panic!("expected ClassNotFound, got {other:?}"),
+            Ok(bytes) => panic!(
+                "corrupt entry must not resolve; got {} bytes",
+                bytes.as_ref().len()
+            ),
+        }
+
+        let _ = fs::remove_file(&path);
     }
 }
