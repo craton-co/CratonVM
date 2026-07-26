@@ -2485,11 +2485,184 @@ unsafe fn osr_trampoline(
 // Method inlining
 // ---------------------------------------------------------------------------
 
-/// Maximum callee bytecode size (excluding padding) eligible for inlining.
-pub const MAX_INLINE_BYTECODE_SIZE: usize = 35;
+/// Maximum callee bytecode size (excluding padding) eligible for inlining at
+/// **any** call site — the admission gate, not the policy.
+///
+/// # 2026-07-26 re-shape (jit-inlining-and-ir-calls)
+///
+/// This was `35`, applied as a flat cap to every callee. That number is
+/// HotSpot's `MaxInlineSize`, which HotSpot applies **only to cold callees**;
+/// for a callee reached from a hot call site HotSpot uses `FreqInlineSize`,
+/// which is `325` — nearly 10x larger. CratonVM had the cold constant and no
+/// hot tier at all, so a 40-byte accessor called a million times in a loop was
+/// treated exactly like a 40-byte method called twice.
+///
+/// The three-tier HotSpot shape now lives here:
+///
+/// | tier | cap | HotSpot name | when |
+/// |---|---|---|---|
+/// | trivial | [`MAX_TRIVIAL_INLINE_SIZE`] = 6 | `MaxTrivialSize` | always — a getter is never worth a call |
+/// | cold | [`MAX_INLINE_SIZE_COLD`] = 35 | `MaxInlineSize` | no profile evidence the site is hot |
+/// | hot | `MAX_INLINE_BYTECODE_SIZE` = 325 | `FreqInlineSize` | the site is in a hot loop or has a hot receiver profile |
+///
+/// **This constant is the value the VM-side inline resolver
+/// (`vm/src/runtime/interpreter.rs::resolve_inline_site`) gates on**, and it
+/// must stay the largest of the three: the resolver is a pure admission
+/// filter that hands candidates to the planner in `try_compile_inner`, which
+/// then applies the per-site tier via [`inline_size_cap_for_site`]. Lowering
+/// this constant back to 35 would make the hot tier unreachable.
+///
+/// See also: `docs/internal/arch-2026-07-26/jit-inlining-and-ir-calls.md`.
+pub const MAX_INLINE_BYTECODE_SIZE: usize = 325;
 
-/// Total inlined bytecode budget per compiled method.
-pub const MAX_INLINE_BUDGET: usize = 250;
+/// Callee-size cap for a call site with **no evidence of hotness** —
+/// HotSpot's `MaxInlineSize`. This is the value the flat pre-2026-07-26 cap
+/// used, so a cold site's inlining decisions are unchanged by the re-shape.
+pub const MAX_INLINE_SIZE_COLD: usize = 35;
+
+/// Callee-size cap below which inlining is **always** profitable regardless of
+/// site hotness — HotSpot's `MaxTrivialSize`. A method this small is smaller
+/// than the call sequence that would invoke it.
+pub const MAX_TRIVIAL_INLINE_SIZE: usize = 6;
+
+/// Total inlined bytecode budget per compiled method, for a caller with no
+/// hot-loop / hot-site evidence.
+///
+/// Raised from 250. The budget is not a free parameter: the single-pass
+/// backend sizes both its code buffer and its frame from it
+/// (`x64::compile` reserves `callee_code_len * 64` buffer bytes and
+/// `callee_max_locals + callee_code_len` spill slots **per inlined site**), so
+/// the ceiling here directly bounds committed executable memory (~64 bytes of
+/// buffer per budgeted bytecode) and JIT frame size (~8 bytes per budgeted
+/// bytecode). 750 keeps both comfortably bounded — ~48 KiB of buffer estimate
+/// and ~6 KiB of frame in the worst case — while being 3x the old ceiling.
+pub const MAX_INLINE_BUDGET: usize = 750;
+
+/// Total inlined bytecode budget for a **hot** caller — one the profile shows
+/// executing a hot loop, which is where inlining actually pays.
+///
+/// Worst case ~128 KiB of buffer estimate and ~16 KiB of frame; see
+/// [`MAX_INLINE_BUDGET`] for where those numbers come from.
+pub const MAX_INLINE_BUDGET_HOT: usize = 2000;
+
+/// Back-edge execution count at which a loop is considered hot for inlining
+/// purposes. Matches the order of magnitude
+/// `LoopTripProfile::suggests_unroll_factor` already uses for "not hot enough"
+/// (100 back-edges), so the two profile consumers agree on what "hot" means.
+pub const INLINE_HOT_LOOP_BACKEDGES: u64 = 100;
+
+/// Observation count at which a *call site* (rather than a loop) is considered
+/// hot, from its receiver-type profile. `MethodProfile::receivers` records one
+/// observation per executed `invokevirtual`/`invokeinterface`, so the summed
+/// count is a direct execution count for that site.
+pub const INLINE_HOT_SITE_OBSERVATIONS: u32 = 500;
+
+/// Bytecode pc ranges `[header, back_edge]` of every loop the profile shows to
+/// be hot, derived from `MethodProfile::loops` (keyed by back-edge pc) plus the
+/// bytecode itself (to recover each back-edge's branch target, i.e. the loop
+/// header).
+///
+/// `LoopTripProfile` records only the back-edge pc, so the header is recovered
+/// by decoding the branch instruction at that pc: a 3-byte `goto` (0xa7) or
+/// conditional (0x99..=0xa6) carries a signed 16-bit relative offset, and a
+/// 5-byte `goto_w` (0xc8) a signed 32-bit one. A back-edge is a branch whose
+/// target is at or before its own pc.
+fn hot_loop_ranges(
+    code: &[u8],
+    code_len: usize,
+    profile: Option<&profile::MethodProfile>,
+) -> Vec<(usize, usize)> {
+    let Some(prof) = profile else {
+        return Vec::new();
+    };
+    let mut ranges = Vec::new();
+    for (&back_pc, trips) in &prof.loops {
+        if trips.backedge_count < INLINE_HOT_LOOP_BACKEDGES {
+            continue;
+        }
+        if back_pc >= code_len {
+            continue;
+        }
+        let op = code[back_pc];
+        let target = match op {
+            // 3-byte relative branches: goto, if<cond>, if_icmp<cond>, if_acmp<cond>.
+            0x99..=0xa8 => {
+                if back_pc + 2 >= code_len {
+                    continue;
+                }
+                let off = i16::from_be_bytes([code[back_pc + 1], code[back_pc + 2]]) as isize;
+                back_pc as isize + off
+            }
+            // goto_w — 5 bytes, 32-bit offset.
+            0xc8 => {
+                if back_pc + 4 >= code_len {
+                    continue;
+                }
+                let off = i32::from_be_bytes([
+                    code[back_pc + 1],
+                    code[back_pc + 2],
+                    code[back_pc + 3],
+                    code[back_pc + 4],
+                ]) as isize;
+                back_pc as isize + off
+            }
+            _ => continue,
+        };
+        if target < 0 || target as usize > back_pc {
+            // Not a backward branch — the profile keyed something else here.
+            continue;
+        }
+        ranges.push((target as usize, back_pc));
+    }
+    ranges
+}
+
+/// Whether a call site at `pc` is HOT, and therefore eligible for the
+/// [`MAX_INLINE_BYTECODE_SIZE`] (`FreqInlineSize`) allowance rather than the
+/// [`MAX_INLINE_SIZE_COLD`] (`MaxInlineSize`) one.
+///
+/// Two independent pieces of real profile evidence, either of which suffices:
+///
+///  1. the site lies inside a loop whose back-edge count clears
+///     [`INLINE_HOT_LOOP_BACKEDGES`] (`MethodProfile::loops`); or
+///  2. the site's own receiver-type profile records at least
+///     [`INLINE_HOT_SITE_OBSERVATIONS`] executions (`MethodProfile::receivers`,
+///     which the interpreter populates per executed virtual/interface invoke).
+///
+/// With no profile at all every site is cold, so an unprofiled compile keeps
+/// exactly the pre-2026-07-26 35-byte behaviour.
+fn call_site_is_hot(
+    pc: usize,
+    hot_loops: &[(usize, usize)],
+    profile: Option<&profile::MethodProfile>,
+) -> bool {
+    if hot_loops
+        .iter()
+        .any(|&(header, back)| pc >= header && pc <= back)
+    {
+        return true;
+    }
+    profile
+        .and_then(|p| p.receivers.get(&pc))
+        .map(|counts| {
+            counts.values().copied().map(u64::from).sum::<u64>()
+                >= u64::from(INLINE_HOT_SITE_OBSERVATIONS)
+        })
+        .unwrap_or(false)
+}
+
+/// Per-site callee-size cap: the HotSpot three-tier shape.
+///
+/// Returns the largest callee bytecode length that may be inlined at this
+/// site. `MAX_TRIVIAL_INLINE_SIZE` is implicit — it is below both other tiers,
+/// so a trivial callee passes whichever cap applies.
+pub fn inline_size_cap_for_site(is_hot: bool) -> usize {
+    if is_hot {
+        MAX_INLINE_BYTECODE_SIZE
+    } else {
+        MAX_INLINE_SIZE_COLD
+    }
+}
 
 /// C1→C2 supersede eligibility: would an `optimize=true` recompile of this
 /// method actually take the optimizing IR pipeline AND be expected to produce
@@ -2497,15 +2670,31 @@ pub const MAX_INLINE_BUDGET: usize = 250;
 ///
 /// Mirrors the IR gate in `try_compile_inner` (`ir_compatible` + the
 /// category-2/FP admission clauses) with one deliberate extra restriction:
-/// only CALL-FREE and ALLOCATION-FREE methods qualify. The IR path lowers
-/// every invoke through the generic `invoke_dispatch` helper (no inline
-/// caches, no direct calls, no direct self-recursive CALL) and its
-/// allocation lowering differs from the single-pass inline-TLAB fast path —
-/// for such methods an "optimizing" recompile can be a net REGRESSION over
-/// the single-pass body (which has direct self-calls, ctor inlining, and the
-/// inline TLAB bump). Pure compute (int/long/FP arithmetic over locals,
-/// arrays and fields — sieve/matrix/reduction loop shapes) is where the IR
-/// backend reliably wins; that is exactly what this admits.
+/// only ALLOCATION-FREE methods qualify.
+///
+/// # 2026-07-26 (jit-inlining-and-ir-calls): the CALL exclusion is gone
+///
+/// This predicate used to additionally refuse any method containing an
+/// invoke. The stated reason — "the IR path lowers every invoke through the
+/// generic `invoke_dispatch` helper (no inline caches, no direct calls, no
+/// direct self-recursive CALL), so an optimizing recompile can be a net
+/// REGRESSION over the single-pass body" — was accurate when written and is
+/// now false on all three counts: `ir_lower` emits a direct self-recursive
+/// `CALL` (`invoke_kind` 4), direct calls to statically-bound compiled
+/// entries, and a MIC + 3-way-PIC inline cache for virtual/interface sites.
+/// An IR call site is now at worst equal to its single-pass counterpart, so
+/// call-bearing methods — i.e. ordinary application code, which was the entire
+/// population this predicate excluded — become C2 upgrade candidates.
+///
+/// The ALLOCATION exclusion **stays**, and deliberately so. The IR still has
+/// no allocation lowering: an `Op::New` that survives escape analysis bails
+/// the whole method to single-pass (`has_live_new`), precisely so the
+/// single-pass inline TLAB bump-pointer fast path keeps serving every real
+/// allocation. Promoting an allocation-bearing method to C2 would at best
+/// waste a compile and at worst trade the inline TLAB bump for a helper call —
+/// which is exactly one of the two independent causes of the July 2026
+/// Binary Trees 4x regression documented in BENCHMARK.md. Do not lift this
+/// clause without first giving the IR an inline-TLAB allocation path.
 pub fn c2_upgrade_would_engage(
     code: &[u8],
     code_len: usize,
@@ -2516,11 +2705,9 @@ pub fn c2_upgrade_would_engage(
     let Some(scan) = x64::jit_scan(code, code_len, descriptor) else {
         return false;
     };
-    if !scan.invoke_ops.is_empty()
-        || !scan.new_ops.is_empty()
-        || !scan.anewarray_ops.is_empty()
-        || !scan.indy_ops.is_empty()
-    {
+    // Allocation exclusion — see the doc comment. `indy` is excluded by
+    // `ir_compatible` too; kept here so the reason is local.
+    if !scan.new_ops.is_empty() || !scan.anewarray_ops.is_empty() || !scan.indy_ops.is_empty() {
         return false;
     }
     if !ir::ir_compatible(&scan) {
@@ -6459,6 +6646,23 @@ fn try_compile_inner(
         // `CompiledMethod` below so the baked `info_ptr`s outlive the code.
         let mut ir_call_infos: Vec<Box<JitInvokeInfo>> = Vec::new();
         let mut ir_call_strings: Vec<Box<str>> = Vec::new();
+        // jit-inlining-and-ir-calls: per-call-site lowering plan handed to
+        // `ir_lower`. Every site defaults to the historical dispatch helper;
+        // the loop below upgrades the ones it can prove better.
+        let mut ir_call_plan = ir_lower::IrCallPlan::default();
+        let mut ir_mic_slots: Vec<Box<JitMICSlot>> = Vec::new();
+        let mut ir_pic_slots: Vec<Box<JitPICSlot>> = Vec::new();
+        // The virtual/interface gate was default-OFF at the VM call sites for
+        // one reason only: the IR lowered `invokevirtual`/`invokeinterface`
+        // through the generic `jit_invoke_dispatch` helper with NO inline
+        // cache, so admitting them made call-heavy methods slower than the
+        // single-pass body they replaced. `ir_lower` now emits the same
+        // MIC + 3-way-PIC cascade the single-pass backend does, so that reason
+        // is gone and the capability becomes opt-OUT
+        // (`CRATONVM_JIT_IR_CALL_VIRTUAL=0`) rather than opt-in. The caller's
+        // parameter still forces the gate on; it can no longer force it off.
+        // See the doc for the matching `env_cache.rs` cleanup.
+        let ir_emit_virtual_calls = ir_emit_virtual_calls || ir_virtual_calls_enabled();
         if (ir_emit_calls || ir_emit_special_calls || ir_emit_virtual_calls)
             && !scan.invoke_ops.is_empty()
         {
@@ -6467,6 +6671,10 @@ fn try_compile_inner(
                 if call_eligible {
                     let mut info_map = std::collections::HashMap::new();
                     let mut all_emittable = true;
+                    // Direct cross-method calls share the single-pass gate, so
+                    // the IR path inherits exactly its safety posture — no new
+                    // raw JIT→JIT transition shape is introduced.
+                    let ir_direct_calls_ok = direct_jit_callee_calls_enabled();
                     // Follow-up to the fib44 fix: when
                     // `CRATONVM_JIT_IR_SELFREC_DIRECT` is on, an eligible
                     // self-recursive static call is emitted as a DIRECT self-call
@@ -6579,6 +6787,13 @@ fn try_compile_inner(
                         } else {
                             3
                         };
+                        // Kept for the per-site lowering plan below, which needs
+                        // the resolved target AFTER the strings are moved into
+                        // the leaked-box vector. Three short-lived allocations
+                        // per call site at compile time.
+                        let cn_for_plan = cn.clone();
+                        let mn_for_plan = mn.clone();
+                        let desc_for_plan = desc.clone();
                         let class_box: Box<str> = cn.into_boxed_str();
                         let method_box: Box<str> = mn.into_boxed_str();
                         let desc_box: Box<str> = desc.into_boxed_str();
@@ -6599,6 +6814,109 @@ fn try_compile_inner(
                         let info_ptr = &*info as *const JitInvokeInfo as usize;
                         ir_call_infos.push(info);
                         info_map.insert(pc, (info_ptr, num_args, ret));
+
+                        // ── Per-site lowering plan (jit-inlining-and-ir-calls) ──
+                        //
+                        // Everything below only ever UPGRADES a site away from
+                        // the generic dispatch helper; an unclassified site
+                        // lowers exactly as it did before this change.
+                        //
+                        // Hard precondition for both upgrades: the call's
+                        // arguments plus the hidden VM context pointer must fit
+                        // the platform's integer argument registers, because
+                        // `emit_direct_call` / `emit_inline_cache_call` marshal
+                        // in registers only (4 on Win64, 6 on SysV). A wider
+                        // site keeps the helper, which marshals through the
+                        // in-frame staging region.
+                        let args_fit = ir_lower::IrCallPlan::args_fit_in_registers(num_args);
+                        if invoke_kind == 4 {
+                            // Already a direct self-call; `ir_lower` keys that
+                            // off `invoke_kind` and never consults the plan.
+                        } else if (is_static || is_special) && args_fit && ir_direct_calls_ok {
+                            // DIRECT CALL — statically bound target whose
+                            // compiled entry we can resolve now. Mirrors the
+                            // single-pass `direct_calls` table, including its
+                            // exclusion of recursive-cycle targets: a direct
+                            // call into ANOTHER method's artifact is a hazard
+                            // the self-call stack guard does not cover, so those
+                            // keep the dispatch route.
+                            //
+                            // `note_jit_recursive_compile_cycle` is called for
+                            // its SIDE EFFECT as well as its answer — it is the
+                            // mechanism that detects a mutual-recursion compile
+                            // cycle. Skipping it (and relying on
+                            // `jit_direct_call_requires_dispatch` alone) would
+                            // let a mutually recursive pair compile each other
+                            // without bound. Same call, same order, same
+                            // interpretation as the single-pass loop below.
+                            let closes_cycle = note_jit_recursive_compile_cycle(
+                                &cn_for_plan,
+                                &mn_for_plan,
+                                &desc_for_plan,
+                            );
+                            let cycle_target = closes_cycle
+                                || jit_direct_call_requires_dispatch(
+                                    &cn_for_plan,
+                                    &mn_for_plan,
+                                    &desc_for_plan,
+                                );
+                            if !is_self_recursive && !cycle_target {
+                                if let Some(compiler) = callee_compiler.as_ref() {
+                                    if let Some((entry, callee_needs_ctx)) =
+                                        compiler(&cn_for_plan, &mn_for_plan, &desc_for_plan)
+                                    {
+                                        // `args_fit` already budgeted the hidden
+                                        // context pointer (`num_args + 1 <=
+                                        // abi_len`), so a callee that does NOT
+                                        // take it needs strictly fewer
+                                        // registers — no re-check required.
+                                        ir_call_plan.sites.insert(
+                                            pc,
+                                            ir_lower::IrCallTarget::Direct {
+                                                entry,
+                                                needs_context: callee_needs_ctx,
+                                            },
+                                        );
+                                    }
+                                }
+                            }
+                        } else if (is_virtual || is_interface)
+                            && args_fit
+                            && helpers.invoke_virtual_mic != 0
+                        {
+                            // INLINE CACHE — the IR analogue of the single-pass
+                            // MIC/PIC pair, allocated with exactly the same
+                            // eager strategy (HIGH-7): one MIC + one PIC per
+                            // virtual/interface site, PIC seeded from the MIC so
+                            // a profile-driven dominant receiver is not lost.
+                            // Slots start empty; the inline guards fall straight
+                            // through to `jit_invoke_virtual_mic`, which
+                            // populates them, after which later invocations take
+                            // the inline path with no recompile.
+                            let mic = Box::new(JitMICSlot::new());
+                            if let Some(prof) = profile {
+                                if let Some(receiver_counts) = prof.receivers.get(&pc) {
+                                    if let Some(dom) =
+                                        profile::dominant_receiver(receiver_counts, 80)
+                                    {
+                                        mic.prepopulate(dom);
+                                    }
+                                }
+                            }
+                            let pic = Box::new(JitPICSlot::new());
+                            pic.seed_from_mic(&mic);
+                            let mic_addr = &*mic as *const JitMICSlot as usize;
+                            let pic_addr = &*pic as *const JitPICSlot as usize;
+                            ir_mic_slots.push(mic);
+                            ir_pic_slots.push(pic);
+                            ir_call_plan.sites.insert(
+                                pc,
+                                ir_lower::IrCallTarget::InlineCache {
+                                    mic: mic_addr,
+                                    pic: pic_addr,
+                                },
+                            );
+                        }
                     }
                     if all_emittable && !info_map.is_empty() {
                         if std::env::var_os("CRATONVM_DBG_IR_CALL").is_some() {
@@ -6614,14 +6932,47 @@ fn try_compile_inner(
                     } else {
                         // A non-emittable invoke is present → leave `invoke_info`
                         // unset (the builder bails on every invoke → single-pass)
-                        // and drop the now-unreferenced boxes/strings.
+                        // and drop the now-unreferenced boxes/strings. The
+                        // lowering plan and its MIC/PIC slots go with them: the
+                        // plan's baked imm64s are addresses INTO those boxes, so
+                        // they must never outlive the vectors that own them.
                         ir_call_infos.clear();
                         ir_call_strings.clear();
+                        ir_call_plan.sites.clear();
+                        ir_mic_slots.clear();
+                        ir_pic_slots.clear();
                     }
                 }
             }
         }
         let built = builder.build(code, code_len);
+        // jit-inlining-and-ir-calls, tier-4 compile-time guard. `ir_compatible`'s
+        // bytecode budget rose from 200 to HotSpot's 8000-byte HugeMethodLimit,
+        // which is the right *admission* rule but a poor proxy for compile cost:
+        // `ir_optimize`'s GVN, the escape-analysis connection graph and the
+        // scheduler are all super-linear in NODE count, and an 8000-byte
+        // straight-line arithmetic method builds a far larger graph than an
+        // 8000-byte call-heavy one. Check the built graph — the one input that
+        // reflects actual complexity — before any optimization runs, so an
+        // over-large method costs exactly one linear build and then takes the
+        // single-pass backend. Without this, raising the size cap would move
+        // compile-time blowup from "impossible" to "unbounded" at tier 4.
+        let built = match built {
+            Some(g) if g.nodes.len() > ir::IR_MAX_GRAPH_NODES => {
+                if std::env::var_os("CRATONVM_DBG_IR_CALL").is_some() {
+                    eprintln!(
+                        "[cratonvm-ircall] {}.{}{}: IR graph {} nodes > IR_MAX_GRAPH_NODES {} — single-pass",
+                        cached.class_name,
+                        cached.method_name,
+                        cached.method_descriptor,
+                        g.nodes.len(),
+                        ir::IR_MAX_GRAPH_NODES,
+                    );
+                }
+                None
+            }
+            other => other,
+        };
         // Soak diagnostic (CRATONVM_DBG_SCALAR_NEW): an allocation-bearing method
         // that bailed the IR builder went single-pass, so `new` scalar
         // replacement could not fire on it — the signal that the IR builder is
@@ -6754,10 +7105,17 @@ fn try_compile_inner(
                                 .collect()
                         })
                         .unwrap_or_default();
-                    // Supply BOTH the profiled branch hints (Step 4) and the
-                    // guard-surviving scalar-replacement map (Front 3.2) to the
-                    // shared lowering body. `sr_map` is `None` unless
-                    // `CRATONVM_SCALAR_DEOPT` + `CRATONVM_DEOPT_REAL` are set.
+                    // Supply the profiled branch hints (Step 4), the
+                    // guard-surviving scalar-replacement map (Front 3.2) and the
+                    // per-call-site lowering plan (jit-inlining-and-ir-calls) to
+                    // the shared lowering body. `sr_map` is `None` unless
+                    // `CRATONVM_SCALAR_DEOPT` + `CRATONVM_DEOPT_REAL` are set;
+                    // an empty plan reproduces the generic-dispatch lowering.
+                    let ir_call_plan_ref = if ir_call_plan.sites.is_empty() {
+                        None
+                    } else {
+                        Some(&ir_call_plan)
+                    };
                     if let Some(mut compiled) = ir_lower::lower_inner(
                         &graph,
                         &schedule,
@@ -6766,6 +7124,7 @@ fn try_compile_inner(
                         helpers,
                         &ir_branch_hints,
                         sr_map.as_ref(),
+                        ir_call_plan_ref,
                     ) {
                         // Gap B: attach the leaked `JitInvokeInfo` boxes/strings
                         // so the `info_ptr`s baked into each `Op::Call` stay valid
@@ -6778,6 +7137,17 @@ fn try_compile_inner(
                             compiled._jit_invoke_infos = ir_call_infos;
                             compiled._jit_strings = ir_call_strings;
                             compiled.has_dispatch = true;
+                        }
+                        // jit-inlining-and-ir-calls: transfer ownership of the
+                        // inline-cache slots to the compiled method. The MIC/PIC
+                        // addresses are baked into the emitted guards as imm64,
+                        // so the boxes MUST outlive the code — exactly the
+                        // contract `_jit_mic_slots` / `_jit_pic_slots` exists
+                        // for on the single-pass path. Both are empty when no
+                        // virtual/interface site was planned.
+                        if !ir_mic_slots.is_empty() {
+                            compiled._jit_mic_slots = ir_mic_slots;
+                            compiled._jit_pic_slots = ir_pic_slots;
                         }
                         // Backend-routing introspection (tests only): this body was
                         // produced by the optimizing IR pipeline. A method that
@@ -7004,7 +7374,20 @@ fn try_compile_inner(
     let mut pic_slots: Vec<(usize, *const JitPICSlot)> = Vec::new();
     let mut owned_pic_slots: Vec<Box<JitPICSlot>> = Vec::new();
     let mut inline_sites: HashMap<usize, InlineSite> = HashMap::new();
-    let mut inline_budget_remaining: usize = MAX_INLINE_BUDGET;
+    // jit-inlining-and-ir-calls: HotSpot-shaped inlining budget. `hot_loops`
+    // is derived once from the profile + bytecode; a caller that executes any
+    // hot loop gets the larger whole-method budget, and each individual site
+    // inside one gets the `FreqInlineSize` (325) rather than `MaxInlineSize`
+    // (35) callee cap. With no profile the lists are empty, every site is cold,
+    // and both the per-site cap and the whole-method budget collapse to the
+    // pre-2026-07-26 values — an unprofiled compile inlines identically.
+    let inline_hot_loops = hot_loop_ranges(code, code_len, profile);
+    let caller_is_hot = !inline_hot_loops.is_empty();
+    let mut inline_budget_remaining: usize = if caller_is_hot {
+        MAX_INLINE_BUDGET_HOT
+    } else {
+        MAX_INLINE_BUDGET
+    };
     let mut inlined_methods: Vec<(String, String, String)> = Vec::new();
     // `java/lang/String` field layout, resolved ONCE for the whole
     // compilation. `try_resolve_string_intrinsic` (in the invoke loop
@@ -7088,7 +7471,27 @@ fn try_compile_inner(
                 if inline_budget_remaining > 0 {
                     if let Some(resolver_fn) = inline_resolver.as_ref() {
                         if let Some(site) = resolver_fn(&class_name, &method_name, &descriptor) {
-                            if site.callee_code_len <= inline_budget_remaining {
+                            // Real budget accounting, in two independent
+                            // dimensions (jit-inlining-and-ir-calls):
+                            //  * PER SITE — the HotSpot three-tier callee cap.
+                            //    A trivial callee (<= MaxTrivialSize) always
+                            //    passes; otherwise a hot site gets
+                            //    FreqInlineSize and a cold one MaxInlineSize.
+                            //    Without this the raised admission constant
+                            //    (`MAX_INLINE_BYTECODE_SIZE`, now 325, which is
+                            //    what the VM-side resolver filters on) would
+                            //    splice 300-byte cold callees everywhere.
+                            //  * PER METHOD — the running `inline_budget_remaining`,
+                            //    which is what actually bounds code-size
+                            //    explosion: the single-pass backend reserves
+                            //    ~64 buffer bytes and ~1 frame slot per
+                            //    inlined bytecode, both linear in this total.
+                            let site_hot =
+                                call_site_is_hot(pc, &inline_hot_loops, profile);
+                            let size_cap = inline_size_cap_for_site(site_hot);
+                            let within_size = site.callee_code_len <= MAX_TRIVIAL_INLINE_SIZE
+                                || site.callee_code_len <= size_cap;
+                            if within_size && site.callee_code_len <= inline_budget_remaining {
                                 inline_budget_remaining =
                                     inline_budget_remaining.saturating_sub(site.callee_code_len);
                                 if site.needs_heap {
@@ -8353,6 +8756,21 @@ thread_local! {
     /// ⇒ fall back to the env var. Production never sets this.
     static SELFREC_DIRECT_TEST_OVERRIDE: std::cell::Cell<Option<bool>> =
         const { std::cell::Cell::new(None) };
+
+    /// Per-thread override for [`ir_virtual_calls_enabled`], for tests that must
+    /// exercise the "virtual calls declined" routing without mutating a
+    /// process-global env var (which would race parallel test threads). `None`
+    /// ⇒ fall back to the env var (i.e. enabled). Production never sets this.
+    static IR_VIRTUAL_CALLS_TEST_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Test hook: force IR virtual/interface call lowering on (`Some(true)`) / off
+/// (`Some(false)`) for the CURRENT thread, or restore env behaviour (`None`).
+/// Thread-local so parallel tests don't race. Not part of the stable API.
+#[doc(hidden)]
+pub fn __set_ir_virtual_calls_override(v: Option<bool>) {
+    IR_VIRTUAL_CALLS_TEST_OVERRIDE.with(|c| c.set(v));
 }
 
 /// Test hook: force the self-recursive direct-call path on (`Some(true)`) / off
@@ -8372,6 +8790,39 @@ fn selfrec_direct_enabled() -> bool {
         return v;
     }
     match std::env::var("CRATONVM_JIT_IR_SELFREC_DIRECT") {
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off"
+        ),
+        Err(_) => true,
+    }
+}
+
+/// Whether the IR pipeline may lower `invokevirtual` / `invokeinterface`
+/// (jit-inlining-and-ir-calls).
+///
+/// This capability existed before, but was gated **opt-IN** at the VM call
+/// sites (`CRATONVM_JIT_IR_CALL_VIRTUAL` had to be *set* to enable it) for a
+/// single, now-obsolete reason: the IR lowered every virtual call through the
+/// generic `jit_invoke_dispatch` helper with no inline cache, so admitting
+/// virtual calls made call-heavy methods SLOWER than the single-pass body they
+/// replaced. `ir_lower` now emits the MIC + 3-way-PIC cascade, so the
+/// regression risk that justified opt-in is gone and the flag inverts to a
+/// diagnostic opt-OUT, matching every other IR capability gate
+/// (`CRATONVM_JIT_IR_CALL`, `…_CALL_SPECIAL`, `…_LONG`, `…_FP`,
+/// `…_SELFREC_DIRECT`), all of which are `map_or(true, |v| v != "0")`.
+///
+/// FOLLOW-UP (not in this change's file scope): `vm/src/runtime/env_cache.rs`
+/// still computes its own copy of this flag as `var_os(...).is_some()`
+/// (opt-in). That copy is now redundant — `try_compile_inner` ORs the caller's
+/// parameter with this function, so the capability is on either way — but it
+/// should be inverted to `map_or(true, |v| v != "0")` for consistency, and
+/// then this local gate can be deleted. See the design doc.
+fn ir_virtual_calls_enabled() -> bool {
+    if let Some(v) = IR_VIRTUAL_CALLS_TEST_OVERRIDE.with(|c| c.get()) {
+        return v;
+    }
+    match std::env::var("CRATONVM_JIT_IR_CALL_VIRTUAL") {
         Ok(v) => !matches!(
             v.trim().to_ascii_lowercase().as_str(),
             "0" | "false" | "off"
@@ -10014,10 +10465,18 @@ mod tests {
         );
     }
 
-    /// inc 26 (Gap B): a resolved `invokevirtual` routes through the IR pipeline
-    /// ONLY when `ir_emit_virtual_calls` is on — independent of the invokestatic
-    /// (`ir_emit_calls`) and invokespecial (`ir_emit_special_calls`) gates. The
-    /// flags are crossed to prove the VIRTUAL flag alone admits invokevirtual.
+    /// inc 26 (Gap B) + jit-inlining-and-ir-calls: a resolved `invokevirtual`
+    /// routes through the IR pipeline.
+    ///
+    /// The polarity of this test INVERTED on 2026-07-26. It used to assert
+    /// "…ONLY when `ir_emit_virtual_calls` is on", because the IR lowered
+    /// virtual calls through the generic dispatch helper with no inline cache
+    /// and admitting them was a throughput regression. `ir_lower` now emits the
+    /// MIC + 3-way-PIC cascade, so the capability became opt-OUT: the caller's
+    /// parameter can still force it ON, but only the diagnostic
+    /// `CRATONVM_JIT_IR_CALL_VIRTUAL=0` (here, its thread-local test override)
+    /// can turn it off.
+    ///
     /// Guards against a vacuous validation: single-pass ALSO dispatches
     /// invokevirtual, so result-equality alone would not prove the IR path ran.
     #[test]
@@ -10096,9 +10555,46 @@ mod tests {
             "an Op::Call method must be needs_context"
         );
 
-        // ir_emit_virtual_calls = false (calls + special ON) → the builder bails on
-        // the invokevirtual → single-pass. Proves the static/special gates do NOT
-        // admit invokevirtual.
+        // Default (parameter false, no override): virtual calls are now
+        // opt-OUT, so the IR pipeline must STILL take this method. This is the
+        // assertion that inverted — it is the whole point of the change.
+        IR_LOWER_COMPILES.with(|c| c.set(0));
+        let by_default = try_compile(
+            &cached,
+            None,
+            None,
+            None,
+            Some(&invoke_resolver),
+            None,
+            None,
+            None,
+            None,
+            None,
+            &helpers,
+            None,
+            None,
+            None,
+            None,
+            true,  // optimize
+            false, // ir_emit_calls OFF
+            false, // ir_emit_special_calls OFF
+            false, // ir_emit_long
+            false, // ir_emit_virtual_calls: caller does NOT force it
+            false, // ir_emit_fp OFF
+            None,
+        );
+        assert!(by_default.is_some());
+        assert_eq!(
+            IR_LOWER_COMPILES.with(|c| c.get()),
+            1,
+            "invokevirtual must take the IR pipeline BY DEFAULT now that ir_lower \
+             emits MIC/PIC inline caches — the capability is opt-out, not opt-in"
+        );
+
+        // Explicit opt-out (`CRATONVM_JIT_IR_CALL_VIRTUAL=0`, modelled by the
+        // thread-local override) → the builder bails on the invokevirtual →
+        // single-pass. Proves the escape hatch still works.
+        __set_ir_virtual_calls_override(Some(false));
         IR_LOWER_COMPILES.with(|c| c.set(0));
         let _without = try_compile(
             &cached,
@@ -10124,10 +10620,11 @@ mod tests {
             false, // ir_emit_fp OFF
             None,  // cp_invokedynamic_descriptor_resolver: no indy in these test methods
         );
+        let took_ir = IR_LOWER_COMPILES.with(|c| c.get());
+        __set_ir_virtual_calls_override(None);
         assert_eq!(
-            IR_LOWER_COMPILES.with(|c| c.get()),
-            0,
-            "without ir_emit_virtual_calls, invokevirtual must NOT take the IR pipeline"
+            took_ir, 0,
+            "with CRATONVM_JIT_IR_CALL_VIRTUAL=0, invokevirtual must NOT take the IR pipeline"
         );
     }
 

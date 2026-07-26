@@ -574,6 +574,40 @@ impl CompilerCore {
                 state.queued_for_compilation = false;
                 state.queued_tier = None;
                 state.last_compile_time_ms = compile_time_ms;
+                // jit-inlining-and-ir-calls — tier-4 compile-time guard.
+                //
+                // The optimizing IR pipeline's admission rule was widened
+                // substantially on 2026-07-26: the invoke / field / static-field
+                // caps went from 5 to 64 and the bytecode-size cap from 200 to
+                // HotSpot's 8000-byte HugeMethodLimit, so the population of
+                // methods reaching C2 is now ordinary application code rather
+                // than a handful of small arithmetic kernels. `ir_compatible`
+                // and `ir::IR_MAX_GRAPH_NODES` bound the *static* inputs to a
+                // compile, but nothing bounded the OBSERVED cost.
+                //
+                // This closes that: a C2 compile that actually took longer than
+                // `MAX_C2_COMPILE_TIME_MS` is not re-attempted at C2 — the
+                // method degrades to C1 exactly as if it had deopted three
+                // times. Reusing `c2_bailout` rather than adding new state is
+                // deliberate: every existing degradation path already consults
+                // it (`should_compile`, `on_backedge`, `request_osr`,
+                // `request_c2_upgrade`), so the demotion is coherent with the
+                // deopt-driven one by construction, and the `c2_bailouts`
+                // statistic keeps counting the whole "stopped trying C2"
+                // population.
+                //
+                // Note this is measured on a compile that SUCCEEDED — a slow
+                // failure is already handled by `tier_fail_count`. A one-off
+                // slow compile on a contended host will demote a method that
+                // might have been fine; that is the intended conservative
+                // direction (C1 code is correct code, just less optimized).
+                if tier == CompilationTier::C2
+                    && compile_time_ms > MAX_C2_COMPILE_TIME_MS
+                    && !state.c2_bailout
+                {
+                    state.c2_bailout = true;
+                    self.stats.c2_bailouts.fetch_add(1, Ordering::Relaxed);
+                }
             }
         }
         if success {
@@ -856,6 +890,19 @@ pub struct TieredCompilationManager {
 
 /// Maximum number of deoptimizations before bailing out of C2.
 const MAX_DEOPTS_BEFORE_BAILOUT: u32 = 3;
+
+/// Wall-clock budget for a single C2 (optimizing IR) compile, in milliseconds.
+///
+/// A successful C2 compile that exceeds this demotes the method to C1 for the
+/// rest of the process, via the same `c2_bailout` flag the 3-deopt rule uses.
+/// See the guard in `CompilerCore::complete_task` for the full rationale.
+///
+/// 250 ms is roughly two orders of magnitude above a typical C2 compile in this
+/// JIT (single-digit milliseconds for the arithmetic kernels that historically
+/// reached tier 4), so it never fires on healthy input — it exists to catch a
+/// pathological method that slips past `ir_compatible`'s static budgets and
+/// `ir::IR_MAX_GRAPH_NODES`, not to tune throughput.
+pub const MAX_C2_COMPILE_TIME_MS: u64 = 250;
 
 /// Maximum number of receiver types tracked per call site.
 const MAX_RECEIVER_TYPES: usize = 3;
@@ -2100,6 +2147,58 @@ mod tests {
         // After 3 deopts, c2_bailout should be set.
         let methods = mgr.core.methods.lock();
         assert!(methods[&key].c2_bailout);
+    }
+
+    // ── Tier-4 compile-time guard (jit-inlining-and-ir-calls) ────────────
+
+    /// A C2 compile that stays inside `MAX_C2_COMPILE_TIME_MS` must leave the
+    /// method eligible for C2; one that exceeds it must demote the method to
+    /// C1 for the rest of the process, through the SAME `c2_bailout` flag the
+    /// 3-deopt rule uses (so every existing degradation path honours it with
+    /// no additional wiring).
+    ///
+    /// This is the coherence guarantee for the widened `ir_compatible` gate:
+    /// the population reaching tier 4 grew from small arithmetic kernels to
+    /// ordinary call-bearing application methods, and nothing previously
+    /// bounded the OBSERVED cost of an optimizing compile.
+    #[test]
+    fn slow_c2_compile_demotes_to_c1() {
+        let mgr = TieredCompilationManager::with_default_policy();
+        let key = test_key();
+        mgr.on_method_invocation(&key);
+
+        // Inside the budget → still a C2 method.
+        mgr.compilation_complete(&key, CompilationTier::C2, MAX_C2_COMPILE_TIME_MS);
+        assert!(
+            !mgr.core.methods.lock()[&key].c2_bailout,
+            "a C2 compile at exactly the budget must not demote"
+        );
+
+        // Over the budget → permanent C2 bailout, and the statistic counts it
+        // alongside deopt-driven bailouts.
+        let before = mgr.stats().c2_bailouts.load(Ordering::Relaxed);
+        mgr.compilation_complete(&key, CompilationTier::C2, MAX_C2_COMPILE_TIME_MS + 1);
+        assert!(
+            mgr.core.methods.lock()[&key].c2_bailout,
+            "a C2 compile over MAX_C2_COMPILE_TIME_MS must demote the method to C1"
+        );
+        assert_eq!(
+            mgr.stats().c2_bailouts.load(Ordering::Relaxed),
+            before + 1,
+            "the compile-time demotion must be counted as a c2 bailout"
+        );
+    }
+
+    /// The compile-time guard is C2-only: a slow C1 compile is not a reason to
+    /// refuse the optimizing tier (C1 and C2 use different backends, and the
+    /// single-pass backend is the fallback the bailout demotes *to*).
+    #[test]
+    fn slow_c1_compile_does_not_demote() {
+        let mgr = TieredCompilationManager::with_default_policy();
+        let key = test_key();
+        mgr.on_method_invocation(&key);
+        mgr.compilation_complete(&key, CompilationTier::C1, MAX_C2_COMPILE_TIME_MS * 10);
+        assert!(!mgr.core.methods.lock()[&key].c2_bailout);
     }
 
     // ── C2 bailout stays at C1 ───────────────────────────────────────────

@@ -2608,14 +2608,41 @@ fn find_loop_headers(code: &[u8], code_len: usize) -> HashSet<usize> {
 /// that constructs exception edges, so methods with try/catch are naturally
 /// rejected either there or at the bytecode-parse level.
 ///
-/// TODO(IR widening): increase caps once differential tests validate.
+/// # The 2026-07-26 re-gating (jit-inlining-and-ir-calls)
+///
+/// The invoke / field / allocation caps below used to be 5 / 5 / 5 / 3 / 3.
+/// Those numbers were not about IR *correctness* — the builder bails cleanly
+/// on anything it cannot lower, and the caller falls back to the single-pass
+/// backend on `build()` or `lower()` returning `None`. They were about
+/// **profitability**: the IR lowered every invoke through the generic
+/// `jit_invoke_dispatch` helper — no direct calls, no inline caches — so for a
+/// call-heavy method an "optimizing" recompile was a net REGRESSION against
+/// the single-pass body, which has direct calls, MIC/PIC inline caches and the
+/// inline TLAB bump. Capping invokes at five was how that regression was kept
+/// out of production, at the cost of excluding essentially every ordinary
+/// application method from the optimizing pipeline.
+///
+/// `ir_lower` now emits direct calls for statically-bound targets and a
+/// MIC + 3-way-PIC inline cache for virtual/interface sites (see
+/// [`crate::ir_lower::IrCallTarget`]), so the premise is gone and the caps
+/// rise with it. What survives is only what is still genuinely **unlowerable**:
+///
+/// | exclusion | why it survives |
+/// |---|---|
+/// | `athrow` | no IR lowering exists; only the single-pass backend emits the stash-pending-exception sequence (RBC.6). |
+/// | `invokedynamic` | the IR builder has no arm for `0xba`; single-pass lowers it to an uncommon trap. |
+/// | `multianewarray` | needs a resolver-shaped helper call sequence the IR lowerer does not synthesize. |
+/// | `checkcast` / `instanceof` | the runtime type check needs its own guard/PIC shape; not emitted by the IR lowerer. |
+///
+/// Everything else is now a **budget**, not a veto — see [`IR_MAX_INVOKES`],
+/// [`IR_MAX_FIELD_OPS`], [`IR_MAX_STATIC_FIELD_OPS`], [`IR_MAX_ALLOCATIONS`]
+/// and [`IR_MAX_BYTECODE_SIZE`]. Each is sized to keep tier-4 compile time and
+/// emitted code size bounded rather than to express a lowering gap; a method
+/// past a budget is still compiled, just by the single-pass backend.
 pub fn ir_compatible(scan: &super::x64::JitScanResult) -> bool {
-    // Caps below are deliberately conservative. A method that exceeds a cap is
-    // still compilable via the x64 single-pass backend; we just decline to
-    // route it through the IR pipeline until we've gained more confidence.
-
     // RBC.6 — the IR pipeline has no athrow lowering; only the x64
     // single-pass backend emits the stash-pending-exception sequence.
+    // SURVIVING EXCLUSION: this is a real missing lowering, not a budget.
     if scan.has_athrow {
         return false;
     }
@@ -2633,33 +2660,45 @@ pub fn ir_compatible(scan: &super::x64::JitScanResult) -> bool {
         return false;
     }
 
-    // Cap simple invokes (invokestatic / invokevirtual / invokespecial /
-    // invokeinterface). Invokedynamic is rejected upstream by `jit_scan`.
-    if scan.invoke_ops.len() > 5 {
+    // ── Budgets (NOT lowering gaps) ──────────────────────────────────
+    // Each of these is a compile-time / code-size guard rail. A method past a
+    // budget is still compiled — by the single-pass backend.
+    if scan.invoke_ops.len() > IR_MAX_INVOKES {
         return false;
     }
-    // Cap getfield/putfield.
-    if scan.field_ops.len() > 5 {
+    // getfield/putfield.
+    if scan.field_ops.len() > IR_MAX_FIELD_OPS {
         return false;
     }
-    // Cap getstatic/putstatic (same shape as instance field ops for IR).
-    if scan.static_field_ops.len() > 5 {
+    // getstatic/putstatic (same shape as instance field ops for IR).
+    if scan.static_field_ops.len() > IR_MAX_STATIC_FIELD_OPS {
         return false;
     }
-    // Cap `new` allocations.
-    if scan.new_ops.len() > 3 {
+    // `new` + `anewarray` allocations. NOTE: this budget is deliberately
+    // *unchanged in spirit* from the pre-2026-07-26 rule, and only modestly
+    // raised. The IR lowerer still has NO allocation path of its own — an
+    // `Op::New` that survives escape analysis makes `try_compile_inner` bail
+    // to single-pass (the `has_live_new` gate), precisely so the single-pass
+    // inline-TLAB bump-pointer fast path keeps serving every real allocation.
+    // Raising this number only lets MORE allocations be *scalar-replaced away*
+    // by escape analysis; it must never become a licence to lower a surviving
+    // allocation in the IR. Losing the inline TLAB bump is exactly how the
+    // July 2026 Binary Trees 4x regression happened (see BENCHMARK.md).
+    if scan.new_ops.len() > IR_MAX_ALLOCATIONS {
         return false;
     }
-    // Cap `anewarray` allocations.
-    if scan.anewarray_ops.len() > 3 {
+    if scan.anewarray_ops.len() > IR_MAX_ALLOCATIONS {
         return false;
     }
 
-    // Still rejected outright — IR has no lowering for these yet:
+    // ── Surviving exclusions — real missing lowerings ────────────────
     //  * `multianewarray` — multi-dim allocation needs a resolver-shaped helper
     //    call sequence that the IR lowerer does not synthesize.
-    //  * `checkcast` / `instanceof` — runtime type checks need polymorphic
-    //    inline caches that the IR pipeline does not yet emit.
+    //  * `checkcast` / `instanceof` — the runtime type check needs its own
+    //    guard shape (class-id compare + subtype-check helper fallback) which
+    //    the IR lowerer does not emit. The inline caches added for
+    //    virtual/interface DISPATCH do not help here: they cache a call
+    //    target, not a subtype answer.
     if !scan.multianewarray_ops.is_empty() {
         return false;
     }
@@ -2670,15 +2709,68 @@ pub fn ir_compatible(scan: &super::x64::JitScanResult) -> bool {
     true
 }
 
-/// Variant of [`ir_compatible`] that also enforces a hard cap on bytecode
-/// length. Kept as a separate entry point so the existing call site and tests
-/// stay source-compatible while callers that know the method size can opt into
-/// the extra guard.
+/// Maximum invoke sites (`invokestatic`/`virtual`/`special`/`interface`) in a
+/// method routed through the IR pipeline.
 ///
-/// TODO(IR widening): fold into `ir_compatible` once `try_compile` plumbs
-/// `code_len` through and once we've validated larger methods.
+/// Was 5, because every invoke cost a generic `jit_invoke_dispatch` round
+/// trip. With direct calls and MIC/PIC inline caches in `ir_lower`, an IR call
+/// site is now at worst equal to and usually cheaper than its single-pass
+/// counterpart, so the cap becomes a pure code-size budget: an inline-cache
+/// site emits ~250 bytes, so 64 sites is ~16 KiB of dispatch code — the same
+/// order as the single-pass backend produces for the same method.
+pub const IR_MAX_INVOKES: usize = 64;
+
+/// Maximum `getfield`/`putfield` sites. Was 5. Instance field access lowers to
+/// `Op::Load`/`Op::Store` (optionally through the checked `jit_getfield`
+/// helper); there is no per-site cost that scales worse than the single-pass
+/// backend, so this is a plain size budget.
+pub const IR_MAX_FIELD_OPS: usize = 64;
+
+/// Maximum `getstatic`/`putstatic` sites. Was 5. Same rationale as
+/// [`IR_MAX_FIELD_OPS`].
+pub const IR_MAX_STATIC_FIELD_OPS: usize = 64;
+
+/// Maximum `new` (and, separately, `anewarray`) sites.
+///
+/// Was 3, and raised only to 16 — deliberately the most conservative of the
+/// budgets. See the note at the allocation check in [`ir_compatible`]: the IR
+/// has no allocation lowering, so this number governs how many allocations
+/// escape analysis is allowed to *attempt* to scalar-replace before the method
+/// is handed to single-pass wholesale. Any surviving allocation still bails the
+/// whole method to single-pass so the inline TLAB bump-pointer fast path is
+/// preserved.
+pub const IR_MAX_ALLOCATIONS: usize = 16;
+
+/// Maximum bytecode length for the IR pipeline.
+///
+/// Was 200 — small enough that essentially no real application method
+/// qualified. 8000 is HotSpot's `HugeMethodLimit`, the point at which HotSpot
+/// itself declines to compile a method at all (`DontCompileHugeMethods`), so
+/// this stops being an IR-specific restriction and becomes the same
+/// "pathological method" backstop every JVM has. Tier-4 compile time is
+/// additionally bounded by [`IR_MAX_GRAPH_NODES`], which is checked on the
+/// *built* graph and therefore reflects actual complexity rather than a byte
+/// count.
+pub const IR_MAX_BYTECODE_SIZE: usize = 8000;
+
+/// Maximum node count of a built IR graph before the optimizing pipeline is
+/// abandoned in favour of the single-pass backend.
+///
+/// This is the real compile-time guard for tier 4. `ir_optimize` runs several
+/// passes that are super-linear in node count (GVN's value numbering, the
+/// escape-analysis connection graph, the scheduler's block placement), so a
+/// bytecode-length cap alone does not bound compile time: an 8000-byte method
+/// dominated by straight-line arithmetic builds a far larger graph than an
+/// 8000-byte method dominated by calls. Checked in `try_compile_inner` right
+/// after `IrBuilder::build`, before any optimization runs, so an over-large
+/// graph costs one linear build and nothing else.
+pub const IR_MAX_GRAPH_NODES: usize = 20_000;
+
+/// Variant of [`ir_compatible`] that also enforces the bytecode-length budget.
+/// Kept as a separate entry point so callers that do not know the method size
+/// stay source-compatible.
 pub fn ir_compatible_sized(scan: &super::x64::JitScanResult, code_len: usize) -> bool {
-    if code_len > 200 {
+    if code_len > IR_MAX_BYTECODE_SIZE {
         return false;
     }
     ir_compatible(scan)
@@ -3046,12 +3138,51 @@ mod tests {
             has_newarray: false,
             ldc_ops: vec![],
         };
-        // Too many invokes.
-        scan.invoke_ops = (0..6).map(|i| (i, i as u16, 0xb8)).collect();
+        // jit-inlining-and-ir-calls: the invoke budget rose from 5 to
+        // IR_MAX_INVOKES once `ir_lower` grew direct calls and MIC/PIC inline
+        // caches. A method AT the budget is admitted; one past it is not.
+        scan.invoke_ops = (0..IR_MAX_INVOKES).map(|i| (i, i as u16, 0xb8)).collect();
+        assert!(
+            ir_compatible(&scan),
+            "a method at exactly IR_MAX_INVOKES invokes must be admitted"
+        );
+        scan.invoke_ops = (0..IR_MAX_INVOKES + 1)
+            .map(|i| (i, i as u16, 0xb8))
+            .collect();
         assert!(!ir_compatible(&scan));
         scan.invoke_ops.clear();
-        // checkcast still rejected outright.
+        // The old 5-invoke cap is emphatically gone: six invokes — the exact
+        // shape the previous gate rejected — must now take the IR path.
+        scan.invoke_ops = (0..6).map(|i| (i, i as u16, 0xb8)).collect();
+        assert!(
+            ir_compatible(&scan),
+            "the pre-2026-07-26 five-invoke cap must no longer apply"
+        );
+        scan.invoke_ops.clear();
+        // Field / static-field / allocation budgets.
+        scan.field_ops = (0..IR_MAX_FIELD_OPS + 1).map(|i| (i, i as u16)).collect();
+        assert!(!ir_compatible(&scan));
+        scan.field_ops.clear();
+        scan.static_field_ops = (0..IR_MAX_STATIC_FIELD_OPS + 1)
+            .map(|i| (i, i as u16))
+            .collect();
+        assert!(!ir_compatible(&scan));
+        scan.static_field_ops.clear();
+        scan.new_ops = (0..IR_MAX_ALLOCATIONS + 1).map(|i| (i, i as u16)).collect();
+        assert!(!ir_compatible(&scan));
+        scan.new_ops.clear();
+        // ── Surviving exclusions ────────────────────────────────────
+        // checkcast/instanceof still rejected outright: the inline caches
+        // added for virtual DISPATCH cache a call target, not a subtype answer.
         scan.typecheck_ops = vec![(0, 1)];
+        assert!(!ir_compatible(&scan));
+        scan.typecheck_ops.clear();
+        // athrow still rejected outright: no IR lowering exists.
+        scan.has_athrow = true;
+        assert!(!ir_compatible(&scan));
+        scan.has_athrow = false;
+        // multianewarray still rejected outright.
+        scan.multianewarray_ops = vec![(0, 1, 2)];
         assert!(!ir_compatible(&scan));
     }
 
@@ -3075,8 +3206,14 @@ mod tests {
             has_newarray: false,
             ldc_ops: vec![],
         };
+        // jit-inlining-and-ir-calls: the bytecode-size budget rose from 200
+        // (which excluded essentially every real application method) to
+        // HotSpot's `HugeMethodLimit`. The 200-byte method that used to sit
+        // exactly at the old boundary must now be admitted.
         assert!(ir_compatible_sized(&scan, 200));
-        assert!(!ir_compatible_sized(&scan, 201));
+        assert!(ir_compatible_sized(&scan, 201));
+        assert!(ir_compatible_sized(&scan, IR_MAX_BYTECODE_SIZE));
+        assert!(!ir_compatible_sized(&scan, IR_MAX_BYTECODE_SIZE + 1));
     }
 
     /// invokedynamic-uncommon-trap fix — regression test: `ir_compatible`
