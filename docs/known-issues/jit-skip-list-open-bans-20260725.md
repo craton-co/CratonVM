@@ -173,6 +173,18 @@ still real correctness bugs worth closing):
   SPB/CGL/PIC/WildFly family). Do not duplicate.
 - PROXY-JITCALL.1 — REMOVED (see above, merged dev@07427a14e).
 
+**Status (`fix/jit-ban-sweep2-20260726` / `wt-jitsweep2-20260726`):**
+- Item 2 (SPB.1 bisection, `org/springframework/util/`) — **STARTED
+  2026-07-26 02:20 UTC.** Confirming this session's own two prior findings
+  before starting: `org/jboss/as/` (SPB.8b sibling) and `org/h2/`
+  (HIB-LONGTAIL.1) are BOTH confirmed still-needed with live JIT-only
+  correctness bugs found (see `docs/internal/jit-ban-sweep-20260725.md`,
+  `docs/known-issues/wildfly/modeltypevalidator-validtypes-npe.md`,
+  `docs/known-issues/h2/h2-jitban-schema-not-found-on-reconnect.md`) — so
+  the "allocate-then-putfield theory is stale" hypothesis is already
+  weakened going into this test; expecting SPB.1 to also still be needed,
+  but testing for real rather than assuming.
+
 1. Verify (or refute) the TYPES-ERASURE.1 consolidation hypothesis — highest
    expected value, cheapest to test (no-rebuild env-var bisection already
    proven to work on this exact cluster).
