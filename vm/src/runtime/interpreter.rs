@@ -2101,6 +2101,21 @@ fn process_references_after_gc(
     if no_refproc() {
         return;
     }
+    // Pressure input to the SoftReference LRU policy (HotSpot's
+    // `LRUMaxHeapPolicy`: clear when `idle_ms > SoftRefLRUPolicyMSPerMB *
+    // free_heap_mb`). This used to be a hardcoded `64`, which pinned the
+    // threshold at a constant 64 seconds of idleness no matter how full the
+    // heap was, so the policy could not respond to memory pressure at all.
+    // `soft_ref_policy_free_mb()` returns whole megabytes of *allocatable*
+    // headroom (min of young/eden and old-gen promotion room, capped by
+    // whole-heap headroom, rounded down so a sub-MB remainder reads as 0 =
+    // maximum pressure) — the right figure under the non-moving fragmenting
+    // collector that actually runs by default, where unused bytes and
+    // obtainable bytes diverge. Read *before* taking the reference-processor
+    // lock: the accessor reaches into the heap's own generation stats, and
+    // there is no reason to nest those acquisitions.
+    // See `docs/internal/arch-2026-07-26/refs-metaspace-unloading.md` §2/§R1.
+    let free_mb = shared.mem.heap.soft_ref_policy_free_mb();
     let mut ref_proc = shared.mem.ref_processor.lock();
 
     // An object is "marked" (survived GC) if:
@@ -2111,7 +2126,10 @@ fn process_references_after_gc(
         pointer_map.contains_key(&addr) || shared.mem.heap.is_addr_live(addr)
     };
 
-    let result = ref_proc.process_references(&is_marked, 64, 0);
+    // The `0` third argument is deliberate, not a second hardcode: when the
+    // caller passes 0, `gc::reference` substitutes the mutator clock it
+    // observes through `touch_soft_reference` (`last_observed_clock_ms`).
+    let result = ref_proc.process_references(&is_marked, free_mb, 0);
 
     // bc math-ec 0x4 ROOT-CAUSE FIX (2026-06-09, hexdump-proven): the
     // cleared/enqueue lists hold PRE-GC addresses; `pointer_map.get(..)
@@ -4568,8 +4586,12 @@ fn g1_remark_process_references(
     if no_refproc() {
         return Vec::new();
     }
+    // Same pressure input as the post-GC path — see the long comment there for
+    // why this is allocatable headroom rather than the former hardcoded `64`,
+    // and why the `0` clock argument is correct rather than a second hardcode.
+    let free_mb = shared.mem.heap.soft_ref_policy_free_mb();
     let mut ref_proc = shared.mem.ref_processor.lock();
-    let result = ref_proc.process_references(is_marked, 64, 0);
+    let result = ref_proc.process_references(is_marked, free_mb, 0);
 
     // Null the referent slot of newly-cleared references (once-only per
     // entry, same contract as the post-GC path).
@@ -30022,18 +30044,33 @@ fn intercept_force_registered_native_cached(
     {
         return None;
     }
-    // Perf (2026-07-19, TestResponsePerformance residual): memoize the
-    // resolved callback per invoke-cache entry, same shape as
-    // `force_native_cache` above -- native registration is immutable after
-    // boot, so this triple always resolves to the same callback. Confirmed
-    // via `perf` that `NativeMethodRegistry::find` was the #2 hottest
-    // symbol (~7% of samples) on this exact benchmark before this fix.
-    let cb = (*cached.native_callback_cache.get_or_init(|| {
-        shared
-            .natives
-            .native_methods
-            .find(class_name, method_name, method_descriptor)
-    }))?;
+    // Site A1 of `docs/internal/arch-2026-07-26/native-dispatch-memoization.md`
+    // §3 Step 2. Perf (2026-07-19, TestResponsePerformance residual): memoize
+    // the resolved callback per invoke-cache entry, same shape as
+    // `force_native_cache` above -- `NativeMethodRegistry::find` was the #2
+    // hottest symbol (~7% of samples) on that benchmark.
+    //
+    // This was a `OnceLock<Option<NativeCallback>>` and is now a
+    // generation-keyed `NativeCallSite`, which also FIXES A LATENT BUG: the
+    // `OnceLock` memoized a *negative* permanently, on the argument that
+    // native registration is immutable after boot. That holds for the steady
+    // state but not for boot itself, nor for `alias_class` / the lazy
+    // `register_*` passes that run after the first bytecode executes -- a
+    // native registered by a later pass was invisible here forever, while
+    // dispatching fine through `find`. The generation check re-resolves
+    // exactly when a new slot is appended.
+    //
+    // ONE CELL, ONE TRIPLE: `class_name`/`method_name`/`method_descriptor` are
+    // `cached.{class,method}_name` / `cached.method_descriptor` verbatim (bound
+    // at the top of this function), so this cell only ever sees this entry's
+    // own triple. The `java/lang/ClassLoader` re-target earlier in this
+    // function deliberately stays on plain `find` for that reason.
+    let cb = cached.native_call_site().callback(
+        &shared.natives.native_methods,
+        class_name,
+        method_name,
+        method_descriptor,
+    )?;
     if method_name == "getTarget" && crate::runtime::env_cache::dbg_ccsprobe() {
         eprintln!(
             "[ccs-probe] intercept_force_registered_native_cached: dispatching native callback"
@@ -39348,31 +39385,34 @@ fn execute_invokevirtual_vtable_fast(
                 cached.method_descriptor.as_ref(),
             )
         });
-        // T2.5 -- the registry probe is memoized too, via the SAME
-        // `native_callback_cache` the force-native interception path
-        // (`intercept_force_registered_native_cached`) and the instance tier-up
-        // gate already use. It is keyed on exactly this triple, and
-        // `NativeMethodRegistry::find` re-hashes all three strings on every
-        // call. The previous comment here kept the probe live because
-        // "registrations can differ between VM configurations" -- true, but that
-        // is a difference between *processes*: every `register` call in the tree
-        // runs in `vm_init.rs` against the `&mut` registry BEFORE `SharedVm` is
-        // constructed, and `SharedVm.native_methods` is a plain immutable
-        // `NativeMethodRegistry` thereafter, so within one process the triple's
-        // answer can never change. That is the same immutability argument
-        // `native_callback_cache`'s own doc comment already relies on.
+        // Site A2 of `native-dispatch-memoization.md` §3 Step 2.
+        //
+        // T2.5 -- the registry probe is memoized too, via the SAME per-entry
+        // `NativeCallSite` the force-native interception path
+        // (`intercept_force_registered_native_cached`, site A1) and the
+        // instance tier-up gate (site A3) use. All three ask for exactly this
+        // entry's triple, which is what the one-cell-one-triple invariant
+        // requires; `NativeMethodRegistry::find` would re-hash all three
+        // strings on every vtable hit.
+        //
+        // The probe used to be a `OnceLock` memo justified by "every `register`
+        // call runs in `vm_init.rs` against the `&mut` registry BEFORE
+        // `SharedVm` is constructed". That is not quite true -- `alias_class`
+        // and the lazy `register_*` passes append slots after the first
+        // bytecode executes -- and a `None` memoized before them never healed.
+        // Keying on `NativeMethodRegistry::generation()` makes the memo correct
+        // at every point in the VM's lifetime, not just after boot.
         // `entry.resolved_method` is a long-lived `Arc` held by the vtable slot,
         // so the memo really does persist across vtable hits.
         let force_native_registered = force_native
             && cached
-                .native_callback_cache
-                .get_or_init(|| {
-                    shared.natives.native_methods.find(
-                        cached.class_name.as_ref(),
-                        cached.method_name.as_ref(),
-                        cached.method_descriptor.as_ref(),
-                    )
-                })
+                .native_call_site()
+                .resolve(
+                    &shared.natives.native_methods,
+                    cached.class_name.as_ref(),
+                    cached.method_name.as_ref(),
+                    cached.method_descriptor.as_ref(),
+                )
                 .is_some();
         if force_native_registered {
             return Ok(CachedCallResult::CacheMiss);
@@ -40219,19 +40259,24 @@ fn execute_invokevirtual_cached(
                     // ONLY under JIT (this tier-up is JIT-only) and ONLY once
                     // warm — see docs/known-issues/springboot/
                     // core-spring-boot-test-config-data-and-classpath-scan-cluster.md
-                    // Cluster C "Residual 5". Reusing `native_callback_cache`
-                    // (already memoized per call site for the force-native path
-                    // above) keeps this a single extra hash lookup, not a
-                    // per-call cost.
+                    // Cluster C "Residual 5". Site A3 of
+                    // `native-dispatch-memoization.md` §3 Step 2: reusing this
+                    // entry's `NativeCallSite` (already warm from the
+                    // force-native path above, and asking for the same triple)
+                    // keeps this two integer loads, not a per-call triple hash.
+                    // Unlike the `OnceLock` it replaces, a native registered by
+                    // a lazy `register_*` pass after this site first ran is now
+                    // seen -- which matters here, because a missed native means
+                    // tier-up compiles the REAL BYTECODE and permanently
+                    // bypasses the override.
                     let has_registered_native = cached
-                        .native_callback_cache
-                        .get_or_init(|| {
-                            shared.natives.native_methods.find(
-                                &cached.class_name,
-                                &cached.method_name,
-                                &cached.method_descriptor,
-                            )
-                        })
+                        .native_call_site()
+                        .resolve(
+                            &shared.natives.native_methods,
+                            &cached.class_name,
+                            &cached.method_name,
+                            &cached.method_descriptor,
+                        )
                         .is_some();
                     if !is_special
                         && !matches!(thread.kind, crate::threading::ThreadKind::Virtual)
@@ -42846,6 +42891,134 @@ mod wave1_adoption_tests {
         assert!(cell_b
             .callback(&registry, "java/lang/Sample", "b", "()V")
             .is_some());
+    }
+
+    fn cached_entry(class: &str, method: &str, descriptor: &str) -> CachedBytecodeMethod {
+        CachedBytecodeMethod {
+            declaring_class_id: cratonvm_types::ClassId::new(4242),
+            class_name: StdArc::from(class),
+            method_name: StdArc::from(method),
+            method_descriptor: StdArc::from(descriptor),
+            source_file: None,
+            code: StdArc::from(vec![0xB1u8].as_slice()),
+            exception_table: StdArc::from(vec![].as_slice()),
+            max_stack: 0,
+            max_locals: 1,
+            num_params: 0,
+            is_synchronized: false,
+            is_static: false,
+            force_native_cache: std::sync::OnceLock::new(),
+            native_callback_cache: std::sync::OnceLock::new(),
+            invoc_key: std::sync::OnceLock::new(),
+            jit_probe_generation: std::sync::atomic::AtomicU64::new(0),
+            quickened: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Sites A1-A3 (`native-dispatch-memoization.md` §3 Step 2) all read the
+    /// SAME per-entry `NativeCallSite`. That is only safe because all three
+    /// hand it the same triple — and each spells the arguments differently:
+    ///
+    /// * A1 (`intercept_force_registered_native_cached`) binds
+    ///   `let class_name = cached.class_name.as_ref();` at the top of the
+    ///   function and passes the bindings;
+    /// * A2 (the vtable-hit force-native gate) passes `cached.*.as_ref()`;
+    /// * A3 (the instance tier-up gate) passes `&cached.*`.
+    ///
+    /// Three spellings of one triple. If any of them ever drifts to a
+    /// *different* triple, the shared cell silently serves that site whatever
+    /// the others memoized (see
+    /// `sharing_one_memo_cell_across_two_triples_silently_mis_answers`). Pin
+    /// that the three spellings are interchangeable through the shared cell.
+    #[test]
+    fn sites_a1_a2_a3_share_one_cell_because_they_share_one_triple() {
+        let cached = cached_entry("java/lang/Sample", "run", "()V");
+        let mut registry = cratonvm_native_api::NativeMethodRegistry::new();
+        registry.register("java/lang/Sample", "run", "()V", noop_native);
+
+        // A1's spelling.
+        let class_name = cached.class_name.as_ref();
+        let method_name = cached.method_name.as_ref();
+        let method_descriptor = cached.method_descriptor.as_ref();
+        let a1 = cached
+            .native_call_site()
+            .callback(&registry, class_name, method_name, method_descriptor)
+            .expect("A1 must resolve the registered native");
+
+        // A2's spelling, through the now-warm shared cell.
+        let a2 = cached
+            .native_call_site()
+            .resolve(
+                &registry,
+                cached.class_name.as_ref(),
+                cached.method_name.as_ref(),
+                cached.method_descriptor.as_ref(),
+            )
+            .expect("A2 must resolve the same native through the warm cell");
+
+        // A3's spelling.
+        let a3 = cached
+            .native_call_site()
+            .resolve(
+                &registry,
+                &cached.class_name,
+                &cached.method_name,
+                &cached.method_descriptor,
+            )
+            .expect("A3 must resolve the same native through the warm cell");
+
+        assert_eq!(a2, a3, "A2 and A3 must resolve the identical native id");
+        assert_eq!(
+            registry.callback_of(a2).map(|cb| cb as usize),
+            Some(a1 as usize),
+            "all three sites must agree with each other and with `find`"
+        );
+        assert_eq!(
+            registry
+                .find("java/lang/Sample", "run", "()V")
+                .map(|cb| cb as usize),
+            Some(a1 as usize),
+            "and with the `find` they replaced"
+        );
+    }
+
+    /// The latent bug the A1-A3 conversion fixes. The `OnceLock` these sites
+    /// used sealed a *negative* for the life of the process, so a native
+    /// registered by `alias_class` or a lazy `register_*` pass — both of which
+    /// run after the first bytecode executes — stayed invisible here. At A3
+    /// that is not merely a slow path: a missed native lets tier-up compile the
+    /// method's real bytecode, which permanently bypasses the override.
+    #[test]
+    fn a1_a3_see_a_native_registered_after_the_site_first_ran() {
+        let cached = cached_entry("java/lang/Sample", "late", "()V");
+        let mut registry = cratonvm_native_api::NativeMethodRegistry::new();
+
+        // Cold pass: no native yet. A `OnceLock` would seal this `None`.
+        assert!(cached
+            .native_call_site()
+            .callback(
+                &registry,
+                cached.class_name.as_ref(),
+                cached.method_name.as_ref(),
+                cached.method_descriptor.as_ref(),
+            )
+            .is_none());
+
+        registry.register("java/lang/Sample", "late", "()V", noop_native);
+
+        assert!(
+            cached
+                .native_call_site()
+                .resolve(
+                    &registry,
+                    cached.class_name.as_ref(),
+                    cached.method_name.as_ref(),
+                    cached.method_descriptor.as_ref(),
+                )
+                .is_some(),
+            "the tier-up gate must observe a late registration, or it will \
+             compile real bytecode over a registered native override"
+        );
     }
 }
 
