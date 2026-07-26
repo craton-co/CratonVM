@@ -3,12 +3,43 @@
 
 //! Profile-Guided Optimization (PGO) pipeline for the CratonVM JIT compiler.
 //!
-//! Collects and analyses runtime profiling data to drive:
+//! Models runtime profiling data intended to drive:
 //! - Branch prediction hints
 //! - Receiver-type (virtual call) specialisation
 //! - Call-site inlining decisions
 //! - Loop unrolling hints
 //! - Devirtualisation strategies
+//!
+//! # ⚠ THIS MODULE IS NOT CONNECTED TO THE RUNNING VM
+//!
+//! **Nothing outside this file constructs, populates or reads any type
+//! declared here.** Verified 2026-07-26: `pgo::`, [`PgoRepository`],
+//! [`MethodProfile`], [`CallSiteProfile`], [`ReceiverTypeProfile`] and
+//! [`InliningPolicy`] have zero references anywhere in `jit/`, `vm/` or the
+//! test suites; `jit/src/lib.rs` declares `pub mod pgo;` and never uses it.
+//! Every counter in this module is therefore permanently **zero at runtime**.
+//!
+//! The consequence for anyone reaching for it: an optimisation gated on
+//! [`CallSiteProfile::inline_benefit_score`], [`MethodProfile::get_inline_candidates`],
+//! [`ReceiverTypeProfile::is_monomorphic`] or [`InliningPolicy::should_inline`]
+//! will silently see "no candidates / not hot / not monomorphic" for every
+//! call site in the VM, and its effect will be indistinguishable from being
+//! turned off. That failure mode — a capability that reads as landed but never
+//! runs — is exactly what `docs/internal/flag-census.md` tracks.
+//!
+//! **The live profile is [`crate::profile`]**, which the interpreter really
+//! does feed (`ProfileStore::record_branch_borrowed` / `record_backedge_borrowed`
+//! / `record_receiver_borrowed` / `increment_invocation` from
+//! `vm/src/runtime/interpreter.rs`) and which the JIT really does consume
+//! (`jit/src/lib.rs` derives `branch_hints` and `loop_unroll_hints` from it and
+//! passes them to `x64::compile`). Use `crate::profile::MethodProfile` — note
+//! it is a *different* type with the same name — and in particular
+//! `crate::profile::MethodProfile::call_site_count`, which reports per-call-site
+//! evidence and distinguishes "no data" from "cold".
+//!
+//! This module is retained as a design sketch for the richer profile the tiered
+//! pipeline eventually wants. Do not delete it silently, and do not wire a new
+//! optimisation to it without first giving it a recorder.
 
 use std::collections::HashMap;
 
