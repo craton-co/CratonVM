@@ -54,6 +54,7 @@ pub use class_manager::is_bootstrap_appended_class;
 pub use class_manager::{
     any_class_redefined,
     bump_jit_supersede_epoch,
+    drain_pending_class_hooks,
     install_class_file_load_hook,
     install_class_load_hook,
     install_class_prepare_hook,
@@ -71,6 +72,7 @@ pub use class_manager::{
     // `docs/internal/loader-identity.md`.
     loader_aware_resolution,
     register_builtin_classloaders,
+    set_current_thread_id,
     static_common_superclass_lookup,
     ClassFileLoadHook,
     ClassManager,

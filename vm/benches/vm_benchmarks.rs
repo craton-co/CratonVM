@@ -37,7 +37,7 @@ fn register_bench_class(
     use cratonvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
     use cratonvm_vm::classloading::Class;
 
-    let mut cm = shared.classes.class_manager.write();
+    let mut cm = shared.classes.class_manager_write();
     let id = cm.class_store.next_id();
     let class_name: Arc<str> = Arc::from(name);
     cm.class_store.add(Class {

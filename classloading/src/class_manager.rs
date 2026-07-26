@@ -19,6 +19,7 @@
 // internal map/set in this file now uses `FxHashMap` / `FxHashSet`
 // (faster non-cryptographic hash, safe because keys are trusted internal
 // data: ClassId, interned class names, etc.).
+use std::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 
@@ -623,60 +624,62 @@ impl<'a> ClassHierarchy for ClassStoreHierarchy<'a> {
 // `AtomicBool` load and branches past the call — the cost of the hook is
 // zero for embedded/test scenarios that do not attach an agent.
 //
-// The hooks receive `(class_id_u32, class_name, thread_id)`. Thread id is
-// supplied by the caller; when unknown (e.g. bootstrap class loading before
-// any thread exists) the caller should pass 0 and the JVMTI layer routes
-// the event to the VM-init thread.
+// The hooks receive `(class_id_u32, class_name, thread_id)`. `thread_id` is
+// `current_thread_id()` (see below) when a VM thread has registered itself
+// via [`set_current_thread_id`], else 0 — the documented "unknown/bootstrap"
+// sentinel that the JVMTI layer routes to the VM-init thread. The three VM
+// thread-creation sites (main thread in `vm_init.rs`, `Thread.start` workers
+// in `vm_exec.rs`, foreign attach in `native/jni.rs`) call
+// `set_current_thread_id` once, at registration, on the OS thread that will
+// go on to run that Java thread's bytecode — so ordinary interpreter-driven
+// class loading reports the real `jthread` an agent can key on to skip its
+// own instrumentation thread.
 //
-// RE-ENTRANCY IS PROHIBITED. Both hooks fire from inside
-// `define_class_shared_with_options` while the class loader still holds
-// `&mut self` — i.e. with the caller's L10 `ClassRealm::class_manager`
-// write guard (`vm/src/vm/realms/class_realm.rs`) still alive. A hook
-// that re-enters ANY class-manager API self-deadlocks on the same
-// thread: `parking_lot::RwLock` is not reentrant. This matches the
-// contract already documented for [`VtableInstallHook`] below, which
-// fires from the same place under the same guard.
+// DEFERRED FIRING (2026-07-26, obsaudit D1). `fire_class_load_hook` /
+// `fire_class_prepare_hook` do not call the installed hook synchronously.
+// They push onto a thread-local queue; the queue is drained — and the hook
+// actually invoked — only after the caller's L10 `ClassRealm::class_manager`
+// write guard (`vm/src/vm/realms/class_realm.rs`) has been released. See
+// `ClassRealm::class_manager_write` / `ClassManagerWriteGuard::drop`, which
+// is now the *only* way to acquire that write lock (every former
+// `.class_manager_write()` call site was mechanically renamed to
+// `.class_manager_write()` so no site can bypass the drain).
 //
-// (An earlier version of this comment claimed calls were made *after*
-// the class manager released its internal locks, so callbacks could
-// safely call back in — e.g. `GetLoadedClasses`. That was never true of
-// this code. The claim is retracted rather than implemented: firing
-// under the guard is deliberate. `define_class` recurses through
-// `load_class` for superclass and interface resolution, so deferring
-// delivery would mean buffering notifications and draining them at
-// every one of the ~59 `class_manager.write()` sites in `vm/` — any
-// missed drain silently delivers ClassLoad late, out of order, or
-// attributed to the wrong thread. The hook is also on the hottest path
-// in the VM (~90k class defines on a Spring Boot cold start) and is
-// designed to cost one `AtomicBool` load when no agent is attached.)
+// This was previously documented as a deliberate "fire under the guard"
+// design, on the theory that deferring would require buffering and draining
+// at every one of the ~50 `class_manager.write()` sites in `vm/`, any one of
+// which could "miss the drain" and leak a stale event. That risk is what the
+// guard-wrapper closes: there is now exactly one place a write guard can be
+// obtained, and exactly one place it is dropped, so there is no site left
+// that could miss the drain. `define_class` recursion through `load_class`
+// (superclass/interface resolution) still holds `&mut self` across nested
+// calls without re-locking, so nested class loads queue several events and
+// they fire together, in push order, the instant the *outermost* guard for
+// that acquisition is released — which is also the earliest instant another
+// thread could observe the new class via a fresh `.read()`/`.write()`, so a
+// listener that reacts to ClassLoad by immediately querying the class (e.g.
+// `GetClassSignature`) no longer blocks on a lock its own event delivery is
+// still holding.
 //
-// Failure mode if a hook does re-enter:
-//   - debug builds, or release with `CRATONVM_LOCK_ORDER_CHECK=1`:
-//     `check_and_acquire` asserts `level < held`, so re-taking L10 at
-//     the same level panics with a `LockOrderViolation` naming
-//     ClassManager twice — a diagnosable panic, not a hang.
-//   - release builds without that env var: enforcement is off and the
-//     re-acquisition is a genuine hard deadlock.
-//   - `read_recursive()` is NOT caught even in debug builds
-//     (`check_and_acquire_reentrant` early-returns when the level is
-//     already held) and still deadlocks against the held write guard.
+// A hook may now freely re-enter the class manager (take a fresh read or
+// write lock, call back into `load_class`, etc.) — by the time it runs, the
+// lock that used to make that a self-deadlock has already been released on
+// this thread. This matches the contract already documented for
+// [`VtableInstallHook`] below only insofar as both fire from the same
+// place; unlike that hook, class-lifecycle hooks are no longer required to
+// avoid calling back in.
 //
 // The in-tree adapters (`class_load_adapter` / `class_prepare_adapter`,
-// `vm/src/vm/vm_init.rs`) satisfy the contract: they forward to
-// `runtime::jvmti::fire_class_{load,prepare}`, which take the JVMTI
-// manager's own `callbacks` lock and invoke a `Box<dyn Fn>` — never
-// touching the class manager.
+// `vm/src/vm/vm_init.rs`) forward to `runtime::jvmti::fire_class_{load,
+// prepare}`, which take the JVMTI manager's own `callbacks` lock and invoke
+// a `Box<dyn Fn>`.
 
 /// Signature of the JVMTI class-lifecycle hook installed by the VM crate.
 /// Parameters: `(class_id_u32, class_name, thread_id)`.
 ///
-/// The hook MUST NOT re-enter the class manager: it is invoked while the
-/// class loader still holds `&mut self`, under the caller's L10
-/// `class_manager` write guard, and `parking_lot::RwLock` is not
-/// reentrant. Both parameters are fully self-contained (an id and a
-/// borrowed name) precisely so a conforming hook never needs to call
-/// back in — copy what you need and return. See the re-entrancy notes on
-/// the hook registry above for the exact failure modes.
+/// Called after the class manager's write guard for this define has been
+/// released (see the DEFERRED FIRING notes on the hook registry above) — a
+/// conforming hook may safely call back into the class manager.
 pub type JvmtiClassHook = fn(u32, &str, u64);
 
 static CLASS_LOAD_HOOK: OnceLock<JvmtiClassHook> = OnceLock::new();
@@ -698,27 +701,112 @@ pub fn install_class_prepare_hook(hook: JvmtiClassHook) {
     }
 }
 
+thread_local! {
+    /// This OS thread's `ThreadId.0`, as last set by [`set_current_thread_id`].
+    /// 0 (the default) means "no VM thread has registered on this OS thread
+    /// yet" — bootstrap class loading before `SharedVm::new` finishes, or a
+    /// background/pool thread that never became a Java thread.
+    static CURRENT_VM_THREAD_ID: Cell<u64> = const { Cell::new(0) };
+
+    /// Class-lifecycle events queued by [`fire_class_load_hook`] /
+    /// [`fire_class_prepare_hook`] on this OS thread, awaiting drain by
+    /// [`drain_pending_class_hooks`] once the write guard that produced them
+    /// is released. See the DEFERRED FIRING notes above.
+    static PENDING_CLASS_HOOKS: RefCell<Vec<PendingClassHook>> = const { RefCell::new(Vec::new()) };
+}
+
+enum PendingClassHook {
+    Load(u32, String, u64),
+    Prepare(u32, String, u64),
+}
+
+/// Bind this OS thread's current `jthread` for class-lifecycle event
+/// attribution. Called once by the VM at Java-thread registration (main
+/// thread, `Thread.start` workers, foreign JNI attach) — see the hook
+/// registry notes above. `id` is the VM's `ThreadId.0`.
+pub fn set_current_thread_id(id: u64) {
+    CURRENT_VM_THREAD_ID.with(|c| c.set(id));
+}
+
+/// This OS thread's bound `jthread`, or 0 if none has registered
+/// (bootstrap / non-Java thread) — the documented "unknown" sentinel.
+fn current_thread_id() -> u64 {
+    CURRENT_VM_THREAD_ID.with(|c| c.get())
+}
+
 /// Invoke the class-load hook if one is installed. Hot path: a single
-/// relaxed atomic load + branch when no agent is attached.
+/// relaxed atomic load + branch when no agent is attached. Queues rather
+/// than fires — see the DEFERRED FIRING notes above.
 #[inline]
 fn fire_class_load_hook(class_id: u32, class_name: &str, thread_id: u64) {
     if !CLASS_HOOKS_ACTIVE.load(Ordering::Acquire) {
         return;
     }
-    if let Some(hook) = CLASS_LOAD_HOOK.get() {
-        hook(class_id, class_name, thread_id);
+    if CLASS_LOAD_HOOK.get().is_some() {
+        PENDING_CLASS_HOOKS.with(|q| {
+            q.borrow_mut()
+                .push(PendingClassHook::Load(class_id, class_name.to_string(), thread_id))
+        });
     }
 }
 
-/// Invoke the class-prepare hook if one is installed.
+/// Invoke the class-prepare hook if one is installed. Queues rather than
+/// fires — see the DEFERRED FIRING notes above.
 #[inline]
 fn fire_class_prepare_hook(class_id: u32, class_name: &str, thread_id: u64) {
     if !CLASS_HOOKS_ACTIVE.load(Ordering::Acquire) {
         return;
     }
-    if let Some(hook) = CLASS_PREPARE_HOOK.get() {
-        hook(class_id, class_name, thread_id);
+    if CLASS_PREPARE_HOOK.get().is_some() {
+        PENDING_CLASS_HOOKS.with(|q| {
+            q.borrow_mut()
+                .push(PendingClassHook::Prepare(class_id, class_name.to_string(), thread_id))
+        });
     }
+}
+
+/// Drain and fire every class-lifecycle event queued on this OS thread by
+/// [`fire_class_load_hook`] / [`fire_class_prepare_hook`]. Must be called
+/// after (never while holding) the L10 `class_manager` write guard that
+/// produced the events — [`ClassManagerWriteGuard`] in
+/// `vm/src/vm/realms/class_realm.rs` is the sole caller in production code.
+///
+/// Drains in FIFO (push) order via `Vec::drain`, so a hook that itself
+/// triggers new class loads (now legal — see DEFERRED FIRING above) has its
+/// own queued events appended and drained within the same call rather than
+/// interleaved with the ones already in flight.
+pub fn drain_pending_class_hooks() {
+    if !CLASS_HOOKS_ACTIVE.load(Ordering::Acquire) {
+        return;
+    }
+    PENDING_CLASS_HOOKS.with(|q| {
+        let mut i = 0;
+        loop {
+            let next = {
+                let mut queue = q.borrow_mut();
+                if i >= queue.len() {
+                    if i > 0 {
+                        queue.clear();
+                    }
+                    break;
+                }
+                std::mem::replace(&mut queue[i], PendingClassHook::Load(0, String::new(), 0))
+            };
+            i += 1;
+            match next {
+                PendingClassHook::Load(class_id, name, thread_id) => {
+                    if let Some(hook) = CLASS_LOAD_HOOK.get() {
+                        hook(class_id, &name, thread_id);
+                    }
+                }
+                PendingClassHook::Prepare(class_id, name, thread_id) => {
+                    if let Some(hook) = CLASS_PREPARE_HOOK.get() {
+                        hook(class_id, &name, thread_id);
+                    }
+                }
+            }
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -3997,18 +4085,13 @@ impl ClassManager {
             fire_vtable_override_hook(super_id, slot);
         }
 
-        // T6.3.1 — Fire the JVMTI ClassLoad hook. The VM's JvmtiEventManager
-        // takes only its own `callbacks` lock and never re-enters the class
-        // manager, so it is safe to call from inside `&mut self`.
-        //
-        // NOTE: these fire UNDER the caller's L10 `class_manager` write
-        // guard — nothing drops it first, here or at any outer callsite.
-        // An installed hook that re-enters the class manager deadlocks the
-        // calling thread (or panics with a `LockOrderViolation` when lock-
-        // order enforcement is active). That prohibition is part of the
-        // `JvmtiClassHook` contract; see the re-entrancy notes on the hook
-        // registry near `install_class_load_hook`. Do not add a hook here
-        // that calls back into `self` or into `shared.classes`.
+        // T6.3.1 — Queue the JVMTI ClassLoad/ClassPrepare events (obsaudit
+        // D1, 2026-07-26: these no longer fire synchronously here). Actual
+        // delivery happens once the caller's L10 `class_manager` write guard
+        // is released — see the DEFERRED FIRING notes on the hook registry
+        // near `install_class_load_hook`, and `ClassManagerWriteGuard` in
+        // `vm/src/vm/realms/class_realm.rs`. A hook may now safely call back
+        // into `self` / `shared.classes` from its own thread.
         //
         // ClassPrepare is fired after linking/verification completes. For
         // classes that are loaded but not yet linked, the VM's linker path
@@ -4016,8 +4099,9 @@ impl ClassManager {
         // eagerly links eagerly-resolved classes, so we fire both here and
         // let the JVMTI layer de-duplicate if the state flag indicates
         // prepare has already been seen.
-        fire_class_load_hook(class_id_for_hook, &class_name_for_hook, 0);
-        fire_class_prepare_hook(class_id_for_hook, &class_name_for_hook, 0);
+        let hook_thread_id = current_thread_id();
+        fire_class_load_hook(class_id_for_hook, &class_name_for_hook, hook_thread_id);
+        fire_class_prepare_hook(class_id_for_hook, &class_name_for_hook, hook_thread_id);
 
         Ok(id)
     }
@@ -13783,10 +13867,37 @@ mod tests {
         fire_class_load_hook(42, "com/example/Foo", 1);
         fire_class_prepare_hook(42, "com/example/Foo", 1);
 
+        // obsaudit D1: firing is now deferred to drain_pending_class_hooks()
+        // (see the DEFERRED FIRING notes near install_class_load_hook) —
+        // queuing alone must not have dispatched the callbacks yet.
+        assert_eq!(LOAD_CALLS.load(O::SeqCst), before_load);
+        assert_eq!(PREPARE_CALLS.load(O::SeqCst), before_prepare);
+
+        drain_pending_class_hooks();
+
         assert_eq!(LOAD_CALLS.load(O::SeqCst), before_load + 1);
         assert_eq!(PREPARE_CALLS.load(O::SeqCst), before_prepare + 1);
         // Flag must be set once either hook is installed.
         assert!(CLASS_HOOKS_ACTIVE.load(Ordering::Acquire));
+
+        // A second drain with nothing queued must be a no-op, not a re-fire.
+        drain_pending_class_hooks();
+        assert_eq!(LOAD_CALLS.load(O::SeqCst), before_load + 1);
+        assert_eq!(PREPARE_CALLS.load(O::SeqCst), before_prepare + 1);
+    }
+
+    #[test]
+    fn jvmti_current_thread_id_defaults_to_zero_and_is_settable() {
+        // obsaudit D1: the "unknown/bootstrap" sentinel is 0 until this OS
+        // thread calls set_current_thread_id — exercised on a fresh thread
+        // so it can't observe another test's binding.
+        std::thread::spawn(|| {
+            assert_eq!(current_thread_id(), 0);
+            set_current_thread_id(7);
+            assert_eq!(current_thread_id(), 7);
+        })
+        .join()
+        .unwrap();
     }
 
     // ------------------------------------------------------------------
