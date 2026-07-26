@@ -1989,45 +1989,52 @@ fn should_skip_jit_internal(
         // reproduces on current dev. `BeanFactorySupportProbe.java` is the
         // regression witness for this one sub-package only.
 
-        // SPB.9c (Session 114) — companion blanket bans for the Spring
-        // component-scan critical path. With SPB.9 and SPB.9b in place,
-        // insurance-backend boot reaches `SpringApplication.run` ->
-        // `AbstractApplicationContext.refresh` ->
-        // `PostProcessorRegistrationDelegate.invokeBeanFactoryPostProcessors`
-        // -> `ConfigurationClassPostProcessor.processConfigBeanDefinitions`
+        // SPB.9c -- REMOVED 2026-07-26. Originally (Session 114):
+        // companion blanket bans for the Spring component-scan critical
+        // path (org/springframework/context/annotation/,
+        // org/springframework/context/support/,
+        // org/springframework/core/io/support/, plus the
+        // org/springframework/beans/factory/ check just below this
+        // comment) -- with SPB.9/SPB.9b in place, insurance-backend boot
+        // reached `SpringApplication.run` -> `...refresh` ->
+        // `ConfigurationClassPostProcessor.processConfigBeanDefinitions`
         // -> `ConfigurationClassParser.parse` ->
         // `ClassPathBeanDefinitionScanner.doScan` ->
-        // `ClassPathScanningCandidateComponentProvider.scanCandidateComponents`
-        // -> `PathMatchingResourcePatternResolver.getResources` /
-        // `findAllModulePathResources` -> `ModuleLayer.configuration` /
-        // `Configuration.modules()` (frame trace depth 15-18 immediately
-        // before the int(1) crash). Each of these makes putfield-heavy
-        // allocations: `ConfigurationClassParser.SourceClass.<init>`
-        // stores `metadata`/`source`/`importBy` slots, and the
-        // `PathMatching` resolver allocates a `Resource[]` per scanned
-        // package and stores resolved `Resource` references via aastore.
-        // Same W2-CHM / RBC.1 / SPB.1-9 archetype.
+        // `...scanCandidateComponents` ->
+        // `PathMatchingResourcePatternResolver.getResources`, each doing
+        // putfield-heavy allocations (SourceClass.<init>, Resource[] via
+        // aastore) -- same W2-CHM/RBC.1/SPB.1-9 archetype. Re-verified
+        // with a standalone probe (`ComponentScanProbe.java`, real
+        // spring-beans/spring-core/spring-context-7.0.7.jar +
+        // commons-logging-1.2.jar) driving a real
+        // `ClassPathBeanDefinitionScanner.scan(...)` against a real
+        // package containing 5 real `@Component`/`@Service`/
+        // `@Repository`/`@Configuration` classes -- the exact
+        // doScan -> scanCandidateComponents -> getResources chain this
+        // ban describes -- 500 times: baseline, package-allowed (all 4
+        // packages together), and a `CRATONVM_JIT_THRESHOLD=1`
+        // aggressive-compilation pass -- 0 failures, consistent
+        // scanned/registered bean counts every call in every
+        // configuration. No longer reproduces on current dev.
+        // `ComponentScanProbe.java` is the regression witness.
         //
-        // Lifted per-package via
-        // `CRATONVM_JIT_ALLOW_PACKAGES=org/springframework/context/annotation/,
-        // org/springframework/context/support/,
-        // org/springframework/core/io/support/,
-        // org/springframework/beans/factory/`.
-        if class_name.starts_with("org/springframework/context/annotation/")
-            && !package_allowed("org/springframework/context/annotation/", allow_packages)
-        {
-            return Some(SkipReason::RustJvmTestFixture);
-        }
-        if class_name.starts_with("org/springframework/context/support/")
-            && !package_allowed("org/springframework/context/support/", allow_packages)
-        {
-            return Some(SkipReason::RustJvmTestFixture);
-        }
-        if class_name.starts_with("org/springframework/core/io/support/")
-            && !package_allowed("org/springframework/core/io/support/", allow_packages)
-        {
-            return Some(SkipReason::RustJvmTestFixture);
-        }
+        // IMPORTANT SHADOWING NOTE: `org/springframework/core/io/support/`
+        // stays interpreted by default regardless of this removal -- the
+        // separate, still-active, untested-this-session `SPB.2` blanket
+        // ban on the much broader `org/springframework/core/` (a few
+        // hundred lines above -- a documented JIT hang in
+        // `SerializableTypeWrapper.forTypeProvider`'s lambda SAM
+        // dispatch) also matches this prefix. This removal's own claim
+        // (the doScan/scanCandidateComponents/getResources allocation
+        // corruption) is genuinely re-verified clean, but ComponentScanProbe
+        // does not exercise SPB.2's `SerializableTypeWrapper`/
+        // `ConcurrentReferenceHashMap` code path at all, so this is a
+        // safe-but-shadowed no-op for `core/io/support/` specifically --
+        // matching the pattern documented in memory
+        // jit-ban-shadowed-differential-false-positive from earlier this
+        // session. The other three SPB.9c sub-bans (context/annotation/,
+        // context/support/, beans/factory/) have no such shadow and are
+        // independently, unconditionally verified.
         // SPB.9d -- REMOVED 2026-07-26. Originally (Session 117):
         // eureka-server boot SEGFAULTed deep in Spring's BeanInfo
         // introspection -- `java/beans/Introspector` delegates into
@@ -2050,12 +2057,11 @@ fn should_skip_jit_internal(
         // failures, 0 crashes, correct property/method counts every call
         // in every configuration. No longer reproduces on current dev.
         // `BeanIntrospectorProbe.java` is the regression witness.
-        if class_name.starts_with("org/springframework/beans/factory/")
-            && !class_name.starts_with("org/springframework/beans/factory/support/")
-            && !package_allowed("org/springframework/beans/factory/", allow_packages)
-        {
-            return Some(SkipReason::RustJvmTestFixture);
-        }
+        // org/springframework/beans/factory/ (excluding .../support/,
+        // already removed separately above) -- REMOVED 2026-07-26 as the
+        // 4th sub-ban of SPB.9c, see the SPB.9c removal comment above for
+        // the full evidence (ComponentScanProbe.java's scan also
+        // registers/reads bean definitions through this exact package).
 
         // PIC.1 (Session 118, 2026-05-25) — provisional blanket ban for the
         // shadowed picocli copy that JUnit Platform ships in its console
@@ -4259,20 +4265,24 @@ mod tests {
                 "org/springframework/beans/factory/support/ must be JIT-eligible now that its SPB.9b sub-ban is removed"
             );
         }
-        // The sibling org/springframework/beans/factory/ ban (a separate,
-        // still-active rule that explicitly carves out .../support/ from
-        // its own scope) must still catch non-support factory classes.
-        assert_eq!(
-            check(
-                "org/springframework/beans/factory/config/BeanDefinitionHolder",
-                "getBeanName",
-                false,
-                true,
-                SkipPolicy::Conservative,
-            ),
-            Some(SkipReason::RustJvmTestFixture),
-            "the sibling org/springframework/beans/factory/ ban (excluding support/) must remain active for non-support classes"
-        );
+        // UPDATE: the sibling org/springframework/beans/factory/ ban
+        // (excluding .../support/) was ALSO removed 2026-07-26, as the
+        // 4th sub-ban of the separate SPB.9c group -- see that removal
+        // comment above should_skip_jit_internal. So non-support factory
+        // classes are now JIT-eligible too.
+        for policy in [SkipPolicy::Conservative, SkipPolicy::Aggressive] {
+            assert_eq!(
+                check(
+                    "org/springframework/beans/factory/config/BeanDefinitionHolder",
+                    "getBeanName",
+                    false,
+                    true,
+                    policy,
+                ),
+                None,
+                "org/springframework/beans/factory/ (excluding support/) must be JIT-eligible now that SPB.9c's 4th sub-ban is also removed"
+            );
+        }
         // The other two still-active SPB.9b sub-bans must remain banned.
         assert_eq!(
             check(
@@ -4284,6 +4294,58 @@ mod tests {
             ),
             Some(SkipReason::RustJvmTestFixture),
             "org/springframework/boot/loader/ must remain banned -- not covered by this partial removal"
+        );
+    }
+
+    #[test]
+    fn spb9c_component_scan_packages_are_jit_eligible_after_removal() {
+        // SPB.9c (all four sub-bans: org/springframework/context/annotation/,
+        // org/springframework/context/support/,
+        // org/springframework/core/io/support/, and
+        // org/springframework/beans/factory/ excluding .../support/) was
+        // removed 2026-07-26 -- see the removal comments above
+        // should_skip_jit_internal for the re-verification evidence
+        // (ComponentScanProbe.java, real spring-context-7.0.7.jar).
+        for (class_name, method) in [
+            ("org/springframework/context/annotation/ConfigurationClassParser", "parse"),
+            ("org/springframework/context/support/AbstractApplicationContext", "refresh"),
+            ("org/springframework/beans/factory/config/BeanDefinitionHolder", "getBeanName"),
+        ] {
+            for policy in [SkipPolicy::Conservative, SkipPolicy::Aggressive] {
+                assert_eq!(
+                    check(class_name, method, false, true, policy),
+                    None,
+                    "{class_name}.{method} must be JIT-eligible now that SPB.9c is removed"
+                );
+            }
+        }
+        // org/springframework/core/io/support/ stays interpreted by
+        // default via the separate, still-active SPB.2 ban on the
+        // broader org/springframework/core/ -- this removal's own claim
+        // is independently verified (see check_with below), but the
+        // class stays banned overall through that unrelated shadow.
+        assert_eq!(
+            check(
+                "org/springframework/core/io/support/PathMatchingResourcePatternResolver",
+                "getResources",
+                false,
+                true,
+                SkipPolicy::Conservative,
+            ),
+            Some(SkipReason::RustJvmTestFixture),
+            "org/springframework/core/io/support/ stays interpreted under Conservative via the separate SPB.2 ban on org/springframework/core/"
+        );
+        assert_eq!(
+            check_with(
+                "org/springframework/core/io/support/PathMatchingResourcePatternResolver",
+                "getResources",
+                false,
+                true,
+                SkipPolicy::Conservative,
+                &["org/springframework/core/"],
+            ),
+            None,
+            "with the shadowing SPB.2 ban also lifted, core/io/support/'s own SPB.9c sub-ban must be independently gone"
         );
     }
 
