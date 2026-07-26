@@ -89,8 +89,9 @@ that run's jar-fix are now closed, and neither was what it looked like.
   returned `value.length >> (hash & 31)` once a string's hash cache was
   populated. kotlin-reflect's `FqNameUnsafe.isRoot()` is `fqName.length() == 0`,
   so hashed package names started reporting themselves as the root package.
-  29/30 classes now pass; the 30th has an unrelated AssertJ residual. See
-  [`spring-kotlin-reflect-illegalstateexception-root-20260726.md`](spring-kotlin-reflect-illegalstateexception-root-20260726.md).
+  All 30 classes now pass, including the 30th's unrelated AssertJ
+  `Representation`-null NPE residual (fixed `fdc852f55`). Doc moved to
+  [`../internal/fixed-suite-bugs/spring-kotlin-reflect-illegalstateexception-root-FIXED.md`](../internal/fixed-suite-bugs/spring-kotlin-reflect-illegalstateexception-root-FIXED.md).
   The same JIT defect (found independently from H2) is
   [`h2/h2-jitban-schema-not-found-on-reconnect-FIXED.md`](../internal/fixed-suite-bugs/h2-suite-bugs/h2-jitban-schema-not-found-on-reconnect-FIXED.md).
 
