@@ -343,3 +343,23 @@ skip_list.rs ~L970-1022. Real Tomcat repros available on this host's
 fixture: `org.apache.jasper.compiler.TestCompiler` (JASPER-JDT.2) and
 `org.apache.catalina.authenticator.TestFormAuthenticatorA/B/C`
 (JASPER-JDT.3).
+
+**Result: TOMCAT-KEYEDLOCK-COMPUTE.1 landed 2026-07-26 03:35 UTC** (new
+ban, not in the original ~46 -- see commit for details). Fixes
+`TestCompiler` 8/12 -> 12/12.
+
+**Residual, NOT yet fixed:** `TestFormAuthenticatorA`/`TestCompiler`
+still hit a SECOND, independent JIT bug in
+`org/apache/catalina/webresources/`: `AbstractResourceSet.checkPath`
+throws `IllegalArgumentException: The requested path [/WEB-INF/...] is
+not valid. It must begin with /` for a path that visibly DOES start
+with `/` -- i.e. `path.charAt(0) != '/'` evaluates true when it
+shouldn't. Confirmed JIT-only (checkPath itself, plus the whole
+`webresources` package, when denied via `CRATONVM_JIT_DENY`, removes
+this exact symptom). A synthetic `charAt(0) == '/'` stress probe
+(500k iterations, various strings) did NOT reproduce it standalone, so
+this needs the real call context (not yet bisected past the package
+level) -- likely a similar family to the KEYEDLOCK-COMPUTE.1 fix just
+landed (String read shortly after construction/mutation reading a stale
+value) but not yet isolated to one method. Flagging for a future session
+rather than continuing further given time already spent this session.
