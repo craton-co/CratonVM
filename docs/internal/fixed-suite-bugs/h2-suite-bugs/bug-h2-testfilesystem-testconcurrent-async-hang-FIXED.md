@@ -1,3 +1,12 @@
+> **RETIRED 2026-07-26 — archived, non-normative.** All seven bugs this doc
+> names are fixed. What is left is a single performance wall —
+> `testConcurrent` on `nioMemLZF:1:`, >18 minutes against HotSpot's 862ms —
+> carried forward with its one concrete lead as "Residual 4" in
+> [`docs/known-issues/h2/h2-jitban-residuals-20260726.md`](../../../known-issues/h2/h2-jitban-residuals-20260726.md).
+> Note the filename is a misnomer: `async:` is the LEAST affected of the
+> sixteen filesystems this class exercises. Do not cite this doc as current
+> behaviour.
+
 # `TestFileSystem.testConcurrent` is pathologically slow — worst on the LZF in-memory filesystems, and NOT on `async:` — seven bugs fixed, one open performance wall remains
 
 *(Filename kept for the inbound links in `../../internal/fixed-suite-bugs/g1-native-alloc-no-safepoint-oom-FIXED.md`, `bug-h2-files-setposixfilepermissions-FIXED.md` and the Tomcat fixture-completion doc. The `async:` in it is a misnomer — see the per-prefix table below: `async:` is the LEAST affected filesystem of the sixteen this class exercises.)*

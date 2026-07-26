@@ -97,3 +97,59 @@ Suggested approach:
    ban's total absence of a rationale comment means nobody currently
    knows what it was protecting against, so a real, broad test corpus
    (not a synthetic probe) is the right bar for removing or narrowing it.
+
+## Update 2026-07-26 (later same day): 80-class real Hibernate sample — clean, no regressions with the blanket ban lifted
+
+Ran an 80-class random sample (seeded, reproducible — `gen_hib_test_list.py`,
+list at `/data/tmp/hib-org-junit-test-sample.txt`, drawn from ~4000 real
+`*Test.class` files) from the real Hibernate ORM 8.0 harness at
+`apps/hibernate-orm-harness/` through `hib-suite-runner/CratonRunner.java`
+(JUnit5 Platform Launcher), comparing:
+
+1. **Baseline** (blanket `org/junit/` ban active, current default): all 80
+   classes ran to completion. Exactly one real failure
+   (`InsertOrderingReferenceSeveralDifferentSubclassTest`,
+   `org.opentest4j.AssertionFailedError`) and one aborted
+   (`FinalEmbeddableFieldTest`, 5/6 ok); everything else fully passed or
+   was cleanly skipped (dialect-gated tests for databases not configured
+   on this host, e.g. HANA/Postgres-specific tests).
+2. **Ban lifted** (`CRATONVM_JIT_ALLOW_PACKAGES=org/junit/` set, same
+   binary, same 80-class list): `diff` of the two runs' `@@RESULT` lines
+   (timing stripped) is **byte-for-byte empty** — identical found/started/
+   ok/failed/aborted/skipped counts for every one of the 80 classes,
+   including the same single pre-existing failure and the same single
+   abort.
+
+**This is a genuinely clean result**: JIT-compiling `org/junit/` classes
+(actually exercising them, not just a shadowed no-op — this ban gates the
+whole package, so lifting it engages real JIT compilation across whatever
+`org/junit/` code this test run exercises) produced zero new failures,
+hangs, or crashes across a real, diverse 80-class Hibernate test sample.
+
+**Not sufficient to remove the ban outright.** 80 classes is a sample of
+roughly 2% of the ~4000 real test classes available in just this one
+fixture, and this ban's total lack of a rationale comment (see the main
+writeup above) means the ORIGINAL bug it was protecting against is
+unknown — a clean sample doesn't prove that original trigger no longer
+exists, only that it didn't happen to fire in this particular 80-class
+draw. The ban predates even the SPRING-TESTCOMPILER/HIB-STOREDPROC-JIT
+family (commit `60ef90d4b`, 2026-07-05) and may have been guarding
+against an ES- or Spring-specific JUnit runner interaction this
+Hibernate-only sample wouldn't exercise at all.
+
+**Recommendation for a future session:** treat this as positive-but-
+partial evidence. Before removing the ban:
+1. Run a much larger sample (or the full ~4000-class corpus) through this
+   same harness.
+2. Also test against a real Spring or Elasticsearch JUnit-based suite
+   (different frameworks/JUnit usage patterns than Hibernate's), since
+   the original trigger's nature is unknown and may be framework-specific.
+3. If both come back clean, this becomes a strong case for removal —
+   restoring JIT eligibility to the entire JUnit test-running harness
+   across every suite this VM runs would be one of the highest-leverage
+   single changes available in this whole campaign.
+
+Raw logs (not committed, too large/verbose): `/data/tmp/hib-baseline-run.log`,
+`/data/tmp/hib-allowjunit-run.log` on the Azure build host. Test list:
+`/data/tmp/hib-org-junit-test-sample.txt` (regenerate via the seeded
+`gen_hib_test_list.py` script for full reproducibility if needed).

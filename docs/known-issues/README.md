@@ -1,8 +1,49 @@
 ﻿# Known issues вЂ” index & bug map
 
+## 2026-07-26 H2 — both H2 JIT/perf docs retired; three residuals carried forward
+
+The `Schema  not found` reconnect corruption and the `TestFileSystem`
+per-invoke costs are fixed and their docs are archived under
+`../internal/fixed-suite-bugs/h2-suite-bugs/`. What is still open — three
+classes that stop passing when the `org/h2/` JIT ban is lifted, one
+`TestFileSystem` performance wall, and one cosmetic `ClassCastException`
+message defect — is in
+[`h2/h2-jitban-residuals-20260726.md`](h2/h2-jitban-residuals-20260726.md).
+Two general x64 JIT defects were fixed on the way there and are worth knowing
+about outside H2: an array reported itself an instance of its component type
+(`String[] instanceof String` was true), and JIT invokespecial resolved its
+target by name, ignoring the caller's class loader.
+
 This folder collects CratonVM-only defects found while running upstream Java
 suites. The docs had grown to describe the **same underlying bug from several
 angles**; this index is the consolidated map. Read it first.
+
+## 2026-07-26 SPB.1 (`org/springframework/util/`) ban REMOVED — the "allocate-then-putfield" crash was a GC-root-scanning gap, not a JIT bug — FIXED, moved to internal
+
+FIXED (moved to
+[`../internal/fixed-suite-bugs/spb1-springframework-util-investigation-FIXED.md`](../internal/fixed-suite-bugs/spb1-springframework-util-investigation-FIXED.md)):
+a follow-up repro (concurrent GC pressure + a fresh `URLClassLoader`-loaded
+`ClassUtils.<clinit>`) reproduced real heap corruption with the SPB.1 ban
+ACTIVE too, ruling out "the ban prevents the regression" and reopening the
+whole ban's justification. Root cause: `vm/src/memory/roots.rs` had four
+root-scan sections (static fields, class-lock objects, CONSTANT_Dynamic
+roots, class mirrors) that deferred a user-defined-loader class's
+still-YOUNG-generation object to the `metadata_pin` side-channel instead of
+rooting it directly. That channel is consulted only by the Generational
+backend's old-gen-only mark BFS, so a value with no other root — the common
+case for a static field's value right after `<clinit>` assigns it — was
+silently reclaimed, and its memory reused moments later by the class's own
+next allocation: reading back as a live, valid, but unrelated object
+(`ReentrantLock$NonfairSync`, `ConcurrentReferenceHashMap$Reference`, a raw
+class-name string). Fixed via `VmHeap::metadata_pin_deferrable`
+(`gc/src/vm_heap.rs`), gating the defer on the object actually being in old
+gen; the identical defect was also found and fixed in
+`native-builtins/src/phases_late.rs`'s `ClassValue` cache. G1/ZGC were
+unaffected — their `metadata_pin` consumers already walk every live region
+uniformly. Verified: 50/50 clean repro-3 runs with the ban kept, 47/47 clean
+with it lifted post-fix (vs. failing ~40-60% of the time pre-fix even with
+the ban active) — no distinct JIT-specific symptom survives, so the ban is
+removed from `vm/src/jit/skip_list.rs` rather than left liftable.
 
 ## 2026-07-26 G1 backend could OOM-abort on a heap full of garbage — natives that allocate internally never triggered a safepoint — FIXED, doc RETIRED
 
@@ -75,10 +116,11 @@ that run's jar-fix are now closed, and neither was what it looked like.
   returned `value.length >> (hash & 31)` once a string's hash cache was
   populated. kotlin-reflect's `FqNameUnsafe.isRoot()` is `fqName.length() == 0`,
   so hashed package names started reporting themselves as the root package.
-  29/30 classes now pass; the 30th has an unrelated AssertJ residual. See
-  [`spring-kotlin-reflect-illegalstateexception-root-20260726.md`](spring-kotlin-reflect-illegalstateexception-root-20260726.md).
+  All 30 classes now pass, including the 30th's unrelated AssertJ
+  `Representation`-null NPE residual (fixed `fdc852f55`). Doc moved to
+  [`../internal/fixed-suite-bugs/spring-kotlin-reflect-illegalstateexception-root-FIXED.md`](../internal/fixed-suite-bugs/spring-kotlin-reflect-illegalstateexception-root-FIXED.md).
   The same JIT defect (found independently from H2) is
-  [`h2/h2-jitban-schema-not-found-on-reconnect.md`](h2/h2-jitban-schema-not-found-on-reconnect.md).
+  [`h2/h2-jitban-schema-not-found-on-reconnect-FIXED.md`](../internal/fixed-suite-bugs/h2-suite-bugs/h2-jitban-schema-not-found-on-reconnect-FIXED.md).
 
 Method note worth keeping: `KRun` only prints a failure's stack trace when
 `KRUN_STACK=1` is set. The Kotlin cluster was filed as "zero-frame stack trace,
