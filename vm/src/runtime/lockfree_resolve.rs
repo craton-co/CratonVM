@@ -1,21 +1,49 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2024-2026 Craton Software Company
 
-//! Lock-free method resolution caching for the interpreter's hot path.
+//! Shared method-resolution caching for the interpreter's hot path.
 //!
-//! This module provides a two-level resolution cache that eliminates lock
-//! contention on the common case (cache hit):
+//! ## What is actually wired (audited 2026-07-26, `stackwalk-and-vtable`)
+//!
+//! This module's historical header described a three-level flow:
 //!
 //! ```text
-//! Resolution flow:
 //! 1. Check thread-local cache (no lock) -> if hit, return immediately
 //! 2. Check shared global cache (read lock) -> if hit, populate thread-local, return
 //! 3. Do full resolution (class manager lock) -> populate shared + thread-local, return
 //! ```
 //!
-//! The **ThreadLocalResolveCache** lives per-thread and requires zero
-//! synchronisation.  The **SharedResolutionState** is a read-optimised global
-//! cache protected by `RwLock`s so concurrent readers never block each other.
+//! **Level 1 does not exist in this module.** [`ThreadLocalResolveCache`] has
+//! zero production instantiations — every reference to it outside this file is
+//! a doc comment or one of this file's own unit tests. The real thread-local
+//! tier is `JvmThread::invoke_cache`, which lives in the threading/interpreter
+//! code and has nothing to do with the type below. Likewise
+//! [`SharedResolutionState::resolve_method`] / `cache_method` /
+//! `resolve_field` / `cache_field` and their `global_methods` /
+//! `global_fields` maps have **no production callers**: `ResolutionKey`,
+//! `ResolvedTarget` and `ResolvedField` are exercised only by tests. The one
+//! live consumer of this module is `promoted_invokes`, reached via
+//! [`SharedResolutionState::get_promoted_invoke`] /
+//! [`SharedResolutionState::insert_promoted_invoke`] from the interpreter's
+//! invoke paths.
+//!
+//! ## "Lock-free" is a misnomer — keep it in mind before relying on it
+//!
+//! Nothing here is lock-free in the technical sense, and the live path in
+//! particular is not. `get_promoted_invoke` takes a `parking_lot::RwLock`
+//! **read** guard on a single process-wide map: acquiring it is an atomic
+//! read-modify-write on one shared word, so every dispatching thread writes
+//! the same cache line on every consult. That is much cheaper than the
+//! `ClassManager` write lock it replaces — which is the real and worthwhile
+//! win, and it is genuine — but it is contention, not its absence. The claim
+//! that this "eliminates lock contention on the common case" was overstated;
+//! it *relocates* it off the class-manager lock.
+//!
+//! (This is the same class of overstatement a sibling pass found on
+//! `class_manager.rs::class_loading_locks`, which claimed to "allow concurrent
+//! loading of different classes to proceed without contention" while
+//! `load_class_concurrent` still ran under the L10 write lock. Verify against
+//! the code, not the comment.)
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -47,18 +75,66 @@ use std::sync::Arc;
 /// the cap, while a key-minting adversary is held to a bounded footprint.
 const DEFAULT_SHARED_CACHE_CAP: usize = 65_536;
 
-/// Resolve the shared-cache capacity, honouring the `CRATONVM_RESOLVE_CACHE_CAP`
-/// environment override (mirrors the project's `CRATONVM_*` configuration
-/// convention). A value of `0`, an empty string, or an unparseable value falls
-/// back to [`DEFAULT_SHARED_CACHE_CAP`]; the cap can never be set below 1 so a
-/// freshly-inserted entry always survives.
-fn shared_cache_cap() -> usize {
+/// Uncached form of [`shared_cache_cap`]. Kept separate so the unit tests can
+/// exercise the parsing rules without depending on which test happened to run
+/// first (the public entry point memoizes for process lifetime).
+fn read_shared_cache_cap() -> usize {
     match std::env::var("CRATONVM_RESOLVE_CACHE_CAP") {
         Ok(s) => match s.trim().parse::<usize>() {
             Ok(n) if n >= 1 => n,
             _ => DEFAULT_SHARED_CACHE_CAP,
         },
         Err(_) => DEFAULT_SHARED_CACHE_CAP,
+    }
+}
+
+/// Resolve the shared-cache capacity, honouring the `CRATONVM_RESOLVE_CACHE_CAP`
+/// environment override (mirrors the project's `CRATONVM_*` configuration
+/// convention). A value of `0`, an empty string, or an unparseable value falls
+/// back to [`DEFAULT_SHARED_CACHE_CAP`]; the cap can never be set below 1 so a
+/// freshly-inserted entry always survives.
+///
+/// PERF (2026-07-26 arch pass). This used to call `std::env::var` — which
+/// allocates a `String` and, on Windows, is a `GetEnvironmentVariableW`
+/// syscall — on **every first promotion of a call site**, and did so *while
+/// holding the `promoted_invokes` write guard*, so every thread promoting a
+/// target serialised behind an environment lookup. Real applications mint one
+/// such promotion per distinct `(caller class, cp_index, receiver class)`
+/// triple, i.e. hundreds of thousands of them during warm-up.
+///
+/// Memoized in a `OnceLock`, matching the process-lifetime memo contract every
+/// flag in `runtime::env_cache` already has (and the one a sibling pass just
+/// applied to the seven throw-path flags in `exceptions.rs`): setting the
+/// variable after the first promotion no longer takes effect. This is not a
+/// new gate — the variable is an existing, optional tuning override with a
+/// working default, so nothing lands off by default.
+#[inline]
+fn shared_cache_cap() -> usize {
+    // Test-only escape hatch. The memo below is process-lifetime, so the
+    // eviction tests can no longer steer it with the environment variable;
+    // they set this instead. Compiled out entirely in non-test builds, so the
+    // shipped fast path is a single relaxed `OnceLock` read.
+    #[cfg(test)]
+    {
+        let forced = tests_cap_override::get();
+        if forced != 0 {
+            return forced;
+        }
+    }
+    static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CAP.get_or_init(read_shared_cache_cap)
+}
+
+#[cfg(test)]
+mod tests_cap_override {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static OVERRIDE: AtomicUsize = AtomicUsize::new(0);
+    /// `0` means "no override — use the memoized value".
+    pub(super) fn get() -> usize {
+        OVERRIDE.load(Ordering::Relaxed)
+    }
+    pub(super) fn set(v: usize) {
+        OVERRIDE.store(v, Ordering::Relaxed);
     }
 }
 
@@ -1315,8 +1391,28 @@ mod tests {
         assert!(map.is_empty());
     }
 
+    /// RAII helper for the test-only capacity override, so a failing
+    /// assertion cannot leak a forced cap into the rest of the suite.
+    struct CapOverride;
+    impl CapOverride {
+        fn set(v: usize) -> Self {
+            tests_cap_override::set(v);
+            CapOverride
+        }
+    }
+    impl Drop for CapOverride {
+        fn drop(&mut self) {
+            tests_cap_override::set(0);
+        }
+    }
+
     #[test]
     fn shared_cache_cap_parses_env_override() {
+        // Exercises the *parsing* rules against the uncached reader.
+        // `shared_cache_cap` itself memoizes for process lifetime (it sits
+        // under the `promoted_invokes` write lock and must not syscall), so it
+        // is deliberately not the function under test here.
+        //
         // Single test owns the env var across all its assertions so it does
         // not race other tests on the process-global environment. Restored
         // on every exit path.
@@ -1325,18 +1421,18 @@ mod tests {
         let prev = std::env::var(VAR).ok();
 
         std::env::set_var(VAR, "10");
-        assert_eq!(shared_cache_cap(), 10);
+        assert_eq!(read_shared_cache_cap(), 10);
 
         // Zero / empty / garbage all fall back to the generous default.
         std::env::set_var(VAR, "0");
-        assert_eq!(shared_cache_cap(), DEFAULT_SHARED_CACHE_CAP);
+        assert_eq!(read_shared_cache_cap(), DEFAULT_SHARED_CACHE_CAP);
         std::env::set_var(VAR, "");
-        assert_eq!(shared_cache_cap(), DEFAULT_SHARED_CACHE_CAP);
+        assert_eq!(read_shared_cache_cap(), DEFAULT_SHARED_CACHE_CAP);
         std::env::set_var(VAR, "not-a-number");
-        assert_eq!(shared_cache_cap(), DEFAULT_SHARED_CACHE_CAP);
+        assert_eq!(read_shared_cache_cap(), DEFAULT_SHARED_CACHE_CAP);
 
         std::env::remove_var(VAR);
-        assert_eq!(shared_cache_cap(), DEFAULT_SHARED_CACHE_CAP);
+        assert_eq!(read_shared_cache_cap(), DEFAULT_SHARED_CACHE_CAP);
 
         // Restore whatever the harness had before.
         match prev {
@@ -1346,14 +1442,35 @@ mod tests {
     }
 
     #[test]
-    fn shared_cache_method_field_promoted_stay_bounded_via_env_cap() {
-        // Drive the *public* insert paths through a small env cap and prove
-        // all three shared maps stay bounded while a key-minting workload
-        // floods distinct keys. Owns the env var for the whole test.
+    fn shared_cache_cap_is_memoized_for_process_lifetime() {
+        // Documents the contract change: the env var is read once. Setting it
+        // afterwards must NOT retroactively change the live cap.
         let _guard = RESOLVE_CACHE_ENV_LOCK.lock().unwrap();
         const VAR: &str = "CRATONVM_RESOLVE_CACHE_CAP";
         let prev = std::env::var(VAR).ok();
-        std::env::set_var(VAR, "16");
+
+        let first = shared_cache_cap();
+        std::env::set_var(VAR, "3");
+        assert_eq!(
+            shared_cache_cap(),
+            first,
+            "shared_cache_cap must not re-read the environment"
+        );
+
+        match prev {
+            Some(v) => std::env::set_var(VAR, v),
+            None => std::env::remove_var(VAR),
+        }
+    }
+
+    #[test]
+    fn shared_cache_method_field_promoted_stay_bounded_via_env_cap() {
+        // Drive the *public* insert paths through a small cap and prove all
+        // three shared maps stay bounded while a key-minting workload floods
+        // distinct keys. The lock is still taken so this test does not
+        // interleave with the env-var tests that share the same knob.
+        let _guard = RESOLVE_CACHE_ENV_LOCK.lock().unwrap();
+        let _cap = CapOverride::set(16);
 
         let state = SharedResolutionState::new();
         for i in 0..500u64 {
@@ -1393,11 +1510,6 @@ mod tests {
         state.cache_method(evicted.clone(), sample_target(0));
         assert_eq!(state.resolve_method(&evicted), Some(sample_target(0)));
         assert!(state.method_count() <= 16);
-
-        match prev {
-            Some(v) => std::env::set_var(VAR, v),
-            None => std::env::remove_var(VAR),
-        }
     }
 
     #[test]
@@ -1405,9 +1517,7 @@ mod tests {
         // Re-caching an already-present key must not trigger eviction (the
         // `contains_key` guard) — capacity is for *new* keys only.
         let _guard = RESOLVE_CACHE_ENV_LOCK.lock().unwrap();
-        const VAR: &str = "CRATONVM_RESOLVE_CACHE_CAP";
-        let prev = std::env::var(VAR).ok();
-        std::env::set_var(VAR, "4");
+        let _cap = CapOverride::set(4);
 
         let state = SharedResolutionState::new();
         // Fill to exactly the cap with 4 distinct keys.
@@ -1426,10 +1536,46 @@ mod tests {
             Some(sample_target(999)),
             "re-cache must update the value in place"
         );
+    }
 
-        match prev {
-            Some(v) => std::env::set_var(VAR, v),
-            None => std::env::remove_var(VAR),
-        }
+    // -- 2026-07-26 arch pass: wiring assertions -------------------------
+
+    #[test]
+    fn promoted_invoke_round_trip_is_the_only_live_path() {
+        // Guards the module doc's claim about what is actually wired: the
+        // promoted-invoke map is the live tier and its read path must not
+        // require the class manager. If a future pass wires `global_methods`
+        // / `global_fields` / `ThreadLocalResolveCache` into production, this
+        // test's comment (and the module header) must be updated with it.
+        let state = SharedResolutionState::new();
+        let key: PromotedInvokeKey = (ClassId::new(1), 4, false, Some(ClassId::new(2)));
+        assert!(state.get_promoted_invoke(&key).is_none());
+        assert_eq!(state.promoted_hit_count(), 0);
+
+        state.insert_promoted_invoke(
+            key,
+            CachedInvokeTarget::VirtualBytecode {
+                receiver_class_id: ClassId::new(2),
+                cached: sample_bytecode_method(2),
+                gate: crate::classloading::resolution::RedefineGate::never_stale(),
+            },
+        );
+        assert!(state.get_promoted_invoke(&key).is_some());
+        assert_eq!(state.promoted_hit_count(), 1);
+        assert_eq!(state.promoted_insert_count(), 1);
+
+        // A miss must not be memoized as a negative anywhere: after
+        // invalidation the same key simply re-misses and can be re-promoted.
+        state.invalidate_promoted_for_class(ClassId::new(1));
+        assert!(state.get_promoted_invoke(&key).is_none());
+        state.insert_promoted_invoke(
+            key,
+            CachedInvokeTarget::VirtualBytecode {
+                receiver_class_id: ClassId::new(2),
+                cached: sample_bytecode_method(2),
+                gate: crate::classloading::resolution::RedefineGate::never_stale(),
+            },
+        );
+        assert!(state.get_promoted_invoke(&key).is_some());
     }
 }
