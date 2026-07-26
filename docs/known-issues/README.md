@@ -4,6 +4,58 @@ This folder collects CratonVM-only defects found while running upstream Java
 suites. The docs had grown to describe the **same underlying bug from several
 angles**; this index is the consolidated map. Read it first.
 
+## 2026-07-26 Moving young gen dropped JIT-held oops — FIXED, moved to internal
+
+FIXED (moved to
+[`../internal/fixed-suite-bugs/app-jvm-bugs/moving-young-gen-drops-jit-held-oops-FIXED.md`](../internal/fixed-suite-bugs/app-jvm-bugs/moving-young-gen-drops-jit-held-oops-FIXED.md)):
+`CRATONVM_MOVING_YOUNG=1` returned a wrong, run-varying Binary-Trees-18
+checksum whenever the JIT was enabled. Root cause was **not** in the collector:
+five single-pass codegen sites in `jit/src/x64.rs` pushed an object reference
+onto the simulated operand stack without tagging it as an oop — the direct
+self-recursive `invokestatic`, the direct `invokevirtual`/`invokespecial`/
+`invokeinterface` call, the inlined-callee return, `getfield` inside an inlined
+callee, and `getfield` on a scalar-replaced object. An untagged entry is
+published to neither the precise oop map nor the shadow stack, yet the
+safepoint still certifies `moving_young_coverage_complete` (that check only
+inspects MARKED entries), so the relocating collector was told the frame was
+fully covered. `BinTreesClassic.bottomUpTree` keeps its first recursive call's
+result — a whole subtree — on the operand stack across its second, and lost it.
+The default non-moving sweep was never affected: its conservative frame scan
+marks such a slot, it just cannot rewrite it. bt18 is now `68332206` on every
+run with the JIT on, over 1–25 real moving cycles depending on heap size.
+
+## 2026-07-26 TestNG-discovery NPE and the 30-class Kotlin `IllegalStateException: root` cluster -- both FIXED
+
+Follow-up to the 2026-07-26 full 8-shard rerun. Both findings that survived
+that run's jar-fix are now closed, and neither was what it looked like.
+
+- **TestNG-engine discovery NPE ("Blocker 1")** -- root cause was CratonVM
+  handing out `java.lang.Package` objects with a null `module` from the
+  `ClassLoader`-side package builders; real `Package.getPackageInfo()` derefs
+  `module()` unguarded, so TestNG's package-annotation walk NPE'd and JUnit
+  reported `TestEngine with ID 'testng' failed to discover tests`. Fixed; all
+  **11** classes in `test.context.testng.*` now match HotSpot exactly (they
+  were 8x `LOADERR` plus one masked JDBC failure). See the
+  "2026-07-26 TestNG-engine discovery NPE (Blocker 1) -- FIXED" section of
+  [`CRATONVM-SPRING-GENUINE-BUGLIST.md`](CRATONVM-SPRING-GENUINE-BUGLIST.md).
+- **30 Kotlin classes throwing `IllegalStateException: root`** -- NOT a
+  kotlin-reflect defect and NOT the multi-version kotlin-reflect drift that doc
+  flagged as its leading suspicion. It was a JIT miscompile: the `String`
+  intrinsics read `coder` from `hash`'s slot on compact objects, so `length()`
+  returned `value.length >> (hash & 31)` once a string's hash cache was
+  populated. kotlin-reflect's `FqNameUnsafe.isRoot()` is `fqName.length() == 0`,
+  so hashed package names started reporting themselves as the root package.
+  29/30 classes now pass; the 30th has an unrelated AssertJ residual. See
+  [`spring-kotlin-reflect-illegalstateexception-root-20260726.md`](spring-kotlin-reflect-illegalstateexception-root-20260726.md).
+  The same JIT defect (found independently from H2) is
+  [`h2/h2-jitban-schema-not-found-on-reconnect.md`](h2/h2-jitban-schema-not-found-on-reconnect.md).
+
+Method note worth keeping: `KRun` only prints a failure's stack trace when
+`KRUN_STACK=1` is set. The Kotlin cluster was filed as "zero-frame stack trace,
+probably a VM-synthesised exception" purely because that env var was unset --
+the exception has a full ~40-frame trace that named the culprit immediately.
+Set `KRUN_STACK=1` before concluding anything about a `FAILCAUSE`'s shape.
+
 ## 2026-07-23 `module/spring-boot-tomcat` 5-class residual sweep — 3 real bugs fixed, 2 open
 
 Fixed and verified (see the two commits on `worktree-sb-tomcat-5class-fix-20260723`):

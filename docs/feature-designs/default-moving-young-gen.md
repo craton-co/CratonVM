@@ -1,9 +1,36 @@
 # Default Moving / Compacting Young Generation
 
-Status: **IMPLEMENTED behind `CRATONVM_MOVING_YOUNG` (default-off), validated
-correct** (see "FINISHED" section at end). XL, GC-coupled. A moving young gen now
-runs safely under live JIT frames via complete rewritable shadow coverage; the
-default flip awaits the app gauntlet + two narrow coverage-fallback cases.
+Status (2026-07-26): **CORRECT behind `CRATONVM_MOVING_YOUNG`, still
+default-off — now for THROUGHPUT reasons, not correctness.** XL, GC-coupled.
+
+The heap corruption that blocked this feature is fixed
+(`docs/internal/fixed-suite-bugs/app-jvm-bugs/moving-young-gen-drops-jit-held-oops-FIXED.md`):
+five `jit/src/x64.rs` sites pushed an object reference onto the operand stack
+without an oop tag, so it reached neither the precise oop map nor the shadow
+stack while the safepoint still certified complete coverage. bt18 is now
+`68332206` on every run with the JIT on, across 1–25 real moving cycles
+(`gc_quiescence::moving_young_cycle_count()`), with zero coverage fallbacks.
+
+**Do not flip `types::flags::DEFAULT_MOVING_YOUNG` on the strength of that.**
+On bt18 at `-Xmx8g`, `CRATONVM_MOVING_YOUNG=1` measured ~19 s against ~6–8 s
+for the default sweep — two separable costs: the per-method codegen overhead
+moving-young forces (shadow push/reload + full-GPR safepoint spill, visible as
+~7–8 s even on runs that executed zero moving cycles) and the Cheney copy of a
+very large live set. bt18 is the worst case for a copying collector, so this
+does not settle the design — but the flip needs its own throughput case, on a
+workload mix, with both counters printed.
+
+Also still open before a flip: `refresh_moving_young_coverage_for_collection`
+treats any cycle with a peer thread in JIT as unproven, so moving-young engages
+only when the initiator is alone in compiled code; and the A5
+`native_stack_has_jit_frame` probe over-detects. Neither is a correctness risk
+— both only cost compaction. See
+`docs/internal/arch-2026-07-26/moving-young-precise-roots.md` "Remaining work".
+
+The 2026-07-01 "FINISHED" validation table at the end of this document remains
+**suspect**: it declared the feature correct without reporting
+`moving_young_cycle_count()`, which the diagnostics added on 2026-07-26 now
+print alongside the fallback count precisely so that cannot recur.
 
 ## Goal
 
