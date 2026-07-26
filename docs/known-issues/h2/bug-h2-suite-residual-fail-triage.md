@@ -1,6 +1,30 @@
-# H2 suite — residual FAIL triage (2026-07-21): reproduced, narrowed, mostly closed after ten follow-up sessions
+# H2 suite — residual FAIL triage (2026-07-21): reproduced, narrowed, FULLY CLOSED after twelve follow-up sessions
 
-## Status
+## Status (2026-07-25 update — see "Follow-up session (twelfth pass, 2026-07-25)" far below)
+**FULLY CLOSED.** The twelfth pass root-caused and fixed the SQL-parsing
+`NullPointerException` that the tenth pass's composite-PK fix had reopened
+(and the eleventh pass had narrowed but not resolved) — a genuine, general
+VM dispatch bug in `try_stackless_invoke`'s forced-native-override
+pre-check (`vm/src/runtime/interpreter.rs`), not anything specific to
+`ParserBase`/`Token`. Fixing it also cleared the ninth-pass's LOB-migration
+`NullPointerException` residual (`SYSTEM_LOB_STREAM`/`combineBlob`) as a
+side effect, since both symptoms traced back to the same underlying
+mechanism. `org.h2.test.unit.TestUpgrade` now passes cleanly end-to-end
+(exit 0) across every mode this session checked (`--nojit` ×2, JIT-on ×1).
+See that section for the full root-cause writeup, the fix, and the
+regression sweep (`TestAlter`/`TestShell`/`TestLinkedTable`/
+`TestPreparedStatement`/`TestDataUtils`, all clean, plus a full 218-class
+suite run). Fix commit `4d97f0eec` landed on `dev` directly from the
+worktree branch `fix/h2-testupgrade-round12-20260725` (fast-forward push;
+`origin/dev` had not moved since this session's fork point).
+
+The remaining, PRE-EXISTING open items below (`TestFileLock`,
+`TestTransaction`, `TestBnf`, `TestFuzzOptimizations`) are root-caused
+performance-margin/inconclusive characterizations, not discrete bugs — see
+each item's own section; no fix is expected or was attempted for them, and
+this stance is unchanged by the twelfth pass.
+
+## Status (superseded by the above — kept for history)
 **MOSTLY CLOSED after nine follow-up sessions.** The ninth pass FIXED the
 `TestUpgrade` SQL-parsing NPE the eighth pass had left open (an eleventh
 item now closed), then discovered a further, deeper residual in
@@ -2738,3 +2762,171 @@ Committed alongside this doc update on `dev` — see commit history for the
 exact SHAs. **Root cause still not found; do not attempt another fix without
 first resolving the pc-semantics question above**, since the
 "`prepareJoinBatch`, not parsing" read this session leaned on is unverified.
+
+## Follow-up session (twelfth pass, 2026-07-25): TestUpgrade's SQL-parsing NPE
+## ROOT-CAUSED AND FIXED — a general `try_stackless_invoke` dispatch bug, not
+## anything ParserBase/Token-specific; LOB-migration residual cleared too —
+## FULLY CLOSED
+
+Worktree `/data/data/wt-h2-testupgrade-round12-20260725` on the Azure host,
+branch `fix/h2-testupgrade-round12-20260725`, branched from `origin/dev`
+(`346c74b71`).
+
+### Bypassing the eleventh pass's pc-semantics blocker entirely
+
+Rather than resolving whether CratonVM's interpreter `pc` numbering maps
+1:1 to raw class-file byte offsets (the question the eleventh pass left as
+a hard blocker), this pass sidestepped it with more direct instrumentation:
+
+1. Extended the existing `CRATONVM_DBG_NPE_STACK` hook (fires at every
+   null-receiver `invoke*`, `vm/src/runtime/interpreter.rs`) to also print
+   each frame's `ClassLoaderId` alongside its class name. Re-running the
+   repro showed the **entire** live `thread.frames` stack at the moment of
+   the `Token.start()` null check is a single, genuine, real-time call
+   chain — `TestUpgrade.testUpgrade` → `JdbcStatement.execute` →
+   `JdbcConnection.prepareCommand` → `Session.prepareCommand` →
+   `Session.prepareLocal` → `Parser.prepareCommand` → `Parser.parse` ×2, all
+   `loader=UserDefined(5)` (the OLD h2-1.4.200 driver) — except the
+   innermost frame, `ParserBase.getSyntaxError()`, which is
+   `loader=Application`. This is NOT a cross-thread/stale-stack-trace
+   artifact (the eleventh pass's leading hypothesis) — it's a real,
+   same-thread, currently-executing call chain. That rules out the entire
+   "stack-trace fidelity" theory outright.
+2. Used `javap -v` on the actual `h2-1.4.200.jar`'s `Parser.class` to find
+   exactly which bytecode offset in `Parser.parse(String,boolean)` the
+   suspended frame's `pc=81` corresponds to (the return-address-after-call
+   convention: `frame.pc` is set to `saved_pc + 3` *before* the callee frame
+   is pushed, so a suspended frame showing `pc=81` mid-callee-execution
+   means the in-flight call is the `invokespecial` at raw offset 78 — 3
+   bytes earlier). Constant-pool entry `#52` at that offset is
+   `org/h2/command/Parser.read:()V` — a **self-call to the old driver's own
+   `read()` method**, not a call to `getSyntaxError()` as every prior pass
+   assumed (the pc=81 return address was previously misread against the
+   *wrong* method/version's disassembly).
+3. Added a one-line entry trace directly inside
+   `native-builtins/src/apps_h2.rs`'s `h2_parser_read` (gated
+   `CRATONVM_DBG_H2PARSERREAD`), printing the receiver's actual `ClassId`.
+   Confirmed directly: the very last of 380 `h2_parser_read` invocations in
+   the run — immediately before the crash — has `this` bound to the OLD
+   driver's own `Parser` instance (a distinct `ClassId` from the
+   Application `Parser` class every other call in the run used). This
+   native is registered for `"org/h2/command/ParserBase".read()V`
+   (`is_h2_parser_native_override`) — the old driver's `Parser` class
+   neither is, nor extends, `ParserBase` (H2 1.4.200 predates that split
+   entirely) — so this native firing on an old-driver receiver is itself
+   the bug's proximate trigger.
+
+### Root cause
+
+`h2_parser_read` expects the modern `Tokenizer`/`tokens`-array-based
+`ParserBase` field layout (`tokenIndex`, `tokens`). The old driver's
+`Parser` object has neither field, so the native immediately falls into its
+"index out of range" branch and calls `h2_syntax_error(ctx, this)`, which
+does:
+```rust
+ctx.invoke_special(
+    "org/h2/command/ParserBase", "getSyntaxError",
+    "()Lorg/h2/message/DbException;", &[Value::Object(Some(this))],
+)
+```
+Since `ParserBase` genuinely has only one definition process-wide (the old
+driver has no such class at all), this bare-name resolution isn't itself
+wrong — it correctly finds Application's `ParserBase`. The bug is that
+`this` here is the OLD driver's `Parser` instance, not an Application
+`ParserBase`/`Parser` instance at all: Application's real
+`getSyntaxError()` bytecode runs with the wrong receiver, does
+`this.token.start()`, and NPEs since the old-driver object has no properly
+populated `token` field for that call to read.
+
+**The actual, deeper bug — why does `h2_parser_read` fire at all for the old
+driver's own, unrelated, directly-declared `read()` self-call?** Traced to
+`try_stackless_invoke`'s forced-native-override pre-check (the `.or_else`
+block starting ~line 30572 of `vm/src/runtime/interpreter.rs`, reached from
+`execute_invoke_kind`'s "exotic fallback" slow path — confirmed via
+instrumentation that this specific call goes through `execute_invoke_kind`,
+unlike the `getSyntaxError` call itself, which is a `NativeContext::
+invoke_special` Rust-to-Java call and never touches bytecode-level dispatch
+tracing at all, explaining why the eighth-through-eleventh passes' bytecode
+tracing never found it despite `getSyntaxError` appearing in every crash).
+This pre-check decides "does the bytecode method about to be called have a
+registered native override that should win," and — independently of the
+`dispatch_class_override` the caller (`execute_invoke_kind`) had *already*
+correctly computed via loader-aware resolution — resolves the CP-referenced
+class NAME via the flat, loader-blind `ClassManager::get_loaded_class_id`.
+Old H2 1.4.200's `Parser` class and the current Application H2 build's
+`Parser` class share the exact name `org/h2/command/Parser` (confirmed:
+Application's modern H2 source under `apps/h2database/h2/src/main` still
+declares a class literally named `Parser`, which now *extends* `ParserBase`
+rather than being monolithic). `get_loaded_class_id("org/h2/command/
+Parser")` collapses to whichever loaded first process-wide — Application's,
+since it loads early in test-harness bootstrap. Application's `Parser`
+class does **not** override `read()` (inherited from `ParserBase`), so the
+`has_own_bytecode` check against the (wrong) Application `Parser` class
+came back `false`, the ancestor walk continued up to `ParserBase`, found
+it declares `read()`, and force-installed `ParserBase`'s registered native
+(`h2_parser_read`) — onto the OLD driver's completely unrelated `read()`
+self-call, whose own class genuinely declares `read()` directly and was
+never consulted because the lookup used the wrong same-named class from
+the start.
+
+This is the same "name resolves to whichever loader/class defined it
+first" bug family as three prior fixes in this doc (`updateRootPage`,
+`h2_session_prepare_local_no_cache`'s `Parser` construction, and the
+seventh pass's `resolved_private_invokevirtual_target`) — but in a fourth,
+previously unaudited spot: the forced-native-override pre-check inside
+`try_stackless_invoke` itself, which had its own independent
+loader-blind lookup instead of reusing the caller's already-loader-precise
+`dispatch_class_override`.
+
+### Fix
+
+`vm/src/runtime/interpreter.rs`'s `try_stackless_invoke`: the
+forced-native-override closure now resolves its starting `ClassId` as
+`dispatch_class_override.or_else(|| cm.get_loaded_class_id(class_name))`
+for both the `has_own_bytecode` check and the ancestor-walk starting class,
+instead of calling `get_loaded_class_id` unconditionally. `dispatch_class_
+override` is `None` at the overwhelming majority of call sites (only a
+handful of already-loader-aware paths — `resolved_private_invokevirtual_
+target`, the lambda-interface-override path, the invokespecial
+loader-initiated-resolution path — ever supply it), so this is a
+behavior-preserving no-op everywhere except where the caller has already
+done the loader-aware work; there, it's now actually honored instead of
+being silently discarded by this one pre-check.
+
+**Verified**: `org.h2.test.unit.TestUpgrade` passes cleanly (exit 0) — 2
+runs under `--nojit`, 1 run with JIT enabled. Regression-clean:
+`TestAlter`, `TestShell`, `TestLinkedTable`, `TestPreparedStatement`, and
+`TestDataUtils` (all exit 0, zero fail/error/exception/assert lines) — plus
+a full 218-class suite run via `apps/h2database-suite-runner` (see below).
+
+### The ninth-pass LOB-migration residual is ALSO cleared, unexpectedly
+
+With this fix in place, `TestUpgrade` runs all the way through
+`Upgrade.upgrade()`'s real `SCRIPT TO`/`RUNSCRIPT FROM` migration — the
+exact path that used to hit the `SYSTEM_LOB_STREAM`/`ScriptCommand.
+getLobStream`/`combineBlob` `NullPointerException` reading BLOB data back
+(ninth pass) — with zero errors. No separate fix was needed for that
+residual; it traced back to the same general `try_stackless_invoke`
+mechanism (plausibly some other same-named-class collision reachable only
+once the SQL-parsing blocker was gone), not anything LOB/BLOB-storage
+specific. Diagnostic tracing left in the tree for this investigation
+(`CRATONVM_DBG_NPE_STACK`'s loader-id addition, `CRATONVM_DBG_INVSPECIAL`,
+`CRATONVM_DBG_GSE`, `CRATONVM_DBG_H2PARSERREAD` in `apps_h2.rs`) was not
+needed to explain the LOB residual specifically and wasn't re-run against
+it in isolation, since the full `TestUpgrade` class already exercises and
+passes that exact path end-to-end.
+
+### Fix commit and full-suite verification
+
+Fix commit `4d97f0eec` pushed directly to `origin/dev` as a fast-forward
+from the worktree branch (`origin/dev` had not moved from this session's
+`346c74b71` fork point, so no merge was needed — same rationale as the
+ninth/tenth passes' direct-push approach). A full 218-class
+`apps/h2database-suite-runner` run (`--category all --count 218 --jit
+off`) was kicked off against the fixed binary to catch any regression from
+this dispatch-path change beyond the H2 classes already spot-checked above
+— see the doc's own results file for the outcome if this section wasn't
+updated with a summary before the session ended (the fix touches a hot,
+general-purpose dispatch path shared by every native-override decision in
+the VM, not just H2-specific code, so this broader check matters more than
+usual).
