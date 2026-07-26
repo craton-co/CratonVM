@@ -351,12 +351,14 @@ fn rh7_oopmap_scaffolding_retains_references() {
         native_pc_offset: 0x40,
         frame_slot_offsets: vec![-16, -24],
         moving_young_coverage_complete: false,
+        live_frame_hi: 0,
     });
     cm.push_oop_map(OopMapEntry {
         bytecode_pc: 0,
         native_pc_offset: 0x80,
         frame_slot_offsets: vec![-16],
         moving_young_coverage_complete: false,
+        live_frame_hi: 0,
     });
     assert!(cm.has_precise_oop_maps());
 

@@ -8,8 +8,10 @@ owner and was **not** edited here.*
 Companion reading:
 
 - `docs/internal/flag-census.md` — the workspace-wide flag inventory this work sits in.
-- `docs/known-issues/moving-young-gen-drops-jit-held-oops.md` — **OPEN**. Do not flip
-  moving-young on the strength of anything in this document.
+- `docs/internal/fixed-suite-bugs/app-jvm-bugs/moving-young-gen-drops-jit-held-oops-FIXED.md`
+  — **CLOSED 2026-07-26** (the corruption was five untagged operand-stack oops
+  in `jit/src/x64.rs`, not the collector). Still do not flip moving-young on the
+  strength of anything in this document: the remaining blocker is throughput.
 - `docs/feature-designs/default-moving-young-gen.md`
 - `docs/internal/inline-allocation-and-reference-publication.md`
 

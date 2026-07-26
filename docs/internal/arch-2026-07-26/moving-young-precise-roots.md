@@ -8,9 +8,18 @@ Basis: merged `dev` @ `6495a191c` (this worktree was branched from `origin/main`
 
 ## VERDICT (read this first)
 
-**Moving-young is NOT on by default after this change, and turning it on would
-corrupt the heap today.** That is not a precaution — it is measured, on
-unmodified `dev`, in `docs/known-issues/moving-young-gen-drops-jit-held-oops.md`:
+> **UPDATE 2026-07-26.** The corruption below is FIXED; the known-issue moved
+> to `docs/internal/fixed-suite-bugs/app-jvm-bugs/moving-young-gen-drops-jit-held-oops-FIXED.md`.
+> The prediction in "#7 — unregistered JIT frame" was **not** the cause: the
+> real producer was an untagged operand-stack oop at five `jit/src/x64.rs`
+> push sites. Turning `CRATONVM_MOVING_YOUNG=1` on with the JIT enabled is now
+> correct (bt18 `68332206` over 1–25 real moving cycles). The default is still
+> off, on throughput grounds. Items 3 and 4 of "Remaining work" below are
+> still open.
+
+**Moving-young was NOT on by default after this change, and turning it on
+corrupted the heap.** That was not a precaution — it was measured, on
+unmodified `dev`:
 
 | Configuration (bt18, `-Xmx8g`, correct = `68332206`) | Checksum |
 |---|---|
@@ -68,9 +77,10 @@ the thing that blocks the flip.
 
 **Acceptance criteria before flipping** (all of them):
 
-- `docs/known-issues/moving-young-gen-drops-jit-held-oops.md` re-measured and
-  CLOSED: bt18 `= 68332206` on every run, with the JIT enabled, at `-Xmx8g`
-  *and* at a small heap where minor GC actually fires.
+- The known-issue re-measured and CLOSED — **done, 2026-07-26**: bt18
+  `= 68332206` on every run with the JIT enabled, at `-Xmx8g` and at `-Xmx512m`
+  (25 moving cycles). See
+  `docs/internal/fixed-suite-bugs/app-jvm-bugs/moving-young-gen-drops-jit-held-oops-FIXED.md`.
 - bt16 `14985902`, bt14 `3222190`.
 - App gauntlet with `gc_quiescence::moving_young_coverage_fallback_count()` and
   `moving_young_cycle_count()` both observed — the second must be non-zero, or
@@ -394,12 +404,13 @@ concurrent `cargo build`s OOM the host). The orchestrator builds after merging.
    the top. Behaviour-preserving today; it is what makes the flip a
    one-constant change.
 
-2. **Re-measure `docs/known-issues/moving-young-gen-drops-jit-held-oops.md`.**
-   The repro is in that file. If obligation #7 was the cause, bt18 should now
-   read `68332206` with `CRATONVM_MOVING_YOUNG=1` and the JIT on — at the cost
-   of moving-young engaging rarely (watch `moving_young_cycle_count()`; if it is
-   zero, the checksum being right proves nothing). Add that repro to the
-   regression suite as the objective pass criterion the known-issue asks for.
+2. ~~**Re-measure the known-issue.**~~ **DONE 2026-07-26 — and obligation #7
+   was NOT the cause.** The producer was an untagged operand-stack oop at five
+   `jit/src/x64.rs` push sites; the frame-band verifier from the companion
+   session is what proved the codegen's coverage bit was lying. bt18 now reads
+   `68332206` with the JIT on over 1–25 real moving cycles and zero coverage
+   fallbacks. Regression tests landed in `jit::x64::tests`. See
+   `docs/internal/fixed-suite-bugs/app-jvm-bugs/moving-young-gen-drops-jit-held-oops-FIXED.md`.
 
 3. **Un-blunt obligation #7 so moving-young can actually engage.** Two
    independent routes, either sufficient:
