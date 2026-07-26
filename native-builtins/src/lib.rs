@@ -31686,7 +31686,23 @@ fn quote_uric(s: &str) -> String {
 ///
 /// This is reused by `getLocalHost` and `NetworkInterface.getNetworkInterfaces`
 /// so both surface the same name to Java code.
+///
+/// Cached: the result is latched on first use. Step 3 forks and execs the
+/// `hostname` binary, and on Linux `HOSTNAME` is frequently *not* exported to
+/// non-interactive shells, so steps 1 and 2 miss and every single
+/// `InetAddress.getLocalHost()` / `NetworkInterface.getNetworkInterfaces()`
+/// call paid a full process spawn. A machine does not rename itself
+/// mid-process, and HotSpot itself caches `getLocalHost()`, so one resolution
+/// per VM is the right granularity. [`resolve_real_hostname_uncached`] keeps
+/// the probing logic testable.
 pub(crate) fn resolve_real_hostname() -> String {
+    static CACHED: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    CACHED.get_or_init(resolve_real_hostname_uncached).clone()
+}
+
+/// The uncached probe behind [`resolve_real_hostname`]. Split out so the
+/// resolution order stays directly testable without the `OnceLock` latch.
+pub(crate) fn resolve_real_hostname_uncached() -> String {
     if let Ok(name) = std::env::var("HOSTNAME") {
         let trimmed = name.trim();
         if !trimmed.is_empty() {

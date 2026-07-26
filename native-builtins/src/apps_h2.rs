@@ -2313,12 +2313,47 @@ fn h2_sql_fragment(
     Ok(ctx.read_string(s).unwrap_or_default())
 }
 
+/// Cached `CRATONVM_DBG_H2PARSERREAD` lookup.
+///
+/// `h2_parser_read` is H2's per-token SQL parser step: a single statement
+/// drives it hundreds of times, and a benchmark run drives it millions.
+/// Probing `env::var_os` per call takes the platform environ lock and scans
+/// `environ` linearly (measurably worse on Windows). Latch the boolean at
+/// first use, matching the `security_manager::dbg_dopriv_enabled` and
+/// `lang_reflect::dbg_method_invoke_box_enabled` convention: the switch must
+/// be set before the first parse to take effect.
+#[inline]
+fn h2_parser_read_dbg_enabled() -> bool {
+    static DBG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DBG.get_or_init(|| std::env::var_os("CRATONVM_DBG_H2PARSERREAD").is_some())
+}
+
+#[cfg(test)]
+mod h2_parser_read_dbg_tests {
+    #[test]
+    fn h2_parser_read_dbg_flag_is_latched_and_matches_environment() {
+        // The per-token parser step used to probe `env::var_os` on every call.
+        // The latched helper must agree with the environment at first use and
+        // stay stable afterwards.
+        let expected = std::env::var_os("CRATONVM_DBG_H2PARSERREAD").is_some();
+        assert_eq!(super::h2_parser_read_dbg_enabled(), expected);
+        assert_eq!(super::h2_parser_read_dbg_enabled(), expected);
+    }
+
+    #[test]
+    fn h2_parser_read_dbg_flag_is_off_in_a_clean_environment() {
+        if std::env::var_os("CRATONVM_DBG_H2PARSERREAD").is_none() {
+            assert!(!super::h2_parser_read_dbg_enabled());
+        }
+    }
+}
+
 fn h2_parser_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
-    if std::env::var_os("CRATONVM_DBG_H2PARSERREAD").is_some() {
+    if h2_parser_read_dbg_enabled() {
         let cid = ctx.class_id_of_object(this);
         let cname = ctx.class_name_of_id(cid).unwrap_or_default();
         eprintln!("[H2PARSERREAD] this class_id={cid:?} class_name={cname}");

@@ -1502,11 +1502,38 @@ fn resolve_host(host: &str) -> Result<IpAddr, cratonvm_types::error::MethodCallF
     }
 }
 
+/// The host name this VM reports to Java code.
+///
+/// Delegates to [`crate::resolve_real_hostname`], which is the crate-wide
+/// source of truth (its own doc already claims `getLocalHost` and
+/// `NetworkInterface.getNetworkInterfaces` share it). This function used to
+/// probe `COMPUTERNAME`/`HOSTNAME` itself, in the opposite precedence and with
+/// no `hostname(1)` fallback -- so on a Linux host where `HOSTNAME` is not
+/// exported, the phase-E `InetAddress.getLocalHost()` here answered
+/// `"localhost"` while `net_uri_inet`'s registration of the *same* method
+/// answered the real machine name. Which one a program saw depended only on
+/// registration order. Sharing one resolver removes the divergence and the two
+/// uncached `getenv` probes per call (the shared resolver latches its result).
 fn hostname_string() -> String {
-    std::env::var("COMPUTERNAME")
-        .ok()
-        .or_else(|| std::env::var("HOSTNAME").ok())
-        .unwrap_or_else(|| "localhost".to_string())
+    crate::resolve_real_hostname()
+}
+
+#[cfg(test)]
+mod hostname_string_tests {
+    #[test]
+    fn hostname_string_agrees_with_the_crate_wide_resolver() {
+        // Two registrations of `InetAddress.getLocalHost()` exist (this phase-E
+        // one and `net_uri_inet`'s). They must not disagree about the machine
+        // name depending on which registered last.
+        assert_eq!(super::hostname_string(), crate::resolve_real_hostname());
+    }
+
+    #[test]
+    fn hostname_string_is_non_empty_and_stable() {
+        let first = super::hostname_string();
+        assert!(!first.is_empty(), "hostname must never be empty");
+        assert_eq!(first, super::hostname_string(), "must be stable across calls");
+    }
 }
 
 // ---------------------------------------------------------------------------
