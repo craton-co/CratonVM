@@ -8,7 +8,7 @@ Date fixed: 2026-07-09
 ## Symptom
 
 Found while continuing the websocket close-delay investigation
-(`../../known-issues/tomcat/wsremoteendpoint-close-delay-near-deadlock.md`)
+(`../tomcat/wsremoteendpoint-close-delay-near-deadlock.md`)
 after the `EnumSet.of()`/`allOf()` fix
 (`docs/internal/fixed-suite-bugs/enumset-synthetic-surface-drop-realmode-FIXED.md`)
 let Tomcat start under real-JDK mode and reach real `ThreadPoolExecutor`
@@ -147,5 +147,5 @@ hypotheses, in
 `docs/internal/tomcat-08-07/swallowabortedupploads-unexpected-socketexception-RESOLVED.md`
 ("New blocker #3") — not this fix's scope; see that doc for the next
 steps on it. See
-`../../known-issues/tomcat/wsremoteendpoint-close-delay-near-deadlock.md`
+`../tomcat/wsremoteendpoint-close-delay-near-deadlock.md`
 for the close-delay investigation's updated status.

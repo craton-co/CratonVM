@@ -5,7 +5,7 @@
 interpreter/dispatch throughput ceiling
 ([`04-embedded-server-throughput-wall-OPEN.md`](04-embedded-server-throughput-wall-OPEN.md)),
 not new or independently-fixable bugs. Closes
-`../../../known-issues/tomcat/regressions-revealed-by-fixture-completion-20260723.md`.
+`../../tomcat/regressions-revealed-by-fixture-completion-20260723.md`.
 
 Work done on branch `fix/tcfixregr-resume-20260723` (base `origin/dev` @
 `85b8b981e`), Azure host worktree `/data/wt-tcfixregr-resume-20260723`,

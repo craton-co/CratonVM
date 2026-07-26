@@ -1,6 +1,17 @@
-# `TestFileSystem.testConcurrent` hangs against the `async:` filesystem — three real bugs fixed, one open performance gap remains
+# `TestFileSystem.testConcurrent` is pathologically slow — worst on the LZF in-memory filesystems, and NOT on `async:` — seven bugs fixed, one open performance wall remains
+
+*(Filename kept for the inbound links in `../../internal/fixed-suite-bugs/g1-native-alloc-no-safepoint-oom-FIXED.md`, `bug-h2-files-setposixfilepermissions-FIXED.md` and the Tomcat fixture-completion doc. The `async:` in it is a misnomer — see the per-prefix table below: `async:` is the LEAST affected filesystem of the sixteen this class exercises.)*
 
 ## Status
+**PARTIALLY FIXED, 2026-07-26 update.** Three more per-invoke costs found and
+fixed (uncached `getenv`, a redundant method-ref resolution, and the
+native-registry digest), worth ~14% on the reduced lock-only form of this
+workload and ~8% on an H2 reconnect workload — see "Session 2026-07-26" below.
+The class still exceeds the 300s watchdog; the remaining gap is still the flat
+ceiling this doc has described since 2026-07-23, and closing it needs the
+architectural item (interpreted-dispatch caching), not more micro-fixes. The
+2026-07-25 text below is unchanged.
+
 **PARTIALLY FIXED, 2026-07-25 update.** Three bugs fixed 2026-07-23 (merged
 `4afa20cea`) plus a fourth, dominant one found and fixed 2026-07-25 (merged
 `dev` `74b709d8e`): `ArenaStore::locate()`'s O(n) linear scan, ~24% of all
@@ -208,6 +219,191 @@ genuinely distributed (no function above ~7%), matching this doc's own
 discrete bug. See "Open: remaining performance gap" below for what closing
 it completely would require.
 
+## Session 2026-07-26: it is not contention, and three more per-invoke costs
+
+Picked this up from the other side: instead of running the 60-minute class,
+reduce it. `RrwlSingle` (in this doc's repro section below) does 100k
+**uncontended** `ReentrantReadWriteLock` write-lock, read-lock and
+`ReentrantLock` lock/unlock pairs on ONE thread, plus 100k `synchronized`
+blocks as a control.
+
+```
+                 HotSpot     CratonVM (dev @ 8e8d4d4fb)     ratio
+write lock         18ms                2950ms              164x
+read lock           8ms                3014ms              377x
+ReentrantLock       7ms                1936ms              277x
+synchronized        2ms                  62ms               31x
+```
+
+Two things fall out immediately:
+
+* **The cost is not contention and not parking.** One thread, no waiters, no
+  `park`/`unpark` — and the AQS lock path is still 164-377x slower, while the
+  VM's own monitor path (`synchronized`) is only 31x. Whatever this doc's
+  original title called a hang is per-operation overhead on the AQS/native
+  dispatch path, which is exactly what 2026-07-23 and 2026-07-25 concluded from
+  the other direction.
+* **`--jit on` is SLOWER than `--nojit` here** (1122ms vs 1563ms for the same
+  100k triple). That is a new, concrete data point for next-step #5: the AQS
+  methods are permanently skip-listed, so every JIT'd caller pays
+  `jit_invoke_virtual_mic` -> `find_method_recursive` re-resolution on each
+  call and gets nothing back. The JIT is a net negative on this shape.
+
+### Three fixes (commits `2eeff06b8`, `c6c1d233d`)
+
+**1. Six more uncached `getenv` reads on interpreter hot paths.** Same defect
+class as 2026-07-23's fix #1, found the same way the CratonBench `getenv`
+hotspot was (`ld-preload-getenv-tally-beats-dwarf-callgraph`): an `LD_PRELOAD`
+tally counted **6,901,759** `getenv` calls for 300k lock/unlock pairs — ~23 per
+operation — of which 6,900,696 were six ad-hoc debug traces reading their
+variable inline per invoke / per putfield / per `if_acmpne`:
+
+```
+4501107  CRATONVM_DBG_GSE                        (invoke-cache lookup, twice per lookup)
+1101202  CRATONVM_DBG_FIELD_WATCH                (every putfield + every field retarget)
+ 599999  CRATONVM_DBG_WATCHREF
+ 398881  CRATONVM_DBG_ASSERTEQ                   (every JIT-ABI invoke)
+ 199000  CRATONVM_EXEC_FRAME_TRACE               (every frame entry)
+ 100507  CRATONVM_ACTIVE_PROFILES_IDENTITY_TRACE (every if_acmpne)
+```
+
+Moved to `vm/src/runtime/env_cache.rs`'s existing `cached_is_set!` pattern:
+**6,901,759 -> 1,070** calls, ~3.5% of CPU by `perf`.
+
+**2. Three sites in `execute_invokevirtual_cached` resolved a method ref to
+test a condition that is almost always false.** Each ran a full
+`resolve_method_ref` — a resolution-cache `RwLock` read, a hash probe and four
+`Arc` clone/drop pairs — before finding out it had nothing to do:
+
+* the Spring `MergedAnnotation$Adapt.isIn` loader-split bridge. Its outer gate,
+  `loader_aware_resolution()`, is **default-ON**, so this ran on EVERY
+  invokevirtual/-interface/-special in the VM purely to compare the owner
+  against one hard-coded class name. Now behind an arm-once atomic that stays
+  false until `resolve_method_metadata` has actually resolved a CP entry naming
+  that method — a strict prerequisite, since the guard's only effect is to
+  return `CacheMiss` and an unresolved site has no inline-cache entry to bypass
+  anyway.
+* the cached-`Native` redefine-shadow re-check: now short-circuits on
+  `any_class_redefined()` (a relaxed atomic load, and already the first line of
+  the helper it feeds) before resolving.
+* the cached-`VirtualNative` synthetic-stub re-check: now tests
+  `real_protected_stub_class(receiver_name)` — the receiver-name half of the
+  predicate it feeds — before resolving.
+
+`resolve_method_ref` calls on the same workload: **6,784,000 -> 1,494,453**.
+`resolve_method_metadata` went from 5.33% to 1.44% of CPU.
+
+**3. `NativeMethodRegistry::slot_for_exact` answers the common miss from the
+class name alone.** With those two out of the way it became the single largest
+entry in a live 30s/999Hz profile of the real `TestFileSystem` — **8.75%**
+across its two threads, plus much of the `__memcmp_evex_movbe` time spent
+name-verifying digest hits. It sits on the every-invoke path via
+`invoke_or_native`, hashes ~60-100 bytes byte-at-a-time across two
+accumulators, and the overwhelming majority of its calls name application
+classes (`org/h2/mvstore/...`, `org/h2/store/...`) that register no natives at
+all. The triple digest is now split into a resumable class-name prefix plus a
+finisher; every registered class's prefix hash lives in a set, and a class
+absent from that set returns `None` without finishing the digest, probing the
+map, or comparing any strings. A hash collision can only add a false positive,
+which falls through to the pre-existing full verification. `slot_for_exact`
+6.27% -> 3.94% on an H2 reconnect workload.
+
+### The ceiling is NOT flat: one prefix/sub-test is the whole wall
+
+The 2026-07-25 conclusion — "a flat, distributed performance ceiling, not a
+further discoverable bug" — is true of the *profile* but not of the *test*.
+Instrumenting `testFileSystem(String fsBase)` with a per-sub-test timer (a
+compiled overlay of `TestFileSystem.java` prepended to the classpath, so the
+shared H2 checkout is untouched) gives a per-prefix breakdown that nobody had
+before, because `TestBase` prints nothing unless something fails — which is
+also why the earlier "no output for 60 minutes" runs looked like a hang.
+
+`testConcurrent`, CratonVM `--jit on --Xmx 1g` vs HotSpot, same host:
+
+| prefix | HotSpot | CratonVM | ratio |
+|---|---:|---:|---:|
+| `./data/test/fs` | 83ms | 2038ms | 25x |
+| `./data/test/fs` (after `split:10:`) | 58ms | 2020ms | 35x |
+| **`async:./data/test/fs`** | 473ms | 2001ms | **4x** |
+| `memFS:` | 31ms | 1036ms | 33x |
+| `memLZF:` | 102ms | 11584ms | 114x |
+| `nioMemFS:` | 44ms | 1143ms | 26x |
+| **`nioMemLZF:1:`** | 862ms | **>1100s, never completed** | **>1200x** |
+
+Everything up to and including `nioMemFS:` finishes in ~130s combined. Then
+`testConcurrent` on `nioMemLZF:1:` runs for **over 18 minutes without
+completing** (killed there; a second run with `CRATONVM_JIT_ALLOW_PACKAGES=
+org/h2/` was equally stuck, so this is not the `org/h2` JIT ban). Whole-class
+HotSpot total: **4.94s**. That single prefix/sub-test pair is what turns this
+class into a >3600s run, and it is where any further work should point.
+
+Note also that **`async:` — the prefix in this doc's title — is the LEAST
+affected of them all at 4x.** The title's premise does not survive
+measurement; the problem is `testConcurrent` generally, and the LZF-compressed
+in-memory filesystems specifically.
+
+### Why `testConcurrent` amplifies: an uncooperative spin lock
+
+`testConcurrent` guards each 64 KB block with a raw, backoff-free spin over an
+`AtomicIntegerArray`:
+
+```java
+while (!locks.compareAndSet(pos, 0, 1)) { }
+try { ... f.read/write ... } finally { locks.set(pos, 0); }
+```
+
+with a `Thread.yield()` per reader iteration and two real threads. Both halves
+of that are slow here, and they multiply:
+
+* `AtomicIntegerArray.compareAndSet` + `set` measures **535ns/pair on CratonVM
+  vs 20ns on HotSpot (27x)** — it goes through the full native dispatch path,
+  and a live profile of the stuck `nioMemLZF:1:` run attributes **12.2%** of
+  both threads to `NativeMethodRegistry::slot_for_exact` alone (plus 9.3% to
+  `invoke_on_class_shared_inner` and 4% to `memcmp`), i.e. a quarter of the
+  run is re-looking-up the same native on every spin iteration.
+* the critical section itself (the `FileChannel` read/write, LZF
+  compress/decompress for the `*LZF*` prefixes) is interpreted-speed, so the
+  lock is held far longer than upstream assumes.
+
+A slow lock primitive plus a long critical section plus an unbounded spin is
+super-linear, which is exactly the shape of the table above: the prefixes with
+the most work inside the lock (`memLZF`, `nioMemLZF`) are the ones that fall
+off a cliff, while `async:` — which does its I/O outside the lock — is barely
+affected.
+
+**Concrete next target.** `invoke_or_native` probes the native registry on
+every call, but `resolve_method_metadata` ALREADY caches the resolved native
+callback and kind per constant-pool entry (`ResolvedMethod::native_target` /
+`native_kind`) — its own doc comment says "the registry hash is paid once per
+resolved CP entry, not once per call site that consumes it". Threading that
+precomputed target into `invoke_or_native` instead of re-probing would remove
+the ~12% directly and, more importantly, shorten the spin-lock critical
+section, which is where the super-linear amplification lives. That is a
+narrower and better-evidenced target than the general interpreted-dispatch
+cache in item 5.
+
+### Measured effect
+
+Three alternating runs each, same host, same shape:
+
+```
+RrwlSingle (write+read+reentrant, 100k each)   2831ms -> 2428ms   -14.2%
+SeqRepro   (H2 open/reconnect x300)             35.3s ->  32.5s    -8.0%
+```
+
+All three fixes are VM-wide, not H2-specific.
+
+### What the profile looks like now
+
+Live 30s/999Hz sample of the real `TestFileSystem` after the fixes, both real
+threads combined: `slot_for_exact` 8.75% (before fix 3),
+`invoke_on_class_shared_inner` 7.5%, `execute_frame_from_index` 4.5%,
+`execute_invokevirtual_cached` 3.3%, `memcmp` 3.1%, `execute` 3.1%,
+`safe_native_call_impl` 2.9%, `_mi_page_malloc_zero` 3.2%,
+`jit_invoke_virtual_mic` 2.2%, `pop_coerced_invoke_args_virtual` 2.2%. Still
+flat, still dominated by generic invoke plumbing — the shape 2026-07-25
+described, one large item lighter.
+
 ## Open: remaining performance gap (not fully closed)
 
 Even with all four fixes above, a fresh `TestFileSystem` class run under
@@ -246,25 +442,24 @@ regression pass — out of scope for this session's time budget, flagging
 here precisely rather than rushing it.
 
 **Suggested next steps for whoever picks this up:**
-1. ~~Get a wall-clock number for a genuinely completed run~~ — attempted
-   2026-07-25: confirmed **>3600s (60 min) both pre- and post-fix** (both
-   runs hard-killed at exactly the 3600s observation ceiling, never
-   completing naturally). Nobody has yet observed this class complete
-   naturally under `--jit on --Xmx 1g` at all; the true completion time
-   (whatever it turns out to be) is still the most useful missing data
-   point, and now clearly requires either a much longer observation window
-   (hours, not one) or the deeper JIT-coverage work in item 5 below before
-   it's practically obtainable.
+1. ~~Get a wall-clock number for a genuinely completed run~~ — **answered
+   2026-07-26, and the question was the wrong one.** The class does not have a
+   uniform completion time to measure: it clears ~14 of its ~16 prefixes in
+   ~130s and then parks in `testConcurrent` on `nioMemLZF:1:` for >18 minutes
+   without completing (HotSpot does that same sub-test in 862ms and the whole
+   class in 4.94s). See "The ceiling is NOT flat" above for the full per-prefix
+   table and how to reproduce it. Measure THAT sub-test, not the class.
 2. ~~Profile a live run~~ — done 2026-07-25 (`perf record -F 999`, flat
    sampling, no call-graph). Dominant cost found and fixed
    (`ArenaStore::locate`, commit `491679a63`). Remaining profile is flat;
    see above for the breakdown and the one identified further opportunity
    (interpreted-dispatch caching for permanently-skip-listed callees).
-3. Consider whether `afc_read_at`/`afc_write_at`'s per-file
-   `std::sync::Mutex` (native-io/src/lib.rs) is itself a bottleneck under
-   this test's tight two-thread read/write interleaving on the same file —
-   still not directly investigated (did not show up as a distinct hotspot
-   in the 2026-07-25 profile, but wasn't isolated either).
+3. ~~Consider whether `afc_read_at`/`afc_write_at`'s per-file
+   `std::sync::Mutex` (native-io/src/lib.rs) is itself a bottleneck~~ —
+   **deprioritised 2026-07-26.** Those are the `async:` path, and `async:` is
+   now measured as the *least* affected prefix (4x vs HotSpot, against 25-1200x
+   for the others). Whatever that mutex costs, it is not what makes this class
+   miss the watchdog.
 4. ~~Root-cause the `--nojit`/G1 OOM~~ — root-caused 2026-07-25, **FIXED
    2026-07-26**, doc retired to
    [`g1-native-alloc-no-safepoint-oom-FIXED.md`](../../internal/fixed-suite-bugs/g1-native-alloc-no-safepoint-oom-FIXED.md).
@@ -284,6 +479,23 @@ here precisely rather than rushing it.
    pursuing further — likely the next-largest opportunity now that the
    arena bug is fixed, but architecturally more involved (JIT MIC/PIC
    changes, not a contained data-structure swap).
+   **2026-07-26: this is now the only item left with an order-of-magnitude in
+   it, and there is direct evidence for it** — on the reduced lock-only
+   workload `--nojit` beats `--jit on` (1122ms vs 1563ms), which is exactly the
+   predicted cost of JIT'd callers re-resolving permanently-skip-listed AQS
+   callees on every call. The three 2026-07-26 fixes took ~14% off that
+   workload and ~8% off an H2 reconnect workload; the class needs roughly 12x
+   to fit the 300s watchdog, so no further micro-fix of this kind will close
+   it.
+6. New: the AQS/RRWL entries in `is_known_miscompile_aqs_family`
+   (`vm/src/jit/skip_list.rs`) may be stale. The 200k-iteration two-thread
+   `RrwlRepro` below, which this doc records as a PERMANENT hang that motivated
+   adding `compareAndSetState`/`getState`/`setState`, now **completes cleanly**
+   with the family lifted (`CRATONVM_JIT_ALLOW_PACKAGES=java/util/concurrent/
+   locks/`) — 9358ms vs 8519ms with the ban in place, i.e. correct but not
+   faster. Not enough to justify lifting on its own (JITting AQS is a small
+   net loss on this shape), but worth re-testing as part of item 5: if the
+   interpreted-dispatch cache lands, the trade-off changes.
 
 ## Repro
 ```
@@ -294,6 +506,42 @@ TMPDIR=/data/data H2_ROOT=<h2 checkout>/h2 \
   --jdk real --jit on --class-to 300
 # -> still HANG at 300.0s (performance gap confirmed to persist post-fix -- see above)
 ```
+Reduced, single-threaded, uncontended form used for the 2026-07-26 work — no
+threads, no disk I/O, no H2, runs in seconds, and reproduces the whole ratio
+(`RrwlSingle`):
+
+```java
+import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.concurrent.locks.ReentrantLock;
+public class RrwlSingle {
+    public static void main(String[] args) throws Exception {
+        int ITERS = args.length > 0 ? Integer.parseInt(args[0]) : 200_000;
+        ReentrantReadWriteLock rw = new ReentrantReadWriteLock();
+        long t0 = System.nanoTime();
+        for (int i = 0; i < ITERS; i++) { rw.writeLock().lock(); rw.writeLock().unlock(); }
+        long t1 = System.nanoTime();
+        for (int i = 0; i < ITERS; i++) { rw.readLock().lock(); rw.readLock().unlock(); }
+        long t2 = System.nanoTime();
+        ReentrantLock rl = new ReentrantLock();
+        for (int i = 0; i < ITERS; i++) { rl.lock(); rl.unlock(); }
+        long t3 = System.nanoTime();
+        Object mon = new Object();
+        int s = 0;
+        for (int i = 0; i < ITERS; i++) { synchronized (mon) { s++; } }
+        long t4 = System.nanoTime();
+        System.out.println("uncontended write=" + (t1-t0)/1000000 + "ms read=" + (t2-t1)/1000000
+            + "ms reentrant=" + (t3-t2)/1000000 + "ms synchronized=" + (t4-t3)/1000000 + "ms s=" + s);
+    }
+}
+```
+
+To count the `getenv` traffic on any workload, use the LD_PRELOAD tally
+(`/data/data/tmp/getenvspy_full.c` on the Azure host):
+`GETENV_TALLY_OUT=tally.tsv LD_PRELOAD=/data/data/tmp/getenvspy_full.so <cmd>`.
+To count resolution traffic, `CRATONVM_DBG_HOTPATH_COUNTS=1` prints
+`force_native`/`resolve_method_ref`/`lookup_loader_initiated`/`retarget_field`
+totals.
+
 Minimal non-H2 repro used to isolate/verify fixes #1 and #2 (no disk I/O, no
 H2 dependency — completes in ~8s post-fix vs hanging pre-fix on the env-var
 issue specifically):
