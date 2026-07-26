@@ -164,7 +164,16 @@ So parked virtual-thread stacks are **not** a second instance of the JIT
 imprecision hole. They are precise. The price is that virtual threads are
 permanently interpreted.
 
-### The real hole: the remount path never applies the accumulated fixup
+### The real hole: the remount path never applied the accumulated fixup
+
+> **RESOLVED at wave-1 integration** by the owner of `vm_exec.rs`, as cross-owner
+> request 7.1 below. `resume_virtual_continuation` now calls
+> `check_post_block_gc()` (gated on `resumed`, since a first mount was never in a
+> blocked region and would otherwise arrive twice at the same handshake), after
+> the registry publishes rather than before. See
+> `docs/internal/arch-2026-07-26/vt-resume-gc-fixup.md`. The analysis below is
+> kept because it is the reasoning that found it.
+
 
 `resume_virtual_continuation` (`vm_exec.rs:2009`) does:
 
@@ -281,15 +290,21 @@ subsystem's header, but it should not be believed.
 
 ---
 
-## 5. Assumptions about the monitor rework
+## 5. Reconciliation with the monitor rework
 
-`docs/internal/arch-2026-07-26/monitor-and-registry-contention.md` did not exist
-in my tree, so these are stated for reconciliation at merge:
+These were written as assumptions before
+`docs/internal/arch-2026-07-26/monitor-and-registry-contention.md` existed;
+re-checked against it after the wave-1 integration merge.
 
 1. **Monitor ownership is keyed by `ThreadId`, not by carrier / OS thread.**
    A virtual thread that acquires a monitor, unmounts, and remounts on a
    different carrier must still be seen as the owner. Anything that keys
    ownership or reentrancy on an OS thread id breaks virtual threads silently.
+   **Confirmed holds.** The rework moved inflated-monitor lookup from the
+   global table to the mark word, but ownership is still a VM `ThreadId` — the
+   thin lock stores it as a u32 (hence that doc's `ThreadId > u32::MAX` legacy
+   fallback), and `holds` / `current_owner` are still `ThreadId`-keyed. Nothing
+   became carrier-keyed.
 2. **`monitors.release_monitors_held_by_except(tid, ..)` runs only at real
    virtual-thread termination** (`resume_virtual_continuation`, `vm_exec.rs:2170`),
    never on unmount. If the rework adds any "release on carrier exit" sweep, it
@@ -332,20 +347,70 @@ Tests added: `unpark_before_unmount_is_not_lost` (the hang regression),
 `unpark_of_queued_thread_does_not_duplicate_submission`,
 `unpark_permit_does_not_truncate_timed_yield`,
 `unpark_of_terminated_thread_is_a_noop`,
+`unpark_of_parked_thread_without_runtime_still_resubmits`,
 `stall_detector_requires_queued_work_saturation_and_no_progress`,
 `next_task_tolerates_compensating_carrier_index`,
 `blocked_carrier_pool_is_grown_by_the_watchdog` (a task body that never returns,
 asserting queued work still runs — the carrier-release-under-blocking case),
 `compensating_carrier_respects_the_pool_cap`.
 
-Not built or tested (nine concurrent builds OOM the host, per standing
+### 6.1 Correction after the first execution
+
+Agents were barred from building, so the first run of this code was the
+orchestrator's. Three tests failed. Two causes, one in the implementation and
+one in the tests — recorded rather than quietly patched, because the split is
+the useful part.
+
+**Implementation was wrong: `manager_park_and_unpark` (pre-existing).**
+I wrote the resubmit condition as `state == Parked && vt.runtime.is_some()`,
+copied from `wake_waiters`. That test parks a virtual thread that has no
+deposited runtime, so unpark left it `Parked` instead of `Started`.
+
+The pre-existing expectation is correct and I made it fail. On the live path the
+two halves of that conjunct are equivalent — `suspend_runtime` writes
+`state = Parked` and `runtime = Some(..)` under a single hold of the `threads`
+mutex, so no observer can see them disagree. The conjunct could therefore only
+ever change behaviour when the invariant is *already* broken, and there it fails
+in the dangerous direction: refusing to submit a `Parked` thread is a permanent
+hang — the precise defect this rework exists to remove — whereas submitting one
+that has no runtime is a no-op (`take_runtime_for_mount` returns `None` and
+`resume_virtual_continuation` returns immediately). Fail open.
+
+Condition is now `state == Parked` in both `unpark_virtual` and `wake_waiters`.
+`wake_waiters` had the identical latent loss: for an already-parked thread its
+`else` branch sets `wake_pending`, which only `suspend_runtime` consumes, and
+`suspend_runtime` will never run again for a thread that is already parked.
+Added `unpark_of_parked_thread_without_runtime_still_resubmits` so the reasoning
+survives even if `manager_park_and_unpark` is ever rewritten.
+
+**My tests were wrong: `unpark_after_unmount_resubmits_once` and
+`unpark_permit_does_not_truncate_timed_yield`.** Both call `mgr.start(id)`,
+which submits, and then neither drained that submission before asserting
+`next_task(..) == None`. The implementation behaved exactly as designed; the
+tests were reading `start`'s own leftover queue entry.
+
+Worth being explicit that adding the drain *strengthens* these rather than
+relaxing them. With an undrained entry sitting in the queue, an assertion of the
+form "nothing was resubmitted" cannot distinguish `start`'s entry from a
+wrongly-resubmitted one — it would have passed whether or not the bug it names
+was present. Draining first is what makes them able to fail.
+
+Not built or tested by me (nine concurrent builds OOM the host, per standing
 instruction). `rustfmt --check` is clean.
 
 ---
 
 ## 7. Cross-owner requests
 
-### 7.1 `vm/src/vm/vm_exec.rs` — `resume_virtual_continuation` must apply the blocked-region fixup (HIGH, heap corruption)
+### 7.1 `vm/src/vm/vm_exec.rs` — `resume_virtual_continuation` must apply the blocked-region fixup (HIGH, heap corruption) — **DONE**
+
+Landed by the `vm_exec.rs` owner at wave-1 integration, with one correction to
+what I specified: the call is gated on `resumed`, because a first mount was
+never in a blocked region and calling it unconditionally makes that mount arrive
+a second time at the same safepoint handshake. The ordering note below (publish
+the registry addresses first, drain second) was kept. See
+`docs/internal/arch-2026-07-26/vt-resume-gc-fixup.md`. Original request:
+
 
 **File:** `vm/src/vm/vm_exec.rs`
 **Function:** `resume_virtual_continuation`, the block at ~lines 2009–2016.
@@ -403,16 +468,16 @@ contenders wedge the entire pool while the owner sits unmountable in the queue.
 The compensation watchdog I added turns that from a deadlock into a slowdown,
 but it is a safety net, not a design.
 
-### 7.3 `vm/src/vm/vm_exec.rs` — remove or wire the vestigial `virtual_scheduler` (LOW, clarity)
+### 7.3 `vm/src/vm/vm_exec.rs` — remove or wire the vestigial `virtual_scheduler` (LOW, clarity) — **DONE, and it was worse than I said**
 
-**Field:** `ThreadRealm::virtual_scheduler` (`vm/src/vm/realms/thread_realm.rs:60`),
-call sites `vm_exec.rs:6992`, `:7135`, `:7251`, `:7908`, `:7914`, `:8676`, `:8717`.
-
-`:6992` / `:7135` / `:7251` are unreachable (the `is_virtual` early return at
-`:6955` precedes the spawn). The reachable ones release a permit in a pool that
-does not own the carrier being blocked, so `vt_release_carrier` reads as if the
-carrier were freed when it is not — which is how one convinces oneself the
-starvation problem does not exist. Either delete it or make it the real bound.
+All eight call sites in `vm_exec.rs` are gone (only explanatory comments remain
+at `:7064`, `:7067`, `:7982`, `:8735`). I filed this as a clarity issue; the
+`vm_exec.rs` owner found the `NativeContextImpl::park` pair was a **live hang
+risk**, not merely misleading: nothing ever releases into that permit pool on
+the virtual-thread path, so once more virtual threads park concurrently than
+`carrier_count`, the surplus post-park `acquire()` calls block a real carrier OS
+thread forever. My §1 characterisation ("releasing one frees nothing") was
+right about the release side and missed that the *acquire* side is what bites.
 
 ### 7.4 `vm/src/vm/vm_exec.rs` — decide whether `synchronized` should pin (MEDIUM, semantics)
 
