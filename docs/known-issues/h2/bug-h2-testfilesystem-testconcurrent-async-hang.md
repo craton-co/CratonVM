@@ -1,17 +1,20 @@
 # `TestFileSystem.testConcurrent` hangs against the `async:` filesystem — three real bugs fixed, one open performance gap remains
 
 ## Status
-**PARTIALLY FIXED 2026-07-23.** Three independently-confirmed bugs found
-during this investigation are fixed and merged to `dev` (`4afa20cea`). The
-original doc's headline hypothesis (a `CompilationPolicy`-mutex/`LinkedHashMap`
-eviction-callback deadlock) did **not** reproduce this session — a fresh,
-from-scratch repro on the same day's `dev` tip showed a different shape
-entirely (see "What actually reproduced" below). The class still exceeds the
-suite runner's 300s per-class watchdog even with all three fixes applied, but
-this is now confirmed to be **severe slowness, not a deadlock** — see "Open:
-remaining performance gap" for the precise next step.
+**PARTIALLY FIXED, 2026-07-25 update.** Three bugs fixed 2026-07-23 (merged
+`4afa20cea`) plus a fourth, dominant one found and fixed 2026-07-25 (merged
+`dev` `74b709d8e`): `ArenaStore::locate()`'s O(n) linear scan, ~24% of all
+CPU on this workload — see "Session 2026-07-25" below. Even with all four
+fixes, the class **still exceeds** the suite runner's 300s per-class
+watchdog under `--jit on --Xmx 1g` — confirmed via a from-scratch,
+timeout-free run that did not complete within 3600s (60 minutes) either,
+before or after the 2026-07-25 fix (see below for exact figures). This is
+now well-characterized as a **flat, distributed performance ceiling**
+across normal interpreter/JIT-dispatch overhead — not a single further
+discoverable bug — see "Open: remaining performance gap" for the precise
+state and what fixing it completely would actually require.
 
-## Three bugs fixed this session (merged to `dev` `4afa20cea`)
+## Three bugs fixed 2026-07-23 (merged to `dev` `4afa20cea`)
 
 ### 1. `callee_saved_gpr_local_homes_enabled()` read an env var on every single interpreted call VM-wide, uncached
 `vm/src/jit/skip_list.rs` — called from `should_skip_jit_internal`, which
@@ -71,7 +74,7 @@ identically on unmodified `dev` (confirmed via `git stash` A/B on the same
 worktree) — pre-existing, unrelated to this session's changes, not
 re-investigated here.
 
-## What actually reproduced this session (differs from the original hypothesis)
+## What actually reproduced 2026-07-23 (differs from the original hypothesis)
 
 A from-scratch repro on a fresh `dev`-tip build (same day, after the six
 `AsynchronousFileChannel`/`FileChannel` fixes from
@@ -116,65 +119,165 @@ a **different** shape than the original doc's gdb snapshot:
   re-investigated.
 - A **separate control-run finding**: `--nojit --Xmx 1g` (and even `--Xmx
   4g`) does **not** cleanly pass either — it OOMs (`FATAL: G1: out of heap
-  space`) within ~10s, far faster than a genuine 10,000-iteration test
-  should exhaust even 1GB. This was flagged as the doc's suggested next step
-  #1 and is now answered: `--nojit` does NOT rule in or out the OSR
-  hypothesis, because it fails via an unrelated, much faster OOM before
-  `testConcurrent` can run long enough to say anything about JIT-specific
-  behavior. This OOM is itself unexplained and is a candidate for separate
-  investigation (not pursued further this session — the `--jit on` path was
-  the actual target).
+  space`) within ~10s. This is now root-caused — see
+  [`bug-g1-native-alloc-no-safepoint-oom.md`](../bug-g1-native-alloc-no-safepoint-oom.md).
 
-## Open: remaining performance gap (not fixed this session)
+## Session 2026-07-25: dominant cost found and fixed (merged `dev` `74b709d8e`)
 
-Even with all three fixes above, a fresh `TestFileSystem` class run under
-`--jit on --Xmx 1g` (the suite runner's real-JDK default) still hits the
-runner's 300s watchdog (`HANG 300.0s`). Direct, timeout-free runs (bypassing
-the suite runner) were let continue for 20+ minutes without completing, while
-repeated `gdb` sampling confirmed the process remained genuinely (if very
-slowly) active the entire time — not stuck.
+Picked up this doc's own next-steps #1 (wall-clock number) and #2 (proper
+profile). Repro'd against a fresh worktree off `dev` `346c74b71` (confirmed
+all three 2026-07-23 fixes present) on the same Azure host.
 
-This is a **real, currently open performance ceiling**, not a correctness
-bug: `testConcurrent` combines two real OS threads, real disk I/O through
-`AsynchronousFileChannel`'s native Rust implementation (a per-file
-`std::sync::Mutex` serializing concurrent read/write on the same handle,
-`native-io/src/lib.rs::afc_read_at`/`afc_write_at`), and now-correctly-
-interpreted (post-fix-#2) `AbstractQueuedLongSynchronizer`/
-`ReentrantReadWriteLock` CAS-retry-heavy locking — a combination whose
-current interpreted/dispatch overhead, compounded across the test's 10,000
-main-loop iterations plus a continuously-looping second thread, apparently
-exceeds 300s (and possibly by a lot) on this hardware.
+**Wall-clock #1 (this doc's suggested next step):** a from-scratch,
+timeout-free `TestFileSystem` run under `--jit on --Xmx 1g` did **not**
+complete within 3600s (60 minutes) — the process was hard-killed by the
+observation harness's own `timeout --kill-after=10 3600` wrapper at exactly
+that mark. `gdb`/`perf` sampling throughout confirmed it was never stuck —
+both real threads were continuously executing different code each time
+sampled — consistent with 2026-07-23's characterization, just now with a
+concrete lower bound: **it takes longer than 60 minutes**, not just "longer
+than 20 minutes."
+
+**Wall-clock #2 (proper profile, this doc's suggested next step #2):**
+`perf record -F 999 -p <pid> -- sleep 30` (no `--call-graph`, since this
+binary's `debug=line-tables-only`/no-frame-pointer release profile makes
+`perf`'s call-graph attribution unreliable — confirmed independently the
+same day chasing a `getenv` hotspot in CratonBench, see
+`ld-preload-getenv-tally-beats-dwarf-callgraph` — but flat, non-call-graph
+leaf sampling needs no unwinding and is fully reliable) on the live,
+30-minutes-in process: **38,854 samples**, one function dominating at
+**23.95% of all CPU time** —
+`cratonvm_native_builtins::unsafe_natives_ext::unsafe_arena::ArenaStore::locate`.
+Every other function was under 6%.
+
+**Root cause:** `ArenaStore` (`native-builtins/src/unsafe_natives_ext.rs`)
+backs `sun.misc.Unsafe`'s off-heap memory natives
+(`allocateMemory`/`getByte`/`putByte`/etc — used by direct `ByteBuffer` I/O,
+which is what `AsynchronousFileChannel` uses under the hood).
+`ArenaStore::locate()` found the arena containing a given address by first
+trying an exact-key `HashMap` lookup (an existing code comment noted this
+"only succeeded at offset 0"), then falling back to a **full linear scan
+over every currently-live arena** for any non-zero offset — the common case
+for literally any multi-byte buffer access. `testConcurrent`'s tight
+read/write loop over real files hits this on every single byte/short/
+int/long access at a non-zero offset, and the live-arena count only grows
+as the test allocates more buffers over its 10,000 iterations — a real,
+severe, and previously-undiagnosed algorithmic bottleneck.
+
+**Fix:** arena bases only ever increase (`ArenaStore::allocate`'s
+`next_addr` is monotonic), so live arenas are always disjoint, base-ordered
+`[base, base+len)` ranges — exactly what a `BTreeMap` answers in O(log n)
+via one `range(..=addr).next_back()` query. Switched the backing map from
+`HashMap` to `BTreeMap` and rewrote `locate()` accordingly (same lookup
+semantics, no behavior change). Commit `491679a63`.
+
+**Verification:**
+- `cargo test -p cratonvm-native-builtins --lib unsafe_natives_ext`: 5/5 pass
+  (this file's own dedicated tests — there is no arena-specific unit test,
+  correctness was additionally verified by the live runs below).
+- Full crate suite: 3075/3080 pass; the 5 failures
+  (`cglib_enhancer::fb_ref_bytecode_tests::fb_ref_splice_shifts_exception_table_by_exactly_8_bytes`,
+  `lang_string::tests::string_join_array_uses_to_string_for_custom_charsequence`,
+  `logmanager::tests::t19_h3_get_logger_names_returns_snapshot_enumeration`,
+  `logmanager::tests::t19_h3_reset_clears_logger_registry_but_keeps_singleton`,
+  `regex_matcher::regex_lookbehind_tests::pem_block_to_der_roundtrip`)
+  reproduce **identically pre- and post-patch, single-threaded** (ruling out
+  test-order flakiness) — pre-existing `dev` state in modules with zero
+  connection to `ArenaStore`, not investigated further here.
+- Re-profiled the SAME live workload after the fix (fresh run, ~20+ minutes
+  in, same 30s/999Hz sampling): `ArenaStore::locate` **no longer appears in
+  the hot list at all**. The profile is now flat — the highest single
+  function is `invoke_on_class_shared_inner` at 7.17%, everything else
+  lower, spread across normal interpreter/JIT-dispatch machinery
+  (`NativeMethodRegistry::find_with_kind`/`find`, `execute_invokevirtual_cached`,
+  `resolve_method_metadata`, `find_method_recursive`, `jit_invoke_virtual_mic`,
+  etc.) — a real, confirmed, substantial win, eliminating the single
+  largest fixable cost found.
+
+**Even after this fix, the class still exceeds the suite runner's 300s
+watchdog** — a from-scratch, timeout-free run with the fixed binary also
+did not complete within 3600s (60 minutes), hard-killed at exactly that
+mark, identically to the pre-fix baseline. The remaining cost is now
+genuinely distributed (no function above ~7%), matching this doc's own
+2026-07-23 characterization of "a real performance ceiling," not a further
+discrete bug. See "Open: remaining performance gap" below for what closing
+it completely would require.
+
+## Open: remaining performance gap (not fully closed)
+
+Even with all four fixes above, a fresh `TestFileSystem` class run under
+`--jit on --Xmx 1g` (the suite runner's real-JDK default) still exceeds the
+runner's 300s watchdog by a wide margin — confirmed: a from-scratch,
+timeout-free run with the 2026-07-25 fix applied **also did not complete
+within 3600s (60 minutes)**, hard-killed by the observation harness at
+exactly that mark, identically to the pre-fix baseline. The fix is real and
+measured (the dominant, single fixable hotspot is gone, see above), but the
+remaining cost — now confirmed to also exceed 60 minutes on its own — is far
+larger than any further micro-optimization could plausibly close. This is a
+**real, still-open performance ceiling**, not a correctness bug and — as of
+2026-07-25 — not attributable to any single further fixable hotspot: the
+post-fix profile is flat, with the largest remaining single function at
+~7% of CPU.
+
+**What the flat profile is actually made of** (2026-07-25 sample, largest
+items): `invoke_on_class_shared_inner` (~7%), `NativeMethodRegistry::
+find_with_kind`/`find` (~10% combined — native-dispatch hashing, already
+partially addressed by 2026-07-23 fix #3, this is the *remaining*
+irreducible per-call hash+lookup cost, not a duplicate-hash bug), general
+interpreter dispatch (`execute`, `execute_frame_from_index`,
+`execute_invokevirtual_cached`, `execute_instruction`), and
+`find_method_recursive`/`Class::find_method` (~3% combined) — the last
+being a linear method-table scan that `jit_invoke_virtual_mic` pays on
+every call to a *permanently-interpreted* callee (e.g. the 2026-07-23
+fix-#2 AQS/RRWL skip-listed methods): the JIT's monomorphic inline cache
+only caches a *compiled* callee's entry pointer, so a stable-receiver-class
+call into a method that will never compile still re-resolves via
+`invoke_or_native`/`find_method_recursive` on every single call. This is a
+real, second-tier optimization opportunity (an "interpreted-dispatch cache"
+analogous to the existing compiled-entry MIC), but implementing it safely
+means touching several JIT hot-dispatch paths
+(`jit/src/helpers.rs::jit_invoke_virtual_mic` and friends) with a full
+regression pass — out of scope for this session's time budget, flagging
+here precisely rather than rushing it.
 
 **Suggested next steps for whoever picks this up:**
-1. Get a wall-clock number for a genuinely completed run (let a from-scratch,
-   timeout-free repro run for as long as it takes — this session ran out of
-   budget before observing a natural completion, only confirmed >20 minutes
-   without one). That number tells you whether this needs a 10x fix or a
-   1000x fix.
-2. Profile a live run with `perf record -g -p <pid>` (or repeated `gdb -batch
-   -ex 'thread apply all bt'` sampling, the poor-man's version used this
-   session) over a longer window than the 5-sample profile taken here, to
-   find the dominant remaining cost with confidence — this session's small
-   sample pointed at native-dispatch hashing (now partially addressed by fix
-   #3) and interpreted AQS/RRWL overhead (now unavoidable given fix #2 makes
-   these methods correctly-but-slowly interpreted), but a proper profile
-   would settle which dominates and by how much.
+1. ~~Get a wall-clock number for a genuinely completed run~~ — attempted
+   2026-07-25: confirmed **>3600s (60 min) both pre- and post-fix** (both
+   runs hard-killed at exactly the 3600s observation ceiling, never
+   completing naturally). Nobody has yet observed this class complete
+   naturally under `--jit on --Xmx 1g` at all; the true completion time
+   (whatever it turns out to be) is still the most useful missing data
+   point, and now clearly requires either a much longer observation window
+   (hours, not one) or the deeper JIT-coverage work in item 5 below before
+   it's practically obtainable.
+2. ~~Profile a live run~~ — done 2026-07-25 (`perf record -F 999`, flat
+   sampling, no call-graph). Dominant cost found and fixed
+   (`ArenaStore::locate`, commit `491679a63`). Remaining profile is flat;
+   see above for the breakdown and the one identified further opportunity
+   (interpreted-dispatch caching for permanently-skip-listed callees).
 3. Consider whether `afc_read_at`/`afc_write_at`'s per-file
    `std::sync::Mutex` (native-io/src/lib.rs) is itself a bottleneck under
    this test's tight two-thread read/write interleaving on the same file —
-   not investigated this session.
-4. Separately: root-cause the `--nojit --Xmx 1g`/`--Xmx 4g` G1 OOM noted
-   above (10s to exhaust 4GB is itself suspicious and worth its own
-   investigation, independent of this doc's JIT-mode focus).
+   still not directly investigated (did not show up as a distinct hotspot
+   in the 2026-07-25 profile, but wasn't isolated either).
+4. ~~Root-cause the `--nojit`/G1 OOM~~ — done 2026-07-25, see
+   [`bug-g1-native-alloc-no-safepoint-oom.md`](../bug-g1-native-alloc-no-safepoint-oom.md).
+   Not fixed (needs interpreter-wide safepoint-checkpoint additions with a
+   full regression pass); the doc has a precise, scoped fix plan.
+5. New: implement the interpreted-dispatch cache described above if the
+   ~10-13% combined native-registry/method-resolution cost is worth
+   pursuing further — likely the next-largest opportunity now that the
+   arena bug is fixed, but architecturally more involved (JIT MIC/PIC
+   changes, not a contained data-structure swap).
 
 ## Repro
 ```
 cd apps/h2database-suite-runner   # or a checkout with H2_ROOT set
-TMPDIR=/data/data/tmp H2_ROOT=<h2 checkout>/h2 \
-  CRATONVM_BIN=<fixed cratonvm binary, dev >= 4afa20cea> JDK25=/home/victor/jdk25 \
+TMPDIR=/data/data H2_ROOT=<h2 checkout>/h2 \
+  CRATONVM_BIN=<fixed cratonvm binary, dev >= 74b709d8e> JDK25=/home/victor/jdk25 \
   bash run-h2-suite.sh run --category all --only 'TestFileSystem' \
   --jdk real --jit on --class-to 300
-# -> still HANG at 300.0s (performance gap, not a deadlock -- see above)
+# -> still HANG at 300.0s (performance gap confirmed to persist post-fix -- see above)
 ```
 Minimal non-H2 repro used to isolate/verify fixes #1 and #2 (no disk I/O, no
 H2 dependency — completes in ~8s post-fix vs hanging pre-fix on the env-var

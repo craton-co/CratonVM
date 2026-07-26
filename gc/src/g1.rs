@@ -6915,6 +6915,33 @@ impl GarbageCollector for G1Collector {
         let body_size = compact_body.unwrap_or(num_fields * SLOT_SIZE);
         let total_size = HEADER_SIZE + body_size;
         let (ptr, _region) = self.alloc_in_region(total_size).unwrap_or_else(|| {
+            if gc_flags().g1_dbg_diag {
+                let regions = self.regions.lock();
+                let mut free = 0usize;
+                let mut eden = 0usize;
+                let mut survivor = 0usize;
+                let mut old = 0usize;
+                let mut hstart = 0usize;
+                let mut hcont = 0usize;
+                for r in regions.iter() {
+                    match r.region_type {
+                        RegionType::Free => free += 1,
+                        RegionType::Eden => eden += 1,
+                        RegionType::Survivor => survivor += 1,
+                        RegionType::Old => old += 1,
+                        RegionType::HumongousStart => hstart += 1,
+                        RegionType::HumongousContinuation => hcont += 1,
+                    }
+                }
+                eprintln!(
+                    "DBG-G1DIAG: heap_size={} region_size={} num_regions={} free={} eden={} survivor={} old={} hstart={} hcont={} collection_count={}",
+                    self.config.heap_size,
+                    self.config.region_size,
+                    regions.len(),
+                    free, eden, survivor, old, hstart, hcont,
+                    self.collection_count.load(Ordering::Relaxed)
+                );
+            }
             eprintln!(
                 "FATAL: G1: out of heap space for object allocation ({} bytes)",
                 total_size
@@ -7396,6 +7423,28 @@ impl GarbageCollector for G1Collector {
         //    compares against `config.max_gc_pause_ms` — feeding a byte
         //    count (typically 10^4-10^8) caused the adaptive IHOP threshold
         //    to floor on essentially every collection.
+        if gc_flags().g1_dbg_diag {
+            let regions = self.regions.lock();
+            let mut free = 0usize;
+            let mut eden = 0usize;
+            let mut survivor = 0usize;
+            let mut old = 0usize;
+            for r in regions.iter() {
+                match r.region_type {
+                    RegionType::Free => free += 1,
+                    RegionType::Eden => eden += 1,
+                    RegionType::Survivor => survivor += 1,
+                    RegionType::Old => old += 1,
+                    _ => {}
+                }
+            }
+            let pinned = regions.iter().filter(|r| r.pinned).count();
+            eprintln!(
+                "DBG-G1DIAG-PRE: collection #{} regions={} free={} eden={} survivor={} old={} pinned={}",
+                self.collection_count.load(Ordering::Relaxed),
+                regions.len(), free, eden, survivor, old, pinned
+            );
+        }
         let pause_start = std::time::Instant::now();
         let result = if self.needs_mixed_gc() {
             self.mixed_collection(roots, monitors)
@@ -7404,6 +7453,12 @@ impl GarbageCollector for G1Collector {
         };
         let result = self.retry_after_evacuation_failure(result, roots, monitors);
         let pause_ms = pause_start.elapsed().as_millis() as u64;
+        if gc_flags().g1_dbg_diag {
+            eprintln!(
+                "DBG-G1DIAG-POST: objects_copied={} bytes_copied={} bytes_freed={}",
+                result.stats.objects_copied, result.stats.bytes_copied, result.stats.bytes_freed
+            );
+        }
 
         // 2. IHOP / concurrent-mark triggering is driven by the VM layer
         //    (`interpreter::maybe_concurrent_gc` -> `g1_concurrent_mark_cycle`),
