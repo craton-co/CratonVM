@@ -195,9 +195,10 @@ semantics, no behavior change). Commit `491679a63`.
   largest fixable cost found.
 
 **Even after this fix, the class still exceeds the suite runner's 300s
-watchdog** — a from-scratch run with the fixed binary was still running
-past 28 minutes (well past 300s) when last checked. The remaining cost is
-now genuinely distributed (no function above ~7%), matching this doc's own
+watchdog** — a from-scratch, timeout-free run with the fixed binary also
+did not complete within 3600s (60 minutes), hard-killed at exactly that
+mark, identically to the pre-fix baseline. The remaining cost is now
+genuinely distributed (no function above ~7%), matching this doc's own
 2026-07-23 characterization of "a real performance ceiling," not a further
 discrete bug. See "Open: remaining performance gap" below for what closing
 it completely would require.
@@ -206,9 +207,14 @@ it completely would require.
 
 Even with all four fixes above, a fresh `TestFileSystem` class run under
 `--jit on --Xmx 1g` (the suite runner's real-JDK default) still exceeds the
-runner's 300s watchdog by a wide margin (confirmed: still running past
-1700s/28+ minutes with the 2026-07-25 fix applied). This is a **real,
-still-open performance ceiling**, not a correctness bug and — as of
+runner's 300s watchdog by a wide margin — confirmed: a from-scratch,
+timeout-free run with the 2026-07-25 fix applied **also did not complete
+within 3600s (60 minutes)**, hard-killed by the observation harness at
+exactly that mark, identically to the pre-fix baseline. The fix is real and
+measured (the dominant, single fixable hotspot is gone, see above), but the
+remaining cost — now confirmed to also exceed 60 minutes on its own — is far
+larger than any further micro-optimization could plausibly close. This is a
+**real, still-open performance ceiling**, not a correctness bug and — as of
 2026-07-25 — not attributable to any single further fixable hotspot: the
 post-fix profile is flat, with the largest remaining single function at
 ~7% of CPU.
@@ -235,11 +241,15 @@ regression pass — out of scope for this session's time budget, flagging
 here precisely rather than rushing it.
 
 **Suggested next steps for whoever picks this up:**
-1. ~~Get a wall-clock number for a genuinely completed run~~ — partially
-   done 2026-07-25: confirmed **>3600s (60 min) pre-fix**, and **still
-   running past 1700s (28+ min) post-fix**. Nobody has yet observed this
-   class complete naturally under `--jit on`; that number (whatever it
-   turns out to be) is still the most useful missing data point.
+1. ~~Get a wall-clock number for a genuinely completed run~~ — attempted
+   2026-07-25: confirmed **>3600s (60 min) both pre- and post-fix** (both
+   runs hard-killed at exactly the 3600s observation ceiling, never
+   completing naturally). Nobody has yet observed this class complete
+   naturally under `--jit on --Xmx 1g` at all; the true completion time
+   (whatever it turns out to be) is still the most useful missing data
+   point, and now clearly requires either a much longer observation window
+   (hours, not one) or the deeper JIT-coverage work in item 5 below before
+   it's practically obtainable.
 2. ~~Profile a live run~~ — done 2026-07-25 (`perf record -F 999`, flat
    sampling, no call-graph). Dominant cost found and fixed
    (`ArenaStore::locate`, commit `491679a63`). Remaining profile is flat;
