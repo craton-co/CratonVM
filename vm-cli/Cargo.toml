@@ -48,6 +48,9 @@ cratonvm-vm = { path = "../vm", version = "0.3.0" }
 # without routing through cratonvm-vm.
 cratonvm-jit = { path = "../jit", version = "0.3.0" }
 cratonvm-native-api = { path = "../native-api", version = "0.3.0" }
+# Direct dep so `main()` can expand the ten grouped `CRATONVM_*` variables into
+# the per-knob keys before anything reads one. See `cratonvm_types::flag_groups`.
+cratonvm-types = { path = "../types", version = "0.3.0" }
 # Direct dep so vm-cli can install the pre-`std::process::exit` hook on
 # `native_system_exit` via `lang_system::set_pre_exit_hook` (installed at the
 # top of `run()`) — dumps the dispatch_trace ring before silent System.exit

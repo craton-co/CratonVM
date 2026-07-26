@@ -4,6 +4,34 @@
 `.rs` file in the workspace plus every `.md` / `.sh` / `.java` / `.toml` under the
 repo root. Regenerate with the scripts recorded at the bottom of this file.*
 
+> **Status, 2026-07-26 — the consolidation this census argued for has landed.**
+>
+> The user-facing surface is now **fifteen** environment variables: ten grouped
+> ones that take a comma-separated token list, plus five scalars. See
+> [`docs/CONFIG.md`](../CONFIG.md) for how to set them and
+> [`docs/flag-tokens.md`](../flag-tokens.md) for every token.
+>
+> | Then | Now |
+> | --- | ---: |
+> | Distinct identifiers a user could plausibly set | 692 → **15** |
+> | Variables the code reads (now internal keys, reachable via tokens) | 559 → 563 |
+> | Class (d) dead identifiers still presented as usable | 133 → **0** |
+> | Documented flags that were silent no-ops | 8 → **0** |
+> | `X` / `NO_X` and `REAL_X` / `SYNTHETIC_X` duplicate pairs | 7 → **0** |
+>
+> The definition lives in [`types/src/flag_groups.rs`](../../types/src/flag_groups.rs).
+> `types/tests/flag_surface.rs` and `tools/flag-census/check-surface.sh` (CI) fail
+> the build if a read site appears without a token, or if the reference docs name
+> a token that does not exist.
+>
+> **Nothing below is stale as history**, and the classification is still the
+> right thing to read before adding a flag. What has changed is the conclusion:
+> §4's "these must be A/B verified" and §11's per-crate migration table describe
+> work in progress at the time; §2's dead list has been acted on. The eleven
+> disagreeing boolean truth tables in §10 are **unchanged** — each field still
+> keeps its own byte-for-byte parser, deliberately, because changing what `X=0`
+> means is a behaviour change and not a plumbing one.
+
 This census is the evidence base for the typed-config refactor
 (`refactor/typed-vmconfig-20260725`). It exists on its own merit: it is the first
 complete inventory of the flag surface, and it is what makes the migration
@@ -40,6 +68,23 @@ the census confirms the premise: the flags have become the de-facto bug-triage
 mechanism, with ~1 flag added per fixed bug and no retirement path.
 
 ## 2. Class (d) — dead flags
+
+> **Acted on.** The 34 per-application `*_REAL` switches are gone from
+> `scripts/real-run-all.sh`, which now uses `CRATONVM_REAL=-stubs` — the switch
+> that actually exists. The dead entries that reference docs presented as usable
+> knobs (`CRATONVM_ECLIPSE_REAL`, `CRATONVM_USE_WILDFLY_MAIN_SHIM`,
+> `CRATONVM_SKIP_JBOSS_PLUMBING`, `CRATONVM_WILDFLY_SHORTCIRCUIT`, …) are removed
+> from `docs/synthetic_methods.md` and the book. Mentions that survive are in
+> `CHANGELOG.md` and `docs/known-issues/**`, which are history and should not be
+> rewritten.
+>
+> Note that this list *over*-counts: the original scan's read-site detector
+> missed `vm/src/runtime/env_cache.rs`'s `cached_is_set!` / `cached_is_ok!`
+> macros, `jit/src/tiered.rs`'s `TieredParams::from_env`, and a `const …_ENV`
+> in `native-builtins/src/aot.rs`. 55 identifiers listed as dead below are in
+> fact live, and all 55 now have tokens. A macro-wrapped read is exactly the
+> shape a literal scan cannot see, which is why `check-surface.sh` scans for
+> the *literal* rather than for the call.
 
 These identifiers have **zero** Rust read sites. Every one of them is referenced
 only by prose, a runbook, or a shell script. Nothing sets a value that any code
@@ -199,6 +244,15 @@ will ever observe. Grouped by why they are dead:
 | `CRATONVM_WILDFLY_SHORTCIRCUIT` | docs:2 |
 
 ## 3. Class (d) highlights — documented flags that do nothing
+
+> **Fixed.** Each of these now has a working spelling, because the canonical
+> token is stated positively and the inventory records which legacy key it
+> expands to: `CRATONVM_JIT=-precise-jit-maps`, `-inline-putfield`,
+> `-scan-cache`, `-precise-inline-frame-record`, `CRATONVM_GC=-selective-promote`,
+> `-moving-young`. `flag_groups::tests::the_documented_no_ops_now_work` asserts
+> each one reaches the key the code reads, and `check-surface.sh` fails CI if
+> the docs ever name a token the inventory does not define — which is the
+> mechanism that let this class exist.
 
 These are worth calling out separately because a reader of the docs would
 reasonably believe they work, and at least two of them make a *measurement* wrong.
@@ -1120,6 +1174,13 @@ plumbing the read differently.
 ```sh
 python3 tools/flag-census/census.py            # totals, from the repo root
 python3 tools/flag-census/census.py /path/to/repo
+```
+
+The two checks that run without Python, and that CI actually enforces:
+
+```sh
+tools/flag-census/check-surface.sh             # fails if the surface grew
+tools/flag-census/render-tokens.sh             # regenerates docs/flag-tokens.md
 ```
 
 The scan is deliberately literal-only: there is **no** dynamic env-var name
