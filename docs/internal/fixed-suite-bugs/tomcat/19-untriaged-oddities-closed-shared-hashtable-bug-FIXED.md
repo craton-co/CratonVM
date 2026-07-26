@@ -1,7 +1,7 @@
 # `untriaged-oddities.md` closed — both classes were the shared Hashtable size-doubling bug / a fixture typo (FIXED)
 
 **Status:** Both classes tracked in
-`../../../known-issues/tomcat/untriaged-oddities.md` are closed.
+`../../tomcat/untriaged-oddities.md` are closed.
 **Test:** `org.apache.catalina.startup.TestTomcat` — now **26/26 PASS**
 clean under CratonVM (was 3 failures / an occasional 300s HANG depending on
 host load). Matches HotSpot.
@@ -75,7 +75,7 @@ resolves it. Verified against a freshly built binary at `dev`'s tip:
 See `744401af4`'s and `b854dc01f`'s commit messages for the full fix
 rationale; `a517d31b4`'s merge message notes the same root cause is shared
 by 8 of the 9 classes in
-[hang-classification-unconfirmed-host-contention.md](../../../known-issues/tomcat/hang-classification-unconfirmed-host-contention.md)
+[hang-classification-unconfirmed-host-contention.md](../../tomcat/hang-classification-unconfirmed-host-contention.md)
 (still open as of this writing — that doc's own status wasn't updated by
 this session, out of scope here).
 

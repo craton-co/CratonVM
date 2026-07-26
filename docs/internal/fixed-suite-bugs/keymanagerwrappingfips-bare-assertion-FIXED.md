@@ -1,6 +1,6 @@
 # TestKeyManagerWrappingFips — bare assertion failure (FIXED)
 
-Formerly tracked at `../../known-issues/tomcat/keymanagerwrappingfips-bare-assertion.md`
+Formerly tracked at `../tomcat/keymanagerwrappingfips-bare-assertion.md`
 (removed from the tracked tree now that this is resolved).
 
 ## Original symptom
