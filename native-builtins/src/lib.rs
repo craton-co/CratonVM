@@ -11639,6 +11639,17 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
                     None
                 };
 
+            // Unnamed module (everything on the application classpath): route
+            // through the shared builder so this mirror is identical to the one
+            // `ClassLoader.getUnnamedModule()` and the `java.lang.Package`
+            // builders hand out, AND carries a non-null `loader` field so real
+            // `Module.getClassLoader()` bytecode answers the AppClassLoader like
+            // HotSpot instead of null. See `lang_class::canonical_unnamed_module`.
+            if module_name.is_none() {
+                let m = crate::lang_class::canonical_unnamed_module(ctx);
+                return Ok(Some(Value::Object(Some(m))));
+            }
+
             // Canonical-cache hit: hand back the existing Module mirror so
             // identity comparisons across classes in the same module succeed.
             if let Some(cached) = ctx.get_cached_module_mirror(module_name.as_deref()) {

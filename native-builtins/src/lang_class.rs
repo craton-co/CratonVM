@@ -14657,7 +14657,11 @@ pub(crate) fn native_class_get_package(
     // HotSpot. `Class.getModule()` already returns a valid (unnamed) module.
     let module_val = match ctx.invoke_virtual(this, "getModule", "()Ljava/lang/Module;", &[]) {
         Ok(Some(v @ Value::Object(Some(_)))) => v,
-        _ => Value::Object(None),
+        // `getModule()` can still answer null for a mirror with no class-store
+        // entry (synthetic lambda proxies, hand-built test mirrors). Leaving
+        // `module` unset is never acceptable -- see `canonical_unnamed_module`
+        // -- so fall back to the canonical unnamed module.
+        _ => Value::Object(Some(canonical_unnamed_module(ctx))),
     };
     if matches!(module_val, Value::Object(Some(_))) {
         let pkg = ctx.read_native_pin(pkg_pin, pkg);
@@ -14753,6 +14757,60 @@ pub(crate) fn i2_classloader_get_defined_packages(
     Ok(Some(Value::Object(Some(empty))))
 }
 
+/// The single canonical **unnamed** `java.lang.Module` mirror for this VM.
+///
+/// Every application-classpath class reports the unnamed module from
+/// `Class.getModule()`, and the JDK compares `Module`s by identity (it has no
+/// `equals` override), so there must be exactly ONE such object. The
+/// `Class.getModule()` override in `lib.rs::register_essential_natives` already
+/// publishes it under the `None` module-name key; this helper is that same
+/// get-or-create, exposed so the `java.lang.Package` builders below and
+/// `ClassLoader.getUnnamedModule()` can all hand back the same instance.
+///
+/// Why every synthesised `Package` MUST carry a non-null `module`: real
+/// `Package.getPackageInfo()` (JDK 25, `Package.java:417`) does
+/// `module().getClassLoader()` with no null check, so a module-less `Package`
+/// NPEs the instant anything asks it for an annotation. TestNG's
+/// `IgnoreListener.findAnnotation(Package)` walks a test class's package chain
+/// with the deprecated static `Package.getPackage(String)` ->
+/// `ClassLoader.getPackage` -> `getDefinedPackage` (overridden below), which
+/// returned exactly such a module-less `Package` -- taking out TestNG-engine
+/// discovery for the whole `org.springframework.test.context.testng` package
+/// with `JUnitException: TestEngine with ID 'testng' failed to discover tests`.
+///
+/// `loader` is wired to the application class loader because that is what
+/// HotSpot reports for an unnamed module (`Module.getClassLoader()` returns the
+/// defining loader, never null, for the classpath's unnamed module). Besides
+/// matching the JDK, it makes `getPackageInfo()`'s
+/// `Class.forName(<pkg>.package-info, false, loader)` resolve against the
+/// classpath instead of the bootstrap loader, so package-level annotations
+/// (JSpecify `@NullMarked`, TestNG `@Ignore`, ...) are actually visible on a
+/// `Package` obtained through any path other than `Class.getPackage()`.
+pub(crate) fn canonical_unnamed_module(ctx: &mut dyn NativeContext) -> ObjectRef {
+    if let Some(cached) = ctx.get_cached_module_mirror(None) {
+        return cached;
+    }
+    let m = alloc_concurrent_synthetic(ctx, "java/lang/Module", 2);
+    let pin = ctx.pin_native_root(m);
+    // Unnamed: BOTH the synthetic 2-field contract's slot 0 and the real
+    // `name` field stay null, so `Module.isNamed()` reports false whichever
+    // shape the reader assumes (see `module_name_of_mirror` in `lib.rs`).
+    ctx.set_field(m, 0, Value::Object(None));
+    ctx.set_field_by_name(m, "name", Value::Object(None));
+    // `get_or_create_app_loader` allocates (and can therefore move `m`), so
+    // re-read the pin before the write. It is a Rust-side singleton with no
+    // path back into `Class.getModule()`, so there is no re-entrancy here.
+    let loader = crate::classloader::get_or_create_app_loader(ctx);
+    let m = ctx.read_native_pin(pin, m);
+    ctx.set_field_by_name(m, "loader", Value::Object(Some(loader)));
+    ctx.unpin_native_roots(pin);
+    // Publish so `Class.getModule()`, `ClassLoader.getUnnamedModule()` and the
+    // Package builders all observe one identity. The VM keeps the cached
+    // mirror as a permanent GC root.
+    ctx.cache_module_mirror(None, m);
+    m
+}
+
 /// Internal helper: synthesise a `java/lang/Package` whose `name` slot is
 /// set to the requested package name (dotted). Mirrors the layout used by
 /// `native_class_get_package` so callers that subsequently invoke
@@ -14764,6 +14822,31 @@ fn i2_alloc_synthetic_package(ctx: &mut dyn NativeContext, name: &str) -> Object
     let pkg = ctx.read_native_pin(pkg_pin, pkg);
     ctx.set_field(pkg, 0, Value::Object(Some(name_str)));
     ctx.set_field_by_name(pkg, "name", Value::Object(Some(name_str)));
+    // Always wire a non-null `module`. Real `Package.getPackageInfo()` derefs
+    // it unconditionally, so a module-less Package is a latent NPE for every
+    // `getAnnotation` / `getDeclaredAnnotations` / `isAnnotationPresent` caller
+    // -- see `canonical_unnamed_module` for the TestNG-discovery blowup this
+    // caused. Callers that KNOW the real module (`definePackage(String,Module)`,
+    // `getNamedPackage`) overwrite this immediately after.
+    let module = canonical_unnamed_module(ctx);
+    let pkg = ctx.read_native_pin(pkg_pin, pkg);
+    ctx.set_field_by_name(pkg, "module", Value::Object(Some(module)));
+    // Same reasoning for `versionInfo`: the real `Package(String, Module)`
+    // constructor always stores `Package$VersionInfo.NULL_VERSION_INFO`, and
+    // `getSpecificationTitle()` / `getImplementationVersion()` / `isSealed()`
+    // all deref it without a null check. `native_class_get_package` already
+    // does this; the ClassLoader-side builders did not, so a Package reached
+    // through `Package.getPackage(String)` NPEd on those accessors.
+    if let Ok(vi_cid) = ctx.ensure_class_initialized("java/lang/Package$VersionInfo") {
+        if let Some(idx) = ctx.static_field_index_by_name(vi_cid, "NULL_VERSION_INFO") {
+            let null_version_info = ctx.get_static_field(vi_cid, idx);
+            if matches!(null_version_info, Value::Object(Some(_))) {
+                let pkg = ctx.read_native_pin(pkg_pin, pkg);
+                ctx.set_field_by_name(pkg, "versionInfo", null_version_info);
+            }
+        }
+    }
+    let pkg = ctx.read_native_pin(pkg_pin, pkg);
     ctx.unpin_native_roots(pkg_pin);
     pkg
 }
@@ -14929,6 +15012,15 @@ fn native_package_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     if this.as_ptr() == other.as_ptr() {
         return Ok(Some(Value::Int(1)));
     }
+    // `equals(Object)` takes ANY object: without this class check a non-Package
+    // argument whose slot 0 happens to hold a String equal to our package name
+    // would compare equal. (This check lived only in a second, duplicate
+    // `Package.equals` registration that the registry's last-registration-wins
+    // rule silently shadowed with this body -- see the registration site.)
+    let other_cid = ctx.class_id_of_object(other);
+    if ctx.class_name_of_id(other_cid).unwrap_or_default() != "java/lang/Package" {
+        return Ok(Some(Value::Int(0)));
+    }
     let this_name = package_name_from_package_obj(ctx, this);
     let other_name = package_name_from_package_obj(ctx, other);
     Ok(Some(Value::Int(
@@ -15010,39 +15102,13 @@ pub fn i2_register_classloader_package_natives(r: &mut cratonvm_native_api::Nati
     // equal, where HotSpot's interned-per-loader objects would not), but it
     // fixes the common case without the GC-safety complexity of interning
     // `Package` objects in a side-table (cf. `system_props_singleton`).
-    r.register(
-        "java/lang/Package",
-        "equals",
-        "(Ljava/lang/Object;)Z",
-        |ctx, args| {
-            let this = match args.first() {
-                Some(Value::Object(Some(o))) => *o,
-                _ => return Ok(Some(Value::Int(0))),
-            };
-            let other = match args.get(1) {
-                Some(Value::Object(Some(o))) => *o,
-                _ => return Ok(Some(Value::Int(0))),
-            };
-            if this == other {
-                return Ok(Some(Value::Int(1)));
-            }
-            let other_cid = ctx.class_id_of_object(other);
-            let other_class_name = ctx.class_name_of_id(other_cid).unwrap_or_default();
-            if other_class_name != "java/lang/Package" {
-                return Ok(Some(Value::Int(0)));
-            }
-            let this_name = ctx.get_field_by_name(this, "name");
-            let other_name = ctx.get_field_by_name(other, "name");
-            let eq = match (this_name, other_name) {
-                (Value::Object(Some(a)), Value::Object(Some(b))) => {
-                    ctx.read_string(a).unwrap_or_default() == ctx.read_string(b).unwrap_or_default()
-                }
-                (Value::Object(None), Value::Object(None)) => true,
-                _ => false,
-            };
-            Ok(Some(Value::Int(eq as i32)))
-        },
-    );
+    //
+    // Registered ONCE. There used to be two `Package.equals` registrations
+    // here -- an inline closure with the class check, immediately followed by
+    // `native_package_equals` without it. `NativeMethodRegistry::register` is
+    // last-registration-wins, so the closure (and its class check) was dead
+    // code from the moment it was written. The check now lives in
+    // `native_package_equals` itself; do not re-add a second registration.
     r.register(
         "java/lang/Package",
         "equals",
