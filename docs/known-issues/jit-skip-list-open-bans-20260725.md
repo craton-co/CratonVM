@@ -392,3 +392,18 @@ level) -- likely a similar family to the KEYEDLOCK-COMPUTE.1 fix just
 landed (String read shortly after construction/mutation reading a stale
 value) but not yet isolated to one method. Flagging for a future session
 rather than continuing further given time already spent this session.
+
+**Result: HIB-BIGINTEGER-AIOOBE.2 landed 2026-07-26 11:20 UTC** (widened
+HIB-BIGINTEGER-AIOOBE.1's scope from MutableBigInteger-only to also cover
+BigInteger itself -- see commit for the deterministic reproducer, the
+first one this ban has ever had). This is a real correctness/performance
+tradeoff for a widely-used JDK class; the ban can be narrowed back down if
+someone root-causes the exact multi-method interaction (constructor +
+some combination of trustedStripLeadingZeroInts/destructiveMulAdd/
+checkRange/parseInt -- each ruled out alone, not yet narrowed further).
+
+**Process note:** hit a real `cargo test` vs `cargo build --release`
+staleness trap mid-investigation -- verifying a skip_list.rs change via
+`cargo test` alone does NOT rebuild the separate `cratonvm` executable.
+Always `cargo build --release` + check the binary's mtime before trusting
+a still crashes/now passes result against a real repro.
