@@ -30,6 +30,24 @@ is how every cluster below with a "bisected to X" note was actually found.
 It costs zero rebuild time and should be the first move on any of the
 still-OPEN items.
 
+**Shortcut found 2026-07-26 ~02:58 UTC (`fix/jit-ban-sweep2-20260726`):
+skip the whole `is_known_miscompile` match-arm cluster.** Every entry
+inside that function's `matches!(...)` block (HashMap.put/get/resize,
+`Calendar.isFieldSet` (BC-ASN1.1), the ByteBuddy/reflection/JUC entries
+catalogued in `jit-regalloc-callee-saved-clobber-family.md`, etc.) is only
+even *checked* when `callee_saved_gpr_local_homes_enabled()` returns true
+(skip_list.rs ~L1176: `if callee_saved_gpr_local_homes_enabled() &&
+is_known_miscompile(...)`), and that function
+(skip_list.rs ~L3253) defaults to **false** on x86_64 unless a developer
+explicitly sets `CRATONVM_JIT_ENABLE_CALLEE_SAVED_GPR_LOCALS=1` for
+diagnosis. **None of these entries are active in any normal run** (none of
+this session's test commands set that var) — they're already effectively
+"removed" from production's perspective, just kept as a diagnostic legacy
+table. Don't spend real-app-testing effort re-verifying any ban that lives
+inside `is_known_miscompile`'s `matches!` block specifically for this
+reason (BC-ASN1.1 is one example — there may be others in that block worth
+a quick grep before picking a next target).
+
 ## This session's concrete finding: TYPES-ERASURE.1 (NEW, landed)
 
 `com.sun.tools.javac.code.Types.erasure` was an **undiscovered** JIT
