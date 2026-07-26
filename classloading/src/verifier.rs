@@ -415,6 +415,141 @@ fn subroutine_unproven_maps(method: &ClassFileMethod) -> MethodTypeMaps {
     builder.finish(false)
 }
 
+/// The "walk did not complete" entry for a method whose Pass-3 walk returned
+/// an error on the **map-collection** path.
+///
+/// Zero rows (`oop_map_at` → `None` at every pc → "unproven, scan
+/// conservatively") plus the [`FastPathVeto::IncompleteWalk`] tag. Used only
+/// by [`collect_class_type_maps`], where a walk failure is *not* a load
+/// decision — see that function for why.
+fn unproven_maps(method: &ClassFileMethod) -> MethodTypeMaps {
+    let (max_locals, max_stack) = match method.code() {
+        Some(code) => (code.max_locals, code.max_stack),
+        None => (0, 0),
+    };
+    MethodTypeMapsBuilder::new(max_locals, max_stack).finish(false)
+}
+
+// ---------------------------------------------------------------------------
+// Map collection without a load decision (arch-2026-07-26, coverage gap)
+// ---------------------------------------------------------------------------
+
+/// Run the Pass-3 walk **for its type maps only**, never rejecting the class.
+///
+/// # Why this exists
+///
+/// `class_manager::define_class_with_options` skips Pass 3 entirely for any
+/// class defined by a *user-defined* loader while `loader_aware_resolution()`
+/// is on (`defer_loader_sensitive_pass3`), and `vm::vm_util` deliberately does
+/// not re-run it at link time. Both deferrals exist for one reason and one
+/// reason only: the hierarchy adapter available at those points cannot always
+/// keep two loaders' same-named classes apart, so its *assignability verdicts*
+/// can be wrong and a wrong verdict there is a spurious `VerifyError` on
+/// bytecode HotSpot accepts (the AssertJ `AbstractThrowableAssert.<init>`
+/// case, 2026-07-13).
+///
+/// The consequence for type maps was total: every Spring / WildFly / H2 /
+/// Elasticsearch application class is loaded by a user-defined loader, so
+/// **none** of them had maps, `safe_for_fast_path` was unavailable for the
+/// entire application workload, and the GC had no precise oop maps exactly
+/// where the interesting object graphs live.
+///
+/// # Why publishing maps from an untrusted-verdict walk is sound
+///
+/// The two outputs of this walk are independent:
+///
+/// * The **verdict** (accept / `VerifyError`) is a function of
+///   [`VerificationFrame::is_assignable_to`], which consults the hierarchy —
+///   this is the part the deferral distrusts, and this function throws it
+///   away rather than acting on it.
+/// * The **rows** record, per pc, which local slots and which operand-stack
+///   slots hold a *reference*. Reference-vs-primitive is decided by
+///   [`VType::is_reference`] over types derived from field/method descriptors,
+///   `ldc` constants, `new`/`anewarray` operands, and the class's own
+///   `StackMapTable` — none of which consult the hierarchy. Merging two
+///   reference types can pick the wrong common supertype under a confused
+///   hierarchy, but the result is still a reference, so the *bit* is
+///   unchanged. Operand-stack depths and local-slot indices are likewise
+///   structural.
+///
+/// So a hierarchy that mis-resolves a name can make this walk accept bytecode
+/// it should have rejected; it cannot make it record an int where a reference
+/// lives or vice versa. That is exactly the property the maps' consumers (the
+/// GC root scan, the interpreter fast path) depend on.
+///
+/// Anything the walk could not finish degrades honestly rather than silently:
+/// a method whose walk errored gets [`unproven_maps`] (zero rows,
+/// [`FastPathVeto::IncompleteWalk`]), a `jsr`/`ret` method gets
+/// [`subroutine_unproven_maps`], and every unrecorded pc answers `None`, which
+/// the type-map contract defines as "scan conservatively".
+///
+/// # Strictness
+///
+/// The walk runs **lenient** (`strict = false`). Strict mode's only extra
+/// behaviour is to turn unreachable-code and frameless-branch-target findings
+/// into a hard `VerifyError`; on this path that would throw away every row of
+/// an otherwise perfectly describable method in exchange for an error nobody
+/// acts on. Lenient keeps the reachable rows and denies `safe_for_fast_path`
+/// via `IncompleteWalk`. This is not a downgrade of verification: **no**
+/// verification decision is made here at all.
+pub fn collect_class_type_maps(class: &Class, hierarchy: &dyn ClassHierarchy) -> ClassTypeMaps {
+    let mut collected: Vec<(Arc<str>, Arc<str>, Option<MethodTypeMaps>)> =
+        Vec::with_capacity(class.methods.len());
+
+    for method in class.methods.iter() {
+        // Abstract / native methods have no `Code`, but they still occupy an
+        // index in `Class::methods`, which is what `ClassTypeMaps` is indexed
+        // by — push `None` to keep the positions aligned.
+        if method.is_abstract() || method.is_native() {
+            collected.push((method.name.clone(), method.descriptor.clone(), None));
+            continue;
+        }
+        if method_uses_jsr_or_ret(method) {
+            // Same reasoning as the verifying path: the worklist collapses two
+            // distinct `ReturnAddress` values at a shared subroutine entry, so
+            // recording *its* answer would be actively wrong. Record the
+            // explicit "proven nothing, and here is why" entry instead.
+            collected.push((
+                method.name.clone(),
+                method.descriptor.clone(),
+                Some(subroutine_unproven_maps(method)),
+            ));
+            continue;
+        }
+        let maps = match verify_method_typestate(class, method, hierarchy, false) {
+            Ok(maps) => maps,
+            // The verdict is discarded (see the doc comment); only the fact
+            // that the walk did not finish is retained.
+            Err(_) => Some(unproven_maps(method)),
+        };
+        collected.push((method.name.clone(), method.descriptor.clone(), maps));
+    }
+
+    ClassTypeMaps::new(collected)
+}
+
+/// Collect and publish type maps for a class whose Pass 3 was deferred.
+///
+/// CAS install, first writer wins — so if the authoritative verifying path
+/// ever does run for this class id, its maps are not clobbered by these.
+/// Returns `true` if these maps were the ones installed.
+pub fn publish_deferred_class_type_maps(class: &Class, hierarchy: &dyn ClassHierarchy) -> bool {
+    crate::type_maps::publish_class_type_maps(class.id, collect_class_type_maps(class, hierarchy))
+}
+
+/// Re-collect and **replace** a class's type maps after its method bodies
+/// changed (JVMTI `RedefineClasses` / `retransformClasses`, WP2.4).
+///
+/// This is not an optimisation. `publish_class_type_maps` is first-writer-wins,
+/// so without an explicit replace the maps published when the class was first
+/// defined would survive a redefine and go on describing the *old* method
+/// bodies — at `Class::methods` indices the redefine may have reshuffled. A
+/// stale oop map is a wrong oop map, which is heap corruption, so the maps must
+/// be replaced in lockstep with the bytecode.
+pub fn refresh_class_type_maps(class: &Class, hierarchy: &dyn ClassHierarchy) -> bool {
+    crate::type_maps::replace_class_type_maps(class.id, collect_class_type_maps(class, hierarchy))
+}
+
 /// Single-method type-state verification mirroring the algorithm used by
 /// `bytecode_verifier::verify_method`.
 ///
@@ -3642,6 +3777,172 @@ mod tests {
         assert!(
             res.is_err(),
             "new C; invokespecial D.<init> must be rejected by the owner-match, got {res:?}"
+        );
+    }
+
+    // =======================================================================
+    // Map collection without a load decision — the user-defined-loader
+    // coverage gap (arch-2026-07-26/access-control-and-map-coverage)
+    // =======================================================================
+
+    /// A method whose bytecode the walk cannot get through: `pop` on an empty
+    /// operand stack.
+    fn underflow_method(name: &str) -> ClassFileMethod {
+        plain_method(name, vec![0x57, 0xb1], 1, 1) // pop; return
+    }
+
+    /// The property the whole coverage fix rests on: a class whose Pass-3
+    /// *verdict* is deferred still gets real maps, and one unverifiable method
+    /// does not cost its siblings theirs.
+    #[test]
+    fn collect_class_type_maps_never_rejects_and_keeps_good_methods() {
+        let class = make_pre_java7_class_with_id(
+            91_001,
+            vec![
+                make_method("abs", "()V", MethodAccessFlags::ABSTRACT, false),
+                underflow_method("cannotWalk"),
+                // aconst_null; astore_0; return
+                plain_method("fine", vec![0x01, 0x4b, 0xb1], 1, 1),
+                double_jsr_method("legacyFinally"),
+            ],
+        );
+
+        // Control: the *verifying* entry point rejects this class outright, so
+        // before the fix a deferred-Pass-3 class published nothing at all.
+        assert!(
+            verify_class_bytecode_inner(&class, &PermissiveHierarchy, true).is_err(),
+            "fixture must be one the verifying path rejects"
+        );
+
+        let maps = collect_class_type_maps(&class, &PermissiveHierarchy);
+        assert!(maps.verified(), "collection is not a `skipped` marker");
+        assert_eq!(maps.method_count(), 4, "one entry per Class::methods slot");
+
+        assert!(maps.method(0).is_none(), "abstract method has no body");
+
+        let bad = maps
+            .method(1)
+            .expect("unwalkable method still gets an entry");
+        assert_eq!(bad.entry_count(), 0, "no rows may be invented for it");
+        assert_eq!(
+            bad.fast_path_veto(),
+            Some(FastPathVeto::IncompleteWalk),
+            "the reason must be recorded, not merely the absence of rows"
+        );
+        assert!(!bad.safe_for_fast_path());
+
+        let good = maps.method(2).expect("the sibling keeps its maps");
+        assert!(
+            good.entry_count() > 0,
+            "a walkable method must not be punished for its sibling"
+        );
+        assert!(
+            good.local_oops_at(2).expect("row at pc 2").get(0),
+            "local 0 holds the stored reference from pc 2 onward"
+        );
+        assert!(good.safe_for_fast_path());
+
+        assert_eq!(
+            maps.method(3).and_then(|m| m.fast_path_veto()),
+            Some(FastPathVeto::Subroutine),
+            "the jsr/ret method keeps its own, more informative veto"
+        );
+    }
+
+    /// `publish_deferred_class_type_maps` must make the class visible to
+    /// `type_maps_for` / `verification_status` — the deferred path's whole
+    /// point. Before the fix these answered `Unknown` for every
+    /// user-defined-loader class in the process.
+    #[test]
+    fn deferred_publish_makes_maps_visible() {
+        let class = make_pre_java7_class_with_id(
+            91_002,
+            vec![plain_method("fine", vec![0x01, 0x4b, 0xb1], 1, 1)],
+        );
+        assert_eq!(
+            crate::type_maps::verification_status(class.id),
+            crate::type_maps::VerificationStatus::Unknown,
+            "nothing published yet"
+        );
+        assert!(publish_deferred_class_type_maps(
+            &class,
+            &PermissiveHierarchy
+        ));
+        assert_eq!(
+            crate::type_maps::verification_status(class.id),
+            crate::type_maps::VerificationStatus::Verified
+        );
+        assert!(crate::type_maps::type_maps_for(class.id, 0)
+            .is_some_and(|m| m.entry_count() > 0 && m.safe_for_fast_path()));
+    }
+
+    /// REDEFINE: `publish_class_type_maps` is first-writer-wins, so after a
+    /// class's bytecode is replaced the old maps would keep describing the old
+    /// bodies unless something *replaces* them. A stale oop map is a wrong oop
+    /// map. `refresh_class_type_maps` is what closes that.
+    #[test]
+    fn refresh_replaces_stale_maps_after_a_redefine() {
+        // v1: one 3-instruction method.
+        let mut class = make_pre_java7_class_with_id(
+            91_003,
+            vec![plain_method("m", vec![0x01, 0x4b, 0xb1], 1, 1)],
+        );
+        assert!(publish_deferred_class_type_maps(
+            &class,
+            &PermissiveHierarchy
+        ));
+        let v1_rows = crate::type_maps::type_maps_for(class.id, 0)
+            .expect("v1 maps")
+            .entry_count();
+        assert_eq!(v1_rows, 3);
+
+        // v2: the redefined body is longer. A no-replace publish is a no-op...
+        class.methods = vec![plain_method("m", vec![0x01, 0x4b, 0x01, 0x4b, 0xb1], 1, 1)];
+        assert!(
+            !crate::type_maps::publish_class_type_maps(
+                class.id,
+                collect_class_type_maps(&class, &PermissiveHierarchy)
+            ),
+            "first-writer-wins: this is exactly why redefine needs `replace`"
+        );
+        assert_eq!(
+            crate::type_maps::type_maps_for(class.id, 0)
+                .expect("maps")
+                .entry_count(),
+            v1_rows,
+            "the stale v1 rows are still what a consumer would read"
+        );
+
+        // ...and `refresh` is what actually installs the new bodies' maps.
+        assert!(refresh_class_type_maps(&class, &PermissiveHierarchy));
+        assert_eq!(
+            crate::type_maps::type_maps_for(class.id, 0)
+                .expect("v2 maps")
+                .entry_count(),
+            5,
+            "the maps must describe the bytecode that is actually installed"
+        );
+    }
+
+    /// `refresh_class_type_maps` must also overwrite a
+    /// `mark_class_verification_skipped` marker — a class defined with
+    /// `skip_verification` and later redefined into ordinary bytecode should
+    /// stop answering `Skipped`.
+    #[test]
+    fn refresh_overwrites_a_verification_skipped_marker() {
+        let class = make_pre_java7_class_with_id(
+            91_004,
+            vec![plain_method("m", vec![0x01, 0x4b, 0xb1], 1, 1)],
+        );
+        assert!(crate::type_maps::mark_class_verification_skipped(class.id));
+        assert_eq!(
+            crate::type_maps::verification_status(class.id),
+            crate::type_maps::VerificationStatus::Skipped
+        );
+        assert!(refresh_class_type_maps(&class, &PermissiveHierarchy));
+        assert_eq!(
+            crate::type_maps::verification_status(class.id),
+            crate::type_maps::VerificationStatus::Verified
         );
     }
 }
