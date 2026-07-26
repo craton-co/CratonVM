@@ -87,13 +87,10 @@ doc is retired (moved from `docs/known-issues/springboot/` to
 
 ## Residuals / related open docs (NOT covered by this fix, left open)
 
-Two other `module/spring-boot-devtools` docs share a directory with this one
-but are **independent bugs, unaffected by the `2a6a57bf8` fix** — checked and
-confirmed still open, out of scope for this closure:
+One other `module/spring-boot-devtools` doc shares a directory with this one
+but is an **independent bug, unaffected by the `2a6a57bf8` fix** — checked
+and confirmed still open, out of scope for this closure:
 
-- [`devtoolsr2dbcautoconfigurationtests-embedded-nested-outer-instance-identity.md`](../../../known-issues/springboot/devtoolsr2dbcautoconfigurationtests-embedded-nested-outer-instance-identity.md) —
-  `@Nested` outer-instance argument type mismatch (JUnit5 loader-identity
-  bug, nothing to do with Hashtable/Derby serialization).
 - [`devtools-2class-host-load-confound.md`](../../../known-issues/springboot/devtools-2class-host-load-confound.md) —
   a genuine hang in `DevToolPropertiesIntegrationTests` and a Mockito
   self-attach `NoClassDefFoundError` in `DevToolsEmbeddedDataSourceAutoConfigurationTests`
