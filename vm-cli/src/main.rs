@@ -102,18 +102,33 @@ struct Args {
     #[arg(long = "Xshare", value_name = "MODE", default_value = "off")]
     xshare: String,
 
-    /// Force synthetic JDK mode (Rust stubs instead of real JDK bytecode).
+    /// Select the synthetic class library (~5,200 Rust stubs in
+    /// `native-builtins`) instead of real JDK bytecode.
     ///
-    /// As of task #53 the launcher defaults to real-JDK boot via JMOD
-    /// (`java.base.jmod` from `JAVA_HOME` / `CRATONVM_JAVA_HOME` / `java`
-    /// on `PATH`) whenever a JDK is detected on the host. Passing this
-    /// flag forces synthetic mode even when a JDK is present — useful
-    /// for hermetic test runs or when comparing synthetic vs. real-JDK
-    /// behaviour. When no JDK is detectable the launcher falls back to
-    /// synthetic automatically, so this flag is only an explicit
-    /// override.
-    #[arg(long = "synthetic-jdk")]
+    /// Mutually exclusive with `--real-jdk`. Requires a build with the
+    /// `synthetic-jdk` Cargo feature; without it the launcher errors out
+    /// rather than booting a VM with no class library (see
+    /// `cratonvm_vm::config::require_synthetic_jdk`).
+    ///
+    /// The launcher default is `--real-jdk`
+    /// (`cratonvm_vm::config::LAUNCHER_DEFAULT_JDK_MODE`), fixed at
+    /// compile time. It is NOT derived from whether a JDK happens to be
+    /// installed — see the determinism note on
+    /// `cratonvm_vm::config::JdkMode`.
+    #[arg(long = "synthetic-jdk", conflicts_with = "real_jdk")]
     synthetic_jdk: bool,
+
+    /// Select the real JDK class library: `java.base` and friends are
+    /// loaded from `$JAVA_HOME/jmods/*.jmod` or the `lib/modules` jimage,
+    /// with only the ~300 truly-native methods implemented in Rust.
+    ///
+    /// This is already the launcher default; the flag exists so the
+    /// choice can be stated explicitly (in scripts, CI lanes and bug
+    /// reproductions) and so the two modes are symmetric. If no usable
+    /// JDK is found the launcher fails with a message naming everything
+    /// it searched — it never silently substitutes the synthetic library.
+    #[arg(long = "real-jdk")]
+    real_jdk: bool,
 
     /// Enable Panama FFI native access (mirrors JDK `--enable-native-access`).
     ///
@@ -1454,6 +1469,260 @@ fn extract_hotspot_flags(raw: Vec<String>) -> (Vec<String>, HotspotFlags) {
     (filtered, out)
 }
 
+// ---------------------------------------------------------------------------
+// JDK-mode selection and reporting
+//
+// CratonVM ships two complete, different standard-library implementations
+// (real JDK bytecode vs ~5,200 synthetic Rust stubs). Which one ran decides
+// which bug set applies, so:
+//
+//   * selection is explicit and deterministic — never inferred from what is
+//     installed on the host (see `cratonvm_vm::config::JdkMode`);
+//   * an unavailable mode is a hard launch error, never a silent downgrade;
+//   * the active mode is printed by `-version` / `-Xinternalversion` and in
+//     the launcher's fatal-error output, so every bug report carries it.
+// ---------------------------------------------------------------------------
+
+/// The mode this process actually booted in, published for the diagnostic
+/// paths in `main()` (which run after `run()` has returned an error and no
+/// longer have the `VmConfig`).
+static ACTIVE_JDK_MODE: std::sync::OnceLock<(cratonvm_vm::config::JdkMode, Option<String>)> =
+    std::sync::OnceLock::new();
+
+/// One-line "which class library is this" summary for diagnostics.
+fn active_jdk_mode_line() -> String {
+    match ACTIVE_JDK_MODE.get() {
+        Some((mode, Some(home))) => format!("jdk mode: {mode} (java.home={home})"),
+        Some((mode, None)) => format!("jdk mode: {mode}"),
+        None => "jdk mode: <not yet resolved — failure occurred during argument parsing>".into(),
+    }
+}
+
+/// Which flavour of version banner the user asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VersionQuery {
+    /// `-version` (stderr, exits) / `--version` (stdout, exits).
+    Version,
+    /// `-fullversion` / `--full-version`: single terse line.
+    Full,
+    /// `-Xinternalversion`: build + JDK-mode diagnostics.
+    Internal,
+    /// `-showversion` / `--show-version`: print, then run the program.
+    Show,
+}
+
+impl VersionQuery {
+    /// HotSpot writes the single-dash forms to stderr and the GNU-style
+    /// double-dash forms to stdout. Build tools that scrape `java -version`
+    /// depend on the stderr side of that.
+    fn to_stdout(self, token: &str) -> bool {
+        let _ = self;
+        token.starts_with("--")
+    }
+
+    fn exits(self) -> bool {
+        !matches!(self, VersionQuery::Show)
+    }
+}
+
+/// Scan the launcher section of argv (everything before the `--` that
+/// [`insert_program_args_separator`] parks after the program selector) for a
+/// version query. Returns the matched token as well so the caller can pick
+/// the right output stream.
+fn scan_version_query(argv: &[String]) -> Option<(VersionQuery, String)> {
+    for a in argv.iter().skip(1) {
+        if a == "--" {
+            return None;
+        }
+        let q = match a.as_str() {
+            "-version" | "--version" | "-v" | "-V" => VersionQuery::Version,
+            "-fullversion" | "--full-version" => VersionQuery::Full,
+            "-Xinternalversion" => VersionQuery::Internal,
+            "-showversion" | "--show-version" => VersionQuery::Show,
+            _ => continue,
+        };
+        return Some((q, a.clone()));
+    }
+    None
+}
+
+/// Remove the first occurrence of `token` from the launcher section of
+/// argv (everything before the `--` separator). Program arguments after
+/// `--` are never touched — a Java program is entitled to its own
+/// `-showversion`.
+fn remove_first_launcher_token(argv: &mut Vec<String>, token: &str) {
+    for i in 1..argv.len() {
+        if argv[i] == "--" {
+            return;
+        }
+        if argv[i] == token {
+            argv.remove(i);
+            return;
+        }
+    }
+}
+
+/// Resolve the requested JDK mode from raw argv, for the version banner.
+///
+/// The authoritative resolution happens after clap parsing
+/// ([`resolve_jdk_mode`]); this pre-parse scan exists only because the
+/// banner must be printable before clap runs (clap's own `--version`
+/// handling would otherwise exit first, printing a banner that says nothing
+/// about which standard library is in play).
+fn scan_requested_jdk_mode(argv: &[String]) -> cratonvm_vm::config::JdkMode {
+    let mut mode = cratonvm_vm::config::LAUNCHER_DEFAULT_JDK_MODE;
+    for a in argv.iter().skip(1) {
+        if a == "--" {
+            break;
+        }
+        match a.as_str() {
+            "--synthetic-jdk" => mode = cratonvm_vm::config::JdkMode::Synthetic,
+            "--real-jdk" => mode = cratonvm_vm::config::JdkMode::Real,
+            _ => {}
+        }
+    }
+    mode
+}
+
+/// Pick up an explicit `--java-home <PATH>` / `--java-home=<PATH>` from raw
+/// argv so the version banner reports the same JDK the run would use.
+fn scan_explicit_java_home(argv: &[String]) -> Option<String> {
+    let mut it = argv.iter().skip(1);
+    while let Some(a) = it.next() {
+        if a == "--" {
+            return None;
+        }
+        if let Some(rest) = a.strip_prefix("--java-home=") {
+            return Some(rest.to_string());
+        }
+        if a == "--java-home" {
+            return it.next().cloned();
+        }
+    }
+    None
+}
+
+/// Render the version banner, always naming the active class library.
+///
+/// This is the primary fix for "a bug report is uninterpretable without
+/// knowing which mode ran": `cratonvm -version` now states it, so the mode
+/// travels with every pasted terminal transcript.
+fn version_banner(
+    query: VersionQuery,
+    mode: cratonvm_vm::config::JdkMode,
+    explicit_java_home: Option<&str>,
+) -> String {
+    use cratonvm_vm::config as cfg;
+    let version = env!("CARGO_PKG_VERSION");
+
+    if query == VersionQuery::Full {
+        return format!("cratonvm full version \"{version}\" ({mode})\n");
+    }
+
+    let mut out = String::new();
+    out.push_str(&format!("cratonvm version \"{version}\"\n"));
+    out.push_str(&format!(
+        "CratonVM (build {version}, mixed mode, sharing)\n"
+    ));
+    out.push_str(&format!(
+        "JDK class library: {mode} — {}\n",
+        mode.describe()
+    ));
+
+    match mode {
+        cfg::JdkMode::Real => match cfg::require_real_jdk(explicit_java_home) {
+            Ok(home) => out.push_str(&format!("JDK class library root: {}\n", home.display())),
+            Err(_) => {
+                out.push_str(
+                    "JDK class library root: NONE FOUND — a program launch in this mode \
+                     will fail (run with --real-jdk for the full diagnostic, or pass \
+                     --synthetic-jdk to select the other library)\n",
+                );
+            }
+        },
+        cfg::JdkMode::Synthetic => {
+            if !cfg::SYNTHETIC_JDK_COMPILED_IN {
+                out.push_str(
+                    "JDK class library root: NOT COMPILED IN — this binary was built \
+                     without the `synthetic-jdk` Cargo feature, so a program launch in \
+                     this mode will fail\n",
+                );
+            }
+        }
+    }
+
+    if query == VersionQuery::Internal {
+        out.push('\n');
+        out.push_str(&format!("jdk.mode.active                = {mode}\n"));
+        out.push_str(&format!(
+            "jdk.mode.default.launcher       = {}\n",
+            cfg::LAUNCHER_DEFAULT_JDK_MODE
+        ));
+        out.push_str(&format!(
+            "jdk.mode.default.embedded       = {}\n",
+            cfg::EMBEDDED_DEFAULT_JDK_MODE
+        ));
+        out.push_str(
+            "jdk.mode.selection              = explicit flag or fixed default \
+             (never host-detected)\n",
+        );
+        out.push_str(&format!(
+            "jdk.mode.synthetic_compiled_in  = {}\n",
+            cfg::SYNTHETIC_JDK_COMPILED_IN
+        ));
+        out.push_str("jdk.search:\n");
+        out.push_str(&cfg::describe_jdk_search(explicit_java_home));
+        out.push('\n');
+    }
+    out
+}
+
+/// Authoritative JDK-mode resolution + availability validation.
+///
+/// Returns the selected mode and, in real-JDK mode, the validated
+/// `JAVA_HOME` root. An unavailable mode is an error — the launcher does
+/// **not** fall back to the other class library, because a run whose
+/// standard library was chosen by the host is neither reproducible nor
+/// reportable.
+fn resolve_jdk_mode(
+    synthetic_flag: bool,
+    real_flag: bool,
+    explicit_java_home: Option<&str>,
+) -> Result<(cratonvm_vm::config::JdkMode, Option<std::path::PathBuf>)> {
+    use cratonvm_vm::config as cfg;
+
+    // clap enforces this via `conflicts_with`; keep the check so a future
+    // argv-preprocessing change can't quietly make one flag win.
+    if synthetic_flag && real_flag {
+        bail!(
+            "--synthetic-jdk and --real-jdk are mutually exclusive: they select \
+             two different standard-library implementations. Pass exactly one \
+             (or neither, for the default {}).",
+            cfg::LAUNCHER_DEFAULT_JDK_MODE
+        );
+    }
+
+    let mode = if synthetic_flag {
+        cfg::JdkMode::Synthetic
+    } else if real_flag {
+        cfg::JdkMode::Real
+    } else {
+        cfg::LAUNCHER_DEFAULT_JDK_MODE
+    };
+
+    match mode {
+        cfg::JdkMode::Synthetic => {
+            cfg::require_synthetic_jdk().map_err(|e| anyhow::anyhow!("{e}"))?;
+            Ok((mode, None))
+        }
+        cfg::JdkMode::Real => {
+            let home =
+                cfg::require_real_jdk(explicit_java_home).map_err(|e| anyhow::anyhow!("{e}"))?;
+            Ok((mode, Some(home)))
+        }
+    }
+}
+
 fn resolve_watchdog_timeout(
     stack_dump_on_timeout: Option<u64>,
     default_watchdog_sec: Option<&str>,
@@ -1502,7 +1771,37 @@ fn run() -> Result<()> {
     // Runs first so the explicit `--` it parks is honoured by every
     // downstream stage.
     let raw_argv: Vec<String> = expand_argfiles(std::env::args().collect());
-    let argv: Vec<String> = insert_program_args_separator(raw_argv);
+    let mut argv: Vec<String> = insert_program_args_separator(raw_argv);
+
+    // Version banners are handled here, ahead of clap, for one reason: the
+    // banner must name the active JDK mode. clap's built-in `--version`
+    // prints and exits before any of our code runs, so it can only report
+    // the crate version — which says nothing about which of the two
+    // standard libraries the VM would boot. Since that is the single most
+    // important fact for interpreting a bug report, `-version`,
+    // `--version`, `-fullversion`, `-showversion` and `-Xinternalversion`
+    // all route through `version_banner` instead.
+    if let Some((query, token)) = scan_version_query(&argv) {
+        let mode = scan_requested_jdk_mode(&argv);
+        let java_home = scan_explicit_java_home(&argv);
+        let banner = version_banner(query, mode, java_home.as_deref());
+        // HotSpot writes the single-dash forms to stderr (build tools scrape
+        // `java -version` from there) and the double-dash forms to stdout.
+        if query.to_stdout(&token) {
+            print!("{banner}");
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+        } else {
+            eprint!("{banner}");
+            let _ = std::io::Write::flush(&mut std::io::stderr());
+        }
+        if query.exits() {
+            std::process::exit(0);
+        }
+        // `-showversion`: banner printed, now launch the program as normal.
+        // Drop the flag so clap doesn't see an unknown option.
+        remove_first_launcher_token(&mut argv, &token);
+    }
+
     // Extract -Dkey=value system properties before clap parsing
     let raw_args: Vec<String> = normalize_java_launcher_argv(argv);
     let (filtered_args, system_properties) = extract_system_properties(raw_args);
@@ -1839,12 +2138,15 @@ fn run() -> Result<()> {
         None
     };
 
-    // Task #53: the launcher prefers real-JDK boot (JMOD) when a JDK is
-    // detected on the host (JAVA_HOME / CRATONVM_JAVA_HOME / `java` on
-    // PATH); otherwise it falls back to the synthetic stubs. The library
-    // path (`VmConfig::default`) stays synthetic so embedded callers and
-    // the in-tree test suite are unaffected.
-    let mut config = VmConfig::with_host_jdk_default()
+    // The launcher's starting config. `for_launcher()` is deterministic:
+    // real-JDK mode (`LAUNCHER_DEFAULT_JDK_MODE`) regardless of what is
+    // installed on this machine. The actual mode — including validation and
+    // the `--synthetic-jdk` / `--real-jdk` override — is resolved below,
+    // after `--java-home` has been parsed. The library path
+    // (`VmConfig::default`) stays synthetic so embedded callers and the
+    // in-tree test suite are unaffected; that split is declared by
+    // `EMBEDDED_DEFAULT_JDK_MODE` in `vm/src/config.rs`.
+    let mut config = VmConfig::for_launcher()
         .with_classpath(classpath)
         .with_verbose_class_loading(args.verbose_class)
         .with_verbose_gc(args.verbose_gc)
@@ -1952,21 +2254,44 @@ fn run() -> Result<()> {
         }
     };
 
-    // Synthetic JDK override (task #53): the launcher already picked the
-    // host-driven default via `with_host_jdk_default()` above (real JDK
-    // when detected, synthetic otherwise). Three cases override that:
+    // ---------------------------------------------------------------
+    // JDK mode: explicit selection, then validation, then publication.
     //
-    //   * `--synthetic-jdk` flag → force synthetic (explicit opt-in)
-    //   * `--java-home` CLI arg → force real-JDK (user pointed at a JDK)
-    //   * `JAVA_HOME` already on `VmConfig` → force real-JDK
+    // Previously this was `use_synthetic_jdk = detect_real_jdk().is_none()`
+    // (in `with_host_jdk_default`) plus an ad-hoc "--java-home implies
+    // real" rule here. That made the *standard library* — and therefore
+    // the set of bugs a run could hit — a function of the host machine,
+    // with nothing in the VM's output recording which one was used.
     //
-    // The `--synthetic-jdk` flag wins over `--java-home` so users can
-    // explicitly compare synthetic vs. real-JDK behaviour against the
-    // same install.
-    if args.synthetic_jdk {
-        config.use_synthetic_jdk = true;
-    } else if args.java_home.is_some() || config.java_home.is_some() {
-        config.use_synthetic_jdk = false;
+    // Now: the mode comes from `--synthetic-jdk` / `--real-jdk` or the
+    // fixed launcher default; an unavailable mode aborts the launch with
+    // an actionable message; and the outcome is published for the
+    // `-version` banner and the fatal-error path. `--java-home` no longer
+    // *selects* real-JDK mode (it is already the default) — it only points
+    // the (already selected) real-JDK mode at a specific installation.
+    // ---------------------------------------------------------------
+    let (jdk_mode, resolved_java_home) = resolve_jdk_mode(
+        args.synthetic_jdk,
+        args.real_jdk,
+        config.java_home.as_deref(),
+    )?;
+    config = config.with_jdk_mode(jdk_mode);
+    // Pin the validated JDK root onto the config so boot-classpath
+    // discovery inside the VM resolves the same installation this launcher
+    // validated, instead of re-running the environment probe and possibly
+    // landing somewhere else.
+    if let Some(home) = resolved_java_home.as_ref() {
+        if config.java_home.is_none() {
+            config = config.with_java_home(home.to_string_lossy().into_owned());
+        }
+    }
+    let _ = ACTIVE_JDK_MODE.set((
+        jdk_mode,
+        resolved_java_home.map(|p| p.to_string_lossy().into_owned()),
+    ));
+    tracing::info!("{}", active_jdk_mode_line());
+    if args.verbose_class || args.verbose_gc {
+        eprintln!("[cratonvm] {}", active_jdk_mode_line());
     }
 
     // AOT configuration
@@ -3648,6 +3973,11 @@ fn main() {
         // Backtrace only when explicitly requested — matches the stock
         // Rust hook semantics so users opting out of backtrace still see
         // the panic message but no overhead.
+        // Stamp the crash with the standard library in play. Two complete
+        // class-library implementations ship in this binary and they fail
+        // differently; a panic report that doesn't say which one ran costs
+        // a round trip to triage.
+        let _ = writeln!(stderr, "[cratonvm] {}", active_jdk_mode_line());
         let bt = std::backtrace::Backtrace::capture();
         if bt.status() == std::backtrace::BacktraceStatus::Captured {
             let _ = writeln!(stderr, "stack backtrace:\n{bt}");
@@ -3721,6 +4051,12 @@ fn main() {
                 Err(e) => {
                     eprintln!("[cratonvm] main-vm run() returned Err: {e:#}");
                     eprintln!("[cratonvm] main-vm run() Err (debug): {e:?}");
+                    // Always stamp the failure with the standard library it
+                    // ran against. CratonVM has two of them with different
+                    // bug sets, so a stack trace or exception without the
+                    // mode is not actionable — this line is what makes a
+                    // pasted terminal transcript sufficient for triage.
+                    eprintln!("[cratonvm] {}", active_jdk_mode_line());
                     let _ = std::io::stderr().flush();
                     std::process::exit(1);
                 }
@@ -3895,6 +4231,192 @@ fn clamp_ergonomic_heap(basis: u64, cap: u64) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cratonvm_vm::config::{
+        JdkMode, EMBEDDED_DEFAULT_JDK_MODE, LAUNCHER_DEFAULT_JDK_MODE, SYNTHETIC_JDK_COMPILED_IN,
+    };
+
+    // -----------------------------------------------------------------------
+    // JDK-mode determinism (2026-07-26)
+    //
+    // The launcher used to pick its standard library by sniffing the host
+    // (`use_synthetic_jdk = detect_real_jdk().is_none()`). These tests pin
+    // the replacement contract: fixed default, symmetric explicit flags,
+    // no silent fallback, and a mode that is visible in `-version`.
+    // -----------------------------------------------------------------------
+
+    fn tokens(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn launcher_default_mode_is_real_jdk() {
+        assert_eq!(LAUNCHER_DEFAULT_JDK_MODE, JdkMode::Real);
+        assert_eq!(
+            scan_requested_jdk_mode(&tokens(&["cratonvm", "Main", "--"])),
+            JdkMode::Real
+        );
+        // ...and the embedding default deliberately differs.
+        assert_eq!(EMBEDDED_DEFAULT_JDK_MODE, JdkMode::Synthetic);
+    }
+
+    #[test]
+    fn explicit_mode_flags_are_symmetric() {
+        assert_eq!(
+            scan_requested_jdk_mode(&tokens(&["cratonvm", "--synthetic-jdk", "Main", "--"])),
+            JdkMode::Synthetic
+        );
+        assert_eq!(
+            scan_requested_jdk_mode(&tokens(&["cratonvm", "--real-jdk", "Main", "--"])),
+            JdkMode::Real
+        );
+    }
+
+    /// A program argument after `--` must never be mistaken for a launcher
+    /// mode flag.
+    #[test]
+    fn mode_flags_after_separator_are_program_args() {
+        assert_eq!(
+            scan_requested_jdk_mode(&tokens(&["cratonvm", "Main", "--", "--synthetic-jdk"])),
+            JdkMode::Real
+        );
+    }
+
+    #[test]
+    fn both_mode_flags_is_an_error_not_a_silent_winner() {
+        let err = resolve_jdk_mode(true, true, None).expect_err("both flags must be rejected");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("mutually exclusive"), "{msg}");
+    }
+
+    /// Selecting synthetic mode in a build without the `synthetic-jdk`
+    /// Cargo feature must abort the launch. Booting anyway would register
+    /// none of the ~5,200 stubs *and* skip boot-classpath discovery,
+    /// producing a VM with no class library at all.
+    #[test]
+    fn synthetic_mode_requires_the_cargo_feature() {
+        let result = resolve_jdk_mode(true, false, None);
+        assert_eq!(result.is_ok(), SYNTHETIC_JDK_COMPILED_IN);
+        if let Err(e) = result {
+            let msg = format!("{e:#}");
+            assert!(msg.contains("synthetic-jdk"), "{msg}");
+        }
+    }
+
+    /// Real-JDK mode with a bogus `--java-home` must fail loudly, naming
+    /// what was searched — never fall through to the synthetic library.
+    #[test]
+    fn real_mode_without_a_jdk_fails_loudly() {
+        let err = resolve_jdk_mode(false, false, Some("/definitely/not/a/jdk/anywhere"))
+            .expect_err("a nonexistent --java-home must not be tolerated");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("no usable JDK was found"), "{msg}");
+        assert!(msg.contains("jmods/java.base.jmod"), "{msg}");
+        assert!(msg.contains("lib/modules"), "{msg}");
+        // The message must offer the other mode explicitly rather than
+        // silently taking it.
+        assert!(msg.contains("--synthetic-jdk"), "{msg}");
+    }
+
+    // ── version banner ───────────────────────────────────────────────
+
+    #[test]
+    fn version_query_is_recognised_in_the_launcher_section() {
+        for (tok, expected) in [
+            ("-version", VersionQuery::Version),
+            ("--version", VersionQuery::Version),
+            ("-fullversion", VersionQuery::Full),
+            ("-Xinternalversion", VersionQuery::Internal),
+            ("-showversion", VersionQuery::Show),
+        ] {
+            let got = scan_version_query(&tokens(&["cratonvm", tok]));
+            assert_eq!(got.map(|(q, _)| q), Some(expected), "token {tok}");
+        }
+        // After the program selector these are program args.
+        assert!(scan_version_query(&tokens(&["cratonvm", "Main", "--", "-version"])).is_none());
+        assert!(scan_version_query(&tokens(&["cratonvm", "Main", "--"])).is_none());
+    }
+
+    /// The whole point of routing version output through our own banner:
+    /// it must name the active class library.
+    #[test]
+    fn version_banner_names_the_jdk_mode() {
+        let banner = version_banner(VersionQuery::Version, JdkMode::Synthetic, None);
+        assert!(banner.contains("cratonvm version"), "{banner}");
+        assert!(banner.contains("synthetic-jdk"), "{banner}");
+        let banner = version_banner(VersionQuery::Version, JdkMode::Real, None);
+        assert!(banner.contains("real-jdk"), "{banner}");
+    }
+
+    #[test]
+    fn internal_version_reports_both_defaults_and_the_search_path() {
+        let banner = version_banner(VersionQuery::Internal, JdkMode::Real, None);
+        for needle in [
+            "jdk.mode.active",
+            "jdk.mode.default.launcher",
+            "jdk.mode.default.embedded",
+            "jdk.mode.synthetic_compiled_in",
+            "never host-detected",
+            "JAVA_HOME",
+            "java on PATH",
+        ] {
+            assert!(banner.contains(needle), "missing {needle}:\n{banner}");
+        }
+    }
+
+    #[test]
+    fn version_stream_matches_hotspot_conventions() {
+        // `java -version` → stderr (build tools scrape it there);
+        // `java --version` → stdout.
+        assert!(!VersionQuery::Version.to_stdout("-version"));
+        assert!(VersionQuery::Version.to_stdout("--version"));
+        assert!(VersionQuery::Version.exits());
+        assert!(!VersionQuery::Show.exits());
+    }
+
+    #[test]
+    fn showversion_token_is_stripped_before_clap() {
+        let mut argv = tokens(&["cratonvm", "-showversion", "Main", "--", "-showversion"]);
+        remove_first_launcher_token(&mut argv, "-showversion");
+        // Only the launcher-section occurrence is removed; the program arg
+        // after `--` survives.
+        assert_eq!(argv, tokens(&["cratonvm", "Main", "--", "-showversion"]));
+    }
+
+    #[test]
+    fn explicit_java_home_is_visible_to_the_banner() {
+        assert_eq!(
+            scan_explicit_java_home(&tokens(&["cratonvm", "--java-home", "/opt/jdk", "Main", "--"])),
+            Some("/opt/jdk".to_string())
+        );
+        assert_eq!(
+            scan_explicit_java_home(&tokens(&["cratonvm", "--java-home=/opt/jdk", "Main", "--"])),
+            Some("/opt/jdk".to_string())
+        );
+        assert_eq!(
+            scan_explicit_java_home(&tokens(&["cratonvm", "Main", "--", "--java-home", "/x"])),
+            None
+        );
+    }
+
+    /// clap must reject the two mode flags together rather than letting one
+    /// silently win.
+    #[test]
+    fn clap_rejects_both_mode_flags() {
+        assert!(
+            Args::try_parse_from(tokens(&[
+                "cratonvm",
+                "--real-jdk",
+                "--synthetic-jdk",
+                "Main"
+            ]))
+            .is_err(),
+            "--real-jdk and --synthetic-jdk must conflict"
+        );
+        let parsed = Args::try_parse_from(tokens(&["cratonvm", "--real-jdk", "Main"]))
+            .expect("clap must accept --real-jdk");
+        assert!(parsed.real_jdk);
+        assert!(!parsed.synthetic_jdk);
+    }
 
     // -----------------------------------------------------------------------
     // Ergonomic default-heap clamp — pure math, exercised directly so the
