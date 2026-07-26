@@ -1051,28 +1051,23 @@ fn should_skip_jit_internal(
         {
             return Some(SkipReason::JavaUtilCollection);
         }
-        // JASPER-JDT.2 (2026-07-08) - default Tomcat
-        // `org.apache.jasper.compiler.TestCompiler` order corrupts Eclipse JDT
-        // parser state under JIT and then fails JSP compilation. The first
-        // stable face was `ArrayIndexOutOfBoundsException: Index -1 out of
-        // bounds for length 100` in `Parser.parse`: `--nojit` passed, running
-        // `testBug55262` alone passed, and package bisection showed
-        // `CRATONVM_JIT_BISECT_ONLY=org/eclipse/jdt/internal/compiler/parser/`
-        // still failed while `CRATONVM_JIT_BISECT_SKIP=.../Parser.consumeRule`
-        // made the two-method repro pass. After rebasing onto newer `dev`, the
-        // full class still produced nondeterministic parser-adjacent heap
-        // corruption/OOM around the `testBug53257*` sequence unless the parser
-        // package was interpreted. The affected generated parser methods
-        // (`consumeRule`, `consumeBlock`, `consumeTypeImportOnDemandDeclarationName`,
-        // and siblings) share the same huge switch/stack update shape, so keep
-        // the parser package interpreted under Conservative until the backend
-        // producer is root-caused. Liftable for diagnosis with
-        // `CRATONVM_JIT_ALLOW_PACKAGES=org/eclipse/jdt/internal/compiler/parser/`.
-        if class_name.starts_with("org/eclipse/jdt/internal/compiler/parser/")
-            && !package_allowed("org/eclipse/jdt/internal/compiler/parser/", allow_packages)
-        {
-            return Some(SkipReason::RustJvmTestFixture);
-        }
+        // JASPER-JDT.2 -- REMOVED 2026-07-26. Originally (2026-07-08) the
+        // real Tomcat `org.apache.jasper.compiler.TestCompiler` suite hit
+        // nondeterministic parser-adjacent heap corruption/OOM (first face:
+        // `ArrayIndexOutOfBoundsException` in `Parser.parse`) that bisected
+        // to `Parser.consumeRule` and the parser package generally. Given
+        // the ban's own documented nondeterminism, re-verified with a much
+        // higher bar than a single run: the real Tomcat fixture's own
+        // `TestCompiler` class (12 real JSP-compilation test methods, each
+        // a full embedded Tomcat boot+shutdown) run twice as baseline
+        // (ban active) and twice with `CRATONVM_JIT_ALLOW_PACKAGES=
+        // org/eclipse/jdt/internal/compiler/parser/` -- all 4 runs `OK (12
+        // tests)`, 0 failures, no AIOOBE, no heap corruption. No longer
+        // reproduces on current dev. JASPER-JDT.3
+        // (org/eclipse/jdt/internal/compiler/ast/, a separate, different
+        // AST-package miscompile found via Tomcat's FORM-auth JSP tests)
+        // is NOT covered by this removal and remains banned/open -- see
+        // docs/known-issues/jasper-jdt-2-3-scoped-for-future-session-20260726.md.
 
         // JASPER-JDT.3 (2026-07-10) - a second, independent Eclipse JDT
         // miscompile family, this one in the AST/flow-analysis package
@@ -4038,39 +4033,38 @@ mod tests {
     }
 
     #[test]
-    fn jdt_parser_package_skips_under_conservative() {
+    fn jdt_parser_package_is_jit_eligible_after_jasper_jdt_2_removal() {
+        // JASPER-JDT.2 was removed 2026-07-26 -- see the removal comment
+        // above should_skip_jit_internal for the re-verification evidence
+        // (2 baseline + 2 lifted runs of the real Tomcat TestCompiler
+        // suite, all OK (12 tests)). JASPER-JDT.3
+        // (org/eclipse/jdt/internal/compiler/ast/) is a separate, still-
+        // active ban and is untouched by this test.
+        for method in ["consumeRule", "consumeTypeImportOnDemandDeclarationName"] {
+            for policy in [SkipPolicy::Conservative, SkipPolicy::Aggressive] {
+                assert_eq!(
+                    check(
+                        "org/eclipse/jdt/internal/compiler/parser/Parser",
+                        method,
+                        false,
+                        true,
+                        policy,
+                    ),
+                    None,
+                    "org/eclipse/jdt/internal/compiler/parser/Parser.{method} must be JIT-eligible now that JASPER-JDT.2 is removed"
+                );
+            }
+        }
         assert_eq!(
             check(
-                "org/eclipse/jdt/internal/compiler/parser/Parser",
-                "consumeRule",
+                "org/eclipse/jdt/internal/compiler/ast/QualifiedNameReference",
+                "analyseCode",
                 false,
                 true,
                 SkipPolicy::Conservative,
             ),
             Some(SkipReason::RustJvmTestFixture),
-            "JDT Parser.consumeRule must stay interpreted for the Jasper parser residual"
-        );
-        assert_eq!(
-            check(
-                "org/eclipse/jdt/internal/compiler/parser/Parser",
-                "consumeTypeImportOnDemandDeclarationName",
-                false,
-                true,
-                SkipPolicy::Conservative,
-            ),
-            Some(SkipReason::RustJvmTestFixture),
-            "the Jasper residual guard covers the JDT parser package, not only consumeRule"
-        );
-        assert_eq!(
-            check(
-                "org/eclipse/jdt/internal/compiler/lookup/Scope",
-                "getType",
-                false,
-                true,
-                SkipPolicy::Conservative,
-            ),
-            None,
-            "the Jasper residual guard is intentionally limited to the parser package"
+            "JASPER-JDT.3 (the separate ast/ package ban) must remain active under Conservative"
         );
     }
 
