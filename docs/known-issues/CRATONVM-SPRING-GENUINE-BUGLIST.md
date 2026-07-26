@@ -3325,3 +3325,67 @@ recorded as an observation, to be reconfirmed on the next run.
    -- still failing, still pre-existing on `origin/dev` (confirmed again this
    session by running the same test against this file's pre-change contents),
    still just stale hardcoded byte-length constants.
+
+dynamically-`defineClass`'d CGLIB class's `<clinit>`) is untouched by this
+session and remains open.
+
+## 2026-07-26 Blocker 2 still open -- but the `NoSuchMethodError` names a MALFORMED descriptor
+
+Re-confirmed on current `dev` (worktree `/data/data/wt-testngnpe-20260726`,
+real JDK 25, `--Xmx 4g`; Blocker 1's testng-jar-stripping workaround is no
+longer needed now that Blocker 1 is fixed). `AotIntegrationTests` still fails
+`endToEndTestsForBeanOverrides` at the same place:
+
+```
+TestContextAotException: Failed to generate AOT artifacts for test classes
+  [...MockitoSpyBeanAndCircularDependenciesWithLazyResolutionProxyIntegrationTests]
+Caused by: NoSuchMethodError: java.lang.Class.getDeclaredMethods()[Ljava/lang/reflect/Method[];
+  at ...$Two$$SpringCGLIB$$0.CGLIB$STATICHOOK1(<generated>)
+  at ...$Two$$SpringCGLIB$$0.<clinit>(<generated>)
+  at org.springframework.cglib.core.ReflectUtils.defineClass(ReflectUtils.java:581)
+```
+
+**New and actionable: look at the descriptor.** It is
+`()[Ljava/lang/reflect/Method[];` -- note the `[]` INSIDE the `L...;`. The real
+descriptor in cglib's generated constant pool is `()[Ljava/lang/reflect/Method;`.
+So this is not "method resolution fails for a dynamically-defined class"; the
+descriptor CratonVM resolves for that call site is textually wrong, and of
+course no such method is registered. The mangled form is exactly what
+`format!("[L{};", name)` produces when handed the *Java-language* array name
+`java/lang/reflect/Method[]` instead of a descriptor-form name -- i.e. an
+array-name-to-descriptor conversion that assumed its input was not already an
+array.
+
+There are **nine** `format!("[L{};", ...)` builders repo-wide, and all nine were
+checked: `native-builtins/src/lang_class.rs` (2 sites, incl.
+`native_class_array_type`), `native-builtins/src/lib.rs`,
+`native-builtins/src/generics.rs`, `native-collections/src/lib.rs`,
+`vm/src/runtime/interpreter.rs`, `vm/src/runtime/hprof.rs`,
+`classloading/src/verify_insn.rs` (`anewarray`) and `classloading/src/vtype.rs`
+(`merge_arrays`). **Every one of them is correctly guarded** -- either by an
+explicit `starts_with('[')` test or by being fed an already-`L…;`-stripped class
+name -- so none of them is the producer, and re-auditing them is a dead end.
+Whatever builds this descriptor is somewhere else; do not start from that list.
+
+Start instead by dumping the descriptor at the resolution site
+(`vm/src/vm/vm_exec.rs`'s `NoSuchMethodError` warn) for a class defined through
+`ReflectUtils.defineClass`, and compare it byte-for-byte with the raw CP UTF8
+entry in the generated class bytes. That answers the one question that decides
+the whole investigation: is the constant pool being parsed wrong, or is the
+descriptor being re-synthesised somewhere between parse and dispatch?
+
+**Ruled out this session** (all verified equal to HotSpot on current `dev`):
+
+- Ordinary real-cglib proxy generation is fine. `Enhancer.create()` on a plain
+  class produces a working proxy, `CGLIB$STATICHOOK1` runs, and
+  `proxyClass.getDeclaredMethods()` returns the same 24 methods HotSpot does.
+  So it is NOT "any real-bytecode cglib proxy generation" as the original
+  Blocker 2 note supposed.
+- `Class.getDeclaredMethods` itself resolves fine everywhere else
+  (`Class.class.getDeclaredMethods().length == 167`, same as HotSpot).
+- Array class naming is correct in isolation: `Method[].class.getName()`,
+  `getClass().getName()`, `arrayType().getName()` and `descriptorString()` all
+  match HotSpot exactly, so the bracketed name is being produced somewhere
+  narrower than the general array-mirror path.
+- `MockitoSpyBeanAndCircularDependenciesWithLazyResolutionProxyIntegrationTests`
+  passes 1/1 when run directly; only the AOT-generation path fails.
