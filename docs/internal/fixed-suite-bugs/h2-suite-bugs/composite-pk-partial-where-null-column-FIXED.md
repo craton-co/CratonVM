@@ -5,14 +5,16 @@
 H2-internals-independent CratonVM correctness bug — not specific to any
 particular application suite. Discovered as a side effect of the H2
 `TestUpgrade` Parser-loader-collapse fix session (see
-`../../../known-issues/h2/bug-h2-suite-residual-fail-triage.md`'s
-ninth-pass section) while investigating a deeper `TestUpgrade`
-LOB-migration residual, and confirmed to be the same root cause as a
-separately-observed dev regression in `org.h2.test.db.TestLinkedTable` /
-`org.h2.test.jdbc.TestPreparedStatement` (both now pass).
+`bug-h2-suite-residual-fail-triage-FIXED.md` (moved into this same
+directory after its own twelfth-pass closure)'s ninth-pass section) while
+investigating a deeper `TestUpgrade` LOB-migration residual, and confirmed
+to be the same root cause as a separately-observed dev regression in
+`org.h2.test.db.TestLinkedTable` / `org.h2.test.jdbc.TestPreparedStatement`
+(both now pass).
 
-**Known trade-off, NOT resolved**: fixing this reopened `TestUpgrade`'s
-SQL-parsing NPE (previously fixed by a different, unrelated session — see
+**Known trade-off, since resolved (twelfth pass, see the other doc)**:
+fixing this reopened `TestUpgrade`'s SQL-parsing NPE (previously fixed by a
+different, unrelated session — see
 the main triage doc's ninth-pass section) through an interaction that
 significant investigation this session did not root-cause. See the triage
 doc's tenth-pass section for the full account and next-step guidance. The

@@ -2923,10 +2923,57 @@ from the worktree branch (`origin/dev` had not moved from this session's
 `346c74b71` fork point, so no merge was needed — same rationale as the
 ninth/tenth passes' direct-push approach). A full 218-class
 `apps/h2database-suite-runner` run (`--category all --count 218 --jit
-off`) was kicked off against the fixed binary to catch any regression from
-this dispatch-path change beyond the H2 classes already spot-checked above
-— see the doc's own results file for the outcome if this section wasn't
-updated with a summary before the session ended (the fix touches a hot,
-general-purpose dispatch path shared by every native-override decision in
-the VM, not just H2-specific code, so this broader check matters more than
-usual).
+off`, `CLASS_TO` default 300s) ran against the fixed binary to catch any
+regression from this dispatch-path change beyond the H2 classes already
+spot-checked above (the fix touches a hot, general-purpose dispatch path
+shared by every native-override decision in the VM, not just H2-specific
+code, so this broader check matters more than usual).
+
+**Result: PASS=155 HANG=34 FAIL=29** (wall-clock 14319s, ~4h). This is
+substantially better across every column than this doc's own originally
+documented 218-class baseline (120 PASS / 59 HANG / 39 FAIL, from the very
+first full run near the top of this doc) — consistent with the cumulative
+effect of all twelve passes' fixes, not a regression from this one.
+`org.h2.test.unit.TestUpgrade` itself: **PASS, 7.3s**.
+
+The FAIL list (`TestCompatibility`, `TestFunctions`, `TestLargeBlob`,
+`TestLob`, `TestMultiThread`, `TestTransaction`, `TestView`,
+`TestGetGeneratedKeys`, `TestRecoverKillLoop`, `TestWeb`,
+`TestKillProcessWhileWriting`, `TestMVStore`, `TestMVStoreStopCompact`,
+`TestStreamStore`, `TestJoin`, `TestMultiThreaded`, `TestPowerOffFs`,
+`TestTimer`, `TestMulti`, `TestBnf`, `TestClassLoaderLeak`, `TestExit`,
+`TestFile`, `TestFileLock`, `TestFileSystem`, `TestMVTempResult`,
+`TestMemoryUnmapper`, `TestPgServer`, `TestSampleApps`) matches this doc's
+own already-documented pre-existing FAIL cluster wherever previously
+characterized (`TestBnf`/`TestFileLock`/`TestTransaction` — performance-
+margin, no fix expected; `TestView`/`TestMVStoreStopCompact`/
+`TestFileSystem` — confirmed pre-existing against unmodified `dev` earlier
+in this doc; `TestRecoverKillLoop` — excluded as non-comparable, its own
+section above) and shows no new failure shape connected to the dispatch
+fix (no `Parser`/`Session`/`ParserBase`/loader-related error text in any of
+them, by class name or by spot-checking a sample of the FAIL logs). One
+noted harness artifact, not a regression: `org.h2.test.store.TestDataUtils`
+shows `HANG 300.0s` in this run because the suite runner's default
+per-class timeout (300s) is only marginally above what this doc's own
+third-pass section already documented as this class's real running time
+(~5-6 minutes) — a dedicated run of just this class with a 900s timeout
+earlier in this same session passed cleanly (exit 0, zero errors).
+
+**Not separately reconfirmed this session** (unchanged from prior passes,
+out of scope for this fix): the HANG cluster's other members, and whether
+any individual FAIL beyond the five listed above as directly
+cross-referenced is itself still accurately characterized — this doc's
+existing per-item sections are the reference for each.
+
+## Summary: this known-issues item is CLOSED
+
+All items this doc originally opened are now resolved to one of: FIXED
+(TestPreparedStatement, TestShell, TestRandomMapOps, TestLinkedTable,
+TestAlter, TestDataUtils, TestUpgrade — both the `SecurityException` and
+`NoSuchMethodError` halves from earlier passes, and now the SQL-parsing
+NPE and LOB-migration NPE from this pass), or root-caused as a genuine
+performance-margin/environment-sensitivity issue with no fix
+expected (`TestBnf`, `TestFileLock`, `TestTransaction`,
+`TestFuzzOptimizations`, `TestRecoverKillLoop`). No further action is
+needed on this doc; future H2-suite work should open new, narrowly-scoped
+docs for anything newly discovered rather than reopening this one.
