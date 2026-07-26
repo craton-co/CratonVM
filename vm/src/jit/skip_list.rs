@@ -1862,50 +1862,34 @@ fn should_skip_jit_internal(
             return Some(SkipReason::RustJvmTestFixture);
         }
 
-        // SPB.9 (Session 114) — provisional blanket ban for the SLF4J /
-        // Logback / commons-logging facades. `apps/insurance-backend` Spring
-        // Boot 3.2 boot reaches the Spring banner then crashes with
-        // `expected object reference, got int(1)` while
-        // `SpringApplication.prepareEnvironment` walks the
-        // `SystemEnvironmentPropertyMapper.processElementValue` chain (frame
-        // depth 18). With `CRATONVM_DISABLE_JIT=1` the same int(1) crash
-        // surfaces — but the very last methods JIT-dispatched before the
-        // failure (`CRATONVM_DBG_JIT_DISPATCH=1` capture) are an extremely
-        // tight loop of `LogAdapter$Slf4jLog.<init>`,
-        // `LogAdapter$Slf4jLocationAwareLog.<init>`,
-        // `LoggerFactory.getLogger`, `LoggerFactory.getProvider`,
-        // `SLF4JServiceProvider.getLoggerFactory`,
-        // `ILoggerFactory.getLogger`, and
-        // `LoggerContext.getLogger` — Spring Boot's per-class logger
-        // wiring during component scan. Each call returns a JIT-compiled
-        // `Logger` reference that is then stored into the
-        // `Slf4jLog.logger` slot via the same allocate-then-putfield
-        // archetype that bites W2-CHM / RBC.1 / SPB.1-8. The miscompiled
-        // store leaves an `int(1)` (likely the `LocationAwareLogger`
-        // instance test boolean) where a `Logger` reference belongs; the
-        // next interpreter `pop_object_ref` on that slot raises the
-        // observed `expected object reference, got int(1)` crash.
+        // SPB.9 -- REMOVED 2026-07-26 for the logging-facade classes
+        // themselves (org/slf4j/, ch/qos/logback/,
+        // org/apache/commons/logging/). Originally (Session 114) banned
+        // after `apps/insurance-backend`'s Spring Boot 3.2 boot crashed
+        // with `expected object reference, got int(1)` inside
+        // `SpringApplication.prepareEnvironment` ->
+        // `SystemEnvironmentPropertyMapper.processElementValue`, with the
+        // last JIT-dispatched methods before the crash being a tight
+        // LoggerFactory/Slf4jLog init loop -- a correlation, not a proven
+        // miscompile inside the logging classes themselves. Re-verified
+        // with a standalone probe (`SlfLoggingProbe.java`, real
+        // jcl-over-slf4j + slf4j-api + logback-classic/core jars) driving
+        // `LogFactory.getLog(Class)` for 10 distinct per-class loggers
+        // (simulating component-scan per-class logger wiring) 20000
+        // times, each followed by a real `log.info(...)` call that would
+        // fail on a corrupted reference: baseline, package-allowed, and a
+        // `CRATONVM_JIT_THRESHOLD=1` aggressive pass -- 0 failures in
+        // every configuration. The logging facade classes' own JIT
+        // compilation is genuinely safe.
         //
-        // The three logging facades are tightly coupled at boot:
-        // `org/slf4j/` (the API), `ch/qos/logback/` (Spring Boot 3.2's
-        // default backend), and `org/apache/commons/logging/` (the
-        // bridge Spring uses internally). Banning all three together
-        // covers the full per-class logger wiring path. Lifted by
-        // `CRATONVM_JIT_ALLOW_PACKAGES=org/slf4j/,ch/qos/logback/,
-        // org/apache/commons/logging/`.
-        if class_name.starts_with("org/slf4j/") && !package_allowed("org/slf4j/", allow_packages) {
-            return Some(SkipReason::RustJvmTestFixture);
-        }
-        if class_name.starts_with("ch/qos/logback/")
-            && !package_allowed("ch/qos/logback/", allow_packages)
-        {
-            return Some(SkipReason::RustJvmTestFixture);
-        }
-        if class_name.starts_with("org/apache/commons/logging/")
-            && !package_allowed("org/apache/commons/logging/", allow_packages)
-        {
-            return Some(SkipReason::RustJvmTestFixture);
-        }
+        // IMPORTANT: this does NOT independently confirm the original
+        // `insurance-backend` crash is fixed -- its actual trigger site
+        // (`SystemEnvironmentPropertyMapper.processElementValue`, in
+        // `org/springframework/boot/context/properties/bind/`) is a
+        // SEPARATE, still-active, already-documented ban (see the
+        // `org/springframework/boot/context/properties/bind/` guard
+        // above) that this removal does not touch. `SlfLoggingProbe.java`
+        // is the regression witness for the logging-facade claim only.
 
         // CGL.1 (Session 117 — agent O4, 2026-05-16) — provisional blanket ban
         // for CGLIB (`net/sf/cglib/`). `apps/cglib_probe` is a minimal repro
@@ -4258,6 +4242,30 @@ mod tests {
                 None,
                 "{class_name}.matches must be JIT-eligible now that ES-HAMCREST.1 is removed"
             );
+        }
+    }
+
+    #[test]
+    fn slf4j_logback_commons_logging_are_jit_eligible_after_spb9_removal() {
+        // SPB.9 was removed 2026-07-26 for these three logging-facade
+        // packages themselves -- see the removal comment above
+        // should_skip_jit_internal for the re-verification evidence
+        // (SlfLoggingProbe.java, real jcl-over-slf4j/slf4j-api/logback
+        // jars) and the important caveat that the original crash's real
+        // trigger site (org/springframework/boot/context/properties/bind/)
+        // is a separate, still-active ban this removal does not touch.
+        for (class_name, method) in [
+            ("org/slf4j/LoggerFactory", "getLogger"),
+            ("ch/qos/logback/classic/Logger", "info"),
+            ("org/apache/commons/logging/LogFactory", "getLog"),
+        ] {
+            for policy in [SkipPolicy::Conservative, SkipPolicy::Aggressive] {
+                assert_eq!(
+                    check(class_name, method, false, true, policy),
+                    None,
+                    "{class_name}.{method} must be JIT-eligible now that SPB.9 is removed"
+                );
+            }
         }
     }
 
