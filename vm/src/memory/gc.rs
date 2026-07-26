@@ -56,7 +56,7 @@ pub fn unload_dead_class_metadata(
     }
 
     let unloaded = {
-        let mut cm = shared.classes.class_manager.write();
+        let mut cm = shared.classes.class_manager_write();
         let mut classes = Vec::new();
         for loader in &loaders {
             classes.extend(cm.unload_user_loader(*loader));

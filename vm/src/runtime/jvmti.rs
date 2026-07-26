@@ -1263,17 +1263,18 @@ impl JvmtiEventManager {
 
     /// Fire ClassLoad.
     ///
-    /// Panic-safe, and load-bearing here in a way it is not for most events:
-    /// this is reached from `ClassManager::define_class_shared_with_options`
-    /// (see the re-entrancy notes above `install_class_load_hook` in
-    /// `classloading/src/class_manager.rs`) while the caller still holds the
-    /// L10 `ClassRealm::class_manager` **write** guard. That guard is a
-    /// `parking_lot::RwLock`, which does not poison — so an agent callback
-    /// that panicked would unwind straight through it and release it
-    /// silently, publishing a half-built `ClassManager` (the class is in the
-    /// store with its vtable installed, but the define path never finished)
-    /// to every later reader with no indication anything went wrong.
-    /// Containing the panic here keeps the unwind out of the guard entirely.
+    /// Reached from `ClassManager::define_class_shared_with_options` via
+    /// `ClassManagerWriteGuard::drop` (`vm/src/vm/realms/class_realm.rs`) —
+    /// see the DEFERRED FIRING notes above `install_class_load_hook` in
+    /// `classloading/src/class_manager.rs`. As of obsaudit D1 (2026-07-26)
+    /// this runs strictly *after* the L10 `ClassRealm::class_manager` write
+    /// guard has been released, not while it is held: a listener may freely
+    /// call back into the class manager (`GetClassSignature`,
+    /// `GetLoadedClasses`, `RetransformClasses`, ...) without self-
+    /// deadlocking. `catch_unwind` is kept regardless — an agent callback is
+    /// untrusted code from the VM's point of view, and a panic in one must
+    /// not unwind through interpreter/classloader frames it has no business
+    /// touching.
     pub fn fire_class_load(&self, thread: ThreadId, class_id: ClassId) {
         if !self.is_event_enabled(JvmtiEventKind::ClassLoad, Some(thread)) {
             return;
@@ -1296,9 +1297,8 @@ impl JvmtiEventManager {
         }
     }
 
-    /// Fire ClassPrepare. Panic-safe for the same reason as
-    /// [`Self::fire_class_load`] — it fires from the same place, under the
-    /// same held class-manager write guard.
+    /// Fire ClassPrepare. Same timing and re-entrancy contract as
+    /// [`Self::fire_class_load`] — see its doc comment.
     pub fn fire_class_prepare(&self, thread: ThreadId, class_id: ClassId) {
         if !self.is_event_enabled(JvmtiEventKind::ClassPrepare, Some(thread)) {
             return;
