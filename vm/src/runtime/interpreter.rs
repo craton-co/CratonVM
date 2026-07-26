@@ -29562,6 +29562,23 @@ fn redefine_immune_forced_native(
         || redefine_immune_jfr_native(class_name, method_name, method_descriptor)
         || is_bc_crypto_math_native_override(class_name, method_name, method_descriptor)
         || is_stamped_lock_native_override(class_name, method_name, method_descriptor)
+        // java.util.logging.FileHandler's registered natives store their
+        // filename/closed bookkeeping in an identity-hash side table
+        // (jul_file_handler_state_table, native-builtins/src/
+        // logging_shims.rs) rather than real instance field slots. Real
+        // FileHandler bytecode (loaded from java.base) is concrete, so
+        // without this entry the default rule ran its REAL <init>()V /
+        // <init>(String)V -- which try to actually open/lock a real log
+        // file via NIO and throw NoSuchFileException -- instead of the
+        // registered native. Keep in sync with vm_exec.rs's
+        // invoke_on_class_shared_inner check_override entry for the same
+        // triples; see
+        // docs/known-issues/springboot/filehandler-noarg-ctor-handler-field-layout-gap.md.
+        || (class_name == "java/util/logging/FileHandler"
+            && matches!(
+                method_name,
+                "<init>" | "publish" | "flush" | "close"
+            ))
 }
 
 pub(crate) fn should_force_registered_native_over_bytecode(
