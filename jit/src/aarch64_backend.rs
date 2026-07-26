@@ -4924,14 +4924,23 @@ mod tests {
         assert!(has_mul, "imul should emit Mul instruction");
     }
 
+    /// `idiv` is REFUSED (see the module header and
+    /// `backend_idiv_bails_to_interpreter`), and the refusal must survive
+    /// compile-time-constant operands too: a constant-folding or peephole path
+    /// that resolved `iconst_1 / iconst_2` before the opcode arm ran would
+    /// reintroduce the `BRK #1`/SIGTRAP lowering for the shape that looks
+    /// safest. Written as "no `SDiv` is emitted" rather than only
+    /// "`!success`", so it still fails if the arm is re-wired.
     #[test]
-    fn backend_int_div_emits_sdiv() {
+    fn backend_int_div_bails_with_constant_operands() {
+        // iconst_1, iconst_2, idiv, ireturn
         let result = make_backend_with_method(0, 0, &[0x04, 0x05, 0x6c, 0xac]);
+        assert!(!result.success, "idiv must bail, constant operands included");
         let has_div = result
             .instructions
             .iter()
             .any(|inst| matches!(inst, Arm64Instruction::SDiv { .. }));
-        assert!(has_div, "idiv should emit SDiv instruction");
+        assert!(!has_div, "no SDiv may be emitted for a refused idiv");
     }
 
     #[test]
@@ -5514,13 +5523,10 @@ mod tests {
         assert!(result.success, "lcmp should compile successfully");
     }
 
-    #[test]
-    fn backend_idiv_opcode() {
-        // iconst_2, iconst_1, idiv, ireturn
-        // 0x05=iconst_2, 0x04=iconst_1, 0x6c=idiv, 0xac=ireturn
-        let result = make_backend_with_method(0, 0, &[0x05, 0x04, 0x6c, 0xac]);
-        assert!(result.success, "idiv should compile successfully");
-    }
+    // `backend_idiv_opcode` (iconst_2, iconst_1, idiv, ireturn — asserted
+    // `success`) was removed with the 82a9d08fc div/rem refusal: inverted it
+    // would assert strictly less than
+    // `backend_int_div_bails_with_constant_operands` above, on the same shape.
 
     #[test]
     fn backend_ifeq_uses_label_not_raw_target() {
@@ -5666,16 +5672,25 @@ mod tests {
         assert!(has_lsr, "iushr should emit Lsr");
     }
 
+    /// Constant-operand counterpart of
+    /// `backend_irem_and_lrem_bail_to_interpreter`. The old `a - (a/b)*b`
+    /// lowering is what made `x % 0` return `x` (AArch64 `SDIV` by zero yields
+    /// 0 instead of trapping), so the assertion is that no `Msub` is emitted,
+    /// not merely that the method bailed.
     #[test]
-    fn p95_irem_compiles() {
+    fn p95_irem_bails_with_constant_operands() {
         // iconst_5, iconst_2, irem, ireturn
         let result = make_backend_with_method(0, 0, &[0x08, 0x05, 0x70, 0xac]);
-        assert!(result.success, "irem should compile");
+        assert!(!result.success, "irem must bail, constant operands included");
         let has_msub = result
             .instructions
             .iter()
             .any(|inst| matches!(inst, Arm64Instruction::Msub { .. }));
-        assert!(has_msub, "irem should emit Msub (a - (a/b)*b)");
+        assert!(
+            !has_msub,
+            "no Msub may be emitted: `a - (a/b)*b` is exactly the lowering that \
+             returned `a` for `a % 0`"
+        );
     }
 
     #[test]
