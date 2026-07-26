@@ -17,6 +17,49 @@ use crate::deopt::{
 };
 use cratonvm_types::{ARRAY_LENGTH_OFFSET, FIELD_CELL_PAYLOAD32_OFFSET, HEADER_SIZE, SLOT_SIZE};
 
+// ── Header-offset emission sites (arch-2026-07-26 `layout-constant-hazards`) ──
+//
+// This file is a SECOND x86-64 emitter alongside `x64.rs`, and it bakes object
+// header displacements straight into instruction encodings. The header-offset
+// inventory the `ObjectHeader` shrink was planned from scanned `x64.rs` only, so
+// the sites below were invisible to it. They are, in emission order:
+//
+//   * field address   — `HEADER_SIZE + field_index * SLOT_SIZE` (disp32)
+//   * field tag address — same formula, tag half of the cell (disp32)
+//   * `MOVSS/MOVSD XMM0, [RAX + RCX*n + HEADER_SIZE]` (disp8, float array load)
+//   * `MOVSS/MOVSD [RAX + RCX*n + HEADER_SIZE], XMM0` (disp8, float array store)
+//   * `MOV R10D, [RAX + ARRAY_LENGTH_OFFSET]` (disp8, bounds check)
+//
+// Every one already reads the shared constant rather than a literal, so a layout
+// change does reach them. The hazard is narrower: the disp8 sites narrow the
+// constant with an *unchecked* cast into a literal instruction byte array. A
+// header past 127 bytes would be re-read by the CPU as a NEGATIVE displacement
+// and the load would address memory before the object — no panic, no failed
+// assertion, just a wrong address. `types/src/heap_types.rs` pins that bound
+// centrally; it is restated here, at the emitter, so the constraint travels with
+// the code that actually depends on it and so this file stops being invisible to
+// anyone grepping for the constraint.
+//
+// Inventory tripwires: `jit/src/lib.rs::layout_constant_inventory` (counts the
+// uses in this file *and* in `lib.rs`, which the substring-needle tripwire in
+// `x64.rs` structurally cannot see) and
+// `x64.rs::ir_lower_header_offset_sites_are_inventoried_too`.
+const _: () = assert!(
+    HEADER_SIZE <= 127,
+    "ir_lower.rs narrows HEADER_SIZE into a signed disp8 byte inside literal \
+     MOVSS/MOVSD encodings; above 127 that displacement reads as negative"
+);
+const _: () = assert!(
+    ARRAY_LENGTH_OFFSET <= 127,
+    "ir_lower.rs narrows ARRAY_LENGTH_OFFSET into the signed disp8 of the \
+     array-length load that guards every bounds check"
+);
+const _: () = assert!(
+    HEADER_SIZE % 8 == 0 && SLOT_SIZE % 8 == 0,
+    "field displacements are HEADER_SIZE + index*SLOT_SIZE; both terms must stay \
+     on the 8-byte grid or an 8-byte field cell straddles an alignment boundary"
+);
+
 // ── Guard-surviving scalar replacement (producer side) ───────────────
 //
 // When escape analysis scalar-replaces an `Op::New` (the allocation is elided,

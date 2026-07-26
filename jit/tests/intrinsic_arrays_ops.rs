@@ -8,18 +8,27 @@
 //! an `invokestatic` resolved to an `Arrays.*` intrinsic, then runs the
 //! generated machine code against the JDK-specified reference behaviour.
 //!
-//! Array memory model (`cratonvm_types`): a 32-byte object header with the
-//! i32 element count at offset 12, element data packed at natural width from
-//! offset 32. The tests fabricate that layout in a raw, 8-byte-aligned
-//! `Vec<u8>` — the intrinsics touch only offset 12 (length) and offset 32+
-//! (data), never the GC mark word, so a real heap allocation is unnecessary.
+//! Array memory model (`cratonvm_types`): an object header of `HEADER_SIZE`
+//! bytes with the i32 element count at `ARRAY_LENGTH_OFFSET`, element data
+//! packed at natural width from `HEADER_SIZE`. The tests fabricate that layout
+//! in a raw, 8-byte-aligned `Vec<u8>` — the intrinsics touch only the length
+//! field and the data area, never the GC mark word, so a real heap allocation
+//! is unnecessary.
+//!
+//! Both constants are **imported from `cratonvm_types`, never restated here**.
+//! Until 2026-07-26 this file defined its own `HEADER_SIZE = 32` /
+//! `ARRAY_LENGTH_OFFSET = 12`, which made it the only site in the workspace
+//! where a layout change fails *unsoundly*: local copies keep compiling, so the
+//! fixture lays memory out at the old offsets while the JIT under test emits
+//! the new ones, and the accesses run past the end of the backing `Vec` instead
+//! of tripping a clean assertion. See
+//! `docs/internal/arch-2026-07-26/header-shrink.md` §6.5 and the layout-drift
+//! tripwires at the bottom of this file.
 
 use cratonvm_jit::x64::{compile, is_jit_compatible};
 use cratonvm_jit_api::JitRuntimeHelpers;
+use cratonvm_types::{ARRAY_LENGTH_OFFSET, HEADER_SIZE};
 use std::collections::{HashMap, HashSet};
-
-const HEADER_SIZE: usize = 32;
-const ARRAY_LENGTH_OFFSET: usize = 12;
 
 /// Runtime helpers for the intrinsic tests. The fill/equals intrinsics emit
 /// no `CALL` on the success path; the ONLY helper they can reach is
@@ -100,8 +109,9 @@ fn arrays_helpers() -> JitRuntimeHelpers {
 }
 
 /// A fabricated primitive array: an 8-byte-aligned buffer laid out exactly
-/// like a `cratonvm` array object (32-byte header, length at +12, data
-/// at +32). Kept alive by holding the backing `Vec`.
+/// like a `cratonvm` array object, using the *real* `HEADER_SIZE` and
+/// `ARRAY_LENGTH_OFFSET` so the fixture can never drift from the layout the
+/// JIT under test emits. Kept alive by holding the backing `Vec`.
 struct FakeArray {
     buf: Vec<u8>,
 }
@@ -629,5 +639,193 @@ fn test_arrays_equals_null_semantics() {
         },
         1,
         "equals(arr, arr) must be true (same reference)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Layout-drift tripwires (arch-2026-07-26 `layout-constant-hazards`)
+// ---------------------------------------------------------------------------
+
+/// `FakeArray` hand-builds an object header, so it is sound only while the
+/// assumptions baked into `FakeArray::new` still hold for the *real* constants.
+///
+/// This file used to restate `HEADER_SIZE = 32` and `ARRAY_LENGTH_OFFSET = 12`
+/// as local `const`s, which made it the workspace's one unsound layout site: a
+/// layout change does not trip an assertion here, it makes the fixture allocate
+/// and index at the old offsets while the JIT under test emits the new ones, so
+/// `set_len` and the element reads run off the end of the backing `Vec`. Both
+/// constants are now imported; this test pins what the fixture still assumes,
+/// so a divergence fails loudly instead of corrupting memory.
+#[test]
+fn fake_array_layout_assumptions_hold_for_the_real_constants() {
+    assert_eq!(
+        HEADER_SIZE,
+        std::mem::size_of::<cratonvm_types::ObjectHeader>(),
+        "the fixture allocates HEADER_SIZE bytes of header; it must be the whole \
+         header the JIT addresses past"
+    );
+    assert_eq!(
+        HEADER_SIZE % 8,
+        0,
+        "FakeArray::base hands out an 8-aligned pointer and FakeArray::data adds \
+         HEADER_SIZE to it, so the element data must stay 8-aligned"
+    );
+    assert!(
+        ARRAY_LENGTH_OFFSET + 4 <= HEADER_SIZE,
+        "the i32 length field must live inside the header the fixture allocates"
+    );
+    assert!(
+        HEADER_SIZE <= 127,
+        "the intrinsics address elements as [base + index*scale + HEADER_SIZE] \
+         with a signed disp8; past 127 the emitted displacement goes negative"
+    );
+    assert!(
+        ARRAY_LENGTH_OFFSET <= 127,
+        "the bounds check loads the length with a signed disp8 displacement"
+    );
+
+    // The fixture over-allocates by 8 so it can hand out an 8-aligned start.
+    // That slack must still cover the worst-case realignment shift for a header
+    // of whatever size the constants now describe.
+    let fa = FakeArray::new(4, 8);
+    let buf_start = fa.buf.as_ptr() as usize;
+    let buf_end = buf_start + fa.buf.len();
+    let base = fa.base() as usize;
+    assert!(
+        base >= buf_start && base + HEADER_SIZE + 4 * 8 <= buf_end,
+        "FakeArray::new under-allocated: the object spans +{}..+{} of a {}-byte \
+         buffer",
+        base - buf_start,
+        base - buf_start + HEADER_SIZE + 32,
+        fa.buf.len()
+    );
+    assert_eq!(
+        fa.base() as usize % 8,
+        0,
+        "the fixture base must be 8-aligned"
+    );
+}
+
+/// **No integration test may restate an object-layout constant.**
+///
+/// A local `const HEADER_SIZE: usize = 32;` in a test keeps compiling after the
+/// real constant moves, and then lays fixtures out at the stale offset. That is
+/// an out-of-bounds access, not a failed assertion — the one failure mode a
+/// layout change does not announce. This walks every `.rs` file under a
+/// `tests/` directory in the workspace and rejects any definition of a name
+/// `cratonvm_types` owns.
+///
+/// Scoped to `tests/` trees on purpose: `HEADER_SIZE` is also a legitimate and
+/// entirely unrelated name in production code — `jfr/src/dump.rs` (JFR chunk
+/// header, 72), `reader/src/jimage.rs` (jimage file header, 28) and
+/// `vm/src/debug/protocol.rs` (debug wire header, 11). None of those describe
+/// the object header, and none of them lay out heap fixtures.
+#[test]
+fn no_test_file_restates_an_object_layout_constant() {
+    const OWNED_BY_TYPES: [&str; 16] = [
+        "HEADER_SIZE",
+        "MARK_WORD_OFFSET",
+        "ARRAY_LENGTH_OFFSET",
+        "ARRAY_ELEMENT_TYPE_OFFSET",
+        "OBJECT_KIND_OFFSET",
+        "NUM_SLOTS_OFFSET",
+        "GC_AGE_OFFSET",
+        "GC_FLAGS_OFFSET",
+        "FORWARDING_PTR_OFFSET",
+        "IDENTITY_HASH_CODE_OFFSET",
+        "SLOT_SIZE",
+        "REF_ELEMENT_SIZE",
+        "REF_FIELD_SIZE",
+        "FIELD_CELL_TAG_OFFSET",
+        "FIELD_CELL_PAYLOAD32_OFFSET",
+        "FIELD_CELL_PAYLOAD64_OFFSET",
+    ];
+
+    let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("the jit crate sits one level under the workspace root")
+        .to_path_buf();
+    assert!(
+        workspace.join("Cargo.toml").is_file(),
+        "expected the workspace manifest at {}; without it the walk below would \
+         silently scan nothing and pass vacuously",
+        workspace.display()
+    );
+
+    let mut offenders: Vec<String> = Vec::new();
+    let mut scanned = 0usize;
+    let mut saw_self = false;
+    let mut stack = vec![workspace.clone()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if path.is_dir() {
+                // `target/` is build output. Hidden directories hold git data
+                // and nested agent worktrees; walking those would scan other
+                // checkouts of this same repository.
+                if name != "target" && !name.starts_with('.') {
+                    stack.push(path);
+                }
+                continue;
+            }
+            if !name.ends_with(".rs") {
+                continue;
+            }
+            let in_tests_tree = path
+                .strip_prefix(&workspace)
+                .map(|rel| rel.components().any(|c| c.as_os_str() == "tests"))
+                .unwrap_or(false);
+            if !in_tests_tree {
+                continue;
+            }
+            let Ok(src) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            scanned += 1;
+            saw_self |= name == "intrinsic_arrays_ops.rs";
+            for (lineno, line) in src.lines().enumerate() {
+                let trimmed = line.trim_start();
+                let Some(rest) = trimmed
+                    .strip_prefix("pub const ")
+                    .or_else(|| trimmed.strip_prefix("const "))
+                    .or_else(|| trimmed.strip_prefix("pub static "))
+                    .or_else(|| trimmed.strip_prefix("static "))
+                else {
+                    continue;
+                };
+                let ident: String = rest
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    .collect();
+                if OWNED_BY_TYPES.contains(&ident.as_str()) {
+                    offenders.push(format!(
+                        "{}:{}: {}",
+                        path.display(),
+                        lineno + 1,
+                        trimmed.trim_end()
+                    ));
+                }
+            }
+        }
+    }
+
+    assert!(
+        scanned > 0 && saw_self,
+        "the walk found {scanned} test sources under {} and {} reach this file; \
+         it is checking nothing",
+        workspace.display(),
+        if saw_self { "did" } else { "did not" }
+    );
+    assert!(
+        offenders.is_empty(),
+        "test files must import object-layout constants from `cratonvm_types`, \
+         never restate them: a stale local copy keeps compiling, lays fixtures \
+         out at the old offsets and reads out of bounds instead of failing an \
+         assertion.\n{}",
+        offenders.join("\n")
     );
 }
