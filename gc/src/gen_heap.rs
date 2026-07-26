@@ -559,6 +559,17 @@ pub fn jit_region_bounds_addr() -> usize {
     &JIT_REGION_BOUNDS as *const _ as usize
 }
 
+/// How many identity hash codes a thread claims per global `fetch_add`.
+/// See [`GenerationalHeap::next_hash`] for the trade-off this number sets.
+const IDENTITY_HASH_BLOCK: i32 = 64;
+
+thread_local! {
+    /// `(next value to serve, values left in this thread's block)`.
+    /// `(0, 0)` forces the first call on a thread to claim a block.
+    static IDENTITY_HASH_CURSOR: std::cell::Cell<(i32, i32)> =
+        const { std::cell::Cell::new((0, 0)) };
+}
+
 /// Does `addr` fall inside either published YOUNG semispace `[base, end)`?
 ///
 /// A *containment* test, deliberately not an object-header validation: it is
@@ -8729,8 +8740,63 @@ impl GenerationalHeap {
     /// of `ClassId(0)` (java/lang/Object) with no fields produce an
     /// all-zero header that the stale-pointer detector mis-flags as
     /// stale.
+    ///
+    /// # Why this hands out per-thread BLOCKS
+    ///
+    /// This is on the *interpreted allocation* path — every `new` calls it
+    /// once. A process-shared atomic read-modify-write there costs a cache-line
+    /// ping-pong per allocation under any concurrency, and it is one of three
+    /// such counters on a path whose HotSpot equivalent is roughly five
+    /// instructions end to end. Claiming [`IDENTITY_HASH_BLOCK`] values with a
+    /// single `fetch_add` and serving the rest from a thread-local cursor
+    /// removes 63 of every 64 RMWs; the remaining cost is one `Cell` read, a
+    /// compare and a `Cell` write.
+    ///
+    /// What the callers actually require of this value, and what still holds:
+    ///
+    /// * **Non-zero.** `0` means "no hash minted yet" to the stale-pointer
+    ///   detector and to `identity_hash_code`'s CAS-from-zero. The counter is
+    ///   an `i32` and wraps, so the one value that would ever be `0` is stepped
+    ///   over explicitly below (`mint_identity_hash_code` also maps a `0` to
+    ///   `i32::MAX` — belt and braces, kept).
+    /// * **Distinct per object, in practice.** Blocks are disjoint by
+    ///   construction, so two threads can never serve the same value.
+    /// * **Increasing within one thread.** Preserved: a thread's cursor only
+    ///   ever moves forward, and a new block starts above every block handed
+    ///   out so far. Cross-thread ordering was never guaranteed by the old
+    ///   `fetch_add` either — two threads racing it observed no defined order.
+    ///
+    /// Waste is bounded by `IDENTITY_HASH_BLOCK` values per thread that ever
+    /// allocates, i.e. `2^31 / 64` ≈ 33 million threads before the space is
+    /// exhausted any faster than it already was.
+    ///
+    /// The cursor is per-*thread*, not per-heap: a process with two
+    /// `GenerationalHeap`s (unit tests, embedders) can serve one heap's `new`
+    /// from a block claimed against the other. That is harmless — the value's
+    /// only contracts are the three above — but it is why this must not be
+    /// used as a per-heap allocation counter.
     pub fn next_hash(&self) -> i32 {
-        self.next_hash_code.fetch_add(1, Ordering::Relaxed)
+        IDENTITY_HASH_CURSOR.with(|c| {
+            let (next, remaining) = c.get();
+            let (mut value, mut left) = if remaining > 0 {
+                (next, remaining)
+            } else {
+                (
+                    self.next_hash_code
+                        .fetch_add(IDENTITY_HASH_BLOCK, Ordering::Relaxed),
+                    IDENTITY_HASH_BLOCK,
+                )
+            };
+            if value == 0 {
+                // Step over the reserved sentinel rather than returning it.
+                // `left` may go to 0 (or below) here; the `remaining > 0` test
+                // above simply claims a fresh block on the next call.
+                value = 1;
+                left -= 1;
+            }
+            c.set((value.wrapping_add(1), left - 1));
+            value
+        })
     }
 
     /// Forward (copy or promote) a single object from young from-space.
@@ -11982,6 +12048,58 @@ mod tests {
     /// direction — live JIT frame, moving-young on, coverage proven, collector
     /// actually copies — is
     /// `moving_young_copies_with_live_jit_frame_and_proven_coverage` below.
+    /// Per-thread identity-hash blocks must not weaken any of the three
+    /// contracts `next_hash` actually has: non-zero, distinct, and increasing
+    /// within one thread — including across a block refill, which is the only
+    /// point the new code can go wrong.
+    #[test]
+    fn identity_hash_blocks_stay_nonzero_distinct_and_increasing() {
+        let heap = small_gen_heap();
+        // More than two blocks, so at least two refills are exercised.
+        let n = (IDENTITY_HASH_BLOCK as usize) * 2 + 5;
+        let mut seen = std::collections::HashSet::new();
+        let mut prev = i32::MIN;
+        for _ in 0..n {
+            let h = heap.next_hash();
+            assert_ne!(h, 0, "0 is the reserved 'no hash minted' sentinel");
+            assert!(
+                seen.insert(h),
+                "identity hashes served to one thread must not repeat ({h})",
+            );
+            assert!(
+                h > prev,
+                "a thread's hashes must increase, including across a block \
+                 refill (got {h} after {prev})",
+            );
+            prev = h;
+        }
+        assert_eq!(seen.len(), n);
+    }
+
+    /// Two threads must never be served the same value: blocks are disjoint by
+    /// construction, and that is the whole reason a block scheme is safe here.
+    #[test]
+    fn identity_hash_blocks_are_disjoint_across_threads() {
+        let heap = std::sync::Arc::new(small_gen_heap());
+        let n = (IDENTITY_HASH_BLOCK as usize) * 3;
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let heap = std::sync::Arc::clone(&heap);
+            handles.push(std::thread::spawn(move || {
+                (0..n).map(|_| heap.next_hash()).collect::<Vec<i32>>()
+            }));
+        }
+        let mut all = std::collections::HashSet::new();
+        let mut total = 0usize;
+        for h in handles {
+            for v in h.join().expect("hash worker must not panic") {
+                total += 1;
+                assert!(all.insert(v), "value {v} served to two threads");
+            }
+        }
+        assert_eq!(all.len(), total);
+    }
+
     #[test]
     fn non_moving_sweep_when_jit_active() {
         let heap = small_gen_heap();
