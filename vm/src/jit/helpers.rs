@@ -4200,15 +4200,47 @@ unsafe fn jit_typecheck_resolve(
     // in place, the cast succeeds and the array round-trips correctly.
     if vm.mem.heap.kind_of(*obj_ref) == cratonvm_types::ObjectKind::Array {
         if let Some(src_desc) = crate::runtime::interpreter::array_descriptor_of(vm, *obj_ref) {
-            let assignable = if lenient {
+            // AUTHORITATIVE for an array receiver — do NOT fall through on a
+            // negative answer.
+            //
+            // BUG-JIT-ARRAY-INSTANCEOF-20260726: this used to `return true`
+            // only on success and otherwise drop into the class-hierarchy path
+            // below, which compares `obj_class_id` against the target. For a
+            // reference array `obj_class_id` is the header's *component* class
+            // id (see the paragraph above), so `String[]` arrived at
+            // `obj_class_id == target_class_id` with both sides equal to
+            // `java/lang/String` and `instanceof` answered **true** for
+            // `String[] instanceof String`. Same for `Integer[] instanceof
+            // Integer`, and `is_subclass_of` extended it to interfaces, so
+            // `String[] instanceof CharSequence` was true as well. Every one of
+            // those is false in the interpreter, whose `Checkcast`/`InstanceOf`
+            // handlers dispatch on array-ness and never reach a hierarchy
+            // comparison — which is why this only reproduced JIT-on, and only
+            // after warm-up.
+            //
+            // H2's `ObjectDataType.getTypeId` is a 15-arm `instanceof` ladder
+            // over `Object`; once compiled it classified a `String[]` as
+            // `TYPE_STRING`, so `StringType`'s generic bridge ran `checkcast
+            // java/lang/String` on the array and `TestObjectDataType` died with
+            // `ClassCastException: java.lang.String cannot be cast to
+            // java.lang.String` (the message renders an array receiver by its
+            // component name — a separate cosmetic defect that made this look
+            // like a class-identity split for far longer than it should have).
+            //
+            // `array_is_assignable_to_impl` is complete for an array source: it
+            // handles `Object`/`Serializable`/`Cloneable`, rejects every
+            // non-array target, recurses on components, and implements the
+            // `lenient` native-`Object[]`→`T[]` carve-out itself. The
+            // hierarchy path below can only add the component-id collapse, so
+            // there is nothing to fall through FOR.
+            return if lenient {
                 crate::runtime::interpreter::array_is_assignable_to(vm, &src_desc, class_name)
             } else {
                 crate::runtime::interpreter::array_is_instance_of(vm, &src_desc, class_name)
             };
-            if assignable {
-                return true;
-            }
         }
+        // No descriptor (a synthetic/incomplete array header): keep the
+        // historical best-effort fall-through rather than hard-failing.
     }
 
     // Fast path: target already loaded. Most call sites hit this.
