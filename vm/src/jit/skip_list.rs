@@ -1187,6 +1187,45 @@ fn should_skip_jit_internal(
             });
         }
 
+        // TOMCAT-KEYEDLOCK-COMPUTE.1 (2026-07-26) -- an undiscovered JIT
+        // miscompile in `KeyedReentrantReadWriteLock$LockImpl.lambda$lock$0`
+        // (the ternary-with-allocation `BiFunction` passed to
+        // `Map.compute`: `(k, v) -> v == null ? new CountedLock() : v`).
+        // Real Tomcat repro: `TestCompiler`/`TestFormAuthenticatorA` under
+        // JIT throw `NullPointerException: Cannot read field "count"` from
+        // `KeyedReentrantReadWriteLock$LockImpl.lock` -- i.e.
+        // `locksMap.compute(key, ...)` itself returns null even though the
+        // BiFunction can never return null. Minimal 25-line standalone
+        // repro (`ComputeInitProbe.java`: a `ConcurrentHashMap<String,
+        // Counted>` where `Counted` has one `AtomicInteger` field, called
+        // via `map.compute(key, (k, v) -> v == null ? new Counted() : v)`
+        // in a loop) reproduces deterministically at iteration 0 -- no
+        // warmup needed. Confirmed JIT-only: identical repro under
+        // `--nojit` is 500000/500000 clean. Bisected with
+        // `CRATONVM_JIT_DENY`/`CRATONVM_JIT_BISECT_SKIP` (no rebuild): the
+        // caller (`main`) and the constructed class's own `<init>` are each
+        // individually NOT the culprit (forcing either alone to interpret
+        // does not fix it); forcing just the lambda body
+        // (`ComputeInitProbe.lambda$main$0`) to interpret fixes it
+        // completely. The bug is therefore in how the JIT compiles a
+        // lambda body shaped like `v == null ? new X() : v` (branch,
+        // allocate-and-construct on one arm, pass through an existing
+        // reference on the other, merge, return) -- plausibly the same
+        // callee-saved-clobber archetype as
+        // `docs/internal/fixed-suite-bugs/jit-regalloc-callee-saved-clobber-family.md`,
+        // but this exact shape (a lambda, not a named user method) was not
+        // covered by that family's fix or its targeted list. Verified fix:
+        // `TestFormAuthenticatorA` no longer hits this NPE with this lambda
+        // pinned (a second, independent JIT bug in
+        // `org/apache/catalina/webresources/` remains open for that test,
+        // tracked separately). Keep this one lambda interpreted until the
+        // ternary-with-allocation lowering bug is found generically.
+        if class_name == "org/apache/tomcat/util/concurrent/KeyedReentrantReadWriteLock$LockImpl"
+            && method_name == "lambda$lock$0"
+        {
+            return Some(SkipReason::RustJvmTestFixture);
+        }
+
         // ALV5th (2026-07-10) -- ConcurrentLinkedQueue is the same
         // allocate-then-CAS hazard as the AQS family above: offer() does
         // `Node<E> newNode = new Node<E>(e);` then CASes it onto the tail
@@ -4958,6 +4997,22 @@ mod tests {
                 "$ProxyN classes must be JIT-eligible now that PROXY-JITCALL.1 is removed",
             );
         }
+    }
+
+    #[test]
+    fn tomcat_keyedlock_compute_lambda_stays_skipped_under_conservative() {
+        assert_eq!(
+            check(
+                "org/apache/tomcat/util/concurrent/KeyedReentrantReadWriteLock$LockImpl",
+                "lambda$lock$0",
+                false,
+                true,
+                SkipPolicy::Conservative,
+            ),
+            Some(SkipReason::RustJvmTestFixture),
+            "KeyedReentrantReadWriteLock$LockImpl.lambda$lock$0 must stay skipped \
+             under Conservative",
+        );
     }
 
     #[test]
