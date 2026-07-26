@@ -258,9 +258,10 @@ pub enum DigestAlg {
 ///
 /// # Trust-store mode for legacy unit tests
 ///
-/// Pass [`TrustStore::permissive_legacy_tests`] to skip the chain step
-/// entirely — used by the pre-task-#40 self-consistency tests below that
-/// embed non-X.509-shaped marker certs.  Production code paths must
+/// `TrustStore::permissive_legacy_tests` skips the chain step entirely —
+/// used by the pre-task-#40 self-consistency tests below that embed
+/// non-X.509-shaped marker certs.  It is `#[cfg(test)]`, so a production
+/// build has no way to construct a permissive store; production code paths
 /// supply a real trust store via [`TrustStore::load_default`].
 ///
 /// # Cryptographic coverage
@@ -1793,9 +1794,9 @@ pub const MAX_TRUST_ANCHORS: usize = 4096;
 ///    TrustedCertEntry becomes a trust anchor.
 ///
 /// An empty trust store rejects every chain with
-/// [`TrustError::NoTrustAnchor`].  Use
-/// [`TrustStore::permissive_legacy_tests`] only for the pre-task-#40
-/// self-consistency fixtures in this file.
+/// [`TrustError::NoTrustAnchor`].  `TrustStore::permissive_legacy_tests`
+/// (`#[cfg(test)]`) exists only for the pre-task-#40 self-consistency
+/// fixtures in this file.
 #[derive(Debug, Default, Clone)]
 pub struct TrustStore {
     anchors: Vec<X509Anchor>,
@@ -1824,6 +1825,23 @@ impl TrustStore {
 
     /// Construct a trust store that skips the chain step in
     /// [`verify_signer_block`].  **Tests only.**
+    ///
+    /// # Why this is `#[cfg(test)]`
+    ///
+    /// The `permissive_legacy` flag disables *two* independent checks at
+    /// once: the SignerInfo public-key signature (`let enforce_pubkey =
+    /// !trust_store.permissive_legacy`) and the whole chain walk.  A
+    /// `TrustStore` built by this constructor therefore accepts any signer
+    /// block whose `.SF` digest is self-consistent — no signature math, no
+    /// trust anchor, no expiry.  As a plain `pub fn` it was a live
+    /// fail-open switch reachable from every crate that depends on
+    /// `cratonvm_classloading`, one call site away from silently turning
+    /// JAR signature verification off in production.  Gating the
+    /// *constructor* (not the flag, which the two branches still read)
+    /// means a non-test build simply has no way to produce a permissive
+    /// store: `TrustStore::default()` / `empty()` / `load_default()` all
+    /// leave `permissive_legacy == false`.
+    #[cfg(test)]
     pub fn permissive_legacy_tests() -> Self {
         let mut t = Self::default();
         t.permissive_legacy = true;
@@ -3175,6 +3193,33 @@ mod tests {
     /// store to keep covering the pre-chain code paths.
     fn legacy_ts() -> TrustStore {
         TrustStore::permissive_legacy_tests()
+    }
+
+    /// The `permissive_legacy` flag switches off BOTH the SignerInfo
+    /// public-key check and the chain walk. Every constructor that a
+    /// production build can reach must leave it `false` — the only one that
+    /// sets it is `permissive_legacy_tests`, which is `#[cfg(test)]` and so
+    /// does not exist outside this configuration.
+    ///
+    /// If a new non-test constructor ever sets the flag, this test fails and
+    /// the regression is caught before it becomes a silent "signature
+    /// verification is off in release" bug.
+    #[test]
+    fn production_trust_store_constructors_are_never_permissive() {
+        assert!(
+            !TrustStore::default().permissive_legacy,
+            "TrustStore::default() must enforce the pubkey + chain checks"
+        );
+        assert!(
+            !TrustStore::empty().permissive_legacy,
+            "TrustStore::empty() must enforce the pubkey + chain checks"
+        );
+        // An empty store is not "permissive" — it is maximally strict: with
+        // no anchors, `verify_chain` bottoms out in NoTrustAnchor.
+        assert_eq!(TrustStore::empty().anchor_count(), 0);
+        // And the test-only escape hatch really does flip it, so the two
+        // assertions above are not vacuous.
+        assert!(TrustStore::permissive_legacy_tests().permissive_legacy);
     }
 
     fn enc_len(len: usize) -> Vec<u8> {

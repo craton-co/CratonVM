@@ -34,6 +34,77 @@
 //! `skip_verification: false` (WP2.5-v3 item 4 — verified by the
 //! `emitted_class_is_straight_line_no_handlers` regression test).
 //!
+//! # Nest host, access flags and module of a generated class
+//!
+//! Recorded here because JVMS §5.4.4 member access checks are being wired
+//! into the interpreter for the first time (see the STATUS block in
+//! `access_control.rs`), and everything this emitter mints is about to start
+//! being checked. Audited 2026-07-26.
+//!
+//! **These are ordinary classes, not hidden classes.** They go through
+//! `NativeContext::define_class_full` →
+//! `ClassManager::define_class_with_options` with `skip_verification: false`,
+//! so full Pass 2/3 verification runs and the class gets normal type maps —
+//! the trusted-hidden-class escape hatch is *not* taken. `hidden` is false.
+//!
+//! **Name / package.** `build_proxy_spec_for` picks
+//! `jdk/proxy<M>/$Proxy<N>` when every proxied interface is public, and
+//! `<iface-package>/$Proxy<N>` when any is not (matching the JDK, and
+//! deliberately avoiding the `java/`/`sun/` "Prohibited package name"
+//! rejection).
+//!
+//! **Nest.** The class `attributes[]` table emitted below is *empty*: no
+//! `NestHost`, no `NestMembers`, no `InnerClasses`. `confirmed_nest_host`
+//! maps `nest_host: None` to the class's own name, so a `$ProxyN` is its own
+//! nest host and is a nestmate of nothing else. That is the correct and safe
+//! answer, because no emitted body touches another class's `private` member:
+//! the only private members involved are its own `m_<i>` static fields
+//! (same-class access), and every off-class target is public — `Class
+//! .getMethod`, `<Wrapper>.valueOf` / `.TYPE` / `.<prim>Value`. Proxies do
+//! **not** have the lambda-body problem where a runtime-generated class can
+//! never appear in a host's `NestMembers`.
+//!
+//! **The one thing to check before wiring member access.** Every emitted
+//! method body ends in `INVOKESTATIC java/lang/reflect/Proxy$Dispatch
+//! .invokeProxy`, and `java/lang/reflect/Proxy$Dispatch` **is never defined
+//! as a class**. It exists only as an owner-name key in the native registry
+//! (`register_reflect_proxy_natives`); nothing calls
+//! `ensure_synthetic_class` for it, so `get_loaded_class_id` returns `None`.
+//! A member-access check that resolves the methodref's owner `Class` before
+//! checking will not find one. Today `check_module_access_by_id` fails open
+//! on exactly that (`interpreter.rs:41800` guards on `get_loaded_class_id`);
+//! a stricter wiring that instead *loads* the owner turns every dynamic-proxy
+//! call in the VM into `NoClassDefFoundError`. The super
+//! `java/lang/reflect/Proxy$Instance` is by contrast a real (synthetic-stub)
+//! class: `ACC_PUBLIC | ACC_SUPER`, with its `<init>` declared
+//! `PUBLIC | NATIVE`, so the `INVOKESPECIAL` in the generated constructor is
+//! accessible cross-package. Under the `proxy_super_class_name()` gate that
+//! super becomes the *real* `java.lang.reflect.Proxy`, whose constructor is
+//! `protected` — that call then depends on the subclass clause of §5.4.4 and
+//! on `receiver_ok_for_protected` not being satisfied vacuously by
+//! `receiver: None`.
+//!
+//! **Module.** `module_name` is assigned by `define_class_shared_with_options`
+//! from `ModuleRegistry::module_for_package`. No module owns `jdk/proxyN`, so
+//! the common case is the unnamed module and every JPMS check short-circuits
+//! to allow. In the non-public-interface case the proxy lands in the
+//! interface's package and inherits whatever module owns it.
+//!
+//! **Known deviation — class access flags.** `access_flags` below is
+//! unconditionally `ACC_PUBLIC | ACC_FINAL | ACC_SUPER | ACC_SYNTHETIC`. The
+//! JDK's `ProxyBuilder` emits `ACC_FINAL | ACC_SUPER` (i.e. *package-private*)
+//! whenever any proxied interface is non-public. CratonVM therefore publishes
+//! a proxy of a package-private interface as a public class in that
+//! interface's package, and `Modifier.isPublic(proxyClass.getModifiers())`
+//! answers `true` where the JDK answers `false` (Spring's `ClassUtils`
+//! visibility helpers and Mockito's mock-visibility logic both read that).
+//! Fixing it needs the publicness of the interface set, which this emitter is
+//! not given: `ProxyClassSpec` carries interface *names* only. The fix is a
+//! new `ProxyClassSpec` field set by `native_builtins::build_proxy_spec_for`
+//! — which already computes exactly this predicate for the package choice
+//! (`non_public_pkg`) — and a two-line change here. It is a cross-file change
+//! and is left to the owner of `native-builtins`.
+//!
 //! # v3 closure (items 3, 4, 6 landed)
 //!
 //! - **Static `Method[]` slots (item 3 — DONE).** Each generated class
@@ -152,21 +223,79 @@ fn invalid_proxy_classfile(class_name: &str, message: impl Into<String>) -> Clas
 
 /// Emit a JVM classfile for the given proxy spec.
 pub fn emit_proxy_classfile(spec: &ProxyClassSpec) -> Result<Vec<u8>, ClassFileError> {
-    if spec.interfaces.len() > u16::MAX as usize {
+    // ── Structural de-duplication (JVMS §4.1 / §4.6) ─────────────────────
+    //
+    // Two classfile invariants the emitter is responsible for, because a
+    // violation of either produces a `ClassFormatError`-shaped class that
+    // no amount of correct method-body emission can rescue:
+    //
+    //   §4.1  "No two entries in the `interfaces` array may be the same
+    //          class or interface."
+    //   §4.6  "No two methods in one `class` file may have the same name
+    //          and descriptor."
+    //
+    // The interfaces one is *reachable from user code*. `ProxyClassSpec`
+    // carries interface **names**, but its producer
+    // (`native_builtins::build_proxy_spec_for`) derives them from a list of
+    // `ClassId`s that is deduplicated **by ClassId**. Two distinct ClassIds
+    // can share a name — that is the whole point of loader-based class
+    // identity, and this VM hits it routinely (see
+    // `force_loader_faithful_linking` in `define_or_get_proxy_class`). So
+    //
+    //     Proxy.newProxyInstance(l, new Class[]{ ifaceFromLoaderA,
+    //                                            ifaceFromLoaderB }, h)
+    //
+    // where both classes are named `com/foo/Bar` survives the ClassId dedup
+    // and arrives here as `interfaces: ["com/foo/Bar", "com/foo/Bar"]`.
+    // `CpBuilder::add_class` dedups, so the emitted `interfaces[]` was two
+    // *byte-identical* u2 entries — exactly the §4.1 violation. HotSpot
+    // rejects such a classfile outright.
+    //
+    // Both are collapsed here rather than reported as errors: at the
+    // classfile level a repeated interface name is indistinguishable from a
+    // single one, and a repeated (name, descriptor) would produce two
+    // identical dispatch shims. The *policy* question — the JDK's
+    // `Proxy.newProxyInstance` throws `IllegalArgumentException("repeated
+    // interface")` — belongs to the caller, which alone can tell "same name,
+    // two loaders" from "same class twice".
+    //
+    // The dedup must happen BEFORE `m_field_refs` / `m_field_meta` are
+    // allocated: `emit_proxy_method` indexes them positionally, so the
+    // fields[], the `<clinit>` PUTSTATIC targets and the method bodies all
+    // have to agree on one method list.
+    let mut seen_iface: Vec<&str> = Vec::with_capacity(spec.interfaces.len());
+    for name in &spec.interfaces {
+        if !seen_iface.iter().any(|s| *s == name.as_str()) {
+            seen_iface.push(name.as_str());
+        }
+    }
+    let interfaces = seen_iface;
+
+    let mut methods: Vec<&ProxyMethod> = Vec::with_capacity(spec.methods.len());
+    for m in &spec.methods {
+        if !methods
+            .iter()
+            .any(|p| p.name == m.name && p.descriptor == m.descriptor)
+        {
+            methods.push(m);
+        }
+    }
+
+    if interfaces.len() > u16::MAX as usize {
         return Err(invalid_proxy_classfile(
             &spec.gen_class_name,
             format!(
                 "proxy implements {} interfaces, exceeding the classfile u2 limit",
-                spec.interfaces.len()
+                interfaces.len()
             ),
         ));
     }
-    if spec.methods.len() > (u16::MAX as usize).saturating_sub(3) {
+    if methods.len() > (u16::MAX as usize).saturating_sub(3) {
         return Err(invalid_proxy_classfile(
             &spec.gen_class_name,
             format!(
                 "proxy declares {} methods, exceeding the classfile methods_count limit",
-                spec.methods.len().saturating_add(3)
+                methods.len().saturating_add(3)
             ),
         ));
     }
@@ -176,7 +305,7 @@ pub fn emit_proxy_classfile(spec: &ProxyClassSpec) -> Result<Vec<u8>, ClassFileE
     // Resolve all class/method/string CP indices we'll need up-front.
     let this_class_idx = cp.add_class(&spec.gen_class_name);
     let super_class_idx = cp.add_class(&spec.super_class);
-    let iface_idxs: Vec<u16> = spec.interfaces.iter().map(|i| cp.add_class(i)).collect();
+    let iface_idxs: Vec<u16> = interfaces.iter().map(|i| cp.add_class(i)).collect();
     let code_attr_name_idx = cp.add_utf8("Code");
 
     // Constructor descriptor and CP refs for super.<init>.
@@ -213,14 +342,14 @@ pub fn emit_proxy_classfile(spec: &ProxyClassSpec) -> Result<Vec<u8>, ClassFileE
     // them via PUTSTATIC. Resolving them up-front keeps the slot indices
     // stable across both emission passes.
     let method_field_desc = "Ljava/lang/reflect/Method;";
-    let m_field_refs: Vec<u16> = (0..spec.methods.len())
+    let m_field_refs: Vec<u16> = (0..methods.len())
         .map(|i| cp.add_fieldref(&spec.gen_class_name, &format!("m_{i}"), method_field_desc))
         .collect();
     // Capture the (name_utf8, desc_utf8) pairs explicitly for the
     // fields[] section below — fieldref allocation guarantees the
     // matching Utf8 already exists in the CP, but we want the indices
     // for the field_info entries.
-    let m_field_meta: Vec<(u16, u16)> = (0..spec.methods.len())
+    let m_field_meta: Vec<(u16, u16)> = (0..methods.len())
         .map(|i| {
             (
                 cp.add_utf8(&format!("m_{i}")),
@@ -230,7 +359,7 @@ pub fn emit_proxy_classfile(spec: &ProxyClassSpec) -> Result<Vec<u8>, ClassFileE
         .collect();
 
     // Emit method blobs.
-    let mut method_blobs: Vec<Vec<u8>> = Vec::with_capacity(spec.methods.len() + 2);
+    let mut method_blobs: Vec<Vec<u8>> = Vec::with_capacity(methods.len() + 3);
 
     // 1) Constructor `<init>` — pure super-delegate. `real_super` selects the
     //    1-arg (real `Proxy`) vs 2-arg (synthetic `Proxy$Instance`) shape.
@@ -265,14 +394,14 @@ pub fn emit_proxy_classfile(spec: &ProxyClassSpec) -> Result<Vec<u8>, ClassFileE
 
     // 2) `<clinit>` — populate every `m_<i>` static slot.
     method_blobs.push(emit_clinit(
-        spec,
+        &methods,
         &mut cp,
         code_attr_name_idx,
         &m_field_refs,
     )?);
 
     // 3) One body per declared method.
-    for (i, m) in spec.methods.iter().enumerate() {
+    for (i, m) in methods.iter().enumerate() {
         method_blobs.push(emit_proxy_method(
             &mut cp,
             m,
@@ -318,7 +447,7 @@ pub fn emit_proxy_classfile(spec: &ProxyClassSpec) -> Result<Vec<u8>, ClassFileE
     // (`final` matches JDK ProxyGenerator; `<clinit>` may still write
     // it because PUTSTATIC of a final field is permitted in <clinit>
     // per JVMS §4.9.2 / §5.4.3.2.)
-    out.extend_from_slice(&(spec.methods.len() as u16).to_be_bytes());
+    out.extend_from_slice(&(methods.len() as u16).to_be_bytes());
     for (name_idx, desc_idx) in &m_field_meta {
         let field_flags: u16 = 0x0002 | 0x0008 | 0x0010 | 0x1000;
         out.extend_from_slice(&field_flags.to_be_bytes());
@@ -1250,8 +1379,12 @@ fn emit_proxy_method(
 /// Straight-line — no branches, no exception handlers, so no
 /// `StackMapTable` is required by JVMS §4.10.1. (Pass 3 type-checking
 /// accepts straight-line bodies without frames.)
+///
+/// `methods` is the **de-duplicated** method list built by
+/// `emit_proxy_classfile`; `m_field_refs[i]` must correspond to
+/// `methods[i]`, so both have to be derived from the same list.
 fn emit_clinit(
-    spec: &ProxyClassSpec,
+    methods: &[&ProxyMethod],
     cp: &mut CpBuilder,
     code_attr_name_idx: u16,
     m_field_refs: &[u16],
@@ -1267,7 +1400,7 @@ fn emit_clinit(
     let mut code = CodeBuilder::new();
     let mut max_stack: u16 = 0;
 
-    for (i, m) in spec.methods.iter().enumerate() {
+    for (i, m) in methods.iter().enumerate() {
         // 1) Push iface Class mirror via LDC class.
         let iface_class_idx = cp.add_class(&m.iface_owner);
         code.emit_ldc_w(iface_class_idx);
@@ -1632,6 +1765,137 @@ mod tests {
             .methods
             .iter()
             .any(|m| &*m.name == "get" && &*m.descriptor == "()Ljava/lang/Object;"));
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // JVMS §4.1 / §4.6 structural invariants
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// JVMS §4.1: "No two entries in the `interfaces` array may be the same
+    /// class or interface."
+    ///
+    /// Reachable repro: `build_proxy_spec_for` deduplicates the requested
+    /// interfaces **by `ClassId`**, and two distinct `ClassId`s can share a
+    /// name when the same interface is loaded by two different class loaders
+    /// — routine in this VM (`force_loader_faithful_linking` exists precisely
+    /// because of it). So
+    ///
+    /// ```java
+    /// Proxy.newProxyInstance(l, new Class[]{ barFromLoaderA, barFromLoaderB }, h)
+    /// ```
+    ///
+    /// arrived here as `interfaces: ["com/foo/Bar", "com/foo/Bar"]`. Because
+    /// `CpBuilder::add_class` dedups, the emitted `interfaces[]` held two
+    /// byte-identical u2 entries — a `ClassFormatError`-shaped classfile that
+    /// HotSpot rejects outright.
+    #[test]
+    fn duplicate_interface_names_are_collapsed_to_one_entry() {
+        let spec = ProxyClassSpec {
+            gen_class_name: "jdk/proxy1/$Proxy7".to_string(),
+            super_class: "java/lang/reflect/Proxy$Instance".to_string(),
+            interfaces: vec![
+                "java/lang/Runnable".to_string(),
+                "java/lang/Runnable".to_string(), // same name, other loader
+            ],
+            methods: vec![ProxyMethod {
+                name: "run".to_string(),
+                descriptor: "()V".to_string(),
+                is_default: false,
+                iface_owner: "java/lang/Runnable".to_string(),
+                param_class_names: vec![],
+                exception_types: vec![],
+            }],
+        };
+        let bytes = emit_proxy_classfile(&spec).expect("emitter must succeed");
+        let cf = read_class(&bytes).expect("class file must round-trip");
+
+        assert_eq!(
+            cf.interfaces.len(),
+            1,
+            "JVMS §4.1 forbids repeated entries in interfaces[]; got {:?}",
+            cf.interfaces.iter().map(|s| &**s).collect::<Vec<_>>()
+        );
+        assert_eq!(&*cf.interfaces[0], "java/lang/Runnable");
+    }
+
+    /// Interface **order** is load-bearing (Spring's
+    /// `AopProxyUtils.proxiedUserInterfaces` trims trailing infrastructure
+    /// interfaces off `getInterfaces()`), so the dedup must keep first
+    /// occurrences in place rather than sorting or keeping the last.
+    #[test]
+    fn interface_dedup_preserves_first_occurrence_order() {
+        let mut spec = supplier_spec();
+        spec.interfaces = vec![
+            "com/example/ITestBean".to_string(),
+            "org/springframework/aop/SpringProxy".to_string(),
+            "com/example/ITestBean".to_string(), // dup of [0]
+            "org/springframework/aop/framework/Advised".to_string(),
+        ];
+        let bytes = emit_proxy_classfile(&spec).expect("emitter must succeed");
+        let cf = read_class(&bytes).expect("class file must round-trip");
+        let names: Vec<&str> = cf.interfaces.iter().map(|s| &**s).collect();
+        assert_eq!(
+            names,
+            vec![
+                "com/example/ITestBean",
+                "org/springframework/aop/SpringProxy",
+                "org/springframework/aop/framework/Advised",
+            ]
+        );
+    }
+
+    /// JVMS §4.6: "No two methods in one `class` file may have the same name
+    /// and descriptor." A repeated `(name, descriptor)` also used to desync
+    /// the positional `m_<i>` bookkeeping's *intent* — two shims resolving
+    /// the same `Method` into two different static slots.
+    #[test]
+    fn duplicate_method_signatures_are_collapsed_to_one_method() {
+        let mut spec = supplier_spec();
+        let m = spec.methods[0].clone();
+        spec.methods = vec![m.clone(), m];
+        let bytes = emit_proxy_classfile(&spec).expect("emitter must succeed");
+        let cf = read_class(&bytes).expect("class file must round-trip");
+
+        let gets = cf
+            .methods
+            .iter()
+            .filter(|mm| &*mm.name == "get" && &*mm.descriptor == "()Ljava/lang/Object;")
+            .count();
+        assert_eq!(gets, 1, "JVMS §4.6 forbids duplicate name+descriptor pairs");
+    }
+
+    /// The `m_<i>` static `Method` slots, the `<clinit>` PUTSTATIC targets and
+    /// the per-method GETSTATIC references are all indexed positionally, so
+    /// they must be derived from the *same* de-duplicated method list. A
+    /// leftover `spec.methods.len()` anywhere would emit one more field than
+    /// there are methods (or leave `m_<n-1>` never written).
+    #[test]
+    fn field_count_matches_deduped_method_count() {
+        let mut spec = supplier_spec();
+        let get = spec.methods[0].clone();
+        let mut other = get.clone();
+        other.name = "getOther".to_string();
+        // 3 entries, 2 distinct signatures.
+        spec.methods = vec![get.clone(), other, get];
+
+        let bytes = emit_proxy_classfile(&spec).expect("emitter must succeed");
+        let cf = read_class(&bytes).expect("class file must round-trip");
+
+        let method_fields = cf
+            .fields
+            .iter()
+            .filter(|f| f.name.starts_with("m_"))
+            .count();
+        assert_eq!(method_fields, 2, "one Method slot per distinct signature");
+        assert!(
+            cf.fields.iter().any(|f| &*f.name == "m_0"),
+            "slots must be contiguous from 0"
+        );
+        assert!(cf.fields.iter().any(|f| &*f.name == "m_1"));
+        assert!(
+            !cf.fields.iter().any(|f| &*f.name == "m_2"),
+            "no slot may be allocated for the collapsed duplicate"
+        );
     }
 
     #[test]
