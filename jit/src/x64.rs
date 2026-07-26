@@ -41405,9 +41405,8 @@ mod flag_and_header_contracts {
     #[test]
     fn locals_past_the_bitset_never_receive_a_register_home() {
         let code: Vec<u8> = vec![0x04, 0xac];
-        let mut assignments = vec![None; 80];
-        // A local at index 70 cannot legally be register-homed; assert the
-        // allocator's own contract rather than trusting the plan to mask it.
+        // Assert the allocator's own contract rather than trusting the plan to
+        // mask the tail away: a local at index >= 64 must never be coloured.
         let alloc = crate::regalloc::allocate_registers(&code, code.len(), 80, 0, &[]);
         assert!(
             alloc.assignments.iter().skip(64).all(Option::is_none),
@@ -41415,10 +41414,15 @@ mod flag_and_header_contracts {
              SafepointPublishPlan's u64 masks silently stop covering the tail and \
              can_elide_self_call_register_spill's soundness argument breaks"
         );
-        // And the plan reports "no oop in registers" for an all-None assignment.
-        assignments[70] = None;
-        let plan =
-            crate::regalloc::plan_safepoint_publication(&code, code.len(), 80, 0, &assignments, 0);
+        // Feeding the allocator's own output back through the plan must agree.
+        let plan = crate::regalloc::plan_safepoint_publication(
+            &code,
+            code.len(),
+            80,
+            0,
+            &alloc.assignments,
+            0,
+        );
         assert!(plan.no_reference_in_registers());
     }
 
