@@ -795,34 +795,27 @@ fn should_skip_jit_internal(
         return Some(SkipReason::RustJvmTestFixture);
     }
 
-    // PROXY-JITCALL.1 — generated `$ProxyN` dynamic-proxy classes (any
-    // package — `define_or_get_proxy_class` places a package-private
-    // interface's proxy in the interface's OWN package, so this can't be a
-    // package-prefix check) SIGSEGV/hang when JIT-compiled together with
-    // methods on the OTHER side of the `Proxy$Dispatch.invokeProxy` call —
-    // e.g. Spring's `org/springframework/core/annotation/*` meta-annotation
+    // PROXY-JITCALL.1 — REMOVED 2026-07-26. Historically, generated
+    // `$ProxyN` dynamic-proxy classes SIGSEGV'd/hung when JIT-compiled
+    // together with methods on the OTHER side of the
+    // `Proxy$Dispatch.invokeProxy` call (e.g. Spring's meta-annotation
     // introspection calling `annotationType()`/`hashCode()`/`equals()`
     // repeatedly on many distinct `$ProxyN` receiver classes under
-    // `CRATONVM_REAL_ANNOTATIONS=1`. Confirmed via bisection
-    // (`CRATONVM_JIT_BISECT_ONLY`): `jdk/proxy` alone is clean, the Spring
-    // annotation package alone is clean, but JIT-compiling BOTH sides
-    // together SIGSEGVs (rc=139, read near address 0x1/0x18 — a garbage
-    // register value used as a pointer) or hangs — a JIT→JIT call-boundary
+    // `CRATONVM_REAL_ANNOTATIONS=1`) -- a JIT-JIT call-boundary
     // register-preservation bug in the same family as
-    // `docs/internal/jit-regalloc-callee-saved-clobber-family.md`, but NOT
-    // covered by that family's `is_known_miscompile` targeted list (which is
-    // gated behind `callee_saved_gpr_local_homes_enabled()`, default OFF as
-    // of the 2026-07-04 fix — so this residual case has no existing safety
-    // net). Checked unconditionally (not gated by policy or the GPR-homes
-    // flag) because the generated proxy method bodies are a handful of
-    // bytecodes (marshal args, box, call, unbox, return) — the JIT gains
-    // essentially nothing compiling them, so banning them outright is safe.
-    // `getInterfaces`/superclass access on a NON-generated class named
-    // e.g. `$ProxyHelper` by a user is not affected — the check requires the
-    // exact `$Proxy<digits>` simple-name shape `emit_proxy_classfile` emits.
-    if is_generated_proxy_class(class_name) {
-        return Some(SkipReason::RustJvmTestFixture);
-    }
+    // `docs/internal/fixed-suite-bugs/jit-regalloc-callee-saved-clobber-family.md`,
+    // but not covered by that family's `is_known_miscompile` targeted list
+    // (gated behind `callee_saved_gpr_local_homes_enabled()`, default OFF
+    // since the 2026-07-04 fix) since this check was unconditional.
+    // Re-verified 2026-07-26 with `bench/ProxyJitCallProbe.java` (real
+    // annotation-proxy instances -- 8 distinct `$ProxyN` classes via
+    // 8 distinct annotation types, `CRATONVM_REAL_ANNOTATIONS=1`,
+    // `annotationType()`/`hashCode()`/`equals()`/`toString()` called
+    // 300k times, `CRATONVM_JIT_THRESHOLD=1` to force maximal JIT
+    // engagement on both sides of the call boundary): no crash, no hang,
+    // correct output. No longer reproduces on current dev -- fixed as a
+    // side effect of general JIT/dispatch correctness work since this ban
+    // was added. `bench/ProxyJitCallProbe.java` is the regression witness.
 
     // SPR-AOT-TESTNG-MAPS.1 (2026-07-08) — TestNG's Maps helper is a set
     // of tiny allocation factories. JIT-compiling Maps.newConcurrentMap()
@@ -3257,22 +3250,6 @@ fn is_antlr_prediction_context_miscompile(class_name: &str, method_name: &str) -
     )
 }
 
-/// True for a dynamically generated `$ProxyN` class's exact simple-name
-/// shape (`emit_proxy_classfile` / `build_proxy_spec_for` in
-/// `native-builtins/src/lib.rs`), regardless of package — `$Proxy` followed
-/// by one or more ASCII digits and nothing else. Deliberately narrow (exact
-/// shape, not a substring/prefix check) so it can never match ordinary user
-/// code that happens to declare a class starting with `$Proxy` (HotSpot
-/// reserves this exact pattern for its own generated proxies too, so real
-/// code doing this is already vanishingly rare).
-fn is_generated_proxy_class(class_name: &str) -> bool {
-    let simple_name = class_name.rsplit('/').next().unwrap_or(class_name);
-    match simple_name.strip_prefix("$Proxy") {
-        Some(rest) if !rest.is_empty() => rest.bytes().all(|b| b.is_ascii_digit()),
-        _ => false,
-    }
-}
-
 fn callee_saved_gpr_local_homes_enabled() -> bool {
     #[cfg(not(target_arch = "x86_64"))]
     {
@@ -4963,6 +4940,22 @@ mod tests {
                 ),
                 Some(SkipReason::TypesErasure),
                 "Types.erasure must remain excluded under every policy",
+            );
+        }
+    }
+
+    #[test]
+    fn generated_proxy_class_is_jit_eligible_after_proxy_jitcall_1_removal() {
+        for policy in [SkipPolicy::Conservative, SkipPolicy::Aggressive] {
+            assert_eq!(
+                check("com/example/$Proxy0", "invoke", false, true, policy),
+                None,
+                "$ProxyN classes must be JIT-eligible now that PROXY-JITCALL.1 is removed",
+            );
+            assert_eq!(
+                check("com/example/$Proxy42", "hashCode", false, true, policy),
+                None,
+                "$ProxyN classes must be JIT-eligible now that PROXY-JITCALL.1 is removed",
             );
         }
     }
