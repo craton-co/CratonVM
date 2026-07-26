@@ -194,6 +194,17 @@ pub enum CompletionKind {
     Void,
     /// Read / write — handler gets `Integer.valueOf(n)`.
     IntCount(i32),
+    /// Handler-form write completion: handler gets `Integer.valueOf(n)` AND
+    /// the source `ByteBuffer` held at `buffer_gref` has its `position`
+    /// advanced by `n` first, per `AsynchronousByteChannel.write`'s contract.
+    /// The dispatcher releases the global root after delivery.
+    ///
+    /// AUDIT 2026-07-26 (native-io-audit): the handler form used to report a
+    /// bare `IntCount`, so the source buffer was never advanced — the exact
+    /// defect already fixed for the sibling Future form at `FutureOutcome::
+    /// Count` (see the 2026-07-17 comment there). `Job::Write` even carried
+    /// the buffer as `bb_obj` and then destructured it away with `bb_obj: _`.
+    WriteCount { n: i32, buffer_gref: usize },
     /// Accept — `new_id` is an `AioHandle::Stream` slot in `aio_registry`,
     /// which the dispatch path wraps into a fresh
     /// `AsynchronousSocketChannel` synthetic Java object.
@@ -230,6 +241,9 @@ fn drain_completions(ctx: &mut dyn NativeContext) {
     // dispatch the matching completion — handlers must observe the
     // post-failure state, not the pre-failure optimistic state.
     flush_pending_field_resets(ctx);
+    // Release (and, for handler-less writes, apply) any buffer roots parked
+    // by `Job::Write` workers.
+    flush_pending_root_releases(ctx);
     for _ in 0..DRAIN_LIMIT {
         let next = completion_queue().lock().pop_front();
         let Some(c) = next else { break };
@@ -239,6 +253,37 @@ fn drain_completions(ctx: &mut dyn NativeContext) {
                     CompletionKind::Void => Value::Object(None),
                     CompletionKind::IntCount(n) => {
                         // Wrap into Integer for completed(Object, Object).
+                        match ctx.new_object("java/lang/Integer") {
+                            Ok(Some(Value::Object(Some(boxed)))) => {
+                                ctx.set_field_by_name(boxed, "value", Value::Int(n));
+                                Value::Object(Some(boxed))
+                            }
+                            _ => Value::Int(n),
+                        }
+                    }
+                    CompletionKind::WriteCount { n, buffer_gref } => {
+                        // Advance the source buffer BEFORE invoking the
+                        // handler: a conforming `completed()` re-arms with
+                        // `buf.hasRemaining()`, so it must observe the
+                        // consumed position. Without this the caller resends
+                        // the identical slice forever (Tomcat's
+                        // `WsRemoteEndpointImplBase` write loop).
+                        if buffer_gref != 0 {
+                            if n > 0 {
+                                if let Some(bb) = ctx.resolve_global_root(buffer_gref) {
+                                    let position = match ctx.get_field_by_name(bb, "position") {
+                                        Value::Int(v) if v >= 0 => v,
+                                        _ => 0,
+                                    };
+                                    ctx.set_field_by_name(
+                                        bb,
+                                        "position",
+                                        Value::Int(position.saturating_add(n)),
+                                    );
+                                }
+                            }
+                            ctx.remove_global_root(buffer_gref);
+                        }
                         match ctx.new_object("java/lang/Integer") {
                             Ok(Some(Value::Object(Some(boxed)))) => {
                                 ctx.set_field_by_name(boxed, "value", Value::Int(n));
@@ -764,7 +809,12 @@ enum Job {
     Write {
         id: i32,
         data: Vec<u8>,
-        bb_obj: ObjectRef,
+        /// Global-root handle for the source `ByteBuffer`, so the dispatcher
+        /// can advance its `position` by the bytes actually written (see
+        /// `CompletionKind::WriteCount`). This used to be a raw `ObjectRef`
+        /// (`bb_obj`) held across a worker-thread blocking write — both
+        /// unrooted against a moving GC and, worse, simply discarded.
+        bb_gref: usize,
         handler: Option<ObjectRef>,
         attachment: Option<ObjectRef>,
     },
@@ -1017,7 +1067,7 @@ fn handle_job(job: Job) -> Result<(), String> {
         Job::Write {
             id,
             data,
-            bb_obj: _,
+            bb_gref,
             handler,
             attachment,
         } => {
@@ -1026,6 +1076,7 @@ fn handle_job(job: Job) -> Result<(), String> {
                 match map.get(&id) {
                     Some(AioHandle::Stream(s)) => Arc::clone(s),
                     _ => {
+                        queue_root_release(bb_gref);
                         if let Some(h) = handler {
                             completion_queue().lock().push_back(Completion {
                                 handler: h,
@@ -1065,14 +1116,29 @@ fn handle_job(job: Job) -> Result<(), String> {
             match res {
                 Ok(n) => {
                     if let Some(h) = handler {
+                        // `WriteCount` carries the buffer root so the
+                        // dispatcher advances `position` by `n` before
+                        // invoking `completed()`; it also releases the root.
                         completion_queue().lock().push_back(Completion {
                             handler: h,
                             attachment,
-                            outcome: Ok(CompletionKind::IntCount(n as i32)),
+                            outcome: Ok(CompletionKind::WriteCount {
+                                n: n as i32,
+                                buffer_gref: bb_gref,
+                            }),
                         });
+                    } else {
+                        // No handler to deliver to — still advance the
+                        // buffer (a write DID happen) and drop the root.
+                        queue_write_advance(bb_gref, n as i32);
                     }
                 }
                 Err(e) => {
+                    // A partial write before the error still consumed
+                    // `written` bytes from the socket's point of view, but the
+                    // JDK reports the operation as failed and leaves the
+                    // buffer position unspecified; just release the root.
+                    queue_root_release(bb_gref);
                     if let Some(h) = handler {
                         completion_queue().lock().push_back(Completion {
                             handler: h,
@@ -1415,6 +1481,60 @@ fn flush_pending_field_resets(ctx: &mut dyn NativeContext) {
         if ctx.object_num_fields(r.target) > r.field {
             ctx.set_field(r.target, r.field, r.value);
         }
+    }
+}
+
+/// A source-`ByteBuffer` global root parked by a worker for the next
+/// user-thread drain. `advance > 0` means "bump `position` by this many bytes
+/// first"; `0` means "just drop the root".
+///
+/// AUDIT 2026-07-26 (native-io-audit): needed because `Job::Write` now holds
+/// its source buffer as a global root (it previously held a bare, unrooted
+/// `ObjectRef` that it discarded). Workers have no `&mut NativeContext`, so
+/// the release has to be parked — same shape as `PendingFieldReset` above.
+/// Every `Job::Write` exit path must reach exactly one of `WriteCount`,
+/// `queue_write_advance`, or `queue_root_release`, or the root leaks.
+struct PendingRootRelease {
+    gref: usize,
+    advance: i32,
+}
+
+fn pending_root_releases() -> &'static Mutex<Vec<PendingRootRelease>> {
+    static V: OnceLock<Mutex<Vec<PendingRootRelease>>> = OnceLock::new();
+    V.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Park a global root for release on the next user-thread drain.
+fn queue_root_release(gref: usize) {
+    if gref != 0 {
+        pending_root_releases()
+            .lock()
+            .push(PendingRootRelease { gref, advance: 0 });
+    }
+}
+
+/// Park a buffer-position advance + root release (handler-less write).
+fn queue_write_advance(gref: usize, advance: i32) {
+    if gref != 0 {
+        pending_root_releases()
+            .lock()
+            .push(PendingRootRelease { gref, advance });
+    }
+}
+
+fn flush_pending_root_releases(ctx: &mut dyn NativeContext) {
+    let parked = std::mem::take(&mut *pending_root_releases().lock());
+    for r in parked {
+        if r.advance > 0 {
+            if let Some(bb) = ctx.resolve_global_root(r.gref) {
+                let position = match ctx.get_field_by_name(bb, "position") {
+                    Value::Int(v) if v >= 0 => v,
+                    _ => 0,
+                };
+                ctx.set_field_by_name(bb, "position", Value::Int(position.saturating_add(r.advance)));
+            }
+        }
+        ctx.remove_global_root(r.gref);
     }
 }
 
@@ -2016,13 +2136,19 @@ fn aio_asc_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         }
         return Ok(Some(Value::Object(None)));
     }
+    // Root the source buffer for the duration of the worker write: the
+    // dispatcher must advance its `position` by the bytes actually written
+    // (`AsynchronousByteChannel.write` contract), and a moving collection can
+    // run while the worker is parked in `write(2)`.
+    let bb_gref = ctx.add_global_root(bb);
     if let Err(e) = job_sender().send(Job::Write {
         id,
         data,
-        bb_obj: bb,
+        bb_gref,
         handler,
         attachment,
     }) {
+        ctx.remove_global_root(bb_gref);
         eprintln!(
             "native-io: aio_asc_write: job channel closed; \
              CompletionHandler will not fire (id={id}, err={e})"
@@ -2365,6 +2491,87 @@ pub fn register_async_socket_real(r: &mut NativeMethodRegistry) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{confine_test_lock, MockNativeContext};
+
+    /// AUDIT 2026-07-26 (native-io-audit): the handler form of
+    /// `AsynchronousSocketChannel.write` reported a bare `IntCount` and never
+    /// advanced the source `ByteBuffer` — the same defect already fixed for
+    /// the Future form (see `FutureOutcome::Count`). A conforming caller
+    /// (`while (buf.hasRemaining()) channel.write(buf, att, handler)`,
+    /// re-armed from `completed()`) therefore resubmitted the identical slice
+    /// forever, physically resending the frame on the wire.
+    #[test]
+    fn audit_handler_write_completion_advances_source_buffer() {
+        let _g = confine_test_lock().lock();
+        let mut ctx = MockNativeContext::new();
+        completion_queue().lock().clear();
+
+        let bb = ctx.alloc_object(8);
+        ctx.set_field_by_name(bb, "position", Value::Int(5));
+        let buffer_gref = ctx.add_global_root(bb);
+        let handler = ctx.alloc_object(1);
+
+        completion_queue().lock().push_back(Completion {
+            handler,
+            attachment: None,
+            outcome: Ok(CompletionKind::WriteCount {
+                n: 7,
+                buffer_gref,
+            }),
+        });
+        drain_completions(&mut ctx);
+
+        assert_eq!(
+            ctx.get_field_by_name(bb, "position"),
+            Value::Int(12),
+            "position must advance by the bytes actually written"
+        );
+        assert_eq!(
+            ctx.global_root_count(),
+            0,
+            "the buffer's global root must be released after delivery"
+        );
+    }
+
+    /// The worker-parked release path (handler-less write, and every error
+    /// exit) must also drop the root — otherwise every async write leaks one.
+    #[test]
+    fn audit_parked_root_release_advances_then_frees() {
+        let _g = confine_test_lock().lock();
+        let mut ctx = MockNativeContext::new();
+        pending_root_releases().lock().clear();
+
+        let advanced = ctx.alloc_object(8);
+        ctx.set_field_by_name(advanced, "position", Value::Int(2));
+        let g1 = ctx.add_global_root(advanced);
+        queue_write_advance(g1, 3);
+
+        let untouched = ctx.alloc_object(8);
+        ctx.set_field_by_name(untouched, "position", Value::Int(9));
+        let g2 = ctx.add_global_root(untouched);
+        queue_root_release(g2);
+
+        assert_eq!(ctx.global_root_count(), 2);
+        flush_pending_root_releases(&mut ctx);
+
+        assert_eq!(ctx.get_field_by_name(advanced, "position"), Value::Int(5));
+        assert_eq!(
+            ctx.get_field_by_name(untouched, "position"),
+            Value::Int(9),
+            "a failed write must not advance the buffer"
+        );
+        assert_eq!(ctx.global_root_count(), 0, "both roots must be freed");
+    }
+
+    /// A zero handle is the "no root" sentinel and must never be queued.
+    #[test]
+    fn audit_zero_gref_is_not_queued() {
+        let _g = confine_test_lock().lock();
+        pending_root_releases().lock().clear();
+        queue_root_release(0);
+        queue_write_advance(0, 4);
+        assert!(pending_root_releases().lock().is_empty());
+    }
 
     #[test]
     fn registers_without_panic() {
