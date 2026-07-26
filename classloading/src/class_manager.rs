@@ -628,12 +628,55 @@ impl<'a> ClassHierarchy for ClassStoreHierarchy<'a> {
 // any thread exists) the caller should pass 0 and the JVMTI layer routes
 // the event to the VM-init thread.
 //
-// Calls are made AFTER the class manager releases its internal locks so
-// agent callbacks can safely re-enter the class loader (e.g. to call
-// GetLoadedClasses) without self-deadlock.
+// RE-ENTRANCY IS PROHIBITED. Both hooks fire from inside
+// `define_class_shared_with_options` while the class loader still holds
+// `&mut self` — i.e. with the caller's L10 `ClassRealm::class_manager`
+// write guard (`vm/src/vm/realms/class_realm.rs`) still alive. A hook
+// that re-enters ANY class-manager API self-deadlocks on the same
+// thread: `parking_lot::RwLock` is not reentrant. This matches the
+// contract already documented for [`VtableInstallHook`] below, which
+// fires from the same place under the same guard.
+//
+// (An earlier version of this comment claimed calls were made *after*
+// the class manager released its internal locks, so callbacks could
+// safely call back in — e.g. `GetLoadedClasses`. That was never true of
+// this code. The claim is retracted rather than implemented: firing
+// under the guard is deliberate. `define_class` recurses through
+// `load_class` for superclass and interface resolution, so deferring
+// delivery would mean buffering notifications and draining them at
+// every one of the ~59 `class_manager.write()` sites in `vm/` — any
+// missed drain silently delivers ClassLoad late, out of order, or
+// attributed to the wrong thread. The hook is also on the hottest path
+// in the VM (~90k class defines on a Spring Boot cold start) and is
+// designed to cost one `AtomicBool` load when no agent is attached.)
+//
+// Failure mode if a hook does re-enter:
+//   - debug builds, or release with `CRATONVM_LOCK_ORDER_CHECK=1`:
+//     `check_and_acquire` asserts `level < held`, so re-taking L10 at
+//     the same level panics with a `LockOrderViolation` naming
+//     ClassManager twice — a diagnosable panic, not a hang.
+//   - release builds without that env var: enforcement is off and the
+//     re-acquisition is a genuine hard deadlock.
+//   - `read_recursive()` is NOT caught even in debug builds
+//     (`check_and_acquire_reentrant` early-returns when the level is
+//     already held) and still deadlocks against the held write guard.
+//
+// The in-tree adapters (`class_load_adapter` / `class_prepare_adapter`,
+// `vm/src/vm/vm_init.rs`) satisfy the contract: they forward to
+// `runtime::jvmti::fire_class_{load,prepare}`, which take the JVMTI
+// manager's own `callbacks` lock and invoke a `Box<dyn Fn>` — never
+// touching the class manager.
 
 /// Signature of the JVMTI class-lifecycle hook installed by the VM crate.
 /// Parameters: `(class_id_u32, class_name, thread_id)`.
+///
+/// The hook MUST NOT re-enter the class manager: it is invoked while the
+/// class loader still holds `&mut self`, under the caller's L10
+/// `class_manager` write guard, and `parking_lot::RwLock` is not
+/// reentrant. Both parameters are fully self-contained (an id and a
+/// borrowed name) precisely so a conforming hook never needs to call
+/// back in — copy what you need and return. See the re-entrancy notes on
+/// the hook registry above for the exact failure modes.
 pub type JvmtiClassHook = fn(u32, &str, u64);
 
 static CLASS_LOAD_HOOK: OnceLock<JvmtiClassHook> = OnceLock::new();
@@ -3955,12 +3998,17 @@ impl ClassManager {
         }
 
         // T6.3.1 — Fire the JVMTI ClassLoad hook. The VM's JvmtiEventManager
-        // snapshots the attached-env list under its own lock; it never
-        // re-enters the class manager, so it is safe to call from inside
-        // `&mut self`. We still release the caller's class-manager write
-        // lock at the outer callsite before agent callbacks run for any
-        // slower path that needs it — here, the define_class path only
-        // mutates `self`, so dropping is not needed.
+        // takes only its own `callbacks` lock and never re-enters the class
+        // manager, so it is safe to call from inside `&mut self`.
+        //
+        // NOTE: these fire UNDER the caller's L10 `class_manager` write
+        // guard — nothing drops it first, here or at any outer callsite.
+        // An installed hook that re-enters the class manager deadlocks the
+        // calling thread (or panics with a `LockOrderViolation` when lock-
+        // order enforcement is active). That prohibition is part of the
+        // `JvmtiClassHook` contract; see the re-entrancy notes on the hook
+        // registry near `install_class_load_hook`. Do not add a hook here
+        // that calls back into `self` or into `shared.classes`.
         //
         // ClassPrepare is fired after linking/verification completes. For
         // classes that are loaded but not yet linked, the VM's linker path

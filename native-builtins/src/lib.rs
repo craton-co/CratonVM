@@ -4393,6 +4393,10 @@ pub mod test_frameworks;
 pub mod logging_shims;
 pub mod messaging_shims;
 pub mod orm_hibernate;
+/// Third-party application-shim registration seams (BouncyCastle,
+/// JBoss/WildFly/XNIO, the JCA pools, ANTLR/ByteBuddy/Mockito/Hibernate).
+/// Grouping only — every family below is still registered unconditionally.
+pub mod app_shims;
 pub mod net_uri_inet;
 pub mod reflect_annotations;
 pub use reflect_annotations::*;
@@ -6997,13 +7001,12 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // never touched at runtime.
     register_biginteger_arithmetic_overrides(registry);
     register_bigdecimal_arithmetic_overrides(registry);
+    // App-shim seam: ANTLR / ByteBuddy / Mockito / Hibernate. See
+    // `crate::app_shims` — grouped so this family can be moved or made
+    // conditional at one site. Still registered unconditionally, under the
+    // same ambient `Intrinsic` category as before.
     registry.with_category(cratonvm_native_api::NativeKind::Intrinsic, |registry| {
-        register_antlr_prediction_context_intrinsics(registry);
-        register_antlr_token_intrinsics(registry);
-        register_bytebuddy_method_token_intrinsics(registry);
-        register_mockito_debugging_intrinsics(registry);
-        register_hibernate_testing_util_intrinsics(registry);
-        register_hibernate_models_intrinsics(registry);
+        crate::app_shims::register_app_intrinsic_shims(registry);
     });
     // SBR-02 / bug-03: opt-in fast regex. The real-JDK `String.replaceAll` /
     // `replaceFirst` / `matches` bodies run `Pattern.compile(...).matcher(...)`
@@ -7587,108 +7590,12 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // and X9 curves. Our string-decimal helpers (sweep landed alongside
     // this commit, follow-up to 958baae) preserve full precision.
     crate::phases_late::register_p71_biginteger_extras(registry);
-    // BouncyCastle RSA-keygen small-factor prime pre-screen fast-path (Intrinsic).
-    // BC is JIT-banned (value-model collision in its F2m EC path, unrelated), so
-    // `Primes.implHasAnySmallFactors` otherwise runs interpreted and dominates
-    // RSA key generation. Faithful single-word-mod reimplementation; see the fn doc.
-    crate::phases_late::register_bc_primes_small_factors(registry);
-    // BouncyCastle binary-field EC uses LongArray for generic F2m arithmetic.
-    // Keep the org/bouncycastle JIT ban intact, but run the small polynomial
-    // multiply/square/reduce/inverse leaves natively so math-ec and EC crypto
-    // regression do not spend minutes in interpreted bit loops.
-    crate::phases_late::register_bc_long_array(registry);
-    // BouncyCastle generic prime-field EC uses ECFieldElement.Fp bytecode for
-    // every point add/double. Keep BC bytecode JIT-banned, but run the field
-    // arithmetic leaves with the same limb BigInteger core used by java.math.
-    crate::phases_late::register_bc_fp_field_element(registry);
-    // The generic prime-field point formulas remain hot in complete EC math
-    // tests after the field leaves are native; route just those methods natively.
-    crate::phases_late::register_bc_fp_point(registry);
-    // Same treatment for generic binary-field ECFieldElement.F2m wrappers: this
-    // avoids spending the math-ec suite in interpreted field-element glue around
-    // the native LongArray polynomial leaves.
-    crate::phases_late::register_bc_f2m_field_element(registry);
-    // Generic binary-field ECPoint.F2m add/double is the hot Lambda-projective
-    // point layer above the native F2m field-element leaves.
-    crate::phases_late::register_bc_f2m_point(registry);
-    // Keep the BC package JIT ban in place, but run the high-level Shamir JSF
-    // driver loop natively above the native EC point methods.
-    crate::phases_late::register_bc_ec_algorithms(registry);
-    // Custom SEC binary curves bypass ECFieldElement.F2m and call static
-    // SecT*Field kernels directly from point add/double code. Route those
-    // polynomial kernels through the same native GF(2^m) engine.
-    crate::phases_late::register_bc_sect_field_kernels(registry);
-    // The inherited ECPoint.timesPow2 loop otherwise spends complete binary
-    // curve tests in interpreted SecT*Point.twice glue around those kernels.
-    crate::phases_late::register_bc_sect_point_methods(registry);
-    // BouncyCastle AESEngine single-block transform fast-path (Intrinsic). Same
-    // JIT-ban rationale: the interpreted T-table AES otherwise dominates AESTest's
-    // Monte-Carlo stress. Verbatim FIPS-197-validated port of encrypt/decryptBlock.
-    crate::phases_late::register_bc_aes_engine(registry);
-    // CBC mode wrapper fast-path for AES-backed MAC/encryption loops. This keeps
-    // the BC JIT ban intact while avoiding interpreted CBC bytecode above the
-    // already-native AES block transform.
-    crate::phases_late::register_bc_cbc_block_cipher(registry);
-    // BouncyCastle GOST3412_2015Engine single-block transform fast-path
-    // (Intrinsic). Keeps the BC package JIT ban while removing the interpreted
-    // block-cipher loop that dominates GOST3412Test CTR stress.
-    crate::phases_late::register_bc_gost3412_engine(registry);
-    // BouncyCastle SM4Engine single-block transform fast-path for crypto regression.
-    crate::phases_late::register_bc_sm4_engine(registry);
-    // BouncyCastle XTEAEngine single-block transform fast-path for CipherStreamTest.
-    crate::phases_late::register_bc_xtea_engine(registry);
-    // BouncyCastle Strings UTF-8 transcode fast-path (Intrinsic) — dominates
-    // AESTest.testCounter's growing-string round-trips once AES is native.
-    crate::phases_late::register_bc_strings_utf8(registry);
-    crate::phases_late::register_bc_arrays_helpers(registry);
-    crate::phases_late::register_bc_param_helpers(registry);
-    // BouncyCastle byte/int packing helpers used by block ciphers and digests.
-    crate::phases_late::register_bc_pack_helpers(registry);
-    // BouncyCastle X25519 field multiply fast-path for Ed25519/X25519 regression.
-    crate::phases_late::register_bc_x25519_field(registry);
-    // BouncyCastle X448 field multiply/square fast-path for Ed448 regression.
-    crate::phases_late::register_bc_x448_field(registry);
-    // BouncyCastle BLAKE2s compression leaf fast-path for Blake2xs XOF vectors.
-    crate::phases_late::register_bc_blake2s_digest(registry);
-    // BouncyCastle Keccak absorb/extract/permutation fast-path for CSHAKE/KMAC.
-    crate::phases_late::register_bc_keccak_digest(registry);
-    // BouncyCastle legacy GOST3411 compression-block fast-path for the
-    // million-'a' digest regression under the org/bouncycastle JIT ban.
-    crate::phases_late::register_bc_gost3411_digest(registry);
-    // BouncyCastle Whirlpool update/compression fast-path for the million-'a'
-    // digest regression under the same package JIT ban.
-    crate::phases_late::register_bc_whirlpool_digest(registry);
-    // BouncyCastle Poly1305 accumulator/finalization fast-path for standalone
-    // Poly1305 and ChaCha20-Poly1305 regression vectors under the BC JIT ban.
-    crate::phases_late::register_bc_poly1305(registry);
-    // BouncyCastle SCrypt SMix/BlockMix fast-path for crypto regression.
-    crate::phases_late::register_bc_scrypt_generator(registry);
-    // BouncyCastle Argon2 block-round fast-path for crypto regression.
-    crate::phases_late::register_bc_argon2_bytes_generator(registry);
-    // BouncyCastle PKCS#5 v2 PBKDF2/SHA-1 KDF fast-path for crypto regression.
-    crate::phases_late::register_bc_pkcs5s2_parameters_generator(registry);
-    // BouncyCastle PKCS#12 SHA-1 KDF fast-path for crypto regression vectors.
-    crate::phases_late::register_bc_pkcs12_parameters_generator(registry);
-    // BouncyCastle BCrypt expensive key schedule fast-path for crypto regression.
-    crate::phases_late::register_bc_bcrypt_generator(registry);
-    // BouncyCastle CTR-mode (SICBlockCipher) per-byte loop fast-path (Intrinsic) —
-    // the sole remaining hot frame in AESTest.testCounter once AES+Strings are native.
-    crate::phases_late::register_bc_sic_ctr(registry);
-    // BouncyCastle DigestRandomGenerator synchronized PRNG fast-path
-    // (Intrinsic). This keeps the package JIT ban intact while avoiding the
-    // million-call interpreted monitor body in DigestRandomNumberTest.
-    crate::phases_late::register_bc_digest_random_generator(registry);
-    // BouncyCastle ChaCha permutation fast-path (Intrinsic). Same JIT-ban
-    // rationale: the interpreted ChaCha core (dozens of Integers.rotateLeft
-    // calls per block) dominates the SPHINCS-256 PQC RegressionTest (PRG via
-    // ChaChaEngine.chachaCore + hash via Permute.permute/HashFunctions).
-    // Verbatim port, RFC 8439- and HotSpot-validated.
-    crate::phases_late::register_bc_chacha(registry);
-    // BouncyCastle NewHope lattice fast-path (Intrinsic). The NTT
-    // (Poly.toNTT/fromNTT) + SHAKE128 sampler (Poly.uniform) dominate the PQC
-    // RegressionTest's NewHopeTest once ChaCha is native. Verbatim port of
-    // NTT/Reduce + the `sha3` crate's SHAKE128, validated against HotSpot.
-    crate::phases_late::register_bc_newhope(registry);
+    // App-shim seam: BouncyCastle. The ~30 crypto-kernel registrars that used
+    // to be inlined here now live behind one call in `crate::app_shims`, with
+    // their per-kernel rationale moved alongside them. Order, ambient
+    // category and the registered set are unchanged; the family is still
+    // registered on every boot, including for programs that never load BC.
+    crate::app_shims::register_bouncycastle_shims(registry);
 
     // Spring Boot loader in real-JDK mode can resolve Pattern natives through
     // synthetic-stub dispatch paths before/without usable JDK bytecode
@@ -8825,26 +8732,14 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // accessors.
     apps_h2::register_h2_parser_fastpaths(registry);
 
-    // T19.8: Agroal (Quarkus) + IronJacamar (WildFly) JDBC pool natives.
-    // real-cdi-bean-container (Keycloak Gap 8): under `CRATONVM_REAL_AGROAL`
-    // the shim is suppressed so the real `io.agroal.pool.*` container bytecode
-    // runs over the real `org.h2.Driver`. The shim's interface-typed config
-    // object otherwise collides with the real `DataSourceProvider` bytecode
-    // (AbstractMethodError on `dataSourceImplementation()`). See `real_agroal`.
-    if !real_agroal() {
-        agroal_pool::register_agroal_natives(registry);
-    }
-    ironjacamar_pool::register_ironjacamar_natives(registry);
-    // T19.10: Infinispan local-mode cache (DefaultCacheManager + Cache).
-    infinispan_local::register_infinispan_natives(registry);
-    // T19.6: Vert.x / Netty NioEventLoop affinity scheduler natives.
-    // Under CRATONVM_REAL_VERTX the synthetic loop is suppressed so the real Netty
-    // NioEventLoop.run() drives Selector.select() over our selector (see real_vertx).
-    if !real_vertx() {
-        vertx_eventloop::register_vertx_eventloop_natives(registry);
-    }
-    // T19.2.e: WildFly Datasources subsystem + Narayana JTA glue.
-    wildfly_datasources_tx::register_wildfly_datasources_tx_natives(registry);
+    // App-shim seam: JDBC connection pools (Agroal / IronJacamar), the
+    // Infinispan local cache, the Vert.x event loop and the WildFly
+    // datasources + Narayana JTA glue. Grouped into `crate::app_shims`; the
+    // `CRATONVM_REAL_AGROAL` / `CRATONVM_REAL_VERTX` escapes moved with it, so
+    // the registered set is unchanged. NOTE: this family also registers
+    // `javax/sql/DataSource`, so it is not severable as-is — see
+    // `ShimFamily::jdk_entanglements`.
+    crate::app_shims::register_datasource_pool_shims(registry);
     // T19.H2: StackWalker boot-time getInstance variants + getCallerClass.
     stack_walker::register_stack_walker_boot(registry);
     // WildFly's security manager can hit StackWalker.walk(Function) before the
@@ -16958,87 +16853,17 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     //         HTTPS_PROXY / NO_PROXY env (case-insensitive, CIDR + wildcard).
     proxy_selector::register_proxy_selector_real(registry);
 
-    // --- RA.4 / RA.5: JBoss Modules `module.xml` parser + ResourceRootFactory.
-    // We bypass the MXParser path (which relies on NIO CharBuffer internals
-    // the VM is still stabilizing) by parsing module.xml in Rust and calling
-    // back into ModuleSpec$Builder / DependencySpec / ResourceLoaders via
-    // `ctx.invoke`.
-    registry.register(
-        "org/jboss/modules/xml/ModuleXmlParser",
-        "parseModuleXml",
-        "(Lorg/jboss/modules/xml/ModuleXmlParser$ResourceRootFactory;Lorg/jboss/modules/ModuleLoader;Ljava/lang/String;Ljava/io/File;Ljava/io/File;)Lorg/jboss/modules/ModuleSpec;",
-        jboss_module_xml::native_parse_module_xml,
-    );
-    jboss_resource_loader::register_resource_loader_natives(registry);
-
-    // T19.1: JBoss MSC (Modular Service Container) — the async service
-    // orchestrator WildFly / Keycloak 16 enters right after Main.main().
-    // Registers ServiceName / ServiceContainer / ServiceController /
-    // StartContext natives and spins up the msc-worker thread pool
-    // lazily on first `ServiceContainer.create()` call.
-    jboss_msc::register_jboss_msc_natives(registry);
-
-    // T19.2.a: WildFly Core kernel — Deployment + Threads + Logging.
-    // Runs right after MSC so DeploymentUnit / EnhancedQueueExecutor /
-    // LogManager + Logger / ControlledProcessState natives are in place
-    // before naming / security / undertow register their services.
-    wildfly_core::register_wildfly_core_natives(registry);
-
-    // T19.2.b: WildFly Naming (JNDI) — InitialContext + ServiceBasedNamingStore
-    // + ContextNames natives. Runs after the Core kernel so the MSC container
-    // and DeploymentUnit layout exist before any subsystem calls `bind()`.
-    // Enforces the Log4Shell-class JNDI-injection allowlist at the native
-    // boundary: only `java:`, `java:jboss/`, `java:comp/`, `java:global/`,
-    // `java:app/`, `java:module/` absolute names are accepted.
-    wildfly_naming::register_wildfly_naming_natives(registry);
-
-    // T19.2.c: WildFly Security — JAAS LoginContext / LoginModule chain,
-    // Subject / Principal sets, SecurityDomainService / ApplicationPolicy
-    // lookup, and SecurityIdentity.runAs. Bootstrap internal-auth path for
-    // Keycloak 16; real identity still comes from KC's own realm.
-    wildfly_security::register_wildfly_security_natives(registry);
-
-    // T19.2.d: WildFly Undertow — HTTP server builder, HttpHandler dispatch,
-    // HeaderMap / HttpString / Sender surface, UndertowService and
-    // ListenerService lifecycle. HTTP/1.1 request head parser with size caps
-    // (8 KiB line / 32 KiB headers / 100 headers / 10 MiB body), CRLF-injection
-    // rejection on response headers, Host-header validation, and panic-safe
-    // handler dispatch (500 on panic instead of process crash). The accept
-    // loop that will drive live request handling is deferred to T19.7 (XNIO
-    // worker); here we expose `dispatch_handler` / `accept_backoff` as the
-    // integration points.
-    wildfly_undertow::register_undertow_natives(registry);
-
-    // T19.7.b: JBoss XNIO worker — top-level XnioWorker with bounded I/O
-    // + task thread pools (default 4 + 16, clamped at 128 + 1024), round-
-    // robin I/O-thread dispatch, panic-safe task submission, and graceful
-    // shutdown/awaitTermination semantics. Provides the scaffolding
-    // T19.7.c (io_thread event loop), T19.7.d (conduits), and T19.7.e
-    // (OptionMap builder) plug into.
-    xnio_worker::register_xnio_worker_natives(registry);
-
-    // T19.7.c: XnioIoThread / NioIoThread / XnioExecutor$Key natives —
-    // execute(), executeAfter(), executeAtTime(), currentThread(),
-    // Key.remove(). Event loop uses a BinaryHeap<Reverse<ScheduledTask>>
-    // min-heap for timers + Mutex<VecDeque<IoTask>> for immediate tasks;
-    // cross-thread execute wakes the Selector via a coalesced AtomicBool.
-    xnio_io_thread::register_xnio_io_thread_natives(registry);
-
-    // T19.7.d: XNIO Conduit stream channels — read/write through
-    // ConduitStreamSourceChannel / ConduitStreamSinkChannel, ChannelListener
-    // dispatch (panic-safe), resume/suspend semantics, half-close via
-    // shutdownReads/Writes, and flush reporting based on a buffered-bytes
-    // counter. Listener callbacks are dispatched through `invoke_virtual`
-    // wrapped in `catch_unwind` so a buggy listener can't crash the loop.
-    xnio_conduits::register_xnio_conduits_natives(registry);
-
-    // T19.7.e: XNIO OptionMap + IoFuture + Options + XnioExecutor primitives.
-    // OptionMap is immutable-after-build (Arc<HashMap>-backed); IoFuture has
-    // an AtomicU8 monotonic state machine (WAITING → DONE/CANCELLED/FAILED)
-    // with Condvar-wake on completion and panic-isolated notifier dispatch.
-    // Populates Options.<WORKER_IO_THREADS, BACKLOG, TCP_NODELAY, …> on first
-    // access so xnio_worker can read defaults.
-    xnio_async::register_xnio_async_natives(registry);
+    // App-shim seam: JBoss Modules / MSC, WildFly Core / Naming / Security /
+    // Undertow, and the four XNIO layers — the largest family in the crate
+    // (~48 kLoC) and the one a `HelloWorld` has the least use for. Grouped
+    // into `crate::app_shims` so it can be moved or gated at one site; still
+    // registered unconditionally, in the same order, under the same ambient
+    // category. NOTE: it also registers the JAAS
+    // (`javax/security/auth/login/LoginContext`, `.../Subject`,
+    // `java/security/AccessControlContext`) and JNDI
+    // (`javax/naming/InitialContext`) natives that non-WildFly programs rely
+    // on, so it is NOT severable as-is — see `ShimFamily::jdk_entanglements`.
+    crate::app_shims::register_jboss_wildfly_xnio_shims(registry);
 
     // B3: ClassLoader.getResources / getSystemResources override.  The real
     // JDK implementation in JDK 25 NPEs during URLClassPath.<clinit> and the
@@ -31686,7 +31511,23 @@ fn quote_uric(s: &str) -> String {
 ///
 /// This is reused by `getLocalHost` and `NetworkInterface.getNetworkInterfaces`
 /// so both surface the same name to Java code.
+///
+/// Cached: the result is latched on first use. Step 3 forks and execs the
+/// `hostname` binary, and on Linux `HOSTNAME` is frequently *not* exported to
+/// non-interactive shells, so steps 1 and 2 miss and every single
+/// `InetAddress.getLocalHost()` / `NetworkInterface.getNetworkInterfaces()`
+/// call paid a full process spawn. A machine does not rename itself
+/// mid-process, and HotSpot itself caches `getLocalHost()`, so one resolution
+/// per VM is the right granularity. [`resolve_real_hostname_uncached`] keeps
+/// the probing logic testable.
 pub(crate) fn resolve_real_hostname() -> String {
+    static CACHED: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    CACHED.get_or_init(resolve_real_hostname_uncached).clone()
+}
+
+/// The uncached probe behind [`resolve_real_hostname`]. Split out so the
+/// resolution order stays directly testable without the `OnceLock` latch.
+pub(crate) fn resolve_real_hostname_uncached() -> String {
     if let Ok(name) = std::env::var("HOSTNAME") {
         let trimmed = name.trim();
         if !trimmed.is_empty() {

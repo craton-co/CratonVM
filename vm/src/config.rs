@@ -55,8 +55,9 @@ pub fn parse_gc_algorithm(name: &str) -> Option<GcAlgorithm> {
 ///
 /// * [`JdkMode::Real`] — real JDK class files are loaded from
 ///   `$JAVA_HOME/jmods/*.jmod` (JDK 9+) or the `lib/modules` jimage
-///   (JRE / `jlink` image), and only the ~300 truly-native methods are
-///   implemented in Rust.
+///   (JRE / `jlink` image), and roughly 2,700 methods are implemented in
+///   Rust. (See [`REAL_JDK_NATIVE_REGISTRATIONS`] — this figure said
+///   "~300" until 2026-07-26 and was wrong by about an order of magnitude.)
 /// * [`JdkMode::Synthetic`] — no JDK is needed at all; ~5,200 native Rust
 ///   stubs stand in for the class library.
 ///
@@ -86,8 +87,9 @@ pub fn parse_gc_algorithm(name: &str) -> Option<GcAlgorithm> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JdkMode {
     /// Boot against real JDK bytecode from `jmods/` or the `lib/modules`
-    /// jimage. Only the ~300 truly-native methods are Rust. Requires a
-    /// usable JDK on the host; see [`require_real_jdk`].
+    /// jimage. Roughly [`REAL_JDK_NATIVE_REGISTRATIONS`] methods are Rust —
+    /// not the "~300" this doc claimed until 2026-07-26. Requires a usable
+    /// JDK on the host; see [`require_real_jdk`].
     Real,
     /// Boot against the ~5,200 synthetic Rust stubs in `native-builtins`.
     /// Needs no JDK on the host, but the class library is CratonVM's own
@@ -110,13 +112,18 @@ impl JdkMode {
 
     /// One-line human description of what the mode actually does, for the
     /// `-version` banner.
+    ///
+    /// The real-JDK figure comes from [`REAL_JDK_NATIVE_REGISTRATIONS`]; run
+    /// `--dump-native-registry` for the exact per-run census.
     pub fn describe(self) -> &'static str {
         match self {
             JdkMode::Real => {
-                "real JDK class files from jmods/ or lib/modules; ~300 native methods in Rust"
+                "real JDK class files from jmods/ or lib/modules; ~2,700 native methods in Rust \
+                 (exact census: --dump-native-registry)"
             }
             JdkMode::Synthetic => {
-                "~5,200 synthetic Rust stubs from native-builtins; no JDK required"
+                "~5,200 synthetic Rust stubs from native-builtins; no JDK required \
+                 (exact census: --dump-native-registry)"
             }
         }
     }
@@ -150,6 +157,43 @@ impl std::fmt::Display for JdkMode {
         f.write_str(self.as_str())
     }
 }
+
+/// Approximate number of native methods CratonVM implements in Rust when
+/// running in [`JdkMode::Real`].
+///
+/// # Why this constant exists
+///
+/// Until 2026-07-26 three doc sites and — worse — the user-visible
+/// `-version` banner ([`JdkMode::describe`]) all said "~300 truly-native
+/// methods". That figure is wrong by about an order of magnitude, and it was
+/// being used to size proposals (see
+/// `docs/internal/arch-2026-07-26/jdk-mode-determinism.md` §7.4, which
+/// scopes a `native-essentials` crate split against it). The number now
+/// lives in one place with its derivation attached.
+///
+/// # How it was derived (2026-07-26, reproducible by grep)
+///
+/// The default build compiles the `#[cfg(not(feature = "synthetic-jdk"))]`
+/// arm of `vm/src/vm/vm_init.rs` (`:1493`), which makes **32** top-level
+/// registration calls, `register_essential_natives` among them.
+/// `register_essential_natives` alone (`native-builtins/src/lib.rs:6851`)
+/// contains **960** direct `registry.register(` sites and calls **184**
+/// distinct sub-registrars. Walking the static call graph over
+/// `native-builtins/src` from all 32 roots — resolving each callee to a
+/// definition in the same file first, then to a globally unique name, and
+/// ignoring ambiguous names — reaches 1,116 functions holding **2,746**
+/// `.register(` call sites. Six of the 32 roots are defined outside
+/// `native-builtins/src` and were not traversed, so 2,746 is a floor.
+///
+/// # What it is not
+///
+/// It counts *registration call sites*, not distinct registry keys. A key
+/// registered twice (see the duplicate-registration cases in the natives
+/// audit) counts twice here, so the true distinct-method count is somewhat
+/// lower. For an exact per-run census run the launcher with
+/// `--dump-native-registry`, which is the authority; this constant exists so
+/// documentation stops quoting a number that is off by 9x.
+pub const REAL_JDK_NATIVE_REGISTRATIONS: u32 = 2_700;
 
 /// The `cratonvm` launcher's fixed default mode.
 ///
@@ -308,9 +352,10 @@ pub struct VmConfig {
     ///   without it the registration blocks in `vm_init.rs` are compiled
     ///   out AND boot-classpath discovery is skipped, leaving a VM with
     ///   neither class library.
-    /// * `false` ([`JdkMode::Real`]) — only the ~300 truly-native methods
-    ///   are registered and real JDK classes load from
-    ///   `$JAVA_HOME/jmods` (or the `lib/modules` jimage).
+    /// * `false` ([`JdkMode::Real`]) — roughly
+    ///   [`REAL_JDK_NATIVE_REGISTRATIONS`] methods are registered (**not**
+    ///   the "~300" this doc claimed until 2026-07-26) and real JDK classes
+    ///   load from `$JAVA_HOME/jmods` (or the `lib/modules` jimage).
     ///
     /// # This value is never host-derived
     ///
@@ -910,6 +955,39 @@ fn posix_drive_tail(rest: &str) -> Option<String> {
 ///
 /// Returns an empty `Vec` if JAVA_HOME is not set or doesn't contain the
 /// expected files.
+///
+/// # Why `jmods/` is still preferred over `lib/modules` (2026-07-26)
+///
+/// `docs/internal/arch-2026-07-26/startup-and-diagnostics.md` §6.1 asked for
+/// the opposite: put `lib/modules` (checked below, after the jmods branch)
+/// *first*, because `ClassPath::load_jmod` used to inflate every `classes/`
+/// entry of all 70 JMODs at load time — 27,962 entries, ~136 MB, 15-21 s
+/// before the first Java class loaded. That measurement was reproduced and
+/// is real. The **cost** was fixed; the **ordering** was deliberately not.
+///
+/// The reason is that `jmods/` and `lib/modules` are not interchangeable
+/// sources for the same classes:
+///
+/// * `lib/modules` is a `jlink`-produced image. Its `module-info.class`
+///   files are rewritten by the `SystemModules` plugin and it carries
+///   generated `jdk.internal.module.SystemModules$*` classes that no JMOD
+///   contains, while the JMODs carry the pristine, un-transformed
+///   `module-info`. `ClassPath::scan_module_infos` feeds the module layer
+///   from exactly those bytes.
+/// * A JMOD also carries `lib/`, `conf/`, `legal/`, `bin/` and `include/`
+///   entries that the jimage does not, and `ClassPath::find_resource` serves
+///   them from the `classes/` subtree and the archive today.
+///
+/// Preferring the jimage would therefore change *which bytes* boot sees, on
+/// every default run, and no session that has proposed it has been able to
+/// run the H2 / Spring / Tomcat suites both ways. The cost was instead
+/// removed where it originated: `load_jmod` now builds a decompression-free
+/// name index and inflates per lookup, the same shape the JAR path has used
+/// since the O(jars x zip-probes) scan was closed. Same win, same reader,
+/// same bytes. See `docs/internal/arch-2026-07-26/boot-classpath-lazy.md`.
+///
+/// This is unconditional — there is no flag and no env var for it, and no
+/// opt-in. Reverting to eager inflation means reverting that commit.
 pub fn discover_boot_classpath(java_home: Option<&str>) -> Vec<String> {
     let java_home = resolve_java_home(java_home);
     let Some(java_home) = java_home else {
@@ -1308,6 +1386,113 @@ fn detect_java_home_from_path() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // Boot-classpath source selection (2026-07-26 boot-classpath-lazy)
+    //
+    // `discover_boot_classpath` prefers `jmods/` and falls back to
+    // `lib/modules`. That ordering is load-bearing — see the function's doc
+    // comment — so it is pinned here rather than left to be "fixed" by a
+    // later reader who only sees the startup cost and not the reason.
+    // `resolve_java_home(Some(dir))` is authoritative when the directory
+    // exists, so these tests need no JDK and touch no environment variables.
+    // -----------------------------------------------------------------------
+
+    fn fake_java_home(tag: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("cratonvm_boot_cp_{}_{}", std::process::id(), tag));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn boot_classpath_prefers_jmods_and_puts_java_base_first() {
+        let home = fake_java_home("jmods_first");
+        let jmods = home.join("jmods");
+        std::fs::create_dir_all(&jmods).unwrap();
+        // Deliberately create them out of order so the result proves sorting
+        // and the java.base hoist rather than directory-iteration order.
+        for name in ["java.xml.jmod", "java.base.jmod", "java.desktop.jmod"] {
+            std::fs::write(jmods.join(name), b"JM\x01\x00").unwrap();
+        }
+        std::fs::create_dir_all(home.join("lib")).unwrap();
+        std::fs::write(home.join("lib").join("modules"), b"not-a-real-jimage").unwrap();
+
+        let cp = discover_boot_classpath(Some(&home.to_string_lossy()));
+        assert_eq!(cp.len(), 3, "all three JMODs must be on the boot classpath");
+        assert!(
+            cp[0].ends_with("java.base.jmod"),
+            "java.base must come first, got {cp:?}"
+        );
+        assert!(
+            cp[1].ends_with("java.desktop.jmod") && cp[2].ends_with("java.xml.jmod"),
+            "remaining JMODs must be sorted for run-to-run determinism, got {cp:?}"
+        );
+        assert!(
+            !cp.iter()
+                .any(|e| e.replace('\\', "/").ends_with("lib/modules")),
+            "lib/modules must not be used when jmods/ is present: {cp:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn boot_classpath_falls_back_to_lib_modules_without_jmods() {
+        // JRE / jlink-trimmed image: no `jmods/` at all. This is the path
+        // RKC16N.9 added, and it must keep working.
+        let home = fake_java_home("jimage_fallback");
+        std::fs::create_dir_all(home.join("lib")).unwrap();
+        std::fs::write(home.join("lib").join("modules"), b"not-a-real-jimage").unwrap();
+
+        let cp = discover_boot_classpath(Some(&home.to_string_lossy()));
+        assert_eq!(cp.len(), 1, "expected the jimage alone, got {cp:?}");
+        assert!(cp[0].replace('\\', "/").ends_with("lib/modules"));
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn boot_classpath_empty_jmods_dir_falls_through_to_lib_modules() {
+        // A `jmods/` directory that exists but holds no `.jmod` files must
+        // not shadow a usable `lib/modules`.
+        let home = fake_java_home("empty_jmods");
+        std::fs::create_dir_all(home.join("jmods")).unwrap();
+        std::fs::create_dir_all(home.join("lib")).unwrap();
+        std::fs::write(home.join("lib").join("modules"), b"not-a-real-jimage").unwrap();
+
+        let cp = discover_boot_classpath(Some(&home.to_string_lossy()));
+        assert_eq!(cp.len(), 1, "expected the jimage alone, got {cp:?}");
+        assert!(cp[0].replace('\\', "/").ends_with("lib/modules"));
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn boot_classpath_empty_when_java_home_has_neither() {
+        let home = fake_java_home("neither");
+        let cp = discover_boot_classpath(Some(&home.to_string_lossy()));
+        assert!(cp.is_empty(), "expected no boot classpath, got {cp:?}");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The `-version` banner must not carry the old, ~9x-low "~300" figure.
+    /// This is user-visible text quoted in bug reports; see
+    /// [`REAL_JDK_NATIVE_REGISTRATIONS`] for the derivation.
+    #[test]
+    fn jdk_mode_describe_does_not_quote_the_stale_native_count() {
+        let real = JdkMode::Real.describe();
+        assert!(
+            !real.contains("~300"),
+            "real-JDK banner still quotes the retracted ~300 figure: {real}"
+        );
+        assert!(
+            real.contains("2,700"),
+            "real-JDK banner should quote the measured figure: {real}"
+        );
+        assert_eq!(REAL_JDK_NATIVE_REGISTRATIONS, 2_700);
+    }
 
     #[test]
     fn default_config() {

@@ -62,6 +62,18 @@ pub(crate) struct MockNativeContext {
     class_table: Vec<String>,
     obj_class: HashMap<usize, ClassId>,
     declared_methods: HashSet<(ClassId, String, String)>,
+    /// Scripted `InputStream.read([BII)I` payload. `invoke_virtual` serves
+    /// bytes from the front of this queue, honouring the caller's requested
+    /// length, and returns `-1` once it is empty — i.e. it behaves like a real
+    /// stream rather than a fixed scripted return value, which is what
+    /// `stream_decoder`'s refill loop needs to be exercised end to end.
+    stream_bytes: UnsafeCell<std::collections::VecDeque<u8>>,
+    /// Set once `stream_bytes` has been supplied, so the mock knows to serve
+    /// `read([BII)I` itself instead of falling through to `scripts`.
+    stream_scripted: bool,
+    /// Global roots handed out by `add_global_root`.
+    global_roots: HashMap<usize, ObjectRef>,
+    next_gref: usize,
 }
 
 impl MockNativeContext {
@@ -80,7 +92,49 @@ impl MockNativeContext {
             class_table: vec![String::new()],
             obj_class: HashMap::new(),
             declared_methods: HashSet::new(),
+            stream_bytes: UnsafeCell::new(std::collections::VecDeque::new()),
+            stream_scripted: false,
+            global_roots: HashMap::new(),
+            next_gref: 1,
         }
+    }
+
+    /// Make `invoke_virtual(_, "read", "([BII)I", ...)` behave like a real
+    /// `InputStream` over `bytes`: it fills the caller's array with up to the
+    /// requested length and returns the count, then `-1` at exhaustion.
+    pub(crate) fn script_input_stream(&mut self, bytes: &[u8]) {
+        let q = unsafe { &mut *self.stream_bytes.get() };
+        q.clear();
+        q.extend(bytes.iter().copied());
+        self.stream_scripted = true;
+    }
+
+    /// Serve one `read([BII)I` from the scripted stream.
+    fn serve_stream_read(&mut self, args: &[Value]) -> MethodCallResult {
+        let arr = match args.first() {
+            Some(Value::Object(Some(a))) => *a,
+            _ => return Ok(Some(Value::Int(-1))),
+        };
+        let off = match args.get(1) {
+            Some(Value::Int(v)) => *v as usize,
+            _ => 0,
+        };
+        let want = match args.get(2) {
+            Some(Value::Int(v)) => *v as usize,
+            _ => 0,
+        };
+        let chunk: Vec<u8> = {
+            let q = unsafe { &mut *self.stream_bytes.get() };
+            let n = want.min(q.len());
+            q.drain(..n).collect()
+        };
+        if chunk.is_empty() {
+            return Ok(Some(Value::Int(-1)));
+        }
+        for (i, b) in chunk.iter().enumerate() {
+            self.set_array_element(arr, off + i, Value::Int(*b as i8 as i32));
+        }
+        Ok(Some(Value::Int(chunk.len() as i32)))
     }
 
     fn ensure_mock_class(&mut self, class_name: &str) -> ClassId {
@@ -176,6 +230,12 @@ impl MockNativeContext {
             descriptor: desc.to_string(),
             result,
         });
+    }
+
+    /// Number of global roots currently held — a non-zero value after a
+    /// native has fully completed is a root leak.
+    pub(crate) fn global_root_count(&self) -> usize {
+        self.global_roots.len()
     }
 
     pub(crate) fn blocking_region_counts(&self) -> (usize, usize) {
@@ -275,6 +335,10 @@ impl NativeContext for MockNativeContext {
             descriptor: descriptor.to_string(),
             args: args.to_vec(),
         });
+        // Scripted InputStream takes precedence over the static script table.
+        if self.stream_scripted && method_name == "read" && descriptor == "([BII)I" {
+            return self.serve_stream_read(args);
+        }
         // Find the first matching script (FIFO per key).
         if let Some(pos) = self
             .scripts
@@ -535,6 +599,21 @@ impl NativeContext for MockNativeContext {
     }
     fn end_blocking_region(&mut self) {
         self.blocking_end_count += 1;
+    }
+    // Real global-root bookkeeping (the trait defaults are inert stubs that
+    // hand back handle 0), so tests can exercise natives that park a Java
+    // object for a worker thread and resolve it again on delivery.
+    fn add_global_root(&mut self, obj: ObjectRef) -> usize {
+        let h = self.next_gref;
+        self.next_gref += 1;
+        self.global_roots.insert(h, obj);
+        h
+    }
+    fn resolve_global_root(&self, handle: usize) -> Option<ObjectRef> {
+        self.global_roots.get(&handle).copied()
+    }
+    fn remove_global_root(&mut self, handle: usize) -> bool {
+        self.global_roots.remove(&handle).is_some()
     }
     fn unpark(&self, _o: ObjectRef) {}
     fn allocate_instance(&mut self, _c: &str) -> Option<ObjectRef> {

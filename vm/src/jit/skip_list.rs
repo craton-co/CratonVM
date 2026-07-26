@@ -784,6 +784,39 @@ fn should_skip_jit_internal(
         return Some(SkipReason::BigIntegerArithmetic);
     }
 
+    // HIB-BIGINTEGER-AIOOBE.2 (2026-07-26) -- while hunting for the
+    // deterministic reproducer HIB-BIGINTEGER-AIOOBE.1 above says never
+    // existed, found one for a DIFFERENT symptom in `BigInteger` ITSELF
+    // (not just its `MutableBigInteger` helper): `new BigInteger(String)`
+    // intermittently throws `NullPointerException: Cannot read the array
+    // length because "this.mag" is null` from inside
+    // `BigInteger(String, int)` -- i.e. the field write to `this.mag` at
+    // the end of construction does not become visible before the very
+    // next read of it. Minimal repro (`BigIntegerToStringProbe.java`, not
+    // committed, matches the bench/ probe convention): construct a random
+    // BigInteger, call `toString()`, then round-trip via
+    // `new BigInteger(s)` -- fails at ITERATION 0, no warmup, no explicit
+    // divide() needed. Confirmed JIT-only via `--nojit` (clean through
+    // 40k+ iterations, vs. instant failure under JIT). This crashes even
+    // WITH the HIB-BIGINTEGER-AIOOBE.1 guard above already in place --
+    // that guard's scope (`MutableBigInteger` only) does not cover it.
+    // Bisected with `CRATONVM_JIT_BISECT_SKIP` (no rebuild): forcing any
+    // ONE of the constructor itself, `trustedStripLeadingZeroInts`,
+    // `destructiveMulAdd`, `checkRange`, or the internal char-array
+    // `parseInt` helper alone to interpret does NOT fix it (each ruled
+    // out individually) -- but denying the whole `java/math/BigInteger`
+    // class via `CRATONVM_JIT_DENY` does. Not yet narrowed past the
+    // whole-class level (a multi-method interaction, same shape as the
+    // TYPES-ERASURE.1 consolidation attempt turning out to need more than
+    // one method -- see docs/known-issues/jit-skip-list-open-bans-20260725.md).
+    // Broadening HIB-BIGINTEGER-AIOOBE.1's scope to also cover
+    // `BigInteger` itself rather than adding a second always-checked
+    // guard, since both now share one fail-closed disposition until the
+    // x64 lowering bug is found.
+    if class_name == "java/math/BigInteger" {
+        return Some(SkipReason::BigIntegerArithmetic);
+    }
+
     // ANTLR-COLDPATH.1 — the Groovy-shaded ANTLR runtime blanket ban is
     // liftable for cold-path validation, but the PredictionContext equality /
     // hash cluster is a known correctness defect. Keep that cluster
@@ -3501,6 +3534,29 @@ mod tests {
     }
 
     #[test]
+    fn biginteger_itself_is_always_interpreted() {
+        // HIB-BIGINTEGER-AIOOBE.2: BigInteger itself, not just its
+        // MutableBigInteger helper, must stay interpreted regardless of
+        // policy or package-allow overrides. Uses a non-constructor method
+        // (`<init>` is already caught by the separate, earlier generic
+        // constructor gate, so it would not exercise this class-name check).
+        for policy in [SkipPolicy::Conservative, SkipPolicy::Aggressive] {
+            assert_eq!(
+                check_with(
+                    "java/math/BigInteger",
+                    "toString",
+                    false,
+                    true,
+                    policy,
+                    &["java/math/"],
+                ),
+                Some(SkipReason::BigIntegerArithmetic),
+                "BigInteger.toString must remain interpreted under {policy:?}",
+            );
+        }
+    }
+
+    #[test]
     fn hibernate_biginteger_divide_cluster_is_always_interpreted() {
         // HIB-BIGINTEGER-AIOOBE.1: do not let a package-allow override or the
         // aggressive policy re-enable the known-corrupting arithmetic class.
@@ -3526,8 +3582,11 @@ mod tests {
             }
         }
 
-        // Keep the quarantine scoped to the implementation class. Public
-        // callers such as BigInteger itself remain eligible for JIT.
+        // HIB-BIGINTEGER-AIOOBE.2 (2026-07-26) widened the quarantine to
+        // BigInteger itself too -- see biginteger_itself_is_always_interpreted
+        // above and that ban's doc comment for the deterministic repro that
+        // justified it. BigInteger.smallToString is therefore ALSO now
+        // interpreted, not exempt.
         assert_eq!(
             check(
                 "java/math/BigInteger",
@@ -3536,7 +3595,7 @@ mod tests {
                 true,
                 SkipPolicy::Aggressive,
             ),
-            None,
+            Some(SkipReason::BigIntegerArithmetic),
         );
     }
 

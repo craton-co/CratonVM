@@ -63855,9 +63855,20 @@ mod tests {
         let soft_addr = soft_ref.as_ptr() as usize;
         {
             let mut proc = shared.mem.ref_processor.lock();
-            // free_heap_mb=0 simulates memory pressure; current_time_ms very high to exceed LRU threshold
+            // free_heap_mb=0 simulates memory pressure; the clock must be far
+            // enough past the entry's own timestamp to exceed the LRU
+            // threshold.
+            //
+            // This used to be a literal `1_000_000`, which stopped working when
+            // `gc::reference` gained `last_observed_clock_ms`: "now" is
+            // `max(caller clock, mutator clock)`, and `SoftReference.<init>`
+            // stamps the entry with `SystemTime::now()` (~1.7e12) via
+            // `touch_soft_reference`. A caller clock of 1e6 was therefore
+            // dominated by the entry's own creation stamp, making idle time 0
+            // and the ref unclearable no matter how much pressure was reported.
+            // Anchor the test clock to the same wall clock the mutator uses.
             let is_marked = |addr: usize| -> bool { addr == soft_addr };
-            let _result = proc.process_references(&is_marked, 0, 1_000_000);
+            let _result = proc.process_references(&is_marked, 0, wall_clock_ms() + 60_000);
             let cleared = proc.cleared_ref_objects();
             assert!(
                 !cleared.is_empty(),
@@ -63925,6 +63936,149 @@ mod tests {
             Value::Object(Some(r)) => assert_eq!(r.as_ptr(), referent.as_ptr()),
             _ => panic!("M20: soft get() should still return referent"),
         }
+    }
+
+    // ======================================================================
+    // Soft-reference pressure input (arch-2026-07-26 §R1).
+    //
+    // `process_references_after_gc` and `g1_remark_process_references` in
+    // `vm/src/runtime/interpreter.rs` passed a hardcoded `64` for
+    // `free_heap_mb`, so the LRU threshold was pinned at exactly 64 seconds of
+    // idleness no matter how full the heap was and the policy could not respond
+    // to memory pressure at all. Both now pass
+    // `shared.mem.heap.soft_ref_policy_free_mb()`.
+    // ======================================================================
+
+    /// Wall-clock milliseconds, the same base
+    /// `NativeContext::touch_soft_reference` stamps soft entries with.
+    fn wall_clock_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before the Unix epoch")
+            .as_millis() as u64
+    }
+
+    /// Build a `SoftReference` whose referent is unmarked (so it is a clear
+    /// candidate) and return `(reference address, is_marked-visible address)`.
+    fn soft_ref_under_test(shared: &Arc<SharedVm>, thread: &mut JvmThread) -> usize {
+        let referent = shared.mem.heap.alloc_object(ClassId::new(0), 1);
+        let soft_ref = shared.mem.heap.alloc_object(ClassId::new(0), 2);
+        call_native(
+            shared,
+            thread,
+            "java/lang/ref/SoftReference",
+            "<init>",
+            "(Ljava/lang/Object;)V",
+            &[Value::Object(Some(soft_ref)), Value::Object(Some(referent))],
+        )
+        .unwrap();
+        soft_ref.as_ptr() as usize
+    }
+
+    /// THE POINT OF §R1: the pressure argument is load-bearing. At one fixed
+    /// instant, with one fixed amount of idleness, the old hardcoded `64` MB
+    /// retains the referent and a real "0 MB allocatable" reading clears it.
+    ///
+    /// If this test ever passes with both arms asserting the same outcome, the
+    /// call sites have regressed to a constant and the policy is dead again.
+    #[test]
+    fn soft_ref_policy_pressure_input_is_load_bearing() {
+        let shared = Arc::new(SharedVm::new(VmConfig::default()));
+        let mut thread = JvmThread::new(ThreadId(0), "test");
+        let soft_addr = soft_ref_under_test(&shared, &mut thread);
+        let is_marked = |addr: usize| -> bool { addr == soft_addr };
+
+        // 30 s of idleness: below the 64 s the old hardcode implied
+        // (`SoftRefLRUPolicyMSPerMB` defaults to 1000), above the 0 s that a
+        // heap with no allocatable headroom implies.
+        let now = wall_clock_ms() + 30_000;
+
+        {
+            let mut proc = shared.mem.ref_processor.lock();
+            let _ = proc.process_references(&is_marked, 64, now);
+            assert!(
+                proc.cleared_ref_objects().is_empty(),
+                "the old hardcoded 64 MB must retain a 30 s-idle soft ref \
+                 (threshold 64 s) -- if it does not, the arms of this test no \
+                 longer discriminate and the regression it guards is invisible"
+            );
+        }
+        {
+            let mut proc = shared.mem.ref_processor.lock();
+            let _ = proc.process_references(&is_marked, 0, now);
+            assert!(
+                !proc.cleared_ref_objects().is_empty(),
+                "with no allocatable headroom the same soft ref, at the same \
+                 instant, must be cleared -- this is the case the hardcoded \
+                 `64` made unreachable"
+            );
+        }
+    }
+
+    /// End-to-end pin on the value the two interpreter call sites now pass:
+    /// it comes from the live heap, is bounded by real headroom, and the
+    /// threshold it produces is the one the processor actually applies.
+    #[test]
+    fn soft_ref_policy_free_mb_drives_the_threshold_the_vm_call_sites_use() {
+        let shared = Arc::new(SharedVm::new(VmConfig::default()));
+        let mut thread = JvmThread::new(ThreadId(0), "test");
+
+        // Exactly the expression `process_references_after_gc` and
+        // `g1_remark_process_references` evaluate.
+        let free_mb = shared.mem.heap.soft_ref_policy_free_mb();
+
+        let (young_used, young_cap) = shared.mem.heap.young_gen_stats();
+        let (old_used, old_cap) = shared.mem.heap.old_gen_stats();
+        let total_free_mb =
+            (young_cap + old_cap).saturating_sub(young_used + old_used) / (1024 * 1024);
+        assert!(
+            free_mb <= total_free_mb,
+            "the pressure input ({free_mb} MB) must never exceed real whole-heap \
+             headroom ({total_free_mb} MB); over-reporting is the failure mode \
+             that clears soft refs never"
+        );
+
+        let soft_addr = soft_ref_under_test(&shared, &mut thread);
+        let is_marked = |addr: usize| -> bool { addr == soft_addr };
+
+        // `SoftRefLRUPolicyMSPerMB` defaults to 1000, so the threshold this
+        // reading implies is `free_mb` seconds. Idle by comfortably more.
+        let past_threshold = wall_clock_ms()
+            .saturating_add(free_mb.saturating_mul(1000) as u64)
+            .saturating_add(10_000);
+        {
+            let mut proc = shared.mem.ref_processor.lock();
+            let _ = proc.process_references(&is_marked, free_mb, past_threshold);
+            assert!(
+                !proc.cleared_ref_objects().is_empty(),
+                "a soft ref idle past `soft_ref_policy_free_mb()` seconds must \
+                 clear under the real pressure input ({free_mb} MB)"
+            );
+        }
+    }
+
+    /// The `0` third argument at both call sites is deliberate, not a second
+    /// hardcode: `gc::reference` substitutes the mutator clock it learned from
+    /// `touch_soft_reference`. A soft ref created *and touched* by
+    /// `SoftReference.<init>` must therefore look freshly-accessed — not
+    /// infinitely idle — when the collector passes `0`.
+    #[test]
+    fn soft_ref_policy_zero_clock_argument_uses_the_mutator_clock() {
+        let shared = Arc::new(SharedVm::new(VmConfig::default()));
+        let mut thread = JvmThread::new(ThreadId(0), "test");
+        let soft_addr = soft_ref_under_test(&shared, &mut thread);
+        let is_marked = |addr: usize| -> bool { addr == soft_addr };
+
+        let mut proc = shared.mem.ref_processor.lock();
+        // Maximum pressure (0 MB free) *and* the literal `0` clock the
+        // interpreter passes. The entry was stamped ~now by `<init>`, so its
+        // idle time is ~0 and it must survive.
+        let _ = proc.process_references(&is_marked, 0, 0);
+        assert!(
+            proc.cleared_ref_objects().is_empty(),
+            "a just-created, just-touched soft ref must not be cleared merely \
+             because the collector passes a `0` clock"
+        );
     }
 
     #[test]
@@ -64518,7 +64672,13 @@ mod tests {
         let soft_addr = soft.as_ptr() as usize;
         {
             let mut proc = shared.mem.ref_processor.lock();
-            let result = proc.process_references(&|addr| addr == soft_addr, 0, 1000);
+            // Wall-clock-anchored: `SoftReference.<init>` stamps the entry with
+            // `SystemTime::now()`, and `gc::reference` drives the LRU with
+            // `max(caller clock, observed mutator clock)`, so a literal `1000`
+            // here is dominated by the entry's own creation stamp and yields
+            // zero idle time. See `soft_ref_policy_pressure_input_is_load_bearing`.
+            let result =
+                proc.process_references(&|addr| addr == soft_addr, 0, wall_clock_ms() + 60_000);
             assert!(
                 result.stats.soft_refs_cleared >= 1,
                 "M20: soft ref should be cleared under zero free heap"
@@ -64665,9 +64825,13 @@ mod tests {
         let queue_addr = queue.as_ptr() as usize;
         {
             let mut proc = shared.mem.ref_processor.lock();
-            // free_heap=0 + high time = memory pressure clears soft ref
+            // free_heap=0 + a clock genuinely past the entry's creation stamp =
+            // memory pressure clears the soft ref. The clock must be anchored to
+            // the mutator's wall clock (`SoftReference.<init>` touches with
+            // `SystemTime::now()`), not a small literal — `gc::reference` drives
+            // the LRU with `max(caller clock, observed mutator clock)`.
             let is_marked = |addr: usize| -> bool { addr == soft_addr || addr == queue_addr };
-            let result = proc.process_references(&is_marked, 0, 1_000_000);
+            let result = proc.process_references(&is_marked, 0, wall_clock_ms() + 60_000);
             assert!(
                 result.stats.soft_refs_cleared >= 1,
                 "S28: soft ref should be cleared"

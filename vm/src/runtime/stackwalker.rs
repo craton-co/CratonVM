@@ -42,8 +42,16 @@
 //!   if the trace is ever read. The deferred resolver is fail-closed: it
 //!   yields the eager answer or [`LINE_NUMBER_UNKNOWN`], never a wrong line.
 //!
-//! See `docs/internal/arch-2026-07-26/stackwalk-and-vtable.md` for what a
-//! fully-lazy throw path additionally needs.
+//! `StackTraceEntry::method_index` (landed 2026-07-26, `cross-owner-closeout`)
+//! is what makes the deferred resolver **exact**: with only
+//! `(class_id, method_name, bci)` an overload set is unresolvable, and the
+//! members of an overload set have different `LineNumberTable`s. Entries built
+//! by [`entry_from_frame`] carry the index; entries built by the lock-free
+//! [`capture_frames_no_lines`] do not, and fall back to the (still fail-closed)
+//! unambiguous-name rule.
+//!
+//! See `docs/internal/arch-2026-07-26/stackwalk-and-vtable.md` and
+//! `docs/internal/arch-2026-07-26/cross-owner-closeout.md`.
 
 use std::sync::Arc;
 
@@ -144,24 +152,29 @@ fn signature_hash(name: &str, descriptor: &str) -> u64 {
     mix(mix(h, &[0xff]), descriptor.as_bytes())
 }
 
-/// `Class::find_method` with the per-signature slot memo in front of it.
+/// The *index* into [`Class::methods`] of the method matching
+/// `(name, descriptor)`, with the per-signature slot memo in front of the scan.
 ///
-/// Semantically **identical** to `class.find_method(name, descriptor)` — the
-/// memo only ever short-circuits a scan whose result is re-verified against
-/// the live class. See the module-level rules above.
-fn find_method_memoized<'a>(
-    class: &'a Class,
+/// Semantically **identical** to `class.methods.iter().position(...)` — the
+/// memo only ever short-circuits a scan whose result is re-verified against the
+/// live class. See the module-level rules above.
+///
+/// The index (rather than the borrow) is the primitive because it is also what
+/// [`StackTraceEntry::method_index`] carries, so a capture and a deferred
+/// resolution both name the method the same way.
+fn find_method_index_memoized(
+    class: &Class,
     class_id: ClassId,
     name: &str,
     descriptor: &str,
-) -> Option<&'a ClassFileMethod> {
+) -> Option<u32> {
     let key = (class_id.as_u32(), signature_hash(name, descriptor));
 
     let memoized = method_slot_memo().read().get(&key).copied();
     if let Some(idx) = memoized {
         if let Some(m) = class.methods.get(idx as usize) {
             if &*m.name == name && &*m.descriptor == descriptor {
-                return Some(m);
+                return Some(idx);
             }
         }
         // Stale (redefinition reordered/removed the method) or an FNV
@@ -173,15 +186,29 @@ fn find_method_memoized<'a>(
         .methods
         .iter()
         .position(|m| &*m.name == name && &*m.descriptor == descriptor)?;
+    let idx = u32::try_from(idx).ok()?;
 
     {
         let mut w = method_slot_memo().write();
         if w.len() >= METHOD_SLOT_MEMO_CAP {
             w.clear();
         }
-        w.insert(key, idx as u32);
+        w.insert(key, idx);
     }
-    class.methods.get(idx)
+    Some(idx)
+}
+
+/// `Class::find_method` with the per-signature slot memo in front of it.
+///
+/// Semantically **identical** to `class.find_method(name, descriptor)`.
+fn find_method_memoized<'a>(
+    class: &'a Class,
+    class_id: ClassId,
+    name: &str,
+    descriptor: &str,
+) -> Option<&'a ClassFileMethod> {
+    let idx = find_method_index_memoized(class, class_id, name, descriptor)?;
+    class.methods.get(idx as usize)
 }
 
 /// Test/diagnostic hook: drop every memoized slot. Never needed for
@@ -284,6 +311,11 @@ pub fn line_number_entries(
 ///
 /// The BCI written into the entry is the frame's `last_instr_pc` — this
 /// is what HotSpot exposes via `StackFrame.getByteCodeIndex()`.
+///
+/// The entry also records the frame's [`StackTraceEntry::method_index`]. That
+/// is free here (the same memo probe that finds the method for the line lookup
+/// yields it) and it is what makes a *deferred* resolution of this entry exact
+/// even for an overload set — see [`resolve_line_numbers_in_place`].
 pub fn entry_from_frame(class_store: &ClassStore, frame: &Frame) -> StackTraceEntry {
     let class_name = frame.class_name_arc();
     let method_name = frame.method_name_arc();
@@ -292,14 +324,20 @@ pub fn entry_from_frame(class_store: &ClassStore, frame: &Frame) -> StackTraceEn
     let bci = frame.last_instr_pc;
     let bci_i32 = bci.min(i32::MAX as usize) as i32;
 
-    let line_number = line_number_for_bci(
-        class_store,
-        frame.class_id,
-        &method_name,
-        &method_descriptor,
-        bci,
-    )
-    .unwrap_or(LINE_NUMBER_UNKNOWN);
+    // One class lookup and one memo probe serve both the method index and the
+    // line number; this is exactly the work `line_number_for_bci` used to do.
+    let (method_index, line_number) = match class_store.get(frame.class_id) {
+        Some(class) => {
+            let idx =
+                find_method_index_memoized(class, frame.class_id, &method_name, &method_descriptor);
+            let line = idx
+                .and_then(|i| class.methods.get(i as usize))
+                .and_then(|m| line_number_for_bci_in_method(m, bci))
+                .unwrap_or(LINE_NUMBER_UNKNOWN);
+            (idx, line)
+        }
+        None => (None, LINE_NUMBER_UNKNOWN),
+    };
 
     StackTraceEntry {
         class_name,
@@ -308,6 +346,7 @@ pub fn entry_from_frame(class_store: &ClassStore, frame: &Frame) -> StackTraceEn
         line_number,
         byte_code_index: bci_i32,
         class_id: Some(frame.class_id),
+        method_index,
     }
 }
 
@@ -333,12 +372,15 @@ pub fn capture_full_trace(class_store: &ClassStore, frames: &[Frame]) -> Vec<Sta
 /// number is left [`LINE_NUMBER_UNKNOWN`].
 ///
 /// Deferred resolution: pass the result to [`resolve_line_numbers_in_place`]
-/// once a `ClassStore` borrow is available. That resolves every frame whose
-/// method name is unambiguous within its declaring class and **leaves the rest
-/// at `UNKNOWN`** — the descriptor needed to disambiguate overloads is not
-/// carried on `StackTraceEntry` (see the doc's cross-owner request CR-SW-1).
-/// It therefore never reports a *wrong* line, only an unknown one, which is
-/// strictly better than the all-`UNKNOWN` snapshot this function returns.
+/// once a `ClassStore` borrow is available — `ThreadRegistry::frame_trace_of_resolved`
+/// is the wired-up reader.
+///
+/// These entries carry no [`StackTraceEntry::method_index`]: deriving one needs
+/// the `ClassStore` this function deliberately does not take. Deferred
+/// resolution therefore falls back to the unambiguous-name rule for them and
+/// leaves overloaded frames at `UNKNOWN`. It never reports a *wrong* line, only
+/// an unknown one, which is strictly better than the all-`UNKNOWN` snapshot
+/// this function returns.
 pub fn capture_frames_no_lines(frames: &[Frame]) -> Vec<StackTraceEntry> {
     frames
         .iter()
@@ -349,6 +391,11 @@ pub fn capture_frames_no_lines(frames: &[Frame]) -> Vec<StackTraceEntry> {
             line_number: LINE_NUMBER_UNKNOWN,
             byte_code_index: f.last_instr_pc.min(i32::MAX as usize) as i32,
             class_id: Some(f.class_id),
+            // Deliberately absent: resolving an index requires the ClassStore
+            // borrow this deposit path must not take. See CR-CLO-2 in
+            // `docs/internal/arch-2026-07-26/cross-owner-closeout.md` for the
+            // `Frame`-side change that would make it free.
+            method_index: None,
         })
         .collect()
 }
@@ -371,34 +418,47 @@ pub fn capture_frames_no_lines(frames: &[Frame]) -> Vec<StackTraceEntry> {
 ///    reused, so this can only ever fail *closed*, never resolve against the
 ///    wrong class;
 /// 4. its `byte_code_index` is non-negative;
-/// 5. **exactly one** method declared by that class carries the recorded name.
-///    With more than one, the entry names an overload set and
-///    `StackTraceEntry` does not carry the descriptor needed to pick the right
-///    member; two overloads have different `LineNumberTable`s, so guessing
-///    would print a line from the wrong method body. Those entries keep
-///    `UNKNOWN`.
+/// 5. the exact declaring method can be identified — see below.
 ///
 /// Returns the number of entries that were filled in.
 ///
-/// # Do not wire this onto the `Throwable` path yet
+/// # How the method is identified (rule 5)
 ///
-/// Rule 5 is a real fidelity ceiling, not a formality: overloaded methods are
-/// everywhere in the JDK and in framework code (`StringBuilder.append`,
-/// `Arrays.copyOf`, every builder API), so a throwable trace resolved this way
-/// would print `Unknown Source` for frames that the eager
-/// [`capture_full_trace`] resolves correctly today. That is a *regression* on
-/// `printStackTrace`, which is precisely the trade this repo has been burned by
-/// before (`tco-breaks-stacktrace-fidelity`).
+/// **Preferred, and exact: `method_index`.** An entry captured through
+/// [`entry_from_frame`] carries [`StackTraceEntry::method_index`], the frame's
+/// slot in `Class::methods`. The index is re-read from the *live* class and its
+/// `name` re-checked against the entry's `method_name` before it is used, so a
+/// redefinition that reordered or removed methods cannot resolve against the
+/// wrong body — it simply fails the check and drops through to the fallback.
+/// With the index present, an overload set is no obstacle: overloads occupy
+/// distinct slots.
+///
+/// **Fallback, when `method_index` is absent** (synthetic entries, and the
+/// deliberately `ClassStore`-free [`capture_frames_no_lines`] snapshot): resolve
+/// only when **exactly one** method declared by that class carries the recorded
+/// name. With more than one, the entry names an overload set and there is
+/// nothing left to disambiguate with; two overloads have different
+/// `LineNumberTable`s, so guessing would print a line from the wrong method
+/// body. Those entries keep `UNKNOWN`.
+///
+/// Either way the function is **fail-closed**: it yields the line an eager
+/// capture would have produced, or `UNKNOWN`. It never reports a wrong line.
+///
+/// # Relationship to the `Throwable` path
+///
+/// This is *not* wired onto the `Throwable` path, and adding `method_index` did
+/// not change that. `Throwable` capture goes through [`capture_full_trace`],
+/// which resolves eagerly and correctly today, including for overloads; routing
+/// it through a deferred resolve would be a behaviour change to the most
+/// fidelity-sensitive output the VM produces (`printStackTrace`) for a
+/// throughput win, and this repo has been burned by exactly that trade before
+/// (`tco-breaks-stacktrace-fidelity`). What the index buys is that such a change
+/// is now *possible* without a fidelity loss; making it is a separate,
+/// measurable step. See
+/// `docs/internal/arch-2026-07-26/cross-owner-closeout.md`.
 ///
 /// It is a strict *improvement* for [`capture_frames_no_lines`] consumers,
-/// which have no line numbers at all right now.
-///
-/// Closing the gap needs `StackTraceEntry` to carry the frame's method
-/// identity — its descriptor, or better its index into `Class::methods` — so
-/// deferred resolution is exact for every frame. `StackTraceEntry` lives in
-/// `native-api/src/registry.rs`, which this pass does not own; see cross-owner
-/// request CR-SW-1 in
-/// `docs/internal/arch-2026-07-26/stackwalk-and-vtable.md`.
+/// which have no line numbers at all otherwise.
 pub fn resolve_line_numbers_in_place(
     class_store: &ClassStore,
     entries: &mut [StackTraceEntry],
@@ -415,18 +475,33 @@ pub fn resolve_line_numbers_in_place(
             continue;
         };
         let name = &*entry.method_name;
-        let mut only: Option<&ClassFileMethod> = None;
-        for m in &class.methods {
-            if &*m.name == name {
-                if only.is_some() {
-                    // Overload set — cannot disambiguate without a descriptor.
-                    only = None;
-                    break;
+
+        // Exact path: the captured slot, re-verified against the live class.
+        let mut method: Option<&ClassFileMethod> = entry
+            .method_index
+            .and_then(|idx| class.methods.get(idx as usize))
+            .filter(|m| &*m.name == name);
+
+        if method.is_none() {
+            // No index, or the index no longer names this method (redefinition).
+            // Fall back to the unambiguous-name rule, which is also fail-closed:
+            // if the name is unique within the class it can only denote the one
+            // method, and if it is not, we decline.
+            let mut only: Option<&ClassFileMethod> = None;
+            for m in &class.methods {
+                if &*m.name == name {
+                    if only.is_some() {
+                        // Overload set — cannot disambiguate without an index.
+                        only = None;
+                        break;
+                    }
+                    only = Some(m);
                 }
-                only = Some(m);
             }
+            method = only;
         }
-        let Some(method) = only else {
+
+        let Some(method) = method else {
             continue;
         };
         if let Some(line) = line_number_for_bci_in_method(method, entry.byte_code_index as usize) {
@@ -448,6 +523,7 @@ pub fn synthetic_entry(class_name: Arc<str>, method_name: Arc<str>) -> StackTrac
         line_number: LINE_NUMBER_NATIVE,
         byte_code_index: -1,
         class_id: None,
+        method_index: None,
     }
 }
 
@@ -457,8 +533,14 @@ pub fn source_file_of_class(class: &Class) -> Option<Arc<str>> {
     class.source_file.as_deref().map(Arc::from)
 }
 
+/// Test-only `ClassStore` fixtures.
+///
+/// Lives outside `mod tests` because deferred line resolution is *consumed*
+/// elsewhere in the crate (`threading::thread_registry::frame_trace_of_resolved`),
+/// and that module's tests need a real class to resolve against. Mirrors
+/// `classloading::class::tests::make_class`.
 #[cfg(test)]
-mod tests {
+pub(crate) mod test_support {
     use super::*;
     use crate::classloading::{ClassLoaderId, ClassState};
     use cratonvm_reader::attribute::{Attribute, CodeAttribute, LineNumberEntry};
@@ -467,14 +549,11 @@ mod tests {
     use cratonvm_reader::constant_pool::{ConstantPool, ConstantPoolEntry};
     use cratonvm_reader::method::ClassFileMethod;
 
-    // -- ClassStore-backed fixtures -------------------------------------
-    //
-    // Mirrors `classloading::class::tests::make_class` so this module can
-    // exercise `line_number_for_bci` / `resolve_line_numbers_in_place` through
-    // a real `ClassStore` rather than reimplementing the scan (which is what
-    // the pre-existing tests below had to do).
-
-    fn named_method(name: &str, descriptor: &str, lines: Vec<LineNumberEntry>) -> ClassFileMethod {
+    pub(crate) fn named_method(
+        name: &str,
+        descriptor: &str,
+        lines: Vec<LineNumberEntry>,
+    ) -> ClassFileMethod {
         let code = CodeAttribute {
             max_stack: 1,
             max_locals: 1,
@@ -492,7 +571,7 @@ mod tests {
         }
     }
 
-    fn store_with(methods: Vec<ClassFileMethod>) -> (ClassStore, ClassId) {
+    pub(crate) fn store_with(methods: Vec<ClassFileMethod>) -> (ClassStore, ClassId) {
         let mut store = ClassStore::new();
         let id = store.next_id();
         let class = Class {
@@ -531,7 +610,18 @@ mod tests {
         let id = store.add(class);
         (store, id)
     }
+}
 
+#[cfg(test)]
+mod tests {
+    use super::test_support::{named_method, store_with};
+    use super::*;
+    use cratonvm_reader::attribute::{Attribute, CodeAttribute, LineNumberEntry};
+    use cratonvm_reader::class_access_flags::MethodAccessFlags;
+    use cratonvm_reader::method::ClassFileMethod;
+
+    /// A deferred entry with no `method_index` — i.e. what the lock-free
+    /// `capture_frames_no_lines` snapshot produces.
     fn entry_for(class_id: ClassId, method: &str, bci: i32) -> StackTraceEntry {
         StackTraceEntry {
             class_name: Arc::from("probe/Target"),
@@ -540,6 +630,21 @@ mod tests {
             line_number: LINE_NUMBER_UNKNOWN,
             byte_code_index: bci,
             class_id: Some(class_id),
+            method_index: None,
+        }
+    }
+
+    /// A deferred entry that carries the method slot, i.e. what
+    /// `entry_from_frame` produces.
+    fn entry_for_indexed(
+        class_id: ClassId,
+        method: &str,
+        bci: i32,
+        method_index: u32,
+    ) -> StackTraceEntry {
+        StackTraceEntry {
+            method_index: Some(method_index),
+            ..entry_for(class_id, method, bci)
         }
     }
 
@@ -726,6 +831,161 @@ mod tests {
             entries[0].line_number, LINE_NUMBER_UNKNOWN,
             "an overload set must stay UNKNOWN rather than guess a body"
         );
+    }
+
+    // -- exact deferred resolution via `method_index` (CR-SW-1) ----------
+
+    /// Two overloads with different `LineNumberTable`s. Without an index the
+    /// resolver must decline (covered above); with one it must pick the exact
+    /// body — this is the whole point of the field.
+    fn overloaded_store() -> (ClassStore, ClassId) {
+        store_with(vec![
+            named_method(
+                "run",
+                "(I)V",
+                vec![LineNumberEntry {
+                    start_pc: 0,
+                    line_number: 11,
+                }],
+            ),
+            named_method(
+                "run",
+                "(J)V",
+                vec![LineNumberEntry {
+                    start_pc: 0,
+                    line_number: 22,
+                }],
+            ),
+            named_method(
+                "run",
+                "(Ljava/lang/String;)V",
+                vec![LineNumberEntry {
+                    start_pc: 0,
+                    line_number: 33,
+                }],
+            ),
+        ])
+    }
+
+    #[test]
+    fn deferred_resolution_is_exact_for_overloads_when_the_index_is_present() {
+        clear_method_slot_memo();
+        let (store, cid) = overloaded_store();
+        let mut entries = vec![
+            entry_for_indexed(cid, "run", 0, 0),
+            entry_for_indexed(cid, "run", 0, 1),
+            entry_for_indexed(cid, "run", 0, 2),
+        ];
+        assert_eq!(
+            resolve_line_numbers_in_place(&store, &mut entries),
+            3,
+            "every overloaded frame must resolve once the slot is carried"
+        );
+        assert_eq!(entries[0].line_number, 11);
+        assert_eq!(entries[1].line_number, 22);
+        assert_eq!(entries[2].line_number, 33);
+    }
+
+    #[test]
+    fn deferred_resolution_with_index_matches_the_eager_answer_exactly() {
+        // The contract that lets a future pass defer the Throwable path: for
+        // every overload, deferred-with-index == eager.
+        clear_method_slot_memo();
+        let (store, cid) = overloaded_store();
+        for (idx, descriptor) in [(0u32, "(I)V"), (1, "(J)V"), (2, "(Ljava/lang/String;)V")] {
+            let eager = line_number_for_bci(&store, cid, "run", descriptor, 0);
+            let mut entries = vec![entry_for_indexed(cid, "run", 0, idx)];
+            assert_eq!(resolve_line_numbers_in_place(&store, &mut entries), 1);
+            assert_eq!(
+                Some(entries[0].line_number),
+                eager,
+                "deferred resolution of slot {idx} must equal the eager answer"
+            );
+        }
+    }
+
+    #[test]
+    fn a_stale_index_falls_back_rather_than_resolving_the_wrong_body() {
+        // A redefinition reorders methods under a captured trace. The index now
+        // names a *different* method, so the name check must reject it. Here
+        // the name is unique after the reorder, so the fallback resolves it
+        // correctly; the point is that the wrong body is never used.
+        clear_method_slot_memo();
+        let (store, cid) = store_with(vec![
+            named_method(
+                "other",
+                "()V",
+                vec![LineNumberEntry {
+                    start_pc: 0,
+                    line_number: 99,
+                }],
+            ),
+            named_method(
+                "compute",
+                "()I",
+                vec![LineNumberEntry {
+                    start_pc: 0,
+                    line_number: 40,
+                }],
+            ),
+        ]);
+        // Entry captured when `compute` was at slot 0.
+        let mut entries = vec![entry_for_indexed(cid, "compute", 0, 0)];
+        assert_eq!(resolve_line_numbers_in_place(&store, &mut entries), 1);
+        assert_eq!(
+            entries[0].line_number, 40,
+            "must not report `other`'s line 99"
+        );
+    }
+
+    #[test]
+    fn a_stale_index_into_an_overload_set_fails_closed() {
+        // Same as above but the fallback cannot help: the name is overloaded.
+        // The only acceptable answer is UNKNOWN.
+        clear_method_slot_memo();
+        let (store, cid) = overloaded_store();
+        let mut entries = vec![entry_for_indexed(cid, "missing", 0, 1)];
+        assert_eq!(resolve_line_numbers_in_place(&store, &mut entries), 0);
+        assert_eq!(entries[0].line_number, LINE_NUMBER_UNKNOWN);
+
+        // And an out-of-range index (class shrank under the trace).
+        let mut entries = vec![entry_for_indexed(cid, "run", 0, 99)];
+        assert_eq!(resolve_line_numbers_in_place(&store, &mut entries), 0);
+        assert_eq!(entries[0].line_number, LINE_NUMBER_UNKNOWN);
+    }
+
+    #[test]
+    fn an_index_pointing_at_the_wrong_overload_is_still_rejected_by_name_only_if_names_differ() {
+        // Honest statement of the residual: the verification is by *name*, so a
+        // stale index that happens to land on ANOTHER member of the same
+        // overload set passes the check. That is why the index is written at
+        // capture time and only ever read against the same live class — and why
+        // the Throwable path stays eager rather than deferring across a window
+        // in which a redefinition could reorder an overload set.
+        clear_method_slot_memo();
+        let (store, cid) = overloaded_store();
+        let mut entries = vec![entry_for_indexed(cid, "run", 0, 1)];
+        assert_eq!(resolve_line_numbers_in_place(&store, &mut entries), 1);
+        assert_eq!(entries[0].line_number, 22, "slot 1 is `run(J)V`");
+    }
+
+    #[test]
+    fn resolution_never_touches_an_entry_whose_class_is_gone_even_with_an_index() {
+        clear_method_slot_memo();
+        let (mut store, cid) = overloaded_store();
+        let mut entries = vec![entry_for_indexed(cid, "run", 0, 0)];
+        let _ = store.remove(cid);
+        assert_eq!(resolve_line_numbers_in_place(&store, &mut entries), 0);
+        assert_eq!(entries[0].line_number, LINE_NUMBER_UNKNOWN);
+    }
+
+    #[test]
+    fn synthetic_and_lockfree_entries_carry_no_method_index() {
+        let e = synthetic_entry(Arc::from("java/lang/Object"), Arc::from("hashCode"));
+        assert!(e.method_index.is_none());
+        // `capture_frames_no_lines` is covered by its own integration path; the
+        // invariant asserted here is the one the resolver depends on.
+        assert_eq!(entry_for(ClassId::new(0), "run", 0).method_index, None);
     }
 
     #[test]

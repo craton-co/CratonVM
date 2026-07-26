@@ -87,6 +87,18 @@ impl ShadowStack {
     pub const TOP_OFFSET: usize = 0;
     /// Byte offset of the `end` field. Read by the JIT-emitted overflow guard.
     pub const END_OFFSET: usize = 8;
+    /// Byte offset of the `base` field.
+    ///
+    /// Part of the same `#[repr(C)]` contract as `TOP_OFFSET`/`END_OFFSET` and
+    /// asserted by `layout_offsets_match_jit_contract`. Not read by codegen —
+    /// it exists so the moving-young coverage verifier
+    /// (`conservative_roots::moving_young_unpublished_frame_oop_present`) can
+    /// recover a thread's published shadow window `[base, top)` from a live
+    /// compiled frame alone: that frame caches its `*mut JvmThread` in
+    /// `[rbp - CompiledMethod::shadow_thread_slot_off]` and the `ShadowStack`
+    /// sits at `thread + CompiledMethod::shadow_off_in_thread`. Without `base`
+    /// the verifier could find `top` but not the start of the scan range.
+    pub const BASE_OFFSET: usize = 16;
 }
 
 // SAFETY: a `ShadowStack` is exclusive to its owning thread; the raw addresses
@@ -248,6 +260,33 @@ mod tests {
             &s.end as *const usize as usize - base,
             ShadowStack::END_OFFSET
         );
+        assert_eq!(
+            &s.base as *const usize as usize - base,
+            ShadowStack::BASE_OFFSET,
+            "the moving-young coverage verifier recovers the published shadow \
+             window [base, top) from a live compiled frame using these offsets",
+        );
+    }
+
+    /// The verifier compares a compiled frame's spill words against the values
+    /// in `[base, top)`. That range is what `for_each_value` walks, so the two
+    /// must agree exactly — a `top` above the pushed data would let the
+    /// verifier accept an unpublished oop because a stale slot happened to
+    /// hold it.
+    #[test]
+    fn published_window_matches_the_scanned_range() {
+        let mut s = ShadowStack::empty();
+        s.ensure_allocated();
+        assert!(s.push(0x1000));
+        assert!(s.push(0x2000));
+
+        let mut scanned = Vec::new();
+        s.for_each_value(|v| scanned.push(v));
+        let window: Vec<usize> = (0..s.depth())
+            .map(|i| unsafe { ((s.base + i * 8) as *const usize).read() })
+            .collect();
+        assert_eq!(scanned, window);
+        assert_eq!(s.top, s.base + scanned.len() * 8);
     }
 
     #[test]

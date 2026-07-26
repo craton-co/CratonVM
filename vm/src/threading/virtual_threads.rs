@@ -1337,7 +1337,14 @@ impl VirtualThreadManager {
                 let Some(vt) = threads.get_mut(&vt_id) else {
                     continue;
                 };
-                if vt.state == VirtualThreadState::Parked && vt.runtime.is_some() {
+                // `Parked` alone, for the reason spelled out in
+                // `unpark_virtual`: on the live path `Parked` already implies
+                // a deposited runtime, and where it does not, refusing to
+                // submit loses the wake permanently (nothing will call
+                // `suspend_runtime` for an already-parked thread, so the
+                // `wake_pending` flag set below would never be consumed).
+                // Submitting a runtime-less thread is a no-op.
+                if vt.state == VirtualThreadState::Parked {
                     vt.state = VirtualThreadState::Started;
                     ready.push(vt_id);
                 } else if vt.state != VirtualThreadState::Terminated {
@@ -1414,7 +1421,25 @@ impl VirtualThreadManager {
             if vt.state == VirtualThreadState::Terminated {
                 return;
             }
-            if vt.state == VirtualThreadState::Parked && vt.runtime.is_some() {
+            // `Parked` alone is the resubmit condition — deliberately NOT
+            // `Parked && runtime.is_some()`.
+            //
+            // On the live path the two are equivalent: `suspend_runtime` sets
+            // `state = Parked` and `runtime = Some(..)` under one hold of the
+            // `threads` mutex, so no observer can see them disagree. The
+            // conjunct was therefore only ever load-bearing when the invariant
+            // is violated — and there it fails the WRONG WAY. Refusing to
+            // submit a `Parked` thread is a permanent hang, which is the exact
+            // defect this function exists to fix. Submitting one that has no
+            // runtime is harmless: `take_runtime_for_mount` returns `None` and
+            // `resume_virtual_continuation` returns immediately.
+            //
+            // Fail open. "Parked implies resubmit" is the invariant that keeps
+            // virtual threads from disappearing, and it must hold
+            // unconditionally. (Caught by the pre-existing
+            // `manager_park_and_unpark`, whose expectation is still exactly
+            // right.)
+            if vt.state == VirtualThreadState::Parked {
                 vt.state = VirtualThreadState::Started;
                 vt.unpark_permit = false;
                 resubmit = true;
@@ -3165,6 +3190,11 @@ mod tests {
         mgr.create_virtual_thread_with_id(id, "unpark-parked");
         mgr.install_runtime(id, Box::new(JvmThread::new(ThreadId(id), "unpark-parked")));
         mgr.start(id);
+        // Drain `start`'s own submission. Without this the queue is never
+        // empty, and every "must not have resubmitted" assertion below would
+        // pass on `start`'s leftover entry instead of testing anything — the
+        // test could not have detected the duplicate-submission bug it names.
+        assert_eq!(mgr.scheduler().next_task(0), Some(id));
         let (runtime, _) = mgr.take_runtime_for_mount(id, 0).unwrap();
         assert_eq!(mgr.scheduler().next_task(0), None);
 
@@ -3213,6 +3243,11 @@ mod tests {
         mgr.create_virtual_thread_with_id(id, "unpark-timed");
         mgr.install_runtime(id, Box::new(JvmThread::new(ThreadId(id), "unpark-timed")));
         mgr.start(id);
+        // Drain `start`'s own submission — see the note in
+        // `unpark_after_unmount_resubmits_once`. The whole point of this test
+        // is the assertion that the queue is EMPTY after a timed yield; with
+        // `start`'s entry still sitting there that assertion is untestable.
+        assert_eq!(mgr.scheduler().next_task(0), Some(id));
         let (runtime, _) = mgr.take_runtime_for_mount(id, 0).unwrap();
 
         mgr.unpark_virtual(id);
@@ -3230,6 +3265,44 @@ mod tests {
         mgr.cancel_wakeup(id);
         // Stops the lazily-started wakeup-timer thread this park spawned.
         mgr.shutdown();
+    }
+
+    /// `Parked` implies resubmit, unconditionally — including when no runtime
+    /// has been deposited.
+    ///
+    /// This pins the reason `unpark_virtual`'s condition is `state == Parked`
+    /// and not `state == Parked && runtime.is_some()`. The two agree on the
+    /// live path (`suspend_runtime` writes both under one lock hold), so the
+    /// conjunct can only ever matter when the invariant is already broken —
+    /// and there it fails closed, turning a wake into a permanent hang. This
+    /// is the same shape the pre-existing `manager_park_and_unpark` asserts;
+    /// kept separately so the *reason* is not lost if that test is rewritten.
+    #[test]
+    fn unpark_of_parked_thread_without_runtime_still_resubmits() {
+        let mgr = VirtualThreadManager::new(1);
+        let id = mgr.create_virtual_thread("parked-no-runtime");
+        {
+            let mut threads = mgr.threads.lock();
+            threads.get_mut(&id).unwrap().mount(0);
+        }
+        assert!(mgr.park_virtual(id));
+        assert_eq!(mgr.get_state(id), Some(VirtualThreadState::Parked));
+        assert!(
+            mgr.threads.lock().get(&id).unwrap().runtime.is_none(),
+            "precondition: this thread has no deposited runtime"
+        );
+
+        mgr.unpark_virtual(id);
+        assert_eq!(
+            mgr.get_state(id),
+            Some(VirtualThreadState::Started),
+            "a parked thread must always become runnable on unpark"
+        );
+        assert_eq!(
+            mgr.scheduler().next_task(0),
+            Some(id),
+            "and must actually reach the scheduler queue"
+        );
     }
 
     /// An unpark of a terminated virtual thread is a no-op — no resurrection,

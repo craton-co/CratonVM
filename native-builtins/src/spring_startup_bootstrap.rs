@@ -2116,6 +2116,41 @@ fn ccpp_process_config_bean_definitions(
 
 /// Recursively walk a class' @Import tree and ensure every imported class
 /// has a RootBeanDefinition registered.  `seen` prevents cycles.
+/// Cached `CCPP_DBG` lookup.
+///
+/// `walk_imports_recursive` runs the `@Import` closure for every
+/// configuration class in the context, and this probe sits on the
+/// class-not-found branch that a large Spring Boot startup takes hundreds of
+/// times (every `@ConditionalOnClass`-guarded import of an absent
+/// optional dependency). `env::var` also allocates a `String` per call on top
+/// of taking the environ lock. Latch it once; the switch must be set before
+/// the first context refresh to take effect.
+#[inline]
+fn ccpp_dbg_enabled() -> bool {
+    static DBG: OnceLock<bool> = OnceLock::new();
+    *DBG.get_or_init(|| std::env::var_os("CCPP_DBG").is_some())
+}
+
+#[cfg(test)]
+mod ccpp_dbg_flag_tests {
+    #[test]
+    fn ccpp_dbg_flag_is_latched_and_matches_environment() {
+        // The `@Import` walker used to call `env::var` (which also allocates a
+        // `String`) on every missing-class branch. The latched helper must
+        // agree with the environment at first use and stay stable.
+        let expected = std::env::var_os("CCPP_DBG").is_some();
+        assert_eq!(super::ccpp_dbg_enabled(), expected);
+        assert_eq!(super::ccpp_dbg_enabled(), expected);
+    }
+
+    #[test]
+    fn ccpp_dbg_flag_is_off_in_a_clean_environment() {
+        if std::env::var_os("CCPP_DBG").is_none() {
+            assert!(!super::ccpp_dbg_enabled());
+        }
+    }
+}
+
 fn walk_imports_recursive(
     ctx: &mut dyn NativeContext,
     class_name: &str,
@@ -2178,7 +2213,7 @@ fn walk_imports_recursive(
         // Without this, registering a RootBeanDefinition for a missing class
         // throws CannotLoadBeanClassException later during bean preInstantiation.
         if ctx.class_id_by_name(&imp_class).is_none() && ctx.load_class(&imp_class).is_err() {
-            if std::env::var("CCPP_DBG").is_ok() {
+            if ccpp_dbg_enabled() {
                 eprintln!(
                     "[CCPP-DBG] walk_imports: skipping missing @Import target {}",
                     imp_class

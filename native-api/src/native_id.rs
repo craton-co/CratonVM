@@ -170,8 +170,44 @@ const MEMO_EMPTY: u64 = 0;
 /// makes a stale negative self-heal at the cost of one `u32` compare, so the
 /// mechanism is correct at every point in the VM's lifetime, not just after
 /// boot. Positive entries are also revalidated, which is free.
+///
+/// # One cell, one triple — and how that is enforced
+///
+/// The memo is keyed on the registry generation **alone**. The
+/// `(class, method, descriptor)` triple is deliberately *not* re-checked on a
+/// warm hit: re-checking it would mean re-hashing the three strings, which is
+/// the exact cost this type exists to remove. The invariant is therefore a
+/// contract on the caller:
+///
+/// > **A given `NativeCallSite` must only ever be asked about one triple.**
+///
+/// Every intended embedding satisfies it structurally — a `static` cell beside
+/// a constant-triple lookup, or a cell owned by the `CachedBytecodeMethod`
+/// whose own `(class_name, method_name, method_descriptor)` is the triple being
+/// looked up. The public API makes it hard to break by accident (there is no
+/// way to inject a raw [`NativeMethodId`], and the strings are passed on every
+/// call so a site cannot silently drift), but it cannot make it *impossible*:
+/// sharing one `static` across two nearby call sites that happen to look up
+/// different triples compiles fine and is silently wrong — the second site
+/// redeems the first site's answer.
+///
+/// So that misuse is **loud instead of silent** in debug builds: the cell
+/// remembers a digest of the first triple it was filled with and
+/// `debug_assert!`s that every later query matches. The field and the check are
+/// behind `#[cfg(debug_assertions)]`, so a release build is byte-for-byte the
+/// one-word cell described above and pays nothing — deliberately, because a
+/// release-path triple check would reinstate the string hashing.
 pub struct NativeCallSite {
     memo: AtomicU64,
+    /// Debug-only witness of "which triple has this cell been used for".
+    ///
+    /// `0` means "never queried"; any other value is a non-zero fold of the
+    /// registry's own 128-bit digest of the triple. Not present in release
+    /// builds. Relaxed ordering is sufficient: this is a debugging aid, and a
+    /// benign race between two threads filling the *same* site with the *same*
+    /// triple stores the same value.
+    #[cfg(debug_assertions)]
+    triple_witness: AtomicU64,
 }
 
 impl NativeCallSite {
@@ -180,7 +216,55 @@ impl NativeCallSite {
     pub const fn new() -> Self {
         Self {
             memo: AtomicU64::new(MEMO_EMPTY),
+            #[cfg(debug_assertions)]
+            triple_witness: AtomicU64::new(0),
         }
+    }
+
+    /// Record the triple this cell is being queried with and report whether it
+    /// agrees with the one it was first queried with. Returns `true` for the
+    /// first query, and `true` in release builds (where the witness field does
+    /// not exist).
+    ///
+    /// Only ever called from inside a [`debug_assert!`], so in a release build
+    /// the expression is not evaluated at all and the hash is never computed —
+    /// which is the whole point of the memo. It must never become a
+    /// release-path check.
+    #[inline]
+    #[cfg(debug_assertions)]
+    fn witness_triple(&self, class_name: &str, method_name: &str, descriptor: &str) -> bool {
+        let (lo, hi) = crate::registry::native_method_hash(class_name, method_name, descriptor);
+        // Fold the registry's own 128-bit digest to one word and force it
+        // non-zero, since 0 is the "never queried" sentinel.
+        let digest = (lo ^ hi.rotate_left(32)) | 1;
+        let prev = self.triple_witness.swap(digest, Ordering::Relaxed);
+        prev == 0 || prev == digest
+    }
+
+    /// Release-build stand-in. Never reached from the hot path — the
+    /// `debug_assert!` in [`check_one_triple_per_site`](Self::check_one_triple_per_site)
+    /// does not evaluate its expression in release — so the triple is not
+    /// hashed and the cell stays one word wide.
+    #[inline]
+    #[cfg(not(debug_assertions))]
+    #[allow(dead_code)]
+    fn witness_triple(&self, _class_name: &str, _method_name: &str, _descriptor: &str) -> bool {
+        true
+    }
+
+    /// The `debug_assert!` wrapper around [`witness_triple`](Self::witness_triple).
+    #[inline]
+    fn check_one_triple_per_site(&self, class_name: &str, method_name: &str, descriptor: &str) {
+        debug_assert!(
+            self.witness_triple(class_name, method_name, descriptor),
+            "NativeCallSite reused for a second (class, method, descriptor) triple \
+             (now {}.{}{}). A call site memoizes ONE triple — the warm path never \
+             re-checks the strings — so two distinct lookups must not share a cell. \
+             Give each lookup its own `NativeCallSite`.",
+            class_name,
+            method_name,
+            descriptor
+        );
     }
 
     /// Resolve (and memoize) the native for this call site.
@@ -197,6 +281,7 @@ impl NativeCallSite {
         method_name: &str,
         descriptor: &str,
     ) -> Option<NativeMethodId> {
+        self.check_one_triple_per_site(class_name, method_name, descriptor);
         let generation = registry.generation();
         let memo = self.memo.load(Ordering::Relaxed);
         if memo != MEMO_EMPTY && (memo >> 32) as u32 == generation {
@@ -217,6 +302,7 @@ impl NativeCallSite {
         method_name: &str,
         descriptor: &str,
     ) -> Option<NativeMethodId> {
+        self.check_one_triple_per_site(class_name, method_name, descriptor);
         let generation = registry.generation();
         let memo = self.memo.load(Ordering::Relaxed);
         if memo != MEMO_EMPTY && (memo >> 32) as u32 == generation {
@@ -259,6 +345,10 @@ impl NativeCallSite {
     /// Forget the memoized result. Rarely needed — the generation check already
     /// handles new registrations — but available for a caller that knows its
     /// own resolution inputs changed.
+    ///
+    /// This clears the *memo*, not the cell's identity: the debug-only triple
+    /// witness is deliberately retained, because invalidating a memo does not
+    /// turn a call site into a different call site.
     #[inline]
     pub fn invalidate(&self) {
         self.memo.store(MEMO_EMPTY, Ordering::Relaxed);
@@ -330,6 +420,12 @@ impl Clone for NativeCallSite {
     fn clone(&self) -> Self {
         Self {
             memo: AtomicU64::new(self.memo.load(Ordering::Relaxed)),
+            // The clone stands at the same call site (a cloned
+            // `CachedBytecodeMethod` describes the same method), so it inherits
+            // the triple witness rather than starting blank — otherwise cloning
+            // would launder a contract violation into a clean cell.
+            #[cfg(debug_assertions)]
+            triple_witness: AtomicU64::new(self.triple_witness.load(Ordering::Relaxed)),
         }
     }
 }
@@ -520,6 +616,114 @@ mod tests {
         assert!(other_site.callback(&second, "z/Z", "other", "()V").is_some());
         // And that second site is likewise not warm for the first registry.
         assert!(!other_site.is_warm(&first));
+    }
+
+    // -----------------------------------------------------------------------
+    // ARCH-2026-07-26 `cross-owner-closeout`: the one-cell-one-triple contract.
+    //
+    // The memo is keyed on the registry generation alone; the triple is NOT
+    // re-checked on a warm hit (that would reinstate the string hashing this
+    // type exists to remove). So a shared cell is silently wrong. These tests
+    // pin the debug-only witness that makes it loud instead.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn witness_accepts_the_same_triple_repeatedly() {
+        let site = NativeCallSite::new();
+        for _ in 0..4 {
+            assert!(site.witness_triple("a/A", "m", "()V"));
+        }
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    fn witness_rejects_a_second_triple_on_the_same_cell() {
+        let site = NativeCallSite::new();
+        assert!(site.witness_triple("a/A", "m", "()V"), "first query sets it");
+        assert!(
+            !site.witness_triple("a/A", "m", "()I"),
+            "a differing descriptor alone must be caught"
+        );
+        // The witness moves to the most recent triple, so a repeat of the new
+        // one agrees — the assertion has already fired for the transition.
+        assert!(site.witness_triple("a/A", "m", "()I"));
+        assert!(
+            !site.witness_triple("b/B", "m", "()I"),
+            "a differing class must be caught"
+        );
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "NativeCallSite reused for a second")]
+    fn sharing_one_cell_between_two_triples_panics_in_debug() {
+        let mut registry = NativeMethodRegistry::new();
+        registry.register("a/A", "m", "()V", native_a);
+        registry.register("z/Z", "other", "()V", native_b);
+
+        let shared = NativeCallSite::new();
+        assert!(shared.callback(&registry, "a/A", "m", "()V").is_some());
+        // Without the witness this would silently redeem `a/A.m`'s slot for
+        // `z/Z.other` — the failure mode the invariant exists to prevent.
+        let _ = shared.callback(&registry, "z/Z", "other", "()V");
+    }
+
+    #[test]
+    fn a_dedicated_cell_per_triple_is_the_supported_shape() {
+        let mut registry = NativeMethodRegistry::new();
+        registry.register("a/A", "m", "()V", native_a);
+        registry.register("z/Z", "other", "()V", native_b);
+
+        let site_a = NativeCallSite::new();
+        let site_z = NativeCallSite::new();
+        assert_eq!(
+            addr(site_a.callback(&registry, "a/A", "m", "()V").expect("hit")),
+            addr(native_a as NativeCallback)
+        );
+        assert_eq!(
+            addr(
+                site_z
+                    .callback(&registry, "z/Z", "other", "()V")
+                    .expect("hit")
+            ),
+            addr(native_b as NativeCallback)
+        );
+        // ...and stay correct once warm.
+        assert_eq!(
+            addr(site_a.callback(&registry, "a/A", "m", "()V").expect("hit")),
+            addr(native_a as NativeCallback)
+        );
+        assert_eq!(
+            addr(
+                site_z
+                    .callback(&registry, "z/Z", "other", "()V")
+                    .expect("hit")
+            ),
+            addr(native_b as NativeCallback)
+        );
+    }
+
+    #[test]
+    fn invalidate_does_not_clear_the_triple_witness() {
+        // `invalidate` forgets the *memo*; it does not turn the cell into a
+        // different call site, so the contract still holds across it.
+        let site = NativeCallSite::new();
+        assert!(site.witness_triple("a/A", "m", "()V"));
+        site.invalidate();
+        assert!(site.witness_triple("a/A", "m", "()V"));
+    }
+
+    #[test]
+    fn clone_carries_the_triple_witness() {
+        let site = NativeCallSite::new();
+        assert!(site.witness_triple("a/A", "m", "()V"));
+        let copy = site.clone();
+        assert!(copy.witness_triple("a/A", "m", "()V"));
+        #[cfg(debug_assertions)]
+        assert!(
+            !copy.witness_triple("a/A", "m", "()I"),
+            "cloning must not launder the contract into a blank cell"
+        );
     }
 
     #[test]

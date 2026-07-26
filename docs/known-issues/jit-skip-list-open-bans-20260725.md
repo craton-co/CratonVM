@@ -206,7 +206,36 @@ still real correctness bugs worth closing):
   (`xerces_schema_jit_deny_prefix`), SnakeYAML emitter
 - ES-HAMCREST.1, ES-JIT-DEOPT-GC.1, ES fragile cluster
   (`is_elasticsearch_suite_jit_fragile_cluster`)
-- JSONSMART-PARSER.1, JASPER-JDT.2/.3, WILDFLY-CONTROLLER-JIT.1
+- JSONSMART-PARSER.1 — **DONE 2026-07-26 03:12 UTC: CONFIRMED still needed,
+  ban KEPT.** Standalone stress repro (`docs/known-issues/repros/jsonsmart/JsonSmartProbe.java`,
+  10 varied JSON docs × 300k iterations, round-trip parse/serialize/re-parse
+  check) against `json-smart-2.6.0.jar`. Baseline (ban in place): 0 errors
+  in whatever it completed within a 200s budget (interpreted parsing is
+  slow, never finished one 30k-iter checkpoint). Lifted
+  (`CRATONVM_JIT_ALLOW_PACKAGES=net/minidev/json/parser/`): **~20% error
+  rate** (239,605/1,200,010 ops), corruption starting within the first ~5
+  iterations and producing a DIFFERENT exception message for the identical
+  input document across consecutive iterations (`"tab" at position 6` →
+  `"tab":"a\tb at position 12` → `character (a) at position 5`, all for the
+  same doc) — a live-state-dependent miscompile signature, not a
+  deterministic parser bug. Full writeup:
+  `docs/known-issues/jsonsmart-parser-still-needed.md`. Fourth-for-four
+  real-app/faithful-repro confirmation this session that this ban family
+  (`org/jboss/as/`, `org/h2/`, `com/unboundid/`, now this) is still fully
+  live — nothing in it has been found safe to remove yet.
+  JASPER-JDT.2/.3 (owned by other session, see below).
+  WILDFLY-CONTROLLER-JIT.1 (`org/jboss/as/controller/`) — **already
+  transitively confirmed still-needed**: it's a strict subset of the
+  broader `org/jboss/as/` prefix this session already lifted for the
+  `org/jboss/as/` WildFly-boot test (`docs/known-issues/wildfly/modeltypevalidator-validtypes-npe.md`)
+  — `package_allowed()` lifts any ban whose prefix starts with an allowed
+  entry, so lifting `org/jboss/as/` also lifted `org/jboss/as/controller/`
+  in that same run. The crash found (`ModelTypeValidator.validTypes` null)
+  is literally inside `org.jboss.as.controller.*`, the same symptom class
+  (a field null after construction under JIT) as this ban's own
+  `AbstractOperationContext.<init>`/`controllerOperations` null report —
+  very likely the same underlying bug family, possibly the same bug. No
+  separate test needed; KEEP.
 - TOMCAT-JNDIREALM-RDN.1, TOMCAT-JNDIREALM-JIT.2 — **CLAIMED by
   `fix/jit-ban-sweep2-20260726` / `wt-jitsweep2-20260726`, 2026-07-26
   ~02:35 UTC** (pivoted here from the blocked ANTLR.1 item above; real
@@ -363,3 +392,26 @@ level) -- likely a similar family to the KEYEDLOCK-COMPUTE.1 fix just
 landed (String read shortly after construction/mutation reading a stale
 value) but not yet isolated to one method. Flagging for a future session
 rather than continuing further given time already spent this session.
+
+**Result: HIB-BIGINTEGER-AIOOBE.2 landed 2026-07-26 11:20 UTC** (widened
+HIB-BIGINTEGER-AIOOBE.1's scope from MutableBigInteger-only to also cover
+BigInteger itself -- see commit for the deterministic reproducer, the
+first one this ban has ever had). This is a real correctness/performance
+tradeoff for a widely-used JDK class; the ban can be narrowed back down if
+someone root-causes the exact multi-method interaction (constructor +
+some combination of trustedStripLeadingZeroInts/destructiveMulAdd/
+checkRange/parseInt -- each ruled out alone, not yet narrowed further).
+
+**Process note:** hit a real `cargo test` vs `cargo build --release`
+staleness trap mid-investigation -- verifying a skip_list.rs change via
+`cargo test` alone does NOT rebuild the separate `cratonvm` executable.
+Always `cargo build --release` + check the binary's mtime before trusting
+a still crashes/now passes result against a real repro.
+
+## SPRING-HAZELCAST-XERCES-JIT.1 — CLAIMED 2026-07-26 11:26 UTC
+
+Branch `fix/jit-ban-sweep-20260725`. `com/sun/org/apache/xerces/internal/`
+(JDK-internal bundled Xerces) banned, skip_list.rs ~L1140-1152.
+SchemaGrammar's SymbolHash corrupted under JIT during XSD schema
+validation, NPE in getGlobalTypeDecl. Fully standalone (javax.xml.validation
++ a simple XSD, no external deps) -- building a stress repro.

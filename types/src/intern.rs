@@ -5,8 +5,35 @@
 //!
 //! Deduplicates strings and returns `&'static str` references, eliminating
 //! redundant allocations for class names, method names, and descriptors.
-//! Interned strings are never freed — this is intentional because JVM class
-//! metadata lives for the entire VM lifetime.
+//!
+//! # Lifetime policy (CORRECTED 2026-07-26 — see the arch note below)
+//!
+//! This module used to state that interned strings are never freed and that
+//! this "is intentional because JVM class metadata lives for the entire VM
+//! lifetime". **The second half of that is no longer true.** CratonVM unloads
+//! classes (`gc::class_unloading`, and the `vm/tests/class_loader_unload_regression.rs`
+//! coverage added with it), and a Spring/Mockito/ByteBuddy workload generates
+//! thousands of synthetic proxy, lambda and CGLIB classes whose names, method
+//! names and descriptors all land here. Every one of those outlives the class
+//! it names, forever. That is an unbounded leak proportional to *generated*
+//! class count, not to live class count.
+//!
+//! Retention is now explicit rather than assumed:
+//!
+//! * [`StringPool::intern_arc`] hands out an `Arc<str>`. The pool's own clone is
+//!   the last one standing when every caller has dropped theirs, which makes
+//!   the entry **prunable** — see [`StringPool::prune_unreferenced`].
+//! * The free [`intern`] function hands out a `&'static str`, which can never be
+//!   invalidated. Its backing `Arc<str>` is therefore **pinned** in a separate,
+//!   permanently-retained list ([`pinned_len`]) so that pruning the pool proper
+//!   can never dangle one. As of 2026-07-26 `intern` has **no callers anywhere
+//!   in the workspace** outside this module's own tests — everything production
+//!   goes through `intern_arc` — so that list is empty in practice and pruning
+//!   reclaims everything it should.
+//!
+//! Nothing calls [`StringPool::prune_unreferenced`] yet; wiring it to the
+//! class-unloading path is a `vm`/`gc` change. See
+//! `docs/internal/arch-2026-07-26/value-repr-and-compressed-oops.md`.
 //!
 //! Two interning modes are offered:
 //!
@@ -49,9 +76,10 @@ type FxHashMap<K, V> = HashMap<K, V, BuildHasherDefault<FxHasher>>;
 ///
 /// Strings are stored in a single `Arc<str>` per unique content; the pool
 /// itself holds one of those `Arc<str>` clones so the backing allocation
-/// outlives every caller. Once interned, strings are never freed — this is
-/// intentional because class/method/descriptor strings live for the entire
-/// VM lifetime.
+/// outlives every caller. Entries are retained until
+/// [`prune_unreferenced`](StringPool::prune_unreferenced) is called; see the
+/// module-level lifetime policy for why "never freed" is no longer the right
+/// default now that classes can be unloaded.
 ///
 /// To obtain a `&'static str`, use the free [`intern`] function, which is
 /// backed by the process-global pool ([`global_pool`]); that pool lives for
@@ -131,6 +159,44 @@ impl StringPool {
     pub fn contains(&self, s: &str) -> bool {
         self.map.read().contains_key(s)
     }
+
+    /// Drop every entry no caller still holds, returning how many were removed.
+    ///
+    /// This is the eviction primitive the class-unloading path needs: a
+    /// synthetic proxy class's name, method names and descriptors become
+    /// garbage the moment the class is unloaded, but nothing here could
+    /// previously reclaim them (see the module-level lifetime policy).
+    ///
+    /// # Why `strong_count == 1` is the correct and safe criterion
+    ///
+    /// The pool holds exactly one `Arc<str>` clone per entry, so a count of 1
+    /// means *the pool is the only owner*: no caller anywhere holds a live
+    /// handle to those bytes, and dropping them cannot invalidate anything. A
+    /// later `intern_arc` of the same content simply reallocates and re-inserts;
+    /// interning has no identity semantics across a prune (callers compare
+    /// `Arc::ptr_eq` between handles they hold *concurrently*, and two handles
+    /// held concurrently keep the count above 1, so they can never straddle a
+    /// prune).
+    ///
+    /// The count is read while holding the **write** lock, which excludes every
+    /// reader. A concurrent `intern_arc` cannot be mid-`Arc::clone`: it must
+    /// hold the read guard to reach the stored `Arc` at all. And `Arc::clone`
+    /// increments *before* the clone exists, so observing 1 under exclusion
+    /// proves no clone exists — the direction that matters. Observing a stale 2
+    /// is possible and merely skips an entry until the next prune.
+    ///
+    /// `&'static str`s handed out by the free [`intern`] function are unaffected
+    /// by construction: their backing `Arc<str>` is pinned outside the map (see
+    /// [`pinned_len`]), so its count is at least 2 and it is never a candidate.
+    ///
+    /// `O(n)` in pool size and takes the write lock for the duration — call it
+    /// from a GC pause or an unload sweep, never from a hot path.
+    pub fn prune_unreferenced(&self) -> usize {
+        let mut write = self.map.write();
+        let before = write.len();
+        write.retain(|k, _| Arc::strong_count(k) > 1);
+        before - write.len()
+    }
 }
 
 impl Default for StringPool {
@@ -180,15 +246,59 @@ pub fn global_pool() -> &'static StringPool {
 /// drop body needs an owned string, clone it ahead of time. The hot-path
 /// callers in the VM already follow this pattern; this note exists so future
 /// natives or class-loader teardown helpers do not accidentally regress it.
+///
+/// # This function has no callers, and that is why the pool can be pruned
+///
+/// A workspace-wide search on 2026-07-26 found **no production caller** of this
+/// function — every VM/classloading/JIT call site uses [`intern_arc`]. Prefer
+/// `intern_arc` in new code and treat this as deprecated in spirit: an
+/// `&'static str` can never be invalidated, so every string that passes through
+/// here is retained for the process lifetime no matter what
+/// [`StringPool::prune_unreferenced`] does.
+///
+/// To make that retention explicit and *bounded to this function*, the backing
+/// `Arc<str>` is pushed onto [`PINNED`] rather than relying on the pool's map
+/// entry surviving. That keeps the `'static` promise sound independently of
+/// pruning, at the cost of one permanently-retained `Arc` clone per distinct
+/// string that reaches this path — which is zero in practice.
 pub fn intern(s: &str) -> &'static str {
     let arc = global_pool().intern_arc(s);
-    // SAFETY: `arc` is a clone of an `Arc<str>` owned by the *global* pool.
-    // The global pool is a `OnceLock` singleton that is never dropped, and the
-    // pool never calls `remove`, so the backing allocation lives for the whole
-    // process. The bytes of an `Arc<str>` are pinned for the lifetime of the
-    // strongest `Arc`; here that lifetime is effectively `'static`.
+    // Pin the allocation outside the map so `prune_unreferenced` can never drop
+    // the bytes this `&'static str` points at. Idempotent per distinct string:
+    // the pool deduplicates, so a repeat `intern` of the same content finds the
+    // same Arc and skips the push.
+    {
+        let already = PINNED.read().iter().any(|p| Arc::ptr_eq(p, &arc));
+        if !already {
+            let mut pinned = PINNED.write();
+            if !pinned.iter().any(|p| Arc::ptr_eq(p, &arc)) {
+                pinned.push(Arc::clone(&arc));
+            }
+        }
+    }
+    // SAFETY: `arc`'s allocation is now owned by the process-lifetime `PINNED`
+    // list (a `OnceLock`-free `static` that is never cleared), in addition to
+    // the global pool's own clone. The bytes of an `Arc<str>` are pinned for the
+    // lifetime of the strongest `Arc`; here that lifetime is `'static` and does
+    // not depend on the pool retaining its map entry.
     let bytes: &str = &arc;
     unsafe { std::mem::transmute::<&str, &'static str>(bytes) }
+}
+
+/// Allocations backing every `&'static str` ever handed out by [`intern`].
+///
+/// Never cleared. See [`intern`] for why this exists and
+/// [`StringPool::prune_unreferenced`] for what it protects against. Empty in
+/// every production run, because nothing calls `intern`.
+static PINNED: RwLock<Vec<Arc<str>>> = RwLock::new(Vec::new());
+
+/// How many allocations are permanently pinned by [`intern`].
+///
+/// Expected to be `0` in a production run. A non-zero value means something
+/// started calling `intern` instead of [`intern_arc`], and that many strings can
+/// never be reclaimed by [`StringPool::prune_unreferenced`].
+pub fn pinned_len() -> usize {
+    PINNED.read().len()
 }
 
 /// Convenience function: interns a string as an `Arc<str>` via the global pool.
@@ -419,7 +529,7 @@ mod tests {
         assert!(Arc::ptr_eq(&a1, &a2));
         assert!(Arc::ptr_eq(&a2, &a3));
         // All three are pointer-identical to the original storage.
-        assert_eq!(Arc::strong_count(&a1) >= 4, true); // a1,a2,a3,pool
+        assert!(Arc::strong_count(&a1) >= 4); // a1,a2,a3,pool
 
         let b = pool.intern_arc("java/util/TreeMap");
         assert!(!Arc::ptr_eq(&a1, &b));
@@ -440,6 +550,122 @@ mod tests {
         let stat2 = intern("()V");
         let arc2 = global_pool().intern_arc("()V");
         assert_eq!(stat2.as_ptr(), arc2.as_ptr());
+    }
+
+    // ------------------------------------------------------------------
+    // Eviction (2026-07-26) — class unloading makes "never freed" wrong.
+    // ------------------------------------------------------------------
+
+    /// The core eviction contract: an entry nobody holds is reclaimed, an entry
+    /// somebody holds is not.
+    #[test]
+    fn prune_unreferenced_drops_only_unheld_entries() {
+        let pool = StringPool::new();
+
+        // Held by the test for the whole function.
+        let held = pool.intern_arc("com/example/HeldClass");
+        // Dropped immediately — only the pool's own clone remains.
+        pool.intern_arc("com/example/Proxy$$EnhancerBySpringCGLIB$$0001");
+        pool.intern_arc("com/example/Proxy$$EnhancerBySpringCGLIB$$0002");
+        assert_eq!(pool.len(), 3);
+
+        let removed = pool.prune_unreferenced();
+        assert_eq!(removed, 2, "both unheld proxy names must be reclaimed");
+        assert_eq!(pool.len(), 1);
+        assert!(pool.contains("com/example/HeldClass"));
+        assert!(!pool.contains("com/example/Proxy$$EnhancerBySpringCGLIB$$0001"));
+        // The held handle is untouched and still readable.
+        assert_eq!(&*held, "com/example/HeldClass");
+
+        // Once the last handle goes, the entry becomes reclaimable too.
+        drop(held);
+        assert_eq!(pool.prune_unreferenced(), 1);
+        assert!(pool.is_empty());
+    }
+
+    /// The leak this closes, stated as a test: a workload that generates and
+    /// discards synthetic class names (ByteBuddy / CGLIB / lambda proxies) used
+    /// to grow the pool without bound. Pruning must return it to baseline.
+    #[test]
+    fn prune_reclaims_generated_class_name_churn() {
+        let pool = StringPool::new();
+        let permanent = pool.intern_arc("java/lang/Object");
+
+        for i in 0..2000 {
+            // Name, method name, descriptor — the three things class loading
+            // interns per generated class.
+            pool.intern_arc(&format!("com/example/Gen${i}"));
+            pool.intern_arc(&format!("invoke${i}"));
+            pool.intern_arc(&format!("(Lcom/example/Gen${i};)V"));
+        }
+        assert_eq!(pool.len(), 6001);
+
+        let removed = pool.prune_unreferenced();
+        assert_eq!(removed, 6000);
+        assert_eq!(pool.len(), 1, "only the still-held name survives");
+        assert_eq!(&*permanent, "java/lang/Object");
+    }
+
+    /// Re-interning after a prune must work and must not resurrect stale bytes.
+    #[test]
+    fn prune_then_reintern_is_a_fresh_allocation() {
+        let pool = StringPool::new();
+        let first = pool.intern_arc("java/util/HashMap");
+        let first_ptr = first.as_ptr();
+        drop(first);
+
+        assert_eq!(pool.prune_unreferenced(), 1);
+        assert!(!pool.contains("java/util/HashMap"));
+
+        let second = pool.intern_arc("java/util/HashMap");
+        assert_eq!(&*second, "java/util/HashMap");
+        assert_eq!(pool.len(), 1);
+        // Deduplication still works across the prune.
+        let third = pool.intern_arc("java/util/HashMap");
+        assert!(Arc::ptr_eq(&second, &third));
+        let _ = first_ptr; // identity across a prune is explicitly not promised
+    }
+
+    /// Pruning an empty pool, and pruning twice, are both no-ops.
+    #[test]
+    fn prune_is_idempotent_and_safe_when_empty() {
+        let pool = StringPool::new();
+        assert_eq!(pool.prune_unreferenced(), 0);
+        pool.intern_arc("x");
+        assert_eq!(pool.prune_unreferenced(), 1);
+        assert_eq!(pool.prune_unreferenced(), 0);
+        assert!(pool.is_empty());
+    }
+
+    /// A `&'static str` from the free `intern` must stay valid across a prune of
+    /// the global pool — the pinning contract. This is the invariant that makes
+    /// `prune_unreferenced` sound while `intern` still exists.
+    #[test]
+    fn global_prune_cannot_dangle_a_static_intern() {
+        let s: &'static str = intern("pinned_across_prune");
+        assert!(pinned_len() >= 1);
+
+        // Prune the global pool. The map entry may or may not survive (other
+        // tests in this process hold handles), but the bytes must.
+        let _ = global_pool().prune_unreferenced();
+
+        // Reading through the &'static str after the prune must be safe and
+        // must still yield the original content.
+        assert_eq!(s, "pinned_across_prune");
+        assert_eq!(s.len(), "pinned_across_prune".len());
+
+        // Interning it again yields the same pinned allocation...
+        let s2: &'static str = intern("pinned_across_prune");
+        assert!(ptr::eq(s, s2));
+
+        // ...and does not pin a second copy. Counted by content rather than by
+        // `pinned_len()`, which other tests in this process also grow.
+        let copies = PINNED
+            .read()
+            .iter()
+            .filter(|p| &***p == "pinned_across_prune")
+            .count();
+        assert_eq!(copies, 1, "pinning must be idempotent per distinct string");
     }
 
     /// Eight threads each interning an overlapping set of strings must agree

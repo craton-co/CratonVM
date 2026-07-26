@@ -5,8 +5,13 @@
 //!
 //! Objects are laid out as contiguous blocks:
 //! ```text
-//! [ObjectHeader (HEADER_SIZE = 32 bytes)] [field0] [field1] ... [fieldN]
+//! [ObjectHeader (HEADER_SIZE bytes)] [field0] [field1] ... [fieldN]
 //! ```
+//!
+//! [`HEADER_SIZE`] is 32 today. It is written symbolically here on purpose:
+//! a shrink to 24 is mapped out in
+//! `docs/internal/arch-2026-07-26/header-shrink.md`, and a baked "32" in a doc
+//! comment is exactly the kind of staleness that document's §6.9 catalogues.
 //!
 //! Field cell width depends on the field's type:
 //!
