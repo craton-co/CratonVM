@@ -1069,36 +1069,26 @@ fn should_skip_jit_internal(
         // is NOT covered by this removal and remains banned/open -- see
         // docs/known-issues/jasper-jdt-2-3-scoped-for-future-session-20260726.md.
 
-        // JASPER-JDT.3 (2026-07-10) - a second, independent Eclipse JDT
-        // miscompile family, this one in the AST/flow-analysis package
-        // rather than JASPER-JDT.2's parser package. Real Tomcat FORM-auth
-        // repro (`TestFormAuthenticatorA/B/C` forwarding to the login-page
-        // JSP): `Servlet.service()` intermittently threw `JasperException:
-        // Unable to compile class for JSP` with root cause
-        // `ArrayIndexOutOfBoundsException: Index 1 out of bounds for
-        // length 1` — reported stack frame was
-        // `QualifiedNameReference.analyseCode(QualifiedNameReference.java:170)`,
-        // which is JUST a trivial 3-arg-to-4-arg delegating wrapper
-        // (`return analyseCode(scope, ctx, info, true);`, no array access
-        // of its own) — i.e. the JIT lost/mis-attributed the inlined
-        // callee's own frame, the same symptom shape as JASPER-JDT.2's
-        // "size varies run to run" AIOOBEs. `--nojit` never reproduces (0/8
-        // hits across repeated full-class runs vs. consistent hits with JIT
-        // on); `CRATONVM_JIT_BISECT_SKIP=.../QualifiedNameReference.analyseCode`
-        // alone eliminates it (confirmed clean across 3 repeat runs). Not
-        // yet root-caused to a specific backend bug (unlike JASPER-JDT.2's
-        // three fully-diagnosed getfield/deopt/arraycopy bugs) — the AST
-        // package's many `analyseCode` overrides likely share a similar
-        // "small final-array-length loop across an inlined overload
-        // boundary" shape, so interpret the whole `ast` package rather than
-        // just this one class, mirroring JASPER-JDT.2's package-wide scope.
-        // Liftable for diagnosis with
-        // `CRATONVM_JIT_ALLOW_PACKAGES=org/eclipse/jdt/internal/compiler/ast/`.
-        if class_name.starts_with("org/eclipse/jdt/internal/compiler/ast/")
-            && !package_allowed("org/eclipse/jdt/internal/compiler/ast/", allow_packages)
-        {
-            return Some(SkipReason::RustJvmTestFixture);
-        }
+        // JASPER-JDT.3 -- REMOVED 2026-07-26. Originally (2026-07-10) a
+        // second, independent Eclipse JDT miscompile family (AST/flow-
+        // analysis package, distinct from JASPER-JDT.2's parser package):
+        // real Tomcat FORM-auth JSP compilation
+        // (`TestFormAuthenticatorA/B/C`) intermittently threw
+        // `JasperException` from an `ArrayIndexOutOfBoundsException`
+        // reported at `QualifiedNameReference.analyseCode` -- a trivial
+        // delegating wrapper with no array access of its own, i.e. the
+        // JIT lost/mis-attributed an inlined callee's frame. Documented
+        // as nondeterministic ("0/8 hits" under `--nojit` vs. consistent
+        // hits with JIT). Re-verified with the same repeat-run bar used
+        // for JASPER-JDT.2: the real Tomcat fixture's own
+        // `TestFormAuthenticatorA` (9 real FORM-auth JSP-compilation test
+        // methods, each a full embedded Tomcat boot+shutdown) run twice
+        // as baseline (ban active) and twice with
+        // `CRATONVM_JIT_ALLOW_PACKAGES=org/eclipse/jdt/internal/compiler/ast/`
+        // -- all 4 runs `OK (9 tests)`, 0 failures, no AIOOBE. No longer
+        // reproduces on current dev, same as its sibling JASPER-JDT.2.
+        // See docs/known-issues/jasper-jdt-2-3-scoped-for-future-session-20260726.md
+        // for the full evidence for both bans.
         if is_elasticsearch_suite_jit_fragile_cluster(class_name, method_name)
             && !package_allowed(class_name, allow_packages)
         {
@@ -4033,13 +4023,14 @@ mod tests {
     }
 
     #[test]
-    fn jdt_parser_package_is_jit_eligible_after_jasper_jdt_2_removal() {
-        // JASPER-JDT.2 was removed 2026-07-26 -- see the removal comment
-        // above should_skip_jit_internal for the re-verification evidence
-        // (2 baseline + 2 lifted runs of the real Tomcat TestCompiler
-        // suite, all OK (12 tests)). JASPER-JDT.3
-        // (org/eclipse/jdt/internal/compiler/ast/) is a separate, still-
-        // active ban and is untouched by this test.
+    fn jdt_parser_and_ast_packages_are_jit_eligible_after_jasper_jdt_2_3_removal() {
+        // Both JASPER-JDT.2 (org/eclipse/jdt/internal/compiler/parser/) and
+        // JASPER-JDT.3 (org/eclipse/jdt/internal/compiler/ast/) were
+        // removed 2026-07-26 -- see the removal comments above
+        // should_skip_jit_internal for the re-verification evidence (each:
+        // 2 baseline + 2 lifted runs of a real Tomcat integration test
+        // suite -- TestCompiler for JASPER-JDT.2, TestFormAuthenticatorA
+        // for JASPER-JDT.3 -- all runs clean).
         for method in ["consumeRule", "consumeTypeImportOnDemandDeclarationName"] {
             for policy in [SkipPolicy::Conservative, SkipPolicy::Aggressive] {
                 assert_eq!(
@@ -4055,17 +4046,19 @@ mod tests {
                 );
             }
         }
-        assert_eq!(
-            check(
-                "org/eclipse/jdt/internal/compiler/ast/QualifiedNameReference",
-                "analyseCode",
-                false,
-                true,
-                SkipPolicy::Conservative,
-            ),
-            Some(SkipReason::RustJvmTestFixture),
-            "JASPER-JDT.3 (the separate ast/ package ban) must remain active under Conservative"
-        );
+        for policy in [SkipPolicy::Conservative, SkipPolicy::Aggressive] {
+            assert_eq!(
+                check(
+                    "org/eclipse/jdt/internal/compiler/ast/QualifiedNameReference",
+                    "analyseCode",
+                    false,
+                    true,
+                    policy,
+                ),
+                None,
+                "org/eclipse/jdt/internal/compiler/ast/QualifiedNameReference.analyseCode must be JIT-eligible now that JASPER-JDT.3 is removed"
+            );
+        }
     }
 
     #[test]
