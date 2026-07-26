@@ -4642,12 +4642,68 @@ fn native_assertj_lightweight_comparable_assert(
         let conditions = static_object(ctx, "org/assertj/core/internal/Conditions", "INSTANCE");
         let assertion_live = ctx.read_native_pin(assertion_pin, assertion);
         ctx.set_field_by_name(assertion_live, "conditions", conditions);
-        let representation = static_object(ctx, "org/assertj/core/api/AbstractAssert", "customRepresentation");
         // WritableAssertionInfo's constructor only assigns the representation;
         // allocating the simple state carrier directly avoids re-entering the
-        // interpreter for every successful one-shot assertion.
+        // interpreter for every successful one-shot assertion. It must still
+        // reproduce the constructor's FALLBACK, though:
+        //
+        //   WritableAssertionInfo(Representation custom) {
+        //     useRepresentation(custom == null
+        //         ? ConfigurationProvider.CONFIGURATION_PROVIDER.representation()
+        //         : custom);
+        //   }
+        //   public void useRepresentation(Representation r) {
+        //     Objects.requireNonNull(r, "The representation to use should not be null.");
+        //     this.representation = r;
+        //   }
+        //
+        // `AbstractAssert.customRepresentation` is null unless the test called
+        // `Assertions.useRepresentation(...)`, i.e. essentially always -- so
+        // copying it straight across left `info.representation` null, which
+        // `useRepresentation`'s `requireNonNull` makes impossible for a real
+        // AssertJ object. Nothing noticed while assertions PASSED; the moment
+        // one failed, `ShouldBeEqual.actualAndExpectedHaveSameStringRepresentation`
+        // dereferenced it and every AssertJ failure in every suite surfaced as
+        // `NullPointerException: Cannot invoke
+        // "org.assertj.core.presentation.Representation.toStringOf(Object)"
+        // because "this.representation" is null` instead of the real assertion
+        // message (found masking the last failure of Spring's
+        // `BindingReflectionHintsRegistrarKotlinTests`).
+        //
+        // Resolve the representation LAST -- after `alloc_blank`, which can
+        // move objects -- and hold no cached ObjectRef across an allocation.
         let info = alloc_blank(ctx, "org/assertj/core/api/WritableAssertionInfo")?;
+        let info_pin = ctx.pin_native_root(info);
+        let mut representation =
+            static_object(ctx, "org/assertj/core/api/AbstractAssert", "customRepresentation");
+        if matches!(representation, Value::Object(None)) {
+            let provider = static_object(
+                ctx,
+                "org/assertj/core/configuration/ConfigurationProvider",
+                "CONFIGURATION_PROVIDER",
+            );
+            if let Value::Object(Some(provider)) = provider {
+                let resolved = ctx
+                    .invoke_virtual(
+                        provider,
+                        "representation",
+                        "()Lorg/assertj/core/presentation/Representation;",
+                        &[],
+                    )
+                    .ok()
+                    .flatten()
+                    .filter(|v| matches!(v, Value::Object(Some(_))))
+                    // Fall back to the field itself if the accessor is
+                    // unavailable; leaving it null is never acceptable.
+                    .unwrap_or_else(|| ctx.get_field_by_name(provider, "representation"));
+                if matches!(resolved, Value::Object(Some(_))) {
+                    representation = resolved;
+                }
+            }
+        }
+        let info = ctx.read_native_pin(info_pin, info);
         ctx.set_field_by_name(info, "representation", representation);
+        ctx.unpin_native_roots(info_pin);
         let assertion_live = ctx.read_native_pin(assertion_pin, assertion);
         ctx.set_field_by_name(assertion_live, "info", Value::Object(Some(info)));
         let creator = match ctx.new_object_initialized(

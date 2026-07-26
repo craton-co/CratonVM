@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | **FIXED 2026-07-26.** Not a kotlin-reflect defect at all — a JIT miscompile of `java.lang.String.length()`. 29 of the 30 classes now pass; the 30th fails on an unrelated AssertJ defect (see "Residual" below). |
+| **Status** | **FIXED 2026-07-26.** Not a kotlin-reflect defect at all — a JIT miscompile of `java.lang.String.length()`. All 30 classes now pass (the last one needed a second, unrelated fix -- see "Verification"). |
 | **Category** | VM-CORRECTNESS (JIT codegen / String field layout) |
 | **Discovered** | 2026-07-26, full-suite run, dev `346c74b71`, Azure host `20.83.144.174`, worktree `/data/data/wt-springsuite8-20260725`, `apps/spring-suite-runner`, real JDK 25, jit-real. |
 | **Root-caused / fixed** | 2026-07-26, worktree `/data/data/wt-testngnpe-20260726`. Fix landed on `dev` as **BUG-STRING-CODER-COMPACT-20260726** (`jit/src/lib.rs` `StringFieldLayout`, `jit/src/x64.rs` `emit_load_string_*`). |
@@ -104,16 +104,33 @@ Minimal standalone reproducer (no Spring, no Kotlin): take any String, call
 
 All 30 classes rerun on the fix, real JDK 25, jit-real, `KRun`:
 
-* **29 OK.**
-* 1 FAIL — `aot.hint.BindingReflectionHintsRegistrarKotlinTests`, 3 of 4
-  methods pass; `Register reflection hints for Kotlinx serialization()` fails
-  with `NullPointerException: Cannot invoke
-  "org.assertj.core.presentation.Representation.toStringOf(Object)" because
-  "this.representation" is null`. That is AssertJ's own failure-message
-  machinery NPE-ing while formatting an assertion result, i.e. a **different**
-  CratonVM defect (an AssertJ `Representation` field left null) that this
-  cluster's `IllegalStateException: root` was previously masking. Tracked as
-  the residual of this doc; not investigated further here.
+* **30 OK.** 29 of them from the String-intrinsic fix alone.
+
+The 30th, `aot.hint.BindingReflectionHintsRegistrarKotlinTests`, needed a
+second and unrelated fix. CratonVM's native `Assertions.assertThat` shim
+(`native_assertj_lightweight_comparable_assert`) builds `AbstractAssert` by
+hand rather than running its constructor, and left the `WritableAssertionInfo`
+it allocates with a null `representation` -- a state the real constructor makes
+impossible (`useRepresentation` starts with `Objects.requireNonNull`). Every
+FAILING AssertJ assertion therefore died with
+
+```
+NullPointerException: Cannot invoke
+"org.assertj.core.presentation.Representation.toStringOf(Object)"
+because "this.representation" is null
+```
+
+instead of reporting the assertion. It also changed outcomes rather than just
+messages: `satisfiesExactlyInAnyOrder` decides which elements matched by
+catching `AssertionError` inside `Iterables.byPassingAssertions`, and an NPE is
+not an `AssertionError`, so it escaped that filter and failed a test that
+should have passed. Fixed; that class is now 4/4.
+
+Standalone repro on any classpath carrying assertj-core:
+`Assertions.assertThat("actualValue").isEqualTo("expectedValue")` threw
+`NullPointerException` on CratonVM where HotSpot throws the expected
+`AssertionError`. Worth remembering that this silently degraded the failure
+message of every AssertJ assertion in every suite.
 
 ## Related
 
