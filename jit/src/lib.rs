@@ -13874,3 +13874,222 @@ mod tests {
         assert!(b >= a);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Layout-constant emission inventory (arch-2026-07-26 `layout-constant-hazards`)
+// ---------------------------------------------------------------------------
+
+/// Inventory tripwire for every object-layout constant this crate bakes into
+/// emitted machine code, covering the two emitters the original header-offset
+/// audit did not reach: this file and `ir_lower.rs`.
+///
+/// # Why this exists alongside the tripwire in `x64.rs`
+///
+/// `x64.rs::header_offset_emission_site_inventory_matches_the_doc` counts the
+/// substring `<CONST> as <ty>` — the constant *immediately* followed by a cast.
+/// That needle is exact for `x64.rs`, and its recorded totals were re-verified
+/// against the tree on 2026-07-26 (31 / 11 / 16 / 5, all matching), as were the
+/// three `ir_lower.rs` totals (2 / 2 / 1). The mechanism does what its name
+/// says — but it is *structurally* blind to any site that uses the constant
+/// inside a larger expression which is then cast, and that is exactly the shape
+/// both of this file's own sites take:
+///
+/// ```text
+/// let abs = (cratonvm_types::HEADER_SIZE + body_off) as i32;
+/// (cratonvm_types::HEADER_SIZE + idx * cratonvm_types::SLOT_SIZE) as i32
+/// ```
+///
+/// A substring scan for the cast form reports **zero** hits here. That is the
+/// mechanical reason `lib.rs` never appeared in the header-offset inventory
+/// even after `x64.rs` and `ir_lower.rs` were audited: the tool could not see
+/// it, so no amount of care from the auditor would have.
+///
+/// This tripwire therefore counts *identifier occurrences in code* instead:
+/// every use of the constant, in any expression shape, outside comments and
+/// string literals. The zero entries are as load-bearing as the non-zero ones —
+/// a constant that starts being used in a file where it never appeared before
+/// also trips the assertion and forces the site into the inventory.
+#[cfg(test)]
+mod layout_constant_inventory {
+    /// Every object-layout constant owned by `cratonvm_types` that this crate
+    /// could plausibly bake into an instruction encoding.
+    const LAYOUT_CONSTANTS: [&str; 8] = [
+        "HEADER_SIZE",
+        "ARRAY_LENGTH_OFFSET",
+        "SLOT_SIZE",
+        "REF_ELEMENT_SIZE",
+        "MARK_WORD_OFFSET",
+        "IDENTITY_HASH_CODE_OFFSET",
+        "FIELD_CELL_PAYLOAD32_OFFSET",
+        "FIELD_CELL_PAYLOAD64_OFFSET",
+    ];
+
+    /// `(file, counts)` where `counts[i]` is the number of code uses of
+    /// `LAYOUT_CONSTANTS[i]` in that file.
+    const INVENTORY: [(&str, [usize; 8]); 2] = [
+        // lib.rs: the `use` list near the top, plus `StringFieldLayout::new`'s
+        // `cell()` closure — its compact-layout branch and its legacy
+        // header-plus-cell fallback, each biased by the payload64 offset.
+        ("lib.rs", [3, 1, 2, 1, 0, 0, 0, 2]),
+        // ir_lower.rs: the `use` list, the three compile-time invariants
+        // restated at the top of that file, two disp32 field-address
+        // computations, two disp8 float array element accesses, and the disp8
+        // array-length load that guards every bounds check.
+        ("ir_lower.rs", [7, 3, 4, 0, 0, 0, 3, 0]),
+    ];
+
+    fn source(file: &str) -> &'static str {
+        match file {
+            "lib.rs" => include_str!("lib.rs"),
+            "ir_lower.rs" => include_str!("ir_lower.rs"),
+            other => panic!("no source registered for {other}"),
+        }
+    }
+
+    fn is_ident_byte(b: u8) -> bool {
+        b.is_ascii_alphanumeric() || b == b'_'
+    }
+
+    /// Count whole-identifier occurrences of `ident` in *code*: whole-line and
+    /// trailing line comments are skipped, double-quoted string literals are
+    /// skipped, and a match that is part of a longer identifier does not count.
+    ///
+    /// Deliberately a tokenizer rather than a substring scan, for the reason in
+    /// the module doc. Two known limitations, both of which can only ever
+    /// *under*-count and both of which are pinned by the fixed totals above: a
+    /// `"` inside a character literal makes the rest of that line read as a
+    /// string, and a string literal continued across a line break is treated as
+    /// re-opening on the next line.
+    fn code_occurrences(src: &str, ident: &str) -> usize {
+        let mut n = 0usize;
+        for raw in src.lines() {
+            if raw.trim_start().starts_with("//") {
+                continue;
+            }
+            let bytes = raw.as_bytes();
+            let mut in_str = false;
+            let mut i = 0usize;
+            while i < bytes.len() {
+                let b = bytes[i];
+                if in_str {
+                    if b == b'\\' {
+                        i += 2;
+                        continue;
+                    }
+                    if b == b'"' {
+                        in_str = false;
+                    }
+                    i += 1;
+                    continue;
+                }
+                if b == b'"' {
+                    in_str = true;
+                    i += 1;
+                    continue;
+                }
+                if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+                    break;
+                }
+                if is_ident_byte(b) {
+                    let start = i;
+                    while i < bytes.len() && is_ident_byte(bytes[i]) {
+                        i += 1;
+                    }
+                    if &raw[start..i] == ident {
+                        n += 1;
+                    }
+                    continue;
+                }
+                i += 1;
+            }
+        }
+        n
+    }
+
+    /// **Verify the counter before trusting anything it reports.**
+    ///
+    /// More than one "audit" in this repo has turned out to check something
+    /// other than what its name says, so this pins what `code_occurrences`
+    /// actually does against a sample whose answer is obvious by inspection —
+    /// and demonstrates, on the same sample, the blind spot in the substring
+    /// needle that kept this file out of the header-offset inventory.
+    #[test]
+    fn the_counter_counts_what_its_name_says() {
+        let sample = concat!(
+            "use x::{FAKE_OFF, OTHER};\n",
+            "// FAKE_OFF in a whole-line comment must not count\n",
+            "/// FAKE_OFF in a doc comment must not count\n",
+            "let a = FAKE_OFF + FAKE_OFF;   // FAKE_OFF trailing comment\n",
+            "let b = MY_FAKE_OFF + FAKE_OFF_2 + FAKE_OFFSET;\n",
+            "panic!(\"FAKE_OFF inside a string literal must not count\");\n",
+            "let c = (FAKE_OFF + n) as i32;\n",
+        );
+        // 1 in the use-list + 2 on the `let a` line + 1 on the `let c` line.
+        assert_eq!(
+            code_occurrences(sample, "FAKE_OFF"),
+            4,
+            "the counter must see code uses only, and must never match inside a \
+             longer identifier"
+        );
+        assert_eq!(
+            code_occurrences(sample, "NOT_PRESENT_ANYWHERE"),
+            0,
+            "an absent identifier must count zero, not match spuriously"
+        );
+        // The substring needle the x64.rs tripwire uses finds NONE of those
+        // four, because not one of them is written as a bare constant directly
+        // followed by a cast. This is the whole reason a second mechanism is
+        // needed rather than another copy of the first.
+        assert_eq!(
+            sample.matches("FAKE_OFF as i32").count(),
+            0,
+            "a `<CONST> as <ty>` substring scan sees nothing here even though the \
+             constant is used four times, one of them inside a cast expression"
+        );
+    }
+
+    /// The inventory itself. Every count, including every zero.
+    #[test]
+    fn layout_constant_emission_sites_are_inventoried() {
+        for (file, expected) in INVENTORY {
+            let src = source(file);
+            for (idx, ident) in LAYOUT_CONSTANTS.into_iter().enumerate() {
+                let want = expected[idx];
+                let found = code_occurrences(src, ident);
+                assert_eq!(
+                    found, want,
+                    "{ident} is used {found}x in jit/src/{file}; the header-shrink \
+                     inventory records {want}x. Both files emit object-header \
+                     displacements into machine code, and neither is covered by \
+                     the substring tripwire in x64.rs. Update \
+                     docs/internal/arch-2026-07-26/layout-constant-hazards.md and \
+                     header-shrink.md §6.6 in the same change, and confirm the new \
+                     or moved site is value-safe at the new layout — the disp8 \
+                     sites in ir_lower.rs silently address backwards past 127."
+                );
+            }
+        }
+    }
+
+    /// The inventory is only meaningful if it is actually reading source. A
+    /// mistyped `include_str!` path is a compile error, but an empty or
+    /// truncated read would silently make every count zero and every assertion
+    /// above pass vacuously for a table of zeros.
+    #[test]
+    fn the_inventory_is_reading_real_source() {
+        for (file, _) in INVENTORY {
+            let src = source(file);
+            assert!(
+                src.len() > 10_000,
+                "{file} read back as {} bytes; the inventory is scanning nothing",
+                src.len()
+            );
+        }
+        assert!(
+            INVENTORY
+                .iter()
+                .any(|(_, counts)| counts.iter().any(|c| *c > 0)),
+            "an inventory of all zeros would pass without checking anything"
+        );
+    }
+}
