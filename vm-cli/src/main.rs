@@ -3859,6 +3859,8 @@ fn main() {
     for t in &unknown_tokens {
         eprintln!("[cratonvm] unknown configuration token: {t}");
     }
+    // `CRATONVM_DBG=-deprecations` expands to `CRATONVM_QUIET_DEPRECATIONS=1`,
+    // which the call above has already written back, so this read sees it.
     if !legacy_direct.is_empty() && std::env::var_os("CRATONVM_QUIET_DEPRECATIONS").is_none() {
         // One line, not one per variable: a debugging session routinely exports
         // a dozen of these and a dozen warnings would just train people to

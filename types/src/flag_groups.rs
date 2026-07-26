@@ -158,17 +158,15 @@ pub struct E {
 
 /// Every knob in the VM, exactly once.
 ///
-/// Generated from the census scan and asserted complete by
-/// [`tests::inventory_covers_every_live_flag`].
+/// Generated from the census scan; `types/tests/flag_surface.rs` asserts it
+/// stays complete and `tools/flag-census/check-surface.sh` asserts the code and
+/// the reference docs agree with it.
+///
+/// One row per line, deliberately. rustfmt would break each entry across five
+/// lines, turning a 541-line table that `grep` can answer questions about into
+/// a 2700-line one that it cannot.
+#[rustfmt::skip]
 pub const INVENTORY: &[E] = &[
-    E { group: Group::COMPAT, token: "eager-streams", on_key: Some("CRATONVM_EAGER_STREAMS"), off_key: None, off_word: None },
-    E { group: Group::COMPAT, token: "foreign-attach", on_key: Some("CRATONVM_FOREIGN_ATTACH"), off_key: None, off_word: None },
-    E { group: Group::COMPAT, token: "jboss-boot-log-file", on_key: Some("CRATONVM_JBOSS_BOOT_LOG_FILE"), off_key: None, off_word: None },
-    E { group: Group::COMPAT, token: "jboss-brute-force-jars", on_key: Some("CRATONVM_JBOSS_BRUTE_FORCE_JARS"), off_key: None, off_word: None },
-    E { group: Group::COMPAT, token: "jboss-logger-base-emit", on_key: Some("CRATONVM_JBOSS_LOGGER_BASE_EMIT"), off_key: None, off_word: None },
-    E { group: Group::COMPAT, token: "jboss-mp-root", on_key: Some("CRATONVM_JBOSS_MP_ROOT"), off_key: None, off_word: None },
-    E { group: Group::COMPAT, token: "lazy-streams", on_key: Some("CRATONVM_LAZY_STREAMS"), off_key: None, off_word: None },
-    E { group: Group::COMPAT, token: "strict-swallows", on_key: Some("CRATONVM_STRICT_SWALLOWS"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "a2", on_key: Some("CRATONVM_DBG_A2"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "access", on_key: Some("CRATONVM_DBG_ACCESS"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "active-profiles-identity-trace", on_key: Some("CRATONVM_ACTIVE_PROFILES_IDENTITY_TRACE"), off_key: None, off_word: None },
@@ -184,23 +182,32 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "aqs-trace", on_key: Some("CRATONVM_DBG_AQS_TRACE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "args", on_key: Some("CRATONVM_DBG_ARGS"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "arraycopy", on_key: Some("CRATONVM_DBG_ARRAYCOPY"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "arrlen", on_key: Some("CRATONVM_DBG_ARRLEN"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "arrstore", on_key: Some("CRATONVM_DBG_ARRSTORE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "asserteq", on_key: Some("CRATONVM_DBG_ASSERTEQ"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "assertj-arr", on_key: Some("CRATONVM_DBG_ASSERTJ_ARR"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "athrow", on_key: Some("CRATONVM_DBG_ATHROW"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "atomic-updater", on_key: Some("CRATONVM_DBG_ATOMIC_UPDATER"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "badrecv", on_key: Some("CRATONVM_DBG_BADRECV"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "badref", on_key: Some("CRATONVM_DBG_BADREF"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "bb", on_key: Some("CRATONVM_DBG_BB"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "bblp", on_key: Some("CRATONVM_DBG_BBLP"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "bd-debug", on_key: Some("CRATONVM_BD_DEBUG"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "blocked-access", on_key: Some("CRATONVM_DBG_BLOCKED_ACCESS"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "blockgc", on_key: Some("CRATONVM_DBG_BLOCKGC"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "bufunder", on_key: Some("CRATONVM_DBG_BUFUNDER"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "bug03", on_key: Some("CRATONVM_DBG_BUG03"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "bytecode-dump", on_key: Some("CRATONVM_DBG_BYTECODE_DUMP"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "caller", on_key: Some("CRATONVM_DBG_CALLER"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "capval", on_key: Some("CRATONVM_DBG_CAPVAL"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "catalina", on_key: Some("CRATONVM_DBG_CATALINA"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "cause", on_key: Some("CRATONVM_DBG_CAUSE"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "cce", on_key: Some("CRATONVM_DBG_CCE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "cce-bt", on_key: Some("CRATONVM_DBG_CCE_BT"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "ccecache", on_key: Some("CRATONVM_DBG_CCECACHE"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "ccsprobe", on_key: Some("CRATONVM_DBG_CCSPROBE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "cellcorrupt", on_key: Some("CRATONVM_DBG_CELLCORRUPT"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "charset", on_key: Some("CRATONVM_DBG_CHARSET"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "classpath", on_key: Some("CRATONVM_DBG_CLASSPATH"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "cleaners", on_key: None, off_key: Some("CRATONVM_DBG_NO_CLEANERS"), off_word: None },
     E { group: Group::DBG, token: "clone", on_key: Some("CRATONVM_DBG_CLONE"), off_key: None, off_word: None },
@@ -211,11 +218,6 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "component-type", on_key: Some("CRATONVM_DBG_COMPONENT_TYPE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "corrupt-frames", on_key: Some("CRATONVM_DBG_CORRUPT_FRAMES"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "ctor-fix", on_key: Some("CRATONVM_DBG_CTOR_FIX"), off_key: None, off_word: None },
-    // Was the bare `CRATONVM_DBG`, which is now the group variable itself.
-    // It gated exactly one call site (`quarkus_staticinit.rs`), so it becomes
-    // an ordinary topic. `CRATONVM_DBG=1` no longer enables it — that spelling
-    // now reports `1` as an unknown token, which is the point.
-    E { group: Group::DBG, token: "quarkus-staticinit", on_key: Some("CRATONVM_DBG_QUARKUS_STATICINIT"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "debug-sfi", on_key: Some("CRATONVM_DEBUG_SFI"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "debug-stack-tag", on_key: Some("CRATONVM_DEBUG_STACK_TAG"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "debug-stackwalk", on_key: Some("CRATONVM_DEBUG_STACKWALK"), off_key: None, off_word: None },
@@ -225,6 +227,9 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "deopt-eager", on_key: Some("CRATONVM_DEOPT_EAGER"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "deopt-eager-bci", on_key: Some("CRATONVM_DEOPT_EAGER_BCI"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "deopt-verify", on_key: Some("CRATONVM_DEOPT_VERIFY"), off_key: None, off_word: None },
+    // Default-ON: the launcher prints one line when it sees a legacy per-flag
+    // variable set directly. `CRATONVM_DBG=-deprecations` silences it.
+    E { group: Group::DBG, token: "deprecations", on_key: None, off_key: Some("CRATONVM_QUIET_DEPRECATIONS"), off_word: None },
     E { group: Group::DBG, token: "desctrace", on_key: Some("CRATONVM_DBG_DESCTRACE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "diag-hib32", on_key: Some("CRATONVM_DIAG_HIB32"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "diag-jar-list", on_key: Some("CRATONVM_DIAG_JAR_LIST"), off_key: None, off_word: None },
@@ -236,6 +241,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "dopriv", on_key: Some("CRATONVM_DBG_DOPRIV"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "dropped-stubs", on_key: Some("CRATONVM_DBG_DROPPED_STUBS"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "dump-jit", on_key: Some("CRATONVM_DBG_DUMP_JIT"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "dupcall-filter", on_key: Some("CRATONVM_DBG_DUPCALL_FILTER"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "dupclass", on_key: Some("CRATONVM_DBG_DUPCLASS"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "dupclass-bt", on_key: Some("CRATONVM_DBG_DUPCLASS_BT"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "dupx-methods", on_key: Some("CRATONVM_DBG_DUPX_METHODS"), off_key: None, off_word: None },
@@ -250,8 +256,10 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "fbref", on_key: Some("CRATONVM_DBG_FBREF"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "field-get", on_key: Some("CRATONVM_DBG_FIELD_GET"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "field-watch", on_key: Some("CRATONVM_DBG_FIELD_WATCH"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "fieldaddr", on_key: Some("CRATONVM_DBG_FIELDADDR"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "force-moving", on_key: Some("CRATONVM_DBG_FORCE_MOVING"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "forname-trace", on_key: Some("CRATONVM_FORNAME_TRACE"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "frame-trace", on_key: Some("CRATONVM_FRAME_TRACE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "fsp", on_key: Some("CRATONVM_DBG_FSP"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "fullstack-scan", on_key: Some("CRATONVM_DBG_FULLSTACK_SCAN"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "fwdguard", on_key: Some("CRATONVM_DBG_FWDGUARD"), off_key: None, off_word: None },
@@ -276,6 +284,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "gse", on_key: Some("CRATONVM_DBG_GSE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "h2parserread", on_key: Some("CRATONVM_DBG_H2PARSERREAD"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "h2trace", on_key: Some("CRATONVM_DBG_H2TRACE"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "hang-sample", on_key: Some("CRATONVM_DBG_HANG_SAMPLE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "hangwalk", on_key: Some("CRATONVM_DBG_HANGWALK"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "heap-stale", on_key: Some("CRATONVM_DBG_HEAP_STALE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "heap-trace", on_key: Some("CRATONVM_DBG_HEAP_TRACE"), off_key: None, off_word: None },
@@ -283,14 +292,18 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "heartbeat", on_key: Some("CRATONVM_DBG_HEARTBEAT"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "hm-trace", on_key: Some("CRATONVM_HM_TRACE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "hmput", on_key: Some("CRATONVM_DBG_HMPUT"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "hotpath-counts", on_key: Some("CRATONVM_DBG_HOTPATH_COUNTS"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "hs-itr-dbg", on_key: Some("CRATONVM_HS_ITR_DBG"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "httpsrv", on_key: Some("CRATONVM_DBG_HTTPSRV"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "iae-trace", on_key: Some("CRATONVM_IAE_TRACE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "iae-trace2", on_key: Some("CRATONVM_IAE_TRACE2"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "imse", on_key: Some("CRATONVM_DBG_IMSE"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "indy-all", on_key: Some("CRATONVM_DBG_INDY_ALL"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "indy-generic", on_key: Some("CRATONVM_DBG_INDY_GENERIC"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "inline-fr", on_key: Some("CRATONVM_DBG_INLINE_FR"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "intrinsic-stats", on_key: Some("CRATONVM_INTRINSIC_STATS"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "invoke-coerce", on_key: Some("CRATONVM_DBG_INVOKE_COERCE"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "invoke-virtual-entry-trace", on_key: Some("CRATONVM_INVOKE_VIRTUAL_ENTRY_TRACE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "invokestatic-loader-trace", on_key: Some("CRATONVM_INVOKESTATIC_LOADER_TRACE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "invokestats", on_key: Some("CRATONVM_DBG_INVOKESTATS"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "invspecial", on_key: Some("CRATONVM_DBG_INVSPECIAL"), off_key: None, off_word: None },
@@ -300,18 +313,25 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "isinstance", on_key: Some("CRATONVM_DBG_ISINSTANCE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "jar", on_key: Some("CRATONVM_DBG_JAR"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "jetty", on_key: Some("CRATONVM_DBG_JETTY"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "jetty2", on_key: Some("CRATONVM_DBG_JETTY2"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "jit-alloc", on_key: Some("CRATONVM_DBG_JIT_ALLOC"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "jit-bisect-only", on_key: Some("CRATONVM_JIT_BISECT_ONLY"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "jit-bisect-skip", on_key: Some("CRATONVM_JIT_BISECT_SKIP"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "jit-code", on_key: Some("CRATONVM_DBG_JIT_CODE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "jit-disasm", on_key: Some("CRATONVM_DBG_JIT_DISASM"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "jit-dispatch", on_key: Some("CRATONVM_DBG_JIT_DISPATCH"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "jit-entry", on_key: Some("CRATONVM_DBG_JIT_ENTRY"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "jit-gen", on_key: Some("CRATONVM_DBG_JIT_GEN"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "jit-ldc", on_key: Some("CRATONVM_DBG_JIT_LDC"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "jit-method-stats", on_key: Some("CRATONVM_DBG_JIT_METHOD_STATS"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "jit-mic", on_key: Some("CRATONVM_DBG_JIT_MIC"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "jit-names", on_key: Some("CRATONVM_DBG_JIT_NAMES"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "jit-putfield", on_key: Some("CRATONVM_DBG_JIT_PUTFIELD"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "jit-safepoints", on_key: Some("CRATONVM_DBG_JIT_SAFEPOINTS"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "jitc", on_key: Some("CRATONVM_DBG_JITC"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "jlm", on_key: Some("CRATONVM_DBG_JLM"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "kcbool", on_key: Some("CRATONVM_DBG_KCBOOL"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "lambda", on_key: Some("CRATONVM_DBG_LAMBDA"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "lambda-dispatch", on_key: Some("CRATONVM_DBG_LAMBDA_DISPATCH"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "lambda-generic", on_key: Some("CRATONVM_DBG_LAMBDA_GENERIC"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "layout", on_key: Some("CRATONVM_DBG_LAYOUT"), off_key: None, off_word: None },
@@ -328,11 +348,14 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "mcl", on_key: Some("CRATONVM_DBG_MCL"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "memwatch", on_key: Some("CRATONVM_DBG_MEMWATCH"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "method-invoke-box", on_key: Some("CRATONVM_DBG_METHOD_INVOKE_BOX"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "mh-adapter", on_key: Some("CRATONVM_DBG_MH_ADAPTER"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "mh-dispatch", on_key: Some("CRATONVM_DBG_MH_DISPATCH"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "mh-stack", on_key: Some("CRATONVM_DBG_MH_STACK"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "mic-prof", on_key: Some("CRATONVM_DBG_MIC_PROF"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "minvoke", on_key: Some("CRATONVM_DBG_MINVOKE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "mirrorpin", on_key: Some("CRATONVM_DBG_MIRRORPIN"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "modprov", on_key: Some("CRATONVM_DBG_MODPROV"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "modstatic", on_key: Some("CRATONVM_DBG_MODSTATIC"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "monenter", on_key: Some("CRATONVM_DBG_MONENTER"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "monexit", on_key: Some("CRATONVM_DBG_MONEXIT"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "moving-young-coverage-dbg", on_key: Some("CRATONVM_MOVING_YOUNG_COVERAGE_DBG"), off_key: None, off_word: None },
@@ -340,13 +363,20 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "moving-young-verify", on_key: Some("CRATONVM_MOVING_YOUNG_VERIFY"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "msc", on_key: Some("CRATONVM_DBG_MSC"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "mtroots", on_key: Some("CRATONVM_DBG_MTROOTS"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "ncdfe", on_key: Some("CRATONVM_DBG_NCDFE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "needs-exact-trace", on_key: Some("CRATONVM_NEEDS_EXACT_TRACE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "net", on_key: Some("CRATONVM_DBG_NET"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "netty-queue", on_key: Some("CRATONVM_DBG_NETTY_QUEUE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "nextint", on_key: Some("CRATONVM_DBG_NEXTINT"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "nio-bind", on_key: Some("CRATONVM_DBG_NIO_BIND"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "nocode", on_key: Some("CRATONVM_DBG_NOCODE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "nonmoving-reclaim", on_key: None, off_key: Some("CRATONVM_DBG_NO_NONMOVING_RECLAIM"), off_word: None },
+    E { group: Group::DBG, token: "npe-invoke", on_key: Some("CRATONVM_DBG_NPE_INVOKE"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "npe-none", on_key: Some("CRATONVM_DBG_NPE_NONE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "npe-stack", on_key: Some("CRATONVM_DBG_NPE_STACK"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "npe-trace", on_key: Some("CRATONVM_DBG_NPE_TRACE"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "nsee-trace", on_key: Some("CRATONVM_NSEE_TRACE"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "nsme", on_key: Some("CRATONVM_DBG_NSME"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "null-native", on_key: Some("CRATONVM_DBG_NULL_NATIVE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "nullthis", on_key: Some("CRATONVM_DBG_NULLTHIS"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "obj-equals", on_key: Some("CRATONVM_DBG_OBJ_EQUALS"), off_key: None, off_word: None },
@@ -358,15 +388,22 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "osr-exit-after", on_key: Some("CRATONVM_OSR_EXIT_AFTER"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "osr-exit-test", on_key: Some("CRATONVM_OSR_EXIT_TEST"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "osr-meta", on_key: Some("CRATONVM_DBG_OSR_META"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "overlay", on_key: Some("CRATONVM_DBG_OVERLAY"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "overlay-all", on_key: Some("CRATONVM_DBG_OVERLAY_ALL"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "parklat", on_key: Some("CRATONVM_DBG_PARKLAT"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "pb", on_key: Some("CRATONVM_DBG_PB"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "pbe", on_key: Some("CRATONVM_DBG_PBE"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "pbstart", on_key: Some("CRATONVM_DBG_PBSTART"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "picocli-style", on_key: Some("CRATONVM_DBG_PICOCLI_STYLE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "popint", on_key: Some("CRATONVM_DBG_POPINT"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "precise", on_key: Some("CRATONVM_DBG_PRECISE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "proxy", on_key: Some("CRATONVM_DBG_PROXY"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "prune", on_key: None, off_key: Some("CRATONVM_DBG_NO_PRUNE"), off_word: None },
+    // Was the bare `CRATONVM_DBG`, which is now the group variable itself. It
+    // gated exactly one call site (`quarkus_staticinit.rs`), so it becomes an
+    // ordinary topic. `CRATONVM_DBG=1` no longer enables it — that spelling now
+    // reports `1` as an unknown token, which is the point.
+    E { group: Group::DBG, token: "quarkus-staticinit", on_key: Some("CRATONVM_DBG_QUARKUS_STATICINIT"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "quicken-stats", on_key: Some("CRATONVM_QUICKEN_STATS"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "raf-getfd", on_key: Some("CRATONVM_DBG_RAF_GETFD"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "raf-init", on_key: Some("CRATONVM_DBG_RAF_INIT"), off_key: None, off_word: None },
@@ -380,6 +417,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "replovr", on_key: Some("CRATONVM_DBG_REPLOVR"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "resolve-shim", on_key: Some("CRATONVM_DBG_RESOLVE_SHIM"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "resource-timing", on_key: Some("CRATONVM_DBG_RESOURCE_TIMING"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "resume-pc", on_key: Some("CRATONVM_DBG_RESUME_PC"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "retransform", on_key: Some("CRATONVM_DBG_RETRANSFORM"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "rootsnap", on_key: Some("CRATONVM_DBG_ROOTSNAP"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "rset-audit", on_key: Some("CRATONVM_DBG_RSET_AUDIT"), off_key: None, off_word: None },
@@ -414,6 +452,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "sp-verify", on_key: Some("CRATONVM_SP_VERIFY"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "spid", on_key: Some("CRATONVM_DBG_SPID"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "spring-dbg", on_key: Some("CRATONVM_SPRING_DBG"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "stackless", on_key: Some("CRATONVM_DBG_STACKLESS"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "stale-objref", on_key: Some("CRATONVM_DBG_STALE_OBJREF"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "stale-objref-cycles", on_key: Some("CRATONVM_DBG_STALE_OBJREF_CYCLES"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "stale-recv", on_key: Some("CRATONVM_DBG_STALE_RECV"), off_key: None, off_word: None },
@@ -444,6 +483,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "trace-arrays-hashcode", on_key: Some("CRATONVM_TRACE_ARRAYS_HASHCODE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "trace-classvalue", on_key: Some("CRATONVM_TRACE_CLASSVALUE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "trace-pti-args", on_key: Some("CRATONVM_TRACE_PTI_ARGS"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "trace-sb-filter", on_key: Some("CRATONVM_TRACE_SB_FILTER"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "trace-unimplemented", on_key: Some("CRATONVM_TRACE_UNIMPLEMENTED"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "track-native", on_key: Some("CRATONVM_TRACK_NATIVE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "uclreg", on_key: Some("CRATONVM_DBG_UCLREG"), off_key: None, off_word: None },
@@ -451,12 +491,14 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "ueh-debug", on_key: Some("CRATONVM_UEH_DEBUG"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "uncaught", on_key: Some("CRATONVM_DBG_UNCAUGHT"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "underflow", on_key: Some("CRATONVM_DBG_UNDERFLOW"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "unpark-miss", on_key: Some("CRATONVM_DBG_UNPARK_MISS"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "unpin-ring", on_key: Some("CRATONVM_DBG_UNPIN_RING"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "unroll", on_key: Some("CRATONVM_DBG_UNROLL"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "urlcl", on_key: Some("CRATONVM_DBG_URLCL"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "ute", on_key: Some("CRATONVM_DBG_UTE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "validate-new", on_key: Some("CRATONVM_DBG_VALIDATE_NEW"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "vdisp", on_key: Some("CRATONVM_DBG_VDISP"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "verify-error", on_key: Some("CRATONVM_DBG_VERIFY_ERROR"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "verify-inline-frame-record", on_key: Some("CRATONVM_DBG_VERIFY_INLINE_FRAME_RECORD"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "verify-oop-maps", on_key: Some("CRATONVM_DBG_VERIFY_OOP_MAPS"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "visitfile", on_key: Some("CRATONVM_DBG_VISITFILE"), off_key: None, off_word: None },
@@ -467,42 +509,12 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::DBG, token: "watchref", on_key: Some("CRATONVM_DBG_WATCHREF"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "weakref", on_key: Some("CRATONVM_DBG_WEAKREF"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "wf", on_key: Some("CRATONVM_DBG_WF"), off_key: None, off_word: None },
+    E { group: Group::DBG, token: "wf-npe", on_key: Some("CRATONVM_DBG_WF_NPE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "xnio-tcp", on_key: Some("CRATONVM_DBG_XNIO_TCP"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "xt-jit-root-scan", on_key: Some("CRATONVM_DBG_XT_JIT_ROOT_SCAN"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "youngscan", on_key: Some("CRATONVM_DBG_YOUNGSCAN"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "youngstate", on_key: Some("CRATONVM_DBG_YOUNGSTATE"), off_key: None, off_word: None },
     E { group: Group::DBG, token: "zero-ranges", on_key: Some("CRATONVM_DBG_ZERO_RANGES"), off_key: None, off_word: None },
-    E { group: Group::GC, token: "card-table-only", on_key: Some("CRATONVM_CARD_TABLE_ONLY"), off_key: None, off_word: None },
-    E { group: Group::GC, token: "compact-ref-fields", on_key: Some("CRATONVM_COMPACT_REF_FIELDS"), off_key: None, off_word: None },
-    E { group: Group::GC, token: "compressed-oops", on_key: Some("CRATONVM_COMPRESSED_OOPS"), off_key: None, off_word: None },
-    E { group: Group::GC, token: "default-heap-ergonomics", on_key: Some("CRATONVM_DEFAULT_HEAP_ERGONOMICS"), off_key: None, off_word: None },
-    E { group: Group::GC, token: "default-heap-max-mb", on_key: Some("CRATONVM_DEFAULT_HEAP_MAX_MB"), off_key: None, off_word: None },
-    E { group: Group::GC, token: "g1-evac-retry", on_key: None, off_key: Some("CRATONVM_G1_NO_EVAC_RETRY"), off_word: None },
-    E { group: Group::GC, token: "g1-parallel-evac", on_key: Some("CRATONVM_G1_PARALLEL_EVAC"), off_key: None, off_word: None },
-    E { group: Group::GC, token: "g1-workers", on_key: Some("CRATONVM_G1_WORKERS"), off_key: None, off_word: None },
-    E { group: Group::GC, token: "gpu-zerocopy", on_key: None, off_key: Some("CRATONVM_GPU_NO_ZEROCOPY"), off_word: None },
-    E { group: Group::GC, token: "max-inflated-bytes", on_key: Some("CRATONVM_MAX_INFLATED_BYTES"), off_key: None, off_word: None },
-    E { group: Group::GC, token: "moving-young", on_key: Some("CRATONVM_MOVING_YOUNG"), off_key: Some("CRATONVM_NO_MOVING_YOUNG"), off_word: None },
-    E { group: Group::GC, token: "overhead-limit", on_key: Some("CRATONVM_GC_OVERHEAD_LIMIT"), off_key: None, off_word: None },
-    E { group: Group::GC, token: "par-min-bytes", on_key: Some("CRATONVM_GC_PAR_MIN_BYTES"), off_key: None, off_word: None },
-    E { group: Group::GC, token: "par-threads", on_key: Some("CRATONVM_GC_PAR_THREADS"), off_key: None, off_word: None },
-    E { group: Group::GC, token: "promotion-guard", on_key: None, off_key: Some("CRATONVM_NO_GC_PROMOTION_GUARD"), off_word: None },
-    E { group: Group::GC, token: "promotion-oom-guard-broad", on_key: Some("CRATONVM_PROMOTION_OOM_GUARD_BROAD"), off_key: None, off_word: None },
-    E { group: Group::GC, token: "selective-promote", on_key: None, off_key: Some("CRATONVM_NO_SELECTIVE_PROMOTE"), off_word: None },
-    E { group: Group::GC, token: "stress", on_key: Some("CRATONVM_GC_STRESS"), off_key: None, off_word: None },
-    E { group: Group::GC, token: "sweep-anchor-stride", on_key: Some("CRATONVM_GC_SWEEP_ANCHOR_STRIDE"), off_key: None, off_word: None },
-    E { group: Group::GC, token: "tlab-gc-trigger", on_key: Some("CRATONVM_TLAB_GC_TRIGGER"), off_key: None, off_word: None },
-    E { group: Group::GC, token: "weakref-clear", on_key: Some("CRATONVM_WEAKREF_CLEAR"), off_key: None, off_word: None },
-    E { group: Group::GC, token: "youngscan-stride", on_key: Some("CRATONVM_YOUNGSCAN_STRIDE"), off_key: None, off_word: None },
-    E { group: Group::IO, token: "canon-openfile", on_key: Some("CRATONVM_CANON_OPENFILE"), off_key: None, off_word: None },
-    E { group: Group::IO, token: "http-max-body", on_key: Some("CRATONVM_HTTP_MAX_BODY"), off_key: None, off_word: None },
-    E { group: Group::IO, token: "netty-queue-bridge", on_key: Some("CRATONVM_NETTY_QUEUE_BRIDGE"), off_key: None, off_word: Some("0") },
-    E { group: Group::IO, token: "resolve-outbound-host", on_key: Some("CRATONVM_RESOLVE_OUTBOUND_HOST"), off_key: None, off_word: None },
-    E { group: Group::IO, token: "select-max-block-ms", on_key: Some("CRATONVM_SELECT_MAX_BLOCK_MS"), off_key: None, off_word: None },
-    E { group: Group::IO, token: "selector-connect-probe", on_key: None, off_key: Some("CRATONVM_NO_SELECTOR_CONNECT_PROBE"), off_word: None },
-    E { group: Group::IO, token: "socket-capture", on_key: Some("CRATONVM_SOCKET_CAPTURE"), off_key: None, off_word: None },
-    E { group: Group::IO, token: "uri-strict-chars", on_key: Some("CRATONVM_URI_STRICT_CHARS"), off_key: None, off_word: Some("0") },
-    E { group: Group::IO, token: "zip-max-entry-bytes", on_key: Some("CRATONVM_ZIP_MAX_ENTRY_BYTES"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "aaload-licm", on_key: None, off_key: Some("CRATONVM_DISABLE_AALOAD_LICM"), off_word: None },
     E { group: Group::JIT, token: "alloc-class-cache", on_key: None, off_key: Some("CRATONVM_NO_JIT_ALLOC_CLASS_CACHE"), off_word: None },
     E { group: Group::JIT, token: "allow-packages", on_key: Some("CRATONVM_JIT_ALLOW_PACKAGES"), off_key: None, off_word: None },
@@ -514,6 +526,7 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "callee-oop-flush", on_key: None, off_key: Some("CRATONVM_JIT_NO_CALLEE_OOP_FLUSH"), off_word: None },
     E { group: Group::JIT, token: "code-cache-max-mb", on_key: Some("CRATONVM_JIT_CODE_CACHE_MAX_MB"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "conservative-locals", on_key: None, off_key: Some("CRATONVM_NO_CONSERVATIVE_LOCALS"), off_word: None },
+    E { group: Group::JIT, token: "ctor-direct-call", on_key: None, off_key: Some("CRATONVM_NO_CTOR_DIRECT_CALL"), off_word: None },
     E { group: Group::JIT, token: "deny", on_key: Some("CRATONVM_JIT_DENY"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "deopt-real", on_key: Some("CRATONVM_DEOPT_REAL"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "direct-callee-calls", on_key: Some("CRATONVM_JIT_DIRECT_CALLEE_CALLS"), off_key: None, off_word: None },
@@ -548,8 +561,10 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "kernel-reg-locals", on_key: Some("CRATONVM_JIT_KERNEL_REG_LOCALS"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "kernel-reg-osr", on_key: Some("CRATONVM_JIT_KERNEL_REG_OSR"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "licm", on_key: Some("CRATONVM_JIT_LICM"), off_key: None, off_word: None },
+    E { group: Group::JIT, token: "local-liveness", on_key: None, off_key: Some("CRATONVM_NO_LOCAL_LIVENESS"), off_word: None },
     E { group: Group::JIT, token: "long-intrinsics", on_key: None, off_key: Some("CRATONVM_JIT_NO_LONG_INTRINSICS"), off_word: None },
     E { group: Group::JIT, token: "longroot-strict", on_key: Some("CRATONVM_LONGROOT_STRICT"), off_key: None, off_word: None },
+    E { group: Group::JIT, token: "main-inline", on_key: Some("CRATONVM_JIT_MAIN_INLINE"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "native-ec-multiply", on_key: Some("CRATONVM_NATIVE_EC_MULTIPLY"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "native-matcher-find", on_key: Some("CRATONVM_NATIVE_MATCHER_FIND"), off_key: None, off_word: Some("0") },
     E { group: Group::JIT, token: "native-pbe-keyfactory", on_key: Some("CRATONVM_NATIVE_PBE_KEYFACTORY"), off_key: None, off_word: None },
@@ -584,26 +599,50 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::JIT, token: "stack-bang", on_key: Some("CRATONVM_JIT_STACK_BANG"), off_key: Some("CRATONVM_JIT_NO_STACK_BANG"), off_word: None },
     E { group: Group::JIT, token: "strict-jit-roots", on_key: Some("CRATONVM_STRICT_JIT_ROOTS"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "threshold", on_key: Some("CRATONVM_JIT_THRESHOLD"), off_key: None, off_word: None },
+    E { group: Group::JIT, token: "tier-c1-threshold", on_key: Some("CRATONVM_TIER_C1_THRESHOLD"), off_key: None, off_word: None },
+    E { group: Group::JIT, token: "tier-c2-min-invocations", on_key: Some("CRATONVM_TIER_C2_MIN_INVOCATIONS"), off_key: None, off_word: None },
+    E { group: Group::JIT, token: "tier-c2-threshold", on_key: Some("CRATONVM_TIER_C2_THRESHOLD"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "tier-osr-backedge", on_key: Some("CRATONVM_TIER_OSR_BACKEDGE"), off_key: None, off_word: None },
+    E { group: Group::JIT, token: "tier-osr-threshold", on_key: Some("CRATONVM_TIER_OSR_THRESHOLD"), off_key: None, off_word: None },
+    E { group: Group::JIT, token: "tier-pgo", on_key: Some("CRATONVM_TIER_PGO"), off_key: None, off_word: None },
+    E { group: Group::JIT, token: "tiered", on_key: Some("CRATONVM_TIER_ENABLED"), off_key: None, off_word: Some("0") },
     E { group: Group::JIT, token: "unban-junitcore", on_key: Some("CRATONVM_JIT_UNBAN_JUNITCORE"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "unroll", on_key: Some("CRATONVM_JIT_UNROLL"), off_key: Some("CRATONVM_DISABLE_UNROLL"), off_word: None },
     E { group: Group::JIT, token: "virtual-tierup", on_key: Some("CRATONVM_JIT_VIRTUAL_TIERUP"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "xt-helper-window-scan", on_key: Some("CRATONVM_XT_HELPER_WINDOW_SCAN"), off_key: None, off_word: None },
     E { group: Group::JIT, token: "xt-jit-root-scan", on_key: Some("CRATONVM_XT_JIT_ROOT_SCAN"), off_key: None, off_word: None },
-    E { group: Group::LOADER, token: "allow-jsr-ret", on_key: Some("CRATONVM_ALLOW_JSR_RET"), off_key: None, off_word: None },
-    E { group: Group::LOADER, token: "aware-resolution", on_key: Some("CRATONVM_LOADER_AWARE_RESOLUTION"), off_key: None, off_word: None },
-    E { group: Group::LOADER, token: "boot-module-registry", on_key: Some("CRATONVM_BOOT_MODULE_REGISTRY"), off_key: None, off_word: Some("off") },
-    E { group: Group::LOADER, token: "cl-bootstrap-scoped", on_key: Some("CRATONVM_CL_BOOTSTRAP_SCOPED"), off_key: None, off_word: Some("0") },
-    E { group: Group::LOADER, token: "fwd-resolve-strict", on_key: Some("CRATONVM_FWD_RESOLVE_STRICT"), off_key: None, off_word: None },
-    E { group: Group::LOADER, token: "jar-mmap", on_key: None, off_key: Some("CRATONVM_DISABLE_JAR_MMAP"), off_word: None },
-    E { group: Group::LOADER, token: "lenient-clinit", on_key: Some("CRATONVM_LENIENT_CLINIT"), off_key: None, off_word: None },
-    E { group: Group::LOADER, token: "longrewrite-loose", on_key: Some("CRATONVM_LONGREWRITE_LOOSE"), off_key: None, off_word: None },
-    E { group: Group::LOADER, token: "resolve-cache-cap", on_key: Some("CRATONVM_RESOLVE_CACHE_CAP"), off_key: None, off_word: None },
-    E { group: Group::LOADER, token: "unload", on_key: Some("CRATONVM_LOADER_UNLOAD"), off_key: None, off_word: Some("0") },
+    E { group: Group::GC, token: "card-table-only", on_key: Some("CRATONVM_CARD_TABLE_ONLY"), off_key: None, off_word: None },
+    E { group: Group::GC, token: "compact-ref-fields", on_key: Some("CRATONVM_COMPACT_REF_FIELDS"), off_key: None, off_word: None },
+    E { group: Group::GC, token: "compressed-oops", on_key: Some("CRATONVM_COMPRESSED_OOPS"), off_key: None, off_word: None },
+    E { group: Group::GC, token: "default-heap-ergonomics", on_key: Some("CRATONVM_DEFAULT_HEAP_ERGONOMICS"), off_key: None, off_word: None },
+    E { group: Group::GC, token: "default-heap-max-mb", on_key: Some("CRATONVM_DEFAULT_HEAP_MAX_MB"), off_key: None, off_word: None },
+    E { group: Group::GC, token: "g1-evac-retry", on_key: None, off_key: Some("CRATONVM_G1_NO_EVAC_RETRY"), off_word: None },
+    E { group: Group::GC, token: "g1-parallel-evac", on_key: Some("CRATONVM_G1_PARALLEL_EVAC"), off_key: None, off_word: None },
+    E { group: Group::GC, token: "g1-workers", on_key: Some("CRATONVM_G1_WORKERS"), off_key: None, off_word: None },
+    E { group: Group::GC, token: "gpu-zerocopy", on_key: None, off_key: Some("CRATONVM_GPU_NO_ZEROCOPY"), off_word: None },
+    E { group: Group::GC, token: "max-inflated-bytes", on_key: Some("CRATONVM_MAX_INFLATED_BYTES"), off_key: None, off_word: None },
+    E { group: Group::GC, token: "moving-young", on_key: Some("CRATONVM_MOVING_YOUNG"), off_key: Some("CRATONVM_NO_MOVING_YOUNG"), off_word: None },
+    E { group: Group::GC, token: "overhead-limit", on_key: Some("CRATONVM_GC_OVERHEAD_LIMIT"), off_key: None, off_word: None },
+    E { group: Group::GC, token: "par-min-bytes", on_key: Some("CRATONVM_GC_PAR_MIN_BYTES"), off_key: None, off_word: None },
+    E { group: Group::GC, token: "par-threads", on_key: Some("CRATONVM_GC_PAR_THREADS"), off_key: None, off_word: None },
+    E { group: Group::GC, token: "promotion-guard", on_key: None, off_key: Some("CRATONVM_NO_GC_PROMOTION_GUARD"), off_word: None },
+    E { group: Group::GC, token: "promotion-oom-guard-broad", on_key: Some("CRATONVM_PROMOTION_OOM_GUARD_BROAD"), off_key: None, off_word: None },
+    E { group: Group::GC, token: "selective-promote", on_key: None, off_key: Some("CRATONVM_NO_SELECTIVE_PROMOTE"), off_word: None },
+    E { group: Group::GC, token: "stress", on_key: Some("CRATONVM_GC_STRESS"), off_key: None, off_word: None },
+    E { group: Group::GC, token: "sweep-anchor-stride", on_key: Some("CRATONVM_GC_SWEEP_ANCHOR_STRIDE"), off_key: None, off_word: None },
+    E { group: Group::GC, token: "tlab-gc-trigger", on_key: Some("CRATONVM_TLAB_GC_TRIGGER"), off_key: None, off_word: None },
+    E { group: Group::GC, token: "weakref-clear", on_key: Some("CRATONVM_WEAKREF_CLEAR"), off_key: None, off_word: None },
+    E { group: Group::GC, token: "youngscan-stride", on_key: Some("CRATONVM_YOUNGSCAN_STRIDE"), off_key: None, off_word: None },
     E { group: Group::REAL, token: "agroal", on_key: Some("CRATONVM_REAL_AGROAL"), off_key: Some("CRATONVM_SYNTHETIC_AGROAL"), off_word: None },
-    // `off_word` is unset because `off_key` already expresses "off": setting
-    // CRATONVM_SYNTHETIC_ANNOTATIONS beats the default-ON CRATONVM_REAL_ANNOTATIONS
-    // at the one call site that reads both (`lang_class.rs:10391`).
+    // `CRATONVM_REAL` itself is the group variable, so it is not a row here.
+    // It already was a comma-separated token list before this refactor —
+    // `vm::runtime::env_cache::RealSelector::parse` reads `all`, `jca` and bare
+    // internal class names straight out of it — which is where the grouped
+    // variable syntax came from. That parse still runs on the raw value.
+    //
+    // `off_word` is unset on the four twin rows below because `off_key` already
+    // expresses "off": the synthetic variable beats the default-ON real one at
+    // the single call site that reads both.
     E { group: Group::REAL, token: "annotations", on_key: Some("CRATONVM_REAL_ANNOTATIONS"), off_key: Some("CRATONVM_SYNTHETIC_ANNOTATIONS"), off_word: None },
     E { group: Group::REAL, token: "aqs", on_key: Some("CRATONVM_REAL_AQS"), off_key: Some("CRATONVM_SYNTHETIC_AQS"), off_word: None },
     E { group: Group::REAL, token: "buffered-writer", on_key: None, off_key: Some("CRATONVM_SYNTHETIC_BUFFERED_WRITER"), off_word: None },
@@ -622,30 +661,31 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::REAL, token: "quarkus-arc", on_key: None, off_key: Some("CRATONVM_SYNTHETIC_QUARKUS_ARC"), off_word: None },
     E { group: Group::REAL, token: "quarkus-start", on_key: Some("CRATONVM_REAL_QUARKUS_START"), off_key: None, off_word: None },
     E { group: Group::REAL, token: "raf", on_key: None, off_key: Some("CRATONVM_SYNTHETIC_RAF"), off_word: None },
-    // `CRATONVM_REAL` itself is the group variable. It already was a
-    // comma-separated token list before this refactor — `vm::runtime::env_cache
-    // ::RealSelector::parse` reads `all`, `jca` and bare internal class names
-    // straight out of it — which is where the grouped-variable shape came from.
-    // That parse still runs on the raw value; the tokens below are layered over
-    // it, and `jca` deliberately means the same thing in both.
     E { group: Group::REAL, token: "rsa", on_key: None, off_key: Some("CRATONVM_SYNTHETIC_RSA"), off_word: None },
     E { group: Group::REAL, token: "stax-factory", on_key: Some("CRATONVM_REAL_STAX_FACTORY"), off_key: None, off_word: Some("0") },
     E { group: Group::REAL, token: "stubs", on_key: None, off_key: Some("CRATONVM_NO_STUBS"), off_word: None },
     E { group: Group::REAL, token: "use-wildfly-reflect-shim", on_key: Some("CRATONVM_USE_WILDFLY_REFLECT_SHIM"), off_key: None, off_word: None },
     E { group: Group::REAL, token: "use-wildfly-synth-bytecode", on_key: Some("CRATONVM_USE_WILDFLY_SYNTH_BYTECODE"), off_key: None, off_word: None },
     E { group: Group::REAL, token: "vertx", on_key: Some("CRATONVM_REAL_VERTX"), off_key: Some("CRATONVM_SYNTHETIC_VERTX"), off_word: None },
-    E { group: Group::SECURITY, token: "block-private-nets", on_key: Some("CRATONVM_BLOCK_PRIVATE_NETS"), off_key: None, off_word: None },
-    E { group: Group::SECURITY, token: "confine-io", on_key: Some("CRATONVM_CONFINE_IO"), off_key: None, off_word: None },
-    E { group: Group::SECURITY, token: "harden-manifest-classpath", on_key: Some("CRATONVM_HARDEN_MANIFEST_CLASSPATH"), off_key: None, off_word: None },
-    E { group: Group::SECURITY, token: "require-policy", on_key: Some("CRATONVM_REQUIRE_POLICY"), off_key: None, off_word: None },
-    E { group: Group::SECURITY, token: "trust-pem", on_key: Some("CRATONVM_TRUST_PEM"), off_key: None, off_word: None },
-    E { group: Group::SECURITY, token: "untrusted-code", on_key: Some("CRATONVM_UNTRUSTED_CODE"), off_key: None, off_word: None },
-    E { group: Group::TEST, token: "force-win-build", on_key: Some("CRATONVM_FORCE_WIN_BUILD"), off_key: None, off_word: None },
-    E { group: Group::TEST, token: "segv", on_key: Some("CRATONVM_TEST_SEGV"), off_key: None, off_word: None },
-    E { group: Group::TEST, token: "soak-method", on_key: Some("CRATONVM_SOAK_METHOD"), off_key: None, off_word: None },
-    E { group: Group::TEST, token: "soak-timeout-secs", on_key: Some("CRATONVM_SOAK_TIMEOUT_SECS"), off_key: None, off_word: None },
-    E { group: Group::TEST, token: "soak-xmx", on_key: Some("CRATONVM_SOAK_XMX"), off_key: None, off_word: None },
-    E { group: Group::TEST, token: "var", on_key: Some("CRATONVM_TEST_VAR"), off_key: None, off_word: None },
+    E { group: Group::LOADER, token: "allow-jsr-ret", on_key: Some("CRATONVM_ALLOW_JSR_RET"), off_key: None, off_word: None },
+    E { group: Group::LOADER, token: "aware-resolution", on_key: Some("CRATONVM_LOADER_AWARE_RESOLUTION"), off_key: None, off_word: None },
+    E { group: Group::LOADER, token: "boot-module-registry", on_key: Some("CRATONVM_BOOT_MODULE_REGISTRY"), off_key: None, off_word: Some("off") },
+    E { group: Group::LOADER, token: "cl-bootstrap-scoped", on_key: Some("CRATONVM_CL_BOOTSTRAP_SCOPED"), off_key: None, off_word: Some("0") },
+    E { group: Group::LOADER, token: "fwd-resolve-strict", on_key: Some("CRATONVM_FWD_RESOLVE_STRICT"), off_key: None, off_word: None },
+    E { group: Group::LOADER, token: "jar-mmap", on_key: None, off_key: Some("CRATONVM_DISABLE_JAR_MMAP"), off_word: None },
+    E { group: Group::LOADER, token: "lenient-clinit", on_key: Some("CRATONVM_LENIENT_CLINIT"), off_key: None, off_word: None },
+    E { group: Group::LOADER, token: "longrewrite-loose", on_key: Some("CRATONVM_LONGREWRITE_LOOSE"), off_key: None, off_word: None },
+    E { group: Group::LOADER, token: "resolve-cache-cap", on_key: Some("CRATONVM_RESOLVE_CACHE_CAP"), off_key: None, off_word: None },
+    E { group: Group::LOADER, token: "unload", on_key: Some("CRATONVM_LOADER_UNLOAD"), off_key: None, off_word: Some("0") },
+    E { group: Group::IO, token: "canon-openfile", on_key: Some("CRATONVM_CANON_OPENFILE"), off_key: None, off_word: None },
+    E { group: Group::IO, token: "http-max-body", on_key: Some("CRATONVM_HTTP_MAX_BODY"), off_key: None, off_word: None },
+    E { group: Group::IO, token: "netty-queue-bridge", on_key: Some("CRATONVM_NETTY_QUEUE_BRIDGE"), off_key: None, off_word: Some("0") },
+    E { group: Group::IO, token: "resolve-outbound-host", on_key: Some("CRATONVM_RESOLVE_OUTBOUND_HOST"), off_key: None, off_word: None },
+    E { group: Group::IO, token: "select-max-block-ms", on_key: Some("CRATONVM_SELECT_MAX_BLOCK_MS"), off_key: None, off_word: None },
+    E { group: Group::IO, token: "selector-connect-probe", on_key: None, off_key: Some("CRATONVM_NO_SELECTOR_CONNECT_PROBE"), off_word: None },
+    E { group: Group::IO, token: "socket-capture", on_key: Some("CRATONVM_SOCKET_CAPTURE"), off_key: None, off_word: None },
+    E { group: Group::IO, token: "uri-strict-chars", on_key: Some("CRATONVM_URI_STRICT_CHARS"), off_key: None, off_word: Some("0") },
+    E { group: Group::IO, token: "zip-max-entry-bytes", on_key: Some("CRATONVM_ZIP_MAX_ENTRY_BYTES"), off_key: None, off_word: None },
     E { group: Group::THREADS, token: "assert-single-os-thread", on_key: Some("CRATONVM_ASSERT_SINGLE_OS_THREAD"), off_key: None, off_word: None },
     E { group: Group::THREADS, token: "async-handoff-sleep-floor-ms", on_key: Some("CRATONVM_ASYNC_HANDOFF_SLEEP_FLOOR_MS"), off_key: None, off_word: None },
     E { group: Group::THREADS, token: "async-submit-grace-ms", on_key: Some("CRATONVM_ASYNC_SUBMIT_GRACE_MS"), off_key: None, off_word: None },
@@ -659,6 +699,30 @@ pub const INVENTORY: &[E] = &[
     E { group: Group::THREADS, token: "inherit-tl-workaround", on_key: Some("CRATONVM_INHERIT_TL_WORKAROUND"), off_key: None, off_word: Some("0") },
     E { group: Group::THREADS, token: "lock-order-check", on_key: Some("CRATONVM_LOCK_ORDER_CHECK"), off_key: None, off_word: None },
     E { group: Group::THREADS, token: "thread-start-grace-ms", on_key: Some("CRATONVM_THREAD_START_GRACE_MS"), off_key: None, off_word: None },
+    E { group: Group::SECURITY, token: "aot-hmac-key", on_key: Some("CRATONVM_AOT_HMAC_KEY"), off_key: None, off_word: None },
+    E { group: Group::SECURITY, token: "block-private-nets", on_key: Some("CRATONVM_BLOCK_PRIVATE_NETS"), off_key: None, off_word: None },
+    E { group: Group::SECURITY, token: "confine-io", on_key: Some("CRATONVM_CONFINE_IO"), off_key: None, off_word: None },
+    E { group: Group::SECURITY, token: "harden-manifest-classpath", on_key: Some("CRATONVM_HARDEN_MANIFEST_CLASSPATH"), off_key: None, off_word: None },
+    E { group: Group::SECURITY, token: "require-policy", on_key: Some("CRATONVM_REQUIRE_POLICY"), off_key: None, off_word: None },
+    E { group: Group::SECURITY, token: "trust-pem", on_key: Some("CRATONVM_TRUST_PEM"), off_key: None, off_word: None },
+    E { group: Group::SECURITY, token: "untrusted-code", on_key: Some("CRATONVM_UNTRUSTED_CODE"), off_key: None, off_word: None },
+    E { group: Group::COMPAT, token: "eager-streams", on_key: Some("CRATONVM_EAGER_STREAMS"), off_key: None, off_word: None },
+    E { group: Group::COMPAT, token: "foreign-attach", on_key: Some("CRATONVM_FOREIGN_ATTACH"), off_key: None, off_word: None },
+    E { group: Group::COMPAT, token: "jboss-boot-log-file", on_key: Some("CRATONVM_JBOSS_BOOT_LOG_FILE"), off_key: None, off_word: None },
+    E { group: Group::COMPAT, token: "jboss-brute-force-jars", on_key: Some("CRATONVM_JBOSS_BRUTE_FORCE_JARS"), off_key: None, off_word: None },
+    E { group: Group::COMPAT, token: "jboss-logger-base-emit", on_key: Some("CRATONVM_JBOSS_LOGGER_BASE_EMIT"), off_key: None, off_word: None },
+    E { group: Group::COMPAT, token: "jboss-mp-root", on_key: Some("CRATONVM_JBOSS_MP_ROOT"), off_key: None, off_word: None },
+    E { group: Group::COMPAT, token: "lazy-streams", on_key: Some("CRATONVM_LAZY_STREAMS"), off_key: None, off_word: None },
+    E { group: Group::COMPAT, token: "strict-swallows", on_key: Some("CRATONVM_STRICT_SWALLOWS"), off_key: None, off_word: None },
+    E { group: Group::TEST, token: "force-win-build", on_key: Some("CRATONVM_FORCE_WIN_BUILD"), off_key: None, off_word: None },
+    E { group: Group::TEST, token: "jdk", on_key: Some("CRATONVM_TEST_JDK"), off_key: None, off_word: None },
+    E { group: Group::TEST, token: "segv", on_key: Some("CRATONVM_TEST_SEGV"), off_key: None, off_word: None },
+    E { group: Group::TEST, token: "soak-iters", on_key: Some("CRATONVM_SOAK_ITERS"), off_key: None, off_word: None },
+    E { group: Group::TEST, token: "soak-k", on_key: Some("CRATONVM_SOAK_K"), off_key: None, off_word: None },
+    E { group: Group::TEST, token: "soak-method", on_key: Some("CRATONVM_SOAK_METHOD"), off_key: None, off_word: None },
+    E { group: Group::TEST, token: "soak-timeout-secs", on_key: Some("CRATONVM_SOAK_TIMEOUT_SECS"), off_key: None, off_word: None },
+    E { group: Group::TEST, token: "soak-xmx", on_key: Some("CRATONVM_SOAK_XMX"), off_key: None, off_word: None },
+    E { group: Group::TEST, token: "var", on_key: Some("CRATONVM_TEST_VAR"), off_key: None, off_word: None },
 ];
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -847,7 +911,6 @@ pub fn expand_process_env() -> (Vec<(&'static str, String)>, Vec<String>) {
     (resolved.legacy_direct, resolved.unknown_tokens)
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -903,7 +966,10 @@ mod tests {
              canonical spelling is ambiguous"
         );
         for s in SCALARS {
-            assert!(!keys.contains(s), "{s} is both a scalar and a grouped token");
+            assert!(
+                !keys.contains(s),
+                "{s} is both a scalar and a grouped token"
+            );
         }
         // A legacy key may not be spelled the same as a group variable: the
         // resolver would then both consume it as a token list and expand a
@@ -960,8 +1026,14 @@ mod tests {
     fn grouped_token_sets_the_legacy_key() {
         let c = case(&[("CRATONVM_DBG", "loader-trace,gc-stress=65536")]);
         let r = c.resolve();
-        assert_eq!(r.get("CRATONVM_DBG_LOADER_TRACE"), Some(OsString::from("1")));
-        assert_eq!(r.get("CRATONVM_DBG_GC_STRESS"), Some(OsString::from("65536")));
+        assert_eq!(
+            r.get("CRATONVM_DBG_LOADER_TRACE"),
+            Some(OsString::from("1"))
+        );
+        assert_eq!(
+            r.get("CRATONVM_DBG_GC_STRESS"),
+            Some(OsString::from("65536"))
+        );
         assert!(r.unknown_tokens.is_empty());
     }
 
@@ -1058,7 +1130,11 @@ mod tests {
         let r = c.resolve();
         for e in entries(Group::DBG) {
             if let Some(k) = e.on_key {
-                assert_eq!(r.get(k), Some(OsString::from("1")), "{k} not enabled by all");
+                assert_eq!(
+                    r.get(k),
+                    Some(OsString::from("1")),
+                    "{k} not enabled by all"
+                );
             }
         }
         assert_eq!(r.get("CRATONVM_JIT_LICM"), None);
@@ -1078,7 +1154,10 @@ mod tests {
         let c = case(&[("CRATONVM_DBG_LOADER_TRACE", "1")]);
         let r = c.resolve();
         // Untouched: the legacy name *is* the key the typed config reads.
-        assert_eq!(r.get("CRATONVM_DBG_LOADER_TRACE"), Some(OsString::from("1")));
+        assert_eq!(
+            r.get("CRATONVM_DBG_LOADER_TRACE"),
+            Some(OsString::from("1"))
+        );
         assert_eq!(
             r.legacy_direct,
             vec![(
