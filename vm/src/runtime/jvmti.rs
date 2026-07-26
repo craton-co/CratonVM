@@ -3,9 +3,52 @@
 
 //! JVMTI (JVM Tool Interface) implementation.
 //!
-//! Provides the complete JVMTI function table, agent loading support,
-//! event delivery infrastructure, and capabilities management as specified
-//! by the JVMTI specification (JSR-163 / JVM TI 11.0+).
+//! Provides the JVMTI function table, agent loading support, event delivery
+//! infrastructure, and capabilities management modelled on the JVMTI
+//! specification (JSR-163 / JVM TI 11.0+).
+//!
+//! ---------------------------------------------------------------------------
+//! # LIVENESS AND SCOPE — established by the observability audit, 2026-07-26
+//! ---------------------------------------------------------------------------
+//!
+//! **There are two JVMTI implementations in this tree and they are not
+//! connected to each other.** Know which one you are looking at:
+//!
+//! | | `vm/src/runtime/jvmti.rs` (this file) | `vm/src/jvmti/` |
+//! |---|---|---|
+//! | Event delivery | `JvmtiEventManager` + `fire_*` free functions | `EventManager` + `EventCallbacks` |
+//! | Callback type | in-process Rust `Box<dyn Fn>` | in-process Rust `Box<dyn Fn>` |
+//! | Reached by native agents | **no** | yes — `agent.rs` does a real `libloading` `dlopen` + `Agent_OnLoad` |
+//! | Wired to the interpreter | **yes** — see below | only `notify_class_load` / `notify_thread_end` |
+//! | Gated on a cargo feature | no | `experimental-debug` (on by default) |
+//!
+//! What IS live in this file on a default build:
+//!
+//!  * `install_global_manager` runs unconditionally from `SharedVm::new`, so
+//!    the process-global `JvmtiEventManager` always exists.
+//!  * `fire_class_load` / `fire_class_prepare` are driven by the
+//!    `classloading` hook adapters, `fire_gc_start` / `fire_gc_finish` by the
+//!    `gc` hook adapters, `fire_vm_init` / `fire_vm_death` by the VM
+//!    lifecycle, and `fire_method_entry` / `fire_method_exit` /
+//!    `fire_single_step` / `fire_frame_pop` / `fire_field_access_if_watched` /
+//!    `fire_field_modification_if_watched` from the interpreter.
+//!  * Every one of those call sites is guarded by an `any_*_listener_active()`
+//!    atomic check, so with no listener registered the cost is a relaxed load.
+//!
+//! What is NOT live: **nothing registers a listener on the global manager
+//! outside `#[cfg(test)]`.** A native agent loaded via `-agentpath:` goes to
+//! `vm/src/jvmti/`, whose `EventManager` is a *different object* — so an
+//! attached agent receives none of the interpreter-sourced events plumbed
+//! here. In practice this file is an in-tree/embedder API today, not the
+//! agent-facing one. Do not describe it to users as "JVMTI works".
+//!
+//! ## Known correctness gaps (each documented at its definition)
+//!
+//!  * `AgentRegistry::load_agents` does not load anything — see its doc.
+//!  * `get_local_*` / `set_local_*` operate on a side table, not on real
+//!    interpreter frames — see [`JvmtiEnv::get_local_int`].
+//!  * `ClassLoad`/`ClassPrepare` are fired from inside the class-manager
+//!    write guard and always report thread 0 — see [`fire_class_load`].
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -780,6 +823,40 @@ impl fmt::Debug for EventCallbacks {
 /// it dispatches to every attached env's callback table in turn, matching the
 /// JVMTI spec semantics where multiple agents may subscribe to the same event.
 ///
+/// **That contract is currently only partially implemented.** 11 of the 30
+/// `fire_*` methods run the `snapshot_envs()` loop; the rest dispatch only to
+/// this manager's own `callbacks` table, so an attached env silently receives
+/// nothing for them. There is no diagnostic when this happens. Still missing
+/// the loop, as of 2026-07-26:
+///
+/// ```text
+/// vm_init          vm_death          thread_start      thread_end
+/// class_file_load_hook               exception         exception_catch
+/// breakpoint       gc_start          gc_finish         monitor_contended_enter
+/// monitor_contended_entered          monitor_wait      monitor_waited
+/// compiled_method_load               compiled_method_unload
+/// dynamic_code_generated
+/// ```
+///
+/// `class_load` / `class_prepare` were in that list and now dispatch per-env;
+/// the others were left alone rather than swept, because two of them need a
+/// semantic decision first, not a copied loop: `class_file_load_hook` returns
+/// replacement bytes (with N agents, whose transform wins — first, last, or
+/// chained?), and `breakpoint` / `exception` are the events where double
+/// delivery to an agent that registered on both tables would be most visible.
+///
+/// Note also that the per-env loops do *not* consult the env's own enable
+/// state — `is_event_enabled` is checked once against this manager, then every
+/// attached env's callback is invoked. An env that never enabled the event
+/// still gets it. That is the established behaviour of every existing loop, so
+/// the two added here match it deliberately rather than inventing a second
+/// semantics; it is worth revisiting if per-env enablement ever matters.
+///
+/// Scope check before relying on any of this: `register_env` has no callers
+/// outside tests, and agents loaded via `-agentpath:` reach a *different*
+/// manager entirely (`vm/src/jvmti/`, see the D14 note at the top of this
+/// file). Per-env delivery here is therefore test-only reachable today.
+///
 /// A per-manager [`AtomicBool`] is used as the no-agent fast path: when no
 /// environment has enabled any event and no callback is registered, the flag
 /// is false and fire_ methods exit in a single atomic load. This keeps the
@@ -1184,6 +1261,19 @@ impl JvmtiEventManager {
         None
     }
 
+    /// Fire ClassLoad.
+    ///
+    /// Panic-safe, and load-bearing here in a way it is not for most events:
+    /// this is reached from `ClassManager::define_class_shared_with_options`
+    /// (see the re-entrancy notes above `install_class_load_hook` in
+    /// `classloading/src/class_manager.rs`) while the caller still holds the
+    /// L10 `ClassRealm::class_manager` **write** guard. That guard is a
+    /// `parking_lot::RwLock`, which does not poison — so an agent callback
+    /// that panicked would unwind straight through it and release it
+    /// silently, publishing a half-built `ClassManager` (the class is in the
+    /// store with its vtable installed, but the define path never finished)
+    /// to every later reader with no indication anything went wrong.
+    /// Containing the panic here keeps the unwind out of the guard entirely.
     pub fn fire_class_load(&self, thread: ThreadId, class_id: ClassId) {
         if !self.is_event_enabled(JvmtiEventKind::ClassLoad, Some(thread)) {
             return;
@@ -1191,11 +1281,24 @@ impl JvmtiEventManager {
         self.record_event(JvmtiEventKind::ClassLoad);
         if let Ok(cbs) = self.callbacks.read() {
             if let Some(ref cb) = cbs.class_load {
-                cb(thread, class_id);
+                let _ =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cb(thread, class_id)));
+            }
+        }
+        for env in self.snapshot_envs() {
+            if let Ok(cbs) = env.event_manager.callbacks.read() {
+                if let Some(ref cb) = cbs.class_load {
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        cb(thread, class_id)
+                    }));
+                }
             }
         }
     }
 
+    /// Fire ClassPrepare. Panic-safe for the same reason as
+    /// [`Self::fire_class_load`] — it fires from the same place, under the
+    /// same held class-manager write guard.
     pub fn fire_class_prepare(&self, thread: ThreadId, class_id: ClassId) {
         if !self.is_event_enabled(JvmtiEventKind::ClassPrepare, Some(thread)) {
             return;
@@ -1203,7 +1306,17 @@ impl JvmtiEventManager {
         self.record_event(JvmtiEventKind::ClassPrepare);
         if let Ok(cbs) = self.callbacks.read() {
             if let Some(ref cb) = cbs.class_prepare {
-                cb(thread, class_id);
+                let _ =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cb(thread, class_id)));
+            }
+        }
+        for env in self.snapshot_envs() {
+            if let Ok(cbs) = env.event_manager.callbacks.read() {
+                if let Some(ref cb) = cbs.class_prepare {
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        cb(thread, class_id)
+                    }));
+                }
             }
         }
     }
@@ -1820,6 +1933,30 @@ impl AgentRegistry {
 
     /// Load all registered agents by invoking their Agent_OnLoad callbacks.
     /// Returns the number of successfully loaded agents.
+    ///
+    /// ---------------------------------------------------------------------
+    /// WARNING (observability audit, 2026-07-26): THIS DOES NOT LOAD NATIVE
+    /// AGENTS.
+    /// ---------------------------------------------------------------------
+    /// There is no `dlopen`/`LoadLibrary` here and no `Agent_OnLoad` symbol
+    /// lookup. Every registered agent is unconditionally marked
+    /// `loaded = true` and counted as a success — including an
+    /// `-agentpath:/does/not/exist.so`. The only callbacks invoked are Rust
+    /// closures previously handed to [`AgentRegistry::register_on_load`],
+    /// which is an in-process/test facility.
+    ///
+    /// Failure scenario: an operator passes `-agentpath:` for a profiler, the
+    /// VM reports the agent loaded, and the profiler is simply never present.
+    /// Nothing distinguishes that from a profiler that attached and found
+    /// nothing to record.
+    ///
+    /// Real native-agent loading lives in `vm/src/jvmti/agent.rs`
+    /// (`AgentRegistry::load_agent` there), which does use `libloading` and
+    /// does resolve `Agent_OnLoad` / `Agent_OnAttach` / `Agent_OnUnload`. That
+    /// is the registry `SharedVm::new` actually drives via
+    /// `load_startup_jvmti_agents`. This type is a *different*, in-tree
+    /// registry that no bootstrap path uses; treat it as an embedder hook, and
+    /// do not route `-agentpath:` here.
     pub fn load_agents(&mut self) -> JvmtiResult<usize> {
         let mut loaded_count = 0usize;
         for agent in &mut self.agents {
@@ -1925,6 +2062,12 @@ pub struct JvmtiEnv {
     /// Class registry for introspection.
     classes: RwLock<HashMap<ClassId, ClassInfo>>,
     /// Local variable table per thread per frame depth.
+    ///
+    /// **This is a side table, not a view of real interpreter frames.** It is
+    /// only ever populated by `set_frame_locals` / `set_local_*` on this same
+    /// `JvmtiEnv`. Nothing in the interpreter, the JIT, or the stack walker
+    /// writes into it. See [`JvmtiEnv::get_local_int`] for what that means for
+    /// `GetLocalVariable*`.
     local_variables: RwLock<HashMap<(ThreadId, u32), HashMap<u32, LocalValue>>>,
     /// System properties.
     system_properties: RwLock<HashMap<String, String>>,
@@ -2229,6 +2372,40 @@ impl JvmtiEnv {
     }
 
     // --- Local Variables ---
+    //
+    // -----------------------------------------------------------------------
+    // GAP (observability audit, 2026-07-26): `GetLocalVariable*` DOES NOT READ
+    // REAL FRAMES.
+    // -----------------------------------------------------------------------
+    // `get_local_int` / `_long` / `_float` / `_double` / `_object` read the
+    // `local_variables` side table. That table is written by exactly one set
+    // of functions: `set_local_variable_table` and `set_local_*` on this same
+    // `JvmtiEnv`. Outside `#[cfg(test)]`, nothing calls any of them — not the
+    // interpreter, not the JIT deopt path, not the stack walker.
+    //
+    // So on a live VM every `get_local_*` returns `JvmtiError::NoMoreFrames`
+    // (no side-table entry for `(thread, depth)`), and `can_access_local_variables`
+    // is nevertheless advertised as `true` in `JvmtiCapabilities::all()`. A
+    // debugger negotiating capabilities is told local-variable inspection
+    // works and then finds every frame empty. That failure mode reads as "the
+    // VM lost my frames", which is a much worse diagnosis than "unsupported".
+    //
+    // Wiring this to real frames is NOT just a matter of plumbing a frame
+    // reference in. JVMTI's API is typed per slot — `GetLocalInt` on a slot
+    // that holds a reference must return `JVMTI_ERROR_TYPE_MISMATCH`, not a
+    // reinterpreted pointer — so the reader needs a per-slot *kind*
+    // (int/long/float/double/ref). The verifier type maps added in
+    // `classloading/src/type_maps.rs` are **oop-vs-not only**: they can say
+    // "slot 3 holds a reference", which is what the GC needs, but they cannot
+    // distinguish an `int` slot from a `float` slot or identify the second
+    // half of a `long`. Implementing `GetLocalVariable*` faithfully therefore
+    // needs either the class file's `LocalVariableTable` attribute (which is
+    // optional, and absent from most release builds) or a widened slot-kind
+    // map. Until one of those exists, returning an error is the honest
+    // behaviour and this note is the contract.
+    //
+    // The `set_local_*` half is genuinely useful as an embedder/test surface
+    // and is left as-is.
 
     /// Set local variable values for a given thread and frame depth.
     pub fn set_local_variable_table(
@@ -2713,6 +2890,35 @@ pub fn fire_vm_death() {
 
 /// Fire ClassLoad at the global level. Called from the class manager
 /// after a new class has been registered.
+///
+/// ---------------------------------------------------------------------------
+/// TWO CALLER-SIDE HAZARDS (observability audit, 2026-07-26)
+/// ---------------------------------------------------------------------------
+///
+/// 1. **Fired while the class-manager write guard is held.** The producer is
+///    `cratonvm_classloading::class_manager::define_class_shared_with_options`,
+///    which calls `fire_class_load_hook` / `fire_class_prepare_hook` from
+///    inside its `&mut self` region — i.e. the L10 `ClassManager` write lock is
+///    held for the whole callback. That file's own comment claims "it never
+///    re-enters the class manager, so it is safe to call from inside
+///    `&mut self`", which holds only because every listener today is an
+///    in-tree Rust function pointer that does nothing but bump a counter.
+///
+///    A real JVMTI agent's `ClassLoad` handler routinely calls back into the
+///    VM — `GetClassSignature`, `GetLoadedClasses`, `GetClassMethods`,
+///    `RetransformClasses` — and every one of those needs to read the class
+///    manager. Because the guard is an exclusive write lock held by the same
+///    thread, that is a **self-deadlock**, not lock contention: the thread
+///    blocks forever on a lock it already owns, taking the class-loading path
+///    for the whole VM down with it. This must be fixed (snapshot what the
+///    event needs, drop the guard, then fire) before any native agent is
+///    allowed to receive `ClassLoad`/`ClassPrepare`.
+///
+/// 2. **`thread` is always 0.** Both hook call sites pass a literal `0` for
+///    the thread id rather than the loading thread. JVMTI's `ClassLoad`
+///    signature carries a `jthread` and agents key on it (e.g. to skip classes
+///    loaded by their own instrumentation thread and avoid recursion). Every
+///    event delivered here reports the same, wrong, thread.
 pub fn fire_class_load(thread: ThreadId, class_id: ClassId) {
     if let Some(m) = GLOBAL_MANAGER.get() {
         m.fire_class_load(thread, class_id);
@@ -2721,6 +2927,9 @@ pub fn fire_class_load(thread: ThreadId, class_id: ClassId) {
 
 /// Fire ClassPrepare at the global level. Called from the class manager
 /// after the class has been linked / prepared.
+///
+/// Shares both hazards documented on [`fire_class_load`]: fired under the
+/// class-manager write guard, with a hardcoded thread id of 0.
 pub fn fire_class_prepare(thread: ThreadId, class_id: ClassId) {
     if let Some(m) = GLOBAL_MANAGER.get() {
         m.fire_class_prepare(thread, class_id);
@@ -3190,6 +3399,59 @@ mod tests {
 
     fn make_test_env() -> JvmtiEnv {
         JvmtiEnv::new()
+    }
+
+    // ---- Observability audit (2026-07-26) contract pins -------------------
+
+    /// `GetLocalVariable*` reads a side table that no production code writes.
+    /// This test pins the current, documented behaviour: on a fresh env there
+    /// are no frames to read, even though `can_access_local_variables` is
+    /// advertised. If someone wires locals to real interpreter frames, this
+    /// test SHOULD fail — and the gap note above the local-variable section
+    /// must be removed in the same change.
+    #[test]
+    fn obsaudit_get_local_reads_side_table_not_real_frames() {
+        let env = make_test_env();
+        env.add_capabilities(&JvmtiCapabilities {
+            can_access_local_variables: true,
+            ..Default::default()
+        })
+        .unwrap();
+
+        // No `set_local_*` call has happened, and nothing else populates the
+        // table, so there is no frame at any depth for any thread.
+        assert_eq!(env.get_local_int(1, 0, 0), Err(JvmtiError::NoMoreFrames));
+        assert_eq!(env.get_local_object(1, 0, 0), Err(JvmtiError::NoMoreFrames));
+
+        // The table is writable, and reads see exactly what was written —
+        // confirming it is a side table rather than a frame view.
+        env.set_local_int(1, 0, 0, 0x5A5A).unwrap();
+        assert_eq!(env.get_local_int(1, 0, 0), Ok(0x5A5A));
+        // Typed access is enforced against the side table's own tag, which is
+        // the one JVMTI-conformant behaviour that survives here.
+        assert_eq!(env.get_local_long(1, 0, 0), Err(JvmtiError::TypeMismatch));
+    }
+
+    /// `AgentRegistry::load_agents` reports success for a library that does
+    /// not exist, because it never dlopens anything. Pinning this keeps the
+    /// "not a real agent loader" warning on `load_agents` honest — if the
+    /// function ever gains real loading, this test fails and the doc must be
+    /// rewritten alongside it.
+    #[test]
+    fn obsaudit_load_agents_does_not_actually_load_native_libraries() {
+        let mut reg = AgentRegistry::new();
+        reg.parse_agent_option("-agentpath:/nonexistent/definitely-not-here.so=opts")
+            .unwrap();
+        let loaded = reg.load_agents().unwrap();
+        assert_eq!(
+            loaded, 1,
+            "current behaviour: a missing agent library still counts as loaded"
+        );
+        assert_eq!(reg.loaded_count(), 1);
+        assert!(
+            !std::path::Path::new("/nonexistent/definitely-not-here.so").exists(),
+            "the library really does not exist — the success above is fictitious"
+        );
     }
 
     fn make_thread_info(name: &str) -> ThreadInfo {
@@ -4166,6 +4428,51 @@ mod tests {
         assert_eq!(*agent_tags.lock().unwrap(), vec![123, 456]);
     }
 
+    /// ClassLoad / ClassPrepare must reach attached envs, not just the
+    /// manager's own callback table.
+    ///
+    /// Both events used to dispatch only to `self.callbacks`, so an agent
+    /// holding its own `JvmtiEnv` silently received neither — no error, no
+    /// diagnostic, just nothing. That contradicted the delivery contract
+    /// documented on `JvmtiEventManager`. This pins the fix; see the same doc
+    /// comment for the events that still lack per-env delivery.
+    #[test]
+    fn test_env_receives_class_load_and_prepare() {
+        let em = JvmtiEventManager::new();
+        let tid: ThreadId = 3;
+        em.set_event_notification_mode(EventMode::Enable, JvmtiEventKind::ClassLoad, Some(tid))
+            .unwrap();
+        em.set_event_notification_mode(EventMode::Enable, JvmtiEventKind::ClassPrepare, Some(tid))
+            .unwrap();
+
+        let env = Arc::new(JvmtiEnv::new());
+        let loaded = Arc::new(Mutex::new(Vec::<ClassId>::new()));
+        let prepared = Arc::new(Mutex::new(Vec::<ClassId>::new()));
+        let (l, p) = (loaded.clone(), prepared.clone());
+        env.event_manager
+            .set_event_callbacks(EventCallbacks {
+                class_load: Some(Box::new(move |_t, c| l.lock().unwrap().push(c))),
+                class_prepare: Some(Box::new(move |_t, c| p.lock().unwrap().push(c))),
+                ..Default::default()
+            })
+            .unwrap();
+
+        em.register_env(&env).unwrap();
+        em.fire_class_load(tid, 11);
+        em.fire_class_load(tid, 22);
+        em.fire_class_prepare(tid, 11);
+
+        assert_eq!(*loaded.lock().unwrap(), vec![11, 22]);
+        assert_eq!(*prepared.lock().unwrap(), vec![11]);
+
+        // Unregistering must stop delivery, same as every other per-env event.
+        em.unregister_env(&env).unwrap();
+        em.fire_class_load(tid, 33);
+        em.fire_class_prepare(tid, 33);
+        assert_eq!(*loaded.lock().unwrap(), vec![11, 22]);
+        assert_eq!(*prepared.lock().unwrap(), vec![11]);
+    }
+
     #[test]
     fn test_env_dropped_envs_pruned() {
         let em = JvmtiEventManager::new();
@@ -4679,6 +4986,64 @@ mod tests {
         fire_method_entry(tid, 999); // agent panics
         fire_method_entry(tid, mid + 1); // must still deliver
         assert_eq!(ok_count.load(Ordering::SeqCst), 3);
+    }
+
+    /// A panicking ClassLoad / ClassPrepare callback must not propagate out
+    /// of the fire_* path.
+    ///
+    /// This matters more than for the other events: both fire from
+    /// `ClassManager::define_class_shared_with_options` while the caller
+    /// holds the L10 `class_manager` **write** guard. `parking_lot::RwLock`
+    /// does not poison, so an escaping unwind would release that guard
+    /// silently and publish a half-built `ClassManager`. See the re-entrancy
+    /// notes above `install_class_load_hook` in
+    /// `classloading/src/class_manager.rs`.
+    #[test]
+    fn class_load_prepare_agent_panic_is_contained() {
+        let _lock = global_test_lock();
+        let mgr = ensure_global_manager();
+        reset_global_manager_for_tests();
+
+        let tid: ThreadId = 21;
+        let poison: ClassId = 999;
+        mgr.set_event_notification_mode(EventMode::Enable, JvmtiEventKind::ClassLoad, Some(tid))
+            .unwrap();
+        mgr.set_event_notification_mode(EventMode::Enable, JvmtiEventKind::ClassPrepare, Some(tid))
+            .unwrap();
+
+        let calls = Arc::new(AtomicU32::new(0));
+        let (cl, cp) = (calls.clone(), calls.clone());
+        mgr.set_event_callbacks(EventCallbacks {
+            class_load: Some(Box::new(move |_t, c| {
+                cl.fetch_add(1, Ordering::SeqCst);
+                if c == poison {
+                    panic!("agent panic in ClassLoad");
+                }
+            })),
+            class_prepare: Some(Box::new(move |_t, c| {
+                cp.fetch_add(1, Ordering::SeqCst);
+                if c == poison {
+                    panic!("agent panic in ClassPrepare");
+                }
+            })),
+            ..Default::default()
+        })
+        .unwrap();
+
+        // Each of these would unwind into the caller before the fix. Reaching
+        // the assertion below at all is the property under test.
+        fire_class_load(tid, 1);
+        fire_class_load(tid, poison);
+        fire_class_load(tid, 2);
+        fire_class_prepare(tid, 1);
+        fire_class_prepare(tid, poison);
+        fire_class_prepare(tid, 2);
+
+        // 3 ClassLoad + 3 ClassPrepare: dispatch survives the panic and keeps
+        // delivering, rather than the callback being torn down or skipped.
+        assert_eq!(calls.load(Ordering::SeqCst), 6);
+        assert_eq!(mgr.event_count(JvmtiEventKind::ClassLoad), 3);
+        assert_eq!(mgr.event_count(JvmtiEventKind::ClassPrepare), 3);
     }
 
     /// T17.Δ.4 — registering a watchpoint idempotently sets access and

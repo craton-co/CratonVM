@@ -103,6 +103,31 @@ impl RememberedSet {
         self.sources.lock().clear();
     }
 
+    /// G1MAT-4 — drop every recorded source region for which `keep` returns
+    /// false.
+    ///
+    /// The G1 remembered set is *additive*: `add_reference` is called by the
+    /// mutator post-write barrier and by the collector's Phase-4 edge rebuild,
+    /// and the only thing that ever removes entries is [`Self::clear`] on the
+    /// TARGET region's own `reset()`. A source region that is later recycled
+    /// therefore stays named in every rset it ever wrote into, forever. The
+    /// scan side already ignores `Free` sources
+    /// (`G1Collector::scan_source_region_for_cset_refs` returns early), so
+    /// stale entries are not a soundness problem — but they grow without
+    /// bound, and every young/mixed pause pays a lookup (and, once the source
+    /// is recycled into a live type again, a full wholesale region walk that
+    /// can resurrect dead objects' referents).
+    ///
+    /// This gives the collector a way to prune entries it can PROVE are dead.
+    /// It deliberately does not expose a "rebuild from scratch" primitive:
+    /// turning the over-approximate rset into an exact one requires proving
+    /// the Phase-4 walk never truncates (it `break`s on a corrupt header, a
+    /// humongous filler, and a straddling object), and a dropped live entry
+    /// there is a use-after-free.
+    pub fn retain_sources<F: FnMut(usize) -> bool>(&self, mut keep: F) {
+        self.sources.lock().retain(|&s| keep(s));
+    }
+
     /// Number of distinct source regions.
     pub fn source_count(&self) -> usize {
         self.sources.lock().len()

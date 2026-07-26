@@ -127,15 +127,35 @@ pub fn unload_dead_class_metadata(
     // These caches are pure memoizers. A conservative clear is preferable to
     // retaining a value that mentions an unloaded class through an indirect
     // target not represented in its key.
-    shared.classes.shared_resolution.invalidate_all();
+    //
+    // ARCH-2026-07-26 (request CR-LR-1 of
+    // `docs/internal/arch-2026-07-26/stackwalk-and-vtable.md`): this used to
+    // call `invalidate_all()`, which takes THREE write locks — but two of them
+    // guard `SharedResolutionState::global_methods` / `global_fields`, whose
+    // only writers (`cache_method` / `cache_field`) have no production callers,
+    // so those maps are always empty here. Re-verified on this tree: the sole
+    // external consumers of `shared_resolution` are this line and the
+    // interpreter's `promoted_*` paths. `invalidate_promoted()` clears exactly
+    // the live cache, and — more importantly — stops this call site implying
+    // that the other two maps are live.
+    shared.classes.shared_resolution.invalidate_promoted();
     shared.classes.osc_cache.remove_classes(&ids);
 
     let mut jit_entries_retired = 0;
     {
+        // PERF (ARCH-2026-07-26, request CR-VT-1 of
+        // `docs/internal/arch-2026-07-26/stackwalk-and-vtable.md`).
+        // `unload_class` calls `invalidate_class`, which sweeps EVERY slot of
+        // EVERY vtable in the VM — so a per-class loop here costs
+        // O(unloaded x all_classes x slots_per_class) under the manager write
+        // lock: for a few hundred unloaded classes in a VM holding tens of
+        // thousands, hundreds of millions of slot visits at a moment when every
+        // dispatching thread is waiting on this lock. `unload_classes` does one
+        // sweep for the whole batch and is proven equivalent to the loop by
+        // `vtable::tests::unload_classes_matches_a_loop_of_unload_class`.
+        let dead: Vec<u64> = unloaded.iter().map(|c| c.id.as_u32() as u64).collect();
         let mut vtables = shared.classes.vtable_manager.write();
-        for class in &unloaded {
-            vtables.unload_class(class.id.as_u32() as u64);
-        }
+        vtables.unload_classes(&dead);
     }
     for class in &unloaded {
         shared

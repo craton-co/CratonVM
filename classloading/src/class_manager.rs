@@ -628,12 +628,55 @@ impl<'a> ClassHierarchy for ClassStoreHierarchy<'a> {
 // any thread exists) the caller should pass 0 and the JVMTI layer routes
 // the event to the VM-init thread.
 //
-// Calls are made AFTER the class manager releases its internal locks so
-// agent callbacks can safely re-enter the class loader (e.g. to call
-// GetLoadedClasses) without self-deadlock.
+// RE-ENTRANCY IS PROHIBITED. Both hooks fire from inside
+// `define_class_shared_with_options` while the class loader still holds
+// `&mut self` — i.e. with the caller's L10 `ClassRealm::class_manager`
+// write guard (`vm/src/vm/realms/class_realm.rs`) still alive. A hook
+// that re-enters ANY class-manager API self-deadlocks on the same
+// thread: `parking_lot::RwLock` is not reentrant. This matches the
+// contract already documented for [`VtableInstallHook`] below, which
+// fires from the same place under the same guard.
+//
+// (An earlier version of this comment claimed calls were made *after*
+// the class manager released its internal locks, so callbacks could
+// safely call back in — e.g. `GetLoadedClasses`. That was never true of
+// this code. The claim is retracted rather than implemented: firing
+// under the guard is deliberate. `define_class` recurses through
+// `load_class` for superclass and interface resolution, so deferring
+// delivery would mean buffering notifications and draining them at
+// every one of the ~59 `class_manager.write()` sites in `vm/` — any
+// missed drain silently delivers ClassLoad late, out of order, or
+// attributed to the wrong thread. The hook is also on the hottest path
+// in the VM (~90k class defines on a Spring Boot cold start) and is
+// designed to cost one `AtomicBool` load when no agent is attached.)
+//
+// Failure mode if a hook does re-enter:
+//   - debug builds, or release with `CRATONVM_LOCK_ORDER_CHECK=1`:
+//     `check_and_acquire` asserts `level < held`, so re-taking L10 at
+//     the same level panics with a `LockOrderViolation` naming
+//     ClassManager twice — a diagnosable panic, not a hang.
+//   - release builds without that env var: enforcement is off and the
+//     re-acquisition is a genuine hard deadlock.
+//   - `read_recursive()` is NOT caught even in debug builds
+//     (`check_and_acquire_reentrant` early-returns when the level is
+//     already held) and still deadlocks against the held write guard.
+//
+// The in-tree adapters (`class_load_adapter` / `class_prepare_adapter`,
+// `vm/src/vm/vm_init.rs`) satisfy the contract: they forward to
+// `runtime::jvmti::fire_class_{load,prepare}`, which take the JVMTI
+// manager's own `callbacks` lock and invoke a `Box<dyn Fn>` — never
+// touching the class manager.
 
 /// Signature of the JVMTI class-lifecycle hook installed by the VM crate.
 /// Parameters: `(class_id_u32, class_name, thread_id)`.
+///
+/// The hook MUST NOT re-enter the class manager: it is invoked while the
+/// class loader still holds `&mut self`, under the caller's L10
+/// `class_manager` write guard, and `parking_lot::RwLock` is not
+/// reentrant. Both parameters are fully self-contained (an id and a
+/// borrowed name) precisely so a conforming hook never needs to call
+/// back in — copy what you need and return. See the re-entrancy notes on
+/// the hook registry above for the exact failure modes.
 pub type JvmtiClassHook = fn(u32, &str, u64);
 
 static CLASS_LOAD_HOOK: OnceLock<JvmtiClassHook> = OnceLock::new();
@@ -3809,12 +3852,21 @@ impl ClassManager {
         // matching the link-time verifier policy in vm_util.
         let defer_loader_sensitive_pass3 =
             loader_aware_resolution() && matches!(class.loader_id, ClassLoaderId::UserDefined(_));
-        if !options.skip_verification
-            && !defer_loader_sensitive_pass3
-            && !self.cds_class_cache.contains_key(name)
-            && !class.is_synthetic_stub
-            && class.state != ClassState::Verified
-        {
+        // TYPE MAPS (arch-2026-07-26/access-control-and-map-coverage): the
+        // deferral above is about the verifier's *load decision*, not about
+        // its type maps. Deferring the whole of Pass 3 also deferred the
+        // per-pc oop maps and the per-method `safe_for_fast_path` flag, and
+        // since every Spring / WildFly / H2 / Elasticsearch application class
+        // is defined by a user-defined loader, that meant no maps for the
+        // entire application workload — precisely the classes the maps exist
+        // to describe. `collect_class_type_maps` runs the same walk with the
+        // verdict discarded; see its doc comment for why the rows are sound
+        // even when the assignability verdicts are not.
+        let skip_all_verification = options.skip_verification
+            || self.cds_class_cache.contains_key(name)
+            || class.is_synthetic_stub
+            || class.state == ClassState::Verified;
+        if !skip_all_verification {
             let hierarchy = ClassStoreHierarchy {
                 class_store: &self.class_store,
                 loaded_classes: &self.loaded_classes,
@@ -3828,7 +3880,13 @@ impl ClassManager {
                 // loader's delegation order, not a global first-match.
                 requesting_loader: Some(class.loader_id),
             };
-            if let Err(verify_err) =
+            if defer_loader_sensitive_pass3 {
+                // Loader-sensitive class: harvest the maps, make no load
+                // decision. Publishing before registration is safe — the id is
+                // already minted, the store is the only other thing keyed by
+                // it, and nothing between here and `class_store.add` can fail.
+                crate::verifier::publish_deferred_class_type_maps(&class, &hierarchy);
+            } else if let Err(verify_err) =
                 crate::verifier::verify_class(&class, &self.class_store, &hierarchy)
             {
                 // Verifier rejected the bytecode. Drop the guard set
@@ -3836,6 +3894,17 @@ impl ClassManager {
                 self.loading_guard.remove(name);
                 return Err(VmError::Linkage(verify_err));
             }
+        } else {
+            // TYPE MAPS: record the *reason* there are no maps. Without this
+            // the side table answers `Unknown` for a `--noverify` /
+            // CDS / synthetic-stub / trusted-generated class, which a consumer
+            // cannot distinguish from "not verified yet" — and "not yet" is a
+            // state it might reasonably wait for. `Skipped` says: none are
+            // coming, scan conservatively and stay off the unchecked fast
+            // path. The marker never traps this id: `type_maps::install`
+            // upgrades an unverified marker to real maps on a later publish,
+            // and the redefine path replaces outright.
+            crate::type_maps::mark_class_verification_skipped(class.id);
         }
 
         debug!(
@@ -3929,12 +3998,17 @@ impl ClassManager {
         }
 
         // T6.3.1 — Fire the JVMTI ClassLoad hook. The VM's JvmtiEventManager
-        // snapshots the attached-env list under its own lock; it never
-        // re-enters the class manager, so it is safe to call from inside
-        // `&mut self`. We still release the caller's class-manager write
-        // lock at the outer callsite before agent callbacks run for any
-        // slower path that needs it — here, the define_class path only
-        // mutates `self`, so dropping is not needed.
+        // takes only its own `callbacks` lock and never re-enters the class
+        // manager, so it is safe to call from inside `&mut self`.
+        //
+        // NOTE: these fire UNDER the caller's L10 `class_manager` write
+        // guard — nothing drops it first, here or at any outer callsite.
+        // An installed hook that re-enters the class manager deadlocks the
+        // calling thread (or panics with a `LockOrderViolation` when lock-
+        // order enforcement is active). That prohibition is part of the
+        // `JvmtiClassHook` contract; see the re-entrancy notes on the hook
+        // registry near `install_class_load_hook`. Do not add a hook here
+        // that calls back into `self` or into `shared.classes`.
         //
         // ClassPrepare is fired after linking/verification completes. For
         // classes that are loaded but not yet linked, the VM's linker path
@@ -5287,6 +5361,35 @@ impl ClassManager {
         // Verification succeeded (or was legitimately skipped). The
         // snapshot vecs (if any) are dropped here; the new ones remain
         // installed.
+
+        // ---- Step 5c: re-publish this class's type maps ----
+        // The maps published when this class was DEFINED describe the OLD
+        // method bodies, at `Class::methods` indices this redefine may have
+        // reshuffled. `type_maps::publish_class_type_maps` is first-writer-
+        // wins, so the verify above (when it ran) could not overwrite them —
+        // the class's bytecode and its oop maps would silently diverge, and a
+        // stale oop map is a wrong oop map, i.e. heap corruption rather than a
+        // pessimisation. `refresh_class_type_maps` is the *replacing* install
+        // and is what keeps the two in lockstep.
+        //
+        // Unconditional on a successful redefine, including the paths that
+        // skipped verification (trusted generated bytecode, `--noverify`):
+        // there, replacing stale maps with an honest "walk did not complete"
+        // set is still strictly better than leaving the old class's rows
+        // visible.
+        {
+            let hierarchy = ClassStoreHierarchy {
+                class_store: &self.class_store,
+                loaded_classes: &self.loaded_classes,
+                in_flight: None,
+                in_flight_super_name: None,
+                requesting_loader: self.class_store.get(class_id).map(|c| c.loader_id),
+            };
+            if let Some(cls) = self.class_store.get(class_id) {
+                crate::verifier::refresh_class_type_maps(cls, &hierarchy);
+            }
+        }
+
         // Forget the borrow — the rest of this function is hooks +
         // bookkeeping that may re-enter the manager.
         let _ = existing_loader; // silence unused warning if no read below

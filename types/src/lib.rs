@@ -45,16 +45,23 @@ pub use flags::{
 };
 pub use float_format::{java_double_to_string, java_float_to_string};
 pub use handle::{HandleScope, HandleStorage, RootedHandle};
+// `mod heap_types` is private, so this list is the *only* way anything outside
+// this crate can name a heap constant. A `pub const` added to `heap_types.rs`
+// and left off this list is not merely inconvenient — it is unreachable from
+// every other crate, i.e. an accidental default-off landing. `MARK_FORWARDED`,
+// `FORWARDING_PTR_MASK` and `IDENTITY_HASH_CODE_OFFSET` were in exactly that
+// state until 2026-07-26; see `arch-2026-07-26/header-shrink.md` §6.2 and the
+// `every_public_heap_constant_is_reachable` test below.
 pub use heap_types::{
     array_data_size, array_data_size_checked, array_element_type_from_tag, element_byte_size,
     object_kind_from_tag, ArrayElementType, ObjectHeader, ObjectKind, ARRAY_ELEMENT_TYPE_OFFSET,
     ARRAY_LENGTH_OFFSET, AUTOBOX_CLASS_ID, FIELD_CELL_PAYLOAD32_OFFSET,
-    FIELD_CELL_PAYLOAD64_OFFSET, FIELD_CELL_TAG_OFFSET, FORWARDING_PTR_OFFSET, GC_AGE_OFFSET,
-    GC_FLAGS_OFFSET, GC_FLAG_COMPACT, GC_FLAG_MARKED, GC_FLAG_OLD_GEN, HEADER_SIZE,
-    INFLATED_PTR_MASK, MARK_INFLATED, MARK_NEUTRAL, MARK_STATE_MASK, MARK_THIN_LOCKED,
-    MARK_WORD_OFFSET, NUM_SLOTS_OFFSET, OBJECT_KIND_OFFSET, REF_ELEMENT_SIZE, REF_FIELD_SIZE,
-    SLOT_SIZE, THIN_LOCK_OWNER_MASK, THIN_LOCK_OWNER_SHIFT, THIN_LOCK_RECURSION_MASK,
-    THIN_LOCK_RECURSION_SHIFT,
+    FIELD_CELL_PAYLOAD64_OFFSET, FIELD_CELL_TAG_OFFSET, FORWARDING_PTR_MASK, FORWARDING_PTR_OFFSET,
+    GC_AGE_OFFSET, GC_FLAGS_OFFSET, GC_FLAG_COMPACT, GC_FLAG_MARKED, GC_FLAG_OLD_GEN, HEADER_SIZE,
+    IDENTITY_HASH_CODE_OFFSET, INFLATED_PTR_MASK, MARK_FORWARDED, MARK_INFLATED, MARK_NEUTRAL,
+    MARK_STATE_MASK, MARK_THIN_LOCKED, MARK_WORD_OFFSET, NUM_SLOTS_OFFSET, OBJECT_KIND_OFFSET,
+    REF_ELEMENT_SIZE, REF_FIELD_SIZE, SLOT_SIZE, THIN_LOCK_OWNER_MASK, THIN_LOCK_OWNER_SHIFT,
+    THIN_LOCK_RECURSION_MASK, THIN_LOCK_RECURSION_SHIFT,
 };
 pub use intern::{intern, intern_arc, StringPool};
 pub use narrow_oop::{
@@ -63,9 +70,9 @@ pub use narrow_oop::{
 pub use value::{
     decode_value, decode_value_checked, encode_value, is_object_tag,
     jlong_bits_as_aligned_object_ptr, plausible_heap_pointer, read_value_atomic,
-    read_value_checked, read_value_checked_atomic, write_value_atomic, ObjectRef, Value,
-    VALUE_MAX_DISCRIMINANT, VTAG_DOUBLE, VTAG_FLOAT, VTAG_INT, VTAG_LONG, VTAG_NULL, VTAG_OBJECT,
-    VTAG_RETADDR, VTAG_UNINIT,
+    read_value_checked, read_value_checked_atomic, write_value_atomic, ObjectRef, RawSlot,
+    SlotType, Value, VALUE_MAX_DISCRIMINANT, VTAG_DOUBLE, VTAG_FLOAT, VTAG_INT, VTAG_LONG,
+    VTAG_NULL, VTAG_OBJECT, VTAG_RETADDR, VTAG_UNINIT,
 };
 
 #[cfg(test)]
@@ -114,15 +121,101 @@ mod tests {
         assert!(!is_object_tag(VTAG_INT));
     }
 
+    /// The re-exported heap constants, checked against the properties that the
+    /// rest of the workspace actually depends on.
+    ///
+    /// This used to open with `assert_eq!(HEADER_SIZE, 32);`. That pinned one
+    /// historical *value* rather than any invariant: it records what the header
+    /// happened to be, so a deliberate, fully-correct shrink trips it and a
+    /// careless change that keeps the size but breaks alignment does not. It
+    /// also cannot say *why* 32 mattered, which is the only thing the person
+    /// reading the failure needs.
+    ///
+    /// Replaced — not deleted — with the three properties that are load-bearing
+    /// and that a layout change can actually violate:
+    ///
+    /// 1. `HEADER_SIZE` stays on the 8-byte grid. Every heap walk, the inline
+    ///    TLAB cursor bump and the qword body-zeroing loop step from it, and
+    ///    the 8-byte `mark_word` must stay naturally aligned for the CAS on the
+    ///    lock fast path.
+    /// 2. `HEADER_SIZE <= 127`. The JIT emits array element addressing as
+    ///    `[base + index*scale + HEADER_SIZE]` with a **signed** `disp8`. Past
+    ///    127 the byte is read back as negative and the emitted load addresses
+    ///    memory *before* the object — no panic, just a wrong address. Same for
+    ///    `ARRAY_LENGTH_OFFSET`, which is the `disp8` of the bounds-check load.
+    /// 3. The header is big enough to hold the fields whose offsets are also
+    ///    exported, so no exported offset can point outside it.
+    ///
+    /// `heap_types.rs` pins (2) at compile time; keeping it here as well means
+    /// the constraint is stated where the constant is *published*, and the
+    /// failure message names the emitter that breaks.
     #[test]
     fn reexport_heap_constants() {
-        assert_eq!(HEADER_SIZE, 32);
+        assert_eq!(
+            HEADER_SIZE % 8,
+            0,
+            "HEADER_SIZE anchors the 8-byte object grid: heap walks, the inline \
+             TLAB cursor bump and the qword body-zeroing loop all step from it"
+        );
+        assert!(
+            HEADER_SIZE >= MARK_WORD_OFFSET + 8,
+            "the 8-byte mark word must fit inside the header"
+        );
+        assert!(
+            HEADER_SIZE <= 127,
+            "HEADER_SIZE is emitted as a signed disp8 in the JIT's array element \
+             addressing (jit/src/x64.rs and jit/src/ir_lower.rs); above 127 the \
+             displacement byte reads as negative and the load addresses memory \
+             before the object"
+        );
+        assert!(
+            ARRAY_LENGTH_OFFSET <= 127,
+            "ARRAY_LENGTH_OFFSET is the signed disp8 of the JIT's array-length \
+             load; same failure mode as HEADER_SIZE above"
+        );
+        assert!(ARRAY_LENGTH_OFFSET > 0);
+        assert!(ARRAY_LENGTH_OFFSET + 4 <= HEADER_SIZE);
+        assert!(IDENTITY_HASH_CODE_OFFSET + 4 <= HEADER_SIZE);
         assert_eq!(SLOT_SIZE, 16);
         assert_eq!(REF_ELEMENT_SIZE, 8);
-        assert!(ARRAY_LENGTH_OFFSET > 0);
         assert_eq!(OBJECT_KIND_OFFSET, 4);
         assert_eq!(ARRAY_ELEMENT_TYPE_OFFSET, 5);
         assert_eq!(AUTOBOX_CLASS_ID.as_u32(), u32::MAX);
+    }
+
+    /// `mod heap_types` is private. Anything it declares `pub` but that is left
+    /// off the `pub use heap_types::{…}` list above is unreachable from every
+    /// other crate in the workspace — the code exists and nothing can call it,
+    /// which is a default-off landing arrived at by omission rather than by
+    /// choice.
+    ///
+    /// That is not hypothetical: `MARK_FORWARDED`, `FORWARDING_PTR_MASK` and
+    /// `IDENTITY_HASH_CODE_OFFSET` all landed in `heap_types.rs` on 2026-07-26
+    /// and were stranded exactly this way. Naming them here means the
+    /// re-export cannot be dropped again without failing to compile.
+    #[test]
+    fn every_public_heap_constant_is_reachable() {
+        // The mark-word encoding for a relocated object. Consumers that match
+        // on `ObjectHeader::mark_state(m)` need the tag constant itself, not
+        // just the `is_forwarded_mark` helper.
+        assert_eq!(MARK_FORWARDED & MARK_STATE_MASK, MARK_FORWARDED);
+        assert_ne!(MARK_FORWARDED, MARK_NEUTRAL);
+        assert_ne!(MARK_FORWARDED, MARK_THIN_LOCKED);
+        assert_ne!(MARK_FORWARDED, MARK_INFLATED);
+
+        // The forwarding pointer occupies every bit the state tag does not, so
+        // an aligned address round-trips through the mark word exactly.
+        assert_eq!(FORWARDING_PTR_MASK, !MARK_STATE_MASK);
+        assert_eq!(FORWARDING_PTR_MASK & MARK_STATE_MASK, 0);
+        let target = 0x0000_7fff_dead_b000u64;
+        assert_eq!(target & MARK_STATE_MASK, 0, "test address must be aligned");
+        assert_eq!((target | MARK_FORWARDED) & FORWARDING_PTR_MASK, target);
+
+        // The last header field that had no named constant. `jit/src/x64.rs`
+        // derived its own via `offset_of!` and `vm/src/jit/helpers.rs` still
+        // writes a bare `raw_ptr.add(8)`; both should use this.
+        assert_eq!(IDENTITY_HASH_CODE_OFFSET % 4, 0, "dword-addressable");
+        assert!(IDENTITY_HASH_CODE_OFFSET < HEADER_SIZE);
     }
 
     #[test]

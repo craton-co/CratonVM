@@ -100,6 +100,25 @@ pub struct ResolvedMethod {
     /// then every call site sharing that resolved reference reuses the target.
     /// Resolution-cache invalidation on class redefinition/unloading drops the
     /// callback with the rest of the method metadata.
+    ///
+    /// **MEMOIZED NEGATIVE — read before adding lazy native registration.**
+    /// `None` here does not mean "not looked up yet"; it means "the registry
+    /// said no native exists", memoized for the lifetime of the enclosing
+    /// [`ResolutionCache`] entry. The producer collapses the absent case with
+    /// `.unwrap_or((None, None))` after a single `NativeMethodRegistry`
+    /// probe, and nothing re-tries it: [`ResolutionCache::invalidate_class`]
+    /// only fires on redefine / unload / synthetic upgrade, none of which are
+    /// triggered by registering a native.
+    ///
+    /// That is sound **only** because the registry is fully populated during
+    /// `vm_init` and never grows afterwards (JNI `RegisterNatives` writes a
+    /// separate table that is consulted independently). The moment any lazy or
+    /// deferred native-registration pass is added — the exact bug already found
+    /// in the native registry's own memo — every method resolved before that
+    /// pass permanently believes it has no native implementation. If you add
+    /// one, either pair this field with a registry epoch that
+    /// [`ResolutionCache`] hits compare against, or invalidate the resolution
+    /// cache from the registration path.
     pub native_target: Option<cratonvm_native_api::NativeCallback>,
     /// Category paired with [`Self::native_target`], cached from the same
     /// registry probe so synthetic-stub selection never re-hashes the triple.
@@ -536,12 +555,28 @@ impl ResolutionCache {
     /// `ResolvedCallSite` and condy values are evicted on the key match
     /// only — their inner contents don't expose a `declaring_class_id`
     /// reachable from the cache.
+    ///
+    /// AUDIT (2026-07-26): prong 2 is **live for `fields` but dead for
+    /// `methods`.** `ResolvedField`'s producer stores the true declaring class
+    /// (found by the superclass walk), so a field resolved *into* a redefined
+    /// superclass is correctly evicted. `ResolvedMethod`'s only producer
+    /// (`interpreter.rs`, `resolve_method_metadata`) sets
+    /// `declaring_class_id: current_class_id` — i.e. the **referring** class,
+    /// identical to `key_class` — so the second conjunct can never eliminate an
+    /// entry the first did not. The "sees through proxy/intermediate classes"
+    /// behaviour described above therefore does not occur for methods. Fixing
+    /// it requires a change in the producer (not this crate); see
+    /// `docs/internal/arch-2026-07-26/classloading-verify-and-resolve.md`,
+    /// "cross-owner requests". Left as-is deliberately rather than papered
+    /// over here, because a same-crate change cannot make the field carry
+    /// information the producer never wrote.
     pub fn invalidate_class(&mut self, class_id: ClassId) {
         // Fields: drop by key OR by resolved declaring class.
         self.fields.retain(|(key_class, _), resolved| {
             *key_class != class_id && resolved.declaring_class_id != class_id
         });
-        // Methods: same two-pronged check.
+        // Methods: same two-pronged check. NB: prong 2 is currently a no-op —
+        // see the doc comment above.
         self.methods.retain(|(key_class, _), resolved| {
             *key_class != class_id && resolved.declaring_class_id != class_id
         });
@@ -1022,9 +1057,36 @@ impl LinkResolver {
     }
 
     /// Drop every cached entry whose key class matches `class_id`, or
-    /// whose resolved declaring class matches. Mirrors
-    /// [`ResolutionCache::invalidate_class`] so a JEP 109 redefine
+    /// whose resolved declaring class matches, **or that is a negative**.
+    /// Mirrors [`ResolutionCache::invalidate_class`] so a JEP 109 redefine
     /// invalidates this cache in lockstep.
+    ///
+    /// BUGFIX (memoized-negative, 2026-07-26): [`ResolvedMember::NotFound`]
+    /// used to be *retained* here unless it happened to be keyed on the
+    /// changed class. That is unsound, because a negative is a statement about
+    /// a whole hierarchy **walk**, not about one class. `find_method_recursive`
+    /// / `find_field_recursive` climb the superclass and superinterface chain,
+    /// so a `NotFound` cached under `(Sub, "m", "()V")` also asserts that
+    /// `Base` does not declare `m` — and nothing in the key records that the
+    /// walk passed through `Base`.
+    ///
+    /// The live failure that produces: a JNI `GetMethodID(Sub, "m", "()V")`
+    /// against a synthetic-stub `Base` caches `NotFound`; `ClassManager::
+    /// upgrade_synthetic_class` later swaps in the real `Base` that *does*
+    /// declare `m` and fires the invalidate hook for `Base`; the entry is keyed
+    /// on `Sub`, so the old `retain` kept it; every later `GetMethodID` returns
+    /// a null `jmethodID` and the caller sees `NoSuchMethodError` for a method
+    /// that now exists. There was no escape short of `clear()` (no production
+    /// caller) or the CLOCK sweep at 128 K entries. The same shape applies to
+    /// `RedefineClasses` adding a member to a superclass.
+    ///
+    /// Since `invalidate_class` has no `ClassStore` it cannot ask whether
+    /// `class_id` is in the key class's ancestry, so it drops **every**
+    /// negative. That is the conservative direction: a dropped-but-still-valid
+    /// negative costs one re-walk and is semantically identical to a miss,
+    /// whereas a retained-but-stale negative is a permanently wrong answer.
+    /// Invalidation is rare (redefine / unload / synthetic upgrade) and the
+    /// pass is already an O(n) `retain`, so this adds no new asymptotic cost.
     pub fn invalidate_class(&self, class_id: ClassId) {
         let mut guard = self.cache.write();
         guard.retain(|(key_class, _, _), entry| {
@@ -1038,7 +1100,9 @@ impl LinkResolver {
                 | ResolvedMember::Field {
                     declaring_class_id, ..
                 } => *declaring_class_id != class_id,
-                ResolvedMember::NotFound => true,
+                // A negative describes a hierarchy walk whose path this key
+                // does not record. Re-derive it rather than trust it.
+                ResolvedMember::NotFound => false,
             }
         });
     }
@@ -1920,7 +1984,8 @@ mod tests {
     /// `LinkResolver` round-trip — populate a triple, read it back,
     /// confirm `NotFound` is also cached so the next probe
     /// short-circuits, and verify `invalidate_class` drops every entry
-    /// whose key or resolved declaring class matches.
+    /// whose key or resolved declaring class matches — plus every
+    /// negative, whose provenance the key does not record.
     #[test]
     fn link_resolver_caches_and_invalidates() {
         let resolver = LinkResolver::new();
@@ -1973,21 +2038,94 @@ mod tests {
         ));
         assert_eq!(resolver.len(), 2);
 
-        // Invalidating class_b must drop the Method entry (resolved
-        // declaring class match) but keep the NotFound entry (no
-        // declaring class link).
+        // Invalidating class_b drops the Method entry (resolved declaring
+        // class match) AND the NotFound entry. The latter changed in the
+        // 2026-07-26 memoized-negative fix: a negative asserts something about
+        // the whole hierarchy walk, and the key does not record which classes
+        // that walk passed through, so it cannot be proven unaffected.
         resolver.invalidate_class(class_b);
         assert!(resolver.get(class_a, &name, &desc).is_none());
+        assert!(
+            resolver.get(class_a, &missing_name, &desc).is_none(),
+            "a negative must not survive an unrelated-looking invalidation — \
+             the changed class may be an ancestor the walk crossed"
+        );
+        assert!(resolver.is_empty());
+    }
+
+    /// REGRESSION (memoized-negative, 2026-07-26): a `NotFound` cached under a
+    /// *subclass* key must be dropped when an **ancestor** is invalidated.
+    ///
+    /// Concrete failure this reproduces: `GetMethodID(Sub, "m", "()V")` runs
+    /// while `Base` is still a synthetic stub that lacks `m`, so `NotFound` is
+    /// cached at key `(Sub, "m", "()V")`. `upgrade_synthetic_class` then swaps
+    /// in the real `Base`, which declares `m`, and fires the invalidate hook
+    /// for `Base`. Under the old `retain`, the entry's key class was `Sub`, not
+    /// `Base`, and its value carried no `declaring_class_id`, so it was kept —
+    /// and every later `GetMethodID` returned a null `jmethodID`, surfacing as
+    /// `NoSuchMethodError` for a method that now exists. The only escapes were
+    /// `clear()` (no production caller) and the CLOCK sweep at 128 K entries.
+    #[test]
+    fn negative_cached_under_subclass_is_dropped_when_ancestor_changes() {
+        let resolver = LinkResolver::new();
+        let base = ClassId::new(10);
+        let sub = ClassId::new(11);
+        let name: Arc<str> = Arc::from("m");
+        let desc: Arc<str> = Arc::from("()V");
+
+        // The walk from `Sub` climbed through `Base` and found nothing.
+        resolver.insert(
+            sub,
+            Arc::clone(&name),
+            Arc::clone(&desc),
+            ResolvedMember::NotFound,
+        );
         assert!(matches!(
-            resolver.get(class_a, &missing_name, &desc),
+            resolver.get(sub, &name, &desc),
             Some(ResolvedMember::NotFound)
         ));
 
-        // Invalidating class_a drops the remaining NotFound entry
-        // (key class match).
-        resolver.invalidate_class(class_a);
-        assert!(resolver.get(class_a, &missing_name, &desc).is_none());
-        assert!(resolver.is_empty());
+        // `Base` gains the method and fires the invalidate hook for itself.
+        // Nothing in the key mentions `Base`, so only the negative-dropping
+        // rule can save us here.
+        resolver.invalidate_class(base);
+
+        assert!(
+            resolver.get(sub, &name, &desc).is_none(),
+            "the stale negative must be gone so the next probe re-walks the \
+             hierarchy and finds the newly-declared method"
+        );
+    }
+
+    /// The fix must not throw away positives it has no reason to distrust: a
+    /// resolution whose declaring class is unrelated to the invalidated class
+    /// still survives.
+    #[test]
+    fn unrelated_positive_survives_invalidation() {
+        let resolver = LinkResolver::new();
+        let keeper = ClassId::new(20);
+        let declaring = ClassId::new(21);
+        let unrelated = ClassId::new(22);
+        let name: Arc<str> = Arc::from("size");
+        let desc: Arc<str> = Arc::from("()I");
+
+        resolver.insert(
+            keeper,
+            Arc::clone(&name),
+            Arc::clone(&desc),
+            ResolvedMember::Method {
+                declaring_class_id: declaring,
+                index: 3,
+            },
+        );
+        resolver.invalidate_class(unrelated);
+        assert!(
+            matches!(
+                resolver.get(keeper, &name, &desc),
+                Some(ResolvedMember::Method { index: 3, .. })
+            ),
+            "positives keyed and declared elsewhere must not be collateral damage"
+        );
     }
 
     /// Round 9 audit fix (vm LOW #11): `resolve_or_compute` must detect

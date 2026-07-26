@@ -5557,7 +5557,48 @@ impl G1Collector {
             let mut live_bytes = 0usize;
             let mut offset = 0usize;
 
-            while offset < region.cursor {
+            // TAMS (top-at-mark-start) for this region. Objects BELOW it were
+            // in the mark snapshot, so the bitmap is authoritative for them;
+            // everything at or above it postdates the snapshot, carries no
+            // mark information, and is implicitly live (added wholesale after
+            // the walk).
+            //
+            // G1MAT-1 (double-count fix): the bitmap walk used to run over the
+            // ENTIRE region `[0, cursor)` and the post-TAMS extent
+            // `cursor - snap_cursor` was then added on top — so every
+            // post-TAMS object that the marker DID reach (SATB keep-alive,
+            // `push_gray_or_mark`, a fresh promotion that a root still names)
+            // was counted twice. That inflates `live_bytes` (it can exceed
+            // `cursor`, breaking the `live_bytes <= cursor` invariant) and
+            // therefore `gc_efficiency`, which is exactly the key
+            // `mixed_collection` / `select_old_regions_for_mixed_gc` sort on
+            // (ascending = worst-first). Inflated efficiency makes
+            // garbage-rich Old regions look live, so mixed GC picks the wrong
+            // regions — and `estimated_evac_cost_ns` (live_bytes x
+            // evac_ns_per_byte) over-charges the pause budget, so it picks
+            // FEWER of them. Net effect: old-gen reclamation is throttled and
+            // biased, which is precisely the failure mode that keeps G1 from
+            // being a usable escape hatch. Bound the bitmap walk by TAMS so
+            // each byte is attributed exactly once.
+            let tams = if mark_snapshot.is_empty() {
+                // No cycle data (cleanup driven outside a real mark cycle,
+                // e.g. unit tests): keep the pure-bitmap behaviour by putting
+                // TAMS at the top, so nothing is treated as implicitly live.
+                region.cursor
+            } else {
+                match mark_snapshot.get(region_idx) {
+                    Some(&(epoch, snap_cursor, snap_type))
+                        if epoch == region.reuse_epoch && snap_type == region.region_type =>
+                    {
+                        snap_cursor.min(region.cursor)
+                    }
+                    // Recycled (epoch bump), re-typed, or absent snapshot entry:
+                    // the region's ENTIRE content postdates the snapshot.
+                    _ => 0,
+                }
+            };
+
+            while offset < tams {
                 let obj_addr = base + offset;
                 // INT-3 — frozen-peer TLAB tail: skip before interpreting.
                 if let Some(skip) = jit_tlab_skip_span_len(&jit_skips, obj_addr) {
@@ -5587,21 +5628,36 @@ impl G1Collector {
                 offset += obj_size;
             }
 
-            // TAMS: everything allocated after the mark-start snapshot is
-            // conservatively live. A recycled (epoch), re-typed, or absent
-            // snapshot entry means the region's ENTIRE content postdates the
-            // snapshot. An empty snapshot (cleanup driven outside a real
-            // mark cycle, e.g. unit tests) keeps the pure-bitmap behaviour.
-            if !mark_snapshot.is_empty() {
-                let post_mark_bytes = match mark_snapshot.get(region_idx) {
-                    Some(&(epoch, snap_cursor, snap_type))
-                        if epoch == region.reuse_epoch && snap_type == region.region_type =>
-                    {
-                        region.cursor.saturating_sub(snap_cursor)
-                    }
-                    _ => region.cursor,
-                };
-                live_bytes += post_mark_bytes;
+            // TAMS: everything at or above `tams` postdates the mark-start
+            // snapshot and is conservatively live. `tams` already encodes the
+            // recycled / re-typed / absent-entry cases (0 => the whole region
+            // postdates the snapshot) and the no-cycle case (`tams == cursor`
+            // => nothing implicitly live, pure-bitmap verdict). Because the
+            // walk above stopped at `tams`, this addition cannot double-count
+            // a marked post-TAMS object (G1MAT-1).
+            live_bytes += region.cursor.saturating_sub(tams);
+
+            // Invariant restored by G1MAT-1: a region can never be more than
+            // 100% live, so `gc_efficiency` stays in [0, 1] and the worst-first
+            // mixed-GC ranking is meaningful. Under bump allocation TAMS is
+            // always an object boundary, so the walk above cannot legitimately
+            // count an object that straddles it — but a corrupt header can
+            // report an implausible extent that still fits inside `cursor`.
+            // Clamp (and log) rather than `debug_assert!`: cleanup must not
+            // introduce a new panic path on an already-damaged heap, and a
+            // clamped value is still non-zero, so the in-place-free decision
+            // below is unaffected.
+            if live_bytes > region.cursor {
+                tracing::warn!(
+                    "g1 cleanup: region {} reported {} live bytes over a {}-byte \
+                     cursor (tams {}) — clamping; a header in this region is \
+                     likely corrupt",
+                    region_idx,
+                    live_bytes,
+                    region.cursor,
+                    tams
+                );
+                live_bytes = region.cursor;
             }
 
             region.live_bytes = live_bytes;
@@ -5657,6 +5713,35 @@ impl G1Collector {
         // closure — skip it under the fail-safe.
         if !saw_implausible {
             self.reclaim_dead_humongous_spans_locked(&mut regions);
+        }
+
+        // G1MAT-4: prune remembered-set entries naming regions that are now
+        // Free. Nothing else in the collector ever removes an rset entry —
+        // `RememberedSet::clear` only runs on the TARGET region's own
+        // `reset()` — so without this a source index recorded once is kept for
+        // the rest of that target's life. Cleanup is the right place: it runs
+        // once per mark cycle, already holds the regions lock, and the Free
+        // set is final here (both the in-place Old frees above and the
+        // humongous reclaim have completed).
+        //
+        // Safety: a `Free` region holds no live object, so it cannot be the
+        // holder of a live cross-region edge — dropping it can only remove
+        // work, never hide a reachable referent. The scan side already skips
+        // Free sources (`scan_source_region_for_cset_refs`), so this changes
+        // no collection decision; it bounds memory and per-pause iteration.
+        // If such a region is later re-typed and stores a cross-region
+        // reference, the mutator post-write barrier re-adds it, and the
+        // Phase-4 rebuild re-derives GC-internal edges.
+        {
+            let is_free: Vec<bool> = regions
+                .iter()
+                .map(|r| r.region_type == RegionType::Free)
+                .collect();
+            for region in regions.iter() {
+                region
+                    .rset
+                    .retain_sources(|src| is_free.get(src).is_some_and(|free| !*free));
+            }
         }
 
         // Refresh the IHOP occupancy statistic NOW: cleanup just freed Old
@@ -5725,6 +5810,35 @@ impl G1Collector {
                 i += 1;
                 continue;
             };
+
+            // G1MAT-2: validate the span before resetting anything in it. The
+            // extent is derived purely from `regions[i].cursor`, so a stale or
+            // corrupt cursor on a `HumongousStart` would silently `reset()`
+            // (zero-fill + retype-to-Free) regions belonging to OTHER live
+            // objects. Every region a humongous span actually owns is typed
+            // `HumongousContinuation` (`alloc_humongous_locked`), so require
+            // exactly that before touching them. A mismatch means the derived
+            // extent disagrees with the region table: skip the span and log,
+            // rather than free memory we cannot prove is ours.
+            //
+            // This is the same class of defect as the round-9 `HumongousFiller`
+            // walker audit: a humongous invariant assumed at a call site rather
+            // than checked there.
+            let span_well_formed = regions[i + 1..end]
+                .iter()
+                .all(|r| r.region_type == RegionType::HumongousContinuation);
+            if !span_well_formed {
+                tracing::warn!(
+                    "g1 cleanup: humongous span at region {} claims {} regions \
+                     (cursor {}) but the following regions are not all \
+                     HumongousContinuation — skipping reclaim",
+                    i,
+                    regions_needed,
+                    total_size
+                );
+                i += 1;
+                continue;
+            }
 
             let pinned = regions[i..end].iter().any(|r| r.pinned);
             if regions[i].live_bytes == 0 && !pinned {
@@ -7337,25 +7451,71 @@ impl GarbageCollector for G1Collector {
         let payload_off = index * elem_size;
         let is_ref = element_type == ArrayElementType::Reference;
 
-        // C2c: SATB pre-barrier for reference element stores (log the OLD ref
-        // before overwriting it) while concurrent marking is active.
-        if is_ref && self.gc_state.is_marking_active() {
-            if let Ok(Value::Object(Some(old_ref))) = self.get_array_element(obj, index) {
-                self.satb_pre_barrier(old_ref.as_ptr() as usize);
-            }
-        }
-
         // Encode the element value into a fixed byte buffer.
         let mut raw = [0u8; 8];
         array_element_to_bytes(element_type, value, &mut raw);
 
         // Write the raw bytes back — flat single-region path or humongous
         // region-translated path. Either way the write is bounds-confined.
+        //
+        // G1MAT-3: the SATB pre-barrier (read the OLD element, log it, THEN
+        // overwrite) now runs inside the SAME `regions` critical section as
+        // the store. It used to call the public `get_array_element`, which
+        // takes and RELEASES the `regions` lock on its own — so the barrier's
+        // read-then-store was split by a full lock release/re-acquire.
+        // Widening that window widens the classic SATB lost-update race: two
+        // mutators both read old value V, both log V, one stores A and the
+        // other stores B; A is then reachable from no logged edge and the
+        // marker can miss it. Keeping read and store under one acquisition
+        // shrinks the window to the minimum this collector's slot model
+        // allows, and drops a redundant `humongous_span` recomputation from
+        // every reference-array store.
+        //
+        // INT-8 parity with `set_field`: honour `satb_pre_suppressed()` so the
+        // weak-reference PROTOCOL writes never log an edge as a mark root.
+        // `satb_pre_barrier` touches only TLS + the SATB shards (never the
+        // `regions` lock), so calling it here cannot deadlock.
         let stored = {
             let regions = self.regions.lock();
             let total_size =
                 HEADER_SIZE + crate::heap::array_data_size(len, element_type).unwrap_or(0);
-            if let Some((start, total_payload)) = self.humongous_span(&regions, obj, total_size) {
+            let span = self.humongous_span(&regions, obj, total_size);
+
+            if is_ref && self.gc_state.is_marking_active() && !satb_pre_suppressed() {
+                let mut old_raw = [0u8; 8];
+                let read_ok = match span {
+                    Some((start, total_payload)) => self.humongous_copy(
+                        &regions,
+                        start,
+                        total_payload,
+                        payload_off,
+                        old_raw.as_mut_ptr(),
+                        elem_size,
+                        false,
+                    ),
+                    None => {
+                        // SAFETY: `index < len` so the slot is inside the payload.
+                        let slot_ptr = unsafe { obj.as_ptr().add(HEADER_SIZE + payload_off) };
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                slot_ptr,
+                                old_raw.as_mut_ptr(),
+                                elem_size,
+                            );
+                        }
+                        true
+                    }
+                };
+                if read_ok {
+                    if let Value::Object(Some(old_ref)) =
+                        array_element_from_bytes(element_type, &old_raw)
+                    {
+                        self.satb_pre_barrier(old_ref.as_ptr() as usize);
+                    }
+                }
+            }
+
+            if let Some((start, total_payload)) = span {
                 self.humongous_copy(
                     &regions,
                     start,
@@ -11846,5 +12006,438 @@ mod tests {
             ),
             other => panic!("keep[0] dropped in mixed GC -> {other:?}"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // G1 maturation (docs/internal/arch-2026-07-26/g1-maturation.md)
+    // -----------------------------------------------------------------------
+
+    /// Overwrite the mark-start (TAMS) snapshot so a test can place TAMS at an
+    /// exact offset inside one region while leaving every other region's entry
+    /// consistent with its current state. Mirrors the shape
+    /// `start_concurrent_mark` publishes; lock order is regions -> snapshot,
+    /// same as production.
+    fn force_mark_snapshot(gc: &G1Collector, region_idx: usize, tams_offset: usize) {
+        let snapshot: Vec<(u64, usize, RegionType)> = {
+            let regions = gc.regions.lock();
+            regions
+                .iter()
+                .enumerate()
+                .map(|(i, r)| {
+                    let cursor = if i == region_idx { tams_offset } else { r.cursor };
+                    (r.reuse_epoch, cursor, r.region_type)
+                })
+                .collect()
+        };
+        let mut snap = gc.mark_start_snapshot.lock();
+        snap.clear();
+        snap.extend(snapshot);
+    }
+
+    /// G1MAT-1 — `cleanup` must attribute each byte of a region exactly once.
+    ///
+    /// Before the fix the bitmap walk covered the WHOLE region and the
+    /// post-TAMS extent was then added on top, so any post-TAMS object the
+    /// marker actually reached (SATB keep-alive, `push_gray_or_mark`, a fresh
+    /// promotion a root still names) was counted twice. `live_bytes` could
+    /// exceed `cursor`, which corrupts `gc_efficiency` — the ascending
+    /// (worst-first) sort key of `mixed_collection` /
+    /// `select_old_regions_for_mixed_gc` — and inflates
+    /// `estimated_evac_cost_ns`, so mixed GC selects the wrong Old regions AND
+    /// fewer of them.
+    #[test]
+    fn g1mat1_cleanup_does_not_double_count_marked_post_tams_objects() {
+        let gc = make_collector();
+        let below = gc.alloc_object(ClassId::new(1), 0);
+        let above = gc.alloc_object(ClassId::new(2), 0);
+        let below_addr = below.as_ptr() as usize;
+        let above_addr = above.as_ptr() as usize;
+
+        let (idx, base) = {
+            let regions = gc.regions.lock();
+            let idx = gc.region_for_ptr(&regions, below.as_ptr()).unwrap();
+            (idx, regions[idx].data.as_ptr() as usize)
+        };
+        assert_eq!(
+            gc.lookup_region_for_addr(above_addr),
+            Some(idx),
+            "test setup: both objects must share one region"
+        );
+
+        // Old, so this is exactly the region class the mixed-GC selector ranks.
+        gc.with_regions_mut(|regions| regions[idx].region_type = RegionType::Old);
+
+        // TAMS lands between the two objects: `below` predates the snapshot,
+        // `above` postdates it.
+        let tams = above_addr - base;
+        force_mark_snapshot(&gc, idx, tams);
+
+        // The marker reached BOTH — including the post-TAMS object. That is the
+        // case the old accounting double-counted.
+        gc.with_regions_mut(|regions| {
+            assert!(regions[idx].mark_bitmap.try_mark(below_addr));
+            assert!(regions[idx].mark_bitmap.try_mark(above_addr));
+        });
+
+        gc.cleanup();
+
+        let (live_bytes, cursor, efficiency) = {
+            let regions = gc.regions.lock();
+            (
+                regions[idx].live_bytes,
+                regions[idx].cursor,
+                regions[idx].gc_efficiency,
+            )
+        };
+        assert_eq!(
+            live_bytes, cursor,
+            "both objects are live exactly once: below-TAMS via the bitmap, \
+             above-TAMS implicitly (double-count would give {} > {})",
+            live_bytes, cursor
+        );
+        assert!(
+            live_bytes <= cursor,
+            "a region can never be more than 100% live"
+        );
+        assert!(
+            efficiency <= 1.0,
+            "gc_efficiency must stay in [0,1] — it is the worst-first sort key \
+             for mixed GC (got {efficiency})"
+        );
+    }
+
+    /// G1MAT-1 — a region whose pre-TAMS content is entirely dead but which
+    /// grew after mark start must report exactly the post-TAMS bytes as live,
+    /// and must NOT be freed in place.
+    #[test]
+    fn g1mat1_cleanup_counts_only_post_tams_bytes_when_pre_tams_is_dead() {
+        let gc = make_collector();
+        let dead = gc.alloc_object(ClassId::new(1), 0);
+        let fresh = gc.alloc_object(ClassId::new(2), 0);
+        let fresh_addr = fresh.as_ptr() as usize;
+
+        let (idx, base) = {
+            let regions = gc.regions.lock();
+            let idx = gc.region_for_ptr(&regions, dead.as_ptr()).unwrap();
+            (idx, regions[idx].data.as_ptr() as usize)
+        };
+        gc.with_regions_mut(|regions| regions[idx].region_type = RegionType::Old);
+
+        let tams = fresh_addr - base;
+        force_mark_snapshot(&gc, idx, tams);
+        // Nothing marked: `dead` is unreachable in the snapshot, `fresh` is
+        // implicitly live because it postdates it.
+        gc.cleanup();
+
+        let (live_bytes, cursor, region_type) = {
+            let regions = gc.regions.lock();
+            (
+                regions[idx].live_bytes,
+                regions[idx].cursor,
+                regions[idx].region_type,
+            )
+        };
+        assert_eq!(
+            live_bytes,
+            cursor - tams,
+            "only the post-TAMS extent is implicitly live"
+        );
+        assert_ne!(
+            region_type,
+            RegionType::Free,
+            "a region with post-TAMS allocation must never be freed in place"
+        );
+    }
+
+    /// G1MAT-2 — `reclaim_dead_humongous_spans_locked` derives a span's extent
+    /// from `regions[i].cursor` alone. If that disagrees with the region table
+    /// (a stale or corrupt cursor), the old code would `reset()` — zero-fill
+    /// and retype-to-Free — regions belonging to OTHER live objects. Require
+    /// every claimed continuation region to actually be typed
+    /// `HumongousContinuation` before touching the span.
+    #[test]
+    fn g1mat2_humongous_reclaim_skips_span_whose_regions_are_not_continuations() {
+        let gc = make_collector();
+        // ~1.6 MB over 1 MB regions => HumongousStart + 1 continuation.
+        let huge = gc.alloc_array(ClassId::new(0), ArrayElementType::Long, 200_000);
+        let start_idx = gc.lookup_region_for_addr(huge.as_ptr() as usize).unwrap();
+        assert_eq!(gc.count_regions(RegionType::HumongousContinuation), 1);
+
+        // Simulate the table/cursor disagreement: the region the cursor claims
+        // as a continuation is in fact an unrelated live Old region.
+        let bystander = start_idx + 1;
+        gc.with_regions_mut(|regions| {
+            regions[start_idx].live_bytes = 0; // "dead" per the mark bitmap
+            regions[bystander].region_type = RegionType::Old;
+            regions[bystander].cursor = 4096;
+        });
+
+        let reclaimed = {
+            let mut regions = gc.regions.lock();
+            gc.reclaim_dead_humongous_spans_locked(&mut regions)
+        };
+
+        assert_eq!(
+            reclaimed, 0,
+            "a malformed span must not be reclaimed at all"
+        );
+        let regions = gc.regions.lock();
+        assert_eq!(
+            regions[bystander].region_type,
+            RegionType::Old,
+            "the bystander region must not be retyped"
+        );
+        assert_eq!(
+            regions[bystander].cursor, 4096,
+            "the bystander region must not be zero-filled/reset"
+        );
+        assert_eq!(
+            regions[start_idx].region_type,
+            RegionType::HumongousStart,
+            "the start region must be left alone too"
+        );
+    }
+
+    /// G1MAT-3 — SATB pre-barrier ordering for reference ARRAY element stores:
+    /// the old referent must reach the SATB log, and the slot must already hold
+    /// the new value afterwards (i.e. the log happened strictly before the
+    /// overwrite). Read and store now share one `regions` critical section, so
+    /// the read->log->store sequence cannot be interleaved by a lock release.
+    #[test]
+    fn g1mat3_satb_pre_barrier_logs_overwritten_array_element_before_store() {
+        let gc = make_collector();
+        let arr = gc.alloc_array(ClassId::new(1), ArrayElementType::Reference, 4);
+        let old = gc.alloc_object(ClassId::new(2), 0);
+        let new = gc.alloc_object(ClassId::new(3), 0);
+        let old_addr = old.as_ptr() as usize;
+
+        gc.set_array_element(arr, 0, Value::Object(Some(old)))
+            .unwrap();
+
+        // Marking inactive: no logging at all (the barrier must cost nothing
+        // outside a cycle).
+        crate::satb::flush_thread_satb_buffer(gc.satb_queue());
+        let _ = gc.satb_queue().drain();
+        gc.set_array_element(arr, 0, Value::Object(Some(old)))
+            .unwrap();
+        crate::satb::flush_thread_satb_buffer(gc.satb_queue());
+        assert!(
+            !gc.satb_queue().drain().contains(&old_addr),
+            "no SATB entry may be logged while marking is idle"
+        );
+
+        // Marking active: the overwritten referent must be logged.
+        gc.start_concurrent_mark();
+        gc.set_array_element(arr, 0, Value::Object(Some(new)))
+            .unwrap();
+        crate::satb::flush_thread_satb_buffer(gc.satb_queue());
+        assert!(
+            gc.satb_queue().drain().contains(&old_addr),
+            "the OLD element value must be logged before it is overwritten"
+        );
+        assert_eq!(
+            gc.get_array_element(arr, 0).unwrap(),
+            Value::Object(Some(new)),
+            "the store must still have landed"
+        );
+    }
+
+    /// G1MAT-3 — the weak-reference PROTOCOL writes suppress the pre-barrier
+    /// (INT-8). `set_array_element` now honours the same TLS scope `set_field`
+    /// does, so the two store paths cannot disagree about what counts as a
+    /// semantic overwrite.
+    #[test]
+    fn g1mat3_satb_pre_barrier_honours_suppression_scope_for_array_stores() {
+        let gc = make_collector();
+        let arr = gc.alloc_array(ClassId::new(1), ArrayElementType::Reference, 2);
+        let referent = gc.alloc_object(ClassId::new(2), 0);
+        let referent_addr = referent.as_ptr() as usize;
+
+        gc.set_array_element(arr, 0, Value::Object(Some(referent)))
+            .unwrap();
+        gc.start_concurrent_mark();
+        crate::satb::flush_thread_satb_buffer(gc.satb_queue());
+        let _ = gc.satb_queue().drain();
+
+        {
+            let _suppressed = SatbPreSuppressGuard::new();
+            gc.set_array_element(arr, 0, Value::Object(None)).unwrap();
+        }
+        crate::satb::flush_thread_satb_buffer(gc.satb_queue());
+        assert!(
+            !gc.satb_queue().drain().contains(&referent_addr),
+            "a suppressed protocol write must not resurrect the referent"
+        );
+        // …and the suppression scope must not leak past its guard.
+        gc.set_array_element(arr, 0, Value::Object(Some(referent)))
+            .unwrap();
+        gc.set_array_element(arr, 0, Value::Object(None)).unwrap();
+        crate::satb::flush_thread_satb_buffer(gc.satb_queue());
+        assert!(
+            gc.satb_queue().drain().contains(&referent_addr),
+            "the pre-barrier must be restored once the guard drops"
+        );
+    }
+
+    /// G1MAT-4 — `cleanup` prunes remembered-set entries naming Free regions.
+    ///
+    /// Nothing else in the collector ever removes an rset entry: `clear()` runs
+    /// only on the TARGET's own `reset()`, so a source index recorded once is
+    /// kept for the rest of that target's life and every later pause pays for
+    /// it. Free sources are provably dead (a Free region holds no live object),
+    /// so dropping them changes no collection decision.
+    #[test]
+    fn g1mat4_cleanup_prunes_rset_sources_naming_free_regions() {
+        let gc = make_collector();
+        gc.with_regions_mut(|regions| {
+            regions[1].region_type = RegionType::Free;
+            regions[2].region_type = RegionType::Old;
+            regions[3].region_type = RegionType::Old;
+            regions[3].rset.add_reference(1); // Free  -> pruned
+            regions[3].rset.add_reference(2); // Old   -> kept
+            regions[3].rset.add_reference(usize::MAX); // out of range -> pruned
+        });
+
+        // No mark-start snapshot: cleanup keeps the pure-bitmap verdict and
+        // performs no in-place frees, so this isolates the rset pruning.
+        gc.cleanup();
+
+        let sources = {
+            let regions = gc.regions.lock();
+            regions[3].rset.sources()
+        };
+        assert!(
+            !sources.contains(&1),
+            "a source region that is Free cannot hold a live edge — prune it"
+        );
+        assert!(
+            sources.contains(&2),
+            "a live source region must be retained"
+        );
+        assert!(
+            !sources.contains(&usize::MAX),
+            "an out-of-range source index must be pruned"
+        );
+    }
+
+    /// Evacuation failure (to-space exhaustion), the path the retry/drain
+    /// machinery is built on. With no Free region and no non-CSet Survivor
+    /// region left, `evacuate_object` must SELF-FORWARD rather than drop the
+    /// object: an identity entry in the pointer map, the object left at its
+    /// original address with its fields intact, and its region KEPT (Eden
+    /// retyped to Survivor) instead of reset.
+    #[test]
+    fn evacuation_failure_self_forwards_and_keeps_region() {
+        let gc = make_collector();
+        let obj = gc.alloc_object(ClassId::new(1), 1);
+        gc.set_field(obj, 0, Value::Int(4242));
+        let obj_addr = obj.as_ptr() as usize;
+
+        let idx = {
+            let regions = gc.regions.lock();
+            gc.region_for_ptr(&regions, obj.as_ptr()).unwrap()
+        };
+
+        // Starve to-space: every other region is a non-Free, non-Survivor
+        // region with no room, so neither the `alloc_in_type_locked` reuse scan
+        // nor `find_free_region` can supply a destination. `cursor = 0` keeps
+        // the Phase-4 walk of these regions a no-op.
+        gc.with_regions_mut(|regions| {
+            for (i, r) in regions.iter_mut().enumerate() {
+                if i != idx {
+                    r.region_type = RegionType::Old;
+                    r.cursor = 0;
+                }
+            }
+        });
+
+        let mut roots = vec![obj];
+        let result = gc.young_collection(&mut roots, &NoopMonitors);
+
+        assert_eq!(
+            result.stats.objects_copied, 0,
+            "there is no to-space: nothing can be copied"
+        );
+        assert_eq!(
+            result.pointer_map.get(&obj_addr),
+            Some(&obj_addr),
+            "evacuation failure must record an IDENTITY forward (self-forward), \
+             not drop the object"
+        );
+        assert_eq!(
+            roots[0].as_ptr() as usize,
+            obj_addr,
+            "a self-forwarded root must not move"
+        );
+        assert_eq!(
+            gc.get_field(roots[0], 0).as_int(),
+            Some(4242),
+            "the self-forwarded object's payload must be intact"
+        );
+
+        let region_type = {
+            let regions = gc.regions.lock();
+            regions[idx].region_type
+        };
+        assert_eq!(
+            region_type,
+            RegionType::Survivor,
+            "a kept (evacuation-failed) Eden region is retyped to Survivor so it \
+             is re-collected next cycle — it must NOT be reset"
+        );
+        assert_eq!(
+            result.stats.bytes_freed, 0,
+            "the kept region's bytes must not be reported as freed"
+        );
+    }
+
+    /// Evacuation failure must not silently degrade the pause trigger: a pause
+    /// that self-forwards raises `needs_gc_free_percent` so the NEXT collection
+    /// starts with a bigger to-space pool (the kept-region death-spiral fix),
+    /// and a clean pause decays it back toward the 25% baseline.
+    #[test]
+    fn evacuation_failure_raises_then_decays_the_gc_trigger() {
+        let gc = make_collector();
+        let baseline = gc.needs_gc_free_percent.load(Ordering::Relaxed);
+
+        let obj = gc.alloc_object(ClassId::new(1), 0);
+        let idx = {
+            let regions = gc.regions.lock();
+            gc.region_for_ptr(&regions, obj.as_ptr()).unwrap()
+        };
+        gc.with_regions_mut(|regions| {
+            for (i, r) in regions.iter_mut().enumerate() {
+                if i != idx {
+                    r.region_type = RegionType::Old;
+                    r.cursor = 0;
+                }
+            }
+        });
+
+        let mut roots = vec![obj];
+        let first = gc.young_collection(&mut roots, &NoopMonitors);
+        let _ = gc.retry_after_evacuation_failure(first, &mut roots, &NoopMonitors);
+        let raised = gc.needs_gc_free_percent.load(Ordering::Relaxed);
+        assert!(
+            raised > baseline,
+            "an evacuation failure must trigger the next GC earlier ({raised} <= {baseline})"
+        );
+        assert!(raised <= 50, "the trigger must stay capped at 50%");
+
+        // A clean pause (empty pointer map => no identity forwards) decays it.
+        let clean = GcResult {
+            stats: GcStats {
+                objects_copied: 0,
+                bytes_copied: 0,
+                bytes_freed: 0,
+            },
+            pointer_map: HashMap::new(),
+        };
+        let mut no_roots: Vec<ObjectRef> = Vec::new();
+        let _ = gc.retry_after_evacuation_failure(clean, &mut no_roots, &NoopMonitors);
+        assert!(
+            gc.needs_gc_free_percent.load(Ordering::Relaxed) < raised,
+            "a clean pause must decay the trigger back toward baseline"
+        );
     }
 }

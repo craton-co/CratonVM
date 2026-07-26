@@ -400,6 +400,26 @@ pub struct SchedulerStats {
 // ForkJoinScheduler
 // ---------------------------------------------------------------------------
 
+/// Hard ceiling on carrier OS threads (base pool + compensating carriers).
+///
+/// Matches the JDK's `jdk.virtualThreadScheduler.maxPoolSize` default. The
+/// base pool is `available_parallelism()`; the starvation watchdog may grow it
+/// up to this bound, and never past it.
+pub const MAX_CARRIER_THREADS: usize = 256;
+
+/// How often the starvation watchdog samples the pool.
+const CARRIER_STALL_SAMPLE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Consecutive stalled samples before a compensating carrier is added. Four
+/// samples at 50 ms is ~200 ms of "queue non-empty, every carrier busy, and not
+/// one task dispatched in the whole window".
+const CARRIER_STALL_SAMPLES: u32 = 4;
+
+/// A compensating carrier that finds no work for this long retires itself, so a
+/// transient blocking storm does not permanently inflate the pool. Base-pool
+/// carriers never retire.
+const COMPENSATING_CARRIER_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// A work-stealing scheduler that maps N virtual threads onto M carrier
 /// (platform) threads.
 pub struct ForkJoinScheduler {
@@ -415,6 +435,21 @@ pub struct ForkJoinScheduler {
     task_available: Condvar,
     /// Mutex paired with task_available condvar.
     task_signal: Mutex<()>,
+    /// Carriers currently inside the task body (as opposed to parked in
+    /// `wait_for_task`). Distinguishes "pool saturated" from "pool idle" for
+    /// the starvation watchdog.
+    busy_carriers: AtomicUsize,
+    /// Carrier OS threads alive right now: the base pool plus every
+    /// compensating carrier the watchdog has added and that has not retired.
+    live_carriers: AtomicUsize,
+    /// Monotonic count of tasks handed to carriers. The watchdog's liveness
+    /// signal — a saturated pool that keeps dispatching is making progress and
+    /// needs no compensation.
+    dispatch_count: AtomicU64,
+    /// Index handed to the next compensating carrier. Always `>= parallelism`,
+    /// so compensating carriers own no per-carrier work queue and go straight
+    /// to the global queue / stealing (see `next_task`).
+    next_carrier_idx: AtomicUsize,
 }
 
 impl ForkJoinScheduler {
@@ -437,6 +472,10 @@ impl ForkJoinScheduler {
             stats: SchedulerStats::default(),
             task_available: Condvar::new(),
             task_signal: Mutex::new(()),
+            busy_carriers: AtomicUsize::new(0),
+            live_carriers: AtomicUsize::new(0),
+            dispatch_count: AtomicU64::new(0),
+            next_carrier_idx: AtomicUsize::new(parallelism),
         }
     }
 
@@ -449,7 +488,21 @@ impl ForkJoinScheduler {
     }
 
     /// Submit a virtual thread for execution (goes into the global queue).
+    ///
+    /// LOST-WAKEUP FIX (2026-07-26): the push and the `notify_one` must happen
+    /// under `task_signal`, the mutex `wait_for_task_until` waits on.
+    /// Previously they did not, leaving the textbook missed-wakeup window — a
+    /// carrier that has just run `next_task()` and found nothing, but has not
+    /// yet reached `wait_for`, misses a `notify_one` issued in that gap. The
+    /// 100 ms poll timeout inside the wait loop hid it as a *latency* bug
+    /// rather than a hang: every unpark that lost this race added up to 100 ms
+    /// before its virtual thread ran. Holding the mutex across both closes the
+    /// window entirely.
+    ///
+    /// Lock order is `task_signal` -> queues, matching `wait_for_task_until`
+    /// (which calls `next_task` while holding `task_signal`). Do not invert it.
     pub fn submit(&self, vt_id: u64) {
+        let _signal = self.task_signal.lock();
         self.submission_queue.lock().push_back(vt_id);
         self.stats.total_submissions.fetch_add(1, Ordering::Relaxed);
         self.total_created.fetch_add(1, Ordering::Relaxed);
@@ -458,7 +511,12 @@ impl ForkJoinScheduler {
     }
 
     /// Signal all carrier threads (used during shutdown).
+    ///
+    /// Takes `task_signal` for the same reason [`Self::submit`] does: a
+    /// notify issued outside it can be missed by a carrier that is between its
+    /// last queue poll and its `wait_for`.
     pub fn notify_all_carriers(&self) {
+        let _signal = self.task_signal.lock();
         self.task_available.notify_all();
     }
 
@@ -476,10 +534,26 @@ impl ForkJoinScheduler {
     /// Wait for a task to become available (blocks the carrier thread).
     /// Returns `None` if the scheduler is shutting down.
     pub fn wait_for_task(&self, carrier_idx: usize) -> Option<u64> {
+        self.wait_for_task_until(carrier_idx, None)
+    }
+
+    /// [`Self::wait_for_task`] with an optional idle retirement deadline.
+    ///
+    /// `idle_timeout` is `None` for base-pool carriers (they live for the
+    /// process) and `Some(..)` for compensating carriers added by the
+    /// starvation watchdog: once one of those has found no work for the whole
+    /// timeout *and* the pool is still above its base size, it returns `None`
+    /// so the carrier retires and the pool shrinks back.
+    pub fn wait_for_task_until(
+        &self,
+        carrier_idx: usize,
+        idle_timeout: Option<std::time::Duration>,
+    ) -> Option<u64> {
         // Fast path: check queues first
         if let Some(task) = self.next_task(carrier_idx) {
             return Some(task);
         }
+        let idle_deadline = idle_timeout.map(|d| Instant::now() + d);
         // Slow path: wait on condvar
         let mut signal = self.task_signal.lock();
         loop {
@@ -489,10 +563,62 @@ impl ForkJoinScheduler {
             if let Some(task) = self.next_task(carrier_idx) {
                 return Some(task);
             }
+            if let Some(deadline) = idle_deadline {
+                // Only retire while the pool is still inflated — never shrink
+                // below the base parallelism, or a quiet period would leave
+                // fewer carriers than the scheduler was built with.
+                if Instant::now() >= deadline
+                    && self.live_carriers.load(Ordering::Acquire) > self.parallelism
+                {
+                    return None;
+                }
+            }
             // Wait with timeout to allow periodic shutdown checks
             self.task_available
                 .wait_for(&mut signal, std::time::Duration::from_millis(100));
         }
+    }
+
+    /// A carrier is entering the task body. Bumps the saturation gauge and the
+    /// dispatch counter the watchdog uses as its liveness signal.
+    fn note_task_started(&self) {
+        self.busy_carriers.fetch_add(1, Ordering::AcqRel);
+        self.dispatch_count.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// A carrier has left the task body.
+    fn note_task_finished(&self) {
+        self.busy_carriers.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    /// Total queued-but-unmounted virtual threads across the global submission
+    /// queue and every per-carrier work queue.
+    pub fn queued_len(&self) -> usize {
+        let mut n = self.submission_queue.lock().len();
+        for q in &self.work_queues {
+            n += q.lock().len();
+        }
+        n
+    }
+
+    /// Carriers currently executing a virtual thread.
+    pub fn busy_carriers(&self) -> usize {
+        self.busy_carriers.load(Ordering::Acquire)
+    }
+
+    /// Carrier OS threads alive right now (base pool + compensating carriers).
+    pub fn live_carriers(&self) -> usize {
+        self.live_carriers.load(Ordering::Acquire)
+    }
+
+    /// Configured base parallelism (the size of the non-retiring pool).
+    pub fn parallelism(&self) -> usize {
+        self.parallelism
+    }
+
+    /// Monotonic count of tasks handed to carriers.
+    pub fn dispatch_count(&self) -> u64 {
+        self.dispatch_count.load(Ordering::Acquire)
     }
 
     /// Try to steal a task from another carrier's work queue.
@@ -511,10 +637,16 @@ impl ForkJoinScheduler {
 
     /// Get the next task for a carrier: own queue first, then global, then
     /// steal from another carrier.
+    ///
+    /// `carrier_idx >= parallelism` identifies a compensating carrier, which
+    /// owns no work queue — it skips straight to the global queue and stealing.
+    /// (Indexing `work_queues[carrier_idx]` directly used to panic for those.)
     pub fn next_task(&self, carrier_idx: usize) -> Option<u64> {
         // 1. Own work queue
-        if let Some(task) = self.work_queues[carrier_idx].lock().pop_front() {
-            return Some(task);
+        if let Some(queue) = self.work_queues.get(carrier_idx) {
+            if let Some(task) = queue.lock().pop_front() {
+                return Some(task);
+            }
         }
         // 2. Global submission queue
         if let Some(task) = self.submission_queue.lock().pop_front() {
@@ -569,6 +701,177 @@ impl ForkJoinScheduler {
 
     pub fn stats(&self) -> &SchedulerStats {
         &self.stats
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Carrier bodies + starvation compensation
+// ---------------------------------------------------------------------------
+
+/// The body every carrier OS thread runs: pull a virtual thread, execute it,
+/// repeat. `idle_timeout` is `None` for base-pool carriers and `Some(..)` for
+/// compensating carriers, which retire when the pool has drained (see
+/// [`ForkJoinScheduler::wait_for_task_until`]).
+///
+/// The busy/idle accounting lives HERE rather than inside `wait_for_task` so
+/// that "carrier is inside the task body" — the state that matters for
+/// starvation, because that is where a carrier can block on a monitor and never
+/// come back — is what the gauge actually measures.
+fn run_carrier(
+    scheduler: &Arc<ForkJoinScheduler>,
+    task_fn: &Arc<dyn Fn(u64) + Send + Sync>,
+    carrier_idx: usize,
+    idle_timeout: Option<std::time::Duration>,
+) {
+    // Both counters are released by `Drop`, not by a trailing statement: a
+    // panic escaping `task_fn` would otherwise leak `busy_carriers` forever,
+    // and a permanently-saturated-looking pool is exactly the condition the
+    // watchdog grows on — one panic would ratchet the pool to its cap.
+    let _alive = CarrierAliveGuard(&**scheduler);
+    while let Some(vt_id) = scheduler.wait_for_task_until(carrier_idx, idle_timeout) {
+        scheduler.note_task_started();
+        let _busy = CarrierBusyGuard(&**scheduler);
+        task_fn(vt_id);
+    }
+}
+
+/// Decrements `live_carriers` when a carrier body exits, however it exits.
+struct CarrierAliveGuard<'a>(&'a ForkJoinScheduler);
+
+impl Drop for CarrierAliveGuard<'_> {
+    fn drop(&mut self) {
+        self.0.live_carriers.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Decrements `busy_carriers` when a task body returns or unwinds.
+struct CarrierBusyGuard<'a>(&'a ForkJoinScheduler);
+
+impl Drop for CarrierBusyGuard<'_> {
+    fn drop(&mut self) {
+        self.0.note_task_finished();
+    }
+}
+
+/// Add one compensating carrier, unless the pool is already at
+/// [`MAX_CARRIER_THREADS`]. Returns whether a carrier was actually spawned.
+///
+/// The reservation is a CAS loop on `live_carriers`, so two watchdogs (or a
+/// watchdog racing a retiring carrier) can never push the pool past the cap.
+fn spawn_compensating_carrier(
+    scheduler: &Arc<ForkJoinScheduler>,
+    task_fn: &Arc<dyn Fn(u64) + Send + Sync>,
+    handles: &Arc<Mutex<Vec<std::thread::JoinHandle<()>>>>,
+) -> bool {
+    let mut live = scheduler.live_carriers.load(Ordering::Acquire);
+    loop {
+        if live >= MAX_CARRIER_THREADS {
+            return false;
+        }
+        match scheduler.live_carriers.compare_exchange_weak(
+            live,
+            live + 1,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => break,
+            Err(observed) => live = observed,
+        }
+    }
+    let carrier_idx = scheduler.next_carrier_idx.fetch_add(1, Ordering::AcqRel);
+    let sched = scheduler.clone();
+    let f = task_fn.clone();
+    match std::thread::Builder::new()
+        .name(format!("ForkJoinPool-carrier-comp-{}", carrier_idx))
+        .stack_size(8 * 1024 * 1024)
+        .spawn(move || {
+            run_carrier(
+                &sched,
+                &f,
+                carrier_idx,
+                Some(COMPENSATING_CARRIER_IDLE_TIMEOUT),
+            )
+        }) {
+        Ok(handle) => {
+            handles.lock().push(handle);
+            true
+        }
+        Err(_) => {
+            // Could not get an OS thread (fd/handle exhaustion). Give the
+            // reservation back so a later attempt can retry.
+            scheduler.live_carriers.fetch_sub(1, Ordering::AcqRel);
+            false
+        }
+    }
+}
+
+/// Decide, from one sample of the pool, whether a compensating carrier is owed.
+///
+/// Stalled means all three of:
+///  * work is queued but unmounted (`queued > 0`);
+///  * every live carrier is inside a task body (`busy >= live`), so nothing is
+///    waiting to pick that work up;
+///  * `dispatch_count` has not moved since the previous sample — a saturated
+///    pool that keeps dequeuing is busy, not stuck, and must not be grown.
+///
+/// A CPU-bound virtual thread that never yields also trips this, and that is
+/// intentional: the JDK compensates for a monopolised carrier the same way, and
+/// the cap plus idle retirement bound the cost.
+fn carrier_pool_is_stalled(queued: usize, busy: usize, live: usize, dispatch_moved: bool) -> bool {
+    queued > 0 && live > 0 && busy >= live && !dispatch_moved
+}
+
+/// Start the single watchdog thread that grows the carrier pool when it is
+/// wedged. One thread per `VirtualThreadManager`, started with the base pool.
+///
+/// This exists because nothing in the VM prevents a carrier from blocking:
+/// contended `monitorenter` goes to `monitor_enter_blocking`, `Object.wait`
+/// goes to `monitor_wait`, and the platform-park fallback goes to
+/// `NativeContextImpl::park` — none of which is virtual-thread aware, and all
+/// of which park the carrier's OS thread with the continuation still mounted.
+/// Without compensation, `parallelism` such blocks stop the whole VM.
+fn spawn_starvation_watchdog(
+    scheduler: Arc<ForkJoinScheduler>,
+    task_fn: Arc<dyn Fn(u64) + Send + Sync>,
+    handles: Arc<Mutex<Vec<std::thread::JoinHandle<()>>>>,
+) {
+    let watchdog_handles = handles.clone();
+    let handle = std::thread::Builder::new()
+        .name("ForkJoinPool-starvation-watchdog".to_string())
+        .spawn(move || {
+            let mut last_dispatch = scheduler.dispatch_count();
+            let mut stalled_samples: u32 = 0;
+            loop {
+                std::thread::sleep(CARRIER_STALL_SAMPLE_INTERVAL);
+                if !scheduler.is_running() {
+                    return;
+                }
+                let dispatch = scheduler.dispatch_count();
+                let dispatch_moved = dispatch != last_dispatch;
+                last_dispatch = dispatch;
+                if carrier_pool_is_stalled(
+                    scheduler.queued_len(),
+                    scheduler.busy_carriers(),
+                    scheduler.live_carriers(),
+                    dispatch_moved,
+                ) {
+                    stalled_samples = stalled_samples.saturating_add(1);
+                    if stalled_samples >= CARRIER_STALL_SAMPLES {
+                        stalled_samples = 0;
+                        if spawn_compensating_carrier(&scheduler, &task_fn, &watchdog_handles) {
+                            // The fresh carrier is parked in `wait_for_task`;
+                            // nudge the condvar so it picks up the backlog
+                            // without waiting out its 100 ms poll.
+                            scheduler.notify_all_carriers();
+                        }
+                    }
+                } else {
+                    stalled_samples = 0;
+                }
+            }
+        });
+    if let Ok(handle) = handle {
+        handles.lock().push(handle);
     }
 }
 
@@ -783,7 +1086,10 @@ pub struct VirtualThreadManager {
     next_id: AtomicU64,
     _next_continuation_id: AtomicU64,
     /// Carrier OS thread join handles (populated by `start_carriers`).
-    carrier_handles: Mutex<Vec<std::thread::JoinHandle<()>>>,
+    ///
+    /// Behind an `Arc` so the starvation watchdog thread can push handles for
+    /// the compensating carriers it spawns without borrowing `&self`.
+    carrier_handles: Arc<Mutex<Vec<std::thread::JoinHandle<()>>>>,
     carriers_started: AtomicBool,
     /// Per-virtual-thread wakeup signal for timed park/sleep cancellation.
     /// T10.9.B: FxHashMap — internal thread IDs.
@@ -810,7 +1116,7 @@ impl VirtualThreadManager {
             scheduler,
             next_id: AtomicU64::new(1),
             _next_continuation_id: AtomicU64::new(1),
-            carrier_handles: Mutex::new(Vec::new()),
+            carrier_handles: Arc::new(Mutex::new(Vec::new())),
             carriers_started: AtomicBool::new(false),
             wakeup_signals,
             wakeup_timer,
@@ -829,28 +1135,36 @@ impl VirtualThreadManager {
     /// threads to run. `task_fn` is called for each virtual thread ID that
     /// gets dequeued — the caller supplies the actual execution logic
     /// (e.g. interpreter invocation).
+    ///
+    /// Also starts the *starvation watchdog* (see [`spawn_starvation_watchdog`]).
+    /// It is unconditional and has no gate: a virtual thread that blocks its
+    /// carrier — waiting on a contended monitor, inside `Object.wait`, or on
+    /// the platform-park fallback — cannot unmount, and with a fixed pool a
+    /// handful of those wedge every carrier permanently. Compensation converts
+    /// that hard deadlock into a slowdown, exactly as the JDK's ForkJoinPool
+    /// does when it compensates for a blocked worker.
     pub fn start_carriers<F>(&self, task_fn: F)
     where
         F: Fn(u64) + Send + Sync + 'static,
     {
-        let task_fn = Arc::new(task_fn);
+        let task_fn: Arc<dyn Fn(u64) + Send + Sync> = Arc::new(task_fn);
         let scheduler = self.scheduler.clone();
         let parallelism = scheduler.parallelism;
-        let mut handles = self.carrier_handles.lock();
-        for carrier_idx in 0..parallelism {
-            let sched = scheduler.clone();
-            let f = task_fn.clone();
-            let handle = std::thread::Builder::new()
-                .name(format!("ForkJoinPool-carrier-{}", carrier_idx))
-                .stack_size(8 * 1024 * 1024)
-                .spawn(move || {
-                    while let Some(vt_id) = sched.wait_for_task(carrier_idx) {
-                        f(vt_id);
-                    }
-                })
-                .expect("failed to spawn carrier thread");
-            handles.push(handle);
+        {
+            let mut handles = self.carrier_handles.lock();
+            for carrier_idx in 0..parallelism {
+                let sched = scheduler.clone();
+                let f = task_fn.clone();
+                sched.live_carriers.fetch_add(1, Ordering::AcqRel);
+                let handle = std::thread::Builder::new()
+                    .name(format!("ForkJoinPool-carrier-{}", carrier_idx))
+                    .stack_size(8 * 1024 * 1024)
+                    .spawn(move || run_carrier(&sched, &f, carrier_idx, None))
+                    .expect("failed to spawn carrier thread");
+                handles.push(handle);
+            }
         }
+        spawn_starvation_watchdog(scheduler, task_fn, self.carrier_handles.clone());
     }
 
     /// Start the bounded carrier pool exactly once.
@@ -872,8 +1186,13 @@ impl VirtualThreadManager {
         self.scheduler.shutdown();
         // Stop the shared wakeup timer thread (if it was ever started).
         self.wakeup_timer.shutdown();
-        let mut handles = self.carrier_handles.lock();
-        for handle in handles.drain(..) {
+        // Take the handles and RELEASE the lock before joining. The starvation
+        // watchdog pushes compensating-carrier handles under this same lock, so
+        // joining while holding it would deadlock shutdown against the very
+        // watchdog thread it is waiting for.
+        let handles: Vec<std::thread::JoinHandle<()>> =
+            self.carrier_handles.lock().drain(..).collect();
+        for handle in handles {
             let _ = handle.join();
         }
     }
@@ -949,6 +1268,26 @@ impl VirtualThreadManager {
                 vt.wake_pending = false;
                 vt.state = VirtualThreadState::Started;
                 resubmit = true;
+            } else if vt.unpark_permit && wake_after.is_zero() {
+                // LOST-UNPARK FIX (2026-07-26): an `unpark` that landed while
+                // this continuation was still mounted (or mid-unmount) left a
+                // sticky permit rather than a submission — see
+                // `unpark_virtual`. Consume it here, which is the earliest
+                // point at which the runtime is deposited and the thread can
+                // legally be resubmitted.
+                //
+                // Gated on `wake_after.is_zero()` deliberately: a zero wake
+                // means an UNTIMED park, the only yield that can hang forever
+                // without this. A timed yield (`Thread.sleep`, `parkNanos`)
+                // already has a `WakeupTimer` deadline, so honouring the
+                // permit there would let a stray permit truncate a real
+                // `Thread.sleep` — a correctness regression traded for
+                // nothing. The residual is bounded latency on `parkNanos`,
+                // recorded as a known gap in
+                // `docs/internal/arch-2026-07-26/virtual-threads.md`.
+                vt.unpark_permit = false;
+                vt.state = VirtualThreadState::Started;
+                resubmit = true;
             }
         }
         drop(threads);
@@ -998,7 +1337,14 @@ impl VirtualThreadManager {
                 let Some(vt) = threads.get_mut(&vt_id) else {
                     continue;
                 };
-                if vt.state == VirtualThreadState::Parked && vt.runtime.is_some() {
+                // `Parked` alone, for the reason spelled out in
+                // `unpark_virtual`: on the live path `Parked` already implies
+                // a deposited runtime, and where it does not, refusing to
+                // submit loses the wake permanently (nothing will call
+                // `suspend_runtime` for an already-parked thread, so the
+                // `wake_pending` flag set below would never be consumed).
+                // Submitting a runtime-less thread is a no-op.
+                if vt.state == VirtualThreadState::Parked {
                     vt.state = VirtualThreadState::Started;
                     ready.push(vt_id);
                 } else if vt.state != VirtualThreadState::Terminated {
@@ -1040,19 +1386,76 @@ impl VirtualThreadManager {
     }
 
     /// Unpark a virtual thread (`LockSupport.unpark`).
+    ///
+    /// Resubmits ONLY when the continuation is genuinely parked *and* its
+    /// heap-resident `runtime` has already been deposited by
+    /// [`Self::suspend_runtime`]. In every other live state the permit is left
+    /// on the `VirtualThread` for `suspend_runtime` to consume — the same
+    /// deposit-then-check handshake [`Self::wake_waiters`] uses.
+    ///
+    /// LOST-UNPARK FIX (2026-07-26). The previous version called `vt.unpark()`
+    /// and then tested `state == Started`, which was wrong in both directions:
+    ///
+    /// * **Lost wakeup.** Between the interpreter returning
+    ///   `VmError::ContinuationYield` on the carrier and `suspend_runtime`
+    ///   depositing the boxed `JvmThread`, the virtual thread is still
+    ///   `Running`. `vt.unpark()` does not change a `Running` state, so the
+    ///   test failed and nothing was submitted; the permit it set
+    ///   (`unpark_permit`) was read by no live code path, because the
+    ///   freeze/thaw `VirtualThread::park` that consumed it is dead code (see
+    ///   `docs/internal/arch-2026-07-26/virtual-threads.md`). An untimed
+    ///   `LockSupport.park()` yields with `wake_after_nanos == 0`, so
+    ///   `suspend_runtime` schedules no timer either — the virtual thread was
+    ///   parked forever. That window is exactly the one every real
+    ///   park/unpark handoff races through.
+    /// * **Duplicate submission.** When the state was ALREADY `Started`
+    ///   (queued, not yet mounted) the test passed and enqueued a second copy
+    ///   of an id that was already in the queue.
     pub fn unpark_virtual(&self, vt_id: u64) {
-        let mut threads = self.threads.lock();
-        if let Some(vt) = threads.get_mut(&vt_id) {
-            vt.unpark();
-            let was_parked = vt.state == VirtualThreadState::Started;
-            drop(threads);
-            if was_parked {
-                self.scheduler.submit(vt_id);
-                self.scheduler
-                    .stats
-                    .total_unparks
-                    .fetch_add(1, Ordering::Relaxed);
+        let mut resubmit = false;
+        {
+            let mut threads = self.threads.lock();
+            let Some(vt) = threads.get_mut(&vt_id) else {
+                return;
+            };
+            if vt.state == VirtualThreadState::Terminated {
+                return;
             }
+            // `Parked` alone is the resubmit condition — deliberately NOT
+            // `Parked && runtime.is_some()`.
+            //
+            // On the live path the two are equivalent: `suspend_runtime` sets
+            // `state = Parked` and `runtime = Some(..)` under one hold of the
+            // `threads` mutex, so no observer can see them disagree. The
+            // conjunct was therefore only ever load-bearing when the invariant
+            // is violated — and there it fails the WRONG WAY. Refusing to
+            // submit a `Parked` thread is a permanent hang, which is the exact
+            // defect this function exists to fix. Submitting one that has no
+            // runtime is harmless: `take_runtime_for_mount` returns `None` and
+            // `resume_virtual_continuation` returns immediately.
+            //
+            // Fail open. "Parked implies resubmit" is the invariant that keeps
+            // virtual threads from disappearing, and it must hold
+            // unconditionally. (Caught by the pre-existing
+            // `manager_park_and_unpark`, whose expectation is still exactly
+            // right.)
+            if vt.state == VirtualThreadState::Parked {
+                vt.state = VirtualThreadState::Started;
+                vt.unpark_permit = false;
+                resubmit = true;
+            } else {
+                // Mounted, mid-unmount, or queued: `LockSupport` permits are
+                // sticky, so record it and let the unmount path (or the next
+                // park) observe it.
+                vt.unpark_permit = true;
+            }
+        }
+        if resubmit {
+            self.scheduler.submit(vt_id);
+            self.scheduler
+                .stats
+                .total_unparks
+                .fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -2732,5 +3135,293 @@ mod tests {
         mgr.wake_waiters(8);
         assert_eq!(mgr.get_state(id), Some(VirtualThreadState::Started));
         assert_eq!(mgr.scheduler().next_task(0), Some(id));
+    }
+
+    // -- Lost-unpark race (2026-07-26) ------------------------------------
+
+    /// The regression this whole fix exists for: `LockSupport.unpark` lands
+    /// while the continuation is still mounted (it has returned
+    /// `ContinuationYield` on its carrier but `suspend_runtime` has not run
+    /// yet). Before the fix nothing was submitted and, for an UNTIMED park
+    /// (`wake_after == 0`, so no wakeup timer either), the virtual thread was
+    /// never scheduled again.
+    #[test]
+    fn unpark_before_unmount_is_not_lost() {
+        use crate::threading::jvm_thread::{JvmThread, ThreadId};
+
+        let mgr = VirtualThreadManager::new(1);
+        let id = 61;
+        mgr.create_virtual_thread_with_id(id, "unpark-race");
+        mgr.install_runtime(id, Box::new(JvmThread::new(ThreadId(id), "unpark-race")));
+        mgr.start(id);
+        assert_eq!(mgr.scheduler().next_task(0), Some(id));
+        let (runtime, _) = mgr.take_runtime_for_mount(id, 0).unwrap();
+        assert_eq!(mgr.get_state(id), Some(VirtualThreadState::Running));
+
+        // Unpark arrives mid-flight: still mounted, runtime not deposited.
+        mgr.unpark_virtual(id);
+        assert!(
+            mgr.threads.lock().get(&id).unwrap().unpark_permit,
+            "a mid-flight unpark must leave a sticky permit"
+        );
+        assert!(
+            mgr.scheduler().next_task(0).is_none(),
+            "nothing may be queued while the runtime is still taken"
+        );
+
+        // Untimed park deposits the runtime — the permit must fire here.
+        mgr.suspend_runtime(id, runtime, std::time::Duration::ZERO);
+        assert_eq!(mgr.get_state(id), Some(VirtualThreadState::Started));
+        assert_eq!(mgr.scheduler().next_task(0), Some(id));
+        assert!(
+            !mgr.threads.lock().get(&id).unwrap().unpark_permit,
+            "the permit must be consumed, not left to fire twice"
+        );
+    }
+
+    /// A parked continuation with its runtime deposited is resubmitted
+    /// directly — the plain park/unpark round trip.
+    #[test]
+    fn unpark_after_unmount_resubmits_once() {
+        use crate::threading::jvm_thread::{JvmThread, ThreadId};
+
+        let mgr = VirtualThreadManager::new(1);
+        let id = 62;
+        mgr.create_virtual_thread_with_id(id, "unpark-parked");
+        mgr.install_runtime(id, Box::new(JvmThread::new(ThreadId(id), "unpark-parked")));
+        mgr.start(id);
+        // Drain `start`'s own submission. Without this the queue is never
+        // empty, and every "must not have resubmitted" assertion below would
+        // pass on `start`'s leftover entry instead of testing anything — the
+        // test could not have detected the duplicate-submission bug it names.
+        assert_eq!(mgr.scheduler().next_task(0), Some(id));
+        let (runtime, _) = mgr.take_runtime_for_mount(id, 0).unwrap();
+        assert_eq!(mgr.scheduler().next_task(0), None);
+
+        mgr.suspend_runtime(id, runtime, std::time::Duration::ZERO);
+        assert_eq!(mgr.get_state(id), Some(VirtualThreadState::Parked));
+        assert_eq!(mgr.scheduler().next_task(0), None);
+
+        mgr.unpark_virtual(id);
+        assert_eq!(mgr.get_state(id), Some(VirtualThreadState::Started));
+        assert_eq!(mgr.scheduler().next_task(0), Some(id));
+        // Exactly one submission — the old code enqueued a second copy when it
+        // saw an already-`Started` thread.
+        assert_eq!(mgr.scheduler().next_task(0), None);
+    }
+
+    /// An unpark against an already-queued (`Started`, not yet mounted)
+    /// virtual thread must not enqueue a duplicate id.
+    #[test]
+    fn unpark_of_queued_thread_does_not_duplicate_submission() {
+        use crate::threading::jvm_thread::{JvmThread, ThreadId};
+
+        let mgr = VirtualThreadManager::new(1);
+        let id = 63;
+        mgr.create_virtual_thread_with_id(id, "unpark-queued");
+        mgr.install_runtime(id, Box::new(JvmThread::new(ThreadId(id), "unpark-queued")));
+        mgr.start(id);
+        assert_eq!(mgr.get_state(id), Some(VirtualThreadState::Started));
+
+        mgr.unpark_virtual(id);
+        assert_eq!(mgr.scheduler().next_task(0), Some(id));
+        assert_eq!(
+            mgr.scheduler().next_task(0),
+            None,
+            "unpark of a queued thread must not duplicate its submission"
+        );
+    }
+
+    /// A stray permit must NOT truncate a timed yield: `Thread.sleep` and
+    /// `parkNanos` already carry a `WakeupTimer` deadline.
+    #[test]
+    fn unpark_permit_does_not_truncate_timed_yield() {
+        use crate::threading::jvm_thread::{JvmThread, ThreadId};
+
+        let mgr = VirtualThreadManager::new(1);
+        let id = 64;
+        mgr.create_virtual_thread_with_id(id, "unpark-timed");
+        mgr.install_runtime(id, Box::new(JvmThread::new(ThreadId(id), "unpark-timed")));
+        mgr.start(id);
+        // Drain `start`'s own submission — see the note in
+        // `unpark_after_unmount_resubmits_once`. The whole point of this test
+        // is the assertion that the queue is EMPTY after a timed yield; with
+        // `start`'s entry still sitting there that assertion is untestable.
+        assert_eq!(mgr.scheduler().next_task(0), Some(id));
+        let (runtime, _) = mgr.take_runtime_for_mount(id, 0).unwrap();
+
+        mgr.unpark_virtual(id);
+        mgr.suspend_runtime(id, runtime, std::time::Duration::from_secs(3600));
+        assert_eq!(
+            mgr.get_state(id),
+            Some(VirtualThreadState::Parked),
+            "a timed yield must stay parked until its deadline"
+        );
+        assert_eq!(mgr.scheduler().next_task(0), None);
+        assert!(
+            mgr.threads.lock().get(&id).unwrap().unpark_permit,
+            "the permit stays sticky for the next untimed park"
+        );
+        mgr.cancel_wakeup(id);
+        // Stops the lazily-started wakeup-timer thread this park spawned.
+        mgr.shutdown();
+    }
+
+    /// `Parked` implies resubmit, unconditionally — including when no runtime
+    /// has been deposited.
+    ///
+    /// This pins the reason `unpark_virtual`'s condition is `state == Parked`
+    /// and not `state == Parked && runtime.is_some()`. The two agree on the
+    /// live path (`suspend_runtime` writes both under one lock hold), so the
+    /// conjunct can only ever matter when the invariant is already broken —
+    /// and there it fails closed, turning a wake into a permanent hang. This
+    /// is the same shape the pre-existing `manager_park_and_unpark` asserts;
+    /// kept separately so the *reason* is not lost if that test is rewritten.
+    #[test]
+    fn unpark_of_parked_thread_without_runtime_still_resubmits() {
+        let mgr = VirtualThreadManager::new(1);
+        let id = mgr.create_virtual_thread("parked-no-runtime");
+        {
+            let mut threads = mgr.threads.lock();
+            threads.get_mut(&id).unwrap().mount(0);
+        }
+        assert!(mgr.park_virtual(id));
+        assert_eq!(mgr.get_state(id), Some(VirtualThreadState::Parked));
+        assert!(
+            mgr.threads.lock().get(&id).unwrap().runtime.is_none(),
+            "precondition: this thread has no deposited runtime"
+        );
+
+        mgr.unpark_virtual(id);
+        assert_eq!(
+            mgr.get_state(id),
+            Some(VirtualThreadState::Started),
+            "a parked thread must always become runnable on unpark"
+        );
+        assert_eq!(
+            mgr.scheduler().next_task(0),
+            Some(id),
+            "and must actually reach the scheduler queue"
+        );
+    }
+
+    /// An unpark of a terminated virtual thread is a no-op — no resurrection,
+    /// no queue entry.
+    #[test]
+    fn unpark_of_terminated_thread_is_a_noop() {
+        let mgr = VirtualThreadManager::new(1);
+        let id = 65;
+        mgr.create_virtual_thread_with_id(id, "unpark-dead");
+        mgr.terminate(id);
+
+        mgr.unpark_virtual(id);
+        assert_eq!(mgr.get_state(id), Some(VirtualThreadState::Terminated));
+        assert_eq!(mgr.scheduler().next_task(0), None);
+    }
+
+    // -- Carrier-pool starvation compensation (2026-07-26) ----------------
+
+    #[test]
+    fn stall_detector_requires_queued_work_saturation_and_no_progress() {
+        // Saturated, queue non-empty, no dispatch since last sample: stalled.
+        assert!(carrier_pool_is_stalled(3, 2, 2, false));
+        // Dispatching -> busy but progressing, never compensate.
+        assert!(!carrier_pool_is_stalled(3, 2, 2, true));
+        // Idle carrier available -> the backlog has a taker.
+        assert!(!carrier_pool_is_stalled(3, 1, 2, false));
+        // Nothing queued -> saturation is just useful work.
+        assert!(!carrier_pool_is_stalled(0, 2, 2, false));
+        // No carriers at all (pool never started) -> nothing to compensate.
+        assert!(!carrier_pool_is_stalled(3, 0, 0, false));
+    }
+
+    /// Compensating carriers get indices past `parallelism` and therefore own
+    /// no per-carrier work queue. `next_task` used to index `work_queues`
+    /// directly, which panicked for exactly those indices.
+    #[test]
+    fn next_task_tolerates_compensating_carrier_index() {
+        let sched = ForkJoinScheduler::new(2);
+        sched.submit(77);
+        let out_of_range = sched.parallelism() + 5;
+        assert_eq!(
+            sched.next_task(out_of_range),
+            Some(77),
+            "a compensating carrier must reach the global queue"
+        );
+        assert_eq!(sched.next_task(out_of_range), None);
+    }
+
+    /// The blocked carrier that motivates compensation: a task body that never
+    /// returns holds its carrier forever. With `parallelism == 1` the queued
+    /// follow-up work is unreachable until a second carrier appears.
+    #[test]
+    fn blocked_carrier_pool_is_grown_by_the_watchdog() {
+        let mgr = VirtualThreadManager::new(1);
+        let entered = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(AtomicBool::new(false));
+        let second_ran = Arc::new(AtomicBool::new(false));
+
+        let entered_task = entered.clone();
+        let release_task = release.clone();
+        let second_task = second_ran.clone();
+        mgr.start_carriers(move |vt_id| {
+            entered_task.fetch_add(1, Ordering::SeqCst);
+            if vt_id == 1 {
+                // Emulate a virtual thread blocking its carrier inside a
+                // contended monitor: the carrier never returns to the pool.
+                while !release_task.load(Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            } else {
+                second_task.store(true, Ordering::SeqCst);
+            }
+        });
+
+        mgr.scheduler().submit(1);
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while entered.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(
+            entered.load(Ordering::SeqCst),
+            1,
+            "the sole base carrier must be wedged inside the task body"
+        );
+
+        // Nothing in the base pool can ever pick this up.
+        mgr.scheduler().submit(2);
+        let deadline = Instant::now() + std::time::Duration::from_secs(20);
+        while !second_ran.load(Ordering::SeqCst) && Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let ran_second = second_ran.load(Ordering::SeqCst);
+        let grew = mgr.scheduler().live_carriers() > mgr.scheduler().parallelism();
+
+        release.store(true, Ordering::SeqCst);
+        mgr.shutdown();
+
+        assert!(
+            ran_second,
+            "the starvation watchdog must add a carrier so queued work still runs"
+        );
+        assert!(grew, "the pool must have grown past its base parallelism");
+    }
+
+    /// The cap is a hard bound, not a target: an already-maxed pool refuses to
+    /// grow.
+    #[test]
+    fn compensating_carrier_respects_the_pool_cap() {
+        let sched = Arc::new(ForkJoinScheduler::new(1));
+        let task_fn: Arc<dyn Fn(u64) + Send + Sync> = Arc::new(|_vt_id: u64| {});
+        let handles = Arc::new(Mutex::new(Vec::new()));
+        sched
+            .live_carriers
+            .store(MAX_CARRIER_THREADS, Ordering::Release);
+        assert!(
+            !spawn_compensating_carrier(&sched, &task_fn, &handles),
+            "must not spawn past MAX_CARRIER_THREADS"
+        );
+        assert_eq!(sched.live_carriers(), MAX_CARRIER_THREADS);
+        assert!(handles.lock().is_empty());
     }
 }

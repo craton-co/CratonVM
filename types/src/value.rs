@@ -735,6 +735,424 @@ pub fn jlong_bits_as_aligned_object_ptr(bits: u64) -> Option<usize> {
 }
 
 // ---------------------------------------------------------------------------
+// Untagged slots (`RawSlot`) — the verifier-map-driven frame representation
+// ---------------------------------------------------------------------------
+//
+// # Why this exists
+//
+// The interpreter currently stores every local and every operand-stack slot as
+// an 8-byte NaN-boxed [`crate::compact_value::CompactValue`] **plus** a
+// parallel `kinds: Vec<u8>` byte (`vm::runtime::value_stack::ValueStack::kinds`
+// and `vm::runtime::frame::Frame::local_kinds`). Those byte arrays exist for
+// exactly one consumer — the GC root scan — and for exactly one reason: a
+// 64-bit `long` uses all 64 bits, so `CompactValue::long(0xFFFC_0000_0000_0000)`
+// is bit-identical to `CompactValue::int(0)`. NaN-boxing cannot tag a full
+// 64-bit payload, so the tag has to live somewhere else. That is a *proven*
+// property of the encoding, not a bug to be fixed: see the five round-trip
+// tests in `compact_value.rs` that pin it.
+//
+// The static fix is to stop carrying a runtime tag at all. Bytecode
+// verification already proves, at every instruction start, exactly which local
+// slots and which operand-stack slots hold an object reference, and
+// `classloading::type_maps::MethodTypeMaps` now *retains* that proof
+// (`local_oops_at` / `stack_oops_at` / `stack_depth_at`). Given the map, a slot
+// needs no tag: the GC reads the oop bit, and the interpreter reads the type
+// from the opcode it is already executing.
+//
+// `RawSlot` is the `types`-side half of that change: the untagged 8-byte slot
+// itself, plus the decoders that turn one into a `Value` when an *external*
+// type source says what it is.
+//
+// # Encoding
+//
+// A `RawSlot` is a bare `u64` with no marker bits whatsoever. The encoding is
+// identical to the *value* half of [`encode_value`]'s `(u64, u8)` SoA pair — so
+// a consumer migrating from `(vals, tags)` storage keeps its bit patterns and
+// only changes where the tag comes from:
+//
+// | Java type      | 64 bits hold                                   |
+// |----------------|------------------------------------------------|
+// | `int`          | the `i32`, zero-extended                       |
+// | `long`         | the `i64`, verbatim — **all 64 bits**          |
+// | `float`        | `f32::to_bits`, zero-extended                  |
+// | `double`       | `f64::to_bits`                                 |
+// | reference      | a **bare pointer**; `0` is `null`              |
+// | `returnAddress`| the pc, zero-extended                          |
+// | uninitialized  | `0`                                            |
+//
+// Two consequences worth stating explicitly:
+//
+// * **A `long` is bit-exact and cannot collide with anything.** The collision
+//   `CompactValue` has is structural: it must reserve bit patterns for tags out
+//   of the same 64 bits the payload needs. `RawSlot` reserves none, so
+//   `RawSlot::from_long(x).bits() == x as u64` for every `x: i64`, including the
+//   NaN-box patterns. This is the whole point.
+// * **A reference is a bare pointer, not NaN-boxed.** A moving collector
+//   updates a root with a plain store ([`RawSlot::set_oop`]) instead of
+//   re-deriving tag bits, and a `RawSlot` object slot can be compared to a heap
+//   address directly.
+//
+// # Slot width and compressed oops
+//
+// A `RawSlot` is always 8 bytes, including when compressed oops are on. Narrow
+// oops (`crate::narrow_oop`) narrow *heap* reference slots — instance fields
+// and array elements — because those are what dominate the heap footprint.
+// Frame locals and operand-stack slots are not heap slots: they are bounded by
+// stack depth, not by live-set size, and narrowing them would cost an
+// encode/decode on every `aload`/`astore` for no footprint win. Frames
+// therefore hold full 64-bit addresses regardless of the narrow-oop setting,
+// and [`RawSlot::oop`] returns a decoded, ready-to-dereference address in both
+// configurations.
+//
+// # What a consumer still needs, and what it does NOT
+//
+// `MethodTypeMaps` records **oop-vs-not** per slot, plus the operand-stack
+// depth. That is precisely, and only, what the GC root scan needs — it must
+// distinguish "reference" from "everything else" and nothing finer. So the GC
+// can consume `RawSlot` today with no further verifier work.
+//
+// It is *not* enough to reconstruct a fully-typed [`Value`] at an arbitrary pc,
+// because the maps do not distinguish `int` from `long` from `float` from
+// `double`. Every consumer that needs that distinction already has a better
+// source for it:
+//
+// * the interpreter knows from the opcode (`ladd` operates on `long`s);
+// * a call/return boundary knows from the method descriptor
+//   (see [`RawSlot::decode_by_descriptor`]);
+// * a field access knows from the field descriptor.
+//
+// A consumer that needs a typed `Value` at an *arbitrary* pc with no such
+// context — JVMTI local-variable inspection, a debugger, a heap-dump frame
+// walker — cannot be served by the current maps. Closing that requires
+// `MethodTypeMaps` to grow a 2-bit-per-slot kind table alongside the 1-bit oop
+// table (`Int32 | Int64 | Float32 | Float64`, references already covered by the
+// oop bit). That is a `classloading` change, is not required by any consumer
+// listed above, and is deliberately not attempted here — see
+// `docs/internal/arch-2026-07-26/value-repr-and-compressed-oops.md`.
+
+/// What an untagged [`RawSlot`] holds, supplied by the caller's type source
+/// (a verifier oop map, an opcode, or a descriptor) rather than by the slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SlotType {
+    Int,
+    Long,
+    Float,
+    Double,
+    /// An object reference or `null`. `null` is the all-zero bit pattern; there
+    /// is no separate `Null` slot type, because a verifier oop bit does not
+    /// distinguish the two and does not need to.
+    Reference,
+    ReturnAddress,
+    Uninitialized,
+}
+
+impl SlotType {
+    /// Whether a slot of this type is a GC root candidate.
+    #[inline(always)]
+    pub const fn is_reference(self) -> bool {
+        matches!(self, SlotType::Reference)
+    }
+
+    /// Whether this is a JVMS category-2 type (`long` / `double`).
+    ///
+    /// Note this describes the *Java* type, not the slot count: CratonVM's
+    /// operand stack gives a category-2 value **one** slot (see the index-space
+    /// table in `classloading::type_maps`), while locals give it two.
+    #[inline(always)]
+    pub const fn is_category2(self) -> bool {
+        matches!(self, SlotType::Long | SlotType::Double)
+    }
+
+    /// The `SlotType` a JVM field/parameter descriptor's first byte denotes.
+    /// `L` and `[` are references; `V` and anything unrecognised yield `None`.
+    #[inline]
+    pub const fn from_descriptor_byte(b: u8) -> Option<SlotType> {
+        Some(match b {
+            b'Z' | b'B' | b'C' | b'S' | b'I' => SlotType::Int,
+            b'J' => SlotType::Long,
+            b'F' => SlotType::Float,
+            b'D' => SlotType::Double,
+            b'L' | b'[' => SlotType::Reference,
+            _ => return None,
+        })
+    }
+}
+
+/// An **untagged** 8-byte interpreter slot.
+///
+/// See the module section above for the encoding, the compressed-oops
+/// interaction, and what a consumer must supply to decode one.
+///
+/// `repr(transparent)` over `u64`, so `Vec<RawSlot>`, `Vec<u64>` and
+/// `Vec<CompactValue>` all share one layout and the existing frame-pool
+/// `Vec<u64>` buffers can back untagged frames with no reallocation.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[repr(transparent)]
+pub struct RawSlot(u64);
+
+const _: () = assert!(std::mem::size_of::<RawSlot>() == 8);
+const _: () = assert!(std::mem::align_of::<RawSlot>() == std::mem::align_of::<u64>());
+
+impl RawSlot {
+    /// The all-zero slot: `null`, `uninitialized`, `0`, and `0.0` all share it.
+    /// Which one it *is* comes from the caller's [`SlotType`].
+    pub const ZERO: RawSlot = RawSlot(0);
+
+    // -- constructors -------------------------------------------------------
+
+    #[inline(always)]
+    pub const fn from_int(v: i32) -> Self {
+        RawSlot(v as u32 as u64)
+    }
+
+    /// Store a `long` **verbatim**. Unlike [`CompactValue::long`] this can never
+    /// alias another slot type's encoding, because `RawSlot` reserves no bits.
+    ///
+    /// [`CompactValue::long`]: crate::compact_value::CompactValue::long
+    #[inline(always)]
+    pub const fn from_long(v: i64) -> Self {
+        RawSlot(v as u64)
+    }
+
+    #[inline(always)]
+    pub const fn from_float(v: f32) -> Self {
+        RawSlot(v.to_bits() as u64)
+    }
+
+    /// Store a `double` **verbatim**, including every NaN payload.
+    /// [`CompactValue::double`] must canonicalise NaNs whose bits collide with
+    /// its tag space; `RawSlot` has no tag space, so it does not.
+    ///
+    /// [`CompactValue::double`]: crate::compact_value::CompactValue::double
+    #[inline(always)]
+    pub const fn from_double(v: f64) -> Self {
+        RawSlot(v.to_bits())
+    }
+
+    /// Store a reference as a bare address. `0` is `null`.
+    #[inline(always)]
+    pub const fn from_oop(addr: u64) -> Self {
+        RawSlot(addr)
+    }
+
+    #[inline(always)]
+    pub const fn from_return_address(pc: u32) -> Self {
+        RawSlot(pc as u64)
+    }
+
+    #[inline(always)]
+    pub const fn from_bits(bits: u64) -> Self {
+        RawSlot(bits)
+    }
+
+    // -- accessors ----------------------------------------------------------
+
+    #[inline(always)]
+    pub const fn bits(self) -> u64 {
+        self.0
+    }
+
+    #[inline(always)]
+    pub const fn as_int(self) -> i32 {
+        self.0 as i32
+    }
+
+    #[inline(always)]
+    pub const fn as_long(self) -> i64 {
+        self.0 as i64
+    }
+
+    #[inline(always)]
+    pub fn as_float(self) -> f32 {
+        f32::from_bits(self.0 as u32)
+    }
+
+    #[inline(always)]
+    pub fn as_double(self) -> f64 {
+        f64::from_bits(self.0)
+    }
+
+    #[inline(always)]
+    pub const fn as_return_address(self) -> u32 {
+        self.0 as u32
+    }
+
+    // -- GC interface -------------------------------------------------------
+
+    /// The heap address this slot roots, or `None` for `null`.
+    ///
+    /// **This is the GC root-scan entry point, and it is deliberately not
+    /// heuristic.** The caller has already proven the slot is a reference by
+    /// consulting `MethodTypeMaps::local_oops_at` / `stack_oops_at`, so this
+    /// performs none of the guesswork the tagged decoders are forced into:
+    ///
+    /// * no [`plausible_heap_pointer`] filter — a proven reference does not
+    ///   need one, and applying it would silently drop a legitimate root that
+    ///   happened to look odd;
+    /// * no provenance-bitmap probe ([`object_ref_payload_is_known`], two
+    ///   dependent loads plus a bit test, on a 2 MiB-per-GiB table that is a
+    ///   near-guaranteed cache miss in a root scan);
+    /// * no degradation counting, because there is nothing to degrade *to* —
+    ///   the alternative reading of these bits does not exist.
+    ///
+    /// Removing those three is the actual throughput argument for untagged
+    /// slots, over and above deleting the `kinds` byte per slot.
+    ///
+    /// A `debug_assert!` still catches a caller that passes a non-reference
+    /// slot (or a corrupt one) during development.
+    #[inline(always)]
+    pub fn oop(self) -> Option<u64> {
+        if self.0 == 0 {
+            return None;
+        }
+        debug_assert!(
+            plausible_heap_pointer(self.0),
+            "RawSlot::oop on a slot the verifier map called a reference, but \
+             whose bits {:#x} cannot be a heap address — the oop map and the \
+             frame have drifted out of sync",
+            self.0
+        );
+        Some(self.0)
+    }
+
+    /// Repoint a root after a moving collector relocates its target.
+    ///
+    /// A plain store: there are no tag bits to preserve. The `CompactValue`
+    /// counterpart (`update_object_ptr`) has to rebuild the NaN box and can
+    /// fail; this cannot.
+    #[inline(always)]
+    pub fn set_oop(&mut self, addr: u64) {
+        debug_assert!(
+            addr == 0 || plausible_heap_pointer(addr),
+            "RawSlot::set_oop with a non-heap address {addr:#x}"
+        );
+        self.0 = addr;
+    }
+
+    // -- typed decode / encode ----------------------------------------------
+
+    /// Reconstruct a [`Value`], given the type from the caller's type source.
+    ///
+    /// For [`SlotType::Reference`] this is the one place a bare address becomes
+    /// an `ObjectRef`, so it keeps the cheap pure-bit-ops
+    /// [`plausible_heap_pointer`] guard: `ObjectRef::from_raw` is `unsafe` and
+    /// its result is handed to code that will dereference it, so a corrupt
+    /// frame must degrade to `null` rather than fabricate a wild pointer. The
+    /// guard costs three ALU ops and no memory traffic — unlike the provenance
+    /// bitmap, which is what this path drops.
+    #[inline]
+    pub fn decode(self, ty: SlotType) -> Value {
+        match ty {
+            SlotType::Int => Value::Int(self.0 as i32),
+            SlotType::Long => Value::Long(self.0 as i64),
+            SlotType::Float => Value::Float(f32::from_bits(self.0 as u32)),
+            SlotType::Double => Value::Double(f64::from_bits(self.0)),
+            SlotType::Reference => {
+                if self.0 == 0 {
+                    Value::Object(None)
+                } else if plausible_heap_pointer(self.0) {
+                    // SAFETY: non-null, 8-byte aligned, above the null guard
+                    // page and within 47 bits. The verifier proved this slot is
+                    // a reference; the guard above rejects a frame that has been
+                    // corrupted out from under that proof.
+                    Value::Object(Some(unsafe { ObjectRef::from_raw(self.0 as *mut u8) }))
+                } else {
+                    cold_decode_degraded_object_ptr(self.0 as *mut u8)
+                }
+            }
+            SlotType::ReturnAddress => Value::ReturnAddress(self.0 as u32),
+            SlotType::Uninitialized => Value::Uninitialized,
+        }
+    }
+
+    /// Decode using a JVM descriptor's first byte as the type source — the
+    /// call/return boundary case, where the descriptor is the authority and no
+    /// oop map is consulted. Unrecognised bytes (including `V`) yield
+    /// [`Value::Uninitialized`].
+    #[inline]
+    pub fn decode_by_descriptor(self, desc_byte: u8) -> Value {
+        match SlotType::from_descriptor_byte(desc_byte) {
+            Some(ty) => self.decode(ty),
+            None => Value::Uninitialized,
+        }
+    }
+
+    /// Split a [`Value`] into its untagged bits and the type a consumer must
+    /// later supply to read them back. The inverse of [`RawSlot::decode`].
+    ///
+    /// `Value::Object(None)` encodes as `(ZERO, Reference)`, not a distinct
+    /// null type — matching what a verifier oop bit can express.
+    #[inline]
+    pub fn encode(v: Value) -> (RawSlot, SlotType) {
+        match v {
+            Value::Int(i) => (RawSlot::from_int(i), SlotType::Int),
+            Value::Long(l) => (RawSlot::from_long(l), SlotType::Long),
+            Value::Float(f) => (RawSlot::from_float(f), SlotType::Float),
+            Value::Double(d) => (RawSlot::from_double(d), SlotType::Double),
+            Value::Object(Some(r)) => (RawSlot(r.as_ptr() as u64), SlotType::Reference),
+            Value::Object(None) => (RawSlot::ZERO, SlotType::Reference),
+            Value::ReturnAddress(a) => (RawSlot::from_return_address(a), SlotType::ReturnAddress),
+            Value::Uninitialized => (RawSlot::ZERO, SlotType::Uninitialized),
+        }
+    }
+
+    // -- migration bridge ---------------------------------------------------
+
+    /// Convert to the tagged [`CompactValue`] the frame uses today.
+    ///
+    /// Lets a consumer migrate one array at a time: a frame can hold `RawSlot`
+    /// locals while its operand stack is still `CompactValue`, or vice versa.
+    ///
+    /// [`CompactValue`]: crate::compact_value::CompactValue
+    #[inline]
+    pub fn to_compact(self, ty: SlotType) -> crate::compact_value::CompactValue {
+        use crate::compact_value::CompactValue;
+        match ty {
+            SlotType::Int => CompactValue::int(self.0 as i32),
+            SlotType::Long => CompactValue::long(self.0 as i64),
+            SlotType::Float => CompactValue::float(f32::from_bits(self.0 as u32)),
+            SlotType::Double => CompactValue::double(f64::from_bits(self.0)),
+            SlotType::Reference => {
+                if self.0 != 0 && plausible_heap_pointer(self.0) {
+                    CompactValue::object(self.0)
+                } else {
+                    CompactValue::null()
+                }
+            }
+            SlotType::ReturnAddress => CompactValue::return_address(self.0 as u32),
+            SlotType::Uninitialized => CompactValue::uninitialized(),
+        }
+    }
+
+    /// Convert from the tagged [`CompactValue`], using the caller's type source
+    /// rather than the value's own (ambiguous for `long`/`double`) tag.
+    ///
+    /// [`CompactValue`]: crate::compact_value::CompactValue
+    #[inline]
+    pub fn from_compact(cv: crate::compact_value::CompactValue, ty: SlotType) -> RawSlot {
+        match ty {
+            // A `long` in a CompactValue is stored verbatim as raw bits.
+            SlotType::Long => RawSlot(cv.as_long_bits_unchecked() as u64),
+            SlotType::Double => RawSlot(cv.raw_bits()),
+            SlotType::Int => RawSlot::from_int(cv.as_int().unwrap_or(0)),
+            SlotType::Float => RawSlot::from_float(cv.as_float().unwrap_or(0.0)),
+            SlotType::Reference => RawSlot(cv.as_object_ptr().unwrap_or(0)),
+            SlotType::ReturnAddress => {
+                RawSlot::from_return_address(cv.as_return_address().unwrap_or(0))
+            }
+            SlotType::Uninitialized => RawSlot::ZERO,
+        }
+    }
+}
+
+impl fmt::Debug for RawSlot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Untagged by construction: printing a type would be a lie.
+        write!(f, "RawSlot({:#018x})", self.0)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Layout invariants (owned by `types` since `Value` is defined here)
 // ---------------------------------------------------------------------------
 //
@@ -1253,6 +1671,310 @@ mod tests {
         let errs = [r_a, r_b];
         let err = errs.iter().find(|r| r.is_err()).unwrap();
         assert_eq!(*err, Err(recorded));
+    }
+
+    // ------------------------------------------------------------------
+    // RawSlot — untagged, verifier-map-driven slots
+    // ------------------------------------------------------------------
+
+    /// The property that motivates the whole design. `CompactValue::int(0)` and
+    /// `CompactValue::long(0xFFFC_0000_0000_0000)` are bit-identical, so a
+    /// tagged 8-byte slot cannot tell them apart without a side array. Untagged
+    /// slots carry no tag bits at all, so they are *supposed* to be
+    /// indistinguishable — and both decode correctly once the type comes from
+    /// the caller.
+    #[test]
+    fn rawslot_int_and_colliding_long_share_bits_but_decode_correctly() {
+        let collide: i64 = 0xFFFC_0000_0000_0000u64 as i64;
+
+        let as_long = RawSlot::from_long(collide);
+        let as_int = RawSlot::from_int(0);
+
+        // The bit patterns genuinely differ here (a long keeps all 64 bits, an
+        // int zero-extends 32), which is already better than the NaN-boxed
+        // case — but that is incidental. What matters is the next assertion.
+        assert_eq!(as_long.bits(), 0xFFFC_0000_0000_0000);
+        assert_eq!(as_int.bits(), 0);
+
+        // With the type supplied externally, both round-trip exactly.
+        assert_eq!(as_long.decode(SlotType::Long), Value::Long(collide));
+        assert_eq!(as_int.decode(SlotType::Int), Value::Int(0));
+    }
+
+    /// The stronger statement: for EVERY `i64`, the untagged bits are the value
+    /// verbatim, so no long can ever be mistaken for anything. This is exactly
+    /// what `CompactValue` cannot promise, and it is why the `kinds` side array
+    /// becomes removable.
+    #[test]
+    fn rawslot_long_is_bit_exact_for_every_tag_pattern() {
+        let hostile: [i64; 12] = [
+            0,
+            -1,
+            i64::MIN,
+            i64::MAX,
+            0xFFFC_0000_0000_0000u64 as i64, // the NaN-box marker pattern
+            0xFFFD_0000_0000_0000u64 as i64, // BouncyCastle LongArray lxor shape
+            0xFFFE_0000_0000_0000u64 as i64,
+            0xFFFF_FFFF_FFFF_FFF8u64 as i64,
+            0x7FF8_0000_0000_0000u64 as i64, // canonical quiet NaN bits
+            0x0000_5555_7777_8000u64 as i64, // looks exactly like a heap pointer
+            1,
+            -1234567890123456789,
+        ];
+        for v in hostile {
+            let s = RawSlot::from_long(v);
+            assert_eq!(s.bits(), v as u64, "long {v:#x} did not store verbatim");
+            assert_eq!(s.as_long(), v);
+            assert_eq!(s.decode(SlotType::Long), Value::Long(v));
+        }
+    }
+
+    /// Every primitive slot type round-trips through `encode`/`decode`.
+    #[test]
+    fn rawslot_encode_decode_round_trip() {
+        let cases = [
+            Value::Int(0),
+            Value::Int(-1),
+            Value::Int(i32::MIN),
+            Value::Int(i32::MAX),
+            Value::Long(0),
+            Value::Long(i64::MIN),
+            Value::Float(0.0),
+            Value::Float(-1.5),
+            Value::Float(f32::MIN),
+            Value::Double(0.0),
+            Value::Double(3.141_592_653_589_793),
+            Value::Double(f64::MAX),
+            Value::Object(None),
+            Value::ReturnAddress(0),
+            Value::ReturnAddress(u32::MAX),
+            Value::Uninitialized,
+        ];
+        for v in cases {
+            let (slot, ty) = RawSlot::encode(v);
+            assert_eq!(slot.decode(ty), v, "{v:?} did not round-trip");
+        }
+    }
+
+    /// `RawSlot` stores a double verbatim — including NaN payloads that
+    /// `CompactValue::double` is forced to canonicalise into the hardware quiet
+    /// NaN because they collide with its tag space.
+    #[test]
+    fn rawslot_preserves_nan_payloads_compactvalue_must_canonicalise() {
+        // A NaN whose bits set the NaN-box marker; CompactValue rewrites it.
+        let exotic = f64::from_bits(0xFFFC_0000_0000_0001);
+        assert!(exotic.is_nan());
+
+        let compact = crate::compact_value::CompactValue::double(exotic);
+        assert_ne!(
+            compact.raw_bits(),
+            0xFFFC_0000_0000_0001,
+            "CompactValue is expected to canonicalise this NaN"
+        );
+
+        let raw = RawSlot::from_double(exotic);
+        assert_eq!(raw.bits(), 0xFFFC_0000_0000_0001);
+        assert!(raw.as_double().is_nan());
+    }
+
+    /// A reference slot holds a bare pointer; `oop()` is a plain read and
+    /// `set_oop` a plain store, which is what lets a moving collector relocate a
+    /// root without rebuilding tag bits.
+    #[test]
+    fn rawslot_reference_is_a_bare_pointer() {
+        let addr = 0x0000_5555_7777_8000u64;
+        let mut slot = RawSlot::from_oop(addr);
+        assert_eq!(slot.bits(), addr, "reference must NOT be NaN-boxed");
+        assert_eq!(slot.oop(), Some(addr));
+
+        // Relocation.
+        let moved = 0x0000_5555_7777_9000u64;
+        slot.set_oop(moved);
+        assert_eq!(slot.oop(), Some(moved));
+        assert_eq!(slot.bits(), moved);
+
+        // Null.
+        let null = RawSlot::from_oop(0);
+        assert_eq!(null.oop(), None);
+        assert_eq!(null.decode(SlotType::Reference), Value::Object(None));
+        assert_eq!(RawSlot::ZERO, null);
+    }
+
+    /// `decode(Reference)` must never fabricate an `ObjectRef` from bits that
+    /// cannot be a heap address, even though the verifier map claimed the slot
+    /// is a reference — a corrupt frame degrades to null instead of producing a
+    /// wild pointer that the caller would dereference.
+    #[test]
+    fn rawslot_decode_reference_degrades_implausible_bits() {
+        for bad in [1u64, 4, 0xFFF, (1u64 << 47) | 8] {
+            let slot = RawSlot::from_bits(bad);
+            assert_eq!(
+                slot.decode(SlotType::Reference),
+                Value::Object(None),
+                "implausible pointer {bad:#x} must degrade to null"
+            );
+        }
+    }
+
+    /// Unlike `decode_value`, the untagged reference decode does NOT consult the
+    /// provenance bitmap: a pointer that never crossed `ObjectRef::from_raw` is
+    /// still decoded, because the verifier map — not a heuristic — is the
+    /// authority. Dropping that probe is the throughput argument for untagged
+    /// slots, so pin it.
+    #[test]
+    fn rawslot_decode_reference_needs_no_provenance_record() {
+        // Deliberately an address this process has never constructed an
+        // ObjectRef for. Plausible (aligned, above the guard page, < 2^47) but
+        // unknown to the provenance bitmap.
+        let never_seen = 0x0000_4242_4242_4000u64;
+        assert!(
+            !object_ref_payload_is_known(never_seen),
+            "test precondition: this address must be unrecorded"
+        );
+
+        // The tagged SoA decoder rejects it...
+        assert_eq!(
+            decode_value(never_seen, VTAG_OBJECT),
+            Value::Object(None),
+            "decode_value is expected to reject an unrecorded pointer"
+        );
+
+        // ...the untagged decoder accepts it, on the verifier's authority.
+        match RawSlot::from_oop(never_seen).decode(SlotType::Reference) {
+            Value::Object(Some(r)) => assert_eq!(r.as_ptr() as u64, never_seen),
+            other => panic!("expected an object reference, got {other:?}"),
+        }
+        assert_eq!(RawSlot::from_oop(never_seen).oop(), Some(never_seen));
+    }
+
+    /// The migration bridge: a frame can be half-converted, so `RawSlot` and
+    /// `CompactValue` must agree on every value they can both represent.
+    #[test]
+    fn rawslot_compact_value_bridge_round_trips() {
+        let cases: [(RawSlot, SlotType); 9] = [
+            (RawSlot::from_int(-7), SlotType::Int),
+            (RawSlot::from_int(i32::MIN), SlotType::Int),
+            (RawSlot::from_long(i64::MIN), SlotType::Long),
+            (
+                RawSlot::from_long(0xFFFC_0000_0000_0000u64 as i64),
+                SlotType::Long,
+            ),
+            (RawSlot::from_float(-2.5), SlotType::Float),
+            (RawSlot::from_double(1.25), SlotType::Double),
+            (RawSlot::from_oop(0), SlotType::Reference),
+            (RawSlot::from_return_address(99), SlotType::ReturnAddress),
+            (RawSlot::ZERO, SlotType::Uninitialized),
+        ];
+        for (slot, ty) in cases {
+            let compact = slot.to_compact(ty);
+            let back = RawSlot::from_compact(compact, ty);
+            assert_eq!(back, slot, "{slot:?} as {ty:?} did not survive the bridge");
+        }
+
+        // A non-null reference needs a plausible address for CompactValue's
+        // (release-active) constructor assertions.
+        let addr = 0x0000_5555_7777_8000u64;
+        let slot = RawSlot::from_oop(addr);
+        let compact = slot.to_compact(SlotType::Reference);
+        assert_eq!(compact.as_object_ptr(), Some(addr));
+        assert_eq!(RawSlot::from_compact(compact, SlotType::Reference), slot);
+    }
+
+    /// `RawSlot` must stay layout-identical to `u64` / `CompactValue` so the
+    /// existing frame-pool `Vec<u64>` buffers can back untagged frames and the
+    /// three GC scanners that transmute `Vec<u64> <-> Vec<CompactValue>` keep
+    /// working during the migration.
+    #[test]
+    fn rawslot_is_layout_compatible_with_u64_and_compact_value() {
+        use crate::compact_value::CompactValue;
+        assert_eq!(std::mem::size_of::<RawSlot>(), std::mem::size_of::<u64>());
+        assert_eq!(std::mem::align_of::<RawSlot>(), std::mem::align_of::<u64>());
+        assert_eq!(
+            std::mem::size_of::<RawSlot>(),
+            std::mem::size_of::<CompactValue>()
+        );
+
+        let v: [RawSlot; 2] = [RawSlot::from_long(-1), RawSlot::from_int(5)];
+        // SAFETY: RawSlot is repr(transparent) over u64 with identical size and
+        // alignment, so a slice of one reinterprets as a slice of the other —
+        // the same property the frame pool relies on for Vec<u64> reuse.
+        let as_u64: &[u64] =
+            unsafe { std::slice::from_raw_parts(v.as_ptr().cast::<u64>(), v.len()) };
+        assert_eq!(as_u64, &[u64::MAX, 5]);
+    }
+
+    /// Descriptor-driven decode, the call/return-boundary type source.
+    #[test]
+    fn rawslot_decode_by_descriptor() {
+        assert_eq!(
+            RawSlot::from_int(1).decode_by_descriptor(b'Z'),
+            Value::Int(1)
+        );
+        assert_eq!(
+            RawSlot::from_int(-1).decode_by_descriptor(b'I'),
+            Value::Int(-1)
+        );
+        assert_eq!(
+            RawSlot::from_long(i64::MIN).decode_by_descriptor(b'J'),
+            Value::Long(i64::MIN)
+        );
+        assert_eq!(
+            RawSlot::from_double(0.5).decode_by_descriptor(b'D'),
+            Value::Double(0.5)
+        );
+        assert_eq!(
+            RawSlot::from_oop(0).decode_by_descriptor(b'L'),
+            Value::Object(None)
+        );
+        assert_eq!(
+            RawSlot::from_oop(0).decode_by_descriptor(b'['),
+            Value::Object(None)
+        );
+        // `V` and junk are not slot types.
+        assert_eq!(
+            RawSlot::ZERO.decode_by_descriptor(b'V'),
+            Value::Uninitialized
+        );
+        assert_eq!(
+            RawSlot::ZERO.decode_by_descriptor(b'?'),
+            Value::Uninitialized
+        );
+    }
+
+    #[test]
+    fn slot_type_classification() {
+        assert!(SlotType::Reference.is_reference());
+        assert!(!SlotType::Long.is_reference());
+        assert!(SlotType::Long.is_category2());
+        assert!(SlotType::Double.is_category2());
+        assert!(!SlotType::Int.is_category2());
+        assert!(!SlotType::Reference.is_category2());
+
+        assert_eq!(SlotType::from_descriptor_byte(b'J'), Some(SlotType::Long));
+        assert_eq!(SlotType::from_descriptor_byte(b'C'), Some(SlotType::Int));
+        assert_eq!(
+            SlotType::from_descriptor_byte(b'['),
+            Some(SlotType::Reference)
+        );
+        assert_eq!(SlotType::from_descriptor_byte(b'V'), None);
+    }
+
+    /// A `RawSlot` is 8 bytes in both narrow-oop configurations: frame slots are
+    /// not heap slots and are never narrowed. Pins the interaction so a future
+    /// compressed-oops change cannot silently narrow the interpreter's frames.
+    #[test]
+    fn rawslot_width_is_independent_of_compressed_oops() {
+        assert_eq!(std::mem::size_of::<RawSlot>(), 8);
+        // Heap reference slots do vary; frame slots must not.
+        assert!(
+            crate::narrow_oop::ref_field_size() == 4 || crate::narrow_oop::ref_field_size() == 8
+        );
+        let addr = 0x0000_5555_7777_8000u64;
+        assert_eq!(
+            RawSlot::from_oop(addr).oop(),
+            Some(addr),
+            "RawSlot holds a decoded 64-bit address regardless of narrow oops"
+        );
     }
 
     #[test]

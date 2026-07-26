@@ -472,6 +472,29 @@ impl SharedVm {
     pub fn new(mut config: VmConfig) -> Self {
         apply_container_default_heap(&mut config);
 
+        // ── Publish the crash-report facts that only the config knows ──────
+        //
+        // The launcher prints the JDK mode on its own paths (`-version`, panic
+        // hook, fatal-error arm), but the hardware-fault handler bypasses all
+        // of them, and the embedding entry points (`libcratonvm`,
+        // `cratonvm-embed`) have no launcher at all. `SharedVm::new` is the one
+        // place every boot passes through *and* the config is in scope, so the
+        // publication happens here, before anything can fault.
+        //
+        // Both cells are one-shot and lock-free; see the `VM diagnostic
+        // snapshot` section in `runtime::crash_handler` and
+        // `docs/internal/arch-2026-07-26/jdk-mode-determinism.md` §6.1.
+        crate::runtime::crash_handler::publish_jdk_mode(
+            config.jdk_mode(),
+            config.java_home.as_deref(),
+        );
+        crate::runtime::crash_handler::publish_gc_algorithm(match config.gc_algorithm {
+            crate::config::GcAlgorithm::Generational => "generational",
+            crate::config::GcAlgorithm::G1 => "g1",
+            #[cfg(feature = "zgc")]
+            crate::config::GcAlgorithm::Zgc => "zgc",
+        });
+
         // Compact tagless field layouts are a VM-wide contract. Generational,
         // G1, and ZGC now share the same allocation predicate, field encoding,
         // oop-map scan, and relocation fixup; no collector-specific opt-out is
@@ -561,7 +584,40 @@ impl SharedVm {
             config.ext_classpath.clone()
         };
 
+        // ── Boot-phase timing ──────────────────────────────────────────────
+        //
+        // Startup is a headline JVM metric and it had no instrumentation at
+        // all: the only way to find out where `SharedVm::new` spent its time
+        // was to add `Instant::now()` by hand and rebuild. The three phases
+        // below are the ones measurement showed actually matter (see
+        // `docs/internal/arch-2026-07-26/startup-and-diagnostics.md` §2):
+        //
+        //   1. classpath ingestion — `ClassManager::new` constructs the
+        //      bootstrap/extension/application `ClassPath`s, and `load_jmod`
+        //      *eagerly inflates every `classes/` entry of every `.jmod` into
+        //      an in-memory map*. `discover_boot_classpath` puts ALL of
+        //      `$JAVA_HOME/jmods` on the boot classpath, so on a stock JDK 25
+        //      this is ~28,000 class entries / ~136 MB of decompressed
+        //      bytecode before a single Java class is loaded. This dominates.
+        //   2. `bootstrap_core_classes` — ~323 named classes plus their
+        //      recursive supertypes, parsed and linked before `main`.
+        //   3. native registration — the `register_*` cascade.
+        //
+        // Emitted through `tracing` (the same channel the surrounding
+        // boot-classpath log already uses), so it costs one `Instant::now()`
+        // per phase and needs no new flag to be useful under `-verbose`/
+        // `RUST_LOG`. Keep these three spans intact: a regression here is
+        // otherwise invisible until someone notices the VM "feels slow".
+        let __boot_t0 = std::time::Instant::now();
         let mut class_manager = ClassManager::new(&boot_cp, &ext_cp, &config.classpath);
+        let __boot_classpath_elapsed = __boot_t0.elapsed();
+        tracing::info!(
+            "boot phase 1/3 classpath ingestion: {:?} ({} boot entries, {} ext, {} app)",
+            __boot_classpath_elapsed,
+            boot_cp.len(),
+            ext_cp.len(),
+            config.classpath.len(),
+        );
 
         // If module registry is empty after scan but we have a real JDK,
         // manually register java.base as a fallback (Session 14).
@@ -624,13 +680,26 @@ impl SharedVm {
 
         // If a real JDK is on the boot classpath, pre-load core classes so their
         // bytecode methods take priority over native registrations (Phase 33).
+        let __boot_t1 = std::time::Instant::now();
         let bootstrapped = class_manager.bootstrap_core_classes();
+        let __boot_core_classes_elapsed = __boot_t1.elapsed();
         if bootstrapped > 0 {
             tracing::info!(
                 "JDK bootstrap: {} core classes loaded from boot classpath",
                 bootstrapped
             );
         }
+        // Reports the *total* loaded count, not just the named list: each of
+        // the ~323 names in `bootstrap_core_classes` recursively drags in its
+        // supertypes and interfaces, so "how many classes are loaded before
+        // main" is the second number, not the first.
+        tracing::info!(
+            "boot phase 2/3 core-class bootstrap: {:?} ({} named classes resolved to real \
+             bytecode, {} classes in the ClassStore)",
+            __boot_core_classes_elapsed,
+            bootstrapped,
+            class_manager.loaded_count(),
+        );
 
         // C25: Pre-register synthetic stub classes used by native-builtins so
         // that allocations via `alloc_concurrent_synthetic` carry a valid
@@ -933,6 +1002,7 @@ impl SharedVm {
         // Reset the ClassValue memoization cache (BUG-W) for the same reason.
         cratonvm_native_builtins::phases_late::reset_classvalue_cache();
 
+        let __boot_t2 = std::time::Instant::now();
         let mut native_methods = NativeMethodRegistry::new();
         #[cfg(feature = "synthetic-jdk")]
         {
@@ -2389,6 +2459,22 @@ impl SharedVm {
         // The real-JDK platform-server bridge needs its interface methods.
         cratonvm_native_builtins::jmx::register_mbean_server(&mut native_methods);
 
+        // Phase 3 closes here — `register_mbean_server` above is the LAST
+        // `register_*` call before the registry is moved into `Self`, so
+        // `native_methods.len()` is the true boot registration count for
+        // whichever arm of the two mode `cfg` blocks was compiled in. That
+        // count is the honest answer to "is real-JDK mode really ~300
+        // natives?" (it is not — see
+        // `docs/internal/arch-2026-07-26/startup-and-diagnostics.md` §2.5).
+        // Note the registry pre-sizes four maps to 4,096 entries
+        // unconditionally (`NativeMethodRegistry::new`), i.e. independently of
+        // mode; that is one bounded allocation, not per-native work.
+        tracing::info!(
+            "boot phase 3/3 native registration: {:?} ({} natives registered)",
+            __boot_t2.elapsed(),
+            native_methods.len(),
+        );
+
         let vm = Self {
             vm_identity: NEXT_VM_IDENTITY.fetch_add(1, Ordering::Relaxed),
             config,
@@ -2683,6 +2769,20 @@ impl SharedVm {
         // perfectly safe for unit tests that construct a SharedVm
         // outside an Arc.
         crate::runtime::jvmti::fire_vm_init();
+
+        // Boot-cost summary. `SharedVm::new` is only part of startup — the
+        // launcher still has to run `System.initPhase1/2/3` and load the
+        // application's own classes after this returns — but it is the part
+        // that is fixed cost for every run, so a regression in it is a
+        // regression for every workload. The three phase lines above break the
+        // total down; this line is what a `RUST_LOG=info` run can be grepped
+        // for to compare two builds.
+        tracing::info!(
+            "boot: SharedVm::new total {:?} (phase 1 classpath {:?}, phase 2 core classes {:?})",
+            __boot_t0.elapsed(),
+            __boot_classpath_elapsed,
+            __boot_core_classes_elapsed,
+        );
 
         vm
     }
@@ -4853,6 +4953,16 @@ impl Vm {
             .threads
             .thread_registry
             .set_frame_trace(ThreadId(0), main_thread.frame_trace.clone());
+        // Same handle to the crash handler, which cannot take the thread
+        // registry's lock (the faulting thread may already hold it). This is
+        // what puts Java frames — not just native ones — into an `hs_err`
+        // report for the thread most crashes happen on. Worker threads need
+        // the equivalent publication at their own registration sites; see the
+        // cross-owner request in
+        // `docs/internal/arch-2026-07-26/startup-and-diagnostics.md`.
+        crate::runtime::crash_handler::publish_primordial_frame_trace(
+            main_thread.frame_trace.clone(),
+        );
         shared
             .threads
             .thread_registry

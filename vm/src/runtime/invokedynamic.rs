@@ -68,6 +68,31 @@ const BOOTSTRAP: &str = "bootstrap";
 /// Apache Groovy's invokedynamic bootstrap class.
 const GROOVY_INDY_INTERFACE: &str = "org/codehaus/groovy/vmplugin/v8/IndyInterface";
 
+/// Cached read of a `CRATONVM_DBG_*` env var.
+///
+/// `std::env::var_os` is a `getenv` mutex + `OsString` allocation on Linux and a
+/// ~500 ns `GetEnvironmentVariableW` syscall plus a UTF-16 decode on Windows.
+/// Two of the three flags below sat on genuinely hot paths:
+/// `CRATONVM_DBG_INDY_GENERIC` is read on **every execution** of a generic
+/// (non-JDK-factory) `invokedynamic` — which is every Groovy / JRuby / Kotlin
+/// call site — and `CRATONVM_DBG_LAMBDA_DISPATCH` on every lambda bootstrap.
+/// Same process-lifetime caching policy as
+/// [`crate::runtime::env_cache`] and `runtime::exceptions`: setting the
+/// variable after the first read has no effect.
+macro_rules! cached_env_flag {
+    ($name:ident, $env:literal) => {
+        #[inline]
+        fn $name() -> bool {
+            static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *CACHE.get_or_init(|| std::env::var_os($env).is_some())
+        }
+    };
+}
+
+cached_env_flag!(dbg_indy_all, "CRATONVM_DBG_INDY_ALL");
+cached_env_flag!(dbg_indy_generic, "CRATONVM_DBG_INDY_GENERIC");
+cached_env_flag!(dbg_lambda_dispatch, "CRATONVM_DBG_LAMBDA_DISPATCH");
+
 /// Groovy call-site name for a coercion (`cast:(Object)Z`, `cast:(Object)I`, …).
 const GROOVY_CAST: &str = "cast";
 
@@ -211,7 +236,7 @@ pub fn execute_invokedynamic(
         }
     }; // cm read lock dropped here
 
-    if std::env::var_os("CRATONVM_DBG_INDY_ALL").is_some() {
+    if dbg_indy_all() {
         let caller_name = {
             let cm = shared.classes.class_manager.read();
             cm.get_class(current_class_id)
@@ -240,7 +265,14 @@ pub fn execute_invokedynamic(
             .write()
             .put_call_site(current_class_id, cp_index, site);
 
-        execute_string_concat(shared, thread, frame_idx, &info)
+        execute_string_concat(
+            shared,
+            thread,
+            frame_idx,
+            &info.recipe,
+            info.constant_args.as_slice(),
+            &info.target_descriptor,
+        )
     } else if info.bsm_class == STRING_CONCAT_FACTORY && info.bsm_method == MAKE_CONCAT {
         // makeConcat has no recipe — all arguments are simply concatenated in order.
         // Synthesize a recipe of all \u{0001} placeholders so the existing concat
@@ -249,20 +281,11 @@ pub fn execute_invokedynamic(
         let synthetic_recipe: String = std::iter::repeat('\u{0001}')
             .take(arg_types.len())
             .collect();
-        let patched_info = IndyInfo {
-            bsm_class: info.bsm_class.clone(),
-            bsm_method: info.bsm_method.clone(),
-            target_name: info.target_name.clone(),
-            target_descriptor: info.target_descriptor.clone(),
-            recipe: synthetic_recipe.clone(),
-            constant_args: vec![],
-            bootstrap_arg_indices: info.bootstrap_arg_indices.clone(),
-        };
 
         let site = ResolvedCallSite::StringConcat {
-            recipe: Arc::from(synthetic_recipe),
+            recipe: Arc::from(synthetic_recipe.as_str()),
             constant_args: vec![],
-            target_descriptor: Arc::from(info.target_descriptor.clone()),
+            target_descriptor: Arc::from(info.target_descriptor.as_str()),
         };
         shared
             .classes
@@ -270,7 +293,19 @@ pub fn execute_invokedynamic(
             .write()
             .put_call_site(current_class_id, cp_index, site);
 
-        execute_string_concat(shared, thread, frame_idx, &patched_info)
+        // A synthesized all-argument recipe is U+0001 repeated, so it holds no
+        // TAG_CONST (U+0002) placeholders and the constant list is empty. The
+        // whole-`IndyInfo` clone (`patched_info`) this branch used to build was
+        // only ever read for the three values passed below.
+        const NO_CONSTANTS: &[&str] = &[];
+        execute_string_concat(
+            shared,
+            thread,
+            frame_idx,
+            &synthetic_recipe,
+            NO_CONSTANTS,
+            &info.target_descriptor,
+        )
     } else if info.bsm_class == LAMBDA_METAFACTORY
         && (info.bsm_method == METAFACTORY || info.bsm_method == ALT_METAFACTORY)
     {
@@ -692,7 +727,7 @@ fn bootstrap_generic(
     }
 
     // --- Invoke the bootstrap method → CallSite. ---
-    let dbg = std::env::var_os("CRATONVM_DBG_INDY_GENERIC").is_some();
+    let dbg = dbg_indy_generic();
     if dbg {
         eprintln!(
             "[indy-generic] bootstrap {bsm_class}.{bsm_method} target={}{} bsm_args_len={}",
@@ -912,18 +947,14 @@ fn execute_cached_call_site(
             recipe,
             constant_args,
             target_descriptor,
-        } => {
-            let info = IndyInfo {
-                bsm_class: String::new(),
-                bsm_method: String::new(),
-                target_name: String::new(),
-                target_descriptor: target_descriptor.to_string(),
-                recipe: recipe.to_string(),
-                constant_args: constant_args.iter().map(|s| s.to_string()).collect(),
-                bootstrap_arg_indices: vec![],
-            };
-            execute_string_concat(shared, thread, frame_idx, &info)
-        }
+        } => execute_string_concat(
+            shared,
+            thread,
+            frame_idx,
+            recipe,
+            constant_args.as_slice(),
+            target_descriptor,
+        ),
         ResolvedCallSite::Lambda(lcs) => execute_cached_lambda(shared, thread, frame_idx, lcs),
         ResolvedCallSite::TypeSwitch { labels } => {
             execute_type_switch(shared, thread, frame_idx, labels)
@@ -1026,7 +1057,7 @@ fn bootstrap_lambda(
         .read()
         .get_loaded_class_id_for_requester(&functional_interface, host_loader);
 
-    if std::env::var_os("CRATONVM_DBG_LAMBDA_DISPATCH").is_some() {
+    if dbg_lambda_dispatch() {
         eprintln!(
             "[DBG_LAMBDA] bootstrap host={:?} loader={:?} iface={} resolved_id={:?}",
             current_class_id, host_loader, functional_interface, functional_interface_id
@@ -1361,13 +1392,29 @@ pub fn resolve_method_handle_full(
 /// Execute StringConcatFactory.makeConcatWithConstants.
 ///
 /// Called after the class_manager read lock has been released.
-fn execute_string_concat(
+/// Execute a `StringConcatFactory` call site.
+///
+/// Takes the three pieces it actually needs as **borrowed** data rather than an
+/// `&IndyInfo`. That is not cosmetic: this is the hottest cached
+/// `invokedynamic` shape in the VM (every `"a" + b` in every logging call,
+/// `toString()`, and exception message), and the cached fast path used to
+/// rebuild a whole `IndyInfo` per execution — `recipe.to_string()` +
+/// `target_descriptor.to_string()` + a `Vec<String>` re-allocating **every**
+/// constant arg — purely to convert the cached `Arc<str>`s into the `String`s
+/// this signature demanded. That was `2 + N` heap allocations plus a `Vec` on
+/// every single string concatenation, all of it discarded microseconds later.
+/// Generic over `S: AsRef<str>` so the cached path can pass its
+/// `&[Arc<str>]` and the bootstrap path its `&[String]` with no conversion at
+/// all.
+fn execute_string_concat<S: AsRef<str>>(
     shared: &SharedVm,
     thread: &mut JvmThread,
     frame_idx: usize,
-    info: &IndyInfo,
+    recipe: &str,
+    constant_args: &[S],
+    target_descriptor: &str,
 ) -> Result<(), MethodCallFailed> {
-    let arg_types = parse_descriptor_args(&info.target_descriptor);
+    let arg_types = parse_descriptor_args(target_descriptor);
 
     // Pop arguments from the stack (pushed left-to-right, pop right-to-left).
     //
@@ -1442,7 +1489,7 @@ fn execute_string_concat(
     let mut arg_idx = 0;
     let mut const_idx = 0;
 
-    for ch in info.recipe.chars() {
+    for ch in recipe.chars() {
         if ch == '\u{0001}' {
             // Argument placeholder
             if arg_idx < arg_values.len() {
@@ -1469,8 +1516,8 @@ fn execute_string_concat(
             }
         } else if ch == '\u{0002}' {
             // Constant placeholder (from bootstrap_arguments[1..])
-            if let Some(s) = info.constant_args.get(const_idx) {
-                result.push_str(s);
+            if let Some(s) = constant_args.get(const_idx) {
+                result.push_str(s.as_ref());
             }
             const_idx += 1;
         } else {
@@ -2904,6 +2951,208 @@ pub fn execute_enum_switch(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // Cached debug-flag helpers
+    // -----------------------------------------------------------------------
+    //
+    // These replaced uncached `std::env::var_os` reads that sat on the
+    // per-execution generic-indy path. The risk of the swap is a typo in the
+    // variable name (the flag would then silently never fire, and a future
+    // debugging session would waste hours on a dead switch), or an inverted
+    // sense. Both are caught by comparing against the live environment.
+
+    #[test]
+    fn cached_indy_debug_flags_match_environment_and_are_stable() {
+        let pairs: [(fn() -> bool, &str); 3] = [
+            (dbg_indy_all, "CRATONVM_DBG_INDY_ALL"),
+            (dbg_indy_generic, "CRATONVM_DBG_INDY_GENERIC"),
+            (dbg_lambda_dispatch, "CRATONVM_DBG_LAMBDA_DISPATCH"),
+        ];
+        for (flag, name) in pairs {
+            let expected = std::env::var_os(name).is_some();
+            assert_eq!(
+                flag(),
+                expected,
+                "cached flag disagrees with env for {name}"
+            );
+            // Process-lifetime memo: repeat reads must be stable (and must not
+            // re-enter `var_os`).
+            assert_eq!(flag(), expected, "cached flag for {name} is not stable");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Call-site cache: population, reuse, and redefinition invalidation
+    // -----------------------------------------------------------------------
+    //
+    // Task-3 coverage for "is the bootstrap result cached per call site and
+    // correctly invalidated?". The observable contract lives entirely in
+    // `ResolutionCache`, which `execute_invokedynamic` consults on its fast
+    // path and populates from every JDK-factory bootstrap branch.
+
+    use crate::classloading::resolution::ResolutionCache;
+
+    fn concat_site(recipe: &str, constants: &[&str], descriptor: &str) -> ResolvedCallSite {
+        ResolvedCallSite::StringConcat {
+            recipe: Arc::from(recipe),
+            constant_args: constants.iter().map(|s| Arc::from(*s)).collect(),
+            target_descriptor: Arc::from(descriptor),
+        }
+    }
+
+    fn lambda_site(iface: &str, impl_owner: &str, impl_name: &str) -> ResolvedCallSite {
+        ResolvedCallSite::Lambda(LambdaCallSite {
+            functional_interface: Arc::from(iface),
+            functional_interface_id: None,
+            sam_method_name: Arc::from("apply"),
+            sam_descriptor: Arc::from("(Ljava/lang/Object;)Ljava/lang/Object;"),
+            impl_handle: MethodHandle {
+                kind: MethodHandleKind::InvokeStatic,
+                class_name: Arc::from(impl_owner),
+                member_name: Arc::from(impl_name),
+                descriptor: Arc::from("(Ljava/lang/Object;)Ljava/lang/Object;"),
+            },
+            instantiated_descriptor: Arc::from("(Ljava/lang/Object;)Ljava/lang/Object;"),
+            capture_types: vec![],
+            proxy_class_id: ClassId::new(9001),
+        })
+    }
+
+    #[test]
+    fn bootstrapped_call_site_is_reused_not_rebootstrapped() {
+        let mut cache = ResolutionCache::new();
+        let caller = ClassId::new(7);
+        assert!(
+            cache.get_call_site(caller, 42).is_none(),
+            "cold call site must miss so the bootstrap slow path runs"
+        );
+        cache.put_call_site(caller, 42, concat_site("\u{0001} items", &[], "(I)V"));
+        // Second and every later execution take the fast path. Nothing here
+        // memoizes a *negative* result, so a miss is always retried — the
+        // "cached `None` is permanent" failure mode does not apply to this
+        // cache (`get_call_site` returns `Option<&_>` from a plain map lookup;
+        // only successful bootstraps ever insert).
+        assert!(cache.get_call_site(caller, 42).is_some());
+        assert!(cache.get_call_site(caller, 42).is_some());
+        assert_eq!(cache.call_site_count(), 1);
+    }
+
+    #[test]
+    fn lambda_call_site_is_dropped_when_its_caller_is_redefined() {
+        let mut cache = ResolutionCache::new();
+        let caller = ClassId::new(11);
+        let other = ClassId::new(12);
+        cache.put_call_site(
+            caller,
+            3,
+            lambda_site("java/util/function/Function", "P", "f"),
+        );
+        cache.put_call_site(
+            other,
+            3,
+            lambda_site("java/util/function/Function", "P", "g"),
+        );
+
+        // Redefining an unrelated class must not disturb this call site: the
+        // lambda keeps dispatching to the same spun proxy.
+        cache.invalidate_class(ClassId::new(99));
+        assert!(cache.get_call_site(caller, 3).is_some());
+
+        // Redefining the class that *contains* the invokedynamic drops it, so
+        // the next execution re-runs LambdaMetafactory against the new constant
+        // pool. Same cp index in a redefined pool may denote a different call
+        // site entirely, which is exactly why key-match eviction is required.
+        cache.invalidate_class(caller);
+        assert!(cache.get_call_site(caller, 3).is_none());
+        // ... and only that class's entries go.
+        assert!(cache.get_call_site(other, 3).is_some());
+    }
+
+    #[test]
+    fn lambda_impl_handle_is_symbolic_so_impl_redefinition_needs_no_eviction() {
+        // `invalidate_class` evicts call sites by *key* class only. That is
+        // sound precisely because `LambdaCallSite::impl_handle` stores the
+        // implementation method symbolically (owner / name / descriptor) and is
+        // re-resolved on each dispatch — redefining the class that owns the
+        // lambda body is therefore picked up without touching this cache. If
+        // anyone ever pre-resolves the handle to a concrete method pointer,
+        // this test fails and flags that eviction must grow a callee-side prong
+        // (as `fields` / `methods` already have).
+        let ResolvedCallSite::Lambda(lcs) = lambda_site("java/util/function/Function", "Impl", "f")
+        else {
+            panic!("expected a lambda call site");
+        };
+        assert_eq!(&*lcs.impl_handle.class_name, "Impl");
+        assert_eq!(&*lcs.impl_handle.member_name, "f");
+        assert_eq!(
+            &*lcs.impl_handle.descriptor,
+            "(Ljava/lang/Object;)Ljava/lang/Object;"
+        );
+    }
+
+    #[test]
+    fn cached_string_concat_site_exposes_borrowable_recipe_and_constants() {
+        // `execute_string_concat` now borrows `&str` / `&[S: AsRef<str>]`
+        // straight out of the cached site instead of rebuilding an `IndyInfo`
+        // with `recipe.to_string()`, `target_descriptor.to_string()` and a
+        // freshly allocated `Vec<String>` of every constant on *every* `"a" + b`
+        // evaluation. This test pins the borrow shape: destructuring the cached
+        // site must yield data usable without conversion, and `Arc<str>` must
+        // satisfy the `AsRef<str>` bound.
+        fn takes_borrowed<S: AsRef<str>>(
+            recipe: &str,
+            constants: &[S],
+            descriptor: &str,
+        ) -> String {
+            let mut out = String::from(recipe);
+            for c in constants {
+                out.push_str(c.as_ref());
+            }
+            out.push_str(descriptor);
+            out
+        }
+
+        let site = concat_site("a\u{0002}b", &["X", "Y"], "(I)Ljava/lang/String;");
+        let ResolvedCallSite::StringConcat {
+            recipe,
+            constant_args,
+            target_descriptor,
+        } = &site
+        else {
+            panic!("expected a StringConcat call site");
+        };
+        assert_eq!(
+            takes_borrowed(recipe, constant_args.as_slice(), target_descriptor),
+            "a\u{0002}bXY(I)Ljava/lang/String;"
+        );
+        // The bootstrap path passes `&[String]`; both must compile against the
+        // same bound.
+        let owned: Vec<String> = vec!["X".to_string(), "Y".to_string()];
+        assert_eq!(
+            takes_borrowed("a\u{0002}b", owned.as_slice(), "(I)Ljava/lang/String;"),
+            "a\u{0002}bXY(I)Ljava/lang/String;"
+        );
+    }
+
+    #[test]
+    fn synthesized_make_concat_recipe_is_all_argument_placeholders() {
+        // The `makeConcat` (no-recipe) branch synthesizes one `\u{0001}` per
+        // declared argument and passes an empty constant list. Regression guard
+        // for the `patched_info` removal: the synthesized recipe must still have
+        // exactly one placeholder per descriptor argument and contain no
+        // `\u{0002}` constant placeholders (there are no constants to consume).
+        for desc in [
+            "()Ljava/lang/String;",
+            "(I)Ljava/lang/String;",
+            "(ILjava/lang/String;J)Ljava/lang/String;",
+        ] {
+            let n = parse_descriptor_args(desc).len();
+            let recipe: String = std::iter::repeat('\u{0001}').take(n).collect();
+            assert_eq!(recipe.chars().filter(|c| *c == '\u{0001}').count(), n);
+            assert!(!recipe.contains('\u{0002}'));
+        }
+    }
 
     #[test]
     fn parse_descriptor_args_empty() {

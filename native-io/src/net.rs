@@ -1355,7 +1355,29 @@ fn net_read0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
             // `wait_for_all` waiting for this thread to reach a safepoint. See
             // socket_channel::ssc_accept for the full rationale.
             ctx.begin_blocking_region();
-            let res = r.read(buf);
+            // AUDIT 2026-07-26 (native-io-audit): retry EINTR. A signal
+            // delivered while parked in the kernel (SIGCHLD from a
+            // `process.rs`-spawned child without SA_RESTART, a profiler or
+            // JVMTI signal) surfaces as `ErrorKind::Interrupted` having
+            // consumed ZERO bytes. `net_err` has no `Interrupted` arm, so it
+            // used to become `SocketException: read0: Interrupted system
+            // call` — a random, unreproducible mid-request connection abort
+            // under load. `socket_channel::try_read_nb` already retries with
+            // the same rationale ("EINTR consumes no bytes"); this is the
+            // `NioSocketImpl` path (plain `Socket.getInputStream().read()`)
+            // that was missed. Some Linux wrappers preserve it only as raw
+            // errno 4.
+            let res = loop {
+                match r.read(buf) {
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::Interrupted
+                            || e.raw_os_error() == Some(4) =>
+                    {
+                        continue
+                    }
+                    other => break other,
+                }
+            };
             ctx.end_blocking_region();
             res
         };
@@ -1589,7 +1611,23 @@ fn net_write0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
             // GC-blocking protocol as accept/read so STW does not wait for a
             // thread that is asleep in the OS.
             ctx.begin_blocking_region();
-            let res = w.write(buf);
+            // AUDIT 2026-07-26 (native-io-audit): retry EINTR — same
+            // rationale as `read0` above. An interrupted write has
+            // transferred nothing, so retrying is safe and is what
+            // `socket_channel::try_write_nb` already does; propagating it
+            // made routine signal delivery indistinguishable from a real
+            // write failure to the Java caller.
+            let res = loop {
+                match w.write(buf) {
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::Interrupted
+                            || error.raw_os_error() == Some(4) =>
+                    {
+                        continue
+                    }
+                    other => break other,
+                }
+            };
             ctx.end_blocking_region();
             // `SocketChannelImpl` deliberately switches an fd to non-blocking
             // mode around its write path. On Windows the resulting
