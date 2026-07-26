@@ -2781,11 +2781,17 @@ impl GenerationalHeap {
                 // SAFETY: `obj_ptr` was just dereferenced via `get_header` without
                 // faulting, so the header's bytes (offsets 0..16) are readable; raw
                 // byte/u32 reads are well-defined for any bit pattern.
+                // Offsets come from the named header constants, not literals:
+                // this diagnostic prints what a heap walker would have decoded,
+                // so it must follow the header layout if it ever shifts (see
+                // docs/internal/arch-2026-07-26/header-shrink.md).
                 let (kind_byte, elem_byte, class_id_raw, stored_len) = unsafe {
                     let class_id_raw = (obj_ptr as *const u32).read_unaligned();
-                    let kind_byte = *obj_ptr.add(4);
-                    let elem_byte = *obj_ptr.add(5);
-                    let stored_len = (obj_ptr.add(12) as *const u32).read_unaligned();
+                    let kind_byte = *obj_ptr.add(cratonvm_types::OBJECT_KIND_OFFSET);
+                    let elem_byte = *obj_ptr.add(cratonvm_types::ARRAY_ELEMENT_TYPE_OFFSET);
+                    let stored_len = (obj_ptr.add(cratonvm_types::ARRAY_LENGTH_OFFSET)
+                        as *const u32)
+                        .read_unaligned();
                     (kind_byte, elem_byte, class_id_raw, stored_len)
                 };
                 let msg = if gc_flags().gc_array_guard_bt {

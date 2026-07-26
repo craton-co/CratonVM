@@ -41452,4 +41452,114 @@ mod flag_and_header_contracts {
             );
         }
     }
+
+    // -- arch-2026-07-26 `header-shrink`: contracts the shrink navigates by ---
+
+    /// **`ir_lower.rs` is a second x64 emitter and the inventory above does not
+    /// cover it.** `header_offset_emission_site_inventory_matches_the_doc`
+    /// scans only `x64.rs`, so five header-offset emission sites in the IR
+    /// lowerer were invisible to the audit the shrink is planned from. They
+    /// bake the same displacements into the same instruction encodings, and a
+    /// shrink that updates only `x64.rs` leaves them emitting stale offsets.
+    ///
+    /// Needles are assembled at runtime for the same reason the sibling test
+    /// does it: a literal here would be counted by that test's scan of this
+    /// file and break its totals.
+    #[test]
+    fn ir_lower_header_offset_sites_are_inventoried_too() {
+        let src = include_str!("ir_lower.rs");
+        let cases: [(&str, &str, usize); 3] = [
+            ("HEADER_SIZE", " as u8", 2),
+            ("HEADER_SIZE", " as i32", 2),
+            ("ARRAY_LENGTH_OFFSET", " as u8", 1),
+        ];
+        for (base, suffix, expected) in cases {
+            let needle = format!("{base}{suffix}");
+            let found = src.matches(needle.as_str()).count();
+            assert_eq!(
+                found, expected,
+                "{needle} appears {found}x in ir_lower.rs, the header-shrink audit \
+                 records {expected}x. ir_lower.rs emits array/field displacements \
+                 exactly as x64.rs does; update \
+                 docs/internal/arch-2026-07-26/header-shrink.md §6 in the same change."
+            );
+        }
+    }
+
+    /// The TLAB grid invariant, asserted where it is actually emitted.
+    ///
+    /// `emit_inline_tlab_new` computes
+    /// `total_size = HEADER_SIZE + (compact_body | num_fields * SLOT_SIZE)`,
+    /// bakes it as an immediate, and bumps the cursor by it **without rounding
+    /// up** — the Rust twin `Tlab::alloc_initialized` rounds to `align`. The
+    /// two agree only while `total_size` is already a multiple of 8, and the
+    /// body-zeroing loop likewise steps 8 bytes at a time from `HEADER_SIZE`.
+    /// The allocation-path guard for this is a `debug_assert`, i.e. absent in
+    /// release, where a violation is a silent heap-walk desync rather than a
+    /// panic. Pin it here so it is checked unconditionally.
+    #[test]
+    fn inline_tlab_total_size_stays_on_the_eight_byte_grid() {
+        assert_eq!(
+            HEADER_SIZE % 8,
+            0,
+            "the inline-TLAB cursor bump and the qword body-zeroing loop both \
+             assume an 8-byte grid anchored at HEADER_SIZE"
+        );
+        assert_eq!(SLOT_SIZE % 8, 0, "legacy field cells must be 8-aligned");
+        for num_fields in 0..128usize {
+            let total = HEADER_SIZE + num_fields * SLOT_SIZE;
+            assert_eq!(
+                total % 8,
+                0,
+                "legacy total_size for {num_fields} fields is off the grid; the JIT \
+                 would publish a cursor the Rust allocator would have rounded"
+            );
+            // The zeroing loop walks HEADER_SIZE..total_size in 8-byte steps.
+            assert_eq!((total - HEADER_SIZE) % 8, 0);
+        }
+        // Compact bodies: `ObjectHeader::set_compact_shape` asserts
+        // `body_size & 7 == 0`, so every admissible body keeps the grid.
+        for body in (0..512usize).step_by(8) {
+            assert_eq!(
+                (HEADER_SIZE + body) % 8,
+                0,
+                "compact total_size for body {body} is off the grid"
+            );
+        }
+    }
+
+    /// Every header field the inline-TLAB emitter writes must stay inside the
+    /// header *and* on the 4-byte grid the dword-immediate store emitter can
+    /// express. There is no qword-immediate store, which is why the 8-byte
+    /// fields are written as dword pairs — a field whose offset is not
+    /// 4-aligned could not be written at all.
+    #[test]
+    fn every_header_field_is_dword_addressable() {
+        for (name, off, width) in [
+            ("class_id", 0usize, 4usize),
+            ("kind/elem/age/flags", cratonvm_types::OBJECT_KIND_OFFSET, 4),
+            ("identity_hash_code", IDENTITY_HASH_CODE_OFFSET, 4),
+            ("shape", cratonvm_types::NUM_SLOTS_OFFSET, 4),
+            ("forwarding_ptr", cratonvm_types::FORWARDING_PTR_OFFSET, 8),
+            ("mark_word", cratonvm_types::MARK_WORD_OFFSET, 8),
+        ] {
+            assert_eq!(
+                off % 4,
+                0,
+                "{name} at +{off} is not 4-aligned; the emitter has only a \
+                 dword-immediate store"
+            );
+            assert!(
+                off + width <= HEADER_SIZE,
+                "{name} at +{off} ({width}B) runs past HEADER_SIZE ({HEADER_SIZE})"
+            );
+        }
+        // The mark word is the target of atomic CAS from the runtime lock
+        // fast-path, so it needs full 8-byte alignment, not merely 4.
+        assert_eq!(
+            cratonvm_types::MARK_WORD_OFFSET % 8,
+            0,
+            "mark_word must be 8-aligned for the atomic CAS in monitor.rs"
+        );
+    }
 }
