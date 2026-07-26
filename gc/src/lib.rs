@@ -44,8 +44,19 @@
     clippy::doc_lazy_continuation
 )]
 
+/// The GC slice of the process-wide typed configuration.
+///
+/// Every `CRATONVM_*` flag this crate reads is a field on
+/// [`cratonvm_types::GcFlags`], parsed once at first use. Before the typed
+/// config existed each of these was an independent `std::env::var_os` call
+/// wrapped in its own `OnceLock`; see `docs/internal/flag-census.md` for the
+/// inventory and `cratonvm_types::flags` for the latching rules.
+#[inline]
+pub(crate) fn gc_flags() -> &'static cratonvm_types::GcFlags {
+    &cratonvm_types::flags().gc
+}
+
 pub mod a2dbg;
-pub mod zero_forensics;
 pub mod arena;
 pub mod blocked_access_debug;
 pub mod card_table;
@@ -75,6 +86,10 @@ pub mod shadow_stack;
 pub mod stale_objref_debug;
 pub mod tlab;
 pub mod vm_heap;
+// Parallel young-generation marking (mark bitmap + scoped worker
+// drain). Crate-internal: only `gen_heap` drives it.
+mod young_mark;
+pub mod zero_forensics;
 // Round-7 cross-cutting Fix 4: ZGC stub (1884 LOC) gated behind the `zgc`
 // feature. No in-workspace consumer references `zgc::*` today, so paying
 // the compile-time + binary-size cost on every build is pure waste. Flip

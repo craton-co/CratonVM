@@ -21,7 +21,90 @@
 //! See `docs/feature-designs/compact-ref-field-layout.md`.
 
 use crate::heap_types::{ObjectHeader, GC_FLAG_COMPACT, SLOT_SIZE};
-use std::sync::{Arc, OnceLock, RwLock};
+use crate::{ObjectRef, Value};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering};
+use std::sync::{Arc, LazyLock, OnceLock, RwLock};
+
+/// Tagless storage representation of a compact instance field.
+///
+/// The verifier and class loader determine this once from the field descriptor;
+/// mutators and compiled code then load/store only the Java payload width. This
+/// removes the 16-byte Rust `Value` discriminant cell from production object
+/// bodies while retaining `Value` at VM API boundaries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum FieldStorageKind {
+    Reference,
+    Boolean,
+    Byte,
+    Char,
+    Short,
+    Int,
+    Float,
+    Long,
+    Double,
+}
+
+impl FieldStorageKind {
+    #[inline]
+    pub const fn from_descriptor_byte(descriptor: u8) -> Option<Self> {
+        Some(match descriptor {
+            b'L' | b'[' => Self::Reference,
+            b'Z' => Self::Boolean,
+            b'B' => Self::Byte,
+            b'C' => Self::Char,
+            b'S' => Self::Short,
+            b'I' => Self::Int,
+            b'F' => Self::Float,
+            b'J' => Self::Long,
+            b'D' => Self::Double,
+            _ => return None,
+        })
+    }
+
+    #[inline]
+    pub const fn size(self) -> u32 {
+        match self {
+            Self::Boolean | Self::Byte => 1,
+            Self::Char | Self::Short => 2,
+            Self::Int | Self::Float => 4,
+            Self::Reference | Self::Long | Self::Double => 8,
+        }
+    }
+
+    #[inline]
+    pub const fn alignment(self) -> u32 {
+        self.size()
+    }
+
+    #[inline]
+    pub const fn is_reference(self) -> bool {
+        matches!(self, Self::Reference)
+    }
+
+    /// Storage width honouring the process-wide narrow-oop setting.
+    ///
+    /// Identical to [`Self::size`] for every primitive kind and for references
+    /// while compressed oops are off (the default). With compressed oops on, a
+    /// reference occupies [`crate::narrow_oop::NARROW_REF_SIZE`] bytes instead
+    /// of 8. This is the width the layout builder must use — [`Self::size`]
+    /// stays `const` for the compile-time layout assertions.
+    #[inline]
+    pub fn size_runtime(self) -> u32 {
+        match self {
+            Self::Reference => crate::narrow_oop::ref_field_size() as u32,
+            other => other.size(),
+        }
+    }
+
+    /// Alignment honouring the process-wide narrow-oop setting. A narrow
+    /// reference is 4-byte aligned, matching its width.
+    #[inline]
+    pub fn alignment_runtime(self) -> u32 {
+        self.size_runtime()
+    }
+}
 
 /// Per-class instance-field layout for the compact reference-field model.
 ///
@@ -30,7 +113,7 @@ use std::sync::{Arc, OnceLock, RwLock};
 /// `set_field`. A parent's layout is an exact prefix of every child's layout
 /// (declaration order, supers first), so inherited indices map to identical
 /// offsets across the hierarchy.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompactLayout {
     /// Byte offset within the object body (relative to `HEADER_SIZE`) of each
     /// field index. `field_offsets.len()` == instance-field count.
@@ -39,12 +122,14 @@ pub struct CompactLayout {
     /// unknown/uncovered descriptor — treated as a reference, matching the heap
     /// default-init rule).
     pub is_ref: Vec<bool>,
+    /// Descriptor-derived tagless storage representation for each field.
+    pub field_kinds: Vec<FieldStorageKind>,
     /// Byte offsets (relative to `HEADER_SIZE`) of every reference field, in
     /// ascending order. This is the GC oop-map: the only slots the collector
     /// scans/remaps for an instance of this class.
     pub ref_offsets: Vec<u32>,
-    /// Total object body size in bytes (sum of per-field sizes; ref = 8,
-    /// primitive = 16). Object total size = `HEADER_SIZE + body_size`.
+    /// Total object body size in bytes, rounded to 8-byte object alignment.
+    /// Fields use their natural Java payload width (1/2/4/8 bytes).
     pub body_size: u32,
 }
 
@@ -59,6 +144,12 @@ impl CompactLayout {
     #[inline]
     pub fn field_is_ref(&self, index: usize) -> Option<bool> {
         self.is_ref.get(index).copied()
+    }
+
+    /// Tagless storage representation of field `index`.
+    #[inline]
+    pub fn field_storage(&self, index: usize) -> Option<FieldStorageKind> {
+        self.field_kinds.get(index).copied()
     }
 
     /// Instance-field count (bounds for `get_field`/`set_field`).
@@ -104,6 +195,20 @@ pub fn set_compact_ref_fields_enabled(enabled: bool) {
 /// Dense `class_id -> layout` registry. `class_id`s are assigned densely from 0,
 /// so a `Vec` indexed by id is compact. Only populated when the flag is on.
 static CLASS_LAYOUTS: RwLock<Vec<Option<Arc<CompactLayout>>>> = RwLock::new(Vec::new());
+/// Version registry: `(class_id, field_count) -> layout`.
+///
+/// `parking_lot::RwLock<FxHashMap<..>>`, not `std::sync::RwLock<HashMap<..>>`.
+/// The std pairing cost real time: `class_layout_for_fields` is called once per
+/// scanned object by the Cheney collector's scan loops (`gc/src/gc.rs`), and
+/// `std::collections::HashMap`'s default hasher is SipHash — a cryptographic
+/// hash over an 8-byte `(u32, u32)` key. A `perf record` of
+/// `BinTreesClassic d=18` attributed **37.8%** of all samples to
+/// `class_layout_for_fields` and a further **4.8%** to
+/// `<sip::Hasher as Hasher>::write`. FxHash over two words is a couple of
+/// multiplies, and `parking_lot`'s reader acquire is cheaper than std's.
+static CLASS_LAYOUT_VERSIONS: LazyLock<
+    parking_lot::RwLock<rustc_hash::FxHashMap<(u32, u32), Arc<CompactLayout>>>,
+> = LazyLock::new(|| parking_lot::RwLock::new(rustc_hash::FxHashMap::default()));
 
 /// Maximum slot count for the dense layout registry.
 ///
@@ -176,6 +281,12 @@ pub fn register_class_layout(class_id: u32, layout: Arc<CompactLayout>) {
          ({MAX_DENSE_CLASS_LAYOUTS}); refusing sparse allocation"
     );
 
+    let field_count = u32::try_from(layout.field_count())
+        .expect("compact field count exceeds u32");
+    {
+        let mut versions = CLASS_LAYOUT_VERSIONS.write();
+        versions.insert((class_id, field_count), Arc::clone(&layout));
+    }
     let mut v = CLASS_LAYOUTS.write().unwrap();
     if idx >= v.len() {
         v.resize(idx + 1, None);
@@ -195,11 +306,286 @@ pub fn register_class_layout(class_id: u32, layout: Arc<CompactLayout>) {
     LAYOUT_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
 }
 
+/// Drop the compact field layout owned by an unloaded class.
+///
+/// The registry is slot-indexed and ClassIds are monotonic, so clearing the
+/// slot releases the layout allocation without allowing a future class to
+/// inherit it.
+pub fn unregister_class_layout(class_id: u32) {
+    let Ok(index) = usize::try_from(class_id) else {
+        return;
+    };
+    CLASS_LAYOUT_VERSIONS
+        .write()
+        .retain(|(id, _), _| *id != class_id);
+    let mut layouts = CLASS_LAYOUTS.write().unwrap();
+    if let Some(slot) = layouts.get_mut(index) {
+        if slot.take().is_some() {
+            if index < MAX_DENSE_CLASS_LAYOUTS {
+                layout_replace_counts()[index]
+                    .fetch_add(1, std::sync::atomic::Ordering::Release);
+            }
+            LAYOUT_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
+        }
+    }
+}
+
 /// Look up the compact layout for a class, if registered.
 #[inline]
 pub fn class_layout(class_id: u32) -> Option<Arc<CompactLayout>> {
     let v = CLASS_LAYOUTS.read().unwrap();
     v.get(class_id as usize).and_then(|o| o.clone())
+}
+
+/// Small per-thread working set for the `(class_id, field_count) -> layout`
+/// lookup. The GC scans long runs of same-class objects, so a handful of entries
+/// captures essentially all traffic; 8 matches the sibling cache in
+/// [`compact_field_storage`].
+const VERSION_CACHE_LEN: usize = 8;
+
+struct VersionCache {
+    /// `(class_id, field_count, generation, resolved)`. `resolved` is `None` for
+    /// a cached negative lookup — see [`class_layout_for_fields`] for why
+    /// negatives are cached too.
+    entries: [Option<(u32, u32, u64, Option<Arc<CompactLayout>>)>; VERSION_CACHE_LEN],
+    /// Round-robin insertion cursor. A [`Cell`](std::cell::Cell) so that the
+    /// lookup path needs only a *shared* `RefCell` borrow — see [`Self::find`].
+    next: std::cell::Cell<usize>,
+    /// Index of the entry that satisfied the previous lookup, checked before the
+    /// linear scan.
+    ///
+    /// The GC scans long *runs* of same-class objects (a binary tree of one node
+    /// type; a young gen full of `HashMap$Node`s), so consecutive calls almost
+    /// always want the same entry. Probing it first turns the common case from a
+    /// scan of up to `VERSION_CACHE_LEN` tuples into one comparison.
+    mru: std::cell::Cell<usize>,
+}
+
+impl VersionCache {
+    const fn new() -> Self {
+        Self {
+            entries: [None, None, None, None, None, None, None, None],
+            next: std::cell::Cell::new(0),
+            mru: std::cell::Cell::new(0),
+        }
+    }
+
+    /// Index of the live entry matching `(class_id, field_count)` at
+    /// `generation`, or `None` for a miss.
+    ///
+    /// Takes `&self`, not `&mut self` — the MRU bookkeeping goes through
+    /// [`std::cell::Cell`] specifically so the *whole lookup path* runs under a
+    /// shared `RefCell` borrow. That is what makes the cache re-entrant: see
+    /// [`with_class_layout`], which holds a shared borrow across a user closure
+    /// that calls back into this cache. Only insertion needs `&mut self`.
+    #[inline]
+    fn find(&self, class_id: u32, field_count: u32, generation: u64) -> Option<usize> {
+        let matches = |entry: &Option<(u32, u32, u64, Option<Arc<CompactLayout>>)>| {
+            matches!(entry, Some((cid, fc, gen, _))
+                if *cid == class_id && *fc == field_count && *gen == generation)
+        };
+        // MRU probe: the GC scans runs of same-class objects, so this hits on
+        // nearly every call and skips the scan below entirely.
+        let mru = self.mru.get();
+        if self.entries.get(mru).is_some_and(matches) {
+            return Some(mru);
+        }
+        for (idx, entry) in self.entries.iter().enumerate() {
+            if matches(entry) {
+                // Self-tune the probe to the run the caller is currently in.
+                self.mru.set(idx);
+                return Some(idx);
+            }
+        }
+        None
+    }
+
+    /// Install `resolved` (which may be a cached negative) and return its slot.
+    #[inline]
+    fn install(
+        &mut self,
+        class_id: u32,
+        field_count: u32,
+        generation: u64,
+        resolved: Option<Arc<CompactLayout>>,
+    ) -> usize {
+        let slot = self.next.get() % VERSION_CACHE_LEN;
+        self.next.set(self.next.get().wrapping_add(1));
+        self.mru.set(slot);
+        self.entries[slot] = Some((class_id, field_count, generation, resolved));
+        slot
+    }
+}
+
+thread_local! {
+    static VERSION_CACHE: std::cell::RefCell<VersionCache> =
+        const { std::cell::RefCell::new(VersionCache::new()) };
+}
+
+/// The uncached registry probe both accessors fall back to: an `RwLock` reader
+/// acquire plus a SipHash probe. Everything above exists to avoid this.
+#[inline]
+fn registry_layout_for_fields(class_id: u32, field_count: u32) -> Option<Arc<CompactLayout>> {
+    CLASS_LAYOUT_VERSIONS
+        .read()
+        .get(&(class_id, field_count))
+        .cloned()
+}
+
+/// Resolve the immutable layout version used by an object with this exact
+/// hierarchy-wide field count. Retaining versions makes object size and oop
+/// maps stable across append-only synthetic-class upgrades.
+///
+/// Prefer [`with_class_layout`] on hot read-only paths: it serves the same cache
+/// without the `Arc` clone/drop pair of atomics.
+///
+/// PERF: this is called **once per scanned object** by the collectors' scan
+/// loops, and the naked registry lookup underneath — an `RwLock` reader
+/// acquire, a hash probe, and an `Arc` clone/drop pair of atomics — dominated
+/// allocation-heavy workloads. A `perf record` of `BinTreesClassic d=18` (whose
+/// young gen is entirely `Node` objects, so the collector re-resolves the same
+/// one or two layouts for every object it scans, every collection) attributed
+/// **37.8%** of all samples to this function and another **4.8%** to SipHash
+/// inside it.
+///
+/// The scan sites themselves have since moved to [`with_class_layout`]; what
+/// still calls *this* form is code that genuinely needs to own the handle —
+/// notably `compact_oop_scan` in `gc/src/heap.rs`, which returns it.
+///
+/// This is a recurrence of a fix already applied elsewhere: `compact_field_slot`
+/// below, and `compact_oop_scan` in `gc/src/heap.rs`, each grew their own
+/// generation-validated thread-local cache for exactly this reason — but they
+/// are per-caller band-aids around one uncached primitive, and the `gc.rs` scan
+/// loops called the primitive directly and so were never covered. Caching *here*
+/// covers every call site at once. (`compact_field_slot`'s private copy has been
+/// deleted as redundant; `compact_oop_scan`'s remains.)
+///
+/// [`LAYOUT_GENERATION`] was introduced for precisely this purpose (see its
+/// doc: "lets hot-path consumers (the GC scan) cache a lookup and cheaply
+/// validate it with a single atomic load instead of re-taking the registry
+/// `RwLock` per scanned object"). A hit costs one relaxed atomic load, one
+/// comparison against the MRU entry (the GC scans runs of same-class objects, so
+/// that hits on nearly every call; a miss falls back to scanning the 8-entry
+/// array), and an `Arc` clone; a registration or redefine bumps the generation
+/// and invalidates every thread's cache at once.
+///
+/// The `Arc` clone/drop is two atomic RMWs paid per call. Callers that only
+/// *read* the layout and drop the handle immediately — which is every GC scan
+/// site — should use [`with_class_layout`] instead, which serves the same cache
+/// entry by reference and pays neither.
+///
+/// Negative results are cached too (`None`): callers that do not pre-filter
+/// with [`is_compact_object`] would otherwise re-probe the registry for every
+/// legacy object, which is the same cost this exists to avoid.
+#[inline]
+pub fn class_layout_for_fields(class_id: u32, field_count: u32) -> Option<Arc<CompactLayout>> {
+    let generation = layout_generation();
+    VERSION_CACHE.with(|cell| {
+        // `try_borrow`/`try_borrow_mut` rather than the panicking forms: this
+        // function is reachable from GC scan paths (and from inside a
+        // `with_class_layout` closure), and a panic-on-reentrancy here would
+        // abort a collection. A failed borrow just skips the cache.
+        //
+        // Taking the *shared* borrow for the lookup is what makes re-entrancy
+        // cheap rather than merely survivable: a nested call still hits the
+        // cache, because shared borrows nest. Only a nested call that also
+        // *misses* falls through to the registry — installing needs the
+        // exclusive borrow, which the enclosing `with_class_layout` frame's
+        // shared borrow rules out.
+        match cell.try_borrow() {
+            Ok(cache) => {
+                if let Some(idx) = cache.find(class_id, field_count, generation) {
+                    return cache.entries[idx].as_ref().and_then(|e| e.3.clone());
+                }
+            }
+            Err(_) => return registry_layout_for_fields(class_id, field_count),
+        }
+        let resolved = registry_layout_for_fields(class_id, field_count);
+        if let Ok(mut cache) = cell.try_borrow_mut() {
+            cache.install(class_id, field_count, generation, resolved.clone());
+        }
+        resolved
+    })
+}
+
+/// Borrowing form of [`class_layout_for_fields`]: runs `f` against the cached
+/// layout in place and returns its result, or `None` if no layout is registered
+/// for `(class_id, field_count)`.
+///
+/// PERF: this exists for the GC scan loops, which call the lookup **once per
+/// scanned object**, read only `ref_offsets` / `field_offsets` / `body_size`,
+/// and drop the handle immediately. [`class_layout_for_fields`] hands them an
+/// `Arc`, so each of those calls pays a clone/drop pair of atomic RMWs for a
+/// handle that never outlives the statement. Serving the same cache entry by
+/// reference removes both.
+///
+/// # `f` runs with the cache borrowed
+///
+/// `f` executes while this thread's cache is borrowed *shared*, which has two
+/// consequences callers must know about:
+///
+///   * Re-entrancy is safe and still fast. A call back into
+///     [`class_layout_for_fields`] or [`with_class_layout`] from inside `f`
+///     takes another shared borrow and hits normally. This is not hypothetical:
+///     the Cheney scan loops call `forward_object` from inside `f`, which
+///     reaches [`object_body_size`] and back into this cache for the *referent's*
+///     class on every object it copies.
+///   * A re-entrant call that *misses* cannot install its result — installation
+///     needs the exclusive borrow — so it degrades to one uncached registry
+///     probe. That is a correctness-preserving slow path, not a stale answer,
+///     and it self-heals as soon as a non-nested call caches the class.
+///
+/// Borrowing rather than cloning is sound across `f` for the same reason: the
+/// shared borrow blocks any `install` that could overwrite the entry, and the
+/// entry owns an `Arc`, so the layout stays alive even if a concurrent redefine
+/// drops the registry's own handle.
+#[inline]
+pub fn with_class_layout<R>(
+    class_id: u32,
+    field_count: u32,
+    f: impl FnOnce(&CompactLayout) -> R,
+) -> Option<R> {
+    let generation = layout_generation();
+    VERSION_CACHE.with(|cell| {
+        match cell.try_borrow() {
+            Ok(cache) => {
+                if let Some(idx) = cache.find(class_id, field_count, generation) {
+                    // Cache hit. `f` runs with the shared borrow live.
+                    return cache.entries[idx]
+                        .as_ref()
+                        .and_then(|e| e.3.as_deref())
+                        .map(f);
+                }
+            }
+            // Cache unusable (an `install` is on this thread's stack). Fall back
+            // to an owning registry read; the `Arc` here is unavoidable but this
+            // path is not reachable from steady-state GC scanning.
+            Err(_) => return registry_layout_for_fields(class_id, field_count).map(|a| f(&a)),
+        }
+        // Miss: resolve and install under a *short* exclusive borrow that never
+        // spans user code, then re-borrow shared to run `f` against the entry.
+        let resolved = registry_layout_for_fields(class_id, field_count);
+        match cell.try_borrow_mut() {
+            Ok(mut cache) => {
+                let idx = cache.install(class_id, field_count, generation, resolved);
+                drop(cache);
+                // `try_borrow`, not `borrow`: nothing can be holding a borrow
+                // here (the exclusive one was just dropped and no user code has
+                // run since), but this is a GC path where a panic aborts the
+                // collection, so re-resolve rather than rely on that reasoning.
+                // Falling through to `None` would be worse than slow — it would
+                // claim the class has no layout.
+                match cell.try_borrow() {
+                    Ok(cache) => cache.entries[idx]
+                        .as_ref()
+                        .and_then(|e| e.3.as_deref())
+                        .map(f),
+                    Err(_) => registry_layout_for_fields(class_id, field_count).map(|a| f(&a)),
+                }
+            }
+            Err(_) => resolved.map(|a| f(&a)),
+        }
+    })
 }
 
 /// `(byte_offset, is_ref)` for field `index` of `class_id`, if a compact layout
@@ -222,6 +608,16 @@ pub fn class_layout(class_id: u32) -> Option<Arc<CompactLayout>> {
 /// layout.
 #[inline]
 pub fn compact_field_slot(class_id: u32, index: usize) -> Option<(usize, bool)> {
+    compact_field_storage(class_id, index)
+        .map(|(offset, storage)| (offset, storage.is_reference()))
+}
+
+/// `(byte_offset, storage_kind)` for a field in a registered compact layout.
+#[inline]
+pub fn compact_field_storage(
+    class_id: u32,
+    index: usize,
+) -> Option<(usize, FieldStorageKind)> {
     struct SlotCache {
         entries: [Option<(u32, u64, Arc<CompactLayout>)>; 8],
         next: usize,
@@ -246,25 +642,193 @@ pub fn compact_field_slot(class_id: u32, index: usize) -> Option<(usize, bool)> 
                 if *cached_cid == class_id && *cached_gen == generation {
                     return Some((
                         layout.field_offset(index)? as usize,
-                        layout.field_is_ref(index)?,
+                        layout.field_storage(index)?,
                     ));
                 }
             }
         }
         let layout = class_layout(class_id)?;
         let offset = layout.field_offset(index)? as usize;
-        let is_ref = layout.field_is_ref(index)?;
+        let storage = layout.field_storage(index)?;
         let slot = cache.next;
         cache.entries[slot] = Some((class_id, generation, layout));
         cache.next = (slot + 1) % cache.entries.len();
-        Some((offset, is_ref))
+        Some((offset, storage))
     })
+}
+
+/// Return the compact body size when `class_id` has a complete layout matching
+/// the requested instance-field count. Allocation paths in every collector use
+/// this one predicate, so an object can never be marked compact with a partial
+/// or stale class recipe.
+#[inline]
+pub fn compact_object_body_size(class_id: u32, field_count: usize) -> Option<usize> {
+    if !compact_ref_fields_enabled() {
+        return None;
+    }
+    class_layout(class_id)
+        .filter(|layout| layout.field_count() == field_count)
+        .map(|layout| layout.body_size as usize)
+}
+
+/// Resolve a field of an object that is actually marked compact.
+#[inline]
+pub fn compact_object_field_storage(
+    header: &ObjectHeader,
+    index: usize,
+) -> Option<(usize, FieldStorageKind)> {
+    if !is_compact_object(header) {
+        return None;
+    }
+    let layout = class_layout_for_fields(header.class_id.as_u32(), header.num_slots())?;
+    Some((
+        layout.field_offset(index)? as usize,
+        layout.field_storage(index)?,
+    ))
+}
+
+/// Atomically read a tagless compact field and reconstruct its VM `Value`.
+///
+/// # Safety
+/// `ptr` must point to a naturally aligned field of the supplied storage kind.
+#[inline]
+pub unsafe fn read_compact_field(
+    ptr: *const u8,
+    storage: FieldStorageKind,
+    ordering: Ordering,
+) -> Value {
+    match storage {
+        FieldStorageKind::Reference => {
+            // Narrow oops: the slot is a 4-byte `(addr - base) >> shift`. The
+            // branch reads a process-wide flag written once at VM init, so it
+            // predicts perfectly and folds away in the common case.
+            let raw = if crate::narrow_oop::narrow_oops_enabled() {
+                let n = unsafe { (&*(ptr as *const AtomicU32)).load(ordering) };
+                crate::narrow_oop::decode(n)
+            } else {
+                unsafe { (&*(ptr as *const AtomicU64)).load(ordering) }
+            };
+            if raw == 0 {
+                Value::Object(None)
+            } else {
+                Value::Object(Some(unsafe { ObjectRef::from_raw(raw as usize as *mut u8) }))
+            }
+        }
+        FieldStorageKind::Boolean => {
+            Value::Int((unsafe { (&*(ptr as *const AtomicU8)).load(ordering) } != 0) as i32)
+        }
+        FieldStorageKind::Byte => Value::Int(
+            unsafe { (&*(ptr as *const AtomicU8)).load(ordering) } as i8 as i32,
+        ),
+        FieldStorageKind::Char => Value::Int(
+            unsafe { (&*(ptr as *const AtomicU16)).load(ordering) } as i32,
+        ),
+        FieldStorageKind::Short => Value::Int(
+            unsafe { (&*(ptr as *const AtomicU16)).load(ordering) } as i16 as i32,
+        ),
+        FieldStorageKind::Int => Value::Int(
+            unsafe { (&*(ptr as *const AtomicU32)).load(ordering) } as i32,
+        ),
+        FieldStorageKind::Float => Value::Float(f32::from_bits(
+            unsafe { (&*(ptr as *const AtomicU32)).load(ordering) },
+        )),
+        FieldStorageKind::Long => Value::Long(
+            unsafe { (&*(ptr as *const AtomicU64)).load(ordering) } as i64,
+        ),
+        FieldStorageKind::Double => Value::Double(f64::from_bits(
+            unsafe { (&*(ptr as *const AtomicU64)).load(ordering) },
+        )),
+    }
+}
+
+/// Atomically store a VM `Value` into tagless compact field storage.
+///
+/// Descriptor-compatible values are expected on verified bytecode paths.
+/// Integer-family writes are narrowed according to JVMS field semantics.
+///
+/// # Safety
+/// `ptr` must point to a naturally aligned field of the supplied storage kind.
+#[inline]
+pub unsafe fn write_compact_field(
+    ptr: *mut u8,
+    storage: FieldStorageKind,
+    value: Value,
+    ordering: Ordering,
+) {
+    match storage {
+        FieldStorageKind::Reference => {
+            let raw = match value {
+                Value::Object(Some(r)) => r.as_ptr() as u64,
+                Value::Object(None) => 0,
+                _ => 0,
+            };
+            crate::narrow_oop::probe(raw);
+            if crate::narrow_oop::narrow_oops_enabled() {
+                let n = crate::narrow_oop::encode(raw);
+                unsafe { (&*(ptr as *const AtomicU32)).store(n, ordering) };
+            } else {
+                unsafe { (&*(ptr as *const AtomicU64)).store(raw, ordering) };
+            }
+        }
+        FieldStorageKind::Boolean => {
+            let raw = matches!(value, Value::Int(v) if v != 0) as u8;
+            unsafe { (&*(ptr as *const AtomicU8)).store(raw, ordering) };
+        }
+        FieldStorageKind::Byte => {
+            let raw = match value { Value::Int(v) => v as u8, _ => 0 };
+            unsafe { (&*(ptr as *const AtomicU8)).store(raw, ordering) };
+        }
+        FieldStorageKind::Char | FieldStorageKind::Short => {
+            let raw = match value { Value::Int(v) => v as u16, _ => 0 };
+            unsafe { (&*(ptr as *const AtomicU16)).store(raw, ordering) };
+        }
+        FieldStorageKind::Int => {
+            let raw = match value {
+                Value::Int(v) => v as u32,
+                Value::Float(v) => v.to_bits(),
+                _ => 0,
+            };
+            unsafe { (&*(ptr as *const AtomicU32)).store(raw, ordering) };
+        }
+        FieldStorageKind::Float => {
+            let raw = match value {
+                Value::Float(v) => v.to_bits(),
+                Value::Int(v) => v as u32,
+                _ => 0,
+            };
+            unsafe { (&*(ptr as *const AtomicU32)).store(raw, ordering) };
+        }
+        FieldStorageKind::Long => {
+            let raw = match value {
+                Value::Long(v) => v as u64,
+                Value::Int(v) => v as i64 as u64,
+                Value::Double(v) => v.to_bits(),
+                _ => 0,
+            };
+            unsafe { (&*(ptr as *const AtomicU64)).store(raw, ordering) };
+        }
+        FieldStorageKind::Double => {
+            let raw = match value {
+                Value::Double(v) => v.to_bits(),
+                Value::Long(v) => v as u64,
+                Value::Int(v) => v as i64 as u64,
+                _ => 0,
+            };
+            unsafe { (&*(ptr as *const AtomicU64)).store(raw, ordering) };
+        }
+    }
 }
 
 /// Clear the registry (test/debug-only).
 #[cfg(any(test, debug_assertions))]
 pub fn clear_class_layouts() {
     CLASS_LAYOUTS.write().unwrap().clear();
+    CLASS_LAYOUT_VERSIONS.write().clear();
+    // The per-thread `class_layout_for_fields` cache is validated against
+    // `layout_generation()`, so bump it here: without this, a test that clears
+    // the registry and re-registers could be served a pre-clear entry from
+    // whichever thread had already warmed its cache.
+    LAYOUT_GENERATION.fetch_add(1, Ordering::AcqRel);
 }
 
 // --- Object body size --------------------------------------------------------
@@ -286,9 +850,17 @@ pub fn is_compact_object(header: &ObjectHeader) -> bool {
 #[inline]
 pub fn object_body_size(header: &ObjectHeader) -> usize {
     if is_compact_object(header) {
-        header.array_length as usize
+        // `with_class_layout`, not `class_layout_for_fields`: this reads one
+        // `u32` and drops the handle. It is also the hottest *nested* consumer
+        // of the layout cache — the Cheney collector reaches it once per copied
+        // object, from `object_total_size` inside `forward_object`, which the
+        // scan loops call from inside their own `with_class_layout` closure.
+        with_class_layout(header.class_id.as_u32(), header.num_slots(), |layout| {
+            layout.body_size as usize
+        })
+        .unwrap_or(0)
     } else {
-        header.num_slots as usize * SLOT_SIZE
+        header.num_slots() as usize * SLOT_SIZE
     }
 }
 
@@ -296,23 +868,30 @@ pub fn object_body_size(header: &ObjectHeader) -> usize {
 mod tests {
     use super::*;
 
+    static REGISTRY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn layout_offsets_and_oopmap() {
         // Class with fields: ref, int, ref  (descriptors L, I, L)
-        // prefix-sum: off0=0(ref,8) off1=8(int,16) off2=24(ref,8) body=32
+        // natural-width layout: ref@0, int@8, align the next ref to ref@16.
         let layout = CompactLayout {
-            field_offsets: vec![0, 8, 24],
+            field_offsets: vec![0, 8, 16],
             is_ref: vec![true, false, true],
-            ref_offsets: vec![0, 24],
-            body_size: 32,
+            field_kinds: vec![
+                FieldStorageKind::Reference,
+                FieldStorageKind::Int,
+                FieldStorageKind::Reference,
+            ],
+            ref_offsets: vec![0, 16],
+            body_size: 24,
         };
         assert_eq!(layout.field_offset(0), Some(0));
         assert_eq!(layout.field_offset(1), Some(8));
-        assert_eq!(layout.field_offset(2), Some(24));
+        assert_eq!(layout.field_offset(2), Some(16));
         assert_eq!(layout.field_offset(3), None);
         assert_eq!(layout.field_is_ref(1), Some(false));
         assert_eq!(layout.field_count(), 3);
-        assert_eq!(layout.ref_offsets, vec![0, 24]);
+        assert_eq!(layout.ref_offsets, vec![0, 16]);
     }
 
     /// Regression: mixed reference + `double`/`long`/`float` fields.
@@ -329,8 +908,6 @@ mod tests {
     /// compact-ref-field-layout.md`).
     #[test]
     fn mixed_ref_double_long_float_offsets() {
-        use crate::heap_types::REF_FIELD_SIZE;
-
         // Fields (declaration order): Object a; double x; Object b; double y;
         //                             long z;   Object c; float f
         // descriptors:                L        D         L        D
@@ -344,32 +921,54 @@ mod tests {
         //   c  L  off 64 (ref, +8)  -> 72
         //   f  F  off 72 (prim,+16) -> 88
         let layout = CompactLayout {
-            field_offsets: vec![0, 8, 24, 32, 48, 64, 72],
+            field_offsets: vec![0, 8, 16, 24, 32, 40, 48],
             is_ref: vec![true, false, true, false, false, true, false],
-            ref_offsets: vec![0, 24, 64],
-            body_size: 88,
+            field_kinds: vec![
+                FieldStorageKind::Reference,
+                FieldStorageKind::Double,
+                FieldStorageKind::Reference,
+                FieldStorageKind::Double,
+                FieldStorageKind::Long,
+                FieldStorageKind::Reference,
+                FieldStorageKind::Float,
+            ],
+            ref_offsets: vec![0, 16, 40],
+            body_size: 56,
         };
 
         // Cross-check the literal layout against the prefix-sum rule it encodes,
         // so a change to REF_FIELD_SIZE / SLOT_SIZE (or a mis-sized field) is
         // caught here rather than corrupting objects at runtime.
-        let is_ref = [true, false, true, false, false, true, false];
+        let kinds = [
+            FieldStorageKind::Reference,
+            FieldStorageKind::Double,
+            FieldStorageKind::Reference,
+            FieldStorageKind::Double,
+            FieldStorageKind::Long,
+            FieldStorageKind::Reference,
+            FieldStorageKind::Float,
+        ];
         let mut expect_off = 0u32;
         let mut expect_refs = Vec::new();
-        for (i, &r) in is_ref.iter().enumerate() {
+        for (i, &kind) in kinds.iter().enumerate() {
+            let align = kind.alignment();
+            expect_off = (expect_off + align - 1) & !(align - 1);
             assert_eq!(
                 layout.field_offset(i),
                 Some(expect_off),
-                "field {i} offset must follow the 8-byte-per-ref prefix sum",
+                "field {i} must be naturally aligned",
             );
-            assert_eq!(layout.field_is_ref(i), Some(r), "field {i} ref-ness");
-            if r {
+            assert_eq!(
+                layout.field_is_ref(i),
+                Some(kind.is_reference()),
+                "field {i} ref-ness"
+            );
+            if kind.is_reference() {
                 expect_refs.push(expect_off);
-                expect_off += REF_FIELD_SIZE as u32;
-            } else {
-                expect_off += SLOT_SIZE as u32;
             }
+            expect_off += kind.size();
         }
+        expect_off = (expect_off + 7) & !7;
         assert_eq!(
             layout.body_size, expect_off,
             "body size = sum of field sizes"
@@ -391,9 +990,9 @@ mod tests {
             1 * SLOT_SIZE as u32,
             "non-compact assumption would use 16"
         );
-        assert_eq!(layout.field_offset(3), Some(32)); // double y, two refs before
+        assert_eq!(layout.field_offset(3), Some(24)); // double y, two refs before
         assert_ne!(
-            32,
+            24,
             3 * SLOT_SIZE as u32,
             "non-compact assumption would use 48"
         );
@@ -401,14 +1000,14 @@ mod tests {
         // No primitive field's [off, off+SLOT_SIZE) byte range may overlap any
         // reference field's [off, off+REF_FIELD_SIZE) range — that overlap is
         // exactly how a double read yields a ref's bytes.
-        for (i, &r) in is_ref.iter().enumerate() {
-            if r {
+        for (i, &kind) in kinds.iter().enumerate() {
+            if kind.is_reference() {
                 continue;
             }
             let p0 = layout.field_offset(i).unwrap();
-            let p1 = p0 + SLOT_SIZE as u32;
+            let p1 = p0 + kind.size();
             for &ro in &layout.ref_offsets {
-                let r1 = ro + REF_FIELD_SIZE as u32;
+                let r1 = ro + FieldStorageKind::Reference.size();
                 assert!(
                     p1 <= ro || r1 <= p0,
                     "primitive field {i} at [{p0},{p1}) overlaps ref slot [{ro},{r1})",
@@ -418,11 +1017,47 @@ mod tests {
     }
 
     #[test]
+    fn tagless_field_round_trip_all_storage_kinds() {
+        let mut words = [0u64; 8];
+        let ptr = words.as_mut_ptr() as *mut u8;
+        let cases = [
+            (FieldStorageKind::Boolean, Value::Int(1)),
+            (FieldStorageKind::Byte, Value::Int(-17)),
+            (FieldStorageKind::Char, Value::Int(0x20ac)),
+            (FieldStorageKind::Short, Value::Int(-1234)),
+            (FieldStorageKind::Int, Value::Int(-123_456_789)),
+            (FieldStorageKind::Float, Value::Float(3.25)),
+            (FieldStorageKind::Long, Value::Long(-9_876_543_210)),
+            (FieldStorageKind::Double, Value::Double(-17.5)),
+        ];
+        for (kind, value) in cases {
+            unsafe {
+                write_compact_field(ptr, kind, value, Ordering::Release);
+                assert_eq!(read_compact_field(ptr, kind, Ordering::Acquire), value);
+            }
+        }
+        unsafe {
+            write_compact_field(
+                ptr,
+                FieldStorageKind::Reference,
+                Value::Object(None),
+                Ordering::Release,
+            );
+            assert_eq!(
+                read_compact_field(ptr, FieldStorageKind::Reference, Ordering::Acquire),
+                Value::Object(None)
+            );
+        }
+    }
+
+    #[test]
     fn registry_round_trip() {
+        let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
         clear_class_layouts();
         let layout = Arc::new(CompactLayout {
             field_offsets: vec![0],
             is_ref: vec![true],
+            field_kinds: vec![FieldStorageKind::Reference],
             ref_offsets: vec![0],
             body_size: 8,
         });
@@ -433,20 +1068,245 @@ mod tests {
         let layout2 = Arc::new(CompactLayout {
             field_offsets: vec![0, 8],
             is_ref: vec![true, true],
+            field_kinds: vec![
+                FieldStorageKind::Reference,
+                FieldStorageKind::Reference,
+            ],
             ref_offsets: vec![0, 8],
             body_size: 16,
         });
         register_class_layout(7, layout2);
         assert_eq!(class_layout(7).unwrap().body_size, 16);
+        assert_eq!(class_layout_for_fields(7, 1).unwrap().body_size, 8);
+        assert_eq!(class_layout_for_fields(7, 2).unwrap().body_size, 16);
+        clear_class_layouts();
+    }
+
+    // --- class_layout_for_fields thread-local cache invalidation -------------
+    //
+    // The cache is validated against `layout_generation()`. Every registry
+    // mutation must bump it, or a warmed thread would keep serving a stale
+    // layout — which for the GC scan means walking an object with the wrong
+    // oop-map (missed or fabricated reference slots => heap corruption). These
+    // tests pin each mutation path.
+
+    fn one_ref_layout(body_size: u32) -> Arc<CompactLayout> {
+        Arc::new(CompactLayout {
+            field_offsets: vec![0],
+            is_ref: vec![true],
+            field_kinds: vec![FieldStorageKind::Reference],
+            ref_offsets: vec![0],
+            body_size,
+        })
+    }
+
+    /// Replacing a layout for the SAME (class_id, field_count) must be visible
+    /// to a thread that already cached the old one.
+    #[test]
+    fn version_cache_sees_replacement() {
+        let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
+        clear_class_layouts();
+        register_class_layout(21, one_ref_layout(8));
+        // Warm the cache.
+        assert_eq!(class_layout_for_fields(21, 1).unwrap().body_size, 8);
+        // Replace with a different layout at the same field count.
+        register_class_layout(21, one_ref_layout(24));
+        assert_eq!(
+            class_layout_for_fields(21, 1).unwrap().body_size,
+            24,
+            "cached entry survived a replacement — generation bump missing"
+        );
+        clear_class_layouts();
+    }
+
+    /// A cached NEGATIVE lookup must not hide a subsequent registration.
+    #[test]
+    fn version_cache_sees_registration_after_negative_lookup() {
+        let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
+        clear_class_layouts();
+        // Warm a negative entry.
+        assert!(class_layout_for_fields(22, 1).is_none());
+        register_class_layout(22, one_ref_layout(8));
+        assert!(
+            class_layout_for_fields(22, 1).is_some(),
+            "cached negative lookup hid a later registration"
+        );
+        clear_class_layouts();
+    }
+
+    /// `unregister_class_layout` must invalidate a warmed positive entry —
+    /// otherwise an unloaded class's layout could be applied to a recycled id.
+    #[test]
+    fn version_cache_sees_unregister() {
+        let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
+        clear_class_layouts();
+        register_class_layout(23, one_ref_layout(8));
+        assert!(class_layout_for_fields(23, 1).is_some());
+        unregister_class_layout(23);
+        assert!(
+            class_layout_for_fields(23, 1).is_none(),
+            "cached entry survived unregister_class_layout"
+        );
+        clear_class_layouts();
+    }
+
+    /// `clear_class_layouts` must invalidate too (it is used between tests, so
+    /// a surviving entry would cross-contaminate them).
+    #[test]
+    fn version_cache_sees_clear() {
+        let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
+        clear_class_layouts();
+        register_class_layout(24, one_ref_layout(8));
+        assert!(class_layout_for_fields(24, 1).is_some());
+        clear_class_layouts();
+        assert!(
+            class_layout_for_fields(24, 1).is_none(),
+            "cached entry survived clear_class_layouts"
+        );
+    }
+
+    /// Every thread must agree with the registry, and repeated lookups (which
+    /// exercise hits) must agree with the first (which was a miss). Also
+    /// exercises eviction: more distinct keys than the 8-entry cache holds.
+    #[test]
+    fn version_cache_consistent_across_threads_and_evictions() {
+        let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
+        clear_class_layouts();
+        // 20 distinct classes > VERSION_CACHE_LEN (8), so entries get evicted
+        // and re-resolved; each body_size encodes its class id.
+        for cid in 30..50u32 {
+            register_class_layout(cid, one_ref_layout(cid * 8));
+        }
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            handles.push(std::thread::spawn(|| {
+                // Two passes: the second pass hits entries the first warmed.
+                for _ in 0..2 {
+                    for cid in 30..50u32 {
+                        let got = class_layout_for_fields(cid, 1)
+                            .expect("registered layout must resolve");
+                        assert_eq!(
+                            got.body_size,
+                            cid * 8,
+                            "cache returned another class's layout for {cid}"
+                        );
+                    }
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("lookup worker should not panic");
+        }
+        clear_class_layouts();
+    }
+
+    /// `with_class_layout` must agree with `class_layout_for_fields` on both
+    /// the miss (first call) and hit (second call) paths, and must report a
+    /// missing layout as `None` rather than running `f`.
+    #[test]
+    fn with_class_layout_matches_owning_accessor() {
+        let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
+        clear_class_layouts();
+        register_class_layout(60, one_ref_layout(40));
+        // First call is a cache miss (installs), second is a hit.
+        for pass in 0..2 {
+            assert_eq!(
+                with_class_layout(60, 1, |l| l.body_size),
+                Some(40),
+                "pass {pass}"
+            );
+            assert_eq!(
+                with_class_layout(60, 1, |l| l.ref_offsets.clone()),
+                Some(vec![0]),
+                "pass {pass}"
+            );
+        }
+        // Unregistered: `f` must not run.
+        let mut ran = false;
+        let got = with_class_layout(61, 1, |_| {
+            ran = true;
+        });
+        assert!(got.is_none());
+        assert!(!ran, "`f` ran for a class with no registered layout");
+        clear_class_layouts();
+    }
+
+    /// Generation invalidation must apply to the borrowing accessor too — it
+    /// shares one cache with `class_layout_for_fields`, so a replacement that
+    /// the owning accessor sees must not be hidden from this one.
+    #[test]
+    fn with_class_layout_sees_replacement_and_unregister() {
+        let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
+        clear_class_layouts();
+        register_class_layout(62, one_ref_layout(8));
+        assert_eq!(with_class_layout(62, 1, |l| l.body_size), Some(8));
+        register_class_layout(62, one_ref_layout(24));
+        assert_eq!(
+            with_class_layout(62, 1, |l| l.body_size),
+            Some(24),
+            "borrowed entry survived a replacement — generation bump missing"
+        );
+        unregister_class_layout(62);
+        assert_eq!(
+            with_class_layout(62, 1, |l| l.body_size),
+            None,
+            "borrowed entry survived unregister_class_layout"
+        );
+        clear_class_layouts();
+    }
+
+    /// `f` runs while this thread's cache is borrowed, and the GC calls back
+    /// into the cache from inside `f` (`forward_object` -> `object_body_size`)
+    /// on every object it copies. Nested lookups must therefore return correct
+    /// layouts — for the same class and for a different one — and must not
+    /// panic on the `RefCell`.
+    ///
+    /// This is the property that makes the borrowing accessor usable inside the
+    /// Cheney scan loops at all; without it every nested lookup would fall
+    /// through to the registry and the change would be a net slowdown.
+    #[test]
+    fn with_class_layout_is_reentrant() {
+        let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
+        clear_class_layouts();
+        register_class_layout(63, one_ref_layout(8));
+        register_class_layout(64, one_ref_layout(16));
+        // Warm both so the nested lookups exercise the hit path.
+        assert_eq!(class_layout_for_fields(63, 1).unwrap().body_size, 8);
+        assert_eq!(class_layout_for_fields(64, 1).unwrap().body_size, 16);
+
+        let observed = with_class_layout(63, 1, |outer| {
+            // Same class, owning accessor (what `object_body_size` used to do).
+            let same = class_layout_for_fields(63, 1).map(|l| l.body_size);
+            // Different class, borrowing accessor (what it does now) — this is
+            // the referent-sizing call the scan loops make per copied object.
+            let other = with_class_layout(64, 1, |inner| inner.body_size);
+            // Three levels deep, to confirm nesting is not merely depth-1.
+            let deep = with_class_layout(64, 1, |_| with_class_layout(63, 1, |l| l.body_size));
+            (outer.body_size, same, other, deep)
+        });
+        assert_eq!(observed, Some((8, Some(8), Some(16), Some(Some(8)))));
+
+        // A nested lookup for a class that is NOT cached cannot install (the
+        // outer shared borrow blocks it), so it falls through to the registry.
+        // It must still return the right answer.
+        register_class_layout(65, one_ref_layout(32));
+        let uncached = with_class_layout(63, 1, |_| with_class_layout(65, 1, |l| l.body_size));
+        assert_eq!(
+            uncached,
+            Some(Some(32)),
+            "a nested miss must fall through to the registry, not fail"
+        );
         clear_class_layouts();
     }
 
     #[test]
     fn registry_rejects_sparse_class_id_without_poisoning_lock() {
+        let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
         clear_class_layouts();
         let layout = Arc::new(CompactLayout {
             field_offsets: vec![0],
             is_ref: vec![true],
+            field_kinds: vec![FieldStorageKind::Reference],
             ref_offsets: vec![0],
             body_size: 8,
         });
@@ -467,4 +1327,5 @@ mod tests {
         assert!(class_layout(u32::MAX).is_none());
         clear_class_layouts();
     }
+
 }

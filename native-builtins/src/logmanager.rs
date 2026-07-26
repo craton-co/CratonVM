@@ -119,9 +119,9 @@ const LM_FIELD_READY: usize = 3;
 ///   * slot 1 — `level` (Level object; null = inherit from parent).
 ///   * slot 2 — `parent` (Logger object; null for root).
 const LOGGER_NUM_FIELDS: usize = 3;
-const LOGGER_FIELD_NAME: usize = 0;
-const LOGGER_FIELD_LEVEL: usize = 1;
-const LOGGER_FIELD_PARENT: usize = 2;
+pub(crate) const LOGGER_FIELD_NAME: usize = 0;
+pub(crate) const LOGGER_FIELD_LEVEL: usize = 1;
+pub(crate) const LOGGER_FIELD_PARENT: usize = 2;
 
 // ---------------------------------------------------------------------------
 // Process-wide singleton state
@@ -441,8 +441,27 @@ fn ensure_singleton(ctx: &mut dyn NativeContext, class_name: &str) -> ObjectRef 
     obj
 }
 
+/// Resolve one of the 9 standard `java.util.logging.Level` singletons
+/// (`INFO`, `ALL`, `FINE`, ...) by name. Shared by the root-level default,
+/// the convenience-method publishers, and `readConfiguration` parsing.
+pub(crate) fn resolve_standard_level(ctx: &mut dyn NativeContext, name: &str) -> Option<ObjectRef> {
+    let level_class = ctx.ensure_class_initialized(CLS_JUL_LEVEL).ok()?;
+    let idx = ctx.static_field_index_by_name(level_class, name)?;
+    match ctx.get_static_field(level_class, idx) {
+        Value::Object(Some(level)) => Some(level),
+        _ => None,
+    }
+}
+
 /// Allocate a `Logger` object, populate its name field, and register
 /// it in the process-wide registry.
+///
+/// Every non-root logger gets a real parent link (the logger for its
+/// dotted-name prefix, recursively demand-created) so `getParent()` /
+/// `getEffectiveLevel()`-style ancestor walks terminate correctly instead
+/// of chasing a permanently-null parent. The root logger ("") has no
+/// parent but is seeded with the JDK-default `Level.INFO` so those same
+/// walks stop at the root instead of dereferencing a null level.
 fn allocate_logger(ctx: &mut dyn NativeContext, name: &str) -> ObjectRef {
     // Ensure the wildfly_core registry also learns about this name so
     // log-level overrides and credential redaction apply uniformly. The
@@ -452,8 +471,19 @@ fn allocate_logger(ctx: &mut dyn NativeContext, name: &str) -> ObjectRef {
     let obj = alloc_concurrent_synthetic(ctx, CLS_JUL_LOGGER, LOGGER_NUM_FIELDS);
     let name_obj = ctx.create_string(name);
     ctx.set_field(obj, LOGGER_FIELD_NAME, Value::Object(Some(name_obj)));
-    ctx.set_field(obj, LOGGER_FIELD_LEVEL, Value::Object(None));
-    ctx.set_field(obj, LOGGER_FIELD_PARENT, Value::Object(None));
+    if name.is_empty() {
+        ctx.set_field(obj, LOGGER_FIELD_PARENT, Value::Object(None));
+        let default_level = resolve_standard_level(ctx, "INFO");
+        ctx.set_field(obj, LOGGER_FIELD_LEVEL, Value::Object(default_level));
+    } else {
+        ctx.set_field(obj, LOGGER_FIELD_LEVEL, Value::Object(None));
+        let parent_name = match name.rfind('.') {
+            Some(idx) => &name[..idx],
+            None => "",
+        };
+        let parent = get_or_create_logger(ctx, parent_name);
+        ctx.set_field(obj, LOGGER_FIELD_PARENT, Value::Object(Some(parent)));
+    }
     obj
 }
 
@@ -462,7 +492,7 @@ fn allocate_logger(ctx: &mut dyn NativeContext, name: &str) -> ObjectRef {
 /// anonymous Logger that isn't registered so the caller still receives
 /// a non-null Logger for the `.info()` / `.warning()` fallback but the
 /// bad name never enters the registry.
-fn get_or_create_logger(ctx: &mut dyn NativeContext, name: &str) -> ObjectRef {
+pub(crate) fn get_or_create_logger(ctx: &mut dyn NativeContext, name: &str) -> ObjectRef {
     if !is_valid_logger_name(name) {
         tracing::warn!(
             rejected_name = %name,
@@ -495,7 +525,7 @@ fn get_or_create_logger(ctx: &mut dyn NativeContext, name: &str) -> ObjectRef {
     obj
 }
 
-fn read_jul_logger_name(ctx: &dyn NativeContext, logger: ObjectRef) -> String {
+pub(crate) fn read_jul_logger_name(ctx: &dyn NativeContext, logger: ObjectRef) -> String {
     // Real-JDK Logger instances keep their name in the `name` field; slot 0 is
     // `Logger$ConfigurationData`. CratonVM synthetic Logger instances keep the
     // name in slot 0. Prefer the real layout, then fall back only if slot 0 is
@@ -854,9 +884,188 @@ fn native_read_configuration_no_arg(
 }
 
 fn native_read_configuration_with_stream(
-    _ctx: &mut dyn NativeContext,
-    _args: &[Value],
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
 ) -> MethodCallResult {
+    // args[0] = this (LogManager), args[1] = the InputStream.
+    let Some(Value::Object(Some(stream))) = args.get(1).copied() else {
+        return Ok(None);
+    };
+    let Some(bytes) = crate::properties_sidetable::drain_input_stream_pub(ctx, stream) else {
+        return Ok(None);
+    };
+    let entries = crate::properties_sidetable::parse_properties_pub(&bytes);
+    apply_jul_config_entries(ctx, &entries)
+}
+
+fn parsed_log_properties() -> &'static Mutex<HashMap<String, String>> {
+    static T: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+    T.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Apply a parsed `java.util.logging` properties file (Spring Boot's
+/// bundled `logging.properties`/`logging-file.properties` in this
+/// cluster): install `handlers=` on the root logger, apply
+/// `.level=`/`<logger-name>.level=` entries into `logger_explicit_levels`,
+/// and forward per-handler `<HandlerClass>.level`/`.formatter` keys to the
+/// handler instances just created.
+///
+/// This intentionally stays reachable ONLY from the `InputStream` overload
+/// (never the no-arg, filesystem-backed one — see
+/// `native_read_configuration_no_arg`), so the only content ever parsed
+/// here is a stream the caller's own Java code already produced (a
+/// packaged classpath `Resource`), not arbitrary filesystem/environment
+/// input.
+fn apply_jul_config_entries(
+    ctx: &mut dyn NativeContext,
+    entries: &[(String, String)],
+) -> MethodCallResult {
+    // A fresh `readConfiguration` call replaces the whole prior config
+    // snapshot, matching real JUL semantics.
+    {
+        let mut props = parsed_log_properties()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        props.clear();
+        for (k, v) in entries {
+            props.insert(k.clone(), v.clone());
+        }
+    }
+    // Real `LogManager.readConfiguration` calls `reset()` first, which sets
+    // every known logger's level back to null before the new config is
+    // applied. Our `logger_explicit_levels` side table has no equivalent of
+    // real JUL's per-Logger weak-reference lifecycle (a real Logger with no
+    // external strong ref is eventually collected and recreated fresh by
+    // `demandLogger`, silently dropping stale explicit levels); ours is a
+    // permanent, process-wide map, so without this clear, an explicit level
+    // set in one test (e.g. `JavaLoggingSystemTests`'s
+    // `@AfterEach resetLogger` calling `this.logger.setLevel(Level.OFF)`)
+    // would leak into every subsequent test sharing this process and
+    // permanently mute that logger.
+    logger_explicit_levels()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
+
+    let handler_class_names: Vec<String> = entries
+        .iter()
+        .find(|(k, _)| k == "handlers")
+        .map(|(_, v)| {
+            v.split(|c: char| c == ',' || c.is_whitespace())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| s.replace('.', "/"))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let root = get_or_create_logger(ctx, "");
+    let root_pin = ctx.pin_native_root(root);
+    // A fresh config replaces whatever handlers a previous
+    // `readConfiguration` call (or explicit `addHandler`) installed on the
+    // root logger -- otherwise repeated `beforeInitialize`/`initialize`
+    // cycles (one per @Test method sharing this process) would stack up
+    // duplicate `ConsoleHandler`s and double-print every message.
+    crate::jul_logger_handlers_clear(ctx, root);
+
+    let mut created: Vec<(String, ObjectRef)> = Vec::new();
+    for cls in &handler_class_names {
+        if let Ok(Some(Value::Object(Some(handler)))) = ctx.new_object_initialized(cls, "()V", &[])
+        {
+            let root = ctx.read_native_pin(root_pin, root);
+            let _ = native_jul_logger_add_handler(
+                ctx,
+                &[Value::Object(Some(root)), Value::Object(Some(handler))],
+            );
+            created.push((cls.replace('/', "."), handler));
+        }
+        // Handler class missing/uninstantiable -- skip it rather than fail
+        // the whole config load (mirrors real JUL's per-handler try/catch
+        // in `LogManager.readConfiguration`).
+    }
+    ctx.unpin_native_roots(root_pin);
+
+    let mut formatter_configured = vec![false; created.len()];
+    for (k, v) in entries {
+        if k == "handlers" {
+            continue;
+        }
+        let Some(dot) = k.rfind('.') else { continue };
+        let (prefix, suffix) = (&k[..dot], &k[dot + 1..]);
+        if let Some(idx) = created.iter().position(|(name, _)| name == prefix) {
+            let handler = created[idx].1;
+            match suffix {
+                "level" => {
+                    if let Some(level) = resolve_standard_level(ctx, v.trim()) {
+                        let _ = ctx.invoke_virtual(
+                            handler,
+                            "setLevel",
+                            "(Ljava/util/logging/Level;)V",
+                            &[Value::Object(Some(level))],
+                        );
+                    }
+                }
+                "formatter" => {
+                    if let Ok(Some(Value::Object(Some(fmt)))) =
+                        ctx.new_object_initialized(&v.trim().replace('.', "/"), "()V", &[])
+                    {
+                        let _ = ctx.invoke_virtual(
+                            handler,
+                            "setFormatter",
+                            "(Ljava/util/logging/Formatter;)V",
+                            &[Value::Object(Some(fmt))],
+                        );
+                        formatter_configured[idx] = true;
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+        // Not a handler-instance key -- treat `<logger-name>.level` (the
+        // root is the empty-prefix case, key literally ".level") as a
+        // per-logger explicit level.
+        if suffix == "level" {
+            if let Some(level) = jul_standard_level_value(v.trim()) {
+                logger_explicit_levels()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(prefix.to_string(), level);
+            }
+        }
+    }
+    // Handlers with no explicit `.formatter=` config fall back to real
+    // JDK's own `new java.util.logging.SimpleFormatter()`. That
+    // constructor computes its default pattern via `invokedynamic` +
+    // `jdk/internal/logger/SurrogateLogger.getSimpleFormat` (a lambda
+    // metafactory call into a JDK-internal helper), which under CratonVM
+    // leaves the formatter's private `format` field null instead of the
+    // documented default pattern -- `String.format(null, ...)` then either
+    // throws (silently swallowed by `Handler.publish`'s own
+    // format-failure error path) or produces no usable text, so every
+    // handler built this way is publish-silent. Detect the unset field
+    // and patch in the documented default pattern directly, sidestepping
+    // the broken `invokedynamic` path without reimplementing it.
+    for (idx, (_, handler)) in created.iter().enumerate() {
+        if formatter_configured[idx] {
+            continue;
+        }
+        if let Ok(Some(Value::Object(Some(fmt)))) =
+            ctx.new_object_initialized("java/util/logging/SimpleFormatter", "()V", &[])
+        {
+            // Always overwrite: the broken constructor doesn't reliably
+            // leave `format` exactly null (observed non-null-but-wrong
+            // values too), so a null-only guard under-detects.
+            let pattern = ctx.create_string("%1$tc%n%4$s: %5$s%n%6$s%n");
+            ctx.set_field_by_name(fmt, "format", Value::Object(Some(pattern)));
+            let _ = ctx.invoke_virtual(
+                *handler,
+                "setFormatter",
+                "(Ljava/util/logging/Formatter;)V",
+                &[Value::Object(Some(fmt))],
+            );
+        }
+    }
     Ok(None)
 }
 
@@ -2736,11 +2945,43 @@ fn publish_to_jul_handlers_src(
                         == Some("java/lang/String"));
             if synthetic_layout {
                 match ctx.get_field(logger, LOGGER_FIELD_PARENT) {
-                    Value::Object(Some(list)) => Some(list),
+                    // `allocate_logger` now populates this same slot with a
+                    // real parent `Logger` (see ancestor walk below) rather
+                    // than a handlers list -- don't misread it as one.
+                    Value::Object(Some(list))
+                        if ctx.class_name_of_id(ctx.class_id_of_object(list)).as_deref()
+                            != Some(CLS_JUL_LOGGER) =>
+                    {
+                        Some(list)
+                    }
                     _ => None,
                 }
             } else {
                 None
+            }
+        }).or_else(|| {
+            // No handlers on the exact logger (and it isn't the legacy
+            // slot-2 layout above): walk dotted-name ancestors up to the
+            // root, mirroring real JUL's parent-handler propagation
+            // (`useParentHandlers`, on by default). Our loggers have no
+            // real object parent chain to traverse pre-T19.H3-fix here, so
+            // walk by name instead -- covers the common case of a single
+            // ConsoleHandler installed on the root logger by
+            // `readConfiguration`.
+            let logger_name = read_jul_logger_name(ctx, logger);
+            let mut candidate: &str = &logger_name;
+            loop {
+                if candidate.is_empty() {
+                    return None;
+                }
+                candidate = match candidate.rfind('.') {
+                    Some(idx) => &candidate[..idx],
+                    None => "",
+                };
+                let ancestor = get_or_create_logger(ctx, candidate);
+                if let Some(h) = crate::jul_logger_handlers_get(ctx, ancestor) {
+                    return Some(h);
+                }
             }
         });
         let Some(handlers) = handlers else {
@@ -3156,18 +3397,7 @@ pub(crate) fn native_jul_logger_is_loggable(
                     Value::Object(Some(s)) => ctx.read_string(s),
                     _ => None,
                 })
-                .map(|n| match n.as_str() {
-                    "OFF" => i32::MAX,
-                    "SEVERE" => 1000,
-                    "WARNING" => 900,
-                    "INFO" => 800,
-                    "CONFIG" => 700,
-                    "FINE" => 500,
-                    "FINER" => 400,
-                    "FINEST" => 300,
-                    "ALL" => i32::MIN,
-                    _ => 800,
-                })
+                .and_then(|n| jul_standard_level_value(&n))
         })
         .unwrap_or(800);
     let configured_threshold = logger
@@ -3184,19 +3414,58 @@ pub(crate) fn native_jul_logger_is_loggable(
         .unwrap_or(800);
     let threshold = logger
         .map(|logger| read_jul_logger_name(ctx, logger))
-        .and_then(|name| {
-            logger_explicit_levels()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .get(&name)
-                .copied()
-        })
+        .map(|name| jul_ancestor_explicit_level(&name).unwrap_or(configured_threshold))
         .unwrap_or(configured_threshold);
     Ok(Some(Value::Int(if level_value >= threshold {
         1
     } else {
         0
     })))
+}
+
+/// Map one of the 9 standard `java.util.logging.Level` names to its `int`
+/// value. Mirrors `java.util.logging.Level`'s built-in constants.
+fn jul_standard_level_value(name: &str) -> Option<i32> {
+    Some(match name {
+        "OFF" => i32::MAX,
+        "SEVERE" => 1000,
+        "WARNING" => 900,
+        "INFO" => 800,
+        "CONFIG" => 700,
+        "FINE" => 500,
+        "FINER" => 400,
+        "FINEST" => 300,
+        "ALL" => i32::MIN,
+        _ => return None,
+    })
+}
+
+/// Look up the effective explicit level threshold for a logger name,
+/// walking from the exact name up through its dotted-name ancestors to the
+/// root ("") — mirroring real JUL's "inherit the nearest ancestor's
+/// explicit level" semantics, which our flat name-keyed
+/// `logger_explicit_levels` side table doesn't give us for free (a
+/// descendant logger that never had `setLevel` called on it directly must
+/// still see an ancestor's level, e.g. Spring Boot's
+/// `JavaLoggingSystem.setLogLevel("org.springframework.boot", DEBUG)`
+/// followed by a child logger's `.fine(...)` call).
+fn jul_ancestor_explicit_level(logger_name: &str) -> Option<i32> {
+    let levels = logger_explicit_levels()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut candidate = logger_name;
+    loop {
+        if let Some(v) = levels.get(candidate) {
+            return Some(*v);
+        }
+        if candidate.is_empty() {
+            return None;
+        }
+        candidate = match candidate.rfind('.') {
+            Some(idx) => &candidate[..idx],
+            None => "",
+        };
+    }
 }
 
 pub(crate) fn record_jul_logger_level(ctx: &dyn NativeContext, logger: ObjectRef, level: Value) {
@@ -3237,8 +3506,12 @@ fn native_jul_logger_severe(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     Ok(None)
 }
 fn native_jul_logger_fine(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    // Keep fine/finer/finest quiet on the console, but explicit JUL handlers
-    // (for example Tomcat's LogCapture) must still receive the record.
+    // Keep fine/finer/finest quiet on the console by default (real JUL's
+    // root level is INFO), but honor an ancestor level raised to
+    // DEBUG/FINE-or-finer (e.g. Spring Boot's `LoggingSystem.setLogLevel`)
+    // and explicit JUL handlers (for example Tomcat's LogCapture) must
+    // still receive the record -- see `publish_jul_convenience`'s
+    // `isLoggable` gate.
     publish_jul_convenience(ctx, args, "FINE")?;
     Ok(None)
 }
@@ -3253,14 +3526,22 @@ fn publish_jul_convenience(
     else {
         return Ok(None);
     };
-    let level_class = ctx.ensure_class_initialized("java/util/logging/Level")?;
-    let Some(level_index) = ctx.static_field_index_by_name(level_class, level_name) else {
+    let Some(level) = resolve_standard_level(ctx, level_name) else {
         return Ok(None);
     };
-    let level = match ctx.get_static_field(level_class, level_index) {
-        Value::Object(Some(level)) => level,
-        _ => return Ok(None),
-    };
+    // Gate on the real (ancestor-aware) effective level, matching the real
+    // JDK's `Logger.info/warning/severe/fine(...)` convenience methods,
+    // which all internally check `isLoggable` before publishing.
+    let loggable = matches!(
+        native_jul_logger_is_loggable(
+            ctx,
+            &[Value::Object(Some(*logger)), Value::Object(Some(level))]
+        )?,
+        Some(Value::Int(1))
+    );
+    if !loggable {
+        return Ok(None);
+    }
     publish_to_jul_handlers(ctx, *logger, level, *message)
 }
 
@@ -3269,6 +3550,39 @@ fn log_simple(ctx: &mut dyn NativeContext, args: &[Value], level: &str) {
         Some(Value::Object(o)) => *o,
         _ => None,
     };
+    // This fallback channel predates the fix that made real
+    // `ConsoleHandler.publish` actually produce visible output (a stale
+    // `phases_early` stub silently discarded every record -- see
+    // `apply_jul_config_entries`/the removed `ConsoleHandler` overrides);
+    // it unconditionally surfaced every `info`/`warning`/`severe` call
+    // regardless of the logger's configured level so *something* was
+    // visible under `CapturedOutput`. Now that real delivery works and is
+    // correctly level-gated, this unconditional emission leaks messages
+    // tests explicitly assert are ABSENT (e.g.
+    // `JavaLoggingSystemTests#noFile` logs "Hidden" while the root logger
+    // is muted to SEVERE via `beforeInitialize`, then asserts the captured
+    // output does NOT contain it). Gate on the same ancestor-aware
+    // effective level so this channel's visibility matches what real JUL
+    // would actually deliver.
+    let jul_level_name = match level {
+        "WARN" => "WARNING",
+        "ERROR" => "SEVERE",
+        _ => "INFO",
+    };
+    if let Some(logger) = this {
+        if let Some(level_obj) = resolve_standard_level(ctx, jul_level_name) {
+            let loggable = matches!(
+                native_jul_logger_is_loggable(
+                    ctx,
+                    &[Value::Object(Some(logger)), Value::Object(Some(level_obj))]
+                ),
+                Ok(Some(Value::Int(1)))
+            );
+            if !loggable {
+                return;
+            }
+        }
+    }
     let message_obj = match args.get(1) {
         Some(Value::Object(o)) => *o,
         _ => None,
@@ -3308,11 +3622,30 @@ fn native_jboss_logger_detach(_ctx: &mut dyn NativeContext, args: &[Value]) -> M
     }))
 }
 
-fn native_get_property(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    // We never load configuration files (see `native_read_configuration_*`),
-    // so every `getProperty(key)` returns null. The JDK default
-    // implementation also allows null returns, so callers handle it.
-    Ok(Some(Value::Object(None)))
+fn native_get_property(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // We never load a filesystem-backed configuration (see
+    // `native_read_configuration_no_arg`), but a prior `readConfiguration
+    // (InputStream)` call (Spring Boot's `JavaLoggingSystem`) does populate
+    // `parsed_log_properties` -- consult it so e.g. a `Handler` subclass's
+    // own constructor bytecode querying `LogManager.getProperty(cname +
+    // ".level")` observes the same config `apply_jul_config_entries`
+    // already applied directly.
+    let key = match args.get(1) {
+        Some(Value::Object(Some(s))) => ctx.read_string(*s),
+        _ => None,
+    };
+    let Some(key) = key else {
+        return Ok(Some(Value::Object(None)));
+    };
+    let value = parsed_log_properties()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&key)
+        .cloned();
+    match value {
+        Some(v) => Ok(Some(Value::Object(Some(ctx.create_string(&v))))),
+        None => Ok(Some(Value::Object(None))),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3880,7 +4213,7 @@ pub fn register_logmanager_natives(registry: &mut NativeMethodRegistry) {
     // Log4j2Logger, Log4jLogger), so `WFLY*` boot messages still reach stderr.
     // Set CRATONVM_JBOSS_LOGGER_BASE_EMIT=1 to restore the old blanket
     // base-class emit if a logger outside that set ever needs it.
-    if std::env::var("CRATONVM_JBOSS_LOGGER_BASE_EMIT").as_deref() == Ok("1") {
+    if crate::nbflags().jboss_logger_base_emit {
         let jlog = "org/jboss/logging/Logger";
         // info family
         // The `(String loggerFqcn, Object message, Throwable)` forms get the

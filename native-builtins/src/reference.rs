@@ -108,6 +108,34 @@ pub(crate) fn register_reference_natives(registry: &mut NativeMethodRegistry) {
         native_brave_weak_key_equals,
     );
 
+    // Same underlying defect as the Brave bridge above (see its comment): a
+    // shared/polymorphic `Object.equals()` call site inside
+    // `ConcurrentHashMap`'s internals can resolve to the wrong override for a
+    // rarely-exercised receiver class, silently falling back to identity
+    // comparison. Mockito's `mockito-core`'s own `WeakConcurrentMap` vendors
+    // the exact same WeakKey/LatentKey asymmetric-equals design as Brave's
+    // (both libraries independently converged on the same pattern for a
+    // GC-aware identity map), and hits the identical dispatch failure: a
+    // freshly created mock's entry is unfindable via
+    // `WeakConcurrentMap.get()` after `put()` genuinely stored it, because
+    // `LatentKey.equals(WeakKey)` (or the reverse) never actually reaches
+    // Mockito's own bytecode. Confirmed via `Mockito.verify(mock)` throwing
+    // `NotAMockException` for a mock created and used successfully moments
+    // earlier (`docs/known-issues/springboot/tomcatservletwebserverservletcontextlistenertests-mockito-forkedclasspath-mockmethodadvice.md`).
+    // Bridge both directions explicitly, mirroring Mockito's own semantics.
+    registry.register(
+        "org/mockito/internal/util/concurrent/WeakConcurrentMap$WeakKey",
+        "equals",
+        "(Ljava/lang/Object;)Z",
+        native_mockito_weak_key_equals,
+    );
+    registry.register(
+        "org/mockito/internal/util/concurrent/WeakConcurrentMap$LatentKey",
+        "equals",
+        "(Ljava/lang/Object;)Z",
+        native_mockito_latent_key_equals,
+    );
+
     // SoftReference constructors
     registry.register(
         "java/lang/ref/SoftReference",
@@ -210,6 +238,61 @@ fn native_brave_weak_key_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     )))
 }
 
+/// `WeakConcurrentMap$WeakKey.equals(Object)` — mirrors Mockito's own
+/// bytecode: `other instanceof LatentKey ? ((LatentKey) other).key ==
+/// this.get() : ((WeakKey) other).get() == this.get()`. See the registration
+/// site's comment for why the real bytecode is unreliable here.
+fn native_mockito_weak_key_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let Some(Value::Object(Some(this))) = args.first() else {
+        return Ok(Some(Value::Int(0)));
+    };
+    let Some(Value::Object(Some(other))) = args.get(1) else {
+        return Ok(Some(Value::Int(0)));
+    };
+    let this_referent = ctx.get_field_by_name(*this, "referent");
+    let is_latent = ctx.class_name_of_id(ctx.class_id_of_object(*other)).as_deref()
+        == Some("org/mockito/internal/util/concurrent/WeakConcurrentMap$LatentKey");
+    let other_key = if is_latent {
+        ctx.get_field_by_name(*other, "key")
+    } else {
+        ctx.get_field_by_name(*other, "referent")
+    };
+    Ok(Some(Value::Int(
+        (matches!((this_referent, other_key),
+            (Value::Object(a), Value::Object(b)) if a == b))
+            as i32,
+    )))
+}
+
+/// `WeakConcurrentMap$LatentKey.equals(Object)` — mirrors Mockito's own
+/// bytecode: `other instanceof LatentKey ? other.key == this.key :
+/// ((WeakKey) other).get() == this.key`.
+fn native_mockito_latent_key_equals(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let Some(Value::Object(Some(this))) = args.first() else {
+        return Ok(Some(Value::Int(0)));
+    };
+    let Some(Value::Object(Some(other))) = args.get(1) else {
+        return Ok(Some(Value::Int(0)));
+    };
+    let this_key = ctx.get_field_by_name(*this, "key");
+    let other_key = if ctx.class_name_of_id(ctx.class_id_of_object(*other))
+        .as_deref()
+        == Some("org/mockito/internal/util/concurrent/WeakConcurrentMap$LatentKey")
+    {
+        ctx.get_field_by_name(*other, "key")
+    } else {
+        ctx.get_field_by_name(*other, "referent")
+    };
+    Ok(Some(Value::Int(
+        (matches!((this_key, other_key),
+            (Value::Object(a), Value::Object(b)) if a == b))
+            as i32,
+    )))
+}
+
 // ---------------------------------------------------------------------------
 // Reference constructors
 // ---------------------------------------------------------------------------
@@ -297,15 +380,40 @@ fn native_weak_ref_init_queue(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     Ok(None)
 }
 
+/// Round-5 fixed `SoftReference.get()` to touch the LRU timestamp on every
+/// *read* — but a freshly-constructed SoftReference whose first read is
+/// still ahead of it starts with `last_access_time_ms == 0`
+/// (`RefProcessor::discover_reference`), which looks INFINITELY idle to
+/// `process_soft_refs`'s `current_time_ms - last_access_time_ms > threshold`
+/// check. A cache that populates a SoftReference once and only reads it
+/// through a wrapper that doesn't itself call `.get()` on the first
+/// population (Groovy's `org.codehaus.groovy.util.LazyReference.getLocked`
+/// stores `new ManagedReference(bundle, res)` and returns `res` directly,
+/// without ever calling the `ManagedReference`'s own `.get()`) can therefore
+/// have its cached value cleared on the very first GC after construction —
+/// SECONDS before anything ever read it — instead of only under genuine LRU
+/// staleness. Root cause of `groovy.lang.MetaClassImpl.addFields` NPEing on
+/// `CachedClass.getFields()` returning null the *second* time a given
+/// interface's fields are requested (`SpringApplicationNoWebTests`,
+/// `GroovySystem.<clinit>` bootstrap). Touch it once at construction so a
+/// brand-new SoftReference starts its LRU clock at "now", matching a real
+/// JVM's effective behavior (a soft ref's clock is seeded relative to the
+/// GC epoch at creation, not zero).
 fn native_soft_ref_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     ref_init_impl(ctx, args, false);
     discover_ref_from_args(ctx, args, 1, false);
+    if let Some(Value::Object(Some(this))) = args.first() {
+        ctx.touch_soft_reference(*this);
+    }
     Ok(None)
 }
 
 fn native_soft_ref_init_queue(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     ref_init_impl(ctx, args, true);
     discover_ref_from_args(ctx, args, 1, true);
+    if let Some(Value::Object(Some(this))) = args.first() {
+        ctx.touch_soft_reference(*this);
+    }
     Ok(None)
 }
 

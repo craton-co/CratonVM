@@ -751,15 +751,14 @@ pub fn verify_instruction(
             })
         }
 
-        Instruction::Tableswitch {
-            default,
-            low: _,
-            high: _,
-            offsets,
-        } => {
+        Instruction::Tableswitch(ts) => {
             frame.pop_expect(&VType::Int, hierarchy)?;
-            let mut targets: Vec<u16> = offsets.iter().map(|off| branch_target(pc, *off)).collect();
-            targets.push(branch_target(pc, *default));
+            let mut targets: Vec<u16> = ts
+                .offsets
+                .iter()
+                .map(|off| branch_target(pc, *off))
+                .collect();
+            targets.push(branch_target(pc, ts.default));
             // Deduplicate
             targets.sort();
             targets.dedup();
@@ -769,13 +768,14 @@ pub fn verify_instruction(
             })
         }
 
-        Instruction::Lookupswitch { default, pairs } => {
+        Instruction::Lookupswitch(ls) => {
             frame.pop_expect(&VType::Int, hierarchy)?;
-            let mut targets: Vec<u16> = pairs
+            let mut targets: Vec<u16> = ls
+                .pairs
                 .iter()
                 .map(|(_, off)| branch_target(pc, *off))
                 .collect();
-            targets.push(branch_target(pc, *default));
+            targets.push(branch_target(pc, ls.default));
             targets.sort();
             targets.dedup();
             Ok(InsnVerifyResult {

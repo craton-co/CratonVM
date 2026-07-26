@@ -100,7 +100,7 @@ Removed the now-fully-superseded `tz_dst_rule`/`dst_start_year`/
   doc's DST-gap repro) — **PASSes**.
 - Broad H2 suite regression pass (`apps/h2database-suite-runner`, jit-real
   mode): no new failures beyond ones already documented elsewhere in
-  `docs/known-issues/h2-suite-bugs/` (`TestAuthentication`, `TestAlter`,
+  `../../../known-issues/h2/` (`TestAuthentication`, `TestAlter`,
   `TestLargeBlob`, etc. — pre-existing, unrelated). `TestDate`/
   `TestDateTimeUtils` intermittent hangs under host load confirmed
   **pre-existing on the baseline (pre-fix) binary too** (identical timeout

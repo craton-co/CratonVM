@@ -143,11 +143,11 @@ and finds none, instead of routing the call to the proxy's `InvocationHandler`
 (Groovy's `ConvertedClosure`, which would call `closure.call(args)`). This is a
 `java.lang.reflect.Proxy` method-dispatch gap for proxies whose interface method
 is invoked from compiled Java/Groovy (cf. [[reference_proxy_realsuper_soak]]).
-Repro: `docs/internal/repros/springrepos-indy-3c/SamRealProbe.java` (real, non-
+Repro: `../repros/springrepos-indy-3c/SamRealProbe.java` (real, non-
 mock `Action` sink).
 
 ## Layer h — closure→Action on a Mockito mock
-`docs/internal/repros/springrepos-indy-3c/SamCoerceProbe.java`: `repo.mavenContent
+`../repros/springrepos-indy-3c/SamCoerceProbe.java`: `repo.mavenContent
 { }` where `repo = mock(MavenArtifactRepository.class)` and
 `given(repo.mavenContent(any(Action.class)))` is stubbed. On CratonVM the stub is
 never driven (`fired=0`), so the test's `mavenContent`/`content`/`credentials`
@@ -181,7 +181,7 @@ CRATONVM_DISABLE_DEFAULT_WATCHDOG=1 "$CV" --java-home "$JH" --nojit -cp "$CP" \
   `mh_dispatch_filter` landed in 3f).
 
 ## Tools / artifacts
-Probes (all under `docs/internal/repros/springrepos-indy-3c/`): `SamRealProbe`
+Probes (all under `../repros/springrepos-indy-3c/`): `SamRealProbe`
 (layer g), `SamCoerceProbe` (layer h); plus the 3e probes `CastProbe`/`NegProbe`/
 `BoolReturnProbe`/`DttProbe` (== HotSpot). buildSrc tree is gitignored; runner
 copies live in `apps/spring-boot/buildSrc/runner/`.

@@ -92,7 +92,7 @@ Branch `fix/otlp-mockito-bytebuddy-hang-20260720`, worktree
 `C:\craton\CratonVM-otlp-mockito-bytebuddy-hang-20260720`, unique binary
 `cratonvm-otlp-mockito-bytebuddy-hang-20260720.exe`.
 
-- Minimal repro (`docs/known-issues/springboot/repros/interface-default-supercall-mockito-spy-repro.java`):
+- Minimal repro (`../../../known-issues/repros/springboot/interface-default-supercall-mockito-spy-repro.java`):
   pre-fix infinite recursion / watchdog abort → post-fix
   `RESULT=interface-default-overridden`, matches real HotSpot exactly.
 - `OtlpMetricsPropertiesConfigAdapterTests` (30 tests): pre-fix CRASH (watchdog abort,

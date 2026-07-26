@@ -12,6 +12,7 @@ use crate::class_file::ClassFile;
 use crate::class_file_version::ClassFileVersion;
 use crate::class_reader_error::ClassReaderError;
 use crate::constant_pool::{ConstantPool, ConstantPoolEntry};
+use crate::byte_view::SharedBytes;
 use crate::field::ClassFileField;
 use crate::method::ClassFileMethod;
 use std::sync::Arc;
@@ -70,7 +71,16 @@ pub fn read_class(data: &[u8]) -> Result<ClassFile, ClassReaderError> {
 /// that [`read_class`] performs at parse entry when the caller already
 /// owns a shared buffer.
 pub fn read_class_arc(source: Arc<[u8]>) -> Result<ClassFile, ClassReaderError> {
-    let mut buf = ClassFileBuffer::new(&source);
+    read_class_shared(source.into())
+}
+
+/// Parse a class directly from shared owned or externally-backed bytes.
+///
+/// File-mapped stored JAR entries use this entry point so every lazy
+/// attribute and bytecode view retains the archive mapping rather than
+/// materializing a per-class copy.
+pub fn read_class_shared(source: SharedBytes) -> Result<ClassFile, ClassReaderError> {
+    let mut buf = ClassFileBuffer::new(source.as_ref());
 
     // Magic number
     let magic = buf.read_u32()?;
@@ -460,7 +470,7 @@ fn read_constant_pool(buf: &mut ClassFileBuffer) -> Result<ConstantPool, ClassRe
 fn read_field(
     buf: &mut ClassFileBuffer,
     constant_pool: &ConstantPool,
-    source: &Arc<[u8]>,
+    source: &SharedBytes,
 ) -> Result<ClassFileField, ClassReaderError> {
     let access_flags_raw = buf.read_u16()?;
     let access_flags = FieldAccessFlags::from_bits_retain(access_flags_raw);
@@ -495,7 +505,7 @@ fn read_field(
 fn read_method(
     buf: &mut ClassFileBuffer,
     constant_pool: &ConstantPool,
-    source: &Arc<[u8]>,
+    source: &SharedBytes,
 ) -> Result<ClassFileMethod, ClassReaderError> {
     let access_flags_raw = buf.read_u16()?;
     let access_flags = MethodAccessFlags::from_bits_retain(access_flags_raw);
@@ -551,7 +561,7 @@ fn read_method(
 fn read_attributes(
     buf: &mut ClassFileBuffer,
     constant_pool: &ConstantPool,
-    source: &Arc<[u8]>,
+    source: &SharedBytes,
 ) -> Result<Vec<LazyAttribute>, ClassReaderError> {
     let count = buf.read_u16()?;
     validate_count("attributes", count, MAX_ATTRIBUTE_COUNT)?;
@@ -614,7 +624,7 @@ fn read_attributes(
         // (~5 k classes × ~10 attrs × ~50 B average).
         attributes.push(LazyAttribute::new_raw_in(
             name,
-            Arc::clone(source),
+            source.clone(),
             start..end,
         ));
     }
@@ -741,7 +751,7 @@ mod tests {
         push_u16(&mut full, 1);
         full.extend_from_slice(&raw);
 
-        let source: Arc<[u8]> = Arc::from(full.as_slice());
+        let source = SharedBytes::from(full.as_slice());
         let mut buf = ClassFileBuffer::new(&source);
         let mut attrs = read_attributes(&mut buf, &cp, &source).unwrap();
         assert_eq!(attrs.len(), 1);
@@ -881,7 +891,7 @@ mod tests {
         raw.extend_from_slice(&len.to_be_bytes());
         raw.extend_from_slice(&body);
 
-        let source: Arc<[u8]> = Arc::from(raw.as_slice());
+        let source = SharedBytes::from(raw.as_slice());
         let mut buf = ClassFileBuffer::new(&source);
         let attrs = read_attributes(&mut buf, &cp, &source).unwrap();
         assert_eq!(attrs.len(), 1);
@@ -906,7 +916,7 @@ mod tests {
         push_u16(&mut raw, 1); // name index
                                // Declared length = 1_000_000, but no body bytes follow.
         raw.extend_from_slice(&1_000_000_u32.to_be_bytes());
-        let source: Arc<[u8]> = Arc::from(raw.as_slice());
+        let source = SharedBytes::from(raw.as_slice());
         let mut buf = ClassFileBuffer::new(&source);
         assert!(read_attributes(&mut buf, &cp, &source).is_err());
     }

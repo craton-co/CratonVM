@@ -67,6 +67,7 @@ use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 
+use crate::io_flags;
 use cratonvm_native_api::fd_table::FdId;
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError, VmError};
@@ -153,7 +154,7 @@ const SYNTHETIC_PROCESS_INPUT_STREAM: &str = "cratonvm/synthetic/ProcessPipeInpu
 const SYNTHETIC_PROCESS_OUTPUT_STREAM: &str = "cratonvm/synthetic/ProcessPipeOutputStream";
 
 fn pb_debug_enabled() -> bool {
-    std::env::var_os("CRATONVM_DBG_PB").is_some()
+    io_flags().dbg_pb
 }
 
 #[derive(Clone, Debug)]

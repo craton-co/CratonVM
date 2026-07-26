@@ -148,6 +148,7 @@ fn clinit_concurrent_init() {
     let t1 = std::thread::spawn(move || {
         let mut thread = cratonvm_vm::threading::JvmThread::new(ThreadId(1), "thread-1");
         shared1
+            .threads
             .thread_registry
             .register(ThreadId(1), "thread-1", None);
         b1.wait(); // sync start
@@ -170,6 +171,7 @@ fn clinit_concurrent_init() {
     let t2 = std::thread::spawn(move || {
         let mut thread = cratonvm_vm::threading::JvmThread::new(ThreadId(2), "thread-2");
         shared2
+            .threads
             .thread_registry
             .register(ThreadId(2), "thread-2", None);
         b2.wait(); // sync start

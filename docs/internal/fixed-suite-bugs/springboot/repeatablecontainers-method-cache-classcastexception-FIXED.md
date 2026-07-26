@@ -70,7 +70,7 @@ closure history for that window) incidentally fixed whatever underlying
 `Map`/reference-handling defect caused this. No specific commit was
 identified as *the* fix — if this ever regresses, re-open with a fresh
 `git bisect` between those dates using the `CrhmRepro.java` probe (kept
-under `docs/known-issues/springboot/repros/` — see below) as a fast,
+under `../../../known-issues/repros/springboot/` — see below) as a fast,
 Spring-independent repro.
 
 ## Repro tooling kept for future use

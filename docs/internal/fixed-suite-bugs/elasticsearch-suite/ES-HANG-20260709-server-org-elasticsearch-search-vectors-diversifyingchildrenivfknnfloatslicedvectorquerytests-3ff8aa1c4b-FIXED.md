@@ -210,7 +210,7 @@ file. Branch `fix/es-ivfknn-hang-20260716`, worktree
   watchdog, zero `implausible extent`/`GAP-filler sentinel`/`Stale pointer`
   warnings).
 - **`testRandomWithFilter`** (the sibling
-  [IVFKnnFloatVectorQueryTests doc](../ES-HANG-20260709-server-org-elasticsearch-search-vectors-ivfknnfloatvectorquerytests-565afb965e-FIXED.md)'s
+  [IVFKnnFloatVectorQueryTests doc](ES-HANG-20260709-server-org-elasticsearch-search-vectors-ivfknnfloatvectorquerytests-565afb965e-FIXED.md)'s
   own hang target): now passes cleanly **4/4** (~20-22s each, zero
   corruption warnings) — see that doc for the full write-up; it is being
   marked FIXED and moved to `docs/internal/fixed-suite-bugs/`.

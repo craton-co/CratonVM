@@ -20,16 +20,19 @@ fn system_getenv_returns_unmodifiable_map_with_hashmap_backing() {
 
     let getenv = vm
         .shared
+        .natives
         .native_methods
         .find("java/lang/System", "getenv", "()Ljava/util/Map;")
         .expect("System.getenv()Map must be registered");
     let object_get_class = vm
         .shared
+        .natives
         .native_methods
         .find("java/lang/Object", "getClass", "()Ljava/lang/Class;")
         .expect("Object.getClass must be registered");
     let class_get_name = vm
         .shared
+        .natives
         .native_methods
         .find("java/lang/Class", "getName", "()Ljava/lang/String;")
         .expect("Class.getName must be registered");
@@ -110,6 +113,7 @@ fn system_getenv_returns_unmodifiable_map_with_hashmap_backing() {
 
     let map_get = vm
         .shared
+        .natives
         .native_methods
         .find(
             "cratonvm/internal/UnmodifiableMap",

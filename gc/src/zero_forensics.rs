@@ -8,11 +8,11 @@
 //! 2 = `Arena::reset` full wipe (moving-GC from-space reset; tag = 0).
 //! Debug-only; every entry point is gated and free when the env is unset.
 
+use crate::gc_flags;
 use std::sync::{Mutex, OnceLock};
 
 pub fn enabled() -> bool {
-    static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| std::env::var_os("CRATONVM_DBG_ZERO_RANGES").is_some())
+    gc_flags().dbg_zero_ranges
 }
 
 #[allow(clippy::type_complexity)]

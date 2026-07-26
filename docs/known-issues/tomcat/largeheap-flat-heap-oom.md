@@ -36,7 +36,7 @@ Ant's own `<test>` fileset selector (`build.xml`) only *includes*
 `**/*LargeHeap.java` when the `test.includeLargeHeap` property is set, and
 when it runs them it applies a bigger per-class `-Xmx` override (`test.xmx`,
 set specifically for this class group) rather than the suite's normal heap
-size. `apps/tomcat-suite-runner/run-tomcat-suite.sh` applies one flat
+size. `../../../apps/tomcat-suite-runner/run-tomcat-suite.sh` applies one flat
 `-Xmx`/`--Xmx` (`MAX_HEAP`, default `2g`) to every class — these
 intentionally-huge-payload tests need considerably more.
 

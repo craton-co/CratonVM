@@ -2,7 +2,7 @@
 
 ## Status
 **FIXED 2026-07-22** — see
-[`../fixed-suite-bugs/bug-h2-charset-cp500-unsupported-FIXED.md`](../bug-h2-charset-cp500-unsupported-FIXED.md)
+[`../fixed-suite-bugs/bug-h2-charset-cp500-unsupported-FIXED.md`](bug-h2-charset-cp500-unsupported-FIXED.md)
 for the fix (a curated IBM500 codec, not the full `sun.nio.cs.ext` provider).
 The rest of this file is kept as the original 2026-06-15 sweep report.
 

@@ -42,7 +42,7 @@ The historical rerun counted ten `crypto/fips1402` assumption-gated classes as `
 every JUnit abort as a failure. The runner now reports all-aborted classes as `SKIP` and mixed pass/abort classes as
 `PARTIAL`; actual failures remain `FAIL`. A focused current-dev Azure comparison of all 21 FIPS classes produced
 the identical HotSpot/CratonVM distribution: 11 PASS, 3 PARTIAL, 7 SKIP, 0 failed, and 0 failed containers.
-See [the fixed reporting record](../../internal/fixed-suite-bugs/keycloak-fips1402-assumption-aborts-classification-FIXED.md).
+See [the fixed reporting record](../../internal/fixed-suite-bugs/keycloak/keycloak-fips1402-assumption-aborts-classification-FIXED.md).
 
 ## 4. Docker not available — 2 `tests/clustering` classes
 

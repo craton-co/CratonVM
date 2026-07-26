@@ -78,7 +78,7 @@ shared trigger path, not 9 independent occurrences.**
 
 This is the same bug *family* previously found and partially fixed on
 `dev` in the DoHead investigation
-(`docs/internal/fixed-suite-bugs/dohead-jit-heap-corruption-register-invisibility-FIXED.md`),
+(`tomcat/dohead-jit-heap-corruption-register-invisibility-FIXED.md`),
 just through a **producer the earlier fix didn't cover**.
 
 ### The mechanism (established, not new)
@@ -337,7 +337,7 @@ regardless of which one wins registration, since the filter operates at
 
 ## Related
 
-- `docs/internal/fixed-suite-bugs/dohead-jit-heap-corruption-register-invisibility-FIXED.md` —
+- `tomcat/dohead-jit-heap-corruption-register-invisibility-FIXED.md` —
   the original `String.setOption` diagnosis and the `javax/net/SocketFactory`
   fix (commit `bd03eb243`) this bug is a gap in.
 - `native-api/src/registry.rs:3526-3563` — the RNS drop-filter that needs
