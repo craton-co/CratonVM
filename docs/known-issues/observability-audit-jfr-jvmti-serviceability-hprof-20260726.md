@@ -17,11 +17,11 @@ established first, per subsystem, before any code change.**
 
 | Subsystem | Reachable on a default build? | Produces real data? | Data trustworthy? |
 |---|---|---|---|
-| **JFR emit surface** (`jfr/src/builtin.rs`, ~30 VM call sites) | Compiled in and called — but every `emit_*` returns early on `is_enabled()`, which is **permanently false** | **No** | n/a |
-| **JFR recording lifecycle** (`new_recording` / `start_recording`) | **No** — zero callers outside `#[cfg(test)]`; no `-XX:StartFlightRecording`; no working jcmd verb | No | n/a |
+| **JFR emit surface** (`jfr/src/builtin.rs`, ~30 VM call sites) | Compiled in and called; `is_enabled()` is real once `-XX:StartFlightRecording` starts a recording (D12) | **Yes, when a recording is active** | Yes for the fields these sites populate |
+| **JFR recording lifecycle** (`new_recording` / `start_recording`) | **Yes (D12)** — `-XX:StartFlightRecording` calls both from `Vm::new`; jcmd verbs still the D3 stubs (bundled with D15) | Yes | Yes — `max_age`/`max_size` are now enforced, not just stored |
 | **JFR file writer** (`dump_to_file`) | **No** — no caller outside the `jfr` crate | n/a | Format is a documented **bespoke** encoding, not stock JFR: not loadable by JMC / `jfr print` |
-| **JVMTI event delivery** (`runtime/jvmti.rs`) | Yes — global manager installed from `SharedVm::new`; `fire_*` driven by interpreter / classloading / GC hooks | Fires, but **nothing registers a listener outside tests** | Partially — see D1, D2 |
-| **JVMTI native agents** (`-agentpath:`) | Yes, via `vm/src/jvmti/agent.rs` (real `dlopen` + `Agent_OnLoad`), feature `experimental-debug` (default-on) | Yes | Agents reach a **different** `EventManager` and receive **none** of the interpreter-sourced events plumbed in `runtime/jvmti.rs` |
+| **JVMTI event delivery** (`runtime/jvmti.rs`) | Yes — global manager installed from `SharedVm::new`; `fire_*` driven by interpreter / classloading / GC hooks | Fires; in-tree/test listeners always worked, and a real native agent now receives 9 of ~26 event kinds via the D14 bridge | Yes — see D1, D2, D14 |
+| **JVMTI native agents** (`-agentpath:`) | Yes, via `vm/src/jvmti/agent.rs` (real `dlopen` + `Agent_OnLoad`), feature `experimental-debug` (default-on) | Yes | Agents reach a **different** `EventManager`, now bridged (D14) for VMInit/VMDeath/ThreadStart/ThreadEnd/ClassLoad/ClassPrepare/GC-start-finish/ObjectFree; `JvmtiCapabilities::potential()` was corrected to advertise `false` for the event kinds that remain unbridged, so `AddCapabilities` no longer over-promises |
 | **JVMTI `GetLocalVariable*`** | Yes (capability advertised) | **No** — reads an agent-written side table, never real frames | n/a — see D2 |
 | **jcmd / attach surface** (`runtime/serviceability.rs`) | **No** — `AttachListener` opens no socket; `JcmdProcessor` constructed only in tests | No | Several handlers returned **fabricated** data — see D3, D4 |
 | **`java.lang.instrument`** (`runtime/instrument.rs`) | **Yes** — natives registered in both the synthetic and real-JDK paths; self-attach (`ByteBuddyAgent.install()`) supported | Yes | Yes, after D5 |
@@ -33,14 +33,21 @@ established first, per subsystem, before any code change.**
   live and correct. It is the one operators actually exercise (Mockito inline
   mock maker, JaCoCo, ByteBuddy self-attach).
 * **HPROF** — live, and now correct after the fixes below. It was not before.
-* Everything else is inert. JFR captures nothing; jcmd/attach is unreachable
-  from another process; JVMTI events fire into a manager nobody listens to.
+* **JVMTI** — the interpreter/GC/classloading-sourced event manager
+  (`runtime/jvmti.rs`) is correct for in-tree/test listeners (D1, D2 fixed);
+  a real native agent (`vm/src/jvmti/`) now receives 9 of ~26 event kinds via
+  a bridge (D14) with an honest, correspondingly-narrowed capability set —
+  full unification of the two implementations remains open.
+* **JFR** — captures real events once `-XX:StartFlightRecording` starts a
+  recording (D12 fixed); jcmd `JFR.*`/attach is still unreachable from
+  another process (D15, open) — see D12's own section for why jcmd wiring
+  waits for D15.
 
 ---
 
 ## 2. Defects
 
-### D1 — `ClassLoad`/`ClassPrepare` fire under the class-manager write guard; a native agent would self-deadlock
+### D1 — `ClassLoad`/`ClassPrepare` fire under the class-manager write guard; a native agent would self-deadlock — **FIXED**
 
 *Confirmed.* `classloading/src/class_manager.rs` calls `fire_class_load_hook` /
 `fire_class_prepare_hook` from inside `define_class_shared_with_options`'s
@@ -59,34 +66,61 @@ every `ClassLoad`/`ClassPrepare` event reports the wrong `jthread`. Agents key
 on that field to skip classes loaded by their own instrumentation thread and
 avoid unbounded recursion.
 
-Documented at `fire_class_load` in `vm/src/runtime/jvmti.rs`. **Not fixed** —
-the producer is in `classloading/`, owned by another agent. See §4.
+Fixed (2026-07-26): `fire_class_load_hook`/`fire_class_prepare_hook`
+(`classloading/src/class_manager.rs`) now queue the event on a thread-local
+instead of invoking the installed hook synchronously; the queue drains only
+after the L10 write guard is released, via a new `ClassRealm::class_manager_write()`
+accessor (`vm/src/vm/realms/class_realm.rs`) that is now the *sole* way to
+take that lock in the workspace — every prior `.class_manager.write()` call
+site was mechanically switched to it, so no site can bypass the drain. A
+listener may now safely call back into the class manager. Thread id is real
+(bound once per Java thread at registration via
+`cratonvm_classloading::set_current_thread_id`, main thread / `Thread.start`
+workers / foreign JNI attach) rather than a hardcoded 0. See
+`vm/src/runtime/jvmti.rs`'s `fire_class_load` doc comment. New tests:
+`jvmti_fire_hooks_dispatch_when_installed` (updated for deferred firing),
+`jvmti_current_thread_id_defaults_to_zero_and_is_settable`.
 
-### D2 — `GetLocalVariable*` reads a side table, not real frames
+### D2 — `GetLocalVariable*` reads a side table, not real frames — **PARTIALLY FIXED (capability negotiation now honest)**
 
 *Confirmed.* `JvmtiEnv::local_variables` is a
 `HashMap<(ThreadId, u32), HashMap<u32, LocalValue>>` written only by
 `set_local_variable_table` / `set_local_*` on the same `JvmtiEnv`. Nothing in
 the interpreter, the JIT deopt path, or the stack walker writes to it. On a
-live VM every `get_local_*` returns `JVMTI_ERROR_NO_MORE_FRAMES` — while
-`JvmtiCapabilities::all()` advertises `can_access_local_variables: true`.
+live VM every `get_local_*` returned `JVMTI_ERROR_NO_MORE_FRAMES` — while
+`JvmtiCapabilities::potentially_available()` advertised
+`can_access_local_variables: true`.
 
-**Failure scenario:** a debugger negotiates the capability, is told local
-inspection works, and then finds every frame empty. That reads as "the VM lost
-my frames", a far worse diagnosis than "unsupported".
-
-Per the wave's cross-reference: implementing this faithfully needs a per-slot
-*kind* (int/long/float/double/ref), because `GetLocalInt` on a reference slot
-must return `TYPE_MISMATCH` rather than a reinterpreted pointer. The new
-verifier type maps in `classloading/src/type_maps.rs` are **oop-vs-not only** —
-they answer the GC's question ("is slot 3 a reference?") but cannot separate an
-`int` slot from a `float` slot, nor identify the upper half of a `long`. So the
-type maps are *not* sufficient to wire this up. The remaining options are the
+Implementing this faithfully needs a per-slot *kind* (int/long/float/double/
+ref), because `GetLocalInt` on a reference slot must return `TYPE_MISMATCH`
+rather than a reinterpreted pointer. The verifier type maps in
+`classloading/src/type_maps.rs` are **oop-vs-not only** — they answer the
+GC's question ("is slot 3 a reference?") but cannot separate an `int` slot
+from a `float` slot, nor identify the upper half of a `long`. So the type
+maps are *not* sufficient to wire this up. The remaining options are the
 optional `LocalVariableTable` class-file attribute (absent from most release
-builds) or a widened slot-kind map.
+builds) or a widened slot-kind map — both larger, separate undertakings. That
+part is **still open** and was out of scope for this pass.
 
-Documented in-file; contract pinned by
-`obsaudit_get_local_reads_side_table_not_real_frames`.
+**What was fixed (2026-07-26):** the failure scenario this defect actually
+warned about — "a debugger negotiates the capability, is told local
+inspection works, and then finds every frame empty" — is closed.
+`JvmtiCapabilities::potentially_available()` now reports
+`can_access_local_variables: false`, and `add_capabilities` rejects a request
+for it with `NotAvailable` rather than silently granting it. A caller that
+checks potential capabilities before requesting (the JVMTI-spec-correct
+order) is told up front, not left to discover empty frames on its own. The
+capability check was removed from the ten `get_local_*`/`set_local_*`
+methods (it could otherwise never be satisfied again), so the side table
+keeps working exactly as before as the embedder/test surface it always was —
+it was never real JVMTI local-variable access, and gating it behind a
+now-permanently-unavailable capability would have made even that unusable.
+
+Documented in-file; the original contract pin
+(`obsaudit_get_local_reads_side_table_not_real_frames`) still pins the
+"side table, not real frames" behavior (now without a capability
+negotiation step). New: `obsaudit_local_variable_capability_is_honestly_
+unavailable` pins the capability-honesty half.
 
 ### D3 — `jcmd JFR.start` / `JFR.stop` / `JFR.dump` reported success without touching the recorder — **FIXED**
 
@@ -221,63 +255,152 @@ Fixed: 8 MiB (HotSpot flushes at 1 MiB). New test
 re-snapshotting and re-allocating the whole registry once per thread. O(n²)
 work and allocation on an app-server dump, on the OOM path. Hoisted.
 
-### D11 — HPROF dumps are not taken at a safepoint — **DOCUMENTED, not fixed**
+### D11 — HPROF dumps are not taken at a safepoint — **FIXED**
 
 `write_heap_segments` carried a comment claiming "the heap is not collected
 while the HPROF dump is in progress — dump is serialized against concurrent GC
-via the SharedVm's gc_barrier". **Neither `dump_heap` nor
-`maybe_dump_heap_on_oom` requests a safepoint or touches any GC barrier.** The
-false claim has been removed and replaced with an accurate note. Tolerable on
-the OOM path (the VM is about to die), but must be fixed before any on-demand
-trigger is wired. Related: object IDs are raw heap addresses, so under a
-relocating collector two dumps disagree and a recycled address can alias.
+via the SharedVm's gc_barrier". Neither `dump_heap` nor
+`maybe_dump_heap_on_oom` requested a safepoint or touched any GC barrier.
 
-### D12 — JFR is unreachable; `RecordingSettings` has five inert fields — **DOCUMENTED**
+Fixed (2026-07-26): `dump_heap` (`vm/src/runtime/hprof.rs`) now takes the
+calling thread's id and requests the same stop-the-world barrier real GC
+cycles use (`GcBarrier::request_stw_counted_with_live_blocked`) before
+walking the heap, via a `DumpSafepoint` RAII guard whose `Drop` releases the
+barrier — with an empty, no-op pointer map, since nothing here relocates any
+object — even on an early error or panic. Deliberately does *not* use the
+interpreter's `stw_take_over_and_wait` forcible-freeze path for in-JIT peers
+(that machinery exists so a *moving* collector can relocate objects safely
+under a frozen peer; a non-moving HPROF walk doesn't need it, and skipping it
+keeps this diagnostic path off the more experimental takeover code). If the
+barrier is already held by a concurrent real GC, the request is declined and
+the dump falls back to the pre-fix unpaused behaviour rather than trying to
+join the other pause — a torn dump on that rare race is still better than the
+OOM handler itself blocking. `maybe_dump_heap_on_oom` and its four call sites
+in `runtime/interpreter.rs` now thread the calling thread through. Related,
+still open: object IDs are raw heap addresses, so under a relocating
+collector two dumps disagree and a recycled address can alias.
 
-`vm-cli` never calls `start_recording` (the code's own comment in
-`vm_init.rs:5041` says so), there is no `-XX:StartFlightRecording`, and the
-jcmd verbs were the stubs of D3. `is_enabled()` is permanently false, so the
-~30 wired `emit_*` call sites are one relaxed atomic load each and capture
-nothing.
+### D12 — JFR is unreachable; `RecordingSettings` has five inert fields — **FIXED**
+
+`vm-cli` never called `start_recording`, there was no
+`-XX:StartFlightRecording`, and the jcmd verbs were the stubs of D3.
+`is_enabled()` was permanently false, so the ~30 wired `emit_*` call sites
+were one relaxed atomic load each and captured nothing.
 
 Separately, `RecordingSettings::{max_age, max_size, disk, dump_on_exit,
-duration}` are **read by no code**. `max_size` and `max_age` in particular are
-honest-looking retention knobs that do nothing: a recording's only bound is
-`EventRepository::default()`'s fixed 100 000-event ring. These must not be
-surfaced as a CLI option, jcmd argument, or `jdk.jfr` API until enforced.
-Contract pinned by `obsaudit_max_size_and_max_age_are_not_enforced`.
+duration}` were **read by no code**. `max_size` and `max_age` in particular
+were honest-looking retention knobs that did nothing: a recording's only
+bound was `EventRepository::default()`'s fixed 100 000-event ring.
 
-**Memory is bounded** (the audit's specific question): per-thread ring 1024
-entries fixed, per-recording repository 100 000 events with eviction. One
-latent hazard: `ThreadRingRegistry` reclaims retired+empty shards only from
-inside `drain_all`, which runs at dump time — so reclamation never runs today.
-Harmless only because the disabled gate keeps ordinary threads from registering
-a shard at all; it becomes a real per-thread leak the moment a long-lived
-recording starts on a thread-churning workload. Fix reclamation as part of
-wiring the trigger, not after.
+**Fixed (2026-07-26):**
 
-### D13 — `runtime::jvmti::AgentRegistry::load_agents` loads nothing — **DOCUMENTED**
+* **The trigger.** `-XX:StartFlightRecording[:filename=...,duration=...,
+  maxage=...,maxevents=...,dumponexit=...]` (`vm-cli/src/main.rs`) starts a
+  real recording from `Vm::new` (`vm/src/vm/vm_init.rs`). Bare
+  `-XX:StartFlightRecording` works with HotSpot's defaults (`dumponexit=true`,
+  no other limits). Deliberately **not** offered: `disk=` (recordings stay
+  memory-only — see below) and HotSpot's `maxsize=` name, reused here as
+  `maxevents=` instead, because `jfr::RecordingSettings::max_size` bounds an
+  *event count*, not bytes — keeping HotSpot's byte-denominated name would
+  have meant something silently different in CratonVM, which is worse than
+  not offering it. jcmd `JFR.start`/`JFR.stop`/`JFR.dump` are unchanged (still
+  D3's honest-error stubs) — wiring them to the now-real `start_recording`/
+  `dump_recording` calls is bundled with D15 (the jcmd dispatch surface),
+  not here.
+* **`max_age` / `max_size`.** `jfr::repository::EventRepository` gained
+  `with_max_age(max_events, max_age_nanos)`; `Recording::new` uses it instead
+  of `EventRepository::default()`, so both are real, continuously-enforced
+  retention bounds now — not a CLI-only illusion. Age is compared against
+  each pushed event's own `start_time` (no wall-clock dependency inside the
+  library). The original contract pin
+  (`obsaudit_max_size_and_max_age_are_not_enforced`) is renamed
+  `obsaudit_max_size_and_max_age_are_enforced` and now asserts the opposite —
+  see the doc comment for how the test still forces a deterministic result.
+* **`dump_on_exit`.** The VM's existing pre-`std::process::exit` hook
+  (`vm-cli/src/main.rs`, the same one `cleanup_staged_archive_copies` already
+  used) now also dumps the flagged recording via `process_vm()` +
+  `FlightRecorder::dump_recording`. Covers Java-initiated exit
+  (`System.exit`/`Runtime.exit`/`Runtime.halt`) — the common real-application
+  shutdown path; a hard native crash or an unrelated direct
+  `std::process::exit` call elsewhere in the Rust CLI would still miss it, an
+  honestly-documented residual rather than a claimed 100%-coverage guarantee.
+* **`duration`.** A background "JFR-Periodic-Drain" thread (spawned only
+  when `-XX:StartFlightRecording` is used) stops the recording once the
+  configured duration elapses.
+* **`disk`.** Still **inert** — there is no disk-backed repository;
+  recordings remain memory-only until an explicit dump. Not exposed by the
+  new CLI flag for this reason; still left in place as "the right shape for
+  the eventual implementation" per `RecordingSettings`'s own doc comment.
 
-No `dlopen`, no `Agent_OnLoad` symbol lookup. Every registered agent is
+**The reclamation leak — fixed as part of the trigger, per this doc's own
+instruction.** `ThreadRingRegistry` reclaimed retired+empty shards only from
+inside `drain_all`, which used to run only at dump time. The same
+periodic-drain thread that enforces `duration` also calls
+`FlightRecorder::drain_per_thread_into_repository()` once a second for the
+lifetime of the recording, so `reclaim_retired_shards` now actually runs
+continuously while a recording is active — a long-lived recording on a
+thread-churning workload no longer accumulates retired shards for its whole
+lifetime.
+
+**Memory is bounded** (the audit's original question, still true and now
+backed by real enforcement rather than accident): per-thread ring 1024
+entries fixed, per-recording repository bounded by `max_size` (default
+100 000) with real age-eviction on top when `max_age` is set.
+
+### D13 — `runtime::jvmti::AgentRegistry::load_agents` loads nothing — **FIXED (removed)**
+
+No `dlopen`, no `Agent_OnLoad` symbol lookup. Every registered agent was
 unconditionally marked `loaded = true` and counted a success — including
-`-agentpath:/does/not/exist.so`. Only previously-registered Rust closures run.
+`-agentpath:/does/not/exist.so`. Only previously-registered Rust closures ran.
 
-This is *not* the registry the VM bootstrap uses: `SharedVm::new` →
+This was *not* the registry the VM bootstrap uses: `SharedVm::new` →
 `load_startup_jvmti_agents` drives `vm/src/jvmti/agent.rs`, which does real
-`libloading` loading. But the two are trivially confusable — same type name,
-same method names, adjacent modules. Documented with an explicit "do not route
-`-agentpath:` here". Pinned by
-`obsaudit_load_agents_does_not_actually_load_native_libraries`.
+`libloading` loading. A repo-wide search confirmed `runtime::jvmti::AgentRegistry`
+(and its `JvmtiEnv::agent_registry` field) had **zero callers outside its own
+unit tests** — not wired to any bootstrap path, not part of the documented
+embedding API. Rather than fix its behaviour in place (which would still
+leave a same-named, same-method-shaped type sitting adjacent to the real one),
+it was deleted outright: `AgentEntry`, `AgentRegistry`, `split_agent_arg`, the
+`JvmtiEnv::agent_registry` field, and their 8 unit tests (including the
+contract-pin `obsaudit_load_agents_does_not_actually_load_native_libraries`,
+which pinned the bug's *existence* and is moot once the buggy code is gone).
+Use `vm::jvmti::AgentRegistry` for anything agent-loading related.
 
-### D14 — two parallel JVMTI implementations — **DOCUMENTED**
+### D14 — two parallel JVMTI implementations — **PARTIALLY FIXED (bridged)**
 
 `vm/src/runtime/jvmti.rs` (4 710 lines) and `vm/src/jvmti/` (2 243 lines) are
-both live and **not connected**. The former owns interpreter/GC/classloading
+both live and were **not connected**. The former owns interpreter/GC/classloading
 event plumbing; the latter owns real native-agent loading and the
 `create_jvmti_env` used at bootstrap. An agent attached via `-agentpath:`
-therefore receives none of the events the interpreter fires. A comparison table
-is now at the top of `runtime/jvmti.rs`; consolidating them is a separate,
-larger task.
+received none of the events the interpreter fires — before this fix, only
+`ClassLoad` and `ThreadEnd` reached it at all, each via its own ad hoc,
+inconsistent call site elsewhere in `vm/` (one of which, in
+`vm/src/vm/vm_init.rs`, incorrectly re-fired `ClassLoad` on every cache-hit
+`load_class` call, not just new definitions).
+
+Fixed (2026-07-26): `install_real_agent_env_bridge` (`vm/src/runtime/jvmti.rs`),
+installed once from `Vm::new` as a `Weak<SharedVm>` (same idiom as
+`set_process_vm` / `set_global_shared_vm_for_hooks`), forwards 9 event kinds —
+VMInit, VMDeath, ThreadStart, ThreadEnd, ClassLoad, ClassPrepare,
+GarbageCollectionStart/Finish, ObjectFree — from `JvmtiEventManager`'s `fire_*`
+methods to the real env's `notify_*` functions, ahead of (not gated by) this
+file's own listener-enabled check. Deliberately **not** bridged: MethodEntry/
+MethodExit/SingleStep/Breakpoint/FramePop/FieldAccess/FieldModification
+(per-bytecode/per-invocation hot paths — bridging would add a `Mutex<JvmtiEnv>`
+lock to the interpreter's hottest paths for every VM, agent attached or not)
+and MonitorWait/MonitorContendedEnter (per-contended-lock hot path; also
+`vm/src/jvmti/mod.rs` has no `notify_monitor_waited`/
+`notify_monitor_contended_entered`, so `can_generate_monitor_events` could
+only ever be half-honest). `vm/src/jvmti/capabilities.rs`'s
+`JvmtiCapabilities::potential()` was corrected to advertise `false` for
+exactly the capabilities whose events are not bridged, so `AddCapabilities`
+now reflects what an agent will actually receive instead of silently granting
+capabilities that deliver nothing.
+
+This is a bridge, not a merge — the two event enums, callback types, and
+capability structs remain separate types. **Full unification (shared event
+enum, shared capability set, one `JvmtiEnv`) remains open, as originally
+scoped**; see the cross-owner request below, updated to reflect the bridge.
 
 ### D15 — the attach surface opens no socket — **DOCUMENTED**
 
@@ -294,32 +417,37 @@ warning against "wiring up jcmd" by simply constructing a `JcmdProcessor` —
 
 | File | Change |
 |---|---|
-| `vm/src/runtime/hprof.rs` | D6, D7, D8, D9, D10 fixed; D11 documented; module LIVENESS block; 4 tests |
+| `vm/src/runtime/hprof.rs` | D6, D7, D8, D9, D10, D11 fixed; module LIVENESS block; 4 tests (original pass) |
 | `vm/src/runtime/serviceability.rs` | D3, D4 fixed; D15 + module LIVENESS block; 3 tests (replacing 4 that asserted the fabricated output) |
 | `vm/src/runtime/instrument.rs` | D5 fixed (`class_file_this_class` validator); 4 tests |
-| `vm/src/runtime/jvmti.rs` | D1, D2, D13, D14 documented in-file; 2 contract-pin tests |
+| `vm/src/runtime/jvmti.rs` | D1 fixed (deferred hook firing + real thread id); D2 partially fixed (honest capability negotiation; frame access itself still open); D13 fixed (dead `AgentRegistry` removed, -8 tests); D14 bridged (`install_real_agent_env_bridge`, 9 event kinds); LIVENESS block updated throughout |
+| `classloading/src/class_manager.rs` | D1: deferred-queue hook firing, `set_current_thread_id`/`current_thread_id`, `drain_pending_class_hooks`; 2 new tests |
+| `vm/src/vm/realms/class_realm.rs` | D1: `ClassManagerWriteGuard` + `class_manager_write()`, now the sole L10 write-lock accessor workspace-wide |
+| `vm/src/vm/vm_init.rs`, `vm/src/vm/vm_exec.rs`, `vm/src/native/jni.rs` | D1: bind real thread id at the 3 thread-registration sites; D14: install the bridge in `Vm::new`; removed a redundant/incorrect ad hoc `ClassLoad` notify in `vm_init.rs` |
+| `vm/src/jvmti/capabilities.rs` | D14: `potential()` no longer advertises capabilities for unbridged event kinds; 2 new tests |
+| `vm/src/jvmti/mod.rs` | D14: `test_full_workflow` updated (no longer requests a now-`false` capability) |
 | `jfr/src/lib.rs` | D12 LIVENESS + memory-bounds block |
-| `jfr/src/recording.rs` | D12 inert-field docs; 2 tests |
+| `jfr/src/recording.rs` | D12 fixed: `Recording::new` enforces `max_size`/`max_age` via `EventRepository::with_max_age`; `RecordingSettings` doc comment updated; contract pin renamed to `obsaudit_max_size_and_max_age_are_enforced` (now asserts enforcement); 1 new test |
+| `jfr/src/repository.rs` | D12 fixed: `EventRepository::with_max_age` + `evict_front` helper (shared by size-cap and age-cap eviction) |
+| `vm/src/config.rs` | D12: `JfrStartRecordingConfig` + `VmConfig::jfr_start_recording` |
+| `vm/src/vm/realms/debug_realm.rs` | D12: `jfr_dump_on_exit` field (recording id + filename for the pre-exit dump) |
+| `vm/src/vm/vm_init.rs` | D12: `Vm::new` starts the recording, spawns the periodic drain/duration-watcher thread (also fixes the `ThreadRingRegistry` reclamation leak) |
+| `vm-cli/src/main.rs` | D12: `-XX:StartFlightRecording[:opts]` parsing (`parse_jfr_start_recording_opts`, `parse_jfr_duration`); pre-exit hook dumps the recording via `process_vm()`; 10 new tests |
 
-Not built or tested — concurrent builds OOM the audit host. All changed files
-pass `rustfmt --edition 2021 --check`; CRLF line endings preserved.
+D1, D13, D14 rows above: built and tested on the Azure host
+(`fix/observability-audit-20260726`) — `cratonvm-classloading` full suite,
+`cratonvm-vm` `jvmti` test subset (117 passed after D13's removal), and
+`vm/tests/lock_order_smoke` / `vm/tests/new19_module_access` all green. The
+original D3–D12 rows above were not built or tested (concurrent builds OOM'd
+the audit host at the time) — still true for that original work; not
+re-verified in this pass.
 
 ---
 
 ## 4. Cross-owner requests
 
-**To the owner of `classloading/src/class_manager.rs` (D1):**
-
-1. `define_class_shared_with_options` fires `fire_class_load_hook` /
-   `fire_class_prepare_hook` (around line 3945) while the `ClassManager` write
-   guard is held. Please snapshot whatever the event needs (class id, name),
-   drop the guard, then fire. As written, any native JVMTI agent whose
-   `ClassLoad` handler calls back into the VM self-deadlocks. The in-file
-   comment asserting the callback "never re-enters the class manager" describes
-   today's in-tree listeners only and should be corrected either way.
-2. Both hook call sites pass a hardcoded `0` for `thread_id`. Please pass the
-   loading thread's id; agents key on `jthread` to avoid instrumenting their
-   own instrumentation.
+**D1 — resolved, no action needed.** See the D1 section above for what
+changed (`classloading/src/class_manager.rs`, `vm/src/vm/realms/class_realm.rs`).
 
 **To the owner of `classloading/src/type_maps.rs` (D2):**
 
@@ -329,9 +457,16 @@ not just oop-vs-not. Today they answer only the GC's question. No action
 requested now — recorded so the requirement is visible if the maps are extended
 for another reason.
 
-**To the owner of `vm/src/jvmti/` (D14):**
+**To the owner of `vm/src/jvmti/` (D14) — partially resolved.**
 
-`vm/src/jvmti/mod.rs`'s `EventManager` and `runtime/jvmti.rs`'s
-`JvmtiEventManager` are disjoint. Agents loaded through `agent.rs` see none of
-the interpreter/GC/classloading events. Either bridge the two managers or
-declare one of them the sole implementation.
+A one-way bridge (`install_real_agent_env_bridge` in `runtime/jvmti.rs`) now
+forwards 9 event kinds to `vm/src/jvmti/`'s `EventManager`; see the D14
+section above for exactly which and why not the rest. Still open, for
+whoever picks this up next: full unification (one event enum, one capability
+struct, one `JvmtiEnv`) so the remaining method-level tracing and monitor
+events don't need a second bespoke bridge each. `vm/src/jvmti/mod.rs` also
+has three `notify_*` functions with zero production callers even after this
+fix (`notify_breakpoint`, `notify_method_entry`, `notify_exception`, and
+others in the same file) — worth checking whether they should be wired too
+before extending the bridge to cover them, since a wired-but-unfired
+`notify_*` is exactly the kind of gap this whole audit exists to catch.

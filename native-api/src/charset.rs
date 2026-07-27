@@ -1004,6 +1004,22 @@ fn encode_utf16_with_bom_strict(chars: &[u16]) -> Result<Vec<u8>, CodingError> {
 }
 
 fn encode_utf16_with_bom(chars: &[u16]) -> Vec<u8> {
+    // FIX (defaultlogbackconfigurationtests-empty-utf16-bom): real JDK's
+    // `"".getBytes(StandardCharsets.UTF_16)` returns an empty array, not a
+    // lone BOM — `UnicodeEncoder`'s BOM write lives inside its per-character
+    // encode loop, which never runs for zero input characters. This helper
+    // (one-shot `String.getBytes(Charset)`/`encode_chars[_lossy]`, NOT the
+    // stateful `CharsetEncoder.encode()` session path in
+    // `native-builtins/src/charset.rs`, which tracks BOM-written state
+    // separately) used to push the BOM unconditionally, so e.g. Logback's
+    // `LayoutWrappingEncoder.headerBytes()` — which always calls
+    // `convertToBytes("")` for an unconfigured header, even when there is
+    // nothing to write — leaked a stray BOM directly into a UTF-16-charset
+    // `ConsoleAppender`'s target stream (real `System.out` by default) the
+    // moment the appender started, before any real log event ever ran.
+    if chars.is_empty() {
+        return Vec::new();
+    }
     // HotSpot writes a BE BOM for UTF-16 output.
     let mut out = Vec::with_capacity(2 + chars.len() * 2);
     out.push(0xFE);

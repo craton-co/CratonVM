@@ -155,7 +155,7 @@ device" writing to `/tmp` — so build with `TMPDIR=/data/tmp/build`.
 
 - `vm/src/jit/skip_list.rs` — the `HIB-LONGTAIL.1` comment, which carries the
   same correction as this doc.
-- `docs/internal/jit-ban-sweep-20260725.md` — the sweep this came out of.
+- `docs/known-issues/jit-ban/jit-ban-sweep-20260725.md` — the sweep this came out of.
 - `docs/known-issues/full-ban-inventory-status-20260726.md` — the cross-session
   ban tracker.
 - `docs/known-issues/hib-antlr-1-removed-shadowed-20260726.md` — a concurrent
