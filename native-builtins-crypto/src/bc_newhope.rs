@@ -131,13 +131,13 @@ fn mul_coefficients(poly: &mut [i16; N], factors: &[i16; N]) {
 }
 
 /// `Poly.toNTT(short[] r)`.
-pub(crate) fn to_ntt(r: &mut [i16; N]) {
+pub fn to_ntt(r: &mut [i16; N]) {
     mul_coefficients(r, &PSIS_BITREV_MONTGOMERY);
     core(r, &OMEGAS_MONTGOMERY);
 }
 
 /// `Poly.fromNTT(short[] r)`.
-pub(crate) fn from_ntt(r: &mut [i16; N]) {
+pub fn from_ntt(r: &mut [i16; N]) {
     bit_reverse(r);
     core(r, &OMEGAS_INV_MONTGOMERY);
     mul_coefficients(r, &PSIS_INV_MONTGOMERY);
@@ -147,7 +147,7 @@ pub(crate) fn from_ntt(r: &mut [i16; N]) {
 /// by rejection-sampling SHAKE128(seed) into `[0, 5*Q)`. `doOutput(256)` in BC
 /// squeezes the next 256 bytes of the XOF stream, which `XofReader::read`
 /// mirrors. Fills exactly `N` coefficients.
-pub(crate) fn uniform(a: &mut [i16; N], seed: &[u8]) {
+pub fn uniform(a: &mut [i16; N], seed: &[u8]) {
     use sha3::digest::{ExtendableOutput, Update, XofReader};
     let mut xof = sha3::Shake128::default();
     xof.update(seed);

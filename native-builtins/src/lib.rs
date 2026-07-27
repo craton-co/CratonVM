@@ -4050,10 +4050,7 @@ pub mod lang_string;
 // helpers, Executable.getParameters, Method.getDefaultValue, etc.).
 pub mod lang_reflect;
 // WP4.7: Real StampedLock + ReentrantReadWriteLock backends.
-pub(crate) mod bc_aes;
-pub(crate) mod bc_chacha;
-pub(crate) mod bc_newhope;
-pub(crate) mod bc_newhope_tables;
+pub(crate) use cratonvm_native_builtins_crypto::{bc_aes, bc_chacha, bc_newhope};
 pub mod lang_invoke;
 pub mod lang_math;
 pub mod lang_misc;
@@ -4381,10 +4378,10 @@ pub mod atomic_updater;
 pub mod biginteger_intrinsics;
 // Byte-identical native intrinsic for the SunEC P-256 Montgomery field
 // multiply/square (dominant cost of EC keygen/sign/verify).
-pub mod sunec_intpoly;
+pub use cratonvm_native_builtins_security::sunec_intpoly;
 // Gated (default-off) coarse native EC scalar-multiply via the p256 crate,
 // bypassing the one-time generator-table precompute.
-pub mod sunec_point;
+pub use cratonvm_native_builtins_security::sunec_point;
 
 // WP1.4 — `jdk.internal.access.SharedSecrets` bridge: 15 *Access
 // interface singletons + every per-interface method.  Unblocks
