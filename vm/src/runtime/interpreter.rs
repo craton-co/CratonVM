@@ -33979,6 +33979,15 @@ fn compile_osr_artifact(
             }
 
             // Eagerly compile invokestatic callees (class_manager lock released)
+            //
+            // Every baked direct-call target must stay mapped until this caller
+            // is published, because publication is what roots them
+            // (`JitCache::prepare_for_publication` -> `_direct_callee_roots`).
+            // Dropping the callee `Arc` here would let a concurrent tier-up
+            // `put` unmap a body whose address is already baked into the
+            // machine code being emitted.
+            let mut baked_callee_pins: Vec<std::sync::Arc<cratonvm_jit::CompiledMethod>> =
+                Vec::new();
             for (ipc, callee_class, callee_method, callee_desc, param_count) in
                 pending_callee_compiles
             {
@@ -33991,7 +34000,8 @@ fn compile_osr_artifact(
                         &callee_desc,
                         true,
                     );
-                if let Some((entry, needs_ctx)) = compiled_callee {
+                if let Some((callee_pin, entry, needs_ctx)) = compiled_callee {
+                    baked_callee_pins.push(callee_pin);
                     if !crate::jit::jit_direct_call_requires_dispatch(
                         &callee_class,
                         &callee_method,
@@ -36505,13 +36515,26 @@ fn callee_neg_fingerprint(class_name: &str, method_name: &str, descriptor: &str)
 /// already-published body regardless of `optimize`, so a method is compiled at
 /// whatever tier reaches it *first* — there is no C1→C2 re-compile/supersede yet
 /// (that needs safe code-cache replacement; tracked as a follow-up).
+///
+/// # Why this returns the artifact and not just its entry address
+///
+/// [`JitCache::put`] REPLACES the body stored under a key. The superseded
+/// artifact's last `Arc` therefore drops, and `ExecutableBuffer::drop` unmaps
+/// its code. A caller holding only `entry_ptr()` is racing exactly that: every
+/// caller here either CALLs the address, publishes it into an inline cache, or
+/// bakes it into generated code, and all three keep using it long after this
+/// function returns. Handing back the `Arc` makes the address valid for as long
+/// as the caller keeps the binding alive — and, because
+/// `resolve_jit_entry_owner` can only succeed while the artifact lives, it is
+/// also what lets the inline-cache publications inside that window take their
+/// own keep-alive.
 pub fn try_jit_compile_callee(
     shared: &SharedVm,
     class_name: &str,
     method_name: &str,
     descriptor: &str,
     optimize: bool,
-) -> Option<(usize, bool)> {
+) -> Option<(std::sync::Arc<cratonvm_jit::CompiledMethod>, usize, bool)> {
     use std::sync::atomic::Ordering;
     // Kill-switch: CRATONVM_DISABLE_JIT=1 forces interpreter-only execution.
     // Useful for bisecting JIT-vs-interpreter bugs during bootstrap crashes.
@@ -36553,8 +36576,9 @@ pub fn try_jit_compile_callee(
         let jit_cache = shared.jit.jit_cache.read();
         if let Some(compiled) = jit_cache.get(class_name, method_name, descriptor, probe_class_id) {
             // Cast: object/code pointer to integer address
-            return Some((compiled.entry_ptr() as usize, compiled.needs_context()));
-            // Cast: JIT entry point to address
+            let entry = compiled.entry_ptr() as usize; // Cast: JIT entry point to address
+            let needs_ctx = compiled.needs_context();
+            return Some((compiled, entry, needs_ctx));
         }
     }
     let fp = callee_neg_fingerprint(class_name, method_name, descriptor);
@@ -36624,6 +36648,7 @@ pub fn try_jit_compile_callee(
 /// No two of {class_manager, flight_recorder, jit_cache} are ever held at once.
 /// GC itself takes none of these during STW (it scans deposited root snapshots),
 /// so the worker's transient holds only matter via the mutator-stall path above.
+#[allow(clippy::type_complexity)]
 fn try_jit_compile_callee_slow(
     shared: &SharedVm,
     class_name: &str,
@@ -36634,7 +36659,7 @@ fn try_jit_compile_callee_slow(
     // backend. Threaded into `jit::try_compile`'s trailing flag.
     optimize: bool,
     cache_negative: &mut bool,
-) -> Option<(usize, bool)> {
+) -> Option<(std::sync::Arc<cratonvm_jit::CompiledMethod>, usize, bool)> {
     // RFJP.1 — never JIT a method whose declaring class transitively extends
     // `java/util/concurrent/ForkJoinTask`. The recursive `compute()` body
     // miscompiles under deep recursion (returns 0 from depth ~10), and the
@@ -37122,8 +37147,6 @@ fn try_jit_compile_callee_slow(
         compiled.entry_ptr(),
         compiled.code_bytes(),
     );
-    let entry = compiled.entry_ptr() as usize; // Cast: JIT entry point to address
-    let needs_ctx = compiled.needs_context();
     let compile_duration_ns = compile_start.elapsed().as_nanos() as u64; // Cast: duration to u64 nanoseconds
 
     // Record JFR compilation event.
@@ -37205,18 +37228,29 @@ fn try_jit_compile_callee_slow(
         &method_desc_key,
         &mut compiled,
     );
-    {
-        let mut jit_cache = shared.jit.jit_cache.write();
+    let published = {
+        let jit_cache = shared.jit.jit_cache.write();
         jit_cache.put(
-            receiver_key,
-            method_name_key,
-            method_desc_key,
+            receiver_key.clone(),
+            method_name_key.clone(),
+            method_desc_key.clone(),
             callee_class_id,
             compiled,
         );
-    }
-
-    Some((entry, needs_ctx))
+        // Read back a STRONG reference to what is now published under this key
+        // rather than returning the address we held before the `put`. If a
+        // concurrent publish won the race, this is its artifact — the live one
+        // — instead of one whose buffer is already being unmapped.
+        jit_cache.get(
+            &receiver_key,
+            &method_name_key,
+            &method_desc_key,
+            callee_class_id,
+        )
+    }?;
+    let entry = published.entry_ptr() as usize; // Cast: JIT entry point to address
+    let needs_ctx = published.needs_context();
+    Some((published, entry, needs_ctx))
 }
 
 /// wire-tiered-manager increment 2 — the REAL off-thread compile callback.

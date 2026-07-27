@@ -1479,6 +1479,9 @@ unsafe impl Sync for CompiledMethod {}
 impl Drop for CompiledMethod {
     fn drop(&mut self) {
         let entry = self.entry as usize;
+        if dbg_stale_ic_enabled() {
+            report_stale_ic_holders(entry);
+        }
         cratonvm_types::jit_activation::unregister_executable_owner(entry);
         unregister_jit_code_range(entry);
         if let Some(owners) = JIT_ENTRY_OWNERS.get() {
@@ -4410,7 +4413,19 @@ impl JitMICSlot {
         // Publish entry_ptr BEFORE class_id so the inline cache reader (which
         // checks class_id first, then loads entry_ptr) never observes a class
         // id paired with stale target metadata.
-        *self.compiled_owner.lock() = resolve_jit_entry_owner(entry_ptr as usize);
+        //
+        // `compiled_owner` is what keeps the callee's code mapped while this
+        // slot's raw entry pointer is callable, so an entry we cannot retain is
+        // downgraded to "class cached, target unresolved" (the same shape
+        // `prepopulate` leaves) rather than published — see
+        // `jit_entry_publishable`.
+        let owner = resolve_jit_entry_owner(entry_ptr as usize);
+        let (entry_ptr, needs_context) = if jit_entry_publishable(entry_ptr, &owner) {
+            (entry_ptr, needs_context)
+        } else {
+            (0, false)
+        };
+        *self.compiled_owner.lock() = owner;
         self.cached_entry_ptr.store(entry_ptr, Ordering::Release);
         *self.cached_class_name.lock() = Some(std::sync::Arc::from(class_name));
         self.cached_needs_context
@@ -4819,8 +4834,14 @@ impl JitPICSlot {
                     )
                     .is_ok()
             {
-                *self.mega_compiled_owners[index].lock() =
-                    resolve_jit_entry_owner(entry_ptr as usize);
+                let owner = resolve_jit_entry_owner(entry_ptr as usize);
+                if !jit_entry_publishable(entry_ptr, &owner) {
+                    // Release the reservation and leave the way empty: the
+                    // helper's own resolution path stays correct.
+                    self.mega_class_ids[index].store(0, Ordering::Release);
+                    return;
+                }
+                *self.mega_compiled_owners[index].lock() = owner;
                 self.mega_entry_ptrs[index].store(entry_ptr, Ordering::Release);
                 self.mega_needs_context[index].store(needs_context, Ordering::Relaxed);
                 self.mega_class_ids[index].store(class_id, Ordering::Release);
@@ -4866,7 +4887,15 @@ impl JitPICSlot {
         entry_ptr: u64,
         needs_ctx: bool,
     ) {
-        *self.compiled_owners[i].lock() = resolve_jit_entry_owner(entry_ptr as usize);
+        // See `JitMICSlot::update`: never publish a compiled target this slot
+        // cannot keep mapped.
+        let owner = resolve_jit_entry_owner(entry_ptr as usize);
+        let (entry_ptr, needs_ctx) = if jit_entry_publishable(entry_ptr, &owner) {
+            (entry_ptr, needs_ctx)
+        } else {
+            (0, false)
+        };
+        *self.compiled_owners[i].lock() = owner;
         self.entry_ptrs[i].store(entry_ptr, std::sync::atomic::Ordering::Release);
         self.needs_context[i].store(needs_ctx, std::sync::atomic::Ordering::Relaxed);
         *self.class_names[i].lock() = Some(class_name.to_string());
@@ -5266,8 +5295,158 @@ fn resolve_jit_entry_owner(entry: usize) -> Option<Arc<CompiledMethod>> {
     jit_entry_owners().lock().get(&entry)?.upgrade()
 }
 
+/// DIAG (2026-07-27): `CRATONVM_DBG_JIT_STALE_IC=1` reports, at each artifact
+/// retirement, any inline-cache slot still pointing into the body being
+/// unmapped. Read-once; default-off.
+fn dbg_stale_ic_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        cratonvm_types::flags::runtime_var("CRATONVM_DBG_JIT_STALE_IC")
+            .map(|v| v != "0")
+            .unwrap_or(false)
+    })
+}
+
+thread_local! {
+    /// Re-entrancy guard: the scan holds `Arc`s, and dropping them can re-enter
+    /// `CompiledMethod::drop`.
+    static STALE_IC_SCANNING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Report every live inline-cache slot whose entry pointer equals `dying`.
+///
+/// Such a slot hands generated code (`jit/src/x64.rs`'s `MOV R11,[slot]; CALL
+/// R11` cascade, and `runtime_lowering::emit_hashed_vtable_stub`) a raw pointer
+/// into a mapping that is being released right now.
+fn report_stale_ic_holders(dying: usize) {
+    if dying == 0 {
+        return;
+    }
+    if STALE_IC_SCANNING.with(|f| f.replace(true)) {
+        return;
+    }
+    let candidates: Vec<Arc<CompiledMethod>> = {
+        let owners = jit_entry_owners().lock();
+        owners.values().filter_map(|w| w.upgrade()).collect()
+    };
+    let dying_name = lookup_jit_method_name(dying).unwrap_or_else(|| "<unnamed>".to_string());
+    for cm in &candidates {
+        if cm.entry as usize == dying {
+            continue;
+        }
+        let mut kind: Option<&'static str> = None;
+        for slot in &cm._jit_mic_slots {
+            if slot
+                .cached_entry_ptr
+                .load(std::sync::atomic::Ordering::Acquire) as usize
+                == dying
+            {
+                kind = Some("MIC");
+            }
+        }
+        for slot in &cm._jit_pic_slots {
+            for i in 0..JIT_PIC_ENTRIES {
+                if slot.entry_ptrs[i].load(std::sync::atomic::Ordering::Acquire) as usize == dying {
+                    kind = Some("PIC");
+                }
+            }
+            for i in 0..JIT_MEGA_ENTRIES {
+                if slot.mega_entry_ptrs[i].load(std::sync::atomic::Ordering::Acquire) as usize
+                    == dying
+                {
+                    kind = Some("MEGA");
+                }
+            }
+        }
+        if let Some(kind) = kind {
+            eprintln!(
+                "[jit-stale-ic] retiring {dying:#x} ({dying_name}) still referenced by a {kind} \
+slot of {:#x} ({})",
+                cm.entry as usize,
+                lookup_jit_method_name(cm.entry as usize)
+                    .unwrap_or_else(|| "<unnamed>".to_string()),
+            );
+        }
+    }
+    drop(candidates);
+    STALE_IC_SCANNING.with(|f| f.set(false));
+}
+
 fn deferred_jit_owners() -> &'static parking_lot::Mutex<Vec<Arc<CompiledMethod>>> {
     DEFERRED_JIT_OWNERS.get_or_init(|| parking_lot::Mutex::new(Vec::new()))
+}
+
+/// Inline-cache installs refused because the compiled target could not be
+/// retained. See [`jit_entry_publishable`]. Diagnostic counter only.
+static UNOWNED_IC_ENTRY_REFUSALS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Number of inline-cache installs refused for lack of a retainable owner.
+pub fn unowned_ic_entry_refusals() -> u64 {
+    UNOWNED_IC_ENTRY_REFUSALS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Whether `entry` may be published into an inline-cache slot that generated
+/// code calls without further validation.
+///
+/// The emitted MIC/PIC cascade in `jit/src/x64.rs` loads the slot's entry
+/// pointer into R11 and `CALL R11`s it, so the slot must keep the pointed-to
+/// body mapped for as long as the pointer is readable. That keep-alive is the
+/// slot's `compiled_owner` / `compiled_owners[i]` `Arc<CompiledMethod>`.
+///
+/// A missing owner is legitimate for a *native* target (a builtin trampoline,
+/// never unmapped) and for the synthetic sentinels unit tests install. It is
+/// NOT legitimate for an address inside a live JIT code region: that is a
+/// compiled body whose `Arc` we failed to resolve, so nothing would stop the
+/// next tier-up `put` from dropping the last clone and `munmap`ping it under a
+/// slot still holding the raw pointer. Refuse those; the site falls back to the
+/// dispatch helper, which re-resolves authoritatively.
+fn jit_entry_publishable(entry: u64, owner: &Option<Arc<CompiledMethod>>) -> bool {
+    if entry == 0 || owner.is_some() {
+        return true;
+    }
+    // No live owner. Two shapes make that fatal rather than merely unowned:
+    //
+    //  * the address is still a `jit_entry_owners` key. Keys are removed only
+    //    by `CompiledMethod::drop`, and only once the `Weak` is already dead,
+    //    so a present key with a non-upgradable `Weak` means "this WAS a
+    //    JitCache artifact and it is gone" — its buffer is unmapped, or worse
+    //    already recycled by a later allocation.
+    //  * the address lies inside a live JIT code region: a compiled body we
+    //    simply failed to resolve, which the next tier-up `put` can drop.
+    //
+    // Anything else was never JIT-managed — a native/builtin target, or a unit
+    // test's synthetic sentinel. Nothing owns those and nothing unmaps them,
+    // so they stay publishable (that is what `compiled_owner`'s doc comment
+    // means by "native targets have no owner").
+    let registered = jit_entry_owners().lock().contains_key(&(entry as usize));
+    let in_jit_region = {
+        let regions = jit_code_regions().lock().unwrap_or_else(|e| e.into_inner());
+        regions.contains(entry as usize as *const u8)
+    };
+    if registered || in_jit_region {
+        UNOWNED_IC_ENTRY_REFUSALS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return false;
+    }
+    // Allowed, but with no keep-alive. Expected only for native/builtin targets
+    // and unit-test sentinels; a *production* hit here means an artifact was
+    // freed between the compile probe handing out its entry and this
+    // publication, which is exactly the stale-entry crash.
+    let n = UNOWNED_IC_ENTRY_PUBLISHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if dbg_stale_ic_enabled() && (n <= 20 || n % 1000 == 0) {
+        eprintln!("[jit-stale-ic] published UNOWNED entry {entry:#x} (n={n})");
+    }
+    true
+}
+
+/// Inline-cache publications of a non-zero entry with no retainable owner.
+static UNOWNED_IC_ENTRY_PUBLISHES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Number of inline-cache publications that carried no owner.
+pub fn unowned_ic_entry_publishes() -> u64 {
+    UNOWNED_IC_ENTRY_PUBLISHES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// DIAG (2026-07-27): `CRATONVM_JIT_LEAK_CODE=1` makes retired JIT code
@@ -12836,6 +13015,116 @@ mod tests {
             lookup_jit_code_range(old_entry).is_none(),
             "dropping the final direct caller must reclaim the old body"
         );
+    }
+
+    /// An inline cache that publishes a compiled entry MUST retain the
+    /// artifact owning it: generated code (`jit/src/x64.rs`'s MIC/PIC cascade)
+    /// loads the raw pointer into R11 and `CALL R11`s it with no validation,
+    /// so an entry whose last `Arc` has dropped is a call into an unmapped —
+    /// or recycled — executable mapping. The virtual dispatch helper used to
+    /// publish `cached_entry_ptr` with a bare atomic store on its
+    /// "class cached, target unresolved" path, taking no owner at all; that is
+    /// the NodeConnectionsServiceTests SIGSEGV.
+    #[test]
+    fn mic_update_retains_the_callee_artifact() {
+        let cache = JitCache::new();
+        let class: Arc<str> = Arc::from("OwnedTarget");
+        let method: Arc<str> = Arc::from("run");
+        let desc: Arc<str> = Arc::from("()V");
+        let cid = cratonvm_types::ClassId::new(4711);
+        let mut buf = ExecutableBuffer::new(64).expect("alloc owned target");
+        buf.emit(&[0xC3]);
+        cache.put(
+            class.clone(),
+            method.clone(),
+            desc.clone(),
+            cid,
+            CompiledMethod::new(buf),
+        );
+        let entry = cache
+            .get(&class, &method, &desc, cid)
+            .expect("target published")
+            .entry_ptr() as usize;
+
+        let slot = JitMICSlot::new();
+        slot.update(cid.as_u32(), &class, entry as u64, false);
+        assert_eq!(
+            slot.cached_entry_ptr
+                .load(std::sync::atomic::Ordering::Acquire) as usize,
+            entry,
+            "a live entry must be published"
+        );
+        assert!(
+            slot.compiled_owner.lock().is_some(),
+            "publishing an entry must take a strong owner for its artifact"
+        );
+
+        // Withdrawing the cache's own reference must not release the artifact
+        // while the slot still points at it.
+        cache.remove(&class, &method, &desc, cid);
+        assert!(
+            resolve_jit_entry_owner(entry).is_some(),
+            "the slot's owner must keep the callee artifact alive"
+        );
+
+        slot.clear_compiled_entry();
+        assert!(
+            resolve_jit_entry_owner(entry).is_none(),
+            "clearing the last holder must release the artifact"
+        );
+    }
+
+    /// The structural half of the same fix: if any caller hands an inline
+    /// cache an entry whose artifact is already gone, the cache must refuse it
+    /// instead of handing it to generated code. A *registered* address whose
+    /// `Weak` no longer upgrades is exactly that case, and is distinguishable
+    /// from a native target, which was never registered and stays publishable.
+    #[test]
+    fn inline_caches_refuse_a_dead_artifact_entry_but_allow_unregistered_ones() {
+        const DEAD_ENTRY: usize = 0x0DEAD_1000;
+        const NATIVE_ENTRY: u64 = 0x0CAFE_2000;
+        {
+            let mut buf = ExecutableBuffer::new(64).expect("alloc dead target");
+            buf.emit(&[0xC3]);
+            let arc = Arc::new(CompiledMethod::new(buf));
+            jit_entry_owners()
+                .lock()
+                .insert(DEAD_ENTRY, Arc::downgrade(&arc));
+            drop(arc);
+        }
+
+        let slot = JitMICSlot::new();
+        slot.update(21, "DeadOwner", DEAD_ENTRY as u64, false);
+        assert_eq!(
+            slot.cached_entry_ptr
+                .load(std::sync::atomic::Ordering::Acquire),
+            0,
+            "a dead artifact's entry must never be published to generated code"
+        );
+
+        let native_slot = JitMICSlot::new();
+        native_slot.update(22, "NativeOwner", NATIVE_ENTRY, false);
+        assert_eq!(
+            native_slot
+                .cached_entry_ptr
+                .load(std::sync::atomic::Ordering::Acquire),
+            NATIVE_ENTRY,
+            "non-artifact targets (natives, trampolines) stay publishable"
+        );
+
+        let pic = JitPICSlot::new();
+        pic.install(21, "DeadOwner", DEAD_ENTRY as u64, false);
+        assert!(
+            pic.lookup_megamorphic(21).is_none(),
+            "the hashed overflow table must refuse a dead entry too"
+        );
+        for i in 0..JIT_PIC_ENTRIES {
+            assert_eq!(
+                pic.entry_ptrs[i].load(std::sync::atomic::Ordering::Acquire),
+                0,
+                "no PIC way may hold a dead entry"
+            );
+        }
     }
 
     #[test]
