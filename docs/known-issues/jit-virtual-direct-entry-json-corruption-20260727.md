@@ -48,6 +48,7 @@ callee-artifact pin fix, so none of this is the stale-entry bug.
 | **`-Xmx8g`** | 1,500,000 | **0** |
 | **`-Xmx8g`**, second run | 1,500,000 | **0** |
 | **`CRATONVM_MOVING_YOUNG=0`** (`-Xmx1g`) | 1,500,000 | **0** |
+| `-Xmx256m` | 600,000 | 0 |
 | `CRATONVM_JIT_POISON_FREE=1` | 1,500,000 | 3, **no SIGSEGV** |
 | `CRATONVM_JIT_DIRECT_CALLEE_CALLS=0` | 1,500,000 | 1 |
 | `CRATONVM_JIT_DISPATCH_CACHE_VIRTUAL_DIRECT_ENTRY=0` (earlier build) | 3,000,000 | 0 |
@@ -56,10 +57,14 @@ callee-artifact pin fix, so none of this is the stale-entry bug.
 Reading those together:
 
 * **It needs a moving young generation.** 3 errors per 3M ops at `-Xmx1g`
-  versus 0 per 3M at `-Xmx8g` (which collects far less) and 0 per 1.5M with
-  `CRATONVM_MOVING_YOUNG=0` at the *same* 1 GiB heap. The heap-size row alone
-  would be confounded by GC frequency; the `MOVING_YOUNG=0` row at an unchanged
-  heap is what isolates *relocation* rather than *collection*.
+  versus 0 per 3M at `-Xmx8g` and 0 per 1.5M with `CRATONVM_MOVING_YOUNG=0` at
+  the *same* 1 GiB heap. The `MOVING_YOUNG=0` row is the load-bearing one: at an
+  unchanged heap it isolates *relocation* rather than *collection*. The rate is
+  NOT monotonic in collection frequency — `-Xmx256m`, which collects far more
+  often, is also clean over 600,000 ops — so the trigger is a particular
+  young-gen regime (big enough to evacuate rather than fall back), not simply
+  "more collections". Whatever narrows that regime is also the cheapest
+  amplifier available.
 * **It is not the inline machine-code MIC/PIC cascade.**
   `CRATONVM_JIT_DIRECT_CALLEE_CALLS=0` stops that cascade from being emitted at
   all and the corruption survives. What remains on that path is the *dispatch
