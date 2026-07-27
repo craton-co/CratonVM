@@ -1,0 +1,1699 @@
+[cratonvm] 2 per-flag variable(s) set directly; the supported spelling is now: CRATONVM_DBG=jit-disasm CRATONVM_JIT=threshold
+[2m2026-07-27T17:44:10.787827Z[0m [33m WARN[0m [2mcratonvm_vm::vm::vm_util[0m[2m:[0m Post-clinit fixup: Unsafe ARRAY_*_BASE_OFFSET/INDEX_SCALE populated (18/18)
+[2m2026-07-27T17:44:10.948571Z[0m [33m WARN[0m [2mcratonvm_vm::vm::vm_util[0m[2m:[0m Post-clinit fixup: UnsafeConstants populated (5/5)
+[CCE] enhance: defined S01_Context$Cfg$$SpringCGLIB$$0 (super=S01_Context$Cfg, loader=2, marker=org/springframework/context/annotation/ConfigurationClassEnhancer$EnhancedConfiguration, intercepted @Bean methods=2)
+[T] acac.getBean: PASS
+[T] acac.isSingleton: PASS
+[T] acac.singletonIdentity: PASS
+[T] acac.containsBean: PASS
+[T] acac.beanDefCount>0: PASS
+[T] acac.hasEnvironment: PASS
+[T] acac.closedNoActiveBeans: PASS
+[2m2026-07-27T17:44:11.237704Z[0m [33m WARN[0m [2mcratonvm_vm::vm::vm_util[0m[2m:[0m Post-clinit fixup: BigInteger ZERO/ONE/TWO/NEGATIVE_ONE/TEN populated (5/5)
+[2m2026-07-27T17:44:11.237741Z[0m [33m WARN[0m [2mcratonvm_vm::vm::vm_util[0m[2m:[0m Post-clinit fixup: BigInteger digitsPerLong/longRadix radix tables populated
+[2m2026-07-27T17:44:11.342709Z[0m [33m WARN[0m [2mcratonvm_vm::vm::vm_util[0m[2m:[0m Post-clinit fixup: PosixFilePermission backfilled 9/9 enum statics
+[cratonvm-jit-disasm] full org/springframework/core/ResolvableType.equals(Ljava/lang/Object;)Z entry=0x7e3685fe8000 len=7436
+       0: 55                       push rbp
+       1: 4889e5                   mov rbp,rsp
+       4: 8b8424d0fdffff           mov eax,[rsp-230h]
+       b: 4881ec30020000           sub rsp,230h
+      12: 8b842400f0ffff           mov eax,[rsp-1000h]
+      19: 4c89a578ffffff           mov [rbp-88h],r12
+      20: 4c89ad70ffffff           mov [rbp-90h],r13
+      27: 48897de0                 mov [rbp-20h],rdi
+      2b: 4c8bee                   mov r13,rsi
+      2e: 4c8be2                   mov r12,rdx
+      31: 488bfd                   mov rdi,rbp
+      34: 48b86088a40c33650000     mov rax,65330CA48860h
+      3e: ffd0                     call rax
+      40: 49bb98cc070100020000     mov r11,2000107CC98h
+      4a: 41f64300ff               test byte [r11],0FFh
+      4f: 0f8485000000             je near 00007E3685FE80DAh
+      55: 4c896df8                 mov [rbp-8],r13
+      59: 4c8965f0                 mov [rbp-10h],r12
+      5d: 4c8965e8                 mov [rbp-18h],r12
+      61: 48898568ffffff           mov [rbp-98h],rax
+      68: 48898d60ffffff           mov [rbp-0A0h],rcx
+      6f: 48899558ffffff           mov [rbp-0A8h],rdx
+      76: 48899d50ffffff           mov [rbp-0B0h],rbx
+      7d: 4889b548ffffff           mov [rbp-0B8h],rsi
+      84: 4889bd40ffffff           mov [rbp-0C0h],rdi
+      8b: 4c898538ffffff           mov [rbp-0C8h],r8
+      92: 4c898d30ffffff           mov [rbp-0D0h],r9
+      99: 4c899528ffffff           mov [rbp-0D8h],r10
+      a0: 4c899d20ffffff           mov [rbp-0E0h],r11
+      a7: 4c89a518ffffff           mov [rbp-0E8h],r12
+      ae: 4c89ad10ffffff           mov [rbp-0F0h],r13
+      b5: 4c89b508ffffff           mov [rbp-0F8h],r14
+      bc: 4c89bd00ffffff           mov [rbp-100h],r15
+      c3: 48c7c0ffffffff           mov rax,0FFFFFFFFFFFFFFFFh
+      ca: 488945d8                 mov [rbp-28h],rax
+      ce: 48b8404ea50c33650000     mov rax,65330CA54E40h
+      d8: ffd0                     call rax
+      da: 4c896dd0                 mov [rbp-30h],r13
+      de: 4c8965c8                 mov [rbp-38h],r12
+      e2: 498bcc                   mov rcx,r12
+      e5: 488b45d0                 mov rax,[rbp-30h]
+      e9: 4839c8                   cmp rax,rcx
+      ec: 0f8522000000             jne near 00007E3685FE8114h
+      f2: 48c7c001000000           mov rax,1
+      f9: 488945d0                 mov [rbp-30h],rax
+      fd: 4c8ba578ffffff           mov r12,[rbp-88h]
+     104: 4c8bad70ffffff           mov r13,[rbp-90h]
+     10b: 4881c430020000           add rsp,230h
+     112: 5d                       pop rbp
+     113: c3                       ret
+     114: 4c8965d0                 mov [rbp-30h],r12
+     118: 498bcc                   mov rcx,r12
+     11b: 4885c9                   test rcx,rcx
+     11e: 0f8486050000             je near 00007E3685FE86AAh
+     124: 4c8965d0                 mov [rbp-30h],r12
+     128: 498bc4                   mov rax,r12
+     12b: 488945c8                 mov [rbp-38h],rax
+     12f: 4c896df8                 mov [rbp-8],r13
+     133: 4c8965f0                 mov [rbp-10h],r12
+     137: 4c8965e8                 mov [rbp-18h],r12
+     13b: 48898568ffffff           mov [rbp-98h],rax
+     142: 48898d60ffffff           mov [rbp-0A0h],rcx
+     149: 48899558ffffff           mov [rbp-0A8h],rdx
+     150: 48899d50ffffff           mov [rbp-0B0h],rbx
+     157: 4889b548ffffff           mov [rbp-0B8h],rsi
+     15e: 4889bd40ffffff           mov [rbp-0C0h],rdi
+     165: 4c898538ffffff           mov [rbp-0C8h],r8
+     16c: 4c898d30ffffff           mov [rbp-0D0h],r9
+     173: 4c899528ffffff           mov [rbp-0D8h],r10
+     17a: 4c899d20ffffff           mov [rbp-0E0h],r11
+     181: 4c89a518ffffff           mov [rbp-0E8h],r12
+     188: 4c89ad10ffffff           mov [rbp-0F0h],r13
+     18f: 4c89b508ffffff           mov [rbp-0F8h],r14
+     196: 4c89bd00ffffff           mov [rbp-100h],r15
+     19d: 48c7c00c000000           mov rax,0Ch
+     1a4: 488945d8                 mov [rbp-28h],rax
+     1a8: 49ba00483e1200020000     mov r10,200123E4800h
+     1b2: 488b7de0                 mov rdi,[rbp-20h]
+     1b6: 488b75c8                 mov rsi,[rbp-38h]
+     1ba: 4885f6                   test rsi,rsi
+     1bd: 0f84c9000000             je near 00007E3685FE828Ch
+     1c3: 8b06                     mov eax,[rsi]
+     1c5: 413b02                   cmp eax,[r10]
+     1c8: 752b                     jne short 00007E3685FE81F5h
+     1ca: 49837a1000               cmp qword [r10+10h],0
+     1cf: 0f84b7000000             je near 00007E3685FE828Ch
+     1d5: 41807a3000               cmp byte [r10+30h],0
+     1da: 0f8405000000             je near 00007E3685FE81E5h
+     1e0: e904000000               jmp 00007E3685FE81E9h
+     1e5: 488b7dc8                 mov rdi,[rbp-38h]
+     1e9: 4d8b5a10                 mov r11,[r10+10h]
+     1ed: 41ffd3                   call r11
+     1f0: e9cb010000               jmp 00007E3685FE83C0h
+     1f5: 413b4204                 cmp eax,[r10+4]
+     1f9: 752b                     jne short 00007E3685FE8226h
+     1fb: 49837a1800               cmp qword [r10+18h],0
+     200: 0f8486000000             je near 00007E3685FE828Ch
+     206: 41807a3100               cmp byte [r10+31h],0
+     20b: 0f8405000000             je near 00007E3685FE8216h
+     211: e904000000               jmp 00007E3685FE821Ah
+     216: 488b7dc8                 mov rdi,[rbp-38h]
+     21a: 4d8b5a18                 mov r11,[r10+18h]
+     21e: 41ffd3                   call r11
+     221: e99a010000               jmp 00007E3685FE83C0h
+     226: 413b4208                 cmp eax,[r10+8]
+     22a: 752b                     jne short 00007E3685FE8257h
+     22c: 49837a2000               cmp qword [r10+20h],0
+     231: 0f8455000000             je near 00007E3685FE828Ch
+     237: 41807a3200               cmp byte [r10+32h],0
+     23c: 0f8405000000             je near 00007E3685FE8247h
+     242: e904000000               jmp 00007E3685FE824Bh
+     247: 488b7dc8                 mov rdi,[rbp-38h]
+     24b: 4d8b5a20                 mov r11,[r10+20h]
+     24f: 41ffd3                   call r11
+     252: e969010000               jmp 00007E3685FE83C0h
+     257: 413b420c                 cmp eax,[r10+0Ch]
+     25b: 0f852b000000             jne near 00007E3685FE828Ch
+     261: 49837a2800               cmp qword [r10+28h],0
+     266: 0f8420000000             je near 00007E3685FE828Ch
+     26c: 41807a3300               cmp byte [r10+33h],0
+     271: 0f8405000000             je near 00007E3685FE827Ch
+     277: e904000000               jmp 00007E3685FE8280h
+     27c: 488b7dc8                 mov rdi,[rbp-38h]
+     280: 4d8b5a28                 mov r11,[r10+28h]
+     284: 41ffd3                   call r11
+     287: e934010000               jmp 00007E3685FE83C0h
+     28c: 488b85c8ffffff           mov rax,[rbp-38h]
+     293: 4885c0                   test rax,rax
+     296: 0f84eb000000             je near 00007E3685FE8387h
+     29c: 8b10                     mov edx,[rax]
+     29e: 69cab179379e             imul ecx,edx,9E3779B1h
+     2a4: c1e91d                   shr ecx,1Dh
+     2a7: d1e1                     shl ecx,1
+     2a9: 49ba00483e1200020000     mov r10,200123E4800h
+     2b3: 413b948a60000000         cmp edx,[r10+rcx*4+60h]
+     2bb: 0f855b000000             jne near 00007E3685FE831Ch
+     2c1: 4d8b9ccaa0000000         mov r11,[r10+rcx*8+0A0h]
+     2c9: 4d85db                   test r11,r11
+     2cc: 0f84b5000000             je near 00007E3685FE8387h
+     2d2: 4180bc0a2001000000       cmp byte [r10+rcx+120h],0
+     2db: 0f8413000000             je near 00007E3685FE82F4h
+     2e1: 488bbde0ffffff           mov rdi,[rbp-20h]
+     2e8: 488bb5c8ffffff           mov rsi,[rbp-38h]
+     2ef: e907000000               jmp 00007E3685FE82FBh
+     2f4: 488bbdc8ffffff           mov rdi,[rbp-38h]
+     2fb: 41ffd3                   call r11
+     2fe: 50                       push rax
+     2ff: 4883ec08                 sub rsp,8
+     303: 4889ef                   mov rdi,rbp
+     306: 48b86088a40c33650000     mov rax,65330CA48860h
+     310: ffd0                     call rax
+     312: 4883c408                 add rsp,8
+     316: 58                       pop rax
+     317: e9a4000000               jmp 00007E3685FE83C0h
+     31c: ffc1                     inc ecx
+     31e: 413b948a60000000         cmp edx,[r10+rcx*4+60h]
+     326: 0f855b000000             jne near 00007E3685FE8387h
+     32c: 4d8b9ccaa0000000         mov r11,[r10+rcx*8+0A0h]
+     334: 4d85db                   test r11,r11
+     337: 0f844a000000             je near 00007E3685FE8387h
+     33d: 4180bc0a2001000000       cmp byte [r10+rcx+120h],0
+     346: 0f8413000000             je near 00007E3685FE835Fh
+     34c: 488bbde0ffffff           mov rdi,[rbp-20h]
+     353: 488bb5c8ffffff           mov rsi,[rbp-38h]
+     35a: e907000000               jmp 00007E3685FE8366h
+     35f: 488bbdc8ffffff           mov rdi,[rbp-38h]
+     366: 41ffd3                   call r11
+     369: 50                       push rax
+     36a: 4883ec08                 sub rsp,8
+     36e: 4889ef                   mov rdi,rbp
+     371: 48b86088a40c33650000     mov rax,65330CA48860h
+     37b: ffd0                     call rax
+     37d: 4883c408                 add rsp,8
+     381: 58                       pop rax
+     382: e939000000               jmp 00007E3685FE83C0h
+     387: 488b7de0                 mov rdi,[rbp-20h]
+     38b: 48be006d471300020000     mov rsi,20013476D00h
+     395: 488d55c8                 lea rdx,[rbp-38h]
+     399: 48c7c101000000           mov rcx,1
+     3a0: 49b8a050471200020000     mov r8,200124750A0h
+     3aa: 49b900483e1200020000     mov r9,200123E4800h
+     3b4: 48b8d013a50c33650000     mov rax,65330CA513D0h
+     3be: ffd0                     call rax
+     3c0: 4c8b6df8                 mov r13,[rbp-8]
+     3c4: 4c8b65f0                 mov r12,[rbp-10h]
+     3c8: 49ba0000000000000080     mov r10,8000000000000000h
+     3d2: 4c39d0                   cmp rax,r10
+     3d5: 0f8410190000             je near 00007E3685FE9CEBh
+     3db: 488945d0                 mov [rbp-30h],rax
+     3df: 4c896dc8                 mov [rbp-38h],r13
+     3e3: 498bc5                   mov rax,r13
+     3e6: 488945c0                 mov [rbp-40h],rax
+     3ea: 4c896df8                 mov [rbp-8],r13
+     3ee: 4c8965f0                 mov [rbp-10h],r12
+     3f2: 4c8965e8                 mov [rbp-18h],r12
+     3f6: 48898568ffffff           mov [rbp-98h],rax
+     3fd: 48898d60ffffff           mov [rbp-0A0h],rcx
+     404: 48899558ffffff           mov [rbp-0A8h],rdx
+     40b: 48899d50ffffff           mov [rbp-0B0h],rbx
+     412: 4889b548ffffff           mov [rbp-0B8h],rsi
+     419: 4889bd40ffffff           mov [rbp-0C0h],rdi
+     420: 4c898538ffffff           mov [rbp-0C8h],r8
+     427: 4c898d30ffffff           mov [rbp-0D0h],r9
+     42e: 4c899528ffffff           mov [rbp-0D8h],r10
+     435: 4c899d20ffffff           mov [rbp-0E0h],r11
+     43c: 4c89a518ffffff           mov [rbp-0E8h],r12
+     443: 4c89ad10ffffff           mov [rbp-0F0h],r13
+     44a: 4c89b508ffffff           mov [rbp-0F8h],r14
+     451: 4c89bd00ffffff           mov [rbp-100h],r15
+     458: 48c7c010000000           mov rax,10h
+     45f: 488945d8                 mov [rbp-28h],rax
+     463: 49ba00453e1200020000     mov r10,200123E4500h
+     46d: 488b7de0                 mov rdi,[rbp-20h]
+     471: 488b75c0                 mov rsi,[rbp-40h]
+     475: 4885f6                   test rsi,rsi
+     478: 0f84c9000000             je near 00007E3685FE8547h
+     47e: 8b06                     mov eax,[rsi]
+     480: 413b02                   cmp eax,[r10]
+     483: 752b                     jne short 00007E3685FE84B0h
+     485: 49837a1000               cmp qword [r10+10h],0
+     48a: 0f84b7000000             je near 00007E3685FE8547h
+     490: 41807a3000               cmp byte [r10+30h],0
+     495: 0f8405000000             je near 00007E3685FE84A0h
+     49b: e904000000               jmp 00007E3685FE84A4h
+     4a0: 488b7dc0                 mov rdi,[rbp-40h]
+     4a4: 4d8b5a10                 mov r11,[r10+10h]
+     4a8: 41ffd3                   call r11
+     4ab: e9cb010000               jmp 00007E3685FE867Bh
+     4b0: 413b4204                 cmp eax,[r10+4]
+     4b4: 752b                     jne short 00007E3685FE84E1h
+     4b6: 49837a1800               cmp qword [r10+18h],0
+     4bb: 0f8486000000             je near 00007E3685FE8547h
+     4c1: 41807a3100               cmp byte [r10+31h],0
+     4c6: 0f8405000000             je near 00007E3685FE84D1h
+     4cc: e904000000               jmp 00007E3685FE84D5h
+     4d1: 488b7dc0                 mov rdi,[rbp-40h]
+     4d5: 4d8b5a18                 mov r11,[r10+18h]
+     4d9: 41ffd3                   call r11
+     4dc: e99a010000               jmp 00007E3685FE867Bh
+     4e1: 413b4208                 cmp eax,[r10+8]
+     4e5: 752b                     jne short 00007E3685FE8512h
+     4e7: 49837a2000               cmp qword [r10+20h],0
+     4ec: 0f8455000000             je near 00007E3685FE8547h
+     4f2: 41807a3200               cmp byte [r10+32h],0
+     4f7: 0f8405000000             je near 00007E3685FE8502h
+     4fd: e904000000               jmp 00007E3685FE8506h
+     502: 488b7dc0                 mov rdi,[rbp-40h]
+     506: 4d8b5a20                 mov r11,[r10+20h]
+     50a: 41ffd3                   call r11
+     50d: e969010000               jmp 00007E3685FE867Bh
+     512: 413b420c                 cmp eax,[r10+0Ch]
+     516: 0f852b000000             jne near 00007E3685FE8547h
+     51c: 49837a2800               cmp qword [r10+28h],0
+     521: 0f8420000000             je near 00007E3685FE8547h
+     527: 41807a3300               cmp byte [r10+33h],0
+     52c: 0f8405000000             je near 00007E3685FE8537h
+     532: e904000000               jmp 00007E3685FE853Bh
+     537: 488b7dc0                 mov rdi,[rbp-40h]
+     53b: 4d8b5a28                 mov r11,[r10+28h]
+     53f: 41ffd3                   call r11
+     542: e934010000               jmp 00007E3685FE867Bh
+     547: 488b85c0ffffff           mov rax,[rbp-40h]
+     54e: 4885c0                   test rax,rax
+     551: 0f84eb000000             je near 00007E3685FE8642h
+     557: 8b10                     mov edx,[rax]
+     559: 69cab179379e             imul ecx,edx,9E3779B1h
+     55f: c1e91d                   shr ecx,1Dh
+     562: d1e1                     shl ecx,1
+     564: 49ba00453e1200020000     mov r10,200123E4500h
+     56e: 413b948a60000000         cmp edx,[r10+rcx*4+60h]
+     576: 0f855b000000             jne near 00007E3685FE85D7h
+     57c: 4d8b9ccaa0000000         mov r11,[r10+rcx*8+0A0h]
+     584: 4d85db                   test r11,r11
+     587: 0f84b5000000             je near 00007E3685FE8642h
+     58d: 4180bc0a2001000000       cmp byte [r10+rcx+120h],0
+     596: 0f8413000000             je near 00007E3685FE85AFh
+     59c: 488bbde0ffffff           mov rdi,[rbp-20h]
+     5a3: 488bb5c0ffffff           mov rsi,[rbp-40h]
+     5aa: e907000000               jmp 00007E3685FE85B6h
+     5af: 488bbdc0ffffff           mov rdi,[rbp-40h]
+     5b6: 41ffd3                   call r11
+     5b9: 50                       push rax
+     5ba: 4883ec08                 sub rsp,8
+     5be: 4889ef                   mov rdi,rbp
+     5c1: 48b86088a40c33650000     mov rax,65330CA48860h
+     5cb: ffd0                     call rax
+     5cd: 4883c408                 add rsp,8
+     5d1: 58                       pop rax
+     5d2: e9a4000000               jmp 00007E3685FE867Bh
+     5d7: ffc1                     inc ecx
+     5d9: 413b948a60000000         cmp edx,[r10+rcx*4+60h]
+     5e1: 0f855b000000             jne near 00007E3685FE8642h
+     5e7: 4d8b9ccaa0000000         mov r11,[r10+rcx*8+0A0h]
+     5ef: 4d85db                   test r11,r11
+     5f2: 0f844a000000             je near 00007E3685FE8642h
+     5f8: 4180bc0a2001000000       cmp byte [r10+rcx+120h],0
+     601: 0f8413000000             je near 00007E3685FE861Ah
+     607: 488bbde0ffffff           mov rdi,[rbp-20h]
+     60e: 488bb5c0ffffff           mov rsi,[rbp-40h]
+     615: e907000000               jmp 00007E3685FE8621h
+     61a: 488bbdc0ffffff           mov rdi,[rbp-40h]
+     621: 41ffd3                   call r11
+     624: 50                       push rax
+     625: 4883ec08                 sub rsp,8
+     629: 4889ef                   mov rdi,rbp
+     62c: 48b86088a40c33650000     mov rax,65330CA48860h
+     636: ffd0                     call rax
+     638: 4883c408                 add rsp,8
+     63c: 58                       pop rax
+     63d: e939000000               jmp 00007E3685FE867Bh
+     642: 488b7de0                 mov rdi,[rbp-20h]
+     646: 48be00c5b11300020000     mov rsi,20013B1C500h
+     650: 488d55c0                 lea rdx,[rbp-40h]
+     654: 48c7c101000000           mov rcx,1
+     65b: 49b8b05e471200020000     mov r8,20012475EB0h
+     665: 49b900453e1200020000     mov r9,200123E4500h
+     66f: 48b8d013a50c33650000     mov rax,65330CA513D0h
+     679: ffd0                     call rax
+     67b: 4c8b6df8                 mov r13,[rbp-8]
+     67f: 4c8b65f0                 mov r12,[rbp-10h]
+     683: 49ba0000000000000080     mov r10,8000000000000000h
+     68d: 4c39d0                   cmp rax,r10
+     690: 0f8455160000             je near 00007E3685FE9CEBh
+     696: 488945c8                 mov [rbp-38h],rax
+     69a: 488bc8                   mov rcx,rax
+     69d: 488b45d0                 mov rax,[rbp-30h]
+     6a1: 4839c8                   cmp rax,rcx
+     6a4: 0f841d000000             je near 00007E3685FE86C7h
+     6aa: 31c0                     xor eax,eax
+     6ac: 488945d0                 mov [rbp-30h],rax
+     6b0: 4c8ba578ffffff           mov r12,[rbp-88h]
+     6b7: 4c8bad70ffffff           mov r13,[rbp-90h]
+     6be: 4881c430020000           add rsp,230h
+     6c5: 5d                       pop rbp
+     6c6: c3                       ret
+     6c7: 4c8965d0                 mov [rbp-30h],r12
+     6cb: 488b7de0                 mov rdi,[rbp-20h]
+     6cf: 488b75d0                 mov rsi,[rbp-30h]
+     6d3: 48ba408cad1000020000     mov rdx,20010AD8C40h
+     6dd: 48c7c127000000           mov rcx,27h
+     6e4: 4c896df8                 mov [rbp-8],r13
+     6e8: 4c8965f0                 mov [rbp-10h],r12
+     6ec: 4c8965e8                 mov [rbp-18h],r12
+     6f0: 48898568ffffff           mov [rbp-98h],rax
+     6f7: 48898d60ffffff           mov [rbp-0A0h],rcx
+     6fe: 48899558ffffff           mov [rbp-0A8h],rdx
+     705: 48899d50ffffff           mov [rbp-0B0h],rbx
+     70c: 4889b548ffffff           mov [rbp-0B8h],rsi
+     713: 4889bd40ffffff           mov [rbp-0C0h],rdi
+     71a: 4c898538ffffff           mov [rbp-0C8h],r8
+     721: 4c898d30ffffff           mov [rbp-0D0h],r9
+     728: 4c899528ffffff           mov [rbp-0D8h],r10
+     72f: 4c899d20ffffff           mov [rbp-0E0h],r11
+     736: 4c89a518ffffff           mov [rbp-0E8h],r12
+     73d: 4c89ad10ffffff           mov [rbp-0F0h],r13
+     744: 4c89b508ffffff           mov [rbp-0F8h],r14
+     74b: 4c89bd00ffffff           mov [rbp-100h],r15
+     752: 48c7c019000000           mov rax,19h
+     759: 488945d8                 mov [rbp-28h],rax
+     75d: 48b820d4a40c33650000     mov rax,65330CA4D420h
+     767: ffd0                     call rax
+     769: 4c8b6df8                 mov r13,[rbp-8]
+     76d: 4c8b65f0                 mov r12,[rbp-10h]
+     771: 49ba0000000000000080     mov r10,8000000000000000h
+     77b: 4c39d0                   cmp rax,r10
+     77e: 0f8467150000             je near 00007E3685FE9CEBh
+     784: 488945d0                 mov [rbp-30h],rax
+     788: 4c8be0                   mov r12,rax
+     78b: 4c896dd0                 mov [rbp-30h],r13
+     78f: 4c8965c8                 mov [rbp-38h],r12
+     793: 488b45d0                 mov rax,[rbp-30h]
+     797: 488945b8                 mov [rbp-48h],rax
+     79b: 488b45c8                 mov rax,[rbp-38h]
+     79f: 488945c0                 mov [rbp-40h],rax
+     7a3: 4c896df8                 mov [rbp-8],r13
+     7a7: 4c8965f0                 mov [rbp-10h],r12
+     7ab: 4c8965e8                 mov [rbp-18h],r12
+     7af: 48898568ffffff           mov [rbp-98h],rax
+     7b6: 48898d60ffffff           mov [rbp-0A0h],rcx
+     7bd: 48899558ffffff           mov [rbp-0A8h],rdx
+     7c4: 48899d50ffffff           mov [rbp-0B0h],rbx
+     7cb: 4889b548ffffff           mov [rbp-0B8h],rsi
+     7d2: 4889bd40ffffff           mov [rbp-0C0h],rdi
+     7d9: 4c898538ffffff           mov [rbp-0C8h],r8
+     7e0: 4c898d30ffffff           mov [rbp-0D0h],r9
+     7e7: 4c899528ffffff           mov [rbp-0D8h],r10
+     7ee: 4c899d20ffffff           mov [rbp-0E0h],r11
+     7f5: 4c89a518ffffff           mov [rbp-0E8h],r12
+     7fc: 4c89ad10ffffff           mov [rbp-0F0h],r13
+     803: 4c89b508ffffff           mov [rbp-0F8h],r14
+     80a: 4c89bd00ffffff           mov [rbp-100h],r15
+     811: 48c7c01f000000           mov rax,1Fh
+     818: 488945d8                 mov [rbp-28h],rax
+     81c: 49ba00423e1200020000     mov r10,200123E4200h
+     826: 488b7de0                 mov rdi,[rbp-20h]
+     82a: 488b75b8                 mov rsi,[rbp-48h]
+     82e: 488b55c0                 mov rdx,[rbp-40h]
+     832: 4885f6                   test rsi,rsi
+     835: 0f84d9000000             je near 00007E3685FE8914h
+     83b: 8b06                     mov eax,[rsi]
+     83d: 413b02                   cmp eax,[r10]
+     840: 752f                     jne short 00007E3685FE8871h
+     842: 49837a1000               cmp qword [r10+10h],0
+     847: 0f84c7000000             je near 00007E3685FE8914h
+     84d: 41807a3000               cmp byte [r10+30h],0
+     852: 0f8405000000             je near 00007E3685FE885Dh
+     858: e908000000               jmp 00007E3685FE8865h
+     85d: 488b7db8                 mov rdi,[rbp-48h]
+     861: 488b75c0                 mov rsi,[rbp-40h]
+     865: 4d8b5a10                 mov r11,[r10+10h]
+     869: 41ffd3                   call r11
+     86c: e9f3010000               jmp 00007E3685FE8A64h
+     871: 413b4204                 cmp eax,[r10+4]
+     875: 752f                     jne short 00007E3685FE88A6h
+     877: 49837a1800               cmp qword [r10+18h],0
+     87c: 0f8492000000             je near 00007E3685FE8914h
+     882: 41807a3100               cmp byte [r10+31h],0
+     887: 0f8405000000             je near 00007E3685FE8892h
+     88d: e908000000               jmp 00007E3685FE889Ah
+     892: 488b7db8                 mov rdi,[rbp-48h]
+     896: 488b75c0                 mov rsi,[rbp-40h]
+     89a: 4d8b5a18                 mov r11,[r10+18h]
+     89e: 41ffd3                   call r11
+     8a1: e9be010000               jmp 00007E3685FE8A64h
+     8a6: 413b4208                 cmp eax,[r10+8]
+     8aa: 752f                     jne short 00007E3685FE88DBh
+     8ac: 49837a2000               cmp qword [r10+20h],0
+     8b1: 0f845d000000             je near 00007E3685FE8914h
+     8b7: 41807a3200               cmp byte [r10+32h],0
+     8bc: 0f8405000000             je near 00007E3685FE88C7h
+     8c2: e908000000               jmp 00007E3685FE88CFh
+     8c7: 488b7db8                 mov rdi,[rbp-48h]
+     8cb: 488b75c0                 mov rsi,[rbp-40h]
+     8cf: 4d8b5a20                 mov r11,[r10+20h]
+     8d3: 41ffd3                   call r11
+     8d6: e989010000               jmp 00007E3685FE8A64h
+     8db: 413b420c                 cmp eax,[r10+0Ch]
+     8df: 0f852f000000             jne near 00007E3685FE8914h
+     8e5: 49837a2800               cmp qword [r10+28h],0
+     8ea: 0f8424000000             je near 00007E3685FE8914h
+     8f0: 41807a3300               cmp byte [r10+33h],0
+     8f5: 0f8405000000             je near 00007E3685FE8900h
+     8fb: e908000000               jmp 00007E3685FE8908h
+     900: 488b7db8                 mov rdi,[rbp-48h]
+     904: 488b75c0                 mov rsi,[rbp-40h]
+     908: 4d8b5a28                 mov r11,[r10+28h]
+     90c: 41ffd3                   call r11
+     90f: e950010000               jmp 00007E3685FE8A64h
+     914: 488b85b8ffffff           mov rax,[rbp-48h]
+     91b: 4885c0                   test rax,rax
+     91e: 0f8407010000             je near 00007E3685FE8A2Bh
+     924: 8b10                     mov edx,[rax]
+     926: 69cab179379e             imul ecx,edx,9E3779B1h
+     92c: c1e91d                   shr ecx,1Dh
+     92f: d1e1                     shl ecx,1
+     931: 49ba00423e1200020000     mov r10,200123E4200h
+     93b: 413b948a60000000         cmp edx,[r10+rcx*4+60h]
+     943: 0f8569000000             jne near 00007E3685FE89B2h
+     949: 4d8b9ccaa0000000         mov r11,[r10+rcx*8+0A0h]
+     951: 4d85db                   test r11,r11
+     954: 0f84d1000000             je near 00007E3685FE8A2Bh
+     95a: 4180bc0a2001000000       cmp byte [r10+rcx+120h],0
+     963: 0f841a000000             je near 00007E3685FE8983h
+     969: 488bbde0ffffff           mov rdi,[rbp-20h]
+     970: 488bb5b8ffffff           mov rsi,[rbp-48h]
+     977: 488b95c0ffffff           mov rdx,[rbp-40h]
+     97e: e90e000000               jmp 00007E3685FE8991h
+     983: 488bbdb8ffffff           mov rdi,[rbp-48h]
+     98a: 488bb5c0ffffff           mov rsi,[rbp-40h]
+     991: 41ffd3                   call r11
+     994: 50                       push rax
+     995: 4883ec08                 sub rsp,8
+     999: 4889ef                   mov rdi,rbp
+     99c: 48b86088a40c33650000     mov rax,65330CA48860h
+     9a6: ffd0                     call rax
+     9a8: 4883c408                 add rsp,8
+     9ac: 58                       pop rax
+     9ad: e9b2000000               jmp 00007E3685FE8A64h
+     9b2: ffc1                     inc ecx
+     9b4: 413b948a60000000         cmp edx,[r10+rcx*4+60h]
+     9bc: 0f8569000000             jne near 00007E3685FE8A2Bh
+     9c2: 4d8b9ccaa0000000         mov r11,[r10+rcx*8+0A0h]
+     9ca: 4d85db                   test r11,r11
+     9cd: 0f8458000000             je near 00007E3685FE8A2Bh
+     9d3: 4180bc0a2001000000       cmp byte [r10+rcx+120h],0
+     9dc: 0f841a000000             je near 00007E3685FE89FCh
+     9e2: 488bbde0ffffff           mov rdi,[rbp-20h]
+     9e9: 488bb5b8ffffff           mov rsi,[rbp-48h]
+     9f0: 488b95c0ffffff           mov rdx,[rbp-40h]
+     9f7: e90e000000               jmp 00007E3685FE8A0Ah
+     9fc: 488bbdb8ffffff           mov rdi,[rbp-48h]
+     a03: 488bb5c0ffffff           mov rsi,[rbp-40h]
+     a0a: 41ffd3                   call r11
+     a0d: 50                       push rax
+     a0e: 4883ec08                 sub rsp,8
+     a12: 4889ef                   mov rdi,rbp
+     a15: 48b86088a40c33650000     mov rax,65330CA48860h
+     a1f: ffd0                     call rax
+     a21: 4883c408                 add rsp,8
+     a25: 58                       pop rax
+     a26: e939000000               jmp 00007E3685FE8A64h
+     a2b: 488b7de0                 mov rdi,[rbp-20h]
+     a2f: 48be4085b11300020000     mov rsi,20013B18540h
+     a39: 488d55b8                 lea rdx,[rbp-48h]
+     a3d: 48c7c102000000           mov rcx,2
+     a44: 49b84056471200020000     mov r8,20012475640h
+     a4e: 49b900423e1200020000     mov r9,200123E4200h
+     a58: 48b8d013a50c33650000     mov rax,65330CA513D0h
+     a62: ffd0                     call rax
+     a64: 4c8b6df8                 mov r13,[rbp-8]
+     a68: 4c8b65f0                 mov r12,[rbp-10h]
+     a6c: 4c8b65e8                 mov r12,[rbp-18h]
+     a70: 49ba0000000000000080     mov r10,8000000000000000h
+     a7a: 4c39d0                   cmp rax,r10
+     a7d: 0f8468120000             je near 00007E3685FE9CEBh
+     a83: 488945d0                 mov [rbp-30h],rax
+     a87: 488bc8                   mov rcx,rax
+     a8a: 85c9                     test ecx,ecx
+     a8c: 0f851d000000             jne near 00007E3685FE8AAFh
+     a92: 31c0                     xor eax,eax
+     a94: 488945d0                 mov [rbp-30h],rax
+     a98: 4c8ba578ffffff           mov r12,[rbp-88h]
+     a9f: 4c8bad70ffffff           mov r13,[rbp-90h]
+     aa6: 4881c430020000           add rsp,230h
+     aad: 5d                       pop rbp
+     aae: c3                       ret
+     aaf: 4c896dd0                 mov [rbp-30h],r13
+     ab3: 498bc5                   mov rax,r13
+     ab6: 4885c0                   test rax,rax
+     ab9: 0f8428000000             je near 00007E3685FE8AE7h
+     abf: 8b8807000000             mov ecx,[rax+7]
+     ac5: 4883e104                 and rcx,4
+     ac9: 0f840c000000             je near 00007E3685FE8ADBh
+     acf: 488b8030000000           mov rax,[rax+30h]
+     ad6: e93a000000               jmp 00007E3685FE8B15h
+     adb: 488b8048000000           mov rax,[rax+48h]
+     ae2: e92e000000               jmp 00007E3685FE8B15h
+     ae7: 488b7de0                 mov rdi,[rbp-20h]
+     aeb: 488b75d0                 mov rsi,[rbp-30h]
+     aef: 48c7c202000000           mov rdx,2
+     af6: 48b890b8a40c33650000     mov rax,65330CA4B890h
+     b00: ffd0                     call rax
+     b02: 49ba0000000000000080     mov r10,8000000000000000h
+     b0c: 4c39d0                   cmp rax,r10
+     b0f: 0f84d6110000             je near 00007E3685FE9CEBh
+     b15: 488945d0                 mov [rbp-30h],rax
+     b19: 4c8965c8                 mov [rbp-38h],r12
+     b1d: 498bc4                   mov rax,r12
+     b20: 4885c0                   test rax,rax
+     b23: 0f8428000000             je near 00007E3685FE8B51h
+     b29: 8b8807000000             mov ecx,[rax+7]
+     b2f: 4883e104                 and rcx,4
+     b33: 0f840c000000             je near 00007E3685FE8B45h
+     b39: 488b8030000000           mov rax,[rax+30h]
+     b40: e93a000000               jmp 00007E3685FE8B7Fh
+     b45: 488b8048000000           mov rax,[rax+48h]
+     b4c: e92e000000               jmp 00007E3685FE8B7Fh
+     b51: 488b7de0                 mov rdi,[rbp-20h]
+     b55: 488b75c8                 mov rsi,[rbp-38h]
+     b59: 48c7c202000000           mov rdx,2
+     b60: 48b890b8a40c33650000     mov rax,65330CA4B890h
+     b6a: ffd0                     call rax
+     b6c: 49ba0000000000000080     mov r10,8000000000000000h
+     b76: 4c39d0                   cmp rax,r10
+     b79: 0f846c110000             je near 00007E3685FE9CEBh
+     b7f: 488945c8                 mov [rbp-38h],rax
+     b83: 488bc8                   mov rcx,rax
+     b86: 488b45d0                 mov rax,[rbp-30h]
+     b8a: 4839c8                   cmp rax,rcx
+     b8d: 0f8429080000             je near 00007E3685FE93BCh
+     b93: 4c896dd0                 mov [rbp-30h],r13
+     b97: 498bc5                   mov rax,r13
+     b9a: 4885c0                   test rax,rax
+     b9d: 0f8428000000             je near 00007E3685FE8BCBh
+     ba3: 8b8807000000             mov ecx,[rax+7]
+     ba9: 4883e104                 and rcx,4
+     bad: 0f840c000000             je near 00007E3685FE8BBFh
+     bb3: 488b8030000000           mov rax,[rax+30h]
+     bba: e93a000000               jmp 00007E3685FE8BF9h
+     bbf: 488b8048000000           mov rax,[rax+48h]
+     bc6: e92e000000               jmp 00007E3685FE8BF9h
+     bcb: 488b7de0                 mov rdi,[rbp-20h]
+     bcf: 488b75d0                 mov rsi,[rbp-30h]
+     bd3: 48c7c202000000           mov rdx,2
+     bda: 48b890b8a40c33650000     mov rax,65330CA4B890h
+     be4: ffd0                     call rax
+     be6: 49ba0000000000000080     mov r10,8000000000000000h
+     bf0: 4c39d0                   cmp rax,r10
+     bf3: 0f84f2100000             je near 00007E3685FE9CEBh
+     bf9: 488945d0                 mov [rbp-30h],rax
+     bfd: 488bc8                   mov rcx,rax
+     c00: 4885c9                   test rcx,rcx
+     c03: 0f8496070000             je near 00007E3685FE939Fh
+     c09: 4c8965d0                 mov [rbp-30h],r12
+     c0d: 498bc4                   mov rax,r12
+     c10: 4885c0                   test rax,rax
+     c13: 0f8428000000             je near 00007E3685FE8C41h
+     c19: 8b8807000000             mov ecx,[rax+7]
+     c1f: 4883e104                 and rcx,4
+     c23: 0f840c000000             je near 00007E3685FE8C35h
+     c29: 488b8030000000           mov rax,[rax+30h]
+     c30: e93a000000               jmp 00007E3685FE8C6Fh
+     c35: 488b8048000000           mov rax,[rax+48h]
+     c3c: e92e000000               jmp 00007E3685FE8C6Fh
+     c41: 488b7de0                 mov rdi,[rbp-20h]
+     c45: 488b75d0                 mov rsi,[rbp-30h]
+     c49: 48c7c202000000           mov rdx,2
+     c50: 48b890b8a40c33650000     mov rax,65330CA4B890h
+     c5a: ffd0                     call rax
+     c5c: 49ba0000000000000080     mov r10,8000000000000000h
+     c66: 4c39d0                   cmp rax,r10
+     c69: 0f847c100000             je near 00007E3685FE9CEBh
+     c6f: 488945d0                 mov [rbp-30h],rax
+     c73: 488bc8                   mov rcx,rax
+     c76: 4885c9                   test rcx,rcx
+     c79: 0f8420070000             je near 00007E3685FE939Fh
+     c7f: 4c896dd0                 mov [rbp-30h],r13
+     c83: 498bc5                   mov rax,r13
+     c86: 4885c0                   test rax,rax
+     c89: 0f8428000000             je near 00007E3685FE8CB7h
+     c8f: 8b8807000000             mov ecx,[rax+7]
+     c95: 4883e104                 and rcx,4
+     c99: 0f840c000000             je near 00007E3685FE8CABh
+     c9f: 488b8030000000           mov rax,[rax+30h]
+     ca6: e93a000000               jmp 00007E3685FE8CE5h
+     cab: 488b8048000000           mov rax,[rax+48h]
+     cb2: e92e000000               jmp 00007E3685FE8CE5h
+     cb7: 488b7de0                 mov rdi,[rbp-20h]
+     cbb: 488b75d0                 mov rsi,[rbp-30h]
+     cbf: 48c7c202000000           mov rdx,2
+     cc6: 48b890b8a40c33650000     mov rax,65330CA4B890h
+     cd0: ffd0                     call rax
+     cd2: 49ba0000000000000080     mov r10,8000000000000000h
+     cdc: 4c39d0                   cmp rax,r10
+     cdf: 0f8406100000             je near 00007E3685FE9CEBh
+     ce5: 488945d0                 mov [rbp-30h],rax
+     ce9: 488945c8                 mov [rbp-38h],rax
+     ced: 4c896df8                 mov [rbp-8],r13
+     cf1: 4c8965f0                 mov [rbp-10h],r12
+     cf5: 4c8965e8                 mov [rbp-18h],r12
+     cf9: 48898568ffffff           mov [rbp-98h],rax
+     d00: 48898d60ffffff           mov [rbp-0A0h],rcx
+     d07: 48899558ffffff           mov [rbp-0A8h],rdx
+     d0e: 48899d50ffffff           mov [rbp-0B0h],rbx
+     d15: 4889b548ffffff           mov [rbp-0B8h],rsi
+     d1c: 4889bd40ffffff           mov [rbp-0C0h],rdi
+     d23: 4c898538ffffff           mov [rbp-0C8h],r8
+     d2a: 4c898d30ffffff           mov [rbp-0D0h],r9
+     d31: 4c899528ffffff           mov [rbp-0D8h],r10
+     d38: 4c899d20ffffff           mov [rbp-0E0h],r11
+     d3f: 4c89a518ffffff           mov [rbp-0E8h],r12
+     d46: 4c89ad10ffffff           mov [rbp-0F0h],r13
+     d4d: 4c89b508ffffff           mov [rbp-0F8h],r14
+     d54: 4c89bd00ffffff           mov [rbp-100h],r15
+     d5b: 48c7c044000000           mov rax,44h
+     d62: 488945d8                 mov [rbp-28h],rax
+     d66: 49ba004b3e1200020000     mov r10,200123E4B00h
+     d70: 488b7de0                 mov rdi,[rbp-20h]
+     d74: 488b75c8                 mov rsi,[rbp-38h]
+     d78: 4885f6                   test rsi,rsi
+     d7b: 0f84c9000000             je near 00007E3685FE8E4Ah
+     d81: 8b06                     mov eax,[rsi]
+     d83: 413b02                   cmp eax,[r10]
+     d86: 752b                     jne short 00007E3685FE8DB3h
+     d88: 49837a1000               cmp qword [r10+10h],0
+     d8d: 0f84b7000000             je near 00007E3685FE8E4Ah
+     d93: 41807a3000               cmp byte [r10+30h],0
+     d98: 0f8405000000             je near 00007E3685FE8DA3h
+     d9e: e904000000               jmp 00007E3685FE8DA7h
+     da3: 488b7dc8                 mov rdi,[rbp-38h]
+     da7: 4d8b5a10                 mov r11,[r10+10h]
+     dab: 41ffd3                   call r11
+     dae: e9cb010000               jmp 00007E3685FE8F7Eh
+     db3: 413b4204                 cmp eax,[r10+4]
+     db7: 752b                     jne short 00007E3685FE8DE4h
+     db9: 49837a1800               cmp qword [r10+18h],0
+     dbe: 0f8486000000             je near 00007E3685FE8E4Ah
+     dc4: 41807a3100               cmp byte [r10+31h],0
+     dc9: 0f8405000000             je near 00007E3685FE8DD4h
+     dcf: e904000000               jmp 00007E3685FE8DD8h
+     dd4: 488b7dc8                 mov rdi,[rbp-38h]
+     dd8: 4d8b5a18                 mov r11,[r10+18h]
+     ddc: 41ffd3                   call r11
+     ddf: e99a010000               jmp 00007E3685FE8F7Eh
+     de4: 413b4208                 cmp eax,[r10+8]
+     de8: 752b                     jne short 00007E3685FE8E15h
+     dea: 49837a2000               cmp qword [r10+20h],0
+     def: 0f8455000000             je near 00007E3685FE8E4Ah
+     df5: 41807a3200               cmp byte [r10+32h],0
+     dfa: 0f8405000000             je near 00007E3685FE8E05h
+     e00: e904000000               jmp 00007E3685FE8E09h
+     e05: 488b7dc8                 mov rdi,[rbp-38h]
+     e09: 4d8b5a20                 mov r11,[r10+20h]
+     e0d: 41ffd3                   call r11
+     e10: e969010000               jmp 00007E3685FE8F7Eh
+     e15: 413b420c                 cmp eax,[r10+0Ch]
+     e19: 0f852b000000             jne near 00007E3685FE8E4Ah
+     e1f: 49837a2800               cmp qword [r10+28h],0
+     e24: 0f8420000000             je near 00007E3685FE8E4Ah
+     e2a: 41807a3300               cmp byte [r10+33h],0
+     e2f: 0f8405000000             je near 00007E3685FE8E3Ah
+     e35: e904000000               jmp 00007E3685FE8E3Eh
+     e3a: 488b7dc8                 mov rdi,[rbp-38h]
+     e3e: 4d8b5a28                 mov r11,[r10+28h]
+     e42: 41ffd3                   call r11
+     e45: e934010000               jmp 00007E3685FE8F7Eh
+     e4a: 488b85c8ffffff           mov rax,[rbp-38h]
+     e51: 4885c0                   test rax,rax
+     e54: 0f84eb000000             je near 00007E3685FE8F45h
+     e5a: 8b10                     mov edx,[rax]
+     e5c: 69cab179379e             imul ecx,edx,9E3779B1h
+     e62: c1e91d                   shr ecx,1Dh
+     e65: d1e1                     shl ecx,1
+     e67: 49ba004b3e1200020000     mov r10,200123E4B00h
+     e71: 413b948a60000000         cmp edx,[r10+rcx*4+60h]
+     e79: 0f855b000000             jne near 00007E3685FE8EDAh
+     e7f: 4d8b9ccaa0000000         mov r11,[r10+rcx*8+0A0h]
+     e87: 4d85db                   test r11,r11
+     e8a: 0f84b5000000             je near 00007E3685FE8F45h
+     e90: 4180bc0a2001000000       cmp byte [r10+rcx+120h],0
+     e99: 0f8413000000             je near 00007E3685FE8EB2h
+     e9f: 488bbde0ffffff           mov rdi,[rbp-20h]
+     ea6: 488bb5c8ffffff           mov rsi,[rbp-38h]
+     ead: e907000000               jmp 00007E3685FE8EB9h
+     eb2: 488bbdc8ffffff           mov rdi,[rbp-38h]
+     eb9: 41ffd3                   call r11
+     ebc: 50                       push rax
+     ebd: 4883ec08                 sub rsp,8
+     ec1: 4889ef                   mov rdi,rbp
+     ec4: 48b86088a40c33650000     mov rax,65330CA48860h
+     ece: ffd0                     call rax
+     ed0: 4883c408                 add rsp,8
+     ed4: 58                       pop rax
+     ed5: e9a4000000               jmp 00007E3685FE8F7Eh
+     eda: ffc1                     inc ecx
+     edc: 413b948a60000000         cmp edx,[r10+rcx*4+60h]
+     ee4: 0f855b000000             jne near 00007E3685FE8F45h
+     eea: 4d8b9ccaa0000000         mov r11,[r10+rcx*8+0A0h]
+     ef2: 4d85db                   test r11,r11
+     ef5: 0f844a000000             je near 00007E3685FE8F45h
+     efb: 4180bc0a2001000000       cmp byte [r10+rcx+120h],0
+     f04: 0f8413000000             je near 00007E3685FE8F1Dh
+     f0a: 488bbde0ffffff           mov rdi,[rbp-20h]
+     f11: 488bb5c8ffffff           mov rsi,[rbp-38h]
+     f18: e907000000               jmp 00007E3685FE8F24h
+     f1d: 488bbdc8ffffff           mov rdi,[rbp-38h]
+     f24: 41ffd3                   call r11
+     f27: 50                       push rax
+     f28: 4883ec08                 sub rsp,8
+     f2c: 4889ef                   mov rdi,rbp
+     f2f: 48b86088a40c33650000     mov rax,65330CA48860h
+     f39: ffd0                     call rax
+     f3b: 4883c408                 add rsp,8
+     f3f: 58                       pop rax
+     f40: e939000000               jmp 00007E3685FE8F7Eh
+     f45: 488b7de0                 mov rdi,[rbp-20h]
+     f49: 48be000a9a0f00020000     mov rsi,2000F9A0A00h
+     f53: 488d55c8                 lea rdx,[rbp-38h]
+     f57: 48c7c101000000           mov rcx,1
+     f5e: 49b8b04f471200020000     mov r8,20012474FB0h
+     f68: 49b9004b3e1200020000     mov r9,200123E4B00h
+     f72: 48b8d013a50c33650000     mov rax,65330CA513D0h
+     f7c: ffd0                     call rax
+     f7e: 4c8b6df8                 mov r13,[rbp-8]
+     f82: 4c8b65f0                 mov r12,[rbp-10h]
+     f86: 4c8b65e8                 mov r12,[rbp-18h]
+     f8a: 49ba0000000000000080     mov r10,8000000000000000h
+     f94: 4c39d0                   cmp rax,r10
+     f97: 0f844e0d0000             je near 00007E3685FE9CEBh
+     f9d: 488945d0                 mov [rbp-30h],rax
+     fa1: 4c8965c8                 mov [rbp-38h],r12
+     fa5: 498bc4                   mov rax,r12
+     fa8: 4885c0                   test rax,rax
+     fab: 0f8428000000             je near 00007E3685FE8FD9h
+     fb1: 8b8807000000             mov ecx,[rax+7]
+     fb7: 4883e104                 and rcx,4
+     fbb: 0f840c000000             je near 00007E3685FE8FCDh
+     fc1: 488b8030000000           mov rax,[rax+30h]
+     fc8: e93a000000               jmp 00007E3685FE9007h
+     fcd: 488b8048000000           mov rax,[rax+48h]
+     fd4: e92e000000               jmp 00007E3685FE9007h
+     fd9: 488b7de0                 mov rdi,[rbp-20h]
+     fdd: 488b75c8                 mov rsi,[rbp-38h]
+     fe1: 48c7c202000000           mov rdx,2
+     fe8: 48b890b8a40c33650000     mov rax,65330CA4B890h
+     ff2: ffd0                     call rax
+     ff4: 49ba0000000000000080     mov r10,8000000000000000h
+     ffe: 4c39d0                   cmp rax,r10
+    1001: 0f84e40c0000             je near 00007E3685FE9CEBh
+    1007: 488945c8                 mov [rbp-38h],rax
+    100b: 488945c0                 mov [rbp-40h],rax
+    100f: 4c896df8                 mov [rbp-8],r13
+    1013: 4c8965f0                 mov [rbp-10h],r12
+    1017: 4c8965e8                 mov [rbp-18h],r12
+    101b: 48898568ffffff           mov [rbp-98h],rax
+    1022: 48898d60ffffff           mov [rbp-0A0h],rcx
+    1029: 48899558ffffff           mov [rbp-0A8h],rdx
+    1030: 48899d50ffffff           mov [rbp-0B0h],rbx
+    1037: 4889b548ffffff           mov [rbp-0B8h],rsi
+    103e: 4889bd40ffffff           mov [rbp-0C0h],rdi
+    1045: 4c898538ffffff           mov [rbp-0C8h],r8
+    104c: 4c898d30ffffff           mov [rbp-0D0h],r9
+    1053: 4c899528ffffff           mov [rbp-0D8h],r10
+    105a: 4c899d20ffffff           mov [rbp-0E0h],r11
+    1061: 4c89a518ffffff           mov [rbp-0E8h],r12
+    1068: 4c89ad10ffffff           mov [rbp-0F0h],r13
+    106f: 4c89b508ffffff           mov [rbp-0F8h],r14
+    1076: 4c89bd00ffffff           mov [rbp-100h],r15
+    107d: 48c7c04d000000           mov rax,4Dh
+    1084: 488945d8                 mov [rbp-28h],rax
+    1088: 49ba004e3e1200020000     mov r10,200123E4E00h
+    1092: 488b7de0                 mov rdi,[rbp-20h]
+    1096: 488b75c0                 mov rsi,[rbp-40h]
+    109a: 4885f6                   test rsi,rsi
+    109d: 0f84c9000000             je near 00007E3685FE916Ch
+    10a3: 8b06                     mov eax,[rsi]
+    10a5: 413b02                   cmp eax,[r10]
+    10a8: 752b                     jne short 00007E3685FE90D5h
+    10aa: 49837a1000               cmp qword [r10+10h],0
+    10af: 0f84b7000000             je near 00007E3685FE916Ch
+    10b5: 41807a3000               cmp byte [r10+30h],0
+    10ba: 0f8405000000             je near 00007E3685FE90C5h
+    10c0: e904000000               jmp 00007E3685FE90C9h
+    10c5: 488b7dc0                 mov rdi,[rbp-40h]
+    10c9: 4d8b5a10                 mov r11,[r10+10h]
+    10cd: 41ffd3                   call r11
+    10d0: e9cb010000               jmp 00007E3685FE92A0h
+    10d5: 413b4204                 cmp eax,[r10+4]
+    10d9: 752b                     jne short 00007E3685FE9106h
+    10db: 49837a1800               cmp qword [r10+18h],0
+    10e0: 0f8486000000             je near 00007E3685FE916Ch
+    10e6: 41807a3100               cmp byte [r10+31h],0
+    10eb: 0f8405000000             je near 00007E3685FE90F6h
+    10f1: e904000000               jmp 00007E3685FE90FAh
+    10f6: 488b7dc0                 mov rdi,[rbp-40h]
+    10fa: 4d8b5a18                 mov r11,[r10+18h]
+    10fe: 41ffd3                   call r11
+    1101: e99a010000               jmp 00007E3685FE92A0h
+    1106: 413b4208                 cmp eax,[r10+8]
+    110a: 752b                     jne short 00007E3685FE9137h
+    110c: 49837a2000               cmp qword [r10+20h],0
+    1111: 0f8455000000             je near 00007E3685FE916Ch
+    1117: 41807a3200               cmp byte [r10+32h],0
+    111c: 0f8405000000             je near 00007E3685FE9127h
+    1122: e904000000               jmp 00007E3685FE912Bh
+    1127: 488b7dc0                 mov rdi,[rbp-40h]
+    112b: 4d8b5a20                 mov r11,[r10+20h]
+    112f: 41ffd3                   call r11
+    1132: e969010000               jmp 00007E3685FE92A0h
+    1137: 413b420c                 cmp eax,[r10+0Ch]
+    113b: 0f852b000000             jne near 00007E3685FE916Ch
+    1141: 49837a2800               cmp qword [r10+28h],0
+    1146: 0f8420000000             je near 00007E3685FE916Ch
+    114c: 41807a3300               cmp byte [r10+33h],0
+    1151: 0f8405000000             je near 00007E3685FE915Ch
+    1157: e904000000               jmp 00007E3685FE9160h
+    115c: 488b7dc0                 mov rdi,[rbp-40h]
+    1160: 4d8b5a28                 mov r11,[r10+28h]
+    1164: 41ffd3                   call r11
+    1167: e934010000               jmp 00007E3685FE92A0h
+    116c: 488b85c0ffffff           mov rax,[rbp-40h]
+    1173: 4885c0                   test rax,rax
+    1176: 0f84eb000000             je near 00007E3685FE9267h
+    117c: 8b10                     mov edx,[rax]
+    117e: 69cab179379e             imul ecx,edx,9E3779B1h
+    1184: c1e91d                   shr ecx,1Dh
+    1187: d1e1                     shl ecx,1
+    1189: 49ba004e3e1200020000     mov r10,200123E4E00h
+    1193: 413b948a60000000         cmp edx,[r10+rcx*4+60h]
+    119b: 0f855b000000             jne near 00007E3685FE91FCh
+    11a1: 4d8b9ccaa0000000         mov r11,[r10+rcx*8+0A0h]
+    11a9: 4d85db                   test r11,r11
+    11ac: 0f84b5000000             je near 00007E3685FE9267h
+    11b2: 4180bc0a2001000000       cmp byte [r10+rcx+120h],0
+    11bb: 0f8413000000             je near 00007E3685FE91D4h
+    11c1: 488bbde0ffffff           mov rdi,[rbp-20h]
+    11c8: 488bb5c0ffffff           mov rsi,[rbp-40h]
+    11cf: e907000000               jmp 00007E3685FE91DBh
+    11d4: 488bbdc0ffffff           mov rdi,[rbp-40h]
+    11db: 41ffd3                   call r11
+    11de: 50                       push rax
+    11df: 4883ec08                 sub rsp,8
+    11e3: 4889ef                   mov rdi,rbp
+    11e6: 48b86088a40c33650000     mov rax,65330CA48860h
+    11f0: ffd0                     call rax
+    11f2: 4883c408                 add rsp,8
+    11f6: 58                       pop rax
+    11f7: e9a4000000               jmp 00007E3685FE92A0h
+    11fc: ffc1                     inc ecx
+    11fe: 413b948a60000000         cmp edx,[r10+rcx*4+60h]
+    1206: 0f855b000000             jne near 00007E3685FE9267h
+    120c: 4d8b9ccaa0000000         mov r11,[r10+rcx*8+0A0h]
+    1214: 4d85db                   test r11,r11
+    1217: 0f844a000000             je near 00007E3685FE9267h
+    121d: 4180bc0a2001000000       cmp byte [r10+rcx+120h],0
+    1226: 0f8413000000             je near 00007E3685FE923Fh
+    122c: 488bbde0ffffff           mov rdi,[rbp-20h]
+    1233: 488bb5c0ffffff           mov rsi,[rbp-40h]
+    123a: e907000000               jmp 00007E3685FE9246h
+    123f: 488bbdc0ffffff           mov rdi,[rbp-40h]
+    1246: 41ffd3                   call r11
+    1249: 50                       push rax
+    124a: 4883ec08                 sub rsp,8
+    124e: 4889ef                   mov rdi,rbp
+    1251: 48b86088a40c33650000     mov rax,65330CA48860h
+    125b: ffd0                     call rax
+    125d: 4883c408                 add rsp,8
+    1261: 58                       pop rax
+    1262: e939000000               jmp 00007E3685FE92A0h
+    1267: 488b7de0                 mov rdi,[rbp-20h]
+    126b: 48be000c9a0f00020000     mov rsi,2000F9A0C00h
+    1275: 488d55c0                 lea rdx,[rbp-40h]
+    1279: 48c7c101000000           mov rcx,1
+    1280: 49b84083401200020000     mov r8,20012408340h
+    128a: 49b9004e3e1200020000     mov r9,200123E4E00h
+    1294: 48b8d013a50c33650000     mov rax,65330CA513D0h
+    129e: ffd0                     call rax
+    12a0: 4c8b6df8                 mov r13,[rbp-8]
+    12a4: 4c8b65f0                 mov r12,[rbp-10h]
+    12a8: 4c8b65e8                 mov r12,[rbp-18h]
+    12ac: 49ba0000000000000080     mov r10,8000000000000000h
+    12b6: 4c39d0                   cmp rax,r10
+    12b9: 0f842c0a0000             je near 00007E3685FE9CEBh
+    12bf: 488945c8                 mov [rbp-38h],rax
+    12c3: 488b45d0                 mov rax,[rbp-30h]
+    12c7: 488945b8                 mov [rbp-48h],rax
+    12cb: 488b45c8                 mov rax,[rbp-38h]
+    12cf: 488945c0                 mov [rbp-40h],rax
+    12d3: 488b7de0                 mov rdi,[rbp-20h]
+    12d7: 48be40c5b11300020000     mov rsi,20013B1C540h
+    12e1: 488d55b8                 lea rdx,[rbp-48h]
+    12e5: 48c7c102000000           mov rcx,2
+    12ec: 4c896df8                 mov [rbp-8],r13
+    12f0: 4c8965f0                 mov [rbp-10h],r12
+    12f4: 4c8965e8                 mov [rbp-18h],r12
+    12f8: 48898568ffffff           mov [rbp-98h],rax
+    12ff: 48898d60ffffff           mov [rbp-0A0h],rcx
+    1306: 48899558ffffff           mov [rbp-0A8h],rdx
+    130d: 48899d50ffffff           mov [rbp-0B0h],rbx
+    1314: 4889b548ffffff           mov [rbp-0B8h],rsi
+    131b: 4889bd40ffffff           mov [rbp-0C0h],rdi
+    1322: 4c898538ffffff           mov [rbp-0C8h],r8
+    1329: 4c898d30ffffff           mov [rbp-0D0h],r9
+    1330: 4c899528ffffff           mov [rbp-0D8h],r10
+    1337: 4c899d20ffffff           mov [rbp-0E0h],r11
+    133e: 4c89a518ffffff           mov [rbp-0E8h],r12
+    1345: 4c89ad10ffffff           mov [rbp-0F0h],r13
+    134c: 4c89b508ffffff           mov [rbp-0F8h],r14
+    1353: 4c89bd00ffffff           mov [rbp-100h],r15
+    135a: 48c7c052000000           mov rax,52h
+    1361: 488945d8                 mov [rbp-28h],rax
+    1365: 48b8d0e1a40c33650000     mov rax,65330CA4E1D0h
+    136f: ffd0                     call rax
+    1371: 4c8b6df8                 mov r13,[rbp-8]
+    1375: 4c8b65f0                 mov r12,[rbp-10h]
+    1379: 4c8b65e8                 mov r12,[rbp-18h]
+    137d: 49ba0000000000000080     mov r10,8000000000000000h
+    1387: 4c39d0                   cmp rax,r10
+    138a: 0f845b090000             je near 00007E3685FE9CEBh
+    1390: 488945d0                 mov [rbp-30h],rax
+    1394: 488bc8                   mov rcx,rax
+    1397: 85c9                     test ecx,ecx
+    1399: 0f851d000000             jne near 00007E3685FE93BCh
+    139f: 31c0                     xor eax,eax
+    13a1: 488945d0                 mov [rbp-30h],rax
+    13a5: 4c8ba578ffffff           mov r12,[rbp-88h]
+    13ac: 4c8bad70ffffff           mov r13,[rbp-90h]
+    13b3: 4881c430020000           add rsp,230h
+    13ba: 5d                       pop rbp
+    13bb: c3                       ret
+    13bc: 4c896dd0                 mov [rbp-30h],r13
+    13c0: 498bc5                   mov rax,r13
+    13c3: 4885c0                   test rax,rax
+    13c6: 0f8428000000             je near 00007E3685FE93F4h
+    13cc: 8b8807000000             mov ecx,[rax+7]
+    13d2: 4883e104                 and rcx,4
+    13d6: 0f840c000000             je near 00007E3685FE93E8h
+    13dc: 488b8038000000           mov rax,[rax+38h]
+    13e3: e93a000000               jmp 00007E3685FE9422h
+    13e8: 488b8058000000           mov rax,[rax+58h]
+    13ef: e92e000000               jmp 00007E3685FE9422h
+    13f4: 488b7de0                 mov rdi,[rbp-20h]
+    13f8: 488b75d0                 mov rsi,[rbp-30h]
+    13fc: 48c7c203000000           mov rdx,3
+    1403: 48b890b8a40c33650000     mov rax,65330CA4B890h
+    140d: ffd0                     call rax
+    140f: 49ba0000000000000080     mov r10,8000000000000000h
+    1419: 4c39d0                   cmp rax,r10
+    141c: 0f84c9080000             je near 00007E3685FE9CEBh
+    1422: 488945d0                 mov [rbp-30h],rax
+    1426: 4c8965c8                 mov [rbp-38h],r12
+    142a: 498bc4                   mov rax,r12
+    142d: 4885c0                   test rax,rax
+    1430: 0f8428000000             je near 00007E3685FE945Eh
+    1436: 8b8807000000             mov ecx,[rax+7]
+    143c: 4883e104                 and rcx,4
+    1440: 0f840c000000             je near 00007E3685FE9452h
+    1446: 488b8038000000           mov rax,[rax+38h]
+    144d: e93a000000               jmp 00007E3685FE948Ch
+    1452: 488b8058000000           mov rax,[rax+58h]
+    1459: e92e000000               jmp 00007E3685FE948Ch
+    145e: 488b7de0                 mov rdi,[rbp-20h]
+    1462: 488b75c8                 mov rsi,[rbp-38h]
+    1466: 48c7c203000000           mov rdx,3
+    146d: 48b890b8a40c33650000     mov rax,65330CA4B890h
+    1477: ffd0                     call rax
+    1479: 49ba0000000000000080     mov r10,8000000000000000h
+    1483: 4c39d0                   cmp rax,r10
+    1486: 0f845f080000             je near 00007E3685FE9CEBh
+    148c: 488945c8                 mov [rbp-38h],rax
+    1490: 488bc8                   mov rcx,rax
+    1493: 488b45d0                 mov rax,[rbp-30h]
+    1497: 4839c8                   cmp rax,rcx
+    149a: 0f8429080000             je near 00007E3685FE9CC9h
+    14a0: 4c896dd0                 mov [rbp-30h],r13
+    14a4: 498bc5                   mov rax,r13
+    14a7: 4885c0                   test rax,rax
+    14aa: 0f8428000000             je near 00007E3685FE94D8h
+    14b0: 8b8807000000             mov ecx,[rax+7]
+    14b6: 4883e104                 and rcx,4
+    14ba: 0f840c000000             je near 00007E3685FE94CCh
+    14c0: 488b8038000000           mov rax,[rax+38h]
+    14c7: e93a000000               jmp 00007E3685FE9506h
+    14cc: 488b8058000000           mov rax,[rax+58h]
+    14d3: e92e000000               jmp 00007E3685FE9506h
+    14d8: 488b7de0                 mov rdi,[rbp-20h]
+    14dc: 488b75d0                 mov rsi,[rbp-30h]
+    14e0: 48c7c203000000           mov rdx,3
+    14e7: 48b890b8a40c33650000     mov rax,65330CA4B890h
+    14f1: ffd0                     call rax
+    14f3: 49ba0000000000000080     mov r10,8000000000000000h
+    14fd: 4c39d0                   cmp rax,r10
+    1500: 0f84e5070000             je near 00007E3685FE9CEBh
+    1506: 488945d0                 mov [rbp-30h],rax
+    150a: 488bc8                   mov rcx,rax
+    150d: 4885c9                   test rcx,rcx
+    1510: 0f8496070000             je near 00007E3685FE9CACh
+    1516: 4c8965d0                 mov [rbp-30h],r12
+    151a: 498bc4                   mov rax,r12
+    151d: 4885c0                   test rax,rax
+    1520: 0f8428000000             je near 00007E3685FE954Eh
+    1526: 8b8807000000             mov ecx,[rax+7]
+    152c: 4883e104                 and rcx,4
+    1530: 0f840c000000             je near 00007E3685FE9542h
+    1536: 488b8038000000           mov rax,[rax+38h]
+    153d: e93a000000               jmp 00007E3685FE957Ch
+    1542: 488b8058000000           mov rax,[rax+58h]
+    1549: e92e000000               jmp 00007E3685FE957Ch
+    154e: 488b7de0                 mov rdi,[rbp-20h]
+    1552: 488b75d0                 mov rsi,[rbp-30h]
+    1556: 48c7c203000000           mov rdx,3
+    155d: 48b890b8a40c33650000     mov rax,65330CA4B890h
+    1567: ffd0                     call rax
+    1569: 49ba0000000000000080     mov r10,8000000000000000h
+    1573: 4c39d0                   cmp rax,r10
+    1576: 0f846f070000             je near 00007E3685FE9CEBh
+    157c: 488945d0                 mov [rbp-30h],rax
+    1580: 488bc8                   mov rcx,rax
+    1583: 4885c9                   test rcx,rcx
+    1586: 0f8420070000             je near 00007E3685FE9CACh
+    158c: 4c896dd0                 mov [rbp-30h],r13
+    1590: 498bc5                   mov rax,r13
+    1593: 4885c0                   test rax,rax
+    1596: 0f8428000000             je near 00007E3685FE95C4h
+    159c: 8b8807000000             mov ecx,[rax+7]
+    15a2: 4883e104                 and rcx,4
+    15a6: 0f840c000000             je near 00007E3685FE95B8h
+    15ac: 488b8038000000           mov rax,[rax+38h]
+    15b3: e93a000000               jmp 00007E3685FE95F2h
+    15b8: 488b8058000000           mov rax,[rax+58h]
+    15bf: e92e000000               jmp 00007E3685FE95F2h
+    15c4: 488b7de0                 mov rdi,[rbp-20h]
+    15c8: 488b75d0                 mov rsi,[rbp-30h]
+    15cc: 48c7c203000000           mov rdx,3
+    15d3: 48b890b8a40c33650000     mov rax,65330CA4B890h
+    15dd: ffd0                     call rax
+    15df: 49ba0000000000000080     mov r10,8000000000000000h
+    15e9: 4c39d0                   cmp rax,r10
+    15ec: 0f84f9060000             je near 00007E3685FE9CEBh
+    15f2: 488945d0                 mov [rbp-30h],rax
+    15f6: 488945c8                 mov [rbp-38h],rax
+    15fa: 4c896df8                 mov [rbp-8],r13
+    15fe: 4c8965f0                 mov [rbp-10h],r12
+    1602: 4c8965e8                 mov [rbp-18h],r12
+    1606: 48898568ffffff           mov [rbp-98h],rax
+    160d: 48898d60ffffff           mov [rbp-0A0h],rcx
+    1614: 48899558ffffff           mov [rbp-0A8h],rdx
+    161b: 48899d50ffffff           mov [rbp-0B0h],rbx
+    1622: 4889b548ffffff           mov [rbp-0B8h],rsi
+    1629: 4889bd40ffffff           mov [rbp-0C0h],rdi
+    1630: 4c898538ffffff           mov [rbp-0C8h],r8
+    1637: 4c898d30ffffff           mov [rbp-0D0h],r9
+    163e: 4c899528ffffff           mov [rbp-0D8h],r10
+    1645: 4c899d20ffffff           mov [rbp-0E0h],r11
+    164c: 4c89a518ffffff           mov [rbp-0E8h],r12
+    1653: 4c89ad10ffffff           mov [rbp-0F0h],r13
+    165a: 4c89b508ffffff           mov [rbp-0F8h],r14
+    1661: 4c89bd00ffffff           mov [rbp-100h],r15
+    1668: 48c7c077000000           mov rax,77h
+    166f: 488945d8                 mov [rbp-28h],rax
+    1673: 49ba00513e1200020000     mov r10,200123E5100h
+    167d: 488b7de0                 mov rdi,[rbp-20h]
+    1681: 488b75c8                 mov rsi,[rbp-38h]
+    1685: 4885f6                   test rsi,rsi
+    1688: 0f84c9000000             je near 00007E3685FE9757h
+    168e: 8b06                     mov eax,[rsi]
+    1690: 413b02                   cmp eax,[r10]
+    1693: 752b                     jne short 00007E3685FE96C0h
+    1695: 49837a1000               cmp qword [r10+10h],0
+    169a: 0f84b7000000             je near 00007E3685FE9757h
+    16a0: 41807a3000               cmp byte [r10+30h],0
+    16a5: 0f8405000000             je near 00007E3685FE96B0h
+    16ab: e904000000               jmp 00007E3685FE96B4h
+    16b0: 488b7dc8                 mov rdi,[rbp-38h]
+    16b4: 4d8b5a10                 mov r11,[r10+10h]
+    16b8: 41ffd3                   call r11
+    16bb: e9cb010000               jmp 00007E3685FE988Bh
+    16c0: 413b4204                 cmp eax,[r10+4]
+    16c4: 752b                     jne short 00007E3685FE96F1h
+    16c6: 49837a1800               cmp qword [r10+18h],0
+    16cb: 0f8486000000             je near 00007E3685FE9757h
+    16d1: 41807a3100               cmp byte [r10+31h],0
+    16d6: 0f8405000000             je near 00007E3685FE96E1h
+    16dc: e904000000               jmp 00007E3685FE96E5h
+    16e1: 488b7dc8                 mov rdi,[rbp-38h]
+    16e5: 4d8b5a18                 mov r11,[r10+18h]
+    16e9: 41ffd3                   call r11
+    16ec: e99a010000               jmp 00007E3685FE988Bh
+    16f1: 413b4208                 cmp eax,[r10+8]
+    16f5: 752b                     jne short 00007E3685FE9722h
+    16f7: 49837a2000               cmp qword [r10+20h],0
+    16fc: 0f8455000000             je near 00007E3685FE9757h
+    1702: 41807a3200               cmp byte [r10+32h],0
+    1707: 0f8405000000             je near 00007E3685FE9712h
+    170d: e904000000               jmp 00007E3685FE9716h
+    1712: 488b7dc8                 mov rdi,[rbp-38h]
+    1716: 4d8b5a20                 mov r11,[r10+20h]
+    171a: 41ffd3                   call r11
+    171d: e969010000               jmp 00007E3685FE988Bh
+    1722: 413b420c                 cmp eax,[r10+0Ch]
+    1726: 0f852b000000             jne near 00007E3685FE9757h
+    172c: 49837a2800               cmp qword [r10+28h],0
+    1731: 0f8420000000             je near 00007E3685FE9757h
+    1737: 41807a3300               cmp byte [r10+33h],0
+    173c: 0f8405000000             je near 00007E3685FE9747h
+    1742: e904000000               jmp 00007E3685FE974Bh
+    1747: 488b7dc8                 mov rdi,[rbp-38h]
+    174b: 4d8b5a28                 mov r11,[r10+28h]
+    174f: 41ffd3                   call r11
+    1752: e934010000               jmp 00007E3685FE988Bh
+    1757: 488b85c8ffffff           mov rax,[rbp-38h]
+    175e: 4885c0                   test rax,rax
+    1761: 0f84eb000000             je near 00007E3685FE9852h
+    1767: 8b10                     mov edx,[rax]
+    1769: 69cab179379e             imul ecx,edx,9E3779B1h
+    176f: c1e91d                   shr ecx,1Dh
+    1772: d1e1                     shl ecx,1
+    1774: 49ba00513e1200020000     mov r10,200123E5100h
+    177e: 413b948a60000000         cmp edx,[r10+rcx*4+60h]
+    1786: 0f855b000000             jne near 00007E3685FE97E7h
+    178c: 4d8b9ccaa0000000         mov r11,[r10+rcx*8+0A0h]
+    1794: 4d85db                   test r11,r11
+    1797: 0f84b5000000             je near 00007E3685FE9852h
+    179d: 4180bc0a2001000000       cmp byte [r10+rcx+120h],0
+    17a6: 0f8413000000             je near 00007E3685FE97BFh
+    17ac: 488bbde0ffffff           mov rdi,[rbp-20h]
+    17b3: 488bb5c8ffffff           mov rsi,[rbp-38h]
+    17ba: e907000000               jmp 00007E3685FE97C6h
+    17bf: 488bbdc8ffffff           mov rdi,[rbp-38h]
+    17c6: 41ffd3                   call r11
+    17c9: 50                       push rax
+    17ca: 4883ec08                 sub rsp,8
+    17ce: 4889ef                   mov rdi,rbp
+    17d1: 48b86088a40c33650000     mov rax,65330CA48860h
+    17db: ffd0                     call rax
+    17dd: 4883c408                 add rsp,8
+    17e1: 58                       pop rax
+    17e2: e9a4000000               jmp 00007E3685FE988Bh
+    17e7: ffc1                     inc ecx
+    17e9: 413b948a60000000         cmp edx,[r10+rcx*4+60h]
+    17f1: 0f855b000000             jne near 00007E3685FE9852h
+    17f7: 4d8b9ccaa0000000         mov r11,[r10+rcx*8+0A0h]
+    17ff: 4d85db                   test r11,r11
+    1802: 0f844a000000             je near 00007E3685FE9852h
+    1808: 4180bc0a2001000000       cmp byte [r10+rcx+120h],0
+    1811: 0f8413000000             je near 00007E3685FE982Ah
+    1817: 488bbde0ffffff           mov rdi,[rbp-20h]
+    181e: 488bb5c8ffffff           mov rsi,[rbp-38h]
+    1825: e907000000               jmp 00007E3685FE9831h
+    182a: 488bbdc8ffffff           mov rdi,[rbp-38h]
+    1831: 41ffd3                   call r11
+    1834: 50                       push rax
+    1835: 4883ec08                 sub rsp,8
+    1839: 4889ef                   mov rdi,rbp
+    183c: 48b86088a40c33650000     mov rax,65330CA48860h
+    1846: ffd0                     call rax
+    1848: 4883c408                 add rsp,8
+    184c: 58                       pop rax
+    184d: e939000000               jmp 00007E3685FE988Bh
+    1852: 488b7de0                 mov rdi,[rbp-20h]
+    1856: 48be4003b51100020000     mov rsi,20011B50340h
+    1860: 488d55c8                 lea rdx,[rbp-38h]
+    1864: 48c7c101000000           mov rcx,1
+    186b: 49b86084401200020000     mov r8,20012408460h
+    1875: 49b900513e1200020000     mov r9,200123E5100h
+    187f: 48b8d013a50c33650000     mov rax,65330CA513D0h
+    1889: ffd0                     call rax
+    188b: 4c8b6df8                 mov r13,[rbp-8]
+    188f: 4c8b65f0                 mov r12,[rbp-10h]
+    1893: 4c8b65e8                 mov r12,[rbp-18h]
+    1897: 49ba0000000000000080     mov r10,8000000000000000h
+    18a1: 4c39d0                   cmp rax,r10
+    18a4: 0f8441040000             je near 00007E3685FE9CEBh
+    18aa: 488945d0                 mov [rbp-30h],rax
+    18ae: 4c8965c8                 mov [rbp-38h],r12
+    18b2: 498bc4                   mov rax,r12
+    18b5: 4885c0                   test rax,rax
+    18b8: 0f8428000000             je near 00007E3685FE98E6h
+    18be: 8b8807000000             mov ecx,[rax+7]
+    18c4: 4883e104                 and rcx,4
+    18c8: 0f840c000000             je near 00007E3685FE98DAh
+    18ce: 488b8038000000           mov rax,[rax+38h]
+    18d5: e93a000000               jmp 00007E3685FE9914h
+    18da: 488b8058000000           mov rax,[rax+58h]
+    18e1: e92e000000               jmp 00007E3685FE9914h
+    18e6: 488b7de0                 mov rdi,[rbp-20h]
+    18ea: 488b75c8                 mov rsi,[rbp-38h]
+    18ee: 48c7c203000000           mov rdx,3
+    18f5: 48b890b8a40c33650000     mov rax,65330CA4B890h
+    18ff: ffd0                     call rax
+    1901: 49ba0000000000000080     mov r10,8000000000000000h
+    190b: 4c39d0                   cmp rax,r10
+    190e: 0f84d7030000             je near 00007E3685FE9CEBh
+    1914: 488945c8                 mov [rbp-38h],rax
+    1918: 488945c0                 mov [rbp-40h],rax
+    191c: 4c896df8                 mov [rbp-8],r13
+    1920: 4c8965f0                 mov [rbp-10h],r12
+    1924: 4c8965e8                 mov [rbp-18h],r12
+    1928: 48898568ffffff           mov [rbp-98h],rax
+    192f: 48898d60ffffff           mov [rbp-0A0h],rcx
+    1936: 48899558ffffff           mov [rbp-0A8h],rdx
+    193d: 48899d50ffffff           mov [rbp-0B0h],rbx
+    1944: 4889b548ffffff           mov [rbp-0B8h],rsi
+    194b: 4889bd40ffffff           mov [rbp-0C0h],rdi
+    1952: 4c898538ffffff           mov [rbp-0C8h],r8
+    1959: 4c898d30ffffff           mov [rbp-0D0h],r9
+    1960: 4c899528ffffff           mov [rbp-0D8h],r10
+    1967: 4c899d20ffffff           mov [rbp-0E0h],r11
+    196e: 4c89a518ffffff           mov [rbp-0E8h],r12
+    1975: 4c89ad10ffffff           mov [rbp-0F0h],r13
+    197c: 4c89b508ffffff           mov [rbp-0F8h],r14
+    1983: 4c89bd00ffffff           mov [rbp-100h],r15
+    198a: 48c7c080000000           mov rax,80h
+    1991: 488945d8                 mov [rbp-28h],rax
+    1995: 49ba00543e1200020000     mov r10,200123E5400h
+    199f: 488b7de0                 mov rdi,[rbp-20h]
+    19a3: 488b75c0                 mov rsi,[rbp-40h]
+    19a7: 4885f6                   test rsi,rsi
+    19aa: 0f84c9000000             je near 00007E3685FE9A79h
+    19b0: 8b06                     mov eax,[rsi]
+    19b2: 413b02                   cmp eax,[r10]
+    19b5: 752b                     jne short 00007E3685FE99E2h
+    19b7: 49837a1000               cmp qword [r10+10h],0
+    19bc: 0f84b7000000             je near 00007E3685FE9A79h
+    19c2: 41807a3000               cmp byte [r10+30h],0
+    19c7: 0f8405000000             je near 00007E3685FE99D2h
+    19cd: e904000000               jmp 00007E3685FE99D6h
+    19d2: 488b7dc0                 mov rdi,[rbp-40h]
+    19d6: 4d8b5a10                 mov r11,[r10+10h]
+    19da: 41ffd3                   call r11
+    19dd: e9cb010000               jmp 00007E3685FE9BADh
+    19e2: 413b4204                 cmp eax,[r10+4]
+    19e6: 752b                     jne short 00007E3685FE9A13h
+    19e8: 49837a1800               cmp qword [r10+18h],0
+    19ed: 0f8486000000             je near 00007E3685FE9A79h
+    19f3: 41807a3100               cmp byte [r10+31h],0
+    19f8: 0f8405000000             je near 00007E3685FE9A03h
+    19fe: e904000000               jmp 00007E3685FE9A07h
+    1a03: 488b7dc0                 mov rdi,[rbp-40h]
+    1a07: 4d8b5a18                 mov r11,[r10+18h]
+    1a0b: 41ffd3                   call r11
+    1a0e: e99a010000               jmp 00007E3685FE9BADh
+    1a13: 413b4208                 cmp eax,[r10+8]
+    1a17: 752b                     jne short 00007E3685FE9A44h
+    1a19: 49837a2000               cmp qword [r10+20h],0
+    1a1e: 0f8455000000             je near 00007E3685FE9A79h
+    1a24: 41807a3200               cmp byte [r10+32h],0
+    1a29: 0f8405000000             je near 00007E3685FE9A34h
+    1a2f: e904000000               jmp 00007E3685FE9A38h
+    1a34: 488b7dc0                 mov rdi,[rbp-40h]
+    1a38: 4d8b5a20                 mov r11,[r10+20h]
+    1a3c: 41ffd3                   call r11
+    1a3f: e969010000               jmp 00007E3685FE9BADh
+    1a44: 413b420c                 cmp eax,[r10+0Ch]
+    1a48: 0f852b000000             jne near 00007E3685FE9A79h
+    1a4e: 49837a2800               cmp qword [r10+28h],0
+    1a53: 0f8420000000             je near 00007E3685FE9A79h
+    1a59: 41807a3300               cmp byte [r10+33h],0
+    1a5e: 0f8405000000             je near 00007E3685FE9A69h
+    1a64: e904000000               jmp 00007E3685FE9A6Dh
+    1a69: 488b7dc0                 mov rdi,[rbp-40h]
+    1a6d: 4d8b5a28                 mov r11,[r10+28h]
+    1a71: 41ffd3                   call r11
+    1a74: e934010000               jmp 00007E3685FE9BADh
+    1a79: 488b85c0ffffff           mov rax,[rbp-40h]
+    1a80: 4885c0                   test rax,rax
+    1a83: 0f84eb000000             je near 00007E3685FE9B74h
+    1a89: 8b10                     mov edx,[rax]
+    1a8b: 69cab179379e             imul ecx,edx,9E3779B1h
+    1a91: c1e91d                   shr ecx,1Dh
+    1a94: d1e1                     shl ecx,1
+    1a96: 49ba00543e1200020000     mov r10,200123E5400h
+    1aa0: 413b948a60000000         cmp edx,[r10+rcx*4+60h]
+    1aa8: 0f855b000000             jne near 00007E3685FE9B09h
+    1aae: 4d8b9ccaa0000000         mov r11,[r10+rcx*8+0A0h]
+    1ab6: 4d85db                   test r11,r11
+    1ab9: 0f84b5000000             je near 00007E3685FE9B74h
+    1abf: 4180bc0a2001000000       cmp byte [r10+rcx+120h],0
+    1ac8: 0f8413000000             je near 00007E3685FE9AE1h
+    1ace: 488bbde0ffffff           mov rdi,[rbp-20h]
+    1ad5: 488bb5c0ffffff           mov rsi,[rbp-40h]
+    1adc: e907000000               jmp 00007E3685FE9AE8h
+    1ae1: 488bbdc0ffffff           mov rdi,[rbp-40h]
+    1ae8: 41ffd3                   call r11
+    1aeb: 50                       push rax
+    1aec: 4883ec08                 sub rsp,8
+    1af0: 4889ef                   mov rdi,rbp
+    1af3: 48b86088a40c33650000     mov rax,65330CA48860h
+    1afd: ffd0                     call rax
+    1aff: 4883c408                 add rsp,8
+    1b03: 58                       pop rax
+    1b04: e9a4000000               jmp 00007E3685FE9BADh
+    1b09: ffc1                     inc ecx
+    1b0b: 413b948a60000000         cmp edx,[r10+rcx*4+60h]
+    1b13: 0f855b000000             jne near 00007E3685FE9B74h
+    1b19: 4d8b9ccaa0000000         mov r11,[r10+rcx*8+0A0h]
+    1b21: 4d85db                   test r11,r11
+    1b24: 0f844a000000             je near 00007E3685FE9B74h
+    1b2a: 4180bc0a2001000000       cmp byte [r10+rcx+120h],0
+    1b33: 0f8413000000             je near 00007E3685FE9B4Ch
+    1b39: 488bbde0ffffff           mov rdi,[rbp-20h]
+    1b40: 488bb5c0ffffff           mov rsi,[rbp-40h]
+    1b47: e907000000               jmp 00007E3685FE9B53h
+    1b4c: 488bbdc0ffffff           mov rdi,[rbp-40h]
+    1b53: 41ffd3                   call r11
+    1b56: 50                       push rax
+    1b57: 4883ec08                 sub rsp,8
+    1b5b: 4889ef                   mov rdi,rbp
+    1b5e: 48b86088a40c33650000     mov rax,65330CA48860h
+    1b68: ffd0                     call rax
+    1b6a: 4883c408                 add rsp,8
+    1b6e: 58                       pop rax
+    1b6f: e939000000               jmp 00007E3685FE9BADh
+    1b74: 488b7de0                 mov rdi,[rbp-20h]
+    1b78: 48be40f5f60e00020000     mov rsi,2000EF6F540h
+    1b82: 488d55c0                 lea rdx,[rbp-40h]
+    1b86: 48c7c101000000           mov rcx,1
+    1b8d: 49b8a083401200020000     mov r8,200124083A0h
+    1b97: 49b900543e1200020000     mov r9,200123E5400h
+    1ba1: 48b8d013a50c33650000     mov rax,65330CA513D0h
+    1bab: ffd0                     call rax
+    1bad: 4c8b6df8                 mov r13,[rbp-8]
+    1bb1: 4c8b65f0                 mov r12,[rbp-10h]
+    1bb5: 4c8b65e8                 mov r12,[rbp-18h]
+    1bb9: 49ba0000000000000080     mov r10,8000000000000000h
+    1bc3: 4c39d0                   cmp rax,r10
+    1bc6: 0f841f010000             je near 00007E3685FE9CEBh
+    1bcc: 488945c8                 mov [rbp-38h],rax
+    1bd0: 488b45d0                 mov rax,[rbp-30h]
+    1bd4: 488945b8                 mov [rbp-48h],rax
+    1bd8: 488b45c8                 mov rax,[rbp-38h]
+    1bdc: 488945c0                 mov [rbp-40h],rax
+    1be0: 488b7de0                 mov rdi,[rbp-20h]
+    1be4: 48be40f8f60e00020000     mov rsi,2000EF6F840h
+    1bee: 488d55b8                 lea rdx,[rbp-48h]
+    1bf2: 48c7c102000000           mov rcx,2
+    1bf9: 4c896df8                 mov [rbp-8],r13
+    1bfd: 4c8965f0                 mov [rbp-10h],r12
+    1c01: 4c8965e8                 mov [rbp-18h],r12
+    1c05: 48898568ffffff           mov [rbp-98h],rax
+    1c0c: 48898d60ffffff           mov [rbp-0A0h],rcx
+    1c13: 48899558ffffff           mov [rbp-0A8h],rdx
+    1c1a: 48899d50ffffff           mov [rbp-0B0h],rbx
+    1c21: 4889b548ffffff           mov [rbp-0B8h],rsi
+    1c28: 4889bd40ffffff           mov [rbp-0C0h],rdi
+    1c2f: 4c898538ffffff           mov [rbp-0C8h],r8
+    1c36: 4c898d30ffffff           mov [rbp-0D0h],r9
+    1c3d: 4c899528ffffff           mov [rbp-0D8h],r10
+    1c44: 4c899d20ffffff           mov [rbp-0E0h],r11
+    1c4b: 4c89a518ffffff           mov [rbp-0E8h],r12
+    1c52: 4c89ad10ffffff           mov [rbp-0F0h],r13
+    1c59: 4c89b508ffffff           mov [rbp-0F8h],r14
+    1c60: 4c89bd00ffffff           mov [rbp-100h],r15
+    1c67: 48c7c085000000           mov rax,85h
+    1c6e: 488945d8                 mov [rbp-28h],rax
+    1c72: 48b8d0e1a40c33650000     mov rax,65330CA4E1D0h
+    1c7c: ffd0                     call rax
+    1c7e: 4c8b6df8                 mov r13,[rbp-8]
+    1c82: 4c8b65f0                 mov r12,[rbp-10h]
+    1c86: 4c8b65e8                 mov r12,[rbp-18h]
+    1c8a: 49ba0000000000000080     mov r10,8000000000000000h
+    1c94: 4c39d0                   cmp rax,r10
+    1c97: 0f844e000000             je near 00007E3685FE9CEBh
+    1c9d: 488945d0                 mov [rbp-30h],rax
+    1ca1: 488bc8                   mov rcx,rax
+    1ca4: 85c9                     test ecx,ecx
+    1ca6: 0f851d000000             jne near 00007E3685FE9CC9h
+    1cac: 31c0                     xor eax,eax
+    1cae: 488945d0                 mov [rbp-30h],rax
+    1cb2: 4c8ba578ffffff           mov r12,[rbp-88h]
+    1cb9: 4c8bad70ffffff           mov r13,[rbp-90h]
+    1cc0: 4881c430020000           add rsp,230h
+    1cc7: 5d                       pop rbp
+    1cc8: c3                       ret
+    1cc9: 48c7c001000000           mov rax,1
+    1cd0: 488945d0                 mov [rbp-30h],rax
+    1cd4: 4c8ba578ffffff           mov r12,[rbp-88h]
+    1cdb: 4c8bad70ffffff           mov r13,[rbp-90h]
+    1ce2: 4881c430020000           add rsp,230h
+    1ce9: 5d                       pop rbp
+    1cea: c3                       ret
+    1ceb: 48b80000000000000080     mov rax,8000000000000000h
+    1cf5: 4c8ba578ffffff           mov r12,[rbp-88h]
+    1cfc: 4c8bad70ffffff           mov r13,[rbp-90h]
+    1d03: 4881c430020000           add rsp,230h
+    1d0a: 5d                       pop rbp
+    1d0b: c3                       ret
+
+[cratonvm-jit-disasm] full org/springframework/core/ResolvableType.equalsType(Lorg/springframework/core/ResolvableType;)Z entry=0x7e3685fe6000 len=1125
+       0: 55                       push rbp
+       1: 4889e5                   mov rbp,rsp
+       4: 8b8424d0fdffff           mov eax,[rsp-230h]
+       b: 4881ec30020000           sub rsp,230h
+      12: 8b842400f0ffff           mov eax,[rsp-1000h]
+      19: 4c896580                 mov [rbp-80h],r12
+      1d: 4c89ad78ffffff           mov [rbp-88h],r13
+      24: 48897de8                 mov [rbp-18h],rdi
+      28: 4c8bee                   mov r13,rsi
+      2b: 4c8be2                   mov r12,rdx
+      2e: 488bfd                   mov rdi,rbp
+      31: 48b86088a40c33650000     mov rax,65330CA48860h
+      3b: ffd0                     call rax
+      3d: 49bb98cc070100020000     mov r11,2000107CC98h
+      47: 41f64300ff               test byte [r11],0FFh
+      4c: 0f8481000000             je near 00007E3685FE60D3h
+      52: 4c896df8                 mov [rbp-8],r13
+      56: 4c8965f0                 mov [rbp-10h],r12
+      5a: 48898570ffffff           mov [rbp-90h],rax
+      61: 48898d68ffffff           mov [rbp-98h],rcx
+      68: 48899560ffffff           mov [rbp-0A0h],rdx
+      6f: 48899d58ffffff           mov [rbp-0A8h],rbx
+      76: 4889b550ffffff           mov [rbp-0B0h],rsi
+      7d: 4889bd48ffffff           mov [rbp-0B8h],rdi
+      84: 4c898540ffffff           mov [rbp-0C0h],r8
+      8b: 4c898d38ffffff           mov [rbp-0C8h],r9
+      92: 4c899530ffffff           mov [rbp-0D0h],r10
+      99: 4c899d28ffffff           mov [rbp-0D8h],r11
+      a0: 4c89a520ffffff           mov [rbp-0E0h],r12
+      a7: 4c89ad18ffffff           mov [rbp-0E8h],r13
+      ae: 4c89b510ffffff           mov [rbp-0F0h],r14
+      b5: 4c89bd08ffffff           mov [rbp-0F8h],r15
+      bc: 48c7c0ffffffff           mov rax,0FFFFFFFFFFFFFFFFh
+      c3: 488945e0                 mov [rbp-20h],rax
+      c7: 48b8404ea50c33650000     mov rax,65330CA54E40h
+      d1: ffd0                     call rax
+      d3: 4c896dd8                 mov [rbp-28h],r13
+      d7: 498bc5                   mov rax,r13
+      da: 4885c0                   test rax,rax
+      dd: 0f8428000000             je near 00007E3685FE610Bh
+      e3: 8b8807000000             mov ecx,[rax+7]
+      e9: 4883e104                 and rcx,4
+      ed: 0f840c000000             je near 00007E3685FE60FFh
+      f3: 488b8020000000           mov rax,[rax+20h]
+      fa: e935000000               jmp 00007E3685FE6134h
+      ff: 488b8028000000           mov rax,[rax+28h]
+     106: e929000000               jmp 00007E3685FE6134h
+     10b: 488b7de8                 mov rdi,[rbp-18h]
+     10f: 488b75d8                 mov rsi,[rbp-28h]
+     113: 31d2                     xor edx,edx
+     115: 48b890b8a40c33650000     mov rax,65330CA4B890h
+     11f: ffd0                     call rax
+     121: 49ba0000000000000080     mov r10,8000000000000000h
+     12b: 4c39d0                   cmp rax,r10
+     12e: 0f8413030000             je near 00007E3685FE6447h
+     134: 488945d8                 mov [rbp-28h],rax
+     138: 4c8965d0                 mov [rbp-30h],r12
+     13c: 498bc4                   mov rax,r12
+     13f: 4885c0                   test rax,rax
+     142: 0f8428000000             je near 00007E3685FE6170h
+     148: 8b8807000000             mov ecx,[rax+7]
+     14e: 4883e104                 and rcx,4
+     152: 0f840c000000             je near 00007E3685FE6164h
+     158: 488b8020000000           mov rax,[rax+20h]
+     15f: e935000000               jmp 00007E3685FE6199h
+     164: 488b8028000000           mov rax,[rax+28h]
+     16b: e929000000               jmp 00007E3685FE6199h
+     170: 488b7de8                 mov rdi,[rbp-18h]
+     174: 488b75d0                 mov rsi,[rbp-30h]
+     178: 31d2                     xor edx,edx
+     17a: 48b890b8a40c33650000     mov rax,65330CA4B890h
+     184: ffd0                     call rax
+     186: 49ba0000000000000080     mov r10,8000000000000000h
+     190: 4c39d0                   cmp rax,r10
+     193: 0f84ae020000             je near 00007E3685FE6447h
+     199: 488945d0                 mov [rbp-30h],rax
+     19d: 488b45d8                 mov rax,[rbp-28h]
+     1a1: 488945c0                 mov [rbp-40h],rax
+     1a5: 488b45d0                 mov rax,[rbp-30h]
+     1a9: 488945c8                 mov [rbp-38h],rax
+     1ad: 488b7de8                 mov rdi,[rbp-18h]
+     1b1: 48be00ae621200020000     mov rsi,2001262AE00h
+     1bb: 488d55c0                 lea rdx,[rbp-40h]
+     1bf: 48c7c102000000           mov rcx,2
+     1c6: 4c896df8                 mov [rbp-8],r13
+     1ca: 4c8965f0                 mov [rbp-10h],r12
+     1ce: 48898570ffffff           mov [rbp-90h],rax
+     1d5: 48898d68ffffff           mov [rbp-98h],rcx
+     1dc: 48899560ffffff           mov [rbp-0A0h],rdx
+     1e3: 48899d58ffffff           mov [rbp-0A8h],rbx
+     1ea: 4889b550ffffff           mov [rbp-0B0h],rsi
+     1f1: 4889bd48ffffff           mov [rbp-0B8h],rdi
+     1f8: 4c898540ffffff           mov [rbp-0C0h],r8
+     1ff: 4c898d38ffffff           mov [rbp-0C8h],r9
+     206: 4c899530ffffff           mov [rbp-0D0h],r10
+     20d: 4c899d28ffffff           mov [rbp-0D8h],r11
+     214: 4c89a520ffffff           mov [rbp-0E0h],r12
+     21b: 4c89ad18ffffff           mov [rbp-0E8h],r13
+     222: 4c89b510ffffff           mov [rbp-0F0h],r14
+     229: 4c89bd08ffffff           mov [rbp-0F8h],r15
+     230: 48c7c008000000           mov rax,8
+     237: 488945e0                 mov [rbp-20h],rax
+     23b: 48b8d0e1a40c33650000     mov rax,65330CA4E1D0h
+     245: ffd0                     call rax
+     247: 4c8b6df8                 mov r13,[rbp-8]
+     24b: 4c8b65f0                 mov r12,[rbp-10h]
+     24f: 49ba0000000000000080     mov r10,8000000000000000h
+     259: 4c39d0                   cmp rax,r10
+     25c: 0f84e5010000             je near 00007E3685FE6447h
+     262: 488945d8                 mov [rbp-28h],rax
+     266: 488bc8                   mov rcx,rax
+     269: 85c9                     test ecx,ecx
+     26b: 0f84b8010000             je near 00007E3685FE6429h
+     271: 4c896dd8                 mov [rbp-28h],r13
+     275: 498bc5                   mov rax,r13
+     278: 4885c0                   test rax,rax
+     27b: 0f8428000000             je near 00007E3685FE62A9h
+     281: 8b8807000000             mov ecx,[rax+7]
+     287: 4883e104                 and rcx,4
+     28b: 0f840c000000             je near 00007E3685FE629Dh
+     291: 488b8028000000           mov rax,[rax+28h]
+     298: e93a000000               jmp 00007E3685FE62D7h
+     29d: 488b8038000000           mov rax,[rax+38h]
+     2a4: e92e000000               jmp 00007E3685FE62D7h
+     2a9: 488b7de8                 mov rdi,[rbp-18h]
+     2ad: 488b75d8                 mov rsi,[rbp-28h]
+     2b1: 48c7c201000000           mov rdx,1
+     2b8: 48b890b8a40c33650000     mov rax,65330CA4B890h
+     2c2: ffd0                     call rax
+     2c4: 49ba0000000000000080     mov r10,8000000000000000h
+     2ce: 4c39d0                   cmp rax,r10
+     2d1: 0f8470010000             je near 00007E3685FE6447h
+     2d7: 488945d8                 mov [rbp-28h],rax
+     2db: 4c8965d0                 mov [rbp-30h],r12
+     2df: 498bc4                   mov rax,r12
+     2e2: 4885c0                   test rax,rax
+     2e5: 0f8428000000             je near 00007E3685FE6313h
+     2eb: 8b8807000000             mov ecx,[rax+7]
+     2f1: 4883e104                 and rcx,4
+     2f5: 0f840c000000             je near 00007E3685FE6307h
+     2fb: 488b8028000000           mov rax,[rax+28h]
+     302: e93a000000               jmp 00007E3685FE6341h
+     307: 488b8038000000           mov rax,[rax+38h]
+     30e: e92e000000               jmp 00007E3685FE6341h
+     313: 488b7de8                 mov rdi,[rbp-18h]
+     317: 488b75d0                 mov rsi,[rbp-30h]
+     31b: 48c7c201000000           mov rdx,1
+     322: 48b890b8a40c33650000     mov rax,65330CA4B890h
+     32c: ffd0                     call rax
+     32e: 49ba0000000000000080     mov r10,8000000000000000h
+     338: 4c39d0                   cmp rax,r10
+     33b: 0f8406010000             je near 00007E3685FE6447h
+     341: 488945d0                 mov [rbp-30h],rax
+     345: 488b45d8                 mov rax,[rbp-28h]
+     349: 488945c0                 mov [rbp-40h],rax
+     34d: 488b45d0                 mov rax,[rbp-30h]
+     351: 488945c8                 mov [rbp-38h],rax
+     355: 488b7de8                 mov rdi,[rbp-18h]
+     359: 48bec0af621200020000     mov rsi,2001262AFC0h
+     363: 488d55c0                 lea rdx,[rbp-40h]
+     367: 48c7c102000000           mov rcx,2
+     36e: 4c896df8                 mov [rbp-8],r13
+     372: 4c8965f0                 mov [rbp-10h],r12
+     376: 48898570ffffff           mov [rbp-90h],rax
+     37d: 48898d68ffffff           mov [rbp-98h],rcx
+     384: 48899560ffffff           mov [rbp-0A0h],rdx
+     38b: 48899d58ffffff           mov [rbp-0A8h],rbx
+     392: 4889b550ffffff           mov [rbp-0B0h],rsi
+     399: 4889bd48ffffff           mov [rbp-0B8h],rdi
+     3a0: 4c898540ffffff           mov [rbp-0C0h],r8
+     3a7: 4c898d38ffffff           mov [rbp-0C8h],r9
+     3ae: 4c899530ffffff           mov [rbp-0D0h],r10
+     3b5: 4c899d28ffffff           mov [rbp-0D8h],r11
+     3bc: 4c89a520ffffff           mov [rbp-0E0h],r12
+     3c3: 4c89ad18ffffff           mov [rbp-0E8h],r13
+     3ca: 4c89b510ffffff           mov [rbp-0F0h],r14
+     3d1: 4c89bd08ffffff           mov [rbp-0F8h],r15
+     3d8: 48c7c016000000           mov rax,16h
+     3df: 488945e0                 mov [rbp-20h],rax
+     3e3: 48b8d0e1a40c33650000     mov rax,65330CA4E1D0h
+     3ed: ffd0                     call rax
+     3ef: 4c8b6df8                 mov r13,[rbp-8]
+     3f3: 4c8b65f0                 mov r12,[rbp-10h]
+     3f7: 49ba0000000000000080     mov r10,8000000000000000h
+     401: 4c39d0                   cmp rax,r10
+     404: 0f843d000000             je near 00007E3685FE6447h
+     40a: 488945d8                 mov [rbp-28h],rax
+     40e: 488bc8                   mov rcx,rax
+     411: 85c9                     test ecx,ecx
+     413: 0f8410000000             je near 00007E3685FE6429h
+     419: 48c7c001000000           mov rax,1
+     420: 488945d8                 mov [rbp-28h],rax
+     424: e906000000               jmp 00007E3685FE642Fh
+     429: 31c0                     xor eax,eax
+     42b: 488945d8                 mov [rbp-28h],rax
+     42f: 488b45d8                 mov rax,[rbp-28h]
+     433: 4c8b6580                 mov r12,[rbp-80h]
+     437: 4c8bad78ffffff           mov r13,[rbp-88h]
+     43e: 4881c430020000           add rsp,230h
+     445: 5d                       pop rbp
+     446: c3                       ret
+     447: 48b80000000000000080     mov rax,8000000000000000h
+     451: 4c8b6580                 mov r12,[rbp-80h]
+     455: 4c8bad78ffffff           mov r13,[rbp-88h]
+     45c: 4881c430020000           add rsp,230h
+     463: 5d                       pop rbp
+     464: c3                       ret
+
+[2m2026-07-27T17:44:11.684418Z[0m [33m WARN[0m [2mcratonvm_vm::vm::vm_util[0m[2m:[0m Post-clinit fixup: File fs/separator/pathSeparator populated (5/5)
+[2m2026-07-27T17:44:12.002891Z[0m [33m WARN[0m [2mcratonvm_vm::vm::vm_util[0m[2m:[0m <clinit> failed вЂ” wrapping in ExceptionInInitializerError [3mclass[0m[2m=[0morg/springframework/boot/context/config/Profiles [3mcause[0m[2m=[0mjava/lang/ClassCastException class [Lorg.springframework.core.ResolvableType; cannot be cast to class org.springframework.core.ResolvableType
+[2m2026-07-27T17:44:12.002927Z[0m [33m WARN[0m [2mcratonvm_vm::vm::vm_util[0m[2m:[0m   [CLINIT-TRACE 0] at S01_Context.main (S01_Context.java:51) bci=184
+[2m2026-07-27T17:44:12.002931Z[0m [33m WARN[0m [2mcratonvm_vm::vm::vm_util[0m[2m:[0m   [CLINIT-TRACE 1] at org/springframework/boot/builder/SpringApplicationBuilder.run (SpringApplicationBuilder.java:154) bci=54
+[2m2026-07-27T17:44:12.002934Z[0m [33m WARN[0m [2mcratonvm_vm::vm::vm_util[0m[2m:[0m   [CLINIT-TRACE 2] at org/springframework/boot/SpringApplication.run (SpringApplication.java:316) bci=65
+[2m2026-07-27T17:44:12.002936Z[0m [33m WARN[0m [2mcratonvm_vm::vm::vm_util[0m[2m:[0m   [CLINIT-TRACE 3] at org/springframework/boot/SpringApplication.prepareEnvironment (SpringApplication.java:356) bci=27
+[2m2026-07-27T17:44:12.002938Z[0m [33m WARN[0m [2mcratonvm_vm::vm::vm_util[0m[2m:[0m   [CLINIT-TRACE 4] at org/springframework/boot/SpringApplicationRunListeners.environmentPrepared (SpringApplicationRunListeners.java:65) bci=10
+[2m2026-07-27T17:44:12.002952Z[0m [33m WARN[0m [2mcratonvm_vm::vm::vm_util[0m[2m:[0m   [CLINIT-TRACE 5] at org/springframework/boot/SpringApplicationRunListeners.doWithListeners (SpringApplicationRunListeners.java:117) bci=4
+[2m2026-07-27T17:44:12.002955Z[0m [33m WARN[0m [2mcratonvm_vm::vm::vm_util[0m[2m:[0m   [CLINIT-TRACE 6] at org/springframework/boot/SpringApplicationRunListeners.doWithListeners (SpringApplicationRunListeners.java:123) bci=17
+[2m2026-07-27T17:44:12.002958Z[0m [33m WARN[0m [2mcratonvm_vm::vm::vm_util[0m[2m:[0m   [CLINIT-TRACE 7] at org/springframework/boot/SpringApplicationRunListeners.lambda$environmentPrepared$0 (SpringApplicationRunListeners.java:66) bci=3
+[2m2026-07-27T17:44:12.002961Z[0m [33m WARN[0m [2mcratonvm_vm::vm::vm_util[0m[2m:[0m   [CLINIT-TRACE 8] at org/springframework/boot/context/event/EventPublishingRunListener.environmentPrepared (EventPublishingRunListener.java:82) bci=18
+[2m2026-07-27T17:44:12.002963Z[0m [33m WARN[0m [2mcratonvm_vm::vm::vm_util[0m[2m:[0m   [CLINIT-TRACE 9] at org/springframework/boot/context/event/EventPublishingRunListener.multicastInitialEvent (EventPublishingRunListener.java:137) bci=9
+[2m2026-07-27T17:44:12.002966Z[0m [33m WARN[0m [2mcratonvm_vm::vm::vm_util[0m[2m:[0m   [CLINIT-TRACE 10] at org/springframework/context/event/SimpleApplicationEventMulticaster.multicastEvent (SimpleApplicationEventMulticaster.java:133) bci=3
+[2m2026-07-27T17:44:12.002969Z[0m [33m WARN[0m [2mcratonvm_vm::vm::vm_util[0m[2m:[0m   [CLINIT-TRACE 11] at org/springframework/context/event/SimpleApplicationEventMulticaster.multicastEvent (SimpleApplicationEventMulticaster.java:151) bci=104
+[2m2026-07-27T17:44:12.002971Z[0m [33m WARN[0m [2mcratonvm_vm::vm::vm_util[0m[2m:[0m   [CLINIT-TRACE 12] at org/springframework/context/event/SimpleApplicationEventMulticaster.invokeListener (SimpleApplicationEventMulticaster.java:173) bci=34
+[2m2026-07-27T17:44:12.002974Z[0m [33m WARN[0m [2mcratonvm_vm::vm::vm_util[0m[2m:[0m   [CLINIT-TRACE 13] at org/springframework/context/event/SimpleApplicationEventMulticaster.doInvokeListener (SimpleApplicationEventMulticaster.java:180) bci=2
+[2m2026-07-27T17:44:12.002977Z[0m [33m WARN[0m [2mcratonvm_vm::vm::vm_util[0m[2m:[0m   [CLINIT-TRACE 14] at org/springframework/boot/support/EnvironmentPostProcessorApplicationListener.onApplicationEvent (EnvironmentPostProcessorApplicationListener.java:120) bci=14
+[2m2026-07-27T17:44:12.002980Z[0m [33m WARN[0m [2mcratonvm_vm::vm::vm_util[0m[2m:[0m   [CLINIT-TRACE 15] at org/springframework/boot/support/EnvironmentPostProcessorApplicationListener.onApplicationEnvironmentPreparedEvent (EnvironmentPostProcessorApplicationListener.java:137) bci=66
+[2m2026-07-27T17:44:12.002982Z[0m [33m WARN[0m [2mcratonvm_vm::vm::vm_util[0m[2m:[0m   [CLINIT-TRACE 16] at org/springframework/boot/context/config/ConfigDataEnvironmentPostProcessor.postProcessEnvironment (ConfigDataEnvironmentPostProcessor.java:90) bci=10
+[2m2026-07-27T17:44:12.002985Z[0m [33m WARN[0m [2mcratonvm_vm::vm::vm_util[0m[2m:[0m   [CLINIT-TRACE 17] at org/springframework/boot/context/config/ConfigDataEnvironmentPostProcessor.postProcessEnvironment (ConfigDataEnvironmentPostProcessor.java:97) bci=34
+[2m2026-07-27T17:44:12.002988Z[0m [33m WARN[0m [2mcratonvm_vm::vm::vm_util[0m[2m:[0m   [CLINIT-TRACE 18] at org/springframework/boot/context/config/ConfigDataEnvironment.processAndApply (ConfigDataEnvironment.java:244) bci=77
+[2m2026-07-27T17:44:12.002991Z[0m [33m WARN[0m [2mcratonvm_vm::vm::vm_util[0m[2m:[0m   [CLINIT-TRACE 19] at org/springframework/boot/context/config/ConfigDataEnvironment.withProfiles (ConfigDataEnvironment.java:287) bci=51
+ERROR [org.springframework.boot.SpringApplication] Application run failed
+java.lang.ExceptionInInitializerError
+	at org.springframework.boot.context.config.ConfigDataEnvironment.getIncludedProfiles(ConfigDataEnvironment.java:308)
+	at org.springframework.boot.context.config.ConfigDataEnvironment.withProfiles(ConfigDataEnvironment.java:287)
+	at org.springframework.boot.context.config.ConfigDataEnvironment.processAndApply(ConfigDataEnvironment.java:244)
+	at org.springframework.boot.context.config.ConfigDataEnvironmentPostProcessor.postProcessEnvironment(ConfigDataEnvironmentPostProcessor.java:97)
+	at org.springframework.boot.context.config.ConfigDataEnvironmentPostProcessor.postProcessEnvironment(ConfigDataEnvironmentPostProcessor.java:90)
+	at org.springframework.boot.support.EnvironmentPostProcessorApplicationListener.onApplicationEnvironmentPreparedEvent(EnvironmentPostProcessorApplicationListener.java:137)
+	at org.springframework.boot.support.EnvironmentPostProcessorApplicationListener.onApplicationEvent(EnvironmentPostProcessorApplicationListener.java:120)
+	at org.springframework.context.event.SimpleApplicationEventMulticaster.doInvokeListener(SimpleApplicationEventMulticaster.java:180)
+	at org.springframework.context.event.SimpleApplicationEventMulticaster.invokeListener(SimpleApplicationEventMulticaster.java:173)
+	at org.springframework.context.event.SimpleApplicationEventMulticaster.multicastEvent(SimpleApplicationEventMulticaster.java:151)
+	at org.springframework.context.event.SimpleApplicationEventMulticaster.multicastEvent(SimpleApplicationEventMulticaster.java:133)
+	at org.springframework.boot.context.event.EventPublishingRunListener.multicastInitialEvent(EventPublishingRunListener.java:137)
+	at org.springframework.boot.context.event.EventPublishingRunListener.environmentPrepared(EventPublishingRunListener.java:82)
+	at org.springframework.boot.SpringApplicationRunListeners.lambda$environmentPrepared$0(SpringApplicationRunListeners.java:66)
+	at org.springframework.boot.SpringApplicationRunListeners.doWithListeners(SpringApplicationRunListeners.java:123)
+[T] boot: FAIL exception=java.lang.IllegalStateException: java.lang.ExceptionInInitializerError
+[CCE] enhance: defined S01_Context$ParentCfg$$SpringCGLIB$$0 (super=S01_Context$ParentCfg, loader=2, marker=org/springframework/context/annotation/ConfigurationClassEnhancer$EnhancedConfiguration, intercepted @Bean methods=1)
+[CCE] enhance: defined S01_Context$ChildCfg$$SpringCGLIB$$0 (super=S01_Context$ChildCfg, loader=2, marker=org/springframework/context/annotation/ConfigurationClassEnhancer$EnhancedConfiguration, intercepted @Bean methods=1)
+[T] child.ownBean: PASS
+[T] child.inheritsParentBean: PASS
+[T] parent.lacksChildBean: PASS
+SUITE S01_Context passed=10 failed=1 total=11
+[cratonvm] System.exit(0) called вЂ” process terminating

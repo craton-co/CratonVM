@@ -311,6 +311,15 @@ pub fn loader_aware_resolution() -> bool {
 /// (or, if the gap breaks a superinterface/superclass resolution, a bare
 /// `NoClassDefFoundError` with no further detail). Off by default to avoid
 /// spamming normal runs.
+/// Cached `CRATONVM_DBG_STUB_BT` filter (see the synthetic-stub fallback in
+/// [`ClassManager::load_class`]).
+fn dbg_stub_bt_filter() -> Option<&'static str> {
+    static FILTER: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    FILTER
+        .get_or_init(|| std::env::var("CRATONVM_DBG_STUB_BT").ok())
+        .as_deref()
+}
+
 fn trace_stub_fallback() -> bool {
     loader_flags().trace_unimplemented
 }
@@ -2272,6 +2281,82 @@ impl ClassManager {
         )
     }
 
+    /// The `InnerClasses` entry a synthetic stub should carry, derived from its
+    /// binary name.
+    ///
+    /// A synthetic stub is minted from a name alone — there is no class file to
+    /// read an `InnerClasses` attribute from — so every JDK member class
+    /// modelled as a stub reported the TOP-LEVEL answer to the whole reflection
+    /// family that consults that attribute. `java.util.Map$Entry` had simple
+    /// name `"Map$Entry"` (not `"Entry"`), canonical name
+    /// `"java.util.Map$Entry"` (not `"java.util.Map.Entry"`), a null
+    /// `getDeclaringClass()`/`getEnclosingClass()`, and `isMemberClass() ==
+    /// false`. Same for `java.util.HashMap$Node`,
+    /// `java.util.Collections$UnmodifiableList`, and every other stubbed
+    /// nested class.
+    ///
+    /// Synthesize the entry javac would have emitted, but ONLY for the
+    /// unambiguous member-class shape `Outer$Member`, where `Member` is a Java
+    /// identifier not starting with a digit. Everything else keeps the honest
+    /// top-level answer:
+    ///
+    ///   * a leading digit marks an anonymous (`Outer$1`) or local
+    ///     (`Outer$1Loc`) class, whose real entry javac writes with a zeroed
+    ///     `outer_class_info_index` (and, for anonymous, `inner_name_index`).
+    ///     That is not reconstructible from the name, and guessing "member"
+    ///     would be worse than reporting top-level.
+    ///   * `$$` is the generated-proxy convention (Spring CGLIB
+    ///     `$$SpringCGLIB$$`, ByteBuddy, EasyMock `$$$EasyMock$`, and lambda
+    ///     hidden classes `Host$$Lambda/0x…`). Those are genuine TOP-LEVEL
+    ///     classes whose literal binary name happens to contain `$`, and
+    ///     `lang_class::simple_class_name` deliberately does not split them —
+    ///     see the EasyMock `isAClassMock` note there.
+    ///   * `com/sun/proxy/$Proxy0` has nothing before the `$` in its last
+    ///     segment, so it is top-level too.
+    ///
+    /// The entry's `access_flags` are the stub's own
+    /// ([`synthetic_stub_access_flags`]) rather than a guess. That keeps
+    /// `Class.getModifiers()` — which prefers the `InnerClasses` flags over the
+    /// class's own for a nested class (JVMS §4.7.6) — returning exactly what it
+    /// did before this entry existed. In particular no `ACC_STATIC` is
+    /// invented: whether a nested class is static is not derivable from its
+    /// name (`HashMap$Node` is static, `HashMap$KeyIterator` is not).
+    fn synthetic_inner_classes(name: &str) -> Vec<InnerClassEntry> {
+        // Arrays have no InnerClasses attribute; `$$` is the generated-proxy
+        // convention, never a javac nested class.
+        if name.starts_with('[') || name.contains("$$") {
+            return Vec::new();
+        }
+        let Some(split) = name.rfind('$') else {
+            return Vec::new();
+        };
+        let (outer_class, inner_name) = (&name[..split], &name[split + 1..]);
+        // `Outer` must actually name something: reject `$Foo` and
+        // `com/sun/proxy/$Proxy0`, where the `$` opens the last name segment.
+        if outer_class.is_empty() || outer_class.ends_with('/') {
+            return Vec::new();
+        }
+        // `Member` must be a Java identifier that does not start with a digit.
+        // (Splitting on the LAST `$` means it cannot itself contain one.)
+        let mut chars = inner_name.chars();
+        let is_member_name = match chars.next() {
+            Some(first) => {
+                (first.is_alphabetic() || first == '_')
+                    && chars.all(|c| c.is_alphanumeric() || c == '_')
+            }
+            None => false,
+        };
+        if !is_member_name {
+            return Vec::new();
+        }
+        vec![InnerClassEntry {
+            inner_class: name.to_string(),
+            outer_class: outer_class.to_string(),
+            inner_name: inner_name.to_string(),
+            access_flags: Self::synthetic_stub_access_flags(name),
+        }]
+    }
+
     /// Register a minimal synthetic class with the given name and field count.
     ///
     /// If a class with this name is already loaded, returns its existing
@@ -2465,7 +2550,7 @@ impl ClassManager {
             nest_members: Vec::new(),
             record_components: Vec::new(),
             permitted_subclasses: Vec::new(),
-            inner_classes: Vec::new(),
+            inner_classes: Self::synthetic_inner_classes(name),
             enclosing_method: None,
             hidden: false,
             module_name: None,
@@ -3041,6 +3126,43 @@ impl ClassManager {
         None
     }
 
+    /// Would [`Self::load_class`] answer `name` with a *fabricated synthetic
+    /// stub* rather than a real class?
+    ///
+    /// A synthetic stub has no `Code` on any method: it exists only so that
+    /// WildFly/Quarkus-style bytecode can LINK against enterprise classes that
+    /// are genuinely absent. Answering with one when the class merely lives
+    /// behind a custom `ClassLoader` (invisible to this process's own `-cp`)
+    /// is a silent mis-resolution -- and a destructive one, because the stub is
+    /// registered globally under `Application`, so the real loader can never
+    /// define its own copy afterwards.
+    ///
+    /// Callers that DO have a loader context (see
+    /// `NativeContextImpl::load_class`) use this to consult that loader
+    /// *before* the fabrication happens. Mirrors `load_class`'s own fallback
+    /// branches exactly, so a `true` answer is precise, not a guess.
+    pub fn would_fabricate_synthetic_stub(&self, name: &str) -> bool {
+        if name.starts_with('[') {
+            return false;
+        }
+        if !is_jdk_class(name) {
+            return false;
+        }
+        if name.contains("$$") || is_jboss_logging_locale_lookup(name) {
+            return false;
+        }
+        if is_standard_jdk_namespace(name)
+            && self.has_real_boot_classes()
+            && !is_native_backed_jdk_stub(name)
+        {
+            return false;
+        }
+        if self.resolve_fast_path_class_id(name).is_some() {
+            return false;
+        }
+        self.find_class_bytes_delegated(name).is_err()
+    }
+
     pub fn load_class(&mut self, name: &str) -> Result<ClassId, VmError> {
         if loader_flags().dbg_loadclass && name.contains("GroupsMetadata") {
             let bt = std::backtrace::Backtrace::force_capture();
@@ -3221,6 +3343,18 @@ impl ClassManager {
                     eprintln!(
                         "[cratonvm] stub fallback: {name} — not found on any classpath entry (enterprise-prefix stub; add the missing jar)"
                     );
+                }
+                // `CRATONVM_DBG_STUB_BT=<substring>` -- Rust backtrace at the
+                // point a synthetic stub is fabricated for a matching name.
+                // The stub itself is silent until something tries to *run* it
+                // (`VerifyError: ... must have Code attribute`), by which
+                // point the resolver that asked for it is long gone from the
+                // stack -- this names it.
+                if let Some(want) = dbg_stub_bt_filter() {
+                    if !want.is_empty() && name.contains(want) {
+                        let bt = std::backtrace::Backtrace::force_capture();
+                        eprintln!("[DBG_STUB_BT] synthetic stub for {name}\n{bt}");
+                    }
                 }
                 self.create_synthetic_stub(name)
             }
@@ -3586,7 +3720,39 @@ impl ClassManager {
                     return Ok(id);
                 }
             }
-            this.load_class(internal)
+            match this.load_class(internal) {
+                Err(VmError::Linkage(LinkageError::IncompatibleClassChangeError { message }))
+                    if message.contains("already defined by") =>
+                {
+                    // Benign concurrent-definition race: this recursive
+                    // supertype/interface resolution (superclass or
+                    // interfaces of the class currently being defined) lost
+                    // a race against ANOTHER thread that independently
+                    // defined the exact same (loader, name) pair in the
+                    // meantime -- e.g. a background thread pool eagerly
+                    // resolving a class (Spring Boot's
+                    // OnClassCondition$ThreadedOutcomesResolver, or a
+                    // Reactor Schedulers worker touching
+                    // reactor/core/scheduler/NonBlocking) while the main
+                    // thread recursively links a DIFFERENT class that also
+                    // implements/extends it. Unlike a genuine duplicate
+                    // `defineClass` call from application code, this path
+                    // has no loader-level lock protecting it (that
+                    // protection -- see native-builtins's
+                    // `url_classloader_define_locks` -- only covers the
+                    // top-level `URLClassLoader.findClass` entry point, not
+                    // this internal recursive resolution). Prefer the
+                    // winner's already-registered copy instead of failing
+                    // this class's own definition outright.
+                    match loaded_classes_probe(&this.loaded_classes, loader_id, internal) {
+                        Some(id) => Ok(id),
+                        None => Err(VmError::Linkage(
+                            LinkageError::IncompatibleClassChangeError { message },
+                        )),
+                    }
+                }
+                other => other,
+            }
         };
         let superclass_id = match class_file.super_class {
             Some(ref super_name) => match resolve_supertype(self, &**super_name) {
@@ -6325,7 +6491,7 @@ impl ClassManager {
             nest_members: Vec::new(),
             record_components: Vec::new(),
             permitted_subclasses: Vec::new(),
-            inner_classes: Vec::new(),
+            inner_classes: Self::synthetic_inner_classes(name),
             enclosing_method: None,
             hidden: false,
             module_name: None,
@@ -12660,6 +12826,66 @@ mod tests {
             descriptor: cratonvm_types::intern_arc("I"),
             attributes: vec![],
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // synthetic_inner_classes — name-derived InnerClasses for synthetic stubs
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn synthetic_inner_classes_derives_the_member_class_shape() {
+        let entries = ClassManager::synthetic_inner_classes("java/util/Map$Entry");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].inner_class, "java/util/Map$Entry");
+        assert_eq!(entries[0].outer_class, "java/util/Map");
+        assert_eq!(entries[0].inner_name, "Entry");
+        // The entry carries the stub's own flags, so `Class.getModifiers()` —
+        // which prefers the InnerClasses flags for a nested class — is
+        // unchanged by the entry's mere existence.
+        assert_eq!(
+            entries[0].access_flags,
+            ClassManager::synthetic_stub_access_flags("java/util/Map$Entry")
+        );
+    }
+
+    #[test]
+    fn synthetic_inner_classes_handles_deeper_nesting_and_underscores() {
+        let entries = ClassManager::synthetic_inner_classes("java/util/HashMap$Node");
+        assert_eq!(entries[0].outer_class, "java/util/HashMap");
+        assert_eq!(entries[0].inner_name, "Node");
+        // Splitting on the LAST `$` makes the immediately-enclosing class the
+        // outer one, as javac emits.
+        let entries = ClassManager::synthetic_inner_classes("a/B$C$D");
+        assert_eq!(entries[0].outer_class, "a/B$C");
+        assert_eq!(entries[0].inner_name, "D");
+        let entries = ClassManager::synthetic_inner_classes("a/B$_Impl2");
+        assert_eq!(entries[0].inner_name, "_Impl2");
+    }
+
+    #[test]
+    fn synthetic_inner_classes_declines_non_member_shapes() {
+        // Top-level: no `$` at all.
+        assert!(ClassManager::synthetic_inner_classes("java/util/HashMap").is_empty());
+        // Anonymous / local: leading digit is not reconstructible as a member.
+        assert!(ClassManager::synthetic_inner_classes("P3$1").is_empty());
+        assert!(ClassManager::synthetic_inner_classes("P3$1Local").is_empty());
+        // Generated-proxy `$$` convention (CGLIB / ByteBuddy / EasyMock /
+        // lambda hidden classes) — genuine top-level classes.
+        assert!(ClassManager::synthetic_inner_classes("P3$$Lambda/0x80000000").is_empty());
+        assert!(
+            ClassManager::synthetic_inner_classes("com/example/Foo$$SpringCGLIB$$0").is_empty()
+        );
+        assert!(ClassManager::synthetic_inner_classes(
+            "org/easymock/mocks/InitialDirContext$$$EasyMock$1"
+        )
+        .is_empty());
+        // JDK dynamic proxies: the `$` opens the last name segment.
+        assert!(ClassManager::synthetic_inner_classes("com/sun/proxy/$Proxy0").is_empty());
+        assert!(ClassManager::synthetic_inner_classes("$Foo").is_empty());
+        // Trailing `$` leaves an empty member name.
+        assert!(ClassManager::synthetic_inner_classes("a/B$").is_empty());
+        // Arrays have no InnerClasses attribute.
+        assert!(ClassManager::synthetic_inner_classes("[Ljava/util/Map$Entry;").is_empty());
     }
 
     #[test]

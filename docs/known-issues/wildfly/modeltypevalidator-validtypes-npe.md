@@ -10,8 +10,7 @@ for whoever picks it up next.
 This was found while re-testing the app-specific JIT skip-list bans in
 `vm/src/jit/skip_list.rs` (the 2026-07-25/26 "jit-ban-sweep" effort) to see
 which are safe to lift now that the general callee-saved-GPR-clobber fix
-(2026-07-04, `docs/internal/fixed-suite-bugs/jit-regalloc-callee-saved-clobber-family.md`)
-and today's JIT/dispatch rework have landed. The `org/jboss/as/` blanket ban
+(2026-07-04) and today's JIT/dispatch rework have landed. The `org/jboss/as/` blanket ban
 (SPB.8b, added ~2026-05-05, Session 113 r2) was tested by lifting it via
 `CRATONVM_JIT_ALLOW_PACKAGES` and booting real WildFly. **Result: it is still
 necessary** — lifting it produces a new, clean, fast, deterministic crash.
@@ -93,7 +92,7 @@ JAVA_HOME=/data/tmp/wf-javahome CRATONVM_JAVA_HOME=/home/victor/jdk25 \
   -Djboss.server.base.dir=/data/tmp/wf-run
 ```
 (`standalone.sh` isn't `chmod +x` in the dist — always invoke via `bash standalone.sh`.
-See `docs/internal/fixed-suite-bugs/wildfly/wildfly-gc-barrier-boot-hang-and-harness-fixes.md`
+See the WildFly GC-barrier boot-hang-and-harness-fixes writeup (since archived)
 for why the fake-JDK-home + `CRATONVM_JAVA_HOME` shape is required for the
 managed/direct-boot case to actually exercise CratonVM as the server JVM.)
 
@@ -115,9 +114,9 @@ may now get further and expose (or clear) different bans downstream.
 
 ## Related
 
-- `docs/internal/fixed-suite-bugs/jit-regalloc-callee-saved-clobber-family.md`
-  — the general callee-saved-GPR-local-homes fix (2026-07-04) this symptom
-  family was supposed to close; this repro shows at least one member of the
-  family (validator-object field population under JIT) is not fully closed.
-- `docs/internal/jit-ban-sweep-20260725.md` — the sweep tracking doc this was
-  found under.
+- The general callee-saved-GPR-local-homes fix (2026-07-04, since archived)
+  this symptom family was supposed to close; this repro shows at least one
+  member of the family (validator-object field population under JIT) is not
+  fully closed.
+- Found during the 2026-07-25/26 "jit-ban-sweep" session effort (see Context
+  above).

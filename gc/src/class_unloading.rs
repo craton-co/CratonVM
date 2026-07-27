@@ -33,7 +33,7 @@
 //!   state/deopt log/code cache and the initiating-resolution cache, then
 //!   `classloading/src/class_manager.rs` — `unload_user_loader`.
 //!
-//! See `docs/internal/class-loader-unloading-and-bounded-metadata.md` for the
+//! See `docs/architecture/class-loader-unloading.md` for the
 //! invariants that transaction upholds, and
 //! `docs/internal/arch-2026-07-26/refs-metaspace-unloading.md` for why this
 //! scaffolding is being kept (correct, tested, and the natural home should the
@@ -329,7 +329,7 @@ impl ClassUnloader {
         // "long-running app with dynamic proxies dies after hours" failure
         // mode, and a direct violation of the "unload invalidation or hard
         // bound" rule in
-        // `docs/internal/class-loader-unloading-and-bounded-metadata.md`.
+        // `docs/architecture/class-loader-unloading.md`.
         //
         // Retiring an entry is now a REMOVAL, not a flag flip. The `valid`
         // field is kept because a caller may hold an entry snapshot, but no
@@ -1311,7 +1311,7 @@ mod tests {
     // BOUNDED-METADATA FIX (2026-07-26): "unload releases everything".
     //
     // These pin the invariant stated in
-    // `docs/internal/class-loader-unloading-and-bounded-metadata.md`: every
+    // `docs/architecture/class-loader-unloading.md`: every
     // process-lifetime cache must have unload invalidation or a hard bound.
     // Two tables here previously had neither.
     // ======================================================================

@@ -136,7 +136,7 @@ and can be overridden by editing the `Default for VmConfig` impl:
 | `gc_algorithm` | `Generational` | Other choices in `GcAlgorithm` enum |
 | `use_compressed_oops` | false | `-XX:+UseCompressedOops` |
 | `use_compact_headers` | false | `-XX:+UseCompactObjectHeaders` |
-| `use_synthetic_jdk` | true (library) / **false — real-JDK, always** (launcher) | **Never host-detected.** Library/embedding default (`VmConfig::default()`, `EMBEDDED_DEFAULT_JDK_MODE`) stays `true` so the in-tree suite is hermetic. The `cratonvm` launcher and the C embedding API use `VmConfig::for_launcher()` (`LAUNCHER_DEFAULT_JDK_MODE`), which is **real-JDK unconditionally**. Select the other mode with `--real-jdk` / `--synthetic-jdk` (mutually exclusive). If the selected mode is unavailable — no usable JDK for `--real-jdk`, or a build without the `synthetic-jdk` Cargo feature for `--synthetic-jdk` — the launch is a **hard error** naming everything searched; there is no silent fallback to the other class library. See [`docs/internal/arch-2026-07-26/jdk-mode-determinism.md`](internal/arch-2026-07-26/jdk-mode-determinism.md). |
+| `use_synthetic_jdk` | true (library) / **false — real-JDK, always** (launcher) | **Never host-detected.** Library/embedding default (`VmConfig::default()`, `EMBEDDED_DEFAULT_JDK_MODE`) stays `true` so the in-tree suite is hermetic. The `cratonvm` launcher and the C embedding API use `VmConfig::for_launcher()` (`LAUNCHER_DEFAULT_JDK_MODE`), which is **real-JDK unconditionally**. Select the other mode with `--real-jdk` / `--synthetic-jdk` (mutually exclusive). If the selected mode is unavailable — no usable JDK for `--real-jdk`, or a build without the `synthetic-jdk` Cargo feature for `--synthetic-jdk` — the launch is a **hard error** naming everything searched; there is no silent fallback to the other class library. |
 | `use_container_support` | true | Cgroup limits honoured by default |
 | `xverify_mode` | `Remote` | See `XverifyMode` enum |
 | `cds_mode` | `Off` | |
@@ -272,6 +272,7 @@ are **off by default** (the default posture is JDK-faithful single-tenant).
 | Token | Group | Description | Default |
 |-------|-------|-------------|---------|
 | `-lazy-streams` / `eager-streams` | `COMPAT` | Opt **out** of the lazy / short-circuiting synthetic `java.util.stream` pipeline back to the legacy eager pipeline. Lazy is the default (keycloak-16 Part B): intermediate ops (`peek`/`map`/`filter`/`limit`/`skip`) defer instead of materialising, and short-circuit terminals stop early — so `Stream.of(...).peek(p).findFirst()` runs `p` once, matching HotSpot. Eager-terminal results and exceptions are identical either way. | lazy |
+| `mockito-legacy-selectors` | `COMPAT` | Restore the pre-2026-07-27 native overrides of Mockito's own selector methods: `LocationFactory.create` returns a `Java8LocationImpl` carrying the hardcoded string `"-> at <<unknown line>>"` instead of walking the stack, and `ModuleMemberAccessor.delegate` always returns `ReflectionMemberAccessor`. Off by default — the real selectors run and pick `LocationImpl` / `InstrumentationMemberAccessor` as on HotSpot, so Mockito failure messages name their real call site. Escape hatch only. | Off |
 | `-default-watchdog` | `THREADS` | Disable the 120-second hang watchdog. | on |
 | `default-watchdog-sec=N` | `THREADS` | Override the default watchdog timeout. | `120` |
 | `lock-order-check` | `THREADS` | Opt in (release builds) to runtime lock-ordering deadlock detection. Truthy values: `1`/`true`/`yes`/`on`. Always on in debug builds. | Off (release) |
@@ -292,11 +293,9 @@ from a parent shell.
 
 > **Debug tokens.** The 342 tokens in `CRATONVM_DBG` are internal
 > developer switches (tracing, GC stress, JIT bisection). They may change or
-> disappear without notice. Each is classified — debug / semantics-changing /
-> test-only / dead — with call sites and cache status in
-> [`docs/internal/flag-census.md`](internal/flag-census.md).
+> disappear without notice.
 >
-> Read that before adding a flag. The surface reached 692 identifiers by
-> growing roughly one per fixed bug with no retirement path; the fifteen
-> variables above are pinned by `types/tests/flag_surface.rs`, so a new raw
-> `std::env::var("CRATONVM_…")` call site is a deliberate two-file edit.
+> The surface reached 692 identifiers by growing roughly one per fixed bug
+> with no retirement path; the fifteen variables above are pinned by
+> `types/tests/flag_surface.rs`, so a new raw `std::env::var("CRATONVM_…")`
+> call site is a deliberate two-file edit.
