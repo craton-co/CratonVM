@@ -83,11 +83,16 @@ Confirmed correct in isolation (identical referents compare equal, distinct
 referents compare unequal) — a genuine fix for a real defect, matching the
 Brave precedent — but it does **not**, by itself, close
 `TomcatServletWebServerServletContextListenerTests`'s residual: a second,
-independent root cause exists in classloader parent-delegation. See
-[`tomcatservletwebserverservletcontextlistenertests-mockito-forkedclasspath-mockmethodadvice.md`](../../known-issues/springboot/tomcatservletwebserverservletcontextlistenertests-mockito-forkedclasspath-mockmethodadvice.md)
-for the full, precise write-up of that remaining, still-open issue — it is
-**not** the same bug as this doc's original hang/`NoClassDefFoundError`,
-despite the 2026-07-24 update below having assumed they were the same.
+independent root cause existed. That residual is now **FIXED (2026-07-26)** —
+see
+[`servletcontextlistener-forkedclasspath-mockito-notamock-FIXED.md`](servletcontextlistener-forkedclasspath-mockito-notamock-FIXED.md).
+It was **not** in classloader parent-delegation as originally suspected:
+`Method.invoke` resolved the declaring class of a *cross-package
+package-private* instance method by name, so JUnit ran the application-loader
+copy of the inherited test method against a fork-loaded receiver — the two
+Mockito `MockUtil` copies involved were simply disjoint. It is **not** the
+same bug as this doc's original hang/`NoClassDefFoundError`, despite the
+2026-07-24 update below having assumed they were the same.
 
 ## Regression check
 

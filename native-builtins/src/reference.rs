@@ -121,7 +121,10 @@ pub(crate) fn register_reference_natives(registry: &mut NativeMethodRegistry) {
     // `LatentKey.equals(WeakKey)` (or the reverse) never actually reaches
     // Mockito's own bytecode. Confirmed via `Mockito.verify(mock)` throwing
     // `NotAMockException` for a mock created and used successfully moments
-    // earlier (`docs/known-issues/springboot/tomcatservletwebserverservletcontextlistenertests-mockito-forkedclasspath-mockmethodadvice.md`).
+    // earlier (`docs/internal/fixed-suite-bugs/springboot/servletcontextlistener-forkedclasspath-mockito-notamock-FIXED.md`
+    // — note that doc's own conclusion: these bridges are a correct fix for a
+    // real dispatch defect, but the `NotAMockException` they were first written
+    // for had a second, independent cause in `Method.invoke`).
     // Bridge both directions explicitly, mirroring Mockito's own semantics.
     registry.register(
         "org/mockito/internal/util/concurrent/WeakConcurrentMap$WeakKey",
