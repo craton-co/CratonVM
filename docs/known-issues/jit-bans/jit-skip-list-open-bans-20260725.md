@@ -214,8 +214,9 @@ still real correctness bugs worth closing):
   above)
 - JAXB (`jaxb_mapping_residual_skip_prefix`), Xerces
   (`xerces_schema_jit_deny_prefix`), SnakeYAML emitter
-- ES-HAMCREST.1, ES-JIT-DEOPT-GC.1, ES fragile cluster
-  (`is_elasticsearch_suite_jit_fragile_cluster`)
+- ES-HAMCREST.1, ES-JIT-DEOPT-GC.1, ~~ES fragile cluster
+  (`is_elasticsearch_suite_jit_fragile_cluster`)~~ — **REMOVED 2026-07-27**,
+  see below
 - JSONSMART-PARSER.1 — **SUPERSEDED. Re-tested 2026-07-27: ban RETIRED, stays
   removed from `skip_list.rs`; the package JIT-compiles and 3,000,000
   round-trip parse operations produce 0 errors. The one real defect found was
@@ -494,9 +495,23 @@ session" list above.
 - **KEPT, confirmed still live:** JAXB (`org/glassfish/jaxb/`) — real
   corruption reproduced once a newly-found, unrelated `java.io.Writer`
   bug (below) was worked around.
-- **KEPT, no fixture to test:** ES fragile cluster / whole `org/elasticsearch/`
-  prefix — no Elasticsearch checkout survives on this host; see
-  `docs/known-issues/es-fragile-cluster-no-fixture-20260726.md`.
+- ~~**KEPT, no fixture to test:** ES fragile cluster / whole
+  `org/elasticsearch/` prefix~~ — **REMOVED 2026-07-27.** A fixture does exist
+  (`/data/data/es-fixture-ivfknn-slicesdense-closure-20260717/`), and with it the JIT-eligible package produces byte-identical
+  results: a 19-class spread sample (every ~150th of the 2555 compiled test
+  classes, plus `FloatFieldBlockLoaderTests` itself) is identical line for line
+  with the ban on and off, and `TextFieldMapperTests` is 149 tests / 24 failures
+  on 3 runs each way. `FloatFieldBlockLoaderTests`, the single class that kept
+  the ban alive on 2026-07-26 (38 baseline -> 41 lifted), is now 31 failures
+  with the ban on AND 31 with it off. The +3 was the stale-compiled-entry defect
+  closed by `docs/internal/nodeconnections-retired-jit-code-jump-20260727.md`
+  (the callee-compile probe handed out an entry address whose artifact it had
+  already released), which was also SIGSEGV-ing
+  `cluster.NodeConnectionsServiceTests` in the same window.
+  `FloatHierarchicalKMeansTests` goes the other way: it times out 3/3 at 900 s
+  with the ban ON and completes in 43-58 s with it lifted, so the ban was
+  causing a hang there. Both prior docs moved to
+  `docs/internal/es-fragile-cluster-{confirmed-needed,no-fixture}-20260726.md`.
 - **Already moot, no action:** BC-ASN1.1 and FELIX.1 both live inside
   `is_known_miscompile`, gated behind `callee_saved_gpr_local_homes_enabled()`
   (defaults `false`) — dead in any default run already. NETTY.1's only

@@ -1485,7 +1485,19 @@ fn maybe_gc_forced(shared: &SharedVm, thread: &mut JvmThread) {
     // GC-overhead accounting: live set BEFORE the collection (post-TLAB-retire),
     // so `note_gc_productivity` can compute how much this forced GC actually
     // freed (`before - after`). See `note_gc_productivity` / `gc_overhead_limit_exceeded`.
-    let before_live = shared.mem.heap.allocated_bytes();
+    //
+    // Use the free-list-aware live estimate, NOT `allocated_bytes`: the default
+    // (non-moving) young sweep reclaims dead objects into the from-space free
+    // list without retreating the bump cursor, so `allocated_bytes` reads a
+    // perfectly-productive sweep as "freed 0" and latches the overhead limit
+    // after `GC_OVERHEAD_LIMIT_CYCLES` young fills — a spurious
+    // `OutOfMemoryError` on a heap that is almost entirely garbage. Restores
+    // part 3 of a9c580aff, which d8092acba ("fix-tests-real-jdk-contracts")
+    // reverted in this file while leaving both accessors in place and
+    // caller-less; see docs/internal/fixed-suite-bugs/tomcat/
+    // 24-stringcache-oom-under-load.md.
+    let before_live = shared.mem.heap.live_bytes_estimate();
+    let before_promoted = shared.mem.heap.bytes_promoted_total();
     // Round-5 fix (CRIT — UAF): see comment in `maybe_gc`. The forced
     // path is also an initiator path; drain its per-thread SATB buffer
     // before scanning roots.
@@ -1514,7 +1526,7 @@ fn maybe_gc_forced(shared: &SharedVm, thread: &mut JvmThread) {
             .mem
             .gc_cycle_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        note_gc_productivity(shared, before_live);
+        note_gc_productivity(shared, before_live, before_promoted);
     } else {
         let mut counted_os_tids: Vec<u32> = Vec::new();
         let should_initiate_gc = {
@@ -1578,7 +1590,7 @@ fn maybe_gc_forced(shared: &SharedVm, thread: &mut JvmThread) {
                 .mem
                 .gc_cycle_count
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            note_gc_productivity(shared, before_live);
+            note_gc_productivity(shared, before_live, before_promoted);
         } else {
             safepoint_check(shared, thread);
         }
@@ -1602,17 +1614,37 @@ const GC_OVERHEAD_LIMIT_CYCLES: u32 = 8;
 /// generational heap: in a retained-allocation death-spiral the young semi-space
 /// is emptied every cycle (so total *fullness* sits near young/total ≈ 50% and
 /// never looks exhausted), yet the GC frees ~nothing net because every survivor
-/// is promoted into an already-full old generation. `before - after` captures
-/// exactly that — promotion is not freeing, so it does not reset the streak.
+/// is promoted into an already-full old generation. Promoted bytes DO count
+/// toward productivity (they re-enable young allocation, which is the point of
+/// the collection) — but the 2%-of-capacity threshold still catches the
+/// death-spiral: a wedged, ~full old generation cannot absorb 2% of total heap
+/// capacity per cycle, so its sliver-promotions stay "unproductive" and the
+/// streak still trips the overhead limit. A healthy young→old drain moves far
+/// more than 2% and resets it.
 /// Forced GCs only happen on genuine allocation failure (young full *and*
 /// promotion blocked), so this never fires during ordinary young-GC churn.
-fn note_gc_productivity(shared: &SharedVm, before_live: usize) {
+fn note_gc_productivity(shared: &SharedVm, before_live: usize, before_promoted: u64) {
     let cap = shared.mem.heap.heap_capacity();
     if cap == 0 {
         return;
     }
-    let after_live = shared.mem.heap.allocated_bytes();
-    let freed = before_live.saturating_sub(after_live);
+    // Free-list-aware live metric (see the capture site in `maybe_gc_forced`):
+    // the non-moving sweep reclaims into the young free list without moving
+    // the bump cursor, so `allocated_bytes` would read a fully-productive
+    // sweep as "freed 0" and falsely latch the overhead limit.
+    let after_live = shared.mem.heap.live_bytes_estimate();
+    // A promotion-only cycle conserves live bytes but still did useful
+    // allocation-enabling work (it drained young), so credit promoted bytes.
+    // The 2%-of-capacity threshold below still catches the genuine
+    // everything-survives-into-a-full-old-gen death spiral.
+    let promoted = shared
+        .mem
+        .heap
+        .bytes_promoted_total()
+        .saturating_sub(before_promoted) as usize;
+    let freed = before_live
+        .saturating_sub(after_live)
+        .saturating_add(promoted);
     // unproductive: freed < 2% of capacity
     // Cast: numeric/representation conversion
     let unproductive = (freed as u128) * 100 < (cap as u128) * 2;
@@ -1631,7 +1663,7 @@ fn note_gc_productivity(shared: &SharedVm, before_live: usize) {
     };
     if cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_GC_OVERHEAD").is_some() {
         eprintln!(
-            "[GC_OVERHEAD] before={before_live} after={after_live} freed={freed} cap={cap} unproductive={unproductive} streak={streak}"
+            "[GC_OVERHEAD] before={before_live} after={after_live} promoted={promoted} freed={freed} cap={cap} unproductive={unproductive} streak={streak}"
         );
     }
 }
@@ -7893,12 +7925,19 @@ pub(crate) fn try_osr_with_backoff(
                 f.class_id,
             )
         };
-        let reusable = {
+        // Three-way classification, not two. `reusable` is the enter-now case;
+        // `published_but_unenterable` is a PUBLISHED OSR artifact that cannot be
+        // entered at THIS pc, which is a permanent property, not a
+        // still-compiling one (see the rejection arm below).
+        let (reusable, published_but_unenterable) = {
             let jc = shared.jit.jit_cache.read();
-            matches!(
-                jc.get_osr(&cn, &mn, &md, frame_class_id),
-                Some(c) if c.compiled_via_osr && c.can_osr_enter(entry_pc)
-            )
+            match jc.get_osr(&cn, &mn, &md, frame_class_id) {
+                Some(c) if c.compiled_via_osr => {
+                    let ok = c.can_osr_enter(entry_pc);
+                    (ok, !ok)
+                }
+                _ => (false, false),
+            }
         };
         if !reusable {
             // Not compiled yet: ensure the worker is running, request an OSR
@@ -7906,7 +7945,32 @@ pub(crate) fn try_osr_with_backoff(
             // than spin. A subsequent hot back-edge finds the published
             // artifact and falls through to the reuse-enter below.
             let key = crate::jit::tiered::MethodKey::new(cn, mn, md);
-            if crate::jit::tiered::is_osr_denied(&key) {
+            // An artifact this same path already published, which reports
+            // `can_osr_enter(entry_pc) == false`, will report that forever:
+            // `osr_pc_to_native[entry_pc]` is a pure function of the bytecode
+            // and the entry pc (the codegen writes `-1` for a pc strictly
+            // inside a LICM-hoisted loop body, whose pre-header an OSR entry
+            // would skip). Recompiling reproduces it byte for byte — the OSR
+            // path passes empty branch/unroll hint maps, so nothing profile-
+            // dependent can change the outcome; a class redefinition, the one
+            // thing that would, replaces the cached artifact and re-evaluates
+            // this check naturally.
+            //
+            // Treating it as "background compile pending" instead —
+            // `record_osr_background_pending()` resets `backward_count` without
+            // consuming the bounded per-pc rejection budget — made the loop
+            // re-request a compile every `osr_threshold` back-edges forever.
+            // Measured on the `CallRate.allocPutOld` probe: 200 full C2
+            // pipelines for 200 000 iterations (one per 1 000), 199 of them
+            // producing the identical un-enterable artifact, with the loop
+            // interpreted throughout. Route it to the existing bounded
+            // exponential-backoff schedule instead, which is already keyed
+            // per-pc, so other loop headers in the same method keep their OSR
+            // eligibility (unlike `mark_osr_denied`, which is method-wide).
+            //
+            // Strictly a waste-elimination change: it removes compiles, never
+            // adds compiled execution. The loop runs interpreted either way.
+            if crate::jit::tiered::is_osr_denied(&key) || published_but_unenterable {
                 thread.frames[*frame_idx].record_osr_rejection(entry_pc);
                 return OsrBackoffOutcome::Skip;
             }
@@ -19382,12 +19446,39 @@ pub(crate) fn resolve_class_loader_aware(
 ) -> Result<ClassId, MethodCallFailed> {
     // (1) Gate / built-in / JDK-name fast paths + already-known loader-local
     //     answer — none of which need a re-entrant call.
-    let isolated_url_definition =
-        is_isolated_url_loader_definition(shared, thread, referencing_class_id);
-    let known = if isolated_url_definition {
-        lookup_loader_defined_exact(shared, referencing_class_id, name)
+    let direct_loader = shared
+        .classes
+        .class_manager
+        .read()
+        .get_loader_id(referencing_class_id);
+    let direct_user_loader = matches!(
+        direct_loader,
+        Some(cratonvm_types::ClassLoaderId::UserDefined(_))
+    );
+    // A class-manager loader id can temporarily disagree with the defining
+    // loader side table for forked loaders, so retain that authoritative
+    // fallback.  Application/bootstrap classes have neither and must not pay
+    // for initiating-resolution map probes merely because another loader was
+    // registered elsewhere in the process.
+    let has_registered_defining_loader =
+        cratonvm_native_builtins::classloader::defining_loader_for(
+            referencing_class_id.as_u32(),
+        )
+        .is_some();
+    let has_loader_namespace = direct_user_loader || has_registered_defining_loader;
+    let isolated_url_definition = if has_registered_defining_loader {
+        is_isolated_url_loader_definition(shared, thread, referencing_class_id)
     } else {
-        lookup_loader_initiated(shared, referencing_class_id, name)
+        false
+    };
+    let known = if has_loader_namespace {
+        if isolated_url_definition {
+            lookup_loader_defined_exact(shared, referencing_class_id, name)
+        } else {
+            lookup_loader_initiated(shared, referencing_class_id, name)
+        }
+    } else {
+        None
     };
     if let Some(id) = known {
         return Ok(id);
@@ -19459,7 +19550,7 @@ pub(crate) fn resolve_class_loader_aware(
     let loader_faithful = should_use_loader_initiated_resolution(shared, referencing_class_id)
         || isolated_url_definition;
     let user_loader =
-        if loader_faithful && !name.starts_with('[') && !is_global_resolution_namespace(name) {
+        if loader_faithful && has_loader_namespace && !name.starts_with('[') && !is_global_resolution_namespace(name) {
             let direct_loader_id = shared
                 .classes
                 .class_manager
@@ -19838,9 +19929,7 @@ fn resolve_field_ref(
         }
     }
 
-    let field_class_id = match loader_local_id
-        .or_else(|| lookup_loader_initiated(shared, current_class_id, &field_class_name))
-    {
+    let field_class_id = match loader_local_id {
         Some(id) => id,
         None if loader_sensitive => {
             return Err(VmError::Internal {
@@ -19968,8 +20057,8 @@ fn resolve_field_ref_loader_aware(
     // it may predate the loader's private definition and point at the
     // application copy. A getstatic against that stale owner shares static
     // annotation metadata caches across otherwise isolated frameworks.
-    let isolated_url_definition =
-        is_isolated_url_loader_definition(shared, thread, current_class_id);
+    let isolated_url_definition = loader_sensitive
+        && is_isolated_url_loader_definition(shared, thread, current_class_id);
     let loader_local_id = if loader_sensitive {
         if isolated_url_definition {
             lookup_loader_defined_exact(shared, current_class_id, &field_class_name)
@@ -22437,6 +22526,27 @@ fn execute_invoke_kind(
         method_descriptor.as_ref(),
         &args,
     ) {
+        // A force-native virtual call used to return before the ordinary
+        // stackless-dispatch epilogue below could warm `invoke_cache`.  That
+        // made every subsequent call to common real-JDK overrides (notably
+        // String's compact-string operations) re-enter full method
+        // resolution, even though `populate_virtual_invoke_cache` already
+        // has a redefine-aware `VirtualNative` representation for exactly
+        // this dispatch.  Keep the private-target exclusion from the normal
+        // virtual epilogue because such a call has a distinct resolution
+        // identity.
+        if !is_special && private_virtual_target.is_none() {
+            if let Some(rcv_cid) = receiver_class_id {
+                populate_virtual_invoke_cache(
+                    thread,
+                    shared,
+                    current_class_id,
+                    cp_index,
+                    rcv_cid,
+                    &args[0],
+                );
+            }
+        }
         return res;
     }
 
@@ -22704,7 +22814,7 @@ fn execute_invoke_kind(
         dispatch_override,
     )? {
         CachedCallResult::FramePushed => {
-            if is_special {
+            if is_special || private_virtual_target.is_some() {
                 populate_invoke_cache(thread, shared, current_class_id, cp_index, is_special);
             } else if private_virtual_target.is_none() && loader_interface_override.is_none() {
                 if let Some(rcv_cid) = receiver_class_id {
@@ -22721,7 +22831,7 @@ fn execute_invoke_kind(
             return Ok(CachedCallResult::FramePushed);
         }
         CachedCallResult::Handled => {
-            if is_special {
+            if is_special || private_virtual_target.is_some() {
                 populate_invoke_cache(thread, shared, current_class_id, cp_index, is_special);
             } else if private_virtual_target.is_none() && loader_interface_override.is_none() {
                 if let Some(rcv_cid) = receiver_class_id {
@@ -22823,7 +22933,7 @@ fn execute_invoke_kind(
     }
 
     // Populate cache for future fast-path hits
-    if is_special {
+    if is_special || private_virtual_target.is_some() {
         populate_invoke_cache(thread, shared, current_class_id, cp_index, is_special);
     } else if private_virtual_target.is_none() {
         if let Some(rcv_cid) = receiver_class_id {
@@ -26233,6 +26343,7 @@ pub(crate) fn is_h2_parser_native_override(
                 | ("setTokenIndex", "(I)V")
                 | ("readIf", "(I)Z")
                 | ("addExpected", "(I)V")
+                | ("testToken", "(Ljava/lang/String;Lorg/h2/command/Token;)Z")
         );
     }
     if class_name == "org/h2/command/Tokenizer" {
@@ -27136,6 +27247,24 @@ pub(crate) fn is_stamped_lock_native_override(
         ) && matches!(
             (method_name, descriptor),
             ("lock", "()V") | ("tryLock", "()Z") | ("unlock", "()V")
+        )
+}
+
+/// The real JDK 25 ReentrantReadWriteLock stores its state in the final
+/// protected helpers inherited from AbstractQueuedLongSynchronizer.  The
+/// native implementations retain the JDK queue algorithm while providing an
+/// atomic scalar state word outside CratonVM's tagged heap slot.
+pub(crate) fn is_aqls_state_native_override(
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+) -> bool {
+    class_name == "java/util/concurrent/locks/AbstractQueuedLongSynchronizer"
+        && matches!(
+            (method_name, descriptor),
+            ("getState", "()J")
+                | ("setState", "(J)V")
+                | ("compareAndSetState", "(JJ)Z")
         )
 }
 
@@ -28340,6 +28469,9 @@ fn force_native_over_real_jdk_bytecode(
     }
 
     if is_forkjoin_native_override(class_name, method_name, method_descriptor) {
+        return true;
+    }
+    if is_aqls_state_native_override(class_name, method_name, method_descriptor) {
         return true;
     }
     if is_bc_crypto_math_native_override(class_name, method_name, method_descriptor) {
@@ -32875,6 +33007,10 @@ fn execute_invokestatic_cached(
 ) -> Result<CachedCallResult, MethodCallFailed> {
     let caller_class_id = thread.frames[frame_idx].class_id;
     let continuation_interpreted = matches!(thread.kind, crate::threading::ThreadKind::Virtual);
+    // A --nojit execution can neither enter a cached artifact nor request a
+    // new one.  Keep the call-cache dispatch entirely interpreter-only rather
+    // than paying its JIT generation probes and hotness atomics on every call.
+    let jit_enabled = !crate::runtime::env_cache::disable_jit();
 
     // Thread-local invoke cache — no locking needed. invokestatic uses
     // is_special=false since static calls never collide cp_index with
@@ -33037,7 +33173,7 @@ fn execute_invokestatic_cached(
             // live generation the cache content is unchanged since we last looked
             // and missed, and looking again cannot find anything. Steady state is
             // two integer loads plus a compare: no hashing, no string compares.
-            if !redefine_jit_quiesced && !continuation_interpreted {
+            if jit_enabled && !redefine_jit_quiesced && !continuation_interpreted {
                 // Read the generation BEFORE probing. A publication racing in
                 // after the probe leaves us memoizing an older generation, which
                 // compares unequal next time and re-probes -- safe. Memoizing a
@@ -33150,11 +33286,13 @@ fn execute_invokestatic_cached(
             /// failure is retried within a few hundred calls rather than after
             /// another full warmup threshold.
             const JIT_RETRY_STRIDE: u32 = 64;
-            let invoc_count = shared.jit.profile_store.increment_invocation(invoc_key);
+            let invoc_count = jit_enabled
+                .then(|| shared.jit.profile_store.increment_invocation(invoc_key))
+                .unwrap_or(0);
             // Fire on the first crossing of the threshold, then re-attempt every
             // `JIT_RETRY_STRIDE` calls until the upgrade succeeds (after which
             // the invoke cache routes through JIT and this block is bypassed).
-            let past_threshold = invoc_count >= jit_invocation_threshold;
+            let past_threshold = jit_enabled && invoc_count >= jit_invocation_threshold;
             let should_attempt = past_threshold
                 && (invoc_count == jit_invocation_threshold
                     || (invoc_count - jit_invocation_threshold) % JIT_RETRY_STRIDE == 0);
@@ -33620,6 +33758,22 @@ fn compile_osr_artifact(
     // reuse kicks in.
     let osr_reused =
         matches!(&cached_osr, Some(c) if c.compiled_via_osr && c.can_osr_enter(entry_pc));
+    // DBG: name WHY a cached artifact was not reused. A cached
+    // `compiled_via_osr` artifact that cannot enter at `entry_pc` means the
+    // recompile below is guaranteed to produce the same un-enterable result
+    // (same bytecode, same entry pc), i.e. a pure-waste recompile loop —
+    // distinguishing that from "no artifact yet" or "artifact came from the
+    // invocation path" is the whole diagnosis.
+    if !osr_reused && cratonvm_types::flags::runtime_var_os("CRATONVM_DBG_JITC").is_some() {
+        let why = match &cached_osr {
+            None => "no-cached-artifact",
+            Some(c) if !c.compiled_via_osr => "cached-not-via-osr",
+            Some(_) => "cached-cannot-enter-at-pc",
+        };
+        eprintln!(
+            "[cratonvm-jitc] OSR-recompile reason={why} {class_name}.{method_name}{method_descriptor} entry_pc={entry_pc}"
+        );
+    }
     let compiled = if osr_reused {
         cached_osr
     } else {
@@ -34127,6 +34281,15 @@ fn compile_osr_artifact(
             }
 
             // Eagerly compile invokestatic callees (class_manager lock released)
+            //
+            // Every baked direct-call target must stay mapped until this caller
+            // is published, because publication is what roots them
+            // (`JitCache::prepare_for_publication` -> `_direct_callee_roots`).
+            // Dropping the callee `Arc` here would let a concurrent tier-up
+            // `put` unmap a body whose address is already baked into the
+            // machine code being emitted.
+            let mut baked_callee_pins: Vec<std::sync::Arc<cratonvm_jit::CompiledMethod>> =
+                Vec::new();
             for (ipc, callee_class, callee_method, callee_desc, param_count) in
                 pending_callee_compiles
             {
@@ -34139,7 +34302,8 @@ fn compile_osr_artifact(
                         &callee_desc,
                         true,
                     );
-                if let Some((entry, needs_ctx)) = compiled_callee {
+                if let Some((callee_pin, entry, needs_ctx)) = compiled_callee {
+                    baked_callee_pins.push(callee_pin);
                     if !crate::jit::jit_direct_call_requires_dispatch(
                         &callee_class,
                         &callee_method,
@@ -36653,13 +36817,26 @@ fn callee_neg_fingerprint(class_name: &str, method_name: &str, descriptor: &str)
 /// already-published body regardless of `optimize`, so a method is compiled at
 /// whatever tier reaches it *first* — there is no C1→C2 re-compile/supersede yet
 /// (that needs safe code-cache replacement; tracked as a follow-up).
+///
+/// # Why this returns the artifact and not just its entry address
+///
+/// [`JitCache::put`] REPLACES the body stored under a key. The superseded
+/// artifact's last `Arc` therefore drops, and `ExecutableBuffer::drop` unmaps
+/// its code. A caller holding only `entry_ptr()` is racing exactly that: every
+/// caller here either CALLs the address, publishes it into an inline cache, or
+/// bakes it into generated code, and all three keep using it long after this
+/// function returns. Handing back the `Arc` makes the address valid for as long
+/// as the caller keeps the binding alive — and, because
+/// `resolve_jit_entry_owner` can only succeed while the artifact lives, it is
+/// also what lets the inline-cache publications inside that window take their
+/// own keep-alive.
 pub fn try_jit_compile_callee(
     shared: &SharedVm,
     class_name: &str,
     method_name: &str,
     descriptor: &str,
     optimize: bool,
-) -> Option<(usize, bool)> {
+) -> Option<(std::sync::Arc<cratonvm_jit::CompiledMethod>, usize, bool)> {
     use std::sync::atomic::Ordering;
     // Kill-switch: CRATONVM_DISABLE_JIT=1 forces interpreter-only execution.
     // Useful for bisecting JIT-vs-interpreter bugs during bootstrap crashes.
@@ -36701,8 +36878,9 @@ pub fn try_jit_compile_callee(
         let jit_cache = shared.jit.jit_cache.read();
         if let Some(compiled) = jit_cache.get(class_name, method_name, descriptor, probe_class_id) {
             // Cast: object/code pointer to integer address
-            return Some((compiled.entry_ptr() as usize, compiled.needs_context()));
-            // Cast: JIT entry point to address
+            let entry = compiled.entry_ptr() as usize; // Cast: JIT entry point to address
+            let needs_ctx = compiled.needs_context();
+            return Some((compiled, entry, needs_ctx));
         }
     }
     let fp = callee_neg_fingerprint(class_name, method_name, descriptor);
@@ -36772,6 +36950,7 @@ pub fn try_jit_compile_callee(
 /// No two of {class_manager, flight_recorder, jit_cache} are ever held at once.
 /// GC itself takes none of these during STW (it scans deposited root snapshots),
 /// so the worker's transient holds only matter via the mutator-stall path above.
+#[allow(clippy::type_complexity)]
 fn try_jit_compile_callee_slow(
     shared: &SharedVm,
     class_name: &str,
@@ -36782,7 +36961,7 @@ fn try_jit_compile_callee_slow(
     // backend. Threaded into `jit::try_compile`'s trailing flag.
     optimize: bool,
     cache_negative: &mut bool,
-) -> Option<(usize, bool)> {
+) -> Option<(std::sync::Arc<cratonvm_jit::CompiledMethod>, usize, bool)> {
     // RFJP.1 — never JIT a method whose declaring class transitively extends
     // `java/util/concurrent/ForkJoinTask`. The recursive `compute()` body
     // miscompiles under deep recursion (returns 0 from depth ~10), and the
@@ -37270,8 +37449,6 @@ fn try_jit_compile_callee_slow(
         compiled.entry_ptr(),
         compiled.code_bytes(),
     );
-    let entry = compiled.entry_ptr() as usize; // Cast: JIT entry point to address
-    let needs_ctx = compiled.needs_context();
     let compile_duration_ns = compile_start.elapsed().as_nanos() as u64; // Cast: duration to u64 nanoseconds
 
     // Record JFR compilation event.
@@ -37353,18 +37530,29 @@ fn try_jit_compile_callee_slow(
         &method_desc_key,
         &mut compiled,
     );
-    {
-        let mut jit_cache = shared.jit.jit_cache.write();
+    let published = {
+        let jit_cache = shared.jit.jit_cache.write();
         jit_cache.put(
-            receiver_key,
-            method_name_key,
-            method_desc_key,
+            receiver_key.clone(),
+            method_name_key.clone(),
+            method_desc_key.clone(),
             callee_class_id,
             compiled,
         );
-    }
-
-    Some((entry, needs_ctx))
+        // Read back a STRONG reference to what is now published under this key
+        // rather than returning the address we held before the `put`. If a
+        // concurrent publish won the race, this is its artifact — the live one
+        // — instead of one whose buffer is already being unmapped.
+        jit_cache.get(
+            &receiver_key,
+            &method_name_key,
+            &method_desc_key,
+            callee_class_id,
+        )
+    }?;
+    let entry = published.entry_ptr() as usize; // Cast: JIT entry point to address
+    let needs_ctx = published.needs_context();
+    Some((published, entry, needs_ctx))
 }
 
 /// wire-tiered-manager increment 2 — the REAL off-thread compile callback.
@@ -40840,6 +41028,7 @@ fn execute_invokevirtual_cached(
                         && !cached.is_synchronized
                         && !has_registered_native
                         && !crate::classloading::any_class_redefined()
+                        && !crate::runtime::env_cache::disable_jit()
                         && crate::runtime::env_cache::jit_virtual_tierup()
                     {
                         // Fast path: already compiled (by this counter or OSR)?

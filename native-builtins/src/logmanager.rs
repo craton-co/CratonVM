@@ -1951,6 +1951,75 @@ fn dump_throwable_to_stderr(ctx: &mut dyn NativeContext, throwable: ObjectRef, i
 /// touching `org.jboss.logmanager.Logger.logRaw` (which our null-safe
 /// stub previously swallowed). By printing here we surface the boot
 /// progress without needing LogRecord field-offset guesses.
+/// `CRATONVM_JBOSS_LOGGER_LEVEL_FILTER=1` — OPT-IN level filtering for
+/// [`native_jboss_logging_logger_do_log`] / `..._do_logf`.
+///
+/// Default OFF, deliberately. These natives stand in for the concrete
+/// backend's `doLog`/`doLogf`, whose real implementations start with an
+/// `isEnabled(level)` check (`org.jboss.logging.Logger.debugf` and friends do
+/// NOT check the level themselves — they delegate that to `doLog`/`doLogf`).
+/// Ours check nothing, so every `tracef`/`debugf` in the process is formatted
+/// and written no matter how the application configured logging: the real
+/// Keycloak 26.6.1 boot emits 2992 lines against HotSpot's 10.
+///
+/// Turning the check on by default is NOT safe yet, because CratonVM cannot
+/// currently see the application's real configuration: it ignores
+/// `-Djava.util.logging.manager`, so Quarkus/Keycloak's
+/// `org.jboss.logmanager.LogManager` is never installed, jboss-logging falls
+/// back to `JDKLoggerProvider`, and everything those frameworks configure
+/// (including `kc.sh --log-level=debug`) is invisible to us. Filtering on the
+/// only thresholds we CAN see would then silently discard output the user
+/// explicitly asked for — verified: with this filter forced on,
+/// `--log-level=debug` produced zero DEBUG lines.
+///
+/// The real fix is to honour `java.util.logging.manager`; until then this flag
+/// exists so a noisy investigation can opt into HotSpot-like quiet.
+fn jboss_logger_level_filter() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("CRATONVM_JBOSS_LOGGER_LEVEL_FILTER").is_some())
+}
+
+/// Would the real backend have DROPPED this record for being below the
+/// logger's configured level?
+///
+/// These `doLog`/`doLogf` natives stand in for the concrete backend
+/// (`JBossLogManagerLogger`, `JDKLogger`, `Slf4jLogger`, ...), whose real
+/// implementations all start with an `isEnabled(level)` check --
+/// `org.jboss.logging.Logger.debugf(...)` and friends do NOT check the level
+/// themselves, they delegate that to `doLog`/`doLogf`. Ours checked nothing,
+/// so EVERY `tracef`/`debugf` call in the process was formatted and written to
+/// stderr no matter how the application had configured logging.
+///
+/// On the real Keycloak 26.6.1 boot that meant 2992 log lines against
+/// HotSpot's 10, dominated by Hibernate's per-attribute `org.hibernate.orm.boot`
+/// TRACE binding messages -- a large, pure-overhead slowdown on a startup path
+/// that is already the slowest part of the run, plus a log in which the actual
+/// INFO-level progress was unfindable.
+///
+/// Only DEBUG and TRACE are gated, and only under
+/// [`jboss_logger_level_filter`] (opt-in). INFO and above always emit, so the
+/// WildFly/JBoss boot visibility these natives were written for (`WFLYSRV*`,
+/// `WFLYCTL*`, and the throwable dump) is unaffected either way.
+fn jboss_record_suppressed_by_level(level_name: &str, logger_name: &str) -> bool {
+    if !jboss_logger_level_filter() || !matches!(level_name, "DEBUG" | "TRACE") {
+        return false;
+    }
+    // jboss-logging `Level` -> the `java.util.logging.Level` value it
+    // translates to (`JDKLogger.translate`): TRACE=FINEST, DEBUG=FINE.
+    let record_value = if level_name == "TRACE" { 300 } else { 500 };
+    // Same threshold resolution `native_jul_logger_is_loggable` uses: the
+    // nearest ancestor logger with an EXPLICITLY configured level (recorded by
+    // the `setLevel` natives -- which is how Quarkus/JBoss LogManager applies
+    // `--log-level=debug`), else the JDK root default of INFO (800).
+    //
+    // NOT the receiver's own `isEnabled`: in real-JDK mode that bottoms out in
+    // `java.util.logging.Logger.isLoggable`, whose `config.levelValue` CratonVM
+    // never initialises -- it reads 0, so every level compares as enabled and
+    // the check answers `true` for TRACE on a default-configured logger.
+    let threshold = jul_ancestor_explicit_level(logger_name).unwrap_or(800);
+    record_value < threshold
+}
+
 fn native_jboss_logging_logger_do_log(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -1972,24 +2041,52 @@ fn native_jboss_logging_logger_do_log(
         Some(Value::Object(o)) => *o,
         _ => None,
     };
-    let logger_name = this
-        .and_then(|o| match ctx.get_field_by_name(o, "name") {
-            Value::Object(Some(s)) => ctx.read_string(s),
-            _ => None,
+    // `isEnabled` below re-enters Java and can move objects, so root every
+    // argument first and re-read them through their pins afterwards.
+    let mut pin_base = None;
+    let mut pin = |ctx: &mut dyn NativeContext, o: Option<ObjectRef>| {
+        o.map(|object| {
+            let p = ctx.pin_native_root(object);
+            pin_base.get_or_insert(p);
+            (p, object)
         })
-        .unwrap_or_default();
-    let level_name = level_obj
+    };
+    let this_pin = pin(ctx, this);
+    let level_pin = pin(ctx, level_obj);
+    let message_pin = pin(ctx, message_obj);
+    let throwable_pin = pin(ctx, throwable_obj);
+
+    let level_name = level_pin
+        .map(|(p, o)| ctx.read_native_pin(p, o))
         .and_then(|o| match ctx.get_field_by_name(o, "name") {
             Value::Object(Some(s)) => ctx.read_string(s),
             _ => None,
         })
         .unwrap_or_else(|| "INFO".to_string());
-    let message = message_obj
+    let logger_name = this_pin
+        .map(|(p, o)| ctx.read_native_pin(p, o))
+        .and_then(|o| match ctx.get_field_by_name(o, "name") {
+            Value::Object(Some(s)) => ctx.read_string(s),
+            _ => None,
+        })
+        .unwrap_or_default();
+    if jboss_record_suppressed_by_level(&level_name, &logger_name) {
+        if let Some(p) = pin_base {
+            ctx.unpin_native_roots(p);
+        }
+        return Ok(None);
+    }
+    let message = message_pin
+        .map(|(p, o)| ctx.read_native_pin(p, o))
         .and_then(|o| ctx.read_string(o))
         .unwrap_or_default();
     crate::emit_framework_log(ctx, &format!("{level_name} [{logger_name}] {message}"));
-    if let Some(t) = throwable_obj {
+    if let Some((p, original)) = throwable_pin {
+        let t = ctx.read_native_pin(p, original);
         dump_throwable_to_stderr(ctx, t, "    ");
+    }
+    if let Some(p) = pin_base {
+        ctx.unpin_native_roots(p);
     }
     Ok(None)
 }
@@ -2072,6 +2169,15 @@ fn native_jboss_logging_logger_do_logf(
             }
         })
         .unwrap_or_else(|| "INFO".to_string());
+    // Drop below-threshold records BEFORE the (expensive) parameter
+    // `toString` + format pass -- see `jboss_record_suppressed_by_level`.
+    if jboss_record_suppressed_by_level(&level_name, &logger_name) {
+        if let Some(pin) = pin_base {
+            ctx.unpin_native_roots(pin);
+        }
+        return Ok(None);
+    }
+
     let format = format_pin
         .and_then(|(pin, object)| {
             let object = ctx.read_native_pin(pin, object);

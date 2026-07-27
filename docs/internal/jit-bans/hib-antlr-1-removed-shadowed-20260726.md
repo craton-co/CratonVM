@@ -108,10 +108,14 @@ failure modes. Neither mode is specific to a configuration:
    `ScrollableCollectionFetchingTest` / `TreatKeywordTest` in both
    configurations. `ASTParserLoadingTest` ran 106/106 clean on the baseline
    binary when the host was quiet and OOM'd on that same binary once load
-   average passed 100. Filed separately; it reproduces with the skip list
-   untouched and is unrelated to any JIT ban.
-
-With those two resolved, the A/B is **57/57 equivalent**.
+      average passed 100. **Identified 2026-07-27 (later the same day): this is
+   the LICM/speculative pre-header bypass fixed in `613b10f4c`** — see
+   `docs/internal/jit-licm-preheader-bypass-20260727.md`. Both arms of this
+   A/B were built from a base that predates that fix, so it was never the
+   ban. `component 6` is a ClassId (`java/lang/String`), not T_FLOAT, and
+   `1677721600 == 25 * 2^26` is `AttributesImpl.ensureCapacity`'s doubling
+   loop running against an un-written hoist slot. 0 OOM in 46 runs on a
+   current-`dev` binary.
 
 ## What changed in the code
 

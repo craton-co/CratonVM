@@ -66,8 +66,7 @@ build-*.log
 # stray developer probe output
 /dd1.out
 
-# stray repro probe output under docs/internal
-docs/internal/**/cld*.out
+
 
 # Merge-conflict side-copies of crate sources. Resolving a conflict in a file
 # the size of native-builtins/src/lib.rs (~86k lines) tends to leave 3 MB

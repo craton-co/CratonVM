@@ -69,7 +69,7 @@ started.
 - ~~JAXB (`org/glassfish/jaxb/`)~~ — **REMOVED 2026-07-27**, root-caused to
   `82b78bca5` (String compact-layout field intrinsic read 4 bytes high), not
   to JAXB. See `docs/internal/jaxb-jit-ban-removed-20260727.md`.
-- ES fragile cluster (`org/elasticsearch/`) — no fixture, `docs/known-issues/es-fragile-cluster-no-fixture-20260726.md`
+- ~~ES fragile cluster (`org/elasticsearch/`)~~ — **BAN LIFTED 2026-07-27**, see the entry further down and `docs/internal/nodeconnections-retired-jit-code-jump-20260727.md`
 - SPB.1 (`org/springframework/util/`) — inconclusive real-app-less repro, `docs/known-issues/spb1-springframework-util-investigation.md`
 - TOMCAT-JNDIREALM-RDN.1 / JIT.2 (`com/unboundid/`) — real Tomcat suite, SIGSEGV confirmed, see `docs/known-issues/jit-skip-list-open-bans-20260725.md`
 - `org/jboss/as/` (WildFly boot, part of the SPB.8b/8c family) — **BAN LIFTED
@@ -214,10 +214,22 @@ they were built for rather than the technology itself, so the earlier
   Elasticsearch 9.6.0-SNAPSHOT checkout at
   `/data/data/es-fixture-ivfknn-slicesdense-closure-20260717/` (2555
   compiled test classes, `test/framework` module, `libvec.so` already
-  built). **CONFIRMED STILL NEEDED** — an 18-class spread sample found a
+  built). ~~**CONFIRMED STILL NEEDED** — an 18-class spread sample found a
   real regression (`FloatFieldBlockLoaderTests`: 38→41 failures under
-  JIT); the true failure surface across the full suite is likely larger,
-  not yet fully characterized.
+  JIT)~~ — **BAN LIFTED 2026-07-27.** Re-measured with the JIT-eligible package produces byte-identical
+  results: a 19-class spread sample (every ~150th of the 2555 compiled test
+  classes, plus `FloatFieldBlockLoaderTests` itself) is identical line for line
+  with the ban on and off, and `TextFieldMapperTests` is 149 tests / 24 failures
+  on 3 runs each way. `FloatFieldBlockLoaderTests`, the single class that kept
+  the ban alive on 2026-07-26 (38 baseline -> 41 lifted), is now 31 failures
+  with the ban on AND 31 with it off. The +3 was the stale-compiled-entry defect
+  closed by `docs/internal/nodeconnections-retired-jit-code-jump-20260727.md`
+  (the callee-compile probe handed out an entry address whose artifact it had
+  already released), which was also SIGSEGV-ing
+  `cluster.NodeConnectionsServiceTests` in the same window.
+  `FloatHierarchicalKMeansTests` goes the other way: it times out 3/3 at 900 s
+  with the ban ON and completes in 43-58 s with it lifted, so the ban was
+  causing a hang there.
 - **UPDATE 2026-07-27 — CLOSED.** The Keycloak boot blocker was root-caused (classloader synthetic-stub fabrication pre-empting a custom `ClassLoader`, NOT `find_class_bytes_delegated`) and fixed; the real Keycloak 26.6.1 server now boots under CratonVM, and **KC26-PIC.1 and KC26-RX.1 were re-measured against it and LIFTED** (removed from `skip_list.rs`).
 - **KC26-PIC.1 / KC26-RX.1** (Keycloak) — found a full real Keycloak
   26.6.1 Maven repo + bootable quarkus-dist server at

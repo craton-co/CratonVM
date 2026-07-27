@@ -2,7 +2,7 @@
 
 **Status:** FIXED (the contention explosion), merged to `dev`
 (`90ce03eb` commit `2034b4a9`; `44db1836` commit `92efb6ac`).
-Residual call-frequency cost remains — see [04](04-embedded-server-throughput-wall-OPEN.md).
+Residual call-frequency cost remains — see [04](../../../known-issues/tomcat/04-embedded-server-throughput-wall-OPEN.md).
 
 ## Symptom
 
@@ -53,4 +53,4 @@ checksums unchanged (bt18=68332206); no stale-ref SEGV over 22M calls.
 millions during a deploy) × O(stack-depth) scan. The raw call VOLUME is now the
 bottleneck (~45µs × millions), addressed only by caching the caller-frame scan
 (O(depth)→O(1)) or reducing publish frequency — both GC-correctness-critical and
-deferred. See [04](04-embedded-server-throughput-wall-OPEN.md).
+deferred. See [04](../../../known-issues/tomcat/04-embedded-server-throughput-wall-OPEN.md).

@@ -344,19 +344,30 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
                         crate::classloading::ClassLoaderId::UserDefined(_)
                     )
                 });
-                // SPB.1 residual fix (see `metadata_pin_deferrable`'s doc):
-                // `mirror_pin`'s consumer (`gen_heap.rs`/`g1.rs`/`zgc.rs`) only
-                // propagates liveness to OLD-GEN mirrors under the
-                // Generational backend. Skipping a still-YOUNG mirror here
-                // relies on it being "already live as a major-GC root" some
-                // other way, which is not actually guaranteed (e.g. a
-                // freshly-created array/nested-class mirror with no Java
-                // local yet holding it) — root it directly instead.
+                // SPB.1 residual fix (see `mirror_pin_deferrable`'s doc): a
+                // mirror may be left out of the unconditional root set only
+                // when SOME marker running this cycle will actually follow
+                // `mirror_pin`. That holds for an OLD-GEN mirror
+                // (`old_gen_gc`'s BFS) and, additionally, for a YOUNG mirror
+                // whenever the cycle is certain to take the non-moving young
+                // marker — which follows `mirror_pin` as an ordinary marking
+                // edge (`gen_heap::mark_young_precise_object`).
+                //
+                // Rooting a young mirror unconditionally — as the stricter
+                // `metadata_pin_deferrable` predicate used here before did —
+                // permanently defeats class unloading for any loader whose
+                // classes' mirrors have not been promoted yet, because a
+                // mirror's `classLoader` field is a real heap edge back to its
+                // defining loader. Doc 26 / `TestDefaultInstanceManager`: the
+                // evicted JSP's `Class` was the ONLY root-held anchor of the
+                // entire retained JSP-compiler graph, and an explicit
+                // `System.gc()` was the run's first collection, so nothing had
+                // ever been promoted.
                 if is_user_defined
                     && shared
                         .mem
                         .heap
-                        .metadata_pin_deferrable(obj_ref.as_ptr() as usize)
+                        .mirror_pin_deferrable(obj_ref.as_ptr() as usize)
                 {
                     continue;
                 }
