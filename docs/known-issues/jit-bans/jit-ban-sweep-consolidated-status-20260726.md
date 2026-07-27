@@ -47,10 +47,16 @@ Two NEW findings surfaced while re-testing, both independent of these
 bans (confirmed to reproduce identically whether the bans are active or
 lifted):
 
-- `docs/known-issues/springboot/configproxy-cglib-singleton-regression-20260727.md`
+- `docs/known-issues/springboot/configproxy-cglib-loaderid-fixed-20260727.md`
   -- `S03_ConfigProxy` scenario regressed 8/8 -> 4/8 since 2026-06-11;
-  confirmed NOT JIT-related (reproduces with `CRATONVM_DISABLE_JIT=1` too)
-  -- a CGLIB `@Configuration` proxy singleton-cache bug.
+  confirmed NOT JIT-related (reproduces with `CRATONVM_DISABLE_JIT=1` too).
+  **FIXED same day**: `define_class_full`'s `loader_id: u32 -> ClassLoaderId`
+  decode was not the inverse of `loader_id_of_class`'s encode (Application
+  encodes to 2, but 2 decoded back to `UserDefined(2)`, not `Application`),
+  so a CGLIB-enhanced subclass defined via the correctly-fetched superclass
+  loader id got mistagged into a different runtime package, defeating
+  package-private `@Bean`-override detection in the vtable builder. Back to
+  8/8 (10/10 scenarios, 95/95 checks, no regressions).
 - `docs/known-issues/resolvabletype-array-cast-aggressive-jit-20260727.md`
   -- real `ClassCastException` (`ResolvableType[]` cast to `ResolvableType`)
   in `Profiles.<clinit>`, but only under `CRATONVM_JIT_THRESHOLD=1`
