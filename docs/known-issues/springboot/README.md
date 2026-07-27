@@ -115,10 +115,48 @@ rebuilding. **290/429 (67.6%) now PASS**, residual down to 99 FAIL + 40
 HANG, **0 CRASH** (all 5 previously-fatal crashes resolved — 4 now PASS,
 1 now FAIL but no longer fatal). Full before/after table, residual module
 breakdown, and reproduce instructions in
-`apps/spring-boot-suite-runner/RESULTS-20260723.md`. Not re-triaged against
-the docs below this session — many residuals are very likely the same
-already-documented OPEN clusters, worth a dedicated confirmation pass
-rather than assuming closed or re-investigating from scratch.
+`apps/spring-boot-suite-runner/RESULTS-20260723.md`.
+
+**Follow-up triage (same day):** investigated the 85 of 99 residual FAIL
+classes outside `loader/spring-boot-loader` (out of scope this round; the
+40 HANG classes also not covered here), in parallel across 5 investigation
+passes (core/spring-boot dedicated, 4 balanced groups for the rest). Found
+that **several docs marked FIXED from the 07-17 round have genuinely
+regressed** — not stale/false triage, but real re-breaks, including one
+traced to a specific silent-merge culprit commit (`http_parse_url`'s
+query-only-path fix got carried back to a pre-fix state by an unrelated
+later merge). Notes added to the affected FIXED docs under
+`docs/internal/fixed-suite-bugs/` rather than reopening them wholesale.
+22 new docs filed for genuinely uncovered clusters, several confirmed at
+file:line (`SSLContext.getDefault()` caching gap, hardcoded `"Thread"`
+worker names bypassing `DefaultThreadFactory`, `Console.ttyStatus()`
+missing native registration, `Files.readAttributes` ignoring the requested
+attribute-view type on Windows, UTF-16 BOM re-emitted per-call, and more)
+— see the full doc list below, all dated 2026-07-23.
+
+- [`core-spring-boot-base64-decoder-message-mismatch-20260723.md`](core-spring-boot-base64-decoder-message-mismatch-20260723.md) — Base64 decode error message text doesn't match real JDK ("Invalid base64 char" vs "Illegal base64")
+- [`core-spring-boot-beandefinitionloader-package-scan-empty-20260723.md`](core-spring-boot-beandefinitionloader-package-scan-empty-20260723.md) — `BeanDefinitionLoader.findPackage()`'s classpath directory scan finds nothing under the suite runner's pathing jar
+- [`core-spring-boot-console-ttystatus-missing-native-20260723.md`](core-spring-boot-console-ttystatus-missing-native-20260723.md) — `java/io/Console.ttyStatus()I` has no native registration — `Console.<clinit>` fails under Mockito instrumentation
+- [`core-spring-boot-crossmethod-state-leakage-residuals-20260723.md`](core-spring-boot-crossmethod-state-leakage-residuals-20260723.md) — Possible cross-test-method state leakage within a single SbRunner process (pattern observation)
+- [`core-spring-boot-keystore-provider-name-swallowed-20260723.md`](core-spring-boot-keystore-provider-name-swallowed-20260723.md) — `KeyStore.getInstance(type, unregisteredProviderName)` loses the provider name from its exception
+- [`core-spring-boot-modifiedclasspath-uniqueid-discovery-failure-20260723.md`](core-spring-boot-modifiedclasspath-uniqueid-discovery-failure-20260723.md) — `ModifiedClassPathExtension`'s nested UniqueId discovery fails for every test method
+- [`core-spring-boot-properties-computeifabsent-null-map-npe-20260723.md`](core-spring-boot-properties-computeifabsent-null-map-npe-20260723.md) — `java.util.Properties.computeIfAbsent` NPEs on `this.map` for a binder-instantiated `Properties` target
+- [`core-spring-boot-properties-parser-drops-formfeed-20260723.md`](core-spring-boot-properties-parser-drops-formfeed-20260723.md) — OriginTrackedPropertiesLoader silently drops a literal form-feed byte from a property value
+- [`core-spring-boot-uncategorized-residuals-20260723.md`](core-spring-boot-uncategorized-residuals-20260723.md) — `core/spring-boot` 2026-07-23 rerun — uncategorized individual residuals
+- [`core-spring-boot-utf16-encoder-bom-restated-every-call-20260723.md`](core-spring-boot-utf16-encoder-bom-restated-every-call-20260723.md) — UTF-16 `CharsetEncoder.encode()` re-emits the byte-order-mark on every call instead of once per stream
+- [`core-spring-boot-windows-posix-fileattributes-classcast-20260723.md`](core-spring-boot-windows-posix-fileattributes-classcast-20260723.md) — `Files.readAttributes(Path, PosixFileAttributes.class, ...)` ClassCastException on Windows
+- [`graphql-rsocket-tcp-blocking-read-timeout-20260723.md`](graphql-rsocket-tcp-blocking-read-timeout-20260723.md) — `GraphQlRSocketAutoConfigurationTests` real-network RSocket-over-TCP blocking read times out at 5s
+- [`http-parse-url-query-only-authority-split-regression-20260723.md`](http-parse-url-query-only-authority-split-regression-20260723.md) — `http_parse_url` lost its query-only-path fix in a silent merge — `BasicErrorControllerIntegrationTests` "bad port" failures are back
+- [`jta-testdatabase-mockito-cold-selfattach-mockmethodadvice-20260723.md`](jta-testdatabase-mockito-cold-selfattach-mockmethodadvice-20260723.md) — `JtaAutoConfigurationTests` / `TestDatabaseAutoConfigurationNoEmbeddedTests`: Mockito `NoClassDefFoundError: MockMethodAdvice` on first mock use in a fresh forked JVM — cross-references an already-characterized, non-Spring-specific CratonVM gap
+- [`liquibase-scope-corruption-atomiclong-logservice-cast-20260723.md`](liquibase-scope-corruption-atomiclong-logservice-cast-20260723.md) — Liquibase `Scope` per-thread state corruption: scope-id stack mismatch + `AtomicLong` misread as `LogService`
+- [`modifiedclasspathextension-nested-launcher-uniqueid-discovery-failure-20260723.md`](modifiedclasspathextension-nested-launcher-uniqueid-discovery-failure-20260723.md) — `ModifiedClassPathExtension`'s nested `Launcher.discover()` fails to resolve its own `UniqueIdSelector` — `DiscoveryIssueException` on every `@ClassPathExclusions`/`@ClassPathOverrides` test
+- [`oracleucp-poolsizeoneconnection-connection-pool-empty-20260723.md`](oracleucp-poolsizeoneconnection-connection-pool-empty-20260723.md) — `OracleUcpDataSourcePoolMetadataTests.getPoolSizeOneConnection` — first on-demand UCP connection borrow reports "pool is empty"
+- [`otlpexemplarsautoconfigurationtests-empty-histogram-output-20260723.md`](otlpexemplarsautoconfigurationtests-empty-histogram-output-20260723.md) — `OtlpExemplarsAutoConfigurationTests`: OTLP histogram export silently produces empty output — a null exemplar crashes the protobuf builder mid-publish
+- [`r2dbcautoconfigurationtests-properties-map-not-applied-20260723.md`](r2dbcautoconfigurationtests-properties-map-not-applied-20260723.md) — `spring.r2dbc.properties.*` relaxed-bound map entries never reach the built `ConnectionFactoryOptions`
+- [`springbootcontextloaderaottests-groovy-metaclass-nullfields-20260723.md`](springbootcontextloaderaottests-groovy-metaclass-nullfields-20260723.md) — `SpringBootContextLoaderAotTests` — Groovy `GroovySystem.<clinit>` bootstrap NPE (`CachedClass.getFields()` returns null)
+- [`sslcontext-getdefault-implicit-caching-gap-20260723.md`](sslcontext-getdefault-implicit-caching-gap-20260723.md) — `SSLContext.getDefault()` allocates a fresh context every call unless `setDefault()` was explicitly invoked first — breaks JDK singleton-default contract
+- [`taskscheduling-scheduledexecutorservice-literal-thread-name-20260723.md`](taskscheduling-scheduledexecutorservice-literal-thread-name-20260723.md) — `ScheduledExecutorService` worker threads get the literal name `"Thread"` instead of `pool-N-thread-M`
+- [`webmvcendpointmanagementcontextconfigurationtests-multipartresolver-selfmatch-residual-20260723.md`](webmvcendpointmanagementcontextconfigurationtests-multipartresolver-selfmatch-residual-20260723.md) — `WebMvcEndpointManagementContextConfigurationTests`: `multipartResolver` factory-method parameter self-resolves to the bean being created
 
 > Closure update (2026-07-23): `module/spring-boot-security`'s 4-class
 > residual from this rerun (`SecurityFilterAutoConfigurationEarlyInitializationTests`,

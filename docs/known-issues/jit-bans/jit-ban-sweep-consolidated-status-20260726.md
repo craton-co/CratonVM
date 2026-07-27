@@ -47,15 +47,32 @@ Two NEW findings surfaced while re-testing, both independent of these
 bans (confirmed to reproduce identically whether the bans are active or
 lifted):
 
-- `docs/known-issues/springboot/configproxy-cglib-singleton-regression-20260727.md`
+- `docs/known-issues/springboot/configproxy-cglib-loaderid-fixed-20260727.md`
   -- `S03_ConfigProxy` scenario regressed 8/8 -> 4/8 since 2026-06-11;
-  confirmed NOT JIT-related (reproduces with `CRATONVM_DISABLE_JIT=1` too)
-  -- a CGLIB `@Configuration` proxy singleton-cache bug.
-- `docs/known-issues/resolvabletype-array-cast-aggressive-jit-20260727.md`
+  confirmed NOT JIT-related (reproduces with `CRATONVM_DISABLE_JIT=1` too).
+  **FIXED same day**: `define_class_full`'s `loader_id: u32 -> ClassLoaderId`
+  decode was not the inverse of `loader_id_of_class`'s encode (Application
+  encodes to 2, but 2 decoded back to `UserDefined(2)`, not `Application`),
+  so a CGLIB-enhanced subclass defined via the correctly-fetched superclass
+  loader id got mistagged into a different runtime package, defeating
+  package-private `@Bean`-override detection in the vtable builder. Back to
+  8/8 (10/10 scenarios, 95/95 checks, no regressions).
+- `docs/known-issues/resolvabletype-equals-jit-narrowed-20260727.md`
   -- real `ClassCastException` (`ResolvableType[]` cast to `ResolvableType`)
-  in `Profiles.<clinit>`, but only under `CRATONVM_JIT_THRESHOLD=1`
-  (a `<clinit>` essentially never reaches real JIT tiers otherwise) --
-  low real-world priority, tracked for a future session.
+  in `Profiles.<clinit>`, only under `CRATONVM_JIT_THRESHOLD=1` (a
+  `<clinit>` essentially never reaches real JIT tiers otherwise) -- low
+  real-world priority but a genuine live miscompile. **Narrowed further**
+  this session via precise `CRATONVM_JIT_DENY` bisection across all 10
+  JIT-compiled `ResolvableType` methods down to exactly
+  `ResolvableType.equals(Object)` (not `equalsType`, `hashCode`,
+  `calculateHashCode`, `resolve`, or either `forType` overload). The
+  compiled x86 was disassembled and correlated to the documented 4-way
+  Polymorphic Inline Cache (PIC) codegen in `jit/src/x64.rs` (the
+  `CRIT-8`/`HIGH-7` comment block) -- root cause NOT yet confirmed (the
+  PIC mechanism itself is heavily used elsewhere without issue, so the
+  defect is likely specific to this call site's slot state, not the
+  template) -- full repro commands, disassembly artifact, and concrete
+  next steps recorded for a future session.
 
 ## Already moot / dead-code (no action needed, confirmed this session)
 
